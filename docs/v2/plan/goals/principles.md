@@ -84,5 +84,22 @@ while any remain in its paths. v2 lands complete or not at all.
     ([concurrency.md](../design/concurrency.md)).
   - **Branch-light and SIMD where it pays**, chosen at run time, bit-identical across paths
     ([hardware.md](../design/hardware.md)).
+- **Known names**
+  - **Fixed name sets become enums.** Intrinsics, lang items, lints, attributes, keywords and
+    target features are known when blaze is built. Each becomes a `u16` enum with a range of
+    pre-interned symbols, so recognizing one is a range check on a symbol ID. Raw bytes from a
+    lexer or an object file go through a perfect hash generated at build time. No `match` on
+    strings and no `strip_prefix` dispatch on a hot path.
+  - **Sets of known names become bitsets**: enabled lints per level, target features, cfg
+    atoms.
+- **Sorting and ordering**
+  - **Integer keys use radix sort.** Addresses, offsets, IDs and ranks use LSD radix sort on
+    8-bit or 11-bit digits, parallel above about 100k elements (the way mold sorts). A
+    comparison sort is for small inputs or keys that aren't integers.
+  - **Sorting by name for determinism uses an order key.** Each interned symbol carries a
+    precomputed `u64` order key (its first 8 bytes big-endian). Compare those first, and fall
+    back to bytes only on a tie. Never `to_string()` or `clone()` inside a sort key.
+  - **Ordered maps for determinism become hash maps sorted once** where the output is written.
+    Timers use a hierarchical timing wheel, not a `BTreeMap`.
 - **Every hot structure states its cost**: a comment or a `const` assertion giving its size
   per element and its lookup cost. `proof`'s budgets hold each lane to them.

@@ -526,14 +526,14 @@ fn crate_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[(ItemKey, Trait
 
 /// The auto traits of the crates `krate` loads, in the order of their keys.
 #[salsa::tracked(returns(ref))]
-fn loaded_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[(ItemKey, TraitId)]> {
+fn loaded_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[TraitId]> {
     let mut traits: Vec<(ItemKey, TraitId)> = loaded_crates(db, krate)
         .iter()
         .flat_map(|&it| crate_auto_traits(db, it).iter().copied())
         .collect();
     traits.sort_unstable();
     traits.dedup();
-    traits.into_boxed_slice()
+    traits.into_iter().map(|(_, it)| it).collect()
 }
 
 /// What an item's visibility is resolved to, once per item.
@@ -614,8 +614,12 @@ impl<'db> Cx<'db> {
             })
             .collect();
         let db = self.db;
-        let keys = |form: &Form| form.refs.iter().map(move |&it| item_key(db, it));
-        finished.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| keys(a.2).cmp(keys(b.2))));
+        finished.sort_by(|a, b| {
+            a.0.cmp(&b.0).then_with(|| {
+                let a = a.2.refs.iter().map(|&it| item_key(db, it));
+                a.cmp(b.2.refs.iter().map(|&it| item_key(db, it)))
+            })
+        });
         f.len(finished.len());
         for (digest, spans, form) in finished {
             f.merge(&digest, &spans, &form.refs, form.missed);
@@ -693,7 +697,7 @@ impl<'db> Cx<'db> {
     pub(crate) fn closure_code(&self, closure: InternedClosureId<'db>) -> Code {
         let mut f = Form::new("closure code");
         match self.db.mir_body_for_closure(closure) {
-            Ok(body) => self.mir(&mut f, body, &mut Vec::new()),
+            Ok(body) => self.mir(&mut f, body, &mut Nests::default()),
             Err(_) => f.error(Missed::NoMir),
         }
         f.code()
@@ -703,7 +707,7 @@ impl<'db> Cx<'db> {
     pub(crate) fn coroutine_code(&self, coroutine: InternedCoroutineId<'db>) -> Code {
         let mut f = Form::new("coroutine code");
         match self.db.mir_body_for_coroutine(coroutine) {
-            Ok(body) => self.mir(&mut f, body, &mut Vec::new()),
+            Ok(body) => self.mir(&mut f, body, &mut Nests::default()),
             Err(_) => f.error(Missed::NoMir),
         }
         f.code()
@@ -745,8 +749,7 @@ impl<'db> Cx<'db> {
         let traits = loaded_auto_traits(db, krate);
         f.len(traits.len());
         let env = ParamEnvAndCrate { param_env: db.trait_environment(def), krate };
-        let ids: Vec<TraitId> = traits.iter().map(|&(_, it)| it).collect();
-        for (&it, holds) in ids.iter().zip(implements_traits_unique(hidden, db, env, &ids)) {
+        for (&it, holds) in traits.iter().zip(implements_traits_unique(hidden, db, env, traits)) {
             f.item(ItemId::Trait(it));
             f.bool(holds);
         }
@@ -786,32 +789,33 @@ impl<'db> Cx<'db> {
     }
 
     /// A type: its digest and slots are the same wherever it is written.
-    pub(crate) fn ty(&self, ty: Ty<'db>) -> Sub {
-        let part = self.ty_part(ty);
-        self.sub_of(part)
+    pub(crate) fn ty(&self, ty: Ty<'db>) -> &'db Sub {
+        &self.ty_code(ty).sub
     }
 
-    fn ty_part(&self, ty: Ty<'db>) -> Part {
-        let known = self.tys.borrow().get(&ty).copied();
-        if let Some(known) = known {
-            return known;
+    fn ty_code(&self, ty: Ty<'db>) -> &'db Code {
+        let entry = &self.seen[FxBuildHasher.hash_one(ty) as usize % SEEN];
+        if let Some((seen, code)) = entry.get()
+            && seen == ty
+        {
+            return code;
         }
-        let mut form = Form::new("ty");
-        if self.spelling.borrow().contains(&ty) {
-            form.error(Missed::ErrorType);
-            return self.part(form);
-        }
-        self.spelling.borrow_mut().push(ty);
-        self.spell(&mut form, ty);
-        self.spelling.borrow_mut().pop();
-        let part = self.part(form);
-        self.tys.borrow_mut().insert(ty, part);
-        part
+        let code = ty_form(self.db, ty.store());
+        entry.set(Some((ty, code)));
+        code
     }
 
     fn ty_in(&self, f: &mut Form, ty: Ty<'db>) {
-        let part = self.ty_part(ty);
-        self.merge(f, part);
+        if f.quiet {
+            return;
+        }
+        #[cfg(test)]
+        if self.reference.is_some() {
+            let code = self.reference_ty(ty);
+            return f.merge(&code.sub.digest, &code.spans, &code.sub.refs, code.sub.missed);
+        }
+        let code = self.ty_code(ty);
+        f.merge(&code.sub.digest, &code.spans, &code.sub.refs, code.sub.missed);
     }
 
     fn function(&self, f: &mut Form, func: FunctionId) {
@@ -949,7 +953,8 @@ impl<'db> Cx<'db> {
                 self.trait_ref(f, trait_ref);
                 // Each item of the trait, in its order, with what implements it here.
                 let trait_items = &trait_ref.def_id.0.trait_items(db).items;
-                let mut used = FxHashSet::default();
+                // The impl items used, as a bit each; past 64 of them, a set.
+                let (mut used, mut used_past) = (0u64, FxHashSet::default());
                 f.len(trait_items.len());
                 for (name, of_trait) in trait_items.iter() {
                     f.item((*of_trait).into());
@@ -958,14 +963,18 @@ impl<'db> Cx<'db> {
                     });
                     match found {
                         Some(at) => {
-                            used.insert(at);
+                            if at < 64 {
+                                used |= 1 << at;
+                            } else {
+                                used_past.insert(at);
+                            }
                             f.u8(1);
                             f.item(items[at].1.into());
                         }
                         None => f.u8(0),
                     }
                 }
-                if used.len() != items.len() {
+                if used.count_ones() as usize + used_past.len() != items.len() {
                     f.error(Missed::ImplItemNotInTrait);
                 }
             }
@@ -1084,14 +1093,14 @@ impl<'db> Cx<'db> {
         let db = self.db;
         self.visibility(f, id.module(db), item_visibility(db, ItemId::Macro(id)));
         self.attrs(f, id.into());
-        let trees = match id {
+        let (trees, count): ([Option<ast::TokenTree>; 2], usize) = match id {
             MacroId::MacroRulesId(it) => {
                 let loc = it.lookup(db);
                 f.u8(0);
                 f.debug(&loc.expander);
                 f.u8(loc.flags.bits());
                 f.debug(&loc.edition);
-                vec![loc.id.to_node(db).token_tree()]
+                ([loc.id.to_node(db).token_tree(), None], 1)
             }
             MacroId::Macro2Id(it) => {
                 let loc = it.lookup(db);
@@ -1101,8 +1110,8 @@ impl<'db> Cx<'db> {
                 f.debug(&loc.edition);
                 let node = loc.id.to_node(db);
                 match node.args() {
-                    Some(args) => vec![Some(args), node.body()],
-                    None => vec![node.body()],
+                    Some(args) => ([Some(args), node.body()], 2),
+                    None => ([node.body(), None], 1),
                 }
             }
             MacroId::ProcMacroId(it) => {
@@ -1123,20 +1132,22 @@ impl<'db> Cx<'db> {
                 return;
             }
         };
-        f.len(trees.len());
-        for tree in trees {
+        f.len(count);
+        for tree in trees.into_iter().take(count) {
             let Some(tree) = tree else { return f.error(Missed::NoRules) };
-            let tokens: Vec<_> =
-                tree.syntax().descendants_with_tokens().filter_map(|it| it.into_token()).collect();
-            let solid = tokens.iter().filter(|it| !it.kind().is_trivia()).count();
-            f.len(solid);
-            for (at, token) in tokens.iter().enumerate() {
+            let at = f.len_at();
+            let mut solid = 0;
+            let mut tokens =
+                tree.syntax().descendants_with_tokens().filter_map(|it| it.into_token()).peekable();
+            while let Some(token) = tokens.next() {
                 if token.kind().is_trivia() {
                     continue;
                 }
                 f.str(token.text());
-                f.bool(tokens.get(at + 1).is_some_and(|next| !next.kind().is_trivia()));
+                f.bool(tokens.peek().is_some_and(|next| !next.kind().is_trivia()));
+                solid += 1;
             }
+            f.set_len(at, solid);
         }
     }
 
@@ -1236,9 +1247,10 @@ impl<'db> Cx<'db> {
         let db = self.db;
         let generics = hir_ty::generics::generics(db, def);
         let defaults = db.generic_defaults(def);
-        let params: Vec<_> = generics.iter(false).collect();
-        f.len(params.len());
-        for (at, (id, data)) in params.into_iter().enumerate() {
+        let len_at = f.len_at();
+        let mut count = 0;
+        for (at, (id, data)) in generics.iter(false).enumerate() {
+            count += 1;
             match data {
                 GenericParamDataRef::TypeParamData(it) => {
                     f.u8(0);
@@ -1266,6 +1278,7 @@ impl<'db> Cx<'db> {
                 None => f.u8(0),
             }
         }
+        f.set_len(len_at, count);
         self.clauses(f, GenericPredicates::query_all(db, def).skip_binder());
     }
 
@@ -1362,8 +1375,7 @@ impl<'db> Cx<'db> {
             }
             TyKind::Dynamic(predicates, region) => {
                 f.u8(16);
-                let mut forms = Vec::new();
-                for predicate in predicates.iter() {
+                let forms = predicates.iter().map(|predicate| {
                     let mut g = Form::new("existential");
                     g.len(predicate.bound_vars().len());
                     match predicate.skip_binder() {
@@ -1386,9 +1398,9 @@ impl<'db> Cx<'db> {
                             g.item(ItemId::Trait(it.0));
                         }
                     }
-                    forms.push(g);
-                }
-                self.sorted(f, self.parts(forms));
+                    g
+                });
+                self.set(f, forms);
                 self.region(f, region);
             }
             TyKind::Closure(id, args) => {
@@ -1692,6 +1704,9 @@ impl<'db> Cx<'db> {
 
     /// A variant by its type and its place in it: a variant's name is in what derives write.
     fn variant(&self, f: &mut Form, variant: VariantId) {
+        if f.quiet {
+            return;
+        }
         match variant {
             VariantId::EnumVariantId(it) => {
                 f.item(ItemId::Adt(it.lookup(self.db).parent.into()));
@@ -1733,6 +1748,9 @@ impl<'db> Cx<'db> {
     }
 
     fn konst(&self, f: &mut Form, konst: Const<'db>) {
+        if f.quiet {
+            return;
+        }
         match konst.kind() {
             ConstKind::Param(param) => {
                 f.u8(0);
@@ -1837,6 +1855,9 @@ impl<'db> Cx<'db> {
     }
 
     fn args(&self, f: &mut Form, args: GenericArgs<'db>) {
+        if f.quiet {
+            return;
+        }
         f.len(args.len());
         for arg in args.iter() {
             self.arg(f, arg);
@@ -1872,23 +1893,23 @@ impl<'db> Cx<'db> {
         self.spell_names(f, found);
     }
 
-    fn spell_names(&self, f: &mut Form, found: Vec<Named>) {
+    fn spell_names(&self, f: &mut Form, mut found: Vec<Named>) {
         let db = self.db;
         let mut seen = FxHashSet::default();
-        let found: Vec<_> = found.into_iter().filter(|it| seen.insert(*it)).collect();
+        found.retain(|it| seen.insert(*it));
         f.len(found.len());
         for named in found {
             match named {
                 Named::Item(id) => {
                     f.u8(0);
                     f.update(&item_key(db, id).0.0);
-                    f.str(&key::path(db, id));
+                    key::path_part(db, id, &mut |it| f.update(it));
                 }
                 Named::Variant(it) => {
                     f.u8(1);
                     f.update(&key::variant_key(db, it).0.0);
                     let parent = it.lookup(db).parent;
-                    f.str(&key::path(db, ItemId::Adt(parent.into())));
+                    key::path_part(db, ItemId::Adt(parent.into()), &mut |it| f.update(it));
                     let variants = &parent.enum_variants(db).variants;
                     match variants.get_index(it.index(db)) {
                         Some((name, _)) => f.str(name.as_str()),
@@ -1976,35 +1997,14 @@ impl<'db> Cx<'db> {
         }
     }
 
-    /// Forms in an order no order they are written in changes: by digest, then by the keys
-    /// of what they refer to.
-    fn sorted(&self, f: &mut Form, mut parts: Vec<Part>) {
-        let db = self.db;
-        {
-            let guard = self.refs.borrow();
-            let refs: &[ItemId] = &guard;
-            let keys = move |part: &Part| {
-                let at = part.refs_at as usize;
-                refs[at..at + part.refs_len as usize].iter().map(move |&it| item_key(db, it))
-            };
-            parts.sort_by(|a, b| a.digest.cmp(&b.digest).then_with(|| keys(a).cmp(keys(b))));
-        }
-        f.len(parts.len());
-        for part in parts {
-            self.merge(f, part);
-        }
-    }
-
     /// Where clauses as a set: reordering them changes nothing.
     fn clauses(&self, f: &mut Form, clauses: impl Iterator<Item = Clause<'db>>) {
-        let forms = clauses
-            .map(|clause| {
-                let mut g = Form::new("clause");
-                self.clause(&mut g, clause);
-                g
-            })
-            .collect();
-        self.sorted(f, self.parts(forms));
+        let forms = clauses.map(|clause| {
+            let mut g = Form::new("clause");
+            self.clause(&mut g, clause);
+            g
+        });
+        self.set(f, forms);
     }
 
     fn clause(&self, f: &mut Form, clause: Clause<'db>) {
@@ -2101,11 +2101,11 @@ impl<'db> Cx<'db> {
     fn code_in(&self, f: &mut Form, owner: InferBodyId<'db>) {
         let db = self.db;
         let Ok(body) = db.mir_body(owner) else { return f.error(Missed::NoMir) };
-        let mut nested = Vec::new();
+        let mut nested = Nests::default();
         self.mir(f, body, &mut nested);
         let mut at = 0;
-        while at < nested.len() {
-            let next = nested[at];
+        while at < nested.order.len() {
+            let next = nested.order[at];
             at += 1;
             let body = match next {
                 Nested::Closure(it) => {
@@ -2122,22 +2122,22 @@ impl<'db> Cx<'db> {
                 Err(_) => f.error(Missed::NoMir),
             }
         }
-        f.len(nested.len());
+        f.len(nested.order.len());
     }
 
     /// A body as the code generator is given it: no names, no spans, blocks and locals by
     /// number in the order a walk from the start block reaches them. The closures and
     /// coroutines it makes go to `nested`.
-    fn mir(&self, f: &mut Form, body: &MirBody<'db>, nested: &mut Vec<Nested<'db>>) {
-        let mut canon = Canon::new(body);
-        self.walk(&mut Form::new(""), &canon);
-        canon.collecting = false;
+    fn mir(&self, f: &mut Form, body: &MirBody<'db>, nested: &mut Nests<'db>) {
+        let canon = Canon::new(body);
+        self.walk(&mut Form::quiet(), &canon);
+        canon.collecting.set(false);
         self.walk(f, &canon);
-        let made = canon.nested.into_inner();
-        for it in made.into_iter().chain(body.closures.iter().map(|&it| Nested::Closure(it))) {
-            if !nested.contains(&it) {
-                nested.push(it);
-            }
+        for it in canon.nested.take() {
+            nested.push(it);
+        }
+        for &it in &body.closures {
+            nested.push(Nested::Closure(it));
         }
     }
 
@@ -2158,8 +2158,9 @@ impl<'db> Cx<'db> {
             }
             None => f.u8(0),
         }
-        f.len(c.order.len());
-        for &id in &c.order {
+        f.len(c.c.order.len());
+        let mut unwinds = 0;
+        for (number, &id) in c.c.order.iter().enumerate() {
             let block = &body.basic_blocks[id];
             f.bool(block.is_cleanup);
             for (at, statement) in block.statements.iter().enumerate() {
@@ -2174,7 +2175,7 @@ impl<'db> Cx<'db> {
                 }
                 f.span(statement.span);
                 self.statement(f, c, &statement.kind);
-                if let Some(&unwind) = c.unwinds.get(&(id, at)) {
+                if let Some(unwind) = c.unwind(&mut unwinds, number as u32, at) {
                     f.u8(0xfd);
                     self.block(f, c, Some(unwind));
                 }
@@ -2191,15 +2192,8 @@ impl<'db> Cx<'db> {
         // What lowering keeps beside the blocks, which the code generator reads: the order
         // scopes drop their locals in, the temporaries promoted to constants, the captures of an
         // `async` body used in place, and the blocks no test leads to.
-        let locals = |f: &mut Form, locals: &mut dyn Iterator<Item = LocalId>| {
-            let used: Vec<_> = locals.filter(|&it| c.used(it)).collect();
-            f.len(used.len());
-            for local in used {
-                self.local(f, c, local);
-            }
-        };
-        locals(f, &mut body.scope_ends.iter().copied());
-        locals(f, &mut body.promoted_constants.iter().copied());
+        self.used_locals(f, c, &body.scope_ends);
+        self.used_locals(f, c, &body.promoted_constants);
         f.len(body.promoted_locals.len());
         for &(local, expr) in &body.promoted_locals {
             self.local(f, c, local);
@@ -2210,30 +2204,45 @@ impl<'db> Cx<'db> {
             self.local(f, c, local);
             f.u32(field);
         }
-        let unreached: Vec<_> = body.unreached.iter().filter_map(|it| c.blocks.get(it)).collect();
-        f.len(unreached.len());
-        for &block in unreached {
-            f.u32(block);
+        let at = f.len_at();
+        let mut count = 0;
+        for &block in &body.unreached {
+            if let Some(number) = c.number_of(block) {
+                f.u32(number);
+                count += 1;
+            }
         }
+        f.set_len(at, count);
+    }
+
+    /// Those of `locals` the first walk found used, counted.
+    fn used_locals(&self, f: &mut Form, c: &Canon<'_, 'db>, locals: &[LocalId]) {
+        let at = f.len_at();
+        let mut count = 0;
+        for &local in locals {
+            if c.used(local) {
+                self.local(f, c, local);
+                count += 1;
+            }
+        }
+        f.set_len(at, count);
     }
 
     /// A local by the order the walk first meets it, with its type the first time: what
     /// lowering numbers it does not matter.
     fn local(&self, f: &mut Form, c: &Canon<'_, 'db>, local: LocalId) {
-        if c.collecting {
-            c.uses.borrow_mut().insert(local);
-            return;
+        if c.collecting.get() {
+            return c.mark_used(local);
         }
-        let mut numbers = c.numbers.borrow_mut();
-        let next = numbers.len() as u32;
-        let number = *numbers.entry(local).or_insert(next);
-        drop(numbers);
-        if number == next {
-            f.u8(0);
-            self.ty_in(f, c.body.locals[local].ty.as_ref());
-        } else {
-            f.u8(1);
-            f.u32(number);
+        match c.number(local) {
+            (_, true) => {
+                f.u8(0);
+                self.ty_in(f, c.body.locals[local].ty.as_ref());
+            }
+            (number, false) => {
+                f.u8(1);
+                f.u32(number);
+            }
         }
     }
 
@@ -2272,15 +2281,7 @@ impl<'db> Cx<'db> {
     }
 
     fn operand(&self, f: &mut Form, c: &Canon<'_, 'db>, operand: &Operand) {
-        match operand.span {
-            Some(span) => {
-                f.spans.push(1);
-                f.span(span);
-            }
-            None => {
-                f.spans.push(0);
-            }
-        }
+        f.operand_span(operand.span);
         match &operand.kind {
             OperandKind::Copy(place) => {
                 f.u8(0);
@@ -2310,6 +2311,9 @@ impl<'db> Cx<'db> {
     /// pointers point to, the types of its vtables, the statics it points into and the types
     /// of the `TypeId`s it holds.
     fn allocation(&self, f: &mut Form, allocation: Allocation<'db>) {
+        if f.quiet {
+            return;
+        }
         self.ty_in(f, allocation.ty);
         f.bytes(&allocation.memory);
         match &allocation.memory_map {
@@ -2438,7 +2442,7 @@ impl<'db> Cx<'db> {
                         f.u8(4);
                         let ty = ty.as_ref();
                         self.ty_in(f, ty);
-                        if !c.collecting
+                        if !c.collecting.get()
                             && let Some(made) = self.nested_of(ty)
                         {
                             c.nested.borrow_mut().push(made);
@@ -2570,7 +2574,7 @@ impl<'db> Cx<'db> {
         match block {
             Some(it) => {
                 f.u8(1);
-                f.u32(c.blocks[&it]);
+                f.u32(c.number_of(it).expect("a block a reached block leads to is reached"));
             }
             None => f.u8(0),
         }
@@ -2585,9 +2589,8 @@ impl<'db> Cx<'db> {
             TerminatorKind::SwitchInt { discr, targets } => {
                 f.u8(1);
                 self.operand(f, c, discr);
-                let values: Vec<_> = targets.iter().collect();
-                f.len(values.len());
-                for (value, target) in values {
+                f.len(targets.iter().count());
+                for (value, target) in targets.iter() {
                     f.u128(value);
                     self.block(f, c, Some(target));
                 }
@@ -2783,81 +2786,313 @@ fn bound_region(f: &mut Form, bound: BoundRegion<'_>) {
 /// nothing the code does and are left out.
 struct Canon<'b, 'db> {
     body: &'b MirBody<'db>,
-    order: Vec<BasicBlockId>,
-    blocks: FxHashMap<BasicBlockId, u32>,
-    unwinds: FxHashMap<(BasicBlockId, usize), BasicBlockId>,
+    c: CanonBuffers,
     /// The first walk only finds which locals are used.
-    collecting: bool,
-    uses: RefCell<FxHashSet<LocalId>>,
-    numbers: RefCell<FxHashMap<LocalId, u32>>,
+    collecting: Cell<bool>,
+    /// The number the next local the second walk meets gets.
+    next: Cell<u32>,
     /// The closures and coroutines the second walk meets being made, in its order.
     nested: RefCell<Vec<Nested<'db>>>,
 }
 
+/// A walk's columns, indexed by arena index: 4 bytes a block and a local and a bit a local,
+/// one load a lookup. Kept by the worker between bodies ([`SPARE`]).
+#[derive(Default)]
+struct CanonBuffers {
+    /// The blocks a walk from the start reaches, in the order it reaches them.
+    order: Vec<BasicBlockId>,
+    /// Each block's place in `order`, [`UNREACHED`] for one no walk reaches.
+    blocks: Vec<u32>,
+    stack: Vec<BasicBlockId>,
+    /// `(place of the block, statement, cleanup block)` of each statement that unwinds,
+    /// sorted: the walk reads it in order with a cursor.
+    unwinds: Vec<(u32, usize, BasicBlockId)>,
+    /// A bit for each local the first walk found used.
+    uses: Vec<Cell<u64>>,
+    /// Each local's number in the order the second walk meets it, [`UNNUMBERED`] before.
+    numbers: Vec<Cell<u32>>,
+}
+
+const UNREACHED: u32 = u32::MAX;
+const UNNUMBERED: u32 = u32::MAX;
+
+fn block_index(id: BasicBlockId) -> usize {
+    id.into_raw().into_u32() as usize
+}
+
+fn local_index(id: LocalId) -> usize {
+    id.into_raw().into_u32() as usize
+}
+
 impl<'b, 'db> Canon<'b, 'db> {
     fn new(body: &'b MirBody<'db>) -> Self {
-        let mut order = Vec::new();
-        let mut blocks = FxHashMap::default();
-        let mut stack = vec![body.start_block];
-        while let Some(id) = stack.pop() {
-            if blocks.contains_key(&id) {
+        let mut c = SPARE
+            .try_with(|spare| spare.try_borrow_mut().ok().and_then(|mut it| it.canons.pop()))
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        c.blocks.resize(body.basic_blocks.len(), UNREACHED);
+        c.stack.push(body.start_block);
+        while let Some(id) = c.stack.pop() {
+            let at = block_index(id);
+            if c.blocks[at] != UNREACHED {
                 continue;
             }
-            blocks.insert(id, order.len() as u32);
-            order.push(id);
+            c.blocks[at] = c.order.len() as u32;
+            c.order.push(id);
             if let Some(terminator) = &body.basic_blocks[id].terminator {
-                let next = successors(&terminator.kind);
-                stack.extend(next.into_iter().rev());
+                push_successors(&terminator.kind, &mut c.stack);
             }
         }
-        let unwinds = body
-            .panic_unwinds
-            .iter()
-            .filter(|it| blocks.contains_key(&it.0) && blocks.contains_key(&it.2))
-            .map(|&(block, at, to)| ((block, at), to))
-            .collect();
+        let blocks = &c.blocks;
+        c.unwinds.extend(body.panic_unwinds.iter().filter_map(|&(block, at, to)| {
+            let number = blocks[block_index(block)];
+            (number != UNREACHED && blocks[block_index(to)] != UNREACHED).then_some((
+                number, at, to,
+            ))
+        }));
+        c.unwinds.sort_by_key(|&(number, at, _)| (number, at));
+        c.uses.resize_with(body.locals.len().div_ceil(64), || Cell::new(0));
+        c.numbers.resize_with(body.locals.len(), || Cell::new(UNNUMBERED));
         Canon {
             body,
-            order,
-            blocks,
-            unwinds,
-            collecting: true,
-            uses: RefCell::default(),
-            numbers: RefCell::default(),
+            c,
+            collecting: Cell::new(true),
+            next: Cell::new(0),
             nested: RefCell::default(),
         }
     }
 
+    /// The place of `block` in the walk's order, if the walk reaches it.
+    fn number_of(&self, block: BasicBlockId) -> Option<u32> {
+        match self.c.blocks[block_index(block)] {
+            UNREACHED => None,
+            number => Some(number),
+        }
+    }
+
+    /// The cleanup block the `at`th statement of the `block`th block unwinds to. The walk asks
+    /// in order, so `cursor` only moves forward; of two entries for one statement the later
+    /// one holds, as it did in a map built from the list.
+    fn unwind(&self, cursor: &mut usize, block: u32, at: usize) -> Option<BasicBlockId> {
+        let unwinds = &self.c.unwinds;
+        while *cursor < unwinds.len() && (unwinds[*cursor].0, unwinds[*cursor].1) < (block, at) {
+            *cursor += 1;
+        }
+        let mut found = None;
+        while *cursor < unwinds.len() && (unwinds[*cursor].0, unwinds[*cursor].1) == (block, at) {
+            found = Some(unwinds[*cursor].2);
+            *cursor += 1;
+        }
+        found
+    }
+
     fn used(&self, local: LocalId) -> bool {
-        self.uses.borrow().contains(&local)
+        let at = local_index(local);
+        (self.c.uses[at / 64].get() >> (at % 64)) & 1 == 1
+    }
+
+    fn mark_used(&self, local: LocalId) {
+        let at = local_index(local);
+        let word = &self.c.uses[at / 64];
+        word.set(word.get() | 1 << (at % 64));
+    }
+
+    /// The local's number, and whether the walk meets it here first.
+    fn number(&self, local: LocalId) -> (u32, bool) {
+        let cell = &self.c.numbers[local_index(local)];
+        match cell.get() {
+            UNNUMBERED => {
+                let number = self.next.get();
+                self.next.set(number + 1);
+                cell.set(number);
+                (number, true)
+            }
+            number => (number, false),
+        }
     }
 }
 
-fn successors(kind: &TerminatorKind) -> Vec<BasicBlockId> {
+impl Drop for Canon<'_, '_> {
+    fn drop(&mut self) {
+        let mut c = mem::take(&mut self.c);
+        if (c.blocks.capacity() + c.numbers.capacity()) * size_of::<u32>() > SPARE_BYTES {
+            return;
+        }
+        c.order.clear();
+        c.blocks.clear();
+        c.stack.clear();
+        c.unwinds.clear();
+        c.uses.clear();
+        c.numbers.clear();
+        let _ = SPARE.try_with(|spare| {
+            if let Ok(mut spare) = spare.try_borrow_mut()
+                && spare.canons.len() < SPARE_COUNT
+            {
+                spare.canons.push(c);
+            }
+        });
+    }
+}
+
+/// Pushes the blocks a terminator may go to onto a walk's stack, the first on top.
+fn push_successors(kind: &TerminatorKind, stack: &mut Vec<BasicBlockId>) {
     match kind {
-        TerminatorKind::Goto { target } => vec![*target],
-        TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().to_vec(),
+        TerminatorKind::Goto { target } => stack.push(*target),
+        TerminatorKind::SwitchInt { targets, .. } => {
+            stack.extend(targets.all_targets().iter().rev())
+        }
         TerminatorKind::Drop { target, unwind, .. }
         | TerminatorKind::DropAndReplace { target, unwind, .. }
         | TerminatorKind::FalseUnwind { real_target: target, unwind } => {
-            std::iter::once(*target).chain(*unwind).collect()
+            stack.extend(*unwind);
+            stack.push(*target);
         }
         TerminatorKind::Call { target, cleanup, .. } => {
-            target.iter().chain(cleanup).copied().collect()
+            stack.extend(*cleanup);
+            stack.extend(*target);
         }
         TerminatorKind::Assert { target, cleanup, .. } => {
-            std::iter::once(*target).chain(*cleanup).collect()
+            stack.extend(*cleanup);
+            stack.push(*target);
         }
         TerminatorKind::Yield { resume, drop, .. } => {
-            std::iter::once(*resume).chain(*drop).collect()
+            stack.extend(*drop);
+            stack.push(*resume);
         }
         TerminatorKind::FalseEdge { real_target, imaginary_target } => {
-            vec![*real_target, *imaginary_target]
+            stack.push(*imaginary_target);
+            stack.push(*real_target);
         }
         TerminatorKind::UnwindResume
         | TerminatorKind::Abort
         | TerminatorKind::Return
         | TerminatorKind::Unreachable
-        | TerminatorKind::CoroutineDrop => Vec::new(),
+        | TerminatorKind::CoroutineDrop => {}
+    }
+}
+
+/// What the tests compare the writer's columns and buffers against: each answer here is read
+/// from the new layout, and the tests build the old one beside it.
+#[cfg(test)]
+pub(crate) mod check {
+    use std::fmt::Debug;
+
+    use hir_ty::{
+        db::HirDatabase,
+        mir::{BasicBlockId, MirBody},
+    };
+
+    use super::{Canon, Cx, Form, local_index};
+    use crate::ItemId;
+
+    /// A walk's order, each reached block's place in it, and the cleanup block each statement
+    /// of a reached block unwinds to, as [`Canon`] keeps them.
+    pub(crate) struct Walk {
+        pub(crate) order: Vec<BasicBlockId>,
+        pub(crate) numbers: Vec<(BasicBlockId, u32)>,
+        pub(crate) unwinds: Vec<((BasicBlockId, usize), BasicBlockId)>,
+    }
+
+    pub(crate) fn walk(body: &MirBody<'_>) -> Walk {
+        let canon = Canon::new(body);
+        let order = canon.c.order.clone();
+        let numbers = body
+            .basic_blocks
+            .iter()
+            .filter_map(|(id, _)| canon.number_of(id).map(|number| (id, number)))
+            .collect();
+        let mut unwinds = Vec::new();
+        let mut cursor = 0;
+        for (number, &id) in order.iter().enumerate() {
+            for at in 0..body.basic_blocks[id].statements.len() {
+                if let Some(to) = canon.unwind(&mut cursor, number as u32, at) {
+                    unwinds.push(((id, at), to));
+                }
+            }
+        }
+        Walk { order, numbers, unwinds }
+    }
+
+    /// The locals the first walk finds used, by index: with the quiet form it walks with, and
+    /// with a form that writes everything, as it walked before.
+    pub(crate) fn uses<'db>(
+        db: &'db dyn HirDatabase,
+        body: &MirBody<'db>,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let used = |mut form: Form| {
+            let cx = Cx::new(db);
+            let canon = Canon::new(body);
+            cx.walk(&mut form, &canon);
+            body.locals
+                .iter()
+                .map(|(local, _)| local)
+                .filter(|&local| canon.used(local))
+                .map(local_index)
+                .collect::<Vec<usize>>()
+        };
+        (used(Form::quiet()), used(Form::new("")))
+    }
+
+    /// The bytes [`Form::debug`] writes, and those of the `format!` it replaced.
+    pub(crate) fn debug<T: Debug + ?Sized>(value: &T) -> (Vec<u8>, Vec<u8>) {
+        let mut new = Form::new("");
+        new.debug(value);
+        let mut old = Form::new("");
+        old.str(&format!("{value:?}"));
+        (new.digest.clone(), old.digest.clone())
+    }
+
+    /// `bytes` counted by a length written after them, and by one written before.
+    pub(crate) fn counted(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut new = Form::new("");
+        let at = new.len_at();
+        for &byte in bytes {
+            new.u8(byte);
+        }
+        new.set_len(at, bytes.len());
+        let mut old = Form::new("");
+        old.len(bytes.len());
+        for &byte in bytes {
+            old.u8(byte);
+        }
+        (new.digest.clone(), old.digest.clone())
+    }
+
+    /// The bytes and refs of `ids` written as slots, and those of a map of every slot, as
+    /// [`Form::item`] kept before it scanned.
+    pub(crate) fn slots(ids: &[ItemId]) -> ((Vec<u8>, Vec<ItemId>), (Vec<u8>, Vec<ItemId>)) {
+        let mut new = Form::new("");
+        for &id in ids {
+            new.item(id);
+        }
+        let mut bytes = Form::new("").digest.clone();
+        let mut refs = Vec::new();
+        let mut slots = rustc_hash::FxHashMap::default();
+        for &id in ids {
+            let next = refs.len() as u32;
+            let slot = *slots.entry(id).or_insert(next);
+            if slot == next {
+                refs.push(id);
+            }
+            bytes.extend_from_slice(&slot.to_le_bytes());
+        }
+        ((new.digest.clone(), new.refs.clone()), (bytes, refs))
+    }
+
+    /// A form written with `ids` and dropped, then the next one: its digest, spans, refs and
+    /// slots, which must hold only its tag.
+    pub(crate) fn reused(ids: &[ItemId]) -> (Vec<u8>, Vec<u8>, Vec<ItemId>, usize) {
+        {
+            let mut form = Form::new("a form with much in it");
+            for &id in ids {
+                form.item(id);
+            }
+            form.spans.extend_from_slice(&[1; 64]);
+            form.error(super::Missed::ErrorType);
+        }
+        let next = Form::new("");
+        assert_eq!(next.missed, None);
+        (next.digest.clone(), next.spans.clone(), next.refs.clone(), next.slots.len())
     }
 }

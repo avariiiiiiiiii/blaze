@@ -537,7 +537,9 @@ fn eval_error_kind(err: &ConstEvalError<'_>) -> String {
 }
 
 fn name_of(db: &dyn HirDatabase, h: &mut Hasher, id: ItemId) {
-    h.part(key::path(db, id).as_bytes());
+    key::path_part(db, id, &mut |bytes| {
+        h.update(bytes);
+    });
     let owner: hir_def::AttrDefId = match id {
         ItemId::Function(it) => it.into(),
         ItemId::Adt(it) => it.into(),

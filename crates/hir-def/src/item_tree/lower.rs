@@ -1,10 +1,12 @@
 //! AST -> `ItemTree` lowering code.
 
-use std::{cell::OnceCell, mem};
+use std::{
+    cell::{Cell, OnceCell},
+    mem,
+};
 
 use base_db::{Crate, FxIndexSet, SourceDatabase};
 use cfg::{CfgExpr, CfgOptions};
-use either::Either;
 use hir_expand::{
     HirFileId,
     attrs::Attr,
@@ -13,7 +15,6 @@ use hir_expand::{
     span_map::SpanMap,
 };
 use la_arena::Arena;
-use rustc_hash::FxHashSet;
 use span::{
     AstIdMap, FileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor, SyntaxContext,
 };
@@ -45,9 +46,34 @@ fn push<T>(column: &mut Vec<T>, value: T) -> u32 {
     at
 }
 
+/// Every column moved out into an exact-size one, `column` left empty with its capacity: one
+/// allocation per non-empty column, none for an empty one.
+fn column<T>(column: &mut Vec<T>) -> Box<[T]> {
+    column.drain(..).collect()
+}
+
+thread_local! {
+    /// The worker's builder, empty between trees and keeping its columns' capacity, so a
+    /// worker grows no column again once it has lowered a tree as big. A tree lowered while
+    /// another is (none is today) takes a fresh one.
+    static SCRATCH: Cell<TreeBuilder> = Cell::new(TreeBuilder::default());
+}
+
+/// The most items a kept [`SCRATCH`] builder has room for: about 100 KiB of columns.
+const SCRATCH_ITEMS: usize = 1 << 13;
+
 /// An [`ItemTree`] being built: its columns, growing.
 #[derive(Default)]
 struct TreeBuilder {
+    /// The items of the lists being lowered, innermost last: a list is lowered onto the end
+    /// and moved to `children` when it is done ([`TreeBuilder::items_since`]); what is left at
+    /// the end is the top level.
+    pending_items: Vec<ModItemId>,
+    /// The same for the lists of `use` trees.
+    pending_use_trees: Vec<UseTreeId>,
+    /// The visibilities a tuple struct's constructor is the least of, while its fields are read.
+    ctor_scratch: Vec<RawVisibility>,
+
     kinds: Vec<ItemKind>,
     data: Vec<u32>,
     ast_ids: Vec<FileAstId<ast::Item>>,
@@ -84,40 +110,42 @@ struct TreeBuilder {
 }
 
 impl TreeBuilder {
-    fn finish(self, top_level: Vec<ModItemId>) -> ItemTree {
-        let mut attr_owners = self.attr_owners;
-        attr_owners.sort_unstable_by_key(|owner| owner.owner);
+    /// The tree built, the pending items its top level; leaves the builder empty, its capacity
+    /// kept.
+    fn finish(&mut self) -> ItemTree {
+        debug_assert!(self.pending_use_trees.is_empty() && self.ctor_scratch.is_empty());
+        self.attr_owners.sort_unstable_by_key(|owner| owner.owner);
         ItemTree {
-            top_level: top_level.into_boxed_slice(),
-            kinds: self.kinds.into_boxed_slice(),
-            data: self.data.into_boxed_slice(),
-            ast_ids: self.ast_ids.into_boxed_slice(),
-            children: self.children.into_boxed_slice(),
-            consts: self.consts.into_boxed_slice(),
-            enums: self.enums.into_boxed_slice(),
-            extern_blocks: self.extern_blocks.into_boxed_slice(),
-            extern_crates: self.extern_crates.into_boxed_slice(),
-            functions: self.functions.into_boxed_slice(),
-            impls: self.impls.into_boxed_slice(),
-            macro2s: self.macro2s.into_boxed_slice(),
-            macro_calls: self.macro_calls.into_boxed_slice(),
-            macro_rules: self.macro_rules.into_boxed_slice(),
-            mods: self.mods.into_boxed_slice(),
-            statics: self.statics.into_boxed_slice(),
-            structs: self.structs.into_boxed_slice(),
-            traits: self.traits.into_boxed_slice(),
-            type_aliases: self.type_aliases.into_boxed_slice(),
-            unions: self.unions.into_boxed_slice(),
-            uses: self.uses.into_boxed_slice(),
-            use_trees: self.use_trees.into_boxed_slice(),
-            use_tree_lists: self.use_tree_lists.into_boxed_slice(),
-            ctor_vis: self.ctor_vis.into_boxed_slice(),
-            names: self.names.into_iter().collect(),
-            paths: self.paths.into_iter().collect(),
-            vis: self.vis.into_iter().collect(),
-            attr_owners: attr_owners.into_boxed_slice(),
-            attrs: self.attrs.into_boxed_slice(),
-            cfgs: self.cfgs.into_boxed_slice(),
+            top_level: column(&mut self.pending_items),
+            kinds: column(&mut self.kinds),
+            data: column(&mut self.data),
+            ast_ids: column(&mut self.ast_ids),
+            children: column(&mut self.children),
+            consts: column(&mut self.consts),
+            enums: column(&mut self.enums),
+            extern_blocks: column(&mut self.extern_blocks),
+            extern_crates: column(&mut self.extern_crates),
+            functions: column(&mut self.functions),
+            impls: column(&mut self.impls),
+            macro2s: column(&mut self.macro2s),
+            macro_calls: column(&mut self.macro_calls),
+            macro_rules: column(&mut self.macro_rules),
+            mods: column(&mut self.mods),
+            statics: column(&mut self.statics),
+            structs: column(&mut self.structs),
+            traits: column(&mut self.traits),
+            type_aliases: column(&mut self.type_aliases),
+            unions: column(&mut self.unions),
+            uses: column(&mut self.uses),
+            use_trees: column(&mut self.use_trees),
+            use_tree_lists: column(&mut self.use_tree_lists),
+            ctor_vis: column(&mut self.ctor_vis),
+            names: self.names.drain(..).collect(),
+            paths: self.paths.drain(..).collect(),
+            vis: self.vis.drain(..).collect(),
+            attr_owners: column(&mut self.attr_owners),
+            attrs: column(&mut self.attrs),
+            cfgs: column(&mut self.cfgs),
         }
     }
 
@@ -131,18 +159,18 @@ impl TreeBuilder {
     }
 
     fn name(&mut self, name: Name) -> NameId {
-        NameId(id(self.names.insert_full(name).0))
+        NameId { raw: id(self.names.insert_full(name).0) }
     }
 
     fn path(&mut self, path: Interned<ModPath>) -> PathId {
-        PathId(id(self.paths.insert_full(path).0))
+        PathId { raw: id(self.paths.insert_full(path).0) }
     }
 
     fn alias(&mut self, alias: Option<ImportAlias>) -> AliasId {
         match alias {
             None => AliasId::NONE,
             Some(ImportAlias::Underscore) => AliasId::UNDERSCORE,
-            Some(ImportAlias::Alias(name)) => AliasId(self.name(name).0),
+            Some(ImportAlias::Alias(name)) => AliasId { raw: self.name(name).raw },
         }
     }
 
@@ -156,26 +184,27 @@ impl TreeBuilder {
                 RawVisibilityId::PRIV_IMPLICIT
             }
             RawVisibility::PubCrate => RawVisibilityId::PUB_CRATE,
-            _ => RawVisibilityId(id(self.vis.insert_full(vis).0)),
+            _ => RawVisibilityId { raw: id(self.vis.insert_full(vis).0) },
         }
     }
 
-    /// The list `items`, appended to `children`.
-    fn items(&mut self, items: Vec<ModItemId>) -> IdRange {
+    /// The list of the items pending from `mark`, moved to `children`.
+    fn items_since(&mut self, mark: usize) -> IdRange {
         let start = id(self.children.len());
-        let len = id(items.len());
-        self.children.extend(items);
+        let len = id(self.pending_items.len() - mark);
+        self.children.extend(self.pending_items.drain(mark..));
         IdRange { start, len }
     }
 
     fn use_tree(&mut self, tree: UseTree) -> UseTreeId {
-        UseTreeId(push(&mut self.use_trees, tree))
+        UseTreeId { raw: push(&mut self.use_trees, tree) }
     }
 
-    fn use_tree_list(&mut self, list: Vec<UseTreeId>) -> IdRange {
+    /// The list of the `use` trees pending from `mark`, moved to `use_tree_lists`.
+    fn use_tree_list_since(&mut self, mark: usize) -> IdRange {
         let start = id(self.use_tree_lists.len());
-        let len = id(list.len());
-        self.use_tree_lists.extend(list);
+        let len = id(self.pending_use_trees.len() - mark);
+        self.use_tree_lists.extend(self.pending_use_trees.drain(mark..));
         IdRange { start, len }
     }
 
@@ -218,7 +247,7 @@ impl<'db> Ctx<'db> {
     pub(super) fn new(db: &'db dyn SourceDatabase, file: HirFileId, krate: Crate) -> Self {
         Self {
             db,
-            tree: TreeBuilder::default(),
+            tree: SCRATCH.take(),
             source_ast_id_map: file.ast_id_map(db),
             file,
             cfg_options: OnceCell::new(),
@@ -285,65 +314,82 @@ impl<'db> Ctx<'db> {
         self.tree.add_attrs(ModItemId::TOP_OWNER, start, cfg);
     }
 
+    /// The tree, its top level the items pending; the builder goes back to [`SCRATCH`] unless
+    /// it grew past [`SCRATCH_ITEMS`] (a generated file), so a worker keeps a bounded amount.
+    fn finish(mut self) -> ItemTree {
+        let tree = self.tree.finish();
+        if self.tree.kinds.capacity() <= SCRATCH_ITEMS {
+            SCRATCH.set(mem::take(&mut self.tree));
+        }
+        tree
+    }
+
+    /// Lowers `item` onto the pending list being lowered, if it is an item.
+    fn pend(&mut self, item: &ast::Item) {
+        if let Some(id) = self.lower_mod_item(item) {
+            self.tree.pending_items.push(id);
+        }
+    }
+
     pub(super) fn lower_module_items(mut self, item_owner: &dyn HasModuleItem) -> ItemTree {
-        let top_level = item_owner.items().filter_map(|item| self.lower_mod_item(&item)).collect();
-        self.tree.finish(top_level)
+        for item in item_owner.items() {
+            self.pend(&item);
+        }
+        self.finish()
     }
 
     pub(super) fn lower_macro_stmts(mut self, stmts: ast::MacroStmts) -> ItemTree {
-        let mut top_level: Vec<_> = stmts
-            .statements()
-            .filter_map(|stmt| {
-                match stmt {
-                    ast::Stmt::Item(item) => Some(item),
-                    // Macro calls can be both items and expressions. The syntax library always treats
-                    // them as expressions here, so we undo that.
-                    ast::Stmt::ExprStmt(es) => match es.expr()? {
-                        ast::Expr::MacroExpr(expr) => {
-                            cov_mark::hit!(macro_call_in_macro_stmts_is_added_to_item_tree);
-                            Some(expr.macro_call()?.into())
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                }
-            })
-            .filter_map(|item| self.lower_mod_item(&item))
-            .collect();
+        for stmt in stmts.statements() {
+            let item = match stmt {
+                ast::Stmt::Item(item) => item,
+                // Macro calls can be both items and expressions. The syntax library always treats
+                // them as expressions here, so we undo that.
+                ast::Stmt::ExprStmt(es) => match es.expr() {
+                    Some(ast::Expr::MacroExpr(expr)) => {
+                        cov_mark::hit!(macro_call_in_macro_stmts_is_added_to_item_tree);
+                        let Some(call) = expr.macro_call() else { continue };
+                        call.into()
+                    }
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            self.pend(&item);
+        }
 
         if let Some(ast::Expr::MacroExpr(tail_macro)) = stmts.expr()
             && let Some(call) = tail_macro.macro_call()
         {
             cov_mark::hit!(macro_stmt_with_trailing_macro_expr);
-            if let Some(mod_item) = self.lower_mod_item(&call.into()) {
-                top_level.push(mod_item);
-            }
+            self.pend(&call.into());
         }
 
-        self.tree.finish(top_level)
+        self.finish()
     }
 
     pub(super) fn lower_block(mut self, block: &ast::BlockExpr) -> ItemTree {
         self.lower_attrs(ModItemId::TOP_OWNER, block);
-        let mut top_level: Vec<_> = block
-            .statements()
-            .filter_map(|stmt| match stmt {
+        for stmt in block.statements() {
+            let id = match stmt {
                 ast::Stmt::Item(item) => self.lower_mod_item(&item),
                 // Macro calls can be both items and expressions. The syntax library always treats
                 // them as expressions here, so we undo that.
-                ast::Stmt::ExprStmt(es) => match es.expr()? {
-                    ast::Expr::MacroExpr(expr) => self.lower_macro_stmt(&expr),
+                ast::Stmt::ExprStmt(es) => match es.expr() {
+                    Some(ast::Expr::MacroExpr(expr)) => self.lower_macro_stmt(&expr),
                     _ => None,
                 },
                 _ => None,
-            })
-            .collect();
+            };
+            if let Some(id) = id {
+                self.tree.pending_items.push(id);
+            }
+        }
         if let Some(ast::Expr::MacroExpr(expr)) = block.tail_expr()
             && let Some(mod_item) = self.lower_macro_stmt(&expr)
         {
-            top_level.push(mod_item);
+            self.tree.pending_items.push(mod_item);
         }
-        self.tree.finish(top_level)
+        self.finish()
     }
 
     /// A macro call written as a statement is an item of the block when it expands to items.
@@ -411,57 +457,48 @@ impl<'db> Ctx<'db> {
             return self.tree.ctor_vis([struct_vis]);
         }
 
-        let mut value_ns_ctor_vis = Either::Left(struct_vis);
+        // The least visibility so far: one, or several distinct `pub(in ..)`s (whose paths are
+        // not ordered before name resolution), in the order of their fields.
+        let mut least = mem::take(&mut self.tree.ctor_scratch);
+        least.push(struct_vis);
         for field in fields.fields() {
             let field_vis = self.lower_visibility_from_ast(&field);
-            match (&field_vis, &mut value_ns_ctor_vis) {
+            match (&field_vis, &least[0]) {
                 (RawVisibility::PubSelf(_), _) => {
                     // If there is a field private, the minimal visibility is private.
-                    value_ns_ctor_vis = Either::Left(field_vis);
+                    least.clear();
+                    least.push(field_vis);
                     break;
                 }
-                (_, Either::Left(RawVisibility::Public)) => {
+                (_, RawVisibility::Public) => {
                     // anything <= `pub`.
-                    value_ns_ctor_vis = Either::Left(field_vis);
+                    least[0] = field_vis;
                 }
-                (RawVisibility::Module(..), Either::Left(RawVisibility::PubCrate)) => {
+                (RawVisibility::Module(..), RawVisibility::PubCrate) => {
                     // `pub(in module)` <= `pub(crate)`.
-                    value_ns_ctor_vis = Either::Left(field_vis);
+                    least[0] = field_vis;
                 }
                 (
                     RawVisibility::Public | RawVisibility::PubCrate,
-                    Either::Right(_)
-                    | Either::Left(RawVisibility::Module(..) | RawVisibility::PubCrate),
+                    RawVisibility::Module(..) | RawVisibility::PubCrate,
                 ) => {
                     // `pub(in module) | pub(crate)` <= `pub(crate) | pub`.
                 }
-                (_, Either::Left(RawVisibility::PubSelf(_))) => {
+                (_, RawVisibility::PubSelf(_)) => {
                     unreachable!("we early-exit on `PubSelf`");
                 }
-                (RawVisibility::Module(..), Either::Left(RawVisibility::Module(..))) => {
-                    let old_vis = match mem::replace(
-                        &mut value_ns_ctor_vis,
-                        Either::Left(RawVisibility::Public),
-                    ) {
-                        Either::Left(it) => it,
-                        _ => unreachable!(),
-                    };
-                    let mut multiple = FxHashSet::default();
-                    multiple.insert(old_vis);
-                    multiple.insert(field_vis);
-                    value_ns_ctor_vis = Either::Right(multiple);
-                }
-                (RawVisibility::Module(..), Either::Right(multiple)) => {
-                    multiple.insert(field_vis);
+                (RawVisibility::Module(..), RawVisibility::Module(..)) => {
+                    if !least.contains(&field_vis) {
+                        least.push(field_vis);
+                    }
                 }
             }
         }
 
-        match value_ns_ctor_vis {
-            Either::Left(vis) => self.tree.ctor_vis([vis]),
-            // One visibility or several, in the set's order: a list of one is that visibility.
-            Either::Right(multiple) => self.tree.ctor_vis(multiple),
-        }
+        // A list of one is that visibility.
+        let range = self.tree.ctor_vis(least.drain(..));
+        self.tree.ctor_scratch = least;
+        range
     }
 
     fn lower_union(&mut self, union: &ast::Union) -> Option<ModItemId> {
@@ -528,14 +565,18 @@ impl<'db> Ctx<'db> {
         let items = if module.semicolon_token().is_some() {
             IdRange::NONE
         } else {
-            let items = match module.item_list() {
-                Some(list) => list.items().filter_map(|item| self.lower_mod_item(&item)).collect(),
+            let mark = self.tree.pending_items.len();
+            match module.item_list() {
+                Some(list) => {
+                    for item in list.items() {
+                        self.pend(&item);
+                    }
+                }
                 None => {
                     cov_mark::hit!(name_res_works_for_broken_modules);
-                    Vec::new()
                 }
-            };
-            self.tree.items(items)
+            }
+            self.tree.items_since(mark)
         };
         let ast_id = self.source_ast_id_map.ast_id(module);
         let res = Mod { name: self.tree.name(name), visibility, items };
@@ -566,8 +607,7 @@ impl<'db> Ctx<'db> {
         let visibility = self.lower_visibility(use_item);
         let ast_id = self.source_ast_id_map.ast_id(use_item);
         let span_map = self.span_map();
-        let mut lowering =
-            UseTreeLowering { db: self.db, mapping: Arena::new(), tree: &mut self.tree };
+        let mut lowering = UseTreeLowering { db: self.db, mapping: None, tree: &mut self.tree };
         let use_tree = lowering.lower_use_tree(use_item.use_tree()?, &mut |range| {
             span_map.span_for_range(range).ctx
         })?;
@@ -633,32 +673,26 @@ impl<'db> Ctx<'db> {
 
     fn lower_extern_block(&mut self, block: &ast::ExternBlock) -> ModItemId {
         let ast_id = self.source_ast_id_map.ast_id(block);
-        let children = match block.extern_item_list() {
-            Some(list) => list
-                .extern_items()
-                .filter_map(|item| {
-                    // Note: All items in an `extern` block need to be lowered as if they're outside of one
-                    // (in other words, the knowledge that they're in an extern block must not be used).
-                    // This is because an extern block can contain macros whose ItemTree's top-level items
-                    // should be considered to be in an extern block too.
-                    let mod_item = match &item {
-                        ast::ExternItem::Fn(ast) => self.lower_function(ast)?,
-                        ast::ExternItem::Static(ast) => self.lower_static(ast)?,
-                        ast::ExternItem::TypeAlias(ty) => self.lower_type_alias(ty)?,
-                        ast::ExternItem::MacroCall(call) => self.lower_macro_call(call)?,
-                    };
-                    match &item {
-                        ast::ExternItem::Fn(func) => {
-                            self.lower_attrs(mod_item, &OutlineFn(func.clone()))
-                        }
-                        _ => self.lower_attrs(mod_item, &item),
-                    }
-                    Some(mod_item)
-                })
-                .collect(),
-            None => Vec::new(),
-        };
-        let children = self.tree.items(children);
+        let mark = self.tree.pending_items.len();
+        for item in block.extern_item_list().into_iter().flat_map(|list| list.extern_items()) {
+            // Note: All items in an `extern` block need to be lowered as if they're outside of one
+            // (in other words, the knowledge that they're in an extern block must not be used).
+            // This is because an extern block can contain macros whose ItemTree's top-level items
+            // should be considered to be in an extern block too.
+            let mod_item = match &item {
+                ast::ExternItem::Fn(ast) => self.lower_function(ast),
+                ast::ExternItem::Static(ast) => self.lower_static(ast),
+                ast::ExternItem::TypeAlias(ty) => self.lower_type_alias(ty),
+                ast::ExternItem::MacroCall(call) => self.lower_macro_call(call),
+            };
+            let Some(mod_item) = mod_item else { continue };
+            match &item {
+                ast::ExternItem::Fn(func) => self.lower_attrs(mod_item, &OutlineFn(func.clone())),
+                _ => self.lower_attrs(mod_item, &item),
+            }
+            self.tree.pending_items.push(mod_item);
+        }
+        let children = self.tree.items_since(mark);
 
         let data = push(&mut self.tree.extern_blocks, ExternBlock { children });
         self.tree.item(ItemKind::ExternBlock, ast_id.upcast(), data)
@@ -698,12 +732,18 @@ impl syntax_bridge::SpanMapper for FakeSpanMap {
 struct UseTreeLowering<'a> {
     db: &'a dyn SourceDatabase,
     /// The lowered trees' syntax, in the order [`Use::expand`] numbers them: a tree before its
-    /// children.
-    mapping: Arena<ast::UseTree>,
+    /// children. Only the source map ([`lower_use_tree`]) wants it.
+    mapping: Option<&'a mut Arena<ast::UseTree>>,
     tree: &'a mut TreeBuilder,
 }
 
 impl UseTreeLowering<'_> {
+    fn map(&mut self, tree: &ast::UseTree) {
+        if let Some(mapping) = &mut self.mapping {
+            mapping.alloc(tree.clone());
+        }
+    }
+
     /// Lowers `tree` into the tree's `use` trees, its children before it.
     fn lower_use_tree(
         &mut self,
@@ -727,17 +767,19 @@ impl UseTreeLowering<'_> {
                 }
             };
 
-            self.mapping.alloc(tree.clone());
-            let list: Vec<_> = use_tree_list
-                .use_trees()
-                .filter_map(|tree| self.lower_use_tree(tree, span_for_range))
-                .collect();
+            self.map(&tree);
+            let mark = self.tree.pending_use_trees.len();
+            for tree in use_tree_list.use_trees() {
+                if let Some(id) = self.lower_use_tree(tree, span_for_range) {
+                    self.tree.pending_use_trees.push(id);
+                }
+            }
 
             let path = match prefix {
                 Some(prefix) => self.tree.path(Interned::new(prefix)),
                 None => PathId::NONE,
             };
-            let list = self.tree.use_tree_list(list);
+            let list = self.tree.use_tree_list_since(mark);
             Some(self.tree.use_tree(UseTree {
                 kind: UseTree::PREFIXED,
                 path,
@@ -766,7 +808,7 @@ impl UseTreeLowering<'_> {
                     if path.is_none() {
                         cov_mark::hit!(glob_enum_group);
                     }
-                    self.mapping.alloc(tree.clone());
+                    self.map(&tree);
                     let path = match path {
                         Some(path) => self.tree.path(Interned::new(path)),
                         None => PathId::NONE,
@@ -783,7 +825,7 @@ impl UseTreeLowering<'_> {
                 // `bla::{ as Name}` is invalid
                 (None, Some(_), false) => None,
                 (Some(path), alias, false) => {
-                    self.mapping.alloc(tree.clone());
+                    self.map(&tree);
                     let path = self.tree.path(Interned::new(path));
                     let alias = self.tree.alias(alias);
                     Some(self.tree.use_tree(UseTree {
@@ -805,9 +847,10 @@ pub(crate) fn lower_use_tree(
     span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,
 ) -> Option<Arena<ast::UseTree>> {
     let mut scratch = TreeBuilder::default();
-    let mut lowering = UseTreeLowering { db, mapping: Arena::new(), tree: &mut scratch };
+    let mut mapping = Arena::new();
+    let mut lowering = UseTreeLowering { db, mapping: Some(&mut mapping), tree: &mut scratch };
     lowering.lower_use_tree(tree, span_for_range)?;
-    Some(lowering.mapping)
+    Some(mapping)
 }
 
 fn private_vis() -> RawVisibility {

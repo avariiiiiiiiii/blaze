@@ -370,6 +370,11 @@ mod tests {
     }
 
     #[test]
+    fn a_pat_is_linted_for_each_or_that_may_follow_it() {
+        assert_eq!(or_patterns("macro_rules! m { ($($x:pat)|* |) => {} }", Edition::Edition2015), ["$x:pat", "$x:pat"]);
+    }
+
+    #[test]
     fn no_pat_param_nor_pat_of_2021_is_linted() {
         assert!(or_patterns("macro_rules! baz { ($x:pat_param | $y:pat_param) => {} }", Edition::Edition2015).is_empty());
         assert!(or_patterns("macro_rules! foo { ($x:pat | $y:pat) => {} }", Edition::Edition2021).is_empty());

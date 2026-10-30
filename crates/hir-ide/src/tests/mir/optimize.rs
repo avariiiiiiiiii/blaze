@@ -8,7 +8,7 @@ use test_fixture::WithFixture;
 
 use crate::{
     db::HirDatabase,
-    mir::{MirOptLevel, print_mir_body},
+    mir::{MirOptLevel, MirOptions, print_mir_body},
     setup_tracing,
     test_db::TestDB,
 };
@@ -66,7 +66,7 @@ fn check_mir(
                 _ => None,
             })
             .expect("no such function");
-        let body = db.optimized_mir_body(func.into(), level).unwrap();
+        let body = db.optimized_mir_body(func.into(), MirOptions::at(level)).unwrap();
         expect.assert_eq(&print_mir_body(&db, body, name));
     })
 }

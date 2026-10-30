@@ -20,18 +20,20 @@
 //! verify, the codegen inputs or the tables give. A cancel skips what has not started, kills
 //! what runs, and the job still finishes once, not ok.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{
-        Arc, RwLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
 
 use blaze_api::{
-    ApiError, Artifact, Diagnostic, FetchVerb, Level, LinkKind, Mismatch, Response, Targets, Traced,
-    UnitStarted, Verb, Worked,
+    ApiError, Artifact, Diagnostic, FetchVerb, Level, LinkKind, Mismatch, Response, Targets, TestOutcome,
+    TestResult, Traced, Ub, UnitStarted, Verb, Worked,
     build::{Builder, JobId, Opened, Work},
 };
 use blaze_cas::{Placed, Store};
@@ -55,7 +57,7 @@ use super::{
     heads::Heads,
     mounts::Mounts,
     plane::{self, Did, Happened, Node, Plane, Task, kinds},
-    work::{Compiled, Failed, Front, Goal, JobInput, Runs, Source, Steps},
+    work::{Compiled, Failed, Front, Goal, JobInput, Runs, Selection, Source, Steps},
 };
 
 /// How many tags one run of user code uses ([`Runs`]).
@@ -70,6 +72,9 @@ pub enum Value {
     Lowered(Result<Arc<dyn Front>, ApiError>),
     Compiled(usize, Result<Compiled, ApiError>),
     Answer(Result<Response, ApiError>),
+    /// `blaze test --ub`: the tests selected, and one's result.
+    Selected(Result<Vec<String>, ApiError>),
+    Evaluated(Result<TestResult, ApiError>),
 }
 
 /// What jobs tell the session, in order.
@@ -84,7 +89,7 @@ pub struct World<'a> {
     pub now: Duration,
     pub vfs: &'a mut Vfs,
     pub db: &'a Arc<Database>,
-    pub store: &'a Arc<RwLock<Store>>,
+    pub store: &'a mut Store,
     pub plane: &'a mut Plane<Value>,
     pub mounts: &'a mut Mounts,
     pub heads: &'a Heads,
@@ -180,6 +185,7 @@ fn command_of(work: &Work) -> Command {
 fn goal_of(work: &Work) -> Goal {
     match work {
         Work::Build(_) | Work::CodegenInputs(_) => Goal::Build,
+        Work::Test { ub: Some(_), .. } => Goal::Check,
         Work::Test { .. } => Goal::Test,
         Work::Run { .. } => Goal::Run,
         Work::Reach { .. } => Goal::Reach,
@@ -306,6 +312,16 @@ struct Build {
     /// The build scripts that run: their first tag, and the run.
     scripts: FxHashMap<NodeId, (u64, Box<dyn Runs>)>,
     artifacts: Vec<Artifact>,
+    /// `blaze test --ub`'s tests, run in the evaluator once every unit is checked.
+    evaluation: Option<Evaluation>,
+}
+
+struct Evaluation {
+    ub: Ub,
+    /// The node that selects the tests, once every unit is checked.
+    select: NodeId,
+    /// A test failed.
+    failed: bool,
 }
 
 impl Build {
@@ -595,6 +611,26 @@ impl Jobs {
                 self.fetch_failed.insert(fetches[at as usize].at.clone(), error);
             }
             Value::Compiled(unit, result) => self.compiled(w, node, unit, result),
+            Value::Evaluated(result) => {
+                let Some(id) = self.job_of(node) else { return };
+                let Some(job) = self.jobs.get_mut(&id) else { return };
+                match result {
+                    Ok(result) => {
+                        if result.outcome == TestOutcome::Failed
+                            && let Stage::Units(build) = &mut job.stage
+                            && let Some(evaluation) = &mut build.evaluation
+                        {
+                            evaluation.failed = true;
+                        }
+                        w.said.push(Said::Report(id, Response::TestResult(result)));
+                    }
+                    Err(error) => {
+                        if !job.cancelled.load(Ordering::Acquire) {
+                            job.over.get_or_insert((false, Some(error)));
+                        }
+                    }
+                }
+            }
             value => {
                 if let Some(job) = self.job_of(node).and_then(|id| self.jobs.get_mut(&id)) {
                     job.values.insert(node, value);
@@ -677,6 +713,15 @@ impl Jobs {
                 Some(Value::Answer(Err(error))) => self.end(w, id, false, Some(error)),
                 _ => self.end(w, id, false, Some(ApiError::new(why, None))),
             },
+            Stage::Units(build) if build.evaluation.as_ref().is_some_and(|it| it.select == node) => {
+                let value = job.values.remove(&node);
+                job.stage = Stage::Units(build);
+                match value {
+                    Some(Value::Selected(Ok(tests))) => self.evaluate(w, id, tests),
+                    Some(Value::Selected(Err(error))) => self.end(w, id, false, Some(error)),
+                    _ => self.end(w, id, false, Some(ApiError::new(format!("selecting the tests: {why}"), None))),
+                }
+            }
             stage => job.stage = stage,
         }
     }
@@ -768,7 +813,7 @@ impl Jobs {
                     files: w.vfs.reader(),
                     config: prep.config,
                     units: Arc::new(units),
-                    store: w.store.clone(),
+                    store: w.store.reader(),
                     color: self.setup.color,
                     goal: goal_of(&job.work),
                     cancelled: job.cancelled.clone(),
@@ -860,7 +905,7 @@ impl Jobs {
             });
         }
         let work: plane::Work<Value> = {
-            let front = front.clone();
+            let (front, cancelled) = (front.clone(), cancelled.clone());
             Arc::new(move |arg| {
                 let at = arg as usize;
                 match front.compile(at) {
@@ -888,6 +933,22 @@ impl Jobs {
             units.graph.units.iter().map(|unit| packages.get(unit.pkg_id.as_str()).copied().unwrap_or(u32::MAX)).collect()
         };
         let reported = vec![0; units.packages.len().div_ceil(64)];
+        let select = match &job.work {
+            Work::Test { filter, args, all, ub: Some(ub), .. } => {
+                let node = w.plane.reserve(1);
+                let (front, filter, args, all, ub) = (front.clone(), filter.clone(), args.clone(), *all, *ub);
+                let selection = move |_| front.ub_tests(Selection { filter: &filter, args: &args, all, ub: Some(ub) });
+                let work = task(&cancelled, selection, |_, it| Value::Selected(it));
+                let deps = (0..count).map(|at| NodeId(first.0 + at)).collect();
+                let spec = spec(node, NodeKind::Bodies, "the tests to evaluate".into(), deps, Pool::Work, None);
+                Some((Evaluation { ub, select: node, failed: false }, Node { spec, task: one(kinds::UB_TESTS) }, work))
+            }
+            _ => None,
+        };
+        let (evaluation, select) = match select {
+            Some((evaluation, node, work)) => (Some(evaluation), Some((node, work))),
+            None => (None, None),
+        };
         job.stage = Stage::Units(Box::new(Build {
             input,
             front,
@@ -896,7 +957,35 @@ impl Jobs {
             reported,
             scripts: FxHashMap::default(),
             artifacts: Vec::new(),
+            evaluation,
         }));
+        self.add(w, id, first, nodes, Some(work));
+        match select {
+            Some((node, work)) => {
+                let first = node.spec.id;
+                self.add(w, id, first, vec![node], Some(work));
+            }
+            None => self.close(w, id),
+        }
+    }
+
+    /// `blaze test --ub`'s tests selected: each one evaluated on a worker, its result reported
+    /// as it ends.
+    fn evaluate(&mut self, w: &mut World<'_>, id: JobId, tests: Vec<String>) {
+        let job = self.jobs.get_mut(&id).expect("a job evaluating");
+        let Stage::Units(build) = &job.stage else { return };
+        let Some(evaluation) = &build.evaluation else { return };
+        let count = u32::try_from(tests.len()).expect("under 2^32 tests");
+        let first = w.plane.reserve(count);
+        let nodes = (0..count)
+            .zip(&tests)
+            .map(|(at, test)| {
+                let spec = spec(NodeId(first.0 + at), NodeKind::Bodies, named("test ", test), Vec::new(), Pool::Work, None);
+                Node { spec, task: Task::Thread { kind: kinds::EVALUATE, arg: at } }
+            })
+            .collect();
+        let (front, tests, ub): (_, Arc<[String]>, _) = (build.front.clone(), tests.into(), evaluation.ub);
+        let work = task(&job.cancelled, move |at| front.evaluate(&tests[at as usize], ub), |_, it| Value::Evaluated(it));
         self.add(w, id, first, nodes, Some(work));
         self.close(w, id);
     }
@@ -992,7 +1081,7 @@ impl Jobs {
             }
         };
         let mut out = Vec::new();
-        let ended = runs.start(&w.store.read().expect("the store's lock"), w.effects, &mut out);
+        let ended = runs.start(w.store, w.effects, &mut out);
         for response in out {
             w.said.push(Said::Report(id, response));
         }
@@ -1020,10 +1109,9 @@ impl Jobs {
         for diagnostic in compiled.diagnostics {
             w.said.push(Said::Report(id, Response::Diagnostic(diagnostic)));
         }
-        let mut store = w.store.write().expect("the store's lock");
         for put in compiled.puts {
             let key = put.key;
-            match store.put(put.key, put.kind, put.bytes) {
+            match w.store.put(put.key, put.kind, put.bytes) {
                 Ok(ticket) => self.put = Some(ticket),
                 Err(mismatch) => {
                     let error = ApiError::new(format!("the store holds other bytes under {key:?}: {mismatch:?}"), None);
@@ -1037,7 +1125,7 @@ impl Jobs {
                 job.over.get_or_insert((false, Some(error)));
                 continue;
             };
-            match store.place(&output.key, file, w.effects) {
+            match w.store.place(&output.key, file, w.effects) {
                 Some(tag) => {
                     self.placing.insert(tag, (id, output.executable));
                     job.placing += 1;
@@ -1098,13 +1186,12 @@ impl Jobs {
             return;
         };
         let mut out = Vec::new();
-        let mut store = w.store.write().expect("the store's lock");
         let ended = match (node, &mut job.stage) {
             (Some(node), Stage::Units(build)) => match build.scripts.get_mut(&node) {
-                Some((_, runs)) => runs.complete(completion, &mut store, w.effects, &mut out),
+                Some((_, runs)) => runs.complete(completion, w.store, w.effects, &mut out),
                 None => None,
             },
-            (None, Stage::Runs(_, runs)) => runs.complete(completion, &mut store, w.effects, &mut out),
+            (None, Stage::Runs(_, runs)) => runs.complete(completion, w.store, w.effects, &mut out),
             _ => None,
         };
         drop(store);
@@ -1150,11 +1237,12 @@ impl Jobs {
             return;
         }
         let ok = ok && job.over.is_none();
-        let runs = ok && matches!(job.work, Work::Test { .. } | Work::Run { .. });
+        let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
         let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { unreachable!("checked above") };
-        let Build { input, front, artifacts, .. } = *build;
+        let Build { input, front, artifacts, evaluation, .. } = *build;
         let profile = input.units.finished.clone();
         if !runs {
+            let ok = ok && evaluation.is_none_or(|it| !it.failed);
             w.said.push(Said::Report(id, Response::Built { artifacts, profile }));
             self.worked(w, id);
             self.end(w, id, ok, None);
@@ -1162,7 +1250,9 @@ impl Jobs {
         }
         let tags = self.run_tags(id, None);
         let started = match &self.jobs[&id].work {
-            Work::Test { filter, all, .. } => front.tests(&artifacts, filter, *all, tags),
+            Work::Test { filter, all, args, ub, .. } => {
+                front.tests(&artifacts, Selection { filter, args, all: *all, ub: *ub }, tags)
+            }
             Work::Run { bin, args, .. } => front.run(&artifacts, bin.as_deref(), args, tags),
             _ => unreachable!("checked above"),
         };
@@ -1177,7 +1267,7 @@ impl Jobs {
             }
         };
         let mut out = Vec::new();
-        let ended = runs.start(&w.store.read().expect("the store's lock"), w.effects, &mut out);
+        let ended = runs.start(w.store, w.effects, &mut out);
         for response in out {
             w.said.push(Said::Report(id, response));
         }
@@ -1283,7 +1373,7 @@ impl Jobs {
         for (id, job) in &mut self.jobs {
             if let Stage::Snapshot { ticket: None, heads, store } = &mut job.stage
                 && w.db.settled()
-                && store.is_none_or(|it| w.store.read().expect("the store's lock").durable(it))
+                && store.is_none_or(|it| w.store.durable(it))
             {
                 let heads = std::mem::take(heads);
                 w.said.push(Said::Report(*id, Response::Snapshotted { heads }));
@@ -1324,7 +1414,7 @@ impl Jobs {
     /// stands, reported once all of it is durable.
     fn snapshot(&mut self, w: &mut World<'_>) -> Stage {
         w.db.write_image(w.effects);
-        w.store.write().expect("the store's lock").flush(w.effects);
+        w.store.flush(w.effects);
         let heads: Vec<(String, ContentId)> = w.vfs.heads().into_iter().map(|(head, root)| (head.to_owned(), root)).collect();
         let ticket = heads.first().and_then(|(head, root)| w.vfs.set_head(head, *root).ok());
         w.vfs.flush(w.effects);
@@ -1448,12 +1538,22 @@ mod tests {
             files: Vec::new(),
             color: false,
         });
-        let work = Work::Test { targets: targets.clone(), filter: Vec::new(), all: false };
+        let work = Work::Test { targets: targets.clone(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
         let made = invocation(&work, Some(&targets), "/elsewhere", &[]);
         assert_eq!(made.command, Command::Test);
         assert_eq!(made.args, vec!["--workspace".to_owned()]);
         assert_eq!(made.cwd, "/w/a");
         assert_eq!(made.env, vec![("RUSTFLAGS".to_owned(), "-Dwarnings".to_owned())]);
+    }
+
+    #[test]
+    fn tests_under_the_evaluator_check_the_units_and_build_none() {
+        let ub = Some(blaze_api::Ub { seed: Some(7), schedules: None });
+        let work = Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub };
+        assert_eq!(command_of(&work), Command::Test);
+        assert_eq!(goal_of(&work), Goal::Check);
+        let compiled = Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub: None };
+        assert_eq!(goal_of(&compiled), Goal::Test);
     }
 
     #[test]

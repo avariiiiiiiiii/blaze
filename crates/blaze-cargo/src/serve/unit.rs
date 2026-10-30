@@ -10,13 +10,16 @@
 //! - [`codegen`]: a unit's codegen policy and roots, and its link.
 //! - [`artifact`]: cargo's `compiler-artifact` of a unit.
 //! - [`script`]: a build script's run and what its directives do, as cargo applies them.
-//! - [`test`]: the tests of a build, on one queue, the reached ones only.
+//! - [`test`]: the tests of a build, on one queue, the reached ones only; with `--ub`, each
+//!   run in blaze's MIR evaluator under the checker of undefined behavior, nothing compiled.
 //! - [`run`]: the program `cargo run` picks, run in the tests' sandbox.
 //! - [`reach`]: what a change reaches, from the database's facts.
 //! - [`say`]: cargo's own lines (`error: ...`, `warning: ...`) as diagnostics.
 //!
 //! Nothing here runs rustc or cargo, and nothing user code runs is outside the sandbox but
 //! what `BLAZE_SANDBOX=off` and the manifest's opt-outs take out (docs/cargo.md).
+
+#![forbid(unsafe_code)]
 
 mod artifact;
 mod codegen;
@@ -39,7 +42,8 @@ use std::{
     time::Instant,
 };
 
-use blaze_api::{ApiError, Artifact, Reach, UnitOf, UnitTarget};
+use blaze_api::{ApiError, Artifact, Reach, Table, TestResult, Ub, UnitOf, UnitTarget};
+use blaze_ids::ContentId;
 use blaze_units::{
     query::{Fetch, Units},
     schema::{Mode, Unit},
@@ -49,7 +53,7 @@ use load_cargo::v2::{Lower, Lowered};
 use crate::serve::{
     Paths,
     fetch::Fetcher,
-    work::{Compiled, Failed, Front, Goal, JobInput, Runs, Source, SourceFile, Steps},
+    work::{Compiled, Failed, Front, Goal, JobInput, Runs, Selection, Source, SourceFile, Steps},
 };
 
 /// The build `blaze serve` runs: one for the daemon's life, shared by every job.
@@ -123,21 +127,13 @@ impl Steps for Real {
     }
 
     fn library(&self) -> Result<(String, Source), ApiError> {
-        let library = blaze_units::stdlib::library(&self.shared.launcher)
-            .map_err(|what| ApiError::new(what, Some("the standard library's sources".to_owned())))?;
-        let files = library
-            .files
-            .into_iter()
-            .map(|it| SourceFile {
-                path: it.path,
-                bytes: it.bytes,
-                mode: match it.executable {
-                    true => blaze_vfs::Mode::Executable,
-                    false => blaze_vfs::Mode::Regular,
-                },
-            })
-            .collect();
-        Ok((library.at, Source { files, under: String::new() }))
+        let at = || Some("the standard library's sources".to_owned());
+        let library = crate::cargo::toolchain::library::fetch().map_err(|what| ApiError::new(what, at()))?;
+        let mut files = Vec::new();
+        library_files(&library.dir, "", &mut files)
+            .map_err(|what| ApiError::new(what, Some(library.dir.display().to_string())))?;
+        files.sort_unstable_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        Ok((blaze_units::stdlib::library_at(&library.commit), Source { files, under: String::new() }))
     }
 
     fn lower(&self, job: &JobInput) -> Result<Arc<dyn Front>, Failed> {
@@ -156,6 +152,32 @@ impl Steps for Real {
         .map_err(|error| Failed::Error(ApiError::new(error.what, error.at)))?;
         Ok(Arc::new(JobFront(Arc::new(Job::new(job.clone(), lowered, self.shared.clone())))))
     }
+}
+
+/// Every file under the library's `dir`, by its path from there. A link is its target's bytes:
+/// the library's digest (`library::digest_of`) was checked when it was found or fetched.
+fn library_files(dir: &std::path::Path, prefix: &str, into: &mut Vec<SourceFile>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
+        let full = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| format!("{}: a name that is not UTF-8", full.display()))?;
+        let path = if prefix.is_empty() { name.to_owned() } else { format!("{prefix}/{name}") };
+        let meta = std::fs::metadata(&full).map_err(|error| format!("{}: {error}", full.display()))?;
+        if meta.is_dir() {
+            library_files(&full, &path, into)?;
+            continue;
+        }
+        let bytes = std::fs::read(&full).map_err(|error| format!("{}: {error}", full.display()))?;
+        #[cfg(unix)]
+        let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
+        #[cfg(not(unix))]
+        let executable = false;
+        let mode = if executable { blaze_vfs::Mode::Executable } else { blaze_vfs::Mode::Regular };
+        into.push(SourceFile { path, bytes, mode });
+    }
+    Ok(())
 }
 
 /// `work` on a worker, the front end's or the build graph's cancel as [`Failed::Again`]: the
@@ -203,6 +225,8 @@ pub(crate) struct Job {
     pub(crate) starts: Box<[Mutex<Option<Box<script::Start>>>]>,
     /// The crates built for build scripts and proc macros, as the code generator takes them.
     pub(crate) build_time: OnceLock<hir_ty_codegen::v2::BuildTime>,
+    /// `blaze test --ub`'s tests, selected once on a worker, read by every evaluation.
+    pub(crate) ub: OnceLock<test::UbTests>,
     /// When the job's front was made: the clock the test queue is given.
     pub(crate) began: Instant,
 }
@@ -226,6 +250,7 @@ impl Job {
             inert: (0..slots).map(|_| OnceLock::new()).collect(),
             starts: (0..slots).map(|_| Mutex::new(None)).collect(),
             build_time: OnceLock::new(),
+            ub: OnceLock::new(),
             began: Instant::now(),
         }
     }
@@ -337,14 +362,19 @@ impl Front for JobFront {
         script::start(&self.0, unit, tags)
     }
 
-    fn tests(
-        &self,
-        built: &[Artifact],
-        filter: &[String],
-        all: bool,
-        tags: u64,
-    ) -> Result<Box<dyn Runs>, ApiError> {
-        test::start(&self.0, built, filter, all, tags)
+    fn tests(&self, built: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<Box<dyn Runs>, ApiError> {
+        test::start(&self.0, built, selection, tags)
+    }
+
+    fn ub_tests(&self, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
+        cancellable(|| test::ub_tests(&self.0, selection))?
+    }
+
+    fn evaluate(&self, test: &str, ub: Ub) -> Result<TestResult, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        cancellable(|| test::evaluate(&self.0, test, ub))?
     }
 
     fn run(
@@ -369,4 +399,36 @@ impl Front for JobFront {
         }
         cancellable(|| reach::reach(&from.0, &self.0, changes))?
     }
+
+    fn codegen_inputs(&self) -> Result<Vec<(ContentId, ContentId)>, Failed> {
+        cancellable(|| compile::codegen_inputs(&self.0))?
+    }
+
+    fn tables(&self) -> Result<Vec<Table>, Failed> {
+        cancellable(|| tables(&self.0))
+    }
+}
+
+/// The front end's tables (tokens, syntax nodes, HIR expressions, MIR statements, memos and
+/// their edges, each as its owner counts it) and the linker's over every image kept linked
+/// (relocations and the rest), summed by name and sorted by it. An image being relinked as
+/// this runs is out of the map for the link, and not counted.
+fn tables(job: &Job) -> Vec<Table> {
+    let mut counted = job.lowered.tables();
+    {
+        let images = job.shared.images.lock().unwrap_or_else(|it| it.into_inner());
+        counted.extend(images.values().flat_map(codegen::Linked::tables));
+    }
+    counted.sort_unstable_by_key(|it| it.0);
+    let mut tables: Vec<Table> = Vec::new();
+    for (name, elements, bytes) in counted {
+        match tables.last_mut() {
+            Some(table) if table.name == name => {
+                table.elements += elements;
+                table.bytes += bytes;
+            }
+            _ => tables.push(Table { name: name.to_owned(), elements, bytes }),
+        }
+    }
+    tables
 }

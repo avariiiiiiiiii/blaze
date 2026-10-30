@@ -29,7 +29,7 @@ use rustc_hash::FxHashMap;
 use syntax::{AstNode, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, T, TextRange, ast};
 
 use super::{
-    Args, Attr, AttrKind, Owner, Target, parsed,
+    Args, Attr, AttrKind, Owner, Target, lint_at, parsed,
     table::{self, Allowed, Builtin, Kind, OnDuplicate, Policy, Safety, Targets},
 };
 use crate::{
@@ -110,41 +110,112 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<
     let mut emitted = Vec::new();
     let mut found = Vec::new();
     for owner in owners {
+        let on_call = owner.target == Target::MacroCall;
         let mut seen = Seen::default();
-        for attr in &owner.attrs {
+        for (i, attr) in owner.attrs.iter().enumerate() {
             let AttrKind::Meta { .. } = &attr.kind else { continue };
             // A macro call's attributes are parsed one at a time, so none is a second one.
-            if owner.target == Target::MacroCall {
+            if on_call {
                 seen = Seen::default();
             }
             let path = attr.path();
             let segments: smallvec::SmallVec<[&str; 2]> = path.iter().map(String::as_str).collect();
-            let Some(builtin) = table::builtin(&segments) else {
-                if owner.target == Target::MacroCall
-                    && let [name] = segments.as_slice()
-                    && !matches!(*name, "cfg" | "cfg_attr")
-                    && table::is_builtin_attr_name(name)
-                {
-                    let mut diag = unused_builtin(cx, owner, attr, name);
-                    source_fact(cx, &mut diag, owner.at());
-                    emitted.push(parsed(diag, owner));
+            match table::builtin(&segments) {
+                Some(builtin) => {
+                    safety(cx, attr, builtin, &mut found);
+                    if parses(attr, builtin) {
+                        accept(cx, &krate, owner, attr, builtin, &mut seen, &mut found);
+                        match builtin.targets {
+                            Targets::ManuallyChecked if attr.is("repr") => {
+                                repr_targets(cx, &krate, owner, attr, &mut found)
+                            }
+                            Targets::ManuallyChecked => {}
+                            targets => check_target(cx, &krate, owner, attr, targets, "", &mut found),
+                        }
+                    }
                 }
-                continue;
-            };
-            safety(cx, attr, builtin, &mut found);
-            accept(cx, &krate, owner, attr, builtin, &mut seen, &mut found);
-            match builtin.targets {
-                Targets::ManuallyChecked if attr.is("repr") => repr_targets(cx, &krate, owner, attr, &mut found),
-                Targets::ManuallyChecked => {}
-                targets => check_target(cx, &krate, owner, attr, targets, "", &mut found),
+                None => {
+                    // `check_attributes` skips an attribute a doc string follows.
+                    if on_call
+                        && !owner.attrs.get(i + 1).is_some_and(is_doc_str)
+                        && let [name] = segments.as_slice()
+                        && !matches!(*name, "cfg" | "cfg_attr")
+                        && table::is_builtin_attr_name(name)
+                    {
+                        found.push(unused_builtin(cx, owner, attr, name));
+                    }
+                }
             }
             for mut diag in found.drain(..) {
-                source_fact(cx, &mut diag, owner.at());
+                source_fact(cx, &mut diag, lint_at(owner));
                 emitted.push(parsed(diag, owner));
             }
         }
     }
     emitted
+}
+
+/// Whether rustc's `ArgParser::from_attr_args` parses the attribute's arguments; when it does
+/// not, it gives an error (`diagnostics-items`') and the attribute is not parsed further. A
+/// `= value` must be an unsuffixed literal; a list must be in parentheses and of meta items, but
+/// for `diagnostic::` attributes and `rustc_dummy`, whose lists are always taken.
+fn parses(attr: &Attr, builtin: &Builtin) -> bool {
+    match attr.args() {
+        Args::Word => true,
+        Args::NameValue(value) => is_unsuffixed_literal(value.as_ref()),
+        Args::List(_) if matches!(builtin.path, ["diagnostic", ..] | ["rustc_dummy"]) => true,
+        Args::List(tt) => {
+            tt.left_delimiter_token().is_some_and(|it| it.kind() == T!['('])
+                && items(&tt).iter().all(|item| is_meta_item(item))
+        }
+    }
+}
+
+/// rustc's `expr_to_lit` accepting `value`: a literal without a suffix.
+fn is_unsuffixed_literal(value: Option<&ast::Expr>) -> bool {
+    let Some(ast::Expr::Literal(literal)) = value else { return false };
+    let token = literal.token();
+    let text = token.text();
+    match literal.kind() {
+        ast::LiteralKind::IntNumber(it) => it.suffix().is_none(),
+        ast::LiteralKind::FloatNumber(it) => it.suffix().is_none(),
+        ast::LiteralKind::String(_) | ast::LiteralKind::ByteString(_) | ast::LiteralKind::CString(_) => {
+            text.ends_with('"') || text.ends_with('#')
+        }
+        ast::LiteralKind::Char(_) | ast::LiteralKind::Byte(_) => text.ends_with('\''),
+        ast::LiteralKind::Bool(_) => true,
+    }
+}
+
+/// Whether rustc's meta item list parser takes `item`: a literal, or a path with nothing after
+/// it, a parenthesized list or `= value`.
+fn is_meta_item(item: &[SyntaxElement]) -> bool {
+    let is_path_token = |it: &SyntaxElement| {
+        matches!(it, NodeOrToken::Token(it) if matches!(it.kind(), SyntaxKind::IDENT | T![::] | T![self] | T![super] | T![crate] | T![Self]) || it.kind().is_keyword(span::Edition::CURRENT))
+    };
+    match item {
+        [] => false,
+        [NodeOrToken::Token(token)] if token.kind().is_literal() || matches!(token.kind(), T![true] | T![false]) => true,
+        _ => {
+            let path = item.iter().take_while(|it| is_path_token(it)).count();
+            if path == 0 {
+                return false;
+            }
+            match &item[path..] {
+                [] => true,
+                [NodeOrToken::Node(list)] => {
+                    ast::TokenTree::cast(list.clone()).and_then(|it| it.left_delimiter_token()).is_some_and(|it| it.kind() == T!['('])
+                }
+                [NodeOrToken::Token(eq), value @ ..] => eq.kind() == T![=] && !value.is_empty(),
+                _ => false,
+            }
+        }
+    }
+}
+
+/// rustc's `doc_str`: a doc comment or `#[doc = "..."]`.
+fn is_doc_str(attr: &Attr) -> bool {
+    attr.is_doc_comment() || attr.is("doc") && matches!(attr.args(), Args::NameValue(value) if string(value.as_ref()).is_some())
 }
 
 /// rustc's `check_attribute_safety`: an attribute that must be `unsafe(..)` and is not,

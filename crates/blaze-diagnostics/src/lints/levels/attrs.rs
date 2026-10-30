@@ -10,15 +10,16 @@
 //! its place), `compiler/rustc_hir/src/intravisit.rs` and `compiler/rustc_ast/src/visit.rs`
 //! (which nodes have lint attributes) (MIT or Apache-2.0).
 
-use std::ops::ControlFlow;
+use std::{borrow::Cow, ops::ControlFlow};
 
 use cfg::CfgOptions;
 use hir::{InFile, Semantics, db::HirDatabase};
 use hir_expand::MacroCallKind;
+use smallvec::SmallVec;
 use span::Edition;
 use syntax::{
     AstNode, AstToken, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxNodePtr,
-    TextRange, ast,
+    SyntaxToken, TextRange, ast,
 };
 
 use crate::{
@@ -32,8 +33,14 @@ pub(super) enum Read {
     /// (`missing_docs`): a lint allowed with no attribute naming it.
     Allows(&'static str),
     /// `#[allow(..)]`, `#[expect(..)]`, `#[warn(..)]`, `#[deny(..)]`, `#[forbid(..)]`.
-    Level(Level, Vec<Item>),
+    Level(Level, Items),
 }
+
+/// The elements of a list, inline for the usual few.
+pub(super) type Items = SmallVec<[Item; 4]>;
+
+/// A path's segments, inline for a lint's (one) and a tool's lint's (two).
+pub(super) type Path = SmallVec<[Segment; 2]>;
 
 /// An element of a lint attribute's list: rustc's `MetaItemInner`.
 pub(super) struct Item {
@@ -43,11 +50,11 @@ pub(super) struct Item {
 
 pub(super) enum ItemKind {
     /// A path: a lint, a group or a tool's lint.
-    Word(Vec<Segment>),
+    Word(Path),
     /// `path = literal`: the literal's value when it is a string, and where the literal is.
-    NameValue { path: Vec<Segment>, string: Option<String>, value: TextRange },
+    NameValue { path: Path, string: Option<String>, value: TextRange },
     /// `path(..)`.
-    List(Vec<Segment>),
+    List(Path),
     /// A literal alone.
     Lit,
 }
@@ -59,21 +66,40 @@ impl ItemKind {
     }
 }
 
-/// A segment of a path, as rustc's `Ident` has it.
+/// A segment of a path, as rustc's `Ident` has it: its token, whose text is read in place, or
+/// none for rustc's `{{root}}` of a leading `::`.
 #[derive(Clone)]
 pub(super) struct Segment {
-    pub(super) name: String,
+    token: Option<SyntaxToken>,
     pub(super) range: TextRange,
+}
+
+impl Segment {
+    pub(super) fn name(&self) -> &str {
+        self.token.as_ref().map_or("{{root}}", |it| it.text())
+    }
 }
 
 /// Whether `path` is the one segment `name`.
 fn is_word(path: &[Segment], name: &str) -> bool {
-    matches!(path, [only] if only.name == name)
+    matches!(path, [only] if only.name() == name)
 }
 
-/// `path` as rustc's `pprust::path_to_string` writes it.
-pub(super) fn path_string(path: &[Segment]) -> String {
-    path.iter().map(|it| it.name.as_str()).collect::<Vec<_>>().join("::")
+/// `path` as rustc's `pprust::path_to_string` writes it: the segment's own text for one.
+pub(super) fn path_string(path: &[Segment]) -> Cow<'_, str> {
+    match path {
+        [only] => Cow::Borrowed(only.name()),
+        _ => {
+            let mut out = String::with_capacity(path.iter().map(|it| it.name().len() + 2).sum());
+            for (at, segment) in path.iter().enumerate() {
+                if at > 0 {
+                    out.push_str("::");
+                }
+                out.push_str(segment.name());
+            }
+            Cow::Owned(out)
+        }
+    }
 }
 
 /// The node whose attributes set lint levels for what is in it, if `node` is one. Not a macro
@@ -83,53 +109,78 @@ pub(super) fn path_string(path: &[Segment]) -> String {
 /// the HIR.
 pub(super) fn owner(node: &SyntaxNode, generics: bool) -> Option<ast::AnyHasAttrs> {
     use SyntaxKind::*;
-    match node.kind() {
-        MACRO_CALL | MACRO_EXPR | MACRO_PAT | MACRO_TYPE | MACRO_STMTS | MACRO_ITEMS => return None,
-        TYPE_PARAM | CONST_PARAM | LIFETIME_PARAM if !generics => return None,
-        _ => {}
+    let kind = node.kind();
+    if !may_be_owner(kind, generics) {
+        return None;
     }
     let owner = ast::AnyHasAttrs::cast(node.clone())?;
-    let inner_of_outer = node.ancestors().skip(1).take(2).any(|it| {
-        ast::AnyHasAttrs::cast(it)
-            .is_some_and(|it| ast::HasAttrs::inner_attributes_node(&it).is_some_and(|inner| &inner == node))
-    });
+    let inner_of_outer = matches!(kind, STMT_LIST | ITEM_LIST | ASSOC_ITEM_LIST | MATCH_ARM_LIST | EXTERN_ITEM_LIST)
+        && node.ancestors().skip(1).take(2).any(|it| {
+            ast::AnyHasAttrs::cast(it)
+                .is_some_and(|it| ast::HasAttrs::inner_attributes_node(&it).is_some_and(|inner| &inner == node))
+        });
     (!inner_of_outer).then_some(owner)
+}
+
+/// Whether a node of `kind` may be an [`owner`], by its kind alone.
+fn may_be_owner(kind: SyntaxKind, generics: bool) -> bool {
+    use SyntaxKind::*;
+    match kind {
+        MACRO_CALL | MACRO_EXPR | MACRO_PAT | MACRO_TYPE | MACRO_STMTS | MACRO_ITEMS => false,
+        TYPE_PARAM | CONST_PARAM | LIFETIME_PARAM => generics,
+        _ => ast::AnyHasAttrs::can_cast(kind),
+    }
+}
+
+/// Whether `node` is an [`owner`] with an attribute: for most nodes of a crate, a check of
+/// the kind and nothing else.
+pub(super) fn may_own(node: &SyntaxNode, generics: bool) -> bool {
+    may_be_owner(node.kind(), generics) && owner(node, generics).is_some_and(|it| attrs_of(&it).next().is_some())
+}
+
+/// The attributes of `owner`, outer then inner: a block's list has its own, inner ones only.
+fn attrs_of(owner: &ast::AnyHasAttrs) -> impl Iterator<Item = ast::Attr> {
+    let (own, with_inner) = match owner.syntax().kind() == SyntaxKind::STMT_LIST {
+        true => (Some(ast::HasAttrs::attrs(owner)), None),
+        false => (None, Some(ast::attrs_including_inner(owner))),
+    };
+    own.into_iter().flatten().chain(with_inner.into_iter().flatten())
 }
 
 /// The lint attributes of `owner`, `cfg_attr` expanded against `cfg`, outer then inner, in
 /// order.
 pub(super) fn read(owner: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition) -> Vec<Read> {
     let mut found = Vec::new();
-    let mut each = |meta: ast::Meta, _: ast::Attr| {
+    hir_expand::attrs::expand_cfg_attr(attrs_of(owner), || cfg, |meta, _| {
         if let Some(read) = read_meta(&meta, edition) {
             found.push(read);
         }
         ControlFlow::<()>::Continue(())
-    };
-    if owner.syntax().kind() == SyntaxKind::STMT_LIST {
-        hir_expand::attrs::expand_cfg_attr(ast::HasAttrs::attrs(owner), || cfg, &mut each);
-    } else {
-        hir_expand::attrs::expand_cfg_attr(ast::attrs_including_inner(owner), || cfg, &mut each);
-    }
+    });
     found
 }
 
 fn read_meta(meta: &ast::Meta, edition: Edition) -> Option<Read> {
-    let name = |path: Option<ast::Path>| {
-        path.and_then(|it| it.as_single_name_ref()).map(|it| it.text().to_string())
-    };
+    let name = |path: Option<ast::Path>| path.and_then(|it| it.as_single_name_ref());
     match meta {
-        ast::Meta::PathMeta(it) if name(it.path()).as_deref() == Some("automatically_derived") => {
+        ast::Meta::PathMeta(it) if name(it.path()).is_some_and(|it| it.text() == "automatically_derived") => {
             Some(Read::Allows("single_use_lifetimes"))
         }
         ast::Meta::TokenTreeMeta(it) => {
             let name = name(it.path())?;
-            let items = list(&it.token_tree()?, edition);
-            if name == "doc" {
-                let hidden = items?.iter().any(|it| matches!(&it.kind, ItemKind::Word(path) if is_word(path, "hidden")));
-                return hidden.then_some(Read::Allows("missing_docs"));
+            let name = name.text();
+            let level = match name {
+                "doc" => None,
+                _ => Some(Level::of_attr(name)?),
+            };
+            let items = list(&it.token_tree()?, edition)?;
+            match level {
+                Some(level) => Some(Read::Level(level, items)),
+                None => {
+                    let hidden = items.iter().any(|it| matches!(&it.kind, ItemKind::Word(path) if is_word(path, "hidden")));
+                    hidden.then_some(Read::Allows("missing_docs"))
+                }
             }
-            Some(Read::Level(Level::of_attr(&name)?, items?))
         }
         _ => None,
     }
@@ -137,15 +188,15 @@ fn read_meta(meta: &ast::Meta, edition: Edition) -> Option<Read> {
 
 /// A parenthesized list read as rustc's `MetaItemKind::list_from_tokens` reads it: `None`
 /// when it is not one, and rustc's lint levels pass the attribute by.
-pub(super) fn list(tt: &ast::TokenTree, edition: Edition) -> Option<Vec<Item>> {
-    let children: Vec<SyntaxElement> =
+pub(super) fn list(tt: &ast::TokenTree, edition: Edition) -> Option<Items> {
+    let children: SmallVec<[SyntaxElement; 16]> =
         tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
     let (first, last) = (children.first()?, children.last()?);
     if first.kind() != SyntaxKind::L_PAREN || last.kind() != SyntaxKind::R_PAREN || children.len() < 2 {
         return None;
     }
     let inner = &children[1..children.len() - 1];
-    let mut items = Vec::new();
+    let mut items = Items::new();
     let mut rest = inner;
     while !rest.is_empty() {
         let end = rest.iter().position(|it| it.kind() == SyntaxKind::COMMA).unwrap_or(rest.len());
@@ -188,11 +239,11 @@ fn item(elements: &[SyntaxElement], edition: Edition) -> Option<Item> {
 
 /// The path `elements` start with and what follows it. A path that starts with `::` has
 /// rustc's `{{root}}` for its first segment, at the `::`.
-fn path(elements: &[SyntaxElement], edition: Edition) -> Option<(Vec<Segment>, &[SyntaxElement])> {
-    let mut segments = Vec::new();
+fn path(elements: &[SyntaxElement], edition: Edition) -> Option<(Path, &[SyntaxElement])> {
+    let mut segments = Path::new();
     let mut rest = elements;
     if let Some((range, after)) = colons(rest) {
-        segments.push(Segment { name: "{{root}}".to_owned(), range });
+        segments.push(Segment { token: None, range });
         rest = after;
     }
     loop {
@@ -200,7 +251,7 @@ fn path(elements: &[SyntaxElement], edition: Edition) -> Option<(Vec<Segment>, &
         if !is_segment(token.kind(), edition) {
             return None;
         }
-        segments.push(Segment { name: token.text().to_owned(), range: token.text_range() });
+        segments.push(Segment { token: Some(token.clone()), range: token.text_range() });
         rest = after;
         match colons(rest) {
             Some((_, after)) => rest = after,
@@ -247,7 +298,7 @@ pub(super) fn registered_tools(root: &ast::AnyHasAttrs, cfg: &CfgOptions, editio
                 if let ItemKind::Word(path) = item.kind
                     && let [tool] = &path[..]
                 {
-                    tools.push(tool.name.clone());
+                    tools.push(tool.name().to_owned());
                 }
             }
         }

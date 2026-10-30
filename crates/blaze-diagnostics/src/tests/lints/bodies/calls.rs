@@ -49,7 +49,7 @@ fn compiletest(test: Test, flags: &[&str]) -> Options {
     args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
     args.extend(flags.iter().flat_map(|flag| split_flag(flag)));
     let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap() }
+    Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() }
 }
 
 /// `-D path-statements` as the two arguments rustc reads it as.

@@ -11,7 +11,7 @@
 use std::mem::offset_of;
 
 use blaze_format::{
-    ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema,
+    ALIGN, Aligned, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema,
     schema_of,
 };
 use hir_def::{
@@ -50,9 +50,9 @@ use crate::{
             ModeColumn, Range, SortedMap, TyColumn,
         },
     },
-    lower::diagnostics::{
-        GenericArgsProhibitedReason, IncorrectGenericsLenKind, PathGenericsSource,
-        PathLoweringDiagnostic, TyLoweringDiagnostic,
+    lower::{
+        diagnostics::IncorrectGenericsLenKind,
+        persist::{Words, put_diagnostic, put_path_diagnostic},
     },
     method_resolution::CandidateId,
     next_solver::{
@@ -217,13 +217,25 @@ pub struct InferenceRecordRef<'a> {
     error_ty: u32,
     flags: u32,
     diagnostics: u32,
-    table: &'a [u8],
+    table: &'a [u128],
     table_root: u64,
 }
 
-fn bytes_of(words: &[u128]) -> &[u8] {
-    // SAFETY: a `u128` is 16 initialized bytes without padding, and a `u8` has no alignment.
-    unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) }
+/// The type table's buffer as words, little-endian, to be placed with the columns at `u128`
+/// alignment.
+fn table_words(bytes: &[u8]) -> Vec<u128> {
+    assert!(bytes.len().is_multiple_of(ALIGN), "a finished buffer is padded to whole words");
+    bytes
+        .chunks_exact(size_of::<u128>())
+        .map(|chunk| u128::from_le_bytes(chunk.try_into().expect("a chunk of 16 bytes")))
+        .collect()
+}
+
+/// The type table's buffer as the reader takes it, from [`table_words`]'s words. A copy, not
+/// a view: the table is small next to the types it interns again.
+fn table_bytes(words: &[u128]) -> Aligned {
+    let bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    Aligned::copy_from(&bytes)
 }
 
 fn salsa_id(bits: u64) -> Option<salsa::Id> {
@@ -492,10 +504,7 @@ impl<'db> InferenceResult<'db> {
         let mut out = Writer::new(TY_TABLE_SCHEMA);
         record.table_root = tys.table.write(&mut out);
         let bytes = out.finish(record.table_root);
-        record.table = bytes
-            .chunks_exact(size_of::<u128>())
-            .map(|chunk| u128::from_le_bytes(chunk.try_into().expect("a chunk of 16 bytes")))
-            .collect();
+        record.table = table_words(&bytes);
         record
     }
 }
@@ -724,7 +733,7 @@ impl InferenceRecord {
             error_ty: self.error_ty,
             flags: self.flags,
             diagnostics: self.diagnostics,
-            table: bytes_of(&self.table),
+            table: &self.table,
             table_root: self.table_root,
         }
     }
@@ -805,7 +814,7 @@ impl Persist for InferenceRecord {
             error_ty: root.error_ty,
             flags: root.flags,
             diagnostics: root.diagnostics,
-            table: bytes_of(root.table.follow(buffer)?),
+            table: root.table.follow(buffer)?,
             table_root: root.table_root,
         };
         record.check()?;
@@ -933,7 +942,8 @@ impl<'a> InferenceRecordRef<'a> {
 
     /// The result again, its types read from the record's type table.
     pub fn to_result<'db>(&self, interner: DbInterner<'db>) -> Result<InferenceResult<'db>, FormatError> {
-        let table = TyTableReader::open(interner, self.table, self.table_root)?;
+        let bytes = table_bytes(self.table);
+        let table = TyTableReader::open(interner, &bytes, self.table_root)?;
         self.decode(&TableDecode { interner, table, at: self.at })
     }
 
@@ -1213,15 +1223,6 @@ impl Sink {
         self.word(local);
     }
 
-    fn generics_source(&mut self, source: PathGenericsSource) {
-        match source {
-            PathGenericsSource::Segment(segment) => self.words.extend([0, segment]),
-            PathGenericsSource::AssocType { segment, assoc_type } => {
-                self.words.extend([1, segment, assoc_type])
-            }
-        }
-    }
-
     fn generics_len_kind(&mut self, kind: IncorrectGenericsLenKind) {
         self.word(match kind {
             IncorrectGenericsLenKind::Lifetimes => 0,
@@ -1257,89 +1258,13 @@ impl Sink {
         });
     }
 
-    fn lowering_diagnostic(&mut self, diagnostic: &TyLoweringDiagnostic) {
-        match diagnostic {
-            TyLoweringDiagnostic::PathDiagnostic { source, diag } => {
-                self.word(0);
-                self.local(*source);
-                self.path_diagnostic(diag);
-            }
-            TyLoweringDiagnostic::InferVarsNotAllowed { source } => {
-                self.word(1);
-                self.span(*source);
-            }
-        }
-    }
-
-    fn path_diagnostic(&mut self, diagnostic: &PathLoweringDiagnostic) {
-        match *diagnostic {
-            PathLoweringDiagnostic::GenericArgsProhibited { segment, reason } => {
-                let reason = match reason {
-                    GenericArgsProhibitedReason::Module => 0,
-                    GenericArgsProhibitedReason::TyParam => 1,
-                    GenericArgsProhibitedReason::SelfTy => 2,
-                    GenericArgsProhibitedReason::PrimitiveTy => 3,
-                    GenericArgsProhibitedReason::Const => 4,
-                    GenericArgsProhibitedReason::Static => 5,
-                    GenericArgsProhibitedReason::LocalVariable => 6,
-                    GenericArgsProhibitedReason::EnumVariant => 7,
-                };
-                self.words.extend([0, segment, reason]);
-            }
-            PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait { segment } => {
-                self.words.extend([1, segment]);
-            }
-            PathLoweringDiagnostic::IncorrectGenericsLen {
-                generics_source,
-                provided_count,
-                expected_count,
-                kind,
-                def,
-            } => {
-                self.word(2);
-                self.generics_source(generics_source);
-                self.words.extend([provided_count, expected_count]);
-                self.generics_len_kind(kind);
-                self.generic_def(def);
-            }
-            PathLoweringDiagnostic::IncorrectGenericsOrder {
-                generics_source,
-                param_id,
-                arg_idx,
-                has_self_arg,
-            } => {
-                self.word(3);
-                self.generics_source(generics_source);
-                self.generic_param(param_id);
-                self.words.extend([arg_idx, u32::from(has_self_arg)]);
-            }
-            PathLoweringDiagnostic::ElidedLifetimesInPath {
-                generics_source,
-                def,
-                expected_count,
-                hard_error,
-            } => {
-                self.word(4);
-                self.generics_source(generics_source);
-                self.generic_def(def);
-                self.words.extend([expected_count, u32::from(hard_error)]);
-            }
-            PathLoweringDiagnostic::ElisionFailure { generics_source, def, expected_count } => {
-                self.word(5);
-                self.generics_source(generics_source);
-                self.generic_def(def);
-                self.word(expected_count);
-            }
-            PathLoweringDiagnostic::MissingLifetime { generics_source, def, expected_count } => {
-                self.word(6);
-                self.generics_source(generics_source);
-                self.generic_def(def);
-                self.word(expected_count);
-            }
-            PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment } => {
-                self.words.extend([7, segment])
-            }
-        }
+    /// A lowering diagnostic in `lower::persist`'s words, after their count, so that
+    /// [`Source::lowering_words`] reads exactly them.
+    fn lowering_words(&mut self, put: impl FnOnce(&mut Vec<u32>)) {
+        let at = self.words.len();
+        self.word(0);
+        put(&mut self.words);
+        self.words[at] = u32::try_from(self.words.len() - at - 1).expect("a diagnostic of 2^32 words");
     }
 
     /// A diagnostic: its kind's place in [`InferenceDiagnostic`]'s declaration, then its fields
@@ -1495,12 +1420,12 @@ impl Sink {
             }
             D::TyDiagnostic { diag } => {
                 self.word(30);
-                self.lowering_diagnostic(diag);
+                self.lowering_words(|words| put_diagnostic(words, diag));
             }
             D::PathDiagnostic { node, diag } => {
                 self.word(31);
                 self.node(*node);
-                self.path_diagnostic(diag);
+                self.lowering_words(|words| put_path_diagnostic(words, diag));
             }
             D::MethodCallIncorrectGenericsLen { expr, provided_count, expected_count, kind, def } => {
                 self.words.extend([32, local(*expr), *provided_count, *expected_count]);
@@ -1829,14 +1754,6 @@ impl Source<'_> {
         })
     }
 
-    fn generics_source(&mut self) -> Result<PathGenericsSource, FormatError> {
-        Ok(match self.word()? {
-            0 => PathGenericsSource::Segment(self.word()?),
-            1 => PathGenericsSource::AssocType { segment: self.word()?, assoc_type: self.word()? },
-            _ => return Err(self.invalid("a generics source of no kind")),
-        })
-    }
-
     fn generics_len_kind(&mut self) -> Result<IncorrectGenericsLenKind, FormatError> {
         Ok(match self.word()? {
             0 => IncorrectGenericsLenKind::Lifetimes,
@@ -1876,73 +1793,19 @@ impl Source<'_> {
         Ok(StoredTraitPredicate { trait_ref, polarity })
     }
 
-    fn lowering_diagnostic(&mut self) -> Result<TyLoweringDiagnostic, FormatError> {
-        Ok(match self.word()? {
-            0 => TyLoweringDiagnostic::PathDiagnostic {
-                source: self.local()?,
-                diag: self.path_diagnostic()?,
-            },
-            1 => TyLoweringDiagnostic::InferVarsNotAllowed { source: self.span()? },
-            _ => return Err(self.invalid("a lowering diagnostic of no kind")),
-        })
-    }
-
-    fn path_diagnostic(&mut self) -> Result<PathLoweringDiagnostic, FormatError> {
-        Ok(match self.word()? {
-            0 => {
-                let segment = self.word()?;
-                let reason = match self.word()? {
-                    0 => GenericArgsProhibitedReason::Module,
-                    1 => GenericArgsProhibitedReason::TyParam,
-                    2 => GenericArgsProhibitedReason::SelfTy,
-                    3 => GenericArgsProhibitedReason::PrimitiveTy,
-                    4 => GenericArgsProhibitedReason::Const,
-                    5 => GenericArgsProhibitedReason::Static,
-                    6 => GenericArgsProhibitedReason::LocalVariable,
-                    7 => GenericArgsProhibitedReason::EnumVariant,
-                    _ => return Err(self.invalid("a prohibition of no reason")),
-                };
-                PathLoweringDiagnostic::GenericArgsProhibited { segment, reason }
-            }
-            1 => PathLoweringDiagnostic::ParenthesizedGenericArgsWithoutFnTrait {
-                segment: self.word()?,
-            },
-            2 => {
-                let generics_source = self.generics_source()?;
-                let (provided_count, expected_count) = (self.word()?, self.word()?);
-                PathLoweringDiagnostic::IncorrectGenericsLen {
-                    generics_source,
-                    provided_count,
-                    expected_count,
-                    kind: self.generics_len_kind()?,
-                    def: self.generic_def()?,
-                }
-            }
-            3 => PathLoweringDiagnostic::IncorrectGenericsOrder {
-                generics_source: self.generics_source()?,
-                param_id: self.generic_param()?,
-                arg_idx: self.word()?,
-                has_self_arg: self.bool()?,
-            },
-            4 => PathLoweringDiagnostic::ElidedLifetimesInPath {
-                generics_source: self.generics_source()?,
-                def: self.generic_def()?,
-                expected_count: self.word()?,
-                hard_error: self.bool()?,
-            },
-            5 => PathLoweringDiagnostic::ElisionFailure {
-                generics_source: self.generics_source()?,
-                def: self.generic_def()?,
-                expected_count: self.word()?,
-            },
-            6 => PathLoweringDiagnostic::MissingLifetime {
-                generics_source: self.generics_source()?,
-                def: self.generic_def()?,
-                expected_count: self.word()?,
-            },
-            7 => PathLoweringDiagnostic::GenericDefaultRefersToSelf { segment: self.word()? },
-            _ => return Err(self.invalid("a path diagnostic of no kind")),
-        })
+    /// What [`Sink::lowering_words`] wrote: `read` must take every one of its words.
+    fn lowering_words<T>(
+        &mut self,
+        read: impl FnOnce(&mut Words<'_>) -> Result<T, FormatError>,
+    ) -> Result<T, FormatError> {
+        let len = self.len()?;
+        let mut words = Words::new(&self.words[self.next..self.next + len], self.at);
+        let value = read(&mut words)?;
+        if !words.is_done() {
+            return Err(self.invalid("a lowering diagnostic with words left over"));
+        }
+        self.next += len;
+        Ok(value)
     }
 
     fn diagnostic(&mut self, tys: &impl TyDecode) -> Result<InferenceDiagnostic, FormatError> {
@@ -2058,8 +1921,11 @@ impl Source<'_> {
                 expr_ty: self.ty(tys)?,
                 cast_ty: self.ty(tys)?,
             },
-            30 => D::TyDiagnostic { diag: self.lowering_diagnostic()? },
-            31 => D::PathDiagnostic { node: self.node()?, diag: self.path_diagnostic()? },
+            30 => D::TyDiagnostic { diag: self.lowering_words(|words| words.diagnostic())? },
+            31 => D::PathDiagnostic {
+                node: self.node()?,
+                diag: self.lowering_words(|words| words.path_diagnostic())?,
+            },
             32 => D::MethodCallIncorrectGenericsLen {
                 expr: self.local()?,
                 provided_count: self.word()?,
@@ -2259,6 +2125,10 @@ mod tests {
     use super::*;
     use crate::{
         infer::{BindingMode, ByRef, columns::CsrBuilder},
+        lower::diagnostics::{
+            GenericArgsProhibitedReason, PathGenericsSource, PathLoweringDiagnostic,
+            TyLoweringDiagnostic,
+        },
         next_solver::{GenericArg, StoredGenericArg, default_types},
     };
 
@@ -2633,6 +2503,17 @@ mod tests {
         result.hash(&mut hasher);
         let (low, high) = hasher.finish128();
         u128::from(high) << 64 | u128::from(low)
+    }
+
+    #[test]
+    fn the_type_table_comes_back_byte_for_byte() {
+        let bytes: Vec<u8> = (0..3 * ALIGN).map(|it| (it * 37 % 251) as u8).collect();
+        let words = table_words(&bytes);
+        assert_eq!(words.len(), 3);
+        assert_eq!(words[0] & 0xff, u128::from(bytes[0]));
+        let back = table_bytes(&words);
+        assert_eq!(&back[..], &bytes[..]);
+        assert_eq!(back.as_ptr().align_offset(ALIGN), 0);
     }
 
     #[test]

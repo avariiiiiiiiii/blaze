@@ -155,3 +155,10 @@ blaze-v2-proof = { path = "crates/blaze-v2-proof" }
   for a view that is no longer open. The session answers `Why` today only for open views.
 
 > forwarded to db
+
+## From safety-audit (2026-10-29, safety-audit-edge)
+
+- `crates/blaze-web/build.rs:1` target root (the build script): no `unsafe`; add `#![forbid(unsafe_code)]` after its `//!` docs.
+- Checked, no other finding. blaze-api, blaze-ci (`src/lib.rs` and `src/bin/blaze-ci.rs`), blaze-protocol and blaze-ui have no `unsafe` and already say `#![forbid(unsafe_code)]` at each root. blaze-web's 24 blocks are all in `flecs.rs` (`#![allow(unsafe_code)]` under the crate's `#![deny(unsafe_code)]`). Each does one op, and each comment names the invariant and where it is upheld (a live world and entity checked by `alive`, layouts checked in `new`, reads borrowed `&self` while writes take `&mut self`).
+
+> applied (ci DONE): `crates/blaze-web/build.rs` says `#![forbid(unsafe_code)]`.

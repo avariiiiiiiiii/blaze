@@ -14,9 +14,10 @@ use triomphe::Arc;
 use crate::{
     db::HirDatabase,
     layout::{
-        Layout, LayoutCx, LayoutError, enum_variant_ids, field_ty, struct_flags, variant_field_ids,
+        FIELDS_INLINE, Layout, LayoutCx, LayoutError, RustcEnumVariantIdx, RustcFieldIdx,
+        enum_variant_ids, struct_flags, struct_tail_may_be_unsized, variant_field_ids,
     },
-    next_solver::{DbInterner, StoredGenericArgs, TypingMode, infer::DbInternerInferExt},
+    next_solver::{DbInterner, GenericArgs, StoredGenericArgs},
     representability::{Representability, representability},
     traits::StoredParamEnvAndCrate,
 };
@@ -37,87 +38,75 @@ pub fn layout_of_adt_query(
     }
     let dl = target;
     let cx = LayoutCx::new(dl);
-    let handle_variant = |def: VariantId| {
-        variant_field_ids(db, def)
-            .iter()
-            .map(|&fd| {
-                super::field_layout(
-                    db,
-                    field_ty(db, def, fd, args.as_ref()).store(),
-                    trait_env.clone(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
+    let args = args.as_ref();
+    // Every variant's field layouts in one buffer, variant `i` at `fields[ends[i - 1]..ends[i]]`.
+    let mut fields = SmallVec::<[Arc<Layout>; FIELDS_INLINE]>::new();
+    let mut ends = SmallVec::<[u32; FIELDS_INLINE]>::new();
+    let mut push_variant = |variant: VariantId| -> Result<(), LayoutError> {
+        variant_field_layouts(db, variant, args, &trait_env, &mut fields)?;
+        ends.push(fields.len() as u32);
+        Ok(())
     };
-    let (variants, repr, niche_optimizations) = match def {
+    let flags = match def {
+        AdtId::StructId(s) => Some(struct_flags(db, s)),
+        AdtId::UnionId(_) | AdtId::EnumId(_) => None,
+    };
+    let (repr, niche_optimizations, enum_variants) = match def {
         AdtId::StructId(s) => {
-            let flags = struct_flags(db, s);
-            let mut r = SmallVec::<[_; 1]>::new();
-            r.push(handle_variant(s.into())?);
+            push_variant(s.into())?;
             (
-                r,
                 AttrFlags::repr(db, s.into()).unwrap_or_default(),
                 // As rustc: `UnsafeCell` and `UnsafePinned` hide their fields' niches.
-                if flags.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED) {
+                if flags.is_some_and(|it| {
+                    it.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED)
+                }) {
                     NicheOptimizations::Disabled
                 } else {
                     NicheOptimizations::Enabled
                 },
+                &[][..],
             )
         }
         AdtId::UnionId(id) => {
             let repr = AttrFlags::repr(db, id.into());
-            let mut r = SmallVec::new();
-            r.push(handle_variant(id.into())?);
-            (r, repr.unwrap_or_default(), NicheOptimizations::Enabled)
+            push_variant(id.into())?;
+            (repr.unwrap_or_default(), NicheOptimizations::Enabled, &[][..])
         }
         AdtId::EnumId(e) => {
-            let r = enum_variant_ids(db, e)
-                .iter()
-                .map(|&v| handle_variant(v.into()))
-                .collect::<Result<SmallVec<_>, _>>()?;
-            (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), NicheOptimizations::Enabled)
+            let variants = enum_variant_ids(db, e);
+            for &v in variants {
+                push_variant(v.into())?;
+            }
+            (AttrFlags::repr(db, e.into()).unwrap_or_default(), NicheOptimizations::Enabled, variants)
         }
     };
-    // A struct whose last field may be unsized for some generic arguments keeps that field last
-    // for all of them, so that unsizing the struct does not move it.
     let maybe_unsized = match def {
-        AdtId::StructId(s) => variant_field_ids(db, s.into()).last().is_some_and(|&fd| {
-            let interner = DbInterner::new_with(db, krate);
-            let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-            let ty = db.field_types(s.into())[fd].ty().instantiate_identity().skip_norm_wip();
-            !infcx.type_is_sized_modulo_regions(db.trait_environment(def.into()), ty)
-        }),
+        AdtId::StructId(s) => struct_tail_may_be_unsized(db, s, krate),
         AdtId::UnionId(_) | AdtId::EnumId(_) => false,
     };
-    let variants = variants
-        .iter()
-        .map(|it| it.iter().map(|it| &**it).collect::<Vec<_>>())
-        .collect::<SmallVec<[_; 1]>>();
-    let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
+    let refs: SmallVec<[&Layout; FIELDS_INLINE]> = fields.iter().map(|it| &**it).collect();
+    let variants = variants_of(&refs, &ends);
     let mut result = if matches!(def, AdtId::UnionId(..)) {
         cx.calc.layout_of_union(&repr, &variants)?
     } else {
+        // As rustc has a discriminant: the bits of its type, and no more.
+        let discr_size = Integer::from_attr(dl, repr.discr_type()).size();
         cx.calc.layout_of_struct_or_enum(
             &repr,
             &variants,
             matches!(def, AdtId::EnumId(..)),
             niche_optimizations,
             |min, max| repr_discr(dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false)),
-            variants.iter_enumerated().filter_map(|(id, _)| {
-                let AdtId::EnumId(e) = def else { return None };
-                let d = db.const_eval_discriminant(enum_variant_ids(db, e)[id.0]).ok()?;
-                // As rustc has a discriminant: the bits of its type, and no more.
-                let size = Integer::from_attr(dl, repr.discr_type()).size();
-                Some((id, size.truncate(d as u128)))
+            enum_variants.iter().enumerate().filter_map(|(index, &v)| {
+                let d = db.const_eval_discriminant(v).ok()?;
+                Some((RustcEnumVariantIdx(index), discr_size.truncate(d as u128)))
             }),
             !matches!(def, AdtId::EnumId(..)) && !maybe_unsized,
         )?
     };
     // As rustc's `layout_of_uncached`: the `f16b` and `ppcf128` lang items are structs over an
     // integer of their size, laid out as the backend's float scalar of that format.
-    if let AdtId::StructId(s) = def {
-        let flags = struct_flags(db, s);
+    if let Some(flags) = flags {
         let float = if flags.contains(StructFlags::IS_F16B) {
             Some(Float::F16B)
         } else if flags.contains(StructFlags::IS_PPC_F128) {
@@ -135,6 +124,43 @@ pub fn layout_of_adt_query(
         }
     }
     Ok(Arc::new(result))
+}
+
+/// Pushes the layout of each field of `variant` onto `out`, in order, reading the variant's
+/// field types once.
+fn variant_field_layouts<'db>(
+    db: &'db dyn HirDatabase,
+    variant: VariantId,
+    args: GenericArgs<'db>,
+    trait_env: &StoredParamEnvAndCrate,
+    out: &mut SmallVec<[Arc<Layout>; FIELDS_INLINE]>,
+) -> Result<(), LayoutError> {
+    let interner = DbInterner::new_no_crate(db);
+    let types = db.field_types(variant);
+    let ids = variant_field_ids(db, variant);
+    out.reserve(ids.len());
+    for &fd in ids {
+        let ty = types[fd].ty().instantiate(interner, args).skip_norm_wip();
+        out.push(super::field_layout(db, ty.store(), trait_env.clone())?);
+    }
+    Ok(())
+}
+
+/// The fields of each variant as the layout calculator takes them: variant `i` is
+/// `refs[ends[i - 1]..ends[i]]`. The calculator wants an owned `IndexVec` per variant; each is
+/// one exact allocation, none for a variant without fields.
+fn variants_of<'a, 'b>(
+    refs: &'a [&'b Layout],
+    ends: &[u32],
+) -> IndexVec<RustcEnumVariantIdx, IndexVec<RustcFieldIdx, &'a &'b Layout>> {
+    let mut variants = IndexVec::with_capacity(ends.len());
+    let mut start = 0;
+    for &end in ends {
+        let end = end as usize;
+        variants.push(refs[start..end].iter().collect());
+        start = end;
+    }
+    variants
 }
 
 fn layout_of_adt_cycle_result(

@@ -96,7 +96,9 @@ pub fn enable(db: &dyn HirDatabase) {
 /// When [`enable`] was not called on `db`.
 fn hir_db(db: &dyn SourceDatabase) -> &dyn HirDatabase {
     let caster = salsa::plumbing::views(db).downcaster_for::<dyn HirDatabase>();
-    // SAFETY: a database's views are made for that database's own type.
+    // SAFETY: `views(db)` is `db`'s own registry, so its caster for `dyn HirDatabase` was
+    // registered for `db`'s concrete type (by `enable`, through `zalsa_register_downcaster`),
+    // which is the type `db.into()` erases; `downcaster_for` panics if none was.
     unsafe { caster.downcast_unchecked(db.into()) }
 }
 

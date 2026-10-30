@@ -3,6 +3,8 @@
 //! names the token, comes to the address the page is at, and, for the websocket, from the
 //! page itself (docs/web.md, "The wire").
 
+#![forbid(unsafe_code)]
+
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, TcpStream},

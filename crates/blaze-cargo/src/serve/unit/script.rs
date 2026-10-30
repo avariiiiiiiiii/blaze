@@ -228,10 +228,12 @@ fn triple_of<'a>(unit: &'a Unit, host: &'a str) -> &'a str {
 /// The environment a script is started in: the job's whole environment, what cargo sets for
 /// the unit over it.
 pub(crate) fn inherited(job: &[(String, String)], plan: &UnitPlan) -> Vec<(OsString, OsString)> {
-    let mut env: BTreeMap<String, String> = job.iter().cloned().collect();
-    for (name, value) in &plan.env {
-        env.insert(name.clone(), value.clone());
-    }
+    // cargo's first, then a stable sort by name and the first of each name kept: cargo's over
+    // the job's, in one sort with no map.
+    let mut env: Vec<&(String, String)> = Vec::with_capacity(plan.env.len() + job.len());
+    env.extend(plan.env.iter().chain(job));
+    env.sort_by(|a, b| a.0.cmp(&b.0));
+    env.dedup_by(|later, first| later.0 == first.0);
     env.into_iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()
 }
 
@@ -400,9 +402,9 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
         How::Inert(_) => true,
         How::Outside(_) => false,
         How::Sandboxed(prepared) => {
-            let store = job.input.store.read().unwrap_or_else(|it| it.into_inner());
+            let guard = blaze_cas::enter();
             matches!(
-                blaze_usercode::index::find(&store, &prepared.spec.key, &mut start.disk),
+                blaze_usercode::index::find(&job.input.store, &guard, &prepared.spec.key, &mut start.disk),
                 Ok(blaze_usercode::index::Found::Hit { .. })
             )
         }

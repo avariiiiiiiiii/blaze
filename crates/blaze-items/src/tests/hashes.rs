@@ -494,3 +494,118 @@ const _: () = ();
         assert_eq!(item_key(&db, id), key::item_key_alone(&db, id), "{id:?}");
     }
 }
+
+#[test]
+fn a_path_hashed_in_parts_is_its_string_hashed() {
+    let (db, _) = single(
+        r#"
+mod m { pub struct A; pub fn f() {} pub enum E { X } }
+trait Tr { fn a(); const C: u8; type T; }
+impl Tr for m::A { fn a() {} const C: u8 = 0; type T = u8; }
+macro_rules! mac { () => {} }
+extern "C" { fn ext(); }
+const _: () = ();
+static S: u8 = 0;
+union U { x: u8 }
+"#,
+    );
+    let items = super::items(&db);
+    assert!(items.len() >= 14, "{items:?}");
+    for id in items {
+        let mut whole = blaze_ids::Hasher::new("test path");
+        whole.part(key::path(&db, id).as_bytes());
+        let mut parts = blaze_ids::Hasher::new("test path");
+        key::path_part(&db, id, &mut |bytes| {
+            parts.update(bytes);
+        });
+        assert_eq!(whole.finish(), parts.finish(), "{id:?}: {}", key::path(&db, id));
+    }
+}
+
+fn crate_items(db: &TestDB, krate: base_db::Crate) -> Vec<ItemId> {
+    let mut items = Vec::new();
+    for (_, module) in hir_def::nameres::crate_def_map(db, krate).modules(db) {
+        for def in module.scope(db).declarations() {
+            match def {
+                hir_def::ModuleDefId::FunctionId(it) => items.push(ItemId::Function(it)),
+                hir_def::ModuleDefId::AdtId(it) => items.push(ItemId::Adt(it)),
+                _ => {}
+            }
+        }
+    }
+    items
+}
+
+#[test]
+fn a_key_says_its_crate_and_whether_it_is_in_a_body() {
+    let db = <TestDB as test_fixture::WithFixture>::with_files(
+        r#"
+//- /a.rs crate:a
+pub struct S;
+pub fn f() -> u8 {
+    struct Inner;
+    let c = || 1u8;
+    c()
+}
+//- /b.rs crate:b
+pub struct S;
+"#,
+    );
+    let mut inner = 0;
+    for &krate in base_db::all_crates(&db).iter() {
+        let prefix = key::crate_key(&db, krate).0[..8].to_vec();
+        for id in crate_items(&db, krate) {
+            let key = item_key(&db, id).0.0;
+            assert_eq!(key[..8], prefix[..], "{id:?}");
+            assert_eq!(key[8] & 0x80, 0, "{id:?} is in no body");
+            let ItemId::Function(func) = id else { continue };
+            for (_, block) in Body::of(&db, func.into()).blocks(&db) {
+                for (_, module) in block.modules(&db) {
+                    for def in module.scope(&db).declarations() {
+                        let hir_def::ModuleDefId::AdtId(it) = def else { continue };
+                        let key = item_key(&db, ItemId::Adt(it)).0.0;
+                        assert_eq!(key[..8], prefix[..]);
+                        assert_eq!(key[8] & 0x80, 0x80, "`Inner` is in a body");
+                        inner += 1;
+                    }
+                }
+            }
+            for closure in closures(&db, id) {
+                let key = key::closure_key(&db, closure).0.0;
+                assert_eq!(key[..8], prefix[..]);
+                assert_eq!(key[8] & 0x80, 0x80, "a closure is in a body");
+                inner += 1;
+            }
+        }
+    }
+    assert_eq!(inner, 2);
+}
+
+#[test]
+fn an_item_of_each_crate_resolves_in_its_own() {
+    let db = <TestDB as test_fixture::WithFixture>::with_files(
+        r#"
+//- /a.rs crate:a
+pub struct S;
+//- /b.rs crate:b
+pub struct S;
+//- /c.rs crate:c deps:a,b
+pub struct S;
+"#,
+    );
+    let mut seen = 0;
+    for &krate in base_db::all_crates(&db).iter() {
+        for id in crate_items(&db, krate) {
+            let key = item_key(&db, id);
+            assert_eq!(resolve(&db, key), Some(Resolved::Item(id)), "{id:?}");
+            let mut flipped = key;
+            flipped.0.0[8] ^= 0x80;
+            assert_eq!(resolve(&db, flipped), None, "{id:?} is in no body");
+            let mut elsewhere = key;
+            elsewhere.0.0[0] ^= 1;
+            assert_eq!(resolve(&db, elsewhere), None, "{id:?} is in no other crate");
+            seen += 1;
+        }
+    }
+    assert!(seen >= 3, "{seen}");
+}

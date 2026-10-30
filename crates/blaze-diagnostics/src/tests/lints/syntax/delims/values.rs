@@ -1,8 +1,11 @@
 //! Parentheses around the value an expression takes: an assigned value, an argument, a
 //! condition, a scrutinee, a `return` or `break` value and a block's tail.
 
-use super::{compiletest, ui_core};
-use crate::tests::ui_with;
+use super::ui_core;
+use crate::{
+    Options,
+    tests::{ui, ui_run_pass},
+};
 
 #[test]
 fn parentheses_around_an_assigned_value_are_removed_without_a_trailing_space() {
@@ -32,7 +35,7 @@ LL +     let _x = 3 + 6;
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui_with("unused-parens-trailing-space-issue-158583.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("unused-parens-trailing-space-issue-158583.rs", "2015", source), expected);
 }
 
 /// The test's stderr is rustc's JSON; this is its `rendered` text, the human form.
@@ -86,7 +89,7 @@ LL +     let _a = 1 / (2 + 3);
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui_with("unused_parens_json_suggestion.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("unused_parens_json_suggestion.rs", "2015", source), expected);
 }
 
 #[test]
@@ -141,7 +144,7 @@ LL +     wrap!(unary routine());
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(ui_with("unused_parens_follow_ident.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("unused_parens_follow_ident.rs", "2015", source), expected);
 }
 
 #[test]
@@ -188,7 +191,7 @@ LL +     for _ in 1..match () { () => 2 } {}
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(ui_with("issue-90807-unused-paren-error.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("issue-90807-unused-paren-error.rs", "2015", source), expected);
 }
 
 #[test]
@@ -202,7 +205,7 @@ fn main() {
     for _ in (1..{ 2 }) {}
 }
 "#;
-    assert_eq!(ui_with("issue-90807-unused-paren.rs", "2015", source, &compiletest(true)), "");
+    assert_eq!(ui("issue-90807-unused-paren.rs", "2015", source), "");
 }
 
 #[test]
@@ -285,7 +288,7 @@ error: aborting due to 3 previous errors
 
 "#;
     assert_eq!(
-        ui_with("unused-parens-assign-expr-in-ret-issue-131989.rs", "2015", source, &compiletest(false)),
+        ui("unused-parens-assign-expr-in-ret-issue-131989.rs", "2015", source),
         expected
     );
 }
@@ -344,7 +347,7 @@ LL +     match e {
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui_with("lint-struct-necessary.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("lint-struct-necessary.rs", "2015", source), expected);
 }
 
 #[test]
@@ -373,7 +376,7 @@ pub fn bar() -> u8 {
 
 fn main() {}
 "#;
-    assert_eq!(ui_with("issue-71290-unused-paren-binop.rs", "2015", source, &compiletest(true)), "");
+    assert_eq!(ui("issue-71290-unused-paren-binop.rs", "2015", source), "");
 }
 
 #[test]
@@ -388,7 +391,7 @@ fn main() {
     if (return) {} // ok
 }
 "#;
-    assert_eq!(ui_with("no-unused-parens-return-block.rs", "2015", source, &compiletest(true)), "");
+    assert_eq!(ui_run_pass("no-unused-parens-return-block.rs", "2015", source, &Options::default()), "");
 }
 
 #[test]
@@ -420,7 +423,7 @@ fn foo() {
 fn main() {}
 "#;
     assert_eq!(
-        ui_core("unused-parens-labeled-break-issue-143256.rs", "2015", "default, ord", source, &compiletest(true)),
+        ui_core("unused-parens-labeled-break-issue-143256.rs", "2015", "default, ord", source),
         ""
     );
 }
@@ -525,7 +528,7 @@ error: aborting due to 5 previous errors
 
 "#;
     assert_eq!(
-        ui_core("unused-parens-for-macro-call-with-brace.rs", "2015", "option", source, &compiletest(false)),
+        ui_core("unused-parens-for-macro-call-with-brace.rs", "2015", "option", source),
         expected
     );
 }
@@ -553,5 +556,5 @@ LL | fn f(){(print!(á
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui_with("unused_parens_multibyte_recovery.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("unused_parens_multibyte_recovery.rs", "2015", source), expected);
 }

@@ -8,6 +8,8 @@
 //! where its operands are: `v1` up from the first argument, `x1` up for a pointer, the result
 //! left in `v0` (and `v1` up for a tuple of vectors).
 
+#![forbid(unsafe_code)]
+
 use std::ops::RangeInclusive;
 
 use cranelift_codegen::ir::{

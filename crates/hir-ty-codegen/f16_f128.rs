@@ -16,6 +16,8 @@
 //! Only the targets this was compared with rustc on take them ([`soft_floats`]); others
 //! refuse them, as before.
 
+#![forbid(unsafe_code)]
+
 use super::*;
 
 /// Whether `ty` is a float this module lowers.

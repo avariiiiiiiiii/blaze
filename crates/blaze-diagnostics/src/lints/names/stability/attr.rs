@@ -3,6 +3,10 @@
 //! them: an attribute rustc rejects as malformed gives nothing (its error is the attribute
 //! checks'), the first well-formed one of a kind is the one that counts.
 //!
+//! The attributes are visited in place (`expand_cfg_attr` over the syntax), nothing collected:
+//! a node with none costs one look at its children and allocates nothing. Only an attribute
+//! that is one of these is parsed, once per definition (`lookup.rs` keeps the result).
+//!
 //! Follows `compiler/rustc_attr_parsing/src/attributes/deprecation.rs`, `stability.rs`,
 //! `allow_unstable.rs` and `util.rs` (`parse_version`), with `compiler/rustc_hir/src/attrs/
 //! data_structures.rs` (`Deprecation`, `DeprecatedSince`) and `compiler/rustc_hir/src/
@@ -12,6 +16,8 @@ use std::ops::ControlFlow;
 
 use cfg::CfgOptions;
 use hir_expand::attrs::{AstKeyValueMetaExt as _, expand_cfg_attr};
+use intern::Symbol;
+use smallvec::SmallVec;
 use syntax::{AstToken, NodeOrToken, SyntaxKind, SyntaxNode, T, ast};
 
 /// A rustc version, `RustcVersion`.
@@ -50,13 +56,13 @@ pub(super) fn parse_version(text: &str) -> Option<Version> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Since {
     RustcVersion(Version),
-    /// `since = "TBD"`.
+    /// `TBD`.
     Future,
-    /// Any other `since` of a crate without `#![feature(staged_api)]`.
+    /// Anything else, in a crate without `staged_api`.
     NonStandard,
-    /// No `since`.
+    /// No `since`, in a crate without `staged_api`.
     Unspecified,
-    /// A `since` of a staged crate that is no version.
+    /// A `since` a staged crate can't have.
     Err,
 }
 
@@ -84,10 +90,11 @@ impl Deprecation {
     }
 }
 
-/// `StabilityLevel` with the feature it names.
+/// `StabilityLevel` with the feature it names, interned: checking whether a feature is
+/// enabled compares `u32`s.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Stability {
-    Unstable { feature: String, reason: Option<String>, issue: Option<u32>, implied_by: Option<String> },
+    Unstable { feature: Symbol, reason: Option<String>, issue: Option<u32>, implied_by: Option<Symbol> },
     Stable {
         /// `#[rustc_allowed_through_unstable_modules = "..."]`: the deprecation message a path
         /// through an unstable module to the item gets instead of an error.
@@ -101,31 +108,30 @@ impl Stability {
     }
 }
 
-/// The attributes of `node` once `cfg_attr` is expanded with `cfg`, outer then inner, each
-/// with the attribute it is written in.
-pub(super) fn attrs(node: &SyntaxNode, cfg: &CfgOptions) -> Vec<(ast::Meta, ast::Attr)> {
-    let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { return Vec::new() };
-    let mut attrs = Vec::new();
-    expand_cfg_attr::<()>(
-        ast::attrs_including_inner(&owner),
-        || cfg,
-        |meta, attr| {
-            attrs.push((meta, attr));
-            ControlFlow::Continue(())
-        },
-    );
-    attrs
+/// Calls `f` with each attribute of `node` once `cfg_attr` is expanded with `cfg`, outer then
+/// inner, with the attribute it is written in, until `f` breaks.
+pub(super) fn each<T>(
+    node: &SyntaxNode,
+    cfg: &CfgOptions,
+    f: impl FnMut(ast::Meta, ast::Attr) -> ControlFlow<T>,
+) -> Option<T> {
+    let owner = ast::AnyHasAttrs::cast(node.clone())?;
+    expand_cfg_attr(ast::attrs_including_inner(&owner), || cfg, f)
 }
 
-/// Whether `meta` is the attribute `name`, a path of one segment.
+/// Whether `meta` is the attribute `name`, a path of one segment: a length check and a
+/// compare of the token's bytes, no hashing.
 pub(super) fn is(meta: &ast::Meta, name: &str) -> bool {
     meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == name)
 }
 
-/// The `#[deprecated]` of `attrs`, read as rustc reads it for a crate that is `staged` (has
+/// The `#[deprecated]` of `node`, read as rustc reads it for a crate that is `staged` (has
 /// `#![feature(staged_api)]`) or not.
-pub(super) fn deprecation(attrs: &[(ast::Meta, ast::Attr)], staged: bool) -> Option<Deprecation> {
-    attrs.iter().filter(|(meta, _)| is(meta, "deprecated")).find_map(|(meta, _)| parse_deprecation(meta, staged))
+pub(super) fn deprecation(node: &SyntaxNode, cfg: &CfgOptions, staged: bool) -> Option<Deprecation> {
+    each(node, cfg, |meta, _| match is(&meta, "deprecated").then(|| parse_deprecation(&meta, staged)).flatten() {
+        Some(it) => ControlFlow::Break(it),
+        None => ControlFlow::Continue(()),
+    })
 }
 
 fn parse_deprecation(meta: &ast::Meta, staged: bool) -> Option<Deprecation> {
@@ -165,32 +171,32 @@ fn parse_deprecation(meta: &ast::Meta, staged: bool) -> Option<Deprecation> {
     Some(Deprecation { since, note, suggestion })
 }
 
-/// The stability `attrs` give an item of a staged crate.
-pub(super) fn stability(attrs: &[(ast::Meta, ast::Attr)]) -> Option<Stability> {
+/// The stability the attributes of `node` give an item of a staged crate.
+pub(super) fn stability(node: &SyntaxNode, cfg: &CfgOptions) -> Option<Stability> {
     let mut stability = None;
     let mut through = None;
-    for (meta, _) in attrs {
-        if is(meta, "stable") || is(meta, "unstable") {
-            if stability.is_some() {
-                continue;
+    each::<()>(node, cfg, |meta, _| {
+        if is(&meta, "stable") || is(&meta, "unstable") {
+            if stability.is_none()
+                && let ast::Meta::TokenTreeMeta(list) = &meta
+                && let Some(items) = list.token_tree().and_then(|it| name_values(&it))
+            {
+                stability = if is(&meta, "unstable") { parse_unstable(items) } else { parse_stable(items) };
             }
-            let ast::Meta::TokenTreeMeta(meta) = meta else { continue };
-            let Some(list) = meta.token_tree().and_then(|it| name_values(&it)) else { continue };
-            let unstable = meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "unstable");
-            stability = if unstable { parse_unstable(list) } else { parse_stable(list) };
-        } else if is(meta, "rustc_allowed_through_unstable_modules")
-            && let ast::Meta::KeyValueMeta(meta) = meta
+        } else if is(&meta, "rustc_allowed_through_unstable_modules")
+            && let ast::Meta::KeyValueMeta(meta) = &meta
         {
             through = meta.value_string().map(|it| it.to_string());
         }
-    }
+        ControlFlow::Continue(())
+    });
     if let Some(Stability::Stable { allowed_through_unstable_modules }) = &mut stability {
         *allowed_through_unstable_modules = through;
     }
     stability
 }
 
-fn parse_stable(list: Vec<(String, String)>) -> Option<Stability> {
+fn parse_stable(list: Items) -> Option<Stability> {
     let mut feature = None;
     let mut since = None;
     for (key, value) in list {
@@ -208,7 +214,7 @@ fn parse_stable(list: Vec<(String, String)>) -> Option<Stability> {
     Some(Stability::Stable { allowed_through_unstable_modules: None })
 }
 
-fn parse_unstable(list: Vec<(String, String)>) -> Option<Stability> {
+fn parse_unstable(list: Items) -> Option<Stability> {
     let (mut feature, mut reason, mut issue, mut implied_by) = (None, None, None, None);
     let mut _old_name = None;
     for (key, value) in list {
@@ -225,44 +231,44 @@ fn parse_unstable(list: Vec<(String, String)>) -> Option<Stability> {
         }
         *slot = Some(value);
     }
-    let feature = feature.filter(|it| is_ident(it))?;
+    let feature = Symbol::intern(&feature.filter(|it| is_ident(it))?);
     let issue = match issue?.as_str() {
         "none" => None,
         issue => Some(issue.parse::<std::num::NonZero<u32>>().ok()?.get()),
     };
+    let implied_by = implied_by.map(|it| Symbol::intern(&it));
     Some(Stability::Unstable { feature, reason, issue, implied_by })
 }
 
-/// The features `#[allow_internal_unstable(..)]` of `attrs` lets a macro's expansion use.
-pub(super) fn allow_internal_unstable(attrs: &[(ast::Meta, ast::Attr)]) -> Vec<String> {
-    let mut features = Vec::new();
-    for (meta, _) in attrs {
-        if !is(meta, "allow_internal_unstable") {
-            continue;
+/// Whether `#[allow_internal_unstable(..)]` on `node` lets a macro's expansion use `feature`.
+pub(super) fn allows_internal_unstable(node: &SyntaxNode, cfg: &CfgOptions, feature: &Symbol) -> bool {
+    let feature = feature.as_str();
+    each(node, cfg, |meta, _| {
+        if is(&meta, "allow_internal_unstable")
+            && let ast::Meta::TokenTreeMeta(meta) = &meta
+            && let Some(tt) = meta.token_tree()
+            && tt.syntax().children_with_tokens().any(|it| {
+                matches!(it, NodeOrToken::Token(token) if token.kind() == SyntaxKind::IDENT
+                    && token.text().trim_start_matches("r#") == feature)
+            })
+        {
+            return ControlFlow::Break(());
         }
-        let ast::Meta::TokenTreeMeta(meta) = meta else { continue };
-        let Some(tt) = meta.token_tree() else { continue };
-        for token in tt.syntax().children_with_tokens() {
-            if let NodeOrToken::Token(token) = token
-                && token.kind() == SyntaxKind::IDENT
-            {
-                features.push(token.text().trim_start_matches("r#").to_owned());
-            }
-        }
-    }
-    features
+        ControlFlow::Continue(())
+    })
+    .is_some()
 }
+
+/// An attribute's `key = "value"` items. Most have up to four (`feature`, `reason`, `issue`,
+/// `implied_by`), kept inline.
+type Items = SmallVec<[(String, String); 4]>;
 
 /// The `key = "value"` items of an attribute's list, each value a string literal; `None` when
 /// an item is anything else (rustc's malformed-attribute errors).
-fn name_values(tt: &ast::TokenTree) -> Option<Vec<(String, String)>> {
-    let mut items = Vec::new();
-    let mut tokens = tt
-        .syntax()
-        .children_with_tokens()
-        .filter(|it| !it.kind().is_trivia())
-        .skip(1)
-        .collect::<Vec<_>>();
+fn name_values(tt: &ast::TokenTree) -> Option<Items> {
+    let mut items = Items::new();
+    let mut tokens: SmallVec<[_; 16]> =
+        tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).skip(1).collect();
     if tokens.last().is_some_and(|it| it.kind() == T![')']) {
         tokens.pop();
     }

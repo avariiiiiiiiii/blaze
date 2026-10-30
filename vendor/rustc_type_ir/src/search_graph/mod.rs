@@ -52,9 +52,25 @@ pub trait Cx: Copy {
     fn get_tracked<T: Debug + Clone>(self, tracked: &Self::Tracked<T>) -> T;
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, Self::DepNodeIndex);
 
-    fn with_global_cache<R>(self, f: impl FnOnce(&mut GlobalCache<Self>) -> R) -> R;
+    /// Runs `f` on the cache of `scope`. A lookup reads [`CacheScope::Shared`], then
+    /// [`CacheScope::Query`]; a result goes where [`Cx::cache_scope`] says.
+    fn with_global_cache<R>(self, scope: CacheScope, f: impl FnOnce(&GlobalCache<Self>) -> R) -> R;
+
+    /// Where a goal solved under `dep_node` may be cached: [`CacheScope::Shared`] only when
+    /// `dep_node` holds every read the result depends on, so another query reusing it takes
+    /// them.
+    fn cache_scope(self, dep_node: &Self::DepNodeIndex) -> CacheScope;
 
     fn assert_evaluation_is_concurrent(&self);
+}
+
+/// Which of an interner's two solver caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheScope {
+    /// Reused by every query of the database state the interner reads.
+    Shared,
+    /// Only the running query's: goals whose reads could not be captured.
+    Query,
 }
 
 pub trait Delegate: Sized {
@@ -1208,12 +1224,14 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
         step_kind_from_parent: PathKind,
         available_depth: AvailableDepth,
     ) -> Option<X::Result> {
-        cx.with_global_cache(|cache| {
-            cache
-                .get(cx, input, available_depth, |nested_goals| {
-                    self.candidate_is_applicable(step_kind_from_parent, nested_goals)
-                })
-                .map(|c| c.result)
+        [CacheScope::Shared, CacheScope::Query].into_iter().find_map(|scope| {
+            cx.with_global_cache(scope, |cache| {
+                cache
+                    .get(cx, input, available_depth, |nested_goals| {
+                        self.candidate_is_applicable(step_kind_from_parent, nested_goals)
+                    })
+                    .map(|c| c.result)
+            })
         })
     }
 
@@ -1227,26 +1245,28 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
         step_kind_from_parent: PathKind,
         available_depth: AvailableDepth,
     ) -> Option<X::Result> {
-        cx.with_global_cache(|cache| {
-            let CacheData { result, required_depth, encountered_overflow, nested_goals } = cache
-                .get(cx, input, available_depth, |nested_goals| {
-                    self.candidate_is_applicable(step_kind_from_parent, nested_goals)
-                })?;
+        [CacheScope::Shared, CacheScope::Query].into_iter().find_map(|scope| {
+            cx.with_global_cache(scope, |cache| {
+                let CacheData { result, required_depth, encountered_overflow, nested_goals } =
+                    cache.get(cx, input, available_depth, |nested_goals| {
+                        self.candidate_is_applicable(step_kind_from_parent, nested_goals)
+                    })?;
 
-            // We don't move cycle participants to the global cache, so the
-            // cycle heads are always empty.
-            let heads = iter::empty();
-            Self::update_parent_goal(
-                &mut self.stack,
-                step_kind_from_parent,
-                required_depth,
-                heads,
-                encountered_overflow,
-                UpdateParentGoalCtxt::Ordinary(nested_goals),
-            );
+                // We don't move cycle participants to the global cache, so the
+                // cycle heads are always empty.
+                let heads = iter::empty();
+                Self::update_parent_goal(
+                    &mut self.stack,
+                    step_kind_from_parent,
+                    required_depth,
+                    heads,
+                    encountered_overflow,
+                    UpdateParentGoalCtxt::Ordinary(nested_goals),
+                );
 
-            debug!(?required_depth, "global cache hit");
-            Some(result)
+                debug!(?required_depth, ?scope, "global cache hit");
+                Some(result)
+            })
         })
     }
 
@@ -1443,6 +1463,7 @@ impl<D: Delegate<Cx = X>, X: Cx> SearchGraph<D, X> {
         dep_node: X::DepNodeIndex,
     ) {
         debug!(?evaluation_result, "insert global cache");
-        cx.with_global_cache(|cache| cache.insert(cx, input, evaluation_result, dep_node))
+        let scope = cx.cache_scope(&dep_node);
+        cx.with_global_cache(scope, |cache| cache.insert(cx, input, evaluation_result, dep_node))
     }
 }

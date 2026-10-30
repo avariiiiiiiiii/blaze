@@ -11,6 +11,8 @@
 //!   preview 1, its preopens and environment, and answers `blaze.run_tool` with what the
 //!   caller says.
 
+#![forbid(unsafe_code)]
+
 #[cfg(feature = "run")]
 pub mod run;
 

@@ -1,12 +1,11 @@
 //! How the database reads a view's files: a [`Tree`] answers for any root, from any thread.
 
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_vfs::Mode;
+
+use crate::table::{FxMap, ShortLock};
 
 /// The files of every root, read from many worker threads at once. A root's files never
 /// change (a root is a content ID), so every answer for a root is the same forever.
@@ -40,7 +39,7 @@ impl Tree for blaze_vfs::Reader {
 /// IDs of the sorted list of paths, modes and file IDs (not the VFS's Merkle IDs).
 #[derive(Default)]
 pub struct MemTree {
-    roots: Mutex<HashMap<ContentId, Arc<Files>>>,
+    roots: ShortLock<FxMap<ContentId, Arc<Files>>>,
 }
 
 type Files = BTreeMap<String, (ContentId, Mode, Arc<[u8]>)>;
@@ -69,12 +68,12 @@ impl MemTree {
             hasher.part(path.as_bytes()).update(&mode.git().to_le_bytes()).id(id);
         }
         let root = hasher.finish();
-        self.roots.lock().unwrap_or_else(PoisonError::into_inner).insert(root, Arc::new(files));
+        self.roots.lock().insert(root, Arc::new(files));
         root
     }
 
     fn files(&self, root: ContentId) -> Option<Arc<Files>> {
-        self.roots.lock().unwrap_or_else(PoisonError::into_inner).get(&root).cloned()
+        self.roots.lock().get(&root).cloned()
     }
 }
 

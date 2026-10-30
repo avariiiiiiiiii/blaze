@@ -8,13 +8,13 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{checked, checked_with, normalized, ui},
+    tests::{Mode, checked, checked_with, compiletest, normalized, ui},
 };
 
 /// [`ui`] of a file with minicore's items for `flags` (`crates/test-utils/src/minicore.rs`).
 fn ui_core(name: &str, flags: &str, source: &str) -> String {
     let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:2015\n{source}");
-    let checked = checked_with(&fixture, "$DIR/", &Options::default());
+    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 

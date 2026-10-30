@@ -15,6 +15,8 @@
 //!
 //! [`rustc_hir_typeck/check.rs`]: https://github.com/rust-lang/rust/blob/5503df87342a73d0c29126a7e08dc9c1255c46ad/compiler/rustc_hir_typeck/src/check.rs
 
+#![forbid(unsafe_code)]
+
 mod autoderef;
 mod callee;
 pub mod cast;
@@ -970,11 +972,11 @@ impl<'db> InferenceTables<'db> {
     }
 
     pub(crate) fn pat_adjustment(&self, id: PatId) -> Option<&[PatAdjustment]> {
-        self.pat_adjustments.get(&id).map(|it| &**it)
+        self.pat_adjustments.get(&id)
     }
 
     pub(crate) fn expr_adjustment(&self, id: ExprId) -> Option<&[Adjustment]> {
-        self.expr_adjustments.get(&id).map(|it| &**it)
+        self.expr_adjustments.get(&id)
     }
 
     pub(crate) fn binding_mode(&self, id: PatId) -> Option<BindingMode> {
@@ -1539,15 +1541,15 @@ impl<'db> InferenceResult<'db> {
     }
 
     pub fn pat_adjustment(&self, id: PatId) -> Option<&[PatAdjustment]> {
-        self.pat_adjustments.get(&id).map(|it| &**it)
+        self.pat_adjustments.get(&id)
     }
 
     pub fn expr_adjustment(&self, id: ExprId) -> Option<&[Adjustment]> {
-        self.expr_adjustments.get(&id).map(|it| &**it)
+        self.expr_adjustments.get(&id)
     }
 
     pub fn assignment_coercion(&self, place: ExprId) -> &[Adjustment] {
-        self.assignment_coercions.get(&place).map_or(&[], |it| &**it)
+        self.assignment_coercions.get(&place).unwrap_or_default()
     }
 
     pub fn binding_mode(&self, id: PatId) -> Option<BindingMode> {

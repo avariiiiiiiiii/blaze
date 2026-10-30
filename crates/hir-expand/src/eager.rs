@@ -30,6 +30,7 @@ use crate::{
     InFile, MacroCallId, MacroCallKind, MacroCallLoc, MacroDefId, MacroDefKind,
     ast::{self, AstNode},
     mod_path::ModPath,
+    span_map::{InOrder, SpanMap},
 };
 
 pub type EagerCallBackFn<'a> = &'a mut dyn FnMut(
@@ -96,7 +97,7 @@ pub fn expand_eager_macro_input(
 
     let mut subtree = syntax_bridge::syntax_node_to_token_tree(
         &expanded_eager_input,
-        arg_map,
+        InOrder::new(SpanMap::ExpansionSpanMap(&arg_map)),
         *span,
         DocCommentDesugarMode::Mbe,
     );
@@ -168,6 +169,7 @@ fn eager_macro_recur(
     // FIXME: We only report a single error inside of eager expansions
     let mut error = None;
     let mut children = original.preorder_with_tokens();
+    let mut span_hint = 0;
 
     // Collect replacement
     while let Some(child) = children.next() {
@@ -184,7 +186,7 @@ fn eager_macro_recur(
                 if let SyntaxElement::Token(t) = child {
                     let start = t.text_range().start();
                     offset += t.text_range().len();
-                    expanded_map.push(offset, span_map.span_at(start));
+                    expanded_map.push(offset, span_map.span_at_from(start, &mut span_hint));
                 }
                 continue;
             }

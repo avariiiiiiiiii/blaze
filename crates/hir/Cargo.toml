@@ -41,6 +41,7 @@ tt.workspace = true
 span.workspace = true
 
 [dev-dependencies]
+blaze-format.workspace = true
 expect-test.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

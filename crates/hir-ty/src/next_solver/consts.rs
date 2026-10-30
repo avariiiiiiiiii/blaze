@@ -30,7 +30,7 @@ pub type ConstKind<'db> = rustc_type_ir::ConstKind<DbInterner<'db>>;
 pub type UnevaluatedConst<'db> = rustc_type_ir::UnevaluatedConst<DbInterner<'db>>;
 
 /// Every interned [`Const`]. A `GenericArg` holds a row in 30 bits.
-static CONSTS: table::Rows = table::Rows::new("consts", table::LAST_ROW);
+static CONSTS: table::Rows<ConstKind<'static>> = table::Rows::new("consts", table::LAST_ROW);
 
 /// A constant: its row in [`CONSTS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,6 +41,8 @@ pub struct Const<'db> {
 }
 
 const _: () = assert!(size_of::<Option<Const<'static>>>() == 4);
+// A row costs `table::ROW_BYTES` hot bytes and its kind, at most 48 cold ones.
+const _: () = assert!(size_of::<ConstKind<'static>>() <= 48);
 
 impl_stored_interned!(Const, StoredConst);
 
@@ -56,11 +58,18 @@ impl<'db> Const<'db> {
         Self::intern(kind)
     }
 
+    #[inline]
     pub(super) fn intern(kind: ConstKind<'db>) -> Self {
-        let words = persist::encode(&kind);
-        Self::at(CONSTS.intern(&words, || {
+        // SAFETY: the two types differ only in their lifetime, which an interned value does not
+        // depend on (it is never freed).
+        let kind = unsafe { std::mem::transmute::<ConstKind<'db>, ConstKind<'static>>(kind) };
+        Self::at(CONSTS.intern(kind, || {
             let computed = FlagComputation::for_const_kind(&kind);
-            (computed.flags, computed.outer_exclusive_binder)
+            table::RowInfo {
+                tag: persist::tag(&kind),
+                flags: computed.flags,
+                binder: computed.outer_exclusive_binder,
+            }
         }))
     }
 
@@ -256,8 +265,10 @@ impl<'db> IntoKind for Const<'db> {
 
     #[inline]
     fn kind(self) -> Self::Kind {
-        // SAFETY: a `Const` is a row of `CONSTS`.
-        persist::decode(unsafe { CONSTS.fields(self.index) })
+        // SAFETY: a `Const` is a row of `CONSTS`; the lifetime is as in `intern`.
+        unsafe {
+            std::mem::transmute::<ConstKind<'static>, ConstKind<'db>>(CONSTS.kind(self.index))
+        }
     }
 }
 

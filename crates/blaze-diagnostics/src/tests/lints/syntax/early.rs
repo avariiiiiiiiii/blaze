@@ -25,7 +25,7 @@ pub(crate) fn compiletest(test: Test) -> Options {
     }
     args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
     let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap() }
+    Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() }
 }
 
 /// What rustc writes to stderr for `fixture`, each file named `$DIR/<path>`: a UI test's

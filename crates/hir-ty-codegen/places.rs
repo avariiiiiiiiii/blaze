@@ -9,6 +9,8 @@
 //! Only where the anchor begins ([`anchor_location`]) is found from the whole file, once per
 //! body, and added when the place is asked for.
 
+#![forbid(unsafe_code)]
+
 use hir_def::expr_store::body::{BodySyntax, body_syntax};
 use hir_expand::{MacroCallId, MacroCallKind, map_node_range_up_rooted_span};
 use span::Span;
@@ -161,10 +163,10 @@ fn source_range(
         // The block an `async fn` is taken to wrap its body in is not written anywhere, and
         // ends where the body does.
         MirSpan::ExprEnd(expr) => {
-            match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {
+            match (source_map.expr_syntax(expr), Body::of(db, owner).expr(expr)) {
                 (Ok(written), _) => written,
                 (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
-                    source_map.expr_syntax(*tail).ok()?
+                    source_map.expr_syntax(tail).ok()?
                 }
                 (Err(_), _) => return None,
             }

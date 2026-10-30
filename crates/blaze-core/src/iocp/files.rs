@@ -206,8 +206,11 @@ fn control<T, U>(handle: &OwnedHandle, code: u32, input: Option<&T>, output: Opt
     let (out_ptr, out_len) =
         output.map_or((std::ptr::null_mut(), 0), |it| ((it as *mut U).cast(), size_of::<U>()));
     let mut returned = 0;
-    // SAFETY: an open handle; the buffers are of the lengths given and live across the call,
-    // which is synchronous (the handle is not overlapped).
+    // SAFETY: an open handle that is not overlapped, so the call is synchronous and the buffers
+    // (of `size_of::<T>()` and `size_of::<U>()` bytes, from live references) outlive it; every
+    // caller passes as `T` and `U` the `FSCTL_*` structs that `code` takes and returns, plain
+    // integers valid for any bytes written; a `U` with invalid bit patterns or pointers would
+    // be UB.
     sys::check(unsafe {
         DeviceIoControl(
             handle.as_raw_handle(),
@@ -320,14 +323,18 @@ struct Mapped {
     len: usize,
 }
 
-// SAFETY: read-only pages no one writes while they are mapped (see `map`).
+// SAFETY: read-only pages no one writes while they are mapped: `Effect::Map`'s contract bars
+// in-place writes and truncates of a mapped file (the store and the image replace a file only
+// by renaming another over it), so threads share them as they would a `&[u8]`.
 unsafe impl Send for Mapped {}
 // SAFETY: as above.
 unsafe impl Sync for Mapped {}
 
 impl AsRef<[u8]> for Mapped {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: `len` bytes mapped at `at` for as long as `self` lives.
+        // SAFETY: `len` bytes mapped at `at` for as long as `self` lives, never written or cut
+        // short meanwhile by `Effect::Map`'s contract; if they were, this slice would see a
+        // data race or fault.
         unsafe { std::slice::from_raw_parts(self.at, self.len) }
     }
 }

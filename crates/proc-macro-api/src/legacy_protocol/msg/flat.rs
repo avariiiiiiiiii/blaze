@@ -79,8 +79,11 @@ pub fn deserialize_span_data_index_map(map: &[u32]) -> SpanDataIndexMap {
                     ast_id: ErasedFileAstId::from_raw(ast_id),
                 },
                 range: TextRange::new(start.into(), end.into()),
-                // SAFETY: We only receive spans from the server. If someone mess up the communication UB can happen,
-                // but that will be their problem.
+                // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's
+                // contexts. These come back from the proc-macro server, which only echoes the
+                // contexts this process sent it (`serialize_span_data_index_map`). Memory
+                // safety doesn't rest on it: a value the server made up panics in `from_u32`
+                // or in salsa's checked lookup, or names another context's hygiene.
                 ctx: unsafe { SyntaxContext::from_u32(e) },
             }
         })

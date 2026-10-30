@@ -296,8 +296,8 @@ pub fn listing<'a>(names: impl IntoIterator<Item = &'a OsStr>) -> [u8; 32] {
 
 /// The lines of `scope` (all of them for `None`), with what they read as `inputs` has it now:
 /// sorted and each once, so equal reads give equal [`Traced`]s whatever order they came in.
-pub fn assemble<I: Inputs>(
-    lines: &[Line],
+pub fn assemble<'l, I: Inputs>(
+    lines: impl IntoIterator<Item = &'l Line>,
     scope: Option<&str>,
     inputs: &mut I,
 ) -> Result<Traced, I::Error> {
@@ -310,7 +310,7 @@ pub fn assemble<I: Inputs>(
         None => true,
         Some(scope) => line.scope.is_empty() || line.scope == scope,
     };
-    for line in lines.iter().filter(|it| ours(it)) {
+    for line in lines.into_iter().filter(|it| ours(it)) {
         match line.seen {
             Seen::Read | Seen::Looked => _ = files.insert(PathBuf::from(&line.what)),
             Seen::Listed => _ = dirs.insert(PathBuf::from(&line.what)),
@@ -388,17 +388,67 @@ pub fn os_bytes(name: &OsStr) -> &[u8] {
     }
 }
 
-pub(crate) fn os_from(bytes: &[u8]) -> OsString {
+/// The name [`os_bytes`] gave `bytes` of, or why they are not one. The bytes come from the
+/// store or another process, so they are checked, never taken on trust.
+pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
     #[cfg(unix)]
     {
-        std::os::unix::ffi::OsStrExt::from_bytes(bytes).to_owned()
+        Ok(std::os::unix::ffi::OsStrExt::from_bytes(bytes).to_owned())
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "wasi")]
     {
-        // SAFETY: the bytes are what `os_bytes` gave of an `OsStr` of this platform, as
-        // `encode` wrote them.
-        unsafe { OsStr::from_encoded_bytes_unchecked(bytes) }.to_owned()
+        Ok(std::os::wasi::ffi::OsStrExt::from_bytes(bytes).to_owned())
     }
+    #[cfg(windows)]
+    {
+        Ok(std::os::windows::ffi::OsStringExt::from_wide(&wide_of_wtf8(bytes)?))
+    }
+    #[cfg(not(any(unix, windows, target_os = "wasi")))]
+    {
+        std::str::from_utf8(bytes)
+            .map(OsString::from)
+            .map_err(|_| "a name is not UTF-8".to_owned())
+    }
+}
+
+/// The UTF-16 units of WTF-8 `bytes` (UTF-8 that may also hold a lone surrogate), which is
+/// what [`OsStr::as_encoded_bytes`] gives on Windows.
+#[cfg(any(windows, test))]
+fn wide_of_wtf8(bytes: &[u8]) -> Result<Vec<u16>, String> {
+    let bad = || "a name is not WTF-8".to_owned();
+    let mut wide = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let lead = bytes[at];
+        let (len, min, init) = match lead {
+            0x00..=0x7f => (1, 0, u32::from(lead)),
+            0xc2..=0xdf => (2, 0x80, u32::from(lead & 0x1f)),
+            0xe0..=0xef => (3, 0x800, u32::from(lead & 0x0f)),
+            0xf0..=0xf4 => (4, 0x1_0000, u32::from(lead & 0x07)),
+            _ => return Err(bad()),
+        };
+        let tail = bytes.get(at + 1..at + len).ok_or_else(bad)?;
+        let mut point = init;
+        for &byte in tail {
+            if byte & 0xc0 != 0x80 {
+                return Err(bad());
+            }
+            point = (point << 6) | u32::from(byte & 0x3f);
+        }
+        if point < min || point > 0x10_ffff {
+            return Err(bad());
+        }
+        match point {
+            0x1_0000.. => {
+                let high = point - 0x1_0000;
+                wide.push(0xd800 | (high >> 10) as u16);
+                wide.push(0xdc00 | (high & 0x3ff) as u16);
+            }
+            _ => wide.push(point as u16),
+        }
+        at += len;
+    }
+    Ok(wide)
 }
 
 /// What a sandbox's launcher leaves for the driver that ran it ([`encode`]).
@@ -512,7 +562,7 @@ pub fn decode(bytes: &[u8]) -> Result<Report, String> {
         2 => {
             let mut traced = Traced::default();
             for _ in 0..at.len()? {
-                let path = PathBuf::from(os_from(at.part()?));
+                let path = PathBuf::from(os_from(at.part()?)?);
                 let hash = match at.byte()? {
                     0 => None,
                     1 => Some(at.hash()?),
@@ -521,14 +571,14 @@ pub fn decode(bytes: &[u8]) -> Result<Report, String> {
                 traced.files.push((path, hash));
             }
             for _ in 0..at.len()? {
-                let path = PathBuf::from(os_from(at.part()?));
+                let path = PathBuf::from(os_from(at.part()?)?);
                 traced.dirs.push((path, at.hash()?));
             }
             for _ in 0..at.len()? {
-                let name = os_from(at.part()?);
+                let name = os_from(at.part()?)?;
                 let value = match at.byte()? {
                     0 => None,
-                    1 => Some(os_from(at.part()?)),
+                    1 => Some(os_from(at.part()?)?),
                     _ => return Err("a variable's value is neither there nor not".to_owned()),
                 };
                 traced.env.push((name, value));
@@ -713,5 +763,17 @@ mod tests {
             assert!(decode(&bytes[..bytes.len() - 1]).is_err());
         }
         assert!(decode(b"blaze v2 report1\x02\xff\xff\xff\xff\xff\xff\xff\xff").is_err());
+    }
+
+    #[test]
+    fn wtf8_reads_as_windows_writes_it() {
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        for text in ["", "a.rs", "é/ß", "日本", "🦀/x"] {
+            assert_eq!(wide_of_wtf8(text.as_bytes()), Ok(wide(text)));
+        }
+        assert_eq!(wide_of_wtf8(b"a\xed\xa0\x80"), Ok(vec![0x61, 0xd800]));
+        for bad in [&b"\xc0\x80"[..], b"\xe0\x80\x80", b"\xf4\x90\x80\x80", b"\xe6\x97", b"\x80", b"\xff"] {
+            assert!(wide_of_wtf8(bad).is_err(), "{bad:?}");
+        }
     }
 }

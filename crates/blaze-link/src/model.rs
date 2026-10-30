@@ -223,10 +223,63 @@ pub(crate) struct Fixup {
 pub(crate) struct Sym(pub u32);
 
 /// A native input as a format reads it.
+///
+/// Readers copy nothing they can point at: a section's bytes are a range of the input
+/// ([`Data::Input`]), every name is a [`Name`] in the file's one [`Names`] arena, relocations
+/// and group members are ranges of one column per object. The core checks every range once
+/// when it takes the file ([`crate::native`]) and reads them in place after that.
 pub(crate) enum NativeFile {
     Object(Object),
     Archive(Archive),
     Shared(Shared),
+}
+
+/// A name in a file's [`Names`]: `len` bytes from `at`. Made only by [`Names::push`], so it
+/// always starts and ends on a character boundary of the arena it came from.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct Name {
+    at: u32,
+    len: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<Name>() == 8);
+
+/// Every name of one native file, one after another in one allocation.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub(crate) struct Names(String);
+
+impl Names {
+    pub fn with_capacity(bytes: usize) -> Names {
+        Names(String::with_capacity(bytes))
+    }
+
+    /// Adds `name`; an error past 4 GiB of names in one file.
+    pub fn push(&mut self, name: &str) -> Result<Name, String> {
+        let at = u32::try_from(self.0.len()).ok();
+        let len = u32::try_from(name.len()).ok();
+        match (at, len) {
+            (Some(at), Some(len)) if at.checked_add(len).is_some() => {
+                self.0.push_str(name);
+                Ok(Name { at, len })
+            }
+            _ => Err("more than 4 GiB of names in one file".to_owned()),
+        }
+    }
+
+    /// The name, when it is one of these names.
+    pub fn get(&self, name: Name) -> Option<&str> {
+        self.0.get(name.at as usize..name.at as usize + name.len as usize)
+    }
+
+    /// The name; `name` must be one [`Names::push`] gave for these names (the core checks
+    /// every name of a file once, when it takes the file).
+    pub fn at(&self, name: Name) -> &str {
+        &self.0[name.at as usize..name.at as usize + name.len as usize]
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.0.len()
+    }
 }
 
 /// A relocatable object (`.o`, `.obj`, a member of an archive).
@@ -234,12 +287,37 @@ pub(crate) enum NativeFile {
 pub(crate) struct Object {
     pub sections: Vec<Section>,
     pub symbols: Vec<Symbol>,
+    /// Every section's relocations, each section's a run of them ([`Section::fixups`]).
+    pub fixups: Vec<NativeFixup>,
     /// COMDAT groups: of each name only the first object's sections are kept.
     pub groups: Vec<Group>,
+    /// Every group's sections, each group's a run of them ([`Group::sections`]).
+    pub grouped: Vec<u32>,
+    /// The names of the symbols, sections and groups.
+    pub names: Names,
+    /// wasm: what an undefined function is imported as when nothing defines it, by symbol
+    /// index. Other formats leave it empty.
+    pub imports: Vec<(u32, blaze_codegen::wasm::Import)>,
     /// Libraries the object asks for (`/DEFAULTLIB` of a COFF object, `LC_LINKER_OPTION`).
     pub libraries: Vec<String>,
     /// What a COFF object's `.drectve` asks of the link beyond its libraries.
     pub directives: Vec<Directive>,
+}
+
+impl Object {
+    pub fn name(&self, name: Name) -> &str {
+        self.names.at(name)
+    }
+
+    /// A section's relocations.
+    pub fn section_fixups(&self, section: &Section) -> &[NativeFixup] {
+        &self.fixups[section.fixups.start as usize..section.fixups.end as usize]
+    }
+
+    /// A group's sections.
+    pub fn group_sections(&self, group: &Group) -> &[u32] {
+        &self.grouped[group.sections.start as usize..group.sections.end as usize]
+    }
 }
 
 /// What a COFF object's `.drectve` asks of the link beyond [`Object::libraries`].
@@ -259,11 +337,12 @@ pub(crate) enum Directive {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Section {
-    pub name: String,
+    pub name: Name,
     pub what: SectionKind,
     pub align: u64,
     pub data: Data,
-    pub fixups: Vec<NativeFixup>,
+    /// Its relocations: this run of [`Object::fixups`].
+    pub fixups: Range<u32>,
     /// Kept whatever refers to it (`SHF_GNU_RETAIN`, `S_ATTR_NO_DEAD_STRIP`).
     pub retain: bool,
 }
@@ -283,6 +362,11 @@ pub(crate) enum SectionKind {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Data {
+    /// `bytes[range]` of the slice handed to [`Writer::read`] (for an archive member, the
+    /// member's own slice): the section as the file has it, never copied.
+    Input(Range<u64>),
+    /// Bytes the reader made: ones the file does not hold as they are (a header it
+    /// prepends, a section it rewrote).
     Bytes(Vec<u8>),
     Zero(u64),
 }
@@ -290,8 +374,24 @@ pub(crate) enum Data {
 impl Data {
     pub fn len(&self) -> u64 {
         match self {
+            Data::Input(range) => range.end.saturating_sub(range.start),
             Data::Bytes(bytes) => bytes.len() as u64,
             Data::Zero(size) => *size,
+        }
+    }
+
+    /// Its bytes, `input` being the slice the file was read from: none for zeroed data, an
+    /// error for a range past the input's end.
+    pub fn bytes<'b>(&'b self, input: &'b [u8]) -> Result<Option<&'b [u8]>, String> {
+        match self {
+            Data::Input(range) => usize::try_from(range.start)
+                .ok()
+                .zip(usize::try_from(range.end).ok())
+                .and_then(|(start, end)| input.get(start..end))
+                .map(Some)
+                .ok_or_else(|| format!("bytes {range:?} past the input's {} bytes", input.len())),
+            Data::Bytes(bytes) => Ok(Some(bytes)),
+            Data::Zero(_) => Ok(None),
         }
     }
 }
@@ -306,17 +406,19 @@ pub(crate) struct NativeFixup {
     pub minus: Option<u32>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+const _: () = assert!(std::mem::size_of::<NativeFixup>() <= 40);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Symbol {
-    pub name: String,
+    pub name: Name,
     pub def: SymbolDef,
     pub binding: Binding,
     pub kind: SymbolKind,
     /// Not exported from a shared library (`STV_HIDDEN`, a private extern).
     pub hidden: bool,
-    /// wasm: what an undefined function is imported as when nothing defines it.
-    pub import: Option<blaze_codegen::wasm::Import>,
 }
+
+const _: () = assert!(std::mem::size_of::<Symbol>() <= 48);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SymbolDef {
@@ -353,8 +455,9 @@ pub(crate) enum SymbolKind {
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Group {
-    pub name: String,
-    pub sections: Vec<u32>,
+    pub name: Name,
+    /// Its sections: this run of [`Object::grouped`].
+    pub sections: Range<u32>,
     /// Of this name the group whose first section is largest is kept, not the first one
     /// (`IMAGE_COMDAT_SELECT_LARGEST`: MSVC's vftables with or without their RTTI locator).
     pub largest: bool,
@@ -365,13 +468,22 @@ pub(crate) struct Group {
 #[derive(Clone, Debug)]
 pub(crate) struct Archive {
     pub members: Vec<Member>,
-    /// Each symbol the archive's index names and the member defining it.
-    pub index: Vec<(String, u32)>,
+    /// Each symbol the archive's index names and the member defining it, in the index's
+    /// order.
+    pub index: Vec<(Name, u32)>,
+    /// The names of the index's symbols and of the members.
+    pub names: Names,
+}
+
+impl Archive {
+    pub fn name(&self, name: Name) -> &str {
+        self.names.at(name)
+    }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Member {
-    pub name: String,
+    pub name: Name,
     pub bytes: Range<usize>,
 }
 
@@ -381,6 +493,10 @@ pub(crate) struct Shared {
     /// What the loader finds it by: the ELF `DT_SONAME`, the Mach-O install name, the DLL.
     pub name: String,
     pub symbols: Vec<SharedSymbol>,
+    /// The symbols' names.
+    pub names: Names,
+    /// The versions symbols are defined at, each once ([`SharedSymbol::version`]).
+    pub versions: Vec<String>,
     /// More shared libraries it stands for: a linker script's `GROUP`, a `.tbd`'s
     /// re-exports, an import library's members of other DLLs.
     pub more: Vec<Shared>,
@@ -389,14 +505,27 @@ pub(crate) struct Shared {
     pub inputs: Vec<String>,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+impl Shared {
+    pub fn symbol_name(&self, symbol: &SharedSymbol) -> &str {
+        self.names.at(symbol.name)
+    }
+
+    pub fn version(&self, symbol: &SharedSymbol) -> Option<&str> {
+        symbol.version.map(|it| self.versions[it as usize].as_str())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct SharedSymbol {
-    pub name: String,
-    /// The version the library defines it at by default (`GLIBC_2.2.5`).
-    pub version: Option<String>,
+    pub name: Name,
+    /// The version the library defines it at by default (`GLIBC_2.2.5`): an index into
+    /// [`Shared::versions`].
+    pub version: Option<u16>,
     pub kind: SymbolKind,
     pub weak: bool,
 }
+
+const _: () = assert!(std::mem::size_of::<SharedSymbol>() <= 16);
 
 /// A symbol the image imports from a shared library.
 #[derive(Clone, PartialEq, Eq, Debug)]

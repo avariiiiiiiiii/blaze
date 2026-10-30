@@ -352,7 +352,7 @@ fn build(walk: impl FnOnce(&mut Building)) -> ExprScopes {
 fn walk_body(sink: &mut impl ScopeSink, body: &Body) {
     let root = sink.push_scope(None, NewScope::Plain);
     if let Some(Param { formal: self_param, user_written: _ }) = body.self_param {
-        add_binding(sink, body, root, self_param);
+        add_binding(&mut *sink, body, root, self_param);
     }
     let mut visitor = ExprScopeVisitor { store: body, scopes: sink, scope: root, const_scope: root };
     body.params.iter().for_each(|param| visitor.on_pat(param.formal));
@@ -367,7 +367,8 @@ fn walk_store(
     let root = sink.push_scope(None, NewScope::Plain);
     for root_expr in roots {
         let scope = sink.push_scope(Some(root), NewScope::Plain);
-        ExprScopeVisitor { store, scopes: &mut *sink, scope, const_scope: scope }.on_expr(root_expr);
+        ExprScopeVisitor { store, scopes: &mut *sink, scope, const_scope: scope }
+            .on_expr(root_expr);
     }
 }
 
@@ -500,7 +501,7 @@ impl<S: ScopeSink> StoreVisitor for ExprScopeVisitor<'_, S> {
 
     fn on_pat(&mut self, pat: PatId) {
         if let Pat::Bind { id, .. } = self.store.pat(pat) {
-            add_binding(self.scopes, self.store, self.scope, id);
+            add_binding(&mut *self.scopes, self.store, self.scope, id);
         }
 
         self.store.visit_pat_children(pat, self);
@@ -579,7 +580,8 @@ mod tests {
     /// Every query of `scopes` answers as the model the same walk built does.
     fn assert_matches_model(scopes: &ExprScopes, model: &Model) {
         assert_eq!(scopes.len(), model.scopes.len(), "the number of scopes");
-        let all = || (0..model.scopes.len() as u32).map(|at| ScopeId::from_raw(RawIdx::from_u32(at)));
+        let all =
+            || (0..model.scopes.len() as u32).map(|at| ScopeId::from_raw(RawIdx::from_u32(at)));
         let names: Vec<&Name> = model.entries.iter().map(|it| &it.name).collect();
         for scope in all() {
             assert_eq!(scopes.scope_chain(Some(scope)).collect::<Vec<_>>(), model.chain(scope));

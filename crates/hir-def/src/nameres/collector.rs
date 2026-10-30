@@ -22,7 +22,7 @@ use hir_expand::{
     name::{AsName, Name},
     proc_macro::{CustomProcMacroExpander, ProcMacros},
 };
-use intern::{Interned, Symbol, sym};
+use intern::{Symbol, sym};
 use itertools::izip;
 use la_arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -41,7 +41,7 @@ use crate::{
     UseLoc, file_item_tree,
     item_scope::{GlobId, ImportId, ImportOrExternCrate, PerNsGlobImports},
     item_tree::{
-        self, Attrs, AttrsOrCfg, ImportAlias, ImportKind, ItemTree, ItemTreeAstId, Macro2,
+        self, Attrs, AttrsOrCfgRef, ImportAlias, ImportKind, ItemTree, ItemTreeAstId, Macro2,
         MacroCall, MacroRules, Mod, ModItemId, ModItemKind, ModKind, StructValueNsCtor, TreeId,
         Use,
     },
@@ -53,7 +53,7 @@ use crate::{
         crate_def_map,
         diagnostics::DefDiagnostic,
         mod_resolution::ModDir,
-        path_resolution::{ReachedFixedPoint, ResolvePathResult},
+        path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
         proc_macro::{ProcMacroDef, ProcMacroKind, parse_macro_name_and_helper_attrs},
         sub_namespace_match,
     },
@@ -99,7 +99,7 @@ pub(super) fn collect_defs(
         local_def_map: LocalDefMap::default(),
         crate_local_def_map,
         deps,
-        globs: GlobEdges::default(),
+        globs: GlobEdges::new(),
         imports: Imports::new(),
         held: Vec::new(),
         path_buf: String::new(),
@@ -187,7 +187,7 @@ impl<'db> Import<'db> {
         mut cb: impl FnMut(Self),
     ) {
         let visibility = &tree[item.visibility];
-        item.expand(|idx, path, kind, alias| {
+        item.expand(tree, |idx, path, kind, alias| {
             cb(Self {
                 path,
                 alias,
@@ -245,8 +245,6 @@ fn written_ns(defs: &PerNs) -> u8 {
 enum WaitOn {
     /// A name in the scope of a module of this def map.
     Slot(ModuleId, Name),
-    /// The types a module of this def map declares: an enum's visibility as declared there.
-    Declared(ModuleId),
     /// What a path's first segment finds besides module scopes: a legacy macro, the extern
     /// prelude, the `macro_use` prelude.
     Env(Name),
@@ -317,10 +315,13 @@ struct Imports<'db> {
     edges: Vec<WaitEdge>,
     /// Head of the edges unlinked from every key, reused before `edges` grows.
     free_edge: u32,
-    /// Whether any import waits on a `WaitOn::Declared`.
-    declared_waits: bool,
+    /// The imports, with the attempt, that read something without a key (a module's children,
+    /// all its declarations): any write wakes them.
+    any_waiters: Vec<(u32, u32)>,
     /// Scratch: the keys of the attempt being registered.
     keys: Vec<(WaitOn, u8)>,
+    /// Scratch: whether the attempt being registered read something without a key.
+    keys_any: bool,
     /// Scratch: the imports a write woke.
     woken: Vec<u32>,
     #[cfg(test)]
@@ -346,8 +347,9 @@ impl<'db> Imports<'db> {
             waits: FxHashMap::default(),
             edges: Vec::new(),
             free_edge: NONE,
-            declared_waits: false,
+            any_waiters: Vec::new(),
             keys: Vec::new(),
+            keys_any: false,
             woken: Vec::new(),
             #[cfg(test)]
             rounds: RESOLVE_STRATEGY.get() == ResolveStrategy::Rounds,
@@ -500,12 +502,21 @@ impl<'db> Imports<'db> {
         *generation = generation.wrapping_add(1);
     }
 
-    /// Makes import `at`'s current attempt wait on `self.keys`, and clears them.
+    /// Makes import `at`'s current attempt wait on `self.keys` (and on any write if
+    /// `self.keys_any`), and clears them.
     fn wait(&mut self, at: u32) {
+        #[cfg(test)]
+        if self.rounds {
+            self.keys.clear();
+            self.keys_any = false;
+            return;
+        }
         let generation = self.generation[at as usize];
+        if mem::take(&mut self.keys_any) {
+            self.any_waiters.push((at, generation));
+        }
         for k in 0..self.keys.len() {
             let (key, ns) = self.keys[k];
-            self.declared_waits |= matches!(key, WaitOn::Declared(_));
             let edge = WaitEdge { import: at, generation, next: NONE, ns };
             let slot = match self.free_edge {
                 NONE => {
@@ -556,19 +567,35 @@ impl<'db> Imports<'db> {
         }
     }
 
+    /// Wakes the imports whose attempt waits on any write; stale ones are dropped.
+    fn wake_any(&mut self) {
+        let mut waiters = mem::take(&mut self.any_waiters);
+        for (at, generation) in waiters.drain(..) {
+            if self.generation[at as usize] == generation {
+                self.wake(at);
+            }
+        }
+        self.any_waiters = waiters;
+    }
+
     /// A write of the namespaces `ns` of `name` in the scope of `module`.
     fn wake_slot(&mut self, module: ModuleId, name: Name, ns: u8) {
-        if self.waits.is_empty() {
+        if ns == 0 {
             return;
         }
-        self.wake_on(&WaitOn::Slot(module, name), ns);
-        if ns & TYPES != 0 && self.declared_waits {
-            self.wake_on(&WaitOn::Declared(module), TYPES);
+        if !self.any_waiters.is_empty() {
+            self.wake_any();
+        }
+        if !self.waits.is_empty() {
+            self.wake_on(&WaitOn::Slot(module, name), ns);
         }
     }
 
     /// A new legacy macro, extern prelude or `macro_use` prelude entry named `name`.
     fn wake_env(&mut self, name: Name, ns: u8) {
+        if !self.any_waiters.is_empty() {
+            self.wake_any();
+        }
         if !self.waits.is_empty() {
             self.wake_on(&WaitOn::Env(name), ns);
         }
@@ -582,119 +609,70 @@ impl<'db> Imports<'db> {
     }
 }
 
-/// What resolving `path` from `module` read that collecting this def map can still change,
-/// pushed to `out` with the namespaces read, for the state as it is. It errs on the side of
-/// more: it follows a module a segment names whatever its visibility, and both the module's and
-/// the std prelude's binding of a first segment. The def maps of other crates and of the blocks
-/// around this one are collected already, so what a path reads there waits on nothing.
-fn import_waits(
-    db: &dyn SourceDatabase,
-    def_map: &DefMap,
-    module: ModuleId,
-    path: &ModPath,
-    out: &mut Vec<(WaitOn, u8)>,
-) {
-    let segments = path.segments();
-    let local = |m: ModuleId| m.krate(db) == def_map.krate && m.block(db) == def_map.block_id();
-    let crate_root = def_map.block.is_none().then_some(def_map.root);
-    let ns_at = |at: usize| if at + 1 == segments.len() { ALL_NS } else { TYPES };
-    let follow = |out: &mut Vec<(WaitOn, u8)>, mut module: ModuleId, mut at: usize| loop {
-        let Some(&name) = segments.get(at) else { return };
-        out.push((WaitOn::Slot(module, name), ns_at(at)));
-        let types = def_map.module(db, module).name_in_scope(db, &name).types;
-        at += 1;
-        if at == segments.len() {
-            return;
-        }
-        match types.map(|it| it.def) {
-            Some(ModuleDefId::ModuleId(next)) if local(next) => module = next,
-            Some(ModuleDefId::AdtId(AdtId::EnumId(e))) => {
-                let container = e.lookup(db).container;
-                if local(container) {
-                    out.push((WaitOn::Declared(container), TYPES));
-                }
-                return;
-            }
-            _ => return,
-        }
-    };
-    match path.kind {
-        PathKind::DollarCrate(krate) => {
-            if krate == def_map.krate
-                && let Some(root) = crate_root
-            {
-                follow(out, root, 0);
-            }
-        }
-        PathKind::Crate => {
-            if let Some(root) = crate_root {
-                follow(out, root, 0);
-            }
-        }
-        // An import in 2015: the crate root, then the extern prelude.
-        PathKind::Plain | PathKind::Abs if def_map.data.edition == Edition::Edition2015 => {
-            let Some(&first) = segments.first() else { return };
-            out.push((WaitOn::Env(first), ns_at(0)));
-            if let Some(root) = crate_root {
-                follow(out, root, 0);
-            }
-        }
-        PathKind::Plain => {
-            let Some(&first) = segments.first() else { return };
-            out.push((WaitOn::Env(first), ns_at(0)));
-            follow(out, module, 0);
-            if let Some((prelude, _)) = def_map.prelude
-                && local(prelude)
-            {
-                follow(out, prelude, 0);
-            }
-        }
-        // `super` counts from the nearest module that is not a block's; one out of this def
-        // map is collected.
-        PathKind::Super(levels) => {
-            let in_block = def_map.block.is_some();
-            let mut at = module;
-            if in_block && at == def_map.root {
-                return;
-            }
-            for _ in 0..levels {
-                match def_map.module(db, at).parent {
-                    Some(parent) => at = parent,
-                    None => return,
-                }
-                if in_block && at == def_map.root {
-                    return;
-                }
-            }
-            follow(out, at, 0);
-        }
-        PathKind::Abs => {
-            if let Some(&first) = segments.first() {
-                out.push((WaitOn::Env(first), ns_at(0)));
-            }
-        }
-    }
-}
-
-/// A module that glob-imports another, linked to the source's next importer. The importers of
-/// one source keep the order they were found in.
-#[derive(Clone, Copy)]
-struct GlobEdge {
-    importer: ModuleId,
-    vis: Visibility,
-    glob: GlobId,
+/// One importer of a source, linked to the source's next importer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImporterEdge<K, T> {
+    importer: K,
+    data: T,
     next: u32,
 }
 
-/// The glob imports between modules of this def map, as a list of importers per source.
-#[derive(Default)]
-struct GlobEdges {
-    edges: Vec<GlobEdge>,
-    /// Head and tail of each source's importers.
-    heads: FxHashMap<ModuleId, (u32, u32)>,
+/// The importers of each source, each list in the order its importers came: one array of edges,
+/// linked per source. An edge is appended without moving the others, so a list is read in place
+/// while its importers are visited.
+struct ImporterLists<K, T> {
+    edges: Vec<ImporterEdge<K, T>>,
+    /// Head and tail of each source's list.
+    heads: FxHashMap<K, (u32, u32)>,
     /// The edge of each `(source, importer)`.
-    by_pair: FxHashMap<(ModuleId, ModuleId), u32>,
+    by_pair: FxHashMap<(K, K), u32>,
 }
+
+impl<K: Copy + Eq + std::hash::Hash, T: Copy> ImporterLists<K, T> {
+    fn new() -> Self {
+        ImporterLists {
+            edges: Vec::new(),
+            heads: FxHashMap::default(),
+            by_pair: FxHashMap::default(),
+        }
+    }
+
+    /// Adds `importer` to the importers of `source`, or, if it is one already, lets `merge`
+    /// update the data it has.
+    fn add(&mut self, source: K, importer: K, data: T, merge: impl FnOnce(&mut T)) {
+        match self.by_pair.entry((source, importer)) {
+            Entry::Occupied(it) => merge(&mut self.edges[*it.get() as usize].data),
+            Entry::Vacant(it) => {
+                let edge = self.edges.len() as u32;
+                it.insert(edge);
+                self.edges.push(ImporterEdge { importer, data, next: NONE });
+                match self.heads.entry(source) {
+                    Entry::Occupied(mut it) => {
+                        let (_, tail) = it.get_mut();
+                        self.edges[*tail as usize].next = edge;
+                        *tail = edge;
+                    }
+                    Entry::Vacant(it) => {
+                        it.insert((edge, edge));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first edge of `source`'s list, or `NONE`.
+    fn first(&self, source: K) -> u32 {
+        self.heads.get(&source).map_or(NONE, |&(head, _)| head)
+    }
+
+    fn edge(&self, at: u32) -> ImporterEdge<K, T> {
+        self.edges[at as usize]
+    }
+}
+
+/// The glob imports between modules of this def map: for each module, the modules that
+/// glob-import it, with the visibility and the glob.
+type GlobEdges = ImporterLists<ModuleId, (Visibility, GlobId)>;
 
 /// A macro call a round resolved: its module, depth, container, call and the item an
 /// attribute macro is on.
@@ -811,9 +789,9 @@ impl<'db> DefCollector<'db> {
         let file_id = self.def_map.krate.root_file_id(self.db);
         let item_tree = file_item_tree(self.db, file_id.into(), self.def_map.krate);
         let attrs = match item_tree.top_level_attrs() {
-            Some(AttrsOrCfg::Enabled { attrs }) => attrs.as_ref(),
+            Some(AttrsOrCfgRef::Enabled { attrs }) => attrs,
             None => Attrs::EMPTY,
-            Some(AttrsOrCfg::CfgDisabled(it)) => it.1.as_ref(),
+            Some(AttrsOrCfgRef::CfgDisabled(_, attrs)) => attrs,
         };
         let crate_data = Arc::get_mut(&mut self.def_map.data).unwrap();
 
@@ -908,13 +886,11 @@ impl<'db> DefCollector<'db> {
         self.inject_std_extern_crate();
 
         let items = item_tree.top_level_items();
-        let items = if let Some(AttrsOrCfg::CfgDisabled(attrs)) = item_tree.top_level_attrs() {
-            let (cfg_expr, _) = &**attrs;
+        let items = if let Some(AttrsOrCfgRef::CfgDisabled(cfg_expr, _)) = item_tree.top_level_attrs() {
             self.def_map.diagnostics.push(DefDiagnostic::unconfigured_code(
                 self.def_map.root,
                 InFile::new(file_id.into(), ROOT_ERASED_FILE_AST_ID),
                 cfg_expr.clone(),
-                self.cfg_options.clone(),
             ));
             // rustc takes the crate's items away before it injects its test harness, so a
             // test crate of `#![cfg(target_arch = "wasm32")]` still has a `main` that runs
@@ -924,7 +900,7 @@ impl<'db> DefCollector<'db> {
             let Some(item) = appended.and_then(|name| {
                 items.last().filter(|&&item| {
                     matches!(item_tree.index(item),
-                        ModItemKind::Mod(_, module) if module.name.as_str() == name)
+                        ModItemKind::Mod(_, module) if item_tree[module.name].as_str() == name)
                 })
             }) else {
                 return;
@@ -950,7 +926,7 @@ impl<'db> DefCollector<'db> {
     fn seed_with_inner(&mut self, tree_id: TreeId) {
         let item_tree = tree_id.item_tree(self.db, self.def_map.krate);
         let is_cfg_enabled =
-            matches!(item_tree.top_level_attrs(), Some(AttrsOrCfg::Enabled { .. }) | None);
+            matches!(item_tree.top_level_attrs(), Some(AttrsOrCfgRef::Enabled { .. }) | None);
         if is_cfg_enabled {
             self.inject_prelude();
 
@@ -1067,7 +1043,7 @@ impl<'db> DefCollector<'db> {
                             attr_args: None,
                             censored_attr_ids: AttrMacroAttrIds::from_one(*attr_id),
                         },
-                        (*attr.path).clone(),
+                        ModPath::clone(&attr.path),
                     ));
 
                     self.skip_attrs.insert(ast_id.ast_id.with_value(*mod_item), *attr_id);
@@ -1491,29 +1467,52 @@ impl<'db> DefCollector<'db> {
 
     /// Makes import `at` wait on what its attempt just read.
     fn wait_on_path(&mut self, at: u32) {
-        #[cfg(test)]
-        if self.imports.rounds {
-            return;
-        }
-        let Imports { directives, keys, .. } = &mut self.imports;
-        let directive = &directives[at as usize];
-        import_waits(self.db, &self.def_map, directive.module_id, &directive.import.path, keys);
         self.imports.wait(at);
     }
 
-    fn resolve_import(&self, at: u32) -> PartialResolvedImport {
+    /// Resolves import `at`, leaving in `imports.keys` (and `imports.keys_any`) what the lookup
+    /// read that collecting this def map can still change, for `wait_on_path`.
+    fn resolve_import(&mut self, at: u32) -> PartialResolvedImport {
         #[cfg(test)]
         RESOLVE_IMPORT_CALLS.with(|it| it.set(it.get() + 1));
-        let directive = &self.imports.directives[at as usize];
+        let db = self.db;
+        let def_map = &self.def_map;
+        let Imports { directives, keys, keys_any, .. } = &mut self.imports;
+        keys.clear();
+        *keys_any = false;
+        let directive = &directives[at as usize];
+        let path = &directive.import.path;
+        let last = path.segments().last().copied();
+        let in_crate = def_map.block.is_none();
+        let local = |m: ModuleId| m.krate(db) == def_map.krate && m.block(db) == def_map.block_id();
+        // The def maps of other crates and of the blocks around this one are collected, so what
+        // the lookup reads there waits on nothing. A name other than the last is read for the
+        // module or type it names.
+        let mut reads = |read: PathRead| match read {
+            PathRead::Slot(module, name) if local(module) => {
+                let ns = if Some(name) == last { ALL_NS } else { TYPES };
+                keys.push((WaitOn::Slot(module, name), ns));
+            }
+            PathRead::LegacyMacro(module, name) if local(module) => {
+                keys.push((WaitOn::Env(name), MACROS));
+            }
+            PathRead::ExternPrelude(name) if in_crate => keys.push((WaitOn::Env(name), TYPES)),
+            PathRead::MacroUsePrelude(name) => keys.push((WaitOn::Env(name), MACROS)),
+            // A new std prelude module wakes every import.
+            PathRead::Prelude => {}
+            PathRead::Unscoped => *keys_any = true,
+            PathRead::Slot(..) | PathRead::LegacyMacro(..) | PathRead::ExternPrelude(_) => {}
+        };
         let ResolvePathResult { resolved_def, segment_index, reached_fixedpoint, prefix_info } =
-            self.def_map.resolve_path_fp_with_macro(
+            def_map.resolve_path_fp_recording(
                 self.crate_local_def_map.unwrap_or(&self.local_def_map),
-                self.db,
+                db,
                 ResolveMode::Import,
                 directive.module_id,
-                &directive.import.path,
+                path,
                 BuiltinShadowMode::Module,
                 None, // An import may resolve to any kind of macro.
+                &mut reads,
             );
 
         if reached_fixedpoint == ReachedFixedPoint::No
@@ -1680,37 +1679,12 @@ impl<'db> DefCollector<'db> {
                                 Some(ImportOrExternCrate::Glob(glob)),
                             );
                             // record the glob import in case we add further items
-                            let globs = &mut self.globs;
-                            match globs.by_pair.entry((m, module_id)) {
-                                Entry::Occupied(it) => {
-                                    let edge = &mut globs.edges[*it.get() as usize];
-                                    if let Some(new_vis) =
-                                        edge.vis.max(self.db, vis, &self.def_map)
-                                    {
-                                        edge.vis = new_vis;
-                                    }
+                            let (db, def_map) = (self.db, &self.def_map);
+                            self.globs.add(m, module_id, (vis, glob), |(old_vis, _)| {
+                                if let Some(new_vis) = old_vis.max(db, vis, def_map) {
+                                    *old_vis = new_vis;
                                 }
-                                Entry::Vacant(it) => {
-                                    let edge = globs.edges.len() as u32;
-                                    it.insert(edge);
-                                    globs.edges.push(GlobEdge {
-                                        importer: module_id,
-                                        vis,
-                                        glob,
-                                        next: NONE,
-                                    });
-                                    match globs.heads.entry(m) {
-                                        Entry::Occupied(mut it) => {
-                                            let (_, tail) = it.get_mut();
-                                            globs.edges[*tail as usize].next = edge;
-                                            *tail = edge;
-                                        }
-                                        Entry::Vacant(it) => {
-                                            it.insert((edge, edge));
-                                        }
-                                    }
-                                }
-                            }
+                            });
                         }
                     }
                     Some(ModuleDefId::AdtId(AdtId::EnumId(e))) => {
@@ -1879,7 +1853,10 @@ impl<'db> DefCollector<'db> {
         if !changed {
             return;
         }
-        let Some(&(first_edge, _)) = self.globs.heads.get(&module_id) else { return };
+        let first_edge = self.globs.first(module_id);
+        if first_edge == NONE {
+            return;
+        }
         // A name this module already had in one namespace kept its own item there, so only
         // what the module now holds reaches the modules that glob-import it. Those go after
         // this level's, and are taken off when its importers are done.
@@ -1911,8 +1888,8 @@ impl<'db> DefCollector<'db> {
         // Propagating adds no glob edge, so the list read as it goes is the list as it was.
         let mut edge = first_edge;
         while edge != NONE {
-            let GlobEdge { importer, vis: glob_import_vis, glob, next } =
-                self.globs.edges[edge as usize];
+            let ImporterEdge { importer, data: (glob_import_vis, glob), next } =
+                self.globs.edge(edge);
             edge = next;
             // we know all resolutions have the same visibility (`vis`), so we
             // just need to check that once
@@ -2314,11 +2291,8 @@ impl<'db> DefCollector<'db> {
                             Some(derive_macros) => {
                                 let call_id = call_id();
                                 for (idx, (path, call_site, _)) in derive_macros.enumerate() {
-                                    let ast_id = AstIdWithPath::new(
-                                        file_id,
-                                        ast_id.value,
-                                        Interned::new(path),
-                                    );
+                                    let ast_id =
+                                        AstIdWithPath::new(file_id, ast_id.value, path);
 
                                     derive_call_ids.push(None);
 
@@ -2441,7 +2415,7 @@ impl<'db> DefCollector<'db> {
                             self.def_map.diagnostics.push(DefDiagnostic::macro_error(
                                 directive.module_id,
                                 ast_id,
-                                (**path).clone(),
+                                ModPath::clone(path),
                                 err,
                             ));
                             return recollect_without(self);
@@ -2659,7 +2633,7 @@ impl<'db> DefCollector<'db> {
                             derive_index: *derive_pos as u32,
                             derive_macro_id: *derive_macro_id,
                         },
-                        (*ast_id.path).clone(),
+                        ModPath::clone(&ast_id.path),
                     ));
                 }
                 // These are diagnosed by `reseed_with_unresolved_attribute`, as that function consumes them
@@ -2790,11 +2764,11 @@ impl ModCollector<'_, '_> {
 
         let mut process_mod_item = |item_id: ModItemId| {
             let attrs = match item_tree.attrs(item_id) {
-                Some(AttrsOrCfg::Enabled { attrs }) => attrs.as_ref(),
+                Some(AttrsOrCfgRef::Enabled { attrs }) => attrs,
                 None => Attrs::EMPTY,
-                Some(AttrsOrCfg::CfgDisabled(cfg)) => {
+                Some(AttrsOrCfgRef::CfgDisabled(cfg, _)) => {
                     let ast_id = item_id.ast_id(self.item_tree).erase();
-                    self.emit_unconfigured_diagnostic(InFile::new(self.file_id(), ast_id), &cfg.0);
+                    self.emit_unconfigured_diagnostic(InFile::new(self.file_id(), ast_id), cfg);
                     return;
                 }
             };
@@ -2827,6 +2801,8 @@ impl ModCollector<'_, '_> {
                 }
                 ModItemKind::ExternCrate(ast_id, item) => {
                     let item_tree::ExternCrate { name, visibility, alias } = item;
+                    let name = &item_tree[*name];
+                    let alias = item_tree.import_alias(*alias);
 
                     let id = ExternCrateLoc {
                         container: module_id,
@@ -2848,7 +2824,7 @@ impl ModCollector<'_, '_> {
                             .map(|dep| crate_def_map(db, dep.crate_id).root_module_id())
                     };
 
-                    let name = match alias {
+                    let name = match &alias {
                         Some(ImportAlias::Alias(name)) => Some(name),
                         Some(ImportAlias::Underscore) => None,
                         None => Some(name),
@@ -2910,7 +2886,7 @@ impl ModCollector<'_, '_> {
                     self.def_collector.def_map.modules.building()[self.module_id]
                         .scope_mut()
                         .define_extern_block(extern_block_id);
-                    self.collect(&block.children, ItemContainerId::ExternBlockId(extern_block_id))
+                    self.collect(item_tree.items(block.children), ItemContainerId::ExternBlockId(extern_block_id))
                 }
                 ModItemKind::MacroCall(ast_id, mac) => {
                     self.collect_macro_call(ast_id, mac, container)
@@ -2936,12 +2912,12 @@ impl ModCollector<'_, '_> {
 
                     let vis = resolve_vis(def_map, local_def_map, &self.item_tree[it.visibility]);
 
-                    update_def(self.def_collector, fn_id.into(), &it.name, vis, None);
+                    update_def(self.def_collector, fn_id.into(), &item_tree[it.name], vis, None);
 
                     if self.def_collector.def_map.block.is_none()
                         && self.def_collector.is_proc_macro
                         && self.module_id == self.def_collector.def_map.root
-                        && let Some(proc_macro) = attrs.parse_proc_macro_decl(&it.name)
+                        && let Some(proc_macro) = attrs.parse_proc_macro_decl(&item_tree[it.name])
                     {
                         // A proc macro is implemented as a function, which is a macro to other
                         // crates. In its own it is a function still, which can be called and
@@ -2956,7 +2932,7 @@ impl ModCollector<'_, '_> {
                 }
                 ModItemKind::Struct(ast_id, it) => {
                     let vis = resolve_vis(def_map, local_def_map, &self.item_tree[it.visibility]);
-                    let value_ns_ctor_vis = match &it.value_ns_ctor {
+                    let value_ns_ctor_vis = match item_tree.value_ns_ctor(it) {
                         StructValueNsCtor::NoValueNsCtor => None,
                         StructValueNsCtor::ValueNsCtorWithVis(vis) => {
                             Some(resolve_vis(def_map, local_def_map, &self.item_tree[*vis]))
@@ -2984,7 +2960,7 @@ impl ModCollector<'_, '_> {
                     update_def(
                         self.def_collector,
                         interned.into(),
-                        &it.name,
+                        &item_tree[it.name],
                         vis,
                         value_ns_ctor_vis,
                     );
@@ -3003,7 +2979,7 @@ impl ModCollector<'_, '_> {
                         interned.into(),
                         def_map,
                     );
-                    update_def(self.def_collector, interned.into(), &it.name, vis, None);
+                    update_def(self.def_collector, interned.into(), &item_tree[it.name], vis, None);
                 }
                 ModItemKind::Enum(ast_id, it) => {
                     let enum_ = EnumLoc {
@@ -3020,14 +2996,14 @@ impl ModCollector<'_, '_> {
                         def_map,
                     );
                     let vis = resolve_vis(def_map, local_def_map, &self.item_tree[it.visibility]);
-                    update_def(self.def_collector, enum_.into(), &it.name, vis, None);
+                    update_def(self.def_collector, enum_.into(), &item_tree[it.name], vis, None);
                 }
                 ModItemKind::Const(ast_id, it) => {
                     let const_id =
                         ConstLoc { container, id: InFile::new(self.tree_id.file_id(), ast_id) }
                             .intern(db);
 
-                    match &it.name {
+                    match item_tree.get_name(it.name) {
                         Some(name) => {
                             let vis =
                                 resolve_vis(def_map, local_def_map, &self.item_tree[it.visibility]);
@@ -3048,7 +3024,7 @@ impl ModCollector<'_, '_> {
                         StaticLoc { container, id: InFile::new(self.file_id(), ast_id) }
                             .intern(db)
                             .into(),
-                        &it.name,
+                        &item_tree[it.name],
                         vis,
                         None,
                     );
@@ -3060,7 +3036,7 @@ impl ModCollector<'_, '_> {
                         TraitLoc { container: module_id, id: InFile::new(self.file_id(), ast_id) }
                             .intern(db)
                             .into(),
-                        &it.name,
+                        &item_tree[it.name],
                         vis,
                         None,
                     );
@@ -3072,7 +3048,7 @@ impl ModCollector<'_, '_> {
                         TypeAliasLoc { container, id: InFile::new(self.file_id(), ast_id) }
                             .intern(db)
                             .into(),
-                        &it.name,
+                        &item_tree[it.name],
                         vis,
                         None,
                     );
@@ -3138,20 +3114,22 @@ impl ModCollector<'_, '_> {
         module: &Mod,
         attrs: Attrs<'_>,
     ) {
+        let item_tree = self.item_tree;
+        let name = &item_tree[module.name];
         let path_attr = attrs.by_key(sym::path).string_value_unescape();
         let is_macro_use = attrs.by_key(sym::macro_use).exists();
-        match &module.kind {
+        match item_tree.mod_kind(module) {
             // inline module, just recurse
             ModKind::Inline { items } => {
                 let module_id = self.push_child_module(
-                    module.name.clone(),
+                    name.clone(),
                     module_ast_id,
                     None,
                     &self.item_tree[module.visibility],
                 );
 
                 let Some(mod_dir) = self.mod_dir.descend_into_definition(
-                    &module.name,
+                    name,
                     path_attr.as_deref(),
                     &mut self.def_collector.path_buf,
                 ) else {
@@ -3180,7 +3158,7 @@ impl ModCollector<'_, '_> {
                     db,
                     krate,
                     file_id,
-                    &module.name,
+                    name,
                     path_attr.as_deref(),
                     &mut self.def_collector.path_buf,
                 ) {
@@ -3189,15 +3167,15 @@ impl ModCollector<'_, '_> {
                             file_item_tree(db, file_id.into(), self.def_collector.def_map.krate);
                         let top_level_attrs = item_tree.top_level_attrs();
                         match top_level_attrs {
-                            Some(AttrsOrCfg::CfgDisabled(cfg)) => {
+                            Some(AttrsOrCfgRef::CfgDisabled(cfg, _)) => {
                                 self.emit_unconfigured_diagnostic(
                                     InFile::new(self.file_id(), module_ast_id.erase()),
-                                    &cfg.0,
+                                    cfg,
                                 );
                             }
-                            Some(AttrsOrCfg::Enabled { .. }) | None => {
+                            Some(AttrsOrCfgRef::Enabled { .. }) | None => {
                                 let module_id = self.push_child_module(
-                                    module.name.clone(),
+                                    name.clone(),
                                     ast_id.value,
                                     Some((file_id, is_mod_rs)),
                                     &self.item_tree[module.visibility],
@@ -3212,7 +3190,7 @@ impl ModCollector<'_, '_> {
                                 }
                                 .collect_in_top_module(item_tree.top_level_items());
                                 let is_macro_use = is_macro_use
-                                    || matches!(top_level_attrs, Some(AttrsOrCfg::Enabled { attrs }) if attrs.as_ref().by_key(sym::macro_use).exists());
+                                    || matches!(top_level_attrs, Some(AttrsOrCfgRef::Enabled { attrs }) if attrs.by_key(sym::macro_use).exists());
                                 if is_macro_use {
                                     self.import_all_legacy_macros(module_id);
                                 }
@@ -3221,7 +3199,7 @@ impl ModCollector<'_, '_> {
                     }
                     Err(candidates) => {
                         self.push_child_module(
-                            module.name.clone(),
+                            name.clone(),
                             ast_id.value,
                             None,
                             &self.item_tree[module.visibility],
@@ -3265,6 +3243,8 @@ impl ModCollector<'_, '_> {
             },
         };
 
+        // SAFETY: the def-map query running now makes this tracked struct and keeps it only in its
+        // own result; salsa deletes it only when this query reruns, which replaces that result.
         let module = unsafe {
             crate::ModuleIdLt::new(
                 self.def_collector.db,
@@ -3332,7 +3312,7 @@ impl ModCollector<'_, '_> {
             let ast_id = AstIdWithPath::new(
                 self.file_id(),
                 mod_item.ast_id(self.item_tree),
-                attr.path.clone(),
+                ModPath::clone(&attr.path),
             );
             self.def_collector.unresolved_macros.push(MacroDirective {
                 module_id: self.module_id,
@@ -3391,7 +3371,7 @@ impl ModCollector<'_, '_> {
                         });
                     match explicit_name {
                         Some(ident) => &ident.as_name(),
-                        None => &mac.name,
+                        None => &self.item_tree[mac.name],
                     }
                 }
             };
@@ -3435,7 +3415,7 @@ impl ModCollector<'_, '_> {
         .intern(self.def_collector.db);
         self.def_collector.define_macro_rules(
             self.module_id,
-            mac.name.clone(),
+            self.item_tree[mac.name].clone(),
             macro_id,
             is_export,
         );
@@ -3449,17 +3429,19 @@ impl ModCollector<'_, '_> {
         module: ModuleId,
     ) {
         let krate = self.def_collector.def_map.krate;
+        let item_tree = self.item_tree;
+        let mac_name = &item_tree[mac.name];
         let f_ast_id = InFile::new(self.file_id(), ast_id.upcast());
 
         // Case 1: builtin macros
         let mut helpers_opt = None;
         let expander = if attrs.by_key(sym::rustc_builtin_macro).exists() {
-            if let Some(expander) = find_builtin_macro(&mac.name) {
+            if let Some(expander) = find_builtin_macro(mac_name) {
                 match expander {
                     Either::Left(it) => MacroExpander::BuiltIn(it),
                     Either::Right(it) => MacroExpander::BuiltInEager(it),
                 }
-            } else if let Some(expander) = find_builtin_derive(&mac.name) {
+            } else if let Some(expander) = find_builtin_derive(mac_name) {
                 if let Some(attr) = attrs.by_key(sym::rustc_builtin_macro).tt_values().next() {
                     // NOTE: The item *may* have both `#[rustc_builtin_macro]` and `#[proc_macro_derive]`,
                     // in which case rustc ignores the helper attributes from the latter, but it
@@ -3469,16 +3451,16 @@ impl ModCollector<'_, '_> {
                         // macro name, but we assume it isn't as there's no such case yet. FIXME if
                         // the following assertion fails.
                         stdx::always!(
-                            name == mac.name,
+                            name == *mac_name,
                             "built-in macro {} has #[rustc_builtin_macro] which declares different name {}",
-                            mac.name.display(self.def_collector.db, Edition::LATEST),
+                            mac_name.display(self.def_collector.db, Edition::LATEST),
                             name.display(self.def_collector.db, Edition::LATEST),
                         );
                         helpers_opt = Some(helpers);
                     }
                 }
                 MacroExpander::BuiltInDerive(expander)
-            } else if let Some(expander) = find_builtin_attr(&mac.name) {
+            } else if let Some(expander) = find_builtin_attr(mac_name) {
                 MacroExpander::BuiltInAttr(expander)
             } else {
                 self.def_collector
@@ -3506,7 +3488,7 @@ impl ModCollector<'_, '_> {
         .intern(self.def_collector.db);
         self.def_collector.define_macro_def(
             self.module_id,
-            mac.name.clone(),
+            mac_name.clone(),
             macro_id,
             &self.item_tree[mac.visibility],
         );
@@ -3526,8 +3508,9 @@ impl ModCollector<'_, '_> {
         macro_call: &MacroCall,
         container: ItemContainerId,
     ) {
-        let &MacroCall { ref path, expand_to, ctxt } = macro_call;
-        let ast_id = AstIdWithPath::new(self.file_id(), ast_id, path.clone());
+        let &MacroCall { path, expand_to, ctxt } = macro_call;
+        let path = &self.item_tree[path];
+        let ast_id = AstIdWithPath::new(self.file_id(), ast_id, ModPath::clone(path));
         let db = self.def_collector.db;
 
         // FIXME: Immediately expanding in "Case 1" is insufficient since "Case 2" may also define
@@ -3700,7 +3683,6 @@ impl ModCollector<'_, '_> {
             self.module_id,
             ast_id,
             cfg.clone(),
-            self.def_collector.cfg_options.clone(),
         ));
     }
 

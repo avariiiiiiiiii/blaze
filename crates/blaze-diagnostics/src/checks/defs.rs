@@ -2,19 +2,24 @@
 //! in a namespace of a module, block, enum or trait (E0428 and its kin E0252, E0254, E0255,
 //! E0259, E0260); a field declared twice (E0124); a discriminant assigned twice (E0081) and the
 //! `repr` of an enum with no variants (E0084); a type of infinite size (E0072); a type or
-//! lifetime parameter of a type never used (E0392).
+//! lifetime parameter of a type never used (E0392), or of a type alias (E0091); a generic
+//! parameter declared twice (E0403), named `'static` (E0262) or named by an earlier default
+//! (E0128); a name bound twice in a parameter list (E0415) or a pattern (E0416).
 //!
 //! Follows rustc's `compiler/rustc_resolve/src/build_reduced_graph.rs` and
-//! `diagnostics/impls.rs` (`report_conflict`), `compiler/rustc_hir_analysis/src/collect.rs`
+//! `diagnostics/impls.rs` (`report_conflict`), `late.rs` (`with_generic_param_rib`,
+//! `visit_generic_params`, `fresh_binding`), `compiler/rustc_hir_analysis/src/collect.rs`
 //! (`FieldUniquenessCheckContext`), `check/check.rs` (`check_item_type`, `check_enum`,
-//! `detect_discriminant_duplicate`), `check/wfcheck.rs` (`check_variances_for_type_defn`,
+//! `detect_discriminant_duplicate`, `check_type_alias_type_params_are_used`), `check/wfcheck.rs` (`check_variances_for_type_defn`,
 //! `report_bivariance`), `compiler/rustc_ty_utils/src/representability.rs` and
 //! `compiler/rustc_query_impl/src/handle_cycle_error.rs` (`recursive_type_error`)
 //! (MIT or Apache-2.0).
 
+mod bindings;
 mod conflicts;
 mod discriminants;
 mod fields;
+mod generics;
 mod recursive;
 mod unused;
 
@@ -36,6 +41,8 @@ use crate::{
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
     let scopes = scopes(cx);
     let mut found = conflicts::check(cx, &scopes);
+    found.extend(generics::check(cx, &scopes));
+    found.extend(bindings::check(cx));
     let adts = adts(cx, &scopes);
     found.extend(fields::check(cx, &adts));
     let mut infinite = recursive::Cycles::default();
@@ -45,6 +52,11 @@ pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
         }
         found.extend(unused::check(cx, adt));
         found.extend(infinite.check(cx, adt));
+    }
+    for def in scopes.iter().flat_map(|module| module.declarations(cx.db)) {
+        if let hir::ModuleDef::TypeAlias(alias) = def {
+            found.extend(unused::check_alias(cx, alias));
+        }
     }
     found
 }

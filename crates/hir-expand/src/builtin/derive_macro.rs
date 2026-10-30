@@ -1558,7 +1558,7 @@ fn write_ordering(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdt
             discriminant(b, false)
         });
     }
-    adt.write_match_both(b, span, (&selfs, &others), arms, arm, |b| {
+    adt.write_match_both(b, span, (&selfs[..], &others[..]), arms, arm, |b| {
         write_ordering_equal(b, span, krate, partial, true)
     });
     if discriminants {

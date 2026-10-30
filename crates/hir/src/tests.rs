@@ -1,16 +1,23 @@
 mod db;
 
 use base_db::{SourceDatabase, all_crates};
+use blaze_format::{Aligned, Persist, Record, Rel, Writer};
 use hir_def::{
-    DefWithBodyId, FunctionId, ModuleDefId, TraitId, nameres::crate_def_map,
-    signatures::FunctionSignature,
+    AdtId, AssocItemId, ConstId, DefWithBodyId, FunctionId, ImplId, ModuleDefId, TraitId,
+    VariantId,
+    nameres::crate_def_map,
+    signatures::{ConstSignature, FunctionSignature, StructSignature},
 };
 use hir_ide::{
-    InferBodyId, InferenceResult,
+    ColdBatch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits,
+    GenericPredicates, InferBodyId, InferenceResult,
+    consteval::{AllocationRec, read_allocation, write_allocation},
     db::HirDatabase,
+    infer::persist::InferenceRecord,
     next_solver::{
         DbInterner, GenericArgs, ParamEnv, Ty, TypingMode,
         infer::{DbInternerInferExt, select::EvaluationResult},
+        persist::{TyTableReader, TyTableWriter},
     },
 };
 use hir_ty_borrowck::{Checked, NotChecked, Refused};
@@ -406,5 +413,454 @@ fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
             scope.spawn(|| crate::attach_db(&db, || implements(warm, tr, &goals))).join().unwrap()
         });
         assert_eq!(elsewhere, cold, "answered on another thread");
+    });
+}
+
+const BORROWCK: &str = r#"
+//- minicore: sized, copy
+struct S;
+fn consume(_: S) {}
+fn read(_: &S) {}
+fn make() -> S { S }
+
+fn use_after_move() {
+    let s = S;
+    consume(s);
+    consume(s);
+}
+fn two_mutable_borrows() {
+    let mut s = S;
+    let a = &mut s;
+    let b = &mut s;
+    let _ = (a, b);
+}
+fn mutable_while_shared() {
+    let mut s = S;
+    let a = &s;
+    let b = &mut s;
+    read(a);
+    let _ = b;
+}
+fn move_while_borrowed() {
+    let s = S;
+    let a = &s;
+    consume(s);
+    read(a);
+}
+fn assign_while_borrowed() {
+    let mut x = 1u32;
+    let a = &x;
+    x = 2;
+    let _ = *a;
+}
+fn does_not_live_long_enough() {
+    let r;
+    {
+        let s = S;
+        r = &s;
+    }
+    read(r);
+}
+fn temporary_dropped() {
+    let r: &S;
+    r = &make();
+    read(r);
+}
+fn needless_mut() {
+    let mut s = S;
+    consume(s);
+}
+fn in_order() {
+    let mut s = S;
+    let a = &s;
+    let b = &mut s;
+    read(a);
+    let _ = b;
+    consume(s);
+    consume(s);
+}
+"#;
+
+const MOVED: (&str, &str) = ("E0382", "use of moved value: `s`");
+const MUTABLE_WHILE_SHARED: (&str, &str) =
+    ("E0502", "cannot borrow `s` as mutable because it is also borrowed as immutable");
+
+/// The borrow check of `BORROWCK`'s `name` gives exactly `expected`, rustc's codes and primary
+/// messages in rustc's order, and the gate refuses it unless all of them are lints.
+fn borrowck_gives(name: &str, expected: &[(&str, &str)]) {
+    let db = TestDB::with_files(BORROWCK);
+    crate::attach_db(&db, || {
+        let def = function(&db, name);
+        let found: Vec<(&str, String)> = hir_ty_borrowck::borrowck(&db, def)
+            .diagnostics
+            .iter()
+            .map(|it| (it.code, it.message.clone()))
+            .collect();
+        let expected: Vec<(&str, String)> =
+            expected.iter().map(|&(code, message)| (code, message.to_owned())).collect();
+        assert_eq!(found, expected, "{found:?}");
+        let errors = expected.iter().any(|(code, _)| code.starts_with('E'));
+        match hir_ty_borrowck::checked(&db, def) {
+            Ok(_) => assert!(!errors, "`{name}` has errors but was let through"),
+            Err(Refused::Errors { owner, .. }) => {
+                assert!(errors, "`{name}` has only lints but was refused");
+                assert_eq!(owner, def);
+            }
+            Err(other) => panic!("`{name}` must be refused for its errors, got {other:?}"),
+        }
+    });
+}
+
+#[test]
+fn borrowck_use_after_move() {
+    borrowck_gives("use_after_move", &[MOVED]);
+}
+
+#[test]
+fn borrowck_two_mutable_borrows() {
+    borrowck_gives(
+        "two_mutable_borrows",
+        &[("E0499", "cannot borrow `s` as mutable more than once at a time")],
+    );
+}
+
+#[test]
+fn borrowck_mutable_while_shared() {
+    borrowck_gives("mutable_while_shared", &[MUTABLE_WHILE_SHARED]);
+}
+
+#[test]
+fn borrowck_move_while_borrowed() {
+    borrowck_gives(
+        "move_while_borrowed",
+        &[("E0505", "cannot move out of `s` because it is borrowed")],
+    );
+}
+
+#[test]
+fn borrowck_assign_while_borrowed() {
+    borrowck_gives(
+        "assign_while_borrowed",
+        &[("E0506", "cannot assign to `x` because it is borrowed")],
+    );
+}
+
+#[test]
+fn borrowck_does_not_live_long_enough() {
+    borrowck_gives("does_not_live_long_enough", &[("E0597", "`s` does not live long enough")]);
+}
+
+#[test]
+fn borrowck_temporary_dropped() {
+    borrowck_gives("temporary_dropped", &[("E0716", "temporary value dropped while borrowed")]);
+}
+
+#[test]
+fn borrowck_needless_mut() {
+    borrowck_gives("needless_mut", &[("unused_mut", "variable does not need to be mutable")]);
+}
+
+#[test]
+fn borrowck_in_order() {
+    borrowck_gives("in_order", &[MUTABLE_WHILE_SHARED, MOVED]);
+}
+
+/// The same signatures, written in `dep` (a library: batched) and in `main` (a query each).
+const SIGNATURES: &str = "
+pub trait Tr {}
+pub struct P<T> { pub a: u32, pub b: T, pub c: (T, u8) }
+pub struct Q<T>(pub T, pub bool);
+pub enum E<T> { One(T), Two { x: u16, y: *const T } }
+impl<T> P<T> { pub fn get(&self) -> u32 { self.a } }
+impl<T> Tr for Q<T> where T: Tr {}
+";
+
+fn signatures_db() -> TestDB {
+    TestDB::with_files(&format!(
+        "//- /dep.rs crate:dep library\n{SIGNATURES}//- /main.rs crate:main\n{SIGNATURES}"
+    ))
+}
+
+/// `dep` and `main` of [`signatures_db`].
+fn dep_and_main(db: &TestDB) -> (base_db::Crate, base_db::Crate) {
+    let crates = all_crates(db);
+    let of =
+        |local: bool| *crates.iter().find(|it| it.data(db).origin.is_local() == local).unwrap();
+    (of(false), of(true))
+}
+
+/// The variants of `krate`, each with its name, and its impls, in def-map order.
+fn signatures(db: &TestDB, krate: base_db::Crate) -> (Vec<(String, VariantId)>, Vec<ImplId>) {
+    let (mut variants, mut impls) = (Vec::new(), Vec::new());
+    for (_, module) in crate_def_map(db, krate).modules(db) {
+        let scope = module.scope(db);
+        for def in scope.declarations() {
+            match def {
+                ModuleDefId::AdtId(AdtId::StructId(it)) => {
+                    let name = StructSignature::of(db, it).name.as_str().to_owned();
+                    variants.push((name, it.into()));
+                }
+                ModuleDefId::AdtId(AdtId::EnumId(it)) => {
+                    for (name, &(variant, _)) in &it.enum_variants(db).variants {
+                        variants.push((name.as_str().to_owned(), variant.into()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        impls.extend(scope.impls());
+    }
+    (variants, impls)
+}
+
+/// What `variants` and `impls` lower to, printed: each variant's field types, then each impl's
+/// self type, trait and predicates. ADTs and traits print by name, parameters by index.
+fn lowered(db: &TestDB, variants: &[(String, VariantId)], impls: &[ImplId]) -> Vec<String> {
+    let mut out = Vec::with_capacity(variants.len() + impls.len());
+    for (name, variant) in variants {
+        let fields: Vec<Ty<'_>> =
+            db.field_types(*variant).values().map(|it| it.ty().skip_binder()).collect();
+        out.push(format!("{name}: {fields:?}"));
+    }
+    for &it in impls {
+        let predicates: Vec<_> =
+            GenericPredicates::query_all(db, it.into()).skip_binder().collect();
+        out.push(format!(
+            "{:?} {:?} {predicates:?}",
+            db.impl_self_ty(it).skip_binder(),
+            db.impl_trait(it).map(|it| it.skip_binder()),
+        ));
+    }
+    out
+}
+
+const BATCHES: [&str; 4] =
+    ["crate_field_types", "crate_impl_self_tys", "crate_impl_traits", "crate_impl_predicates"];
+
+#[test]
+fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
+    let db = signatures_db();
+    crate::attach_db(&db, || {
+        let (dep, main) = dep_and_main(&db);
+        let (dep_variants, dep_impls) = signatures(&db, dep);
+        let (main_variants, main_impls) = signatures(&db, main);
+        let names = |variants: &[(String, VariantId)]| -> Vec<String> {
+            variants.iter().map(|(name, _)| name.clone()).collect()
+        };
+        assert_eq!(names(&dep_variants), ["P", "Q", "One", "Two"]);
+        assert_eq!(names(&dep_variants), names(&main_variants));
+        assert_eq!(dep_impls.len(), 2);
+        assert_eq!(main_impls.len(), 2);
+
+        let (mut batched, mut per_item) = (Vec::new(), Vec::new());
+        let executed = db.executed(|| {
+            batched = lowered(&db, &dep_variants, &dep_impls);
+            per_item = lowered(&db, &main_variants, &main_impls);
+        });
+        assert_eq!(batched, per_item);
+        for batch in BATCHES {
+            assert_eq!(count(&executed, batch), 1, "{batch}: {executed:#?}");
+        }
+        assert_eq!(
+            count(&executed, "field_types_of_variant"),
+            main_variants.len(),
+            "{executed:#?}"
+        );
+        assert_eq!(count(&executed, "impl_self_ty_of_impl"), main_impls.len(), "{executed:#?}");
+        assert_eq!(count(&executed, "impl_trait_of_impl"), main_impls.len(), "{executed:#?}");
+    });
+}
+
+/// `cold` written twice to equal bytes, and read back from an aligned copy.
+fn round_trip(cold: &ColdBatch, again: &ColdBatch) -> Aligned {
+    let bytes = blaze_format::to_bytes(cold);
+    assert_eq!(bytes, blaze_format::to_bytes(again), "equal batches are equal bytes");
+    Aligned::copy_from(&bytes)
+}
+
+#[test]
+fn a_cold_batch_round_trips_with_its_types() {
+    let db = signatures_db();
+    crate::attach_db(&db, || {
+        let (dep, _) = dep_and_main(&db);
+        let interner = DbInterner::new_with(&db, dep);
+
+        let batch = CrateFieldTypes::of(&db, dep);
+        assert!(!batch.is_empty());
+        let buffer = round_trip(
+            &ColdBatch::of_field_types(interner, batch),
+            &ColdBatch::of_field_types(interner, batch),
+        );
+        assert_eq!(&ColdBatch::read(&buffer).unwrap().field_types(interner).unwrap(), batch);
+
+        let batch = CrateImplSelfTys::of(&db, dep);
+        let buffer = round_trip(
+            &ColdBatch::of_impl_self_tys(interner, batch),
+            &ColdBatch::of_impl_self_tys(interner, batch),
+        );
+        assert_eq!(&ColdBatch::read(&buffer).unwrap().impl_self_tys(interner).unwrap(), batch);
+
+        let batch = CrateImplTraits::of(&db, dep);
+        let buffer = round_trip(
+            &ColdBatch::of_impl_traits(interner, batch),
+            &ColdBatch::of_impl_traits(interner, batch),
+        );
+        assert_eq!(&ColdBatch::read(&buffer).unwrap().impl_traits(interner).unwrap(), batch);
+
+        let batch = CrateImplPredicates::of(&db, dep);
+        let buffer = round_trip(
+            &ColdBatch::of_impl_predicates(interner, batch),
+            &ColdBatch::of_impl_predicates(interner, batch),
+        );
+        assert_eq!(&ColdBatch::read(&buffer).unwrap().impl_predicates(interner).unwrap(), batch);
+    });
+}
+
+#[test]
+fn a_workspace_crate_has_no_batch() {
+    let db = signatures_db();
+    crate::attach_db(&db, || {
+        let (_, main) = dep_and_main(&db);
+        let (variants, impls) = signatures(&db, main);
+        let executed = db.executed(|| {
+            lowered(&db, &variants, &impls);
+        });
+        for batch in BATCHES {
+            assert_eq!(count(&executed, batch), 0, "{batch}: {executed:#?}");
+        }
+    });
+}
+
+blaze_format::record! {
+    /// A buffer of one allocation and the type table its types are in.
+    #[derive(Clone, Copy)]
+    struct AllocationRoot: 1 {
+        table: u64,
+        allocation: Rel<AllocationRec>,
+        reserved: u32,
+    }
+}
+
+/// The constant named `name` in a module of the fixture.
+fn constant(db: &TestDB, name: &str) -> ConstId {
+    for &krate in all_crates(db).iter() {
+        for (_, module) in crate_def_map(db, krate).modules(db) {
+            for def in module.scope(db).declarations() {
+                if let ModuleDefId::ConstId(it) = def
+                    && ConstSignature::of(db, it)
+                        .name
+                        .as_ref()
+                        .is_some_and(|found| found.as_str() == name)
+                {
+                    return it;
+                }
+            }
+        }
+    }
+    panic!("no constant `{name}` in the fixture")
+}
+
+#[test]
+fn allocations_read_back_as_written() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized, unsize, coerce_unsized
+trait T { fn f(&self) -> u8; }
+impl T for u8 { fn f(&self) -> u8 { *self } }
+const S: &str = "text";
+const D: &dyn T = &7u8;
+const P: (&[u16], u8) = (&[1, 2, 3], 4);
+"#,
+    );
+    crate::attach_db(&db, || {
+        let interner = DbInterner::new_no_crate(&db);
+        for name in ["S", "D", "P"] {
+            let value = db
+                .const_eval(constant(&db, name), GenericArgs::empty(), None)
+                .unwrap_or_else(|error| panic!("`{name}` evaluates: {error:?}"));
+
+            let mut out = Writer::new(<AllocationRoot as Record>::SCHEMA);
+            let mut tys = TyTableWriter::new(interner);
+            let allocation = write_allocation(&mut out, &mut tys, value);
+            let table = tys.write(&mut out);
+            let at = out.next::<AllocationRoot>();
+            let field = at + std::mem::offset_of!(AllocationRoot, allocation) as u64;
+            let root = out.push(&AllocationRoot {
+                table,
+                allocation: Rel::between(field, allocation),
+                reserved: 0,
+            });
+            let buffer = Aligned::copy_from(&out.finish(root));
+
+            let root = blaze_format::open::<AllocationRoot>(&buffer).unwrap();
+            let record = root.allocation.follow(&buffer).unwrap().unwrap();
+            let tys = TyTableReader::open(interner, &buffer, root.table).unwrap();
+            let read_back = read_allocation(record, &buffer, &tys).unwrap();
+            assert!(read_back == value, "`{name}` reads back as {read_back:?}, not {value:?}");
+        }
+    });
+}
+
+/// Every function body of the workspace crates, impl methods too, in def-map order.
+fn bodies(db: &TestDB) -> Vec<DefWithBodyId> {
+    let mut bodies = Vec::new();
+    for krate in crate::check::workspace_crates(db) {
+        for (_, module) in crate_def_map(db, krate.id).modules(db) {
+            let scope = module.scope(db);
+            for def in scope.declarations() {
+                if let ModuleDefId::FunctionId(it) = def {
+                    bodies.push(it.into());
+                }
+            }
+            for impl_id in scope.impls() {
+                for &(_, item) in &impl_id.impl_items(db).items {
+                    if let AssocItemId::FunctionId(it) = item {
+                        bodies.push(it.into());
+                    }
+                }
+            }
+        }
+    }
+    bodies
+}
+
+#[test]
+fn an_inference_record_round_trips_through_its_type_table() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: deref, coerce_unsized, fn, sized, index, slice
+struct S { a: u32, b: (u8, bool) }
+impl S { fn get<T: Default>(&self) -> T { T::default() } }
+trait Tr { fn m(&self) -> u32; }
+impl Tr for u32 { fn m(&self) -> u32 { *self } }
+fn opaque() -> impl Tr { 5u32 }
+fn f(s: &S, v: &mut Vec<u32>) -> u32 {
+    let x: u8 = s.get::<u8>();
+    let (ref mut y, _) = s.b;
+    let slice: &[u32] = &[1, 2, 3];
+    let mut count = 0;
+    let mut add = |n: u32| count += n + s.a;
+    add(1);
+    let moved = move || x;
+    match &s.b { (0, flag) => { let _: &bool = flag; } _ => {} }
+    let k = const { 3 + 4 };
+    s.missing();
+    let wrong: bool = 1u32;
+    opaque().m() + slice[0] + moved() as u32 + k
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let interner = DbInterner::new_no_crate(&db);
+        let bodies = bodies(&db);
+        assert_eq!(bodies.len(), 4, "`get`, `m`, `opaque` and `f`");
+        for def in bodies {
+            let result = InferenceResult::of(&db, def);
+            let record = result.to_record(interner);
+            let bytes = Aligned::copy_from(&blaze_format::to_bytes(&record));
+            let read = <InferenceRecord as Persist>::read(&bytes).unwrap();
+            assert_eq!(read.to_result(interner).unwrap(), *result);
+            assert_eq!(record.as_ref().to_result(interner).unwrap(), *result);
+        }
     });
 }

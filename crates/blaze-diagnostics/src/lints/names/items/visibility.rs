@@ -278,7 +278,7 @@ fn reaches(cx: &Cx<'_, '_>, def: Def) -> Vec<Def> {
 }
 
 /// The syntax of a def's interface, parsed as the semantics have it.
-fn interface_node(cx: &Cx<'_, '_>, def: Def) -> Option<InFile<SyntaxNode>> {
+pub(super) fn interface_node(cx: &Cx<'_, '_>, def: Def) -> Option<InFile<SyntaxNode>> {
     fn of<N: AstNode>(cx: &Cx<'_, '_>, src: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
         let src = src?;
         let node = cx.node(src.as_ref().map(AstPtr::new));

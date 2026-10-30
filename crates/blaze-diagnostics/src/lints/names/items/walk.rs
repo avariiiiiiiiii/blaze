@@ -59,6 +59,31 @@ impl Item {
     }
 }
 
+/// Where a module is in the crate as the AST has it: the offsets of the declarations of it and
+/// the modules it is in, from the crate's root.
+pub(super) fn module_order(cx: &Cx<'_, '_>, module: hir::Module) -> Vec<u32> {
+    let mut order = Vec::new();
+    let mut at = Some(module);
+    while let Some(module) = at {
+        if let Some(range) = module.declaration_source_range(cx.db) {
+            order.push(cx.span(range).lo);
+        }
+        at = module.parent(cx.db);
+    }
+    order.reverse();
+    order
+}
+
+/// The key that sorts what is at `lo` in the module at `module` (its [`module_order`]) as the
+/// AST has it, each module's items in place of its `mod`: rustc's order of `DefIndex`es and of
+/// the early lint pass.
+pub(super) fn source_order(module: &[u32], lo: u32) -> Vec<u32> {
+    let mut key = Vec::with_capacity(module.len() + 1);
+    key.extend_from_slice(module);
+    key.push(lo);
+    key
+}
+
 /// The items of `cx.krate` in the order rustc visits them.
 pub(super) fn items(cx: &Cx<'_, '_>) -> Vec<Item> {
     let mut walk = Walk { cx, items: Vec::new() };

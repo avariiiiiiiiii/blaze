@@ -12,12 +12,11 @@ use std::hash::{Hash as _, Hasher};
 
 use blaze_codegen::backend::Shape;
 use cranelift_codegen::ir::{self, UserExternalName};
-use cranelift_module::ModuleRelocTarget;
 
 use super::{Built, DataPlace, Function, Places, side::Variable};
 use crate::{
     ConstBlob, DataIdentity,
-    fragment::{self, DataRequest, Hint, Requests},
+    fragment::{self, DataRequest, Hint, RelocName, Requests},
 };
 
 const VERSION: u8 = 3;
@@ -79,20 +78,21 @@ pub(crate) fn of(function: &Function) -> Result<Shape, String> {
             out.bytes(&code.bytes);
             out.u64(code.align);
             out.u32(code.relocs.len() as u32);
-            for reloc in &code.relocs {
+            for reloc in code.relocs.iter() {
                 out.u32(reloc.offset);
                 out.u8(reloc_kind(reloc.kind));
                 out.u64(reloc.addend as u64);
                 match reloc.name {
-                    ModuleRelocTarget::User { namespace: 0, index } => {
+                    RelocName::Func(index) => {
                         out.name(UserExternalName::new(namespace::PLACE, place(places, index)?));
                     }
-                    ModuleRelocTarget::User { namespace: 1, index } => out.name(data.name(index)?),
-                    ref other => return Err(format!("assembly naming {other:?}")),
+                    RelocName::Data(index) => out.name(data.name(index)?),
+                    other => return Err(format!("assembly naming {other:?}")),
                 }
             }
-            out.u32(code.elf_types.len() as u32);
-            for &(at, kind) in &code.elf_types {
+            let typed = code.relocs.iter().filter_map(|it| Some((it.offset, it.elf_type?)));
+            out.u32(typed.clone().count() as u32);
+            for (at, kind) in typed {
                 out.u32(at);
                 out.u32(kind);
             }

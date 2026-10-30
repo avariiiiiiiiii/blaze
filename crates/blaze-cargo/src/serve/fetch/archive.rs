@@ -3,6 +3,8 @@
 //! lets one unpack to; and what the VFS can't hold refused, naming the entry: a path that is not
 //! UTF-8, absolute, or has an empty, `.` or `..` part, a file twice, a file where a directory is.
 
+#![forbid(unsafe_code)]
+
 use std::io::{self, Read};
 
 use blaze_vfs::Mode;

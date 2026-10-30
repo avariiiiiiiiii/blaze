@@ -1,8 +1,10 @@
 //! Parentheses around a pattern: of a `let`, a `for`, an argument, a match arm and the
 //! subpatterns of one.
 
-use super::compiletest;
-use crate::tests::ui_with;
+use crate::{
+    Options,
+    tests::{ui, ui_run_pass},
+};
 
 #[test]
 fn a_space_takes_the_place_of_parentheses_after_a_keyword() {
@@ -80,7 +82,7 @@ LL +     if 2 == 1 {}
 error: aborting due to 4 previous errors
 
 "#;
-    assert_eq!(ui_with("issue-103435-extra-parentheses.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("issue-103435-extra-parentheses.rs", "2015", source), expected);
 }
 
 /// What a macro wrote is linted without a suggestion, once for each expansion.
@@ -167,5 +169,5 @@ LL | unused_parens!(T1, T2, T3);
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(ui_with("unused-parens-in-macro-issue-120642.rs", "2015", source, &compiletest(true)), expected);
+    assert_eq!(ui_run_pass("unused-parens-in-macro-issue-120642.rs", "2015", source, &Options::default()), expected);
 }

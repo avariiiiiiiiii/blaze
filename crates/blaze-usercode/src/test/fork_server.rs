@@ -96,12 +96,15 @@ mod unix {
         /// The child's pidfd, which is close-on-exec. `pid` is not reaped yet, so it is there
         /// even if it has ended.
         pub fn watch(_queue: &Option<OwnedFd>, pid: Int) -> Result<(Option<OwnedFd>, bool), String> {
-            // SAFETY: `pidfd_open(pid, 0)` takes two integers and returns a descriptor or -1.
+            // SAFETY: `pidfd_open` takes a pid and flags by value and touches no memory of
+            // ours; the variadic arguments are passed as `long`, the width the kernel reads.
+            // A wrong number would run another syscall, which is why `PIDFD_OPEN` is pinned.
             let fd = unsafe { syscall(PIDFD_OPEN, pid as ::core::ffi::c_long, 0 as ::core::ffi::c_long) };
             if fd < 0 {
                 return Err(format!("pidfd_open: {}", ::std::io::Error::last_os_error()));
             }
-            // SAFETY: the descriptor was just made and nothing else owns it.
+            // SAFETY: `fd` is >= 0, so `pidfd_open` just made it, and no other owner of it
+            // exists; were there one, the two would close it twice.
             Ok((Some(unsafe { OwnedFd::from_raw_fd(fd as Int) }), false))
         }
 
@@ -148,12 +151,13 @@ mod unix {
 
         /// A kqueue, which a forked child doesn't inherit.
         pub fn queue() -> Result<Option<OwnedFd>, String> {
-            // SAFETY: a plain call.
+            // SAFETY: `kqueue` takes no arguments and touches no memory of ours.
             let fd = unsafe { kqueue() };
             if fd < 0 {
                 return Err(format!("kqueue: {}", ::std::io::Error::last_os_error()));
             }
-            // SAFETY: the descriptor was just made and nothing else owns it.
+            // SAFETY: `fd` is >= 0, so `kqueue` just made it, and no other owner of it
+            // exists; were there one, the two would close it twice.
             Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }))
         }
 
@@ -169,7 +173,9 @@ mod unix {
                 data: 0,
                 udata: ::core::ptr::null_mut(),
             };
-            // SAFETY: one change from a live struct, no events back.
+            // SAFETY: `change` is a live `Kevent` laid out as the kernel's (`repr(C)`, the
+            // fields of `<sys/event.h>`), read for the count 1 passed; the event list is null
+            // with room 0, so nothing is written, and the null timeout is allowed.
             let done = unsafe { kevent(queue.as_raw_fd(), &change, 1, ::core::ptr::null_mut(), 0, ::core::ptr::null()) };
             if done < 0 {
                 let error = ::std::io::Error::last_os_error();
@@ -186,10 +192,13 @@ mod unix {
         pub fn clear(queue: &Option<OwnedFd>) {
             let queue = queue.as_ref().expect("a kqueue on this system");
             let zero = Timespec { seconds: 0, nanoseconds: 0 };
-            // SAFETY: integers and a raw pointer, for which zero is a value.
+            // SAFETY: every field of `Kevent` is an integer or a raw pointer, for which all
+            // zero bytes are a valid value (0 and null).
             let mut events: [Kevent; 16] = unsafe { ::core::mem::zeroed() };
             loop {
-                // SAFETY: `events` holds 16 entries, and the call doesn't wait.
+                // SAFETY: `events` is live and holds the 16 entries the call may write, no more
+                // than that count is passed, and `zero` is a live timeout, so the call returns
+                // at once. A larger count would let the kernel write past the array.
                 let got = unsafe { kevent(queue.as_raw_fd(), ::core::ptr::null(), 0, events.as_mut_ptr(), 16, &zero) };
                 if got < 16 {
                     return;
@@ -223,7 +232,9 @@ mod unix {
 
     pub fn serve(tests: &'static [&'static test::TestDescAndFn], socket: &::std::ffi::OsStr) -> Result<(), String> {
         // Taken out before any test runs, so a test that runs its own binary gets libtest.
-        // SAFETY: the server has one thread, and nothing reads the environment as it changes.
+        // SAFETY: the harness's `main` calls this before it starts any thread, and the server
+        // never starts one (a test's thread runs in a forked child), so no other thread reads
+        // the environment as it changes. A thread here would make this a data race.
         unsafe {
             ::std::env::remove_var(SOCKET);
         }
@@ -416,7 +427,9 @@ mod unix {
         };
         let (ours, theirs) =
             UnixStream::pair().map_err(|error| format!("a socket pair for the test's output: {}", error))?;
-        // SAFETY: the server runs on one thread, so the child is a whole copy of it.
+        // SAFETY: the server has one thread (see `serve`), so the child is a whole copy of it
+        // and no lock is left held by a thread that isn't there. The child only closes and
+        // copies descriptors, then runs the test and leaves by `_exit`.
         let pid = unsafe { fork() };
         if pid < 0 {
             return Err(format!("fork: {}", ::std::io::Error::last_os_error()));
@@ -425,7 +438,8 @@ mod unix {
             // The child closes the server's descriptors under the owners that hold them: it
             // never uses those owners again, since it leaves by `_exit` below, which runs no
             // destructor, so no descriptor is closed twice or used after its close.
-            // SAFETY: integers only; the child leads a group of its own.
+            // SAFETY: `setpgid` takes integers and touches no memory of ours; (0, 0) makes
+            // the child lead a group of its own, which `kill_group` relies on.
             unsafe { setpgid(0, 0) };
             // SAFETY: as above, the socket's owner is not used in the child.
             unsafe { close(stream.as_raw_fd()) };
@@ -450,11 +464,14 @@ mod unix {
             let code = run(test);
             let _ = ::std::io::stdout().flush();
             let _ = ::std::io::stderr().flush();
-            // SAFETY: ends this process without running the server's exit handlers twice.
+            // SAFETY: `_exit` ends the process at once and returns to nothing; the child's
+            // copies of the server's owners are never dropped, which is what the closes above
+            // rely on, and the server's `atexit` handlers don't run a second time here.
             unsafe { _exit(code) }
         }
         // Made by both, so a kill sent at once finds the group.
-        // SAFETY: a plain call.
+        // SAFETY: `setpgid` takes integers and touches no memory of ours; `pid` is the child
+        // just forked, not yet reaped, so it can't name another process.
         unsafe { setpgid(pid, pid) };
         drop(theirs);
         ours.set_nonblocking(true).map_err(|error| format!("the test's output socket: {}", error))?;
@@ -483,7 +500,8 @@ mod unix {
     fn reap(children: &mut [Child]) {
         loop {
             let mut status: Int = 0;
-            // SAFETY: `status` is a live `int`.
+            // SAFETY: `status` is a live `int` the call writes once; `WNOHANG` keeps it from
+            // blocking the server.
             let pid = unsafe { waitpid(-1, &mut status, WNOHANG) };
             if pid <= 0 {
                 return;
@@ -502,8 +520,9 @@ mod unix {
     }
 
     fn kill_group(pid: Int) {
-        // SAFETY: integers only. `pid` is a child not yet reaped (callers pass only those with
-        // no status), so neither it nor its group can be another process's.
+        // SAFETY: `kill` takes integers and touches no memory of ours. `pid` is a child not yet
+        // reaped (callers pass only those with no status), so neither it nor its group can
+        // have been reused for another process; a reaped one could, and this would kill it.
         unsafe { kill(-pid, SIGKILL) };
         // SAFETY: as above.
         unsafe { kill(pid, SIGKILL) };
@@ -515,7 +534,8 @@ mod unix {
         }
         for child in children.iter().filter(|it| it.status.is_none()) {
             let mut status: Int = 0;
-            // SAFETY: `status` is a live `int`.
+            // SAFETY: `status` is a live `int` the call writes once; `child.pid` is a child of
+            // this process just killed, so the wait ends.
             unsafe { waitpid(child.pid, &mut status, 0) };
         }
         children.clear();
@@ -523,7 +543,8 @@ mod unix {
 
     /// Ends the child, as a function of `()` so a panic hook can end with it.
     fn exit_now(code: Int) {
-        // SAFETY: ends this process; nothing of it is needed after.
+        // SAFETY: `_exit` ends the process at once; it runs in a forked child (or its panic
+        // hook), whose state nothing reads after, and runs no destructor or `atexit` handler.
         unsafe { _exit(code) }
     }
 
@@ -532,7 +553,8 @@ mod unix {
         path.extend_from_slice(MARK.as_bytes());
         path.extend_from_slice(name.as_bytes());
         path.push(0);
-        // SAFETY: `path` ends with a nul.
+        // SAFETY: `path` is live across the call and ends with the nul pushed above, so
+        // `access` reads within it; without the nul it would read past the buffer.
         unsafe { access(path.as_ptr() as *const ::core::ffi::c_char, 0) };
     }
 

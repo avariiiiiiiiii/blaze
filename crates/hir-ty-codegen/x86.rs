@@ -11,6 +11,8 @@
 //! The ones SSE2 has and Cranelift says as vector instructions (`minps`, the packs,
 //! `pmaddwd`, `pavgb`) are [`FunctionCx::x86_vector`]'s instead, in the function's own code.
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::ir::{
     Endianness, InstBuilder, MemFlagsData, Type, Value, condcodes::FloatCC, types,
 };

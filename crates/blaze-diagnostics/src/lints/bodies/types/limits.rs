@@ -14,6 +14,7 @@ use hir_def::{
     hir::{BinaryOp, CmpOp, Expr, ExprId, Ordering, UnaryOp},
 };
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
+use intern::Symbol;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
 use syntax::{AstNode as _, ast};
 
@@ -146,7 +147,7 @@ impl LatePass for TypeLimits {
             }
             Expr::MethodCall { receiver, args, .. } if args.len() == 1 => {
                 let Some(def) = util::method_fn(b, expr) else { return };
-                let Some(cmpop) = util::fn_item(b.db(), def).as_deref().and_then(diag_item_cmpop) else { return };
+                let Some(cmpop) = util::fn_item(b.db(), def).as_ref().map(Symbol::as_str).and_then(diag_item_cmpop) else { return };
                 let Some(span) = util::span(b, expr) else { return };
                 out.extend(lint_wide_pointer(b, expr, &span, cmpop, receiver, args[0]));
                 out.extend(lint_fn_pointer(b, expr, &span, cmpop, receiver, args[0]));
@@ -207,7 +208,7 @@ fn until(span: &Span, end: &Span) -> Span {
 fn lint_nan(b: &BodyCx<'_, '_>, e: ExprId, e_span: &Span, op: Cmp, l: ExprId, r: ExprId) -> Option<Found> {
     let is_nan = |expr: ExprId| {
         let expr = util::peel_borrows(b, util::peel_blocks(b, expr));
-        matches!(util::path_item(b, expr).as_deref(), Some("f16_nan" | "f32_nan" | "f64_nan" | "f128_nan"))
+        matches!(util::path_item(b, expr).as_ref().map(Symbol::as_str), Some("f16_nan" | "f32_nan" | "f64_nan" | "f128_nan"))
     };
     const EQ_NE: &str = "incorrect NaN comparison, NaN cannot be directly compared to itself";
     const HELP: &str = "use `f32::is_nan()` or `f64::is_nan()` instead";

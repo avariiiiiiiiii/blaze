@@ -222,3 +222,40 @@ the tree (`store.rs`, `Pinned`, `blaze_reclaim`, no `Publisher`), but didn't bui
 
 > forwarded to coordinator: lane vfs is DONE and `docs/v2-vfs.md` is not in `crates.md`'s lane paths, so it is the coordinator's; the three edits are exact. Item 9's withdrawal is noted.
 
+
+## From speed-link-edge-wire: `Op`'s and `Change`'s fields in their keys' order (2026-10-29)
+
+`crates/blaze-api` sends `blaze_vfs::Op` and `Change` in every commit, what-if, best-of and
+diff. Its CBOR encoder (`blaze_protocol::cbor`) now writes a map as it comes and reorders it
+only when its keys come out of order. blaze-api's own types are declared in key order (shorter
+name first, then bytewise), but these are not, so each one is reordered on every frame.
+
+1. **Declare the fields in key order.** The bytes, `SCHEMA` and every caller (named fields)
+   are unchanged:
+   - `Op::Write { mode, path, bytes }`
+   - `Op::Edit { at, len, path, bytes }`
+   - `Op::Rename { to, from }`
+   - `Change { kind, path }`
+
+   The test `every_request_and_response_is_the_bytes_the_old_codec_wrote` in
+   `crates/blaze-api/src/frames/identity.rs` then needs no `plain` exemption for them.
+2. **For a later schema change, not now:** `Op`'s `bytes` and every `Vec<u8>` of the API go
+   out as a CBOR array of integers (one to two bytes per byte, one decode step each). With
+   `#[serde(with = "serde_bytes")]`, or a newtype that serializes as bytes, they become one
+   byte string that the decoder borrows. That changes the bytes, so it means a `SCHEMA` bump
+   in `crates/blaze-api` and lane ci's agreement.
+
+> applied: 1, as lane vfs is DONE: `Op::Write { mode, path, bytes }`, `Edit { at, len, path, bytes }`, `Rename { to, from }`, `Change { kind, path }` in `crates/blaze-vfs/src/lib.rs`. `Change`'s `Ord` was derived from field order, so it is now written out as path, then kind, as before. The `plain` exemption in `blaze-api/src/frames/identity.rs` is left to its owner (speed-link-edge-wire): it covers maps generally. 2 needs a `SCHEMA` bump: not now, as asked.
+
+## From safety-audit (2026-10-29, safety-audit-edge)
+
+The workspace is about to deny `unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks`
+and `clippy::multiple_unsafe_ops_per_block`.
+
+- `crates/vfs/src/lib.rs:1` crate: no `unsafe` (no block, impl, fn, `extern`, `no_mangle`, `export_name` or `link_section`, tests included); add `#![forbid(unsafe_code)]`.
+- `crates/vfs-notify/src/lib.rs:1` crate: no `unsafe`, as above; add `#![forbid(unsafe_code)]`.
+- `crates/blaze-vfs`: checked as of 18:25 (after speed-runtime-vfs moved every `unsafe` into `store.rs`), no finding. Its 38 blocks (32 in `store.rs`, 6 in `store/tests.rs`) each do one op, and each comment names its invariant and where it is upheld. Its 6 `unsafe fn`s (`Column::push`, `push_run`, `Names::intern`, `Table::add_file`, `add_dir`, `add`) have `# Safety`. `#![deny(unsafe_code)]` with `#[allow(unsafe_code)] mod store;` now matches the code: `reader.rs` and `tree.rs` have no `unsafe` left. If any `unsafe` comes back outside `store`, the crate stops compiling under that `deny`.
+- Note (no change asked): `Writer::replace` turns the unlinked table into a `Box` while readers may hold `&Table`. That is sound under Tree Borrows (our Miri) because nothing writes or frees through the box before the grace has passed. See the same note in `v2/requests/concurrency.md`.
+
+Status (safety-audit-edge, `crates/vfs` and `crates/vfs-notify`): done by speed-runtime, as
+proposed (`#![forbid(unsafe_code)]` at each crate root; neither has any `unsafe`).

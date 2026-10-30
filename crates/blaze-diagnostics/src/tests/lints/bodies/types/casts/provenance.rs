@@ -1,7 +1,7 @@
 //! `implicit_provenance_casts`: rustc's `tests/ui/lint/lint-strict-provenance-*.rs` and
 //! `tests/ui/feature-gates/feature-gate-strict_provenance_lints.rs`.
 
-use super::{Test, Ui, ui};
+use crate::tests::ui;
 
 #[test]
 fn lossy_casts() {
@@ -81,7 +81,7 @@ LL |     let ptr_addr_32bit = ptr as u32;
 error: aborting due to 4 previous errors
 
 "##;
-    let stderr = ui(Ui { name: "lint-strict-provenance-lossy-casts.rs", test: Test::Passes, source, ..Ui::default() });
+    let stderr = ui("lint-strict-provenance-lossy-casts.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -117,7 +117,7 @@ LL +     let dangling = (...).with_addr(16_usize);
 error: aborting due to 1 previous error
 
 "##;
-    let stderr = ui(Ui { name: "lint-strict-provenance-fuzzy-casts.rs", test: Test::Passes, source, ..Ui::default() });
+    let stderr = ui("lint-strict-provenance-fuzzy-casts.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -217,7 +217,7 @@ LL |     i2p!(0x42);
 error: aborting due to 4 previous errors
 
 "##;
-    let stderr = ui(Ui { name: "lint-strict-provenance-macro-casts.rs", test: Test::Passes, source, ..Ui::default() });
+    let stderr = ui("lint-strict-provenance-macro-casts.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -299,6 +299,6 @@ LL | #![deny(lossy_provenance_casts)]
 warning: 5 warnings emitted
 
 "##;
-    let stderr = ui(Ui { name: "feature-gate-strict_provenance_lints.rs", test: Test::Passes, source, ..Ui::default() });
+    let stderr = ui("feature-gate-strict_provenance_lints.rs", "2015", source);
     assert_eq!(stderr, expected);
 }

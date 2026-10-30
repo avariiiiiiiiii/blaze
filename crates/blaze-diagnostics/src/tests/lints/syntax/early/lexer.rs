@@ -1,7 +1,55 @@
 //! The lints of rustc's lexer, `keyword_idents` and the identifier lints, against rustc's UI
 //! tests.
 
-use super::{Test, stderr, ui};
+use crate::{
+    Options,
+    emit::Style,
+    tests::{Mode, checked_with, compiletest, normalized, ui},
+};
+
+/// std's items the UI tests use, `println!` (with what it calls) and `Box`, and what std's
+/// prelude adds of them.
+const STD: (&str, &str) = (
+    r#"pub mod io {
+    pub fn _print(_args: core::fmt::Arguments<'_>) {}
+}
+
+pub mod boxed {
+    #[lang = "owned_box"]
+    pub struct Box<T: ?Sized>(*mut T);
+}
+
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        $crate::io::_print(core::format_args_nl!($($arg)*));
+    }};
+}
+"#,
+    "pub use crate::boxed::Box;",
+);
+
+/// What compiletest gives for `fixture`, each file named `$DIR/<path>`: [`ui`] of a UI test
+/// of more than one file.
+fn stderr(fixture: &str) -> String {
+    let options = compiletest(Mode::Other, &Options::default());
+    let stderr = checked_with(fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    normalized(&stderr)
+}
+
+/// [`ui`] of a UI test that uses std's items: `std` is a crate of [`STD`] on minicore, with a
+/// prelude of core's and of what std's prelude adds.
+fn ui_with_std(name: &str, edition: &str, source: &str) -> String {
+    let (items, prelude) = STD;
+    let preludes: String = ["rust_2015", "rust_2018", "rust_2021", "rust_2024"]
+        .iter()
+        .map(|it| format!("    pub mod {it} {{ pub use core::prelude::{it}::*; {prelude} }}\n"))
+        .collect();
+    stderr(&format!(
+        "//- minicore: sized, fmt, builtin_impls\n//- /std.rs crate:std deps:core\npub mod prelude {{\n{preludes}}}\n{items}\n\
+         //- /{name} crate:main edition:{edition} deps:std\n{source}"
+    ))
+}
 
 /// `source` with each `<U+XXXX>` in it written as that codepoint. The UI tests of the text
 /// direction lints hold codepoints this file can't: rustc denies them in a literal.
@@ -51,7 +99,7 @@ LL | /// �א�, �ב�, �ג�, �ד�, �ה�
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("unicode-control-doc-comment-issue-153096.rs", "2024", Test::Fails, &codepoints(source)), expected);
+    assert_eq!(ui("unicode-control-doc-comment-issue-153096.rs", "2024", &codepoints(source)), expected);
 }
 
 #[test]
@@ -358,7 +406,7 @@ LL | |  *  '�'); */fn bar() {}
 error: aborting due to 20 previous errors
 
 "###;
-    assert_eq!(ui("unicode-control-codepoints.rs", "2021", Test::Fails, &codepoints(source)), expected);
+    assert_eq!(ui_with_std("unicode-control-codepoints.rs", "2021", &codepoints(source)), expected);
 }
 
 #[test]
@@ -375,7 +423,7 @@ fn main() {
 }
 "#;
     let expected = "";
-    assert_eq!(ui("issue-90614-accept-allow-text-direction-codepoint-in-comment-lint.rs", "2015", Test::Passes, &codepoints(source)), expected);
+    assert_eq!(ui("issue-90614-accept-allow-text-direction-codepoint-in-comment-lint.rs", "2015", &codepoints(source)), expected);
 }
 
 #[test]
@@ -493,7 +541,7 @@ LL |     #name = #kind #value
 warning: 5 warnings emitted
 
 "#;
-    assert_eq!(ui("reserved-prefixes-migration.rs", "2018", Test::Passes, source), expected);
+    assert_eq!(ui_with_std("reserved-prefixes-migration.rs", "2018", source), expected);
 }
 
 #[test]
@@ -893,7 +941,7 @@ LL |     demo5!(##"foo"# #);
 warning: 22 warnings emitted
 
 "####;
-    assert_eq!(ui("reserved-guarded-strings-migration.rs", "2021", Test::Passes, source), expected);
+    assert_eq!(ui("reserved-guarded-strings-migration.rs", "2021", source), expected);
 }
 
 #[test]
@@ -1112,7 +1160,7 @@ LL |     (async) => (1)
 error: aborting due to 14 previous errors
 
 "#;
-    assert_eq!(ui("async-ident.rs", "2015", Test::Fails, source), expected);
+    assert_eq!(ui("async-ident.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1148,7 +1196,7 @@ LL | #![deny(rust_2018_compatibility)]
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("async-ident-allowed.rs", "2015", Test::Fails, source), expected);
+    assert_eq!(ui("async-ident-allowed.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1183,7 +1231,7 @@ LL | #![deny(keyword_idents)]
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("dyn-keyword.rs", "2015", Test::Fails, source), expected);
+    assert_eq!(ui("dyn-keyword.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1233,7 +1281,7 @@ LL | fn try() {
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(ui("try-ident.rs", "2015", Test::Passes, source), expected);
+    assert_eq!(ui("try-ident.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1366,7 +1414,7 @@ LL | struct Test<'gen>(Box<Test<'gen>>, &'gen ());
 error: aborting due to 8 previous errors
 
 "#;
-    assert_eq!(ui("gen-kw.rs", "2015", Test::Fails, source), expected);
+    assert_eq!(ui_with_std("gen-kw.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1499,7 +1547,7 @@ LL | struct Test<'gen>(Box<Test<'gen>>, &'gen ());
 error: aborting due to 8 previous errors
 
 "#;
-    assert_eq!(ui("gen-kw.rs", "2018", Test::Fails, source), expected);
+    assert_eq!(ui_with_std("gen-kw.rs", "2018", source), expected);
 }
 
 #[test]
@@ -1520,7 +1568,7 @@ fn main() {
 }
 "#;
     let expected = "";
-    assert_eq!(ui("gen-kw-in-macro.rs", "2015", Test::Passes, source), expected);
+    assert_eq!(ui_with_std("gen-kw-in-macro.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1536,7 +1584,7 @@ fn foo<'r#gen>() {}
 fn main() {}
 "#;
     let expected = "";
-    assert_eq!(ui("raw-gen-lt.rs", "2021", Test::Passes, source), expected);
+    assert_eq!(ui("raw-gen-lt.rs", "2021", source), expected);
 }
 
 #[test]
@@ -1582,7 +1630,7 @@ LL |     let naïveté = 2;
 error: aborting due to 3 previous errors
 
 "#;
-    assert_eq!(ui("lint-non-ascii-idents.rs", "2015", Test::Fails, source), expected);
+    assert_eq!(ui_with_std("lint-non-ascii-idents.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1643,7 +1691,7 @@ LL | const µ: f64 = 0.000001;
 error: aborting due to 3 previous errors; 1 warning emitted
 
 "#;
-    assert_eq!(ui("lint-uncommon-codepoints.rs", "2015", Test::Fails, source), expected);
+    assert_eq!(ui_with_std("lint-uncommon-codepoints.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1693,7 +1741,7 @@ LL |     let ｓ_ｓ = "rust2";
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(ui("lint-confusable-idents.rs", "2015", Test::Fails, source), expected);
+    assert_eq!(ui("lint-confusable-idents.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1749,7 +1797,7 @@ LL |     const エ: &'static str = "アイウ";
 error: aborting due to 3 previous errors
 
 "#;
-    assert_eq!(ui("lint-mixed-script-confusables.rs", "2015", Test::Fails, source), expected);
+    assert_eq!(ui("lint-mixed-script-confusables.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1776,7 +1824,7 @@ mod роре {
 }
 "#;
     let expected = "";
-    assert_eq!(ui("lint-mixed-script-confusables-2.rs", "2015", Test::Passes, source), expected);
+    assert_eq!(ui_with_std("lint-mixed-script-confusables-2.rs", "2015", source), expected);
 }
 
 #[test]
@@ -1810,5 +1858,5 @@ fn dyn() {}
 // Keywords reserved from Rust 2024:
 fn gen() {}
 "#;
-    assert_eq!(stderr(fixture, Test::Passes), "");
+    assert_eq!(stderr(fixture), "");
 }

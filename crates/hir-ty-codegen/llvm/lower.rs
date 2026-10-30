@@ -36,7 +36,6 @@ use inkwell::{
     },
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::sync::Arc;
 
 use hir_def::hir::AsmOptions;
 use inkwell::InlineAsmDialect;
@@ -122,7 +121,7 @@ pub(super) struct Lowering<'ctx, 'f> {
     memcmp: Option<u32>,
     /// The `asm!` blocks whose wrappers are called, by the numbers in the wrappers' names, that
     /// go where they are called as LLVM's inline assembly.
-    blocks_asm: &'f FxHashMap<u32, Arc<asm::Inline>>,
+    blocks_asm: &'f FxHashMap<u32, &'static asm::Inline>,
     pads: FxHashMap<Pad, BasicBlock<'ctx>>,
     /// The block the allocas are in.
     frame: Option<BasicBlock<'ctx>>,
@@ -590,7 +589,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         statics: &'f FxHashSet<u32>,
         resume: Option<u32>,
         memcmp: Option<u32>,
-        blocks_asm: &'f FxHashMap<u32, Arc<asm::Inline>>,
+        blocks_asm: &'f FxHashMap<u32, &'static asm::Inline>,
         shown: &'f FxHashMap<u32, FunctionValue<'ctx>>,
         debug: Option<&'f Debug<'ctx>>,
     ) -> Lowered<()> {
@@ -1283,7 +1282,7 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     && dfg.inst_results(inst).is_empty()
                     && let Some(block) = self.asm_block(func_ref)
                 {
-                    return self.inline_asm(&block, slot);
+                    return self.inline_asm(block, slot);
                 }
                 let callee = self.callee(func_ref)?;
                 let sig = &dfg.signatures[dfg.ext_funcs[func_ref].signature];
@@ -1958,10 +1957,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     /// The `asm!` block the call of `func_ref` runs, when it goes where it is called.
-    fn asm_block(&self, func_ref: ir::FuncRef) -> Option<Arc<asm::Inline>> {
+    fn asm_block(&self, func_ref: ir::FuncRef) -> Option<&'static asm::Inline> {
         let name = self.external_name(&self.func.dfg.ext_funcs[func_ref].name).ok()?;
         match super::Symbol::parse(&name)? {
-            super::Symbol::Func(id) => self.blocks_asm.get(&id).cloned(),
+            super::Symbol::Func(id) => self.blocks_asm.get(&id).copied(),
             super::Symbol::Data(_) => None,
         }
     }

@@ -129,7 +129,7 @@ impl Graph {
                 h.update(b"own")
                     .id(&interface.digest)
                     .part(target.data_layout.as_bytes())
-                    .part(format!("{:?}", target.arch).as_bytes());
+                    .part(arch_name(target.arch).as_bytes());
                 Ok(h.finish())
             }
             Graph::Deep => {
@@ -155,6 +155,15 @@ impl Graph {
             (Graph::Layout, _) => interface_of(db, to),
             (Graph::Deep, _) => deep_of(db, to),
         }
+    }
+}
+
+/// The arch as a layout hash spells it: its `Debug` name, written out so no string is built.
+fn arch_name(arch: base_db::target::Arch) -> &'static str {
+    match arch {
+        base_db::target::Arch::Wasm32 => "Wasm32",
+        base_db::target::Arch::Wasm64 => "Wasm64",
+        base_db::target::Arch::Other => "Other",
     }
 }
 
@@ -270,8 +279,15 @@ fn component_hash(db: &dyn HirDatabase, graph: Graph, root: ItemId) -> Result<Co
     let members = component(db, graph, root);
     let n = members.len();
     let domain = graph.domain();
-    let position: FxHashMap<ItemId, usize> =
-        members.iter().enumerate().map(|(at, &id)| (id, at)).collect();
+    // Most components are one item, which needs no map to find a member's position.
+    let position: FxHashMap<ItemId, usize> = match n {
+        1 => FxHashMap::default(),
+        _ => members.iter().enumerate().map(|(at, &id)| (id, at)).collect(),
+    };
+    let inside = |to: ItemId| match n {
+        1 => (to == root).then_some(0),
+        _ => position.get(&to).copied(),
+    };
     let owns = members.iter().map(|&member| graph.own(db, member)).collect::<Result<Vec<_>, _>>()?;
     // Every member's refs in one list, member `at`'s at `starts[at]..starts[at + 1]`, and what
     // each ref outside the component is filled with, `None` for one inside it.
@@ -284,7 +300,7 @@ fn component_hash(db: &dyn HirDatabase, graph: Graph, root: ItemId) -> Result<Co
     }
     let fills = refs
         .iter()
-        .map(|&to| match position.get(&to) {
+        .map(|&to| match inside(to) {
             Some(_) => Ok(None),
             None => graph.fill(db, to).map(Some),
         })
@@ -313,8 +329,8 @@ fn component_hash(db: &dyn HirDatabase, graph: Graph, root: ItemId) -> Result<Co
         for at in 0..n {
             b.update(b"refine").id(&color[at]);
             for to in &refs[of(at)] {
-                if let Some(&inside) = position.get(to) {
-                    b.id(&color[inside]);
+                if let Some(at) = inside(*to) {
+                    b.id(&color[at]);
                 }
             }
             b.end();
@@ -338,11 +354,13 @@ fn component_hash(db: &dyn HirDatabase, graph: Graph, root: ItemId) -> Result<Co
     b.update(b"cycle").word(n);
     for &at in &order {
         b.id(&owns[at]);
-        spell_fills(&mut b, &refs[of(at)], &fills[of(at)], |to| rank[position[&to]]);
+        spell_fills(&mut b, &refs[of(at)], &fills[of(at)], |to| {
+            rank[inside(to).expect("a ref without a fill is to a member")]
+        });
     }
     let whole = b.hash_one(domain);
     let mut b = Batch::default();
-    b.update(b"member").id(&whole).word(rank[position[&root]]);
+    b.update(b"member").id(&whole).word(rank[inside(root).expect("the root is a member")]);
     Ok(b.hash_one(domain))
 }
 

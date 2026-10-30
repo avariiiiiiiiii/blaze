@@ -1,12 +1,23 @@
 //! rustc's MIR optimizations, run on a [`MirPhase::Runtime`] body as rustc's
-//! `run_optimization_passes` runs them on its runtime MIR (`rustc_mir_transform` at 1.99.0,
-//! `compiler/rustc_mir_transform/src/lib.rs`). They are optional: the IDE and the interpreter
-//! never ask for them, and the code generator asks only when told to (`BLAZE_MIR_OPT`).
+//! `run_optimization_passes` runs them on its runtime MIR (`rustc_mir_transform` at the pinned
+//! nightly, `compiler/rustc_mir_transform/src/lib.rs`). The IDE and the interpreter never ask
+//! for them. The code generator asks for each crate at the level rustc gives the crate's
+//! `opt-level`; `BLAZE_MIR_OPT` only overrides that level.
 //!
-//! The level is rustc's `-Zmir-opt-level`: [`MirOptLevel::Debug`] is what rustc runs at
-//! `opt-level=0` (its level 1) and [`MirOptLevel::Release`] what it runs otherwise (its
-//! level 2). Each pass is a port of rustc's pass of the same name; where it does less than
-//! rustc's, its module says what. Passes rustc runs at a level and these do not are listed in
+//! What they run with is a [`MirOptions`], which keys the queries:
+//! - `level` is rustc's `-Zmir-opt-level`: [`MirOptLevel::Debug`] is what rustc runs at
+//!   `opt-level=0` (its level 1) and [`MirOptLevel::Release`] what it runs otherwise (its
+//!   level 2).
+//! - `ub_checks` is rustc's `sess.ub_checks()` of the crate the body is of. With it,
+//!   `CheckAlignment`, `CheckNull` and `CheckEnums` add their checks at every level,
+//!   [`MirOptLevel::Off`] and coroutine bodies included, as rustc's do: they are part of what
+//!   UB checks mean, not optimizations.
+//! - `lifetime_markers` says the code generator gives its backend storage markers as
+//!   lifetimes; `RemoveStorageMarkers` runs only without them, as rustc's runs only where it
+//!   emits none (`!emit_lifetime_markers()`).
+//!
+//! Each pass is a port of rustc's pass of the same name; where it does less than rustc's, its
+//! module says what. Passes rustc runs at a level and these do not are listed in
 //! [`passes_not_ported`].
 //!
 //! The passes run on the generic body, as rustc's do, once per function: monomorphization
@@ -15,6 +26,8 @@
 //! [`MirPhase::Runtime`]: super::MirPhase::Runtime
 
 mod cfg;
+mod check_enums;
+mod check_pointers;
 mod copy_prop;
 mod dse;
 mod inst_simplify;
@@ -28,15 +41,15 @@ use std::cell::Cell;
 
 use crate::{
     InferBodyId,
-    db::{HirDatabase, InternedClosureId},
+    db::{HirDatabase, InternedClosureId, InternedCoroutineId},
     traits::StoredParamEnvAndCrate,
 };
 
 use crate::next_solver::StoredGenericArgs;
 
 use super::{
-    BasicBlock, BasicBlockId, LocalId, MirBody, MirLowerError, MirOptLevel, OperandKind, PlaceElem,
-    ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    BasicBlock, BasicBlockId, LocalId, MirBody, MirLowerError, MirOptLevel, MirOptions,
+    OperandKind, PlaceElem, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     monomorphization::monomorphized, transform::Ctx,
 };
 
@@ -48,17 +61,11 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
     match level {
         MirOptLevel::Off => &[],
         MirOptLevel::Debug => &[
-            "CheckAlignment",
-            "CheckNull",
-            "CheckEnums",
             "ForceInline",
             "RemoveZsts",
             "UnreachableEnumBranching",
         ],
         MirOptLevel::Release => &[
-            "CheckAlignment",
-            "CheckNull",
-            "CheckEnums",
             "ForceInline",
             "Inline",
             "RemoveZsts",
@@ -76,16 +83,19 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
     }
 }
 
-/// `body` after rustc's optimizations at `level`. Coroutine bodies are left as they are: what
-/// a future keeps across a yield is computed from the runtime body.
+/// `body` after rustc's optimizations with `options`. Of a coroutine body only the UB checks
+/// run: what a future keeps across a yield is computed from the runtime body, and the checks'
+/// temporaries live within one block.
 pub(super) fn optimize<'db>(
     db: &'db dyn HirDatabase,
     body: &MirBody<'db>,
-    level: MirOptLevel,
-) -> MirBody<'db> {
+    options: MirOptions,
+) -> Result<'db, MirBody<'db>> {
     let mut body = body.clone();
-    if level == MirOptLevel::Off || body.coroutine.is_some() {
-        return body;
+    let level = options.level;
+    let optimizing = level != MirOptLevel::Off && body.coroutine.is_none();
+    if !optimizing && !options.ub_checks {
+        return Ok(body);
     }
     let ctx = Ctx::new(db, body.owner);
     let release = level >= MirOptLevel::Release;
@@ -101,13 +111,24 @@ pub(super) fn optimize<'db>(
     }
     // rustc's runtime cleanup, which its runtime MIR has had before any of these:
     // `CleanupPostBorrowck` and `SimplifyCfg-pre-optimizations`.
-    run!("CleanupPostBorrowck", cfg::cleanup_post_borrowck(&mut body));
-    run!("SimplifyCfg", cfg::simplify_cfg(&mut body));
+    if optimizing {
+        run!("CleanupPostBorrowck", cfg::cleanup_post_borrowck(&mut body));
+        run!("SimplifyCfg", cfg::simplify_cfg(&mut body));
+    }
+    if options.ub_checks {
+        use check_pointers::{PointerCheck, check_pointers};
+        run!("CheckAlignment", check_pointers(&ctx, &mut body, PointerCheck::Alignment)?);
+        run!("CheckNull", check_pointers(&ctx, &mut body, PointerCheck::Null)?);
+        run!("CheckEnums", check_enums::check_enums(&ctx, &mut body)?);
+    }
+    if !optimizing {
+        return Ok(body);
+    }
 
     run!("LowerSliceLenCalls", inst_simplify::lower_slice_len_calls(&ctx, &mut body));
     run!("InstSimplify", inst_simplify::inst_simplify(&ctx, &mut body));
-    // rustc keeps storage markers only where it gives LLVM lifetimes: at `opt-level > 0`.
-    if !release {
+    // rustc keeps storage markers only where it gives the backend lifetimes.
+    if !options.lifetime_markers {
         run!("RemoveStorageMarkers", locals::remove_storage_markers(&mut body));
     }
     run!("RemoveUnneededDrops", cfg::remove_unneeded_drops(&ctx, &mut body));
@@ -133,36 +154,36 @@ pub(super) fn optimize<'db>(
     }
     run!("SimplifyLocals", locals::simplify_locals(&mut body));
     run!("CriticalCallEdges", cfg::critical_call_edges(&mut body));
-    body
+    Ok(body)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_cycle_result)]
 pub fn optimized_mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
-    level: MirOptLevel,
+    options: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
-    Ok(optimize(db, db.runtime_mir_body(def)?, level))
+    optimize(db, db.runtime_mir_body(def)?, options)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_for_closure_cycle_result)]
 pub fn optimized_mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
-    level: MirOptLevel,
+    options: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
-    Ok(optimize(db, db.runtime_mir_body_for_closure(closure)?, level))
+    optimize(db, db.runtime_mir_body_for_closure(closure)?, options)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = monomorphized_optimized_mir_body_cycle_result)]
 pub fn monomorphized_optimized_mir_body_query<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
-    level: MirOptLevel,
+    options: MirOptions,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.optimized_mir_body(def, level)?, &subst, &trait_env)
+    monomorphized(db, db.optimized_mir_body(def, options)?, &subst, &trait_env)
 }
 
 #[salsa::tracked(
@@ -172,18 +193,88 @@ pub fn monomorphized_optimized_mir_body_query<'db>(
 pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
-    level: MirOptLevel,
+    options: MirOptions,
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.optimized_mir_body_for_closure(closure, level)?, &subst, &trait_env)
+    monomorphized(db, db.optimized_mir_body_for_closure(closure, options)?, &subst, &trait_env)
+}
+
+/// The body of an `async` block's `poll` with `options`: of the passes, only the UB checks run
+/// on a coroutine body.
+#[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_for_coroutine_cycle_result)]
+pub fn optimized_mir_body_for_coroutine_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    options: MirOptions,
+) -> Result<'db, MirBody<'db>> {
+    optimize(db, db.runtime_mir_body_for_coroutine(coroutine)?, options)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = optimized_mir_body_for_coroutine_cycle_result)]
+pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    options: MirOptions,
+) -> Result<'db, MirBody<'db>> {
+    optimize(db, db.runtime_mir_body_for_coroutine_by_move(coroutine)?, options)
+}
+
+#[salsa::tracked(
+    returns(as_ref),
+    cycle_result = monomorphized_optimized_mir_body_for_coroutine_cycle_result
+)]
+pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    options: MirOptions,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Result<'db, MirBody<'db>> {
+    let body = db.optimized_mir_body_for_coroutine(coroutine, options)?;
+    monomorphized(db, body, &subst, &trait_env)
+}
+
+#[salsa::tracked(
+    returns(as_ref),
+    cycle_result = monomorphized_optimized_mir_body_for_coroutine_cycle_result
+)]
+pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    options: MirOptions,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Result<'db, MirBody<'db>> {
+    let body = db.optimized_mir_body_for_coroutine_by_move(coroutine, options)?;
+    monomorphized(db, body, &subst, &trait_env)
+}
+
+fn optimized_mir_body_for_coroutine_cycle_result<'db>(
+    _db: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _: InternedCoroutineId<'db>,
+    _: MirOptions,
+) -> Result<'db, MirBody<'db>> {
+    Err(MirLowerError::Loop)
+}
+
+fn monomorphized_optimized_mir_body_for_coroutine_cycle_result<'db>(
+    _db: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _: InternedCoroutineId<'db>,
+    _: MirOptions,
+    _: StoredGenericArgs,
+    _: StoredParamEnvAndCrate,
+) -> Result<'db, MirBody<'db>> {
+    Err(MirLowerError::Loop)
 }
 
 fn monomorphized_optimized_mir_body_cycle_result<'db>(
     _db: &'db dyn HirDatabase,
     _: salsa::Id,
     _: InferBodyId<'db>,
-    _: MirOptLevel,
+    _: MirOptions,
     _: StoredGenericArgs,
     _: StoredParamEnvAndCrate,
 ) -> Result<'db, MirBody<'db>> {
@@ -194,7 +285,7 @@ fn monomorphized_optimized_mir_body_for_closure_cycle_result<'db>(
     _db: &'db dyn HirDatabase,
     _: salsa::Id,
     _: InternedClosureId<'db>,
-    _: MirOptLevel,
+    _: MirOptions,
     _: StoredGenericArgs,
     _: StoredParamEnvAndCrate,
 ) -> Result<'db, MirBody<'db>> {
@@ -226,7 +317,7 @@ pub(super) fn interpreted_body<'db>(
 ) -> Result<'db, &'db MirBody<'db>> {
     match interpreter_level() {
         MirOptLevel::Off => db.monomorphized_runtime_mir_body(def, subst, env),
-        level => db.monomorphized_optimized_mir_body(def, level, subst, env),
+        level => db.monomorphized_optimized_mir_body(def, MirOptions::at(level), subst, env),
     }
 }
 
@@ -238,7 +329,10 @@ pub(super) fn interpreted_closure_body<'db>(
 ) -> Result<'db, &'db MirBody<'db>> {
     match interpreter_level() {
         MirOptLevel::Off => db.monomorphized_runtime_mir_body_for_closure(closure, subst, env),
-        level => db.monomorphized_optimized_mir_body_for_closure(closure, level, subst, env),
+        level => {
+            let options = MirOptions::at(level);
+            db.monomorphized_optimized_mir_body_for_closure(closure, options, subst, env)
+        }
     }
 }
 
@@ -246,7 +340,7 @@ fn optimized_mir_body_cycle_result<'db>(
     _db: &'db dyn HirDatabase,
     _: salsa::Id,
     _: InferBodyId<'db>,
-    _: MirOptLevel,
+    _: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
     Err(MirLowerError::Loop)
 }
@@ -255,7 +349,7 @@ fn optimized_mir_body_for_closure_cycle_result<'db>(
     _db: &'db dyn HirDatabase,
     _: salsa::Id,
     _: InternedClosureId<'db>,
-    _: MirOptLevel,
+    _: MirOptions,
 ) -> Result<'db, MirBody<'db>> {
     Err(MirLowerError::Loop)
 }

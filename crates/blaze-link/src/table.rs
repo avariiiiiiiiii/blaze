@@ -12,6 +12,7 @@
 //! sets aside for veneers).
 
 use blaze_codegen::Arch;
+use rayon::prelude::*;
 
 use crate::model::Apply;
 
@@ -32,37 +33,69 @@ pub(crate) fn stub_size(arch: Arch) -> u64 {
     }
 }
 
-/// The stub of `slot`: its bytes, and the fixups that point it at the table cell.
-pub(crate) fn stub(arch: Arch, slot: u32) -> (Vec<u8>, Vec<StubFixup>) {
+/// `mov r11, [rip + cell]; jmp [r11 + disp32]; int3; int3`, the displacement at 10.
+const X86_STUB: [u8; 16] = [0x4c, 0x8b, 0x1d, 0, 0, 0, 0, 0x41, 0xff, 0xa3, 0, 0, 0, 0, 0xcc, 0xcc];
+const X86_STUB_FIXUPS: [StubFixup; 1] = [StubFixup { at: 3, apply: Apply::Rel32, addend: -4 }];
+
+/// adrp x16, cell; ldr x16, [x16, :lo12:cell]; movz x17, #low; movk x17, #high, lsl #16;
+/// ldr x16, [x16, x17]; br x16.
+const A64_STUB: [u32; 6] = [0x9000_0010, 0xf940_0210, 0xd280_0011, 0xf2a0_0011, 0xf871_6a10, 0xd61f_0200];
+const A64_PAGE_FIXUPS: [StubFixup; 2] = [
+    StubFixup { at: 0, apply: Apply::A64Page21, addend: 0 },
+    StubFixup { at: 4, apply: Apply::A64Lo12 { shift: 3 }, addend: 0 },
+];
+
+/// The fixups of every slot's stub, from the stub's start: each to the table cell.
+pub(crate) fn stub_fixups(arch: Arch) -> &'static [StubFixup] {
+    match arch {
+        Arch::X86_64 => &X86_STUB_FIXUPS,
+        Arch::Aarch64 => &A64_PAGE_FIXUPS,
+        Arch::Wasm32 => &[],
+    }
+}
+
+/// Writes the stub of `slot` into `out`, [`stub_size`] bytes; its fixups are [`stub_fixups`].
+pub(crate) fn write_stub(arch: Arch, slot: u32, out: &mut [u8]) {
     let offset = u64::from(slot) * 8;
     match arch {
         Arch::X86_64 => {
-            let disp = u32::try_from(offset).expect("a slot below 2^28");
-            let mut code = vec![0x4c, 0x8b, 0x1d, 0, 0, 0, 0, 0x41, 0xff, 0xa3];
-            code.extend_from_slice(&disp.to_le_bytes());
-            code.extend_from_slice(&[0xcc, 0xcc]);
-            (code, vec![StubFixup { at: 3, apply: Apply::Rel32, addend: -4 }])
+            let disp = u32::try_from(offset).expect("a slot below 2^29");
+            out[..16].copy_from_slice(&X86_STUB);
+            out[10..14].copy_from_slice(&disp.to_le_bytes());
         }
         Arch::Aarch64 => {
             let low = (offset & 0xffff) as u32;
             let high = ((offset >> 16) & 0xffff) as u32;
-            let words = [
-                0x9000_0010,               // adrp x16, cell
-                0xf940_0210,               // ldr x16, [x16, :lo12:cell]
-                0xd280_0011 | (low << 5),  // movz x17, #low
-                0xf2a0_0011 | (high << 5), // movk x17, #high, lsl #16
-                0xf871_6a10,               // ldr x16, [x16, x17]
-                0xd61f_0200,               // br x16
-            ];
-            let code = words.iter().flat_map(|it: &u32| it.to_le_bytes()).collect();
-            let fixups = vec![
-                StubFixup { at: 0, apply: Apply::A64Page21, addend: 0 },
-                StubFixup { at: 4, apply: Apply::A64Lo12 { shift: 3 }, addend: 0 },
-            ];
-            (code, fixups)
+            let mut words = A64_STUB;
+            words[2] |= low << 5;
+            words[3] |= high << 5;
+            for (to, word) in out[..24].chunks_exact_mut(4).zip(words) {
+                to.copy_from_slice(&word.to_le_bytes());
+            }
         }
-        Arch::Wasm32 => (Vec::new(), Vec::new()),
+        Arch::Wasm32 => {}
     }
+}
+
+/// The stubs of slots `0..count`, one after another, written in parallel into one buffer.
+pub(crate) fn stubs(arch: Arch, count: u32) -> Vec<u8> {
+    let size = stub_size(arch) as usize;
+    let mut code = vec![0; size * count as usize];
+    if size == 0 {
+        return code;
+    }
+    code.par_chunks_mut(size).with_min_len(4096).enumerate().for_each(|(slot, out)| {
+        write_stub(arch, slot as u32, out);
+    });
+    code
+}
+
+/// The stub of `slot`: its bytes and fixups.
+#[cfg(test)]
+pub(crate) fn stub(arch: Arch, slot: u32) -> (Vec<u8>, &'static [StubFixup]) {
+    let mut code = vec![0; stub_size(arch) as usize];
+    write_stub(arch, slot, &mut code);
+    (code, stub_fixups(arch))
 }
 
 /// The size of one PLT stub: a jump through an import's GOT cell.
@@ -73,29 +106,33 @@ pub(crate) fn plt_size(arch: Arch) -> u64 {
     }
 }
 
-/// A PLT stub: its bytes, and the fixups that point it at the GOT cell.
-pub(crate) fn plt(arch: Arch) -> (Vec<u8>, Vec<StubFixup>) {
+/// `jmp [rip + cell]`, padded with `int3`.
+const X86_PLT: [u8; 16] = [0xff, 0x25, 0, 0, 0, 0, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc];
+const X86_PLT_FIXUPS: [StubFixup; 1] = [StubFixup { at: 2, apply: Apply::Rel32, addend: -4 }];
+/// adrp x16, cell; ldr x17, [x16, :lo12:cell]; br x17; brk #0.
+const A64_PLT: [u8; 16] = words_le([0x9000_0010, 0xf940_0211, 0xd61f_0220, 0xd420_0000]);
+
+const fn words_le(words: [u32; 4]) -> [u8; 16] {
+    let mut out = [0; 16];
+    let mut at = 0;
+    while at < 4 {
+        let bytes = words[at].to_le_bytes();
+        out[at * 4] = bytes[0];
+        out[at * 4 + 1] = bytes[1];
+        out[at * 4 + 2] = bytes[2];
+        out[at * 4 + 3] = bytes[3];
+        at += 1;
+    }
+    out
+}
+
+/// A PLT stub: its bytes, and the fixups that point it at the GOT cell. Both static: making a
+/// stub allocates nothing.
+pub(crate) fn plt(arch: Arch) -> (&'static [u8], &'static [StubFixup]) {
     match arch {
-        Arch::X86_64 => {
-            let mut code = vec![0xff, 0x25, 0, 0, 0, 0];
-            code.resize(16, 0xcc);
-            (code, vec![StubFixup { at: 2, apply: Apply::Rel32, addend: -4 }])
-        }
-        Arch::Aarch64 => {
-            let words: [u32; 4] = [
-                0x9000_0010, // adrp x16, cell
-                0xf940_0211, // ldr x17, [x16, :lo12:cell]
-                0xd61f_0220, // br x17
-                0xd420_0000, // brk #0
-            ];
-            let code = words.iter().flat_map(|it| it.to_le_bytes()).collect();
-            let fixups = vec![
-                StubFixup { at: 0, apply: Apply::A64Page21, addend: 0 },
-                StubFixup { at: 4, apply: Apply::A64Lo12 { shift: 3 }, addend: 0 },
-            ];
-            (code, fixups)
-        }
-        Arch::Wasm32 => (Vec::new(), Vec::new()),
+        Arch::X86_64 => (&X86_PLT, &X86_PLT_FIXUPS),
+        Arch::Aarch64 => (&A64_PLT, &A64_PAGE_FIXUPS),
+        Arch::Wasm32 => (&[], &[]),
     }
 }
 
@@ -152,6 +189,23 @@ mod tests {
         assert_eq!((word(12) >> 5) & 0xffff, (offset >> 16) as u32);
         // The cell's low 12 bits, scaled for the 8-byte load.
         assert_eq!((word(4) >> 10) & 0xfff, 8 >> 3);
+    }
+
+    #[test]
+    fn the_bulk_stubs_are_each_slots_stub() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let size = stub_size(arch) as usize;
+            let all = stubs(arch, 9000);
+            assert_eq!(all.len(), size * 9000);
+            for slot in [0u32, 1, 4095, 4096, 8191, 8999] {
+                let (one, _) = stub(arch, slot);
+                assert_eq!(&all[slot as usize * size..][..size], &one[..], "{arch:?} slot {slot}");
+            }
+        }
+        let (x86, fixups) = plt(Arch::X86_64);
+        assert_eq!((x86.len() as u64, &x86[..2], fixups[0].at), (plt_size(Arch::X86_64), &[0xff, 0x25][..], 2));
+        let (a64, _) = plt(Arch::Aarch64);
+        assert_eq!(u32::from_le_bytes(a64[8..12].try_into().unwrap()), 0xd61f_0220);
     }
 
     #[test]

@@ -78,7 +78,8 @@ pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     if bytes.len() >= 1 << 20 && at % 4096 == 0 && bytes.len() % 4096 == 0 {
         use std::os::fd::AsRawFd as _;
-        // SAFETY: an open descriptor; the flag changes only how its writes use the cache.
+        // SAFETY: `file`, opened above, owns the descriptor and outlives the call; the flag
+        // changes only how its writes use the cache.
         if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } < 0 {
             return Err(io::Error::last_os_error());
         }
@@ -289,7 +290,9 @@ struct Mapped {
     len: usize,
 }
 
-// SAFETY: read-only pages no one writes while they are mapped (see `map`).
+// SAFETY: read-only pages no one writes while they are mapped: `Effect::Map`'s contract bars
+// in-place writes and truncates of a mapped file (the store and the image replace a file only
+// by renaming another over it), so threads share them as they would a `&[u8]`.
 #[cfg(unix)]
 unsafe impl Send for Mapped {}
 // SAFETY: as above.
@@ -299,7 +302,9 @@ unsafe impl Sync for Mapped {}
 #[cfg(unix)]
 impl AsRef<[u8]> for Mapped {
     fn as_ref(&self) -> &[u8] {
-        // SAFETY: `len` bytes mapped at `at` for as long as `self` lives.
+        // SAFETY: `len` bytes mapped at `at` for as long as `self` lives, never written or cut
+        // short meanwhile by `Effect::Map`'s contract; if they were, this slice would see a
+        // data race or fault.
         unsafe { std::slice::from_raw_parts(self.at, self.len) }
     }
 }

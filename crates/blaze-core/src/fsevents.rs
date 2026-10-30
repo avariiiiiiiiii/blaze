@@ -58,6 +58,8 @@ const LOSES: u32 = EVENT_MUST_SCAN_SUB_DIRS
     | EVENT_MOUNT
     | EVENT_UNMOUNT;
 
+// SAFETY: these signatures match CoreFoundation's CFString.h and CFArray.h (`CFRef` is
+// `CFTypeRef`, `CFIndex` is `isize`); a mismatch would be UB at every call.
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFTypeArrayCallBacks: CFArrayCallBacks;
@@ -71,6 +73,7 @@ unsafe extern "C" {
     fn CFRelease(object: CFRef);
 }
 
+// SAFETY: these signatures match FSEvents.h.
 #[link(name = "CoreServices", kind = "framework")]
 unsafe extern "C" {
     fn FSEventStreamCreate(
@@ -90,6 +93,7 @@ unsafe extern "C" {
 }
 
 // libdispatch, in libSystem.
+// SAFETY: these signatures match dispatch/queue.h and dispatch/object.h.
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const c_char, attributes: *const c_void) -> DispatchQueue;
     fn dispatch_sync_f(queue: DispatchQueue, context: *mut c_void, work: extern "C" fn(*mut c_void));

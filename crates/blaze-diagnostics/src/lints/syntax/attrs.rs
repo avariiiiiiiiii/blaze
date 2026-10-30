@@ -177,6 +177,9 @@ pub(crate) struct Owner {
     pub(crate) node: InFile<SyntaxNode>,
     pub(crate) target: Target,
     pub(crate) attrs: Vec<Attr>,
+    /// For a macro call, the node expansion buffers its attributes' lints at
+    /// (`current_expansion.lint_node_id`).
+    pub(crate) buffered_at: Option<InFile<SyntaxNodePtr>>,
 }
 
 impl Owner {
@@ -225,10 +228,15 @@ pub(crate) fn owners(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Owner> {
                 node: InFile::new(tree.file, node.clone()),
                 target,
                 attrs: attributes(walk, tree.file, &has_attrs),
+                buffered_at: None,
             });
         }
     }
     owners.retain(|it| !it.attrs.is_empty());
+    let mut modules = doc::comments::Modules::default();
+    for owner in owners.iter_mut().filter(|it| it.target == Target::MacroCall) {
+        owner.buffered_at = Some(doc::comments::lint_node(cx, &owner.node, &mut modules));
+    }
     owners
 }
 
@@ -265,10 +273,16 @@ fn attributes(walk: &Walk<'_>, file: HirFileId, owner: &ast::AnyHasAttrs) -> Vec
 /// the rest of the delayed lints, right after `check_mod_attrs`; for a macro call's attributes,
 /// which expansion parses, buffered for the early lint pass.
 pub(crate) fn parsed(diag: Diag, owner: &Owner) -> Emitted {
-    match owner.target {
-        Target::MacroCall => Emitted::new(diag, Phase::Resolve, Pass::Buffered, owner.at()),
-        _ => Emitted::new(diag, Phase::Items, Pass::Early, owner.at()),
+    match &owner.buffered_at {
+        Some(at) => Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()),
+        None => Emitted::new(diag, Phase::Items, Pass::Early, owner.at()),
     }
+}
+
+/// The node a lint of `owner`'s attributes is emitted at: for a macro call, the one
+/// expansion buffers at.
+pub(crate) fn lint_at(owner: &Owner) -> InFile<SyntaxNodePtr> {
+    owner.buffered_at.clone().unwrap_or_else(|| owner.at())
 }
 
 /// A lint `check_mod_attrs` gives of `owner`'s attributes.

@@ -9,7 +9,7 @@ use crate::{
     mir_pretty::MirEvalErrorPretty as _, next_solver::GenericArgs, setup_tracing, test_db::TestDB,
 };
 
-use crate::mir::{MirEvalError, MirOptLevel, interpret_mir, set_interpreter_mir_opt_level};
+use crate::mir::{MirEvalError, MirOptLevel, MirOptions, interpret_mir, set_interpreter_mir_opt_level};
 
 fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError<'_>> {
     let unoptimized = eval_main_at(db, file_id, MirOptLevel::Off);
@@ -62,7 +62,7 @@ fn eval_main_at(
         let args = GenericArgs::empty().store();
         let body = match level {
             MirOptLevel::Off => db.monomorphized_runtime_mir_body(func_id.into(), args, env),
-            level => db.monomorphized_optimized_mir_body(func_id.into(), level, args, env),
+            level => db.monomorphized_optimized_mir_body(func_id.into(), MirOptions::at(level), args, env),
         }
         .map_err(|e| MirEvalError::MirLowerError(func_id, e))?;
         set_interpreter_mir_opt_level(level);

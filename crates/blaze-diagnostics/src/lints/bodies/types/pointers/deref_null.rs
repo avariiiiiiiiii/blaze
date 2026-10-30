@@ -7,6 +7,7 @@
 
 use hir_def::hir::{Expr, ExprId, UnaryOp, type_ref::{Rawness, TypeRef}};
 use hir_ty::next_solver::TyKind;
+use intern::Symbol;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::IntoKind as _;
 
@@ -60,10 +61,10 @@ fn is_null_ptr(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
     }
     match b.store().expr(expr) {
         Expr::Cast { expr: inner, type_ref } => {
-            matches!(b.store()[type_ref], TypeRef::RawPtr(..)) && (is_zero(b, inner) || is_null_ptr(b, inner))
+            matches!(b.store().type_ref(type_ref), TypeRef::RawPtr(..)) && (is_zero(b, inner) || is_null_ptr(b, inner))
         }
         Expr::Call { callee, .. } => {
-            matches!(super::callee_item(b, callee).as_deref(), Some("ptr_null" | "ptr_null_mut"))
+            matches!(super::callee_item(b, callee).as_ref().map(Symbol::as_str), Some("ptr_null" | "ptr_null_mut"))
         }
         _ => false,
     }

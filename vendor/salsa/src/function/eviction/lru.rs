@@ -1,65 +1,35 @@
 //! Least Recently Used (LRU) eviction policy.
 //!
-//! This policy tracks the most recently accessed items and evicts
-//! the least recently used ones when the cache exceeds its capacity.
+//! When more values are memoized than the capacity, the values of the memos verified longest
+//! ago are evicted at the start of each new revision.
 
 use std::num::NonZeroUsize;
-
-use crate::Id;
-use crate::hash::FxLinkedHashSet;
-use crate::sync::Mutex;
 
 use super::{EvictionPolicy, HasCapacity};
 
 /// Least Recently Used eviction policy.
 ///
-/// When the number of memoized values exceeds the configured capacity,
-/// the least recently accessed values are evicted at the start of each
-/// new revision.
+/// "Used" is the revision a memo was last verified in: a read verifies the memo before it
+/// returns, so a revision's reads keep their values over the values of older revisions. Memos
+/// verified in the same revision are evicted in slot order.
 pub struct Lru {
     capacity: Option<NonZeroUsize>,
-    set: Mutex<FxLinkedHashSet<Id>>,
-}
-
-impl Lru {
-    #[inline(never)]
-    fn insert(&self, id: Id) {
-        self.set.lock().insert(id);
-    }
 }
 
 impl EvictionPolicy for Lru {
     fn new(cap: usize) -> Self {
         Self {
             capacity: NonZeroUsize::new(cap),
-            set: Mutex::default(),
-        }
-    }
-
-    #[inline(always)]
-    fn record_use(&self, id: Id) {
-        if self.capacity.is_some() {
-            self.insert(id);
         }
     }
 
     fn set_capacity(&mut self, capacity: usize) {
         self.capacity = NonZeroUsize::new(capacity);
-        if self.capacity.is_none() {
-            self.set.get_mut().clear();
-        }
     }
 
-    fn for_each_evicted(&mut self, mut cb: impl FnMut(Id)) {
-        let Some(cap) = self.capacity else {
-            return;
-        };
-        let set = self.set.get_mut();
-        while set.len() > cap.get() {
-            if let Some(id) = set.pop_front() {
-                cb(id);
-            }
-        }
+    #[inline]
+    fn capacity(&self) -> Option<NonZeroUsize> {
+        self.capacity
     }
 }
 

@@ -23,7 +23,7 @@ use syntax::{
     ast::{self, HasGenericArgs, HasGenericParams, HasTypeBounds},
 };
 
-use super::walk::Item;
+use super::walk::{self, Item};
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
@@ -52,11 +52,11 @@ type Elision = Option<Res>;
 
 pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
     let anonymous_in_impl_trait = super::feature(cx, "anonymous_lifetime_in_impl_trait");
-    let mut found: Vec<((Vec<u32>, u32), Found)> = Vec::new();
+    let mut found: Vec<(Vec<u32>, Found)> = Vec::new();
     let mut lints = Lints { cx, anonymous_in_impl_trait, found: &mut found };
     for item in items {
         let derived = item.node.file_id.macro_file().is_some_and(|it| it.loc(cx.db).def.is_derive());
-        let order = module_order(cx, item.module);
+        let order = walk::module_order(cx, item.module);
         let node = item.node.as_ref();
         match node.value {
             ast::Item::Fn(f) => {
@@ -94,26 +94,10 @@ pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
     found.into_iter().map(|(_, it)| it).collect()
 }
 
-/// Where a module is in the crate as the AST has it: the offsets of the declarations of it and
-/// the modules it is in, from the crate's root, so that items sort as the early lint pass
-/// visits them (each module's items in place of its `mod`).
-fn module_order(cx: &Cx<'_, '_>, module: hir::Module) -> Vec<u32> {
-    let mut order = Vec::new();
-    let mut at = Some(module);
-    while let Some(module) = at {
-        if let Some(range) = module.declaration_source_range(cx.db) {
-            order.push(cx.span(range).lo);
-        }
-        at = module.parent(cx.db);
-    }
-    order.reverse();
-    order
-}
-
 struct Lints<'c, 'a, 'db, 'f> {
     cx: &'c Cx<'a, 'db>,
     anonymous_in_impl_trait: bool,
-    found: &'f mut Vec<((Vec<u32>, u32), Found)>,
+    found: &'f mut Vec<(Vec<u32>, Found)>,
 }
 
 impl Lints<'_, '_, '_, '_> {
@@ -206,7 +190,7 @@ impl Lints<'_, '_, '_, '_> {
                 diag.fact(Fact::Signature(cx.key(id)), format!("the generics of `{item_name}`"));
             }
             crate::lints::code_fact(cx, &mut diag, item.ptr());
-            let key = (order.to_vec(), cx.span(InFile::new(file, param.syntax().text_range())).lo);
+            let key = walk::source_order(order, cx.span(InFile::new(file, param.syntax().text_range())).lo);
             self.found.push((key, Found::lint(diag, Phase::Resolve, at)));
         }
     }

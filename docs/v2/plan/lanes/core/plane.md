@@ -57,6 +57,14 @@ that gives no file handles is an error for fanotify, not a switch to inotify; on
 for privilege is (no-fallback). `Threads` is the portable reference: blocking calls on
 threads, the meaning every other driver is compared with.
 
+**The ring** (Linux 6.0 or newer, else an error naming the feature): SQPOLL, so a busy driver
+submits with no system call; a sparse registered-file table for cached files and sockets, its
+upper half for multishot accepts straight into slots; four registered 1 MiB buffers for
+`O_DIRECT` writes; multishot receives from a provided-buffer ring; a whole-file write as linked
+write, sync, rename and directory sync. A `WriteAt` of 1 MiB or more whose offset and length
+fit the device's `STATX_DIOALIGN` bypasses the page cache (`F_NOCACHE` on macOS, from 4 KiB
+alignment); the bytes on disk are the same either way.
+
 **Sandboxes are usercode's.** A `Command` with `Sandbox::On` runs through a
 `blaze_core::Confine` the driver was given (`Threads::confined`, `Uring::confined`,
 `Kqueue::confined`, `Iocp::confined`): it says the program, arguments, environment and
@@ -107,7 +115,9 @@ its expected memory.
    at the plane's virtual time; ties go to the heavier, then the first opened. Work under way
    is never stopped.
 4. **Critical path.** Within a request, the ready node with the longest path of expected cost
-   to the end runs first; ties to the node added first.
+   to the end runs first; ties to the node added first. A `Run` says `critical` when its
+   node's path is at least that of every ready and running node of its request, and the pool
+   puts it on a fast group.
 5. **Memory admission.** A task starts only when the granted memory plus its own prediction
    fit the budget. A task passed over `starve_after` times holds back every task with memory,
    of every pool and request, until it starts (tasks with no memory still start). A task
@@ -117,6 +127,12 @@ its expected memory.
    runs finish, and ends it not ok. `Plane::release(request)` gives back a finished request's
    room. `Plane::stats(request)` says what it ran, found cached and joined, and its critical
    path as measured.
+7. **Layout.** Nodes and tasks are `u32` slots into hot rows (64 bytes a node, 32 a task) and
+   colder columns, reused through free lists; a request's deps are one edge array (a node's
+   deps a range of it, its dependents a list threaded through it); task members a list through
+   the node rows; ready sets 4-ary heaps whose nodes know their place; keys index the flight
+   table by their own first eight bytes. In steady state a task costs the plane no allocation;
+   `Plane::step_into` appends to the caller's buffer.
 
 `Machine` (the build-script and name-resolution graphs) is the plane with one request and no
 memo; its outputs are the same as before, which a test checks over a recorded trace and 300
@@ -129,8 +145,10 @@ memory stays within the budget, the held task starts first, and every request en
 - **Estimates** per task kind: a peak at or over the prediction becomes the prediction at
   once; 64 peaks in a row under it bring it half way down to their most. Unseen kinds take a
   default. Encoded deterministically for the daemon's image.
-- **Measured, not guessed**: `arena::Counting` is the daemon's global allocator (per-thread
-  counts, sharded totals, no lock); `measure(f)` is the peak of what `f` held, `held()` what the
+- **Measured, not guessed**: `arena::Counting` is the daemon's global allocator, over the
+  allocator it uses (per-thread counts added to one total each time they drift 256 KiB and at
+  thread exit: no lock and no atomic per allocation; `held()` is one load, within 256 KiB per
+  other thread); `measure(f)` is the peak of what `f` held, `held()` what the
   process holds. The scheduler measures every task and feeds `observe` and `Held`.
 - **The daemon's own cap**: `Bump` arenas reserve their chunks from a `Cap`, which calls a
   spill (cold results to disk) once each time it crosses `spill_at`, makes a reserve over the
@@ -144,8 +162,10 @@ memory stays within the budget, the held task starts first, and every request en
 
 - **Groups**: on Linux the CPUs of a level 3 cache (an EPYC's CCD) or, where smaller, a
   cluster of more than one core (Graviton); on macOS an L2 cluster of one performance level,
-  level 0 fast. Only CPUs in the affinity mask. Stealing goes to the own group, then the other
-  groups of the socket nearest by id, then the rest.
+  level 0 fast. A group never spans NUMA nodes (an L3 shared across sub-NUMA clusters is split
+  by node). Only CPUs in the affinity mask. Stealing goes to the own group, then its node, then
+  its socket, then the rest. Where sysfs, the affinity mask or the perflevels say nothing,
+  `Topology::detect` is an error naming what, never one group.
 - **Pool**: one worker per CPU, pinned on Linux (`sched_setaffinity`), a QoS class by P or E
   core on macOS; a lock-free deque per worker and an injector per group; a job near no group
   goes to the least loaded group, fast first. A worker that cannot start or bind fails the
@@ -171,7 +191,7 @@ cancelled (step 7).
 ## What others wire
 
 - usercode: a `Confine` over the sandbox, given to the drivers.
-- the daemon: `arena::Counting` as its global allocator; its work on `exec::Scheduler` with the
+- the daemon: `arena::Counting<Jemalloc>` (or mimalloc) as its global allocator; its work on `exec::Scheduler` with the
   database's `Memo`, the budget from `machine_budget`.
 - db: `blaze_query::Cancelled` as `blaze_graph::Cancelled`, `Cx::get` on `Flights`.
 - ci: `NodeState::Cancelled`, and `Plane::stats` in the API's per-request work.

@@ -143,8 +143,10 @@ impl Flecs {
         if flecs.rest.is_null() {
             return Err("Flecs made no REST server".into());
         }
-        flecs.workspace = flecs.component(c"Workspace", size_of::<Workspace>(), align_of::<Workspace>())?;
-        flecs.function = flecs.component(c"Function", size_of::<Function>(), align_of::<Function>())?;
+        let workspace = (size_of::<Workspace>(), align_of::<Workspace>());
+        flecs.workspace = flecs.component(c"Workspace", workspace.0, workspace.1)?;
+        let function = (size_of::<Function>(), align_of::<Function>());
+        flecs.function = flecs.component(c"Function", function.0, function.1)?;
         let vector = (size_of::<ecs::ecs_vec_t>(), align_of::<ecs::ecs_vec_t>());
         flecs.callees = flecs.component(c"Callees", vector.0, vector.1)?;
         // SAFETY: an extern static that Flecs's bootstrap (`ecs_init`, above) writes once and
@@ -318,14 +320,15 @@ impl Flecs {
     fn alive(&self, entity: Entity) {
         // SAFETY: a live world; any id may be asked of (0 is never alive, and is not asked).
         let alive = entity != 0 && unsafe { ecs::ecs_is_alive(self.world, entity) };
-        assert!(alive, "build page: {entity:#x} is no live entity of the world: its bookkeeping is wrong");
+        assert!(alive, "build page: {entity:#x} is no live entity of the world");
     }
 
     fn lookup(&self, name: &CStr) -> Result<Entity, String> {
         // SAFETY: a live world and a NUL-terminated name.
         let entity = unsafe { ecs::ecs_lookup(self.world, name.as_ptr()) };
         if entity == 0 {
-            return Err(format!("Flecs has no {} of the build page's kinds", name.to_string_lossy()));
+            let name = name.to_string_lossy();
+            return Err(format!("Flecs has no {name} of the build page's kinds"));
         }
         Ok(entity)
     }
@@ -350,7 +353,8 @@ impl Flecs {
         let Component { size: has, alignment } = unsafe { at.read() };
         if has as usize != size || alignment as usize != align {
             return Err(format!(
-                "Flecs lays out {name} in {has} bytes aligned to {alignment}, not {size} aligned to {align}"
+                "Flecs lays out {name} in {has} bytes aligned to {alignment}, \
+                 not {size} aligned to {align}"
             ));
         }
         Ok(())

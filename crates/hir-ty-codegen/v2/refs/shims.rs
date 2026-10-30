@@ -22,7 +22,7 @@ use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
 use salsa::plumbing::AsId;
 
-use super::told;
+use super::{Tys, told};
 use crate::{CodegenError, FunctionCx, InstanceDef, coroutine_instance, implemented_fn_method};
 
 impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
@@ -128,7 +128,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
         };
         let poll_ty = poll_ty.as_ref();
         // The pinned reference and the context, as many of them as the body takes.
-        let arg_tys: Vec<Ty<'db>> = body.params.iter().take(2).map(|it| it.as_ref()).collect();
+        let arg_tys: Tys<'db> = body.params.iter().take(2).map(|it| it.as_ref()).collect();
         self.fx.layout(poll_ty).map_err(told)?;
         self.emit_call(def, parent_args, &arg_tys, poll_ty)
     }
@@ -312,7 +312,7 @@ impl<'cx, 'db> super::Walk<'_, 'cx, 'db> {
         self.fx.layout(dst_ty).map_err(told)?;
         let abi = if receiver { ExternAbi::Rust } else { fn_sig.abi() };
         let inputs = FunctionCx::abi_inputs(abi, fn_sig.inputs()).map_err(told)?;
-        let mut arg_tys = Vec::with_capacity(inputs.len());
+        let mut arg_tys = Tys::with_capacity(inputs.len());
         for &input in inputs.iter() {
             self.fx.layout(input).map_err(told)?;
             arg_tys.push(input);

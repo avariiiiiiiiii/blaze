@@ -3,7 +3,19 @@
 //! Of a test whose later errors are other passes' (trait solving, type checking, borrow
 //! checking), the `.stderr` before them.
 
-use super::super::early::{Test, ui, ui_core};
+use crate::{
+    Options,
+    emit::Style,
+    tests::{Mode, checked_with, compiletest, normalized, ui},
+};
+
+/// [`ui`] of a UI test that needs core's items: core is minicore with `flags`
+/// (`crates/test-utils/src/minicore.rs`).
+fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}");
+    let options = compiletest(Mode::Other, &Options::default());
+    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
+}
 
 /// Whether `stderr` starts with `expected`, the `.stderr` of a UI test up to its first error
 /// of a later pass.
@@ -40,7 +52,7 @@ LL | #![deny(unknown_or_malformed_diagnostic_attributes)]
 error: aborting due to 1 previous error
 
 "#;
-    let stderr = ui("deny_malformed_attribute.rs", "2015", Test::Fails, source);
+    let stderr = ui("deny_malformed_attribute.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -78,7 +90,7 @@ LL | #[diagnostic::non_existing_attribute(with_option = "foo")]
 warning: 2 warnings emitted
 
 "#;
-    let stderr = ui("non_existing_attributes_accepted.rs", "2015", Test::Passes, source);
+    let stderr = ui("non_existing_attributes_accepted.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -164,7 +176,7 @@ LL + #[diagnostic::do_not_recommend]
 error: aborting due to 4 previous errors
 
 "#;
-    let stderr = ui("suggest_typos.rs", "2015", Test::Fails, source);
+    let stderr = ui("suggest_typos.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -293,7 +305,7 @@ LL |     multiline string {Self:?}")]
 error: aborting due to 8 previous errors
 
 "#;
-    let stderr = ui("multiline_spans.rs", "2015", Test::Fails, source);
+    let stderr = ui("multiline_spans.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -330,7 +342,7 @@ LL | #![deny(unused_attributes)]
 error: aborting due to 1 previous error
 
 "#;
-    let stderr = ui("duplicate.rs", "2015", Test::Fails, source);
+    let stderr = ui("duplicate.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -359,7 +371,7 @@ LL | #[diagnostic::do_not_recommend(if not_accepted)]
 warning: 1 warning emitted
 
 "#;
-    let stderr = ui("malformed-diagnostic-attributes-if-expression.rs", "2015", Test::Passes, source);
+    let stderr = ui("malformed-diagnostic-attributes-if-expression.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -424,7 +436,7 @@ LL | #[diagnostic::do_not_recommend(x = y + z)]
 warning: 4 warnings emitted
 
 "#;
-    let stderr = ui_core("does_not_acccept_args.rs", "2015", Test::Passes, "send", source);
+    let stderr = ui_core("does_not_acccept_args.rs", "2015", "send", source);
     assert_eq!(stderr, expected);
 }
 
@@ -461,7 +473,7 @@ LL |     message = "{T}! is missing arguments",
 warning: 1 warning emitted
 
 "#;
-    let stderr = ui("report_warning_on_invalid_formats.rs", "2015", Test::Passes, source);
+    let stderr = ui("report_warning_on_invalid_formats.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -493,7 +505,7 @@ LL | #[diagnostic::on_unmatched_args = "foo"]
 warning: 1 warning emitted
 
 "#;
-    let stderr = ui("report_warning_on_invalid_meta_item_syntax.rs", "2015", Test::Passes, source);
+    let stderr = ui("report_warning_on_invalid_meta_item_syntax.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -525,7 +537,7 @@ LL | #[diagnostic::on_unmatched_args]
 warning: 1 warning emitted
 
 "#;
-    let stderr = ui("report_warning_on_missing_options.rs", "2015", Test::Passes, source);
+    let stderr = ui("report_warning_on_missing_options.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -557,7 +569,7 @@ LL | #[diagnostic::on_unmatched_args(unsupported = "foo")]
 warning: 1 warning emitted
 
 "#;
-    let stderr = ui("report_warning_on_unknown_options.rs", "2015", Test::Passes, source);
+    let stderr = ui("report_warning_on_unknown_options.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -578,7 +590,7 @@ macro_rules! pair {
 fn main() {}
 "#;
     let expected = r#""#;
-    let stderr = ui("disabled-feature-issue-159886.rs", "2015", Test::Passes, source);
+    let stderr = ui("disabled-feature-issue-159886.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -609,7 +621,7 @@ LL |     #[diagnostic::on_unknown(message = "anonymous block")]
 warning: 1 warning emitted
 
 "#;
-    let stderr = ui("incorrect_unstable_positions.rs", "2015", Test::Passes, source);
+    let stderr = ui("incorrect_unstable_positions.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -714,7 +726,7 @@ LL | #[diagnostic::on_unimplemented(message = "Test {Self:}")]
    |                                                     ^ remove this format specifier
 
 "#;
-    let stderr = ui("broken_format.rs", "2015", Test::Fails, source);
+    let stderr = ui("broken_format.rs", "2015", source);
     assert_starts_with(&stderr, expected);
 }
 
@@ -961,7 +973,7 @@ LL |     label = "{float}{_Self}{crate_local}{This}{ItemContext}{This:path}{This
 
 "#;
     let name = "do_not_accept_options_of_the_internal_rustc_attribute.rs";
-    let stderr = ui(name, "2015", Test::Fails, source);
+    let stderr = ui(name, "2015", source);
     assert_starts_with(&stderr, expected);
 }
 
@@ -997,7 +1009,7 @@ LL |     message = "Foo {Baz}",
    = note: `#[warn(malformed_diagnostic_format_literals)]` (part of `#[warn(unknown_or_malformed_diagnostic_attributes)]`) on by default
 
 "#;
-    let stderr = ui("report_warning_on_invalid_formats.rs", "2015", Test::Fails, source);
+    let stderr = ui("report_warning_on_invalid_formats.rs", "2015", source);
     assert_starts_with(&stderr, expected);
 }
 
@@ -1048,7 +1060,7 @@ LL |     label = "second label",
    |     ^^^^^^^^^^^^^^^^^^^^^^ `label` is later redundantly declared here
 
 "#;
-    let stderr = ui("report_warning_on_duplicated_options.rs", "2015", Test::Fails, source);
+    let stderr = ui("report_warning_on_duplicated_options.rs", "2015", source);
     assert_starts_with(&stderr, expected);
 }
 
@@ -1087,7 +1099,7 @@ LL | #[diagnostic::on_move(message = "Foo", label = "Bar", note = "{Expected} {F
    = help: expect either a generic argument name or `{Self}` as format argument
 
 "#;
-    let stderr = ui("on-type-error-invalid-placeholders.rs", "2015", Test::Fails, source);
+    let stderr = ui("on-type-error-invalid-placeholders.rs", "2015", source);
     assert_starts_with(&stderr, expected);
 }
 
@@ -1114,7 +1126,7 @@ LL | struct TooMany<T, U>(T, U);
    = note: `#[warn(malformed_diagnostic_attributes)]` (part of `#[warn(unknown_or_malformed_diagnostic_attributes)]`) on by default
 
 "#;
-    let stderr = ui("on_type_error_with_too_many_generics.rs", "2015", Test::Fails, source);
+    let stderr = ui("on_type_error_with_too_many_generics.rs", "2015", source);
     assert_starts_with(&stderr, expected);
 }
 
@@ -1171,7 +1183,7 @@ LL | #[diagnostic::on_type_error(label = "custom on_type_error note: not allowed
    = help: only `note` is allowed as option for `diagnostic::on_type_error`
 
 "#;
-    let stderr = ui("report_warning_on_unknown_options.rs", "2015", Test::Fails, source);
+    let stderr = ui("report_warning_on_unknown_options.rs", "2015", source);
     assert_starts_with(&stderr, expected);
 }
 
@@ -1230,6 +1242,6 @@ LL |     note = "my label {Baz}",
    = help: expect either a generic argument name or `{Self}` as format argument
 
 "#;
-    let stderr = ui("malformed_format_literals.rs", "2015", Test::Fails, source);
+    let stderr = ui("malformed_format_literals.rs", "2015", source);
     assert_starts_with(&stderr, expected);
 }

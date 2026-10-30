@@ -160,6 +160,19 @@ pub struct Label {
 }
 pub type LabelId = Idx<Label>;
 
+// The flat arrays' elements, on 64-bit (`docs/v2/plan/design/data.md`'s budgets). An
+// `Option<ExprId>` is 8 bytes because `la_arena::Idx` has no niche: with one, `MatchArm` would
+// be 12 and `Statement` 24.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(mem::size_of::<Label>() == 8);
+    assert!(mem::size_of::<MatchArm>() == 16);
+    assert!(mem::size_of::<RecordLitField>() == 16);
+    assert!(mem::size_of::<RecordFieldPat>() == 16);
+    assert!(mem::size_of::<Statement>() == 32);
+    assert!(mem::size_of::<Binding>() == 16);
+};
+
 // We leave float values as a string to avoid double rounding.
 // For PartialEq, string comparison should work, as ordering is not important
 // https://github.com/rust-lang/rust-analyzer/issues/12380#issuecomment-1137284360

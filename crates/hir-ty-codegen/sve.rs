@@ -15,6 +15,8 @@
 //! from the places it is handed (`ldr z`, `ldr p`), runs the instruction LLVM selects for the
 //! intrinsic, and stores the result (`str z`, `str p`) or returns a scalar.
 
+#![forbid(unsafe_code)]
+
 use std::fmt::Write;
 
 use cranelift_codegen::ir::{AbiParam, InstBuilder, Signature, Value};

@@ -52,7 +52,7 @@ fn constant_bool(operand: &Operand) -> Option<bool> {
 }
 
 /// The function a call calls, when it names one.
-fn callee(func: &Operand) -> Option<hir_def::FunctionId> {
+pub(super) fn callee(func: &Operand) -> Option<hir_def::FunctionId> {
     let ty = match &func.kind {
         OperandKind::Allocation { allocation } => allocation.as_ref().ty,
         OperandKind::Constant { ty, .. } => ty.as_ref(),

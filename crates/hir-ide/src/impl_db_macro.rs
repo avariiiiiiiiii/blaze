@@ -10,7 +10,7 @@ macro_rules! impl_hir_database {
                 db::{HirDatabase, InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
                 display::{DisplayTarget, HirDisplay},
                 mir,
-                mir::{MirBody, MirEvalError, MirLowerError, MirOptLevel},
+                mir::{MirBody, MirEvalError, MirLowerError, MirOptions},
                 next_solver::{Allocation, GenericArgs, StoredGenericArgs, Ty},
                 traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
             };
@@ -121,40 +121,84 @@ macro_rules! impl_hir_database {
                 fn optimized_mir_body<'db>(
                     &'db self,
                     def: InferBodyId<'db>,
-                    level: MirOptLevel,
+                    options: MirOptions,
                 ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-                    mir::optimized_mir_body_query(self, def, level).map_err(|err| err.clone())
+                    mir::optimized_mir_body_query(self, def, options).map_err(|err| err.clone())
                 }
 
                 fn optimized_mir_body_for_closure<'db>(
                     &'db self,
                     def: InternedClosureId<'db>,
-                    level: MirOptLevel,
+                    options: MirOptions,
                 ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-                    mir::optimized_mir_body_for_closure_query(self, def, level)
+                    mir::optimized_mir_body_for_closure_query(self, def, options)
+                        .map_err(|err| err.clone())
+                }
+
+                fn optimized_mir_body_for_coroutine<'db>(
+                    &'db self,
+                    def: InternedCoroutineId<'db>,
+                    options: MirOptions,
+                ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+                    mir::optimized_mir_body_for_coroutine_query(self, def, options)
+                        .map_err(|err| err.clone())
+                }
+
+                fn optimized_mir_body_for_coroutine_by_move<'db>(
+                    &'db self,
+                    def: InternedCoroutineId<'db>,
+                    options: MirOptions,
+                ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+                    mir::optimized_mir_body_for_coroutine_by_move_query(self, def, options)
                         .map_err(|err| err.clone())
                 }
 
                 fn monomorphized_optimized_mir_body<'db>(
                     &'db self,
                     def: InferBodyId<'db>,
-                    level: MirOptLevel,
+                    options: MirOptions,
                     subst: StoredGenericArgs,
                     env: StoredParamEnvAndCrate,
                 ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
-                    mir::monomorphized_optimized_mir_body_query(self, def, level, subst, env)
+                    mir::monomorphized_optimized_mir_body_query(self, def, options, subst, env)
                         .map_err(|err| err.clone())
                 }
 
                 fn monomorphized_optimized_mir_body_for_closure<'db>(
                     &'db self,
                     def: InternedClosureId<'db>,
-                    level: MirOptLevel,
+                    options: MirOptions,
                     subst: StoredGenericArgs,
                     env: StoredParamEnvAndCrate,
                 ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
                     mir::monomorphized_optimized_mir_body_for_closure_query(
-                        self, def, level, subst, env,
+                        self, def, options, subst, env,
+                    )
+                    .map_err(|err| err.clone())
+                }
+
+                fn monomorphized_optimized_mir_body_for_coroutine<'db>(
+                    &'db self,
+                    def: InternedCoroutineId<'db>,
+                    options: MirOptions,
+                    subst: StoredGenericArgs,
+                    env: StoredParamEnvAndCrate,
+                ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+                    mir::monomorphized_optimized_mir_body_for_coroutine_query(
+                        self, def, options, subst, env,
+                    )
+                    .map_err(|err| err.clone())
+                }
+
+                fn monomorphized_optimized_mir_body_for_coroutine_by_move<'db>(
+                    &'db self,
+                    def: InternedCoroutineId<'db>,
+                    options: MirOptions,
+                    subst: StoredGenericArgs,
+                    env: StoredParamEnvAndCrate,
+                ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+                    mir::monomorphized_optimized_mir_body_for_coroutine_by_move_query(
+                        self, def, options, subst, env,
                     )
                     .map_err(|err| err.clone())
                 }

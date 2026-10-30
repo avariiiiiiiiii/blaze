@@ -3,6 +3,8 @@
 //! unpacked in memory with cargo's checks of its paths, a sparse index's file as served, a git
 //! tree at exactly its locked commit. Called on an IO thread of the plane ([`super::work::Steps::fetch`]).
 
+#![forbid(unsafe_code)]
+
 mod archive;
 mod git;
 #[cfg(test)]

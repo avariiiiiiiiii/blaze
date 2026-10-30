@@ -17,6 +17,8 @@
 //! - [`snapshot`] and [`standby`]: the VM snapshots itself; a standby resumes from the newest.
 //! - [`config`]: the service's one JSON input.
 
+#![forbid(unsafe_code)]
+
 pub mod checkout;
 pub mod config;
 pub mod github;

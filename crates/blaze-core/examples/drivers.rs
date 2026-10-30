@@ -9,6 +9,7 @@
 //! file, all in flight (milliseconds for all, five times; the file is read once first, so they
 //! come from the page cache).
 
+#![forbid(unsafe_code)]
 #![allow(clippy::print_stdout)]
 
 use std::time::Instant;

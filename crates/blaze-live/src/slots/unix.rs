@@ -1,12 +1,7 @@
 //! What Linux and macOS share: finding the descriptor with `dlsym`, walking a stack with
-//! `_Unwind_Backtrace`, the unwinder's `__register_frame`, and reading a message file in
-//! place from a mapping of it.
+//! `_Unwind_Backtrace`, and the unwinder's `__register_frame`.
 
-use std::{
-    ffi::{CStr, CString, c_char, c_int, c_void},
-    fs::File,
-    os::fd::AsRawFd,
-};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
 use super::hook::FRAMES;
 use crate::patch::DESCRIPTOR;
@@ -31,73 +26,6 @@ unsafe extern "C" {
     ) -> c_int;
     fn _Unwind_GetIP(context: *mut c_void) -> usize;
     pub(super) fn __register_frame(frame: *const u8);
-    fn mmap(
-        addr: *mut c_void,
-        len: usize,
-        prot: c_int,
-        flags: c_int,
-        fd: c_int,
-        offset: i64,
-    ) -> *mut c_void;
-    fn munmap(addr: *mut c_void, len: usize) -> c_int;
-}
-
-const PROT_READ: c_int = 1;
-const MAP_PRIVATE: c_int = 2;
-/// Linux faults every page of the mapping in within the one call.
-#[cfg(target_os = "linux")]
-const MAP_POPULATE: c_int = 0x8000;
-#[cfg(target_os = "macos")]
-const MAP_POPULATE: c_int = 0;
-const MAP_FAILED: *mut c_void = !0usize as *mut c_void;
-
-/// A message file mapped read-only, its bytes read in place and unmapped when dropped.
-pub(super) struct Map {
-    at: *mut c_void,
-    len: usize,
-}
-
-impl Map {
-    /// Maps the `len` bytes of `file` (its length when opened).
-    pub(super) fn new(file: &File, len: u64) -> Result<Map, String> {
-        let len = usize::try_from(len).map_err(|_| format!("a message of {len} bytes"))?;
-        if len == 0 {
-            return Ok(Map { at: std::ptr::null_mut(), len });
-        }
-        // SAFETY: a new private, read-only mapping of an open file, anywhere.
-        let at = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                len,
-                PROT_READ,
-                MAP_PRIVATE | MAP_POPULATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if at == MAP_FAILED {
-            return Err(format!("mapping the message: {}", std::io::Error::last_os_error()));
-        }
-        Ok(Map { at, len })
-    }
-
-    pub(super) fn bytes(&self) -> &[u8] {
-        if self.len == 0 {
-            return &[];
-        }
-        // SAFETY: `len` bytes mapped readable at `at` until drop. The linker writes a message
-        // under another name and renames it into place, so nothing writes the file's bytes.
-        unsafe { std::slice::from_raw_parts(self.at as *const u8, self.len) }
-    }
-}
-
-impl Drop for Map {
-    fn drop(&mut self) {
-        if self.len != 0 {
-            // SAFETY: this map's own mapping, which nothing borrows once it is dropped.
-            unsafe { munmap(self.at, self.len) };
-        }
-    }
 }
 
 const RTLD_LAZY: c_int = 1;

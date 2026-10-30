@@ -7,7 +7,13 @@
 //! root is known ([`Roots`]), and one send on a channel that takes none: keeping it, applying
 //! it and encoding it are the page's thread's. That thread takes what came in batches and sends
 //! each page one frame of all the records of a batch, encoded once for every page.
+//!
+//! Its one unsafe module is [`flecs`], the Flecs C calls behind a safe API
+//! (docs/v2/plan/design/unsafe.md); every other module forbids unsafe code.
 
+#![deny(unsafe_code)]
+
+mod flecs;
 mod http;
 mod kept;
 #[cfg(test)]

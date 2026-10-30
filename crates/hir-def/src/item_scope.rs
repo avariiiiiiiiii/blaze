@@ -31,7 +31,7 @@ use crate::{
     AdtId, BuiltinDeriveImplId, BuiltinType, ConstId, ExternBlockId, ExternCrateId, HasModule,
     ImplId, Lookup, MacroCallStyles, MacroId, ModuleDefId, ModuleId, TraitId, UseId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
-    per_ns::{Item, MacrosItem, PerNs, TypesItem, ValuesItem},
+    per_ns::{Item, PerNs, TypesItem},
     visibility::{Visibility, VisibilityExplicitness},
 };
 
@@ -764,6 +764,10 @@ pub struct ItemScope {
     /// [`ItemScope::entries`] lists. Made by the first `entries` after a name was added, and
     /// written only that once for a scope that is handed over.
     pub(crate) sorted: OnceLock<Box<[u32]>>,
+    /// The entries of the three namespaces by def, as `namespace << 30 | position` sorted by
+    /// namespace, def and position: what [`ItemScope::name_of`] searches in a scope of more than
+    /// [`LINEAR`] names. 4 bytes an entry, made by the first `name_of` after a def changed.
+    pub(crate) by_def: OnceLock<Box<[u32]>>,
 
     /// The defs declared in this scope. Each def has a single scope where it is
     /// declared.
@@ -814,6 +818,7 @@ impl PartialEq for ItemScope {
             unresolved,
             names: _,
             sorted: _,
+            by_def: _,
             declarations,
             impls,
             builtin_derive_impls,
@@ -997,6 +1002,7 @@ impl ItemScope {
 
     fn added(&mut self, ns: u32, pos: usize, name: &Name) {
         self.sorted.take();
+        self.by_def.take();
         let len = self.indexed_len();
         if len <= LINEAR {
             return;
@@ -1239,24 +1245,68 @@ impl ItemScope {
         Some(self.macros.at(self.position(MACROS, name)?).def)
     }
 
-    /// The entries of `item`'s namespace that name it, compared packed.
-    fn naming(&self, item: ItemInNs) -> impl Iterator<Item = (&Name, Visibility, bool)> + '_ {
-        let (column, def) = match item {
-            ItemInNs::Types(def) => (&self.types.entries, def.pack()),
-            ItemInNs::Values(def) => (&self.values.entries, def.pack()),
-            ItemInNs::Macros(def) => (&self.macros.entries, def.pack()),
-        };
-        (column.iter())
-            .filter(move |it| it.is_def(def))
-            .map(|it| (&it.name, it.vis(), it.declared()))
+    #[inline]
+    fn entry_at(&self, at: u32) -> &Entry {
+        let pos = (at & POS_MASK) as usize;
+        match at >> 30 {
+            TYPES => &self.types.entries[pos],
+            VALUES => &self.values.entries[pos],
+            _ => &self.macros.entries[pos],
+        }
     }
 
-    /// XXX: this is O(N) rather than O(1), try to not introduce new usages.
+    /// The entries of the three namespaces, by namespace, def and then position.
+    fn by_def(&self) -> &[u32] {
+        self.by_def.get_or_init(|| {
+            let mut all: Vec<u32> = (named(TYPES, &self.types.entries))
+                .chain(named(VALUES, &self.values.entries))
+                .chain(named(MACROS, &self.macros.entries))
+                .map(|(ns, pos, _)| ns << 30 | pos as u32)
+                .collect();
+            // The position last keeps a def's names in column order, which is the order
+            // `name_of` (the first) and `names_of` (the first `Some`) answer in.
+            all.sort_unstable_by_key(|&at| {
+                let it = self.entry_at(at);
+                (at >> 30, it.def_tag, it.def, at & POS_MASK)
+            });
+            all.into_boxed_slice()
+        })
+    }
+
+    /// The entries of `item`'s namespace that name it, in column order, compared packed: a scan
+    /// of the column in a scope of at most [`LINEAR`] names, a binary search of `by_def` above.
+    fn naming(&self, item: ItemInNs) -> impl Iterator<Item = (&Name, Visibility, bool)> + '_ {
+        let (ns, column, def) = match item {
+            ItemInNs::Types(def) => (TYPES, &self.types.entries, def.pack()),
+            ItemInNs::Values(def) => (VALUES, &self.values.entries, def.pack()),
+            ItemInNs::Macros(def) => (MACROS, &self.macros.entries, def.pack()),
+        };
+        let found = if self.indexed_len() <= LINEAR {
+            Either::Left(column.iter().filter(move |it| it.is_def(def)))
+        } else {
+            let by_def = self.by_def();
+            let key = (ns, def.0, def.1);
+            let start = by_def.partition_point(|&at| {
+                let it = self.entry_at(at);
+                (at >> 30, it.def_tag, it.def) < key
+            });
+            Either::Right(
+                by_def[start..]
+                    .iter()
+                    .map(|&at| (at >> 30, self.entry_at(at)))
+                    .take_while(move |&(at_ns, it)| at_ns == ns && it.is_def(def))
+                    .map(|(_, it)| it),
+            )
+        };
+        found.map(|it| (&it.name, it.vis(), it.declared()))
+    }
+
+    /// A binary search of the scope's entries by def (built on the first call after a change).
     pub(crate) fn name_of(&self, item: ItemInNs) -> Option<(&Name, Visibility, /*declared*/ bool)> {
         self.naming(item).next()
     }
 
-    /// XXX: this is O(N) rather than O(1), try to not introduce new usages.
+    /// Like [`ItemScope::name_of`], over every name of `item` in column order.
     pub(crate) fn names_of<T>(
         &self,
         item: ItemInNs,
@@ -1476,6 +1526,7 @@ impl ItemScope {
                                 }
                                 cov_mark::hit!(import_shadowed);
                                 self.types.entries[pos] = Entry::new(name, fld);
+                                self.by_def.take();
                                 changed = true;
                             }
                         }
@@ -1515,6 +1566,7 @@ impl ItemScope {
                                 .insert(import, prev.map_or(ImportOrDef::Def(fld.def), Into::into));
                         }
                         self.values.entries[pos] = Entry::new(name, fld);
+                        self.by_def.take();
                         changed = true;
                     }
                 }
@@ -1555,6 +1607,7 @@ impl ItemScope {
                         );
                     }
                     self.macros.entries[pos] = Entry::new(name, fld);
+                    self.by_def.take();
                     changed = true;
                 }
                 Some(_) => {}
@@ -1668,6 +1721,7 @@ impl ItemScope {
             unresolved,
             names: _,
             sorted: _,
+            by_def: _,
             declarations,
             impls,
             builtin_derive_impls,
@@ -1733,6 +1787,7 @@ impl ItemScope {
         let entry = &mut self.types.entries[pos];
         entry.set_def(def);
         entry.set_vis(vis);
+        self.by_def.take();
     }
 
     pub(crate) fn update_def_values(&mut self, name: &Name, def: ModuleDefId, vis: Visibility) {
@@ -1740,6 +1795,7 @@ impl ItemScope {
         let entry = &mut self.values.entries[pos];
         entry.set_def(def);
         entry.set_vis(vis);
+        self.by_def.take();
     }
 
     pub(crate) fn update_def_macros(&mut self, name: &Name, def: MacroId, vis: Visibility) {
@@ -1747,6 +1803,7 @@ impl ItemScope {
         let entry = &mut self.macros.entries[pos];
         entry.set_def(def);
         entry.set_vis(vis);
+        self.by_def.take();
     }
 }
 
@@ -1836,7 +1893,10 @@ mod tests {
     use rustc_hash::FxHashMap;
 
     use super::*;
-    use crate::{FxIndexMap, per_ns::Namespace};
+    use crate::{
+        FxIndexMap,
+        per_ns::{MacrosItem, Namespace, ValuesItem},
+    };
 
     /// A salsa id of no database: the scope only packs and compares it.
     fn id<T: FromId>(n: u64) -> T {
@@ -2130,6 +2190,28 @@ mod tests {
             let expected = (first.0, first.1.vis, first.1.import.is_none());
             assert_eq!(scope.name_of(ItemInNs::Macros(item.def)), Some(expected));
         }
+        let names_of = |item: ItemInNs| {
+            let mut all = Vec::new();
+            scope.names_of(item, |name, vis, declared| {
+                all.push((*name, vis, declared));
+                None::<()>
+            });
+            all
+        };
+        for item in model.values.values() {
+            let expected: Vec<_> = (model.values.iter())
+                .filter(|(_, it)| it.def == item.def)
+                .map(|(name, it)| (*name, it.vis, it.import.is_none()))
+                .collect();
+            assert_eq!(names_of(ItemInNs::Values(item.def)), expected);
+        }
+        for item in model.types.values() {
+            let expected: Vec<_> = (model.types.iter())
+                .filter(|(_, it)| it.def == item.def)
+                .map(|(name, it)| (*name, it.vis, it.import.is_none()))
+                .collect();
+            assert_eq!(names_of(ItemInNs::Types(item.def)), expected);
+        }
         let modules = model.types.values().filter_map(|it| match it.def {
             ModuleDefId::ModuleId(module) => Some((module, it.vis)),
             _ => None,
@@ -2234,8 +2316,8 @@ mod tests {
     fn scope_of(names: &[Name], unresolved: &[Name]) -> ItemScope {
         let mut scope = ItemScope::default();
         let mut globs = PerNsGlobImports::default();
-        for (n, &name) in names.iter().enumerate() {
-            let def = PerNs { types: Some(item(n as u64)), values: None, macros: None };
+        for &name in names {
+            let def = PerNs { types: Some(item(0)), values: None, macros: None };
             scope.push_res_with_import(&mut globs, (id(0), name), def, None);
         }
         for &name in unresolved {
@@ -2302,7 +2384,7 @@ mod tests {
         let mut reordered: Keyed<u32, u64> = Keyed::default();
         let mut sorted: Vec<_> = map.iter().collect();
         sorted.sort();
-        for (&k, &v) in sorted.iter().rev() {
+        for &(&k, &v) in sorted.iter().rev() {
             reordered.insert(k, v);
         }
         assert_eq!(reordered, keyed);
@@ -2316,9 +2398,11 @@ mod tests {
         assert_eq!(all.map(|(_, it)| it), BUILTIN_TYPES);
         for (index, (name, ty)) in all.iter().enumerate() {
             assert_eq!(builtin_index(*ty) as usize, index);
-            assert_eq!(BUILTIN_SCOPE.get(name).copied(), Some(PerNs::types((*ty).into(), Visibility::Public, None)));
+            let expected = PerNs::types((*ty).into(), Visibility::Public, None);
+            assert_eq!(BUILTIN_SCOPE.get(name).copied(), Some(expected));
         }
-        assert!(BUILTIN_SCOPE.iter().map(|(name, _)| *name).eq(all.iter().map(|(name, _)| *name)));
+        let listed = BUILTIN_SCOPE.iter().map(|(name, _)| *name);
+        assert!(listed.eq(all.iter().map(|(name, _)| *name)));
         for name in names() {
             assert_eq!(BUILTIN_SCOPE.get(&name), None);
         }
@@ -2333,8 +2417,9 @@ mod tests {
             let item = Item { def: def(&mut rng), vis: vis(&mut rng), import: import(&mut rng) };
             let entry = Entry::new(name, item);
             assert_eq!(entry.item::<ModuleDefId, ImportOrExternCrate>(), item);
-            assert_eq!(entry.is_def(item.def.pack()), true);
-            let value = Item { import: item.import.and_then(ImportOrExternCrate::import_or_glob), ..item };
+            assert!(entry.is_def(item.def.pack()));
+            let import = item.import.and_then(ImportOrExternCrate::import_or_glob);
+            let value = Item { def: item.def, vis: item.vis, import };
             assert_eq!(Entry::new(name, value).item::<ModuleDefId, ImportOrGlob>(), value);
         }
     }

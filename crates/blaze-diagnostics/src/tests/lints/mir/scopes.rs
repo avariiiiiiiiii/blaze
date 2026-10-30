@@ -6,44 +6,15 @@
 use crate::{
     Options,
     emit::Style,
-    lints::CommandLine,
-    tests::{checked_with, normalized},
+    tests::{Mode, checked_with, compiletest, normalized, ui},
 };
-
-/// Whether a UI test passes (`//@ check-pass`): compiletest gives it more flags.
-#[derive(Clone, Copy)]
-enum Test {
-    Passes,
-    Fails,
-}
-
-/// The lint flags compiletest gives a UI test (`runtest.rs`, `make_compile_args`), with
-/// `-A unused -W unused_attributes` before them for a test that passes.
-fn compiletest(test: Test) -> Options {
-    let mut args: Vec<&str> = Vec::new();
-    if let Test::Passes = test {
-        args.extend(["-A", "unused", "-W", "unused_attributes"]);
-    }
-    args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
-    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap() }
-}
-
-fn stderr(fixture: &str, test: Test) -> String {
-    let stderr =
-        checked_with(fixture, "$DIR/", &compiletest(test)).stderr_with(Style { ui_testing: true, ..Style::default() });
-    normalized(&stderr)
-}
-
-/// [`crate::tests::ui`] under compiletest's flags.
-fn ui(name: &str, edition: &str, test: Test, source: &str) -> String {
-    stderr(&format!("//- /{name} crate:main edition:{edition}\n{source}"), test)
-}
 
 /// [`ui`] of a UI test that needs core's items: core is minicore with `flags`
 /// (`crates/test-utils/src/minicore.rs`).
-fn ui_core(name: &str, edition: &str, test: Test, flags: &str, source: &str) -> String {
-    stderr(&format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}"), test)
+fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
+    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}");
+    let options = compiletest(Mode::Other, &Options::default());
+    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
 #[test]
@@ -74,7 +45,69 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0728`.
 "#;
-    assert_eq!(ui("issue-51719.rs", "2018", Test::Fails, source), stderr);
+    assert_eq!(ui("issue-51719.rs", "2018", source), stderr);
+}
+
+#[test]
+fn an_await_in_a_function_points_at_it_and_not_at_a_closure_before() {
+    // tests/ui/async-await/issues/non-async-enclosing-span.rs
+    let source = r#"//@ edition:2018
+
+async fn do_the_thing() -> u8 {
+    8
+}
+// #63398: point at the enclosing scope and not the previously seen closure
+fn main() {  //~ NOTE this is not `async`
+    let x = move || {};
+    let y = do_the_thing().await; //~ ERROR `await` is only allowed inside `async` functions
+    //~^ NOTE only allowed inside `async` functions and blocks
+}
+"#;
+    let stderr = r#"error[E0728]: `await` is only allowed inside `async` functions and blocks
+  --> $DIR/non-async-enclosing-span.rs:9:28
+   |
+LL | fn main() {
+   | --------- this is not `async`
+LL |     let x = move || {};
+LL |     let y = do_the_thing().await;
+   |                            ^^^^^ only allowed inside `async` functions and blocks
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0728`.
+"#;
+    assert_eq!(ui("non-async-enclosing-span.rs", "2018", source), stderr);
+}
+
+#[test]
+fn an_await_of_a_local_future_points_at_the_function() {
+    // tests/ui/async-await/issues/issue-51751.rs
+    let source = r#"//@ edition:2018
+
+async fn inc(limit: i64) -> i64 {
+    limit + 1
+}
+
+fn main() {
+    let result = inc(10000);
+    let finished = result.await;
+    //~^ ERROR `await` is only allowed inside `async` functions and blocks
+}
+"#;
+    let stderr = r#"error[E0728]: `await` is only allowed inside `async` functions and blocks
+  --> $DIR/issue-51751.rs:9:27
+   |
+LL | fn main() {
+   | --------- this is not `async`
+LL |     let result = inc(10000);
+LL |     let finished = result.await;
+   |                           ^^^^^ only allowed inside `async` functions and blocks
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0728`.
+"#;
+    assert_eq!(ui("issue-51751.rs", "2018", source), stderr);
 }
 
 #[test]
@@ -101,7 +134,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0728`.
 "#;
-    assert_eq!(ui_core("issue-62009-2.rs", "2018", Test::Fails, "async_fn", source), stderr);
+    assert_eq!(ui_core("issue-62009-2.rs", "2018", "async_fn", source), stderr);
 }
 
 #[test]
@@ -129,7 +162,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0728`.
 "#;
-    assert_eq!(ui("issue-70594.rs", "2018", Test::Fails, source), stderr);
+    assert_eq!(ui("issue-70594.rs", "2018", source), stderr);
 }
 
 #[test]
@@ -246,7 +279,7 @@ error: aborting due to 8 previous errors
 Some errors have detailed explanations: E0268, E0572, E0728, E0767.
 For more information about an error, try `rustc --explain E0268`.
 "#;
-    assert_eq!(ui("cross-const-control-flow-125846.rs", "2021", Test::Fails, source), stderr);
+    assert_eq!(ui("cross-const-control-flow-125846.rs", "2021", source), stderr);
 }
 
 #[test]
@@ -268,7 +301,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0267`.
 "#;
-    assert_eq!(ui("E0267.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("E0267.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -288,7 +321,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0268`.
 "#;
-    assert_eq!(ui("E0268.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("E0268.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -372,7 +405,7 @@ error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0571`.
 "#;
-    assert_eq!(ui_core("issue-114529-illegal-break-with-value.rs", "2015", Test::Fails, "option", source), stderr);
+    assert_eq!(ui_core("issue-114529-illegal-break-with-value.rs", "2015", "option", source), stderr);
 }
 
 #[test]
@@ -417,7 +450,7 @@ error: aborting due to 2 previous errors
 Some errors have detailed explanations: E0695, E0696.
 For more information about an error, try `rustc --explain E0695`.
 "#;
-    assert_eq!(ui("label_break_value_continue.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("label_break_value_continue.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -446,7 +479,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0695`.
 "#;
-    assert_eq!(ui("label_break_value_unlabeled_break.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("label_break_value_unlabeled_break.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -479,7 +512,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0696`.
 "#;
-    assert_eq!(ui("continue-pointing-to-block-ice-121623.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("continue-pointing-to-block-ice-121623.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -499,7 +532,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0572`.
 "#;
-    assert_eq!(ui("E0572.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("E0572.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -522,7 +555,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0572`.
 "#;
-    assert_eq!(ui("const-return-outside-fn.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("const-return-outside-fn.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -621,7 +654,7 @@ error: aborting due to 4 previous errors
 
 For more information about this error, try `rustc --explain E0572`.
 "#;
-    assert_eq!(ui("issue-86188-return-not-in-fn-body.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("issue-86188-return-not-in-fn-body.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -644,7 +677,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0426`.
 "#;
-    assert_eq!(ui("E0426.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("E0426.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -680,7 +713,7 @@ error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0426`.
 "#;
-    assert_eq!(ui("undeclared-label-span.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("undeclared-label-span.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -740,7 +773,7 @@ error: aborting due to 3 previous errors
 
 For more information about this error, try `rustc --explain E0426`.
 "#;
-    assert_eq!(ui("suggest-labels.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("suggest-labels.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -769,7 +802,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0426`.
 "#;
-    assert_eq!(ui("hygienic-label-1.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("hygienic-label-1.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -793,7 +826,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0426`.
 "#;
-    assert_eq!(ui("hygienic-label-2.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("hygienic-label-2.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -836,7 +869,7 @@ error: aborting due to 2 previous errors
 Some errors have detailed explanations: E0308, E0767.
 For more information about an error, try `rustc --explain E0308`.
 "#;
-    assert_eq!(ui("E0767.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("E0767.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -867,7 +900,7 @@ error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0627`.
 "#;
-    assert_eq!(ui("yield-in-const.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("yield-in-const.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -897,7 +930,7 @@ error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0627`.
 "#;
-    assert_eq!(ui("yield-in-static.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("yield-in-static.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -930,7 +963,7 @@ error: aborting due to 2 previous errors
 
 For more information about this error, try `rustc --explain E0627`.
 "#;
-    assert_eq!(ui("yield-in-function.rs", "2015", Test::Fails, source), stderr);
+    assert_eq!(ui("yield-in-function.rs", "2015", source), stderr);
 }
 
 #[test]
@@ -996,5 +1029,5 @@ LL |         let _ = foo();
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(ui("must-use-block-expr.rs", "2015", Test::Passes, source), stderr);
+    assert_eq!(ui("must-use-block-expr.rs", "2015", source), stderr);
 }

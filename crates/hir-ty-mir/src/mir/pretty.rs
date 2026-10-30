@@ -255,6 +255,7 @@ impl<'db> Printer<'_, 'db> {
                     CastKind::FloatToFloat => "FloatToFloat".to_owned(),
                     CastKind::IntToFloat => "IntToFloat".to_owned(),
                     CastKind::FnPtrToPtr => "FnPtrToPtr".to_owned(),
+                    CastKind::Transmute => "Transmute".to_owned(),
                 };
                 format!("{} as {} ({kind})", self.operand(operand), self.ty(ty.as_ref()))
             }
@@ -479,6 +480,17 @@ impl<'db> Printer<'_, 'db> {
             AssertKind::RemainderByZero(a) => format!(
                 "\"attempt to calculate the remainder of `{{}}` with a divisor of zero\", {}",
                 self.operand(a)
+            ),
+            AssertKind::MisalignedPointerDereference { required, found } => format!(
+                "\"misaligned pointer dereference: address must be a multiple of {{}} but is {{}}\", {}, {}",
+                self.operand(required),
+                self.operand(found)
+            ),
+            AssertKind::NullPointerDereference => "\"null pointer dereference occurred\"".to_owned(),
+            AssertKind::NullReferenceConstructed => "\"null reference produced\"".to_owned(),
+            AssertKind::InvalidEnumConstruction(source) => format!(
+                "\"trying to construct an enum from an invalid value {{}}\", {}",
+                self.operand(source)
             ),
         }
     }

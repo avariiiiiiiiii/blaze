@@ -9,11 +9,14 @@ use std::time::{Duration, Instant};
 
 fn pin(cpu: usize) {
     #[cfg(target_os = "linux")]
-    // SAFETY: the set is a plain bit mask, written in full before it is read.
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_SET(cpu, &mut set);
-        let pinned = libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set);
+    {
+        // SAFETY: `cpu_set_t` is an array of integers, valid as all-zero bytes.
+        let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `CPU_SET` indexes `set.bits` with Rust's bounds check, so a `cpu` past
+        // `CPU_SETSIZE` panics rather than writing out of bounds.
+        unsafe { libc::CPU_SET(cpu, &mut set) };
+        // SAFETY: `&set` is a live `cpu_set_t` of the size passed, read and not kept by the call.
+        let pinned = unsafe { libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &set) };
         assert_eq!(pinned, 0, "pinning to CPU {cpu}");
     }
     #[cfg(not(target_os = "linux"))]

@@ -104,28 +104,77 @@ level, so readers never wait: this meets concurrency.md.
    when the edge equals the last one recorded; `SyncTable` shards at
    `(max_parallelism() * 4).next_power_of_two()`.
 
-## What it would take to meet the memo budget (not filed: a redesign of the memo layer)
+## S5: memos and edges as columns (the design, applied by speed-salsa 10-29)
 
-- **Memos as columns per function ingredient**, rustc's `DepNodeIndex` model: each memo gets a
-  `u32` node index at creation. Columns indexed by it hold the key, `verified_at` (4 bytes), the
-  changed-at revision and durability (4 + 1), the fingerprint (16, only for memos that have
-  one, in a side column), the value's offset into a per-ingredient value arena (4), and the
-  edge range (4 + 4). That gives 24 bytes hot with the fingerprint cold. The slot's `MemoTable`
-  holds a `u32` node index per function (4 bytes instead of an 8-byte pointer to a box).
-  Replacing a memo appends a new node; old nodes are reclaimed at the revision boundary, which
-  already frees `deleted_entries`.
-- **Edges as one CSR array per function ingredient**, each a `u32` node index into a global
-  node column that maps node to `DatabaseKeyIndex`. Input fields, interned and tracked struct
-  reads need node indices too: one column per ingredient beside its slots. The task's edges stay
-  in its own frame and are appended to the ingredient's array when the memo is published.
-  That is one append per memo instead of one allocation (concurrency.md: per-worker segments,
-  since many tasks publish into one ingredient).
-- **Deep verify without a claim** while it only reads: verifying is idempotent (it stores
-  `verified_at` and marks outputs validated, both idempotent), so it can run unclaimed and
-  take the claim only when an input changed and the memo must run. rustc's `try_mark_green`
-  works this way.
+### How it maps onto blaze-query
 
-Together these touch every ingredient kind, persistence, cycle handling and the macros. That is
-the db lane's "remade from vendor/salsa" work (docs/v2/plan/lanes/db.md, section 7), and
-blaze-query already has its own memo layout. It belongs to whoever owns salsa once db-salsa's
-`Sync` work lands, since both rewrite `sync.rs`, `zalsa_local.rs` and `function/*`.
+`crates/blaze-query` (lane db, read only here) keeps per key a list of `MemoData`: the key
+(`QueryKey`, a kind and a content ID), a 128-bit value `fingerprint`, `edges: Edges` (an owned
+`Box<[Edge]>` or a range of 56-byte records in the image, each `Edge { read: QueryKey, saw:
+Fingerprint }`), and the value (`Value::Memory`, `Mapped` or `Evicted`). salsa's front-end memos
+are the same four things in revision form, so the columns below line up one to one with them:
+
+| blaze-query | salsa after S5 | bytes |
+|---|---|---|
+| `MemoData::key` (`QueryKey`, hashed to a `ContentId`) | the slot the memo hangs off (ingredient, `Id`); a key read through an edge gets a dense `u32` **node** in the database's node table, which is what an edge names | 0 in the memo; 12 per node, once per key ever read |
+| `MemoData::fingerprint` | the value fingerprint, in the memo's cold box only once a value was evicted with one; a flag bit says it is there, so a hit never loads it | 0 hot; 16 cold |
+| (view: verified in this view) | `verified_at` | 8 |
+| `MemoData::value` (`Stored`) | `value: Option<Output>` beside the header in the memo's row; `None` once evicted, like `Value::Evicted` | the value |
+| `MemoData::edges` (`Edges`, in read order) | `(start, len)` into the database's one CSR edge array; each edge one `u32` word: node (31 bits) and an output bit; the fingerprint it saw, when it had one, in the cold box by position (`Edge::saw`) | 8, plus 4 per edge |
+| changed-at, durability (no counterpart: blaze-query has no revisions) | one `AtomicU64`: changed-at in the low 56 bits, durability, origin kind, `verified_final`, accumulated-inputs, cold and has-fingerprint bits in the top byte | 8 |
+
+So a memo header is 24 bytes (`verified_at`, the packed word, the edge span or the cold box), plus
+4 per edge in the shared array; data.md's "a memo 24 plus 4 per edge". The node table is the
+piece blaze-query has no need for (its edges name content IDs), and the reason a salsa edge fits
+in 4 bytes: rustc's `DepNodeIndex`. When the front end moves onto blaze-query, a salsa memo
+converts to a `MemoData` by mapping each edge's node through the node table to its key, and its
+cold fingerprints to `Edge::saw`.
+
+### The pieces
+
+- **Node table** (`src/node.rs`, one per database in `Zalsa`). A `DatabaseKeyIndex` gets a node the
+  first time a finished query's edges name it, and keeps it for the life of the database (an edge
+  must never come to name another key, so nodes are not reused). Two columns, `id` (`u64`) and
+  `ingredient` (`u32`), in pages that grow by doubling and never move. The map from key to node
+  is the SwissTable of `crates/intern/src/arena.rs`, sharded at four times the cores: groups of
+  seven slots and a control word of tag bytes on one 128-byte pair of lines, found with no lock
+  and no write; a miss takes the shard's lock to look again and insert. Every task keeps a
+  1024-entry direct-mapped cache of key to node, so the keys a task reads again and again (the
+  crate graph, a file's text, the def map) cost one cache line in L1, not a probe of the shared
+  table.
+- **Edge array** (`src/edges.rs`, one per database in `Zalsa`). `AtomicU32` words in pages that
+  double and never move; a range never crosses a page, so a memo's edges are one slice. A task
+  reserves 256 words at a time (one CAS on the array's length per 256 edges, never one per edge
+  or per memo) and writes its query's edges there when the query finishes (`ActiveQuery` pop):
+  the edges were recorded in the task's own frame and are published with the memo, which is the
+  release store that makes them visible (concurrency.md, "Dependencies are recorded per task").
+  Replaced memos leave dead ranges; at a new revision (with `&mut`), when the array is more than
+  twice what was live at the last compaction (and over 1M words), every function ingredient
+  copies its memos' ranges into a new array in slot order and the old one is dropped. That is
+  O(live edges), paid at most once per doubling.
+
+  One array for the database rather than one per memo table: rustc's `SerializedDepGraph` keeps
+  one edge list for the whole graph; one array means one reservation per task (not one per
+  function it ran), and one compaction pass.
+- **Memo header** (`function/memo.rs`, `zalsa_local.rs`): `verified_at`, the packed
+  changed-at and flags word, and a union of the edge span and `Box<Cold>`. The cold box holds
+  what most memos don't have: cycle heads, iteration and convergence, tracked struct IDs,
+  accumulated values, an assigning query (`specify`), and the edge and value fingerprints.
+  `const` assertions hold the header at 24 bytes.
+- **Deep verify without a claim** (`function/maybe_changed_after.rs`, `fetch.rs`): a memo that
+  isn't provisional, took no part in a cycle and has no outputs is verified before any claim is
+  taken: its edges are checked in order, each dependency by the same claim-free check, which
+  only reads (and stores `verified_at` once a memo is found unchanged, which is idempotent). If
+  every edge is unchanged, the memo is marked verified with no claim. Only a memo that must run
+  takes a claim, and the claimed path is the existing one, so cycle handling, backdating and
+  provisional memos are untouched. rustc's `try_mark_green` works this way. The recursion is
+  bounded (256 levels); deeper chains continue under claims.
+
+### Kept
+
+Every public API `crates/` calls (`Storage`, `Database`, `#[salsa::tracked]`, `evict_values`,
+`evict_values_of`, `trigger_lru_eviction`, `set_lru_capacity`, `memory_usage`), durability and
+backdating (#350: a fingerprint backdates only when durability didn't drop), cycle handling,
+eviction keeping edges and fingerprints, and determinism: node numbers depend on scheduling, but
+nothing observable does (edges are compared by key, compaction copies in slot order, and no node
+number is ever persisted or hashed).

@@ -339,7 +339,12 @@ impl<'snap> EnvChange<'snap> {
             changed_vars: new_vars
                 .iter()
                 .map(|(k, v)| {
-                    // SAFETY: We have acquired the environment lock
+                    // SAFETY: `set_var` needs no other thread reading or writing the
+                    // environment as it changes. `ENV_LOCK` is held from here until this
+                    // `EnvChange` drops, after `expand` has joined the macro's thread, so no
+                    // expansion runs while it changes, and no other thread of the server reads
+                    // the environment. A thread that did (a macro's own thread left running, a
+                    // C library's `getenv`) would race with the write.
                     unsafe { env::set_var(k, v) };
                     &**k
                 })
@@ -355,12 +360,12 @@ impl<'snap> EnvChange<'snap> {
 impl Drop for EnvChange<'_> {
     fn drop(&mut self) {
         for name in self.changed_vars.drain(..) {
-            // SAFETY: We have acquired the environment lock
-            unsafe {
-                match self.snap.vars.get::<std::ffi::OsStr>(name.as_ref()) {
-                    Some(prev_val) => env::set_var(name, prev_val),
-                    None => env::remove_var(name),
-                }
+            match self.snap.vars.get::<std::ffi::OsStr>(name.as_ref()) {
+                // SAFETY: `self._guard` still holds `ENV_LOCK` and the macro's thread has been
+                // joined, as in `apply`, so no other thread reads the environment as it changes.
+                Some(prev_val) => unsafe { env::set_var(name, prev_val) },
+                // SAFETY: as for `set_var` just above.
+                None => unsafe { env::remove_var(name) },
             }
         }
 

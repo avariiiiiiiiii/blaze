@@ -20,7 +20,6 @@ use ::tt::TextRange;
 use base_db::{Crate, SourceDatabase};
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
-use intern::Interned;
 use itertools::Itertools;
 use mbe::{DelimiterKind, Punct};
 use smallvec::SmallVec;
@@ -220,7 +219,7 @@ pub fn collect_item_tree_attrs<'a, BreakValue>(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attr {
-    pub path: Interned<ModPath>,
+    pub path: ModPath,
     pub input: Option<Box<AttrInput>>,
     pub ctxt: SyntaxContext,
 }

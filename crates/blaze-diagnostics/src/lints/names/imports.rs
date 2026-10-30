@@ -45,17 +45,17 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
     let uses = used::Uses::of(cx, &walk, &places);
     let mut buffered = macros::lints(cx, &walk, &uses);
     buffered.extend(globs::lints(cx, &uses));
-    let unused = unused::Unused::of(cx, &uses);
-    buffered.extend(unused.lints(cx, &uses));
-    buffered.extend(qualifications::lints(cx, &walk, &uses, &unused));
+    let mut unused = unused::Unused::of(cx, &uses);
+    buffered.append(&mut unused.resolve);
+    buffered.extend(qualifications::lints(cx, &walk, &unused));
     let mut keyed: Vec<_> = buffered
         .into_iter()
-        .map(|found| (found.lint_at.map(|at| places.place(cx, at)).unwrap_or_default(), found))
+        .map(|found| (found.lint_at.clone().map(|at| places.place(cx, at)).unwrap_or_default(), found))
         .collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
     let mut found: Vec<Found> = keyed.into_iter().map(|(_, found)| found).collect();
     debug_assert!(found.iter().all(|it| it.phase == Phase::Resolve));
-    found.extend(unused.traits(cx, &uses));
+    found.append(&mut unused.bodies);
     found
 }
 

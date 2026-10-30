@@ -2,9 +2,12 @@
 //! for each, the same whether the IR builder or the walk of the MIR ([`super::refs`]) asks.
 //! Equal references are one place, so both go through here.
 
+use std::hash::BuildHasher as _;
+
 use blaze_codegen::{Target, backend::FrontRef, template::Refs};
 use cranelift_codegen::ir;
-use rustc_hash::FxHashMap;
+use hashbrown::HashTable;
+use rustc_hash::FxBuildHasher;
 use hir_def::{
     FunctionId, ItemContainerId, Lookup, StaticId,
     attrs::AttrFlags,
@@ -146,33 +149,45 @@ pub(crate) fn personality_ref() -> Ref {
 /// added to, or a static's, made as its requests come.
 pub(crate) struct Placer {
     refs: Vec<Ref>,
-    index: FxHashMap<Ref, u32>,
+    /// Each place, found by its reference's hash and checked against `refs`, so no reference is
+    /// cloned into a key: 4 bytes and a control byte a place, one probe a lookup.
+    index: HashTable<u32>,
     open: bool,
+}
+
+fn hash(it: &Ref) -> u64 {
+    FxBuildHasher.hash_one(it)
 }
 
 impl Placer {
     pub(crate) fn listed(refs: Vec<Ref>) -> Placer {
-        let mut index = FxHashMap::default();
+        let mut index = HashTable::with_capacity(refs.len());
         for (place, it) in refs.iter().enumerate() {
-            index.entry(it.clone()).or_insert(place as u32);
+            let hashed = hash(it);
+            if index.find(hashed, |&at: &u32| refs[at as usize] == *it).is_none() {
+                index.insert_unique(hashed, place as u32, |&at| hash(&refs[at as usize]));
+            }
         }
         Placer { refs, index, open: false }
     }
 
     pub(crate) fn open() -> Placer {
-        Placer { refs: Vec::new(), index: FxHashMap::default(), open: true }
+        Placer { refs: Vec::new(), index: HashTable::new(), open: true }
     }
 
     pub(crate) fn place(&mut self, it: Ref) -> Result<u32, String> {
-        if let Some(&place) = self.index.get(&it) {
+        let hashed = hash(&it);
+        let refs = &self.refs;
+        if let Some(&place) = self.index.find(hashed, |&at| refs[at as usize] == it) {
             return Ok(place);
         }
         if !self.open {
             return Err(format!("the IR asks for {it:?}, which its references do not list"));
         }
         let place = self.refs.len() as u32;
-        self.refs.push(it.clone());
-        self.index.insert(it, place);
+        self.refs.push(it);
+        let refs = &self.refs;
+        self.index.insert_unique(hashed, place, |&at| hash(&refs[at as usize]));
         Ok(place)
     }
 

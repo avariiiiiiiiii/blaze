@@ -10,23 +10,29 @@
 //! errors.rs` (the texts) and `compiler/rustc_session/src/parse.rs`
 //! (`add_feature_diagnostics_for_issue`) (MIT or Apache-2.0).
 
+use std::{hash::BuildHasher, ops::Range};
+
+use hashbrown::HashTable;
 use hir::{HirFileId, InFile};
 use intern::Symbol;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxBuildHasher;
 use syntax::{SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast};
 
 use super::{
-    Shared, Source, Spec,
+    ExpectId, Shared, Source, SourceId, Spec,
     attrs::{self, ItemKind, Read},
 };
 use crate::{
     lints::{
-        registry::{self, Checked, Level, Lint},
+        registry::{self, Checked, Level, Lint, LintId},
         syntax::Walk,
     },
     lower::mutable_ref_binding::BUILT_ON,
     model::{Applicability, Code, Diag, MultiSpan, Span},
 };
+
+/// Where rustc's walk of the crate comes to a node: [`attrs::place`].
+type Place = Vec<(u32, u32)>;
 
 /// A diagnostic of lint levels, and when rustc gives it.
 pub(super) struct Emitted {
@@ -35,28 +41,35 @@ pub(super) struct Emitted {
     /// as the early lint pass comes to them.
     pub(super) pre: bool,
     /// Where the walk of the crate comes to the node; nothing for the command line's.
-    pub(super) place: Vec<(u32, u32)>,
+    pub(super) place: Place,
     pub(super) diag: Diag,
 }
 
 /// An `#[expect]` of one lint, a group or a tool's lint, as the HIR has it.
 pub(super) struct Expectation {
-    /// Where the name is in the attribute, which is what a lint at its level fulfills.
+    pub(super) id: ExpectId,
+    /// Where the name is in the attribute.
     pub(super) key: Span,
-    pub(super) reason: Option<String>,
+    pub(super) reason: Option<Box<str>>,
     /// `#[expect(unfulfilled_lint_expectations)]`, which nothing fulfills.
     pub(super) is_unfulfilled: bool,
     /// The node the attribute is on: where the level of `unfulfilled_lint_expectations` is.
     pub(super) node: InFile<SyntaxNode>,
 }
 
-/// The levels set by one node's attributes, or by the command line.
-struct Set {
-    specs: Vec<(&'static Lint, Spec)>,
-    parent: Option<usize>,
-}
+/// A set of levels: the command line's, or one node's attributes'.
+type SetId = u32;
+
+const COMMAND_LINE: SetId = 0;
+const NO_SET: SetId = SetId::MAX;
 
 /// The levels of a crate as one of rustc's builders has them.
+///
+/// The sets are CSR columns: set `s` gives the lints `ids[start[s]..start[s + 1]]` (to the
+/// end for the last) the levels at the same indices of `specs`, inside set `parent[s]`. That
+/// is 8 bytes a set and 14 a lint in one, against rustc's `FxIndexMap` per set; finding a
+/// lint's level scans the 2-byte ids of each set from the node out, which are few (a set is
+/// made only for a node with lint attributes) and short.
 pub(super) struct Levels {
     /// rustc's `lint_added_lints`: the early lint pass's builder, which says what is wrong with
     /// the attributes and holds to a `forbid`; the HIR's does neither and has no lint attributes
@@ -65,15 +78,19 @@ pub(super) struct Levels {
     /// Whether the walk of the crate is on: what is said of the attributes is said then, as
     /// rustc's walk comes to them, and once.
     walking: bool,
-    /// The command line's first.
-    sets: Vec<Set>,
-    /// The set in force at each node seen.
-    at: FxHashMap<InFile<SyntaxNodePtr>, usize>,
+    start: Vec<u32>,
+    parent: Vec<SetId>,
+    ids: Vec<LintId>,
+    specs: Vec<Spec>,
+    /// The set in force at each node seen, by one FxHash of the node: 28 bytes a node.
+    at: HashTable<(InFile<SyntaxNodePtr>, SetId)>,
+    /// The nodes between one asked of and the nearest seen, kept for its capacity.
+    chain: Vec<(u64, InFile<SyntaxNodePtr>, InFile<SyntaxNode>)>,
     pub(super) emitted: Vec<Emitted>,
     pub(super) expectations: Vec<Expectation>,
 }
 
-const COMMAND_LINE: usize = 0;
+const _: () = assert!(size_of::<(InFile<SyntaxNodePtr>, SetId)>() <= 28);
 
 impl Levels {
     /// The builder with the command line's levels (rustc's `add_command_line`), and what the
@@ -82,8 +99,12 @@ impl Levels {
         let mut levels = Levels {
             early,
             walking: true,
-            sets: vec![Set { specs: Vec::new(), parent: None }],
-            at: FxHashMap::default(),
+            start: vec![0],
+            parent: vec![NO_SET],
+            ids: Vec::with_capacity(sh.cmd.opts.len()),
+            specs: Vec::with_capacity(sh.cmd.opts.len()),
+            at: HashTable::new(),
+            chain: Vec::new(),
             emitted: Vec::new(),
             expectations: Vec::new(),
         };
@@ -99,8 +120,8 @@ impl Levels {
             Some((tool, only)) => (Some(tool), only),
             None => (None, name),
         };
-        let requested = format!("requested on the command line with `{} {name}`", level.to_cmd_flag());
         if self.early {
+            let requested = format!("requested on the command line with `{} {name}`", level.to_cmd_flag());
             if only == "warnings" && level == Level::ForceWarn {
                 let mut diag = Diag::new(
                     crate::model::Level::Error,
@@ -159,23 +180,25 @@ impl Levels {
             }
         }
         let Some(lints) = sh.store.find_lints(name) else { return };
+        let source = sh.source(Source::CommandLine { name: name.into(), level });
         for lint in lints {
-            if self.own(COMMAND_LINE, lint).is_some_and(|it| matches!(it.level, Level::ForceWarn | Level::Forbid)) {
+            let id = LintId::of(lint);
+            if self.own(COMMAND_LINE, id).is_some_and(|it| matches!(it.level, Level::ForceWarn | Level::Forbid)) {
                 continue;
             }
-            if self.gated(sh, COMMAND_LINE, lint, None, Vec::new()) {
-                let source = Source::CommandLine { name: name.to_owned(), level };
-                self.insert(COMMAND_LINE, lint, Spec { level, expect: None, source });
+            if self.gated(sh, COMMAND_LINE, lint, None, &mut Vec::new) {
+                self.insert(COMMAND_LINE, id, Spec { level, expect: None, source });
             }
         }
     }
 
-    /// Every node of the crate with attributes, as rustc's walk comes to it.
+    /// Every node of the crate with attributes, as rustc's walk comes to it. One without any
+    /// costs a check of its kind and of its first child.
     pub(super) fn walk(&mut self, sh: &mut Shared<'_, '_, '_>, walk: &Walk<'_>) {
         self.walking = true;
         for tree in &walk.trees {
             for node in &tree.nodes {
-                if attrs::owner(node, self.early).is_some() {
+                if attrs::may_own(node, self.early) {
                     self.set_at(sh, InFile::new(tree.file, node.clone()));
                 }
             }
@@ -183,61 +206,75 @@ impl Levels {
         self.walking = false;
     }
 
+    /// [`Levels::set_at`] of the node `at` points to, with no tree walked when a node at it was
+    /// seen.
+    pub(super) fn set_of(&mut self, sh: &mut Shared<'_, '_, '_>, at: InFile<SyntaxNodePtr>) -> SetId {
+        let hash = FxBuildHasher.hash_one(&at);
+        if let Some(&(_, set)) = self.at.find(hash, |(it, _)| *it == at) {
+            return set;
+        }
+        let node = sh.cx.syntax(at);
+        self.set_at(sh, node)
+    }
+
     /// The set in force at `node`: of its attributes, else of the nearest node around it with
-    /// any.
-    pub(super) fn set_at(&mut self, sh: &mut Shared<'_, '_, '_>, node: InFile<SyntaxNode>) -> usize {
-        let mut chain = Vec::new();
+    /// any. Each node between it and the nearest one seen is hashed once.
+    pub(super) fn set_at(&mut self, sh: &mut Shared<'_, '_, '_>, node: InFile<SyntaxNode>) -> SetId {
+        let mut chain = std::mem::take(&mut self.chain);
         let mut next = Some(node);
         let mut set = COMMAND_LINE;
         while let Some(node) = next {
             let key = attrs::key(&node);
-            if let Some(&known) = self.at.get(&key) {
+            let hash = FxBuildHasher.hash_one(&key);
+            if let Some(&(_, known)) = self.at.find(hash, |(it, _)| *it == key) {
                 set = known;
                 break;
             }
             next = attrs::parent(sh.cx.sema, &node);
-            chain.push((key, node));
+            chain.push((hash, key, node));
         }
-        for (key, node) in chain.into_iter().rev() {
+        for (hash, key, node) in chain.drain(..).rev() {
             set = self.push_node(sh, set, &node);
-            self.at.insert(key, set);
+            self.at.insert_unique(hash, (key, set), |(it, _)| FxBuildHasher.hash_one(it));
         }
+        self.chain = chain;
         set
     }
 
-    fn push_node(&mut self, sh: &mut Shared<'_, '_, '_>, parent: usize, node: &InFile<SyntaxNode>) -> usize {
+    fn push_node(&mut self, sh: &mut Shared<'_, '_, '_>, parent: SetId, node: &InFile<SyntaxNode>) -> SetId {
         let Some(owner) = attrs::owner(&node.value, self.early) else { return parent };
         let reads = attrs::read(&owner, sh.cfg, sh.cx.edition);
         if reads.is_empty() {
             return parent;
         }
         let is_crate = node.value.kind() == SyntaxKind::SOURCE_FILE && node.file_id == sh.root;
-        let set = self.sets.len();
-        self.sets.push(Set { specs: Vec::new(), parent: Some(parent) });
+        let set = SetId::try_from(self.start.len()).expect("fewer than 2^32 sets");
+        self.start.push(u32::try_from(self.ids.len()).expect("fewer than 2^32 levels"));
+        self.parent.push(parent);
         self.add(sh, set, node, reads, is_crate);
-        if self.sets[set].specs.is_empty() {
-            self.sets.pop();
+        if self.range(set).is_empty() {
+            self.start.pop();
+            self.parent.pop();
             return parent;
         }
         set
     }
 
     /// rustc's `add`: the attributes of one node.
-    fn add(&mut self, sh: &mut Shared<'_, '_, '_>, set: usize, node: &InFile<SyntaxNode>, reads: Vec<Read>, is_crate: bool) {
+    fn add(&mut self, sh: &mut Shared<'_, '_, '_>, set: SetId, node: &InFile<SyntaxNode>, reads: Vec<Read>, is_crate: bool) {
         let says = self.early && self.walking;
-        let place = match says {
-            true => attrs::place(sh.cx.sema, node),
-            false => Vec::new(),
-        };
         let pre = node.file_id == sh.root;
         let cx = sh.cx;
         let file = node.file_id;
         let span = |range: TextRange| cx.span(InFile::new(file, range));
+        let mut known: Option<Place> = None;
+        let mut place = || known.get_or_insert_with(|| attrs::place(cx.sema, node)).clone();
         for read in reads {
             let (level, mut items) = match read {
                 Read::Allows(name) => {
                     let lint = registry::lint(name).unwrap_or_else(|| panic!("no lint `{name}`"));
-                    self.insert(set, lint, Spec { level: Level::Allow, expect: None, source: Source::Default });
+                    let spec = Spec { level: Level::Allow, expect: None, source: SourceId::DEFAULT };
+                    self.insert(set, LintId::of(lint), spec);
                     continue;
                 }
                 Read::Level(level, items) => (level, items),
@@ -252,15 +289,15 @@ impl Levels {
                     ItemKind::NameValue { .. } | ItemKind::List(_) => Tail::Bad(it.range),
                 },
             };
-            let mut reason = None;
+            let mut reason: Option<Box<str>> = None;
             match tail {
                 Tail::Lint => {}
                 Tail::Reason(string, value) => {
                     match string {
-                        Some(string) => reason = Some(string),
+                        Some(string) => reason = Some(string.into_boxed_str()),
                         None if says => {
                             let diag = malformed(span(value), "reason must be a string literal");
-                            self.push(pre, place.clone(), diag);
+                            self.push(pre, place(), diag);
                         }
                         None => {}
                     }
@@ -268,34 +305,34 @@ impl Levels {
                 }
                 Tail::Bad(range) => {
                     if says {
-                        self.push(pre, place.clone(), malformed(span(range), "bad attribute argument"));
+                        self.push(pre, place(), malformed(span(range), "bad attribute argument"));
                     }
                 }
             }
             for item in &items {
-                let at = span(item.range);
                 let ItemKind::Word(path) = &item.kind else {
                     if says {
                         let label = match item.kind.is_reason() {
                             true => "reason in lint attribute must come last",
                             false => "bad attribute argument",
                         };
-                        self.push(pre, place.clone(), malformed(at, label));
+                        self.push(pre, place(), malformed(span(item.range), label));
                     }
                     continue;
                 };
-                let expect = (level == Level::Expect).then(|| at.clone());
+                let at = span(item.range);
+                let expect = (level == Level::Expect).then(|| sh.expect_id(file, item.range));
                 let (tool, name) = match &path[..] {
                     [tool, rest @ ..] if !rest.is_empty() => (Some(tool), attrs::path_string(rest)),
                     _ => (None, attrs::path_string(path)),
                 };
                 let full = match tool {
-                    Some(tool) => format!("{}::{name}", tool.name),
-                    None => name.clone(),
+                    Some(tool) => format!("{}::{name}", tool.name()),
+                    None => name.clone().into_owned(),
                 };
                 let lint_diag = |lint: &str, message: String| Diag::lint(lint, message, at.clone());
-                let (lints, named) = match sh.store.check(&name, tool.map(|it| it.name.as_str())) {
-                    Checked::Ok(lints) => (lints, path.last().map(|it| it.name.clone()).unwrap_or_default()),
+                let (lints, named) = match sh.store.check(&name, tool.map(|it| it.name())) {
+                    Checked::Ok(lints) => (lints, path.last().map_or("", |it| it.name()).to_owned()),
                     Checked::Tool(lints, None) => (lints, full),
                     Checked::Tool(lints, Some(new)) => {
                         if says {
@@ -304,7 +341,7 @@ impl Levels {
                                 format!("lint name `{name}` is deprecated and may not have an effect in the future"),
                             );
                             diag.suggestion(at.clone(), "change it to", new.clone(), Applicability::MachineApplicable);
-                            self.lint(sh, set, false, place.clone(), diag, None);
+                            self.lint(sh, set, false, place(), diag, None);
                         }
                         (lints, new)
                     }
@@ -314,11 +351,11 @@ impl Levels {
                             let tool = tool.expect("a tool's lint");
                             let mut diag = Diag::error(
                                 Some("E0710"),
-                                format!("unknown tool name `{0}` found in scoped lint: `{0}::{name}`", tool.name),
+                                format!("unknown tool name `{0}` found in scoped lint: `{0}::{name}`", tool.name()),
                                 span(tool.range),
                             );
-                            diag.help(format!("add `#![register_tool({})]` to the crate root", tool.name));
-                            self.push(pre, place.clone(), diag);
+                            diag.help(format!("add `#![register_tool({})]` to the crate root", tool.name()));
+                            self.push(pre, place(), diag);
                         }
                         continue;
                     }
@@ -329,7 +366,7 @@ impl Levels {
                                 format!("lint `{full}` has been renamed to `{new}`"),
                             );
                             diag.suggestion(at.clone(), "use the new name", new, Applicability::MachineApplicable);
-                            self.lint(sh, set, false, place.clone(), diag, None);
+                            self.lint(sh, set, false, place(), diag, None);
                         }
                         match sh.store.check(new, None) {
                             Checked::Ok(lints) => (lints, new.to_owned()),
@@ -339,7 +376,7 @@ impl Levels {
                     Checked::Removed(why) => {
                         if says {
                             let diag = lint_diag("renamed_and_removed_lints", format!("lint `{full}` has been removed: {why}"));
-                            self.lint(sh, set, false, place.clone(), diag, None);
+                            self.lint(sh, set, false, place(), diag, None);
                         }
                         continue;
                     }
@@ -353,50 +390,66 @@ impl Levels {
                                 };
                                 diag.suggestion(at.clone(), message, replace, Applicability::MaybeIncorrect);
                             }
-                            self.lint(sh, set, false, place.clone(), diag, None);
+                            self.lint(sh, set, false, place(), diag, None);
                         }
                         continue;
                     }
                 };
-                let source = Source::Node { name: named, span: at.clone(), reason: reason.clone() };
+                let source =
+                    sh.source(Source::Node { name: named.into_boxed_str(), span: at.clone(), reason: reason.clone() });
                 for &lint in &lints {
-                    if self.gated(sh, set, lint, Some(&at), place.clone()) {
-                        let spec = Spec { level, expect: expect.clone(), source: source.clone() };
-                        self.insert_spec(sh, set, lint, spec, &place);
+                    if self.gated(sh, set, lint, Some(&at), &mut place) {
+                        self.insert_spec(sh, set, lint, Spec { level, expect, source }, &mut place);
                     }
                 }
-                if level == Level::Expect && !self.early && self.walking {
+                if let Some(id) = expect
+                    && !self.early
+                    && self.walking
+                {
                     let is_unfulfilled = matches!(&lints[..], [only] if only.name == "unfulfilled_lint_expectations");
-                    self.expectations.push(Expectation { key: at, reason: reason.clone(), is_unfulfilled, node: node.clone() });
+                    let reason = reason.clone();
+                    self.expectations.push(Expectation { id, key: at, reason, is_unfulfilled, node: node.clone() });
                 }
             }
         }
         if says && !is_crate {
-            let ignored = self.sets[set].specs.iter().find_map(|(lint, spec)| match &spec.source {
-                Source::Node { name, span, .. } if lint.crate_level_only => Some((spec.level, name.clone(), span.clone())),
-                _ => None,
+            let range = self.range(set);
+            let ignored = self.ids[range.clone()].iter().zip(&self.specs[range]).find_map(|(id, spec)| {
+                match &sh.sources[spec.source.0 as usize] {
+                    Source::Node { name, span, .. } if id.lint().crate_level_only => {
+                        Some((spec.level, name.clone(), span.clone()))
+                    }
+                    _ => None,
+                }
             });
             if let Some((level, name, at)) = ignored {
                 let message = format!("{}({name}) is ignored unless specified at crate level", level.as_str());
-                self.lint(sh, set, false, place, Diag::lint("unused_attributes", message, at), None);
+                self.lint(sh, set, false, place(), Diag::lint("unused_attributes", message, at), None);
             }
         }
     }
 
     /// rustc's `insert_spec`: `spec` of an attribute for `lint`, unless a `forbid` before it
     /// holds.
-    fn insert_spec(&mut self, sh: &mut Shared<'_, '_, '_>, set: usize, lint: &'static Lint, spec: Spec, place: &[(u32, u32)]) {
+    fn insert_spec(
+        &mut self,
+        sh: &mut Shared<'_, '_, '_>,
+        set: SetId,
+        lint: &'static Lint,
+        spec: Spec,
+        place: &mut impl FnMut() -> Place,
+    ) {
         let old = self.spec(sh, lint, set);
         if self.early && spec.level == Level::Deny && old.level == Level::Forbid {
             return;
         }
         if self.early && spec.level != Level::Forbid && old.level == Level::Forbid {
-            let groups = match &old.source {
+            let groups = match &sh.sources[old.source.0 as usize] {
                 Source::Default => false,
                 Source::Node { name, .. } | Source::CommandLine { name, .. } => sh.store.is_lint_group(name),
             };
             if self.walking
-                && let Source::Node { name, span, .. } = &spec.source
+                && let Source::Node { name, span, .. } = &sh.sources[spec.source.0 as usize]
             {
                 let message = format!("{}({name}) incompatible with previous forbid", spec.level.as_str());
                 let mut diag = match groups {
@@ -404,14 +457,14 @@ impl Levels {
                     false => Diag::error(Some("E0453"), message, span.clone()),
                 };
                 diag.span_label(span.clone(), "overruled by previous forbid");
-                match &old.source {
+                match &sh.sources[old.source.0 as usize] {
                     Source::Default => {
                         diag.note(format!("`forbid` lint level is the default for {}", lint.name));
                     }
                     Source::Node { span, reason, .. } => {
                         diag.span_label(span.clone(), "`forbid` level set here");
                         if let Some(reason) = reason {
-                            diag.note(reason.clone());
+                            diag.note(&**reason);
                         }
                     }
                     Source::CommandLine { name, .. } => {
@@ -419,8 +472,8 @@ impl Levels {
                     }
                 }
                 match groups {
-                    true => self.lint(sh, set, false, place.to_vec(), diag, None),
-                    false => self.push(false, place.to_vec(), diag),
+                    true => self.lint(sh, set, false, place(), diag, None),
+                    false => self.push(false, place(), diag),
                 }
             }
             if !groups {
@@ -435,12 +488,19 @@ impl Levels {
             (Level::ForceWarn, _) => Spec { level: Level::ForceWarn, expect: None, source: old.source },
             _ => spec,
         };
-        self.insert(set, lint, spec);
+        self.insert(set, LintId::of(lint), spec);
     }
 
     /// rustc's `check_gated_lint`: whether `lint` is not behind a feature the crate lacks; the
     /// early builder says so of one that is.
-    fn gated(&mut self, sh: &mut Shared<'_, '_, '_>, set: usize, lint: &'static Lint, at: Option<&Span>, place: Vec<(u32, u32)>) -> bool {
+    fn gated(
+        &mut self,
+        sh: &mut Shared<'_, '_, '_>,
+        set: SetId,
+        lint: &'static Lint,
+        at: Option<&Span>,
+        place: &mut impl FnMut() -> Place,
+    ) -> bool {
         let Some(feature) = lint.feature_gate else { return true };
         if sh.features.is_enabled(&Symbol::intern(feature.name)) {
             return true;
@@ -463,16 +523,16 @@ impl Levels {
                 Some(_) => format!("add `#![feature({})]` to the crate attributes to enable", feature.name),
             });
             diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
-            self.lint(sh, set, false, place, diag, None);
+            self.lint(sh, set, false, place(), diag, None);
         }
         false
     }
 
     /// `diag` of a lint at its level in `set` as it is now (rustc's `emit_span_lint` from the
     /// builder), with `code` for its code when it has one of its own.
-    fn lint(&mut self, sh: &mut Shared<'_, '_, '_>, set: usize, pre: bool, place: Vec<(u32, u32)>, diag: Diag, code: Option<&str>) {
-        let name = diag.lint_name().expect("a lint's diagnostic").to_owned();
-        let lint = registry::lint(&name).unwrap_or_else(|| panic!("no lint `{name}`"));
+    fn lint(&mut self, sh: &mut Shared<'_, '_, '_>, set: SetId, pre: bool, place: Place, diag: Diag, code: Option<&str>) {
+        let name = diag.lint_name().expect("a lint's diagnostic");
+        let lint = registry::lint(name).unwrap_or_else(|| panic!("no lint `{name}`"));
         let spec = self.spec(sh, lint, set);
         if let Some(mut diag) = sh.finish(lint, spec, diag) {
             if let Some(code) = code {
@@ -482,20 +542,20 @@ impl Levels {
         }
     }
 
-    fn push(&mut self, pre: bool, place: Vec<(u32, u32)>, diag: Diag) {
+    fn push(&mut self, pre: bool, place: Place, diag: Diag) {
         self.emitted.push(Emitted { pre, place, diag });
     }
 
     /// The level of `lint` in `set`: rustc's `reveal_actual_level_spec`, with `warnings` and
     /// `--cap-lints`.
-    pub(super) fn spec(&self, sh: &Shared<'_, '_, '_>, lint: &'static Lint, set: usize) -> Spec {
-        let mut spec = self.raw(lint.name, set).unwrap_or_else(|| Spec {
+    pub(super) fn spec(&self, sh: &Shared<'_, '_, '_>, lint: &'static Lint, set: SetId) -> Spec {
+        let mut spec = self.raw(LintId::of(lint), set).unwrap_or(Spec {
             level: lint.default_level(sh.cx.edition),
             expect: None,
-            source: Source::Default,
+            source: SourceId::DEFAULT,
         });
         if spec.level == Level::Warn
-            && let Some(warnings) = self.raw("warnings", set)
+            && let Some(warnings) = self.raw(sh.warnings, set)
         {
             let respect = match warnings.level {
                 Level::Warn | Level::ForceWarn => false,
@@ -506,33 +566,50 @@ impl Levels {
                 spec = warnings;
             }
         }
-        let forced = matches!(spec.source, Source::CommandLine { level: Level::ForceWarn, .. });
-        if !forced && let Some(cap) = sh.cmd.cap {
+        // Only `--force-warn` gives `ForceWarn`, which keeps its source over an attribute's
+        // level: a `ForceWarn` is a command-line one, which the cap leaves.
+        if spec.level != Level::ForceWarn
+            && let Some(cap) = sh.cmd.cap
+        {
             spec.level = spec.level.min(cap);
         }
         spec
     }
 
-    fn raw(&self, name: &str, set: usize) -> Option<Spec> {
-        let mut at = Some(set);
-        while let Some(set) = at {
-            if let Some((_, spec)) = self.sets[set].specs.iter().find(|(it, _)| it.name == name) {
-                return Some(spec.clone());
+    fn range(&self, set: SetId) -> Range<usize> {
+        let set = set as usize;
+        let end = self.start.get(set + 1).map_or(self.ids.len(), |&it| it as usize);
+        self.start[set] as usize..end
+    }
+
+    fn raw(&self, id: LintId, set: SetId) -> Option<Spec> {
+        let mut at = set;
+        while at != NO_SET {
+            if let Some(spec) = self.own(at, id) {
+                return Some(spec);
             }
-            at = self.sets[set].parent;
+            at = self.parent[at as usize];
         }
         None
     }
 
-    fn own(&self, set: usize, lint: &'static Lint) -> Option<&Spec> {
-        self.sets[set].specs.iter().find(|(it, _)| it.name == lint.name).map(|(_, spec)| spec)
+    fn own(&self, set: SetId, id: LintId) -> Option<Spec> {
+        let range = self.range(set);
+        let start = range.start;
+        self.ids[range].iter().position(|&it| it == id).map(|it| self.specs[start + it])
     }
 
-    fn insert(&mut self, set: usize, lint: &'static Lint, spec: Spec) {
-        let specs = &mut self.sets[set].specs;
-        match specs.iter_mut().find(|(it, _)| it.name == lint.name) {
-            Some((_, it)) => *it = spec,
-            None => specs.push((lint, spec)),
+    /// Sets `id` at `spec` in `set`, which is the last set.
+    fn insert(&mut self, set: SetId, id: LintId, spec: Spec) {
+        debug_assert_eq!(set as usize, self.start.len() - 1, "levels are set in the last set only");
+        let range = self.range(set);
+        let start = range.start;
+        match self.ids[range].iter().position(|&it| it == id) {
+            Some(at) => self.specs[start + at] = spec,
+            None => {
+                self.ids.push(id);
+                self.specs.push(spec);
+            }
         }
     }
 }
@@ -556,7 +633,7 @@ fn malformed(at: Span, label: &str) -> Diag {
 /// Where the HIR has the `#[expect]`s of `node`, for the order rustc checks them in
 /// (`ModuleItems::owners`): the crate, then free items, trait items, impl items and foreign
 /// items, each in order; the owner is the item `node` is in.
-pub(super) fn owner_rank(sh: &Shared<'_, '_, '_>, node: &InFile<SyntaxNode>) -> (u8, Vec<(u32, u32)>) {
+pub(super) fn owner_rank(sh: &Shared<'_, '_, '_>, node: &InFile<SyntaxNode>) -> (u8, Place) {
     let sema = sh.cx.sema;
     let mut at = node.clone();
     loop {

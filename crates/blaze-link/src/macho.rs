@@ -38,8 +38,8 @@ use blaze_codegen::Arch;
 use object::macho;
 
 use crate::model::{
-    Class, Counts, File, Holds, NativeFile, Placed, Plan, Prot, Region, SectionKind, Special,
-    Writer,
+    Class, Counts, Data, File, Holds, Name, NativeFile, Names, Placed, Plan, Prot, Region,
+    SectionKind, Special, Writer,
 };
 use crate::output::Platform;
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
@@ -96,6 +96,17 @@ pub(super) fn core_name(name: &[u8]) -> Result<String, String> {
         Some(rest) => rest.to_owned(),
         None => format!("\x01{name}"),
     })
+}
+
+/// [`core_name`] added to a file's `names`: no `String` of its own, but for the rare name
+/// without an underscore, which gains a `\x01`.
+pub(super) fn push_core_name(names: &mut Names, name: &[u8]) -> Result<Name, String> {
+    let text = std::str::from_utf8(name)
+        .map_err(|_| format!("the symbol `{}` is not UTF-8", String::from_utf8_lossy(name)))?;
+    match text.strip_prefix('_') {
+        Some(rest) => names.push(rest),
+        None => names.push(&format!("\x01{text}")),
+    }
 }
 
 /// The Mach-O name of a symbol the core names `name`.
@@ -536,8 +547,19 @@ impl Writer for MachO {
         let (at, bytes) = self.thin(name, bytes)?;
         let magic = bytes.get(..4).map(|it| u32::from_le_bytes([it[0], it[1], it[2], it[3]]));
         match kind {
-            NativeKind::Object => aligned(bytes, |bytes| input::read(name, bytes, self.output.arch))
-                .map(NativeFile::Object),
+            NativeKind::Object => {
+                let mut object = input::read(name, bytes, self.output.arch)?;
+                // The reader's ranges are of the slice it read: of this file, past a universal
+                // header.
+                if at != 0 {
+                    for section in &mut object.sections {
+                        if let Data::Input(range) = &mut section.data {
+                            *range = range.start + at as u64..range.end + at as u64;
+                        }
+                    }
+                }
+                Ok(NativeFile::Object(object))
+            }
             NativeKind::Archive { .. } => {
                 let mut archive = archive::read(name, bytes)?;
                 for member in &mut archive.members {
@@ -546,8 +568,7 @@ impl Writer for MachO {
                 Ok(NativeFile::Archive(archive))
             }
             NativeKind::Shared { .. } if magic == Some(macho::MH_MAGIC_64) => {
-                aligned(bytes, |bytes| dylib::read(name, bytes, self.output.arch))
-                    .map(NativeFile::Shared)
+                dylib::read(name, bytes, self.output.arch).map(NativeFile::Shared)
             }
             NativeKind::Shared { .. } => {
                 let text = std::str::from_utf8(bytes).map_err(|_| {
@@ -591,20 +612,20 @@ impl Writer for MachO {
     }
 }
 
-/// `f` of `bytes` at an address `object`'s Mach-O structures may be read at (8), copied
-/// when they aren't there: an archive's member starts where its header and name end.
-fn aligned<T>(bytes: &[u8], f: impl FnOnce(&[u8]) -> T) -> T {
-    if (bytes.as_ptr() as usize).is_multiple_of(8) {
-        return f(bytes);
-    }
-    let mut words = vec![0u64; bytes.len().div_ceil(8)];
-    // SAFETY: `words` is at least `bytes.len()` bytes long and is borrowed for as long as
-    // `copy`; every byte of a `u64` is a valid `u8`.
-    let copy =
-        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), bytes.len()) };
-    copy.copy_from_slice(bytes);
-    f(copy)
-}
+// The readers view an input in place wherever it starts (an archive's member starts where
+// its header and name end, at any byte): the workspace builds `object` with `unaligned`,
+// which makes every structure it reads byte-aligned.
+const _: () = {
+    use std::mem::align_of;
+    type E = object::LittleEndian;
+    assert!(align_of::<macho::FatHeader>() == 1 && align_of::<macho::FatArch64>() == 1);
+    assert!(align_of::<macho::MachHeader64<E>>() == 1 && align_of::<macho::LoadCommand<E>>() == 1);
+    assert!(align_of::<macho::SegmentCommand64<E>>() == 1 && align_of::<macho::Section64<E>>() == 1);
+    assert!(align_of::<macho::SymtabCommand<E>>() == 1 && align_of::<macho::Nlist64<E>>() == 1);
+    assert!(align_of::<macho::Relocation<E>>() == 1 && align_of::<macho::DylibCommand<E>>() == 1);
+    assert!(align_of::<macho::DyldInfoCommand<E>>() == 1);
+    assert!(align_of::<macho::LinkeditDataCommand<E>>() == 1);
+};
 
 /// A segment as its load command says it.
 struct SegmentOut {

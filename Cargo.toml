@@ -276,6 +276,7 @@ unsafe_op_in_unsafe_fn = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(bootstrap)',
     "cfg(no_salsa_async_drops)",
+    "cfg(blaze_check)",
 ] }
 unused_extern_crates = "warn"
 unused_lifetimes = "warn"

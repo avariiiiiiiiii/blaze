@@ -9,8 +9,6 @@
 //! that changed; the tests are matched against a hash set of the old code hashes of what
 //! changed, `O(1)` per hash a test reached.
 
-use std::collections::BTreeSet;
-
 use blaze_api::{FactRead, Reach, ReachedItem};
 use blaze_items::{CodeHash, Fact, HashColumns, ItemHashes, ItemKey, ItemKind, Resolved};
 use hir_ty::db::HirDatabase;
@@ -55,7 +53,7 @@ pub(crate) fn reach(from: &Job, to: &Job, changes: &[blaze_vfs::Change]) -> Resu
     let old_db: &dyn HirDatabase = &before;
     let new_db: &dyn HirDatabase = &after;
     let mut items = Vec::new();
-    let mut compiled = BTreeSet::new();
+    let mut compiled = Vec::new();
     let mut changed_code: FxHashSet<CodeHash> = FxHashSet::default();
     let mut seen: FxHashSet<ItemKey> = FxHashSet::default();
     for (at, unit) in to.units().graph.units.iter().enumerate() {
@@ -93,7 +91,7 @@ pub(crate) fn reach(from: &Job, to: &Job, changes: &[blaze_vfs::Change]) -> Resu
                     changed_code.insert(code);
                 }
                 if now.is_some_and(|it| it.kind == ItemKind::Fn && it.code.is_some()) {
-                    compiled.insert(name.clone());
+                    compiled.push(name.clone());
                 }
             }
             items.push(ReachedItem {
@@ -102,18 +100,17 @@ pub(crate) fn reach(from: &Job, to: &Job, changes: &[blaze_vfs::Change]) -> Resu
             });
         }
     }
-    let mut tests = BTreeSet::new();
+    let mut tests = Vec::new();
     for done in from.made.iter().filter_map(|it| it.get()) {
         for test in &done.tests {
             if test.outside || test.reached.iter().any(|it| changed_code.contains(it)) {
-                tests.insert(test.name.clone());
+                tests.push(test.name.clone());
             }
         }
     }
-    Ok(Reach {
-        changes: changes.to_vec(),
-        items,
-        compiled: compiled.into_iter().collect(),
-        tests: tests.into_iter().collect(),
-    })
+    compiled.sort_unstable();
+    compiled.dedup();
+    tests.sort_unstable();
+    tests.dedup();
+    Ok(Reach { changes: changes.to_vec(), items, compiled, tests })
 }

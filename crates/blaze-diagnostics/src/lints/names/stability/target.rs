@@ -202,38 +202,36 @@ impl Attribute {
     }
 }
 
-/// The target check's `useless_deprecated` of each `#[deprecated]` where it is a warning, as
-/// the parser of the crate's attributes finds them.
-pub(super) fn useless(cx: &Cx<'_, '_>, attrs: &[Attribute]) -> Vec<Found> {
-    let extern_types = cx.krate.is_unstable_feature_enabled(cx.db, &Symbol::intern("extern_types"));
-    let mut found = Vec::new();
-    for attr in attrs {
-        let target = attr.target;
-        let unused = matches!(
-            target,
-            Target::Closure | Target::Expression | Target::Statement | Target::Arm | Target::MacroCall
-        );
-        if ALLOWED.contains(&target) || target == Target::WherePredicate || unused {
-            continue;
-        }
-        let message = format!("the `deprecated` attribute cannot be used on {}", target.plural_name());
-        let mut diag = Diag::lint("useless_deprecated", message, cx.span(attr.path));
-        diag.suggestion_with_style(
-            vec![(cx.span(attr.whole), String::new())],
-            "remove the attribute",
-            Applicability::MachineApplicable,
-            SuggestionStyle::CompletelyHidden,
-        );
-        let (applied, only) = applied(target, extern_types);
-        let only = if only { "only " } else { "" };
-        diag.help(format!("the `deprecated` attribute can {only}be applied to {}", and_list(&applied)));
-        diag.warn(
-            "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!",
-        );
-        super::source_fact(cx, &mut diag, attr.on);
-        found.push(Found::lint(diag, Phase::Items, attr.on));
+/// Whether the crate enables `extern_types`, which adds foreign types to the targets the
+/// help names.
+pub(super) fn extern_types(cx: &Cx<'_, '_>) -> bool {
+    cx.krate.is_unstable_feature_enabled(cx.db, &Symbol::intern("extern_types"))
+}
+
+/// The target check's `useless_deprecated` of a `#[deprecated]`, where it is a warning.
+pub(super) fn useless(cx: &Cx<'_, '_>, attr: &Attribute, extern_types: bool) -> Option<Found> {
+    let target = attr.target;
+    let unused =
+        matches!(target, Target::Closure | Target::Expression | Target::Statement | Target::Arm | Target::MacroCall);
+    if ALLOWED.contains(&target) || target == Target::WherePredicate || unused {
+        return None;
     }
-    found
+    let message = format!("the `deprecated` attribute cannot be used on {}", target.plural_name());
+    let mut diag = Diag::lint("useless_deprecated", message, cx.span(attr.path));
+    diag.suggestion_with_style(
+        vec![(cx.span(attr.whole), String::new())],
+        "remove the attribute",
+        Applicability::MachineApplicable,
+        SuggestionStyle::CompletelyHidden,
+    );
+    let (applied, only) = applied(target, extern_types);
+    let only = if only { "only " } else { "" };
+    diag.help(format!("the `deprecated` attribute can {only}be applied to {}", and_list(&applied)));
+    diag.warn(
+        "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!",
+    );
+    super::source_fact(cx, &mut diag, attr.on);
+    Some(Found::lint(diag, Phase::Items, attr.on))
 }
 
 /// `check_attr`'s `check_deprecated`: `#[deprecated]` on an associated const or type of a

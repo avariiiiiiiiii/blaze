@@ -472,6 +472,11 @@ impl<I: Interner> AliasTy<I> {
         AliasTy { kind, args, _use_alias_ty_new_instead: () }
     }
 
+    /// As [`crate::TraitRef::from_checked_parts`].
+    pub fn from_checked_parts(kind: AliasTyKind<I>, args: I::GenericArgs) -> AliasTy<I> {
+        AliasTy { kind, args, _use_alias_ty_new_instead: () }
+    }
+
     pub fn new(
         interner: I,
         kind: AliasTyKind<I>,

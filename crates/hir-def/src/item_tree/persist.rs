@@ -19,7 +19,7 @@ use hir_expand::{
     ExpandTo,
     attrs::{Attr, AttrInput},
 };
-use span::{ErasedFileAstId, FileAstId, Span, SyntaxContext};
+use span::{ErasedFileAstId, FileAstId, Span};
 
 use super::{
     AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, FieldsShape, Function, IdRange,
@@ -27,7 +27,7 @@ use super::{
     PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use,
     UseTree, UseTreeId, VisibilityExplicitness,
 };
-use crate::hir::persist::{Code, Column, Read, Words, WordsRec};
+use crate::hir::persist::{Code, Column, Read, Words, WordsRec, syntax_context};
 
 blaze_format::record! {
     /// A [`MacroCall`] as a record: its context and its expansion kind as words.
@@ -82,7 +82,11 @@ blaze_format::record! {
 pub struct ItemTreeRef<'a> {
     buffer: &'a [u8],
     root: &'a Root,
+    // The per-item columns and the lists, resolved once by `read`: an item is then two loads.
     top_level: &'a [ModItemId],
+    kinds: &'a [u8],
+    ast_ids: &'a [u32],
+    children: &'a [ModItemId],
 }
 
 impl<'a> ItemTreeRef<'a> {
@@ -93,7 +97,26 @@ impl<'a> ItemTreeRef<'a> {
 
     /// How many items the tree has, at the top level or not.
     pub fn len(self) -> usize {
-        self.root.kinds.get(self.buffer).len()
+        self.kinds.len()
+    }
+
+    /// The kind of `item`, read in place; `None` when the buffer has no such item or its kind
+    /// is out of range (which [`ItemTreeRef::decode`] refuses).
+    pub(crate) fn kind(self, item: ModItemId) -> Option<ItemKind> {
+        ItemKind::from_u8(*self.kinds.get(item.index as usize)?)
+    }
+
+    /// The ast id of `item`, read in place.
+    pub fn ast_id(self, item: ModItemId) -> Option<ErasedFileAstId> {
+        self.ast_ids.get(item.index as usize).map(|&raw| ErasedFileAstId::from_raw(raw))
+    }
+
+    /// The items of an inline module's or an extern block's list, read in place.
+    pub fn children(self, list: IdRange) -> Option<&'a [ModItemId]> {
+        if !list.within(self.children.len()) {
+            return None;
+        }
+        Some(&self.children[list.range()])
     }
 
     pub fn is_empty(self) -> bool {
@@ -104,22 +127,18 @@ impl<'a> ItemTreeRef<'a> {
     pub fn decode(self) -> Result<ItemTree, FormatError> {
         let (root, buffer) = (self.root, self.buffer);
         let invalid = |what| FormatError::Invalid { at: self.position(root), what };
-        let kinds = (root.kinds.follow(buffer)?.iter())
+        let kinds = (self.kinds.iter())
             .map(|&kind| ItemKind::from_u8(kind).ok_or_else(|| invalid("an item kind out of range")))
             .collect::<Result<Box<[ItemKind]>, FormatError>>()?;
-        let ast_ids = (root.ast_ids.follow(buffer)?.iter())
+        let ast_ids = (self.ast_ids.iter())
             .map(|&raw| FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw)))
             .collect();
         let macro_calls = (root.macro_calls.follow(buffer)?.iter())
             .map(|call| {
                 let expand_to = expand_to_of(call.expand_to)
                     .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
-                if call.ctxt == u32::MAX {
-                    return Err(invalid("a syntax context of u32::MAX"));
-                }
-                // SAFETY: `ctxt` is what `into_u32` gave for a context of the database that
-                // wrote the buffer, which is the one reading it (`crate::hir::persist`'s docs).
-                let ctxt = unsafe { SyntaxContext::from_u32(call.ctxt) };
+                let ctxt = syntax_context(call.ctxt)
+                    .ok_or_else(|| invalid("a syntax context of u32::MAX"))?;
                 Ok(MacroCall { path: call.path, ctxt, expand_to })
             })
             .collect::<Result<Box<[MacroCall]>, FormatError>>()?;
@@ -129,7 +148,7 @@ impl<'a> ItemTreeRef<'a> {
             kinds,
             data: column(&root.data, buffer)?,
             ast_ids,
-            children: column(&root.children, buffer)?,
+            children: self.children.into(),
             consts: column(&root.consts, buffer)?,
             enums: column(&root.enums, buffer)?,
             extern_blocks: column(&root.extern_blocks, buffer)?,
@@ -178,12 +197,12 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
     if tree.data.len() != items || tree.ast_ids.len() != items {
         return Err("per-item columns of different lengths");
     }
-    let vis = |id: RawVisibilityId| id.is_builtin() || (id.0 as usize) < tree.vis.len();
-    let name = |id: NameId| (id.0 as usize) < tree.names.len();
-    let path = |id: PathId| (id.0 as usize) < tree.paths.len();
+    let vis = |id: RawVisibilityId| id.is_builtin() || (id.raw as usize) < tree.vis.len();
+    let name = |id: NameId| (id.raw as usize) < tree.names.len();
+    let path = |id: PathId| (id.raw as usize) < tree.paths.len();
     let path_or_none = |id: PathId| id == PathId::NONE || path(id);
     let alias =
-        |id: AliasId| matches!(id, AliasId::NONE | AliasId::UNDERSCORE) || name(NameId(id.0));
+        |id: AliasId| matches!(id, AliasId::NONE | AliasId::UNDERSCORE) || name(NameId { raw: id.raw });
     let named = |name_id: NameId, vis_id: RawVisibilityId| name(name_id) && vis(vis_id);
     // A list of items, each before the item `holder` that holds the list.
     let list = |range: IdRange, holder: usize| {
@@ -233,7 +252,7 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
             ItemKind::Union => named(tree.unions[data].name, tree.unions[data].visibility),
             ItemKind::Use => {
                 let it = &tree.uses[data];
-                vis(it.visibility) && (it.use_tree.0 as usize) < tree.use_trees.len()
+                vis(it.visibility) && (it.use_tree.raw as usize) < tree.use_trees.len()
             }
         };
         if !ok {
@@ -254,7 +273,7 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
                     && it.alias == AliasId::NONE
                     && it.list.within(tree.use_tree_lists.len())
                     && (tree.use_tree_lists[it.list.range()].iter())
-                        .all(|child| (child.0 as usize) < at)
+                        .all(|child| (child.raw as usize) < at)
             }
             _ => false,
         };
@@ -379,7 +398,14 @@ impl Persist for ItemTree {
 
     fn read(buffer: &[u8]) -> Result<ItemTreeRef<'_>, FormatError> {
         let root = blaze_format::open_as::<Root>(buffer, Self::SCHEMA)?;
-        Ok(ItemTreeRef { buffer, root, top_level: root.top_level.follow(buffer)? })
+        Ok(ItemTreeRef {
+            buffer,
+            root,
+            top_level: root.top_level.follow(buffer)?,
+            kinds: root.kinds.follow(buffer)?,
+            ast_ids: root.ast_ids.follow(buffer)?,
+            children: root.children.follow(buffer)?,
+        })
     }
 }
 
@@ -802,6 +828,24 @@ pub(crate) fn assert_round_trip(tree: &ItemTree) {
     let read = ItemTree::read(&buffer).expect("an item tree just written");
     assert_eq!(read.top_level().collect::<Vec<_>>(), tree.top_level.to_vec());
     assert_eq!(read.len(), tree.kinds.len());
+    for index in 0..tree.kinds.len() as u32 {
+        let item = ModItemId { index };
+        assert_eq!(read.kind(item), Some(tree.kinds[index as usize]));
+        assert_eq!(read.ast_id(item), Some(item.ast_id(tree).erase()));
+    }
+    let past = ModItemId { index: tree.kinds.len() as u32 };
+    assert_eq!((read.kind(past), read.ast_id(past)), (None, None));
+    for (&kind, &data) in tree.kinds.iter().zip(&tree.data) {
+        let list = match kind {
+            ItemKind::Mod if tree.mods[data as usize].items != IdRange::NONE => {
+                tree.mods[data as usize].items
+            }
+            ItemKind::ExternBlock => tree.extern_blocks[data as usize].children,
+            _ => continue,
+        };
+        assert_eq!(read.children(list), Some(tree.items(list)));
+    }
+    assert_eq!(read.children(IdRange { start: 0, len: tree.children.len() as u32 + 1 }), None);
     let decoded = read.decode().expect("an item tree just written");
     assert_eq!(decoded, *tree);
     assert_eq!(blaze_format::to_bytes(&decoded), bytes, "an item tree written twice differs");

@@ -1,7 +1,8 @@
 //! Compute the binary representation of a type
 
-use std::fmt;
+use std::{cell::OnceCell, fmt};
 
+use base_db::Crate;
 use hir_def::{
     AdtId, EnumId, EnumVariantId, LocalFieldId, StructId, VariantId,
     attrs::AttrFlags,
@@ -15,11 +16,12 @@ use rustc_abi::{
     NumScalableVectors, Primitive, ReprOptions, Scalar, Size, StructKind, TargetDataLayout,
     WrappingRange,
 };
-use rustc_index::{IndexVec, bit_set::BitMatrix};
+use rustc_index::{IndexSlice, IndexVec, bit_set::BitMatrix};
 use rustc_type_ir::{
     FloatTy, IntTy, TypeVisitableExt as _, UintTy,
     inherent::{GenericArgs as _, IntoKind},
 };
+use smallvec::SmallVec;
 use triomphe::Arc;
 
 use crate::{
@@ -27,9 +29,9 @@ use crate::{
     consteval::try_const_usize,
     db::HirDatabase,
     next_solver::{
-        Const, ConstKind, DbInterner, GenericArgs, PatternKind, StoredTy, Ty, TyKind, TypingMode,
-        ValueConst,
-        infer::{DbInternerInferExt, traits::ObligationCause},
+        Const, ConstKind, DbInterner, GenericArgs, ParamEnv, PatternKind, StoredTy, Ty, TyKind,
+        TypingMode, ValueConst,
+        infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
     },
     representability::{Representability, representability},
     traits::StoredParamEnvAndCrate,
@@ -128,6 +130,20 @@ impl<F> From<LayoutCalculatorError<F>> for LayoutError {
 #[salsa::tracked]
 pub fn struct_flags(db: &dyn HirDatabase, id: StructId) -> StructFlags {
     StructSignature::of(db, id).flags
+}
+
+/// Whether the last field of a struct may be unsized for some generic arguments. Such a field
+/// stays last for all of them, so that unsizing the struct does not move it. The answer reads
+/// the struct's own declaration and the crate's `Sized`, never a layout's generic arguments, so
+/// it is asked once per struct and crate rather than once per instantiation.
+#[salsa::tracked]
+pub fn struct_tail_may_be_unsized(db: &dyn HirDatabase, id: StructId, krate: Crate) -> bool {
+    variant_field_ids(db, id.into()).last().is_some_and(|&fd| {
+        let interner = DbInterner::new_with(db, krate);
+        let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        let ty = db.field_types(id.into())[fd].ty().instantiate_identity().skip_norm_wip();
+        !infcx.type_is_sized_modulo_regions(db.trait_environment(AdtId::from(id).into()), ty)
+    })
 }
 
 /// The fields of a variant, in order: what a layout reads of them besides their types. A
@@ -247,6 +263,74 @@ pub(crate) fn field_layout<'db>(
     Ok(layout)
 }
 
+/// Whether `deeply_normalize` can change `ty`: its folder gives back as it is any type without
+/// an alias or a `ConstKind::Unevaluated` in it, which is what `HAS_ALIAS` flags.
+fn needs_normalizing(ty: Ty<'_>) -> bool {
+    ty.has_aliases()
+}
+
+/// Normalizes the types a layout reads, as rustc's `layout_of` skips `normalize_erasing_regions`
+/// for a type without aliases. The interner (which reads the crate's lang items and def map)
+/// and the inference context are built for the first type that needs them and shared by the
+/// ones after, as one context was for all of them.
+struct Normalizer<'db> {
+    db: &'db dyn HirDatabase,
+    krate: Crate,
+    param_env: ParamEnv<'db>,
+    cause: ObligationCause,
+    infcx: OnceCell<InferCtxt<'db>>,
+}
+
+impl<'db> Normalizer<'db> {
+    fn new(db: &'db dyn HirDatabase, krate: Crate, param_env: ParamEnv<'db>) -> Self {
+        Self { db, krate, param_env, cause: ObligationCause::dummy(), infcx: OnceCell::new() }
+    }
+
+    fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
+        // `deeply_normalize` refuses these, aliases or not.
+        assert!(!ty.has_escaping_bound_vars());
+        if !needs_normalizing(ty) {
+            return ty;
+        }
+        let infcx = self.infcx.get_or_init(|| {
+            DbInterner::new_with(self.db, self.krate).infer_ctxt().build(TypingMode::PostAnalysis)
+        });
+        infcx.at(&self.cause, self.param_env).deeply_normalize(ty).unwrap_or(ty)
+    }
+}
+
+/// Fields a layout keeps on the stack before its buffers spill to the heap: each buffer is
+/// eight pointers, 64 bytes.
+const FIELDS_INLINE: usize = 8;
+
+/// A tuple's or closure's fields laid out as one variant.
+fn univariant<'db>(
+    cx: &LayoutCx<'_>,
+    db: &'db dyn HirDatabase,
+    tys: impl Iterator<Item = Ty<'db>>,
+    trait_env: &StoredParamEnvAndCrate,
+    kind: StructKind,
+) -> Result<Layout, LayoutError> {
+    let fields = tys
+        .map(|ty| field_layout(db, ty.store(), trait_env.clone()))
+        .collect::<Result<SmallVec<[Arc<Layout>; FIELDS_INLINE]>, _>>()?;
+    univariant_of(cx, &fields, kind)
+}
+
+fn univariant_of(
+    cx: &LayoutCx<'_>,
+    fields: &[Arc<Layout>],
+    kind: StructKind,
+) -> Result<Layout, LayoutError> {
+    let refs: SmallVec<[&Layout; FIELDS_INLINE]> = fields.iter().map(|it| &**it).collect();
+    let fields: SmallVec<[&&Layout; FIELDS_INLINE]> = refs.iter().collect();
+    Ok(cx.calc.layout_of_univariant(
+        IndexSlice::<RustcFieldIdx, _>::from_raw(&fields),
+        &ReprOptions::default(),
+        kind,
+    )?)
+}
+
 #[salsa::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone))]
 pub fn layout_of_ty_query(
     db: &dyn HirDatabase,
@@ -254,18 +338,13 @@ pub fn layout_of_ty_query(
     trait_env: StoredParamEnvAndCrate,
 ) -> Result<Arc<Layout>, LayoutError> {
     let krate = trait_env.krate;
-    let interner = DbInterner::new_with(db, krate);
     let Ok(target) = db.target_data_layout(krate) else {
         return Err(LayoutError::TargetLayoutNotAvailable);
     };
     let dl = target;
     let cx = LayoutCx::new(dl);
-    let infer_ctxt = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-    let cause = ObligationCause::dummy();
-    let ty = infer_ctxt
-        .at(&cause, trait_env.param_env(db))
-        .deeply_normalize(ty.as_ref())
-        .unwrap_or(ty.as_ref());
+    let normalizer = Normalizer::new(db, krate, trait_env.param_env(db));
+    let ty = normalizer.normalize(ty.as_ref());
     let result = match ty.kind() {
         TyKind::Adt(def, args) => {
             match def.def_id() {
@@ -358,14 +437,7 @@ pub fn layout_of_ty_query(
         TyKind::Tuple(tys) => {
             let kind =
                 if tys.is_empty() { StructKind::AlwaysSized } else { StructKind::MaybeUnsized };
-
-            let fields = tys
-                .iter()
-                .map(|k| field_layout(db, k.store(), trait_env.clone()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
-            let fields = fields.iter().collect::<IndexVec<_, _>>();
-            cx.calc.layout_of_univariant(&fields, &ReprOptions::default(), kind)?
+            univariant(&cx, db, tys.iter(), &trait_env, kind)?
         }
         TyKind::Array(element, count) => {
             let count = try_const_usize(db, count).ok_or(LayoutError::HasErrorConst)? as u64;
@@ -394,9 +466,7 @@ pub fn layout_of_ty_query(
             // }
 
             // The tail can be behind an associated type, such as `A::Dyn`.
-            let normalize = |ty| {
-                infer_ctxt.at(&cause, trait_env.param_env(db)).deeply_normalize(ty).unwrap_or(ty)
-            };
+            let normalize = |ty| normalizer.normalize(ty);
             let unsized_part = struct_tail_erasing_lifetimes(db, pointee, &normalize);
             // FIXME(next-solver)
             /*
@@ -439,17 +509,8 @@ pub fn layout_of_ty_query(
             // Not the layout of the tuple of captures: a tuple's last field can be unsized and
             // so stays last, where a closure's fields are all free to move.
             let upvars = ty.closure_upvars_ty().expect("a closure");
-            let fields = rustc_type_ir::inherent::Ty::tuple_fields(upvars)
-                .iter()
-                .map(|k| field_layout(db, k.store(), trait_env.clone()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let fields = fields.iter().map(|it| &**it).collect::<Vec<_>>();
-            let fields = fields.iter().collect::<IndexVec<_, _>>();
-            cx.calc.layout_of_univariant(
-                &fields,
-                &ReprOptions::default(),
-                StructKind::AlwaysSized,
-            )?
+            let upvars = rustc_type_ir::inherent::Ty::tuple_fields(upvars);
+            univariant(&cx, db, upvars.iter(), &trait_env, StructKind::AlwaysSized)?
         }
         TyKind::Coroutine(id, args) => {
             // Laid out as rustc's `coroutine_layout` lays it out: what was captured and where
@@ -476,7 +537,7 @@ pub fn layout_of_ty_query(
             let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
                 .iter()
                 .map(|ty| field_layout(db, ty.store(), trait_env.clone()))
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Result<SmallVec<[_; FIELDS_INLINE]>, _>>()?;
             // Each local is a `MaybeUninit` of its type, as rustc has it: nothing of it is a
             // niche.
             let locals = held
@@ -490,10 +551,11 @@ pub fn layout_of_ty_query(
                     Ok(layout)
                 })
                 .collect::<Result<Vec<_>, LayoutError>>()?;
-            let prefix: Vec<&Layout> = upvars.iter().map(|it| &**it).collect();
+            let prefix: SmallVec<[&Layout; FIELDS_INLINE]> = upvars.iter().map(|it| &**it).collect();
             let prefix = prefix.iter().collect::<IndexVec<RustcFieldIdx, _>>();
-            let locals = locals.iter().collect::<Vec<_>>();
-            let locals = locals.iter().collect::<IndexVec<usize, _>>();
+            let locals = locals.iter().collect::<SmallVec<[&Layout; FIELDS_INLINE]>>();
+            let locals = locals.iter().collect::<SmallVec<[&&Layout; FIELDS_INLINE]>>();
+            let locals = IndexSlice::<usize, _>::from_raw(&locals);
             // The body has not started, has returned or has panicked, and holds nothing then.
             let mut kept: IndexVec<RustcEnumVariantIdx, IndexVec<RustcFieldIdx, usize>> =
                 IndexVec::from_elem_n(IndexVec::new(), CoroutineFrame::SUSPENDED);
@@ -508,7 +570,7 @@ pub fn layout_of_ty_query(
             }
             let state = Layout::scalar(dl, CoroutineFrame::state_scalar(held.yields.len()));
             let state = &state;
-            cx.calc.layout_of_coroutine(&locals, prefix, &kept, &conflicts, |_| &state)?
+            cx.calc.layout_of_coroutine(locals, prefix, &kept, &conflicts, |_| &state)?
         }
         TyKind::CoroutineWitness(_, _) => {
             return Err(LayoutError::NotImplemented);

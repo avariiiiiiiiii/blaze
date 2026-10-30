@@ -264,7 +264,7 @@ fn check_impl(
                     let adjustments = inference_result
                         .expr_adjustments
                         .get(&expr)
-                        .map_or_else(Default::default, |it| &**it);
+                        .unwrap_or_default();
                     assert_eq!(
                         expected,
                         adjustments

@@ -131,7 +131,10 @@ pub(super) fn transcribe(
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     let mut ctx = ExpandCtx { bindings, nesting: Vec::new(), call_site };
-    let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(ctx.call_site));
+    let mut builder = tt::TopSubtreeBuilder::with_capacity(
+        tt::Delimiter::invisible_spanned(ctx.call_site),
+        template.0.len() + bindings.token_trees(),
+    );
     expand_subtree(&mut ctx, template, &mut builder, marker).map(|()| builder.build())
 }
 

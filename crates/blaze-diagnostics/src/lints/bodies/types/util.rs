@@ -5,21 +5,20 @@
 //!
 //! Follows rustc's `compiler/rustc_hir/src/hir.rs` (`Expr::peel_blocks`, `peel_borrows`),
 //! `compiler/rustc_span/src/lib.rs` (`Span::find_ancestor_inside`, `from_expansion`),
-//! `compiler/rustc_middle/src/lint.rs` (`in_external_macro`) and
-//! `compiler/rustc_passes/src/diagnostic_items.rs` (MIT or Apache-2.0).
+//! `compiler/rustc_middle/src/lint.rs` (`in_external_macro`),
+//! `compiler/rustc_ast_lowering/src/expr.rs` (the span of `(e)`) and
+//! `compiler/rustc_hir_typeck` (`qpath_res`) (MIT or Apache-2.0).
 
-use std::ops::ControlFlow;
-
-use base_db::Crate;
 use hir::{InFile, db::HirDatabase};
 use hir_def::{
-    AdtId, AttrDefId, CallableDefId, FunctionId, HasModule, Lookup,
+    AdtId, AttrDefId, CallableDefId, FunctionId, HasModule,
+    attrs::AttrFlags,
     expr_store::scope::ExprScopes,
     hir::{Expr, ExprId, Literal},
     resolver::{ValueNs, resolver_for_scope},
-    src::HasSource,
 };
-use hir_expand::attrs::{AstKeyValueMetaExt as _, AstPathExt as _, expand_cfg_attr};
+use hir_expand::mod_path::PathKind;
+use intern::Symbol;
 use hir_ty::{
     method_resolution::CandidateId,
     next_solver::{
@@ -30,41 +29,20 @@ use hir_ty::{
 use rustc_type_ir::inherent::IntoKind;
 use syntax::{
     AstNode, SyntaxNode,
-    ast::{self, HasAttrs},
+    ast,
 };
 
 use crate::{lints::bodies::BodyCx, model::Span};
 
-/// The name `#[rustc_diagnostic_item = "name"]` gives `def`, its `cfg_attr`s expanded: what
-/// rustc's `get_diagnostic_name` gives (`diagnostic_items.rs`, `observe_item`).
-pub(crate) fn diagnostic_item(db: &dyn HirDatabase, def: AttrDefId) -> Option<String> {
-    let (krate, attrs): (Crate, Vec<ast::Attr>) = match def {
-        AttrDefId::FunctionId(it) => (it.krate(db), it.lookup(db).source(db).value.attrs().collect()),
-        AttrDefId::ConstId(it) => (it.krate(db), it.lookup(db).source(db).value.attrs().collect()),
-        AttrDefId::StaticId(it) => (it.krate(db), it.lookup(db).source(db).value.attrs().collect()),
-        AttrDefId::TraitId(it) => (it.krate(db), it.lookup(db).source(db).value.attrs().collect()),
-        AttrDefId::TypeAliasId(it) => (it.krate(db), it.lookup(db).source(db).value.attrs().collect()),
-        AttrDefId::AdtId(AdtId::StructId(it)) => {
-            (it.krate(db), it.lookup(db).source(db).value.attrs().collect())
-        }
-        AttrDefId::AdtId(AdtId::EnumId(it)) => (it.krate(db), it.lookup(db).source(db).value.attrs().collect()),
-        AttrDefId::AdtId(AdtId::UnionId(it)) => {
-            (it.krate(db), it.lookup(db).source(db).value.attrs().collect())
-        }
-        _ => return None,
-    };
-    let cfg = krate.cfg_options(db);
-    expand_cfg_attr(attrs.into_iter(), || cfg, |meta, _| match meta {
-        ast::Meta::KeyValueMeta(attr) if attr.path().is1("rustc_diagnostic_item") => match attr.value_string() {
-            Some(name) => ControlFlow::Break(name.to_string()),
-            None => ControlFlow::Continue(()),
-        },
-        _ => ControlFlow::Continue(()),
-    })
+/// The name `#[rustc_diagnostic_item = "name"]` gives `def`: rustc's `get_diagnostic_name`.
+/// hir-def's `AttrFlags` answers it: a bit test of the item's memoized attribute flags, then
+/// the memoized symbol; comparing it with another `Symbol` is a pointer compare.
+pub(crate) fn diagnostic_item(db: &dyn HirDatabase, def: AttrDefId) -> Option<Symbol> {
+    AttrFlags::diagnostic_item(db, def)
 }
 
 /// [`diagnostic_item`] of a function.
-pub(crate) fn fn_item(db: &dyn HirDatabase, def: FunctionId) -> Option<String> {
+pub(crate) fn fn_item(db: &dyn HirDatabase, def: FunctionId) -> Option<Symbol> {
     diagnostic_item(db, AttrDefId::FunctionId(def))
 }
 
@@ -80,7 +58,7 @@ pub(crate) fn called_fn(b: &BodyCx<'_, '_>, call: ExprId) -> Option<(FunctionId,
 }
 
 /// The diagnostic item of the function `call` calls through a path, with its arguments.
-pub(crate) fn called_item<'a>(b: &'a BodyCx<'_, '_>, call: ExprId) -> Option<(String, &'a [ExprId])> {
+pub(crate) fn called_item<'a>(b: &'a BodyCx<'_, '_>, call: ExprId) -> Option<(Symbol, &'a [ExprId])> {
     let (def, _) = called_fn(b, call)?;
     let name = fn_item(b.db(), def)?;
     Some((name, call_args(b, call)?))
@@ -101,8 +79,11 @@ pub(crate) fn method_fn(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<FunctionId> 
     b.infer.method_resolution(expr).map(|(def, _)| def)
 }
 
-/// What the path `expr` names in the value namespace (rustc's `qpath_res`): an associated item
-/// as type checking resolved it, else as the scope of `expr` resolves it.
+/// What the path `expr` names in the value namespace (rustc's `qpath_res`). In the order of
+/// cost: an associated item as type checking resolved it (a table lookup); a function, tuple
+/// struct or variant by the `FnDef` type checking gave the path, when it can't name a local (a
+/// path of more than one segment, or one no binding in scope is named as); else the scope's
+/// resolver, which builds the scope chain.
 pub(crate) fn path_value(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ValueNs> {
     let Expr::Path(path) = b.store().expr(expr) else { return None };
     if let Some((assoc, _)) = b.infer.assoc_resolutions_for_expr(expr) {
@@ -112,12 +93,29 @@ pub(crate) fn path_value(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ValueNs> {
         });
     }
     let db = b.db();
-    let scope = ExprScopes::of(db, b.owner).scope_for(expr);
+    let scopes = ExprScopes::of(db, b.owner);
+    let scope = scopes.scope_for(expr);
+    if let TyKind::FnDef(CallableIdWrapper(callable), _) = b.infer.expr_ty(expr).kind() {
+        let local = match (path.mod_path(), scope) {
+            (Some(mod_path), Some(scope)) => match mod_path.as_ident() {
+                Some(name) if mod_path.kind == PathKind::Plain => scopes.resolve_name_in_scope(scope, name).is_some(),
+                _ => false,
+            },
+            _ => true,
+        };
+        if !local {
+            return Some(match callable {
+                CallableDefId::FunctionId(it) => ValueNs::FunctionId(it),
+                CallableDefId::StructId(it) => ValueNs::StructId(it),
+                CallableDefId::EnumVariantId(it) => ValueNs::EnumVariantId(it),
+            });
+        }
+    }
     resolver_for_scope(db, b.owner, scope).resolve_path_in_value_ns_fully(db, path, b.store().expr_path_hygiene(expr))
 }
 
 /// The diagnostic item the path `expr` names (`f32::NAN`, `std::ptr::null`).
-pub(crate) fn path_item(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<String> {
+pub(crate) fn path_item(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Symbol> {
     let def = match path_value(b, expr)? {
         ValueNs::FunctionId(it) => AttrDefId::FunctionId(it),
         ValueNs::ConstId(it) => AttrDefId::ConstId(it),
@@ -168,9 +166,9 @@ pub(crate) fn syntax(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<InFile<SyntaxNo
 }
 
 /// rustc's span of `expr`: where it is written, with the parentheses around it, which rustc's
-/// lowering gives the expression in them (`rustc_ast_lowering`, `ExprKind::Paren`).
-/// Parentheses a macro put around an expression it was handed are not written, and are left
-/// out.
+/// lowering gives the expression in them when their span contains its (`rustc_ast_lowering`,
+/// `ExprKind::Paren`). Parentheses a macro put around an expression it was handed do not
+/// contain it, and are left out.
 pub(crate) fn span(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
     let node = b.expr_node(expr)?;
     let mut span = b.cx.span_of(node);
@@ -178,7 +176,9 @@ pub(crate) fn span(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
     let mut at = value;
     while let Some(parent) = at.parent().filter(|it| ast::ParenExpr::can_cast(it.kind())) {
         let outer = b.cx.span(InFile::new(file_id, parent.text_range()));
-        if !b.cx.snippet(&outer).is_some_and(|it| it.starts_with('(') && it.ends_with(')')) {
+        let contains = outer.file == span.file && outer.lo <= span.lo && span.hi <= outer.hi;
+        let parenthesized = b.cx.snippet(&outer).is_some_and(|it| it.starts_with('(') && it.ends_with(')'));
+        if !contains || !parenthesized {
             break;
         }
         span = outer;

@@ -11,7 +11,7 @@
 use std::{
     fmt,
     marker::PhantomData,
-    ops::{Deref, DerefMut, Index},
+    ops::Index,
 };
 
 use hir_def::{
@@ -491,68 +491,6 @@ impl Range {
 
 const _: () = assert!(size_of::<Range>() == 8);
 
-/// One key's list of a CSR column, as `[T]`: what [`Csr::get`] hands out, so that callers
-/// treat it as the slice it derefs to.
-#[repr(transparent)]
-pub struct Run<T>([T]);
-
-impl<T> Run<T> {
-    #[inline]
-    fn new(items: &[T]) -> &Run<T> {
-        // SAFETY: `Run<T>` is `#[repr(transparent)]` over `[T]`.
-        unsafe { &*(items as *const [T] as *const Run<T>) }
-    }
-
-    #[inline]
-    fn new_mut(items: &mut [T]) -> &mut Run<T> {
-        // SAFETY: `Run<T>` is `#[repr(transparent)]` over `[T]`, and the borrow is unique.
-        unsafe { &mut *(items as *mut [T] as *mut Run<T>) }
-    }
-}
-
-impl<T> Deref for Run<T> {
-    type Target = [T];
-
-    #[inline]
-    fn deref(&self) -> &[T] {
-        &self.0
-    }
-}
-
-impl<T> DerefMut for Run<T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut [T] {
-        &mut self.0
-    }
-}
-
-impl<T> AsRef<[T]> for Run<T> {
-    fn as_ref(&self) -> &[T] {
-        &self.0
-    }
-}
-
-impl<'a, T> IntoIterator for &'a Run<T> {
-    type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
-    }
-}
-
-impl<T: PartialEq> PartialEq for Run<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for Run<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 /// A list per key as CSR: each key's [`Range`] into one flat array, the lists in key order.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Csr<K, T> {
@@ -594,9 +532,9 @@ impl<K: DenseKey, T> Csr<K, T> {
     }
 
     #[inline]
-    pub fn get(&self, key: &K) -> Option<&Run<T>> {
+    pub fn get(&self, key: &K) -> Option<&[T]> {
         match self.ranges.get(key.to_index()) {
-            Some(&range) if !range.is_absent() => Some(Run::new(&self.items[range.slice()])),
+            Some(&range) if !range.is_absent() => Some(&self.items[range.slice()]),
             _ => None,
         }
     }
@@ -668,14 +606,14 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
         place(self.items.len())
     }
 
-    pub(crate) fn get(&self, key: &K) -> Option<&Run<T>> {
+    pub(crate) fn get(&self, key: &K) -> Option<&[T]> {
         let range = self.range(key);
-        (!range.is_absent()).then(|| Run::new(&self.items[range.slice()]))
+        (!range.is_absent()).then(|| &self.items[range.slice()])
     }
 
-    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut Run<T>> {
+    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut [T]> {
         let range = self.range(key);
-        (!range.is_absent()).then(|| Run::new_mut(&mut self.items[range.slice()]))
+        (!range.is_absent()).then(|| &mut self.items[range.slice()])
     }
 
     pub(crate) fn contains_key(&self, key: &K) -> bool {
@@ -981,13 +919,10 @@ impl<K: DenseKey + fmt::Debug> fmt::Debug for ModeColumn<K> {
 }
 
 /// A side table of the few keys that have a value, sorted by key.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct SortedMap<K, V> {
     entries: Box<[(K, V)]>,
 }
-
-// SAFETY: a boxed slice of `(K, V)`, nothing else: storable as both are.
-unsafe impl<K: salsa::SalsaValue, V: salsa::SalsaValue> salsa::SalsaValue for SortedMap<K, V> {}
 
 impl<K, V> Default for SortedMap<K, V> {
     fn default() -> Self {

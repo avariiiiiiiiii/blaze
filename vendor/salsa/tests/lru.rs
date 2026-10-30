@@ -145,3 +145,36 @@ fn lru_keeps_dependency_info() {
     assert_eq!(p, 0);
     db.assert_logs_len(0);
 }
+
+#[test]
+fn lru_keeps_the_latest_revisions_reads() {
+    let mut db = common::LoggerDatabase::default();
+    let capacity = 8;
+    let inputs: Vec<MyInput> = (0..2 * capacity)
+        .map(|i| MyInput::new(&db, i as u32))
+        .collect();
+
+    for input in &inputs {
+        get_hot_potato(&db, *input);
+    }
+    db.assert_logs_len(2 * capacity);
+    db.synthetic_write(salsa::Durability::HIGH);
+    assert_eq!(load_n_potatoes(), capacity);
+
+    // Every memo was verified in the same revision, so the first slots went: keys
+    // `0..capacity` run again, and now they are the ones read last.
+    for input in &inputs[..capacity] {
+        get_hot_potato(&db, *input);
+    }
+    db.assert_logs_len(capacity);
+    assert_eq!(load_n_potatoes(), 2 * capacity);
+    db.synthetic_write(salsa::Durability::HIGH);
+    assert_eq!(load_n_potatoes(), capacity);
+
+    for input in &inputs[..capacity] {
+        get_hot_potato(&db, *input);
+    }
+    db.assert_logs_len(0);
+    get_hot_potato(&db, inputs[capacity]);
+    db.assert_logs_len(1);
+}

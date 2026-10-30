@@ -48,7 +48,7 @@ LL |     let _ = unsafe { (&raw mut TEST) as *const usize };
 warning: 2 warnings emitted
 
 "##;
-    let stderr = ui(Ui { name: "static-mut-shared-parens.rs", test: Test::Passes, source, ..Ui::default() });
+    let stderr = crate::tests::ui("static-mut-shared-parens.rs", "2015", source);
     assert_eq!(stderr, expected);
 }
 
@@ -83,7 +83,7 @@ LL | static n: &'static usize = unsafe { &raw const n_mut };
 warning: 1 warning emitted
 
 "##;
-    assert_eq!(ui(Ui { name: "issue-15261.rs", test: Test::Passes, source, ..Ui::default() }), expected);
+    assert_eq!(crate::tests::ui("issue-15261.rs", "2015", source), expected);
 }
 
 /// `tests/ui/lint/static-mut-refs.rs`: borrows, `let ref`, a method call, a borrow

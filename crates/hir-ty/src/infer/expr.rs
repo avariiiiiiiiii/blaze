@@ -75,7 +75,7 @@ impl<'db> InferenceContext<'db> {
         let ty = self.infer_expr_inner(expr, expected, is_read);
         if ty.is_never() {
             if let Some(adjustments) = self.result.expr_adjustments.get(&expr) {
-                return if let [Adjustment { kind: Adjust::NeverToAny, target }] = &**adjustments {
+                return if let [Adjustment { kind: Adjust::NeverToAny, target }] = adjustments {
                     target.as_ref()
                 } else {
                     self.err_ty()
@@ -292,7 +292,7 @@ impl<'db> InferenceContext<'db> {
         // coercions from `!` to `expected`.
         if ty.is_never() {
             if let Some(adjustments) = self.result.expr_adjustments.get(&expr) {
-                return if let [Adjustment { kind: Adjust::NeverToAny, target }] = &**adjustments {
+                return if let [Adjustment { kind: Adjust::NeverToAny, target }] = adjustments {
                     target.as_ref()
                 } else {
                     self.err_ty()

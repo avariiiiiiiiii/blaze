@@ -68,7 +68,7 @@ use hir_expand::{
     name::Name,
     proc_macro::{CustomProcMacroExpander, ProcMacroKind},
 };
-use intern::{Interned, sym};
+use intern::sym;
 use nameres::DefMap;
 use rustc_abi::ExternAbi;
 use salsa::{Durability, Setter};
@@ -654,6 +654,9 @@ impl<'db> BlockIdLt<'db> {
     ///
     /// The caller must ensure that the `ModuleId` is not leaked outside of query computations.
     pub unsafe fn to_static(self) -> BlockId {
+        // SAFETY: `BlockIdLt<'db>` and `BlockId` are one type up to the lifetime: a salsa
+        // id with no data behind the lifetime, so the bits are the same. That the id is not
+        // read after `'db` ends is the caller's, per `# Safety` above.
         unsafe { std::mem::transmute(self) }
     }
 }
@@ -662,6 +665,9 @@ impl BlockId {
     ///
     /// The caller must ensure that the `BlockId` comes from the given database.
     pub unsafe fn to_db<'db>(self, _db: &'db dyn SourceDatabase) -> BlockIdLt<'db> {
+        // SAFETY: `BlockId` and `BlockIdLt<'db>` are one type up to the lifetime: a salsa
+        // id with no data behind the lifetime, so the bits are the same. That it was made by
+        // `_db` is the caller's, per `# Safety` above.
         unsafe { std::mem::transmute(self) }
     }
 }
@@ -691,6 +697,9 @@ impl<'db> ModuleIdLt<'db> {
     ///
     /// The caller must ensure that the `ModuleId` is not leaked outside of query computations.
     pub unsafe fn to_static(self) -> ModuleId {
+        // SAFETY: `ModuleIdLt<'db>` and `ModuleId` are one type up to the lifetime: a salsa
+        // id with no data behind the lifetime, so the bits are the same. That the id is not
+        // read after `'db` ends is the caller's, per `# Safety` above.
         unsafe { std::mem::transmute(self) }
     }
 
@@ -744,6 +753,9 @@ impl ModuleId {
     ///
     /// The caller must ensure that the `ModuleId` comes from the given database.
     pub unsafe fn to_db<'db>(self, _db: &'db dyn SourceDatabase) -> ModuleIdLt<'db> {
+        // SAFETY: `ModuleId` and `ModuleIdLt<'db>` are one type up to the lifetime: a salsa
+        // id with no data behind the lifetime, so the bits are the same. That it was made by
+        // `_db` is the caller's, per `# Safety` above.
         unsafe { std::mem::transmute(self) }
     }
 }
@@ -1605,11 +1617,11 @@ impl ModuleDefId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AstIdWithPath<T: AstIdNode> {
     ast_id: AstId<T>,
-    path: Interned<ModPath>,
+    path: ModPath,
 }
 
 impl<T: AstIdNode> AstIdWithPath<T> {
-    fn new(file_id: HirFileId, ast_id: FileAstId<T>, path: Interned<ModPath>) -> AstIdWithPath<T> {
+    fn new(file_id: HirFileId, ast_id: FileAstId<T>, path: ModPath) -> AstIdWithPath<T> {
         AstIdWithPath { ast_id: AstId::new(file_id, ast_id), path }
     }
 }

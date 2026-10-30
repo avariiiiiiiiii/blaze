@@ -15,6 +15,8 @@
 //! sandboxed spawn to a kept result; [`script`] and [`pool`] are build scripts and the warm
 //! processes proc macros run in; [`test`] selects and runs tests (docs/v2/plan/lanes/usercode/notes.md).
 
+#![forbid(unsafe_code)]
+
 pub mod confine;
 pub mod index;
 pub mod inputs;

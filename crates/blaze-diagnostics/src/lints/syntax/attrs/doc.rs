@@ -18,7 +18,7 @@
 //! diagnostics.rs`, `compiler/rustc_middle/src/hir/map.rs` (`hir_span`) and `compiler/
 //! rustc_expand/src/expand.rs` (`InvocationCollector::check_attributes`) (MIT or Apache-2.0).
 
-mod comments;
+pub(super) mod comments;
 mod meta;
 
 use hir::InFile;
@@ -120,8 +120,17 @@ fn macro_call(cx: &Cx<'_, '_>, owner: &Owner, modules: &mut comments::Modules, e
 /// rustc's `Attribute::doc_str`: a doc comment, or `#[doc = "string"]`.
 fn is_doc_str(attr: &Attr) -> bool {
     attr.is_doc_comment()
-        || (attr.is("doc")
+        || (is_doc(attr)
             && matches!(attr.args(), Args::NameValue(Some(ast::Expr::Literal(it))) if (Lit { token: it.token() }).str().is_some()))
+}
+
+/// Whether `attr` is `#[doc..]`, not a doc comment.
+fn is_doc(attr: &Attr) -> bool {
+    let Some(path) = attr.meta().and_then(|it| it.path()) else { return false };
+    path.qualifier().is_none()
+        && path.segment().is_some_and(|it| {
+            it.coloncolon_token().is_none() && it.name_ref().is_some_and(|it| it.text() == "doc")
+        })
 }
 
 /// What `DocParser` keeps of a node's `#[doc]` attributes that its lints read.
@@ -210,7 +219,7 @@ impl Parser<'_, '_, '_> {
 
     /// `DocParser`'s `accept_single_doc_attr`.
     fn attr(&mut self, attr: &Attr) {
-        if attr.is_doc_comment() || !attr.is("doc") {
+        if !is_doc(attr) {
             return;
         }
         match attr.args() {

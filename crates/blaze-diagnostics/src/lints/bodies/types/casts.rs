@@ -20,8 +20,9 @@ mod static_mut_refs;
 
 use hir::InFile;
 use hir_def::hir::ExprId;
-use syntax::{AstNode, SyntaxKind, ast};
+use syntax::{AstNode, ast};
 
+use super::util::{from_expansion, span as expr_span};
 use crate::{
     lints::bodies::BodyCx,
     model::{MacroKind, Span},
@@ -37,25 +38,6 @@ pub(super) fn passes() -> Vec<Box<dyn crate::lints::bodies::LatePass>> {
     ]
 }
 
-/// rustc's span of the HIR expression `expr`: where it is written, with the parentheses written
-/// around it (rustc's lowering gives what parentheses hold their span). Parentheses a macro put
-/// around an expression it was handed are not written, and are left out.
-fn expr_span(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
-    let node = b.expr_node(expr)?;
-    let mut span = b.cx.span_of(node);
-    let InFile { file_id, value } = b.cx.syntax(node);
-    let mut at = value;
-    while let Some(parent) = at.parent().filter(|it| it.kind() == SyntaxKind::PAREN_EXPR) {
-        let outer = b.cx.span(InFile::new(file_id, parent.text_range()));
-        if !b.cx.snippet(&outer).is_some_and(|it| it.starts_with('(') && it.ends_with(')')) {
-            break;
-        }
-        span = outer;
-        at = parent;
-    }
-    Some(span)
-}
-
 /// rustc's span of the type of the cast `cast` (`ExprKind::Cast`'s `hir::Ty`), its parentheses
 /// left out as rustc's lowering leaves them.
 fn cast_ty_span(b: &BodyCx<'_, '_>, cast: ExprId) -> Option<Span> {
@@ -66,11 +48,6 @@ fn cast_ty_span(b: &BodyCx<'_, '_>, cast: ExprId) -> Option<Span> {
         ty = it.ty()?;
     }
     Some(b.cx.span(InFile::new(file_id, ty.syntax().text_range())))
-}
-
-/// rustc's `Span::from_expansion`.
-fn from_expansion(span: &Span) -> bool {
-    span.expansion.is_some()
 }
 
 /// rustc's `Span::can_be_used_for_suggestions`: not in a macro's expansion, or in a derive's

@@ -11,7 +11,9 @@
 //! one reads values onto a flat tape of 12-byte [`Node`]s whose scalars are spans of the
 //! text, copied only when unescaped or wrapped across lines. A list is decoded only when its
 //! targets select it, and each name is hashed once into an open-addressing set ([`Seen`])
-//! before its one allocation.
+//! and, when new, appended to the file's one [`Names`] arena, sized before the first name.
+
+#![forbid(unsafe_code)]
 
 use std::hash::BuildHasher as _;
 use std::ops::Range;
@@ -19,7 +21,7 @@ use std::ops::Range;
 use blaze_codegen::Arch;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-use crate::model::{Shared, SharedSymbol, SymbolKind};
+use crate::model::{Names, Shared, SharedSymbol, SymbolKind};
 
 /// A text-based stub (`.tbd`, as the macOS SDK ships `libSystem.tbd`) for `arch` on
 /// `platform` (`LC_BUILD_VERSION`'s number: 1 macOS, 2 iOS, 3 tvOS, 4 watchOS, 6 Mac
@@ -67,9 +69,12 @@ fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, Strin
     let mut seen = FxHashSet::default();
     seen.insert(view.str(docs[0].install_name));
     stream.fold(0, arch, platform, &mut seen, &mut plan)?;
+    let Exports { symbols, names, .. } = decode(view, &plan)?;
     Ok(Shared {
         name: view.str(docs[0].install_name).to_owned(),
-        symbols: decode(view, &plan),
+        symbols,
+        names,
+        versions: Vec::new(),
         more: Vec::new(),
         inputs: plan.inputs.iter().map(|it| (*it).to_owned()).collect(),
     })
@@ -86,11 +91,13 @@ struct Stream<'s, 'd> {
 }
 
 /// The lists to decode, in the order their names are added, how many names they give at
-/// most, and the re-exported libraries that are not documents of the file.
+/// most and how many bytes those take at most, and the re-exported libraries that are not
+/// documents of the file.
 #[derive(Default)]
 struct Plan<'s> {
     lists: Vec<List>,
     names: usize,
+    bytes: usize,
     inputs: Vec<&'s str>,
 }
 
@@ -252,11 +259,17 @@ impl<'s> Stream<'s, '_> {
                 other => return Err(self.unknown(doc, list, other)),
             };
             let names = view.scalars(value, key)?;
-            plan.names += names.len()
-                * match what {
-                    What::Symbols { .. } => 1,
-                    What::Objc { prefixes, .. } => prefixes.len(),
-                };
+            let text: usize = names.clone().map(|it| view.str(it).len()).sum();
+            match what {
+                What::Symbols { .. } => {
+                    plan.names += names.len();
+                    plan.bytes += text + names.len();
+                }
+                What::Objc { prefixes, .. } => {
+                    plan.names += names.len() * prefixes.len();
+                    plan.bytes += prefixes.iter().map(|it| it.len() * names.len() + text).sum::<usize>();
+                }
+            }
             plan.lists.push(List { what, names });
         }
         Ok(())
@@ -315,10 +328,12 @@ impl<'s> Stream<'s, '_> {
 
 /// The planned lists' names, decoded in order: each one's core name (`_x` is `x`, a name
 /// without `_` gets `\x01`, as `super::core_name` makes them) borrowed from the text or built
-/// in one reused buffer, hashed once, and allocated only when new.
-fn decode(view: View<'_>, plan: &Plan<'_>) -> Vec<SharedSymbol> {
+/// in one reused buffer, hashed once, and appended to the arena only when new. The symbols,
+/// the arena and the set are each sized once from the plan, so nothing grows per name.
+fn decode(view: View<'_>, plan: &Plan<'_>) -> Result<Exports, String> {
     let mut out = Exports {
         symbols: Vec::with_capacity(plan.names),
+        names: Names::with_capacity(plan.bytes),
         seen: Seen::with_capacity(plan.names),
     };
     let mut key = String::new();
@@ -327,12 +342,12 @@ fn decode(view: View<'_>, plan: &Plan<'_>) -> Vec<SharedSymbol> {
             let name = view.str(node);
             match list.what {
                 What::Symbols { kind, weak } => match name.strip_prefix('_') {
-                    Some(rest) => out.add(rest, kind, weak),
+                    Some(rest) => out.add(rest, kind, weak)?,
                     None => {
                         key.clear();
                         key.push('\x01');
                         key.push_str(name);
-                        out.add(&key, kind, weak);
+                        out.add(&key, kind, weak)?;
                     }
                 },
                 What::Objc { prefixes, strip } => {
@@ -341,32 +356,36 @@ fn decode(view: View<'_>, plan: &Plan<'_>) -> Vec<SharedSymbol> {
                         key.clear();
                         key.push_str(prefix);
                         key.push_str(name);
-                        out.add(&key, SymbolKind::Other, false);
+                        out.add(&key, SymbolKind::Other, false)?;
                     }
                 }
             }
         }
     }
-    out.symbols
+    Ok(out)
 }
 
-/// The exports so far, each name once.
+/// The exports so far, each name once: 16 bytes of [`SharedSymbol`] and the name's bytes in
+/// `names` per export, 8 to 16 bytes of `seen` per planned name.
 struct Exports {
     symbols: Vec<SharedSymbol>,
+    names: Names,
     seen: Seen,
 }
 
 impl Exports {
-    fn add(&mut self, name: &str, kind: SymbolKind, weak: bool) {
-        if self.seen.insert(&self.symbols, name) {
-            self.symbols.push(SharedSymbol { name: name.to_owned(), version: None, kind, weak });
+    fn add(&mut self, name: &str, kind: SymbolKind, weak: bool) -> Result<(), String> {
+        if self.seen.insert(&self.symbols, &self.names, name) {
+            let name = self.names.push(name)?;
+            self.symbols.push(SharedSymbol { name, version: None, kind, weak });
         }
+        Ok(())
     }
 }
 
 /// The names of `symbols`, by open addressing: a slot (4 bytes) is an index into `symbols`
 /// or [`EMPTY`], at most half the slots are full, so a lookup hashes once and probes about
-/// 1.5 slots.
+/// 1.5 slots, comparing against the name's bytes in the arena in place.
 struct Seen {
     slots: Vec<u32>,
     mask: usize,
@@ -380,11 +399,11 @@ impl Seen {
         Seen { slots: vec![EMPTY; len], mask: len - 1 }
     }
 
-    /// Whether `name` is not among `symbols`; when it is not, it is recorded as the symbol
-    /// the caller pushes next.
-    fn insert(&mut self, symbols: &[SharedSymbol], name: &str) -> bool {
+    /// Whether `name` is not among `symbols` (named in `names`); when it is not, it is
+    /// recorded as the symbol the caller pushes next.
+    fn insert(&mut self, symbols: &[SharedSymbol], names: &Names, name: &str) -> bool {
         if symbols.len() * 2 >= self.slots.len() {
-            self.grow(symbols);
+            self.grow(symbols, names);
         }
         let mut at = FxBuildHasher.hash_one(name) as usize & self.mask;
         loop {
@@ -393,19 +412,19 @@ impl Seen {
                     self.slots[at] = symbols.len() as u32;
                     return true;
                 }
-                index if symbols[index as usize].name == name => return false,
+                index if names.at(symbols[index as usize].name) == name => return false,
                 _ => at = (at + 1) & self.mask,
             }
         }
     }
 
-    fn grow(&mut self, symbols: &[SharedSymbol]) {
+    fn grow(&mut self, symbols: &[SharedSymbol], names: &Names) {
         let len = self.slots.len() * 2;
         self.slots.clear();
         self.slots.resize(len, EMPTY);
         self.mask = len - 1;
         for (index, symbol) in symbols.iter().enumerate() {
-            let mut at = FxBuildHasher.hash_one(symbol.name.as_str()) as usize & self.mask;
+            let mut at = FxBuildHasher.hash_one(names.at(symbol.name)) as usize & self.mask;
             while self.slots[at] != EMPTY {
                 at = (at + 1) & self.mask;
             }
@@ -1611,12 +1630,35 @@ impl Flow<'_> {
 mod tests {
     use super::*;
 
-    fn sym(name: &str, kind: SymbolKind, weak: bool) -> SharedSymbol {
-        SharedSymbol { name: name.to_owned(), version: None, kind, weak }
+    /// A symbol as the reader held it before names moved into the arena: the form the
+    /// reference model gives and the tests compare in.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub(super) struct Owned {
+        pub name: String,
+        pub version: Option<String>,
+        pub kind: SymbolKind,
+        pub weak: bool,
+    }
+
+    fn sym(name: &str, kind: SymbolKind, weak: bool) -> Owned {
+        Owned { name: name.to_owned(), version: None, kind, weak }
+    }
+
+    fn owned(shared: &Shared) -> Vec<Owned> {
+        shared
+            .symbols
+            .iter()
+            .map(|it| Owned {
+                name: shared.symbol_name(it).to_owned(),
+                version: shared.version(it).map(str::to_owned),
+                kind: it.kind,
+                weak: it.weak,
+            })
+            .collect()
     }
 
     fn names(shared: &Shared) -> Vec<&str> {
-        shared.symbols.iter().map(|it| it.name.as_str()).collect()
+        shared.symbols.iter().map(|it| shared.symbol_name(it)).collect()
     }
 
     const V4: &str = "\
@@ -1666,7 +1708,7 @@ exports:
         let shared = read("libfoo.tbd", V4, Arch::Aarch64, 1).unwrap();
         assert_eq!(shared.name, "/usr/lib/libfoo.dylib");
         assert_eq!(
-            shared.symbols,
+            owned(&shared),
             vec![
                 sym("foo", SymbolKind::Other, false),
                 sym("quoted$name", SymbolKind::Other, false),
@@ -1763,7 +1805,7 @@ exports:
         let shared = read("libv3.tbd", V3, Arch::Aarch64, 1).unwrap();
         assert_eq!(shared.name, "/usr/lib/libv3.dylib");
         assert_eq!(
-            shared.symbols,
+            owned(&shared),
             vec![
                 sym("common", SymbolKind::Other, false),
                 sym("doubleA", SymbolKind::Other, false),
@@ -1943,9 +1985,13 @@ e:
     fn same(text: &str) {
         for arch in [Arch::Aarch64, Arch::X86_64] {
             for platform in [1, 2, 6] {
-                let new = read("t.tbd", text, arch, platform).map(|it| (it.name, it.symbols, it.inputs));
+                let new = read("t.tbd", text, arch, platform);
+                if let Ok(shared) = &new {
+                    arena_is_exact(shared);
+                }
+                let new = new.map(|it| (owned(&it), it.name, it.inputs));
                 let old =
-                    reference::read("t.tbd", text, arch, platform).map(|it| (it.name, it.symbols, it.inputs));
+                    reference::read("t.tbd", text, arch, platform).map(|it| (it.symbols, it.name, it.inputs));
                 assert_eq!(new, old, "{arch:?} platform {platform}:\n{text}");
             }
         }
@@ -2076,14 +2122,28 @@ e:
     }
 
     fn names_for(rng: &mut Rng) -> Vec<String> {
-        (0..rng.below(6)).map(|_| render(rng, NAMES[rng.below(NAMES.len())])).collect()
+        (0..rng.below(6))
+            .map(|_| {
+                let name = NAMES[rng.below(NAMES.len())];
+                render(rng, name)
+            })
+            .collect()
+    }
+
+    fn libraries_for(rng: &mut Rng, most: usize, count: usize) -> Vec<String> {
+        (0..1 + rng.below(most))
+            .map(|_| {
+                let name = library(rng.below(count + 1));
+                render(rng, &name)
+            })
+            .collect()
     }
 
     fn doc_v4(rng: &mut Rng, out: &mut String, nl: &str, index: usize, count: usize) {
         let targets = rng.subset(&TARGETS);
-        let plain = |items: &[&str]| items.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>();
+        let plain: Vec<String> = targets.iter().map(|it| (*it).to_owned()).collect();
         out.push_str(&format!("--- !tapi-tbd{nl}tbd-version:     4{nl}"));
-        list(rng, out, nl, 0, "targets", &plain(&targets));
+        list(rng, out, nl, 0, "targets", &plain);
         if rng.one_in(3) {
             out.push_str(&format!("# a comment{nl}{nl}"));
         }
@@ -2100,8 +2160,7 @@ e:
         if rng.one_in(2) {
             out.push_str(&format!("reexported-libraries:{nl}"));
             out.push_str(&format!("  - targets:         [ {} ]{nl}", rng.subset(&targets).join(", ")));
-            let libraries: Vec<String> =
-                (0..1 + rng.below(3)).map(|_| render(rng, &library(rng.below(count + 1)))).collect();
+            let libraries = libraries_for(rng, 3, count);
             list(rng, out, nl, 4, "libraries", &libraries);
         }
         for key in ["exports", "reexports"] {
@@ -2140,8 +2199,7 @@ e:
         for _ in 0..1 + rng.below(3) {
             out.push_str(&format!("  - archs:           [ {} ]{nl}", rng.subset(&archs).join(", ")));
             if rng.one_in(2) {
-                let libraries: Vec<String> =
-                    (0..1 + rng.below(2)).map(|_| render(rng, &library(rng.below(count + 1)))).collect();
+                let libraries = libraries_for(rng, 2, count);
                 list(rng, out, nl, 4, "re-exports", &libraries);
             }
             for list_key in
@@ -2180,7 +2238,8 @@ e:
                 let boundaries: Vec<usize> = (0..=out.len()).filter(|&it| out.is_char_boundary(it)).collect();
                 let at = boundaries[rng.below(boundaries.len())];
                 if rng.one_in(2) {
-                    let byte = b"[]{}'\",:#- \n\tx"[rng.below(15)];
+                    const BYTES: &[u8] = b"[]{}'\",:#- \n\tx";
+                    let byte = BYTES[rng.below(BYTES.len())];
                     out.insert(at, char::from(byte));
                 } else if at < out.len() {
                     out.remove(at);
@@ -2234,20 +2293,80 @@ e:
 
     #[test]
     fn seen_grows_and_dedups() {
-        let mut symbols: Vec<SharedSymbol> = Vec::new();
-        let mut seen = Seen::with_capacity(0);
+        let mut out = Exports { symbols: Vec::new(), names: Names::default(), seen: Seen::with_capacity(0) };
         for round in 0..2 {
             for index in 0..5000 {
                 let name = format!("name{index}");
-                let new = seen.insert(&symbols, &name);
-                assert_eq!(new, round == 0, "{name}");
-                if new {
-                    symbols.push(sym(&name, SymbolKind::Other, false));
-                }
+                let before = out.symbols.len();
+                out.add(&name, SymbolKind::Other, false).unwrap();
+                assert_eq!(out.symbols.len() > before, round == 0, "{name}");
             }
         }
-        assert_eq!(symbols.len(), 5000);
-        assert!(symbols.len() * 2 < seen.slots.len());
+        assert_eq!(out.symbols.len(), 5000);
+        assert!(out.symbols.len() * 2 < out.seen.slots.len());
+        for (index, symbol) in out.symbols.iter().enumerate() {
+            assert_eq!(out.names.at(symbol.name), format!("name{index}"));
+        }
+    }
+
+    /// Every name of a read library is one [`Names::push`] of the arena, back to back in
+    /// symbol order: the arena holds each kept name's bytes once and nothing else.
+    fn arena_is_exact(shared: &Shared) {
+        let mut bytes = 0;
+        for symbol in &shared.symbols {
+            let name = shared.names.get(symbol.name).expect("a name of the arena");
+            bytes += name.len();
+            assert_eq!(symbol.version, None);
+        }
+        assert_eq!(shared.names.bytes(), bytes);
+        assert!(shared.versions.is_empty());
+    }
+
+    /// The plan's bound on the arena's bytes holds, so it is sized once and never grows.
+    #[test]
+    fn arena_sized_once() {
+        for text in [V4, V3] {
+            for (arch, platform) in [(Arch::Aarch64, 1), (Arch::X86_64, 1), (Arch::Aarch64, 2)] {
+                let Ok(shared) = read("t.tbd", text, arch, platform) else { continue };
+                arena_is_exact(&shared);
+            }
+        }
+        let mut rng = Rng(0xa7e4a);
+        for _ in 0..200 {
+            let text = generate(&mut rng);
+            let raw = documents(&text);
+            let Ok(raw) = raw else { continue };
+            let mut tape = Tape { nodes: Vec::new(), scratch: String::new() };
+            let (mut lines, mut pieces, mut targets) = (Vec::new(), Vec::new(), Vec::new());
+            let mut docs = Vec::new();
+            let mut ok = !raw.is_empty();
+            for doc in &raw {
+                match parse(&text, doc, &mut tape, &mut lines, &mut pieces)
+                    .and_then(|root| Doc::new(&tape.view(&text), doc, root, &mut targets))
+                {
+                    Ok(it) => docs.push(it),
+                    Err(_) => ok = false,
+                }
+            }
+            if !ok {
+                continue;
+            }
+            let view = tape.view(&text);
+            let mut by_name = FxHashMap::default();
+            for (at, doc) in docs.iter().enumerate() {
+                by_name.entry(view.str(doc.install_name)).or_insert(at);
+            }
+            let stream = Stream { view, docs: &docs, targets: &targets, by_name };
+            let mut plan = Plan::default();
+            let mut seen = FxHashSet::default();
+            seen.insert(view.str(docs[0].install_name));
+            if stream.fold(0, Arch::Aarch64, 1, &mut seen, &mut plan).is_err() {
+                continue;
+            }
+            let out = decode(view, &plan).unwrap();
+            assert!(out.symbols.len() <= plan.names);
+            assert!(out.names.bytes() <= plan.bytes, "{} > {}: {text}", out.names.bytes(), plan.bytes);
+        }
     }
 
     fn noise(rng: &mut Rng, len: usize) -> Vec<u8> {
@@ -2306,7 +2425,7 @@ e:
         for arch in [Arch::Aarch64, Arch::X86_64] {
             let shared = read(&path, &text, arch, 1).unwrap();
             assert_eq!(shared.name, "/usr/lib/libSystem.B.dylib");
-            let names: FxHashSet<&str> = shared.symbols.iter().map(|it| it.name.as_str()).collect();
+            let names: FxHashSet<&str> = names(&shared).into_iter().collect();
             for name in ["malloc", "printf", "pthread_create", "_tlv_bootstrap", binder.as_str()] {
                 assert!(names.contains(name), "{arch:?}: no `{name:?}` in {path}");
             }
@@ -2321,13 +2440,21 @@ e:
         use rustc_hash::FxHashSet;
 
         use super::super::{PLATFORMS, arch_name, arch_rank, platform_name, v3_platforms};
-        use crate::model::{Shared, SharedSymbol, SymbolKind};
+        use super::Owned;
+        use crate::model::SymbolKind;
 
-        pub(super) fn read(name: &str, text: &str, arch: Arch, platform: u32) -> Result<Shared, String> {
+        /// A library as the reference reads it: every name its own `String`.
+        pub(super) struct Library {
+            pub name: String,
+            pub symbols: Vec<Owned>,
+            pub inputs: Vec<String>,
+        }
+
+        pub(super) fn read(name: &str, text: &str, arch: Arch, platform: u32) -> Result<Library, String> {
             read_documents(text, arch, platform).map_err(|what| format!("{name}: {what}"))
         }
 
-        fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Shared, String> {
+        fn read_documents(text: &str, arch: Arch, platform: u32) -> Result<Library, String> {
             if matches!(arch, Arch::Wasm32) {
                 return Err("a `.tbd` describes a Mach-O library; this output is wasm32".to_owned());
             }
@@ -2346,7 +2473,7 @@ e:
             let mut seen = FxHashSet::default();
             seen.insert(docs[0].install_name.clone());
             fold(&docs, 0, arch, platform, &mut seen, &mut out)?;
-            Ok(Shared { name: docs[0].install_name.clone(), symbols: out.symbols, more: Vec::new(), inputs: out.inputs })
+            Ok(Library { name: docs[0].install_name.clone(), symbols: out.symbols, inputs: out.inputs })
         }
 
         fn fold(
@@ -2374,7 +2501,7 @@ e:
 
         #[derive(Default)]
         struct Exports {
-            symbols: Vec<SharedSymbol>,
+            symbols: Vec<Owned>,
             names: FxHashSet<String>,
             inputs: Vec<String>,
         }
@@ -2383,7 +2510,7 @@ e:
             fn add(&mut self, raw: &str, kind: SymbolKind, weak: bool) -> Result<(), String> {
                 let name = crate::macho::core_name(raw.as_bytes())?;
                 if self.names.insert(name.clone()) {
-                    self.symbols.push(SharedSymbol { name, version: None, kind, weak });
+                    self.symbols.push(Owned { name, version: None, kind, weak });
                 }
                 Ok(())
             }

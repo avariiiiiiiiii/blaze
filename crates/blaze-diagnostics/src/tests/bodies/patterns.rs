@@ -10,19 +10,21 @@ use crate::{
     emit::{Style, written},
     lower::mutable_ref_binding::BUILT_ON,
     model::Diag,
-    tests::{checked_with, normalized, ui},
+    tests::{Mode, checked_with, compiletest, normalized, ui},
 };
 
 /// [`ui`] of a fixture of several files or crates, or with minicore: each file named
-/// `$DIR/<path>`, its stderr under `-Z ui-testing`.
+/// `$DIR/<path>`, run as compiletest runs a test that is not `//@ run-pass` (none here is, in
+/// the revisions taken).
 fn ui_fixture(fixture: &str) -> String {
-    let stderr = checked_with(fixture, "$DIR/", &Options::default()).stderr_with(ui_testing());
+    let stderr = checked_with(fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()))
+        .stderr_with(ui_testing());
     built_on(&normalized(&stderr))
 }
 
 /// [`ui_fixture`] with only the diagnostics `keep` takes, without the closing ones.
 fn ui_only(fixture: &str, keep: impl Fn(&Diag) -> bool) -> String {
-    let checked = checked_with(fixture, "$DIR/", &Options::default());
+    let checked = checked_with(fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     let mut sources = checked.sources();
     let stderr: String = checked
         .diags

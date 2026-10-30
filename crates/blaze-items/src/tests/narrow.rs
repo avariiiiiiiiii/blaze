@@ -7,15 +7,19 @@ use either::Either;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, FunctionId, GenericDefId, ImplId, ModuleDefId, StructId,
     TraitId,
-    nameres::crate_def_map,
+    expr_store::Body,
+    nameres::{DefMap, crate_def_map},
     signatures::{FunctionSignature, StructSignature, TraitSignature},
 };
+use hir_expand::name::Name;
 use hir_ty::{
     InferenceResult, ParamEnvAndCrate, check_orphan_rules,
     db::HirDatabase,
     drop::destructor,
     layout::layout_of_adt_query,
-    method_resolution::{InherentImpls, TraitImpls},
+    method_resolution::{
+        ImplWork, InherentImpls, TraitImpls, TraitValueItems, impl_work, trait_value_item,
+    },
     next_solver::{DbInterner, GenericArgs, SimplifiedType},
     traits::{implements_trait_unique, implements_traits_unique, is_inherent_impl_coherent},
 };
@@ -445,4 +449,208 @@ fn implements_traits_unique_answers_as_one_at_a_time() {
             }
         });
     }
+}
+
+const DEP_BODIES: &str = r#"
+//- proc_macros: mirror
+//- /main.rs crate:main deps:dep
+//- /dep.rs crate:dep library
+macro_rules! quiet { ($($t:tt)*) => {}; }
+macro_rules! mirror { ($($t:tt)*) => {}; }
+pub fn plain() { let _ = 1; }
+pub fn calls_inert() { quiet!(x); }
+pub fn allowed() { #[allow(unused)] let x = 1; }
+pub fn calls_proc_macro() { mirror!(struct S;); }
+pub fn derives() { #[derive(Clone)] struct X; }
+"#;
+
+fn crate_named(db: &TestDB, name: &str) -> Crate {
+    *all_crates(db)
+        .iter()
+        .find(|it| {
+            let display = &it.extra_data(db).display_name;
+            display.as_ref().is_some_and(|it| it.crate_name().as_str() == name)
+        })
+        .unwrap_or_else(|| panic!("no crate `{name}`"))
+}
+
+/// The functions of `krate` whose bodies are lowered to find impls in them.
+fn holders(db: &TestDB, krate: Crate) -> Vec<String> {
+    hir_ty::attach_db(db, || {
+        impl_work(db, krate)
+            .into_iter()
+            .filter_map(|it| match it {
+                ImplWork::Holder(DefWithBodyId::FunctionId(it)) => {
+                    Some(FunctionSignature::of(db, it).name.as_str().to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    })
+}
+
+/// A dependency's function holds an impl rustc sees when a procedural macro is called in it
+/// (`mirror!`, though a `macro_rules!` of the name writes none) or an item in it has a
+/// `#[derive]`, with no `impl` in its text. A call of a macro proven to write none, or an
+/// inert attribute, leaves the body unlowered.
+#[test]
+fn a_dependency_body_with_a_proc_macro_call_or_a_derive_holds_impls() {
+    let (db, _) = TestDB::with_many_files(DEP_BODIES);
+    let held = holders(&db, crate_named(&db, "dep"));
+    for holder in ["calls_proc_macro", "derives"] {
+        assert!(held.iter().any(|it| it == holder), "{holder}: {held:?}");
+    }
+    for inert in ["plain", "calls_inert", "allowed"] {
+        assert!(!held.iter().any(|it| it == inert), "{inert}: {held:?}");
+    }
+}
+
+const LOCAL_BODIES: &str = r#"
+//- /main.rs crate:main
+pub trait Tr {}
+macro_rules! quiet { ($($t:tt)*) => {}; }
+macro_rules! writes { ($t:ident) => { impl Tr for $t {} }; }
+fn plain() { let _ = 1; }
+fn calls_inert() { quiet!(x); }
+fn allowed() { #[allow(unused)] let x = 1; }
+fn holds() { struct A; impl Tr for A {} }
+fn calls_writer() { struct B; writes!(B); }
+fn derives() { #[derive(Clone)] struct C; }
+fn calls_unknown() { unknown!(struct D;); }
+fn bracketed() -> [u8; { 4 }] { struct E; impl Tr for E {} [0; 4] }
+pub struct Wrap<const N: usize>;
+fn const_argument() -> Wrap<{ 4 }> { struct F; impl Tr for F {} Wrap }
+"#;
+
+/// A workspace crate's bodies are looked into as a dependency's are: a body whose text has
+/// an `impl`, a call of a macro that may write one or an attribute that is not inert holds
+/// impls, and the rest are not lowered for them. A block in the signature (`[u8; { 4 }]`,
+/// `Wrap<{ 4 }>`) is not taken for the body. Every impl in a body is still found.
+#[test]
+fn a_local_body_is_lowered_for_impls_only_when_it_may_hold_one() {
+    let (db, _) = TestDB::with_many_files(LOCAL_BODIES);
+    let main = crate_named(&db, "main");
+    let held = holders(&db, main);
+    let holding =
+        ["holds", "calls_writer", "derives", "calls_unknown", "bracketed", "const_argument"];
+    for holder in holding {
+        assert!(held.iter().any(|it| it == holder), "{holder}: {held:?}");
+    }
+    for inert in ["plain", "calls_inert", "allowed"] {
+        assert!(!held.iter().any(|it| it == inert), "{inert}: {held:?}");
+    }
+    let tr = crate_def_map(&db, main)
+        .modules(&db)
+        .flat_map(|(_, module)| module.scope(&db).declarations().collect::<Vec<_>>())
+        .find_map(|def| match def {
+            ModuleDefId::TraitId(it) => Some(it),
+            _ => None,
+        })
+        .expect("trait `Tr`");
+    let found = hir_ty::attach_db(&db, || TraitImpls::in_crate_for_trait(&db, main, tr).len());
+    // `A`, `B` (through `writes!`), `E` and `F`.
+    assert_eq!(found, 4);
+}
+
+const TRAIT_ITEMS: &str = r#"
+//- /main.rs crate:main deps:dep,other
+mod inner;
+pub trait Shared { fn a(&self); fn b(&self) {} const C: u8; type T; }
+pub trait Twice { fn a(&self); fn x(&self); fn a(&self, _: u8); }
+macro_rules! make { ($n:ident) => { pub trait $n { fn a(&self); fn made(&self); } }; }
+make!(Made);
+fn blocky() {
+    trait Local { fn a(&self); fn local(&self); }
+    { trait Nested { fn b(&self); const C: u8; } }
+}
+//- /inner.rs
+pub trait InModule { fn b(&self); fn c(&self); }
+//- /dep.rs crate:dep library
+pub trait Shared { fn a(&self); fn z(&self); }
+pub trait Other { const A: u8; }
+//- /other.rs crate:other library
+pub trait Empty {}
+pub trait OnlyTypes { type a; }
+"#;
+
+/// The traits of `def_map`'s modules and of the blocks in its functions' bodies.
+fn traits_in(db: &TestDB, def_map: &DefMap, traits: &mut Vec<TraitId>) {
+    for (_, module) in def_map.modules(db) {
+        for def in module.scope(db).declarations() {
+            match def {
+                ModuleDefId::TraitId(it) => traits.push(it),
+                ModuleDefId::FunctionId(it) => {
+                    for (_, block) in Body::of(db, DefWithBodyId::from(it)).blocks(db) {
+                        traits_in(db, block, traits);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The per-crate name index gives each trait, in crates and in blocks, the item
+/// `trait_value_item` gives it alone, for every name its items have and one they don't, with
+/// one index asked of every trait in turn as a probe asks.
+#[test]
+fn the_trait_name_index_answers_as_each_trait_alone() {
+    let (db, _) = TestDB::with_many_files(TRAIT_ITEMS);
+    hir_ty::attach_db(&db, || {
+        let mut traits = Vec::new();
+        for name in ["main", "dep", "other"] {
+            traits_in(&db, crate_def_map(&db, crate_named(&db, name)), &mut traits);
+        }
+        assert_eq!(traits.len(), 10, "{traits:?}");
+        let mut names: Vec<Name> = traits
+            .iter()
+            .flat_map(|it| it.trait_items(&db).items.iter().map(|&(name, _)| name))
+            .collect();
+        names.push(Name::new_root("missing"));
+        names.sort();
+        names.dedup();
+        for name in names {
+            let mut index = TraitValueItems::default();
+            for &trait_ in traits.iter().chain(traits.iter().rev()) {
+                let alone = trait_value_item(&db, trait_, name);
+                assert_eq!(index.get(&db, trait_, name), alone, "{trait_:?} {name:?}");
+            }
+        }
+    });
+}
+
+const TRAIT_CALLER: &str = "mod a;\nuse a::Tr;\nfn caller(x: a::A) {\n    x.m();\n}\n";
+const TRAIT_DEF: &str =
+    "pub struct A;\npub trait Tr {\n    fn m(&self);\n}\nimpl Tr for A {\n    fn m(&self) {}\n}\n";
+
+fn trait_method_db() -> (TestDB, FileId, FunctionId) {
+    let (db, files) = TestDB::with_many_files(&format!(
+        "//- /main.rs crate:main\n{TRAIT_CALLER}//- /a.rs\n{TRAIT_DEF}"
+    ));
+    let trait_file = files[1].file_id(&db);
+    let caller = function_named(&db, "caller");
+    (db, trait_file, caller)
+}
+
+#[test]
+fn a_trait_method_of_another_name_leaves_the_lookup() {
+    let (mut db, trait_file, caller) = trait_method_db();
+    let cold = db.executed(|| infer(&db, caller));
+    assert!(ran(&cold, "in_crate_trait_value_items"), "{cold:#?}");
+
+    let added = TRAIT_DEF.replace("fn m(&self);", "fn m(&self);\n    fn n(&self) {}");
+    db.set_file_text(trait_file, &added);
+    let warm = db.executed(|| infer(&db, caller));
+    assert!(ran(&warm, "in_crate_trait_value_items"), "{warm:#?}");
+    assert!(!ran(&warm, "::for_body"), "{warm:#?}");
+}
+
+#[test]
+fn removing_the_trait_method_reruns_the_lookup() {
+    let (mut db, trait_file, caller) = trait_method_db();
+    infer(&db, caller);
+
+    db.set_file_text(trait_file, &TRAIT_DEF.replace("fn m(&self);", "fn k(&self);"));
+    let warm = db.executed(|| infer(&db, caller));
+    assert!(ran(&warm, "::for_body"), "{warm:#?}");
 }

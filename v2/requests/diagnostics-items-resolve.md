@@ -89,3 +89,5 @@ Why: `docs/v2/plan/design/unsafe.md`: a crate with no unsafe module forbids it. 
 no `unsafe` of its own (`rg` finds it only inside test sources, as Rust text in strings), and
 nothing in this lane needs it: the speed here comes from not running on a clean build and from
 `macro_def_error::check`'s allocation-free single pass, not from unchecked access.
+
+> forwarded to diagnostics: its own `src/lib.rs`.

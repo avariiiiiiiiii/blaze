@@ -56,7 +56,7 @@ use crate::{
     fixup::SyntaxFixupUndoInfo,
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt, span_with_mixed_site_ctxt},
     proc_macro::{CustomProcMacroExpander, ProcMacroKind, ProcMacros},
-    span_map::{ExpansionSpanMap, MacroRulesArgs, RealSpanMap, SpanMap},
+    span_map::{ExpansionSpanMap, InOrder, MacroRulesArgs, RealSpanMap, SpanMap},
 };
 
 pub use crate::{
@@ -625,12 +625,17 @@ impl MacroCallId {
                     MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => {
                         syntax_bridge::syntax_node_to_token_tree(
                             tt.syntax(),
-                            MacroRulesArgs(map),
+                            MacroRulesArgs(InOrder::new(map)),
                             span,
                             mode,
                         )
                     }
-                    _ => syntax_bridge::syntax_node_to_token_tree(tt.syntax(), map, span, mode),
+                    _ => syntax_bridge::syntax_node_to_token_tree(
+                        tt.syntax(),
+                        InOrder::new(map),
+                        span,
+                        mode,
+                    ),
                 };
                 if loc.def.is_proc_macro() {
                     // proc macros expect their inputs without parentheses, MBEs expect it with them included
@@ -1330,9 +1335,7 @@ impl<'db> ExpansionInfo<'db> {
 
     /// Maps the passed in file range down into a macro expansion if it is the input to a macro call.
     ///
-    /// Note this does a linear search through the entire backing vector of the spanmap.
-    // FIXME: Consider adding a reverse map to ExpansionInfo to get rid of the linear search which
-    // potentially results in quadratic look ups (notably this might improve semantic highlighting perf)
+    /// A binary search of the span map's index by anchor, then the run of entries in it.
     pub fn map_range_down_exact(
         &self,
         span: Span,
@@ -1351,7 +1354,7 @@ impl<'db> ExpansionInfo<'db> {
     /// Maps the passed in file range down into a macro expansion if it is the input to a macro call.
     /// Unlike [`ExpansionInfo::map_range_down_exact`], this will consider spans that contain the given span.
     ///
-    /// Note this does a linear search through the entire backing vector of the spanmap.
+    /// A binary search of the span map's index by anchor, then the run of entries in it.
     pub fn map_range_down(
         &self,
         span: Span,

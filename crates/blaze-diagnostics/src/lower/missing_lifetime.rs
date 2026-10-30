@@ -12,7 +12,7 @@
 
 use hir::{GenericDef, InFile, ModuleDef, PathResolution};
 use syntax::{
-    AstNode, SyntaxNode, TextRange, TextSize, WalkEvent,
+    AstNode, SmolStr, SyntaxNode, TextRange, TextSize, WalkEvent,
     ast::{self, HasGenericArgs as _, HasGenericParams as _, HasName as _},
 };
 
@@ -51,7 +51,7 @@ struct Missing {
 /// rustc's `ElisionFnParameter`: a parameter whose type has lifetimes.
 struct FnParam {
     index: usize,
-    ident: Option<String>,
+    ident: Option<SmolStr>,
     lifetime_count: usize,
     range: TextRange,
 }
@@ -98,7 +98,7 @@ enum At {
 struct Rib {
     kind: Binder,
     at: At,
-    lifetimes: Vec<(String, TextRange)>,
+    lifetimes: Vec<(SmolStr, TextRange)>,
 }
 
 fn rib(kind: Binder, list: Option<ast::GenericParamList>, empty_at: TextSize) -> Rib {
@@ -113,7 +113,7 @@ fn rib(kind: Binder, list: Option<ast::GenericParamList>, empty_at: TextSize) ->
         .lifetime_params()
         .filter_map(|param| {
             let lifetime = param.lifetime()?;
-            Some((lifetime.text().to_string(), lifetime.syntax().text_range()))
+            Some((SmolStr::new(lifetime.text()), lifetime.syntax().text_range()))
         })
         .collect();
     Rib { kind, at, lifetimes }
@@ -236,9 +236,13 @@ fn return_of(node: &SyntaxNode) -> Option<Sig> {
 /// candidates of a parameter, or the elision failures of a return type.
 #[derive(Default)]
 struct Lifetimes {
-    named: Vec<String>,
+    /// Distinct names; a lifetime's name fits `SmolStr`'s inline buffer, so no heap.
+    named: Vec<SmolStr>,
     fresh: usize,
     missing: Vec<Missing>,
+    /// When set, the walk stops once a missing site with this range is recorded.
+    until: Option<TextRange>,
+    reached: bool,
 }
 
 impl Lifetimes {
@@ -247,7 +251,7 @@ impl Lifetimes {
     }
 
     fn lifetime(&mut self, lifetime: &ast::Lifetime) {
-        let text = lifetime.text().to_string();
+        let text = lifetime.text();
         if text == "'_" {
             self.fresh += 1;
             self.missing.push(Missing {
@@ -256,8 +260,8 @@ impl Lifetimes {
                 count: 1,
                 empty_brackets: false,
             });
-        } else if !self.named.contains(&text) {
-            self.named.push(text);
+        } else if !self.named.iter().any(|it| it == text) {
+            self.named.push(SmolStr::new(text));
         }
     }
 }
@@ -314,6 +318,10 @@ fn path_missing(cx: &Cx<'_, '_>, path: &ast::Path) -> Option<Missing> {
 fn walk(cx: &Cx<'_, '_>, node: &SyntaxNode, into: &mut Lifetimes) {
     let mut preorder = node.preorder();
     while let Some(event) = preorder.next() {
+        if into.until.is_some_and(|until| into.missing.last().is_some_and(|it| it.range == until)) {
+            into.reached = true;
+            return;
+        }
         let WalkEvent::Enter(node) = event else { continue };
         let kind = node.kind();
         if ast::FnPtrType::can_cast(kind)
@@ -368,7 +376,7 @@ fn walk(cx: &Cx<'_, '_>, node: &SyntaxNode, into: &mut Lifetimes) {
 /// The parameters of `sig` with lifetimes in their types, and the lifetimes they leave out:
 /// rustc's `resolve_fn_params` when elision fails.
 fn fn_params(cx: &Cx<'_, '_>, sig: &Sig) -> (Vec<Missing>, Vec<FnParam>) {
-    let mut inputs: Vec<(Option<String>, SyntaxNode, TextRange)> = Vec::new();
+    let mut inputs: Vec<(Option<SmolStr>, SyntaxNode, TextRange)> = Vec::new();
     let mut self_param = None;
     let params = match sig {
         Sig::Fn(it) => it.param_list(),
@@ -389,7 +397,7 @@ fn fn_params(cx: &Cx<'_, '_>, sig: &Sig) -> (Vec<Missing>, Vec<FnParam>) {
         for param in list.params() {
             let Some(ty) = param.ty() else { continue };
             let ident = match param.pat() {
-                Some(ast::Pat::IdentPat(pat)) => pat.name().map(|it| it.text().to_string()),
+                Some(ast::Pat::IdentPat(pat)) => pat.name().map(|it| SmolStr::new(it.text())),
                 _ => None,
             };
             inputs.push((ident, ty.syntax().clone(), ty.syntax().text_range()));
@@ -425,7 +433,7 @@ fn fn_params(cx: &Cx<'_, '_>, sig: &Sig) -> (Vec<Missing>, Vec<FnParam>) {
         if lifetimes.count() != 0 {
             out.push(FnParam {
                 index,
-                ident: Some("self".to_owned()),
+                ident: Some(SmolStr::new_static("self")),
                 lifetime_count: lifetimes.count(),
                 range,
             });
@@ -497,6 +505,20 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
     let sig = return_of(&seg.node);
     let (refs, params) = match &sig {
         Some(sig) => {
+            // Each site of the group has its own hir diagnostic: the walk up to this one's
+            // site says whether a path came before it, without resolving the rest.
+            if let Some(ret) = ret_type(sig) {
+                let mut upto = Lifetimes { until: Some(this.range), ..Lifetimes::default() };
+                walk(cx, ret.syntax(), &mut upto);
+                let reached = upto.reached
+                    || upto.missing.last().is_some_and(|it| it.range == this.range);
+                let earlier_path = upto.missing[..upto.missing.len().saturating_sub(1)]
+                    .iter()
+                    .any(|it| matches!(it.kind, Kind::Comma | Kind::Brackets));
+                if reached && earlier_path {
+                    return Vec::new();
+                }
+            }
             let mut refs = Lifetimes::default();
             if let Some(ret) = ret_type(sig) {
                 walk(cx, ret.syntax(), &mut refs);
@@ -531,7 +553,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
     }
 
     let ribs = ribs(&seg.node);
-    let mut in_scope: Vec<(String, Option<TextRange>)> = Vec::new();
+    let mut in_scope: Vec<(SmolStr, Option<TextRange>)> = Vec::new();
     for rib in &ribs {
         for (name, range) in &rib.lifetimes {
             if name != "'_" {
@@ -574,7 +596,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingLifetime) -> Vec<Found> {
             });
             if in_scope.is_empty() {
                 maybe_static = true;
-                in_scope.push(("'static".to_owned(), None));
+                in_scope.push((SmolStr::new_static("'static"), None));
             }
         } else if num_params == 1 {
             diag.help(format!(

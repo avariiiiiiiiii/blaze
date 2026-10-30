@@ -2,6 +2,8 @@
 //! by what they are, not by where an object file put them. That makes the result a function of
 //! the database alone, so it is a query, and a build stitches the results into an object.
 
+#![forbid(unsafe_code)]
+
 use std::{
     cell::RefCell,
     fmt,
@@ -158,6 +160,9 @@ pub(super) enum RelocName {
     Known(ir::KnownSymbol),
     /// The function itself, this many bytes into its code.
     Own(u32),
+    /// A name in a namespace of its own: a body built in ([`INLINED`]) until
+    /// [`inline`](super::inline) puts it there, or the body a v2 thunk calls.
+    User { namespace: u32, index: u32 },
 }
 
 /// One relocation of a function's code, as [`Relocs`] gives it.
@@ -190,6 +195,7 @@ impl Reloc {
             RelocName::LibCall(call) => ModuleRelocTarget::LibCall(call),
             RelocName::Known(symbol) => ModuleRelocTarget::KnownSymbol(symbol),
             RelocName::Own(offset) => ModuleRelocTarget::FunctionOffset(own, offset),
+            RelocName::User { namespace, index } => ModuleRelocTarget::user(namespace, index),
         };
         ModuleReloc { offset: self.offset, kind: self.kind, name, addend: self.addend }
     }
@@ -198,18 +204,18 @@ impl Reloc {
 impl RelocName {
     /// The name Cranelift's module has for `namespace` and `index`: 0 for functions, 1 for
     /// data, as [`Recorder::declare_func_in_func`] and [`Recorder::declare_data_in_func`]
-    /// declare them.
-    pub(super) fn user(namespace: u32, index: u32) -> std::result::Result<RelocName, RelocError> {
+    /// declare them; any other is [`RelocName::User`].
+    pub(super) fn user(namespace: u32, index: u32) -> RelocName {
         match namespace {
-            0 => Ok(RelocName::Func(index)),
-            1 => Ok(RelocName::Data(index)),
-            _ => Err(RelocError::Namespace(namespace)),
+            0 => RelocName::Func(index),
+            1 => RelocName::Data(index),
+            _ => RelocName::User { namespace, index },
         }
     }
 
     fn of_module(name: &ModuleRelocTarget) -> std::result::Result<RelocName, RelocError> {
         Ok(match *name {
-            ModuleRelocTarget::User { namespace, index } => RelocName::user(namespace, index)?,
+            ModuleRelocTarget::User { namespace, index } => RelocName::user(namespace, index),
             ModuleRelocTarget::LibCall(call) => RelocName::LibCall(call),
             ModuleRelocTarget::KnownSymbol(symbol) => RelocName::Known(symbol),
             ModuleRelocTarget::FunctionOffset(_, offset) => RelocName::Own(offset),
@@ -220,8 +226,6 @@ impl RelocName {
 /// Why a relocation can't be kept as a [`Relocs`] row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum RelocError {
-    /// A name in a namespace that is neither functions' (0) nor data's (1).
-    Namespace(u32),
     /// An ELF type above 16 bits, which no relocation of x86-64 or AArch64 has.
     ElfType(u32),
     /// An ELF type for an offset where no relocation is, in the order of the relocations.
@@ -235,7 +239,6 @@ pub(super) enum RelocError {
 impl fmt::Display for RelocError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RelocError::Namespace(it) => write!(f, "a relocation against namespace {it}"),
             RelocError::ElfType(it) => write!(f, "a relocation of ELF type {it}, above 16 bits"),
             RelocError::Unmatched(it) => {
                 write!(f, "an ELF type for offset {it}, where no relocation is")
@@ -264,6 +267,8 @@ enum NameTag {
     Known,
     /// `index` is the offset into the function.
     Own,
+    /// `index` is the name's in its namespace, which is in [`Relocs::spaces`].
+    User,
 }
 
 /// A [`Reloc`] as [`Relocs`] keeps it: 16 bytes, the size data.md budgets a relocation, and
@@ -289,18 +294,21 @@ const WIDE: i32 = i32::MIN;
 
 /// The relocations of a function's code, as columns of 16-byte rows (data.md): offset, target
 /// by its `u32` place among the function's requests, kind and a 32-bit addend, with the few
-/// addends wider than that in a side table. One `Vec` of rows a function, no name owned by a
-/// row, and a lookup is an index (a wide addend a binary search of the few there are).
+/// addends wider than that, and the namespaces of [`RelocName::User`] names, in side tables.
+/// One `Vec` of rows a function, no name owned by a row, and a lookup is an index (a wide
+/// addend or a namespace a binary search of the few there are).
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub(super) struct Relocs {
     rows: Vec<Row>,
     /// The addends rows hold [`WIDE`] for, by the row's place, in the order of the rows.
     wide: Vec<(u32, i64)>,
+    /// The namespaces of the rows of [`NameTag::User`], by the row's place, in their order.
+    spaces: Vec<(u32, u32)>,
 }
 
 impl Relocs {
     pub(super) fn with_capacity(capacity: usize) -> Relocs {
-        Relocs { rows: Vec::with_capacity(capacity), wide: Vec::new() }
+        Relocs { rows: Vec::with_capacity(capacity), wide: Vec::new(), spaces: Vec::new() }
     }
 
     /// Cranelift's relocations of `func`'s code.
@@ -313,7 +321,7 @@ impl Relocs {
             let name = match &reloc.target {
                 FinalizedRelocTarget::ExternalName(ir::ExternalName::User(name)) => {
                     let name = &func.params.user_named_funcs()[*name];
-                    RelocName::user(name.namespace, name.index)?
+                    RelocName::user(name.namespace, name.index)
                 }
                 FinalizedRelocTarget::ExternalName(ir::ExternalName::LibCall(call)) => {
                     RelocName::LibCall(*call)
@@ -369,13 +377,17 @@ impl Relocs {
                 .filter(|it| *it != 0)
                 .ok_or(RelocError::ElfType(elf))?,
         };
+        let at = self.rows.len() as u32;
         let addend = match i32::try_from(reloc.addend) {
             Ok(addend) if addend != WIDE => addend,
             _ => {
-                self.wide.push((self.rows.len() as u32, reloc.addend));
+                self.wide.push((at, reloc.addend));
                 WIDE
             }
         };
+        if let RelocName::User { namespace, .. } = reloc.name {
+            self.spaces.push((at, namespace));
+        }
         self.rows.push(Row { offset: reloc.offset, index, addend, kind: reloc.kind, name, elf });
         Ok(())
     }
@@ -394,10 +406,11 @@ impl Relocs {
                 ir::KnownSymbol::CoffTlsIndex => 1,
             }),
             RelocName::Own(offset) => (NameTag::Own, offset),
+            RelocName::User { index, .. } => (NameTag::User, index),
         })
     }
 
-    fn name(row: &Row) -> RelocName {
+    fn name(&self, at: usize, row: &Row) -> RelocName {
         match row.name {
             NameTag::Func => RelocName::Func(row.index),
             NameTag::Data => RelocName::Data(row.index),
@@ -407,6 +420,11 @@ impl Relocs {
                 _ => ir::KnownSymbol::CoffTlsIndex,
             }),
             NameTag::Own => RelocName::Own(row.index),
+            NameTag::User => {
+                let found = self.spaces.binary_search_by_key(&(at as u32), |it| it.0);
+                let namespace = self.spaces[found.expect("a namespace is kept for its row")].1;
+                RelocName::User { namespace, index: row.index }
+            }
         }
     }
 
@@ -421,7 +439,7 @@ impl Relocs {
         Reloc {
             offset: row.offset,
             kind: row.kind,
-            name: Self::name(row),
+            name: self.name(at, row),
             addend,
             elf_type: (row.elf != 0).then_some(u32::from(row.elf)),
         }
@@ -459,7 +477,7 @@ impl Relocs {
             match row.name {
                 NameTag::Func => row.index = funcs(row.index),
                 NameTag::Data => row.index = datas(row.index),
-                NameTag::LibCall | NameTag::Known | NameTag::Own => {}
+                NameTag::LibCall | NameTag::Known | NameTag::Own | NameTag::User => {}
             }
         }
     }
@@ -607,10 +625,6 @@ pub(super) struct Inlinable {
     pub(super) seen: Vec<Seen>,
     /// The instances whose bodies it has in it, as [`Recorder::built_in`].
     pub(super) built_in: Vec<Instance>,
-    /// Every data object it asks for is one object per function however often it is asked
-    /// for (a shared blob, a vtable, a static), so that a caller that builds it in at a
-    /// second call gets the very body it got at the first ([`Recorder::declare_inlined`]).
-    reusable: bool,
 }
 
 impl Inlinable {
@@ -630,21 +644,12 @@ impl Inlinable {
             }
             _ => false,
         });
-        let reusable = requests.datas.iter().all(|it| match it {
-            DataRequest::Blob { identity, .. } => *identity == DataIdentity::Shared,
-            DataRequest::Vtable { .. } | DataRequest::Static(_) => true,
-            DataRequest::Location(_)
-            | DataRequest::Declaration(_)
-            | DataRequest::FilePath(_)
-            | DataRequest::Text(_) => false,
-        });
         (requests.ordered() && !hashed_later).then_some(Inlinable {
             func,
             requests,
             pointees,
             seen,
             built_in,
-            reusable,
         })
     }
 }
@@ -767,14 +772,14 @@ struct Slot {
     at: u32,
 }
 
-/// A callee's body as [`Recorder::declare_inlined`] put it among [`Recorder::inlined`].
+/// A callee's body as [`Recorder::declare_inlined`] put it among [`Recorder::inlined`], by
+/// the instance alone: a body is built of the instance and nothing of the call (`tier::body`
+/// keys it by the instance and `track_caller`, which is the function's), and its data
+/// (locations, texts, blobs of its own) is one object per body, as rustc has one per function.
+/// Not by the body's address, which a rebuilt body may or may not get again.
 struct Reused {
     hash: u64,
     instance: Instance,
-    /// The address of what it was made of. Compared, never followed: the same instance gives
-    /// the same body wherever a function asks for it, and a body at another address is only
-    /// not reused.
-    body: usize,
     at: u32,
 }
 
@@ -925,11 +930,11 @@ impl Wants {
     /// The `asm!` blocks it calls the wrappers of that go where they are called as LLVM's
     /// inline assembly, by the places of the wrappers among the requests.
     #[cfg(feature = "llvm")]
-    pub(super) fn asm_blocks(&self) -> FxHashMap<u32, std::sync::Arc<super::asm::Inline>> {
+    pub(super) fn asm_blocks(&self) -> FxHashMap<u32, &'static super::asm::Inline> {
         let funcs = self.requests.funcs.iter().enumerate();
         funcs
             .filter_map(|(at, it)| match &it.target {
-                FuncTarget::Asm(text) => Some((at as u32, super::asm::inline_of(text)?)),
+                FuncTarget::Asm(text) => Some((at as u32, super::asm::inline_block(text)?)),
                 _ => None,
             })
             .collect()
@@ -1517,21 +1522,16 @@ impl<'db> Recorder<'db> {
                 built_in.push(it.clone());
             }
         }
-        let address = std::ptr::from_ref(body) as usize;
         let hash = FxBuildHasher.hash_one(instance);
-        let reused = self.reused.find(hash, |it| {
-            it.hash == hash && it.body == address && it.instance == *instance
-        });
+        let reused = self.reused.find(hash, |it| it.hash == hash && it.instance == *instance);
         let at = match reused {
             Some(it) => it.at,
             None => {
                 let at = self.inlined.len() as u32;
                 let callee = self.moved(body);
                 self.inlined.push(callee);
-                if body.reusable {
-                    let reused = Reused { hash, instance: instance.clone(), body: address, at };
-                    self.reused.insert_unique(hash, reused, |it| it.hash);
-                }
+                let reused = Reused { hash, instance: instance.clone(), at };
+                self.reused.insert_unique(hash, reused, |it| it.hash);
                 at
             }
         };
@@ -1662,9 +1662,13 @@ mod tests {
         let mut elf_types = Vec::new();
         for at in 0..count {
             let offset = at as u32 * 4;
-            let name = match random.below(5) {
+            let name = match random.below(6) {
                 0 => ModuleRelocTarget::user(0, random.below(40) as u32),
                 1 => ModuleRelocTarget::user(1, random.below(40) as u32),
+                5 => {
+                    let namespace = [INLINED, u32::MAX - 1, 7][random.below(3) as usize];
+                    ModuleRelocTarget::user(namespace, random.below(40) as u32)
+                }
                 2 => {
                     let all = ir::LibCall::all_libcalls();
                     ModuleRelocTarget::LibCall(all[random.below(all.len() as u64) as usize])
@@ -1760,6 +1764,7 @@ mod tests {
             let name = match was.name {
                 ModuleRelocTarget::User { namespace: 0, index } => RelocName::Func(index + 1000),
                 ModuleRelocTarget::User { namespace: 1, index } => RelocName::Data(index * 2),
+                ModuleRelocTarget::User { namespace, index } => RelocName::User { namespace, index },
                 ref other => RelocName::of_module(other).unwrap(),
             };
             assert_eq!((row.offset, row.name, row.addend), (was.offset + 16, name, was.addend));
@@ -1769,8 +1774,6 @@ mod tests {
     #[test]
     fn what_a_row_cannot_hold_is_an_error() {
         let reloc = |name| ModuleReloc { offset: 0, kind: KINDS[0], name, addend: 0 };
-        let other = reloc(ModuleRelocTarget::user(INLINED, 0));
-        assert_eq!(Relocs::of_module(&[other], &[]), Err(RelocError::Namespace(INLINED)));
         let plain = reloc(ModuleRelocTarget::user(0, 0));
         let wide = [(0, 1 << 16)];
         assert_eq!(Relocs::of_module(&[plain.clone()], &wide), Err(RelocError::ElfType(1 << 16)));

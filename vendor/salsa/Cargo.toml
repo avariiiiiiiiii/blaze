@@ -329,6 +329,10 @@ name = "interned-structs"
 path = "tests/interned-structs.rs"
 
 [[test]]
+name = "interned_lockfree"
+path = "tests/interned_lockfree.rs"
+
+[[test]]
 name = "lru"
 path = "tests/lru.rs"
 

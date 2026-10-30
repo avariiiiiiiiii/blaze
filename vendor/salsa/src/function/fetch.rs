@@ -1,5 +1,4 @@
 use crate::cycle::{CycleRecoveryStrategy, IterationStamp};
-use crate::function::eviction::EvictionPolicy;
 use crate::function::memo::Memo;
 use crate::function::sync::ClaimResult;
 use crate::function::{Configuration, IngredientImpl, Reentrancy};
@@ -30,8 +29,6 @@ where
 
         // SAFETY: We just refreshed the memo so it is guaranteed to contain a value now.
         let memo_value = unsafe { memo.value().unwrap_unchecked() };
-
-        self.eviction.record_use(id);
 
         let revisions = &memo.header.revisions;
         zalsa_local.report_tracked_read(

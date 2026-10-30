@@ -42,6 +42,8 @@ spells that body again, and with it every type it names.
 | nested bodies | `Vec::contains` per closure (quadratic) | a seen-set |
 | counted lists (generics, used locals, unreached blocks, macro tokens, switch targets) | a `Vec` collected only to know its length | the length written after, into a slot written before |
 | impl items against trait items | `FxHashSet` of used impl items | a `u64` mask (a set only past 64 items) |
+| names for `type_name` / `type_id` | a `String` per path (`key::path`) and a second `Vec` to dedup | the path's interned symbols written in place (`key::path_part`), deduped in place |
+| vtables of an allocation | probed by id up from 0 | `VTableMap::tys()` |
 
 ## Decisions
 
@@ -54,6 +56,9 @@ spells that body again, and with it every type it names.
   probe. So `Cx` keeps a 64-entry direct-mapped cache of `(Ty, &'db Code)`, 1 KiB with no
   allocation, and a hit makes no call. A `Cx` lives inside one query, so a hit skips only a
   read that query has already recorded.
+- **`Cx::ty` returns `&'db Sub`**, borrowed from the memo, so no `Box` of refs is cloned per
+  call. Its caller (`facts.rs`, `ty_hash`) passes `&sub` on to `hash::filled`, which takes
+  `&Sub`, and compiles unchanged.
 - **The cycle guard is salsa's.** `cycle_result` (FallbackImmediate in this salsa) gives every
   query in a cycle the fallback, a `"ty"` form with `Missed::ErrorType`, whichever type was
   asked first. Only programs rustc rejects have a type that contains itself (a coroutine
@@ -76,14 +81,19 @@ spells that body again, and with it every type it names.
   `successors` list).
 - `the_quiet_first_walk_finds_the_locals_a_written_one_does`: for every body, the used-locals
   set from the quiet pass against a pass that writes everything.
+- `a_path_written_in_place_is_the_path_spelled`: for every item of the fixtures,
+  `key::path_part`'s bytes against the length-prefixed `key::path` string `spell_names` wrote
+  before.
 - `debug_and_counted_lengths_write_the_old_bytes`, `slots_by_scan_are_slots_by_map` and
   `a_reused_buffer_starts_empty`: unit checks of the writer.
 
+The fixtures (`FIXTURES`) write every kind of item, each kind of generic parameter, where
+clauses and `dyn` bounds two or more at a time (the batched `of_many` path), matches, loops,
+conditional drops, closures in closures, `async` bodies, `impl Trait` and both kinds of
+declarative macro.
+
 ## What is left
 
-- `spell_names` hashes `key::path(db, id)`, which builds a `String`. That only runs for direct
-  `type_name` and `type_id` calls. A writer form of `key::path` is asked of speed-types
-  (`v2/requests/speed.md`).
 - Each `ContentId::of` derives BLAKE3's key from the domain again. One derived key per domain
   is asked of format (`v2/requests/format.md`, speed-types' request).
 - Salsa interns the `StoredTy` argument of `ty_form` under a shard lock. If `StoredTy` were a

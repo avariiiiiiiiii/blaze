@@ -14,11 +14,17 @@
 //!   [`blaze_core::Effect`]s, with group commit and recovery from a torn tail.
 //! - Watching: changes a driver reports ([`blaze_core::Done::Changed`]) become ops on the
 //!   workspace's head ([`Watcher`]).
+//!
+//! Unsafe code is only in `store` (docs/v2/plan/design/unsafe.md), whose API is safe.
+
+#![deny(unsafe_code)]
 
 mod journal;
 mod reader;
 mod rebase;
+#[allow(unsafe_code)]
 mod store;
+mod sync;
 mod tree;
 pub mod watch;
 
@@ -98,14 +104,16 @@ pub struct File<'a> {
 /// itself, never on what it points to.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Op {
+    // Each variant's fields in CBOR key order (shorter name first, then bytewise), so the
+    // encoder writes the map as it comes.
     /// The whole file with its mode, created with its directories if missing.
-    Write { path: String, bytes: Vec<u8>, mode: Mode },
+    Write { mode: Mode, path: String, bytes: Vec<u8> },
     /// `len` bytes at `at` replaced by `bytes`, as an editor's change is; the mode is kept.
-    Edit { path: String, at: u64, len: u64, bytes: Vec<u8> },
+    Edit { at: u64, len: u64, path: String, bytes: Vec<u8> },
     /// A file, or a directory with everything under it.
     Delete { path: String },
     /// A file or a directory moved; `to` must not exist.
-    Rename { from: String, to: String },
+    Rename { to: String, from: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -151,11 +159,24 @@ impl fmt::Display for OpError {
     }
 }
 
-/// A file that differs between two roots.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+/// A file that differs between two roots. Ordered by path, then kind.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Change {
-    pub path: String,
+    // In CBOR key order (shorter name first), so the encoder writes the map as it comes.
     pub kind: ChangeKind,
+    pub path: String,
+}
+
+impl Ord for Change {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.path.cmp(&other.path).then(self.kind.cmp(&other.kind))
+    }
+}
+
+impl PartialOrd for Change {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]

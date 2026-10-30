@@ -27,7 +27,7 @@ use super::{Symbol, Unhandled};
 use crate::{
     ConstBlob,
     debuginfo::{LineRow, SlotPlaces, VariablePlace},
-    fragment::{Code, Wants},
+    fragment::{Code, Relocs, Wants},
     unwind::{FrameRows, FrameRule, FunctionUnwind, seh},
 };
 
@@ -50,7 +50,7 @@ pub(super) struct Emitted<'data, 'file> {
     code: u32,
     align: u64,
     relocs: Vec<ModuleReloc>,
-    /// See [`Code::elf_types`].
+    /// See [`Reloc::elf_type`](crate::fragment::Reloc::elf_type).
     elf_types: Vec<(u32, u32)>,
 }
 
@@ -174,7 +174,8 @@ impl<'data, 'file> Emitted<'data, 'file> {
         let lines = emitted.lines()?;
         let slots = emitted.slots().unwrap_or_default();
         let Emitted { bytes, align, relocs, elf_types, .. } = emitted;
-        Ok(Code { signature, bytes, align, relocs, elf_types, unwind, lines, slots })
+        let relocs = Relocs::of_module(&relocs, &elf_types).map_err(|e| Unhandled::Llvm(e.to_string()))?;
+        Ok(Code { signature, bytes, align, relocs, unwind, lines, slots })
     }
 
     /// Where LLVM kept the stack slots `lower` told it of as variables, which are named by

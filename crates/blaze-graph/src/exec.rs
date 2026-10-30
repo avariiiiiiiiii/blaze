@@ -10,7 +10,9 @@
 
 use std::{
     any::Any,
+    cell::UnsafeCell,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    ptr::{self, NonNull},
     sync::{
         Arc, OnceLock,
         atomic::{AtomicU32, Ordering},
@@ -29,7 +31,7 @@ use crate::{
     arena,
     machine::{Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{Memo, Plane, PlaneConfig, PlaneInput, PlaneOutput, RequestId},
-    pool::{self, Pool as Workers},
+    pool::{self, Header, Pool as Workers},
     pump::Lock,
     topology::Topology,
 };
@@ -260,6 +262,9 @@ enum Msg {
     Cancel { request: RequestId },
     Done {
         at_ns: u64,
+        /// The run's slot in the owner's [`Table`], free again once this is taken; `None` for
+        /// a node run with no work, which had none.
+        slot: Option<u32>,
         id: NodeId,
         request: RequestId,
         kind: TaskKind,
@@ -269,29 +274,154 @@ enum Msg {
         group: Option<u32>,
     },
     Estimates { reply: Sender<Estimates> },
+    /// How many slots the owner's table has made.
+    #[cfg(test)]
+    Slots { reply: Sender<usize> },
     Stop,
 }
 
-/// What a running task needs to run and say it ran.
-struct Job {
-    id: NodeId,
-    request: RequestId,
-    kind: TaskKind,
-    work: Work,
+/// What every run of a scheduler reaches besides its slot. Leaked as the scheduler is made: a
+/// run's last act is its `Done`'s send through `tx`, which nothing can wait for the end of, so
+/// the sender (and the channel it keeps) must outlive every run.
+struct Ctx {
     tx: Sender<Msg>,
-    /// The IO threads' queue, for an IO task posted again.
-    io: Option<Sender<Arc<Job>>>,
-    /// On its request's critical path, as the plane said when it ran it.
-    critical: bool,
+    /// The IO threads' queue; `None` stops one of them.
+    io: Sender<Option<Ran>>,
+    pool: &'static Workers,
     start: Instant,
 }
 
-impl Job {
-    fn done(&self, did: Did, peak: Option<u64>, group: Option<u32>) {
-        let (id, request, kind) = (self.id, self.request, self.kind);
-        let at_ns = ns(self.start);
-        // A scheduler dropped while its tasks run takes nothing more of them.
-        _ = self.tx.send(Msg::Done { at_ns, id, request, kind, did, peak, group });
+/// A run under way: the node, and the work it runs (a clone the owner made and drops).
+struct Live {
+    id: NodeId,
+    request: RequestId,
+    kind: TaskKind,
+    /// On its request's critical path, as the plane said when it ran it.
+    critical: bool,
+    work: Work,
+}
+
+/// A slot of the owner's [`Table`]: the pool's job itself (its header first), so posting a run
+/// allocates nothing and clones no `Arc` or sender. Filled by the owner, then read only by the
+/// thread that runs it until it sends its `Done`; then the owner's again.
+#[repr(C)]
+struct Run {
+    header: Header,
+    ctx: &'static Ctx,
+    at: u32,
+    live: UnsafeCell<Option<Live>>,
+}
+
+// SAFETY: `live` has one reader or writer at a time: the owner while the slot is free (or
+// filling it), then the thread holding its `Ran`, handed over by the pool's queue or the IO
+// queue and back by the `Done` message, each of which orders the writes before the reads. The
+// other fields are written only as the chunk is made.
+unsafe impl Sync for Run {}
+
+/// How many slots a [`Table`] grows by.
+const RUNS: usize = 64;
+
+/// The runs under way, by slot, each reused once its `Done` is in: chunks of [`RUNS`] that
+/// never move, so a slot's address is its job's for as long as it runs. Only the owner thread
+/// takes and frees slots; a run that ends sends its slot's index back, nothing else.
+#[derive(Default)]
+struct Table {
+    /// Leaked boxes, freed on drop: a `Box` moved as the list grows would claim its chunk
+    /// unshared while runs read it.
+    chunks: Vec<&'static [Run]>,
+    free: Vec<u32>,
+    running: usize,
+}
+
+impl Drop for Table {
+    fn drop(&mut self) {
+        // An owner unwinding with runs under way leaves their slots to them.
+        if self.running > 0 {
+            return;
+        }
+        for chunk in self.chunks.drain(..) {
+            // SAFETY: `grow` leaked the chunk, and no run is under way to name a slot of it.
+            drop(unsafe { Box::from_raw(ptr::from_ref(chunk).cast_mut()) });
+        }
+    }
+}
+
+impl Table {
+    fn slot(&self, at: u32) -> &Run {
+        &self.chunks[at as usize / RUNS][at as usize % RUNS]
+    }
+
+    fn take(&mut self, ctx: &'static Ctx, live: Live) -> Ran {
+        let at = match self.free.pop() {
+            Some(at) => at,
+            None => self.grow(ctx),
+        };
+        let run = self.slot(at);
+        // SAFETY: a free slot is named by no `Ran`, so only this (the owner) thread reaches it.
+        unsafe { *run.live.get() = Some(live) };
+        self.running += 1;
+        Ran(NonNull::from(run))
+    }
+
+    /// One chunk more: its first slot, the others free.
+    fn grow(&mut self, ctx: &'static Ctx) -> u32 {
+        let first = u32::try_from(self.chunks.len() * RUNS)
+            .unwrap_or_else(|_| panic!("a scheduler with 2^32 runs under way"));
+        let end = first + RUNS as u32;
+        let chunk: Box<[Run]> = (first..end)
+            .map(|at| Run { header: Header::new(run_pooled), ctx, at, live: UnsafeCell::new(None) })
+            .collect();
+        self.chunks.push(Box::leak(chunk));
+        self.free.extend((first + 1..end).rev());
+        first
+    }
+
+    fn free(&mut self, at: u32) {
+        let run = self.slot(at);
+        // SAFETY: its `Done` is in: the `Ran` that named it was consumed sending it, so only
+        // this (the owner) thread reaches it.
+        drop(unsafe { (*run.live.get()).take() });
+        self.free.push(at);
+        self.running -= 1;
+    }
+}
+
+/// The one name of a filled slot, held by the thread that runs it: made by [`Table::take`],
+/// consumed by [`Ran::done`] or by posting it again.
+struct Ran(NonNull<Run>);
+
+// SAFETY: a `Ran` moves to the thread that runs it with the pool's queue or the IO queue (both
+// order the owner's writes to the slot before the reads); what the slot holds is `Send`.
+unsafe impl Send for Ran {}
+
+impl Ran {
+    fn run(&self) -> &Run {
+        // SAFETY: a slot stays in its table (whose chunks never move) until the owner frees it,
+        // which is after this `Ran` is consumed; the owner waits for its runs before it drops
+        // the table.
+        unsafe { self.0.as_ref() }
+    }
+
+    fn live(&self) -> &Live {
+        // SAFETY: while a `Ran` lives its slot is filled and nobody writes it (see `Run`).
+        unsafe { &*self.run().live.get() }.as_ref().expect("a slot given to a run is filled")
+    }
+
+    /// Says what came of the run. Its last touch of the slot is reading it for the message.
+    fn done(self, did: Did, peak: Option<u64>, group: Option<u32>) {
+        let (run, live) = (self.run(), self.live());
+        let ctx = run.ctx;
+        let msg = Msg::Done {
+            at_ns: ns(ctx.start),
+            slot: Some(run.at),
+            id: live.id,
+            request: live.request,
+            kind: live.kind,
+            did,
+            peak,
+            group,
+        };
+        _ = ctx.tx.send(msg);
     }
 }
 
@@ -349,12 +479,24 @@ impl Handle {
         _ = self.tx.send(Msg::Estimates { reply });
         estimates.recv().unwrap_or_else(|_| panic!("the scheduler is gone"))
     }
+
+    #[cfg(test)]
+    fn slots(&self) -> usize {
+        let (reply, slots) = crossbeam_channel::bounded(1);
+        _ = self.tx.send(Msg::Slots { reply });
+        slots.recv().unwrap_or_else(|_| panic!("the scheduler is gone"))
+    }
 }
 
 /// The daemon's one scheduler (docs/v2/plan/lanes/core/plane.md): requests from any thread, through
 /// [`Handle`]s; the plane stepped on its owner thread; tasks on a worker pool, IO tasks on
-/// threads of their own. Dropping it stops the owner thread and waits for the IO tasks under
-/// way; pool tasks under way finish on the pool, and what came of them is not taken.
+/// threads of their own. Dropping it waits for the tasks under way (pool and IO, each posted
+/// again until it ends; what came of them is not taken), then stops the owner thread and the
+/// IO threads: so it is never dropped by one of its own tasks.
+///
+/// A run is a slot of the owner's table, reused once its `Done` is in, and the slot itself is
+/// the pool's job: posting a task allocates nothing and clones no `Arc` or sender, and its end
+/// is one message to the owner.
 ///
 /// A task's work runs in its thread's task arena ([`arena::task`]: a pool worker's is on its
 /// NUMA node, in huge pages, and reset when the task ends) inside [`arena::measure`], and its
@@ -397,30 +539,31 @@ impl Scheduler {
         let io_threads = config.io;
         let plane = Plane::with_memo(config, memo)?;
         let (tx, rx) = unbounded::<Msg>();
-        let (io_tx, io_rx) = unbounded::<Arc<Job>>();
+        let (io_tx, io_rx) = unbounded::<Option<Ran>>();
         let io = (0..io_threads)
             .map(|at| {
                 let io_rx = io_rx.clone();
                 thread::Builder::new()
                     .name(format!("blaze-io-{at}"))
                     .spawn(move || {
-                        // Ends once the owner is gone and no queued task can post itself again.
-                        for job in io_rx {
-                            run_io(job);
+                        // Ends when the owner, its runs over, says so.
+                        while let Ok(Some(run)) = io_rx.recv() {
+                            run_io(run);
                         }
                     })
                     .unwrap_or_else(|why| panic!("an IO thread of the scheduler: {why}"))
             })
             .collect();
+        let ctx: &'static Ctx =
+            Box::leak(Box::new(Ctx { tx: tx.clone(), io: io_tx, pool, start: Instant::now() }));
         let owner = Owner {
             plane,
             estimates,
             heard: FxHashMap::default(),
             works: FxHashMap::default(),
-            pool,
-            io: io_tx,
-            tx: tx.clone(),
-            start: Instant::now(),
+            ctx,
+            table: Table::default(),
+            io_threads,
         };
         let owner = thread::Builder::new()
             .name("blaze-plane".to_owned())
@@ -483,25 +626,43 @@ struct Owner {
     heard: FxHashMap<RequestId, Sender<Heard>>,
     /// The work of each node added and not settled.
     works: FxHashMap<NodeId, Entry>,
-    pool: &'static Workers,
-    io: Sender<Arc<Job>>,
-    tx: Sender<Msg>,
-    start: Instant,
+    ctx: &'static Ctx,
+    table: Table,
+    io_threads: usize,
 }
 
 impl Owner {
     fn serve(mut self, rx: &Receiver<Msg>) {
+        /// Stops the IO threads as the owner ends, unwinding too.
+        struct StopIo(&'static Ctx, usize);
+        impl Drop for StopIo {
+            fn drop(&mut self) {
+                for _ in 0..self.1 {
+                    _ = self.0.io.send(None);
+                }
+            }
+        }
+        let _stop_io = StopIo(self.ctx, self.io_threads);
         // The owner's one wait.
         while let Ok(msg) = rx.recv() {
             if !self.take(msg) {
                 break;
             }
         }
+        // Each run under way reads a slot of the table: it ends before the table goes, and
+        // nothing more comes of it.
+        while self.table.running > 0 {
+            match rx.recv() {
+                Ok(Msg::Done { slot: Some(slot), .. }) => self.table.free(slot),
+                Ok(_) => {}
+                Err(_) => unreachable!("the scheduler's context keeps a sender"),
+            }
+        }
     }
 
     /// Takes one input; false once told to stop.
     fn take(&mut self, msg: Msg) -> bool {
-        let at_ns = ns(self.start);
+        let at_ns = ns(self.ctx.start);
         match msg {
             Msg::Open { request, weight, keep_going, heard } => {
                 self.heard.insert(request, heard);
@@ -544,7 +705,10 @@ impl Owner {
                 let outputs = self.plane.cancel(at_ns, request);
                 self.outputs(request, outputs);
             }
-            Msg::Done { at_ns, id, request, kind, did, peak, group } => {
+            Msg::Done { at_ns, slot, id, request, kind, did, peak, group } => {
+                if let Some(slot) = slot {
+                    self.table.free(slot);
+                }
                 if let Some(peak) = peak {
                     self.estimates.observe(kind, peak);
                 }
@@ -574,10 +738,12 @@ impl Owner {
                     let input = PlaneInput::Done { at_ns, id, outcome, added: Vec::new(), group, peak };
                     self.step(request, input);
                 }
-                let held = PlaneInput::Held { at_ns: ns(self.start), bytes: arena::held() };
+                let held = PlaneInput::Held { at_ns: ns(self.ctx.start), bytes: arena::held() };
                 self.step(request, held);
             }
             Msg::Estimates { reply } => _ = reply.send(self.estimates.clone()),
+            #[cfg(test)]
+            Msg::Slots { reply } => _ = reply.send(self.table.chunks.len() * RUNS),
             Msg::Stop => return false,
         }
         true
@@ -633,8 +799,9 @@ impl Owner {
         let Some(entry) = self.works.get(&id) else {
             // The plane runs only nodes added here, each with its work: a node it runs with
             // none fails, saying so, through the owner's own queue.
-            _ = self.tx.send(Msg::Done {
-                at_ns: ns(self.start),
+            _ = self.ctx.tx.send(Msg::Done {
+                at_ns: ns(self.ctx.start),
+                slot: None,
                 id,
                 request: RequestId(u32::MAX),
                 kind: TaskKind(u32::MAX),
@@ -644,59 +811,59 @@ impl Owner {
             });
             return;
         };
-        let io = (pool == Pool::Io).then(|| self.io.clone());
-        let job = Arc::new(Job {
-            id,
-            request: entry.request,
-            kind: entry.kind,
-            work: entry.work.clone(),
-            tx: self.tx.clone(),
-            io,
-            critical,
-            start: self.start,
-        });
+        let live =
+            Live { id, request: entry.request, kind: entry.kind, critical, work: entry.work.clone() };
+        let run = self.table.take(self.ctx, live);
         match pool {
-            Pool::Work => post(self.pool, near, job),
-            // The IO threads outlive this send: they end once the owner is gone.
-            Pool::Io => _ = self.io.send(job),
+            Pool::Work => post(self.ctx, near, critical, run),
+            // The IO threads outlive this send: they end once the owner, its runs over, says so.
+            Pool::Io => _ = self.ctx.io.send(Some(run)),
         }
     }
 }
 
-/// Runs `job` on `pool` near `near` (on a fast group when it is critical); posted again,
-/// behind what is ready on the group it ran on, while its work gives way.
-fn post(pool: &'static Workers, near: Option<u32>, job: Arc<Job>) {
-    let again = job.clone();
-    let critical = job.critical;
-    let run = move || measured(&job);
-    let done = move |result: thread::Result<(Result<Did, Cancelled>, u64)>| match result {
-        Ok((Ok(did), peak)) => again.done(did, Some(peak), pool::group()),
-        Ok((Err(Cancelled), _)) => post(pool, pool::group(), again),
-        Err(panic) => again.done(Did::failed(panicked(&*panic)), None, pool::group()),
-    };
-    if critical {
-        pool.submit_critical(near, run, done);
-    } else {
-        pool.submit(near, run, done);
+/// Runs `run` on the scheduler's pool near `near` (on a fast group when it is critical).
+fn post(ctx: &Ctx, near: Option<u32>, critical: bool, run: Ran) {
+    // SAFETY: the slot's header is its first field (`Run` is `repr(C)`) and runs `run_pooled`;
+    // the slot stays in its table, unmoved, until its `Done` is taken, and `run`, moved here,
+    // was its one name.
+    let job = unsafe { pool::Job::from_header(run.0.cast::<Header>()) };
+    ctx.pool.push_placed(near, critical, job);
+}
+
+/// A run's pool job: its work, then its `Done`; posted again, behind what is ready on the group
+/// it ran on, while its work gives way.
+///
+/// # Safety
+///
+/// `header` is the header of a filled slot of a live [`Table`], given to the pool by [`post`].
+unsafe fn run_pooled(header: NonNull<Header>) {
+    let run = Ran(header.cast::<Run>());
+    let (ctx, critical) = (run.run().ctx, run.live().critical);
+    let result = catch_unwind(AssertUnwindSafe(|| measured(run.live())));
+    let group = pool::group();
+    match result {
+        Ok((Ok(did), peak)) => run.done(did, Some(peak), group),
+        Ok((Err(Cancelled), _)) => post(ctx, group, critical, run),
+        Err(panic) => run.done(Did::failed(panicked(&*panic)), None, group),
     }
 }
 
-/// `job`'s work in this thread's task arena, reset when it ends, and the peak it held.
-fn measured(job: &Job) -> (Result<Did, Cancelled>, u64) {
-    arena::measure(|| arena::task(|| (job.work)()))
+/// `live`'s work in this thread's task arena, reset when it ends, and the peak it held.
+fn measured(live: &Live) -> (Result<Did, Cancelled>, u64) {
+    arena::measure(|| arena::task(|| (live.work)()))
 }
 
 /// Runs an IO task on this thread; posted again, behind what is queued for the IO threads,
 /// while its work gives way.
-fn run_io(job: Arc<Job>) {
-    match catch_unwind(AssertUnwindSafe(|| measured(&job))) {
-        Ok((Ok(did), peak)) => job.done(did, Some(peak), None),
+fn run_io(run: Ran) {
+    match catch_unwind(AssertUnwindSafe(|| measured(run.live()))) {
+        Ok((Ok(did), peak)) => run.done(did, Some(peak), None),
         Ok((Err(Cancelled), _)) => {
-            if let Some(io) = job.io.clone() {
-                _ = io.send(job);
-            }
+            let ctx = run.run().ctx;
+            _ = ctx.io.send(Some(run));
         }
-        Err(panic) => job.done(Did::failed(panicked(&*panic)), None, None),
+        Err(panic) => run.done(Did::failed(panicked(&*panic)), None, None),
     }
 }
 
@@ -717,7 +884,7 @@ mod tests {
     use crossbeam_channel::bounded;
     use rustc_hash::FxHashMap;
 
-    use super::{Did, Heard, Opened, SPARE, Scheduler, Task, Work, Workers, drive};
+    use super::{Did, Heard, Opened, RUNS, SPARE, Scheduler, Task, Work, Workers, drive};
     use crate::{
         Cancelled, Key,
         admission::{Estimates, TaskKind},
@@ -928,6 +1095,62 @@ mod tests {
         assert!(!ok);
         ended_rx.recv_timeout(LONG).expect("the running work completes");
         assert!(!second_ran.load(Ordering::SeqCst));
+    }
+
+    /// A thousand runs, no more than the pool's two workers under way at once and an IO task
+    /// beside each round, take one chunk of the run table: each slot is reused once its `Done`
+    /// is in.
+    #[test]
+    fn runs_reuse_their_slots() {
+        let (scheduler, _) = scheduler(2);
+        let built: Work = Arc::new(|| Ok(Did::built()));
+        for round in 0..10u32 {
+            let opened = scheduler.open(1, false);
+            let first = 2000 + round * 101;
+            let mut tasks: Vec<Task> =
+                (0..100).map(|at| task(first + at, &[], None, built.clone())).collect();
+            let io = spec(first + 100, &[], Pool::Io, None);
+            tasks.push(Task { spec: io, kind: TaskKind(1), work: built.clone() });
+            scheduler.add(opened.request, tasks);
+            scheduler.close(opened.request);
+            assert!(finish(&opened).0);
+        }
+        assert_eq!(scheduler.handle().slots(), RUNS);
+    }
+
+    /// Dropping a scheduler waits for the task under way, which reads its slot, and the task
+    /// ends.
+    #[test]
+    fn dropping_the_scheduler_waits_for_its_runs() {
+        let (scheduler, _) = scheduler(2);
+        let (started_tx, started_rx) = bounded::<()>(1);
+        let (gate_tx, gate_rx) = bounded::<()>(0);
+        let ended = Arc::new(AtomicBool::new(false));
+        let work: Work = {
+            let ended = ended.clone();
+            Arc::new(move || {
+                _ = started_tx.send(());
+                gate_rx.recv_timeout(LONG).expect("the gate opens");
+                ended.store(true, Ordering::SeqCst);
+                Ok(Did::built())
+            })
+        };
+        let opened = scheduler.open(1, false);
+        scheduler.add(opened.request, vec![task(90, &[], None, work)]);
+        scheduler.close(opened.request);
+        started_rx.recv_timeout(LONG).unwrap();
+        let dropped = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let dropper = scope.spawn(|| {
+                drop(scheduler);
+                dropped.store(true, Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!dropped.load(Ordering::SeqCst), "the drop waits for the run under way");
+            gate_tx.send_timeout((), LONG).unwrap();
+            dropper.join().unwrap();
+        });
+        assert!(ended.load(Ordering::SeqCst) && dropped.load(Ordering::SeqCst));
     }
 
     #[test]

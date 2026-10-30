@@ -74,10 +74,12 @@ read is an error naming it.
 The launcher records `E *` (the whole environment) for every traced run, because a process can
 walk `environ` with no call the sandbox sees (Rust's `env::vars` on Linux, C's `environ`). So
 today every passed-through variable is in every traced key: sound, but a shell that differs in
-`SHLVL` or `OLDPWD` reruns build scripts and misses kept expansions. The way out is a std that
-says when it walks (v2/requests/usercode.md, request 6): then `E *` is recorded only for a
-process whose executable is not blaze-built, and a blaze-built script is keyed by the variables
-it read by name.
+`SHLVL` or `OLDPWD` reruns build scripts and misses kept expansions. `E *` also covers what the C
+library reads through its own internal calls (`TZ`, `LANG`, `LC_*`, `TMPDIR`, `MALLOC_*`, the
+resolver's variables), which no interposer sees. Narrowing it takes three owned pieces
+(v2/requests/usercode.md, request 6 revised): std calls a hook before it walks; the linker
+marks an object whose only `environ` references are std's; and the interposer records `E *` for
+an unmarked object and the C library's own reads by name, from the libc the toolchain pins.
 
 ## What can't be traced
 

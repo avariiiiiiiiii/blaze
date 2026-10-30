@@ -8,6 +8,9 @@
 //! `float_to_float_or_int`) and `compiler/rustc_middle/src/ty/consts/int.rs` (`ConstInt`'s
 //! `Debug`) (MIT or Apache-2.0).
 
+#[cfg(test)]
+mod tests;
+
 use std::cmp::Ordering;
 
 use hir_ty::mir::{BinOp, UnOp};
@@ -31,6 +34,8 @@ pub(super) struct Scalar {
     pub(super) size: u8,
     pub(super) kind: Kind,
 }
+
+const _: () = assert!(size_of::<Scalar>() <= 32);
 
 /// What a binary operation gives: a value, or with `AddWithOverflow` and the like, the value
 /// with whether it overflowed.
@@ -191,18 +196,17 @@ fn int_op(op: &BinOp, l: Scalar, r: Scalar) -> Option<Output> {
         if let BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge = op {
             return Some(Output::One(Scalar::from_bool(compare(op, a.cmp(&b))?)));
         }
-        let f: Option<fn(i128, i128) -> (i128, bool)> = match op {
+        let wide = match op {
             BinOp::Div | BinOp::Rem if b == 0 => return None,
             BinOp::Div | BinOp::Rem if a == signed_min(l.size) && b == -1 => return None,
-            BinOp::Div => Some(i128::overflowing_div),
-            BinOp::Rem => Some(i128::overflowing_rem),
-            BinOp::Add | BinOp::AddWithOverflow => Some(i128::overflowing_add),
-            BinOp::Sub | BinOp::SubWithOverflow => Some(i128::overflowing_sub),
-            BinOp::Mul | BinOp::MulWithOverflow => Some(i128::overflowing_mul),
+            BinOp::Div => Some(a.overflowing_div(b)),
+            BinOp::Rem => Some(a.overflowing_rem(b)),
+            BinOp::Add | BinOp::AddWithOverflow => Some(a.overflowing_add(b)),
+            BinOp::Sub | BinOp::SubWithOverflow => Some(a.overflowing_sub(b)),
+            BinOp::Mul | BinOp::MulWithOverflow => Some(a.overflowing_mul(b)),
             _ => None,
         };
-        if let Some(f) = f {
-            let (result, overflowed) = f(a, b);
+        if let Some((result, overflowed)) = wide {
             let value = l.with(result as u128);
             return Some(output(value, overflowed || value.int() != result));
         }
@@ -216,16 +220,15 @@ fn int_op(op: &BinOp, l: Scalar, r: Scalar) -> Option<Output> {
         BinOp::BitAnd => Output::One(l.with(a & b)),
         BinOp::BitXor => Output::One(l.with(a ^ b)),
         _ => {
-            let f: fn(u128, u128) -> (u128, bool) = match op {
-                BinOp::Add | BinOp::AddWithOverflow => u128::overflowing_add,
-                BinOp::Sub | BinOp::SubWithOverflow => u128::overflowing_sub,
-                BinOp::Mul | BinOp::MulWithOverflow => u128::overflowing_mul,
+            let (result, overflowed) = match op {
+                BinOp::Add | BinOp::AddWithOverflow => a.overflowing_add(b),
+                BinOp::Sub | BinOp::SubWithOverflow => a.overflowing_sub(b),
+                BinOp::Mul | BinOp::MulWithOverflow => a.overflowing_mul(b),
                 BinOp::Div | BinOp::Rem if b == 0 => return None,
-                BinOp::Div => u128::overflowing_div,
-                BinOp::Rem => u128::overflowing_rem,
+                BinOp::Div => a.overflowing_div(b),
+                BinOp::Rem => a.overflowing_rem(b),
                 _ => return None,
             };
-            let (result, overflowed) = f(a, b);
             let value = l.with(result);
             output(value, overflowed || value.bits != result)
         }

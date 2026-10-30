@@ -75,14 +75,15 @@ several per MIR statement. `variant_shape` (each aggregate of an enum variant, e
 `SetDiscriminant`, each downcast) rebuilt `Layout::for_variant` (two `Vec`s cloned) and
 recomputed the tag every time.
 
-**After.** `Layouts` (one per `build`, borrowed by `FunctionCx` as `&'cx Layouts`) lends
-`&'cx Layout` out of the map: a hit is one hash and no refcount write. The map only ever gains
-entries, so the `Arc` behind each keeps its `Layout` where it is however the map rehashes; the
-`unsafe` in `Layouts::lend` states that invariant. A second map, `(VariantId, GenericArgs) ->
-Option<VariantShape>`, keeps each variant's layout and tag once per function: the `for_variant`
-copy and the tag computation happen once per variant instead of once per use. Test:
-`a_lent_layout_is_the_entry_however_the_map_grows` (4096 seeded layouts; every lent reference
-is the entry's and equal to an `Arc` clone of it after the map grew).
+**After.** Each `build` owns a `KeptLayouts`: two `typed_arena::Arena`s, one of the `Arc`s the
+query gave and one of variant layouts. `FunctionCx::layouts` maps `Ty` to `&'cx Layout` lent
+from them, so a hit is one hash and no refcount write. This is safe code: the arena drops what
+it holds when the build ends, and `mod.rs` has no `unsafe` for it (`docs/v2/plan/design/unsafe.md`).
+A second map, `(VariantId, GenericArgs) -> Option<(&Layout, Tag)>`, keeps each variant's layout
+and tag once per function. The `for_variant` copy and the tag computation happen once per
+variant, not once per use. A single-variant type lends the whole type's layout, not a clone.
+Test: `a_kept_layout_is_the_one_the_query_gave` (4096 seeded layouts; each lent reference is
+the query's `Layout`, not a copy).
 
 **Missing.** The salsa query `layout_of_ty` is `returns(clone)`, so the miss path still clones
 an `Arc` out of salsa: a `returns(ref)` (hir-ty, not this lane) would make it a borrow. The map
@@ -99,8 +100,8 @@ and allocates the `OsString`.
 **After.** `dump_mir_of`, `dumps_clif`, `dumps_tier` and `checks_cache` read once per process
 (`LazyLock`), like `mir_opt_level` already did. What remains are v1's per-unit reads
 (`BLAZE_STATS`, `BLAZE_LAYOUTS`, `BLAZE_SHAPES`), once per unit, not per function. `tier.rs`'s
-three `BLAZE_DUMP_TIER` reads are asked to use `dumps_tier()` (speed-backend-llvm), and
-`Recorder::new`'s `BLAZE_LAYOUTS` read per compile to be a `LazyLock` (speed-backend-code).
+three `BLAZE_DUMP_TIER` reads are asked to use `dumps_tier()` (speed-backend-llvm).
+`Recorder::new`'s `BLAZE_LAYOUTS` is already read once (`fragment.rs` `LAYOUTS`).
 
 ## Strings on per-statement paths
 
@@ -127,9 +128,11 @@ instructions in a new `Vec`.
 **After.** One `Dfs` and one order `Vec` per `inline`, cleared and reused for every call site
 it builds in (`Dfs::pre_order_iter` clears its own state first).
 
-**Missing.** `Recorder::declare_inlined` (`fragment.rs`) clones the callee's whole IR
-(`moved`) per call site, not once per instance (asked of speed-backend-code); and the
-`built_in.contains` there is a linear scan.
+Separately, `Recorder::declare_inlined` (`fragment.rs`, speed-backend-code's) used to clone the
+callee's whole IR per call site. It now moves a callee's body once per instance, and every call
+site shares that body and its data (one `Location`/`Text` per body, as rustc has).
+
+**Missing.** Building callees in for v2 units (see "Code speed" below).
 
 ## `FunctionCx` maps
 

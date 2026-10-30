@@ -8,7 +8,7 @@ use blaze_units::{
 };
 use blaze_usercode::run::Value;
 
-use super::{artifact, codegen, compile, run, script, unit_target};
+use super::{artifact, codegen, compile, graph, run, script, test, unit_target};
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 
@@ -484,4 +484,125 @@ fn a_crate_record_is_an_archive_of_one_member() {
     let bytes = compile::crate_record(&lib, Some(ContentId::of("blaze v2 test 1", b"id")), &[]);
     assert!(bytes.starts_with(b"!<arch>\nlib.rmeta/"));
     assert_eq!(bytes.len() % 2, 0);
+}
+
+#[test]
+fn the_graph_is_cargos_build_map_in_columns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut units = build(dir.path());
+    // 4: z-sys's library, built with its script's run; 5: p's binary, with its run and z-sys.
+    let mut lib = unit(Z, target("z_sys", "lib", "/w/z-sys/src/lib.rs"), Mode::Build, &[1]);
+    lib.target.crate_types = vec!["lib".to_owned()];
+    units.graph.units.push(lib);
+    units.graph.units.push(unit(P, target("p", "bin", "/w/p/src/main.rs"), Mode::Build, &[4, 3]));
+    units.plans.push(plan("-0004", &[]));
+    units.plans.push(plan("-0005", &[]));
+    let graph = graph::Graph::new(&units);
+    assert_eq!(graph.deps(5), [3, 4], "sorted by package id");
+    assert_eq!(graph.closure(3), [3, 1, 0, 2]);
+    assert_eq!(graph.closure(5), [5, 4, 3, 1, 0, 2]);
+    // p's own run, then z-sys's through its linked library; the scripts' compiles are the host's.
+    assert_eq!(graph.links(5), [3, 1]);
+    assert_eq!(graph.links(3), [] as [u32; 0]);
+    assert_eq!(graph.linked_in(5), [5, 4]);
+    assert!(graph.build_time(0) && graph.build_time(2));
+    assert!(!graph.build_time(4) && !graph.build_time(5));
+    assert!(graph.package_has_lib(4) && !graph.package_has_lib(5));
+    let all = &units.graph.units;
+    let kinds = ["custom-build".to_owned()];
+    assert_eq!(graph.find(all, Z, "build-script-build", &kinds, Mode::RunCustomBuild), Some(1));
+    assert_eq!(graph.find(all, P, "build-script-build", &kinds, Mode::RunCustomBuild), Some(3));
+    assert_eq!(graph.find(all, P, "build-script-build", &kinds, Mode::Test), None);
+}
+
+#[test]
+fn a_relink_is_a_merge_of_sorted_columns() {
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    codegen::diff(&[1, 3, 5, 7], &[2, 3, 7, 8], &mut removed, &mut added);
+    assert_eq!(removed, [1, 5]);
+    assert_eq!(added, [2, 8]);
+    let old = vec!["a".to_owned(), "c".to_owned(), "d".to_owned()];
+    let mut new = vec!["d", "b", "a", "b"];
+    let (kept, gone) = codegen::renamed(old, &mut new);
+    assert_eq!(kept, ["a", "b", "d"]);
+    assert_eq!(gone, ["c"]);
+}
+
+#[test]
+fn a_records_header_is_checked_in_place() {
+    use blaze_cas::Key;
+    let one = Key(ContentId::of("blaze v2 test 1", b"one"));
+    let two = Key(ContentId::of("blaze v2 test 1", b"two"));
+    let lib = ContentId([7; 32]);
+    let mut bytes = Vec::new();
+    compile::header::write(&mut bytes, &[one, two], &[("/usr/lib/libz.so".to_owned(), lib)]);
+    let body = bytes.len();
+    bytes.extend_from_slice(b"cbor");
+    let same = |path: &std::path::Path| (path == std::path::Path::new("/usr/lib/libz.so")).then_some([7; 32]);
+    let changed = |_: &std::path::Path| Some([8; 32]);
+    assert_eq!(compile::header::check(&bytes, |_| true, &mut { same }), Some(body));
+    assert_eq!(compile::header::check(&bytes, |key| *key != two, &mut { same }), None, "an output gone");
+    assert_eq!(compile::header::check(&bytes, |_| true, &mut { changed }), None, "a library changed");
+    assert_eq!(compile::header::check(&bytes[..body - 3], |_| true, &mut { same }), None, "cut short");
+    assert_eq!(compile::header::check(b"nope", |_| true, &mut { same }), None);
+}
+
+fn selection<'a>(filter: &'a [String], args: &'a [String]) -> crate::serve::work::Selection<'a> {
+    crate::serve::work::Selection { filter, args, all: true, ub: None }
+}
+
+fn strings(of: &[&str]) -> Vec<String> {
+    of.iter().map(|it| (*it).to_owned()).collect()
+}
+
+/// The arguments after `--` select as libtest's `parse_opts` reads them; one it doesn't take
+/// is refused, never dropped.
+#[test]
+fn libtests_selection_is_read_as_libtest_reads_it() {
+    use blaze_usercode::test::Ignored;
+    let named = strings(&["parse"]);
+    let args = strings(&["lex", "--exact", "--skip", "slow", "--skip=huge", "--include-ignored"]);
+    let filter = test::filter(&selection(&named, &args)).expect("libtest's selection");
+    assert_eq!(filter.names, ["parse", "lex"]);
+    assert!(filter.exact);
+    assert_eq!(filter.skip, ["slow", "huge"]);
+    assert_eq!(filter.ignored, Ignored::Include);
+    let only = test::filter(&selection(&[], &strings(&["--ignored"]))).expect("--ignored");
+    assert_eq!(only.ignored, Ignored::Only);
+    assert_eq!(test::filter(&selection(&[], &[])).expect("none").ignored, Ignored::Skip);
+    let both = test::filter(&selection(&[], &strings(&["--ignored", "--include-ignored"]))).unwrap_err();
+    assert_eq!(both.what, "the options --include-ignored and --ignored are mutually exclusive");
+    assert_eq!(test::filter(&selection(&[], &strings(&["--skip"]))).unwrap_err().what, "argument to option 'skip' missing");
+    let other = test::filter(&selection(&[], &strings(&["--nocapture"]))).unwrap_err();
+    assert!(other.what.starts_with("`--nocapture` after `--`"), "{}", other.what);
+}
+
+/// A test the evaluator ran is judged as libtest judges it with its `#[should_panic]`;
+/// undefined behavior and what the evaluator can't run fail whatever the test expects.
+#[test]
+fn an_evaluated_test_is_judged_as_libtest_judges_it() {
+    use blaze_api::TestOutcome::{Failed, Passed};
+    use blaze_usercode::test::ShouldPanic::{No, WithMessage, Yes};
+    use test::{Ran, judged};
+    let expected = WithMessage("overflow".to_owned());
+    assert_eq!(judged(Ran::Returned, &No), (Passed, String::new()));
+    assert_eq!(judged(Ran::Returned, &Yes), (Failed, "note: test did not panic as expected\n".to_owned()));
+    assert_eq!(judged(Ran::Panicked("boom"), &No), (Failed, "boom\n".to_owned()));
+    assert_eq!(judged(Ran::Panicked("boom"), &Yes), (Passed, String::new()));
+    assert_eq!(judged(Ran::Panicked("attempt to add with overflow"), &expected), (Passed, String::new()));
+    assert_eq!(
+        judged(Ran::Panicked("boom"), &expected),
+        (
+            Failed,
+            "note: panic did not contain expected string\n      panic message: \"boom\"\n expected substring: \"overflow\"\n"
+                .to_owned()
+        )
+    );
+    let ub = Ran::Ub { report: "error: Undefined Behavior: out-of-bounds read", seed: 7 };
+    for expects in [&No, &Yes, &expected] {
+        assert_eq!(judged(ub, expects), (Failed, "error: Undefined Behavior: out-of-bounds read\nseed: 7\n".to_owned()));
+        let (outcome, output) = judged(Ran::Unsupported("inline assembly"), expects);
+        assert_eq!(outcome, Failed);
+        assert!(output.ends_with("inline assembly\n"), "{output}");
+    }
 }

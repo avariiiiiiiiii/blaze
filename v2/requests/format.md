@@ -399,6 +399,11 @@ format-hir change. The item tree's own migration follows under "## format-hir-tr
 
 > forwarded to db and codegen: `hir-ty`, `hir-ty-borrowck`, `hir-def`'s `resolver.rs`/`upvars.rs` and `hir` are lane db's (crates.md gives `crates/hir/` to db, not items); `hir-ty-mir` and `hir-ty-codegen` are codegen's. Lane items is DONE, so its part is `requests`': items' `hir-ty` files have no `store[e]` site; `blaze-items`' four `exprs()` loops (`key.rs:887`, `tests/{form,hashes,facts}.rs`) drop `*closure_kind` for `closure_kind` once `ExpressionStore::exprs` yields `Expr<'_>` (it still yields `&Expr` from the arena).
 
+- `resolver.rs`: done by speed-hir-nameres-paths. It has no `ExprId`/`PatId` index site: its
+  store reads are `impl_data.store[target_trait.path]` (a `PathId`) and
+  `ExpressionStore::of(db, owner)[label]` (a `LabelId`), which keep `Index` under the contract,
+  so nothing changes.
+
 ## speed-types: `ContentId::of_many` and a context key per domain (`crates/blaze-ids/src/lib.rs`)
 
 From `speed-types` (blaze-items' speed pass). `blaze-items` already calls
@@ -540,6 +545,18 @@ me (`tmux send-keys -t blaze-v2:speed-hir-expand`).
 
 > forwarded to format (`span`, `syntax-bridge`) and to speed (speed-span-ast, speed-span-tt), both still running.
 
+Status (syntax-bridge side) done by speed-span-tt. `SpanMapper::span_for` stays `&self`: hold the
+`Cell<u32>` hint in hir-expand's mappers, one per conversion. Within one
+`syntax_node_to_token_tree*` call, `span_for` and `fragment_bounds` see ranges in increasing
+start order: one call per token, one per char of a multi-char punct, and two for a lifetime, the
+`'` then the rest. A doc comment's span and a closing delimiter's span are asked at that token's
+own range. Leaves that `on_enter`/`append` inject are the exception. Only the `_modified` entry
+point takes them, and each comes with the empty range at 0: `fragment_bounds` is asked about that
+range, `span_for` is not. A hint survives the jump back, because any hint gives the same answer.
+Apart from that, `span_at_from` and
+`span_for_range_from` give amortized two compares per token. For item 2, `token_tree_to_syntax_node`
+now builds its map with `SpanMap::with_capacity(parser_input.len())`.
+
 ## format-hir-encode: untrusted salsa indices in HIR buffers (docs/v2/plan/design/unsafe.md)
 
 From format-hir-encode, for the lead (`crates/blaze-format/`) and format-span (`crates/span/`).
@@ -578,3 +595,321 @@ comment in `hir::persist::syntax_context` can now name `read_verified` as where 
 is upheld (format-hir told).
 
 > forwarded to format: `crates/blaze-format/` and `crates/span/` are lane format's.
+
+## speed-span-tt: an in-order token walk of a flat tree (`crates/syntax-tree/src/flat.rs`)
+
+From `speed-span-tt`, for format-tree (live as format-edit). Notes:
+`docs/v2/plan/lanes/format/speed-span-tt.md`.
+
+`syntax_node_to_token_tree` on a flat node, through syntax-bridge's `FlatTokens`, reads every
+token of a macro input in order through `FlatTree::range(at)`. `range` computes `offset(at)` from
+the last mark, which is up to `MARK` (8) `text_len` steps per token. That is the bridge's only
+per-token cost above O(1). Before this change it called `range` and then `token_text`, so the
+cost was paid twice; now it is paid once, with the text sliced from `text()`.
+
+1. **`FlatTree::tokens_in(&self, at: u32) -> impl Iterator<Item = (u32, TextRange)>`**: the tokens
+   and lazy nodes from `at` to `end(at)` in order, each with its range. It starts from
+   `offset(at)` once, then adds `text_len` as it goes, so each step is O(1). A lazy node gets its
+   range, and its text is skipped. Same ranges as `range(it)` for each `it`. Or make `text_len`
+   public, and the bridge keeps the running offset itself. Tell `speed-span-tt` or whoever owns
+   `crates/syntax-bridge/` then; `FlatTokens::next` is the only caller to change.
+
+> forwarded to format: `crates/syntax-tree/` is lane format's.
+
+## speed-hir-store-readers: the lazy nodes as a slice (`crates/syntax-tree/src/flat.rs`)
+
+From `speed-hir-store-readers` (owns `crates/hir-def/src/expr_store/body.rs`), for whoever owns
+`crates/syntax-tree/` (speed-syntax / format-tree).
+
+`body_syntax` asks, per anchor of a file, whether its subtree holds a lazy node of an outline
+(`holds_lazy` in `expr_store/body.rs`): `tree.lazies().find(|&it| it >= at)`. `lazies()` is an
+iterator over `Lazy::nodes` (sorted, preorder), so each anchor scans every lazy node before it:
+O(anchors x bodies) for every edit of a dependency's file, where a binary search is O(log bodies).
+
+1. **`FlatTree::lazy_nodes(&self) -> &[u32]`**: the lazy nodes in preorder, sorted ascending
+   (`self.lazy.as_ref().map_or(&[], |it| &it.nodes)`). `lazies()` can stay as
+   `self.lazy_nodes().iter().copied()`.
+
+Once it exists, `holds_lazy` becomes (I make the edit; tell `speed-hir-store-readers` or
+`speed-hir-store`):
+```rust
+let lazies = tree.lazy_nodes();
+lazies.get(lazies.partition_point(|&it| it < at)).is_some_and(|&it| it < tree.end(at))
+```
+
+> applied (speed-syntax, 10-29): `FlatTree::lazy_nodes(&self) -> &[u32]` in
+> `crates/syntax-tree/src/flat.rs`, ascending preorder, empty without lazy nodes; `lazies()` is
+> now `self.lazy_nodes().iter().copied()`. Not compiled (no builds in this lane).
+
+## format-hir-tree
+
+From format-hir-tree (a child of format-hir), 2026-10-29. Not compiled (this lane runs no
+builds). Per `docs/v2/plan/design/data.md` and the lead's addendum, the `ItemTree`
+(`crates/hir-def/src/item_tree.rs`) is now columns:
+- An item is a dense `ModItemId` into three per-item columns: kind (`u8`), data word (`u32`) and
+  `FileAstId` (`u32`). That is `ITEM_BYTES = 9` per item, const-asserted.
+- Each kind's payload is a flat column of plain `u32` records (at most 16 bytes: `Struct` and
+  `Mod`).
+- Lists are `IdRange`s: inline module and extern block items, a `use` tree's children, a tuple
+  struct's constructor visibilities.
+- Names and paths are per-tree ids (`NameId`, `PathId`). Aliases are `AliasId`, use trees
+  `UseTreeId`.
+- Attributes are one flat array, one `IdRange` per item, read as `AttrsOrCfgRef<'_>`.
+
+`ItemTree::index(id)` still gives `ModItemKind::X(ast_id, &X)`. What changed is what the record
+fields hold. These sites are lanes db's and items' (`nameres/`, `src.rs`); every one is in
+`crates/hir-def/src/nameres/collector.rs` except the last.
+
+The rule:
+1. A record's `name` is a `NameId`. `&it.name` becomes `&item_tree[it.name]` (or
+   `&self.item_tree[it.name]`). `it.name.clone()` becomes `item_tree[it.name].clone()`.
+   `Const::name` is `NameId::NONE` for `const _`; read it as `item_tree.get_name(it.name)`, an
+   `Option<&Name>`.
+2. `MacroCall::path` is a `PathId`, so `&item_tree[path]` is the `Interned<ModPath>`.
+   `ExternCrate::alias` is an `AliasId`, so `item_tree.import_alias(alias)` is the
+   `Option<ImportAlias>`.
+3. Lists come from the tree:
+   - `&block.children` becomes `item_tree.items(block.children)`.
+   - `match &module.kind` becomes `match item_tree.mod_kind(module)`. That gives
+     `ModKind::Inline { items: &[ModItemId] }` or `ModKind::Outline`.
+   - `match &it.value_ns_ctor` becomes `match item_tree.value_ns_ctor(it)`. The variants keep
+     their names: `ValueNsCtorWithVis(&RawVisibilityId)`, `ValueNsCtorWithMinVis(&[RawVisibilityId])`.
+4. Attributes: `item_tree.attrs(id)` and `top_level_attrs()` give `Option<AttrsOrCfgRef<'_>>`,
+   a `Copy` enum with two variants:
+   - `Enabled { attrs: Attrs<'_> }`;
+   - `CfgDisabled(&CfgExpr, Attrs<'_>)`.
+
+   So `attrs.as_ref()` becomes `attrs`, `cfg.0` / `&cfg.0` becomes `cfg`, and `it.1.as_ref()`
+   becomes the second field. `AttrsOrCfg::lower` (owned, used by `nameres/assoc.rs`) is
+   unchanged.
+5. `Use::expand(&self, cb)` becomes `Use::expand(&self, tree: &ItemTree, cb)`.
+   `lower_use_tree(..)` returns `Option<Arena<ast::UseTree>>`, the source map alone.
+
+Examples:
+
+```rust
+// before (collector.rs 2962)
+update_def(self.def_collector, fn_id.into(), &it.name, vis, None);
+// after
+update_def(self.def_collector, fn_id.into(), &item_tree[it.name], vis, None);
+```
+
+```rust
+// before (collector.rs 2815-2822)
+Some(AttrsOrCfg::Enabled { attrs }) => attrs.as_ref(),
+None => Attrs::EMPTY,
+Some(AttrsOrCfg::CfgDisabled(cfg)) => {
+    let ast_id = item_id.ast_id(self.item_tree).erase();
+    self.emit_unconfigured_diagnostic(InFile::new(self.file_id(), ast_id), &cfg.0);
+// after
+Some(AttrsOrCfgRef::Enabled { attrs }) => attrs,
+None => Attrs::EMPTY,
+Some(AttrsOrCfgRef::CfgDisabled(cfg, _)) => {
+    let ast_id = item_id.ast_id(self.item_tree).erase();
+    self.emit_unconfigured_diagnostic(InFile::new(self.file_id(), ast_id), cfg);
+```
+
+```rust
+// before (collector.rs 2936)
+self.collect(&block.children, ItemContainerId::ExternBlockId(extern_block_id))
+// after
+self.collect(item_tree.items(block.children), ItemContainerId::ExternBlockId(extern_block_id))
+```
+
+Exact edits, `crates/hir-def/src/nameres/collector.rs` (line numbers as of this note):
+- 44: in the `item_tree::{..}` import, `AttrsOrCfg` becomes `AttrsOrCfgRef`.
+- 190: `item.expand(|idx, path, kind, alias| {` becomes
+  `item.expand(tree, |idx, path, kind, alias| {`.
+- 858-862 (`seed_with_top_level`):
+  ```rust
+  let attrs = match item_tree.top_level_attrs() {
+      Some(AttrsOrCfgRef::Enabled { attrs }) => attrs,
+      None => Attrs::EMPTY,
+      Some(AttrsOrCfgRef::CfgDisabled(_, attrs)) => attrs,
+  };
+  ```
+- 956-957: the condition becomes
+  `if let Some(AttrsOrCfgRef::CfgDisabled(cfg_expr, _)) = item_tree.top_level_attrs() {`.
+  Delete the next line, `let (cfg_expr, _) = &**attrs;` (`cfg_expr.clone()` at 961 stays).
+- 972: `ModItemKind::Mod(_, module) if module.name.as_str() == name)` becomes
+  `ModItemKind::Mod(_, module) if item_tree[module.name].as_str() == name)`.
+- 998: `Some(AttrsOrCfg::Enabled { .. }) | None` becomes `Some(AttrsOrCfgRef::Enabled { .. }) | None`.
+- 2815-2822: as in the second example above.
+- 2852, after `let item_tree::ExternCrate { name, visibility, alias } = item;`, add:
+  ```rust
+  let name = &item_tree[*name];
+  let alias = item_tree.import_alias(*alias);
+  ```
+  Then 2874 `let name = match alias {` becomes `let name = match &alias {`. The arms and the
+  uses of `name` after it stay as they are: `*name == sym::self_`,
+  `.get(name)`, `name.cloned()`.
+- 2936: as in the third example above.
+- `&it.name` becomes `&item_tree[it.name]` at 2962 and 2967 (`parse_proc_macro_decl`), 3010,
+  3029, 3046, 3074, 3086 and 3098.
+- 2982: `match &it.value_ns_ctor {` becomes `match item_tree.value_ns_ctor(it) {`. The arms stay.
+- 3053: `match &it.name {` becomes `match item_tree.get_name(it.name) {`. The arms stay.
+- `collect_module` (3158-3258):
+  - At the top, add `let item_tree = self.item_tree; let name = &item_tree[module.name];`.
+  - 3166: `match &module.kind {` becomes `match item_tree.mod_kind(module) {`.
+  - `module.name.clone()` becomes `name.clone()` at 3170, 3223 and 3247.
+  - `&module.name` becomes `name` at 3177 and 3206.
+  - 3215-3218: `Some(AttrsOrCfgRef::CfgDisabled(cfg, _)) => {`, then pass `cfg` for `&cfg.0`.
+  - 3221: `Some(AttrsOrCfgRef::Enabled { .. }) | None => {`.
+  - 3238: `matches!(top_level_attrs, Some(AttrsOrCfgRef::Enabled { attrs }) if attrs.by_key(sym::macro_use).exists())`.
+- `collect_macro_rules`: 3417 `None => &mac.name,` becomes `None => &self.item_tree[mac.name],`.
+  3461 `mac.name.clone(),` becomes `self.item_tree[mac.name].clone(),`.
+- `collect_macro_def`:
+  - At the top (after `let krate = ..`), add
+    `let item_tree = self.item_tree; let mac_name = &item_tree[mac.name];`.
+  - `&mac.name` becomes `mac_name` at 3480, 3485 and 3504.
+  - 3495: `name == mac.name` becomes `name == *mac_name`.
+  - 3497: `mac.name.display(..)` becomes `mac_name.display(..)`.
+  - 3532: `mac.name.clone()` becomes `mac_name.clone()`.
+- `collect_macro_call`: 3552 `let &MacroCall { ref path, expand_to, ctxt } = macro_call;`
+  becomes:
+  ```rust
+  let &MacroCall { path, expand_to, ctxt } = macro_call;
+  let path = &self.item_tree[path];
+  ```
+  The `path.clone()` at 3553 is unchanged and still gives an `Interned<ModPath>`.
+
+Status (`nameres/collector.rs`, every edit above): done by speed-hir-nameres-fixpoint. `src.rs` is not
+its path.
+
+`crates/hir-def/src/src.rs` 59-63 (`use_tree_source_map`): delete the `.1` after
+`.expect("failed to lower use tree")`, because `lower_use_tree` returns the arena itself.
+
+One more, for whoever owns `crates/span`: `FileAstId::downcast_unchecked` debug-asserts the
+id's kind, and `ErasedFileAstId::kind_typed` / `ErasedFileAstIdKind::syntax_kind` are private.
+So a decoded item tree can't check that each item's ast id has its kind's syntax kind, and a
+corrupted buffer panics in debug builds at `ItemTree::index` where it should be refused.
+Wanted: `pub fn ErasedFileAstId::may_be<N: AstIdNode>(self) -> bool`, the same test the
+debug assertion makes. `item_tree/persist.rs`'s `check` would then call it per item (I'd make
+that edit).
+
+> forwarded to format: between its own children.
+
+## format-hir: type refs are columns too (addition to the rule above; to lanes db, items)
+
+From format-hir, 2026-10-29. `hir/type_ref.rs` keeps a store's type refs as columns
+(`TypeColumns`: a u8 kind and a u32 word each, 5 bytes against a budget of 12, const-asserted).
+`TypeRef<'a>` is a view, `TypeRefId = Idx<TypeRef<'static>>`, and `Index<TypeRefId>` for
+`ExpressionStore` is gone. The same rule applies:
+1. `store[t]` / `&store[t]` becomes `store.type_ref(t)`. `store.types.iter()` (or an
+   iteration over every type ref) becomes `store.type_refs()`, yielding
+   `(TypeRefId, TypeRef<'_>)`.
+2. Fields of the view: `Tuple(&[TypeRefId])`, `ImplTrait(&[TypeBound])` and
+   `DynTrait(&[TypeBound])` are slices as before. `Path(&Path)`, `Reference(&RefType)`,
+   `Array(&ArrayType)` and `Fn(&FnType)` are references (an earlier `&**fn_type` becomes
+   `fn_type`). `RawPtr(TypeRefId, Mutability)`, `Slice(TypeRefId)`,
+   `TypeParam(TypeParamId)` and `PatternType(TypeRefId, PatId)` bind by value
+   (`*inner` becomes `inner`).
+3. A function taking `&TypeRef` takes `TypeRef<'_>`.
+
+Sites, about 73: hir-ty `lower.rs` 27, `lower/path.rs` 4, `generics.rs` 2 (lane db);
+hir-ty-borrowck `regions.rs` 30 (lane db); hir `display.rs` 6, `diagnostics.rs` 2,
+`semantics.rs` 1, `lib.rs` 1 (lane items). These land with the expression change.
+
+## From safety-audit
+
+From `safety-audit-front` (child of `safety-audit`, lane `safety`). The workspace is about to deny
+`unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks` and
+`clippy::multiple_unsafe_ops_per_block`. Every file below was BUSY, so these are for you to paste.
+Comments, `# Safety` sections, block splits and crate-root attributes only: no behavior change.
+A split keeps the order of evaluation and binds only `Copy` values. Line numbers are as of
+2026-10-29 18:45.
+
+### intern
+
+- `crates/intern/src/arena.rs:135` block (`Table::new`): 2 ops (two `zeroed` calls). Split:
+  ```rust
+  // SAFETY: all-zero bytes are a `Group`: a zero control word (every slot empty) and null pointers.
+  let slots: Box<[Group]> = unsafe { zeroed(groups) };
+  // SAFETY: all-zero bytes are an `AtomicU64` of 0.
+  let hashes: Box<[AtomicU64]> = unsafe { zeroed(groups * GROUP) };
+  Table { groups: slots, hashes }
+  ```
+- `crates/intern/src/arena.rs:412` block (`Bump::alloc`): 3 ops (`cursor.add`, `at.add`, `NonNull::new_unchecked`). Split:
+  ```rust
+  // SAFETY: `pad + size <= left`, the bytes of the current chunk from `cursor`, so `cursor + pad` is in the chunk.
+  let at = unsafe { self.cursor.add(pad) };
+  // SAFETY: as for `at`: `at + size` is at most one past the chunk's last byte.
+  self.cursor = unsafe { at.add(size) };
+  self.left -= pad + size;
+  // SAFETY: `at` is inside a chunk from `chunk`, an allocation `own` never returns null.
+  unsafe { NonNull::new_unchecked(at) }
+  ```
+- `crates/intern/src/arena.rs:464` block (test helper `intern`, `to.cast::<u64>().write(value)`): no SAFETY. Put the comment on its own line between `Entry::Vacant(vacant) => vacant` and `.insert(..)`: `` // SAFETY: `insert` hands `write` fresh memory of `Layout::new::<u64>()`, aligned and written by no one else. ``
+- `crates/intern/src/intern.rs:148` `unsafe impl<T: Sync> Sync for InternedRef<'_, T>`: no SAFETY (the comment above `:147` covers only the `Send` impl). Proposed: `` // SAFETY: as for `Send`: sharing an `InternedRef` shares only a `&T` to a value that lives for the process, which `T: Sync` makes safe. ``
+- `crates/intern/src/intern_slice.rs:54` `unsafe impl Sync for InternedSlice<T>`: no SAFETY of its own. Proposed: `` // SAFETY: as for `Send`: an `InternedSlice` is a shared reference to a header and items that are `Send + Sync`, live for the process and are never written again. ``
+- `crates/intern/src/intern_slice.rs:107` block (`write`): 4 ops (two derefs of `fat`, `write`, `copy_from_nonoverlapping`). Split:
+  ```rust
+  // SAFETY: `fat` points at writable memory of `layout::<T>(slice.len())` (the precondition), so its `header` field is in bounds and aligned (`repr(C)`); this takes the field's address without reading it.
+  let header_at = unsafe { &raw mut (*fat).header };
+  // SAFETY: `header_at` is in bounds, aligned and not initialized yet; `write` drops nothing.
+  unsafe { header_at.write(HeaderWithLength { header, length: slice.len() }) };
+  // SAFETY: as for `header_at`: the address of the `slice` field, `slice.len()` items long.
+  let items_at = unsafe { &raw mut (*fat).slice }.cast::<T::SliceType>();
+  // SAFETY: `items_at` has room for `slice.len()` items and is aligned for them, and it is fresh memory, so it cannot overlap `slice`; `SliceType: Copy`, so copying the bytes is a copy.
+  unsafe { items_at.copy_from_nonoverlapping(slice.as_ptr(), slice.len()) };
+  ```
+- `crates/intern/src/intern_slice.rs:122` block (`pointee`): 3 ops (deref of `header`, `read`, deref of the fat pointer). Split:
+  ```rust
+  let header = at.cast::<HeaderWithLength<T::Header>>().as_ptr();
+  // SAFETY: `at` starts a published `Pointee<T>` (the precondition), which starts with its initialized `HeaderWithLength`; this takes the `length` field's address.
+  let length_at = unsafe { &raw const (*header).length };
+  // SAFETY: `length_at` is the initialized `length` of a value never written again.
+  let length = unsafe { length_at.read() };
+  // SAFETY: `length` is the value's own slice length, so the fat pointer covers exactly the value, which lives for the process.
+  unsafe { &*fat::<T>(at, length) }
+  ```
+- `crates/intern/src/intern_slice.rs:188` `unsafe impl Sync for InternedSliceRef<'_, T>`: no SAFETY of its own. Proposed: `` // SAFETY: as for `Send`: a shared reference to `Send + Sync` values that live for the process. ``
+- `crates/intern/src/symbol.rs:33` `unsafe impl Sync for Symbol`: no SAFETY of its own. Proposed: `` // SAFETY: as for `Send`: a `Symbol` is a shared reference to a `&'static str` that is never written again. ``
+- `crates/intern/src/symbol.rs:86` block (`Symbol::intern`, the `insert` closure): 5 ops (`add`, `copy_from_nonoverlapping`, `from_raw_parts`, `from_utf8_unchecked`, `write`). Split:
+  ```rust
+  // SAFETY: `to` is fresh memory of `layout`, and `bytes_at` is where `Layout::extend` put the bytes in it, so the pointer stays in the allocation.
+  let bytes = unsafe { to.as_ptr().add(bytes_at) };
+  // SAFETY: `bytes` has room for `s.len()` bytes (the array part of `layout`) and is fresh memory, so it cannot overlap `s`.
+  unsafe { bytes.copy_from_nonoverlapping(s.as_ptr(), s.len()) };
+  // SAFETY: the `s.len()` bytes at `bytes` were just written, and the arena never moves, writes or frees them, so they live for `'static`.
+  let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes, s.len()) };
+  // SAFETY: `bytes` is a copy of `s`, a `&str`, so it is UTF-8.
+  let text: &'static str = unsafe { std::str::from_utf8_unchecked(bytes) };
+  // SAFETY: `layout` starts with a `&'static str` (`Layout::new`), so `to` is aligned for it and has room, and nothing was there to drop.
+  unsafe { to.cast::<&'static str>().write(text) };
+  ```
+- Everything else in `intern` (`arena.rs:128`, `:240`, `:295`, `:387`, `:431`, `:445`, `:457`; `intern.rs`; `intern_slice.rs:66`, `:75`, `:152`, `:199`; `symbol.rs:59`, `:69`, `:75`, `:106`, `:113`): ok.
+
+### syntax-tree
+
+`crates/syntax-tree/Cargo.toml` has no `[lints] workspace = true`, so the lints don't bind it until it does; the findings stand either way.
+
+- `crates/syntax-tree/src/cursor.rs:186` unsafe fn `flat_unbound`: its contract is a `SAFETY:` paragraph, not a `# Safety` section. Proposed doc:
+  ```rust
+  /// [`flat`] for a root that is not borrowed from a cursor.
+  ///
+  /// # Safety
+  ///
+  /// The caller holds a cursor into `root`'s file, which keeps `root` alive (a part's root lives
+  /// as long as its file's), for as long as `'a`.
+  ```
+- `crates/syntax-tree/src/cursor.rs:187` block (`&*root.as_ptr()`): no SAFETY. Proposed: `` // SAFETY: the caller's precondition keeps `root` alive for `'a`: a `FlatRoot` made from a box by `new_flat_root` or `part_root`, freed only when the last cursor into its file drops, and only ever read through shared references. ``
+
+### syntax
+
+- `crates/syntax/examples/trees.rs:29` block (`System.alloc`): the comment `as the system allocator's own` names no invariant. Proposed: `` // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (a non-zero-sized `layout`), which is `System`'s too. ``
+- `crates/syntax/examples/trees.rs:34` block (`System.dealloc`): same. Proposed: `` // SAFETY: `ptr` came from `alloc` above with `layout`, which is `System.alloc`'s, so it is `System`'s to free with that layout. ``
+- `src/raw.rs` and the crate root (`deny(unsafe_code)` with `#[allow(unsafe_code)] mod raw`): ok.
+- `crates/syntax/fuzz/` is a package of its own (its own `[workspace]`, no workspace lints) with no unsafe; `#![forbid(unsafe_code)]` at the top of `fuzz_targets/parser.rs` and `reparse.rs` is optional, since libfuzzer's `fuzz_target!` expands outside them.
+
+### blaze-ids, mbe (item 4)
+
+- `crates/blaze-ids/src/lib.rs:12` crate: no `unsafe`. Add `#![forbid(unsafe_code)]` after the `//!` docs.
+- `crates/mbe/src/lib.rs:9` crate: no `unsafe` (`parser.rs:21`'s `sym::unsafe_` is a symbol). Add `#![forbid(unsafe_code)]` after the `#![cfg_attr(feature = "in-rust-tree", ...)]` line.
+
+### Checked, nothing to do
+
+- `tt` (`lib.rs:7`), `syntax-bridge` (`lib.rs:4`) and `const-ast` (`lib.rs:28`) already forbid `unsafe_code`.
+- `blaze-format`: `Record`'s `# Safety` (`lib.rs:48`) asks for `#[repr(C)]` or a primitive, no padding, no pointer, and every bit pattern `check` accepts being a value. Every impl meets it: `plain!` (primitives, and `ContentId`, `Fingerprint`, `SchemaHash`, each `#[repr(transparent)]` over a byte array or an integer), `bool` (`check` accepts only 0 and 1), `[T; N]`, `Rel<T>` and `Slice<T>` (`#[repr(C)]` integers and a ZST), `SpanRef` (`#[repr(C)]`, size asserted 36), and `record!` (asserts no padding; `SAFETY` written inside the macro body). Its blocks are single-op and commented. The same holds for `blaze-query/src/tests.rs:27`'s `Word`.
+- `parser` (`syntax_kind.rs:20`, `lexed_str/scan.rs`), `span` (`hygiene.rs`) and format's `hir-def` files (`hir/persist.rs:615`, `expr_store/lower.rs:2808`, `:3085`, `item_tree/persist.rs:122`; `item_tree.rs` has no unsafe of its own left, using `record!`): ok.
+- `#[salsa::interned(unsafe(no_lifetime))]` (a salsa option, not Rust `unsafe`): `span/src/hygiene.rs:62`.

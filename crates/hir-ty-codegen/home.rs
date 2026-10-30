@@ -6,6 +6,8 @@
 //! on every file of the workspace crate that happened to use it, and give it one cache entry
 //! per crate that does.
 
+#![forbid(unsafe_code)]
+
 use std::sync::LazyLock;
 
 use base_db::{Crate, FileId};

@@ -9,6 +9,8 @@
 //! thread task held at most is measured ([`arena::measure`]) and teaches the [`Estimates`] the
 //! next task of its kind is admitted by.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::{BTreeMap, VecDeque},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -39,6 +41,9 @@ pub mod kinds {
     pub const REACH: TaskKind = TaskKind(0x1_0005);
     /// A view's queries walked for `Trace`, `Verify` or `CodegenInputs`.
     pub const WALK: TaskKind = TaskKind(0x1_0006);
+    /// `blaze test --ub`: the tests selected, and one test evaluated.
+    pub const UB_TESTS: TaskKind = TaskKind(0x1_0007);
+    pub const EVALUATE: TaskKind = TaskKind(0x1_0008);
 }
 
 /// What a thread task came to: how the plane settles its node, and its value for the loop.
@@ -246,8 +251,8 @@ impl<T> Inline<T> {
 }
 
 impl<T: Send + 'static> Runner<T> for Inline<T> {
-    fn post(&mut self, id: NodeId, _: Pool, _: Option<u32>, kind: TaskKind, work: Work<T>, arg: u32) {
-        self.queue.push_back((id, kind, work, arg));
+    fn post(&mut self, task: Posting, work: Work<T>) {
+        self.queue.push_back((task, work));
     }
 
     fn take(&mut self, out: &mut Vec<Ran<T>>) {
@@ -259,10 +264,10 @@ impl<T: Send + 'static> Runner<T> for Inline<T> {
         self.rng.shuffle(&mut posted);
         let now = 1 + self.rng.below(posted.len() as u64) as usize;
         self.queue.extend(posted.drain(now..));
-        for (id, kind, work, arg) in posted.drain(..) {
-            match run_measured(&work, arg) {
-                (Some(did), peak) => out.push(Ran { id, kind, did, peak }),
-                (None, _) => self.queue.push_back((id, kind, work, arg)),
+        for (task, work) in posted.drain(..) {
+            match run_measured(&work, task.arg) {
+                (Some(did), peak) => out.push(Ran { id: task.id, kind: task.kind, did, peak }),
+                (None, _) => self.queue.push_back((task, work)),
             }
         }
         self.posted = posted;
@@ -296,6 +301,7 @@ pub struct Plane<T> {
     next_request: u32,
     happened: Vec<Happened<T>>,
     ran: Vec<Ran<T>>,
+    said: Vec<PlaneOutput>,
 }
 
 fn ns(at: Duration) -> u64 {
@@ -313,6 +319,7 @@ impl<T: Send + 'static> Plane<T> {
             next_request: 0,
             happened: Vec::new(),
             ran: Vec::new(),
+            said: Vec::new(),
         })
     }
 
@@ -419,11 +426,12 @@ impl<T: Send + 'static> Plane<T> {
 
     /// Skips what of `request` has not started; it finishes not ok once what runs is done.
     pub fn cancel(&mut self, at: Duration, request: RequestId) {
-        let outputs = self
-            .graph
-            .cancel(ns(at), request)
+        let mut said = std::mem::take(&mut self.said);
+        self.graph
+            .cancel_into(ns(at), request, &mut said)
             .unwrap_or_else(|error| panic!("the plane refused to cancel {request}: {error}"));
-        self.outputs(outputs);
+        self.outputs(&mut said);
+        self.said = said;
     }
 
     /// A loop task is over.
@@ -470,14 +478,20 @@ impl<T: Send + 'static> Plane<T> {
         self.runner.running()
     }
 
+    /// One input, its outputs taken through `said`, which is reused by every step.
     fn step(&mut self, input: PlaneInput) -> Result<(), Error> {
-        let outputs = self.graph.step(input)?;
-        self.outputs(outputs);
-        Ok(())
+        let mut said = std::mem::take(&mut self.said);
+        let taken = self.graph.step_into(input, &mut said);
+        if taken.is_ok() {
+            self.outputs(&mut said);
+        }
+        said.clear();
+        self.said = said;
+        taken
     }
 
-    fn outputs(&mut self, outputs: Vec<PlaneOutput>) {
-        for output in outputs {
+    fn outputs(&mut self, outputs: &mut Vec<PlaneOutput>) {
+        for output in outputs.drain(..) {
             match output {
                 PlaneOutput::Said { record, .. } => {
                     let Event::Moved { id, state } = record.event else { continue };
@@ -496,11 +510,11 @@ impl<T: Send + 'static> Plane<T> {
                     };
                     self.happened.push(Happened::Settled { id, ok, why });
                 }
-                PlaneOutput::Run { id, pool, near } => match self.task(id) {
+                PlaneOutput::Run { id, pool, near, critical } => match self.task(id) {
                     Some((batch, Task::Thread { kind, arg })) => {
                         let work = batch.work.clone().expect("checked by add");
                         self.happened.push(Happened::Started { id });
-                        self.runner.post(id, pool, near, kind, work, arg);
+                        self.runner.post(Posting { id, pool, near, critical, kind, arg }, work);
                     }
                     Some((_, Task::Loop)) => self.happened.push(Happened::Run { id }),
                     Some((_, Task::Gone)) | None => panic!("the plane runs node {id}, which the daemon gave no task"),

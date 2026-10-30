@@ -6,6 +6,7 @@ use blaze_core::{
 };
 
 use super::*;
+use crate::read::Found;
 
 fn name(it: &str) -> FileName {
     FileName::new(it).unwrap()
@@ -86,8 +87,39 @@ fn settle(sim: &mut Sim, store: &mut Store) -> Settled {
     settled
 }
 
+impl Store {
+    /// What a lookup of `key` finds; it must be there and whole.
+    fn found_of(&self, key: &Key) -> Found<'_> {
+        self.look().find(key).expect("the store has the key").expect("its record is whole")
+    }
+
+    /// Where the record of `key` is in its pack: once a commit has moved it out of its segment.
+    fn loc_of(&self, key: &Key) -> Loc {
+        match self.found_of(key).place {
+            Place::Pack(loc) => loc,
+            Place::Segment(_) => panic!("{key:?} is still in its segment"),
+        }
+    }
+
+    /// The form of the record of `key`, and the bytes it stores and holds, wherever it is.
+    fn sizes_of(&self, key: &Key) -> (Form, u64, u64) {
+        match self.found_of(key).place {
+            Place::Pack(loc) => (loc.form, loc.stored, loc.raw),
+            Place::Segment(seg) => (seg.form, seg.stored, seg.raw),
+        }
+    }
+
+    fn flag_of(&self, key: &Key, flag: Flag) -> bool {
+        self.found_of(key).at.get(flag)
+    }
+
+    fn delta_len(&self) -> usize {
+        self.tiers[0].delta.len()
+    }
+}
+
 fn form_of(store: &Store, key: &Key) -> Form {
-    store.tiers[0].find(key).unwrap().unwrap().0.form
+    store.found_of(key).place.form()
 }
 
 fn quiet() -> Faults {
@@ -239,7 +271,7 @@ fn a_flipped_byte_of_a_value_is_never_served() {
     store.put(key(1), Kind::Query, vec![b'a'; 1000]).unwrap();
     store.put(key(2), Kind::Query, vec![b'b'; 1000]).unwrap();
     flush(&mut sim, &mut store);
-    let loc = store.tiers[0].delta[&key(2)].loc;
+    let loc = store.loc_of(&key(2));
     drop(store);
     let pack = name("store/pack-000000");
     let mut bytes = sim.contents(&pack);
@@ -304,13 +336,14 @@ fn near_identical_outputs_share_their_chunks() {
     second.splice(5000..5000, *b"a patched function").for_each(drop);
     second[1 << 20] ^= 1;
     store.put(key(1), Kind::Output, first.clone()).unwrap();
+    flush(&mut sim, &mut store);
     let after_first = output_bytes(&store);
     store.put(key(2), Kind::Output, second.clone()).unwrap();
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), first);
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), second, "read from its segment");
+    flush(&mut sim, &mut store);
     let added = output_bytes(&store) - after_first;
     assert!(added * 4 < first.len() as u64, "the second output added {added} bytes");
-    assert_eq!(bytes_of(&store, &key(1)).unwrap(), first);
-    assert_eq!(bytes_of(&store, &key(2)).unwrap(), second);
-    flush(&mut sim, &mut store);
     drop(store);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), second);
@@ -327,11 +360,10 @@ fn a_cold_kind_trains_its_dictionary_and_compresses_what_follows() {
     }
     assert_eq!(store.problems(), &[] as &[String]);
     assert_eq!(store.tiers[0].dictionaries.len(), 1, "one dictionary for runs");
-    let loc = store.tiers[0].delta[&key(count - 1)].loc;
-    assert_eq!(loc.form, Form::Zstd);
-    assert!(loc.stored * 3 < loc.raw, "{} stored of {}", loc.stored, loc.raw);
-    let first = store.tiers[0].delta[&key(0)].loc;
-    assert_eq!(first.form, Form::Raw);
+    let (form, stored, raw) = store.sizes_of(&key(count - 1));
+    assert_eq!(form, Form::Zstd);
+    assert!(stored * 3 < raw, "{stored} stored of {raw}");
+    assert_eq!(form_of(&store, &key(0)), Form::Raw);
     for n in 0..count {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), run_output(n));
     }
@@ -436,7 +468,7 @@ fn the_index_is_rewritten_into_the_other_slot_and_the_head_flipped() {
     }
     flush(&mut sim, &mut store);
     assert_eq!(store.tiers[0].head.index.unwrap().slot, 0);
-    assert!(store.tiers[0].delta.is_empty(), "the new table holds every record");
+    assert_eq!(store.delta_len(), 0, "the new table holds every record");
     for n in 1000..1000 + INDEX_AFTER as u64 {
         store.put(key(n), Kind::Code, n.to_le_bytes().to_vec()).unwrap();
     }
@@ -448,7 +480,7 @@ fn the_index_is_rewritten_into_the_other_slot_and_the_head_flipped() {
     flush(&mut sim, &mut store);
     drop(store);
     let store = open(&mut sim, "store");
-    assert_eq!(store.tiers[0].delta.len(), 1, "only what came after the table is read at open");
+    assert_eq!(store.delta_len(), 1, "only what came after the table is read at open");
     for n in (0..INDEX_AFTER as u64 + 5).chain(1000..1000 + INDEX_AFTER as u64) {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), n.to_le_bytes(), "{n}");
     }
@@ -463,10 +495,10 @@ fn packs_roll_over_when_full() {
     for n in 0..80 {
         store.put(key(n), Kind::Code, noise(10 << 10, n)).unwrap();
     }
+    flush(&mut sim, &mut store);
     let packs = store.tiers[0].packs.len();
     assert!(packs >= 3, "{packs} packs");
     assert!(store.tiers[0].packs.iter().all(|it| it.end <= PACK_MOST));
-    flush(&mut sim, &mut store);
     drop(store);
     let store = open(&mut sim, "store");
     for n in 0..80 {
@@ -693,14 +725,15 @@ fn a_long_cold_value_is_compressed_without_a_dictionary_over_a_long_window() {
         n += 1;
     }
     store.put(key(1), Kind::Debug, long.clone()).unwrap();
-    let loc = store.tiers[0].delta[&key(1)].loc;
-    assert_eq!(loc.form, Form::Zstd);
-    assert!(loc.stored * 4 < loc.raw, "{} stored of {}", loc.stored, loc.raw);
-    let header = RecordHeader::decode(store.tiers[0].packs[0].bytes(loc.offset, RECORD_HEADER).unwrap());
-    assert_eq!(header.unwrap().dictionary, NO_DICTIONARY);
+    let (form, stored, raw) = store.sizes_of(&key(1));
+    assert_eq!(form, Form::Zstd);
+    assert!(stored * 4 < raw, "{stored} stored of {raw}");
     assert!(store.tiers[0].dictionaries.is_empty(), "a long value is not a sample");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), long);
     flush(&mut sim, &mut store);
+    let loc = store.loc_of(&key(1));
+    let header = RecordHeader::decode(store.tiers[0].packs[loc.pack as usize].bytes(loc.offset, RECORD_HEADER).unwrap());
+    assert_eq!(header.unwrap().dictionary, NO_DICTIONARY);
     drop(store);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), long);
@@ -722,9 +755,9 @@ fn chunks_that_shrink_are_kept_in_lz4_and_the_rest_raw() {
     store.put(key(1), Kind::Output, both.clone()).unwrap();
     let forms: Vec<Form> = store.tiers[0]
         .delta
-        .iter()
-        .filter(|(key, _)| **key != self::key(1))
-        .map(|(_, it)| it.loc.form)
+        .iter(Held::writer(&store))
+        .filter(|(_, it)| it.key != key(1))
+        .map(|(_, it)| it.place.form())
         .collect();
     assert!(forms.contains(&Form::Lz4), "{forms:?}");
     assert!(forms.contains(&Form::Raw), "{forms:?}");
@@ -797,8 +830,7 @@ fn a_value_that_does_not_compress_is_tried_once() {
     settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
     assert_eq!(settle(&mut sim, &mut store).demoted, 0);
-    let (_, row) = store.tiers[0].find(&key(1)).unwrap().unwrap();
-    assert!(store.flags[0].get(row, Flag::Tried));
+    assert!(store.flag_of(&key(1), Flag::Tried));
     assert_eq!(form_of(&store, &key(1)), Form::Raw);
     assert_eq!(settle(&mut sim, &mut store), Settled::default());
 }
@@ -981,7 +1013,7 @@ fn a_value_of_columns_goes_warm_then_cold_then_comes_back_hot() {
     }
     assert_eq!(settle(&mut sim, &mut store).demoted, 1);
     assert_eq!(form_of(&store, &key(1)), Form::Warm);
-    assert!(store.tiers[0].find(&key(1)).unwrap().unwrap().0.stored < hot.len() as u64 / 4);
+    assert!(store.sizes_of(&key(1)).1 < hot.len() as u64 / 4);
     assert_eq!(settle(&mut sim, &mut store).demoted, 0, "a warm record made last period stays");
     assert_eq!(settle(&mut sim, &mut store).demoted, 1);
     assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
@@ -1040,8 +1072,7 @@ fn columns_that_do_not_decode_to_the_value_are_not_kept() {
     }
     assert_eq!(form_of(&store, &key(1)), Form::Raw);
     assert!(store.problems().iter().any(|it| it.contains("do not decode")), "{:?}", store.problems());
-    let (_, row) = store.tiers[0].find(&key(1)).unwrap().unwrap();
-    assert!(store.flags[0].get(row, Flag::Tried));
+    assert!(store.flag_of(&key(1), Flag::Tried));
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
 }
 
@@ -1075,7 +1106,7 @@ fn each_crate_version_has_packs_of_its_own_and_keeps_them_across_an_open() {
     }
     store.put(key(10), Kind::Image, noise(3000, 10)).unwrap();
     flush(&mut sim, &mut store);
-    let pack_of = |store: &Store, n: u64| store.tiers[0].find(&key(n)).unwrap().unwrap().0.pack as usize;
+    let pack_of = |store: &Store, n: u64| store.loc_of(&key(n)).pack as usize;
     let units: Vec<u32> = (0..6).map(|n| store.tiers[0].packs[pack_of(&store, n)].unit).collect();
     assert_eq!(units, [unit_a.0, unit_b.0, unit_a.0, unit_b.0, unit_a.0, unit_b.0]);
     assert_eq!(pack_of(&store, 0), pack_of(&store, 2), "kinds of one crate version share its file");
@@ -1089,6 +1120,7 @@ fn each_crate_version_has_packs_of_its_own_and_keeps_them_across_an_open() {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), noise(5000, n), "{n}");
     }
     store.put_in(unit_a, key(20), Kind::Query, noise(100, 20)).unwrap();
+    flush(&mut sim, &mut store);
     assert_eq!(pack_of(&store, 20), pack_of(&store, 0), "a unit appends to its own pack");
     assert_eq!(store.verify(None), Vec::new());
 }
@@ -1126,9 +1158,9 @@ fn movable_column(column: &[u32]) -> Vec<u32> {
 /// The record's form and values, read without counting as a read, so looking does not change
 /// where the mover sends it.
 fn peek(store: &Store, key: &Key) -> (Form, Vec<u32>) {
-    let (loc, row) = store.tiers[0].find(key).unwrap().unwrap();
-    let (_, bytes) = store.value(0, key, loc, row, Use::Check).unwrap();
-    (loc.form, one_column(false).values(&bytes).unwrap())
+    let found = store.found_of(key);
+    let (_, bytes) = store.look().value(found, key, Use::Check).unwrap();
+    (found.place.form(), one_column(false).values(&bytes).unwrap())
 }
 
 /// What a column read as at each step of its record's life in the store.

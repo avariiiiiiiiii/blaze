@@ -128,8 +128,13 @@ static FREE: Lock<Free> = Lock::new(Free { next: 1, free: Vec::new() });
 fn stack(index: u64) -> Option<&'static Stack> {
     let index = usize::try_from(index).ok()?;
     let chunk = DIR.get(index / CHUNK)?.load(Ordering::Acquire);
-    // SAFETY: a published chunk is `CHUNK` stacks, leaked, never freed or moved.
-    (!chunk.is_null()).then(|| unsafe { &*chunk.add(index % CHUNK) })
+    (!chunk.is_null()).then(|| {
+        // SAFETY: `index % CHUNK < CHUNK`, and a published chunk is `CHUNK` stacks.
+        let at = unsafe { chunk.add(index % CHUNK) };
+        // SAFETY: a published chunk is leaked, never freed or moved, and its stacks were made
+        // before the release store that published it, which the acquire load above pairs with.
+        unsafe { &*at }
+    })
 }
 
 fn claim() -> (u32, &'static Stack) {

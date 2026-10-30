@@ -7,8 +7,9 @@ use hir_def::{
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, ConstKind, RegionKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
-    TypeVisitor, inherent::IntoKind as _,
+    TypeVisitor, fast_reject::DeepRejectCtxt, inherent::IntoKind as _,
 };
+use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::{
@@ -178,13 +179,26 @@ pub(crate) fn specialized_ancestor(
     if !features.specialization && !features.min_specialization {
         return None;
     }
-    let trait_id = db.impl_trait(impl_id)?.skip_binder().def_id.0;
-    let ancestors: Vec<ImplId> =
-        TraitImpls::in_crate_and_deps_for_trait(db, impl_id.krate(db), trait_id)
+    let trait_ref = db.impl_trait(impl_id)?.instantiate_identity().skip_norm_wip();
+    // As rustc's `overlapping_impls` rejects a pair before relating it, with the parameters as
+    // `specializes_query` has them: the specializing impl's rigid, the parent's inference
+    // variables. A pair rejected here is one whose trait refs that query fails to equate.
+    let reject = DeepRejectCtxt::relate_rigid_infer(DbInterner::new_no_crate(db));
+    let headers_may_unify = |ancestor: ImplId| {
+        db.impl_trait(ancestor).is_some_and(|parent| {
+            let parent = parent.instantiate_identity().skip_norm_wip();
+            reject.args_may_unify(trait_ref.args, parent.args)
+        })
+    };
+    let ancestors: SmallVec<[ImplId; 4]> =
+        TraitImpls::in_crate_and_deps_for_trait(db, impl_id.krate(db), trait_ref.def_id.0)
             .iter()
             .copied()
             .filter(|&ancestor| {
-                ancestor != impl_id && has_item(ancestor) && specializes(db, impl_id, ancestor)
+                ancestor != impl_id
+                    && has_item(ancestor)
+                    && headers_may_unify(ancestor)
+                    && specializes(db, impl_id, ancestor)
             })
             .collect();
     ancestors.iter().copied().find(|&ancestor| {
@@ -256,18 +270,38 @@ fn parameters_for<'db>(
 /// variable nothing constrains, and gives an error instead.
 #[salsa::tracked(returns(copy))]
 pub(crate) fn impl_has_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> bool {
-    !impl_unconstrained_params(db, impl_id).is_empty()
+    let Some(constrained) = constrained_params(db, impl_id) else { return false };
+    type_or_const_params(db, impl_id)
+        .any(|param| !constrained.contains(&Parameter::TypeOrConst(param)))
 }
 
 /// The type and const parameters of `impl_id` that are constrained neither by its header nor
 /// by the associated types its where clauses equate with what is, in declaration order: each
 /// is one E0207. None when the header has an error type.
 pub fn impl_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> Vec<TypeOrConstParamId> {
+    let Some(constrained) = constrained_params(db, impl_id) else { return Vec::new() };
+    type_or_const_params(db, impl_id)
+        .filter(|&param| !constrained.contains(&Parameter::TypeOrConst(param)))
+        .collect()
+}
+
+fn type_or_const_params(
+    db: &dyn HirDatabase,
+    impl_id: ImplId,
+) -> impl Iterator<Item = TypeOrConstParamId> + '_ {
+    GenericParams::of(db, impl_id.into())
+        .iter_type_or_consts()
+        .map(move |(local_id, _)| TypeOrConstParamId { parent: impl_id.into(), local_id })
+}
+
+/// The parameters of `impl_id` its header and its where clauses' projections constrain, or
+/// `None` when the header has an error type.
+fn constrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> Option<FxHashSet<Parameter>> {
     let interner = DbInterner::new_no_crate(db);
     let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
     let trait_ref = db.impl_trait(impl_id).map(|it| it.instantiate_identity().skip_norm_wip());
     if self_ty.references_error() || trait_ref.is_some_and(|it| it.references_error()) {
-        return Vec::new();
+        return None;
     }
     let mut constrained = FxHashSet::default();
     match trait_ref {
@@ -275,21 +309,23 @@ pub fn impl_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> Vec<T
         None => parameters_for(self_ty, false, &mut constrained),
     }
     // rustc's `setup_constraining_predicates`: `<T as Trait>::Assoc == U` constrains `U` once
-    // what the projection names is.
-    let projections: Vec<_> = GenericPredicates::query_own_explicit(db, impl_id.into())
+    // what the projection names is. A projection of the impl's own trait ref never does.
+    let projections: SmallVec<[_; 4]> = GenericPredicates::query_own_explicit(db, impl_id.into())
         .iter_identity()
         .filter_map(|it| match it.skip_norm_wip().kind().skip_binder() {
-            ClauseKind::Projection(projection) => Some(projection),
+            ClauseKind::Projection(projection)
+                if Some(projection.projection_term.trait_ref(interner)) != trait_ref =>
+            {
+                Some(projection)
+            }
             _ => None,
         })
         .collect();
+    let mut inputs = FxHashSet::default();
     loop {
         let before = constrained.len();
         for projection in &projections {
-            if Some(projection.projection_term.trait_ref(interner)) == trait_ref {
-                continue;
-            }
-            let mut inputs = FxHashSet::default();
+            inputs.clear();
             parameters_for(projection.projection_term, true, &mut inputs);
             if inputs.is_subset(&constrained) {
                 parameters_for(projection.term, false, &mut constrained);
@@ -299,9 +335,5 @@ pub fn impl_unconstrained_params(db: &dyn HirDatabase, impl_id: ImplId) -> Vec<T
             break;
         }
     }
-    GenericParams::of(db, impl_id.into())
-        .iter_type_or_consts()
-        .map(|(local_id, _)| TypeOrConstParamId { parent: impl_id.into(), local_id })
-        .filter(|&param| !constrained.contains(&Parameter::TypeOrConst(param)))
-        .collect()
+    Some(constrained)
 }

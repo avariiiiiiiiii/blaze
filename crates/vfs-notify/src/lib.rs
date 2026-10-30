@@ -7,6 +7,8 @@
 //! Hopefully, one day a reliable file watching/walking crate appears on
 //! crates.io, and we can reduce this to trivial glue code.
 
+#![forbid(unsafe_code)]
+
 use std::{
     fs,
     path::{Component, Path},

@@ -18,6 +18,7 @@ doctest = false
 [dependencies]
 bumpalo.workspace = true
 either.workspace = true
+hashbrown.workspace = true
 indexmap.workspace = true
 la-arena.workspace = true
 postcard.workspace = true

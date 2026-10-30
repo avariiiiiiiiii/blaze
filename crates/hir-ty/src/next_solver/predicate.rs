@@ -181,7 +181,8 @@ impl<'db> rustc_type_ir::relate::Relate<DbInterner<'db>> for BoundExistentialPre
 }
 
 /// Every interned [`Predicate`].
-static PREDICATES: table::Rows = table::Rows::new("predicates", table::LAST_ROW);
+static PREDICATES: table::Rows<Binder<'static, PredicateKind<'static>>> =
+    table::Rows::new("predicates", table::LAST_ROW);
 
 /// A predicate: its row in [`PREDICATES`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -192,17 +193,31 @@ pub struct Predicate<'db> {
 }
 
 const _: () = assert!(size_of::<Option<Predicate<'static>>>() == 4);
+// A row costs `table::ROW_BYTES` hot bytes and its kind, at most 48 cold ones.
+const _: () = assert!(size_of::<Binder<'static, PredicateKind<'static>>>() <= 48);
 
 impl<'db> Predicate<'db> {
     pub fn new(_interner: DbInterner<'db>, kind: Binder<'db, PredicateKind<'db>>) -> Self {
         Self::intern(kind)
     }
 
+    #[inline]
     pub(super) fn intern(kind: Binder<'db, PredicateKind<'db>>) -> Self {
-        let words = persist::encode(&kind);
-        Self::at(PREDICATES.intern(&words, || {
+        // SAFETY: the two types differ only in their lifetime, which an interned value does not
+        // depend on (it is never freed).
+        let kind = unsafe {
+            std::mem::transmute::<
+                Binder<'db, PredicateKind<'db>>,
+                Binder<'static, PredicateKind<'static>>,
+            >(kind)
+        };
+        Self::at(PREDICATES.intern(kind, || {
             let computed = FlagComputation::for_predicate(kind);
-            (computed.flags, computed.outer_exclusive_binder)
+            table::RowInfo {
+                tag: persist::tag(&kind),
+                flags: computed.flags,
+                binder: computed.outer_exclusive_binder,
+            }
         }))
     }
 
@@ -614,8 +629,13 @@ impl<'db> IntoKind for Predicate<'db> {
 
     #[inline]
     fn kind(self) -> Self::Kind {
-        // SAFETY: a `Predicate` is a row of `PREDICATES`.
-        persist::decode(unsafe { PREDICATES.fields(self.index) })
+        // SAFETY: a `Predicate` is a row of `PREDICATES`; the lifetime is as in `intern`.
+        unsafe {
+            std::mem::transmute::<
+                Binder<'static, PredicateKind<'static>>,
+                Binder<'db, PredicateKind<'db>>,
+            >(PREDICATES.kind(self.index))
+        }
     }
 }
 

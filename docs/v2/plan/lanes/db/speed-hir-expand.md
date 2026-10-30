@@ -35,8 +35,8 @@ format's (`crates/span`, `crates/syntax-bridge`); what hir-expand needs from the
 | eager input's nested lazy call | a `Parse` clone (two `Arc` increments on shared lines) | the root node |
 | attribute path check (`is1`, item-tree filter, cfg stripping) | a `SmolStr` per attribute | the segment's text read in place |
 | span-map entry (format's) | 24 bytes, `(TextSize, Span)` interleaved: the search read 24-byte entries | 4-byte `ends` column searched, 20-byte `spans` column loaded once: 24 bytes per entry, 16 offsets per cache line |
-| span lookups per token, syntax to token tree (format's) | one binary search per token, `O(log n)` | unchanged: the in-order cursor (amortized `O(1)`) is filed, not landed |
-| down-mapping (IDE, format's) | linear scan of the map per token | unchanged: the anchor-sorted index is filed |
+| span lookups per token, syntax to token tree | one binary search per token, `O(log n)` | two compares while the token stays in its piece or moves to the next (`span_map.rs` `InOrder` over speed-span-ast's `span_at_from` / `span_for_range_from`), at every macro argument, attribute and derive input, `macro_rules` definition, eager input and `include!` |
+| down-mapping (IDE, speed-span-ast's) | linear scan of the map per token | a binary search of a lazily built anchor-sorted index, then the matching run |
 
 Allocations per token on the expansion paths in my files are now zero: the mark cache is a
 fixed array in a `Cell`, names and paths intern without allocating on a hit, and the per-token
@@ -75,10 +75,20 @@ which db-salsa's S2 removes.
 
 - **Spans**: 20 bytes against rustc's 8. The `Span` type is format's (`crates/span`), and the
   token tree stores it per token.
-- **Per-token lookups**: still `O(log n)` until format's cursor lands. hir-expand's mappers
-  (`SpanMap<'_>`, `MacroRulesArgs`) then hold a `Cell<u32>` hint.
+- **Per-token lookups** go through `InOrder` everywhere tokens are walked in order in my paths.
+  The builtin derives' own small conversions (`derive_macro.rs`) and the IDE's speculative
+  expansion still take the plain lookup.
 - **`Interned<ModPath>`**: hir-def still interns `ModPath` a second time at every store. That
   is filed with the hir-def siblings in `v2/requests/speed-hir.md`, and
   `hir_expand::attrs::Attr::path` moves to `ModPath` in the same change.
 - **Proc macro calls**: build a `String` of the crate's working directory per call. The
   `expand_in` signature is `usercode-macros-native-next1`'s.
+- **One parse per derive, not per `#[derive]`.** Each builtin derive of `#[derive(A, B, C)]`
+  turns the same input tree back into syntax (`derive_macro.rs` `to_adt_syntax`), which is N-1
+  extra parses and span maps per attribute. rustc reads the AST it already has. It can't read
+  the source AST here, because the input is the item after `cfg` processing. What it would take:
+  a tracked `MacroCallId::derive_input_syntax` (`returns(ref)`, `no_eq`) on the `#[derive]`
+  attribute's call, parsing its `macro_arg` once, read by the derives. That needs the derive's
+  id threaded into `BuiltinDeriveExpander::expander()`'s `fn(db, Span, &TopSubtree)` (a public
+  signature held fixed in this pass), and `expand_speculative` keeping today's path for its own
+  input tree.

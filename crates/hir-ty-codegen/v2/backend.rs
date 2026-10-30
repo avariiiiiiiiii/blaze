@@ -1,6 +1,8 @@
 //! The backends of a v2 build ([`Prepare`]): the IR builder's IR of an instance against its
 //! references by place, compiled with Cranelift, or handed to LLVM ([`super::release`]).
 
+use std::marker::PhantomData;
+
 use blaze_codegen::{
     Arch, Backend, CodegenError, CompiledFunction, Compile, Static, Unit,
     backend::{Emitted, FrontRef, Import, Prepare, Shape},
@@ -13,6 +15,7 @@ use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::ItemKey;
 use cranelift_codegen::{ir, isa::TargetIsa};
+use smallvec::SmallVec;
 use hir_def::{
     DefWithBodyId, HasModule, attrs::AttrFlags, expr_store::Body, signatures::FunctionSignature,
 };
@@ -35,7 +38,7 @@ use crate::{
 
 /// Cranelift and LLVM over the IR builder.
 #[derive(Default)]
-pub struct Backends;
+pub struct Backends<'db>(PhantomData<&'db ()>);
 
 /// Variables of the environment that change the code the IR builder makes, which a unit's
 /// key has no part of: set, they would give two builds of one key different code.
@@ -109,17 +112,24 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
             if pic { "position-independent" } else { "static" }
         )));
     }
-    if let Some(knob) = CHANGES_CODE.iter().find(|it| std::env::var_os(it).is_some()) {
+    if let Some(knob) = set_knob() {
         return Err(fail(format!("`{knob}` is set, which changes code a unit's key has no part of")));
     }
     Ok(())
+}
+
+/// The first of [`CHANGES_CODE`] that is set, read once: the environment is the process's,
+/// and reading it takes the environment's lock.
+fn set_knob() -> Option<&'static str> {
+    static SET: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| CHANGES_CODE.iter().copied().find(|it| std::env::var_os(it).is_some()))
 }
 
 fn isa(unit: &Unit) -> Result<&'static dyn TargetIsa, CodegenError> {
     crate::target().map(|it| &**it).map_err(|e| failed(unit, e))
 }
 
-impl Backends {
+impl Backends<'_> {
     pub(super) fn prepared(
         &self,
         db: &dyn HirDatabase,
@@ -226,7 +236,7 @@ fn foldable(db: &dyn HirDatabase, instance: &HirInstance) -> bool {
             !FunctionSignature::of(db, *func).is_varargs()
         }
         Kind::Code(..) => true,
-        Kind::Asm(_) | Kind::Start(_) => false,
+        Kind::Asm(_) | Kind::Start(_) | Kind::Allocator(_) => false,
     }
 }
 
@@ -242,6 +252,7 @@ pub(super) fn built(db: &dyn HirDatabase, instance: &HirInstance, checked: bool)
             compile_as(db, env, None, false, checked, true, |fx| fx.start_shim(*main))
         }
         Kind::Asm(text) => return assembled(text),
+        Kind::Allocator(forward) => super::allocator::built(db, forward, checked),
     }
     .map_err(|e| e.to_string())?;
     Ok(match produced {
@@ -261,8 +272,7 @@ fn assembled(text: &str) -> Result<Built, String> {
         signature: ir::Signature::new(isa.default_call_conv()),
         bytes: assembled.code.clone(),
         align: 16,
-        relocs: Vec::new(),
-        elf_types: Vec::new(),
+        relocs: fragment::Relocs::default(),
         unwind: None,
         lines: Vec::new(),
         slots: SlotPlaces::default(),
@@ -304,7 +314,8 @@ fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref]) {
     let outside = |place: u32| {
         matches!(refs.get(place as usize), Some(FrontRef::Extern(_) | FrontRef::Weak(_)) | None)
     };
-    let names = func.params.user_named_funcs().clone();
+    let ir::Function { params, stencil, .. } = func;
+    let names = params.user_named_funcs();
     let own = |name: &ir::ExternalName| -> Option<bool> {
         let ir::ExternalName::User(at) = name else { return None };
         let name = &names[*at];
@@ -319,23 +330,26 @@ fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref]) {
             _ => None,
         }
     };
-    let addressed: rustc_hash::FxHashSet<ir::FuncRef> = func
-        .layout
-        .blocks()
-        .flat_map(|block| func.layout.block_insts(block))
-        .filter_map(|inst| match func.dfg.insts[inst] {
-            ir::InstructionData::FuncAddr { func_ref, .. } => Some(func_ref),
-            _ => None,
-        })
-        .collect();
-    for (func_ref, ext) in func.dfg.ext_funcs.iter_mut() {
+    // One bit a callee: no allocation for the usual few hundred.
+    let mut addressed: SmallVec<[u64; 4]> = SmallVec::new();
+    addressed.resize(stencil.dfg.ext_funcs.len().div_ceil(64), 0);
+    for block in stencil.layout.blocks() {
+        for inst in stencil.layout.block_insts(block) {
+            if let ir::InstructionData::FuncAddr { func_ref, .. } = stencil.dfg.insts[inst] {
+                let at = func_ref.as_u32() as usize;
+                addressed[at / 64] |= 1 << (at % 64);
+            }
+        }
+    }
+    for (func_ref, ext) in stencil.dfg.ext_funcs.iter_mut() {
+        let at = func_ref.as_u32() as usize;
         match own(&ext.name) {
             Some(true) => ext.colocated = true,
-            Some(false) if !addressed.contains(&func_ref) => ext.colocated = true,
+            Some(false) if addressed[at / 64] & (1 << (at % 64)) == 0 => ext.colocated = true,
             _ => {}
         }
     }
-    for (_, global) in func.global_values.iter_mut() {
+    for (_, global) in stencil.global_values.iter_mut() {
         if let ir::GlobalValueData::Symbol { name, colocated, tls: false, .. } = global
             && own(name) == Some(true)
         {
@@ -469,14 +483,14 @@ fn compiled(
     })
 }
 
-impl Prepare for Backends {
-    type Frontend = HirFrontend;
+impl<'db> Prepare for Backends<'db> {
+    type Frontend = HirFrontend<'db>;
     type Prepared = Prepared;
     type Export = super::release::Export;
 
     fn prepare(
         &self,
-        frontend: &HirFrontend,
+        frontend: &HirFrontend<'db>,
         unit: &Unit,
         spec: &Spec,
         instance: &HirInstance,
@@ -562,7 +576,7 @@ impl Prepare for Backends {
 
     fn compile_static(
         &self,
-        frontend: &HirFrontend,
+        frontend: &HirFrontend<'db>,
         spec: &Spec,
         value: &super::HirStatic,
         refs: &Refs,
@@ -575,8 +589,8 @@ impl Prepare for Backends {
     }
 }
 
-impl Compile for Backends {
-    type Mir<'a> = (&'a HirFrontend, &'a Spec, &'a HirInstance, &'a Refs);
+impl Compile for Backends<'_> {
+    type Mir<'a> = (&'a HirFrontend<'a>, &'a Spec, &'a HirInstance, &'a Refs);
 
     fn compile(
         &self,

@@ -45,9 +45,9 @@ memchr's and Teddy's inner loops are made of exactly these: `simd_eq`, `simd_or`
 | x86 `minps`/`maxps`/`minpd`/`maxpd`, packs, `pmaddwd`, `pavgb`/`pavgw` (SSE2, AVX2 per half) | loop over lanes | 1 instruction per 16 bytes | 1 (AVX2: 1 per 32) |
 | `asm::assemble` hit | a global `Mutex` and a SHA-256 of the text per call | a thread-local map, no lock, no hash | n/a |
 
-The `simd_*`, `neon_vector` and `x86_vector` rows land in code once `mod.rs` calls the two new
-functions (the request in `v2/requests/speed-backend-lower.md`). The `simd_*` rows already run,
-since `mod.rs` calls `wasm_simd_intrinsic` first on every target.
+All rows are in the code generator. `mod.rs` calls `wasm_simd_intrinsic` first on every
+target, and `llvm_intrinsic` calls `neon_vector` before `neon_lanes` and `x86_vector` right
+after. speed-backend-lower applied that on 2026-10-29.
 
 ### Generic `simd_*` on every target (`wasm_simd.rs`)
 
@@ -95,12 +95,22 @@ Cranelift's SSE2 sequence stands in; it gives the same bits.
 ### Assembler cache (`asm.rs`)
 
 `assemble` used to lock one global `Mutex` and hash the text with SHA-256 on every call. Now a
-hit is read from a thread-local `FxHashMap<Box<str>, &'static Assembled>` with no lock. A miss
-goes to a sharded map, whose shard count is a power of two at least 4 × the core count (as
-`docs/concurrency.md` asks). It is keyed by the unchanged SHA-256 key (domain `"blaze asm 3"`),
-then the store, then the assembler. A result is leaked once and never changes, so a reader holds
-a `&'static` to it. `inline_of`/`keep_inline` use the same sharded map. `BLAZE_ASSEMBLER` is read
-once.
+repeat on a thread is read from a thread-local `FxHashMap<Box<str>, &'static Assembled>`. A
+first lookup goes to a shared `Table` keyed by the unchanged SHA-256 key (domain
+`"blaze asm 3"`), then the store, then the assembler. `BLAZE_ASSEMBLER` is read once.
+
+`Table` is the append-only table of [concurrency.md](../../design/concurrency.md), written in
+safe code:
+
+- open-addressed `OnceLock` slots, each set once, 16 probes per level;
+- a full window leads to the next level, of twice the slots, and nothing is rehashed;
+- a lookup is acquire loads and allocates nothing;
+- entries are never freed, so readers hold `&'static` references.
+
+`INLINE` (the blocks LLVM gets as inline assembly) uses the same table. When two blocks share a
+wrapper, a flag on the entry is set and readers see `None`; the published block is never
+changed. Readers (`fragment.rs` `asm_blocks`, `llvm/lower.rs`) take `&'static Inline` from
+`inline_block`, with no `Arc` clone.
 
 ## Bit-identity
 
@@ -113,6 +123,19 @@ compare, so the bits are rustc's on every input:
 
 Nothing reads `std::env` per function or per instruction. The asm cache key and its hash domain
 are unchanged, since the hashed bytes are unchanged.
+
+## Unsafe ([unsafe.md](../../design/unsafe.md))
+
+None of the speed above takes `unsafe` Rust. The vector code is what Cranelift emits, and the
+lock-free reads of `asm.rs` are a thread-local map and `&'static` values leaked once. Each of
+this lane's modules says `#![forbid(unsafe_code)]`. The crate can't say it, because `llvm*.rs`,
+`backend.rs`, `fncache/` and `mod.rs` hold unsafe code.
+
+The one parser of bytes from disk is `Assembled::from_bytes`. It runs on a copy the store
+checked with CRC32, is bounds-checked, and allocates no more than its input. A stored value that
+doesn't parse is now an error naming the key, not a silent reassembly. Its model is `to_bytes`,
+checked by a round-trip test over seeded values. It is listed for safety-fuzz in
+`v2/requests/safety.md`.
 
 ## What Cranelift cannot say yet (requests)
 

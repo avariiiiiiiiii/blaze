@@ -16,6 +16,8 @@
 //! changes costs one pass over its files: each is matched against the checkout's cookie prefix
 //! and filtered in place, nothing allocated per file.
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 
 use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef};

@@ -2,6 +2,8 @@
 //! expansions across processes with it), and whether an expansion asked anything of the
 //! database while it ran, which an expansion that is kept must not have.
 
+#![forbid(unsafe_code)]
+
 use std::{cell::Cell, sync::Arc, sync::OnceLock};
 
 use hir_expand::proc_macro::{ProcMacroExpander, ProcMacroKind};

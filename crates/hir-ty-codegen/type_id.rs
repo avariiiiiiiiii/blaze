@@ -4,6 +4,8 @@
 //! this follows `TyCtxt::type_id_hash` of the pinned toolchain input for input. `None` is a
 //! type whose hash takes something this does not reproduce, never a guess.
 
+#![forbid(unsafe_code)]
+
 use std::hash::Hasher;
 
 use base_db::Crate;
@@ -384,9 +386,9 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
         // An `async` closure is two definitions to rustc, the closure and its body's
         // coroutine, where the body has one expression.
         let body = hir_def::expr_store::Body::of(db, func.into());
-        if let hir_def::hir::Expr::Closure { closure_kind, .. } = &body[expr]
+        if let hir_def::hir::Expr::Closure { closure_kind, .. } = body.expr(expr)
             && let hir_def::hir::ClosureKind::Coroutine { source, .. } = closure_kind
-            && *source == hir_def::hir::CoroutineSource::Closure
+            && source == hir_def::hir::CoroutineSource::Closure
         {
             return None;
         }
@@ -413,7 +415,7 @@ impl<'a, 'db> TypeIdHasher<'a, 'db> {
             return None;
         };
         let body = hir_def::expr_store::Body::of(db, func.into());
-        let Expr::Closure { closure_kind: ClosureKind::Coroutine { kind, .. }, .. } = &body[expr]
+        let Expr::Closure { closure_kind: ClosureKind::Coroutine { kind, .. }, .. } = body.expr(expr)
         else {
             return None;
         };

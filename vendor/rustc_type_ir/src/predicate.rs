@@ -141,6 +141,12 @@ impl<I: Interner> TraitRef<I> {
         Self { def_id: trait_def_id, args, _use_trait_ref_new_instead: () }
     }
 
+    /// A trait reference of parts that were checked when it was first made, read back where no
+    /// interner is at hand (an interned row, a persisted type table).
+    pub fn from_checked_parts(def_id: I::TraitId, args: I::GenericArgs) -> Self {
+        Self { def_id, args, _use_trait_ref_new_instead: () }
+    }
+
     pub fn new(
         interner: I,
         trait_def_id: I::TraitId,
@@ -418,6 +424,11 @@ impl<I: Interner> ExistentialTraitRef<I> {
         Self { def_id: trait_def_id, args, _use_existential_trait_ref_new_instead: () }
     }
 
+    /// As [`TraitRef::from_checked_parts`].
+    pub fn from_checked_parts(def_id: I::TraitId, args: I::GenericArgs) -> Self {
+        Self { def_id, args, _use_existential_trait_ref_new_instead: () }
+    }
+
     pub fn new(
         interner: I,
         trait_def_id: I::TraitId,
@@ -492,6 +503,15 @@ impl<I: Interner> ExistentialProjection<I> {
         term: I::Term,
     ) -> ExistentialProjection<I> {
         interner.debug_assert_existential_args_compatible(def_id.into(), args);
+        Self { def_id, args, term, use_existential_projection_new_instead: () }
+    }
+
+    /// As [`TraitRef::from_checked_parts`].
+    pub fn from_checked_parts(
+        def_id: I::TraitAssocTermId,
+        args: I::GenericArgs,
+        term: I::Term,
+    ) -> Self {
         Self { def_id, args, term, use_existential_projection_new_instead: () }
     }
 
@@ -699,6 +719,11 @@ impl<I: Interner> AliasTerm<I> {
         args: I::GenericArgs,
     ) -> AliasTerm<I> {
         interner.debug_assert_args_compatible(kind.def_id(), args);
+        AliasTerm { kind, args, _use_alias_term_new_instead: () }
+    }
+
+    /// As [`TraitRef::from_checked_parts`].
+    pub fn from_checked_parts(kind: AliasTermKind<I>, args: I::GenericArgs) -> Self {
         AliasTerm { kind, args, _use_alias_term_new_instead: () }
     }
 

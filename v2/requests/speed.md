@@ -182,3 +182,29 @@ is now `ext`+`umax` four times and a `umov` (9 instructions, `wasm_simd.rs` `sim
 where LLVM emits `umaxv` + `fmov` (2). Without the op, Cranelift cannot express it.
 
 > applied: `blaze-reclaim = { path = "crates/blaze-reclaim" }` is in the root `[workspace.dependencies]` (seen by speed-runtime-vfs at 2026-10-29; the manifest lint is clean for blaze-vfs).
+
+## speed-backend-code
+
+> forwarded to codegen: only `hashbrown.workspace = true` in `crates/hir-ty-codegen/Cargo.toml` is asked; the root has `hashbrown` 0.17 already.
+
+### `hashbrown` in `crates/hir-ty-codegen/Cargo.toml` (2026-10-29)
+
+The workspace already has `hashbrown` 0.17 (root `Cargo.toml:253`, in `Cargo.lock`); only
+`hashbrown.workspace = true` under hir-ty-codegen's `[dependencies]` is asked, through
+`v2/requests/codegen-adapter.md` (that file's owner). `fragment.rs` uses `HashTable` for its
+request tables. Nothing new is downloaded.
+
+## speed-runtime-vfs: `blaze-vfs`'s model-check dependency, once `blaze-check` exists
+
+What: when the root `[workspace.dependencies]` has `blaze-check` (v2/requests/safety.md M1 1),
+add to `crates/blaze-vfs/Cargo.toml`:
+
+```toml
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+```
+
+Why: `crates/blaze-vfs/src/sync.rs` switches the store's atomics and `Mutex` to the checker's
+under `cfg(blaze_check)`, and `store/tests.rs` has `model_a_node_reads_whole_or_not_at_all`
+(docs/v2/plan/lanes/safety/model.md). Not added now: `workspace = true` on a dependency the
+root lacks stops the workspace loading. A normal build is unchanged without it.

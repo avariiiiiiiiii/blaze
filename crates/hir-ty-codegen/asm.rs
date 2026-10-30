@@ -3,13 +3,18 @@
 //! inputs to a stack slot and passes its address, and the function loads the registers from
 //! it, runs the block, and writes the outputs back.
 
+#![forbid(unsafe_code)]
+
 use std::{
     cell::RefCell,
     fmt::Write,
-    hash::{BuildHasher, Hash},
+    hash::BuildHasher,
     path::PathBuf,
     process::Command,
-    sync::{Arc, LazyLock, Mutex, MutexGuard},
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cranelift_codegen::binemit::Reloc;
@@ -945,49 +950,108 @@ pub(super) struct Inline {
     pub(super) options: AsmOptions,
 }
 
-/// A map shared by the threads compiling, in shards by the hash of the key: a power of two
-/// of them, at least 4 for each core, so threads at work on different keys rarely meet on one
-/// lock, which is held for one lookup or insert alone.
-struct Sharded<K, V> {
-    shards: Box<[Mutex<FxHashMap<K, V>>]>,
+/// An append-only map shared by the threads compiling, as `docs/v2/plan/design/concurrency.md`
+/// asks of one: each entry is a slot set once, with its key, in a level of slots probed from
+/// the key's hash, and a level whose probes are all taken leads to the next, of twice as many,
+/// so nothing is moved or rehashed and a lookup is acquire loads alone. Two threads that set
+/// one slot meet on it for the move of an entry, never while one computes it.
+struct Table<K, V> {
+    levels: [OnceLock<Box<[OnceLock<(K, V)>]>>; LEVELS],
 }
 
-impl<K: Eq + Hash, V> Sharded<K, V> {
-    fn new() -> Sharded<K, V> {
-        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
-        let count = (4 * cores).next_power_of_two();
-        Sharded { shards: (0..count).map(|_| Mutex::default()).collect() }
+/// Levels of a [`Table`], the first of `FIRST` slots: room for 2^36 entries.
+const LEVELS: usize = 26;
+const FIRST: usize = 1 << 10;
+/// The slots of a level a key may be in, from the one its hash names on.
+const PROBES: usize = 16;
+
+impl<K: PartialEq, V> Table<K, V> {
+    const fn new() -> Table<K, V> {
+        Table { levels: [const { OnceLock::new() }; LEVELS] }
     }
 
-    /// The shard of keys of `hash`. Also after a thread panicked with it: a map is whole
-    /// between any two statements.
-    fn shard(&self, hash: u64) -> MutexGuard<'_, FxHashMap<K, V>> {
-        let shard = &self.shards[hash as usize & (self.shards.len() - 1)];
-        shard.lock().unwrap_or_else(|e| e.into_inner())
+    /// The slots `hash` may be in, in the order every lookup and insert takes them. An insert
+    /// (`make`) makes a level the first time a key gets to it; a lookup stops before one that
+    /// is not made, as no key is in it.
+    fn slots(&self, hash: u64, make: bool) -> impl Iterator<Item = &OnceLock<(K, V)>> {
+        let levels = self.levels.iter().enumerate().map_while(move |(at, level)| match make {
+            true => Some(level.get_or_init(|| (0..FIRST << at).map(|_| OnceLock::new()).collect())),
+            false => level.get(),
+        });
+        levels.flat_map(move |level| {
+            let mask = level.len() - 1;
+            (0..PROBES).map(move |probe| &level[(hash as usize).wrapping_add(probe) & mask])
+        })
+    }
+
+    /// The entry of `key`. A key is in the first slot of its order that was empty when it was
+    /// added, so an empty slot before it means there is none.
+    fn get(&self, hash: u64, key: &(impl PartialEq<K> + ?Sized)) -> Option<&(K, V)> {
+        for slot in self.slots(hash, false) {
+            match slot.get() {
+                Some(entry) if *key == entry.0 => return Some(entry),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+        None
+    }
+
+    /// The entry of `key`: `value` if there was none, else the one there was (another thread
+    /// may have added it first), and `value` is dropped. `None` when every level is full.
+    fn insert(&self, hash: u64, key: K, value: V) -> Option<&(K, V)> {
+        let mut entry = Some((key, value));
+        for slot in self.slots(hash, true) {
+            if let Some(new) = entry.take() {
+                entry = slot.set(new).err();
+            }
+            let kept = slot.get().expect("a slot is set once it was tried");
+            match &entry {
+                None => return Some(kept),
+                Some(new) if new.0 == kept.0 => return Some(kept),
+                Some(_) => {}
+            }
+        }
+        None
     }
 }
 
 /// The blocks given to LLVM as inline assembly, by the text of their wrappers, which is what
-/// the request of the call of one says. `None` where two blocks of one wrapper are not one
-/// block, which a later block can find, so an entry is read under its shard's lock.
-static INLINE: LazyLock<Sharded<String, Option<Arc<Inline>>>> = LazyLock::new(Sharded::new);
+/// the request of the call of one says.
+static INLINE: Table<String, Kept> = Table::new();
+
+/// The first block kept for a wrapper, and whether another block that is not it has the same
+/// wrapper since, which makes the wrapper none of them: a flag, so the entry stays as it was
+/// published.
+struct Kept {
+    inline: Option<Arc<Inline>>,
+    other: AtomicBool,
+}
 
 /// Keeps `inline` as the block the wrapper of `text` is.
 pub(super) fn keep_inline(text: &str, inline: Option<Inline>) {
-    let mut known = INLINE.shard(FxBuildHasher.hash_one(text));
-    match known.get_mut(text) {
-        Some(kept) => {
-            if kept.as_deref() != inline.as_ref() {
-                *kept = None;
-            }
+    let hash = FxBuildHasher.hash_one(text);
+    let inline = inline.map(Arc::new);
+    let (_, found) = match INLINE.get(hash, text) {
+        Some(found) => found,
+        None => {
+            let kept = Kept { inline: inline.clone(), other: false.into() };
+            INLINE.insert(hash, text.to_owned(), kept).expect("2^36 blocks of assembly at most")
         }
-        None => _ = known.insert(text.to_owned(), inline.map(Arc::new)),
+    };
+    if found.inline != inline {
+        found.other.store(true, Ordering::Release);
     }
 }
 
-/// The block the wrapper of `text` is, as LLVM's inline assembly.
-pub(super) fn inline_of(text: &str) -> Option<Arc<Inline>> {
-    INLINE.shard(FxBuildHasher.hash_one(text)).get(text).cloned().flatten()
+/// The block the wrapper of `text` is, as LLVM's inline assembly, read with no write another
+/// core sees.
+pub(super) fn inline_block(text: &str) -> Option<&'static Inline> {
+    let (_, kept) = INLINE.get(FxBuildHasher.hash_one(text), text)?;
+    match kept.other.load(Ordering::Acquire) {
+        true => None,
+        false => kept.inline.as_deref(),
+    }
 }
 
 /// The block as LLVM's inline assembly, where it is one LLVM takes as rustc's LLVM does:
@@ -1189,7 +1253,7 @@ pub(super) struct Named {
     pub(super) offset: u32,
     pub(super) kind: Reloc,
     /// The type ELF has for it, when Cranelift has no kind for that and `kind` stands in:
-    /// see [`Code::elf_types`](super::fragment::Code).
+    /// see [`Reloc::elf_type`](super::fragment::Reloc).
     pub(super) elf_type: Option<u32>,
     /// The index of the operand.
     pub(super) operand: u32,
@@ -1289,7 +1353,8 @@ impl Assembled {
         let mut bytes = (self.code.len() as u32).to_le_bytes().to_vec();
         bytes.extend_from_slice(&self.code);
         for named in &self.relocs {
-            let kind = RELOCS.iter().position(|it| *it == named.kind).unwrap_or(RELOCS.len());
+            let kind = RELOCS.iter().position(|it| *it == named.kind);
+            let kind = kind.expect("`Named::kind` gives only the relocations of `RELOCS`");
             bytes.extend_from_slice(&named.offset.to_le_bytes());
             bytes.push(kind as u8);
             bytes.extend_from_slice(&named.elf_type.unwrap_or(0).to_le_bytes());
@@ -1324,8 +1389,8 @@ impl Assembled {
 /// The machine code of the function that `text` defines. Each text is assembled once: the
 /// store keeps the code, as it does a compiled function's, and the process keeps it for as
 /// long as it runs. A thread that asked for a text before has it from its own table, with no
-/// lock, no write another core sees and no hash of the text but `FxHash`; one that has not
-/// takes it from the shared table, by its SHA-256, under the lock of one shard.
+/// write another core sees and no hash of the text but `FxHash`; one that has not looks in
+/// the shared [`Table`] by its SHA-256, with loads alone.
 pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     thread_local! {
         /// What this thread had assembled for the triple it names, by text.
@@ -1352,8 +1417,7 @@ pub(super) fn assemble(triple: &str, text: &str) -> Result<&'static Assembled, S
 
 /// [`assemble`] of a text this thread has not asked for.
 fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
-    static ASSEMBLED: LazyLock<Sharded<[u8; 32], &'static Assembled>> =
-        LazyLock::new(Sharded::new);
+    static ASSEMBLED: Table<[u8; 32], Assembled> = Table::new();
     let mut hasher = Sha256::new();
     hasher.update(b"blaze asm 3");
     hasher.update(triple);
@@ -1362,11 +1426,23 @@ fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
     let key: [u8; 32] = hasher.finalize().into();
     // A digest's bytes are as good a hash as any of them.
     let hash = u64::from_le_bytes(key[..8].try_into().expect("8 bytes"));
-    if let Some(&code) = ASSEMBLED.shard(hash).get(&key) {
+    if let Some((_, code)) = ASSEMBLED.get(hash, &key) {
         return Ok(code);
     }
     let store = Store::global();
-    let kept = store.and_then(|it| it.get(&key)).and_then(|it| Assembled::from_bytes(&it));
+    // The store gives back only bytes whose checksum it checked; bytes that pass it and are
+    // still not an `Assembled` were written by another format of it, which is a bug to name.
+    let kept = match store.and_then(|it| it.get(&key)) {
+        Some(bytes) => Some(Assembled::from_bytes(&bytes).ok_or_else(|| {
+            format!(
+                "the store's assembled code of key {} is not one this blaze reads \
+                 ({} bytes); bump the domain \"blaze asm 3\" when its format changes",
+                key.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                bytes.len(),
+            )
+        })?),
+        None => None,
+    };
     let code = match kept {
         Some(code) => code,
         None => {
@@ -1377,10 +1453,9 @@ fn assembled(triple: &str, text: &str) -> Result<&'static Assembled, String> {
             code
         }
     };
-    // Two threads may both have assembled it: the first one kept is the one all are given,
-    // and the other's equal bytes stay unread, one copy each at most.
-    let code: &'static Assembled = Box::leak(Box::new(code));
-    Ok(*ASSEMBLED.shard(hash).entry(key).or_insert(code))
+    // Two threads may both have assembled it: the first one kept is the one all are given.
+    let (_, code) = ASSEMBLED.insert(hash, key, code).expect("2^36 blocks of assembly at most");
+    Ok(code)
 }
 
 /// What turns the text of a block into an object file. `BLAZE_ASSEMBLER=cc` picks the C
@@ -1635,27 +1710,116 @@ mod tests {
         assert!(att.contains("movl $$7, %eax\n"), "{att}");
     }
 
-    /// The shards are a power of two, at least four a core, and a key is in the shard of its
-    /// hash wherever it is looked up from: what one thread inserts, another finds.
+    /// Threads that add the same keys at once, more of them than the first level holds, all
+    /// get back the one entry kept for a key, and the table then says what a `HashMap` of the
+    /// first entry of each key says: the safe model of it.
     #[test]
-    fn sharded_maps_find_what_any_thread_kept() {
-        use super::{BuildHasher, FxBuildHasher, Sharded};
-        let map: Sharded<u64, u64> = Sharded::new();
-        let count = map.shards.len();
-        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
-        assert!(count.is_power_of_two() && count >= 4 * cores, "{count}");
-        std::thread::scope(|scope| {
-            for thread in 0..4u64 {
-                let map = &map;
+    fn a_table_keeps_one_entry_a_key_whoever_adds_it() {
+        use super::{BuildHasher, FIRST, FxBuildHasher, FxHashMap, Table};
+        let table: Table<u64, u64> = Table::new();
+        let keys = 4 * FIRST as u64;
+        let given = std::thread::scope(|scope| {
+            let threads = (0..8u64).map(|thread| {
+                let table = &table;
                 scope.spawn(move || {
-                    for key in (thread..4000).step_by(4) {
-                        map.shard(FxBuildHasher.hash_one(key)).insert(key, key * 3);
-                    }
-                });
-            }
+                    (0..keys)
+                        .map(|key| {
+                            let key = (key * 7 + thread * 13) % keys;
+                            let hash = FxBuildHasher.hash_one(key);
+                            (key, table.insert(hash, key, thread).expect("room").1)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            });
+            let threads = threads.collect::<Vec<_>>();
+            threads.into_iter().map(|it| it.join().unwrap()).collect::<Vec<_>>()
         });
-        for key in 0..4000u64 {
-            assert_eq!(map.shard(FxBuildHasher.hash_one(key)).get(&key), Some(&(key * 3)));
+        let mut model = FxHashMap::default();
+        for (key, value) in given.into_iter().flatten() {
+            assert_eq!(*model.entry(key).or_insert(value), value, "key {key}");
+        }
+        assert_eq!(model.len() as u64, keys);
+        for key in 0..2 * keys {
+            let found = table.get(FxBuildHasher.hash_one(key), &key).map(|it| it.1);
+            assert_eq!(found, model.get(&key).copied(), "key {key}");
+        }
+    }
+
+    /// Keys of one hash fill its probes of a level and go on to the next levels, where each is
+    /// still found; a lookup of a key that is not there stops at the first empty slot.
+    #[test]
+    fn keys_of_one_hash_go_on_to_later_levels() {
+        use super::{PROBES, Table};
+        let table: Table<u32, u32> = Table::new();
+        let count = 3 * PROBES as u32 + 1;
+        for key in 0..count {
+            assert_eq!(table.insert(42, key, key + 1).map(|it| it.1), Some(key + 1));
+        }
+        assert!(table.levels[3].get().is_some() && table.levels[4].get().is_none());
+        for key in 0..count {
+            assert_eq!(table.get(42, &key).map(|it| it.1), Some(key + 1));
+        }
+        assert_eq!(table.get(42, &count), None);
+        assert!(table.levels[4].get().is_none(), "a lookup makes no level");
+    }
+
+    /// A wrapper two different blocks have is none of them, also for the first, which stays
+    /// as it was published; one block kept twice is that block.
+    #[test]
+    fn a_wrapper_of_two_blocks_is_neither() {
+        use super::{AsmOptions, Inline, inline_block, keep_inline};
+        let block = |text: &str| Inline {
+            text: text.into(),
+            constraints: "r".into(),
+            outputs: Vec::new(),
+            inputs: vec![(0, 8)],
+            options: AsmOptions::empty(),
+        };
+        let one = "a_wrapper_of_two_blocks_is_neither 1";
+        let two = "a_wrapper_of_two_blocks_is_neither 2";
+        keep_inline(one, Some(block("nop")));
+        keep_inline(one, Some(block("nop")));
+        assert_eq!(inline_block(one), Some(&block("nop")));
+        keep_inline(two, Some(block("nop")));
+        keep_inline(two, Some(block("pause")));
+        assert_eq!(inline_block(two), None);
+        keep_inline(two, Some(block("nop")));
+        assert_eq!(inline_block(two), None);
+        assert_eq!(inline_block("a_wrapper_of_two_blocks_is_neither 3"), None);
+    }
+
+    /// What the store keeps of an `Assembled` reads back as it was, over seeded code and
+    /// relocations, and the bytes with any one of them taken out are refused, not misread.
+    #[test]
+    fn kept_code_reads_back_and_short_bytes_are_refused() {
+        use super::{Assembled, Named, RELOCS};
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200 {
+            let code = (0..next() % 64).map(|_| next() as u8).collect::<Vec<_>>();
+            let relocs = (0..next() % 5)
+                .map(|_| Named {
+                    offset: next() as u32,
+                    kind: RELOCS[next() as usize % RELOCS.len()],
+                    elf_type: Some(next() as u32).filter(|it| *it != 0),
+                    operand: next() as u32,
+                    addend: next() as i64,
+                })
+                .collect::<Vec<_>>();
+            let bytes = Assembled { code: code.clone(), relocs }.to_bytes();
+            let read = Assembled::from_bytes(&bytes).expect("its own bytes");
+            assert_eq!(read.code, code);
+            assert_eq!(read.to_bytes(), bytes);
+            // The records after the code are then a byte short of a whole number of them.
+            for cut in 0..bytes.len() {
+                let short = [&bytes[..cut], &bytes[cut + 1..]].concat();
+                assert!(Assembled::from_bytes(&short).is_none(), "cut at {cut}");
+            }
         }
     }
 }

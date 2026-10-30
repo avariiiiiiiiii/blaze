@@ -3,6 +3,25 @@ use span::Edition;
 use super::*;
 
 #[test]
+fn lint_ids_are_dense_and_round_trip() {
+    let all = lints().iter().chain(internal_lints()).chain(unregistered());
+    for (at, lint) in all.enumerate() {
+        let id = LintId::of(lint);
+        assert_eq!(usize::from(id.0), at, "{}", lint.name);
+        assert!(std::ptr::eq(id.lint(), lint), "{}", lint.name);
+    }
+}
+
+#[test]
+fn group_of_is_the_first_group_without_aliases() {
+    let store = Store::default();
+    for lint in lints() {
+        let first = groups().iter().filter(|it| it.alias_of.is_none()).find(|it| it.lints.iter().any(|it| it.name == lint.name));
+        assert_eq!(store.group_of(lint), first.map(|it| it.name), "{}", lint.name);
+    }
+}
+
+#[test]
 fn counts_are_rustcs() {
     // 108 of the builtin passes and `foreign_modules`, 141 hardwired.
     assert_eq!(lints().len(), 249);

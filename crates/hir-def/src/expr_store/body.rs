@@ -389,8 +389,8 @@ impl BodySyntax {
 /// Whether the subtree of `node` holds a lazy node of an outline, parsed or not.
 fn holds_lazy(node: &SyntaxNode) -> bool {
     node.flat().is_some_and(|(tree, at)| {
-        let end = tree.end(at);
-        tree.lazies().find(|&it| it >= at).is_some_and(|it| it < end)
+        let lazies = tree.lazy_nodes();
+        lazies.get(lazies.partition_point(|&it| it < at)).is_some_and(|&it| it < tree.end(at))
     })
 }
 

@@ -452,7 +452,7 @@ fn no_downmap() {
     let fixture = r#"
 macro_rules! m {
     ($func_name:ident) => {
-        fn $func_name() { todo!() }
+        fn $func_name() { loop {} }
     };
 }
 m!(f);

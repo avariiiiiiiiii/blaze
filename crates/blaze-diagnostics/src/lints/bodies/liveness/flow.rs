@@ -235,14 +235,15 @@ impl Cfg {
         let mut postorder = Vec::new();
         let mut stack: Vec<(BasicBlockId, usize)> = vec![(start, succ[raw(start)].len())];
         visited[raw(start)] = true;
-        while let Some((block, left)) = stack.last_mut() {
-            if *left == 0 {
-                postorder.push(*block);
+        while let Some(top) = stack.len().checked_sub(1) {
+            let (block, left) = stack[top];
+            if left == 0 {
+                postorder.push(block);
                 stack.pop();
                 continue;
             }
-            *left -= 1;
-            let next = succ[raw(*block)][*left];
+            stack[top].1 = left - 1;
+            let next = succ[raw(block)][left - 1];
             if !visited[raw(next)] {
                 visited[raw(next)] = true;
                 stack.push((next, succ[raw(next)].len()));
@@ -299,7 +300,7 @@ pub(super) enum Access {
 }
 
 /// What the dataflow found: rustc's `AssignmentResult` before it reports.
-pub(super) struct Found<'m> {
+pub(super) struct Seen<'m> {
     pub(super) sightings: Vec<Sighting<'m>>,
     pub(super) ever_live: Bits,
     pub(super) ever_dropped: Bits,
@@ -363,7 +364,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
     fn block(&self, block: BasicBlockId, state: &mut Bits, closures: &mut dyn Closures<'db>) {
         let data = &self.mir.basic_blocks[block];
         if let Some(terminator) = &data.terminator {
-            self.terminator(&terminator.kind, state, closures);
+            self.terminator(&terminator.kind, state);
         }
         for (index, statement) in data.statements.iter().enumerate().rev() {
             self.statement(&statement.kind, (raw(block) as u32, index as u32), state, closures);
@@ -413,7 +414,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn terminator(&self, kind: &TerminatorKind, live: &mut Bits, closures: &mut dyn Closures<'db>) {
+    fn terminator(&self, kind: &TerminatorKind, live: &mut Bits) {
         let again = self.kind == CaptureKind::FnMut;
         match kind {
             TerminatorKind::Return | TerminatorKind::Yield { .. } | TerminatorKind::Call { target: None, .. }
@@ -451,7 +452,6 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => {}
         }
-        let _ = closures;
     }
 
     /// What the closure's caller can read after it returns, yields or unwinds: what it
@@ -527,12 +527,13 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
     /// Every assignment of a checked place in the blocks reachable from the start, with its
     /// liveness after it, and of the parameters and captures where the body starts: rustc's
     /// `find_dead_assignments`.
-    pub(super) fn assignments(&self, closures: &mut dyn Closures<'db>) -> Found<'m> {
+    pub(super) fn assignments(&self, closures: &mut dyn Closures<'db>) -> Seen<'m> {
         let n = self.places.len();
-        let mut found = Found { sightings: Vec::new(), ever_live: Bits::new(n), ever_dropped: Bits::new(n) };
+        let mut found = Seen { sightings: Vec::new(), ever_live: Bits::new(n), ever_dropped: Bits::new(n) };
         let mut state = Bits::new(n);
+        let mir: &'m MirBody<'db> = self.mir;
         for &block in &self.cfg.postorder {
-            let data = &self.mir.basic_blocks[block];
+            let data = &mir.basic_blocks[block];
             self.exit(block, &mut state);
             found.ever_live.union(&state);
             let end = Loc { block, index: data.statements.len() as u32 };
@@ -550,7 +551,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
                     TerminatorKind::Drop { place, .. } => self.dropped(&mut found, place),
                     _ => {}
                 }
-                self.terminator(&terminator.kind, &mut state, closures);
+                self.terminator(&terminator.kind, &mut state);
             }
             for (index, statement) in data.statements.iter().enumerate().rev() {
                 found.ever_live.union(&state);
@@ -599,7 +600,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         self.mir.param_locals.iter().any(|&local| self.places.of_local(local) == Some(at))
     }
 
-    fn sight(&self, found: &mut Found<'m>, place: &'m StoredPlace, span: MirSpan, loc: Loc, live: &Bits) {
+    fn sight(&self, found: &mut Seen<'m>, place: &'m StoredPlace, span: MirSpan, loc: Loc, live: &Bits) {
         let Some((at, extra)) = self.places.get(place.local, place.projection.as_slice()) else { return };
         if is_indirect(extra) {
             return;
@@ -615,7 +616,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         });
     }
 
-    fn dropped(&self, found: &mut Found<'m>, place: &StoredPlace) {
+    fn dropped(&self, found: &mut Seen<'m>, place: &StoredPlace) {
         if let Some((at, [])) = self.places.get(place.local, place.projection.as_slice()) {
             found.ever_dropped.insert(at);
         }

@@ -15,10 +15,11 @@ use hir_def::{
     AdtId, AttrDefId, CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
     hir::{BinaryOp, BindingId, ClosureKind, Expr, ExprId, Statement, type_ref::TypeRef},
     resolver::ValueNs,
-    signatures::FunctionSignature,
+    signatures::{FnFlags, FunctionSignature},
     src::HasSource,
 };
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
+use intern::Symbol;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use syntax::{AstNode, ast};
@@ -47,7 +48,8 @@ impl LatePass for DanglingPointers {
         let DefWithBodyId::FunctionId(function) = b.owner else { return };
         let root = b.body.root_expr();
         Searcher { b, inside_call_args: false, out }.expr(root);
-        if FunctionSignature::of(b.db(), function).is_async() || is_gen(b, function) {
+        let sig = FunctionSignature::of(b.db(), function);
+        if sig.is_async() || sig.flags.contains(FnFlags::GEN) {
             return;
         }
         let Some(fn_ret) = function_return(b, function) else { return };
@@ -65,10 +67,6 @@ impl LatePass for DanglingPointers {
         let inits = self.inits.of(b);
         Locals { b, inits, fn_ret: &fn_ret, owner: Some(expr) }.check(body, out);
     }
-}
-
-fn is_gen(b: &BodyCx<'_, '_>, function: FunctionId) -> bool {
-    FunctionSignature::of(b.db(), function).flags.contains(hir_def::signatures::FnFlags::GEN)
 }
 
 /// rustc's `DanglingPointerSearcher`: every expression of a body but those in a call's
@@ -212,7 +210,7 @@ fn owns_allocation<'db>(b: &BodyCx<'_, 'db>, ty: Ty<'db>) -> bool {
         return true;
     }
     let name = util::diagnostic_item(b.db(), AttrDefId::AdtId(adt));
-    matches!(name.as_deref(), Some("cstring_type" | "Vec" | "Cell" | "SyncUnsafeCell"))
+    matches!(name.as_ref().map(Symbol::as_str), Some("cstring_type" | "Vec" | "Cell" | "SyncUnsafeCell"))
 }
 
 /// What a function or closure returning a raw pointer is linted with: rustc's
@@ -228,7 +226,7 @@ fn function_return(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<FnRet> {
     let db = b.db();
     let sig = FunctionSignature::of(db, function);
     let ret = sig.ret_type?;
-    if !matches!(sig.store[ret], TypeRef::RawPtr(..)) {
+    if !matches!(sig.store.type_ref(ret), TypeRef::RawPtr(..)) {
         return None;
     }
     let interner = DbInterner::new_with(db, function.krate(db));
@@ -250,7 +248,7 @@ fn function_return(b: &BodyCx<'_, '_>, function: FunctionId) -> Option<FnRet> {
 /// not a 1-ZST.
 fn closure_return(b: &BodyCx<'_, '_>, closure: ExprId) -> Option<FnRet> {
     let Expr::Closure { ret_type: Some(ret), .. } = b.store().expr(closure) else { return None };
-    if !matches!(b.store()[ret], TypeRef::RawPtr(..)) {
+    if !matches!(b.store().type_ref(ret), TypeRef::RawPtr(..)) {
         return None;
     }
     let ty = super::type_info(b, closure)?.original;

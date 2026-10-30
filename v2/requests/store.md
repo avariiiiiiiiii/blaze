@@ -174,3 +174,33 @@
   Until then every value is in the shared file, as before.
 
 > forwarded to codegen, usercode, cargo and db: each caller of `Store::put` is in its own lane (blaze-codegen; blaze-usercode and blaze-expand; blaze-cargo's `serve/`; the query results through the daemon).
+
+## From safety-audit (2026-10-29, safety-audit-edge)
+
+The workspace is about to deny `unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks`
+and `clippy::multiple_unsafe_ops_per_block`. Each finding below is comments, block splits or a
+crate-root attribute only, in the original evaluation order (`||` short-circuits as before). Every
+`windows-sys` and `libc` function is an `unsafe fn`, one op per call.
+
+### blaze-store
+
+- `crates/blaze-store/src/acl.rs:75` block: 2 ops (`GetCurrentProcess`, `OpenProcessToken`). Split:
+  `// SAFETY: `GetCurrentProcess` takes nothing and returns this process's pseudo-handle, which needs no closing.` `let process = unsafe { GetCurrentProcess() };` then
+  `// SAFETY: `process` is this process's handle, and `token` is where a handle goes.` `if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {`.
+- `crates/blaze-store/src/acl.rs:102` block in `trusted`: 3 ops (`EqualSid`, `IsWellKnownSid` twice). Split, one block per operand:
+  `// SAFETY: both are valid identifiers, by what the caller says.` `unsafe { EqualSid(sid, user) != 0 }`
+  `// SAFETY: `sid` is a valid identifier, by what the caller says.` `|| unsafe { IsWellKnownSid(sid, WinLocalSystemSid) != 0 }`
+  `// SAFETY: as above.` `|| unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0 }`.
+- `crates/blaze-store/src/acl.rs:170` block: 2 ops (`trusted`, `IsWellKnownSid`). Split:
+  `// SAFETY: `sid` is in the list, which the descriptor keeps alive, and `user` in its buffer.` `let known = unsafe { trusted(sid, user) }`
+  `// SAFETY: `sid` is a valid identifier, as above; the owner's own rights are those of the owner, who was found to be trusted.` `|| unsafe { IsWellKnownSid(sid, WinCreatorOwnerRightsSid) != 0 };`.
+- `crates/blaze-store/src/lib.rs:294` block `std::mem::zeroed()`: its comment is about the `statvfs` call on the next line, so the `zeroed` has none of its own. Proposed above line 294: `// SAFETY: `libc::statvfs` is a C struct of integers, for which all zero bytes is a valid value.`, and keep the present comment, moved above line 295 (the `libc::statvfs` call).
+- `crates/blaze-store/examples/store_open.rs:1` target root: no `unsafe` in it; add `#![forbid(unsafe_code)]` after its `//!` docs.
+- Checked, no other finding (21 blocks, 1 `unsafe fn` with `# Safety`, the rest one op each). The two `memmap2::Mmap::map`s (`lib.rs:759`, `:1057`) map packs that nobody writes while they are mapped: an open pack is written only by its lock holder, and a sealed pack never again. The mapped bytes are read only by safe, bounds-checked parsing (`records`, `Index::read`); no view of them is transmuted.
+
+### blaze-cargo remote
+
+- `crates/blaze-cargo/src/remote/keeper.rs:253` block in `end_by`: 2 ops (`libc::signal`, `libc::raise`). Split:
+  `// SAFETY: setting a signal back to its default action is safe from any thread, and `signal` is one the runtime reported.` `unsafe { libc::signal(signal, libc::SIG_DFL) };` then
+  `// SAFETY: raising a signal is safe from any thread; with the default action in place it ends the process as the signal would have.` `unsafe { libc::raise(signal) };`.
+- Checked, no other finding: `remote.rs:771` and `:808` each map a sealed pack (never written again) with one op, and read it only through safe slicing (`pack_keys`, `zstd::bulk::compress`).

@@ -62,7 +62,10 @@ impl Host<'_> {
                 file_id: first.anchor.file_id,
                 ast_id: ErasedFileAstId::from_raw(it.ast_id),
             };
-            // SAFETY: the context is one the database gave.
+            // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts:
+            // `it.ctx` is what `load_cargo::answer` read from `self.db` for this join, in this
+            // process. Memory safety doesn't rest on it: a wrong value panics in `from_u32` or
+            // in salsa's checked lookup, or names another context's hygiene.
             let ctx = unsafe { SyntaxContext::from_u32(it.ctx) };
             return Some(Span { range: range(it.start, it.end), anchor, ctx });
         }
@@ -134,7 +137,10 @@ fn spanned(file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Span {
         file_id: EditionedFileId::from_raw(file_id),
         ast_id: ErasedFileAstId::from_raw(ast_id),
     };
-    // SAFETY: the context is one the database gave.
+    // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts: every
+    // caller passes a `ctx` that `load_cargo::answer` read from the host's database in this
+    // process (`span_parent`, `span_source`). Memory safety doesn't rest on it: a wrong value
+    // panics in `from_u32` or in salsa's checked lookup, or names another context's hygiene.
     Span { range: range(start, end), anchor, ctx: unsafe { SyntaxContext::from_u32(ctx) } }
 }
 

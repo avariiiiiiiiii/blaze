@@ -140,6 +140,24 @@ place of linear scans per record. The live region is rendered into one reused bu
 the lines that differ from the last drawn region are written. Plain output goes through one
 buffer, with no `String` per line.
 
+## Unsafe ([unsafe.md](../../design/unsafe.md))
+
+None of the speed above needed `unsafe`. `blaze-ci` and `blaze-ui` say `#![forbid(unsafe_code)]`.
+In `blaze-web`, the only unsafe module is `flecs.rs`: it holds the Flecs C calls, behind a safe
+API, with a `// SAFETY:` comment on each block, and every other module forbids unsafe code.
+
+For the safety lane:
+
+- **Fuzz targets** for the parsers of untrusted bytes:
+  - the webhook body and signature (`webhook::parse`);
+  - GitHub's API responses (`github.rs`);
+  - git's `diff-tree`, `ls-tree` and `cat-file --batch` output (`checkout.rs`);
+  - the websocket frame reader and HTTP request parser (`blaze-web/src/http.rs`).
+- **Model checking**:
+  - `blaze-web`'s `Roots`: safe code, but its reads are lock-free (acquire loads of `len`
+    and `OnceLock` slots, with writers under a mutex);
+  - the record channel to the page's thread.
+
 ## What measures them
 
 - **JSON**: simdjson and sonic-rs for decoding a webhook body; the borrowed serde decode

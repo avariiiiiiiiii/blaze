@@ -11,8 +11,11 @@
 //! that any of them compiles (it walks with unwinding, `ub_checks()` and debug assertions
 //! on), each check overflow checks may make, each landing pad's routines.
 
+use std::{borrow::Cow, hash::BuildHasher};
+
 use blaze_codegen::backend::FrontRef;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
+use hashbrown::{HashTable, hash_table::Entry};
 use hir_def::{
     AdtId, CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
     attrs::AttrFlags, signatures::FunctionSignature,
@@ -34,18 +37,20 @@ use hir_ty_mir::mir::{
 };
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
 use salsa::plumbing::AsId;
+use smallvec::{SmallVec, smallvec};
 
 use super::{
     HirInstance, Kind,
+    build::Build,
     places::{self, Ref},
 };
 use crate::{
     Arch, CodegenError, FnAbi, FunctionCx, Instance, InstanceDef, Target, asm, coroutine_instance,
     fn_trait_methods, fncache,
-    fragment::{DataRequest, Recorder},
+    fragment::{DataRequest, FuncTarget, Recorder},
     home::Homes,
     is_integer, is_thread_local,
 };
@@ -55,6 +60,9 @@ mod shims;
 #[cfg(test)]
 mod tests;
 
+/// The types of a call's operands: inline up to eight, as nearly every call has.
+pub(super) type Tys<'db> = SmallVec<[Ty<'db>; 8]>;
+
 /// Everything the IR of `instance` can request, each once, in the order of its MIR: [`walked`],
 /// owned.
 pub(crate) fn walk(
@@ -62,6 +70,9 @@ pub(crate) fn walk(
     instance: &HirInstance,
     _: &mut Homes,
 ) -> Result<Vec<Ref>, String> {
+    if let Kind::Allocator(forward) = &instance.0 {
+        return Ok(super::allocator::walk(forward));
+    }
     walked(db, instance).map(<[Ref]>::to_vec)
 }
 
@@ -77,6 +88,9 @@ pub(crate) fn walked<'db>(
         // assembly function with a relocation.
         Kind::Asm(_) => return Ok(&[]),
         Kind::Start(main) => start_walk(db, *main),
+        Kind::Allocator(forward) => {
+            return Err(format!("{forward:?}: an allocator entry, whose references are listed"));
+        }
         Kind::Code(code, env) => code_walk(db, code.clone(), env.clone()),
     };
     walked.as_deref().map_err(|what| format!("the references of {instance:?}: {what}"))
@@ -249,20 +263,23 @@ impl Listed {
             it => it,
         };
         let hash = FxBuildHasher.hash_one(&it);
+        let at = self.next();
         let refs = &self.refs;
         let entry = self.at.entry(hash, |slot| refs[slot.at as usize] == it, |slot| slot.hash);
         if let Entry::Vacant(vacant) = entry {
-            vacant.insert(Slot { hash, at: u32::try_from(refs.len()).expect("fewer than 2^32 references") });
+            vacant.insert(Slot { hash, at });
             self.refs.push(it);
         }
     }
 
     fn symbol(&mut self, name: Cow<'_, str>) {
         let hash = FxBuildHasher.hash_one(&*name);
+        let at = self.next();
         let refs = &self.refs;
-        let same = |slot: &Slot| matches!(&refs[slot.at as usize], FrontRef::Extern(it) if *it == *name);
+        let same =
+            |slot: &Slot| matches!(&refs[slot.at as usize], FrontRef::Extern(it) if **it == *name);
         if let Entry::Vacant(vacant) = self.symbols.entry(hash, same, |slot| slot.hash) {
-            vacant.insert(Slot { hash, at: u32::try_from(refs.len()).expect("fewer than 2^32 references") });
+            vacant.insert(Slot { hash, at });
             self.refs.push(FrontRef::Extern(name.into_owned()));
         }
     }
@@ -316,7 +333,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let requests = &fx.cg.wants.requests;
         for request in &requests.funcs[drained.0..] {
             match &request.target {
-                FuncTarget::Symbol(symbol) => listed.symbol(Cow::Borrowed(symbol)),
+                FuncTarget::Symbol(symbol) => listed.symbol(Cow::Borrowed(symbol.as_str())),
                 target => listed.add(places::func_ref(db, homes, target)?),
             }
         }
@@ -345,24 +362,33 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     pub(super) fn add(&mut self, it: Ref) -> Result<(), String> {
         self.drain()?;
-        self.list(it);
+        self.listed.add(it);
         Ok(())
     }
 
     /// A call of `def` with `args`, as `Recorder::callee` asks for it.
     pub(super) fn call(&mut self, def: InstanceDef, args: GenericArgs<'db>) -> Result<(), String> {
-        let it = places::call_ref(self.fx.cg.db, self.homes, def, args, &self.env)?;
-        self.add(it)
+        self.drain()?;
+        if !self.called.insert((def, args)) {
+            return Ok(());
+        }
+        let it = places::call_ref(self.fx.cg.db, &mut self.homes, def, args, &self.env)?;
+        self.listed.add(it);
+        Ok(())
     }
 
     /// A function of no crate of the build, by its symbol: `Recorder::import`.
     pub(super) fn symbol(&mut self, name: &str) -> Result<(), String> {
-        self.add(FrontRef::Extern(name.to_owned()))
+        self.drain()?;
+        self.listed.symbol(Cow::Borrowed(name));
+        Ok(())
     }
 
     /// A routine Cranelift calls itself, which no request names.
     pub(super) fn libcall(&mut self, libcall: ir::LibCall) -> Result<(), String> {
-        self.add(places::libcall_ref(libcall))
+        self.drain()?;
+        self.listed.libcall(libcall);
+        Ok(())
     }
 
     /// The function of assembly `text`: `Recorder::assembly`.
@@ -376,7 +402,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         for libcall in [ir::LibCall::Memcpy, ir::LibCall::Memmove, ir::LibCall::Memset] {
             self.libcall(libcall)?;
         }
-        self.add(places::personality_ref())?;
+        self.symbol(places::PERSONALITY)?;
         let resume = match self.fx.cg.target.exception_in_register() {
             true => "_Unwind_Resume",
             false => crate::unwind::seh::RESUME,
@@ -958,22 +984,21 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             AssertKind::BoundsCheck { .. } => {
                 return self.panic(&["panicking", "panic_bounds_check"]);
             }
-            AssertKind::Overflow(BinOp::Add, ..) => "add_overflow",
-            AssertKind::Overflow(BinOp::Sub, ..) => "sub_overflow",
-            AssertKind::Overflow(BinOp::Mul, ..) => "mul_overflow",
-            AssertKind::Overflow(BinOp::Div, ..) => "div_overflow",
-            AssertKind::Overflow(BinOp::Rem, ..) => "rem_overflow",
-            AssertKind::Overflow(BinOp::Shl, ..) => "shl_overflow",
-            AssertKind::Overflow(BinOp::Shr, ..) => "shr_overflow",
+            AssertKind::Overflow(BinOp::Add, ..) => "panic_const_add_overflow",
+            AssertKind::Overflow(BinOp::Sub, ..) => "panic_const_sub_overflow",
+            AssertKind::Overflow(BinOp::Mul, ..) => "panic_const_mul_overflow",
+            AssertKind::Overflow(BinOp::Div, ..) => "panic_const_div_overflow",
+            AssertKind::Overflow(BinOp::Rem, ..) => "panic_const_rem_overflow",
+            AssertKind::Overflow(BinOp::Shl, ..) => "panic_const_shl_overflow",
+            AssertKind::Overflow(BinOp::Shr, ..) => "panic_const_shr_overflow",
             // A unit that makes this check refuses it, naming it.
             AssertKind::Overflow(..) if msg.is_optional_overflow_check() => return Ok(()),
             AssertKind::Overflow(op, ..) => return Err(format!("overflow check of {op:?}")),
-            AssertKind::OverflowNeg(_) => "neg_overflow",
-            AssertKind::DivisionByZero(_) => "div_by_zero",
-            AssertKind::RemainderByZero(_) => "rem_by_zero",
+            AssertKind::OverflowNeg(_) => "panic_const_neg_overflow",
+            AssertKind::DivisionByZero(_) => "panic_const_div_by_zero",
+            AssertKind::RemainderByZero(_) => "panic_const_rem_by_zero",
         };
-        let name = format!("panic_const_{name}");
-        self.panic(&["panicking", "panic_const", &name])
+        self.panic(&["panicking", "panic_const", name])
     }
 
     /// `call_with`: what a call terminator calls, as the IR builder sorts it out.

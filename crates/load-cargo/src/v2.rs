@@ -19,12 +19,9 @@
 //! - **Build script runs** are applied by [`Lowered::ran`]; a proc macro's built expanders by
 //!   [`Lowered::macros`].
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod crates;
-// salsa's `#[salsa::db]`, `#[salsa::interned]` and `#[salsa::tracked]` expand to `unsafe impl`s
-// behind salsa's safe API; nothing in `db` writes `unsafe` itself.
-#[allow(unsafe_code)]
 mod db;
 mod files;
 #[cfg(test)]

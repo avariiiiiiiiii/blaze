@@ -17,6 +17,7 @@ use hir_ty::{
     consteval::try_const_usize,
     next_solver::{EarlyBinder, GenericArgs, Ty, TyKind},
 };
+use intern::Symbol;
 use rustc_abi::BackendRepr;
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::AstNode as _;
@@ -122,7 +123,7 @@ fn dangerous_init(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Init> {
         }
         Expr::MethodCall { receiver, .. } => {
             let def = util::method_fn(b, expr)?;
-            if util::fn_item(b.db(), def).as_deref() != Some("assume_init") {
+            if util::fn_item(b.db(), def).as_ref().map(Symbol::as_str) != Some("assume_init") {
                 return None;
             }
             let Expr::Call { callee, .. } = store.expr(receiver) else { return None };

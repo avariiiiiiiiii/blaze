@@ -1,5 +1,6 @@
 //! A set of high-level utility fixture methods to use in tests.
 
+#![forbid(unsafe_code)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
 #[cfg(feature = "in-rust-tree")]

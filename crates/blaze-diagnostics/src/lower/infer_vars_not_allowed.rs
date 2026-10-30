@@ -18,20 +18,16 @@ use crate::{
     model::{Applicability, Diag},
 };
 
-/// The placeholders under `node`: rustc's `HirPlaceholderCollector`, of `_` types and of `_`
-/// const arguments and array lengths.
-fn placeholders(node: &SyntaxNode) -> Vec<TextRange> {
-    let mut out: Vec<TextRange> = node
-        .descendants()
+/// The placeholders under `node` in source order (a preorder walk; placeholders don't nest):
+/// rustc's `HirPlaceholderCollector`, of `_` types and of `_` const arguments and array lengths.
+fn placeholders(node: &SyntaxNode) -> impl Iterator<Item = TextRange> {
+    node.descendants()
         .filter(|it| {
             ast::InferType::can_cast(it.kind())
                 || (ast::UnderscoreExpr::can_cast(it.kind())
                     && it.parent().is_some_and(|p| ast::ConstArg::can_cast(p.kind())))
         })
         .map(|it| it.text_range())
-        .collect();
-    out.sort_by_key(|it| (it.start(), it.end()));
-    out
 }
 
 /// rustc's `bad_placeholder`: `kind` pluralized, the spans sorted, each labelled.
@@ -141,17 +137,23 @@ fn impl_trait(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
         CallableKind::Function(_) | CallableKind::TupleStruct(_) | CallableKind::TupleEnumVariant(_) => "Fn",
         _ => return None,
     };
-    let params: Vec<hir::Type<'_>> = callable.params().into_iter().map(|it| it.ty().clone()).collect();
-    if params.iter().any(|it| !suggestable(cx, it)) {
-        return None;
+    let mut out = format!("impl {trait_name}(");
+    for (i, param) in callable.params().iter().enumerate() {
+        if !suggestable(cx, param.ty()) {
+            return None;
+        }
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&cx.ty(param.ty()));
     }
+    out.push(')');
     let ret = callable.return_type();
-    let maybe_ret = match ret.is_unit() {
-        true => String::new(),
-        false => format!(" -> {}", cx.ty(&ret)),
-    };
-    let params: Vec<String> = params.iter().map(|it| cx.ty(it)).collect();
-    Some(format!("impl {trait_name}({}){maybe_ret}", params.join(", ")))
+    if !ret.is_unit() {
+        out.push_str(" -> ");
+        out.push_str(&cx.ty(&ret));
+    }
+    Some(out)
 }
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InferVarsNotAllowed) -> Vec<Found> {
@@ -191,10 +193,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InferVarsNotAllowed) -> Vec<Found>
         site_fact(cx, &mut diag, node.as_ref());
         return vec![Found::new(diag, Phase::Items)];
     };
-    let spans = placeholders(&ty);
-    let spans = if spans.is_empty() { vec![at] } else { spans };
-    if spans[0] != at {
+    // Every placeholder of the type has its own hir diagnostic; only the first one's builds the
+    // error, and the others stop at the first node of the walk.
+    if placeholders(&ty).next().is_some_and(|first| first != at) {
         return Vec::new();
+    }
+    let mut spans: Vec<TextRange> = placeholders(&ty).collect();
+    if spans.is_empty() {
+        spans.push(at);
     }
     let mut diag = bad_placeholder(cx, file, &spans, kind);
     let inferred = cx.sema.type_of_expr(&body).map(|it| it.original());

@@ -204,7 +204,7 @@ impl<'db> AssocItemCollector<'db> {
         let ast_id = InFile::new(self.file_id, ast_id.upcast());
 
         'attrs: for (attr_id, attr) in attrs.as_ref().iter() {
-            let ast_id_with_path = AstIdWithPath { path: attr.path.clone(), ast_id };
+            let ast_id_with_path = AstIdWithPath { path: ModPath::clone(&attr.path), ast_id };
 
             match self.def_map.resolve_attr_macro(
                 self.local_def_map,

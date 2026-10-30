@@ -83,11 +83,10 @@ impl Hashes for ById {
     }
 }
 
-fn frontend(text: &str) -> (TestDB, HirFrontend) {
-    let (db, _) = TestDB::with_single_file(text);
-    let fork = std::sync::Mutex::new(db.clone());
-    let databases = Databases::new(move || Box::new(fork.lock().expect("the fixture").clone()));
-    (db, HirFrontend::new(databases, Box::new(ById), BuildTime(Default::default())))
+/// The fixture lives as long as the test process, as the frontend borrows it.
+fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
+    let db: &'static TestDB = Box::leak(Box::new(TestDB::with_single_file(text).0));
+    (db, HirFrontend::new(Databases::new(db), Box::new(ById), BuildTime(Default::default())))
 }
 
 fn declarations(db: &TestDB) -> Vec<ModuleDefId> {
@@ -249,7 +248,7 @@ fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
                         }
                     }
                     Kind::Asm(_) => assert_eq!(walk(db, next, homes), Ok(Vec::new())),
-                    Kind::Start(_) => (),
+                    Kind::Start(_) | Kind::Allocator(_) => (),
                 }
             }
             reached.push((instance, walk_of));

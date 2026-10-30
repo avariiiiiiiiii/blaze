@@ -9,6 +9,8 @@
 //! its length (`u32`, little-endian) and its CBOR. What a Began or a whole object drops is
 //! always a whole stream, so nothing is ever compressed twice.
 
+#![forbid(unsafe_code)]
+
 use std::io::{Read, Write};
 
 use blaze_protocol::events::{Event, Record};

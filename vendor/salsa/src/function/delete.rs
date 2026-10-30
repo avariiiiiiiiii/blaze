@@ -10,9 +10,11 @@ pub(super) struct DeletedEntries<C: Configuration> {
     memos: boxcar::Vec<SharedBox<Memo<C>>>,
 }
 
-#[allow(clippy::undocumented_unsafe_blocks)] // TODO(#697) document safety
+// SAFETY: A `SharedBox` uniquely owns its allocation (the contract of `DeletedEntries::push`), so
+// it is a `Box<T>` and sends under the same bound.
 unsafe impl<T: Send> Send for SharedBox<T> {}
-#[allow(clippy::undocumented_unsafe_blocks)] // TODO(#697) document safety
+// SAFETY: `&SharedBox<T>` gives no access to the `T` at all (only `Drop`, through `&mut`, touches
+// it), so sharing it is at most as permissive as sharing a `Box<T>`.
 unsafe impl<T: Sync> Sync for SharedBox<T> {}
 
 impl<C: Configuration> Default for DeletedEntries<C> {
@@ -26,7 +28,8 @@ impl<C: Configuration> Default for DeletedEntries<C> {
 impl<C: Configuration> DeletedEntries<C> {
     /// # Safety
     ///
-    /// The memo must be valid and safe to free when the `DeletedEntries` list is cleared or dropped.
+    /// The memo must come from `Box::leak` (or `Box::into_raw`), be owned by nothing else, and be
+    /// safe to free when the `DeletedEntries` list is cleared or dropped.
     pub(super) unsafe fn push(&self, memo: NonNull<Memo<C>>) {
         self.memos.push(SharedBox(memo));
     }

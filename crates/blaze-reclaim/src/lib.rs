@@ -206,9 +206,10 @@ impl Grace {
 /// What a writer unlinked, held until its grace has passed. Dropping a limbo drops everything
 /// it holds at once: its owner drops it only when no reader can reach the tables those values
 /// were in any more.
+/// What it holds is `Sync` too, so a limbo is: an owner that is shared keeps it.
 #[derive(Default)]
 pub struct Limbo {
-    held: Vec<(Grace, Box<dyn Send>)>,
+    held: Vec<(Grace, Box<dyn Send + Sync>)>,
 }
 
 impl Limbo {
@@ -218,12 +219,12 @@ impl Limbo {
 
     /// Holds `value`, unlinked before `grace` started, until `grace` has passed. One grace may
     /// cover any number of values unlinked before it.
-    pub fn hold(&mut self, grace: Grace, value: impl Send + 'static) {
+    pub fn hold(&mut self, grace: Grace, value: impl Send + Sync + 'static) {
         self.held.push((grace, Box::new(value)));
     }
 
     /// Holds `value`, unlinked just now, under a grace of its own.
-    pub fn retire(&mut self, value: impl Send + 'static) {
+    pub fn retire(&mut self, value: impl Send + Sync + 'static) {
         self.hold(Grace::start(), value);
     }
 

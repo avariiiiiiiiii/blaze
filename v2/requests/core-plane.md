@@ -75,3 +75,5 @@
 - Why: plan design/hardware.md, "P cores for the critical path": the plane now says whether a
   task is on its request's critical path. `exec.rs` already takes it; `machine.rs` and
   `build.rs` match with `..`.
+
+> forwarded to cargo: the daemon's match is lane cargo's (cargo.md, "From core").

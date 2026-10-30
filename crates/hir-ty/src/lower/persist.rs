@@ -777,7 +777,7 @@ fn put_span(w: &mut Vec<u32>, span: Span) {
     }
 }
 
-fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic) {
+pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic) {
     match diagnostic {
         TyLoweringDiagnostic::PathDiagnostic { source, diag } => {
             w.push(0);
@@ -791,7 +791,7 @@ fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic) {
     }
 }
 
-fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDiagnostic) {
+pub(crate) fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDiagnostic) {
     match *diagnostic {
         PathLoweringDiagnostic::GenericArgsProhibited { segment, reason } => {
             let reason = match reason {
@@ -864,15 +864,22 @@ fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDiagnostic) {
 }
 
 /// Diagnostics' words being read.
-struct Words<'a> {
+pub(crate) struct Words<'a> {
     words: &'a [u32],
     next: usize,
     /// Where the batch's root is, for errors.
     at: u64,
 }
 
+impl<'a> Words<'a> {
+    /// `words` as [`put_diagnostic`] and [`put_path_diagnostic`] wrote them, in a record at `at`.
+    pub(crate) fn new(words: &'a [u32], at: u64) -> Words<'a> {
+        Words { words, next: 0, at }
+    }
+}
+
 impl Words<'_> {
-    fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.next == self.words.len()
     }
 
@@ -959,7 +966,7 @@ impl Words<'_> {
         })
     }
 
-    fn diagnostic(&mut self) -> Result<TyLoweringDiagnostic, FormatError> {
+    pub(crate) fn diagnostic(&mut self) -> Result<TyLoweringDiagnostic, FormatError> {
         Ok(match self.u32()? {
             0 => TyLoweringDiagnostic::PathDiagnostic {
                 source: self.local()?,
@@ -970,7 +977,7 @@ impl Words<'_> {
         })
     }
 
-    fn path_diagnostic(&mut self) -> Result<PathLoweringDiagnostic, FormatError> {
+    pub(crate) fn path_diagnostic(&mut self) -> Result<PathLoweringDiagnostic, FormatError> {
         Ok(match self.u32()? {
             0 => {
                 let segment = self.u32()?;

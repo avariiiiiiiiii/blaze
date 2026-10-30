@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::{io::Read, path::Path, sync::Arc, time::Duration};
 
 use blaze_protocol::events::{Event, Fns, Function, How, Record, Summary};

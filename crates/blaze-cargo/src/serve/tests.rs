@@ -2,6 +2,8 @@
 //! before it plans, a front end that compiles every unit at once, build scripts that end as
 //! they start. Tasks run inline in a seeded order, so a run is a function of its seed.
 
+#![forbid(unsafe_code)]
+
 use std::{
     any::Any,
     cell::{Cell, RefCell},
@@ -10,7 +12,8 @@ use std::{
 };
 
 use blaze_api::{
-    ApiError, Artifact, Envelope, FetchVerb, Level, Reach, Request, Response, SCHEMA, Table, Targets, Verb, ViewRef,
+    ApiError, Artifact, Envelope, FetchVerb, Level, Reach, Request, Response, SCHEMA, Table, Targets, TestOutcome,
+    TestResult, Ub, Verb, ViewRef,
     frames::{self, Frames},
 };
 use blaze_cas::Store;
@@ -30,7 +33,7 @@ use super::{
     Daemon, Options,
     job::Value,
     plane::Inline,
-    work::{Compiled, Failed, Front, Goal, JobInput, Runs, Source, SourceFile, Steps},
+    work::{Compiled, Failed, Front, Goal, JobInput, Runs, Selection, Source, SourceFile, Steps},
 };
 
 const SOCKET: &str = "run/blaze/v2.sock";
@@ -298,8 +301,23 @@ impl Front for FakeFront {
         Ok(Box::new(Over(Vec::new())))
     }
 
-    fn tests(&self, _: &[Artifact], _: &[String], _: bool, _: u64) -> Result<Box<dyn Runs>, ApiError> {
+    fn tests(&self, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<Box<dyn Runs>, ApiError> {
+        assert!(selection.ub.is_none(), "tests under the evaluator are evaluated, not run");
         Ok(Box::new(Over(Vec::new())))
+    }
+
+    fn ub_tests(&self, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
+        assert_eq!(self.goal, Goal::Check, "tests under the evaluator only check their units");
+        let all = ["a::adds", "a::overflows", "b::reads"];
+        Ok(all.iter().filter(|it| selection.filter.iter().all(|filter| it.contains(&**filter))).map(|it| (*it).to_owned()).collect())
+    }
+
+    fn evaluate(&self, test: &str, ub: Ub) -> Result<TestResult, Failed> {
+        let (outcome, output) = match test {
+            "a::overflows" => (TestOutcome::Failed, format!("undefined behavior\nseed: {}\n", ub.seed.unwrap_or(0)).into_bytes()),
+            _ => (TestOutcome::Passed, Vec::new()),
+        };
+        Ok(TestResult { name: test.to_owned(), binary: "a".into(), millis: 0, output, outcome })
     }
 
     fn run(&self, _: &[Artifact], _: Option<&str>, _: &[String], _: u64) -> Result<Box<dyn Runs>, ApiError> {
@@ -602,6 +620,51 @@ fn a_run_reports_what_ran_after_built() {
     assert_eq!(got.last(), Some(&Response::Done { ok: true }));
 }
 
+#[test]
+fn tests_under_the_evaluator_are_each_evaluated_and_one_failing_fails_the_job() {
+    let mut sim = Sim::new(9, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 9);
+    let mut client = dial(&mut daemon);
+    let test = |filter: &str| Request::Test {
+        view: ViewRef::Head("/w".into()),
+        targets: agent(),
+        filter: vec![filter.to_owned()],
+        all: true,
+        args: Vec::new(),
+        ub: Some(Ub { seed: Some(3), schedules: None }),
+    };
+    let results = |got: &[Response]| -> Vec<(String, TestOutcome)> {
+        let mut results: Vec<_> = got
+            .iter()
+            .filter_map(|it| match it {
+                Response::TestResult(result) => Some((result.name.clone(), result.outcome)),
+                _ => None,
+            })
+            .collect();
+        results.sort();
+        results
+    };
+    let id = client.send(&mut daemon, test("a::"));
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(
+        results(&got),
+        vec![("a::adds".to_owned(), TestOutcome::Passed), ("a::overflows".to_owned(), TestOutcome::Failed)],
+        "{got:#?}"
+    );
+    let failed = got.iter().find_map(|it| match it {
+        Response::TestResult(result) if result.outcome == TestOutcome::Failed => Some(result.output.clone()),
+        _ => None,
+    });
+    assert_eq!(failed.as_deref(), Some(&b"undefined behavior\nseed: 3\n"[..]));
+    assert_eq!(got.last(), Some(&Response::Done { ok: false }));
+    let id = client.send(&mut daemon, test("b::"));
+    let got = client.wait(&mut daemon, id);
+    assert_eq!(results(&got), vec![("b::reads".to_owned(), TestOutcome::Passed)], "{got:#?}");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }));
+}
+
 /// What one client asked and how it ended.
 struct Asked {
     client: usize,
@@ -653,7 +716,7 @@ fn every_request_ends_once_over_many_seeds() {
             let request = match rng.below(4) {
                 0 => Request::Check { view, targets: agent() },
                 1 => Request::Build { view, targets: agent() },
-                2 => Request::Test { view, targets: agent(), filter: Vec::new(), all: false },
+                2 => Request::Test { view, targets: agent(), filter: Vec::new(), all: false, args: Vec::new(), ub: None },
                 _ => Request::Run { view, targets: agent(), bin: None, args: Vec::new() },
             };
             let id = clients[client].send(&mut daemon, request);

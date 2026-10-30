@@ -209,7 +209,16 @@ pub trait Interner:
     type Clause: Clause<Self>;
     type Clauses: Clauses<Self>;
 
-    fn with_global_cache<R>(self, f: impl FnOnce(&mut search_graph::GlobalCache<Self>) -> R) -> R;
+    /// The solver cache of `scope`, read and written through `&`: see
+    /// [`search_graph::Cx::with_global_cache`].
+    fn with_global_cache<R>(
+        self,
+        scope: search_graph::CacheScope,
+        f: impl FnOnce(&search_graph::GlobalCache<Self>) -> R,
+    ) -> R;
+
+    /// See [`search_graph::Cx::cache_scope`].
+    fn cache_scope(self, dep_node: &Self::DepNodeIndex) -> search_graph::CacheScope;
 
     fn canonical_param_env_cache_get_or_insert<R>(
         self,
@@ -643,8 +652,15 @@ impl<I: Interner> search_graph::Cx for I {
     fn with_cached_task<T>(self, task: impl FnOnce() -> T) -> (T, I::DepNodeIndex) {
         I::with_cached_task(self, task)
     }
-    fn with_global_cache<R>(self, f: impl FnOnce(&mut search_graph::GlobalCache<Self>) -> R) -> R {
-        I::with_global_cache(self, f)
+    fn with_global_cache<R>(
+        self,
+        scope: search_graph::CacheScope,
+        f: impl FnOnce(&search_graph::GlobalCache<Self>) -> R,
+    ) -> R {
+        I::with_global_cache(self, scope, f)
+    }
+    fn cache_scope(self, dep_node: &I::DepNodeIndex) -> search_graph::CacheScope {
+        I::cache_scope(self, dep_node)
     }
     fn assert_evaluation_is_concurrent(&self) {
         self.assert_evaluation_is_concurrent()

@@ -1,7 +1,7 @@
 //! Switching an image's jump table between generations, apart from how a platform writes
 //! its memory ([`Memory`]).
 //!
-//! A patch is checked whole, read in place from its message's bytes, with scratch buffers the
+//! A patch is checked whole, viewed in place in its message's bytes, with scratch buffers the
 //! switch keeps from patch to patch: once they have grown, taking a patch allocates nothing.
 //! Its cells go into one of [`POOL`] tables the switch owns, the one the cell left longest
 //! ago, brought to the new generation by storing only the slots that differ: undoing the
@@ -151,6 +151,11 @@ impl Span {
     pub(crate) fn range(&self) -> Range<u64> {
         self.at..self.end()
     }
+
+    #[cfg(test)]
+    pub(crate) fn new(at: u64, from: usize, len: usize) -> Span {
+        Span { at, from, len }
+    }
 }
 
 /// What a platform writes, every address in memory: spans of the message's bytes sorted by
@@ -164,6 +169,16 @@ pub(crate) struct Writes<'a> {
 }
 
 impl<'a> Writes<'a> {
+    #[cfg(test)]
+    pub(crate) fn new(
+        message: &'a [u8],
+        spans: &'a [Span],
+        rebase: &'a [u64],
+        slide: u64,
+    ) -> Writes<'a> {
+        Writes { message, spans, rebase, slide }
+    }
+
     pub(crate) fn bytes(&self, span: &Span) -> &'a [u8] {
         &self.message[span.from..span.from + span.len]
     }
@@ -185,14 +200,11 @@ impl<'a> Writes<'a> {
             let bytes = self.bytes(span);
             let (from, until) = (span.at.max(range.start), span.end().min(range.end));
             let part = &bytes[(from - span.at) as usize..(until - span.at) as usize];
-            // SAFETY: `from..until` is within `range`, which `to` stands for (the caller's).
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    part.as_ptr(),
-                    to.add((from - range.start) as usize),
-                    part.len(),
-                )
-            };
+            // SAFETY: `from` is within `range`, which `to` stands for (the caller's).
+            let into = unsafe { to.add((from - range.start) as usize) };
+            // SAFETY: `from..until` is within `range`, writable at `into` (the caller's); the
+            // message is not the memory written.
+            unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), into, part.len()) };
             let lowest = span.at.max(from.saturating_sub(7));
             let first = self.rebase.partition_point(|it| *it < lowest);
             for &field in self.rebase[first..].iter().take_while(|it| **it < until) {
@@ -201,16 +213,19 @@ impl<'a> Writes<'a> {
                     .to_le_bytes();
                 let (start, end) = (field.max(from), (field + 8).min(until));
                 let part = &value[(start - field) as usize..(end - field) as usize];
-                // SAFETY: as above: `start..end` is within `range`.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        part.as_ptr(),
-                        to.add((start - range.start) as usize),
-                        part.len(),
-                    )
-                };
+                // SAFETY: as above: `start` is within `range`.
+                let into = unsafe { to.add((start - range.start) as usize) };
+                // SAFETY: as above: `start..end` is within `range`; `value` is a local.
+                unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), into, part.len()) };
             }
         }
+    }
+
+    /// [`Writes::put`] into `to`, which stands for `range`.
+    pub(crate) fn fill(&self, range: &Range<u64>, to: &mut [u8]) {
+        assert_eq!(to.len() as u64, range.end - range.start, "a buffer the length of {range:x?}");
+        // SAFETY: `to` is `range`'s length (asserted) and borrowed mutably for this call.
+        unsafe { self.put(range, to.as_mut_ptr()) }
     }
 
     /// Writes every span where it goes.
@@ -625,13 +640,19 @@ impl<M: Memory> Switch<M> {
         Ok(())
     }
 
+    /// The loader's table, which the cell pointed at when the program started.
+    fn image(&self) -> &[u64] {
+        let slots = self.layout.slots as usize;
+        // SAFETY: `slots` code addresses (the descriptor's count), 8-aligned (`Switch::new`
+        // checked), in the image's data, mapped as long as it is. Nothing writes it: the
+        // switch stores only to the cell and its own tables.
+        unsafe { std::slice::from_raw_parts(self.image as *const u64, slots) }
+    }
+
     /// The target of `slot` in the table the cell points at.
     fn value(&self, slot: u32) -> u64 {
         match self.on {
-            // SAFETY: the loader's table, which the cell pointed at when the program started:
-            // `slots` code addresses (the descriptor's count, which `slot` is below), 8-aligned
-            // (`Switch::new` checked), in the image, mapped as long as it is. Nothing writes it.
-            None => unsafe { (self.image as *const u64).add(slot as usize).read() },
+            None => self.image()[slot as usize],
             Some(at) => self.pool[at].table[slot as usize].load(Ordering::Relaxed),
         }
     }
@@ -644,12 +665,7 @@ impl<M: Memory> Switch<M> {
         }
         let at = if self.pool.len() < POOL {
             let table: Box<[AtomicU64]> = match self.on {
-                None => {
-                    let slots = self.layout.slots as usize;
-                    // SAFETY: as in `value`: the loader's table of `slots` entries.
-                    let image = unsafe { std::slice::from_raw_parts(self.image as *const u64, slots) };
-                    image.iter().map(|it| AtomicU64::new(*it)).collect()
-                }
+                None => self.image().iter().map(|it| AtomicU64::new(*it)).collect(),
                 Some(on) => {
                     let table = &self.pool[on].table;
                     table.iter().map(|it| AtomicU64::new(it.load(Ordering::Relaxed))).collect()

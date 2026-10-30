@@ -124,7 +124,7 @@ impl Indent {
 
     fn write(self, out: &mut String) {
         for at in 0..self.depth {
-            out.push_str(if self.lasts >> at & 1 == 1 { "   " } else { "\u{2502}  " });
+            out.push_str(if (self.lasts >> at) & 1 == 1 { "   " } else { "\u{2502}  " });
         }
     }
 }
@@ -305,9 +305,8 @@ fn changed(was: &Frame, now: &Frame, out: &mut String) {
     }
     // Up to the first that differs, clear below and write the rest.
     let up = drawn - first;
-    let whole = usize::from(drawn > 0)
-        + if up > 0 { 3 + digits(up as u64) + 3 } else { 0 }
-        + now.text.len() - now.start(first);
+    let moves = if up > 0 { 3 + digits(up as u64) + 3 } else { 0 };
+    let whole = usize::from(drawn > 0) + moves + (now.text.len() - now.start(first));
     if out.len() - from > whole {
         out.truncate(from);
         if drawn > 0 {

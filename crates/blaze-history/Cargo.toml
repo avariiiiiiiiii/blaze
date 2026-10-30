@@ -1,0 +1,24 @@
+[package]
+name = "blaze-history"
+description = "blaze v2's scheduling from history: each task's past run times and peak memory, by kind and key, as the plane's critical-path costs and admission peaks (docs/v2/plan/design/compile-time.md change 11)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-graph.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+blaze-protocol.workspace = true
+
+[lints]
+workspace = true

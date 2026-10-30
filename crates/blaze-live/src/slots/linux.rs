@@ -19,7 +19,7 @@ use std::{
     },
 };
 
-pub(super) use super::unix::{Map, backtrace, descriptor};
+pub(super) use super::unix::{backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
@@ -129,25 +129,26 @@ impl Os {
     /// writable: made writable for the write, then given it back.
     fn protected(&self, writes: &Writes<'_>, pages: &Range<u64>, protection: i32) -> Result<(), String> {
         let (start, len) = (pages.start as *mut c_void, (pages.end - pages.start) as usize);
-        // SAFETY: the pages are of the image's mappings with `protection` (read at start),
-        // made writable for the write and given it back; nothing else of the program's
-        // writes the image's data a patch writes while `poll` writes it.
-        unsafe {
-            if mprotect(start, len, protection | PROT_WRITE) != 0 {
-                return Err(format!(
-                    "making {:#x} writable: {}",
-                    pages.start,
-                    std::io::Error::last_os_error()
-                ));
-            }
-            writes.put(pages, pages.start as *mut u8);
-            if mprotect(start, len, protection) != 0 {
-                return Err(format!(
-                    "protecting {:#x} again: {}",
-                    pages.start,
-                    std::io::Error::last_os_error()
-                ));
-            }
+        // SAFETY: the pages are of the image's mappings with `protection` (read at start);
+        // adding write access changes no byte and keeps them readable and, if they were,
+        // runnable.
+        if unsafe { mprotect(start, len, protection | PROT_WRITE) } != 0 {
+            return Err(format!(
+                "making {:#x} writable: {}",
+                pages.start,
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: the pages are writable now; nothing else of the program's writes the
+        // image's data a patch writes while `poll` writes it.
+        unsafe { writes.put(pages, pages.start as *mut u8) };
+        // SAFETY: as for making them writable: their protection from before.
+        if unsafe { mprotect(start, len, protection) } != 0 {
+            return Err(format!(
+                "protecting {:#x} again: {}",
+                pages.start,
+                std::io::Error::last_os_error()
+            ));
         }
         if protection & PROT_EXEC != 0 {
             flush(std::iter::once(pages.clone()), 0);
@@ -197,11 +198,10 @@ fn map_twice(code: &Range<u64>) -> Result<u64, String> {
         let moved = unsafe { mremap(view, len, len, MREMAP_MAYMOVE | MREMAP_FIXED, to) };
         if moved != to {
             let error = error("moving a memory file over the region");
-            // SAFETY: this function's mappings, which nothing refers to.
-            unsafe {
-                munmap(view, len);
-                munmap(alias, len);
-            }
+            // SAFETY: this function's mapping, which nothing refers to.
+            unsafe { munmap(view, len) };
+            // SAFETY: as above.
+            unsafe { munmap(alias, len) };
             return Err(error);
         }
         Ok(alias as u64)
@@ -446,27 +446,29 @@ fn flush(ranges: impl Iterator<Item = Range<u64>> + Clone, delta: u64) {
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
     let data_line = 4u64 << ((ctr >> 16) & 0xf);
     let code_line = 4u64 << (ctr & 0xf);
-    // SAFETY: cleaning and invalidating caches by address of memory that is mapped changes
-    // no memory, as __clear_cache does.
-    unsafe {
-        for range in ranges.clone() {
-            let (start, end) = (range.start.wrapping_add(delta), range.end.wrapping_add(delta));
-            let mut at = start & !(data_line - 1);
-            while at < end {
-                asm!("dc cvau, {}", in(reg) at, options(nostack));
-                at += data_line;
-            }
+    // Cleaning and invalidating caches by address of memory that is mapped changes no
+    // memory, as __clear_cache does; each address below is of a range just written.
+    for range in ranges.clone() {
+        let (start, end) = (range.start.wrapping_add(delta), range.end.wrapping_add(delta));
+        let mut at = start & !(data_line - 1);
+        while at < end {
+            // SAFETY: as above: `at` is in a mapped range.
+            unsafe { asm!("dc cvau, {}", in(reg) at, options(nostack)) };
+            at += data_line;
         }
-        asm!("dsb ish", options(nostack));
-        for range in ranges {
-            let mut at = range.start & !(code_line - 1);
-            while at < range.end {
-                asm!("ic ivau, {}", in(reg) at, options(nostack));
-                at += code_line;
-            }
-        }
-        asm!("dsb ish", "isb", options(nostack));
     }
+    // SAFETY: a barrier, which touches no memory.
+    unsafe { asm!("dsb ish", options(nostack)) };
+    for range in ranges {
+        let mut at = range.start & !(code_line - 1);
+        while at < range.end {
+            // SAFETY: as above: `at` is in a mapped range.
+            unsafe { asm!("ic ivau, {}", in(reg) at, options(nostack)) };
+            at += code_line;
+        }
+    }
+    // SAFETY: barriers, which touch no memory.
+    unsafe { asm!("dsb ish", "isb", options(nostack)) };
 }
 
 /// x86 keeps instruction fetch coherent with stores, through any mapping of the page.

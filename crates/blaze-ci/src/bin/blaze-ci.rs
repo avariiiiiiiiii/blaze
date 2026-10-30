@@ -2,6 +2,8 @@
 //! `blaze-ci standby <config.json>`: on another machine, takes over from the newest snapshot
 //! when the primary stops answering.
 
+#![forbid(unsafe_code)]
+
 use std::{path::Path, process::ExitCode};
 
 use blaze_ci::{config::Config, runtime, standby};

@@ -15,6 +15,8 @@
 //! scan of every crate, node or step), and the renderers write into one buffer each, with no
 //! `String` per line.
 
+#![forbid(unsafe_code)]
+
 /// `write!` into a `String`, which cannot fail.
 macro_rules! put {
     ($out:expr, $($arg:tt)*) => {{

@@ -38,6 +38,9 @@ pub(crate) struct Made {
     /// What the binary does depends on beside the code it reaches: its target, toolchain,
     /// codegen settings and panic strategy ([`blaze_usercode::test::Suite::context`]).
     pub(crate) context: Option<ContentId>,
+    /// Every instance its codegen compiled or found, with the code hash it was made from, as
+    /// [`blaze_api::Response::CodegenInputs`] lists them: sorted by key.
+    pub(crate) inputs: Vec<(ContentId, ContentId)>,
 }
 
 /// A test of a test binary, as selection sees it.
@@ -74,17 +77,17 @@ struct RecordRef<'a> {
     made: &'a Made,
 }
 
-const RECORD: &str = "blaze v2 cargo unit record 1";
+const RECORD: &str = "blaze v2 cargo unit record 2";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 
 /// The record's fixed header, which `fresh` reads where the store has it, allocating nothing:
 /// `MAGIC`, the count of outputs and of native inputs (`u32` LE each), each output's key
 /// (32 bytes), then each native input's BLAKE3 hash (32 bytes), its path's length (`u32` LE)
 /// and its path. The CBOR of [`Record`] follows.
-mod header {
-    pub(super) const MAGIC: &[u8; 4] = b"BZU1";
+pub(crate) mod header {
+    pub(crate) const MAGIC: &[u8; 4] = b"BZU1";
 
-    pub(super) fn write(out: &mut Vec<u8>, outputs: &[blaze_cas::Key], natives: &[(String, blaze_ids::ContentId)]) {
+    pub(crate) fn write(out: &mut Vec<u8>, outputs: &[blaze_cas::Key], natives: &[(String, blaze_ids::ContentId)]) {
         let paths: usize = natives.iter().map(|it| it.0.len()).sum();
         out.reserve(12 + 32 * outputs.len() + 36 * natives.len() + paths);
         out.extend_from_slice(MAGIC);
@@ -112,7 +115,7 @@ mod header {
 
     /// Whether every output is in the store and every native input is as it was, and where the
     /// CBOR body starts; `None` for a record that is not, or a header that is cut short.
-    pub(super) fn check(
+    pub(crate) fn check(
         mut bytes: &[u8],
         has: impl Fn(&blaze_cas::Key) -> bool,
         file: &mut impl FnMut(&std::path::Path) -> Option<[u8; 32]>,
@@ -166,20 +169,36 @@ fn work_out_key(job: &Job, unit: usize) -> Result<Option<Key>, ApiError> {
         Goal::Run => 3,
         Goal::Reach => 4,
     };
+    let runs = runs(job, unit);
     let mut hasher = Hasher::new(RECORD);
-    hasher
-        .id(&identity)
-        .part(&cbor(u, "unit", unit)?)
-        .part(&cbor(plan, "plan", unit)?)
-        .part(&cbor(&runs(job, unit).env, "run environment", unit)?)
-        .id(&toolchain.id)
-        .update(&[goal, u8::from(job.input.color)]);
+    hasher.id(&identity);
+    // The unit, its plan and its run environment, each encoded into one buffer kept per
+    // thread and hashed from it: no buffer allocated per unit once the first has grown it.
+    SCRATCH.with_borrow_mut(|scratch| -> Result<(), ApiError> {
+        hash_cbor(&mut hasher, scratch, u, "unit", unit)?;
+        hash_cbor(&mut hasher, scratch, plan, "plan", unit)?;
+        hash_cbor(&mut hasher, scratch, &runs.env, "run environment", unit)
+    })?;
+    hasher.id(&toolchain.id).update(&[goal, u8::from(job.input.color)]);
     Ok(Some(Key(hasher.finish())))
 }
 
-fn cbor<T: Serialize>(value: &T, what: &str, unit: usize) -> Result<Vec<u8>, ApiError> {
-    blaze_protocol::cbor::to_vec(value)
-        .map_err(|why| ApiError::new(format!("encoding the {what} of unit {unit}: {why}"), None))
+fn hash_cbor<T: Serialize + ?Sized>(
+    hasher: &mut Hasher,
+    scratch: &mut Vec<u8>,
+    value: &T,
+    what: &str,
+    unit: usize,
+) -> Result<(), ApiError> {
+    scratch.clear();
+    blaze_protocol::cbor::append(scratch, value)
+        .map_err(|why| ApiError::new(format!("encoding the {what} of unit {unit}: {why}"), None))?;
+    hasher.part(scratch);
+    Ok(())
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// The machine's files as the process's table of them by `stat` hashes them: one `stat` for a
@@ -192,19 +211,48 @@ fn machine_file(disk: &mut blaze_usercode::inputs::Disk) -> impl FnMut(&std::pat
 /// and every native input it linked is as it was. Read in place: no decode, no allocation.
 pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     let Ok(Some(key)) = record_key(job, unit) else { return false };
-    let store = job.input.store.read().unwrap_or_else(|it| it.into_inner());
-    let Ok(Some(entry)) = store.get(&key) else { return false };
+    let (store, guard) = (&job.input.store, blaze_cas::enter());
+    let Ok(Some(entry)) = store.get(&guard, &key) else { return false };
     let mut disk = blaze_usercode::inputs::Disk::new(Vec::new());
-    header::check(entry.bytes, |key| store.has(key), &mut machine_file(&mut disk)).is_some()
+    header::check(entry.bytes, |key| store.has(&guard, key), &mut machine_file(&mut disk)).is_some()
+}
+
+/// What `unit`'s last build made, as its record keeps it: none when the view's units were never
+/// built, or were built from other code.
+pub(crate) fn last_made(job: &Job, unit: usize) -> Option<Made> {
+    kept(job, unit).map(|it| it.made)
+}
+
+/// Every instance the view's last build compiled or found, with the code hash it was made
+/// from, sorted by key: each unit's from its record. A unit with no record, never built or
+/// built from other code, is an error naming it.
+pub(crate) fn codegen_inputs(job: &Job) -> Result<Vec<(ContentId, ContentId)>, Failed> {
+    let mut inputs = Vec::new();
+    for unit in 0..job.graph.len() {
+        if job.graph.has(unit as u32, graph::flag::RUN) {
+            continue;
+        }
+        if job.cancelled() {
+            return Err(Failed::Again);
+        }
+        let Some(made) = last_made(job, unit) else {
+            let name = &job.unit(unit)?.target.name;
+            return Err(ApiError::new(format!("`{name}` has no build of this view to list the codegen inputs of"), None).into());
+        };
+        inputs.extend(made.inputs);
+    }
+    inputs.sort_unstable();
+    inputs.dedup();
+    Ok(inputs)
 }
 
 /// The record of `unit` the store has, every output and native input of it as it was.
 fn kept(job: &Job, unit: usize) -> Option<Record> {
     let key = record_key(job, unit).ok()??;
-    let store = job.input.store.read().unwrap_or_else(|it| it.into_inner());
-    let entry = store.get(&key).ok()??;
+    let (store, guard) = (&job.input.store, blaze_cas::enter());
+    let entry = store.get(&guard, &key).ok()??;
     let mut disk = blaze_usercode::inputs::Disk::new(Vec::new());
-    let body = header::check(entry.bytes, |key| store.has(key), &mut machine_file(&mut disk))?;
+    let body = header::check(entry.bytes, |key| store.has(&guard, key), &mut machine_file(&mut disk))?;
     blaze_protocol::cbor::from_slice(&entry.bytes[body..]).ok()
 }
 
@@ -382,6 +430,7 @@ fn make(job: &Job, unit: usize) -> Result<Made2, Failed> {
         puts.reserve(built_puts.len() + plan.outputs.len());
         puts.extend(built_puts.into_iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes }));
         made.context = Some(context(&generated.policy));
+        made.inputs = generated.built.inputs.iter().map(|(key, code)| (key.0, code.0)).collect();
         for test in &generated.roots.tests {
             let root = generated.built.roots.get(test.root).ok_or_else(|| {
                 ApiError::new(format!("test `{}` has no root among the build's", test.name), Some(u.target.name.clone()))

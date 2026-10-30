@@ -427,3 +427,288 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
     assert_eq!(db.revision(), revision);
     assert_eq!(file_at(&db, &base, "src/lib.rs"), None);
 }
+
+/// splitmix64: the seeded inputs of the model tests.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+#[test]
+fn a_table_finds_what_a_hash_map_does() {
+    use crate::table::{Table, hash_of};
+    use rustc_hash::FxHashMap;
+
+    let table: Table<Box<str>> = Table::new();
+    let mut model: FxHashMap<String, u32> = FxHashMap::default();
+    let mut order = Vec::new();
+    let mut rng = Rng(7);
+    for _ in 0..20_000 {
+        let key = format!("key {}", rng.below(5_000));
+        let hash = hash_of(key.as_str());
+        let (at, inserted) = table.insert(hash, |it| **it == *key, || key.as_str().into());
+        match model.get(&key) {
+            Some(&known) => assert_eq!((at, inserted), (known, false), "{key}"),
+            None => {
+                assert!(inserted, "{key}");
+                model.insert(key.clone(), at);
+                order.push(key.clone());
+            }
+        }
+        assert_eq!(&**table.get(at), key.as_str());
+    }
+    for (key, &at) in &model {
+        assert_eq!(table.find(hash_of(key.as_str()), |it| **it == **key), Some(at));
+    }
+    assert_eq!(table.find(hash_of("absent"), |it| &**it == "absent"), None);
+    let kept: Vec<&str> = table.iter().map(|it| &**it).collect();
+    assert_eq!(kept, order.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+#[test]
+fn threads_inserting_one_key_get_one_value() {
+    use crate::table::{Table, hash_of};
+
+    let table: Table<u64> = Table::new();
+    let found: Vec<Vec<u32>> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..8)
+            .map(|thread| {
+                let table = &table;
+                scope.spawn(move || {
+                    let mut rng = Rng(thread);
+                    let mut at = vec![u32::MAX; 2_000];
+                    for _ in 0..10_000 {
+                        let key = rng.below(2_000);
+                        let (got, _) = table.insert(hash_of(key), |it| *it == key, || key);
+                        assert!(at[key as usize] == u32::MAX || at[key as usize] == got);
+                        at[key as usize] = got;
+                    }
+                    at
+                })
+            })
+            .collect();
+        threads.into_iter().map(|it| it.join().unwrap()).collect()
+    });
+    assert!(table.iter().count() <= 2_000);
+    let mut seen = std::collections::BTreeSet::new();
+    for value in table.iter() {
+        assert!(seen.insert(*value), "{value} kept twice");
+    }
+    for key in 0..2_000u64 {
+        let at = table.find(hash_of(key), |it| *it == key);
+        for thread in &found {
+            if thread[key as usize] != u32::MAX {
+                assert_eq!(Some(thread[key as usize]), at);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_log_and_a_column_give_back_what_was_put() {
+    use crate::table::{Column, Log};
+    use salsa::plumbing::Id;
+
+    let log: Log<u32> = Log::new();
+    for value in 0..5_000u32 {
+        assert_eq!(log.push(value * 3), value);
+    }
+    for value in 0..5_000u32 {
+        assert_eq!(log.get(value), Some(&(value * 3)));
+    }
+    assert_eq!(log.get(5_000), None);
+    assert!(log.iter().copied().eq((0..5_000).map(|it| it * 3)));
+
+    let column: Column<Id> = Column::new();
+    let mut model = std::collections::BTreeMap::new();
+    let mut rng = Rng(11);
+    for _ in 0..10_000 {
+        let raw = rng.below(1 << 16) as u32;
+        if rng.below(4) == 0 {
+            column.set(raw, None);
+            model.remove(&raw);
+        } else {
+            let id = Id::from_bits(rng.below(u32::MAX as u64) + 1);
+            column.set(raw, Some(id));
+            model.insert(raw, id);
+        }
+    }
+    for raw in 0..1 << 16 {
+        assert_eq!(column.get(raw), model.get(&raw).copied(), "{raw}");
+    }
+    assert_eq!(column.get(Column::<Id>::MAX + 1), None);
+    assert!(column.iter().eq(model.iter().map(|(&raw, &id)| (raw, id))));
+}
+
+#[test]
+fn what_queries_note_is_kept_once_and_sorted() {
+    let mut db = TestDb::new();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let c = add(&mut graph, files[2], CfgOptions::default(), Env::default());
+    let crates = graph.set_in_db(&mut db);
+    let (a, c) = (crates[&a], crates[&c]);
+    for (krate, key) in [(c, "B"), (a, "B"), (a, "A"), (c, "B"), (a, "B")] {
+        db.files.env_is_read(krate, key);
+    }
+    db.files.env_is_unset(a, "X");
+    db.files.env_is_unset(a, "X");
+    let mut expected = vec![(a, "A".to_owned()), (a, "B".to_owned()), (c, "B".to_owned())];
+    expected.sort();
+    assert_eq!(db.files.env_read(), expected);
+    assert_eq!(db.files.env_unset(), vec![(a, "X".to_owned())]);
+
+    let dir = AbsPathBuf::assert_utf8(std::env::temp_dir());
+    let (x, y) = (dir.join("blaze-base-db-x.rs"), dir.join("blaze-base-db-y.rs"));
+    for (path, krate) in [(&y, a), (&x, c), (&y, a), (&y, c)] {
+        db.files.include_source(path, SourceRootId(0), krate);
+    }
+    assert_eq!(
+        db.files.included_sources(),
+        vec![(x.clone(), SourceRootId(0)), (y.clone(), SourceRootId(0))]
+    );
+    let mut named = vec![(a, y.clone()), (c, x.clone()), (c, y.clone())];
+    named.sort();
+    assert_eq!(db.files.sources_included_by(), named);
+}
+
+/// The view a seed makes at a step: some of a fixed set of paths, each with one of a few
+/// contents, some of which are not UTF-8.
+fn seeded_view(rng: &mut Rng) -> Vec<(String, Vec<u8>)> {
+    const CONTENTS: &[&[u8]] = &[b"fn a() {}", b"fn b() {}", b"mod c;", &[0xff, 0x00], &[0xfe]];
+    let mut view = Vec::new();
+    for at in 0..16 {
+        if rng.below(10) < 7 {
+            let path = match at % 4 {
+                0 => format!("src/m{at}.rs"),
+                1 => format!("src/deep/n{at}.rs"),
+                2 => format!("data/b{at}.bin"),
+                _ => format!("target/out{at}.rs"),
+            };
+            view.push((path, CONTENTS[rng.below(CONTENTS.len() as u64) as usize].to_vec()));
+        }
+    }
+    view
+}
+
+/// Everything a view's files are as inputs, by path: present, has text, its text ID and
+/// source root; then each source root's content ID.
+fn view_state(
+    db: &TestDb,
+    base: &AbsPathBuf,
+    paths: &[String],
+) -> (Vec<Option<(bool, Option<ContentId>, SourceRootId)>>, [ContentId; 2]) {
+    let files = paths
+        .iter()
+        .map(|path| {
+            let id = file_at(db, base, path)?;
+            let text = db.has_file_text(id);
+            let content = text.then(|| db.file_text(id).content(db));
+            Some((text, content, db.file_source_root(id).source_root_id(db)))
+        })
+        .collect();
+    let roots = [0, 1].map(|root| db.source_root(SourceRootId(root)).content(db));
+    (files, roots)
+}
+
+#[test]
+fn a_view_set_over_others_is_the_view_set_alone() {
+    let mut rng = Rng(3);
+    let mut db = TestDb::new();
+    let (base, partition) = checkout(&mut db);
+    let built = [base.join("target")];
+    let mut every_path: Vec<String> = Vec::new();
+    let mut before: Vec<(String, Vec<u8>)> = Vec::new();
+    for step in 0..40 {
+        let view = seeded_view(&mut rng);
+        let id_of = |db: &TestDb, path: &str| file_at(db, &base, path);
+        let ids_before: Vec<(String, Option<FileId>)> =
+            before.iter().map(|(path, _)| (path.clone(), id_of(&db, path))).collect();
+        let files: Vec<ViewFile<'_>> =
+            view.iter().map(|(path, bytes)| ViewFile { path, file: vfs_file(bytes) }).collect();
+        let root = ViewRoot { base: &base, built: &built, partition: &partition, other: SourceRootId(1), files: &files };
+        let change = db.set_view_root(root).unwrap();
+
+        // What the change says, from the two views alone. A file under `target` is built: one
+        // the view lacks stays; one it has is set like any other.
+        let old: std::collections::BTreeMap<&str, &[u8]> =
+            before.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+        let new: std::collections::BTreeMap<&str, &[u8]> =
+            view.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+        let in_root: std::collections::BTreeSet<&str> = old
+            .keys()
+            .copied()
+            .filter(|path| ids_before.iter().any(|(known, id)| known == path && id.is_some()))
+            .collect();
+        let mut set = Vec::new();
+        let mut added = Vec::new();
+        let mut no_text = Vec::new();
+        for (&path, &bytes) in &new {
+            let id = id_of(&db, path).unwrap();
+            let written = match old.get(path) {
+                Some(&was) if in_root.contains(path) => {
+                    if was != bytes {
+                        let both_binary =
+                            std::str::from_utf8(was).is_err() && std::str::from_utf8(bytes).is_err();
+                        if !both_binary {
+                            set.push(id);
+                        }
+                    }
+                    was != bytes
+                }
+                _ => {
+                    added.push(id);
+                    true
+                }
+            };
+            if written && std::str::from_utf8(bytes).is_err() {
+                no_text.push(id);
+            }
+        }
+        let mut removed: Vec<FileId> = ids_before
+            .iter()
+            .filter(|(path, _)| !new.contains_key(path.as_str()) && !path.starts_with("target/"))
+            .filter_map(|(_, id)| *id)
+            .collect();
+        for list in [&mut set, &mut added, &mut no_text, &mut removed] {
+            list.sort_unstable();
+        }
+        assert_eq!((change.set, change.added, change.no_text, change.removed), (set, added, no_text, removed), "step {step}");
+
+        // Built files the view lacks stay; take them into the view for the comparison.
+        let mut whole = view.clone();
+        for (path, bytes) in &before {
+            if path.starts_with("target/") && !new.contains_key(path.as_str()) {
+                whole.push((path.clone(), bytes.clone()));
+            }
+        }
+        for (path, _) in &whole {
+            if !every_path.contains(path) {
+                every_path.push(path.clone());
+            }
+        }
+        let mut fresh = TestDb::new();
+        let (fresh_base, fresh_partition) = checkout(&mut fresh);
+        let fresh_files: Vec<(&str, &[u8])> =
+            whole.iter().map(|(path, bytes)| (path.as_str(), bytes.as_slice())).collect();
+        set_view(&mut fresh, &fresh_base, &fresh_partition, &fresh_files).unwrap();
+        assert_eq!(
+            view_state(&db, &base, &every_path),
+            view_state(&fresh, &fresh_base, &every_path),
+            "step {step}"
+        );
+        before = whole;
+    }
+}

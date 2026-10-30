@@ -1,6 +1,8 @@
 //! A proc-macro crate of a load and what it depends on, as a `rust-project.json`: what a
 //! caller builds it from itself (blaze, as a WebAssembly module), whoever compiled its library.
 
+#![forbid(unsafe_code)]
+
 use cfg::CfgAtom;
 use ide_db::{
     FxHashMap, FxHashSet,

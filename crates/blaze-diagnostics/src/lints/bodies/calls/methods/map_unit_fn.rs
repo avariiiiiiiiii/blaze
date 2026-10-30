@@ -91,6 +91,12 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
     diag.span_label(arg_span, "called `Iterator::map` with callable that returns `()`");
     diag.span_label(span, "after this call to map, the resulting iterator is `impl Iterator<Item = ()>`, which means the only information carried by the iterator is the number of items");
     diag.suggestion_verbose(name_span, "you might have meant to use `Iterator::for_each`", "for_each", Applicability::MaybeIncorrect);
+    if let Some(written) = util::syntax(b, receiver).and_then(|it| ast::Expr::cast(it.value))
+        && let Some(receiver_ty) = b.cx.sema.type_of_expr(&written)
+    {
+        let printed = b.cx.ty(&receiver_ty.original);
+        diag.fact_opt(b.cx.method_fact(&receiver_ty.original, "map"), format!("what `map` is on `{printed}`"));
+    }
     Some(b.lint(diag, Phase::Late, stmt.map(|it| SyntaxNodePtr::new(&it))))
 }
 

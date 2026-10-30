@@ -124,6 +124,12 @@ impl Def {
         self.ns() == Some(Ns::Value)
     }
 
+    /// Whether its path segment is rustc's `DefPathData::TypeNs`, the segments a re-export
+    /// can rename.
+    pub(crate) fn is_type_ns(self) -> bool {
+        self.ns() == Some(Ns::Type)
+    }
+
     /// The name of the definition's path segment; None for a crate root and an impl.
     pub(crate) fn name(self, cx: &Cx<'_, '_>) -> Option<Name> {
         let db = cx.db;
@@ -170,6 +176,7 @@ enum Ns {
 }
 
 /// What a definition's path is printed under: rustc's `def_key(def).parent`.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) enum Parent {
     Def(Def),
     /// An item written in a body: the body's owner, then the closures it is written in,
@@ -209,8 +216,21 @@ fn block_owner(cx: &Cx<'_, '_>, module: ModuleId) -> Option<Parent> {
     let ast_id = block.ast_id(db);
     let root = cx.sema.parse_or_expand(ast_id.file_id);
     let node = ast_id.file_id.ast_id_map(db).get(ast_id.value).to_node(&root);
+    body_parent(cx, node.syntax().clone())
+}
+
+/// The path of a closure, an `async` block or a `gen` block `node`: its body's owner and the
+/// closures down to it, itself last.
+pub(crate) fn closure_path(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
+    body_parent(cx, node)
+}
+
+/// The body's owner `node` is written in and the closures around it, `node` included when it
+/// is one.
+fn body_parent(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
+    let db = cx.db;
     let mut closures = Vec::new();
-    for ancestor in cx.sema.ancestors_with_macros(node.syntax().clone()) {
+    for ancestor in cx.sema.ancestors_with_macros(node) {
         if is_closure_like(&ancestor) {
             closures.push(ancestor);
             continue;

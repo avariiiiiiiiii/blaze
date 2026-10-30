@@ -258,6 +258,12 @@ after each `new_revision` is `min(cap, values)`, and every kept value was verifi
 than every evicted one.
 
 > forwarded to db: `vendor/salsa` is lane db's.
+> applied by db-salsa-speed: already in by speed-salsa, checked against the `Sync` code; no change.
+
+> Status: done by speed-salsa (10-29): as written, the ranking in `EvictionCutoff`
+> (`function.rs`), tests `lru_tests` (against a sorted reference) and
+> `tests/lru.rs::lru_keeps_the_latest_revisions_reads`. `hashlink` is unused now; its
+> `Cargo.toml` entry goes when `Cargo.lock` is next regenerated.
 
 ## S2. Interning: no lock on a hit (`interned.rs`)
 
@@ -326,6 +332,7 @@ sweeps the same shard: either the reader's ID is current and its fields are the 
 interned, or the reader got a new ID; never a reused slot under an old ID.
 
 > forwarded to db: `vendor/salsa` is lane db's.
+> not applied: live agent `speed-salsa-interned` owns `src/interned.rs` and is writing S2; a second writer would collide.
 
 ## S2a. Existing unsafe against `unsafe.md` (note for you and the safety lane)
 
@@ -335,6 +342,7 @@ salsa has 270 `unsafe {` blocks, and three files opt out of `clippy::undocumente
 you next touch these files, write the comments and drop the `allow`s. S1 and S4 add no unsafe.
 
 > forwarded to db: `vendor/salsa` is lane db's.
+> applied by db-salsa-speed: `SAFETY:` comments added and all three `allow`s dropped.
 
 ## S3. Claims: shard count (`function/sync.rs:75`)
 
@@ -345,6 +353,9 @@ revision takes a claim, so on a warm build after an edit, each verified memo loc
 your `Sync` rewrite replaces `SyncTable`, apply this to its replacement.
 
 > forwarded to db: `vendor/salsa` is lane db's.
+> applied by db-salsa-speed: already in (`SyncTable::new`, `* 4` shards), checked; no change.
+
+> Status: done by speed-salsa (10-29).
 
 ## S4. Recording a read: skip the hash for a repeated edge (`active_query.rs:144`)
 
@@ -366,6 +377,10 @@ calling one query on one key, and an accessor that reads one memo many times. Do
 reads `a, a, b, a` records edges `[a, b]` with the same positions and fingerprints as before.
 
 > forwarded to db: `vendor/salsa` is lane db's.
+> applied by db-salsa-speed: already in (`ActiveQuery::insert_edge`), checked; no change.
+
+> Status: done by speed-salsa (10-29): `ActiveQuery::insert_edge`, test
+> `active_query::tests::repeated_reads_record_one_edge`.
 
 ## S5. Not filed, for the salsa owner after `Sync` lands: memos and edges as columns
 
@@ -379,3 +394,35 @@ rewrites `zalsa_local.rs`, `function/*`, `table/memo.rs` and every ingredient, s
 your current part.
 
 > forwarded to db: a plan for the salsa owner.
+
+## blaze-query: `Database::get` is now `Database::pin().get` (10-29; blaze-cargo, blaze-units, blaze-tree; lane db's doc)
+
+What changed: the coordinator gave db-salsa blaze-query's lock-free lookups
+(`docs/v2/plan/design/concurrency.md`). Its tables are now read with acquire loads alone, and
+what a writer unlinks (an evicted value, a replaced entry, a closed view) is freed once every
+task that could have read it has ended (`blaze_reclaim`), not kept until `&mut Database`. A value
+the database hands out must therefore borrow a task. From outside a query, that task is
+`Database::pin() -> Pinned<'_>`, and `Database::get` moved onto it as `Pinned::get` with the same
+arguments and result, its `Ref` borrowing the `Pinned`. `Cx::get` is unchanged.
+
+The edit at each site is the same: `db.get::<Q>(` becomes `db.pin().get::<Q>(`. Every site
+either matches on the result or calls `.get()` on it in the same expression, so the temporary
+`Pinned` lives long enough:
+
+- blaze-cargo: `crates/blaze-cargo/src/serve/work.rs:166` (`plan`) and
+  `crates/blaze-cargo/src/serve/tests.rs:248`.
+- blaze-units: `crates/blaze-units/src/stdlib/tests.rs:307`, `src/load/tests.rs:152`,
+  `src/load/source/tests.rs:184` and `:358`.
+- blaze-tree: `crates/blaze-tree/src/query/tests.rs:70`, `:115` and `:132`.
+
+`Database::reclaim(&mut self)` stays and still frees everything at once; the daemon's call
+after `settle` (`blaze-cargo/src/serve/daemon.rs:570`) needs no change. Hold a `Pinned` for one
+request, no longer: what the database lets go of meanwhile is freed only after it is dropped.
+
+Lane db: `docs/v2/plan/lanes/db/query-database.md` line 51 says "`Database::get` from inside
+`Query::execute` panics", which is now `Pinned::get`. Line 75 says retired things are dropped by
+`&mut Database`; they are now freed once every task that could hold them has ended (the
+database's limbo, `blaze_reclaim`), and `reclaim`/`settle` free the rest at once. The lookups
+are lock-free maps sharded by `blaze_ids::shard_count()`, with views in an append-only column.
+
+> for blaze-cargo, blaze-units, blaze-tree and lane db.

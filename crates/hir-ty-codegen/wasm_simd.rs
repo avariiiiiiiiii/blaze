@@ -18,6 +18,8 @@
 //! [`super::wasm::INSTRUCTION`]. A relaxed instruction is emitted as itself, so it behaves as
 //! the engine that runs it chooses, the way rustc's does.
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::ir::{
     self, AbiParam, Endianness, InstBuilder, MemFlagsData, Type, Value,
     condcodes::{FloatCC, IntCC},

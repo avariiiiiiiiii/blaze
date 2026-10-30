@@ -13,9 +13,11 @@
 //! - A stop writes the image and the estimates, waits for the image to be mapped, then stops
 //!   listening and hangs up.
 
+#![forbid(unsafe_code)]
+
 use std::{
     net::SocketAddr,
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -87,7 +89,7 @@ macro_rules! world {
             now: $daemon.driver.now(),
             vfs: &mut $daemon.vfs,
             db: &$daemon.db,
-            store: &$daemon.store,
+            store: &mut $daemon.store,
             plane: &mut $daemon.plane,
             mounts: &mut $daemon.mounts,
             heads: &$daemon.heads,
@@ -138,7 +140,8 @@ pub struct Daemon<D: Driver> {
     session: Session,
     vfs: Vfs,
     db: Arc<Database>,
-    store: Arc<RwLock<Store>>,
+    /// Only the loop writes it; workers read it through [`Store::reader`], with no lock.
+    store: Store,
     plane: Plane<Value>,
     mounts: Mounts,
     heads: Heads,
@@ -304,7 +307,7 @@ impl<D: Driver> Daemon<D> {
             session: Session::new(),
             vfs,
             db: Arc::new(db),
-            store: Arc::new(RwLock::new(store)),
+            store,
             plane,
             mounts,
             heads: Heads::new(COOKIES, WATCHERS, RUNS),
@@ -365,7 +368,7 @@ impl<D: Driver> Daemon<D> {
         self.heads.stop(&mut self.effects);
         self.db.write_image(&mut self.effects);
         self.write_estimates();
-        self.store.write().expect("the store's lock").flush(&mut self.effects);
+        self.store.flush(&mut self.effects);
         self.vfs.flush(&mut self.effects);
     }
 
@@ -432,12 +435,9 @@ impl<D: Driver> Daemon<D> {
             }
             DB..STORE => self.db.complete(completion, &mut self.effects),
             STORE..COOKIES => {
-                debug_assert!(self.store.read().expect("the store's lock").owns(completion.tag), "the store's tags are its");
-                let placed = {
-                    let mut store = self.store.write().expect("the store's lock");
-                    store.complete(completion, &mut self.effects);
-                    store.placed()
-                };
+                debug_assert!(self.store.owns(completion.tag), "the store's tags are its");
+                self.store.complete(completion, &mut self.effects);
+                let placed = self.store.placed();
                 let mut said = self.spare.said.pop().unwrap_or_default();
                 self.jobs.placed(&mut world!(self, said), placed);
                 self.said(said);

@@ -23,6 +23,8 @@
 //! - [`client`]: the CLI's and CI's side, blocking.
 //! - [`json`]: the rendering for people.
 
+#![forbid(unsafe_code)]
+
 pub mod build;
 pub mod client;
 pub mod frames;

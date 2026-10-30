@@ -348,7 +348,8 @@ impl Docs {
     }
 
     fn remove_indent(&mut self, indent: &Indent) {
-        /// In case of panics, we want to avoid corrupted UTF-8 in `self.docs`, so we clear it.
+        /// In case of panics the text is half shifted and already moved out of `self.docs`, so
+        /// we drop everything that points into it.
         struct Guard<'a>(&'a mut Docs);
         impl Drop for Guard<'_> {
             fn drop(&mut self) {
@@ -362,9 +363,7 @@ impl Docs {
                     outline_inner_docs_start: _,
                     macro_calls: _,
                 } = self.0;
-                // Don't use `String::clear()` here because it's not guaranteed to not do UTF-8-dependent things,
-                // and we may have temporarily broken the string's encoding.
-                unsafe { docs.as_mut_vec() }.clear();
+                docs.clear();
                 // This is just to avoid panics down the road.
                 docs_source_map.clear();
                 *outline_mod = None;
@@ -405,24 +404,25 @@ impl Docs {
             return;
         };
 
-        let guard = Guard(self);
+        let docs_len = TextSize::of(&self.docs);
+        let mut bytes = std::mem::take(&mut self.docs).into_bytes();
+        let guard = Guard(&mut *self);
         let source_map = guard.0.docs_source_map.as_mut_slice();
         let Some(&DocsSourceMapLine { string_offset: mut copy_into, .. }) = source_map.first()
         else {
             return;
         };
-        // We basically want to remove multiple ranges from a string. Doing this efficiently (without O(N^2)
-        // or allocations) requires unsafe. Basically, for each line, we copy the line minus the indent into
-        // consecutive to the previous line (which may have moved). Then at the end we truncate.
+        // We remove multiple ranges from the text in place, without O(N^2) or allocations: for
+        // each line, we copy the line minus the indent right after the previous line (which may
+        // have moved). Then at the end we truncate and check the UTF-8 once.
         let mut accumulated_offset = TextSize::new(0);
         for idx in 0..source_map.len() {
-            let string_end_offset = source_map
-                .get(idx + 1)
-                .map_or_else(|| TextSize::of(&guard.0.docs), |next_attr| next_attr.string_offset);
+            let string_end_offset =
+                source_map.get(idx + 1).map_or(docs_len, |next_attr| next_attr.string_offset);
             let line_source = &mut source_map[idx];
-            let line_docs =
-                &guard.0.docs[TextRange::new(line_source.string_offset, string_end_offset)];
-            let line_docs_len = TextSize::of(line_docs);
+            let line_range = TextRange::new(line_source.string_offset, string_end_offset);
+            let line_docs = &bytes[Range::<usize>::from(line_range)];
+            let line_docs_len = line_range.len();
             let indent_size = if let Some((_, DocCommentKind::Desugared)) = indent.lines[idx]
                 && min_indent > 0
             {
@@ -430,11 +430,13 @@ impl Docs {
             } else {
                 min_indent
             };
-            let indent_size = line_docs.char_indices().nth(indent_size).map_or_else(
-                || TextSize::of(line_docs) - TextSize::of("\n"),
-                |(offset, _)| TextSize::new(offset as u32),
+            // Every copy lands at or before its own line's start, so this line's bytes are
+            // still the UTF-8 that was pushed and its char starts are its non-continuation bytes.
+            let indent_size = char_starts(line_docs).nth(indent_size).map_or_else(
+                || line_docs_len - TextSize::of("\n"),
+                |offset| TextSize::new(offset as u32),
             );
-            unsafe { guard.0.docs.as_bytes_mut() }.copy_within(
+            bytes.copy_within(
                 Range::<usize>::from(TextRange::new(
                     line_source.string_offset + indent_size,
                     string_end_offset,
@@ -460,11 +462,11 @@ impl Docs {
 
             accumulated_offset += indent_size;
         }
-        // Don't use `String::truncate()` here because it's not guaranteed to not do UTF-8-dependent things,
-        // and we may have temporarily broken the string's encoding.
-        unsafe { guard.0.docs.as_mut_vec() }.truncate(copy_into.into());
+        bytes.truncate(copy_into.into());
 
         std::mem::forget(guard);
+        self.docs = String::from_utf8(bytes)
+            .expect("doc lines end in `\\n` and their indent ends on a char start");
     }
 
     fn remove_last_newline(&mut self) {
@@ -788,6 +790,11 @@ fn block_may_start_with_inner_doc(block: &str) -> bool {
             return rest.chars().next().is_none_or(|c| c == '#' || !c.is_ascii());
         }
     }
+}
+
+/// The offsets at which a char of `utf8` starts, as `str::char_indices` gives them.
+fn char_starts(utf8: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    utf8.iter().enumerate().filter(|&(_, &byte)| byte & 0xC0 != 0x80).map(|(at, _)| at)
 }
 
 /// How long the rest of a block comment is, after its opening `/*`, to just past the `*/` that
@@ -1136,6 +1143,75 @@ mod tests {
         docs.remove_last_newline();
 
         assert_eq!(docs.docs(), "hello!\nanother");
+    }
+
+    /// `remove_indent` as a model: each line cut at its indent with `str::char_indices` and
+    /// pushed onto a new string.
+    fn remove_indent_by_lines(docs: &Docs, indent: &Indent) -> String {
+        let add_indent = if indent.seen_sugared { 1 } else { 0 };
+        let Some(min_indent) = indent
+            .lines
+            .iter()
+            .filter_map(|it| *it)
+            .map(|(line_indent, line_kind)| match line_kind {
+                DocCommentKind::Sugared(_) => line_indent,
+                DocCommentKind::Desugared => line_indent + add_indent,
+            })
+            .min()
+        else {
+            return docs.docs.clone();
+        };
+        let map = &docs.docs_source_map;
+        let mut out = String::new();
+        for (idx, line) in map.iter().enumerate() {
+            let end = map.get(idx + 1).map_or(TextSize::of(&docs.docs), |it| it.string_offset);
+            let line = &docs.docs[TextRange::new(line.string_offset, end)];
+            let skip = match indent.lines[idx] {
+                Some((_, DocCommentKind::Desugared)) if min_indent > 0 => min_indent - add_indent,
+                _ => min_indent,
+            };
+            let start = line.char_indices().nth(skip).map_or(line.len() - 1, |(at, _)| at);
+            out.push_str(&line[start..]);
+        }
+        out
+    }
+
+    #[test]
+    fn remove_indent_as_by_lines() {
+        let (_db, file_id) = TestDB::with_single_file("");
+        let lines = [
+            "", " ", "  a", "\tb", " \t ü", "ü", "   日本", "x", "  ", " 🦀 c", "\t\td", "    e",
+        ];
+        let kinds = [
+            DocCommentKind::Sugared(ast::CommentShape::Line),
+            DocCommentKind::Sugared(ast::CommentShape::Block),
+            DocCommentKind::Desugared,
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for case in 0..2000 {
+            let mut docs = Docs {
+                docs: String::new(),
+                docs_source_map: Vec::new(),
+                outline_mod: None,
+                inline_file: file_id.into(),
+                prefix_len: TextSize::new(0),
+                inline_inner_docs_start: None,
+                outline_inner_docs_start: None,
+                macro_calls: ThinVec::new(),
+            };
+            let mut indent = Indent::default();
+            for _ in 0..1 + case % 6 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let line = lines[seed as usize % lines.len()];
+                let kind = kinds[(seed >> 32) as usize % kinds.len()];
+                docs.push_doc_lines(line, None, kind, &mut indent);
+            }
+            let want = remove_indent_by_lines(&docs, &indent);
+            docs.remove_indent(&indent);
+            assert_eq!(docs.docs, want, "case {case}");
+        }
     }
 
     /// Extracts the docs of the first comment in `source`, running the same normalization as

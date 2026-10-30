@@ -1,6 +1,6 @@
 //! Builtin macro
 
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::OnceLock};
 
 use base_db::{AnchoredPath, SourceDatabase};
 use cfg::CfgExpr;
@@ -9,16 +9,12 @@ use intern::{Symbol, sym};
 use itertools::Itertools;
 use mbe::{DelimiterKind, expect_fragment};
 use span::{Edition, FileId, Span};
-use stdx::format_to;
-use syntax::{
-    format_smolstr,
-    unescape::{unescape_byte, unescape_char},
-};
+use syntax::unescape::{unescape_byte, unescape_char};
 use syntax_bridge::syntax_node_to_token_tree;
 
 use crate::{
     EditionedFileId, ExpandError, ExpandResult, HirFileId, MacroCallId,
-    builtin::quote::{WithDelimiter, dollar_crate},
+    builtin::quote::{WithDelimiter, dollar_crate, emit, group, str_literal},
     hygiene::{span_with_call_site_ctxt, span_with_def_site_ctxt},
     name,
     tt::{self, DelimSpan, TtElement, TtIter},
@@ -145,13 +141,37 @@ fn mk_pound(span: Span) -> tt::Leaf {
     crate::tt::Leaf::Punct(crate::tt::Punct { char: '#', spacing: crate::tt::Spacing::Alone, span })
 }
 
+/// The string literal of `text`, a constant: escaped and interned on the first call, then one
+/// acquire load.
+fn constant_str_literal(cell: &'static OnceLock<Symbol>, text: &str, span: Span) -> tt::Literal {
+    tt::Literal {
+        text_and_suffix: *cell.get_or_init(|| str_literal(text, span).text_and_suffix),
+        span,
+        kind: tt::LitKind::Str,
+        suffix_len: 0,
+    }
+}
+
+/// The call's arguments in parentheses at the spans of its own delimiters: the tree spliced with
+/// its top subtree made a parenthesis, read where it is instead of cloned to be changed.
+fn parenthesized(tt: &tt::TopSubtree) -> WithDelimiter<'_> {
+    WithDelimiter {
+        delimiter: tt::Delimiter {
+            kind: tt::DelimiterKind::Parenthesis,
+            ..tt.top_subtree().delimiter
+        },
+        token_trees: tt.token_trees(),
+    }
+}
+
 fn module_path_expand(
     _db: &dyn SourceDatabase,
     _id: MacroCallId,
     _tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let placeholder = MODULE_PATH_PLACEHOLDER;
+    static PLACEHOLDER: OnceLock<Symbol> = OnceLock::new();
+    let placeholder = constant_str_literal(&PLACEHOLDER, MODULE_PATH_PLACEHOLDER, span);
     ExpandResult::ok(quote! {span =>
          #placeholder
     })
@@ -170,10 +190,14 @@ fn line_expand(
     // dummy implementation for type-checking purposes
     // Note that `line!` and `column!` will never be implemented properly, as they are by definition
     // not incremental
-    ExpandResult::ok(tt::TopSubtree::invisible_from_leaves(
+    static ZERO_U32: OnceLock<Symbol> = OnceLock::new();
+    let zero = tt::Literal {
+        text_and_suffix: *ZERO_U32.get_or_init(|| Symbol::intern("0u32")),
         span,
-        [tt::Leaf::Literal(tt::Literal::new("0", span, tt::LitKind::Integer, "u32"))],
-    ))
+        kind: tt::LitKind::Integer,
+        suffix_len: 3,
+    };
+    ExpandResult::ok(tt::TopSubtree::invisible_from_leaves(span, [tt::Leaf::Literal(zero)]))
 }
 
 fn log_syntax_expand(
@@ -243,12 +267,12 @@ fn stringify_expand(
 }
 
 /// Formats the binary operators and paths in the expression reported by a failed assertion.
-/// `stringify!` instead preserves the token spacing supplied by the caller.
-fn assert_condition(tokens: &str, edition: Edition) -> String {
+/// `stringify!` instead preserves the token spacing supplied by the caller. Appended to `out`.
+fn write_assert_condition(out: &mut String, tokens: &str, edition: Edition) {
     use syntax::{SyntaxKind, T};
 
     let expr = syntax::ast::Expr::parse(tokens, edition).syntax_node();
-    let mut out = String::new();
+    let start = out.len();
     let mut whitespace = false;
     let mut after_operator = false;
     let mut after_separator = false;
@@ -260,7 +284,7 @@ fn assert_condition(tokens: &str, edition: Edition) -> String {
         let parent = token.parent().map(|it| it.kind());
         let operator = parent == Some(SyntaxKind::BIN_EXPR);
         let separator = token.kind() == T![::] && parent == Some(SyntaxKind::PATH);
-        if !out.is_empty()
+        if out.len() > start
             && (operator || after_operator || (whitespace && !separator && !after_separator))
         {
             out.push(' ');
@@ -270,7 +294,6 @@ fn assert_condition(tokens: &str, edition: Edition) -> String {
         after_operator = operator;
         after_separator = separator;
     }
-    out
 }
 
 fn assert_expand(
@@ -293,22 +316,33 @@ fn assert_expand(
     let rest = iter.remaining();
 
     let dollar_crate = dollar_crate(span);
-    let panic_args = rest.iter();
-    let mac = if rest.is_empty() {
-        // Without a message of its own, the assertion reports the condition.
+    // Without a message of its own, the assertion reports the condition.
+    let message = rest.is_empty().then(|| {
         let tokens = ::tt::stringify(
             cond.value,
             &|span, text| source_joined(db, span, text),
             through_proc_macro(db, id),
         );
-        let message =
-            format!("assertion failed: {}", assert_condition(&tokens, span.ctx.edition(db)));
-        quote! {call_site_span => #dollar_crate::panicking::panic(#message) }
-    } else if use_panic_2021(db, span) {
-        quote! {call_site_span => #dollar_crate::panic::panic_2021!(# #panic_args) }
-    } else {
-        quote! {call_site_span => #dollar_crate::panic!(# #panic_args) }
-    };
+        const HEAD: &str = "assertion failed: ";
+        let mut message = String::with_capacity(HEAD.len() + tokens.len() + tokens.len() / 4);
+        message.push_str(HEAD);
+        write_assert_condition(&mut message, &tokens, span.ctx.edition(db));
+        message
+    });
+    let panic_2021 = message.is_none() && use_panic_2021(db, span);
+    // Written in the expansion's own builder, in the invisible group a spliced `quote!` adds.
+    let mac = group(call_site_span, |b| {
+        let panic_args = rest.iter();
+        match &message {
+            Some(message) => {
+                quote_into!(b, call_site_span => #dollar_crate::panicking::panic(#message))
+            }
+            None if panic_2021 => {
+                quote_into!(b, call_site_span => #dollar_crate::panic::panic_2021!(# #panic_args))
+            }
+            None => quote_into!(b, call_site_span => #dollar_crate::panic!(# #panic_args)),
+        }
+    });
     let value = cond.value;
     let expanded = quote! {call_site_span =>{
         if !(#value) {
@@ -330,7 +364,8 @@ fn file_expand(
 ) -> ExpandResult<tt::TopSubtree> {
     // FIXME: RA purposefully lacks knowledge of absolute file names
     // so just return "".
-    let file_name = "file";
+    static FILE: OnceLock<Symbol> = OnceLock::new();
+    let file_name = constant_str_literal(&FILE, "file", span);
 
     let expanded = quote! {span =>
         #file_name
@@ -346,10 +381,9 @@ fn format_args_expand(
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
     let pound = mk_pound(span);
-    let mut tt = tt.clone();
-    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
+    let args = parenthesized(tt);
     ExpandResult::ok(quote! {span =>
-        builtin #pound format_args #tt
+        builtin #pound format_args #args
     })
 }
 
@@ -359,24 +393,44 @@ fn format_args_nl_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let pound = mk_pound(span);
-    let lit = tt.as_token_trees().iter_flat_tokens().nth(1);
-    if let Some(tt::TokenTree::Leaf(tt::Leaf::Literal(
-        mut lit @ tt::Literal { kind: tt::LitKind::Str | tt::LitKind::StrRaw(_), .. },
-    ))) = lit
-    {
-        let mut tt = tt.clone();
-        tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
-        // A raw string has no escapes: the newline goes in as it is.
-        let newline = if lit.kind == tt::LitKind::Str { "\\n" } else { "\n" };
-        let (text, suffix) = lit.text_and_suffix();
-        lit.text_and_suffix = Symbol::intern(&format_smolstr!("{text}{newline}{suffix}"));
-        tt.set_token(1, lit.into());
-        return ExpandResult::ok(quote! {span =>
-            builtin #pound format_args #tt
-        });
+    match format_args_nl_of_literal(tt, span) {
+        Some(expanded) => ExpandResult::ok(expanded),
+        None => format_args_nl_of_macro(db, tt, span),
     }
-    format_args_nl_of_macro(db, tt, span)
+}
+
+/// `format_args_nl!` whose template is a string literal: `format_args!` of the literal with a
+/// newline appended. `None` if the first token is not a string literal.
+fn format_args_nl_of_literal(tt: &tt::TopSubtree, span: Span) -> Option<tt::TopSubtree> {
+    let mut args = tt.iter();
+    let Some(tt::TtElement::Leaf(tt::Leaf::Literal(
+        lit @ tt::Literal { kind: tt::LitKind::Str | tt::LitKind::StrRaw(_), .. },
+    ))) = args.next()
+    else {
+        return None;
+    };
+    // A raw string has no escapes: the newline goes in as it is.
+    let newline = if lit.kind == tt::LitKind::Str { "\\n" } else { "\n" };
+    let (text, suffix) = lit.text_and_suffix();
+    let mut joined = String::with_capacity(text.len() + newline.len() + suffix.len());
+    joined.push_str(text);
+    joined.push_str(newline);
+    joined.push_str(suffix);
+    let template = tt::Literal { text_and_suffix: Symbol::intern(&joined), ..lit };
+    let rest = args.remaining();
+    // The arguments with the template's text changed, written where they are read: the tree is
+    // not cloned and rebuilt to change one token.
+    let delimiter = parenthesized(tt).delimiter;
+    let args = emit(|b: &mut tt::TopSubtreeBuilder| {
+        b.open(delimiter.kind, delimiter.open);
+        b.push(template.clone().into());
+        b.extend_with_tt(rest);
+        b.close(delimiter.close);
+    });
+    let pound = mk_pound(span);
+    Some(quote! {span =>
+        builtin #pound format_args #args
+    })
 }
 
 /// `format_args_nl!` whose template is not written as a string: a macro that expands to one.
@@ -417,11 +471,10 @@ fn asm_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let mut tt = tt.clone();
-    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
+    let args = parenthesized(tt);
     let pound = mk_pound(span);
     let expanded = quote! {span =>
-        builtin #pound asm #tt
+        builtin #pound asm #args
     };
     ExpandResult::ok(expanded)
 }
@@ -432,11 +485,10 @@ fn global_asm_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let mut tt = tt.clone();
-    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
+    let args = parenthesized(tt);
     let pound = mk_pound(span);
     let expanded = quote! {span =>
-        builtin #pound global_asm #tt
+        builtin #pound global_asm #args
     };
     ExpandResult::ok(expanded)
 }
@@ -447,11 +499,10 @@ fn naked_asm_expand(
     tt: &tt::TopSubtree,
     span: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let mut tt = tt.clone();
-    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
+    let args = parenthesized(tt);
     let pound = mk_pound(span);
     let expanded = quote! {span =>
-        builtin #pound naked_asm #tt
+        builtin #pound naked_asm #args
     };
     ExpandResult::ok(expanded)
 }
@@ -599,12 +650,14 @@ fn unreachable_expand(
     let mac = if use_panic_2021(db, span) { sym::unreachable_2021 } else { sym::unreachable_2015 };
 
     // Pass the original arguments
-    let mut subtree = tt.clone();
-    subtree.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
-    subtree.set_top_subtree_delimiter_span(tt::DelimSpan {
-        open: call_site_span,
-        close: call_site_span,
-    });
+    let subtree = WithDelimiter {
+        delimiter: tt::Delimiter {
+            open: call_site_span,
+            close: call_site_span,
+            kind: tt::DelimiterKind::Parenthesis,
+        },
+        token_trees: tt.token_trees(),
+    };
 
     // Expand to a macro call `$crate::panic::panic_{edition}`
     let call = quote!(call_site_span =>#dollar_crate::panic::#mac! #subtree);
@@ -693,15 +746,13 @@ fn concat_expand(
                         }
                         record_span(it.span);
                     }
-                    tt::LitKind::Integer | tt::LitKind::Float => {
-                        format_to!(text, "{}", it.text())
-                    }
+                    tt::LitKind::Integer | tt::LitKind::Float => text.push_str(it.text()),
                     tt::LitKind::Str => {
-                        text.push_str(&unescape_str(it.text()));
+                        unescape_str_into(it.text(), &mut text);
                         record_span(it.span);
                     }
                     tt::LitKind::StrRaw(_) => {
-                        format_to!(text, "{}", it.text());
+                        text.push_str(it.text());
                         record_span(it.span);
                     }
                     tt::LitKind::Byte
@@ -739,7 +790,8 @@ fn concat_expand(
                     TtElement::Leaf(tt::Leaf::Literal(it))
                         if matches!(it.kind, tt::LitKind::Integer | tt::LitKind::Float) =>
                     {
-                        format_to!(text, "-{}", it.text());
+                        text.push('-');
+                        text.push_str(it.text());
                         record_span(punct.span.cover(it.span));
                     }
                     _ => {
@@ -956,7 +1008,7 @@ fn include_expand(
     // FIXME: Parse errors
     ExpandResult::ok(syntax_node_to_token_tree(
         &editioned_file_id.parse(db).syntax_node(),
-        crate::HirFileId::from(editioned_file_id).span_map(db),
+        crate::span_map::InOrder::new(crate::HirFileId::from(editioned_file_id).span_map(db)),
         span,
         syntax_bridge::DocCommentDesugarMode::ProcMacro,
     ))
@@ -983,7 +1035,7 @@ fn include_bytes_expand(
     });
     match read {
         Ok(bytes) => {
-            let text = bytes.escape_ascii().to_string();
+            let text = escape_ascii(bytes);
             let literal = tt::Literal::new_no_suffix(&text, span, tt::LitKind::ByteStr);
             ExpandResult::ok(quote!(span =>#literal))
         }
@@ -993,6 +1045,37 @@ fn include_bytes_expand(
             ExpandResult::new(quote! {span => builtin #pound include_bytes }, e)
         }
     }
+}
+
+/// `<[u8]>::escape_ascii` of `bytes` as one string, written in runs: the bytes it keeps (the
+/// printable ASCII other than quotes and backslashes) are copied whole, not formatted one by
+/// one, and the string is sized for them up front.
+fn escape_ascii(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let kept = |b: u8| matches!(b, 0x20..=0x7e) && !matches!(b, b'"' | b'\'' | b'\\');
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 8);
+    let mut run = 0;
+    for (at, &b) in bytes.iter().enumerate() {
+        if kept(b) {
+            continue;
+        }
+        out.extend_from_slice(&bytes[run..at]);
+        run = at + 1;
+        match b {
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\\' | b'\'' | b'"' => out.extend_from_slice(&[b'\\', b]),
+            _ => out.extend_from_slice(&[
+                b'\\',
+                b'x',
+                HEX[usize::from(b >> 4)],
+                HEX[usize::from(b & 0xf)],
+            ]),
+        }
+    }
+    out.extend_from_slice(&bytes[run..]);
+    String::from_utf8(out).expect("escaped bytes are ASCII")
 }
 
 /// The contents of the file an `include_bytes!` or `include_str!` at `call_id` names.
@@ -1028,10 +1111,13 @@ fn include_str_expand(
         }
     };
 
-    let text = included_bytes(db, arg_id, path.as_str())
-        .map(|it| String::from_utf8_lossy(it).into_owned());
+    // A UTF-8 file is escaped where it is read, not copied first.
+    let text = included_bytes(db, arg_id, path.as_str()).map(String::from_utf8_lossy);
     match text {
-        Some(text) => ExpandResult::ok(quote!(call_site =>#text)),
+        Some(text) => {
+            let literal = str_literal(&text, call_site);
+            ExpandResult::ok(quote!(call_site =>#literal))
+        }
         None => ExpandResult::new(
             quote!(call_site =>""),
             ExpandError::other(input_span, format!("failed to load file `{path}`")),
@@ -1104,8 +1190,8 @@ fn option_env_expand(
     let expanded = match get_env_inner(db, arg_id, &key) {
         None => quote! {call_site => #dollar_crate::option::Option::None::<&str> },
         Some(s) => {
-            let s = quote! (span => #s);
-            quote! {call_site => #dollar_crate::option::Option::Some(#s) }
+            let value = group(span, |b| quote_into!(b, span => #s));
+            quote! {call_site => #dollar_crate::option::Option::Some(#value) }
         }
     };
 
@@ -1127,14 +1213,23 @@ fn quote_expand(
 fn unescape_str(s: &str) -> Cow<'_, str> {
     if s.contains('\\') {
         let mut buf = String::with_capacity(s.len());
-        syntax::unescape::unescape_str(s, |_, c| {
-            if let Ok(c) = c {
-                buf.push(c)
-            }
-        });
+        unescape_str_into(s, &mut buf);
         Cow::Owned(buf)
     } else {
         Cow::Borrowed(s)
+    }
+}
+
+/// [`unescape_str`] of `s` appended to `out`, with no buffer of its own.
+fn unescape_str_into(s: &str, out: &mut String) {
+    if s.contains('\\') {
+        syntax::unescape::unescape_str(s, |_, c| {
+            if let Ok(c) = c {
+                out.push(c)
+            }
+        });
+    } else {
+        out.push_str(s);
     }
 }
 
@@ -1156,21 +1251,210 @@ fn pattern_type_expand(
     tt: &tt::TopSubtree,
     call_site: Span,
 ) -> ExpandResult<tt::TopSubtree> {
-    let mut tt = tt.clone();
-    tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
+    let ty = WithDelimiter {
+        delimiter: tt::Delimiter { kind: tt::DelimiterKind::Invisible, ..tt.top_subtree().delimiter },
+        token_trees: tt.token_trees(),
+    };
     let pound = mk_pound(call_site);
-    ExpandResult::ok(quote! {call_site => builtin #pound pattern_type ( #tt ) })
+    ExpandResult::ok(quote! {call_site => builtin #pound pattern_type ( #ty ) })
 }
 
 #[cfg(test)]
 mod assert_condition_tests {
-    use super::{Edition, assert_condition};
+    use super::{Edition, write_assert_condition};
 
     #[test]
     fn formats_the_asserted_expression() {
-        assert_eq!(
-            assert_condition(r#"value<= Self :: MAX && "A :: B".is_empty()"#, Edition::CURRENT),
-            r#"value <= Self::MAX && "A :: B".is_empty()"#,
+        let mut out = String::new();
+        write_assert_condition(
+            &mut out,
+            r#"value<= Self :: MAX && "A :: B".is_empty()"#,
+            Edition::CURRENT,
         );
+        assert_eq!(out, r#"value <= Self::MAX && "A :: B".is_empty()"#);
+    }
+
+    /// Written after a head, the condition is spaced as it is alone: the first token has no
+    /// space before it.
+    #[test]
+    fn appends_after_the_head() {
+        let mut out = String::from("assertion failed: ");
+        write_assert_condition(&mut out, "!x", Edition::CURRENT);
+        assert_eq!(out, "assertion failed: !x");
+        let mut out = String::from("assertion failed: ");
+        write_assert_condition(&mut out, "a ==b", Edition::CURRENT);
+        assert_eq!(out, "assertion failed: a == b");
+    }
+}
+
+/// The expansions that read the call's tree where it is against the clone-and-change they
+/// replace: the same trees (nodes, spans, symbols), `Debug` and `Display`.
+#[cfg(test)]
+mod tests {
+    use intern::Symbol;
+    use span::{Edition, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext};
+    use syntax::{TextRange, TextSize};
+
+    use super::{WithDelimiter, escape_ascii, format_args_nl_of_literal, mk_pound, parenthesized};
+    use crate::tt;
+
+    fn at(offset: u32) -> Span {
+        Span {
+            range: TextRange::empty(TextSize::new(offset)),
+            anchor: SpanAnchor {
+                file_id: span::EditionedFileId::new(span::FileId::from_raw(3), Edition::CURRENT),
+                ast_id: ROOT_ERASED_FILE_AST_ID,
+            },
+            ctx: SyntaxContext::root(Edition::CURRENT),
+        }
+    }
+
+    const CALL: u32 = 100;
+
+    fn assert_same(old: &tt::TopSubtree, new: &tt::TopSubtree) {
+        assert_eq!(format!("{old:#?}"), format!("{new:#?}"));
+        assert_eq!(old.to_string(), new.to_string());
+        assert!(old == new);
+    }
+
+    /// A call's arguments `{ <first>, x [y] }`, every token at a span of its own.
+    fn call_args(first: Option<tt::Literal>) -> tt::TopSubtree {
+        let mut b = tt::TopSubtreeBuilder::new(tt::Delimiter {
+            kind: tt::DelimiterKind::Brace,
+            open: at(1),
+            close: at(9),
+        });
+        match first {
+            Some(lit) => b.push(lit.into()),
+            None => b.push(tt::Leaf::Ident(tt::Ident::new("ident", at(2)))),
+        }
+        b.push(tt::Leaf::Punct(tt::Punct { char: ',', spacing: tt::Spacing::Alone, span: at(3) }));
+        b.push(tt::Leaf::Ident(tt::Ident::new("x", at(4))));
+        b.open(tt::DelimiterKind::Bracket, at(5));
+        b.push(tt::Leaf::Ident(tt::Ident::new("y", at(6))));
+        b.close(at(7));
+        b.build()
+    }
+
+    fn templates() -> Vec<Option<tt::Literal>> {
+        vec![
+            None,
+            Some(tt::Literal::new_no_suffix("a {} b", at(2), tt::LitKind::Str)),
+            Some(tt::Literal::new_no_suffix("esc\\t\\\"{x}", at(2), tt::LitKind::Str)),
+            Some(tt::Literal::new_no_suffix("raw {}", at(2), tt::LitKind::StrRaw(2))),
+            Some(tt::Literal::new("suffixed", at(2), tt::LitKind::Str, "sfx")),
+            Some(tt::Literal::new_no_suffix("b", at(2), tt::LitKind::ByteStr)),
+        ]
+    }
+
+    #[test]
+    fn parenthesized_is_the_clone_made_a_parenthesis() {
+        let span = at(CALL);
+        for first in templates() {
+            let tt = call_args(first);
+            let pound = mk_pound(span);
+            let old = {
+                let mut tt = tt.clone();
+                tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
+                quote! {span => builtin #pound format_args #tt}
+            };
+            let args = parenthesized(&tt);
+            assert_same(&old, &quote! {span => builtin #pound format_args #args});
+        }
+    }
+
+    /// `unreachable!`'s arguments at the call site's spans, and `pattern_type!`'s made
+    /// invisible.
+    #[test]
+    fn with_delimiter_is_the_clone_changed() {
+        let span = at(CALL);
+        let tt = call_args(None);
+        let old = {
+            let mut tt = tt.clone();
+            tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
+            tt.set_top_subtree_delimiter_span(tt::DelimSpan { open: span, close: span });
+            quote! {span => m! #tt}
+        };
+        let new = WithDelimiter {
+            delimiter: tt::Delimiter { open: span, close: span, kind: tt::DelimiterKind::Parenthesis },
+            token_trees: tt.token_trees(),
+        };
+        assert_same(&old, &quote! {span => m! #new});
+
+        let old = {
+            let mut tt = tt.clone();
+            tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
+            quote! {span => pattern_type ( #tt )}
+        };
+        let new = WithDelimiter {
+            delimiter: tt::Delimiter { kind: tt::DelimiterKind::Invisible, ..tt.top_subtree().delimiter },
+            token_trees: tt.token_trees(),
+        };
+        assert_same(&old, &quote! {span => pattern_type ( #new )});
+    }
+
+    /// The old `format_args_nl!` of a literal: the tree cloned and rebuilt with the token changed.
+    fn format_args_nl_by_set_token(tt: &tt::TopSubtree, span: Span) -> Option<tt::TopSubtree> {
+        let pound = mk_pound(span);
+        let lit = tt.as_token_trees().iter_flat_tokens().nth(1);
+        let Some(tt::TokenTree::Leaf(tt::Leaf::Literal(
+            mut lit @ tt::Literal { kind: tt::LitKind::Str | tt::LitKind::StrRaw(_), .. },
+        ))) = lit
+        else {
+            return None;
+        };
+        let mut tt = tt.clone();
+        tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
+        let newline = if lit.kind == tt::LitKind::Str { "\\n" } else { "\n" };
+        let (text, suffix) = lit.text_and_suffix();
+        lit.text_and_suffix = Symbol::intern(&format!("{text}{newline}{suffix}"));
+        tt.set_token(1, lit.into());
+        Some(quote! {span => builtin #pound format_args #tt})
+    }
+
+    #[test]
+    fn format_args_nl_of_literal_is_set_token() {
+        let span = at(CALL);
+        for first in templates() {
+            let tt = call_args(first);
+            let old = format_args_nl_by_set_token(&tt, span);
+            let new = format_args_nl_of_literal(&tt, span);
+            assert_eq!(old.is_some(), new.is_some());
+            if let (Some(old), Some(new)) = (old, new) {
+                assert_same(&old, &new);
+            }
+        }
+        // A template alone, and nothing at all.
+        let alone = tt::TopSubtree::invisible_from_leaves(
+            at(1),
+            [tt::Leaf::Literal(tt::Literal::new_no_suffix("t", at(2), tt::LitKind::Str))],
+        );
+        assert_same(
+            &format_args_nl_by_set_token(&alone, span).unwrap(),
+            &format_args_nl_of_literal(&alone, span).unwrap(),
+        );
+        let empty = tt::TopSubtree::empty(tt::DelimSpan::from_single(at(1)));
+        assert!(format_args_nl_of_literal(&empty, span).is_none());
+    }
+
+    #[test]
+    fn escape_ascii_is_std() {
+        let every: Vec<u8> = (0..=255).collect();
+        assert_eq!(escape_ascii(&every), every.escape_ascii().to_string());
+        // Runs of kept bytes between escaped ones, from a fixed xorshift.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut bytes = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let b = state as u8;
+            bytes.push(if state & 0x300 == 0 { b } else { b'a' + b % 26 });
+        }
+        for len in [0, 1, 2, 7, 64, 4096] {
+            let it = &bytes[..len];
+            assert_eq!(escape_ascii(it), it.escape_ascii().to_string(), "{len}");
+        }
+        assert_eq!(escape_ascii(b"\t\r\n\\'\"\x00\x7f\xff ok"), "\\t\\r\\n\\\\\\'\\\"\\x00\\x7f\\xff ok");
     }
 }

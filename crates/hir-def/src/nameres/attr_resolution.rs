@@ -62,7 +62,7 @@ impl DefMap {
                     return Ok(ResolvedAttr::Other);
                 }
             }
-            None => return Err(UnresolvedMacro { path: (*ast_id.path).clone() }),
+            None => return Err(UnresolvedMacro { path: ast_id.path }),
         };
 
         Ok(ResolvedAttr::Macro(attr_macro_as_call_id(
@@ -154,7 +154,7 @@ pub(super) fn derive_macro_as_call_id(
 ) -> Result<(MacroId, MacroDefId, MacroCallId), UnresolvedMacro> {
     let (macro_id, def_id) = resolver(&item_attr.path)
         .filter(|(_, def_id)| def_id.is_derive())
-        .ok_or_else(|| UnresolvedMacro { path: (*item_attr.path).clone() })?;
+        .ok_or_else(|| UnresolvedMacro { path: item_attr.path })?;
     let call_id = def_id.make_call(
         db,
         krate,

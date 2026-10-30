@@ -56,7 +56,8 @@ impl Screen {
                     self.settle();
                     match (end, number) {
                         ('A', Some(up)) => {
-                            assert!(up > 0 && up <= self.row, "up {up} from {}: {bytes:?}", self.row);
+                            let row = self.row;
+                            assert!(up > 0 && up <= row, "up {up} from {row}: {bytes:?}");
                             self.row -= up;
                         }
                         ('B', Some(down)) => {
@@ -421,7 +422,11 @@ fn graphed() -> Vec<Record> {
 }
 
 /// Draws `records` on a screen, each at its time, then a tick at `now_ns`: the region then.
-fn region_at(live: &mut Live, records: impl IntoIterator<Item = Record>, now_ns: u64) -> Vec<String> {
+fn region_at(
+    live: &mut Live,
+    records: impl IntoIterator<Item = Record>,
+    now_ns: u64,
+) -> Vec<String> {
     let mut screen = Screen::default();
     for record in records {
         screen.feed(&live.record(&record, record.at_ns));
@@ -624,7 +629,8 @@ fn the_functions_slow_to_compile_show_under_their_crate_and_at_the_end() {
     ];
     let drawn: String = end.iter().map(|it| live.record(it, it.at_ns)).collect();
     let said = "     Slowest fns: wgpu::Device::new 1.40s, wgpu::Queue::submit 1.10s";
-    assert!(drawn.contains(said), "{drawn:?}"); // A name too long keeps its end, which says which function it is.
+    assert!(drawn.contains(said), "{drawn:?}");
+    // A name too long keeps its end, which says which function it is.
     let name = "<regex_syntax::unicode::SimpleCaseFolder>::new";
     assert_eq!(crate::tail(name, 24), "\u{2026}:SimpleCaseFolder>::new");
 }

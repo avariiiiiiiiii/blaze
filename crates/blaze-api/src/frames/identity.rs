@@ -1,0 +1,628 @@
+//! Every request and response of the API held to [`cbor::reference`], the codec before the
+//! one in use: the same bytes from each way an envelope is written, the same value read back
+//! by both, the same answer from both for the bytes changed, and nothing of the API's own
+//! types put in order on the way out.
+
+use std::fmt::Debug;
+
+use blaze_ids::{ContentId, Fingerprint};
+use blaze_protocol::cbor::{self, reference};
+use blaze_query::{Changed, Edge, Input, QueryKey, QueryKind, Why};
+use blaze_vfs::{Change, ChangeKind, Mode, Op, View};
+use serde::{Serialize, de::DeserializeOwned};
+
+use super::{decode, encode, encode_into};
+use crate::{
+    ApiError, Artifact, BuildScriptRan, Cargo, Diagnostic, Envelope, FactRead, FetchVerb, Level,
+    LinkKind, Mismatch, Ranked, Reach, ReachedItem, Request, Response, Span, Status, Table,
+    Targets, TestOutcome, TestResult, Traced, Ub, UnitOf, UnitProfile, UnitStarted, UnitTarget,
+    Verb, ViewRef, Worked,
+};
+
+const REQUESTS: usize = 19;
+const RESPONSES: usize = 24;
+
+const CHARS: [char; 9] = ['a', 'Z', '0', ' ', '-', '/', '\u{e9}', '\u{6c34}', '\u{1f525}'];
+
+/// Values of the API from a seed, the same in every run. `plain` leaves out what holds a map
+/// of another crate's type whose fields are not declared in their keys' order (`Op`,
+/// `Change`, `Edge`, `Why`), which the writer puts in order.
+struct Gen {
+    state: u64,
+    plain: bool,
+}
+
+impl Gen {
+    fn next(&mut self) -> u64 {
+        self.state ^= self.state << 13;
+        self.state ^= self.state >> 7;
+        self.state ^= self.state << 17;
+        self.state
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn yes(&mut self) -> bool {
+        self.next() & 1 == 1
+    }
+
+    /// A number of each width a head has.
+    fn wide(&mut self) -> u64 {
+        match self.below(5) {
+            0 => self.below(24),
+            1 => self.below(1 << 8),
+            2 => self.below(1 << 16),
+            3 => self.below(1 << 32),
+            _ => self.next(),
+        }
+    }
+
+    fn u32(&mut self) -> u32 {
+        self.wide() as u32
+    }
+
+    /// Mostly short, sometimes past the lengths a head of one and of two bytes says.
+    fn text(&mut self) -> String {
+        let len = match self.below(20) {
+            0 => 24 + self.below(8),
+            1 => 256 + self.below(4),
+            n => n % 6,
+        };
+        (0..len).map(|_| CHARS[self.below(CHARS.len() as u64) as usize]).collect()
+    }
+
+    fn bytes(&mut self) -> Vec<u8> {
+        let len = self.count(1);
+        (0..len).map(|_| self.next() as u8).collect()
+    }
+
+    /// How many items a list has: at the top sometimes past what a head of one byte says.
+    fn count(&mut self, depth: u32) -> usize {
+        match (depth, self.below(12)) {
+            (0, 0) => 24 + self.below(4) as usize,
+            (_, n) => (n % 3) as usize,
+        }
+    }
+
+    fn many<T>(&mut self, depth: u32, mut one: impl FnMut(&mut Gen) -> T) -> Vec<T> {
+        let len = self.count(depth);
+        (0..len).map(|_| one(self)).collect()
+    }
+
+    fn maybe<T>(&mut self, one: impl FnOnce(&mut Gen) -> T) -> Option<T> {
+        match self.yes() {
+            true => Some(one(self)),
+            false => None,
+        }
+    }
+
+    fn texts(&mut self, depth: u32) -> Vec<String> {
+        self.many(depth, Gen::text)
+    }
+
+    fn pairs(&mut self, depth: u32) -> Vec<(String, String)> {
+        self.many(depth, |g| (g.text(), g.text()))
+    }
+
+    fn id(&mut self) -> ContentId {
+        let mut bytes = [0; 32];
+        for byte in &mut bytes {
+            *byte = self.next() as u8;
+        }
+        ContentId(bytes)
+    }
+
+    fn fingerprint(&mut self) -> Fingerprint {
+        let high = u128::from(self.next());
+        Fingerprint((high << 64) | u128::from(self.next()))
+    }
+
+    fn key(&mut self) -> QueryKey {
+        QueryKey { kind: QueryKind(self.wide() as u16), input: self.id() }
+    }
+
+    fn fact(&mut self) -> FactRead {
+        FactRead { key: self.key(), what: self.text() }
+    }
+
+    fn op(&mut self) -> Op {
+        match self.below(4) {
+            0 => Op::Write {
+                path: self.text(),
+                bytes: self.bytes(),
+                mode: match self.below(3) {
+                    0 => Mode::Regular,
+                    1 => Mode::Executable,
+                    _ => Mode::Symlink,
+                },
+            },
+            1 => {
+                Op::Edit { path: self.text(), at: self.wide(), len: self.wide(), bytes: self.bytes() }
+            }
+            2 => Op::Delete { path: self.text() },
+            _ => Op::Rename { from: self.text(), to: self.text() },
+        }
+    }
+
+    fn ops(&mut self, depth: u32) -> Vec<Op> {
+        match self.plain {
+            true => Vec::new(),
+            false => self.many(depth, Gen::op),
+        }
+    }
+
+    fn changes(&mut self, depth: u32) -> Vec<Change> {
+        if self.plain {
+            return Vec::new();
+        }
+        self.many(depth, |g| Change {
+            path: g.text(),
+            kind: match g.below(3) {
+                0 => ChangeKind::Added,
+                1 => ChangeKind::Removed,
+                _ => ChangeKind::Modified,
+            },
+        })
+    }
+
+    fn edges(&mut self, depth: u32) -> Vec<Edge> {
+        if self.plain {
+            return Vec::new();
+        }
+        self.many(depth, |g| Edge { read: g.key(), saw: g.fingerprint() })
+    }
+
+    fn why(&mut self) -> Why {
+        Why {
+            query: self.key(),
+            chain: self.many(1, |g| Changed {
+                key: g.key(),
+                was: g.fingerprint(),
+                now: g.fingerprint(),
+            }),
+            input: self.maybe(|g| match g.below(3) {
+                0 => Input::File(g.text()),
+                1 => Input::Dir(g.text()),
+                _ => Input::Config,
+            }),
+        }
+    }
+
+    fn view(&mut self, depth: u32) -> ViewRef {
+        let kinds = if self.plain || depth > 2 { 2 } else { 3 };
+        match self.below(kinds) {
+            0 => ViewRef::Head(self.text()),
+            1 => ViewRef::Root(View { root: self.id() }),
+            _ => ViewRef::WhatIf { ops: self.ops(depth + 1), base: Box::new(self.view(depth + 1)) },
+        }
+    }
+
+    fn cargo(&mut self) -> Cargo {
+        Cargo {
+            cwd: self.text(),
+            env: self.pairs(1),
+            args: self.texts(1),
+            root: self.text(),
+            color: self.yes(),
+            files: self.many(1, |g| (g.text(), g.bytes())),
+            command: self.text(),
+        }
+    }
+
+    fn targets(&mut self) -> Targets {
+        Targets {
+            cargo: self.maybe(Gen::cargo),
+            target: self.maybe(Gen::text),
+            profile: self.text(),
+            features: self.texts(1),
+            packages: self.texts(1),
+            all_features: self.yes(),
+            no_default_features: self.yes(),
+        }
+    }
+
+    fn request(&mut self) -> Request {
+        match self.below(REQUESTS as u64) {
+            0 => Request::Commit { ops: self.ops(0), base: self.id(), head: self.text() },
+            1 => Request::Check { view: self.view(0), targets: self.targets() },
+            2 => Request::Build { view: self.view(0), targets: self.targets() },
+            3 => Request::Test {
+                ub: self.maybe(|g| Ub { seed: g.maybe(Gen::wide), schedules: g.maybe(Gen::u32) }),
+                all: self.yes(),
+                args: self.texts(0),
+                view: self.view(0),
+                filter: self.texts(0),
+                targets: self.targets(),
+            },
+            4 => Request::Run {
+                bin: self.maybe(Gen::text),
+                args: self.texts(0),
+                view: self.view(0),
+                targets: self.targets(),
+            },
+            5 => Request::Diff { to: self.view(0), from: self.view(0) },
+            6 => Request::Why { view: self.view(0), query: self.key() },
+            7 => Request::Status,
+            8 => Request::Cancel { id: self.wide() },
+            9 => Request::Open { view: self.view(0) },
+            10 => Request::Close { root: self.id() },
+            11 => Request::Reach { to: self.view(0), from: self.view(0), targets: self.targets() },
+            12 => Request::BestOf {
+                base: self.view(0),
+                test: self.yes(),
+                filter: self.texts(0),
+                targets: self.targets(),
+                candidates: self.many(0, |g| g.ops(1)),
+            },
+            13 => Request::Verify { view: self.view(0), targets: self.targets() },
+            14 => Request::Snapshot,
+            15 => Request::CodegenInputs { view: self.view(0), targets: self.targets() },
+            16 => Request::Trace { view: self.view(0), targets: self.targets() },
+            17 => Request::Tables { view: self.view(0) },
+            _ => Request::Stop,
+        }
+    }
+
+    fn span(&mut self) -> Span {
+        Span {
+            file: self.text(),
+            line: self.u32(),
+            label: self.maybe(Gen::text),
+            column: self.u32(),
+            primary: self.yes(),
+            byte_end: self.u32(),
+            end_line: self.u32(),
+            byte_start: self.u32(),
+            end_column: self.u32(),
+            replacement: self.maybe(Gen::text),
+            applicability: self.maybe(Gen::text),
+        }
+    }
+
+    fn unit_target(&mut self) -> UnitTarget {
+        UnitTarget {
+            doc: self.yes(),
+            kind: self.texts(1),
+            name: self.text(),
+            test: self.yes(),
+            doctest: self.yes(),
+            edition: self.text(),
+            src_path: self.text(),
+            crate_types: self.texts(1),
+        }
+    }
+
+    fn unit_of(&mut self) -> UnitOf {
+        UnitOf {
+            test: self.yes(),
+            target: self.unit_target(),
+            package_id: self.text(),
+            manifest_path: self.text(),
+        }
+    }
+
+    fn diagnostic(&mut self, depth: u32) -> Diagnostic {
+        Diagnostic {
+            code: self.maybe(Gen::text),
+            unit: self.maybe(Gen::unit_of),
+            facts: self.many(1, Gen::fact),
+            level: match self.below(5) {
+                0 => Level::Error,
+                1 => Level::Warning,
+                2 => Level::Note,
+                3 => Level::Help,
+                _ => Level::FailureNote,
+            },
+            spans: self.many(1, Gen::span),
+            message: self.text(),
+            children: match depth < 2 {
+                true => self.many(1, |g| g.diagnostic(depth + 1)),
+                false => Vec::new(),
+            },
+            rendered: self.text(),
+        }
+    }
+
+    fn artifact(&mut self) -> Artifact {
+        Artifact {
+            env: self.pairs(1),
+            kind: self.text(),
+            path: self.text(),
+            fresh: self.yes(),
+            runner: self.texts(1),
+            target: self.unit_target(),
+            content: self.id(),
+            harness: self.yes(),
+            package: self.text(),
+            profile: UnitProfile {
+                test: self.yes(),
+                debuginfo: self.u32(),
+                opt_level: self.text(),
+                overflow_checks: self.yes(),
+                debug_assertions: self.yes(),
+            },
+            features: self.texts(1),
+            filenames: self.texts(1),
+            executable: self.maybe(Gen::text),
+            manifest_path: self.text(),
+        }
+    }
+
+    /// A response; [`Response::Of`], the last, only at a `depth` under 2.
+    fn response(&mut self, depth: u32) -> Response {
+        let kinds = if depth > 1 { RESPONSES - 1 } else { RESPONSES };
+        match self.below(kinds as u64) {
+            0 => Response::Committed { root: self.id(), rebased: self.yes() },
+            1 => Response::Diagnostic(self.diagnostic(0)),
+            2 => Response::Built {
+                members: self.u32(),
+                profile: self.text(),
+                artifacts: self.many(depth, Gen::artifact),
+            },
+            3 => Response::Unit(UnitStarted {
+                name: self.text(),
+                verb: match self.below(3) {
+                    0 => Verb::Compiling,
+                    1 => Verb::Checking,
+                    _ => Verb::Fresh,
+                },
+                source: self.maybe(Gen::text),
+                version: self.text(),
+                package_id: self.text(),
+            }),
+            4 => Response::UnitEnded(self.unit_of()),
+            5 => Response::Fetched {
+                verb: match self.yes() {
+                    true => FetchVerb::Updating,
+                    false => FetchVerb::Downloaded,
+                },
+                what: self.text(),
+            },
+            6 => Response::BuildScript(BuildScriptRan {
+                env: self.pairs(depth),
+                cfgs: self.texts(depth),
+                out_dir: self.text(),
+                package_id: self.text(),
+                linked_libs: self.texts(depth),
+                linked_paths: self.texts(depth),
+            }),
+            7 => Response::Work(Worked {
+                link: match self.yes() {
+                    true => LinkKind::Patched,
+                    false => LinkKind::Placed,
+                },
+                found: self.wide(),
+                green: self.wide(),
+                reran: self.wide(),
+                compiled: self.wide(),
+                critical_path_us: self.wide(),
+            }),
+            8 => Response::TestResult(TestResult {
+                name: self.text(),
+                binary: self.text(),
+                millis: self.wide(),
+                output: self.bytes(),
+                outcome: match self.below(4) {
+                    0 => TestOutcome::Passed,
+                    1 => TestOutcome::Failed,
+                    2 => TestOutcome::Ignored,
+                    _ => TestOutcome::Unreached,
+                },
+            }),
+            9 => Response::Ran {
+                code: self.maybe(|g| g.next() as i32),
+                stderr: self.bytes(),
+                stdout: self.bytes(),
+            },
+            10 => Response::Diff { changes: self.changes(depth) },
+            11 if self.plain => Response::Done { ok: self.yes() },
+            11 => Response::Why(self.why()),
+            12 => Response::Status(Status {
+                views: self.u32(),
+                requests: self.many(depth, Gen::wide),
+                budget_bytes: self.wide(),
+                memory_bytes: self.wide(),
+            }),
+            13 => Response::Done { ok: self.yes() },
+            14 => Response::Error(ApiError { at: self.maybe(Gen::text), what: self.text() }),
+            15 => Response::Opened { root: self.id() },
+            16 => Response::Reached(Reach {
+                items: self.many(depth, |g| ReachedItem {
+                    path: g.text(),
+                    facts: g.many(1, Gen::fact),
+                }),
+                tests: self.texts(depth),
+                changes: self.changes(depth),
+                compiled: self.texts(depth),
+            }),
+            17 => Response::Ranked(self.many(depth, |g| Ranked {
+                ok: g.yes(),
+                root: g.id(),
+                errors: g.u32(),
+                failed: g.u32(),
+                passed: g.u32(),
+                warnings: g.u32(),
+                candidate: g.u32(),
+            })),
+            18 => Response::Verified {
+                mismatches: self.many(depth, |g| Mismatch {
+                    fact: g.maybe(Gen::fact),
+                    query: g.key(),
+                    scratch: g.fingerprint(),
+                    incremental: g.fingerprint(),
+                }),
+            },
+            19 => Response::Snapshotted { heads: self.many(depth, |g| (g.text(), g.id())) },
+            20 => Response::CodegenInputs(self.many(depth, |g| (g.id(), g.id()))),
+            21 => Response::Trace(self.many(depth, |g| Traced {
+                key: g.key(),
+                ran: g.yes(),
+                edges: g.edges(1),
+                fingerprint: g.fingerprint(),
+            })),
+            22 => Response::Tables(self.many(depth, |g| Table {
+                name: g.text(),
+                bytes: g.wide(),
+                elements: g.wide(),
+            })),
+            _ => {
+                Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }
+            }
+        }
+    }
+
+    /// A few bytes flipped, replaced, cut, put in or swapped.
+    fn mutate(&mut self, bytes: &mut Vec<u8>) {
+        for _ in 0..=self.below(3) {
+            match self.below(5) {
+                0 if !bytes.is_empty() => {
+                    let at = self.below(bytes.len() as u64) as usize;
+                    bytes[at] ^= 1 << self.below(8);
+                }
+                1 if !bytes.is_empty() => {
+                    let at = self.below(bytes.len() as u64) as usize;
+                    bytes[at] = self.next() as u8;
+                }
+                2 => bytes.truncate(self.below(bytes.len() as u64 + 1) as usize),
+                3 => {
+                    let at = self.below(bytes.len() as u64 + 1) as usize;
+                    bytes.insert(at, self.next() as u8);
+                }
+                _ if bytes.len() >= 2 => {
+                    let at = self.below(bytes.len() as u64 - 1) as usize;
+                    bytes.swap(at, at + 1);
+                }
+                _ => bytes.push(0),
+            }
+        }
+    }
+}
+
+/// Which of [`Gen::request`]'s a request is; a variant added is a variant to generate.
+fn request_index(request: &Request) -> usize {
+    match request {
+        Request::Commit { .. } => 0,
+        Request::Check { .. } => 1,
+        Request::Build { .. } => 2,
+        Request::Test { .. } => 3,
+        Request::Run { .. } => 4,
+        Request::Diff { .. } => 5,
+        Request::Why { .. } => 6,
+        Request::Status => 7,
+        Request::Cancel { .. } => 8,
+        Request::Open { .. } => 9,
+        Request::Close { .. } => 10,
+        Request::Reach { .. } => 11,
+        Request::BestOf { .. } => 12,
+        Request::Verify { .. } => 13,
+        Request::Snapshot => 14,
+        Request::CodegenInputs { .. } => 15,
+        Request::Trace { .. } => 16,
+        Request::Tables { .. } => 17,
+        Request::Stop => 18,
+    }
+}
+
+/// Which of [`Gen::response`]'s a response is; a variant added is a variant to generate.
+fn response_index(response: &Response) -> usize {
+    match response {
+        Response::Committed { .. } => 0,
+        Response::Diagnostic(_) => 1,
+        Response::Built { .. } => 2,
+        Response::Unit(_) => 3,
+        Response::UnitEnded(_) => 4,
+        Response::Fetched { .. } => 5,
+        Response::BuildScript(_) => 6,
+        Response::Work(_) => 7,
+        Response::TestResult(_) => 8,
+        Response::Ran { .. } => 9,
+        Response::Diff { .. } => 10,
+        Response::Why(_) => 11,
+        Response::Status(_) => 12,
+        Response::Done { .. } => 13,
+        Response::Error(_) => 14,
+        Response::Opened { .. } => 15,
+        Response::Reached(_) => 16,
+        Response::Ranked(_) => 17,
+        Response::Verified { .. } => 18,
+        Response::Snapshotted { .. } => 19,
+        Response::CodegenInputs(_) => 20,
+        Response::Trace(_) => 21,
+        Response::Tables(_) => 22,
+        Response::Of { .. } => 23,
+    }
+}
+
+/// Holds `envelope` to the reference codec every way it is written and read; true when the
+/// kept writer put no map of it in order.
+fn same<T>(writer: &mut cbor::Writer, envelope: &Envelope<T>) -> bool
+where
+    T: Serialize + DeserializeOwned + PartialEq + Debug,
+{
+    let old = reference::to_vec(envelope).expect("the reference codec encodes every envelope");
+    assert_eq!(cbor::to_vec(envelope).unwrap(), old, "{envelope:?}");
+    let framed = encode(envelope).unwrap();
+    assert_eq!(framed[..4], (old.len() as u32).to_be_bytes());
+    assert_eq!(framed[4..], old[..], "{envelope:?}");
+    let permuted = writer.permuted();
+    let mut kept = vec![7];
+    encode_into(writer, &mut kept, envelope).unwrap();
+    assert_eq!(kept[0], 7);
+    assert_eq!(kept[5..], old[..], "{envelope:?}");
+    let in_order = writer.permuted() == permuted;
+    let back: Envelope<T> = cbor::from_slice(&old).unwrap();
+    assert_eq!(&back, envelope);
+    assert_eq!(reference::from_slice::<Envelope<T>>(&old).unwrap(), back);
+    assert_eq!(&decode::<T>(&old).unwrap(), envelope);
+    in_order
+}
+
+/// The same value, or the same error, from both codecs.
+fn same_answer<T: DeserializeOwned + PartialEq + Debug>(bytes: &[u8]) {
+    let new = cbor::from_slice::<Envelope<T>>(bytes);
+    let old = reference::from_slice::<Envelope<T>>(bytes);
+    assert_eq!(new, old, "{bytes:02x?}");
+}
+
+#[test]
+fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
+    let mut g = Gen { state: 0x2545_f491_4f6c_dd1d, plain: false };
+    let mut writer = cbor::Writer::new();
+    let (mut requests, mut responses) = ([false; REQUESTS], [false; RESPONSES]);
+    for round in 0..3000 {
+        g.plain = round % 2 == 0;
+        let envelope = Envelope::new(g.wide(), g.request());
+        requests[request_index(&envelope.body)] = true;
+        let in_order = same(&mut writer, &envelope);
+        assert!(
+            in_order || !g.plain,
+            "a map of the API's own types written out of order (declare fields by key, shorter \
+             first, then bytewise): {envelope:?}"
+        );
+        let envelope = Envelope::new(g.wide(), g.response(0));
+        responses[response_index(&envelope.body)] = true;
+        let in_order = same(&mut writer, &envelope);
+        assert!(
+            in_order || !g.plain,
+            "a map of the API's own types written out of order (declare fields by key, shorter \
+             first, then bytewise): {envelope:?}"
+        );
+    }
+    assert!(requests.iter().all(|&seen| seen), "requests generated: {requests:?}");
+    assert!(responses.iter().all(|&seen| seen), "responses generated: {responses:?}");
+}
+
+#[test]
+fn changed_bytes_read_as_the_old_codec_read_them() {
+    let mut g = Gen { state: 0x9e37_79b9_7f4a_7c15, plain: false };
+    for _ in 0..1500 {
+        let mut request = reference::to_vec(&Envelope::new(g.wide(), g.request())).unwrap();
+        g.mutate(&mut request);
+        same_answer::<Request>(&request);
+        let mut response = reference::to_vec(&Envelope::new(g.wide(), g.response(0))).unwrap();
+        g.mutate(&mut response);
+        same_answer::<Response>(&response);
+    }
+}

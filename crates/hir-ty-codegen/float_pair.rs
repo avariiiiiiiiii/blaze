@@ -5,6 +5,8 @@
 //! widths, in `rax` and `rdx`, and a call of one bitcasts what it gets back. rustc returns
 //! the pair in `xmm0` and `xmm1`, which only a program that links rustc's objects would need.
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::{
     cursor::{Cursor, FuncCursor},
     ir::{self, InstBuilder, MemFlagsData, Opcode, Signature, types},

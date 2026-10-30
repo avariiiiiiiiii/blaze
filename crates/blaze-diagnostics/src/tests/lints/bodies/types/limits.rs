@@ -4,8 +4,10 @@
 
 use super::{Test, Ui, ui};
 
-fn check(name: &str, test: Test, flags: &[&str], source: &str, stderr: &str) {
-    let actual = ui(Ui { name, test, flags, source, ..Ui::default() });
+/// compiletest gives `-A unused` to every UI test but a `run-pass` one (`runtest.rs`,
+/// `AllowUnused`), which `Test::Passes` stands for; none of these is `run-pass`.
+fn check(name: &str, flags: &[&str], source: &str, stderr: &str) {
+    let actual = ui(Ui { name, test: Test::Passes, flags, source, ..Ui::default() });
     assert_eq!(actual, stderr, "{name}");
 }
 
@@ -13,7 +15,6 @@ fn check(name: &str, test: Test, flags: &[&str], source: &str, stderr: &str) {
 fn lint_type_limits() {
     check(
         "lint-type-limits.rs",
-        Test::Fails,
         &["-D unused-comparisons"],
         include_str!("limits/ui/lint-type-limits.rs"),
         include_str!("limits/ui/lint-type-limits.stderr"),
@@ -24,7 +25,6 @@ fn lint_type_limits() {
 fn lint_type_limits2() {
     check(
         "lint-type-limits2.rs",
-        Test::Fails,
         &["-D unused-comparisons"],
         include_str!("limits/ui/lint-type-limits2.rs"),
         include_str!("limits/ui/lint-type-limits2.stderr"),
@@ -35,7 +35,6 @@ fn lint_type_limits2() {
 fn lint_type_limits3() {
     check(
         "lint-type-limits3.rs",
-        Test::Fails,
         &["-D unused-comparisons"],
         include_str!("limits/ui/lint-type-limits3.rs"),
         include_str!("limits/ui/lint-type-limits3.stderr"),
@@ -46,7 +45,6 @@ fn lint_type_limits3() {
 fn type_overflow() {
     check(
         "type-overflow.rs",
-        Test::Passes,
         &[],
         include_str!("limits/ui/type-overflow.rs"),
         include_str!("limits/ui/type-overflow.stderr"),
@@ -57,7 +55,6 @@ fn type_overflow() {
 fn lint_type_overflow2() {
     check(
         "lint-type-overflow2.rs",
-        Test::Fails,
         &[],
         include_str!("limits/ui/lint-type-overflow2.rs"),
         include_str!("limits/ui/lint-type-overflow2.stderr"),
@@ -68,7 +65,6 @@ fn lint_type_overflow2() {
 fn lint_overflowing_int_136675() {
     check(
         "lint-overflowing-int-136675.rs",
-        Test::Fails,
         &[],
         include_str!("limits/ui/lint-overflowing-int-136675.rs"),
         include_str!("limits/ui/lint-overflowing-int-136675.stderr"),

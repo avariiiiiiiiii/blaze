@@ -15,7 +15,7 @@ use syntax_bridge::DocCommentDesugarMode;
 use crate::{
     attrs::{AttrId, expand_cfg_attr, is_item_tree_filtered_attr, with_one_segment},
     fixup::{self, SyntaxFixupUndoInfo},
-    span_map::SpanMap,
+    span_map::{InOrder, SpanMap},
     tt::{self, DelimSpan, Span},
 };
 
@@ -308,7 +308,7 @@ pub(crate) fn attr_macro_input_to_token_tree(
     (
         syntax_bridge::syntax_node_to_token_tree_modified(
             node,
-            span_map,
+            InOrder::new(span_map),
             fixups.append,
             fixups.remove,
             span,

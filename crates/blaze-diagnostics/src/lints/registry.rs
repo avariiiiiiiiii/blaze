@@ -15,7 +15,7 @@
 mod lints;
 mod names;
 
-use std::sync::OnceLock;
+use std::{borrow::Cow, sync::OnceLock};
 
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -319,7 +319,59 @@ pub fn internal_lints() -> &'static [Lint] {
     lints::INTERNAL
 }
 
-/// The builtin lint named `name`, lowercase, as rustc's store has it.
+/// The tool of blaze's own lints, which every crate has, as rustc has `rustc` and `rustdoc`.
+pub const BLAZE_TOOL: &str = "blaze";
+
+/// blaze's own lints, `blaze::`, registered in every crate after rustc's builtin ones.
+pub fn blaze_lints() -> &'static [Lint] {
+    lints::BLAZE
+}
+
+/// Every lint table, in the order of [`LintId`]s.
+fn tables() -> [&'static [Lint]; 4] {
+    [lints::BUILTIN, lints::BLAZE, lints::INTERNAL, lints::UNREGISTERED]
+}
+
+/// A lint as a `u16`: its index in the builtin lints, then blaze's, the internal ones and the
+/// unregistered ones. Comparing or hashing one is comparing two bytes, not a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LintId(u16);
+
+const _: () = assert!(size_of::<LintId>() == 2);
+const _: () = assert!(size_of::<Lint>() > 0);
+
+impl LintId {
+    /// The id of `lint`, which is one of [`lints`], [`blaze_lints`], [`internal_lints`] or
+    /// [`unregistered`] (where every `&'static Lint` of this module points): its address in its
+    /// table, with no lookup.
+    pub fn of(lint: &'static Lint) -> LintId {
+        let at = lint as *const Lint as usize;
+        let mut first = 0;
+        for table in tables() {
+            let start = table.as_ptr() as usize;
+            if (start..start + size_of_val(table)).contains(&at) {
+                let index = first + (at - start) / size_of::<Lint>();
+                return LintId(u16::try_from(index).expect("fewer than 65536 lints"));
+            }
+            first += table.len();
+        }
+        panic!("`{}` is not a lint of the registry's tables", lint.name)
+    }
+
+    pub fn lint(self) -> &'static Lint {
+        let mut index = usize::from(self.0);
+        for table in tables() {
+            match table.get(index) {
+                Some(lint) => return lint,
+                None => index -= table.len(),
+            }
+        }
+        unreachable!("a `LintId` is made only of a lint of the tables")
+    }
+}
+
+/// The builtin lint, or blaze's, named `name`, lowercase, as the store has it: one FxHash of
+/// the name.
 pub fn lint(name: &str) -> Option<&'static Lint> {
     index().lints.get(name).copied()
 }
@@ -332,14 +384,13 @@ pub fn unregistered() -> &'static [Lint] {
 /// The lint a diagnostic named `name` is of: a builtin one, an internal one, or one rustc
 /// emits without registering it (`private_macro_use`).
 pub fn declared(name: &str) -> Option<&'static Lint> {
-    lint(name).or_else(|| {
-        lints::INTERNAL.iter().chain(lints::UNREGISTERED).find(|it| it.name == name)
-    })
+    let index = index();
+    index.lints.get(name).or_else(|| index.declared.get(name)).copied()
 }
 
 /// The builtin lint group named `name`, aliases included.
 pub fn group(name: &str) -> Option<&'static Group> {
-    groups().iter().find(|it| it.name == name)
+    index().groups.get(name).map(|&it| &groups()[usize::from(it)])
 }
 
 /// rustc's lint groups, in the order it adds them: those it makes of the future-incompatible
@@ -456,15 +507,50 @@ enum Entry {
     Ignored,
 }
 
+/// The registry's lookups, built once: every one is a single FxHash of a name, or an index.
 struct Index {
     lints: FxHashMap<&'static str, &'static Lint>,
+    /// The internal and unregistered lints.
+    declared: FxHashMap<&'static str, &'static Lint>,
     names: FxHashMap<&'static str, Entry>,
+    /// Each of [`groups`] by name, as its index.
+    groups: FxHashMap<&'static str, u16>,
+    /// For each builtin lint, by [`LintId`]: the first of [`groups`] that has it, aliases left
+    /// out.
+    first_group: Vec<Option<u16>>,
+    /// The tools of the builtin and of the internal lints' names, `tool::`.
+    builtin_tools: Vec<&'static str>,
+    internal_tools: Vec<&'static str>,
 }
 
 fn index() -> &'static Index {
     static INDEX: OnceLock<Index> = OnceLock::new();
     INDEX.get_or_init(|| {
-        let lints = lints::BUILTIN.iter().map(|it| (it.name, it)).collect();
+        let lints = lints::BUILTIN.iter().chain(lints::BLAZE).map(|it| (it.name, it)).collect();
+        let declared = lints::INTERNAL.iter().chain(lints::UNREGISTERED).map(|it| (it.name, it)).collect();
+        let all = groups();
+        let mut groups = FxHashMap::with_capacity_and_hasher(all.len(), Default::default());
+        let mut first_group = vec![None; lints::BUILTIN.len()];
+        for (at, group) in all.iter().enumerate() {
+            let at = u16::try_from(at).expect("fewer than 65536 groups");
+            groups.entry(group.name).or_insert(at);
+            if group.alias_of.is_none() {
+                for &lint in &group.lints {
+                    first_group[usize::from(LintId::of(lint).0)].get_or_insert(at);
+                }
+            }
+        }
+        let tools = |table: &'static [Lint]| {
+            let mut tools: Vec<&'static str> =
+                table.iter().filter_map(|it| it.name.split_once("::").map(|(tool, _)| tool)).collect();
+            tools.sort_unstable();
+            tools.dedup();
+            tools
+        };
+        let mut builtin_tools = [tools(lints::BUILTIN), tools(lints::BLAZE)].concat();
+        builtin_tools.sort_unstable();
+        builtin_tools.dedup();
+        let internal_tools = tools(lints::INTERNAL);
         let mut names = FxHashMap::default();
         for &name in names::IGNORED {
             names.insert(name, Entry::Ignored);
@@ -475,7 +561,7 @@ fn index() -> &'static Index {
         for &(name, reason) in names::REMOVED {
             names.insert(name, Entry::Removed(reason));
         }
-        Index { lints, names }
+        Index { lints, declared, names, groups, first_group, builtin_tools, internal_tools }
     })
 }
 
@@ -519,6 +605,12 @@ impl Store {
         groups().iter().chain(internal)
     }
 
+    /// Whether some lint registered is `tool`'s.
+    fn has_lints_of(&self, tool: &str) -> bool {
+        let index = index();
+        index.builtin_tools.contains(&tool) || (self.internal && index.internal_tools.contains(&tool))
+    }
+
     fn by_name(&self, name: &str) -> Option<&'static Lint> {
         lint(name).or_else(|| {
             self.internal.then(|| lints::INTERNAL.iter().find(|it| it.name == name)).flatten()
@@ -526,7 +618,7 @@ impl Store {
     }
 
     fn group(&self, name: &str) -> Option<&'static Group> {
-        self.groups().find(|it| it.name == name)
+        group(name).or_else(|| (self.internal && name == "rustc::internal").then(internal_group))
     }
 
     /// Whether `name` is a group's, or `warnings`: rustc's `is_lint_group`.
@@ -559,21 +651,20 @@ impl Store {
         {
             return Checked::NoTool;
         }
-        let complete = match tool {
-            Some(tool) => format!("{tool}::{name}"),
-            None => name.to_owned(),
+        let complete: Cow<'_, str> = match tool {
+            Some(tool) => Cow::Owned(format!("{tool}::{name}")),
+            None => Cow::Borrowed(name),
         };
         if let Some(tool) = tool {
             if let Some(lint) = self.by_name(&complete) {
                 return Checked::Tool(vec![lint], None);
             }
-            if index().names.get(complete.as_str()).is_none() {
+            if index().names.get(&*complete).is_none() {
                 return match self.group(&complete) {
                     // Every alias of rustc's is a quiet one: none is said to be deprecated.
                     Some(group) => Checked::Tool(group.lints.clone(), None),
                     None => {
-                        let prefix = format!("{tool}::");
-                        if self.lints().any(|it| it.name.starts_with(&prefix)) {
+                        if self.has_lints_of(tool) {
                             self.no_lint_suggestion(&complete, tool)
                         } else {
                             Checked::MissingTool
@@ -585,7 +676,7 @@ impl Store {
         if let Some(lint) = self.by_name(&complete) {
             return Checked::Ok(vec![lint]);
         }
-        match index().names.get(complete.as_str()).copied() {
+        match index().names.get(&*complete).copied() {
             Some(Entry::Renamed(new)) => Checked::Renamed(new),
             Some(Entry::Removed(reason)) => Checked::Removed(reason),
             Some(Entry::Ignored) => Checked::Ok(Vec::new()),
@@ -637,11 +728,15 @@ impl Store {
 
     /// The first group, aliases left out, that has `lint`: what rustc's note of a default
     /// level names it part of.
-    pub fn group_of(&self, lint: &Lint) -> Option<&'static str> {
-        self.groups()
-            .filter(|it| it.alias_of.is_none())
-            .find(|it| it.lints.iter().any(|it| it.name == lint.name))
-            .map(|it| it.name)
+    pub fn group_of(&self, lint: &'static Lint) -> Option<&'static str> {
+        let id = usize::from(LintId::of(lint).0);
+        match index().first_group.get(id) {
+            Some(first) => first.map(|it| groups()[usize::from(it)].name),
+            None => {
+                let internal = self.internal && internal_group().lints.iter().any(|it| std::ptr::eq(*it, lint));
+                internal.then_some(internal_group().name)
+            }
+        }
     }
 }
 

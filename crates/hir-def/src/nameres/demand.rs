@@ -206,6 +206,9 @@ pub fn bodies_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefW
 /// field's default) is in no body.
 pub fn block_owner(db: &dyn SourceDatabase, block: BlockId) -> Result<DefWithBodyId, String> {
     let item = owning_item(db, block.ast_id(db))?;
+    // SAFETY: the id was read from `db` in this computation and is used only while `db` is borrowed
+    // (as a key or in this query's result); salsa deletes a tracked struct only when the query that
+    // made it reruns, which reruns this one too.
     let mut module = unsafe { block.module(db).to_static() };
     let owner = loop {
         if let Some(owner) = owner_in_module(db, module, item) {
@@ -213,6 +216,9 @@ pub fn block_owner(db: &dyn SourceDatabase, block: BlockId) -> Result<DefWithBod
         }
         // The module of a block in a block of the same body is the outer block's.
         let outer = match module.block(db) {
+            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
+            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
+            // when the query that made it reruns, which reruns this one too.
             Some(outer) if module.is_block_module(db) => unsafe { outer.to_static() },
             _ => {
                 return Err(format!(
@@ -221,6 +227,9 @@ pub fn block_owner(db: &dyn SourceDatabase, block: BlockId) -> Result<DefWithBod
                 ));
             }
         };
+        // SAFETY: the id was read from `db` in this computation and is used only while `db` is
+        // borrowed (as a key or in this query's result); salsa deletes a tracked struct only when
+        // the query that made it reruns, which reruns this one too.
         module = unsafe { outer.module(db).to_static() };
     };
     if !Body::of(db, owner).blocks(db).any(|(it, _)| it == block) {

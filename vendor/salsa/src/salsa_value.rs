@@ -1,5 +1,3 @@
-#![allow(clippy::undocumented_unsafe_blocks)] // Implementations are structural; see trait safety docs.
-
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -109,9 +107,11 @@ salsa_values! {
 #[cfg(feature = "compact_str")]
 salsa_values!(compact_str::CompactString);
 
-// SAFETY: Values of these types contain no database-lifetime references.
+// SAFETY: A `str` is bytes; it contains no database-lifetime references.
 unsafe impl SalsaValue for str {}
+// SAFETY: A `Path` is bytes; it contains no database-lifetime references.
 unsafe impl SalsaValue for Path {}
+// SAFETY: Every element is a `SalsaValue`.
 unsafe impl<T: SalsaValue> SalsaValue for [T] {}
 
 // SAFETY: A genuinely `'static` reference remains valid across revisions.
@@ -141,7 +141,9 @@ default_salsa_value!(std::ops::RangeInclusive<T>);
 
 // SAFETY: The owned pointee is a `SalsaValue`.
 unsafe impl<T: ?Sized + SalsaValue> SalsaValue for Box<T> {}
+// SAFETY: The shared pointee is a `SalsaValue`, kept alive by the count this `Arc` holds.
 unsafe impl<T: ?Sized + SalsaValue> SalsaValue for Arc<T> {}
+// SAFETY: The shared pointee is a `SalsaValue`, kept alive by the count this `Rc` holds.
 unsafe impl<T: ?Sized + SalsaValue> SalsaValue for Rc<T> {}
 
 #[cfg(feature = "triomphe")]
@@ -150,6 +152,8 @@ unsafe impl<T: ?Sized + SalsaValue> SalsaValue for triomphe::Arc<T> {}
 
 // SAFETY: Every retained element is a `SalsaValue`.
 unsafe impl<T: SalsaValue, const N: usize> SalsaValue for [T; N] {}
+// SAFETY: Every retained element is an `A::Item`, a `SalsaValue`; the inline buffer is `A` itself,
+// whose elements are the same items.
 unsafe impl<A> SalsaValue for smallvec::SmallVec<A>
 where
     A: smallvec::Array,

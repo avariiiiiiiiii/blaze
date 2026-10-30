@@ -1,6 +1,7 @@
 //! Conversions between [`SyntaxNode`] and [`tt::TokenTree`].
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![forbid(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
@@ -977,7 +978,8 @@ impl<'t> Iterator for FlatTokens<'t> {
             *next += 1;
             if tree.is_token(at) {
                 let kind = SyntaxKind::from(tree.kind(at).0);
-                return Some(FlatTok { kind, range: tree.range(at), text: tree.token_text(at) });
+                let range = tree.range(at);
+                return Some(FlatTok { kind, range, text: &tree.text()[range] });
             }
             if tree.is_lazy(at) {
                 self.enter(tree, at);

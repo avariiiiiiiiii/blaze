@@ -1,6 +1,8 @@
 //! The shape of a vtable, which has to agree with rustc's `vtable_entries` slot for slot:
 //! objects cross between rustc-compiled code and ours in both directions.
 
+#![forbid(unsafe_code)]
+
 use hir_def::{AssocItemId, FunctionId, TraitId};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{

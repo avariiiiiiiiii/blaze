@@ -14,7 +14,7 @@
 
 use std::{ffi::OsString, path::PathBuf};
 
-use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
+use blaze_cas::{Corrupt, Guard, Key, Kind, Mismatch, Reader, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
 use blaze_ids::{ContentId, Hasher};
 
@@ -117,13 +117,13 @@ impl Shape {
         let mut at = At(rest);
         let mut shape = Shape::default();
         for _ in 0..at.len()? {
-            shape.files.push(PathBuf::from(os_from(at.part()?)));
+            shape.files.push(PathBuf::from(os_from(at.part()?)?));
         }
         for _ in 0..at.len()? {
-            shape.dirs.push(PathBuf::from(os_from(at.part()?)));
+            shape.dirs.push(PathBuf::from(os_from(at.part()?)?));
         }
         for _ in 0..at.len()? {
-            shape.env.push(os_from(at.part()?));
+            shape.env.push(os_from(at.part()?)?);
         }
         for _ in 0..at.len()? {
             let name = String::from_utf8_lossy(at.part()?).into_owned();
@@ -173,24 +173,42 @@ pub enum FindError<E> {
     Inputs(E),
 }
 
-/// The result of `run` for `inputs` as they are now, if the store has one.
+/// The result of `run` for `inputs` as they are now, if the store has one: read in place on
+/// any thread, the hit's bytes valid while `guard`'s task runs.
 pub fn find<'s, I: Inputs>(
+    store: &'s Reader,
+    guard: &'s Guard,
+    run: &RunKey,
+    inputs: &mut I,
+) -> Result<Found<'s>, FindError<I::Error>> {
+    search(|key| Ok(store.get(guard, key)?.map(|entry| entry.bytes)), run, inputs)
+}
+
+/// [`find`] for the store's own thread, which holds it.
+pub(crate) fn find_held<'s, I: Inputs>(
     store: &'s Store,
+    run: &RunKey,
+    inputs: &mut I,
+) -> Result<Found<'s>, FindError<I::Error>> {
+    search(|key| Ok(store.get(key)?.map(|entry| entry.bytes)), run, inputs)
+}
+
+fn search<'s, I: Inputs>(
+    get: impl Fn(&Key) -> Result<Option<&'s [u8]>, Corrupt>,
     run: &RunKey,
     inputs: &mut I,
 ) -> Result<Found<'s>, FindError<I::Error>> {
     let mut n = 0;
     loop {
         let key = slot(run, n);
-        let Some(entry) = store.get(&key).map_err(FindError::Corrupt)? else {
+        let Some(bytes) = get(&key).map_err(FindError::Corrupt)? else {
             return Ok(Found::Miss { shapes: n });
         };
-        let shape =
-            Shape::decode(entry.bytes).map_err(|why| FindError::NotAShape { key, why })?;
+        let shape = Shape::decode(bytes).map_err(|why| FindError::NotAShape { key, why })?;
         let traced = shape.values(inputs).map_err(FindError::Inputs)?;
         let key = result_key(run, &traced);
-        if let Some(entry) = store.get(&key).map_err(FindError::Corrupt)? {
-            return Ok(Found::Hit { traced, key, value: entry.bytes });
+        if let Some(value) = get(&key).map_err(FindError::Corrupt)? {
+            return Ok(Found::Hit { traced, key, value });
         }
         n += 1;
     }

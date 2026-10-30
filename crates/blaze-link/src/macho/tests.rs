@@ -248,6 +248,12 @@ fn names_cross_the_edge_both_ways() {
         assert_eq!(core_name(macho_name(name).as_bytes()).unwrap(), name);
     }
     assert!(core_name(&[b'_', 0xff]).is_err());
+    let mut names = crate::model::Names::default();
+    for raw in [&b"_main"[..], b"__mh_execute_header", b"section$start$__DATA$__x", b"_", b"x"] {
+        let name = super::push_core_name(&mut names, raw).unwrap();
+        assert_eq!(names.at(name), core_name(raw).unwrap());
+    }
+    assert!(super::push_core_name(&mut names, &[b'_', 0xff]).is_err());
 }
 
 #[test]
@@ -1045,16 +1051,138 @@ fn reads_universal_slices() {
     assert_eq!(ppc.thin("thin", b"\xcf\xfa\xed\xfe....").unwrap().0, 0);
 }
 
+/// An arm64 object with code, data and C strings in atoms, a local and an undefined symbol,
+/// and pointers to both.
+fn an_object() -> Vec<u8> {
+    use object::write::{Object as Builder, Relocation, StandardSection, Symbol as Def, SymbolSection};
+    use object::{
+        Architecture, BinaryFormat, Endianness, RelocationFlags, SymbolFlags, SymbolKind as Type,
+        SymbolScope,
+    };
+    let mut b = Builder::new(BinaryFormat::MachO, Architecture::Aarch64, Endianness::Little);
+    b.set_subsections_via_symbols();
+    let text = b.section_id(StandardSection::Text);
+    b.append_section_data(text, &[0x1f, 0x20, 0x03, 0xd5].repeat(8), 4);
+    let data = b.section_id(StandardSection::Data);
+    b.append_section_data(data, &[0; 16], 8);
+    let strings = b.section_id(StandardSection::CString);
+    b.append_section_data(strings, b"hello\0world\0", 1);
+    let mut symbol = |name: &str, value: u64, size: u64, kind, scope, section| {
+        b.add_symbol(Def {
+            name: name.into(),
+            value,
+            size,
+            kind,
+            scope,
+            weak: false,
+            section,
+            flags: SymbolFlags::None,
+        })
+    };
+    let f = symbol("_f", 0, 16, Type::Text, SymbolScope::Linkage, SymbolSection::Section(text));
+    symbol("_g", 16, 16, Type::Text, SymbolScope::Compilation, SymbolSection::Section(text));
+    symbol("_d", 0, 16, Type::Data, SymbolScope::Linkage, SymbolSection::Section(data));
+    let ext = symbol("_ext", 0, 0, Type::Unknown, SymbolScope::Dynamic, SymbolSection::Undefined);
+    for (at, target) in [(0, f), (8, ext)] {
+        let flags =
+            RelocationFlags::MachO { r_type: macho::ARM64_RELOC_UNSIGNED, r_pcrel: false, r_length: 3 };
+        b.add_relocation(data, Relocation { offset: at, symbol: target, addend: 0, flags }).unwrap();
+    }
+    b.write().unwrap()
+}
+
+fn native_object(read: Result<crate::model::NativeFile, String>) -> crate::model::Object {
+    match read {
+        Ok(crate::model::NativeFile::Object(object)) => object,
+        Ok(_) => panic!("read as something other than an object"),
+        Err(error) => panic!("{error}"),
+    }
+}
+
+/// `a`, read from `a_input`, and `b`, from `b_input`, say the same through every accessor.
+fn same_object(
+    a: &crate::model::Object,
+    a_input: &[u8],
+    b: &crate::model::Object,
+    b_input: &[u8],
+) {
+    assert_eq!(a.sections.len(), b.sections.len());
+    for (x, y) in a.sections.iter().zip(&b.sections) {
+        assert_eq!(a.name(x.name), b.name(y.name));
+        assert_eq!((&x.what, x.align, x.retain), (&y.what, y.align, y.retain));
+        assert_eq!(x.data.len(), y.data.len());
+        assert_eq!(x.data.bytes(a_input).unwrap(), y.data.bytes(b_input).unwrap(), "{}", a.name(x.name));
+        assert_eq!(a.section_fixups(x), b.section_fixups(y));
+    }
+    assert_eq!(a.symbols, b.symbols);
+    assert_eq!(a.names, b.names);
+    assert_eq!(a.libraries, b.libraries);
+}
+
 #[test]
-fn misaligned_inputs_are_read_aligned() {
-    let words = vec![0x0102_0304_0506_0708u64; 4];
-    let bytes: Vec<u8> = words.iter().flat_map(|it| it.to_le_bytes()).collect();
-    let (want, misaligned) = (&bytes[1..29], &bytes[1..29]);
-    let seen = super::aligned(misaligned, |it| {
-        assert!((it.as_ptr() as usize).is_multiple_of(8));
-        it.to_vec()
-    });
-    assert_eq!(seen, want);
+fn objects_are_read_in_place_wherever_they_start() {
+    use crate::model::Data;
+    let bytes = an_object();
+    let writer = super::writer(&executable(Arch::Aarch64)).unwrap();
+    let thin = native_object(writer.read("x.o", &bytes, &crate::NativeKind::Object));
+    let mut held = 0;
+    for section in &thin.sections {
+        match &section.data {
+            Data::Input(range) => {
+                assert!(range.start <= range.end && range.end <= bytes.len() as u64);
+                held += range.end - range.start;
+            }
+            Data::Zero(_) => {}
+            Data::Bytes(_) => panic!("{}: copied, not a range of the input", thin.name(section.name)),
+        }
+    }
+    assert_eq!(held, 32 + 16 + 12, "every byte of the code, the data and the strings");
+    // An archive's member starts at any byte: every start of a word reads the same.
+    let mut buffer = vec![0u8; bytes.len() + 8];
+    for start in 0..8 {
+        buffer[start..start + bytes.len()].copy_from_slice(&bytes);
+        let input = &buffer[start..start + bytes.len()];
+        let read = native_object(writer.read("x.o", input, &crate::NativeKind::Object));
+        same_object(&thin, &bytes, &read, input);
+        for (x, y) in thin.sections.iter().zip(&read.sections) {
+            assert_eq!(x.data, y.data, "ranges of the slice read, wherever it is");
+        }
+    }
+}
+
+#[test]
+fn universal_objects_name_bytes_of_the_whole_file() {
+    use crate::model::Data;
+    let bytes = an_object();
+    let at = 0x4000u32;
+    let mut fat = Vec::new();
+    for field in [macho::FAT_MAGIC, 2] {
+        fat.extend_from_slice(&field.to_be_bytes());
+    }
+    for (cpu, offset, size, align) in
+        [(macho::CPU_TYPE_X86_64, 0x1000, 8, 12), (macho::CPU_TYPE_ARM64, at, bytes.len() as u32, 14)]
+    {
+        for field in [cpu, 0, offset, size, align] {
+            fat.extend_from_slice(&field.to_be_bytes());
+        }
+    }
+    fat.resize(0x1000, 0);
+    fat.extend_from_slice(b"x86slice");
+    fat.resize(at as usize, 0);
+    fat.extend_from_slice(&bytes);
+
+    let writer = super::writer(&executable(Arch::Aarch64)).unwrap();
+    let thin = native_object(writer.read("x.o", &bytes, &crate::NativeKind::Object));
+    let read = native_object(writer.read("fat.o", &fat, &crate::NativeKind::Object));
+    same_object(&thin, &bytes, &read, &fat);
+    for (x, y) in thin.sections.iter().zip(&read.sections) {
+        match (&x.data, &y.data) {
+            (Data::Input(x), Data::Input(y)) => {
+                assert_eq!(*y, x.start + u64::from(at)..x.end + u64::from(at));
+            }
+            (x, y) => assert_eq!(x, y),
+        }
+    }
 }
 
 /// The trie as it was first built, one name at a time with an edge label copied per edge:

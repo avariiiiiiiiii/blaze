@@ -4,6 +4,8 @@ mod imports;
 mod incremental;
 mod macros;
 mod mod_resolution;
+mod paths;
+mod worklist;
 mod batch_order;
 
 use expect_test::{Expect, expect};

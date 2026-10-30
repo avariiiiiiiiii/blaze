@@ -151,6 +151,11 @@ pub enum Effect {
     Timer { after: Duration, tag: Tag },
     /// The whole file mapped read-only into memory, shared with every other mapping of it
     /// (a pack of the store, the daemon's image). Completes with [`Done::Mapped`].
+    ///
+    /// The asker's contract: while any [`Mapping`] of the file lives, no effect writes,
+    /// appends to or truncates that file in place; it is replaced only by renaming another
+    /// file over it, as the store and the image do. An in-place write would change bytes under
+    /// a live `&[u8]`, and a truncate would fault on the next read of the pages cut.
     Map { file: FileName, tag: Tag },
     /// A process started as `command` says, in its sandbox; completes with [`Done::Exited`]
     /// once it has exited and its output is read, or with [`Done::Failed`] when it could not

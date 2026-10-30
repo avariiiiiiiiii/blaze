@@ -11,7 +11,7 @@ use tt::TextRange;
 use crate::{
     expr_store::lower::{ExprCollector, FxIndexSet},
     hir::{
-        AsmOperand, AsmOptions, AsmPiece, Expr, ExprId, InlineAsm, InlineAsmKind,
+        AsmOperand, AsmOptions, AsmPiece, ExprId, InlineAsm, InlineAsmKind,
         InlineAsmRegOrRegClass,
     },
 };
@@ -343,17 +343,15 @@ impl ExprCollector<'_> {
             InlineAsmKind::Asm
         };
 
-        let idx = self.alloc_expr(
-            Expr::InlineAsm(&InlineAsm {
-                operands: operands.into_boxed_slice(),
-                template: template.map(Vec::into_boxed_slice),
-                options,
-                kind,
-                comment_only,
-                clobber_abi: !clobber_abis.is_empty(),
-            }),
-            syntax_ptr,
-        );
+        let idx = self.store.alloc_asm_expr(InlineAsm {
+            operands: operands.into_boxed_slice(),
+            template: template.map(Vec::into_boxed_slice),
+            options,
+            kind,
+            comment_only,
+            clobber_abi: !clobber_abis.is_empty(),
+        });
+        let idx = self.map_expr(idx, syntax_ptr);
         self.store
             .template_map
             .get_or_insert_with(Default::default)

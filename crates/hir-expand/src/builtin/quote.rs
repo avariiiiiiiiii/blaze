@@ -275,16 +275,33 @@ impl_to_to_tokentrees! {
     };
 }
 
-/// A string literal of `s`, escaped by [`str::escape_default`].
-fn str_literal(s: &str, span: Span) -> crate::tt::Literal {
-    // `escape_default` keeps exactly the printable ASCII other than quotes and backslashes.
-    let plain = s.bytes().all(|b| matches!(b, 0x20..=0x7e) && !matches!(b, b'"' | b'\'' | b'\\'));
-    let text_and_suffix = if plain {
-        Symbol::intern(s)
-    } else {
-        let mut escaped = String::with_capacity(s.len() + s.len() / 2 + 2);
-        escaped.extend(s.escape_default());
-        Symbol::intern(&escaped)
+/// Whether [`str::escape_default`] keeps the byte as it is: the printable ASCII other than quotes
+/// and backslashes.
+#[inline]
+fn kept_by_escape_default(b: u8) -> bool {
+    matches!(b, 0x20..=0x7e) && !matches!(b, b'"' | b'\'' | b'\\')
+}
+
+/// A string literal of `s`, escaped by [`str::escape_default`]: the runs it keeps are copied
+/// whole, and only the characters between them escaped one by one.
+pub(crate) fn str_literal(s: &str, span: Span) -> crate::tt::Literal {
+    let text_and_suffix = match s.bytes().position(|b| !kept_by_escape_default(b)) {
+        None => Symbol::intern(s),
+        Some(first) => {
+            let mut escaped = String::with_capacity(s.len() + s.len() / 2 + 2);
+            // A kept byte is ASCII, so each run ends at the start of a character.
+            let (kept, mut rest) = s.split_at(first);
+            escaped.push_str(kept);
+            while let Some(c) = rest.chars().next() {
+                escaped.extend(c.escape_default());
+                rest = &rest[c.len_utf8()..];
+                let run = rest.bytes().position(|b| !kept_by_escape_default(b)).unwrap_or(rest.len());
+                let (kept, tail) = rest.split_at(run);
+                escaped.push_str(kept);
+                rest = tail;
+            }
+            Symbol::intern(&escaped)
+        }
     };
     crate::tt::Literal { text_and_suffix, span, kind: tt::LitKind::Str, suffix_len: 0 }
 }
@@ -504,7 +521,18 @@ mod tests {
     /// The string literal fast path is `escape_default` exactly.
     #[test]
     fn str_literal_escapes_as_escape_default() {
-        for s in ["", "plain text 123", "a\"b", "it's", "back\\slash", "tab\t", "nl\n", "café", "\u{0}", "~ !"] {
+        let mut cases: Vec<String> = [
+            "", "plain text 123", "a\"b", "it's", "back\\slash", "tab\t", "nl\n", "café", "\u{0}",
+            "~ !", "\"", "\n\n\nend", "start\u{7f}", "日本語", "mixed é \u{1F600} \\ \" ' \r\t x",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        // Every character up to U+00FF, and a few beyond, alone and between kept runs.
+        let chars: String = (0u32..0x100).chain([0x2028, 0xFEFF, 0x1F600]).filter_map(char::from_u32).collect();
+        cases.push(chars.clone());
+        cases.push(chars.chars().flat_map(|c| [c, 'k', 'e', 'p', 't']).collect());
+        for s in &cases {
             let lit = super::str_literal(s, DUMMY);
             assert_eq!(lit.text_and_suffix.as_str(), s.escape_default().to_string(), "{s:?}");
             assert_eq!(lit.kind, tt::LitKind::Str);

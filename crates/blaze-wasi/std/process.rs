@@ -305,11 +305,13 @@ fn call(request: &[u8]) -> Result<Ran, (io::ErrorKind, String)> {
         return Err((io::ErrorKind::InvalidInput, "blaze: the host could not read the command".into()));
     };
     let mut response = Vec::with_capacity(len);
-    // SAFETY: `response` has room for `len` bytes, which the host writes.
-    unsafe {
-        blaze_run_tool_response(response.as_mut_ptr(), len);
-        response.set_len(len);
-    }
+    // SAFETY: `response` was made with room for `len` bytes, the length the host answered for
+    // this response, and the host writes exactly that many from its start; a shorter buffer
+    // would have the host write past it.
+    unsafe { blaze_run_tool_response(response.as_mut_ptr(), len) };
+    // SAFETY: the call above wrote all `len` bytes, so they are initialized, and `len` is the
+    // capacity asked for; without that write the response would be read uninitialized.
+    unsafe { response.set_len(len) };
     let bad = || (io::ErrorKind::InvalidData, "blaze: the host's response is not one".to_owned());
     let rest = &mut &response[..];
     let mut take = |n: usize| -> Result<&[u8], (io::ErrorKind, String)> {

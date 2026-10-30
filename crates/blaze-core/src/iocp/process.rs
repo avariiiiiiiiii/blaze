@@ -472,6 +472,10 @@ struct Waiter {
     serial: u64,
 }
 
+/// # Safety
+/// `context` is the `Waiter` that `Waiting::new` leaked with `Box::into_raw`, called only by
+/// the thread pool's wait, which `Waiting::drop` unregisters (waiting for a call in progress)
+/// before it frees the `Waiter`.
 unsafe extern "system" fn ended(context: *mut c_void, _timed_out: bool) {
     // SAFETY: the `Waiter` of `Waiting::new`, alive until its wait is unregistered, which
     // waits for this call to return.

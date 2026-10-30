@@ -5,6 +5,8 @@
 //!
 //! [`rustc_hir_typeck/autoderef.rs`]: https://github.com/rust-lang/rust/blob/5503df87342a73d0c29126a7e08dc9c1255c46ad/compiler/rustc_hir_typeck/src/autoderef.rs
 
+#![forbid(unsafe_code)]
+
 use std::fmt;
 
 use hir_def::{TraitId, TypeAliasId};

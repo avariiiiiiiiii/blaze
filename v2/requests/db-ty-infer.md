@@ -17,6 +17,8 @@ that does not compile against the columns; every other use of `expr_adjustments`
 accessors is unchanged in name, signature and meaning).
 Why: the result's columns (db-ty-shared.md, db-ty-infer's part).
 
+> forwarded to codegen: `crates/hir-ty-mir/` is lane codegen's, not db-ty's (`crates.md`).
+
 ## 2. db-ty-hir: a fixture test of the inference record's round trip through the type table
 
 What: one test in `crates/hir/src/tests.rs` (its `TestDB` pattern), for each body of the fixture
@@ -60,6 +62,8 @@ list of types in place of the table (it needs no database), so the table itself
 (`TyTableWriter`/`TyTableReader`) and `SolverDiagnostic::TraitUnimplemented` (whose trait
 reference needs an interner) are covered only by a fixture test.
 
+> forwarded to db: `crates/hir/` is lane db's.
+
 ## 3. db-ty-types: `next_solver::persist::{TyTableWriter, TyTableReader}`, as the contract says
 
 What: the API of db-ty-shared.md rule 2, unchanged. `crates/hir-ty/src/infer/persist.rs` uses
@@ -69,6 +73,8 @@ What: the API of db-ty-shared.md rule 2, unchanged. `crates/hir-ty/src/infer/per
 `lower/persist.rs` does.
 Where: `crates/hir-ty/src/next_solver/persist.rs` (new), `pub mod persist;` in `next_solver.rs`.
 Why: nothing else in the record depends on the interners' dense indices.
+
+> forwarded to db: between lane db's children.
 
 ## 4. db-ty-lower: share the lowering diagnostics' words
 
@@ -82,6 +88,11 @@ does it once they are reachable).
 Where: `crates/hir-ty/src/lower/persist.rs`.
 Why: one encoding of a type in one place.
 
+> forwarded to db: between lane db's children.
+
+> applied (db-ty): reachable as `crate::lower::persist::*`. db-ty-infer has switched to them and
+> dropped its copy.
+
 ## 5. db-ty-db: the inference result's cold form
 
 What: when `infer`/`infer_anon_const` results are evicted to the store, their cold form is
@@ -91,6 +102,8 @@ a read that fails is an error naming the record, never a recomputation in its pl
 Where: `crates/hir-ty/src/db.rs`, `evict.rs`.
 Why: db-ty-shared.md rule 4, values in the format.
 
+> forwarded to db: between lane db's children.
+
 ## 6. Notes (no change asked)
 
 - The pending obligations are `FulfillmentCtxt`'s (`next_solver/fulfill.rs`, db-ty-solver's).
@@ -99,3 +112,58 @@ Why: db-ty-shared.md rule 4, values in the format.
 - The diagnostics lane's request for an `unreachable()` pass (`v2/requests/diagnostics.md`,
   around line 165) is a semantic port outside db-ty-infer's part (columns and the record form);
   db-ty to assign.
+
+> applied: noted; no change asked.
+
+## 7. codegen (via db-ty) and db: CSR column lists are plain slices now
+
+What: for `docs/v2/plan/design/unsafe.md`, `Run<T>` (an unsized wrapper over `[T]`, made by two
+unsafe pointer casts, for no speed) is gone. `Csr::get` now gives `Option<&[T]>`. The callers
+that wrote `&**it` to get from the old `&Box<[T]>` to `&[T]` take `it` as it is:
+
+- `crates/hir-ty-mir/src/mir/lower.rs` ~2734: `.map_or(&[][..], |it| it)` (or `.unwrap_or_default()`).
+- `crates/hir-ty-mir/src/mir/lower/match_tree.rs` ~285 and `pattern_matching.rs` ~311: the same.
+- `crates/hir-ty-mir/src/mir/lower.rs` ~3200: request 1 still holds, `.map(<[_]>::to_vec)`.
+- `crates/hir-ide/src/tests.rs` ~267: `.unwrap_or_default()` in place of
+  `.map_or_else(Default::default, |it| &**it)`.
+- `crates/hir-ide/src/diagnostics/match_check.rs` ~120: `.unwrap_or_default()` in place of
+  `.map(|it| &**it).unwrap_or_default()`.
+
+Every other use (`&it[..]`, `.iter()`, `.last()`, `.split_last()`, passing it as `&[T]`) is
+unchanged. hir-ty's own callers are done.
+Where: the lines above. `crates/hir-ty-mir/` is codegen's and `crates/hir-ide/` is db's.
+Why: unsafe.md "Where unsafe is allowed".
+
+> applied (hir-ide is the coordinator's): `tests.rs` and `diagnostics/match_check.rs` use `.unwrap_or_default()` on the slice. forwarded to codegen for the three `hir-ty-mir` sites.
+
+## 8. format (lead): a safe byte view of a `Record` slice
+
+What: `pub fn bytes_of<T: Record>(values: &[T]) -> &[u8]` in `blaze_format` (the cast
+`Writer::push_slice` already makes, lib.rs ~528). It would remove one copy of the type table
+per decode in `infer/persist.rs`'s `table_bytes`, which now copies the words into an `Aligned`
+buffer so that it needs no unsafe. Also, `crates/hir-ty/src/lower/persist.rs:190` (db-ty-lower's)
+keeps its own unsafe `bytes_of` over `u128`s, which reads the words in native byte order while
+they are written little-endian. Take this only if a profile shows the copy matters.
+Where: `crates/blaze-format/src/lib.rs`.
+Why: unsafe.md: unsafe in small modules behind a safe API, only for measured speed.
+
+> forwarded to format.
+
+## 9. safety (safety-fuzz): the inference record is a parser of untrusted bytes
+
+No `unsafe` remains in `crates/hir-ty/src/infer.rs`, `infer/` or `autoderef.rs`, and both
+modules say `#![forbid(unsafe_code)]` (hir-ty as a whole has unsafe elsewhere, so the crate
+attribute is not db-ty-infer's). The record is safe code, so the target is for panics, hangs and
+memory that grows faster than the input:
+
+- `<InferenceRecord as blaze_format::Persist>::read(&[u8])`, then `InferenceRecordRef::decode`
+  with the tests' `Model` codec (no database needed).
+  - Fuzz target: arbitrary bytes, and a valid record with one word of `u64s`, `u32s` or `bytes`
+    changed. The result must be an error or a result whose record writes back to the same columns.
+    It must never panic.
+  - Model: `a_result_with_every_column_round_trips` and `truncated_words_are_refused_not_misread`
+    in `infer/persist.rs`'s tests (the seed corpus is their records).
+  - Bounds: every list length is bounded by the words left (`Source::len`), and no column is
+    sized by an index it reads, so memory is at most a fixed multiple of the input.
+
+> forwarded to safety (safety-fuzz).

@@ -10,7 +10,7 @@ use super::coff::{Aligned, ImportName, words};
 use super::image::{self, Buf, Image, Tables, alignment, pdb_name};
 use super::{DEBUG, IDATA, OBJ_PDATA, PDATA, Pe, RELOC, TLS_DIR, TLS_INDEX, rank, writer};
 use crate::model::{
-    Apply, Bind, Binding, Class, Counts, Data, Directive, Export, Function, GotEntry, Group, Holds, Import, Library,
+    Apply, Bind, Binding, Class, Counts, Data, Directive, Export, Function, GotEntry, Holds, Import, Library,
     NativeFile, NativeFixup, Placed, Plan, Region, SectionKind, Special, SymbolDef, SymbolKind, Tls, WindowsUnwind,
     Writer,
 };
@@ -121,10 +121,10 @@ impl Fixture {
             }
             addr = addr.next_multiple_of(16);
             let size = data.len();
-            contents.push(match data {
-                Data::Bytes(bytes) => bytes.clone(),
-                Data::Zero(_) if super::zeroed(&class) => Vec::new(),
-                Data::Zero(size) => vec![0; *size as usize],
+            contents.push(match data.bytes(&[]).unwrap() {
+                Some(bytes) => bytes.to_vec(),
+                None if super::zeroed(&class) => Vec::new(),
+                None => vec![0; size as usize],
             });
             regions.push(Region { class, addr, capacity: size, size, prot, align: 16 });
             addr += size;
@@ -1057,9 +1057,10 @@ fn read_object(bytes: &[u8]) -> crate::model::Object {
 
 #[test]
 fn coff_object_sections_and_groups() {
-    let object = read_object(&object());
+    let bytes = object();
+    let object = read_object(&bytes);
     let kinds: Vec<(&str, &SectionKind, bool)> =
-        object.sections.iter().map(|it| (it.name.as_str(), &it.what, it.retain)).collect();
+        object.sections.iter().map(|it| (object.name(it.name), &it.what, it.retain)).collect();
     let pdata = Class::Named { name: ".pdata".into(), write: false, exec: false };
     assert_eq!(
         kinds,
@@ -1077,7 +1078,16 @@ fn coff_object_sections_and_groups() {
     assert_eq!(object.sections[0].align, 16);
     assert_eq!(object.sections[1].align, 8);
     assert_eq!(object.sections[7].data, Data::Zero(32));
-    assert_eq!(object.groups, [Group { name: "inline_fn".into(), sections: vec![3, 4, 5], largest: false }]);
+    assert!(matches!(object.sections[0].data, Data::Input(_)));
+    let text = object.sections[0].data.bytes(&bytes).unwrap().unwrap();
+    assert_eq!(text.len(), 16);
+    assert_eq!(text[5..9], 4u32.to_le_bytes());
+    assert_eq!(object.sections[4].data.bytes(&bytes).unwrap().unwrap()[4..8], 4u32.to_le_bytes());
+    assert_eq!(object.sections[7].data.bytes(&bytes).unwrap(), None);
+    assert_eq!(object.groups.len(), 1);
+    assert_eq!(object.name(object.groups[0].name), "inline_fn");
+    assert_eq!(object.group_sections(&object.groups[0]), [3, 4, 5]);
+    assert!(!object.groups[0].largest);
     assert_eq!(object.libraries, ["msvcrt.lib", "oldnames.lib"]);
     assert_eq!(
         object.directives,
@@ -1091,7 +1101,7 @@ fn coff_object_sections_and_groups() {
 #[test]
 fn coff_object_symbols() {
     let object = read_object(&object());
-    let names: Vec<&str> = object.symbols.iter().map(|it| it.name.as_str()).collect();
+    let names: Vec<&str> = object.symbols.iter().map(|it| object.name(it.name)).collect();
     assert_eq!(
         names,
         [
@@ -1113,7 +1123,7 @@ fn coff_object_symbols() {
             "alias",
         ]
     );
-    let symbol = |name: &str| object.symbols.iter().find(|it| it.name == name).unwrap();
+    let symbol = |name: &str| object.symbols.iter().find(|it| object.name(it.name) == name).unwrap();
     assert_eq!(symbol(".text").kind, SymbolKind::Section);
     assert_eq!(symbol(".text").def, SymbolDef::Section { section: 0, value: 0, size: 16 });
     assert_eq!(symbol(".text").binding, Binding::Local);
@@ -1136,8 +1146,9 @@ fn coff_object_symbols() {
 fn coff_object_relocations() {
     let object = read_object(&object());
     let fixup = |at, apply, symbol, addend| NativeFixup { at, apply, symbol, addend, minus: None };
+    let fixups = |section: usize| object.section_fixups(&object.sections[section]);
     assert_eq!(
-        object.sections[0].fixups,
+        fixups(0),
         [
             fixup(1, Apply::X86Branch32, 7, -4),
             fixup(5, Apply::ImageRel32, 1, 4),
@@ -1145,12 +1156,16 @@ fn coff_object_relocations() {
             fixup(12, Apply::SecRel32, 8, 0),
         ]
     );
-    assert_eq!(object.sections[1].fixups, [fixup(0, Apply::Abs64, 7, 16), fixup(8, Apply::Abs32, 9, 0)]);
+    assert_eq!(fixups(1), [fixup(0, Apply::Abs64, 7, 16), fixup(8, Apply::Abs32, 9, 0)]);
     assert_eq!(
-        object.sections[4].fixups,
+        fixups(4),
         [fixup(0, Apply::ImageRel32, 4, 0), fixup(4, Apply::ImageRel32, 4, 4), fixup(8, Apply::ImageRel32, 6, 0)]
     );
-    assert!(object.sections[2].fixups.is_empty());
+    assert!(fixups(2).is_empty());
+    assert!(fixups(7).is_empty());
+    // One column, each section's a run of it in section order.
+    assert_eq!(object.fixups.len(), 9);
+    assert_eq!(object.sections[1].fixups, 4..6);
 }
 
 #[test]
@@ -1267,18 +1282,21 @@ fn short_import_members() {
     let shared = read(&short_import("ExitProcess", "KERNEL32.dll", 356, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME));
     assert_eq!(shared.name, "KERNEL32.dll");
     assert_eq!(shared.symbols.len(), 1);
-    assert_eq!(shared.symbols[0].name, "ExitProcess");
-    assert_eq!(shared.symbols[0].version.as_deref(), Some("356 ExitProcess"));
+    assert_eq!(shared.symbol_name(&shared.symbols[0]), "ExitProcess");
+    assert_eq!(shared.symbols[0].version, Some(0));
+    assert_eq!(shared.versions, ["356 ExitProcess"]);
+    assert_eq!(shared.version(&shared.symbols[0]), Some("356 ExitProcess"));
     assert_eq!(shared.symbols[0].kind, SymbolKind::Function);
     assert!(!shared.symbols[0].weak);
 
     let shared = read(&short_import("_f@8", "X.dll", 2, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_NAME_UNDECORATE));
-    assert_eq!(shared.symbols[0].version.as_deref(), Some("2 f"));
+    assert_eq!(shared.symbol_name(&shared.symbols[0]), "_f@8");
+    assert_eq!(shared.version(&shared.symbols[0]), Some("2 f"));
     let shared = read(&short_import("_g", "X.dll", 3, pe::IMPORT_OBJECT_DATA, pe::IMPORT_OBJECT_NAME_NO_PREFIX));
-    assert_eq!(shared.symbols[0].version.as_deref(), Some("3 g"));
+    assert_eq!(shared.version(&shared.symbols[0]), Some("3 g"));
     assert_eq!(shared.symbols[0].kind, SymbolKind::Data);
     let shared = read(&short_import("ord", "X.dll", 115, pe::IMPORT_OBJECT_CODE, pe::IMPORT_OBJECT_ORDINAL));
-    assert_eq!(shared.symbols[0].version.as_deref(), Some("#115"));
+    assert_eq!(shared.version(&shared.symbols[0]), Some("#115"));
 
     let error = pe.read("x.lib(x)", &short_import("h", "X.dll", 0, 3, 1), &NativeKind::Object).err().unwrap();
     assert!(error.contains("import type 3"), "{error}");
@@ -1297,23 +1315,19 @@ fn archive_index_names_members() {
     let NativeFile::Archive(archive) = pe.read("t.lib", &bytes, &NativeKind::Archive { whole: false }).unwrap() else {
         panic!("not read as an archive")
     };
-    let members: Vec<&str> = archive.members.iter().map(|it| it.name.as_str()).collect();
+    let members: Vec<&str> = archive.members.iter().map(|it| archive.name(it.name)).collect();
     assert_eq!(members, ["test.obj", "k32.dll"]);
     assert_eq!(&bytes[archive.members[1].bytes.clone()], &import[..]);
-    let mut index = archive.index.clone();
+    let mut index: Vec<(&str, u32)> =
+        archive.index.iter().map(|&(name, member)| (archive.name(name), member)).collect();
     index.sort();
-    assert_eq!(
-        index,
-        [
-            ("ExitProcess".to_owned(), 1),
-            ("__imp_ExitProcess".to_owned(), 1),
-            ("inline_fn".to_owned(), 0),
-            ("main_fn".to_owned(), 0),
-        ]
-    );
+    assert_eq!(index, [("ExitProcess", 1), ("__imp_ExitProcess", 1), ("inline_fn", 0), ("main_fn", 0)]);
     let member = &bytes[archive.members[0].bytes.clone()];
     let object = read_object(member);
     assert_eq!(object.groups.len(), 1);
+    // A member's sections are ranges of the member's own bytes.
+    let text = object.sections[0].data.bytes(member).unwrap().unwrap();
+    assert_eq!(text[5..9], 4u32.to_le_bytes());
 }
 
 #[test]
@@ -1330,11 +1344,15 @@ fn import_library_is_a_shared_per_dll() {
         panic!("not read as an import library")
     };
     assert_eq!(shared.name, "KERNEL32.dll");
-    let names: Vec<&str> = shared.symbols.iter().map(|it| it.name.as_str()).collect();
+    let names: Vec<&str> = shared.symbols.iter().map(|it| shared.symbol_name(it)).collect();
     assert_eq!(names, ["ExitProcess", "Sleep"]);
+    let versions: Vec<Option<&str>> = shared.symbols.iter().map(|it| shared.version(it)).collect();
+    assert_eq!(versions, [Some("1 ExitProcess"), Some("3 Sleep")]);
     assert_eq!(shared.more.len(), 1);
-    assert_eq!(shared.more[0].name, "USER32.dll");
-    assert_eq!(shared.more[0].symbols[0].version.as_deref(), Some("2 MessageBoxW"));
+    let user32 = &shared.more[0];
+    assert_eq!(user32.name, "USER32.dll");
+    assert_eq!(user32.symbol_name(&user32.symbols[0]), "MessageBoxW");
+    assert_eq!(user32.version(&user32.symbols[0]), Some("2 MessageBoxW"));
 
     let error = pe.read("x.dll", b"MZ\x90\0", &NativeKind::Shared { as_needed: true }).err().unwrap();
     assert!(error.contains("import library"), "{error}");

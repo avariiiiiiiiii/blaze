@@ -20,7 +20,7 @@ use blaze_ids::ContentId;
 
 use crate::{
     File, Mode,
-    store::{Entries, Shared, Table, mode_of},
+    store::{Shared, Snapshot, mode_of},
 };
 
 /// A handle on every node the [`Vfs`](crate::Vfs) has, by content ID: cheap to clone, `Send`
@@ -61,19 +61,14 @@ impl Reader {
     /// Hold it only while reading: a collection's old nodes are freed once the task it is in
     /// ends.
     pub fn pin(&self) -> Pinned<'_> {
-        let task = blaze_reclaim::enter();
-        // SAFETY: in a task, for as long as `Pinned` lives.
-        let table = unsafe { self.shared.table() };
-        Pinned { shared: &self.shared, table, _task: task }
+        Pinned { snapshot: self.shared.read() }
     }
 }
 
 /// The tree as it was when [`Reader::pin`] was called, read in place. Not `Send`: the task is
 /// the thread's.
 pub struct Pinned<'r> {
-    shared: &'r Shared,
-    table: &'r Table,
-    _task: blaze_reclaim::Guard,
+    snapshot: Snapshot<'r>,
 }
 
 impl Pinned<'_> {
@@ -93,28 +88,21 @@ impl Pinned<'_> {
         path: &str,
     ) -> Option<impl Iterator<Item = (&str, bool)> + '_> {
         let (node, _) = self.walk(root, path)?;
-        // SAFETY: reached through this table while pinned.
-        let shape = unsafe { self.table.shape(node) };
+        let table = self.snapshot.table();
+        let shape = table.shape(node);
         if !shape.is_dir() {
             return None;
         }
-        // SAFETY: a directory's shape, as above.
-        let entries: Entries<'_> = unsafe { self.table.entries(shape) };
-        let names = &self.shared.names;
-        Some((0..entries.len()).map(move |at| {
-            // SAFETY: an entry's name was interned before its directory was published.
-            let name = unsafe { names.get(entries.names[at]) };
-            // SAFETY: names are interned only from `&str`s.
-            (unsafe { std::str::from_utf8_unchecked(name) }, entries.is_dir(at))
-        }))
+        let entries = table.entries(shape);
+        let names = self.snapshot.names();
+        Some((0..entries.len()).map(move |at| (names.str(entries.names[at]), entries.is_dir(at))))
     }
 
     /// The node `path` names under the directory `root`, and its mode, as the tree's `entry`.
     fn walk(&self, root: ContentId, path: &str) -> Option<(u32, Mode)> {
-        let table = self.table;
-        let root = table.find(&root).ok()?;
-        // SAFETY: reached through the index while pinned; so is every node below.
-        let mut shape = unsafe { table.shape(root) };
+        let table = self.snapshot.table();
+        let root = table.find(&root)?;
+        let mut shape = table.shape(root);
         if !shape.is_dir() {
             return None;
         }
@@ -126,22 +114,18 @@ impl Pinned<'_> {
             if !shape.is_dir() {
                 return None;
             }
-            // SAFETY: as above.
-            let entries = unsafe { table.entries(shape) };
-            let at = entries.find(&self.shared.names, name.as_bytes())?;
+            let entries = table.entries(shape);
+            let at = entries.find(self.snapshot.names(), name.as_bytes())?;
             (node, mode) = (entries.nodes[at], mode_of(entries.modes[at]));
-            // SAFETY: as above.
-            shape = unsafe { table.shape(node) };
+            shape = table.shape(node);
         }
         Some((node, mode))
     }
 
     /// A file node's ID and bytes; `None` for a directory.
     fn blob(&self, node: u32) -> Option<(&ContentId, &Arc<[u8]>)> {
-        // SAFETY: reached through this table while pinned.
-        unsafe {
-            let shape = self.table.shape(node);
-            (!shape.is_dir()).then(|| (self.table.id(node), self.table.blob(shape)))
-        }
+        let table = self.snapshot.table();
+        let shape = table.shape(node);
+        (!shape.is_dir()).then(|| (table.id(node), table.blob(shape)))
     }
 }

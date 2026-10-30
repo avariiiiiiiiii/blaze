@@ -31,7 +31,8 @@ pub(super) fn print_item_tree(
         p.print_mod_item(*item);
     }
 
-    let mut s = p.buf.trim_end_matches('\n').to_owned();
+    let mut s = p.buf;
+    s.truncate(s.trim_end_matches('\n').len());
     s.push('\n');
     s
 }
@@ -66,7 +67,7 @@ impl Printer<'_> {
         wln!(self);
         f(self);
         self.indent_level -= 1;
-        self.buf = self.buf.trim_end_matches('\n').to_owned();
+        self.buf.truncate(self.buf.trim_end_matches('\n').len());
     }
 
     /// Ensures that a blank line is output before the next text.
@@ -313,7 +314,9 @@ impl Write for Printer<'_> {
                     Some('\n') | None => {}
                     _ => self.buf.push('\n'),
                 }
-                self.buf.push_str(&"    ".repeat(self.indent_level));
+                for _ in 0..self.indent_level {
+                    self.buf.push_str("    ");
+                }
                 self.needs_indent = false;
             }
 

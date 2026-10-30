@@ -1019,8 +1019,11 @@ pub fn answer(db: &dyn SourceDatabase, req: SubRequest) -> SubResponse {
                         file_id: span::EditionedFileId::from_raw(file_id),
                         ast_id: span::ErasedFileAstId::from_raw(ast_id),
                     },
-                    // SAFETY: We only receive spans from the server. If someone mess up the communication UB can happen,
-                    // but that will be their problem.
+                    // SAFETY: `from_u32` asks for a value `into_u32` gave for a context of this database,
+                    // which the proc-macro server echoes from the spans blaze sent it; a made-up value (a
+                    // buggy or hostile server) gives a panic or another context's hygiene data, never UB,
+                    // since `SyntaxContext::id` checks salsa's bound and salsa's table checks page, slot
+                    // and type.
                     ctx: unsafe { SyntaxContext::from_u32(ctx) },
                 };
 
@@ -1066,8 +1069,11 @@ pub fn answer(db: &dyn SourceDatabase, req: SubRequest) -> SubResponse {
                         file_id: span::EditionedFileId::from_raw(file_id),
                         ast_id: span::ErasedFileAstId::from_raw(ast_id),
                     },
-                    // SAFETY: We only receive spans from the server. If someone mess up the communication UB can happen,
-                    // but that will be their problem.
+                    // SAFETY: `from_u32` asks for a value `into_u32` gave for a context of this database,
+                    // which the proc-macro server echoes from the spans blaze sent it; a made-up value (a
+                    // buggy or hostile server) gives a panic or another context's hygiene data, never UB,
+                    // since `SyntaxContext::id` checks salsa's bound and salsa's table checks page, slot
+                    // and type.
                     ctx: unsafe { SyntaxContext::from_u32(ctx) },
                 };
 

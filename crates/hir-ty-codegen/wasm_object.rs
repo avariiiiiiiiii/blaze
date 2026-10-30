@@ -12,6 +12,8 @@
 //! hand because relocations are offsets into them, and the reloc sections because it has no
 //! encoder for them.
 
+#![forbid(unsafe_code)]
+
 use cranelift_object::object::{
     self, Object, ObjectSection, ObjectSymbol, RelocationTarget, SectionIndex, SectionKind,
     SymbolIndex, SymbolKind,

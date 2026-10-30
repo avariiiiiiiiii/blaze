@@ -1,7 +1,6 @@
 //! Braces around a value and around one import.
 
-use super::compiletest;
-use crate::tests::ui_with;
+use crate::tests::ui;
 
 #[test]
 fn braces_around_an_argument_are_linted_and_a_borrowed_block_is_not() {
@@ -52,7 +51,7 @@ LL +     consume(a.b);
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui_with("unused_braces_borrow.rs", "2015", source, &compiletest(true)), expected);
+    assert_eq!(ui("unused_braces_borrow.rs", "2015", source), expected);
 }
 
 /// A const argument needs its braces unless it is a literal written where it is.
@@ -97,7 +96,7 @@ LL +     let _: A<7>;
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui_with("unused_braces.rs", "2015", source, &compiletest(true)), expected);
+    assert_eq!(ui("unused_braces.rs", "2015", source), expected);
 }
 
 #[test]
@@ -126,7 +125,7 @@ impl Foo {
 
 fn main() {}
 "#;
-    assert_eq!(ui_with("const-local-var.rs", "2015", source, &compiletest(true)), "");
+    assert_eq!(ui("const-local-var.rs", "2015", source), "");
 }
 
 #[test]
@@ -158,5 +157,5 @@ LL | #![deny(unused_import_braces)]
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui_with("lint-unnecessary-import-braces.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("lint-unnecessary-import-braces.rs", "2015", source), expected);
 }

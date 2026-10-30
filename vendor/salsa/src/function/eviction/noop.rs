@@ -2,7 +2,9 @@
 //!
 //! This is the default eviction policy when no LRU capacity is specified.
 
-use crate::{Id, function::EvictionPolicy};
+use std::num::NonZeroUsize;
+
+use crate::function::EvictionPolicy;
 
 /// No eviction - cache grows unbounded.
 pub struct NoopEviction;
@@ -13,11 +15,10 @@ impl EvictionPolicy for NoopEviction {
     }
 
     #[inline(always)]
-    fn record_use(&self, _id: Id) {}
-
-    #[inline(always)]
     fn set_capacity(&mut self, _capacity: usize) {}
 
     #[inline(always)]
-    fn for_each_evicted(&mut self, _cb: impl FnMut(Id)) {}
+    fn capacity(&self) -> Option<NonZeroUsize> {
+        None
+    }
 }

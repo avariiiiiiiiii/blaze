@@ -80,7 +80,7 @@ use hir_ty_mir::mir::is_by_move_coroutine;
 use self::debuginfo::{DebugContext, FunctionDebug, LineRow, SlotPlaces, VariableDebug};
 use self::fragment::{
     Code, CompiledFunction, CompiledStatic, DataRequest, FuncRequest, FuncTarget, Named, Recorder,
-    Requests, TextPart, Variable,
+    Reloc as CodeReloc, RelocName, Relocs, Requests, TextPart, Variable,
 };
 use self::unwind::{FunctionUnwind, UnwindContext};
 use self::vtable::{Slot, Upcast, VtableLayout};
@@ -194,7 +194,7 @@ mod wasm_object;
 pub mod watch;
 mod x86;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CodegenError {
     /// The function uses something this backend can't compile yet; fall back to rustc.
     Unsupported(String),
@@ -2482,20 +2482,13 @@ impl Resolved {
         }
     }
 
-    fn reloc(&self, reloc: &ModuleReloc, own: FuncId) -> ModuleReloc {
+    fn reloc(&self, reloc: CodeReloc, own: FuncId) -> (ModuleReloc, Option<u32>) {
         let name = match reloc.name {
-            ModuleRelocTarget::User { namespace: 0, index } => {
-                ModuleRelocTarget::user(0, self.funcs[index as usize].as_u32())
-            }
-            ModuleRelocTarget::User { index, .. } => {
-                ModuleRelocTarget::user(1, self.datas[index as usize].as_u32())
-            }
-            ModuleRelocTarget::FunctionOffset(_, offset) => {
-                ModuleRelocTarget::FunctionOffset(own, offset)
-            }
-            ref other => other.clone(),
+            RelocName::Func(index) => RelocName::Func(self.funcs[index as usize].as_u32()),
+            RelocName::Data(index) => RelocName::Data(self.datas[index as usize].as_u32()),
+            other => other,
         };
-        ModuleReloc { name, ..reloc.clone() }
+        (CodeReloc { name, ..reloc }.module(own), reloc.elf_type)
     }
 }
 
@@ -2569,7 +2562,7 @@ const SINGLE_PASS: usize = 50_000;
 const CHAINED: usize = 256;
 
 /// A relocation of a function that Cranelift has no kind for, which the object is given
-/// once Cranelift has written it: see [`Code::elf_types`].
+/// once Cranelift has written it: see [`CodeReloc::elf_type`].
 struct ElfReloc {
     func: FuncId,
     reloc: ModuleReloc,
@@ -3629,7 +3622,7 @@ fn coroutine_layout_line<'db>(
     let Expr::Closure {
         closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Fn, .. },
         ..
-    } = &store[closure.expr]
+    } = store.expr(closure.expr)
     else {
         return None;
     };
@@ -4782,28 +4775,24 @@ fn compile_as<'db>(
         Some((text, syms)) => {
             let assembled = asm::assemble(&isa.triple().to_string(), &text)
                 .map_err(CodegenError::Unsupported)?;
-            let relocs = assembled.relocs.iter().map(|named| {
-                let name = syms.get(named.operand as usize).cloned().flatten()?;
-                Some(ModuleReloc {
+            let mut relocs = Relocs::with_capacity(assembled.relocs.len());
+            for named in &assembled.relocs {
+                let Some(name) = syms.get(named.operand as usize).cloned().flatten() else {
+                    unsupported!("inline assembly that names a symbol");
+                };
+                let reloc = ModuleReloc {
                     offset: named.offset,
                     kind: named.kind,
                     name,
                     addend: named.addend,
-                })
-            });
-            let Some(relocs) = relocs.collect() else {
-                unsupported!("inline assembly that names a symbol");
-            };
+                };
+                relocs.push_module(&reloc, named.elf_type)?;
+            }
             Code {
                 signature: ctx.func.signature.clone(),
                 bytes: assembled.code.clone(),
                 align: 16,
                 relocs,
-                elf_types: assembled
-                    .relocs
-                    .iter()
-                    .filter_map(|named| Some((named.offset, named.elf_type?)))
-                    .collect(),
                 unwind: None,
                 lines: Vec::new(),
                 slots: SlotPlaces::default(),
@@ -5289,20 +5278,12 @@ fn emit_with(
         let Some(compiled) = ctx.compiled_code() else {
             return Err("no compiled code".to_owned());
         };
-        // Relocations against the function itself get its id when it is stitched. One below
-        // `u32::MAX` — `from_u32(u32::MAX)` asserts the reserved value away in debug builds.
-        let own = FuncId::from_u32(u32::MAX - 1);
         Ok(Code {
             signature: ctx.func.signature.clone(),
             bytes: compiled.buffer.data().to_vec(),
             align: compiled.buffer.alignment.into(),
-            relocs: compiled
-                .buffer
-                .relocs()
-                .iter()
-                .map(|reloc| ModuleReloc::from_mach_reloc(reloc, &ctx.func, own))
-                .collect(),
-            elf_types: Vec::new(),
+            relocs: Relocs::of_mach(compiled.buffer.relocs(), &ctx.func)
+                .map_err(|e| e.to_string())?,
             unwind: FunctionUnwind::of(isa, ctx)?,
             lines: LineRow::of_ranges(
                 compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
@@ -5336,8 +5317,7 @@ fn emit_wasm(func: &cranelift_codegen::ir::Function, calls: Calls) -> Result<Cod
         signature: func.signature.clone(),
         bytes,
         align: 1,
-        relocs,
-        elf_types: Vec::new(),
+        relocs: Relocs::of_module(&relocs, &[])?,
         unwind: None,
         lines: Vec::new(),
         slots: SlotPlaces::default(),
@@ -6900,7 +6880,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
     }
 
-    fn shape_code(&mut self, id: FuncId, code: &Code, relocs: &[ModuleReloc]) {
+    fn shape_code(&mut self, id: FuncId, code: &Code, relocs: &[(ModuleReloc, Option<u32>)]) {
         use std::hash::{Hash, Hasher};
         use std::io::Write;
         if self.shapes.is_none() {
@@ -6910,7 +6890,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let mut hasher = rustc_hash::FxHasher::default();
         code.bytes.hash(&mut hasher);
         let mut targets = Vec::new();
-        for reloc in relocs {
+        for (reloc, _) in relocs {
             (reloc.offset, format!("{:?}", reloc.kind), reloc.addend).hash(&mut hasher);
             targets.push(match reloc.name {
                 ModuleRelocTarget::User { namespace: 0, index } => {
@@ -6937,23 +6917,20 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
     }
 
-    fn define_code(&mut self, id: FuncId, code: &Code, relocs: &[ModuleReloc]) -> Result<()> {
-        if code.elf_types.is_empty() {
-            self.module.define_function_bytes(id, code.align, &code.bytes, relocs)?;
-        } else {
-            // Cranelift is given the relocations it has a kind for, and `finish` adds the
-            // others to the object.
-            let elf_type = |reloc: &ModuleReloc| {
-                code.elf_types.iter().find(|(offset, _)| *offset == reloc.offset).map(|it| it.1)
-            };
-            let (by_type, plain): (Vec<_>, Vec<_>) =
-                relocs.iter().cloned().partition(|reloc| elf_type(reloc).is_some());
-            self.module.define_function_bytes(id, code.align, &code.bytes, &plain)?;
-            self.elf_relocs.extend(by_type.into_iter().filter_map(|reloc| {
-                let r_type = elf_type(&reloc)?;
-                Some(ElfReloc { func: id, reloc, r_type })
-            }));
-        }
+    fn define_code(
+        &mut self,
+        id: FuncId,
+        code: &Code,
+        relocs: &[(ModuleReloc, Option<u32>)],
+    ) -> Result<()> {
+        // Cranelift is given the relocations it has a kind for, and `finish` adds the others
+        // to the object.
+        let plain: Vec<ModuleReloc> =
+            relocs.iter().filter(|it| it.1.is_none()).map(|it| it.0.clone()).collect();
+        self.module.define_function_bytes(id, code.align, &code.bytes, &plain)?;
+        self.elf_relocs.extend(relocs.iter().filter_map(|(reloc, r_type)| {
+            Some(ElfReloc { func: id, reloc: reloc.clone(), r_type: (*r_type)? })
+        }));
         if let Some(unwind) = &code.unwind {
             self.unwind
                 .add_function(&mut self.module, id, unwind)
@@ -6964,13 +6941,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// Compiles a function built here, whose IR names what it uses by the ids of the module.
     fn define_shim(&mut self, id: FuncId, ctx: &mut cranelift_codegen::Context) -> Result<()> {
-        let mut code = emit(ctx)?;
-        for reloc in &mut code.relocs {
-            if let ModuleRelocTarget::FunctionOffset(_, offset) = reloc.name {
-                reloc.name = ModuleRelocTarget::FunctionOffset(id, offset);
-            }
-        }
-        let relocs = std::mem::take(&mut code.relocs);
+        let code = emit_cached(ctx)?;
+        let relocs: Vec<_> = code.relocs.iter().map(|it| (it.module(id), it.elf_type)).collect();
         self.define_code(id, &code, &relocs)
     }
 
@@ -8301,13 +8273,32 @@ struct Layouts<'cx, 'db> {
 
 /// What [`Layouts`] lends from, owned by `build` for the whole of it and freed after.
 struct KeptLayouts {
-    asked: typed_arena::Arena<Arc<Layout>>,
-    variants: typed_arena::Arena<Layout>,
+    asked: Lent<Arc<Layout>>,
+    variants: Lent<Box<Layout>>,
 }
 
 impl KeptLayouts {
     fn new() -> Self {
-        Self { asked: typed_arena::Arena::new(), variants: typed_arena::Arena::new() }
+        Self { asked: Lent(Default::default()), variants: Lent(Default::default()) }
+    }
+}
+
+/// Values lent for as long as the list lives. Each is behind a pointer of its own, so the
+/// list growing moves the pointers, never what they point at.
+struct Lent<P>(std::cell::RefCell<Vec<P>>);
+
+/// A pointer whose target stays where it is when the pointer moves.
+trait Stable: std::ops::Deref {}
+impl<T> Stable for Arc<T> {}
+impl<T> Stable for Box<T> {}
+
+impl<P: Stable> Lent<P> {
+    fn alloc(&self, value: P) -> &P::Target {
+        let at: *const P::Target = &*value;
+        self.0.borrow_mut().push(value);
+        // SAFETY: `P` is `Stable`, so `at` stays valid while `value` is in the list, and
+        // nothing is taken out of the list before it is dropped, which `&self` outlives.
+        unsafe { &*at }
     }
 }
 
@@ -12634,7 +12625,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         };
         let kept: &'cx KeptLayouts = self.layouts.kept;
         let layout: &'cx Layout =
-            kept.variants.alloc(Layout::for_variant(layout, RustcEnumVariantIdx(index)));
+            kept.variants.alloc(Box::new(Layout::for_variant(layout, RustcEnumVariantIdx(index))));
         Ok(Some((layout, tag_value.map(|it| (offset, tag_ty, it)))))
     }
 
@@ -17378,8 +17369,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         dst_ty: Ty<'db>,
     ) -> Result<()> {
         if let Some(neon) = name.strip_prefix("aarch64.neon.")
-            && self.neon_lanes(neon, args, dst)?
+            && (self.neon_vector(neon, args, dst)? || self.neon_lanes(neon, args, dst)?)
         {
+            return Ok(());
+        }
+        if self.x86_vector(name, args, dst)? {
             return Ok(());
         }
         if name.starts_with("aarch64.sve.")
@@ -19700,7 +19694,7 @@ mod tests {
 
     /// A layout kept for a build is the database's own, not a copy: lent from the `Arc` the
     /// query gave, however many more the build keeps after it. Seeded layouts of every
-    /// integer width, more than the arena's first chunk holds.
+    /// integer width, enough for the list to grow many times.
     #[test]
     fn a_kept_layout_is_the_one_the_query_gave() {
         use super::{Arc, KeptLayouts, Layout, Primitive, Scalar};

@@ -46,7 +46,8 @@ const ISSUE_NOTE: &str = concat!(
     mut_ref_issue!(),
     "> for more information"
 );
-const UPGRADE_NOTE: &str = concat!(
+/// rustc's note on every feature-gate error (`SuggestUpgradeCompiler`).
+pub(crate) const UPGRADE_NOTE: &str = concat!(
     "this compiler was built on ",
     built_on!(),
     "; consider upgrading it if it is out of date"

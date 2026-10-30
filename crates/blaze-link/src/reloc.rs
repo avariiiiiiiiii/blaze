@@ -2,7 +2,10 @@
 //!
 //! Every [`Apply`] but [`Apply::Native`] is computed and written here, for x86-64 and
 //! AArch64; a value that does not fit its field is an error naming the field, never a
-//! truncation.
+//! truncation. [`apply`] is one `match` on the kind with no allocation: a failure is a
+//! [`Bad`] of a few words, made into words only when the link reports it.
+
+use std::fmt;
 
 use blaze_codegen::{Arch, RelocKind};
 
@@ -10,6 +13,72 @@ use crate::{
     Format,
     model::{Apply, Tls},
 };
+
+/// Why a relocation can't be written. `Copy` and 24 bytes: the success path builds nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Bad {
+    PastEnd { apply: Apply, need: u8 },
+    Signed32(i64),
+    Unsigned32(u64),
+    NoTls,
+    OutsideTls,
+    SecRelNotTls,
+    Section16,
+    TlsOffsetIn(Format, Arch),
+    A64Literal,
+    Branch { offset: i64, bits: u8 },
+    Adrp(i64),
+    Adr(i64),
+    Lo12Insn(u32),
+    Lo12Align { low: u64, shift: u8 },
+    TpRange(i64),
+    Native,
+    WasmTls,
+}
+
+const _: () = assert!(size_of::<Bad>() <= 24);
+
+impl fmt::Display for Bad {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Bad::PastEnd { apply, need } => {
+                write!(f, "a {apply:?} relocation {need} bytes wide past the end of its piece")
+            }
+            Bad::Signed32(value) => write!(f, "{value:#x} does not fit a signed 32-bit field"),
+            Bad::Unsigned32(value) => write!(f, "{value:#x} does not fit an unsigned 32-bit field"),
+            Bad::NoTls => f.write_str("a thread-local relocation in an image with no thread-locals"),
+            Bad::OutsideTls => f.write_str("a TLS offset outside TLS"),
+            Bad::SecRelNotTls => f.write_str(
+                "a section-relative relocation to what is not thread-local: only `.tls`'s are kept in the image",
+            ),
+            Bad::Section16 => f.write_str("a section index relocation outside debug info, which is dropped"),
+            Bad::TlsOffsetIn(format, arch) => write!(
+                f,
+                "a thread-local offset in {format:?} {arch:?} code: this target reaches thread-locals \
+                 through descriptors (TLV relocations)"
+            ),
+            Bad::A64Literal => f.write_str("an AArch64 thread-local offset is a 64-bit literal"),
+            Bad::Branch { offset, bits } => write!(
+                f,
+                "an AArch64 branch of {offset:#x} bytes, past its {bits}-bit field's reach of {:#x}",
+                1i64 << (bits + 1)
+            ),
+            Bad::Adrp(pages) => write!(f, "an ADRP of {pages:#x} pages, past its 4 GiB reach"),
+            Bad::Adr(offset) => write!(f, "an ADR of {offset:#x} bytes, past its 1 MiB reach"),
+            Bad::Lo12Insn(insn) => {
+                write!(f, "a low-12-bit relocation in {insn:#010x}, neither an ADD nor a load or store")
+            }
+            Bad::Lo12Align { low, shift } => write!(
+                f,
+                "a low-12-bit offset {low:#x} not aligned to the {}-byte access it is in",
+                1u32 << shift
+            ),
+            Bad::TpRange(off) => write!(f, "a thread-pointer offset {off:#x} past 16 MiB"),
+            Bad::Native => f.write_str("a native relocation is the format writer's to apply"),
+            Bad::WasmTls => f.write_str("thread-locals of wasm are the wasm writer's"),
+        }
+    }
+}
 
 /// What a relocation's value is made of, resolved by the caller.
 #[derive(Clone, Copy, Debug)]
@@ -130,13 +199,13 @@ pub(crate) fn is_tls(apply: Apply) -> bool {
 /// The offset of the thread-local at `s` from the thread pointer: ELF variant II on
 /// x86-64 (the block ends at the pointer), variant I on AArch64 (a 16-byte TCB, then the
 /// block at its alignment).
-pub(crate) fn tp_offset(arch: Arch, tls: Tls, s: u64) -> Result<i64, String> {
-    let at = s.checked_sub(tls.addr).ok_or("a thread-local offset of a symbol outside TLS")?;
+pub(crate) fn tp_offset(arch: Arch, tls: Tls, s: u64) -> Result<i64, Bad> {
+    let at = s.checked_sub(tls.addr).ok_or(Bad::OutsideTls)?;
     let align = tls.align.max(1);
     Ok(match arch {
         Arch::X86_64 => at as i64 - align_up(tls.size, align) as i64,
         Arch::Aarch64 => (align_up(16, align) + at) as i64,
-        Arch::Wasm32 => return Err("thread-locals of wasm are the wasm writer's".to_owned()),
+        Arch::Wasm32 => return Err(Bad::WasmTls),
     })
 }
 
@@ -146,15 +215,16 @@ pub(crate) fn align_up(value: u64, align: u64) -> u64 {
 }
 
 /// Writes `apply`'s value at the start of `field`.
-pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), String> {
+pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Bad> {
     let need = width(apply);
     if field.len() < need {
-        return Err(format!("a {apply:?} relocation {need} bytes wide past the end of its piece"));
+        return Err(Bad::PastEnd { apply, need: need as u8 });
     }
     let Ctx { s, a, p, g, m, base, .. } = *ctx;
     let sa = s.wrapping_add(a as u64);
+    let ga = g.wrapping_add(a as u64);
     let pc = |to: u64| to.wrapping_sub(p) as i64;
-    let tls = || ctx.tls.ok_or("a thread-local relocation in an image with no thread-locals");
+    let tls = || ctx.tls.ok_or(Bad::NoTls);
     match apply {
         Apply::Abs64 => put(field, sa.to_le_bytes()),
         Apply::Abs32 => put(field, fits_u32(sa)?.to_le_bytes()),
@@ -166,29 +236,25 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Str
         Apply::ImageRel32 => put(field, fits_u32(sa.wrapping_sub(base))?.to_le_bytes()),
         Apply::SecRel32 => {
             let tls = tls()?;
-            let at = sa.checked_sub(tls.addr).filter(|it| *it <= tls.size).ok_or(
-                "a section-relative relocation to what is not thread-local: only `.tls`'s are \
-                 kept in the image",
-            )?;
+            let at = sa.checked_sub(tls.addr).filter(|it| *it <= tls.size).ok_or(Bad::SecRelNotTls)?;
             put(field, fits_u32(at)?.to_le_bytes())
         }
-        Apply::Section16 => {
-            return Err("a section index relocation outside debug info, which is dropped".into());
-        }
-        Apply::X86GotPcRel32 | Apply::X86GotTpOff32 | Apply::X86TlsGd32 | Apply::GotRel32 => {
-            put(field, fits_i32(pc(g.wrapping_add(a as u64)))?.to_le_bytes())
-        }
-        Apply::TlvRel32 => put(field, fits_i32(pc(g.wrapping_add(a as u64)))?.to_le_bytes()),
+        Apply::Section16 => return Err(Bad::Section16),
+        Apply::X86GotPcRel32
+        | Apply::X86GotTpOff32
+        | Apply::X86TlsGd32
+        | Apply::GotRel32
+        | Apply::TlvRel32 => put(field, fits_i32(pc(ga))?.to_le_bytes()),
         Apply::X86TpOff32 => {
             let off = tp_offset(ctx.arch, tls()?, s)? + a;
             put(field, fits_i32(off)?.to_le_bytes())
         }
         Apply::DtpOff32 => {
-            let off = s.checked_sub(tls()?.addr).ok_or("a TLS offset outside TLS")? as i64 + a;
+            let off = s.checked_sub(tls()?.addr).ok_or(Bad::OutsideTls)? as i64 + a;
             put(field, fits_i32(off)?.to_le_bytes())
         }
         Apply::DtpOff64 => {
-            let off = s.checked_sub(tls()?.addr).ok_or("a TLS offset outside TLS")? as i64 + a;
+            let off = s.checked_sub(tls()?.addr).ok_or(Bad::OutsideTls)? as i64 + a;
             put(field, off.to_le_bytes())
         }
         Apply::TpOff64 => put(field, (tp_offset(ctx.arch, tls()?, s)? + a).to_le_bytes()),
@@ -199,21 +265,16 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Str
             }
             (Format::Elf, Arch::Aarch64) => {
                 if field.len() < 8 {
-                    return Err("an AArch64 thread-local offset is a 64-bit literal".into());
+                    return Err(Bad::A64Literal);
                 }
                 let off = tp_offset(ctx.arch, tls()?, s)? + a;
                 put(field, off.to_le_bytes())
             }
             (Format::Pe, _) => {
-                let at = s.checked_sub(tls()?.addr).ok_or("a TLS offset outside TLS")?;
+                let at = s.checked_sub(tls()?.addr).ok_or(Bad::OutsideTls)?;
                 put(field, fits_u32(at.wrapping_add(a as u64))?.to_le_bytes())
             }
-            (format, arch) => {
-                return Err(format!(
-                    "a thread-local offset in {format:?} {arch:?} code: this target reaches \
-                     thread-locals through descriptors (TLV relocations)"
-                ));
-            }
+            (format, arch) => return Err(Bad::TlsOffsetIn(format, arch)),
         },
         Apply::A64Call26 | Apply::A64Jump26 => a64_branch(field, pc(sa), 26)?,
         Apply::A64CondBr19 => a64_branch(field, pc(sa), 19)?,
@@ -227,39 +288,40 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Str
             write32(field, (insn & !(0xffff << 5)) | (imm << 5));
         }
         Apply::A64GotPage21 | Apply::A64TlsIePage21 | Apply::A64TlsDescPage21 | Apply::TlvPage21 => {
-            a64_adrp(field, g.wrapping_add(a as u64), p)?
+            a64_adrp(field, ga, p)?
         }
         Apply::A64GotLo12 | Apply::A64TlsIeLo12 | Apply::A64TlsDescLo12 | Apply::TlvLo12 => {
-            a64_lo12(field, g.wrapping_add(a as u64), 3)?
+            a64_lo12(field, ga, 3)?
         }
-        Apply::A64TlsDescAdd12 => a64_lo12(field, g.wrapping_add(a as u64), 0)?,
+        Apply::A64TlsDescAdd12 => a64_lo12(field, ga, 0)?,
         Apply::A64TlsDescCall => {}
         Apply::A64TpHi12 | Apply::A64TpLo12 => {
             let off = tp_offset(ctx.arch, tls()?, s)? + a;
             if !(0..1 << 24).contains(&off) {
-                return Err(format!("a thread-pointer offset {off:#x} past 16 MiB"));
+                return Err(Bad::TpRange(off));
             }
             let imm = if apply == Apply::A64TpHi12 { off >> 12 } else { off } as u32 & 0xfff;
             let insn = read32(field);
             write32(field, (insn & !(0xfff << 10)) | (imm << 10));
         }
-        Apply::Native(_) => {
-            return Err("a native relocation is the format writer's to apply".to_owned());
-        }
+        Apply::Native(_) => return Err(Bad::Native),
     }
     Ok(())
 }
 
+#[inline(always)]
 fn put<const N: usize>(field: &mut [u8], bytes: [u8; N]) {
     field[..N].copy_from_slice(&bytes);
 }
 
-fn fits_i32(value: i64) -> Result<i32, String> {
-    i32::try_from(value).map_err(|_| format!("{value:#x} does not fit a signed 32-bit field"))
+#[inline(always)]
+fn fits_i32(value: i64) -> Result<i32, Bad> {
+    i32::try_from(value).map_err(|_| Bad::Signed32(value))
 }
 
-fn fits_u32(value: u64) -> Result<u32, String> {
-    u32::try_from(value).map_err(|_| format!("{value:#x} does not fit an unsigned 32-bit field"))
+#[inline(always)]
+fn fits_u32(value: u64) -> Result<u32, Bad> {
+    u32::try_from(value).map_err(|_| Bad::Unsigned32(value))
 }
 
 fn read32(field: &[u8]) -> u32 {
@@ -271,13 +333,10 @@ fn write32(field: &mut [u8], insn: u32) {
 }
 
 /// A `B`/`BL` (26 bits), `B.cond`/`CBZ`/`LDR literal` (19) or `TBZ` (14) offset.
-fn a64_branch(field: &mut [u8], offset: i64, bits: u32) -> Result<(), String> {
+fn a64_branch(field: &mut [u8], offset: i64, bits: u32) -> Result<(), Bad> {
     let reach = 1i64 << (bits + 1);
     if offset & 3 != 0 || !(-reach..reach).contains(&offset) {
-        return Err(format!(
-            "an AArch64 branch of {offset:#x} bytes, past its {bits}-bit field's reach of \
-             {reach:#x}"
-        ));
+        return Err(Bad::Branch { offset, bits: bits as u8 });
     }
     let insn = read32(field);
     let imm = ((offset >> 2) as u32) & ((1 << bits) - 1);
@@ -296,18 +355,18 @@ fn a64_adr_fields(insn: u32, imm: i64) -> u32 {
     (insn & !((3 << 29) | (0x7_ffff << 5))) | ((imm & 3) << 29) | ((imm >> 2) << 5)
 }
 
-fn a64_adrp(field: &mut [u8], to: u64, p: u64) -> Result<(), String> {
+fn a64_adrp(field: &mut [u8], to: u64, p: u64) -> Result<(), Bad> {
     let pages = ((to & !0xfff) as i64).wrapping_sub((p & !0xfff) as i64) >> 12;
     if !(-(1 << 20)..1 << 20).contains(&pages) {
-        return Err(format!("an ADRP of {pages:#x} pages, past its 4 GiB reach"));
+        return Err(Bad::Adrp(pages));
     }
     write32(field, a64_adr_fields(read32(field), pages));
     Ok(())
 }
 
-fn a64_adr(field: &mut [u8], offset: i64) -> Result<(), String> {
+fn a64_adr(field: &mut [u8], offset: i64) -> Result<(), Bad> {
     if !(-(1 << 20)..1 << 20).contains(&offset) {
-        return Err(format!("an ADR of {offset:#x} bytes, past its 1 MiB reach"));
+        return Err(Bad::Adr(offset));
     }
     write32(field, a64_adr_fields(read32(field), offset));
     Ok(())
@@ -315,7 +374,7 @@ fn a64_adr(field: &mut [u8], offset: i64) -> Result<(), String> {
 
 /// The shift of a 12-bit low-offset field, from the instruction it is in: 0 for `ADD`, the
 /// access size's log for `LDR`/`STR` (immediate, unsigned offset), 4 for a 128-bit one.
-pub(crate) fn a64_lo12_shift(insn: u32) -> Result<u8, String> {
+pub(crate) fn a64_lo12_shift(insn: u32) -> Result<u8, Bad> {
     if insn & 0x1f00_0000 == 0x1100_0000 {
         return Ok(0);
     }
@@ -325,18 +384,15 @@ pub(crate) fn a64_lo12_shift(insn: u32) -> Result<u8, String> {
         let opc = (insn >> 22) & 3;
         return Ok(if vector && size == 0 && opc >= 2 { 4 } else { size });
     }
-    Err(format!("a low-12-bit relocation in {insn:#010x}, neither an ADD nor a load or store"))
+    Err(Bad::Lo12Insn(insn))
 }
 
-fn a64_lo12(field: &mut [u8], to: u64, shift: u8) -> Result<(), String> {
+fn a64_lo12(field: &mut [u8], to: u64, shift: u8) -> Result<(), Bad> {
     let insn = read32(field);
     let shift = if shift == u8::MAX { a64_lo12_shift(insn)? } else { shift };
     let low = to & 0xfff;
     if low & ((1 << shift) - 1) != 0 {
-        return Err(format!(
-            "a low-12-bit offset {low:#x} not aligned to the {}-byte access it is in",
-            1 << shift
-        ));
+        return Err(Bad::Lo12Align { low, shift });
     }
     let imm = (low >> shift) as u32;
     write32(field, (insn & !(0xfff << 10)) | (imm << 10));
@@ -357,7 +413,8 @@ mod tests {
         apply(Apply::X86Branch32, &ctx(Arch::X86_64, 0x2000, -4, 0x1001), &mut code[1..]).unwrap();
         assert_eq!(i32::from_le_bytes(code[1..].try_into().unwrap()), 0x2000 - 4 - 0x1001);
         let far = apply(Apply::X86Branch32, &ctx(Arch::X86_64, 1 << 40, 0, 0), &mut code[1..]);
-        assert!(far.unwrap_err().contains("signed 32-bit"));
+        assert_eq!(far, Err(Bad::Signed32(1i64 << 40)));
+        assert!(far.unwrap_err().to_string().contains("signed 32-bit"));
     }
 
     #[test]
@@ -423,5 +480,23 @@ mod tests {
         let got = Ctx { g: 0x3000, ..ctx(Arch::X86_64, 0, -4, 0x1004) };
         apply(Apply::X86GotPcRel32, &got, &mut field).unwrap();
         assert_eq!(i32::from_le_bytes(field), 0x3000 - 4 - 0x1004);
+    }
+
+    #[test]
+    fn failures_name_the_field_once_reported() {
+        let mut short = [0u8; 2];
+        let past = apply(Apply::Abs64, &ctx(Arch::X86_64, 0, 0, 0), &mut short).unwrap_err();
+        assert_eq!(past, Bad::PastEnd { apply: Apply::Abs64, need: 8 });
+        assert!(past.to_string().contains("8 bytes wide"));
+        let mut bl = 0x9400_0000u32.to_le_bytes();
+        let far = apply(Apply::A64Call26, &ctx(Arch::Aarch64, 1 << 28, 0, 0), &mut bl).unwrap_err();
+        assert_eq!(far, Bad::Branch { offset: 1 << 28, bits: 26 });
+        assert!(far.to_string().contains("reach of 0x8000000"));
+        let mut ldr = 0xf940_0020u32.to_le_bytes();
+        let odd = apply(Apply::A64Lo12 { shift: u8::MAX }, &ctx(Arch::Aarch64, 0x5674, 0, 0), &mut ldr);
+        assert!(odd.unwrap_err().to_string().contains("8-byte access"));
+        let mut field = [0u8; 4];
+        let no_tls = apply(Apply::X86TpOff32, &ctx(Arch::X86_64, 0, 0, 0), &mut field);
+        assert_eq!(no_tls, Err(Bad::NoTls));
     }
 }

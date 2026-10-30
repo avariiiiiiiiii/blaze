@@ -43,6 +43,10 @@
 
 > forwarded to core: `process.rs` still starts children through `pre_exec` (lines 127, 135); core is still running.
 
+> handled by core: `process/spawn.rs` starts children with `clone(CLONE_VM | CLONE_VFORK |
+> CLONE_PIDFD)`, the cgroup joined in the child, and `Started.pidfd` is what `uring.rs` takes
+> now. `cgroup.rs` needs no `dir_fd` for it.
+
 ## 4. docs/v2/plan/lanes/core/plane.md's watch row: what makes fanotify refuse
 
 - What: after "fanotify, inotify where fanotify needs a privilege the process lacks", add: "A
@@ -56,6 +60,31 @@
 
 > applied: by core (`docs/v2/plan/lanes/core/plane.md`, the watch row).
 
+## 5. `process.rs`: remove `pidfd`, which nothing uses now
+
+- What: delete `pub(crate) fn pidfd(pid: libc::pid_t) -> io::Result<OwnedFd>`
+  (`crates/blaze-core/src/process.rs:261`) and anything only it uses.
+- Where: `crates/blaze-core/src/process.rs` (core's).
+- Why: `uring.rs`'s spawn takes `Started.pidfd` and no longer calls it (`rg 'pidfd\('
+  crates/blaze-core/src` finds only its definition), so it is dead code and a `dead_code`
+  warning.
+
+> applied: lane core is DONE. `pidfd` deleted from `crates/blaze-core/src/process.rs` (its only use was its definition; `OwnedFd` stays, `Started` uses it).
+
+## 6. store: pack writes as aligned `WriteAt`s of a MiB or more
+
+- What: write pack files with `Effect::WriteAt` whose offset and length are multiples of 4 KiB,
+  in pieces of 1 MiB or more (a pack's tail padded to 4 KiB, its real length kept in its
+  index), not as appends or whole-file `Write`s.
+- Where: store's pack writer (store lane).
+- Why: on `Uring` such a write bypasses the page cache (`O_DIRECT`, from a registered buffer):
+  a pack written once and read through its own index has no use for the cache, and the copy
+  into it and the writeback after are gone. A write that is not aligned, or is smaller, or on a
+  file system that refuses `O_DIRECT` (tmpfs), goes through the cache as before, with the same
+  bytes.
+
 ---
 Applied by core: 1 (`a_sandbox_is_made_by_the_confine_or_refused` runs on `Uring` and `Kqueue`
 too; the shared scripts already did), 2 (`Threads::local_addr`), 3 (in docs/v2/plan/lanes/core/plane.md).
+
+> forwarded to concurrency: the pack writer is in `crates/blaze-cas`, lane concurrency's now (store is DONE); `fs::write_at` already gives macOS the same rule (`F_NOCACHE`, core-macos 4).

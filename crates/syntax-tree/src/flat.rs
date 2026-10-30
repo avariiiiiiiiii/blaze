@@ -967,7 +967,16 @@ impl FlatTree {
 
     /// The lazy nodes, in preorder.
     pub fn lazies(&self) -> impl Iterator<Item = u32> + '_ {
-        self.lazy.iter().flat_map(|it| it.nodes.iter().copied())
+        self.lazy_nodes().iter().copied()
+    }
+
+    /// The lazy nodes, in preorder, so ascending: a `partition_point` finds the first at or
+    /// after an element.
+    pub fn lazy_nodes(&self) -> &[u32] {
+        match &self.lazy {
+            Some(lazy) => &lazy.nodes,
+            None => &[],
+        }
     }
 
     fn slot(&self, at: u32) -> &OnceLock<Part> {

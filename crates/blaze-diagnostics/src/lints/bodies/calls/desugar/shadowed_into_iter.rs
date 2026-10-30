@@ -10,8 +10,9 @@
 
 use blaze_items::{Fact, ItemId};
 use hir_def::{
-    ModuleDefId,
+    FunctionId, HasModule as _, ModuleDefId,
     hir::{Expr, ExprId},
+    lang_item::lang_items,
 };
 use hir_ty::next_solver::{Ty, TyKind};
 use rustc_hash::FxHashSet;
@@ -27,6 +28,8 @@ use crate::{
 
 #[derive(Default)]
 pub(crate) struct ShadowedIntoIter {
+    /// `IntoIterator::into_iter`, as the body's crate sees it.
+    into_iter: Option<FunctionId>,
     /// The iterated expressions of the body's `for` loops visited so far: the argument of the
     /// `IntoIterator::into_iter` call each is desugared to (rustc's parent of the parent of a
     /// method call that is one).
@@ -38,22 +41,22 @@ impl LatePass for ShadowedIntoIter {
         "ShadowedIntoIter"
     }
 
-    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+    fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.for_heads.clear();
+        let db = b.db();
+        self.into_iter = lang_items(db, b.owner.krate(db)).IntoIterIntoIter;
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+        let Some(into_iter) = self.into_iter else { return };
         if let Some(found) = for_loop(b, expr)
-            && into_iter_path(b, found.into_iter)
+            && util::called_fn(b, found.into_iter).is_some_and(|(def, _)| def == into_iter)
         {
             self.for_heads.insert(found.head);
             return;
         }
         let Expr::MethodCall { receiver, .. } = b.store().expr(expr) else { return };
-        let solver = util::Solver::of(b);
-        let Some(into_iter) = solver.interner().lang_items().IntoIterIntoIter else { return };
-        let Some(method) = util::method_fn(b, expr) else { return };
-        if method != into_iter {
+        if util::method_fn(b, expr) != Some(into_iter) {
             return;
         }
 
@@ -63,15 +66,15 @@ impl LatePass for ShadowedIntoIter {
             adjusted.extend(adjustments.iter().map(|it| it.target.as_ref()));
         }
         let Some(&last) = adjusted.last() else { return };
-        let first_before = |is_ref: fn(Ty<'_>) -> bool, is: fn(Ty<'_>) -> bool| {
-            adjusted.iter().copied().take_while(|it| !is_ref(*it)).position(is)
-        };
+        let array_at = || adjusted.iter().take_while(|it| !is_ref_to_array(**it)).position(|it| it.is_array());
+        let boxed_slice_at =
+            || adjusted.iter().take_while(|it| !is_ref_to_boxed_slice(**it)).position(|it| is_boxed_slice(*it));
         let (lint, target, edition, can_suggest_ufcs) = if is_ref_to_array(last)
-            && let Some(index) = first_before(is_ref_to_array, Ty::is_array)
+            && let Some(index) = array_at()
         {
             ("array_into_iter", "[T; N]", "2021", index == 0)
         } else if is_ref_to_boxed_slice(last)
-            && let Some(index) = first_before(is_ref_to_boxed_slice, is_boxed_slice)
+            && let Some(index) = boxed_slice_at()
         {
             ("boxed_slice_into_iter", "Box<[T]>", "2024", index == 0)
         } else {
@@ -115,17 +118,10 @@ impl LatePass for ShadowedIntoIter {
             }
             _ => {}
         }
-        let called = b.cx.def_path(ModuleDefId::FunctionId(method).into());
-        diag.fact(Fact::Signature(b.cx.key(ItemId::Function(method))), format!("the signature of `{called}`"));
+        let called = b.cx.def_path(ModuleDefId::FunctionId(into_iter).into());
+        diag.fact(Fact::Signature(b.cx.key(ItemId::Function(into_iter))), format!("the signature of `{called}`"));
         out.push(b.lint(diag, Phase::Late, at));
     }
-}
-
-/// Whether the callee of the call `call` is the path to `IntoIterator::into_iter` (rustc's
-/// `qpath_is_lang_item(qpath, LangItem::IntoIterIntoIter)`).
-fn into_iter_path(b: &BodyCx<'_, '_>, call: ExprId) -> bool {
-    let Some((def, _)) = util::called_fn(b, call) else { return false };
-    util::Solver::of(b).interner().lang_items().IntoIterIntoIter == Some(def)
 }
 
 fn is_ref_to_array(ty: Ty<'_>) -> bool {

@@ -3,13 +3,14 @@
 //! platform's writes done by [`Fake`].
 
 use std::{
+    collections::HashMap,
     ops::Range,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 use super::{
     Outcome, hook,
-    switch::{Dwarf, HOST_ARCH, KEPT, Layout, Memory, Switch},
+    switch::{Dwarf, HOST_ARCH, KEPT, Layout, Memory, POOL, Span, Switch, Writes},
 };
 use crate::patch::{
     Answer, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, FIRST_GENERATION, Message, Patch,
@@ -49,27 +50,23 @@ struct Fake {
     published: usize,
 }
 
-fn copy(writes: &[(u64, Vec<u8>)]) {
-    for (at, bytes) in writes {
-        // SAFETY: every write the tests make is to a buffer of their `Program`, which outlives
-        // the switch, and the switch checked it is in the region the descriptor names.
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), *at as *mut u8, bytes.len()) };
-    }
-}
-
 impl Memory for Fake {
     const DWARF: Dwarf = Dwarf::Sections;
     const SEH: bool = true;
 
-    fn code(&mut self, writes: &[(u64, Vec<u8>)]) -> Result<(), String> {
+    fn code(&mut self, writes: &Writes<'_>) -> Result<(), String> {
         if self.write_code {
-            copy(writes);
+            // SAFETY: every write the tests make is to a buffer of their `Program`, which
+            // outlives the switch, and the switch checked it is in the region the descriptor
+            // names.
+            unsafe { writes.put_in_place() };
         }
         Ok(())
     }
 
-    fn data(&mut self, writes: &[(u64, Vec<u8>)]) -> Result<(), String> {
-        copy(writes);
+    fn data(&mut self, writes: &Writes<'_>) -> Result<(), String> {
+        // SAFETY: as for code.
+        unsafe { writes.put_in_place() };
         Ok(())
     }
 
@@ -103,7 +100,13 @@ struct Program {
 
 impl Program {
     fn new() -> Program {
-        let table: Box<[u64]> = vec![address(one), address(two)].into_boxed_slice();
+        Program::with_slots(2)
+    }
+
+    /// A program whose table has `slots` slots, of `one` and `two` in turn.
+    fn with_slots(slots: usize) -> Program {
+        let table: Box<[u64]> =
+            (0..slots).map(|it| if it % 2 == 0 { address(one) } else { address(two) }).collect();
         let cell = Box::new(AtomicU64::new(table.as_ptr() as u64));
         let code = vec![0u64; 512].into_boxed_slice();
         let region = code.as_ptr() as u64..code.as_ptr() as u64 + 512 * 8;
@@ -150,16 +153,22 @@ impl Program {
 
     /// Calls slot `slot` as code the linker made does: the cell, then the slot.
     fn call(&self, slot: usize) -> u32 {
-        let table = self.cell.load(Ordering::Acquire) as *const u64;
-        // SAFETY: the cell holds a table of two addresses of `extern "C-unwind" fn() -> u32`.
-        let f = unsafe { *table.add(slot) };
-        // SAFETY: as above.
+        let f = self.slots()[slot];
+        // SAFETY: the table holds addresses of `extern "C-unwind" fn() -> u32`.
         let f: extern "C-unwind" fn() -> u32 = unsafe { std::mem::transmute(f as usize) };
         f()
     }
 
     fn calls(&self) -> (u32, u32) {
         (self.call(0), self.call(1))
+    }
+
+    /// Every slot of the table the cell points at.
+    fn slots(&self) -> Vec<u64> {
+        let table = self.cell.load(Ordering::Acquire) as *const u64;
+        // SAFETY: the cell holds a table of `self.table.len()` addresses, 8-aligned, which
+        // nothing writes while the test reads it.
+        unsafe { std::slice::from_raw_parts(table, self.table.len()) }.to_vec()
     }
 }
 
@@ -358,7 +367,7 @@ fn the_last_generations_are_kept() {
     for generation in 1..=100u64 {
         let target = if generation % 2 == 0 { address(one) } else { address(two) };
         applied(&mut switch, patch(generation, generation - 1, vec![(0, unslid(target))]));
-        assert!(switch.retired() <= KEPT);
+        assert!(switch.pooled() <= POOL);
     }
     assert_eq!(program.call(0), 1);
     assert_eq!(switch.kept(), (101 - KEPT as u64..=100).collect::<Vec<_>>());
@@ -437,6 +446,109 @@ fn a_panic_elsewhere_is_resumed() {
     assert!(answers.is_empty());
     assert_eq!(switch.current(), 1);
     assert_eq!(switch.guard(|| 7, &mut |_| {}), Ok(7));
+}
+
+/// The pool's tables, brought from one generation to another by undoing and redoing cells,
+/// against a whole table of every generation, over patches and rollbacks that branch.
+#[test]
+fn the_pool_holds_what_a_whole_table_per_generation_would() {
+    const SLOTS: usize = 16;
+    let program = Program::with_slots(SLOTS);
+    let mut switch = program.switch(false);
+    let mut model = HashMap::from([(FIRST_GENERATION, program.table.to_vec())]);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut random = move |below: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % below
+    };
+    let mut next = FIRST_GENERATION + 1;
+    for _ in 0..2000 {
+        if random(3) == 0 {
+            let kept = switch.kept();
+            let to = kept[random(kept.len() as u64) as usize];
+            switch.roll_back(to).expect("a kept generation");
+        } else {
+            let base = switch.current();
+            let mut table = model[&base].clone();
+            let mut cells = Vec::new();
+            for slot in 0..SLOTS {
+                if random(4) == 0 {
+                    let target = 0x10_0000 + random(1 << 20) * 8;
+                    table[slot] = target;
+                    cells.push((slot as u32, unslid(target)));
+                }
+            }
+            applied(&mut switch, patch(next, base, cells));
+            model.insert(next, table);
+            next += 1;
+        }
+        assert!(switch.pooled() <= POOL);
+        assert_eq!(program.slots(), model[&switch.current()], "at {}", switch.current());
+    }
+    assert_eq!(switch.pooled(), POOL);
+}
+
+#[test]
+fn a_rollback_to_a_generation_a_table_holds_writes_no_table() {
+    let program = Program::new();
+    let image = program.cell.load(Ordering::Relaxed);
+    let mut switch = program.switch(false);
+    applied(&mut switch, patch(1, 0, vec![(0, unslid(address(two)))]));
+    let first = switch.table_of(1).expect("a table holds generation 1");
+    applied(&mut switch, patch(2, 1, vec![(1, unslid(address(one)))]));
+    let second = switch.table_of(2).expect("a table holds generation 2");
+    assert_ne!(first, second);
+    assert_eq!(switch.table_of(1), Some(first));
+    assert_eq!(program.calls(), (2, 1));
+
+    switch.roll_back(1).expect("generation 1 is kept");
+    assert_eq!(program.cell.load(Ordering::Relaxed), first);
+    assert_eq!(program.calls(), (2, 2));
+    switch.roll_back(0).expect("generation 0 is kept");
+    assert_eq!(program.cell.load(Ordering::Relaxed), image);
+    assert_eq!(switch.table_of(0), Some(image));
+    switch.roll_back(2).expect("generation 2 is kept");
+    assert_eq!(program.cell.load(Ordering::Relaxed), second);
+    assert_eq!(program.calls(), (2, 1));
+    assert_eq!(switch.pooled(), 2);
+}
+
+/// `put` of every range against the bytes written whole and rebased one field at a time,
+/// for ranges that cut spans and rebased fields anywhere.
+#[test]
+fn a_write_puts_any_part_of_its_spans_rebased() {
+    const START: u64 = 0x1000;
+    let message: Vec<u8> = (0..64u8).collect();
+    let spans = [Span::new(START, 0, 24), Span::new(START + 30, 40, 16)];
+    let rebase = [START + 4, START + 16, START + 36];
+    let slide = 0x0123_4567_89ab_cdef;
+    let writes = Writes::new(&message, &spans, &rebase, slide);
+
+    let mut whole = [None::<u8>; 48];
+    for span in &spans {
+        for (offset, byte) in writes.bytes(span).iter().enumerate() {
+            whole[(span.at - START) as usize + offset] = Some(*byte);
+        }
+    }
+    for field in rebase {
+        let at = (field - START) as usize;
+        let bytes: Vec<u8> = whole[at..at + 8].iter().map(|it| it.expect("in a span")).collect();
+        let value = u64::from_le_bytes(bytes.try_into().expect("8 bytes")).wrapping_add(slide);
+        for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
+            whole[at + offset] = Some(byte);
+        }
+    }
+    for start in 0..whole.len() {
+        for end in start..=whole.len() {
+            let mut buffer = vec![0xee; end - start];
+            let range = START + start as u64..START + end as u64;
+            writes.fill(&range, &mut buffer);
+            let expected: Vec<u8> = whole[start..end].iter().map(|it| it.unwrap_or(0xee)).collect();
+            assert_eq!(buffer, expected, "{range:x?}");
+        }
+    }
 }
 
 #[test]

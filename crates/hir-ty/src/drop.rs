@@ -76,24 +76,21 @@ pub fn is_freeze<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -
         TyKind::Tuple(fields) => fields.iter().all(|field| is_freeze(infcx, field, env)),
         TyKind::Closure(_, args) => is_freeze(infcx, args.as_closure().tupled_upvars_ty(), env),
         TyKind::Adt(def, args) => {
-            let variants: Vec<hir_def::VariantId> = match def.def_id() {
-                AdtId::StructId(id) => {
-                    if Some(id) == interner.lang_items().UnsafeCell {
-                        return false;
-                    }
-                    vec![id.into()]
-                }
-                AdtId::EnumId(id) => {
-                    enum_variant_ids(db, id).iter().map(|&it| it.into()).collect()
-                }
-                AdtId::UnionId(_) => return false,
-            };
-            variants.into_iter().all(|variant| {
+            let fields_freeze = |variant: hir_def::VariantId| {
                 db.field_types(variant).iter().all(|(_, field)| {
                     let ty = field.ty().instantiate(interner, args).skip_norm_wip();
                     is_freeze(infcx, ty, env)
                 })
-            })
+            };
+            match def.def_id() {
+                AdtId::StructId(id) => {
+                    Some(id) != interner.lang_items().UnsafeCell && fields_freeze(id.into())
+                }
+                AdtId::EnumId(id) => {
+                    enum_variant_ids(db, id).iter().all(|&variant| fields_freeze(variant.into()))
+                }
+                AdtId::UnionId(_) => false,
+            }
         }
         _ => false,
     }

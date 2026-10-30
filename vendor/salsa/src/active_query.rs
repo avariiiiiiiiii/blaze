@@ -141,7 +141,7 @@ impl ActiveQuery {
         let record_input = record_input || accumulated_inputs.is_any();
 
         if record_input {
-            let (edge, inserted) = self.input_outputs.insert_full(QueryEdge::input(input));
+            let (edge, inserted) = self.insert_edge(QueryEdge::input(input));
             if inserted && fingerprint.is_value() {
                 self.edge_fingerprints.push(EdgeFingerprint {
                     edge: u32::try_from(edge)
@@ -170,7 +170,7 @@ impl ActiveQuery {
         self.add_changed_at(revision);
 
         if cfg!(feature = "persistence") || durability != Durability::NEVER_CHANGE {
-            self.input_outputs.insert(QueryEdge::input(input));
+            self.insert_edge(QueryEdge::input(input));
         }
     }
 
@@ -191,7 +191,17 @@ impl ActiveQuery {
 
     /// Adds a key to our list of outputs, returning whether it was newly inserted.
     pub(super) fn add_output(&mut self, key: DatabaseKeyIndex) -> bool {
-        self.input_outputs.insert(QueryEdge::output(key))
+        self.insert_edge(QueryEdge::output(key)).1
+    }
+
+    /// Inserts `edge` into `input_outputs` as `insert_full` does, returning its position and
+    /// whether it is new, without hashing it when it repeats the last edge.
+    #[inline]
+    fn insert_edge(&mut self, edge: QueryEdge) -> (usize, bool) {
+        match self.input_outputs.last() {
+            Some(last) if *last == edge => (self.input_outputs.len() - 1, false),
+            _ => self.input_outputs.insert_full(edge),
+        }
     }
 
     /// True if the given key was output by this query.
@@ -642,5 +652,66 @@ impl fmt::Display for Backtrace {
             .transpose()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ActiveQuery;
+    use crate::cycle::CycleHeads;
+    use crate::durability::Durability;
+    use crate::fingerprint::Fingerprint;
+    use crate::key::DatabaseKeyIndex;
+    use crate::zalsa::IngredientIndex;
+    use crate::zalsa_local::{EdgeFingerprint, QueryEdge};
+    use crate::{Id, Revision};
+
+    fn key(index: u64) -> DatabaseKeyIndex {
+        DatabaseKeyIndex::new(IngredientIndex::new(1), Id::from_bits(index))
+    }
+
+    fn read(query: &mut ActiveQuery, input: DatabaseKeyIndex, fingerprint: Fingerprint) {
+        #[cfg(feature = "accumulator")]
+        let accumulated = crate::accumulator::accumulated_map::AtomicInputAccumulatedValues::new(
+            Default::default(),
+        );
+        query.add_read(
+            input,
+            Durability::LOW,
+            Revision::start(),
+            fingerprint,
+            &CycleHeads::default(),
+            #[cfg(feature = "accumulator")]
+            false,
+            #[cfg(feature = "accumulator")]
+            &accumulated,
+        );
+    }
+
+    #[test]
+    fn repeated_reads_record_one_edge() {
+        let (a, b) = (key(1), key(2));
+        let (fa, fb) = (Fingerprint::of_value(&1u32), Fingerprint::of_value(&2u32));
+        let mut query = ActiveQuery::new(key(9));
+        read(&mut query, a, fa);
+        read(&mut query, a, fa);
+        read(&mut query, b, fb);
+        read(&mut query, a, fa);
+        query.add_read_simple(b, Durability::LOW, Revision::start());
+        assert!(query.add_output(key(3)));
+        assert!(!query.add_output(key(3)));
+
+        let edges: Vec<QueryEdge> = query.input_outputs.iter().copied().collect();
+        assert_eq!(
+            edges,
+            [QueryEdge::input(a), QueryEdge::input(b), QueryEdge::output(key(3))]
+        );
+        assert_eq!(
+            query.edge_fingerprints.as_slice(),
+            [
+                EdgeFingerprint { edge: 0, fingerprint: fa },
+                EdgeFingerprint { edge: 1, fingerprint: fb },
+            ]
+        );
     }
 }

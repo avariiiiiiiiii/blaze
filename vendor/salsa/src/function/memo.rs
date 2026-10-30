@@ -239,7 +239,7 @@ impl MemoHeader {
         self.revisions.origin()
     }
 
-    fn can_evict_value(&self) -> bool {
+    pub(super) fn can_evict_value(&self) -> bool {
         // Careful: Cannot evict memos whose values were
         // assigned as output of another query
         // or those with untracked inputs

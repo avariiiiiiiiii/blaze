@@ -2,6 +2,8 @@
 //! ([`proc_macro_api::wrap`]): their libraries are expanded by servers of their own, started
 //! with [`proc_macro_api::wrap::UNSANDBOXED`] set, which the caller's wrapper leaves alone.
 
+#![forbid(unsafe_code)]
+
 use std::sync::OnceLock;
 
 use vfs::AbsPath;

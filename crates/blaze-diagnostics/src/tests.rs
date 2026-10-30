@@ -95,23 +95,59 @@ pub(crate) fn checked(fixture: &str) -> Checked {
 }
 
 /// What rustc writes to stderr compiling `source` as the one file of a crate, named
-/// `$DIR/<name>` as rustc's UI tests name it, in edition `edition`, under `-Z ui-testing`
-/// (`LL` for line numbers): a UI test's `.stderr`.
+/// `$DIR/<name>` as rustc's UI tests name it, in edition `edition`, as compiletest runs a UI
+/// test that is not `//@ run-pass`: a UI test's `.stderr`.
 pub(crate) fn ui(name: &str, edition: &str, source: &str) -> String {
     ui_with(name, edition, source, &Options::default())
 }
 
+/// [`ui`] with the test's own flags (`//@ compile-flags`) in `options`.
 pub(crate) fn ui_with(name: &str, edition: &str, source: &str, options: &Options) -> String {
+    ui_as(Mode::Other, name, edition, source, options)
+}
+
+/// [`ui_with`] of a `//@ run-pass` test, which compiletest gives no `-A unused`.
+pub(crate) fn ui_run_pass(name: &str, edition: &str, source: &str, options: &Options) -> String {
+    ui_as(Mode::RunPass, name, edition, source, options)
+}
+
+/// The pass mode a UI test declares, as far as compiletest's flags depend on it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Mode {
+    RunPass,
+    Other,
+}
+
+pub(crate) fn ui_as(mode: Mode, name: &str, edition: &str, source: &str, options: &Options) -> String {
     let fixture = format!("//- /{name} crate:main edition:{edition}\n{source}");
-    let stderr =
-        checked_with(&fixture, "$DIR/", options).stderr_with(Style { ui_testing: true, ..Style::default() });
+    let stderr = checked_with(&fixture, "$DIR/", &compiletest(mode, options))
+        .stderr_with(Style { ui_testing: true, ..Style::default() });
     normalized(&stderr)
+}
+
+/// The options compiletest runs a UI test with (`runtest.rs`, `make_compile_args`): `-Z
+/// ui-testing` (in the style), `-Z deduplicate-diagnostics=no`, and its lint flags before the
+/// test's own: `-A unused -W unused_attributes` but for `run-pass`, then `-A
+/// internal_features -A incomplete_features -A unused_parens -A unused_braces`.
+pub(crate) fn compiletest(mode: Mode, options: &Options) -> Options {
+    let mut args: Vec<&str> = Vec::new();
+    if mode == Mode::Other {
+        args.extend(["-A", "unused", "-W", "unused_attributes"]);
+    }
+    args.extend(["-A", "internal_features", "-A", "incomplete_features"]);
+    args.extend(["-A", "unused_parens", "-A", "unused_braces"]);
+    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+    let mut lints = crate::lints::CommandLine::parse(&args).expect("compiletest's lint flags are rustc's");
+    lints.opts.extend(options.lints.opts.iter().cloned());
+    lints.cap = options.lints.cap;
+    lints.check_cfg = options.lints.check_cfg.clone();
+    Options { lints, keep_duplicates: true }
 }
 
 /// compiletest's normalization of a UI test's output (`runtest.rs`, `normalize_output`) as far
 /// as a one-file crate needs it: tabs shown as `\t`, and the test's `//~` annotations removed
 /// with the white space before them (its regex `\s*//(\[.*\])?~.*`).
-fn normalized(output: &str) -> String {
+pub(crate) fn normalized(output: &str) -> String {
     let output = output.replace('\t', "\\t");
     let mut out = String::with_capacity(output.len());
     let mut rest = output.as_str();

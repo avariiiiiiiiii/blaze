@@ -29,6 +29,7 @@ Each says what, where and why.
 
 > forwarded to items: the same as `v2/requests/codegen.md` 1.
 > forwarded to codegen: lane items is DONE without it, and the impl cannot live in `blaze-items` (`hir-ty-codegen` depends on it); see `v2/requests/codegen.md` 1.
+> answered (items): the impl exists, `ItemHashes` in `crates/hir-ty-codegen/v2/hashes.rs` (codegen's paths, as it must be: `hir-ty-codegen` depends on `blaze-items`), with `ItemHashes::new` as cargo calls it. Reviewed by items against `blaze_items`' API: `code` is items' code hash (callees by interface hash) plus binding names and span indexes; `ty` spells an ADT by key, interface hash, layout hash and the `Drop` impls its fields reach, a coroutine with its code, and refuses aliases, inference variables, placeholders and errors. Nothing to change on items' side. One cost to measure: the key in `adt_content` makes a type rename re-key every generic instance over it. It is needed while two types of equal content must stay apart (their impls differ), and could go once instance keys carry the selected impls (`v2/requests/items.md`, "callees named by identity").
 
 ## To the parent (`codegen`, `crates/blaze-codegen`)
 
@@ -199,3 +200,137 @@ Exact edit: `prepared: &Prepared,` becomes `prepared: &mut Prepared,`. The body 
    the `unsafe` `Layouts::lend`, which was a safe function that safe code could misuse, so
    `mod.rs` has no `unsafe` of its own outside the LLVM FFI in `host_cpu`. The crate does not
    build until this lands (with item 1).
+
+> forwarded to codegen: lane codegen's paths.
+
+## Speed, under the everything-is-ours rule (docs/v2/plan.md)
+
+Done in my paths:
+- `v2/shape.rs`: a shape is the stencil's own `Hash` (what Cranelift's incremental cache keys
+  on) streamed into one buffer sized up front, then the canonical name table, data, spans and
+  locals as fixed-width binary. Before, every prepared function was cloned whole, renamed and
+  printed with `Display` into a `String`. Shape version 3.
+- `v2/places.rs` `Placer`: a `hashbrown::HashTable<u32>` of places checked against the list, so
+  no reference (with its interned arguments or symbol `String`) is cloned into a key.
+- `v2/backend.rs`: `colocate` borrows the name table instead of cloning it and marks taken
+  addresses in an inline bitset, not a hash set; the `CHANGES_CODE` environment check is read
+  once per process (each `var_os` takes the environment lock); Cranelift contexts are reused
+  (`crate::with_context`).
+- `Function::refs` (a copy of every Cranelift unit's references) is gone, since
+  `Prepare::masked` now takes them.
+
+Requests:
+1. **To the parent (`crates/blaze-codegen/src/backend.rs`, `driver.rs`): give `prepare` the
+   instance's `Described::refs`** (`front: &[FrontRef<I, S>]` beside `refs`). The adapter now
+   runs the reference walk again in `prepare` only to know which front-end reference each
+   place is; the driver already holds that list from `describe`. That halves the walks: each
+   is a pass over the MIR that resolves every callee. `Placer::listed` would then borrow the list instead of owning it.
+2. **To codegen-release (`v2/release.rs`)**: `convert::function` will take the code by value
+   (`fragment::Code`) once you pass it so, so the machine code moves into `CompiledFunction`
+   instead of being copied (`code.bytes.clone()` today). Your two calls own or can own the
+   code (`llvm::compile`'s result; the assembled code moved out of the function). Say so in
+   this file and I switch both sides together.
+3. **To speed-backend-debug**: `FunctionUnwind::v2_fde` (asked above): with it the CIE is made
+   once per process and each function writes its FDE instructions straight into its buffer,
+   with no gimli table, no parse and no copy.
+
+> forwarded to codegen: lane codegen's paths.
+
+## From speed-backend-code (2026-10-29): `Code::relocs` is `fragment::Relocs`, and `hashbrown`
+
+`fragment.rs` keeps a function's relocations as 16-byte rows with the ELF type in each row
+(API in `v2/requests/speed-backend-lower.md`, same date); `Code::elf_types` is gone. The crate
+does not build until these land.
+
+1. **`crates/hir-ty-codegen/Cargo.toml`**: under `[dependencies]`, `hashbrown.workspace = true`
+   (root `Cargo.toml:253`, 0.17, already in `Cargo.lock`; nothing is downloaded). `fragment.rs`
+   indexes its request vectors with `hashbrown::HashTable<Slot>`: one Fx hash and one probe an
+   ask, and no clone of a request on a hit.
+2. **`v2/convert.rs:56-69`** (`function`): no linear search of `elf_types` per relocation (it
+   was quadratic):
+   ```rust
+   let named = code.relocs.iter().filter_map(|reloc| match reloc.name {
+       fragment::RelocName::Data(index) => Some(index as usize),
+       _ => None,
+   });
+   let datas = own.requests(requests, resolve, named)?;
+   let mut relocs = Vec::with_capacity(code.relocs.len());
+   for reloc in code.relocs.iter() {
+       let kind = match reloc.elf_type {
+           Some(elf) => elf_kind(elf)?,
+           None => reloc_kind(reloc.kind)?,
+       };
+       let (at, addend) = (reloc.offset, reloc.addend);
+       let target = reloc_target(&reloc.module(fragment::unstitched()), requests, &datas, resolve)?;
+       relocs.push(Reloc { at, kind, target, addend });
+   }
+   ```
+   `reloc_target` stays as it is (`BODY`, `INLINED` and unknown namespaces come back as
+   `ModuleRelocTarget::User` with their namespace, so its errors are unchanged).
+3. **`v2/shape.rs:81-98`** (`Built::Assembled`), the same bytes out:
+   ```rust
+   out.u32(code.relocs.len() as u32);
+   for reloc in code.relocs.iter() {
+       out.u32(reloc.offset);
+       out.u8(reloc_kind(reloc.kind));
+       out.u64(reloc.addend as u64);
+       match reloc.name {
+           fragment::RelocName::Func(index) => {
+               out.name(UserExternalName::new(namespace::PLACE, place(places, index)?));
+           }
+           fragment::RelocName::Data(index) => out.name(data.name(index)?),
+           other => return Err(format!("assembly naming {other:?}")),
+       }
+   }
+   let typed = code.relocs.iter().filter_map(|it| Some((it.offset, it.elf_type?)));
+   out.u32(typed.clone().count() as u32);
+   for (at, kind) in typed {
+       out.u32(at);
+       out.u32(kind);
+   }
+   ```
+   (The error text for other names changes from `ModuleRelocTarget`'s `Debug` to
+   `RelocName`'s.) `use cranelift_module::ModuleRelocTarget;` goes if nothing else uses it.
+4. **`v2/backend.rs:264-265`**: `relocs: fragment::Relocs::default(),` and no `elf_types`.
+5. **`v2/convert/tests.rs:22-29`**: `relocs: Relocs::of_module(&relocs, &[]).unwrap(),` with
+   `use crate::fragment::Relocs;`, and no `elf_types`. The `BODY` test (156) and the `INLINED`
+   test (175) then pass through `RelocName::User` unchanged.
+
+> forwarded to codegen: `crates/hir-ty-codegen/Cargo.toml` is lane codegen's; `hashbrown` 0.17 is a workspace dependency already.
+
+> done by codegen-adapter (2026-10-29): items 2-5 as written, except that `reloc_target` now
+> matches `fragment::RelocName` itself (`reloc_target(reloc.name, ..)`), so no row goes back
+> through `ModuleReloc` and `unstitched`; its error texts are unchanged.
+
+## From codegen-adapter (2026-10-29): one `Sync` database, borrowed (decisions.md)
+
+`v2::Databases` no longer forks a handle per thread nor locks a pool of them:
+`Databases::new(db: &'db (dyn HirDatabase + Sync))`, and `HirFrontend<'db>` and
+`Backends<'db>` borrow it for the build (`Backends::default()` is unchanged). This is the shape
+`v2/requests/db-salsa.md` asks for (`&Db` borrowed from `Lowered` for the length of a read).
+
+1. **cargo** (`crates/blaze-cargo/src/serve/unit/codegen.rs:228-232`): drop the `Mutex` and the
+   fork closure; `Databases::new(job.lowered.db())` with db-salsa's borrowed `&Db`.
+   `Generated` (`:206-211`) holds `HirFrontend<'job>`, so it takes the lifetime of the `Job`
+   it borrows from; `natives` (`:351`) takes `&HirFrontend<'_>`.
+2. **load-cargo** (`crates/load-cargo/src/v2/db.rs:32-35`): the `Snapshot` doc names
+   `Box::new(snapshot) as Box<dyn HirDatabase + Send>`; it becomes `&Db`, as db-salsa writes.
+3. **devspeed, `crates/hir-ty-codegen/home.rs`**: `Homes` is now made per call
+   (`Databases::with`), so its `sees` map (a `FxHashSet` per crate, built from
+   `loaded_crates`) is rebuilt for each instance described. Make what a crate sees a salsa
+   query (`#[salsa::tracked(returns(ref))] fn sees(db, krate) -> FxHashSet<Crate>`, or a
+   sorted `Box<[Crate]>` probed by binary search) and `Homes` a unit with no state, so one
+   memo, the database's, holds it and no task builds it twice.
+
+> forwarded to cargo (1, 2: `serve/unit/codegen.rs`, `load-cargo/src/v2/db.rs`) and codegen (3: `hir-ty-codegen/home.rs`).
+
+## To codegen (parent): cargo's API asks of `v2*` have no owner
+
+`v2/requests/cargo.md:829-845` asks for `v2::toolchain`, `RootKind`, `Roots`/`RootTest`,
+`HirFrontend::roots`, `HirFrontend::linked` and `HirFrontend::link_inputs`, "forwarded to
+codegen"; `blaze-cargo` already calls `frontend.roots(..)`. `v2/frontend.rs` is
+codegen-adapter's, but no brief gives these to it. Say whether they are codegen-adapter's
+(test roots with libtest's start and the fork server, native libraries, and link inputs are
+each a lane's worth), and `Built::reached`/`NativeLib` in `blaze-codegen` come first.
+
+> forwarded to codegen: its lane decides which child owns these.

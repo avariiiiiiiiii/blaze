@@ -16,6 +16,7 @@ use crate::{
     MacroCallStyle,
     attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr},
     hygiene::{MarkCache, Transparency, apply_mark},
+    span_map::InOrder,
     tt,
 };
 
@@ -134,7 +135,7 @@ impl AstId<ast::Macro> {
                     Some(arg) => {
                         let tt = syntax_bridge::syntax_node_to_token_tree(
                             arg.syntax(),
-                            map,
+                            InOrder::new(map),
                             map.span_for_range(
                                 macro_rules.macro_rules_token().unwrap().text_range(),
                             ),
@@ -158,14 +159,14 @@ impl AstId<ast::Macro> {
                         let args = macro_def.args().map(|args| {
                             syntax_bridge::syntax_node_to_token_tree(
                                 args.syntax(),
-                                map,
+                                InOrder::new(map),
                                 span,
                                 DocCommentDesugarMode::Mbe,
                             )
                         });
                         let body = syntax_bridge::syntax_node_to_token_tree(
                             body.syntax(),
-                            map,
+                            InOrder::new(map),
                             span,
                             DocCommentDesugarMode::Mbe,
                         );

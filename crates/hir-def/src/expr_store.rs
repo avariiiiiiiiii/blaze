@@ -36,9 +36,9 @@ use crate::{
     expr_store::path::{AssociatedTypeBinding, GenericArg, GenericArgs, NormalPath, Path},
     hir::{
         Array, AsmOperand, Binding, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
-        InlineAsm, Label, LabelId, MatchArm, OffsetOf, Pat, PatId, RecordFieldPat, RecordLitField,
-        RecordSpread, Statement,
-        columns::{Frozen, Growing, HirColumns},
+        InlineAsm, Label, LabelId, Literal, MatchArm, OffsetOf, Pat, PatId, RecordFieldPat,
+        RecordLitField, RecordSpread, Statement,
+        columns::{self, Frozen, Growing, HirColumns, take_exact},
     },
     nameres::{DefMap, block_def_map},
     signatures::VariantFields,
@@ -269,6 +269,93 @@ impl<K: Ord + Copy, V> IdTable<K, V> {
     }
 }
 
+/// The order of a [`SourceTable`]'s keys, total and the same on every run (a hash map's is
+/// neither): the file (files before macro files, each by its salsa id's bits), the range's start
+/// and end, the syntax kind. `expr_store/persist.rs` writes and checks tables in exactly this
+/// order (`Src::key`), so a change here is a change of its format.
+pub(crate) trait SourceKey {
+    fn source_key(&self) -> (u8, u64, u32, u32, u16);
+}
+
+impl<N: AstNode> SourceKey for InFile<AstPtr<N>> {
+    #[inline]
+    fn source_key(&self) -> (u8, u64, u32, u32, u16) {
+        let (file_kind, file) = match self.file_id {
+            HirFileId::FileId(file) => (1, file.as_id().as_bits()),
+            HirFileId::MacroFile(call) => (2, call.as_id().as_bits()),
+        };
+        let range = self.value.text_range();
+        (file_kind, file, range.start().into(), range.end().into(), u16::from(self.value.kind()))
+    }
+}
+
+/// A map from syntax pointers to a store's ids, as one column sorted by [`SourceKey`] and
+/// searched: what a source map keeps in place of a hash map. 24 bytes per entry for an
+/// `InFile<AstPtr<_>>` key and a `u32` value; a lookup is `log2(n)` key compares with no
+/// hashing, and iteration is in key order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceTable<K, V>(Box<[(K, V)]>);
+
+impl<K, V> Default for SourceTable<K, V> {
+    fn default() -> Self {
+        SourceTable(Box::default())
+    }
+}
+
+impl<K: SourceKey, V> SourceTable<K, V> {
+    /// The table of `pushed`, in the order lowering pushed them: a later value for a key
+    /// replaces an earlier one, as an insert into a map does. `pushed` is left empty with its
+    /// capacity (it is a pooled builder's column); the table is one allocation of its length.
+    /// Lowering pushes in preorder, which is nearly in key order, so the stable sort is close to
+    /// one linear pass.
+    pub(crate) fn from_pushed(pushed: &mut Vec<(K, V)>) -> Self {
+        pushed.sort_by_key(|(key, _)| key.source_key());
+        // Stable, so equal keys stay in push order; keep the last of each run.
+        pushed.dedup_by(|later, kept| {
+            let same = later.0.source_key() == kept.0.source_key();
+            if same {
+                mem::swap(later, kept);
+            }
+            same
+        });
+        SourceTable(take_exact(pushed))
+    }
+
+    /// The table of `entries`, which are in strictly increasing key order (no key twice).
+    pub(crate) fn from_sorted(entries: Box<[(K, V)]>) -> Option<Self> {
+        let sorted = entries.windows(2).all(|pair| pair[0].0.source_key() < pair[1].0.source_key());
+        sorted.then_some(SourceTable(entries))
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, key: &K) -> Option<&V> {
+        let key = key.source_key();
+        let at = self.0.binary_search_by(|(it, _)| it.source_key().cmp(&key)).ok()?;
+        Some(&self.0[at].1)
+    }
+
+    /// Every entry, in key order.
+    #[inline]
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (&K, &V)> + '_ {
+        self.0.iter().map(|(key, value)| (key, value))
+    }
+
+    #[inline]
+    pub(crate) fn entries(&self) -> &[(K, V)] {
+        &self.0
+    }
+
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 impl PartialEq for ExpressionOnlySourceMap {
     fn eq(&self, other: &Self) -> bool {
         // we only need to compare one of the two mappings
@@ -305,10 +392,10 @@ pub struct ExpressionStoreSourceMap {
     expr_only: Option<Box<ExpressionOnlySourceMap>>,
 
     types_map_back: ArenaMap<TypeRefId, TypeSource>,
-    types_map: FxHashMap<TypeSource, TypeRefId>,
+    types_map: SourceTable<TypeSource, TypeRefId>,
 
     lifetime_map_back: ArenaMap<LifetimeRefId, LifetimeSource>,
-    lifetime_map: FxHashMap<LifetimeSource, LifetimeRefId>,
+    lifetime_map: SourceTable<LifetimeSource, LifetimeRefId>,
 }
 
 impl PartialEq for ExpressionStoreSourceMap {
@@ -346,11 +433,13 @@ impl Move<'_> {
         map.iter().map(|(id, &src)| (id, self.ptr(src))).collect()
     }
 
+    /// Moving pointers can change their order, so the table is sorted again.
     fn forth<N: AstNode, V: Copy>(
         &self,
-        map: &FxHashMap<InFile<AstPtr<N>>, V>,
-    ) -> FxHashMap<InFile<AstPtr<N>>, V> {
-        map.iter().map(|(&src, &id)| (self.ptr(src), id)).collect()
+        map: &SourceTable<InFile<AstPtr<N>>, V>,
+    ) -> SourceTable<InFile<AstPtr<N>>, V> {
+        let mut moved = map.iter().map(|(&src, &id)| (self.ptr(src), id)).collect::<Vec<_>>();
+        SourceTable::from_pushed(&mut moved)
     }
 
     fn raw(&self, src: InFile<SyntaxNodePtr>) -> InFile<SyntaxNodePtr> {
@@ -393,11 +482,14 @@ impl ExpressionStoreSourceMap {
                 diagnostics: it.diagnostics.iter().map(|it| it.moved(mv)).collect(),
             })
         });
+        let mut types_map: Vec<_> = types_map_back.iter().map(|(id, &src)| (src, id)).collect();
+        let mut lifetime_map: Vec<_> =
+            lifetime_map_back.iter().map(|(id, &src)| (src, id)).collect();
         ExpressionStoreSourceMap {
             expr_only,
-            types_map: types_map_back.iter().map(|(id, &src)| (src, id)).collect(),
+            types_map: SourceTable::from_pushed(&mut types_map),
             types_map_back,
-            lifetime_map: lifetime_map_back.iter().map(|(id, &src)| (src, id)).collect(),
+            lifetime_map: SourceTable::from_pushed(&mut lifetime_map),
             lifetime_map_back,
         }
     }
@@ -431,15 +523,19 @@ impl ExpressionStoreDiagnostics {
     }
 }
 
-/// The body of an item (function, const etc.).
-#[derive(Debug, Eq, PartialEq, Default)]
+/// The body of an item (function, const etc.) while it is lowered. Its columns, forward maps,
+/// back maps and list stacks are a [`Scratch`] taken from this thread's pool by
+/// [`ExpressionStoreBuilder::new`] and given back, emptied, by [`ExpressionStoreBuilder::finish`].
+#[derive(Debug, Eq, PartialEq)]
 pub struct ExpressionStoreBuilder {
     pub(crate) columns: HirColumns<Growing>,
+    pub(crate) types: TypeColumns<Growing>,
+    /// The stacks lowering collects a node's children on ([`ExpressionStoreBuilder::list_mark`]).
+    lists: Lists,
     pub bindings: Arena<Binding>,
     pub labels: Arena<Label>,
     pub lifetimes: Arena<LifetimeRef>,
     pub binding_owners: FxHashMap<BindingId, ExprId>,
-    pub types: Arena<TypeRef>,
     block_scopes: Vec<BlockId>,
     ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
     pub(crate) type_hygiene: Vec<(TypeRefId, HygieneId)>,
@@ -451,20 +547,22 @@ pub struct ExpressionStoreBuilder {
 
     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
     // to `PatId`, and `PatId` can also map to `ExprSource` (the other way around is unaffected).
-    expr_map: FxHashMap<ExprSource, ExprOrPatIdPacked>,
+    // The forward maps are pushed to in lowering order and never read while lowering; `finish`
+    // sorts each into a `SourceTable`, a later push for a pointer replacing an earlier one.
+    expr_map: Vec<(ExprSource, ExprOrPatIdPacked)>,
     expr_map_back: ArenaMap<ExprId, ExprOrPatSource>,
 
-    pat_map: FxHashMap<PatSource, ExprOrPatIdPacked>,
+    pat_map: Vec<(PatSource, ExprOrPatIdPacked)>,
     pat_map_back: ArenaMap<PatId, ExprOrPatSource>,
 
-    label_map: FxHashMap<LabelSource, LabelId>,
+    label_map: Vec<(LabelSource, LabelId)>,
     label_map_back: ArenaMap<LabelId, LabelSource>,
 
     types_map_back: ArenaMap<TypeRefId, TypeSource>,
-    types_map: FxHashMap<TypeSource, TypeRefId>,
+    types_map: Vec<(TypeSource, TypeRefId)>,
 
     lifetime_map_back: ArenaMap<LifetimeRefId, LifetimeSource>,
-    lifetime_map: FxHashMap<LifetimeSource, LifetimeRefId>,
+    lifetime_map: Vec<(LifetimeSource, LifetimeRefId)>,
 
     binding_definitions:
         ArenaMap<BindingId, SmallVec<[PatId; 2 * size_of::<usize>() / size_of::<PatId>()]>>,
@@ -476,7 +574,7 @@ pub struct ExpressionStoreBuilder {
 
     template_map: Option<Box<PendingTemplate>>,
 
-    expansions: FxHashMap<InFile<MacroCallPtr>, MacroCallId>,
+    expansions: Vec<(InFile<MacroCallPtr>, MacroCallId)>,
 
     /// Diagnostics accumulated during lowering. These contain `AstPtr`s and so are stored in
     /// the source map (since they're just as volatile).
@@ -540,7 +638,563 @@ pub enum ExpressionStoreDiagnostics {
     MissingBody { node: InFile<SyntaxNodePtr>, kind: MissingBodyItemKind },
 }
 
+/// The stacks lowering collects a node's children on before it allocates the node, one per
+/// element type of a list. They are used in stack order: a nested node's children go above its
+/// parent's and are truncated away before the parent is allocated, so no list needs a `Vec`,
+/// `SmallVec` or `Box<[_]>` of its own.
+///
+/// To allocate a node from the lists above a mark, lowering moves the stacks out of the builder
+/// ([`ExpressionStoreBuilder::take_lists`], a move of a few `Vec` headers), builds the view from
+/// `lists.exprs_since(mark)` and the like, allocates it, and puts them back truncated to the mark
+/// ([`ExpressionStoreBuilder::put_lists`]): borrowing them in place would hold the builder
+/// shared while it allocates.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Lists {
+    exprs: Vec<ExprId>,
+    pats: Vec<PatId>,
+    types: Vec<TypeRefId>,
+    opt_types: Vec<Option<TypeRefId>>,
+    statements: Vec<Statement>,
+    arms: Vec<MatchArm>,
+    record_fields: Vec<RecordLitField>,
+    field_pats: Vec<RecordFieldPat>,
+    bounds: Vec<TypeBound>,
+}
+
+/// How high each list stack stood: [`ExpressionStoreBuilder::list_mark`]. Public because it is
+/// in the type of `ExprCollector::impl_trait_error_allocator`, which other crates pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListMark {
+    exprs: u32,
+    pats: u32,
+    types: u32,
+    opt_types: u32,
+    statements: u32,
+    arms: u32,
+    record_fields: u32,
+    field_pats: u32,
+    bounds: u32,
+}
+
+// Each `*_since` is the elements of one stack pushed since `mark`. It panics when the stack is
+// below the mark: lowering truncated past a mark it did not own.
+impl Lists {
+    #[inline]
+    pub(crate) fn exprs_since(&self, mark: ListMark) -> &[ExprId] {
+        &self.exprs[mark.exprs as usize..]
+    }
+
+    /// The expressions pushed since `mark`, to reorder or rewrite in place.
+    #[inline]
+    pub(crate) fn exprs_since_mut(&mut self, mark: ListMark) -> &mut [ExprId] {
+        &mut self.exprs[mark.exprs as usize..]
+    }
+
+    #[inline]
+    pub(crate) fn pats_since(&self, mark: ListMark) -> &[PatId] {
+        &self.pats[mark.pats as usize..]
+    }
+
+    #[inline]
+    pub(crate) fn pats_since_mut(&mut self, mark: ListMark) -> &mut [PatId] {
+        &mut self.pats[mark.pats as usize..]
+    }
+
+    /// The elements of a `TypeRef::Tuple`.
+    #[inline]
+    pub(crate) fn types_since(&self, mark: ListMark) -> &[TypeRefId] {
+        &self.types[mark.types as usize..]
+    }
+
+    /// A closure's argument types.
+    #[inline]
+    pub(crate) fn opt_types_since(&self, mark: ListMark) -> &[Option<TypeRefId>] {
+        &self.opt_types[mark.opt_types as usize..]
+    }
+
+    #[inline]
+    pub(crate) fn statements_since(&self, mark: ListMark) -> &[Statement] {
+        &self.statements[mark.statements as usize..]
+    }
+
+    #[inline]
+    pub(crate) fn arms_since(&self, mark: ListMark) -> &[MatchArm] {
+        &self.arms[mark.arms as usize..]
+    }
+
+    #[inline]
+    pub(crate) fn record_fields_since(&self, mark: ListMark) -> &[RecordLitField] {
+        &self.record_fields[mark.record_fields as usize..]
+    }
+
+    #[inline]
+    pub(crate) fn field_pats_since(&self, mark: ListMark) -> &[RecordFieldPat] {
+        &self.field_pats[mark.field_pats as usize..]
+    }
+
+    /// The bounds of a `TypeRef::ImplTrait` or `DynTrait`.
+    #[inline]
+    pub(crate) fn bounds_since(&self, mark: ListMark) -> &[TypeBound] {
+        &self.bounds[mark.bounds as usize..]
+    }
+
+    fn mark(&self) -> ListMark {
+        ListMark {
+            exprs: columns::len(self.exprs.len()),
+            pats: columns::len(self.pats.len()),
+            types: columns::len(self.types.len()),
+            opt_types: columns::len(self.opt_types.len()),
+            statements: columns::len(self.statements.len()),
+            arms: columns::len(self.arms.len()),
+            record_fields: columns::len(self.record_fields.len()),
+            field_pats: columns::len(self.field_pats.len()),
+            bounds: columns::len(self.bounds.len()),
+        }
+    }
+
+    fn truncate(&mut self, mark: ListMark) {
+        self.exprs.truncate(mark.exprs as usize);
+        self.pats.truncate(mark.pats as usize);
+        self.types.truncate(mark.types as usize);
+        self.opt_types.truncate(mark.opt_types as usize);
+        self.statements.truncate(mark.statements as usize);
+        self.arms.truncate(mark.arms as usize);
+        self.record_fields.truncate(mark.record_fields as usize);
+        self.field_pats.truncate(mark.field_pats as usize);
+        self.bounds.truncate(mark.bounds as usize);
+    }
+
+    fn clear(&mut self) {
+        let Lists {
+            exprs,
+            pats,
+            types,
+            opt_types,
+            statements,
+            arms,
+            record_fields,
+            field_pats,
+            bounds,
+        } = self;
+        exprs.clear();
+        pats.clear();
+        types.clear();
+        opt_types.clear();
+        statements.clear();
+        arms.clear();
+        record_fields.clear();
+        field_pats.clear();
+        bounds.clear();
+    }
+
+    /// The first stack that is not empty, by name: a builder finishes with every one empty, or
+    /// the ids left on it would land in the next store's lists.
+    fn stacked(&self) -> Option<&'static str> {
+        let Lists {
+            exprs,
+            pats,
+            types,
+            opt_types,
+            statements,
+            arms,
+            record_fields,
+            field_pats,
+            bounds,
+        } = self;
+        [
+            (exprs.is_empty(), "exprs"),
+            (pats.is_empty(), "pats"),
+            (types.is_empty(), "types"),
+            (opt_types.is_empty(), "opt_types"),
+            (statements.is_empty(), "statements"),
+            (arms.is_empty(), "arms"),
+            (record_fields.is_empty(), "record_fields"),
+            (field_pats.is_empty(), "field_pats"),
+            (bounds.is_empty(), "bounds"),
+        ]
+        .into_iter()
+        .find_map(|(empty, name)| (!empty).then_some(name))
+    }
+
+    fn capacity(&self) -> usize {
+        self.exprs.capacity()
+            + self.pats.capacity()
+            + self.types.capacity()
+            + self.opt_types.capacity()
+            + self.statements.capacity()
+            + self.arms.capacity()
+            + self.record_fields.capacity()
+            + self.field_pats.capacity()
+            + self.bounds.capacity()
+    }
+}
+
+/// What a builder grows while it lowers a store, kept per thread between stores
+/// ([`Scratch::take`], [`Scratch::give`]): a thread's scratch grows to its largest body once,
+/// and after that lowering a body allocates nothing per node, only the exact columns of the
+/// finished store.
+#[derive(Default)]
+struct Scratch {
+    columns: HirColumns<Growing>,
+    types: TypeColumns<Growing>,
+    lists: Lists,
+    expr_map: Vec<(ExprSource, ExprOrPatIdPacked)>,
+    pat_map: Vec<(PatSource, ExprOrPatIdPacked)>,
+    label_map: Vec<(LabelSource, LabelId)>,
+    types_map: Vec<(TypeSource, TypeRefId)>,
+    lifetime_map: Vec<(LifetimeSource, LifetimeRefId)>,
+    expansions: Vec<(InFile<MacroCallPtr>, MacroCallId)>,
+    expr_map_back: ArenaMap<ExprId, ExprOrPatSource>,
+    pat_map_back: ArenaMap<PatId, ExprOrPatSource>,
+    label_map_back: ArenaMap<LabelId, LabelSource>,
+    types_map_back: ArenaMap<TypeRefId, TypeSource>,
+    lifetime_map_back: ArenaMap<LifetimeRefId, LifetimeSource>,
+}
+
+/// The scratch sets a thread keeps, and the elements above which a set is dropped instead of
+/// kept, so that one huge body doesn't pin its memory.
+const POOL_SETS: usize = 4;
+const POOL_ELEMENTS: usize = 1 << 20;
+
+thread_local! {
+    /// This thread's spare scratch, a stack: lowering one store can run a query that lowers
+    /// another on the same thread, which takes the next set (or a fresh one) and gives it back
+    /// before the outer one finishes. Only this thread touches it: no lock, no shared write.
+    static POOL: RefCell<Vec<Scratch>> = const { RefCell::new(Vec::new()) };
+}
+
+impl Scratch {
+    fn take() -> Scratch {
+        POOL.try_with(|pool| pool.borrow_mut().pop()).ok().flatten().unwrap_or_default()
+    }
+
+    /// Empties `self` and keeps it for the next builder on this thread, unless the pool is
+    /// full, `self` is over [`POOL_ELEMENTS`] or the thread is exiting.
+    fn give(mut self) {
+        self.clear();
+        if self.capacity() > POOL_ELEMENTS {
+            return;
+        }
+        let _exiting = POOL.try_with(move |pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < POOL_SETS {
+                pool.push(self);
+            }
+        });
+    }
+
+    fn clear(&mut self) {
+        let Scratch {
+            columns,
+            types,
+            lists,
+            expr_map,
+            pat_map,
+            label_map,
+            types_map,
+            lifetime_map,
+            expansions,
+            expr_map_back,
+            pat_map_back,
+            label_map_back,
+            types_map_back,
+            lifetime_map_back,
+        } = self;
+        columns.clear();
+        types.clear();
+        lists.clear();
+        expr_map.clear();
+        pat_map.clear();
+        label_map.clear();
+        types_map.clear();
+        lifetime_map.clear();
+        expansions.clear();
+        expr_map_back.clear();
+        pat_map_back.clear();
+        label_map_back.clear();
+        types_map_back.clear();
+        lifetime_map_back.clear();
+    }
+
+    fn capacity(&self) -> usize {
+        self.columns.capacity()
+            + self.types.capacity()
+            + self.lists.capacity()
+            + self.expr_map.capacity()
+            + self.pat_map.capacity()
+            + self.types_map.capacity()
+    }
+}
+
+/// `map`'s entries in a map of exactly their room, leaving `map` empty with its capacity.
+fn take_map<K, V: Copy>(map: &mut ArenaMap<Idx<K>, V>) -> ArenaMap<Idx<K>, V> {
+    let len = map.iter().next_back().map_or(0, |(id, _)| id.into_raw().into_u32() as usize + 1);
+    let mut exact = ArenaMap::with_capacity(len);
+    exact.extend(map.iter().map(|(id, &value)| (id, value)));
+    map.clear();
+    exact
+}
+
 impl ExpressionStoreBuilder {
+    /// A builder on this thread's pooled scratch.
+    pub(crate) fn new() -> Self {
+        let Scratch {
+            columns,
+            types,
+            lists,
+            expr_map,
+            pat_map,
+            label_map,
+            types_map,
+            lifetime_map,
+            expansions,
+            expr_map_back,
+            pat_map_back,
+            label_map_back,
+            types_map_back,
+            lifetime_map_back,
+        } = Scratch::take();
+        ExpressionStoreBuilder {
+            columns,
+            types,
+            lists,
+            bindings: Arena::new(),
+            labels: Arena::new(),
+            lifetimes: Arena::new(),
+            binding_owners: FxHashMap::default(),
+            block_scopes: Vec::new(),
+            ident_hygiene: FxHashMap::default(),
+            type_hygiene: Vec::new(),
+            block_editions: FxHashMap::default(),
+            overflow_inheriting: FxHashSet::default(),
+            inference_roots: None,
+            expr_map,
+            expr_map_back,
+            pat_map,
+            pat_map_back,
+            label_map,
+            label_map_back,
+            types_map_back,
+            types_map,
+            lifetime_map_back,
+            lifetime_map,
+            binding_definitions: ArenaMap::default(),
+            field_map_back: Vec::new(),
+            pat_field_map_back: Vec::new(),
+            template_map: None,
+            expansions,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn alloc_type_ref(&mut self, type_ref: TypeRef<'_>) -> TypeRefId {
+        self.types.push(type_ref)
+    }
+
+    /// A `TypeRef::Path`, `path` moved into its table where [`Self::alloc_type_ref`] clones it.
+    #[inline]
+    pub(crate) fn alloc_path_type(&mut self, path: Path) -> TypeRefId {
+        self.types.push_path(path)
+    }
+
+    /// A `TypeRef::Fn`, `fn_type` moved into its table.
+    #[inline]
+    pub(crate) fn alloc_fn_type(&mut self, fn_type: FnType) -> TypeRefId {
+        self.types.push_fn(fn_type)
+    }
+
+    #[inline]
+    pub(crate) fn type_ref(&self, id: TypeRefId) -> TypeRef<'_> {
+        self.types.get(id)
+    }
+
+    #[inline]
+    pub(crate) fn type_ref_count(&self) -> usize {
+        self.types.len()
+    }
+
+    #[inline]
+    pub(crate) fn list_mark(&self) -> ListMark {
+        self.lists.mark()
+    }
+
+    #[inline]
+    pub(crate) fn push_list_expr(&mut self, expr: ExprId) {
+        self.lists.exprs.push(expr);
+    }
+
+    #[inline]
+    pub(crate) fn push_list_pat(&mut self, pat: PatId) {
+        self.lists.pats.push(pat);
+    }
+
+    #[inline]
+    pub(crate) fn push_list_type(&mut self, type_ref: TypeRefId) {
+        self.lists.types.push(type_ref);
+    }
+
+    #[inline]
+    pub(crate) fn push_list_opt_type(&mut self, type_ref: Option<TypeRefId>) {
+        self.lists.opt_types.push(type_ref);
+    }
+
+    #[inline]
+    pub(crate) fn push_list_statement(&mut self, statement: Statement) {
+        self.lists.statements.push(statement);
+    }
+
+    #[inline]
+    pub(crate) fn push_list_arm(&mut self, arm: MatchArm) {
+        self.lists.arms.push(arm);
+    }
+
+    #[inline]
+    pub(crate) fn push_list_record_field(&mut self, field: RecordLitField) {
+        self.lists.record_fields.push(field);
+    }
+
+    #[inline]
+    pub(crate) fn push_list_field_pat(&mut self, field: RecordFieldPat) {
+        self.lists.field_pats.push(field);
+    }
+
+    #[inline]
+    pub(crate) fn push_list_bound(&mut self, bound: TypeBound) {
+        self.lists.bounds.push(bound);
+    }
+
+    // For code that only reads its lists; to allocate a node from them, see `take_lists`.
+
+    #[inline]
+    pub(crate) fn exprs_since(&self, mark: ListMark) -> &[ExprId] {
+        self.lists.exprs_since(mark)
+    }
+
+    #[inline]
+    pub(crate) fn pats_since(&self, mark: ListMark) -> &[PatId] {
+        self.lists.pats_since(mark)
+    }
+
+    #[inline]
+    pub(crate) fn types_since(&self, mark: ListMark) -> &[TypeRefId] {
+        self.lists.types_since(mark)
+    }
+
+    /// The list stacks, moved out so a node can be allocated from them ([`Lists`]). The builder
+    /// holds empty stacks (no allocation) until [`Self::put_lists`] returns them; what is pushed
+    /// onto the builder meanwhile is lost.
+    #[inline]
+    pub(crate) fn take_lists(&mut self) -> Lists {
+        mem::take(&mut self.lists)
+    }
+
+    /// Puts back the stacks [`Self::take_lists`] took, truncated to `mark`.
+    #[inline]
+    pub(crate) fn put_lists(&mut self, mut lists: Lists, mark: ListMark) {
+        debug_assert_eq!(self.lists.stacked(), None, "pushed onto this stack while taken");
+        lists.truncate(mark);
+        self.lists = lists;
+    }
+
+    /// The last statement pushed since `mark`, taken off the stack; `None` when there is none
+    /// above `mark`.
+    #[inline]
+    pub(crate) fn pop_list_statement(&mut self, mark: ListMark) -> Option<Statement> {
+        match self.lists.statements.len() > mark.statements as usize {
+            true => self.lists.statements.pop(),
+            false => None,
+        }
+    }
+
+    /// The bounds pushed since `mark`, moved off the stack.
+    #[inline]
+    pub(crate) fn drain_bounds(&mut self, mark: ListMark) -> std::vec::Drain<'_, TypeBound> {
+        self.lists.bounds.drain(mark.bounds as usize..)
+    }
+
+    /// Pops every stack back to `mark`.
+    #[inline]
+    pub(crate) fn truncate_to(&mut self, mark: ListMark) {
+        self.lists.truncate(mark);
+    }
+
+    // The by-value allocations below move their cold values (paths, names, literals, generic
+    // arguments) into the store where building the view would clone them. Their lists are
+    // copied into the store's arrays, as `alloc_expr` copies a view's.
+
+    #[inline]
+    pub(crate) fn alloc_path_expr(&mut self, path: Path) -> ExprId {
+        self.columns.push_path_expr(path)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_path_pat(&mut self, path: Path) -> PatId {
+        self.columns.push_path_pat(path)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_literal_expr(&mut self, literal: Literal) -> ExprId {
+        self.columns.push_literal_expr(literal)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_offset_of_expr(&mut self, offset_of: OffsetOf) -> ExprId {
+        self.columns.push_offset_of_expr(offset_of)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_asm_expr(&mut self, asm: InlineAsm) -> ExprId {
+        self.columns.push_asm_expr(asm)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_method_call(
+        &mut self,
+        receiver: ExprId,
+        method_name: Name,
+        args: &[ExprId],
+        generic_args: Option<GenericArgs>,
+    ) -> ExprId {
+        self.columns.push_method_call(receiver, method_name, args, generic_args)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_record_lit(
+        &mut self,
+        path: Path,
+        fields: &[RecordLitField],
+        spread: RecordSpread,
+    ) -> ExprId {
+        self.columns.push_record_lit(path, fields.iter().cloned(), spread)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_record_pat(
+        &mut self,
+        path: Path,
+        args: &[RecordFieldPat],
+        ellipsis: bool,
+    ) -> PatId {
+        self.columns.push_record_pat(path, args.iter().cloned(), ellipsis)
+    }
+
+    #[inline]
+    pub(crate) fn alloc_tuple_struct_pat(
+        &mut self,
+        path: Path,
+        args: &[PatId],
+        ellipsis: Option<u32>,
+    ) -> PatId {
+        self.columns.push_tuple_struct_pat(path, args, ellipsis)
+    }
+
+    /// Gives the block `block` the tail `tail`, in place. Panics when `block` is not a block.
+    #[inline]
+    pub(crate) fn set_block_tail(&mut self, block: ExprId, tail: ExprId) {
+        self.columns.set_block_tail(block, tail)
+    }
+
     #[inline]
     pub(crate) fn alloc_expr(&mut self, expr: Expr<'_>) -> ExprId {
         self.columns.push_expr(expr)
@@ -582,10 +1236,15 @@ impl ExpressionStoreBuilder {
         self.columns.pat_count()
     }
 
+    /// The finished store and source map: each column, table and map copied out of the pooled
+    /// scratch at its exact length (one allocation per non-empty one, no `shrink_to_fit`
+    /// reallocation), the scratch given back to this thread's pool.
     pub fn finish(self) -> (ExpressionStore, ExpressionStoreSourceMap) {
         let Self {
             block_scopes,
             columns,
+            types,
+            lists,
             mut labels,
             mut bindings,
             binding_owners,
@@ -594,41 +1253,60 @@ impl ExpressionStoreBuilder {
             block_editions,
             overflow_inheriting,
             inference_roots: mut expr_roots,
-            mut types,
             mut lifetimes,
 
-            mut expr_map,
-            mut expr_map_back,
-            mut pat_map,
-            mut pat_map_back,
-            mut label_map,
-            mut label_map_back,
-            mut types_map_back,
-            mut types_map,
-            mut lifetime_map_back,
-            mut lifetime_map,
+            expr_map,
+            expr_map_back,
+            pat_map,
+            pat_map_back,
+            label_map,
+            label_map_back,
+            types_map_back,
+            types_map,
+            lifetime_map_back,
+            lifetime_map,
             mut binding_definitions,
             field_map_back,
             pat_field_map_back,
             template_map,
-            mut expansions,
+            expansions,
             diagnostics,
         } = self;
+        debug_assert_eq!(lists.stacked(), None, "lowering left a list on this stack");
+        let mut scratch = Scratch {
+            columns,
+            types,
+            lists,
+            expr_map,
+            pat_map,
+            label_map,
+            types_map,
+            lifetime_map,
+            expansions,
+            expr_map_back,
+            pat_map_back,
+            label_map_back,
+            types_map_back,
+            lifetime_map_back,
+        };
+        let columns = scratch.columns.freeze_into();
+        let types = scratch.types.freeze_into();
+        let expr_map = SourceTable::from_pushed(&mut scratch.expr_map);
+        let expr_map_back = take_map(&mut scratch.expr_map_back);
+        let pat_map = SourceTable::from_pushed(&mut scratch.pat_map);
+        let pat_map_back = take_map(&mut scratch.pat_map_back);
+        let label_map = SourceTable::from_pushed(&mut scratch.label_map);
+        let label_map_back = take_map(&mut scratch.label_map_back);
+        let types_map = SourceTable::from_pushed(&mut scratch.types_map);
+        let types_map_back = take_map(&mut scratch.types_map_back);
+        let lifetime_map = SourceTable::from_pushed(&mut scratch.lifetime_map);
+        let lifetime_map_back = take_map(&mut scratch.lifetime_map_back);
+        let expansions = SourceTable::from_pushed(&mut scratch.expansions);
+        scratch.give();
+
         labels.shrink_to_fit();
         bindings.shrink_to_fit();
-        types.shrink_to_fit();
         lifetimes.shrink_to_fit();
-
-        expr_map.shrink_to_fit();
-        expr_map_back.shrink_to_fit();
-        pat_map.shrink_to_fit();
-        pat_map_back.shrink_to_fit();
-        label_map.shrink_to_fit();
-        label_map_back.shrink_to_fit();
-        types_map_back.shrink_to_fit();
-        types_map.shrink_to_fit();
-        lifetime_map_back.shrink_to_fit();
-        lifetime_map.shrink_to_fit();
         binding_definitions.shrink_to_fit();
         let field_map_back = IdTable::from_pushed(field_map_back);
         let pat_field_map_back = IdTable::from_pushed(pat_field_map_back);
@@ -641,7 +1319,6 @@ impl ExpressionStoreBuilder {
                 implicit_capture_to_source: IdTable::from_pushed(implicit_capture_to_source),
             })
         });
-        expansions.shrink_to_fit();
 
         let has_exprs = !columns.is_empty() || !labels.is_empty() || !bindings.is_empty();
 
@@ -668,7 +1345,7 @@ impl ExpressionStoreBuilder {
                 let mut overflow_inheriting: Box<[_]> = overflow_inheriting.into_iter().collect();
                 overflow_inheriting.sort_unstable();
                 Some(Box::new(ExpressionOnlyStore {
-                    columns: columns.freeze(),
+                    columns,
                     bindings,
                     labels,
                     binding_owners,
@@ -719,16 +1396,28 @@ impl ExpressionStoreBuilder {
 }
 
 impl ExpressionStore {
-    const EMPTY: &ExpressionStore = &ExpressionStore {
-        expr_only: None,
-        types: Arena::new(),
-        lifetimes: Arena::new(),
-        type_hygiene: None,
-    };
-
+    /// The store with nothing in it. A `static` rather than a `const`: boxed columns can't be
+    /// made in a `const`. Empty columns allocate nothing.
     #[inline]
     pub fn empty() -> &'static ExpressionStore {
-        ExpressionStore::EMPTY
+        static EMPTY: LazyLock<ExpressionStore> = LazyLock::new(|| ExpressionStore {
+            expr_only: None,
+            types: TypeColumns::default(),
+            lifetimes: Arena::new(),
+            type_hygiene: None,
+        });
+        &EMPTY
+    }
+
+    /// The type ref `id`, decoded from the store's columns.
+    #[inline]
+    pub fn type_ref(&self, id: TypeRefId) -> TypeRef<'_> {
+        self.types.get(id)
+    }
+
+    #[inline]
+    pub fn type_refs(&self) -> impl Iterator<Item = (TypeRefId, TypeRef<'_>)> {
+        self.types.iter()
     }
 
     pub fn of(db: &dyn SourceDatabase, def: ExpressionStoreOwnerId) -> &ExpressionStore {
@@ -1108,17 +1797,16 @@ impl ExpressionStore {
     }
 
     pub fn visit_type_ref_children(&self, type_ref: TypeRefId, mut visitor: impl StoreVisitor) {
-        match &self[type_ref] {
+        match self.type_ref(type_ref) {
             TypeRef::Never | TypeRef::Placeholder | TypeRef::TypeParam(_) | TypeRef::Error => {}
-            &TypeRef::PatternType(ty, pat) => {
+            TypeRef::PatternType(ty, pat) => {
                 visitor.on_type(ty);
                 visitor.on_pat(pat)
             }
             TypeRef::Tuple(types) => visitor.on_types(types),
             TypeRef::Path(path) => visitor.on_path(path),
-            TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => visitor.on_type(*inner),
-            TypeRef::Reference(ref_type) => {
-                let RefType { ty, lifetime, mutability: _ } = &**ref_type;
+            TypeRef::RawPtr(inner, _) | TypeRef::Slice(inner) => visitor.on_type(inner),
+            TypeRef::Reference(RefType { ty, lifetime, mutability: _ }) => {
                 visitor.on_type(*ty);
                 visitor.on_lifetime_opt(*lifetime);
             }
@@ -1126,8 +1814,7 @@ impl ExpressionStore {
                 visitor.on_type(*ty);
                 visitor.on_anon_const_expr(*len);
             }
-            TypeRef::Fn(fn_type) => {
-                let FnType { params, is_varargs: _, is_unsafe: _, abi: _, binder: _ } = &**fn_type;
+            TypeRef::Fn(FnType { params, is_varargs: _, is_unsafe: _, abi: _, binder: _ }) => {
                 params.iter().for_each(|(_, param_ty)| visitor.on_type(*param_ty));
             }
             TypeRef::ImplTrait(bounds) | TypeRef::DynTrait(bounds) => {
@@ -1205,6 +1892,18 @@ impl ExpressionStore {
     #[inline]
     pub fn exprs(&self) -> impl Iterator<Item = (ExprId, Expr<'_>)> {
         self.expr_only.as_deref().into_iter().flat_map(|it| it.columns.exprs())
+    }
+
+    /// How many expressions the store holds.
+    #[inline]
+    pub fn expr_count(&self) -> usize {
+        self.expr_only.as_deref().map_or(0, |it| it.columns.expr_count())
+    }
+
+    /// The store's columns, `None` for a store without expressions.
+    #[cfg(test)]
+    pub(crate) fn hir_columns(&self) -> Option<&crate::hir::columns::HirColumns> {
+        self.expr_only.as_deref().map(|it| &it.columns)
     }
 
     #[inline]
@@ -1383,15 +2082,6 @@ impl Index<BindingId> for ExpressionStore {
     }
 }
 
-impl Index<TypeRefId> for ExpressionStore {
-    type Output = TypeRef;
-
-    #[inline]
-    fn index(&self, b: TypeRefId) -> &TypeRef {
-        &self.types[b]
-    }
-}
-
 impl Index<LifetimeRefId> for ExpressionStore {
     type Output = LifetimeRef;
 
@@ -1406,10 +2096,7 @@ impl Index<PathId> for ExpressionStore {
 
     #[inline]
     fn index(&self, index: PathId) -> &Self::Output {
-        let TypeRef::Path(path) = &self[index.type_ref()] else {
-            unreachable!("`PathId` always points to `TypeRef::Path`");
-        };
-        path
+        self.types.path(index)
     }
 }
 
@@ -1552,5 +2239,227 @@ impl ExpressionStoreSourceMap {
     /// Get a reference to the source map's diagnostics.
     pub fn diagnostics(&self) -> &[ExpressionStoreDiagnostics] {
         self.expr_only().map(|it| &*it.diagnostics).unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use salsa::plumbing::FromId;
+    use syntax::{SyntaxKind, TextSize};
+
+    use super::*;
+
+    /// A pointer to a node of `kind` at `start..end` in file (or, when `in_macro`, macro file)
+    /// `file`.
+    fn src<N: AstNode>(
+        file: u32,
+        in_macro: bool,
+        kind: SyntaxKind,
+        start: u32,
+        end: u32,
+    ) -> InFile<AstPtr<N>> {
+        let id = salsa::Id::from_bits(u64::from(file) + 1);
+        let file_id = match in_macro {
+            true => HirFileId::MacroFile(FromId::from_id(id)),
+            false => HirFileId::FileId(FromId::from_id(id)),
+        };
+        let range = TextRange::new(TextSize::from(start), TextSize::from(end));
+        let ptr = AstPtr::try_from_raw(SyntaxNodePtr::from_parts(kind, range));
+        InFile::new(file_id, ptr.expect("a pointer of its type"))
+    }
+
+    /// xorshift64*: the same pushes on every run.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) % n
+        }
+    }
+
+    const EXPR_KINDS: [SyntaxKind; 3] =
+        [SyntaxKind::PATH_EXPR, SyntaxKind::CALL_EXPR, SyntaxKind::LITERAL];
+
+    /// A pointer from a small domain, so that pushes repeat keys.
+    fn seeded_src(rng: &mut Seeded) -> ExprSource {
+        let start = rng.below(8) as u32;
+        let end = start + rng.below(4) as u32;
+        let kind = EXPR_KINDS[rng.below(3) as usize];
+        src(rng.below(3) as u32, rng.below(2) == 1, kind, start, end)
+    }
+
+    #[test]
+    fn a_source_table_answers_as_a_hash_map_does() {
+        for seed in 0..64 {
+            let mut rng = Seeded(seed * 2 + 1);
+            let mut pushed = Vec::new();
+            let mut model = FxHashMap::default();
+            for value in 0..rng.below(300) as u32 {
+                let key = seeded_src(&mut rng);
+                pushed.push((key, value));
+                model.insert(key, value);
+            }
+            let room = pushed.capacity();
+            let table = SourceTable::from_pushed(&mut pushed);
+            assert!(pushed.is_empty() && pushed.capacity() == room, "the scratch keeps its room");
+
+            assert_eq!(table.len(), model.len());
+            for (key, value) in &model {
+                assert_eq!(table.get(key), Some(value), "the last push of a key wins");
+            }
+            let absent = src::<ast::Expr>(7, false, SyntaxKind::PATH_EXPR, 0, 0);
+            assert_eq!(table.get(&absent), None);
+
+            let keys: Vec<_> = table.iter().map(|(key, _)| key.source_key()).collect();
+            assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "iteration is in key order");
+            let mut sorted: Vec<_> = model.keys().map(SourceKey::source_key).collect();
+            sorted.sort_unstable();
+            assert_eq!(keys, sorted);
+
+            let again = SourceTable::from_sorted(table.entries().to_vec().into_boxed_slice());
+            assert_eq!(again.as_ref(), Some(&table));
+            if table.len() > 1 {
+                let mut reversed = table.entries().to_vec();
+                reversed.reverse();
+                assert_eq!(SourceTable::from_sorted(reversed.into_boxed_slice()), None);
+            }
+        }
+    }
+
+    #[test]
+    fn files_come_before_macro_files_then_ranges_then_kinds() {
+        let ordered: [ExprSource; 5] = [
+            src(0, false, SyntaxKind::CALL_EXPR, 0, 9),
+            src(0, false, SyntaxKind::CALL_EXPR, 1, 2),
+            src(0, false, SyntaxKind::CALL_EXPR, 1, 3),
+            src(1, false, SyntaxKind::PATH_EXPR, 0, 1),
+            src(0, true, SyntaxKind::PATH_EXPR, 0, 1),
+        ];
+        let mut pushed: Vec<_> = ordered.iter().rev().map(|&key| (key, ())).collect();
+        let table = SourceTable::from_pushed(&mut pushed);
+        assert_eq!(table.iter().map(|(&key, _)| key).collect::<Vec<_>>(), ordered);
+        let (call, path) = (SyntaxKind::CALL_EXPR, SyntaxKind::PATH_EXPR);
+        assert!(u16::from(path) != u16::from(call));
+        let same_range = [src::<ast::Expr>(0, false, call, 0, 1), src(0, false, path, 0, 1)];
+        let by_kind = same_range[0].source_key() < same_range[1].source_key();
+        assert_eq!(by_kind, u16::from(call) < u16::from(path));
+    }
+
+    fn empty_pool() {
+        POOL.with(|pool| pool.borrow_mut().clear());
+    }
+
+    fn pooled() -> usize {
+        POOL.with(|pool| pool.borrow().len())
+    }
+
+    /// A small store: type refs, expressions and patterns made through the list stacks, and
+    /// source maps with repeated pointers.
+    fn lower_one(builder: &mut ExpressionStoreBuilder, shift: u32) {
+        builder.inference_roots = Some(SmallVec::new());
+        let unit = builder.alloc_type_ref(TypeRef::UNIT);
+        let mark = builder.list_mark();
+        builder.push_list_type(unit);
+        builder.push_list_type(unit);
+        let lists = builder.take_lists();
+        let tuple = builder.alloc_type_ref(TypeRef::Tuple(lists.types_since(mark)));
+        builder.put_lists(lists, mark);
+        let missing = builder.alloc_expr(Expr::Missing);
+        let outer = builder.list_mark();
+        builder.push_list_expr(missing);
+        let inner = builder.list_mark();
+        builder.push_list_expr(missing);
+        builder.push_list_expr(missing);
+        let lists = builder.take_lists();
+        let tuple_expr = builder.alloc_expr(Expr::Tuple { exprs: lists.exprs_since(inner) });
+        builder.put_lists(lists, inner);
+        assert_eq!(builder.exprs_since(outer), &[missing], "the inner list is gone");
+        builder.push_list_expr(tuple_expr);
+        let lists = builder.take_lists();
+        let call = builder.alloc_expr(Expr::Call { callee: missing, args: lists.exprs_since(outer) });
+        builder.put_lists(lists, outer);
+        let wild = builder.alloc_pat(Pat::Wild);
+        for at in [shift, shift + 1, shift] {
+            builder.expr_map.push((src(0, false, SyntaxKind::CALL_EXPR, at, at + 2), call.into()));
+        }
+        builder.pat_map.push((src(0, false, SyntaxKind::WILDCARD_PAT, 4, 5), wild.into()));
+        builder.types_map.push((src(0, false, SyntaxKind::TUPLE_TYPE, 6, 9), tuple));
+        builder.expr_map_back.insert(call, src(0, false, SyntaxKind::CALL_EXPR, shift, shift + 2));
+        builder.types_map_back.insert(tuple, src(0, false, SyntaxKind::TUPLE_TYPE, 6, 9));
+    }
+
+    fn finished(shift: u32) -> (ExpressionStore, ExpressionStoreSourceMap) {
+        let mut builder = ExpressionStoreBuilder::new();
+        lower_one(&mut builder, shift);
+        builder.finish()
+    }
+
+    #[test]
+    fn nested_builders_take_the_pool_in_stack_order() {
+        empty_pool();
+        let mut outer = ExpressionStoreBuilder::new();
+        outer.alloc_expr(Expr::Missing);
+        outer.inference_roots = Some(SmallVec::new());
+        let mut inner = ExpressionStoreBuilder::new();
+        inner.alloc_expr(Expr::Missing);
+        inner.inference_roots = Some(SmallVec::new());
+        let (outer_at, inner_at) =
+            (outer.columns.expr_kind.as_ptr(), inner.columns.expr_kind.as_ptr());
+        assert_ne!(outer_at, inner_at, "a nested builder has scratch of its own");
+
+        let _ = inner.finish();
+        let _ = outer.finish();
+        assert_eq!(pooled(), 2);
+        let first = ExpressionStoreBuilder::new();
+        let second = ExpressionStoreBuilder::new();
+        assert_eq!(first.columns.expr_kind.as_ptr(), outer_at, "the last given is taken first");
+        assert_eq!(second.columns.expr_kind.as_ptr(), inner_at);
+        assert!(first.columns.is_empty() && second.columns.is_empty(), "given back emptied");
+        assert_eq!(pooled(), 0);
+    }
+
+    #[test]
+    fn a_store_is_the_same_on_fresh_or_reused_scratch() {
+        empty_pool();
+        let (fresh, fresh_map) = finished(0);
+        assert_eq!(pooled(), 1);
+        let _ = finished(10);
+        let (reused, reused_map) = finished(0);
+        assert_eq!(pooled(), 1, "one set is enough for builders one after another");
+        assert_eq!(reused, fresh);
+        assert_eq!(reused_map, fresh_map);
+        let (fresh_only, reused_only) =
+            (fresh_map.expr_only.as_deref().unwrap(), reused_map.expr_only.as_deref().unwrap());
+        assert_eq!(reused_only.expr_map, fresh_only.expr_map);
+        assert_eq!(reused_only.pat_map, fresh_only.pat_map);
+        assert_eq!(reused_map.types_map, fresh_map.types_map);
+
+        assert_eq!(fresh_only.expr_map.len(), 2, "a repeated pointer is one entry");
+        let call = fresh.exprs().find(|(_, expr)| matches!(expr, Expr::Call { .. })).unwrap().0;
+        let pushed_twice = src(0, false, SyntaxKind::CALL_EXPR, 0, 2);
+        assert_eq!(fresh_only.expr_map.get(&pushed_twice), Some(&call.into()));
+        let Expr::Call { args, .. } = fresh.expr(call) else { unreachable!() };
+        assert!(matches!(fresh.expr(args[1]), Expr::Tuple { exprs } if exprs.len() == 2));
+        let tuple = fresh.type_refs().find(|(_, ty)| matches!(ty, TypeRef::Tuple(_))).unwrap();
+        assert!(matches!(tuple.1, TypeRef::Tuple(types) if types.len() == 2));
+        let tuple_src = src(0, false, SyntaxKind::TUPLE_TYPE, 6, 9);
+        assert_eq!(fresh_map.types_map.get(&tuple_src), Some(&tuple.0));
+    }
+
+    #[test]
+    fn the_pool_keeps_few_and_small_sets() {
+        empty_pool();
+        let builders: Vec<_> = (0..POOL_SETS + 2).map(|_| ExpressionStoreBuilder::new()).collect();
+        builders.into_iter().for_each(|builder| drop(builder.finish()));
+        assert_eq!(pooled(), POOL_SETS);
+
+        empty_pool();
+        let mut huge = ExpressionStoreBuilder::new();
+        huge.columns.expr_kind.reserve(POOL_ELEMENTS + 1);
+        let _ = huge.finish();
+        assert_eq!(pooled(), 0, "a set over the cap is dropped");
     }
 }

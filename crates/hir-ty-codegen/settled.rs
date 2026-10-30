@@ -7,6 +7,8 @@
 //! small function of another crate itself. Neither is in the source. Both are in the symbols
 //! of what rustc built, where a copy ends in the crate that made it, so that is what is read.
 
+#![forbid(unsafe_code)]
+
 use base_db::Crate;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};

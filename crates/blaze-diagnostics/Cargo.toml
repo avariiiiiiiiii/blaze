@@ -20,11 +20,16 @@ annotate-snippets.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 memchr.workspace = true
+ra-ap-rustc_lexer.workspace = true
+ra-ap-rustc_parse_format.workspace = true
+rustc_apfloat = "0.2.3"
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 smallvec.workspace = true
 unicode-ident.workspace = true
+unicode-normalization.workspace = true
+unicode-security.workspace = true
 
 base-db.workspace = true
 blaze-api.workspace = true
@@ -38,6 +43,7 @@ hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-borrowck.workspace = true
 intern.workspace = true
+rustc_abi.workspace = true
 rustc_type_ir.workspace = true
 span.workspace = true
 stdx.workspace = true

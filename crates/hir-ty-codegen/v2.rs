@@ -24,6 +24,7 @@ use hir_ty_mir::mir::MirSpan;
 
 use crate::{Instance, Pending, fragment};
 
+pub(crate) mod allocator;
 pub(crate) mod backend;
 pub(crate) mod build;
 pub(crate) mod convert;
@@ -99,6 +100,8 @@ pub(crate) enum Kind {
     Asm(String),
     /// The C `main` that runs the program's `fn main`.
     Start(FunctionId),
+    /// A function of the program's allocator shim.
+    Allocator(allocator::Forward),
 }
 
 /// A static as the front end holds it.

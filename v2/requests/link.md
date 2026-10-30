@@ -350,3 +350,49 @@ calling the old code, or the link fails naming a caller of the removed function.
   `Writer::file`). 7.5: not applied (a proposal). 7.6 applied: `blaze_link::fuzz_read`.
 
 > applied: noted; 5 to 7 are lane link's own.
+
+## 10. From speed-link-edge-live: encode the live message once, and a shorter AArch64 stub
+
+Status: open. For lead `link` (`crates/blaze-link/src/live.rs`, `commit.rs`, `table.rs`). The
+`blaze-live` side is in place, and the bytes on the wire are unchanged. See
+`docs/v2/plan/lanes/link/speed-link-edge-live.md`.
+
+1. `live.rs` `message()`: each piece is copied (`self.new.bytes(piece).to_vec()`) into an owned
+   `Patch`. `blaze_live::patch::PatchRef<'a>` has the same fields, borrowing: `code` and `data`
+   are `&'a [(u64, &'a [u8])]`, and `rebase`, `cells`, `frames` and `windows` are slices. Build
+   the `(address, &[u8])` list over `self.new.bytes(piece)` and call
+   `PatchRef::encode_into(&mut out)`, which reserves `encoded_len()` and writes once.
+   `Patch::with(|it| ..)` gives the same view of an owned `Patch`, for tests.
+2. `commit.rs`: `Writes::message` is `Option<(u64, Message)>`, encoded in the step
+   (`message.encode()`). Carrying the bytes encoded by item 1 (`Option<(u64, Vec<u8>)>`) makes
+   one buffer, moved into the one `Effect::Write`, which already writes a temp file and renames
+   it. `RollBack` and `Restart` take `Message::encode_into` the same way.
+3. `table.rs` AArch64 stub (6 instructions now: `adrp`, `ldr` of the cell, `movz`, `movk`, `ldr
+   x16, [x16, x17]`, `br`): while `slot * 8 < 32768`, `adrp x16, cell; ldr x16, [x16,
+   :lo12:cell]; ldr x16, [x16, #slot*8]; br x16` (4). Up to 2^21 slots, add `add x16, x16,
+   #(slot*8 >> 12), lsl #12` before the load (5). Pad it to 24 bytes. That is one register and
+   two instructions fewer on every call; the loads stay address dependent, so the cell's release
+   store still orders the slots.
+
+> forwarded to link: lane link's paths.
+
+## 7. From speed-link-edge-macho (found by speed-link-edge-macho-dylib): a name index per `Shared`
+
+Status: open. For lead `link`.
+
+What is slow: `native.rs:672-677` builds an `FxHashMap<&str, (usize, &SharedSymbol)>` over every
+symbol of every shared library on every link (libSystem's stub alone is about 10k names) only to
+look up the names the link imports.
+
+The change: `model.rs` `Shared` gains `pub index: Vec<u32>` (open addressing, a power of two
+long, at most half full, each slot an index into `symbols` or `u32::MAX`, slot
+`FxBuildHasher.hash_one(name) as usize & (len - 1)`, probed linearly) and
+`impl Shared { pub fn find(&self, hash: u64, name: &str) -> Option<&SharedSymbol> }`. `native.rs`
+hashes each wanted name once and asks each library in order
+(`libraries.iter().enumerate().find_map(|(at, (_, it))| it.find(hash, name).map(|s| (at, s)))`),
+the same first-library-wins answer. The readers build it once per file: Mach-O's `tbd.rs`
+already builds exactly this table to deduplicate (`Seen`), a 3-line move; `dylib.rs`, ELF and
+COFF build it the same way.
+
+Why: the work becomes proportional to the imports, not the exports, and is done once per parsed
+input rather than per link.

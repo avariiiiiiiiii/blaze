@@ -17,7 +17,7 @@ use syntax::{AstNode, SyntaxNode, ast, ast::HasName as _};
 use crate::cx::Cx;
 
 /// What a use names.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Def {
     Item(ModuleDef),
     Field(hir::Field),
@@ -395,16 +395,11 @@ fn closure_index(cx: &Cx<'_, '_>, parent: Option<&InFile<SyntaxNode>>, closure: 
 
 /// Whether a definition at `node` is the parent of the definitions written in it.
 pub(super) fn is_def_parent(node: &SyntaxNode) -> bool {
-    ast::Module::can_cast(node.kind())
-        || ast::Fn::can_cast(node.kind())
-        || ast::Const::can_cast(node.kind())
-        || ast::Static::can_cast(node.kind())
-        || ast::Adt::can_cast(node.kind())
-        || ast::Variant::can_cast(node.kind())
-        || ast::Trait::can_cast(node.kind())
-        || ast::Impl::can_cast(node.kind())
-        || ast::TypeAlias::can_cast(node.kind())
-        || ast::ClosureExpr::can_cast(node.kind())
+    use syntax::SyntaxKind::*;
+    matches!(
+        node.kind(),
+        MODULE | FN | CONST | STATIC | STRUCT | ENUM | UNION | VARIANT | TRAIT | IMPL | TYPE_ALIAS | CLOSURE_EXPR
+    )
 }
 
 /// The definition `node`'s is in (`opt_local_parent`): the nearest enclosing one, through a
@@ -416,7 +411,7 @@ pub(super) fn def_parent(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<In
 
 /// [`def_parent`], or the `extern` block in between: what deprecation is inherited from.
 pub(super) fn attr_parent(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<InFile<SyntaxNode>> {
-    parent(cx, node, |it| is_def_parent(it) || ast::ExternBlock::can_cast(it.kind()))
+    parent(cx, node, |it| is_def_parent(it) || it.kind() == syntax::SyntaxKind::EXTERN_BLOCK)
 }
 
 fn parent(

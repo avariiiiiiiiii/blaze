@@ -101,6 +101,8 @@ impl salsa::Database for RootDatabase {}
 
 impl Drop for RootDatabase {
     fn drop(&mut self) {
+        // SAFETY: `storage` is dropped here once, in `RootDatabase`'s own `drop`, and nothing
+        // reads it after: no other code takes it out of its `ManuallyDrop`.
         unsafe { ManuallyDrop::drop(&mut self.storage) };
     }
 }

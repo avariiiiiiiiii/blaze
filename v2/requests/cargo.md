@@ -950,3 +950,315 @@ critical path). `serve/plane.rs:494` matches `PlaneOutput::Run { id, pool, near 
 where the task goes to the pool, submit it with `Pool::submit_critical` when `critical`
 (as `blaze_graph::exec` does), so a critical task runs on a fast group (P cores on Apple).
 Why: docs/v2/plan/design/hardware.md, threads row: the critical path on the fast cores.
+
+> forwarded to cargo: `crates/blaze-cargo/src/serve/plane.rs` is lane cargo's.
+
+## From speed-link-edge-ci-ui (2026-10-29): `cargo/client.rs` and `cargo/say.rs`, one draw per read
+
+What: `blaze_ui::Live` gains `records_into(&mut self, records: &[Record], now_ns, out: &mut
+String)`: every record's staying lines in order, then one draw of the region. The screen
+ends exactly as after `record` for each in turn; the bytes are fewer (one region draw, not
+one per record). `record_into` and `tick_into` write into a caller's `String` too, and
+`Plain::record_into`/`tick_into` likewise. Nothing that compiles today stops compiling.
+
+The edit: in `client.rs` `exchange`, collect the records of one `next(&mut got)` loop into a
+`Vec<Record>` (cleared each read), and hand them to a new `Shown::records(&mut self,
+records: &[Record])` before the `Answer::Reply` arm's `shown.done()` and after the loop. In
+`say.rs`, `Shown` keeps one `out: String`; `records` does `event_out`, the `Began` reset (a
+`Began` past the first splits the batch there: the records before it go to the old
+rendering, then `finish`, then the rest to the new) and `self.records.extend`, then
+`live.records_into(batch, now_ns, &mut self.out)` (or `plain.record_into` per record) and
+one `self.write(&self.out)`. `tick` uses `tick_into` into the same `out`.
+
+Why: a cold build sends thousands of records, and a 64 KiB read holds hundreds. Each now
+costs a region redraw and an `eprint!`; batched, a read is one draw and one write.
+
+Lane speed-link-edge-ci-ui's notes: docs/v2/plan/lanes/ci/speed-link-edge-ci-ui.md.
+
+**From cargo-daemon-units, speed (to lanes codegen, link, store/concurrency, core):**
+- link: `blaze_link::target::locate(&Output, &[NativeLib], &[PathBuf]) -> Result<Vec<Located { path:
+  PathBuf, name: String, kind: NativeKind }>, LinkError>`: the native inputs found, in link order, *not
+  read*. `serve/unit` hashes each one with a single `stat` through `blaze_usercode::inputs::Files` and
+  reads only the libraries the kept image does not already have. This replaces the asked
+  `target::natives`, which read every library on every link.
+- codegen: `HirFrontend::new` should take the build-time set as `Arc<BuildTime>` (today every compile
+  clones the job's `FxHashSet`), and `Build::run` should take one `Origin` per call, not one per root
+  (today a `String` is cloned for every root).
+- store/concurrency: a lock-free read view of the store (`blaze_cas::Reader`) on `JobInput`.
+  `fresh`, `kept` and the codegen run take `store.read()` on the job's `RwLock` today.
+- core: batched `statx` (io_uring, or kqueue on macOS) for a list of paths. `fresh` makes one `stat` per
+  native input of each unit.
+
+> forwarded to cargo: `cargo/client.rs` and `cargo/say.rs` are lane cargo's (`blaze_ui::Live` already has `records_into`, the requester's).
+
+## 16. From cargo-daemon (2026-10-29; to usercode, codegen, core, safety, and answers to speed-runtime-plane, core and cargo-cli)
+
+The daemon's store has no lock now: `Daemon` owns `Store`, only the loop writes it, and
+`JobInput.store` is a `blaze_cas::Reader` (each task takes `blaze_cas::enter()` once and reads
+under that guard). Two reads still take `&Store`:
+
+- **usercode** (`crates/blaze-usercode/src/index.rs:177`): `index::find` takes `&Store`. Asked:
+  `find(store: &Reader, guard: &Guard, run, inputs)` (or generic over a get trait `blaze_cas`
+  gives both), returning the hit's bytes borrowed from the guard. `serve/unit/script.rs:405`
+  (a build script's cache check, on a worker) does not build until it lands.
+- **codegen** (`crates/blaze-codegen/src/driver.rs:47`): `Lookup::get` returns `Vec<u8>`, so
+  every template read from the store is copied. Asked: `fn get(&self, key) -> Result<Option<&[u8]>,
+  String>` (read in place, valid while the build's guard is held). The units child implements
+  `Lookup` on a reader with its guard in `serve/unit/codegen.rs` meanwhile.
+- **core** (`crates/blaze-graph`): a batched `PlaneInput::Add` for a range of ids: names in one
+  string with offsets, deps as CSR (`offsets: Vec<u32>, deps: Vec<NodeId>`), keys and costs as
+  columns. Today `Spec` holds a `String` and a `Vec<NodeId>` per node, so a 10k-unit build makes
+  20k small allocations to plan. `serve/plane.rs` already reserves contiguous ids and shares one
+  work function per batch, so it can hand the columns over as is.
+- **safety** (`crates/hir-ty-ub/src/lib.rs:28`): `check::run_test`, `Config` and `Outcome` are
+  re-exported but `src/check.rs` is not there. `blaze test --ub` is wired end to end in
+  `serve/job.rs` (a select node once every unit is checked, then one `evaluate` task per test,
+  each reported as a `TestResult`); `Front::evaluate` in `serve/unit` calls `run_test` and does
+  not build until it lands.
+
+Done, answering earlier requests:
+- speed-runtime-plane: `serve/plane.rs` uses `step_into` and `cancel_into` with one reused buffer.
+- core: `PlaneOutput::Run.critical` goes to `Pool::submit_critical`.
+- cargo-cli (section 15): `Request::Test { args, ub }` reaches `Front::tests` through
+  `Selection { filter, args, all, ub }`; with `ub`, the job's goal is `Goal::Check` and nothing is
+  compiled, linked or run.
+
+> applied (usercode, DONE): `blaze_usercode::index::find(store: &Reader, guard: &Guard, run, inputs)`, the hit borrowed from the guard; `Run::begin` (which holds the `&Store`) uses `index::find_held`; both share one search; `run.rs` test checks the two read the same bytes. forwarded to codegen (`Lookup::get` in place), core-plane (batched `PlaneInput::Add`; `plane.rs` is core-plane's while it runs), safety (`hir-ty-ub/src/check.rs`).
+
+## From safety-audit
+
+From `safety-audit-cargodiag` (report `/tmp/blaze-lanes/v2-safety-audit-cargodiag.md`). The
+workspace is about to deny `unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks` and
+`clippy::multiple_unsafe_ops_per_block`. These are comments, splits and crate-root attributes
+only: none of them changes behavior. Each split keeps the original order of evaluation and the
+original `&&`/`||` short-circuiting.
+
+> forwarded to cargo: `blaze-cargo` and `load-cargo` are lane cargo's while it runs.
+
+### blaze-cargo
+
+- `crates/blaze-cargo/src/serve.rs:228` block: 2 ops (`libc::signal` twice). Split:
+  ```rust
+  // SAFETY: `handler` is `signalled`, an `extern "C" fn(c_int)` that only stores to an atomic,
+  // which is async-signal-safe; were it to lock or allocate, a signal arriving inside malloc
+  // could deadlock or corrupt the heap.
+  unsafe { libc::signal(libc::SIGTERM, handler) };
+  // SAFETY: the same handler as for SIGTERM, which only stores to an atomic.
+  unsafe { libc::signal(libc::SIGINT, handler) };
+  ```
+- `crates/blaze-cargo/src/cargo/backend.rs:48` block: 2 ops (`set_var` twice), and the comment
+  doesn't say where "before any thread" is upheld. Split:
+  ```rust
+  // SAFETY: `set_var` races only with another thread using the environment; `follow_profile`
+  // runs from `cargo::command` (`cargo/mod.rs:80`) on the main thread, after `toolchain::settle`
+  // joined its scoped threads and before any other starts; were one running, its `getenv` could
+  // read freed memory.
+  unsafe { std::env::set_var(BACKEND, "llvm") };
+  if std::env::var_os(OPTIMIZATION).is_none() {
+      // SAFETY: still on the main thread with no other running, as for `BACKEND` above.
+      unsafe { std::env::set_var(OPTIMIZATION, level) };
+  }
+  ```
+- `crates/blaze-cargo/src/cargo/client.rs:144` block: 2 ops (`GetHandleInformation`,
+  `SetHandleInformation`). Split, keeping the `&&` chain:
+  ```rust
+  // SAFETY: `GetHandleInformation` checks `handle` and fails on a number that is no open
+  // handle, and `flags` is a `u32` it only writes; no Rust memory rests on the handle.
+  let held = unsafe { GetHandleInformation(handle, &mut flags) } != 0
+      && flags & HANDLE_FLAG_INHERIT != 0
+      // SAFETY: `handle` was just found open and inheritable; clearing the flag touches no
+      // memory, and `Inherited`'s drop sets it again. A number closed and reused meanwhile only
+      // has that handle's inheritance changed.
+      && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0;
+  ```
+- `crates/blaze-cargo/src/cargo/toolchain.rs:179` block: 6 ops (`set_var` ×5, `remove_var`), and
+  the comment doesn't say where "before any thread" is upheld. Split into one block per call, in
+  the same order:
+  ```rust
+  // SAFETY: `set_var` races only with another thread using the environment; `use_toolchain` runs
+  // only from `settle` (line 140), which `cargo::command` calls on the main thread once its
+  // scoped threads are joined and before any other starts; were one running, its `getenv` could
+  // read freed memory.
+  unsafe { std::env::set_var("CARGO", exe("cargo")) };
+  // SAFETY: main thread, no other running, as for `CARGO` above.
+  unsafe { std::env::set_var("RUSTC", exe("rustc")) };
+  // SAFETY: main thread, no other running, as for `CARGO` above.
+  unsafe { std::env::set_var("RUSTDOC", exe("rustdoc")) };
+  // SAFETY: main thread, no other running, as for `CARGO` above.
+  unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", dir) };
+  // SAFETY: main thread, no other running, as for `CARGO` above.
+  unsafe { std::env::remove_var("RUSTUP_TOOLCHAIN_SOURCE") };
+  if let Ok(path) = std::env::join_paths(path) {
+      // SAFETY: main thread, no other running, as for `CARGO` above.
+      unsafe { std::env::set_var("PATH", path) };
+  }
+  ```
+- `crates/blaze-cargo/src/cargo/layout.rs:36` block: the comment doesn't say where its
+  invariant is upheld. Proposed: `// SAFETY: \`set_var\` races only with another thread using the environment; \`cargo::command\` (\`cargo/mod.rs:77\`) calls this on the main thread before it starts any; were one running, its \`getenv\` could read freed memory.`
+- `crates/blaze-cargo/src/cargo/toolchain/library.rs:397` block: as for layout.rs. Proposed:
+  `// SAFETY: \`set_var\` races only with another thread using the environment; \`publish\` is called from blaze-engine's \`main\` (\`crates/blaze-engine/src/lib.rs:8041\`) before anything there starts a thread; were one running, its \`getenv\` could read freed memory.`
+- `crates/blaze-cargo/src/cargo/toolchain/library.rs:403` block: as for layout.rs. Proposed:
+  `// SAFETY: \`set_var\` races only with another thread using the environment; \`publish_fetched\` is called only from \`toolchain::settle\` (\`toolchain.rs:139\`) on the main thread, after its scoped threads are joined; were one running, its \`getenv\` could read freed memory.`
+- `crates/blaze-cargo/src/cargo/keyed.rs:258` block (test): no SAFETY. Proposed: the same comment as the one for line 255 below.
+- `crates/blaze-cargo/src/cargo/keyed.rs:260` block (test): no SAFETY. Proposed: the same comment as the one for line 255 below.
+- `crates/blaze-cargo/src/cargo/keyed.rs:255` MAY BE UNSOUND (test only): the comment ("no other
+  thread of this test reads this variable") is not what `set_var` needs. Tests run on parallel
+  threads, and C code calling `getenv` on any of them (`getaddrinfo`, `localtime`, ...) races with
+  the rewrite of `environ`, whatever the variable. std's own `env::var`/`set_var` share a lock.
+  If no test in blaze-cargo's test binary reaches libc's `getenv` from C, use:
+  `// SAFETY: std's \`env::var\` and \`set_var\` share one lock, so other tests' \`std::env\` calls don't race this; no test in this binary calls libc's \`getenv\` from C on another thread, the race \`set_var\` warns of, which could read freed memory.`
+  If one does, check `var` in a child process given the variable with `Command::env` instead.
+- `crates/blaze-cargo/src/cargo/say.rs:116` block: its comment is about the `ioctl` on the next
+  line, not about `zeroed`. Proposed: `// SAFETY: \`winsize\` is four \`c_ushort\`s, for which all zeros is a value.`
+- `crates/blaze-cargo/src/cargo/say.rs:117` block: no SAFETY. Proposed: `// SAFETY: \`TIOCGWINSZ\` writes one \`winsize\` through its third argument, which \`&mut size\` is for the call; on failure it writes nothing and \`size\` stays zeros.`
+- `crates/blaze-cargo/src/socket/windows.rs:76` block: 3 ops (`text.add(at)` and its deref,
+  which sit in the `take_while` closure but count toward this block, plus
+  `slice::from_raw_parts`). Split:
+  ```rust
+  let len = (0..)
+      .take_while(|&at| {
+          // SAFETY: `text` is the zero-ended UTF-16 `ConvertSidToStringSidW` allocated, and
+          // `take_while` stops at its zero, so `at` never passes the end of it.
+          let unit = unsafe { text.add(at) };
+          // SAFETY: `unit` points at a `u16` of that allocation, which lives until the
+          // `LocalFree` below.
+          unsafe { *unit } != 0
+      })
+      .count();
+  // SAFETY: the `len` units before the zero are initialized `u16`s of the allocation, which is
+  // not written to or freed until the `LocalFree` below.
+  let written = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+  ```
+- `crates/blaze-cargo/src/socket/windows.rs:187` block: 2 ops (two derefs of `entry`). Split:
+  ```rust
+  let entry = entry.cast::<ACCESS_ALLOWED_ACE>();
+  // SAFETY: `GetAce` set `entry` to an entry of `list`, which lives in `descriptor` until
+  // `_descriptor` drops at the end of this function; every entry begins with an `ACE_HEADER`,
+  // so this reads only the header.
+  let kind = unsafe { (*entry).Header.AceType };
+  // SAFETY: the same entry; `&raw mut` makes no reference, and for the two kinds read further
+  // (allowed and denied) the identifier begins at `SidStart`. For any other kind it is never read.
+  let whose = unsafe { (&raw mut (*entry).SidStart).cast::<c_void>() };
+  ```
+- `crates/blaze-cargo/src/socket/windows.rs:196` block: no SAFETY that clippy accepts (the
+  comment is above the `ACCESS_ALLOWED_ACE_TYPE` pattern line, not above the block or its
+  statement), and 3 ops (`IsWellKnownSid` ×3). Split, keeping the `||` chain:
+  ```rust
+  ACCESS_ALLOWED_ACE_TYPE
+      if user.is(whose)
+          // SAFETY: `whose` is the identifier of an allowed entry of `list`, alive until
+          // `_descriptor` drops; `IsWellKnownSid` only reads it.
+          || unsafe { IsWellKnownSid(whose, WinLocalSystemSid) } != 0
+          // SAFETY: the same identifier, only read.
+          || unsafe { IsWellKnownSid(whose, WinBuiltinAdministratorsSid) } != 0
+          // SAFETY: the same identifier, only read.
+          || unsafe { IsWellKnownSid(whose, WinCreatorOwnerRightsSid) } != 0 => {}
+  ```
+- `crates/blaze-cargo/build.rs:1` build-script target: no unsafe; add `#![forbid(unsafe_code)]`
+  after its `//!` doc.
+
+Note (owner's choice, signature change): `pub fn layout::first_unless_chosen`, `pub fn
+toolchain::library::publish`, `pub fn library::publish_fetched`, `pub fn toolchain::settle` and
+`pub(crate) fn backend::follow_profile` are safe functions whose soundness rests on "called
+before any thread starts", so safe code could misuse them (`docs/v2/plan/design/unsafe.md`:
+"public functions are safe and can't be misused from safe code"). Consider making them
+`unsafe fn` with `/// # Safety\n/// No other thread may be running: it calls \`std::env::set_var\`.`
+
+### load-cargo
+
+- `crates/load-cargo/src/lib.rs:1024` block: the comment is wrong (it says UB can happen if the
+  server misbehaves). `SyntaxContext::from_u32`'s `# Safety`
+  (`crates/span/src/hygiene.rs:78`) says memory safety doesn't rest on the value. Proposed:
+  `// SAFETY: \`from_u32\` asks for a value \`into_u32\` gave for a context of this database, which the proc-macro server echoes from the spans blaze sent it; a made-up value (a buggy or hostile server) gives a panic or another context's hygiene data, never UB, since \`SyntaxContext::id\` checks salsa's bound and salsa's table checks page, slot and type.`
+- `crates/load-cargo/src/lib.rs:1071` block: the same wrong comment. Proposed: the same text as
+  for line 1024.
+- `crates/load-cargo/src/v2.rs:22` module: change `#![deny(unsafe_code)]` to
+  `#![forbid(unsafe_code)]`, and delete lines 25-27 (the salsa comment and
+  `#[allow(unsafe_code)]` on `mod db`). `UNSAFE_CODE` has no `report_in_external_macro`, so rustc
+  drops it in salsa's attribute-macro spans (`rustc_middle/src/lint.rs` ~440-475).
+  `vendor/salsa` emits no `allow(unsafe_code)`, which would clash with `forbid`, and blaze-items
+  already uses `#[salsa::db]` under `forbid`. The crate root keeps unsafe for the two blocks
+  above.
+- Note: a `ctx` from the proc-macro server that this database never made panics in
+  `SyntaxContext::id` rather than being refused with an error, so a hostile proc macro can stop
+  the daemon. That is not memory unsafety; consider a checked decode that answers with an error.
+
+project-model, blaze-units and blaze-tree: no unsafe, and each already has
+`#![forbid(unsafe_code)]` in its only target root. Nothing to do.
+
+## 17. From cargo-daemon (2026-10-29): safety-audit's items on `serve.rs` and `load-cargo`, done; one to format
+
+Done (answering the safety-audit entries above):
+- `crates/blaze-cargo/src/serve.rs:228`: the signal handler moved to `serve/signals.rs`, the one
+  unsafe module of `serve`, behind the safe `catch()` and `signalled()`. One `libc::signal` per
+  block, each with its `// SAFETY:`. Every other `serve` module I own (`daemon`, `heads`, `job`,
+  `mounts`, `plane`, `work`, `tests`) says `#![forbid(unsafe_code)]`. The fetch and units
+  children were asked to do the same in `serve/fetch*` and `serve/unit*`, which have no unsafe.
+- `crates/load-cargo/src/lib.rs:1024` and `:1071`: the audit's `SAFETY` text. `described`,
+  `listed`, `unsandboxed`, `wasm` and `wrap` say `#![forbid(unsafe_code)]`. `v2.rs`'s
+  `deny` to `forbid` was sent to cargo-daemon-lower, who owns it.
+
+To format (`crates/span/src/hygiene.rs`): a checked `SyntaxContext::from_wire(db, u32) ->
+Option<SyntaxContext>`, `None` for a value that is no root and no interned context of this
+database. Why: `load-cargo`'s proc-macro sub-request answers (`SpanSource`, `SpanParent`) decode
+a `ctx` a proc-macro server sends, and a made-up one panics the daemon in `SyntaxContext::id`.
+With it, `answer` refuses the request, naming the value, instead of panicking.
+
+> forwarded to format (`SyntaxContext::from_wire` in `crates/span/src/hygiene.rs`).
+
+## 18. From cargo-daemon-units (2026-10-29; to cargo-daemon, cargo-daemon-lower, codegen, link, usercode, safety)
+
+Done, answering section 16, section 17, safety's item 1 and cargo-cli's section 15:
+- `serve/unit.rs` says `#![forbid(unsafe_code)]`, which covers every `serve/unit/` module. None
+  has unsafe. The record header is parsed with bounds checks, and the bytes come from the
+  store, which verifies them.
+- `JobInput.store` is read as a `blaze_cas::Reader` under `blaze_cas::enter()` in
+  `compile::{fresh, kept}`. The code generator's reads go through `codegen::Reading`, a
+  `Lookup` over the reader and its guard; it still copies until codegen's in-place `get`
+  lands. `script::fresh` calls `index::find(&Reader, &Guard, run, inputs)`, the signature
+  section 16 asked usercode for.
+- `Front::tests` takes `Selection`. libtest's arguments after `--` are read as `parse_opts`
+  reads them (`test::filter`): free names, `--exact`, `--skip NAME`/`--skip=NAME`, `--ignored`
+  and `--include-ignored`. Asking for both of the last two gives libtest's own error. Any other
+  argument is refused, naming it. To cargo-cli: send only those after `--`, or the request fails.
+- `Front::ub_tests` and `Front::evaluate` (`serve/unit/test.rs`).
+  - `ub_tests` lists each test unit's tests with the harness's listing, `codegen::test_roots`,
+    which is `HirFrontend::roots(krate, RootKind::Test)` and compiles nothing. It selects
+    them with `select::wanted`.
+  - Tests are ordered unit by unit in the build's order, each unit's by name as libtest sorts
+    them. Each is named by a key, `"<package> <target> <test>"`, unique within the job.
+  - `#[ignore]`d tests that were not asked for are listed too: `evaluate` reports them
+    `Ignored` without running them, as libtest does.
+  - `evaluate` runs `hir_ty_ub::run_test` on a snapshot of the front end. A bench is refused,
+    naming it.
+  - With `all: false` (`--reached`) it is an error: what a test reaches is known only from its
+    compiled code.
+- `Front::codegen_inputs`: each unit's record (`Made::inputs`, from `Built::inputs`), merged,
+  sorted and deduplicated. A unit with no record for the view is an error naming it. The record
+  domain is now `blaze v2 cargo unit record 2`.
+- `Front::tables`: `Lowered::tables()` plus `Linked::tables()` over the images kept linked,
+  summed by name.
+
+Asked (each call is written and waits on the lane named):
+- **cargo-daemon** (`crates/blaze-cargo/Cargo.toml`): `hir-ty-ub.workspace = true` and
+  `hir-def.workspace = true`. `test.rs` names `hir_def::FunctionId` and calls
+  `hir_ty_ub::{run_test, Config, Outcome}`.
+- **codegen** (`hir_ty_codegen::v2`): each test of `Roots::tests` gains
+  `function: hir_def::FunctionId`, the `#[test]` function. `Built` gains
+  `inputs: Vec<(InstanceKey, CodeHash)>`: every instance compiled or found, with the code hash
+  it was made from, sorted by key. This is proof's `CodegenInputs` (proof.md item 1).
+- **safety** (`crates/hir-ty-ub/src/check.rs`):
+  `run_test(db: &dyn HirDatabase, test: FunctionId, config: &Config) -> Outcome`, with `Config`
+  `Default` and having `seed: Option<u64>` and `schedules: Option<u32>`, exactly as
+  `blaze_api::Ub` has them.
+  `Outcome::{Passed, Failed { message: String, .. }, Ub { report: String, seed: u64, .. },
+  Unsupported { what: String, .. }}`.
+  `Failed::message` is the panic's payload text: `#[should_panic(expected)]` is matched
+  against it, as libtest matches it.
+- **cargo-daemon-lower** (`load-cargo::v2::Lowered`): `tables(&self) -> Vec<(&'static str, u64,
+  u64)>`, each front-end table's name, elements and bytes, counted by its owner (format, db):
+  `token`, `syntax-node`, `hir-expr`, `mir-statement`, `memo` and `memo-edge`.
+- **link** (`blaze_link::Image`): `tables(&self) -> Vec<(&'static str, u64, u64)>`, at least
+  `relocation`.
+
+> forwarded to cargo (cargo-daemon, cargo-daemon-lower), codegen (`Roots::tests` `function`, `Built::inputs`), safety (`hir-ty-ub` `check.rs`), link (`Image::tables`). Usercode's `index::find(&Reader, &Guard, ..)` is applied (section 16).

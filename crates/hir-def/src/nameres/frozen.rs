@@ -40,13 +40,15 @@ use span::{
     Transparency,
 };
 use syntax::ast;
+use thin_vec::ThinVec;
 use triomphe::Arc as TArc;
 use tt::{Delimiter, DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing, Subtree, TokenTree};
 
 use crate::{
     AdtId, AstId, BlockId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc,
     DefWithBodyId, EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc,
-    ExternCrateId, ExternCrateLoc, FunctionLoc, ImplId, ImplLoc, Intern, ItemContainerId, Lookup,
+    ExternCrateId, ExternCrateLoc, FunctionLoc, FxIndexMap, ImplId, ImplLoc, Intern,
+    ItemContainerId, Lookup,
     Macro2Loc, MacroExpander, MacroId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId,
     ModuleIdLt, ProcMacroLoc, StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseId,
     UseLoc,
@@ -61,7 +63,7 @@ use crate::{
     lang_item::{LangItemEnum, LangItemTarget, LangItems},
     nameres::{
         DefDiagnostic, DefMap, DefMapCrateData, LocalDefMap, ModuleData, ModuleOrigin, ModulesSlot,
-        ScopeSlot, diagnostics::DefDiagnosticKind,
+        diagnostics::DefDiagnosticKind,
     },
     per_ns::Item,
     unstable_features::UnstableFeatures,
@@ -110,17 +112,41 @@ pub fn set(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
 
 /// Each difference found, by the crate and the kind of what was frozen: a crate's `DefMap`
 /// is resolved again when an `include!` loads a file, and only the last one is the crate's.
-static DIFFERENCES: Mutex<Vec<(Crate, &'static str, String)>> = Mutex::new(Vec::new());
+///
+/// A lock, not a query result: only [`Mode::Check`] and [`Mode::Verify`] write it (a mode for
+/// testing the bytes, never serving them), the reader is whoever set the mode, outside any
+/// query, and each method takes it once and drops it before returning, so it is never held
+/// across a database call. [`Mode::Serve`] never touches it.
+struct Differences(Mutex<Vec<(Crate, &'static str, String)>>);
+
+impl Differences {
+    fn found(&self) -> std::sync::MutexGuard<'_, Vec<(Crate, &'static str, String)>> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn take(&self) -> Vec<(Crate, &'static str, String)> {
+        std::mem::take(&mut *self.found())
+    }
+
+    /// Forgets a difference found before in the frozen `kind` of `krate`, and records `said`
+    /// in its place if there is one.
+    fn record(&self, krate: Crate, kind: &'static str, said: Option<String>) {
+        let mut found = self.found();
+        found.retain(|(at, of, _)| (*at, *of) != (krate, kind));
+        found.extend(said.map(|said| (krate, kind, said)));
+    }
+}
+
+static DIFFERENCES: Differences = Differences(Mutex::new(Vec::new()));
 
 /// The differences [`Mode::Check`] and [`Mode::Verify`] found since this was last called.
 pub fn differences() -> Vec<String> {
-    let found = std::mem::take(&mut *DIFFERENCES.lock().unwrap());
-    found.into_iter().map(|(_, _, it)| it).collect()
+    DIFFERENCES.take().into_iter().map(|(_, _, it)| it).collect()
 }
 
 /// Forgets a difference found before in the frozen `kind` of `krate`, which agrees now.
-fn agrees(krate: Crate, kind: &str) {
-    DIFFERENCES.lock().unwrap().retain(|(at, of, _)| (*at, *of) != (krate, kind));
+fn agrees(krate: Crate, kind: &'static str) {
+    DIFFERENCES.record(krate, kind, None);
 }
 
 fn differs(db: &dyn SourceDatabase, krate: Crate, what: &str, written: &[u8], frozen: &[u8]) {
@@ -144,8 +170,7 @@ pub fn record_difference(
         written.len(),
         frozen.len(),
     );
-    agrees(krate, kind);
-    DIFFERENCES.lock().unwrap().push((krate, kind, said));
+    DIFFERENCES.record(krate, kind, Some(said));
 }
 
 /// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it, when its
@@ -968,6 +993,9 @@ impl Enc<'_> {
         let db = self.db;
         if let Some(block) = it.block(db) {
             // A block is made as its body is lowered: it is named by that body.
+            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
+            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
+            // when the query that made it reruns, which reruns this one too.
             let block = unsafe { block.to_static() };
             let owner = self.block_owner(block)?;
             self.u8(1);
@@ -1394,27 +1422,30 @@ impl Enc<'_> {
             attr_macros,
             macro_invocations,
             derive_macros,
+            names: _,
+            sorted: _,
+            by_def: _,
         } = it;
         self.usize(types.len())?;
-        for (name, Item { def, vis, import }) in types {
+        for (name, Item { def, vis, import }) in types.iter() {
             self.name(name)?;
-            self.def(*def)?;
-            self.visibility(*vis)?;
-            self.option(*import, Self::import_or_extern_crate)?;
+            self.def(def)?;
+            self.visibility(vis)?;
+            self.option(import, Self::import_or_extern_crate)?;
         }
         self.usize(values.len())?;
-        for (name, Item { def, vis, import }) in values {
+        for (name, Item { def, vis, import }) in values.iter() {
             self.name(name)?;
-            self.def(*def)?;
-            self.visibility(*vis)?;
-            self.option(*import, Self::import_or_glob)?;
+            self.def(def)?;
+            self.visibility(vis)?;
+            self.option(import, Self::import_or_glob)?;
         }
         self.usize(macros.len())?;
-        for (name, Item { def, vis, import }) in macros {
+        for (name, Item { def, vis, import }) in macros.iter() {
             self.name(name)?;
-            self.macro_id(*def)?;
-            self.visibility(*vis)?;
-            self.option(*import, Self::import_or_extern_crate)?;
+            self.macro_id(def)?;
+            self.visibility(vis)?;
+            self.option(import, Self::import_or_extern_crate)?;
         }
         let mut names: Vec<&str> = unresolved.iter().map(|it| it.symbol().as_str()).collect();
         names.sort_unstable();
@@ -1604,7 +1635,7 @@ impl Enc<'_> {
         Ok(())
     }
 
-    fn diagnostic(&mut self, krate: Crate, it: &DefDiagnostic) -> R {
+    fn diagnostic(&mut self, it: &DefDiagnostic) -> R {
         let DefDiagnostic { in_module, kind } = it;
         self.module(*in_module)?;
         match kind {
@@ -1625,10 +1656,7 @@ impl Enc<'_> {
                 self.ast_id(*id)?;
                 self.u32(index.into_raw().into_u32());
             }
-            DefDiagnosticKind::UnconfiguredCode { ast_id, cfg, opts } => {
-                if opts != krate.cfg_options(self.db) {
-                    return Err("code a cfg other than its crate's left out".to_owned());
-                }
+            DefDiagnosticKind::UnconfiguredCode { ast_id, cfg } => {
                 self.u8(3);
                 self.hir_file(ast_id.file_id)?;
                 self.erased_ast_id(ast_id.value);
@@ -1829,7 +1857,7 @@ impl Enc<'_> {
         }
         self.usize(diagnostics.len())?;
         for it in diagnostics {
-            self.diagnostic(*krate, it)?;
+            self.diagnostic(it)?;
         }
         Ok(())
     }
@@ -2581,47 +2609,93 @@ impl Dec<'_> {
         ))
     }
 
-    pub fn many<T>(&mut self, mut f: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
+    /// A list's written length, and as much room as the bytes left can fill: every entry is at
+    /// least a byte, so a length the bytes cannot hold reserves no more than they could.
+    fn len_and_room(&mut self) -> R<(usize, usize)> {
         let n = self.len()?;
-        let mut all = Vec::with_capacity(n);
+        Ok((n, n.min(self.bytes.len() - self.at)))
+    }
+
+    pub fn many<T>(&mut self, mut f: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
+        let (n, room) = self.len_and_room()?;
+        let mut all = Vec::with_capacity(room);
         for _ in 0..n {
             all.push(f(self)?);
         }
         Ok(all)
     }
 
+    /// Reads a list into `into`, which grows once to the written length.
+    fn fill<C: Extend<T>, T>(
+        &mut self,
+        into: &mut C,
+        reserve: impl FnOnce(&mut C, usize),
+        mut f: impl FnMut(&mut Self) -> R<T>,
+    ) -> R {
+        let (n, room) = self.len_and_room()?;
+        reserve(into, room);
+        for _ in 0..n {
+            into.extend([f(self)?]);
+        }
+        Ok(())
+    }
+
+    /// Reads a list of up to `N` entries without allocating, the rest onto the heap once.
+    fn small<T, const N: usize>(&mut self, f: impl FnMut(&mut Self) -> R<T>) -> R<SmallVec<[T; N]>>
+    where
+        [T; N]: smallvec::Array<Item = T>,
+    {
+        let mut all = SmallVec::new();
+        self.fill(&mut all, SmallVec::reserve_exact, f)?;
+        Ok(all)
+    }
+
+    /// A scope read straight into its columns; the name index is built once, at the end.
     fn scope(&mut self) -> R<ItemScope> {
-        let types = self.many(|dec| {
-            let name = dec.name()?;
-            let def = dec.def()?;
-            let vis = dec.visibility()?;
-            let import = dec.option(Self::import_or_extern_crate)?;
-            Ok((name, Item { def, vis, import }))
+        let mut scope = ItemScope::default();
+        let (n, room) = self.len_and_room()?;
+        scope.types.reserve(room);
+        for _ in 0..n {
+            let name = self.name()?;
+            let def = self.def()?;
+            let vis = self.visibility()?;
+            let import = self.option(Self::import_or_extern_crate)?;
+            scope.types.push_unindexed(name, Item { def, vis, import });
+        }
+        let (n, room) = self.len_and_room()?;
+        scope.values.reserve(room);
+        for _ in 0..n {
+            let name = self.name()?;
+            let def = self.def()?;
+            let vis = self.visibility()?;
+            let import = self.option(Self::import_or_glob)?;
+            scope.values.push_unindexed(name, Item { def, vis, import });
+        }
+        let (n, room) = self.len_and_room()?;
+        scope.macros.reserve(room);
+        for _ in 0..n {
+            let name = self.name()?;
+            let def = self.macro_id()?;
+            let vis = self.visibility()?;
+            let import = self.option(Self::import_or_extern_crate)?;
+            scope.macros.push_unindexed(name, Item { def, vis, import });
+        }
+        self.fill(&mut scope.unresolved, ThinVec::reserve_exact, Self::name)?;
+        self.fill(&mut scope.declarations, ThinVec::reserve_exact, Self::def)?;
+        self.fill(&mut scope.impls, ThinVec::reserve_exact, |dec| {
+            Ok((dec.impl_id()?, dec.bool()?))
         })?;
-        let values = self.many(|dec| {
-            let name = dec.name()?;
-            let def = dec.def()?;
-            let vis = dec.visibility()?;
-            let import = dec.option(Self::import_or_glob)?;
-            Ok((name, Item { def, vis, import }))
-        })?;
-        let macros = self.many(|dec| {
-            let name = dec.name()?;
-            let def = dec.macro_id()?;
-            let vis = dec.visibility()?;
-            let import = dec.option(Self::import_or_extern_crate)?;
-            Ok((name, Item { def, vis, import }))
-        })?;
-        let unresolved = self.many(Self::name)?;
-        let declarations = self.many(Self::def)?;
-        let impls = self.many(|dec| Ok((dec.impl_id()?, dec.bool()?)))?;
-        let builtin_derive_impls = self.many(Self::builtin_derive_impl)?;
-        let extern_blocks = self.many(Self::extern_block)?;
-        let unnamed_consts = self.many(|dec| match dec.def()? {
+        self.fill(
+            &mut scope.builtin_derive_impls,
+            ThinVec::reserve_exact,
+            Self::builtin_derive_impl,
+        )?;
+        self.fill(&mut scope.extern_blocks, ThinVec::reserve_exact, Self::extern_block)?;
+        self.fill(&mut scope.unnamed_consts, ThinVec::reserve_exact, |dec| match dec.def()? {
             ModuleDefId::ConstId(it) => Ok(it),
             _ => Err("an unnamed const that is not one".to_owned()),
         })?;
-        let unnamed_trait_imports = self.many(|dec| {
+        self.fill(&mut scope.unnamed_trait_imports, ThinVec::reserve_exact, |dec| {
             let ModuleDefId::TraitId(it) = dec.def()? else {
                 return Err("a trait import of no trait".to_owned());
             };
@@ -2632,27 +2706,53 @@ impl Dec<'_> {
             })?;
             Ok((it, Item { def: (), vis, import }))
         })?;
-        let use_imports_types =
-            self.many(|dec| Ok((dec.import_or_extern_crate()?, dec.import_or_def()?)))?;
-        let use_imports_values =
-            self.many(|dec| Ok((dec.import_or_glob()?, dec.import_or_def()?)))?;
-        let use_imports_macros =
-            self.many(|dec| Ok((dec.import_or_extern_crate()?, dec.import_or_def()?)))?;
-        let use_decls = self.many(Self::use_id)?;
-        let extern_crate_decls = self.many(Self::extern_crate)?;
-        let legacy_macros = self.many(|dec| {
-            let name = dec.name()?;
-            let ids = dec.many(Self::macro_id)?;
-            Ok((name, SmallVec::from_vec(ids)))
-        })?;
-        let attr_macros = self.many(|dec| Ok((dec.ast_id()?, dec.call()?)))?;
-        let macro_invocations = self.many(|dec| Ok((dec.ast_id()?, dec.call()?)))?;
-        let derive_macros = self.many(|dec| {
-            let ast_id = dec.ast_id()?;
-            let invocations = dec.many(|dec| {
+        let (n, room) = self.len_and_room()?;
+        scope.use_imports_types.reserve(room);
+        for _ in 0..n {
+            let (k, v) = (self.import_or_extern_crate()?, self.import_or_def()?);
+            scope.use_imports_types.push_unindexed(k, v);
+        }
+        let (n, room) = self.len_and_room()?;
+        scope.use_imports_values.reserve(room);
+        for _ in 0..n {
+            let (k, v) = (self.import_or_glob()?, self.import_or_def()?);
+            scope.use_imports_values.push_unindexed(k, v);
+        }
+        let (n, room) = self.len_and_room()?;
+        scope.use_imports_macros.reserve(room);
+        for _ in 0..n {
+            let (k, v) = (self.import_or_extern_crate()?, self.import_or_def()?);
+            scope.use_imports_macros.push_unindexed(k, v);
+        }
+        self.fill(&mut scope.use_decls, ThinVec::reserve_exact, Self::use_id)?;
+        self.fill(&mut scope.extern_crate_decls, ThinVec::reserve_exact, Self::extern_crate)?;
+        let (n, room) = self.len_and_room()?;
+        scope.legacy_macros.reserve(room);
+        for _ in 0..n {
+            let name = self.name()?;
+            let ids = self.small(Self::macro_id)?;
+            scope.legacy_macros.push_unindexed(name, ids);
+        }
+        let (n, room) = self.len_and_room()?;
+        scope.attr_macros.reserve(room);
+        for _ in 0..n {
+            let (k, v) = (self.ast_id()?, self.call()?);
+            scope.attr_macros.push_unindexed(k, v);
+        }
+        let (n, room) = self.len_and_room()?;
+        scope.macro_invocations.reserve(room);
+        for _ in 0..n {
+            let (k, v) = (self.ast_id()?, self.call()?);
+            scope.macro_invocations.push_unindexed(k, v);
+        }
+        let (n, room) = self.len_and_room()?;
+        scope.derive_macros.reserve(room);
+        for _ in 0..n {
+            let ast_id = self.ast_id()?;
+            let invocations = self.small(|dec| {
                 let attr_id = AttrId::from_item_tree_index(dec.u32()?);
                 let attr_call_id = dec.call()?;
-                let derive_call_ids = dec.many(|dec| {
+                let derive_call_ids = dec.small(|dec| {
                     Ok(match dec.u8()? {
                         0 => None,
                         1 => Some(Either::Left(dec.call()?)),
@@ -2660,35 +2760,12 @@ impl Dec<'_> {
                         it => return Err(format!("derive call {it}")),
                     })
                 })?;
-                Ok(DeriveMacroInvocation {
-                    attr_id,
-                    attr_call_id,
-                    derive_call_ids: SmallVec::from_vec(derive_call_ids),
-                })
+                Ok(DeriveMacroInvocation { attr_id, attr_call_id, derive_call_ids })
             })?;
-            Ok((ast_id, SmallVec::from_vec(invocations)))
-        })?;
-        Ok(ItemScope {
-            types: types.into_iter().collect(),
-            values: values.into_iter().collect(),
-            macros: macros.into_iter().collect(),
-            unresolved: unresolved.into_iter().collect(),
-            declarations: declarations.into_iter().collect(),
-            impls: impls.into_iter().collect(),
-            builtin_derive_impls: builtin_derive_impls.into_iter().collect(),
-            extern_blocks: extern_blocks.into_iter().collect(),
-            unnamed_consts: unnamed_consts.into_iter().collect(),
-            unnamed_trait_imports: unnamed_trait_imports.into_iter().collect(),
-            use_imports_types: use_imports_types.into_iter().collect(),
-            use_imports_values: use_imports_values.into_iter().collect(),
-            use_imports_macros: use_imports_macros.into_iter().collect(),
-            use_decls: use_decls.into_iter().collect(),
-            extern_crate_decls: extern_crate_decls.into_iter().collect(),
-            legacy_macros: legacy_macros.into_iter().collect(),
-            attr_macros: attr_macros.into_iter().collect(),
-            macro_invocations: macro_invocations.into_iter().collect(),
-            derive_macros: derive_macros.into_iter().collect(),
-        })
+            scope.derive_macros.push_unindexed(ast_id, invocations);
+        }
+        scope.seal().map_err(str::to_owned)?;
+        Ok(scope)
     }
 
     fn tree_id(&mut self) -> R<TreeId> {
@@ -2761,8 +2838,7 @@ impl Dec<'_> {
                 let file = self.hir_file()?;
                 let ast_id = hir_expand::InFile::new(file, self.erased_ast_id()?);
                 let cfg = self.cfg()?;
-                let opts = self.krate.cfg_options(self.db).clone();
-                DefDiagnosticKind::UnconfiguredCode { ast_id, cfg, opts }
+                DefDiagnosticKind::UnconfiguredCode { ast_id, cfg }
             }
             4 => {
                 let ast = self.call_kind()?;
@@ -2827,8 +2903,8 @@ impl Dec<'_> {
 
         // The modules: the root as `DefMap::empty` makes it, and the others as the collector
         // does, each in its parent.
-        let n = self.len()?;
-        let mut skeleton = Vec::with_capacity(n);
+        let (n, room) = self.len_and_room()?;
+        let mut skeleton = Vec::with_capacity(room);
         for _ in 0..n {
             let parent = self.option(Self::u32)?;
             let name = self.option(Self::name)?;
@@ -2846,6 +2922,9 @@ impl Dec<'_> {
             let parent = *self.own.get(parent).ok_or("a module before its parent")?;
             let name = name.clone().ok_or("a module with no name")?;
             let module =
+                // SAFETY: the def-map query running now makes this tracked struct and keeps it only
+                // in its own result; salsa deletes it only when this query reruns, which replaces
+                // that result.
                 unsafe { ModuleIdLt::new(db, krate, None, Some(parent), name).to_static() };
             self.own.push(module);
         }
@@ -2854,17 +2933,15 @@ impl Dec<'_> {
             let origin = self.origin()?;
             let visibility = self.visibility()?;
             let scope = self.scope()?;
-            let children = self.many(|dec| {
-                let name = dec.name()?;
-                let child = dec.len()?;
-                Ok((name, *dec.own.get(child).ok_or("a child not read")?))
-            })?;
+            let (n, room) = self.len_and_room()?;
+            let mut children = FxIndexMap::with_capacity_and_hasher(room, Default::default());
+            for _ in 0..n {
+                let name = self.name()?;
+                let child = self.len()?;
+                children.insert(name, *self.own.get(child).ok_or("a child not read")?);
+            }
             let parent = parent.map(|it| self.own[it as usize]);
-            let mut module = ModuleData::new(origin, visibility, parent);
-            module.scope = ScopeSlot::Building {
-                scope: Box::new(scope),
-                children: children.into_iter().collect(),
-            };
+            let module = ModuleData::with_scope(origin, visibility, parent, scope, children);
             table.insert(self.own[index], module);
         }
         def_map.modules = ModulesSlot::Building(table);
@@ -3020,6 +3097,35 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
             assert_eq!(encode(&db, krate).as_ref(), Ok(written), "{name}");
         }
         assert_eq!(differences(), Vec::<String>::new());
+    }
+
+    /// The bytes of each module's scope, which name everything by what it is, so two databases'
+    /// scopes compare by them.
+    fn scope_bytes(db: &TestDB, name: &str) -> Vec<Vec<u8>> {
+        let krate = crate_named(db, name);
+        let def_map = super::super::crate_def_map(db, krate);
+        let table = def_map.table(db);
+        let modules: FxHashMap<ModuleId, (u32, u32)> =
+            table.keys().enumerate().map(|(index, &it)| (it, (0, index as u32))).collect();
+        (table.iter())
+            .map(|(_, module)| {
+                let mut enc = Enc::new(db, krate);
+                enc.modules = modules.clone();
+                enc.indexed.insert(krate);
+                enc.scope(module.scope(db)).unwrap();
+                enc.out
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_scope_reads_back_as_it_was_written() {
+        let bytes = frozen();
+        let live = TestDB::with_files(FIXTURE);
+        let served = with(Mode::Serve, &bytes);
+        for name in ["lib", "main"] {
+            assert_eq!(scope_bytes(&served, name), scope_bytes(&live, name), "{name}");
+        }
     }
 
     #[test]

@@ -14,11 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) enum Row {
     /// Its slot in the mapped index table.
     Slot(u64),
-    /// Its row in the delta table.
+    /// Its row in the delta table. A settle, the one user of rows, does not run while an index
+    /// swap leaves a delta before it.
     Delta(u64),
-    /// Its row in the delta table an index swap left, read until every writer that could still
-    /// put into it has ended its task.
-    Prev(u64),
 }
 
 #[derive(Clone, Copy, Debug)]

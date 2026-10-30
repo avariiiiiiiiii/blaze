@@ -1,7 +1,6 @@
 //! The front end of a v2 build over the database: what each instance and static is by
 //! content, whose code it is, and what it refers to.
 
-use std::sync::Mutex;
 
 use base_db::{Crate, CrateOrigin};
 use blaze_codegen::{
@@ -30,42 +29,31 @@ use crate::{
     linked_symbol,
 };
 
-/// Databases for the build's threads: salsa's are `Send`, never `Sync`, so each thread
-/// borrows one of its own, forked from the build's.
-pub struct Databases {
-    idle: Mutex<Vec<Lent>>,
-    fork: Box<dyn Fn() -> Box<dyn HirDatabase + Send> + Send + Sync>,
+/// The build's database, `Sync` and shared by reference by every task. Nothing here locks:
+/// each call has its own [`Homes`], which lives as long as the task's work on one instance.
+pub struct Databases<'db> {
+    db: &'db (dyn HirDatabase + Sync),
 }
 
-struct Lent {
-    db: Box<dyn HirDatabase + Send>,
-    homes: Homes,
-}
-
-impl Databases {
-    /// `fork` gives another handle on the build's database, of the same revision.
-    pub fn new(fork: impl Fn() -> Box<dyn HirDatabase + Send> + Send + Sync + 'static) -> Self {
-        Databases { idle: Mutex::new(Vec::new()), fork: Box::new(fork) }
+impl<'db> Databases<'db> {
+    pub fn new(db: &'db (dyn HirDatabase + Sync)) -> Self {
+        Databases { db }
     }
 
     pub(crate) fn with<T>(&self, work: impl FnOnce(&dyn HirDatabase, &mut Homes) -> T) -> T {
-        let lent = self.idle.lock().unwrap_or_else(|it| it.into_inner()).pop();
-        let mut lent = lent.unwrap_or_else(|| Lent { db: (self.fork)(), homes: Homes::default() });
-        let out = work(&*lent.db, &mut lent.homes);
-        self.idle.lock().unwrap_or_else(|it| it.into_inner()).push(lent);
-        out
+        work(self.db, &mut Homes::default())
     }
 }
 
 /// The front end of a v2 build.
-pub struct HirFrontend {
-    pub(crate) databases: Databases,
+pub struct HirFrontend<'db> {
+    pub(crate) databases: Databases<'db>,
     pub(crate) hashes: Box<dyn Hashes>,
     pub(crate) build_time: BuildTime,
 }
 
-impl HirFrontend {
-    pub fn new(databases: Databases, hashes: Box<dyn Hashes>, build_time: BuildTime) -> Self {
+impl<'db> HirFrontend<'db> {
+    pub fn new(databases: Databases<'db>, hashes: Box<dyn Hashes>, build_time: BuildTime) -> Self {
         HirFrontend { databases, hashes, build_time }
     }
 
@@ -90,6 +78,13 @@ impl HirFrontend {
         HirInstance(Kind::Start(main))
     }
 
+    /// The allocator shim of the program of `krate`, with the `#[global_allocator]`'s
+    /// functions it calls: roots of a program with a `main`, and of a `cdylib`.
+    pub fn allocator_shim(&self, krate: Crate) -> Result<Vec<HirInstance>, CodegenError> {
+        self.with(|db, _| super::allocator::shim(db, krate, |func| self.root(func)))
+            .map_err(|what| undescribed(&krate, None, format!("its allocator shim: {what}")))
+    }
+
     pub(crate) fn with<T>(&self, work: impl FnOnce(&dyn HirDatabase, &mut Homes) -> T) -> T {
         self.databases.with(work)
     }
@@ -104,6 +99,7 @@ impl HirFrontend {
         let hashes = &*self.hashes;
         let item = match &instance.0 {
             Kind::Asm(text) => Ok(ItemKey(ContentId::of(ASM_ITEM_DOMAIN, text.as_bytes()))),
+            Kind::Allocator(forward) => Ok(super::allocator::item(forward)),
             kind => item_of(db, kind).and_then(|item| hashes.item(db, item)),
         }
         .map_err(|what| undescribed(instance, None, what))?;
@@ -177,7 +173,7 @@ impl HirFrontend {
     }
 }
 
-impl Frontend for HirFrontend {
+impl Frontend for HirFrontend<'_> {
     type Instance = HirInstance;
     type Static = HirStatic;
 
@@ -229,6 +225,9 @@ fn item_of(db: &dyn HirDatabase, kind: &Kind) -> Result<ItemId, String> {
         Kind::Code(instance, env) => (instance, env),
         Kind::Start(main) => return Ok(ItemId::Function(*main)),
         Kind::Asm(_) => return Err("an `asm!` function, which is no item".to_owned()),
+        Kind::Allocator(_) => {
+            return Err("a function of the allocator shim, which is no item".to_owned());
+        }
     };
     let lang_items = || DbInterner::new_with(db, env.krate).lang_items();
     let lang = |item: Option<FunctionId>, name: &str| {
@@ -272,6 +271,7 @@ fn code_of(db: &dyn HirDatabase, hashes: &dyn Hashes, kind: &Kind) -> Result<Cod
     let instance = match kind {
         Kind::Code(instance, _) => instance,
         Kind::Asm(text) => return Ok(CodeHash(ContentId::of(ASM_DOMAIN, text.as_bytes()))),
+        Kind::Allocator(forward) => return Ok(super::allocator::code(forward)),
         Kind::Start(main) => {
             let mut hasher = Hasher::new(START_DOMAIN);
             hasher.id(&hashes.code(db, Body::Item((*main).into()))?.0);
@@ -349,7 +349,7 @@ fn crate_of(db: &dyn HirDatabase, kind: &Kind) -> Option<Crate> {
             def => closure_loc(db, def).map(|loc| loc.owner.module(db).krate(db)),
         },
         Kind::Start(main) => Some(main.krate(db)),
-        Kind::Asm(_) => None,
+        Kind::Asm(_) | Kind::Allocator(_) => None,
     }
 }
 
@@ -385,6 +385,7 @@ pub(super) fn symbol_of(db: &dyn HirDatabase, kind: &Kind) -> Option<String> {
             _ => None,
         },
         Kind::Start(_) => Some(crate::Target::current().entry().0.to_owned()),
+        Kind::Allocator(forward) => Some(forward.symbol.to_owned()),
         Kind::Asm(_) => None,
     }
 }

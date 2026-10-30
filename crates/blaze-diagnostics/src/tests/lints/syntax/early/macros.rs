@@ -3,25 +3,19 @@
 mod asm;
 mod matchers;
 
-use crate::{Options, emit::Style, lints::CommandLine, tests::ui_with};
+use crate::{
+    Options,
+    emit::Style,
+    tests::{Mode, ui},
+};
 
-/// The lint flags compiletest gives every UI test (`runtest.rs`, `make_compile_args`), with
-/// `-A unused -W unused_attributes` before them for a test that passes.
-fn compiletest(passes: bool) -> Options {
-    let mut args: Vec<&str> = Vec::new();
-    if passes {
-        args.extend(["-A", "unused", "-W", "unused_attributes"]);
-    }
-    args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
-    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap() }
-}
-
-/// [`crate::tests::ui_with`] of a fixture of several files: a UI test, its auxiliary crates
-/// and the files it includes, each named `$DIR/<path>`.
-fn ui_fixture(fixture: &str, options: &Options) -> String {
-    let stderr =
-        crate::tests::checked_with(fixture, "$DIR/", options).stderr_with(Style { ui_testing: true, ..Style::default() });
+/// [`crate::tests::ui_as`] of a fixture of several files: a UI test, its auxiliary crates
+/// and the files it includes, each named `$DIR/<path>`, run as compiletest runs a test of
+/// `mode` with the test's own flags in `options`.
+fn ui_fixture(mode: Mode, fixture: &str, options: &Options) -> String {
+    let options = crate::tests::compiletest(mode, options);
+    let stderr = crate::tests::checked_with(fixture, "$DIR/", &options)
+        .stderr_with(Style { ui_testing: true, ..Style::default() });
     crate::tests::normalized(&stderr)
 }
 
@@ -78,7 +72,7 @@ LL |     expand_it!()
    = note: this error originates in the macro `expand_it` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 "#;
-    assert_eq!(ui_with("lint-trailing-macro-call.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("lint-trailing-macro-call.rs", "2015", source), expected);
 }
 
 #[test]
@@ -131,7 +125,7 @@ LL |         _ => foo!()
    = note: this error originates in the macro `foo` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 "#;
-    assert_eq!(ui_with("warn-semicolon-in-expressions-from-macros.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("warn-semicolon-in-expressions-from-macros.rs", "2015", source), expected);
 }
 
 #[test]
@@ -191,7 +185,7 @@ LL | #![deny(semicolon_in_expressions_from_macros)]
    = note: this error originates in the macro `len` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 "#;
-    assert_eq!(ui_with("issue-84195-lint-anon-const.rs", "2015", source, &compiletest(false)), expected);
+    assert_eq!(ui("issue-84195-lint-anon-const.rs", "2015", source), expected);
 }
 
 #[test]
@@ -248,7 +242,7 @@ LL | #![deny(semicolon_in_expressions_from_non_local_macros)]
    = note: this error originates in the macro `foreign_crate::my_macro` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 "#;
-    assert_eq!(ui_fixture(fixture, &compiletest(false)), expected);
+    assert_eq!(ui_fixture(Mode::Other, fixture, &Options::default()), expected);
 }
 
 #[test]
@@ -485,7 +479,7 @@ LL | #![warn(semicolon_in_expressions_from_macros)]
    = note: this warning originates in the macro `foo` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 "#;
-    assert_eq!(ui_with("semicolon-in-expressions-from-macros.rs", "2018", source, &compiletest(true)), expected);
+    assert_eq!(ui("semicolon-in-expressions-from-macros.rs", "2018", source), expected);
 }
 
 #[test]
@@ -522,7 +516,7 @@ LL | 10
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui_fixture(fixture, &compiletest(false)), expected);
+    assert_eq!(ui_fixture(Mode::Other, fixture, &Options::default()), expected);
 }
 
 #[test]
@@ -588,7 +582,7 @@ LL | #[warn(incomplete_include)]
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(ui_fixture(fixture, &compiletest(true)), expected);
+    assert_eq!(ui_fixture(Mode::Other, fixture, &Options::default()), expected);
 }
 
 #[test]
@@ -639,7 +633,7 @@ fn main() {
     assert_eq!(add3!(9), 12);
 }
 "#;
-    assert_eq!(ui_fixture(fixture, &compiletest(true)), "");
+    assert_eq!(ui_fixture(Mode::RunPass, fixture, &Options::default()), "");
 }
 
 /// What `std` and `test` are to `duplicated-attributes.rs`: the builtin attribute macros in the
@@ -733,5 +727,5 @@ LL | #[cfg_eval]
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(ui_fixture(&format!("{TEST_CRATES}{source}"), &compiletest(true)), expected);
+    assert_eq!(ui_fixture(Mode::Other, &format!("{TEST_CRATES}{source}"), &Options::default()), expected);
 }

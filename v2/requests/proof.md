@@ -141,3 +141,36 @@ folded in here: what they asked of `proof` (engine, fixture, proof.py) is done i
 
 > applied: `blaze-v2-proof = { path = "crates/blaze-v2-proof" }` in the root `[workspace.dependencies]`; `crates/blaze-format` already uses it.
 > forwarded to store: `crates/blaze-cas/Cargo.toml` has no `blaze-v2-proof` dev-dependency or tier round-trip test yet.
+
+## From safety-audit (2026-10-29, safety-audit-edge)
+
+The workspace is about to deny `unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks`
+and `clippy::multiple_unsafe_ops_per_block`. Each finding below is comments, `# Safety` docs,
+block splits or a crate-root attribute only, in the original evaluation order. On the pinned nightly
+the loads (`_mm512_loadu_si512`, `_mm512_maskz_loadu_epi8`, `_mm256_loadu_si256`,
+`_mm_loadu_si128`, `vld1q_u8`) are `unsafe fn`s, and the compares and movemasks are safe in a
+function with the feature, so each load and each `add` is one op. One comment above a `let` covers
+every single-op block in that statement's tuple.
+
+### blaze-v2-proof
+
+- `crates/blaze-v2-proof/src/bytes.rs:109` `avx512`, `:159` `avx2`, `:209` `sse2`, `:258` `neon`: no `# Safety`. Proposed, above each `#[cfg]`: `/// # Safety\n///\n/// The CPU has AVX-512BW (AVX2, SSE2, NEON), which `first_difference_with` asserts, and `b` is at least as long as `a`: every read is below `a.len()` in both.`
+- `bytes.rs:114` `differ`, `:165` `same`, `:215` `same`, `:265` `eq` (the inner `unsafe fn`s): no `# Safety`. Proposed: `/// # Safety\n///\n/// The CPU has AVX-512BW (AVX2, SSE2, NEON), and `pa` and `pb` each point at 64 (32, 16, 16) readable bytes.` (keep `same`'s first line).
+- `bytes.rs:116` block: 2 ops (two `_mm512_loadu_si512`). Split:
+  `// SAFETY: the caller has 64 readable bytes at `pa`; the load is unaligned.` `let x = unsafe { _mm512_loadu_si512(pa.cast::<__m512i>()) };`
+  `// SAFETY: as above, at `pb`.` `let y = unsafe { _mm512_loadu_si512(pb.cast::<__m512i>()) };` then `_mm512_cmpneq_epi8_mask(x, y)`.
+  The same at `:167` (`_mm256_loadu_si256`, then `_mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32`), `:217` (`_mm_loadu_si128`, then `_mm_movemask_epi8(_mm_cmpeq_epi8(x, y)) as u16`) and `:267` (`vld1q_u8`, then `vceqq_u8(x, y)`).
+- `bytes.rs:122` block: 2 ops (two `_mm512_maskz_loadu_epi8`). Split:
+  `// SAFETY: the masked load touches only the lanes of `keep`, the first `n` bytes of `a`, and reads zero in the others.` `let x = unsafe { _mm512_maskz_loadu_epi8(keep, pa.cast()) };`
+  `// SAFETY: as above, for `b`, as long as `a`.` `let y = unsafe { _mm512_maskz_loadu_epi8(keep, pb.cast()) };` then `let differ = _mm512_cmpneq_epi8_mask(x, y);`.
+- `bytes.rs:128` block (four vectors a loop): 12 ops (8 `add`, 4 `differ`). Split per vector, in today's order (shown for AVX-512, `W = 64`):
+  `// SAFETY: `at + 256 <= n`, the length of both slices, so `at` is inside both.` `let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });`
+  `// SAFETY: the 64 bytes from each end at or before `at + 256 <= n`.` `let m0 = unsafe { differ(a0, b0) };`
+  then the same with `at + 64` (`a1`, `b1`, `m1`), `at + 128` (`m2`) and `at + 192` (`m3`), each with `// SAFETY: as above.` over both lets, and `let m = [m0, m1, m2, m3];`.
+  The same at `:178` (`W = 32`, `same`, bound `at + 128`), `:227` (`W = 16`, `same`, bound `at + 64`) and `:282` (`W = 16`, `eq`, bound `at + 64`, `let e = [e0, e1, e2, e3];`).
+- `bytes.rs:140`, `:149`, `:190`, `:199`, `:239`, `:248`, `:299`, `:308` blocks (one vector, and the overlapping last one): 3 ops each (2 `add`, 1 call). Split (shown for `:140`):
+  `// SAFETY: `at + 64 <= n`, so `at` is inside both slices.` `let (a0, b0) = (unsafe { pa.add(at) }, unsafe { pb.add(at) });`
+  `// SAFETY: the 64 bytes from each end at or before `n`.` `let m = unsafe { differ(a0, b0) };`
+  For the last vector use `last` and `// SAFETY: `n >= W`, so `last + W == n`.`. For NEON, `let m = same(unsafe { eq(a0, b0) });`.
+- `crates/blaze-v2-proof/src/main.rs:1` target root: it declares no modules and has no `unsafe` (it uses the library); add `#![forbid(unsafe_code)]`.
+- Checked, no other finding: the four dispatch blocks in `first_difference_with` (`:71`-`:89`) and `Mapped::open` (`:330`) are one op each with real comments. The map is of finished build outputs that nothing writes while they are compared, and its bytes are read only as a safe `&[u8]`.

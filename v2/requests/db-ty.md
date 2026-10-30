@@ -186,3 +186,19 @@ keeps the structured report, so the variant carries nothing (and `MirEvalError` 
 never stops.
 
 > forwarded to db: `crates/hir-ty/src/mir.rs` is lane db's.
+
+## From speed-types-probe (2026-10-29): two query kinds (`crates/hir-ty/src/db.rs`)
+
+What: in `kinds!`, after `IMPL_HAS_UNCONSTRAINED_PARAMS = 0x2478, "impl_has_unconstrained_params";`:
+
+```rust
+        TRAIT_VALUE_ITEMS = 0x2479, "trait_value_items";
+        IN_CRATE_TRAIT_VALUE_ITEMS = 0x247a, "in_crate_trait_value_items";
+```
+
+Why: two new tracked functions in `method_resolution.rs` (items' file): a per-crate index of
+every trait's first function or constant per name, and its run for one name. The method probe
+asks one per crate of its traits in scope instead of one `trait_value_item` per trait.
+`kinds_are_distinct_and_hir_tys` finds every tracked function in the source and fails without
+these lines. Numbers `0x2457`..`0x245f`, `0x247b`..`0x247d` and `0x2487`..`0x248a` are kept for
+speed-types-probe's children (layout, coherence and opaques), which will request their own lines.

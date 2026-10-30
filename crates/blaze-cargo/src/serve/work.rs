@@ -6,19 +6,22 @@
 //!
 //! - **On an IO thread of the plane**: [`Steps::fetch`], [`Steps::library`]. They may block on
 //!   the network or the disk; they touch no state of the loop.
-//! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`]. They
+//! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`],
+//!   [`Front::ub_tests`], [`Front::evaluate`]. They
 //!   read the database, the VFS's reader and the store through [`JobInput`], and give back what
 //!   the loop writes ([`Compiled::puts`]); a [`Failed::Again`] is posted again whole.
 //! - **On the loop**: [`Front::fresh`], [`Front::script`], [`Front::tests`], [`Front::run`] and
 //!   every [`Runs`] method. User code runs as [`blaze_core::Effect::Spawn`]s of the loop's
 //!   driver, in the sandbox its [`blaze_core::Confine`] makes, never on a thread of its own.
 
+#![forbid(unsafe_code)]
+
 use std::{
     any::Any,
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, atomic::AtomicBool},
 };
 
-use blaze_api::{ApiError, Artifact, Diagnostic, Reach, Response, Table};
+use blaze_api::{ApiError, Artifact, Diagnostic, Reach, Response, Table, TestResult, Ub};
 use blaze_cas::Store;
 use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
@@ -57,6 +60,21 @@ pub enum Goal {
     Reach,
 }
 
+/// The tests a job runs, and how, as `blaze test` asked.
+#[derive(Clone, Copy, Debug)]
+pub struct Selection<'a> {
+    /// Text a test's name must contain one of; none selects every test.
+    pub filter: &'a [String],
+    /// libtest's own selection, what followed `--`: `--exact`, `--ignored`,
+    /// `--include-ignored`, `--skip NAME`.
+    pub args: &'a [String],
+    /// Every test, not only those the change reached.
+    pub all: bool,
+    /// Each test run in blaze's MIR evaluator, checked for undefined behavior. The job's
+    /// units were checked only ([`Goal::Check`]): `built` is empty, nothing is linked.
+    pub ub: Option<Ub>,
+}
+
 /// A job as its steps see it.
 #[derive(Clone)]
 pub struct JobInput {
@@ -71,8 +89,9 @@ pub struct JobInput {
     /// environment, held in memory for the job only and never logged or kept.
     pub config: Arc<BuildConfig>,
     pub units: Arc<Units>,
-    /// The store, read by tasks; written only by the loop.
-    pub store: Arc<RwLock<Store>>,
+    /// The store, read by tasks with no lock (a read is valid while its
+    /// [`blaze_cas::enter`] guard is held); written only by the loop.
+    pub store: blaze_cas::Reader,
     pub color: bool,
     pub goal: Goal,
     /// Set once the job is cancelled: long work looks at it between pieces and stops with
@@ -174,10 +193,19 @@ pub trait Front: Send + Sync + 'static {
     /// It ends not ok for a script that failed, after the diagnostic cargo gives.
     fn script(&self, unit: usize, tags: u64) -> Result<Box<dyn Runs>, ApiError>;
     /// On the loop, once every unit is built: the tests of the build (their artifacts in
-    /// `built`), filtered by name, the reached ones only unless `all`, each reported as a
-    /// [`Response::TestResult`]; it ends not ok when one failed.
-    fn tests(&self, built: &[Artifact], filter: &[String], all: bool, tags: u64)
-    -> Result<Box<dyn Runs>, ApiError>;
+    /// `built`) that `selection` selects, each reported as a [`Response::TestResult`]; it ends
+    /// not ok when one failed.
+    fn tests(&self, built: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<Box<dyn Runs>, ApiError>;
+    /// On a worker, for `blaze test --ub` once every unit is checked: the tests `selection`
+    /// selects (as libtest would: its filters, `--exact`, `#[ignore]`), by name in libtest's
+    /// order, each run by [`Front::evaluate`].
+    fn ub_tests(&self, selection: Selection<'_>) -> Result<Vec<String>, Failed>;
+    /// On a worker: the test named `test` of [`Front::ub_tests`] run in blaze's MIR
+    /// evaluator under `ub` (`hir_ty_ub::run_test`), nothing compiled. It passes, fails as a
+    /// panicking test does (honoring `#[should_panic]`), or fails with the evaluator's report
+    /// then `seed: N` as its output for undefined behavior, or with what the evaluator can't
+    /// run: never a pass and never a compiled run in its place.
+    fn evaluate(&self, test: &str, ub: Ub) -> Result<TestResult, Failed>;
     /// On the loop, once every unit is built: `bin` (cargo's choice when none) run with
     /// `args`, reported as [`Response::Ran`].
     fn run(&self, built: &[Artifact], bin: Option<&str>, args: &[String], tags: u64)

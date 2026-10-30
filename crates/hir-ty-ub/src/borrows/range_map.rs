@@ -26,6 +26,14 @@ impl<T> RangeMap<T> {
         RangeMap { v }
     }
 
+    /// Back to `RangeMap::new(size, init)`, keeping the buffer.
+    pub(super) fn reset(&mut self, size: u64, init: T) {
+        self.v.clear();
+        if size > 0 {
+            self.v.push(Elem { range: 0..size, data: init });
+        }
+    }
+
     pub(super) fn size(&self) -> u64 {
         self.v.last().map_or(0, |x| x.range.end)
     }

@@ -56,9 +56,7 @@ pub(super) fn before_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
 
 /// `check_private_in_public`: `private_interfaces` and `private_bounds`.
 pub(super) fn private_in_public(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let items = walk::items(cx);
-    let effective = visibility::Effective::of(cx, &items);
-    privacy::lints(cx, &items, &effective)
+    privacy::lints(cx, &walk::items(cx))
 }
 
 /// rustc's late module pass over each item, in the order of `BuiltinCombinedLateLintModPass`.

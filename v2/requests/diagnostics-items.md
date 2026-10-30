@@ -40,3 +40,5 @@ Why: `follow.rs` already ports FIRST/FOLLOW and `check_matcher_core`, but only f
 `rust_2021_incompatible_or_patterns`; mbe checks no follow set, and `macro_def_error` does not
 port it, so a matcher rustc refuses is accepted by blaze (superset-of-rust: accepting what rustc
 rejects is a bug). One port of the sets, not two.
+
+> forwarded to diagnostics: between its own children.

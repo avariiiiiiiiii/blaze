@@ -95,15 +95,29 @@ impl<'db> Ctx<'db> {
         !self.needs_drop(ty) && crate::drop::is_freeze(&self.infcx, ty, self.env)
     }
 
-    fn bool_ty(&self) -> Ty<'db> {
+    pub(super) fn bool_ty(&self) -> Ty<'db> {
         Ty::new_bool(self.infcx.interner)
     }
 
+    /// The crate the body is of.
+    pub(super) fn krate(&self) -> Crate {
+        self.krate
+    }
+
     /// The size of `ty` in bytes, if its layout is known where the body is generic.
-    fn size_of(&self, ty: Ty<'db>) -> Option<u64> {
+    pub(super) fn size_of(&self, ty: Ty<'db>) -> Option<u64> {
+        Some(self.layout_of(ty)?.size.bytes())
+    }
+
+    /// The layout of `ty`, if it is known where the body is generic.
+    pub(super) fn layout_of(&self, ty: Ty<'db>) -> Option<triomphe::Arc<crate::layout::Layout>> {
         let env = ParamEnvAndCrate { param_env: self.env, krate: self.krate };
-        let layout = self.db.layout_of_ty(ty.store(), env.store()).ok()?;
-        Some(layout.size.bytes())
+        self.db.layout_of_ty(ty.store(), env.store()).ok()
+    }
+
+    /// Whether `ty` is `Sized` where the body is generic: rustc's `Ty::is_sized`.
+    pub(super) fn is_sized(&self, ty: Ty<'db>) -> bool {
+        self.infcx.type_is_sized_modulo_regions(self.env, ty)
     }
 
     /// The alignment of `ty`, if its layout is known where the body is generic.

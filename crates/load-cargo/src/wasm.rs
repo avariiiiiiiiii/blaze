@@ -1,6 +1,8 @@
 //! Proc macros compiled to WebAssembly, which no proc-macro server loads: a caller that runs
 //! them (blaze, `crates/blaze-macro-wasm`) loads them itself, in its own process.
 
+#![forbid(unsafe_code)]
+
 use std::sync::OnceLock;
 
 use hir_expand::proc_macro::ProcMacroLoadResult;

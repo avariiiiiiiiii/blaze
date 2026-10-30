@@ -7,7 +7,8 @@
 //!   item that has it again.
 //! - `matchers`: what rustc lints on a macro's definition (`meta_variable_misuse`,
 //!   `rust_2021_incompatible_or_patterns`, `edition_2024_expr_fragment_specifier`).
-//! - `asm`: `bad_asm_style`, `named_asm_labels`, `binary_asm_labels`.
+//! - `asm`: `bad_asm_style` (`named_asm_labels` and `binary_asm_labels` are the late pass
+//!   `AsmLabels`, in `lints/bodies/calls/methods`).
 //!
 //! Follows rustc's `compiler/rustc_expand/src/mbe/macro_rules.rs` (`ParserAnyMacro::make`,
 //! `is_defined_in_current_crate`), `compiler/rustc_expand/src/expand.rs` (`assign_id!`, the

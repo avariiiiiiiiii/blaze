@@ -230,4 +230,6 @@ pub(crate) fn item_into<T: Serialize>(
 }
 
 #[cfg(test)]
+mod identity;
+#[cfg(test)]
 mod tests;

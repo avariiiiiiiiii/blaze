@@ -78,36 +78,24 @@ pub(crate) use crate::item_tree::{
     lower::{lower_use_tree, visibility_from_ast},
 };
 
-/// `Record` for an id that is a `u32`: what it names is checked when a tree is decoded
-/// ([`persist`]), not when its bytes are.
-macro_rules! u32_records {
-    ($($ty:ident),* $(,)?) => {$(
-        // SAFETY: `#[repr(transparent)]` over a `u32`, so no padding and every bit pattern is a
-        // value.
-        unsafe impl blaze_format::Record for $ty {
-            const SCHEMA: blaze_format::SchemaHash = blaze_format::schema(stringify!($ty));
-            fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), blaze_format::FormatError> {
-                <u32 as blaze_format::Record>::check(bytes, buffer)
-            }
-        }
-    )*};
+blaze_format::record! {
+    /// A visibility of an [`ItemTree`]: one of the four every tree has, or an index into its
+    /// table of them.
+    #[derive(Copy, Clone, Eq, PartialEq)]
+    pub(crate) struct RawVisibilityId: 1 {
+        raw: u32,
+    }
 }
 
-u32_records!(ModItemId, RawVisibilityId, NameId, PathId, AliasId, UseTreeId);
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-#[repr(transparent)]
-pub(crate) struct RawVisibilityId(u32);
-
 impl RawVisibilityId {
-    const PUB: Self = RawVisibilityId(u32::MAX);
-    const PRIV_IMPLICIT: Self = RawVisibilityId(u32::MAX - 1);
-    const PRIV_EXPLICIT: Self = RawVisibilityId(u32::MAX - 2);
-    const PUB_CRATE: Self = RawVisibilityId(u32::MAX - 3);
+    const PUB: Self = RawVisibilityId { raw: u32::MAX };
+    const PRIV_IMPLICIT: Self = RawVisibilityId { raw: u32::MAX - 1 };
+    const PRIV_EXPLICIT: Self = RawVisibilityId { raw: u32::MAX - 2 };
+    const PUB_CRATE: Self = RawVisibilityId { raw: u32::MAX - 3 };
 
     /// Whether this is one of the visibilities every tree has, not one of its table.
     fn is_builtin(self) -> bool {
-        self.0 >= Self::PUB_CRATE.0
+        self.raw >= Self::PUB_CRATE.raw
     }
 }
 
@@ -118,48 +106,60 @@ impl fmt::Debug for RawVisibilityId {
             Self::PUB => f.field(&"pub"),
             Self::PRIV_IMPLICIT | Self::PRIV_EXPLICIT => f.field(&"pub(self)"),
             Self::PUB_CRATE => f.field(&"pub(crate)"),
-            _ => f.field(&self.0),
+            _ => f.field(&self.raw),
         };
         f.finish()
     }
 }
 
-/// A name of an [`ItemTree`]: an index into its table of names, `&tree[id]` the [`Name`].
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct NameId(u32);
+blaze_format::record! {
+    /// A name of an [`ItemTree`]: an index into its table of names, `&tree[id]` the [`Name`].
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+    pub struct NameId: 1 {
+        raw: u32,
+    }
+}
 
 impl NameId {
     /// No name: the name of `const _`.
-    pub const NONE: NameId = NameId(u32::MAX);
+    pub const NONE: NameId = NameId { raw: u32::MAX };
 }
 
-/// A path of an [`ItemTree`]: an index into its table of paths, `&tree[id]` the path.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct PathId(u32);
+blaze_format::record! {
+    /// A path of an [`ItemTree`]: an index into its table of paths, `&tree[id]` the path.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+    pub struct PathId: 1 {
+        raw: u32,
+    }
+}
 
 impl PathId {
     /// No path: the prefix of `use {a, b}` or the path of `use *` in a nested tree.
-    pub const NONE: PathId = PathId(u32::MAX);
+    pub const NONE: PathId = PathId { raw: u32::MAX };
 }
 
-/// An [`ImportAlias`] of an [`ItemTree`], or none: [`ItemTree::import_alias`] reads it.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct AliasId(u32);
+blaze_format::record! {
+    /// An [`ImportAlias`] of an [`ItemTree`], or none: [`ItemTree::import_alias`] reads it.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+    pub struct AliasId: 1 {
+        raw: u32,
+    }
+}
 
 impl AliasId {
     /// No `as`.
-    pub const NONE: AliasId = AliasId(u32::MAX);
+    pub const NONE: AliasId = AliasId { raw: u32::MAX };
     /// `as _`.
-    pub const UNDERSCORE: AliasId = AliasId(u32::MAX - 1);
+    pub const UNDERSCORE: AliasId = AliasId { raw: u32::MAX - 1 };
 }
 
-/// A `use` tree of an [`ItemTree`]: an index into its array of them.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-#[repr(transparent)]
-pub struct UseTreeId(u32);
+blaze_format::record! {
+    /// A `use` tree of an [`ItemTree`]: an index into its array of them.
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+    pub struct UseTreeId: 1 {
+        raw: u32,
+    }
+}
 
 blaze_format::record! {
     /// A list: `len` elements of one of the tree's arrays from `start`.
@@ -401,13 +401,13 @@ impl ItemTree {
         match alias {
             AliasId::NONE => None,
             AliasId::UNDERSCORE => Some(ImportAlias::Underscore),
-            AliasId(name) => Some(ImportAlias::Alias(self[NameId(name)].clone())),
+            AliasId { raw } => Some(ImportAlias::Alias(self[NameId { raw }].clone())),
         }
     }
 
     #[inline]
     pub fn use_tree(&self, id: UseTreeId) -> &UseTree {
-        &self.use_trees[id.0 as usize]
+        &self.use_trees[id.raw as usize]
     }
 
     /// Returns a count of a few, expensive items.
@@ -438,7 +438,7 @@ impl Index<NameId> for ItemTree {
     type Output = Name;
     #[inline]
     fn index(&self, id: NameId) -> &Name {
-        &self.names[id.0 as usize]
+        &self.names[id.raw as usize]
     }
 }
 
@@ -446,7 +446,7 @@ impl Index<PathId> for ItemTree {
     type Output = Interned<ModPath>;
     #[inline]
     fn index(&self, id: PathId) -> &Interned<ModPath> {
-        &self.paths[id.0 as usize]
+        &self.paths[id.raw as usize]
     }
 }
 
@@ -500,11 +500,12 @@ impl TreeId {
     }
 }
 
-/// An item of an [`ItemTree`]: its index in the per-item columns.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
-#[repr(transparent)]
-pub struct ModItemId {
-    index: u32,
+blaze_format::record! {
+    /// An item of an [`ItemTree`]: its index in the per-item columns.
+    #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
+    pub struct ModItemId: 1 {
+        index: u32,
+    }
 }
 
 impl ModItemId {
@@ -610,7 +611,7 @@ impl Index<RawVisibilityId> for ItemTree {
             RawVisibilityId::PRIV_EXPLICIT => &VIS_PRIV_EXPLICIT,
             RawVisibilityId::PUB => &VIS_PUB,
             RawVisibilityId::PUB_CRATE => &VIS_PUB_CRATE,
-            _ => &self.vis[index.0 as usize],
+            _ => &self.vis[index.raw as usize],
         }
     }
 }

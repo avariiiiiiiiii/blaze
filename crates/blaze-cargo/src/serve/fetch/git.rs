@@ -4,6 +4,8 @@
 //! submodules cargo checks out, under cargo's package cache lock. The checkout is then read
 //! whole, every file with its mode, but each `.git` (the clone's own, not the tree's).
 
+#![forbid(unsafe_code)]
+
 use std::path::Path;
 
 use anyhow::{Context as _, bail};

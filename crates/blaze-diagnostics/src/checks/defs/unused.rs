@@ -1,8 +1,9 @@
 //! E0392: a type or lifetime parameter of a struct, enum or union that nothing constrains, so
 //! its variance is bivariant; or one used only through the type itself ("is only used
-//! recursively").
+//! recursively"). E0091: a type parameter of a type alias its type never names.
 //!
-//! Follows rustc's `compiler/rustc_hir_analysis/src/check/wfcheck.rs`
+//! Follows rustc's `compiler/rustc_hir_analysis/src/check/check.rs`
+//! (`check_type_alias_type_params_are_used`), `wfcheck.rs`
 //! (`check_variances_for_type_defn`, `report_bivariance`, `HasErrorDeep`,
 //! `IsProbablyCyclical`, `CollectUsageSpans`), `constrained_generic_params.rs`
 //! (`identify_constrained_generic_params`, `setup_constraining_predicates`, `parameters_for`)
@@ -51,6 +52,10 @@ pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
     }
 
     let fields = field_types(&source.value);
+    let invalid = Invalid::of(&list);
+    if invalid.named_in(&fields) {
+        return Vec::new();
+    }
     let phantom_data = hir_def::lang_item::lang_items(db, cx.krate.base())
         .PhantomData
         .map(|it| cx.def_path(hir::ModuleDef::Adt(hir::Adt::Struct(it.into()))));
@@ -69,6 +74,9 @@ pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
             }
             ast::GenericParam::LifetimeParam(it) => {
                 let Some(lifetime) = it.lifetime() else { continue };
+                if invalid.lifetimes.contains(&lifetime.syntax().text_range()) {
+                    continue;
+                }
                 (lifetime.text().to_string(), "lifetime parameter", lifetime.syntax().text_range())
             }
             ast::GenericParam::ConstParam(_) => continue,
@@ -115,6 +123,97 @@ pub(super) fn check(cx: &Cx<'_, '_>, adt: hir::Adt) -> Vec<Found> {
         found.push(Found::new(diag, Phase::Items));
     }
     found
+}
+
+/// E0091: rustc's `check_type_alias_type_params_are_used`, a type parameter of a type alias its
+/// type never names. A checked alias (`checked_type_aliases`, or one holding an `impl Trait`) is
+/// checked as an item instead.
+pub(super) fn check_alias(cx: &Cx<'_, '_>, alias: hir::TypeAlias) -> Vec<Found> {
+    let db = cx.db;
+    let Some(source) = cx.sema.source(alias) else { return Vec::new() };
+    let Some(list) = source.value.generic_param_list() else { return Vec::new() };
+    let params: Vec<(hir::GenericParam, ast::TypeParam)> = list
+        .type_or_const_params()
+        .filter_map(|it| match it {
+            ast::TypeOrConstParam::Type(it) => Some((hir::GenericParam::TypeParam(cx.sema.to_def(&it)?), it)),
+            ast::TypeOrConstParam::Const(_) => None,
+        })
+        .collect();
+    let Some(ty) = source.value.ty() else { return Vec::new() };
+    if params.is_empty()
+        || ty.syntax().descendants().any(|it| ast::ImplTraitType::can_cast(it.kind()))
+        || Invalid::of(&list).named_in(std::slice::from_ref(&ty))
+    {
+        return Vec::new();
+    }
+    let checked = hir_def::unstable_features::UnstableFeatures::query(db, cx.krate.base())
+        .iter()
+        .any(|it| it.as_str() == "checked_type_aliases");
+    if checked {
+        return Vec::new();
+    }
+    let mut error = false;
+    alias.ty(db).walk(db, |ty| error |= ty.is_unknown());
+    if error {
+        return Vec::new();
+    }
+    let mut used = FxHashSet::default();
+    params_in(cx, ty.syntax(), true, &mut used);
+
+    // rustc reads the bounds after `Sized` elaboration: a parameter without `?Sized` has an
+    // implicit bound, so none at all means every parameter is `?Sized` and bounded by nothing.
+    let bounds: Vec<(bool, bool)> =
+        params.iter().map(|(def, node)| written_bounds(cx, &source.value, node, *def)).collect();
+    let none = bounds.iter().all(|&(relaxed, written)| relaxed && !written);
+    let what = format!("the type of `{}`", cx.def_path(hir::ModuleDef::TypeAlias(alias)));
+    let fact = Fact::Signature(cx.key(ItemId::Alias(alias.into())));
+    let mut found = Vec::new();
+    for ((param, node), (_, written)) in params.iter().zip(bounds) {
+        if used.contains(param) {
+            continue;
+        }
+        let Some(name) = node.name() else { continue };
+        let name_text = name.text();
+        let span = cx.span(source.with_value(name.syntax().text_range()));
+        let mut diag =
+            Diag::error(Some("E0091"), format!("type parameter `{name_text}` is never used"), span.clone());
+        diag.span_label(span, "unused type parameter");
+        diag.help(format!("consider removing `{name_text}` or referring to it in the body of the type alias"));
+        if !(none || written) {
+            diag.help(format!(
+                "if you intended `{name_text}` to be a const parameter, use `const {name_text}: /* Type */` instead"
+            ));
+        }
+        diag.fact(fact.clone(), what.clone());
+        found.push(Found::new(diag, Phase::Items));
+    }
+    found
+}
+
+/// Whether `param` of an alias is relaxed with `?Sized`, and whether a bound other than a
+/// relaxed one is written on it, inline or in the where clause.
+fn written_bounds(cx: &Cx<'_, '_>, node: &ast::TypeAlias, param: &ast::TypeParam, def: hir::GenericParam) -> (bool, bool) {
+    let mut lists: Vec<ast::TypeBoundList> = param.type_bound_list().into_iter().collect();
+    if let (Some(clause), hir::GenericParam::TypeParam(def)) = (node.where_clause(), def) {
+        for pred in clause.predicates() {
+            let Some(ast::Type::PathType(ty)) = pred.ty() else { continue };
+            let Some(path) = ty.path() else { continue };
+            if path.qualifier().is_none()
+                && cx.sema.resolve_path(&path) == Some(PathResolution::TypeParam(def))
+            {
+                lists.extend(pred.type_bound_list());
+            }
+        }
+    }
+    let (mut relaxed, mut written) = (false, false);
+    for bound in lists.iter().flat_map(|it| it.bounds()) {
+        if bound.question_mark_token().is_some() {
+            relaxed = true;
+        } else {
+            written = true;
+        }
+    }
+    (relaxed, written)
 }
 
 /// rustc's `identify_constrained_generic_params` of an ADT's predicates: a parameter an
@@ -318,6 +417,51 @@ fn is_explicitly_bounded(cx: &Cx<'_, '_>, node: &ast::Adt, param: &ast::TypePara
             false
         }
     })
+}
+
+/// The parameters rustc's resolver turns into errors (E0403, E0262, E0637): a type or const
+/// name declared twice, whose every use is then an error, and a lifetime declared again or
+/// named `'static` or `'_`, whose name is `ParamName::Error`.
+struct Invalid {
+    names: FxHashSet<String>,
+    lifetimes: FxHashSet<TextRange>,
+}
+
+impl Invalid {
+    fn of(list: &ast::GenericParamList) -> Invalid {
+        let mut seen = FxHashSet::default();
+        let mut invalid = Invalid { names: FxHashSet::default(), lifetimes: FxHashSet::default() };
+        for param in list.generic_params() {
+            match param {
+                ast::GenericParam::LifetimeParam(it) => {
+                    let Some(lifetime) = it.lifetime() else { continue };
+                    let text = lifetime.text();
+                    if !seen.insert(text.to_owned()) || text == "'static" || text == "'_" {
+                        invalid.lifetimes.insert(lifetime.syntax().text_range());
+                    }
+                }
+                ast::GenericParam::TypeParam(it) => invalid.name(&mut seen, it.name()),
+                ast::GenericParam::ConstParam(it) => invalid.name(&mut seen, it.name()),
+            }
+        }
+        invalid
+    }
+
+    fn name(&mut self, seen: &mut FxHashSet<String>, name: Option<ast::Name>) {
+        let Some(name) = name else { return };
+        if !seen.insert(name.text().to_owned()) {
+            self.names.insert(name.text().to_owned());
+        }
+    }
+
+    /// Whether `fields` name a type or const declared twice, rustc's `Res::Err`.
+    fn named_in(&self, fields: &[ast::Type]) -> bool {
+        !self.names.is_empty()
+            && fields.iter().flat_map(|ty| ty.syntax().descendants().filter_map(ast::Path::cast)).any(|path| {
+                path.qualifier().is_none()
+                    && path.segment().and_then(|it| it.name_ref()).is_some_and(|it| self.names.contains(it.text()))
+            })
+    }
 }
 
 /// rustc's `HasErrorDeep`: whether the fields, and those of the types they hold, have a type

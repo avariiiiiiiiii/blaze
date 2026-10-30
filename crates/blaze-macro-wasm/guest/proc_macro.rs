@@ -76,8 +76,11 @@ fn live() -> usize {
     LIVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// SAFETY: every method passes its arguments to `System` unchanged and returns what it returns; the
+// counter is only a statistic.
 unsafe impl std::alloc::GlobalAlloc for Counted {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc`'s contract for this call, which is `System`'s.
         let at = unsafe { std::alloc::System.alloc(layout) };
         if !at.is_null() {
             LIVE.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
@@ -86,6 +89,7 @@ unsafe impl std::alloc::GlobalAlloc for Counted {
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc`'s contract for this call, which is `System`'s.
         let at = unsafe { std::alloc::System.alloc_zeroed(layout) };
         if !at.is_null() {
             LIVE.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed);
@@ -94,11 +98,13 @@ unsafe impl std::alloc::GlobalAlloc for Counted {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: the caller upholds `GlobalAlloc`'s contract for this call, which is `System`'s.
         unsafe { std::alloc::System.dealloc(ptr, layout) };
         LIVE.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc`'s contract for this call, which is `System`'s.
         let at = unsafe { std::alloc::System.realloc(ptr, layout, size) };
         if !at.is_null() {
             LIVE.fetch_add(size, std::sync::atomic::Ordering::Relaxed);
@@ -114,6 +120,8 @@ static ALLOCATOR: Counted = Counted;
 fn taken(len: i32) -> Option<Vec<u8>> {
     let len = usize::try_from(len).ok()?;
     let mut bytes = vec![0u8; len];
+    // SAFETY: `bytes` has `len` bytes, the length the host answered for what is in its buffer,
+    // which `take` copies whole.
     unsafe { sys::take(bytes.as_mut_ptr()) };
     Some(bytes)
 }
@@ -174,6 +182,8 @@ impl FromStr for TokenStream {
     type Err = LexError;
 
     fn from_str(src: &str) -> Result<TokenStream, LexError> {
+        // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+        // frame, which the host only reads during the call.
         let len = unsafe { sys::ts_from_str(src.as_ptr(), src.len()) };
         match taken(len) {
             Some(bytes) => Ok(wire::Reader::new(&bytes).stream()),
@@ -335,14 +345,17 @@ pub struct Span(u32);
 
 impl Span {
     pub fn def_site() -> Span {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span(unsafe { sys::def_site() })
     }
 
     pub fn call_site() -> Span {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span(unsafe { sys::call_site() })
     }
 
     pub fn mixed_site() -> Span {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span(unsafe { sys::mixed_site() })
     }
 
@@ -351,52 +364,64 @@ impl Span {
     }
 
     pub fn parent(&self) -> Option<Span> {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span::some(unsafe { sys::span_parent(self.0) })
     }
 
     pub fn source(&self) -> Span {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span(unsafe { sys::span_source(self.0) })
     }
 
     pub fn byte_range(&self) -> Range<usize> {
         let mut out = [0u32; 2];
+        // SAFETY: `out` is two writable `u32`s of this frame, which the host writes.
         unsafe { sys::span_byte_range(self.0, out.as_mut_ptr()) };
         out[0] as usize..out[1] as usize
     }
 
     pub fn start(&self) -> Span {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span(unsafe { sys::span_start(self.0) })
     }
 
     pub fn end(&self) -> Span {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span(unsafe { sys::span_end(self.0) })
     }
 
     pub fn line(&self) -> usize {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         unsafe { sys::span_line(self.0) as usize }
     }
 
     pub fn column(&self) -> usize {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         unsafe { sys::span_column(self.0) as usize }
     }
 
     pub fn file(&self) -> String {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         taken_string(unsafe { sys::span_file(self.0) }).unwrap_or_default()
     }
 
     pub fn local_file(&self) -> Option<PathBuf> {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         taken_string(unsafe { sys::span_local_file(self.0) }).map(PathBuf::from)
     }
 
     pub fn join(&self, other: Span) -> Option<Span> {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span::some(unsafe { sys::span_join(self.0, other.0) })
     }
 
     pub fn resolved_at(&self, other: Span) -> Span {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span(unsafe { sys::span_resolved_at(self.0, other.0) })
     }
 
     pub fn located_at(&self, other: Span) -> Span {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span(unsafe { sys::span_located_at(self.0, other.0) })
     }
 
@@ -405,6 +430,7 @@ impl Span {
     }
 
     pub fn source_text(&self) -> Option<String> {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         taken_string(unsafe { sys::span_source_text(self.0) })
     }
 
@@ -435,6 +461,7 @@ impl Span {
 
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         let text = taken_string(unsafe { sys::span_debug(self.0) }).unwrap_or_default();
         f.write_str(&text)
     }
@@ -881,6 +908,7 @@ impl Literal {
             Bound::Excluded(at) => 3 + 4 * *at as u64,
         };
         let (start, end) = (bound(range.start_bound()), bound(range.end_bound()));
+        // SAFETY: the import takes and gives integers only and reads no memory of the module.
         Span::some(unsafe { sys::span_subspan(self.span.0, start, end) })
     }
 
@@ -926,6 +954,8 @@ impl FromStr for Literal {
     type Err = LexError;
 
     fn from_str(src: &str) -> Result<Literal, LexError> {
+        // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+        // frame, which the host only reads during the call.
         let len = unsafe { sys::literal_from_str(src.as_ptr(), src.len()) };
         let Some(bytes) = taken(len) else {
             return Err(LexError("cannot parse string into literal".to_owned()));
@@ -1109,6 +1139,8 @@ impl Diagnostic {
             Level::Help => 3,
         };
         let span = self.spans.first().map_or(0, |it| it.0);
+        // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+        // frame, which the host only reads during the call.
         unsafe { sys::diagnostic(level, self.message.as_ptr(), self.message.len(), span) };
         for child in self.children {
             child.emit();
@@ -1125,12 +1157,16 @@ pub mod tracked {
 
     pub fn env_var<K: AsRef<OsStr> + AsRef<str>>(key: K) -> Result<String, VarError> {
         let key: &str = key.as_ref();
+        // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+        // frame, which the host only reads during the call.
         unsafe { super::sys::track_env_var(key.as_ptr(), key.len()) };
         env::var(key)
     }
 
     pub fn path<P: AsRef<Path>>(path: P) {
         let path: &str = path.as_ref().to_str().unwrap();
+        // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+        // frame, which the host only reads during the call.
         unsafe { super::sys::track_path(path.as_ptr(), path.len()) };
     }
 }
@@ -1341,6 +1377,10 @@ pub mod __blaze {
     }
 
     fn input(ptr: *const u8, len: usize) -> TokenStream {
+        // SAFETY: `ptr`..`ptr + len` is what the host wrote the input into (`alloc`), live in
+        // `ROOM` until the expansion ends; the exports pass only that. `expand1` and `expand2` are
+        // safe `pub fn`s that don't require it of other callers (v2/requests/usercode.md,
+        // safety-audit MAY BE UNSOUND 5), though a wrong pointer stays inside this instance.
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
         wire::Reader::new(bytes).stream()
     }
@@ -1353,6 +1393,8 @@ pub mod __blaze {
                 (_, Some(it)) => it.clone(),
                 _ => "Box<dyn Any>".to_owned(),
             };
+            // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+            // frame, which the host only reads during the call.
             unsafe { sys::panicked(message.as_ptr(), message.len()) };
         }));
     }
@@ -1360,6 +1402,8 @@ pub mod __blaze {
     fn give(output: TokenStream) {
         let mut out = Vec::new();
         wire::write(&output, &mut out);
+        // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+        // frame, which the host only reads during the call.
         unsafe { sys::output(out.as_ptr(), out.len()) };
     }
 
@@ -1373,6 +1417,7 @@ pub mod __blaze {
         ROOM.with(|room| room.borrow_mut().clear());
         let left = live().saturating_sub(before);
         if left != 0 {
+            // SAFETY: the import takes and gives integers only and reads no memory of the module.
             unsafe { sys::retained(left) };
         }
     }
@@ -1402,11 +1447,15 @@ pub mod __blaze {
     /// The list of macros, a line each: kind (0 derive, 1 attribute, 2 function-like), name
     /// and the derive's helper attributes, tab-separated.
     pub fn list(text: &str) {
+        // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+        // frame, which the host only reads during the call.
         unsafe { sys::output(text.as_ptr(), text.len()) };
     }
 
     /// As [`list`], of the bytes of the static the module also carries in a custom section.
     pub fn list_bytes(text: &[u8]) {
+        // SAFETY: the pointer and length are those of a live `&str`, `&[u8]` or `Vec` of this
+        // frame, which the host only reads during the call.
         unsafe { sys::output(text.as_ptr(), text.len()) };
     }
 }

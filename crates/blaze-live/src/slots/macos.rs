@@ -23,7 +23,7 @@ use std::{
     },
 };
 
-pub(super) use super::unix::{Map, backtrace, descriptor};
+pub(super) use super::unix::{backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},
@@ -201,7 +201,7 @@ impl Memory for Os {
                         if let Some((done, protection)) = run.replace((pages, protection)) {
                             // SAFETY: read-only pages of the image, which nothing writes; the
                             // copy mapped over them has the rest of their bytes as they are.
-                            unsafe { swap(&done, protection, |copy| writes.put(&done, copy))? };
+                            unsafe { swap(&done, protection, |copy| writes.fill(&done, copy))? };
                         }
                     }
                 }
@@ -209,7 +209,7 @@ impl Memory for Os {
         }
         if let Some((done, protection)) = run {
             // SAFETY: as above.
-            unsafe { swap(&done, protection, |copy| writes.put(&done, copy))? };
+            unsafe { swap(&done, protection, |copy| writes.fill(&done, copy))? };
         }
         Ok(())
     }
@@ -236,14 +236,9 @@ impl Memory for Os {
         // A page mapped over the cell's in one step is a store a reader sees all of or none.
         let pages = pages(&(cell..cell + 8));
         let bytes = table.to_le_bytes();
-        // SAFETY: the cell's page is read-only data of the image, which nothing else writes;
-        // the cell is within the copy, 8 bytes from `cell - pages.start`.
-        unsafe {
-            swap(&pages, self.cell, |copy| {
-                let to = copy.add((cell - pages.start) as usize);
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, 8);
-            })
-        }
+        let at = (cell - pages.start) as usize;
+        // SAFETY: the cell's page is read-only data of the image, which nothing else writes.
+        unsafe { swap(&pages, self.cell, |copy| copy[at..at + 8].copy_from_slice(&bytes)) }
     }
 }
 
@@ -253,7 +248,7 @@ impl Os {
         // SAFETY: the pages are the patch code region's, mapped with one protection
         // (`Os::new` checked, and every swap keeps it); the bytes written are where no kept
         // generation's code is, and the rest of the pages is copied as it is.
-        unsafe { swap(run, self.protection, |copy| writes.put(run, copy)) }
+        unsafe { swap(run, self.protection, |copy| writes.fill(run, copy)) }
     }
 }
 
@@ -273,8 +268,8 @@ fn region_at(address: u64) -> Result<(Range<u64>, i32), String> {
     let mut info = [0i32; 9];
     let mut count = info.len() as u32;
     // SAFETY: `info` is as large as the basic information of a region, in `int`s.
-    unsafe {
-        check(mach_vm_region(
+    check(unsafe {
+        mach_vm_region(
             task,
             &mut start,
             &mut size,
@@ -282,8 +277,8 @@ fn region_at(address: u64) -> Result<(Range<u64>, i32), String> {
             info.as_mut_ptr(),
             &mut count,
             &mut object,
-        ))
-    }
+        )
+    })
     .map_err(|it| format!("reading the protection at {address:#x}: {it}"))?;
     if start > address || start.saturating_add(size) <= address {
         return Err(format!("nothing is mapped at {address:#x}"));
@@ -292,32 +287,40 @@ fn region_at(address: u64) -> Result<(Range<u64>, i32), String> {
 }
 
 /// Writes the whole pages `pages`, mapped with `protection`, by mapping a copy of them over
-/// them: `fill` writes the copy, at the address it is given for `pages.start`.
+/// them: `fill` writes the copy, which stands for `pages`.
 ///
 /// # Safety
 ///
-/// `pages` are mapped and readable, nothing writes them while this runs, and `fill` writes
-/// only within the copy's `pages.end - pages.start` bytes.
+/// `pages` are whole mapped and readable pages of the image that nothing writes while this
+/// runs.
 unsafe fn swap(
     pages: &Range<u64>,
     protection: i32,
-    fill: impl FnOnce(*mut u8),
+    fill: impl FnOnce(&mut [u8]),
 ) -> Result<(), String> {
     let len = pages.end - pages.start;
     // SAFETY: it takes no pointer.
     let task = unsafe { mach_task_self() };
     let mut scratch = 0u64;
-    // SAFETY: a new allocation anywhere; `pages` are readable (the caller's), `fill` writes
-    // within the copy, and the scratch is freed once mapped over them.
-    unsafe {
-        check(mach_vm_allocate(task, &mut scratch, len, ANYWHERE))
-            .map_err(|it| format!("allocating a copy of {:#x}: {it}", pages.start))?;
-        std::ptr::copy_nonoverlapping(pages.start as *const u8, scratch as *mut u8, len as usize);
-        fill(scratch as *mut u8);
-        let swapped = (|| {
-            check(mach_vm_protect(task, scratch, len, 0, protection))?;
-            let (mut current, mut max, mut target) = (0, 0, pages.start);
-            check(mach_vm_remap(
+    // SAFETY: a new allocation anywhere, written to `scratch`.
+    check(unsafe { mach_vm_allocate(task, &mut scratch, len, ANYWHERE) })
+        .map_err(|it| format!("allocating a copy of {:#x}: {it}", pages.start))?;
+    {
+        // SAFETY: `len` bytes allocated above, zeroed, which only this function knows of.
+        let copy = unsafe { std::slice::from_raw_parts_mut(scratch as *mut u8, len as usize) };
+        // SAFETY: `pages` are mapped and readable, and nothing writes them (the caller's).
+        let now = unsafe { std::slice::from_raw_parts(pages.start as *const u8, len as usize) };
+        copy.copy_from_slice(now);
+        fill(copy);
+    }
+    let swapped = (|| {
+        // SAFETY: the allocation above, of `len` bytes.
+        check(unsafe { mach_vm_protect(task, scratch, len, 0, protection) })?;
+        let (mut current, mut max, mut target) = (0, 0, pages.start);
+        // SAFETY: maps the copy over `pages` in one step, so a reader sees the old bytes or
+        // the new; whole pages (the caller's), with the protection they had.
+        check(unsafe {
+            mach_vm_remap(
                 task,
                 &mut target,
                 len,
@@ -329,13 +332,15 @@ unsafe fn swap(
                 &mut current,
                 &mut max,
                 INHERIT_NONE,
-            ))
-        })();
-        mach_vm_deallocate(task, scratch, len);
-        swapped.map_err(|it| format!("writing at {:#x}: {it}", pages.start))?;
-        if protection & EXECUTE != 0 {
-            sys_icache_invalidate(pages.start as *mut c_void, len as usize);
-        }
+            )
+        })
+    })();
+    // SAFETY: the allocation above, which no slice borrows now; the remap shares its pages.
+    unsafe { mach_vm_deallocate(task, scratch, len) };
+    swapped.map_err(|it| format!("writing at {:#x}: {it}", pages.start))?;
+    if protection & EXECUTE != 0 {
+        // SAFETY: the pages were just mapped; invalidating changes no memory.
+        unsafe { sys_icache_invalidate(pages.start as *mut c_void, len as usize) };
     }
     Ok(())
 }
@@ -410,13 +415,12 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
                 }
             }
         }
-        // SAFETY: the thread's own descriptors.
-        unsafe {
-            if let Some(fd) = watched {
-                close(fd);
-            }
-            close(kq);
+        if let Some(fd) = watched {
+            // SAFETY: the thread's own descriptor, closed once.
+            unsafe { close(fd) };
         }
+        // SAFETY: as above.
+        unsafe { close(kq) };
     };
     std::thread::Builder::new()
         .name("blaze-live-slots".to_owned())

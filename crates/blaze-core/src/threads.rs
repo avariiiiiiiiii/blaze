@@ -474,9 +474,11 @@ mod world {
             if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            // SAFETY: the call made both; each is owned once from here.
-            let (read_end, write_end) =
-                unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+            // SAFETY: `pipe` succeeded, so `ends[0]` is a new descriptor nothing else owns; owned
+            // once, here.
+            let read_end = unsafe { OwnedFd::from_raw_fd(ends[0]) };
+            // SAFETY: as above, for `ends[1]`.
+            let write_end = unsafe { OwnedFd::from_raw_fd(ends[1]) };
             net::set_cloexec(read_end.as_raw_fd())?;
             net::set_cloexec(write_end.as_raw_fd())?;
             listener.set_nonblocking(true)?;

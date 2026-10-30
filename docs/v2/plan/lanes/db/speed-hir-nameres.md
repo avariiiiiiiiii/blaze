@@ -18,6 +18,27 @@ point), the per-module `ItemScope`s they hand to the database, `resolve_path_fp_
 | the edge | `find_path.rs`, `import_map.rs` | [speed-hir-nameres-edge.md](speed-hir-nameres-edge.md) |
 | the def map, bodies on demand, invalidation | `nameres.rs`, `nameres/demand.rs`, `nameres/tests/backdate.rs` | this file |
 
+## Before and after, by part
+
+Each part's notes give the detail; the headline numbers:
+
+| measure | before | after | part |
+|---|---|---|---|
+| bytes per scope entry | ~73 (`IndexMap` bucket and table, with slack) | 40 (8 names or fewer), ~45-47 above | scope |
+| hashes and tables probed per `ItemScope::get` | 3 and 3 | 1 and 1 probe run for all namespaces | scope |
+| allocations per decoded scope on a frozen hit | about 3 per non-empty map, 2 per list | 1 per column, plus 1 for the name index above 8 names | scope |
+| allocations per path lookup | one `ModPath` per def map the path continues in, plus a `tracing` check per segment | 0 | paths |
+| probes per later path segment | 1 | 1 | paths |
+| bytes per `Resolver` scope | about 32 | at most 24 (asserted), 16 where the niche fits | paths |
+| bytes per import-map item (one info) | about 104 | about 64 | edge |
+| `ModPath`s built per `find_path` call | one per segment per candidate | one, for the chosen path | edge |
+| imports retried per pass | every unresolved and indeterminate import | only those a write to a slot their last lookup read woke | fixpoint |
+| `resolve_import` calls, a chain of 64 modules each importing the next | about 4000 (O(n²)) | 127 (O(n)) | fixpoint |
+| allocations per glob propagation step (`update_recursive`) | 2 (importer list clone, `held`) | 0 | fixpoint |
+| bytes of a collected module row's scope slot | ~64 | at most 16 | def map |
+| `CfgOptions` clones per cfg'd-out item | 1 (a hash set) | 0 | def map |
+| symbol interns per word of a scanned dependency body | 1 | 0 | demand |
+
 ## Benchmarks
 
 - **rustc's resolver** (`rustc_resolve`): `NameBinding`s interned in an arena, `resolutions:

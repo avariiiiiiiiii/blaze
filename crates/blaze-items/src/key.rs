@@ -8,12 +8,16 @@
 //! that macro's expansion, named by the key of the call. A key never says what the item is:
 //! an edit of its signature or body keeps it, a rename or a move gives a new one.
 //!
+//! Like a `DefPathHash`, a key also says where it is: its first 8 bytes are its crate key's,
+//! and the top bit of byte 8 says whether it is inside a body (an item of a block, a closure,
+//! an opaque type). [`resolve`] reads both and looks in one index of one crate.
+//!
 //! A crate is named by its content, never by its `Crate` id: its name, version, origin, kind
 //! of target and the cfg it is built with. Features are in the cfg: one package is built
 //! twice in one build, for the host and for the target, with different features and, when not
 //! cross compiling, the same target cfg. Turning on a feature names its crate's items anew;
 //! their hashes stay what they were, so it costs queries, not code. Two crates of one build
-//! with equal keys are an error [`resolve`] stops at.
+//! with equal keys, or keys with equal first 8 bytes, are an error [`resolve`] stops at.
 //!
 //! [`resolve`] goes back from a key to the item of the current database, by indexes over every
 //! crate's items: one of the items of its modules, impls and traits, one per body of the items
@@ -43,13 +47,12 @@ use hir_ty::{
     },
     next_solver::SolverDefId,
 };
-use rustc_hash::FxHashMap;
 use span::ErasedFileAstId;
 use syntax::ast::HasName;
 
 use crate::{ItemId, ItemKey, NAME_DOMAIN, NameHash, SimplifiedType};
 
-pub const KEY_DOMAIN: &str = "blaze v2 item key 1";
+pub const KEY_DOMAIN: &str = "blaze v2 item key 2";
 pub const CRATE_DOMAIN: &str = "blaze v2 crate key 1";
 pub const SIMPLIFIED_DOMAIN: &str = "blaze v2 simplified type 1";
 
@@ -105,9 +108,11 @@ pub fn crate_key(db: &dyn HirDatabase, krate: Crate) -> ContentId {
         TargetKind::BuildScript => h.update(&[5]),
         TargetKind::Other => h.update(&[6]),
     };
-    let mut atoms: Vec<Vec<u8>> = Vec::new();
+    // Every atom's bytes in one buffer, sorted as byte strings.
+    let mut bytes = Vec::new();
+    let mut atoms: Vec<(usize, usize)> = Vec::new();
     for atom in krate.cfg_options(db) {
-        let mut bytes = Vec::new();
+        let start = bytes.len();
         match atom {
             cfg::CfgAtom::Flag(name) => {
                 bytes.push(0);
@@ -119,12 +124,12 @@ pub fn crate_key(db: &dyn HirDatabase, krate: Crate) -> ContentId {
                 frame(&mut bytes, value.as_str());
             }
         }
-        atoms.push(bytes);
+        atoms.push((start, bytes.len()));
     }
-    atoms.sort_unstable();
+    atoms.sort_unstable_by(|a, b| bytes[a.0..a.1].cmp(&bytes[b.0..b.1]));
     h.update(&(atoms.len() as u64).to_le_bytes());
-    for atom in &atoms {
-        h.part(atom);
+    for &(start, end) in &atoms {
+        h.part(&bytes[start..end]);
     }
     h.finish()
 }
@@ -180,13 +185,84 @@ impl Bytes {
     }
 }
 
-/// Many preimages hashed in one batch: BLAKE3 over 16 inputs at a time with AVX-512, 4 with
-/// NEON, each exactly `ContentId::of(KEY_DOMAIN, it)`.
-fn hash_all<T>(entries: Vec<(T, Bytes)>) -> impl Iterator<Item = (T, ItemKey)> {
-    let inputs: Vec<&[u8]> = entries.iter().map(|(_, it)| &it.0[..]).collect();
-    let keys = ContentId::of_many(KEY_DOMAIN, &inputs);
-    drop(inputs);
-    entries.into_iter().zip(keys).map(|((it, _), key)| (it, ItemKey(key)))
+/// The top bit of a key's byte 8: the key is of something inside a body (an item of a block,
+/// a block's module, a closure, an anonymous constant, an opaque type).
+const INNER: u8 = 0x80;
+
+/// A key has rustc's `DefPathHash` shape, so [`resolve`] goes straight to one index of one
+/// crate: bytes 0..8 are the first 8 of its crate's key, byte 8's top bit is [`INNER`], and the
+/// other 247 bits are the hash of its preimage.
+impl ItemKey {
+    fn crate_prefix(&self) -> [u8; 8] {
+        *self.0.0.first_chunk().expect("a key is 32 bytes")
+    }
+
+    fn is_inner(&self) -> bool {
+        self.0.0[8] & INNER != 0
+    }
+}
+
+fn shaped(prefix: [u8; 8], inner: bool, hash: ContentId) -> ItemKey {
+    let mut bytes = hash.0;
+    bytes[..8].copy_from_slice(&prefix);
+    bytes[8] = (bytes[8] & !INNER) | if inner { INNER } else { 0 };
+    ItemKey(ContentId(bytes))
+}
+
+/// The key of something in `parent`: its crate, inside a body if its parent is or `inner` says.
+fn under(parent: &ItemKey, inner: bool, hash: ContentId) -> ItemKey {
+    shaped(parent.crate_prefix(), parent.is_inner() || inner, hash)
+}
+
+fn crate_prefix(krate: &ContentId) -> [u8; 8] {
+    *krate.0.first_chunk().expect("a key is 32 bytes")
+}
+
+/// The preimages of many keys in one buffer, `ends[i]` where the `i`th ends, hashed in one
+/// batch: BLAKE3 over 16 inputs at a time with AVX-512, 4 with NEON, each exactly
+/// `ContentId::of(KEY_DOMAIN, it)`. One allocation per batch, not one per key.
+struct Batch<T> {
+    rows: Vec<(T, ItemKey)>,
+    bytes: Bytes,
+    ends: Vec<u32>,
+}
+
+impl<T: Copy + Ord> Batch<T> {
+    fn with_capacity(count: usize) -> Batch<T> {
+        Batch {
+            rows: Vec::with_capacity(count),
+            bytes: Bytes(Vec::with_capacity(count * 96)),
+            ends: Vec::with_capacity(count),
+        }
+    }
+
+    /// Adds `id`, whose preimage `write` appends and whose parent it returns.
+    fn push(&mut self, id: T, write: impl FnOnce(&mut Bytes) -> ItemKey) {
+        let parent = write(&mut self.bytes);
+        self.rows.push((id, parent));
+        self.ends.push(u32::try_from(self.bytes.0.len()).expect("a batch of keys under 4 GiB"));
+    }
+
+    /// The keys, sorted by id for [`find`].
+    fn finish(self) -> Vec<(T, ItemKey)> {
+        let Batch { mut rows, bytes, ends } = self;
+        let mut inputs: Vec<&[u8]> = Vec::with_capacity(ends.len());
+        let mut start = 0;
+        for &end in &ends {
+            inputs.push(&bytes.0[start..end as usize]);
+            start = end as usize;
+        }
+        for ((_, parent), hash) in rows.iter_mut().zip(ContentId::of_many(KEY_DOMAIN, &inputs)) {
+            *parent = under(parent, false, hash);
+        }
+        rows.sort_unstable_by_key(|&(id, _)| id);
+        rows
+    }
+}
+
+/// The key of `id` in keys [`Batch::finish`] gave.
+fn find<T: Copy + Ord>(keys: &[(T, ItemKey)], id: T) -> Option<ItemKey> {
+    keys.binary_search_by_key(&id, |&(it, _)| it).ok().map(|at| keys[at].1)
 }
 
 /// The key of a module: of its crate for a crate's root, of its block for a block's, else of
@@ -201,20 +277,25 @@ fn module_key_in<'db>(db: &'db dyn HirDatabase, module: ModuleIdLt<'db>) -> Item
     match module.containing_module_inside_def_map(db) {
         Some(parent) => {
             let name = module.name(db);
-            b.id(&module_key_in(db, parent).0).update(b"mod").opt(name.as_ref().map(|it| it.as_str()));
+            let parent = module_key_in(db, parent);
+            b.id(&parent.0).update(b"mod").opt(name.as_ref().map(|it| it.as_str()));
+            under(&parent, false, ContentId::of(KEY_DOMAIN, &b.0))
         }
         None => match module.block(db) {
             Some(block) => {
                 let ast = block.ast_id(db);
-                b.id(&module_key_in(db, block.module(db)).0).update(b"block");
+                let parent = module_key_in(db, block.module(db));
+                b.id(&parent.0).update(b"block");
                 written(db, &mut b, ast.file_id, ast.value.erase());
+                under(&parent, true, ContentId::of(KEY_DOMAIN, &b.0))
             }
             None => {
-                b.update(b"crate").id(&crate_key(db, module.krate(db)));
+                let krate = crate_key(db, module.krate(db));
+                b.update(b"crate").id(&krate);
+                shaped(crate_prefix(&krate), false, ContentId::of(KEY_DOMAIN, &b.0))
             }
         },
     }
-    ItemKey(ContentId::of(KEY_DOMAIN, &b.0))
 }
 
 /// Where a declaration is written: the file (an expansion named by its call) and the raw AST
@@ -292,8 +373,8 @@ pub fn item_key(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
         Siblings::Impl(it) => impl_item_keys(db, it),
         Siblings::Trait(it) => trait_item_keys(db, it),
     };
-    match batch.get(&id) {
-        Some(&key) => key,
+    match find(batch, id) {
+        Some(key) => key,
         // An item its module's scope does not list, as a `macro_rules!` that a later one of
         // its name shadows: the same bytes, hashed alone.
         None => item_key_alone(db, id),
@@ -302,15 +383,18 @@ pub fn item_key(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
 
 /// An item's key hashed by itself, which the batch gives bit for bit.
 pub(crate) fn item_key_alone(db: &dyn HirDatabase, id: ItemId) -> ItemKey {
-    ItemKey(ContentId::of(KEY_DOMAIN, &item_preimage(db, id).0))
+    let mut b = Bytes::default();
+    let parent = item_preimage(db, id, &mut b);
+    under(&parent, false, ContentId::of(KEY_DOMAIN, &b.0))
 }
 
-/// The keys of the items a module's scope declares.
+/// The keys of the items a module's scope declares, sorted by id: 40 bytes per item, found by
+/// binary search.
 #[salsa::tracked(returns(ref))]
 fn module_item_keys<'db>(
     db: &'db dyn HirDatabase,
     module: ModuleIdLt<'db>,
-) -> FxHashMap<ItemId, ItemKey> {
+) -> Vec<(ItemId, ItemKey)> {
     let scope = module.def_map(db).module(db, module).scope(db);
     let mut ids = Vec::new();
     for def in scope.declarations() {
@@ -336,132 +420,149 @@ fn module_item_keys<'db>(
     });
     ids.sort_unstable();
     ids.dedup();
-    let entries = ids.into_iter().map(|id| (id, item_preimage(db, id))).collect();
-    hash_all(entries).collect()
+    let mut batch = Batch::with_capacity(ids.len());
+    for id in ids {
+        batch.push(id, |b| item_preimage(db, id, b));
+    }
+    batch.finish()
 }
 
 #[salsa::tracked(returns(ref))]
-fn impl_item_keys(db: &dyn HirDatabase, impl_: ImplId) -> FxHashMap<ItemId, ItemKey> {
-    let entries = impl_
-        .impl_items(db)
-        .items
-        .iter()
-        .map(|&(_, it)| (ItemId::from(it), item_preimage(db, it.into())))
-        .collect();
-    hash_all(entries).collect()
+fn impl_item_keys(db: &dyn HirDatabase, impl_: ImplId) -> Vec<(ItemId, ItemKey)> {
+    let items = &impl_.impl_items(db).items;
+    let mut batch = Batch::with_capacity(items.len());
+    for &(_, it) in items.iter() {
+        batch.push(ItemId::from(it), |b| item_preimage(db, it.into(), b));
+    }
+    batch.finish()
 }
 
 #[salsa::tracked(returns(ref))]
-fn trait_item_keys(db: &dyn HirDatabase, trait_: TraitId) -> FxHashMap<ItemId, ItemKey> {
-    let entries = trait_
-        .trait_items(db)
-        .items
-        .iter()
-        .map(|&(_, it)| (ItemId::from(it), item_preimage(db, it.into())))
-        .collect();
-    hash_all(entries).collect()
+fn trait_item_keys(db: &dyn HirDatabase, trait_: TraitId) -> Vec<(ItemId, ItemKey)> {
+    let items = &trait_.trait_items(db).items;
+    let mut batch = Batch::with_capacity(items.len());
+    for &(_, it) in items.iter() {
+        batch.push(ItemId::from(it), |b| item_preimage(db, it.into(), b));
+    }
+    batch.finish()
 }
 
-/// The bytes an item's key is the hash of: its parent's key, its kind, its name and where it
-/// is written.
-fn item_preimage(db: &dyn HirDatabase, id: ItemId) -> Bytes {
-    let (parent, prefix, tag, name, file, ast): (_, &[u8], &[u8], _, _, _) = match id {
+/// Appends the bytes an item's key is the hash of to `b`: its parent's key, its kind, its name
+/// (the interned symbol's bytes, read in place) and where it is written. Gives the parent.
+fn item_preimage(db: &dyn HirDatabase, id: ItemId, b: &mut Bytes) -> ItemKey {
+    fn head(b: &mut Bytes, parent: ItemKey, prefix: &[u8], tag: &[u8], name: Option<&str>) {
+        b.id(&parent.0).part(prefix).part(tag).opt(name);
+    }
+    let (parent, file, ast) = match id {
         ItemId::Function(it) => {
             let loc = it.lookup(db);
             let (parent, prefix) = container_key(db, loc.container);
-            let name = Some(FunctionSignature::of(db, it).name.as_str().to_owned());
-            (parent, prefix, b"fn", name, loc.id.file_id, loc.id.value.erase())
+            head(b, parent, prefix, b"fn", Some(FunctionSignature::of(db, it).name.as_str()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Adt(AdtId::StructId(it)) => {
             let loc = it.lookup(db);
-            let name = Some(StructSignature::of(db, it).name.as_str().to_owned());
-            (module_key(db, loc.container), b"", b"struct", name, loc.id.file_id, loc.id.value.erase())
+            let parent = module_key(db, loc.container);
+            head(b, parent, b"", b"struct", Some(StructSignature::of(db, it).name.as_str()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Adt(AdtId::EnumId(it)) => {
             let loc = it.lookup(db);
-            let name = Some(EnumSignature::of(db, it).name.as_str().to_owned());
-            (module_key(db, loc.container), b"", b"enum", name, loc.id.file_id, loc.id.value.erase())
+            let parent = module_key(db, loc.container);
+            head(b, parent, b"", b"enum", Some(EnumSignature::of(db, it).name.as_str()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Adt(AdtId::UnionId(it)) => {
             let loc = it.lookup(db);
-            let name = Some(UnionSignature::of(db, it).name.as_str().to_owned());
-            (module_key(db, loc.container), b"", b"union", name, loc.id.file_id, loc.id.value.erase())
+            let parent = module_key(db, loc.container);
+            head(b, parent, b"", b"union", Some(UnionSignature::of(db, it).name.as_str()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Trait(it) => {
             let loc = it.lookup(db);
-            let name = Some(TraitSignature::of(db, it).name.as_str().to_owned());
-            (module_key(db, loc.container), b"", b"trait", name, loc.id.file_id, loc.id.value.erase())
+            let parent = module_key(db, loc.container);
+            head(b, parent, b"", b"trait", Some(TraitSignature::of(db, it).name.as_str()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Impl(it) => {
             let loc = it.lookup(db);
-            (module_key(db, loc.container), b"", b"impl", None, loc.id.file_id, loc.id.value.erase())
+            let parent = module_key(db, loc.container);
+            head(b, parent, b"", b"impl", None);
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Const(it) => {
             let loc = it.lookup(db);
             let (parent, prefix) = container_key(db, loc.container);
-            let name = ConstSignature::of(db, it).name.as_ref().map(|it| it.as_str().to_owned());
-            (parent, prefix, b"const", name, loc.id.file_id, loc.id.value.erase())
+            let signature = ConstSignature::of(db, it);
+            head(b, parent, prefix, b"const", signature.name.as_ref().map(|it| it.as_str()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Static(it) => {
             let loc = it.lookup(db);
             let (parent, prefix) = container_key(db, loc.container);
-            let name = Some(StaticSignature::of(db, it).name.as_str().to_owned());
-            (parent, prefix, b"static", name, loc.id.file_id, loc.id.value.erase())
+            head(b, parent, prefix, b"static", Some(StaticSignature::of(db, it).name.as_str()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Alias(it) => {
             let loc = it.lookup(db);
             let (parent, prefix) = container_key(db, loc.container);
-            let name = Some(TypeAliasSignature::of(db, it).name.as_str().to_owned());
-            (parent, prefix, b"type", name, loc.id.file_id, loc.id.value.erase())
+            head(b, parent, prefix, b"type", Some(TypeAliasSignature::of(db, it).name.as_str()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
+        // hir-def keeps no macro's name but in its syntax.
         ItemId::Macro(MacroId::MacroRulesId(it)) => {
             let loc = it.lookup(db);
-            let name = loc.id.to_node(db).name().map(|it| it.text().to_string());
-            (module_key(db, loc.container), b"", b"macro_rules", name, loc.id.file_id, loc.id.value.erase())
+            let parent = module_key(db, loc.container);
+            let name = loc.id.to_node(db).name();
+            head(b, parent, b"", b"macro_rules", name.as_ref().map(|it| it.text()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Macro(MacroId::Macro2Id(it)) => {
             let loc = it.lookup(db);
-            let name = loc.id.to_node(db).name().map(|it| it.text().to_string());
-            (module_key(db, loc.container), b"", b"macro", name, loc.id.file_id, loc.id.value.erase())
+            let parent = module_key(db, loc.container);
+            let name = loc.id.to_node(db).name();
+            head(b, parent, b"", b"macro", name.as_ref().map(|it| it.text()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
         ItemId::Macro(MacroId::ProcMacroId(it)) => {
             let loc = it.lookup(db);
-            let name = loc.id.to_node(db).name().map(|it| it.text().to_string());
-            (module_key(db, loc.container), b"", b"proc_macro", name, loc.id.file_id, loc.id.value.erase())
+            let parent = module_key(db, loc.container);
+            let name = loc.id.to_node(db).name();
+            head(b, parent, b"", b"proc_macro", name.as_ref().map(|it| it.text()));
+            (parent, loc.id.file_id, loc.id.value.erase())
         }
     };
-    let mut b = Bytes::default();
-    b.id(&parent.0).part(prefix).part(tag).opt(name.as_deref());
-    written(db, &mut b, file, ast);
-    b
+    written(db, b, file, ast);
+    parent
 }
 
 /// The key of an enum variant: its enum's and its name.
 pub fn variant_key(db: &dyn HirDatabase, variant: EnumVariantId) -> ItemKey {
     let loc = variant.lookup(db);
-    match enum_variant_keys(db, loc.parent).get(&variant) {
-        Some(&key) => key,
-        None => ItemKey(ContentId::of(KEY_DOMAIN, &variant_preimage(db, loc.parent, &loc.name).0)),
+    match find(enum_variant_keys(db, loc.parent), variant) {
+        Some(key) => key,
+        None => {
+            let mut b = Bytes::default();
+            let parent = variant_preimage(db, loc.parent, &loc.name, &mut b);
+            under(&parent, false, ContentId::of(KEY_DOMAIN, &b.0))
+        }
     }
 }
 
-fn variant_preimage(db: &dyn HirDatabase, parent: EnumId, name: &Name) -> Bytes {
-    let mut b = Bytes::default();
-    b.id(&item_key(db, ItemId::Adt(parent.into())).0)
-        .part(b"variant")
-        .part(name.as_str().as_bytes());
-    b
+fn variant_preimage(db: &dyn HirDatabase, parent: EnumId, name: &Name, b: &mut Bytes) -> ItemKey {
+    let parent = item_key(db, ItemId::Adt(parent.into()));
+    b.id(&parent.0).part(b"variant").part(name.as_str().as_bytes());
+    parent
 }
 
 #[salsa::tracked(returns(ref))]
-fn enum_variant_keys(db: &dyn HirDatabase, enum_: EnumId) -> FxHashMap<EnumVariantId, ItemKey> {
-    let entries = enum_
-        .enum_variants(db)
-        .variants
-        .iter()
-        .map(|(name, &(variant, _))| (variant, variant_preimage(db, enum_, name)))
-        .collect();
-    hash_all(entries).collect()
+fn enum_variant_keys(db: &dyn HirDatabase, enum_: EnumId) -> Vec<(EnumVariantId, ItemKey)> {
+    let variants = &enum_.enum_variants(db).variants;
+    let mut batch = Batch::with_capacity(variants.len());
+    for (name, &(variant, _)) in variants.iter() {
+        batch.push(variant, |b| variant_preimage(db, enum_, name, b));
+    }
+    batch.finish()
 }
 
 fn variant_id_key(db: &dyn HirDatabase, variant: VariantId) -> ItemKey {
@@ -486,33 +587,27 @@ pub(crate) fn generic_def_item(def: GenericDefId) -> ItemId {
 
 /// The key of an expression store: of a signature, a body or the fields of a variant.
 pub fn store_key(db: &dyn HirDatabase, store: ExpressionStoreOwnerId) -> ItemKey {
-    let mut h = Hasher::new(KEY_DOMAIN);
-    match store {
-        ExpressionStoreOwnerId::Signature(def) => {
-            h.id(&item_key(db, generic_def_item(def)).0).part(b"signature")
-        }
+    let (parent, tag): (_, &[u8]) = match store {
+        ExpressionStoreOwnerId::Signature(def) => (item_key(db, generic_def_item(def)), b"signature"),
         ExpressionStoreOwnerId::Body(DefWithBodyId::VariantId(it)) => {
-            h.id(&variant_key(db, it).0).part(b"discriminant")
+            (variant_key(db, it), b"discriminant")
         }
-        ExpressionStoreOwnerId::Body(body) => {
-            h.id(&item_key(db, ItemId::of_body(db, body)).0).part(b"body")
-        }
-        ExpressionStoreOwnerId::VariantFields(it) => {
-            h.id(&variant_id_key(db, it).0).part(b"fields")
-        }
+        ExpressionStoreOwnerId::Body(body) => (item_key(db, ItemId::of_body(db, body)), b"body"),
+        ExpressionStoreOwnerId::VariantFields(it) => (variant_id_key(db, it), b"fields"),
     };
-    ItemKey(h.finish())
+    let mut h = Hasher::new(KEY_DOMAIN);
+    h.id(&parent.0).part(tag);
+    under(&parent, true, h.finish())
 }
 
 /// The key of an anonymous constant (an array length, a const argument): its store's and its
 /// root expression's index there.
 pub fn anon_const_key<'db>(db: &'db dyn HirDatabase, anon: AnonConstId<'db>) -> ItemKey {
     let loc = anon.loc(db);
+    let parent = store_key(db, loc.owner);
     let mut h = Hasher::new(KEY_DOMAIN);
-    h.id(&store_key(db, loc.owner).0)
-        .part(b"anon const")
-        .update(&loc.expr.into_raw().into_u32().to_le_bytes());
-    ItemKey(h.finish())
+    h.id(&parent.0).part(b"anon const").update(&loc.expr.into_raw().into_u32().to_le_bytes());
+    under(&parent, true, h.finish())
 }
 
 fn closure_key_of(
@@ -521,9 +616,10 @@ fn closure_key_of(
     tag: &'static [u8],
     nth: u32,
 ) -> ItemKey {
+    let parent = store_key(db, store);
     let mut h = Hasher::new(KEY_DOMAIN);
-    h.id(&store_key(db, store).0).part(tag).update(&nth.to_le_bytes());
-    ItemKey(h.finish())
+    h.id(&parent.0).part(tag).update(&nth.to_le_bytes());
+    under(&parent, true, h.finish())
 }
 
 fn store_of<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> ExpressionStoreOwnerId {
@@ -553,9 +649,10 @@ pub fn coroutine_closure_key<'db>(
 /// The key of the `index`th opaque type of `owner`: a function's return type or a type
 /// alias's type.
 pub fn opaque_key(db: &dyn HirDatabase, owner: ItemId, index: u32) -> ItemKey {
+    let parent = item_key(db, owner);
     let mut h = Hasher::new(KEY_DOMAIN);
-    h.id(&item_key(db, owner).0).part(b"opaque").update(&index.to_le_bytes());
-    ItemKey(h.finish())
+    h.id(&parent.0).part(b"opaque").update(&index.to_le_bytes());
+    under(&parent, true, h.finish())
 }
 
 fn opaque_of<'db>(db: &'db dyn HirDatabase, opaque: InternedOpaqueTyId<'db>) -> (ItemId, u32) {
@@ -577,13 +674,14 @@ pub fn opaque_ty_key<'db>(db: &'db dyn HirDatabase, opaque: InternedOpaqueTyId<'
 /// The key of an impl a built-in derive writes: its type's, the trait and which derive.
 pub fn builtin_derive_key(db: &dyn HirDatabase, id: BuiltinDeriveImplId) -> ItemKey {
     let loc = id.loc(db);
+    let parent = item_key(db, ItemId::Adt(loc.adt));
     let mut h = Hasher::new(KEY_DOMAIN);
-    h.id(&item_key(db, ItemId::Adt(loc.adt)).0)
+    h.id(&parent.0)
         .part(b"builtin derive")
         .part(loc.trait_.name().as_str().as_bytes())
         .update(&loc.derive_attr_id.item_tree_index().to_le_bytes())
         .update(&loc.derive_index.to_le_bytes());
-    ItemKey(h.finish())
+    under(&parent, false, h.finish())
 }
 
 /// The key of anything the solver names by a `SolverDefId`.
@@ -610,7 +708,7 @@ pub fn def_key<'db>(db: &'db dyn HirDatabase, def: SolverDefId<'db>) -> ItemKey 
             };
             let mut h = Hasher::new(KEY_DOMAIN);
             h.id(&of.0).part(b"ctor");
-            ItemKey(h.finish())
+            under(&of, false, h.finish())
         }
     }
 }
@@ -659,70 +757,104 @@ pub fn simplified<'db>(
 /// its name; an impl's item under `<impl>`.
 pub fn path(db: &dyn HirDatabase, id: ItemId) -> String {
     let mut out = String::new();
-    let (module, container_segment) = match id {
+    path_segments(db, id, &mut |it| out.push_str(it));
+    out
+}
+
+/// What `h.part(path(db, id).as_bytes())` gives a hasher, with no string built: `write` gets
+/// the length as 8 little-endian bytes, then the path's bytes a segment at a time.
+pub(crate) fn path_part(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut(&[u8])) {
+    let mut len = 0u64;
+    path_segments(db, id, &mut |it| len += it.len() as u64);
+    write(&len.to_le_bytes());
+    path_segments(db, id, &mut |it| write(it.as_bytes()));
+}
+
+/// [`path`] a segment at a time, each an interned symbol's bytes read in place.
+fn path_segments(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut(&str)) {
+    let (module, container) = match id {
         ItemId::Function(it) => assoc_container(db, it.lookup(db).container),
         ItemId::Const(it) => assoc_container(db, it.lookup(db).container),
         ItemId::Static(it) => assoc_container(db, it.lookup(db).container),
         ItemId::Alias(it) => assoc_container(db, it.lookup(db).container),
         other => (other.module(db), None),
     };
-    module_path(db, module, &mut out);
-    if let Some(segment) = container_segment {
-        out.push_str("::");
-        out.push_str(&segment);
+    module_path(db, module, write);
+    match container {
+        Some(ItemContainerId::TraitId(it)) => {
+            write("::");
+            write(TraitSignature::of(db, it).name.as_str());
+        }
+        Some(ItemContainerId::ImplId(_)) => {
+            write("::");
+            write("<impl>");
+        }
+        Some(ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_)) | None => {}
     }
-    out.push_str("::");
-    out.push_str(&item_name(db, id).unwrap_or_else(|| "_".to_owned()));
-    out
+    write("::");
+    item_name(db, id, write);
 }
 
-fn assoc_container(db: &dyn HirDatabase, container: ItemContainerId) -> (ModuleId, Option<String>) {
+/// The module an associated item's path goes through, and its trait or impl if it has one.
+fn assoc_container(
+    db: &dyn HirDatabase,
+    container: ItemContainerId,
+) -> (ModuleId, Option<ItemContainerId>) {
     match container {
         ItemContainerId::ModuleId(it) => (it, None),
         ItemContainerId::ExternBlockId(it) => (it.lookup(db).container, None),
-        ItemContainerId::TraitId(it) => {
-            (it.lookup(db).container, Some(TraitSignature::of(db, it).name.as_str().to_owned()))
-        }
-        ItemContainerId::ImplId(it) => (it.lookup(db).container, Some("<impl>".to_owned())),
+        ItemContainerId::TraitId(it) => (it.lookup(db).container, Some(container)),
+        ItemContainerId::ImplId(it) => (it.lookup(db).container, Some(container)),
     }
 }
 
-fn module_path<'db>(db: &'db dyn HirDatabase, module: ModuleIdLt<'db>, out: &mut String) {
+fn module_path<'db>(
+    db: &'db dyn HirDatabase,
+    module: ModuleIdLt<'db>,
+    write: &mut impl FnMut(&str),
+) {
     match module.containing_module(db) {
         Some(parent) => {
-            module_path(db, parent, out);
-            out.push_str("::");
+            module_path(db, parent, write);
+            write("::");
             match module.name(db) {
-                Some(name) => out.push_str(name.as_str()),
-                None => out.push_str("{block}"),
+                Some(name) => write(name.as_str()),
+                None => write("{block}"),
             }
         }
         None => match &module.krate(db).extra_data(db).display_name {
-            Some(name) => out.push_str(name.crate_name().symbol().as_str()),
-            None => out.push_str("{crate}"),
+            Some(name) => write(name.crate_name().symbol().as_str()),
+            None => write("{crate}"),
         },
     }
 }
 
-fn item_name(db: &dyn HirDatabase, id: ItemId) -> Option<String> {
-    Some(match id {
-        ItemId::Function(it) => FunctionSignature::of(db, it).name.as_str().to_owned(),
-        ItemId::Adt(AdtId::StructId(it)) => StructSignature::of(db, it).name.as_str().to_owned(),
-        ItemId::Adt(AdtId::EnumId(it)) => EnumSignature::of(db, it).name.as_str().to_owned(),
-        ItemId::Adt(AdtId::UnionId(it)) => UnionSignature::of(db, it).name.as_str().to_owned(),
-        ItemId::Trait(it) => TraitSignature::of(db, it).name.as_str().to_owned(),
-        ItemId::Impl(_) => "<impl>".to_owned(),
-        ItemId::Const(it) => ConstSignature::of(db, it).name.as_ref()?.as_str().to_owned(),
-        ItemId::Static(it) => StaticSignature::of(db, it).name.as_str().to_owned(),
-        ItemId::Alias(it) => TypeAliasSignature::of(db, it).name.as_str().to_owned(),
+/// Writes an item's name, `_` for one without.
+fn item_name(db: &dyn HirDatabase, id: ItemId, write: &mut impl FnMut(&str)) {
+    fn macro_name(name: Option<syntax::ast::Name>, write: &mut impl FnMut(&str)) {
+        write(name.as_ref().map_or("_", |it| it.text()))
+    }
+    match id {
+        ItemId::Function(it) => write(FunctionSignature::of(db, it).name.as_str()),
+        ItemId::Adt(AdtId::StructId(it)) => write(StructSignature::of(db, it).name.as_str()),
+        ItemId::Adt(AdtId::EnumId(it)) => write(EnumSignature::of(db, it).name.as_str()),
+        ItemId::Adt(AdtId::UnionId(it)) => write(UnionSignature::of(db, it).name.as_str()),
+        ItemId::Trait(it) => write(TraitSignature::of(db, it).name.as_str()),
+        ItemId::Impl(_) => write("<impl>"),
+        ItemId::Const(it) => {
+            write(ConstSignature::of(db, it).name.as_ref().map_or("_", |it| it.as_str()))
+        }
+        ItemId::Static(it) => write(StaticSignature::of(db, it).name.as_str()),
+        ItemId::Alias(it) => write(TypeAliasSignature::of(db, it).name.as_str()),
+        // hir-def keeps no macro's name but in its syntax.
         ItemId::Macro(MacroId::MacroRulesId(it)) => {
-            it.lookup(db).id.to_node(db).name()?.text().to_string()
+            macro_name(it.lookup(db).id.to_node(db).name(), write)
         }
-        ItemId::Macro(MacroId::Macro2Id(it)) => it.lookup(db).id.to_node(db).name()?.text().to_string(),
+        ItemId::Macro(MacroId::Macro2Id(it)) => macro_name(it.lookup(db).id.to_node(db).name(), write),
         ItemId::Macro(MacroId::ProcMacroId(it)) => {
-            it.lookup(db).id.to_node(db).name()?.text().to_string()
+            macro_name(it.lookup(db).id.to_node(db).name(), write)
         }
-    })
+    }
 }
 
 impl ItemId {
@@ -742,14 +874,12 @@ impl ItemId {
 
 /// The item of the current database a key names, if one still has it (see the module doc).
 pub fn resolve(db: &dyn HirDatabase, key: ItemKey) -> Option<Resolved> {
-    crate_keys_distinct(db);
-    let krates = base_db::all_crates(db);
-    for &krate in krates.iter() {
-        if let Some(found) = crate_items(db, krate).index.get(&key) {
-            return Some(*found);
-        }
-    }
-    krates.iter().find_map(|&krate| crate_inner_items(db, krate).index.get(&key).copied())
+    let krates = crates_by_prefix(db);
+    let prefix = u64::from_le_bytes(key.crate_prefix());
+    let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
+    let krate = krates[at].1;
+    let items = if key.is_inner() { crate_inner_items(db, krate) } else { crate_items(db, krate) };
+    items.index.get(&key).copied()
 }
 
 type Index = std::collections::HashMap<ItemKey, Resolved, KeyHashing>;
@@ -779,6 +909,12 @@ impl std::hash::Hasher for KeyHasher {
     fn write_usize(&mut self, _: usize) {}
 
     fn write(&mut self, bytes: &[u8]) {
+        // A key's: its first 9 bytes are its crate's and one bit, the same for a whole index,
+        // and its last 8 are as random as BLAKE3 makes them.
+        if let Ok(key) = <&[u8; 32]>::try_from(bytes) {
+            self.0 = self.0.rotate_left(29) ^ u64::from_le_bytes(*key.last_chunk::<8>().expect("32 bytes"));
+            return;
+        }
         for chunk in bytes.chunks(8) {
             let mut word = [0; 8];
             word[..chunk.len()].copy_from_slice(chunk);
@@ -787,19 +923,27 @@ impl std::hash::Hasher for KeyHasher {
     }
 }
 
-/// Stops if two crates of the build have one key: an item of one would be taken for the
-/// other's.
-#[salsa::tracked]
-fn crate_keys_distinct(db: &dyn HirDatabase) {
-    let mut seen: FxHashMap<ContentId, Crate> = FxHashMap::default();
-    for &krate in base_db::all_crates(db).iter() {
-        if let Some(other) = seen.insert(crate_key(db, krate), krate) {
+/// Every crate of the build by the first 8 bytes of its key, sorted. Stops if two crates have
+/// one: an item of one would be taken for the other's.
+#[salsa::tracked(returns(ref))]
+fn crates_by_prefix(db: &dyn HirDatabase) -> Vec<(u64, Crate)> {
+    let mut krates: Vec<(u64, Crate)> = base_db::all_crates(db)
+        .iter()
+        .map(|&krate| (u64::from_le_bytes(crate_prefix(&crate_key(db, krate))), krate))
+        .collect();
+    krates.sort_unstable_by_key(|&(prefix, _)| prefix);
+    for pair in krates.windows(2) {
+        let ((prefix, krate), (other_prefix, other)) = (pair[0], pair[1]);
+        if prefix == other_prefix {
+            let same = crate_key(db, krate) == crate_key(db, other);
             panic!(
-                "blaze-items: crates {krate:?} and {other:?} have one key: the same name, \
-                 version, origin, kind of target and cfg"
+                "blaze-items: crates {krate:?} and {other:?} have {}: the same name, version, \
+                 origin, kind of target and cfg, or a 64-bit collision",
+                if same { "one key" } else { "keys with equal first 8 bytes" }
             );
         }
     }
+    krates
 }
 
 /// Every item of `krate` with an [`ItemId`], those of its bodies' blocks included.

@@ -888,6 +888,14 @@ pub(super) static BUILTIN: &[Lint] = &[
     l("warnings", Warn, "mass-change the level for lints which produce warnings"),
 ];
 
+/// The lints of the tool `blaze`, blaze's own (docs/fn-cache.md), always registered: rustc
+/// has none of them.
+pub(super) static BLAZE: &[Lint] = &[l(
+    "blaze::const_impure",
+    Warn,
+    "detects a `#[blaze::cache]` function whose result depends on more than its arguments",
+)];
+
 /// Lints rustc declares and never registers: an attribute can't name them, but
 /// `private_macro_use` is still emitted by name resolution at its default level.
 pub(super) static UNREGISTERED: &[Lint] = &[

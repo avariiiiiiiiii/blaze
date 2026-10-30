@@ -25,3 +25,18 @@ Why: the twelve changes of `docs/v2/plan/design/compile-time.md` live in these c
 them, all with `workspace = true`. Members come from the `crates/*` glob; each crate arrives
 with its `Cargo.toml` and `src/lib.rs` together. `blaze-testsel` is added here only if
 `fastcompile-ident-select` creates it.
+
+## fastcompile-ident-select 1: coordinator: workspace dependency `blaze-testsel` (root `Cargo.toml`)
+
+What: in `[workspace.dependencies]`, beside the lane's other crates:
+
+```toml
+blaze-testsel = { path = "crates/blaze-testsel" }
+```
+
+Why: exact test selection (idea 3 of `docs/v2/plan/design/compile-time.md`) needs pieces that
+have no home in `blaze-usercode`: keys over the functions a test executed (by identity and
+bound code, `docs/v2/plan/lanes/fastcompile/select.md`), the record of executed functions, and
+the cached mark. `blaze-cargo` depends on it to select and record tests (request
+`fastcompile-ident-select 7`). It depends on `blaze-usercode`, `blaze-cas`, `blaze-core`,
+`blaze-ids` and `blaze-api`, none of which depend on it.

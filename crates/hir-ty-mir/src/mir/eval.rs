@@ -1763,6 +1763,10 @@ impl<'db> Evaluator<'db> {
                 CastKind::FnPtrToPtr => {
                     Owned(self.eval_operand(operand, locals)?.get(self)?.to_vec())
                 }
+                // The same bytes as the other type, of the same size.
+                CastKind::Transmute => {
+                    Owned(self.eval_operand(operand, locals)?.get(self)?.to_vec())
+                }
             },
             Rvalue::ThreadLocalRef(n) | Rvalue::AddressOf(n) | Rvalue::NullaryOp(n) => match *n {},
         })
@@ -1785,6 +1789,20 @@ impl<'db> Evaluator<'db> {
             AssertKind::OverflowNeg(_) => "Overflow in Neg".to_owned(),
             AssertKind::DivisionByZero(_) => "Overflow in Div".to_owned(),
             AssertKind::RemainderByZero(_) => "Overflow in Rem".to_owned(),
+            // core's words for the panics of the UB checks (`core::panicking`).
+            AssertKind::MisalignedPointerDereference { required, found } => {
+                let required = from_bytes!(usize, self.eval_operand(required, locals)?.get(self)?);
+                let found = from_bytes!(usize, self.eval_operand(found, locals)?.get(self)?);
+                format!(
+                    "misaligned pointer dereference: address must be a multiple of {required:#x} but is {found:#x}"
+                )
+            }
+            AssertKind::NullPointerDereference => "null pointer dereference occurred".to_owned(),
+            AssertKind::NullReferenceConstructed => "null reference produced".to_owned(),
+            AssertKind::InvalidEnumConstruction(source) => {
+                let source = from_bytes!(u128, self.eval_operand(source, locals)?.get(self)?);
+                format!("trying to construct an enum from an invalid value {source:#x}")
+            }
         })
     }
 

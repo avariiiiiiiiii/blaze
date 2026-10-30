@@ -13,6 +13,7 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use hir_ty::next_solver::TyKind;
+use intern::Symbol;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind as _;
 
@@ -47,14 +48,14 @@ impl LatePass for PtrNullChecks {
         match store.expr(expr) {
             Expr::Call { callee, args } => {
                 let Some(name) = callee_item(b, callee) else { return };
-                if matches!(&*name, "ptr_const_is_null" | "ptr_is_null")
+                if matches!(name.as_str(), "ptr_const_is_null" | "ptr_is_null")
                     && let [arg] = args
                     && let Some(useless) = useless_check(b, *arg)
                 {
                     emit_useless(b, expr, useless, out);
                     return;
                 }
-                let (arg_indices, are_zsts_allowed): (&[usize], bool) = match &*name {
+                let (arg_indices, are_zsts_allowed): (&[usize], bool) = match name.as_str() {
                     "ptr_read" | "ptr_read_unaligned" | "ptr_replace" | "ptr_write" | "ptr_write_bytes"
                     | "ptr_write_unaligned" => (&[0], true),
                     "slice_from_raw_parts" | "slice_from_raw_parts_mut" => (&[0], false),
@@ -90,7 +91,7 @@ impl LatePass for PtrNullChecks {
                 }
             }
             Expr::MethodCall { receiver, .. } => {
-                if matches!(method_item(b, expr).as_deref(), Some("ptr_const_is_null" | "ptr_is_null"))
+                if matches!(method_item(b, expr).as_ref().map(Symbol::as_str), Some("ptr_const_is_null" | "ptr_is_null"))
                     && let Some(useless) = useless_check(b, receiver)
                 {
                     emit_useless(b, expr, useless, out);
@@ -107,7 +108,7 @@ impl LatePass for PtrNullChecks {
                 let is_null = match store.expr(to_check) {
                     Expr::Cast { expr: inner, .. } => is_zero(b, inner),
                     Expr::Call { callee, args } => {
-                        args.is_empty() && matches!(callee_item(b, callee).as_deref(), Some("ptr_null" | "ptr_null_mut"))
+                        args.is_empty() && matches!(callee_item(b, callee).as_ref().map(Symbol::as_str), Some("ptr_null" | "ptr_null_mut"))
                     }
                     _ => false,
                 };
@@ -171,12 +172,12 @@ fn useless_check(b: &BodyCx<'_, '_>, mut e: ExprId) -> Option<Useless> {
             return Some(Useless::FnRet { fn_name });
         }
         e = match store.expr(e) {
-            Expr::Cast { expr, type_ref } if matches!(store[type_ref], TypeRef::RawPtr(..)) => {
+            Expr::Cast { expr, type_ref } if matches!(store.type_ref(type_ref), TypeRef::RawPtr(..)) => {
                 had_at_least_one_cast = true;
                 expr
             }
             Expr::MethodCall { receiver, args, .. }
-                if args.is_empty() && matches!(method_item(b, e).as_deref(), Some("ptr_cast" | "ptr_cast_mut")) =>
+                if args.is_empty() && matches!(method_item(b, e).as_ref().map(Symbol::as_str), Some("ptr_cast" | "ptr_cast_mut")) =>
             {
                 had_at_least_one_cast = true;
                 receiver
@@ -202,7 +203,7 @@ fn is_null_ptr(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId>, expr: E
     let expr = peel_casts(b, inits, expr);
     let is_null = match b.store().expr(expr) {
         Expr::Call { callee, args } if args.is_empty() => {
-            matches!(callee_item(b, callee).as_deref(), Some("ptr_null" | "ptr_null_mut"))
+            matches!(callee_item(b, callee).as_ref().map(Symbol::as_str), Some("ptr_null" | "ptr_null_mut"))
         }
         Expr::Call { .. } => false,
         _ => is_zero(b, expr),

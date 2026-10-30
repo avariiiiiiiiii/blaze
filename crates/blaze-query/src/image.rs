@@ -17,15 +17,16 @@
 //! The header, root and section bounds are checked when the image is opened; each record is
 //! checked when it is first read, so a start reads nothing it does not use.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use blaze_core::Mapping;
 use blaze_format::{FormatError, MAGIC, SchemaHash};
 use blaze_ids::{ContentId, Fingerprint};
+use blaze_reclaim::Guard;
 
 use crate::{
     Input, QueryKey, QueryKind, kinds,
-    table::{EDGE_RECORD, Edges, MemoData, Value},
+    table::{EDGE_RECORD, Edges, MemoData, Value, ValueCell},
 };
 
 pub(crate) const MEMO_RECORD: usize = 192;
@@ -73,7 +74,7 @@ fn put_key(out: &mut Vec<u8>, key: &QueryKey) {
 }
 
 /// The image of `entries` (sorted by key, each key's memos in a fixed order) and `inputs`.
-pub(crate) fn write(entries: &[Entry], inputs: &[(QueryKey, Input)]) -> Vec<u8> {
+pub(crate) fn write(task: &Guard, entries: &[Entry], inputs: &[(QueryKey, Input)]) -> Vec<u8> {
     let memo_count: usize = entries.iter().map(|entry| entry.memos.len()).sum();
     let edge_count: usize =
         entries.iter().flat_map(|entry| entry.memos.iter()).map(|memo| memo.edges.len()).sum();
@@ -113,15 +114,12 @@ pub(crate) fn write(entries: &[Entry], inputs: &[(QueryKey, Input)]) -> Vec<u8> 
             memos.extend_from_slice(&memo.fingerprint.0.to_le_bytes());
             memos.extend_from_slice(&memo.schema.0.0);
             memos.extend_from_slice(&memo.producer.0);
-            let (value_id, value_at, value_len) = match memo.bytes() {
-                Some((pointer, len)) => {
-                    // SAFETY: `MemoData::bytes` points at `len` bytes that live as long as the
-                    // database, which outlives this call.
-                    let bytes = unsafe { std::slice::from_raw_parts(pointer, len) };
+            let (value_id, value_at, value_len) = match memo.bytes(task) {
+                Some(bytes) => {
                     pad(&mut blob, 16);
                     let at = blob_at + blob.len();
                     blob.extend_from_slice(bytes);
-                    (crate::value_id(bytes), at as u64, len as u64)
+                    (crate::value_id(bytes), at as u64, bytes.len() as u64)
                 }
                 None => (ContentId::default(), 0, EVICTED),
             };
@@ -356,13 +354,13 @@ impl ImageMap {
         let value_at = u64::from_le_bytes(record[160..168].try_into().expect("8"));
         let value_len = u64::from_le_bytes(record[168..176].try_into().expect("8"));
         let value = if value_len == EVICTED {
-            Value::Evicted
+            None
         } else {
             let (at, len) = self.blob_range(value_at, value_len, "a value");
             if at % 16 != 0 {
                 panic!("the daemon image is corrupt: memo {index}'s value is misaligned");
             }
-            Value::Mapped { mapping: self.mapping.clone(), at, len, id: value_id }
+            Some(Value::Mapped { mapping: self.mapping.clone(), at, len, id: value_id })
         };
         MemoData {
             key,
@@ -374,7 +372,7 @@ impl ImageMap {
                 at: self.edges_at + first_edge * EDGE_RECORD,
                 len: edge_len,
             },
-            value: Mutex::new(value),
+            value: ValueCell::new(value),
         }
     }
 

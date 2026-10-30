@@ -412,7 +412,7 @@ impl Kept {
         let code = self.dylib.code().map_err(|why| self.error(why))?;
         let run = RunKey { code, given: given.finish() };
         let seen = inputs::Env::new(Environment::seen(
-            &installed.expansions.environment.passed(),
+            installed.expansions.environment.passed(),
             env.iter(),
         ));
         // The files' table and this call's environment: no lock, and nothing here asks the

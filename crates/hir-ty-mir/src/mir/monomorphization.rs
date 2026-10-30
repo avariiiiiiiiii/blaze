@@ -336,13 +336,20 @@ impl<'db> Filler<'db> {
                         self.fill_operand(cond)?;
                         match msg {
                             super::AssertKind::BoundsCheck { len: a, index: b }
-                            | super::AssertKind::Overflow(_, a, b) => {
+                            | super::AssertKind::Overflow(_, a, b)
+                            | super::AssertKind::MisalignedPointerDereference {
+                                required: a,
+                                found: b,
+                            } => {
                                 self.fill_operand(a)?;
                                 self.fill_operand(b)?;
                             }
                             super::AssertKind::OverflowNeg(a)
                             | super::AssertKind::DivisionByZero(a)
-                            | super::AssertKind::RemainderByZero(a) => self.fill_operand(a)?,
+                            | super::AssertKind::RemainderByZero(a)
+                            | super::AssertKind::InvalidEnumConstruction(a) => self.fill_operand(a)?,
+                            super::AssertKind::NullPointerDereference
+                            | super::AssertKind::NullReferenceConstructed => (),
                         }
                     }
                     TerminatorKind::Goto { .. }

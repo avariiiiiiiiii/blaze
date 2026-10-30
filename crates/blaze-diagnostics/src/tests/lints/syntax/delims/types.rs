@@ -1,7 +1,6 @@
 //! Parentheses around a type.
 
-use super::compiletest;
-use crate::tests::ui_with;
+use crate::tests::ui;
 
 #[test]
 fn a_cast_type_before_a_less_than_or_a_shift_keeps_its_parentheses() {
@@ -166,5 +165,5 @@ LL +     let _ = id(1 as i32) << 2;
 warning: 10 warnings emitted
 
 "#;
-    assert_eq!(ui_with("unused-parens-issue-106413.rs", "2015", source, &compiletest(true)), expected);
+    assert_eq!(ui("unused-parens-issue-106413.rs", "2015", source), expected);
 }

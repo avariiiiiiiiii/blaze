@@ -161,3 +161,31 @@ uploads.
   (including a stream that takes 7 bytes a write).
 - Page: `frame: every record of it, in order`, `frame: a record of it that is not one is named
   by its place`, `frame: one cut short is refused`.
+
+## Unsafe (docs/v2/plan/design/unsafe.md)
+
+None of the speed work is unsafe: the hand-off (`OnceLock` levels and `mpsc`), the frames, the
+kept runs and the module lookup are safe code. The crate's only unsafe is the Flecs FFI, which
+reaches a C library and buys no speed. It now sits in one module, `src/flecs.rs`, behind a
+safe API (`Flecs`: `entity`, `delete`, `set_workspace`, `set_function`, `set_parent`,
+`set_callees`, `named`, `add_calls`, `function`, `rest`).
+
+- `lib.rs` has `#![deny(unsafe_code)]`. `flecs.rs` alone has `#![allow(unsafe_code)]`, and
+  `world.rs`, `http.rs`, `kept.rs` and `tests.rs` each have `#![forbid(unsafe_code)]`. A
+  crate-level `forbid` is not possible while one module needs unsafe.
+- Each unsafe block holds one unsafe operation and has a `// SAFETY:` comment naming its
+  invariant and where it is upheld. The module doc lists the invariants: one thread (raw
+  pointers, so not `Send`), live entities, layouts, Flecs's copies, and reads borrowed until
+  the next write.
+- **Checked, not assumed.**
+  - Every entity handed in is checked with `ecs_is_alive`. A dead one stops the thread with
+    its id rather than reach Flecs, whose release build does not check.
+  - `Flecs::new` checks each Rust type's size and alignment against Flecs's `EcsComponent`.
+    That covers `Workspace`, `Function`, `Callees` (`ecs_vec_t`) and `Parent`, so a change to
+    `KINDS` or to Flecs that moves a field stops the world rather than misread it.
+  - A read checks for null and alignment before it makes a reference.
+- **Safe reference.** The world's calls and functions, read back through its snapshot, are
+  checked against a model with no Flecs (`calls_waiting_in_chains_are_those_a_scan_found`).
+  The REST test reads the entities back through Flecs.
+- No bytes from a peer reach Flecs: REST paths become `CString`s, which refuse a NUL, and
+  names have their NULs removed (`c_text`).

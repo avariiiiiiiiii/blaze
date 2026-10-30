@@ -38,6 +38,8 @@
 //! [`Handle`]: loader::Handle
 //! [`Entries`]: loader::Entry
 
+#![forbid(unsafe_code)]
+
 mod anchored_path;
 pub mod file_set;
 pub mod loader;

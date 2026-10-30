@@ -6,6 +6,8 @@
 //! and that nothing but loads of the same type reads, is the stored value where the store
 //! dominates the load: the load and then the store are removed.
 
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 
 use cranelift_codegen::{

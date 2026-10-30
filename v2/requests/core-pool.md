@@ -72,3 +72,9 @@ them in. `topology.rs` (NUMA) and `exec.rs` (the callers) are done by core-pool 
   memory rows.
 
 > forwarded to speed: speed-runtime-pool is rewriting `pool.rs`.
+
+Status: done by speed-runtime-pool (2026-10-29). `pool::node()`, `Pool::submit_critical` (and
+`pub(crate) push_placed`, which exec.rs's run table uses for its intrusive jobs), placement as
+specified (`Shared::place`, `least`), `critical_submitted`, the `node: 0` test literals, and
+tests: `least` against a model, placement on `from_perflevels(&[(4, 2), (4, 4)])`, all-fast
+unchanged, `node()` on a two-node topology.

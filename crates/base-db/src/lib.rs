@@ -265,7 +265,7 @@ pub struct FileSourceRootInput {
 /// ([`SourceRoot::DOMAIN`]), kept by [`Files`] as either changes.
 #[salsa::input(debug)]
 pub struct SourceRootInput {
-    #[returns(clone)]
+    #[returns(ref)]
     #[get(source_root_field)]
     #[set(set_source_root_field)]
     source_root: Arc<SourceRoot>,
@@ -277,6 +277,12 @@ pub struct SourceRootInput {
 
 impl SourceRootInput {
     pub fn source_root<Db: ?Sized + salsa::Database>(self, db: &Db) -> Arc<SourceRoot> {
+        self.source_root_field(db).clone()
+    }
+
+    /// [`SourceRootInput::source_root`] without a clone of the `Arc` (a write to the count
+    /// every reader of the root shares).
+    pub fn source_root_ref<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db SourceRoot {
         self.source_root_field(db)
     }
 
@@ -340,7 +346,7 @@ pub trait SourceDatabase: salsa::Database + std::fmt::Debug {
         // FIXME: this *somehow* should be platform agnostic...
         let source_root = self.file_source_root(path.anchor);
         let source_root = self.source_root(source_root.source_root_id(self));
-        source_root.source_root(self).resolve_path(path)
+        source_root.source_root_ref(self).resolve_path(path)
     }
 
     /// The file `path` names relative to `anchor`, when it is not one of the files of the VFS,

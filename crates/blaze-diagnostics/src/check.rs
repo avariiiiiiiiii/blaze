@@ -27,6 +27,9 @@ pub struct Options {
     /// The lint flags rustc is given: cargo's `[lints]` and `RUSTFLAGS`, and `--cap-lints`
     /// for a crate cargo builds as a dependency.
     pub lints: lints::CommandLine,
+    /// `-Z deduplicate-diagnostics=no`, as compiletest gives every UI test: a diagnostic
+    /// identical to one written is written again, with a note that it is.
+    pub keep_duplicates: bool,
 }
 
 /// What rustc says compiling `krate`: its diagnostics in the order it writes them, then its
@@ -51,11 +54,7 @@ pub fn check_crate_with<'db>(
     let cx = Cx::new(sema, krate, files);
     let parsed = lower::parse::parsed(&cx);
     if parsed.fatal {
-        let mut diags: Vec<Diag> = parsed.found.into_iter().map(|it| it.diag).collect();
-        finish(&mut diags);
-        let closing = emit::summary(&diags);
-        diags.extend(closing);
-        return diags;
+        return written(parsed.found.into_iter().map(|it| it.diag).collect(), options);
     }
     let mut found: Vec<Found> = parsed.found;
     for diagnostic in hir::check::check_crate(cx.db, krate, false, None) {
@@ -70,11 +69,7 @@ pub fn check_crate_with<'db>(
         late.iter_mut().for_each(|it| it.phase = Phase::Late);
         found.extend(late);
     }
-    let mut diags = lints::decide(&cx, &options.lints, found, aborted);
-    finish(&mut diags);
-    let closing = emit::summary(&diags);
-    diags.extend(closing);
-    diags
+    written(lints::decide(&cx, &options.lints, found, aborted), options)
 }
 
 /// Whether rustc stops before its late passes for `found`: an error that is not a lint's
@@ -84,22 +79,43 @@ fn stops_before_late(found: &Found) -> bool {
     found.phase < Phase::Late && found.diag.is_error() && !found.diag.is_lint()
 }
 
-/// What rustc does as it emits each diagnostic: the note of the macro it came from, and none
-/// written twice, nor a `note_once` already written with another.
-fn finish(diags: &mut Vec<Diag>) {
-    for diag in diags.iter_mut() {
+const DUPLICATE: &str = "duplicate diagnostic emitted due to `-Z deduplicate-diagnostics=no`";
+
+/// What rustc does as it emits each diagnostic: the note of the macro it came from, none
+/// written twice (unless `keep_duplicates`: then with a note that it is one), nor a
+/// `note_once` already written with another. Gives what is written and, of it, what rustc
+/// counts for its closing lines (each diagnostic once: `deduplicated_err_count`).
+fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> (Vec<Diag>, Vec<Diag>) {
+    let mut seen: FxHashSet<Diag> = FxHashSet::default();
+    let mut once: FxHashSet<Child> = FxHashSet::default();
+    let mut written = Vec::with_capacity(diags.len());
+    let mut counted = Vec::with_capacity(diags.len());
+    for mut diag in diags {
         let in_macro = diag.span.primary.iter().any(|it| it.expansion.is_some());
         let noted = diag.children.iter().any(|it| it.message.contains("(in Nightly builds, run with -Z macro-backtrace for more info)"));
         if in_macro && !noted {
             diag.originates_in();
         }
-    }
-    let mut seen: FxHashSet<Diag> = FxHashSet::default();
-    diags.retain(|it| seen.insert(it.clone()));
-    let mut once: FxHashSet<Child> = FxHashSet::default();
-    for diag in diags.iter_mut() {
+        let already = !seen.insert(diag.clone());
+        if already && !keep_duplicates {
+            continue;
+        }
         diag.children.retain(|child| !child.once || once.insert(child.clone()));
+        if already {
+            diag.note(DUPLICATE);
+        } else {
+            counted.push(diag.clone());
+        }
+        written.push(diag);
     }
+    (written, counted)
+}
+
+/// `diags` as rustc writes them, then its closing lines.
+fn written(diags: Vec<Diag>, options: &Options) -> Vec<Diag> {
+    let (mut written, counted) = finish(diags, options.keep_duplicates);
+    written.extend(emit::summary(&counted));
+    written
 }
 
 #[cfg(test)]
@@ -138,10 +154,20 @@ mod tests {
         a.children.push(note.clone());
         let mut b = Diag::lint("unused_variables", "unused variable: `b`", at(9));
         b.children.push(note);
-        let mut diags = vec![a.clone(), a, b];
-        finish(&mut diags);
+        let (diags, counted) = finish(vec![a.clone(), a, b], false);
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0].children.len(), 1);
         assert!(diags[1].children.is_empty());
+        assert_eq!(counted, diags);
+    }
+
+    #[test]
+    fn a_duplicate_kept_is_noted_and_not_counted() {
+        let a = Diag::error(Some("E0425"), "cannot find value `x` in this scope", at(0));
+        let (diags, counted) = finish(vec![a.clone(), a.clone()], true);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0], a);
+        assert_eq!(diags[1].children.last().map(|it| it.message.as_str()), Some(DUPLICATE));
+        assert_eq!(counted, [a]);
     }
 }

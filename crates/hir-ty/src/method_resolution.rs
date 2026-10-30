@@ -552,6 +552,76 @@ pub fn trait_value_item(
     value_item_named(&trait_.trait_items(db).items, &name)
 }
 
+/// For every trait declared in a module of `krate` (not in a block), what [`trait_value_item`]
+/// answers for each name its items have, sorted by name and then trait. Built once per crate,
+/// so a probe asks one query per crate of its traits in scope instead of one per trait.
+#[salsa::tracked(returns(deref))]
+fn trait_value_items(db: &dyn HirDatabase, krate: Crate) -> Box<[(Name, TraitId, CandidateId)]> {
+    let mut items: Vec<(Name, TraitId, CandidateId)> = Vec::new();
+    for (_, module) in crate_def_map(db, krate).modules(db) {
+        for def in module.scope(db).declarations() {
+            let ModuleDefId::TraitId(trait_) = def else { continue };
+            items.extend(trait_.trait_items(db).items.iter().filter_map(|&(name, item)| {
+                match item {
+                    AssocItemId::FunctionId(it) => Some((name, trait_, it.into())),
+                    AssocItemId::ConstId(it) => Some((name, trait_, it.into())),
+                    AssocItemId::TypeAliasId(_) => None,
+                }
+            }));
+        }
+    }
+    // Stable, so of a trait's items of one name the first stays first, as `value_item_named`
+    // takes it.
+    items.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    items.dedup_by(|later, first| (later.0, later.1) == (first.0, first.1));
+    items.into()
+}
+
+/// The run of [`trait_value_items`] named `name`, sorted by trait: an item of another name
+/// added to a trait of `krate` leaves it as it was.
+#[salsa::tracked(returns(deref))]
+fn in_crate_trait_value_items(
+    db: &dyn HirDatabase,
+    krate: Crate,
+    name: Name,
+) -> Box<[(TraitId, CandidateId)]> {
+    let items = trait_value_items(db, krate);
+    let start = items.partition_point(|&(it, _, _)| it < name);
+    items[start..].iter().take_while(|&&(it, _, _)| it == name).map(|&(_, t, i)| (t, i)).collect()
+}
+
+/// [`trait_value_item`] for each trait a probe asks of, through one
+/// [`in_crate_trait_value_items`] per crate and a binary search per trait. A trait in a block is
+/// asked of alone.
+#[derive(Debug, Default)]
+pub struct TraitValueItems<'db> {
+    runs: smallvec::SmallVec<[(Crate, &'db [(TraitId, CandidateId)]); 4]>,
+}
+
+impl<'db> TraitValueItems<'db> {
+    pub fn get(
+        &mut self,
+        db: &'db dyn HirDatabase,
+        trait_: TraitId,
+        name: Name,
+    ) -> Option<CandidateId> {
+        let module = trait_.module(db);
+        if module.block(db).is_some() {
+            return trait_value_item(db, trait_, name);
+        }
+        let krate = module.krate(db);
+        let run = match self.runs.iter().find(|&&(it, _)| it == krate) {
+            Some(&(_, run)) => run,
+            None => {
+                let run = in_crate_trait_value_items(db, krate, name);
+                self.runs.push((krate, run));
+                run
+            }
+        };
+        run.binary_search_by_key(&trait_, |&(it, _)| it).ok().map(|i| run[i].1)
+    }
+}
+
 fn value_item_named(items: &[(Name, AssocItemId)], name: &Name) -> Option<CandidateId> {
     items.iter().find_map(|(item_name, item)| match *item {
         AssocItemId::FunctionId(it) if item_name == name => Some(it.into()),
@@ -633,11 +703,16 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
     let named_in = |unnamed: &mut Vec<&base_db::BuiltDependency>, root: &syntax::SyntaxNode| {
         let root = root.to_flat();
         let (tree, at) = root.flat().expect("a flat tree");
-        let identifiers: FxHashSet<&str> = (at..tree.end(at))
-            .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16)
-            .map(|it| tree.token_text(it))
-            .collect();
-        unnamed.retain(|dep| !identifiers.contains(dep.name.symbol().as_str()));
+        // Few dependencies are left unnamed: each identifier is compared with them, and the
+        // walk ends when none is left.
+        let mut identifiers = (at..tree.end(at))
+            .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16);
+        while !unnamed.is_empty()
+            && let Some(it) = identifiers.next()
+        {
+            let text = tree.token_text(it);
+            unnamed.retain(|dep| dep.name.symbol().as_str() != text);
+        }
     };
     while !unnamed.is_empty()
         && let Some(file) = files.next()
@@ -689,30 +764,30 @@ pub fn loaded_crates(db: &dyn HirDatabase, krate: Crate) -> Box<[Crate]> {
 /// The items of `scope` whose bodies may hold impls: an impl is one of its crate wherever it
 /// is written. Custom derives write theirs in a const, `const _: () = { ... };` or one with a
 /// name, and those are looked into in every crate. A function can hold one as well, of a type
-/// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test), and
-/// a workspace crate's functions are all looked into. Lowering every body of every dependency
-/// for this is too much, so a dependency's function, static or associated constant is looked
-/// into unless lexing its text proves it holds none ([`may_hold`]): bincode's
-/// `deserialize_enum` holds its `EnumAccess` for `&mut Deserializer`, and a `#[derive]` on a
-/// struct in a body or a procedural macro called there writes one with no `impl` in the text.
+/// that is not its own (zerocopy's tests `impl KnownLayout for elain::Align<8>` in a test).
+/// Lowering every body for this is too much, and puts every body's lowering before the first
+/// trait query, so a function, static or associated constant is looked into unless lexing its
+/// text proves it holds none ([`may_hold`]): bincode's `deserialize_enum` holds its
+/// `EnumAccess` for `&mut Deserializer`, and a `#[derive]` on a struct in a body or a
+/// procedural macro called there writes one with no `impl` in the text. A module's constants
+/// are all looked into: lexing finds no initializer after `const _`.
 fn impl_holders(db: &dyn HirDatabase, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
     let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
-    let local = krate.data(db).origin.is_local();
     let declared = scope.declarations().filter_map(|def| match def {
-        ModuleDefId::FunctionId(it) if local || may_hold(db, krate, it.loc(db).id, true) => {
+        ModuleDefId::FunctionId(it) if may_hold(db, krate, it.loc(db).id, true) => {
             Some(DefWithBodyId::from(it))
         }
-        ModuleDefId::StaticId(it) if local || may_hold(db, krate, it.loc(db).id, true) => {
+        ModuleDefId::StaticId(it) if may_hold(db, krate, it.loc(db).id, true) => {
             Some(DefWithBodyId::from(it))
         }
         _ => None,
     });
     holders.extend(declared);
     let item = |item: &AssocItemId| match *item {
-        AssocItemId::FunctionId(it) if local || may_hold(db, krate, it.loc(db).id, true) => {
+        AssocItemId::FunctionId(it) if may_hold(db, krate, it.loc(db).id, true) => {
             Some(DefWithBodyId::from(it))
         }
-        AssocItemId::ConstId(it) if local || may_hold(db, krate, it.loc(db).id, true) => {
+        AssocItemId::ConstId(it) if may_hold(db, krate, it.loc(db).id, true) => {
             Some(DefWithBodyId::from(it))
         }
         _ => None,
@@ -860,7 +935,13 @@ fn impls_in_bodies(
                 }
             }
             T!['{'] => {
-                let body = signature.take().is_some();
+                // A block inside brackets (`-> [u8; { N }]`) is no body. One after `<`, `,` or
+                // `=` may be a const argument (`-> impl Tr<{ N }>`): counted as a body, it
+                // leaves the brace after it one as well.
+                let body = signature == Some(nested);
+                if body && !matches!(previous, T![<] | T![,] | T![=]) {
+                    signature = None;
+                }
                 bodies += usize::from(body);
                 braces.push(body);
                 depth += 1;

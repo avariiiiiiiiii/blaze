@@ -468,7 +468,10 @@ struct Wrong<'a, 'b, 'db> {
     param: Option<hir::ConstParam>,
     info: Info,
     /// The arguments written, constraints left out.
-    args: Vec<ast::GenericArg>,
+    args: &'a [ast::GenericArg],
+    /// `def`'s lifetime and written type or const parameters, read once per error.
+    lifetimes: &'a [Param],
+    types: &'a [Param],
 }
 
 impl Wrong<'_, '_, '_> {
@@ -734,16 +737,17 @@ impl Wrong<'_, '_, '_> {
     fn type_or_const_args_suggestions_from_param_names(&self, take: usize) -> String {
         let in_method_call = self.is_in_a_method_call();
         let inputs = self.fn_input_names();
-        type_or_const_params(self.cx, self.def)
-            .into_iter()
-            .skip(self.num_provided_type_or_const_args())
-            .take(take)
-            .map(|param| match param.is_type && (in_method_call || inputs.contains(&param.name)) {
-                true => "_".to_owned(),
-                false => param.name,
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        let mut out = String::new();
+        for param in self.types.iter().skip(self.num_provided_type_or_const_args()).take(take) {
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            match param.is_type && (in_method_call || inputs.contains(&param.name)) {
+                true => out.push('_'),
+                false => out.push_str(&param.name),
+            }
+        }
+        out
     }
 
     /// Whether the first expression around the segment, beyond the one it is the path of, is a
@@ -912,7 +916,7 @@ impl Wrong<'_, '_, '_> {
         let expected = self.num_expected_lifetime_args();
         let mut spans = Vec::new();
         let mut found_redundant = false;
-        for arg in &self.args {
+        for arg in self.args {
             if let ast::GenericArg::LifetimeArg(_) = arg {
                 spans.push(Self::arg_range(arg));
                 if spans.len() > expected {
@@ -937,7 +941,7 @@ impl Wrong<'_, '_, '_> {
         let expected = self.num_expected_type_or_const_args();
         let mut spans = Vec::new();
         let mut found_redundant = false;
-        for arg in &self.args {
+        for arg in self.args {
             match arg {
                 ast::GenericArg::TypeArg(_) | ast::GenericArg::ConstArg(_) => {
                     spans.push(Self::arg_range(arg));
@@ -1000,20 +1004,22 @@ impl Wrong<'_, '_, '_> {
             0 => String::new(),
             _ => {
                 let params = match self.missing_lifetimes() {
-                    true => lifetime_params(self.cx, self.def),
-                    false => type_or_const_params(self.cx, self.def),
+                    true => self.lifetimes,
+                    false => self.types,
                 };
-                let names: Vec<String> = params
-                    .into_iter()
-                    .take(bound)
-                    .map(|param| {
-                        if let Some(span) = param.span {
-                            spans.labels.push((span, String::new()));
-                        }
-                        format!("`{}`", param.name)
-                    })
-                    .collect();
-                format!(": {}", names.join(", "))
+                let mut names = String::from(": ");
+                for (i, param) in params.iter().take(bound).enumerate() {
+                    if let Some(span) = &param.span {
+                        spans.labels.push((span.clone(), String::new()));
+                    }
+                    if i > 0 {
+                        names.push_str(", ");
+                    }
+                    names.push('`');
+                    names.push_str(&param.name);
+                    names.push('`');
+                }
+                names
             }
         };
         let msg = format!(
@@ -1050,10 +1056,11 @@ impl Wrong<'_, '_, '_> {
             .iter()
             .filter_map(|it| Some(it.name_ref()?.text().to_string()))
             .collect();
-        let params: Vec<String> = lifetime_params(self.cx, self.def)
-            .into_iter()
-            .chain(type_or_const_params(self.cx, self.def))
-            .map(|it| it.name)
+        let params: Vec<String> = self
+            .lifetimes
+            .iter()
+            .chain(self.types)
+            .map(|it| it.name.clone())
             .chain(
                 self.def
                     .type_or_const_params(db)
@@ -1082,13 +1089,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found
     let node_span = cx.span(node.as_ref().map(|it| it.syntax().text_range()));
     let provided = d.provided as usize;
     let expected = d.expected as usize;
+    let types = type_or_const_params(cx, d.def);
     let info = match d.kind {
         IncorrectGenericsLenKind::Lifetimes => match provided > expected {
             true => Info::ExcessLifetimes { redundant: provided - expected },
             false => Info::MissingLifetimes { missing: expected - provided },
         },
         IncorrectGenericsLenKind::TypesAndConsts => {
-            let defaults = type_or_const_params(cx, d.def).iter().filter(|it| it.has_default).count();
+            let defaults = types.iter().filter(|it| it.has_default).count();
             match provided > expected {
                 true => Info::ExcessTypesOrConsts {
                     redundant: provided - expected,
@@ -1116,7 +1124,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found
         return vec![Found::new(diag, Phase::Items)];
     };
     let args = seg.args();
-    let wrong = Wrong { cx, seg: &seg, def: d.def, param: None, info, args };
+    let lifetimes = lifetime_params(cx, d.def);
+    let wrong = Wrong {
+        cx,
+        seg: &seg,
+        def: d.def,
+        param: None,
+        info,
+        args: &args,
+        lifetimes: &lifetimes,
+        types: &types,
+    };
     if wrong.all_params_are_bound() {
         return Vec::new();
     }
@@ -1155,7 +1173,8 @@ pub(crate) fn takes_none(
     ];
     let mut found = Vec::new();
     for info in infos.into_iter().flatten() {
-        let wrong = Wrong { cx, seg, def, param, info, args: args.clone() };
+        // A static and a const parameter take no generics: there are none to list.
+        let wrong = Wrong { cx, seg, def, param, info, args: &args, lifetimes: &[], types: &[] };
         let mut diag = Diag::error(Some("E0107"), wrong.message(), seg.name_span(cx));
         wrong.notify(&mut diag);
         wrong.suggest(&mut diag);

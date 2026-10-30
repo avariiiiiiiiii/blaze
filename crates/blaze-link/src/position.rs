@@ -5,6 +5,12 @@
 //! relocation to a `core::panic::Location` record the linker makes from the span side table
 //! of the span's anchor. A reformat changes the table, so the record is rewritten in place and
 //! no function is compiled again.
+//!
+//! The image keeps each table as [`Spans`]: its encoding, checked once and read in place (one
+//! allocation per table, none per file or span). A table the change carries again unchanged
+//! is told by comparing bytes, before anything is decoded.
+
+use std::sync::Arc;
 
 use blaze_ids::ContentId;
 
@@ -25,12 +31,16 @@ pub struct Position {
 }
 
 const MAGIC: [u8; 8] = *b"BZSPANS1";
+/// A span's three `u32`s.
+const SPAN: usize = 12;
 
 impl SpanTable {
     /// `MAGIC`, the file count and each file as a length and its UTF-8, the span count and
     /// each span as three little-endian `u32`s.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = MAGIC.to_vec();
+        let names: usize = self.files.iter().map(|it| 4 + it.len()).sum();
+        let mut out = Vec::with_capacity(8 + 4 + names + 4 + SPAN * self.spans.len());
+        out.extend_from_slice(&MAGIC);
         out.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
         for file in &self.files {
             out.extend_from_slice(&(file.len() as u32).to_le_bytes());
@@ -46,34 +56,102 @@ impl SpanTable {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<SpanTable, String> {
-        let mut read = Reader { bytes, at: 0 };
-        if read.take(8)? != MAGIC {
-            return Err("not a span table: its magic is wrong".to_owned());
-        }
-        let files = read.word()? as usize;
-        let mut table = SpanTable::default();
-        for _ in 0..files {
-            let len = read.word()? as usize;
-            let name = std::str::from_utf8(read.take(len)?).map_err(|_| "a file name not UTF-8")?;
-            table.files.push(name.to_owned());
-        }
-        let spans = read.word()? as usize;
-        for _ in 0..spans {
-            let span = Position { file: read.word()?, line: read.word()?, column: read.word()? };
-            if span.file as usize >= table.files.len() {
-                return Err(format!("a span in file {} of {}", span.file, table.files.len()));
-            }
-            table.spans.push(span);
-        }
-        if read.at != bytes.len() {
-            return Err("bytes after a span table".to_owned());
-        }
-        Ok(table)
+        let spans = Spans::new(bytes)?;
+        Ok(SpanTable {
+            files: (0..spans.files()).map(|it| spans.file(it).to_owned()).collect(),
+            spans: (0..spans.len()).map(|it| spans.span(it).expect("in range")).collect(),
+        })
     }
 
     /// The content ID of the table, which the image keeps to tell a changed one.
     pub fn id(&self) -> ContentId {
         ContentId::of(SPAN_TABLE_DOMAIN, &self.encode())
+    }
+}
+
+/// A checked span table, read in place. One buffer: the file names' starts (a `u32` each,
+/// pointing at the name's bytes in the encoding), then the encoding itself. Cloning is an
+/// `Arc` count; reading a span is three loads, a file name two.
+#[derive(Clone, Debug)]
+pub(crate) struct Spans {
+    buf: Arc<[u8]>,
+    files: u32,
+    /// Where the spans start in `buf`, and how many there are.
+    spans_at: u32,
+    spans: u32,
+}
+
+impl Spans {
+    /// Checks `bytes` as a span table and keeps one copy of it.
+    pub fn new(bytes: &[u8]) -> Result<Spans, String> {
+        let mut read = Reader { bytes, at: 0 };
+        if read.take(8)? != MAGIC {
+            return Err("not a span table: its magic is wrong".to_owned());
+        }
+        let files = read.word()?;
+        let index = (files as usize).checked_mul(4).filter(|it| *it <= bytes.len()).ok_or("a span table cut short")?;
+        let mut buf = Vec::with_capacity(index + bytes.len());
+        for _ in 0..files {
+            let len = read.word()? as usize;
+            let start = read.at;
+            std::str::from_utf8(read.take(len)?).map_err(|_| "a file name not UTF-8")?;
+            buf.extend_from_slice(&((index + start) as u32).to_le_bytes());
+        }
+        let spans = read.word()?;
+        let spans_at = read.at;
+        let body = (spans as usize).checked_mul(SPAN).ok_or("a span table cut short")?;
+        let rest = read.take(body)?;
+        if read.at != bytes.len() {
+            return Err("bytes after a span table".to_owned());
+        }
+        for span in rest.chunks_exact(SPAN) {
+            let file = u32::from_le_bytes(span[..4].try_into().expect("four bytes"));
+            if file >= files {
+                return Err(format!("a span in file {file} of {files}"));
+            }
+        }
+        buf.extend_from_slice(bytes);
+        let spans_at = u32::try_from(index + spans_at).map_err(|_| "a span table past 4 GiB")?;
+        Ok(Spans { buf: buf.into(), files, spans_at, spans })
+    }
+
+    /// The table's encoding, as the change carried it.
+    pub fn encoding(&self) -> &[u8] {
+        &self.buf[self.files as usize * 4..]
+    }
+
+    /// Whether `bytes` is this table: a comparison, nothing decoded.
+    pub fn is(&self, bytes: &[u8]) -> bool {
+        self.encoding() == bytes
+    }
+
+    pub fn files(&self) -> u32 {
+        self.files
+    }
+
+    pub fn len(&self) -> u32 {
+        self.spans
+    }
+
+    /// The name of file `file` (below [`Spans::files`]).
+    pub fn file(&self, file: u32) -> &str {
+        let at = file as usize * 4;
+        let start = u32::from_le_bytes(self.buf[at..at + 4].try_into().expect("four bytes")) as usize;
+        let len = u32::from_le_bytes(self.buf[start - 4..start].try_into().expect("four bytes")) as usize;
+        std::str::from_utf8(&self.buf[start..start + len]).expect("checked UTF-8 when made")
+    }
+
+    pub fn span(&self, index: u32) -> Option<Position> {
+        if index >= self.spans {
+            return None;
+        }
+        let at = self.spans_at as usize + index as usize * SPAN;
+        let word = |n: usize| u32::from_le_bytes(self.buf[at + n * 4..at + n * 4 + 4].try_into().expect("four bytes"));
+        Some(Position { file: word(0), line: word(1), column: word(2) })
+    }
+
+    pub fn id(&self) -> ContentId {
+        ContentId::of(SPAN_TABLE_DOMAIN, self.encoding())
     }
 }
 
@@ -107,8 +185,8 @@ pub const LINE: i64 = 16;
 pub const COLUMN: i64 = 20;
 
 /// A `Location` record's bytes, its pointer left for a relocation to the file name.
-pub(crate) fn location(name_len: usize, position: Position) -> Vec<u8> {
-    let mut record = vec![0; LOCATION_SIZE as usize];
+pub(crate) fn location(name_len: usize, position: Position) -> [u8; LOCATION_SIZE as usize] {
+    let mut record = [0; LOCATION_SIZE as usize];
     record[8..16].copy_from_slice(&(name_len as u64).to_le_bytes());
     record[16..20].copy_from_slice(&position.line.to_le_bytes());
     record[20..24].copy_from_slice(&position.column.to_le_bytes());
@@ -118,7 +196,8 @@ pub(crate) fn location(name_len: usize, position: Position) -> Vec<u8> {
 /// The bytes of a file name a `Location` points at: NUL-terminated, as
 /// `Location::file_as_c_str` reads one byte past the length.
 pub(crate) fn file_name(name: &str) -> Vec<u8> {
-    let mut bytes = name.as_bytes().to_vec();
+    let mut bytes = Vec::with_capacity(name.len() + 1);
+    bytes.extend_from_slice(name.as_bytes());
     bytes.push(0);
     bytes
 }
@@ -148,6 +227,7 @@ mod tests {
         let bytes = table().encode();
         for len in 0..bytes.len() {
             assert!(SpanTable::decode(&bytes[..len]).is_err(), "cut at {len}");
+            assert!(Spans::new(&bytes[..len]).is_err(), "cut at {len}");
         }
         let mut wrong_file = table();
         wrong_file.spans[0].file = 2;
@@ -155,6 +235,36 @@ mod tests {
         let mut more = bytes.clone();
         more.push(0);
         assert!(SpanTable::decode(&more).is_err());
+        let mut not_utf8 = bytes.clone();
+        not_utf8[16] = 0xff;
+        assert!(Spans::new(&not_utf8).is_err());
+        let mut huge = MAGIC.to_vec();
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(Spans::new(&huge).is_err());
+    }
+
+    #[test]
+    fn spans_read_in_place_what_the_owned_table_holds() {
+        let owned = table();
+        let bytes = owned.encode();
+        let spans = Spans::new(&bytes).unwrap();
+        assert!(spans.is(&bytes));
+        assert_eq!(spans.encoding(), &bytes[..]);
+        assert_eq!(spans.id(), owned.id());
+        assert_eq!((spans.files(), spans.len()), (2, 2));
+        for (at, name) in owned.files.iter().enumerate() {
+            assert_eq!(spans.file(at as u32), name);
+        }
+        for (at, span) in owned.spans.iter().enumerate() {
+            assert_eq!(spans.span(at as u32), Some(*span));
+        }
+        assert_eq!(spans.span(2), None);
+        let mut other = owned.clone();
+        other.spans[1].line = 121;
+        assert!(!spans.is(&other.encode()));
+        let empty = SpanTable::default().encode();
+        let none = Spans::new(&empty).unwrap();
+        assert_eq!((none.files(), none.len(), none.span(0)), (0, 0, None));
     }
 
     #[test]

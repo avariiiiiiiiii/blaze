@@ -2,6 +2,8 @@
 //! section 3): `at -> root`, kept durable in the VFS's journal as one head per mount, so a
 //! restart recovers every source fetched before and fetches none of them again.
 
+#![forbid(unsafe_code)]
+
 use std::collections::BTreeMap;
 
 use blaze_ids::ContentId;

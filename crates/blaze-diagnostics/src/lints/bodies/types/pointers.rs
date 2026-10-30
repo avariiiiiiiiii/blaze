@@ -8,8 +8,7 @@
 //!   `dangling_pointers_from_locals`).
 //!
 //! What they share follows rustc's `compiler/rustc_lint/src/utils.rs` (`peel_casts`),
-//! `compiler/rustc_lint/src/context.rs` (`LateContext::expr_or_init`) and
-//! `compiler/rustc_ast_lowering/src/expr.rs` (the span of `(e)`) (MIT or Apache-2.0).
+//! `compiler/rustc_lint/src/context.rs` (`LateContext::expr_or_init`) (MIT or Apache-2.0).
 
 mod autorefs;
 mod dangling;
@@ -28,9 +27,10 @@ use hir_def::{
 };
 use hir_expand::attrs::{AstPathExt as _, expand_cfg_attr};
 use hir_ty::{ParamEnvAndCrate, next_solver::Ty};
+use intern::Symbol;
 use rustc_hash::FxHashMap;
 use syntax::{
-    AstNode, SyntaxKind,
+    AstNode,
     ast::{self, HasAttrs},
 };
 
@@ -48,26 +48,7 @@ pub(super) fn passes() -> Vec<Box<dyn crate::lints::bodies::LatePass>> {
     ]
 }
 
-/// The span rustc gives `expr`: that of the parentheses around it, as its lowering of `(e)`
-/// gives `e` the span of `(e)` when that contains it (in a macro's expansion, parentheses the
-/// macro wrote do not contain what it was handed).
-pub(super) fn span(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
-    let node = b.expr_node(expr)?;
-    let mut span = b.cx.span_of(node);
-    let syntax = b.cx.syntax(node);
-    let mut at = syntax.value.clone();
-    while let Some(parent) = at.parent().filter(|it| it.kind() == SyntaxKind::PAREN_EXPR) {
-        let outer = b.cx.span(syntax.with_value(parent.text_range()));
-        let contains = outer.file == span.file && outer.lo <= span.lo && span.hi <= outer.hi;
-        let parenthesized = b.cx.snippet(&outer).is_some_and(|it| it.starts_with('(') && it.ends_with(')'));
-        if !contains || !parenthesized {
-            break;
-        }
-        span = outer;
-        at = parent;
-    }
-    Some(span)
-}
+pub(super) use util::span;
 
 /// rustc's `Span::source_callsite`: the call of the outermost macro `span` came from, or
 /// `span`.
@@ -107,7 +88,7 @@ pub(super) fn has_attr(db: &dyn HirDatabase, def: FunctionId, name: &str) -> boo
 }
 
 /// The diagnostic item of the method `expr` calls, if it is a method call of one.
-pub(super) fn method_item(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<String> {
+pub(super) fn method_item(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Symbol> {
     util::fn_item(b.db(), util::method_fn(b, expr)?)
 }
 
@@ -207,7 +188,7 @@ pub(super) fn peel_casts(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId
             Expr::MethodCall { receiver, args, .. }
                 if args.is_empty()
                     && matches!(
-                        method_item(b, e).as_deref(),
+                        method_item(b, e).as_ref().map(Symbol::as_str),
                         Some("ptr_cast" | "const_ptr_cast" | "ptr_cast_mut" | "ptr_cast_const")
                     ) =>
             {
@@ -216,7 +197,7 @@ pub(super) fn peel_casts(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId
             Expr::Call { callee, args }
                 if args.len() == 1
                     && matches!(
-                        callee_item(b, callee).as_deref(),
+                        callee_item(b, callee).as_ref().map(Symbol::as_str),
                         Some("ptr_from_ref" | "unsafe_cell_raw_get" | "transmute")
                     ) =>
             {
@@ -236,7 +217,7 @@ pub(super) fn peel_casts(b: &BodyCx<'_, '_>, inits: &FxHashMap<BindingId, ExprId
 
 /// The diagnostic item the callee `callee` names when it is a path (rustc's `qpath_res` of
 /// it, `get_diagnostic_name`).
-pub(super) fn callee_item(b: &BodyCx<'_, '_>, callee: ExprId) -> Option<String> {
+pub(super) fn callee_item(b: &BodyCx<'_, '_>, callee: ExprId) -> Option<Symbol> {
     match b.store().expr(callee) {
         Expr::Path(_) => util::path_item(b, callee),
         _ => None,

@@ -8,12 +8,11 @@ use blaze_codegen::{
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use cranelift_codegen::{binemit, isa::TargetIsa};
-use cranelift_module::{ModuleReloc, ModuleRelocTarget};
 
 use super::places::{PERSONALITY, libcall_symbol};
 use crate::{
     ConstBlob, DataIdentity,
-    fragment::{self, DataRequest, FuncRequest, Requests},
+    fragment::{self, DataRequest, FuncRequest, RelocName, Requests},
 };
 
 /// What a data request is in the build.
@@ -54,18 +53,17 @@ pub(crate) fn function(
     let word = word(arch)?;
     let mut own = OwnData { data: Vec::new(), word };
     let named = code.relocs.iter().filter_map(|reloc| match reloc.name {
-        ModuleRelocTarget::User { namespace: 1, index } => Some(index as usize),
+        RelocName::Data(index) => Some(index as usize),
         _ => None,
     });
     let datas = own.requests(requests, resolve, named)?;
     let mut relocs = Vec::with_capacity(code.relocs.len());
-    for reloc in &code.relocs {
-        let elf = code.elf_types.iter().find(|it| it.0 == reloc.offset).map(|it| it.1);
-        let kind = match elf {
+    for reloc in code.relocs.iter() {
+        let kind = match reloc.elf_type {
             Some(elf) => elf_kind(elf)?,
             None => reloc_kind(reloc.kind)?,
         };
-        let target = reloc_target(reloc, requests, &datas, resolve)?;
+        let target = reloc_target(reloc.name, requests, &datas, resolve)?;
         relocs.push(Reloc { at: reloc.offset, kind, target, addend: reloc.addend });
     }
     let unwind = match &code.unwind {
@@ -275,36 +273,36 @@ fn own_blob(request: &DataRequest) -> Result<&ConstBlob, String> {
 }
 
 fn reloc_target(
-    reloc: &ModuleReloc,
+    name: RelocName,
     requests: &Requests,
     datas: &[Option<Target>],
     resolve: &Resolve<'_>,
 ) -> Result<Target, String> {
-    match &reloc.name {
-        &ModuleRelocTarget::User { namespace: 0, index } => {
+    match name {
+        RelocName::Func(index) => {
             let request = requests
                 .funcs
                 .get(index as usize)
                 .ok_or_else(|| format!("a relocation at function {index}, never requested"))?;
             (resolve.func)(index, request)
         }
-        &ModuleRelocTarget::User { namespace: 1, index } => datas
+        RelocName::Data(index) => datas
             .get(index as usize)
             .cloned()
             .flatten()
             .ok_or_else(|| format!("a relocation at data {index}, never requested")),
-        ModuleRelocTarget::User { namespace: super::fold::BODY, index: 0 } => (resolve.body)(),
-        &ModuleRelocTarget::User { namespace: fragment::INLINED, .. } => {
+        RelocName::User { namespace: super::fold::BODY, index: 0 } => (resolve.body)(),
+        RelocName::User { namespace: fragment::INLINED, .. } => {
             Err("a relocation at a reference of a body built in".to_owned())
         }
-        ModuleRelocTarget::User { namespace, .. } => {
+        RelocName::User { namespace, .. } => {
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }
-        &ModuleRelocTarget::LibCall(libcall) => (resolve.symbol)(&libcall_symbol(libcall)),
-        ModuleRelocTarget::KnownSymbol(symbol) => {
+        RelocName::LibCall(libcall) => (resolve.symbol)(&libcall_symbol(libcall)),
+        RelocName::Known(symbol) => {
             Err(format!("a relocation at the linker's {symbol:?}, which v2 has no target for"))
         }
-        ModuleRelocTarget::FunctionOffset(_, offset) => {
+        RelocName::Own(offset) => {
             Err(format!("a relocation at offset {offset} of the function itself"))
         }
     }
@@ -322,6 +320,15 @@ pub(crate) fn reloc_kind(kind: binemit::Reloc) -> Result<RelocKind, String> {
         R::Aarch64AddAbsLo12Nc => RelocKind::PageOffset12,
         R::Aarch64AdrGotPage21 => RelocKind::GotPage21,
         R::Aarch64Ld64GotLo12Nc => RelocKind::GotPageOffset12,
+        R::ElfX86_64TlsGd => RelocKind::TlsGd32,
+        R::MachOX86_64Tlv => RelocKind::TlvRel32,
+        R::MachOAarch64TlsAdrPage21 => RelocKind::TlvPage21,
+        R::MachOAarch64TlsAdrPageOff12 => RelocKind::TlvPageOffset12,
+        R::Aarch64TlsDescAdrPage21 => RelocKind::TlsDescPage21,
+        R::Aarch64TlsDescLd64Lo12 => RelocKind::TlsDescLd64Lo12,
+        R::Aarch64TlsDescAddLo12 => RelocKind::TlsDescAddLo12,
+        R::Aarch64TlsDescCall => RelocKind::TlsDescCall,
+        R::X86SecRel => RelocKind::SectionRel32,
         other => return Err(format!("a {other:?} relocation, which v2 has no kind for")),
     })
 }
@@ -337,9 +344,25 @@ pub(crate) fn elf_kind(elf: u32) -> Result<RelocKind, String> {
         }
         elf::R_AARCH64_CALL26 | elf::R_AARCH64_JUMP26 => RelocKind::Call26,
         elf::R_AARCH64_ADR_PREL_PG_HI21 => RelocKind::AdrpPage21,
-        elf::R_AARCH64_ADD_ABS_LO12_NC => RelocKind::PageOffset12,
+        elf::R_AARCH64_ADD_ABS_LO12_NC
+        | elf::R_AARCH64_LDST8_ABS_LO12_NC
+        | elf::R_AARCH64_LDST16_ABS_LO12_NC
+        | elf::R_AARCH64_LDST32_ABS_LO12_NC
+        | elf::R_AARCH64_LDST64_ABS_LO12_NC
+        | elf::R_AARCH64_LDST128_ABS_LO12_NC => RelocKind::PageOffset12,
         elf::R_AARCH64_ADR_GOT_PAGE => RelocKind::GotPage21,
         elf::R_AARCH64_LD64_GOT_LO12_NC => RelocKind::GotPageOffset12,
+        elf::R_X86_64_TLSGD => RelocKind::TlsGd32,
+        elf::R_X86_64_GOTTPOFF => RelocKind::TlsGotTpOff32,
+        elf::R_X86_64_TPOFF32 => RelocKind::TlsOffset,
+        elf::R_AARCH64_TLSDESC_ADR_PAGE21 => RelocKind::TlsDescPage21,
+        elf::R_AARCH64_TLSDESC_LD64_LO12 => RelocKind::TlsDescLd64Lo12,
+        elf::R_AARCH64_TLSDESC_ADD_LO12 => RelocKind::TlsDescAddLo12,
+        elf::R_AARCH64_TLSDESC_CALL => RelocKind::TlsDescCall,
+        elf::R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 => RelocKind::TlsIePage21,
+        elf::R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC => RelocKind::TlsIeLo12,
+        elf::R_AARCH64_TLSLE_ADD_TPREL_HI12 => RelocKind::TpHi12,
+        elf::R_AARCH64_TLSLE_ADD_TPREL_LO12_NC => RelocKind::TpLo12,
         other => return Err(format!("a relocation of ELF type {other}, which v2 has no kind for")),
     })
 }

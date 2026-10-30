@@ -73,7 +73,8 @@ pub(crate) struct SyncState {
 
 impl SyncTable {
     pub(crate) fn new(ingredient: IngredientIndex) -> Self {
-        let shard_count = max_parallelism().next_power_of_two().max(2);
+        // Four shards per core (concurrency.md), so claims on different keys rarely share a lock.
+        let shard_count = (max_parallelism() * 4).next_power_of_two();
 
         Self {
             shards: (0..shard_count)

@@ -155,7 +155,7 @@ impl Run {
         tag: Tag,
         effects: &mut Vec<Effect>,
     ) -> Result<Begun, RunError<I::Error>> {
-        let kept = match index::find(store, &spec.key, inputs).map_err(RunError::Find)? {
+        let kept = match index::find_held(store, &spec.key, inputs).map_err(RunError::Find)? {
             Found::Hit { value, .. } => Some(Value::decode(value).map_err(RunError::BadValue)?),
             Found::Miss { .. } => None,
         };
@@ -505,6 +505,19 @@ mod tests {
         assert!(ran && first.stdout == b"cargo:rustc-cfg=one\n");
         let (again, ran) = go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap();
         assert!(!ran && again == first);
+        // A worker's read, through a reader under its task's guard, finds what the store's
+        // thread finds.
+        let key = spec(Mode::Normal).key;
+        let reader = store.reader();
+        let guard = blaze_cas::enter();
+        let Ok(Found::Hit { value: read, .. }) = index::find(&reader, &guard, &key, &mut inputs) else {
+            panic!("a reader misses a kept run")
+        };
+        let Ok(Found::Hit { value: held, .. }) = index::find_held(&store, &key, &mut inputs) else {
+            panic!("the store misses a kept run")
+        };
+        assert_eq!(read, held);
+        drop(guard);
         // A variable the run never read changes nothing.
         inputs.env.push(("PATH".into(), "/elsewhere".into()));
         assert!(!go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap().1);

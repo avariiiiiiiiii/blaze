@@ -29,6 +29,7 @@ covers the writer (`macho.rs`, `linkedit.rs`, `sign.rs`, `sha256.rs`) and sums u
 |---|---|---|---|
 | parse: objects | atoms found by two `Vec<u64>` per section and a linear scan per symbol for its size (quadratic per section); a `Vec` of relocations per section; `__eh_frame` pointers resolved by linear scans | one sorted column of atom bounds and starts per file, sizes and address→atom by binary search; nlists and relocations read in place; fixups one column with one sort; `__eh_frame` by binary search ([input notes](speed-link-edge-macho-input.md)). Still a `Vec<u8>` per atom and a `String` per symbol, forced by `model.rs` | as lld's `ObjFile` on passes and lookups; behind mold and wild on copies until `v2/requests/link.md` items 5 and 5a land (bytes and names in place, fixups as CSR) |
 | parse: archives | each index entry re-parsed its member's header | members by binary search over header offsets, index preallocated | as lld |
+| parse: where an input starts | a member not at a multiple of 8 (GNU-format archives, `llvm-ar`'s) was copied whole into an aligned buffer before it was read (`aligned`, one `unsafe` block) | read in place at any byte: the workspace builds `object` with `unaligned`, so its Mach-O structures are byte arrays, which arm64 and x86-64 load unaligned at no cost; `macho.rs` asserts at compile time that every structure the readers view has alignment 1. A universal file's object is read in its slice and its `Data::Input` ranges moved onto the whole file, so the core reads them in place too | as wild and mold: no copy of any input |
 | parse: `.tbd`, dylibs | a parse tree of `String`s and `Vec`s per YAML node | see [dylib notes](speed-link-edge-macho-dylib.md) | |
 | resolve | the core's, fed `String` names | the same until item 5 | as above |
 | layout | `synthetic` sizes `__unwind_info` from counts only: no pass over the image | unchanged | as lld |
@@ -52,9 +53,6 @@ covers the writer (`macho.rs`, `linkedit.rs`, `sign.rs`, `sha256.rs`) and sums u
   asks for it. With it, the chain is written as pieces are placed, page starts and the imports
   table in one pass from counts known up front, and a relink rewrites only the slots whose
   target or neighbour changed.
-- **Archive members not 8-aligned** are copied before reading (`aligned`): `object` is built
-  without its `unaligned` feature, which would make every read of every format slower.
-  Members written by Apple's `libtool` are aligned and are read in place.
 - **The symbol table and the trie are rebuilt on every relink**: `Writer::synthesize` and
   `Writer::file` are pure functions of `Placed`, which does not say what changed since the last
   link. Both are linear after one sort of the names (O(n log n) string compares, n the

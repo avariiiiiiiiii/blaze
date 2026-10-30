@@ -588,6 +588,7 @@ fn a_directory_deleted_and_written_under_again_keeps_its_dotted_sibling() {
 /// Readers on several threads, each pinned to read a root whole, while the writer commits and
 /// collects: every root a reader finds reads complete and self-consistent, and one a
 /// collection dropped reads as none, never as part of a tree.
+#[cfg(not(blaze_check))] // many threads, long loops
 #[test]
 fn readers_on_many_threads_see_whole_roots_while_commits_and_collections_run() {
     use std::sync::{
@@ -683,6 +684,7 @@ fn pinned_list(reader: &Reader, root: ContentId, path: &str) -> Option<Vec<(Stri
     Some(reader.pin().list(root, path)?.map(|(name, dir)| (name.to_owned(), dir)).collect())
 }
 
+#[cfg(not(blaze_check))] // many threads, long loops
 #[test]
 fn the_reader_reads_every_root_as_the_vfs_does() {
     let mut vfs = new_vfs();

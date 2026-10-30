@@ -1,18 +1,16 @@
-//! Interned values as `u32` words, in two places.
+//! Interned values as `u32` words: the codec, [`Code`], of what a value writes to a [`Sink`]
+//! and reads back from a [`Source`]. It is prefix-free: a value's first word, its tag, says how
+//! many words follow.
 //!
-//! - In memory: the row of an interned value (`interner::table::Rows`) is its words, each child
-//!   (a type, a region, a list, ...) as its index in its own table, an ADT with the flags it was
-//!   made with.
 //! - Persisted: a query result holds types as their place in a table of its own
 //!   ([`TyTableWriter`], [`TyTableReader`]): each value written once, after the values it holds,
 //!   as its words, each child as its place in the table, definitions as salsa ids, an ADT as its
 //!   id alone (its flags are read again from the database the table is read into).
-//!
-//! Both are the one codec, [`Code`]: what a value writes to a [`Sink`] and reads back from a
-//! [`Source`]. It is prefix-free, which a row's equality relies on: a value's first word says
-//! how many words follow.
+//! - In memory a row keeps its kind whole (`interner::table::Rows`); the codec gives the row's
+//!   tag when it is added ([`tag`]), and in debug builds checks that what it writes reads back
+//!   as the same value, so every interned value is a round trip of the persisted codec.
 
-use std::{convert::Infallible, marker::PhantomData, mem::MaybeUninit, num::NonZeroU32};
+use std::{convert::Infallible, marker::PhantomData, num::NonZeroU32};
 
 use blaze_format::{FormatError, HEADER_LEN, Record, Slice, Writer};
 use hir_def::{AdtId, ConstParamId, GenericDefId, LifetimeParamId, TypeOrConstParamId, TypeParamId};
@@ -45,7 +43,7 @@ use super::{
     SubtypePredicate, Term, TermKind, TraitAssocConstId, TraitAssocTermId, TraitAssocTyId,
     TraitIdWrapper, TraitPredicate, TraitRef, Ty, TyKind, TypeAliasIdWrapper, Tys,
     UnevaluatedConst, ValTree, ValTreeKind, ValueConst, abi::Safety, ensure_sufficient_stack,
-    interner::{Symbol, table::Fields},
+    interner::Symbol,
 };
 
 /// Where a value's words go.
@@ -121,8 +119,8 @@ pub(crate) trait Node<'db>: Copy {
     fn get_node<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error>;
 }
 
-/// A value's words as its row holds them.
-pub(crate) type Words = SmallVec<[u32; 16]>;
+/// A value's words, its children as their rows: on the stack for any value but a long one.
+type Words = SmallVec<[u32; 16]>;
 
 impl<'db> Sink<'db> for Words {
     #[inline]
@@ -141,26 +139,24 @@ impl<'db> Sink<'db> for Words {
     }
 }
 
-/// The words of `value`'s row.
-#[inline]
-pub(crate) fn encode<'db>(value: &impl Code<'db>) -> Words {
+/// The tag of `value`, a row being added: its codec's first word. In debug builds, also checks
+/// that the codec reads back what it writes for `value`.
+pub(crate) fn tag<'db, T: Code<'db> + PartialEq>(value: &T) -> u8 {
     let mut words = Words::new();
     value.put(&mut words);
-    words
-}
-
-/// The value of a row.
-#[inline]
-pub(crate) fn decode<'db, T: Code<'db>>(fields: Fields<'_>) -> T {
-    match T::get(&mut Row { tag: Some(fields.tag), words: fields.words }) {
-        Ok(value) => value,
-        Err(never) => match never {},
+    if cfg!(debug_assertions) {
+        let read = match T::get(&mut Row { words: &words }) {
+            Ok(read) => read,
+            Err(never) => match never {},
+        };
+        assert!(read == *value, "the codec reads back a value other than it wrote");
     }
+    let tag = words[0];
+    u8::try_from(tag).unwrap_or_else(|_| panic!("a tag of {tag}"))
 }
 
-/// The words of a row, read back: what `encode` gave, so none is invalid.
+/// The words of a value, read back: what its `put` gave, so none is invalid.
 struct Row<'r> {
-    tag: Option<u32>,
     words: &'r [u32],
 }
 
@@ -169,9 +165,6 @@ impl<'db> Source<'db> for Row<'_> {
 
     #[inline]
     fn word(&mut self) -> Result<u32, Infallible> {
-        if let Some(tag) = self.tag.take() {
-            return Ok(tag);
-        }
         let (&word, rest) = self.words.split_first().expect("a row as long as its value");
         self.words = rest;
         Ok(word)
@@ -505,22 +498,8 @@ impl<'db> Code<'db> for ConstParamId {
     }
 }
 
-/// A struct of `rustc_type_ir` whose one private field is a `()` that has it be built by a
-/// function taking an interner, built from its public fields: the checks that function would
-/// make (`Interner::debug_assert_args_compatible` and
-/// `Interner::debug_assert_existential_args_compatible`) are empty for `DbInterner`.
-macro_rules! assemble {
-    ($ty:ty { $($field:ident: $value:expr),* $(,)? }) => {{
-        let mut value = MaybeUninit::<$ty>::uninit();
-        let at = value.as_mut_ptr();
-        // SAFETY: the fields written are all of the struct's but a `()`, which has no bytes, so
-        // the struct is initialized once they are.
-        unsafe {
-            $( (&raw mut (*at).$field).write($value); )*
-            value.assume_init()
-        }
-    }};
-}
+// The structs below are rebuilt with `from_checked_parts`: their parts were checked when the
+// value was first made (and `DbInterner`'s `debug_assert_args_compatible` is empty).
 
 impl<'db> Code<'db> for TraitRef<'db> {
     fn put(&self, sink: &mut impl Sink<'db>) {
@@ -530,7 +509,7 @@ impl<'db> Code<'db> for TraitRef<'db> {
     fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
         let def_id = Code::get(source)?;
         let args = Code::get(source)?;
-        Ok(assemble!(TraitRef<'db> { def_id: def_id, args: args }))
+        Ok(TraitRef::from_checked_parts(def_id, args))
     }
 }
 
@@ -542,7 +521,7 @@ impl<'db> Code<'db> for ExistentialTraitRef<'db> {
     fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
         let def_id = Code::get(source)?;
         let args = Code::get(source)?;
-        Ok(assemble!(ExistentialTraitRef<'db> { def_id: def_id, args: args }))
+        Ok(ExistentialTraitRef::from_checked_parts(def_id, args))
     }
 }
 
@@ -556,7 +535,7 @@ impl<'db> Code<'db> for ExistentialProjection<'db> {
         let def_id = Code::get(source)?;
         let args = Code::get(source)?;
         let term = Code::get(source)?;
-        Ok(assemble!(ExistentialProjection<'db> { def_id: def_id, args: args, term: term }))
+        Ok(ExistentialProjection::from_checked_parts(def_id, args, term))
     }
 }
 
@@ -568,7 +547,7 @@ impl<'db> Code<'db> for AliasTy<'db> {
     fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
         let args = Code::get(source)?;
         let kind = Code::get(source)?;
-        Ok(assemble!(AliasTy<'db> { args: args, kind: kind }))
+        Ok(AliasTy::from_checked_parts(kind, args))
     }
 }
 
@@ -580,7 +559,7 @@ impl<'db> Code<'db> for AliasTerm<'db> {
     fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
         let args = Code::get(source)?;
         let kind = Code::get(source)?;
-        Ok(assemble!(AliasTerm<'db> { args: args, kind: kind }))
+        Ok(AliasTerm::from_checked_parts(kind, args))
     }
 }
 
@@ -1553,11 +1532,18 @@ blaze_format::record! {
 /// Writes the types (and regions, constants, lists and clauses) of a query result into a table
 /// of its own, each once: each is named by its place in the table, from the `u32` its method
 /// returns.
+///
+/// Cost: a value already written is one Fx hash of a `u64` key and one probe. A new one is
+/// written to `words` once, its children first; the words of the values being written wait
+/// in `pending`, one stack reused for the whole table, so writing allocates only as the table
+/// grows.
 pub struct TyTableWriter<'db> {
     /// The place of each value written, by kind and row.
     places: FxHashMap<(Kind, NonZeroU32), u32>,
     nodes: Vec<NodeRec>,
     words: Vec<u32>,
+    /// The words of the values being written, innermost last.
+    pending: Vec<u32>,
     _db: PhantomData<DbInterner<'db>>,
 }
 
@@ -1572,6 +1558,7 @@ impl<'db> TyTableWriter<'db> {
             places: FxHashMap::default(),
             nodes: Vec::new(),
             words: Vec::new(),
+            pending: Vec::new(),
             _db: PhantomData,
         }
     }
@@ -1608,37 +1595,47 @@ impl<'db> TyTableWriter<'db> {
         })
     }
 
-    /// The place of `node`, written with what it holds if it is not in the table yet.
+    /// The place of `node`, written with what it holds if it is not in the table yet. A miss
+    /// hashes its key twice, as its children are written between the lookup and the insert.
+    #[inline]
     fn place<N: Node<'db>>(&mut self, node: N) -> u32 {
         let key = (N::KIND, node.row());
-        if let Some(&place) = self.places.get(&key) {
-            return place;
+        match self.places.get(&key) {
+            Some(&place) => place,
+            None => self.add(key, node),
         }
-        let mut words = Vec::new();
-        ensure_sufficient_stack(|| node.put_node(&mut Children { writer: self, words: &mut words }));
+    }
+
+    #[cold]
+    fn add<N: Node<'db>>(&mut self, key: (Kind, NonZeroU32), node: N) -> u32 {
+        let start = self.pending.len();
+        ensure_sufficient_stack(|| node.put_node(&mut Children { writer: self }));
         let place = u32::try_from(self.nodes.len()).expect("a type table of fewer than 2^32 values");
         let at = u32::try_from(self.words.len()).expect("a type table of fewer than 2^32 words");
         self.nodes.push(NodeRec { kind: N::KIND as u32, at });
-        self.words.extend(words);
+        self.words.extend_from_slice(&self.pending[start..]);
+        self.pending.truncate(start);
         self.places.insert(key, place);
         place
     }
 }
 
-/// The words of a node being written: its children are written first.
+/// The words of a node being written, onto the writer's `pending` stack above its parent's:
+/// its children are written first.
 struct Children<'w, 'db> {
     writer: &'w mut TyTableWriter<'db>,
-    words: &'w mut Vec<u32>,
 }
 
 impl<'db> Sink<'db> for Children<'_, 'db> {
+    #[inline]
     fn word(&mut self, word: u32) {
-        self.words.push(word);
+        self.writer.pending.push(word);
     }
 
+    #[inline]
     fn node<N: Node<'db>>(&mut self, node: N) {
         let place = self.writer.place(node);
-        self.words.push(place);
+        self.writer.pending.push(place);
     }
 
     fn adt(&mut self, adt: AdtDef) {
@@ -1688,7 +1685,9 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
                 .ok_or(FormatError::Invalid { at, what: "a type table value of no kind" })?;
             let mut source =
                 Reading { values: &values, words: &words[start..end], adt: &adt, at };
-            let row = ensure_sufficient_stack(|| match kind {
+            // A value's children are places of values read before it, so reading one is
+            // shallow: no stack check.
+            let row = match kind {
                 Kind::Ty => Ty::get_node(&mut source).map(Ty::row),
                 Kind::Region => Region::get_node(&mut source).map(Region::row),
                 Kind::Const => Const::get_node(&mut source).map(Const::row),
@@ -1705,7 +1704,7 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
                 Kind::BoundExistentialPredicates => BoundExistentialPredicates::get_node(&mut source)
                     .map(BoundExistentialPredicates::row),
                 Kind::Clauses => Clauses::get_node(&mut source).map(Clauses::row),
-            })?;
+            }?;
             if !source.words.is_empty() {
                 return Err(FormatError::Invalid { at, what: "a type table value with words left over" });
             }
@@ -1873,9 +1872,9 @@ mod tests {
             ValTreeKind::Leaf(ScalarInt::from(7u8)),
         )));
         let pair = Tys::new_from_slice(&[u8, Ty::intern(TyKind::Bool)]);
-        let trait_ref = assemble!(TraitRef<'db> { def_id: trait_, args: args });
-        let alias_term = |kind| assemble!(AliasTerm<'db> { args: args, kind: kind });
-        let alias_ty = |kind| assemble!(AliasTy<'db> { args: args, kind: kind });
+        let trait_ref = TraitRef::from_checked_parts(trait_, args);
+        let alias_term = |kind| AliasTerm::from_checked_parts(kind, args);
+        let alias_ty = |kind| AliasTy::from_checked_parts(kind, args);
         let bound_ty = |var, kind| BoundTy { var: BoundVar::from_u32(var), kind };
         let bound_region = |var, kind| BoundRegion { var: BoundVar::from_u32(var), kind };
         let range = PatternKind::Range { start: seven, end: seven };
@@ -1908,19 +1907,18 @@ mod tests {
             TyKind::Dynamic(
                 BoundExistentialPredicates::new_from_slice(&[
                     Binder::bind_with_vars(
-                        ExistentialPredicate::Trait(assemble!(ExistentialTraitRef<'db> {
-                            def_id: trait_,
-                            args: args,
-                        })),
+                        ExistentialPredicate::Trait(ExistentialTraitRef::from_checked_parts(
+                            trait_, args,
+                        )),
                         vars,
                     ),
-                    Binder::dummy(ExistentialPredicate::Projection(assemble!(
-                        ExistentialProjection<'db> {
-                            def_id: TraitAssocTermId(TermId::TypeAliasId(alias)),
-                            args: args,
-                            term: u8.into(),
-                        }
-                    ))),
+                    Binder::dummy(ExistentialPredicate::Projection(
+                        ExistentialProjection::from_checked_parts(
+                            TraitAssocTermId(TermId::TypeAliasId(alias)),
+                            args,
+                            u8.into(),
+                        ),
+                    )),
                     Binder::dummy(ExistentialPredicate::AutoTrait(trait_)),
                 ]),
                 statik,

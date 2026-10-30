@@ -31,6 +31,8 @@
 //! they are, its result going only to shuffles. A crate of the program's own is taken as the
 //! dev profile builds it, where that inliner does not run.
 
+#![forbid(unsafe_code)]
+
 use super::*;
 
 /// What runs after the fma, in its block: whether FastISel can select it.

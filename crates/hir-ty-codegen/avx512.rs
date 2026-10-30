@@ -19,6 +19,8 @@
 //! directions with `_MM_FROUND_NO_EXC` (8 to 11) are `{rn-sae}` to `{rz-sae}`, and where the
 //! operand only suppresses exceptions, 8 (or 12) is `{sae}`. LLVM rejects any other value.
 
+#![forbid(unsafe_code)]
+
 /// An operand of the intrinsic as the code generator has it: its size, whether it is an
 /// address, and its value where that is a constant integer.
 #[derive(Clone, Copy, Debug)]

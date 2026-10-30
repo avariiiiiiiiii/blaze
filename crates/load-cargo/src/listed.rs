@@ -2,6 +2,8 @@
 //! which the toolchain's server does not read: a caller that names a server reading that list
 //! has such libraries expanded by it, and the others by the toolchain's.
 
+#![forbid(unsafe_code)]
+
 use std::sync::OnceLock;
 
 use vfs::{AbsPath, AbsPathBuf};

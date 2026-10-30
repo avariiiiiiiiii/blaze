@@ -20,6 +20,8 @@ mod parser;
 #[cfg(test)]
 mod benchmark;
 #[cfg(test)]
+mod differential;
+#[cfg(test)]
 mod tests;
 
 use span::{Edition, Span, SyntaxContext};

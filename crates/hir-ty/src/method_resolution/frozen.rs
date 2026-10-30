@@ -44,8 +44,8 @@ pub fn set(db: &mut dyn SourceDatabase, maps: FxHashMap<Crate, Frozen>) {
     }
 }
 
-fn frozen(db: &dyn HirDatabase, krate: Crate) -> Option<Frozen> {
-    FrozenImpls::try_get(db)?.maps(db).get(&krate).cloned()
+fn frozen(db: &dyn HirDatabase, krate: Crate) -> Option<&Frozen> {
+    FrozenImpls::try_get(db)?.maps(db).get(&krate)
 }
 
 /// Whether the impls of `krate` are read from frozen bytes rather than found.

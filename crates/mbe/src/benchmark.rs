@@ -61,7 +61,7 @@ fn benchmark_expand_macro_rules() {
     assert_eq!(hash, 450144);
 }
 
-fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
+pub(crate) fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
     macro_rules_fixtures_tt()
         .into_iter()
         .sorted_by_key(|(id, _)| id.clone())
@@ -91,7 +91,7 @@ fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree> {
 }
 
 /// Generate random invocation fixtures from rules
-fn invocation_fixtures(
+pub(crate) fn invocation_fixtures(
     db: &dyn salsa::Database,
     rules: &FxHashMap<String, DeclarativeMacro>,
 ) -> Vec<(String, tt::TopSubtree)> {

@@ -5,12 +5,14 @@
 //!
 //! Cost: one pass over an object's section headers and one over its symbol table, with section
 //! names and `.drectve` words borrowed from the input; a symbol's object index is a `u32` column
-//! by COFF index. What is copied is what the contract owns: each symbol's and section's name,
-//! each section's bytes (`Data::Bytes`), each import's `"<hint> <name>"`. A short import member
-//! is read in place, never copied for alignment.
+//! by COFF index. A section's bytes are a range of the input (`Data::Input`), never copied; every
+//! name is borrowed from the input and pushed once into the file's one `Names` arena (sized up
+//! front from the string table); relocations and COMDAT members are runs of one column per
+//! object. What is still made is each import's `"<hint> <name>"` (its `Shared::versions` entry).
+//! A short import member is read in place, never copied for alignment.
 
 use std::borrow::Cow;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::sync::Mutex;
 
 use object::LittleEndian as LE;
@@ -23,8 +25,8 @@ use rustc_hash::FxHashMap;
 use super::{OBJ_PDATA, Pe};
 use crate::NativeKind;
 use crate::model::{
-    Apply, Archive, Binding, Class, Data, Directive, Group, Member, NativeFile, NativeFixup, Object, Section,
-    SectionKind, Shared, SharedSymbol, Symbol, SymbolDef, SymbolKind, Writer,
+    Apply, Archive, Binding, Class, Data, Directive, Group, Member, Name, Names, NativeFile, NativeFixup, Object,
+    Section, SectionKind, Shared, SharedSymbol, Symbol, SymbolDef, SymbolKind, Writer,
 };
 
 /// The size of an archive member's header.
@@ -77,23 +79,55 @@ impl<'a> Dlls<'a> {
     }
 }
 
+/// One import of a DLL as an import member names it: the symbol, borrowed from the member
+/// when it can be, and how the DLL's export table names it (`"<hint> <name>"` or
+/// `"#<ordinal>"`, which PE carries as the symbol's version).
+struct Imported<'a> {
+    name: Cow<'a, str>,
+    version: String,
+    kind: SymbolKind,
+}
+
 /// A relocatable input as read: an object, or one import of a DLL.
 enum Parsed<'a> {
     Object(Object),
-    Import(Cow<'a, str>, SharedSymbol),
+    Import(Cow<'a, str>, Imported<'a>),
 }
 
-fn shared(dll: String, symbol: SharedSymbol) -> Shared {
-    Shared { name: dll, symbols: vec![symbol], more: Vec::new(), inputs: Vec::new() }
+fn shared(dll: String) -> Shared {
+    Shared {
+        name: dll,
+        symbols: Vec::new(),
+        names: Names::default(),
+        versions: Vec::new(),
+        more: Vec::new(),
+        inputs: Vec::new(),
+    }
+}
+
+/// Adds an import to its DLL: the name pushed into the DLL's names, the export name as a
+/// version of its own (each import's differs).
+fn add(shared: &mut Shared, input: Input<'_>, import: Imported<'_>) -> Result<(), String> {
+    let version = u16::try_from(shared.versions.len()).map_err(|_| {
+        format!("{input}: more than 65,536 imports of {}, more than a DLL can export", shared.name)
+    })?;
+    let name = shared.names.push(&import.name).map_err(|e| format!("{input}: {e}"))?;
+    shared.versions.push(import.version);
+    shared.symbols.push(SharedSymbol { name, version: Some(version), kind: import.kind, weak: false });
+    Ok(())
 }
 
 pub(super) fn read(pe: &Pe, name: &str, bytes: &[u8], kind: &NativeKind) -> Result<NativeFile, String> {
     let input = Input { file: name, member: None };
     match kind {
-        NativeKind::Object => Ok(match member(pe, Dlls::Read(&pe.descriptors), input, bytes)? {
-            Parsed::Object(object) => NativeFile::Object(object),
-            Parsed::Import(dll, symbol) => NativeFile::Shared(shared(dll.into_owned(), symbol)),
-        }),
+        NativeKind::Object => match member(pe, Dlls::Read(&pe.descriptors), input, bytes)? {
+            Parsed::Object(object) => Ok(NativeFile::Object(object)),
+            Parsed::Import(dll, import) => {
+                let mut shared = shared(dll.into_owned());
+                add(&mut shared, input, import)?;
+                Ok(NativeFile::Shared(shared))
+            }
+        },
         NativeKind::Archive { whole } => {
             let (archive, descriptors) = archive(input, bytes, *whole)?;
             if !descriptors.is_empty() {
@@ -172,8 +206,8 @@ fn strip(name: &str) -> &str {
     name.strip_prefix(['?', '@', '_']).unwrap_or(name)
 }
 
-/// A short import member: one symbol of one DLL, the DLL's name borrowed from it.
-fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, SharedSymbol), String> {
+/// A short import member: one symbol of one DLL, the symbol's and the DLL's names borrowed from it.
+fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Imported<'d>), String> {
     let short = || format!("{name}: a truncated import member");
     let machine = u16_at(data, 6).ok_or_else(short)?;
     if machine != pe::IMAGE_FILE_MACHINE_AMD64 {
@@ -184,7 +218,7 @@ fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Sh
     let types = u16_at(data, 18).ok_or_else(short)?;
     let strings = data.get(20..20 + size).ok_or_else(short)?;
     let mut strings = strings.split(|it| *it == 0);
-    let symbol = lossy(strings.next().ok_or_else(short)?);
+    let symbol = String::from_utf8_lossy(strings.next().ok_or_else(short)?);
     let dll = String::from_utf8_lossy(strings.next().ok_or_else(short)?);
     let kind = match types & pe::IMPORT_OBJECT_TYPE_MASK {
         pe::IMPORT_OBJECT_CODE => SymbolKind::Function,
@@ -194,7 +228,7 @@ fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Sh
     let export_as: Cow<'_, str>;
     let export = match (types >> pe::IMPORT_OBJECT_NAME_SHIFT) & pe::IMPORT_OBJECT_NAME_MASK {
         pe::IMPORT_OBJECT_ORDINAL => None,
-        pe::IMPORT_OBJECT_NAME => Some(symbol.as_str()),
+        pe::IMPORT_OBJECT_NAME => Some(&*symbol),
         pe::IMPORT_OBJECT_NAME_NO_PREFIX => Some(strip(&symbol)),
         pe::IMPORT_OBJECT_NAME_UNDECORATE => Some(strip(&symbol).split('@').next().unwrap_or_default()),
         pe::IMPORT_OBJECT_NAME_EXPORTAS => {
@@ -209,7 +243,7 @@ fn short_import<'d>(name: Input<'_>, data: &'d [u8]) -> Result<(Cow<'d, str>, Sh
         None => format!("#{ordinal_or_hint}"),
         Some(export) => format!("{ordinal_or_hint} {export}"),
     };
-    Ok((dll, SharedSymbol { name: symbol, version: Some(version), kind, weak: false }))
+    Ok((dll, Imported { name: symbol, version, kind }))
 }
 
 /// How the writer names an import in the DLL's export table, as `SharedSymbol::version` and
@@ -245,13 +279,16 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
         other => return Err(format!("{name}: a {other:?} archive, not a COFF one")),
     }
     let mut members = Vec::new();
+    let mut names = Names::default();
     // Each member's header offset, ascending as the members are in the file.
     let mut starts = Vec::new();
     for member in file.members() {
         let member = member.map_err(|e| format!("{name}: {e}"))?;
         let (offset, size) = member.file_range();
         starts.push(offset - MEMBER_HEADER);
-        members.push(Member { name: lossy(member.name()), bytes: offset as usize..(offset + size) as usize });
+        let member_name = String::from_utf8_lossy(member.name());
+        let member_name = names.push(&member_name).map_err(|e| format!("{name}: {e}"))?;
+        members.push(Member { name: member_name, bytes: offset as usize..(offset + size) as usize });
     }
     let mut index = Vec::new();
     let mut descriptors = Descriptors::default();
@@ -259,19 +296,17 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
         for symbol in symbols {
             let symbol = symbol.map_err(|e| format!("{name}: {e}"))?;
             let offset = symbol.offset().0;
+            let symbol_name = String::from_utf8_lossy(symbol.name());
             let member = starts.binary_search(&offset).map_err(|_| {
-                format!(
-                    "{name}: the index names {} in a member at {offset:#x}, where none starts",
-                    String::from_utf8_lossy(symbol.name())
-                )
+                format!("{name}: the index names {symbol_name} in a member at {offset:#x}, where none starts")
             })? as u32;
-            let symbol_name = lossy(symbol.name());
-            if symbol_name.starts_with("__IMPORT_DESCRIPTOR_") && !descriptors.contains_key(&symbol_name) {
+            if symbol_name.starts_with("__IMPORT_DESCRIPTOR_") && !descriptors.contains_key(&*symbol_name) {
                 let it = &members[member as usize];
-                let input = Input { file: name.file, member: Some(&it.name) };
-                descriptors.insert(symbol_name.clone(), descriptor_dll(input, &bytes[it.bytes.clone()])?);
+                let input = Input { file: name.file, member: Some(names.at(it.name)) };
+                let dll = descriptor_dll(input, &bytes[it.bytes.clone()])?;
+                descriptors.insert((*symbol_name).to_owned(), dll);
             }
-            index.push((symbol_name, member));
+            index.push((names.push(&symbol_name).map_err(|e| format!("{name}: {e}"))?, member));
         }
     }
     if index.is_empty() && !members.is_empty() && !whole {
@@ -280,7 +315,7 @@ fn archive(name: Input<'_>, bytes: &[u8], whole: bool) -> Result<(Archive, Descr
              symbol (index it with lib.exe or llvm-ranlib)"
         ));
     }
-    Ok((Archive { members, index }, descriptors))
+    Ok((Archive { members, index, names }, descriptors))
 }
 
 /// The DLL an import descriptor member names: its `.idata$6`.
@@ -322,9 +357,9 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
     let mut dlls: Vec<Shared> = Vec::new();
     let mut of: FxHashMap<Cow<'_, str>, u32> = FxHashMap::default();
     for it in &archive.members {
-        let input = Input { file: name.file, member: Some(&it.name) };
-        let (dll, symbol) = match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.clone()])? {
-            Parsed::Import(dll, symbol) => (dll, symbol),
+        let input = Input { file: name.file, member: Some(archive.name(it.name)) };
+        let (dll, import) = match member(pe, Dlls::Library(&descriptors), input, &bytes[it.bytes.clone()])? {
+            Parsed::Import(dll, import) => (dll, import),
             Parsed::Object(object) if object.sections.is_empty() => continue,
             Parsed::Object(_) => {
                 return Err(format!(
@@ -333,13 +368,15 @@ fn import_library(pe: &Pe, name: Input<'_>, bytes: &[u8]) -> Result<Shared, Stri
                 ));
             }
         };
-        match of.get(&*dll) {
-            Some(&at) => dlls[at as usize].symbols.push(symbol),
+        let at = match of.get(&*dll) {
+            Some(&at) => at as usize,
             None => {
                 of.insert(dll.clone(), dlls.len() as u32);
-                dlls.push(shared(dll.into_owned(), symbol));
+                dlls.push(shared(dll.into_owned()));
+                dlls.len() - 1
             }
-        }
+        };
+        add(&mut dlls[at], input, import)?;
     }
     let mut dlls = dlls.into_iter();
     let mut first = dlls.next().ok_or_else(|| format!("{name}: an import library importing nothing"))?;
@@ -376,7 +413,13 @@ fn coff<'a, C: CoffHeader>(pe: &Pe, dlls: Dlls<'a>, name: Input<'_>, data: &[u8]
     if import {
         return long_import(dlls, name, data, &sections, &symbols);
     }
-    Reader { pe, name, data, sections: &sections, symbols: &symbols }.object().map(Parsed::Object)
+    // Every name is at most 8 bytes in its record or one string of the string table, whose
+    // length is the word after the symbol table; never more than the input holds.
+    let strings_at = header.pointer_to_symbol_table() as usize
+        + symbols.len() * std::mem::size_of::<C::ImageSymbolBytes>();
+    let string_bytes = u32_at(data, strings_at).unwrap_or(0) as usize;
+    let capacity = (string_bytes + 8 * (symbols.len() + sections.names.len())).min(data.len());
+    Reader { pe, name, data, sections: &sections, symbols: &symbols, names: capacity }.object().map(Parsed::Object)
 }
 
 struct Reader<'a, 'd, C: CoffHeader> {
@@ -385,6 +428,8 @@ struct Reader<'a, 'd, C: CoffHeader> {
     data: &'d [u8],
     sections: &'a Sections<'d>,
     symbols: &'a SymbolTable<'d, &'d [u8], C>,
+    /// What the object's `Names` is allocated with.
+    names: usize,
 }
 
 /// What a COFF symbol table is to the link, from one pass over it.
@@ -411,9 +456,12 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
     }
 
     fn object(&self) -> Result<Object, String> {
-        let mut sections = Vec::with_capacity(self.sections.names.len());
-        let mut libraries = Vec::new();
-        let mut directives = Vec::new();
+        let mut object = Object {
+            sections: Vec::with_capacity(self.sections.names.len()),
+            names: Names::with_capacity(self.names),
+            ..Object::default()
+        };
+        // `/ALTERNATENAME` pairs `(from, to)`, their names pushed as the `.drectve` is read.
         let mut alternates = Vec::new();
         for (index, section_name) in self.sections.names.iter().enumerate() {
             let section_name: &str = section_name;
@@ -421,48 +469,70 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             let flags = header.characteristics.get(LE);
             if section_name == ".drectve" {
                 let bytes = header.coff_data(self.data).map_err(|()| self.err("a truncated .drectve"))?;
-                self.directives(bytes, &mut libraries, &mut directives, &mut alternates)?;
+                self.directives(
+                    bytes,
+                    &mut object.names,
+                    &mut object.libraries,
+                    &mut object.directives,
+                    &mut alternates,
+                )?;
             }
-            sections.push(self.section(section_name, header, flags)?);
+            let section = self.section(&mut object.names, section_name, header, flags)?;
+            object.sections.push(section);
         }
-        let read = self.symbols()?;
-        let groups = self.groups(&mut sections, &read)?;
+        let read = self.symbols(&mut object.names)?;
+        self.groups(&mut object, &read)?;
         for (index, header) in self.sections.table.iter().enumerate() {
-            if sections[index].what == SectionKind::Dropped {
+            if object.sections[index].what == SectionKind::Dropped {
                 continue;
             }
-            sections[index].fixups = self.fixups(index, header, &sections[index], &read)?;
+            let start = self.run(object.fixups.len())?;
+            self.fixups(index, header, &object.sections[index].data, &read, &object.names, &mut object.fixups)?;
+            object.sections[index].fixups = start..self.run(object.fixups.len())?;
         }
-        let mut symbols = read.symbols;
-        symbols.reserve(alternates.len() * 2);
+        object.symbols = read.symbols;
+        object.symbols.reserve(alternates.len() * 2);
         for (from, to) in alternates {
-            let target = match symbols.iter().position(|it| it.name == to && it.binding != Binding::Local) {
+            let names = &object.names;
+            let found = object.symbols.iter().position(|it| {
+                it.binding != Binding::Local && names.at(it.name) == names.at(to)
+            });
+            let target = match found {
                 Some(at) => at as u32,
                 None => {
-                    symbols.push(Symbol {
+                    object.symbols.push(Symbol {
                         name: to,
                         def: SymbolDef::Undefined,
                         binding: Binding::Global,
                         kind: SymbolKind::Other,
                         hidden: true,
-                        import: None,
                     });
-                    symbols.len() as u32 - 1
+                    object.symbols.len() as u32 - 1
                 }
             };
-            symbols.push(Symbol {
+            object.symbols.push(Symbol {
                 name: from,
                 def: SymbolDef::Fallback { symbol: target, search: false },
                 binding: Binding::Global,
                 kind: SymbolKind::Other,
                 hidden: true,
-                import: None,
             });
         }
-        Ok(Object { sections, symbols, groups, libraries, directives })
+        Ok(object)
     }
 
-    fn section(&self, section_name: &str, header: &pe::ImageSectionHeader, flags: u32) -> Result<Section, String> {
+    /// The end of a run of one of the object's columns, as the contract's `u32` ranges hold it.
+    fn run(&self, len: usize) -> Result<u32, String> {
+        u32::try_from(len).map_err(|_| self.err("more than 4 Gi relocations or COMDAT members in one object"))
+    }
+
+    fn section(
+        &self,
+        names: &mut Names,
+        section_name: &str,
+        header: &pe::ImageSectionHeader,
+        flags: u32,
+    ) -> Result<Section, String> {
         let align = alignment(flags).ok_or_else(|| {
             self.err(format!("section {section_name} has alignment bits {:#x}", flags & pe::IMAGE_SCN_ALIGN_MASK))
         })?;
@@ -474,10 +544,11 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         } else if zero {
             Data::Zero(header.size_of_raw_data.get(LE).into())
         } else {
-            let bytes = header
+            header
                 .coff_data(self.data)
                 .map_err(|()| self.err(format!("section {section_name} is past the end")))?;
-            Data::Bytes(bytes.to_vec())
+            let start = u64::from(header.pointer_to_raw_data.get(LE));
+            Data::Input(start..start + u64::from(header.size_of_raw_data.get(LE)))
         };
         let what = if dropped {
             SectionKind::Dropped
@@ -499,16 +570,16 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         };
         let comdat = flags & pe::IMAGE_SCN_LNK_COMDAT != 0;
         Ok(Section {
-            name: section_name.to_owned(),
+            name: names.push(section_name).map_err(|e| self.err(e))?,
             retain: what != SectionKind::Dropped && !comdat,
             what,
             align,
             data,
-            fixups: Vec::new(),
+            fixups: 0..0,
         })
     }
 
-    fn symbols(&self) -> Result<Read, String> {
+    fn symbols(&self, names: &mut Names) -> Result<Read, String> {
         let strings = self.symbols.strings();
         let count = self.sections.names.len();
         let mut read = Read {
@@ -546,7 +617,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             if !linkable || number == pe::IMAGE_SYM_DEBUG {
                 continue;
             }
-            let symbol_name = lossy(symbol.name(strings).map_err(|e| self.err(e))?);
+            let symbol_name = String::from_utf8_lossy(symbol.name(strings).map_err(|e| self.err(e))?);
             let value = u64::from(symbol.value());
             let function = symbol.derived_type() == pe::IMAGE_SYM_DTYPE_FUNCTION;
             let (def, kind) = if class == pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL {
@@ -592,8 +663,9 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 pe::IMAGE_SYM_CLASS_WEAK_EXTERNAL => Binding::Weak,
                 _ => Binding::Local,
             };
+            let name = names.push(&symbol_name).map_err(|e| self.err(e))?;
             read.map[index.0] = read.symbols.len() as u32;
-            read.symbols.push(Symbol { name: symbol_name, def, binding, kind, hidden: true, import: None });
+            read.symbols.push(Symbol { name, def, binding, kind, hidden: true });
         }
         // A symbol's size runs to the next greater value in its section, or the section's end.
         defined.sort_unstable();
@@ -616,7 +688,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             let target = read.map.get(default.0).copied().filter(|it| *it != NONE).ok_or_else(|| {
                 self.err(format!(
                     "weak external {} defaults to symbol {}, which is not one",
-                    read.symbols[symbol].name, default.0
+                    names.at(read.symbols[symbol].name),
+                    default.0
                 ))
             })?;
             let search = match search {
@@ -625,7 +698,7 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 other => {
                     return Err(self.err(format!(
                         "weak external {} has search type {other}, which blaze does not link",
-                        read.symbols[symbol].name
+                        names.at(read.symbols[symbol].name)
                     )));
                 }
             };
@@ -655,16 +728,22 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
         }
     }
 
-    /// The COMDAT groups, and which sections stay whatever refers to them.
-    fn groups(&self, sections: &mut [Section], read: &Read) -> Result<Vec<Group>, String> {
+    /// The COMDAT groups with their sections in `object.grouped`, and which sections stay
+    /// whatever refers to them.
+    fn groups(&self, object: &mut Object, read: &Read) -> Result<(), String> {
         let strings = self.symbols.strings();
-        let count = sections.len();
-        let mut groups: Vec<Group> = Vec::new();
-        let mut group_of: Vec<Option<usize>> = vec![None; count];
+        let count = object.sections.len();
+        // Each section's group, [`NONE`] for none: 4 bytes per section.
+        let mut group_of = vec![NONE; count];
+        // `(group, section)`: each group's own section, then the associatives that join it;
+        // sorted once by group (stably, so the group's own section stays first) into runs.
+        let mut members: Vec<(u32, u32)> = Vec::new();
         let mut associate = Vec::new();
+        // A local COMDAT's group name, made in one reused buffer.
+        let mut local = String::new();
         for index in 0..count {
             if self.header(index).characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT == 0
-                || sections[index].what == SectionKind::Dropped
+                || object.sections[index].what == SectionKind::Dropped
             {
                 continue;
             }
@@ -696,13 +775,18 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
             let leader = read.second[index]
                 .and_then(|it| self.symbols.symbol(it).ok())
                 .ok_or_else(|| self.err(format!("COMDAT section {section_name} has no COMDAT symbol")))?;
-            let group_name = if leader.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL {
-                lossy(leader.name(strings).map_err(|e| self.err(e))?)
+            let pushed = if leader.storage_class() == pe::IMAGE_SYM_CLASS_EXTERNAL {
+                object.names.push(&String::from_utf8_lossy(leader.name(strings).map_err(|e| self.err(e))?))
             } else {
-                format!("\0{}\0{index}", self.name)
+                local.clear();
+                write!(local, "\0{}\0{index}", self.name).map_err(|e| self.err(e))?;
+                object.names.push(&local)
             };
-            group_of[index] = Some(groups.len());
-            groups.push(Group { name: group_name, sections: vec![index as u32], largest });
+            let name = pushed.map_err(|e| self.err(e))?;
+            let group = object.groups.len() as u32;
+            group_of[index] = group;
+            members.push((group, index as u32));
+            object.groups.push(Group { name, sections: 0..0, largest });
         }
         for (index, parent) in associate {
             let mut root = parent as usize;
@@ -729,35 +813,45 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                 }
             }
             match group_of[root - 1] {
-                Some(group) => groups[group].sections.push(index as u32),
-                None if self.header(root - 1).characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT == 0 => {
-                    sections[index].retain = true;
+                NONE if self.header(root - 1).characteristics.get(LE) & pe::IMAGE_SCN_LNK_COMDAT == 0 => {
+                    object.sections[index].retain = true;
                 }
-                None => {}
+                NONE => {}
+                group => members.push((group, index as u32)),
             }
         }
-        Ok(groups)
+        members.sort_by_key(|it| it.0);
+        object.grouped.reserve(members.len());
+        for run in members.chunk_by(|a, b| a.0 == b.0) {
+            let start = self.run(object.grouped.len())?;
+            object.grouped.extend(run.iter().map(|it| it.1));
+            object.groups[run[0].0 as usize].sections = start..self.run(object.grouped.len())?;
+        }
+        Ok(())
     }
 
-    /// The section's relocations: a `match` on the type per relocation, the implicit addend
-    /// read from the section's bytes, no allocation but the result's.
+    /// Appends the section's relocations to `fixups` (the object's column): a `match` on the
+    /// type per relocation, the implicit addend read from the section's bytes in the input, no
+    /// allocation but the column's growth.
     fn fixups(
         &self,
         index: usize,
         header: &pe::ImageSectionHeader,
-        section: &Section,
+        data: &Data,
         read: &Read,
-    ) -> Result<Vec<NativeFixup>, String> {
+        names: &Names,
+        fixups: &mut Vec<NativeFixup>,
+    ) -> Result<(), String> {
         let relocations = header.coff_relocations(self.data).map_err(|e| self.err(e))?;
         let section_name = &self.sections.names[index];
-        let bytes = match &section.data {
-            Data::Bytes(bytes) => bytes.as_slice(),
-            Data::Zero(_) if relocations.is_empty() => return Ok(Vec::new()),
-            Data::Zero(_) => {
+        let bytes = match data.bytes(self.data).map_err(|e| self.err(format!("section {section_name}: {e}")))? {
+            Some(bytes) => bytes,
+            None if relocations.is_empty() => return Ok(()),
+            None => {
                 return Err(self.err(format!("relocations in {section_name}, which has no bytes")));
             }
         };
-        let mut fixups = Vec::with_capacity(relocations.len());
+        fixups.reserve(relocations.len());
         for relocation in relocations {
             let at = relocation.virtual_address.get(LE) as usize;
             let typ = relocation.typ.get(LE);
@@ -795,21 +889,22 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                         "relocation type {other:#x} ({}) in {section_name} at {at:#x} against {}, \
                          which blaze does not link",
                         relocation_name(other),
-                        target.name
+                        names.at(target.name)
                     )));
                 }
             };
             fixups.push(NativeFixup { at: at as u64, apply, symbol, addend, minus: None });
         }
-        Ok(fixups)
+        Ok(())
     }
 
     fn directives(
         &self,
         bytes: &[u8],
+        names: &mut Names,
         libraries: &mut Vec<String>,
         directives: &mut Vec<Directive>,
-        alternates: &mut Vec<(String, String)>,
+        alternates: &mut Vec<(Name, Name)>,
     ) -> Result<(), String> {
         let text = String::from_utf8_lossy(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes));
         for word in words(&text) {
@@ -843,7 +938,8 @@ impl<'d, C: CoffHeader> Reader<'_, 'd, C> {
                     let arg = arg.ok_or_else(need)?;
                     let (from, to) =
                         arg.split_once('=').ok_or_else(|| self.err(format!("/ALTERNATENAME:{arg} is not from=to")))?;
-                    alternates.push((from.to_owned(), to.to_owned()));
+                    let from = names.push(from).map_err(|e| self.err(e))?;
+                    alternates.push((from, names.push(to).map_err(|e| self.err(e))?));
                 }
                 b"export" => directives.push(self.export(arg.ok_or_else(need)?)?),
                 b"failifmismatch" => {
@@ -1058,5 +1154,5 @@ fn long_import<'a, 'd, C: CoffHeader>(
         }
     };
     let kind = if defined_in_code.contains(&stripped) { SymbolKind::Function } else { SymbolKind::Data };
-    Ok(Parsed::Import(dll, SharedSymbol { name: symbol, version: Some(version), kind, weak: false }))
+    Ok(Parsed::Import(dll, Imported { name: Cow::Owned(symbol), version, kind }))
 }

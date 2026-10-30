@@ -1,13 +1,14 @@
 //! Thin Mach-O dynamic libraries: the install name and the exports, from the export trie (or,
 //! without one, the symbol table's external definitions).
 
+#![forbid(unsafe_code)]
+
 use blaze_codegen::Arch;
 use object::Endianness;
 use object::macho;
 use object::read::macho::{MachHeader as _, Nlist as _, Section as _, Segment as _, SymbolTable};
-use rustc_hash::FxHashSet;
 
-use crate::model::{Shared, SharedSymbol, SymbolKind};
+use crate::model::{Names, Shared, SharedSymbol, SymbolKind};
 
 type Header = macho::MachHeader64<Endianness>;
 
@@ -128,6 +129,7 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
     }
     let name = install_name.ok_or("a dynamic library without LC_ID_DYLIB")?;
 
+    let mut names;
     let symbols = match trie {
         Some((command, offset, size)) => {
             let data = usize::try_from(offset)
@@ -138,15 +140,22 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
                     format!("{command}'s export trie ({size} bytes at {offset:#x}) is outside the file")
                 })?;
             let base = base.ok_or("an export trie, but no segment maps the Mach-O header")?;
-            trie_exports(data, base, &sections).map_err(|what| format!("{command}'s export trie: {what}"))?
+            // The trie shares prefixes, so its names take more bytes than it does: start at
+            // twice its size; past that the arena doubles, a few times per file at most.
+            names = Names::with_capacity(data.len() * 2);
+            trie_exports(data, base, &sections, &mut names)
+                .map_err(|what| format!("{command}'s export trie: {what}"))?
         }
         None => {
             let symtab = symtab.ok_or("neither an export trie nor a symbol table")?;
             let table: SymbolTable<'_, Header, &[u8]> = symtab.symbols(endian, bytes).map_err(err)?;
-            symtab_exports(&table, endian, &sections)?
+            // The string table is in the file (`symbols` checked it) and holds every name, each of
+            // which loses its `_` (or, rarely, gains a `\x01`).
+            names = Names::with_capacity(symtab.strsize.get(endian) as usize);
+            symtab_exports(&table, endian, &sections, &mut names)?
         }
     };
-    Ok(Shared { name, symbols, more: Vec::new(), inputs })
+    Ok(Shared { name, symbols, names, versions: Vec::new(), more: Vec::new(), inputs })
 }
 
 fn set_trie(
@@ -189,22 +198,76 @@ fn cstring<'a>(data: &'a [u8], at: &mut usize) -> Result<&'a [u8], String> {
     Ok(&rest[..len])
 }
 
-/// Every terminal node of the trie, in the order of a walk that takes edges as written.
-fn trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Result<Vec<SharedSymbol>, String> {
+/// The sections by address, to classify an export's address in O(log n).
+struct Sections<'a> {
+    /// In load-command order.
+    all: &'a [Section],
+    /// The non-empty ones by address, when no two overlap (as every linker writes them):
+    /// then at most one holds an address, the one `all`'s first match finds.
+    sorted: Option<Vec<Section>>,
+}
+
+impl<'a> Sections<'a> {
+    fn new(all: &'a [Section]) -> Sections<'a> {
+        let mut sorted: Vec<Section> = all.iter().copied().filter(|it| it.size != 0).collect();
+        sorted.sort_by_key(|it| it.addr);
+        let disjoint = sorted.windows(2).all(|it| it[0].addr.checked_add(it[0].size).is_some_and(|end| end <= it[1].addr));
+        Sections { all, sorted: disjoint.then_some(sorted) }
+    }
+
+    fn find(&self, addr: u64) -> Option<&Section> {
+        match &self.sorted {
+            Some(sorted) => {
+                let after = sorted.partition_point(|it| it.addr <= addr);
+                after.checked_sub(1).map(|it| &sorted[it]).filter(|it| it.contains(addr))
+            }
+            None => self.all.iter().find(|it| it.contains(addr)),
+        }
+    }
+}
+
+/// An edge of the trie still to walk: its label (`len` bytes at `label`), the child it leads
+/// to, and the name's length at its parent. 16 bytes; one stack of them for the whole walk.
+#[derive(Clone, Copy)]
+struct Edge {
+    label: u32,
+    len: u32,
+    child: u32,
+    parent: u32,
+}
+
+const _: () = assert!(size_of::<Edge>() == 16);
+
+/// Every terminal node of the trie, in the order of a walk that takes edges as written (each
+/// node's edges are read before its first child is entered). The name is one buffer cut back
+/// to each edge's parent, the nodes seen are a bit per trie byte, and each export's name is
+/// appended to `names`.
+fn trie_exports(
+    data: &[u8],
+    base: u64,
+    sections: &[Section],
+    names: &mut Names,
+) -> Result<Vec<SharedSymbol>, String> {
+    // `LC_DYLD_INFO`'s and `LC_DYLD_EXPORTS_TRIE`'s sizes are `u32`, so offsets and names fit.
+    debug_assert!(u32::try_from(data.len()).is_ok());
+    let sections = Sections::new(sections);
     let classify = |offset: u64| -> SymbolKind {
-        let addr = base.wrapping_add(offset);
-        match sections.iter().find(|it| it.contains(addr)) {
+        match sections.find(base.wrapping_add(offset)) {
             Some(section) if section.code() => SymbolKind::Function,
             _ => SymbolKind::Data,
         }
     };
     let mut out = Vec::new();
-    let mut visited = FxHashSet::default();
-    let mut stack = vec![(0usize, Vec::new())];
-    while let Some((node, prefix)) = stack.pop() {
-        if !visited.insert(node) {
+    let mut seen = vec![0u64; data.len().div_ceil(64)];
+    let mut name: Vec<u8> = Vec::new();
+    let mut stack: Vec<Edge> = Vec::new();
+    let mut node = 0usize;
+    loop {
+        let (word, bit) = (node / 64, 1u64 << (node % 64));
+        if seen[word] & bit != 0 {
             return Err(format!("node {node:#x} is reached twice (a cycle)"));
         }
+        seen[word] |= bit;
         let mut at = node;
         let terminal = uleb(data, &mut at)?;
         if terminal != 0 {
@@ -216,25 +279,27 @@ fn trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Result<Vec<Shar
             let info = &data[at..end];
             let (kind, weak) = export(info, &classify)
                 .map_err(|what| format!("node {node:#x}: {what}"))?;
-            let name = super::core_name(&prefix)?;
-            out.push(SharedSymbol { name, version: None, kind, weak });
+            out.push(SharedSymbol { name: super::push_core_name(names, &name)?, version: None, kind, weak });
             at = end;
         }
         let count = *data.get(at).ok_or_else(|| format!("node {node:#x} runs past the end"))?;
         at += 1;
-        let mut children = Vec::with_capacity(usize::from(count));
+        let first = stack.len();
         for _ in 0..count {
-            let label = cstring(data, &mut at)?;
+            let label = at;
+            let len = cstring(data, &mut at)?.len();
             let child = uleb(data, &mut at)?;
             let child = usize::try_from(child)
                 .ok()
                 .filter(|&it| it < data.len())
                 .ok_or_else(|| format!("node {node:#x} has a child at {child:#x}, out of range"))?;
-            let mut name = prefix.clone();
-            name.extend_from_slice(label);
-            children.push((child, name));
+            stack.push(Edge { label: label as u32, len: len as u32, child: child as u32, parent: name.len() as u32 });
         }
-        stack.extend(children.into_iter().rev());
+        stack[first..].reverse();
+        let Some(edge) = stack.pop() else { break };
+        name.truncate(edge.parent as usize);
+        name.extend_from_slice(&data[edge.label as usize..][..edge.len as usize]);
+        node = edge.child as usize;
     }
     Ok(out)
 }
@@ -281,20 +346,27 @@ fn export(info: &[u8], classify: &dyn Fn(u64) -> SymbolKind) -> Result<(SymbolKi
     Ok((kind, weak))
 }
 
-/// The symbol table's external definitions, for a library without an export trie.
+/// The symbol table's external definitions, for a library without an export trie, their
+/// names appended to `names`.
 fn symtab_exports(
     table: &SymbolTable<'_, Header, &[u8]>,
     endian: Endianness,
     sections: &[Section],
+    names: &mut Names,
 ) -> Result<Vec<SharedSymbol>, String> {
-    let mut out = Vec::new();
+    let external = |n_type: u8| {
+        n_type & macho::N_STAB == 0
+            && n_type & macho::N_EXT != 0
+            && n_type & macho::N_PEXT == 0
+            && !matches!(n_type & macho::N_TYPE, macho::N_UNDF | macho::N_PBUD)
+    };
+    let mut out = Vec::with_capacity(table.iter().filter(|it| external(it.n_type())).count());
     for nlist in table.iter() {
         let n_type = nlist.n_type();
-        if n_type & macho::N_STAB != 0 || n_type & macho::N_EXT == 0 || n_type & macho::N_PEXT != 0 {
+        if !external(n_type) {
             continue;
         }
         let kind = match n_type & macho::N_TYPE {
-            macho::N_UNDF | macho::N_PBUD => continue,
             macho::N_SECT => {
                 let index = nlist.n_sect();
                 let section = usize::from(index)
@@ -315,7 +387,7 @@ fn symtab_exports(
         };
         let name = nlist.name(endian, table.strings()).map_err(err)?;
         out.push(SharedSymbol {
-            name: super::core_name(name)?,
+            name: super::push_core_name(names, name)?,
             version: None,
             kind,
             weak: nlist.n_desc(endian) & macho::N_WEAK_DEF != 0,
@@ -541,8 +613,49 @@ mod tests {
         out
     }
 
-    fn sym(name: &str, kind: SymbolKind, weak: bool) -> SharedSymbol {
-        SharedSymbol { name: name.to_owned(), version: None, kind, weak }
+    /// An export as the reader held it before names moved into the arena: the form the tests
+    /// and the reference walk compare in.
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct Owned {
+        name: String,
+        kind: SymbolKind,
+        weak: bool,
+    }
+
+    fn sym(name: &str, kind: SymbolKind, weak: bool) -> Owned {
+        Owned { name: name.to_owned(), kind, weak }
+    }
+
+    fn owned(names: &Names, symbols: &[SharedSymbol]) -> Vec<Owned> {
+        symbols
+            .iter()
+            .map(|it| {
+                assert_eq!(it.version, None);
+                Owned { name: names.at(it.name).to_owned(), kind: it.kind, weak: it.weak }
+            })
+            .collect()
+    }
+
+    /// Every export's name is one push of the arena, back to back: the arena holds each name
+    /// once and nothing else, and the library has no versions.
+    fn arena_is_exact(shared: &Shared) {
+        let bytes: usize = shared.symbols.iter().map(|it| shared.names.get(it.name).expect("in the arena").len()).sum();
+        assert_eq!(shared.names.bytes(), bytes);
+        assert!(shared.versions.is_empty());
+    }
+
+    /// `read`'s exports as the reader held them, the arena checked on the way.
+    fn exports(shared: &Shared) -> Vec<Owned> {
+        arena_is_exact(shared);
+        owned(&shared.names, &shared.symbols)
+    }
+
+    /// The new walk, its names resolved.
+    fn walk(data: &[u8], base: u64, sections: &[Section]) -> Result<Vec<Owned>, String> {
+        let mut names = Names::default();
+        let symbols = trie_exports(data, base, sections, &mut names)?;
+        assert_eq!(names.bytes(), symbols.iter().map(|it| names.at(it.name).len()).sum::<usize>());
+        Ok(owned(&names, &symbols))
     }
 
     fn sample_trie() -> Vec<u8> {
@@ -578,7 +691,7 @@ mod tests {
         assert_eq!(shared.inputs, vec!["/usr/lib/libbar.dylib".to_owned()]);
         assert!(shared.more.is_empty());
         assert_eq!(
-            shared.symbols,
+            exports(&shared),
             vec![
                 sym("foo", SymbolKind::Function, false),
                 sym("foobar", SymbolKind::Data, true),
@@ -611,6 +724,7 @@ mod tests {
         );
         let shared = read("libfoo.dylib", &bytes, Arch::X86_64).unwrap();
         assert_eq!(shared.symbols.len(), 7);
+        assert_eq!(exports(&shared), exports(&read("libfoo.dylib", &with_trie(macho::CPU_TYPE_X86_64, &trie), Arch::X86_64).unwrap()));
         assert!(shared.inputs.is_empty());
     }
 
@@ -679,7 +793,7 @@ mod tests {
         let shared = read("libsym.dylib", &bytes, Arch::Aarch64).unwrap();
         assert_eq!(shared.name, "/usr/lib/libsym.dylib");
         assert_eq!(
-            shared.symbols,
+            exports(&shared),
             vec![
                 sym("f", SymbolKind::Function, false),
                 sym("d", SymbolKind::Data, true),
@@ -687,6 +801,152 @@ mod tests {
                 sym("abs", SymbolKind::Data, false),
             ]
         );
+    }
+
+    /// The walk as it was before the one-buffer walk: a stack of owned prefixes, a hash set
+    /// of the nodes seen, the model `trie_exports` is checked against.
+    fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Result<Vec<Owned>, String> {
+        let classify = |offset: u64| -> SymbolKind {
+            let addr = base.wrapping_add(offset);
+            match sections.iter().find(|it| it.contains(addr)) {
+                Some(section) if section.code() => SymbolKind::Function,
+                _ => SymbolKind::Data,
+            }
+        };
+        let mut out = Vec::new();
+        let mut visited = rustc_hash::FxHashSet::default();
+        let mut stack = vec![(0usize, Vec::new())];
+        while let Some((node, prefix)) = stack.pop() {
+            if !visited.insert(node) {
+                return Err(format!("node {node:#x} is reached twice (a cycle)"));
+            }
+            let mut at = node;
+            let terminal = uleb(data, &mut at)?;
+            if terminal != 0 {
+                let end = usize::try_from(terminal)
+                    .ok()
+                    .and_then(|it| at.checked_add(it))
+                    .filter(|&it| it <= data.len())
+                    .ok_or_else(|| format!("node {node:#x}'s export info runs past the end"))?;
+                let (kind, weak) =
+                    export(&data[at..end], &classify).map_err(|what| format!("node {node:#x}: {what}"))?;
+                out.push(Owned { name: super::super::core_name(&prefix)?, kind, weak });
+                at = end;
+            }
+            let count = *data.get(at).ok_or_else(|| format!("node {node:#x} runs past the end"))?;
+            at += 1;
+            let mut children = Vec::with_capacity(usize::from(count));
+            for _ in 0..count {
+                let label = cstring(data, &mut at)?;
+                let child = uleb(data, &mut at)?;
+                let child = usize::try_from(child)
+                    .ok()
+                    .filter(|&it| it < data.len())
+                    .ok_or_else(|| format!("node {node:#x} has a child at {child:#x}, out of range"))?;
+                let mut name = prefix.clone();
+                name.extend_from_slice(label);
+                children.push((child, name));
+            }
+            stack.extend(children.into_iter().rev());
+        }
+        Ok(out)
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const LABELS: [&str; 9] = ["_", "a", "b", "foo", "o", "bar", "_x", "\u{e9}", "longer_label"];
+
+    fn random_info(rng: &mut Rng) -> Vec<u8> {
+        let addr = [0x1010, 0x4010, 0x4100, 0x9999][rng.below(4)];
+        match rng.below(7) {
+            0 => Vec::new(),
+            1 => info(0, &[addr]),
+            2 => info(macho::EXPORT_SYMBOL_FLAGS_WEAK_DEFINITION, &[addr]),
+            3 => info(macho::EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL, &[addr]),
+            4 => info(macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE, &[addr]),
+            5 => info(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER, &[addr, 0x1030]),
+            _ => reexport(0, 1, "_other"),
+        }
+    }
+
+    fn random_node(rng: &mut Rng, depth: usize) -> Node {
+        let children = if depth > 4 { 0 } else { rng.below(4) };
+        Node {
+            terminal: random_info(rng),
+            children: (0..children).map(|_| (LABELS[rng.below(LABELS.len())], random_node(rng, depth + 1))).collect(),
+        }
+    }
+
+    fn test_sections() -> Vec<Section> {
+        let code = macho::S_ATTR_PURE_INSTRUCTIONS | macho::S_ATTR_SOME_INSTRUCTIONS;
+        vec![
+            Section { addr: 0x4000, size: 0x100, flags: 0 },
+            Section { addr: 0x1000, size: 0x100, flags: code },
+            Section { addr: 0x4100, size: 0x30, flags: macho::S_THREAD_LOCAL_VARIABLES },
+            Section { addr: 0x2000, size: 0, flags: code },
+        ]
+    }
+
+    /// The one-buffer walk against the reference over seeded tries, and over the same tries
+    /// with a byte changed or cut off for the error paths.
+    #[test]
+    fn trie_walk_matches_reference() {
+        let mut rng = Rng(0xd1_1b);
+        let sections = test_sections();
+        for round in 0..400 {
+            let mut trie = build_trie(&random_node(&mut rng, 0));
+            match round % 3 {
+                1 => {
+                    let at = rng.below(trie.len());
+                    trie[at] = rng.next() as u8;
+                }
+                2 => trie.truncate(rng.below(trie.len() + 1)),
+                _ => {}
+            }
+            assert_eq!(walk(&trie, 0, &sections), reference_trie_exports(&trie, 0, &sections), "{trie:x?}");
+        }
+        let trie = sample_trie();
+        assert_eq!(walk(&trie, 0, &sections), reference_trie_exports(&trie, 0, &sections));
+    }
+
+    /// Binary search over disjoint sections, and the first match over overlapping ones, against
+    /// the first match in load-command order.
+    #[test]
+    fn sections_find_matches_linear() {
+        let mut rng = Rng(5);
+        for _ in 0..200 {
+            let all: Vec<Section> = (0..rng.below(6))
+                .map(|_| Section {
+                    addr: rng.below(16) as u64 * 0x10,
+                    size: rng.below(3) as u64 * 0x10,
+                    flags: rng.below(2) as u32 * macho::S_ATTR_PURE_INSTRUCTIONS,
+                })
+                .collect();
+            let sections = Sections::new(&all);
+            for addr in (0..0x120).step_by(8) {
+                let linear = all.iter().find(|it| it.contains(addr)).map(|it| (it.addr, it.size, it.flags));
+                let found = sections.find(addr).map(|it| (it.addr, it.size, it.flags));
+                assert_eq!(found, linear, "{addr:#x}");
+            }
+        }
+        let overlapping = [Section { addr: 0x10, size: 0x20, flags: 0 }, Section { addr: 0, size: 0x20, flags: 0 }];
+        assert!(Sections::new(&overlapping).sorted.is_none());
+        let high = [Section { addr: u64::MAX - 1, size: 4, flags: 0 }, Section { addr: 0, size: 4, flags: 0 }];
+        assert!(Sections::new(&high).find(u64::MAX).is_some());
     }
 
     #[test]

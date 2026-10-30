@@ -161,6 +161,11 @@ pub fn tait_hidden_types(
 ) -> ArenaMap<ImplTraitIdx, StoredEarlyBinder<StoredTy>> {
     // Call this first, to not perform redundant work if there are no TAITs.
     let taits_count = SelfAndAssocBounds::type_alias_impl_traits(db, type_alias).len();
+    // An alias without `impl Trait` has no opaque a body could define, so inferring its
+    // defining bodies would find nothing to keep.
+    if taits_count == 0 {
+        return ArenaMap::new();
+    }
 
     let loc = type_alias.loc(db);
     let module = loc.module(db);
@@ -170,10 +175,8 @@ pub fn tait_hidden_types(
     let cause = ObligationCause::dummy();
     let param_env = db.trait_environment(type_alias.into());
 
-    let defining_bodies = tait_defining_bodies(db, type_alias, loc);
-
     let mut result = ArenaMap::with_capacity(taits_count);
-    for defining_body in defining_bodies {
+    for_each_defining_body(db, type_alias, loc, |defining_body| {
         let infer = InferenceResult::of(db, defining_body);
         for (&opaque, hidden_type) in &infer.type_of_opaque {
             let ImplTraitId::TypeAliasImplTrait(opaque_owner, opaque_idx) = opaque.loc(db) else {
@@ -199,7 +202,7 @@ pub fn tait_hidden_types(
                 }
             }
         }
-    }
+    });
 
     _ = ocx.try_evaluate_obligations();
 
@@ -224,35 +227,38 @@ pub fn tait_hidden_types(
     result
 }
 
-fn tait_defining_bodies(
+/// Calls `f` with each body that may define the type alias's opaques, in order.
+fn for_each_defining_body(
     db: &dyn HirDatabase,
     type_alias: TypeAliasId,
     loc: &AssocItemLoc<ast::TypeAlias>,
-) -> Vec<DefWithBodyId> {
-    let from_assoc_items = |assoc_items: &[(Name, AssocItemId)]| {
-        // Associated Type Position Impl Trait.
-        assoc_items
-            .iter()
-            .filter_map(|&(_, assoc_id)| match assoc_id {
-                AssocItemId::FunctionId(it) => Some(it.into()),
-                AssocItemId::ConstId(it) => Some(it.into()),
-                AssocItemId::TypeAliasId(_) => None,
-            })
-            .collect()
-    };
+    mut f: impl FnMut(DefWithBodyId),
+) {
     match loc.container {
         ItemContainerId::ImplId(impl_id)
             if ImplSignature::of(db, impl_id).target_trait.is_some() =>
         {
-            return from_assoc_items(&impl_id.impl_items(db).items);
+            from_assoc_items(&impl_id.impl_items(db).items, &mut f)
         }
         ItemContainerId::TraitId(trait_id) => {
-            return from_assoc_items(&trait_id.trait_items(db).items);
+            from_assoc_items(&trait_id.trait_items(db).items, &mut f)
         }
-        _ => {}
+        _ => defining_functions(db, type_alias).iter().for_each(|&func| f(func.into())),
     }
 
-    defining_functions(db, type_alias).iter().map(|&func| func.into()).collect()
+    // Associated Type Position Impl Trait.
+    fn from_assoc_items(
+        assoc_items: &[(Name, AssocItemId)],
+        f: &mut impl FnMut(DefWithBodyId),
+    ) {
+        for &(_, assoc_id) in assoc_items {
+            match assoc_id {
+                AssocItemId::FunctionId(it) => f(it.into()),
+                AssocItemId::ConstId(it) => f(it.into()),
+                AssocItemId::TypeAliasId(_) => {}
+            }
+        }
+    }
 }
 
 /// The functions of the type alias's crate whose `#[define_opaque(..)]` names it: what its
@@ -303,35 +309,41 @@ fn define_opaque_functions(db: &dyn HirDatabase, krate: Crate) -> Box<[FunctionI
     ) {
         for (_, module) in def_map.modules(db) {
             let scope = module.scope(db);
-            let mut holders: Vec<DefWithBodyId> = Vec::new();
             for def in scope.declarations() {
                 match def {
-                    ModuleDefId::FunctionId(it) => holders.push(it.into()),
-                    ModuleDefId::ConstId(it) => holders.push(it.into()),
-                    ModuleDefId::StaticId(it) => holders.push(it.into()),
+                    ModuleDefId::FunctionId(it) => holder(db, krate, it.into(), local, result),
+                    ModuleDefId::ConstId(it) => holder(db, krate, it.into(), local, result),
+                    ModuleDefId::StaticId(it) => holder(db, krate, it.into(), local, result),
                     _ => {}
                 }
             }
             for impl_id in scope.impls() {
                 for &(_, item) in &impl_id.impl_items(db).items {
                     match item {
-                        AssocItemId::FunctionId(it) => holders.push(it.into()),
-                        AssocItemId::ConstId(it) => holders.push(it.into()),
+                        AssocItemId::FunctionId(it) => holder(db, krate, it.into(), local, result),
+                        AssocItemId::ConstId(it) => holder(db, krate, it.into(), local, result),
                         AssocItemId::TypeAliasId(_) => {}
                     }
                 }
             }
-            for owner in holders {
-                if let DefWithBodyId::FunctionId(func) = owner
-                    && !AttrFlags::define_opaque(db, func).is_empty()
-                {
-                    result.push(func);
-                }
-                if local || may_define_opaque(db, krate, owner) {
-                    for (_, block) in Body::of(db, owner).blocks(db) {
-                        collect(db, krate, block, local, result);
-                    }
-                }
+        }
+    }
+
+    fn holder(
+        db: &dyn HirDatabase,
+        krate: Crate,
+        owner: DefWithBodyId,
+        local: bool,
+        result: &mut Vec<FunctionId>,
+    ) {
+        if let DefWithBodyId::FunctionId(func) = owner
+            && !AttrFlags::define_opaque(db, func).is_empty()
+        {
+            result.push(func);
+        }
+        if local || may_define_opaque(db, krate, owner) {
+            for (_, block) in Body::of(db, owner).blocks(db) {
+                collect(db, krate, block, local, result);
             }
         }
     }

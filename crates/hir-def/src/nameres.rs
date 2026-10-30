@@ -549,8 +549,14 @@ pub(crate) fn crate_local_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> D
 
 #[salsa::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db dyn SourceDatabase, block_id: BlockIdLt<'db>) -> DefMap {
+    // SAFETY: the id was read from `db` in this computation and is used only while `db` is borrowed
+    // (as a key or in this query's result); salsa deletes a tracked struct only when the query that
+    // made it reruns, which reruns this one too.
     let block_id = unsafe { block_id.to_static() };
     let ast_id = block_id.ast_id(db);
+    // SAFETY: the id was read from `db` in this computation and is used only while `db` is borrowed
+    // (as a key or in this query's result); salsa deletes a tracked struct only when the query that
+    // made it reruns, which reruns this one too.
     let module = unsafe { block_id.module(db).to_static() };
 
     let visibility = Visibility::Module(module, VisibilityExplicitness::Implicit);
@@ -590,6 +596,8 @@ impl DefMap {
         block: Option<BlockInfo>,
     ) -> DefMap {
         let mut modules = ModulesMap::new();
+        // SAFETY: the def-map query running now makes this tracked struct and keeps it only in its
+        // own result; salsa deletes it only when this query reruns, which replaces that result.
         let root = unsafe {
             ModuleIdLt::new(
                 db,
@@ -658,6 +666,9 @@ impl DefMap {
 
     /// One module of the `DefMap`; depends on that module only.
     pub fn module<'a>(&'a self, db: &'a dyn SourceDatabase, id: ModuleIdLt<'_>) -> &'a ModuleData {
+        // SAFETY: the id was read from `db` in this computation and is used only while `db` is
+        // borrowed (as a key or in this query's result); salsa deletes a tracked struct only when
+        // the query that made it reruns, which reruns this one too.
         let id = unsafe { id.to_static() };
         let found = match &self.modules {
             ModulesSlot::Building(modules) => modules.get(&id),
@@ -1285,6 +1296,9 @@ impl Index<ModuleIdLt<'_>> for ModulesMap {
 
     fn index(&self, id: ModuleIdLt<'_>) -> &ModuleData {
         self.inner
+            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
+            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
+            // when the query that made it reruns, which reruns this one too.
             .get(&unsafe { id.to_static() })
             .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap: {id:#?}"))
     }

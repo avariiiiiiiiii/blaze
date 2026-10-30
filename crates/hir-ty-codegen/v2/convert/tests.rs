@@ -8,7 +8,7 @@ use super::{DataTarget, Resolve, function};
 use crate::{
     ConstBlob, DataIdentity,
     debuginfo::{LineRow, SlotPlaces},
-    fragment::{Code, DataRequest, FuncRequest, FuncTarget, Requests},
+    fragment::{Code, DataRequest, FuncRequest, FuncTarget, Relocs, Requests},
 };
 
 fn sig() -> Signature {
@@ -24,8 +24,7 @@ fn code(relocs: Vec<ModuleReloc>, lines: Vec<LineRow>) -> Code {
         signature: sig(),
         bytes: vec![0x90; 32],
         align: 16,
-        relocs,
-        elf_types: Vec::new(),
+        relocs: Relocs::of_module(&relocs, &[]).unwrap(),
         unwind: None,
         lines,
         slots: SlotPlaces::default(),
@@ -203,13 +202,38 @@ fn relocation_kinds() {
         (R::Aarch64AddAbsLo12Nc, RelocKind::PageOffset12),
         (R::Aarch64AdrGotPage21, RelocKind::GotPage21),
         (R::Aarch64Ld64GotLo12Nc, RelocKind::GotPageOffset12),
+        (R::ElfX86_64TlsGd, RelocKind::TlsGd32),
+        (R::MachOX86_64Tlv, RelocKind::TlvRel32),
+        (R::MachOAarch64TlsAdrPage21, RelocKind::TlvPage21),
+        (R::MachOAarch64TlsAdrPageOff12, RelocKind::TlvPageOffset12),
+        (R::Aarch64TlsDescAdrPage21, RelocKind::TlsDescPage21),
+        (R::Aarch64TlsDescLd64Lo12, RelocKind::TlsDescLd64Lo12),
+        (R::Aarch64TlsDescAddLo12, RelocKind::TlsDescAddLo12),
+        (R::Aarch64TlsDescCall, RelocKind::TlsDescCall),
+        (R::X86SecRel, RelocKind::SectionRel32),
     ];
     for (cranelift, v2) in kinds {
         assert_eq!(super::reloc_kind(cranelift), Ok(v2));
     }
-    assert!(super::reloc_kind(R::ElfX86_64TlsGd).is_err());
     assert!(super::reloc_kind(R::Abs4).is_err());
     assert_eq!(super::elf_kind(283), Ok(RelocKind::Call26));
-    // R_AARCH64_LDST64_ABS_LO12_NC: scaled, which `PageOffset12` is not.
-    assert!(super::elf_kind(286).is_err());
+    // The linker reads an AArch64 LO12's scale from the instruction.
+    for elf in [277, 278, 284, 285, 286, 299] {
+        assert_eq!(super::elf_kind(elf), Ok(RelocKind::PageOffset12), "ELF type {elf}");
+    }
+    let tls = [
+        (19, RelocKind::TlsGd32),
+        (22, RelocKind::TlsGotTpOff32),
+        (23, RelocKind::TlsOffset),
+        (541, RelocKind::TlsIePage21),
+        (542, RelocKind::TlsIeLo12),
+        (549, RelocKind::TpHi12),
+        (551, RelocKind::TpLo12),
+        (569, RelocKind::TlsDescCall),
+    ];
+    for (elf, v2) in tls {
+        assert_eq!(super::elf_kind(elf), Ok(v2), "ELF type {elf}");
+    }
+    // R_AARCH64_TLSLE_ADD_TPREL_LO12, which checks for overflow that `TpLo12` does not.
+    assert!(super::elf_kind(550).is_err());
 }

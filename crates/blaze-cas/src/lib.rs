@@ -17,6 +17,11 @@
 //!   daemon before they are put. Each tenant has a store; only the read-only base layer of
 //!   public dependencies is shared.
 //! - [`Store`] does no IO: it maps and appends through [`blaze_core::Effect`]s.
+//! - **Reads take no lock and write no shared line** (docs/v2/plan/design/concurrency.md): a
+//!   [`Reader`] reads from any task, through tables the store publishes once and frees at task
+//!   boundaries ([`blaze_reclaim`]). Each worker puts through a [`Writer`] of its own, into a
+//!   segment of its own; the store copies the segments into its packs at a commit and points
+//!   each key at its pack with one swap.
 //!
 //! The layout on disk and why it survives a crash at any point: docs/v2-store.md.
 
@@ -27,29 +32,32 @@ mod crc;
 mod disk;
 mod flags;
 mod index;
+mod read;
 pub mod remote;
+mod segment;
+mod table;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    borrow::Cow,
-    fmt,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-};
+use std::{collections::VecDeque, fmt, sync::Arc};
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::SchemaHash;
 use blaze_ids::{ContentId, Hasher};
-use rustc_hash::FxHashMap;
+use blaze_reclaim::{Grace, Limbo};
+pub use blaze_reclaim::{Guard, enter};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::disk::{
-    CHUNK_DOMAIN, DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head,
-    IndexRef, Loc, NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader,
-    SCHEMA_PREFIX, content_of,
+    DICTIONARY_DOMAIN, DictionaryRef, ExternalRef, Form, HEAD_FILE, Head, IndexRef, Loc,
+    NO_DICTIONARY, PACK_HEADER, PackRef, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of,
 };
-use crate::flags::{Flag, Flags, Row};
-use crate::index::{Shape, Table};
+use crate::flags::{FLAGS, Flag, Row};
+use crate::read::{ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View};
+use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
+pub use crate::segment::Writer;
+use crate::table::{Held, Table};
 
 /// The format of everything in a store's directory. A store of another refuses to open, naming
 /// both; nothing reads it as this one.
@@ -86,6 +94,16 @@ const EXTERNAL_FROM: usize = 96 << 10;
 const INDEX_AFTER: usize = 1 << 16;
 #[cfg(test)]
 const INDEX_AFTER: usize = 48;
+
+/// Slots of a delta table's first level: room for what comes before a new index takes it.
+const DELTA_FIRST: usize = (INDEX_AFTER * 2).next_power_of_two();
+
+/// Values made whole to be read are kept until they are this many bytes, then let go of at
+/// task boundaries.
+#[cfg(not(test))]
+const OWNED_MOST: u64 = 256 << 20;
+#[cfg(test)]
+const OWNED_MOST: u64 = 1 << 20;
 
 /// IO that fails this many times in a row breaks the store.
 const FAILURES_MOST: u32 = 8;
@@ -230,9 +248,29 @@ impl Unit {
     pub const SHARED: Unit = Unit(0);
 }
 
-/// A put's place in line for durability.
+/// A put's place in line for durability: its writer's segment and the put's number in it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Ticket(pub u64);
+
+impl Ticket {
+    /// What a put of a value that is durable already gets.
+    pub const DURABLE: Ticket = Ticket(0);
+
+    const PUT_BITS: u32 = 40;
+
+    pub(crate) fn of(segment: u32, put: u64) -> Ticket {
+        assert!(put < 1 << Ticket::PUT_BITS, "a writer of 2^40 puts");
+        Ticket((u64::from(segment) << Ticket::PUT_BITS) | put)
+    }
+
+    pub(crate) fn parts(self) -> (u32, u64) {
+        ((self.0 >> Ticket::PUT_BITS) as u32, self.0 & ((1 << Ticket::PUT_BITS) - 1))
+    }
+
+    pub(crate) fn segment(self) -> u32 {
+        self.parts().0
+    }
+}
 
 /// A value whose bytes are not what the store recorded.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -295,7 +333,8 @@ pub struct Placed {
 /// One store, as a state machine.
 ///
 /// Only the daemon holds a store, and one daemon a directory (#686): it is the one writer of its
-/// packs and its head, and every build's reads go through its one mapped index.
+/// packs and its head, and every build's reads go through its one mapped index. Readers and
+/// writers on other threads go through [`Store::reader`] and [`Store::writer`], with no lock.
 pub struct Store {
     config: Config,
     /// Its own directory first, then the layers in order.
@@ -304,30 +343,109 @@ pub struct Store {
     broken: Option<Broken>,
     /// IO failures in a row.
     failures: u32,
-    next_ticket: u64,
-    /// Every ticket up to this one is durable.
-    durable: u64,
+    /// What it publishes for readers and writers.
+    shared: Arc<Shared>,
+    /// Its own writer (segment 0): its puts, and the records a settle moves.
+    own: Own,
+    /// Each writer's segment as far as it has been drained, by number.
+    drains: Vec<Drain>,
+    /// What was drained since the last commit began, for the next one.
+    draining: Batch,
+    /// Batches committed whose mappings have not all come, oldest first.
+    pending: VecDeque<Batch>,
+    next_batch: u64,
     commit: Option<Commit>,
     /// A flush asked for while a commit was in flight.
     flush_wanted: bool,
-    /// Counts the records put, so a new index table knows which of them it holds.
-    seq: u64,
-    /// A new index table was written and its mapping has not come.
+    /// A new index table was written and is not yet in use: its mapping has not come, or the
+    /// records it holds are not all mapped yet.
     index_mapping: bool,
+    /// The new index table, mapped, waiting for the batches up to the one named to be mapped.
+    flip: Option<(Arc<Index>, u64)>,
+    /// An index swap left the delta before it in `prev`, where a writer that loaded the view
+    /// before the swap may still put; it is folded in once this grace has passed.
+    migrating: Option<Grace>,
+    /// What it unlinked, freed at task boundaries.
+    limbo: Limbo,
     training: [Training; Kind::ALL.len()],
     problems: Vec<String>,
     fetching: ByHash<Key, Tag>,
     fetched: Vec<(Key, Fetched)>,
     placed: Vec<Placed>,
-    /// Each tier's flag columns: verified, read, tried.
-    flags: Vec<Flags>,
     /// How many times the own tier's read flags have rotated since its rows were last
     /// numbered afresh: a record is unread for two periods only once there have been two.
     periods: u32,
-    /// Values made whole to be read (decompressed, or put together from chunks), by place.
-    owned: Mutex<FxHashMap<u64, (ContentId, Box<[u8]>)>>,
     /// The encodings of each schema whose values it keeps in columns.
-    columns: FxHashMap<SchemaHash, Arc<dyn Columns>>,
+    columns: Arc<FxHashMap<SchemaHash, Arc<dyn Columns>>>,
+}
+
+/// A way to read a store from any thread, with no lock: [`Store::reader`].
+#[derive(Clone)]
+pub struct Reader {
+    shared: Arc<Shared>,
+}
+
+impl Reader {
+    /// The value of `key`, verified, as [`Store::get`] gives it; valid while `guard`'s task runs.
+    pub fn get<'g>(&'g self, guard: &'g Guard, key: &Key) -> Result<Option<Entry<'g>>, Corrupt> {
+        self.look(guard).get(key)
+    }
+
+    /// The value of `key` as [`Store::get_in_place`] gives it.
+    pub fn get_in_place<'g>(&'g self, guard: &'g Guard, key: &Key) -> Result<Option<(Heat, Entry<'g>)>, Corrupt> {
+        self.look(guard).get_in_place(key)
+    }
+
+    /// Whether it has a value of `key`, unverified: for planning, never for use.
+    pub fn has(&self, guard: &Guard, key: &Key) -> bool {
+        self.look(guard).has(key)
+    }
+
+    /// Whether the put that got `ticket` is durable.
+    pub fn durable(&self, ticket: Ticket) -> bool {
+        self.shared.durable(ticket)
+    }
+
+    fn look<'g>(&'g self, guard: &'g Guard) -> Look<'g> {
+        Look::new(&self.shared, Held::task(guard))
+    }
+}
+
+/// A writer's segment, drained up to `at` of `chunk`.
+struct Drain {
+    segment: Arc<Segment>,
+    chunk: ChunkRef,
+    at: u64,
+    /// Puts that ended in the chunks before `chunk`.
+    puts: u64,
+}
+
+impl Drain {
+    fn new(segment: Arc<Segment>) -> Drain {
+        Drain { chunk: segment.first(), segment, at: 0, puts: 0 }
+    }
+}
+
+/// What one commit copied out of the segments.
+#[derive(Default)]
+struct Batch {
+    id: u64,
+    moves: Vec<Move>,
+    /// Chunks drained to their end, with their segment's number, oldest first: freed once the
+    /// moves are made.
+    chunks: Vec<(usize, ChunkRef)>,
+    /// Each segment's puts drained in all, by number.
+    puts: Vec<u64>,
+    /// Mappings still to come before the moves are made.
+    maps: usize,
+}
+
+/// A record copied from a segment into a pack, its key to be pointed at the pack.
+#[derive(Clone, Copy)]
+struct Move {
+    key: Key,
+    from: Seg,
+    to: Loc,
 }
 
 /// What one [`Store::settle`] did.
@@ -347,7 +465,7 @@ pub struct Settled {
 /// Why a record's bytes are wanted, which decides whether its check is remembered and
 /// whether it counts as read.
 #[derive(Clone, Copy)]
-enum Use {
+pub(crate) enum Use {
     Read,
     Check,
     Move,
@@ -378,7 +496,7 @@ enum Op {
     Head { tier: usize },
     Map { tier: usize, file: FileName, what: Mapped },
     Truncate { pack: usize },
-    Append { pack: usize },
+    WritePack { pack: usize },
     Sync { pack: usize },
     WriteExternal { content: ContentId },
     WriteIndex,
@@ -393,11 +511,12 @@ enum Op {
 
 #[derive(Clone, Copy, Debug)]
 enum Mapped {
-    /// `seq` is `None` for the table the store opened with, else the last record it holds.
-    Index { seq: Option<u64> },
-    /// `usable` is how much of the file is the store's as of the commit that asked.
-    Pack { pack: usize, usable: u64 },
-    External { content: ContentId },
+    /// `covers` is `None` for the table the store opened with, else the last batch it holds.
+    Index { covers: Option<u64> },
+    /// `usable` is how much of the file is the store's as of the commit that asked; `batch`,
+    /// the batch of moves waiting for it.
+    Pack { pack: usize, usable: u64, batch: Option<u64> },
+    External { content: ContentId, batch: Option<u64> },
 }
 
 impl Mapped {
@@ -418,14 +537,14 @@ struct Tier {
     opened: bool,
     /// Mappings of the opening still to come.
     waiting: usize,
-    /// The index table's mapping, with what was found when it was checked.
-    index: Option<(Mapping, Shape)>,
+    /// The index table, mapped and checked.
+    index: Option<Arc<Index>>,
     packs: Vec<Pack>,
     /// Records the index table does not hold: read from the packs' tails at opening, or put
     /// since.
-    delta: ByHash<Key, Delta>,
-    /// The row the next record of the delta gets.
-    next_row: u64,
+    delta: Arc<Table<Spot>>,
+    /// The delta an index swap left, while a writer may still put into it.
+    prev: Option<Arc<Table<Spot>>>,
     externals: ByHash<ContentId, External>,
     /// By number, which a compressed record names.
     dictionaries: Vec<Dictionary>,
@@ -444,8 +563,8 @@ impl Tier {
             waiting: 0,
             index: None,
             packs: Vec::new(),
-            delta: ByHash::default(),
-            next_row: 0,
+            delta: Arc::new(Table::new(DELTA_FIRST, FLAGS)),
+            prev: None,
             externals: ByHash::default(),
             dictionaries: Vec::new(),
             units: Vec::new(),
@@ -462,53 +581,28 @@ impl Tier {
         self.file(&disk::index_file(self.head.index.map_or(0, |it| it.slot)))
     }
 
-    fn table(&self) -> Option<Table<'_>> {
-        self.index.as_ref().map(|(mapping, shape)| Table::again(mapping.bytes(), *shape))
-    }
-
-    fn find(&self, key: &Key) -> Option<Result<(Loc, Row), &'static str>> {
-        if let Some(delta) = self.delta.get(key) {
-            return Some(Ok((delta.loc, Row::Delta(delta.row))));
+    /// It as readers see it.
+    fn view(&self) -> TierView {
+        TierView {
+            dir: self.dir.clone(),
+            index_file: self.index_file(),
+            index: self.index.clone(),
+            delta: self.delta.clone(),
+            prev: self.prev.clone(),
+            packs: self
+                .packs
+                .iter()
+                .map(|it| PackView { file: it.file.clone(), mapping: it.mapping.clone(), usable: it.usable })
+                .collect(),
+            externals: self
+                .externals
+                .iter()
+                .map(|(content, it)| (*content, ExternalView { file: it.file.clone(), mapping: it.mapping.clone() }))
+                .collect(),
+            dictionaries: self.dictionaries.iter().map(|it| (it.kind, it.bytes.clone())).collect(),
         }
-        let (slot, loc) = self.table()?.get(key)?;
-        Some(loc.map(|loc| (loc, Row::Slot(slot))))
-    }
-
-    /// Every record it can find, by key, with its row: the delta's and the table's the delta
-    /// does not shadow. A slot that is not whole is in `bad`.
-    fn rows(&self, bad: &mut Vec<(Key, &'static str)>) -> Vec<(Key, Loc, Row)> {
-        let mut out = Vec::with_capacity(self.delta.len());
-        if let Some(table) = self.table() {
-            out.reserve(table.count() as usize);
-            for (slot, key, loc) in table.iter() {
-                match loc {
-                    Ok(_) if self.delta.contains_key(&key) => {}
-                    Ok(loc) => out.push((key, loc, Row::Slot(slot))),
-                    Err(what) => bad.push((key, what)),
-                }
-            }
-        }
-        out.extend(self.delta.iter().map(|(key, it)| (*key, it.loc, Row::Delta(it.row))));
-        out
-    }
-
-    /// A record of the delta: where, the `seq` of its put, and its row.
-    fn note(&mut self, key: Key, loc: Loc, seq: u64) -> Row {
-        let row = self.next_row;
-        self.next_row += 1;
-        self.delta.insert(key, Delta { loc, seq, row });
-        Row::Delta(row)
     }
 }
-
-#[derive(Clone, Copy, Debug)]
-struct Delta {
-    loc: Loc,
-    seq: u64,
-    row: u64,
-}
-
-const _: () = assert!(size_of::<Delta>() == 48);
 
 struct Pack {
     /// Its [`Unit`]'s number.
@@ -517,7 +611,8 @@ struct Pack {
     mapping: Option<Mapping>,
     /// How much of `mapping` is the store's.
     usable: u64,
-    /// The bytes from `usable` to `end`, held until a mapping covers them.
+    /// The bytes from `usable` to `end`, held until a mapping covers them. Only the store
+    /// reads them: a record not yet mapped is read from its segment.
     memory: Vec<u8>,
     /// What the head on disk says is the store's.
     committed: u64,
@@ -562,7 +657,7 @@ struct Dictionary {
 /// The raw values of a cold kind kept so far, to train its dictionary on.
 #[derive(Default)]
 struct Training {
-    samples: Vec<(u32, u64, u64)>,
+    samples: Vec<Vec<u8>>,
     bytes: u64,
     /// No training before this many samples: doubled after one fails.
     after: usize,
@@ -574,11 +669,11 @@ struct Commit {
     /// Each pack written and the end it is written to.
     packs: Vec<(usize, u64)>,
     externals: Vec<ContentId>,
-    /// The slot of the index table it wrote, and the last record that table holds.
+    /// The slot of the index table it wrote, and the last batch that table holds.
     index: Option<(u8, u64)>,
     head: Head,
-    /// The last ticket it makes durable.
-    tickets: u64,
+    /// What it copied out of the segments: durable with it.
+    batch: Batch,
     steps: usize,
     failed: Option<Broken>,
     head_sent: bool,
@@ -651,11 +746,8 @@ impl std::hash::Hasher for Prehashed {
 }
 
 /// A map on BLAKE3 hashes ([`Key`], [`ContentId`]), indexed by the hash itself.
+#[expect(clippy::disallowed_types, reason = "Uses a custom hasher")]
 type ByHash<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Prehashed>>;
-
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// A record's place in the store, as one number.
 fn location(tier: usize, pack: u32, offset: u64) -> u64 {
@@ -676,28 +768,37 @@ impl Store {
     pub fn open(config: Config, effects: &mut Vec<Effect>) -> Store {
         let mut tiers = vec![Tier::new(config.dir.clone())];
         tiers.extend(config.layers.iter().cloned().map(Tier::new));
-        let flags = (0..tiers.len()).map(|_| Flags::default()).collect();
+        let columns = Arc::<FxHashMap<SchemaHash, Arc<dyn Columns>>>::default();
+        let view = View { tiers: tiers.iter().map(Tier::view).collect(), columns: columns.clone() };
+        let shared = Arc::new(Shared::new(view));
+        let own = Own::new(0);
+        shared.add_segment(own.segment().clone());
+        let drains = vec![Drain::new(own.segment().clone())];
         let mut store = Store {
             tags: Tags { base: config.tags, next: 0, ops: FxHashMap::default() },
             config,
             tiers,
             broken: None,
             failures: 0,
-            next_ticket: 1,
-            durable: 0,
+            shared,
+            own,
+            drains,
+            draining: Batch::default(),
+            pending: VecDeque::new(),
+            next_batch: 0,
             commit: None,
             flush_wanted: false,
-            seq: 0,
             index_mapping: false,
+            flip: None,
+            migrating: None,
+            limbo: Limbo::new(),
             training: Default::default(),
             problems: Vec::new(),
             fetching: ByHash::default(),
             fetched: Vec::new(),
             placed: Vec::new(),
-            flags,
             periods: 0,
-            columns: FxHashMap::default(),
-            owned: Mutex::default(),
+            columns,
         };
         for tier in 0..store.tiers.len() {
             let file = store.tiers[tier].file(HEAD_FILE);
@@ -724,37 +825,34 @@ impl Store {
 
     /// Whether the put that got `ticket` is durable.
     pub fn durable(&self, ticket: Ticket) -> bool {
-        ticket.0 <= self.durable
+        self.shared.durable(ticket)
+    }
+
+    /// A reader of it for any thread: what it reads is valid while the task it reads in runs.
+    pub fn reader(&self) -> Reader {
+        Reader { shared: self.shared.clone() }
+    }
+
+    /// A writer of it for one worker: its puts go into a segment of its own, read at once by
+    /// every reader and made durable by the store's next commit.
+    pub fn writer(&mut self) -> Writer {
+        assert!(self.tiers[0].opened, "a writer of a store that is not open");
+        let own = Own::new(self.drains.len() as u32);
+        self.shared.add_segment(own.segment().clone());
+        self.drains.push(Drain::new(own.segment().clone()));
+        Writer { shared: self.shared.clone(), own }
     }
 
     /// The value of `key`, verified; `None` when it has none.
     pub fn get(&self, key: &Key) -> Result<Option<Entry<'_>>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
-        let (tier, loc, row) = found?;
-        self.read(tier, key, loc, row).map(Some)
+        self.look().get(key)
     }
 
     /// The value of `key` as [`Store::get`] gives it, except that a value kept in warm columns
     /// is given in them, read in place ([`Heat::Warm`]), for readers of its schema's warm form.
     /// Checked as `get` checks: decoded and hashed once a record.
     pub fn get_in_place(&self, key: &Key) -> Result<Option<(Heat, Entry<'_>)>, Corrupt> {
-        let Some(found) = self.find(key) else { return Ok(None) };
-        let (tier, loc, row) = found?;
-        if loc.form != Form::Warm {
-            return self.read(tier, key, loc, row).map(|entry| Some((Heat::Hot, entry)));
-        }
-        let (header, payload) = self.record(tier, key, loc)?;
-        if self.flags[tier].get(row, Flag::Verified) {
-            self.was_read(tier, row);
-        } else {
-            self.value(tier, key, loc, row, Use::Read)?;
-        }
-        let warm = payload.get(SCHEMA_PREFIX..).ok_or_else(|| Corrupt {
-            key: *key,
-            pack: self.tiers[tier].packs[loc.pack as usize].file.clone(),
-            what: "its payload is shorter than the schema it starts with".into(),
-        })?;
-        Ok(Some((Heat::Warm, Entry { key: *key, kind: header.kind, content: header.content, bytes: warm })))
+        self.look().get_in_place(key)
     }
 
     /// Gives it the encodings of one schema's values: [`Store::settle`] moves values of the
@@ -762,8 +860,9 @@ impl Store {
     /// Until it is given them, a value of the schema kept in columns is refused, naming it.
     pub fn encode_columns(&mut self, columns: Arc<dyn Columns>) {
         let schema = columns.schema();
-        let old = self.columns.insert(schema, columns);
+        let old = Arc::make_mut(&mut self.columns).insert(schema, columns);
         assert!(old.is_none(), "two encodings of schema {:x}", schema.0);
+        self.publish();
     }
 
     /// The encodings of the schema `bytes` are a buffer of, when it has been given them.
@@ -772,24 +871,15 @@ impl Store {
         self.columns.get(&schema).cloned()
     }
 
-    /// The encodings named by a columns payload, and the encoded bytes after the name.
-    fn columns_in<'s, 'p>(&'s self, payload: &'p [u8]) -> Result<(&'s dyn Columns, &'p [u8]), String> {
-        let Some((schema, rest)) = payload.split_at_checked(SCHEMA_PREFIX) else {
-            return Err("its payload is shorter than the schema it starts with".into());
-        };
-        let schema = SchemaHash(ContentId(schema.try_into().expect("a schema is 32 bytes")));
-        match self.columns.get(&schema) {
-            Some(columns) => Ok((columns.as_ref(), rest)),
-            None => Err(format!(
-                "it is kept in the columns of schema {:x}, and the store was given no encoding of it",
-                schema.0
-            )),
-        }
-    }
-
     /// Whether it has a value of `key`, unverified: for planning, never for use.
     pub fn has(&self, key: &Key) -> bool {
-        self.find(key).is_some()
+        self.look().has(key)
+    }
+
+    /// Its own reads: what they find is valid while it is borrowed, since only its `&mut`
+    /// methods free anything.
+    fn look(&self) -> Look<'_> {
+        Look::new(&self.shared, Held::writer(&*self.shared))
     }
 
     /// The unit of `crate_version` (the content ID of a crate's name, version and source, as
@@ -817,97 +907,29 @@ impl Store {
     pub fn put_in(&mut self, unit: Unit, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
         assert!(unit.0 as usize <= self.tiers[0].units.len(), "{unit:?} is not one this store gave");
         assert!(self.tiers[0].opened, "a put into a store that is not open");
-        self.forget_owned();
-        let content = content_of(&bytes);
-        if let Some((tier, loc)) = self.find_kept(&key) {
-            if let Some(kept) = self.content_at(tier, &key, loc) {
-                if kept != content {
-                    return Err(Mismatch { key, kept, given: content });
-                }
-                return Ok(self.ticket_of_kept(tier, loc));
-            }
-            // A record whose header is corrupt is shadowed by the new one.
+        self.tidy();
+        let look = self.look();
+        let sample = kind.cold()
+            && bytes.len() < cold::LONG_FROM
+            && look.kept(&key).is_none()
+            && look.dictionary_of(kind).is_none()
+            && look.columns_of(&bytes).is_none();
+        if sample {
+            self.sample(kind, &bytes);
         }
-        let ticket = Ticket(self.next_ticket);
-        self.next_ticket += 1;
-        let raw = bytes.len() as u64;
-        if kind == Kind::Output && bytes.len() >= CHUNK_FROM {
-            let mut refs = Vec::new();
-            for range in chunk::chunks(&bytes) {
-                let piece = &bytes[range];
-                let chunk = Key(ContentId::of(CHUNK_DOMAIN, piece));
-                if self.find_kept(&chunk).is_none() {
-                    let len = piece.len() as u64;
-                    match cold::lz4(piece) {
-                        Some(stored) => {
-                            let (kind, content) = (Kind::Output, content_of(piece));
-                            self.append_value(Unit::SHARED, chunk, kind, Form::Lz4, 0, content, len, &stored);
-                        }
-                        None => {
-                            self.append(Unit::SHARED, chunk, Kind::Output, Form::Raw, 0, content_of(piece), piece);
-                        }
-                    }
-                }
-                refs.push((chunk, piece.len() as u64));
-            }
-            let payload = disk::encode_chunks(&refs);
-            self.append_value(unit, key, kind, Form::Chunked, 0, content, raw, &payload);
-        } else if !kind.cold() && kind != Kind::Output && bytes.len() >= EXTERNAL_FROM {
-            let own = &mut self.tiers[0];
-            let file = own.file(&disk::external_file(&content));
-            own.externals.entry(content).or_insert(External {
-                len: raw,
-                file,
-                mapping: None,
-                memory: Some(bytes),
-                committed: false,
-            });
-            self.append_value(unit, key, kind, Form::External, 0, content, raw, &[]);
-        } else if let Some(columns) = self.columns_of(&bytes).filter(|_| kind.cold()) {
-            match cold_columns(columns.as_ref(), &bytes) {
-                Ok(payload) => {
-                    self.append_value(unit, key, kind, Form::ColdColumns, 0, content, raw, &payload);
-                }
-                Err(why) => self.cannot_compress(kind, why),
-            }
-        } else if kind.cold() && bytes.len() >= cold::LONG_FROM {
-            match cold::compress_long(&bytes) {
-                Ok(stored) => {
-                    self.append_value(unit, key, kind, Form::Zstd, NO_DICTIONARY, content, raw, &stored);
-                }
-                Err(why) => self.cannot_compress(kind, why),
-            }
-        } else if kind.cold() {
-            match self.dictionary_of(kind) {
-                Some(number) => {
-                    let dictionary = Arc::clone(
-                        self.tiers[0].dictionaries[number as usize]
-                            .bytes
-                            .as_ref()
-                            .expect("a dictionary of its own is held"),
-                    );
-                    match cold::compress(&dictionary, &bytes) {
-                        Ok(stored) => {
-                            self.append_value(unit, key, kind, Form::Zstd, number, content, raw, &stored);
-                        }
-                        Err(why) => self.cannot_compress(kind, why),
-                    }
-                }
-                None => {
-                    let loc = self.append(unit, key, kind, Form::Raw, 0, content, &bytes);
-                    self.sample(kind, loc);
-                }
-            }
-        } else {
-            self.append(unit, key, kind, Form::Raw, 0, content, &bytes);
+        let put = self.own.put(Look::new(&self.shared, Held::writer(&*self.shared)), unit, key, kind, bytes);
+        if let Some(why) = self.own.segment().failed() {
+            let (dir, why) = (self.tiers[0].dir.clone(), why.to_owned());
+            self.fail(dir, why);
         }
-        Ok(ticket)
+        put
     }
 
-    /// Asks for what puts made since the last flush need to be durable.
+    /// Asks for what puts made since the last flush (by it and by every writer) need to be
+    /// durable.
     pub fn flush(&mut self, effects: &mut Vec<Effect>) {
         assert!(self.tiers[0].opened, "a flush of a store that is not open");
-        self.forget_owned();
+        self.tidy();
         if self.broken.is_some() {
             return;
         }
@@ -929,12 +951,12 @@ impl Store {
     /// bytes a call.
     pub fn settle(&mut self, effects: &mut Vec<Effect>) -> Settled {
         assert!(self.tiers[0].opened, "a settle of a store that is not open");
-        self.forget_owned();
+        self.tidy();
         let mut settled = Settled::default();
         if self.broken.is_some() {
             return settled;
         }
-        if self.commit.is_some() || self.index_mapping {
+        if self.commit.is_some() || self.index_mapping || self.migrating.is_some() {
             settled.more = true;
             return settled;
         }
@@ -946,7 +968,11 @@ impl Store {
             let kind = group[0].1.kind;
             if self.dictionary_of(kind).is_none() {
                 for &(_, loc, _) in group.iter().filter(|(_, loc, _)| loc.form == Form::Raw) {
-                    self.sample(kind, loc);
+                    let pack = &self.tiers[0].packs[loc.pack as usize];
+                    let Some(bytes) = pack.bytes(loc.offset + RECORD_HEADER, loc.raw).map(<[u8]>::to_vec) else {
+                        continue;
+                    };
+                    self.sample(kind, &bytes);
                     if self.dictionary_of(kind).is_some() {
                         break;
                     }
@@ -971,7 +997,7 @@ impl Store {
                     settled.more = true;
                     break 'kinds;
                 }
-                let Some((content, bytes)) = self.movable(key, loc, row) else { continue };
+                let Some((content, bytes)) = self.movable(key, loc) else { continue };
                 spent += loc.raw;
                 if let Some(columns) = self.columns_of(&bytes) {
                     match colder_columns(columns.as_ref(), loc, &bytes) {
@@ -979,10 +1005,10 @@ impl Store {
                             self.replace(key, loc, form, 0, content, &payload);
                             settled.demoted += 1;
                         }
-                        Ok(None) => self.flags[0].set(row, Flag::Tried),
+                        Ok(None) => self.set_flag(row, Flag::Tried),
                         Err(why) => {
                             self.problems.push(format!("{:x} is not moved colder: {why}", key.0));
-                            self.flags[0].set(row, Flag::Tried);
+                            self.set_flag(row, Flag::Tried);
                         }
                     }
                     continue;
@@ -997,7 +1023,7 @@ impl Store {
                     }
                 };
                 if stored.len() as u64 + loc.raw / 8 > loc.raw {
-                    self.flags[0].set(row, Flag::Tried);
+                    self.set_flag(row, Flag::Tried);
                     continue;
                 }
                 let dictionary = if long { NO_DICTIONARY } else { number.unwrap_or(NO_DICTIONARY) };
@@ -1010,7 +1036,7 @@ impl Store {
                 settled.more = true;
                 break;
             }
-            let Some((content, bytes)) = self.movable(key, loc, row) else { continue };
+            let Some((content, bytes)) = self.movable(key, loc) else { continue };
             spent += loc.raw;
             match (loc.kind == Kind::Output).then(|| cold::lz4(&bytes)).flatten() {
                 Some(stored) => self.replace(key, loc, Form::Lz4, 0, content, &stored),
@@ -1031,48 +1057,50 @@ impl Store {
             spent += bytes;
             let unit = Unit(self.tiers[0].packs[at].unit);
             for (header, payload) in live {
-                let loc = self.append_record(unit, header, &payload);
-                self.seq += 1;
-                let row = self.tiers[0].note(header.key, loc, self.seq);
-                self.fit_flags(0);
-                self.flags[0].set(row, Flag::New);
+                self.rehome(unit, header, &payload);
             }
             self.tiers[0].packs[at].retiring = true;
             settled.retired += 1;
         }
-        self.flags[0].rotate();
+        let own = &self.tiers[0];
+        if let Some(index) = &own.index {
+            index.bits.rotate();
+        }
+        own.delta.rotate(Flag::Read as usize, Flag::ReadBefore as usize);
+        own.delta.rotate(Flag::New as usize, Flag::NewBefore as usize);
         self.periods = self.periods.saturating_add(1);
         self.start_commit(effects);
         settled
     }
 
-    /// The own tier's records to move cold and to move hot, as of the period ending now.
+    /// The own tier's records in its packs to move cold and to move hot, as of the period
+    /// ending now. A record still in a segment is new, and stays.
     fn tier_moves(&self) -> (Vec<(Key, Loc, Row)>, Vec<(Key, Loc, Row)>) {
         let own = &self.tiers[0];
         let mut bad = Vec::new();
-        let rows = own.rows(&mut bad);
-        let flags = &self.flags[0];
+        let rows = self.look().rows(0, &mut bad);
         let (mut demote, mut promote) = (Vec::new(), Vec::new());
-        for (key, loc, row) in rows {
+        for (key, found) in rows {
+            let Place::Pack(loc) = found.place else { continue };
             let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
             if pack.removed || pack.retiring || loc.raw < DEMOTE_FROM {
                 continue;
             }
-            let read = flags.get(row, Flag::Read);
-            let before = flags.get(row, Flag::ReadBefore);
+            let flag = |flag| found.at.get(flag);
+            let (read, before) = (flag(Flag::Read), flag(Flag::ReadBefore));
             match loc.form {
                 Form::Raw | Form::Lz4 | Form::Warm
                     if self.periods >= 2
                         && !read
                         && !before
-                        && !flags.get(row, Flag::New)
-                        && !flags.get(row, Flag::NewBefore)
-                        && !flags.get(row, Flag::Tried) =>
+                        && !flag(Flag::New)
+                        && !flag(Flag::NewBefore)
+                        && !flag(Flag::Tried) =>
                 {
-                    demote.push((key, loc, row));
+                    demote.push((key, loc, found.at.row()));
                 }
                 Form::Zstd | Form::Warm | Form::ColdColumns if read && before => {
-                    promote.push((key, loc, row));
+                    promote.push((key, loc, found.at.row()));
                 }
                 _ => {}
             }
@@ -1080,11 +1108,30 @@ impl Store {
         (demote, promote)
     }
 
-    /// The bytes of a record to move, verified, or `None` with why in the problems.
-    fn movable(&mut self, key: Key, loc: Loc, row: Row) -> Option<(ContentId, Vec<u8>)> {
-        let value = self
-            .value(0, &key, loc, row, Use::Move)
-            .map(|(header, bytes)| (header.content, bytes.into_owned()));
+    /// Sets a flag of an own record by its row: rows hold while the store swaps no table, as
+    /// within a settle.
+    fn set_flag(&self, row: Row, flag: Flag) {
+        let own = &self.tiers[0];
+        match row {
+            Row::Slot(slot) => {
+                if let Some(index) = &own.index {
+                    index.bits.set(slot, flag);
+                }
+            }
+            Row::Delta(row) => own.delta.set_flag(row, flag as usize),
+        }
+    }
+
+    /// The bytes of the record of `key` at `loc`, verified, or `None` with why in the problems.
+    fn movable(&mut self, key: Key, loc: Loc) -> Option<(ContentId, Vec<u8>)> {
+        let look = self.look();
+        let value = match look.find(&key) {
+            Some(Ok(found)) if found.place == Place::Pack(loc) => look
+                .value(found, &key, Use::Move)
+                .map(|(header, bytes)| (header.content, bytes.into_owned())),
+            Some(Err(corrupt)) => Err(corrupt),
+            _ => return None,
+        };
         match value {
             Ok(value) => Some(value),
             Err(corrupt) => {
@@ -1094,7 +1141,7 @@ impl Store {
         }
     }
 
-    /// Appends another record of `key` in place of the one at `old`, whose bytes are then dead.
+    /// Writes another record of `key` in place of the one at `old`, whose bytes are then dead.
     fn replace(
         &mut self,
         key: Key,
@@ -1105,8 +1152,38 @@ impl Store {
         payload: &[u8],
     ) {
         let unit = Unit(self.tiers[0].packs[old.pack as usize].unit);
-        self.append_value(unit, key, old.kind, form, dictionary, content, old.raw, payload);
+        let header = RecordHeader {
+            kind: old.kind,
+            form,
+            dictionary,
+            stored: payload.len() as u64,
+            raw: old.raw,
+            key,
+            content,
+        };
+        self.rehome(unit, header, payload);
         self.tiers[0].packs[old.pack as usize].dead += disk::aligned(RECORD_HEADER + old.stored);
+    }
+
+    /// Writes a record the store moves into its own segment and points its key at it. The
+    /// value was durable where it was, so it is as durable now.
+    fn rehome(&mut self, unit: Unit, header: RecordHeader, payload: &[u8]) {
+        let (seg, span) = self.own.write(unit, &header, payload, 0);
+        self.own.keep(span);
+        let spot = Box::new(Spot::new(header.key, header.content, Place::Segment(seg), Ticket::DURABLE));
+        let held = Held::writer(&*self.shared);
+        let delta = &self.tiers[0].delta;
+        let row = match delta.replace(spot) {
+            Ok(old) => {
+                self.limbo.retire(old);
+                delta.get(held, &header.key).expect("a key replaced just now").0
+            }
+            // Only in the index table, or (a slot not whole) put meanwhile by a writer.
+            Err(spot) => match delta.insert(held, spot) {
+                Ok((row, _)) | Err((_, (row, _))) => row,
+            },
+        };
+        delta.set_flag(row, Flag::New as usize);
     }
 
     /// The own packs that are at least half dead bytes, wholly committed, not the one their
@@ -1162,8 +1239,8 @@ impl Store {
                 }
             };
             let here = matches!(
-                own.find(&header.key),
-                Some(Ok((loc, _))) if loc.pack as usize == at && loc.offset == offset
+                self.look().find(&header.key),
+                Some(Ok(found)) if matches!(found.place, Place::Pack(loc) if loc.pack as usize == at && loc.offset == offset)
             );
             if here && header.form != Form::Dictionary {
                 let Some(payload) = pack.bytes(offset + RECORD_HEADER, header.stored) else {
@@ -1193,9 +1270,10 @@ impl Store {
     pub fn verify(&self, kind: Option<Kind>) -> Vec<Corrupt> {
         let mut out = Vec::new();
         let nothing = Key(ContentId::default());
+        let look = self.look();
         for (tier_at, tier) in self.tiers.iter().enumerate() {
-            if let (None, Some(index), Some(mapping)) = (kind, tier.head.index, &tier.index) {
-                let found = crc::crc32c(mapping.bytes());
+            if let (None, Some(index), Some(table)) = (kind, tier.head.index, &tier.index) {
+                let found = crc::crc32c(table.mapping.bytes());
                 if found != index.check {
                     out.push(Corrupt {
                         key: nothing,
@@ -1219,16 +1297,19 @@ impl Store {
                 }
             }
             let mut bad = Vec::new();
-            let mut entries = tier.rows(&mut bad);
+            let mut entries = look.rows(tier_at, &mut bad);
             for (key, what) in bad {
                 out.push(Corrupt { key, pack: tier.index_file(), what: what.into() });
             }
-            entries.sort_unstable_by_key(|(key, loc, _)| (loc.pack, loc.offset, *key));
-            for (key, loc, row) in entries {
-                if kind.is_some_and(|it| it != loc.kind) {
+            entries.sort_unstable_by_key(|(key, found)| match found.place {
+                Place::Pack(loc) => (0, u64::from(loc.pack), loc.offset, *key),
+                Place::Segment(seg) => (1, u64::from(seg.segment), seg.offset, *key),
+            });
+            for (key, found) in entries {
+                if kind.is_some_and(|it| it != found.place.kind()) {
                     continue;
                 }
-                if let Err(corrupt) = self.value(tier_at, &key, loc, row, Use::Check) {
+                if let Err(corrupt) = look.value(found, &key, Use::Check) {
                     out.push(corrupt);
                 }
             }
@@ -1247,19 +1328,21 @@ impl Store {
             !self.tiers.iter().any(|tier| to.is_under(&tier.dir)),
             "{to} is in the store: values are placed outside it"
         );
-        self.forget_owned();
+        self.tidy();
         enum Plan {
             Clone(FileName),
             Write(Vec<u8>),
             Refused(String),
         }
-        let found = self.find(key)?;
-        let plan = match found
-            .and_then(|(tier, loc, row)| Ok((tier, loc, self.read(tier, key, loc, row)?)))
-        {
+        let look = self.look();
+        let found = look.find(key)?;
+        let plan = match found.and_then(|found| Ok((found, look.read(found, key)?))) {
             Err(corrupt) => Plan::Refused(corrupt.to_string()),
-            Ok((tier, loc, entry)) => match self.tiers[tier].externals.get(&entry.content) {
-                Some(external) if loc.form == Form::External && external.committed => {
+            Ok((found, entry)) => match self.tiers[found.tier].externals.get(&entry.content) {
+                Some(external)
+                    if matches!(found.place, Place::Pack(loc) if loc.form == Form::External)
+                        && external.committed =>
+                {
                     Plan::Clone(external.file.clone())
                 }
                 _ => {
@@ -1319,7 +1402,7 @@ impl Store {
     /// Takes a completion of its own: a mapping, an append, a sync. Says which puts are now
     /// durable.
     pub fn complete(&mut self, completion: Completion, effects: &mut Vec<Effect>) -> Vec<Ticket> {
-        self.forget_owned();
+        self.tidy();
         let Some(op) = self.tags.ops.remove(&completion.tag) else { return Vec::new() };
         let done = completion.done;
         match op {
@@ -1377,7 +1460,7 @@ impl Store {
     /// Takes a mapping it asked for. Separate from [`Store::complete`] for drivers that map
     /// by themselves at start.
     pub fn mapped(&mut self, file: FileName, mapping: Mapping) {
-        self.forget_owned();
+        self.tidy();
         let asked = self
             .tags
             .ops
@@ -1393,236 +1476,7 @@ impl Store {
         }
     }
 
-    // Reading.
-
-    fn find(&self, key: &Key) -> Option<Result<(usize, Loc, Row), Corrupt>> {
-        for (at, tier) in self.tiers.iter().enumerate() {
-            match tier.find(key) {
-                Some(Ok((loc, row))) => return Some(Ok((at, loc, row))),
-                Some(Err(what)) => {
-                    return Some(Err(Corrupt {
-                        key: *key,
-                        pack: tier.index_file(),
-                        what: what.into(),
-                    }));
-                }
-                None => {}
-            }
-        }
-        None
-    }
-
-    /// Where a value of `key` is, passing over an index slot that is not whole.
-    fn find_kept(&self, key: &Key) -> Option<(usize, Loc)> {
-        self.tiers
-            .iter()
-            .enumerate()
-            .find_map(|(at, tier)| tier.find(key).and_then(Result::ok).map(|(loc, _)| (at, loc)))
-    }
-
-    /// The content its record says, unverified.
-    fn content_at(&self, tier: usize, key: &Key, loc: Loc) -> Option<ContentId> {
-        let pack = self.tiers[tier].packs.get(loc.pack as usize)?;
-        let header = RecordHeader::decode(pack.bytes(loc.offset, RECORD_HEADER)?).ok()?;
-        (header.key == *key).then_some(header.content)
-    }
-
-    fn read(&self, tier: usize, key: &Key, loc: Loc, row: Row) -> Result<Entry<'_>, Corrupt> {
-        let id = location(tier, loc.pack, loc.offset);
-        if matches!(loc.form, Form::Zstd | Form::Chunked | Form::Lz4 | Form::Warm | Form::ColdColumns) {
-            if let Some((content, bytes)) = self.cached(id) {
-                self.was_read(tier, row);
-                return Ok(Entry { key: *key, kind: loc.kind, content, bytes });
-            }
-        }
-        let (header, bytes) = self.value(tier, key, loc, row, Use::Read)?;
-        let bytes = match bytes {
-            Cow::Borrowed(bytes) => bytes,
-            Cow::Owned(bytes) => self.keep(id, header.content, bytes),
-        };
-        Ok(Entry { key: *key, kind: header.kind, content: header.content, bytes })
-    }
-
-    fn was_read(&self, tier: usize, row: Row) {
-        if tier == 0 {
-            self.flags[0].set(row, Flag::Read);
-        }
-    }
-
-    /// The header of the record at `loc`, checked to be of `key`, and its payload.
-    fn record(&self, tier_at: usize, key: &Key, loc: Loc) -> Result<(RecordHeader, &[u8]), Corrupt> {
-        let tier = &self.tiers[tier_at];
-        let Some(pack) = tier.packs.get(loc.pack as usize) else {
-            return Err(Corrupt {
-                key: *key,
-                pack: tier.index_file(),
-                what: format!("its index names pack {} its head does not have", loc.pack),
-            });
-        };
-        let corrupt = |what: String| Corrupt { key: *key, pack: pack.file.clone(), what };
-        let at = loc.offset;
-        let header = pack
-            .bytes(at, RECORD_HEADER)
-            .ok_or_else(|| corrupt(format!("its record at {at} is outside the pack")))
-            .and_then(|bytes| {
-                RecordHeader::decode(bytes).map_err(|what| corrupt(format!("the record at {at}: {what}")))
-            })?;
-        if header.key != *key {
-            return Err(corrupt(format!("the record at {at} is of another key")));
-        }
-        let payload = pack
-            .bytes(at + RECORD_HEADER, header.stored)
-            .ok_or_else(|| corrupt(format!("the record at {at} runs past the pack")))?;
-        Ok((header, payload))
-    }
-
-    /// The bytes of the record at `loc`, checked against its content hash: once a record for
-    /// reads and moves, every time for [`Use::Check`].
-    fn value<'a>(
-        &'a self,
-        tier_at: usize,
-        key: &Key,
-        loc: Loc,
-        row: Row,
-        why: Use,
-    ) -> Result<(RecordHeader, Cow<'a, [u8]>), Corrupt> {
-        let (header, payload) = self.record(tier_at, key, loc)?;
-        let tier = &self.tiers[tier_at];
-        let pack = &tier.packs[loc.pack as usize];
-        let corrupt = |what: String| Corrupt { key: *key, pack: pack.file.clone(), what };
-        let at = loc.offset;
-        let bytes: Cow<'a, [u8]> = match header.form {
-            Form::Warm | Form::ColdColumns => {
-                let (columns, encoded) = self.columns_in(payload).map_err(corrupt)?;
-                let hot = match header.form {
-                    Form::Warm => columns.hot_from_warm(encoded),
-                    _ => columns.hot_from_cold(encoded),
-                };
-                Cow::Owned(hot.map_err(|why| corrupt(format!("its columns do not decode: {why}")))?)
-            }
-            Form::Raw => Cow::Borrowed(payload),
-            Form::Zstd if header.dictionary == NO_DICTIONARY => {
-                Cow::Owned(cold::decompress_long(payload, header.raw).map_err(corrupt)?)
-            }
-            Form::Lz4 => Cow::Owned(cold::unlz4(payload, header.raw).map_err(corrupt)?),
-            Form::Zstd => {
-                let dictionary = tier.dictionaries.get(header.dictionary as usize).ok_or_else(
-                    || corrupt(format!("it names dictionary {} the store does not have", header.dictionary)),
-                )?;
-                let dictionary =
-                    dictionary.bytes.as_deref().map_err(|why| corrupt(format!("its dictionary {why}")))?;
-                Cow::Owned(cold::decompress(dictionary, payload, header.raw).map_err(corrupt)?)
-            }
-            Form::Chunked => {
-                let chunks = disk::decode_chunks(payload).map_err(|what| corrupt(what.into()))?;
-                let total: u64 = chunks.iter().map(|(_, len)| *len).sum();
-                if total != header.raw {
-                    return Err(corrupt(format!(
-                        "its chunks are {total} bytes, not the {} recorded",
-                        header.raw
-                    )));
-                }
-                let mut whole = Vec::with_capacity(total as usize);
-                for (chunk, len) in chunks {
-                    let (chunk_tier, chunk_loc, chunk_row) = self
-                        .find(&chunk)
-                        .ok_or_else(|| corrupt(format!("its chunk {} is not in the store", chunk.0)))??;
-                    if !matches!(chunk_loc.form, Form::Raw | Form::Lz4 | Form::Zstd) {
-                        return Err(corrupt(format!("its chunk {} is not kept as a chunk", chunk.0)));
-                    }
-                    let (_, piece) = self.value(chunk_tier, &chunk, chunk_loc, chunk_row, why)?;
-                    if piece.len() as u64 != len {
-                        return Err(corrupt(format!("its chunk {} is of another length", chunk.0)));
-                    }
-                    whole.extend_from_slice(&piece);
-                }
-                Cow::Owned(whole)
-            }
-            Form::External => {
-                let Some(external) = tier.externals.get(&header.content) else {
-                    return Err(corrupt(format!("its file {:x} is not in the head", header.content)));
-                };
-                match (&external.mapping, &external.memory) {
-                    (Some(mapping), _) => Cow::Borrowed(mapping.bytes()),
-                    (None, Some(bytes)) => Cow::Borrowed(bytes.as_slice()),
-                    (None, None) => {
-                        return Err(Corrupt {
-                            key: *key,
-                            pack: external.file.clone(),
-                            what: "it was not mapped".into(),
-                        });
-                    }
-                }
-            }
-            Form::Dictionary => {
-                return Err(corrupt(format!("the record at {at} is a dictionary, not a value")));
-            }
-        };
-        if bytes.len() as u64 != header.raw {
-            return Err(corrupt(format!(
-                "it is {} bytes, not the {} recorded",
-                bytes.len(),
-                header.raw
-            )));
-        }
-        let memo = !matches!(why, Use::Check);
-        if !(memo && self.flags[tier_at].get(row, Flag::Verified)) {
-            let found = content_of(&bytes);
-            if found != header.content {
-                return Err(corrupt(format!(
-                    "its bytes hash to {found:x}, not the {:x} recorded",
-                    header.content
-                )));
-            }
-            if memo {
-                self.flags[tier_at].set(row, Flag::Verified);
-            }
-        }
-        if matches!(why, Use::Read) {
-            self.was_read(tier_at, row);
-        }
-        Ok((header, bytes))
-    }
-
-    fn cached(&self, id: u64) -> Option<(ContentId, &[u8])> {
-        let owned = lock(&self.owned);
-        let (content, bytes) = owned.get(&id)?;
-        let bytes: *const [u8] = &**bytes;
-        // SAFETY: as in `keep`.
-        Some((*content, unsafe { &*bytes }))
-    }
-
-    fn keep(&self, id: u64, content: ContentId, bytes: Vec<u8>) -> &[u8] {
-        let mut owned = lock(&self.owned);
-        let (_, held) = owned.entry(id).or_insert_with(|| (content, bytes.into_boxed_slice()));
-        let held: *const [u8] = &**held;
-        // SAFETY: a value in `owned` is never removed, replaced or written while `self` is
-        // borrowed shared: `or_insert_with` keeps the first, and only `forget_owned`, which
-        // takes `&mut self`, clears the map. A rehash moves the box, not the bytes it points
-        // to. So the bytes live as long as the `&self` this borrows.
-        unsafe { &*held }
-    }
-
-    fn forget_owned(&mut self) {
-        self.owned.get_mut().unwrap_or_else(PoisonError::into_inner).clear();
-    }
-
     // Writing.
-
-    fn ticket_of_kept(&mut self, tier: usize, loc: Loc) -> Ticket {
-        let pack = &self.tiers[tier].packs[loc.pack as usize];
-        if tier != 0 || loc.offset < pack.committed {
-            return Ticket(self.durable);
-        }
-        if let Some(commit) = &self.commit {
-            if commit.to(loc.pack as usize).is_some_and(|to| loc.offset < to) {
-                return Ticket(commit.tickets);
-            }
-        }
-        let ticket = Ticket(self.next_ticket);
-        self.next_ticket += 1;
-        ticket
-    }
 
     /// The own pack of `kind` a record of `span` bytes goes into, made if none has room.
     fn writable_pack(&mut self, unit: Unit, span: u64) -> usize {
@@ -1670,45 +1524,210 @@ impl Store {
         }
     }
 
-    fn append_value(
-        &mut self,
-        unit: Unit,
-        key: Key,
-        kind: Kind,
-        form: Form,
-        dictionary: u32,
-        content: ContentId,
-        raw: u64,
-        payload: &[u8],
-    ) -> Loc {
-        let header = RecordHeader {
-            kind,
-            form,
-            dictionary,
-            stored: payload.len() as u64,
-            raw,
-            key,
-            content,
-        };
-        let loc = self.append_record(unit, header, payload);
-        self.seq += 1;
-        let row = self.tiers[0].note(key, loc, self.seq);
-        self.fit_flags(0);
-        self.flags[0].set(row, Flag::New);
-        loc
+    /// Copies what every writer has published since the last drain into the packs, for the
+    /// commit beginning: the keys keep pointing at the segments until the packs are mapped.
+    fn drain(&mut self) {
+        let mut batch = std::mem::take(&mut self.draining);
+        batch.puts.resize(self.drains.len(), 0);
+        for number in 0..self.drains.len() {
+            loop {
+                let at_chunk = self.drains[number].chunk;
+                // SAFETY: the store frees a segment's chunks only behind its drain, in
+                // `finish_batches`, never while it drains.
+                let chunk = unsafe { at_chunk.get() };
+                // Loaded before what it published: once there is a next, that is final.
+                let next = chunk.next();
+                let (bytes, puts) = chunk.published();
+                let mut at = self.drains[number].at;
+                while at < bytes {
+                    at += self.drain_record(number, at_chunk, chunk, at, &mut batch);
+                }
+                let drain = &mut self.drains[number];
+                drain.at = at;
+                match next {
+                    Some(next) => {
+                        batch.chunks.push((number, drain.chunk));
+                        drain.puts += puts;
+                        drain.chunk = next;
+                        drain.at = 0;
+                    }
+                    None => {
+                        batch.puts[number] = drain.puts + puts;
+                        break;
+                    }
+                }
+            }
+        }
+        self.draining = batch;
     }
 
-    fn append(
-        &mut self,
-        unit: Unit,
-        key: Key,
-        kind: Kind,
-        form: Form,
-        dictionary: u32,
-        content: ContentId,
-        bytes: &[u8],
-    ) -> Loc {
-        self.append_value(unit, key, kind, form, dictionary, content, bytes.len() as u64, bytes)
+    /// Copies the record at `at` of a segment's chunk into its pack; gives its length there.
+    fn drain_record(&mut self, number: usize, at_chunk: ChunkRef, chunk: &Chunk, at: u64, batch: &mut Batch) -> u64 {
+        let frame = chunk.bytes(at, FRAME).expect("a published record is in its chunk");
+        let unit = u32::from_le_bytes(*frame.first_chunk().expect("a frame is 16 bytes"));
+        let copy = frame[4] == COPY;
+        let header = chunk
+            .bytes(at + FRAME, RECORD_HEADER)
+            .map(RecordHeader::decode)
+            .expect("a published record is in its chunk")
+            .expect("a writer writes whole records");
+        let payload = chunk
+            .bytes(at + FRAME + RECORD_HEADER, header.stored)
+            .expect("a published record is in its chunk");
+        assert!(unit as usize <= self.tiers[0].units.len(), "a put into unit {unit}, which this store did not give");
+        let loc = if header.form == Form::External && header.stored > 0 {
+            let own = &mut self.tiers[0];
+            let file = own.file(&disk::external_file(&header.content));
+            own.externals.entry(header.content).or_insert_with(|| External {
+                len: header.raw,
+                file,
+                mapping: None,
+                memory: Some(payload.to_vec()),
+                committed: false,
+            });
+            self.append_record(Unit(unit), RecordHeader { stored: 0, ..header }, &[])
+        } else {
+            self.append_record(Unit(unit), header, payload)
+        };
+        if copy {
+            self.tiers[0].packs[loc.pack as usize].dead += header.span();
+        } else {
+            // The store's own puts were sampled as they were put.
+            if number != 0 && header.kind.cold() && header.form == Form::Raw {
+                self.sample(header.kind, payload);
+            }
+            let from = Seg {
+                chunk: at_chunk,
+                segment: number as u32,
+                offset: at + FRAME,
+                kind: header.kind,
+                form: header.form,
+                stored: header.stored,
+                raw: header.raw,
+            };
+            batch.moves.push(Move { key: header.key, from, to: loc });
+        }
+        FRAME + header.span()
+    }
+
+    /// Makes the moves of every batch whose mappings have all come, oldest first: publishes a
+    /// view with the mappings, points each key at its pack, and frees the old spots and the
+    /// chunks drained to their end at task boundaries.
+    fn finish_batches(&mut self) {
+        if self.pending.front().is_some_and(|it| it.maps == 0) {
+            self.publish();
+            let (mut old, mut chunks) = (Vec::new(), Vec::new());
+            while self.pending.front().is_some_and(|it| it.maps == 0) {
+                let batch = self.pending.pop_front().expect("a batch at the front");
+                let held = Held::writer(&*self.shared);
+                let own = &self.tiers[0];
+                for it in &batch.moves {
+                    for table in std::iter::once(&own.delta).chain(&own.prev) {
+                        if let Some((_, spot)) = table.get(held, &it.key)
+                            && spot.place == Place::Segment(it.from)
+                            && let Ok(was) = table.replace(spot.at(Place::Pack(it.to)))
+                        {
+                            old.push(was);
+                        }
+                    }
+                }
+                for &(number, chunk) in &batch.chunks {
+                    chunks.push(self.drains[number].segment.unlink_first(chunk));
+                }
+            }
+            let grace = Grace::start();
+            self.limbo.hold(grace, old);
+            self.limbo.hold(grace, chunks);
+        }
+        self.try_flip();
+    }
+
+    /// Puts the new index table in use once every record it holds is mapped: a new delta takes
+    /// what the table does not hold, and the old one stays readable as `prev` while a writer
+    /// that loaded the view before may still put into it.
+    fn try_flip(&mut self) {
+        let Some((_, covers)) = &self.flip else { return };
+        if self.pending.front().is_some_and(|it| it.id <= *covers) {
+            return;
+        }
+        let (index, _) = self.flip.take().expect("a flip waiting");
+        let held = Held::writer(&*self.shared);
+        let own = &mut self.tiers[0];
+        let fresh: Table<Spot> = Table::new(DELTA_FIRST, FLAGS);
+        let table = index.table();
+        for (_, spot) in own.delta.iter(held) {
+            let indexed = matches!(
+                (spot.place, table.get(&spot.key)),
+                (Place::Pack(loc), Some((_, Ok(at)))) if at == loc
+            );
+            if !indexed {
+                _ = fresh.insert(Held::writer(&fresh), spot.at(spot.place));
+            }
+        }
+        let old = std::mem::replace(&mut own.delta, Arc::new(fresh));
+        own.index = Some(index);
+        let writers = self.drains.len() > 1;
+        if writers {
+            own.prev = Some(old);
+        }
+        self.periods = 0;
+        self.index_mapping = false;
+        self.publish();
+        if writers {
+            self.migrating = Some(Grace::start());
+        }
+    }
+
+    /// Folds the delta an index swap left into the new one once no writer can put into it any
+    /// more: what a writer put there after the swap is copied over.
+    fn end_migration(&mut self) {
+        let Some(grace) = self.migrating else { return };
+        if !grace.passed() {
+            return;
+        }
+        self.migrating = None;
+        let held = Held::writer(&*self.shared);
+        let own = &mut self.tiers[0];
+        let Some(prev) = own.prev.take() else { return };
+        let table = own.index.as_ref().map(|it| it.table());
+        for (_, spot) in prev.iter(held) {
+            match own.delta.get(held, &spot.key) {
+                Some((_, kept)) if kept.content != spot.content => self.problems.push(format!(
+                    "{:x} was put twice across an index swap, as {:x} and {:x}: the first is kept",
+                    spot.key.0, kept.content, spot.content
+                )),
+                Some(_) => {}
+                None => {
+                    let indexed = matches!(
+                        (spot.place, table.as_ref().and_then(|it| it.get(&spot.key))),
+                        (Place::Pack(loc), Some((_, Ok(at)))) if at == loc
+                    );
+                    if !indexed {
+                        _ = own.delta.insert(held, spot.at(spot.place));
+                    }
+                }
+            }
+        }
+        self.publish();
+    }
+
+    /// Publishes what readers see, and frees the view it replaces at task boundaries.
+    fn publish(&mut self) {
+        let view = View { tiers: self.tiers.iter().map(Tier::view).collect(), columns: self.columns.clone() };
+        let old = self.shared.publish(view);
+        self.limbo.retire(old);
+    }
+
+    /// What every `&mut` entry point does first, before it finds anything: frees what passed
+    /// its grace, ends an index swap whose writers are gone, and lets go of the values made
+    /// whole once they hold too much.
+    fn tidy(&mut self) {
+        self.limbo.collect();
+        self.end_migration();
+        if self.shared.owned(Held::writer(&*self.shared)).bytes() > OWNED_MOST {
+            let old = self.shared.fresh_owned();
+            self.limbo.retire(old);
+        }
     }
 
     /// zstd refusing a value is a broken build of it (a missing feature), not something a
@@ -1726,11 +1745,11 @@ impl Store {
             .map(|at| at as u32)
     }
 
-    fn sample(&mut self, kind: Kind, loc: Loc) {
+    fn sample(&mut self, kind: Kind, bytes: &[u8]) {
         let training = &mut self.training[kind.code() as usize];
         if training.samples.len() < cold::SAMPLES_MOST && training.bytes < cold::SAMPLE_BYTES_MOST {
-            training.samples.push((loc.pack, loc.offset, loc.raw));
-            training.bytes += loc.raw;
+            training.samples.push(bytes.to_vec());
+            training.bytes += bytes.len() as u64;
         }
         if training.samples.len() >= cold::TRAIN_VALUES.max(training.after)
             && training.bytes >= cold::TRAIN_BYTES
@@ -1741,14 +1760,8 @@ impl Store {
 
     fn train(&mut self, kind: Kind) {
         let trained = {
-            let own = &self.tiers[0];
-            let samples: Vec<&[u8]> = self.training[kind.code() as usize]
-                .samples
-                .iter()
-                .filter_map(|&(pack, offset, raw)| {
-                    own.packs[pack as usize].bytes(offset + RECORD_HEADER, raw)
-                })
-                .collect();
+            let samples: Vec<&[u8]> =
+                self.training[kind.code() as usize].samples.iter().map(Vec::as_slice).collect();
             cold::train(&samples)
         };
         let training = &mut self.training[kind.code() as usize];
@@ -1771,6 +1784,7 @@ impl Store {
                     offset: loc.offset,
                     bytes: Ok(Arc::new(cold::Prepared::new(dictionary))),
                 });
+                self.publish();
             }
             Err(why) => {
                 training.after = training.samples.len() * 2;
@@ -1781,6 +1795,12 @@ impl Store {
 
     fn start_commit(&mut self, effects: &mut Vec<Effect>) {
         debug_assert!(self.commit.is_none());
+        self.drain();
+        let failed = self.drains.iter().find_map(|it| it.segment.failed().map(str::to_owned));
+        if let Some(why) = failed {
+            let dir = self.tiers[0].dir.clone();
+            return self.fail(dir, why);
+        }
         for pack in &mut self.tiers[0].packs {
             if pack.end > pack.committed {
                 let padded = disk::blocks(pack.end);
@@ -1799,7 +1819,7 @@ impl Store {
         let mut externals: Vec<ContentId> =
             own.externals.iter().filter(|(_, it)| !it.committed).map(|(it, _)| *it).collect();
         externals.sort_unstable();
-        let compact = !self.index_mapping && own.delta.len() >= INDEX_AFTER;
+        let compact = !self.index_mapping && self.migrating.is_none() && own.delta.len() >= INDEX_AFTER;
         if packs.is_empty() && externals.is_empty() && !compact {
             return;
         }
@@ -1834,12 +1854,11 @@ impl Store {
         let mut index = None;
         if compact {
             let mut bad = Vec::new();
-            let rows = own.rows(&mut bad);
+            let mut entries = self.index_entries(&mut bad);
             for (_, what) in bad {
                 self.problems
                     .push(format!("a slot of {} left out of the next index: {what}", own.index_file()));
             }
-            let mut entries: Vec<(Key, Loc)> = rows.into_iter().map(|(key, loc, _)| (key, loc)).collect();
             entries.sort_unstable_by_key(|(key, _)| *key);
             let bytes = index::build_index(&entries);
             let slot = match own.head.index {
@@ -1871,22 +1890,63 @@ impl Store {
             effects.push(Effect::Write { file: external.file.clone(), bytes, tag });
             steps += 1;
         }
+        let mut batch = std::mem::take(&mut self.draining);
+        batch.id = self.next_batch;
+        self.next_batch += 1;
         let index = index.map(|(slot, bytes)| {
             let tag = self.tags.ask(Op::WriteIndex);
             effects.push(Effect::Write { file: own.file(&disk::index_file(slot)), bytes, tag });
             steps += 1;
-            (slot, self.seq)
+            (slot, batch.id)
         });
         self.commit = Some(Commit {
             packs,
             externals,
             index,
             head,
-            tickets: self.next_ticket - 1,
+            batch,
             steps,
             failed: None,
             head_sent: false,
         });
+    }
+
+    /// What the next index table holds: every own record a lookup finds, at its place in a
+    /// pack. A record copied out of its segment into a pack of this commit or an earlier one is
+    /// held at its pack, though its key still points at the segment; one still only in a
+    /// segment is not held, nor does it shadow the record the table held before. A slot that
+    /// is not whole is in `bad`.
+    fn index_entries(&self, bad: &mut Vec<(Key, &'static str)>) -> Vec<(Key, Loc)> {
+        let mut moved: FxHashMap<Key, (Seg, Loc)> = FxHashMap::default();
+        for it in self.pending.iter().chain([&self.draining]).flat_map(|it| &it.moves) {
+            moved.insert(it.key, (it.from, it.to));
+        }
+        let held = Held::writer(&*self.shared);
+        let own = &self.tiers[0];
+        let mut out = Vec::new();
+        let mut taken = FxHashSet::default();
+        for (_, spot) in own.delta.iter(held) {
+            let loc = match spot.place {
+                Place::Pack(loc) => Some(loc),
+                Place::Segment(seg) => {
+                    moved.get(&spot.key).filter(|(from, _)| *from == seg).map(|(_, to)| *to)
+                }
+            };
+            if let Some(loc) = loc {
+                taken.insert(spot.key);
+                out.push((spot.key, loc));
+            }
+        }
+        if let Some(index) = &own.index {
+            for (_, key, loc) in index.table().iter() {
+                match loc {
+                    Ok(_) if taken.contains(&key) => {}
+                    Ok(loc) => out.push((key, loc)),
+                    Err(what) => bad.push((key, what)),
+                }
+            }
+        }
+        out
     }
 
     fn step(&mut self, op: Op, done: Done, effects: &mut Vec<Effect>) -> Vec<Ticket> {
@@ -1894,7 +1954,7 @@ impl Store {
         commit.steps -= 1;
         let own = &self.tiers[0];
         let file_of = |op: &Op| match op {
-            Op::Truncate { pack } | Op::Append { pack } | Op::Sync { pack } => {
+            Op::Truncate { pack } | Op::WritePack { pack } | Op::Sync { pack } => {
                 own.packs[*pack].file.clone()
             }
             Op::WriteExternal { content } => own.externals[content].file.clone(),
@@ -1910,12 +1970,14 @@ impl Store {
                     let bytes = pack.memory
                         [(pack.committed - pack.usable) as usize..(to - pack.usable) as usize]
                         .to_vec();
-                    let tag = self.tags.ask(Op::Append { pack: at });
-                    effects.push(Effect::Append { file: pack.file.clone(), bytes, tag });
+                    // `committed` and `to` are block ends (each commit pads its packs), so on a
+                    // driver that can, a long write skips the page cache.
+                    let tag = self.tags.ask(Op::WritePack { pack: at });
+                    effects.push(Effect::WriteAt { file: pack.file.clone(), at: pack.committed, bytes, tag });
                     commit.steps += 1;
                 }
             }
-            (Op::Append { pack }, Done::Appended) => {
+            (Op::WritePack { pack }, Done::Written) => {
                 if commit.failed.is_none() {
                     let tag = self.tags.ask(Op::Sync { pack: *pack });
                     effects.push(Effect::Sync { file: own.packs[*pack].file.clone(), tag });
@@ -1935,7 +1997,8 @@ impl Store {
             return Vec::new();
         }
         if let Some(failed) = commit.failed.take() {
-            self.commit = None;
+            // What it drained is still in the packs' memory: the next commit writes it again.
+            self.draining = self.commit.take().expect("a commit in flight").batch;
             self.failures += 1;
             if self.failures >= FAILURES_MOST {
                 self.broken.get_or_insert(failed);
@@ -1976,25 +2039,36 @@ impl Store {
             self.remove_pack(at, effects);
         }
         let own = &mut self.tiers[0];
+        let mut batch = commit.batch;
         let mut maps = Vec::new();
         for content in &commit.externals {
             let external = own.externals.get_mut(content).expect("a file the commit wrote");
             external.committed = true;
-            maps.push((external.file.clone(), Mapped::External { content: *content }));
+            maps.push((external.file.clone(), Mapped::External { content: *content, batch: Some(batch.id) }));
         }
         for &(at, to) in &commit.packs {
-            maps.push((own.packs[at].file.clone(), Mapped::Pack { pack: at, usable: to }));
+            maps.push((own.packs[at].file.clone(), Mapped::Pack { pack: at, usable: to, batch: Some(batch.id) }));
         }
-        if let Some((slot, seq)) = commit.index {
-            maps.push((own.file(&disk::index_file(slot)), Mapped::Index { seq: Some(seq) }));
+        batch.maps = maps.len();
+        if let Some((slot, covers)) = commit.index {
+            maps.push((own.file(&disk::index_file(slot)), Mapped::Index { covers: Some(covers) }));
             self.index_mapping = true;
         }
+        let mut tickets = Vec::new();
+        for (number, &puts) in batch.puts.iter().enumerate() {
+            let segment = &self.drains[number].segment;
+            let before = segment.durable();
+            if puts > before {
+                segment.set_durable(puts);
+                tickets.extend((before + 1..=puts).map(|put| Ticket::of(number as u32, put)));
+            }
+        }
+        self.pending.push_back(batch);
         for (file, what) in maps {
             self.ask_map(0, file, what, effects);
         }
+        self.finish_batches();
         self.failures = 0;
-        let tickets = (self.durable + 1..=commit.tickets).map(Ticket).collect();
-        self.durable = self.durable.max(commit.tickets);
         if std::mem::take(&mut self.flush_wanted) {
             self.start_commit(effects);
         }
@@ -2069,17 +2143,17 @@ impl Store {
             .collect();
         let mut maps = Vec::new();
         if let Some(index) = head.index {
-            maps.push((tier.file(&disk::index_file(index.slot)), Mapped::Index { seq: None }));
+            maps.push((tier.file(&disk::index_file(index.slot)), Mapped::Index { covers: None }));
         }
         for (pack, it) in packs.iter().enumerate().filter(|(_, it)| !it.removed) {
-            maps.push((it.file.clone(), Mapped::Pack { pack, usable: it.committed }));
+            maps.push((it.file.clone(), Mapped::Pack { pack, usable: it.committed, batch: None }));
         }
         let removed: Vec<usize> =
             packs.iter().enumerate().filter(|(_, it)| it.removed).map(|(at, _)| at).collect();
         let mut contents: Vec<&ContentId> = externals.keys().collect();
         contents.sort_unstable();
         for content in contents {
-            maps.push((externals[content].file.clone(), Mapped::External { content: *content }));
+            maps.push((externals[content].file.clone(), Mapped::External { content: *content, batch: None }));
         }
         tier.dictionaries = head
             .dictionaries
@@ -2116,7 +2190,7 @@ impl Store {
         let len = mapping.bytes().len() as u64;
         let tier = &mut self.tiers[at];
         match what {
-            Mapped::Pack { pack, usable } => {
+            Mapped::Pack { pack, usable, batch } => {
                 if len < usable {
                     return self.fail(
                         file,
@@ -2129,40 +2203,33 @@ impl Store {
                     pack.usable = usable;
                     pack.mapping = Some(mapping);
                 }
+                self.mapped_for(batch);
             }
-            Mapped::External { content } => {
-                let Some(external) = tier.externals.get_mut(&content) else { return };
-                if len != external.len {
-                    return self.fail(
-                        file,
-                        format!("it is {len} bytes, not the {} its head names", external.len),
-                    );
+            Mapped::External { content, batch } => {
+                if let Some(external) = tier.externals.get_mut(&content) {
+                    if len != external.len {
+                        return self.fail(
+                            file,
+                            format!("it is {len} bytes, not the {} its head names", external.len),
+                        );
+                    }
+                    external.mapping = Some(mapping);
+                    external.memory = None;
                 }
-                external.mapping = Some(mapping);
-                external.memory = None;
+                self.mapped_for(batch);
             }
-            Mapped::Index { seq } => {
-                let shape = match Table::new(mapping.bytes()) {
-                    Ok(table) => table.shape(),
+            Mapped::Index { covers } => {
+                let index = match Index::new(mapping) {
+                    Ok(index) => Arc::new(index),
                     Err(why) => return self.fail(file, why),
                 };
-                match seq {
-                    None => tier.index = Some((mapping, shape)),
-                    Some(seq) => {
-                        tier.index = Some((mapping, shape));
-                        tier.delta.retain(|_, it| it.seq > seq);
-                        let mut rest: Vec<(Key, Delta)> = tier.delta.drain().collect();
-                        rest.sort_unstable_by_key(|(_, it)| it.row);
-                        tier.next_row = 0;
-                        for (key, it) in rest {
-                            tier.note(key, it.loc, it.seq);
-                        }
-                        self.flags[at].forget();
-                        self.periods = 0;
-                        self.index_mapping = false;
+                match covers {
+                    None => tier.index = Some(index),
+                    Some(covers) => {
+                        self.flip = Some((index, covers));
+                        self.try_flip();
                     }
                 }
-                self.fit_flags(at);
             }
         }
         self.failures = 0;
@@ -2178,18 +2245,20 @@ impl Store {
     fn finish_open(&mut self, at: usize) {
         match open_tier(&mut self.tiers[at]) {
             Ok(()) => {
-                self.fit_flags(at);
                 self.tiers[at].opened = true;
+                self.publish();
             }
             Err((file, why)) => self.fail(file, why),
         }
     }
 
-    /// Sizes tier `at`'s flag columns to its rows, so a read sets a flag without growing one.
-    fn fit_flags(&mut self, at: usize) {
-        let tier = &self.tiers[at];
-        let slots = tier.table().map_or(0, |it| it.slots());
-        self.flags[at].fit(slots, tier.next_row);
+    /// One mapping of batch `batch` came: its moves are made once all have.
+    fn mapped_for(&mut self, batch: Option<u64>) {
+        let Some(id) = batch else { return };
+        if let Some(batch) = self.pending.iter_mut().find(|it| it.id == id) {
+            batch.maps -= 1;
+        }
+        self.finish_batches();
     }
 
     fn take_fetched(&mut self, key: Key, done: Done) -> Fetched {
@@ -2223,23 +2292,31 @@ impl Store {
     }
 }
 
+impl Drop for Store {
+    /// A reader or writer may outlive the store and still be in a task that loaded what its
+    /// limbo holds: the limbo goes with what they share, dropped when the last lets go.
+    fn drop(&mut self) {
+        self.shared.orphan(std::mem::take(&mut self.limbo));
+    }
+}
+
 /// Checks what a tier's head names against what was mapped, and reads the records past its
 /// index table and its dictionaries.
 fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
     if let Some(index) = tier.head.index {
         let file = tier.index_file();
-        let (mapping, _) =
-            tier.index.as_ref().ok_or_else(|| (file.clone(), "it was not mapped".to_owned()))?;
-        if mapping.bytes().len() as u64 != index.len {
+        let mapped = tier.index.as_ref().ok_or_else(|| (file.clone(), "it was not mapped".to_owned()))?;
+        let bytes = mapped.mapping.bytes();
+        if bytes.len() as u64 != index.len {
             return Err((file, format!("it is not the {} bytes its head names", index.len)));
         }
-        let check = crc::crc32c(mapping.bytes());
+        let check = crc::crc32c(bytes);
         if check != index.check {
             return Err((file, format!("its CRC-32C is {check:08x}, not the {:08x} its head names", index.check)));
         }
-        let table = Table::new(mapping.bytes()).map_err(|why| (file.clone(), why.to_owned()))?;
-        if table.count() != index.count {
-            return Err((file, format!("it holds {} values, not the {} its head names", table.count(), index.count)));
+        let count = mapped.table().count();
+        if count != index.count {
+            return Err((file, format!("it holds {count} values, not the {} its head names", index.count)));
         }
     }
     let mut found = Vec::new();
@@ -2272,16 +2349,19 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
                     stored: header.stored,
                     raw: header.raw,
                 };
-                found.push((header.key, loc));
+                found.push(Spot::new(header.key, header.content, Place::Pack(loc), Ticket::DURABLE));
             }
             at = end;
         }
     }
-    tier.delta = ByHash::default();
-    tier.next_row = 0;
-    for (key, loc) in found {
-        tier.note(key, loc, 0);
+    let delta: Table<Spot> = Table::new(DELTA_FIRST.max(found.len() * 2), FLAGS);
+    let held = Held::writer(&delta);
+    // A settle writes a key's new record after its old one, so the last of a key is its live
+    // one: inserted first, it keeps the key.
+    for spot in found.into_iter().rev() {
+        _ = delta.insert(held, Box::new(spot));
     }
+    tier.delta = Arc::new(delta);
     let packs = &tier.packs;
     for dictionary in &mut tier.dictionaries {
         let pack = &packs[dictionary.pack as usize];

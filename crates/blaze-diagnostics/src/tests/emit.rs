@@ -82,29 +82,11 @@ fn json(diags: &[Diag], sources: &mut Sources, style: Style) -> String {
     compiletest(&out, true)
 }
 
-/// compiletest's `normalize_output` of the parts these tests meet: JSON's `\n` as newlines,
-/// tabs shown, and the `//~` annotations of the source taken out (`\s*//(\[.*\])?~.*`).
+/// compiletest's `normalize_output` of what rustc wrote, JSON's `\n` first as newlines.
 fn compiletest(out: &str, json: bool) -> String {
-    let out = if json { out.replace("\\n", "\n") } else { out.to_owned() };
-    let out = out.replace('\t', "\\t");
-    let mut normalized = String::with_capacity(out.len());
-    let mut rest = out.as_str();
-    'next: loop {
-        for (at, _) in rest.match_indices("//") {
-            let after = &rest[at + 2..];
-            let line = &after[..after.find('\n').unwrap_or(after.len())];
-            let annotation =
-                line.starts_with('~') || (line.starts_with('[') && line.contains("]~"));
-            if !annotation {
-                continue;
-            }
-            let start = rest[..at].trim_end_matches(char::is_whitespace).len();
-            normalized.push_str(&rest[..start]);
-            rest = &rest[at + 2 + line.len()..];
-            continue 'next;
-        }
-        normalized.push_str(rest);
-        return normalized;
+    match json {
+        true => super::normalized(&out.replace("\\n", "\n")),
+        false => super::normalized(out),
     }
 }
 
@@ -1261,9 +1243,6 @@ fn rendered_is_written_without_its_empty_line() {
 }
 
 #[test]
-fn compiletest_takes_annotations_out() {
-    assert_eq!(compiletest("LL |     x; //~ ERROR e\n   |", false), "LL |     x;\n   |");
-    assert_eq!(compiletest("a //[rev]~^ ERROR e\nb", false), "a\nb");
-    assert_eq!(compiletest("a // not one\n", false), "a // not one\n");
+fn ansi_runs_are_normalized_as_the_ui_test_says() {
     assert_eq!(ansi(r"\u001b[1m\u001b[33mw\u001b[0m: x"), "[ANSI]w[ANSI]: x");
 }

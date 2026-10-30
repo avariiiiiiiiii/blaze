@@ -1,0 +1,32 @@
+[package]
+name = "blaze-fuzzer"
+description = "Coverage-guided fuzzing of every parser of untrusted bytes in blaze: the engine, and one target binary per parser"
+publish = false
+autobins = false
+autotests = false
+autoexamples = false
+autobenches = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+blaze-fuzz.workspace = true
+blaze-api.workspace = true
+blaze-cas.workspace = true
+blaze-codegen.workspace = true
+blaze-ids.workspace = true
+blaze-link.workspace = true
+blaze-macro-wasm.workspace = true
+blaze-protocol.workspace = true
+blaze-vfs.workspace = true
+
+[lints]
+workspace = true

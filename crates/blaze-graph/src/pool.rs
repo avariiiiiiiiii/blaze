@@ -101,6 +101,10 @@ impl Job {
     ///
     /// What `f` borrows outlives its run.
     unsafe fn erase<F: FnOnce() + Send>(f: F) -> Job {
+        /// # Safety
+        ///
+        /// `header` is the header of the `Boxed<F>` that `erase` leaked, and this is its one
+        /// run (it frees the box).
         unsafe fn run<F: FnOnce()>(header: NonNull<Header>) {
             // SAFETY: `header` is the first field of the `Boxed<F>` that `erase` leaked, run once.
             let boxed = unsafe { Box::from_raw(header.cast::<Boxed<F>>().as_ptr()) };
@@ -120,9 +124,12 @@ impl Job {
     }
 
     fn run(self) {
-        // SAFETY: a job is run once (it is moved here), and its header says how.
+        // SAFETY: `self.0` points at the live `Header` of a job not yet run (`erase` leaked it,
+        // or `from_header`'s caller keeps it until it has run), and running moves the `Job`, so
+        // no other `Job` names it; if not, this reads freed memory.
         let run = unsafe { self.0.as_ref().run };
-        // SAFETY: as above.
+        // SAFETY: `run` is the function made for this header's job (`erase`'s, or the one its
+        // `from_header` caller put there), called once, as its own `# Safety` asks.
         unsafe { run(self.0) }
     }
 }
@@ -380,22 +387,23 @@ impl Pool {
         run: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
-        #[cfg(test)]
-        self.shared.critical.fetch_add(1, Ordering::Relaxed);
-        let job = Job::boxed(move || done(catch_unwind(AssertUnwindSafe(run))));
-        let group = self.shared.place(near, true);
-        self.shared.push_to(group, job);
+        self.push_placed(near, true, Job::boxed(move || done(catch_unwind(AssertUnwindSafe(run)))));
     }
 
-    /// How many jobs were given by [`Pool::submit_critical`].
+    /// `job` near `near`, placed as [`Pool::submit_critical`] places a job when `critical`,
+    /// else as [`Pool::submit`] does.
+    pub(crate) fn push_placed(&self, near: Option<u32>, critical: bool, job: Job) {
+        #[cfg(test)]
+        if critical {
+            self.shared.critical.fetch_add(1, Ordering::Relaxed);
+        }
+        self.shared.push_to(self.shared.place(near, critical), job);
+    }
+
+    /// How many jobs were given as critical.
     #[cfg(test)]
     pub(crate) fn critical_submitted(&self) -> usize {
         self.shared.critical.load(Ordering::Relaxed)
-    }
-
-    /// `job` behind what is queued near `near`, as [`Pool::submit`] puts a job.
-    pub(crate) fn push(&self, near: Option<u32>, job: Job) {
-        self.shared.push(near, job);
     }
 
     /// Runs `f`, which may submit jobs that borrow what outlives this call, and returns once
@@ -1381,7 +1389,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn workers_bound_to_their_cpus_run_jobs() {
-        let topology = Topology::detect();
+        let topology = Topology::detect().unwrap();
         let pool = Pool::new(&topology, true).unwrap();
         let (tx, rx) = unbounded::<Option<u32>>();
         for _ in 0..pool.workers() {

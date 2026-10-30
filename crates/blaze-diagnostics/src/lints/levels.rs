@@ -10,6 +10,11 @@
 //! - `builder`: rustc's `LintLevelsBuilder`, as the early lint pass has it and as the HIR
 //!   has it.
 //!
+//! Cost: a node with no attribute costs the walk a check of its kind. A lint found costs one
+//! FxHash of its name to its lint, one of its node (or of each node out to the nearest one
+//! seen), and a scan of the 2-byte lint ids of each set of levels from there out; a level is a
+//! 12-byte `Spec`. Nothing is allocated for a lint unless it is shown.
+//!
 //! Follows rustc's `compiler/rustc_session/src/config.rs` (`get_cmd_lint_options`),
 //! `compiler/rustc_middle/src/lint.rs` (`emit_lint_base`, `explain_lint_level_source`),
 //! `compiler/rustc_lint/src/expect.rs` (`check_expectations`) and
@@ -20,11 +25,13 @@
 mod attrs;
 mod builder;
 
+use std::num::NonZeroU32;
+
 use cfg::CfgOptions;
 use hir::HirFileId;
 use hir_def::unstable_features::UnstableFeatures;
-use rustc_hash::FxHashSet;
-use syntax::ast;
+use rustc_hash::FxHashMap;
+use syntax::{TextRange, ast};
 
 pub use crate::lints::registry::Level;
 
@@ -33,7 +40,7 @@ use crate::{
     cx::Cx,
     lints::{
         CheckCfg,
-        registry::{self, Lint, Store},
+        registry::{self, Lint, LintId, Store},
         syntax::Walk,
     },
     lower::{Found, Phase},
@@ -111,14 +118,35 @@ impl CommandLine {
     }
 }
 
-/// A lint's level where it is: rustc's `LevelSpec`.
-#[derive(Clone, Debug)]
+/// A lint's level where it is: rustc's `LevelSpec`, as 12 bytes. What rustc keeps in it of
+/// where the level came from is in [`Shared::sources`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Spec {
     level: Level,
-    /// For `expect`, and `--force-warn` over one: the expectation a lint at it fulfills, by
-    /// where the name is in the `#[expect]`.
-    expect: Option<Span>,
-    source: Source,
+    /// For `expect`, and `--force-warn` over one: the expectation a lint at it fulfills.
+    expect: Option<ExpectId>,
+    source: SourceId,
+}
+
+const _: () = assert!(size_of::<Spec>() == 12);
+
+/// An `#[expect]`'s name, by where it is: an index into [`Shared::fulfilled`], from 1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ExpectId(NonZeroU32);
+
+impl ExpectId {
+    fn index(self) -> usize {
+        self.0.get() as usize - 1
+    }
+}
+
+/// An index into [`Shared::sources`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SourceId(u32);
+
+impl SourceId {
+    /// rustc's `LintLevelSource::Default`, always the first.
+    pub(super) const DEFAULT: SourceId = SourceId(0);
 }
 
 /// Where a level came from: rustc's `LintLevelSource`.
@@ -127,9 +155,9 @@ pub(super) enum Source {
     Default,
     /// An attribute: the name it sets the level of (the new one of a renamed lint, with its
     /// tool for a tool's), where the name is, and its `reason`.
-    Node { name: String, span: Span, reason: Option<String> },
+    Node { name: Box<str>, span: Span, reason: Option<Box<str>> },
     /// The command line: the name given, with `_` for `-`, and the level of its flag.
-    CommandLine { name: String, level: Level },
+    CommandLine { name: Box<str>, level: Level },
 }
 
 /// What deciding levels in a crate reads and what it finds along the way.
@@ -141,11 +169,47 @@ pub(super) struct Shared<'a, 'b, 'db> {
     cfg: &'a CfgOptions,
     /// The crate's root file.
     root: HirFileId,
-    /// The expectations a lint at their level fulfilled.
-    fulfilled: FxHashSet<Span>,
+    /// The level the first `-D warnings` or the like gives `warnings` on the command line.
+    cmd_warnings: Option<Level>,
+    /// The `warnings` lint.
+    warnings: LintId,
+    /// Where each level came from, by [`SourceId`]: one per name in an attribute or on the
+    /// command line, not one per lint or per node.
+    sources: Vec<Source>,
+    /// Each `#[expect]`'s name by where it is, hashed once as both builders come to it.
+    expects: FxHashMap<(HirFileId, TextRange), ExpectId>,
+    /// Bit `i`: whether a lint at its level fulfilled the expectation of index `i`.
+    fulfilled: Vec<u64>,
 }
 
 impl Shared<'_, '_, '_> {
+    pub(super) fn source(&mut self, source: Source) -> SourceId {
+        let id = SourceId(u32::try_from(self.sources.len()).expect("fewer than 2^32 lint names"));
+        self.sources.push(source);
+        id
+    }
+
+    /// The expectation of the `#[expect]` name at `range` of `file`, the same to both builders.
+    pub(super) fn expect_id(&mut self, file: HirFileId, range: TextRange) -> ExpectId {
+        let next = self.expects.len();
+        *self.expects.entry((file, range)).or_insert_with(|| {
+            let id = u32::try_from(next + 1).ok().and_then(NonZeroU32::new).expect("fewer than 2^32 expectations");
+            ExpectId(id)
+        })
+    }
+
+    fn fulfill(&mut self, id: ExpectId) {
+        let (word, bit) = (id.index() / 64, id.index() % 64);
+        if self.fulfilled.len() <= word {
+            self.fulfilled.resize(word + 1, 0);
+        }
+        self.fulfilled[word] |= 1 << bit;
+    }
+
+    fn is_fulfilled(&self, id: ExpectId) -> bool {
+        let (word, bit) = (id.index() / 64, id.index() % 64);
+        self.fulfilled.get(word).is_some_and(|it| it & (1 << bit) != 0)
+    }
     /// `diag` of `lint` at `spec` as rustc's `emit_lint_base` emits it: nothing when it is
     /// allowed or expected (the expectation fulfilled), or in another crate's macro and not of
     /// a lint given there; else at its level, with the future-incompatible warning and link
@@ -161,8 +225,8 @@ impl Shared<'_, '_, '_> {
             }
             diag.suggestions_disabled = true;
         }
-        if let Some(expect) = &spec.expect {
-            self.fulfilled.insert(expect.clone());
+        if let Some(expect) = spec.expect {
+            self.fulfill(expect);
         }
         if spec.level == Level::Expect {
             return None;
@@ -177,12 +241,12 @@ impl Shared<'_, '_, '_> {
             }
             diag.note(format!("for more information, see {}", future.reason.reference()));
         }
-        self.explain(lint, &spec, &mut diag);
+        self.explain(lint, spec, &mut diag);
         Some(diag)
     }
 
     /// rustc's `explain_lint_level_source`.
-    fn explain(&self, lint: &'static Lint, spec: &Spec, diag: &mut Diag) {
+    fn explain(&self, lint: &'static Lint, spec: Spec, diag: &mut Diag) {
         let level = spec.level;
         if level == Level::Allow {
             return;
@@ -192,7 +256,7 @@ impl Shared<'_, '_, '_> {
         };
         let name = lint.name;
         let shown = level.as_str();
-        match &spec.source {
+        match &self.sources[spec.source.0 as usize] {
             Source::Default => {
                 let note = match self.store.group_of(lint) {
                     Some(group) => format!("`#[{shown}({name})]` (part of `#[{shown}({group})]`) on by default"),
@@ -203,7 +267,7 @@ impl Shared<'_, '_, '_> {
             Source::CommandLine { name: given, level: flagged } => {
                 let flag = flagged.to_cmd_flag();
                 let hyphens = name.replace('_', "-");
-                if given == name {
+                if &**given == name {
                     once(diag, Sublevel::Note, format!("requested on the command line with `{flag} {hyphens}`"));
                 } else {
                     let given = given.replace('_', "-");
@@ -219,16 +283,15 @@ impl Shared<'_, '_, '_> {
             }
             Source::Node { name: attr, span, reason } => {
                 if let Some(reason) = reason {
-                    diag.note(reason.clone());
+                    diag.note(&**reason);
                 }
                 diag.sub(Sublevel::Note, "the lint level is defined here", MultiSpan::of(span.clone()), true);
-                if attr != name {
+                if &**attr != name {
                     once(diag, Sublevel::Note, format!("`#[{shown}({name})]` implied by `#[{shown}({attr})]`"));
                 }
             }
         }
-        let warnings = self.cmd.opts.iter().find(|(it, _)| it == "warnings").map(|(_, it)| *it);
-        if let Some(warnings) = warnings
+        if let Some(warnings) = self.cmd_warnings
             && warnings >= Level::Deny
             && level < warnings
         {
@@ -258,7 +321,11 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         features: UnstableFeatures::query(cx.db, cx.krate.base()),
         cfg: walk.cfg,
         root,
-        fulfilled: FxHashSet::default(),
+        cmd_warnings: cmd.opts.iter().find(|(it, _)| it == "warnings").map(|&(_, it)| it),
+        warnings: LintId::of(registry::lint("warnings").expect("a builtin lint")),
+        sources: vec![Source::Default],
+        expects: FxHashMap::default(),
+        fulfilled: Vec::new(),
     };
     let mut early = Levels::new(&mut sh, true);
     early.walk(&mut sh, &walk);
@@ -268,19 +335,20 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
     let (mut pre, mut during): (Vec<_>, Vec<_>) = std::mem::take(&mut early.emitted).into_iter().partition(|it| it.pre);
     pre.sort_by(|a, b| a.place.cmp(&b.place));
     during.sort_by(|a, b| a.place.cmp(&b.place));
+    let extra = pre.len() + during.len();
     let mut pre = pre.into_iter().map(|it| it.diag);
     let mut during = during.into_iter().map(|it| it.diag);
 
-    let found: Vec<Found> = match aborted {
-        true => found.into_iter().filter(|it| it.phase != Phase::Late).collect(),
-        false => found,
-    };
+    let mut found = found;
+    if aborted {
+        found.retain(|it| it.phase != Phase::Late);
+    }
     let pre_at = found.iter().position(|it| it.phase != Phase::Parse || it.diag.is_lint()).unwrap_or(found.len());
     let early_at = found
         .iter()
         .position(|it| it.phase > Phase::Resolve || (it.phase == Phase::Resolve && it.diag.is_lint()))
         .unwrap_or(found.len());
-    let mut out = Vec::with_capacity(found.len());
+    let mut out = Vec::with_capacity(found.len() + extra + late.expectations.len());
     for (index, it) in found.into_iter().enumerate() {
         if index == pre_at {
             out.extend(pre.by_ref());
@@ -288,18 +356,18 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         if index == early_at {
             out.extend(during.by_ref());
         }
-        let name = it.diag.lint_name().map(str::to_owned);
-        let (Some(at), Some(name)) = (it.lint_at, name) else {
+        let lint = it.diag.lint_name().map(|name| {
+            registry::declared(name).unwrap_or_else(|| panic!("`{name}` is not a lint of rustc's"))
+        });
+        let (Some(at), Some(lint)) = (it.lint_at, lint) else {
             out.push(it.diag);
             continue;
         };
-        let lint = registry::declared(&name)
-            .unwrap_or_else(|| panic!("`{name}` is not a lint of rustc's, given as one at {at:?}"));
         let levels = match it.phase <= Phase::Resolve {
             true => &mut early,
             false => &mut late,
         };
-        let set = levels.set_at(&mut sh, cx.syntax(at));
+        let set = levels.set_of(&mut sh, at);
         let spec = levels.spec(&sh, lint, set);
         out.extend(sh.finish(lint, spec, it.diag));
     }
@@ -316,12 +384,12 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         .collect();
     expectations.sort_by(|a, b| a.0.cmp(&b.0));
     for (_, expectation) in expectations {
-        if sh.fulfilled.contains(&expectation.key) {
+        if sh.is_fulfilled(expectation.id) {
             continue;
         }
         let mut diag = Diag::lint(unfulfilled.name, "this lint expectation is unfulfilled", expectation.key);
         if let Some(reason) = expectation.reason {
-            diag.note(reason);
+            diag.note(reason.into_string());
         }
         if expectation.is_unfulfilled {
             diag.note("the `unfulfilled_lint_expectations` lint can't be expected and will always produce this message");

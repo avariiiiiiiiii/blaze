@@ -8,7 +8,7 @@ use std::{
 };
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
-use blaze_format::{FormatError, Persist, Record, SchemaHash, Writer};
+use blaze_format::{FormatError, Persist, Record, SchemaHash, Slice, Writer};
 use blaze_ids::{ContentId, Fingerprint};
 use blaze_vfs::{View, ViewId};
 
@@ -271,7 +271,7 @@ fn key<Q: Query<Key = String>>(name: &str) -> QueryKey {
 }
 
 fn double(db: &Database, view: ViewId, name: &str) -> u64 {
-    db.get::<Double>(view, &name.to_owned()).expect("double")
+    db.pin().get::<Double>(view, &name.to_owned()).expect("double")
 }
 
 fn mapping(bytes: &[u8]) -> Mapping {
@@ -331,10 +331,10 @@ fn an_equal_fingerprint_stops_the_rerun() {
 fn verification_stops_at_the_first_changed_edge() {
     let (db, tree) = setup();
     let one = view(&db, &tree, &[("a", "b"), ("b", "12")]);
-    assert_eq!(db.get::<Follow>(one, &"a".to_owned()), Ok(3));
+    assert_eq!(db.pin().get::<Follow>(one, &"a".to_owned()), Ok(3));
     // `b` is gone and `a` names `c`: verifying follow(a) must stop at `a`, never ask must(b).
     let two = view(&db, &tree, &[("a", "c"), ("c", "1")]);
-    assert_eq!(db.get::<Follow>(two, &"a".to_owned()), Ok(2));
+    assert_eq!(db.pin().get::<Follow>(two, &"a".to_owned()), Ok(2));
     assert_eq!(runs("must"), 2);
     assert_eq!(runs("follow"), 2);
 }
@@ -374,7 +374,7 @@ fn an_evicted_value_is_made_again_and_cutoff_holds() {
     assert_eq!(runs("double"), 1, "eviction kept len's fingerprint, so double is cut off");
 
     let same = view(&db, &tree, &[("a", "abc")]);
-    assert_eq!(db.get::<Len>(same, &"a".to_owned()), Ok(3));
+    assert_eq!(db.pin().get::<Len>(same, &"a".to_owned()), Ok(3));
     assert_eq!(runs("len"), 3, "the evicted value was made again");
 }
 
@@ -496,7 +496,7 @@ fn a_wait_that_would_close_a_cycle_is_cancelled() {
     let y = view(&db, &tree, &[("a", ""), ("b", "a")]);
     let cancelled = AtomicUsize::new(0);
     let ask = |view: ViewId, name: &str| loop {
-        match db.get::<Chain>(view, &name.to_owned()) {
+        match db.pin().get::<Chain>(view, &name.to_owned()) {
             Ok(n) => break n,
             Err(DbError::Cancelled) => {
                 cancelled.fetch_add(1, Ordering::SeqCst);
@@ -519,30 +519,30 @@ fn configuration_and_directories_are_inputs() {
     let root = tree.root(&[("src/a.rs", b"1".as_slice()), ("src/b.rs", b"2")]);
     let x86 = db.open_with(View { root }, b"x86_64");
     let arm = db.open_with(View { root }, b"aarch64");
-    assert_eq!(db.get::<Conf>(x86, &()), Ok(6));
-    assert_eq!(db.get::<Conf>(arm, &()), Ok(7));
+    assert_eq!(db.pin().get::<Conf>(x86, &()), Ok(6));
+    assert_eq!(db.pin().get::<Conf>(arm, &()), Ok(7));
     let x86_again = db.open_with(View { root }, b"x86_64");
-    assert_eq!(db.get::<Conf>(x86_again, &()), Ok(6));
+    assert_eq!(db.pin().get::<Conf>(x86_again, &()), Ok(6));
     assert_eq!(runs("conf"), 2);
 
-    assert_eq!(db.get::<Names>(x86, &"src".to_owned()), Ok(2));
+    assert_eq!(db.pin().get::<Names>(x86, &"src".to_owned()), Ok(2));
     let edited = view(&db, &tree, &[("src/a.rs", "11"), ("src/b.rs", "2")]);
-    assert_eq!(db.get::<Names>(edited, &"src".to_owned()), Ok(2));
+    assert_eq!(db.pin().get::<Names>(edited, &"src".to_owned()), Ok(2));
     assert_eq!(runs("names"), 1, "an edit inside the directory leaves its names");
     let added = view(&db, &tree, &[("src/a.rs", "1"), ("src/b.rs", "2"), ("src/c.rs", "3")]);
-    assert_eq!(db.get::<Names>(added, &"src".to_owned()), Ok(3));
-    assert_eq!(db.get::<Names>(added, &"nowhere".to_owned()), Ok(u64::MAX));
+    assert_eq!(db.pin().get::<Names>(added, &"src".to_owned()), Ok(3));
+    assert_eq!(db.pin().get::<Names>(added, &"nowhere".to_owned()), Ok(u64::MAX));
 }
 
 #[test]
 fn a_fact_no_query_answers_is_never_reused_unverified() {
     let (db, tree) = setup();
     let one = view(&db, &tree, &[("a", "x")]);
-    assert_eq!(db.get::<ReadsFact>(one, &()), Ok(1));
-    assert_eq!(db.get::<ReadsFact>(one, &()), Ok(1));
+    assert_eq!(db.pin().get::<ReadsFact>(one, &()), Ok(1));
+    assert_eq!(db.pin().get::<ReadsFact>(one, &()), Ok(1));
     assert_eq!(runs("reads fact"), 1, "within a view it is resolved once");
     let two = view(&db, &tree, &[("a", "x")]);
-    assert_eq!(db.get::<ReadsFact>(two, &()), Ok(1));
+    assert_eq!(db.pin().get::<ReadsFact>(two, &()), Ok(1));
     assert_eq!(runs("reads fact"), 2, "another view can't verify the fact, so it runs again");
 }
 
@@ -551,10 +551,10 @@ fn asking_what_is_not_there_is_an_error() {
     let (db, tree) = setup();
     let one = view(&db, &tree, &[("a", "x")]);
     db.close(one);
-    assert_eq!(db.get::<Len>(one, &"a".to_owned()), Err(DbError::NoView(one)));
+    assert_eq!(db.pin().get::<Len>(one, &"a".to_owned()), Err(DbError::NoView(one)));
     let empty = Database::empty();
     let none = empty.open(View { root: ContentId([0; 32]) });
-    assert_eq!(empty.get::<Len>(none, &"a".to_owned()), Err(DbError::Unknown(Len::KIND)));
+    assert_eq!(empty.pin().get::<Len>(none, &"a".to_owned()), Err(DbError::Unknown(Len::KIND)));
 }
 
 #[test]
@@ -631,13 +631,13 @@ fn a_job_pumped_under_a_waiting_query_asks_as_a_task_of_its_own() {
     };
 
     std::thread::scope(|scope| {
-        let holder = scope.spawn(|| db.get::<Hold>(one, &()));
+        let holder = scope.spawn(|| db.pin().get::<Hold>(one, &()));
         wait(&HELD);
 
         let (asked, heard) = mpsc::channel();
         {
             let (db, asked) = (db.clone(), asked.clone());
-            pool.submit(None, move || db.get::<AsksHold>(one, &()), move |it| _ = asked.send(("asks", it)));
+            pool.submit(None, move || db.pin().get::<AsksHold>(one, &()), move |it| _ = asked.send(("asks", it)));
         }
         wait(&ASKING);
         std::thread::sleep(Duration::from_millis(50));
@@ -648,7 +648,7 @@ fn a_job_pumped_under_a_waiting_query_asks_as_a_task_of_its_own() {
                 None,
                 move || {
                     let depth = blaze_graph::pump::depth() as u64;
-                    db.get::<Len>(one, &"a".to_owned()).map(|len| len * 100 + depth)
+                    db.pin().get::<Len>(one, &"a".to_owned()).map(|len| len * 100 + depth)
                 },
                 move |it| _ = asked.send(("len", it)),
             );
@@ -659,7 +659,7 @@ fn a_job_pumped_under_a_waiting_query_asks_as_a_task_of_its_own() {
 
         {
             let (db, asked) = (db.clone(), asked.clone());
-            pool.submit(None, move || db.get::<AsksHold>(one, &()), move |it| _ = asked.send(("again", it)));
+            pool.submit(None, move || db.pin().get::<AsksHold>(one, &()), move |it| _ = asked.send(("again", it)));
         }
         let (name, again) = heard.recv_timeout(Duration::from_secs(60)).expect("not a deadlock");
         assert_eq!(name, "again");
@@ -671,6 +671,118 @@ fn a_job_pumped_under_a_waiting_query_asks_as_a_task_of_its_own() {
         assert_eq!(name, "asks");
         assert_eq!(asks.expect("no panic"), Ok(6));
     });
+}
+
+static COUNTED: AtomicUsize = AtomicUsize::new(0);
+
+/// The length of a file, its runs counted across threads.
+struct Counted;
+
+impl Query for Counted {
+    const KIND: QueryKind = QueryKind(0x2f0a);
+    const NAME: &'static str = "counted";
+    const PRODUCER: ContentId = ContentId([12; 32]);
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        COUNTED.fetch_add(1, Ordering::SeqCst);
+        Ok(Num(cx.file(key)?.map_or(u64::MAX, |file| file.bytes.len() as u64)))
+    }
+}
+
+#[test]
+fn threads_asking_overlapping_keys_run_each_once() {
+    let (mut db, tree) = setup();
+    db.register::<Counted>();
+    let files: Vec<(String, String)> = (0..64).map(|i| (format!("f{i}"), "x".repeat(i))).collect();
+    let files: Vec<(&str, &str)> = files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
+    let one = view(&db, &tree, &files);
+    std::thread::scope(|scope| {
+        for thread in 0..8 {
+            let db = &db;
+            scope.spawn(move || {
+                let pinned = db.pin();
+                for round in 0..64 {
+                    let i = (round * 7 + thread * 5) % 64;
+                    assert_eq!(pinned.get::<Counted>(one, &format!("f{i}")), Ok(i as u64));
+                }
+            });
+        }
+    });
+    assert_eq!(COUNTED.load(Ordering::SeqCst), 64, "each key ran once, whichever thread asked first");
+}
+
+const TEXT: SchemaHash = SchemaHash(ContentId([0x54; 32]));
+
+blaze_format::record! {
+    #[derive(Clone, Copy)]
+    struct TextRoot: 1 {
+        text: Slice<u8>,
+    }
+}
+
+/// Bytes read in place: a value whose [`Persist::Ref`] borrows the database.
+struct Text(String);
+
+impl Persist for Text {
+    const SCHEMA: SchemaHash = TEXT;
+    type Ref<'a> = &'a [u8];
+    fn write(&self, out: &mut Writer) -> u64 {
+        let at = out.push_str(&self.0);
+        let root = out.next::<TextRoot>();
+        out.push(&TextRoot { text: Slice::between(root, at, self.0.len()) })
+    }
+    fn read(buffer: &[u8]) -> Result<&[u8], FormatError> {
+        blaze_format::open_as::<TextRoot>(buffer, TEXT)?.text.follow(buffer)
+    }
+}
+
+/// A file's bytes.
+struct Contents;
+
+impl Query for Contents {
+    const KIND: QueryKind = QueryKind(0x2f0b);
+    const NAME: &'static str = "contents";
+    const PRODUCER: ContentId = ContentId([13; 32]);
+    type Key = String;
+    type Value = Text;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Text, Cancelled> {
+        ran("contents");
+        let file = cx.file(key)?.expect("a file");
+        Ok(Text(String::from_utf8(file.bytes.to_vec()).expect("text")))
+    }
+}
+
+/// Eviction swaps the value out; the buffer a task read stays until the task ends, and is
+/// freed once every task that could hold it has.
+#[test]
+fn a_value_held_by_a_task_outlives_its_eviction() {
+    use std::time::{Duration, Instant};
+
+    let (mut db, tree) = setup();
+    db.register::<Contents>();
+    let one = view(&db, &tree, &[("a", "the bytes of a")]);
+    let pinned = db.pin();
+    let held = pinned.get::<Contents>(one, &"a".to_owned()).expect("contents");
+    assert_eq!(db.evict(&key::<Contents>("a")), 1);
+    assert_eq!(db.memo(&key::<Contents>("a")).map(|memo| memo.value), Some(Stored::Evicted));
+    assert_eq!(db.held(), 1, "the evicted buffer waits for this task");
+    assert_eq!(held, b"the bytes of a");
+    drop(pinned);
+
+    assert_eq!(db.pin().get::<Contents>(one, &"a".to_owned()), Ok(&b"the bytes of a"[..]));
+    assert_eq!(runs("contents"), 2, "made again");
+    let until = Instant::now() + Duration::from_secs(60);
+    while db.held() > 0 {
+        assert!(Instant::now() < until, "the evicted buffer was never freed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[test]

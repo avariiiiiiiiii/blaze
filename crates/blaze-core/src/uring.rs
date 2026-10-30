@@ -1,18 +1,27 @@
 //! A [`Driver`] on Linux's io_uring: one ring, shared with the kernel through memory, that the
-//! thread which polls fills with requests and reaps completions from, with no thread of its own
-//! and one system call for a batch either way. Reads, appends, syncs and timers are the ring's;
-//! a file is opened once and kept open. A truncation, which comes only in recovery, is a call
-//! made where it is submitted.
+//! thread which polls fills with requests and reaps completions from. The kernel takes the
+//! requests on a thread of its own (`IORING_SETUP_SQPOLL`), so a busy driver submits with no
+//! system call; an idle one lets that thread sleep and wakes it when it writes again.
+//!
+//! Reads, appends, syncs, timers, writes at an offset, whole-file writes and renames are the
+//! ring's. A file is opened once, kept open and registered in the ring's table of files, so
+//! requests name its slot. A whole file's write is one linked chain (written, synced, renamed
+//! over the old, its directory synced), and a rename is linked to its directories' syncs. A
+//! large aligned write at an offset bypasses the page cache from a registered buffer. A
+//! truncation, which comes only in recovery, is a call made where it is submitted.
 //!
 //! A spawned process is watched through the ring too: a poll of its pidfd for its exit, its
 //! output pipes read and its input written by the ring. A listen's accepts (one multishot
-//! request for all of them), a connect, and a connection's receives and sends are the ring's;
-//! mapping a file is a call made where it is submitted. A listing, which may take long, runs on
-//! a thread of its own, which wakes the ring through an eventfd it reads.
+//! request for all of them, each connection put straight into the table), a connect, a
+//! connection's receives (one multishot request into a ring of provided buffers) and sends,
+//! and a hangup's shutdown are the ring's; mapping a file is a call made where it is
+//! submitted. A listing, which may take long, runs on a thread of its own, which wakes the ring
+//! through an eventfd it reads.
 //!
-//! The ring is set up with the system calls themselves (`io_uring_setup`, `io_uring_enter` and
-//! three `mmap`s), the layouts as `linux/io_uring.h` has them, for one issuing thread whose
-//! waits run the kernel's completion work (`IORING_SETUP_DEFER_TASKRUN`). Kernel 6.1 or later.
+//! The ring is set up with the system calls themselves (`io_uring_setup`, `io_uring_enter`,
+//! `io_uring_register` and `mmap`), the layouts as `linux/io_uring.h` has them. Linux 6.0 or
+//! later: each feature's absence is an error naming it and the kernel that has it. Before 6.1
+//! `statx` says no alignment for writes that bypass the cache, so none does.
 
 use std::{
     cell::RefCell,
@@ -88,6 +97,9 @@ const CQE_F_BUFFER: u32 = 1 << 0;
 /// In a completion's flags: the request goes on and will complete again.
 const CQE_F_MORE: u32 = 1 << 1;
 const CQE_BUFFER_SHIFT: u32 = 16;
+/// In a cancel's flags: every request it matches, not the first, and every request at all.
+const ASYNC_CANCEL_ALL: u32 = 1 << 0;
+const ASYNC_CANCEL_ANY: u32 = 1 << 2;
 
 const REGISTER_FILES2: libc::c_uint = 13;
 const REGISTER_FILES_UPDATE2: libc::c_uint = 14;
@@ -102,8 +114,8 @@ const TABLE: u32 = 1 << 16;
 /// Registered buffers for writes that bypass the page cache, each a piece of such a write.
 const DIRECT_BUFFERS: u16 = 4;
 const DIRECT_PIECE: usize = 1 << 20;
-/// A write at an offset of at least this many bytes, aligned to its file system's blocks,
-/// bypasses the page cache (`O_DIRECT`).
+/// A `WriteAt` of at least this many bytes, its offset and length aligned to its file
+/// system's blocks, bypasses the page cache (`O_DIRECT`).
 const DIRECT_LEAST: usize = 1 << 20;
 /// The provided buffers a connection's receives take from, and the size of each.
 const RECV_BUFFERS: u16 = 64;
@@ -286,7 +298,8 @@ fn register<T>(ring: RawFd, opcode: libc::c_uint, arg: *const T, nr: libc::c_uin
 
 /// An anonymous mapping of `len` bytes, page-aligned, unmapped when dropped.
 fn anonymous(len: usize) -> io::Result<Map> {
-    // SAFETY: a new private mapping of no file.
+    // SAFETY: a new private anonymous mapping: no file, no address hint, so it overlaps nothing
+    // the program holds; the result is checked against `MAP_FAILED` below.
     let at = unsafe {
         libc::mmap(
             ptr::null_mut(),
@@ -317,7 +330,7 @@ struct Table {
 impl Table {
     fn new(ring: &Rc<OwnedFd>) -> io::Result<Rc<Table>> {
         let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-        // SAFETY: a limit to write.
+        // SAFETY: `&mut limit` is a live, aligned `rlimit` the call writes and does not keep.
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -469,21 +482,31 @@ impl Provided {
 
     /// The bytes the kernel put in buffer `bid`.
     fn bytes(&self, bid: u16, len: usize) -> &[u8] {
-        // SAFETY: the buffer the completion names, written by the kernel and not given back.
-        unsafe { std::slice::from_raw_parts(self.buffers.at.add(bid as usize * RECV_BUFFER), len.min(RECV_BUFFER)) }
+        // SAFETY: `bid` is a buffer id the kernel took from this group, below `RECV_BUFFERS`, so
+        // the offset is within `buffers` (`RECV_BUFFERS * RECV_BUFFER` bytes); if not, the
+        // pointer leaves the mapping.
+        let at = unsafe { self.buffers.at.add(bid as usize * RECV_BUFFER) };
+        // SAFETY: `at` starts buffer `bid`, `RECV_BUFFER` bytes the kernel wrote for this
+        // completion and does not touch again until `give(bid)`, which needs `&mut self` and so
+        // cannot run while the slice borrows `self`; if not, the slice aliases a kernel write.
+        unsafe { std::slice::from_raw_parts(at, len.min(RECV_BUFFER)) }
     }
 
     /// Buffer `bid` the kernel's again.
     fn give(&mut self, bid: u16) {
         let mask = RECV_BUFFERS - 1;
         let entry: *mut ProvidedBuf = self.ring.at((self.tail & mask) as u32 * size_of::<ProvidedBuf>() as u32);
-        // SAFETY: an entry of the ring past the tail, which the kernel does not read until the
-        // tail moves past it; the buffer is the driver's until then.
-        unsafe {
-            (*entry).addr = self.buffers.at.add(bid as usize * RECV_BUFFER) as u64;
-            (*entry).len = RECV_BUFFER as u32;
-            (*entry).bid = bid;
-        }
+        // SAFETY: `bid` is below `RECV_BUFFERS` (from `new`'s loop or a completion of this
+        // group), so the offset is within `buffers`.
+        let addr = unsafe { self.buffers.at.add(bid as usize * RECV_BUFFER) } as u64;
+        // SAFETY: `entry` is slot `tail & mask` of the ring `new` mapped for `RECV_BUFFERS`
+        // entries; the kernel does not read it until the tail store below moves past it; if it
+        // did, it would read a half-written entry.
+        unsafe { (*entry).addr = addr };
+        // SAFETY: as above.
+        unsafe { (*entry).len = RECV_BUFFER as u32 };
+        // SAFETY: as above.
+        unsafe { (*entry).bid = bid };
         self.tail = self.tail.wrapping_add(1);
         // SAFETY: the tail is the `resv` of the first entry, the kernel's to read.
         unsafe { (*self.ring.at::<AtomicU16>(14)).store(self.tail, Ordering::Release) };
@@ -544,7 +567,10 @@ impl Map {
     /// The `T` at `offset`, which the kernel's offsets say is one.
     fn at<T>(&self, offset: u32) -> *mut T {
         debug_assert!(offset as usize + size_of::<T>() <= self.len);
-        // SAFETY: within the mapping, as the debug assertion checks.
+        // SAFETY: every caller passes an offset the kernel gave in `io_uring_params` (`sq_off`,
+        // `cq_off`, 0 for the SQE array) or the fixed `resv` offset 14 of a provided-buffer ring,
+        // each within the `len` bytes mapped (the debug assertion checks it); if not, the pointer
+        // leaves the mapping.
         unsafe { self.at.add(offset as usize).cast() }
     }
 }
@@ -631,12 +657,18 @@ impl Ring {
         let (sq, cq) = (&params.sq_off, &params.cq_off);
         let array: *mut u32 = rings.at(sq.array);
         for index in 0..params.sq_entries {
-            // SAFETY: the array has `sq_entries` slots; each names the request of its index.
-            unsafe { array.add(index as usize).write(index) };
+            // SAFETY: `index < sq_entries` and the kernel's array at `sq.array` has
+            // `sq_entries` `u32` slots in `rings`.
+            let slot = unsafe { array.add(index as usize) };
+            // SAFETY: `slot` is in the mapping, aligned (the kernel's offset) and not yet read by
+            // the kernel, which waits for the first tail move.
+            unsafe { slot.write(index) };
         }
-        // SAFETY: the kernel put these counters at these offsets of the mapping.
-        let (sq_mask, cq_mask) =
-            unsafe { (*rings.at::<u32>(sq.ring_mask), *rings.at::<u32>(cq.ring_mask)) };
+        // SAFETY: the kernel put the submission ring's mask, a `u32` it never changes, at
+        // `sq.ring_mask` of `rings`.
+        let sq_mask = unsafe { *rings.at::<u32>(sq.ring_mask) };
+        // SAFETY: as above, the completion ring's mask at `cq.ring_mask`.
+        let cq_mask = unsafe { *rings.at::<u32>(cq.ring_mask) };
         Ok(Ring {
             sq_head: rings.at(sq.head),
             sq_tail: rings.at(sq.tail),
@@ -657,17 +689,22 @@ impl Ring {
     /// Writes `sqes` to the ring one after another, all or, where there is no room for all,
     /// none (a linked chain is links of requests next to each other).
     fn push(&mut self, sqes: &[Sqe]) -> bool {
-        // SAFETY: the counters are the kernel's and this thread's; the kernel moves the head.
-        let (head, tail) = unsafe {
-            ((*self.sq_head).load(Ordering::Acquire), (*self.sq_tail).load(Ordering::Relaxed))
-        };
+        // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while `self`
+        // lives; the kernel moves it, so only atomic loads.
+        let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
+        // SAFETY: `sq_tail` as above; only this thread writes it.
+        let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
         if tail.wrapping_sub(head) as usize + sqes.len() > self.sq_entries as usize {
             return false;
         }
         for (n, sqe) in sqes.iter().enumerate() {
             let at = tail.wrapping_add(n as u32) & self.sq_mask;
-            // SAFETY: the slots from `tail` are not the kernel's until the tail moves past them.
-            unsafe { self.sqes.add(at as usize).write(*sqe) };
+            // SAFETY: `at` is masked by `sq_mask`, so below `sq_entries`, the length of the SQE
+            // array.
+            let slot = unsafe { self.sqes.add(at as usize) };
+            // SAFETY: slots from `tail` are not the kernel's until the tail store below moves
+            // past them; if it read one early it would see a torn request.
+            unsafe { slot.write(*sqe) };
         }
         // SAFETY: as above; the release publishes the entries with the tail.
         unsafe { (*self.sq_tail).store(tail.wrapping_add(sqes.len() as u32), Ordering::Release) };
@@ -688,7 +725,13 @@ impl Ring {
     /// are flushed to the ring by any enter that gets events.
     fn enter(&mut self, wait: Option<Duration>) -> io::Result<()> {
         let flags = self.flags();
-        let wake = self.unsubmitted > 0 && flags & SQ_NEED_WAKEUP != 0;
+        // SAFETY: `sq_head` points at the kernel's `AtomicU32` in `rings`, mapped while `self`
+        // lives; the kernel moves it, so only atomic loads.
+        let head = unsafe { (*self.sq_head).load(Ordering::Acquire) };
+        // SAFETY: `sq_tail` as above; only this thread writes it.
+        let tail = unsafe { (*self.sq_tail).load(Ordering::Relaxed) };
+        let queued = head != tail;
+        let wake = queued && flags & SQ_NEED_WAKEUP != 0;
         self.unsubmitted = 0;
         let wait = wait.or((flags & SQ_CQ_OVERFLOW != 0).then_some(Duration::ZERO));
         if wait.is_none() && !wake {
@@ -741,13 +784,19 @@ impl Ring {
     /// Every completion the kernel has posted: its `user_data`, its result and its flags
     /// ([`CQE_F_MORE`], [`CQE_F_BUFFER`] and the buffer's id).
     fn reap(&mut self, mut each: impl FnMut(u64, i32, u32)) {
-        // SAFETY: the counters are the kernel's and this thread's; the kernel moves the tail.
-        let (mut head, tail) = unsafe {
-            ((*self.cq_head).load(Ordering::Relaxed), (*self.cq_tail).load(Ordering::Acquire))
-        };
+        // SAFETY: `cq_head` points at the kernel's `AtomicU32` in `rings`; only this thread
+        // writes it.
+        let mut head = unsafe { (*self.cq_head).load(Ordering::Relaxed) };
+        // SAFETY: `cq_tail` as above; the kernel moves it, and the acquire pairs with its release
+        // of the entries.
+        let tail = unsafe { (*self.cq_tail).load(Ordering::Acquire) };
         while head != tail {
-            // SAFETY: the entries between the head and the tail are posted and not reaped.
-            let cqe = unsafe { &*self.cqes.add((head & self.cq_mask) as usize) };
+            // SAFETY: masked by `cq_mask`, so below the completion ring's `cq_entries`.
+            let at = unsafe { self.cqes.add((head & self.cq_mask) as usize) };
+            // SAFETY: entries between head and tail are posted (the acquire above) and the kernel
+            // does not reuse one until the head store below passes it; the reference is dropped
+            // before that store.
+            let cqe = unsafe { &*at };
             let (user_data, res, flags) = (cqe.user_data, cqe.res, cqe.flags);
             head = head.wrapping_add(1);
             // SAFETY: as above; the entry is the kernel's again once the head is past it.
@@ -758,46 +807,60 @@ impl Ring {
 }
 
 /// A request in flight. Every buffer or address the kernel is given is on the heap and stays
-/// where it is until the request's completion is reaped: moving an `Op` moves none of them.
+/// where it is until the request's completion is reaped: moving an `Op` moves none of them. A
+/// file it names is an `Rc<Fixed>` of its own, so neither the file's slot nor its descriptor is
+/// let go while the kernel may still be given the request.
 enum Op {
     /// Into `bytes` from `at`, `got` of `bytes.len()` read so far.
     Read {
-        fd: RawFd,
+        file: Rc<Fixed>,
         at: u64,
         bytes: Vec<u8>,
         got: usize,
     },
     /// `bytes` at the end of the file, `put` of them written so far.
     Append {
-        fd: RawFd,
+        file: Rc<Fixed>,
         bytes: Vec<u8>,
         put: usize,
     },
     /// `bytes` at `at` of a file, through a descriptor of its own: the one kept for the file
-    /// appends wherever it is told to write.
+    /// appends wherever it is told to write. With `direct` the descriptor bypasses the page
+    /// cache, and each piece is copied into the registered buffer `buffer` and written from
+    /// there; until one is free, it waits.
     WriteAt {
         fd: OwnedFd,
         at: u64,
         bytes: Vec<u8>,
         put: usize,
+        direct: bool,
+        buffer: Option<u16>,
     },
     Sync {
-        fd: RawFd,
+        file: Rc<Fixed>,
     },
     /// The kernel reads the time from here until it completes.
     Timer {
         after: Box<Timespec>,
     },
-    /// A whole file written to `temporary`, then synced, then renamed over `path` where it
-    /// completes.
+    /// A whole file as one chain of linked requests: written to `temporary`, synced, renamed
+    /// over the path (`names` are the two), and its directory `dir` synced. A link that fails
+    /// cancels those after it; a short write asks the chain again from where it stopped.
     Write {
         fd: OwnedFd,
+        dir: OwnedFd,
         bytes: Vec<u8>,
         put: usize,
-        synced: bool,
         temporary: PathBuf,
-        path: PathBuf,
+        names: Box<[CString; 2]>,
         file: FileName,
+        chain: Chain,
+    },
+    /// `names[0]` renamed over `names[1]`, then each of `dirs` synced, linked.
+    Rename {
+        names: Box<[CString; 2]>,
+        dirs: Vec<OwnedFd>,
+        chain: Chain,
     },
     /// A read of a watch's events, asked again after each until the watch is stopped.
     Watch {
@@ -805,7 +868,7 @@ enum Op {
         buffer: Vec<u8>,
         stopping: bool,
     },
-    /// Stops the request `target`; its own completion is nobody's.
+    /// Stops the request whose `user_data` is `target`; its own completion is nobody's.
     Cancel {
         target: u64,
     },
@@ -826,28 +889,34 @@ enum Op {
         bytes: Vec<u8>,
         put: usize,
     },
-    /// An accept of a listen's, asked again after each until the listen is stopped.
+    /// An accept of a listen's, asked again after each until the listen is stopped. The
+    /// kernel puts each connection straight into a slot of its half of the [`Table`].
     Accept {
         listener: crate::net::Listener,
         stopping: bool,
     },
     /// The kernel reads the address from `at` until it completes.
     Connect {
-        fd: Option<OwnedFd>,
+        socket: Option<Rc<Fixed>>,
         at: Box<crate::net::SockAddr>,
     },
-    /// A receive on `conn`, whose socket stays open while this is in flight.
+    /// The one receive of `conn`, multishot: each completion's bytes are in a buffer of the
+    /// [`Provided`] ring, copied into the connection's inbox and the buffer given back.
     Recv {
         conn: Conn,
-        fd: RawFd,
-        bytes: Vec<u8>,
+        socket: Rc<Fixed>,
     },
     /// A send on `conn`, `put` of `bytes` sent so far.
     Send {
         conn: Conn,
-        fd: RawFd,
+        socket: Rc<Fixed>,
         bytes: Vec<u8>,
         put: usize,
+    },
+    /// `conn` shut both ways, for a hangup.
+    Shutdown {
+        conn: Conn,
+        socket: Rc<Fixed>,
     },
     /// A read of the eventfd that threads doing work off the ring bump once they have sent
     /// its completion; in flight while any such work is.
@@ -856,6 +925,50 @@ enum Op {
         count: Box<[u8; 8]>,
     },
 }
+
+impl Op {
+    /// The completions the kernel still owes it: one per link of a chain not yet in.
+    fn owed(&self) -> usize {
+        match self {
+            Op::Write { chain, .. } => chain.owed(WRITE_LINKS),
+            Op::Rename { chain, dirs, .. } => chain.owed(1 + dirs.len()),
+            _ => 1,
+        }
+    }
+}
+
+/// The links of a whole file's write: the write, its sync, the rename and its directory's sync.
+const WRITE_LINKS: usize = 4;
+
+/// The results of a linked chain's requests, by link, as their completions come in any order.
+#[derive(Default)]
+struct Chain {
+    results: [Option<i32>; 4],
+}
+
+impl Chain {
+    /// The result of link `link`; once all `links` are in, every result, and the chain is
+    /// empty for its next asking.
+    fn take(&mut self, link: usize, res: i32, links: usize) -> Option<[i32; 4]> {
+        self.results[link] = Some(res);
+        if self.results[..links].iter().any(Option::is_none) {
+            return None;
+        }
+        Some(std::mem::take(&mut self.results).map(|it| it.unwrap_or(0)))
+    }
+
+    fn owed(&self, links: usize) -> usize {
+        self.results[..links].iter().filter(|it| it.is_none()).count()
+    }
+}
+
+/// The `user_data` of link `link` of the request `id`; a request of no chain is its link 0.
+fn data(id: u64, link: usize) -> u64 {
+    id << 2 | link as u64
+}
+
+/// The tag of a request that is no effect's own (a receive, a cancel).
+const NOBODYS: Tag = Tag(u64::MAX);
 
 /// Work done on threads of its own rather than through the ring (a listing, which may take
 /// long): their completions, and the eventfd that wakes the ring when one is sent.
@@ -896,6 +1009,9 @@ enum Step {
     Again,
     /// `done` told, and it asked for again: a watch's change, a listen's accept.
     Goes(Done),
+    /// Kept as it is, not asked again: a chain with links still to complete, or a multishot
+    /// request the kernel still holds.
+    Held,
     /// It ended, with its effect's completion if it has one of its own.
     Ends(Option<Done>),
 }
@@ -934,25 +1050,49 @@ impl Spawning {
 
 /// A connection a listen accepted or a connect made.
 struct Connection {
-    socket: crate::net::Socket,
-    /// Receives and sends of it in flight: its socket closes once none is and it is hung up.
+    socket: Rc<Fixed>,
+    /// Requests in flight on it (its receive, sends, its shutdown): it is let go once none is
+    /// and it is hung up.
     users: usize,
     hung: bool,
+    /// What its receive took and no `Recv` has yet, in order.
+    inbox: VecDeque<u8>,
+    /// The `Recv`s waiting for bytes, in the order they were submitted, with their most.
+    recvs: VecDeque<(Tag, usize)>,
+    /// Its multishot receive, while the kernel holds one.
+    receiving: Option<u64>,
+    /// Its receive is being cancelled: the inbox holds [`INBOX`] bytes no `Recv` took.
+    pausing: bool,
+    /// How its receiving ended: the peer hung up (or reset it), or why it failed.
+    ended: Option<Result<(), String>>,
 }
 
 pub struct Uring {
     start: Instant,
     root: PathBuf,
     ring: Ring,
+    table: Rc<Table>,
+    registered: Registered,
+    /// Not freed while the kernel may still write into it (see `Drop`).
+    provided: std::mem::ManuallyDrop<Provided>,
     /// Each file opened, for reading and appending.
-    files: BTreeMap<FileName, OwnedFd>,
-    /// By the `user_data` the ring hands back, which is never used for another request.
+    files: BTreeMap<FileName, Rc<Fixed>>,
+    /// By the id in the `user_data` the ring hands back, which is never used for another
+    /// request.
     pending: FxHashMap<u64, Pending>,
     next: u64,
     /// Requests for which the ring had no room.
     waiting: VecDeque<u64>,
+    /// Writes bypassing the page cache waiting for a registered buffer.
+    for_buffers: VecDeque<u64>,
+    /// Devices whose file system refused `O_DIRECT`: their writes go through the page cache.
+    refused: rustc_hash::FxHashSet<u64>,
+    /// Writes that bypassed the page cache, ended.
+    direct_writes: u64,
     /// Completions to hand out at the next poll, in order.
     ready: Vec<Completion>,
+    /// The completions reaped from the ring, kept for the next reap's.
+    posted: Vec<(u64, i32, u32)>,
     /// The request reading each watch's events, by the watch's tag.
     watches: BTreeMap<Tag, u64>,
     /// The request accepting each listen's connections, by the listen's tag.
@@ -971,15 +1111,26 @@ pub struct Uring {
 impl Uring {
     /// A driver whose files are under `root`, or why this kernel has no ring for it.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Uring> {
+        let ring = Ring::new(ENTRIES, COMPLETIONS)?;
+        let table = Table::new(&ring.fd)?;
+        let registered = Registered::new(ring.fd.as_raw_fd())?;
+        let provided = std::mem::ManuallyDrop::new(Provided::new(ring.fd.as_raw_fd())?);
         Ok(Uring {
             start: Instant::now(),
             root: root.into(),
-            ring: Ring::new(ENTRIES, COMPLETIONS)?,
+            ring,
+            table,
+            registered,
+            provided,
             files: BTreeMap::new(),
             pending: FxHashMap::default(),
             next: 0,
             waiting: VecDeque::new(),
+            for_buffers: VecDeque::new(),
+            refused: rustc_hash::FxHashSet::default(),
+            direct_writes: 0,
             ready: Vec::new(),
+            posted: Vec::new(),
             watches: BTreeMap::new(),
             listens: BTreeMap::new(),
             spawns: BTreeMap::new(),
@@ -1016,19 +1167,24 @@ impl Uring {
         self.files.remove(name);
     }
 
-    /// The file, opened once; `make` makes it if missing, with its directories.
-    fn file(&mut self, name: &FileName, make: bool) -> io::Result<RawFd> {
-        if let Some(fd) = self.files.get(name) {
-            return Ok(fd.as_raw_fd());
+    /// The file, opened once and put in the driver's half of the table; `make` makes it if
+    /// missing, with its directories. Where that half is full, the files kept are let go
+    /// (each request in flight keeps its own until it ends) to make room.
+    fn file(&mut self, name: &FileName, make: bool) -> io::Result<Rc<Fixed>> {
+        if let Some(file) = self.files.get(name) {
+            return Ok(file.clone());
         }
         let path = self.root.join(name.as_str());
         if make && let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let fd = open(&path, make)?;
-        let raw = fd.as_raw_fd();
-        self.files.insert(name.clone(), fd);
-        Ok(raw)
+        if self.table.free.borrow().is_empty() {
+            self.files.clear();
+        }
+        let file = self.table.install(fd)?;
+        self.files.insert(name.clone(), file.clone());
+        Ok(file)
     }
 
     fn start(&mut self, tag: Tag, op: Op) -> u64 {
@@ -1040,39 +1196,98 @@ impl Uring {
     }
 
     /// Writes the request `id` as it now stands to the ring, or keeps it for when there is
-    /// room.
+    /// room (or, bypassing the page cache, for when a registered buffer is free).
     fn queue(&mut self, id: u64) {
-        if !self.waiting.is_empty() || !self.ring.push(self.sqe(id)) {
+        if !self.buffered(id) {
+            self.for_buffers.push_back(id);
+            return;
+        }
+        let mut sqes = [Sqe::default(); WRITE_LINKS];
+        let n = self.sqes(id, &mut sqes);
+        if !self.waiting.is_empty() || !self.ring.push(&sqes[..n]) {
             self.waiting.push_back(id);
         }
     }
 
-    fn sqe(&self, id: u64) -> Sqe {
+    /// Whether the request `id` has the registered buffer it needs, given one if it needs one
+    /// and one is free.
+    fn buffered(&mut self, id: u64) -> bool {
+        let Some(Pending { op: Op::WriteAt { direct: true, buffer, .. }, .. }) =
+            self.pending.get_mut(&id)
+        else {
+            return true;
+        };
+        if buffer.is_none() {
+            *buffer = self.registered.free.pop();
+        }
+        buffer.is_some()
+    }
+
+    /// The registered buffer of a write that ended free again, for the next that waits.
+    fn unbuffer(&mut self, buffer: u16) {
+        self.registered.free.push(buffer);
+        while let Some(id) = self.for_buffers.pop_front() {
+            if self.pending.contains_key(&id) {
+                self.queue(id);
+                return;
+            }
+        }
+    }
+
+    /// The requests the request `id` is, as it now stands, into `sqes`: one, or each link of
+    /// a chain. How many.
+    fn sqes(&self, id: u64, sqes: &mut [Sqe; WRITE_LINKS]) -> usize {
         let pending = &self.pending[&id];
-        let user_data = id;
+        let user_data = data(id, 0);
         // SAFETY of the kernel's reads and writes: every buffer and address below stays where
         // it is until the request's completion (see `Op`).
-        match &pending.op {
-            Op::Read { fd, at, bytes, got } => Sqe {
-                opcode: OP_READ,
-                fd: *fd,
-                off: at + *got as u64,
-                addr: bytes[*got..].as_ptr() as u64,
-                len: (bytes.len() - got) as u32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Append { fd, bytes, put } => Sqe {
-                opcode: OP_WRITE,
-                fd: *fd,
-                // The file's position, which is its end: it is open for appending.
-                off: u64::MAX,
-                addr: bytes[*put..].as_ptr() as u64,
-                len: (bytes.len() - put) as u32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::WriteAt { fd, at, bytes, put } => Sqe {
+        sqes[0] = match &pending.op {
+            Op::Read { file, at, bytes, got } => {
+                let (fd, flags) = file.target();
+                Sqe {
+                    opcode: OP_READ,
+                    flags,
+                    fd,
+                    off: at + *got as u64,
+                    addr: bytes[*got..].as_ptr() as u64,
+                    len: (bytes.len() - got).min(u32::MAX as usize) as u32,
+                    user_data,
+                    ..Sqe::default()
+                }
+            }
+            Op::Append { file, bytes, put } => {
+                let (fd, flags) = file.target();
+                Sqe {
+                    opcode: OP_WRITE,
+                    flags,
+                    fd,
+                    // The file's position, which is its end: it is open for appending.
+                    off: u64::MAX,
+                    addr: bytes[*put..].as_ptr() as u64,
+                    len: (bytes.len() - put).min(u32::MAX as usize) as u32,
+                    user_data,
+                    ..Sqe::default()
+                }
+            }
+            Op::WriteAt { fd, at, bytes, put, direct: true, buffer } => {
+                let buffer = buffer.expect("a registered buffer, given before it is queued");
+                let piece = (bytes.len() - put).min(DIRECT_PIECE);
+                let to = self.registered.at(buffer);
+                // SAFETY: the buffer is this request's alone, `DIRECT_PIECE` long, and the
+                // kernel reads it only for this request, which it is not given before this.
+                unsafe { ptr::copy_nonoverlapping(bytes[*put..].as_ptr(), to, piece) };
+                Sqe {
+                    opcode: OP_WRITE_FIXED,
+                    fd: fd.as_raw_fd(),
+                    off: at + *put as u64,
+                    addr: to as u64,
+                    len: piece as u32,
+                    buf_index: buffer,
+                    user_data,
+                    ..Sqe::default()
+                }
+            }
+            Op::WriteAt { fd, at, bytes, put, .. } => Sqe {
                 opcode: OP_WRITE,
                 fd: fd.as_raw_fd(),
                 off: at + *put as u64,
@@ -1081,7 +1296,10 @@ impl Uring {
                 user_data,
                 ..Sqe::default()
             },
-            Op::Sync { fd } => Sqe { opcode: OP_FSYNC, fd: *fd, user_data, ..Sqe::default() },
+            Op::Sync { file } => {
+                let (fd, flags) = file.target();
+                Sqe { opcode: OP_FSYNC, flags, fd, user_data, ..Sqe::default() }
+            }
             Op::Timer { after } => Sqe {
                 opcode: OP_TIMEOUT,
                 fd: -1,
@@ -1090,17 +1308,37 @@ impl Uring {
                 user_data,
                 ..Sqe::default()
             },
-            Op::Write { fd, synced: false, bytes, put, .. } if *put < bytes.len() => Sqe {
-                opcode: OP_WRITE,
-                fd: fd.as_raw_fd(),
-                off: *put as u64,
-                addr: bytes[*put..].as_ptr() as u64,
-                len: (bytes.len() - put) as u32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Write { fd, .. } => {
-                Sqe { opcode: OP_FSYNC, fd: fd.as_raw_fd(), user_data, ..Sqe::default() }
+            Op::Write { fd, dir, bytes, put, names, .. } => {
+                let fd = fd.as_raw_fd();
+                sqes[1] =
+                    Sqe { opcode: OP_FSYNC, flags: SQE_IO_LINK, fd, user_data: data(id, 1), ..Sqe::default() };
+                sqes[2] = rename(names, SQE_IO_LINK, data(id, 2));
+                sqes[3] = Sqe { opcode: OP_FSYNC, fd: dir.as_raw_fd(), user_data: data(id, 3), ..Sqe::default() };
+                sqes[0] = Sqe {
+                    opcode: OP_WRITE,
+                    flags: SQE_IO_LINK,
+                    fd,
+                    off: *put as u64,
+                    addr: bytes[*put..].as_ptr() as u64,
+                    len: (bytes.len() - put).min(u32::MAX as usize) as u32,
+                    user_data,
+                    ..Sqe::default()
+                };
+                return WRITE_LINKS;
+            }
+            Op::Rename { names, dirs, .. } => {
+                for (n, dir) in dirs.iter().enumerate() {
+                    let flags = if n + 1 < dirs.len() { SQE_IO_LINK } else { 0 };
+                    sqes[1 + n] = Sqe {
+                        opcode: OP_FSYNC,
+                        flags,
+                        fd: dir.as_raw_fd(),
+                        user_data: data(id, 1 + n),
+                        ..Sqe::default()
+                    };
+                }
+                sqes[0] = rename(names, if dirs.is_empty() { 0 } else { SQE_IO_LINK }, user_data);
+                return 1 + dirs.len();
             }
             Op::Watch { tree, buffer, .. } => Sqe {
                 opcode: OP_READ,
@@ -1149,35 +1387,60 @@ impl Uring {
                 ioprio: ACCEPT_MULTISHOT,
                 fd: listener.fd(),
                 op_flags: libc::SOCK_CLOEXEC as u32,
+                // Into a slot of the kernel's half of the table, which the completion names.
+                splice_fd_in: FILE_INDEX_ALLOC as i32,
                 user_data,
                 ..Sqe::default()
             },
-            Op::Connect { fd, at } => Sqe {
-                opcode: OP_CONNECT,
-                fd: fd.as_ref().map_or(-1, |it| it.as_raw_fd()),
-                addr: &raw const at.storage as u64,
-                // The address's length.
-                off: u64::from(at.len),
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Recv { fd, bytes, .. } => Sqe {
-                opcode: OP_RECV,
-                fd: *fd,
-                addr: bytes.as_ptr() as u64,
-                len: bytes.len().min(u32::MAX as usize) as u32,
-                user_data,
-                ..Sqe::default()
-            },
-            Op::Send { fd, bytes, put, .. } => Sqe {
-                opcode: OP_SEND,
-                fd: *fd,
-                addr: bytes[*put..].as_ptr() as u64,
-                len: (bytes.len() - put).min(u32::MAX as usize) as u32,
-                op_flags: libc::MSG_NOSIGNAL as u32,
-                user_data,
-                ..Sqe::default()
-            },
+            Op::Connect { socket, at, .. } => {
+                let (fd, flags) = socket.as_ref().expect("a connect's socket").target();
+                Sqe {
+                    opcode: OP_CONNECT,
+                    flags,
+                    fd,
+                    addr: &raw const at.storage as u64,
+                    // The address's length.
+                    off: u64::from(at.len),
+                    user_data,
+                    ..Sqe::default()
+                }
+            }
+            Op::Recv { socket, .. } => {
+                let (fd, flags) = socket.target();
+                Sqe {
+                    opcode: OP_RECV,
+                    flags: flags | SQE_BUFFER_SELECT,
+                    ioprio: RECV_MULTISHOT,
+                    fd,
+                    buf_index: RECV_GROUP,
+                    user_data,
+                    ..Sqe::default()
+                }
+            }
+            Op::Send { socket, bytes, put, .. } => {
+                let (fd, flags) = socket.target();
+                Sqe {
+                    opcode: OP_SEND,
+                    flags,
+                    fd,
+                    addr: bytes[*put..].as_ptr() as u64,
+                    len: (bytes.len() - put).min(u32::MAX as usize) as u32,
+                    op_flags: libc::MSG_NOSIGNAL as u32,
+                    user_data,
+                    ..Sqe::default()
+                }
+            }
+            Op::Shutdown { socket, .. } => {
+                let (fd, flags) = socket.target();
+                Sqe {
+                    opcode: OP_SHUTDOWN,
+                    flags,
+                    fd,
+                    len: libc::SHUT_RDWR as u32,
+                    user_data,
+                    ..Sqe::default()
+                }
+            }
             Op::Wake { fd, count } => Sqe {
                 opcode: OP_READ,
                 fd: *fd,
@@ -1187,7 +1450,41 @@ impl Uring {
                 user_data,
                 ..Sqe::default()
             },
+        };
+        1
+    }
+
+    /// Whether `WriteAt` of `len` bytes at `at` through `fd` bypasses the page cache, `fd`
+    /// set to do so if it does: a write of [`DIRECT_LEAST`] or more whose offset and length
+    /// are multiples of the alignment its file system says such writes need. A file system
+    /// that refuses `O_DIRECT` (tmpfs) is remembered, and its writes go through the cache.
+    fn direct(&mut self, fd: RawFd, at: u64, len: usize) -> io::Result<bool> {
+        const SECTOR: u64 = 512;
+        if len < DIRECT_LEAST || at % SECTOR != 0 || len as u64 % SECTOR != 0 {
+            return Ok(false);
         }
+        let (device, align) = direct_alignment(fd)?;
+        let align = u64::from(align);
+        if align == 0
+            || self.refused.contains(&device)
+            || DIRECT_PIECE as u64 % align != 0
+            || at % align != 0
+            || len as u64 % align != 0
+        {
+            return Ok(false);
+        }
+        // SAFETY: an open descriptor; no pointers.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        // SAFETY: as above.
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_DIRECT) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                self.refused.insert(device);
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        Ok(true)
     }
 
     /// `effect` done by [`crate::threads::run`] on a thread of its own, its completion taken
@@ -1226,13 +1523,14 @@ impl Uring {
     }
 
     fn flush_waiting(&mut self) {
+        let mut sqes = [Sqe::default(); WRITE_LINKS];
         while let Some(&id) = self.waiting.front() {
             if !self.pending.contains_key(&id) {
                 self.waiting.pop_front();
                 continue;
             }
-            let sqe = self.sqe(id);
-            if !self.ring.push(sqe) {
+            let n = self.sqes(id, &mut sqes);
+            if !self.ring.push(&sqes[..n]) {
                 break;
             }
             self.waiting.pop_front();
@@ -1256,11 +1554,12 @@ impl Uring {
         for pending in pending {
             match pending.op {
                 // A spawn fails once, below; work off the ring still completes through its
-                // thread.
+                // thread; a receive's effects fail with their connection's, below.
                 Op::Cancel { .. }
                 | Op::Exit { .. }
                 | Op::Output { .. }
                 | Op::Input { .. }
+                | Op::Recv { .. }
                 | Op::Wake { .. } => {}
                 _ => self.ready.push(failed(pending.tag)),
             }
@@ -1273,24 +1572,31 @@ impl Uring {
             spawn.failed = Some(why.clone());
             self.ready.push(Completion { tag, done: spawn.end() });
         }
-        self.conns.retain(|_, conn| {
+        for conn in self.conns.values_mut() {
+            for (tag, _) in conn.recvs.drain(..) {
+                self.ready.push(failed(tag));
+            }
             conn.users = 0;
-            !conn.hung
-        });
+            conn.receiving = None;
+        }
+        self.conns.retain(|_, conn| !conn.hung);
         self.watches.clear();
         self.listens.clear();
         self.offload.reading = None;
         self.waiting.clear();
+        self.for_buffers.clear();
         self.ring.unsubmitted = 0;
     }
 
-    /// Takes the completion of the request `id`: its effect's completion, or the rest of it
-    /// asked for. With `more`, the kernel still holds the request (a multishot one), so it is
-    /// kept and not asked again.
-    fn completed(&mut self, id: u64, res: i32, more: bool) {
+    /// Takes the completion whose `user_data` is `user_data`: its effect's completion, or the
+    /// rest of it asked for. With [`CQE_F_MORE`] in `flags` the kernel still holds the
+    /// request (a multishot one), so it is kept and not asked again.
+    fn completed(&mut self, user_data: u64, res: i32, flags: u32) {
+        let (id, link) = (user_data >> 2, (user_data & 3) as usize);
         let Some(mut pending) = self.pending.remove(&id) else { return };
         let tag = pending.tag;
-        match self.step(tag, &mut pending.op, res, more) {
+        let more = flags & CQE_F_MORE != 0;
+        match self.step(tag, &mut pending.op, link, res, flags) {
             Step::Again => {
                 self.pending.insert(id, pending);
                 if !more {
@@ -1304,6 +1610,9 @@ impl Uring {
                     self.queue(id);
                 }
             }
+            Step::Held => {
+                self.pending.insert(id, pending);
+            }
             Step::Ends(done) => {
                 if let Some(done) = done {
                     self.ready.push(Completion { tag, done });
@@ -1314,17 +1623,32 @@ impl Uring {
                         drop(pending);
                         self.part_ended(tag);
                     }
-                    Op::Recv { conn, .. } | Op::Send { conn, .. } => self.release(conn),
+                    Op::Recv { conn, .. } => {
+                        drop(pending);
+                        self.release(conn);
+                        self.deliver(conn);
+                    }
+                    Op::Send { conn, .. } | Op::Shutdown { conn, .. } => {
+                        drop(pending);
+                        self.release(conn);
+                    }
+                    Op::WriteAt { direct, buffer, .. } => {
+                        self.direct_writes += u64::from(direct);
+                        if let Some(buffer) = buffer {
+                            self.unbuffer(buffer);
+                        }
+                    }
                     _ => {}
                 }
             }
         }
     }
 
-    /// What the result `res` of a request of the effect `tag` means for it.
-    fn step(&mut self, tag: Tag, op: &mut Op, res: i32, more: bool) -> Step {
+    /// What the result `res` of link `link` of a request of the effect `tag` means for it.
+    fn step(&mut self, tag: Tag, op: &mut Op, link: usize, res: i32, flags: u32) -> Step {
         let error = |res: i32| io::Error::from_raw_os_error(-res).to_string();
         let failed = |res: i32| Some(Done::Failed(IoError(error(res))));
+        let more = flags & CQE_F_MORE != 0;
         match op {
             Op::Cancel { .. } => Step::Ends(None),
             Op::Read { bytes, got, .. } => {
@@ -1365,27 +1689,36 @@ impl Uring {
             Op::Sync { .. } => Step::Ends(Some(Done::Synced)),
             Op::Timer { .. } if res == -libc::ETIME || res == 0 => Step::Ends(Some(Done::Fired)),
             Op::Timer { .. } => Step::Ends(failed(res)),
-            Op::Write { temporary, .. } if res < 0 => {
-                _ = std::fs::remove_file(&*temporary);
-                Step::Ends(failed(res))
-            }
-            Op::Write { synced: false, bytes, put, temporary, .. } if *put < bytes.len() => {
-                if res == 0 {
-                    _ = std::fs::remove_file(&*temporary);
-                    return Step::Ends(failed(-libc::EIO));
+            Op::Write { bytes, put, temporary, file, chain, .. } => {
+                let Some([wrote, synced, renamed, dir]) = chain.take(link, res, WRITE_LINKS) else {
+                    return Step::Held;
+                };
+                // A short write breaks the chain; the rest is asked again, with the links
+                // after it.
+                if wrote > 0 && *put + (wrote as usize) < bytes.len() {
+                    *put += wrote as usize;
+                    return Step::Again;
                 }
-                *put += res as usize;
-                // The rest of it, or the sync once it is all written.
-                Step::Again
-            }
-            Op::Write { synced, temporary, path, file, .. } => {
-                *synced = true;
                 let file = file.clone();
                 self.forget(&file);
-                Step::Ends(Some(match crate::fs::commit_rename(temporary, path) {
-                    Ok(()) => Done::Written,
-                    Err(error) => Done::Failed(IoError(error.to_string())),
-                }))
+                let wrote = if wrote == 0 && *put < bytes.len() { -libc::EIO } else { wrote };
+                match [wrote, synced, renamed].into_iter().find(|it| *it < 0) {
+                    // The temporary was never renamed: the old file is as it was.
+                    Some(res) => {
+                        _ = std::fs::remove_file(&*temporary);
+                        Step::Ends(failed(res))
+                    }
+                    None if dir < 0 => Step::Ends(failed(dir)),
+                    None => Step::Ends(Some(Done::Written)),
+                }
+            }
+            Op::Rename { dirs, chain, .. } => {
+                let links = 1 + dirs.len();
+                let Some(results) = chain.take(link, res, links) else { return Step::Held };
+                match results[..links].iter().find(|it| **it < 0) {
+                    Some(&res) => Step::Ends(failed(res)),
+                    None => Step::Ends(Some(Done::Renamed)),
+                }
             }
             Op::Watch { stopping, .. } if res == -libc::ECANCELED || (res < 0 && *stopping) => {
                 self.watches.remove(&tag);
@@ -1443,11 +1776,10 @@ impl Uring {
                     false => Step::Ends(None),
                 }
             }
-            Op::Accept { listener, stopping } => {
+            Op::Accept { stopping, .. } => {
                 if res >= 0 {
-                    // SAFETY: the accept made this descriptor, owned from here.
-                    let fd = unsafe { OwnedFd::from_raw_fd(res) };
-                    let conn = self.add(crate::net::Socket::from_fd(fd, listener.is_unix()));
+                    let socket = self.table.accepted(res as u32);
+                    let conn = self.add(socket);
                     let done = Done::Accepted { conn };
                     // Stopping, it ends only at the completion that says the kernel let go of
                     // it: until then it may accept more.
@@ -1460,11 +1792,21 @@ impl Uring {
                 }
                 if more {
                     // The kernel goes on accepting with it: it has not ended.
-                    return Step::Again;
+                    return Step::Held;
                 }
                 if res == -libc::ECANCELED || *stopping {
                     self.listens.remove(&tag);
                     return Step::Ends(Some(Done::Unlistened));
+                }
+                if res == -libc::ENFILE {
+                    self.listens.remove(&tag);
+                    let why = format!(
+                        "{}: every one of the {} slots the ring's table of files keeps for \
+                         accepted connections is in use",
+                        error(res),
+                        self.table.ours
+                    );
+                    return Step::Ends(Some(Done::Failed(IoError(why))));
                 }
                 // A connection that went before it was taken, or the network's errors that
                 // accept(2) says to take as "try again".
@@ -1486,25 +1828,50 @@ impl Uring {
                 self.listens.remove(&tag);
                 Step::Ends(failed(res))
             }
-            Op::Connect { fd, at } => {
+            Op::Connect { socket, .. } => {
                 if res < 0 {
                     return Step::Ends(failed(res));
                 }
-                let fd = fd.take().expect("a connect's socket");
-                let conn = self.add(crate::net::Socket::from_fd(fd, at.domain == libc::AF_UNIX));
+                let socket = socket.take().expect("a connect's socket");
+                let conn = self.add(socket);
                 Step::Ends(Some(Done::Connected { conn }))
             }
-            Op::Recv { bytes, .. } => {
-                if res == -libc::ECONNRESET {
-                    // The peer reset it: as good as hung up, for a reader.
-                    return Step::Ends(Some(Done::Read(Vec::new())));
+            Op::Recv { conn, .. } => {
+                let conn = *conn;
+                if flags & CQE_F_BUFFER != 0 {
+                    let bid = (flags >> CQE_BUFFER_SHIFT) as u16;
+                    if res > 0
+                        && let Some(connection) = self.conns.get_mut(&conn)
+                        && !connection.hung
+                    {
+                        connection.inbox.extend(self.provided.bytes(bid, res as usize));
+                    }
+                    self.provided.give(bid);
                 }
-                if res < 0 {
-                    return Step::Ends(failed(res));
+                let Some(connection) = self.conns.get_mut(&conn) else {
+                    return if more { Step::Held } else { Step::Ends(None) };
+                };
+                if !more {
+                    connection.receiving = None;
+                    connection.pausing = false;
+                    match res {
+                        // The peer hung up, or reset it: as good as hung up, for a reader.
+                        0 => connection.ended = Some(Ok(())),
+                        _ if res == -libc::ECONNRESET => connection.ended = Some(Ok(())),
+                        // Out of buffers, or paused: armed again once it is wanted.
+                        _ if res == -libc::ENOBUFS || res == -libc::ECANCELED || res > 0 => {}
+                        _ => connection.ended = Some(Err(error(res))),
+                    }
+                    return Step::Ends(None);
                 }
-                let mut bytes = std::mem::take(bytes);
-                bytes.truncate(res as usize);
-                Step::Ends(Some(Done::Read(bytes)))
+                let pause = connection.inbox.len() >= INBOX && !connection.pausing;
+                if pause {
+                    connection.pausing = true;
+                    let id = connection.receiving.expect("an armed receive");
+                    self.start(NOBODYS, Op::Cancel { target: data(id, 0) });
+                }
+                self.deliver(conn);
+                Step::Held
             }
             Op::Wake { .. } => {
                 self.take_offloaded();
@@ -1527,16 +1894,19 @@ impl Uring {
                     (true, _) => Step::Again,
                 }
             }
+            Op::Shutdown { .. } if res < 0 && res != -libc::ENOTCONN => Step::Ends(failed(res)),
+            Op::Shutdown { .. } => Step::Ends(Some(Done::HungUp)),
         }
     }
 
     fn reap(&mut self) {
         self.take_offloaded();
-        let mut posted = Vec::new();
-        self.ring.reap(|user_data, res, more| posted.push((user_data, res, more)));
-        for (id, res, more) in posted {
-            self.completed(id, res, more);
+        let mut posted = std::mem::take(&mut self.posted);
+        self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
+        for (user_data, res, flags) in posted.drain(..) {
+            self.completed(user_data, res, flags);
         }
+        self.posted = posted;
         self.flush_waiting();
         self.submit_ring();
     }
@@ -1553,7 +1923,7 @@ impl Uring {
         }
         let tag = pending.tag;
         let Some(at) = self.waiting.iter().position(|&it| it == id) else {
-            self.start(tag, Op::Cancel { target: id });
+            self.start(tag, Op::Cancel { target: data(id, 0) });
             return;
         };
         self.waiting.remove(at);
@@ -1631,23 +2001,27 @@ impl Uring {
         }
     }
 
-    fn add(&mut self, socket: crate::net::Socket) -> Conn {
-        if let crate::net::Socket::Tcp(stream) = &socket {
-            // Latency only: a request and its answer are each one send.
-            _ = stream.set_nodelay(true);
-        }
+    fn add(&mut self, socket: Rc<Fixed>) -> Conn {
         let conn = Conn(self.next_conn);
         self.next_conn += 1;
-        self.conns.insert(conn, Connection { socket, users: 0, hung: false });
+        self.conns.insert(conn, Connection {
+            socket,
+            users: 0,
+            hung: false,
+            inbox: VecDeque::new(),
+            recvs: VecDeque::new(),
+            receiving: None,
+            pausing: false,
+            ended: None,
+        });
         conn
     }
 
-    /// The socket of `conn`, kept open until [`Uring::release`] says the request using it
-    /// ended.
-    fn use_conn(&mut self, conn: Conn) -> io::Result<RawFd> {
+    /// The socket of `conn`, kept until [`Uring::release`] says the request using it ended.
+    fn use_conn(&mut self, conn: Conn) -> io::Result<Rc<Fixed>> {
         let connection = self.conns.get_mut(&conn).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
         connection.users += 1;
-        Ok(connection.socket.fd())
+        Ok(connection.socket.clone())
     }
 
     fn release(&mut self, conn: Conn) {
@@ -1658,23 +2032,100 @@ impl Uring {
         }
     }
 
-    /// Shuts `conn` both ways, so a receive in flight on it ends empty, and closes it once
-    /// nothing in flight uses it.
-    fn hang_up(&mut self, conn: Conn) -> io::Result<()> {
+    /// A receive of at most `most` bytes on `conn`: from what its receive took, in order,
+    /// once there is any.
+    fn recv(&mut self, conn: Conn, tag: Tag, most: usize) -> io::Result<()> {
+        let connection = self.conns.get_mut(&conn).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
+        connection.recvs.push_back((tag, most));
+        self.deliver(conn);
+        Ok(())
+    }
+
+    /// Hands `conn`'s waiting `Recv`s what its inbox holds, or its end, and arms its receive
+    /// where one waits for bytes not yet taken.
+    fn deliver(&mut self, conn: Conn) {
+        let Some(connection) = self.conns.get_mut(&conn) else { return };
+        while let Some(&(tag, most)) = connection.recvs.front() {
+            let done = match &connection.ended {
+                _ if most == 0 => Done::Read(Vec::new()),
+                _ if !connection.inbox.is_empty() => {
+                    let n = most.min(connection.inbox.len());
+                    let (front, back) = connection.inbox.as_slices();
+                    let split = front.len().min(n);
+                    let mut bytes = Vec::with_capacity(n);
+                    bytes.extend_from_slice(&front[..split]);
+                    bytes.extend_from_slice(&back[..n - split]);
+                    connection.inbox.drain(..n);
+                    Done::Read(bytes)
+                }
+                Some(Ok(())) => Done::Read(Vec::new()),
+                Some(Err(why)) => Done::Failed(IoError(why.clone())),
+                None => break,
+            };
+            connection.recvs.pop_front();
+            self.ready.push(Completion { tag, done });
+        }
+        let arm = connection.receiving.is_none()
+            && connection.ended.is_none()
+            && !connection.hung
+            && !connection.recvs.is_empty()
+            && connection.inbox.len() < INBOX;
+        if !arm {
+            return;
+        }
+        connection.users += 1;
+        let socket = connection.socket.clone();
+        let id = self.start(NOBODYS, Op::Recv { conn, socket });
+        if let Some(connection) = self.conns.get_mut(&conn) {
+            connection.receiving = Some(id);
+        }
+    }
+
+    /// Shuts `conn` both ways through the ring, its waiting receives answered empty, and lets
+    /// it go once nothing in flight uses it.
+    fn hang_up(&mut self, conn: Conn, tag: Tag) -> io::Result<()> {
         let connection = self.conns.get_mut(&conn).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
         connection.hung = true;
-        let shut = connection.socket.shutdown();
-        if connection.users == 0 {
-            self.conns.remove(&conn);
+        connection.inbox = VecDeque::new();
+        connection.users += 1;
+        let socket = connection.socket.clone();
+        let receiving = connection.receiving;
+        for (tag, _) in std::mem::take(&mut connection.recvs) {
+            self.ready.push(Completion { tag, done: Done::Read(Vec::new()) });
         }
-        shut
+        if let Some(id) = receiving {
+            self.start(NOBODYS, Op::Cancel { target: data(id, 0) });
+        }
+        self.start(tag, Op::Shutdown { conn, socket });
+        Ok(())
+    }
+
+    /// Writes that bypassed the page cache (`O_DIRECT`) and ended, since the driver was made.
+    pub fn direct_writes(&self) -> u64 {
+        self.direct_writes
+    }
+}
+
+/// The rename of `names[0]` over `names[1]`, both relative to the working directory.
+fn rename(names: &[CString; 2], flags: u8, user_data: u64) -> Sqe {
+    Sqe {
+        opcode: OP_RENAMEAT,
+        flags,
+        fd: libc::AT_FDCWD,
+        addr: names[0].as_ptr() as u64,
+        // The new name's directory, and the new name.
+        len: libc::AT_FDCWD as u32,
+        off: names[1].as_ptr() as u64,
+        user_data,
+        ..Sqe::default()
     }
 }
 
 impl Drop for Uring {
     /// Kills the processes of spawns in flight and takes back from the kernel every buffer
-    /// it was lent (each request cancelled, its completion waited for), so none is freed while
-    /// the kernel may still write into it. What it does not give back in time is leaked.
+    /// it was lent (every request cancelled, its completions waited for), so none is freed
+    /// while the kernel may still write into it. What it does not give back in time is leaked,
+    /// with the provided buffers its receives write into.
     fn drop(&mut self) {
         for spawn in self.spawns.values() {
             if !spawn.exited {
@@ -1682,38 +2133,44 @@ impl Drop for Uring {
             }
         }
         // Never handed to the kernel.
-        for id in std::mem::take(&mut self.waiting) {
+        for id in std::mem::take(&mut self.waiting).into_iter().chain(std::mem::take(&mut self.for_buffers)) {
             self.pending.remove(&id);
         }
+        let mut owed: FxHashMap<u64, usize> =
+            self.pending.iter().map(|(&id, it)| (id, it.op.owed())).collect();
         let deadline = Instant::now() + LETTING_GO;
         let mut posted = Vec::new();
-        let targets: Vec<u64> = self.pending.keys().copied().collect();
+        let cancel = Sqe {
+            opcode: OP_ASYNC_CANCEL,
+            fd: -1,
+            op_flags: ASYNC_CANCEL_ALL | ASYNC_CANCEL_ANY,
+            user_data: NOBODY,
+            ..Sqe::default()
+        };
         let mut alive = true;
-        for target in targets {
-            let cancel = Sqe {
-                opcode: OP_ASYNC_CANCEL,
-                fd: -1,
-                addr: target,
-                user_data: NOBODY,
-                ..Sqe::default()
-            };
-            while alive && !self.ring.push(cancel) {
-                alive = Instant::now() < deadline && self.ring.enter(None).is_ok();
-                self.ring.reap(|user_data, res, more| posted.push((user_data, res, more)));
-            }
+        while alive && !self.pending.is_empty() && !self.ring.push(&[cancel]) {
+            alive = Instant::now() < deadline && self.ring.enter(None).is_ok();
+            self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
         }
         while alive {
-            for (id, res, more) in posted.drain(..) {
-                if res >= 0
-                    && let Some(Pending { op: Op::Accept { .. }, .. }) = self.pending.get(&id)
-                {
-                    // SAFETY: a connection the accept made after it was cancelled, owned here
-                    // and closed.
-                    drop(unsafe { OwnedFd::from_raw_fd(res) });
+            for (user_data, res, flags) in posted.drain(..) {
+                let id = user_data >> 2;
+                match self.pending.get(&id).map(|it| &it.op) {
+                    // A connection the accept made after it was cancelled, let go here.
+                    Some(Op::Accept { .. }) if res >= 0 => _ = self.table.set(res as u32, -1),
+                    Some(Op::Recv { .. }) if flags & CQE_F_BUFFER != 0 => {
+                        self.provided.give((flags >> CQE_BUFFER_SHIFT) as u16);
+                    }
+                    _ => {}
                 }
                 // A multishot request the kernel still holds is not given back yet.
-                if !more {
-                    self.pending.remove(&id);
+                if flags & CQE_F_MORE == 0
+                    && let Some(left) = owed.get_mut(&id)
+                {
+                    *left -= 1;
+                    if *left == 0 {
+                        self.pending.remove(&id);
+                    }
                 }
             }
             let left = deadline.saturating_duration_since(Instant::now());
@@ -1722,10 +2179,16 @@ impl Drop for Uring {
                 break;
             }
             alive = self.ring.enter(Some(left)).is_ok();
-            self.ring.reap(|user_data, res, more| posted.push((user_data, res, more)));
+            self.ring.reap(|user_data, res, flags| posted.push((user_data, res, flags)));
         }
         for (_, spawn) in std::mem::take(&mut self.spawns) {
             _ = spawn.end();
+        }
+        let lent = self.pending.values().any(|it| !matches!(it.op, Op::Cancel { .. }))
+            || !self.abandoned.is_empty();
+        if !lent {
+            // SAFETY: dropped once, here; no request the kernel holds writes into it.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.provided) };
         }
         std::mem::forget(std::mem::take(&mut self.pending));
         std::mem::forget(std::mem::take(&mut self.abandoned));
@@ -1762,9 +2225,13 @@ fn gone(conn: Conn) -> io::Error {
     )
 }
 
+fn c_path(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))
+}
+
 fn open(path: &Path, make: bool) -> io::Result<OwnedFd> {
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))?;
+    let path = c_path(path)?;
     let flags =
         libc::O_RDWR | libc::O_APPEND | libc::O_CLOEXEC | if make { libc::O_CREAT } else { 0 };
     // SAFETY: a NUL-terminated path; the descriptor returned is this driver's.
@@ -1783,8 +2250,7 @@ fn create(path: &Path) -> io::Result<OwnedFd> {
 
 /// A file opened for writing where it is told to; `flags` added to the opening's.
 fn open_to_write(path: &Path, flags: libc::c_int) -> io::Result<OwnedFd> {
-    let path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))?;
+    let path = c_path(path)?;
     let flags = libc::O_WRONLY | libc::O_CLOEXEC | flags;
     // SAFETY: a NUL-terminated path; the descriptor returned is this driver's.
     let fd = unsafe { libc::open(path.as_ptr(), flags, 0o644 as libc::c_uint) };
@@ -1795,14 +2261,76 @@ fn open_to_write(path: &Path, flags: libc::c_int) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// The directory `path` is in, opened to be synced.
+fn open_dir_of(path: &Path) -> io::Result<OwnedFd> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let dir = c_path(dir)?;
+    // SAFETY: a NUL-terminated path; the descriptor returned is this driver's.
+    let fd = unsafe { libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 fn size_of_file(fd: RawFd) -> io::Result<u64> {
-    // SAFETY: `stat` is written by the call.
+    // SAFETY: `libc::stat` is a C struct of integers and arrays of them, for which all-zero
+    // bytes is a valid value.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: an open descriptor and a `stat` to write.
     if unsafe { libc::fstat(fd, &mut stat) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(stat.st_size as u64)
+}
+
+/// Makes a TCP listener's connections, which they inherit it from, send each write at once.
+fn no_delay(listener: &crate::net::Listener) -> io::Result<()> {
+    if listener.is_unix() {
+        return Ok(());
+    }
+    let on: libc::c_int = 1;
+    // SAFETY: an open socket and an int option of the size given.
+    let set = unsafe {
+        libc::setsockopt(
+            listener.fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            (&raw const on).cast(),
+            size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if set != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A socket made for a connect, its writes sent at once where it is TCP's, in the driver's
+/// half of the table.
+fn connect_socket(table: &Rc<Table>, domain: libc::c_int) -> io::Result<Rc<Fixed>> {
+    let fd = crate::net::stream_socket(domain)?;
+    if domain != libc::AF_UNIX {
+        let on: libc::c_int = 1;
+        // SAFETY: an open socket and an int option of the size given.
+        let set = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                (&raw const on).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if set != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    table.install(fd)
 }
 
 impl Driver for Uring {
@@ -1837,18 +2365,23 @@ impl Driver for Uring {
                 Effect::Write { file, bytes, .. } => {
                     let path = at(&file);
                     let temporary = crate::fs::temporary_next_to(&path);
-                    crate::fs::make_parent(&path).and_then(|()| create(&temporary)).map(|fd| {
-                        self.start(tag, Op::Write {
-                            fd,
-                            bytes,
-                            put: 0,
-                            synced: false,
-                            temporary,
-                            path,
-                            file,
-                        });
-                        None
-                    })
+                    crate::fs::make_parent(&path)
+                        .and_then(|()| Ok((c_path(&temporary)?, c_path(&path)?)))
+                        .and_then(|names| Ok((names, open_dir_of(&path)?)))
+                        .and_then(|(names, dir)| Ok((names, dir, create(&temporary)?)))
+                        .map(|((from, to), dir, fd)| {
+                            self.start(tag, Op::Write {
+                                fd,
+                                dir,
+                                bytes,
+                                put: 0,
+                                temporary,
+                                names: Box::new([from, to]),
+                                file,
+                                chain: Chain::default(),
+                            });
+                            None
+                        })
                 }
                 Effect::Clone { from, to, .. } => {
                     self.forget(&to);
@@ -1861,18 +2394,29 @@ impl Driver for Uring {
                 Effect::Stat { file, .. } => crate::fs::stat(&at(&file)).map(|it| Some(Done::Stat(it))),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
                 Effect::WriteAt { file, at: offset, bytes, .. } => {
-                    open_to_write(&at(&file), 0).map(|fd| match bytes.is_empty() {
-                        true => Some(Done::Written),
+                    open_to_write(&at(&file), 0).and_then(|fd| match bytes.is_empty() {
+                        true => Ok(Some(Done::Written)),
                         false => {
-                            self.start(tag, Op::WriteAt { fd, at: offset, bytes, put: 0 });
-                            None
+                            let direct = self.direct(fd.as_raw_fd(), offset, bytes.len())?;
+                            let op = Op::WriteAt { fd, at: offset, bytes, put: 0, direct, buffer: None };
+                            self.start(tag, op);
+                            Ok(None)
                         }
                     })
                 }
                 Effect::Rename { from, to, .. } => {
                     self.forget(&from);
                     self.forget(&to);
-                    crate::fs::rename(&at(&from), &at(&to)).map(|()| Some(Done::Renamed))
+                    let (from, to) = (at(&from), at(&to));
+                    crate::fs::make_parent(&to).and_then(|()| {
+                        let names = Box::new([c_path(&from)?, c_path(&to)?]);
+                        let mut dirs = vec![open_dir_of(&to)?];
+                        if from.parent() != to.parent() {
+                            dirs.push(open_dir_of(&from)?);
+                        }
+                        self.start(tag, Op::Rename { names, dirs, chain: Chain::default() });
+                        Ok(None)
+                    })
                 }
                 Effect::Mode { file, mode, .. } => {
                     crate::fs::set_mode(&at(&file), mode).map(|()| Some(Done::Moded))
@@ -1893,12 +2437,12 @@ impl Driver for Uring {
                     unreachable!("taken above")
                 }
                 Effect::ReadAll { file, .. } => match self.file(&file, false) {
-                    Ok(fd) => size_of_file(fd).map(|size| {
+                    Ok(file) => size_of_file(file.fd()).map(|size| {
                         let bytes = vec![0; size as usize];
                         match size {
                             0 => Some(Done::Read(bytes)),
                             _ => {
-                                self.start(tag, Op::Read { fd, at: 0, bytes, got: 0 });
+                                self.start(tag, Op::Read { file, at: 0, bytes, got: 0 });
                                 None
                             }
                         }
@@ -1908,26 +2452,26 @@ impl Driver for Uring {
                     }
                     Err(error) => Err(error),
                 },
-                Effect::Read { file, at, len, .. } => self.file(&file, false).map(|fd| {
-                    self.start(tag, Op::Read { fd, at, bytes: vec![0; len], got: 0 });
+                Effect::Read { file, at, len, .. } => self.file(&file, false).map(|file| {
+                    self.start(tag, Op::Read { file, at, bytes: vec![0; len], got: 0 });
                     None
                 }),
                 Effect::Append { file, bytes, .. } => {
-                    self.file(&file, true).map(|fd| match bytes.is_empty() {
+                    self.file(&file, true).map(|file| match bytes.is_empty() {
                         true => Some(Done::Appended),
                         false => {
-                            self.start(tag, Op::Append { fd, bytes, put: 0 });
+                            self.start(tag, Op::Append { file, bytes, put: 0 });
                             None
                         }
                     })
                 }
-                Effect::Sync { file, .. } => self.file(&file, true).map(|fd| {
-                    self.start(tag, Op::Sync { fd });
+                Effect::Sync { file, .. } => self.file(&file, true).map(|file| {
+                    self.start(tag, Op::Sync { file });
                     None
                 }),
-                Effect::Truncate { file, len, .. } => self.file(&file, true).and_then(|fd| {
+                Effect::Truncate { file, len, .. } => self.file(&file, true).and_then(|file| {
                     // SAFETY: an open descriptor.
-                    match unsafe { libc::ftruncate(fd, len as libc::off_t) } {
+                    match unsafe { libc::ftruncate(file.fd(), len as libc::off_t) } {
                         0 => Ok(Some(Done::Truncated)),
                         _ => Err(io::Error::last_os_error()),
                     }
@@ -1943,33 +2487,32 @@ impl Driver for Uring {
                 Effect::Map { file, .. } => crate::fs::map(&at(&file)).map(|it| Some(Done::Mapped(it))),
                 Effect::Spawn { command, .. } => self.spawn(tag, command).map(|()| None),
                 Effect::Listen { at: address, .. } => {
-                    crate::net::listen(&self.root, &address).map(|listener| {
+                    crate::net::listen(&self.root, &address).and_then(|listener| {
+                        no_delay(&listener)?;
                         let id = self.start(tag, Op::Accept { listener, stopping: false });
                         self.listens.insert(tag, id);
-                        None
+                        Ok(None)
                     })
                 }
                 Effect::Connect { at: address, .. } => crate::net::sockaddr(&self.root, &address)
                     .and_then(|address| {
-                        let fd = crate::net::stream_socket(address.domain)?;
-                        self.start(tag, Op::Connect { fd: Some(fd), at: Box::new(address) });
+                        let socket = connect_socket(&self.table, address.domain)?;
+                        let op = Op::Connect { socket: Some(socket), at: Box::new(address) };
+                        self.start(tag, op);
                         Ok(None)
                     }),
-                Effect::Recv { conn, most, .. } => self.use_conn(conn).map(|fd| {
-                    self.start(tag, Op::Recv { conn, fd, bytes: vec![0; most] });
-                    None
-                }),
+                Effect::Recv { conn, most, .. } => self.recv(conn, tag, most).map(|()| None),
                 Effect::Send { conn, bytes, .. } if bytes.is_empty() => self
                     .conns
                     .get(&conn)
                     .filter(|it| !it.hung)
                     .map(|_| Some(Done::Sent))
                     .ok_or_else(|| gone(conn)),
-                Effect::Send { conn, bytes, .. } => self.use_conn(conn).map(|fd| {
-                    self.start(tag, Op::Send { conn, fd, bytes, put: 0 });
+                Effect::Send { conn, bytes, .. } => self.use_conn(conn).map(|socket| {
+                    self.start(tag, Op::Send { conn, socket, bytes, put: 0 });
                     None
                 }),
-                Effect::Hangup { conn, .. } => self.hang_up(conn).map(|()| Some(Done::HungUp)),
+                Effect::Hangup { conn, .. } => self.hang_up(conn, tag).map(|()| None),
             };
             match started {
                 Ok(None) => {}
@@ -1979,6 +2522,7 @@ impl Driver for Uring {
                     .push(Completion { tag, done: Done::Failed(IoError(error.to_string())) }),
             }
         }
+        self.flush_waiting();
         self.submit_ring();
     }
 
@@ -2513,5 +3057,198 @@ mod tests {
         // SAFETY: no pointers.
         assert_eq!(unsafe { libc::waitpid(pid, ptr::null_mut(), libc::WNOHANG) }, -1);
         assert!(!root.join("api.sock").exists());
+    }
+
+    /// A file kept open is in the driver's half of the table, and its reads and appends name
+    /// the slot; forgetting it empties the slot for the next.
+    #[test]
+    fn kept_files_are_registered() {
+        let root = dir("uring-fixed");
+        let mut driver = Uring::new(&root).unwrap();
+        let name = |it: &str| FileName::new(it).unwrap();
+        let mut effects = vec![
+            Effect::Append { file: name("a"), bytes: b"one".to_vec(), tag: Tag(1) },
+            Effect::Append { file: name("b"), bytes: b"two".to_vec(), tag: Tag(2) },
+        ];
+        let mut seen = Vec::new();
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        assert_eq!(seen, [Done::Appended, Done::Appended]);
+        let slot = |driver: &Uring, it: &str| driver.files[&name(it)].slot;
+        let (a, b) = (slot(&driver, "a").expect("a slot"), slot(&driver, "b").expect("a slot"));
+        assert!(a != b && a < driver.table.ours && b < driver.table.ours, "{a} {b}");
+        let free = driver.table.free.borrow().len();
+        let mut effects = vec![
+            Effect::Read { file: name("a"), at: 0, len: 3, tag: Tag(3) },
+            Effect::Remove { file: name("b"), tag: Tag(4) },
+        ];
+        let mut seen = Vec::new();
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        assert_eq!(seen, [Done::Read(b"one".to_vec()), Done::Removed]);
+        assert_eq!(driver.table.free.borrow().len(), free + 1);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The kernel's submission thread sleeps once idle; a request written after is still
+    /// taken, the thread woken by the enter that says so.
+    #[test]
+    fn a_sleeping_submission_thread_is_woken() {
+        let root = dir("uring-sqpoll");
+        let mut driver = Uring::new(&root).unwrap();
+        let file = FileName::new("log").unwrap();
+        for n in 0..3u8 {
+            std::thread::sleep(Duration::from_millis(u64::from(SQ_THREAD_IDLE_MS) * 4));
+            assert_ne!(driver.ring.flags() & SQ_NEED_WAKEUP, 0, "asleep after {SQ_THREAD_IDLE_MS} ms idle");
+            let began = Instant::now();
+            let mut effects = vec![Effect::Append { file: file.clone(), bytes: vec![n], tag: Tag(n.into()) }];
+            let mut seen = Vec::new();
+            run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+            assert_eq!(seen, [Done::Appended]);
+            assert!(began.elapsed() < Duration::from_secs(1), "{:?}", began.elapsed());
+        }
+        assert_eq!(std::fs::read(root.join("log")).unwrap(), [0, 1, 2]);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Aligned writes of a MiB or more, more at once than there are registered buffers, each
+    /// read back as written; where the file system takes `O_DIRECT` they bypassed the cache.
+    /// A write that is not aligned goes through the cache.
+    #[test]
+    fn aligned_writes_read_back_equal() {
+        let root = dir("uring-direct");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let pack = FileName::new("store/pack").unwrap();
+        let piece = 3 * DIRECT_PIECE / 2;
+        let count = 2 * DIRECT_BUFFERS as usize;
+        let bytes = |n: usize| -> Vec<u8> { (0..piece).map(|at| (at * 31 + n * 7) as u8).collect() };
+        std::fs::create_dir_all(root.join("store")).unwrap();
+        std::fs::write(root.join("store/pack"), b"").unwrap();
+        let mut effects: Vec<Effect> = (0..count)
+            .map(|n| Effect::WriteAt { file: pack.clone(), at: (n * piece) as u64, bytes: bytes(n), tag: Tag(n as u64) })
+            .collect();
+        let odd = (count * piece) as u64 + 7;
+        effects.push(Effect::WriteAt { file: pack.clone(), at: odd, bytes: vec![9; DIRECT_PIECE + 1], tag: Tag(99) });
+        let mut seen = Vec::new();
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        assert_eq!(seen, vec![Done::Written; count + 1]);
+        let file = std::fs::read(root.join("store/pack")).unwrap();
+        for n in 0..count {
+            assert!(file[n * piece..(n + 1) * piece] == bytes(n), "piece {n}");
+        }
+        assert!(file[odd as usize..].iter().all(|&it| it == 9));
+        let fd = open(&root.join("store/pack"), false).unwrap();
+        let (device, align) = direct_alignment(fd.as_raw_fd()).unwrap();
+        let aligned = align != 0 && piece % align as usize == 0 && DIRECT_PIECE % align as usize == 0;
+        let direct = if aligned && !driver.refused.contains(&device) { count as u64 } else { 0 };
+        assert_eq!(driver.direct_writes(), direct, "alignment {align}");
+        assert_eq!(driver.registered.free.len(), DIRECT_BUFFERS as usize);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Many sends, one after another, received by one multishot receive through a ring of
+    /// fewer buffers than they fill, in order and whole.
+    #[test]
+    fn one_receive_takes_many_messages_through_few_buffers() {
+        let root = dir("uring-multishot");
+        let mut ring = Uring::new(&root).unwrap();
+        let at = Address::Unix(FileName::new("s.sock").unwrap());
+        let message = |n: usize| -> Vec<u8> { (0..4096).map(|at| (at + n) as u8).collect() };
+        let messages = 4 * RECV_BUFFERS as usize * RECV_BUFFER / 4096;
+        let mut effects = vec![
+            Effect::Listen { at: at.clone(), tag: Tag(1) },
+            Effect::Connect { at, tag: Tag(2) },
+        ];
+        let (mut server, mut client) = (None, None);
+        let (mut sent, mut got) = (0, Vec::new());
+        let mut tag = 10;
+        run_until_idle(&mut ring, &mut effects, |done, effects| {
+            let mut next = || {
+                tag += 1;
+                Tag(tag)
+            };
+            match &done.done {
+                Done::Accepted { conn } => server = Some(*conn),
+                Done::Connected { conn } => client = Some(*conn),
+                Done::Sent => sent += 1,
+                Done::Read(bytes) => {
+                    assert!(!bytes.is_empty(), "ended after {} bytes", got.len());
+                    got.extend_from_slice(bytes);
+                }
+                Done::Unlistened | Done::HungUp => {}
+                other => panic!("{other:?}"),
+            }
+            let (Some(server), Some(client)) = (server, client) else { return };
+            if matches!(done.done, Done::Accepted { .. } | Done::Connected { .. }) {
+                effects.push(Effect::Recv { conn: server, most: 64 << 10, tag: next() });
+                effects.push(Effect::Send { conn: client, bytes: message(0), tag: next() });
+                return;
+            }
+            if matches!(done.done, Done::Sent) && sent < messages {
+                effects.push(Effect::Send { conn: client, bytes: message(sent), tag: next() });
+            }
+            if matches!(done.done, Done::Read(_)) {
+                if got.len() < messages * 4096 {
+                    effects.push(Effect::Recv { conn: server, most: 64 << 10, tag: next() });
+                } else {
+                    effects.push(Effect::Hangup { conn: client, tag: next() });
+                    effects.push(Effect::Hangup { conn: server, tag: next() });
+                    effects.push(Effect::Unlisten { tag: Tag(1) });
+                }
+            }
+        });
+        assert_eq!(sent, messages);
+        let wanted: Vec<u8> = (0..messages).flat_map(message).collect();
+        assert!(got == wanted, "{} bytes of {}", got.len(), wanted.len());
+        assert_eq!(ring.in_flight(), 0);
+        assert!(ring.conns.is_empty());
+        drop(ring);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A whole file's write is one linked chain: written, synced, renamed over the old and the
+    /// directory synced. Where the rename fails the old is as it was and no temporary is left;
+    /// a rename across directories is linked to both directories' syncs.
+    #[test]
+    fn a_linked_write_whose_rename_fails_leaves_the_old() {
+        let root = dir("uring-linked");
+        std::fs::create_dir_all(root.join("out/blocked")).unwrap();
+        std::fs::write(root.join("out/blocked/kept"), b"old").unwrap();
+        std::fs::write(root.join("out/file"), b"old").unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let name = |it: &str| FileName::new(it).unwrap();
+        let mut effects = vec![
+            Effect::Write { file: name("out/blocked"), bytes: b"new".to_vec(), tag: Tag(1) },
+            Effect::Write { file: name("out/file"), bytes: vec![5; 3 << 20], tag: Tag(2) },
+            Effect::Write { file: name("out/fresh"), bytes: Vec::new(), tag: Tag(3) },
+        ];
+        let mut seen = BTreeMap::new();
+        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, shown(&done.done)));
+        assert_eq!(
+            seen,
+            BTreeMap::from([(1, "failed".to_owned()), (2, "Written".to_owned()), (3, "Written".to_owned())])
+        );
+        assert_eq!(std::fs::read(root.join("out/blocked/kept")).unwrap(), b"old");
+        assert_eq!(std::fs::read(root.join("out/file")).unwrap(), vec![5; 3 << 20]);
+        assert_eq!(std::fs::read(root.join("out/fresh")).unwrap(), b"");
+        let mut left: Vec<String> = std::fs::read_dir(root.join("out"))
+            .unwrap()
+            .map(|it| it.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["blocked", "file", "fresh"]);
+        let mut effects = vec![
+            Effect::Rename { from: name("out/file"), to: name("moved/file"), tag: Tag(4) },
+            Effect::Rename { from: name("out/missing"), to: name("out/other"), tag: Tag(5) },
+        ];
+        let mut seen = BTreeMap::new();
+        run_until_idle(&mut driver, &mut effects, |done, _| _ = seen.insert(done.tag.0, shown(&done.done)));
+        assert_eq!(seen, BTreeMap::from([(4, "Renamed".to_owned()), (5, "failed".to_owned())]));
+        assert_eq!(std::fs::read(root.join("moved/file")).unwrap().len(), 3 << 20);
+        assert!(!root.join("out/file").exists());
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

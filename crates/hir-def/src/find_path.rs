@@ -308,6 +308,9 @@ fn find_path_for_module<'db>(
             ctx.db,
             ctx.from_def_map,
             ctx.from,
+            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
+            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
+            // when the query that made it reruns, which reruns this one too.
             ItemInNs::Types(unsafe { module_id.to_static() }.into()),
             ctx.ignore_local_imports,
         );
@@ -325,6 +328,9 @@ fn find_path_for_module<'db>(
     }
 
     // - if the module is in the prelude, return it by that path
+    // SAFETY: the id was read from `db` in this computation and is used only while `db` is borrowed
+    // (as a key or in this query's result); salsa deletes a tracked struct only when the query that
+    // made it reruns, which reruns this one too.
     let item = ItemInNs::Types(unsafe { module_id.to_static() }.into());
     if let Some(choice) = find_in_prelude(ctx.db, st, ctx.from_def_map, item, ctx.from) {
         return Some(choice);
@@ -562,7 +568,8 @@ fn calculate_best_path_local<'db>(
 }
 
 /// A candidate path: its kind, its segments as a chain in [`FindPathScratch::segments`], and
-/// what the tie-breaks compare. 24 bytes, `Copy`; comparing two is a few integer compares.
+/// what the tie-breaks compare. 28 bytes (the `PathKind` is 12: `DollarCrate` holds a salsa id),
+/// `Copy`; comparing two is a few integer compares.
 #[derive(Clone, Copy, Debug)]
 struct Choice {
     kind: PathKind,
@@ -578,7 +585,7 @@ struct Choice {
     has_prelude_segment: bool,
 }
 
-const _: () = assert!(size_of::<Choice>() <= 24);
+const _: () = assert!(size_of::<Choice>() <= 28);
 
 impl Choice {
     /// A path of `kind` alone: `crate`, `self` or `super`.
@@ -2612,6 +2619,10 @@ pub mod future {
                     ctx.db,
                     ctx.from_def_map,
                     ctx.from,
+                    // SAFETY: the id was read from `db` in this computation and is used only while
+                    // `db` is borrowed (as a key or in this query's result); salsa deletes a
+                    // tracked struct only when the query that made it reruns, which reruns this one
+                    // too.
                     ItemInNs::Types(unsafe { module_id.to_static() }.into()),
                     ctx.ignore_local_imports,
                 );
@@ -2630,6 +2641,9 @@ pub mod future {
                     has_prelude_segment: false,
                 });
             }
+            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
+            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
+            // when the query that made it reruns, which reruns this one too.
             let item = ItemInNs::Types(unsafe { module_id.to_static() }.into());
             if let Some(choice) = find_in_prelude(ctx.db, ctx.from_def_map, item, ctx.from) {
                 return Some(choice);
@@ -3444,6 +3458,6 @@ pub mod future {
     #[test]
     fn choice_layout() {
         assert_eq!(size_of::<Segment>(), 16);
-        assert!(size_of::<Choice>() <= 24);
+        assert!(size_of::<Choice>() <= 28);
     }
 }

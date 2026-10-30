@@ -160,6 +160,20 @@ impl<'a> Bindings<'a> {
         &self.fragments[idx as usize]
     }
 
+    /// The token trees of all the fragments bound: what the transcriber reserves room for with
+    /// the template's own.
+    fn token_trees(&self) -> usize {
+        self.fragments
+            .iter()
+            .map(|fragment| match fragment {
+                Fragment::Empty => 0,
+                Fragment::Tokens { tree, .. } => tree.len(),
+                Fragment::Expr(it) | Fragment::Path(it) | Fragment::Ty(it) => it.len(),
+                Fragment::TokensOwned(it) => it.as_token_trees().len(),
+            })
+            .sum()
+    }
+
     /// The bindings under `binding`, each leaf counting one: how a match ranks among the
     /// rules' (`Match::bound_count`).
     fn bound(&self, binding: Binding) -> usize {

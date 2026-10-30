@@ -39,7 +39,7 @@
 //! src/interface.rs` (`parse_attribute_list`: the order of a node's attributes),
 //! `compiler/rustc_codegen_ssa/src/codegen_attrs.rs` and `compiler/rustc_middle/src/middle/
 //! codegen_fn_attrs.rs` (`contains_extern_indicator`), `compiler/rustc_abi/src/extern_abi.rs`
-//! (the ABIs) and `compiler/rustc_session/src/output.rs` (`collect_crate_types`) as of the July
+//! (the ABIs) and `compiler/rustc_interface/src/passes.rs` (`collect_crate_types`) as of the July
 //! 2026 checkout; nothing of them is known to differ in `nightly-2026-10-27` (MIT or
 //! Apache-2.0).
 

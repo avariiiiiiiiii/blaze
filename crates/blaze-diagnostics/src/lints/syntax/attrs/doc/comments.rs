@@ -65,7 +65,7 @@ pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner, emitted: &mut Vec<Emitted>)
     let attrs = &owner.attrs;
     let mut sugared: Option<InFile<TextRange>> = None;
     for (i, attr) in attrs.iter().enumerate() {
-        let is_doc_attribute = !attr.is_doc_comment() && attr.is("doc");
+        let is_doc_attribute = super::is_doc(attr);
         let is_doc = attr.is_doc_comment() || is_doc_attribute;
         let range = attr.in_file(attr.range());
         if is_doc {
@@ -129,7 +129,7 @@ fn is_block(node: &SyntaxNode) -> bool {
 
 /// The `mod` items module files are declared by, found once when a lint needs one.
 #[derive(Default)]
-pub(super) struct Modules(Option<FxHashMap<HirFileId, InFile<SyntaxNodePtr>>>);
+pub(in crate::lints::syntax::attrs) struct Modules(Option<FxHashMap<HirFileId, InFile<SyntaxNodePtr>>>);
 
 impl Modules {
     fn declaration(&mut self, cx: &Cx<'_, '_>, file: HirFileId) -> Option<InFile<SyntaxNodePtr>> {
@@ -152,7 +152,7 @@ impl Modules {
 /// (`current_expansion.lint_node_id`): the innermost node around the call that the invocation
 /// collector gives an id of its own, through the expansions the call is in. A module file's
 /// root is its `mod` item.
-pub(super) fn lint_node(cx: &Cx<'_, '_>, call: &InFile<SyntaxNode>, modules: &mut Modules) -> InFile<SyntaxNodePtr> {
+pub(in crate::lints::syntax::attrs) fn lint_node(cx: &Cx<'_, '_>, call: &InFile<SyntaxNode>, modules: &mut Modules) -> InFile<SyntaxNodePtr> {
     let mut at = call.clone();
     loop {
         // `at` itself is a macro call (or what an attribute macro or derive is on): no node

@@ -25,6 +25,8 @@
 //! function may use the `simd128` feature. A wasm instruction Cranelift has no opcode for is
 //! a call of a name of [`INSTRUCTION`], which is lowered to the instruction in place.
 
+#![forbid(unsafe_code)]
+
 mod v128;
 
 pub use v128::{INSTRUCTION, Instruction};

@@ -7,6 +7,8 @@
 //! as integers: through the library each was a call, and the slots on both sides escaped,
 //! which kept [`promote`](super::promote) from taking them out of the frame.
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::{
     cursor::{Cursor, FuncCursor},
     ir::{self, InstBuilder, InstructionData, Opcode, Value, condcodes::IntCC, types},

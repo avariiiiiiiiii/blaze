@@ -13,6 +13,8 @@
 //! - [`check`]: a crate's diagnostics in the order rustc gives them, stopping where it stops.
 //! - [`api`]: a diagnostic as the agent API sends it.
 
+#![forbid(unsafe_code)]
+
 pub mod api;
 pub mod check;
 mod checks;

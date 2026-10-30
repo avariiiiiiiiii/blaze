@@ -45,85 +45,161 @@ mod sys {
 
     /// The text at `ptr`, as the wasm host reads it.
     ///
-    /// SAFETY: `ptr` and `len` are those of a `&str` the caller holds.
+    /// # Safety
+    ///
+    /// `ptr` and `len` are those of a `&str` the caller holds.
     unsafe fn read(ptr: *const u8, len: usize) -> String {
+        // SAFETY: the caller gives the `ptr` and `len` of a `&str` it holds (# Safety).
         String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned()
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn def_site() -> u32 {
         host(|it| it.def_site())
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn call_site() -> u32 {
         host(|it| it.call_site())
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn mixed_site() -> u32 {
         host(|it| it.mixed_site())
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_join(a: u32, b: u32) -> u32 {
         host(|it| it.span_join(a, b))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_resolved_at(a: u32, b: u32) -> u32 {
         host(|it| it.span_resolved_at(a, b))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_located_at(a: u32, b: u32) -> u32 {
         host(|it| it.span_located_at(a, b))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_parent(a: u32) -> u32 {
         host(|it| it.span_parent(a))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_source(a: u32) -> u32 {
         host(|it| it.span_source(a))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_start(a: u32) -> u32 {
         host(|it| it.span_start(a))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_end(a: u32) -> u32 {
         host(|it| it.span_end(a))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_subspan(a: u32, start: u64, end: u64) -> u32 {
         host(|it| it.span_subspan(a, start, end))
     }
 
-    /// SAFETY: `out` is room for two `u32`s.
+    /// # Safety
+    ///
+    /// `out` is room for two `u32`s.
     pub unsafe fn span_byte_range(a: u32, out: *mut u32) {
         let [start, end] = host(|it| it.span_byte_range(a));
-        unsafe {
-            out.write(start);
-            out.add(1).write(end);
-        }
+        // SAFETY: the caller gives `out` room for two `u32`s (# Safety).
+        unsafe { out.write(start) };
+        // SAFETY: the second of those two is inside the same room.
+        let second = unsafe { out.add(1) };
+        // SAFETY: `second` is the second `u32` of the caller's room.
+        unsafe { second.write(end) };
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_line(a: u32) -> u32 {
         host(|it| it.span_line(a))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_column(a: u32) -> u32 {
         host(|it| it.span_column(a))
     }
 
     /// The length of the text put in the buffer for [`take`], or -1 for none.
+    ///
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_debug(a: u32) -> i32 {
         give_text(host(|it| it.span_debug(a)))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_file(a: u32) -> i32 {
         give_text(host(|it| it.span_file(a)))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_local_file(a: u32) -> i32 {
         give_text(host(|it| it.span_local_file(a)))
     }
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn span_source_text(a: u32) -> i32 {
         give_text(host(|it| it.span_source_text(a)))
     }
@@ -131,8 +207,11 @@ mod sys {
     /// A stream lexed from the text: its encoding's length in the buffer, or `-1 - len`
     /// with the error's text of `len` bytes there.
     ///
-    /// SAFETY: `ptr` and `len` are those of a `&str` the caller holds.
+    /// # Safety
+    ///
+    /// `ptr` and `len` are those of a `&str` the caller holds.
     pub unsafe fn ts_from_str(ptr: *const u8, len: usize) -> i32 {
+        // SAFETY: `ptr` and `len` are the caller's `&str` (this fn's # Safety), as `read` needs.
         let text = unsafe { read(ptr, len) };
         match host(|it| it.ts_from_str(&text)) {
             Ok(stream) => give(stream),
@@ -140,8 +219,11 @@ mod sys {
         }
     }
 
-    /// SAFETY: `ptr` and `len` are those of a `&str` the caller holds.
+    /// # Safety
+    ///
+    /// `ptr` and `len` are those of a `&str` the caller holds.
     pub unsafe fn literal_from_str(ptr: *const u8, len: usize) -> i32 {
+        // SAFETY: `ptr` and `len` are the caller's `&str` (this fn's # Safety), as `read` needs.
         let text = unsafe { read(ptr, len) };
         match host(|it| it.literal_from_str(&text)) {
             Some(literal) => give(literal),
@@ -151,24 +233,42 @@ mod sys {
 
     /// Copies the buffer to `to`, and empties it.
     ///
-    /// SAFETY: `to` is room for as many bytes as the call that filled the buffer said it
+    /// # Safety
+    ///
+    /// `to` is room for as many bytes as the call that filled the buffer said it
     /// holds, as `taken` makes right after that call.
     pub unsafe fn take(to: *mut u8) {
         let buffer = BUFFER.with(|it| std::mem::take(&mut *it.borrow_mut()));
+        // SAFETY: `to` has room for `buffer.len()` bytes (# Safety: what the call that filled
+        // the buffer said), and a fresh `Vec` doesn't overlap it.
         unsafe { std::ptr::copy_nonoverlapping(buffer.as_ptr(), to, buffer.len()) };
     }
 
     // As the wasm host's, these grant nothing and show nothing.
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn track_path(_ptr: *const u8, _len: usize) {}
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn track_env_var(_ptr: *const u8, _len: usize) {}
 
+    /// # Safety
+    ///
+    /// None: `unsafe` only to have the signature of the wasm guest's imports, which this
+    /// `proc_macro` calls the same way.
     pub unsafe fn diagnostic(_level: u32, _ptr: *const u8, _len: usize, _span: u32) {}
 }
 
 fn taken(len: i32) -> Option<Vec<u8>> {
     let len = usize::try_from(len).ok()?;
     let mut bytes = vec![0u8; len];
+    // SAFETY: `bytes` has `len` bytes, the length the host answered for what is in its
+    // buffer, which `take` copies whole.
     unsafe { sys::take(bytes.as_mut_ptr()) };
     Some(bytes)
 }
@@ -229,6 +329,7 @@ impl FromStr for TokenStream {
     type Err = LexError;
 
     fn from_str(src: &str) -> Result<TokenStream, LexError> {
+        // SAFETY: the pointer and length are those of a live `&str` of this frame.
         let len = unsafe { sys::ts_from_str(src.as_ptr(), src.len()) };
         match taken(len) {
             Some(bytes) => Ok(wire::Reader::new(&bytes).stream()),
@@ -390,14 +491,17 @@ pub struct Span(u32);
 
 impl Span {
     pub fn def_site() -> Span {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span(unsafe { sys::def_site() })
     }
 
     pub fn call_site() -> Span {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span(unsafe { sys::call_site() })
     }
 
     pub fn mixed_site() -> Span {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span(unsafe { sys::mixed_site() })
     }
 
@@ -406,52 +510,64 @@ impl Span {
     }
 
     pub fn parent(&self) -> Option<Span> {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span::some(unsafe { sys::span_parent(self.0) })
     }
 
     pub fn source(&self) -> Span {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span(unsafe { sys::span_source(self.0) })
     }
 
     pub fn byte_range(&self) -> Range<usize> {
         let mut out = [0u32; 2];
+        // SAFETY: `out` is two writable `u32`s of this frame.
         unsafe { sys::span_byte_range(self.0, out.as_mut_ptr()) };
         out[0] as usize..out[1] as usize
     }
 
     pub fn start(&self) -> Span {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span(unsafe { sys::span_start(self.0) })
     }
 
     pub fn end(&self) -> Span {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span(unsafe { sys::span_end(self.0) })
     }
 
     pub fn line(&self) -> usize {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         unsafe { sys::span_line(self.0) as usize }
     }
 
     pub fn column(&self) -> usize {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         unsafe { sys::span_column(self.0) as usize }
     }
 
     pub fn file(&self) -> String {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         taken_string(unsafe { sys::span_file(self.0) }).unwrap_or_default()
     }
 
     pub fn local_file(&self) -> Option<PathBuf> {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         taken_string(unsafe { sys::span_local_file(self.0) }).map(PathBuf::from)
     }
 
     pub fn join(&self, other: Span) -> Option<Span> {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span::some(unsafe { sys::span_join(self.0, other.0) })
     }
 
     pub fn resolved_at(&self, other: Span) -> Span {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span(unsafe { sys::span_resolved_at(self.0, other.0) })
     }
 
     pub fn located_at(&self, other: Span) -> Span {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span(unsafe { sys::span_located_at(self.0, other.0) })
     }
 
@@ -460,6 +576,7 @@ impl Span {
     }
 
     pub fn source_text(&self) -> Option<String> {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         taken_string(unsafe { sys::span_source_text(self.0) })
     }
 
@@ -490,6 +607,7 @@ impl Span {
 
 impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         let text = taken_string(unsafe { sys::span_debug(self.0) }).unwrap_or_default();
         f.write_str(&text)
     }
@@ -936,6 +1054,7 @@ impl Literal {
             Bound::Excluded(at) => 3 + 4 * *at as u64,
         };
         let (start, end) = (bound(range.start_bound()), bound(range.end_bound()));
+        // SAFETY: this `sys` function takes integers only and has no requirement (its # Safety).
         Span::some(unsafe { sys::span_subspan(self.span.0, start, end) })
     }
 
@@ -981,6 +1100,7 @@ impl FromStr for Literal {
     type Err = LexError;
 
     fn from_str(src: &str) -> Result<Literal, LexError> {
+        // SAFETY: the pointer and length are those of a live `&str` of this frame.
         let len = unsafe { sys::literal_from_str(src.as_ptr(), src.len()) };
         let Some(bytes) = taken(len) else {
             return Err(LexError("cannot parse string into literal".to_owned()));
@@ -1164,6 +1284,7 @@ impl Diagnostic {
             Level::Help => 3,
         };
         let span = self.spans.first().map_or(0, |it| it.0);
+        // SAFETY: the pointer and length are those of a live `&str` of this frame.
         unsafe { sys::diagnostic(level, self.message.as_ptr(), self.message.len(), span) };
         for child in self.children {
             child.emit();
@@ -1180,12 +1301,14 @@ pub mod tracked {
 
     pub fn env_var<K: AsRef<OsStr> + AsRef<str>>(key: K) -> Result<String, VarError> {
         let key: &str = key.as_ref();
+        // SAFETY: the pointer and length are those of a live `&str` of this frame.
         unsafe { super::sys::track_env_var(key.as_ptr(), key.len()) };
         env::var(key)
     }
 
     pub fn path<P: AsRef<Path>>(path: P) {
         let path: &str = path.as_ref().to_str().unwrap();
+        // SAFETY: the pointer and length are those of a live `&str` of this frame.
         unsafe { super::sys::track_path(path.as_ptr(), path.len()) };
     }
 }

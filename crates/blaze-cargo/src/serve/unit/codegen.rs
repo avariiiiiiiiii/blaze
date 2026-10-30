@@ -210,6 +210,47 @@ pub(crate) struct Generated {
     pub(crate) policy: Policy,
 }
 
+/// The code generator's view of the job's front end, its files named as rustc names them.
+fn frontend(job: &Job, mounted: &Arc<Mounted>) -> HirFrontend {
+    let snapshot = Mutex::new(job.lowered.snapshot());
+    let databases = Databases::new(move || {
+        let snapshot = snapshot.lock().unwrap_or_else(|it| it.into_inner());
+        Box::new(snapshot.clone()) as Box<dyn HirDatabase + Send>
+    });
+    let names = {
+        let mounted = Arc::clone(mounted);
+        let paths = job.lowered.paths();
+        move |file: base_db::FileId| -> Option<String> { paths.get(&file).map(|path| mounted.name(path)) }
+    };
+    HirFrontend::new(databases, Box::new(ItemHashes::new(Box::new(names))), build_time(job))
+}
+
+/// The tests of test unit `unit` as its harness lists them, compiling nothing: the same
+/// listing, names and attributes as the test binary's ([`generate`]).
+pub(crate) fn test_roots(job: &Job, unit: usize) -> Result<Roots, String> {
+    let u = job.unit(unit).map_err(|it| it.what)?;
+    let krate = job
+        .lowered
+        .krate(unit)
+        .ok_or_else(|| format!("unit {unit} (`{}`) has no crate in the front end", u.target.name))?;
+    frontend(job, &job.mounted).roots(krate, RootKind::Test).map_err(|it| it.what)
+}
+
+/// The store as a build reads it: with no lock, under the build's guard.
+struct Reading<'a> {
+    store: &'a blaze_cas::Reader,
+    guard: &'a blaze_cas::Guard,
+}
+
+impl blaze_codegen::driver::Lookup for Reading<'_> {
+    fn get(&self, key: &blaze_cas::Key) -> Result<Option<Vec<u8>>, String> {
+        match self.store.get(self.guard, key) {
+            Ok(entry) => Ok(entry.map(|it| it.bytes.to_vec())),
+            Err(corrupt) => Err(corrupt.to_string()),
+        }
+    }
+}
+
 /// `unit`'s functions compiled from its roots: `Err` with the code generator's errors, each
 /// naming the function it could not compile.
 pub(crate) fn generate(
@@ -225,17 +266,7 @@ pub(crate) fn generate(
         .ok_or_else(|| format!("unit {unit} (`{}`) has no crate in the front end", u.target.name))?;
     let toolchain = toolchain(job, unit)?;
     let policy = policy(job, unit, toolchain)?;
-    let snapshot = Mutex::new(job.lowered.snapshot());
-    let databases = Databases::new(move || {
-        let snapshot = snapshot.lock().unwrap_or_else(|it| it.into_inner());
-        Box::new(snapshot.clone()) as Box<dyn HirDatabase + Send>
-    });
-    let names = {
-        let mounted = Arc::clone(mounted);
-        let paths = job.lowered.paths();
-        move |file: base_db::FileId| -> Option<String> { paths.get(&file).map(|path| mounted.name(path)) }
-    };
-    let frontend = HirFrontend::new(databases, Box::new(ItemHashes::new(Box::new(names))), build_time(job));
+    let frontend = frontend(job, mounted);
     let roots = match frontend.roots(krate, root_kind(u, makes)) {
         Ok(it) => it,
         Err(error) => return Ok(Err(vec![error.what])),
@@ -244,8 +275,9 @@ pub(crate) fn generate(
     let asked: Vec<(HirInstance, Origin)> = roots.roots.iter().map(|it| (it.clone(), origin.clone())).collect();
     let backends = Backends::default();
     let built = {
-        let store = job.input.store.read().unwrap_or_else(|it| it.into_inner());
-        Build::new(&backends, &frontend, &policy, &job.shared.memo).run(&asked, &*store)
+        let guard = blaze_cas::enter();
+        let store = Reading { store: &job.input.store, guard: &guard };
+        Build::new(&backends, &frontend, &policy, &job.shared.memo).run(&asked, &store)
     };
     match built {
         Ok(built) => Ok(Ok(Generated { built, roots, frontend, policy })),
@@ -265,8 +297,16 @@ pub(crate) struct Linked {
     names: Vec<String>,
 }
 
+impl Linked {
+    /// The image's tables as the linker counts them, each with its elements and bytes
+    /// ([`blaze_api::Response::Tables`]): `relocation` and the rest.
+    pub(crate) fn tables(&self) -> Vec<(&'static str, u64, u64)> {
+        self.image.tables()
+    }
+}
+
 /// What of sorted `old` is not in sorted `new`, and what of `new` is not in `old`, in one pass.
-fn diff<T: Ord + Copy>(old: &[T], new: &[T], removed: &mut Vec<T>, added: &mut Vec<T>) {
+pub(crate) fn diff<T: Ord + Copy>(old: &[T], new: &[T], removed: &mut Vec<T>, added: &mut Vec<T>) {
     let (mut a, mut b) = (0, 0);
     while a < old.len() && b < new.len() {
         match old[a].cmp(&new[b]) {
@@ -290,7 +330,7 @@ fn diff<T: Ord + Copy>(old: &[T], new: &[T], removed: &mut Vec<T>, added: &mut V
 
 /// The symbol names of a link, sorted, each kept `String` moved from the last link's rather
 /// than copied: only a name new to the image is allocated, and each name gone is moved out.
-fn renamed(old: Vec<String>, new: &mut Vec<&str>) -> (Vec<String>, Vec<String>) {
+pub(crate) fn renamed(old: Vec<String>, new: &mut Vec<&str>) -> (Vec<String>, Vec<String>) {
     new.sort_unstable();
     new.dedup();
     let mut kept = Vec::with_capacity(new.len());

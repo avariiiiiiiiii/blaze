@@ -8,7 +8,7 @@ use la_arena::ArenaMap;
 use syntax::ast::{self, HasVisibility};
 
 use crate::{
-    AssocItemId, HasModule, ItemContainerId, LocalFieldId, ModuleId, ModuleIdLt, TraitId,
+    AssocItemId, BlockIdLt, HasModule, ItemContainerId, LocalFieldId, ModuleId, ModuleIdLt, TraitId,
     VariantId, nameres::DefMap, resolver::HasResolver, signatures::VariantFields, src::HasSource,
 };
 
@@ -23,6 +23,20 @@ pub enum Visibility {
     PubCrate(Crate),
     /// Visibility is unrestricted.
     Public,
+}
+
+// A module id (8 bytes) and the explicitness, whose spare values tag the other two.
+const _: () = assert!(size_of::<Visibility>() <= 12);
+
+/// Whether `ancestor` is `module` or a module above it in their `DefMap`, by the parent each
+/// module id carries.
+fn is_ancestor_in_def_map<'db>(
+    db: &'db dyn SourceDatabase,
+    ancestor: ModuleIdLt<'db>,
+    module: ModuleIdLt<'db>,
+) -> bool {
+    iter::successors(Some(module), |&m| m.containing_module_inside_def_map(db))
+        .any(|m| m == ancestor)
 }
 
 impl Visibility {
@@ -46,6 +60,8 @@ impl Visibility {
         from_module: ModuleIdLt<'db>,
     ) -> bool {
         let to_module = match self {
+            // SAFETY: `self` was resolved in `db`, the database borrowed for `'db`, and the id is
+            // read only during this call.
             Visibility::Module(m, _) => unsafe { m.to_db(db) },
             Visibility::PubCrate(krate) => return from_module.krate(db) == krate,
             Visibility::Public => return true,
@@ -58,8 +74,7 @@ impl Visibility {
         if from_module.krate(db) != to_module.krate(db) {
             return false;
         }
-        let def_map = from_module.def_map(db);
-        Self::is_visible_from_def_map_(db, def_map, to_module, from_module)
+        Self::is_visible_from_def_map_(db, from_module.block(db), to_module, from_module)
     }
 
     pub(crate) fn is_visible_from_def_map<'db>(
@@ -89,60 +104,47 @@ impl Visibility {
             // if the modules are the same, visibility is trivially satisfied
             return true;
         }
-        Self::is_visible_from_def_map_(db, def_map, to_module, from_module)
+        Self::is_visible_from_def_map_(db, def_map.block_id(), to_module, from_module)
     }
 
+    /// Whether `from_module`, in the `DefMap` of `def_map_block`, sees what is visible in
+    /// `to_module`. Each step up reads the module id's own fields (its parent in its `DefMap`, or
+    /// the module its block is in), never a `DefMap`: `to_module` may be in the one being
+    /// computed.
     fn is_visible_from_def_map_<'db>(
         db: &'db dyn SourceDatabase,
-        def_map: &'db DefMap,
+        def_map_block: Option<BlockIdLt<'db>>,
         mut to_module: ModuleIdLt<'db>,
         mut from_module: ModuleIdLt<'db>,
     ) -> bool {
-        debug_assert_eq!(to_module.krate(db), def_map.krate());
         // `to_module` might be the root module of a block expression. Those have the same
         // visibility as the containing module (even though no items are directly nameable from
         // there, getting this right is important for method resolution).
         // In that case, we adjust the visibility of `to_module` to point to the containing module.
-
-        // Additional complication: `to_module` might be in `from_module`'s `DefMap`, which we're
-        // currently computing, so we must not call the `def_map` query for it.
-        let def_map_block = def_map.block_id();
         loop {
             match (to_module.block(db), def_map_block) {
                 // `to_module` is not a block, so there is no parent def map to use.
                 (None, _) => (),
                 // `to_module` is at `def_map`'s block, no need to move further.
                 (Some(a), Some(b)) if a == b => {}
-                _ => {
-                    if let Some(parent) = to_module.def_map(db).parent() {
-                        to_module = parent;
-                        continue;
-                    }
+                // The module the block is in is the parent of the block's `DefMap`.
+                (Some(block), _) => {
+                    to_module = block.module(db);
+                    continue;
                 }
             }
             break;
         }
 
         // from_module needs to be a descendant of to_module
-        let mut def_map = def_map;
-        let mut parent_arc;
         loop {
             if from_module == to_module {
                 return true;
             }
-            match def_map.module(db, from_module).parent {
+            match from_module.containing_module(db) {
                 Some(parent) => from_module = parent,
-                None => {
-                    match def_map.parent() {
-                        Some(module) => {
-                            parent_arc = module.def_map(db);
-                            def_map = parent_arc;
-                            from_module = module;
-                        }
-                        // Reached the root module, nothing left to check.
-                        None => return false,
-                    }
-                }
+                // Reached the root module, nothing left to check.
+                None => return false,
             }
         }
     }
@@ -195,17 +197,12 @@ impl Visibility {
                     return None;
                 }
 
-                let mut a_ancestors =
-                    iter::successors(Some(mod_a), |&m| def_map.module(db, m).parent);
-
-                if a_ancestors.any(|m| m == mod_b) {
+                if is_ancestor_in_def_map(db, mod_b, mod_a) {
                     // B is above A
                     return Some(Visibility::Module(mod_b, expl_b));
                 }
 
-                let mut b_ancestors =
-                    iter::successors(Some(mod_b), |&m| def_map.module(db, m).parent);
-                if b_ancestors.any(|m| m == mod_a) {
+                if is_ancestor_in_def_map(db, mod_a, mod_b) {
                     // A is above B
                     return Some(Visibility::Module(mod_a, expl_a));
                 }
@@ -263,17 +260,12 @@ impl Visibility {
                     return None;
                 }
 
-                let mut a_ancestors =
-                    iter::successors(Some(mod_a), |&m| def_map.module(db, m).parent);
-
-                if a_ancestors.any(|m| m == mod_b) {
+                if is_ancestor_in_def_map(db, mod_b, mod_a) {
                     // B is above A
                     return Some(Visibility::Module(mod_a, expl_a));
                 }
 
-                let mut b_ancestors =
-                    iter::successors(Some(mod_b), |&m| def_map.module(db, m).parent);
-                if b_ancestors.any(|m| m == mod_a) {
+                if is_ancestor_in_def_map(db, mod_a, mod_b) {
                     // A is above B
                     return Some(Visibility::Module(mod_b, expl_b));
                 }

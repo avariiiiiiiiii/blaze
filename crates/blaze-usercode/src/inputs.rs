@@ -365,7 +365,7 @@ impl Inputs for ViewInputs<'_, '_> {
         let Some(name) = self.in_view(path) else { return Ok(self.now.names(path)?) };
         Ok(self.cx.dir(&name)?.map(|entries| {
             let mut names: Vec<(OsString, bool)> =
-                entries.into_iter().map(|(name, dir)| (OsString::from(name), dir)).collect();
+                entries.iter().map(|(name, dir)| (OsString::from(name), *dir)).collect();
             names.sort();
             names
         }))

@@ -7,9 +7,8 @@
 
 use std::{
     ffi::c_void,
-    fs::File,
     ops::Range,
-    os::windows::{ffi::OsStrExt, io::AsRawHandle},
+    os::windows::ffi::OsStrExt,
     path::Path,
     sync::{
         Arc,
@@ -60,23 +59,6 @@ unsafe extern "system" {
         frames: *mut *mut c_void,
         hash: *mut u32,
     ) -> u16;
-    fn CreateFileMappingW(
-        file: *mut c_void,
-        attributes: *const c_void,
-        protect: u32,
-        size_high: u32,
-        size_low: u32,
-        name: *const u16,
-    ) -> *mut c_void;
-    fn MapViewOfFile(
-        mapping: *mut c_void,
-        access: u32,
-        offset_high: u32,
-        offset_low: u32,
-        len: usize,
-    ) -> *mut c_void;
-    fn UnmapViewOfFile(address: *const c_void) -> i32;
-    fn CloseHandle(handle: *mut c_void) -> i32;
     fn FindFirstChangeNotificationW(path: *const u16, subtree: i32, filter: u32) -> *mut c_void;
     fn FindNextChangeNotification(handle: *mut c_void) -> i32;
     fn FindCloseChangeNotification(handle: *mut c_void) -> i32;
@@ -86,7 +68,6 @@ unsafe extern "system" {
 const FROM_ADDRESS: u32 = 0x4;
 const UNCHANGED_REFCOUNT: u32 = 0x2;
 const MEM_COMMIT: u32 = 0x1000;
-const PAGE_READONLY: u32 = 0x02;
 const PAGE_READWRITE: u32 = 0x04;
 const PAGE_WRITECOPY: u32 = 0x08;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
@@ -94,7 +75,6 @@ const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
 const EXECUTABLE: u32 = 0xf0;
 const WRITABLE: u32 =
     PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-const FILE_MAP_READ: u32 = 0x4;
 const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
 const FILE_NOTIFY_CHANGE_LAST_WRITE: u32 = 0x10;
 const INVALID_HANDLE_VALUE: *mut c_void = !0usize as *mut c_void;
@@ -145,62 +125,6 @@ pub(super) fn backtrace(pcs: &mut Vec<u64>) {
     pcs.extend(frames[..count].iter().map(|it| (*it as u64).wrapping_sub(1)));
 }
 
-/// A message file mapped read-only, its bytes read in place and unmapped when dropped.
-pub(super) struct Map {
-    at: *mut c_void,
-    len: usize,
-}
-
-impl Map {
-    /// Maps the `len` bytes of `file` (its length when opened).
-    pub(super) fn new(file: &File, len: u64) -> Result<Map, String> {
-        let len = usize::try_from(len).map_err(|_| format!("a message of {len} bytes"))?;
-        if len == 0 {
-            return Ok(Map { at: std::ptr::null_mut(), len });
-        }
-        let error = |what: &str| format!("{what} the message: {}", std::io::Error::last_os_error());
-        // SAFETY: a read-only mapping of an open file, of its whole length, unnamed.
-        let mapping = unsafe {
-            CreateFileMappingW(
-                file.as_raw_handle(),
-                std::ptr::null(),
-                PAGE_READONLY,
-                0,
-                0,
-                std::ptr::null(),
-            )
-        };
-        if mapping.is_null() {
-            return Err(error("mapping"));
-        }
-        // SAFETY: a view of the mapping made above, which the view keeps once its handle is
-        // closed.
-        let at = unsafe { MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, len) };
-        let viewed = if at.is_null() { Err(error("viewing")) } else { Ok(Map { at, len }) };
-        // SAFETY: this function's handle.
-        unsafe { CloseHandle(mapping) };
-        viewed
-    }
-
-    pub(super) fn bytes(&self) -> &[u8] {
-        if self.len == 0 {
-            return &[];
-        }
-        // SAFETY: `len` bytes viewed readable at `at` until drop. The linker writes a message
-        // under another name and renames it into place, so nothing writes the file's bytes.
-        unsafe { std::slice::from_raw_parts(self.at as *const u8, self.len) }
-    }
-}
-
-impl Drop for Map {
-    fn drop(&mut self) {
-        if self.len != 0 {
-            // SAFETY: this map's own view, which nothing borrows once it is dropped.
-            unsafe { UnmapViewOfFile(self.at) };
-        }
-    }
-}
-
 /// Watches `dir` on a thread of its own: each change of its file names (a message renamed
 /// into place) is told to `events`.
 pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
@@ -231,8 +155,9 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
             // SAFETY: the thread's own notification handle.
             if unsafe { WaitForSingleObject(handle, WAKE_EVERY_MS) } == WAIT_OBJECT_0 {
                 events.tell();
-                // SAFETY: as above; one that can't go on is closed, once.
+                // SAFETY: as above.
                 if unsafe { FindNextChangeNotification(handle) } == 0 {
+                    // SAFETY: as above; one that can't go on is closed, once.
                     unsafe { FindCloseChangeNotification(handle) };
                     watched = None;
                 }
@@ -414,9 +339,13 @@ fn regions(
 /// Writes what `writes` has within `pages`, committed memory of the image with `protect`,
 /// which isn't writable: made writable once for the write, then given it back.
 fn protected(writes: &Writes<'_>, pages: &Range<u64>, protect: u32) -> Result<(), String> {
-    // SAFETY: the pages are the image's, committed with `protect` (`regions` read it), and
-    // nothing else of the program's writes them while `poll` does.
-    unsafe { writable(pages, protect, || writes.put(pages, pages.start as *mut u8))? };
+    let put = || {
+        // SAFETY: the pages are writable while this runs (`writable`), and nothing else of
+        // the program's writes them while `poll` does.
+        unsafe { writes.put(pages, pages.start as *mut u8) }
+    };
+    // SAFETY: the pages are the image's, committed with `protect` (`regions` read it).
+    unsafe { writable(pages, protect, put)? };
     if protect & EXECUTABLE != 0 {
         flush(pages);
     }
@@ -424,14 +353,11 @@ fn protected(writes: &Writes<'_>, pages: &Range<u64>, protect: u32) -> Result<()
 }
 
 fn flush(range: &Range<u64>) {
-    // SAFETY: the range was just written.
-    unsafe {
-        FlushInstructionCache(
-            GetCurrentProcess(),
-            range.start as *const c_void,
-            (range.end - range.start) as usize,
-        )
-    };
+    // SAFETY: it takes no pointer; the handle stands for this process and needs no closing.
+    let process = unsafe { GetCurrentProcess() };
+    let (start, len) = (range.start as *const c_void, (range.end - range.start) as usize);
+    // SAFETY: the range was just written; flushing changes no memory.
+    unsafe { FlushInstructionCache(process, start, len) };
 }
 
 /// Runs `f` with `range`, of regions with `protect`, made writable.

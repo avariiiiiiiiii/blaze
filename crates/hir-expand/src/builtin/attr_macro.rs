@@ -238,7 +238,11 @@ pub fn pseudo_derive_attr_expansion(
     let mk_leaf =
         |char| tt::Leaf::Punct(tt::Punct { char, spacing: tt::Spacing::Alone, span: call_site });
 
-    let mut token_trees = tt::TopSubtreeBuilder::new(args.top_subtree().delimiter);
+    // Each of the `n` paths gains `#`, `!` and a bracket, and loses its comma: at most
+    // `len + 2n + 1` token trees, and `n <= len + 1`.
+    let len = args.token_trees().len();
+    let mut token_trees =
+        tt::TopSubtreeBuilder::with_capacity(args.top_subtree().delimiter, 3 * len + 3);
     let iter = args.token_trees().split(|tt| {
         matches!(tt, tt::TtElement::Leaf(tt::Leaf::Punct(tt::Punct { char: ',', .. })))
     });

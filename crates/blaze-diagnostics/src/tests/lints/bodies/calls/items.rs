@@ -3,28 +3,11 @@
 //! against a `std` of the items of std it uses, written as std writes them, with their
 //! diagnostic items and lang items.
 
-use crate::{Options, emit::Style, lints::CommandLine};
-
-/// What compiletest adds to rustc's command line for a UI test that is not `run-pass`
-/// (`runtest.rs`, `make_compile_args`), before the test's own flags.
-fn compiletest() -> Options {
-    let args = [
-        "-A",
-        "unused",
-        "-W",
-        "unused_attributes",
-        "-A",
-        "internal_features",
-        "-A",
-        "incomplete_features",
-        "-A",
-        "unused_parens",
-        "-A",
-        "unused_braces",
-    ]
-    .map(str::to_owned);
-    Options { lints: CommandLine::parse(&args).unwrap() }
-}
+use crate::{
+    Options,
+    emit::Style,
+    tests::{Mode, compiletest},
+};
 
 /// A `std` prelude: core's, with `extra` (`pub use` lines) for what std's prelude has that
 /// core's does not, which shadow core's of the same name.
@@ -37,15 +20,16 @@ fn prelude(extra: &str) -> String {
     out
 }
 
-/// What rustc writes compiling the UI test `name` (2015 edition, as the tests say none), core
-/// being minicore with `flags` and std the prelude of [`prelude`] with `extra` and `std_items`.
+/// What rustc writes compiling the UI test `name` (2015 edition, as the tests say none; none is
+/// `run-pass` and none has `//@ compile-flags`), core being minicore with `flags` and std the
+/// prelude of [`prelude`] with `extra` and `std_items`.
 fn ui_std(name: &str, flags: &str, extra: &str, std_items: &str, source: &str) -> String {
     let fixture = format!(
         "//- minicore: {flags}\n//- /std.rs crate:std deps:core\n{}{std_items}\n\
          //- /{name} crate:main edition:2015 deps:std\n{source}",
         prelude(extra)
     );
-    let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest())
+    let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()))
         .stderr_with(Style { ui_testing: true, ..Style::default() });
     crate::tests::normalized(&stderr)
 }

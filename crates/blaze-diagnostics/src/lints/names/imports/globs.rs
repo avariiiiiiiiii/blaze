@@ -21,7 +21,7 @@ use syntax::{
     ast::{self, HasVisibility},
 };
 
-use super::used::{Binding, Entry, Ns, TreeKind, UseItem, Uses, entry, lookup};
+use super::used::{Binding, Entry, Ns, Tree, TreeKind, UseItem, Uses, entry, lookup};
 use crate::{
     cx::{Cx, item_range},
     lower::{Found, Phase},
@@ -109,7 +109,7 @@ fn glob_visibility(cx: &Cx<'_, '_>, item: &UseItem, tree: &Tree) -> Option<Found
 
 /// `pub_use_of_private_extern_crate`: a `pub` single import of nothing but an `extern crate`
 /// item less visible than it.
-fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &super::used::Tree) -> Option<Found> {
+fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree) -> Option<Found> {
     if !item.public || tree.self_import || tree.binding.is_none() {
         return None;
     }
@@ -148,7 +148,7 @@ fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &sup
 fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
     let db = cx.db;
     let mut found = Vec::new();
-    let globs: Vec<(&UseItem, &super::used::Tree, ModuleId)> = uses
+    let globs: Vec<(&UseItem, &Tree, ModuleId)> = uses
         .items
         .iter()
         .filter(|it| it.module == module)
@@ -173,7 +173,7 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
     for name in names {
         let current = here.get(&name);
         for ns in Ns::ALL {
-            let imported: Vec<(&UseItem, &super::used::Tree, Entry)> = globs
+            let imported: Vec<(&UseItem, &Tree, Entry)> = globs
                 .iter()
                 .filter_map(|(item, tree, from)| {
                     let per = from.def_map(db).module(db, *from).name_in_scope(db, &name);
@@ -265,19 +265,21 @@ fn binding_node(cx: &Cx<'_, '_>, uses: &Uses, it: Entry) -> Option<InFile<Syntax
 
 /// The item that defines `def`.
 fn def_node(cx: &Cx<'_, '_>, def: ModuleDefId) -> Option<InFile<SyntaxNode>> {
+    fn node<N: AstNode>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
+        it.map(|it| it.map(|it| it.syntax().clone()))
+    }
     let db = cx.db;
-    let syntax = |it: Option<InFile<_>>| it.map(|it: InFile<_>| it.map(|it: ast::Item| it.syntax().clone()));
     match ModuleDef::from(def) {
-        ModuleDef::Module(it) => it.declaration_source(db).map(|it| it.map(|it| it.syntax().clone())),
-        ModuleDef::Function(it) => syntax(it.source(db).map(|it| it.map(ast::Item::from))),
-        ModuleDef::Adt(hir::Adt::Struct(it)) => syntax(it.source(db).map(|it| it.map(ast::Item::from))),
-        ModuleDef::Adt(hir::Adt::Union(it)) => syntax(it.source(db).map(|it| it.map(ast::Item::from))),
-        ModuleDef::Adt(hir::Adt::Enum(it)) => syntax(it.source(db).map(|it| it.map(ast::Item::from))),
-        ModuleDef::Const(it) => syntax(it.source(db).map(|it| it.map(ast::Item::from))),
-        ModuleDef::Static(it) => syntax(it.source(db).map(|it| it.map(ast::Item::from))),
-        ModuleDef::Trait(it) => syntax(it.source(db).map(|it| it.map(ast::Item::from))),
-        ModuleDef::TypeAlias(it) => syntax(it.source(db).map(|it| it.map(ast::Item::from))),
-        ModuleDef::Macro(it) => it.source(db).map(|it| it.map(|it| it.syntax().clone())),
+        ModuleDef::Module(it) => node(it.declaration_source(db)),
+        ModuleDef::Function(it) => node(it.source(db)),
+        ModuleDef::Adt(hir::Adt::Struct(it)) => node(it.source(db)),
+        ModuleDef::Adt(hir::Adt::Union(it)) => node(it.source(db)),
+        ModuleDef::Adt(hir::Adt::Enum(it)) => node(it.source(db)),
+        ModuleDef::Const(it) => node(it.source(db)),
+        ModuleDef::Static(it) => node(it.source(db)),
+        ModuleDef::Trait(it) => node(it.source(db)),
+        ModuleDef::TypeAlias(it) => node(it.source(db)),
+        ModuleDef::Macro(it) => node(it.source(db)),
         ModuleDef::EnumVariant(_) | ModuleDef::BuiltinType(_) => None,
     }
 }

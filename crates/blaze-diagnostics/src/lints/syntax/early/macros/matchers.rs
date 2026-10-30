@@ -2,8 +2,8 @@
 //!
 //! - `meta_variable_misuse`: a variable of a rule's transcriber that its matcher does not bind,
 //!   or uses at another depth or with another repetition operator; buffered at the definition.
-//! - `rust_2021_incompatible_or_patterns`: a `pat` before 2021 that `|` may follow; buffered at
-//!   the crate.
+//! - `rust_2021_incompatible_or_patterns`: a `pat` before 2021 that `|` may follow, once for
+//!   each `|`; buffered at the crate.
 //! - `edition_2024_expr_fragment_specifier`: an `expr` before 2024, of the early lint pass's
 //!   `check_mac_def`.
 //!
@@ -21,7 +21,6 @@ mod quoted;
 mod tokens;
 
 use hir::{HirFileId, InFile};
-use rustc_hash::FxHashSet;
 use span::{Edition, SyntaxContext};
 use syntax::{AstNode, TextRange, TextSize, ast};
 
@@ -45,7 +44,6 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
         .and_then(|it| walk.tree(HirFileId::from(it)))
         .map(|it| it.ptr(&it.root));
     let mut out = Vec::new();
-    let mut or_patterns: FxHashSet<(HirFileId, TextRange)> = FxHashSet::default();
     for tree in &walk.trees {
         for node in &tree.nodes {
             let Some(def) = ast::Macro::cast(node.clone()) else { continue };
@@ -82,9 +80,6 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
             }
             if let Some(krate) = krate {
                 for it in found {
-                    if !or_patterns.insert((tree.file, it.span)) {
-                        continue;
-                    }
                     let span = cx.span(InFile::new(tree.file, it.span));
                     let mut diag = Diag::lint(
                         "rust_2021_incompatible_or_patterns",

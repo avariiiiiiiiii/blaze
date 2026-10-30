@@ -7,7 +7,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{checked_with, normalized, ui},
+    tests::{Mode, checked_with, compiletest, normalized, ui},
 };
 
 #[test]
@@ -754,7 +754,8 @@ For more information about this error, try `rustc --explain E0133`.
          //- /auxiliary/external_unsafe_macro.rs crate:external_unsafe_macro edition:2015\n{aux}"
     );
     let style = Style { ui_testing: true, ..Style::default() };
-    let written = checked_with(&fixture, "$DIR/", &Options::default()).stderr_with(style);
+    let options = compiletest(Mode::Other, &Options::default());
+    let written = checked_with(&fixture, "$DIR/", &options).stderr_with(style);
     assert_eq!(normalized(&written), stderr);
 }
 

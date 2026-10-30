@@ -1497,9 +1497,9 @@ define void @"blaze.own"(ptr %to, i64 %from) {
     fn a_unit_reads_back_each_function_with_its_calls_and_constants() {
         use cranelift_codegen::ir::{AbiParam, InstBuilder, UserFuncName, types::F64};
         use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-        use cranelift_module::{FuncId, ModuleRelocTarget};
+        use cranelift_module::FuncId;
 
-        use super::super::fragment::FuncTarget;
+        use super::super::fragment::{FuncTarget, RelocName};
 
         let isa = super::super::target().unwrap();
         let mut wants = Wants::new(&**isa);
@@ -1539,15 +1539,11 @@ define void @"blaze.own"(ptr %to, i64 %from) {
         // The distinct targets of one namespace: AArch64 loads a constant with `adrp` and
         // `ldr`, two relocations of one symbol.
         let named = |code: &Code, wanted| -> Vec<u32> {
-            let names = code.relocs.iter().map(|it| &it.name);
-            let mut indices: Vec<u32> = names
-                .filter_map(|it| match *it {
-                    ModuleRelocTarget::User { namespace, index } if namespace == wanted => {
-                        Some(index)
-                    }
-                    _ => None,
-                })
-                .collect();
+            let indices = code.relocs.iter().filter_map(|it| match (it.name, wanted) {
+                (RelocName::Func(index), 0) | (RelocName::Data(index), 1) => Some(index),
+                _ => None,
+            });
+            let mut indices: Vec<u32> = indices.collect();
             indices.sort_unstable();
             indices.dedup();
             indices

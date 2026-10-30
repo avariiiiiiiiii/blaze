@@ -47,8 +47,11 @@ pub use monomorphization::{
     monomorphized_promoted_mir_body_query,
 };
 pub use optimize::{
-    monomorphized_optimized_mir_body_for_closure_query, monomorphized_optimized_mir_body_query,
-    optimized_mir_body_for_closure_query, optimized_mir_body_query, passes_not_ported,
+    monomorphized_optimized_mir_body_for_closure_query,
+    monomorphized_optimized_mir_body_for_coroutine_by_move_query,
+    monomorphized_optimized_mir_body_for_coroutine_query, monomorphized_optimized_mir_body_query,
+    optimized_mir_body_for_closure_query, optimized_mir_body_for_coroutine_by_move_query,
+    optimized_mir_body_for_coroutine_query, optimized_mir_body_query, passes_not_ported,
     set_interpreter_mir_opt_level,
 };
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};

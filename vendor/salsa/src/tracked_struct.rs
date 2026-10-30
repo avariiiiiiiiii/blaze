@@ -1,5 +1,3 @@
-#![allow(clippy::undocumented_unsafe_blocks)] // TODO(#697) document safety
-
 use std::any::TypeId;
 use std::hash::Hash;
 use std::marker::PhantomData;
@@ -737,6 +735,8 @@ where
                 .expect("already verified that generation is not maximum");
         }
 
+        // SAFETY: We hold the write lock (`None` in `updated_at`, swapped in above), and readers
+        // touch `durability` only under a read lock, so this borrow is exclusive.
         let durability = unsafe { &mut (*data_raw).durability };
         if current_deps.durability < *durability {
             let new_revisions = C::new_revisions(current_deps.changed_at);
@@ -798,6 +798,9 @@ where
 
         // We want to set `updated_at` to `None`, signalling that other field values
         // cannot be read. The current value should be `Some(R0)` for some older revision.
+        // SAFETY: `id` was allocated by this ingredient (it is a stale output of a query), so
+        // `data` points to an initialized `Value<C>` (`Table::page` checks the page's type), and
+        // `updated_at` is never exclusively borrowed, so borrowing it is sound.
         match unsafe { (*data).updated_at.swap(None) } {
             None => {
                 panic!("cannot delete write-locked id `{id:?}`; value leaked across threads");
@@ -897,9 +900,10 @@ where
         let field_changed_at = unsafe { (&(*data).revisions)[relative_tracked_index].load() };
 
         // SAFETY: We just acquired the read lock (in `Self::fields`), so accessing `durability` will not be able to alias
+        let durability = unsafe { (*data).durability };
         zalsa_local.report_tracked_read_simple(
             DatabaseKeyIndex::new(field_ingredient_index, id),
-            unsafe { (*data).durability },
+            durability,
             field_changed_at,
         );
 
@@ -1405,10 +1409,9 @@ mod persistence {
         {
             // SAFETY: Guaranteed by `Configuration`; the restored lifetime is
             // bounded by the borrow of the retained fields.
-            C::serialize(
-                unsafe { std::mem::transmute::<&C::Fields<'static>, &C::Fields<'_>>(self.0) },
-                serializer,
-            )
+            let fields =
+                unsafe { std::mem::transmute::<&C::Fields<'static>, &C::Fields<'_>>(self.0) };
+            C::serialize(fields, serializer)
         }
     }
 

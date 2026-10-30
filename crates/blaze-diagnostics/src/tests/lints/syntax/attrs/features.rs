@@ -4,28 +4,15 @@
 use crate::{
     Options,
     emit::Style,
-    lints::CommandLine,
-    tests::{checked_with, normalized},
+    tests::{Mode, checked_with, compiletest, normalized, ui},
 };
 
-/// The lint flags compiletest gives every UI test (`runtest.rs`, `make_compile_args`), with
-/// `-A unused -W unused_attributes` before them for a test that passes.
-fn compiletest(passes: bool) -> Options {
-    let mut args: Vec<&str> = Vec::new();
-    if passes {
-        args.extend(["-A", "unused", "-W", "unused_attributes"]);
-    }
-    args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
-    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap() }
-}
-
-/// What rustc writes compiling the UI test `source`, named `$DIR/<name>`, of edition 2015 with
-/// `--cfg <cfg>` for its revision.
-fn ui(name: &str, cfg: &str, source: &str, options: &Options) -> String {
-    let cfg = if cfg.is_empty() { String::new() } else { format!(" cfg:{cfg}") };
-    let fixture = format!("//- /{name} crate:main edition:2015{cfg}\n{source}");
-    normalized(&checked_with(&fixture, "$DIR/", options).stderr_with(Style { ui_testing: true, ..Style::default() }))
+/// [`crate::tests::ui`] of the revision of a UI test of edition 2015 that compiletest gives
+/// `--cfg <revision>`.
+fn ui_revision(name: &str, revision: &str, source: &str) -> String {
+    let fixture = format!("//- /{name} crate:main edition:2015 cfg:{revision}\n{source}");
+    let options = compiletest(Mode::Other, &Options::default());
+    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
 /// The messages of the feature lints `source` gets, with their lint names.
@@ -75,7 +62,7 @@ LL | #![feature(intrinsics, panic_internals)]
 error: aborting due to 2 previous errors
 
 "#;
-    assert_eq!(ui("internal_features.rs", "", source, &compiletest(false)), expected);
+    assert_eq!(ui("internal_features.rs", "2015", source), expected);
 }
 
 #[test]
@@ -109,8 +96,8 @@ LL | #![cfg_attr(warn, warn(incomplete_features))]
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui("incomplete-features.rs", "warn", source, &compiletest(true)), expected);
-    assert_eq!(ui("incomplete-features.rs", "expect", source, &compiletest(true)), "");
+    assert_eq!(ui_revision("incomplete-features.rs", "warn", source), expected);
+    assert_eq!(ui_revision("incomplete-features.rs", "expect", source), "");
 }
 
 #[test]
@@ -157,7 +144,7 @@ LL | #![warn(incomplete_features)]
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui("feature-gate-unsafe_fields.rs", "with_gate", source, &compiletest(true)), expected);
+    assert_eq!(ui_revision("feature-gate-unsafe_fields.rs", "with_gate", source), expected);
 }
 
 #[test]
@@ -184,7 +171,7 @@ LL | #![warn(incomplete_features)]
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui("specialization.rs", "", source, &compiletest(true)), expected);
+    assert_eq!(ui("specialization.rs", "2015", source), expected);
 }
 
 #[test]
@@ -209,7 +196,7 @@ LL | #![forbid(unstable_features)]
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("feature-gate-feature-gate.rs", "", source, &compiletest(false)), expected);
+    assert_eq!(ui("feature-gate-feature-gate.rs", "2015", source), expected);
 }
 
 #[test]

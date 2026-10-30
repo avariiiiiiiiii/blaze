@@ -31,7 +31,7 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{
         CandidateId, CandidateSource, InherentImpls, MethodError, MethodResolutionContext,
-        SelfTyKey, impl_value_item, simplified_type_module, trait_value_item,
+        SelfTyKey, TraitValueItems, impl_value_item, simplified_type_module,
         with_incoherent_inherent_impls,
     },
     next_solver::{
@@ -85,6 +85,9 @@ pub struct Candidate<'db> {
     pub item: CandidateId,
     pub kind: CandidateKind<'db>,
 }
+
+/// The candidates of one pick attempt that match: nearly always none or one.
+type ApplicableCandidates<'a, 'db> = SmallVec<[&'a Candidate<'db>; 4]>;
 
 #[derive(Debug, Clone)]
 pub enum CandidateKind<'db> {
@@ -291,6 +294,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                 item_name,
                 stable_only: false,
                 allow_unstable,
+                trait_items: TraitValueItems::default(),
             },
         )
     }
@@ -311,13 +315,13 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         choice: Choice,
     ) -> Choice::FinalChoice {
         let mut orig_values = OriginalQueryValues::default();
-        let predefined_opaques_in_body = PredefinedOpaques::new_from_slice(
-            &self
-                .infcx
-                .clone_opaque_types()
-                .into_iter()
-                .map(|(key, hidden_ty)| (key, hidden_ty.ty))
-                .collect::<Vec<_>>(),
+        let predefined_opaques_in_body = PredefinedOpaques::new_from_iter(
+            self.infcx
+                .inner
+                .borrow_mut()
+                .opaque_type_storage
+                .iter_opaque_types()
+                .map(|(key, hidden_ty)| (key, hidden_ty.ty)),
         );
         let query_input =
             self.infcx.canonicalize_query((self_ty, predefined_opaques_in_body), &mut orig_values);
@@ -590,7 +594,7 @@ trait ProbeChoice<'db>: Sized {
     fn consider_candidates(
         this: &ProbeContext<'_, 'db, Self>,
         self_ty: Ty<'db>,
-        candidates: Vec<&Candidate<'db>>,
+        candidates: ApplicableCandidates<'_, 'db>,
     ) -> ControlFlow<Self::Choice>;
 
     fn consider_private_candidates(
@@ -637,6 +641,8 @@ struct ProbeForNameChoice<'db> {
     stable_only: bool,
     /// Whether such items are as good as the others: the path was not written by the user.
     allow_unstable: bool,
+    /// The items of `item_name` of the traits asked of so far.
+    trait_items: TraitValueItems<'db>,
 }
 
 impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
@@ -649,10 +655,10 @@ impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
         mut callback: impl FnMut(&mut ProbeContext<'a, 'db, Self>, CandidateId),
     ) {
         let db = this.db();
-        let name = this.choice.item_name.clone();
+        let name = this.choice.item_name;
         let item = match items {
             ItemsOf::Impl(id) => impl_value_item(db, id, name),
-            ItemsOf::Trait(id) => trait_value_item(db, id, name),
+            ItemsOf::Trait(id) => this.choice.trait_items.get(db, id, name),
         }
         .filter(|id| this.mode == Mode::Path || matches!(id, CandidateId::FunctionId(_)));
         if let Some(item) = item {
@@ -663,7 +669,7 @@ impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
     fn consider_candidates(
         this: &ProbeContext<'_, 'db, Self>,
         self_ty: Ty<'db>,
-        mut applicable_candidates: Vec<&Candidate<'db>>,
+        mut applicable_candidates: ApplicableCandidates<'_, 'db>,
     ) -> ControlFlow<Self::Choice> {
         if this.choice.stable_only {
             applicable_candidates.retain(|candidate| !this.is_denied_unstable(candidate.item));
@@ -816,7 +822,7 @@ impl<'db> ProbeChoice<'db> for ProbeAllChoice<'db> {
     fn consider_candidates(
         this: &ProbeContext<'_, 'db, Self>,
         _self_ty: Ty<'db>,
-        candidates: Vec<&Candidate<'db>>,
+        candidates: ApplicableCandidates<'_, 'db>,
     ) -> ControlFlow<Self::Choice> {
         let is_visible = this.choice.considering_visible_candidates;
         let mut all_candidates = this.choice.candidates.borrow_mut();
@@ -1192,9 +1198,8 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
 
     #[instrument(level = "debug", skip(self))]
     fn assemble_extension_candidates_for_trait(&mut self, trait_def_id: TraitId) {
-        let trait_args = self.infcx().fresh_args_for_item(self.ctx.call_span, trait_def_id.into());
-        let trait_ref = TraitRef::new_from_args(self.interner(), trait_def_id.into(), trait_args);
-
+        // Made for the first item only: most traits in scope have none of the name.
+        let mut trait_ref = None;
         self.with_trait_item(trait_def_id, |this, item| {
             // Check whether `trait_def_id` defines a method with suitable name.
             if !this.has_applicable_self(item) {
@@ -1202,6 +1207,11 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 this.record_static_candidate(CandidateSource::Trait(trait_def_id));
                 return;
             }
+            let trait_ref = *trait_ref.get_or_insert_with(|| {
+                let trait_args =
+                    this.infcx().fresh_args_for_item(this.ctx.call_span, trait_def_id.into());
+                TraitRef::new_from_args(this.interner(), trait_def_id.into(), trait_args)
+            });
             this.push_candidate(
                 Candidate { item, kind: TraitCandidate(Binder::dummy(trait_ref)) },
                 false,
@@ -1584,7 +1594,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
         candidates: &[Candidate<'db>],
         pick_constraints: Option<&PickConstraintsForShadowed>,
     ) -> ControlFlow<Choice::Choice> {
-        let applicable_candidates: Vec<_> = candidates
+        let applicable_candidates: ApplicableCandidates<'_, 'db> = candidates
             .iter()
             .filter(|candidate| {
                 pick_constraints

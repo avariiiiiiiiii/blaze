@@ -10,6 +10,8 @@
 //! put together greedily, the largest first, into one slot per group of locals of which no two
 //! conflict ([`FrameStorage::frame_storage_conflicts`](hir_ty_mir::mir::FrameStorage::frame_storage_conflicts)).
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::{
     entity::{EntitySet, PackedOption, SecondaryMap},
     ir::{self, InstructionData},

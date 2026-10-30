@@ -81,6 +81,24 @@ or for an `extern` block or crate root).
   `TestDB` the unit tests run on), never on a build's path; left as is.
 - `macro_expansion_tests/`: tests only; nothing on a build's path.
 
+## Unsafe ([unsafe.md](../../design/unsafe.md))
+
+- `attrs/docs.rs` `Docs::remove_indent` had 3 `unsafe` blocks (`as_mut_vec`, `as_bytes_mut`)
+  so it could strip indents in place while the `String` was briefly not UTF-8. It buys no
+  speed that matters: docs are cold, and the safe version doesn't allocate either. It takes the
+  bytes out (`mem::take(..).into_bytes()`), moves the lines with `copy_within`, finds char
+  starts by skipping continuation bytes, and ends with one `String::from_utf8` (one linear
+  check). On a panic the guard leaves the docs empty and the map cleared, as before.
+  `attrs/` has no `unsafe` left.
+- `lib.rs`: the 4 lifetime transmutes (`BlockIdLt::to_static`, `BlockId::to_db`, and the same
+  for `ModuleId`) are the only way to erase a salsa id's `'db`. They keep their `# Safety`
+  sections and now have `// SAFETY:` comments too. Removing them is lane db's job (salsa ids
+  without a lifetime); callers are in `hir`, `nameres/`, `visibility.rs` and codegen.
+- `dyn_map.rs`: 2 transmutes over the `#[repr(transparent)]` `KeyMap`, with `// SAFETY:`
+  (speed-hir-defs-locs).
+- hir-def can't take `#![forbid(unsafe_code)]`: `nameres/` and the transmutes above still have
+  `unsafe`. Each block holds one unsafe op (`multiple_unsafe_ops_per_block`).
+
 ## Tests (`attrs/tests.rs`, `attrs/docs.rs`)
 
 - `every_word_is_found_at_its_tag`, `a_word_is_one_probe_on_average`,
@@ -98,3 +116,6 @@ or for an `extern` block or crate root).
   word and a non-string value.
 - `field_flags_are_indexed_by_field` (a cfg'd-out field shifts the indices),
   `inner_docs_of_a_fn_body`, `a_block_may_start_with_inner_docs`.
+- `remove_indent_as_by_lines`: `remove_indent` against a model that cuts each line with
+  `str::char_indices` and pushes it onto a new string. It runs 2000 seeded docs of 1–6 lines:
+  tabs, blank lines, 2-, 3- and 4-byte chars, and all three doc kinds.

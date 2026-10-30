@@ -600,6 +600,20 @@ impl Code for Edition {
     }
 }
 
+/// The syntax context `raw` names, as `into_u32` gave it; `None` for `u32::MAX`, which no
+/// context is.
+pub(crate) fn syntax_context(raw: u32) -> Option<SyntaxContext> {
+    if raw == u32::MAX {
+        return None;
+    }
+    // SAFETY: `from_u32` needs a context of this database. `raw` is what `into_u32` gave in
+    // the database that wrote the buffer, which is the one reading it (the module's docs);
+    // `u32::MAX`, which `from_u32` would turn into an overflow, is refused above. Not yet
+    // upheld for a corrupted buffer: v2/requests/format.md, "format-hir-encode: untrusted
+    // salsa indices".
+    Some(unsafe { SyntaxContext::from_u32(raw) })
+}
+
 impl Code for SyntaxContext {
     fn put(&self, w: &mut Words) {
         w.u32(self.into_u32());
@@ -607,12 +621,7 @@ impl Code for SyntaxContext {
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         let raw = r.u32()?;
-        if raw == u32::MAX {
-            return Err(r.invalid("a syntax context of u32::MAX"));
-        }
-        // SAFETY: `raw` is what `into_u32` gave for a context of the database that wrote the
-        // buffer, which is the one reading it (the module's docs).
-        Ok(unsafe { SyntaxContext::from_u32(raw) })
+        syntax_context(raw).ok_or_else(|| r.invalid("a syntax context of u32::MAX"))
     }
 }
 

@@ -4,7 +4,7 @@
 
 use object::read::archive::{ArchiveFile, ArchiveKind};
 
-use crate::model::{Archive, Member};
+use crate::model::{Archive, Member, Names};
 
 /// A BSD `ar` archive (as Apple's `libtool`/`ar` write it, `#1/<len>` long names) or a GNU one,
 /// with its `__.SYMDEF`/`__.SYMDEF SORTED`/`__.SYMDEF_64` index (a GNU `/` index too).
@@ -21,6 +21,18 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
         }
         other => return Err(format!("{name}: a {other:?} archive, not a BSD or GNU one")),
     }
+
+    let symbols = file
+        .symbols()
+        .map_err(|e| format!("{name}: {e}"))?
+        .ok_or_else(|| format!("{name}: an archive without a symbol index (run `ranlib` on it)"))?;
+    // Sized from the index, read in place once: a core name is at most one byte longer than
+    // its Mach-O one. The members' names, short and few, grow it at most once.
+    let mut index_bytes = 0;
+    for symbol in symbols.clone() {
+        index_bytes += symbol.map_err(|e| format!("{name}: {e}"))?.name().len() + 1;
+    }
+    let mut names = Names::with_capacity(index_bytes);
 
     let mut members = Vec::new();
     // Where each member's header is, in archive order (so sorted): what the index's offsets
@@ -40,13 +52,10 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
             .ok_or_else(|| format!("{name}: a member past the end of the archive"))?;
         let member_name = std::str::from_utf8(member.name())
             .map_err(|_| format!("{name}: a member whose name isn't UTF-8: {:?}", member.name()))?;
-        members.push(Member { name: member_name.to_owned(), bytes: range });
+        let member_name = names.push(member_name).map_err(|e| format!("{name}: {e}"))?;
+        members.push(Member { name: member_name, bytes: range });
     }
 
-    let symbols = file
-        .symbols()
-        .map_err(|e| format!("{name}: {e}"))?
-        .ok_or_else(|| format!("{name}: an archive without a symbol index (run `ranlib` on it)"))?;
     let mut index = Vec::with_capacity(symbols.size_hint().0);
     for symbol in symbols {
         let symbol = symbol.map_err(|e| format!("{name}: {e}"))?;
@@ -54,15 +63,16 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
             let shown = String::from_utf8_lossy(symbol.name());
             format!("{name}: the index puts {shown} at offset {}, which is no member", symbol.offset().0)
         })?;
-        let core = super::core_name(symbol.name()).map_err(|e| format!("{name}: {e}"))?;
+        let core = super::push_core_name(&mut names, symbol.name()).map_err(|e| format!("{name}: {e}"))?;
         index.push((core, found as u32));
     }
-    Ok(Archive { members, index })
+    Ok(Archive { members, index, names })
 }
 
 #[cfg(test)]
 mod tests {
     use super::read;
+    use crate::model::Archive;
 
     fn header(out: &mut Vec<u8>, name: &str, size: usize) {
         out.extend_from_slice(format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644).as_bytes());
@@ -123,6 +133,14 @@ mod tests {
         crate::macho::core_name(name.as_bytes()).unwrap()
     }
 
+    fn member_names(archive: &Archive) -> Vec<&str> {
+        archive.members.iter().map(|it| archive.name(it.name)).collect()
+    }
+
+    fn index(archive: &Archive) -> Vec<(String, u32)> {
+        archive.index.iter().map(|&(name, member)| (archive.name(name).to_owned(), member)).collect()
+    }
+
     #[test]
     fn bsd_archive_with_long_names_and_its_index() {
         let bytes = bsd(
@@ -130,11 +148,10 @@ mod tests {
             &[("_one", 0), ("_two", 1), ("_three", 1)],
         );
         let archive = read("libx.a", &bytes).unwrap();
-        let names: Vec<&str> = archive.members.iter().map(|it| it.name.as_str()).collect();
-        assert_eq!(names, ["a_rather_long_member_name.o", "b.o"]);
+        assert_eq!(member_names(&archive), ["a_rather_long_member_name.o", "b.o"]);
         assert_eq!(&bytes[archive.members[0].bytes.clone()], b"first");
         assert_eq!(&bytes[archive.members[1].bytes.clone()], b"second!");
-        assert_eq!(archive.index, [(core("_one"), 0), (core("_two"), 1), (core("_three"), 1)]);
+        assert_eq!(index(&archive), [(core("_one"), 0), (core("_two"), 1), (core("_three"), 1)]);
     }
 
     #[test]
@@ -166,10 +183,9 @@ mod tests {
             }
         }
         let archive = read("libx.a", &out).unwrap();
-        let names: Vec<&str> = archive.members.iter().map(|it| it.name.as_str()).collect();
-        assert_eq!(names, ["a.o", "b.o"]);
+        assert_eq!(member_names(&archive), ["a.o", "b.o"]);
         assert_eq!(&out[archive.members[1].bytes.clone()], b"bbb");
-        assert_eq!(archive.index, [(core("_f"), 0), (core("_g"), 1)]);
+        assert_eq!(index(&archive), [(core("_f"), 0), (core("_g"), 1)]);
     }
 
     #[test]
@@ -194,13 +210,16 @@ mod tests {
             let index: Vec<(&str, usize)> = symbols.iter().map(|(name, at)| (name.as_str(), *at)).collect();
             let bytes = bsd(&members, &index);
             let archive = read("libseeded.a", &bytes).unwrap_or_else(|e| panic!("round {round}: {e}"));
-            let got: Vec<&str> = archive.members.iter().map(|it| it.name.as_str()).collect();
-            assert_eq!(got, names, "round {round}");
+            assert_eq!(member_names(&archive), names, "round {round}");
             for (member, data) in archive.members.iter().zip(&datas) {
                 assert_eq!(&bytes[member.bytes.clone()], data.as_slice(), "round {round}");
             }
             let want: Vec<(String, u32)> = symbols.iter().map(|(name, at)| (core(name), *at as u32)).collect();
-            assert_eq!(archive.index, want, "round {round}");
+            assert_eq!(index(&archive), want, "round {round}");
+            // Every name in the one arena: the members' and the index's, nothing else.
+            let bytes_named: usize = names.iter().map(String::len).sum::<usize>()
+                + want.iter().map(|(name, _)| name.len()).sum::<usize>();
+            assert_eq!(archive.names.bytes(), bytes_named, "round {round}");
         }
     }
 

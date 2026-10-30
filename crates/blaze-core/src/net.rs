@@ -111,12 +111,13 @@ impl Socket {
     /// A connected socket the driver got as a bare descriptor (an accept of the ring's).
     pub(crate) fn from_fd(fd: OwnedFd, unix: bool) -> Socket {
         let raw = fd.into_raw_fd();
-        // SAFETY: the descriptor is a connected socket of the kind named, owned from here.
-        unsafe {
-            match unix {
-                true => Socket::Unix(UnixStream::from_raw_fd(raw)),
-                false => Socket::Tcp(TcpStream::from_raw_fd(raw)),
-            }
+        match unix {
+            // SAFETY: `raw` came from `fd.into_raw_fd()`, a connected socket of the kind `unix`
+            // names, so it is owned once, here; a wrong kind would make std's stream calls fail,
+            // not UB.
+            true => Socket::Unix(unsafe { UnixStream::from_raw_fd(raw) }),
+            // SAFETY: as above, a TCP socket.
+            false => Socket::Tcp(unsafe { TcpStream::from_raw_fd(raw) }),
         }
     }
 

@@ -75,6 +75,25 @@ moving against Watchman's settle-to-query latency.
 - **Mapped file bytes**: a large file read straight into the store's memory (or a mapping of
   it) instead of a `Vec` turned into an `Arc<[u8]>`.
 
+## Unsafe ([../../design/unsafe.md](../../design/unsafe.md))
+
+- All of it is in `store.rs`, behind a safe API. `lib.rs` denies `unsafe_code` everywhere else
+  (`deny`, not `forbid`, so `store` alone can allow it).
+- Each read is checked against a column length published with release: one acquire load and a
+  compare, so a bad node number panics instead of reading uninitialized memory.
+- Each push goes through the one `Writer` (`&mut self`) or a `Building` only the collection
+  holds.
+- A reader reaches a table only through a `Snapshot` that holds its reclamation task. What the
+  snapshot lends can't outlive it.
+- Why unsafe at all: the safe versions cost every read a shared write (a lock's count on each
+  column) or every commit a copy of the tree.
+- Proof:
+  - `store/tests.rs` checks the columns, index and names against `Vec`, `FxHashMap` and
+    `Vec<String>`.
+  - `model_a_node_reads_whole_or_not_at_all` runs under blaze-check (`sync.rs` switches the
+    atomics).
+  - safety-fuzz-vfs fuzzes the journal's recovery.
+
 ## Tests
 
 - `transactions_match_a_model`: seeded transactions (writes, edits, deletes of files and

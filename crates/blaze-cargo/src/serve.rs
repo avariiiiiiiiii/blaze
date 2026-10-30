@@ -16,6 +16,7 @@ mod heads;
 mod job;
 mod mounts;
 mod plane;
+mod signals;
 #[cfg(test)]
 mod tests;
 mod unit;
@@ -26,10 +27,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 use anyhow::{Context, bail};
@@ -46,9 +44,6 @@ pub struct Paths {
     /// blaze's own executable: the sandbox's launcher.
     pub launcher: PathBuf,
 }
-
-/// Set by SIGTERM or SIGINT: the loop writes its image and stops.
-static SIGNALLED: AtomicBool = AtomicBool::new(false);
 
 /// Where the daemon's socket is: `<home>/v2.sock`.
 pub fn socket() -> anyhow::Result<PathBuf> {
@@ -167,7 +162,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
             .to_owned(),
         color: false,
     };
-    signals();
+    signals::catch();
     let steps: Arc<dyn work::Steps> = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
     let runner = Box::new(plane::Threads::new(options.io));
@@ -205,7 +200,7 @@ fn run<D: Driver>(
     let mut daemon = Daemon::start(driver, options, steps, runner).map_err(|why| anyhow::anyhow!(why))?;
     eprintln!("blaze serve: listening on {}", daemon.listening());
     loop {
-        if SIGNALLED.load(Ordering::Acquire) {
+        if signals::signalled() {
             daemon.stop();
         }
         if !daemon.turn() {
@@ -217,19 +212,3 @@ fn run<D: Driver>(
         None => Ok(()),
     }
 }
-
-#[cfg(unix)]
-fn signals() {
-    extern "C" fn signalled(_: libc::c_int) {
-        SIGNALLED.store(true, Ordering::Release);
-    }
-    let handler = signalled as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
-    unsafe {
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGINT, handler);
-    }
-}
-
-#[cfg(not(unix))]
-fn signals() {}

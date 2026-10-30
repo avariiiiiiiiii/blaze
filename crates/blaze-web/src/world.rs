@@ -7,9 +7,8 @@
 //!   build put a function of, `Crate`, named as the crate, and in a crate its modules, `Module`,
 //!   named as the module, one in another as in the crate;
 //! - a function: `Function { key, name, how, ns, build }`, unnamed, in the module its path is
-//!   in ([`module_path`]: a
-//!   type's path is a module here, as on the page), or the crate when it is in none, and
-//!   `Callees`, the functions it calls;
+//!   in ([`module_path`]: a type's path is a module here, as on the page), or the crate when
+//!   it is in none, and `Callees`, the functions it calls;
 //! - a module's `Callees`, the other modules its functions call, and `(Calls, crate)` on a
 //!   crate one of whose functions calls one of that crate's. A call that is gone stays until
 //!   the program is written again. Only crates' calls are pairs: anim's 150 000 calls of
@@ -21,8 +20,8 @@
 //! Flecs through a reused buffer, its module is one hash of its path, and a call to an id not
 //! yet named waits in a chain of its `(object, id)` rather than in a list every record scans.
 //!
-//! One thread has the world: [`World`] is not `Send`. Flecs is reached only through
-//! [`crate::flecs`], so this module is safe code.
+//! One thread has the world: [`World`] is not `Send`. Flecs is reached only through the
+//! crate's `flecs` module, so this module is safe code.
 
 #![forbid(unsafe_code)]
 
@@ -130,50 +129,9 @@ struct Node {
     module: Entity,
 }
 
-/// What Flecs's REST answered.
-pub struct Answer {
-    pub code: u16,
-    pub kind: String,
-    pub body: Vec<u8>,
-}
-
 impl World {
     pub fn new() -> Result<World, String> {
-        // SAFETY: a world of its own, and NUL-terminated strings.
-        unsafe {
-            let world = ecs::ecs_init();
-            if world.is_null() {
-                return Err("Flecs made no world".into());
-            }
-            let code = CString::new(KINDS).map_err(|e| e.to_string())?;
-            if ecs::ecs_script_run(
-                world,
-                c"blaze-web".as_ptr(),
-                code.as_ptr(),
-                std::ptr::null_mut(),
-            ) != 0
-            {
-                ecs::ecs_fini(world);
-                return Err("Flecs did not take the build page's kinds".into());
-            }
-            let rest = ecs::glue_rest_new(world);
-            if rest.is_null() {
-                ecs::ecs_fini(world);
-                return Err("Flecs made no REST server".into());
-            }
-            let named = |name: &CStr| ecs::ecs_lookup(world, name.as_ptr());
-            Ok(World {
-                world,
-                rest,
-                workspace: named(c"Workspace"),
-                function: named(c"Function"),
-                callees: named(c"Callees"),
-                krate: named(c"Crate"),
-                module: named(c"Module"),
-                calls: named(c"Calls"),
-                scratch: Scratch::default(),
-            })
-        }
+        Ok(World { flecs: Flecs::new()?, scratch: Scratch::default() })
     }
 
     /// A program of the workspace at `root`, with no functions yet.
@@ -207,8 +165,8 @@ impl World {
 
     /// Takes the program out of the world.
     pub fn forget(&mut self, program: Program) {
-        // SAFETY: the world's thread; children go with the workspace.
-        unsafe { ecs::ecs_delete(self.world, program.entity) };
+        // Its children go with the workspace.
+        self.flecs.delete(program.entity);
     }
 
     /// Takes in `record`, of build `build` of the program's workspace.
@@ -250,35 +208,7 @@ impl World {
 
     /// What Flecs's REST answers `method` of `path` (with its query), read only.
     pub fn rest(&mut self, method: &str, path: &str) -> Result<Answer, String> {
-        let method = CString::new(method).map_err(|_| "a NUL in the method")?;
-        let path = CString::new(path).map_err(|_| "a NUL in the path")?;
-        let (mut body, mut len, mut kind) = (std::ptr::null_mut(), 0i32, std::ptr::null());
-        // SAFETY: the world's thread, its server, NUL-terminated strings; the body is Flecs's
-        // to free, once copied.
-        unsafe {
-            let code = ecs::glue_rest_request(
-                self.rest,
-                method.as_ptr(),
-                path.as_ptr(),
-                std::ptr::null(),
-                &mut body,
-                &mut len,
-                &mut kind,
-            );
-            let bytes = if body.is_null() || len <= 0 {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(body.cast::<u8>(), len as usize).to_vec()
-            };
-            ecs::glue_free(body.cast::<c_void>());
-            let kind = if kind.is_null() {
-                "application/json".to_owned()
-            } else {
-                CStr::from_ptr(kind).to_string_lossy().into_owned()
-            };
-            let code = u16::try_from(code).map_err(|_| format!("Flecs answered {code}"))?;
-            Ok(Answer { code, kind, body: bytes })
-        }
+        self.flecs.rest(method, path)
     }
 
     /// The program in the layout of docs/web.md, "The snapshot".
@@ -294,17 +224,16 @@ impl World {
         }
         out.extend((program.nodes.len() as u32).to_le_bytes());
         for node in &program.nodes {
-            // SAFETY: the world's thread; every node has a Function.
-            let function = unsafe {
-                &*ecs::ecs_get_id(self.world, node.entity, self.function).cast::<Function>()
+            // `placed` sets every node's Function as it makes the node.
+            let Some(function) = self.flecs.function(node.entity) else {
+                panic!("build page: function {:#x} has no Function in the world", node.entity)
             };
             out.extend(function.key.to_le_bytes());
             out.extend(node.krate.to_le_bytes());
             out.push(function.how);
             out.extend(function.ns.to_le_bytes());
             out.extend(function.build.to_le_bytes());
-            // SAFETY: Flecs's copy of the name, NUL-terminated.
-            text(&mut out, unsafe { CStr::from_ptr(function.name) }.to_bytes());
+            text(&mut out, function.name);
         }
         out.extend((program.edges as u32).to_le_bytes());
         let mut sorted = Vec::new();
@@ -321,24 +250,20 @@ impl World {
     }
 
     fn workspace_of(&mut self, root: &Path, build: u64) -> Entity {
-        // SAFETY: the world's thread.
-        let entity = unsafe { ecs::ecs_new(self.world) };
-        let root = c_text(&mut self.scratch.text, root.to_string_lossy().as_bytes());
-        let value = Workspace { root, build };
-        self.set(entity, self.workspace, &value);
+        let entity = self.flecs.entity();
+        self.flecs.set_workspace(entity, root.to_string_lossy().as_bytes(), build);
         entity
     }
 
     fn set_workspace(&mut self, program: &Program) {
-        let root = c_text(&mut self.scratch.text, program.root.to_string_lossy().as_bytes());
-        let value = Workspace { root, build: program.build };
-        self.set(program.entity, self.workspace, &value);
+        let root = program.root.to_string_lossy();
+        self.flecs.set_workspace(program.entity, root.as_bytes(), program.build);
     }
 
     /// A build writes the whole program again: what it says is all of it.
     fn forget_functions(&mut self, program: &mut Program) {
-        // SAFETY: the world's thread; children go with the workspace.
-        unsafe { ecs::ecs_delete(self.world, program.entity) };
+        // Its children go with the workspace.
+        self.flecs.delete(program.entity);
         program.entity = self.workspace_of(&program.root, program.build);
         program.crates.clear();
         program.crates_of.clear();
@@ -382,9 +307,8 @@ impl World {
                 None => {
                     let parent =
                         self.module_of(program, krate, in_crate, &function.krate, &function.name);
-                    // SAFETY: the world's thread.
-                    let entity = unsafe { ecs::ecs_new(self.world) };
-                    self.set_parent(entity, parent);
+                    let entity = self.flecs.entity();
+                    self.flecs.set_parent(entity, parent);
                     let at = program.nodes.len() as u32;
                     program.nodes.push(Node { entity, krate, module: parent });
                     program.out.push(Vec::new());
@@ -398,9 +322,9 @@ impl World {
                 How::Unchanged => (2, 0),
                 How::Stored => (3, 0),
             };
-            let name = c_text(&mut self.scratch.text, function.name.as_bytes());
-            let value = Function { key: function.key, name, how, ns, build: program.build };
-            self.set(program.nodes[at as usize].entity, self.function, &value);
+            let entity = program.nodes[at as usize].entity;
+            let (key, name) = (function.key, function.name.as_bytes());
+            self.flecs.set_function(entity, key, name, how, ns, program.build);
             program.ids.entry(object).or_default().insert(function.id, at);
             placed.push(at);
         }
@@ -472,8 +396,7 @@ impl World {
                 changed_modules.push(from.module);
             }
             if crates.0 != crates.1 && program.calls.insert(crates) {
-                // SAFETY: the world's thread.
-                unsafe { ecs::ecs_add_id(self.world, crates.0, pair(self.calls, crates.1)) };
+                self.flecs.add_calls(crates.0, crates.1);
             }
         }
         changed.sort_unstable();
@@ -483,12 +406,12 @@ impl World {
             callees.clear();
             let out = &program.out[at as usize];
             callees.extend(out.iter().map(|&to| program.nodes[to as usize].entity));
-            self.set_callees(program.nodes[at as usize].entity, &callees);
+            self.flecs.set_callees(program.nodes[at as usize].entity, &callees);
         }
         changed_modules.sort_unstable();
         changed_modules.dedup();
         for &module in &changed_modules {
-            self.set_callees(module, &program.module_calls[&module]);
+            self.flecs.set_callees(module, &program.module_calls[&module]);
         }
         self.scratch.placed = placed;
         self.scratch.calls = calls;
@@ -497,16 +420,6 @@ impl World {
         self.scratch.changed = changed;
         self.scratch.changed_modules = changed_modules;
         self.scratch.callees = callees;
-    }
-
-    /// Sets `callees` as the `Callees` of `entity`: Flecs copies them.
-    fn set_callees(&mut self, entity: Entity, callees: &[Entity]) {
-        let vector = ecs::ecs_vec_t {
-            array: callees.as_ptr().cast_mut().cast::<c_void>(),
-            count: callees.len() as i32,
-            size: callees.len() as i32,
-        };
-        self.set(entity, self.callees, &vector);
     }
 
     fn crate_of(&mut self, program: &mut Program, name: &str) -> (u32, Entity) {
@@ -518,7 +431,7 @@ impl World {
             program.last_crate = it.0;
             return it;
         }
-        let entity = self.named(program.entity, name, self.krate);
+        let entity = self.flecs.named(program.entity, name.as_bytes(), Tag::Crate);
         let it = (program.crates.len() as u32, entity);
         program.crates.push(name.to_owned());
         program.crates_of.push(entity);
@@ -568,7 +481,8 @@ impl World {
                 at = match program.modules.get(&path[..until]) {
                     Some(&it) => it,
                     None => {
-                        let it = self.named(at, &name[start..end], self.module);
+                        let segment = &name.as_bytes()[start..end];
+                        let it = self.flecs.named(at, segment, Tag::Module);
                         program.modules.insert(path[..until].into(), it);
                         it
                     }
@@ -582,51 +496,6 @@ impl World {
         at
     }
 
-    fn named(&mut self, parent: Entity, name: &str, kind: Entity) -> Entity {
-        // SAFETY: the world's thread.
-        let entity = unsafe { ecs::ecs_new(self.world) };
-        self.set_parent(entity, parent);
-        let name = c_text(&mut self.scratch.text, name.as_bytes());
-        // SAFETY: as above, and a NUL-terminated name Flecs copies.
-        unsafe {
-            ecs::ecs_set_name(self.world, entity, name);
-            ecs::ecs_add_id(self.world, entity, kind);
-        }
-        entity
-    }
-
-    /// Puts `entity` in `parent` with Flecs's `Parent`, a `ChildOf` that does not fragment:
-    /// with `(ChildOf, module)` the functions of each module are a table of their own, and anim
-    /// has 5 000 modules.
-    fn set_parent(&mut self, entity: Entity, parent: Entity) {
-        // SAFETY: a constant Flecs sets once, before any world.
-        let id = unsafe { ecs::FLECS_IDEcsParentID_ };
-        self.set(entity, id, &Parent { value: parent });
-    }
-
-    /// Sets `value` as the component `id` of `entity`: Flecs copies it, its strings too.
-    fn set<T>(&mut self, entity: Entity, id: Entity, value: &T) {
-        // SAFETY: the world's thread, and `T` is laid out as the component (KINDS).
-        unsafe {
-            ecs::ecs_set_id(
-                self.world,
-                entity,
-                id,
-                size_of::<T>(),
-                std::ptr::from_ref(value).cast::<c_void>(),
-            )
-        };
-    }
-}
-
-impl Drop for World {
-    fn drop(&mut self) {
-        // SAFETY: the world's thread, and nothing uses either after.
-        unsafe {
-            ecs::glue_rest_free(self.rest);
-            ecs::ecs_fini(self.world);
-        }
-    }
 }
 
 impl Program {
@@ -819,24 +688,7 @@ fn segments<'a>(path: &'a str, f: &mut impl FnMut(&'a str)) {
     });
 }
 
-fn pair(relationship: Entity, target: Entity) -> ecs::ecs_id_t {
-    ecs::ECS_PAIR | ((relationship & 0xFFFF_FFFF) << 32) | (target & 0xFFFF_FFFF)
-}
-
 fn text(out: &mut Vec<u8>, text: &[u8]) {
     out.extend((text.len() as u32).to_le_bytes());
     out.extend(text);
-}
-
-/// `text` without its NULs and with one at its end, in `into`, for Flecs to copy: valid until
-/// `into` is next changed.
-fn c_text(into: &mut Vec<u8>, text: &[u8]) -> *const c_char {
-    into.clear();
-    if text.contains(&0) {
-        into.extend(text.iter().copied().filter(|&it| it != 0));
-    } else {
-        into.extend_from_slice(text);
-    }
-    into.push(0);
-    into.as_ptr().cast()
 }

@@ -26,6 +26,7 @@ its callers' relocations without recompiling them (docs/v2-codegen.md, "Template
 
 > forwarded to items
 > forwarded to codegen: lane items is DONE without it, and `blaze-items` cannot implement a trait of `hir-ty-codegen`, which depends on it (a cycle). The impl goes in `crates/hir-ty-codegen/v2/` over `blaze_items`' public functions (`item_key`, `crate_hashes`, the `hash` exports). Lane cargo already calls it as `hir_ty_codegen::v2::ItemHashes::new(Box::new(names))`, `names: Fn(base_db::FileId) -> Option<String>` (`crates/blaze-cargo/src/serve/unit/codegen.rs:265`), and that name does not exist yet.
+> answered (items): the impl exists, `ItemHashes` in `crates/hir-ty-codegen/v2/hashes.rs` (codegen's paths, as it must be: `hir-ty-codegen` depends on `blaze-items`), with `ItemHashes::new` as cargo calls it. Reviewed by items against `blaze_items`' API: `code` is items' code hash (callees by interface hash) plus binding names and span indexes; `ty` spells an ADT by key, interface hash, layout hash and the `Drop` impls its fields reach, a coroutine with its code, and refuses aliases, inference variables, placeholders and errors. Nothing to change on items' side. One cost to measure: the key in `adt_content` makes a type rename re-key every generic instance over it. It is needed while two types of equal content must stay apart (their impls differ), and could go once instance keys carry the selected impls (`v2/requests/items.md`, "callees named by identity").
 
 ## 2. link: what codegen now gives (request link.md section 1 applied)
 
@@ -159,6 +160,31 @@ modules v2 never reaches: `units.rs`, `cached.rs`, `flight.rs`, `counted.rs`, `p
    and `emit` (`mod.rs:5215`) still go through `blaze_store::Store::global()`, which is v1 and
    deleted at integration, so its locks were not audited. The move to `blaze-cas` has to land
    before then.
+   Status: done by speed-backend-intrinsics, in `asm.rs` alone. Both are now an append-only
+   `Table`, safe code with no lock:
+   - **Slots.** Open-addressed `OnceLock` slots set once, 16 probes a level, and a full window
+     leads to the next level of twice the slots, never rehashed. A lookup is acquire loads and
+     makes no level.
+   - **`ASSEMBLED`.** Keyed by the 32-byte key, holding the `Assembled` itself. A repeat on a
+     thread is still a thread-local hit with no SHA-256.
+   - **`INLINE`.** A published entry is never changed: two blocks of one wrapper set the
+     entry's `other` flag (one release store), and readers see `None`.
+
+   `inline_of` keeps its `Arc` signature (`fragment.rs` and `llvm/lower.rs` spell the type),
+   so it still clones an `Arc` per read. The new `asm::inline_block(text) -> Option<&'static
+   Inline>` reads with no shared write. Asked of speed-backend-code (`fragment.rs`
+   `asm_blocks`) and speed-backend-llvm (`llvm/lower.rs` `blocks_asm`, `asm_block`): use it
+   and a map of `&'static Inline`, then `inline_of` goes. Done by both, and `inline_of` is
+   deleted, so reading an inline block writes no shared memory. Carrying the block in the function's
+   `Requests` (the finding's first fix) needs `mod.rs` and `fragment.rs` and isn't needed for
+   the rules any more; it stays theirs to choose. Done by speed-backend-code (2026-10-29):
+   `Wants::asm_blocks` returns `FxHashMap<u32, &'static asm::Inline>` through `inline_block`,
+   which is what `llvm/lower.rs` already takes; `inline_of` is now used only by `asm.rs`'s
+   own tests, so speed-backend-intrinsics can remove it. Carrying the block in `Requests` is
+   not done: with no lock and no shared write left, it buys nothing. `Store::global()` in `assemble` is unchanged:
+   it moves with the rest of v1's store to `blaze-cas`.
+   Tests: `asm::tests::{a_table_keeps_one_entry_a_key_whoever_adds_it,
+   keys_of_one_hash_go_on_to_later_levels, a_wrapper_of_two_blocks_is_neither}`.
 5. **`crates/hir-ty-codegen/backend.rs:368`, `:372`, `:380`: `Tally`'s `alone`, `fallbacks`
    and `passes` locks, and its shared counters.** `Tally::passes` (`:497-505`) takes a global
    lock for every Cranelift function `emit` compiles (`mod.rs:5222`) under `BLAZE_STATS`. The
@@ -374,6 +400,10 @@ stays), `v2/refs.rs`, `v2/frontend.rs`, `stable.rs` (no expression or pattern lo
 - ~L164  `match (source_map.expr_syntax(expr), &Body::of(db, owner)[expr]) {`  ->  `match (source_map.expr_syntax(expr), Body::of(db, owner).expr(expr)) {`
 - ~L167  `source_map.expr_syntax(*tail).ok()?`  ->  `source_map.expr_syntax(tail).ok()?`
 
+> done by speed-backend-code (2026-10-29): the `type_id.rs` and `places.rs` sites above, as
+> written (unbuilt: that lane runs no build). No other HIR expression or pattern lookups in its
+> files. `fncache/dispatch.rs` and `mod.rs` are left to their owners.
+
 ### speed-hir-store addendum (type refs become views; from speed-hir-store-mir)
 For both sections above (hir-ty-mir and hir-ty-codegen): no `TypeRef` edits. Neither crate reads a
 `TypeRef` from a store (`store[t]`, `&TypeRef`, `TypeRef::` patterns: none). The only HIR type-ref
@@ -506,3 +536,32 @@ the MIR names, and a `coroutine_by_move_code` query, would hash each body once i
 Why: hash once (principles.md); today the MIR's spans are walked twice per body.
 
 > forwarded to coordinator: lane items is DONE and this is a restructure of its hashing (`hash.rs`) with a new code query, optional: new work for a lane the coordinator names, not an edit.
+
+## From speed-backend-code (2026-10-29): `blaze_codegen::Reloc` in 16 bytes (lead)
+
+`crates/blaze-codegen/src/lib.rs:176`: `Reloc { at: u32, kind: RelocKind, target: Target,
+addend: i64 }` holds its `Target` inline (`InstanceKey`, `ContentId`, `ItemKey` + `ContentId`,
+or an owned `String`), so a relocation is far over data.md's 16 bytes and each `Extern` one
+owns a heap string. `hir-ty-codegen`'s own `fragment::Relocs` is now 16-byte rows; the
+conversion in `v2/convert.rs` widens every one back. Exact layout asked:
+
+```rust
+/// 16 bytes (const-asserted): read in place, sorted by `at`.
+#[repr(C)]
+pub struct Reloc {
+    pub at: u32,
+    /// Index into `CompiledFunction::targets`, each distinct target once.
+    pub target: u32,
+    /// The addend, or `i32::MIN` for one kept in `CompiledFunction::wide` by this row's index.
+    pub addend: i32,
+    pub kind: RelocKind, // #[repr(u8)]
+    pad: [u8; 3],
+}
+pub struct CompiledFunction { /* ... */ pub relocs: Vec<Reloc>, pub targets: Vec<Target>, pub wide: Vec<(u32, i64)>, /* ... */ }
+```
+
+The serialized form changes, so the function schema's version and every key over it bump. A
+call site per target is then 16 bytes and a lookup an index; `targets` dedups the dozen calls
+of one callee a function has. Not blocking: `hir-ty-codegen` builds without it.
+
+> forwarded to codegen: `blaze_codegen::Reloc` is lane codegen's.

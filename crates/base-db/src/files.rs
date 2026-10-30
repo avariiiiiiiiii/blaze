@@ -571,7 +571,7 @@ impl Files {
     fn path_for_file(&self, db: &dyn SourceDatabase, id: FileId) -> Option<VfsPath> {
         self.source_roots
             .iter()
-            .find_map(|(_, source_root)| source_root.source_root(db).path_for_file(&id).cloned())
+            .find_map(|(_, source_root)| source_root.source_root_ref(db).path_for_file(&id).cloned())
     }
 
     pub fn set_file_source_root_with_durability(

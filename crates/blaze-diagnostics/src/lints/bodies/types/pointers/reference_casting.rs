@@ -13,6 +13,7 @@ use hir_def::{
     hir::{BinaryOp, BindingId, Expr, ExprId, Pat, UnaryOp},
 };
 use hir_ty::next_solver::{DbInterner, Ty, TyKind};
+use intern::Symbol;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     Interner as _, Mutability,
@@ -116,7 +117,7 @@ fn borrow_or_assign(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<(ExprId, Pattern
     }
     let Expr::Call { callee, args } = store.expr(expr) else { return None };
     let [pointer, _] = args else { return None };
-    match callee_item(b, callee).as_deref() {
+    match callee_item(b, callee).as_ref().map(Symbol::as_str) {
         Some("ptr_write" | "ptr_write_volatile" | "ptr_write_unaligned") => Some((*pointer, PatternKind::Assign)),
         _ => None,
     }

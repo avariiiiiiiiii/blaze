@@ -27,7 +27,7 @@ use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
 use smallvec::SmallVec;
 
-use super::{Walk, told};
+use super::{Tys, Walk, told};
 use crate::{
     AbiScalar, Arch, CodegenError, VariableArguments, asm, avx512, f16_f128, neon, sve, x86,
 };
@@ -250,7 +250,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
     pub(super) fn neon_fused(&mut self) -> Result<bool, String> {
         let Some((name, lowered)) = self.fx.neon_fused().map_err(told)? else { return Ok(false) };
         let body = self.fx.body.expect("MIR body");
-        let arg_tys: Vec<Ty<'db>> =
+        let arg_tys: Tys<'db> =
             body.param_locals.iter().map(|&local| body.locals[local].ty.as_ref()).collect();
         let dst_ty = body.locals[crate::returned_local(body)].ty.as_ref();
         let text = self.neon_text(&name, &lowered, &arg_tys, dst_ty)?;
@@ -1210,7 +1210,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let text = lowered.text.replace("{imm}", &value.to_string());
             with_immediate = Some(neon::Lowered { text, ..lowered.clone() });
         }
-        let arg_tys: SmallVec<[Ty<'db>; 8]> = args.iter().map(|arg| self.operand_ty(arg)).collect();
+        let arg_tys: Tys<'db> = args.iter().map(|arg| self.operand_ty(arg)).collect();
         let text =
             self.neon_text(name, with_immediate.as_ref().unwrap_or(lowered), &arg_tys, dst_ty)?;
         self.assembly(text)

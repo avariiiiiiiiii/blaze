@@ -23,7 +23,7 @@ use rustc_hash::FxBuildHasher;
 use crate::{
     Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError,
     reader::Reader,
-    store::{DIR, Entries, FILE, Shape, Shared, Span, Table, mode_byte, mode_of, run},
+    store::{Building, DIR, Entries, Shape, Table, Writer, mode_byte, mode_of},
 };
 
 /// A node of a [`Tree`]. Only meaningful for the tree that made it, and only until it collects.
@@ -89,39 +89,29 @@ impl<'a> Dir<'a> {
     }
 }
 
-/// Every node and name made so far, interned. The one writer of its [`Shared`] storage.
+/// Every node and name made so far, interned. The one writer of the store readers share.
 pub(crate) struct Tree {
-    shared: Arc<Shared>,
-    /// How many nodes and blobs the table in use holds, and where its next run of entries may
-    /// start.
-    nodes: u32,
-    blobs: u32,
-    entries: u32,
-    /// How many names there are, where the next one's bytes may start, and each by the hash of
-    /// its bytes (computed once and kept, so growing never hashes again).
-    names: u32,
-    name_bytes: u32,
+    store: Writer,
+    /// Each name by the hash of its bytes (computed once and kept, so growing never hashes
+    /// again).
     name_index: HashTable<(u64, u32)>,
     empty: NodeId,
     /// Tables replaced by collections and not freed yet.
     retired: usize,
-    /// A directory's hashed bytes, reused.
+    /// A directory's hashed bytes, and its entries as the store keeps them, reused.
     scratch: Vec<u8>,
+    columns: Vec<(u32, u32, u8)>,
 }
 
 impl Tree {
     pub(crate) fn new() -> Tree {
         let mut tree = Tree {
-            shared: Arc::new(Shared::new(Table::new(0))),
-            nodes: 0,
-            blobs: 0,
-            entries: 0,
-            names: 0,
-            name_bytes: 0,
+            store: Writer::new(),
             name_index: HashTable::new(),
             empty: NodeId(0),
             retired: 0,
             scratch: Vec::new(),
+            columns: Vec::new(),
         };
         tree.empty = tree.dir_sorted(&mut []);
         tree
@@ -129,19 +119,17 @@ impl Tree {
 
     /// A handle that reads every node from any thread.
     pub(crate) fn reader(&self) -> Reader {
-        Reader::new(self.shared.clone())
+        Reader::new(self.store.shared())
     }
 
     fn table(&self) -> &Table {
-        // SAFETY: this tree is the table's one writer, and replaces it only in `collect`,
-        // through `&mut self`, so no reference from `&self` outlives it.
-        unsafe { self.shared.table() }
+        self.store.table()
     }
 
     /// Frees the tables collections replaced that no reader is in any more.
     pub(crate) fn reclaim(&mut self) {
         if self.retired > 0 {
-            self.retired = self.shared.reclaim();
+            self.retired = self.store.reclaim();
         }
     }
 
@@ -152,23 +140,19 @@ impl Tree {
 
     /// How many nodes it holds.
     pub(crate) fn len(&self) -> usize {
-        self.nodes as usize
+        self.table().len() as usize
     }
 
     fn shape(&self, node: NodeId) -> Shape {
-        assert!(node.0 < self.nodes, "node {} of a tree of {}", node.0, self.nodes);
-        // SAFETY: every node below `nodes` was written by this tree.
-        unsafe { self.table().shape(node.0) }
+        self.table().shape(node.0)
     }
 
     pub(crate) fn id(&self, node: NodeId) -> ContentId {
-        assert!(node.0 < self.nodes, "node {} of a tree of {}", node.0, self.nodes);
-        // SAFETY: as in `shape`.
-        unsafe { *self.table().id(node.0) }
+        *self.table().id(node.0)
     }
 
     pub(crate) fn node(&self, id: &ContentId) -> Option<NodeId> {
-        self.table().find(id).ok().map(NodeId)
+        self.table().find(id).map(NodeId)
     }
 
     pub(crate) fn is_dir(&self, node: NodeId) -> bool {
@@ -178,39 +162,23 @@ impl Tree {
     /// A directory's entries, sorted by name; `None` for a file.
     pub(crate) fn entries(&self, node: NodeId) -> Option<Dir<'_>> {
         let shape = self.shape(node);
-        // SAFETY: a directory's shape of this tree's.
-        shape.is_dir().then(|| Dir(unsafe { self.table().entries(shape) }))
+        shape.is_dir().then(|| Dir(self.table().entries(shape)))
     }
 
     /// A file's bytes; `None` for a directory.
     pub(crate) fn bytes(&self, node: NodeId) -> Option<&Arc<[u8]>> {
         let shape = self.shape(node);
-        // SAFETY: a file's shape of this tree's.
-        (!shape.is_dir()).then(|| unsafe { self.table().blob(shape) })
+        (!shape.is_dir()).then(|| self.table().blob(shape))
     }
 
     pub(crate) fn name(&mut self, name: &str) -> NameId {
         let hash = FxBuildHasher.hash_one(name.as_bytes());
-        let Tree { shared, name_index, names, name_bytes, .. } = self;
-        let store = &shared.names;
-        // SAFETY: every interned name was written by this tree.
-        let same =
-            |&(at, id): &(u64, u32)| at == hash && unsafe { store.get(id) } == name.as_bytes();
+        let Tree { store, name_index, .. } = self;
+        let same = |&(at, id): &(u64, u32)| at == hash && store.names().get(id) == name.as_bytes();
         match name_index.entry(hash, same, |&(at, _)| at) {
             hash_table::Entry::Occupied(it) => NameId(it.get().1),
             hash_table::Entry::Vacant(it) => {
-                let len = u32::try_from(name.len()).expect("a name under 4 GiB");
-                let start = run(*name_bytes, len);
-                let id = *names;
-                assert!(id != u32::MAX, "2^32 names");
-                // SAFETY: the writer, at offsets past every name written, published by the
-                // directory that names it.
-                unsafe {
-                    store.bytes.write_run(start, name.as_bytes());
-                    store.spans.write(id, Span { start, len });
-                }
-                *name_bytes = start + len;
-                *names += 1;
+                let id = store.intern(name);
                 it.insert((hash, id));
                 NameId(id)
             }
@@ -218,43 +186,17 @@ impl Tree {
     }
 
     fn name_bytes(&self, name: NameId) -> &[u8] {
-        assert!(name.0 < self.names, "name {} of {}", name.0, self.names);
-        // SAFETY: every name below `names` was written by this tree.
-        unsafe { self.shared.names.get(name.0) }
+        self.store.names().get(name.0)
     }
 
     pub(crate) fn name_str(&self, name: NameId) -> &str {
-        // SAFETY: a name is interned only from a `&str`.
-        unsafe { std::str::from_utf8_unchecked(self.name_bytes(name)) }
-    }
-
-    /// Writes a node found missing at `place` of the index.
-    fn push(&mut self, id: ContentId, shape: Shape, place: usize) -> NodeId {
-        let node = self.nodes;
-        assert!(node < u32::MAX - 1, "2^32 nodes");
-        let table = self.table();
-        // SAFETY: the writer, at the next node, indexed (so published) only after.
-        unsafe {
-            table.ids.write(node, id);
-            table.shapes.write(node, shape);
-        }
-        table.index(&id, node, place, node as usize);
-        self.nodes += 1;
-        NodeId(node)
+        self.store.names().str(name.0)
     }
 
     /// The node of a file with these bytes.
     pub(crate) fn file(&mut self, bytes: Arc<[u8]>) -> NodeId {
         let id = ContentId::of(FILE_DOMAIN, &bytes);
-        let place = match self.table().find(&id) {
-            Ok(node) => return NodeId(node),
-            Err(place) => place,
-        };
-        let blob = self.blobs;
-        // SAFETY: the writer, at the next blob, named only by the node pushed after.
-        unsafe { self.table().blobs.write(blob, bytes) };
-        self.blobs += 1;
-        self.push(id, Shape { start: blob, len: FILE }, place)
+        NodeId(self.store.file(id, bytes))
     }
 
     /// The node of a directory with these entries, in any order; names must be distinct.
@@ -286,25 +228,17 @@ impl Tree {
         }
         let id = ContentId::of(DIR_DOMAIN, &bytes);
         self.scratch = bytes;
-        let place = match self.table().find(&id) {
-            Ok(node) => return NodeId(node),
-            Err(place) => place,
-        };
-        let len = u32::try_from(entries.len()).expect("fewer than 2^32 entries");
-        let start = run(self.entries, len);
-        let table = self.table();
-        for (at, &(name, child, mode)) in (start..).zip(entries.iter()) {
-            let byte = if self.is_dir(child) { DIR } else { mode_byte(mode) };
-            // SAFETY: the writer, in a run past every entry written, named only by the node
-            // pushed after.
-            unsafe {
-                table.entry_names.write(at, name.0);
-                table.entry_nodes.write(at, child.0);
-                table.entry_modes.write(at, byte);
-            }
+        if let Some(node) = self.table().find(&id) {
+            return NodeId(node);
         }
-        self.entries = start + len;
-        self.push(id, Shape { start, len }, place)
+        let mut columns = std::mem::take(&mut self.columns);
+        columns.clear();
+        columns.extend(entries.iter().map(|&(name, child, mode)| {
+            (name.0, child.0, if self.is_dir(child) { DIR } else { mode_byte(mode) })
+        }));
+        let node = self.store.dir(id, &columns);
+        self.columns = columns;
+        NodeId(node)
     }
 
     /// git's code for a directory entry: 040000 for a directory, else its file's mode.
@@ -314,7 +248,7 @@ impl Tree {
 
     fn child(&self, dir: NodeId, name: &str) -> Option<(NodeId, Mode)> {
         let Dir(entries) = self.entries(dir)?;
-        let at = entries.find(&self.shared.names, name.as_bytes())?;
+        let at = entries.find(self.store.names(), name.as_bytes())?;
         Some((NodeId(entries.nodes[at]), mode_of(entries.modes[at])))
     }
 
@@ -764,7 +698,7 @@ impl Tree {
     /// readers move to at once; `live` is updated in place. Names are kept. Returns each old
     /// node's new one, `None` for a node dropped.
     pub(crate) fn collect(&mut self, live: &mut [NodeId]) -> Vec<Option<NodeId>> {
-        let len = self.nodes as usize;
+        let len = self.len();
         let mut reached = vec![0u64; len.div_ceil(64)];
         let mut stack: Vec<NodeId> = live.iter().copied().chain([self.empty]).collect();
         while let Some(node) = stack.pop() {
@@ -778,50 +712,30 @@ impl Tree {
             }
         }
         let count = reached.iter().map(|it| it.count_ones() as usize).sum();
-        let next = Table::new(count);
-        let old = self.table();
-        let mut renumbered = vec![None; len];
-        let (mut nodes, mut blobs, mut entries) = (0u32, 0u32, 0u32);
+        let mut next = Building::new(count);
+        let old = self.store.table();
+        let mut renumbered: Vec<Option<NodeId>> = vec![None; len];
+        let mut columns = Vec::new();
         // Children have smaller numbers than their parents, so they are renumbered first.
         for at in 0..len as u32 {
             if reached[at as usize / 64] & (1 << (at % 64)) == 0 {
                 continue;
             }
-            // SAFETY: every node below `nodes` was written by this tree.
-            let (id, shape) = unsafe { (*old.id(at), old.shape(at)) };
-            let shape = if shape.is_dir() {
-                // SAFETY: a directory's shape, of this tree's.
-                let from = unsafe { old.entries(shape) };
-                let start = run(entries, shape.len);
-                for (place, k) in (start..).zip(0..from.len()) {
+            let (id, shape) = (*old.id(at), old.shape(at));
+            let node = if shape.is_dir() {
+                let from = old.entries(shape);
+                columns.clear();
+                columns.extend((0..from.len()).map(|k| {
                     let child = renumbered[from.nodes[k] as usize].expect("a child is reached");
-                    // SAFETY: the writer of the new table, which no reader has yet.
-                    unsafe {
-                        next.entry_names.write(place, from.names[k]);
-                        next.entry_nodes.write(place, child);
-                        next.entry_modes.write(place, from.modes[k]);
-                    }
-                }
-                entries = start + shape.len;
-                Shape { start, len: shape.len }
+                    (from.names[k], child.0, from.modes[k])
+                }));
+                next.dir(id, &columns)
             } else {
-                // SAFETY: as above.
-                unsafe { next.blobs.write(blobs, old.blob(shape).clone()) };
-                blobs += 1;
-                Shape { start: blobs - 1, len: FILE }
+                next.file(id, old.blob(shape).clone())
             };
-            // SAFETY: as above.
-            unsafe {
-                next.ids.write(nodes, id);
-                next.shapes.write(nodes, shape);
-            }
-            let Err(place) = next.find(&id) else { unreachable!("a node kept twice") };
-            next.index(&id, nodes, place, nodes as usize);
-            renumbered[at as usize] = Some(NodeId(nodes));
-            nodes += 1;
+            renumbered[at as usize] = Some(NodeId(node));
         }
-        self.retired = self.shared.replace(next);
-        (self.nodes, self.blobs, self.entries) = (nodes, blobs, entries);
+        self.retired = self.store.replace(next);
         self.empty = renumbered[self.empty.0 as usize].expect("the empty root is kept");
         for root in live {
             *root = renumbered[root.0 as usize].expect("a live root is kept");

@@ -4,7 +4,9 @@
 //! [`Counting`] is the daemon's global allocator: it counts the bytes the process holds
 //! ([`held`]) and, per thread, the bytes the task the thread runs now holds, so [`measure`]
 //! says what a task held at most. [`Bump`] is an arena for results built before they are
-//! written into the zero-copy format. [`Cap`] is the daemon's limit on its own arenas: past
+//! written into the zero-copy format; every task runs with one of its thread's ([`task`],
+//! [`with`]), reset when it ends, its huge chunks on the worker's NUMA node. [`Cap`] is the
+//! daemon's limit on its own arenas: past
 //! `spill_at` it asks for cold results to go to disk, and a reserve that would pass the limit
 //! waits. [`machine_budget`] is the memory the plane may grant: the machine's limit, less what
 //! others use in blaze's own cgroup and a margin.
@@ -216,21 +218,79 @@ pub fn held() -> u64 {
 const FIRST_CHUNK: usize = 64 << 10;
 const LAST_CHUNK: usize = 16 << 20;
 const CHUNK_ALIGN: usize = 16;
-/// Chunks this big or bigger are aligned to a huge page and asked to be backed by them
-/// (docs/v2/plan/design/hardware.md, "memory").
+/// Chunks this big or bigger are huge pages (docs/v2/plan/design/hardware.md, "memory"): on
+/// Linux the arena maps them itself, a multiple of this, aligned to it, with `MADV_HUGEPAGE`,
+/// and binds them to the NUMA node of the worker that takes them; elsewhere they come from the
+/// global allocator, aligned to it.
 const HUGE_PAGE: usize = 2 << 20;
 
 struct Chunk {
     ptr: NonNull<u8>,
     layout: Layout,
+    /// Mapped by the arena ([`map_chunk`]) rather than taken from the global allocator.
+    mapped: bool,
     /// The [`Cap`]'s bytes it holds, given back when it is freed.
     _grant: Option<Grant>,
 }
 
-/// A bump arena: values are put in chunks from the global allocator, from each chunk's end
-/// down (the fastest bump: a subtraction, a mask and one compare per value, as bumpalo), and
-/// all are freed together when it is dropped or [`Bump::reset`]. No value's destructor runs,
-/// so it takes only `Copy` values. Under a [`Cap`], each chunk is reserved from it first.
+thread_local! {
+    /// The arena of the task this thread runs now ([`task`]), null off a task.
+    static TASK: Cell<*const Bump> = const { Cell::new(std::ptr::null()) };
+    /// Arenas of tasks that ended, reset, each keeping its last chunk: the next task on the
+    /// thread takes one, so a worker's tasks reuse their memory without the allocator.
+    static SPARE: RefCell<Vec<Bump>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` with an arena of its own installed for [`with`], and resets it after (on a panic
+/// too): every value put in it is freed when `f` returns, and its last chunk goes to the next
+/// task of the thread. A task run inside another (one a waiting worker pumps) gets its own
+/// arena, not its waiter's, and the waiter's is installed again once it ends. On a pool
+/// worker, the arena's huge chunks are on the worker's NUMA node.
+pub fn task<R>(f: impl FnOnce() -> R) -> R {
+    struct Installed {
+        arena: Bump,
+        outer: *const Bump,
+    }
+    impl Drop for Installed {
+        fn drop(&mut self) {
+            TASK.set(self.outer);
+            let mut arena = std::mem::take(&mut self.arena);
+            arena.reset();
+            // At the thread's exit `SPARE` may be gone: the arena is then freed here.
+            _ = SPARE.try_with(|spare| spare.borrow_mut().push(arena));
+        }
+    }
+    let arena = SPARE.with(|spare| spare.borrow_mut().pop()).unwrap_or_default();
+    let installed = Installed { arena, outer: TASK.get() };
+    TASK.set(&raw const installed.arena);
+    let result = f();
+    drop(installed);
+    result
+}
+
+/// Gives `f` the arena of the task this thread runs ([`task`]). What `f` puts in it lives
+/// until the task ends, and no borrow of it outlives `f`.
+///
+/// # Panics
+///
+/// Off a task: work that wants an arena runs inside [`task`].
+pub fn with<R>(f: impl FnOnce(&Bump) -> R) -> R {
+    let at = TASK.get();
+    assert!(!at.is_null(), "arena::with outside a task: the work runs inside arena::task");
+    // SAFETY: `TASK` is not null only while a `task` on this thread runs its `f`, and then
+    // points at that call's `Installed::arena`, a local it does not move, which lives and is
+    // not reset until `f` has returned (its `Drop` puts back the outer pointer first, on an
+    // unwind too). This call is within that `f`, and the borrow ends with `f` here, so it ends
+    // before the reset; a nested `task` installs its own arena and never touches this one.
+    f(unsafe { &*at })
+}
+
+/// A bump arena: values are put in chunks from the global allocator (or, for huge ones on
+/// Linux, mapped by the arena: [`HUGE_PAGE`]), from each chunk's end down (the fastest bump: a
+/// subtraction, a mask and one compare per value, as bumpalo), and all are freed together when
+/// it is dropped or [`Bump::reset`]. No value's destructor runs, so it takes only `Copy`
+/// values. Under a [`Cap`], each chunk is reserved from it first. Mapped chunks count in
+/// [`held`] and [`measure`] as the allocator's do.
 pub struct Bump {
     chunks: RefCell<Vec<Chunk>>,
     /// The lowest byte in use of the last chunk: the next value goes below it, down to `start`.
@@ -296,12 +356,13 @@ impl Bump {
     #[allow(clippy::mut_from_ref)]
     pub fn alloc<T: Copy>(&self, value: T) -> Result<&mut T, Cancelled> {
         let ptr = self.alloc_layout(Layout::new::<T>())?.cast::<T>();
-        // SAFETY: the room is fresh, aligned and big enough for a `T`, and no other reference
-        // to it is given out while `self` is borrowed.
-        unsafe {
-            ptr.as_ptr().write(value);
-            Ok(&mut *ptr.as_ptr())
-        }
+        // SAFETY: `alloc_layout` gave fresh room, aligned and big enough for a `T`, that nothing
+        // else points at.
+        unsafe { ptr.as_ptr().write(value) };
+        // SAFETY: the `T` was just written there, and no other reference to the room is given
+        // out while `self` is borrowed; the `Bump` frees it only on `reset`, which takes
+        // `&mut self`.
+        Ok(unsafe { &mut *ptr.as_ptr() })
     }
 
     #[inline]
@@ -309,12 +370,12 @@ impl Bump {
     pub fn alloc_slice<T: Copy>(&self, values: &[T]) -> Result<&mut [T], Cancelled> {
         let layout = Layout::array::<T>(values.len()).expect("a slice's layout fits");
         let ptr = self.alloc_layout(layout)?.cast::<T>();
-        // SAFETY: the room is fresh, aligned and big enough for `values.len()` of `T`, which
-        // cannot overlap `values`, and no other reference to it is given out.
-        unsafe {
-            std::ptr::copy_nonoverlapping(values.as_ptr(), ptr.as_ptr(), values.len());
-            Ok(std::slice::from_raw_parts_mut(ptr.as_ptr(), values.len()))
-        }
+        // SAFETY: the room is fresh, aligned and big enough for `values.len()` of `T`, so it
+        // cannot overlap `values`.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), ptr.as_ptr(), values.len()) };
+        // SAFETY: those `values.len()` `T`s were just written, and no other reference to the
+        // room is given out while `self` is borrowed.
+        Ok(unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), values.len()) })
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -367,24 +428,27 @@ impl Bump {
         let last = self.chunks.borrow().last().map_or(0, |it| it.layout.size());
         let wanted = layout.size().checked_add(layout.align()).expect("a value's size fits");
         let size = (last * 2).clamp(FIRST_CHUNK, LAST_CHUNK).max(wanted);
-        let align = if size >= HUGE_PAGE { HUGE_PAGE } else { CHUNK_ALIGN };
-        let chunk_layout =
-            Layout::from_size_align(size, align.max(layout.align())).expect("a chunk's layout fits");
+        // A value of any alignment fits: `wanted` has room to align it down within the chunk.
+        let mapped = cfg!(target_os = "linux") && size >= HUGE_PAGE;
+        let (size, align) = match size >= HUGE_PAGE {
+            true if mapped => (size.next_multiple_of(HUGE_PAGE), HUGE_PAGE),
+            true => (size, HUGE_PAGE.max(layout.align())),
+            false => (size, CHUNK_ALIGN.max(layout.align())),
+        };
+        let chunk_layout = Layout::from_size_align(size, align).expect("a chunk's layout fits");
         let grant = match &self.cap {
             Some(cap) => Some(cap.reserve(size as u64)?),
             None => None,
         };
-        // SAFETY: the layout's size is not zero.
-        let ptr = unsafe { std::alloc::alloc(chunk_layout) };
-        let Some(ptr) = NonNull::new(ptr) else { std::alloc::handle_alloc_error(chunk_layout) };
-        #[cfg(target_os = "linux")]
-        if size >= HUGE_PAGE {
-            // A hint, not a request that can fail the arena: the kernel's transparent huge
-            // page setting decides whether it is taken.
-            // SAFETY: the range is the chunk just allocated, aligned to a huge page.
-            _ = unsafe { libc::madvise(ptr.as_ptr().cast(), size, libc::MADV_HUGEPAGE) };
-        }
-        self.chunks.borrow_mut().push(Chunk { ptr, layout: chunk_layout, _grant: grant });
+        let ptr = if mapped {
+            map_chunk(chunk_layout)
+        } else {
+            // SAFETY: the layout's size is not zero.
+            let ptr = unsafe { std::alloc::alloc(chunk_layout) };
+            let Some(ptr) = NonNull::new(ptr) else { std::alloc::handle_alloc_error(chunk_layout) };
+            ptr
+        };
+        self.chunks.borrow_mut().push(Chunk { ptr, layout: chunk_layout, mapped, _grant: grant });
         self.start.set(ptr.as_ptr());
         // SAFETY: one past the end of the chunk's allocation.
         self.ptr.set(unsafe { ptr.as_ptr().add(size) });
@@ -396,9 +460,120 @@ impl Bump {
 }
 
 fn free(chunk: Chunk) {
+    if chunk.mapped {
+        unmap_chunk(&chunk);
+        return;
+    }
     // SAFETY: the chunk was allocated by the global allocator with this layout, and the values
     // in it are borrowed from the `Bump`, which its caller borrows mutably.
     unsafe { std::alloc::dealloc(chunk.ptr.as_ptr(), chunk.layout) };
+}
+
+/// A chunk of `layout` (its size a multiple of [`HUGE_PAGE`], its alignment that) mapped by
+/// the arena: anonymous memory, asked to be huge pages, and on a pool worker bound to the
+/// worker's NUMA node before anything touches it, so its pages are made there. Counted in the
+/// thread's count as an allocation is.
+#[cfg(target_os = "linux")]
+fn map_chunk(layout: Layout) -> NonNull<u8> {
+    let (len, align) = (layout.size(), layout.align());
+    debug_assert!(len.is_multiple_of(align) && align == HUGE_PAGE);
+    // One huge page more than asked, so an aligned range of `len` is within it; the rest goes.
+    let span = len + align;
+    // SAFETY: a new anonymous private mapping, at no address asked for, overlaps nothing.
+    let raw = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            span,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if raw == libc::MAP_FAILED {
+        std::alloc::handle_alloc_error(layout);
+    }
+    let raw = raw.cast::<u8>();
+    let head = raw.addr().next_multiple_of(align) - raw.addr();
+    let tail = span - head - len;
+    let start = raw.wrapping_add(head);
+    if head > 0 {
+        // SAFETY: the first `head` bytes of the mapping just made, which nothing uses.
+        unsafe { libc::munmap(raw.cast(), head) };
+    }
+    if tail > 0 {
+        // SAFETY: the last `tail` bytes of the mapping just made, past the chunk.
+        unsafe { libc::munmap(start.wrapping_add(len).cast(), tail) };
+    }
+    // A hint, not a request that can fail the arena: the kernel's transparent huge page
+    // setting decides whether it is taken; the bytes are the same either way.
+    // SAFETY: the range is the chunk just mapped.
+    _ = unsafe { libc::madvise(start.cast(), len, libc::MADV_HUGEPAGE) };
+    if let Some(node) = crate::pool::node()
+        && let Err(why) = bind(start, len, node)
+    {
+        panic!("binding a {len}-byte arena chunk to NUMA node {node} (mbind): {why}");
+    }
+    count(signed(len));
+    // SAFETY: `mmap` did not fail, so `raw` and `start` within it are not null.
+    unsafe { NonNull::new_unchecked(start) }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn map_chunk(_layout: Layout) -> NonNull<u8> {
+    unreachable!("only Linux maps arena chunks")
+}
+
+#[cfg(target_os = "linux")]
+fn unmap_chunk(chunk: &Chunk) {
+    // SAFETY: the chunk is the range `map_chunk` kept, and its values are borrowed from the
+    // `Bump`, which its caller borrows mutably or drops.
+    unsafe { libc::munmap(chunk.ptr.as_ptr().cast(), chunk.layout.size()) };
+    count(-signed(chunk.layout.size()));
+}
+
+#[cfg(not(target_os = "linux"))]
+fn unmap_chunk(_chunk: &Chunk) {
+    unreachable!("only Linux maps arena chunks")
+}
+
+/// `mempolicy.h`'s `MPOL_PREFERRED`: pages are made on the node given while it has room.
+#[cfg(target_os = "linux")]
+const MPOL_PREFERRED: libc::c_long = 1;
+/// The nodes a node mask of [`bind`] can name.
+#[cfg(target_os = "linux")]
+const MASK_WORDS: usize = 16;
+
+/// Binds the `len` bytes at `start`, not yet touched, to NUMA node `node` (`MPOL_PREFERRED`).
+/// `Ok(false)` on a kernel built without NUMA (`ENOSYS`): it has one node, and its memory is
+/// all on it.
+#[cfg(target_os = "linux")]
+fn bind(start: *mut u8, len: usize, node: u32) -> io::Result<bool> {
+    let mut mask = [0 as libc::c_ulong; MASK_WORDS];
+    let bits = libc::c_ulong::BITS as usize;
+    let at = node as usize;
+    let Some(word) = mask.get_mut(at / bits) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("node {node} is past the {} nodes a mask names", MASK_WORDS * bits),
+        ));
+    };
+    *word |= 1 << (at % bits);
+    // The kernel reads one bit fewer than `maxnode` says.
+    let maxnode = (MASK_WORDS * bits + 1) as libc::c_ulong;
+    // SAFETY: `mbind` reads `MASK_WORDS` words of `mask`, a live array, and changes only the
+    // policy of the range, a mapping of the caller's.
+    let status = unsafe {
+        libc::syscall(libc::SYS_mbind, start, len, MPOL_PREFERRED, mask.as_ptr(), maxnode, 0)
+    };
+    if status == 0 {
+        return Ok(true);
+    }
+    let why = io::Error::last_os_error();
+    match why.raw_os_error() {
+        Some(libc::ENOSYS) => Ok(false),
+        _ => Err(why),
+    }
 }
 
 impl Drop for Bump {
@@ -1052,6 +1227,155 @@ mod tests {
         let chunk = chunks.last().unwrap();
         assert!(chunk.layout.size() >= HUGE_PAGE);
         assert_eq!(chunk.ptr.as_ptr() as usize % HUGE_PAGE, 0);
+    }
+
+    /// What this thread allocated less what it freed, exactly.
+    fn net() -> i64 {
+        LOCAL.with(|local| local.net.get())
+    }
+
+    fn address(bump: &Bump) -> usize {
+        std::ptr::from_ref(bump).addr()
+    }
+
+    /// The calls of `with` in one task share its arena; once it ends the arena is reset, and
+    /// the next task on the thread gets it with only its last chunk.
+    #[test]
+    fn a_task_keeps_its_arena_until_it_ends_and_the_next_gets_it_reset() {
+        let (same, held) = task(|| {
+            let first = with(|bump| {
+                assert!(bump.alloc_slice(&[1u8; 300_000]).unwrap().iter().all(|&it| it == 1));
+                address(bump)
+            });
+            with(|bump| {
+                let second = bump.alloc_slice(&[2u8; 300_000]).unwrap();
+                assert!(second.iter().all(|&it| it == 2));
+                (address(bump) == first, bump.held())
+            })
+        });
+        assert!(same);
+        assert!(held >= 600_000, "{held}");
+        // Only the last chunk is kept (all of them, if an earlier test on the thread left one
+        // big enough for both).
+        let kept = task(|| with(|bump| bump.held()));
+        assert!(kept > 0 && kept <= held, "{kept} of {held}");
+    }
+
+    /// A task run inside another has an arena of its own, and the outer one's is back after.
+    #[test]
+    fn a_task_inside_a_task_has_its_own_arena() {
+        task(|| {
+            with(|outer| {
+                let one = outer.alloc(1u64).unwrap();
+                let inner = task(|| {
+                    with(|inner| {
+                        assert_eq!(*inner.alloc(2u64).unwrap(), 2);
+                        address(inner)
+                    })
+                });
+                assert_ne!(inner, address(outer));
+                assert_eq!(*one, 1);
+                assert_eq!(with(address), address(outer));
+            });
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "arena::with outside a task")]
+    fn an_arena_off_a_task_is_refused() {
+        with(|_| ());
+    }
+
+    #[test]
+    fn a_tasks_arena_is_reset_after_a_panic_too() {
+        let caught = std::panic::catch_unwind(|| {
+            task(|| {
+                with(|bump| _ = bump.alloc_slice(&[0u8; 200_000]).unwrap());
+                panic!("the task's work panics");
+            })
+        });
+        assert!(caught.is_err());
+        let refused = std::panic::catch_unwind(|| with(|_| ()));
+        assert!(refused.is_err(), "no arena is installed once the task unwound");
+        assert!(task(|| with(|bump| bump.held())) > 0);
+    }
+
+    /// A measure of a task sees its arena's chunks and their reset: what stays is the chunk
+    /// the arena keeps for the next task, less the one it kept before.
+    #[test]
+    fn a_measure_sees_a_tasks_arena_and_its_reset() {
+        task(|| with(|bump| _ = bump.alloc(0u8).unwrap()));
+        let warm = task(|| with(|bump| bump.held()));
+        // Bigger than the chunk kept, so new chunks are taken.
+        let big = Layout::from_size_align(warm as usize + MB, 8).unwrap();
+        let before = net();
+        let (kept, peak) = measure(|| {
+            task(|| {
+                with(|bump| {
+                    bump.alloc_layout(big).unwrap();
+                    bump.alloc_layout(big).unwrap();
+                });
+            });
+            task(|| with(|bump| bump.held()))
+        });
+        assert_eq!(net() - before, kept as i64 - warm as i64);
+        assert!(peak >= 2 * big.size() as u64, "{peak}");
+    }
+
+    /// On Linux a huge chunk is the arena's own mapping: aligned, a multiple of a huge page,
+    /// counted as an allocation, and given back when the arena goes.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn huge_chunks_are_mapped_by_the_arena_and_counted() {
+        let before = net();
+        let bump = Bump::new();
+        bump.alloc_layout(Layout::from_size_align(3 * MB, 8).unwrap()).unwrap();
+        let (mapped, size) = {
+            let chunks = bump.chunks.borrow();
+            let chunk = chunks.last().unwrap();
+            assert_eq!(chunk.ptr.as_ptr().addr() % HUGE_PAGE, 0);
+            (chunk.mapped, chunk.layout.size())
+        };
+        assert!(mapped);
+        assert!(size.is_multiple_of(HUGE_PAGE) && size >= 3 * MB, "{size}");
+        // The chunk, and the arena's list of chunks.
+        let grew = net() - before;
+        assert!((size as i64..size as i64 + 4096).contains(&grew), "{grew} for {size}");
+        drop(bump);
+        assert_eq!(net(), before);
+    }
+
+    /// A chunk bound to a node says so to `get_mempolicy`; a kernel with no NUMA binds nothing.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_mapped_chunk_is_bound_to_the_node_asked() {
+        let layout = Layout::from_size_align(HUGE_PAGE, HUGE_PAGE).unwrap();
+        // Off the pool: not bound yet.
+        let chunk = map_chunk(layout);
+        if bind(chunk.as_ptr(), HUGE_PAGE, 0).unwrap() {
+            let mut mode: libc::c_int = -1;
+            let mut mask = [0 as libc::c_ulong; MASK_WORDS];
+            let maxnode = (MASK_WORDS * libc::c_ulong::BITS as usize + 1) as libc::c_ulong;
+            const MPOL_F_ADDR: libc::c_ulong = 2;
+            // SAFETY: `mode` and `mask` are live and as big as `maxnode` says; the address is
+            // the chunk's, mapped.
+            let status = unsafe {
+                libc::syscall(
+                    libc::SYS_get_mempolicy,
+                    &raw mut mode,
+                    mask.as_mut_ptr(),
+                    maxnode,
+                    chunk.as_ptr(),
+                    MPOL_F_ADDR,
+                )
+            };
+            assert_eq!(status, 0, "{}", io::Error::last_os_error());
+            assert_eq!(libc::c_long::from(mode), MPOL_PREFERRED);
+            assert_eq!(mask[0] & 1, 1);
+        }
+        unmap_chunk(&Chunk { ptr: chunk, layout, mapped: true, _grant: None });
+        let far = bind(std::ptr::null_mut(), 0, 1 << 20).unwrap_err();
+        assert!(far.to_string().contains("past the"), "{far}");
     }
 
     struct SplitMix(u64);

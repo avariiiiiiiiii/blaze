@@ -8,6 +8,8 @@
 //! request it belongs to and its body. JSON is only a rendering of the same records for
 //! people, never the wire.
 
+#![forbid(unsafe_code)]
+
 pub mod cbor;
 pub mod events;
 pub mod follow;

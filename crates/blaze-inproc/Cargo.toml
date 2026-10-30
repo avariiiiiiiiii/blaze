@@ -1,0 +1,36 @@
+[package]
+name = "blaze-inproc"
+description = "blaze v2's dev runs with no binary on disk: code memory mapped writable in the daemon and executable in the run process, blaze's own loader, fences for running threads, and the channel between them"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[[bin]]
+name = "blaze-inproc-run"
+path = "src/bin/blaze-inproc-run.rs"
+test = false
+
+[features]
+# The daemon's side (`host`): launches a run through `blaze-core`'s `Effect::Spawn`. The run
+# process links the crate without it.
+host = ["dep:blaze-core"]
+
+[dependencies]
+blaze-core = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

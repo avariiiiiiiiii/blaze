@@ -148,6 +148,8 @@ struct Db(*const (dyn SourceDatabase + 'static));
 // SAFETY: a `Db` is only read on the thread that expands, while `Session::run` holds the
 // database it points to, and clears the pointer even when the host unwinds.
 unsafe impl Send for Db {}
+// SAFETY: as for `Send`: the pointer is dereferenced only on the thread that expands, while
+// `Session::run` holds the database, which it clears before returning or resuming an unwind.
 unsafe impl Sync for Db {}
 
 /// What an instance has while it runs.
@@ -736,17 +738,22 @@ impl Wasm {
         let key = code_key(&digest);
         let file = code_file(path, &key);
         let stats = std::env::var_os("BLAZE_STATS").is_some();
-        // SAFETY: the file beside the module and what the store has under the key are what
-        // `serialize` wrote for this key, the store's checked against its checksum when read;
-        // Wasmtime refuses code of another version, configuration or CPU.
+        // SAFETY: rests on the file beside the module being what `serialize` wrote for this
+        // key (its name has the key) and nothing else writing that path; its bytes are not
+        // checked against the store's (v2/requests/usercode.md, safety-audit MAY BE UNSOUND
+        // 4), and other bytes would run as machine code. Wasmtime refuses code of another
+        // version, configuration or CPU.
         let beside = unsafe { Module::deserialize_file(engine(), &file) }.ok();
         let (module, was_kept) = match beside {
             // Written beside it by the process that compiled it, which kept it in the store.
             Some(module) => (module, true),
-            None => match store
-                .and_then(|it| it.get_lasting(&key))
-                .and_then(|it| unsafe { Module::deserialize(engine(), &it) }.ok().map(|m| (m, it)))
-            {
+            None => match store.and_then(|it| it.get_lasting(&key)).and_then(|it| {
+                // SAFETY: the store gave what it keeps under `key`, checked against its
+                // checksum as it was read, which `serialize` wrote for this key; Wasmtime
+                // refuses code of another version, configuration or CPU; other bytes would
+                // run as machine code.
+                unsafe { Module::deserialize(engine(), &it) }.ok().map(|m| (m, it))
+            }) {
                 Some((module, code)) => {
                     write_whole(&file, &code);
                     (module, true)
@@ -963,9 +970,10 @@ impl Session {
         input: &[u8],
         attr: Option<&[u8]>,
     ) -> Result<Vec<u8>, ProcMacroExpansionError> {
-        // SAFETY: the pointer is used only during this call and cleared before returning
-        // or resuming an unwind. The session retains no database reference between calls.
         self.store.data_mut().db = db.map(|db| {
+            // SAFETY: only the lifetime changes; `run` sets `db` to `None` before it returns
+            // or resumes an unwind, so the pointer is never read after the borrow it came
+            // from ends, and the session keeps no database between calls.
             Db(unsafe {
                 std::mem::transmute::<
                     *const dyn SourceDatabase,
@@ -1728,8 +1736,8 @@ struct Lazy {
 /// that keeps state between calls is a function of the calls before, so one runs at a time,
 /// in the order they came. No lock is held while one runs: it takes the session out of the
 /// queue, so the database it asks can expand any other macro meanwhile.
-struct Seat {
-    of: (Nonce, Crate),
+struct Seat<Of = (Nonce, Crate)> {
+    of: Of,
     /// Locked only to take a turn or end one, never while an expansion runs.
     queue: Mutex<Queue>,
     turn: Condvar,
@@ -1748,13 +1756,13 @@ struct Queue {
 }
 
 /// One expansion's turn in a [`Seat`]: the session is its until the turn is dropped.
-struct Turn<'a> {
-    seat: &'a Seat,
+struct Turn<'a, Of> {
+    seat: &'a Seat<Of>,
     session: Option<(salsa::Revision, Result<Session, String>)>,
 }
 
-impl Seat {
-    fn new(of: (Nonce, Crate)) -> Seat {
+impl<Of> Seat<Of> {
+    fn new(of: Of) -> Seat<Of> {
         Seat { of, queue: Mutex::new(Queue::default()), turn: Condvar::new() }
     }
 
@@ -1762,7 +1770,7 @@ impl Seat {
     /// asked for in the seat while this thread's own runs in it (a question of a span that
     /// expands the crate's macros again) is refused: the module's instance is in the middle
     /// of a call, and the expansion can't wait for itself.
-    fn take(&self) -> Result<Turn<'_>, ()> {
+    fn take(&self) -> Result<Turn<'_, Of>, ()> {
         let me = std::thread::current().id();
         let mut queue = self.queue.lock().unwrap_or_else(|it| it.into_inner());
         if queue.running == Some(me) {
@@ -1779,7 +1787,7 @@ impl Seat {
     }
 }
 
-impl Drop for Turn<'_> {
+impl<Of> Drop for Turn<'_, Of> {
     fn drop(&mut self) {
         let mut queue = self.seat.queue.lock().unwrap_or_else(|it| it.into_inner());
         queue.session = self.session.take();
@@ -1820,8 +1828,61 @@ impl Lazy {
             verdict: verdict(&known.digest),
             ran: AtomicBool::new(false),
             retained: AtomicBool::new(false),
-            sessions: Mutex::new(FxHashMap::default()),
+            seats: Sharded::new(),
+            made: Mutex::new(Vec::new()),
+            swept: Mutex::new(FxHashMap::default()),
         }
+    }
+
+    /// The seat of `of`, made the first time it is asked for.
+    fn seat(&self, of: (Nonce, Crate)) -> &Seat {
+        let id = seat_id(&of);
+        let at = match self.seats.find(&id) {
+            Some(at) => at,
+            None => {
+                // Also true when another thread interned it meanwhile: the seat is then listed
+                // twice, which a sweep doesn't mind.
+                let mut new = false;
+                let at = self.seats.intern(id, || {
+                    new = true;
+                    Seat::new(of)
+                });
+                if new {
+                    self.made.lock().unwrap_or_else(|it| it.into_inner()).push(at);
+                }
+                at
+            }
+        };
+        let seat = self.seats.get(at);
+        assert_eq!(seat.of, of, "two seats with one content ID");
+        seat
+    }
+
+    /// Drops the sessions of `nonce`'s database of revisions before `revision`, which it has
+    /// moved to: once per revision, by the first expansion that found its seat's session old.
+    /// A session in use is the current revision's, as salsa runs one revision at a time.
+    fn sweep(&self, nonce: Nonce, revision: salsa::Revision) {
+        {
+            let mut swept = self.swept.lock().unwrap_or_else(|it| it.into_inner());
+            if swept.get(&nonce) == Some(&revision) {
+                return;
+            }
+            swept.insert(nonce, revision);
+        }
+        let made: Vec<Idx<Seat>> = self.made.lock().unwrap_or_else(|it| it.into_inner()).clone();
+        let mut old = Vec::new();
+        for at in made {
+            let seat = self.seats.get(at);
+            if seat.of.0 != nonce {
+                continue;
+            }
+            let mut queue = seat.queue.lock().unwrap_or_else(|it| it.into_inner());
+            if queue.session.as_ref().is_some_and(|(of, _)| *of != revision) {
+                old.extend(queue.session.take());
+            }
+        }
+        // Dropped with no seat locked.
+        drop(old);
     }
 
     fn get(&self) -> Result<&Arc<Wasm>, String> {
@@ -2034,17 +2095,24 @@ impl ProcMacroExpander for Expander {
         db.report_untracked_read();
         let (nonce, revision) = db.nonce_and_revision();
         let wasm = self.wasm.get().map_err(ProcMacroExpansionError::System)?;
-        let slot = {
-            let mut sessions = self.wasm.sessions.lock().unwrap_or_else(|e| e.into_inner());
-            sessions.retain(|(owner, _), (seen, _)| *owner != nonce || *seen == revision);
-            let entry = sessions.entry((nonce, calling_crate));
-            entry.or_insert_with(|| (revision, Slot::default())).1.clone()
-        };
-        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-        let session = slot.get_or_insert_with(|| {
-            wasm.session(env).map_err(|e| match e {
+        let seat = self.wasm.seat((nonce, calling_crate));
+        let mut turn = seat.take().map_err(|()| {
+            ProcMacroExpansionError::System(format!(
+                "`{}` was asked to expand while one of its crate's expansions in the same \
+                 module runs on this thread (a question it asked expands it again); the module \
+                 keeps state between calls, so the two can't run at once",
+                self.listed.name
+            ))
+        })?;
+        if turn.session.as_ref().is_some_and(|(of, _)| *of != revision) {
+            turn.session = None;
+            self.wasm.sweep(nonce, revision);
+        }
+        let (_, session) = turn.session.get_or_insert_with(|| {
+            let session = wasm.session(env).map_err(|e| match e {
                 ProcMacroExpansionError::Panic(why) | ProcMacroExpansionError::System(why) => why,
-            })
+            });
+            (revision, session)
         });
         let session = session.as_mut().map_err(|e| ProcMacroExpansionError::System(e.clone()))?;
         let call = Call { subtree, attrs, env, def_site, call_site, mixed_site };
@@ -2291,10 +2359,20 @@ mod tests {
         files.take_traced()
     }
 
+    fn now<'a>(
+        root: Option<&'a Path>,
+        shapes: &'a Shapes,
+        answers: &'a FxHashMap<String, String>,
+    ) -> Now<'a> {
+        static NONE: std::sync::LazyLock<inputs::Env> = std::sync::LazyLock::new(inputs::Env::default);
+        let machine = inputs::Now { files: Files::shared(), env: &NONE };
+        Now { root, machine, env: &[], shapes, answers, unanswered: Vec::new() }
+    }
+
     fn now_of(package: &Path, traced: &Traced) -> Traced {
-        let mut disk = Disk::new(Vec::new());
         let shapes = Shapes::of(&[]);
-        let mut now = Now { root: Some(package), disk: &mut disk, env: &[], shapes: &shapes, db: None };
+        let answers = FxHashMap::default();
+        let mut now = now(Some(package), &shapes, &answers);
         index::Shape::of(traced).values(&mut now).unwrap()
     }
 
@@ -2354,10 +2432,21 @@ mod tests {
         let traced = what_it_read(&mut state).unwrap();
         assert_eq!(traced.env.len(), 1);
         let shapes = Shapes::of(&[span(3, 9)]);
-        let mut disk = Disk::new(Vec::new());
-        let mut now = Now { root: None, disk: &mut disk, env: &[], shapes: &shapes, db: None };
+        let read = traced.env[0].0.to_str().unwrap().to_owned();
+        let mut answers = FxHashMap::default();
+        // A question with no answer yet is noted, once, for the database to answer with no
+        // guard held, and is no input until then.
+        let mut asking = now(None, &shapes, &answers);
+        assert_eq!(asking.env(&traced.env[0].0), None);
+        assert_eq!(asking.env(&traced.env[0].0), None);
+        assert_eq!(asking.unanswered, [read.clone()]);
         // No database answers nothing, which is not the answer it was kept with.
-        assert_eq!(now.env(&traced.env[0].0), Some("-".into()));
+        let said = answer(&read, &shapes, None);
+        assert_eq!(said, "-");
+        answers.insert(read, said);
+        let mut answered = now(None, &shapes, &answers);
+        assert_eq!(answered.env(&traced.env[0].0), Some("-".into()));
+        assert!(answered.unanswered.is_empty());
         let mut state = State::empty();
         state.asked = true;
         assert!(what_it_read(&mut state).is_none(), "it learned what no question says");
@@ -2373,11 +2462,34 @@ mod tests {
     #[test]
     fn a_path_outside_the_package_is_no_input_of_a_module() {
         let shapes = Shapes::of(&[]);
-        let mut disk = Disk::new(Vec::new());
-        let mut now = Now { root: Some(Path::new("/p")), disk: &mut disk, env: &[], shapes: &shapes, db: None };
+        let answers = FxHashMap::default();
+        let mut now = now(Some(Path::new("/p")), &shapes, &answers);
         assert!(now.file(Path::new("/etc/passwd")).is_err());
     }
 
+    #[test]
+    fn a_seats_expansions_take_turns_in_order_and_one_within_its_own_is_refused() {
+        let seat = Seat::new(());
+        let turn = seat.take().unwrap();
+        assert!(seat.take().is_err(), "this thread's own expansion runs in the seat");
+        let order = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| {
+                let turn = seat.take().unwrap();
+                order.lock().unwrap().push("waiting");
+                assert!(turn.session.is_none(), "no session was given back");
+            });
+            while seat.queue.lock().unwrap().next < 2 {
+                std::thread::yield_now();
+            }
+            order.lock().unwrap().push("first");
+            drop(turn);
+            waiting.join().unwrap();
+        });
+        assert_eq!(*order.lock().unwrap(), ["first", "waiting"]);
+        let queue = seat.queue.lock().unwrap();
+        assert_eq!((queue.next, queue.serving, queue.running), (2, 2, None));
+    }
     #[test]
     fn the_environment_is_cargos_and_the_same_on_every_machine() {
         let mut env = Env::default();

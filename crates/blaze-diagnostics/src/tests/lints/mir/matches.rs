@@ -6,14 +6,14 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{checked_with, normalized, ui},
+    tests::{Mode, checked_with, compiletest, normalized, ui},
 };
 
 /// [`ui`] of a UI test that needs core's items: `flags` are minicore's
 /// (`crates/test-utils/src/minicore.rs`), in the prelude as std's are for rustc.
 fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
     let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}");
-    let checked = checked_with(&fixture, "$DIR/", &Options::default());
+    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 

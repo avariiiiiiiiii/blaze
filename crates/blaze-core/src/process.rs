@@ -255,16 +255,3 @@ pub(crate) fn kill(pid: libc::pid_t) {
     // SAFETY: no pointers; the pid is a child not yet reaped, so no one else's.
     unsafe { libc::kill(pid, libc::SIGKILL) };
 }
-
-/// A pidfd of `pid`, a child not yet reaped: readable once it exits.
-#[cfg(target_os = "linux")]
-pub(crate) fn pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
-    use std::os::fd::FromRawFd as _;
-    // SAFETY: no pointers; a descriptor of its own or -1.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the call returned a descriptor of its own.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
-}

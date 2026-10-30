@@ -10,7 +10,7 @@
 //!
 //! The descriptor ([`crate::patch::Descriptor`]) says where everything is. A program at
 //! generation `g` takes the message in the file [`message_file`]`(g)` of the directory it
-//! names, read in place from a mapping of the file, and answers each there
+//! names, read into a buffer kept from message to message, and answers each there
 //! ([`crate::patch::Answer`]). A thread blocks on the platform's notification of changes to
 //! the directory (inotify, kqueue, change notifications) and counts them, so [`Live::poll`]
 //! is one atomic load while nothing came.
@@ -22,6 +22,7 @@ use std::{
     collections::VecDeque,
     fmt,
     fs::{File, Metadata},
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -66,7 +67,7 @@ use windows as os;
     all(windows, target_arch = "x86_64"),
 )))]
 mod os {
-    use std::{fs::File, path::Path, sync::Arc};
+    use std::{path::Path, sync::Arc};
 
     use super::{
         Events,
@@ -105,18 +106,6 @@ mod os {
         }
 
         fn publish(&mut self, _: u64, _: u64) -> Result<(), String> {
-            match *self {}
-        }
-    }
-
-    pub(super) enum Map {}
-
-    impl Map {
-        pub(super) fn new(_: &File, _: u64) -> Result<Map, String> {
-            Err(PLATFORMS.to_owned())
-        }
-
-        pub(super) fn bytes(&self) -> &[u8] {
             match *self {}
         }
     }
@@ -249,6 +238,8 @@ pub struct Live {
     looked: Option<(u64, u64)>,
     /// The files of the last messages taken, by generation: none is taken twice.
     taken: VecDeque<(u64, Identity)>,
+    /// The bytes of the last message, its buffer kept for the next.
+    message: Vec<u8>,
 }
 
 impl Live {
@@ -289,7 +280,15 @@ impl Live {
         let events = Arc::new(Events::default());
         os::watch(&dir, events.clone())?;
         let answers = Answers::new(&dir);
-        Ok(Live { switch, dir, answers, events, looked: None, taken: VecDeque::new() })
+        Ok(Live {
+            switch,
+            dir,
+            answers,
+            events,
+            looked: None,
+            taken: VecDeque::new(),
+            message: Vec::new(),
+        })
     }
 
     /// The generation the program runs.
@@ -336,12 +335,15 @@ impl Live {
             self.taken.pop_front();
         }
         self.taken.push_back((generation, identity));
-        let map = match os::Map::new(&file, meta.len()) {
-            Ok(map) => map,
-            Err(why) => return Some(self.unread(generation, &path, &why)),
-        };
+        // Read, not mapped: the bytes checked are the bytes written, whatever happens to the
+        // file meanwhile.
+        self.message.clear();
+        self.message.reserve(usize::try_from(meta.len()).unwrap_or(0));
+        if let Err(error) = (&file).read_to_end(&mut self.message) {
+            return Some(self.unread(generation, &path, &error.to_string()));
+        }
         drop(file);
-        let (outcome, said) = match Message::view(map.bytes()) {
+        let (outcome, said) = match Message::view(&self.message) {
             Ok(message) => self.switch.take(&message),
             Err(why) => {
                 let why = format!("{}: {why}", path.display());
@@ -351,7 +353,6 @@ impl Live {
                 )
             }
         };
-        drop(map);
         if let Some(said) = &said {
             self.answers.write(said);
         }

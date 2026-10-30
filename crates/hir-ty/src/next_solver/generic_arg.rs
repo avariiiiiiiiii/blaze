@@ -6,7 +6,7 @@
 //! `GenericArg` and `Term` is shared in [`GenericArgImpl`]. This both simplifies the implementation,
 //! as well as enables a noop conversion from `Term` to `GenericArg`.
 
-use std::{hint::unreachable_unchecked, marker::PhantomData, num::NonZeroU32};
+use std::{marker::PhantomData, num::NonZeroU32};
 
 use arrayvec::ArrayVec;
 use hir_def::{GenericDefId, GenericParamId, hir::generics::LifetimeParamData};
@@ -55,13 +55,13 @@ impl<'db> GenericArgImpl<'db> {
     fn pack(row: NonZeroU32, tag: u32) -> Self {
         // A row is at most `table::LAST_ROW`, so two bits are free above it.
         debug_assert!(row.get() <= table::LAST_ROW);
-        let packed = NonZeroU32::new((row.get() << 2) | tag).expect("rows start at 1");
+        let packed = NonZeroU32::new((row.get() << 2) | tag).expect("a row is at least 1");
         Self { packed, _marker: PhantomData }
     }
 
     #[inline]
     fn row(self) -> NonZeroU32 {
-        NonZeroU32::new(self.packed.get() >> 2).expect("rows start at 1")
+        NonZeroU32::new(self.packed.get() >> 2).expect("`pack` shifted a row of at least 1")
     }
 
     #[inline]
@@ -85,8 +85,7 @@ impl<'db> GenericArgImpl<'db> {
             Self::TY_TAG => GenericArgKind::Type(Ty::at(self.row())),
             Self::CONST_TAG => GenericArgKind::Const(Const::at(self.row())),
             Self::REGION_TAG => GenericArgKind::Lifetime(Region::at(self.row())),
-            // SAFETY: we are only made by `pack`, with one of the tags above.
-            _ => unsafe { unreachable_unchecked() },
+            tag => unreachable!("`pack` gave a generic argument the tag {tag}"),
         }
     }
 
@@ -97,8 +96,7 @@ impl<'db> GenericArgImpl<'db> {
         match self.packed.get() & Self::KIND_MASK {
             Self::TY_TAG => TermKind::Ty(Ty::at(self.row())),
             Self::CONST_TAG => TermKind::Const(Const::at(self.row())),
-            // SAFETY: a `Term` is only made from a `Ty` or a `Const`.
-            _ => unsafe { unreachable_unchecked() },
+            tag => unreachable!("a term is a type or a constant, not the tag {tag}"),
         }
     }
 }

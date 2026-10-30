@@ -52,7 +52,7 @@ pub type AliasTermKind<'db> = rustc_type_ir::AliasTermKind<DbInterner<'db>>;
 pub type FnSigKind<'db> = rustc_type_ir::FnSigKind<DbInterner<'db>>;
 
 /// Every interned [`Ty`]. A `GenericArg` holds a row in 30 bits.
-static TYS: table::Rows = table::Rows::new("tys", table::LAST_ROW);
+static TYS: table::Rows<TyKind<'static>> = table::Rows::new("tys", table::LAST_ROW);
 
 /// A type: its row in [`TYS`], which is never freed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -63,6 +63,8 @@ pub struct Ty<'db> {
 }
 
 const _: () = assert!(size_of::<Option<Ty<'static>>>() == 4);
+// A row costs `table::ROW_BYTES` hot bytes and its kind, at most 48 cold ones.
+const _: () = assert!(size_of::<TyKind<'static>>() <= 48);
 
 impl_stored_interned!(Ty, StoredTy);
 impl_foldable_for_stored_type!(StoredTy);
@@ -80,11 +82,18 @@ impl<'db> Ty<'db> {
         Self::intern(kind)
     }
 
+    #[inline]
     pub(super) fn intern(kind: TyKind<'db>) -> Self {
-        let words = persist::encode(&kind);
-        Self::at(TYS.intern(&words, || {
+        // SAFETY: the two types differ only in their lifetime, which an interned value does not
+        // depend on (it is never freed).
+        let kind = unsafe { std::mem::transmute::<TyKind<'db>, TyKind<'static>>(kind) };
+        Self::at(TYS.intern(kind, || {
             let computed = FlagComputation::for_kind(&kind);
-            (computed.flags, computed.outer_exclusive_binder)
+            table::RowInfo {
+                tag: persist::tag(&kind),
+                flags: computed.flags,
+                binder: computed.outer_exclusive_binder,
+            }
         }))
     }
 
@@ -913,8 +922,8 @@ impl<'db> IntoKind for Ty<'db> {
 
     #[inline]
     fn kind(self) -> Self::Kind {
-        // SAFETY: a `Ty` is a row of `TYS`.
-        persist::decode(unsafe { TYS.fields(self.index) })
+        // SAFETY: a `Ty` is a row of `TYS`; the lifetime is as in `intern`.
+        unsafe { std::mem::transmute::<TyKind<'static>, TyKind<'db>>(TYS.kind(self.index)) }
     }
 }
 

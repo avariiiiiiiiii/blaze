@@ -443,11 +443,15 @@ pub enum SearchMode {
 }
 
 impl SearchMode {
+    /// Compares bytes in place: nothing is allocated or case-folded into a copy.
     pub fn check(self, query: &str, case_sensitive: bool, candidate: &str) -> bool {
         match self {
             SearchMode::Exact if case_sensitive => candidate == query,
             SearchMode::Exact => candidate.eq_ignore_ascii_case(query),
             SearchMode::Prefix => {
+                // On bytes, so a query ending inside one of the candidate's chars is no match
+                // (equal bytes end on a char boundary of both).
+                let (query, candidate) = (query.as_bytes(), candidate.as_bytes());
                 query.len() <= candidate.len() && {
                     let prefix = &candidate[..query.len()];
                     if case_sensitive {
@@ -460,14 +464,26 @@ impl SearchMode {
             SearchMode::Fuzzy => {
                 let mut name = candidate;
                 query.chars().all(|query_char| {
-                    let m = if case_sensitive {
-                        name.match_indices(query_char).next()
+                    // The end of the first match of the query char (or, ignoring case, of it or
+                    // its ASCII uppercase) in what is left of the name.
+                    let end = if query_char.is_ascii() {
+                        // An ASCII byte in UTF-8 is always a whole char.
+                        let exact = query_char as u8;
+                        let upper = exact.to_ascii_uppercase();
+                        let bytes = name.as_bytes();
+                        let at = if case_sensitive {
+                            bytes.iter().position(|&b| b == exact)
+                        } else {
+                            bytes.iter().position(|&b| b == exact || b == upper)
+                        };
+                        at.map(|at| at + 1)
                     } else {
-                        name.match_indices([query_char, query_char.to_ascii_uppercase()]).next()
+                        // `to_ascii_uppercase` leaves a non-ASCII char as it is.
+                        name.match_indices(query_char).next().map(|(at, m)| at + m.len())
                     };
-                    match m {
-                        Some((index, _)) => {
-                            name = name[index..].strip_prefix(|_: char| true).unwrap_or_default();
+                    match end {
+                        Some(end) => {
+                            name = &name[end..];
                             true
                         }
                         None => false,
@@ -596,23 +612,18 @@ fn search_maps(
         for &IndexedValue { index: import_map_idx, value } in indexed_values {
             let end = (value & 0xFFFF_FFFF) as usize;
             let start = (value >> 32) as usize;
-            let ImportMap { item_to_info_map, importables, .. } = import_maps[import_map_idx];
-            let importables = &importables[start..end];
-
-            let iter = importables
-                .iter()
-                .copied()
-                .filter_map(|(item, info_idx)| {
-                    let (import_infos, assoc_mode) = &item_to_info_map[&item];
-                    query
-                        .matches_assoc_mode(*assoc_mode)
-                        .then(|| (item, &import_infos[info_idx as usize]))
-                })
-                .filter(|&(_, info)| {
-                    query.search_mode.check(&query.query, query.case_sensitive, info.name.as_str())
-                })
-                .map(|(item, import_info)| (item, import_info.complete));
-            res.extend(iter);
+            let map = import_maps[import_map_idx];
+            for &info_idx in &map.importables[start..end] {
+                let info = &map.infos[info_idx as usize];
+                if !query.search_mode.check(&query.query, query.case_sensitive, info.name.as_str())
+                {
+                    continue;
+                }
+                let row = map.row_of_info(info_idx);
+                if query.matches_assoc_mode(map.is_trait_assoc_item(row)) {
+                    res.insert((map.items[row], info.complete));
+                }
+            }
         }
     }
 
@@ -623,6 +634,7 @@ fn search_maps(
 mod tests {
     use base_db::all_crates;
     use expect_test::{Expect, expect};
+    use itertools::Itertools;
     use test_fixture::WithFixture;
 
     use crate::{ItemContainerId, Lookup, nameres::assoc::TraitItems, test_db::TestDB};
@@ -632,9 +644,10 @@ mod tests {
     impl ImportMap {
         fn fmt_for_test(&self, db: &dyn SourceDatabase) -> String {
             let mut importable_paths: Vec<_> = self
-                .item_to_info_map
+                .items
                 .iter()
-                .flat_map(|(item, (info, _))| info.iter().map(move |info| (item, info)))
+                .enumerate()
+                .flat_map(|(row, item)| self.row_infos(row).iter().map(move |info| (item, info)))
                 .map(|(item, info)| {
                     let path = render_path(db, info);
                     let ns = match item {
@@ -1204,5 +1217,465 @@ pub mod fmt {
             dep::あい (f)
         "#]],
         );
+    }
+
+    #[test]
+    fn prefix_query_ending_inside_a_char() {
+        // The query's byte length falls inside the candidate's first char.
+        assert!(!SearchMode::Prefix.check("a", false, "あい"));
+        assert!(!SearchMode::Prefix.check("ab", true, "あい"));
+        assert!(SearchMode::Prefix.check("あ", true, "あい"));
+        assert!(SearchMode::Prefix.check("fO", false, "Foo"));
+    }
+
+    /// The import map as it was before its columns: an `FxIndexMap` from item to a `SmallVec` of
+    /// infos, importables as `(item, index in the SmallVec)`, the FST keys lowercased into a
+    /// `String` each. The model the differential test compares with.
+    mod reference {
+        use base_db::{Crate, SourceDatabase};
+        use fst::{Automaton, Streamer, raw::IndexedValue};
+        use itertools::Itertools;
+        use rustc_hash::FxHashSet;
+        use smallvec::SmallVec;
+
+        use super::super::{ImportInfo, IsTraitAssocItem, Query, SearchMode};
+        use crate::{
+            AdtId, AssocItemId, AttrDefId, Complete, EnumId, FxIndexMap, ModuleDefId, TraitId,
+            attrs::AttrFlags,
+            item_scope::{ImportOrExternCrate, ItemInNs},
+            nameres::{assoc::TraitItems, crate_def_map},
+            visibility::Visibility,
+        };
+
+        pub(super) type Index =
+            FxIndexMap<ItemInNs, (SmallVec<[ImportInfo; 1]>, IsTraitAssocItem)>;
+
+        pub(super) struct OldImportMap {
+            pub(super) map: Index,
+            pub(super) importables: Vec<(ItemInNs, u32)>,
+            pub(super) fst: fst::Map<Vec<u8>>,
+        }
+
+        pub(super) fn build(db: &dyn SourceDatabase, krate: Crate) -> OldImportMap {
+            let map = collect(db, krate);
+            let mut importables: Vec<_> = map
+                .iter()
+                .flat_map(|(&item, (info, _))| {
+                    info.iter()
+                        .enumerate()
+                        .map(move |(idx, info)| (item, info.name.as_str(), idx as u32))
+                })
+                .collect();
+            importables.sort_by(|(_, l_info, _), (_, r_info, _)| {
+                let lhs_chars = l_info.chars().map(|c| c.to_ascii_lowercase());
+                let rhs_chars = r_info.chars().map(|c| c.to_ascii_lowercase());
+                lhs_chars.cmp(rhs_chars)
+            });
+            importables.dedup();
+
+            let mut builder = fst::MapBuilder::memory();
+            let mut iter = importables
+                .iter()
+                .enumerate()
+                .dedup_by(|&(_, (_, lhs, _)), &(_, (_, rhs, _))| lhs.eq_ignore_ascii_case(rhs));
+            let mut insert = |name: &str, start, end| {
+                builder
+                    .insert(name.to_ascii_lowercase(), ((start as u64) << 32) | end as u64)
+                    .unwrap()
+            };
+            if let Some((mut last, (_, name, _))) = iter.next() {
+                let mut last_name = name;
+                for (next, (_, next_name, _)) in iter {
+                    insert(last_name, last, next);
+                    last = next;
+                    last_name = next_name;
+                }
+                insert(last_name, last, importables.len());
+            }
+            let importables = importables.into_iter().map(|(item, _, idx)| (item, idx)).collect();
+            OldImportMap { map, fst: builder.into_map(), importables }
+        }
+
+        fn collect(db: &dyn SourceDatabase, krate: Crate) -> Index {
+            let def_map = crate_def_map(db, krate);
+            let mut map = FxIndexMap::default();
+            let root = def_map.root_module_id();
+            let mut worklist = vec![root];
+            let mut visited = FxHashSet::default();
+            while let Some(module) = worklist.pop() {
+                if !visited.insert(module) {
+                    continue;
+                }
+                let mod_data = if module.krate(db) == krate {
+                    &def_map.module(db, module)
+                } else {
+                    &module.def_map(db).module(db, module)
+                };
+                let visible_items = mod_data.scope(db).entries().filter_map(|(name, per_ns)| {
+                    let per_ns = per_ns.filter_visibility(|vis| vis == Visibility::Public);
+                    if per_ns.is_none() { None } else { Some((name, per_ns)) }
+                });
+                for (name, per_ns) in visible_items {
+                    for (item, import) in per_ns.iter_items() {
+                        let attr_id = if let Some(import) = import {
+                            match import {
+                                ImportOrExternCrate::ExternCrate(id) => Some(id.into()),
+                                ImportOrExternCrate::Import(id) => Some(id.use_.into()),
+                                ImportOrExternCrate::Glob(id) => Some(id.use_.into()),
+                            }
+                        } else {
+                            match item {
+                                ItemInNs::Types(id) | ItemInNs::Values(id) => match id {
+                                    ModuleDefId::ModuleId(it) => Some(AttrDefId::ModuleId(it)),
+                                    ModuleDefId::FunctionId(it) => Some(it.into()),
+                                    ModuleDefId::AdtId(it) => Some(it.into()),
+                                    ModuleDefId::EnumVariantId(it) => Some(it.into()),
+                                    ModuleDefId::ConstId(it) => Some(it.into()),
+                                    ModuleDefId::StaticId(it) => Some(it.into()),
+                                    ModuleDefId::TraitId(it) => Some(it.into()),
+                                    ModuleDefId::TypeAliasId(it) => Some(it.into()),
+                                    ModuleDefId::MacroId(it) => Some(it.into()),
+                                    ModuleDefId::BuiltinType(_) => None,
+                                },
+                                ItemInNs::Macros(id) => Some(id.into()),
+                            }
+                        };
+                        let (is_doc_hidden, is_unstable, do_not_complete) = match attr_id {
+                            None => (false, false, Complete::Yes),
+                            Some(attr_id) => {
+                                let attrs = AttrFlags::query(db, attr_id);
+                                let do_not_complete = Complete::extract(
+                                    matches!(attr_id, AttrDefId::TraitId(_)),
+                                    attrs,
+                                );
+                                (
+                                    attrs.contains(AttrFlags::IS_DOC_HIDDEN),
+                                    attrs.contains(AttrFlags::IS_UNSTABLE),
+                                    do_not_complete,
+                                )
+                            }
+                        };
+                        let import_info = ImportInfo {
+                            name: name.clone(),
+                            container: module,
+                            is_doc_hidden,
+                            is_unstable,
+                            complete: do_not_complete,
+                        };
+                        let module_def = item.as_module_def_id();
+                        if let Some(ModuleDefId::TraitId(tr)) = module_def {
+                            collect_trait_assoc_items(
+                                db,
+                                &mut map,
+                                tr,
+                                matches!(item, ItemInNs::Types(_)),
+                                &import_info,
+                            );
+                        } else if let Some(ModuleDefId::AdtId(AdtId::EnumId(enum_))) = module_def
+                        {
+                            collect_enum_variants(db, &mut map, enum_, &import_info);
+                        }
+                        let (infos, _) = map
+                            .entry(item)
+                            .or_insert_with(|| (SmallVec::new(), IsTraitAssocItem::No));
+                        infos.push(import_info);
+                        if let Some(ModuleDefId::ModuleId(mod_id)) = module_def {
+                            worklist.push(mod_id);
+                        }
+                    }
+                }
+            }
+            map
+        }
+
+        fn collect_enum_variants(
+            db: &dyn SourceDatabase,
+            map: &mut Index,
+            enum_: EnumId,
+            enum_import_info: &ImportInfo,
+        ) {
+            for (variant_name, &(variant, _)) in &enum_.enum_variants(db).variants {
+                let attrs = AttrFlags::query(db, variant.into());
+                let variant_info = ImportInfo {
+                    container: enum_import_info.container,
+                    name: variant_name.clone(),
+                    is_doc_hidden: attrs.contains(AttrFlags::IS_DOC_HIDDEN),
+                    is_unstable: attrs.contains(AttrFlags::IS_UNSTABLE),
+                    complete: Complete::extract(false, attrs),
+                };
+                let (infos, _) = map
+                    .entry(ItemInNs::Types(variant.into()))
+                    .or_insert_with(|| (SmallVec::new(), IsTraitAssocItem::No));
+                infos.push(variant_info);
+            }
+        }
+
+        fn collect_trait_assoc_items(
+            db: &dyn SourceDatabase,
+            map: &mut Index,
+            tr: TraitId,
+            is_type_in_ns: bool,
+            trait_import_info: &ImportInfo,
+        ) {
+            for &(ref assoc_item_name, item) in &TraitItems::query(db, tr).items {
+                let module_def_id = match item {
+                    AssocItemId::FunctionId(f) => ModuleDefId::from(f),
+                    AssocItemId::ConstId(c) => ModuleDefId::from(c),
+                    AssocItemId::TypeAliasId(_) => continue,
+                };
+                let assoc_item = if is_type_in_ns {
+                    ItemInNs::Types(module_def_id)
+                } else {
+                    ItemInNs::Values(module_def_id)
+                };
+                let attrs = AttrFlags::query(db, item.into());
+                let do_not_complete = Complete::for_trait_item(
+                    trait_import_info.complete,
+                    Complete::extract(false, attrs),
+                );
+                let assoc_item_info = ImportInfo {
+                    container: trait_import_info.container,
+                    name: assoc_item_name.clone(),
+                    is_doc_hidden: attrs.contains(AttrFlags::IS_DOC_HIDDEN),
+                    is_unstable: attrs.contains(AttrFlags::IS_UNSTABLE),
+                    complete: do_not_complete,
+                };
+                let (infos, _) = map
+                    .entry(assoc_item)
+                    .or_insert_with(|| (SmallVec::new(), IsTraitAssocItem::Yes));
+                infos.push(assoc_item_info);
+            }
+        }
+
+        /// `SearchMode::check` as it was, slicing `str`s.
+        pub(super) fn check(
+            mode: SearchMode,
+            query: &str,
+            case_sensitive: bool,
+            candidate: &str,
+        ) -> bool {
+            match mode {
+                SearchMode::Exact if case_sensitive => candidate == query,
+                SearchMode::Exact => candidate.eq_ignore_ascii_case(query),
+                SearchMode::Prefix => {
+                    query.len() <= candidate.len() && {
+                        let prefix = &candidate[..query.len()];
+                        if case_sensitive {
+                            prefix == query
+                        } else {
+                            prefix.eq_ignore_ascii_case(query)
+                        }
+                    }
+                }
+                SearchMode::Fuzzy => {
+                    let mut name = candidate;
+                    query.chars().all(|query_char| {
+                        let m = if case_sensitive {
+                            name.match_indices(query_char).next()
+                        } else {
+                            name.match_indices([query_char, query_char.to_ascii_uppercase()])
+                                .next()
+                        };
+                        match m {
+                            Some((index, _)) => {
+                                name = name[index..]
+                                    .strip_prefix(|_: char| true)
+                                    .unwrap_or_default();
+                                true
+                            }
+                            None => false,
+                        }
+                    })
+                }
+            }
+        }
+
+        pub(super) fn search(
+            db: &dyn SourceDatabase,
+            krate: Crate,
+            query: &Query,
+        ) -> FxHashSet<(ItemInNs, Complete)> {
+            let maps: Vec<_> =
+                krate.data(db).dependencies.iter().map(|dep| build(db, dep.crate_id)).collect();
+            let mut op = fst::map::OpBuilder::new();
+            match query.search_mode {
+                SearchMode::Exact => {
+                    let automaton = fst::automaton::Str::new(&query.lowercased);
+                    for map in &maps {
+                        op = op.add(map.fst.search(&automaton));
+                    }
+                    search_maps(&maps, op.union(), query)
+                }
+                SearchMode::Fuzzy => {
+                    let automaton = fst::automaton::Subsequence::new(&query.lowercased);
+                    for map in &maps {
+                        op = op.add(map.fst.search(&automaton));
+                    }
+                    search_maps(&maps, op.union(), query)
+                }
+                SearchMode::Prefix => {
+                    let automaton = fst::automaton::Str::new(&query.lowercased).starts_with();
+                    for map in &maps {
+                        op = op.add(map.fst.search(&automaton));
+                    }
+                    search_maps(&maps, op.union(), query)
+                }
+            }
+        }
+
+        fn search_maps(
+            maps: &[OldImportMap],
+            mut stream: fst::map::Union<'_>,
+            query: &Query,
+        ) -> FxHashSet<(ItemInNs, Complete)> {
+            let mut res = FxHashSet::default();
+            while let Some((_, indexed_values)) = stream.next() {
+                for &IndexedValue { index, value } in indexed_values {
+                    let end = (value & 0xFFFF_FFFF) as usize;
+                    let start = (value >> 32) as usize;
+                    let OldImportMap { map, importables, .. } = &maps[index];
+                    for &(item, info_idx) in &importables[start..end] {
+                        let (import_infos, assoc_mode) = &map[&item];
+                        let info = &import_infos[info_idx as usize];
+                        if query.matches_assoc_mode(*assoc_mode)
+                            && check(
+                                query.search_mode,
+                                &query.query,
+                                query.case_sensitive,
+                                info.name.as_str(),
+                            )
+                        {
+                            res.insert((item, info.complete));
+                        }
+                    }
+                }
+            }
+            res
+        }
+    }
+
+    /// Over seeded random crates (modules, re-exports, renames, globs, enums, traits, macros, a
+    /// prelude), the columns give what the old map gave: the same rows in the same order, the
+    /// same infos and trait flags per row, the same importables and the same FST bytes; and
+    /// `search_dependencies` finds the same items for exact, prefix and fuzzy queries, either
+    /// case, in every associated-item mode.
+    #[test]
+    fn differential_against_reference() {
+        use crate::find_path::tests::{Shape, gen_fixture};
+
+        for seed in 0..16u64 {
+            let shape = Shape { private_modules: seed % 2 == 0, private_imports: seed % 3 != 0 };
+            let fixture = gen_fixture(seed, shape);
+            let db = TestDB::with_files(&fixture);
+            let mut names = Vec::new();
+            for &krate in all_crates(&db).iter() {
+                let new = ImportMap::of(&db, krate);
+                let old = reference::build(&db, krate);
+                assert_eq!(
+                    new.items.iter().copied().collect::<Vec<_>>(),
+                    old.map.keys().copied().collect::<Vec<_>>(),
+                    "seed {seed}\n{fixture}"
+                );
+                for (row, (&item, (infos, assoc))) in old.map.iter().enumerate() {
+                    assert_eq!(new.import_info_for(item), Some(&infos[..]), "seed {seed}, {item:?}");
+                    assert_eq!(new.is_trait_assoc_item(row), *assoc, "seed {seed}, {item:?}");
+                    names.extend(infos.iter().map(|info| info.name.as_str().to_owned()));
+                }
+                let importables: Vec<(ItemInNs, u32)> = new
+                    .importables
+                    .iter()
+                    .map(|&info| {
+                        let row = new.row_of_info(info);
+                        (new.items[row], info - new.info_start[row])
+                    })
+                    .collect();
+                assert_eq!(importables, old.importables, "seed {seed}\n{fixture}");
+                assert_eq!(
+                    new.fst.as_fst().as_bytes(),
+                    old.fst.as_fst().as_bytes(),
+                    "seed {seed}\n{fixture}"
+                );
+                assert!(ImportMap::import_map_query_impl(&db, krate) == *new, "seed {seed}");
+            }
+            names.sort();
+            names.dedup();
+
+            let main = *all_crates(&db)
+                .iter()
+                .find(|krate| {
+                    krate
+                        .extra_data(&db)
+                        .display_name
+                        .as_ref()
+                        .is_some_and(|it| it.crate_name().as_str() == "main")
+                })
+                .unwrap();
+            let step = names.len().div_ceil(12).max(1);
+            for name in names.iter().step_by(step) {
+                let head = name.get(..2).unwrap_or(name.as_str()).to_owned();
+                let every_other: String = name.chars().step_by(2).collect();
+                let queries = || {
+                    [
+                        Query::new(name.clone()),
+                        Query::new(name.to_uppercase()),
+                        Query::new(name.clone()).case_sensitive(),
+                        Query::new(head.clone()).prefix(),
+                        Query::new(head.to_lowercase()).prefix().case_sensitive(),
+                        Query::new(every_other.clone()).fuzzy(),
+                        Query::new(every_other.to_uppercase()).fuzzy(),
+                        Query::new(every_other.clone()).fuzzy().case_sensitive(),
+                    ]
+                };
+                for assoc_mode in [
+                    AssocSearchMode::Include,
+                    AssocSearchMode::Exclude,
+                    AssocSearchMode::AssocItemsOnly,
+                ] {
+                    for query in queries() {
+                        let query = query.assoc_search_mode(assoc_mode);
+                        assert_eq!(
+                            search_dependencies(&db, main, &query),
+                            reference::search(&db, main, &query),
+                            "seed {seed}, {query:?}\n{fixture}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn search_mode_against_reference_check() {
+        let mut rng = crate::find_path::tests::Rng::new(7);
+        let alphabet = ['a', 'B', 'c', 'D', '_', '1', 'あ', 'é', 'É'];
+        let word = |rng: &mut crate::find_path::tests::Rng, len: usize| -> String {
+            (0..len).map(|_| alphabet[rng.below(alphabet.len())]).collect()
+        };
+        for _ in 0..4000 {
+            let query_len = rng.below(4);
+            let query = word(&mut rng, query_len);
+            let candidate_len = rng.below(7);
+            let candidate = word(&mut rng, candidate_len);
+            for mode in [SearchMode::Exact, SearchMode::Fuzzy] {
+                for case_sensitive in [false, true] {
+                    assert_eq!(
+                        mode.check(&query, case_sensitive, &candidate),
+                        reference::check(mode, &query, case_sensitive, &candidate),
+                        "{mode:?} {query:?} {candidate:?} {case_sensitive}"
+                    );
+                }
+            }
+            // The old prefix check panicked when the query ended inside a char of the
+            // candidate; where it did not, the answers agree.
+            for case_sensitive in [false, true] {
+                if candidate.is_char_boundary(query.len().min(candidate.len())) {
+                    assert_eq!(
+                        SearchMode::Prefix.check(&query, case_sensitive, &candidate),
+                        reference::check(SearchMode::Prefix, &query, case_sensitive, &candidate),
+                        "prefix {query:?} {candidate:?} {case_sensitive}"
+                    );
+                }
+            }
+        }
     }
 }

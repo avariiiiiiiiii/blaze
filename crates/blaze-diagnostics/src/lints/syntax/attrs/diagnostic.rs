@@ -31,7 +31,7 @@ use syntax::{
 
 use self::directive::Directive;
 use super::super::{Emitted, Pass, Walk, source_fact};
-use super::{Attr, Owner, Target, checked, parsed};
+use super::{Attr, Owner, Target, checked, lint_at, parsed};
 use crate::{
     cx::{Cx, def_range},
     lints::edit_distance::find_best_match_for_name,
@@ -161,7 +161,7 @@ impl Sink<'_, '_, '_> {
 
     /// A lint parsing the attributes gives.
     fn parsed(&mut self, mut diag: Diag) {
-        source_fact(self.cx, &mut diag, self.owner.at());
+        source_fact(self.cx, &mut diag, lint_at(self.owner));
         self.out.push(parsed(diag, self.owner));
     }
 

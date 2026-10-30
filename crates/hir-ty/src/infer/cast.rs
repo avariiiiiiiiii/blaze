@@ -67,7 +67,7 @@ impl<'db> CastTy<'db> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum CastError {
     Unknown,
     CastToBool,

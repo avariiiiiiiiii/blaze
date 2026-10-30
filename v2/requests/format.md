@@ -1,0 +1,129 @@
+# Requests from lane format
+
+Each: what, where, why. Children of format (format-tree, format-parse, format-span,
+format-hir) append below with their name.
+
+## format (lead)
+
+1. **Outline parses for dependency files** — `crates/base-db/src/editioned_file_id.rs`,
+   `EditionedFileId::parse` (lane db). Parse files of crates whose origin is not local
+   (`CrateOrigin::is_local() == false`, the registry and git dependencies and the sysroot)
+   with `ast::SourceFile::parse_outline(text, edition)` and the rest with
+   `ast::SourceFile::parse_shared(text, edition)`; `parse_errors` of a dependency file uses
+   `Parse::errors_with_bodies()` only when the build checks that crate (`blaze check` checks
+   workspace crates fully; a dependency's body that is never reached is never parsed: see the
+   report's note on syntax errors in unreached bodies). Why: #1294, docs/v2/format.md
+   "Issues this lane takes in": dependency bodies are parsed only when reached. The parse
+   query needs to know the file's crate; if it can't, a second query `parse_outline` beside
+   `parse`, chosen by the caller that knows the crate, works as well.
+2. **One text, not two** — `crates/base-db/src/lib.rs:396`, `FileText::text` (lane db):
+   make it `std::sync::Arc<str>` instead of `triomphe::Arc<str>`, so `parse_shared` /
+   `parse_outline` keep the file's own text in the tree instead of a copy (syntax-tree's
+   `FlatTree::source` is a `std::sync::Arc<str>`; it can't take triomphe's without a copy).
+   Why: docs/v2/format.md "Syntax": text read from the source, not copied.
+3. **Drop the green-tree switch** — `crates/blaze-engine/src/lib.rs:8041` (lane codegen):
+   delete `syntax::set_green_trees(std::env::var_os("BLAZE_GREEN_TREES").is_some());`.
+   Why: parses make only flat trees now (no-fallback: no second path); `set_green_trees` is
+   removed from `syntax`.
+4. **Use the item reparse on an edit** — the db's parse query (lane db): when the previous
+   parse of the same file is at hand and the VFS gives the edit (`blaze_vfs::Change`), make
+   the new parse with `Parse::reparse(delete, insert, edition)` rather than parsing the whole
+   file. It gives the same tree as a full parse (format-parse's tests check it). Why:
+   docs/v2/format.md "an edit reparses the changed item".
+
+## format-span-intern
+
+`crates/intern/` is now sharded and append-only (docs/v2/format.md section 5, "IDs, two kinds";
+docs/v2/db.md: memory is bounded by the db's reachability GC rebuilding arenas, not by
+refcounts). `Interned`, `InternedRef`, `InternedSlice`, `InternedSliceRef` and `Symbol` are
+`Copy` pointers with no reference count; nothing is ever freed. So the GC (`intern::GarbageCollector`,
+`GcInternedVisit`, `GcInternedSliceVisit`), `InternedRef::decrement_refcount`,
+`InternedSliceRef::decrement_refcount` and the `prevent-gc` feature are gone. These callers
+break without the edits below (lane: whoever owns hir-ty / hir; no crate enabled `prevent-gc`,
+so no Cargo.toml edit is needed).
+
+1. **Remove the interner GC from the solver** — `crates/hir-ty/src/next_solver/interner.rs`,
+   lines 2707 to the end of the file (2818). Old text: everything from
+   ```rust
+   impl WorldExposer for intern::GarbageCollector {
+   ```
+   through the end of the file, i.e. that impl, `pub unsafe fn collect_ty_garbage() { ... }`,
+   `macro_rules! impl_gc_visit { ... }` with its `impl_gc_visit!( ... );` call, and
+   `macro_rules! impl_gc_visit_slice { ... }` with its `impl_gc_visit_slice!( ... );` call.
+   New text: nothing (the file ends after `mod tls_cache`'s closing `}` at line 2705).
+   Why: the types and the collection no longer exist; values are never freed, so there is
+   nothing to mark or sweep. `WorldExposer` itself can stay (every `GenericTypeVisitable`
+   impl names it); it now has no implementor, so whoever owns hir-ty may remove it and those
+   impls later, but that is not needed to build.
+2. **Drop the re-export** — `crates/hir/src/lib.rs:215`. Old text:
+   ```rust
+           next_solver::{clear_tls_solver_cache, collect_ty_garbage},
+   ```
+   New text:
+   ```rust
+           next_solver::clear_tls_solver_cache,
+   ```
+   Why: `collect_ty_garbage` is removed by request 1 (nothing calls it: `rg collect_ty_garbage`).
+3. **`StoredGenericArg` holds no reference count** — `crates/hir-ty/src/next_solver/generic_arg.rs:147-184`.
+   Old text:
+   ```rust
+   #[derive(PartialEq, Eq, Hash)]
+   pub struct StoredGenericArg {
+       ptr: GenericArgImpl<'static>,
+   }
+
+   impl Clone for StoredGenericArg {
+       #[inline]
+       fn clone(&self) -> Self {
+           match self.ptr.kind() {
+               GenericArgKind::Lifetime(it) => std::mem::forget(it.interned.to_owned()),
+               GenericArgKind::Type(it) => std::mem::forget(it.interned.to_owned()),
+               GenericArgKind::Const(it) => std::mem::forget(it.interned.to_owned()),
+           }
+           Self { ptr: self.ptr }
+       }
+   }
+
+   impl Drop for StoredGenericArg {
+       #[inline]
+       fn drop(&mut self) {
+           unsafe {
+               match self.ptr.kind() {
+                   GenericArgKind::Lifetime(it) => it.interned.decrement_refcount(),
+                   GenericArgKind::Type(it) => it.interned.decrement_refcount(),
+                   GenericArgKind::Const(it) => it.interned.decrement_refcount(),
+               }
+           }
+       }
+   }
+
+   impl StoredGenericArg {
+       #[inline]
+       fn new(value: GenericArg<'_>) -> Self {
+           let result = Self { ptr: GenericArgImpl { ptr: value.ptr.ptr, _marker: PhantomData } };
+           // Increase refcount.
+           std::mem::forget(result.clone());
+           result
+       }
+   ```
+   New text:
+   ```rust
+   #[derive(Clone, PartialEq, Eq, Hash)]
+   pub struct StoredGenericArg {
+       ptr: GenericArgImpl<'static>,
+   }
+
+   impl StoredGenericArg {
+       #[inline]
+       fn new(value: GenericArg<'_>) -> Self {
+           Self { ptr: GenericArgImpl { ptr: value.ptr.ptr, _marker: PhantomData } }
+       }
+   ```
+   Why: `decrement_refcount` is gone (interned values are never freed, so a no-op in its place
+   would be a silent path), and the `forget(to_owned())` dance only bumped the count.
+   `GenericArgImpl`'s tag bits still work: every interned value sits at its type's alignment
+   in the arena, at least 8 for `TyInterned`/`ConstInterned`/`RegionInterned`.
+
+Optional, not needed to build: `impl_internable!(gc; X)` and `impl_slice_internable!(gc; X, H, S)`
+are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*.rs`); the
+`gc;` can be dropped from those calls whenever someone touches them.

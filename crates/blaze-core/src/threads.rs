@@ -204,6 +204,18 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             fs::write_atomically(&at(&file), &bytes)?;
             Ok(Done::Written)
         }
+        Effect::WriteAt { file, at: offset, bytes, .. } => {
+            fs::write_at(&at(&file), offset, &bytes)?;
+            Ok(Done::Written)
+        }
+        Effect::Rename { from, to, .. } => {
+            fs::rename(&at(&from), &at(&to))?;
+            Ok(Done::Renamed)
+        }
+        Effect::Mode { file, mode, .. } => {
+            fs::set_mode(&at(&file), mode)?;
+            Ok(Done::Moded)
+        }
         Effect::Clone { from, to, .. } => {
             fs::clone(&at(&from), &at(&to))?;
             Ok(Done::Cloned)
@@ -213,6 +225,7 @@ pub(crate) fn run(root: &Path, effect: Effect) -> io::Result<Done> {
             Ok(Done::Linked)
         }
         Effect::Stat { file, .. } => Ok(Done::Stat(fs::stat(&at(&file))?)),
+        Effect::List { dir, .. } => Ok(Done::Listed(fs::list(&at(&dir), &dir)?)),
         Effect::Remove { file, .. } => {
             fs::remove(&at(&file))?;
             Ok(Done::Removed)

@@ -23,8 +23,8 @@ pub(crate) fn rebase(
         }
     }
     // A path that resolves alike in both has the same directories above it in both; one a head
-    // made unreachable fails as the op would on the head.
-    let changed = |path: &str| tree.lookup(base, path) != tree.lookup(head, path);
+    // made unreachable fails as the op would on the head. A change of mode is a change.
+    let changed = |path: &str| tree.entry(base, path) != tree.entry(head, path);
     let mut moved = Vec::with_capacity(ops.len());
     for op in ops {
         let Some(path) = op_paths(op).find(|it| changed(it)) else {

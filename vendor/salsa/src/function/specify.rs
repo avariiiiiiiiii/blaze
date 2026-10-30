@@ -1,6 +1,9 @@
+use thin_vec::ThinVec;
+
 #[cfg(feature = "accumulator")]
 use crate::accumulator::accumulated_map::InputAccumulatedValues;
 use crate::active_query::CompletedQuery;
+use crate::fingerprint::Fingerprint;
 use crate::function::memo::Memo;
 use crate::function::sync::{ClaimResult, Reentrancy};
 use crate::function::{Configuration, IngredientImpl};
@@ -116,6 +119,12 @@ where
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: Default::default(),
                 verified_final: AtomicBool::new(!is_provisional),
+                fingerprint: if is_provisional {
+                    Fingerprint::NONE
+                } else {
+                    C::fingerprint(&value).unwrap_or(Fingerprint::NONE)
+                },
+                edge_fingerprints: ThinVec::new(),
             },
             stale_tracked_structs: Vec::new(),
         };
@@ -135,6 +144,7 @@ where
                 database_key_index,
                 &mut completed_query.revisions,
                 &value,
+                revision,
             );
             old_memo
                 .header

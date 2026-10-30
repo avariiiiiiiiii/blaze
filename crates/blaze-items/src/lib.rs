@@ -20,9 +20,127 @@
 //! S") are answered from indexes keyed by [`ImplIndexKey`] and [`ScopeIndexKey`], so an added
 //! impl or item touches only the queries that asked a question it now answers differently.
 
+//!
+//! In this crate: [`key`] gives each item its [`ItemKey`] and resolves one back; `form` writes
+//! an item's normalized form; [`hash`] fills the forms' slots and gives the four hashes
+//! ([`hashes`]); [`facts`] gives each [`Fact`] its value; `index` holds the negative-fact
+//! indexes. Each is computed by `#[salsa::tracked]` queries over the front end's database, so
+//! an edit recomputes only the forms it touched and stops where a hash comes out equal.
+
+mod facts;
+mod form;
+pub mod hash;
+mod index;
+pub mod key;
+#[cfg(test)]
+mod tests;
+
 use blaze_ids::{ContentId, Hasher};
 use blaze_query::{QueryKey, QueryKind};
+use hir_def::{
+    AdtId, AssocItemId, ConstId, DefWithBodyId, FunctionId, GenericDefId, ImplId, MacroId,
+    StaticId, TraitId, TypeAliasId,
+};
 use serde::{Deserialize, Serialize};
+
+pub use facts::*;
+pub use hash::{
+    Unhashable, closure_code, code_hash, coroutine_code, deep_hash, hashes, interface_hash,
+    layout_hash,
+};
+pub use index::*;
+pub use key::{Resolved, item_key, resolve};
+
+/// Which item, in one database: its dense ids, never hashed, never kept past the database.
+/// [`ItemKey`] is what is kept.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::Supertype)]
+pub enum ItemId {
+    Function(FunctionId),
+    Adt(AdtId),
+    Trait(TraitId),
+    Impl(ImplId),
+    Const(ConstId),
+    Static(StaticId),
+    Alias(TypeAliasId),
+    Macro(MacroId),
+}
+
+impl ItemId {
+    pub fn kind(self) -> ItemKind {
+        match self {
+            ItemId::Function(_) => ItemKind::Fn,
+            ItemId::Adt(AdtId::StructId(_)) => ItemKind::Struct,
+            ItemId::Adt(AdtId::EnumId(_)) => ItemKind::Enum,
+            ItemId::Adt(AdtId::UnionId(_)) => ItemKind::Union,
+            ItemId::Trait(_) => ItemKind::Trait,
+            ItemId::Impl(_) => ItemKind::Impl,
+            ItemId::Const(_) => ItemKind::Const,
+            ItemId::Static(_) => ItemKind::Static,
+            ItemId::Alias(_) => ItemKind::TypeAlias,
+            ItemId::Macro(_) => ItemKind::Macro,
+        }
+    }
+
+    pub fn krate(self, db: &dyn hir_ty::db::HirDatabase) -> base_db::Crate {
+        use hir_def::HasModule;
+        match self {
+            ItemId::Function(it) => it.krate(db),
+            ItemId::Adt(it) => it.krate(db),
+            ItemId::Trait(it) => it.krate(db),
+            ItemId::Impl(it) => it.krate(db),
+            ItemId::Const(it) => it.krate(db),
+            ItemId::Static(it) => it.krate(db),
+            ItemId::Alias(it) => it.krate(db),
+            ItemId::Macro(it) => it.krate(db),
+        }
+    }
+
+    /// The body it has, if it is of a kind that has one.
+    pub fn body(self) -> Option<DefWithBodyId> {
+        match self {
+            ItemId::Function(it) => Some(it.into()),
+            ItemId::Const(it) => Some(it.into()),
+            ItemId::Static(it) => Some(it.into()),
+            _ => None,
+        }
+    }
+
+    pub fn generic_def(self) -> Option<GenericDefId> {
+        match self {
+            ItemId::Function(it) => Some(it.into()),
+            ItemId::Adt(it) => Some(it.into()),
+            ItemId::Trait(it) => Some(it.into()),
+            ItemId::Impl(it) => Some(it.into()),
+            ItemId::Const(it) => Some(it.into()),
+            ItemId::Static(it) => Some(it.into()),
+            ItemId::Alias(it) => Some(it.into()),
+            ItemId::Macro(_) => None,
+        }
+    }
+}
+
+impl From<AssocItemId> for ItemId {
+    fn from(item: AssocItemId) -> ItemId {
+        match item {
+            AssocItemId::FunctionId(it) => ItemId::Function(it),
+            AssocItemId::ConstId(it) => ItemId::Const(it),
+            AssocItemId::TypeAliasId(it) => ItemId::Alias(it),
+        }
+    }
+}
+
+impl ItemId {
+    /// The item a body is of: an enum variant's discriminant is its enum's.
+    pub fn of_body(db: &dyn hir_ty::db::HirDatabase, body: DefWithBodyId) -> ItemId {
+        use hir_def::Lookup;
+        match body {
+            DefWithBodyId::FunctionId(it) => ItemId::Function(it),
+            DefWithBodyId::ConstId(it) => ItemId::Const(it),
+            DefWithBodyId::StaticId(it) => ItemId::Static(it),
+            DefWithBodyId::VariantId(it) => ItemId::Adt(it.lookup(db).parent.into()),
+        }
+    }
+}
 
 /// Which item: stable across edits of what it is, changed by a rename or a move.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]

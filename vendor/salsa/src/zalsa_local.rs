@@ -20,6 +20,7 @@ use crate::accumulator::{
 use crate::active_query::{CompletedQuery, DetachedInputOutputs, QueryCompletion, QueryStack};
 use crate::cycle::{AtomicIterationStamp, CycleHeads, IterationStamp, empty_cycle_heads};
 use crate::durability::Durability;
+use crate::fingerprint::Fingerprint;
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
 use crate::sync::atomic::AtomicBool;
@@ -324,15 +325,17 @@ impl ZalsaLocal {
         input: DatabaseKeyIndex,
         durability: Durability,
         changed_at: Revision,
+        fingerprint: Fingerprint,
         cycle_heads: &CycleHeads,
         #[cfg(feature = "accumulator")] has_accumulated: bool,
         #[cfg(feature = "accumulator")] accumulated_inputs: &AtomicInputAccumulatedValues,
     ) {
         crate::tracing::debug!(
-            "report_tracked_read(input={:?}, durability={:?}, changed_at={:?})",
+            "report_tracked_read(input={:?}, durability={:?}, changed_at={:?}, fingerprint={:?})",
             input,
             durability,
-            changed_at
+            changed_at,
+            fingerprint
         );
 
         // SAFETY: We do not access the query stack reentrantly.
@@ -343,6 +346,7 @@ impl ZalsaLocal {
                         input,
                         durability,
                         changed_at,
+                        fingerprint,
                         cycle_heads,
                         #[cfg(feature = "accumulator")]
                         has_accumulated,
@@ -523,9 +527,48 @@ pub(crate) struct QueryRevisions {
     /// relevant for queries that participate in a cycle, but we get it for
     /// free anyways due to padding.
     pub(super) verified_final: AtomicBool,
+
+    /// The hash of the memo's value, kept when the value is evicted, or
+    /// [`Fingerprint::NONE`] when the function's output has no stable hash (see
+    /// [`QueryRevisions::fingerprint`]) or the value is provisional.
+    pub(crate) fingerprint: Fingerprint,
+
+    /// The value fingerprints the inputs had when this query read them, for the inputs that
+    /// have one, sorted by the input's position in the origin's edges. An input without an entry
+    /// is compared by revision alone.
+    pub(crate) edge_fingerprints: ThinVec<EdgeFingerprint>,
+}
+
+/// The value fingerprint a dependency had when it was read.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EdgeFingerprint {
+    /// Position of the input in [`QueryOriginRef::edges`].
+    pub(crate) edge: u32,
+    pub(crate) fingerprint: Fingerprint,
 }
 
 impl QueryRevisions {
+    /// The memo's fingerprint: the hash of its value where the output has a stable hash,
+    /// otherwise the revision the value last changed in.
+    #[inline]
+    pub(crate) fn fingerprint(&self) -> Fingerprint {
+        if self.fingerprint.is_value() {
+            self.fingerprint
+        } else {
+            Fingerprint::of_revision(self.changed_at)
+        }
+    }
+
+    /// The fingerprint recorded for the input at `edge` in [`QueryOriginRef::edges`], if it was
+    /// read with a value fingerprint.
+    pub(crate) fn edge_fingerprint(&self, edge: usize) -> Option<Fingerprint> {
+        let position = self
+            .edge_fingerprints
+            .binary_search_by_key(&edge, |entry| entry.edge as usize)
+            .ok()?;
+        Some(self.edge_fingerprints[position].fingerprint)
+    }
+
     /// Returns the semantic origin of this query.
     #[inline]
     pub(crate) const fn origin(&self) -> QueryOriginRef<'_> {
@@ -558,6 +601,7 @@ impl QueryRevisions {
         }
 
         self.origin_and_extra.clear_edges();
+        self.edge_fingerprints = ThinVec::new();
     }
 
     #[cfg(feature = "salsa_unstable")]
@@ -569,9 +613,16 @@ impl QueryRevisions {
             origin_and_extra,
             #[cfg(feature = "accumulator")]
                 accumulated_inputs: _,
+            fingerprint: _,
+            edge_fingerprints,
         } = self;
 
-        origin_and_extra.allocation_size()
+        let edge_fingerprints = if edge_fingerprints.is_empty() {
+            0
+        } else {
+            2 * std::mem::size_of::<usize>() + std::mem::size_of_val(edge_fingerprints.as_slice())
+        };
+        origin_and_extra.allocation_size() + edge_fingerprints
     }
 }
 
@@ -743,7 +794,9 @@ impl fmt::Debug for QueryRevisionsExtraInner {
 
 #[cfg(not(feature = "shuttle"))]
 #[cfg(target_pointer_width = "64")]
-const _: [(); std::mem::size_of::<QueryRevisions>()] = [(); std::mem::size_of::<[usize; 3]>()];
+const _: [(); std::mem::size_of::<QueryRevisions>()] = [(); std::mem::size_of::<[usize; 6]>()];
+
+const _: [(); std::mem::size_of::<EdgeFingerprint>()] = [(); 20];
 
 #[cfg(not(feature = "shuttle"))]
 #[cfg(target_pointer_width = "64")]
@@ -769,6 +822,8 @@ impl QueryRevisions {
             #[cfg(feature = "accumulator")]
             accumulated_inputs: Default::default(),
             verified_final: AtomicBool::new(false),
+            fingerprint: Fingerprint::NONE,
+            edge_fingerprints: ThinVec::new(),
         }
     }
 

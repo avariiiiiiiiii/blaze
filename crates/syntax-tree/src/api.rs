@@ -102,11 +102,18 @@ impl<L: Language> SyntaxNode<L> {
     pub fn new_flat_root(tree: std::sync::Arc<crate::FlatTree>) -> SyntaxNode<L> {
         SyntaxNode::from(cursor::SyntaxNode::new_flat_root(tree))
     }
-    /// The flat tree this node is in, if it is in one.
+    /// The flat tree this node is in, if it is in one: a lazy node's part for a node inside
+    /// it.
     pub fn flat_tree(&self) -> Option<&std::sync::Arc<crate::FlatTree>> {
         self.raw.flat_tree()
     }
-    /// The flat tree this node is in and the node's number in it, if it is in one.
+    /// Whether this is a lazy node of a flat tree whose part is not parsed yet. Never parses.
+    #[inline]
+    pub fn is_lazy(&self) -> bool {
+        self.raw.is_lazy()
+    }
+    /// The flat tree this node is in and the node's number in it, if it is in one: a lazy
+    /// node's part for a node inside it, the file's tree for the lazy node itself.
     #[inline]
     pub fn flat(&self) -> Option<(&std::sync::Arc<crate::FlatTree>, u32)> {
         self.raw.flat()

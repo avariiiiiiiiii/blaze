@@ -42,9 +42,10 @@
 
 ## 4. pyproject.toml: lint and type-check harness/v2
 
-- What: add `"harness/v2"` to both `include` lists (ruff and pyright) and
+- What: add `"harness/v2"` to both `include` lists (ruff and pyright),
   `"harness/v2/*.py" = ["E402"]` beside the other per-file ignores (the scripts put
-  `harness/` on `sys.path` before importing `engine`, `report` and `blaze_cli`).
+  `harness/` on `sys.path` before importing `engine`, `report` and `blaze_cli`), and pyright
+  `extraPaths = ["harness", "harness/v2"]` so those sibling imports resolve.
 - Where: `pyproject.toml` (coordinator).
 - Why: the scripts are written pyright-strict; nothing checks them until they are included.
 
@@ -67,3 +68,18 @@
 
 ---
 Routed or applied by the coordinator, 16:54.
+
+## 7. blaze-api: one check of a whole workspace that keeps going (from proof-corpus)
+
+- What: `Request::Check` over a workspace checks every member even after one fails and says
+  per member whether it was accepted or which errors it had (each `Diagnostic` naming its
+  target); CLI `blaze check --workspace --keep-going --message-format=json`, a
+  `compiler-artifact` per accepted member and `target.name` on each message.
+- Where: `crates/blaze-api` (ci), the `blaze check` client.
+- Why: `harness/v2/rejections.py` checks thousands of rustc compile-fail tests, about 100 to
+  a workspace; its `whole: true` mode makes one request per workspace instead of one per
+  test. Each member is still checked exactly as on its own.
+
+The children's own files (`v2/requests/proof-corpus.md`, `v2/requests/proof-perf.md`) are
+folded in here: what they asked of `proof` (engine, fixture, proof.py) is done in
+`harness/v2/`; what they asked of the coordinator is items 4 and 7 above.

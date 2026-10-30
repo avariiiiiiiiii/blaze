@@ -66,7 +66,14 @@ pub struct Summary {
     pub params: u32,
     /// The parameters its body never reads, by place.
     pub unused: Vec<u32>,
+    /// What LLVM infers of it alone, knowing nothing of what it calls.
     pub attrs: Attrs,
+    /// What LLVM infers of it when every function of the build it calls (every
+    /// [`Call::callee`]) is nounwind, readnone, willreturn and norecurse: what holds of its
+    /// own instructions, for [`crate::imports::decide`] to meet with its callees'. Its
+    /// `noreturn` is [`Summary::attrs`]'s, as a noreturn callee on one path says nothing of
+    /// the others.
+    pub body: Attrs,
     /// Whether code outside the build can call it: an exported symbol, a patchable function
     /// of a live build. Nothing is assumed of its callers.
     pub external: bool,

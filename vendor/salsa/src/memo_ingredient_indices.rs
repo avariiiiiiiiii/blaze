@@ -136,6 +136,10 @@ impl MemoIngredientMap for MemoIngredientIndices {
     fn get(&self, index: IngredientIndex) -> MemoIngredientIndex {
         self.indices[index.as_u32() as usize]
     }
+    #[inline]
+    fn get_checked(&self, index: IngredientIndex) -> Option<MemoIngredientIndex> {
+        self.indices.get(index.as_u32() as usize).copied()
+    }
 }
 
 #[derive(Debug)]
@@ -149,6 +153,10 @@ impl MemoIngredientMap for MemoIngredientSingletonIndex {
     #[inline(always)]
     fn get(&self, _: IngredientIndex) -> MemoIngredientIndex {
         self.0
+    }
+    #[inline]
+    fn get_checked(&self, _: IngredientIndex) -> Option<MemoIngredientIndex> {
+        Some(self.0)
     }
 }
 
@@ -182,4 +190,8 @@ impl NewMemoIngredientIndices for MemoIngredientSingletonIndex {
 pub trait MemoIngredientMap: Send + Sync {
     fn get_zalsa_id(&self, zalsa: &Zalsa, id: Id) -> MemoIngredientIndex;
     fn get(&self, index: IngredientIndex) -> MemoIngredientIndex;
+    /// Like [`get`](Self::get), but without panicking for a struct ingredient that isn't in the
+    /// map; the index returned for one may still belong to another function, so callers check
+    /// the memo type registered there.
+    fn get_checked(&self, index: IngredientIndex) -> Option<MemoIngredientIndex>;
 }

@@ -33,6 +33,10 @@ pub(crate) enum Class {
     /// Range-extension veneers for AArch64 branches that can't reach their target.
     Veneers,
     Rodata,
+    /// Read-only once the loader has relocated it: constant data holding addresses (vtables,
+    /// panic locations, constant statics with pointers), ELF's `.data.rel.ro`, Mach-O's
+    /// `__DATA_CONST,__const`, PE's `.rdata`.
+    RelRo,
     /// Call frame information (`.eh_frame`, `__eh_frame`) that the core assembles.
     EhFrame,
     Data,
@@ -49,6 +53,10 @@ pub(crate) enum Class {
     /// A section a static or a native object names (`#[link_section]`), kept whole and in
     /// input order so the program can walk it between its start and stop symbols.
     Named { name: String, write: bool, exec: bool },
+    /// Mach-O thread-local variable descriptors (`__thread_vars`): three words each, the
+    /// `_tlv_bootstrap` thunk (bound), a key (0) and the variable's offset in the template.
+    /// The core makes one for each thread-local static when [`Plan::tls_descriptors`].
+    ThreadVars,
     /// The thread-local template: initialized, then zeroed.
     Tdata,
     Tbss,
@@ -170,10 +178,12 @@ pub(crate) enum Apply {
     A64TlsDescLo12,
     A64TlsDescAdd12,
     A64TlsDescCall,
-    /// Mach-O TLV: the page and low 12 bits of `S`'s thread-local variable descriptor.
+    /// Mach-O TLV (`TLVP_LOAD_*`): the page and low 12 bits (an `LDR`) of a GOT cell holding
+    /// the address of `S`'s descriptor (`S` itself for a native one in `__thread_vars`, the one
+    /// the core makes in [`Class::ThreadVars`] for a thread-local static).
     TlvPage21,
     TlvLo12,
-    /// x86-64 Mach-O TLV: `rel32` to the descriptor.
+    /// x86-64 Mach-O TLV: `rel32` to that cell.
     TlvRel32,
     /// The thread-local offset of `S + A` codegen asks for ([`blaze_codegen::RelocKind::TlsOffset`]):
     /// 32 bits on x86-64 (`TPOFF32`), a 64-bit literal on AArch64.
@@ -380,8 +390,6 @@ pub(crate) enum Holds {
     TlsGd { import: Option<u32>, offset: u64 },
     /// A TLS descriptor (two cells) of a thread-local, local or imported.
     TlsDesc { import: Option<u32>, offset: u64 },
-    /// A Mach-O TLV descriptor: (`__tlv_bootstrap`, key, offset), three cells.
-    Tlv { offset: u64 },
 }
 
 /// An address holding an import's address plus `addend`, which the loader binds.
@@ -451,7 +459,7 @@ pub(crate) struct Placed<'a> {
     pub plan: &'a Plan,
     /// In address order; each region's bytes are [`Placed::bytes`] of it.
     pub regions: &'a [Region],
-    pub contents: &'a [Vec<u8>],
+    pub contents: &'a [&'a [u8]],
     /// Shared libraries imported from, in the order the loader loads them.
     pub libraries: &'a [Library],
     pub imports: &'a [Import],
@@ -472,7 +480,7 @@ pub(crate) struct Placed<'a> {
 impl Placed<'_> {
     /// The bytes placed in `region` (index into [`Placed::regions`]): empty for zeroed ones.
     pub fn bytes(&self, region: usize) -> &[u8] {
-        &self.contents[region]
+        self.contents[region]
     }
 
     pub fn region(&self, class: &Class) -> Option<(usize, &Region)> {

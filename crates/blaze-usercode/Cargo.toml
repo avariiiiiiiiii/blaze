@@ -21,6 +21,7 @@ blaze-core.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-query.workspace = true
+postcard.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 

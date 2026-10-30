@@ -21,12 +21,29 @@ use crate::{
     T,
 };
 
+/// The tokens of a text, the last an `EOF` of no length.
+///
+/// A token is one `u32`: its kind in the low [`KIND_BITS`] bits and its length in bytes in the
+/// rest. A length of [`LONG`] (4 MiB) or more, a huge string literal or comment, is written as
+/// [`LONG`] and kept in `long`, a side table sorted by token. Starts are arithmetic, as in the
+/// flat syntax tree: `checkpoints` holds the start of every [`CHECKPOINT`]th token, and a start
+/// is its checkpoint plus the lengths of the tokens between. So a token costs 4 bytes and a
+/// sixteenth of a checkpoint's 4, 4.25 bytes, against the 6 of a kind (`u16`) and a start
+/// (`u32`) each; finding a start reads at most 15 lengths, and walking the tokens in order
+/// (`to_input`, `intersperse_trivia`) keeps a running offset instead.
 pub struct LexedStr<'a> {
     text: &'a str,
-    kind: Vec<SyntaxKind>,
-    start: Vec<u32>,
+    tokens: Vec<u32>,
+    checkpoints: Vec<u32>,
+    long: Vec<(u32, u32)>,
     error: Vec<LexError>,
 }
+
+const KIND_BITS: u32 = 10;
+const KIND_MASK: u32 = (1 << KIND_BITS) - 1;
+const LONG: u32 = (1 << (32 - KIND_BITS)) - 1;
+const CHECKPOINT: usize = 16;
+const _: () = assert!((SyntaxKind::__LAST as u32) <= KIND_MASK, "a kind fits in KIND_BITS");
 
 struct LexError {
     msg: String,
@@ -36,6 +53,7 @@ struct LexError {
 impl<'a> LexedStr<'a> {
     pub fn new(edition: Edition, text: &'a str) -> LexedStr<'a> {
         let _p = tracing::info_span!("LexedStr::new").entered();
+        assert!(text.len() <= u32::MAX as usize, "a text of 4 GiB or more");
         let mut conv = Converter::new(edition, text);
         if let Ok(script) = crate::frontmatter::ScriptSource::parse(text) {
             if let Some(shebang) = script.shebang_span() {
@@ -74,8 +92,8 @@ impl<'a> LexedStr<'a> {
 
         let mut conv = Converter::new(edition, text);
         conv.extend_token(&token.kind, text);
-        match &*conv.res.kind {
-            [kind] => Some((*kind, conv.res.error.pop().map(|it| it.msg))),
+        match conv.res.tokens.len() {
+            1 => Some((conv.res.raw_kind(0), conv.res.error.pop().map(|it| it.msg))),
             _ => None,
         }
     }
@@ -85,7 +103,7 @@ impl<'a> LexedStr<'a> {
     }
 
     pub fn len(&self) -> usize {
-        self.kind.len() - 1
+        self.tokens.len() - 1
     }
 
     pub fn is_empty(&self) -> bool {
@@ -94,7 +112,7 @@ impl<'a> LexedStr<'a> {
 
     pub fn kind(&self, i: usize) -> SyntaxKind {
         assert!(i < self.len());
-        self.kind[i]
+        self.raw_kind(i)
     }
 
     pub fn text(&self, i: usize) -> &str {
@@ -103,26 +121,51 @@ impl<'a> LexedStr<'a> {
 
     pub fn range_text(&self, r: ops::Range<usize>) -> &str {
         assert!(r.start < r.end && r.end <= self.len());
-        let lo = self.start[r.start] as usize;
-        let hi = self.start[r.end] as usize;
+        let lo = self.text_start(r.start);
+        let hi = lo + (r.start..r.end).map(|i| self.raw_len(i)).sum::<usize>();
         &self.text[lo..hi]
     }
 
     // Naming is hard.
     pub fn text_range(&self, i: usize) -> ops::Range<usize> {
         assert!(i < self.len());
-        let lo = self.start[i] as usize;
-        let hi = self.start[i + 1] as usize;
-        lo..hi
+        let lo = self.text_start(i);
+        lo..lo + self.raw_len(i)
     }
     pub fn text_start(&self, i: usize) -> usize {
         assert!(i <= self.len());
-        self.start[i] as usize
+        let checkpoint = i / CHECKPOINT;
+        let from = checkpoint * CHECKPOINT;
+        self.checkpoints[checkpoint] as usize + (from..i).map(|i| self.raw_len(i)).sum::<usize>()
     }
     pub fn text_len(&self, i: usize) -> usize {
         assert!(i < self.len());
-        let r = self.text_range(i);
-        r.end - r.start
+        self.raw_len(i)
+    }
+
+    /// The length of token `i`, for walks that keep their own offset.
+    #[inline]
+    pub(crate) fn token_len(&self, i: usize) -> usize {
+        debug_assert!(i < self.len());
+        self.raw_len(i)
+    }
+
+    #[inline]
+    fn raw_kind(&self, i: usize) -> SyntaxKind {
+        SyntaxKind::from((self.tokens[i] & KIND_MASK) as u16)
+    }
+
+    #[inline]
+    fn raw_len(&self, i: usize) -> usize {
+        let len = self.tokens[i] >> KIND_BITS;
+        if len < LONG {
+            return len as usize;
+        }
+        let at = self
+            .long
+            .binary_search_by_key(&(i as u32), |&(token, _)| token)
+            .expect("a long token's length is in the side table");
+        self.long[at].1 as usize
     }
 
     pub fn error(&self, i: usize) -> Option<&str> {
@@ -135,9 +178,19 @@ impl<'a> LexedStr<'a> {
         self.error.iter().map(|it| (it.token as usize, it.msg.as_str()))
     }
 
-    fn push(&mut self, kind: SyntaxKind, offset: usize) {
-        self.kind.push(kind);
-        self.start.push(offset as u32);
+    fn push(&mut self, kind: SyntaxKind, start: usize, len: usize) {
+        let at = self.tokens.len();
+        if at.is_multiple_of(CHECKPOINT) {
+            self.checkpoints.push(start as u32);
+        }
+        let kind = kind as u16 as u32;
+        match u32::try_from(len) {
+            Ok(len) if len < LONG => self.tokens.push(kind | (len << KIND_BITS)),
+            _ => {
+                self.tokens.push(kind | (LONG << KIND_BITS));
+                self.long.push((at as u32, len as u32));
+            }
+        }
     }
 }
 
@@ -152,8 +205,9 @@ impl<'a> Converter<'a> {
         Self {
             res: LexedStr {
                 text,
-                kind: Vec::with_capacity(text.len() / 3),
-                start: Vec::with_capacity(text.len() / 3),
+                tokens: Vec::with_capacity(text.len() / 3),
+                checkpoints: Vec::with_capacity(text.len() / 3 / CHECKPOINT + 1),
+                long: Vec::new(),
                 error: Vec::new(),
             },
             offset: 0,
@@ -163,34 +217,34 @@ impl<'a> Converter<'a> {
 
     /// Check for likely unterminated string by analyzing STRING token content
     fn has_likely_unterminated_string(&self) -> bool {
-        let Some(last_idx) = self.res.kind.len().checked_sub(1) else { return false };
-
-        for i in (0..=last_idx).rev().take(5) {
-            if self.res.kind[i] == STRING {
-                let start = self.res.start[i] as usize;
-                let end = self.res.start.get(i + 1).map(|&s| s as usize).unwrap_or(self.offset);
+        let mut end = self.offset;
+        for i in (0..self.res.tokens.len()).rev().take(5) {
+            let start = end - self.res.raw_len(i);
+            if self.res.raw_kind(i) == STRING {
                 let content = &self.res.text[start..end];
 
                 if content.contains('(') && (content.contains("//") || content.contains(";\n")) {
                     return true;
                 }
             }
+            end = start;
         }
         false
     }
 
     fn finalize_with_eof(mut self) -> LexedStr<'a> {
-        self.res.push(EOF, self.offset);
+        self.res.push(EOF, self.offset, 0);
         self.res
     }
 
     fn push(&mut self, kind: SyntaxKind, len: usize, errors: Vec<String>) {
-        self.res.push(kind, self.offset);
+        self.res.push(kind, self.offset, len);
         self.offset += len;
 
+        let token = (self.res.tokens.len() - 1) as u32;
         for msg in errors {
             if !msg.is_empty() {
-                self.res.error.push(LexError { msg, token: self.res.len() as u32 });
+                self.res.error.push(LexError { msg, token });
             }
         }
     }

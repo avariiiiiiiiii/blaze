@@ -17,5 +17,8 @@ doctest = false
 blaze-ids.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
+[dev-dependencies]
+blake3.workspace = true
+
 [lints]
 workspace = true

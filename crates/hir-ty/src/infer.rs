@@ -36,7 +36,7 @@ use std::{
     cmp,
     convert::identity,
     fmt,
-    hash::Hash,
+    hash::{Hash, Hasher},
     ops::Deref,
 };
 
@@ -270,7 +270,7 @@ fn infer_finalize<'db>(mut ctx: InferenceContext<'db>) -> InferenceResult<'db> {
     ctx.resolve_all()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum ByRef {
     Yes(Mutability),
     No,
@@ -281,10 +281,10 @@ pub enum ByRef {
 /// and the final binding mode that we infer after type inference/match ergonomics.
 /// `.0` is the by-reference mode (`ref`, `ref mut`, or by value),
 /// `.1` is the mutability of the binding.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct BindingMode(pub ByRef, pub Mutability);
 
-#[derive(Debug, PartialEq, Eq, Clone, TypeVisitable, TypeFoldable)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash, TypeVisitable, TypeFoldable)]
 pub enum InferenceDiagnostic {
     NoSuchField {
         #[type_visitable(ignore)]
@@ -575,13 +575,13 @@ impl InferenceDiagnostic {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum ReturnKind {
     ReturnExpr,
     BecomeExpr,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum ExplicitDropMethodUseKind {
     MethodCall(ExprId),
     Path(ExprOrPatIdPacked),
@@ -755,7 +755,7 @@ pub enum PointerCast {
 
 /// Represents an implicit coercion applied to the scrutinee of a match before testing a pattern
 /// against it. Currently, this is used only for implicit dereferences.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PatAdjustment {
     pub kind: PatAdjust,
     /// The type of the scrutinee before the adjustment is applied, or the "adjusted type" of the
@@ -764,7 +764,7 @@ pub struct PatAdjustment {
 }
 
 /// Represents implicit coercions of patterns' types, rather than values' types.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum PatAdjust {
     /// An implicit dereference before matching, such as when matching the pattern `0` against a
     /// scrutinee of type `&u8` or `&mut u8`.
@@ -862,6 +862,82 @@ pub struct InferenceResult<'db> {
     defined_anon_consts: ThinVec<AnonConstId<'db>>,
 }
 
+/// Hashes an unordered collection the same for equal values, which may iterate in different
+/// orders: each entry by itself, summed.
+fn hash_unordered<T: Hash, H: Hasher>(entries: impl ExactSizeIterator<Item = T>, state: &mut H) {
+    state.write_usize(entries.len());
+    let sum = entries.fold(0u128, |sum, entry| {
+        let mut hasher = salsa::StableHasher::new();
+        entry.hash(&mut hasher);
+        let (low, high) = hasher.finish128();
+        sum.wrapping_add(u128::from(high) << 64 | u128::from(low))
+    });
+    state.write_u128(sum);
+}
+
+/// Everything `==` compares, so that salsa's fingerprint of a dropped result backdates its
+/// recomputation only when the two are equal.
+impl Hash for InferenceResult<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let InferenceResult {
+            method_resolutions,
+            field_resolutions,
+            variant_resolutions,
+            assoc_resolutions,
+            tuple_field_access_types,
+            type_of_expr,
+            type_of_pat,
+            type_of_binding,
+            type_of_type_placeholder,
+            type_of_opaque,
+            has_errors,
+            diagnostics,
+            nodes_with_type_mismatches,
+            error_ty,
+            expr_adjustments,
+            assignment_coercions,
+            pat_adjustments,
+            binding_modes,
+            skipped_ref_pats,
+            coercion_casts,
+            closures_without_expectation,
+            asm_sym_tys,
+            closures_data,
+            defined_anon_consts,
+        } = self;
+        hash_unordered(method_resolutions.iter(), state);
+        hash_unordered(field_resolutions.iter(), state);
+        hash_unordered(variant_resolutions.iter(), state);
+        hash_unordered(assoc_resolutions.iter(), state);
+        tuple_field_access_types.hash(state);
+        type_of_expr.hash(state);
+        type_of_pat.hash(state);
+        type_of_binding.hash(state);
+        hash_unordered(type_of_type_placeholder.iter(), state);
+        hash_unordered(type_of_opaque.iter(), state);
+        has_errors.hash(state);
+        diagnostics.hash(state);
+        match nodes_with_type_mismatches {
+            None => state.write_u8(0),
+            Some(nodes) => {
+                state.write_u8(1);
+                hash_unordered(nodes.iter(), state);
+            }
+        }
+        error_ty.hash(state);
+        hash_unordered(expr_adjustments.iter(), state);
+        hash_unordered(assignment_coercions.iter(), state);
+        hash_unordered(pat_adjustments.iter(), state);
+        binding_modes.hash(state);
+        hash_unordered(skipped_ref_pats.iter(), state);
+        hash_unordered(coercion_casts.iter(), state);
+        hash_unordered(closures_without_expectation.iter(), state);
+        hash_unordered(asm_sym_tys.iter(), state);
+        hash_unordered(closures_data.iter(), state);
+        defined_anon_consts.hash(state);
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ClosureData {
     /// Tracks the minimum captures required for a closure;
@@ -927,6 +1003,15 @@ pub struct ClosureData {
     /// Note that `'a` is not bound (it would be an `ReLateParam`) and
     /// that the `Foo` opaque type is replaced by its hidden type.
     pub liberated_sig: StoredFnSig,
+}
+
+impl Hash for ClosureData {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let ClosureData { min_captures, fake_reads, liberated_sig } = self;
+        hash_unordered(min_captures.iter(), state);
+        fake_reads.hash(state);
+        liberated_sig.hash(state);
+    }
 }
 
 /// Part of `MinCaptureInformationMap`; Maps a root variable to the list of `CapturedPlace`.
@@ -2859,5 +2944,42 @@ impl std::ops::BitAndAssign for Diverges {
 impl std::ops::BitOrAssign for Diverges {
     fn bitor_assign(&mut self, other: Self) {
         *self = *self | other;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hash::FxHashMap;
+
+    use super::hash_unordered;
+
+    fn hash(map: &FxHashMap<u32, u32>) -> (u64, u64) {
+        let mut hasher = salsa::StableHasher::new();
+        hash_unordered(map.iter(), &mut hasher);
+        hasher.finish128()
+    }
+
+    #[test]
+    fn equal_maps_hash_the_same_whatever_their_order() {
+        let forward: FxHashMap<u32, u32> = (0..64).map(|it| (it, it * 7)).collect();
+        let mut backward = FxHashMap::default();
+        backward.reserve(1024);
+        for it in (0..64).rev() {
+            backward.insert(it, it * 7);
+        }
+        assert_eq!(forward, backward);
+        assert_eq!(hash(&forward), hash(&backward));
+    }
+
+    #[test]
+    fn a_changed_entry_changes_the_hash() {
+        let map: FxHashMap<u32, u32> = (0..64).map(|it| (it, it * 7)).collect();
+        let mut changed = map.clone();
+        changed.insert(5, 0);
+        assert_ne!(hash(&map), hash(&changed));
+        let mut moved = map.clone();
+        moved.remove(&5);
+        moved.insert(64, 35);
+        assert_ne!(hash(&map), hash(&moved));
     }
 }

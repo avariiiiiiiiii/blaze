@@ -1,5 +1,6 @@
 use crate::Backtrace;
 use crate::DatabaseKeyIndex;
+use crate::Revision;
 use crate::function::memo::{Memo, MemoHeader};
 use crate::function::{Configuration, IngredientImpl};
 use crate::zalsa_local::QueryRevisions;
@@ -12,18 +13,36 @@ where
     /// If the value/durability of this memo is equal to what is found in `revisions`/`value`,
     /// then update `revisions.changed_at` to match `self.revisions.changed_at`. This is invoked
     /// on an old memo when a new memo has been produced to check whether there have been changed.
+    ///
+    /// `revisions.fingerprint` must already hold the new value's fingerprint. When the old value
+    /// was evicted, the values are the same if both have value fingerprints and they are equal.
+    /// Without value fingerprints, an evicted value is only known to be the same when the old memo
+    /// was verified in `now`, the current revision: every input was unchanged, so executing again
+    /// computes the value the memo had.
     pub(super) fn backdate_if_appropriate<'db>(
         &self,
         old_memo: &'db Memo<C>,
         index: DatabaseKeyIndex,
         revisions: &mut QueryRevisions,
         value: &C::Output<'db>,
+        now: Revision,
     ) {
-        if old_memo.header.can_backdate(revisions)
-            && old_memo
-                .value()
-                .is_some_and(|old_value| C::values_equal(old_value, value))
-        {
+        if !old_memo.header.can_backdate(revisions) {
+            return;
+        }
+        let same = match old_memo.value() {
+            Some(old_value) => C::values_equal(old_value, value),
+            None => {
+                let old = old_memo.header.revisions.fingerprint;
+                let new = revisions.fingerprint;
+                if old.is_value() && new.is_value() {
+                    old == new
+                } else {
+                    old_memo.header.verified_at.load() == now
+                }
+            }
+        };
+        if same {
             old_memo.header.backdate(index, revisions);
         }
     }

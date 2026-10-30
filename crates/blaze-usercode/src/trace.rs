@@ -187,6 +187,95 @@ pub trait Inputs {
     fn env(&mut self, name: &OsStr) -> Option<OsString>;
     /// The whole environment, for a run that read all of it.
     fn env_all(&mut self) -> Vec<(OsString, OsString)>;
+    /// The names in the directory, each with whether it is a directory, sorted; `None` for
+    /// no directory there. What [`package`] walks.
+    fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Self::Error>;
+}
+
+/// What a [`Traced`] names a package's whole tree by, below the package's directory: the
+/// input of cargo's rule for a script that printed no `rerun-if-changed` ([`crate::rule`]).
+/// No file has this name: a name is a C string.
+pub const PACKAGE: &str = "\0package";
+
+/// What a [`Traced`] names everything below a directory by: the input of cargo's rule for a
+/// `rerun-if-changed` of a directory, which cargo watches whole.
+pub const TREE: &str = "\0tree";
+
+/// The directory `path` is the [`PACKAGE`] or [`TREE`] entry of, and whether it is a
+/// package, when it is one.
+pub fn walked(path: &Path) -> Option<(&Path, bool)> {
+    let name = path.file_name()?;
+    let package = if name == PACKAGE {
+        true
+    } else if name == TREE {
+        false
+    } else {
+        return None;
+    };
+    Some((path.parent()?, package))
+}
+
+/// The directory `path` is the [`PACKAGE`] entry of, when it is one.
+pub fn package_of(path: &Path) -> Option<&Path> {
+    walked(path).filter(|it| it.1).map(|it| it.0)
+}
+
+/// The hash of every file of the package at `dir` as cargo watches it: every file below it,
+/// by its path from `dir` and its bytes, but what is in a directory whose name starts with a
+/// `.` and the package's own `target`. `None` for no directory there.
+pub fn package<I: Inputs + ?Sized>(inputs: &mut I, dir: &Path) -> Result<Option<[u8; 32]>, I::Error> {
+    walk(inputs, dir, true)
+}
+
+/// The hash of every file below `dir`, as [`package`] hashes them; with `package`, a
+/// package's, without its hidden directories and its `target`.
+pub fn walk<I: Inputs + ?Sized>(
+    inputs: &mut I,
+    dir: &Path,
+    package: bool,
+) -> Result<Option<[u8; 32]>, I::Error> {
+    let Some(top) = inputs.names(dir)? else { return Ok(None) };
+    let mut hasher = Hasher::new(match package {
+        true => "blaze v2 package tree 1",
+        false => "blaze v2 tree 1",
+    });
+    let mut stack: Vec<(PathBuf, Vec<(OsString, bool)>)> = vec![(PathBuf::new(), top)];
+    // Depth first, each directory's names in order, so the walk's order is the paths'.
+    while let Some((rel, mut names)) = stack.pop() {
+        names.sort();
+        names.reverse();
+        let mut deeper = Vec::new();
+        while let Some((name, is_dir)) = names.pop() {
+            let skipped = os_bytes(&name).starts_with(b".")
+                || (rel.as_os_str().is_empty() && name == "target");
+            if package && skipped {
+                continue;
+            }
+            let rel = rel.join(&name);
+            let whole = dir.join(&rel);
+            match is_dir {
+                true => {
+                    if let Some(inner) = inputs.names(&whole)? {
+                        hasher.part(os_bytes(rel.as_os_str())).part(b"d");
+                        deeper.push((rel, inner));
+                    }
+                }
+                false => {
+                    let hash = inputs.file(&whole)?;
+                    hasher.part(os_bytes(rel.as_os_str()));
+                    match hash {
+                        Some(hash) => _ = hasher.part(&hash),
+                        None => _ = hasher.part(b"-"),
+                    }
+                }
+            }
+        }
+        // The first directory of this one is walked next.
+        while let Some(it) = deeper.pop() {
+            stack.push(it);
+        }
+    }
+    Ok(Some(hasher.finish().0))
 }
 
 /// What a traced file that is a directory hashes as: what a look at it showed is that it is
@@ -487,6 +576,45 @@ mod tests {
         fn env_all(&mut self) -> Vec<(OsString, OsString)> {
             self.env.clone()
         }
+        fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, String> {
+            let Some(names) = self.dirs.get(path) else { return Ok(None) };
+            let mut out: Vec<(OsString, bool)> = names
+                .iter()
+                .map(|name| (OsString::from(name), self.dirs.contains_key(&path.join(name))))
+                .collect();
+            out.sort();
+            Ok(Some(out))
+        }
+    }
+
+    #[test]
+    fn a_package_is_every_file_but_hidden_ones_and_its_target() {
+        let mut inputs = Fixed {
+            files: [
+                ("/p/build.rs".into(), [1; 32]),
+                ("/p/src/lib.rs".into(), [2; 32]),
+                ("/p/target/x".into(), [3; 32]),
+                ("/p/.git/HEAD".into(), [4; 32]),
+            ]
+            .into(),
+            dirs: [
+                ("/p".into(), vec!["build.rs", "src", "target", ".git"]),
+                ("/p/src".into(), vec!["lib.rs"]),
+                ("/p/target".into(), vec!["x"]),
+                ("/p/.git".into(), vec!["HEAD"]),
+            ]
+            .into(),
+            env: Vec::new(),
+        };
+        let before = package(&mut inputs, Path::new("/p")).unwrap().unwrap();
+        inputs.files.insert("/p/target/x".into(), [9; 32]);
+        inputs.files.insert("/p/.git/HEAD".into(), [9; 32]);
+        assert_eq!(package(&mut inputs, Path::new("/p")).unwrap(), Some(before));
+        inputs.files.insert("/p/src/lib.rs".into(), [9; 32]);
+        assert_ne!(package(&mut inputs, Path::new("/p")).unwrap(), Some(before));
+        assert_eq!(package(&mut inputs, Path::new("/none")).unwrap(), None);
+        assert_eq!(package_of(&Path::new("/p").join(PACKAGE)), Some(Path::new("/p")));
+        assert_eq!(package_of(Path::new("/p/src")), None);
     }
 
     fn fixed() -> Fixed {

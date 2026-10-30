@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 
 use crate::cycle::{CycleRecoveryStrategy, IterationStamp, ProvisionalStatus};
 use crate::database::RawDatabase;
+use crate::fingerprint::Fingerprint;
 use crate::function::delete::DeletedEntries;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::ingredient::Ingredient;
@@ -81,6 +82,15 @@ pub unsafe trait Configuration: Any {
     ///
     /// This invokes user code in form of the `Eq` impl.
     fn values_equal<'db>(old_value: &Self::Output<'db>, new_value: &Self::Output<'db>) -> bool;
+
+    /// The stable hash of a value, kept with the memo when its value is evicted, or `None` when
+    /// the output has no stable hash and the memo is fingerprinted by revision instead. Values
+    /// that [`values_equal`](Self::values_equal) calls equal must have equal fingerprints.
+    ///
+    /// This invokes user code in form of the `Hash` impl.
+    fn fingerprint(_value: &Self::Output<'_>) -> Option<Fingerprint> {
+        None
+    }
 
     /// Convert from the id used internally to the value that execute is expecting.
     /// This is a no-op if the input to the function is a salsa struct.
@@ -310,6 +320,49 @@ where
         self.eviction.set_capacity(capacity);
     }
 
+    /// Drops the values of the function ingredient at `index`: of the memos for `keys`, or of
+    /// every memo when `keys` is `None`. Each memo keeps its fingerprint and dependency edges, so
+    /// a later read computes the value again and, when the output has a value fingerprint equal
+    /// to the kept one, backdates it and nothing that read it runs again. Memos whose values
+    /// can't be computed again (assigned by `specify`, with untracked reads, or provisional) keep
+    /// their values. Returns how many values were dropped.
+    pub fn evict_values(zalsa: &mut Zalsa, index: IngredientIndex, keys: Option<&[Id]>) -> usize
+    where
+        C::Eviction: HasCapacity,
+    {
+        let (ingredient, runtime) = zalsa.lookup_ingredient_mut(index);
+        let ingredient = ingredient.assert_type_mut::<Self>();
+        let table = runtime.table_mut();
+        let mut evicted = 0;
+        match keys {
+            Some(keys) => {
+                for &id in keys {
+                    let memo_ingredient_index =
+                        ingredient.memo_ingredient_indices.get(table.ingredient_index(id));
+                    evicted += usize::from(Self::evict_value_from_memo_for(
+                        table.memos_mut(id),
+                        memo_ingredient_index,
+                    ));
+                }
+            }
+            None => table.for_each_memo_table_mut::<Memo<C>>(
+                |struct_ingredient| {
+                    ingredient
+                        .memo_ingredient_indices
+                        .get_checked(struct_ingredient)
+                },
+                |memos, memo_ingredient_index| {
+                    evicted += usize::from(Self::evict_value_from_memo_for(
+                        memos,
+                        memo_ingredient_index,
+                    ));
+                },
+            ),
+        }
+        ingredient.deleted_entries.clear();
+        evicted
+    }
+
     /// Returns a reference to the memo value that lives as long as self.
     /// This is UNSAFE: the caller is responsible for ensuring that the
     /// memo will not be released so long as the `&self` is valid.
@@ -508,7 +561,7 @@ where
             Self::evict_value_from_memo_for(
                 table.memos_mut(evict),
                 self.memo_ingredient_indices.get(ingredient_index),
-            )
+            );
         });
 
         self.deleted_entries.clear();

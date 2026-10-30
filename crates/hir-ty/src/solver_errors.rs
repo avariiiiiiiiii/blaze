@@ -25,13 +25,13 @@ use crate::{
     },
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, TypeVisitable, TypeFoldable)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
 pub struct SolverDiagnostic {
     pub span: Span,
     pub kind: SolverDiagnosticKind,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, TypeVisitable, TypeFoldable)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
 pub enum SolverDiagnosticKind {
     TraitUnimplemented {
         trait_predicate: StoredTraitPredicate,
@@ -49,7 +49,7 @@ pub enum SolverDiagnosticKind {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, TypeVisitable, TypeFoldable)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
 pub struct StoredTraitPredicate {
     pub trait_ref: StoredTraitRef,
     pub polarity: PredicatePolarity,

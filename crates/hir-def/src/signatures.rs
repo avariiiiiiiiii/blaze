@@ -25,7 +25,7 @@ use crate::{
     TypeAliasId, UnionId, VariantId,
     attrs::AttrFlags,
     expr_store::{
-        Body, ExpressionStore, ExpressionStoreBuilder, ExpressionStoreSourceMap,
+        ExpressionStore, ExpressionStoreBuilder, ExpressionStoreSourceMap,
         lower::{
             ExprCollector, lower_function, lower_generic_params, lower_trait, lower_type_alias,
         },
@@ -1079,6 +1079,10 @@ pub struct InactiveEnumVariantCode {
 #[derive(Debug, Clone)]
 pub struct EnumVariants {
     pub variants: FxIndexMap<Name, (EnumVariantId, FieldsShape)>,
+    /// For each of [`EnumVariants::variants`], at the same index, whether it is written with
+    /// an explicit discriminant (`= expr`): rustc's `VariantDiscr::Explicit`, read off the
+    /// syntax, so that nothing a signature asks lowers the discriminant's body.
+    explicit_discriminant: Box<[bool]>,
 }
 
 // The order of the variants is part of the enum: discriminants and layout follow it. Two
@@ -1087,6 +1091,7 @@ impl PartialEq for EnumVariants {
     fn eq(&self, other: &Self) -> bool {
         self.variants.len() == other.variants.len()
             && self.variants.iter().eq(other.variants.iter())
+            && self.explicit_discriminant == other.explicit_discriminant
     }
 }
 
@@ -1105,44 +1110,66 @@ impl EnumVariants {
 
         let mut diagnostics = ThinVec::new();
         let cfg_options = loc.container.krate(db).cfg_options(db);
-        let Some(variants) = source.value.variant_list() else {
-            return (EnumVariants { variants: FxIndexMap::default() }, ThinVec::new());
+        let Some(list) = source.value.variant_list() else {
+            let variants = FxIndexMap::default();
+            let explicit_discriminant = Box::default();
+            return (EnumVariants { variants, explicit_discriminant }, ThinVec::new());
         };
-        let mut variants = variants
-            .variants()
-            .filter_map(|variant| {
-                let ast_id = ast_id_map.ast_id(&variant);
-                match AttrFlags::is_cfg_enabled_for(&variant, cfg_options) {
-                    Ok(()) => {
-                        let name = as_name_opt(variant.name());
-                        let enum_variant = EnumVariantLoc {
-                            id: source.with_value(ast_id),
-                            parent: e,
-                            name: name.clone(),
-                        }
-                        .intern(db);
-                        let shape = adt_shape(variant.kind());
-                        Some((name, (enum_variant, shape)))
-                    }
-                    Err(cfg) => {
-                        diagnostics.push(InactiveEnumVariantCode {
-                            ast_id,
-                            cfg,
-                            opts: cfg_options.clone(),
-                        });
-                        None
+        let mut variants = FxIndexMap::default();
+        let mut explicit_discriminant = Vec::new();
+        for variant in list.variants() {
+            let ast_id = ast_id_map.ast_id(&variant);
+            match AttrFlags::is_cfg_enabled_for(&variant, cfg_options) {
+                Ok(()) => {
+                    let name = as_name_opt(variant.name());
+                    let id = source.with_value(ast_id);
+                    let enum_variant = EnumVariantLoc { id, parent: e, name: name.clone() }.intern(db);
+                    let shape = adt_shape(variant.kind());
+                    // The expression the variant's body is lowered from, when it has one.
+                    let explicit = variant.const_arg().and_then(|it| it.expr()).is_some();
+                    // A name written twice keeps its first place and the last variant's value.
+                    match variants.insert_full(name, (enum_variant, shape)) {
+                        (index, Some(_)) => explicit_discriminant[index] = explicit,
+                        (_, None) => explicit_discriminant.push(explicit),
                     }
                 }
-            })
-            .collect::<FxIndexMap<_, _>>();
+                Err(cfg) => {
+                    diagnostics.push(InactiveEnumVariantCode {
+                        ast_id,
+                        cfg,
+                        opts: cfg_options.clone(),
+                    });
+                }
+            }
+        }
         variants.shrink_to_fit();
         diagnostics.shrink_to_fit();
 
-        (EnumVariants { variants }, diagnostics)
+        let explicit_discriminant = explicit_discriminant.into();
+        (EnumVariants { variants, explicit_discriminant }, diagnostics)
     }
 }
 
 impl EnumVariants {
+    /// Whether `variant` is written with an explicit discriminant, `= expr`. Read off the
+    /// syntax when the variants are lowered; its body is not lowered.
+    pub fn has_explicit_discriminant(&self, variant: EnumVariantId) -> bool {
+        self.variants
+            .values()
+            .position(|&(it, _)| it == variant)
+            .is_some_and(|index| self.explicit_discriminant[index])
+    }
+
+    /// Each variant with whether it is written with an explicit discriminant.
+    pub fn with_explicit_discriminant(
+        &self,
+    ) -> impl Iterator<Item = (EnumVariantId, FieldsShape, bool)> + '_ {
+        self.variants
+            .values()
+            .zip(self.explicit_discriminant.iter())
+            .map(|(&(id, shape), &explicit)| (id, shape, explicit))
+    }
+
     pub fn variant(&self, name: &Name) -> Option<EnumVariantId> {
         self.variants.get(name).map(|&(id, _)| id)
     }
@@ -1155,7 +1182,7 @@ impl EnumVariants {
 
     // [Adopted from rustc](https://github.com/rust-lang/rust/blob/bd53aa3bf7a24a70d763182303bd75e5fc51a9af/compiler/rustc_middle/src/ty/adt.rs#L446-L448)
     pub fn is_payload_free(&self, db: &dyn SourceDatabase) -> bool {
-        self.variants.values().all(|&(v, shape)| {
+        self.with_explicit_discriminant().all(|(v, shape, explicit)| {
             // The condition check order is slightly modified from rustc
             // to improve performance by early returning with relatively fast checks
 
@@ -1166,9 +1193,7 @@ impl EnumVariants {
                     return false;
                 }
 
-                let body = Body::of(db, v.into());
-                // A variant with explicit discriminant
-                if !matches!(body[body.root_expr()], crate::hir::Expr::Missing) {
+                if explicit {
                     return false;
                 }
             }

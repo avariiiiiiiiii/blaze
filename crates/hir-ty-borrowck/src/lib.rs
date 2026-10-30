@@ -11,6 +11,7 @@ extern crate rustc_type_ir;
 mod bitset;
 mod cfg;
 mod check;
+mod gate;
 mod inference;
 mod intervals;
 mod liveness;
@@ -45,6 +46,10 @@ use hir_ty::{
 
 use hir_ty_mir::mir::{
     LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceElem, PlaceTy, StoredPlace,
+};
+
+pub use gate::{
+    Checked, CheckedMir, Pending, Refused, Unchecked, UncheckedMir, checked, speculate,
 };
 
 /// Which of rustc's borrow checkers to match: the one stable Rust has, or the location
@@ -91,9 +96,10 @@ pub struct BorrowckDiagnostic {
 }
 
 impl BorrowckDiagnostic {
-    /// An error, which keeps the body out of any build (cargo's rule), not a lint.
+    /// An error, which keeps the body out of any build (cargo's rule), not a lint: rustc gives
+    /// some errors no code ("lifetime may not live long enough"), and a lint a lowercase name.
     pub fn is_error(&self) -> bool {
-        self.code.starts_with('E')
+        !self.code.starts_with(|it: char| it.is_ascii_lowercase())
     }
 }
 

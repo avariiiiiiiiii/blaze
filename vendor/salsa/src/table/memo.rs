@@ -285,6 +285,13 @@ impl MemoTableTypes {
         self.types.len()
     }
 
+    /// Whether memos of type `M` are registered at `memo_ingredient_index`.
+    pub(crate) fn holds<M: Memo>(&self, memo_ingredient_index: MemoIngredientIndex) -> bool {
+        self.types
+            .get(memo_ingredient_index.as_usize())
+            .is_some_and(|type_| type_.type_id == TypeId::of::<M>())
+    }
+
     /// # Safety
     ///
     /// The types table must be the correct one of `memos`.

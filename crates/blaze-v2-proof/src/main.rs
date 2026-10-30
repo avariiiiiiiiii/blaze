@@ -3,6 +3,9 @@
 //! one argument is a JSON value inline, the path of a file holding one, or `-` for stdin;
 //! `before`, the trace of the build before the incremental one, adds what it reran for
 //! nothing. Exits 1 when anything is stale, 2 when it could not compare.
+//!
+//! `blaze-v2-proof '{"first": "a", "second": "b"}'` compares two files byte for byte instead
+//! (`blaze_v2_proof::bytes`, by the CPU's SIMD) and prints where they first differ.
 
 use std::{
     fs,
@@ -14,6 +17,20 @@ use std::{
 use blaze_query::QueryKey;
 use blaze_v2_proof::{Stale, Trace, over, under};
 use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Given {
+    Traces(Input),
+    Files(Files),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Files {
+    first: PathBuf,
+    second: PathBuf,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +80,7 @@ fn found(stale: &Stale) -> Found {
     Found { what, query: name(&stale.query()), culprit: stale.is_culprit(), detail }
 }
 
-fn read_input(arg: &str) -> Result<Input, String> {
+fn read_input(arg: &str) -> Result<Given, String> {
     let text = if arg == "-" {
         let mut text = String::new();
         std::io::stdin().read_to_string(&mut text).map_err(|e| format!("stdin: {e}"))?;
@@ -73,7 +90,9 @@ fn read_input(arg: &str) -> Result<Input, String> {
     } else {
         fs::read_to_string(arg).map_err(|e| format!("{arg}: {e}"))?
     };
-    serde_json::from_str(&text).map_err(|e| format!("the input: {e}"))
+    serde_json::from_str(&text).map_err(|e| {
+        format!("the input: {{\"incremental\", \"scratch\", \"before\"?}} or {{\"first\", \"second\"}}: {e}")
+    })
 }
 
 fn trace(path: &Path) -> Result<Trace, String> {
@@ -96,13 +115,41 @@ fn compare(input: &Input) -> Result<Output, String> {
     Ok(Output { stale, culprits, work, needless })
 }
 
+fn compare_files(files: &Files) -> ExitCode {
+    match blaze_v2_proof::bytes::first_file_difference(&files.first, &files.second) {
+        Ok(at) => {
+            let simd = format!("{:?}", blaze_v2_proof::bytes::fastest());
+            println!("{}", serde_json::json!({ "differs_at": at, "simd": simd }));
+            if at.is_some() { ExitCode::from(1) } else { ExitCode::SUCCESS }
+        }
+        Err(e) => {
+            eprintln!("blaze-v2-proof: {} against {}: {e}", files.first.display(), files.second.display());
+            ExitCode::from(2)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [arg] = args.as_slice() else {
-        eprintln!("usage: blaze-v2-proof JSON (inline, a file's path, or -): {{\"incremental\", \"scratch\", \"before\"?}}");
+        eprintln!(
+            "usage: blaze-v2-proof JSON (inline, a file's path, or -): {{\"incremental\", \"scratch\", \"before\"?}} \
+             or {{\"first\", \"second\"}}"
+        );
         return ExitCode::from(2);
     };
-    match read_input(arg).and_then(|input| compare(&input)) {
+    let given = match read_input(arg) {
+        Ok(given) => given,
+        Err(e) => {
+            eprintln!("blaze-v2-proof: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let input = match given {
+        Given::Traces(input) => input,
+        Given::Files(files) => return compare_files(&files),
+    };
+    match compare(&input) {
         Ok(output) => {
             let stale = !output.stale.is_empty();
             println!("{}", serde_json::to_string_pretty(&output).expect("the output is JSON"));

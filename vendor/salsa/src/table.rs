@@ -12,6 +12,7 @@ use rustc_hash::FxHashMap;
 use crate::sync::atomic::{AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex};
 use crate::table::memo::{MemoTableTypes, MemoTableWithTypes, MemoTableWithTypesMut};
+use crate::zalsa::MemoIngredientIndex;
 use crate::{Id, IngredientIndex, Revision};
 
 pub(crate) mod memo;
@@ -397,6 +398,35 @@ impl Table {
         let memos = unsafe { &mut *(page.slot_vtable.memos_mut)(page.get(slot)) };
         // SAFETY: The `Page` keeps the correct memo types.
         unsafe { page.memo_types.attach_memos_mut(memos) }
+    }
+
+    /// Calls `f` with the memo table of every allocated slot on the pages that hold memos of type
+    /// `M` at the index `memo_index` returns for the page's ingredient.
+    pub(crate) fn for_each_memo_table_mut<M: memo::Memo>(
+        &mut self,
+        memo_index: impl Fn(IngredientIndex) -> Option<MemoIngredientIndex>,
+        mut f: impl FnMut(MemoTableWithTypesMut<'_>, MemoIngredientIndex),
+    ) {
+        for page_index in 0..self.pages.count() {
+            let Some(page) = self.pages.get_mut(page_index) else {
+                continue;
+            };
+            let Some(memo_ingredient_index) = memo_index(page.ingredient) else {
+                continue;
+            };
+            if !page.memo_types.holds::<M>(memo_ingredient_index) {
+                continue;
+            }
+            for slot in 0..*page.allocated.get_mut() {
+                let slot = page.get(SlotIndex::new(slot));
+                // SAFETY: `slot` points to an initialized slot of this page, whose vtable matches
+                // its slot type, and `&mut self` makes this the only access to it.
+                let memos = unsafe { &mut *(page.slot_vtable.memos_mut)(slot) };
+                // SAFETY: The `Page` keeps the correct memo types.
+                let memos = unsafe { page.memo_types.attach_memos_mut(memos) };
+                f(memos, memo_ingredient_index);
+            }
+        }
     }
 
     pub(crate) fn slots_of<T: Slot>(&self) -> impl Iterator<Item = (Id, &T)> + '_ {

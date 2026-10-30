@@ -13,10 +13,13 @@
 //! [`pool`] is the threads the plane's tasks run on, one per core, stealing work nearest first
 //! by [`topology`] (a CCD or a cluster, then a socket, then any). [`pump`] is the rule for a
 //! wait inside a task (#1301): the waiting thread runs other work, and a wait that would close
-//! a cycle is [`Cancelled`] and its task posted again.
+//! a cycle is [`Cancelled`] and its task posted again. [`build`] says a build's nodes:
+//! the workspace load, codegen with its store writes, links and test runs (docs/driver.md
+//! steps 4 to 7).
 
 pub mod admission;
 pub mod arena;
+pub mod build;
 pub mod exec;
 pub mod machine;
 pub mod plane;

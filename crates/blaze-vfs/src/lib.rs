@@ -34,7 +34,39 @@ use crate::{
 pub use crate::watch::{Watched, Watcher};
 
 pub const FILE_DOMAIN: &str = "blaze v2 vfs file 1";
-pub const DIR_DOMAIN: &str = "blaze v2 vfs directory 1";
+pub const DIR_DOMAIN: &str = "blaze v2 vfs directory 2";
+
+/// What kind of file an entry is, as git's tree says: hashed into the directory's entry with
+/// git's code, so a change of mode is a change of the tree while equal bytes stay one file. A
+/// symlink's bytes are its target.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum Mode {
+    Regular,
+    Executable,
+    Symlink,
+}
+
+impl Mode {
+    /// git's mode for it: `0o100644`, `0o100755`, `0o120000`.
+    pub const fn git(self) -> u32 {
+        match self {
+            Mode::Regular => 0o100644,
+            Mode::Executable => 0o100755,
+            Mode::Symlink => 0o120000,
+        }
+    }
+
+    /// The mode of a git tree entry that is a file; `None` for a directory, a submodule or
+    /// anything else. `0o100664`, which old gits wrote, is a regular file, as git reads it.
+    pub const fn from_git(mode: u32) -> Option<Mode> {
+        match mode {
+            0o100644 | 0o100664 => Some(Mode::Regular),
+            0o100755 => Some(Mode::Executable),
+            0o120000 => Some(Mode::Symlink),
+            _ => None,
+        }
+    }
+}
 
 /// A root a request builds. Its identity is its content ID; [`ViewId`] is the daemon's dense
 /// name for an open one.
@@ -47,19 +79,23 @@ pub struct View {
 /// input hashes, never by view.
 pub type ViewId = Idx<View>;
 
-/// A file of a view, read in place.
+/// A file of a view, read in place. A symlink is read as itself: its bytes are its target
+/// ([`Vfs::follow`] reads what it points to).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct File<'a> {
+    /// The hash of `bytes` alone: equal bytes of two modes are one ID.
     pub id: ContentId,
+    pub mode: Mode,
     pub bytes: &'a [u8],
 }
 
-/// A change to a list of files, applied all together or not at all.
+/// A change to a list of files, applied all together or not at all. Ops act on a symlink
+/// itself, never on what it points to.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Op {
-    /// The whole file, created with its directories if missing.
-    Write { path: String, bytes: Vec<u8> },
-    /// `len` bytes at `at` replaced by `bytes`, as an editor's change is.
+    /// The whole file with its mode, created with its directories if missing.
+    Write { path: String, bytes: Vec<u8>, mode: Mode },
+    /// `len` bytes at `at` replaced by `bytes`, as an editor's change is; the mode is kept.
     Edit { path: String, at: u64, len: u64, bytes: Vec<u8> },
     /// A file, or a directory with everything under it.
     Delete { path: String },
@@ -76,6 +112,9 @@ pub enum OpError {
     NotADirectory(String),
     Exists(String),
     OutOfRange { path: String, at: u64, len: u64, size: u64 },
+    /// The symlink at `path` points outside the tree (an absolute target, or `..` past the
+    /// root) or into a loop of symlinks.
+    BadLink { path: String, target: String },
 }
 
 impl fmt::Display for OpError {
@@ -88,6 +127,9 @@ impl fmt::Display for OpError {
             OpError::Exists(path) => write!(f, "{path} is already there"),
             OpError::OutOfRange { path, at, len, size } => {
                 write!(f, "{path} has {size} bytes, so {len} at {at} are not in it")
+            }
+            OpError::BadLink { path, target } => {
+                write!(f, "{path} is a symlink to {target:?}, which leaves the tree or loops")
             }
         }
     }
@@ -263,9 +305,19 @@ impl Vfs {
 
     /// The file at `path` in `view`; `None` for none, or a directory.
     pub fn read(&self, view: ViewId, path: &str) -> Option<File<'_>> {
-        let node = self.tree.lookup(self.open_root(view), path)?;
+        let (node, mode) = self.tree.entry(self.open_root(view), path)?;
         let bytes = self.tree.bytes(node)?;
-        Some(File { id: self.tree.id(node), bytes })
+        Some(File { id: self.tree.id(node), mode, bytes })
+    }
+
+    /// The file at `path` in `view` with every symlink on the way followed, as the system opens
+    /// a path (a relative target is taken from the link's directory); `Ok(None)` for none, or a
+    /// directory. A link out of the tree or into a loop is [`OpError::BadLink`].
+    pub fn follow(&self, view: ViewId, path: &str) -> Result<Option<File<'_>>, OpError> {
+        let Some((node, mode)) = self.tree.resolve(self.open_root(view), path)? else {
+            return Ok(None);
+        };
+        Ok(self.tree.bytes(node).map(|bytes| File { id: self.tree.id(node), mode, bytes }))
     }
 
     /// The content ID of what is at `path` in `view`, a file or a directory.
@@ -280,7 +332,9 @@ impl Vfs {
         Some(
             entries
                 .iter()
-                .map(|&(name, child)| (self.tree.name_str(name).to_owned(), self.tree.is_dir(child)))
+                .map(|&(name, child, _)| {
+                    (self.tree.name_str(name).to_owned(), self.tree.is_dir(child))
+                })
                 .collect(),
         )
     }

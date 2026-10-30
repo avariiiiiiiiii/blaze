@@ -432,7 +432,20 @@ pub fn where_predicate_must_hold<'db>(
     }
 }
 
+/// Whether the inherent impl `impl_id` may be written in the crate of `def_map`. The answer
+/// depends on the impl, that crate and whether it is `#![rustc_coherence_is_core]`, and is
+/// kept per impl.
 pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id: ImplId) -> bool {
+    inherent_impl_coherent(db, impl_id, def_map.krate(), def_map.is_rustc_coherence_is_core())
+}
+
+#[salsa::tracked]
+fn inherent_impl_coherent(
+    db: &dyn HirDatabase,
+    impl_id: ImplId,
+    krate: Crate,
+    rustc_coherence_is_core: bool,
+) -> bool {
     let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
     let self_ty = self_ty.kind();
     let impl_allowed = match self_ty {
@@ -448,12 +461,12 @@ pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id
         | TyKind::Char
         | TyKind::Int(_)
         | TyKind::Uint(_)
-        | TyKind::Float(_) => def_map.is_rustc_coherence_is_core(),
+        | TyKind::Float(_) => rustc_coherence_is_core,
 
-        TyKind::Adt(adt_def, _) => adt_def.def_id().module(db).krate(db) == def_map.krate(),
-        TyKind::Dynamic(it, _) => it
-            .principal_def_id()
-            .is_some_and(|trait_id| trait_id.0.module(db).krate(db) == def_map.krate()),
+        TyKind::Adt(adt_def, _) => adt_def.def_id().module(db).krate(db) == krate,
+        TyKind::Dynamic(it, _) => {
+            it.principal_def_id().is_some_and(|trait_id| trait_id.0.module(db).krate(db) == krate)
+        }
 
         _ => true,
     };
@@ -517,6 +530,15 @@ pub fn is_inherent_impl_coherent(db: &dyn HirDatabase, def_map: &DefMap, impl_id
 ///   - At least one of the types `T0..=Tn` must be a local type. Let `Ti` be the first such type.
 ///   - No uncovered type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)
 pub fn check_orphan_rules<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool {
+    orphan_rules_hold(db, impl_)
+}
+
+#[salsa::tracked]
+fn orphan_rules_hold(db: &dyn HirDatabase, impl_: ImplId) -> bool {
+    check_orphan_rules_uncached(db, impl_)
+}
+
+fn check_orphan_rules_uncached<'db>(db: &'db dyn HirDatabase, impl_: ImplId) -> bool {
     let Some(impl_trait) = db.impl_trait(impl_) else {
         // not a trait impl
         return true;

@@ -107,20 +107,83 @@ impl Default for Faults {
     }
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct SimFile {
     /// What survives a crash.
     durable: Vec<u8>,
-    /// Appended since the last sync that covered it; read as part of the file, lost (in part)
-    /// by a crash.
-    volatile: Vec<u8>,
+    /// What changed it since the last sync that covered it, in order; read as part of the
+    /// file, lost (in part) by a crash.
+    ops: Vec<Op>,
+    mode: u32,
+}
+
+impl Default for SimFile {
+    fn default() -> SimFile {
+        SimFile { durable: Vec::new(), ops: Vec::new(), mode: 0o644 }
+    }
+}
+
+impl SimFile {
+    fn whole(bytes: Vec<u8>) -> SimFile {
+        SimFile { durable: bytes, ..SimFile::default() }
+    }
+
+    fn contents(&self) -> Vec<u8> {
+        let mut bytes = self.durable.clone();
+        for op in &self.ops {
+            op.apply(&mut bytes);
+        }
+        bytes
+    }
+
+    /// The first `covers` of its changes made durable.
+    fn sync(&mut self, covers: usize) {
+        let covered: Vec<Op> = self.ops.drain(..covers.min(self.ops.len())).collect();
+        for op in &covered {
+            op.apply(&mut self.durable);
+        }
+    }
+}
+
+/// A change to a file not yet synced.
+#[derive(Clone, Debug)]
+enum Op {
+    Append(Vec<u8>),
+    At(u64, Vec<u8>),
+    Cut(u64),
+}
+
+impl Op {
+    fn apply(&self, bytes: &mut Vec<u8>) {
+        match self {
+            Op::Append(more) => bytes.extend_from_slice(more),
+            Op::At(at, more) => {
+                let at = *at as usize;
+                if bytes.len() < at + more.len() {
+                    bytes.resize(at + more.len(), 0);
+                }
+                bytes[at..at + more.len()].copy_from_slice(more);
+            }
+            Op::Cut(len) => bytes.resize(*len as usize, 0),
+        }
+    }
+
+    /// The change cut short, as a power cut leaves a write it was in the middle of.
+    fn torn(&self, rng: &mut Rng) -> Option<Op> {
+        let part = |more: &[u8], rng: &mut Rng| more[..rng.below(more.len() as u64) as usize].to_vec();
+        match self {
+            Op::Append(more) => Some(Op::Append(part(more, rng))),
+            Op::At(at, more) => Some(Op::At(*at, part(more, rng))),
+            Op::Cut(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct Pending {
     ready: Duration,
     effect: Effect,
-    /// For a sync: how many volatile bytes the file had when it was submitted.
+    /// For a sync: how many changes the file had not synced when it was submitted.
     covers: usize,
 }
 
@@ -216,8 +279,9 @@ impl Sim {
 
     /// The machine loses power: every effect in flight is gone without a completion, every
     /// watch, process, listen and connection with it, and each file keeps what was synced plus
-    /// a random prefix of what was appended after. A whole-file write that completed is kept
-    /// whole; one in flight is not there.
+    /// a random prefix of the changes after (appends, writes at an offset, truncations), the
+    /// last of which may be torn. A whole-file write or rename that completed is kept whole;
+    /// one in flight is not there.
     pub fn crash(&mut self) {
         self.pending.clear();
         self.watches.clear();
@@ -227,18 +291,24 @@ impl Sim {
         self.ends.clear();
         self.receiving.clear();
         for file in self.files.values_mut() {
-            let kept = self.rng.below(file.volatile.len() as u64 + 1) as usize;
-            file.durable.extend_from_slice(&file.volatile[..kept]);
-            file.volatile.clear();
+            let kept = self.rng.below(file.ops.len() as u64 + 1) as usize;
+            let torn = file.ops.get(kept).and_then(|op| op.torn(&mut self.rng));
+            file.sync(kept);
+            if let Some(torn) = torn {
+                torn.apply(&mut file.durable);
+            }
+            file.ops.clear();
         }
     }
 
     /// What a file holds now, synced or not.
     pub fn contents(&self, file: &FileName) -> Vec<u8> {
-        self.files
-            .get(file)
-            .map(|it| [it.durable.as_slice(), &it.volatile].concat())
-            .unwrap_or_default()
+        self.files.get(file).map(SimFile::contents).unwrap_or_default()
+    }
+
+    /// The file's permission bits, if it is there.
+    pub fn mode(&self, file: &FileName) -> Option<u32> {
+        self.files.get(file).map(|it| it.mode)
     }
 
     /// Whether the file is there.
@@ -249,8 +319,42 @@ impl Sim {
     /// The file made to hold `bytes`, durably, by something outside the state machine (a
     /// person's editor): watches of it hear of it.
     pub fn change(&mut self, file: &FileName, bytes: &[u8]) {
-        self.files.insert(file.clone(), SimFile { durable: bytes.to_vec(), volatile: Vec::new() });
+        self.files.insert(file.clone(), SimFile::whole(bytes.to_vec()));
         self.changed(file);
+    }
+
+    /// `to` made with `from`'s contents and mode, durably: the simulation does not model
+    /// shared blocks or a link's shared inode.
+    fn copy(&mut self, from: &FileName, to: &FileName) {
+        let mode = self.files[from].mode;
+        let bytes = self.contents(from);
+        self.files.insert(to.clone(), SimFile { mode, ..SimFile::whole(bytes) });
+        self.changed(to);
+    }
+
+    /// The files under `dir` and the directories they imply, as a disk would list them. As for
+    /// a stat, a directory is there while some file is under it.
+    fn list(&self, dir: &FileName) -> Done {
+        if self.files.contains_key(dir) {
+            return Done::Failed(IoError(format!("{dir}: not a directory")));
+        }
+        let mut found = BTreeMap::new();
+        for (file, sim) in self.files.iter().filter(|(it, _)| it.is_under(dir)) {
+            let rest = &file.as_str()[dir.as_str().len() + 1..];
+            for (at, _) in rest.match_indices('/') {
+                let inner =
+                    FileName::new(&format!("{dir}/{}", &rest[..at])).expect("a part of a name");
+                found.entry(inner).or_insert(Meta { len: 0, dir: true, modified_ns: 0 });
+            }
+            found.insert(
+                file.clone(),
+                Meta { len: sim.contents().len() as u64, dir: false, modified_ns: 0 },
+            );
+        }
+        if found.is_empty() {
+            return Done::Failed(IoError(format!("{dir}: no such directory")));
+        }
+        Done::Listed(found.into_iter().collect())
     }
 
     /// The file removed by something outside the state machine.
@@ -378,8 +482,8 @@ impl Sim {
                 self.files
                     .entry(file.clone())
                     .or_default()
-                    .volatile
-                    .extend_from_slice(&bytes[..torn]);
+                    .ops
+                    .push(Op::Append(bytes[..torn].to_vec()));
                 if torn > 0 {
                     self.changed(&file.clone());
                 }
@@ -394,34 +498,48 @@ impl Sim {
                 Done::Read(all[at..(at + len).min(all.len())].to_vec())
             }
             Effect::Append { file, bytes, .. } => {
-                self.files.entry(file.clone()).or_default().volatile.extend_from_slice(&bytes);
+                self.files.entry(file.clone()).or_default().ops.push(Op::Append(bytes));
                 self.changed(&file);
                 Done::Appended
             }
             Effect::Sync { file, .. } => {
-                let file = self.files.entry(file).or_default();
-                let covered = pending.covers.min(file.volatile.len());
-                file.durable.extend(file.volatile.drain(..covered));
+                self.files.entry(file).or_default().sync(pending.covers);
                 Done::Synced
             }
-            // Simpler than a disk: the cut is not undone by a crash before the next sync.
             Effect::Truncate { file, len, .. } => {
-                let sim = self.files.entry(file.clone()).or_default();
-                let len = len as usize;
-                if len <= sim.durable.len() {
-                    sim.durable.truncate(len);
-                    sim.volatile.clear();
-                } else {
-                    sim.volatile.truncate(len - sim.durable.len());
-                }
+                self.files.entry(file.clone()).or_default().ops.push(Op::Cut(len));
                 self.changed(&file);
                 Done::Truncated
             }
             Effect::Write { file, bytes, .. } => {
-                self.files.insert(file.clone(), SimFile { durable: bytes, volatile: Vec::new() });
+                self.files.insert(file.clone(), SimFile::whole(bytes));
                 self.changed(&file);
                 Done::Written
             }
+            Effect::WriteAt { file, at, bytes, .. } => match self.files.get_mut(&file) {
+                Some(sim) => {
+                    sim.ops.push(Op::At(at, bytes));
+                    self.changed(&file);
+                    Done::Written
+                }
+                None => Done::Failed(IoError(format!("{file}: no such file"))),
+            },
+            Effect::Rename { from, to, .. } => match self.files.remove(&from) {
+                Some(sim) => {
+                    self.files.insert(to.clone(), sim);
+                    self.changed(&from);
+                    self.changed(&to);
+                    Done::Renamed
+                }
+                None => Done::Failed(IoError(format!("{from}: no such file"))),
+            },
+            Effect::Mode { file, mode, .. } => match self.files.get_mut(&file) {
+                Some(sim) => {
+                    sim.mode = mode;
+                    Done::Moded
+                }
+                None => Done::Failed(IoError(format!("{file}: no such file"))),
+            },
             Effect::Clone { from, to, .. } | Effect::Link { from, to, .. }
                 if !self.files.contains_key(&from) =>
             {
@@ -436,20 +554,16 @@ impl Sim {
                 Done::Failed(IoError(format!("{to}: already there")))
             }
             Effect::Clone { from, to, .. } => {
-                let bytes = self.contents(&from);
-                self.files.insert(to.clone(), SimFile { durable: bytes, volatile: Vec::new() });
-                self.changed(&to);
+                self.copy(&from, &to);
                 Done::Cloned
             }
             Effect::Link { from, to, .. } => {
-                let bytes = self.contents(&from);
-                self.files.insert(to.clone(), SimFile { durable: bytes, volatile: Vec::new() });
-                self.changed(&to);
+                self.copy(&from, &to);
                 Done::Linked
             }
             Effect::Stat { file, .. } => Done::Stat(match self.files.get(&file) {
                 Some(it) => Some(Meta {
-                    len: (it.durable.len() + it.volatile.len()) as u64,
+                    len: it.contents().len() as u64,
                     dir: false,
                     modified_ns: 0,
                 }),
@@ -458,6 +572,7 @@ impl Sim {
                 }
                 None => None,
             }),
+            Effect::List { dir, .. } => self.list(&dir),
             Effect::Remove { file, .. } => {
                 if self.files.remove(&file).is_some() {
                     self.changed(&file);
@@ -639,7 +754,7 @@ impl Driver for Sim {
                 _ => self.delay(),
             };
             let covers = match &effect {
-                Effect::Sync { file, .. } => self.files.get(file).map_or(0, |it| it.volatile.len()),
+                Effect::Sync { file, .. } => self.files.get(file).map_or(0, |it| it.ops.len()),
                 _ => 0,
             };
             self.pending.push(Pending { ready: self.now + delay, effect, covers });
@@ -753,11 +868,66 @@ mod tests {
         run_until_idle(&mut sim, &mut effects, |_, _| {});
         sim.submit(&mut vec![Effect::Sync { file: file.clone(), tag: Tag(1) }]);
         // Appended after the sync was asked for, completed before it.
-        sim.files.get_mut(&file).unwrap().volatile.extend_from_slice(b"b");
+        sim.files.get_mut(&file).unwrap().ops.push(Op::Append(b"b".to_vec()));
         let mut out = Vec::new();
         sim.poll(&mut out, Duration::ZERO);
         let file = &sim.files[&file];
-        assert_eq!((file.durable.as_slice(), file.volatile.as_slice()), (&b"a"[..], &b"b"[..]));
+        assert_eq!((file.durable.as_slice(), file.contents().as_slice()), (&b"a"[..], &b"ab"[..]));
+    }
+
+    /// A write at an offset over synced bytes is lost or kept, maybe torn, by a crash, never
+    /// anything else; once synced it is kept. Rename and mode take effect at once.
+    #[test]
+    fn a_write_at_an_offset_is_durable_after_its_sync_on_every_seed() {
+        let file = FileName::new("out/app").unwrap();
+        for seed in 0..300 {
+            let mut sim = Sim::new(seed, Faults::default());
+            let mut effects = vec![Effect::Write {
+                file: file.clone(),
+                bytes: b"aaaa".to_vec(),
+                tag: Tag(0),
+            }];
+            run_until_idle(&mut sim, &mut effects, |_, _| {});
+            let synced = seed % 2 == 0;
+            let mut effects = vec![Effect::WriteAt {
+                file: file.clone(),
+                at: 2,
+                bytes: b"bbbb".to_vec(),
+                tag: Tag(1),
+            }];
+            run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
+            assert_eq!(sim.contents(&file), b"aabbbb");
+            if synced {
+                let mut effects = vec![Effect::Sync { file: file.clone(), tag: Tag(2) }];
+                run_until_idle(&mut sim, &mut effects, |_, _| {});
+            }
+            sim.crash();
+            let after = sim.contents(&file);
+            if synced {
+                assert_eq!(after, b"aabbbb", "seed {seed}");
+            } else {
+                // Some first part of the bbbb landed over aaaa, lengthening it past its end.
+                let landed = after.iter().skip(2).take_while(|&&b| b == b'b').count();
+                let mut want = b"aaaa".to_vec();
+                Op::At(2, vec![b'b'; landed]).apply(&mut want);
+                assert_eq!(after, want, "seed {seed}");
+            }
+        }
+        let mut sim = Sim::new(1, Faults::default());
+        let to = FileName::new("out/app.new").unwrap();
+        let mut effects = vec![Effect::Write { file: to.clone(), bytes: b"new".to_vec(), tag: Tag(0) }];
+        run_until_idle(&mut sim, &mut effects, |_, _| {});
+        let mut effects = vec![Effect::Mode { file: to.clone(), mode: 0o755, tag: Tag(1) }];
+        run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Moded));
+        let mut effects = vec![Effect::Rename { from: to.clone(), to: file.clone(), tag: Tag(2) }];
+        run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Renamed));
+        sim.crash();
+        assert_eq!(
+            (sim.contents(&file), sim.mode(&file), sim.exists(&to)),
+            (b"new".to_vec(), Some(0o755), false),
+        );
+        let mut effects = vec![Effect::WriteAt { file: to, at: 0, bytes: vec![1], tag: Tag(3) }];
+        run_until_idle(&mut sim, &mut effects, |it, _| assert!(matches!(it.done, Done::Failed(_))));
     }
 
     /// A whole-file write is all or nothing over a crash at any point, on every seed.

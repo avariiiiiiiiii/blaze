@@ -50,6 +50,7 @@
 pub mod assoc;
 pub mod attr_resolution;
 mod collector;
+pub mod demand;
 pub mod diagnostics;
 pub mod frozen;
 pub use hir_expand::proc_macro::may_have_session_macros;
@@ -57,6 +58,8 @@ mod mod_resolution;
 mod path_resolution;
 pub mod proc_macro;
 
+#[cfg(test)]
+mod demand_tests;
 #[cfg(test)]
 mod tests;
 

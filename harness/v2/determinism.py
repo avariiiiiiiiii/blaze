@@ -1,6 +1,6 @@
 """determinism.py: every corpus build twice, on different core counts, byte for byte the same
-(docs/v2/README.md section 1, "Deterministic", and docs/v2/proof.md). Linux only: a build is pinned to its cores with
-the scheduler's affinity, as `taskset -c` pins one.
+(docs/v2/README.md section 1, "Deterministic", and docs/v2/proof.md). Linux only: a build is
+pinned to its cores with the scheduler's affinity, as `taskset -c` pins one.
 
     uv run --frozen python harness/v2/determinism.py '{"engine": {"kind": "v1", "blaze": "target/release/blaze"}, "out": "/tmp/determinism.json"}'
     uv run --frozen python harness/v2/determinism.py '{"engine": {...}, "out": "...", "projects": ["ripgrep", "just", "fd"], "cores_a": 4}'
@@ -14,9 +14,9 @@ The input is one JSON object (inline, a file's path, or `-`):
                   directory under /tmp when empty
     projects      the projects of bench.PROJECTS built, at their pinned revisions (ripgrep, just;
                   name more to build more)
-    fixture       also the oracle's fixture, harness/v2/fixture.py's `write_workspace(dir, seed)`
-                  (true); an outcome says so when that is not there yet
-    fixture_seed  the seed the fixture is written with (0)
+    fixture       also the oracle's fixture (harness/v2/fixture.py), built with the environment
+                  its state asks for (true)
+    fixture_seed  its state: "base" for the default one, any other seed for a random one ("base")
     profiles      dev, release or both (both)
     cores_a       the cores of the first build (2)
     cores_b       the cores of the second (0: every core this script may run on); not cores_a
@@ -28,11 +28,10 @@ empty home, store and target directory and its own daemon, the first pinned to t
 `engine.outputs` of both (every program and library a build delivers, by its sha256). One
 outcome per (project, profile): pass when both builds delivered the same files with the same
 bytes; fail naming each file that differs and where (`engine.first_difference`), or that is in
-one build only, or when a build failed or was not blaze's. `selftest` checks the comparison and
-the choice of cores without blaze, cargo or the network.
+one build only, or when a build failed or was not blaze's. `selftest` checks the comparison, the
+choice of cores and the fixture's workspace and environment without blaze, cargo or the network.
 """
 
-import importlib
 import os
 import shutil
 import sys
@@ -41,7 +40,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, cast, get_args
+from typing import Literal, get_args
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -49,6 +48,7 @@ from typed_input import fail, parse
 import engine
 import report
 import budgets
+import fixture
 
 SCRIPT = "determinism.py"
 Profile = Literal["dev", "release"]
@@ -62,7 +62,7 @@ class Input:
     work: str = ""
     projects: tuple[str, ...] = ("ripgrep", "just")
     fixture: bool = True
-    fixture_seed: int = 0
+    fixture_seed: str = "base"
     profiles: tuple[Profile, ...] = get_args(Profile)
     cores_a: int = 2
     cores_b: int = 0
@@ -72,13 +72,15 @@ class Input:
 @dataclass(frozen=True)
 class Subject:
     """What is built: a tree copied afresh for each build, its workspace (`sub`, a directory of
-    it or ""), the arguments of `blaze build` and the environment it needs."""
+    it or ""), the arguments of `blaze build`, the environment it needs and a directory put in
+    front of PATH (or none)."""
 
     label: str
     source: Path
     sub: str = ""
     build: tuple[str, ...] = ()
     env: dict[str, str] = field(default_factory=dict[str, str])
+    path_front: Path | None = None
 
 
 def cpu_set(available: list[int], n: int) -> set[int]:
@@ -118,6 +120,8 @@ def pinned_build(eng: engine.Engine, subject: Subject, top: Path, profile: Profi
     shutil.copytree(subject.source, tree, symlinks=True, ignore=budgets.left_out)
     ws = tree / subject.sub if subject.sub else tree
     env = eng.env(home, store, None, subject.env)
+    if subject.path_front is not None:
+        env["PATH"] = f"{subject.path_front}{os.pathsep}{env['PATH']}"
     args = [*subject.build, *(["--release"] if profile == "release" else [])]
     step = f"{subject.label} {profile} on {len(cores)} cores"
     if sys.platform != "linux":
@@ -169,20 +173,22 @@ def compare(eng: engine.Engine, rep: report.Report, subject: Subject, top: Path,
             differing=len(found), **numbers)
 
 
-def fixture_subject(top: Path, seed: int) -> Subject | str:
-    """The oracle's fixture written once into `top/source`, or what keeps it from being written."""
-    try:
-        module = importlib.import_module("fixture")
-    except ImportError as e:
-        return f"harness/v2/fixture.py is not there yet ({e})"
-    write = getattr(module, "write_workspace", None)
-    if not callable(write):
-        return "harness/v2/fixture.py has no write_workspace(dir, seed)"
+def fixture_subject(top: Path, seed: str) -> Subject:
+    """The oracle's fixture in the state of `seed`, written once into `top/source`, with the
+    environment variables that state is built with and, where it asks for one, an empty
+    directory in front of PATH (as oracle.py builds it)."""
+    state = fixture.default_state() if seed == "base" else fixture.random_state(seed)
     source = top / "source"
     shutil.rmtree(source, ignore_errors=True)
     source.mkdir(parents=True)
-    cast(Callable[[Path, int], object], write)(source, seed)
-    return Subject(f"fixture (seed {seed})", source)
+    fixture.write(source, state)
+    want = fixture.environment(state)
+    env = {name: value for name in ("ORACLE_SCRIPT_VALUE", "ORACLE_SOURCE_ENV") if (value := want[name]) is not None}
+    front: Path | None = None
+    if want["PATH_EXTRA"]:
+        front = top / "path-extra"
+        front.mkdir(exist_ok=True)
+    return Subject(f"fixture ({seed})", source, env=env, path_front=front)
 
 
 def project_subject(name: str, top: Path) -> Subject:
@@ -220,7 +226,7 @@ def main(args: Input) -> None:
     work = Path(args.work or tempfile.mkdtemp(prefix="bz-determinism-", dir="/tmp")).resolve()
     work.mkdir(parents=True, exist_ok=True)
     print(f"work: {work}; cores {len(cores_a)} and {len(cores_b)}", flush=True)
-    subjects: list[tuple[str, Callable[[Path], Subject | str]]] = [
+    subjects: list[tuple[str, Callable[[Path], Subject]]] = [
         (name, lambda top, name=name: project_subject(name, top)) for name in dict.fromkeys(args.projects)]
     if args.fixture:
         subjects.append(("fixture", lambda top: fixture_subject(top, args.fixture_seed)))
@@ -236,9 +242,7 @@ def main(args: Input) -> None:
         shutil.rmtree(top, ignore_errors=True)
         top.mkdir(parents=True)
         subject = rep.guarded(f"{label}: setting up", lambda: budgets.failing(label, lambda: make(top)))
-        if isinstance(subject, str):
-            rep.add(f"{label}: setting up", "error", subject)
-        elif subject is not None:
+        if subject is not None:
             each(subject, top)
         if not args.keep:
             shutil.rmtree(top, ignore_errors=True)
@@ -265,6 +269,17 @@ def selftest() -> None:
            == [("b", "differs"), ("c", "only in the second build"), ("d", "only in the first build")],
            "every difference is named, in order")
     expect(profile_dir("dev") == "debug" and profile_dir("release") == "release", "profile directories")
+    with tempfile.TemporaryDirectory() as tmp:
+        for seed in ("base", "1"):
+            top = Path(tmp) / seed
+            top.mkdir()
+            subject = fixture_subject(top, seed)
+            state = fixture.default_state() if seed == "base" else fixture.random_state(seed)
+            want = fixture.environment(state)
+            expect((subject.source / "Cargo.toml").is_file(), f"fixture {seed}: the workspace is written")
+            expect(all(subject.env.get(name) == want[name] for name in ("ORACLE_SCRIPT_VALUE", "ORACLE_SOURCE_ENV")),
+                   f"fixture {seed}: its environment is {want}, not {subject.env}")
+            expect((subject.path_front is not None) == bool(want["PATH_EXTRA"]), f"fixture {seed}: PATH_EXTRA")
     print(f"{SCRIPT} selftest: ok")
 
 

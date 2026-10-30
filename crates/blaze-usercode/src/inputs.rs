@@ -19,6 +19,9 @@ use blaze_query::{Cancelled, Cx};
 
 use crate::trace::{DIRECTORY, Inputs, listing};
 
+/// What a traced path that is neither a file nor a directory hashes as.
+pub const SPECIAL: [u8; 32] = *b"blaze v2 traced: not a file\0\0\0\0\0";
+
 /// A path that is there and could not be read.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Unreadable {
@@ -128,6 +131,12 @@ impl Inputs for Disk {
         if meta.is_dir() {
             return Ok(Some(DIRECTORY));
         }
+        if !meta.is_file() {
+            // A pipe (the jobserver's), a socket or a device: reading it would take what is in
+            // it from whoever it is for, or never end. What comes out of one is no file's
+            // contents: the sandbox notes a read of the random devices as `T random`.
+            return Ok(Some(SPECIAL));
+        }
         let stamp = Stamp::of(&meta);
         if let Some((seen, hash)) = self.files.get(path)
             && *seen == stamp
@@ -145,17 +154,25 @@ impl Inputs for Disk {
     }
 
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
+        Ok(self.names(path)?.map(|names| listing(names.iter().map(|it| it.0.as_os_str()))))
+    }
+
+    fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, Unreadable> {
+        let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
             Err(error) if missing(&error) => return Ok(None),
-            Err(error) => return Err(Unreadable { path: path.to_owned(), error: error.to_string() }),
+            Err(error) => return Err(unreadable(error)),
         };
         let mut names = Vec::new();
         for entry in entries {
-            let entry = entry.map_err(|error| Unreadable { path: path.to_owned(), error: error.to_string() })?;
-            names.push(entry.file_name());
+            let entry = entry.map_err(unreadable)?;
+            // A link is what it leads to, as the program that opens it sees.
+            let dir = std::fs::metadata(entry.path()).is_ok_and(|it| it.is_dir());
+            names.push((entry.file_name(), dir));
         }
-        Ok(Some(listing(names.iter().map(OsString::as_os_str))))
+        names.sort();
+        Ok(Some(names))
     }
 
     fn env(&mut self, name: &OsStr) -> Option<OsString> {
@@ -240,6 +257,16 @@ impl Inputs for ViewInputs<'_, '_> {
     fn dir(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ViewError> {
         let Some(name) = self.in_view(path) else { return Ok(self.disk.dir(path)?) };
         Ok(self.cx.dir(&name)?.map(|entries| listing(entries.iter().map(|it| OsStr::new(&it.0)))))
+    }
+
+    fn names(&mut self, path: &Path) -> Result<Option<Vec<(OsString, bool)>>, ViewError> {
+        let Some(name) = self.in_view(path) else { return Ok(self.disk.names(path)?) };
+        Ok(self.cx.dir(&name)?.map(|entries| {
+            let mut names: Vec<(OsString, bool)> =
+                entries.into_iter().map(|(name, dir)| (OsString::from(name), dir)).collect();
+            names.sort();
+            names
+        }))
     }
 
     fn env(&mut self, name: &OsStr) -> Option<OsString> {

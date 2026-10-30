@@ -9,7 +9,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use crate::Meta;
+use crate::{FileName, Meta};
 
 static TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -53,6 +53,55 @@ pub(crate) fn commit_rename(from: &Path, to: &Path) -> io::Result<()> {
     sync_dir_of(to)
 }
 
+/// `from` renamed over `to`, made the new name durably; `from` is left as it was when the
+/// rename fails.
+pub(crate) fn rename(from: &Path, to: &Path) -> io::Result<()> {
+    make_parent(to)?;
+    std::fs::rename(from, to)?;
+    sync_dir_of(to)?;
+    match (from.parent(), to.parent()) {
+        (Some(was), Some(is)) if was != is => sync_dir_of(from),
+        _ => Ok(()),
+    }
+}
+
+/// `bytes` written at `at` of the file at `path`, which exists.
+pub(crate) fn write_at(path: &Path, at: u64, bytes: &[u8]) -> io::Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    #[cfg(unix)]
+    return std::os::unix::fs::FileExt::write_all_at(&file, bytes, at);
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < bytes.len() {
+            let n = std::os::windows::fs::FileExt::seek_write(
+                &file,
+                &bytes[done..],
+                at + done as u64,
+            )?;
+            if n == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{}: permission bits {mode:o} are of Unix only", path.display()),
+    ))
+}
+
 #[cfg(unix)]
 fn sync_dir_of(path: &Path) -> io::Result<()> {
     match path.parent() {
@@ -68,18 +117,51 @@ fn sync_dir_of(_: &Path) -> io::Result<()> {
 
 pub(crate) fn stat(path: &Path) -> io::Result<Option<Meta>> {
     match std::fs::metadata(path) {
-        Ok(meta) => Ok(Some(Meta {
-            len: meta.len(),
-            dir: meta.is_dir(),
-            modified_ns: meta
-                .modified()
-                .ok()
-                .and_then(|it| it.duration_since(UNIX_EPOCH).ok())
-                .map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX)),
-        })),
+        Ok(meta) => Ok(Some(meta_of(&meta))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn meta_of(meta: &std::fs::Metadata) -> Meta {
+    Meta {
+        len: meta.len(),
+        dir: meta.is_dir(),
+        modified_ns: meta
+            .modified()
+            .ok()
+            .and_then(|it| it.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX)),
+    }
+}
+
+/// Every file and directory under `dir` (named `name` under the root), sorted by name;
+/// symbolic links are not followed.
+pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Meta)>> {
+    let mut found = Vec::new();
+    let mut todo = vec![(dir.to_path_buf(), name.clone())];
+    while let Some((path, name)) = todo.pop() {
+        for entry in std::fs::read_dir(&path)
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?
+        {
+            let entry = entry?;
+            let file = entry.file_name();
+            let Some(file) = file.to_str().and_then(|it| FileName::new(&format!("{name}/{it}")))
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: a name that is not UTF-8", entry.path().display()),
+                ));
+            };
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            if meta.is_dir() {
+                todo.push((entry.path(), file.clone()));
+            }
+            found.push((file, meta_of(&meta)));
+        }
+    }
+    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    Ok(found)
 }
 
 pub(crate) fn remove(path: &Path) -> io::Result<()> {

@@ -2,8 +2,8 @@
 
 use base_db::Crate;
 use hir_def::{
-    AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ItemContainerId, ModuleDefId,
-    TypeAliasId,
+    AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId,
+    ModuleDefId, TraitId, TypeAliasId,
     attrs::AttrFlags,
     expr_store::Body,
     nameres::{DefMap, crate_def_map},
@@ -51,23 +51,17 @@ pub(crate) fn opaque_types_defined_by<'db>(
     };
 
     // Collect opaques from assoc items.
-    let extend_with_atpit_from_assoc_items = |assoc_items: &[(Name, AssocItemId)]| {
-        assoc_items
-            .iter()
-            .filter_map(|&(_, assoc_id)| match assoc_id {
-                AssocItemId::TypeAliasId(it) => Some(it),
-                AssocItemId::FunctionId(_) | AssocItemId::ConstId(_) => None,
-            })
-            .for_each(extend_with_taits);
+    let extend_with_atpit_from_assoc_items = |type_aliases: &[TypeAliasId]| {
+        type_aliases.iter().copied().for_each(extend_with_taits);
     };
     let extend_with_atpit_from_container = |container| match container {
         ItemContainerId::ImplId(impl_id)
             if ImplSignature::of(db, impl_id).target_trait.is_some() =>
         {
-            extend_with_atpit_from_assoc_items(&impl_id.impl_items(db).items);
+            extend_with_atpit_from_assoc_items(impl_type_aliases(db, impl_id));
         }
         ItemContainerId::TraitId(trait_id) => {
-            extend_with_atpit_from_assoc_items(&trait_id.trait_items(db).items);
+            extend_with_atpit_from_assoc_items(trait_type_aliases(db, trait_id));
         }
         _ => {}
     };
@@ -112,6 +106,37 @@ pub(crate) fn opaque_types_defined_by<'db>(
     }
 }
 
+impl SelfAndAssocBounds {
+    /// How many opaque types (`impl Trait`) the type of `type_alias` defines, numbered
+    /// `0..count` by their [`ImplTraitIdx`].
+    pub fn type_alias_opaque_count(db: &dyn HirDatabase, type_alias: TypeAliasId) -> usize {
+        SelfAndAssocBounds::type_alias_impl_traits(db, type_alias).len()
+    }
+}
+
+/// The associated types of an impl, in order: what a body in it reads of its items for the
+/// opaque types it may define. A function or constant added to the impl leaves this equal.
+#[salsa::tracked(returns(deref))]
+fn impl_type_aliases(db: &dyn HirDatabase, impl_id: ImplId) -> Box<[TypeAliasId]> {
+    type_aliases_of(&impl_id.impl_items(db).items)
+}
+
+/// As [`impl_type_aliases`], of a trait.
+#[salsa::tracked(returns(deref))]
+fn trait_type_aliases(db: &dyn HirDatabase, trait_id: TraitId) -> Box<[TypeAliasId]> {
+    type_aliases_of(&trait_id.trait_items(db).items)
+}
+
+fn type_aliases_of(items: &[(Name, AssocItemId)]) -> Box<[TypeAliasId]> {
+    items
+        .iter()
+        .filter_map(|&(_, assoc_id)| match assoc_id {
+            AssocItemId::TypeAliasId(it) => Some(it),
+            AssocItemId::FunctionId(_) | AssocItemId::ConstId(_) => None,
+        })
+        .collect()
+}
+
 // These are firewall queries to prevent drawing dependencies between infers:
 
 #[salsa::tracked(returns(ref))]
@@ -144,7 +169,7 @@ pub(crate) fn tait_hidden_types(
     let cause = ObligationCause::dummy();
     let param_env = db.trait_environment(type_alias.into());
 
-    let defining_bodies = tait_defining_bodies(db, loc);
+    let defining_bodies = tait_defining_bodies(db, type_alias, loc);
 
     let mut result = ArenaMap::with_capacity(taits_count);
     for defining_body in defining_bodies {
@@ -200,6 +225,7 @@ pub(crate) fn tait_hidden_types(
 
 fn tait_defining_bodies(
     db: &dyn HirDatabase,
+    type_alias: TypeAliasId,
     loc: &AssocItemLoc<ast::TypeAlias>,
 ) -> Vec<DefWithBodyId> {
     let from_assoc_items = |assoc_items: &[(Name, AssocItemId)]| {
@@ -225,10 +251,18 @@ fn tait_defining_bodies(
         _ => {}
     }
 
-    define_opaque_functions(db, loc.module(db).krate(db))
+    defining_functions(db, type_alias).iter().map(|&func| func.into()).collect()
+}
+
+/// The functions of the type alias's crate whose `#[define_opaque(..)]` names it: what its
+/// hidden types read of [`define_opaque_functions`], so another type alias's defining
+/// function added or removed leaves them as they were.
+#[salsa::tracked(returns(deref))]
+fn defining_functions(db: &dyn HirDatabase, type_alias: TypeAliasId) -> Box<[FunctionId]> {
+    define_opaque_functions(db, type_alias.loc(db).module(db).krate(db))
         .iter()
-        .filter(|&&func| defined_type_aliases(db, func).any(|alias| alias.loc(db) == loc))
-        .map(|&func| func.into())
+        .copied()
+        .filter(|&func| defined_type_aliases(db, func).any(|alias| alias == type_alias))
         .collect()
 }
 

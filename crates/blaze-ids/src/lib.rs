@@ -197,7 +197,8 @@ pub trait Interner<T>: Sync {
 /// [`Interner::content`] and [`Interner::find`] take no lock. A shard's table grows by
 /// copying into one twice its size, published once full; the tables it outgrew are kept until
 /// the interner is dropped, as a reader may be probing one, so the tables cost at most twice
-/// the last one.
+/// the last one. `intern`'s `value` runs with the shard locked, so it must not intern into the
+/// same interner.
 pub struct Sharded<T> {
     slots: Chunks<T>,
     next: AtomicU32,

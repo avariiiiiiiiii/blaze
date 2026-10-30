@@ -70,6 +70,16 @@ impl HygieneId {
     }
 }
 
+impl crate::hir::persist::Code for HygieneId {
+    fn put(&self, w: &mut crate::hir::persist::Words) {
+        self.0.put(w);
+    }
+
+    fn get(r: &mut crate::hir::persist::Read<'_>) -> Result<Self, blaze_format::FormatError> {
+        r.get().map(HygieneId)
+    }
+}
+
 pub type ExprPtr = AstPtr<ast::Expr>;
 pub type ExprSource = InFile<ExprPtr>;
 
@@ -117,24 +127,25 @@ struct ExpressionOnlyStore {
     pats: Arena<Pat>,
     bindings: Arena<Binding>,
     labels: Arena<Label>,
-    /// Id of the closure/coroutine/anon const that owns the corresponding binding. If a binding is owned by the
-    /// top level expression, it will not be listed in here.
-    binding_owners: FxHashMap<BindingId, ExprId>,
+    /// The closure/coroutine/anon const that owns each binding, by binding: [`NO_OWNER`] for a
+    /// binding the top level expression owns. Empty when it owns them all.
+    binding_owners: Box<[u32]>,
     /// Block expressions in this store that may contain inner items.
     block_scopes: Box<[BlockId]>,
 
-    /// A map from an variable usages to their hygiene ID.
+    /// The hygiene of variable usages whose hygiene is not the root's, by expression or pattern
+    /// in increasing order.
     ///
     /// Expressions (and destructuring patterns) that can be recorded here are single segment path, although not all single segments path refer
     /// to variables and have hygiene (some refer to items, we don't know at this stage).
-    ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
+    ident_hygiene: Box<[(ExprOrPatIdPacked, HygieneId)]>,
 
-    /// The edition of each block that a macro wrote: it is the macro's, not the one of the crate
-    /// that uses the macro.
-    block_editions: FxHashMap<ExprId, Edition>,
+    /// The edition of each block that a macro wrote, by block in increasing order: it is the
+    /// macro's, not the one of the crate that uses the macro.
+    block_editions: Box<[(ExprId, Edition)]>,
 
-    /// The closures written with `#[rustc_inherit_overflow_checks]`.
-    overflow_inheriting: FxHashSet<ExprId>,
+    /// The closures written with `#[rustc_inherit_overflow_checks]`, in increasing order.
+    overflow_inheriting: Box<[ExprId]>,
 
     /// Maps expression roots to their origin.
     ///
@@ -163,6 +174,9 @@ struct ExpressionOnlyStore {
     /// into the outer const.
     expr_roots: SmallVec<[ExprRoot; 1]>,
 }
+
+/// The owner in [`ExpressionOnlyStore::binding_owners`] of a binding the top level owns.
+const NO_OWNER: u32 = u32::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpressionStore {
@@ -477,11 +491,11 @@ impl ExpressionStoreBuilder {
             mut labels,
             mut pats,
             mut bindings,
-            mut binding_owners,
-            mut ident_hygiene,
+            binding_owners,
+            ident_hygiene,
             type_hygiene,
-            mut block_editions,
-            mut overflow_inheriting,
+            block_editions,
+            overflow_inheriting,
             inference_roots: mut expr_roots,
             mut types,
             mut lifetimes,
@@ -507,10 +521,6 @@ impl ExpressionStoreBuilder {
         labels.shrink_to_fit();
         pats.shrink_to_fit();
         bindings.shrink_to_fit();
-        binding_owners.shrink_to_fit();
-        ident_hygiene.shrink_to_fit();
-        block_editions.shrink_to_fit();
-        overflow_inheriting.shrink_to_fit();
         types.shrink_to_fit();
         lifetimes.shrink_to_fit();
 
@@ -547,6 +557,23 @@ impl ExpressionStoreBuilder {
                 if let Some(expr_roots) = &mut expr_roots {
                     expr_roots.shrink_to_fit();
                 }
+                let binding_owners = match binding_owners.is_empty() {
+                    true => Box::default(),
+                    false => {
+                        let mut column = vec![NO_OWNER; bindings.len()].into_boxed_slice();
+                        for (binding, owner) in binding_owners {
+                            column[binding.into_raw().into_u32() as usize] =
+                                owner.into_raw().into_u32();
+                        }
+                        column
+                    }
+                };
+                let mut ident_hygiene: Box<[_]> = ident_hygiene.into_iter().collect();
+                ident_hygiene.sort_unstable_by_key(|&(id, _)| id);
+                let mut block_editions: Box<[_]> = block_editions.into_iter().collect();
+                block_editions.sort_unstable_by_key(|&(id, _)| id);
+                let mut overflow_inheriting: Box<[_]> = overflow_inheriting.into_iter().collect();
+                overflow_inheriting.sort_unstable();
                 Some(Box::new(ExpressionOnlyStore {
                     exprs,
                     pats,
@@ -804,7 +831,9 @@ impl ExpressionStore {
 
     #[inline]
     pub fn binding_owner(&self, id: BindingId) -> Option<ExprId> {
-        self.expr_only.as_ref()?.binding_owners.get(&id).copied()
+        let owners = &self.expr_only.as_ref()?.binding_owners;
+        let owner = *owners.get(id.into_raw().into_u32() as usize)?;
+        (owner != NO_OWNER).then(|| ExprId::from_raw(la_arena::RawIdx::from_u32(owner)))
     }
 
     pub fn visit_expr_children(&self, expr_id: ExprId, visitor: impl StoreVisitor) {
@@ -1029,12 +1058,14 @@ impl ExpressionStore {
     /// Whether a closure takes the overflow checks of the crate that compiles it, as a function
     /// with `#[rustc_inherit_overflow_checks]` does.
     pub fn inherits_overflow_checks(&self, closure: ExprId) -> bool {
-        self.assert_expr_only().overflow_inheriting.contains(&closure)
+        self.assert_expr_only().overflow_inheriting.binary_search(&closure).is_ok()
     }
 
     /// The edition a block was written in, when a macro wrote it.
     pub fn block_edition(&self, block: ExprId) -> Option<Edition> {
-        self.assert_expr_only().block_editions.get(&block).copied()
+        let editions = &self.assert_expr_only().block_editions;
+        let index = editions.binary_search_by_key(&block, |&(id, _)| id).ok()?;
+        Some(editions[index].1)
     }
 
     pub fn type_path_hygiene(&self, type_ref: TypeRefId) -> HygieneId {
@@ -1045,12 +1076,20 @@ impl ExpressionStore {
         }
     }
 
+    fn ident_hygiene(&self, id: ExprOrPatIdPacked) -> HygieneId {
+        let hygiene = &self.assert_expr_only().ident_hygiene;
+        match hygiene.binary_search_by_key(&id, |&(id, _)| id) {
+            Ok(index) => hygiene[index].1,
+            Err(_) => HygieneId::ROOT,
+        }
+    }
+
     pub fn expr_path_hygiene(&self, expr: ExprId) -> HygieneId {
-        self.assert_expr_only().ident_hygiene.get(&expr.into()).copied().unwrap_or(HygieneId::ROOT)
+        self.ident_hygiene(expr.into())
     }
 
     pub fn pat_path_hygiene(&self, pat: PatId) -> HygieneId {
-        self.assert_expr_only().ident_hygiene.get(&pat.into()).copied().unwrap_or(HygieneId::ROOT)
+        self.ident_hygiene(pat.into())
     }
 
     pub fn expr_or_pat_path_hygiene(&self, id: ExprOrPatId) -> HygieneId {

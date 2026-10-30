@@ -1,7 +1,9 @@
 use smallvec::SmallVec;
+use thin_vec::ThinVec;
 
 use crate::active_query::CompletedQuery;
 use crate::cycle::{CycleHeads, CycleRecoveryStrategy, IterationStamp, ProvisionalStatus};
+use crate::fingerprint::Fingerprint;
 use crate::function::memo::{Memo, MemoHeader};
 use crate::function::sync::ReleaseMode;
 use crate::function::{ClaimGuard, ClaimResult, Configuration, IngredientImpl, Reentrancy};
@@ -10,7 +12,9 @@ use crate::plumbing::ZalsaLocal;
 use crate::sync::thread;
 use crate::tracked_struct::Identity;
 use crate::zalsa::{MemoIngredientIndex, Zalsa};
-use crate::zalsa_local::{ActiveQueryGuard, QueryEdge, QueryEdgeKind, QueryRevisions};
+use crate::zalsa_local::{
+    ActiveQueryGuard, EdgeFingerprint, QueryEdge, QueryEdgeKind, QueryRevisions,
+};
 use crate::{Cancelled, Cycle, tracing};
 use crate::{DatabaseKeyIndex, Event, EventKind, Id};
 
@@ -79,6 +83,11 @@ where
             }
         };
 
+        if *completed_query.revisions.verified_final.get_mut() {
+            completed_query.revisions.fingerprint =
+                C::fingerprint(&new_value).unwrap_or(Fingerprint::NONE);
+        }
+
         if let Some(old_memo) = opt_old_memo {
             // If the new value is equal to the old one, then it didn't
             // really change, even if some of its inputs have. So we can
@@ -89,6 +98,7 @@ where
                 database_key_index,
                 &mut completed_query.revisions,
                 &new_value,
+                zalsa.current_revision(),
             );
 
             // Diff the new outputs with the old, to discard any no-longer-emitted
@@ -960,7 +970,10 @@ fn complete_cycle_query(
     );
 
     seen.clear();
-    let completion = detached_query.pop_completion(iteration, true);
+    let edge_fingerprints = flattened_edge_fingerprints(zalsa, &flattened);
+    let completion = detached_query
+        .pop_completion(iteration, true)
+        .with_edge_fingerprints(edge_fingerprints);
     let completed_query = completion.finish(flattened.drain(..));
     #[cfg(feature = "accumulator")]
     assert!(
@@ -973,6 +986,38 @@ fn complete_cycle_query(
     );
     FLATTEN_MAPS.set(Some((flattened, seen)));
     completed_query
+}
+
+/// The value fingerprints of the finalized function memos among a cycle head's flattened inputs.
+///
+/// Flattening replaces the edges the head recorded while it ran, so the fingerprints are read
+/// from the memos now. Those memos are final and were read in this revision, so their
+/// fingerprints are the ones the cycle saw.
+fn flattened_edge_fingerprints(
+    zalsa: &Zalsa,
+    flattened: &FxIndexSet<QueryEdge>,
+) -> ThinVec<EdgeFingerprint> {
+    flattened
+        .iter()
+        .enumerate()
+        .filter_map(|(position, edge)| {
+            if !matches!(edge.kind(), QueryEdgeKind::Input) {
+                return None;
+            }
+            let input = edge.key();
+            let memo = zalsa
+                .lookup_ingredient(input.ingredient_index())
+                .as_function()?
+                .memo(zalsa, input.key_index())?;
+            let header = memo.header();
+            let fingerprint = header.revisions.fingerprint;
+            (fingerprint.is_value() && !header.may_be_provisional()).then(|| EdgeFingerprint {
+                edge: u32::try_from(position)
+                    .expect("exceeded more than `u32::MAX` query edges; this should never happen"),
+                fingerprint,
+            })
+        })
+        .collect()
 }
 
 /// Flattens the dependencies of `head` so that `head`'s origin only depends on finalized queries,

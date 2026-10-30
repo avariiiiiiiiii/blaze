@@ -3,9 +3,10 @@
 use std::fmt;
 
 use hir_def::{
-    AdtId, LocalFieldId, StructId,
+    AdtId, EnumId, EnumVariantId, LocalFieldId, StructId, VariantId,
     attrs::AttrFlags,
     layout::{LayoutCalculatorError, LayoutData},
+    signatures::{StructFlags, StructSignature},
 };
 use la_arena::{Idx, RawIdx};
 
@@ -120,6 +121,26 @@ impl<F> From<LayoutCalculatorError<F>> for LayoutError {
     fn from(err: LayoutCalculatorError<F>) -> Self {
         LayoutError::BadCalc(err.without_payload())
     }
+}
+
+/// What a layout reads of a struct's signature: its flags. A rename, or a change to its
+/// generics or their bounds, leaves this equal.
+#[salsa::tracked]
+pub fn struct_flags(db: &dyn HirDatabase, id: StructId) -> StructFlags {
+    StructSignature::of(db, id).flags
+}
+
+/// The fields of a variant, in order: what a layout reads of them besides their types. A
+/// field's rename or visibility leaves this equal.
+#[salsa::tracked(returns(deref))]
+pub fn variant_field_ids(db: &dyn HirDatabase, variant: VariantId) -> Box<[LocalFieldId]> {
+    variant.fields(db).fields().iter().map(|(id, _)| id).collect()
+}
+
+/// The variants of an enum, in order: what a layout reads of them besides their fields.
+#[salsa::tracked(returns(deref))]
+pub fn enum_variant_ids(db: &dyn HirDatabase, id: EnumId) -> Box<[EnumVariantId]> {
+    id.enum_variants(db).variants.values().map(|&(variant, _)| variant).collect()
 }
 
 struct LayoutCx<'a> {
@@ -689,10 +710,8 @@ pub fn struct_tail_erasing_lifetimes<'a>(
             if representability(db, def.def_id()) == Representability::Infinite {
                 return pointee;
             }
-            let data = struct_id.fields(db);
-            let mut it = data.fields().iter().rev();
-            match it.next() {
-                Some((f, _)) => {
+            match variant_field_ids(db, struct_id.into()).last() {
+                Some(&f) => {
                     let last_field_ty = normalize(field_ty(db, struct_id.into(), f, args));
                     struct_tail_erasing_lifetimes(db, last_field_ty, normalize)
                 }

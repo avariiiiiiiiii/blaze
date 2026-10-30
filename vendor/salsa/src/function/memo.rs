@@ -87,18 +87,21 @@ impl<C: Configuration> IngredientImpl<C> {
     /// Evicts the existing memo for the given key, replacing it
     /// with an equivalent memo that has no value. If the memo is untracked
     /// or has values assigned as output of another query, this has no effect.
+    /// The memo keeps its fingerprint and dependency edges. Returns whether a value was dropped.
     pub(super) fn evict_value_from_memo_for(
         table: MemoTableWithTypesMut<'_>,
         memo_ingredient_index: MemoIngredientIndex,
-    ) {
+    ) -> bool {
+        let mut evicted = false;
         let map = |memo: &mut Memo<C>| {
             if memo.header.can_evict_value() {
                 // Set the memo value to `None`.
-                memo.value = None;
+                evicted = memo.value.take().is_some();
             }
         };
 
-        table.map_memo(memo_ingredient_index, map)
+        table.map_memo(memo_ingredient_index, map);
+        evicted
     }
 }
 
@@ -504,11 +507,16 @@ mod persistence {
             }
 
             let memo = DeserializeMemo::<C>::deserialize(deserializer)?;
+            // Only final memos are serialized (`Memo::should_serialize`), and the fingerprint of
+            // a value is not persisted but computed again from it.
+            let mut revisions = memo.revisions;
+            revisions.fingerprint = C::fingerprint(&memo.value.0)
+                .unwrap_or(crate::fingerprint::Fingerprint::NONE);
 
             Ok(Memo::new(
                 Some(memo.value.0),
                 memo.verified_at.load(),
-                memo.revisions,
+                revisions,
             ))
         }
     }
@@ -635,9 +643,9 @@ mod _memory_usage {
 
     // Memos are stored a lot, make sure their size doesn't randomly increase.
     const _: [(); std::mem::size_of::<super::MemoHeader>()] =
-        [(); std::mem::size_of::<[usize; 4]>()];
+        [(); std::mem::size_of::<[usize; 7]>()];
     const _: [(); std::mem::size_of::<super::Memo<DummyConfiguration>>()] =
-        [(); std::mem::size_of::<[usize; 5]>()];
+        [(); std::mem::size_of::<[usize; 8]>()];
     const _: [(); std::mem::size_of::<super::ErasedMemo<'static>>()] =
         [(); std::mem::size_of::<[usize; 4]>()];
 
@@ -648,15 +656,15 @@ mod _memory_usage {
         const LEAF_TYPE_IDS: &'static [typeid::ConstTypeId] = &[];
 
         fn lookup_ingredient_index(_: &Zalsa) -> IngredientIndices {
-            unimplemented!()
+            IngredientIndices::empty()
         }
 
         fn cast(_: Id, _: TypeId) -> Option<Self> {
-            unimplemented!()
+            None
         }
 
         unsafe fn memo_table(_: &Zalsa, _: Id, _: Revision) -> MemoTableWithTypes<'_> {
-            unimplemented!()
+            unreachable!("`DummyStruct` only sizes memos and is never registered in a database")
         }
 
         fn entries(_: &Zalsa) -> impl Iterator<Item = crate::DatabaseKeyIndex> + '_ {
@@ -679,16 +687,14 @@ mod _memory_usage {
         type Output<'db> = NonZeroUsize;
         type Eviction = crate::function::eviction::NoopEviction;
 
-        fn values_equal<'db>(_: &Self::Output<'db>, _: &Self::Output<'db>) -> bool {
-            unimplemented!()
+        fn values_equal<'db>(old_value: &Self::Output<'db>, new_value: &Self::Output<'db>) -> bool {
+            old_value == new_value
         }
 
-        fn id_to_input(_: &Zalsa, _: Id) -> Self::Input<'_> {
-            unimplemented!()
-        }
+        fn id_to_input(_: &Zalsa, _: Id) -> Self::Input<'_> {}
 
         fn execute<'db>(_: &'db Self::DbView, _: Self::Input<'db>) -> Self::Output<'db> {
-            unimplemented!()
+            NonZeroUsize::MIN
         }
 
         fn cycle_initial<'db>(
@@ -696,7 +702,7 @@ mod _memory_usage {
             _: Id,
             _: Self::Input<'db>,
         ) -> Self::Output<'db> {
-            unimplemented!()
+            NonZeroUsize::MIN
         }
 
         fn recover_from_cycle<'db>(
@@ -713,14 +719,14 @@ mod _memory_usage {
         where
             S: plumbing::serde::Serializer,
         {
-            unimplemented!()
+            unreachable!("`DummyConfiguration` has `PERSIST = false` and is never serialized")
         }
 
         fn deserialize<'de, D>(_: D) -> Result<Self::Output<'static>, D::Error>
         where
             D: plumbing::serde::Deserializer<'de>,
         {
-            unimplemented!()
+            unreachable!("`DummyConfiguration` has `PERSIST = false` and is never deserialized")
         }
     }
 }

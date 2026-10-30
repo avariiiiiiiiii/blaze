@@ -4,13 +4,13 @@ use hir_def::{GenericDefId, GenericParamId, type_ref::TypeRefId};
 
 use crate::Span;
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum TyLoweringDiagnostic {
     PathDiagnostic { source: TypeRefId, diag: PathLoweringDiagnostic },
     InferVarsNotAllowed { source: Span },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenericArgsProhibitedReason {
     Module,
     TyParam,
@@ -27,7 +27,7 @@ pub enum GenericArgsProhibitedReason {
 /// A path can have many generic arguments: each segment may have one associated with the
 /// segment, and in addition, each associated type binding may have generic arguments. This
 /// enum abstracts over both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PathGenericsSource {
     /// Generic arguments directly on the segment.
     Segment(u32),
@@ -35,7 +35,7 @@ pub enum PathGenericsSource {
     AssocType { segment: u32, assoc_type: u32 },
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum PathLoweringDiagnostic {
     GenericArgsProhibited {
         segment: u32,
@@ -84,7 +84,7 @@ pub enum PathLoweringDiagnostic {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IncorrectGenericsLenKind {
     Lifetimes,
     TypesAndConsts,

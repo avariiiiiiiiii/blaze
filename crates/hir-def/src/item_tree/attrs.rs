@@ -181,6 +181,11 @@ impl AttrsOwned {
     pub(crate) fn as_ref(&self) -> Attrs<'_> {
         Attrs(&self.0)
     }
+
+    /// The attributes `attrs`, as lowering would have collected them.
+    pub(super) fn from_attrs(attrs: Box<[Attr]>) -> AttrsOwned {
+        AttrsOwned(attrs)
+    }
 }
 
 impl<'a> Attrs<'a> {

@@ -172,19 +172,21 @@ fn expand_in_parallel(
         }
     };
     std::thread::scope(|scope| {
-        let workers: Vec<_> = (1..threads)
-            .map(|_| {
-                let fork = db.fork();
-                let work = &work;
-                std::thread::Builder::new()
-                    .name("expand".to_owned())
-                    .stack_size(EXPANSION_STACK)
-                    .spawn_scoped(scope, move || work(&*fork))
-                    .unwrap_or_else(|error| {
-                        panic!("spawning a thread to expand the macros of {krate:?}: {error}")
-                    })
-            })
-            .collect();
+        let mut workers = Vec::with_capacity(threads - 1);
+        // A round of small expansions may be done by the first workers before the rest would
+        // have started: no thread is spawned once every call is taken.
+        while workers.len() + 1 < threads && next.load(atomic::Ordering::Relaxed) < calls.len() {
+            let fork = db.fork();
+            let work = &work;
+            let worker = std::thread::Builder::new()
+                .name("expand".to_owned())
+                .stack_size(EXPANSION_STACK)
+                .spawn_scoped(scope, move || work(&*fork))
+                .unwrap_or_else(|error| {
+                    panic!("spawning a thread to expand the macros of {krate:?}: {error}")
+                });
+            workers.push(worker);
+        }
         let here = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(db)));
         // Each worker is joined before a panic goes on, so a cancellation reaches the caller
         // as salsa's own payload rather than as a scoped thread's.

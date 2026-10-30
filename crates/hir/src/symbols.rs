@@ -413,6 +413,11 @@ impl<'a> SymbolCollector<'a> {
             return;
         }
         let body_id = body_id.into();
+        // A dependency's bodies are lowered only when something reaches them (#1293), and what
+        // a body declares is not nameable outside its crate.
+        if !HasModule::krate(&body_id, self.db).data(self.db).origin.is_local() {
+            return;
+        }
         let body = Body::of(self.db, body_id);
 
         // Descend into the blocks and enqueue collection of all modules within.

@@ -1,0 +1,212 @@
+//! Code dedupe (docs/v2/items.md section 6.4): functions of a build that run the same
+//! instructions against the same addresses are one function.
+//!
+//! Functions are grouped by [`code_id`]; each group's least key is kept and callers'
+//! relocations are pointed at it. That can make callers equal in turn, so it repeats until
+//! nothing changes, as a linker's identical code folding does. What may be merged is the
+//! caller's to say ([`dedupe`]'s `mergeable`): never a function whose address is significant
+//! (an exported symbol), never one reached through its slot (a member of a live build, which
+//! an edit patches alone). Statics are never functions here: [`crate::Target::Static`] is by
+//! which item, and its value is never merged.
+
+use std::collections::{BTreeMap, HashMap};
+
+use blaze_ids::ContentId;
+
+use crate::{CompiledFunction, Data, InstanceKey, Reloc, Target, content::code_id};
+
+/// What became of a build's functions.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Deduped {
+    /// Each function merged away, with the one kept for it.
+    pub merged: BTreeMap<InstanceKey, InstanceKey>,
+}
+
+fn renamed(key: &InstanceKey, kept: &HashMap<InstanceKey, InstanceKey>) -> InstanceKey {
+    kept.get(key).copied().unwrap_or(*key)
+}
+
+fn rename_relocs(
+    relocs: &[Reloc],
+    kept: &HashMap<InstanceKey, InstanceKey>,
+    data: &HashMap<ContentId, ContentId>,
+) -> Vec<Reloc> {
+    relocs
+        .iter()
+        .map(|reloc| {
+            let target = match &reloc.target {
+                Target::Function(key) => Target::Function(renamed(key, kept)),
+                Target::Direct(key) => Target::Direct(renamed(key, kept)),
+                Target::Data(id) => Target::Data(data.get(id).copied().unwrap_or(*id)),
+                other => other.clone(),
+            };
+            Reloc { target, ..reloc.clone() }
+        })
+        .collect()
+}
+
+/// `function` with what it calls renamed by `kept`, its data's IDs made again; `None` when
+/// nothing of it changed.
+fn rename(
+    function: &CompiledFunction,
+    kept: &HashMap<InstanceKey, InstanceKey>,
+) -> Option<CompiledFunction> {
+    let names_one = |relocs: &[Reloc]| {
+        relocs.iter().any(|it| match &it.target {
+            Target::Function(key) | Target::Direct(key) => kept.contains_key(key),
+            _ => false,
+        })
+    };
+    if !names_one(&function.relocs) && !function.data.iter().any(|it| names_one(&it.relocs)) {
+        return None;
+    }
+    let mut ids = HashMap::new();
+    let mut data = Vec::with_capacity(function.data.len());
+    for it in &function.data {
+        let made = Data::new(it.align, it.bytes.clone(), rename_relocs(&it.relocs, kept, &ids));
+        ids.insert(it.id, made.id);
+        data.push(made);
+    }
+    Some(CompiledFunction {
+        relocs: rename_relocs(&function.relocs, kept, &ids),
+        data,
+        ..function.clone()
+    })
+}
+
+/// Merges the functions of a build whose code is equal, in place: `functions` keeps one of
+/// each group, and every relocation that named one merged away names the one kept.
+/// `mergeable` says which may be merged; any function's callers are renamed.
+pub fn dedupe(
+    functions: &mut Vec<CompiledFunction>,
+    mergeable: &dyn Fn(&InstanceKey) -> bool,
+) -> Deduped {
+    let mut kept: HashMap<InstanceKey, InstanceKey> = HashMap::new();
+    loop {
+        let mut groups: BTreeMap<ContentId, Vec<InstanceKey>> = BTreeMap::new();
+        for function in functions.iter().filter(|it| mergeable(&it.key)) {
+            groups.entry(code_id(function)).or_default().push(function.key);
+        }
+        let mut more: HashMap<InstanceKey, InstanceKey> = HashMap::new();
+        for mut keys in groups.into_values().filter(|it| it.len() > 1) {
+            keys.sort();
+            let first = keys[0];
+            more.extend(keys[1..].iter().map(|key| (*key, first)));
+        }
+        if more.is_empty() {
+            break;
+        }
+        functions.retain(|it| !more.contains_key(&it.key));
+        for to in kept.values_mut() {
+            *to = renamed(to, &more);
+        }
+        kept.extend(more.iter().map(|(from, to)| (*from, *to)));
+        for function in functions.iter_mut() {
+            if let Some(renamed) = rename(function, &more) {
+                *function = renamed;
+            }
+        }
+    }
+    functions.sort_by_key(|it| it.key);
+    Deduped { merged: kept.into_iter().collect() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Arch, RelocKind};
+
+    fn key(n: u8) -> InstanceKey {
+        InstanceKey(ContentId([n; 32]))
+    }
+
+    fn function(n: u8, code: u8, calls: &[u8]) -> CompiledFunction {
+        let relocs = calls
+            .iter()
+            .enumerate()
+            .map(|(at, callee)| Reloc {
+                at: 1 + 5 * at as u32,
+                kind: RelocKind::PcRel32,
+                target: Target::Direct(key(*callee)),
+                addend: -4,
+            })
+            .collect();
+        CompiledFunction {
+            key: key(n),
+            arch: Arch::X86_64,
+            align: 16,
+            code: vec![code; 1 + 5 * calls.len()],
+            relocs,
+            data: Vec::new(),
+            inlined: Vec::new(),
+            side: None,
+        }
+    }
+
+    #[test]
+    fn equal_code_is_one_function_and_callers_follow() {
+        // 2 and 3 are equal; 4 calls 2 and 5 calls 3, so they become equal too.
+        let mut functions = vec![
+            function(2, 0x90, &[]),
+            function(3, 0x90, &[]),
+            function(4, 0xcc, &[2]),
+            function(5, 0xcc, &[3]),
+            function(6, 0xc3, &[5]),
+        ];
+        let deduped = dedupe(&mut functions, &|_| true);
+        assert_eq!(deduped.merged, BTreeMap::from([(key(3), key(2)), (key(5), key(4))]));
+        let keys: Vec<_> = functions.iter().map(|it| it.key).collect();
+        assert_eq!(keys, vec![key(2), key(4), key(6)]);
+        assert_eq!(functions[2].relocs[0].target, Target::Direct(key(4)));
+    }
+
+    #[test]
+    fn what_may_not_be_merged_stays_but_its_callers_are_renamed() {
+        let mut functions =
+            vec![function(2, 0x90, &[]), function(3, 0x90, &[]), function(7, 0xc3, &[3])];
+        let deduped = dedupe(&mut functions, &|it| *it != key(2));
+        assert!(deduped.merged.is_empty());
+        assert_eq!(functions.len(), 3);
+        let mut functions =
+            vec![function(2, 0x90, &[]), function(3, 0x90, &[]), function(7, 0xc3, &[3])];
+        dedupe(&mut functions, &|it| *it != key(7));
+        assert_eq!(functions.iter().find(|it| it.key == key(7)).unwrap().relocs[0].target, Target::Direct(key(2)));
+    }
+
+    #[test]
+    fn data_pointing_at_a_merged_function_gets_its_new_id() {
+        let vtable = |to: u8| {
+            Data::new(
+                8,
+                vec![0; 8],
+                vec![Reloc { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(to)), addend: 0 }],
+            )
+        };
+        let mut caller = function(9, 0x55, &[]);
+        let table = vtable(3);
+        caller.relocs.push(Reloc { at: 0, kind: RelocKind::PcRel32, target: Target::Data(table.id), addend: -4 });
+        caller.data.push(table);
+        let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[]), caller];
+        dedupe(&mut functions, &|_| true);
+        let caller = functions.iter().find(|it| it.key == key(9)).unwrap();
+        assert_eq!(caller.data[0], vtable(2));
+        assert_eq!(caller.relocs[0].target, Target::Data(vtable(2).id));
+    }
+
+    #[test]
+    fn the_result_is_the_same_whatever_the_order() {
+        let make = || {
+            vec![
+                function(2, 0x90, &[]),
+                function(3, 0x90, &[]),
+                function(4, 0xcc, &[2]),
+                function(5, 0xcc, &[3]),
+            ]
+        };
+        let mut a = make();
+        let mut b = make();
+        b.reverse();
+        assert_eq!(dedupe(&mut a, &|_| true), dedupe(&mut b, &|_| true));
+        assert_eq!(a, b);
+    }
+}

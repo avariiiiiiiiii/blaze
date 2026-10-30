@@ -18,6 +18,7 @@ mod tests;
 use std::collections::BTreeMap;
 
 use blaze_core::Conn;
+use rustc_hash::FxHashMap;
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
 use blaze_vfs::{CommitError, OpError, Ticket, View, ViewId, Vfs};
@@ -47,13 +48,14 @@ pub struct Session {
     next_serial: u64,
     /// Every request not yet over, by the session's own number for it; a gone connection's
     /// stay until their jobs finish.
-    pending: BTreeMap<u64, Pending>,
-    /// The number of each request of a live connection not yet over.
+    pending: FxHashMap<u64, Pending>,
+    /// The number of each request of a live connection not yet over, ordered so a gone
+    /// connection's are one range.
     live: BTreeMap<RequestRef, u64>,
     /// Each job's request, and its candidate for a best-of-N.
-    jobs: BTreeMap<JobId, (u64, Option<u32>)>,
+    jobs: FxHashMap<JobId, (u64, Option<u32>)>,
     /// Commits waiting to be durable.
-    tickets: BTreeMap<Ticket, u64>,
+    tickets: FxHashMap<Ticket, u64>,
     /// The views each connection opened with [`Request::Open`], by root, one per open.
     held: BTreeMap<Conn, BTreeMap<ContentId, Vec<ViewId>>>,
 }
@@ -80,7 +82,7 @@ impl Sink {
 }
 
 enum Kind {
-    Commit { root: ContentId, rebased: bool, head: String },
+    Commit { root: ContentId, rebased: bool, ticket: Ticket, head: String },
     /// One job of the build, with the views it holds.
     Job { job: JobId, cancelled: bool, views: Vec<Opened> },
     BestOf(BestOf),
@@ -120,10 +122,10 @@ impl Session {
         Session {
             next_job: 0,
             next_serial: 0,
-            pending: BTreeMap::new(),
+            pending: FxHashMap::default(),
             live: BTreeMap::new(),
-            jobs: BTreeMap::new(),
-            tickets: BTreeMap::new(),
+            jobs: FxHashMap::default(),
+            tickets: FxHashMap::default(),
             held: BTreeMap::new(),
         }
     }
@@ -249,7 +251,12 @@ impl Session {
                     cx.vfs.commit(&head, base, &ops).map_err(|error| commit_error(&head, base, &error))?;
                 let serial = self.begin(
                     req,
-                    Kind::Commit { root: commit.root, rebased: commit.rebased, head },
+                    Kind::Commit {
+                        root: commit.root,
+                        rebased: commit.rebased,
+                        ticket: commit.ticket,
+                        head,
+                    },
                 );
                 self.tickets.insert(commit.ticket, serial);
             }
@@ -466,9 +473,9 @@ impl Session {
             self.live.remove(&req);
             let pending = self.pending.get_mut(&serial).expect("a live request is pending");
             pending.sink.gone = true;
-            if let Kind::Commit { .. } = pending.what {
+            if let Kind::Commit { ticket, .. } = pending.what {
                 self.pending.remove(&serial);
-                self.tickets.retain(|_, it| *it != serial);
+                self.tickets.remove(&ticket);
             } else {
                 pending.what.cancel(cx.builder);
             }

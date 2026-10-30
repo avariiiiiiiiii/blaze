@@ -1,16 +1,7 @@
 //! Module defining all known symbols required by the rest of rust-analyzer.
 #![allow(non_upper_case_globals)]
 
-use std::{
-    hash::{BuildHasher, BuildHasherDefault},
-    ptr::NonNull,
-};
-
-use arrayvec::ArrayString;
-use dashmap::{DashMap, SharedValue};
-use rustc_hash::FxHasher;
-
-use crate::{Symbol, symbol::TaggedArcPtr};
+use crate::{Symbol, arena::Store, symbol::prefill_one};
 
 macro_rules! last {
     ( $($elems:literal,)+ ) => {
@@ -21,14 +12,8 @@ macro_rules! last {
 impl Integer {
     #[inline]
     pub fn as_uint(sym: &Symbol) -> Option<usize> {
-        if !sym.repr.is_arc() {
-            let elem_ref = sym.repr.pointer();
-            // SAFETY: The types have the same layout.
-            let elem_ref = unsafe { std::mem::transmute::<NonNull<*const str>, &&str>(elem_ref) };
-            Self::LIST.element_offset(elem_ref)
-        } else {
-            Self::as_uint_cold(sym)
-        }
+        // A declared integer's text is in `LIST`; one interned at runtime is parsed.
+        Self::LIST.element_offset(sym.as_static()).or_else(|| Self::as_uint_cold(sym))
     }
 
     #[cold]
@@ -55,18 +40,13 @@ macro_rules! define_symbols {
                 #[cold]
                 #[inline(never)]
                 fn create(idx: usize) -> Symbol {
-                    use std::fmt::Write;
-                    const MAX_LEN: usize = $list_prefix.len() + u64::MAX.ilog10() as usize + 1;
-                    let mut s = ArrayString::<MAX_LEN>::new();
-                    s.push_str($list_prefix);
-                    _ = write!(s, "{idx}");
-                    Symbol::intern(&s)
+                    Symbol::intern(&format!("{}{idx}", $list_prefix))
                 }
 
                 #[inline]
                 pub fn get(idx: usize) -> Symbol {
                     match Self::LIST.get(idx) {
-                        Option::Some(s) => Symbol { repr: TaggedArcPtr::non_arc(s) },
+                        Option::Some(s) => Symbol::from_static(s),
                         Option::None => Self::create(idx),
                     }
                 }
@@ -77,45 +57,32 @@ macro_rules! define_symbols {
         $(
             pub const $name: Symbol = {
                 static SYMBOL_STR: &str = stringify!($name);
-                Symbol { repr: TaggedArcPtr::non_arc(&SYMBOL_STR) }
+                Symbol::from_static(&SYMBOL_STR)
             };
         )*
         $(
             pub const $alias: Symbol = {
                 static SYMBOL_STR: &str = $value;
-                Symbol { repr: TaggedArcPtr::non_arc(&SYMBOL_STR) }
+                Symbol::from_static(&SYMBOL_STR)
             };
         )*
 
-
-        pub(super) fn prefill() -> DashMap<Symbol, (), BuildHasherDefault<FxHasher>> {
-            let mut dashmap_ = <DashMap<Symbol, (), BuildHasherDefault<FxHasher>>>::with_hasher(BuildHasherDefault::default());
-
-            let hasher_ = dashmap_.hasher().clone();
-            let hash_one = |it_: &str| hasher_.hash_one(it_);
-            {
-                $(
-                    for s in $list_type_name::LIST {
-                        let hash_ = hash_one(s);
-                        let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
-                        let symbol = Symbol { repr: TaggedArcPtr::non_arc(s) };
-                        dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, (symbol, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
-                    }
-                )*
-                $(
-                    let s = stringify!($name);
-                    let hash_ = hash_one(s);
-                    let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
-                    dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, ($name, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
-                )*
-                $(
-                    let s = $value;
-                    let hash_ = hash_one(s);
-                    let shard_idx_ = dashmap_.determine_shard(hash_ as usize);
-                    dashmap_.shards_mut()[shard_idx_].get_mut().insert(hash_, ($alias, SharedValue::new(())), |(x, _)| hash_one(x.as_str()));
-                )*
-            }
-            dashmap_
+        /// The store of symbols, holding every declared one so that interning a declared
+        /// symbol's text gives it. A text declared twice gives the first.
+        pub(super) fn prefill() -> Store {
+            let store_ = Store::new();
+            $(
+                for s in $list_type_name::LIST {
+                    prefill_one(&store_, Symbol::from_static(s));
+                }
+            )*
+            $(
+                prefill_one(&store_, $name);
+            )*
+            $(
+                prefill_one(&store_, $alias);
+            )*
+            store_
         }
     };
 }

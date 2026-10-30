@@ -61,6 +61,14 @@ their pinned revisions, except blaze, which is the files of this checkout as the
     ci             blaze, warm after the cold build and one `blaze test`: `self_edit`, then
                    `blaze build` and `blaze test` with BLAZE_TESTS=affected: under 120 s, every
                    test it runs passing
+    memory         (also) nushell: the cold peak per thousand lines of the workspace's .rs files,
+                   at most cargo's
+    layout         nushell after its cold build: bytes per element of each table
+                   docs/v2/README.md section 17 sizes (Engine.tables): a token 4, a syntax node 8,
+                   a HIR expression 12, a MIR statement 16, a memo 24 and an edge 4, a
+                   relocation 16
+    cache-misses   nushell: the machine's cache misses over the build of bench's `body` edit
+                   (`perf stat -a`, Linux); section 17 asks for it and sets no budget
 
 Each project's checkout has a blaze home and store of its own and a cargo target directory
 outside the checkout (engine.reference_env). A build blaze did not serve (`Engine.not_blazes`)
@@ -73,6 +81,7 @@ need neither blaze nor cargo nor the network: edit generation, budget evaluation
 """
 
 import bisect
+import math
 import os
 import re
 import shutil
@@ -98,7 +107,7 @@ import memory
 SCRIPT = "budgets.py"
 Budget = Literal[
     "body", "signature", "format", "comment", "rename", "move", "memory", "warm-start", "noop", "dev-speed",
-    "release-speed", "big-crate", "cold-blaze", "ci",
+    "release-speed", "big-crate", "cold-blaze", "ci", "layout", "cache-misses",
 ]
 Project = Literal["nushell", "ripgrep", "ruff", "blaze"]
 type Change = tuple[str, str | None, str]
@@ -206,7 +215,23 @@ ROWS = (
         "x the critical path", COLD_BLAZE),
     Row("ci", "ci", "blaze", "blaze's own CI, small PR: a body edit, `blaze build` and the affected tests, warm", 120,
         True, "s", "30 min+"),
+    Row("memory-kloc", "memory", "nushell", "memory per thousand lines (nushell's own source): blaze's cold peak "
+        "at most cargo's", 0, True, "MB per kloc", "nushell 12.5 GB (#734)"),
+    *(Row(f"layout-{table}", "layout", "nushell", f"bytes per {what} (nushell)", size, True, "bytes", today)
+      for table, what, size, today in (
+          ("token", "token", 4, "a rowan token and its green node"),
+          ("syntax-node", "syntax node", 8, "rowan green and red nodes"),
+          ("hir-expr", "HIR expression", 12, "rust-analyzer's `Expr` enum"),
+          ("mir-statement", "MIR statement", 16, "hir-ty's MIR statement enum"),
+          ("memo", "memo, its edges apart", 24, "salsa's memos"),
+          ("memo-edge", "memo edge", 4, "salsa's edges: 0.8 GB of nushell's 12.5 GB (#734)"),
+          ("relocation", "relocation", 16, "the object file's relocations"),
+      )),
+    Row("cache-misses", "cache-misses", "nushell", "cache misses over a body edit's build (nushell, `perf stat -a`)",
+        math.inf, True, "misses", "not measured before"),
 )
+# Section 17's sizes: what `Engine.tables` names each table, and the row it is judged by.
+TABLES = {row.key: row.key.removeprefix("layout-") for row in ROWS if row.budget == "layout"}
 
 
 class Wrong(Exception):
@@ -215,7 +240,7 @@ class Wrong(Exception):
 
 
 HARNESS_ERRORS = (AssertionError, OSError, ValueError, subprocess.SubprocessError)
-SETUP_ERRORS = (Wrong, engine.Failed, engine.Unmeasurable, NotImplementedError, *HARNESS_ERRORS)
+SETUP_ERRORS = (Wrong, engine.Failed, engine.Unmeasurable, *HARNESS_ERRORS)
 
 
 def failing[T](what: str, fn: Callable[[], T]) -> T:
@@ -274,8 +299,6 @@ def setup_failed(rep: report.Report, rows: Iterable[Row], error: BaseException) 
         how, said = "fail", str(error)
     elif isinstance(error, engine.Unmeasurable):
         how, said = "unmeasured", str(error)
-    elif isinstance(error, NotImplementedError):
-        said = f"not implemented: {error}"
     elif isinstance(error, engine.Failed):
         said = str(error)
     for row in rows:
@@ -572,6 +595,38 @@ def project_env(spec: dict[str, Any]) -> dict[str, str]:
     return dict(cast(dict[str, str], spec.get("env") or {}))
 
 
+def rust_lines(ws: Path) -> int:
+    """Lines of the `.rs` files of `ws`, outside its target directories and `.git`."""
+    total = 0
+    for root, dirs, files in os.walk(ws):
+        dirs[:] = [d for d in dirs if d not in ("target", "target-ref", ".git")]
+        for name in files:
+            if name.endswith(".rs"):
+                with open(os.path.join(root, name), "rb") as f:
+                    total += sum(chunk.count(b"\n") for chunk in iter(lambda: f.read(1 << 20), b""))
+    return total
+
+
+def perf_counts(text: str) -> dict[str, int]:
+    """The counts of `perf stat -x ,`'s output by event, its `:u`-style modifiers taken off. A
+    counter the machine does not have is an engine.Failed naming it, never a zero."""
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        fields = line.split(",")
+        if len(fields) < 3:
+            continue
+        value, event = fields[0].strip(), fields[2].strip().split(":")[0]
+        if not value.isdigit():
+            raise engine.Failed(f"perf stat: {event} is {value}")
+        counts[event] = int(value)
+    for event in ("cache-misses", "cache-references"):
+        if event not in counts:
+            raise engine.Failed(f"perf stat said nothing of {event}:\n{text[-1000:]}")
+    return counts
+
+
 def served(eng: engine.Engine, step: str, ran: engine.Ran) -> engine.Ran:
     """`ran`, when it ended well and blaze served it; else a Wrong saying what happened."""
     if ran.returncode != 0:
@@ -782,6 +837,51 @@ class Lane:
                         numbers=dict(blaze_median_s=round(ours, 4), cargo_median_s=round(cargos, 4),
                                      blaze_samples_s=samples(times["blaze"]), cargo_samples_s=samples(times["cargo"])))
 
+    def layout(self, key: str) -> Measured:
+        name = TABLES[key]
+        tables = self.eng.tables(self.ws, self.env)
+        table = tables.get(name)
+        if table is None or table.elements == 0:
+            raise engine.Failed(f"{self.name}: the engine's tables have no {name!r} with elements in it "
+                                f"(it has {', '.join(sorted(tables)) or 'none'})")
+        return Measured(table.bytes / table.elements, numbers=dict(elements=table.elements, bytes=table.bytes))
+
+    def memory_per_kloc(self, cold: Cold) -> Measured:
+        lines = rust_lines(self.ws)
+        if lines == 0:
+            raise engine.Failed(f"{self.name}: no Rust source under {self.ws}")
+        kloc = lines / 1000
+        return Measured(cold.blaze_peak_mb / kloc, cold.cargo_peak_mb / kloc, f"{lines} lines of the workspace's .rs files",
+                        dict(lines=lines, blaze_peak_mb=cold.blaze_peak_mb, cargo_peak_mb=cold.cargo_peak_mb))
+
+    def cache_misses(self) -> Measured:
+        """bench.py's `body` edit `runs` times, each build under `perf stat -a`: the machine's
+        cache misses over it, which counts the daemon's however it is started."""
+        if shutil.which("perf") is None:
+            raise engine.Failed("perf is not on PATH: cache misses are read with `perf stat`")
+        apply, revert = self.bench_edit("body")
+        misses: list[int] = []
+        references: list[int] = []
+        counts_file = self.top / "perf-stat.csv"
+        for n in range(self.args.runs):
+            apply(n)
+            try:
+                step = f"{self.name}: body edit {n + 1} under perf stat"
+                ran = engine.run(step, ["perf", "stat", "-a", "-x", ",", "-e", "cache-misses,cache-references",
+                                        "-o", str(counts_file), "--", str(self.eng.blaze), "build", *self.build_args],
+                                 self.ws, self.env, RUN_SECS)
+                if ran.returncode != 0:
+                    raise engine.Failed(f"{step}: exited {ran.returncode}:\n{ran.said()}")
+                served(self.eng, step, ran)
+                counts = perf_counts(counts_file.read_text())
+                misses.append(counts["cache-misses"])
+                references.append(counts["cache-references"])
+            finally:
+                revert(n)
+            self.build(f"body edit {n + 1} taken back", False)
+        return Measured(statistics.median(misses), detail="section 17 asks for the number and sets no budget",
+                        numbers=dict(samples=samples(misses), references_median=statistics.median(references)))
+
     def items(self, rep: report.Report, rows: dict[str, Row]) -> None:
         """The rename and the move, from a private function and its call added first."""
         chosen = [rows[key] for key in ("rename", "move") if key in rows]
@@ -839,6 +939,11 @@ def third_party(eng: engine.Engine, rep: report.Report, args: Input, work: Path,
             judge(rep, rows[f"memory-{name}"], lambda: Measured(
                 cold.blaze_peak_mb, cold.cargo_peak_mb, numbers=dict(
                     cargo_peak_mb=cold.cargo_peak_mb, blaze_s=round(cold.blaze_s, 3), cargo_s=round(cold.cargo_s, 3))))
+        if "memory-kloc" in rows:
+            judge(rep, rows["memory-kloc"], lambda: lane.memory_per_kloc(cold))
+        for key in TABLES:
+            if key in rows:
+                judge(rep, rows[key], lambda: lane.layout(key))
         if "noop" in rows:
             judge(rep, rows["noop"], lane.noop)
         if "dev-speed" in rows:
@@ -850,6 +955,8 @@ def third_party(eng: engine.Engine, rep: report.Report, args: Input, work: Path,
                 judge(rep, rows[key], lambda: lane.timed_edit("body edit"))
         if "signature" in rows:
             judge(rep, rows["signature"], lane.signature)
+        if "cache-misses" in rows:
+            judge(rep, rows["cache-misses"], lane.cache_misses)
         generated: dict[str, Callable[[str, str, int], str]] = {
             "format-blank": blank_lines, "format-indent": reindent, "comment-line": comment_line,
             "comment-inline": inline_comment,
@@ -1095,6 +1202,15 @@ def selftest() -> None:
         expect(False, "readings with no ticks between are refused")
     except ValueError:
         pass
+    perf = "# started on Thu\n\n1234,,cache-misses:u,100.00,,\n98765,,cache-references,100.00,,\n"
+    expect(perf_counts(perf) == {"cache-misses": 1234, "cache-references": 98765}, f"perf stat read: {perf_counts(perf)}")
+    try:
+        perf_counts("<not supported>,,cache-misses,0,,\n1,,cache-references,1,,\n")
+        expect(False, "a counter the machine lacks is refused")
+    except engine.Failed:
+        pass
+    expect(set(TABLES.values()) == {"token", "syntax-node", "hir-expr", "mir-statement", "memo", "memo-edge",
+                                    "relocation"}, f"the tables of section 17: {TABLES}")
     print(f"{SCRIPT} selftest: ok")
 
 

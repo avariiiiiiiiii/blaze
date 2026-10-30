@@ -2,11 +2,7 @@
 
 use std::cmp;
 
-use hir_def::{
-    AdtId, VariantId,
-    attrs::AttrFlags,
-    signatures::{StructFlags, StructSignature, VariantFields},
-};
+use hir_def::{AdtId, VariantId, attrs::AttrFlags, signatures::StructFlags};
 use rustc_abi::{
     BackendRepr, Float, Integer, NicheOptimizations, Primitive, ReprOptions, Scalar,
     TargetDataLayout, WrappingRange,
@@ -17,7 +13,9 @@ use triomphe::Arc;
 
 use crate::{
     db::HirDatabase,
-    layout::{Layout, LayoutCx, LayoutError, field_ty},
+    layout::{
+        Layout, LayoutCx, LayoutError, enum_variant_ids, field_ty, struct_flags, variant_field_ids,
+    },
     next_solver::{DbInterner, StoredGenericArgs, TypingMode, infer::DbInternerInferExt},
     representability::{Representability, representability},
     traits::StoredParamEnvAndCrate,
@@ -39,10 +37,10 @@ pub fn layout_of_adt_query(
     }
     let dl = target;
     let cx = LayoutCx::new(dl);
-    let handle_variant = |def: VariantId, var: &VariantFields| {
-        var.fields()
+    let handle_variant = |def: VariantId| {
+        variant_field_ids(db, def)
             .iter()
-            .map(|(fd, _)| {
+            .map(|&fd| {
                 super::field_layout(
                     db,
                     field_ty(db, def, fd, args.as_ref()).store(),
@@ -53,15 +51,14 @@ pub fn layout_of_adt_query(
     };
     let (variants, repr, niche_optimizations) = match def {
         AdtId::StructId(s) => {
-            let sig = StructSignature::of(db, s);
+            let flags = struct_flags(db, s);
             let mut r = SmallVec::<[_; 1]>::new();
-            r.push(handle_variant(s.into(), s.fields(db))?);
+            r.push(handle_variant(s.into())?);
             (
                 r,
                 AttrFlags::repr(db, s.into()).unwrap_or_default(),
                 // As rustc: `UnsafeCell` and `UnsafePinned` hide their fields' niches.
-                if sig.flags.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED)
-                {
+                if flags.intersects(StructFlags::IS_UNSAFE_CELL | StructFlags::IS_UNSAFE_PINNED) {
                     NicheOptimizations::Disabled
                 } else {
                     NicheOptimizations::Enabled
@@ -71,15 +68,13 @@ pub fn layout_of_adt_query(
         AdtId::UnionId(id) => {
             let repr = AttrFlags::repr(db, id.into());
             let mut r = SmallVec::new();
-            r.push(handle_variant(id.into(), id.fields(db))?);
+            r.push(handle_variant(id.into())?);
             (r, repr.unwrap_or_default(), NicheOptimizations::Enabled)
         }
         AdtId::EnumId(e) => {
-            let variants = e.enum_variants(db);
-            let r = variants
-                .variants
-                .values()
-                .map(|&(v, _)| handle_variant(v.into(), v.fields(db)))
+            let r = enum_variant_ids(db, e)
+                .iter()
+                .map(|&v| handle_variant(v.into()))
                 .collect::<Result<SmallVec<_>, _>>()?;
             (r, AttrFlags::repr(db, e.into()).unwrap_or_default(), NicheOptimizations::Enabled)
         }
@@ -87,7 +82,7 @@ pub fn layout_of_adt_query(
     // A struct whose last field may be unsized for some generic arguments keeps that field last
     // for all of them, so that unsizing the struct does not move it.
     let maybe_unsized = match def {
-        AdtId::StructId(s) => s.fields(db).fields().iter().last().is_some_and(|(fd, _)| {
+        AdtId::StructId(s) => variant_field_ids(db, s.into()).last().is_some_and(|&fd| {
             let interner = DbInterner::new_with(db, krate);
             let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
             let ty = db.field_types(s.into())[fd].ty().instantiate_identity().skip_norm_wip();
@@ -111,7 +106,7 @@ pub fn layout_of_adt_query(
             |min, max| repr_discr(dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false)),
             variants.iter_enumerated().filter_map(|(id, _)| {
                 let AdtId::EnumId(e) = def else { return None };
-                let d = db.const_eval_discriminant(e.enum_variants(db).variants[id.0].0).ok()?;
+                let d = db.const_eval_discriminant(enum_variant_ids(db, e)[id.0]).ok()?;
                 // As rustc has a discriminant: the bits of its type, and no more.
                 let size = Integer::from_attr(dl, repr.discr_type()).size();
                 Some((id, size.truncate(d as u128)))
@@ -122,7 +117,7 @@ pub fn layout_of_adt_query(
     // As rustc's `layout_of_uncached`: the `f16b` and `ppcf128` lang items are structs over an
     // integer of their size, laid out as the backend's float scalar of that format.
     if let AdtId::StructId(s) = def {
-        let flags = StructSignature::of(db, s).flags;
+        let flags = struct_flags(db, s);
         let float = if flags.contains(StructFlags::IS_F16B) {
             Some(Float::F16B)
         } else if flags.contains(StructFlags::IS_PPC_F128) {

@@ -17,6 +17,9 @@
 //! - [`apart`]: where two maps differ, for the codegen inputs (each `InstanceKey` with its
 //!   `CodeHash`) and the output files.
 //! - [`Rng`] and [`sample`]: the seeded choice of what to check when not everything is.
+//! - [`bytes`]: where two outputs first differ, by SIMD chosen at run time.
+
+pub mod bytes;
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -28,12 +28,17 @@ mod has_source;
 mod semantics;
 mod source_analyzer;
 
+pub mod check;
 pub mod db;
 pub mod diagnostics;
+pub mod evict;
 pub mod symbols;
 pub mod term_search;
 
 mod display;
+
+#[cfg(test)]
+mod tests;
 
 #[doc(hidden)]
 pub use hir_def::ModuleId;

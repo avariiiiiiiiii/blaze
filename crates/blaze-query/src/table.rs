@@ -80,10 +80,6 @@ impl<V> Shards<V> {
             write(shard).retain(|key, value| f(key, value));
         }
     }
-
-    pub(crate) fn len(&self) -> usize {
-        self.shards.iter().map(|shard| read(shard).len()).sum()
-    }
 }
 
 impl<V: Clone> Shards<V> {

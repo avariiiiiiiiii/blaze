@@ -44,7 +44,7 @@ use triomphe::Arc as TArc;
 use tt::{Delimiter, DelimiterKind, IdentIsRaw, Leaf, LitKind, Spacing, Subtree, TokenTree};
 
 use crate::{
-    AdtId, AssocItemId, AstId, BlockId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc,
+    AdtId, AstId, BlockId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc,
     DefWithBodyId, EnumLoc, EnumVariantId, EnumVariantLoc, ExternBlockId, ExternBlockLoc,
     ExternCrateId, ExternCrateLoc, FunctionLoc, ImplId, ImplLoc, Intern, ItemContainerId, Lookup,
     Macro2Loc, MacroExpander, MacroId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId,
@@ -386,44 +386,6 @@ fn position<T: PartialEq>(all: &[T], it: T) -> u32 {
     all.iter().position(|x| *x == it).unwrap() as u32
 }
 
-/// The items of `module` that have a body: a block in the module is in one of theirs.
-fn body_owners(db: &dyn SourceDatabase, module: ModuleId) -> Vec<DefWithBodyId> {
-    let def_map = module.def_map(db);
-    let Some((_, data)) = def_map.modules(db).find(|(id, _)| *id == module) else {
-        return Vec::new();
-    };
-    let scope = data.scope(db);
-    let mut owners: Vec<DefWithBodyId> = scope.unnamed_consts().map(Into::into).collect();
-    let assoc = |owners: &mut Vec<DefWithBodyId>, items: &[(Name, AssocItemId)]| {
-        for (_, item) in items {
-            match *item {
-                AssocItemId::FunctionId(it) => owners.push(it.into()),
-                AssocItemId::ConstId(it) => owners.push(it.into()),
-                AssocItemId::TypeAliasId(_) => {}
-            }
-        }
-    };
-    for def in scope.declarations() {
-        match def {
-            ModuleDefId::FunctionId(it) => owners.push(it.into()),
-            ModuleDefId::ConstId(it) => owners.push(it.into()),
-            ModuleDefId::StaticId(it) => owners.push(it.into()),
-            ModuleDefId::AdtId(AdtId::EnumId(it)) => {
-                let variants = &crate::signatures::EnumVariants::of(db, it).0.variants;
-                owners.extend(variants.values().map(|&(it, _)| DefWithBodyId::VariantId(it)));
-            }
-            ModuleDefId::TraitId(it) => {
-                assoc(&mut owners, &super::assoc::TraitItems::query(db, it).items)
-            }
-            _ => {}
-        }
-    }
-    for it in scope.impls() {
-        assoc(&mut owners, &super::assoc::ImplItems::of(db, it).0.items);
-    }
-    owners
-}
-
 const NEW: u8 = 0;
 const SEEN: u8 = 1;
 
@@ -451,10 +413,8 @@ pub struct Enc<'a> {
     context_hashes: FxHashMap<SyntaxContext, u128>,
     modules: FxHashMap<ModuleId, (u32, u32)>,
     indexed: FxHashSet<Crate>,
-    /// The body each block that was looked for is in, found by lowering every body of the
-    /// modules in `searched`.
+    /// The body each block that was looked for is in.
     block_owners: FxHashMap<BlockId, DefWithBodyId>,
-    searched: FxHashSet<ModuleId>,
     out_dirs: Vec<(u32, String)>,
 }
 
@@ -515,7 +475,6 @@ impl<'a> Enc<'a> {
             modules: FxHashMap::default(),
             indexed: FxHashSet::default(),
             block_owners: FxHashMap::default(),
-            searched: FxHashSet::default(),
             out_dirs,
         }
     }
@@ -1034,30 +993,12 @@ impl Enc<'_> {
         Ok(())
     }
 
-    /// The body `block` is in: one of an item of the module the block is in, or, in a block
-    /// with items, that block's.
+    /// The body `block` is in, found without lowering any other body.
     fn block_owner(&mut self, block: BlockId) -> R<DefWithBodyId> {
         if let Some(&owner) = self.block_owners.get(&block) {
             return Ok(owner);
         }
-        let db = self.db;
-        let module = unsafe { block.module(db).to_static() };
-        if self.searched.insert(module) {
-            for owner in body_owners(db, module) {
-                for (found, _) in Body::of(db, owner).blocks(db) {
-                    self.block_owners.entry(found).or_insert(owner);
-                }
-            }
-        }
-        if let Some(&owner) = self.block_owners.get(&block) {
-            return Ok(owner);
-        }
-        let outer = module.block(db).map(|it| unsafe { it.to_static() });
-        let owner = outer.ok_or("a block in no body of its module")?;
-        let owner = self.block_owner(owner)?;
-        if !Body::of(db, owner).blocks(db).any(|(it, _)| it == block) {
-            return Err("a block in no body of the block it is in".to_owned());
-        }
+        let owner = super::demand::block_owner(self.db, block)?;
         self.block_owners.insert(block, owner);
         Ok(owner)
     }

@@ -11,6 +11,10 @@
 //!   itself is not taken back in as an edit.
 //! - Changes the system dropped (`lost`) stop the watch ([`Watched::Lost`]): the head no longer
 //!   follows the disk, and nothing guesses what changed.
+//! - Modes: [`Effect::Stat`] says nothing of a file's executable bit or of a symlink, and
+//!   [`Effect::ReadAll`] reads through a symlink. So a file the head has keeps its mode, a new
+//!   one is [`Mode::Regular`], and a chmod alone is not seen, until the driver reports modes
+//!   (v2/requests/vfs.md item 6).
 
 use std::collections::VecDeque;
 
@@ -18,7 +22,17 @@ use blaze_core::{Completion, Done, Effect, FileName, IoError, Tag};
 use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
-use crate::{Commit, FILE_DOMAIN, Op, Vfs, tree::ancestors};
+use crate::{
+    Commit, FILE_DOMAIN, Mode, Op, Vfs,
+    tree::{NodeId, Tree, ancestors},
+};
+
+/// What the head has at a path: its node's content ID and its mode.
+type Seen = Option<(ContentId, Mode)>;
+
+fn seen(tree: &Tree, root: NodeId, path: &str) -> Seen {
+    tree.entry(root, path).map(|(node, mode)| (tree.id(node), mode))
+}
 
 /// How many tags a watcher uses: its watch, then one per path being read, reused in turn.
 const TAGS: u64 = 1 << 32;
@@ -53,7 +67,7 @@ struct Slot {
     /// Under the driver's root.
     file: FileName,
     /// What the head had at `path` when the change was reported.
-    was: Option<ContentId>,
+    was: Seen,
     disk: Option<Disk>,
 }
 
@@ -74,7 +88,7 @@ pub struct Watcher {
     reading: FxHashMap<Tag, (u64, usize)>,
     next_tag: u64,
     /// What this watcher's commits left at each path, while batches told before them wait.
-    ours: FxHashMap<String, Option<ContentId>>,
+    ours: FxHashMap<String, Seen>,
 }
 
 impl Watcher {
@@ -188,7 +202,7 @@ impl Watcher {
         for file in files {
             let Some(path) = file.as_str().strip_prefix(&below) else { continue };
             let path = path.to_owned();
-            let was = vfs.tree.lookup(head, &path).map(|it| vfs.tree.id(it));
+            let was = seen(&vfs.tree, head, &path);
             let tag = Tag(self.tags + 1 + self.next_tag);
             self.next_tag = (self.next_tag + 1) % (TAGS - 1);
             assert!(!self.reading.contains_key(&tag), "2^32 paths are being read at once");
@@ -205,11 +219,12 @@ impl Watcher {
         let base = vfs.heads.get(&*self.head).copied().unwrap_or(vfs.tree.empty());
         let tree = &vfs.tree;
         let mut deletes: Vec<String> = Vec::new();
-        let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut writes: Vec<(String, Vec<u8>, Mode)> = Vec::new();
         let mut taken = Vec::new();
         for slot in batch.slots {
-            let node = tree.lookup(base, &slot.path);
-            let now = node.map(|it| tree.id(it));
+            let entry = tree.entry(base, &slot.path);
+            let node = entry.map(|it| it.0);
+            let now = entry.map(|(node, mode)| (tree.id(node), mode));
             if now != slot.was && !self.made(&slot.path, now) {
                 out.push(Watched::Conflict { path: slot.path });
                 continue;
@@ -231,8 +246,9 @@ impl Watcher {
                     if node.is_some() && !is_file {
                         deletes.push(slot.path.clone());
                     }
-                    if now != Some(ContentId::of(FILE_DOMAIN, &bytes)) {
-                        writes.push((slot.path.clone(), bytes));
+                    let mode = entry.filter(|_| is_file).map_or(Mode::Regular, |it| it.1);
+                    if now != Some((ContentId::of(FILE_DOMAIN, &bytes), mode)) {
+                        writes.push((slot.path.clone(), bytes, mode));
                     }
                 }
             }
@@ -247,7 +263,7 @@ impl Watcher {
         let ops: Vec<Op> = deletes
             .into_iter()
             .map(|path| Op::Delete { path })
-            .chain(writes.into_iter().map(|(path, bytes)| Op::Write { path, bytes }))
+            .chain(writes.into_iter().map(|(path, bytes, mode)| Op::Write { path, bytes, mode }))
             .collect();
         if ops.is_empty() {
             return;
@@ -262,15 +278,14 @@ impl Watcher {
             Op::Edit { .. } | Op::Rename { .. } => unreachable!("the disk makes no {op:?}"),
         });
         for path in taken.iter().chain(paths) {
-            let left = vfs.tree.lookup(root, path).map(|it| vfs.tree.id(it));
-            self.ours.insert(path.clone(), left);
+            self.ours.insert(path.clone(), seen(&vfs.tree, root, path));
         }
         out.push(Watched::Committed(commit));
     }
 
     /// Whether this watcher's commits left `path` as `now`: it put that there, or `path` is gone
     /// because it replaced or deleted something above it.
-    fn made(&self, path: &str, now: Option<ContentId>) -> bool {
+    fn made(&self, path: &str, now: Seen) -> bool {
         self.ours.get(path) == Some(&now)
             || (now.is_none() && ancestors(path).any(|up| self.ours.contains_key(up)))
     }

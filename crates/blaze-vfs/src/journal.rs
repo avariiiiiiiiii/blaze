@@ -24,11 +24,11 @@ use blaze_ids::{ContentId, Hasher};
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Recovered, Ticket,
+    Mode, Recovered, Ticket,
     tree::{NodeId, Tree},
 };
 
-const MAGIC: [u8; 4] = *b"BZJ2";
+const MAGIC: [u8; 4] = *b"BZJ3";
 const HEADER: usize = MAGIC.len() + 4 + 1;
 const CHECKSUM: usize = 8;
 const CHECKSUM_DOMAIN: &str = "blaze v2 vfs journal record 1";
@@ -334,10 +334,11 @@ fn write_node(tree: &Tree, written: &mut [bool], out: &mut Vec<u8>, node: NodeId
         } else {
             let entries = tree.entries(node).expect("a directory");
             let mut payload = Vec::new();
-            for &(name, child) in entries {
+            for &(name, child, mode) in entries {
                 let name = tree.name_str(name);
                 payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
                 payload.extend_from_slice(name.as_bytes());
+                payload.extend_from_slice(&mode.git().to_le_bytes());
                 payload.extend_from_slice(&tree.id(child).0);
             }
             frame(out, DIR, &payload);
@@ -408,11 +409,13 @@ fn load(
             while !rest.is_empty() {
                 let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
                 let name = std::str::from_utf8(rest.get(4..4 + len)?).ok()?;
-                let id = ContentId(rest.get(4 + len..4 + len + 32)?.try_into().ok()?);
-                rest = &rest[4 + len + 32..];
+                let mode = u32::from_le_bytes(rest.get(4 + len..8 + len)?.try_into().ok()?);
+                let mode = Mode::from_git(mode)?;
+                let id = ContentId(rest.get(8 + len..8 + len + 32)?.try_into().ok()?);
+                rest = &rest[8 + len + 32..];
                 let child = tree.node(&id)?;
                 let name = tree.name(name);
-                entries.push((name, child));
+                entries.push((name, child, mode));
             }
             tree.dir(entries);
         }

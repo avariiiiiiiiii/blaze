@@ -11,6 +11,10 @@
 //! A cursor can also point into a [`FlatTree`]: then it is the tree's root and an
 //! element's number, and moving is arithmetic on the tree's arrays, with nothing
 //! allocated. A green tree of a flat one's part is made only when asked for.
+//!
+//! A flat tree's lazy nodes are transparent: moving down into one moves into its part
+//! (parsed then, once), whose root stands for the lazy node itself, and moving up or
+//! sideways out of a part's children moves back into the file's tree.
 
 // Implementation notes:
 //
@@ -39,6 +43,14 @@
 // the green trees made of its parts, which live as long as it does: a `&GreenNodeData`
 // handed out for a flat node points into one of them. Two roots of one tree have equal
 // cursors, as two roots of one green node do.
+//
+// A cursor into a lazy node's part points at a `FlatRoot` of the part, which the file's
+// `FlatRoot` makes the first time a cursor enters the part and owns: such a root has no
+// count of its own, and a cursor into it counts the file's root, so it lives as long as any
+// cursor into the file. A cursor never points at a part's root element: that element is the
+// lazy node, so a cursor at it points at the lazy node in the file's tree (`flat_ref`), and
+// equal elements are equal cursors. Parts have no lazy nodes of their own (`FlatTree::part`
+// checks), so a part's root is always a file root's.
 
 use std::{
     cell::{Cell, RefCell},
@@ -78,9 +90,23 @@ struct NodeData {
 }
 
 struct FlatRoot {
+    /// The cursors into this tree and its parts; unused in a part's root.
     rc: Cell<u32>,
     tree: Arc<FlatTree>,
     greens: RefCell<FxHashMap<u32, NodeOrToken<GreenNode, GreenToken>>>,
+    /// For a part's root: the file's root, which owns it, and the lazy node it is the part of.
+    file: Option<(ptr::NonNull<FlatRoot>, u32)>,
+    /// For a file's root: the roots of the parts cursors entered, by their lazy node.
+    parts: RefCell<FxHashMap<u32, ptr::NonNull<FlatRoot>>>,
+}
+
+impl Drop for FlatRoot {
+    fn drop(&mut self) {
+        for (_, part) in self.parts.get_mut().drain() {
+            // SAFETY: a part's root is made by `part_root` from a box and freed only here.
+            drop(unsafe { Box::from_raw(part.as_ptr()) })
+        }
+    }
 }
 
 /// What a cursor points at: a `NodeData`, or an element of a flat tree.
@@ -98,7 +124,7 @@ impl Clone for Ref {
                 Ref::Green(ptr)
             }
             Ref::Flat(root, at) => {
-                flat(&root).inc_rc();
+                flat(&owner(root)).inc_rc();
                 Ref::Flat(root, at)
             }
         }
@@ -115,8 +141,9 @@ impl Drop for Ref {
                 }
             }
             Ref::Flat(root, _) => {
-                if flat(&root).dec_rc() {
-                    drop(unsafe { Box::from_raw(root.as_ptr()) })
+                let owner = owner(root);
+                if flat(&owner).dec_rc() {
+                    drop(unsafe { Box::from_raw(owner.as_ptr()) })
                 }
             }
         }
@@ -133,7 +160,35 @@ fn flat(root: &ptr::NonNull<FlatRoot>) -> &FlatRoot {
     unsafe { root.as_ref() }
 }
 
+/// The root that owns `root` and counts the cursors into it: the file's for a part's.
+#[inline]
+fn owner(root: ptr::NonNull<FlatRoot>) -> ptr::NonNull<FlatRoot> {
+    match flat(&root).file {
+        Some((file, _)) => file,
+        None => root,
+    }
+}
+
 impl FlatRoot {
+    /// The root of the part of lazy node `at` of this file's tree, made the first time.
+    fn part_root(&self, this: ptr::NonNull<FlatRoot>, at: u32) -> ptr::NonNull<FlatRoot> {
+        debug_assert!(self.file.is_none(), "a part has no lazy nodes");
+        if let Some(&part) = self.parts.borrow().get(&at) {
+            return part;
+        }
+        let tree = self.tree.part(at).clone();
+        let part = FlatRoot {
+            rc: Cell::new(0),
+            tree,
+            greens: RefCell::default(),
+            file: Some((this, at)),
+            parts: RefCell::default(),
+        };
+        let part = unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(part))) };
+        self.parts.borrow_mut().insert(at, part);
+        part
+    }
+
     #[inline]
     fn inc_rc(&self) {
         let rc = match self.rc.get().checked_add(1) {
@@ -172,20 +227,76 @@ impl FlatRoot {
     }
 }
 
-/// A cursor at element `at` of the flat tree `root`.
+/// A cursor at element `at` of the flat tree `root`: at the lazy node for a part's root.
 #[inline]
 fn flat_ref(root: ptr::NonNull<FlatRoot>, at: u32) -> Ref {
-    flat(&root).inc_rc();
+    let (root, at) = match flat(&root).file {
+        Some(lazy) if at == 0 => lazy,
+        _ => (root, at),
+    };
+    flat(&owner(root)).inc_rc();
     Ref::Flat(root, at)
 }
 
 #[inline]
 fn flat_element(root: ptr::NonNull<FlatRoot>, at: u32) -> SyntaxElement {
+    let token = flat(&root).tree.is_token(at);
     let element = flat_ref(root, at);
-    match flat(&root).tree.is_token(at) {
+    match token {
         true => NodeOrToken::Token(SyntaxToken(element)),
         false => NodeOrToken::Node(SyntaxNode(element)),
     }
+}
+
+/// Where the children of element `at` of `root` are: a lazy node's in its part, under the
+/// part's root.
+#[inline]
+fn inner(root: ptr::NonNull<FlatRoot>, at: u32) -> (ptr::NonNull<FlatRoot>, u32) {
+    match flat(&root).tree.is_lazy(at) {
+        true => (flat(&root).part_root(root, at), 0),
+        false => (root, at),
+    }
+}
+
+/// The parent of element `at` of `root`: the lazy node for a child of a part's root.
+#[inline]
+fn up(root: ptr::NonNull<FlatRoot>, at: u32) -> Option<(ptr::NonNull<FlatRoot>, u32)> {
+    let parent = flat(&root).tree.parent(at)?;
+    Some(match flat(&root).file {
+        Some(lazy) if parent == 0 => lazy,
+        _ => (root, parent),
+    })
+}
+
+/// [`flat`] for a root that is not borrowed from a cursor.
+///
+/// SAFETY: the caller holds a cursor into `root`'s file, which keeps `root` alive (a part's
+/// root lives as long as its file's), for as long as the reference is used.
+#[inline]
+unsafe fn flat_unbound<'a>(root: ptr::NonNull<FlatRoot>) -> &'a FlatRoot {
+    unsafe { &*root.as_ptr() }
+}
+
+/// What stepping down by `child_or_token_at_range` from element `at` of `root` finds first
+/// of `kind` and `range`, a range that is not empty. The arrays' search sees a lazy node as
+/// a node without children, so when it finds nothing and the range is inside a lazy node,
+/// the search goes on in its part: what is above the lazy node was searched already.
+fn flat_node_at_range(
+    root: ptr::NonNull<FlatRoot>,
+    at: u32,
+    range: TextRange,
+    kind: SyntaxKind,
+) -> Option<SyntaxNode> {
+    let (root, at) = inner(root, at);
+    let tree = &flat(&root).tree;
+    if let Some(found) = tree.node_at_range(at, range, kind) {
+        return Some(SyntaxNode(flat_ref(root, found)));
+    }
+    let lazy = tree
+        .last_starting(at, range.start())
+        .filter(|&it| tree.is_lazy(it) && tree.range(it).contains_range(range))?;
+    let (part, at) = inner(root, lazy);
+    flat(&part).tree.node_at_range(at, range, kind).map(|it| SyntaxNode(flat_ref(part, it)))
 }
 
 pub type SyntaxElement = NodeOrToken<SyntaxNode, SyntaxToken>;
@@ -410,7 +521,7 @@ impl Ref {
         match self {
             Ref::Green(ptr) => data(ptr).parent_node(),
             Ref::Flat(root, at) => {
-                flat(root).tree.parent(*at).map(|it| SyntaxNode(flat_ref(*root, it)))
+                up(*root, *at).map(|(root, it)| SyntaxNode(flat_ref(root, it)))
             }
         }
     }
@@ -449,15 +560,15 @@ impl Ref {
     /// The element of a green tree equal to the flat one this points into that is where
     /// this element is.
     fn green_twin(&self) -> SyntaxElement {
-        let Ref::Flat(root, at) = self else { unreachable!("a green element is its own twin") };
-        let tree = &flat(root).tree;
+        let Ref::Flat(root, _) = self else { unreachable!("a green element is its own twin") };
         let mut path = Vec::new();
-        let mut at = *at;
-        while let Some(parent) = tree.parent(at) {
-            path.push(tree.index(at));
-            at = parent;
+        let mut it = self.clone();
+        while let Some(parent) = it.parent() {
+            path.push(it.index());
+            it = parent.0;
         }
-        let green = flat(root).green(0).into_node().expect("the root is a node").to_owned();
+        let top = owner(*root);
+        let green = flat(&top).green(0).into_node().expect("the root is a node").to_owned();
         let mut element: SyntaxElement = SyntaxNode::new_root(green).into();
         for index in path.into_iter().rev() {
             let node = element.into_node().expect("a token has no children");
@@ -477,12 +588,31 @@ impl SyntaxNode {
     /// The root of a flat tree.
     pub fn new_flat_root(tree: Arc<FlatTree>) -> SyntaxNode {
         assert!(!tree.is_empty() && !tree.is_token(0), "a tree's root is a node");
-        let root = FlatRoot { rc: Cell::new(1), tree, greens: RefCell::default() };
+        let root = FlatRoot {
+            rc: Cell::new(1),
+            tree,
+            greens: RefCell::default(),
+            file: None,
+            parts: RefCell::default(),
+        };
         let root = unsafe { ptr::NonNull::new_unchecked(Box::into_raw(Box::new(root))) };
         SyntaxNode(Ref::Flat(root, 0))
     }
 
-    /// The flat tree this node is in, if it is in one.
+    /// Whether this is a lazy node of a flat tree whose part is not parsed yet. Never parses.
+    #[inline]
+    pub fn is_lazy(&self) -> bool {
+        match &self.0 {
+            Ref::Flat(root, at) => {
+                let tree = &flat(root).tree;
+                tree.is_lazy(*at) && !tree.is_parsed(*at)
+            }
+            Ref::Green(_) => false,
+        }
+    }
+
+    /// The flat tree this node is in, if it is in one: a lazy node's part for a node inside
+    /// it.
     pub fn flat_tree(&self) -> Option<&Arc<FlatTree>> {
         match &self.0 {
             Ref::Green(_) => None,
@@ -490,7 +620,8 @@ impl SyntaxNode {
         }
     }
 
-    /// The flat tree this node is in and the node's number in it, if it is in one.
+    /// The flat tree this node is in and the node's number in it, if it is in one: a lazy
+    /// node's part for a node inside it, the file's tree for the lazy node itself.
     #[inline]
     pub fn flat(&self) -> Option<(&Arc<FlatTree>, u32)> {
         match &self.0 {
@@ -542,6 +673,7 @@ impl SyntaxNode {
     pub fn child_where(&self, mut pred: impl FnMut(SyntaxKind) -> bool) -> Option<SyntaxNode> {
         match self.0 {
             Ref::Flat(root, at) => {
+                let (root, at) = inner(root, at);
                 let tree = &flat(&root).tree;
                 let child = tree.children(at).find(|&it| pred(tree.kind(it)))?;
                 Some(SyntaxNode(flat_ref(root, child)))
@@ -555,10 +687,9 @@ impl SyntaxNode {
     pub fn ancestor_where(&self, mut pred: impl FnMut(SyntaxKind) -> bool) -> Option<SyntaxNode> {
         match self.0 {
             Ref::Flat(root, at) => {
-                let tree = &flat(&root).tree;
-                let mut it = at;
-                while !pred(tree.kind(it)) {
-                    it = tree.parent(it)?;
+                let (mut root, mut it) = (root, at);
+                while !pred(flat(&root).tree.kind(it)) {
+                    (root, it) = up(root, it)?;
                 }
                 Some(SyntaxNode(flat_ref(root, it)))
             }
@@ -571,6 +702,7 @@ impl SyntaxNode {
     pub fn child_token(&self, kind: SyntaxKind) -> Option<SyntaxToken> {
         match self.0 {
             Ref::Flat(root, at) => {
+                let (root, at) = inner(root, at);
                 let tree = &flat(&root).tree;
                 let token = tree
                     .children_with_tokens(at)
@@ -588,7 +720,11 @@ impl SyntaxNode {
     #[inline]
     pub fn children_where(&self) -> SyntaxNodeChildrenWhere {
         SyntaxNodeChildrenWhere(match self.0 {
-            Ref::Flat(_, at) => ChildrenWhere::Flat { parent: self.clone(), next: at + 1 },
+            Ref::Flat(root, at) => {
+                let (root, at) = inner(root, at);
+                let end = flat(&root).tree.end(at);
+                ChildrenWhere::Flat { _parent: self.clone(), root, next: at + 1, end }
+            }
             Ref::Green(_) => ChildrenWhere::Green(self.children()),
         })
     }
@@ -606,9 +742,12 @@ impl SyntaxNode {
     pub fn clone_subtree(&self) -> SyntaxNode {
         match &self.0 {
             Ref::Green(_) => SyntaxNode::new_root(self.green().to_owned()),
-            Ref::Flat(root, 0) => SyntaxNode(flat_ref(*root, 0)),
             Ref::Flat(root, at) => {
-                SyntaxNode::new_flat_root(Arc::new(flat(root).tree.subtree(*at)))
+                let tree = &flat(root).tree;
+                match *at == 0 && flat(root).file.is_none() && tree.range(0).start() == 0.into() {
+                    true => SyntaxNode(flat_ref(*root, 0)),
+                    false => SyntaxNode::new_flat_root(Arc::new(tree.subtree(*at))),
+                }
             }
         }
     }
@@ -663,8 +802,10 @@ impl SyntaxNode {
         match &self.0 {
             Ref::Green(_) => Some(self.green_ref().children().next()?.into_token()?.text()),
             Ref::Flat(root, at) => {
-                let tree = &flat(root).tree;
-                let first = tree.first_child_or_token(*at).filter(|&it| tree.is_token(it))?;
+                let (root, at) = inner(*root, *at);
+                // SAFETY: `self` is a cursor into the file `root` is the tree or a part of.
+                let tree = &unsafe { flat_unbound(root) }.tree;
+                let first = tree.first_child_or_token(at).filter(|&it| tree.is_token(it))?;
                 Some(tree.token_text(first))
             }
         }
@@ -688,7 +829,7 @@ impl SyntaxNode {
     pub fn tree_top(&self) -> SyntaxNode {
         match &self.0 {
             Ref::Green(_) => self.ancestors().last().unwrap(),
-            Ref::Flat(root, _) => SyntaxNode(flat_ref(*root, 0)),
+            Ref::Flat(root, _) => SyntaxNode(flat_ref(owner(*root), 0)),
         }
     }
 
@@ -704,6 +845,7 @@ impl SyntaxNode {
 
     pub fn first_child(&self) -> Option<SyntaxNode> {
         if let Ref::Flat(root, at) = self.0 {
+            let (root, at) = inner(root, at);
             return flat(&root).tree.first_child(at).map(|it| SyntaxNode(flat_ref(root, it)));
         }
         self.green_ref().children().raw.enumerate().find_map(|(index, child)| {
@@ -719,6 +861,7 @@ impl SyntaxNode {
     }
     pub fn last_child(&self) -> Option<SyntaxNode> {
         if let Ref::Flat(root, at) = self.0 {
+            let (root, at) = inner(root, at);
             let tree = &flat(&root).tree;
             let mut child = tree.last_child_or_token(at);
             while let Some(it) = child {
@@ -743,6 +886,7 @@ impl SyntaxNode {
 
     pub fn first_child_or_token(&self) -> Option<SyntaxElement> {
         if let Ref::Flat(root, at) = self.0 {
+            let (root, at) = inner(root, at);
             return flat(&root).tree.first_child_or_token(at).map(|it| flat_element(root, it));
         }
         self.green_ref().children().raw.next().map(|child| {
@@ -751,6 +895,7 @@ impl SyntaxNode {
     }
     pub fn last_child_or_token(&self) -> Option<SyntaxElement> {
         if let Ref::Flat(root, at) = self.0 {
+            let (root, at) = inner(root, at);
             return flat(&root).tree.last_child_or_token(at).map(|it| flat_element(root, it));
         }
         self.green_ref().children().raw.enumerate().next_back().map(|(index, child)| {
@@ -917,18 +1062,16 @@ impl SyntaxNode {
         kind: SyntaxKind,
     ) -> Option<Option<SyntaxNode>> {
         match self.0 {
-            Ref::Flat(root, at) if !range.is_empty() => Some(
-                flat(&root)
-                    .tree
-                    .node_at_range(at, range, kind)
-                    .map(|it| SyntaxNode(flat_ref(root, it))),
-            ),
+            Ref::Flat(root, at) if !range.is_empty() => {
+                Some(flat_node_at_range(root, at, range, kind))
+            }
             _ => None,
         }
     }
 
     pub fn child_or_token_at_range(&self, range: TextRange) -> Option<SyntaxElement> {
         if let Ref::Flat(root, at) = self.0 {
+            let (root, at) = inner(root, at);
             return flat(&root).tree.child_at_range(at, range).map(|it| flat_element(root, it));
         }
         let rel_range = range - self.offset();
@@ -1272,7 +1415,9 @@ pub struct SyntaxNodeChildrenWhere(ChildrenWhere);
 
 #[derive(Clone, Debug)]
 enum ChildrenWhere {
-    Flat { parent: SyntaxNode, next: u32 },
+    /// The children from `next` to `end` of `root`'s tree, `_parent` (whose children they
+    /// are, in its part when it is a lazy node) keeping `root` alive.
+    Flat { _parent: SyntaxNode, root: ptr::NonNull<FlatRoot>, next: u32, end: u32 },
     Green(SyntaxNodeChildren),
 }
 
@@ -1281,11 +1426,10 @@ impl SyntaxNodeChildrenWhere {
     #[inline]
     pub fn next_where(&mut self, mut pred: impl FnMut(SyntaxKind) -> bool) -> Option<SyntaxNode> {
         match &mut self.0 {
-            ChildrenWhere::Flat { parent, next } => {
-                let Ref::Flat(root, at) = parent.0 else { unreachable!("a flat node's parent") };
+            ChildrenWhere::Flat { root, next, end, .. } => {
+                let root = *root;
                 let tree = &flat(&root).tree;
-                let end = tree.end(at);
-                while *next < end {
+                while *next < *end {
                     let it = *next;
                     *next = tree.end(it);
                     if !tree.is_token(it) && pred(tree.kind(it)) {

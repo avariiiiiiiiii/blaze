@@ -41,11 +41,15 @@ impl Shape {
     pub fn of(traced: &Traced) -> Shape {
         let mut traced = traced.clone();
         trace::normalize(&mut traced);
-        let mut env: Vec<OsString> = traced.env.into_iter().map(|it| it.0).collect();
-        // The variables a run that read them all saw are any the environment has then.
-        if env.iter().any(|it| it == ALL_ENV_NAME) {
-            env = vec![ALL_ENV_NAME.into()];
-        }
+        let all = traced.env.iter().any(|it| it.0 == ALL_ENV_NAME);
+        // The variables a run that read them all saw are any the environment has then; what
+        // it asked for by name and was not there is named still.
+        let env: Vec<OsString> = traced
+            .env
+            .into_iter()
+            .filter(|(name, value)| !all || name == ALL_ENV_NAME || value.is_none())
+            .map(|it| it.0)
+            .collect();
         Shape {
             files: traced.files.into_iter().map(|it| it.0).collect(),
             dirs: traced.dirs.into_iter().map(|it| it.0).collect(),
@@ -63,7 +67,11 @@ impl Shape {
             traced.files.push((path.clone(), inputs.file(path)?));
         }
         for path in &self.dirs {
-            match inputs.dir(path)? {
+            let hash = match trace::walked(path) {
+                Some((dir, package)) => trace::walk(inputs, dir, package)?,
+                None => inputs.dir(path)?,
+            };
+            match hash {
                 Some(hash) => traced.dirs.push((path.clone(), hash)),
                 None => traced.files.push((path.clone(), None)),
             }
@@ -215,9 +223,10 @@ pub fn keep(
     let mut n = 0;
     loop {
         let at = slot(run, n);
-        match store.get(&at).map_err(KeepError::Corrupt)? {
-            Some(entry) if entry.bytes == shape.as_slice() => return Ok(tickets),
-            Some(_) => n += 1,
+        let same = store.get(&at).map_err(KeepError::Corrupt)?.map(|it| it.bytes == shape.as_slice());
+        match same {
+            Some(true) => return Ok(tickets),
+            Some(false) => n += 1,
             None => match store.put(at, Kind::Run, shape.clone()) {
                 Ok(ticket) => {
                     tickets.push(ticket);
@@ -282,6 +291,42 @@ mod tests {
             ..Traced::default()
         };
         assert_eq!(Shape::of(&traced).env, vec![OsString::from(ALL_ENV_NAME)]);
+    }
+
+    #[test]
+    fn a_whole_environment_and_a_name_not_there_find_their_result() {
+        use std::ffi::OsStr;
+
+        use crate::trace::{Line, Seen, assemble};
+
+        struct Env(Vec<(OsString, OsString)>);
+        impl Inputs for Env {
+            type Error = ();
+            fn file(&mut self, _: &Path) -> Result<Option<[u8; 32]>, ()> {
+                Ok(None)
+            }
+            fn dir(&mut self, _: &Path) -> Result<Option<[u8; 32]>, ()> {
+                Ok(None)
+            }
+            fn env(&mut self, name: &OsStr) -> Option<OsString> {
+                self.0.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+            }
+            fn env_all(&mut self) -> Vec<(OsString, OsString)> {
+                self.0.clone()
+            }
+            fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, ()> {
+                Ok(None)
+            }
+        }
+        let lines = [Line::new(Seen::Env, "", "*"), Line::new(Seen::Env, "", "UNSET"), Line::new(Seen::Env, "", "A")];
+        let mut env = Env(vec![("A".into(), "1".into())]);
+        let traced = assemble(&lines, None, &mut env).unwrap();
+        let shape = Shape::of(&traced);
+        assert_eq!(shape.values(&mut env).unwrap(), traced);
+        env.0.push(("UNSET".into(), "now".into()));
+        assert_ne!(shape.values(&mut env).unwrap(), traced);
+        let mut added = Env(vec![("A".into(), "1".into()), ("B".into(), "2".into())]);
+        assert_ne!(shape.values(&mut added).unwrap(), traced);
     }
 
     #[test]

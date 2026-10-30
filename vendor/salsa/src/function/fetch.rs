@@ -38,6 +38,7 @@ where
             database_key_index,
             revisions.durability,
             revisions.changed_at,
+            revisions.fingerprint,
             memo.header.cycle_heads(),
             #[cfg(feature = "accumulator")]
             revisions.accumulated().is_some(),
@@ -138,19 +139,35 @@ where
         // Now that we've claimed the item, check again to see if there's a "hot" value.
         let opt_old_memo = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index);
 
-        if let Some(old_memo) = opt_old_memo
-            && old_memo.value.is_some()
-            && old_memo.header.verify_memo(
-                db.into(),
-                &claim_guard,
-                C::CYCLE_STRATEGY,
-                #[cfg(feature = "detailed-trace")]
-                true,
-            )
-        {
-            // SAFETY: memo is present in memo_map and we have verified that it is
-            // still valid for the current revision.
-            return unsafe { Some(self.extend_memo_lifetime(old_memo)) };
+        if let Some(old_memo) = opt_old_memo {
+            if old_memo.value.is_some() {
+                if old_memo.header.verify_memo(
+                    db.into(),
+                    &claim_guard,
+                    C::CYCLE_STRATEGY,
+                    #[cfg(feature = "detailed-trace")]
+                    true,
+                ) {
+                    // SAFETY: memo is present in memo_map and we have verified that it is
+                    // still valid for the current revision.
+                    return unsafe { Some(self.extend_memo_lifetime(old_memo)) };
+                }
+            } else if !old_memo.header.revisions.fingerprint.is_value()
+                && !old_memo.header.may_be_provisional()
+            {
+                // An evicted value without a value fingerprint can only be backdated when the
+                // memo is verified in this revision (see `backdate_if_appropriate`), so verify
+                // it before computing the value again. One with a value fingerprint is compared
+                // by fingerprint and needs no verification first; a provisional memo is never
+                // backdated.
+                let _verified = old_memo.header.verify_memo(
+                    db.into(),
+                    &claim_guard,
+                    C::CYCLE_STRATEGY,
+                    #[cfg(feature = "detailed-trace")]
+                    true,
+                );
+            }
         }
 
         self.execute(db, claim_guard, opt_old_memo)

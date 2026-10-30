@@ -1,16 +1,15 @@
-//! Global `Arc`-based object interning infrastructure.
-//!
-//! Eventually this should probably be replaced with salsa-based interning.
+//! Global interning in sharded, append-only arenas (docs/v2/format.md section 5, "IDs, two
+//! kinds"): an interned value is stored once, never moves and is never freed, and its handle is
+//! a `Copy` pointer compared by address.
 
-mod gc;
+mod arena;
 mod intern;
 mod intern_slice;
-mod local;
 mod symbol;
 
-pub use self::gc::{GarbageCollector, GcInternedSliceVisit, GcInternedVisit};
 pub use self::intern::{InternStorage, Internable, Interned, InternedRef, impl_internable};
 pub use self::intern_slice::{
-    InternSliceStorage, InternedSlice, InternedSliceRef, SliceInternable, impl_slice_internable,
+    HeaderSlice, HeaderWithLength, InternSliceStorage, InternedSlice, InternedSliceRef,
+    SliceInternable, impl_slice_internable,
 };
 pub use self::symbol::{Symbol, symbols as sym};

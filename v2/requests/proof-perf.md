@@ -1,49 +1,24 @@
 # Requests from lane proof-perf
 
 `harness/v2/budgets.py`, `harness/v2/determinism.py` and `harness/v2/tightmemory.py` are written
-against the items below.
+against the items below. `pyproject.toml` already checks `harness/v2`, `fixture.py` has the
+workspace determinism builds, and `proof.py` runs all three, so those requests are gone.
 
-## 1. `pyproject.toml`: lint and type-check `harness/v2`
+## 1. The agent API: what a request did, and its critical path
 
-Where: the root `pyproject.toml`, ruff's and pyright's include lists.
+Where: `crates/blaze-api` (lane ci, docs/v2/ci.md), then `harness/v2/engine.py`'s `V2.mark`,
+`V2.work_since` and `V2.critical_path_s`.
 
-Why: nothing checks the three scripts today, and they import their siblings by name.
+Why: these three raise `engine.Missing` on v2. Every budget that counts the functions an edit
+compiled (body, signature, format, comment, rename, move, big crate) needs `mark`/`work_since`.
+The cold build of blaze needs `critical_path_s`. On v2 those rows are an `error` naming the
+missing request until the API carries:
 
-- Add `harness/v2/*.py` to ruff's and pyright's `include`.
-- Set pyright `extraPaths = ["harness", "harness/v2", "python/typed-input"]` so that `engine`,
-  `report`, `budgets`, `bench`, `memory`, `blaze_cli` and `typed_input` resolve.
-- Add a ruff per-file ignore of `E402` for `harness/v2/*`: the imports follow the `sys.path`
-  line.
+- per request: the queries rerun and found green, the functions compiled and found in the store,
+  and how the program was linked;
+- per cold build: the critical path as the plane measured it (docs/v2/plane.md).
 
-## 2. `harness/v2/fixture.py`: `write_workspace(dir: Path, seed: int)`
-
-Where: lane proof-corpus's `harness/v2/fixture.py`.
-
-Why: determinism.py builds the oracle's fixture twice on different core counts. It calls
-`write_workspace(dir, seed)` with an existing, empty directory, expects a cargo workspace there
-that `blaze build` builds from that directory, and ignores what it returns. Until it exists,
-determinism's fixture row is an `error` that says so.
-
-## 3. `harness/v2/proof.py`: run and read the three
-
-Where: lane proof's `harness/v2/proof.py`.
-
-Why: each script writes a `report.Report` JSON to `out`. All three need Linux.
-
-- `budgets.py {engine, out, work}`.
-- `determinism.py {engine, out, work}`.
-- `tightmemory.py {engine, out, work}`, plus `cgroup` (a writable cgroup v2 directory with
-  `memory` in its `cgroup.subtree_control`) where `systemd-run --user` has no memory controller
-  delegated.
-
-## 4. `harness/v2/engine.py`: the V2 adapter's measuring calls
-
-Where: `harness/v2/engine.py`, `V2`.
-
-Why: `wait_ready`, `stop`, `mark`/`work_since` and `critical_path_s` raise
-`NotImplementedError("v2: ...")`. Every row that needs one is an `error` on v2 until it is there.
-
-## 5. Finding for core: what `BLAZE_MEMORY_BUDGET` takes off
+## 2. Finding for core: what `BLAZE_MEMORY_BUDGET` takes off
 
 Where: `crates/blaze-cargo/src/memory.rs`, and docs/v2/core.md section 4.
 

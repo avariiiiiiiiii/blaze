@@ -129,6 +129,15 @@ class Work:
 
 
 @dataclass(frozen=True)
+class Table:
+    """One of the daemon's long-lived tables (docs/v2/README.md section 17): how many elements
+    it holds and the bytes of all its columns and side tables together."""
+
+    elements: int
+    bytes: int
+
+
+@dataclass(frozen=True)
 class Mark:
     """Where an engine's logs were at a moment: `work_since` reads what came after it."""
 
@@ -295,6 +304,11 @@ class Engine(ABC):
         """The length in seconds of the longest chain of work the last cold build of `ws` waited on."""
 
     @abstractmethod
+    def tables(self, ws: Path, env: dict[str, str]) -> dict[str, Table]:
+        """The daemon's tables for `ws` by name (`token`, `syntax-node`, `hir-expr`,
+        `mir-statement`, `memo`, `memo-edge`, `relocation`), for section 17's size budgets."""
+
+    @abstractmethod
     def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
         """Writes to `to` what the last build of `ws` left in the query database, as the
         deterministic CBOR of `blaze_v2_proof::Trace`, which `blaze-v2-proof` compares."""
@@ -308,7 +322,13 @@ class V1(Engine):
         import blaze_cli
 
         how = cast(str, blaze_cli.how_built(ran.stderr))
-        return None if how == "daemon" or how.startswith("unchanged") else how
+        if how == "daemon" or how.startswith("unchanged"):
+            return None
+        # Only the `Finished` line of a build says `[blaze]`: a build blaze refused is its own
+        # unless it says it went to cargo, or cargo's own `Finished` line is there.
+        if how == "cargo" and ran.returncode != 0 and not blaze_cli.by_rustc(ran.stderr):
+            return None
+        return how
 
     def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
               timeout: float = 7200) -> Ran:
@@ -375,6 +395,9 @@ class V1(Engine):
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
         raise Unmeasurable("v1 does not record the critical path of a build")
 
+    def tables(self, ws: Path, env: dict[str, str]) -> dict[str, Table]:
+        raise Unmeasurable("v1 keeps rowan trees and salsa memos, not columns it can count")
+
     def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
         raise Unmeasurable("v1 has no query database of fingerprints and edges to trace")
 
@@ -409,6 +432,9 @@ class V2(Engine):
 
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
         raise Missing("the critical path of a request, as the plane measured it")
+
+    def tables(self, ws: Path, env: dict[str, str]) -> dict[str, Table]:
+        raise Missing("the size of each long-lived table: its elements and bytes")
 
     def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
         raise Missing("a view's trace: every result of its last build with its fingerprint, edges and whether it ran")

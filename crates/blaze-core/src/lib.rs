@@ -115,6 +115,20 @@ pub enum Effect {
     /// The file's whole contents replaced by `bytes`, durably and all at once: a reader or a
     /// crash sees the old contents or the new, never a part. Its directories are made.
     Write { file: FileName, bytes: Vec<u8>, tag: Tag },
+    /// Every file and directory under `dir`, at any depth, sorted by name, each with its
+    /// [`Meta`]. A symbolic link is listed as a file of its own length and not followed.
+    /// Completes with [`Done::Listed`]; a `dir` that is not there fails.
+    List { dir: FileName, tag: Tag },
+    /// `bytes` written at `at` of `file`, which exists, past its end making it longer; durable
+    /// once a later [`Effect::Sync`] of the file completes. Completes with [`Done::Written`].
+    /// For a link writing the pages that changed into a clone of the last executable.
+    WriteAt { file: FileName, at: u64, bytes: Vec<u8>, tag: Tag },
+    /// `from` renamed over `to`, atomically: a reader sees the old `to` or the new, and the
+    /// new name survives a crash once it completes. Completes with [`Done::Renamed`].
+    Rename { from: FileName, to: FileName, tag: Tag },
+    /// The file's permission bits set to `mode` (0o755 for an executable). Completes with
+    /// [`Done::Moded`].
+    Mode { file: FileName, mode: u32, tag: Tag },
     /// `to` made a file with `from`'s contents that shares its blocks (`FICLONE`,
     /// `clonefile`). Fails where the file system cannot share blocks, naming it: nothing
     /// copies instead.
@@ -168,6 +182,10 @@ impl Effect {
             | Effect::Sync { tag, .. }
             | Effect::Truncate { tag, .. }
             | Effect::Write { tag, .. }
+            | Effect::List { tag, .. }
+            | Effect::WriteAt { tag, .. }
+            | Effect::Rename { tag, .. }
+            | Effect::Mode { tag, .. }
             | Effect::Clone { tag, .. }
             | Effect::Link { tag, .. }
             | Effect::Stat { tag, .. }
@@ -318,6 +336,9 @@ pub enum Done {
     Synced,
     Truncated,
     Written,
+    Listed(Vec<(FileName, Meta)>),
+    Renamed,
+    Moded,
     Cloned,
     Linked,
     Stat(Option<Meta>),

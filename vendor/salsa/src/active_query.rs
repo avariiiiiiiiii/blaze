@@ -1,17 +1,22 @@
 use std::{fmt, mem, ops};
 
+use thin_vec::ThinVec;
+
 use crate::Revision;
 #[cfg(feature = "accumulator")]
 use crate::accumulator::{
     Accumulator,
     accumulated_map::{AccumulatedMap, AtomicInputAccumulatedValues, InputAccumulatedValues},
 };
+use crate::fingerprint::Fingerprint;
 use crate::hash::FxIndexSet;
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
 use crate::sync::atomic::AtomicBool;
 use crate::tracked_struct::{Disambiguator, DisambiguatorMap, IdentityHash, IdentityMap};
-use crate::zalsa_local::{OriginAndExtra, QueryEdge, QueryRevisions, QueryRevisionsExtra};
+use crate::zalsa_local::{
+    EdgeFingerprint, OriginAndExtra, QueryEdge, QueryRevisions, QueryRevisionsExtra,
+};
 use crate::{
     Id,
     cycle::{CycleHeads, IterationStamp},
@@ -36,6 +41,10 @@ pub(crate) struct ActiveQuery {
     /// * invocations of `specify`
     /// * accumulators pushed to
     input_outputs: FxIndexSet<QueryEdge>,
+
+    /// The value fingerprints of the inputs in `input_outputs` that were read with one, keyed by
+    /// the input's position there.
+    edge_fingerprints: ThinVec<EdgeFingerprint>,
 
     /// True if there was an untracked read.
     untracked_read: bool,
@@ -110,6 +119,7 @@ impl ActiveQuery {
         input: DatabaseKeyIndex,
         durability: Durability,
         changed_at: Revision,
+        fingerprint: Fingerprint,
         cycle_heads: &CycleHeads,
         #[cfg(feature = "accumulator")] has_accumulated: bool,
         #[cfg(feature = "accumulator")] accumulated_inputs: &AtomicInputAccumulatedValues,
@@ -131,7 +141,14 @@ impl ActiveQuery {
         let record_input = record_input || accumulated_inputs.is_any();
 
         if record_input {
-            self.input_outputs.insert(QueryEdge::input(input));
+            let (edge, inserted) = self.input_outputs.insert_full(QueryEdge::input(input));
+            if inserted && fingerprint.is_value() {
+                self.edge_fingerprints.push(EdgeFingerprint {
+                    edge: u32::try_from(edge)
+                        .expect("exceeded more than `u32::MAX` query edges; this should never happen"),
+                    fingerprint,
+                });
+            }
         }
 
         self.cycle_heads.extend(cycle_heads);
@@ -203,6 +220,7 @@ impl ActiveQuery {
             durability: Durability::MAX,
             changed_at: Revision::start(),
             input_outputs: FxIndexSet::default(),
+            edge_fingerprints: ThinVec::new(),
             untracked_read: false,
             disambiguator_map: Default::default(),
             tracked_struct_ids: Default::default(),
@@ -224,6 +242,7 @@ impl ActiveQuery {
             durability,
             changed_at,
             input_outputs: _,
+            ref mut edge_fingerprints,
             untracked_read,
             ref mut disambiguator_map,
             ref mut tracked_struct_ids,
@@ -249,11 +268,14 @@ impl ActiveQuery {
             iteration,
             force_extra,
         );
+        let mut edge_fingerprints = mem::take(edge_fingerprints);
+        edge_fingerprints.shrink_to_fit();
         QueryCompletion {
             changed_at,
             durability,
             untracked_read,
             extra,
+            edge_fingerprints,
             #[cfg(feature = "accumulator")]
             accumulated_inputs,
             verified_final,
@@ -267,6 +289,7 @@ impl ActiveQuery {
             durability: _,
             changed_at: _,
             input_outputs,
+            edge_fingerprints,
             untracked_read: _,
             disambiguator_map,
             tracked_struct_ids,
@@ -277,6 +300,7 @@ impl ActiveQuery {
                 accumulated_inputs: _,
         } = self;
         input_outputs.clear();
+        edge_fingerprints.clear();
         disambiguator_map.clear();
         tracked_struct_ids.clear();
         *cycle_heads = Default::default();
@@ -290,6 +314,7 @@ impl ActiveQuery {
             durability,
             changed_at,
             input_outputs,
+            edge_fingerprints,
             untracked_read,
             disambiguator_map,
             tracked_struct_ids,
@@ -305,6 +330,10 @@ impl ActiveQuery {
         *untracked_read = false;
         debug_assert!(
             input_outputs.is_empty(),
+            "`ActiveQuery::clear` or `ActiveQuery::into_revisions` should've been called"
+        );
+        debug_assert!(
+            edge_fingerprints.is_empty(),
             "`ActiveQuery::clear` or `ActiveQuery::into_revisions` should've been called"
         );
         debug_assert!(
@@ -454,6 +483,7 @@ pub(crate) struct QueryCompletion {
     durability: Durability,
     untracked_read: bool,
     extra: QueryRevisionsExtra,
+    edge_fingerprints: ThinVec<EdgeFingerprint>,
     #[cfg(feature = "accumulator")]
     accumulated_inputs: AtomicInputAccumulatedValues,
     verified_final: bool,
@@ -461,6 +491,16 @@ pub(crate) struct QueryCompletion {
 }
 
 impl QueryCompletion {
+    /// Replaces the recorded input fingerprints, for a completion whose edges are not the ones
+    /// the query recorded while it ran (a cycle head's flattened edges).
+    pub(crate) fn with_edge_fingerprints(
+        mut self,
+        edge_fingerprints: ThinVec<EdgeFingerprint>,
+    ) -> Self {
+        self.edge_fingerprints = edge_fingerprints;
+        self
+    }
+
     pub(crate) fn finish(
         self,
         input_outputs: impl ExactSizeIterator<Item = QueryEdge>,
@@ -478,6 +518,8 @@ impl QueryCompletion {
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: self.accumulated_inputs,
                 verified_final: AtomicBool::new(self.verified_final),
+                fingerprint: Fingerprint::NONE,
+                edge_fingerprints: self.edge_fingerprints,
             },
             stale_tracked_structs: self.stale_tracked_structs,
         }

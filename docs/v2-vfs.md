@@ -1,0 +1,69 @@
+---
+status: plan
+summary: blaze v2 vfs lane's design: the Merkle tree, heads and views, rebase, the journal with group commit, recovery and compaction, and the disk watcher as one input of transactions.
+date: 2026-10-29
+---
+# blaze v2: the vfs lane's design
+
+How [vfs.md](v2/vfs.md) is built in `crates/blaze-vfs`, as of 2026-10-29. The tree, rebase and
+journal are blaze-next's `blaze-vfs` (`git show origin/blaze-next:crates/blaze-vfs`) behind the
+v2 interface; what changed from it is below.
+
+## The tree
+
+- A node is interned by its [`ContentId`](../crates/blaze-ids/src/lib.rs): a file's under
+  `"blaze v2 vfs file 1"` (the hash of its bytes), a directory's under
+  `"blaze v2 vfs directory 1"` (each entry's kind, length-prefixed name and child ID, sorted
+  by name). A dense `NodeId` never leaves the crate: every public type names roots and files by
+  content ID, so collection can renumber freely.
+- **Path order** is by component, as the tree is walked: `a/x` comes before `a.b`. A diff where
+  a file and a directory swap gives the file's path first, then the paths under it.
+- `lookup` and `list` take `""` for the root.
+
+## Heads and views
+
+- A head is a named root: a workspace, `branch/<name>`, `pr/<number>`. `commit` moves one by a
+  transaction (rebased file by file when its base is stale); `set_head` moves one to any root
+  the tree has (a checkout, a fork, a push); `remove_head` drops one (a deleted branch, a closed
+  PR). Each is a journal record with a sequence number.
+- A view is an open root: `open` is constant time (a slot in an arena) and keeps what the root
+  reaches alive until `close`. A closed view's number is never given out again, so a stale
+  `ViewId` panics instead of reading another view. A what-if is `apply` and then `open`.
+- A CI job's checkout is `apply(empty, writes)` of the commit's files, opened as a view or set
+  as a head.
+
+## The journal
+
+- Records: file, directory, head move, head removal, and sequence (below), each framed with
+  magic `BZJ2`, a length, a kind and an 8-byte checksum under `"blaze v2 vfs journal record 1"`.
+- One effect in flight at a time (append, then sync; a cut; a rewrite), with commits made in
+  between grouped into the next append, as in blaze-next.
+- **Compaction**: `collect` drops unreached nodes from memory and, if anything was appended
+  since the last rewrite, asks the next flush to replace the whole file in one `Effect::Write`
+  with the nodes the heads reach and one record per head. That write is atomic, so a crash
+  leaves the old file or the new. Nothing is appended while it is in flight. A failed one is
+  made again from the state then, which holds every commit recorded since. The rewrite ends
+  with a sequence record, so the numbers of removals it drops are not given out again after
+  recovery.
+- Recovery rebuilds the tree and heads, skips damaged stretches, drops a head whose root did
+  not survive (falling back to its latest earlier move that did), and cuts a torn tail before
+  the first append.
+
+## The disk as input
+
+[`Watcher`](../crates/blaze-vfs/src/watch.rs) is its own state machine with its own tags:
+
+- Each `Done::Changed` is a batch. Every path in it is stat-ed, and each file is then read.
+  Batches commit in the order they were told, so a later read wins.
+- Ops are made against the head as it is at commit time: a delete for a path gone, a write for
+  a file whose bytes differ (bytes the head has already make nothing, so a file blaze wrote
+  is not taken back), a delete of a file where a directory now is, and of any file above a
+  file now there.
+- A path whose head changed after the report, by anyone but this watcher, is not taken:
+  `Watched::Conflict` names it and the head keeps its version.
+- `lost` (the system dropped changes) stops the watch with `Watched::Lost`. A rescan needs a
+  directory listing effect, which `blaze-core` does not have yet (requested). For the same
+  reason the head must already hold what the directory does when the watch starts.
+- Projection (writing a head's changes back to its directory) is not in this lane yet. Until it
+  is, an agent's transaction and an editor's save of the same file race, and the disk's read
+  wins unless the agent's commit lands after the report.

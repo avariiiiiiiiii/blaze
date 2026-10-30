@@ -1,125 +1,36 @@
-//! Attempt at flexible symbol interning, allowing to intern and free strings at runtime while also
-//! supporting compile time declaration of symbols that will never be freed.
+//! Interned strings: symbols declared at compile time ([`symbols`]) and ones interned at
+//! runtime, both never freed.
+//!
+//! A [`Symbol`] points at a `&'static str`: a declared symbol's is a `static`, a runtime one's
+//! sits in the append-only arena of [`crate::arena`] beside its bytes. The table is filled with
+//! the declared symbols first, so interning a declared symbol's text gives the declared symbol.
 
 use std::{
+    alloc::Layout,
     fmt,
-    hash::{BuildHasher, BuildHasherDefault, Hash},
-    mem::{self, ManuallyDrop},
+    hash::BuildHasher,
     ptr::NonNull,
     sync::OnceLock,
 };
 
-use dashmap::{DashMap, SharedValue};
-use hashbrown::raw::RawTable;
-use rustc_hash::FxHasher;
-use triomphe::Arc;
+use rustc_hash::FxBuildHasher;
+
+use crate::arena::{Entry, Store};
 
 pub mod symbols;
 
-// some asserts for layout compatibility
-const _: () = assert!(size_of::<Box<str>>() == size_of::<&str>());
-const _: () = assert!(align_of::<Box<str>>() == align_of::<&str>());
-
-const _: () = assert!(size_of::<Arc<Box<str>>>() == size_of::<&&str>());
-const _: () = assert!(align_of::<Arc<Box<str>>>() == align_of::<&&str>());
-
-const _: () = assert!(size_of::<*const *const str>() == size_of::<TaggedArcPtr>());
-const _: () = assert!(align_of::<*const *const str>() == align_of::<TaggedArcPtr>());
-
-const _: () = assert!(size_of::<Arc<Box<str>>>() == size_of::<TaggedArcPtr>());
-const _: () = assert!(align_of::<Arc<Box<str>>>() == align_of::<TaggedArcPtr>());
-
-/// A pointer that points to a pointer to a `str`, it may be backed as a `&'static &'static str` or
-/// `Arc<Box<str>>` but its size is that of a thin pointer. The active variant is encoded as a tag
-/// in the LSB of the alignment niche.
-// Note, Ideally this would encode a `ThinArc<str>` and `ThinRef<str>`/`ThinConstPtr<str>` instead of the double indirection.
-#[derive(PartialEq, Eq, Hash, Copy, Clone, Debug)]
-struct TaggedArcPtr {
-    packed: NonNull<*const str>,
-}
-
-unsafe impl Send for TaggedArcPtr {}
-unsafe impl Sync for TaggedArcPtr {}
-
-impl TaggedArcPtr {
-    const BOOL_BITS: usize = true as usize;
-
-    const fn non_arc(r: &'static &'static str) -> Self {
-        assert!(align_of::<&'static &'static str>().trailing_zeros() as usize > Self::BOOL_BITS);
-        // SAFETY: The pointer is non-null as it is derived from a reference
-        // Ideally we would call out to `pack_arc` but for a `false` tag, unfortunately the
-        // packing stuff requires reading out the pointer to an integer which is not supported
-        // in const contexts, so here we make use of the fact that for the non-arc version the
-        // tag is false (0) and thus does not need touching the actual pointer value.ext)
-
-        let packed =
-            unsafe { NonNull::new_unchecked((r as *const &str).cast::<*const str>().cast_mut()) };
-        Self { packed }
-    }
-
-    fn arc(arc: Arc<Box<str>>) -> Self {
-        assert!(align_of::<&'static &'static str>().trailing_zeros() as usize > Self::BOOL_BITS);
-        Self {
-            packed: Self::pack_arc(
-                // Safety: `Arc::into_raw` always returns a non null pointer
-                unsafe { NonNull::new_unchecked(Arc::into_raw(arc).cast_mut().cast()) },
-            ),
-        }
-    }
-
-    /// Retrieves the tag.
-    ///
-    /// # Safety
-    ///
-    /// You can only drop the `Arc` if the instance is dropped.
-    #[inline]
-    unsafe fn try_as_arc_owned(self) -> Option<ManuallyDrop<Arc<Box<str>>>> {
-        // Unpack the tag from the alignment niche
-        if self.is_arc() {
-            // Safety: We checked that the tag is non-zero -> true, so we are pointing to the data offset of an `Arc`
-            Some(ManuallyDrop::new(unsafe {
-                Arc::from_raw(self.pointer().as_ptr().cast::<Box<str>>())
-            }))
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    fn is_arc(&self) -> bool {
-        (self.packed.as_ptr().addr() & Self::BOOL_BITS) != 0
-    }
-
-    #[inline]
-    fn pack_arc(ptr: NonNull<*const str>) -> NonNull<*const str> {
-        let packed_tag = true as usize;
-
-        unsafe {
-            // Safety: The pointer is derived from a non-null and bit-oring it with true (1) will
-            // not make it null.
-            NonNull::new_unchecked(ptr.as_ptr().map_addr(|addr| addr | packed_tag))
-        }
-    }
-
-    #[inline]
-    pub(crate) fn pointer(self) -> NonNull<*const str> {
-        // SAFETY: The resulting pointer is guaranteed to be NonNull as we only modify the niche bytes
-        unsafe {
-            NonNull::new_unchecked(self.packed.as_ptr().map_addr(|addr| addr & !Self::BOOL_BITS))
-        }
-    }
-
-    #[inline]
-    pub(crate) fn as_str(&self) -> &str {
-        // SAFETY: We always point to a pointer to a str no matter what variant is active
-        unsafe { *self.pointer().as_ptr().cast::<&str>() }
-    }
-}
-
-#[derive(PartialEq, Eq, Hash)]
+/// # Invariant
+///
+/// `repr` points at a `&'static str` that never moves, changes or is freed: a `static`, or one
+/// in [`STORE`]'s arena. Two symbols are one string exactly when they are one pointer.
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
 pub struct Symbol {
-    repr: TaggedArcPtr,
+    repr: NonNull<&'static str>,
 }
+
+// SAFETY: A `Symbol` is a shared reference to a `&'static str` that is never written again.
+unsafe impl Send for Symbol {}
+unsafe impl Sync for Symbol {}
 
 impl fmt::Debug for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -129,48 +40,60 @@ impl fmt::Debug for Symbol {
 
 const _: () = assert!(size_of::<Symbol>() == size_of::<NonNull<()>>());
 const _: () = assert!(align_of::<Symbol>() == align_of::<NonNull<()>>());
+const _: () = assert!(size_of::<Option<Symbol>>() == size_of::<NonNull<()>>());
 
-type Map = DashMap<Symbol, (), BuildHasherDefault<FxHasher>>;
-static MAP: OnceLock<Map> = OnceLock::new();
+static STORE: OnceLock<Store> = OnceLock::new();
+
+fn store() -> &'static Store {
+    STORE.get_or_init(symbols::prefill)
+}
+
+fn hash(s: &str) -> u64 {
+    FxBuildHasher.hash_one(s)
+}
+
+/// Makes `symbol` the one `Symbol::intern` gives for its text, unless one is already.
+fn prefill_one(store: &Store, symbol: Symbol) {
+    let s = symbol.as_str();
+    // SAFETY: Every value of the store is a `&'static str`, as `Symbol::repr` points at.
+    let same = |at: NonNull<u8>| unsafe { *at.cast::<&'static str>().as_ref() == s };
+    if let Entry::Vacant(vacant) = store.entry(hash(s), same) {
+        vacant.publish(symbol.repr.cast());
+    }
+}
 
 impl Symbol {
+    /// The symbol of the `static` `r`.
+    pub(crate) const fn from_static(r: &'static &'static str) -> Symbol {
+        // SAFETY: A reference is not null.
+        Symbol { repr: unsafe { NonNull::new_unchecked((r as *const &'static str).cast_mut()) } }
+    }
+
     pub fn intern(s: &str) -> Self {
-        let storage = MAP.get_or_init(symbols::prefill);
-        let hash = Self::hash(storage, s);
-        let shard = &storage.shards()[storage.determine_shard(hash as usize)];
-        // Nearly every name interned already is, and is asked for from many threads at once:
-        // looking under a lock other readers share finds it without waiting on them.
-        if let Some(bucket) = shard.read().find(hash, |(other, _)| other.as_str() == s) {
-            // SAFETY: The bucket is read while its shard is locked.
-            return unsafe { bucket.as_ref().0.clone() };
-        }
-        let mut shard = shard.write();
-        // Atomically,
-        // - check if `obj` is already in the map
-        //   - if so, copy out its entry, conditionally bumping the backing Arc and return it
-        //   - if not, put it into a box and then into an Arc, insert it, bump the ref-count and return the copy
-        // This needs to be atomic (locking the shard) to avoid races with other thread, which could
-        // insert the same object between us looking it up and inserting it.
-        let bucket = match shard.find_or_find_insert_slot(
-            hash,
-            |(other, _)| other.as_str() == s,
-            |(x, _)| Self::hash(storage, x.as_str()),
-        ) {
-            Ok(bucket) => bucket,
-            // SAFETY: The slot came from `find_or_find_insert_slot()`, and the table wasn't modified since then.
-            Err(insert_slot) => unsafe {
-                shard.insert_in_slot(
-                    hash,
-                    insert_slot,
-                    (
-                        Symbol { repr: TaggedArcPtr::arc(Arc::new(Box::<str>::from(s))) },
-                        SharedValue::new(()),
-                    ),
-                )
-            },
+        let store = store();
+        // SAFETY: Every value of the store is a `&'static str`.
+        let same = |at: NonNull<u8>| unsafe { *at.cast::<&'static str>().as_ref() == s };
+        let at = match store.entry(hash(s), same) {
+            Entry::Found(at) => at,
+            Entry::Vacant(vacant) => {
+                let (layout, bytes_at) = Layout::new::<&'static str>()
+                    .extend(Layout::array::<u8>(s.len()).expect("a symbol's layout"))
+                    .expect("a symbol's layout");
+                vacant.insert(layout, |to| {
+                    // SAFETY: `to` is fresh memory of `layout`: a `&str` and, at `bytes_at`,
+                    // `s.len()` bytes. Neither moves or is freed, so the `&str` written points
+                    // at bytes that live for `'static`.
+                    unsafe {
+                        let bytes = to.as_ptr().add(bytes_at);
+                        bytes.copy_from_nonoverlapping(s.as_ptr(), s.len());
+                        let bytes = std::slice::from_raw_parts(bytes, s.len());
+                        let text: &'static str = std::str::from_utf8_unchecked(bytes);
+                        to.cast::<&'static str>().write(text);
+                    }
+                })
+            }
         };
-        // SAFETY: We just retrieved/inserted this bucket.
-        unsafe { bucket.as_ref().0.clone() }
+        Symbol { repr: at.cast() }
     }
 
     pub fn empty() -> Self {
@@ -179,96 +102,16 @@ impl Symbol {
 
     #[inline]
     pub fn as_str(&self) -> &str {
-        self.repr.as_str()
+        // SAFETY: `repr`'s invariant.
+        unsafe { *self.repr.as_ref() }
     }
 
+    /// The `&'static str` the symbol points at.
     #[inline]
-    fn select_shard(
-        storage: &'static Map,
-        s: &str,
-    ) -> (dashmap::RwLockWriteGuard<'static, RawTable<(Symbol, SharedValue<()>)>>, u64) {
-        let hash = Self::hash(storage, s);
-        let shard_idx = storage.determine_shard(hash as usize);
-        let shard = &storage.shards()[shard_idx];
-        (shard.write(), hash)
+    pub(crate) fn as_static(&self) -> &'static &'static str {
+        // SAFETY: `repr`'s invariant.
+        unsafe { self.repr.as_ref() }
     }
-
-    #[inline]
-    fn hash(storage: &'static Map, s: &str) -> u64 {
-        storage.hasher().hash_one(s)
-    }
-
-    #[cold]
-    fn drop_slow(arc: &Arc<Box<str>>) {
-        let storage = MAP.get_or_init(symbols::prefill);
-        let (mut shard, hash) = Self::select_shard(storage, arc);
-
-        match Arc::count(arc) {
-            0 | 1 => unreachable!(),
-            2 => (),
-            _ => {
-                // Another thread has interned another copy
-                return;
-            }
-        }
-
-        let s = &***arc;
-        let (ptr, _) = shard.remove_entry(hash, |(x, _)| x.as_str() == s).unwrap();
-        let ptr = ManuallyDrop::new(ptr);
-        // SAFETY: We're dropping, we have ownership.
-        ManuallyDrop::into_inner(unsafe { ptr.repr.try_as_arc_owned().unwrap() });
-        debug_assert_eq!(Arc::count(arc), 1);
-
-        // Shrink the backing storage if the shard is less than 50% occupied.
-        if shard.len() * 2 < shard.capacity() {
-            let len = shard.len();
-            shard.shrink_to(len, |(x, _)| Self::hash(storage, x.as_str()));
-        }
-    }
-
-    /// # Safety
-    ///
-    /// You must know that you have a `Symbol` instance that won't be dropped, so decreasing the refcount is valid.
-    #[inline]
-    pub unsafe fn decrease_refcount(&mut self) {
-        // SAFETY: We're dropping, we have ownership.
-        let Some(arc) = (unsafe { self.repr.try_as_arc_owned() }) else {
-            return;
-        };
-        // When the last `Ref` is dropped, remove the object from the global map.
-        if Arc::count(&arc) == 2 {
-            // Only `self` and the global map point to the object.
-
-            Self::drop_slow(&arc);
-        }
-        // decrement the ref count
-        ManuallyDrop::into_inner(arc);
-    }
-}
-
-impl Drop for Symbol {
-    #[inline]
-    fn drop(&mut self) {
-        unsafe {
-            self.decrease_refcount();
-        }
-    }
-}
-
-impl Clone for Symbol {
-    fn clone(&self) -> Self {
-        Self { repr: increase_arc_refcount(self.repr) }
-    }
-}
-
-fn increase_arc_refcount(repr: TaggedArcPtr) -> TaggedArcPtr {
-    // SAFETY: We're not dropping the `Arc`.
-    let Some(arc) = (unsafe { repr.try_as_arc_owned() }) else {
-        return repr;
-    };
-    // increase the ref count
-    mem::forget(Arc::clone(&arc));
-    repr
 }
 
 impl fmt::Display for Symbol {
@@ -280,40 +123,87 @@ impl fmt::Display for Symbol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sym;
 
     #[test]
     fn smoke_test() {
-        Symbol::intern("isize");
-        let base_len = MAP.get().unwrap().len();
         let hello = Symbol::intern("hello");
         let world = Symbol::intern("world");
-        let more_worlds = world.clone();
         let bang = Symbol::intern("!");
         let q = Symbol::intern("?");
-        assert_eq!(MAP.get().unwrap().len(), base_len + 4);
-        let bang2 = Symbol::intern("!");
-        assert_eq!(MAP.get().unwrap().len(), base_len + 4);
-        drop(bang2);
-        assert_eq!(MAP.get().unwrap().len(), base_len + 4);
-        drop(q);
-        assert_eq!(MAP.get().unwrap().len(), base_len + 3);
+        assert_eq!(Symbol::intern("!"), bang);
+        assert_eq!(Symbol::intern("hello"), hello);
+        assert!(store().len() >= 4);
+        assert_ne!(hello, world);
+        assert_ne!(bang, q);
         let default = Symbol::intern("default");
-        let many_worlds = world.clone();
-        assert_eq!(MAP.get().unwrap().len(), base_len + 3);
         assert_eq!(
             "hello default world!",
             format!("{} {} {}{}", hello.as_str(), default.as_str(), world.as_str(), bang.as_str())
         );
-        drop(default);
-        assert_eq!(
-            "hello world!",
-            format!("{} {}{}", hello.as_str(), world.as_str(), bang.as_str())
-        );
-        drop(many_worlds);
-        drop(more_worlds);
-        drop(hello);
-        drop(world);
-        drop(bang);
-        assert_eq!(MAP.get().unwrap().len(), base_len);
+        assert_eq!(format!("{hello:?} {world}"), "\"hello\" world");
+    }
+
+    #[test]
+    fn round_trips() {
+        for s in ["self", "Self", "", "fn", "0", "255", "256", "a new symbol", "ünïcödé", "x"] {
+            assert_eq!(Symbol::intern(s).as_str(), s);
+            assert_eq!(Symbol::intern(s), Symbol::intern(&s.to_owned()));
+        }
+        let long = "y".repeat(1 << 20);
+        assert_eq!(Symbol::intern(&long).as_str(), long);
+    }
+
+    #[test]
+    fn declared_symbols_are_interned() {
+        assert_eq!(Symbol::intern("self"), sym::self_);
+        assert_eq!(Symbol::intern("Self"), sym::Self_);
+        assert_eq!(Symbol::intern("..."), sym::dotdotdot);
+        assert_eq!(Symbol::intern(""), Symbol::empty());
+        assert_eq!(Symbol::empty(), sym::__empty);
+        assert_eq!(sym::self_.as_str(), "self");
+        assert_ne!(sym::self_, sym::Self_);
+        const DECLARED: Symbol = sym::self_;
+        assert_eq!(DECLARED, Symbol::intern("self"));
+    }
+
+    #[test]
+    fn integers() {
+        for n in [0usize, 1, 9, 10, 255, 256, 1_000, 123_456_789] {
+            let declared = sym::Integer::get(n);
+            assert_eq!(declared.as_str(), n.to_string());
+            assert_eq!(declared, Symbol::intern(&n.to_string()));
+            assert_eq!(sym::Integer::as_uint(&declared), Some(n));
+            assert_eq!(sym::Integer::as_uint(&Symbol::intern(&n.to_string())), Some(n));
+        }
+        assert_eq!(sym::Integer::as_uint(&sym::self_), None);
+        assert_eq!(sym::Integer::as_uint(&Symbol::intern("12a")), None);
+        assert_eq!(sym::RaGeneratedName::get(3).as_str(), "<ra@gennew>3");
+        assert_eq!(sym::RaGeneratedName::get(300).as_str(), "<ra@gennew>300");
+        assert_eq!(sym::RaGeneratedName::get(300), Symbol::intern("<ra@gennew>300"));
+    }
+
+    #[test]
+    fn symbols_from_many_threads() {
+        let seen: Vec<Vec<Symbol>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..16u32)
+                .map(|worker| {
+                    scope.spawn(move || {
+                        (0..10_000u32)
+                            .map(|n| (n + worker * 613) % 10_000)
+                            .map(|n| Symbol::intern(&format!("racing {n}")))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|it| it.join().unwrap()).collect()
+        });
+        for (worker, symbols) in seen.iter().enumerate() {
+            for (i, &symbol) in symbols.iter().enumerate() {
+                let n = (i as u32 + worker as u32 * 613) % 10_000;
+                assert_eq!(symbol.as_str(), format!("racing {n}"));
+                assert_eq!(symbol, seen[0][n as usize]);
+            }
+        }
     }
 }

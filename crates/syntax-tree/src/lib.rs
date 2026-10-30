@@ -32,7 +32,7 @@ pub use crate::{
         Language, SyntaxElement, SyntaxElementChildren, SyntaxNode, SyntaxNodeChildren,
         SyntaxNodeChildrenWhere, SyntaxToken,
     },
-    flat::{FlatTree, FlatTreeBuilder},
+    flat::{Expand, FlatTree, FlatTreeBuilder},
     green::{
         Checkpoint, Children, GreenNode, GreenNodeBuilder, GreenNodeData, GreenToken,
         GreenTokenData, NodeCache, SyntaxKind,

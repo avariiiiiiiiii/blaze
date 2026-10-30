@@ -262,6 +262,7 @@ mod database;
 mod database_impl;
 mod durability;
 mod event;
+mod fingerprint;
 mod function;
 mod hash;
 mod id;
@@ -304,6 +305,7 @@ pub use self::database::Database;
 pub use self::database_impl::DatabaseImpl;
 pub use self::durability::Durability;
 pub use self::event::{Event, EventKind};
+pub use self::fingerprint::{Fingerprint, StableHasher};
 pub use self::id::Id;
 pub use self::input::setter::Setter;
 pub use self::key::DatabaseKeyIndex;
@@ -409,6 +411,11 @@ pub mod plumbing {
 
     pub mod interned {
         pub use crate::interned::{Configuration, IngredientImpl, JarImpl, Value};
+    }
+
+    pub mod fingerprint {
+        pub use crate::fingerprint::Fingerprint;
+        pub use crate::fingerprint::probe::{Probe, ViaHash, ViaRevision};
     }
 
     pub mod function {

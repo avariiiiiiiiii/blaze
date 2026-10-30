@@ -11,13 +11,27 @@
 //! store's results. A [`Persist`] type is one a query can return: written once into a
 //! buffer, read in place as its [`Persist::Ref`].
 //!
-//! Spans are never in a record that is hashed: they sit in a side table, and a record names
-//! one by [`SpanRef`].
+//! A reference always points at bytes written before the record that holds it: a [`Writer`]
+//! writes children first and the root last. [`Record::check`] refuses any other reference, so
+//! checking a buffer always ends, and costs what the records reached from the root are. Keep
+//! columns of plain values ([`Slice`]s of integers): following one checks only its bounds.
+//!
+//! Spans are never in a record that is hashed: they sit in a side table ([`Spans`]), and a
+//! record names one by [`SpanRef`].
 
-use std::{fmt, marker::PhantomData};
+mod schema;
 
-use blaze_ids::ContentId;
+use std::{
+    fmt,
+    marker::PhantomData,
+    mem::{align_of, offset_of, size_of, size_of_val},
+    ops::Deref,
+};
+
+use blaze_ids::{ContentId, Fingerprint};
 use serde::{Deserialize, Serialize};
+
+pub use crate::schema::{Part, SCHEMA_DOMAIN, schema, schema_of};
 
 #[cfg(target_endian = "big")]
 compile_error!("blaze's format is little-endian, as every target blaze runs on is");
@@ -34,12 +48,84 @@ pub struct SchemaHash(pub ContentId);
 ///
 /// The implementor is `#[repr(C)]` (or a primitive) with no padding, no pointer, reference,
 /// `Box` or `Arc` in it, and every bit pattern [`Record::check`] accepts is a valid value:
-/// [`open`] hands out `&Self` over bytes it has only checked with it.
+/// [`open`] hands out `&Self` over bytes it has only checked with it. [`record!`] writes this
+/// impl for a struct and asserts it has no padding.
 pub unsafe trait Record: Copy + 'static {
     const SCHEMA: SchemaHash;
     /// Whether `bytes`, `size_of::<Self>()` of them at an aligned address, are a valid value,
     /// the [`Rel`]s and [`Slice`]s in it within `buffer`.
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError>;
+}
+
+/// Checks the field of type `F` at `offset` in `record`, the bytes of a record in `buffer`:
+/// what a [`Record::check`] calls for each of its fields.
+pub fn check_field<F: Record>(
+    record: &[u8],
+    offset: usize,
+    buffer: &[u8],
+) -> Result<(), FormatError> {
+    let at = (record.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
+    let at = at + offset as u64;
+    let Some(end) = offset.checked_add(size_of::<F>()).filter(|&end| end <= record.len()) else {
+        return Err(FormatError::Invalid { at, what: "a field past the end of its record" });
+    };
+    let bytes = &record[offset..end];
+    if !(bytes.as_ptr() as usize).is_multiple_of(align_of::<F>()) {
+        return Err(FormatError::OutOfBounds { at });
+    }
+    F::check(bytes, buffer)
+}
+
+/// Whether `bytes` are where a `T` can be read: its size, at its alignment.
+fn fits<T>(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+    let at = (bytes.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
+    match bytes.len() == size_of::<T>() && (bytes.as_ptr() as usize).is_multiple_of(align_of::<T>())
+    {
+        true => Ok(()),
+        false => Err(FormatError::Invalid { at, what: "a record of the wrong size or alignment" }),
+    }
+}
+
+macro_rules! plain {
+    ($($ty:ty => $name:literal),* $(,)?) => {$(
+        // SAFETY: a primitive or a byte array, with no padding; every bit pattern is a value.
+        unsafe impl Record for $ty {
+            const SCHEMA: SchemaHash = schema($name);
+            fn check(_: &[u8], _: &[u8]) -> Result<(), FormatError> {
+                Ok(())
+            }
+        }
+    )*};
+}
+
+plain! {
+    u8 => "u8", u16 => "u16", u32 => "u32", u64 => "u64", u128 => "u128",
+    i8 => "i8", i16 => "i16", i32 => "i32", i64 => "i64", i128 => "i128",
+    ContentId => "ContentId", Fingerprint => "Fingerprint", SchemaHash => "SchemaHash",
+}
+
+// SAFETY: one byte, and `check` accepts only 0 and 1.
+unsafe impl Record for bool {
+    const SCHEMA: SchemaHash = schema("bool");
+    fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        fits::<bool>(bytes, buffer)?;
+        match bytes[0] {
+            0 | 1 => Ok(()),
+            _ => Err(FormatError::Invalid {
+                at: (bytes.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64,
+                what: "a bool that is neither 0 nor 1",
+            }),
+        }
+    }
+}
+
+// SAFETY: an array has no padding between its elements, each checked as a `T`.
+unsafe impl<T: Record, const N: usize> Record for [T; N] {
+    const SCHEMA: SchemaHash =
+        schema_of(&[Part::Str("array"), Part::U64(N as u64), Part::Schema(T::SCHEMA)]);
+    fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        (0..N).try_for_each(|i| check_field::<T>(bytes, i * size_of::<T>(), buffer))
+    }
 }
 
 /// A reference to a `T` elsewhere in the same buffer: its offset from this field's own
@@ -63,20 +149,216 @@ pub struct Slice<T> {
 /// UTF-8 bytes in the buffer.
 pub type Str = Slice<u8>;
 
+/// The offset from a field at `field_at` to a target at `target_at`, both from the buffer's
+/// start, the target written before the field.
+fn offset(field_at: u64, target_at: u64) -> i32 {
+    assert!(target_at <= field_at, "a reference to bytes written after it");
+    i32::try_from(target_at as i64 - field_at as i64)
+        .expect("a reference across more than 2 GiB of one buffer")
+}
+
+/// Where `field` is in `buffer`, from its start.
+fn position<F>(field: &F, buffer: &[u8]) -> Result<u64, FormatError> {
+    let (address, base) = (field as *const F as usize, buffer.as_ptr() as usize);
+    let at = address.wrapping_sub(base);
+    match address >= base && at.checked_add(size_of::<F>()).is_some_and(|end| end <= buffer.len())
+    {
+        true => Ok(at as u64),
+        false => Err(FormatError::OutOfBounds { at: at as u64 }),
+    }
+}
+
+/// Where `count` `T`s that a field at `field_at` points `offset` bytes away from start, from
+/// the buffer's start: after the header, before the field, aligned for `T`.
+fn target<T>(field_at: u64, offset: i32, count: u32, buffer: &[u8]) -> Result<usize, FormatError> {
+    let bad = FormatError::OutOfBounds { at: field_at };
+    let target = field_at as i64 + offset as i64;
+    if target < HEADER_LEN as i64 {
+        return Err(bad);
+    }
+    let target = target as u64;
+    let len = (size_of::<T>() as u64).checked_mul(count as u64).ok_or(bad.clone())?;
+    if target.checked_add(len).is_none_or(|end| end > field_at) {
+        return Err(bad);
+    }
+    let address = (buffer.as_ptr() as usize).wrapping_add(target as usize);
+    match address.is_multiple_of(align_of::<T>()) {
+        true => Ok(target as usize),
+        false => Err(bad),
+    }
+}
+
 impl<T> Rel<T> {
     pub const NONE: Rel<T> = Rel { offset: 0, of: PhantomData };
 
+    /// The reference a field at `field_at` holds to a `T` at `target_at`, both from the
+    /// buffer's start: the `T` was written before the record holding the field.
+    pub fn between(field_at: u64, target_at: u64) -> Rel<T> {
+        assert!(target_at < field_at, "a reference to bytes written after it");
+        Rel { offset: offset(field_at, target_at), of: PhantomData }
+    }
+
+    pub fn is_none(&self) -> bool {
+        self.offset == 0
+    }
+}
+
+impl<T: Record> Rel<T> {
+    /// The `T` this points at, `None` for [`Rel::NONE`]. Panics when `buffer` is not the
+    /// buffer this field is in, or the `T` is not a valid one there: a buffer from [`open`]
+    /// was checked whole, so this checks again only what a reference itself holds.
     pub fn get<'a>(&'a self, buffer: &'a [u8]) -> Option<&'a T> {
-        let _ = buffer;
-        unimplemented!("v2: following a checked relative reference (v2-format)")
+        self.follow(buffer).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn follow<'a>(&'a self, buffer: &'a [u8]) -> Result<Option<&'a T>, FormatError> {
+        if self.offset == 0 {
+            return Ok(None);
+        }
+        let at = position(self, buffer)?;
+        let target = target::<T>(at, self.offset, 1, buffer)?;
+        let bytes = &buffer[target..target + size_of::<T>()];
+        T::check(bytes, buffer)?;
+        // SAFETY: `bytes` are in `buffer`, `size_of::<T>()` of them, aligned for `T`, and
+        // `T::check` accepted them, which `Record`'s contract makes a valid `T`.
+        Ok(Some(unsafe { &*bytes.as_ptr().cast::<T>() }))
     }
 }
 
 impl<T> Slice<T> {
-    pub fn get<'a>(&'a self, buffer: &'a [u8]) -> &'a [T] {
-        let _ = buffer;
-        unimplemented!("v2: following a checked relative slice (v2-format)")
+    pub const EMPTY: Slice<T> = Slice { offset: 0, len: 0, of: PhantomData };
+
+    /// The slice a field at `field_at` holds of `len` `T`s at `target_at`, both from the
+    /// buffer's start: the `T`s were written before the record holding the field.
+    pub fn between(field_at: u64, target_at: u64, len: usize) -> Slice<T> {
+        let len = u32::try_from(len).expect("a slice of 2^32 values or more");
+        Slice { offset: offset(field_at, target_at), len, of: PhantomData }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<T: Record> Slice<T> {
+    /// The `T`s this points at. Panics as [`Rel::get`] does.
+    pub fn get<'a>(&'a self, buffer: &'a [u8]) -> &'a [T] {
+        self.follow(buffer).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn follow<'a>(&'a self, buffer: &'a [u8]) -> Result<&'a [T], FormatError> {
+        if self.len == 0 {
+            return Ok(&[]);
+        }
+        let at = position(self, buffer)?;
+        let target = target::<T>(at, self.offset, self.len, buffer)?;
+        let size = size_of::<T>();
+        let bytes = &buffer[target..target + size * self.len as usize];
+        (0..self.len as usize).try_for_each(|i| check_field::<T>(bytes, i * size, buffer))?;
+        // SAFETY: `bytes` are in `buffer`, `len` `T`s of them, aligned for `T`, and each was
+        // accepted by `T::check`, which `Record`'s contract makes a valid `T`.
+        Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), self.len as usize) })
+    }
+}
+
+impl Slice<u8> {
+    /// The text this points at, refused when it is not UTF-8.
+    pub fn as_str<'a>(&'a self, buffer: &'a [u8]) -> Result<&'a str, FormatError> {
+        let bytes = self.follow(buffer)?;
+        std::str::from_utf8(bytes).map_err(|_| FormatError::Invalid {
+            at: (bytes.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64,
+            what: "text that is not UTF-8",
+        })
+    }
+}
+
+// SAFETY: an `i32` and a zero-sized marker: every bit pattern is a `Rel`; `check` follows it
+// and checks the `T` it reaches.
+unsafe impl<T: Record> Record for Rel<T> {
+    const SCHEMA: SchemaHash = schema_of(&[Part::Str("Rel"), Part::Schema(T::SCHEMA)]);
+    fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        fits::<Rel<T>>(bytes, buffer)?;
+        // SAFETY: `fits` checked size and alignment, and every bit pattern is a `Rel`.
+        let rel = unsafe { &*bytes.as_ptr().cast::<Rel<T>>() };
+        rel.follow(buffer).map(|_| ())
+    }
+}
+
+// SAFETY: an `i32`, a `u32` and a zero-sized marker: every bit pattern is a `Slice`; `check`
+// follows it and checks each `T` it reaches.
+unsafe impl<T: Record> Record for Slice<T> {
+    const SCHEMA: SchemaHash = schema_of(&[Part::Str("Slice"), Part::Schema(T::SCHEMA)]);
+    fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        fits::<Slice<T>>(bytes, buffer)?;
+        // SAFETY: `fits` checked size and alignment, and every bit pattern is a `Slice`.
+        let slice = unsafe { &*bytes.as_ptr().cast::<Slice<T>>() };
+        slice.follow(buffer).map(|_| ())
+    }
+}
+
+/// Declares a `#[repr(C)]` struct of [`Record`] fields and implements [`Record`] for it: its
+/// schema from its name, its version (the number after the name), and each field's name,
+/// offset and schema; its check field by field. Fails to compile if the struct has padding:
+/// order the fields by alignment, or spell the padding out as a `[u8; N]` field. The struct
+/// must derive `Clone` and `Copy`.
+///
+/// ```ignore
+/// blaze_format::record! {
+///     #[derive(Clone, Copy, Debug)]
+///     pub struct Node: 1 {
+///         pub kind: u32,
+///         pub children: Slice<u32>,
+///     }
+/// }
+/// ```
+#[macro_export]
+macro_rules! record {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident: $version:literal {
+            $( $(#[$field_meta:meta])* $field_vis:vis $field:ident: $ty:ty ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[repr(C)]
+        $vis struct $name {
+            $( $(#[$field_meta])* $field_vis $field: $ty, )*
+        }
+
+        const _: () = ::core::assert!(
+            ::core::mem::size_of::<$name>() == 0 $( + ::core::mem::size_of::<$ty>() )*,
+            ::core::concat!(::core::stringify!($name), " has padding: order its fields by alignment"),
+        );
+
+        // SAFETY: `#[repr(C)]` without padding (asserted above), each field a `Record` checked
+        // by its own `check`.
+        unsafe impl $crate::Record for $name {
+            const SCHEMA: $crate::SchemaHash = $crate::schema_of(&[
+                $crate::Part::Str(::core::stringify!($name)),
+                $crate::Part::U64($version),
+                $(
+                    $crate::Part::Str(::core::stringify!($field)),
+                    $crate::Part::U64(::core::mem::offset_of!($name, $field) as u64),
+                    $crate::Part::Schema(<$ty as $crate::Record>::SCHEMA),
+                )*
+            ]);
+
+            fn check(
+                bytes: &[u8],
+                buffer: &[u8],
+            ) -> ::core::result::Result<(), $crate::FormatError> {
+                $(
+                    $crate::check_field::<$ty>(
+                        bytes,
+                        ::core::mem::offset_of!($name, $field),
+                        buffer,
+                    )?;
+                )*
+                let _ = (bytes, buffer);
+                ::core::result::Result::Ok(())
+            }
+        }
+    };
 }
 
 /// What a buffer starts with.
@@ -97,39 +379,136 @@ pub const MAGIC: [u8; 8] = *b"BLAZEV2\0";
 /// The alignment every buffer is mapped and written at: records align to at most this.
 pub const ALIGN: usize = 16;
 
+/// How long a [`Header`] is: no record is in the first this many bytes of a buffer.
+pub const HEADER_LEN: usize = size_of::<Header>();
+
+const _: () = assert!(HEADER_LEN == 8 + 32 + 8 + 8, "the header has padding");
+
+fn read_u64(buffer: &[u8], at: usize) -> u64 {
+    let mut word = [0; 8];
+    word.copy_from_slice(&buffer[at..at + 8]);
+    u64::from_le_bytes(word)
+}
+
+/// The header of `buffer`, checked: its magic, its length, and that the buffer is at an
+/// address aligned to [`ALIGN`], which every record in it relies on.
+pub fn header(buffer: &[u8]) -> Result<Header, FormatError> {
+    if buffer.len() < HEADER_LEN {
+        return Err(FormatError::Header("shorter than a header"));
+    }
+    if !(buffer.as_ptr() as usize).is_multiple_of(ALIGN) {
+        return Err(FormatError::Header("not at an address aligned to 16 bytes"));
+    }
+    let mut magic = [0; 8];
+    magic.copy_from_slice(&buffer[..8]);
+    if magic != MAGIC {
+        return Err(FormatError::Header("a wrong magic"));
+    }
+    let mut schema = [0; 32];
+    schema.copy_from_slice(&buffer[offset_of!(Header, schema)..offset_of!(Header, schema) + 32]);
+    let header = Header {
+        magic,
+        schema: SchemaHash(ContentId(schema)),
+        len: read_u64(buffer, offset_of!(Header, len)),
+        root: read_u64(buffer, offset_of!(Header, root)),
+    };
+    if header.len != buffer.len() as u64 {
+        return Err(FormatError::Header("a length that is not the buffer's"));
+    }
+    Ok(header)
+}
+
 /// The root `T` of `buffer`, after checking its header, its schema and every record reached
 /// from the root.
 pub fn open<T: Record>(buffer: &[u8]) -> Result<&T, FormatError> {
-    let _ = buffer;
-    unimplemented!("v2: opening a buffer, its header and its records checked (v2-format)")
+    open_as::<T>(buffer, T::SCHEMA)
+}
+
+/// The root `R` of a buffer of schema `schema`, checked as [`open`] checks: what a
+/// [`Persist::read`] opens its buffer with, the buffer's schema being the `Persist` type's.
+pub fn open_as<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<&R, FormatError> {
+    let header = header(buffer)?;
+    if header.schema != schema {
+        return Err(FormatError::Schema { found: header.schema, wanted: schema });
+    }
+    let root = header.root;
+    let end = root.checked_add(size_of::<R>() as u64).filter(|&end| end <= header.len);
+    let Some(end) = end.filter(|_| root >= HEADER_LEN as u64 && root.is_multiple_of(align_of::<R>() as u64))
+    else {
+        return Err(FormatError::OutOfBounds { at: root });
+    };
+    let bytes = &buffer[root as usize..end as usize];
+    R::check(bytes, buffer)?;
+    // SAFETY: `bytes` are in `buffer`, `size_of::<R>()` of them, aligned for `R` (the buffer is
+    // aligned to `ALIGN`, `root` to `R`), and `R::check` accepted them.
+    Ok(unsafe { &*bytes.as_ptr().cast::<R>() })
 }
 
 /// Appends records to one buffer, aligned, and gives each a place for the [`Rel`]s of others.
+/// Padding between records is zeros, so equal values written in the same order are equal
+/// bytes.
 pub struct Writer {
     pub bytes: Vec<u8>,
 }
 
+fn align_up(at: usize, align: usize) -> usize {
+    assert!(align <= ALIGN, "a record aligned to more than {ALIGN} bytes");
+    at.next_multiple_of(align)
+}
+
 impl Writer {
     pub fn new(schema: SchemaHash) -> Writer {
-        let _ = schema;
-        unimplemented!("v2: a buffer with its header (v2-format)")
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&schema.0.0);
+        bytes.extend_from_slice(&[0; 16]);
+        debug_assert_eq!(bytes.len(), HEADER_LEN);
+        Writer { bytes }
+    }
+
+    /// Where the next `T` pushed will be, from the buffer's start: what a record's [`Rel`]s
+    /// and [`Slice`]s are made from before it is pushed.
+    pub fn next<T: Record>(&self) -> u64 {
+        align_up(self.bytes.len(), align_of::<T>()) as u64
+    }
+
+    fn pad(&mut self, align: usize) -> u64 {
+        let at = align_up(self.bytes.len(), align);
+        self.bytes.resize(at, 0);
+        at as u64
     }
 
     /// Where `value` was written, from the buffer's start.
     pub fn push<T: Record>(&mut self, value: &T) -> u64 {
-        let _ = value;
-        unimplemented!("v2: appending an aligned record (v2-format)")
+        self.push_slice(std::slice::from_ref(value))
     }
 
     pub fn push_slice<T: Record>(&mut self, values: &[T]) -> u64 {
-        let _ = values;
-        unimplemented!("v2: appending aligned records in a row (v2-format)")
+        let at = self.pad(align_of::<T>());
+        // SAFETY: a `Record` has no padding, so every byte of `values` is initialized.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) };
+        self.bytes.extend_from_slice(bytes);
+        at
+    }
+
+    /// Where `text` was written, for a [`Str`] of `text.len()` bytes.
+    pub fn push_str(&mut self, text: &str) -> u64 {
+        self.push_slice(text.as_bytes())
     }
 
     /// The buffer, with `root` as its root record.
-    pub fn finish(self, root: u64) -> Vec<u8> {
-        let _ = root;
-        unimplemented!("v2: closing a buffer (v2-format)")
+    pub fn finish(mut self, root: u64) -> Vec<u8> {
+        assert!(
+            root >= HEADER_LEN as u64 && root < self.bytes.len() as u64,
+            "the root is not a record of this buffer"
+        );
+        let len = self.pad(ALIGN);
+        let at = offset_of!(Header, len);
+        self.bytes[at..at + 8].copy_from_slice(&len.to_le_bytes());
+        let at = offset_of!(Header, root);
+        self.bytes[at..at + 8].copy_from_slice(&root.to_le_bytes());
+        self.bytes
     }
 }
 
@@ -143,6 +522,51 @@ pub trait Persist: Send + Sync + 'static {
     fn read(buffer: &[u8]) -> Result<Self::Ref<'_>, FormatError>;
 }
 
+/// `value` as a buffer of its own.
+pub fn to_bytes<P: Persist>(value: &P) -> Vec<u8> {
+    let mut out = Writer::new(P::SCHEMA);
+    let root = value.write(&mut out);
+    out.finish(root)
+}
+
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct Block([u8; ALIGN]);
+
+/// Owned bytes at an address aligned to [`ALIGN`]: what a buffer is read from when it is not
+/// mmapped (a `Vec<u8>` is aligned to 1).
+#[derive(Clone)]
+pub struct Aligned {
+    blocks: Vec<Block>,
+    len: usize,
+}
+
+impl Aligned {
+    pub fn copy_from(bytes: &[u8]) -> Aligned {
+        let mut blocks = vec![Block([0; ALIGN]); bytes.len().div_ceil(ALIGN)];
+        for (block, chunk) in blocks.iter_mut().zip(bytes.chunks(ALIGN)) {
+            block.0[..chunk.len()].copy_from_slice(chunk);
+        }
+        Aligned { blocks, len: bytes.len() }
+    }
+}
+
+impl Deref for Aligned {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `blocks` holds at least `len` initialized bytes, `Block` being 16 bytes
+        // without padding.
+        unsafe { std::slice::from_raw_parts(self.blocks.as_ptr().cast::<u8>(), self.len) }
+    }
+}
+
+impl fmt::Debug for Aligned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Aligned").field("len", &self.len).finish()
+    }
+}
+
 /// A span in a span side table (docs/v2/format.md section 5, "Spans"): the anchor is the
 /// content ID of the item the span is relative to, `index` its place in that item's table.
 /// Never hashed into code: a formatting edit changes the table, not the code that names it.
@@ -151,6 +575,116 @@ pub trait Persist: Send + Sync + 'static {
 pub struct SpanRef {
     pub anchor: ContentId,
     pub index: u32,
+}
+
+const _: () = assert!(size_of::<SpanRef>() == 32 + 4, "a SpanRef has padding");
+
+// SAFETY: `#[repr(C)]` without padding (asserted above), of two fields every bit pattern of
+// which is a value.
+unsafe impl Record for SpanRef {
+    const SCHEMA: SchemaHash = schema_of(&[
+        Part::Str("SpanRef"),
+        Part::U64(1),
+        Part::Str("anchor"),
+        Part::U64(offset_of!(SpanRef, anchor) as u64),
+        Part::Schema(<ContentId as Record>::SCHEMA),
+        Part::Str("index"),
+        Part::U64(offset_of!(SpanRef, index) as u64),
+        Part::Schema(<u32 as Record>::SCHEMA),
+    ]);
+    fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        fits::<SpanRef>(bytes, buffer)
+    }
+}
+
+record! {
+    /// A span of an anchor's span table: bytes from the anchor's start, so an edit that moves
+    /// the anchor in its file moves none of its spans.
+    #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+    pub struct RelSpan: 1 {
+        pub start: u32,
+        pub len: u32,
+    }
+}
+
+record! {
+    #[derive(Clone, Copy)]
+    struct SpansRoot: 1 {
+        anchor: ContentId,
+        spans: Slice<RelSpan>,
+    }
+}
+
+/// The span side table of one anchor: what a [`SpanRef`] of that anchor indexes.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct Spans {
+    pub anchor: ContentId,
+    pub spans: Vec<RelSpan>,
+}
+
+impl Spans {
+    pub fn new(anchor: ContentId) -> Spans {
+        Spans { anchor, spans: Vec::new() }
+    }
+
+    /// Adds a span `len` bytes long, `start` bytes from the anchor's start.
+    pub fn push(&mut self, start: u32, len: u32) -> SpanRef {
+        let index = u32::try_from(self.spans.len()).expect("an anchor of 2^32 spans");
+        self.spans.push(RelSpan { start, len });
+        SpanRef { anchor: self.anchor, index }
+    }
+
+    /// The span `span` names, `None` for a span of another anchor or past this table.
+    pub fn get(&self, span: SpanRef) -> Option<RelSpan> {
+        match span.anchor == self.anchor {
+            true => self.spans.get(span.index as usize).copied(),
+            false => None,
+        }
+    }
+}
+
+/// [`Spans`] read in place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SpansRef<'a> {
+    pub anchor: ContentId,
+    pub spans: &'a [RelSpan],
+}
+
+impl SpansRef<'_> {
+    pub fn get(&self, span: SpanRef) -> Option<RelSpan> {
+        match span.anchor == self.anchor {
+            true => self.spans.get(span.index as usize).copied(),
+            false => None,
+        }
+    }
+
+    pub fn to_spans(&self) -> Spans {
+        Spans { anchor: self.anchor, spans: self.spans.to_vec() }
+    }
+}
+
+impl Persist for Spans {
+    const SCHEMA: SchemaHash =
+        schema_of(&[Part::Str("Spans"), Part::U64(1), Part::Schema(SpansRoot::SCHEMA)]);
+    type Ref<'a> = SpansRef<'a>;
+
+    fn write(&self, out: &mut Writer) -> u64 {
+        let spans = out.push_slice(&self.spans);
+        let at = out.next::<SpansRoot>();
+        let field = at + offset_of!(SpansRoot, spans) as u64;
+        let root = SpansRoot {
+            anchor: self.anchor,
+            spans: Slice::between(field, spans, self.spans.len()),
+        };
+        let written = out.push(&root);
+        debug_assert_eq!(written, at);
+        at
+    }
+
+    fn read(buffer: &[u8]) -> Result<SpansRef<'_>, FormatError> {
+        let root = open_as::<SpansRoot>(buffer, Self::SCHEMA)?;
+        Ok(SpansRef { anchor: root.anchor, spans: root.spans.follow(buffer)? })
+    }
 }
 
 /// Why bytes are not a value.
@@ -182,3 +716,6 @@ impl fmt::Display for FormatError {
 }
 
 impl std::error::Error for FormatError {}
+
+#[cfg(test)]
+mod tests;

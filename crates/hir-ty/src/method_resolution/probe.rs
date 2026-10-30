@@ -31,7 +31,8 @@ use crate::{
     lower::GenericPredicates,
     method_resolution::{
         CandidateId, CandidateSource, InherentImpls, MethodError, MethodResolutionContext,
-        SelfTyKey, simplified_type_module, with_incoherent_inherent_impls,
+        SelfTyKey, impl_value_item, simplified_type_module, trait_value_item,
+        with_incoherent_inherent_impls,
     },
     next_solver::{
         Binder, Canonical, ClauseKind, DbInterner, FnSig, GenericArg, GenericArgs, Goal, ParamEnv,
@@ -566,6 +567,13 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
     }
 }
 
+/// The impl or trait whose items a probe looks among.
+#[derive(Clone, Copy)]
+enum ItemsOf {
+    Impl(ImplId),
+    Trait(TraitId),
+}
+
 trait ProbeChoice<'db>: Sized {
     type Choice;
     type FinalChoice;
@@ -575,7 +583,7 @@ trait ProbeChoice<'db>: Sized {
     // method is fairly hot.
     fn with_impl_or_trait_item<'a>(
         this: &mut ProbeContext<'a, 'db, Self>,
-        items: &[(Name, AssocItemId)],
+        items: ItemsOf,
         callback: impl FnMut(&mut ProbeContext<'a, 'db, Self>, CandidateId),
     );
 
@@ -637,22 +645,16 @@ impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
 
     fn with_impl_or_trait_item<'a>(
         this: &mut ProbeContext<'a, 'db, Self>,
-        items: &[(Name, AssocItemId)],
+        items: ItemsOf,
         mut callback: impl FnMut(&mut ProbeContext<'a, 'db, Self>, CandidateId),
     ) {
-        let item = items
-            .iter()
-            .filter_map(|(name, id)| {
-                let id = match *id {
-                    AssocItemId::FunctionId(id) => id.into(),
-                    AssocItemId::ConstId(id) => id.into(),
-                    AssocItemId::TypeAliasId(_) => return None,
-                };
-                Some((name, id))
-            })
-            .find(|(name, _)| **name == this.choice.item_name)
-            .map(|(_, id)| id)
-            .filter(|id| this.mode == Mode::Path || matches!(id, CandidateId::FunctionId(_)));
+        let db = this.db();
+        let name = this.choice.item_name.clone();
+        let item = match items {
+            ItemsOf::Impl(id) => impl_value_item(db, id, name),
+            ItemsOf::Trait(id) => trait_value_item(db, id, name),
+        }
+        .filter(|id| this.mode == Mode::Path || matches!(id, CandidateId::FunctionId(_)));
         if let Some(item) = item {
             callback(this, item);
         }
@@ -796,10 +798,15 @@ impl<'db> ProbeChoice<'db> for ProbeAllChoice<'db> {
 
     fn with_impl_or_trait_item<'a>(
         this: &mut ProbeContext<'a, 'db, Self>,
-        items: &[(Name, AssocItemId)],
+        items: ItemsOf,
         mut callback: impl FnMut(&mut ProbeContext<'a, 'db, Self>, CandidateId),
     ) {
         let mode = this.mode;
+        let db = this.db();
+        let items = match items {
+            ItemsOf::Impl(id) => &id.impl_items(db).items,
+            ItemsOf::Trait(id) => &id.trait_items(db).items,
+        };
         items
             .iter()
             .filter_map(|(_, id)| is_relevant_kind_for_mode(mode, *id))
@@ -1061,8 +1068,9 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
         };
         let db = self.db();
         let blocks = std::iter::successors(module.block(db), |block| block.module(db).block(db));
-        for impls in blocks.filter_map(|block| InherentImpls::for_block(db, block).as_deref()) {
-            for &impl_def_id in impls.for_self_ty(self_ty) {
+        for block in blocks {
+            for &impl_def_id in InherentImpls::in_block_for_self_ty(db, block, SelfTyKey(*self_ty))
+            {
                 self.assemble_inherent_impl_probe(impl_def_id, receiver_steps);
             }
         }
@@ -2162,11 +2170,11 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
     }
 
     fn with_impl_item(&mut self, def_id: ImplId, callback: impl FnMut(&mut Self, CandidateId)) {
-        Choice::with_impl_or_trait_item(self, &def_id.impl_items(self.db()).items, callback)
+        Choice::with_impl_or_trait_item(self, ItemsOf::Impl(def_id), callback)
     }
 
     fn with_trait_item(&mut self, def_id: TraitId, callback: impl FnMut(&mut Self, CandidateId)) {
-        Choice::with_impl_or_trait_item(self, &def_id.trait_items(self.db()).items, callback)
+        Choice::with_impl_or_trait_item(self, ItemsOf::Trait(def_id), callback)
     }
 }
 

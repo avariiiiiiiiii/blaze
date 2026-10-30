@@ -1,6 +1,8 @@
-//! Watching a tree on Linux with inotify: a watch on each directory under the watched one,
-//! added as directories appear, and the events read off one descriptor, which the threads
-//! driver reads on a thread of its own and the ring driver through the ring.
+//! Watching a tree on Linux (docs/v2/plane.md's table): with fanotify, one mark of the whole
+//! file system, where the process has the privileges it needs, and with inotify where it does
+//! not (a watch on each directory under the watched one, added as directories appear). Either
+//! way the events are read off one descriptor, which the threads driver reads on a thread of
+//! its own and the ring driver through the ring.
 
 use std::{
     collections::BTreeSet,
@@ -29,7 +31,46 @@ const MASK: u32 = libc::IN_CREATE
 /// The head of an event, before its name.
 const HEAD: usize = 16;
 
-pub(crate) struct Inotify {
+/// A tree watched, with fanotify or inotify.
+pub(crate) struct Tree(Kind);
+
+enum Kind {
+    Fanotify(crate::fanotify::Fanotify),
+    Inotify(Inotify),
+}
+
+impl Tree {
+    /// Watches `dir` under `root` and everything under it: with fanotify unless the process
+    /// lacks `CAP_SYS_ADMIN` or `CAP_DAC_READ_SEARCH` (the call fails with `EPERM`), with
+    /// inotify then. Any other failure of fanotify's is the watch's.
+    pub(crate) fn new(root: &Path, dir: &FileName, nonblocking: bool) -> io::Result<Tree> {
+        match crate::fanotify::Fanotify::new(root, dir, nonblocking) {
+            Ok(it) => Ok(Tree(Kind::Fanotify(it))),
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                Ok(Tree(Kind::Inotify(Inotify::new(root, dir, nonblocking)?)))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The descriptor to read events from.
+    pub(crate) fn raw(&self) -> RawFd {
+        match &self.0 {
+            Kind::Fanotify(it) => it.raw(),
+            Kind::Inotify(it) => it.raw(),
+        }
+    }
+
+    /// What the events read into `bytes` say: a [`Done::Changed`].
+    pub(crate) fn take(&mut self, bytes: &[u8]) -> Done {
+        match &mut self.0 {
+            Kind::Fanotify(it) => it.take(bytes),
+            Kind::Inotify(it) => it.take(bytes),
+        }
+    }
+}
+
+struct Inotify {
     fd: OwnedFd,
     root: PathBuf,
     /// Each directory watched, by its watch, relative to the root ("" for the root).
@@ -38,7 +79,7 @@ pub(crate) struct Inotify {
 
 impl Inotify {
     /// Watches `dir` under `root` and every directory under it.
-    pub(crate) fn new(root: &Path, dir: &FileName, nonblocking: bool) -> io::Result<Inotify> {
+    fn new(root: &Path, dir: &FileName, nonblocking: bool) -> io::Result<Inotify> {
         let flags = libc::IN_CLOEXEC | if nonblocking { libc::IN_NONBLOCK } else { 0 };
         // SAFETY: no pointers; a descriptor of its own or -1.
         let fd = unsafe { libc::inotify_init1(flags) };
@@ -53,7 +94,7 @@ impl Inotify {
         Ok(watch)
     }
 
-    pub(crate) fn raw(&self) -> RawFd {
+    fn raw(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 
@@ -91,7 +132,7 @@ impl Inotify {
     }
 
     /// What the events in `bytes` say, watching each directory they say was made.
-    pub(crate) fn take(&mut self, bytes: &[u8]) -> Done {
+    fn take(&mut self, bytes: &[u8]) -> Done {
         let mut files = BTreeSet::new();
         let mut lost = false;
         let mut at = 0;

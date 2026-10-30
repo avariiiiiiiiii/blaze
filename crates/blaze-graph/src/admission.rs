@@ -10,7 +10,7 @@
 //! The rule, integers only, the same observations giving the same estimates: a peak at or over
 //! the prediction becomes the prediction at once. A peak under it counts toward a window of
 //! [`WINDOW`] of them in a row; once the window is full the prediction comes down half the way
-//! to the most of the window's peaks, and a new window begins. So the prediction is a high
+//! (rounded up) to the most of the window's peaks, and a new window begins. So the prediction is a high
 //! quantile of what the kind held lately (the most of the last [`WINDOW`] peaks, approached by
 //! halves), never under the last peak seen, never over the most ever seen.
 
@@ -223,7 +223,7 @@ mod tests {
     struct SplitMix(u64);
 
     impl SplitMix {
-        fn next(&mut self) -> u64 {
+        fn next_u64(&mut self) -> u64 {
             self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
             let mut z = self.0;
             z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -232,7 +232,7 @@ mod tests {
         }
 
         fn below(&mut self, n: u64) -> u64 {
-            self.next() % n.max(1)
+            self.next_u64() % n.max(1)
         }
     }
 
@@ -277,7 +277,7 @@ mod tests {
             assert_eq!(estimates.predict(kind), 1 << 20);
         }
         estimates.observe(kind, 1024);
-        assert_eq!(estimates.predict(kind), 1024 + ((1 << 20) - 1024) / 2 + 1);
+        assert_eq!(estimates.predict(kind), 1024 + ((1 << 20) - 1024) / 2);
         let mut windows = 1;
         while estimates.predict(kind) > 1024 {
             for _ in 0..WINDOW {
@@ -298,7 +298,7 @@ mod tests {
         for seed in 0..200u64 {
             let mut random = SplitMix(seed);
             let mut estimates = Estimates::new(random.below(1 << 30));
-            let mut smaller_in_a_row: FxCounts = FxCounts::default();
+            let mut smaller_in_a_row = Windows::new();
             for _ in 0..2000 {
                 let kind = TaskKind(random.below(4) as u32);
                 let peak = peak(&mut random);
@@ -332,7 +332,8 @@ mod tests {
         }
     }
 
-    type FxCounts = BTreeMap<TaskKind, (u32, u64)>;
+    /// Per kind: the smaller peaks in a row since its prediction moved, and the most of them.
+    type Windows = BTreeMap<TaskKind, (u32, u64)>;
 
     #[test]
     fn the_same_observations_give_the_same_estimates_and_bytes() {

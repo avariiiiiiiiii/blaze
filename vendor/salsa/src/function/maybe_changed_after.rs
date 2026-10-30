@@ -2,6 +2,7 @@
 use crate::accumulator::accumulated_map::InputAccumulatedValues;
 use crate::cycle::{CycleHeads, CycleRecoveryStrategy, ProvisionalStatus};
 use crate::database::RawDatabase;
+use crate::fingerprint::Fingerprint;
 use crate::function::memo::{ErasedMemo, MemoHeader, TryClaimCycleHeadsIter, TryClaimHeadsResult};
 use crate::function::sync::{ClaimGuard, ClaimResult};
 use crate::function::{Configuration, IngredientImpl, Reentrancy, SyncTable};
@@ -244,7 +245,9 @@ where
             } => {
                 let old_memo = old_memo.downcast::<C>();
 
-                if old_memo.value.is_none() {
+                // An evicted value with a value fingerprint is computed again and backdated
+                // when its fingerprint is the kept one. Without one it can't be compared.
+                if old_memo.value.is_none() && !old_memo.header.revisions.fingerprint.is_value() {
                     return Some(VerifyResult::changed());
                 }
 
@@ -580,7 +583,7 @@ fn maybe_changed_after_cold_cycle(
 fn deep_verify_edges(
     db: crate::database::RawDatabase,
     zalsa: &Zalsa,
-    #[allow(unused)] old_revisions: &QueryRevisions,
+    old_revisions: &QueryRevisions,
     old_verified_at: Revision,
     edges: QueryEdges<'_>,
     database_key_index: DatabaseKeyIndex,
@@ -594,11 +597,20 @@ fn deep_verify_edges(
     // they executed. It's possible that if the value of some input I0 is no longer
     // valid, then some later input I1 might never have executed at all, so verifying
     // it is still up to date is meaningless.
-    for edge in edges {
+    for (position, edge) in edges.into_iter().enumerate() {
         match edge.kind() {
             QueryEdgeKind::Input => {
                 let dependency_index = edge.key();
-                let input_result = dependency_index.maybe_changed_after(db, zalsa, old_verified_at);
+                let mut input_result =
+                    dependency_index.maybe_changed_after(db, zalsa, old_verified_at);
+
+                if let VerifyResult::Changed = input_result
+                    && let Some(saw) = old_revisions.edge_fingerprint(position)
+                    && let Some(unchanged) =
+                        unchanged_by_fingerprint(zalsa, dependency_index, saw, old_revisions)
+                {
+                    input_result = unchanged;
+                }
 
                 match input_result {
                     VerifyResult::Changed => {
@@ -645,6 +657,29 @@ fn deep_verify_edges(
     old_revisions.accumulated_inputs.store(inputs);
 
     result
+}
+
+/// An input that changed since the reader was verified still holds the value the reader saw when
+/// its memo is up to date in this revision and has the fingerprint the reader recorded. The
+/// input's durability must not have dropped below the reader's: the reader would keep its higher
+/// durability and later skip checking the input when only less durable inputs change.
+fn unchanged_by_fingerprint(
+    zalsa: &Zalsa,
+    dependency_index: DatabaseKeyIndex,
+    saw: Fingerprint,
+    reader: &QueryRevisions,
+) -> Option<VerifyResult> {
+    let memo = zalsa
+        .lookup_ingredient(dependency_index.ingredient_index())
+        .as_function()?
+        .memo(zalsa, dependency_index.key_index())?;
+    let header = memo.header();
+    let revisions = &header.revisions;
+    (header.verified_at.load() == zalsa.current_revision()
+        && !header.may_be_provisional()
+        && revisions.durability >= reader.durability
+        && revisions.fingerprint == saw)
+        .then(|| VerifyResult::unchanged_for_memo(revisions))
 }
 
 /// Check if this memo's cycle heads have all been finalized. If so, mark it verified final and

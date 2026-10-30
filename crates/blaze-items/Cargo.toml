@@ -27,6 +27,7 @@ rustc_type_ir.workspace = true
 rustc_abi.workspace = true
 
 base-db.workspace = true
+cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true

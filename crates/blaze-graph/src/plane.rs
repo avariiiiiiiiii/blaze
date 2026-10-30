@@ -6,24 +6,34 @@
 //! everything its value depends on. The plane keeps what came of each key that was done
 //! (**memo**): a node whose key was done before, by any request, settles at once as cached and
 //! runs nothing. A node whose key another node is running or about to run joins it (**single
-//! flight**): one task runs, and every node of it settles when it ends.
+//! flight**): one task runs, and every node of it settles when it ends. A task not yet started
+//! is ready in the request of each of its nodes, at that node's priority, and the first request
+//! to start it runs it.
 //!
-//! Of the requests with ready work, the next thread of a pool goes to the one using the least
-//! of its share (its running tasks over its weight, **fair share**); ties go to the request
-//! opened first. Within a request, the ready task with the longest path of expected cost to
-//! the end of the request runs first (**critical path**), ties to the node added first.
+//! Of the requests with ready work, the next thread of a pool goes to the one that started the
+//! fewest tasks of the pool for its weight (**fair share**, stride scheduling: each start moves
+//! a request's virtual time on by the inverse of its weight, and the least virtual time goes
+//! next; a request that had no ready work comes back at the plane's virtual time, not behind
+//! it). Ties go to the heavier request, then to the one opened first. Within a request, the
+//! ready task with the longest path of expected cost to the end of the request runs first
+//! (**critical path**), ties to the node added first.
 //!
 //! With a [`Budget`], a task starts only when the predicted peaks of what runs (or what the
-//! process is said to hold, if more), plus its own, fit in it (**memory admission**). A task
-//! passed over for memory more than [`PlaneConfig::starve_after`] times holds back every task
-//! behind it until it fits, so a large task is never starved. A task whose prediction alone is
-//! more than the budget fails before it starts, saying so; so does one that cannot fit while
-//! nothing runs. Nothing is retried with less at once.
+//! process is said to hold, if more), plus its own, fit in it (**memory admission**). Each time
+//! a task with memory starts while another, ready in the same pool, does not fit, that one is
+//! passed over; the first passed over [`PlaneConfig::starve_after`] times holds back every task
+//! with memory, of every pool and request, until it starts, so a large task is never starved
+//! ([`Plane::holding`]). A task whose prediction alone is more than the budget fails before it
+//! starts, saying so; so does one that cannot fit while nothing runs. Nothing is retried with
+//! less at once.
+//!
+//! A request may be cancelled ([`Plane::cancel`]): what of it has not started is skipped, what
+//! runs is let finish, and it finishes failed.
 
 use std::{cmp::Reverse, collections::BTreeSet, fmt};
 
-use blaze_protocol::events::{Event, NodeState, Record};
-use rustc_hash::FxHashMap;
+use blaze_protocol::events::{Event, Level, NodeState, Record};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::machine::{Error, NodeId, Outcome, Pool, Spec};
@@ -126,6 +136,10 @@ pub struct Counts {
     pub granted_most: u64,
 }
 
+/// What a start moves a request's virtual time on by, over its weight: divisible by every
+/// weight up to 16, so for those the shares are exact.
+const SHARE: u128 = 720_720 << 32;
+
 struct Node {
     request: usize,
     spec: Spec,
@@ -147,11 +161,14 @@ struct Task {
     key: Option<Key>,
     pool: Pool,
     memory: u64,
-    /// The node whose id the task runs as, and whose request it counts against.
+    /// The node whose id the task runs as, and whose request it counts against: the member
+    /// that started it, once it runs.
     runner: usize,
-    /// Every node that settles when it does, the runner first.
+    /// Every node that settles when it does. While it is not running, each is ready in its own
+    /// request.
     members: Vec<usize>,
     running: bool,
+    /// How many times a task with memory started while it did not fit.
     passed: u32,
 }
 
@@ -160,13 +177,15 @@ struct Request {
     weight: u32,
     keep_going: bool,
     closed: bool,
+    cancelled: bool,
     finished: bool,
     /// How many of its nodes are not settled.
     open: usize,
     failed: Option<usize>,
-    /// Its ready tasks of each pool, by their runner: the first to run first.
+    /// Its ready nodes of each pool, each one of a task not running: the first to run first.
     ready: [BTreeSet<(Reverse<u64>, usize)>; 2],
-    running: [usize; 2],
+    /// Its virtual time in each pool, for fair share.
+    vtime: [u128; 2],
     nodes: Vec<usize>,
 }
 
@@ -184,6 +203,10 @@ pub struct Plane {
     running: [usize; 2],
     granted: u64,
     held: u64,
+    /// The virtual time of each pool: that of the request that started a task last.
+    vclock: [u128; 2],
+    /// The task passed over for memory long enough that it holds back the others.
+    hold: Option<usize>,
     /// Nodes to settle once the move under way is done, as the memo or the budget says, in
     /// order: settling them where they are found would nest without bound.
     deferred: Vec<(usize, NodeState)>,
@@ -221,6 +244,8 @@ impl Plane {
             running: [0; 2],
             granted: 0,
             held: 0,
+            vclock: [0; 2],
+            hold: None,
             deferred: Vec::new(),
             last_ns: 0,
             counts: Counts::default(),
@@ -243,6 +268,16 @@ impl Plane {
     /// The state of `id`, if it was added.
     pub fn state(&self, id: NodeId) -> Option<&NodeState> {
         Some(&self.nodes[*self.index.get(&id)?].state)
+    }
+
+    /// A node of the task that holds back every other task with memory until it fits, if one
+    /// does.
+    pub fn holding(&self) -> Option<NodeId> {
+        let task = &self.tasks[self.hold?];
+        if task.running {
+            return None;
+        }
+        Some(self.nodes[*task.members.first()?].spec.id)
     }
 
     /// Whether a value of `key` is remembered.
@@ -275,11 +310,12 @@ impl Plane {
                     weight,
                     keep_going,
                     closed: false,
+                    cancelled: false,
                     finished: false,
                     open: 0,
                     failed: None,
                     ready: [BTreeSet::new(), BTreeSet::new()],
-                    running: [0; 2],
+                    vtime: self.vclock,
                     nodes: Vec::new(),
                 });
             }
@@ -321,6 +357,58 @@ impl Plane {
             }
             PlaneInput::Held { bytes, .. } => self.held = bytes,
         }
+        self.after(at, out, touched)
+    }
+
+    /// Cancels `request`: each of its nodes not started is skipped, because of the request's
+    /// first node (the protocol has no state of its own for it yet), after a note that says
+    /// the request is cancelled. A task it runs is let finish, and its [`PlaneInput::Done`] is
+    /// taken as ever: its nodes of other requests settle with it, and what it finds is added
+    /// skipped. A node of it that joined another request's running task leaves it, skipped,
+    /// and that task runs on for the rest. Once what it runs is done the request finishes,
+    /// not ok. It takes no more [`PlaneInput::Add`] or [`PlaneInput::Close`]; a second cancel
+    /// does nothing.
+    pub fn cancel(&mut self, at_ns: u64, request: RequestId) -> Result<Vec<PlaneOutput>, Error> {
+        let at = at_ns.max(self.last_ns);
+        let r = self.open_request(request)?;
+        let mut out = Vec::new();
+        if !self.requests[r].cancelled {
+            self.requests[r].cancelled = true;
+            self.requests[r].closed = true;
+            out.push(said(
+                request,
+                at,
+                Event::Said { level: Level::Note, text: format!("{request} is cancelled") },
+            ));
+            if let Some(&first) = self.requests[r].nodes.first() {
+                let because = self.nodes[first].spec.id.0;
+                for at_node in 0..self.requests[r].nodes.len() {
+                    let me = self.requests[r].nodes[at_node];
+                    let skip = match self.nodes[me].state {
+                        NodeState::Waiting | NodeState::Ready => true,
+                        NodeState::Running => self.nodes[me]
+                            .task
+                            .is_some_and(|task| self.tasks[task].runner != me),
+                        _ => false,
+                    };
+                    if skip {
+                        self.leave_task(me);
+                        self.moved(at, me, NodeState::Skipped { because }, &mut out);
+                    }
+                }
+            }
+        }
+        self.after(at, out, vec![r])
+    }
+
+    /// What follows any input: the deferred nodes settled, the threads given work, and the
+    /// requests `touched` that are over finished.
+    fn after(
+        &mut self,
+        at: u64,
+        mut out: Vec<PlaneOutput>,
+        mut touched: Vec<usize>,
+    ) -> Result<Vec<PlaneOutput>, Error> {
         self.settle_deferred(at, &mut out, &mut touched);
         self.last_ns = at;
         self.dispatch(at, &mut out, &mut touched);
@@ -334,7 +422,7 @@ impl Plane {
                     self.critical(r).into_iter().map(|it| self.nodes[it].spec.id.0).collect();
                 let id = self.requests[r].id;
                 out.push(said(id, at, Event::Critical { path }));
-                let ok = self.requests[r].failed.is_none();
+                let ok = self.requests[r].failed.is_none() && !self.requests[r].cancelled;
                 out.push(PlaneOutput::Finished { request: id, ok });
             }
         }
@@ -425,6 +513,9 @@ impl Plane {
             if !self.requests[r].keep_going {
                 skipped = skipped.or(self.requests[r].failed);
             }
+            if self.requests[r].cancelled {
+                skipped = skipped.or(self.requests[r].nodes.first().copied());
+            }
             let id = self.requests[r].id;
             out.push(said(
                 id,
@@ -487,6 +578,17 @@ impl Plane {
         out.push(said(id, at, Event::Moved { id: node.spec.id.0, state }));
     }
 
+    /// Puts `me`, of a task not running, among its request's ready nodes of pool `p`. A
+    /// request that had none comes back at the pool's virtual time: what it did not use while
+    /// it had nothing to run is not owed to it.
+    fn make_ready(&mut self, me: usize, p: usize) {
+        let request = &mut self.requests[self.nodes[me].request];
+        if request.ready[p].is_empty() {
+            request.vtime[p] = request.vtime[p].max(self.vclock[p]);
+        }
+        request.ready[p].insert((Reverse(self.nodes[me].priority), me));
+    }
+
     /// `me`'s deps are done: it is remembered, joins a task of its key, or is a task of its
     /// own, ready to run.
     fn became_ready(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
@@ -501,9 +603,12 @@ impl Plane {
                 self.counts.joined += 1;
                 self.tasks[task].members.push(me);
                 self.nodes[me].task = Some(task);
-                let state =
-                    if self.tasks[task].running { NodeState::Running } else { NodeState::Ready };
-                self.moved(at, me, state, out);
+                if self.tasks[task].running {
+                    self.moved(at, me, NodeState::Running, out);
+                } else {
+                    self.make_ready(me, pool_at(self.tasks[task].pool));
+                    self.moved(at, me, NodeState::Ready, out);
+                }
                 return;
             }
         }
@@ -535,9 +640,7 @@ impl Plane {
             self.flight.insert(key, task);
         }
         self.nodes[me].task = Some(task);
-        let (r, pool, priority) =
-            (self.nodes[me].request, pool_at(self.tasks[task].pool), self.nodes[me].priority);
-        self.requests[r].ready[pool].insert((Reverse(priority), me));
+        self.make_ready(me, pool_at(self.tasks[task].pool));
         self.moved(at, me, NodeState::Ready, out);
     }
 
@@ -590,28 +693,23 @@ impl Plane {
         }
     }
 
-    /// `me`, which is not running, no longer waits for its task: a task nobody waits for is
-    /// dropped, and one whose runner it was runs as another of its nodes.
+    /// `me` no longer waits for its task: a node of a task not running is no longer ready, and
+    /// a task with no node left is dropped. A running task runs on without it; its runner
+    /// never leaves it.
     fn leave_task(&mut self, me: usize) {
         let Some(task) = self.nodes[me].task.take() else { return };
         let t = &mut self.tasks[task];
+        debug_assert!(!t.running || t.runner != me, "the runner of a running task left it");
         t.members.retain(|&it| it != me);
-        if t.running || t.runner != me {
+        if t.running {
             return;
         }
-        let (pool, r) = (pool_at(t.pool), self.nodes[me].request);
-        self.requests[r].ready[pool].remove(&(Reverse(self.nodes[me].priority), me));
-        match self.tasks[task].members.first().copied() {
-            Some(next) => {
-                self.tasks[task].runner = next;
-                let r = self.nodes[next].request;
-                self.requests[r].ready[pool].insert((Reverse(self.nodes[next].priority), next));
-            }
-            None => {
-                if let Some(key) = self.tasks[task].key {
-                    self.flight.remove(&key);
-                }
-            }
+        let (p, r) = (pool_at(t.pool), self.nodes[me].request);
+        self.requests[r].ready[p].remove(&(Reverse(self.nodes[me].priority), me));
+        if self.tasks[task].members.is_empty()
+            && let Some(key) = self.tasks[task].key
+        {
+            self.flight.remove(&key);
         }
     }
 
@@ -626,10 +724,9 @@ impl Plane {
     ) {
         let t = &mut self.tasks[task];
         t.running = false;
-        let (pool, memory, runner, key) = (pool_at(t.pool), t.memory, t.runner, t.key);
+        let (pool, memory, key) = (pool_at(t.pool), t.memory, t.key);
         let members = std::mem::take(&mut t.members);
         self.running[pool] -= 1;
-        self.requests[self.nodes[runner].request].running[pool] -= 1;
         self.granted -= memory;
         if let Some(key) = key {
             self.flight.remove(&key);
@@ -646,11 +743,9 @@ impl Plane {
             self.nodes[member].group = group;
             self.nodes[member].task = None;
             touched.push(self.nodes[member].request);
-            // A member's request may have settled it as skipped while it ran: not for a node
-            // that runs, which settles when its task does.
-            if !self.nodes[member].state.settled() {
-                self.settle(at, member, state.clone(), out);
-            }
+            // Every member is running: a node that leaves a running task is taken out of it.
+            debug_assert_eq!(self.nodes[member].state, NodeState::Running);
+            self.settle(at, member, state.clone(), out);
         }
     }
 
@@ -659,22 +754,35 @@ impl Plane {
         Some(budget.bytes.saturating_sub(self.granted.max(self.held)))
     }
 
+    /// The task that holds back the others, while it is still to start.
+    fn hold(&mut self) -> Option<usize> {
+        if let Some(task) = self.hold
+            && (self.tasks[task].running || self.tasks[task].members.is_empty())
+        {
+            self.hold = None;
+        }
+        self.hold
+    }
+
     fn dispatch(&mut self, at: u64, out: &mut Vec<PlaneOutput>, touched: &mut Vec<usize>) {
         for pool in [Pool::Io, Pool::Work] {
             let (p, limit) = (pool_at(pool), self.threads(pool));
             'next: while self.running[p] < limit {
-                let mut order: Vec<usize> =
-                    (0..self.requests.len()).filter(|&r| !self.requests[r].ready[p].is_empty()).collect();
-                // The least used of its share first: running / weight, compared without division.
-                order.sort_by(|&a, &b| {
-                    let (a_, b_) = (&self.requests[a], &self.requests[b]);
-                    let used_a = a_.running[p] as u128 * u128::from(b_.weight);
-                    let used_b = b_.running[p] as u128 * u128::from(a_.weight);
-                    used_a.cmp(&used_b).then(a.cmp(&b))
+                let mut order: Vec<usize> = (0..self.requests.len())
+                    .filter(|&r| !self.requests[r].ready[p].is_empty())
+                    .collect();
+                order.sort_by_key(|&r| {
+                    let request = &self.requests[r];
+                    (request.vtime[p], Reverse(request.weight), r)
                 });
+                let mut passed = Vec::new();
                 for r in order {
-                    match self.pick(r, p) {
+                    match self.pick(r, p, &mut passed) {
                         Pick::Start(me) => {
+                            let task = self.nodes[me].task.expect("a ready node's task");
+                            if self.tasks[task].memory > 0 {
+                                self.pass(&passed);
+                            }
                             self.start(at, me, out);
                             continue 'next;
                         }
@@ -685,11 +793,26 @@ impl Plane {
                             self.settle_deferred(at, out, touched);
                             continue 'next;
                         }
-                        Pick::Held => break 'next,
                         Pick::None => {}
                     }
                 }
                 break;
+            }
+        }
+    }
+
+    /// Each of the tasks `passed` over was so once more; the first of them to have been so
+    /// [`PlaneConfig::starve_after`] times holds back the rest, if none does.
+    fn pass(&mut self, passed: &[usize]) {
+        let mut seen = FxHashSet::default();
+        for &task in passed {
+            if !seen.insert(task) {
+                continue;
+            }
+            let t = &mut self.tasks[task];
+            t.passed = t.passed.saturating_add(1);
+            if t.passed >= self.config.starve_after && self.hold().is_none() {
+                self.hold = Some(task);
             }
         }
     }
@@ -701,42 +824,38 @@ impl Plane {
         }
     }
 
-    /// The task of request `r` to start next on pool `p`, as memory allows.
-    fn pick(&mut self, r: usize, p: usize) -> Pick {
+    /// The node of request `r` whose task starts next on pool `p`, as memory allows; the tasks
+    /// of it that did not fit, before that one, are added to `passed`.
+    fn pick(&mut self, r: usize, p: usize, passed: &mut Vec<usize>) -> Pick {
         let Some(free) = self.memory_free() else {
             return match self.requests[r].ready[p].first() {
                 Some(&(_, me)) => Pick::Start(me),
                 None => Pick::None,
             };
         };
-        let mut passed = Vec::new();
-        let mut found = None;
-        for &(_, me) in &self.requests[r].ready[p] {
-            let task = &self.tasks[self.nodes[me].task.expect("a ready node's task")];
-            if task.memory <= free {
-                found = Some(me);
-                break;
-            }
-            if task.passed >= self.config.starve_after {
-                // It waited long enough: nothing behind it starts until it fits.
-                found = None;
-                passed.clear();
-                passed.push(me);
-                break;
-            }
-            passed.push(me);
-        }
         let nothing_runs = self.running == [0, 0];
-        match found {
-            Some(me) => {
-                for it in passed {
-                    let task = self.nodes[it].task.expect("a ready node's task");
-                    self.tasks[task].passed += 1;
+        let hold = self.hold();
+        let mut unfit = None;
+        for &(_, me) in &self.requests[r].ready[p] {
+            let task = self.nodes[me].task.expect("a ready node's task");
+            let memory = self.tasks[task].memory;
+            match hold {
+                // Only it, and what takes no memory, may start until it does.
+                Some(held) if held != task => {
+                    if memory == 0 {
+                        return Pick::Start(me);
+                    }
                 }
-                Pick::Start(me)
+                _ if memory <= free => return Pick::Start(me),
+                Some(_) => unfit = Some(me),
+                None => {
+                    unfit.get_or_insert(me);
+                    passed.push(task);
+                }
             }
-            None if nothing_runs && !passed.is_empty() => {
-                let me = passed[0];
+        }
+        match unfit {
+            Some(me) if nothing_runs => {
                 let budget = self.config.budget.as_ref().expect("a budget");
                 let spec = &self.nodes[me].spec;
                 Pick::Fail(
@@ -752,28 +871,30 @@ impl Plane {
                     ),
                 )
             }
-            None if passed.iter().any(|&it| {
-                self.tasks[self.nodes[it].task.expect("a ready node's task")].passed
-                    >= self.config.starve_after
-            }) =>
-            {
-                Pick::Held
-            }
-            None => Pick::None,
+            _ => Pick::None,
         }
     }
 
     fn start(&mut self, at: u64, me: usize, out: &mut Vec<PlaneOutput>) {
         let task = self.nodes[me].task.expect("a ready node's task");
-        let (p, r) = (pool_at(self.tasks[task].pool), self.nodes[me].request);
-        self.requests[r].ready[p].remove(&(Reverse(self.nodes[me].priority), me));
-        self.tasks[task].running = true;
+        let p = pool_at(self.tasks[task].pool);
+        for at_member in 0..self.tasks[task].members.len() {
+            let member = self.tasks[task].members[at_member];
+            let r = self.nodes[member].request;
+            self.requests[r].ready[p].remove(&(Reverse(self.nodes[member].priority), member));
+        }
+        let request = &mut self.requests[self.nodes[me].request];
+        self.vclock[p] = self.vclock[p].max(request.vtime[p]);
+        request.vtime[p] += SHARE / u128::from(request.weight);
+        let t = &mut self.tasks[task];
+        t.runner = me;
+        t.running = true;
         self.running[p] += 1;
-        self.requests[r].running[p] += 1;
-        self.granted += self.tasks[task].memory;
+        self.granted += t.memory;
         self.counts.granted_most = self.counts.granted_most.max(self.granted);
         self.counts.ran += 1;
-        for member in self.tasks[task].members.clone() {
+        for at_member in 0..self.tasks[task].members.len() {
+            let member = self.tasks[task].members[at_member];
             self.moved(at, member, NodeState::Running, out);
         }
         let near = self.nodes[me].blocker.and_then(|it| self.nodes[it].group);
@@ -799,8 +920,6 @@ enum Pick {
     Start(usize),
     /// It cannot fit even with nothing running.
     Fail(usize, String),
-    /// A task held for memory: nothing of this pool starts until it fits.
-    Held,
     None,
 }
 

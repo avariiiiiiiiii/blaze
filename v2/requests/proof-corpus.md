@@ -36,3 +36,16 @@
 - **What:** `Ran` could carry blaze's kept test passes, as `blaze_cli.Side.cargo` does.
 - **Why:** today `corpus.py` reads `target/blaze/tests.ndjson` itself and wraps the result in its
   own `Tested`. That works as it is; the change would only move the reading into the engine.
+
+## 5. One check request for a whole workspace that keeps going and reports per package
+
+- **Where:** the v2 check request in the agent API (`crates/blaze-api`, docs/v2/ci.md) and the
+  `blaze check` client.
+- **What:** `blaze check --workspace --keep-going --message-format=json` (or the request behind
+  it) checks every member even after one fails, and says for each member whether it was
+  accepted (a `compiler-artifact`) or which errors it had (`target.name` on each message).
+- **Why:** `harness/v2/rejections.py` checks thousands of rustc compile-fail tests, about 100 to
+  a workspace. Today the default asks once per member (`-p`), one client round trip and plan
+  per test. With this request it can use `whole: true`, one request per workspace, and the daemon
+  checks the members in parallel on all cores. Rust's semantics are unchanged: each member is
+  checked exactly as on its own.

@@ -11,6 +11,7 @@ use std::hash::BuildHasherDefault;
 use std::str::FromStr;
 use std::{fmt, mem, ops};
 
+use blaze_ids::{ContentId, Hasher};
 use cfg::{CfgOptions, HashableCfgOptions};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -24,7 +25,8 @@ use vfs::{AbsPathBuf, AnchoredPath, FileId, VfsPath, file_set::FileSet};
 
 use crate::{
     CrateWorkspaceData, EditionedFileId, FxIndexSet, SourceDatabase, all_crates,
-    set_all_crates_with_durability,
+    content::{self, InputId, cfg_options_content},
+    refresh_crate_graph_content, set_all_crates_with_durability,
 };
 
 pub type ProcMacroPaths =
@@ -100,6 +102,17 @@ pub struct SourceRoot {
 }
 
 impl SourceRoot {
+    /// A source root's content ID is of `is_library` and the content ID of each of its
+    /// buckets, [`SourceRoot::BUCKETS`] of them in order: a bucket holds the files whose path's
+    /// [`SourceRoot::PATH_DOMAIN`] hash starts with its number, sorted by path, each as its path
+    /// and its content ID ([`FileText::content`](crate::FileText::content), or
+    /// [`FileText::no_text`](crate::FileText::no_text)). A function of the sorted (path,
+    /// content ID) pairs and `is_library` alone, kept current in `O(files / BUCKETS)` an edit.
+    pub const DOMAIN: &'static str = "blaze v2 source root 1";
+    pub const BUCKET_DOMAIN: &'static str = "blaze v2 source root bucket 1";
+    pub const PATH_DOMAIN: &'static str = "blaze v2 source root path 1";
+    pub const BUCKETS: usize = 64;
+
     pub fn new_local(file_set: FileSet) -> SourceRoot {
         SourceRoot { is_library: false, file_set }
     }
@@ -499,23 +512,246 @@ impl BuiltDependency {
 
 pub type CratesIdMap = FxHashMap<CrateBuilderId, Crate>;
 
+/// A crate. Its fields are set only through base-db ([`Crate::create`], [`Crate::set_env`] and
+/// the other setters, [`CrateGraphBuilder::set_in_db`]), which keep [`Crate::content`] the
+/// content ID of them all and of its dependencies' content IDs.
 #[salsa::input]
 #[derive(Debug, PartialOrd, Ord)]
 pub struct Crate {
     #[returns(ref)]
-    pub data: BuiltCrateData,
+    #[get(data_field)]
+    #[set(set_data_field)]
+    data: BuiltCrateData,
     /// Crate data that is not needed for analysis.
     ///
     /// This is split into a separate field to increase incrementality.
     #[returns(ref)]
-    pub extra_data: ExtraCrateData,
+    #[get(extra_data_field)]
+    #[set(set_extra_data_field)]
+    extra_data: ExtraCrateData,
     // This is in `Arc` because it is shared for all crates in a workspace.
     #[returns(ref)]
-    pub workspace_data: Arc<CrateWorkspaceData>,
+    #[get(workspace_data_field)]
+    #[set(set_workspace_data_field)]
+    workspace_data: Arc<CrateWorkspaceData>,
     #[returns(ref)]
-    pub cfg_options: CfgOptions,
+    #[get(cfg_options_field)]
+    #[set(set_cfg_options_field)]
+    cfg_options: CfgOptions,
     #[returns(ref)]
-    pub env: Env,
+    #[get(env_field)]
+    #[set(set_env_field)]
+    env: Env,
+    #[returns(copy)]
+    #[get(content_field)]
+    #[set(set_content_field)]
+    content: InputId,
+}
+
+impl Crate {
+    /// A crate's content ID is of its root file's path, its [`BuiltCrateData`] (each
+    /// dependency as its crate's content ID, so a crate's ID covers everything it depends on),
+    /// its [`ExtraCrateData`], [`CrateWorkspaceData::content`], [`cfg_options_content`] and
+    /// [`Env::content`]. [`UniqueCrateData`] adds nothing: its root file is hashed as its
+    /// path, and its disambiguator is the crate's own data and cfg.
+    pub const DOMAIN: &'static str = "blaze v2 crate 1";
+
+    pub fn data<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db BuiltCrateData {
+        self.data_field(db)
+    }
+
+    pub fn extra_data<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db ExtraCrateData {
+        self.extra_data_field(db)
+    }
+
+    pub fn workspace_data<'db, Db: ?Sized + salsa::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db Arc<CrateWorkspaceData> {
+        self.workspace_data_field(db)
+    }
+
+    pub fn cfg_options<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db CfgOptions {
+        self.cfg_options_field(db)
+    }
+
+    pub fn env<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db Env {
+        self.env_field(db)
+    }
+
+    pub fn content<Db: ?Sized + salsa::Database>(self, db: &Db) -> ContentId {
+        self.content_field(db).id()
+    }
+
+    /// A crate outside a [`CrateGraphBuilder`], all its fields with `durability`. Its root
+    /// file must be in a source root already, and its dependencies made.
+    pub fn create(
+        db: &mut dyn SourceDatabase,
+        data: BuiltCrateData,
+        extra: ExtraCrateData,
+        workspace: Arc<CrateWorkspaceData>,
+        cfg: CfgOptions,
+        env: Env,
+        durability: Durability,
+    ) -> Crate {
+        let content = Crate::content_of(&*db, &data, &extra, &workspace, &cfg, &env);
+        Crate::builder(data, extra, workspace, cfg, env, InputId(content))
+            .durability(durability)
+            .new(&*db)
+    }
+
+    pub fn set_data(self, db: &mut dyn SourceDatabase, data: BuiltCrateData) {
+        self.set_data_field(db).to(data);
+        refresh_contents(db, self);
+    }
+
+    pub fn set_extra_data(self, db: &mut dyn SourceDatabase, extra: ExtraCrateData) {
+        self.set_extra_data_field(db).to(extra);
+        refresh_contents(db, self);
+    }
+
+    pub fn set_workspace_data(self, db: &mut dyn SourceDatabase, workspace: Arc<CrateWorkspaceData>) {
+        self.set_workspace_data_field(db).to(workspace);
+        refresh_contents(db, self);
+    }
+
+    pub fn set_cfg_options(self, db: &mut dyn SourceDatabase, cfg: CfgOptions) {
+        self.set_cfg_options_field(db).to(cfg);
+        refresh_contents(db, self);
+    }
+
+    pub fn set_env(self, db: &mut dyn SourceDatabase, env: Env) {
+        self.set_env_field(db).to(env);
+        refresh_contents(db, self);
+    }
+
+    fn content_of(
+        db: &dyn SourceDatabase,
+        data: &BuiltCrateData,
+        extra: &ExtraCrateData,
+        workspace: &CrateWorkspaceData,
+        cfg: &CfgOptions,
+        env: &Env,
+    ) -> ContentId {
+        let mut hasher = Hasher::new(Crate::DOMAIN);
+        hasher.part(&content::path_key(&root_path(db, data.root_file_id)));
+        hasher.update(&(data.edition.number() as u64).to_le_bytes());
+        content::len(&mut hasher, data.dependencies.len());
+        for dep in &data.dependencies {
+            hasher
+                .id(&dep.crate_id.content(db))
+                .part(dep.name.as_str().as_bytes())
+                .update(&[dep.prelude as u8, dep.sysroot as u8]);
+        }
+        match &data.origin {
+            CrateOrigin::Rustc { name } => hasher.update(&[0]).part(name.as_str().as_bytes()),
+            CrateOrigin::Local { repo, name } => {
+                hasher.update(&[1]);
+                content::opt(&mut hasher, repo.as_deref());
+                content::opt(&mut hasher, name.as_ref().map(Symbol::as_str));
+                &mut hasher
+            }
+            CrateOrigin::Library { repo, name } => {
+                hasher.update(&[2]);
+                content::opt(&mut hasher, repo.as_deref());
+                hasher.part(name.as_str().as_bytes())
+            }
+            CrateOrigin::Lang(lang) => {
+                let lang = match lang {
+                    LangCrateOrigin::Alloc => 0,
+                    LangCrateOrigin::Core => 1,
+                    LangCrateOrigin::ProcMacro => 2,
+                    LangCrateOrigin::Std => 3,
+                    LangCrateOrigin::Test => 4,
+                    LangCrateOrigin::Dependency => 5,
+                    LangCrateOrigin::Other => 6,
+                };
+                hasher.update(&[3, lang])
+            }
+        };
+        content::len(&mut hasher, data.crate_attrs.len());
+        for attr in &data.crate_attrs {
+            hasher.part(attr.as_bytes());
+        }
+        let target_kind = match data.target_kind {
+            TargetKind::Bin => 0,
+            TargetKind::Lib { is_proc_macro: false } => 1,
+            TargetKind::Lib { is_proc_macro: true } => 2,
+            TargetKind::Example => 3,
+            TargetKind::Test => 4,
+            TargetKind::Bench => 5,
+            TargetKind::BuildScript => 6,
+            TargetKind::Other => 7,
+        };
+        hasher.update(&[target_kind]).part(data.proc_macro_cwd.as_str().as_bytes());
+        content::opt(&mut hasher, extra.version.as_deref());
+        match &extra.display_name {
+            None => hasher.update(&[0]),
+            Some(name) => hasher
+                .update(&[1])
+                .part(name.crate_name().as_str().as_bytes())
+                .part(name.canonical_name().as_str().as_bytes()),
+        };
+        match &extra.potential_cfg_options {
+            None => hasher.update(&[0]),
+            Some(cfg) => hasher.update(&[1]).id(&cfg_options_content(cfg)),
+        };
+        hasher
+            .id(&workspace.content())
+            .id(&cfg_options_content(cfg))
+            .id(&env.content())
+            .finish()
+    }
+}
+
+/// The path of a crate's root file: its identity in the crate's content ID.
+fn root_path(db: &dyn SourceDatabase, file: FileId) -> VfsPath {
+    let root_id = db.file_source_root(file).source_root_id(db);
+    let root = db.source_root(root_id).source_root(db);
+    match root.path_for_file(&file) {
+        Some(path) => path.clone(),
+        None => panic!(
+            "the root file {file:?} of a crate is not in its source root {root_id:?}: \
+             set the source roots before the crates"
+        ),
+    }
+}
+
+/// Sets the content ID of `krate`, and of every crate that depends on it whose ID changes
+/// with it, after one of its fields was set.
+fn refresh_contents(db: &mut dyn SourceDatabase, krate: Crate) {
+    if !refresh_content(db, krate) {
+        return;
+    }
+    let mut changed = FxHashSet::default();
+    changed.insert(krate);
+    // In topological order: a crate's dependencies are refreshed before it.
+    for dependent in all_crates(&*db).iter().copied() {
+        if dependent != krate
+            && dependent.data(&*db).dependencies.iter().any(|dep| changed.contains(&dep.crate_id))
+            && refresh_content(db, dependent)
+        {
+            changed.insert(dependent);
+        }
+    }
+    refresh_crate_graph_content(db);
+}
+
+/// Sets `krate`'s content ID from its fields as they are; whether it changed.
+fn refresh_content(db: &mut dyn SourceDatabase, krate: Crate) -> bool {
+    let content = Crate::content_of(
+        &*db,
+        krate.data(&*db),
+        krate.extra_data(&*db),
+        krate.workspace_data(&*db),
+        krate.cfg_options(&*db),
+        krate.env(&*db),
+    );
+    if krate.content(&*db) == content {
+        return false;
+    }
+    krate.set_content_field(db).to(InputId(content));
+    true
 }
 
 impl Crate {
@@ -669,6 +905,7 @@ impl CrateGraphBuilder {
         {
             set_all_crates_with_durability(db, all_crates, Durability::MEDIUM);
         }
+        refresh_crate_graph_content(db);
 
         return visited;
 
@@ -719,37 +956,55 @@ impl CrateGraphBuilder {
                 Some(Box::new((crate_data.clone(), krate.cfg_options.to_hashable())))
             };
 
+            // The dependencies are set already, with their content IDs.
+            let content = Crate::content_of(
+                &*db,
+                &crate_data,
+                &krate.extra,
+                &krate.ws_data,
+                &krate.cfg_options,
+                &krate.env,
+            );
             let unique_crate_data =
                 UniqueCrateData { root_file_id: krate.basic.root_file_id, disambiguator };
             let crate_input = match crates_map.0.entry(unique_crate_data) {
                 Entry::Occupied(entry) => {
                     let old_crate = *entry.get();
                     if crate_data != *old_crate.data(db) {
-                        old_crate.set_data(db).with_durability(Durability::MEDIUM).to(crate_data);
+                        old_crate
+                            .set_data_field(db)
+                            .with_durability(Durability::MEDIUM)
+                            .to(crate_data);
                     }
                     if krate.extra != *old_crate.extra_data(db) {
                         old_crate
-                            .set_extra_data(db)
+                            .set_extra_data_field(db)
                             .with_durability(Durability::MEDIUM)
                             .to(krate.extra.clone());
                     }
                     if krate.cfg_options != *old_crate.cfg_options(db) {
                         old_crate
-                            .set_cfg_options(db)
+                            .set_cfg_options_field(db)
                             .with_durability(Durability::MEDIUM)
                             .to(krate.cfg_options.clone());
                     }
                     if krate.env != *old_crate.env(db) {
                         old_crate
-                            .set_env(db)
+                            .set_env_field(db)
                             .with_durability(Durability::MEDIUM)
                             .to(krate.env.clone());
                     }
                     if krate.ws_data != *old_crate.workspace_data(db) {
                         old_crate
-                            .set_workspace_data(db)
+                            .set_workspace_data_field(db)
                             .with_durability(Durability::MEDIUM)
                             .to(krate.ws_data.clone());
+                    }
+                    if content != old_crate.content(db) {
+                        old_crate
+                            .set_content_field(db)
+                            .with_durability(Durability::MEDIUM)
+                            .to(InputId(content));
                     }
                     old_crate
                 }
@@ -760,6 +1015,7 @@ impl CrateGraphBuilder {
                         krate.ws_data.clone(),
                         krate.cfg_options.clone(),
                         krate.env.clone(),
+                        InputId(content),
                     )
                     .durability(Durability::MEDIUM)
                     .new(db);
@@ -958,6 +1214,20 @@ impl FromIterator<(String, String)> for Env {
 }
 
 impl Env {
+    pub const DOMAIN: &'static str = "blaze v2 env 1";
+
+    /// Of its variables sorted by name, each as its name and value.
+    pub fn content(&self) -> ContentId {
+        let mut entries: Vec<_> = self.entries.iter().collect();
+        entries.sort_unstable();
+        let mut hasher = Hasher::new(Env::DOMAIN);
+        content::len(&mut hasher, entries.len());
+        for (key, value) in entries {
+            hasher.part(key.as_bytes()).part(value.as_bytes());
+        }
+        hasher.finish()
+    }
+
     pub fn set(&mut self, env: &str, value: impl Into<String>) {
         self.entries.insert(env.to_owned(), value.into());
     }

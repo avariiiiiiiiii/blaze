@@ -1,6 +1,5 @@
 //! Impl specialization related things
 
-use either::Either;
 use hir_def::{
     HasModule, ImplId, LifetimeParamId, TypeOrConstParamId, hir::generics::GenericParams,
     signatures::ImplSignature, unstable_features::UnstableFeatures,
@@ -180,15 +179,14 @@ pub(crate) fn specialized_ancestor(
         return None;
     }
     let trait_id = db.impl_trait(impl_id)?.skip_binder().def_id.0;
-    let mut ancestors = Vec::new();
-    for impls in TraitImpls::for_crate_and_deps(db, impl_id.krate(db)).iter() {
-        impls.for_trait(trait_id, |impls| {
-            let Either::Left(impls) = impls else { return };
-            ancestors.extend(impls.iter().copied().filter(|&ancestor| {
+    let ancestors: Vec<ImplId> =
+        TraitImpls::in_crate_and_deps_for_trait(db, impl_id.krate(db), trait_id)
+            .iter()
+            .copied()
+            .filter(|&ancestor| {
                 ancestor != impl_id && has_item(ancestor) && specializes(db, impl_id, ancestor)
-            }));
-        });
-    }
+            })
+            .collect();
     ancestors.iter().copied().find(|&ancestor| {
         ancestors.iter().all(|&other| other == ancestor || specializes(db, ancestor, other))
     })

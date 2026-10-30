@@ -17,7 +17,9 @@ doctest = false
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
+zstd.workspace = true
 
 [lints]
 workspace = true

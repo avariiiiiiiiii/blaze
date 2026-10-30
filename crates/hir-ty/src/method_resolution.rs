@@ -505,11 +505,11 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
                 .map(|method| (Either::Right((impl_, method)), impl_subst));
         }
     };
+    let db = infcx.interner.db;
     let item_of = |impl_id: ImplId| {
-        impl_id.impl_items(infcx.interner.db).items.iter().find_map(|(n, it)| match *it {
-            AssocItemId::FunctionId(f) => (n == name).then_some(AssocItemId::FunctionId(f)),
-            AssocItemId::ConstId(c) => (n == name).then_some(AssocItemId::ConstId(c)),
-            AssocItemId::TypeAliasId(_) => None,
+        impl_value_item(db, impl_id, name.clone()).map(|it| match it {
+            CandidateId::FunctionId(f) => AssocItemId::FunctionId(f),
+            CandidateId::ConstId(c) => AssocItemId::ConstId(c),
         })
     };
     if let Some(item) = item_of(impl_id) {
@@ -517,7 +517,6 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
     }
     // A specializing impl takes the items it leaves out from the impl it specializes: the
     // closest one that has the item.
-    let db = infcx.interner.db;
     let parent =
         crate::specialization::specialized_ancestor(db, impl_id, |it| item_of(it).is_some())?;
     let parent_args = infcx.fresh_args_for_item(Span::Dummy, parent.into());
@@ -531,6 +530,32 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
     }
     let parent_args = parent_args.fold_with(&mut ReplaceInferWithError::new(infcx.interner));
     Some((Either::Left(item_of(parent)?), parent_args))
+}
+
+/// The function or constant of `impl_` named `name`, the first if there are more: all that a
+/// lookup of `name` reads of the impl, so an item of another name added to it leaves the
+/// lookup as it was.
+#[salsa::tracked]
+pub fn impl_value_item(db: &dyn HirDatabase, impl_: ImplId, name: Name) -> Option<CandidateId> {
+    value_item_named(&impl_.impl_items(db).items, &name)
+}
+
+/// As [`impl_value_item`], of a trait.
+#[salsa::tracked]
+pub fn trait_value_item(
+    db: &dyn HirDatabase,
+    trait_: TraitId,
+    name: Name,
+) -> Option<CandidateId> {
+    value_item_named(&trait_.trait_items(db).items, &name)
+}
+
+fn value_item_named(items: &[(Name, AssocItemId)], name: &Name) -> Option<CandidateId> {
+    items.iter().find_map(|(item_name, item)| match *item {
+        AssocItemId::FunctionId(it) if item_name == name => Some(it.into()),
+        AssocItemId::ConstId(it) if item_name == name => Some(it.into()),
+        _ => None,
+    })
 }
 
 pub(crate) fn find_matching_impl<'db>(
@@ -928,8 +953,7 @@ pub fn with_incoherent_inherent_impls<'db>(
     let _p = tracing::info_span!("incoherent_inherent_impls").entered();
     let crates = crates_containing_incoherent_inherent_impls(db, krate);
     for &krate in crates {
-        let impls = InherentImpls::for_crate(db, krate);
-        callback(impls.for_self_ty(self_ty));
+        callback(InherentImpls::in_crate_for_self_ty(db, krate, SelfTyKey(*self_ty)));
     }
 }
 
@@ -993,6 +1017,19 @@ impl<'db> InherentImpls<'db> {
         let block_def_map = block_def_map(db, block);
         let result = Self::collect_def_map(db, block_def_map);
         if result.map.is_empty() { None } else { Some(Box::new(result)) }
+    }
+
+    /// The inherent impls of `block` for one type, as [`Self::in_crate_for_self_ty`].
+    #[salsa::tracked(returns(deref))]
+    pub fn in_block_for_self_ty(
+        db: &'db dyn HirDatabase,
+        block: BlockIdLt<'db>,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        match Self::for_block(db, block) {
+            Some(impls) => impls.for_self_ty(&self_ty.0).into(),
+            None => Box::default(),
+        }
     }
 }
 
@@ -1144,6 +1181,64 @@ impl<'db> TraitImpls<'db> {
         Self::for_crate_and_deps(db, krate)
             .iter()
             .flat_map(|impls| impls.blanket_impls(trait_))
+            .copied()
+            .collect()
+    }
+
+    /// The impls of one trait for one type in `krate` alone, without the built-in derives.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_for_trait_and_self_ty(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        trait_: TraitId,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        Self::for_crate(db, krate).for_trait_and_self_ty(trait_, &self_ty.0).0.into()
+    }
+
+    /// The impls of one trait for one type in `block` alone, without the built-in derives.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_block_for_trait_and_self_ty(
+        db: &'db dyn HirDatabase,
+        block: BlockIdLt<'db>,
+        trait_: TraitId,
+        self_ty: SelfTyKey<'db>,
+    ) -> Box<[ImplId]> {
+        match Self::for_block(db, block) {
+            Some(impls) => impls.for_trait_and_self_ty(trait_, &self_ty.0).0.into(),
+            None => Box::default(),
+        }
+    }
+
+    /// The impls of one trait in `krate` alone, without the built-in derives, in the order
+    /// [`Self::for_trait`] gives them: the blanket impls first.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_for_trait(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        trait_: TraitId,
+    ) -> Box<[ImplId]> {
+        let mut found = Vec::new();
+        Self::for_crate(db, krate).for_trait(trait_, |impls| {
+            if let Either::Left(impls) = impls {
+                found.extend_from_slice(impls);
+            }
+        });
+        found.into()
+    }
+
+    /// The impls of one trait in `krate` and its dependencies, each crate's as
+    /// [`Self::in_crate_for_trait`]. An impl of another trait changes `for_crate()` and
+    /// `in_crate_for_trait()` reruns equal, so this does not rerun.
+    #[salsa::tracked(returns(deref))]
+    pub fn in_crate_and_deps_for_trait(
+        db: &'db dyn HirDatabase,
+        krate: Crate,
+        trait_: TraitId,
+    ) -> Box<[ImplId]> {
+        loaded_crates(db, krate)
+            .iter()
+            .flat_map(|&dep| Self::in_crate_for_trait(db, dep, trait_))
             .copied()
             .collect()
     }

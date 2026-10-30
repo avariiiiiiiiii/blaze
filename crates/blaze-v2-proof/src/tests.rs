@@ -149,3 +149,54 @@ fn a_trace_round_trips_in_deterministic_cbor() {
     let back: Trace = blaze_protocol::cbor::from_slice(&bytes).unwrap();
     assert_eq!(back, trace);
 }
+
+#[test]
+fn every_simd_path_finds_the_first_difference_the_scalar_one_does() {
+    let mut rng = Rng::new(1606);
+    let paths = bytes::available();
+    assert_eq!(paths.last(), Some(&bytes::Simd::Scalar));
+    for len in (0..300).chain([1 << 12, (1 << 16) + 7]) {
+        let a: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+        let mut cases = vec![(a.clone(), None)];
+        for _ in 0..4 {
+            if len == 0 {
+                break;
+            }
+            let at = rng.below(len as u64) as usize;
+            let mut b = a.clone();
+            b[at] ^= 1 << rng.below(8);
+            // A second difference after the first must not hide it.
+            if at + 1 < len {
+                b[len - 1] ^= 0x80;
+            }
+            cases.push((b, Some(at)));
+        }
+        let mut shorter = a.clone();
+        shorter.truncate(len / 2);
+        cases.push((shorter, if len / 2 < len { Some(len / 2) } else { None }));
+        for (b, want) in &cases {
+            for &path in &paths {
+                assert_eq!(bytes::first_difference_with(path, &a, b), *want, "{path:?}, length {len}");
+                assert_eq!(bytes::first_difference_with(path, b, &a), *want, "{path:?}, length {len}, swapped");
+            }
+        }
+    }
+}
+
+#[test]
+fn files_are_compared_across_buffer_boundaries() {
+    let dir = std::env::temp_dir().join(format!("blaze-v2-proof-bytes-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    let body: Vec<u8> = (0..(3 << 20) + 5).map(|i: u32| (i % 251) as u8).collect();
+    std::fs::write(&a, &body).unwrap();
+    std::fs::write(&b, &body).unwrap();
+    assert_eq!(bytes::first_file_difference(&a, &b).unwrap(), None);
+    let mut other = body.clone();
+    other[(2 << 20) + 3] ^= 1;
+    std::fs::write(&b, &other).unwrap();
+    assert_eq!(bytes::first_file_difference(&a, &b).unwrap(), Some((2 << 20) + 3));
+    std::fs::write(&b, &body[..1 << 20]).unwrap();
+    assert_eq!(bytes::first_file_difference(&a, &b).unwrap(), Some(1 << 20));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

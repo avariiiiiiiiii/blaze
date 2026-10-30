@@ -16,6 +16,7 @@
 
 pub mod format_args;
 pub mod generics;
+pub(crate) mod persist;
 pub mod type_ref;
 
 use std::{fmt, mem};
@@ -76,7 +77,7 @@ impl ExprOrPatId {
     }
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq, salsa::SalsaValue)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, salsa::SalsaValue)]
 pub struct ExprOrPatIdPacked(u32);
 
 const _: () = assert!(mem::size_of::<ExprOrPatIdPacked>() == mem::size_of::<u32>());

@@ -1,6 +1,10 @@
 //! MIR definitions and implementation
 
-use std::{fmt::Display, iter};
+use std::{
+    fmt::Display,
+    hash::{Hash, Hasher},
+    iter,
+};
 
 use base_db::target::TargetLoadError;
 use either::Either;
@@ -72,14 +76,14 @@ pub struct Local {
 /// **Needs clarification:** Is loading a place that has its variant index set well-formed? Miri
 /// currently implements it, but it seems like this may be something to check against in the
 /// validator.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Operand {
     pub kind: OperandKind,
     // FIXME : This should actually just be of type `MirSpan`.
     pub span: Option<MirSpan>,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum OperandKind {
     /// Creates a value by loading the given place.
     ///
@@ -287,7 +291,7 @@ impl<'db> From<LocalId> for Place<'db> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum AggregateKind {
     /// The type is of the element
     Array(StoredTy),
@@ -368,14 +372,14 @@ impl SwitchTargets {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Terminator {
     pub span: MirSpan,
     pub kind: TerminatorKind,
 }
 
 /// What a failed [`TerminatorKind::Assert`] panics with: rustc's `AssertKind`.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum AssertKind {
     BoundsCheck { len: Operand, index: Operand },
     Overflow(BinOp, Operand, Operand),
@@ -431,7 +435,7 @@ impl AssertKind {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum TerminatorKind {
     /// Block has one successor; we continue execution there.
     Goto { target: BasicBlockId },
@@ -654,7 +658,7 @@ pub enum TerminatorKind {
 }
 
 // Order of variants in this enum matter: they are used to compare borrow kinds.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub enum BorrowKind {
     /// Data must be immutable and is aliasable.
     Shared,
@@ -685,7 +689,7 @@ pub enum BorrowKind {
 }
 
 // Order of variants in this enum matter: they are used to compare borrow kinds.
-#[derive(Debug, PartialEq, Eq, Clone, Copy, PartialOrd, Ord)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, PartialOrd, Ord)]
 pub enum MutBorrowKind {
     /// Data must be immutable but not aliasable. This kind of borrow cannot currently
     /// be expressed by the user and is used only in implicit closure bindings.
@@ -732,7 +736,7 @@ pub enum UnOp {
     Neg,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum BinOp {
     /// The `+` operator (addition)
     Add,
@@ -876,7 +880,7 @@ impl From<Operand> for Rvalue {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum CastKind {
     /// An exposing pointer to address cast. A cast between a pointer and an integer type, or
     /// between a function pointer and an integer type.
@@ -899,7 +903,7 @@ pub enum CastKind {
     FnPtrToPtr,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Rvalue {
     /// Yields the operand unchanged
     Use(Operand),
@@ -1034,7 +1038,7 @@ pub enum Rvalue {
     CopyForDeref(StoredPlace),
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum StatementKind {
     Assign(StoredPlace, Rvalue),
     FakeRead(StoredPlace),
@@ -1053,7 +1057,7 @@ pub enum StatementKind {
 }
 
 /// An `asm!` block. One that does not return is followed by `Unreachable`.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct InlineAsm {
     /// The pieces name `operands` by index.
     pub template: Box<[hir_def::hir::AsmPiece]>,
@@ -1068,7 +1072,7 @@ pub struct InlineAsm {
     pub clobber_abi: bool,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum AsmOperand {
     /// A register that holds `input` when the block starts, and whose value when the block
     /// ends goes to `output`. With neither it is one the block overwrites.
@@ -1091,13 +1095,13 @@ impl StatementKind {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct Statement {
     pub kind: StatementKind,
     pub span: MirSpan,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct BasicBlock {
     /// List of statements in this block.
     pub statements: Vec<Statement>,
@@ -1374,6 +1378,64 @@ pub struct MirBody<'db> {
     pub promoted_constants: Vec<LocalId>,
 }
 
+impl Hash for MirBody<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        let MirBody {
+            basic_blocks,
+            locals,
+            start_block,
+            owner,
+            binding_locals,
+            upvar_locals,
+            param_locals,
+            promoted_locals,
+            closures,
+            coroutine,
+            unreached,
+            scope_ends,
+            inherits_overflow_checks,
+            phase,
+            upvars_in_place,
+            panic_unwinds,
+            promoted_constants,
+        } = self;
+        basic_blocks.hash(state);
+        locals.hash(state);
+        start_block.hash(state);
+        owner.hash(state);
+        binding_locals.hash(state);
+        hash_unordered(upvar_locals.iter(), state);
+        param_locals.hash(state);
+        promoted_locals.hash(state);
+        closures.hash(state);
+        coroutine.hash(state);
+        unreached.hash(state);
+        scope_ends.hash(state);
+        inherits_overflow_checks.hash(state);
+        phase.hash(state);
+        upvars_in_place.hash(state);
+        panic_unwinds.hash(state);
+        promoted_constants.hash(state);
+    }
+}
+
+/// Hashes the entries of a map so that maps that are `==` hash the same whatever order they
+/// iterate in: each entry on its own, summed.
+fn hash_unordered<'a, K: Hash + 'a, V: Hash + 'a, H: Hasher>(
+    entries: impl ExactSizeIterator<Item = (&'a K, &'a V)>,
+    state: &mut H,
+) {
+    let len = entries.len();
+    let sum = entries.fold(0u128, |sum, entry| {
+        let mut hasher = salsa::StableHasher::new();
+        entry.hash(&mut hasher);
+        let (low, high) = hasher.finish128();
+        sum.wrapping_add((u128::from(high) << 64) | u128::from(low))
+    });
+    state.write_usize(len);
+    state.write_u128(sum);
+}
+
 /// What a body means, which depends on the passes it has been through. The IDE only ever
 /// asks for [`MirPhase::Built`]; the interpreter and the code generator run
 /// [`MirPhase::Runtime`], which is computed on its own (`runtime_mir_body` and the like).
@@ -1397,7 +1459,7 @@ pub enum MirPhase {
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
 /// reference to the future and the `&mut Context` of the current `poll`, and the return slot
 /// has the type of the block's value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct CoroutineLocals {
     /// The `Poll` that `Return` and `Yield` hand to the caller of `poll`.
     pub poll: LocalId,
@@ -1905,7 +1967,7 @@ impl<'db> VTableMap<'db> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Hash, SalsaValue)]
 pub enum MirEvalError<'db> {
     ConstEvalError(String, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError, StoredTy),
@@ -1992,7 +2054,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
 }
 
 /// What an evaluation ran out of: its budget of steps or of bytes, of this size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
 pub enum Budget {
     Steps(u64),
     Memory(u64),
@@ -2038,7 +2100,7 @@ pub fn pad16(it: &[u8], is_signed: IsSigned) -> [u8; 16] {
 }
 
 // FIXME: Make this smaller, its stored in database queries
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
 pub enum MirLowerError<'db> {
     ConstEvalError(Box<str>, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError),
@@ -2133,5 +2195,63 @@ impl MirOptLevel {
             MirOptLevel::Debug => 1,
             MirOptLevel::Release => 2,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hash::FxHashMap;
+
+    use super::hash_unordered;
+
+    fn digest<'a>(entries: impl ExactSizeIterator<Item = (&'a u32, &'a Vec<u32>)>) -> (u64, u64) {
+        let mut hasher = salsa::StableHasher::new();
+        hash_unordered(entries, &mut hasher);
+        hasher.finish128()
+    }
+
+    fn map(
+        entries: impl IntoIterator<Item = (u32, Vec<u32>)>,
+        capacity: usize,
+    ) -> FxHashMap<u32, Vec<u32>> {
+        let mut map = FxHashMap::with_capacity_and_hasher(capacity, Default::default());
+        map.extend(entries);
+        map
+    }
+
+    fn entries() -> Vec<(u32, Vec<u32>)> {
+        (0..40).map(|key| (key, vec![key, key * 3])).collect()
+    }
+
+    #[test]
+    fn unordered_hash_ignores_insertion_order() {
+        let forward = map(entries(), 0);
+        let backward = map(entries().into_iter().rev(), 256);
+        assert_eq!(forward, backward);
+        assert_eq!(digest(forward.iter()), digest(backward.iter()));
+
+        let pairs = entries();
+        let refs: Vec<(&u32, &Vec<u32>)> = pairs.iter().map(|(key, value)| (key, value)).collect();
+        assert_eq!(digest(refs.iter().copied()), digest(refs.iter().rev().copied()));
+        assert_eq!(digest(refs.iter().copied()), digest(forward.iter()));
+    }
+
+    #[test]
+    fn unordered_hash_sees_every_entry() {
+        let base = map(entries(), 0);
+
+        let mut changed = base.clone();
+        changed.get_mut(&17).unwrap()[1] += 1;
+        assert_ne!(base, changed);
+        assert_ne!(digest(base.iter()), digest(changed.iter()));
+
+        let mut rekeyed = base.clone();
+        let value = rekeyed.remove(&17).unwrap();
+        rekeyed.insert(1000, value);
+        assert_ne!(digest(base.iter()), digest(rekeyed.iter()));
+
+        let mut fewer = base.clone();
+        fewer.remove(&17);
+        assert_ne!(digest(base.iter()), digest(fewer.iter()));
     }
 }

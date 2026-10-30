@@ -1,16 +1,14 @@
 //! Utilities for computing drop info about types.
 
-use hir_def::{
-    AdtId, ImplId,
-    signatures::{StructFlags, StructSignature},
-};
+use hir_def::{AdtId, ImplId, signatures::StructFlags};
 use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{AdtDef, GenericArgs as _, IntoKind};
 
 use crate::{
     consteval,
     db::HirDatabase,
-    method_resolution::TraitImpls,
+    layout::{enum_variant_ids, struct_flags},
+    method_resolution::{SelfTyKey, TraitImpls},
     next_solver::{
         DbInterner, ParamEnv, SimplifiedType, Ty, TyKind,
         infer::{InferCtxt, traits::ObligationCause},
@@ -27,11 +25,14 @@ pub fn destructor(db: &dyn HirDatabase, adt: AdtId) -> Option<ImplId> {
     };
     let interner = DbInterner::new_with(db, module.krate(db));
     let drop_trait = interner.lang_items().Drop?;
+    let self_ty = SelfTyKey(SimplifiedType::Adt(adt.into()));
     let impls = match module.block(db) {
-        Some(block) => TraitImpls::for_block(db, block)?,
-        None => TraitImpls::for_crate(db, module.krate(db)),
+        Some(block) => TraitImpls::in_block_for_trait_and_self_ty(db, block, drop_trait, self_ty),
+        None => {
+            TraitImpls::in_crate_for_trait_and_self_ty(db, module.krate(db), drop_trait, self_ty)
+        }
     };
-    impls.for_trait_and_self_ty(drop_trait, &SimplifiedType::Adt(adt.into())).0.first().copied()
+    impls.first().copied()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -83,7 +84,7 @@ pub fn is_freeze<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -
                     vec![id.into()]
                 }
                 AdtId::EnumId(id) => {
-                    id.enum_variants(db).variants.iter().map(|(_, it)| it.0.into()).collect()
+                    enum_variant_ids(db, id).iter().map(|&it| it.into()).collect()
                 }
                 AdtId::UnionId(_) => return false,
             };
@@ -130,8 +131,7 @@ fn has_drop_glue_impl<'db>(
             }
             match adt_id {
                 AdtId::StructId(id) => {
-                    if StructSignature::of(db, id)
-                        .flags
+                    if struct_flags(db, id)
                         .intersects(StructFlags::IS_MANUALLY_DROP | StructFlags::IS_PHANTOM_DATA)
                     {
                         return DropGlue::None;
@@ -151,11 +151,9 @@ fn has_drop_glue_impl<'db>(
                 }
                 // Unions cannot have fields with destructors.
                 AdtId::UnionId(_) => DropGlue::None,
-                AdtId::EnumId(id) => id
-                    .enum_variants(db)
-                    .variants
-                    .values()
-                    .map(|&(variant, _)| {
+                AdtId::EnumId(id) => enum_variant_ids(db, id)
+                    .iter()
+                    .map(|&variant| {
                         db.field_types(variant.into())
                             .iter()
                             .map(|(_, field)| {

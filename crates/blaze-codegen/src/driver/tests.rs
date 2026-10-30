@@ -1,0 +1,459 @@
+//! The build over a front end and backend made up here: what is compiled, kept, shared and
+//! renamed, without a database.
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use blaze_ids::{ContentId, Hasher};
+use blaze_items::{CodeHash, ItemKey};
+
+use super::*;
+use crate::{
+    Arch, Backend, RelocKind,
+    plan::{Mode, OptLevel, Override, Profile},
+    settings::{DebugInfo, Panic, Relocation, Toolchain},
+    summary::{Attrs, Call, Hint},
+};
+
+#[derive(Clone)]
+struct Function {
+    body: u8,
+    calls: Vec<u32>,
+    statics: Vec<u32>,
+    origin: Origin,
+    symbol: Option<String>,
+}
+
+#[derive(Default)]
+struct Program {
+    functions: HashMap<u32, Function>,
+    statics: HashMap<u32, u8>,
+}
+
+impl Program {
+    fn function(&mut self, id: u32, body: u8, calls: &[u32]) -> &mut Function {
+        let function = Function {
+            body,
+            calls: calls.to_vec(),
+            statics: Vec::new(),
+            origin: Origin::Member("app".to_owned()),
+            symbol: None,
+        };
+        self.functions.insert(id, function);
+        self.functions.get_mut(&id).unwrap()
+    }
+}
+
+fn item(id: u32) -> ItemKey {
+    ItemKey(ContentId::of("blaze v2 test item 1", &id.to_le_bytes()))
+}
+
+fn static_item(id: u32) -> ItemKey {
+    ItemKey(ContentId::of("blaze v2 test static 1", &id.to_le_bytes()))
+}
+
+impl Frontend for Program {
+    type Instance = u32;
+    type Static = u32;
+
+    fn describe(&self, id: &u32, _: &Origin) -> Result<Described<u32, u32>, CodegenError> {
+        let function = &self.functions[id];
+        let refs = function
+            .calls
+            .iter()
+            .map(|it| FrontRef::Function(*it))
+            .chain(function.statics.iter().map(|it| FrontRef::Static(*it)))
+            .chain([FrontRef::Extern("memcpy".to_owned())])
+            .collect();
+        // The code takes callees by their interface, here their number: not their bodies.
+        let mut code = Hasher::new("blaze v2 test code 1");
+        code.update(&id.to_le_bytes()).update(&[function.body]);
+        for callee in &function.calls {
+            code.update(&callee.to_le_bytes());
+        }
+        Ok(Described {
+            item: item(*id),
+            code: CodeHash(code.finish()),
+            args: ContentId::default(),
+            origin: function.origin.clone(),
+            overflow_checks: None,
+            address: match function.symbol {
+                Some(_) => Address::Significant,
+                None => Address::Free,
+            },
+            symbol: function.symbol.clone(),
+            refs,
+        })
+    }
+
+    fn describe_static(&self, id: &u32) -> Result<DescribedStatic<u32, u32>, CodegenError> {
+        let value = self.statics[id];
+        Ok(DescribedStatic {
+            item: static_item(*id),
+            instance: ContentId::default(),
+            value: ContentId::of("blaze v2 test value 1", &[value]),
+            origin: Origin::Member("app".to_owned()),
+            symbol: None,
+            refs: Vec::new(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct Machine {
+    prepared: AtomicUsize,
+    emitted: AtomicUsize,
+    summarized: AtomicUsize,
+    statics: AtomicUsize,
+}
+
+/// A function's body byte, and how many places it has.
+struct Prepared {
+    body: u8,
+    refs: usize,
+}
+
+fn code(prepared: &Prepared) -> Vec<u8> {
+    let mut code = vec![prepared.body];
+    code.extend(std::iter::repeat_n([0xe8, 0, 0, 0, 0], prepared.refs).flatten());
+    code
+}
+
+impl Prepare for Machine {
+    type Frontend = Program;
+    type Prepared = Prepared;
+    type Export = u8;
+
+    fn prepare(
+        &self,
+        program: &Program,
+        _: &Unit,
+        _: &Spec,
+        id: &u32,
+        refs: &crate::template::Refs,
+    ) -> Result<(Shape, Prepared), CodegenError> {
+        self.prepared.fetch_add(1, Ordering::Relaxed);
+        let prepared = Prepared { body: program.functions[id].body, refs: refs.len() };
+        Ok((Shape(code(&prepared)), prepared))
+    }
+
+    fn summarize(
+        &self,
+        unit: &Unit,
+        _: &Spec,
+        prepared: &Prepared,
+        refs: &crate::template::Refs,
+    ) -> Result<(Summary, u8), CodegenError> {
+        self.summarized.fetch_add(1, Ordering::Relaxed);
+        let calls = refs
+            .iter()
+            .filter_map(|it| match it {
+                Target::Function(key) | Target::Direct(key) => {
+                    Some(Call { callee: *key, count: 1, args: Vec::new() })
+                }
+                _ => None,
+            })
+            .collect();
+        let summary = Summary {
+            key: unit.instance.key(),
+            size: 4,
+            hint: Hint::None,
+            calls,
+            addressed: Vec::new(),
+            params: 0,
+            unused: Vec::new(),
+            attrs: Attrs::default(),
+            external: false,
+        };
+        Ok((summary, prepared.body))
+    }
+
+    fn emit(
+        &self,
+        unit: &Unit,
+        _: &Spec,
+        prepared: Prepared,
+        refs: &crate::template::Refs,
+        imports: Option<(&Imports, &[Import<'_, u8>])>,
+    ) -> Result<Emitted, CodegenError> {
+        self.emitted.fetch_add(1, Ordering::Relaxed);
+        let relocs = (0..prepared.refs)
+            .map(|at| Reloc {
+                at: 2 + 5 * at as u32,
+                kind: RelocKind::PcRel32,
+                target: refs[at].clone(),
+                addend: -4,
+            })
+            .collect();
+        let mut code = code(&prepared);
+        // What it built in shows in its code, as an import's body would.
+        for import in imports.map_or(&[][..], |it| it.1) {
+            code.push(*import.export);
+        }
+        let function = CompiledFunction {
+            key: unit.instance.key(),
+            arch: unit.arch,
+            align: 16,
+            code,
+            relocs,
+            data: Vec::new(),
+            inlined: Vec::new(),
+            side: None,
+        };
+        Ok(Emitted { function, side: None })
+    }
+
+    fn masked(&self, _: &Unit, _: &Prepared) -> Option<Masked> {
+        None
+    }
+
+    fn merge(
+        &self,
+        group: &Group,
+        _: Vec<(&Unit, &Spec, Prepared, &crate::template::Refs)>,
+    ) -> Result<fold::Merged, CodegenError> {
+        Err(error(group.key(), item(0), "nothing folds here"))
+    }
+
+    fn compile_static(
+        &self,
+        program: &Program,
+        _: &Spec,
+        id: &u32,
+        _: &crate::template::Refs,
+    ) -> Result<CompiledStatic, CodegenError> {
+        self.statics.fetch_add(1, Ordering::Relaxed);
+        Ok(CompiledStatic {
+            item: static_item(*id),
+            instance: ContentId::default(),
+            align: 8,
+            bytes: vec![program.statics[id]; 8],
+            relocs: Vec::new(),
+            data: Vec::new(),
+            writable: false,
+            thread_local: false,
+        })
+    }
+}
+
+#[derive(Default)]
+struct Store(BTreeMap<Key, Vec<u8>>);
+
+impl Lookup for Store {
+    fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, String> {
+        Ok(self.0.get(key).cloned())
+    }
+}
+
+impl Store {
+    fn keep(&mut self, puts: &[Put]) {
+        for put in puts {
+            self.0.insert(put.key, put.bytes.clone());
+        }
+    }
+}
+
+fn policy(level: OptLevel, mode: Mode) -> Policy {
+    Policy {
+        toolchain: Toolchain {
+            id: ContentId([1; 32]),
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+            arch: Arch::X86_64,
+            cpu: "x86-64-v3".to_owned(),
+            features: Vec::new(),
+            cranelift: "0.136".to_owned(),
+            llvm: Some("23.1".to_owned()),
+            frame_pointers: false,
+            relocation: Relocation::Pic,
+        },
+        profile: Profile {
+            opt_level: level,
+            overflow_checks: true,
+            debug_assertions: true,
+            debuginfo: DebugInfo::Full,
+            panic: Panic::Unwind,
+            packages: BTreeMap::new(),
+            build_override: Override::default(),
+        },
+        mode,
+        fold: false,
+    }
+}
+
+fn member() -> Origin {
+    Origin::Member("app".to_owned())
+}
+
+/// `main` (1) calls 2 and 3; 2 calls 4, 3 calls 5; 4 and 5 differ; 2 and 3 are one shape.
+fn program() -> Program {
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2, 3]).symbol = Some("main".to_owned());
+    program.function(2, 0x22, &[4]);
+    program.function(3, 0x22, &[5]);
+    program.function(4, 0x44, &[]);
+    program.function(5, 0x55, &[]);
+    program
+}
+
+fn build(
+    program: &Program,
+    machine: &Machine,
+    policy: &Policy,
+    memo: &Memo,
+    store: &Store,
+) -> Result<Built, Vec<CodegenError>> {
+    Build::new(machine, program, policy, memo).run(&[(1, member())], store)
+}
+
+#[test]
+fn a_cold_build_compiles_once_per_shape_and_a_warm_one_compiles_nothing() {
+    let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
+    let (machine, memo, mut store) = (Machine::default(), Memo::new(), Store::default());
+    let cold = build(&program, &machine, &policy, &memo, &store).unwrap();
+    assert_eq!(cold.stats.instances, 5);
+    // 2 and 3 are one shape up to their callees: one compile, one memo hit.
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), 4);
+    assert_eq!(cold.stats.memo, 1);
+    assert_eq!(cold.functions.len(), 5);
+    assert_eq!(cold.roots.len(), 1);
+    assert_eq!(cold.symbols, vec![(cold.roots[0], "main".to_owned())]);
+
+    store.keep(&cold.puts);
+    let warm_machine = Machine::default();
+    let warm = build(&program, &warm_machine, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(warm_machine.prepared.load(Ordering::Relaxed), 0);
+    assert_eq!(warm_machine.emitted.load(Ordering::Relaxed), 0);
+    assert_eq!(warm.stats.stored, 5);
+    assert_eq!(warm.functions, cold.functions);
+}
+
+#[test]
+fn a_callee_edit_renames_its_callers_and_compiles_only_it() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = program();
+    let memo = Memo::new();
+    let mut store = Store::default();
+    let before = build(&program, &Machine::default(), &policy, &memo, &store).unwrap();
+    store.keep(&before.puts);
+
+    program.functions.get_mut(&4).unwrap().body = 0x45;
+    let machine = Machine::default();
+    let after = build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), 1);
+    let key_of = |built: &Built, body: u8| {
+        built.functions.iter().find(|it| it.code[0] == body).map(|it| it.key).unwrap()
+    };
+    let (old, new) = (key_of(&before, 0x44), key_of(&after, 0x45));
+    assert_ne!(old, new);
+    // 2 is the same template; its call now names the new 4.
+    let caller = after.functions.iter().find(|it| it.relocs.iter().any(|r| r.target == Target::Direct(new)));
+    assert!(caller.is_some_and(|it| it.code[0] == 0x22));
+    assert!(after.functions.iter().all(|it| it.relocs.iter().all(|r| r.target != Target::Direct(old))));
+}
+
+#[test]
+fn equal_code_is_one_function_unless_its_address_is_significant() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = Program::default();
+    program.function(1, 0x11, &[2, 3]).symbol = Some("main".to_owned());
+    program.function(2, 0x77, &[]);
+    program.function(3, 0x77, &[]);
+    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    assert_eq!(built.deduped.merged.len(), 1);
+    assert_eq!(built.functions.len(), 2);
+
+    program.functions.get_mut(&3).unwrap().symbol = Some("exported".to_owned());
+    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    assert!(built.deduped.merged.is_empty());
+    assert_eq!(built.functions.len(), 3);
+}
+
+#[test]
+fn statics_are_kept_by_which_they_are() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = program();
+    program.statics.insert(7, 0xaa);
+    program.statics.insert(8, 0xaa);
+    program.functions.get_mut(&4).unwrap().statics = vec![7, 8];
+    let machine = Machine::default();
+    let mut store = Store::default();
+    let built = build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
+    // Equal values, two statics, each compiled: a cold build reads the store before either.
+    assert_eq!(built.statics.len(), 2);
+    assert_eq!(machine.statics.load(Ordering::Relaxed), 2);
+    let caller = built.functions.iter().find(|it| it.code[0] == 0x44).unwrap();
+    let statics = caller.relocs.iter().filter(|it| matches!(it.target, Target::Static { .. })).count();
+    assert_eq!(statics, 2);
+    store.keep(&built.puts);
+    let warm = Machine::default();
+    let again = build(&program, &warm, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(warm.statics.load(Ordering::Relaxed), 0);
+    assert_eq!(again.statics, built.statics);
+}
+
+#[test]
+fn a_release_build_summarizes_decides_and_keeps_by_imports() {
+    let (program, policy) = (program(), policy(OptLevel::O3, Mode::Output));
+    let (machine, mut store) = (Machine::default(), Store::default());
+    let cold = build(&program, &machine, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(machine.summarized.load(Ordering::Relaxed), 5);
+    assert_eq!(cold.functions.len(), 5);
+    assert!(cold.functions.iter().all(|it| it.arch == Arch::X86_64));
+    store.keep(&cold.puts);
+
+    let warm = Machine::default();
+    let again = build(&program, &warm, &policy, &Memo::new(), &store).unwrap();
+    assert_eq!(warm.prepared.load(Ordering::Relaxed), 0);
+    assert_eq!(warm.summarized.load(Ordering::Relaxed), 0);
+    assert_eq!(again.functions, cold.functions);
+}
+
+#[test]
+fn a_live_build_starts_at_cranelift_and_tiers_up() {
+    let mut policy = policy(OptLevel::O0, Mode::Live);
+    policy.profile.packages.insert(
+        "*".to_owned(),
+        Override { opt_level: Some(OptLevel::O3), ..Override::default() },
+    );
+    let mut program = program();
+    program.functions.get_mut(&4).unwrap().origin = Origin::Dependency("memchr".to_owned());
+    let machine = Machine::default();
+    let memo = Memo::new();
+    let mut build = Build::new(&machine, &program, &policy, &memo);
+    let built = build.run(&[(1, member())], &Store::default()).unwrap();
+    assert_eq!(built.tiered.len(), 1);
+    // Members and the tiered function are reached through their slots.
+    let tiered = built.tiered[0];
+    assert!(built.functions.iter().any(|it| it.relocs.iter().any(|r| r.target == Target::Function(tiered))));
+    assert_eq!(machine.summarized.load(Ordering::Relaxed), 0);
+    let up = build.tier_up(&Store::default()).unwrap();
+    assert_eq!(up.replaced.len(), 1);
+    assert_eq!(up.replaced[0].0, tiered);
+    assert_ne!(up.replaced[0].1.key, tiered);
+}
+
+#[test]
+fn a_store_entry_that_does_not_read_is_an_error_not_a_compile() {
+    let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
+    let mut store = Store::default();
+    let cold = build(&program, &Machine::default(), &policy, &Memo::new(), &store).unwrap();
+    store.keep(&cold.puts);
+    for bytes in store.0.values_mut() {
+        bytes.truncate(3);
+    }
+    let machine = Machine::default();
+    let errors = build(&program, &machine, &policy, &Memo::new(), &store).unwrap_err();
+    assert_eq!(errors.len(), 5);
+    assert_eq!(machine.emitted.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_level_without_its_backend_names_the_function() {
+    let mut policy = policy(OptLevel::O3, Mode::Output);
+    policy.toolchain.llvm = None;
+    let errors = build(&program(), &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].item, item(1));
+}

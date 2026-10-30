@@ -217,6 +217,7 @@ define_symbols! {
     alloc_layout,
     alloc,
     allow,
+    anon,
     any,
     as_str,
     asm,

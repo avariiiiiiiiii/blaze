@@ -314,7 +314,7 @@ pub(crate) enum CreateConstError<'db> {
     },
 }
 
-pub(crate) fn path_to_const<'a, 'db>(
+pub(crate) fn path_to_const<'a, 'db: 'a>(
     db: &'db Db,
     resolver: &Resolver<'db>,
     generics: &impl Fn() -> &'a Generics<'db>,
@@ -361,7 +361,7 @@ pub(crate) fn path_to_const<'a, 'db>(
 /// an anon const). Inside field defaults, you are allowed to refer to them even inside anon consts.
 ///
 /// There's also `generic_const_exprs`, `min_generic_const_args`, and `generic_const_args`, all of which we don't implement yet.
-pub(crate) fn create_anon_const<'a, 'db>(
+pub(crate) fn create_anon_const<'a, 'db: 'a>(
     interner: DbInterner<'db>,
     owner: ExpressionStoreOwnerId,
     store: &ExpressionStore,

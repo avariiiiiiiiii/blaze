@@ -2813,7 +2813,7 @@ pub(crate) fn field_types_query(db: &Db, variant_id: VariantId) -> &FieldTypes {
     field_types_with_diagnostics(db, variant_id).value
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
 pub struct FieldType {
     pub(crate) ty: StoredEarlyBinder<StoredTy>,
     pub(crate) default: Option<StoredEarlyBinder<StoredConst>>,

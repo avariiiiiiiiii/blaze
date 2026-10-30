@@ -1,8 +1,9 @@
 //! MIR definitions and implementation
 
 use std::{
+    collections::HashMap,
     fmt::Display,
-    hash::{Hash, Hasher},
+    hash::{BuildHasherDefault, Hash, Hasher},
     iter,
 };
 
@@ -18,7 +19,7 @@ use hir_expand::{mod_path::ModPath, name::Name};
 use intern::Symbol;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHasher};
 use rustc_type_ir::{
     CoroutineArgs, GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
@@ -2204,7 +2205,8 @@ impl<'db> PlaceTy<'db> {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)]
 pub struct VTableMap<'db> {
-    ty_to_id: FxHashMap<Ty<'db>, usize>,
+    /// Fx hashed as `FxHashMap`, with the hasher `rustc_type_ir` can visit.
+    ty_to_id: HashMap<Ty<'db>, usize, BuildHasherDefault<FxHasher>>,
     id_to_ty: Vec<Ty<'db>>,
 }
 

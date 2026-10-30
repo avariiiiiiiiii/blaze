@@ -271,7 +271,7 @@ pub fn intrinsic_of(
 
 impl Intrinsic {
     /// How many names there are: rustc's intrinsics, and the older names.
-    pub const COUNT: usize = BY_INDEX.len();
+    pub const COUNT: usize = BY_INDEX.as_slice().len();
 
     /// The intrinsic named `name`, if there is one: a pointer subtraction and one load.
     #[inline]

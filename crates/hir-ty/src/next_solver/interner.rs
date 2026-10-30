@@ -238,7 +238,9 @@ macro_rules! interned_slice {
             }
         }
 
-        impl<'db, V: $crate::next_solver::interner::WorldExposer>
+        // SAFETY: the handle holds one value, its row's slice, whose items this visits whenever
+        // the visitor asks to go into the row.
+        unsafe impl<'db, V: $crate::next_solver::interner::WorldExposer>
             rustc_type_ir::GenericTypeVisitable<V> for $name<'db>
         {
             #[inline]
@@ -1087,7 +1089,9 @@ impl<'db> rustc_type_ir::TypeVisitable<DbInterner<'db>> for Pattern<'db> {
     }
 }
 
-impl<'db, V: WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Pattern<'db> {
+// SAFETY: the handle holds one value, its row's kind, which this visits whenever the visitor
+// asks to go into the row.
+unsafe impl<'db, V: WorldExposer> rustc_type_ir::GenericTypeVisitable<V> for Pattern<'db> {
     fn generic_visit_with(&self, visitor: &mut V) {
         if visitor.on_interned(PATTERNS.name(), self.index.get()).is_continue() {
             self.kind().generic_visit_with(visitor);
@@ -3226,7 +3230,7 @@ pub(crate) mod table {
 
     /// `value` under its `'static` name.
     #[inline]
-    fn erase<V: Erase>(value: V) -> V::Static {
+    fn to_static<V: Erase>(value: V) -> V::Static {
         same_layout::<V>();
         let value = ManuallyDrop::new(value);
         // SAFETY: `V::Static` is `V` but for lifetimes (`Erase`), and `value` is moved, not
@@ -3239,14 +3243,14 @@ pub(crate) mod table {
     fn unerase<V: Erase>(value: V::Static) -> V {
         same_layout::<V>();
         let value = ManuallyDrop::new(value);
-        // SAFETY: as in `erase`.
+        // SAFETY: as in `to_static`.
         unsafe { ptr::read(ptr::from_ref::<V::Static>(&value).cast::<V>()) }
     }
 
     #[inline]
     fn unerase_ref<V: Erase>(value: &V::Static) -> &V {
         same_layout::<V>();
-        // SAFETY: as in `erase`; the reference keeps its lifetime.
+        // SAFETY: as in `to_static`; the reference keeps its lifetime.
         unsafe { &*ptr::from_ref(value).cast::<V>() }
     }
 
@@ -3256,7 +3260,7 @@ pub(crate) mod table {
     #[inline]
     pub(crate) fn unerase_mut<V: Erase>(value: &mut V::Static) -> &mut V {
         same_layout::<V>();
-        // SAFETY: as in `erase`; the reference keeps its lifetime, and a `V` written through it
+        // SAFETY: as in `to_static`; the reference keeps its lifetime, and a `V` written through it
         // is a valid `V::Static` (`Erase`).
         unsafe { &mut *ptr::from_mut(value).cast::<V>() }
     }
@@ -3264,7 +3268,7 @@ pub(crate) mod table {
     #[inline]
     fn erase_slice<V: Erase>(items: &[V]) -> &[V::Static] {
         same_layout::<V>();
-        // SAFETY: as in `erase`, for each item; the slice keeps its lifetime.
+        // SAFETY: as in `to_static`, for each item; the slice keeps its lifetime.
         unsafe { std::slice::from_raw_parts(items.as_ptr().cast(), items.len()) }
     }
 
@@ -3756,7 +3760,7 @@ pub(crate) mod table {
             kind: V,
             info: impl FnOnce() -> RowInfo,
         ) -> NonZeroU32 {
-            let kind = erase(kind);
+            let kind = to_static(kind);
             let hash = hash_of(&kind);
             match self.index.find(hash, |row| self.indexed(row) == kind) {
                 Some(row) => row,
@@ -4061,7 +4065,7 @@ pub(crate) mod table {
 
         /// The row of `value`, added if it is not there.
         pub(crate) fn intern<V: Erase<Static = T>>(&self, value: V) -> NonZeroU32 {
-            let value = erase(value);
+            let value = to_static(value);
             let hash = hash_of(&value);
             if let Some(row) = self.index.find(hash, |row| self.indexed(row) == &value) {
                 return row;

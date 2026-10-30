@@ -66,7 +66,7 @@ pub(crate) fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
 /// bounds), then `specializing_impl_def_id` must also be const for the same
 /// set of types.
 #[salsa::tracked(cycle_result = specializes_query_cycle, returns(copy), mem_tag = Infer)]
-fn specializes_query(db: &Db, pair: ImplPair) -> bool {
+fn specializes_query<'db>(db: &'db Db, pair: ImplPair<'db>) -> bool {
     let (specializing_impl_def_id, parent_impl_def_id) = (pair.specializing(db), pair.parent(db));
     let trait_env = db.trait_environment(specializing_impl_def_id.into());
     let interner = DbInterner::new_with(db, specializing_impl_def_id.krate(db));

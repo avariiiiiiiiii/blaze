@@ -77,7 +77,7 @@ fn body() -> Valid {
 fn valid() -> &'static [Valid] {
     static VALID: OnceLock<Vec<Valid>> = OnceLock::new();
     VALID.get_or_init(|| {
-        let empty = Body { store: ExpressionStore::empty().clone(), params: Box::new([]), self_param: None };
+        let empty = Body { store: ExpressionStore::empty_owned(), params: Box::new([]), self_param: None };
         vec![Valid { bytes: blaze_format::to_bytes(&empty), columns: Vec::new() }, body()]
     })
 }

@@ -32,7 +32,7 @@ profile and fails with it. From a checkout, the release's own recipe builds all 
     python3 .github/scripts/build_release.py --target $(rustc +"$(cat harness/toolchain)" -vV | sed -n 's/^host: //p') --out shipped
     cp shipped/* ~/.cargo/bin/
 
-That build has the LLVM backend (`BLAZE_BACKEND=llvm`) and the LLVM tiers, as the
+That build has the LLVM backend (the release profile's, [below](#backends)) and the LLVM tiers, as the
 installer's binaries do: the script fetches the LLVM 23 blaze pins and links it in statically
 ([which LLVM](contributing.md#llvm-for---features-llvm)). `cargo install` from crates.io has
 the Cranelift backend only; `--features llvm` there needs `LLVM_SYS_231_PREFIX` set to that

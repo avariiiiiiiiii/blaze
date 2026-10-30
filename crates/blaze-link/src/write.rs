@@ -98,7 +98,7 @@ fn through_plt(apply: Apply, got_by_library: bool, imports: &[Import], at: u32) 
 
 /// Symbol values as the image is placed: `Sync`, so the parallel passes share it.
 #[derive(Clone, Copy)]
-struct Resolver<'s> {
+pub(crate) struct Resolver<'s> {
     symbols: &'s Symbols,
     state: &'s State,
     regions: &'s [Region],
@@ -106,6 +106,14 @@ struct Resolver<'s> {
 }
 
 impl Resolver<'_> {
+    /// The address of a name the image defines: [`Placed::symbol`].
+    pub(crate) fn address_of(&self, name: &str) -> Option<u64> {
+        match self.value(self.symbols.find_sym_name(name)?) {
+            Ok(Value::Image(addr)) => Some(addr),
+            _ => None,
+        }
+    }
+
     fn value(&self, mut sym: Sym) -> Result<Value, Why> {
         for _ in 0..64 {
             return Ok(match self.state.def(sym) {
@@ -727,7 +735,7 @@ impl<'a> Stage<'a> {
         let regions = self.new.regions();
         let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(if full { self.new.spaces.len() } else { 0 });
         if full {
-            for space in &self.new.spaces {
+            for space in self.new.spaces.iter() {
                 // alloc: a full link's regions, one zeroed buffer each, kept as the image's bytes
                 buffers.push(if has_bytes(space) { vec![0; space.region.size as usize] } else { Vec::new() });
             }
@@ -1733,13 +1741,9 @@ impl<'a> Stage<'a> {
         crate::dwarf::sections(&views, rows, &files, size).map_err(|it| error(None, format!("debug info: {it}")))
     }
 
-    /// The address of a name the image defines, among `regions`: [`Placed::symbol`].
-    pub fn address_of(&self, regions: &[Region], name: &str) -> Option<u64> {
-        let resolver = Resolver { symbols: self.symbols, state: &self.new, regions, base: self.plan.base };
-        match resolver.value(self.symbols.find_sym_name(name)?) {
-            Ok(Value::Image(addr)) => Some(addr),
-            _ => None,
-        }
+    /// What finds the address of a name the image defines, among `regions`: [`Placed::symbol`].
+    pub(crate) fn resolver<'s>(&'s self, regions: &'s [Region]) -> Resolver<'s> {
+        Resolver { symbols: self.symbols, state: &self.new, regions, base: self.plan.base }
     }
 }
 
@@ -1750,7 +1754,7 @@ impl Parts {
         contents: &'p [&'p [u8]],
         paged: &'p [Option<Pages<'p>>],
         // dyn: `Placed::symbol`'s type (model.rs); a writer asks it a few fixed names per link
-        symbol: &'p dyn Fn(&str) -> Option<u64>,
+        symbol: &'p (dyn Fn(&str) -> Option<u64> + Sync),
         delta: Option<&'p Delta<'p>>,
         encoded: &'p [(u64, u64)],
     ) -> Placed<'p> {

@@ -235,7 +235,7 @@ jobs:
           echo "parts=$parts" >> "$GITHUB_OUTPUT"
 
   harness:
-    name: harness (${{ matrix.backend }}, ${{ matrix.part }})
+    name: harness (${{ matrix.part }})
     if: (inputs.tier == 'fast' || inputs.tier == 'full')
     needs: build
     runs-on: ${{ inputs.os }}
@@ -243,12 +243,9 @@ jobs:
     timeout-minutes: ${{ inputs.tier == 'fast' && inputs.harnesses == '' && 25 || 60 }}
     strategy:
       fail-fast: false
-      # {"include": [{"backend", "part", "apt"}, ...]}: each backend has parts of its own.
+      # {"include": [{"part", "apt"}, ...]}. No backend: v2 picks it by the profile, and refuses
+      # every unit while BLAZE_BACKEND or BLAZE_OPT is set (harness/ci.py).
       matrix: ${{ fromJSON(needs.build.outputs.parts) }}
-    env:
-      BLAZE_BACKEND: ${{ matrix.backend }}
-      BLAZE_OPT: 2
-      BLAZE_EMIT: fast
     steps:
       - if: runner.os == 'Windows'
         run: git config --global core.autocrlf false
@@ -265,7 +262,7 @@ jobs:
       # `debuginfo.py` has perf unwind what blaze built, which it says it did not run where
       # there is no perf or the kernel does not let this user sample.
       - name: perf
-        if: runner.os == 'Linux' && matrix.backend == 'cranelift' && startsWith(matrix.part, 'core-')
+        if: runner.os == 'Linux' && startsWith(matrix.part, 'core-')
         continue-on-error: true
         run: |
           sudo apt-get install -y linux-tools-common "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-generic
@@ -294,7 +291,7 @@ jobs:
         env:
           HARNESSES: ${{ inputs.harnesses }}
         run: |
-          uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES, \"backend\": \"${{ matrix.backend }}\"}"
+          uv run --frozen --no-dev python harness/focused.py run "{\"harnesses\": $HARNESSES}"
       # What the daemons said when a harness failed (each harness keeps its daemon's log in a
       # temporary directory of its own), and the report of a process that crashed on macOS.
       - name: Daemon logs
@@ -344,7 +341,7 @@ jobs:
   # as on a developer's machine: with it off the tests of every project are cargo's (the
   # harness has that case among the flags).
   blaze-cli:
-    name: blaze (${{ matrix.backend }}, ${{ matrix.group }})
+    name: blaze (${{ matrix.group }})
     if: inputs.blaze-cli
     needs: build
     runs-on: ${{ inputs.os }}
@@ -352,12 +349,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [cranelift, llvm]
         group: ["ripgrep hyperfine", "fd", "checks"]
-    env:
-      BLAZE_BACKEND: ${{ matrix.backend }}
-      BLAZE_OPT: 2
-      BLAZE_EMIT: fast
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain
@@ -382,7 +374,7 @@ jobs:
       - if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: blaze-cli-logs-${{ inputs.platform }}-${{ matrix.backend }}-${{ strategy.job-index }}
+          name: blaze-cli-logs-${{ inputs.platform }}-${{ strategy.job-index }}
           path: |
             /tmp/blaze-cargo-processes.txt
             /tmp/blaze-cargo-*/home-*/*.log
@@ -393,7 +385,7 @@ jobs:
   # what every test says has to be what cargo gives. The ten after these take more than a hosted
   # runner's three hours, and it was shut down loading rust-analyzer.
   projects:
-    name: projects (${{ matrix.backend }}, ${{ matrix.projects }})
+    name: projects (${{ matrix.projects }})
     if: inputs.projects
     needs: build
     runs-on: ${{ inputs.os }}
@@ -406,12 +398,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [cranelift, llvm]
         projects: ["ripgrep fd", "bat hyperfine", "just", "axum", "nushell", "checks"]
-    env:
-      BLAZE_BACKEND: ${{ matrix.backend }}
-      BLAZE_OPT: 2
-      BLAZE_EMIT: fast
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/toolchain

@@ -5,7 +5,7 @@
 
 use cranelift_codegen::{
     binemit::Reloc,
-    ir::{self, GlobalValueData, InstructionData as Data, Opcode},
+    ir::{self, GlobalValueData, InstructionData as Data, Opcode, types},
     isa::CallConv,
 };
 

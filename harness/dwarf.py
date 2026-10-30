@@ -7,7 +7,6 @@ with the pinned LLVM's `llvm-dwarfdump`.
 import os, re, shutil, subprocess
 
 WINDOWS = os.name == "nt"
-LLVM = os.environ.get("BLAZE_BACKEND") == "llvm"
 # The pinned LLVM's, on PATH in the flake's dev shell and in CI.
 DWARFDUMP = shutil.which("llvm-dwarfdump") or "llvm-dwarfdump"
 # What rustc calls the code that drops a coroutine, which blaze has the coroutine itself do.
@@ -93,49 +92,16 @@ class Tally:
         print(f"{what:58} {verdict:14} {more}", flush=True)
 
 
-def jumps_away(binary, name):
-    """Whether the function blaze compiled under that name leaves by jumping to another one
-    rather than calling it, so that it has no frame while the other runs. Its range is what the
-    debug info says, and the jump is read from the disassembly; None where that cannot be read."""
-    said = dumped(binary, f"--name={name}")
-    entries = [it for it in said.split("\n\n") if "DW_TAG_subprogram" in it]
-    if not entries and re.fullmatch(r"\w+(::\w+)*", name):
-        # A function with a symbol of its own is named by its last part and its mangled path.
-        parts = name.split("::")
-        said = dumped(binary, f"--name={parts[-1]}")
-        mangled = "".join(f"{len(part)}{part}" for part in parts)
-        entries = [it for it in said.split("\n\n") if "DW_TAG_subprogram" in it
-                   and re.search(rf'DW_AT_linkage_name\s+\("_R\w*?{mangled}"\)', it)]
-    ranges = [(low.group(1), high.group(1)) for it in entries
-              if (low := re.search(r"DW_AT_low_pc\s+\((0x[0-9a-f]+)\)", it))
-              and (high := re.search(r"DW_AT_high_pc\s+\((0x[0-9a-f]+)\)", it))]
-    # A function whose entry is kept apart from the program has its code as a list of one range.
-    ranges += [ends for it in entries for ends in re.findall(r"\[(0x[0-9a-f]+), (0x[0-9a-f]+)\)", it)]
-    if not ranges or not shutil.which("objdump"):
-        return None
-    for low, high in ((int(low, 16), int(high, 16)) for low, high in ranges):
-        listed = subprocess.run(["objdump", "-d", "--no-show-raw-insn", f"--start-address={low:#x}",
-                                 f"--stop-address={high:#x}", binary], capture_output=True, text=True).stdout
-        targets = [int(it, 16) for it in re.findall(r"^\s*[0-9a-f]+:\s+(?:jmp|b)\s+([0-9a-f]+)\b", listed, re.M)]
-        if any(not low <= target < high for target in targets):
-            return True
-        # A call through a pointer in tail position is a jump through a register. A jump table's
-        # is one too, but has the function's code after it: the tail call is the last instruction.
-        last = re.findall(r"^\s*[0-9a-f]+:\s+(\S.*)$", listed, re.M)[-1:]
-        if last and re.match(r"(?:notrack\s+)?jmp\s+\*|br\s+x\d+\b", last[0]):
-            return True
-    return False
-
-
-def held(tally, what, ours, sites, binary=None):
+def held(tally, what, ours, sites):
     """Holds the frames of each panic of blaze's binary to the places the source says it passes
     through. `sites` has, for each panic, its (function, file:line) from where it panics out, in
     order, the function as its symbol names it or None; only frames of the workspace's own files
-    are looked at, and others may be between them. With LLVM a caller's frame may be missing where
-    the function left by a jump; the place it panics at never may."""
+    are looked at, and others may be between them. Every place has to have its frame: the
+    programs are of the dev profile, which v2 compiles with Cranelift, so no frame is optimized
+    away."""
     if len(ours) != len(sites):
         return tally.say(what, "NOT THE PANICS", f"{len(ours)} for {len(sites)}")
-    differ, fewer, frames, shown, absent = 0, 0, 0, "", set()
+    differ, frames, shown = 0, 0, ""
     for (at, got), want in zip(ours, sites):
         places = [place.removeprefix("./") for _, place in own(got)]
         frames += len(places)
@@ -147,25 +113,11 @@ def held(tally, what, ours, sites, binary=None):
                 missing.append((name, place))
         if not missing:
             continue
-        if LLVM and missing[0] != want[0]:
-            fewer += 1
-            absent.update(missing)
-            continue
         differ += 1
         shown = shown or f"at {at}: {[it[1] for it in missing][:2]} not in {places[:4]}"
     if not frames:
         return tally.say(what, "NO FRAMES")
     more = f"{len(ours)} panics, {frames} frames"
-    if fewer:
-        # A frame may only be missing because its function left by a jump: anything else is a
-        # frame the debug info lost.
-        left = {(name, place): jumps_away(binary, name) if binary and name and not WINDOWS else None for name, place in sorted(absent, key=str)}
-        kept = [f"{name or '?'} at {place}" for (name, place), jumps in left.items() if jumps is False]
-        if kept:
-            return tally.say(what, "FRAMES LOST", f"{more}; {kept[0]} calls and has no frame")
-        seen = sum(1 for jumps in left.values() if jumps)
-        more += (f", {fewer} with frames the optimizer left out: {seen} of {len(left)} functions seen to leave"
-                 f" by a jump, first {next(iter(left))[1][:60]}")
     tally.say(what, "NOT WHERE THE SOURCE SAYS" if differ else "where the source says",
               more + (f"; {differ} differ, first {shown}" if differ else ""))
 

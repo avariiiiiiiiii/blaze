@@ -1524,7 +1524,6 @@ dependencies = [
  "blaze-lower",
  "blaze-mem",
  "blaze-native-proc-macro",
- "blaze-store",
  "blaze-usercode",
  "hir-expand",
  "intern",
@@ -1699,7 +1698,6 @@ dependencies = [
  "blaze-manifest",
  "blaze-resolve",
  "blaze-source",
- "blaze-store",
  "cargo-platform",
  "filetime",
  "flate2",
@@ -1783,22 +1781,6 @@ dependencies = [
  "llvm-sys",
  "object 0.37.3",
  "smallvec",
-]
-
-[[package]]
-name = "blaze-store"
-version = "0.0.0"
-dependencies = [
- "blaze-alloc-count",
- "blaze-core",
- "blaze-fuzz",
- "blaze-ids",
- "crc32fast",
- "libc",
- "rustc-hash 2.1.2",
- "sha2 0.10.9",
- "windows-sys 0.61.2",
- "zstd",
 ]
 
 [[package]]

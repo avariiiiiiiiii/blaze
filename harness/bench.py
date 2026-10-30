@@ -51,7 +51,9 @@ program's peak and size.
 than in the first by more than the threshold, was built by cargo where the daemon built it,
 was linked again where it was added, or is missing. Differences under 50 ms are not counted.
 
-The blaze of a backend is `BLAZE_BIN` (cranelift) or `BLAZE_LLVM_BIN` (llvm).
+The blaze of a backend is `BLAZE_BIN` (cranelift) or `BLAZE_LLVM_BIN` (llvm, a blaze built with
+`--features llvm`). A backend is a profile, as v2 picks it: `cranelift` builds the dev profile,
+`llvm` the release profile (`--release`), on both sides.
 """
 import glob, importlib, json, os, platform, re, shutil, statistics, subprocess, sys, tempfile, time
 
@@ -329,12 +331,12 @@ PROJECTS = {
     ),
     # A video rendering framework: its hello-world example's renderer, over FFmpeg and Skia,
     # which its build scripts download (a prebuilt Skia; FFmpeg's source for the example's
-    # codecs, a prebuilt FFmpeg for the tests'): `fetches` locks them for both. The run is one
-    # frame by the CPU backend. Its build scripts need nasm and libclang: measured only when named.
+    # codecs, a prebuilt FFmpeg for the tests'). v1 locked those downloads with `blaze lock
+    # --fetches`; v2 has no such command, so its sandboxed build scripts are refused the network
+    # until it has. The run is one frame by the CPU backend. Its build scripts need nasm and
+    # libclang: measured only when named.
     "fframes": dict(
         repo="dmtrKovalenko/fframes", tag="v1.3.0", rev="69174f0187b5d8e92329246898f70250b59f08f2", named=True,
-        fetches=[["-p", "hello-world-example"],
-                 ["--tests", "-p", "fframes", "-p", "fframes-media", "-p", "webvtt-parser", "-p", "fframes-media-dir-macro"]],
         build=["-p", "hello-world-example", "--bin", "hello_world_example_bin"],
         run=["--renderer", "cpu", "svg", "1s"],
         edits=dict(
@@ -415,10 +417,10 @@ SETUPS = {
     "check": dict(command="check"),
 }
 
-BACKENDS = {
-    "cranelift": dict(BLAZE_BACKEND="cranelift"),
-    "llvm": dict(BLAZE_BACKEND="llvm", BLAZE_OPT="2", BLAZE_EMIT="fast"),
-}
+# Each backend as v2 picks it, by the profile: cargo's arguments for it, given to both sides of
+# every build. v2 compiles dev with Cranelift and release with LLVM, and refuses every unit
+# while BLAZE_BACKEND or BLAZE_OPT is set (crates/hir-ty-codegen/v2/backend.rs).
+BACKENDS = {"cranelift": (), "llvm": ("--release",)}
 DURATION = re.compile(r"([0-9.]+)(ns|µs|ms|s)\b")
 UNITS = {"ns": 1e-9, "µs": 1e-6, "ms": 1e-3, "s": 1.0}
 FLOOR_SECS = 0.05
@@ -696,7 +698,7 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     home = lambda label: os.path.join(work, f"home-{name}-{backend}-{label}")
     env = dict(blaze_cli.base_env(home(0)), **spec.get("env", {}), **prepared)
     env["PATH"] = os.path.dirname(blaze) + os.pathsep + env["PATH"]
-    env.update(BACKENDS[backend], BLAZE_STATS="1")
+    env.update(BLAZE_STATS="1")
     # Neither side gets a compiler cache: a cold build is a cold build.
     env.pop("RUSTC_WRAPPER", None)
     ours, theirs = Side(ws, env, True), Side(ws, env, False)
@@ -705,14 +707,8 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     setups = [Setup(s, ws, theirs.env, reference_dir or ws) for s in setup_names]
     phases, wrong = {}, []
     SO_FAR[name, backend] = (phases, wrong, ours)
-    build, run = spec.get("build", []), spec.get("run")
+    build, run = [*spec.get("build", []), *BACKENDS[backend]], spec.get("run")
     subprocess.run(["cargo", "fetch"], cwd=ws, env=env, capture_output=True)
-    # What its build scripts download, for each feature set a build of it picks it by.
-    for selection in spec.get("fetches", []):
-        _, locked = ours.cargo("lock", "--fetches", *selection)
-        if locked.returncode != 0:
-            raise Failed(f"{name} {backend}: `blaze lock --fetches {' '.join(selection)}` failed:\n"
-                         f"{locked.stderr[-3000:]}")
 
     def others():
         """Every setup builds what plain cargo just built: its seconds by name."""
@@ -770,10 +766,9 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
     colds, builds = [], [0]
     for turn in range(cold_runs):
         ours.cargo("stop")
-        store = os.path.join(work, f"store-{name}-{backend}-{turn}")
-        for path in (os.path.join(ws, "target"), theirs.env["CARGO_TARGET_DIR"], store, home(turn)):
+        for path in (os.path.join(ws, "target"), theirs.env["CARGO_TARGET_DIR"], home(turn)):
             shutil.rmtree(path, ignore_errors=True)
-        ours.env.update(BLAZE_HOME=home(turn), BLAZE_CACHE=store)
+        ours.env.update(BLAZE_HOME=home(turn))
         daemon = Daemon(ours)
         took, warm, mine, used = cold_blaze(ours, "empty store", daemon)
         said, built, peak = daemon.said(), how_built(mine.stderr), daemon.peak_mb()
@@ -858,6 +853,8 @@ def measure(name, spec, backend, runs, work, reference_dir, cold_runs=1, setup_n
         other_top = top + "-b"
         shutil.copytree(top, other_top, symlinks=True, ignore=shutil.ignore_patterns("target", "target-ref", "target-*"))
         other_ws = os.path.join(other_top, os.path.relpath(ws, top))
+        shutil.rmtree(home(f"{turn}b"), ignore_errors=True)
+        shutil.copytree(storelib.store_of(ours.env["BLAZE_HOME"]), storelib.store_of(home(f"{turn}b")), symlinks=True)
         second = Side(other_ws, dict(ours.env, BLAZE_HOME=home(f"{turn}b")), True)
         took_b, warm_b, _, used_b = cold_blaze(second, "store filled by another checkout", Daemon(second))
         second.cargo("stop")
@@ -941,11 +938,16 @@ def runtime(name, spec, theirs, ws, build, runs, wrong):
     cache, so that the machine's drift falls on all of them alike. Seconds per run; each has to
     exit 0."""
     spec = spec["runtime"]
+    built, build = "release" if "--release" in build else "debug", [a for a in build if a != "--release"]
     _, released = theirs.cargo("build", "--release", *build)
     if released.returncode != 0:
         raise Failed(f"{name}: the cargo release build failed:\n{released.stderr[-3000:]}")
+    if built == "release":
+        _, debug = theirs.cargo("build", *build)
+        if debug.returncode != 0:
+            raise Failed(f"{name}: the cargo debug build failed:\n{debug.stderr[-3000:]}")
     target = theirs.env["CARGO_TARGET_DIR"]
-    programs = {"blaze": os.path.join(ws, "target/debug", spec["bin"]), "cargo debug": os.path.join(target, "debug", spec["bin"]),
+    programs = {"blaze": os.path.join(ws, "target", built, spec["bin"]), "cargo debug": os.path.join(target, "debug", spec["bin"]),
                 "cargo release": os.path.join(target, "release", spec["bin"])}
     args = [a.replace("{library}", library()) for a in spec["args"]]
     times, outputs, held = {label: [] for label in programs}, {}, {label: [] for label in programs}

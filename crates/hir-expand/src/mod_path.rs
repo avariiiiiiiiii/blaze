@@ -368,7 +368,7 @@ fn convert_path_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
                 leaves.next()
             {
                 if text != sym::super_ {
-                    segments.push(Name::new_symbol(*text, span.ctx));
+                    segments.push(Name::new_symbol(text, span.ctx));
                     break;
                 }
                 deg += 1;

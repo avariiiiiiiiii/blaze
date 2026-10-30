@@ -119,7 +119,7 @@ def main():
     for spec in args or (CRATES[:3] if "--few" in sys.argv else CRATES):
         verdict, said = row(spec)
         counts[verdict] += 1
-        print(f"{spec:28} {os.environ.get('BLAZE_BACKEND', 'cranelift'):9} {verdict:8} {said}", flush=True)
+        print(f"{spec:28} {verdict:8} {said}", flush=True)
     print(f"{counts['pass']} pass, {counts['refused']} refused, {counts['WRONG']} WRONG")
     sys.exit(1 if counts["WRONG"] else 0)
 

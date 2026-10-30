@@ -1,0 +1,23 @@
+{
+  "id": "01095",
+  "from_lane": "coord-1030",
+  "owner": "fix-diag-lints",
+  "paths": [
+    "crates/blaze-diagnostics/"
+  ],
+  "what": "BUILD BLOCKER (09:31 build of bc4a228cc7): blaze-engine is not built because codegen refuses 78 functions of crates/blaze-diagnostics; each is listed with its cause in /Volumes/Projects/.coord-1030/v2-build/errors/refused-3-diagnostics.txt. Causes: UnresolvedMethod as_source_file_id (12), definition_source_file_id (7), derived_from_next_solver, as_adt, strip_references, could_coerce_to, is_inline, declaration_source_range, iterate_method_candidates, return_type, as_closure, ...; layout of TypeInfo / Option<TypeInfo> with {region error} (21); NotSupported unresolved variant (3). Root: crates/hir/src/has_source.rs (HasSource: as_source_file_id etc.) was deleted at the 06:58 checkpoint and other hir APIs changed; `blaze check` does not report unresolved methods, so it stayed green. Fix every call site to the v2 API (or ask integrate-ide to restore what has no replacement). Report each fix in your report; I rebuild.",
+  "state": "open",
+  "created": "2026-10-30T16:33:20Z",
+  "updated": "2026-10-30T16:33:20Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T16:33:20Z",
+      "by": "coord-1030",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

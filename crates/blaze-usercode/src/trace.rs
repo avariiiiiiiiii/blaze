@@ -711,11 +711,13 @@ pub fn os_bytes(name: &OsStr) -> Cow<'_, [u8]> {
 pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
     #[cfg(unix)]
     {
-        Ok(std::os::unix::ffi::OsStrExt::from_bytes(bytes).to_owned()) // alloc: the name the caller keeps
+        use std::os::unix::ffi::OsStrExt as _;
+        Ok(OsStr::from_bytes(bytes).to_owned()) // alloc: the name the caller keeps
     }
     #[cfg(target_os = "wasi")]
     {
-        Ok(std::os::wasi::ffi::OsStrExt::from_bytes(bytes).to_owned()) // alloc: the name the caller keeps
+        use std::os::wasi::ffi::OsStrExt as _;
+        Ok(OsStr::from_bytes(bytes).to_owned()) // alloc: the name the caller keeps
     }
     #[cfg(windows)]
     {

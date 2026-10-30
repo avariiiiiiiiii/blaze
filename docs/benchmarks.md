@@ -13,10 +13,9 @@ and with its own history, not with another platform's: the machines differ in mo
 architecture. The rest of this page says how, so that anyone can check it or run it again.
 
 Every number on this page is blaze v1's: each table names the commit it measured, all from
-2026-10-20 to 2026-10-25, before v2 replaced v1 on 2026-10-30. No run of v2 has been published,
-and `harness/bench.py` can't measure v2 yet: it chooses the backend with v1's `BLAZE_BACKEND`,
-`BLAZE_OPT` and `BLAZE_EMIT`, which v2 refuses (v2 picks it from the profile), runs v1's `blaze
-lock --fetches`, and tells a daemon's build from cargo's by v1's `[blaze]` line
+2026-10-20 to 2026-10-25, before v2 replaced v1 on 2026-10-30. No run of v2 has been published.
+`harness/bench.py` now picks the backend as v2 does, by the profile (`cranelift` is the dev
+profile, `llvm` the release profile on both sides), but has not run against v2 yet
 ([harness.md](harness.md#timing)). Where this page says what the daemon does (hands an edit to
 cargo, builds cold with cargo, leaves crates to rustc), it says what v1 did; v2 never hands a
 build to cargo or rustc. v2's targets are in [v2/plan/goals/targets.md](v2/plan/goals/targets.md),
@@ -488,7 +487,7 @@ Each project was measured with each code producer v1 had: Cranelift (the default
 summary tables) and LLVM (`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`, `BACKENDS` in
 `harness/bench.py`). v2 refuses those variables and picks the backend from the profile's
 `opt-level` (0 and 1 Cranelift, the rest LLVM; `crates/blaze-codegen/src/plan.rs`), so a v2
-tier is a profile, which `bench.py` does not choose yet. Cranelift is measured
+tier is a profile: `bench.py`'s `BACKENDS` gives the release profile's `--release` for `llvm`. Cranelift is measured
 with blaze as it is installed and released, without the `llvm` feature (`BLAZE_BIN`), and LLVM
 with a build that has it (`BLAZE_LLVM_BIN`): a binary that links libLLVM loads it each time it
 starts, about 6 ms on the benchmark machine, and every `blaze` starts it once. A new tier

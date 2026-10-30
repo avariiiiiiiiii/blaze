@@ -927,7 +927,7 @@ pub(crate) struct Placed<'a> {
     /// The address of a global name the image defines, an object's or a special (PE's data
     /// directories point at the CRT's `_tls_used` and `_load_config_used`).
     // dyn: a handful of calls per image (PE's data directories), never per element
-    pub symbol: &'a dyn Fn(&str) -> Option<u64>,
+    pub symbol: &'a (dyn Fn(&str) -> Option<u64> + Sync),
     /// This link's synthesis: a number no other synthesis in the process has. A writer that
     /// keeps its last tables records it, and patches them only for a [`Delta::from`] equal to
     /// it (a rollback brings back a state its last tables are not of).

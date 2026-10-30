@@ -24,7 +24,7 @@ you send them, including fixes you find here and want to upstream.
     crates/blaze-engine/       the program `blaze`: what runs before blaze's cargo, and pinning
     crates/blaze-cargo/        blaze's cargo: the client (`cli`), the daemon (`serve`), the sandbox
     crates/hir-ty-codegen/    the code generator: MIR to Cranelift IR, the producers
-    crates/blaze-store/      the disk store of compiled code, which knows nothing about Rust
+    crates/blaze-cas/        the content-addressed store of everything blaze keeps, which knows nothing about Rust
     crates/blaze-fuzz/       made-up and damaged inputs for the tests of what reads the store
     crates/blaze-build-script/ build scripts run as cargo runs them, with no cargo (no-rustc.md, step I)
     crates/blaze-resolve/     cargo's resolver owned by blaze: the package model, Cargo.lock, versions, features
@@ -153,9 +153,10 @@ What it leaves to a person, and prints at the end:
    `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
-3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM, under Cranelift and under LLVM
-   (in `nix develop`, with `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast`). It builds
-   blaze and runs, in parallel, `toolchain_pins.py` and the gate's quick parts.
+3. `uv run --frozen python harness/toolchain_bump.py checks '{}'` in an ix VM (in `nix develop`,
+   with a blaze built with `--features llvm`: the profile picks the backend, and the harnesses
+   that cover LLVM build the release profile). It builds blaze and runs, in parallel,
+   `toolchain_pins.py` and the gate's quick parts.
 4. The full tier re-measured at the new commit: the train and the crates' own test suites.
 5. One commit for the bump, landed like any other change.
 

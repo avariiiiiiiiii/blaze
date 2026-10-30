@@ -43,7 +43,7 @@ def main():
     home = os.path.join(work, "home")
     env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **extra_env)
     env["PATH"] = os.path.dirname(bench.blaze_of("cranelift")) + os.pathsep + env["PATH"]
-    env.update(bench.BACKENDS["cranelift"], BLAZE_STATS="1")
+    env.update(BLAZE_STATS="1")
     env.pop("RUSTC_WRAPPER", None)
     reports = env.get("BLAZE_MEMORY")
     build = spec.get("build", [])

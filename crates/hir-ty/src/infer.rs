@@ -2413,7 +2413,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             source: impl Iterator<Item = (K, &'a [T])>,
         ) {
             for (key, items) in source {
-                debug_assert!(dest.get(&key).is_none_or(|it| **it == *items));
+                debug_assert!(dest.get(&key).is_none_or(|it| it == items));
                 dest.insert(key, items.iter().cloned());
             }
         }

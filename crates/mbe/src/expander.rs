@@ -236,7 +236,7 @@ impl<'a> Bindings<'a> {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 enum Fragment<'a> {
     #[default]
     Empty,
@@ -280,6 +280,21 @@ impl Fragment<'_> {
             Fragment::Expr(it) => it.len() == 0,
             Fragment::Path(it) | Fragment::Ty(it) => it.len() == 0,
             Fragment::TokensOwned(_) => false, // A `TopSubtree` is never empty
+        }
+    }
+}
+
+/// A `TopSubtree` is not `Clone`: an owned fragment's tree is copied by name.
+impl Clone for Fragment<'_> {
+    fn clone(&self) -> Self {
+        match self {
+            Fragment::Empty => Fragment::Empty,
+            &Fragment::Tokens { tree, origin } => Fragment::Tokens { tree, origin },
+            &Fragment::Expr(it) => Fragment::Expr(it),
+            &Fragment::Path(it) => Fragment::Path(it),
+            &Fragment::Ty(it) => Fragment::Ty(it),
+            // alloc: a copy of an owned fragment's block, which the matcher never makes.
+            Fragment::TokensOwned(it) => Fragment::TokensOwned(it.copy()),
         }
     }
 }

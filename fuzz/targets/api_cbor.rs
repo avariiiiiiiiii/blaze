@@ -90,8 +90,8 @@ fn check_case(data: &[u8], case: usize) {
     let (most, read) = blaze_fuzz::largest_allocation(|| cbor::from_slice::<Value<'_>>(data));
     assert!(most <= allowed, "decoding {} bytes asked for {most} at once", data.len());
     assert_eq!(
-        read.as_ref().map(|_| ()).map_err(Clone::clone),
-        checked,
+        read.as_ref().err(),
+        checked.as_ref().err(),
         "the bytes decode as an item exactly when check passes them, with its error"
     );
     let (most, old) = blaze_fuzz::largest_allocation(|| reference::from_slice::<Value<'_>>(data));

@@ -2645,7 +2645,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
     fn lang_callee(&self, call: ExprId) -> Option<LangItemTarget> {
         let Expr::Call { callee, .. } = self.store.expr(call) else { return None };
         match self.store.expr(callee) {
-            Expr::Path(Path::LangItem(target, _)) => Some(*target),
+            Expr::Path(Path::LangItem(target, _)) => Some(target),
             _ => None,
         }
     }

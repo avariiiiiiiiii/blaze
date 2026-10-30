@@ -278,10 +278,10 @@ fn find_best_leaf_obligation<'db>(
                 // walk around the fact that the cause in `Obligation` is ignored by folders so that
                 // we can properly fudge the infer vars in cause code.
                 .map(|(obligation, parent_trait_obligations, parent_impls)| {
-                    (obligation.cause, obligation, parent_trait_obligations, parent_impls)
+                    (obligation.cause, (obligation, parent_trait_obligations, parent_impls))
                 })
         })
-        .map(|(cause, obligation, parent_trait_obligations, parent_impls)| {
+        .map(|(cause, (obligation, parent_trait_obligations, parent_impls))| {
             (PredicateObligation { cause, ..obligation }, parent_trait_obligations, parent_impls)
         })
         // alloc: error path; empty `Vec`s do not allocate.

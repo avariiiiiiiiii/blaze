@@ -861,8 +861,7 @@ fn drop_span(block: *mut Block) {
 /// Why the cap refused, as the error to return; a cancel unwinds instead.
 fn refused(why: cap::Refused, tag: Tag, wanted: usize) -> MemError {
     match why {
-        // alloc: a cancel's payload, once per cancelled task
-        cap::Refused::Cancelled => std::panic::resume_unwind(Box::new(Cancelled)),
+        cap::Refused::Cancelled => cancel(),
         cap::Refused::TooBig { limit } => {
             MemError::Exhausted { tag, reserved: usize::try_from(limit).unwrap_or(usize::MAX), wanted }
         }
@@ -1140,6 +1139,9 @@ struct Stack {
     peak: Cell<usize>,
     /// Frame ids handed out to this thread's tasks, `next..end`.
     ids: Cell<(u32, u32)>,
+    /// A cap's cancel is unwinding this thread: set by [`cancel`], cleared when the thread's
+    /// outermost task ends.
+    cancelling: Cell<bool>,
 }
 
 thread_local! {
@@ -1159,6 +1161,7 @@ thread_local! {
             below: Cell::new(0),
             peak: Cell::new(0),
             ids: Cell::new((0, 0)),
+            cancelling: Cell::new(false),
         }
     };
 }
@@ -1229,6 +1232,9 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
             // A thread being torn down has no stack left to put back.
             _ = STACK.try_with(|stack| {
                 stack.current.set(self.outer);
+                if self.outer.is_null() {
+                    stack.cancelling.set(false);
+                }
                 stack.below.set(self.outer_below);
                 if held > stack.peak.get() {
                     stack.peak.set(held);
@@ -1273,6 +1279,23 @@ pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R {
 /// Whether the calling thread is in a [`task`], so [`current`] has a frame to give.
 pub fn in_task() -> bool {
     STACK.try_with(|stack| !stack.current.get().is_null()).unwrap_or(false)
+}
+
+/// Unwinds the calling task with [`Cancelled`], for its scheduler to run again: what the cap does
+/// to the newest waiter when every holder waits. Until the thread's outermost task ends,
+/// [`cancelling`] says so, for the guards the unwind drops on its way out (a query's claim,
+/// released to its waiters as a cancel, not a panic).
+#[track_caller]
+pub fn cancel() -> ! {
+    assert!(in_task(), "frame::cancel outside any frame::task");
+    _ = STACK.try_with(|stack| stack.cancelling.set(true));
+    // alloc: a cancel's payload, once per cancelled task
+    std::panic::resume_unwind(Box::new(Cancelled))
+}
+
+/// Whether the calling thread is unwinding from [`cancel`].
+pub fn cancelling() -> bool {
+    STACK.try_with(|stack| stack.cancelling.get()).unwrap_or(false)
 }
 
 /// Runs `f` and says the most bytes the calling thread's task frames held at once while it ran,

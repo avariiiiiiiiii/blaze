@@ -56,10 +56,9 @@ def main():
     name = sys.argv[1]
     base, spec = project_spec(name)
     ws = checkout(base, spec)
-    home, store, cargo_home = (f"{L}/{d}/{name}" for d in ("home", "store", "cargo-home"))
-    for d in (home, store):
-        shutil.rmtree(d, ignore_errors=True)
-        os.makedirs(d, mode=0o700)
+    home, cargo_home = (f"{L}/{d}/{name}" for d in ("home", "cargo-home"))
+    shutil.rmtree(home, ignore_errors=True)
+    os.makedirs(home, mode=0o700)
     os.makedirs(cargo_home, exist_ok=True)
     log = f"{L}/logs/{name}.log"
     open(log, "w").close()
@@ -67,7 +66,7 @@ def main():
     prefix = os.environ.get("NR_PATH_PREFIX", "")
     env.update(PATH=f"{L}/target/release:{prefix + ':' if prefix else ''}/run/current-system/sw/bin:{env['PATH']}",
                RUSTUP_TOOLCHAIN="nr-pin",
-               BLAZE_HOME=home, BLAZE_CACHE=store, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
+               BLAZE_HOME=home, CARGO_HOME=cargo_home, RUST_BACKTRACE="0",
                BLAZE_SKIPPED=f"{L}/logs/{name}.skipped", NR_LOG=log, **spec.get("env", {}))
     # The standard library's crates are units of the first build like any other.
     extra = json.loads(os.environ.get("NR_ENV", "{}"))

@@ -308,7 +308,8 @@ impl<'a> Stage<'a> {
         let synthetic = {
             let refs = collect_in(contents.iter().map(|it| it.0), arena);
             let paged = collect_in(contents.iter().map(|it| it.1), arena);
-            let symbol = |name: &str| self.address_of(&parts.regions, name);
+            let resolver = self.resolver(&parts.regions);
+            let symbol = |name: &str| resolver.address_of(name);
             let delta = delta(changes.as_ref(), from, same_names, same_regions, &pieces);
             let placed = parts.placed(&self, &refs, &paged, &symbol, delta.as_ref(), &[]);
             self.writer.synthesize(&placed)?
@@ -362,7 +363,8 @@ impl<'a> Stage<'a> {
                     None => (&[][..], Some(Pages::all(bytes))),
                 };
             }
-            let symbol = |name: &str| self.address_of(&parts.regions, name);
+            let resolver = self.resolver(&parts.regions);
+            let symbol = |name: &str| resolver.address_of(name);
             let delta = delta(changes.as_ref(), from, same_names, same_regions, &written_all);
             let placed = parts.placed(&self, &refs, &paged, &symbol, delta.as_ref(), &[]);
             let offsets = collect_in(parts.regions.iter().map(|it| self.writer.offset(&placed, it)), arena);

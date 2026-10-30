@@ -32,21 +32,21 @@ harnesses are of three kinds:
 
 - **v2's own**, which run against v2 as written: the store harnesses on `storelib.py`
   (`storekills.py`, `storecorrupts.py`, `storefull.py`, `storeguards.py`, `storetracked.py`),
-  `storerevisions.py`, `fuzz/store.py` and `harness/v2/` ([The v2 proof](#the-v2-proof)), with
-  the backend caveat of [Under LLVM](#under-llvm).
+  `storerevisions.py`, `fuzz/store.py` and `harness/v2/` ([The v2 proof](#the-v2-proof), which
+  still sets `BLAZE_BACKEND`).
 - **Through the command line**: harnesses that drive `blaze build`, `run`, `test`, `check`,
   `stop` and `status`, which v2 has, and so run against v2. Some read v1's output or set v1's
-  settings, which v2 doesn't have; those are named in their rows. One read is in most of them:
-  `blaze_cli.how_built` takes a build as the daemon's only when it printed `[blaze]`, which v2
-  never prints, so a check that a build was the daemon's fails on v2.
+  settings, which v2 doesn't have; those are named in their rows. Most of them read
+  `blaze_cli.how_built`, which under v2 says whether a build finished (cargo's `Finished` line,
+  which v2 prints as cargo does) or its first error: v2 builds only through its daemon, so its
+  output can't tell a build of cargo's from its own, and that no rustc runs is `norustc.py`'s.
 - **Edit, rebuild, compare with a fresh build**, on `rebuild.py`: an edit gives the program a
   fresh build of the edited source gives, which is what incremental builds rest on. A
   `rebuild.Project` builds a checkout with `blaze build` (or `test`, `run`) under a warm daemon
   of its own home (`storelib.Daemon`), runs what the build's `artifact` message names, and holds
   what it prints and how it exits to a build of the same checkout, at the same path, in an
   empty home and target directory; an edit the fresh build refuses has to be refused warm too.
-  It unsets `BLAZE_BACKEND`, which v2 refuses (the profile picks the backend: dev is
-  Cranelift's, release LLVM's). These are `programs.py`, `includes.py` and `unwinds.py`,
+  The profile picks the backend (dev is Cranelift's, release LLVM's). These are `programs.py`, `includes.py` and `unwinds.py`,
   `stress.py`, `worktrees.py`, `keys.py`, `growth.py`, `selects.py`, `rustsrc.py`,
   `wholeprogram.py`, `debuginfo.py` and `fuzz/edits.py`. They were v1's on its daemon's
   `--socket`, `--patch` and `--watch`, and moved onto the command line on 2026-10-30; what
@@ -90,9 +90,9 @@ need a few gigabytes there.
 The gate is what a change runs before it lands: its fast tier in the lane's ix VM. CI's merge
 gate is only the build and the unit tests; all of it, every part on every platform, runs in the
 release train on main after the merge ([CI](#ci)), which finds what the fast tier would have.
-A change is not done until all of it exits 0 under both backends.
-`harness/ci.py` is the one list of it: which harness runs in which part, in which tier, on
-which hosts and under which backend.
+A change is not done until all of it exits 0, with a blaze built with `--features llvm` (the
+release profile is LLVM's). `harness/ci.py` is the one list of it: which harness runs in which
+part, in which tier, on which hosts.
 
     uv run --frozen python harness/ci.py list '{}'                  # every harness, its part, fast-tier seconds and hosts
     uv run --frozen python harness/ci.py parts '{}'                 # the full tier's parts on this machine (the train's)
@@ -154,15 +154,13 @@ profile that asks for LLVM of a blaze built without it is refused.
 `BLAZE_BACKEND` and `BLAZE_OPT` are v1's settings: under v2, either one set at all makes every
 unit fail, saying the variable changes code its key has no part of
 (`crates/hir-ty-codegen/v2/backend.rs`, `CHANGES_CODE`), and `BLAZE_EMIT` is read only by v1's
-code generator left in `crates/hir-ty-codegen/backend.rs`. The harnesses still choose the
-backend that way: `ci.py` and `focused.py` set `BLAZE_BACKEND` for each run, the train's jobs
-set it in their environment (`blaze-platform.yaml`), `storelib.py` passes it on to the daemon it
-starts, `harness/v2/engine.py` sets it for every command, and `bench.py`'s `BACKENDS` sets all
-three. Until they choose by profile, as `fuzz/store.py` and `fuzz/edits.py` do (`"profiles":
-["dev", "release"]`), a run with `BLAZE_BACKEND` set fails on v2. `rebuild.py` unsets it for the
-builds it asks for, and `ci.py` runs its harnesses under the Cranelift entry of the matrix
-alone, as a dev build is Cranelift's either way. v1's recipe, for the record, was
-`BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast` on that build.
+code generator left in `crates/hir-ty-codegen/backend.rs`. So no harness sets them, and none
+takes them away from its caller's environment: a run with one set fails as v2 says. CI's
+matrix has no backend; a harness that is to cover LLVM builds the release profile, as
+`fuzz/store.py` and `fuzz/edits.py` do (`"profiles": ["dev", "release"]`), `wholeprogram.py
+--release`, and `bench.py`'s `llvm` (`--release` on both sides). `harness/v2/engine.py` (the
+proof's) still sets `BLAZE_BACKEND` for every command ([The v2 proof](#the-v2-proof)). v1's
+recipe, for the record, was `BLAZE_BACKEND=llvm BLAZE_OPT=2 BLAZE_EMIT=fast` on that build.
 
 ## What each one checks
 
@@ -246,9 +244,8 @@ own to test here: its remote is the read-through tier of `crates/blaze-cas/src/r
 `memsplit.py`, `realbench.py`, `spare.py`, `live_latency.py` and `testselectbench.py` measure
 and do not gate. All of them were written against v1, and none has measured v2 yet. They drive
 `blaze build` and the daemon through the command line but lean on v1's settings and output:
-`bench.py` chooses the backend with `BLAZE_BACKEND`, `BLAZE_OPT` and `BLAZE_EMIT` ([Under
-LLVM](#under-llvm)), runs `blaze lock --fetches` and sets `BLAZE_CACHE` (none of which v2 has
-or reads) and tells who built a step by `blaze_cli.how_built`;
+`bench.py` picks the backend by the profile ([Under LLVM](#under-llvm)) and tells a step that
+finished by `blaze_cli.how_built`;
 `testselectbench.py` and `sandboxbench.py` set `BLAZE_TESTS`, `spare.py` and `memsplit.py`
 measure v1's spare worker (`BLAZE_SPARE`), and `coldprof.py` and `realbench.py` set
 `BLAZE_IDLE_SECS`, none of which a v2 crate reads.
@@ -330,9 +327,13 @@ value with an `engine`, `{"kind": "v1" | "v2", "blaze": PATH}`, and drives blaze
 the `blaze` command line and `engine.py`. It was written to run against v1 first and v2 later,
 unchanged; since 2026-10-30 there is only v2, so `"kind": "v2"` is the one that has a blaze to
 run. One thing stops it on v2 today: `Engine.env` sets `BLAZE_BACKEND` for every command (and
-`BLAZE_OPT` and `BLAZE_EMIT` for LLVM) and a store in `BLAZE_CACHE`, and v2 refuses every unit
-while `BLAZE_BACKEND` or `BLAZE_OPT` is set ([Under LLVM](#under-llvm)) and keeps its store in
-`<home>/v2/store` whatever `BLAZE_CACHE` says.
+`BLAZE_OPT` and `BLAZE_EMIT` for LLVM), and v2 refuses every unit while `BLAZE_BACKEND` or
+`BLAZE_OPT` is set ([Under LLVM](#under-llvm)).
+
+A daemon keeps its store in `<home>/v2/store` and reads no other, so a harness gives a build a
+store of its own with a home of its own, and a store shared or warm across homes is copied to
+`<home>/v2/store` before that home's daemon starts (`engine.store_of`, `storelib.store_of`).
+`Engine.env` refuses a `store` anywhere else.
 
 - Where v1 has no answer (codegen inputs, a query trace, table sizes, the critical path), the
   outcome is `unmeasured`.
@@ -474,13 +475,13 @@ before or without the whole train. Neither releases anything or is part of `ci`.
 
 `focused.yaml` runs the harnesses it is given by name (`harness/focused.py`: a label of
 `ci.py list '{}'`, or its start up to a space) against one build of the ref, on the platforms asked
-for, under both backends, as the train builds and runs them:
+for, as the train builds and runs them:
 
     gh workflow run focused.yaml --ref <branch> -f harnesses='["anonstatics.py", "testselect.py"]'
-    uv run --frozen python harness/focused.py run '{"harnesses": ["anonstatics.py"], "backend": "llvm"}'
+    uv run --frozen python harness/focused.py run '{"harnesses": ["anonstatics.py"]}'
 
-The second line is the same in a lane's VM. A name that is no harness's, or that runs on none of
-a platform's backends, fails rather than run nothing. This is the part of Astral's per-change
+The second line is the same in a lane's VM. A name that is no harness's, or that runs nowhere
+on a platform, fails rather than run nothing. This is the part of Astral's per-change
 selection (astral-experiments/blaze#7, #58) that applies here: their fork had a model pick the
 suites and harnesses of each pull request, with path rules when it gave no answer. Here the gate
 is already the build and the unit tests alone, and `blaze test` picks which unit tests to run
@@ -520,7 +521,7 @@ It builds blaze once per platform (Linux x86-64, Linux AArch64, macOS arm64, Win
 with the `llvm` feature, hands the binary to its other jobs, and runs:
 
 - `harness/unittests.py` on each platform;
-- every part of `ci.py parts` under each backend, a job each: `core-1` ... `core-N` (the
+- every part of `ci.py parts`, a job each: `core-1` ... `core-N` (the
   harnesses of `core`, packed by the seconds `CORE` in ci.py says each takes, so that no part
   is longer than its longest harness), `keys-1` ... `keys-3`, `store-kills`, `store` and
   `daemon`;

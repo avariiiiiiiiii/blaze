@@ -1310,6 +1310,23 @@ fn frame_cap_cancels_the_newest_wait_when_every_holder_waits() {
 }
 
 #[test]
+fn frame_cancel_unwinds_its_task_and_says_so_until_the_outermost_task_ends() {
+    frame::task(Tag::Infer, |_| {
+        let unwound = std::panic::catch_unwind(|| frame::task(Tag::Mir, |_| frame::cancel()));
+        let payload = unwound.expect_err("a cancel unwinds");
+        assert!(payload.is::<frame::Cancelled>(), "its payload is `Cancelled`");
+        assert!(frame::cancelling(), "still inside the outer task");
+    });
+    assert!(!frame::cancelling(), "the outermost task has ended");
+}
+
+#[test]
+#[should_panic(expected = "frame::cancel outside any frame::task")]
+fn frame_cancel_outside_any_task_stops() {
+    frame::cancel();
+}
+
+#[test]
 fn frame_cap_says_each_pass_of_spill_at() {
     let (cap, spills) = frame::Cap::new(1000, 500);
     let a = cap.reserve(600).expect("fits");

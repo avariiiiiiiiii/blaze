@@ -102,7 +102,6 @@ rustc-symbols = { path = "crates/rustc-symbols" }
 native-proc-macro = { package = "blaze-native-proc-macro", path = "crates/blaze-macro-wasm/native/proc_macro" }
 blaze-macro-wasm = { path = "crates/blaze-macro-wasm" }
 blaze-macro-eval = { path = "crates/blaze-macro-eval" }
-blaze-store = { path = "crates/blaze-store" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
 blaze-lints = { path = "crates/blaze-lints" }

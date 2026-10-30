@@ -14,7 +14,7 @@ puts objects at `<base>/<name>`.
 Allowed `<name>`s (anything else is the same 404 as an absent object):
 
 - `packs/<h>.pack`, `keys/<h>`, `index/<h>`, `units/<h>`: content-addressed, `<h>` = lowercase hex SHA-256 of the body.
-  `index/<h>` is a run or a shard of a project's key index (`crates/blaze-store/src/remote_index.rs`).
+  `index/<h>` is a run or a shard of a project's key index (v1's `crates/blaze-store/src/remote_index.rs`, deleted 2026-10-30).
 - `packs/<h>.pack.zst`: `<h>` names the uncompressed pack; the body's own SHA-256 is sent as
   `x-blaze-sha256` on PUT, checked, stored, and returned on GET/HEAD as `x-blaze-sha256`.
 - `manifests/<project>`, `deps/<project>`: mutable lists (a project's key index is the list

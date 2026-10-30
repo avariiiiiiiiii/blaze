@@ -131,9 +131,9 @@ where
 }
 
 macro_rules! not_supported {
-    ($it: expr) => {
+    ($($it:tt)+) => {
         // alloc: error path
-        return Err($crate::mir::MirEvalError::NotSupported(format!($it)))
+        return Err($crate::mir::MirEvalError::NotSupported(format!($($it)+)))
     };
 }
 use not_supported;

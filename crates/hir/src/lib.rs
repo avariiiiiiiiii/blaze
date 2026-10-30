@@ -678,6 +678,18 @@ impl Module {
         self.crate_root(db) == self
     }
 
+    /// The file that is this module, for a crate root or a `mod m;`; `None` for an inline
+    /// module or a block.
+    pub fn as_source_file_id(self, db: &Db) -> Option<EditionedFileId> {
+        self.id.def_map(db).module(db, self.id).origin.file_id()
+    }
+
+    /// The file this module's items are written in: its own, or for an inline module or a
+    /// block, the file holding it.
+    pub fn definition_source_file_id(self, db: &Db) -> HirFileId {
+        self.id.def_map(db).module(db, self.id).definition_source_file_id()
+    }
+
     /// Iterates over all child modules.
     pub fn children(self, db: &Db) -> impl Iterator<Item = Module> {
         let def_map = self.id.def_map(db);

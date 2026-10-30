@@ -208,7 +208,9 @@ pub(crate) fn write<'db>(
     let allocs = Placed::push_each(
         &mut out,
         allocs.len(),
-        allocs.iter().enumerate().map(|(n, &target)| Rel::between(rels_at + n as u64 * rel_size, target)),
+        allocs.iter().enumerate().map(|(n, &target)| {
+            Rel::<AllocationRec>::between(rels_at + n as u64 * rel_size, target)
+        }),
     );
     debug_assert!(allocs.len == 0 || allocs.at == rels_at);
     let at = out.next::<MirRoot>();

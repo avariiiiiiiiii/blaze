@@ -2610,7 +2610,7 @@ fn declaration_location<'db>(
     db: &'db Db,
     func: FunctionId,
 ) -> Option<(base_db::FileId, u32, u32)> {
-    let source = written_node(db, &func.lookup(db));
+    let source = written_node(db, func.lookup(db));
     location_of(db, source.file_id, written_range(source.value))
 }
 

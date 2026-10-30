@@ -2708,7 +2708,7 @@ fn parse_repr_tt(tt: ast::TokenTree<'_>) -> Option<ReprOptions> {
 fn parse_rustc_legacy_const_generics(tt: ast::TokenTree<'_>, frame: &Frame) -> Box<[u32]> {
     let mut found = Vec::<u32, _>::new_in(frame);
     found.extend(TokenTreeChildren::new(tt).filter_map(|param| {
-        ast::IntNumber::cast(param.into_token()?)?.value().ok()?.try_into().ok()
+        u32::try_from(ast::IntNumber::cast(param.into_token()?)?.value().ok()?).ok()
     }));
     // alloc: the memo's value, exact, only for a function with `#[rustc_legacy_const_generics]`
     Box::from(&found[..])

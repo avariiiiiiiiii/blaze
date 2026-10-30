@@ -1,6 +1,6 @@
 ---
 status: superseded
-summary: blaze v1's disk store (blaze-store) and its remote (blaze-cargo's remote.rs, deleted); v2's store is blaze-cas.
+summary: blaze v1's disk store (blaze-store) and its remote (blaze-cargo's remote.rs), both deleted; v2's store is blaze-cas.
 date: 2026-10-30
 superseded_by: v2/plan/lanes/store.md
 ---
@@ -11,9 +11,9 @@ longer. The disk store is one directory on this machine that every daemon and ev
 checkout of the user shares, on by default. The remote is a directory or an S3 bucket that
 several machines push to and pull from, off until you configure it.
 
-This describes blaze v1. Its remote (blaze-cargo's `remote.rs`) was deleted on 2026-10-30,
-with the `blaze-engine cache` commands and every `BLAZE_REMOTE*` variable, and its store
-(`crates/blaze-store`) goes with v1's whole-object build in hir-ty-codegen, its last user. v2 keeps one store per daemon in `$BLAZE_HOME/v2/store`
+This describes blaze v1. Its store (`crates/blaze-store`) and remote (blaze-cargo's
+`remote.rs`) were deleted on 2026-10-30, with the `blaze-engine cache` commands, `BLAZE_CACHE`
+and every `BLAZE_REMOTE*` variable. v2 keeps one store per daemon in `$BLAZE_HOME/v2/store`
 (`crates/blaze-cas`), and its remote is the read-through tier `blaze_cas::remote`: see
 [v2/plan/lanes/store.md](v2/plan/lanes/store.md). The reports behind this file are
 [reports/DISKCACHE.md](reports/DISKCACHE.md) and [reports/REMOTE.md](reports/REMOTE.md).

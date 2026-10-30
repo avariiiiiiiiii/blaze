@@ -75,7 +75,7 @@ impl<'db> InferCtxt<'db> {
     where
         V: TypeFoldable<DbInterner<'db>>,
     {
-        Canonicalizer::<CanonicalizeAllFreeRegions>::canonicalize(
+        Canonicalizer::<'_, '_, CanonicalizeAllFreeRegions>::canonicalize(
             value,
             self,
             self.interner,
@@ -113,7 +113,7 @@ impl<'db> InferCtxt<'db> {
         V: TypeFoldable<DbInterner<'db>>,
     {
         let mut query_state = OriginalQueryValues::default();
-        Canonicalizer::<CanonicalizeQueryResponse>::canonicalize(
+        Canonicalizer::<'_, '_, CanonicalizeQueryResponse>::canonicalize(
             value,
             self,
             self.interner,
@@ -126,7 +126,7 @@ impl<'db> InferCtxt<'db> {
         V: TypeFoldable<DbInterner<'db>>,
     {
         let mut query_state = OriginalQueryValues::default();
-        Canonicalizer::<CanonicalizeUserTypeAnnotation>::canonicalize(
+        Canonicalizer::<'_, '_, CanonicalizeUserTypeAnnotation>::canonicalize(
             value,
             self,
             self.interner,
@@ -489,7 +489,7 @@ impl<'cx, 'db, M: CanonicalizeMode> Canonicalizer<'cx, 'db, M> {
             var_kinds: CanonicalVarKinds::empty(),
             value: (),
         };
-        Canonicalizer::<M>::canonicalize_with_base(base, value, infcx, tcx, query_state)
+        Canonicalizer::<'_, '_, M>::canonicalize_with_base(base, value, infcx, tcx, query_state)
         .unchecked_map(|((), val)| val)
     }
 

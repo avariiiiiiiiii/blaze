@@ -68,7 +68,7 @@ async def from_nothing(stage: int, work: Path, bin_dir: Path) -> str:
     home = tempfile.mkdtemp(prefix="rj-scratch-", dir=None if os.name == "nt" else "/tmp")
     target = work / f"target-scratch-{stage}"
     env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
-               BLAZE_CACHE=os.path.join(home, "store"), CARGO_TARGET_DIR=str(target))
+               CARGO_TARGET_DIR=str(target))
     env.pop("CARGO_INCREMENTAL", None)
     try:
         await build(step, project, env)

@@ -9,7 +9,7 @@ variable asks for is written into the copy, and `blaze` builds it cold, waits fo
 daemon, and builds it again after a comment is added, so that the program looked at is the
 one the daemon linked. Then, in the dev profile:
   gdb       stops at each place, in a function of blaze's, and has its arguments and locals
-            with values, none of them optimized out but under LLVM
+            with values, none of them optimized out (v2 compiles the dev profile with Cranelift)
   panic     each panic has a frame at the line the panic was written into, by file:line
   perf      `perf record --call-graph dwarf`, then `perf report` names the symbols and
             `perf script` the lines of the frames in blaze's functions
@@ -20,7 +20,7 @@ import os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request, 
 
 import blaze_cli
 from blaze_cli import PROJECTS, Side, base_env, fetch, how_built, rewrite, wait_warm
-from dwarf import DWARFDUMP, LLVM, OPTIMIZED_OUT, Tally, held, own_ranges, panics, units, unit_of
+from dwarf import DWARFDUMP, OPTIMIZED_OUT, Tally, held, own_ranges, panics, units, unit_of
 
 PANIC = 'if std::env::var_os("REALDEBUG_PANIC").is_some() { panic!("asked for"); }'
 
@@ -139,9 +139,7 @@ def debugger(tally, what, binary, ws, spec):
         said = f"{what}: gdb at {os.path.basename(file)}:{place.rsplit(':', 1)[1]}"
         ours = stopped(binary, ws, place, run, serves)
         if not ours:
-            # Optimized code may have no instruction for a line, and then there is nowhere to stop.
-            empty = LLVM and "contains no code" in told(binary, ws, f"info line {place}")
-            tally.say(said, "no code" if empty else "NOT STOPPED", "the optimizer left the line none" if empty else "")
+            tally.say(said, "NOT STOPPED")
             continue
         producer = unit_of(binary, ours["at"]) if ours["at"] is not None else "nothing"
         if not producer.startswith("blaze"):
@@ -150,7 +148,7 @@ def debugger(tally, what, binary, ws, spec):
         # What an `async` body is resumed with is of no name the source has.
         names = [name for name in ours["values"] if name != "_task_context"]
         gone = [name for name in names if OPTIMIZED_OUT in ours["values"][name]]
-        verdict = "OPTIMIZED OUT" if gone and not LLVM else "stopped"
+        verdict = "OPTIMIZED OUT" if gone else "stopped"
         more = f"in {ours['name'][:50]}: {len(names)} names, {len(gone)} optimized out"
         if gone and verdict.isupper():
             more += f"; {gone[0]}"
@@ -162,7 +160,7 @@ def backtrace(tally, what, binary, ws, spec):
     ours = panics(driven([binary, *spec.get("run", [])], ws, env, spec.get("serves")))
     file = spec["panic"][0]
     site = f"{file}:{line_of(ws, file, PANIC)}"
-    held(tally, f"{what}: frames of each panic", ours, [[(None, site)]] * max(len(ours), 1), binary)
+    held(tally, f"{what}: frames of each panic", ours, [[(None, site)]] * max(len(ours), 1))
 
 
 def profiler(tally, what, binary, ws, spec):
@@ -265,7 +263,7 @@ def main():
             print(f"kept: {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
-    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'} ({'llvm' if LLVM else 'cranelift'})")
+    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'}")
     sys.exit(1 if tally.wrong else 0)
 
 

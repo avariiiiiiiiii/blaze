@@ -454,7 +454,11 @@ impl<'de> de::Deserializer<'de> for ArrayItemDeserializer<'_> {
         visitor: V,
     ) -> Result<V::Value, Self::Error> {
         if name == value::NAME && fields == value::FIELDS {
-            let source = ValueSource::ConfigValue { cv: self.cv, key_path: self.key_path };
+            // `F` is the files of the other variant's deserializer; an array item has none.
+            let source = ValueSource::<'_, '_, crate::files::Disk>::ConfigValue {
+                cv: self.cv,
+                key_path: self.key_path,
+            };
             return visitor.visit_map(ValueDeserializer::new(source));
         }
         visitor.visit_map(ArrayItemMapAccess::with_struct(self.cv, fields, self.key_path))

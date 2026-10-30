@@ -28,7 +28,7 @@ def main():
     ws = tempfile.mkdtemp(prefix="blaze-constmacros-")
     shutil.copytree(os.path.join(HERE, "constmacros"), ws, dirs_exist_ok=True)
     home = os.path.join(ws, ".blaze-home")
-    env = {**os.environ, "BLAZE_HOME": home, "BLAZE_CACHE": os.path.join(home, "store")}
+    env = {**os.environ, "BLAZE_HOME": home}
 
     def blaze(*args):
         start = time.monotonic()

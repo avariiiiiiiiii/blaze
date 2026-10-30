@@ -36,8 +36,8 @@ In order, each step one outcome, the run stopping at the first that does not pas
     test        the `BLAZE_MACRO_CORPUS` config (crates/blaze-macro-eval/tests/corpus/config.rs:
                 `workspace`, `scratch`, `cargo_home`, `wasm`) written to
                 `WORK/corpus.json`, then `blaze test -p blaze-macro-eval --test corpus --test
-                kept -- --ignored` in this repository, BLAZE_CACHE and BLAZE_PROC_MACRO_CACHE
-                unset; then one outcome per test of the two files, by libtest's name
+                kept -- --ignored` in this repository, BLAZE_PROC_MACRO_CACHE unset; then
+                one outcome per test of the two files, by libtest's name
 
 Every tool, fetch or build missing is an error naming it: nothing is skipped. cargo runs only to
 fetch the registry packages.
@@ -81,7 +81,7 @@ PROC_MACROS = ("corpus_macros", "corpus_state", "serde_derive", "thiserror_impl"
 PACKAGE = "corpus-calls"
 COPIES = ("workspace", "scratch")
 TEST_ARGS = ("-p", "blaze-macro-eval", *(w for t in TEST_FILES for w in ("--test", t)), "--", "--ignored")
-UNSET = ("BLAZE_CACHE", "BLAZE_PROC_MACRO_CACHE")
+UNSET = ("BLAZE_PROC_MACRO_CACHE",)
 FETCH_SECS = 1800
 BUILD_SECS = 3600
 TEST_SECS = 7200

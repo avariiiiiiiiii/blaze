@@ -124,9 +124,8 @@ def main():
     for path, text in FILES.items():
         os.makedirs(os.path.dirname(os.path.join(root, path)), exist_ok=True)
         open(os.path.join(root, path), "w").write(text)
-    # A store of its own, so that no function compiled by another build of blaze is found.
-    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home,
-               BLAZE_CACHE=os.path.join(root, "store"))
+    # A home of its own, so its store has no function compiled by another build of blaze.
+    env = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", BLAZE_HOME=home)
     for name in ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS"):
         env.pop(name, None)
     program, source = os.path.join(ws, "target", "debug", "aapp"), os.path.join(ws, "app", "src", "main.rs")

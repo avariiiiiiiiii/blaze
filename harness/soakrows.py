@@ -40,8 +40,9 @@ class Row:
         self.dir = os.path.join(work, name)
         self.ws = os.path.realpath(at or os.path.join(self.dir, "ws"))
         self.home = os.path.join(self.dir, "home")
+        self.store = os.path.join(self.home, "v2", "store")
         os.makedirs(self.dir, exist_ok=True)
-        self.env = dict(base_env(self.home), BLAZE_CACHE=os.path.join(self.dir, "store"), **(env or {}))
+        self.env = dict(base_env(self.home), **(env or {}))
         self.built, self.notes, self.mark = [], [], 1000
         self.copy(self.ws)
 
@@ -395,7 +396,7 @@ def non_utf8_root(row):
 
 
 def other_filesystem(row):
-    here, there = os.stat(row.ws).st_dev, os.stat(row.env["BLAZE_CACHE"] if os.path.isdir(row.env["BLAZE_CACHE"]) else row.dir).st_dev
+    here, there = os.stat(row.ws).st_dev, os.stat(row.store if os.path.isdir(row.store) else row.dir).st_dev
     if here == there:
         raise Wrong("the workspace and the store are on one filesystem here; name another with --other-fs")
     row.warm()
@@ -403,10 +404,9 @@ def other_filesystem(row):
         row.edit()
         row.both(f"edited, {round}", want=f"mark {row.mark}")
     row.both("tests", command="test")
-    # A pack is open for as long as the worker that writes it lives.
-    packs = [it for kind in ("*.pack", "*.open") for it in glob.glob(os.path.join(row.env["BLAZE_CACHE"], kind))]
-    stored = sum(os.path.getsize(it) for it in packs)
-    row.notes.append(f"{stored} bytes in {len(packs)} packs in the store on the other filesystem")
+    packs, files = (glob.glob(os.path.join(row.store, kind)) for kind in ("pack-*", "file-*"))
+    stored = sum(os.path.getsize(it) for it in packs + files)
+    row.notes.append(f"{stored} bytes in {len(packs)} packs and {len(files)} files in the store on the other filesystem")
     if not stored:
         raise Wrong("nothing was stored")
 
@@ -1139,9 +1139,8 @@ def main():
         print(f"{'ok ' if result == 'right' else '-- ' if result.startswith('not run') else 'NOT'} {name}  {time.time() - began:.0f}s  {result if result != 'right' else ''}", flush=True)
         for line in row.built:
             print(f"      {line}", flush=True)
-    backend = os.environ.get("BLAZE_BACKEND", "cranelift")
     with open(os.path.join(HERE, "SOAKROWS.md"), "w") as out:
-        out.write(f"# soakrows.py\n\n{len(table) - failed} of {len(table)} rows right, {backend}.\n\n| row | result | who built each comparison |\n|---|---|---|\n")
+        out.write(f"# soakrows.py\n\n{len(table) - failed} of {len(table)} rows right.\n\n| row | result | who built each comparison |\n|---|---|---|\n")
         for name, result, built, _ in table:
             out.write(f"| {name} | {result.replace('|', '/')[:400]} | {'; '.join(built).replace('|', '/')} |\n")
         for name, _, _, notes in table:

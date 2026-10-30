@@ -321,9 +321,9 @@ fn owner_location(db: &Db, owner: DefWithBodyId) -> Option<Row> {
     use hir_ty_mir::mir::location::{location_of, written_range};
     let source = match owner {
         DefWithBodyId::FunctionId(func) => return *crate::declaration_location(db, func),
-        DefWithBodyId::StaticId(it) => crate::written_node(db, &it.lookup(db)),
-        DefWithBodyId::ConstId(it) => crate::written_node(db, &it.lookup(db)),
-        DefWithBodyId::VariantId(it) => crate::written_node(db, &it.lookup(db)),
+        DefWithBodyId::StaticId(it) => crate::written_node(db, it.lookup(db)),
+        DefWithBodyId::ConstId(it) => crate::written_node(db, it.lookup(db)),
+        DefWithBodyId::VariantId(it) => crate::written_node(db, it.lookup(db)),
     };
     location_of(db, source.file_id, written_range(source.value))
 }

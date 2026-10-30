@@ -20,10 +20,6 @@ mod leak_check;
 
 impl rustc_type_ir::region_constraint::ConstraintSpan for Span {}
 
-rustc_type_ir::TrivialTypeTraversalImpls! {
-    crate::Span,
-}
-
 /// The region constraint the next solver builds (`-Zassumptions-on-binders` in rustc), each
 /// leaf with the span it came from.
 pub type SolverRegionConstraint<'db> =

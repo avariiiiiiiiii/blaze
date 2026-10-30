@@ -175,8 +175,8 @@ Sampler: Callable[[], Sampling] = getattr(memory, "Sampler")
 
 @dataclass(frozen=True)
 class SelfEdit:
-    file: str = "crates/blaze-store/src/lib.rs"
-    opening: str = "pub fn parse_size(text: &str) -> Option<u64> {"
+    file: str = "crates/blaze-cas/src/lib.rs"
+    opening: str = "fn location(tier: usize, pack: u32, offset: u64) -> u64 {"
 
 
 @dataclass(frozen=True)

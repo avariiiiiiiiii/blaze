@@ -23,10 +23,6 @@ from blaze_cli import BLAZE
 from storelib import BUILD_SECS, RUN_SECS, RUNNER, Daemon, Failed, scratch  # noqa: F401 (scratch: for the harnesses)
 
 WRONG = ("REFUSED", "FRESH REFUSED", "BUILT BROKEN CODE", "DIFFERENT OUTPUT", "DAEMON DIED")
-# BLAZE_BACKEND names the backend of ci.py's matrix. v2 picks the backend by the profile (dev
-# with Cranelift, release with LLVM) and turns down every unit while the variable is set
-# (hir-ty-codegen's CHANGES_CODE), so it is not passed on to blaze.
-NOT_PASSED = {"BLAZE_BACKEND": None}
 
 
 def edit(ws, path, old, new):
@@ -90,7 +86,7 @@ class Project:
 
     def __init__(self, ws, work, *, env=None, home=None, name="warm", serves=None):
         self.ws, self.work, self.name, self.serves = ws, work, name, serves
-        self.env = {**NOT_PASSED, **(env or {})}
+        self.env = dict(env or {})
         self.home = serves.home if serves else home or os.path.join(work, "home")
         self.target = os.path.join(ws, "target")
         self.daemon = None

@@ -159,13 +159,13 @@ async def main() -> None:
         shutil.copytree(ROOT / "demo" / "lifebench", work / "demo" / "lifebench", ignore=shutil.ignore_patterns("target"))
         project = work / "demo" / "lifebench"
         base = dict(os.environ, PATH=f"{bin_dir}{os.pathsep}{os.environ['PATH']}", RUSTUP_TOOLCHAIN=PIN)
-        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER", "BLAZE_BACKEND", "BLAZE_OPT"):
+        for name in ("CARGO_INCREMENTAL", "BLAZE_TIER"):
             base.pop(name, None)
 
         # What blaze's build from nothing prints, with nothing tiered: it runs a fixed number of
         # generations, as many as a tiered run got to.
         scratch_env = dict(base, CARGO_TARGET_DIR=str(work / "scratch"), BLAZE_HOME=str(work / "home-scratch"),
-                           BLAZE_CACHE=str(work / "home-scratch" / "store"), BLAZE_TIER="off")
+                           BLAZE_TIER="off")
         await build("build from nothing", project, scratch_env)
 
         async def scratch(count: int) -> list[str]:

@@ -670,11 +670,6 @@ impl<D: PackedDef, I: PackedImport> Column<D, I> {
     }
 }
 
-/// Keys and values in the order the keys were first added, with an [`Index`] once there are
-/// more than [`LINEAR`]: `size_of::<(K, V)>()` plus 4 bytes of index a key over the load, and
-/// none while small. Two are equal when they map the same keys to the same values in any order,
-/// as the hash maps they replace were.
-#[derive(Clone)]
 /// `v` again at exactly its length: one allocation for a non-empty column, none for an empty one
 /// or one already exact.
 fn exact<T>(v: &mut ThinVec<T>) {
@@ -687,6 +682,11 @@ fn exact<T>(v: &mut ThinVec<T>) {
     *v = out;
 }
 
+/// Keys and values in the order the keys were first added, with an [`Index`] once there are
+/// more than [`LINEAR`]: `size_of::<(K, V)>()` plus 4 bytes of index a key over the load, and
+/// none while small. Two are equal when they map the same keys to the same values in any order,
+/// as the hash maps they replace were.
+#[derive(Clone)]
 pub(crate) struct Keyed<K, V> {
     entries: ThinVec<(K, V)>,
     index: Index,

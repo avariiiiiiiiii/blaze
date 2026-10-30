@@ -1739,7 +1739,8 @@ impl<'db> Interner for DbInterner<'db> {
                 crate::lower::const_conditions(db, def).skip_binder().iter().copied(),
             ))
         };
-        EarlyBinder::bind(self, match def_id {
+        // Every arm reads a stored binder, which holds no rigid alias.
+        EarlyBinder::bind_unchecked(match def_id {
             SolverDefId::FunctionId(it) => of(it.into()),
             SolverDefId::ImplId(it) => of(it.into()),
             SolverDefId::TraitId(it) => of(it.into()),
@@ -2468,9 +2469,9 @@ impl<'db> Interner for DbInterner<'db> {
             _ => (&[][..], None),
         };
         // A trait's `[const]` supertraits are its conditions on `Self`; an alias's bounds keep
-        // their own self type, the projection or opaque.
-        EarlyBinder::bind(
-            self,
+        // their own self type, the projection or opaque. Read out of a stored binder, which holds
+        // no rigid alias.
+        EarlyBinder::bind_unchecked(
             crate::effects::effect_trait_refs(conditions.iter().copied()).filter(move |it| {
                 trait_.is_none_or(|trait_| {
                     it.skip_binder().def_id.0 != trait_ && is_ty_self(it.skip_binder().self_ty())

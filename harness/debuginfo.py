@@ -28,7 +28,7 @@ import bisect, os, re, shutil, struct, subprocess, sys, tempfile, time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 os.environ.setdefault("CARGO_PROFILE_DEV_DEBUG", "true")
-from dwarf import DWARFDUMP, LLVM, OPTIMIZED_OUT, WINDOWS, Tally, dumped, held, own, own_ranges, panics, unit_of, units
+from dwarf import DWARFDUMP, OPTIMIZED_OUT, WINDOWS, Tally, dumped, held, own, own_ranges, panics, unit_of, units
 from rebuild import Project, copy, scratch
 from storelib import forget
 
@@ -657,7 +657,7 @@ def program(tally, what, workspace, crates, package, inject):
     binary = build(ws, package, os.path.join(work, "home"))
     ours = backtraces(binary, ws, env)
     site = f"{path}:{line_of(text, PANIC)}"
-    held(tally, f"{what}: frames of each panic", ours, [[(None, site)]], binary)
+    held(tally, f"{what}: frames of each panic", ours, [[(None, site)]])
     verify(tally, what, binary)
     unwinding(tally, what, binary)
     if place := call_site(ours):
@@ -713,7 +713,7 @@ def edited(tally, part):
                 continue
             binary = built.executable
             ours, sites = backtraces(binary, ws), edit_sites(text)
-            held(tally, f"{part}: {what}", ours, sites, binary)
+            held(tally, f"{part}: {what}", ours, sites)
             verify(tally, f"{part}: {what}", binary)
             unwinding(tally, f"{part}: {what}", binary)
     finally:
@@ -727,7 +727,7 @@ def edited(tally, part):
         # `walk` asks for the item at 7, through `between` or not.
         line = line_of(open(os.path.join(ws, MAIN)).read(), "must(length)")
         mine = printed_by("gdb", binary, ws, f"{MAIN}:{line}", ["at"])["at"]
-        right = mine == "7" or (LLVM and mine == OPTIMIZED_OUT)
+        right = mine == "7"
         tally.say(f"{part}: the last binary: gdb prints an argument", "as it is" if right else "NOT AS IT IS", f"at = {mine}")
     if os.environ.get("CARGO_PROFILE_DEV_SPLIT_DEBUGINFO"):
         kept = sum("DW_AT_GNU_dwo_name" in unit and bool(re.search(r'DW_AT_producer\s+\("blaze[ "]', unit)) for unit in units(binary))
@@ -795,7 +795,7 @@ def callers(tally):
     place the source says they pass through."""
     work, ws = sline("callers", CALLERS_MAIN)
     binary = build(ws, "sline", os.path.join(work, "home"))
-    held(tally, "callers: frames of each panic", backtraces(binary, ws), caller_sites(), binary)
+    held(tally, "callers: frames of each panic", backtraces(binary, ws), caller_sites())
     verify(tally, "callers", binary)
 
 
@@ -989,7 +989,7 @@ def main():
         if only in (None, name):
             part()
     left = f", {tally.open} open" if tally.open else ""
-    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'}{left} ({'llvm' if LLVM else 'cranelift'})")
+    print(f"{'wrong: ' + str(tally.wrong) if tally.wrong else 'all right'}{left}")
     sys.exit(1 if tally.wrong else 0)
 
 

@@ -60,7 +60,6 @@ SCRUBBED = (
     "CARGO_BUILD_TARGET",
     "CARGO_BUILD_JOBS",
     "CARGO_INCREMENTAL",
-    "BLAZE_CACHE",
     "BLAZE_HOME",
     "BLAZE_BIN",
     "BLAZE_BACKEND",
@@ -193,6 +192,11 @@ def run(step: str, argv: list[str], cwd: Path, env: dict[str, str], timeout: flo
     if check and ran.returncode != 0:
         raise Failed(f"{step}: `{' '.join(argv)}` in {cwd} exited {ran.returncode}:\n{ran.said()}")
     return ran
+
+
+def store_of(home: Path) -> Path:
+    """Where the daemon of `home` keeps its store (crates/blaze-cargo/src/serve/daemon.rs)."""
+    return home / "v2" / "store"
 
 
 def scrubbed() -> dict[str, str]:
@@ -420,10 +424,15 @@ class Engine(ABC):
     def env(self, home: Path, store: Path | None = None, target: Path | None = None,
             extra: dict[str, str] | None = None) -> dict[str, str]:
         """The environment of a `blaze` command with a home (daemon, socket, logs) and a store of
-        its own; the target directory is the workspace's `target` unless `target` is given."""
+        its own; the target directory is the workspace's `target` unless `target` is given.
+        The daemon's store is always `store_of(home)`: a `store` elsewhere is refused, and a store
+        shared or seeded across homes is copied there before the daemon starts."""
+        if store is not None and store != store_of(home):
+            raise Failed(f"a store at {store} for the home {home}: the daemon keeps its store at "
+                         f"{store_of(home)} and reads no other")
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         env = scrubbed()
-        env.update(BLAZE_HOME=str(home), BLAZE_CACHE=str(store or home / "store"), BLAZE_STATS="1",
+        env.update(BLAZE_HOME=str(home), BLAZE_STATS="1",
                    BLAZE_BACKEND=self.spec.backend, PATH=f"{self.blaze.parent}{os.pathsep}{env.get('PATH', '')}")
         if self.spec.backend == "llvm":
             env.update(BLAZE_OPT="2", BLAZE_EMIT="fast")

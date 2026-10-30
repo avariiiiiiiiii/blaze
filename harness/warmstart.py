@@ -43,15 +43,18 @@ def main():
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
     source = fetch(name, spec)
-    store = os.path.join(work, "store")
     build, run = spec.get("build", []), spec.get("run")
     edit = spec["edits"]["body"]
 
-    def checkout(label):
+    def checkout(label, seed=None):
+        """A copy of the project with a home of its own, whose store is a copy of `seed`'s."""
         ws = os.path.join(work, label)
         shutil.copytree(source, ws, symlinks=True, ignore=lambda at, names: [n for n in names if n in ("target", ".git")])
-        env = dict(blaze_cli.base_env(os.path.join(work, f"home-{label}")), **spec.get("env", {}), **extra_env)
-        env.update(BLAZE_CACHE=store, BLAZE_STATS="1")
+        home = os.path.join(work, f"home-{label}")
+        if seed is not None:
+            shutil.copytree(os.path.join(seed.env["BLAZE_HOME"], "v2", "store"), os.path.join(home, "v2", "store"), symlinks=True)
+        env = dict(blaze_cli.base_env(home), **spec.get("env", {}), **extra_env)
+        env.update(BLAZE_STATS="1")
         env.pop("RUSTC_WRAPPER", None)
         return Side(ws, env, True)
 
@@ -100,7 +103,7 @@ def main():
     first = checkout("first")
     step("first", first)
     first.cargo("stop")
-    second = checkout("second")
+    second = checkout("second", seed=first)
     step("warm", second)
     second.cargo("stop")
     step("restart", second)

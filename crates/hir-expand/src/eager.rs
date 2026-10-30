@@ -429,7 +429,10 @@ fn replace_calls(
                         builder.view(NodeOrToken::Node(insert.root()));
                         events.skip_subtree();
                         let leave = events.next();
-                        debug_assert!(leave == Some(WalkEvent::Leave(NodeOrToken::Node(node))));
+                        debug_assert!(matches!(
+                            leave,
+                            Some(WalkEvent::Leave(NodeOrToken::Node(it))) if it == node
+                        ));
                     }
                     None => builder.start_node(node.raw_kind()),
                 }

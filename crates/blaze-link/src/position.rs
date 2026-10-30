@@ -248,7 +248,7 @@ mod tests {
             assert_eq!(spans.span(at as u32), Some(*span));
         }
         assert_eq!(spans.span(2), None);
-        let mut other = owned.clone();
+        let mut other = table();
         other.spans[1].line = 121;
         assert!(!spans.is(&other.encode()));
         let empty = SpanTable::default().encode();

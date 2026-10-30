@@ -320,8 +320,8 @@ pub(super) mod tests {
                 (0..below(50)).map(|i| (format!("_s{i}"), below(count as u64) as usize)).collect();
             let members: Vec<(&str, &[u8])> =
                 names.iter().zip(&datas).map(|(name, data)| (name.as_str(), data.as_slice())).collect();
-            let index: Vec<(&str, usize)> = symbols.iter().map(|(name, at)| (name.as_str(), *at)).collect();
-            let bytes = bsd(&members, &index);
+            let entries: Vec<(&str, usize)> = symbols.iter().map(|(name, at)| (name.as_str(), *at)).collect();
+            let bytes = bsd(&members, &entries);
             let archive = read("libseeded.a", &bytes).unwrap_or_else(|e| panic!("round {round}: {e}"));
             assert_eq!(member_names(&archive), names, "round {round}");
             for (member, data) in archive.members.iter().zip(&datas) {

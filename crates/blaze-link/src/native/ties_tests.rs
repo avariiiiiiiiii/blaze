@@ -133,18 +133,18 @@ fn a_tied_section_is_no_root_and_no_start_symbol_keeps_it() {
     let init = Class::InitArray;
     let mut it = object(&[TEXT, init.clone(), init, counters(), counters()], &[]);
     it.ties = vec![tie(1, 0), tie(3, 0)];
-    let graph = graph(vec![it]);
-    let parsed = &graph.loads[0].parsed;
+    let untied = graph(vec![it]);
+    let parsed = &untied.loads[0].parsed;
     assert_eq!(parsed.roots, [2], "the untied init array only");
     assert_eq!(parsed.named, [(NameId(4), 4)], "`__start___sancov_cntrs` keeps only the untied counters");
-    assert_eq!(kept(&graph, &[]), [(0, 2)]);
+    assert_eq!(kept(&untied, &[]), [(0, 2)]);
 
     let mut it = object(&[TEXT, counters()], &[]);
     it.ties = vec![tie(1, 0)];
     it.sections[1].retain = true;
-    let graph = graph(vec![it]);
-    assert_eq!(graph.loads[0].parsed.roots, [1], "retain says so itself (lld: before SHF_LINK_ORDER)");
-    assert_eq!(kept(&graph, &[]), [(0, 0), (0, 1)], "and keeps what it is tied to");
+    let retained = graph(vec![it]);
+    assert_eq!(retained.loads[0].parsed.roots, [1], "retain says so itself (lld: before SHF_LINK_ORDER)");
+    assert_eq!(kept(&retained, &[]), [(0, 0), (0, 1)], "and keeps what it is tied to");
 }
 
 /// COFF: an associative COMDAT is in its root's group as well as tied to its parent; a

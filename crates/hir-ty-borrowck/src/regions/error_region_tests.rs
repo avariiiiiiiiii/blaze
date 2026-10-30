@@ -3,7 +3,7 @@
 //! constraints and type tests are dropped. Reduced from `blaze-link`'s `cow.rs` `unique`: one
 //! parameter with two lifetimes, the elided `&mut` and the `'static` written in it.
 
-use base_db::all_crates;
+use base_db::{Db, all_crates};
 use hir_def::{FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature};
 use hir_ty::{MissingLifetimeKind, TyLoweringDiagnostic, db::HirDatabase as _};
 use hir_expand::fixture;
@@ -53,7 +53,7 @@ fn too_long<'s>(shared: &'s mut Shared<'static, u8>) -> &'static mut u8 {
 }
 "#;
 
-fn function(db: &TestDB, name: &str) -> FunctionId {
+fn function(db: &Db, name: &str) -> FunctionId {
     for &krate in all_crates(db).iter() {
         let def_map = crate_def_map(db, krate);
         for (_, module) in def_map.modules(db) {

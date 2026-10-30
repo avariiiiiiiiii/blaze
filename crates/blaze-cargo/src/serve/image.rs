@@ -277,7 +277,9 @@ mod tests {
     fn a_history_that_does_not_decode_stops_the_daemon_naming_it() {
         let mut cut = empty();
         cut.truncate(cut.len() - 1);
-        let error = history(&with_history(HISTORY, &cut), blaze_history::Config::default()).unwrap_err();
+        let Err(error) = history(&with_history(HISTORY, &cut), blaze_history::Config::default()) else {
+            panic!("a cut history decoded")
+        };
         assert!(error.contains("the plane's history"), "{error}");
     }
 }

@@ -275,7 +275,7 @@ mod tests {
         let pool = sized_fields(&dl);
         let tail = unsized_field(&dl);
         let repr = ReprOptions::default();
-        let discr = |min: std::ops::RangeFrom<i128>, max: std::ops::RangeToInclusive<u128>| {
+        let discr = |min: std::range::RangeFrom<i128>, max: std::range::RangeToInclusive<u128>| {
             repr_discr(&dl, &repr, min.start, max.last).unwrap_or((Integer::I8, false))
         };
         let mut seed = SplitMix64::new(0x2545_f491_4f6c_dd1d);

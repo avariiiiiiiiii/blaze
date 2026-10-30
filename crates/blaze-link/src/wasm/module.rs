@@ -1447,7 +1447,7 @@ mod tests {
     fn a_command() {
         let module = command().module().unwrap();
         let file = ::object::File::parse(&*module).expect("object reads the module");
-        assert_eq!(::object::Object::format(&file), ::object::BinaryFormat::Wasm);
+        assert_eq!(file.format(), ::object::BinaryFormat::Wasm);
 
         let sections = sections(&module);
         let ids: Vec<u8> = sections.iter().map(|it| it.0).collect();

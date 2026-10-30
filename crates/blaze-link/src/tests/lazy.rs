@@ -495,7 +495,7 @@ fn a_lazy_image_is_a_dev_run_with_a_jump_table_and_the_hook() {
         assert!(error.what.contains(&format!("`{hook}`")), "{case:?}: {error}");
         assert_eq!(hook == "_blaze_lazy_resolve", matches!(case, Case::MachO), "{case:?}: {hook}");
 
-        let (_, other) = session(case, &LAZY[..2]);
+        let (_, other) = self::session(case, &LAZY[..2]);
         let error = image.stage_lazy(case.change(&functions), &session, &other).err().expect("another region");
         assert!(error.what.contains("not the session's"), "{case:?}: {error}");
     }
@@ -522,7 +522,7 @@ fn a_later_link_keeps_its_hands_off_lazy_slots() {
         assert_eq!(error.function, Some(key(L1)), "{case:?}: {error}");
         assert!(error.what.contains("keeps every lazy function's slot"), "{case:?}: {error}");
 
-        let (other, other_stubs) = session(case, &LAZY[..3]);
+        let (other, other_stubs) = self::session(case, &LAZY[..3]);
         let error = image.stage_lazy(Change::default(), &other, &other_stubs).err().expect("another session");
         assert!(error.what.contains("another session"), "{case:?}: {error}");
         assert!(image.stage_lazy(Change::default(), &session, &stubs).is_ok(), "{case:?}: the same session");

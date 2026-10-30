@@ -10,7 +10,7 @@ use hir_def::{
     nameres::crate_def_map,
     signatures::{FunctionSignature, TraitSignature, TypeAliasSignature},
 };
-use rustc_type_ir::inherent::IntoKind as _;
+use rustc_type_ir::inherent::{Clause as _, IntoKind as _};
 use hir_expand::fixture;
 
 use crate::{

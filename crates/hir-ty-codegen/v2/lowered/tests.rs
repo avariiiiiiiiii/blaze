@@ -153,12 +153,12 @@ fn the_ir_is_the_stencil_backends() {
         let built = built_spec();
         let (_, prepared) = Backends::default()
             .prepare(&frontend, &unit(&built), &built, &root, &refs)
-            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let Prepared::Stencil(function) = prepared else { panic!("{name}: a stencil unit") };
         let mut want = function.ir().expect("IR").clone();
         drop(crate::v2::backend::stencil_ir(&mut want));
         let tier = spec();
-        let lowering = lowered(&frontend, &unit(&tier), &tier, &root, &refs).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let lowering = lowered(&frontend, &unit(&tier), &tier, &root, &refs).unwrap_or_else(|e| panic!("{name}: {e:?}"));
         let Lowering::Ir { func, .. } = lowering else { panic!("{name}: IR") };
         assert_eq!(func.display().to_string(), want.display().to_string(), "{name}");
     }
@@ -198,8 +198,8 @@ fn what_the_tier_does_not_compile_is_refused_by_name() {
     let refused = |spec: Spec, what: &str| {
         let unit = unit(&spec);
         let Err(e) = lowered(&frontend, &unit, &spec, &root, &refs) else { panic!("{what}: lowered") };
-        assert_eq!(e.unit, unit.instance.key(), "{e}");
-        assert!(e.what.contains(what), "{what}: {e}");
+        assert_eq!(e.unit, unit.instance.key(), "{e:?}");
+        assert!(e.what.contains(what), "{what}: {e:?}");
     };
     refused(Spec { backend: Backend::Cranelift { speed: false }, ..spec() }, "for Cranelift");
     refused(Spec { counted: true, ..spec() }, "`counted`");
@@ -213,7 +213,7 @@ fn what_the_tier_does_not_compile_is_refused_by_name() {
         let root = frontend.root(function(db, name));
         let refs = refs_of(&frontend, &root);
         let Err(e) = lowered(&frontend, &unit(&tier), &tier, &root, &refs) else { panic!("{name}: lowered") };
-        assert!(e.what.contains(what) && e.what.contains(name), "{name}: {e}");
+        assert!(e.what.contains(what) && e.what.contains(name), "{name}: {e:?}");
     }
 }
 
@@ -274,7 +274,7 @@ fn the_reach_of_a_root_is_the_drivers() {
         match lowered(&frontend, &unit, &tier, instance, refs) {
             Ok(Lowering::Ir { names, .. }) => assert!(names.iter().all(|it| !matches!(it, Target::Counter(_)))),
             Ok(_) => {}
-            Err(e) => panic!("{instance:?}: {e}"),
+            Err(e) => panic!("{instance:?}: {e:?}"),
         }
     }
 }

@@ -200,7 +200,7 @@ mod tests {
         });
         caller.data.push(area);
         let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[]), caller];
-        dedupe(&mut functions, &|it| *it != key(9));
+        dedupe(&mut functions, |it| *it != key(9));
         let caller = functions.iter().find(|it| it.key == key(9)).unwrap();
         assert!(matches!(
             &caller.unwind,
@@ -219,7 +219,7 @@ mod tests {
             function(5, 0xcc, &[3]),
             function(6, 0xc3, &[5]),
         ];
-        let deduped = dedupe(&mut functions, &|_| true);
+        let deduped = dedupe(&mut functions, |_| true);
         assert_eq!(deduped.merged, BTreeMap::from([(key(3), key(2)), (key(5), key(4))]));
         let keys: Vec<_> = functions.iter().map(|it| it.key).collect();
         assert_eq!(keys, vec![key(2), key(4), key(6)]);
@@ -233,7 +233,7 @@ mod tests {
             ..function(n, 0x90, &[])
         };
         let mut functions = vec![covered(2), covered(3)];
-        assert!(dedupe(&mut functions, &|_| true).merged.is_empty());
+        assert!(dedupe(&mut functions, |_| true).merged.is_empty());
         assert_eq!(functions.len(), 2);
     }
 
@@ -245,7 +245,7 @@ mod tests {
             it
         };
         let mut functions = vec![counting(2), counting(3), function(7, 0xc3, &[3])];
-        assert!(dedupe(&mut functions, &|_| true).merged.is_empty());
+        assert!(dedupe(&mut functions, |_| true).merged.is_empty());
         assert_eq!(functions.len(), 3);
         assert_eq!(functions[0].relocs.targets(), [Target::Counter(key(2))]);
     }
@@ -259,12 +259,12 @@ mod tests {
         let mut functions = vec![profiled(2, crate::Profiled::Counted(record)), profiled(3, crate::Profiled::Counted(record))];
         functions[0].relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::ProfileCounters, addend: 4 });
         functions[1].relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::ProfileCounters, addend: 4 });
-        assert!(dedupe(&mut functions, &|_| true).merged.is_empty());
+        assert!(dedupe(&mut functions, |_| true).merged.is_empty());
         assert_eq!(functions.len(), 2);
 
         let used = |mismatched| crate::Profiled::Used { mismatched };
         let mut functions = vec![profiled(2, used(true)), profiled(3, used(true)), profiled(4, used(false))];
-        let deduped = dedupe(&mut functions, &|_| true);
+        let deduped = dedupe(&mut functions, |_| true);
         assert_eq!(deduped.merged, BTreeMap::from([(key(3), key(2))]));
         assert_eq!(functions.len(), 2);
     }
@@ -273,12 +273,12 @@ mod tests {
     fn what_may_not_be_merged_stays_but_its_callers_are_renamed() {
         let mut functions =
             vec![function(2, 0x90, &[]), function(3, 0x90, &[]), function(7, 0xc3, &[3])];
-        let deduped = dedupe(&mut functions, &|it| *it != key(2));
+        let deduped = dedupe(&mut functions, |it| *it != key(2));
         assert!(deduped.merged.is_empty());
         assert_eq!(functions.len(), 3);
         let mut functions =
             vec![function(2, 0x90, &[]), function(3, 0x90, &[]), function(7, 0xc3, &[3])];
-        dedupe(&mut functions, &|it| *it != key(7));
+        dedupe(&mut functions, |it| *it != key(7));
         assert_eq!(functions.iter().find(|it| it.key == key(7)).unwrap().relocs.targets(), [Target::Direct(key(2))]);
     }
 
@@ -296,7 +296,7 @@ mod tests {
         caller.relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::Data(table.id), addend: -4 });
         caller.data.push(table);
         let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[]), caller];
-        dedupe(&mut functions, &|_| true);
+        dedupe(&mut functions, |_| true);
         let caller = functions.iter().find(|it| it.key == key(9)).unwrap();
         assert_eq!(caller.data[0], vtable(2));
         assert_eq!(caller.relocs.targets(), [Target::Data(vtable(2).id)]);
@@ -315,7 +315,7 @@ mod tests {
         let mut a = make();
         let mut b = make();
         b.reverse();
-        assert_eq!(dedupe(&mut a, &|_| true), dedupe(&mut b, &|_| true));
+        assert_eq!(dedupe(&mut a, |_| true), dedupe(&mut b, |_| true));
         assert_eq!(a, b);
     }
 
@@ -331,7 +331,7 @@ mod tests {
                 .collect()
         };
         let mut first = make();
-        let want = dedupe(&mut first, &|it| *it != key(7));
+        let want = dedupe(&mut first, |it| *it != key(7));
         assert!(want.merged.len() > 20, "{}", want.merged.len());
         for step in [7usize, 11, 13, 59] {
             let mut functions = make();
@@ -339,7 +339,7 @@ mod tests {
             let permuted: Vec<CompiledFunction> =
                 (0..len).map(|at| functions[at * step % len].clone()).collect();
             functions = permuted;
-            assert_eq!(dedupe(&mut functions, &|it| *it != key(7)), want);
+            assert_eq!(dedupe(&mut functions, |it| *it != key(7)), want);
             assert_eq!(functions, first);
         }
     }

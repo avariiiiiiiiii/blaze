@@ -6,7 +6,7 @@ pub(crate) mod db;
 
 use base_db::all_crates;
 use hir_def::{
-    DefWithBodyId, ModuleDefId,
+    DefWithBodyId, HasModule as _, ModuleDefId,
     expr_store::ExpressionStore,
     hir::{BindingId, Expr, ExprId, Pat, PatId, Statement},
     nameres::crate_def_map,

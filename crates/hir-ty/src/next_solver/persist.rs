@@ -2465,7 +2465,7 @@ mod tests {
         }
         let clauses: Vec<_> =
             samples.predicates.iter().map(|&kind| Clause(Predicate::intern(kind))).collect();
-        let computed = FlagComputation::for_clauses(&clauses);
+        let computed = FlagComputation::<DbInterner<'_>>::for_clauses(&clauses);
         let clauses = Clauses::new_from_slice(&clauses);
         assert_eq!(clauses.flags(), computed.flags);
         assert_eq!(clauses.outer_exclusive_binder(), computed.outer_exclusive_binder);

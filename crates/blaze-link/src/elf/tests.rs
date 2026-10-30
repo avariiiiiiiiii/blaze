@@ -280,11 +280,8 @@ fn the_debug_sections_are_the_cores_not_copies() {
         let parsed = ElfFile64::<Endianness>::parse(&bytes[..]).unwrap();
         let endian = parsed.endian();
         let shdrs = parsed.elf_section_table();
-        let strings = shdrs.strings(endian, &bytes[..]).unwrap();
         for (name, data) in &image.debug {
-            let (_, shdr) = (shdrs.iter().enumerate())
-                .find(|(_, it)| it.name(endian, strings).unwrap() == name.as_bytes())
-                .unwrap_or_else(|| panic!("no {name}"));
+            let (_, shdr) = shdrs.section_by_name(endian, name.as_bytes()).unwrap_or_else(|| panic!("no {name}"));
             assert_eq!(shdr.data(endian, &bytes[..]).unwrap(), &data[..], "{name}");
         }
         used
@@ -431,12 +428,12 @@ fn an_executable_reads_back() {
     let phdr = |p_type| phdrs.iter().find(|it| it.p_type(endian) == p_type).unwrap();
     let interp = phdr(elf::PT_INTERP);
     assert_eq!(interp.data(endian, data_bytes).unwrap(), b"/lib64/ld-linux-x86-64.so.2\0");
-    let relro = phdr(elf::PT_GNU_RELRO);
+    let relro_phdr = phdr(elf::PT_GNU_RELRO);
     for class in [Class::RelRo, Class::Got, Class::InitArray, Class::Synthetic(super::DYNAMIC)] {
         let addr = image.at(&class);
-        assert!(relro.p_vaddr(endian) <= addr && addr < relro.p_vaddr(endian) + relro.p_memsz(endian));
+        assert!(relro_phdr.p_vaddr(endian) <= addr && addr < relro_phdr.p_vaddr(endian) + relro_phdr.p_memsz(endian));
     }
-    assert!(relro.p_vaddr(endian) + relro.p_memsz(endian) <= data, "relro ends before the writable data");
+    assert!(relro_phdr.p_vaddr(endian) + relro_phdr.p_memsz(endian) <= data, "relro ends before the writable data");
     let tls = phdr(elf::PT_TLS);
     assert_eq!((tls.p_vaddr(endian), tls.p_filesz(endian), tls.p_memsz(endian)), (tdata, 8, 24));
     assert!(tdata < bss);

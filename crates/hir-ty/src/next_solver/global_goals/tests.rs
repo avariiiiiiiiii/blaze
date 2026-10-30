@@ -532,7 +532,7 @@ fn a_key_names_its_goal() {
         assert_eq!(key.bits() & GoalKey::PENDING, 0);
         assert_eq!(key.predicate(), predicate);
         assert_eq!(key.param_env(), ParamEnv::empty());
-        assert_eq!(key.typing_mode(), mode);
+        assert_eq!(format!("{:?}", key.typing_mode()), format!("{mode:?}"));
     }
     // An env with a region parameter is not global.
     assert_eq!(GoalKey::of(predicate, env, TypingMode::PostAnalysis), None);

@@ -2,6 +2,7 @@
 
 use base_db::{Crate, Db, all_crates};
 use hir_def::{
+    Lookup as _,
     item_scope::{GlobId, ImportId, ImportOrExternCrate},
     src::use_tree_to_view,
 };

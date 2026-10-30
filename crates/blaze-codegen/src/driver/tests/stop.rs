@@ -171,7 +171,8 @@ fn a_stop_while_checking_ends_a_lazy_build_within_one_function() {
     let program = wide();
     let machine = stopping(&program, Some(10), None);
     let policy = policy(OptLevel::O0, Mode::Live);
-    let mut build = Build::new(&machine, &program, &policy, &Memo::new());
+    let memo = Memo::new();
+    let mut build = Build::new(&machine, &program, &policy, &memo);
     stopped_with(build.run_later(&[(1, member())], &[], &[0], &Store::default()));
     let (prepared, _, emitted) = machine.counts();
     assert!(prepared >= 10 && prepared <= within_one_function_a_core(10), "{prepared} prepared");

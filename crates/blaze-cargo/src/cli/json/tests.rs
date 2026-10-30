@@ -32,8 +32,8 @@ const TARGET: &str = r#"{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_
 
 #[test]
 fn build_finished() {
-    assert_eq!(line(|out| build_finished(out, true)), r#"{"reason":"build-finished","success":true}"#);
-    assert_eq!(line(|out| build_finished(out, false)), r#"{"reason":"build-finished","success":false}"#);
+    assert_eq!(line(|out| super::build_finished(out, true)), r#"{"reason":"build-finished","success":true}"#);
+    assert_eq!(line(|out| super::build_finished(out, false)), r#"{"reason":"build-finished","success":false}"#);
 }
 
 #[test]

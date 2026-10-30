@@ -396,7 +396,7 @@ mod tests {
         let names: Vec<_> = traced.env.iter().map(|it| it.0.clone()).collect();
         assert_eq!(names, [trace::ALL_ENV_NAME.into(), "OUT".into(), "PATH".into()]);
         assert!(!traced.files.iter().any(|it| it.0 == Path::new("/x")), "not this run's line");
-        let untraced = super::spec(&dir, "/bin/true", &[], false);
+        let untraced = self::spec(&dir, "/bin/true", &[], false);
         std::fs::write(&untraced.live, "").unwrap();
         let live = super::begin(&untraced).unwrap();
         assert_eq!(std::fs::read_to_string(&untraced.live).unwrap(), "");
@@ -449,7 +449,7 @@ mod tests {
     fn a_sandbox_that_cannot_be_made_is_a_report_that_says_why() {
         let dir = scratch("not-made");
         let mut spec = spec(&dir, "/bin/true", &[], true);
-        spec.env.push(("TMPDIR".into(), std::os::unix::ffi::OsStrExt::from_bytes(b"/tmp/\xff").into()));
+        spec.env.push(("TMPDIR".into(), <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"/tmp/\xff").into()));
         assert_eq!(super::launch(&spec), super::COULD_NOT);
         let report = trace::decode(&std::fs::read(&spec.report).unwrap()).unwrap();
         let Report::NotMade(why) = report else { panic!("{report:?}") };

@@ -419,7 +419,7 @@ mod tests {
         Case { cfg, domain, points, edges: kinds, boundary }
     }
 
-    fn edge_kind(case: &Case<'_>, from: usize, to: usize) -> Option<&EdgeKind> {
+    fn edge_kind<'a>(case: &'a Case<'_>, from: usize, to: usize) -> Option<&'a EdgeKind> {
         case.edges.iter().find(|(it, _)| *it == (from, to)).map(|(_, it)| it)
     }
 

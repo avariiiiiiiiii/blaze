@@ -574,7 +574,7 @@ mod tests {
     }
 
     fn owned(relocs: &Relocs) -> Vec<Relocation> {
-        relocs.iter().map(|it| Relocation { target: it.target.clone(), ..it }).collect()
+        relocs.iter().map(|it| Relocation { at: it.at, kind: it.kind, target: it.target.clone(), addend: it.addend }).collect()
     }
 
     #[test]

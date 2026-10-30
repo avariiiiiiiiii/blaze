@@ -125,7 +125,7 @@ fn two_functions_importing_one_name_from_two_modules_is_an_error_naming_both() {
     assert_eq!(puts(&image), (Some(&import("env_a")), 1));
 
     // A static is a declarer the same way.
-    let error = image.stage(Change { statics: vec![declaring("env_b")], ..Change::default() }).err().expect("a static's");
+    let error = image.stage(Change { statics: vec![&declaring("env_b")], ..Change::default() }).err().expect("a static's");
     says_both(&error, "env_a", "env_b");
     assert_eq!(error.function, None);
     assert!(error.what.contains(&format!("by the function {:?}", key(F))), "{}", error.what);
@@ -178,9 +178,9 @@ fn replacing_a_function_with_one_importing_from_another_module_moves_the_import(
     assert_eq!(puts(&image), (Some(&import("env_a")), 1));
 
     // A static edited the same way: the old one is unmade before the new one declares.
-    disk.link(&mut image, Change { statics: vec![declaring("env_a")], ..Change::default() }).unwrap();
+    disk.link(&mut image, Change { statics: vec![&declaring("env_a")], ..Change::default() }).unwrap();
     assert_eq!(puts(&image), (Some(&import("env_a")), 2));
-    disk.link(&mut image, Change { removed: vec![key(G)], statics: vec![declaring("env_b")], ..Change::default() })
+    disk.link(&mut image, Change { removed: vec![key(G)], statics: vec![&declaring("env_b")], ..Change::default() })
         .unwrap();
     assert_eq!(puts(&image), (Some(&import("env_b")), 1));
 }

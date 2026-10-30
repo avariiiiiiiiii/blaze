@@ -194,9 +194,9 @@ fn unit(pkg_id: &str, kind: &str, mode: Mode, deps: &[usize]) -> Unit {
             .map(|&index| UnitDep {
                 index,
                 extern_crate_name: "dep".into(),
-                public: false,
-                noprelude: false,
-                nounused: false,
+                public: Some(false),
+                noprelude: Some(false),
+                nounused: Some(false),
             })
             .collect(),
     }
@@ -237,6 +237,7 @@ fn of_graph(root: &str, manifest: String, graph: UnitGraph) -> Units {
         checked_as_test: false,
         metadata: "0".into(),
         extra_filename: String::new(),
+        unit_id: "0123456789abcdef".to_owned(),
         cfgs: Vec::new(),
         check_cfg: Vec::new(),
         rustflags: Vec::new(),
@@ -1020,7 +1021,7 @@ fn tests_under_the_evaluator_are_each_evaluated_and_one_failing_fails_the_job() 
                 _ => None,
             })
             .collect();
-        results.sort();
+        results.sort_by(|a, b| a.0.cmp(&b.0));
         results
     };
     let id = client.send(&mut daemon, test("a::"));

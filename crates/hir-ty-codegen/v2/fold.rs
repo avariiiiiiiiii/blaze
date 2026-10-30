@@ -1086,8 +1086,8 @@ mod tests {
         };
         let name = user(&mut func, 0, callee);
         let signature = func.import_signature(signature());
-        let data = ir::ExtFuncData { name, signature, colocated: true, patchable: false };
-        let callee = func.import_function(data);
+        let ext = ir::ExtFuncData { name, signature, colocated: true, patchable: false };
+        let callee = func.import_function(ext);
         let name = user(&mut func, 0, stat);
         let stat = func.create_global_value(ir::GlobalValueData::Symbol {
             name,
@@ -1169,7 +1169,7 @@ mod tests {
     #[test]
     fn what_has_no_parameters_is_not_masked() {
         assert!(masked_ir(&ir::Function::new(), PLAIN).is_none());
-        assert!(masked_ir(&grow(8, 0, 1, false), &|_| None).is_none());
+        assert!(masked_ir(&grow(8, 0, 1, false), Names::Plain(|_| None)).is_none());
     }
 
     /// The masked form as it was: Cranelift's printed text, its entities renumbered by first
@@ -1951,7 +1951,8 @@ mod tests {
         assert_eq!(group.varying, vec![0]);
         // The static differs, but the group was made with it equal.
         let members: [Member<'_>; 2] = [(&a, PLAIN, &refs[..]), (&b, PLAIN, &other[..])];
-        assert!(build(group, &members, pointer).unwrap_err().contains("varies"));
+        let Err(why) = build(group, &members, pointer) else { panic!("a member unlike the group was built") };
+        assert!(why.contains("varies"), "{why}");
         assert!(build(group, &members[..1], pointer).is_err());
     }
 }

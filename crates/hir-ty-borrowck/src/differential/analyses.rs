@@ -12,7 +12,7 @@ use std::fmt::Write as _;
 use base_db::Db;
 use blaze_mem::{Tag, frame};
 use hir_def::{
-    DefWithBodyId,
+    DefWithBodyId, HasModule as _,
     expr_store::{Body, BodySourceMap, ExpressionStore},
     hir::ExprId,
 };
@@ -329,12 +329,12 @@ fn compare_body<'db>(what: &str, ctx: &Ctx<'_, 'db>, body: &MirBody<'db>) {
     assert_eq!(exit.reached.words(), old_exit.reached.words(), "{what}: blocks reached");
     for block in 0..blocks {
         assert_eq!(
-            exit.exit.row(block),
+            exit.exit.row(block).words(),
             old_exit.exit.row(block),
             "{what}: initialized leaving block {block}"
         );
         assert_eq!(
-            exit.returned.row(block),
+            exit.returned.row(block).words(),
             old_exit.returned.row(block),
             "{what}: initialized as block {block}'s call returns"
         );

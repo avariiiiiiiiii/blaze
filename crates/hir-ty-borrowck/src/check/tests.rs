@@ -5,7 +5,7 @@
 
 use std::cell::Cell;
 
-use base_db::all_crates;
+use base_db::{Db, all_crates};
 use hir_def::{
     AdtId, DefWithBodyId, ModuleDefId,
     expr_store::{Body, BodySourceMap},
@@ -72,7 +72,7 @@ fn e0597() {
 }
 "#;
 
-fn function(db: &TestDB, name: &str) -> DefWithBodyId {
+fn function(db: &Db, name: &str) -> DefWithBodyId {
     for &krate in all_crates(db).iter() {
         let def_map = crate_def_map(db, krate);
         for (_, module) in def_map.modules(db) {
@@ -89,7 +89,7 @@ fn function(db: &TestDB, name: &str) -> DefWithBodyId {
 }
 
 /// The source text `span` points at; of a scope end, its closing brace.
-fn source(db: &TestDB, source_map: &BodySourceMap, span: MirSpan) -> String {
+fn source(db: &Db, source_map: &BodySourceMap, span: MirSpan) -> String {
     let source = match span {
         MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => source_map.expr_syntax(expr),
         MirSpan::PatId(pat) => source_map.pat_syntax(pat),
@@ -106,7 +106,7 @@ fn source(db: &TestDB, source_map: &BodySourceMap, span: MirSpan) -> String {
     }
 }
 
-fn part(db: &TestDB, source_map: &BodySourceMap, span: PartSpan) -> String {
+fn part(db: &Db, source_map: &BodySourceMap, span: PartSpan) -> String {
     match span {
         PartSpan::At(span) => source(db, source_map, span),
         PartSpan::Before(span) => format!("before {}", source(db, source_map, span)),
@@ -119,7 +119,7 @@ fn part(db: &TestDB, source_map: &BodySourceMap, span: PartSpan) -> String {
 
 type Labels = Vec<(String, String)>;
 
-fn labels(db: &TestDB, source_map: &BodySourceMap, labels: &[(PartSpan, String)]) -> Labels {
+fn labels(db: &Db, source_map: &BodySourceMap, labels: &[(PartSpan, String)]) -> Labels {
     let mut found: Labels =
         labels.iter().map(|(at, text)| (part(db, source_map, *at), text.clone())).collect();
     found.sort();
@@ -139,7 +139,7 @@ fn error_of(
     name: &str,
     code: &str,
     want: &[(&str, &str)],
-    rest: impl FnOnce(&TestDB, &BodySourceMap, &BorrowckDiagnostic),
+    rest: impl FnOnce(&Db, &BodySourceMap, &BorrowckDiagnostic),
 ) {
     let fx = fixture::db(FIXTURE);
     let _ = fx.only_file();

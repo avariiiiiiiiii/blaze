@@ -410,7 +410,7 @@ impl Small {
 
 fn natives() -> Vec<SidedNative<'static>> {
     vec![SidedNative {
-        native: Native { id: id(9_300), name: "libc.so.6", bytes: &[], kind: NativeKind::Shared { as_needed: true }, order: 1 },
+        native: Native { id: id(9_300), name: "libc.so.6", bytes: Box::leak(Box::new(std::sync::Arc::<[u8]>::from([]))), kind: NativeKind::Shared { as_needed: true }, order: 1 },
         dependency: true,
     }]
 }

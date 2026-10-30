@@ -699,7 +699,7 @@ fn drop_constraint(db: &Db, adt: AdtId) -> DropConstraint {
     let mut tys = Vec::new();
     if let Some(drop_impl) = hir_ty::drop::destructor(db, adt) {
         let args = GenericArgs::identity_for_item(interner, adt.into());
-        let dangling = may_dangle(db, *drop_impl, args.len());
+        let dangling = may_dangle(db, drop_impl, args.len());
         for (index, arg) in args.iter().enumerate() {
             let dangles = dangling.get(index).copied().unwrap_or(false);
             match arg.kind() {

@@ -1090,7 +1090,7 @@ fn an_object() -> Vec<u8> {
     b.append_section_data(text, &[0x1f, 0x20, 0x03, 0xd5].repeat(8), 4);
     let data = b.section_id(StandardSection::Data);
     b.append_section_data(data, &[0; 16], 8);
-    let strings = b.section_id(StandardSection::CString);
+    let strings = b.section_id(StandardSection::ReadOnlyString);
     b.append_section_data(strings, b"hello\0world\0", 1);
     let mut symbol = |name: &str, value: u64, size: u64, kind, scope, section| {
         b.add_symbol(Def {

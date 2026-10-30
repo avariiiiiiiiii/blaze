@@ -194,7 +194,7 @@ impl ImageStore for Memory {
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
         let mut values = self.values.lock().unwrap();
         match values.get(&key) {
-            Some(kept) if **kept != *value => Err(format!("{key:?} is kept with other bytes")),
+            Some(kept) if kept[..] != value[..] => Err(format!("{key:?} is kept with other bytes")),
             Some(_) => Ok(()),
             None => {
                 values.insert(key, Arc::new(Aligned::copy_from(&value)));

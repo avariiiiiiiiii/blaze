@@ -66,6 +66,7 @@ fn join(out: &mut Vec<u8>, pieces: Vec<Result<Vec<u8>, String>>) -> Result<(), S
 }
 
 /// A segment, by its index among the image's `LC_SEGMENT_64`s.
+#[derive(Clone)]
 pub(super) struct Span {
     pub name: &'static str,
     pub start: u64,
@@ -627,7 +628,8 @@ mod tests {
             for seed in 0..12u64 {
                 let mut rng = SplitMix64::new(0x7265_6261_7365 ^ seed);
                 let n = [10, CHUNK - 1, 2 * CHUNK, 3 * CHUNK + 77, 5 * CHUNK][seed as usize % 5];
-                let mut addrs = pointers(&mut rng, n, CONST + 8 * rng.range(0..64), true);
+                let start = CONST + 8 * rng.range(0..64);
+                let mut addrs = pointers(&mut rng, n, start, true);
                 if seed % 3 == 0 {
                     rng.shuffle(&mut addrs);
                 }
@@ -663,7 +665,7 @@ mod tests {
             assert!(error.contains("__LOCKED"), "{error}");
             assert_eq!(pieces.unwrap_err(), error);
             // Without the locked segment, the first error is the hole's.
-            let mut open = spans;
+            let mut open = spans.clone();
             open[2].writable = true;
             let (pieces, one) = both(&addrs, &open);
             let error = one.unwrap_err();

@@ -19,7 +19,7 @@ use crate::{
 fn impl_of(db: &Db, trait_name: &str) -> ImplId {
     crate_def_map(db, fixture::test_crate(db))
         .modules(db)
-        .flat_map(|(module, _)| module.scope(db).impls().collect::<Vec<_>>())
+        .flat_map(|(_, module)| module.scope(db).impls().collect::<Vec<_>>())
         .find(|&impl_| {
             db.impl_trait(impl_).is_some_and(|it| {
                 TraitSignature::of(db, it.skip_binder().def_id.0).name.as_str() == trait_name

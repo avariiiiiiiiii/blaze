@@ -165,8 +165,8 @@ fn prepared(frontend: &HirFrontend, spec: &Spec, instance: &HirInstance) -> (Sha
         let refs: &Refs = &refs;
         let walked = (instance, inlines(spec));
         Backends::default()
-            .prepared(db, homes, &*frontend.hashes, &unit(spec), spec, walked, refs)
-            .unwrap_or_else(|e| panic!("{instance:?}: {e}"))
+            .prepared(db, homes, &frontend.hashes, &unit(spec), spec, walked, refs)
+            .unwrap_or_else(|e| panic!("{instance:?}: {e:?}"))
     })
 }
 
@@ -622,7 +622,7 @@ fn cranelift_refuses_a_sanitized_unit() {
         let Err(e) = Backends::default().prepare(&frontend, &unit(&spec), &spec, &loud, refs) else {
             panic!("a sanitized Cranelift unit was built");
         };
-        assert!(e.to_string().contains("-Zsanitizer and SanitizerCoverage"), "{e}");
+        assert!(e.what.contains("-Zsanitizer and SanitizerCoverage"), "{e:?}");
     }
     let plain = spec();
     let built = Backends::default().prepare(&frontend, &unit(&plain), &plain, &loud, refs);

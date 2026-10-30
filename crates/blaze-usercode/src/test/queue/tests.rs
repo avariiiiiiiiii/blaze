@@ -586,12 +586,12 @@ fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
     let conn = fake.hello(0, &["a", "b", "c"]);
     let runs = fake.runs(conn);
     assert_eq!(indices(&runs), [0, 1, 2]);
-    let hits = Executed::Hits { slots: 8, hits: vec![1] };
-    fake.end_with(conn, runs[0].0, End::Exited(0), b"a ok", hits.clone());
+    let hits = || Executed::Hits { slots: 8, hits: vec![1] };
+    fake.end_with(conn, runs[0].0, End::Exited(0), b"a ok", hits());
     fake.end(conn, runs[1].0, End::Exited(101), b"b failed");
     fake.end(conn, runs[2].0, End::Signaled(6), b"");
     assert_eq!((&fake.result("a").outcome, fake.result("a").output.as_slice()), (&Outcome::Passed, &b"a ok"[..]));
-    assert_eq!(fake.result("a").executed, hits);
+    assert_eq!(fake.result("a").executed, hits());
     assert_eq!(fake.result("b").outcome, Outcome::Failed(Failure::Code(101)));
     assert_eq!(fake.result("c").outcome, Outcome::Failed(Failure::Signal(6)));
     for test in ["a", "b", "c"] {
@@ -858,10 +858,10 @@ fn what_a_test_executed_comes_with_its_result() {
     let mut fake = Fake::new(config(2), vec![binary("lib", vec![job("a", 2), job("b", 1)])]);
     let conn = fake.hello(0, &["a", "b"]);
     let runs = fake.runs(conn);
-    let hits = Executed::Hits { slots: 64, hits: vec![3, 9, 63] };
-    fake.end_with(conn, runs[0].0, End::Exited(0), b"", hits.clone());
+    let hits = || Executed::Hits { slots: 64, hits: vec![3, 9, 63] };
+    fake.end_with(conn, runs[0].0, End::Exited(0), b"", hits());
     fake.end_with(conn, runs[1].0, End::Exited(1), b"", Executed::Not("its region was not armed".to_owned()));
-    assert_eq!(fake.result("a").executed, hits);
+    assert_eq!(fake.result("a").executed, hits());
     assert_eq!(fake.result("b").executed, Executed::Not("its region was not armed".to_owned()));
 }
 

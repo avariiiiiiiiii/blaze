@@ -8,10 +8,10 @@ use blaze_codegen::settings::{Coverage, Sanitize, Sanitizers};
 use blaze_codegen::{Arch, Covered, Init, RelocKind, Relocs, Static, Target};
 use blaze_items::ItemKey;
 use object::read::elf::{Rela as _, SectionHeader as _};
-use object::write::{Object as Builder, Symbol as Def, SymbolSection};
+use object::write::{Object as Builder, StandardSection, Symbol as Def, SymbolSection};
 use object::{
-    Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, SectionFlags, SectionKind, StandardSection,
-    SymbolFlags, SymbolKind, SymbolScope, elf,
+    Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, SectionFlags, SectionKind, SymbolFlags,
+    SymbolKind, SymbolScope, elf,
 };
 
 use super::{CALLER, Change, Disk, Image, Linked, Native, NativeKind, TO, covered, function, id, key, name, output, rel32, returns, section_of};

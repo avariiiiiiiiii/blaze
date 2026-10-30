@@ -422,7 +422,10 @@ mod tests {
                     file[5 * PAGE + 9] ^= 0xff;
                     written.push((5 * PAGE as u64, 16));
                 }
-                6 => file[file.len() - 3] ^= 0xff,
+                6 => {
+                    let at = file.len() - 3;
+                    file[at] ^= 0xff;
+                }
                 7 => {
                     file[20 * PAGE] ^= 0xff;
                     from = 1;

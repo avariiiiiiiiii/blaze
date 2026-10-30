@@ -1,5 +1,8 @@
 //! The roots of each kind of unit over fixtures.
 
+#[path = "../tests/db.rs"]
+mod db;
+
 use blaze_codegen::{plan::Mode, settings::Panic};
 use hir_def::{AssocItemId, test_items};
 use hir_expand::fixture;
@@ -10,6 +13,7 @@ use super::{
     },
     RootKind, Roots,
 };
+use db::TestDB;
 
 
 /// What a test of `harness` is given as usercode's fork server: its two names, no more.

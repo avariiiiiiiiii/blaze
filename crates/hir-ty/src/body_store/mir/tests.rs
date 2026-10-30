@@ -560,10 +560,10 @@ fn a_location_constant_that_is_not_its_literals_is_refused() {
     let s = session(db_of(&fixture), &Arc::new(Memory::default()), &Defs::default(), None, Mode::Serve);
     let def = function(&s.db, "located");
     let mut body = located_mir(&s.db, def, &fixture);
-    let Rvalue::Use(operand) = match &mut body.basic_blocks[body.start_block].statements[0].kind {
+    let Rvalue::Use(operand) = (match &mut body.basic_blocks[body.start_block].statements[0].kind {
         StatementKind::Assign(_, rvalue) => rvalue,
         _ => unreachable!("the first statement assigns the line"),
-    } else {
+    }) else {
         unreachable!("of a constant")
     };
     *operand = Operand { span: operand.span, ..Operand::from_bytes(Box::new([0; 4]), default_types().types.u32) };

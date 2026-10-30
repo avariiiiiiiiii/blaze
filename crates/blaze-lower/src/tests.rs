@@ -119,6 +119,7 @@ fn plan(cfgs: &[&str], env: &[(&str, &str)], out_dir: Option<&str>) -> UnitPlan 
         checked_as_test: false,
         metadata: String::new(),
         extra_filename: String::new(),
+        unit_id: "0123456789abcdef".to_owned(),
         cfgs: cfgs.iter().map(|it| (*it).to_owned()).collect(),
         check_cfg: Vec::new(),
         rustflags: Vec::new(),
@@ -271,7 +272,7 @@ fn every_unit_that_compiles_is_a_crate() {
     for unit in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST] {
         assert!(built.lowered.krate(unit).is_some(), "unit {unit}");
     }
-    assert_eq!(base_db::all_crates(&db).len(), 6);
+    assert_eq!(base_db::all_crates(db).len(), 6);
     // What every task shares answers as the writer does.
     fn shared<T: Send + Sync>(_: &T) {}
     let crates = built.lowered.crates();
@@ -282,9 +283,9 @@ fn every_unit_that_compiles_is_a_crate() {
     assert!(crates.is_proc_macro(MACRO) && !crates.is_proc_macro(LIB));
     // The lib and its test are two crates of one root file.
     assert_ne!(krate(&built, LIB), krate(&built, LIB_TEST));
-    assert_eq!(krate(&built, LIB).data(&db).root_file_id, krate(&built, LIB_TEST).data(&db).root_file_id);
+    assert_eq!(krate(&built, LIB).data(db).root_file_id, krate(&built, LIB_TEST).data(db).root_file_id);
     // A crate comes after every crate it depends on.
-    let all = base_db::all_crates(&db);
+    let all = base_db::all_crates(db);
     let at = |unit| all.iter().position(|it| *it == krate(&built, unit)).unwrap();
     assert!(at(CORE) < at(LIB) && at(LIB) < at(BIN) && at(MACRO) < at(BIN));
 }
@@ -293,7 +294,7 @@ fn every_unit_that_compiles_is_a_crate() {
 fn deps_are_by_extern_name_in_the_units_order() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
-    let deps = &krate(&built, BIN).data(&db).dependencies;
+    let deps = &krate(&built, BIN).data(db).dependencies;
     let names: Vec<&str> = deps.iter().map(|it| it.name.as_str()).collect();
     assert_eq!(names, ["alpha", "m", "core"]);
     assert_eq!(deps[0].crate_id, krate(&built, LIB));
@@ -302,7 +303,7 @@ fn deps_are_by_extern_name_in_the_units_order() {
     assert!(deps[0].is_prelude() && !deps[0].is_sysroot());
     assert!(!deps[2].is_prelude() && deps[2].is_sysroot());
     // A build script's run is no crate's dependency.
-    let lib_deps: Vec<&str> = krate(&built, LIB).data(&db).dependencies.iter().map(|it| it.name.as_str()).collect();
+    let lib_deps: Vec<&str> = krate(&built, LIB).data(db).dependencies.iter().map(|it| it.name.as_str()).collect();
     assert_eq!(lib_deps, ["core"]);
 }
 
@@ -310,7 +311,7 @@ fn deps_are_by_extern_name_in_the_units_order() {
 fn editions_kinds_and_origins_are_cargos() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
-    let data = |unit| krate(&built, unit).data(&db).clone();
+    let data = |unit| krate(&built, unit).data(db).clone();
     assert_eq!(data(LIB).edition, Edition::Edition2021);
     assert_eq!(data(BIN).edition, Edition::Edition2024);
     assert_eq!(data(LIB).target_kind, TargetKind::Lib { is_proc_macro: false });
@@ -329,10 +330,10 @@ fn editions_kinds_and_origins_are_cargos() {
     assert!(data(LIB).origin.is_local());
     // A member's proc macros run in the workspace's root.
     assert_eq!(data(MACRO).proc_macro_cwd.as_str(), "/w");
-    let extra = krate(&built, BIN).extra_data(&db);
+    let extra = krate(&built, BIN).extra_data(db);
     assert_eq!(extra.version.as_deref(), Some("0.1.0"));
     assert_eq!(extra.display_name.as_ref().map(|it| it.canonical_name().as_str().to_owned()).as_deref(), Some("b"));
-    assert_eq!(krate(&built, LIB).workspace_data(&db).const_eval.steps, 5000);
+    assert_eq!(krate(&built, LIB).workspace_data(db).const_eval.steps, 5000);
 }
 
 #[test]
@@ -348,24 +349,24 @@ fn a_crate_type_rustc_does_not_name_is_an_error_naming_the_unit() {
 fn cfgs_are_the_targets_with_the_units() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
-    let lib = krate(&built, LIB).cfg_options(&db).clone();
+    let lib = krate(&built, LIB).cfg_options(db).clone();
     assert!(lib.check_atom(&key_value("feature", "fast")));
     assert!(lib.check_atom(&key_value("target_os", "linux")));
     assert!(lib.check_atom(&flag("debug_assertions")));
     assert!(!lib.check_atom(&flag("test")));
     assert!(!lib.check_atom(&flag("proc_macro")));
-    let test = krate(&built, LIB_TEST).cfg_options(&db).clone();
+    let test = krate(&built, LIB_TEST).cfg_options(db).clone();
     assert!(test.check_atom(&flag("test")));
-    assert!(krate(&built, MACRO).cfg_options(&db).check_atom(&flag("proc_macro")));
+    assert!(krate(&built, MACRO).cfg_options(db).check_atom(&flag("proc_macro")));
 }
 
 #[test]
 fn env_is_the_units() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
-    assert_eq!(krate(&built, LIB).env(&db).get("CARGO_PKG_NAME").as_deref(), Some("a"));
-    assert_eq!(krate(&built, BIN).env(&db).get("CARGO_PKG_NAME").as_deref(), Some("b"));
-    assert_eq!(krate(&built, BIN).env(&db).get("OUT_DIR"), None);
+    assert_eq!(krate(&built, LIB).env(db).get("CARGO_PKG_NAME").as_deref(), Some("a"));
+    assert_eq!(krate(&built, BIN).env(db).get("CARGO_PKG_NAME").as_deref(), Some("b"));
+    assert_eq!(krate(&built, BIN).env(db).get("OUT_DIR"), None);
 }
 
 #[test]
@@ -373,21 +374,21 @@ fn files_are_at_cargos_paths_in_their_roots() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
     let paths = built.lowered.paths();
-    let lib_root = krate(&built, LIB).data(&db).root_file_id;
+    let lib_root = krate(&built, LIB).data(db).root_file_id;
     assert_eq!(paths.get(&lib_root).map(String::as_str), Some("/w/a/src/lib.rs"));
-    assert!(db.file_text(lib_root).text(&db).starts_with("include!"));
+    assert!(db.file_text(lib_root).text(db).starts_with("include!"));
     // Each package's root holds its files and no other's.
-    let a = root_of(&db, krate(&built, LIB));
+    let a = root_of(db, krate(&built, LIB));
     assert!(a.file_for_path(&path("/w/a/src/more.rs")).is_some());
     assert!(a.file_for_path(&path("/w/b/src/main.rs")).is_none());
     assert!(!a.is_library);
     // What the build writes is read by nobody.
     assert!(!paths.values().any(|it| it.starts_with("/w/target/")));
     // The standard library is one library root: core reads stdarch by `#[path]`.
-    let core = root_of(&db, krate(&built, CORE));
+    let core = root_of(db, krate(&built, CORE));
     assert!(core.is_library);
     assert!(core.file_for_path(&path("/rustc/abc/library/stdarch/crates/core_arch/src/mod.rs")).is_some());
-    assert_ne!(root_id_of(&db, krate(&built, CORE)), root_id_of(&db, krate(&built, LIB)));
+    assert_ne!(root_id_of(db, krate(&built, CORE)), root_id_of(db, krate(&built, LIB)));
 }
 
 #[test]
@@ -416,28 +417,28 @@ fn a_run_reaches_the_units_depending_on_it_and_no_other() {
     let db = built.lowered.db();
     for unit in [LIB, LIB_TEST] {
         let krate = krate(&built, unit);
-        assert!(krate.cfg_options(&db).check_atom(&flag("has_gen")), "unit {unit}");
-        assert!(krate.cfg_options(&db).check_atom(&key_value("gen", "two")), "unit {unit}");
-        assert_eq!(krate.env(&db).get("GEN").as_deref(), Some("1"));
-        assert_eq!(krate.env(&db).get("OUT_DIR").as_deref(), Some(OUT_DIR));
+        assert!(krate.cfg_options(db).check_atom(&flag("has_gen")), "unit {unit}");
+        assert!(krate.cfg_options(db).check_atom(&key_value("gen", "two")), "unit {unit}");
+        assert_eq!(krate.env(db).get("GEN").as_deref(), Some("1"));
+        assert_eq!(krate.env(db).get("OUT_DIR").as_deref(), Some(OUT_DIR));
     }
     let bin = krate(&built, BIN);
-    assert!(!bin.cfg_options(&db).check_atom(&flag("has_gen")));
-    assert_eq!(bin.env(&db).get("GEN"), None);
+    assert!(!bin.cfg_options(db).check_atom(&flag("has_gen")));
+    assert_eq!(bin.env(db).get("GEN"), None);
 
     let generated = path(&format!("{OUT_DIR}/gen.rs"));
-    let file = root_of(&db, krate(&built, LIB)).file_for_path(&generated).copied().unwrap();
-    assert_eq!(&**db.file_text(file).text(&db), "pub fn gen() {}\n");
-    assert!(root_of(&db, bin).file_for_path(&generated).is_none());
-    assert!(root_of(&db, krate(&built, MACRO)).file_for_path(&generated).is_none());
+    let file = root_of(db, krate(&built, LIB)).file_for_path(&generated).copied().unwrap();
+    assert_eq!(&**db.file_text(file).text(db), "pub fn gen() {}\n");
+    assert!(root_of(db, bin).file_for_path(&generated).is_none());
+    assert!(root_of(db, krate(&built, MACRO)).file_for_path(&generated).is_none());
     assert_eq!(built.lowered.paths().get(&file).map(String::as_str), Some(&*format!("{OUT_DIR}/gen.rs")));
 
     // Applied again without the file and the cfg, the run leaves neither.
     let again = Ran { cfgs: Vec::new(), files: Vec::new(), ..ran };
     built.lowered.ran(RUN, &again).unwrap();
     let db = built.lowered.db();
-    assert!(!krate(&built, LIB).cfg_options(&db).check_atom(&flag("has_gen")));
-    assert!(root_of(&db, krate(&built, LIB)).file_for_path(&generated).is_none());
+    assert!(!krate(&built, LIB).cfg_options(db).check_atom(&flag("has_gen")));
+    assert!(root_of(db, krate(&built, LIB)).file_for_path(&generated).is_none());
     assert!(!built.lowered.paths().contains_key(&file));
 }
 
@@ -459,11 +460,11 @@ fn lowering_twice_gives_equal_crates() {
     let second = lowered(&units).unwrap();
     let (one, two) = (first.lowered.db(), second.lowered.db());
     for unit in [CORE, BUILD_SCRIPT, LIB, MACRO, BIN, LIB_TEST] {
-        assert_eq!(krate(&first, unit).content(&one), krate(&second, unit).content(&two), "unit {unit}");
+        assert_eq!(krate(&first, unit).content(one), krate(&second, unit).content(two), "unit {unit}");
     }
-    assert_eq!(base_db::all_crates_content(&one), base_db::all_crates_content(&two));
+    assert_eq!(base_db::all_crates_content(one), base_db::all_crates_content(two));
     // The lib and its test differ by `cfg(test)`.
-    assert_ne!(krate(&first, LIB).content(&one), krate(&first, LIB_TEST).content(&one));
+    assert_ne!(krate(&first, LIB).content(one), krate(&first, LIB_TEST).content(one));
 }
 
 #[test]
@@ -600,7 +601,7 @@ fn a_refresh_reads_the_view_again_and_no_fixed_mount() {
     let db = built.lowered.db();
     let a = root_of(db, krate(&built, LIB));
     let more = a.file_for_path(&path("/w/a/src/more.rs")).copied().unwrap();
-    assert!(db.file_text(more).text(&db).starts_with("pub fn more() -> u8"));
+    assert!(db.file_text(more).text(db).starts_with("pub fn more() -> u8"));
     let new = a.file_for_path(&path("/w/a/src/new.rs")).copied().unwrap();
     assert_eq!(built.lowered.paths().get(&new).map(String::as_str), Some("/w/a/src/new.rs"));
     assert_eq!(krate(&built, BIN).data(db).root_file_id, bin_root, "a file that did not change keeps its id");
@@ -892,32 +893,32 @@ fn a_packages_const_macros_are_one_crate_its_crates_depend_on_by_the_files_stem(
     assert_eq!(dependency_of(db, krate(&built, BUILD_SCRIPT), "macros"), None, "a build script has none");
 
     // Every crate depending on them has the cfg rustc never sets; no other crate does.
-    let has_cfg = |unit| krate(&built, unit).cfg_options(&db).check_atom(&flag("blaze_const_macros"));
+    let has_cfg = |unit| krate(&built, unit).cfg_options(db).check_atom(&flag("blaze_const_macros"));
     assert!(has_cfg(LIB) && has_cfg(LIB_TEST));
     assert!(!has_cfg(BUILD_SCRIPT) && !has_cfg(BIN));
 
     // A proc macro's crate of the lib's dependencies, cfgs and edition, which no unit compiles.
-    let data = macros.data(&db);
+    let data = macros.data(db);
     assert_eq!(data.target_kind, TargetKind::Lib { is_proc_macro: true });
     assert_eq!(data.edition, Edition::Edition2021);
     assert_eq!(built.lowered.paths().get(&data.root_file_id).map(String::as_str), Some("/w/a/src/macros.rs"));
     let names: Vec<&str> = data.dependencies.iter().map(|it| it.name.as_str()).collect();
     assert_eq!(names, ["core", "proc_macro", "const_ast"]);
-    let cfg = macros.cfg_options(&db);
+    let cfg = macros.cfg_options(db);
     assert!(cfg.check_atom(&flag("proc_macro")) && cfg.check_atom(&flag("blaze_const_macros")));
     assert!(cfg.check_atom(&key_value("feature", "fast")) && !cfg.check_atom(&flag("test")));
     assert!((0..units.graph.units.len()).all(|unit| built.lowered.krate(unit) != Some(macros)));
 
     // blaze's `const-ast`, beside the standard library, on `core` alone.
     let const_ast = dependency_of(db, macros, "const_ast").unwrap();
-    let root = const_ast.data(&db).root_file_id;
+    let root = const_ast.data(db).root_file_id;
     assert_eq!(built.lowered.paths().get(&root).map(String::as_str), Some("/rustc/abc/blaze/const-ast/lib.rs"));
-    let on: Vec<Crate> = const_ast.data(&db).dependencies.iter().map(|it| it.crate_id).collect();
+    let on: Vec<Crate> = const_ast.data(db).dependencies.iter().map(|it| it.crate_id).collect();
     assert_eq!(on, [krate(&built, CORE)]);
 
     // Its macros are listed from its file, and every crate comes after what it depends on.
     assert_eq!(const_macros_of(db, macros), ["double"]);
-    let all = base_db::all_crates(&db);
+    let all = base_db::all_crates(db);
     assert_eq!(all.len(), 9);
     let at = |krate: Crate| all.iter().position(|it| *it == krate).unwrap();
     assert!(at(krate(&built, PROC_MACRO)) < at(macros) && at(const_ast) < at(macros));
@@ -941,14 +942,14 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
     let more: &'static [u8] = b"#[proc_macro]\npub fn double(input: TokenStream) -> TokenStream { input }\n\
         #[proc_macro_attribute]\npub fn twice(attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
     let root = changed(&tree, &[("a/src/macros.rs", Some(more))]);
-    let config = config(root, library_with_proc_macro(&tree));
-    let refreshed = built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None });
+    let with_more = config(root, library_with_proc_macro(&tree));
+    let refreshed = built.lowered.refresh(Lower { units: &units, config: &with_more, files: &tree, root, host_cpu: None });
     assert_eq!(refreshed, Ok(true));
     assert_eq!(const_macros_of(built.lowered.db(), macros), ["double", "twice"]);
 
     let root = changed(&tree, &[]);
-    let config = config(root, library_with_proc_macro(&tree));
-    let Err(error) = built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+    let without = config(root, library_with_proc_macro(&tree));
+    let Err(error) = built.lowered.refresh(Lower { units: &units, config: &without, files: &tree, root, host_cpu: None })
     else {
         panic!("the const macros' file went and nothing said so")
     };

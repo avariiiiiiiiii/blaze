@@ -2,11 +2,12 @@
 //! a private field hides an uninhabited type unless visibility is ignored.
 
 use base_db::{Crate, Db, all_crates};
-use hir_def::{AdtId, EnumVariantId, ModuleDefId, ModuleId, TyDefId, nameres::crate_def_map};
+use hir_def::{AdtId, EnumVariantId, ModuleDefId, ModuleId, nameres::crate_def_map};
 use hir_expand::name::Name;
 use hir_expand::fixture;
 
 use crate::{
+    TyDefId,
     db::HirDatabase,
     inhabitedness::{
         is_enum_variant_privately_uninhabited, is_enum_variant_uninhabited_from,

@@ -1822,7 +1822,7 @@ fn rebased(file: &PeFile64<'_>, image: &[u8]) -> Vec<u32> {
 }
 
 /// (VirtualAddress, VirtualSize, SizeOfRawData, PointerToRawData, Characteristics) of each section.
-fn table(file: &PeFile64<'_>) -> Vec<(u32, u32, u32, u32, u32)> {
+fn section_headers(file: &PeFile64<'_>) -> Vec<(u32, u32, u32, u32, u32)> {
     file.section_table()
         .iter()
         .map(|it| {
@@ -1914,7 +1914,7 @@ fn dev_run_code_is_on_its_own_granules() {
     assert_eq!(optional.size_of_headers(), 0x1_0000);
     assert_eq!(optional.base_of_code(), 0x1_0000);
     assert_eq!(optional.section_alignment(), 0x1000);
-    let sections = table(&file);
+    let sections = section_headers(&file);
     let (va, size, raw, at, flags) = sections[0];
     assert_eq!(va, 0x1_0000, "the code starts on a granule");
     assert_ne!(flags & pe::IMAGE_SCN_MEM_EXECUTE, 0);
@@ -1972,7 +1972,7 @@ fn dev_run_reservations_are_the_last_sections_with_no_access() {
     let file = PeFile64::parse(&image[..]).unwrap();
     let names = section_names(&file);
     assert_eq!(names[names.len() - 3..], [".barena", ".bcells", ".bfixed"]);
-    let sections = table(&file);
+    let sections = section_headers(&file);
     let arena = f.at(&Class::Reserve(Reserve::Arena));
     let mut at = f.rva(arena);
     for (&(va, size, raw, raw_at, flags), want) in sections[sections.len() - 3..].iter().zip([0x2_0000, 0x1_0000, 0x3_0000]) {
@@ -1997,7 +1997,7 @@ fn dev_run_has_no_base_relocation_in_code_and_no_cfg() {
     let mut f = dev_executable();
     let image = f.image().unwrap();
     let file = PeFile64::parse(&image[..]).unwrap();
-    let (va, size, ..) = table(&file)[0];
+    let (va, size, ..) = section_headers(&file)[0];
     assert!(rebased(&file, &image).iter().all(|it| !(va..va + size).contains(it)));
     let optional = file.nt_headers().optional_header();
     assert_eq!(optional.dll_characteristics() & pe::IMAGE_DLLCHARACTERISTICS_GUARD_CF, 0);
@@ -2063,7 +2063,7 @@ fn without_a_dev_run_the_image_is_unchanged() {
     let optional = file.nt_headers().optional_header();
     assert_eq!(optional.size_of_headers(), 0x1000);
     assert_eq!(section_names(&file), [".text", ".rdata", ".data", ".reloc"]);
-    let sections = table(&file);
+    let sections = section_headers(&file);
     assert_eq!((sections[0].0, sections[0].1, sections[0].2), (0x1000, 0x40, 0x1000));
     assert_eq!(sections[1].0, 0x2000);
     assert_eq!(directory(&file, pe::IMAGE_DIRECTORY_ENTRY_TLS), (0, 0), "no TLS directory with no thread-locals");

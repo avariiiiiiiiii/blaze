@@ -139,7 +139,8 @@ mod tests {
         let mut map: FxHashMap<String, u32> = FxHashMap::default();
         for _ in 0..20_000 {
             let name = format!("/ws/{}", rng.below(3_000));
-            let expected = *map.entry(name.clone()).or_insert(map.len() as u32);
+            let next = map.len() as u32;
+            let expected = *map.entry(name.clone()).or_insert(next);
             assert_eq!(names.intern(&name), Some(expected));
             assert_eq!(names.find(&name), Some(expected));
         }

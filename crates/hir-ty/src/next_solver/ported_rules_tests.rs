@@ -2,7 +2,8 @@
 
 use base_db::{Db, all_crates};
 use hir_def::{
-    AssocItemId, FunctionId, ImplId, ModuleDefId, TraitId, TypeAliasId,
+    AssocItemId, FunctionId, ImplId, ModuleDefId, ModuleId, TraitId, TypeAliasId,
+    item_scope::ItemScope,
     nameres::crate_def_map,
     signatures::{FunctionSignature, TraitSignature},
 };
@@ -14,21 +15,28 @@ use hir_expand::fixture;
 
 use crate::{
     ImplTraitId,
-    db::InternedOpaqueTyId,
-    next_solver::{AnyImplId, CallableIdWrapper, DbInterner, ImplTraitIdx, SolverDefId},
+    db::{HirDatabase as _, InternedOpaqueTyId},
+    next_solver::{
+        AnyImplId, CallableIdWrapper, DbInterner, ImplOrTraitAssocTermId, ImplTraitIdx,
+        SolverDefId, TermId,
+    },
 };
 
-fn modules(db: &Db) -> Vec<hir_def::ModuleId> {
+fn modules(db: &Db) -> Vec<ModuleId> {
     all_crates(db)
         .iter()
         .flat_map(|&krate| crate_def_map(db, krate).modules(db).map(|(id, _)| id).collect::<Vec<_>>())
         .collect()
 }
 
+fn scope(db: &Db, module: ModuleId) -> &ItemScope {
+    module.def_map(db).module(db, module).scope(db)
+}
+
 fn function(db: &Db, name: &str) -> FunctionId {
     modules(db)
         .into_iter()
-        .flat_map(|module| module.scope(db).declarations().collect::<Vec<_>>())
+        .flat_map(|module| scope(db, module).declarations().collect::<Vec<_>>())
         .find_map(|def| match def {
             ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
                 Some(it)
@@ -41,7 +49,7 @@ fn function(db: &Db, name: &str) -> FunctionId {
 fn trait_(db: &Db, name: &str) -> TraitId {
     modules(db)
         .into_iter()
-        .flat_map(|module| module.scope(db).declarations().collect::<Vec<_>>())
+        .flat_map(|module| scope(db, module).declarations().collect::<Vec<_>>())
         .find_map(|def| match def {
             ModuleDefId::TraitId(it) if TraitSignature::of(db, it).name.as_str() == name => {
                 Some(it)
@@ -70,7 +78,7 @@ fn impl_of(db: &Db, trait_name: &str) -> ImplId {
     let wanted = trait_(db, trait_name);
     modules(db)
         .into_iter()
-        .flat_map(|module| module.scope(db).impls().collect::<Vec<_>>())
+        .flat_map(|module| scope(db, module).impls().collect::<Vec<_>>())
         .find(|&impl_| {
             db.impl_trait(impl_).is_some_and(|it| it.skip_binder().def_id.0 == wanted)
         })
@@ -102,9 +110,9 @@ trait Tr {
         for (name, expected) in
             [("Bare", false), ("Defaulted", true), ("BARE", false), ("DEFAULTED", true)]
         {
-            let def: SolverDefId<'_> = match assoc(&db, tr, name) {
-                AssocItemId::TypeAliasId(it) => it.into(),
-                AssocItemId::ConstId(it) => it.into(),
+            let def = match assoc(&db, tr, name) {
+                AssocItemId::TypeAliasId(it) => ImplOrTraitAssocTermId(TermId::TypeAliasId(it)),
+                AssocItemId::ConstId(it) => ImplOrTraitAssocTermId(TermId::ConstId(it)),
                 it => panic!("`{name}` is {it:?}"),
             };
             assert_eq!(interner.has_item_definition(def), expected, "`{name}`");
@@ -247,7 +255,7 @@ type Opaque = impl Sized;
         let interner = DbInterner::new_with(&db, fixture::test_crate(&db));
         let alias = modules(&db)
             .into_iter()
-            .flat_map(|module| module.scope(&db).declarations().collect::<Vec<_>>())
+            .flat_map(|module| scope(&db, module).declarations().collect::<Vec<_>>())
             .find_map(|def| match def {
                 ModuleDefId::TypeAliasId(it) => Some(it),
                 _ => None,
@@ -271,7 +279,7 @@ fn here() {}
 fn foreign_struct(db: &Db) -> hir_def::AdtId {
     modules(db)
         .into_iter()
-        .flat_map(|module| module.scope(db).declarations().collect::<Vec<_>>())
+        .flat_map(|module| scope(db, module).declarations().collect::<Vec<_>>())
         .find_map(|def| match def {
             ModuleDefId::AdtId(it) => Some(it),
             _ => None,

@@ -533,6 +533,7 @@ pub(crate) fn erase_regions<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
     struct Unlinked;
     inventory::collect!(Unlinked);
 
@@ -540,6 +541,7 @@ mod tests {
     inventory::collect!(Once);
     inventory::submit! { Once(7) }
 
+    #[derive(Debug)]
     struct Twice;
     inventory::collect!(Twice);
     inventory::submit! { Twice }

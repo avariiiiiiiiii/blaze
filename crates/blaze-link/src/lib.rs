@@ -122,6 +122,16 @@ impl Staged {
     }
 }
 
+impl fmt::Debug for Staged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Staged")
+            .field("base", &self.base)
+            .field("generation", &self.generation())
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Why a link failed: names the function and the relocation.
 #[derive(PartialEq, Eq, Debug)]
 pub struct LinkError {

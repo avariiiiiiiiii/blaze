@@ -99,6 +99,9 @@ fn render_error(error: &MatchError) -> (ExprOrPatId, String) {
         MatchError::MixedDerefPatterns { deref_pat, .. } => {
             ((*deref_pat).into(), "mixed deref patterns".to_owned())
         }
+        MatchError::ConstPattern { pat, error } => {
+            ((*pat).into(), format!("const pattern: {error:?}"))
+        }
     }
 }
 

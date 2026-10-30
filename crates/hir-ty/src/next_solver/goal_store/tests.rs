@@ -22,7 +22,7 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use rustc_hash::FxHashMap;
-use rustc_type_ir::inherent::Ty as _;
+use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 use salsa::Setter;
 use hir_expand::fixture;
 
@@ -160,7 +160,7 @@ impl ImageStore for Memory {
     fn put(&self, key: ContentId, value: Vec<u8>) -> Result<(), String> {
         let mut images = self.images.lock().unwrap();
         match images.get(&key) {
-            Some(kept) if **kept != *value => Err(format!("{key:?} kept with other bytes")),
+            Some(kept) if kept[..] != value[..] => Err(format!("{key:?} kept with other bytes")),
             Some(_) => Ok(()),
             None => {
                 images.insert(key, Arc::new(Aligned::copy_from(&value)));

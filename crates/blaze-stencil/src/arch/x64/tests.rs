@@ -230,7 +230,7 @@ fn build(
     let params = b.block_params(entry).to_vec();
     body(&mut b, &params);
     b.seal_all_blocks();
-    b.finalize();
+    b.finalize(isa(&LINUX).frontend_config());
     func
 }
 

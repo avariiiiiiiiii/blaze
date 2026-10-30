@@ -724,7 +724,7 @@ mod tests {
         assert_eq!(Intrinsic::COUNT, 377);
         assert_eq!(BY_INDEX.iter().filter(|intrinsic| !intrinsic.is_legacy()).count(), 277);
         let mut seen = [false; Intrinsic::COUNT];
-        for (at, &intrinsic) in BY_INDEX.iter().enumerate() {
+        for (at, intrinsic) in BY_INDEX.into_iter().enumerate() {
             assert_eq!(usize::from(intrinsic.index()), at, "{intrinsic}");
             assert!(!std::mem::replace(&mut seen[at], true));
             let name = intrinsic.symbol();

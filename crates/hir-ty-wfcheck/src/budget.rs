@@ -12,9 +12,9 @@ fn items(db: &TestDB) -> Vec<GenericDefId> {
     for &krate in base_db::all_crates(db).iter() {
         for (_, module) in crate_def_map(db, krate).modules(db) {
             found.extend(module.scope(db).declarations().filter_map(|def| match def {
-                ModuleDefId::AdtId(it) => Some(it.into()),
-                ModuleDefId::FunctionId(it) => Some(it.into()),
-                ModuleDefId::TraitId(it) => Some(it.into()),
+                ModuleDefId::AdtId(it) => Some(GenericDefId::from(it)),
+                ModuleDefId::FunctionId(it) => Some(GenericDefId::from(it)),
+                ModuleDefId::TraitId(it) => Some(GenericDefId::from(it)),
                 _ => None,
             }));
             found.extend(module.scope(db).impls().map(GenericDefId::from));

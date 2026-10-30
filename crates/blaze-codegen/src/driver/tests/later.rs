@@ -136,7 +136,8 @@ fn an_entry_that_is_no_root_is_an_error() {
 #[test]
 fn compile_one_names_what_it_cannot_compile_alone() {
     let (program, release) = (program(), policy(OptLevel::O3, Mode::Output));
-    let mut build = Build::new(&Machine::default(), &program, &release, &Memo::new());
+    let (machine, memo) = (Machine::default(), Memo::new());
+    let mut build = Build::new(&machine, &program, &release, &memo);
     let built = build.run(&[(1, member())], &Store::default()).unwrap();
     let error = build.compile_one(built.roots[0], &Store::default()).unwrap_err();
     assert_eq!(error.item, item(1));

@@ -3,7 +3,7 @@
 
 use hir_ty::{
     db::HirDatabase,
-    next_solver::{Binder, DbInterner, Region, RegionKind, Ty},
+    next_solver::{Binder, DbInterner, Region, RegionExt as _, RegionKind, Ty},
 };
 use hir_ty_mir::mir::erase_and_anonymize_regions;
 use rustc_type_ir::{Interner, TypeFoldable, TypeFolder, TypeSuperFoldable, inherent::IntoKind};

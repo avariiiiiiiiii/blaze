@@ -397,7 +397,10 @@ impl<'f> Both<'f> {
         let depth = self.depth();
         match rng.below(20) {
             0..=3 => self.schedule(rng, depth - 1),
-            4 => self.schedule(rng, rng.below(depth)),
+            4 => {
+                let to = rng.below(depth);
+                self.schedule(rng, to)
+            }
             5 if depth < 8 => self.push_scope(),
             6 if depth > 1 => self.pop_scope(),
             7 if self.locals > 0 => {

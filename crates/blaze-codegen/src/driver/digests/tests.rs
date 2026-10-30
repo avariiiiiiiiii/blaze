@@ -33,7 +33,7 @@ fn import(field: &str, params: Vec<ValType>) -> (String, wasm::Import) {
 
 #[test]
 fn a_static_definition_changes_with_every_field_it_covers() {
-    let base = base();
+    let before = base();
     let changed: Vec<(&str, Static)> = vec![
         ("its item", Static { item: ItemKey(id(9)), ..base() }),
         ("its instance", Static { instance: id(9), ..base() }),
@@ -56,7 +56,7 @@ fn a_static_definition_changes_with_every_field_it_covers() {
         ("its section", Static { section: Some(".init_array".to_owned()), ..base() }),
         ("an import", Static { imports: vec![import("f", vec![ValType::I32])], ..base() }),
     ];
-    let digest = static_definition(&base);
+    let digest = static_definition(&before);
     assert_eq!(digest, static_definition(&base()), "a function of the static alone");
     let mut seen = vec![digest];
     for (what, value) in &changed {

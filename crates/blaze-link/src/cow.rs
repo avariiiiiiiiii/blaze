@@ -1178,7 +1178,7 @@ mod tests {
         assert_eq!(b.get(3500), Some(&0));
         assert!(a.chunks.get(1).unwrap().ptr_eq(b.chunks.get(1).unwrap()));
         assert!(!a.chunks.get(0).unwrap().ptr_eq(b.chunks.get(0).unwrap()));
-        assert_eq!(a.iter().copied().sum::<u32>(), (0..3000).sum());
+        assert_eq!(a.iter().copied().sum::<u32>(), (0..3000).sum::<u32>());
     }
 
     #[test]
@@ -1453,7 +1453,8 @@ mod tests {
                         live += len;
                     }
                     3 | 4 if !lists.is_empty() => {
-                        let (list, items) = &mut lists[rng.index(lists.len())];
+                        let pick = rng.index(lists.len());
+                        let (list, items) = &mut lists[pick];
                         if !items.is_empty() {
                             let (at, value) = (rng.index(items.len()), rng.next_u32());
                             arena.get_mut(*list)[at] = value;

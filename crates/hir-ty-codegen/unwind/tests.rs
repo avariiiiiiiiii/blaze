@@ -292,7 +292,7 @@ fn saving(isa: &dyn TargetIsa, ints: usize, floats: usize, stack: u32) -> ir::Fu
     let (int, float) = (builder.block_params(entry)[0], builder.block_params(entry)[1]);
     if stack > 0 {
         let slot = builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, stack, 4));
-        builder.ins().stack_store(int, slot, 0);
+        builder.ins().stack_store(types::I64, int, slot, 0);
     }
     let ints: Vec<_> = (0..ints as i64).map(|at| builder.ins().imul_imm(int, at + 3)).collect();
     let floats: Vec<_> = (0..floats).map(|_| builder.ins().fadd(float, float)).collect();

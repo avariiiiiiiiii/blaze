@@ -180,7 +180,7 @@ fn reach(frontend: &HirFrontend, root: HirInstance) -> Reached {
     })
 }
 
-fn reach_from(text: &str, root: &str) -> (TestDB, Reached) {
+fn reach_from(text: &str, root: &str) -> (&'static TestDB, Reached) {
     let (db, frontend) = frontend(text);
     let root = frontend.root(function(&db, root));
     let reached = reach(&frontend, root);

@@ -535,6 +535,7 @@ pub enum DisplaySourceCodeError {
     Cycle,
 }
 
+#[derive(Debug)]
 pub enum HirDisplayError {
     /// Errors that can occur when generating source code
     DisplaySourceCodeError(DisplaySourceCodeError),

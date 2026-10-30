@@ -70,7 +70,7 @@ fn verified(f: impl FnOnce()) -> u64 {
     HITS.get() - before
 }
 
-fn same(a: &PickResult<'_>, b: &PickResult<'_>) -> bool {
+fn same<'db>(a: &PickResult<'db>, b: &PickResult<'db>) -> bool {
     match (a, b) {
         (Ok(a), Ok(b)) => same_pick(a, b),
         (Err(MethodError::NoMatch), Err(MethodError::NoMatch)) => true,
@@ -80,7 +80,7 @@ fn same(a: &PickResult<'_>, b: &PickResult<'_>) -> bool {
     }
 }
 
-fn same_pick(a: &Pick<'_>, b: &Pick<'_>) -> bool {
+fn same_pick<'db>(a: &Pick<'db>, b: &Pick<'db>) -> bool {
     a.item == b.item
         && a.kind == b.kind
         && a.autoderefs == b.autoderefs

@@ -5,7 +5,7 @@ use hir_expand::fixture;
 
 use crate::{
     db::HirDatabase,
-    next_solver::{DbInterner, RegionKind, TyKind},
+    next_solver::{ConstExt as _, DbInterner, RegionKind, TyKind},
     test_db::TestDBExt as _,
     tests::{check_infer, check_no_mismatches, check_types},
 };

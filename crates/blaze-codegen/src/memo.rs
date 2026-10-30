@@ -291,7 +291,7 @@ mod tests {
         let mut memo = Memo::new();
         memo.put(ContentId([1; 32]), template(1));
         memo.put(ContentId([2; 32]), template(2));
-        memo.retain(&|shape| shape.0[0] == 2);
+        memo.retain(|shape| shape.0[0] == 2);
         assert!(memo.get(&ContentId([1; 32])).is_none());
         assert_eq!(*memo.get(&ContentId([2; 32])).unwrap(), template(2));
         assert_eq!(memo.len(), 1);
@@ -343,7 +343,7 @@ mod tests {
             match op {
                 0 => {
                     let kept = (next() % 4) as u8;
-                    memo.retain(&|it| it.0[31] % 4 != kept);
+                    memo.retain(|it| it.0[31] % 4 != kept);
                     reference.retain(|it, _| it.0[31] % 4 != kept);
                 }
                 1..8 => {

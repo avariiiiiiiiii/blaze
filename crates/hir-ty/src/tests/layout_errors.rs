@@ -2,6 +2,7 @@
 
 use hir_def::{AdtId, EnumId, GenericDefId, ModuleDefId, nameres::crate_def_map};
 use hir_expand::fixture;
+use rustc_type_ir::inherent::GenericArgs as _;
 
 use crate::{
     ParamEnvAndCrate,

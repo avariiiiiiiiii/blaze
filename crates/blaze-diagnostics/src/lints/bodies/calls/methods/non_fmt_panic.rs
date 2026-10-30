@@ -39,7 +39,7 @@ use syntax::{
 
 use crate::{
     lints::bodies::{
-        BodyCx, Hooks, LatePass,
+        BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set,
         types::util::{self, Solver},
     },
     lower::{Found, Phase},
@@ -50,11 +50,8 @@ const LINT: &str = "non_fmt_panics";
 const MORE: &str =
     "for more information, see <https://doc.rust-lang.org/edition-guide/rust-2021/panic-macro-consistency.html>";
 
-pub(super) fn pass() -> Box<dyn LatePass> {
-    Box::new(NonPanicFmt { traits: None })
-}
-
-struct NonPanicFmt {
+#[derive(Default)]
+pub(crate) struct NonPanicFmt {
     /// `Display` and `Debug`, found by their diagnostic items the first time a message is not a
     /// string literal.
     traits: Option<FmtTraits>,
@@ -68,13 +65,8 @@ struct FmtTraits {
 }
 
 impl LatePass for NonPanicFmt {
-    fn name(&self) -> &'static str {
-        "NonPanicFmt"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set([LINT]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Call { callee, args: &[arg] } = b.store().expr(expr) else { return };

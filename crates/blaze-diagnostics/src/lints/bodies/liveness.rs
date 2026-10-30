@@ -54,7 +54,7 @@ use rustc_type_ir::{
 };
 use syntax::SyntaxNodePtr;
 
-use self::flow::{Access, Bits, CaptureKind, Cfg, Closures, DeadCaptures, Flow, Index, Kind, Loc, Places, Special};
+use self::flow::{Access, CaptureKind, Cfg, DeadCaptures, Flow, Index, Kind, Loc, PlaceSet, Places, Special};
 use self::source::{Decl, Source, Var};
 use super::BodyCx;
 use crate::{
@@ -62,8 +62,11 @@ use crate::{
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
+/// The lints this module gives: it runs only when one may fire.
+pub(super) const LINTS: super::LintSet = super::lint_set(["unused_variables", "unused_assignments"]);
+
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
-    if b.mir_tainted || source::skipped(b) {
+    if b.mir_tainted() || source::skipped(b) {
         return Vec::new();
     }
     let Some(mir) = b.mir() else { return Vec::new() };
@@ -147,7 +150,8 @@ struct Liveness<'b, 'a, 'db> {
     out: Vec<Found>,
 }
 
-impl<'db> Closures<'db> for Liveness<'_, '_, 'db> {
+impl<'db> Liveness<'_, '_, 'db> {
+    /// The analysis of a closure the body makes, decided the first time it is needed.
     fn dead_captures(&mut self, closure: Ty<'db>) -> DeadCaptures {
         let nested = self.nested(closure)?;
         if let Some(found) = self.analysed.get(&nested) {
@@ -344,8 +348,8 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                 ) && self.needs_drop(ty)
             }
         };
-        let drop_guards: Bits = {
-            let mut it = Bits::new(n);
+        let drop_guards: PlaceSet = {
+            let mut it = PlaceSet::new(n);
             for at in 0..n as Index {
                 if drop_guard(at) {
                     it.insert(at);

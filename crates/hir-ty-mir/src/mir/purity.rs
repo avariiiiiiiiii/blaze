@@ -52,12 +52,16 @@ impl Impure {
     /// Said of the function: "reaches `a` → `b`, which reads the foreign static `environ`".
     pub fn said(&self) -> String {
         match self.through.as_slice() {
+            // alloc: the text said of the function, made when it is reported
             [] => self.what.clone(),
             names => {
                 let shown = match names.len() {
+                    // alloc: the text said of the function, made when it is reported
                     ..=3 => names.join(" → "),
+                    // alloc: the text said of the function, made when it is reported
                     n => format!("{} → … → {}", names[0], names[n - 1]),
                 };
+                // alloc: the text said of the function, made when it is reported
                 format!("reaches {shown}, which {}", self.what)
             }
         }
@@ -77,6 +81,7 @@ pub fn is_const_pure(db: &Db, func: FunctionId) -> bool {
 #[salsa::tracked(returns(ref), cycle_result = const_purity_cycle_result)]
 pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
     let unknown =
+        // alloc: the impurity the query keeps, only when there is one
         |what: String, span: MirSpan| Impure { what, through: Vec::new(), span, told: false };
     let signature = FunctionSignature::of(db, func);
     let krate = func.krate(db);
@@ -100,6 +105,7 @@ pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             let found = match &statement.kind {
+                // alloc: the impurity the query keeps
                 StatementKind::InlineAsm(_) => Some(("has assembly in it".to_owned(), false)),
                 StatementKind::Assign(place, rvalue) => {
                     assigned(db, krate, body, own, place, rvalue)
@@ -110,6 +116,7 @@ pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
                 Some((what, true)) => {
                     return Some(Impure {
                         what,
+                        // alloc: empty, no allocation
                         through: Vec::new(),
                         span: statement.span,
                         told: true,
@@ -122,9 +129,9 @@ pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
             }
         }
         let Some(terminator) = &block.terminator else { continue };
-        let (read, callee): (Vec<&Operand>, _) = match &terminator.kind {
-            TerminatorKind::Call { func, args, .. } => (args.iter().collect(), Some(func)),
-            TerminatorKind::SwitchInt { discr, .. } => (vec![discr], None),
+        let (read, callee): (&[Operand], _) = match &terminator.kind {
+            TerminatorKind::Call { func, args, .. } => (&args[..], Some(func)),
+            TerminatorKind::SwitchInt { discr, .. } => (std::slice::from_ref(discr), None),
             TerminatorKind::Drop { place, .. } | TerminatorKind::DropAndReplace { place, .. } => {
                 // What a `Drop` impl does is not looked into.
                 let glue = !place.projection.as_slice().is_empty() || {
@@ -144,14 +151,15 @@ pub fn const_purity<'db>(db: &'db Db, func: FunctionId) -> Option<Impure> {
                         unknown("drops a value with drop glue".to_owned(), terminator.span)
                     });
                 }
-                (Vec::new(), None)
+                (&[], None)
             }
-            _ => (Vec::new(), None),
+            _ => (&[], None),
         };
         for operand in read {
             if let Some(what) = state_read(db, krate, operand) {
                 return Some(Impure {
                     what,
+                    // alloc: empty, no allocation
                     through: Vec::new(),
                     span: terminator.span,
                     told: true,
@@ -178,7 +186,9 @@ fn const_purity_cycle_result(
     _func: FunctionId,
 ) -> Option<Impure> {
     Some(Impure {
+        // alloc: the impurity the query keeps
         what: "calls itself back".to_owned(),
+        // alloc: empty, no allocation
         through: Vec::new(),
         span: MirSpan::Unknown,
         told: false,
@@ -204,14 +214,17 @@ fn assigned(
         return None;
     }
     if let Rvalue::Cast(CastKind::PointerExposeAddress, ..) = rvalue {
+        // alloc: the impurity the query keeps
         return Some(("exposes a pointer address".to_owned(), true));
     }
+    // alloc: the impurity the query keeps, only when there is one
     raw_use_in(body, place, rvalue).map(|what| (what.to_owned(), false))
 }
 
 /// What a function called by `callee` does that is not pure, said with the way to it.
 fn called(db: &Db, krate: base_db::Crate, callee: &Operand) -> Option<Impure> {
     let unknown =
+        // alloc: the impurity the query keeps, only when there is one
         |what: String| Impure { what, through: Vec::new(), span: MirSpan::Unknown, told: false };
     let ty: Ty<'_> = match &callee.kind {
         OperandKind::Constant { ty, .. } => ty.as_ref(),
@@ -232,6 +245,7 @@ fn called(db: &Db, krate: base_db::Crate, callee: &Operand) -> Option<Impure> {
         ItemContainerId::TraitId(_) => match resolved(db, krate, func, args) {
             Some(it) => it,
             None => {
+                // alloc: error path
                 let name = FunctionSignature::of(db, func).name.as_str().to_owned();
                 // alloc: error path
                 return Some(unknown(format!("calls `{name}` of a trait, for a type not known")));
@@ -240,8 +254,13 @@ fn called(db: &Db, krate: base_db::Crate, callee: &Operand) -> Option<Impure> {
         _ => func,
     };
     let inner = const_purity(db, func).as_ref()?;
-    let mut through = vec![format!("`{}`", FunctionSignature::of(db, func).name.as_str())];
+    // alloc: the impurity the query keeps, with the way to it
+    let mut through = Vec::with_capacity(1 + inner.through.len());
+    // alloc: the impurity the query keeps, with the way to it
+    through.push(format!("`{}`", FunctionSignature::of(db, func).name.as_str()));
+    // clone: the callee's way, kept in this function's result
     through.extend(inner.through.iter().cloned());
+    // clone: the callee's text, kept in this function's result
     Some(Impure { what: inner.what.clone(), through, span: MirSpan::Unknown, told: inner.told })
 }
 
@@ -278,16 +297,20 @@ fn static_state(db: &Db, krate: base_db::Crate, id: StaticId) -> Option<String> 
     let signature = StaticSignature::of(db, id);
     if signature.flags.contains(StaticFlags::EXTERN) {
         let name =
+            // clone: an interned symbol
             AttrFlags::link_name(db, id.into()).unwrap_or_else(|| signature.name.symbol().clone());
         let name = name.as_str();
         return (!name.starts_with("__rust_"))
+            // alloc: the impurity the query keeps
             .then(|| format!("reads the foreign static `{name}`"));
     }
     let name = signature.name.as_str();
     if AttrFlags::query(db, id.into()).contains(AttrFlags::THREAD_LOCAL) {
+        // alloc: the impurity the query keeps
         return Some(format!("uses the thread-local `{name}`"));
     }
     if signature.flags.contains(StaticFlags::MUTABLE) {
+        // alloc: the impurity the query keeps
         return Some(format!("reads or writes mutable state: `{name}` is a `static mut`"));
     }
     let ty = db.type_for_static(id).skip_binder();
@@ -299,25 +322,27 @@ fn static_state(db: &Db, krate: base_db::Crate, id: StaticId) -> Option<String> 
     let shown = super::type_name::rustc_type_name(db, ty)
         .map(|it| {
             let (bare, rest) = it.split_at(it.find('<').unwrap_or(it.len()));
+            // alloc: the impurity the query keeps
             format!("{}{rest}", bare.rsplit("::").next().unwrap_or(bare))
         })
+        // alloc: the impurity the query keeps
         .unwrap_or_else(|| "_".to_owned());
+    // alloc: the impurity the query keeps
     Some(format!("reads or writes mutable state: `{name}` is `{shown}`, which is not `Freeze`"))
 }
 
-/// The operands an rvalue reads.
-pub fn operands(rvalue: &Rvalue) -> Vec<&Operand> {
-    match rvalue {
+/// The operands an rvalue reads, in order.
+pub fn operands(rvalue: &Rvalue) -> impl Iterator<Item = &Operand> {
+    let (one, two, many): (Option<&Operand>, Option<&Operand>, &[Operand]) = match rvalue {
         Rvalue::Use(it)
         | Rvalue::Repeat(it, _)
         | Rvalue::Cast(_, it, _)
-        | Rvalue::UnaryOp(_, it) => {
-            vec![it]
-        }
-        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => vec![a, b],
-        Rvalue::Aggregate(_, it) => it.iter().collect(),
-        _ => Vec::new(),
-    }
+        | Rvalue::UnaryOp(_, it) => (Some(it), None, &[]),
+        Rvalue::BinaryOp(_, a, b) | Rvalue::CheckedBinaryOp(_, a, b) => (Some(a), Some(b), &[]),
+        Rvalue::Aggregate(_, it) => (None, None, &it[..]),
+        _ => (None, None, &[]),
+    };
+    one.into_iter().chain(two).chain(many)
 }
 
 /// Whether an assignment goes through a raw pointer, which makes what it gives depend on more
@@ -336,7 +361,7 @@ fn raw_use_in(body: &MirBody<'_>, place: &StoredPlace, rvalue: &Rvalue) -> Optio
         | Rvalue::Len(it)
         | Rvalue::Discriminant(it)
         | Rvalue::CopyForDeref(it) => raw(it),
-        _ => operands(rvalue).into_iter().any(operand_raw),
+        _ => operands(rvalue).any(operand_raw),
     };
     (raw(place) || read).then_some("dereferences a raw pointer")
 }

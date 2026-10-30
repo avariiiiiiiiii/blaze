@@ -280,53 +280,7 @@ impl std::hash::Hasher for Le<'_> {
         self.0.extend_from_slice(bytes);
     }
 
-    fn write_u8(&mut self, i: u8) {
-        self.0.push(i);
-    }
-
-    fn write_u16(&mut self, i: u16) {
-        self.write(&i.to_le_bytes());
-    }
-
-    fn write_u32(&mut self, i: u32) {
-        self.write(&i.to_le_bytes());
-    }
-
-    fn write_u64(&mut self, i: u64) {
-        self.write(&i.to_le_bytes());
-    }
-
-    fn write_u128(&mut self, i: u128) {
-        self.write(&i.to_le_bytes());
-    }
-
-    fn write_usize(&mut self, i: usize) {
-        self.write_u64(i as u64);
-    }
-
-    fn write_i8(&mut self, i: i8) {
-        self.write_u8(i as u8);
-    }
-
-    fn write_i16(&mut self, i: i16) {
-        self.write_u16(i as u16);
-    }
-
-    fn write_i32(&mut self, i: i32) {
-        self.write_u32(i as u32);
-    }
-
-    fn write_i64(&mut self, i: i64) {
-        self.write_u64(i as u64);
-    }
-
-    fn write_i128(&mut self, i: i128) {
-        self.write_u128(i as u128);
-    }
-
-    fn write_isize(&mut self, i: isize) {
-        self.write_u64(i as u64);
-    }
+    blaze_ids::fixed_width_writes!();
 }
 
 struct Canon<'a> {
@@ -1400,22 +1354,18 @@ mod tests {
     /// SplitMix64. With `mutate`, that draw is moved by one: the same function but for one
     /// choice.
     struct Draws {
-        state: u64,
+        rng: blaze_ids::rng::SplitMix64,
         count: u32,
         mutate: Option<u32>,
     }
 
     impl Draws {
         fn new(seed: u64, mutate: Option<u32>) -> Draws {
-            Draws { state: seed, count: 0, mutate }
+            Draws { rng: blaze_ids::rng::SplitMix64::new(seed), count: 0, mutate }
         }
 
         fn below(&mut self, n: u32) -> u32 {
-            self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.state;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            let value = ((z ^ (z >> 31)) % u64::from(n)) as u32;
+            let value = self.rng.below(u64::from(n)) as u32;
             let at = self.count;
             self.count += 1;
             if self.mutate == Some(at) { (value + 1) % n } else { value }

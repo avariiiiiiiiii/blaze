@@ -92,15 +92,16 @@ pub fn shared() -> &'static Workers {
 /// A node whose work panics fails, and once the build is over the panic goes on on the calling
 /// thread, as from a thread of [`std::thread::scope`]: a panic that unwinds on purpose, as
 /// salsa's cancellation does, reaches whoever catches it.
-pub fn drive<W>(
+pub fn drive<W, S>(
     machine: &mut Machine,
     nodes: Vec<Spec>,
     work: &W,
-    said: &mut dyn FnMut(&Record),
+    said: &mut S,
     trace: Option<&mut Vec<Input>>,
 ) -> Result<bool, Error>
 where
     W: Fn(NodeId) -> Did + Sync,
+    S: FnMut(&Record),
 {
     let start = Instant::now();
     let now = || ns(start);
@@ -109,7 +110,9 @@ where
     let io = Lent::take(config.io, "IO");
     let (done_tx, done_rx) = unbounded::<(NodeId, Did, u64)>();
     // Taken only to keep a node's panic, once it has unwound.
+    // dyn: a panic's payload, as `catch_unwind` gives it
     let first_panic: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
+    // dyn: as above, once per node that panicked
     let failed = |panic: Box<dyn Any + Send>| {
         let did = Did::failed(panicked(&*panic));
         first_panic.lock().get_or_insert(panic);
@@ -139,15 +142,20 @@ where
     over
 }
 
-fn run(
+fn run<P, N, S>(
     machine: &mut Machine,
     nodes: Vec<Spec>,
-    post: &dyn Fn(NodeId, Pool),
+    post: &P,
     done_rx: &Receiver<(NodeId, Did, u64)>,
-    now: &dyn Fn() -> u64,
-    said: &mut dyn FnMut(&Record),
+    now: &N,
+    said: &mut S,
     mut trace: Option<&mut Vec<Input>>,
-) -> Result<bool, Error> {
+) -> Result<bool, Error>
+where
+    P: Fn(NodeId, Pool),
+    N: Fn() -> u64,
+    S: FnMut(&Record),
+{
     let mut feed = |input: Input| -> Result<Option<bool>, Error> {
         if let Some(trace) = trace.as_deref_mut() {
             trace.push(input.clone());
@@ -213,6 +221,7 @@ fn ns(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+// dyn: a panic's payload, read once per task that panicked
 fn panicked(panic: &(dyn Any + Send)) -> String {
     let what = panic
         .downcast_ref::<&str>()
@@ -222,8 +231,15 @@ fn panicked(panic: &(dyn Any + Send)) -> String {
     format!("panicked: {what}")
 }
 
-/// A task's work: what it came to, or [`Cancelled`] to be posted again whole.
-pub type Work = Arc<dyn Fn() -> Result<Did, Cancelled> + Send + Sync>;
+/// What runs a [`Scheduler`]'s tasks: the one database behind it. A task carries its
+/// [`Runner::Work`], data the runner reads (a query and its key), not code of its own, so a
+/// run is a static call and posting a task boxes nothing.
+pub trait Runner: Send + Sync + 'static {
+    /// A task's work, as the runner reads it.
+    type Work: Send + 'static;
+    /// Runs `work` on this thread: what it came to, or [`Cancelled`] to be posted again whole.
+    fn run(&self, work: &Self::Work) -> Result<Did, Cancelled>;
+}
 
 /// A node of a [`Scheduler`]'s request, with its work.
 ///
@@ -236,10 +252,10 @@ pub type Work = Arc<dyn Fn() -> Result<Did, Cancelled> + Send + Sync>;
 /// gives the scheduler their work first; a found node with no work fails the task that found
 /// it, saying so.
 #[derive(Clone)]
-pub struct Task {
+pub struct Task<W> {
     pub spec: Spec,
     pub kind: TaskKind,
-    pub work: Work,
+    pub work: W,
 }
 
 /// What a request's opener hears of it, in order.
@@ -257,10 +273,10 @@ pub struct Opened {
     pub heard: Receiver<Heard>,
 }
 
-enum Msg {
+enum Msg<W> {
     Open { request: RequestId, weight: u32, keep_going: bool, heard: Sender<Heard> },
-    Add { request: RequestId, tasks: Vec<Task> },
-    Found { request: RequestId, tasks: Vec<Task> },
+    Add { request: RequestId, tasks: Vec<Task<W>> },
+    Found { request: RequestId, tasks: Vec<Task<W>> },
     Close { request: RequestId },
     Cancel { request: RequestId },
     Done {
@@ -288,15 +304,16 @@ enum Msg {
 /// What every run of a scheduler reaches besides its slot. Leaked as the scheduler is made: a
 /// run's last act is its `Done`'s send through `tx`, which nothing can wait for the end of, so
 /// the sender (and the channel it keeps) must outlive every run.
-struct Ctx {
-    tx: Sender<Msg>,
+struct Ctx<R: Runner> {
+    tx: Sender<Msg<R::Work>>,
     /// The IO threads' queue; `None` stops one of them.
-    io: Sender<Option<Ran>>,
+    io: Sender<Option<Ran<R>>>,
     pool: &'static Workers,
     start: Instant,
     /// Every run's slot, which is its pool job: at an address that stays put while the run is
     /// under way, reused once its `Done` is in.
-    slots: blaze_mem::Pool<Run>,
+    slots: blaze_mem::Pool<Run<R>>,
+    runner: R,
 }
 
 /// What a task's run that ended held at most, and the time it ran (its own, not the tries
@@ -307,34 +324,36 @@ struct Measure {
     ran_ns: u64,
 }
 
-/// A run under way: the node, and the work it runs (a clone the owner made and drops).
-struct Live {
+/// A run under way: the node, and the work it runs, moved out of the owner's entry for it.
+struct Live<W> {
     id: NodeId,
     request: RequestId,
     kind: TaskKind,
     key: Option<Key>,
     /// On its request's critical path, as the plane said when it ran it.
     critical: bool,
-    work: Work,
+    work: W,
 }
 
 /// A run's slot in the scheduler's [`Ctx::slots`]: the pool's job itself (its header first),
 /// so posting a run allocates nothing and clones no `Arc` or sender. Filled by the owner, then
 /// read only by the thread that runs it until it sends its `Done`; then the owner's again.
 #[repr(C)]
-struct Run {
+struct Run<R: Runner> {
     header: Header,
-    ctx: &'static Ctx,
+    ctx: &'static Ctx<R>,
     /// Its handle in the owner's [`Table`], as bits: what its `Done` names.
     at: u64,
-    live: UnsafeCell<Option<Live>>,
+    live: UnsafeCell<Option<Live<R::Work>>>,
 }
 
 // SAFETY: `live` has one reader or writer at a time: the owner while it fills the slot, then
 // the thread holding its `Ran`, handed over by the pool's queue or the IO queue and back by
-// the `Done` message, each of which orders the writes before the reads. The other fields are
-// written only before the slot is first posted.
-unsafe impl Sync for Run {}
+// the `Done` message, each of which orders the writes before the reads; so its work moves
+// between threads and is never shared, which `Runner::Work: Send` allows. The other fields are
+// written only before the slot is first posted, but for the header's `next`, which the pool's
+// inject queue writes while the run is queued: an atomic, so shared writes are no race.
+unsafe impl<R: Runner> Sync for Run<R> {}
 
 /// The most runs under way at once. The plane runs no more tasks at once than its pools have
 /// threads, so this is far past what any machine reaches; past it a node fails, naming the
@@ -350,8 +369,8 @@ const RUNS: usize = blaze_mem::pool::BATCH;
 const MAILBOX: usize = 1 << 12;
 
 /// A run under way in the owner's [`Table`]: its slot, and what holding it back needs.
-struct Slot {
-    run: Pooled<'static, Run>,
+struct Slot<R: Runner> {
+    run: Pooled<'static, Run<R>>,
     tag: MemTag,
     pool: Pool,
     near: Option<u32>,
@@ -363,13 +382,13 @@ struct Slot {
 /// slots never move, so a slot's address is its job's for as long as it runs; only the owner
 /// thread takes and frees them, through its own cache, and a run that ends sends its handle
 /// back, nothing else. A warm take and free make no call to the global allocator.
-struct Table {
-    cache: Cache<'static, Run>,
+struct Table<R: Runner> {
+    cache: Cache<'static, Run<R>>,
     /// Dropped only with no run under way: a run under way still reads its slot.
-    live: ManuallyDrop<Slab<Slot>>,
+    live: ManuallyDrop<Slab<Slot<R>>>,
 }
 
-impl Drop for Table {
+impl<R: Runner> Drop for Table<R> {
     fn drop(&mut self) {
         // An owner unwinding with runs under way leaves their slots to them: the slots are the
         // scheduler's pool, which is never freed, and the handles naming them go with them.
@@ -380,8 +399,8 @@ impl Drop for Table {
     }
 }
 
-impl Table {
-    fn new(ctx: &'static Ctx) -> Result<Table, MemError> {
+impl<R: Runner> Table<R> {
+    fn new(ctx: &'static Ctx<R>) -> Result<Table<R>, MemError> {
         Ok(Table {
             cache: ctx.slots.cache(),
             live: ManuallyDrop::new(Slab::new(MAX_RUNS, MemTag::Plane)?),
@@ -396,13 +415,13 @@ impl Table {
     /// handle's bits.
     fn take(
         &mut self,
-        ctx: &'static Ctx,
-        live: Live,
+        ctx: &'static Ctx<R>,
+        live: Live<R::Work>,
         tag: MemTag,
         pool: Pool,
         near: Option<u32>,
     ) -> Result<u64, MemError> {
-        let header = Header::new(run_pooled);
+        let header = Header::new(run_pooled::<R>);
         let live = UnsafeCell::new(Some(live));
         let run = self.cache.try_alloc(Run { header, ctx, at: u64::MAX, live })?;
         let handle = self.live.try_insert(Slot { run, tag, pool, near })?;
@@ -413,12 +432,12 @@ impl Table {
 
     /// The one name of run `at`'s slot, to post it, and where it goes.
     /// Called once per run: two `Ran`s of one slot would both run it.
-    fn ran(&self, at: u64) -> (Ran, Pool, Option<u32>) {
+    fn ran(&self, at: u64) -> (Ran<R>, Pool, Option<u32>) {
         let slot = self.slot(at);
         (Ran(NonNull::from(&*slot.run)), slot.pool, slot.near)
     }
 
-    fn slot(&self, at: u64) -> &Slot {
+    fn slot(&self, at: u64) -> &Slot<R> {
         self.live.get(blaze_mem::Handle::from_bits(at)).unwrap_or_else(|| {
             panic!("run {at:#x} is not under way: a stale handle to the scheduler's run table")
         })
@@ -538,21 +557,22 @@ impl Throttle {
 
 /// The one name of a filled slot, held by the thread that runs it: made by [`Table::ran`] once
 /// per run, as the owner starts it, consumed by [`Ran::done`] or by posting it again.
-struct Ran(NonNull<Run>);
+struct Ran<R: Runner>(NonNull<Run<R>>);
 
 // SAFETY: a `Ran` moves to the thread that runs it with the pool's queue or the IO queue (both
-// order the owner's writes to the slot before the reads); what the slot holds is `Send`.
-unsafe impl Send for Ran {}
+// order the owner's writes to the slot before the reads); what the slot holds is `Send`
+// (`Runner::Work: Send`) and its context `Sync` (`Runner: Sync`).
+unsafe impl<R: Runner> Send for Ran<R> {}
 
-impl Ran {
-    fn run(&self) -> &Run {
+impl<R: Runner> Ran<R> {
+    fn run(&self) -> &Run<R> {
         // SAFETY: a slot is in the scheduler's pool, whose slots never move and which is never
         // freed (its context is leaked), and the owner recycles it only once this `Ran` is
         // consumed sending its `Done`.
         unsafe { self.0.as_ref() }
     }
 
-    fn live(&self) -> &Live {
+    fn live(&self) -> &Live<R::Work> {
         // SAFETY: while a `Ran` lives its slot is filled and nobody writes it (see `Run`).
         unsafe { &*self.run().live.get() }.as_ref().expect("a slot given to a run is filled")
     }
@@ -577,13 +597,18 @@ impl Ran {
 }
 
 /// Asks a [`Scheduler`] for requests from any thread, the work of its tasks included.
-#[derive(Clone)]
-pub struct Handle {
-    tx: Sender<Msg>,
+pub struct Handle<W> {
+    tx: Sender<Msg<W>>,
     next: Arc<AtomicU32>,
 }
 
-impl Handle {
+impl<W> Clone for Handle<W> {
+    fn clone(&self) -> Handle<W> {
+        Handle { tx: self.tx.clone(), next: Arc::clone(&self.next) }
+    }
+}
+
+impl<W> Handle<W> {
     /// A request of `weight` (its share of the threads against the others'); with
     /// `keep_going` false its first failure skips what of it has not started. Its records and
     /// its end come to [`Opened::heard`]; it is gone when the scheduler is.
@@ -597,14 +622,14 @@ impl Handle {
     /// Tasks of `request`, besides those it had; each one's spec takes the scheduler's
     /// [`Prediction`](crate::admission::Prediction) for its kind and key (its memory never
     /// under the predicted peak, its cost the predicted one when there is one).
-    pub fn add(&self, request: RequestId, tasks: Vec<Task>) {
+    pub fn add(&self, request: RequestId, tasks: Vec<Task<W>>) {
         _ = self.tx.send(Msg::Add { request, tasks });
     }
 
     /// Gives the scheduler the work of the nodes a running task of `request` found, called by
     /// that task's work on its own thread before it returns; what it gives back goes in the
     /// task's [`Did::added`]. A request closed takes new nodes only so.
-    pub fn found(&self, request: RequestId, tasks: Vec<Task>) -> Vec<Spec> {
+    pub fn found(&self, request: RequestId, tasks: Vec<Task<W>>) -> Vec<Spec> {
         let specs = tasks.iter().map(|it| it.spec.clone()).collect();
         _ = self.tx.send(Msg::Found { request, tasks });
         specs
@@ -647,14 +672,16 @@ impl Handle {
 /// again until it ends; what came of them is not taken), then stops the owner thread and the
 /// IO threads: so it is never dropped by one of its own tasks.
 ///
-/// A run is a slot of the owner's table, reused once its `Done` is in, and the slot itself is
-/// the pool's job: posting a task allocates nothing and clones no `Arc` or sender, and its end
-/// is one message to the owner.
+/// A run is a slot of the scheduler's blaze-mem pool, named by a generational handle in the
+/// owner's table and reused once its `Done` is in, and the slot itself is the pool's job:
+/// posting a task allocates nothing and clones no `Arc` or sender, and its end is one message
+/// to the owner. A run whose subsystem ([`admission::tag_of`]) is over its budget waits while
+/// another run of that subsystem is under way ([`Throttle`]).
 ///
 /// A task's work runs in its thread's task arena ([`arena::task`]: a pool worker's is on its
 /// NUMA node, in huge pages, and reset when the task ends) inside [`arena::measure`], and its
 /// `Done` gives the plane the peak it held and the group it ran on; after each `Done` the plane
-/// hears what the process holds ([`arena::held`]). The scheduler's [`Predict`] gives each task
+/// hears what blaze holds ([`arena::own`]). The scheduler's [`Predict`] gives each task
 /// added or found its cost and memory before the plane sees it, and learns the peak and own run
 /// time of each run that ends with a result (a run that gave way and one that panicked teach it
 /// nothing), under the task's kind and its spec's key. A task the plane says is on its request's
@@ -664,22 +691,33 @@ impl Handle {
 ///
 /// Every request is released as it opens: once it finishes, the plane gives its room (nodes,
 /// names, deps, its id) to the next, so a daemon's plane holds only the requests under way.
-pub struct Scheduler {
-    handle: Handle,
+///
+/// It is of one database ([`Runner`] and [`Memo`]) and one [`Predict`], each a type parameter
+/// of its constructor: the owner thread's loop and the runs are made once for the three, and
+/// every call to them is static. Holders name only the work, `Scheduler<W>`.
+pub struct Scheduler<W> {
+    handle: Handle<W>,
     owner: Option<JoinHandle<()>>,
     io: Vec<JoinHandle<()>>,
 }
 
-impl Scheduler {
-    /// A scheduler of the plane `config` says, on the process's [`shared`] pool. The plane
-    /// asks `memo`, the database's, whether a key is settled before it runs a node of it;
-    /// `predict` gives each task's cost and memory and learns from each run that ends.
-    pub fn new(
+impl<W: Send + 'static> Scheduler<W> {
+    /// A scheduler of the plane `config` says, on the process's [`shared`] pool. `runner`, the
+    /// database, runs each task's work; the plane asks `memo`, the database's, whether a key is
+    /// settled before it runs a node of it; `predict` gives each task's cost and memory and
+    /// learns from each run that ends.
+    pub fn new<R, P, M>(
         config: PlaneConfig,
-        predict: Box<dyn Predict>,
-        memo: Box<dyn Memo + Send>,
-    ) -> Result<Scheduler, Error> {
-        Scheduler::with_pool(config, predict, memo, shared())
+        runner: R,
+        predict: P,
+        memo: M,
+    ) -> Result<Scheduler<W>, Error>
+    where
+        R: Runner<Work = W>,
+        P: Predict + 'static,
+        M: Memo + Send + 'static,
+    {
+        Scheduler::with_pool(config, runner, predict, memo, shared())
     }
 
     /// A scheduler whose tasks run on `pool`.
@@ -687,20 +725,26 @@ impl Scheduler {
     /// # Panics
     ///
     /// When a thread cannot be started, as [`std::thread::spawn`].
-    pub fn with_pool(
+    pub fn with_pool<R, P, M>(
         config: PlaneConfig,
-        predict: Box<dyn Predict>,
-        memo: Box<dyn Memo + Send>,
+        runner: R,
+        predict: P,
+        memo: M,
         pool: &'static Workers,
-    ) -> Result<Scheduler, Error> {
+    ) -> Result<Scheduler<W>, Error>
+    where
+        R: Runner<Work = W>,
+        P: Predict + 'static,
+        M: Memo + Send + 'static,
+    {
         let io_threads = config.io;
         if let Some(budget) = &config.budget {
             admission::set_budgets(budget.bytes);
         }
         let plane = Plane::with_memo(config, memo)?;
-        let (tx, rx) = bounded::<Msg>(MAILBOX);
+        let (tx, rx) = bounded::<Msg<W>>(MAILBOX);
         // Each message is a run under way or the stop of one thread, so a send never waits.
-        let (io_tx, io_rx) = bounded::<Option<Ran>>(MAX_RUNS as usize + io_threads);
+        let (io_tx, io_rx) = bounded::<Option<Ran<R>>>(MAX_RUNS as usize + io_threads);
         let io = (0..io_threads)
             .map(|at| {
                 let io_rx = io_rx.clone();
@@ -717,12 +761,13 @@ impl Scheduler {
             .collect();
         let slots = blaze_mem::Pool::new(MAX_RUNS, MemTag::Plane)
             .unwrap_or_else(|why| panic!("the scheduler's run slots: {why}"));
-        let ctx: &'static Ctx = Box::leak(Box::new(Ctx {
+        let ctx: &'static Ctx<R> = Box::leak(Box::new(Ctx {
             tx: tx.clone(),
             io: io_tx,
             pool,
             start: Instant::now(),
             slots,
+            runner,
         }));
         let table =
             Table::new(ctx).unwrap_or_else(|why| panic!("the scheduler's run table: {why}"));
@@ -750,7 +795,7 @@ impl Scheduler {
         })
     }
 
-    pub fn handle(&self) -> Handle {
+    pub fn handle(&self) -> Handle<W> {
         self.handle.clone()
     }
 
@@ -758,7 +803,7 @@ impl Scheduler {
         self.handle.open(weight, keep_going)
     }
 
-    pub fn add(&self, request: RequestId, tasks: Vec<Task>) {
+    pub fn add(&self, request: RequestId, tasks: Vec<Task<W>>) {
         self.handle.add(request, tasks);
     }
 
@@ -775,7 +820,7 @@ impl Scheduler {
     }
 }
 
-impl Drop for Scheduler {
+impl<W> Drop for Scheduler<W> {
     fn drop(&mut self) {
         _ = self.handle.tx.send(Msg::Stop);
         if let Some(owner) = self.owner.take() {
@@ -787,34 +832,35 @@ impl Drop for Scheduler {
     }
 }
 
-struct Entry {
+struct Entry<W> {
     request: RequestId,
     kind: TaskKind,
     key: Option<Key>,
-    work: Work,
+    /// Moved to its run when the plane runs the node, which it does once.
+    work: Option<W>,
 }
 
 /// The owner thread's: the plane and everything only it changes.
-struct Owner {
-    plane: Plane,
-    predict: Box<dyn Predict>,
+struct Owner<R: Runner, P, M> {
+    plane: Plane<M>,
+    predict: P,
     heard: FxHashMap<RequestId, Sender<Heard>>,
     /// The work of each node added and not settled.
-    works: FxHashMap<NodeId, Entry>,
-    ctx: &'static Ctx,
-    table: Table,
+    works: FxHashMap<NodeId, Entry<R::Work>>,
+    ctx: &'static Ctx<R>,
+    table: Table<R>,
     throttle: Throttle,
     /// What the owner tells itself (a node it cannot run fails), taken after the message at
     /// hand: never through its own mailbox, which could be full.
-    later: VecDeque<Msg>,
+    later: VecDeque<Msg<R::Work>>,
     io_threads: usize,
 }
 
-impl Owner {
-    fn serve(mut self, rx: &Receiver<Msg>) {
+impl<R: Runner, P: Predict, M: Memo> Owner<R, P, M> {
+    fn serve(mut self, rx: &Receiver<Msg<R::Work>>) {
         /// Stops the IO threads as the owner ends, unwinding too.
-        struct StopIo(&'static Ctx, usize);
-        impl Drop for StopIo {
+        struct StopIo<R: Runner>(&'static Ctx<R>, usize);
+        impl<R: Runner> Drop for StopIo<R> {
             fn drop(&mut self) {
                 for _ in 0..self.1 {
                     _ = self.0.io.send(None);
@@ -853,7 +899,7 @@ impl Owner {
     }
 
     /// Takes one input; false once told to stop.
-    fn take(&mut self, msg: Msg) -> bool {
+    fn take(&mut self, msg: Msg<R::Work>) -> bool {
         let at_ns = ns(self.ctx.start);
         match msg {
             Msg::Open { request, weight, keep_going, heard } => {
@@ -875,7 +921,8 @@ impl Owner {
                     self.predict.predict(kind, spec.key).apply(&mut spec);
                     // A node added twice is refused by the plane: the first keeps its work.
                     if !self.works.contains_key(&spec.id) {
-                        self.works.insert(spec.id, Entry { request, kind, key: spec.key, work });
+                        let entry = Entry { request, kind, key: spec.key, work: Some(work) };
+                        self.works.insert(spec.id, entry);
                         new.push(spec.id);
                     }
                     nodes.push(spec);
@@ -890,7 +937,8 @@ impl Owner {
                 for Task { spec, kind, work } in tasks {
                     // Found again by a task posted again: the first keeps its work.
                     let key = spec.key;
-                    self.works.entry(spec.id).or_insert(Entry { request, kind, key, work });
+                    let entry = Entry { request, kind, key, work: Some(work) };
+                    self.works.entry(spec.id).or_insert(entry);
                 }
             }
             Msg::Close { request } => _ = self.step(request, PlaneInput::Close { at_ns, request }),
@@ -996,15 +1044,18 @@ impl Owner {
     }
 
     fn run(&mut self, id: NodeId, pool: Pool, near: Option<u32>, critical: bool) {
-        let Some(entry) = self.works.get(&id) else {
-            // The plane runs only nodes added here, each with its work: a node it runs with
-            // none fails, saying so.
+        let taken = self.works.get_mut(&id).and_then(|entry| {
+            let work = entry.work.take()?;
+            Some((entry.request, entry.kind, entry.key, work))
+        });
+        let Some((request, kind, key, work)) = taken else {
+            // The plane runs only nodes added here, each with its work, and each once: a node
+            // it runs with none (or with its work gone to its first run) fails, saying so.
             // alloc: a failure's message, once per failed node.
             let why = format!("node {id} was run with no work");
             self.fail(id, RequestId(u32::MAX), TaskKind(u32::MAX), why);
             return;
         };
-        let (request, kind, key, work) = (entry.request, entry.kind, entry.key, entry.work.clone());
         let live = Live { id, request, kind, key, critical, work };
         let tag = admission::tag_of(kind);
         let at = match self.table.take(self.ctx, live, tag, pool, near) {
@@ -1048,7 +1099,7 @@ impl Owner {
 }
 
 /// Runs `run` on the scheduler's pool near `near` (on a fast group when it is critical).
-fn post(ctx: &Ctx, near: Option<u32>, critical: bool, run: Ran) {
+fn post<R: Runner>(ctx: &Ctx<R>, near: Option<u32>, critical: bool, run: Ran<R>) {
     // SAFETY: the slot's header is its first field (`Run` is `repr(C)`) and runs `run_pooled`;
     // the slot stays in the scheduler's pool, unmoved, until its `Done` is taken, and `run`,
     // moved here, was its one name.
@@ -1062,10 +1113,10 @@ fn post(ctx: &Ctx, near: Option<u32>, critical: bool, run: Ran) {
 /// # Safety
 ///
 /// `header` is the header of a filled slot of a live [`Table`], given to the pool by [`post`].
-unsafe fn run_pooled(header: NonNull<Header>) {
-    let run = Ran(header.cast::<Run>());
+unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
+    let run = Ran(header.cast::<Run<R>>());
     let (ctx, critical) = (run.run().ctx, run.live().critical);
-    let result = catch_unwind(AssertUnwindSafe(|| measured(run.live())));
+    let result = catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live())));
     let group = pool::group();
     match result {
         Ok((Ok(did), measure)) => run.done(did, Some(measure), group),
@@ -1074,23 +1125,21 @@ unsafe fn run_pooled(header: NonNull<Header>) {
     }
 }
 
-/// `live`'s work in this thread's task arena, reset when it ends, the peak it held and the
-/// time it took.
-fn measured(live: &Live) -> (Result<Did, Cancelled>, Measure) {
+/// `live`'s work run by `runner` in this thread's task arena, reset when it ends, the peak it
+/// held and the time it took.
+fn measured<R: Runner>(runner: &R, live: &Live<R::Work>) -> (Result<Did, Cancelled>, Measure) {
     let start = Instant::now();
-    let (did, peak) = arena::measure(|| arena::task(|| (live.work)()));
+    let (did, peak) = arena::measure(|| arena::task(|| runner.run(&live.work)));
     (did, Measure { peak, ran_ns: ns(start) })
 }
 
 /// Runs an IO task on this thread; posted again, behind what is queued for the IO threads,
 /// while its work gives way.
-fn run_io(run: Ran) {
-    match catch_unwind(AssertUnwindSafe(|| measured(run.live()))) {
+fn run_io<R: Runner>(run: Ran<R>) {
+    let ctx = run.run().ctx;
+    match catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live()))) {
         Ok((Ok(did), measure)) => run.done(did, Some(measure), None),
-        Ok((Err(Cancelled), _)) => {
-            let ctx = run.run().ctx;
-            _ = ctx.io.send(Some(run));
-        }
+        Ok((Err(Cancelled), _)) => _ = ctx.io.send(Some(run)),
         Err(panic) => run.done(Did::failed(panicked(&*panic)), None, None),
     }
 }
@@ -1108,6 +1157,7 @@ mod tests {
         time::Duration,
     };
 
+    use blaze_ids::rng::SplitMix64;
     use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
     use crossbeam_channel::bounded;
     use rustc_hash::FxHashMap;
@@ -1115,8 +1165,8 @@ mod tests {
     use blaze_mem::Tag as MemTag;
 
     use super::{
-        Ctx, Did, Heard, Live, Opened, RUNS, RequestId, SPARE, Scheduler, Table, Task,
-        Throttle, Work, Workers, drive,
+        Ctx, Did, Heard, Live, Opened, RUNS, RequestId, Runner, SPARE, Scheduler, Table, Task,
+        Throttle, Workers, drive,
     };
     use crate::{
         Cancelled, Key,
@@ -1143,7 +1193,22 @@ mod tests {
         }
     }
 
-    fn task(id: u32, deps: &[u32], key: Option<u8>, work: Work) -> Task {
+    /// A test task's work: a closure of its own, which [`Closures`] calls.
+    // dyn: the tests' work, a different closure for each task they make
+    type Work = Arc<dyn Fn() -> Result<Did, Cancelled> + Send + Sync>;
+
+    /// The tests' runner: each task's work is the closure to call.
+    struct Closures;
+
+    impl Runner for Closures {
+        type Work = Work;
+
+        fn run(&self, work: &Work) -> Result<Did, Cancelled> {
+            work()
+        }
+    }
+
+    fn task(id: u32, deps: &[u32], key: Option<u8>, work: Work) -> Task<Work> {
         Task { spec: spec(id, deps, Pool::Work, key), kind: TaskKind(1), work }
     }
 
@@ -1151,19 +1216,19 @@ mod tests {
     /// does; the scheduler's memo reads it.
     type Db = Arc<Mutex<FxHashMap<Key, Outcome>>>;
 
-    fn scheduler(workers: usize) -> (Scheduler, Db) {
+    fn scheduler(workers: usize) -> (Scheduler<Work>, Db) {
         scheduler_on(&Topology::flat(workers)).0
     }
 
     /// A scheduler on a pool of `topology`'s shape, and the pool.
-    fn scheduler_on(topology: &Topology) -> ((Scheduler, Db), &'static Workers) {
-        scheduler_with(topology, Box::new(Estimates::default()))
+    fn scheduler_on(topology: &Topology) -> ((Scheduler<Work>, Db), &'static Workers) {
+        scheduler_with(topology, Estimates::default())
     }
 
     fn scheduler_with(
         topology: &Topology,
-        predict: Box<dyn Predict>,
-    ) -> ((Scheduler, Db), &'static Workers) {
+        predict: impl Predict + 'static,
+    ) -> ((Scheduler<Work>, Db), &'static Workers) {
         let pool: &'static Workers = Box::leak(Box::new(Workers::new(topology, false).unwrap()));
         let workers = pool.workers();
         let config = PlaneConfig { io: 1, work: workers, budget: None, starve_after: 4 };
@@ -1172,7 +1237,7 @@ mod tests {
             let db = db.clone();
             move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
         };
-        ((Scheduler::with_pool(config, predict, Box::new(memo), pool).unwrap(), db), pool)
+        ((Scheduler::with_pool(config, Closures, predict, memo, pool).unwrap(), db), pool)
     }
 
     /// What a [`Recorder`] was asked and told, in order.
@@ -1214,7 +1279,7 @@ mod tests {
             asked: asked.clone(),
             prediction: Prediction { cost: Some(5), peak: 1 << 10 },
         };
-        let ((scheduler, _), _) = scheduler_with(&Topology::flat(2), Box::new(recorder));
+        let ((scheduler, _), _) = scheduler_with(&Topology::flat(2), recorder);
         let opened = scheduler.open(1, false);
         let (request, handle) = (opened.request, scheduler.handle());
         let tries = Arc::new(AtomicU32::new(0));
@@ -1228,7 +1293,7 @@ mod tests {
             Ok(Did::built())
         });
         let finder: Work = Arc::new(move || {
-            let found = Task {
+            let found: Task<Work> = Task {
                 spec: spec(52, &[51], Pool::Work, Some(9)),
                 kind: TaskKind(3),
                 work: Arc::new(|| Ok(Did::built())),
@@ -1306,6 +1371,42 @@ mod tests {
         scheduler.add(opened.request, vec![io, task(72, &[71], None, work)]);
         scheduler.close(opened.request);
         assert!(finish(&opened).0);
+    }
+
+    /// A runner of plain data: each task's work is a number, moved to its run with no closure
+    /// or box, and the runner reads each once, on the pool and the IO threads both.
+    #[test]
+    fn a_runner_reads_each_tasks_work_as_data() {
+        struct Squares(Arc<Mutex<Vec<u32>>>);
+        impl Runner for Squares {
+            type Work = u32;
+
+            fn run(&self, work: &u32) -> Result<Did, Cancelled> {
+                self.0.lock().unwrap().push(*work);
+                Ok(Did::built())
+            }
+        }
+        let seen: Arc<Mutex<Vec<u32>>> = Arc::default();
+        let pool = Workers::new(&Topology::flat(2), false).unwrap();
+        let pool: &'static Workers = Box::leak(Box::new(pool));
+        let config = PlaneConfig { io: 1, work: 2, budget: None, starve_after: 4 };
+        let runner = Squares(seen.clone());
+        let memo = crate::plane::NoMemo;
+        let scheduler =
+            Scheduler::with_pool(config, runner, Estimates::default(), memo, pool).unwrap();
+        let opened = scheduler.open(1, false);
+        let tasks = (0..20u32)
+            .map(|id| {
+                let at = if id % 4 == 0 { Pool::Io } else { Pool::Work };
+                Task { spec: spec(200 + id, &[], at, None), kind: TaskKind(1), work: id * id }
+            })
+            .collect();
+        scheduler.add(opened.request, tasks);
+        scheduler.close(opened.request);
+        assert!(finish(&opened).0);
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..20u32).map(|id| id * id).collect::<Vec<_>>());
     }
 
     /// Everything the request said, up to its end, and whether it was ok.
@@ -1441,7 +1542,7 @@ mod tests {
         for round in 0..10u32 {
             let opened = scheduler.open(1, false);
             let first = 2000 + round * 101;
-            let mut tasks: Vec<Task> =
+            let mut tasks: Vec<Task<Work>> =
                 (0..100).map(|at| task(first + at, &[], None, built.clone())).collect();
             let io = spec(first + 100, &[], Pool::Io, None);
             tasks.push(Task { spec: io, kind: TaskKind(1), work: built.clone() });
@@ -1559,16 +1660,17 @@ mod tests {
     }
 
     /// A scheduler's context on a one-worker pool, for the run table alone.
-    fn ctx() -> &'static Ctx {
+    fn ctx() -> &'static Ctx<Closures> {
         let pool = Workers::new(&Topology::flat(1), false).unwrap();
         let pool: &'static Workers = Box::leak(Box::new(pool));
         let (tx, _) = bounded(1);
         let (io, _) = bounded(1);
         let slots = blaze_mem::Pool::new(super::MAX_RUNS, MemTag::Plane).unwrap();
-        Box::leak(Box::new(Ctx { tx, io, pool, start: std::time::Instant::now(), slots }))
+        let start = std::time::Instant::now();
+        Box::leak(Box::new(Ctx { tx, io, pool, start, slots, runner: Closures }))
     }
 
-    fn live(id: u32, work: &Work) -> Live {
+    fn live(id: u32, work: &Work) -> Live<Work> {
         Live {
             id: NodeId(id),
             request: RequestId(0),
@@ -1619,13 +1721,7 @@ mod tests {
     fn the_throttle_matches_a_queue_per_subsystem() {
         let tags = [MemTag::Infer, MemTag::Codegen, MemTag::Vfs, MemTag::Mir];
         for seed in 0..200u64 {
-            let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-            let mut rand = move |below: u64| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state % below
-            };
+            let mut rng = SplitMix64::new(seed);
             let mut throttle = Throttle::new().unwrap();
             let mut model = Model::default();
             let mut over = [false; MemTag::COUNT];
@@ -1634,13 +1730,13 @@ mod tests {
             let mut tag_of = [MemTag::Other; 400];
             let quiet = seed % 4 == 0;
             for run in 0..400u64 {
-                if !quiet && rand(8) == 0 {
-                    let tag = tags[rand(4) as usize];
+                if !quiet && rng.one_in(8) {
+                    let tag = tags[rng.index(4)];
                     over[tag.index()] = !over[tag.index()];
                 }
                 let is_over = |tag: MemTag| over[tag.index()];
-                if started.is_empty() || rand(3) > 0 {
-                    let tag = tags[rand(4) as usize];
+                if started.is_empty() || !rng.one_in(3) {
+                    let tag = tags[rng.index(4)];
                     tag_of[run as usize] = tag;
                     let now = throttle.admit(tag, run, is_over);
                     assert_eq!(now, model.admit(tag, run, is_over(tag)), "seed {seed} run {run}");
@@ -1648,7 +1744,7 @@ mod tests {
                         started.push(tag);
                     }
                 } else {
-                    let tag = started.swap_remove(rand(started.len() as u64) as usize);
+                    let tag = started.swap_remove(rng.index(started.len()));
                     throttle.ended(tag);
                     model.running[tag.index()] -= 1;
                     loop {

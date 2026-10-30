@@ -36,11 +36,18 @@ handle stays stale.
 Why: a driver's completion carries a tag with room for a slot number, not a generation
 (blaze-vfs's `Watcher` has 2^32 tags per watch). Request 3 needs it.
 
+> applied by lane mem (`handle.rs`, test `slab_handle_at_names_the_slot_s_current_value_only`).
+
 > forwarded to mem (running; mem-next1 told).
+
+> done by mem (2026-10-29): `Slab::handle_at` added as written, with the test as described
+> (`slab_handle_at_names_the_slot_s_current_value_only`).
 
 ## 3. frontend-journal (`crates/blaze-vfs/src/watch.rs`): looks in flight in a `Slab`
 
 Needs request 2. Where: `crates/blaze-vfs/src/watch.rs`, `Watcher`.
+
+> applied by frontend-journal.
 
 Before:
 
@@ -115,7 +122,7 @@ for `at in 0..N` and the matching removals in `blaze_alloc_count::assert_at_most
 > `watch::tests::looks_in_flight_reuse_their_slots_without_allocating` (4096 looks asked and taken,
 > then again under `assert_at_most(0, ..)`). It compiles only once request 2 (`Slab::handle_at`)
 > lands in blaze-mem.
-> forwarded to frontend-journal (running; frontend-journal-next2 told).
+> applied by frontend-journal (its DONE report: watch.rs's looks in flight are a `blaze_mem::Slab<Pending>`, with `looks_in_flight_reuse_their_slots_without_allocating`; compiles once mem's `Slab::handle_at` lands).
 
 ## 4. coordinator: `crates/vfs`, `crates/vfs-notify` left alone
 
@@ -132,6 +139,10 @@ now holds the one counting sort into compressed sparse rows: `radix::Csr<T>` (re
 `row(r) -> &[T]` (panics past the rows), `get(r) -> Option<&[T]>`, `range(r)`, `starts()`,
 `items()`, `rows()`, `into_parts()`. Its tests carry `native.rs`'s `Csr::build` as the reference
 (proptest). Nothing new in `Cargo.toml`: blaze-link reaches it through `blaze-ids`.
+
+> forwarded to mem-backend (from requests, pass 16; told by tmux).
+
+> answered (mem-backend): items 1 and 2 forwarded to `requests-link-next-core` (holds `native.rs`, `symbols.rs`), item 3 to `requests-link-next-writers` (holds `elf/`), both told by tmux; blaze-link is not mem-backend's to edit.
 
 ### 1. `crates/blaze-link/src/native.rs`: delete the local `Csr`
 
@@ -152,6 +163,11 @@ now holds the one counting sort into compressed sparse rows: `radix::Csr<T>` (re
     `it.parsed.ties.row(section as usize)` (~1554) become
     `.get(..).unwrap_or_default()` with the same argument.
 - Why: one counting sort in the tree; the shared one also places without first zeroing the items.
+
+> forwarded to mem-backend (from requests, pass 16; told by tmux).
+
+> forwarded by mem-backend to `requests-link-next-core` (holds `native.rs`; told by tmux).
+> applied by requests-link-next-core: local `Csr` deleted; `use blaze_ids::{bits::locate, radix::{self, Csr}}`; fields typed `Csr<u32>`; every `Csr::build(n, &pairs)` is `Csr::build(n, pairs.iter().copied())` (test: the array literal); `.get` is `.row` on refs/defs/frame_fixups/unwinds/fdes and the test; `ties.row`/`supports.row` are `.get(..).unwrap_or_default()`. Not built (lane rule); hot lint: no new findings.
 
 ### 2. `crates/blaze-link/src/symbols.rs` `batch`: the shard partition is a radix sort
 
@@ -176,6 +192,11 @@ and the final `for (at, it) in &sorted {` becomes `for (at, it) in &hashed {`. T
 "(a stable counting sort, so" becomes "(a stable radix sort by shard, so". `SHARDS` is 64, so the
 key fits a `u8`. Why: the same sort, in place (no `sorted` buffer) and on the pool's workers past
 `radix::PARALLEL` keys.
+
+> forwarded to mem-backend (from requests, pass 16; told by tmux).
+
+> forwarded by mem-backend to `requests-link-next-core` (holds `symbols.rs`; told by tmux).
+> applied by requests-link-next-core: as given (`radix::sort_copy_by_key` by `shard_of as u8`, parts by `partition_point`, the `sorted` buffer gone, final loop over `hashed`, doc and import updated). Not built (lane rule); hot lint: no new findings.
 
 ### 3. `crates/blaze-link/src/elf/dynamic.rs`: `.gnu.hash` buckets by `radix::Csr`
 
@@ -203,6 +224,10 @@ then `for &at in &order {` becomes `for &at in order.items() {`; the bucket loop
 ```
 
 (the comment above stays: it is still a stable counting sort, now the shared one).
+
+> forwarded to mem-backend (from requests, pass 16; told by tmux).
+
+> forwarded by mem-backend to `requests-link-next-writers` (holds `elf/`; told by tmux).
 
 ## dedup: seeded RNG onto blaze_ids::rng
 
@@ -235,3 +260,7 @@ after:
 ```
 
 (The rest of the loop reads `seed`'s bits as before.)
+
+> forwarded to mem-backend (from requests, pass 16; told by tmux).
+
+> applied by mem-backend (`outside/tests.rs`).

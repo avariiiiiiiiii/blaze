@@ -2,14 +2,13 @@
 //! ([`CompiledFunction`]): every relocation at a target of the build, and the function's own
 //! data by content, each object pointing only at the ones before it.
 
-use blaze_codegen::{
-    Arch, CompiledFunction, Data, InstanceKey, Line, Reloc, RelocKind, Target,
-};
+use blaze_codegen::{Arch, CompiledFunction, Data, InstanceKey, Line, RelocKind, Relocation, Relocs, Target};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
+use blaze_mem::Frame;
 use cranelift_codegen::{binemit, isa::TargetIsa};
 
-use super::places::{PERSONALITY, libcall_symbol};
+use super::places::{PERSONALITY, libcall_name};
 use crate::{
     ConstBlob, DataIdentity,
     fragment::{self, DataRequest, FuncRequest, RelocName, Requests},
@@ -74,10 +73,13 @@ where
 }
 
 /// The function `code` is, `requests` being what its relocations name and `spans` what its
-/// line rows do. Its bytes move into the result, uncopied.
+/// line rows do. Its bytes move into the result, uncopied; its tables are in `frame`, the
+/// unit's, and its lists of relocations and line rows go back to the thread.
 pub(crate) fn function(
+    frame: &Frame,
     key: InstanceKey,
     arch: Arch,
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     isa: &dyn TargetIsa,
     code: fragment::Code,
     requests: &Requests,
@@ -87,20 +89,23 @@ pub(crate) fn function(
 ) -> Result<CompiledFunction, String> {
     let word = word(arch)?;
     let mut own = OwnData { data: Vec::new(), word };
-    let named = code.relocs.iter().filter_map(|reloc| match reloc.name {
+    let names: Relocs<RelocName> = code
+        .relocs
+        .iter()
+        .map(|reloc| {
+            let kind = match reloc.elf_type {
+                Some(elf) => elf_kind(elf)?,
+                None => reloc_kind(reloc.kind)?,
+            };
+            Ok(Relocation { at: reloc.offset, kind, target: reloc.name, addend: reloc.addend })
+        })
+        .collect::<Result<_, String>>()?;
+    let named = names.targets().iter().filter_map(|name| match *name {
         RelocName::Data(index) => Some(index as usize),
         _ => None,
     });
-    let datas = own.requests(requests, resolve, named)?;
-    let mut relocs = Vec::with_capacity(code.relocs.len());
-    for reloc in code.relocs.iter() {
-        let kind = match reloc.elf_type {
-            Some(elf) => elf_kind(elf)?,
-            None => reloc_kind(reloc.kind)?,
-        };
-        let target = reloc_target(reloc.name, requests, &datas, resolve)?;
-        relocs.push(Reloc { at: reloc.offset, kind, target, addend: reloc.addend });
-    }
+    let datas = own.requests(frame, requests, resolve, named)?;
+    let relocs = names.try_map(|&name| reloc_target(name, requests, &datas, resolve))?;
     let unwind = match &code.unwind {
         Some(unwind) => {
             let personality = || resolve.symbol(PERSONALITY);
@@ -124,11 +129,14 @@ pub(crate) fn function(
     if !align.is_power_of_two() {
         return Err(format!("code aligned to {align}, not a power of two"));
     }
+    let fragment::Code { bytes, relocs: rows, lines: line_rows, .. } = code;
+    crate::spare::keep_relocs(rows);
+    crate::spare::keep_lines(line_rows);
     Ok(CompiledFunction {
         key,
         arch,
         align,
-        code: code.bytes,
+        code: bytes,
         relocs,
         data: own.data,
         inlined: Vec::new(),
@@ -142,14 +150,15 @@ pub(crate) fn function(
 /// A static's value: its own data, the target of each of its requests, and its blob's
 /// relocations at those.
 pub(crate) fn value(
+    frame: &Frame,
     arch: Arch,
     blob: &ConstBlob,
     requests: &Requests,
     resolve: &impl Resolver,
-) -> Result<(Vec<Data>, Vec<Reloc>), String> {
+) -> Result<(Vec<Data>, Relocs), String> {
     let mut own = OwnData { data: Vec::new(), word: word(arch)? };
     let named = blob.relocs.iter().map(|&(_, data, _)| data.as_u32() as usize);
-    let targets = own.requests(requests, resolve, named)?;
+    let targets = own.requests(frame, requests, resolve, named)?;
     let relocs = own.relocs(blob, requests.datas.len(), &targets, requests, resolve)?;
     Ok((own.data, relocs))
 }
@@ -178,13 +187,14 @@ impl OwnData {
 
     /// The target of each data request that `named` (the requests the code or value names)
     /// reaches, making the function's own as they come: what nothing reaches is none of it.
-    fn requests(
+    fn requests<'f>(
         &mut self,
+        frame: &'f Frame,
         requests: &Requests,
         resolve: &impl Resolver,
         named: impl Iterator<Item = usize>,
-    ) -> Result<Vec<Option<Target>>, String> {
-        let mut used = vec![false; requests.datas.len()];
+    ) -> Result<Vec<Option<Target>, &'f Frame>, String> {
+        let used: &mut [bool] = frame.alloc_slice_fill_with(requests.datas.len(), |_| false);
         for index in named {
             *used
                 .get_mut(index)
@@ -206,7 +216,9 @@ impl OwnData {
                 }
             }
         }
-        let mut targets: Vec<Option<Target>> = Vec::with_capacity(requests.datas.len());
+        // A `Vec`, never a frame slice: an `Extern`'s name has to be dropped.
+        let mut targets: Vec<Option<Target>, &Frame> =
+            Vec::with_capacity_in(requests.datas.len(), frame);
         for (index, request) in requests.datas.iter().enumerate() {
             if !used[index] {
                 targets.push(None);
@@ -249,7 +261,7 @@ impl OwnData {
         before: &[Option<Target>],
         requests: &Requests,
         resolve: &impl Resolver,
-    ) -> Result<Vec<Reloc>, String> {
+    ) -> Result<Relocs, String> {
         if !blob.type_ids.is_empty() {
             return Err("a constant with a `TypeId` the adapter did not fill".to_owned());
         }
@@ -259,27 +271,26 @@ impl OwnData {
             let Some(Some(target)) = before.get(at_data).filter(|_| at_data < index) else {
                 return Err(format!("data {index} points at data {at_data}, not one before it"));
             };
-            relocs.push(Reloc { at, kind: RelocKind::Abs64, target: target.clone(), addend });
+            relocs.push(Relocation { at, kind: RelocKind::Abs64, target: target.clone(), addend });
         }
         for &(at, func) in &blob.fn_relocs {
             let request = requests.funcs.get(func.as_u32() as usize).ok_or_else(|| {
                 format!("data {index} points at function {}, never requested", func.as_u32())
             })?;
             let target = resolve.func(func.as_u32(), request)?;
-            relocs.push(Reloc { at, kind: RelocKind::Abs64, target, addend: 0 });
+            relocs.push(Relocation { at, kind: RelocKind::Abs64, target, addend: 0 });
         }
-        blaze_ids::radix::sort_by_key(&mut relocs, |it| it.at);
-        Ok(relocs)
+        Ok(relocs.into())
     }
 
     /// The bytes of `text`, and the `&str` of them.
     fn text(&mut self, text: String) -> Target {
         let len = text.len() as u64;
-        let bytes = self.push(Data::new(1, text.into_bytes(), Vec::new()));
+        let bytes = self.push(Data::new(1, text.into_bytes(), Relocs::new()));
         let mut fat = vec![0; 2 * self.word];
         fat[self.word..].copy_from_slice(&len.to_le_bytes()[..self.word]);
-        let pointer = Reloc { at: 0, kind: RelocKind::Abs64, target: bytes, addend: 0 };
-        self.push(Data::new(self.word as u32, fat, vec![pointer]))
+        let pointer = Relocation { at: 0, kind: RelocKind::Abs64, target: bytes, addend: 0 };
+        self.push(Data::new(self.word as u32, fat, vec![pointer].into()))
     }
 
     /// A `core::panic::Location` of no file, as v1 makes it: `<blaze>`, line 0, column 0.
@@ -288,12 +299,12 @@ impl OwnData {
         let mut name = file.as_bytes().to_vec();
         // The name is followed by a NUL that its length leaves out.
         name.push(0);
-        let name = self.push(Data::new(1, name, Vec::new()));
+        let name = self.push(Data::new(1, name, Relocs::new()));
         let mut bytes = vec![0u8; 2 * self.word + 8];
         bytes[self.word..2 * self.word]
             .copy_from_slice(&(file.len() as u64).to_le_bytes()[..self.word]);
-        let pointer = Reloc { at: 0, kind: RelocKind::Abs64, target: name, addend: 0 };
-        self.push(Data::new(self.word as u32, bytes, vec![pointer]))
+        let pointer = Relocation { at: 0, kind: RelocKind::Abs64, target: name, addend: 0 };
+        self.push(Data::new(self.word as u32, bytes, vec![pointer].into()))
     }
 }
 
@@ -339,7 +350,7 @@ fn reloc_target(
         RelocName::User { namespace, .. } => {
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }
-        RelocName::LibCall(libcall) => resolve.symbol(&libcall_symbol(libcall)),
+        RelocName::LibCall(libcall) => resolve.symbol(libcall_name(libcall)?),
         RelocName::Known(symbol) => {
             Err(format!("a relocation at the linker's {symbol:?}, which v2 has no target for"))
         }

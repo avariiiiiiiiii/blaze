@@ -1,7 +1,7 @@
 //! The lints run over crates written out as rust-analyzer's fixtures write them, their
 //! diagnostics compared with what clippy writes of the same source.
 
-use ide_db::{RootDatabase, base_db::SourceDatabase as _};
+use base_db::{Db, FileId};
 use rustc_hash::FxHashMap;
 use test_fixture::WithFixture as _;
 
@@ -70,13 +70,15 @@ macro_rules! vec {
 /// The diagnostics clippy's lints have in the crate `main` of `fixture`, rustc's flags `flags`
 /// given, each as rustc writes it.
 pub(crate) fn lint(fixture: &str, flags: &str) -> String {
-    let db = RootDatabase::with_files(fixture);
+    lint_with(fixture, flags, Conf::default())
+}
+
+/// [`lint`] with the `clippy.toml` configuration `conf`.
+pub(crate) fn lint_with(fixture: &str, flags: &str, conf: Conf) -> String {
+    let db = Db::with_files(fixture);
     hir::attach_db(&db, || {
-        let krate = hir::Crate::all(&db)
-            .into_iter()
-            .find(|it| it.display_name(&db).is_some_and(|it| it.to_string() == "main"))
-            .expect("the fixture has a crate `main`");
-        let mut names: FxHashMap<ide_db::FileId, String> = FxHashMap::default();
+        let krate = main_crate(&db);
+        let mut names: FxHashMap<FileId, String> = FxHashMap::default();
         let mut texts = Vec::new();
         for krate in hir::Crate::all(&db) {
             for module in krate.modules(&db) {
@@ -92,11 +94,8 @@ pub(crate) fn lint(fixture: &str, flags: &str) -> String {
             }
         }
         let flags: Vec<String> = flags.split_whitespace().map(str::to_owned).collect();
-        let setup = Setup {
-            command_line: CommandLine::parse(&flags).expect("the flags read"),
-            conf: Conf::default(),
-        };
-        let name_of = |file: ide_db::FileId| names.get(&file).cloned();
+        let setup = Setup { command_line: CommandLine::parse(&flags).expect("the flags read"), conf };
+        let name_of = |file: FileId| names.get(&file).cloned();
         let found = check(&db, krate, &setup, &name_of);
         let mut sources = Sources::of(texts);
         found
@@ -104,6 +103,14 @@ pub(crate) fn lint(fixture: &str, flags: &str) -> String {
             .map(|it| emit::written(&it.diagnostic, &mut sources, Style::default()))
             .collect()
     })
+}
+
+/// The crate `main` of a fixture's database.
+pub(crate) fn main_crate(db: &Db) -> hir::Crate {
+    hir::Crate::all(db)
+        .into_iter()
+        .find(|it| it.display_name(db).is_some_and(|it| it.to_string() == "main"))
+        .expect("the fixture has a crate `main`")
 }
 
 #[test]

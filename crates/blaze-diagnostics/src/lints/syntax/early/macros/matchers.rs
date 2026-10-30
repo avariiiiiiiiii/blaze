@@ -31,7 +31,10 @@ use self::{
 };
 use crate::{
     cx::Cx,
-    lints::syntax::{Emitted, Pass, Tree, Walk, source_fact},
+    lints::{
+        registry::{LintId, LintSet},
+        syntax::{Emitted, Pass, Tree, Walk, source_fact},
+    },
     lower::Phase,
     model::{Applicability, Diag},
 };
@@ -45,8 +48,17 @@ pub(super) fn crate_at(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Option<InFile<Syntax
         .map(|it| it.ptr(&it.root))
 }
 
+const META_VARIABLE_MISUSE: LintId = LintId::named("meta_variable_misuse");
+const INCOMPATIBLE_OR_PATTERNS: LintId = LintId::named("rust_2021_incompatible_or_patterns");
+const EXPR_FRAGMENT_SPECIFIER: LintId = LintId::named("edition_2024_expr_fragment_specifier");
+
+/// The lints of this module, each allowed by default.
+const LINTS: LintSet = LintSet::of(&[META_VARIABLE_MISUSE, INCOMPATIBLE_OR_PATTERNS, EXPR_FRAGMENT_SPECIFIER]);
+
 /// The lints of the macro definition `node` (a `MACRO_RULES` or `MACRO_DEF` of `tree`), as the
-/// early pass's one walk (`super::super::lints`) comes to it; `krate` is [`crate_at`].
+/// early pass's one walk (`super::super::lints`) comes to it; `krate` is [`crate_at`]. A
+/// definition is not read unless one of its lints may fire, and each check runs only when
+/// its own lint may.
 pub(super) fn definition(
     cx: &Cx<'_, '_>,
     krate: Option<InFile<SyntaxNodePtr>>,
@@ -54,6 +66,14 @@ pub(super) fn definition(
     node: &SyntaxNode,
     out: &mut Vec<Emitted>,
 ) {
+    if !cx.any_may_fire(&LINTS) {
+        return;
+    }
+    let (misuse, or_patterns, exprs) = (
+        cx.lint_may_fire(META_VARIABLE_MISUSE),
+        cx.lint_may_fire(INCOMPATIBLE_OR_PATTERNS),
+        cx.lint_may_fire(EXPR_FRAGMENT_SPECIFIER),
+    );
     let Some(def) = ast::Macro::cast(node.clone()) else { return };
     let at = tree.ptr(node);
     let map = tree.file.macro_file().map(|call| call.expansion_span_map(cx.db));
@@ -73,10 +93,12 @@ pub(super) fn definition(
     let mut checker = Checker::new(&m, &tokens);
     let mut found = Vec::new();
     for rule in &rules {
-        for lhs in rule.args.into_iter().chain(rule.lhs) {
-            follow::check_lhs(&m, &tokens, lhs, &mut found);
+        if or_patterns {
+            for lhs in rule.args.into_iter().chain(rule.lhs) {
+                follow::check_lhs(&m, &tokens, lhs, &mut found);
+            }
         }
-        if let (Some(lhs), Some(rhs)) = (rule.lhs, rule.rhs) {
+        if misuse && let (Some(lhs), Some(rhs)) = (rule.lhs, rule.rhs) {
             checker.rule(rule.args, lhs, rhs);
         }
     }
@@ -103,7 +125,7 @@ pub(super) fn definition(
             out.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, krate));
         }
     }
-    for range in expr_2024::exprs(&tokens) {
+    for range in exprs.then(|| expr_2024::exprs(&tokens)).into_iter().flatten() {
         let span = cx.span(InFile::new(tree.file, range));
         let mut diag = Diag::lint(
             "edition_2024_expr_fragment_specifier",

@@ -324,7 +324,8 @@ impl Writer for Wasm {
         // alloc: error path
         let module = module::write(self, placed).map_err(|e| error(format!("wasm: {e}")))?;
         // alloc: once per link, the one part of the `File` (the module, written whole)
-        Ok(File { len: module.len() as u64, parts: vec![(0, module)] })
+        // alloc: none for `debug`: an empty `Vec` holds no buffer
+        Ok(File { len: module.len() as u64, parts: vec![(0, module)], debug: Vec::new() })
     }
 }
 

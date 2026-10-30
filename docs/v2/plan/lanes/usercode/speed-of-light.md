@@ -292,10 +292,52 @@ then a fork per test.
   is sans-IO, driven from one thread, with no lock and nothing shared. About 0.5 µs a test with
   its 8 allocations, **under 1% of the fork**.
 - **What is left:** the 8 allocations, each owned by the result past the queue, go to 0 with a
-  run's results in its request arena (`v2/requests/usercode-fast-tests.md`, 13). One server forks
-  serially, so a binary starts at most about `1 / 55 µs` = 18,000 tests a second, which caps
-  short tests on many cores. `K` replicas of the server are asked for in the same file (7). Both
-  need cargo.
+  run's results in its request arena (`v2/requests/usercode-fast-tests.md`, 13), which needs
+  cargo. The fork wall of one server is removed by replicas (next section).
+
+### Replicas of a fork server
+
+- **The wall:** one server forks one test at a time, `F + s` each: its fork `F` (about 50 µs)
+  and its other calls `s` (about 5 µs, the server's 10 calls above). So a binary starts at most
+  `1 / (F + s)`, about 18,000 tests a second. A core holds a test for about `F + T + E` (the
+  fork, the test, its exit and reap `E`, about 10 µs), so `C` cores ask for `C / (F + T + E)`
+  tests a second. The fork is the wall whenever `T < C × (F + s) - F - E`: on 16 cores any test
+  under 820 µs, on 64 cores any test under 3.5 ms, the common case for unit tests.
+- **The removal:** `K` replicas per binary. `K` servers start `K / (F + s)` tests a second,
+  enough once `K ≥ C × (F + s) / (F + T + E)`. The queue takes
+  \(K = \lceil C \times F / (F + T) \rceil\), at least 1, at most `C` and the binary's test
+  count, with `F` the server's own measure and `T` the median of the binary's expected test
+  times (zero for a test never run, so a new binary gets `C`). Against the exact need the two
+  terms it leaves out cancel to within 10% either way: at `T = 0` it asks `F / F = 1` against
+  `(F + s) / (F + E)` = 0.92, and as `T` grows past `F` it asks `F / (F + T)` against at most
+  `(F + s) / (F + T)`, at most `s / F` = 10% under before rounding up. A fork measured as 0 gives
+  1. Examples: 16 cores, `F` = 50 µs, `T` = 100 µs gives 6; `T` = 1 ms gives 1; 64 cores and
+  `T` = 0 gives 64.
+- **Measuring `F`:** the server forks a child that leaves at once, three times before its hello,
+  and sends the least (`Frame::Hello`'s `fork`). That costs `3 × (F + E)`, about 180 µs once per
+  binary, and measures the fork at the server's real size (its page tables), on the machine it
+  runs on. A fixed `F` would be wrong by the size of the binary.
+- **Making the replicas:** blaze's first frame to the first server is `Frame::Replicate { count:
+  K - 1 }`. Each process forks a copy and gives it half of what is left, so `K - 1` copies come
+  in \(\lceil \log_2 K \rceil\) rounds: 6 forks deep (300 µs) for `K = 64`, where one after another
+  would be 63 forks (3.2 ms), more than a binary's start. Each copy is a fork of a server that
+  ran no test, so it has the statics, the slot count and an empty pool of regions; it gets a
+  kqueue of its own on macOS (a fork inherits none), connects anew on the same socket and says
+  its own hello. Memory: page tables (40 KB for a 20 MB server) and the pages it writes.
+- **Handing tests out:** each live replica takes at most `room = ceil(C / live)` tests at once,
+  so the live replicas together always have room for every free core and a ready test never
+  waits for one. The replicas with room are a bitset (`blaze_ids::bits`); a pick is its first
+  set bit (one word for `K ≤ 64`) and an end sets the bit again: O(1), no allocation, so the
+  queue's 0.5 µs and 8 allocations a test are unchanged (`the_steady_state_reuses_its_slabs`
+  runs at one server and at four replicas). Tests still go in the one longest-first order.
+- **A replica that dies:** its connection ends, so the tests it ran are lost with which replica
+  (its pid) and why. The rest carry on, with `room` recomputed for the replicas left, and only
+  when none is left is the server killed. The first server is the process blaze started and
+  waits for, so its own end still ends every replica's tests, as one server's end did; it runs
+  no test itself, so that takes a fault in the server. A late hello takes its share from the
+  next free core.
+- **Where it is:** a binary starts up to `K / (F + s)` tests a second. At `K = C` and `T = 0`
+  that is `C` times one server, the cores' own bound for empty tests.
 
 **State of the art:** Android's zygote and AFL++'s fork server for the per-test start; nextest
 for process-per-test isolation, which this keeps at about a tenth of its cost; timing wheels
@@ -493,6 +535,58 @@ the lock):
   binary, about as costly to start as the program, so a run's fixed cost is about **2 to 3 times
   the bound**.
 
+**The warm launcher** (usercode-win-launcher, 2026-10-29; written, not built or run, and the
+driver's side waits on lane core, below):
+- **One launcher per daemon:** `blaze sandbox --v2-serve` (`sandbox/windows/serve.rs`), started
+  by the driver outside the daemon, in no job of the driver's (Windows won't nest the run's job,
+  which has UI limits, under one the launcher is in), and outside any sandbox. It reads one frame
+  per run on its stdin: a fixed header (version, the driver's run number, and the handles of its
+  stdin, stdout, stderr and job, which the driver duplicated into the launcher) and the run's
+  `Spec`, as `confine::Launcher::hand` writes it and `confine::read_hand` reads it. It runs
+  `windows::run` on a thread of the run's own and writes back a 12-byte `Answer`, the run number
+  and the exit code.
+- **The driver keeps the job:** it makes each run's job (killed on close, a crash ending a
+  process, the memory limit) and its pipes as for a spawn it starts. So kill
+  (`TerminateJobObject`), peak memory and the output stay the driver's, and no kill frame is
+  needed. The launcher checks that the job it was handed kills on close (else it refuses the
+  run), adds the UI limits and starts the program into it with `PROC_THREAD_ATTRIBUTE_JOB_LIST`.
+- **Kept once per launcher:** the container SID and the two well-known SIDs (`Kept`, copied
+  once), the session lock's handle, and the read checks (`sandbox/windows/reads.rs`). A path found
+  covered is kept in a lock-free table until a `ReadDirectoryChangesW` watch on its volume's root
+  (subtree, `FILE_NOTIFY_CHANGE_SECURITY | FILE_NAME | DIR_NAME`) reports that path changed. A
+  removal or rename forgets everything under it. An overflow forgets the whole volume, and a watch
+  that ends leaves its volume checked every run, which is reported on stderr. Only paths whose
+  final path is the one asked are kept, so a link or junction is checked every run. A check
+  begun before a change is reported is not kept (each check takes a token before it reads the
+  DACL and publishes only if no change came in between).
+- **A launcher fault ends it:** a bad frame or a failed answer stops it, with its runs' jobs
+  ended and their grants taken back for up to 4 s. A panic aborts it at once, and the driver's
+  handles of the jobs end its runs. A write grant left behind names a run's own SID, which
+  nothing holds again. The driver fails every run in flight naming the launcher, and starts a
+  new one at the next run. A run never falls back to a launcher
+  per run or to running outside the sandbox.
+- **Per run, steady state, estimated:**
+  - In the launcher, about 70 system calls in place of 176:
+    - the 22 read checks cost none (a hash lookup each), in place of 110;
+    - `OUT_DIR`'s grant 10 and its revoke 25, as the bound;
+    - about 6 around `CreateProcessW`, plus 3 on the job (one query, the UI limits, the
+      emptiness check at the end);
+    - about 5 for the temporary directory (made with its grant, removed);
+    - about 6 for the frame's read, the thread and the answer;
+    - about 10 for the report and live files;
+    - 4 closes of the handed handles.
+  - In the driver, about 15: the job and its limits (3), the pipes as now, 4
+    `DuplicateHandle`s, the frame's write, the answer's read, and the job's peak.
+  - ACL calls: 2 DACL reads and 2 writes, `OUT_DIR`'s, which is the bound.
+  - One process creation, the program's.
+- **What separates it from the bound** is about 30 cheap calls (the temporary directory, the
+  report and live files, the frame and answer, the duplicates), about 50 to 150 µs against a
+  process creation of 1 to 3 ms. So a run's fixed cost is about **1.03 to 1.1 times the bound**,
+  in place of 2 to 3.
+  - A watch overflow (many changes on a volume at once, a checkout) makes the next run check
+    its 22 paths again, the 110 calls of before, once.
+  - A volume that can't be watched (some network shares) is checked every run.
+
 **The three known obstacles** (`v2/requests/usercode-sandbox.md` section 6):
 - **Item 3, write grants rewritten every run:** partly removed.
   - The temporary directory's grant and revoke are gone, and so is the grant of a writable
@@ -507,9 +601,12 @@ the lock):
     in this pass.
 - **Item 4, `CreateAppContainerProfile` every run:** removed. The lead applied it: the SID is
   derived when the profile's folder is there. The folder check is now one `GetFileAttributesW`.
-- **Item 5, two process creations a run:** blocked. The lead declined running the launcher
-  inside the daemon, because a launcher fault would end the daemon, the job objects and console
-  handler would be the daemon's, and `confine` would stop being one `Command`.
+- **Item 5, two process creations a run:** removed on the sandbox's side, by the warm launcher
+  above. The driver's side waits on lane core (`v2/requests/usercode-win-launcher.md`, 1 and 2),
+  and the daemon on Windows still needs to run the IOCP driver (3 there, cargo's). The lead
+  declined running the launcher inside the daemon, because a launcher fault would end the daemon,
+  the job objects and console handler would be the daemon's, and `confine` would stop being one
+  `Command`.
   - The removal is a warm launcher: one long-lived `blaze sandbox` process per daemon, outside
     it, that holds the jobs and the console handler, makes the SIDs and handles once, remembers
     read grants until a `ReadDirectoryChangesW` watch with `FILE_NOTIFY_CHANGE_SECURITY` says a
@@ -526,11 +623,12 @@ tool once, in a job. Both are the warm launcher's design. Per run, the code is n
 of a launcher-per-run design; the broker design is what reaches the bound.
 
 **What `proof` measures** (budget = bound × 1.1):
-- system calls per run (an ETW kernel trace) of the workload above: at most 194 now, and at most
-  about 20 around the `CreateProcessW` with the warm launcher;
+- system calls per run (an ETW kernel trace) of the workload above: at most 194 with a launcher
+  per run, and with the warm launcher at most 77 in the launcher and 17 in the driver, with no
+  DACL read for a read path checked by an earlier run;
 - wall time from the spawn to the program's exit for an empty program, against a bare
-  `CreateProcessW` of the same program in the same AppContainer and job: the ratio, now about 2
-  to 3, and at most 1.1 with the warm launcher.
+  `CreateProcessW` of the same program in the same AppContainer and job: the ratio, about 2 to 3
+  with a launcher per run, and at most 1.1 with the warm launcher.
 
 ## A proc-macro expansion: `blaze-expand`, `proc-macro-api/src/warm.rs`
 

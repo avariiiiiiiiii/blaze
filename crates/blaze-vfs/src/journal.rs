@@ -34,7 +34,8 @@
 //!   node of the file's base was dropped since the file was last rewritten (`settled`).
 
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
-use blaze_ids::{ContentId, Hasher};
+use blaze_format::cursor::{Put as _, Reader};
+use blaze_ids::{ContentId, Hasher, bits::BitSet};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -85,48 +86,24 @@ enum Flight {
 
 /// By node, one bit: whether a record of it is in the file (or the image it starts from), or
 /// will be before any record made now.
-#[derive(Clone, Default)]
-struct Written(Vec<u64>);
+type Written = BitSet<NodeId>;
 
-impl Written {
-    fn new(len: usize, all: bool) -> Written {
-        let mut words = vec![if all { u64::MAX } else { 0 }; len.div_ceil(64)];
-        if all && len % 64 != 0 {
-            *words.last_mut().expect("a partial word") = (1 << (len % 64)) - 1;
-        }
-        Written(words)
-    }
-
-    fn get(&self, node: NodeId) -> bool {
-        let at = node.0 as usize;
-        self.0.get(at / 64).is_some_and(|word| word >> (at % 64) & 1 != 0)
-    }
-
-    fn set(&mut self, node: NodeId) {
-        let at = node.0 as usize;
-        self.0[at / 64] |= 1 << (at % 64);
-    }
-
-    /// Room for `len` nodes; the new ones are not written.
-    fn grow(&mut self, len: usize) {
-        self.0.resize(len.div_ceil(64), 0);
-    }
-
-    /// The same bits by each node's number after a collection, and whether a node with its
-    /// bit set was dropped.
-    fn renumbered(&self, renumbered: &[Option<NodeId>], len: usize) -> (Written, bool) {
-        let mut out = Written::new(len, false);
-        let mut dropped = false;
-        for (old, new) in renumbered.iter().enumerate() {
-            if self.get(NodeId(old as u32)) {
-                match new {
-                    Some(new) => out.set(*new),
-                    None => dropped = true,
+/// The same bits by each node's number after a collection, and whether a node with its bit
+/// set was dropped.
+fn renumbered(written: &Written, renumbered: &[Option<NodeId>], len: usize) -> (Written, bool) {
+    let mut out = Written::new(len);
+    let mut dropped = false;
+    for (old, new) in renumbered.iter().enumerate() {
+        if written.contains(NodeId(old as u32)) {
+            match new {
+                Some(new) => {
+                    out.insert(*new);
                 }
+                None => dropped = true,
             }
         }
-        (out, dropped)
     }
+    (out, dropped)
 }
 
 /// An image of the tree the file starts from, or will: its name, its node count, and which
@@ -211,7 +188,7 @@ impl Journal {
         let mut sequence = 0;
         let (mut tree, from) = match image {
             Some(FromImage { tree, name, nodes, resumed }) => {
-                let of = Written::new(tree.table().base_len() as usize, true);
+                let of = Written::filled(tree.table().base_len() as usize);
                 (tree, Some((FileBase { name, nodes, of }, resumed)))
             }
             None => (Tree::new(), None),
@@ -235,7 +212,7 @@ impl Journal {
         let mut journal = Journal {
             file,
             tags,
-            written: Written::new(tree.len(), true),
+            written: Written::filled(tree.len()),
             sequence,
             heads: FxHashMap::default(),
             open: Batch::default(),
@@ -338,7 +315,7 @@ impl Journal {
     /// [`Journal::can_stage`].
     pub(crate) fn stage(&mut self, name: ContentId, nodes: u64) {
         assert!(self.can_stage(), "an image staged while the journal's base is changing");
-        self.staged = Some(FileBase { name, nodes, of: Written::new(nodes as usize, true) });
+        self.staged = Some(FileBase { name, nodes, of: Written::filled(nodes as usize) });
     }
 
     /// The image named `name` is durable: the next flush rewrites the file to start from it.
@@ -373,15 +350,15 @@ impl Journal {
             self.written = match target.as_ref().or(self.base.as_ref()) {
                 Some(base) => {
                     frame(&mut bytes, BASE, |out| {
-                        out.extend_from_slice(&base.name.0);
-                        out.extend_from_slice(&base.nodes.to_le_bytes());
+                        out.put_bytes(&base.name.0);
+                        out.put_u64(base.nodes);
                     });
                     // clone: one bit per node, once per rewrite.
                     let mut written = base.of.clone();
                     written.grow(tree.len());
                     written
                 }
-                None => Written::new(tree.len(), false),
+                None => Written::new(tree.len()),
             };
             self.rewrite_settles = true;
             self.switching = target;
@@ -394,7 +371,7 @@ impl Journal {
                 let sequence = self.heads[&***name];
                 head_record(&mut bytes, sequence, Some(&tree.id(heads[*name])), name);
             }
-            frame(&mut bytes, SEQUENCE, |out| out.extend_from_slice(&self.sequence.to_le_bytes()));
+            frame(&mut bytes, SEQUENCE, |out| out.put_u64(self.sequence));
             // What was recorded and not appended is in the rewrite: the heads as they are now.
             let tickets = std::mem::take(&mut self.open).tickets;
             effects.push(Effect::Write { file: self.file.clone(), bytes, tag: self.tag(REWRITE) });
@@ -484,15 +461,15 @@ impl Journal {
     /// file naming a node the tree no longer has, so no image is written until it is
     /// rewritten.
     pub(crate) fn collected(&mut self, renumbered: &[Option<NodeId>], len: usize) {
-        self.written = self.written.renumbered(renumbered, len).0;
+        self.written = self::renumbered(&self.written, renumbered, len).0;
         let mut lost = false;
         for base in [&mut self.base, &mut self.switching].into_iter().flatten() {
-            let (of, dropped) = base.of.renumbered(renumbered, len);
+            let (of, dropped) = self::renumbered(&base.of, renumbered, len);
             base.of = of;
             lost |= dropped;
         }
         for image in [&mut self.staged, &mut self.next].into_iter().flatten() {
-            image.of = image.of.renumbered(renumbered, len).0;
+            image.of = self::renumbered(&image.of, renumbered, len).0;
         }
         if lost {
             self.settled = false;
@@ -514,7 +491,7 @@ fn next(sequence: u64) -> u64 {
 fn write_node(tree: &Tree, written: &mut Written, out: &mut Vec<u8>, node: NodeId) {
     let mut stack = vec![(node, false)];
     while let Some((node, children_done)) = stack.pop() {
-        if written.get(node) {
+        if written.contains(node) {
             continue;
         }
         // A file of the image is in the base the file starts from, so its bit is set: no
@@ -528,32 +505,30 @@ fn write_node(tree: &Tree, written: &mut Written, out: &mut Vec<u8>, node: NodeI
         } else if !children_done {
             stack.push((node, true));
             let entries = tree.entries(node).expect("a directory");
-            stack.extend(entries.iter().filter(|it| !written.get(it.1)).map(|it| (it.1, false)));
+            stack.extend(entries.iter().filter(|it| !written.contains(it.1)).map(|it| (it.1, false)));
             continue;
         } else {
             let entries = tree.entries(node).expect("a directory");
             frame(out, DIR, |out| {
                 for (name, child, mode) in entries.iter() {
-                    let name = tree.name_str(name);
-                    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                    out.extend_from_slice(name.as_bytes());
-                    out.extend_from_slice(&tree.code(child, mode).to_le_bytes());
-                    out.extend_from_slice(&tree.id(child).0);
+                    out.put_bytes_u32(tree.name_str(name).as_bytes());
+                    out.put_u32(tree.code(child, mode));
+                    out.put_bytes(&tree.id(child).0);
                 }
             });
         }
-        written.set(node);
+        written.insert(node);
     }
 }
 
 fn head_record(out: &mut Vec<u8>, sequence: u64, root: Option<&ContentId>, head: &str) {
     let kind = if root.is_some() { HEAD } else { REMOVE };
     frame(out, kind, |out| {
-        out.extend_from_slice(&sequence.to_le_bytes());
+        out.put_u64(sequence);
         if let Some(root) = root {
-            out.extend_from_slice(&root.0);
+            out.put_bytes(&root.0);
         }
-        out.extend_from_slice(head.as_bytes());
+        out.put_bytes(head.as_bytes());
     });
 }
 
@@ -565,14 +540,14 @@ fn checksum(kind: u8, payload: &[u8]) -> [u8; CHECKSUM] {
 /// Appends one record whose payload `payload` writes, in place: the length is filled in after.
 fn frame(out: &mut Vec<u8>, kind: u8, payload: impl FnOnce(&mut Vec<u8>)) {
     let start = out.len();
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&[0; 4]);
-    out.push(kind);
+    out.put_bytes(&MAGIC);
+    out.put_u32(0);
+    out.put_u8(kind);
     payload(out);
     let len = u32::try_from(out.len() - start - HEADER).expect("a record under 4 GiB");
-    out[start + MAGIC.len()..start + MAGIC.len() + 4].copy_from_slice(&len.to_le_bytes());
+    out.patch_u32(start + MAGIC.len(), len);
     let sum = checksum(kind, &out[start + HEADER..]);
-    out.extend_from_slice(&sum);
+    out.put_bytes(&sum);
 }
 
 /// One record of `kind` holding `payload`, framed with a good checksum: for tests that forge one.
@@ -596,22 +571,23 @@ pub(crate) fn base_of(bytes: &[u8]) -> Option<(ContentId, u64)> {
     if kind != BASE || payload.len() != BASE_PAYLOAD {
         return None;
     }
-    let name = ContentId(payload[..32].try_into().expect("32 bytes"));
-    Some((name, u64::from_le_bytes(payload[32..].try_into().expect("8 bytes"))))
+    let mut read = Reader::new(payload);
+    let name = ContentId(*read.array().ok()?);
+    Some((name, read.u64().ok()?))
 }
 
 /// The record at the start of `bytes`, its payload and its whole length, if it is a whole record
 /// with a good checksum.
 fn record(bytes: &[u8]) -> Option<(u8, &[u8], usize)> {
-    if bytes.len() < HEADER + CHECKSUM || bytes[..4] != MAGIC {
+    let mut read = Reader::new(bytes);
+    if *read.array::<4>().ok()? != MAGIC {
         return None;
     }
-    let len = u32::from_le_bytes(bytes[4..8].try_into().ok()?) as usize;
-    let kind = bytes[8];
-    let end = HEADER.checked_add(len)?;
-    let payload = bytes.get(HEADER..end)?;
-    let sum = bytes.get(end..end.checked_add(CHECKSUM)?)?;
-    (checksum(kind, payload) == *sum).then_some((kind, payload, end + CHECKSUM))
+    let len = read.u32().ok()? as usize;
+    let kind = read.u8().ok()?;
+    let payload = read.take(len).ok()?;
+    let sum = read.array::<CHECKSUM>().ok()?;
+    (checksum(kind, payload) == *sum).then_some((kind, payload, read.at()))
 }
 
 /// Loads one record; `None` when it names a node that is not there or is malformed (a
@@ -630,19 +606,17 @@ fn load(
         }
         DIR => {
             let mut entries = Vec::new();
-            let mut rest = payload;
+            let mut rest = Reader::new(payload);
             let mut last: Option<&str> = None;
-            while !rest.is_empty() {
-                let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
-                let name = std::str::from_utf8(rest.get(4..4 + len)?).ok()?;
+            while !rest.is_done() {
+                let name = rest.str_u32().ok()?;
                 // As the tree writes them: one component each, sorted by bytes, so distinct.
                 if parts(name).ok()?.len() != 1 || last.is_some_and(|it| it >= name) {
                     return None;
                 }
                 last = Some(name);
-                let code = u32::from_le_bytes(rest.get(4 + len..8 + len)?.try_into().ok()?);
-                let id = ContentId(rest.get(8 + len..8 + len + 32)?.try_into().ok()?);
-                rest = &rest[8 + len + 32..];
+                let code = rest.u32().ok()?;
+                let id = ContentId(*rest.array().ok()?);
                 let child = tree.node(&id)?;
                 // A directory is its node's kind; the code must say the same.
                 let mode = match code {
@@ -656,20 +630,23 @@ fn load(
             tree.dir(entries);
         }
         HEAD => {
-            let at = sequence_at(payload)?;
-            let root = ContentId(payload.get(8..40)?.try_into().ok()?);
-            let name = std::str::from_utf8(&payload[40..]).ok()?;
+            let mut read = Reader::new(payload);
+            let at = sequence_at(&mut read)?;
+            let root = ContentId(*read.array().ok()?);
+            let name = std::str::from_utf8(read.take_rest()).ok()?;
             moves.entry(name.into()).or_default().push((at, Some(root)));
             *sequence = (*sequence).max(at);
         }
         REMOVE => {
-            let at = sequence_at(payload)?;
-            let name = std::str::from_utf8(&payload[8..]).ok()?;
+            let mut read = Reader::new(payload);
+            let at = sequence_at(&mut read)?;
+            let name = std::str::from_utf8(read.take_rest()).ok()?;
             moves.entry(name.into()).or_default().push((at, None));
             *sequence = (*sequence).max(at);
         }
         SEQUENCE => {
-            let at = sequence_at(payload).filter(|_| payload.len() == 8)?;
+            let mut read = Reader::new(payload);
+            let at = sequence_at(&mut read).filter(|_| read.is_done())?;
             *sequence = (*sequence).max(at);
         }
         _ => return None,
@@ -678,7 +655,6 @@ fn load(
 }
 
 /// The sequence number a record's payload starts with, if it is below [`SEQUENCES`].
-fn sequence_at(payload: &[u8]) -> Option<u64> {
-    let at = u64::from_le_bytes(payload.get(..8)?.try_into().ok()?);
-    (at < SEQUENCES).then_some(at)
+fn sequence_at(read: &mut Reader<'_>) -> Option<u64> {
+    read.u64().ok().filter(|&at| at < SEQUENCES)
 }

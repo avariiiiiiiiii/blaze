@@ -70,6 +70,7 @@ use std::{
 
 use anyhow::{Context, bail, ensure};
 use blaze_core::fs::Mapped;
+use blaze_format::cursor::{Put, Reader};
 use blaze_ids::radix;
 use object::{
     Endianness, Object, ObjectSection, ObjectSymbol, ObjectSymbolTable, RelocationFlags,
@@ -1146,7 +1147,7 @@ impl Machine {
         Ok(match self {
             Machine::X86_64 => {
                 let mut code = vec![0xff, 0x25];
-                code.extend_from_slice(&relative(slot, stub + 6)?.to_le_bytes());
+                code.put_i32(relative(slot, stub + 6)?);
                 code
             }
             // `adrp x16, slot`, `ldr x16, [x16, slot's low bits]`, `br x16`.
@@ -1178,7 +1179,7 @@ impl Machine {
         match self {
             Machine::X86_64 => {
                 let mut jump = vec![0xe9];
-                jump.extend_from_slice(&relative(new, old + 5)?.to_le_bytes());
+                jump.put_i32(relative(new, old + 5)?);
                 Ok(jump)
             }
             Machine::Aarch64 => {
@@ -1634,12 +1635,11 @@ impl UnwindTable {
             table.len() >= Self::HEADER && table[..4] == Self::ENCODINGS,
             "an unwind table in encodings we don't write"
         );
-        let frames = (address + 4).wrapping_add_signed(i64::from(read_i32(&table[4..])));
-        let count = u32::from_le_bytes(table[8..12].try_into()?) as usize;
-        let entries = table
-            .get(Self::HEADER..Self::HEADER + count * Self::ENTRY)
-            .context("the unwind table ends early")?
-            .to_vec();
+        let mut read = Reader::new(&table[4..]);
+        let frames = (address + 4).wrapping_add_signed(i64::from(read.i32()?));
+        let count = read.count_u32(Self::ENTRY).context("the unwind table ends early")?;
+        // alloc: setup, once per executable read: the image keeps its table across splices
+        let entries = read.take(count * Self::ENTRY)?.to_vec();
         Ok(UnwindTable { segment, address, frames, entries })
     }
 
@@ -1652,19 +1652,19 @@ impl UnwindTable {
     fn moved(&self, address: u64, mut added: Vec<(u64, u64)>) -> anyhow::Result<Vec<u8>> {
         radix::sort_copy_by_key(&mut added, |&(code, frame)| radix::pack_64(code, frame));
         let mut table = Vec::with_capacity(self.len_with(added.len()));
-        table.extend_from_slice(&Self::ENCODINGS);
-        table.extend_from_slice(&relative(self.frames, address + 4)?.to_le_bytes());
+        table.put_bytes(&Self::ENCODINGS);
+        table.put_i32(relative(self.frames, address + 4)?);
         let count = self.entries.len() / Self::ENTRY + added.len();
-        table.extend_from_slice(&u32::try_from(count)?.to_le_bytes());
+        table.put_u32(u32::try_from(count)?);
         let shift = relative(self.address, address)?;
         for &field in self.entries.as_chunks().0 {
             let field =
                 i32::from_le_bytes(field).checked_add(shift).context("the program is too large")?;
-            table.extend_from_slice(&field.to_le_bytes());
+            table.put_i32(field);
         }
         for (code, frame) in added {
-            table.extend_from_slice(&relative(code, address)?.to_le_bytes());
-            table.extend_from_slice(&relative(frame, address)?.to_le_bytes());
+            table.put_i32(relative(code, address)?);
+            table.put_i32(relative(frame, address)?);
         }
         Ok(table)
     }
@@ -1784,47 +1784,32 @@ struct CommonEntry;
 impl CommonEntry {
     /// How the frames of the entry at `at` write where their code starts.
     fn pointer_encoding(section: &[u8], at: usize) -> anyhow::Result<u8> {
-        let mut rest = section.get(at + 8..).context("a frame of no common entry")?;
-        let mut byte = || -> anyhow::Result<u8> {
-            let (&first, others) = rest.split_first().context("a common entry that ends early")?;
-            rest = others;
-            Ok(first)
-        };
-        let version = byte()?;
+        const EARLY: &str = "a common entry that ends early";
+        let mut entry =
+            Reader::starting_at(section, at + 8).context("a frame of no common entry")?;
+        let version = entry.u8().context(EARLY)?;
         ensure!(version == 1 || version == 3, "a common entry of version {version}");
-        let mut augmentation = Vec::new();
-        loop {
-            match byte()? {
-                0 => break,
-                letter => augmentation.push(letter),
-            }
-        }
-        let mut leb = || -> anyhow::Result<()> {
-            while byte()? & 0x80 != 0 {}
-            Ok(())
-        };
+        let augmentation = entry.cstr().context(EARLY)?;
         // The alignment of code and of data, the register of the return address, and the
         // length of what the augmentation adds.
         for _ in 0..4 {
-            leb()?;
+            entry.skip_leb().context(EARLY)?;
         }
         ensure!(augmentation.first() == Some(&b'z'), "a common entry without augmentation");
         for letter in &augmentation[1..] {
             match letter {
-                b'R' => return byte(),
-                b'L' => _ = byte()?,
+                b'R' => return entry.u8().context(EARLY),
+                b'L' => _ = entry.u8().context(EARLY)?,
                 b'S' | b'B' => {}
                 // The personality routine: an encoding and then an address written in it.
                 b'P' => {
-                    let len = match byte()? & 0x0f {
+                    let len = match entry.u8().context(EARLY)? & 0x0f {
                         0x00 | 0x04 | 0x0c => 8,
                         0x03 | 0x0b => 4,
                         0x02 | 0x0a => 2,
                         other => bail!("a personality routine encoded as {other:#x}"),
                     };
-                    for _ in 0..len {
-                        byte()?;
-                    }
+                    entry.skip(len).context(EARLY)?;
                 }
                 other => bail!("a common entry augmented with {:?}", *other as char),
             }
@@ -2216,35 +2201,29 @@ impl<'a> Patch<'a> {
         address: u64,
         mut found: impl FnMut(u64, u64),
     ) -> anyhow::Result<()> {
-        let early = "an unwind table that ends early";
-        let u32_at = |at: usize| -> anyhow::Result<u32> {
-            let bytes = section.get(at..at + 4).context(early)?;
-            Ok(u32::from_le_bytes(bytes.try_into()?))
-        };
-        let mut at = 0;
-        while at < section.len() {
-            let len = u32_at(at)? as usize;
+        const EARLY: &str = "an unwind table that ends early";
+        let mut frames = Reader::new(section);
+        while !frames.is_done() {
+            let at = frames.at();
+            let len = frames.u32().context(EARLY)? as usize;
             if len == 0 {
                 break;
             }
             ensure!(len != u32::MAX as usize, "an unwind table in the 64-bit format");
+            let mut frame = Reader::new(frames.take(len).context(EARLY)?);
             // A frame says how far back its common entry is; a common entry says zero.
-            let back = u32_at(at + 4)? as usize;
+            let back = frame.u32().context(EARLY)? as usize;
             if back != 0 {
                 let common = (at + 4).checked_sub(back).context("a frame of no common entry")?;
                 let start = at + 8;
                 let begins = match CommonEntry::pointer_encoding(section, common)? {
-                    eh::ABSOLUTE => {
-                        let bytes = section.get(start..start + 8).context(early)?;
-                        u64::from_le_bytes(bytes.try_into()?)
-                    }
+                    eh::ABSOLUTE => frame.u64().context(EARLY)?,
                     encoding if encoding == eh::RELATIVE | eh::SIGNED_4 => (address + start as u64)
-                        .wrapping_add_signed(i64::from(u32_at(start)? as i32)),
+                        .wrapping_add_signed(i64::from(frame.i32().context(EARLY)?)),
                     other => bail!("frames whose addresses are encoded as {other:#x}"),
                 };
                 found(begins, address + at as u64);
             }
-            at += 4 + len;
         }
         Ok(())
     }
@@ -2773,10 +2752,6 @@ pub struct Addition {
     live_pointers: Vec<u64>,
     /// Where each symbol the patch defines is now, of an ELF executable.
     defined: Vec<(Box<[u8]>, Defined)>,
-}
-
-fn read_i32(bytes: &[u8]) -> i32 {
-    i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
 
 /// The distance from `from` to `to`, where the code has four bytes for it.

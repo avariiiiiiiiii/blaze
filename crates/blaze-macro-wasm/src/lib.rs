@@ -34,10 +34,9 @@
 pub mod bench;
 mod keyed;
 pub mod rule;
-mod lex;
 mod wasi;
-mod wire;
 
+use salsa::Database as _;
 use std::{
     any::Any,
     ffi::{OsStr, OsString},
@@ -56,6 +55,10 @@ use base_db::{Db, Crate, Env, Nonce};
 use blaze_core::Traced;
 use blaze_expand::{
     Mode, Put,
+    bridge::{
+        lex, spans,
+        wire::{self, NONE, Part, Parts, Tree},
+    },
     tally::{Mine, Tally},
 };
 use blaze_ids::{ContentId, Hasher, Idx, Interner, Sharded};
@@ -81,10 +84,13 @@ use wasmtime::{
     StoreLimits, StoreLimitsBuilder,
 };
 
-use crate::wire::{NONE, Part, Parts, Tree};
 
-/// The `proc_macro` crate a proc macro compiled to WebAssembly is built against.
-pub const GUEST: &str = include_str!("../guest/proc_macro.rs");
+/// The `proc_macro` crate a proc macro compiled to WebAssembly is built against: the guest's
+/// imports and exports, then the API the in-process bridge's `proc_macro` includes too.
+pub const GUEST: &str = concat!(
+    include_str!("../guest/proc_macro.rs"),
+    include_str!("../../blaze-expand/src/native/proc_macro/api.rs"),
+);
 
 /// The functions a module of proc macros exports, which blaze puts in the crate
 /// (`crates/blaze-engine/src/macro_list.rs`).
@@ -186,14 +192,19 @@ impl State {
             parts: Parts::default(),
             sites: [NONE; 3],
             files: wasi::Files::new(None),
+            // alloc: none, an empty list until the instance runs.
             env: Vec::new(),
+            // alloc: none, an empty list until the instance runs.
             buffer: Vec::new(),
             output: None,
             panic: None,
             retained: false,
             asked: false,
+            // alloc: none, an empty list until the instance runs.
             anchors: Vec::new(),
+            // alloc: none, an empty list until the instance runs.
             contexts: Vec::new(),
+            // alloc: none, an empty list until the instance runs.
             asks: Vec::new(),
             db: None,
             limits: StoreLimitsBuilder::new().memory_size(MEMORY).build(),
@@ -368,79 +379,6 @@ fn read_text(caller: &mut Caller<'_, State>, ptr: u32, len: u32) -> wasmtime::Re
     Ok(String::from_utf8_lossy(guest_slice(memory.data(&*caller), ptr, len)?).into_owned())
 }
 
-fn subspan(span: Span, start: u64, end: u64) -> Option<Span> {
-    if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
-        return Some(span);
-    }
-    let length: u32 = span.range.len().into();
-    let bound = |it: u64, unbounded: u32, included_end: bool| -> Option<u32> {
-        let at = u32::try_from(it / 4).ok()?;
-        match (it, it % 4) {
-            (0, _) => Some(unbounded),
-            (_, 1) if included_end => at.checked_add(1),
-            (_, 1) => Some(at),
-            (_, 3) if included_end => Some(at),
-            (_, 3) => at.checked_add(1),
-            _ => None,
-        }
-    };
-    let start = bound(start, 0, false)?;
-    let end = bound(end, length, true)?;
-    let span_start: u32 = span.range.start().into();
-    if (u32::MAX - start) < span_start
-        || (u32::MAX - end) < span_start
-        || start >= end
-        || end > length
-    {
-        return None;
-    }
-    let range = TextRange::new(TextSize::from(start), TextSize::from(end)) + span.range.start();
-    Some(Span { range, ..span })
-}
-
-fn join(state: &mut State, first: Span, second: Span) -> Option<Span> {
-    if first.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
-        return Some(second);
-    }
-    if second.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
-        return Some(first);
-    }
-    if first.anchor != second.anchor {
-        if first.anchor.file_id != second.anchor.file_id {
-            return None;
-        }
-        let req = SubRequest::SpanJoin {
-            file_id: first.anchor.file_id.as_u32(),
-            ast_id_first: first.anchor.ast_id.into_raw(),
-            start_first: first.range.start().into(),
-            end_first: first.range.end().into(),
-            ctx_first: first.ctx.into_u32(),
-            ast_id_second: second.anchor.ast_id.into_raw(),
-            start_second: second.range.start().into(),
-            end_second: second.range.end().into(),
-            ctx_second: second.ctx.into_u32(),
-        };
-        let Some(SubResponse::SpanJoinResult { span: Some(it) }) = state.ask(req) else {
-            return None;
-        };
-        let anchor = SpanAnchor {
-            file_id: first.anchor.file_id,
-            ast_id: ErasedFileAstId::from_raw(it.ast_id),
-        };
-        // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts:
-        // `it.ctx` is what `load_cargo::answer` read from the running expansion's database for
-        // this join (`state.ask`), in this process. Memory safety doesn't rest on it: a wrong
-        // value panics in `from_u32` or in salsa's checked lookup, or names another context's
-        // hygiene.
-        let ctx = unsafe { SyntaxContext::from_u32(it.ctx) };
-        return Some(Span { range: range(it.start, it.end), anchor, ctx });
-    }
-    if first.ctx != second.ctx {
-        return Some(first);
-    }
-    Some(Span { range: first.range.cover(second.range), anchor: second.anchor, ctx: second.ctx })
-}
-
 fn range(start: u32, end: u32) -> TextRange {
     TextRange::new(TextSize::new(start), TextSize::new(end.max(start)))
 }
@@ -472,7 +410,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     linker.func_wrap(HOST, "span_join", |mut caller: Caller<'_, State>, a: u64, b: u64| {
         let state = caller.data_mut();
         let (Some(first), Some(second)) = (state.span(a), state.span(b)) else { return NONE };
-        join(state, first, second).map_or(NONE, |it| state.pack(it))
+        spans::join(first, second, |req| state.ask(req)).map_or(NONE, |it| state.pack(it))
     })?;
     linker.func_wrap(
         HOST,
@@ -548,7 +486,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         |mut caller: Caller<'_, State>, a: u64, start: u64, end: u64| {
             let state = caller.data_mut();
             let Some(span) = state.span(a) else { return NONE };
-            subspan(span, start, end).map_or(NONE, |it| state.pack(it))
+            spans::subspan(span, start, end).map_or(NONE, |it| state.pack(it))
         },
     )?;
     linker.func_wrap(
@@ -604,6 +542,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         let state = caller.data_mut();
         // What it says is of the database's numbering, which the key does not have.
         state.asked = true;
+        // alloc: the text the macro asked for.
         let text = state.span(a).map(|it| format!("{it:?}"));
         state.give(text)
     })?;
@@ -612,6 +551,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         let Some(span) = state.span(a) else { return -1 };
         let name = match state.ask_value(Value::File, span) {
             Some(SubResponse::FilePathResult { name }) => name,
+            // alloc: none, an empty name.
             _ => String::new(),
         };
         state.give(Some(name))
@@ -641,11 +581,13 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             let text = read_text(&mut caller, ptr, len)?;
             let state = caller.data_mut();
             let Some(call_site) = state.span(state.sites[1]) else {
+                // alloc: the message of text refused.
                 return Ok(-1 - state.give(Some(NO_CALL.to_owned())));
             };
             Ok(match lex::stream(&text, call_site) {
-                Ok(trees) => state.give_tree(&wire::invisible(&trees, call_site)),
+                Ok(trees) => state.give_tree(&wire::invisible(trees, call_site)),
                 Err(e) => {
+                    // alloc: the message of text refused.
                     let e = format!("failed to parse str to token stream: {e}");
                     -1 - state.give(Some(e))
                 }
@@ -662,7 +604,7 @@ fn add_host(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             Ok(match lex::literal_from_str(&text, call_site) {
                 Some(literal) => {
                     let trees = [Tree::Leaf(tt::Leaf::Literal(literal))];
-                    state.give_tree(&wire::invisible(&trees, call_site))
+                    state.give_tree(&wire::invisible(trees, call_site))
                 }
                 None => -1,
             })
@@ -966,6 +908,7 @@ impl Session {
         if self.failed {
             return Ran {
                 output: Err(ProcMacroExpansionError::System(
+                    // alloc: the message of a session that failed.
                     "an earlier expansion failed; the macro session cannot continue in this revision".to_owned(),
                 )),
                 found: false,
@@ -984,19 +927,21 @@ impl Session {
         state.files.output.clear();
         // Nothing a session makes is kept, so what it read is of no use.
         state.files.take_traced();
-        let mut input = Vec::new();
-        wire::relative(call.subtree, &mut state.parts, &mut input);
-        let attr = call.attrs.map(|it| {
-            let mut attr = Vec::new();
-            wire::relative(it, &mut state.parts, &mut attr);
-            attr
-        });
-        let attr = match listed.kind {
-            ProcMacroKind::Attr => Some(attr.unwrap_or_default()),
-            _ => attr,
+        let mut input = Reused::take();
+        let mut attr = Reused::take();
+        wire::relative(call.subtree, &mut state.parts, &mut input.0);
+        // An attribute written without arguments is given as no bytes, an empty stream.
+        let attr = match (call.attrs, listed.kind) {
+            (Some(it), _) => {
+                wire::relative(it, &mut state.parts, &mut attr.0);
+                Some(attr)
+            }
+            (None, ProcMacroKind::Attr) => Some(attr),
+            (None, _) => None,
         };
         let output = self.run(index, db, &input, attr.as_deref()).and_then(|output| {
             let tree = wire::read(&output, &self.store.data().parts)
+                // alloc: the message of an output refused.
                 .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", listed.name)))?;
             Ok(match &self.root {
                 Some(root) => placed(tree, root),
@@ -1188,16 +1133,7 @@ pub fn decode(bytes: &[u8], sites: [Span; 3]) -> Result<tt::TopSubtree, String> 
 /// without compiling it: `None` for a module built before modules carried one.
 pub fn carried_list(bytes: &[u8]) -> Option<String> {
     fn leb(bytes: &[u8], at: &mut usize) -> Option<usize> {
-        let mut value = 0usize;
-        for shift in (0..35).step_by(7) {
-            let byte = *bytes.get(*at)?;
-            *at += 1;
-            value |= usize::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Some(value);
-            }
-        }
-        None
+        blaze_format::leb::read_u32(bytes, at).ok().map(|it| it as usize)
     }
     if bytes.get(..4)? != b"\0asm" {
         return None;
@@ -1380,6 +1316,7 @@ fn placed(tree: tt::TopSubtree, root: &Path) -> tt::TopSubtree {
             }
             other => other,
         })
+        // alloc: only an output with a string naming the package, rebuilt with the package's place.
         .collect();
     tt::TopSubtree::from_serialized(flat)
 }
@@ -1389,6 +1326,7 @@ fn placed(tree: tt::TopSubtree, root: &Path) -> tt::TopSubtree {
 /// words, whose ranges the input's bytes don't have. A kept output's parts are written the
 /// same way, so the next call, with other anchors and contexts in the same places, is given
 /// them back as its own.
+#[derive(Default)]
 struct Shapes {
     anchors: Vec<SpanAnchor>,
     contexts: Vec<SyntaxContext>,
@@ -1404,23 +1342,28 @@ fn position<T: PartialEq>(all: &mut Vec<T>, it: T) -> u32 {
 }
 
 impl Shapes {
+    #[cfg(test)]
     fn of(parts: &[Part], sites: [u64; 3]) -> Shapes {
-        let mut shapes = Shapes {
-            anchors: Vec::new(),
-            contexts: Vec::new(),
-            bytes: Vec::with_capacity(8 * parts.len() + 24),
-        };
+        let mut shapes = Shapes::default();
+        shapes.fill(parts, sites);
+        shapes
+    }
+
+    /// Makes these the shapes of `parts` and the three sites' words, keeping the room.
+    fn fill(&mut self, parts: &[Part], sites: [u64; 3]) {
+        self.anchors.clear();
+        self.contexts.clear();
+        self.bytes.clear();
         for &(anchor, ctx) in parts {
-            let anchor = position(&mut shapes.anchors, anchor);
-            let context = position(&mut shapes.contexts, ctx);
+            let anchor = position(&mut self.anchors, anchor);
+            let context = position(&mut self.contexts, ctx);
             for it in [anchor, context] {
-                shapes.bytes.extend_from_slice(&u32::to_le_bytes(it));
+                self.bytes.extend_from_slice(&u32::to_le_bytes(it));
             }
         }
         for site in sites {
-            shapes.bytes.extend_from_slice(&site.to_le_bytes());
+            self.bytes.extend_from_slice(&site.to_le_bytes());
         }
-        shapes
     }
 
     /// What is kept of an output: the shapes of every part of the expansion, then the output.
@@ -1439,24 +1382,26 @@ impl Shapes {
         Some(value)
     }
 
-    /// The output kept as [`Shapes::written`] wrote it, its parts this input's.
-    fn read(&self, value: &[u8]) -> Result<tt::TopSubtree, String> {
+    /// The output kept as [`Shapes::written`] wrote it, its parts this input's, put in `parts`.
+    fn read(&self, value: &[u8], parts: &mut Parts) -> Result<tt::TopSubtree, String> {
         let count = value.get(..4).map(|it| u32::from_le_bytes(it.try_into().unwrap()) as usize);
         let table = count.and_then(|count| value.get(4..4 + count.checked_mul(8)?));
         let Some(table) = table else { return Err("its table of span parts is cut short".into()) };
-        let mut parts = Parts::default();
+        parts.clear();
         for (at, shape) in table.as_chunks::<8>().0.iter().enumerate() {
             let field = |at: usize| u32::from_le_bytes(shape[at..at + 4].try_into().unwrap());
             let anchor = self.anchors.get(field(0) as usize);
             let ctx = self.contexts.get(field(4) as usize);
             let Some((&anchor, &ctx)) = anchor.zip(ctx) else {
+                // alloc: the message of a kept output refused.
                 return Err(format!("its span part {at} is of no anchor and context of the input"));
             };
             if parts.part(anchor, ctx) as usize != at {
+                // alloc: the message of a kept output refused.
                 return Err(format!("its span part {at} is an earlier one again"));
             }
         }
-        wire::read(&value[4 + table.len()..], &parts)
+        wire::read(&value[4 + table.len()..], parts)
     }
 }
 
@@ -1641,6 +1586,38 @@ impl Drop for Reused {
     }
 }
 
+/// An expansion's span parts and shapes and a kept output's parts, this thread's, cleared
+/// where used, given back when dropped: a hit allocates none of them once the thread has
+/// expanded one as large. An expansion while another runs on the thread makes its own.
+#[derive(Default)]
+struct Scratch {
+    parts: Parts,
+    shapes: Shapes,
+    kept: Parts,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::Cell<Scratch> = std::cell::Cell::new(Scratch::default());
+}
+
+struct Scratched(Scratch);
+
+impl Scratched {
+    fn take() -> Scratched {
+        let mut it = SCRATCH.take();
+        it.parts.clear();
+        Scratched(it)
+    }
+}
+
+impl Drop for Scratched {
+    fn drop(&mut self) {
+        let it = std::mem::take(&mut self.0);
+        // A thread that is ending has no scratch left to give it to.
+        _ = SCRATCH.try_with(|cell| cell.set(it));
+    }
+}
+
 /// Expands the macro at `index` of the module whose expansions are kept under `code` in a
 /// fresh instance: what is kept of it when the store has it, else by running it in what
 /// `wasm` gives, which is asked for only then, and keeps what it made by what it read
@@ -1649,7 +1626,7 @@ impl Drop for Reused {
 #[allow(clippy::too_many_arguments)]
 fn expand<'a>(
     code: &ContentId,
-    wasm: &dyn Fn() -> Result<&'a Wasm, String>,
+    wasm: &impl Fn() -> Result<&'a Wasm, String>,
     index: u32,
     listed: &Listed,
     db: Option<&Db>,
@@ -1657,26 +1634,29 @@ fn expand<'a>(
 ) -> Ran {
     let start = Instant::now();
     let failed = |why: String| {
+        // alloc: the message of an expansion that failed.
         ProcMacroExpansionError::System(format!("the wasm proc macro `{}`: {why}", listed.name))
     };
     let root = package_dir(call.env);
     let env = guest_env(call.env);
-    let mut parts = Parts::default();
+    let mut scratch = Scratched::take();
+    let Scratch { parts, shapes, kept } = &mut scratch.0;
     let sites = [call.def_site, call.call_site, call.mixed_site].map(|span| parts.pack(span));
     let mut input = Reused::take();
     let mut attr = Reused::take();
-    wire::relative(call.subtree, &mut parts, &mut input.0);
+    wire::relative(call.subtree, parts, &mut input.0);
     // rust-analyzer gives an attribute written without arguments (`#[twice]`) none, which
     // the module is given as no bytes, an empty stream.
     let attr = match (call.attrs, listed.kind) {
         (Some(it), _) => {
-            wire::relative(it, &mut parts, &mut attr.0);
+            wire::relative(it, parts, &mut attr.0);
             Some(attr)
         }
         (None, ProcMacroKind::Attr) => Some(attr),
         (None, _) => None,
     };
-    let shapes = Shapes::of(parts.all(), sites);
+    shapes.fill(parts.all(), sites);
+    let shapes = &*shapes;
     let mut given = Given::new(RunKind::ProcMacro);
     given
         .part("host", HOST_VERSION.as_bytes())
@@ -1692,6 +1672,7 @@ fn expand<'a>(
         None => tree,
     };
     let keeping = blaze_expand::keeping();
+    let kept = std::cell::Cell::from_mut(kept);
     let found = match keeping {
         Some(keeping) => {
             let found = find_answered(
@@ -1699,11 +1680,16 @@ fn expand<'a>(
                 &run,
                 root.as_deref(),
                 &env,
-                &shapes,
+                shapes,
                 db,
                 |found| match found {
                     // Read in place, under the guard: a hit copies nothing out of the store.
-                    Found::Hit { value, .. } if keeping.mode == Mode::Keep => Err(shapes.read(value)),
+                    Found::Hit { value, .. } if keeping.mode == Mode::Keep => {
+                        let mut parts = kept.take();
+                        let read = shapes.read(value, &mut parts);
+                        kept.set(parts);
+                        Err(read)
+                    }
                     Found::Hit { value, .. } => Ok(Some(blaze_expand::checked(value))),
                     Found::Miss { .. } => Ok(None),
                 },
@@ -1711,18 +1697,23 @@ fn expand<'a>(
             match found {
                 Ok(Ok(found)) => found,
                 Ok(Err(kept)) => {
-                    let output = kept
-                        .map(&restore)
-                        .map_err(|why| failed(format!("the store's expansion of it is not one: {why}")));
+                    let output = kept.map(&restore).map_err(|why| {
+                        // alloc: the message of a kept output refused.
+                        failed(format!("the store's expansion of it is not one: {why}"))
+                    });
                     count(Counted::Found, start.elapsed());
                     return Ran { output, found: true, retained: false, took: start.elapsed() };
                 }
                 Err(error) => {
+                    // alloc: the message of a store that can't be read.
                     let why = match error {
+                        // alloc: the message of a store that can't be read.
                         FindError::Corrupt(corrupt) => corrupt.to_string(),
                         FindError::NotAShape { key, why } => {
+                            // alloc: the message of a store that can't be read.
                             format!("the store's {key:?} is not a shape: {why}")
                         }
+                        // alloc: the message of a store that can't be read.
                         FindError::Inputs(unreadable) => unreadable.to_string(),
                     };
                     let took = start.elapsed();
@@ -1734,12 +1725,15 @@ fn expand<'a>(
     };
     let ran = wasm().map_err(ProcMacroExpansionError::System).and_then(|wasm| {
         let mut state = State::empty();
+        // clone: the instance's own copy, made only when the macro runs.
         state.anchors = shapes.anchors.clone();
+        // clone: the instance's own copy, made only when the macro runs.
         state.contexts = shapes.contexts.clone();
-        state.parts = parts;
+        state.parts = std::mem::take(parts);
         state.sites = sites;
         state.files = wasi::Files::new(root.as_deref());
         state.env = owned_env(&env);
+        // clone: the instance's own path, made only when the macro runs.
         let mut instance = wasm.instance_with(state, root.clone())?;
         let output = instance.run(index, db, &input, attr.as_deref())?;
         Ok((instance.store.into_data(), output))
@@ -1747,11 +1741,14 @@ fn expand<'a>(
     let mut retained = false;
     let output = ran.and_then(|(mut state, output)| {
         let tree = wire::read(&output, &state.parts)
+            // alloc: the message of an output refused.
             .map_err(|e| ProcMacroExpansionError::System(format!("`{}`: {e}", listed.name)))?;
         retained = state.retained;
         let value = shapes.written(&state.parts, &output);
+        std::mem::swap(parts, &mut state.parts);
         if let Some(kept) = &found {
             if value.as_deref().map(blaze_expand::checked).as_ref() != Some(kept) {
+                // alloc: the message of an expansion that failed.
                 return Err(failed(format!(
                     "{}=check: it expanded otherwise than the store kept it, under a key of \
                      every input it read",
@@ -1771,6 +1768,7 @@ fn expand<'a>(
             }
             (Some(_), _) if state.retained => {}
             (Some(traced), Some(value)) => {
+                // alloc: what names an output the store keeps, made only when the macro ran.
                 let what = format!("the wasm proc macro `{}`", listed.name);
                 blaze_expand::put(Put { run, traced, value, what });
                 count(Counted::Kept, Duration::ZERO);
@@ -2309,17 +2307,11 @@ mod tests {
     }
 
     #[test]
-    fn text_is_lexed_as_the_proc_macro_server_lexes_it() {
-        let lexed = tokens("fn f<'a>(x: &'a u8) -> r#u8 { x.0 + -1i32 } /// doc", span(0, 0));
-        assert_eq!(
-            lexed.unwrap().to_string(),
-            "fn f <'a >(x : &'a u8) -> r#u8 {x . 0 + - 1i32} # [doc = \" doc\"]"
-        );
-        assert!(tokens("(]", span(0, 0)).is_err());
-        assert!(tokens("a ` b", span(0, 0)).is_err());
-        let one = lex::literal_from_str("-1.5f32", span(0, 0)).unwrap();
-        assert_eq!(one.text_and_suffix(), ("-1.5", "f32"));
-        assert!(lex::literal_from_str("-\"no\"", span(0, 0)).is_none());
+    fn the_guest_is_its_own_text_then_the_bridges_api() {
+        let api = include_str!("../../blaze-expand/src/native/proc_macro/api.rs");
+        assert!(GUEST.ends_with(api));
+        assert_eq!(GUEST.matches("\nfn taken(").count(), 1);
+        assert!(GUEST[..GUEST.len() - api.len()].ends_with('\n'), "the API starts a line");
     }
 
     #[test]
@@ -2362,31 +2354,6 @@ mod tests {
         let mut raw = bytes.clone();
         raw[at + 4..at + 8].copy_from_slice(&1u32.to_le_bytes());
         assert!(decode(&raw, sites).unwrap_err().contains("span parts"));
-    }
-
-    #[test]
-    fn a_negative_number_comes_out_as_a_minus_and_a_number() {
-        let number = |text: &str, kind: tt::LitKind, suffix: &str| {
-            Tree::Leaf(tt::Leaf::Literal(tt::Literal::new(text, span(0, 0), kind, suffix)))
-        };
-        let trees = vec![
-            number("-1", tt::LitKind::Integer, "i8"),
-            number("-1.5", tt::LitKind::Float, ""),
-            number("2", tt::LitKind::Integer, ""),
-        ];
-        let want = tokens("-1i8 -1.5 2", span(0, 0)).unwrap();
-        assert_eq!(wire::top_subtree(trees, span(0, 0)).to_string(), want.to_string());
-    }
-
-    #[test]
-    fn text_rustc_refuses_to_lex_is_an_error() {
-        for text in ["r\"", "r#", "br\"", "br#", "cr\"", "cr#", "\"open", "b'x"] {
-            assert!(tokens(text, span(0, 0)).is_err(), "{text}");
-            assert!(lex::literal_from_str(text, span(0, 0)).is_none(), "{text}");
-        }
-        let long = format!("1{}", "a".repeat(lex::SUFFIX_MOST + 1));
-        assert!(tokens(&long, span(0, 0)).is_err());
-        assert!(tokens(&long[..lex::SUFFIX_MOST + 1], span(0, 0)).is_ok());
     }
 
     #[test]
@@ -2473,17 +2440,6 @@ mod tests {
         let answer = SubResponse::LineColumnResult { line: 3, column: 4 };
         assert_eq!(Value::LineColumn.said(Some(&answer)), "3:4");
         assert_eq!(Value::SourceText.said(None), "-");
-    }
-
-    #[test]
-    fn a_subspan_is_of_the_span_and_within_it() {
-        let it = span(10, 20);
-        // Unbounded, included and excluded bounds as the module writes them.
-        assert_eq!(subspan(it, 0, 0).unwrap().range, range(10, 20));
-        assert_eq!(subspan(it, 1 + 4 * 2, 3 + 4 * 5).unwrap().range, range(12, 15));
-        assert_eq!(subspan(it, 3 + 4 * 2, 1 + 4 * 5).unwrap().range, range(13, 16));
-        assert!(subspan(it, 1 + 4 * 5, 3 + 4 * 5).is_none());
-        assert!(subspan(it, 0, 3 + 4 * 11).is_none());
     }
 
     #[test]

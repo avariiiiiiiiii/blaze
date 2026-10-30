@@ -11,10 +11,45 @@ use std::sync::OnceLock;
 use cranelift_codegen::{
     ir::{Type, types},
     isa::{self, CallConv, OwnedTargetIsa},
-    settings::{self, Configurable},
+    settings::{self, Configurable, OptLevel},
 };
 
 static SELECTED: OnceLock<Target> = OnceLock::new();
+
+/// The target features of the process's code past the baseline ([`Target::select_features`]).
+/// Read once by the first ISA made, after which they are what they are.
+static FEATURES: OnceLock<Box<[String]>> = OnceLock::new();
+
+/// rustc's names of the x86-64 features Cranelift has a setting for, and the setting.
+const X86_FEATURES: [(&str, &str); 18] = [
+    ("sse3", "has_sse3"),
+    ("ssse3", "has_ssse3"),
+    ("sse4.1", "has_sse41"),
+    ("sse4.2", "has_sse42"),
+    ("popcnt", "has_popcnt"),
+    ("avx", "has_avx"),
+    ("avx2", "has_avx2"),
+    ("fma", "has_fma"),
+    ("avxvnni", "has_avx_vnni"),
+    ("bmi1", "has_bmi1"),
+    ("bmi2", "has_bmi2"),
+    ("lzcnt", "has_lzcnt"),
+    ("avx512f", "has_avx512f"),
+    ("avx512vl", "has_avx512vl"),
+    ("avx512dq", "has_avx512dq"),
+    ("avx512bitalg", "has_avx512bitalg"),
+    ("avx512vbmi", "has_avx512vbmi"),
+    ("avx512vnni", "has_avx512vnni"),
+];
+
+/// rustc's names of the AArch64 features Cranelift has a setting for, and the setting.
+const AARCH64_FEATURES: [(&str, &str); 5] = [
+    ("lse", "has_lse"),
+    ("paca", "has_pauth"),
+    ("fp16", "has_fp16"),
+    ("dotprod", "has_dotprod"),
+    ("i8mm", "has_i8mm"),
+];
 
 #[derive(Debug)]
 pub struct Target {
@@ -119,6 +154,64 @@ impl Target {
         } else {
             Err(format!("the target is {} already, not {triple}", selected.triple))
         }
+    }
+
+    /// Names the target features of the process's code past the baseline of
+    /// [`Target::cpu`]: `-C target-feature` resolved and sorted, as
+    /// `blaze_codegen::Toolchain::features` has them (the host's for a dev build that runs
+    /// where it is built). Said once, before anything is compiled; nothing said is the
+    /// baseline. A feature that turns off what Cranelift's code of the target always uses
+    /// is refused, as is a name that is not `+` or `-` and a feature.
+    pub fn select_features(&self, features: &[String]) -> Result<(), String> {
+        for feature in features {
+            self.cranelift_setting(feature)?;
+        }
+        let selected = FEATURES.get_or_init(|| features.into());
+        if **selected == *features {
+            Ok(())
+        } else {
+            // alloc: an error at setup, once a process.
+            Err(format!("the target features are {selected:?} already, not {features:?}"))
+        }
+    }
+
+    /// The target features [`Target::select_features`] named, empty for the baseline. Once
+    /// read, they can no longer be named otherwise.
+    pub fn features(&self) -> &'static [String] {
+        FEATURES.get_or_init(Default::default)
+    }
+
+    /// The setting of Cranelift's ISA a feature of `-C target-feature` (`+name` or `-name`)
+    /// turns on or off, or `None` where Cranelift's choice of instructions does not change:
+    /// a feature it has no setting for (it never picks those instructions unasked, and the
+    /// IR builder's intrinsics that need one ask for it), or one it has on for every function
+    /// already and uses only where the IR asks (`cmpxchg16b`).
+    pub(super) fn cranelift_setting(
+        &self,
+        feature: &str,
+    ) -> Result<Option<(&'static str, bool)>, String> {
+        let (on, name) = match feature.split_at_checked(1) {
+            Some(("+", name)) if !name.is_empty() => (true, name),
+            Some(("-", name)) if !name.is_empty() => (false, name),
+            // alloc: an error at setup, read once per ISA made.
+            _ => return Err(format!("the target feature {feature:?} is not `+` or `-` and a name")),
+        };
+        let (table, always): (&[(&str, &str)], &[&str]) = match self.arch {
+            Arch::X86_64 => (&X86_FEATURES, &["x87", "fxsr", "sse", "sse2", "cmpxchg16b"]),
+            Arch::Aarch64 => (&AARCH64_FEATURES, &["neon", "fp-armv8"]),
+            Arch::Wasm32 => (&[], &[]),
+        };
+        if always.contains(&name) {
+            if !on && name != "cmpxchg16b" {
+                // alloc: an error at setup, read once per ISA made.
+                return Err(format!(
+                    "-{name}: Cranelift's code for {} always uses it",
+                    self.triple
+                ));
+            }
+            return Ok(None);
+        }
+        Ok(table.iter().find(|(it, _)| *it == name).map(|&(_, setting)| (setting, on)))
     }
 
     /// The target that was named, or the host.
@@ -289,13 +382,16 @@ impl Target {
         }
     }
 
-    /// The code generator for the target. `regalloc` names Cranelift's register allocator.
-    /// With `frame_pointers` every function it compiles keeps one, which a function that
-    /// asks for its frame pointer needs.
+    /// The code generator for the target, with the [`features`](Self::features) of the
+    /// process. `regalloc` names Cranelift's register allocator. With `frame_pointers` every
+    /// function it compiles keeps one, which a function that asks for its frame pointer
+    /// needs. `opt` is `None` for code an edit reaches, `Speed` for what no edit does (the
+    /// standard library's and dependencies').
     pub(super) fn isa(
         &self,
         regalloc: &str,
         frame_pointers: bool,
+        opt: OptLevel,
     ) -> Result<OwnedTargetIsa, String> {
         let mut flags = settings::builder();
         // An image of PE reaches all of itself relative to the instruction, and what it
@@ -323,7 +419,12 @@ impl Target {
             // Cranelift gives a function its frame pointer only when all of them keep one.
             flags.set("preserve_frame_pointers", "true").map_err(|e| e.to_string())?;
         }
-        flags.set("opt_level", "none").map_err(|e| e.to_string())?;
+        let opt = match opt {
+            OptLevel::None => "none",
+            OptLevel::Speed => "speed",
+            OptLevel::SpeedAndSize => "speed_and_size",
+        };
+        flags.set("opt_level", opt).map_err(|e| e.to_string())?;
         // Cranelift checks the IR of every function it is given unless told not to: a walk of
         // all of it, with its dominator tree, before any code is made. Tests check it, and
         // `BLAZE_VERIFY=1` asks for it elsewhere; the code made is the same either way.
@@ -347,6 +448,12 @@ impl Target {
         for setting in self.baseline_settings() {
             isa.enable(setting).map_err(|e| e.to_string())?;
         }
+        for feature in self.features() {
+            if let Some((setting, on)) = self.cranelift_setting(feature)? {
+                let value = if on { "true" } else { "false" };
+                isa.set(setting, value).map_err(|e| e.to_string())?;
+            }
+        }
         isa.finish(settings::Flags::new(flags)).map_err(|e| e.to_string())
     }
 
@@ -364,10 +471,12 @@ impl Target {
 
 #[cfg(test)]
 mod tests {
-    use super::Target;
+    use cranelift_codegen::settings::OptLevel;
+
+    use super::{AARCH64_FEATURES, Arch, Target, X86_FEATURES};
 
     fn setting(target: &Target, name: &str) -> Option<bool> {
-        let isa = target.isa("backtracking", false).expect("the ISA");
+        let isa = target.isa("backtracking", false, OptLevel::None).expect("the ISA");
         isa.isa_flags().iter().find(|it| it.name == name).and_then(|it| it.as_bool())
     }
 
@@ -393,8 +502,41 @@ mod tests {
     #[test]
     fn tests_verify_what_cranelift_is_given() {
         let target = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
-        let isa = target.isa("backtracking", false).expect("the ISA");
+        let isa = target.isa("backtracking", false, OptLevel::None).expect("the ISA");
         assert!(isa.flags().enable_verifier());
-        assert_eq!(isa.flags().opt_level(), cranelift_codegen::settings::OptLevel::None);
+        assert_eq!(isa.flags().opt_level(), OptLevel::None);
+        let isa = target.isa("backtracking", false, OptLevel::Speed).expect("the ISA");
+        assert_eq!(isa.flags().opt_level(), OptLevel::Speed);
+    }
+
+    /// Every setting a feature names is one Cranelift's ISA of the architecture has.
+    #[test]
+    fn every_mapped_feature_is_a_setting_of_its_isa() {
+        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        let arm = Target::parse("aarch64-unknown-linux-gnu").expect("a target");
+        for (target, table) in [(&x86, &X86_FEATURES[..]), (&arm, &AARCH64_FEATURES[..])] {
+            for &(feature, name) in table {
+                assert_eq!(setting(target, name).map(|_| ()), Some(()), "{feature}: {name}");
+                let plus = format!("+{feature}");
+                assert_eq!(target.cranelift_setting(&plus), Ok(Some((name, true))));
+                let minus = format!("-{feature}");
+                assert_eq!(target.cranelift_setting(&minus), Ok(Some((name, false))));
+            }
+        }
+    }
+
+    #[test]
+    fn features_cranelift_always_uses_cannot_be_turned_off() {
+        let x86 = Target::parse("x86_64-unknown-linux-gnu").expect("a target");
+        assert_eq!(x86.cranelift_setting("+sse2"), Ok(None));
+        assert!(x86.cranelift_setting("-sse2").is_err());
+        assert_eq!(x86.cranelift_setting("-cmpxchg16b"), Ok(None));
+        assert_eq!(x86.cranelift_setting("+aes"), Ok(None));
+        let arm = Target::parse("aarch64-apple-darwin").expect("a target");
+        assert_eq!(arm.arch, Arch::Aarch64);
+        assert!(arm.cranelift_setting("-neon").is_err());
+        for malformed in ["", "+", "-", "avx2", "*avx2"] {
+            assert!(x86.cranelift_setting(malformed).is_err(), "{malformed:?}");
+        }
     }
 }

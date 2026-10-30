@@ -23,7 +23,7 @@ use syntax::{
 use super::used::Uses;
 use crate::{
     cx::Cx,
-    lints::syntax::Walk,
+    lints::{registry::LintId, syntax::Walk},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -31,11 +31,13 @@ use crate::{
 /// rustc's `unused_macros` and `unused_macro_rules`, each at the macro's item.
 pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found> {
     let mut found = Vec::new();
+    let (macros, arms) =
+        (cx.lint_may_fire(LintId::named("unused_macros")), cx.lint_may_fire(LintId::named("unused_macro_rules")));
+    if !macros && !arms {
+        return found;
+    }
     for tree in &walk.trees {
-        for node in &tree.nodes {
-            if !matches!(node.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) {
-                continue;
-            }
+        for node in tree.of_kind(|it| matches!(it, SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF)) {
             let Some(def) = ast::Macro::cast(node.clone()) else { continue };
             let Some(name) = def.name() else { continue };
             let text = name.text();
@@ -46,13 +48,16 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
             let id = MacroId::from(it);
             let at = tree.ptr(node);
             if !uses.macros.contains(&id) {
+                if !macros {
+                    continue;
+                }
                 let span = cx.span(InFile::new(tree.file, name.syntax().text_range()));
                 let mut diag = Diag::lint("unused_macros", format!("unused macro definition: `{text}`"), span);
                 diag.fact(cx.resolves_fact(it.module(cx.db), text), format!("what the calls of `{text}` resolve to"));
                 found.push(Found::lint(diag, Phase::Resolve, at));
                 continue;
             }
-            if uses.arms_unknown.contains(&id) {
+            if !arms || uses.arms_unknown.contains(&id) {
                 continue;
             }
             let matched = uses.arms.get(&id);

@@ -209,8 +209,8 @@ impl Message for BidirectionalMessage {
             Some(buf) => Some(postcard::decode(buf)?),
         })
     }
-    fn write(self, out: &mut dyn Write) -> io::Result<()> {
-        let value = postcard::encode(&self)?;
+    fn write(&self, out: &mut dyn Write) -> io::Result<()> {
+        let value = postcard::encode(self)?;
         postcard::write(out, &value)
     }
 }

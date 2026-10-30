@@ -29,3 +29,4 @@ reads it from `call.expansion_span_map(db)` and expands nothing. I switch to it 
 `macros.rs` the moment it lands.
 
 > forwarded to db: `crates/hir-expand/` is lane db's (speed-hir-expand works in it).
+> applied by db-expand: `call.expansion_span_map(db).dropped_semicolon` is the dropped `;`'s span, set once in `parse_macro_expansion` (`crates/hir-expand/src/lib.rs`); test `the_dropped_semicolon_is_in_the_expansion_span_map`. `lints/syntax/early/macros.rs`'s `dropped_semicolon` can read it now and stop expanding a second time.

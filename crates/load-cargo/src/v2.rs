@@ -401,6 +401,7 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
             origin: crates::origin(package, unit),
             crate_attrs: Box::new([]),
             target_kind: crates::target_kind(unit, plan, what)?,
+            crate_types: crates::crate_types(unit, plan, what)?,
             proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(&workspace_root, package))?),
         };
         let extra = base_db::ExtraCrateData {

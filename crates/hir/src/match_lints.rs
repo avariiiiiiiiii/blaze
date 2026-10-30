@@ -28,8 +28,8 @@ pub use hir_ty_matchck::{BindingOrigin, SpecialTy};
 use crate::{
     Const, DefWithBody, Enum, EnumVariant, Module, Type, TypeOwnerId,
     diagnostics::{
-        AnyDiagnostic, EmptyRangePattern, MissingMatchArms, MixedDerefPatterns, NonExhaustiveLet,
-        PatternComplexityLimit,
+        AnyDiagnostic, ConstPatternRefused, EmptyRangePattern, MissingMatchArms, MixedDerefPatterns,
+        NonExhaustiveLet, PatternComplexityLimit,
     },
 };
 
@@ -57,6 +57,23 @@ pub struct UnreachablePattern<'db> {
     /// The match arm the pattern is the whole of, for "remove the match arm".
     pub arm: Option<InFile<AstPtr<ast::MatchArm>>>,
     pub typo: Option<PatternTypo>,
+}
+
+/// What rustc's `const_to_pat` refuses in a constant used as a pattern.
+#[derive(Debug, Clone)]
+pub enum ConstPatternError<'db> {
+    /// "cannot use unions in constant patterns".
+    Union,
+    /// A function pointer, or a raw pointer into an allocation.
+    Pointer,
+    /// "{prefix} `{ty}` cannot be used in patterns", `ty` being the part of the value refused.
+    Invalid(Type<'db>),
+    /// The value holds this ADT, which doesn't derive `PartialEq` (`TypeNotStructural`).
+    NotStructural(Type<'db>),
+    /// The constant's type doesn't implement `PartialEq` (`TypeNotPartialEq`).
+    NotPartialEq(Type<'db>),
+    /// "cannot use NaN in patterns".
+    NaN,
 }
 
 /// What rustc's `find_fallback_pattern_typo` finds for a catch-all binding.
@@ -331,6 +348,22 @@ impl<'db> Syntax<'_, 'db> {
             }
             &MatchError::ComplexityLimit { at } => PatternComplexityLimit {
                 at: self.source_map.expr_or_pat_syntax(at).ok()?.map(|it| it.syntax_node_ptr()),
+            }
+            .into(),
+            MatchError::ConstPattern { pat, error } => ConstPatternRefused {
+                pat: self.pat(*pat)?,
+                error: match error {
+                    matchck::ConstPatternError::Union => ConstPatternError::Union,
+                    matchck::ConstPatternError::Pointer => ConstPatternError::Pointer,
+                    matchck::ConstPatternError::Invalid(it) => ConstPatternError::Invalid(ty(it)),
+                    matchck::ConstPatternError::NotStructural(it) => {
+                        ConstPatternError::NotStructural(ty(it))
+                    }
+                    matchck::ConstPatternError::NotPartialEq(it) => {
+                        ConstPatternError::NotPartialEq(ty(it))
+                    }
+                    matchck::ConstPatternError::NaN => ConstPatternError::NaN,
+                },
             }
             .into(),
             &MatchError::MixedDerefPatterns { deref_pat, normal_pat } => MixedDerefPatterns {

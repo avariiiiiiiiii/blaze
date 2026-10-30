@@ -1335,7 +1335,7 @@ m! { = > }
         expect![[r#"
 macro_rules! m { ($tt:tt) => { ok!(); } }
 ok!();
-/* error: leftover tokens */ok!();
+/* error: no rules expected `>` */ok!();
 "#]],
     );
 }
@@ -1557,7 +1557,7 @@ macro_rules !matches {
     ;
 }
 fn main() {
-    /* error: unexpected token in input *//* parse error: expected expression */
+    /* error: no rules expected `|` *//* parse error: expected expression */
 /* parse error: expected FAT_ARROW */
 /* parse error: expected `,` */
 /* parse error: expected pattern */

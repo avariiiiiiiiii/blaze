@@ -187,7 +187,7 @@ pub(crate) fn is_item_tree_filtered_attr(name: &str) -> bool {
 /// This collects attributes exactly as the item tree needs them. This is used for the item tree,
 /// as well as for resolving [`AttrId`]s.
 pub fn collect_item_tree_attrs<'a, BreakValue>(
-    owner: &dyn ast::HasAttrs,
+    owner: &dyn ast::HasAttrs, // dyn: once per item, into syntax's attrs_including_inner; a generic would copy the cfg_attr expansion per node type
     cfg_options: impl Fn() -> &'a CfgOptions,
     mut on_attr: impl FnMut(ast::Meta, ast::Attr) -> ControlFlow<BreakValue>,
 ) -> Option<Either<BreakValue, CfgExpr>> {
@@ -225,7 +225,9 @@ pub fn collect_item_tree_attrs<'a, BreakValue>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attr {
     pub path: ModPath,
-    pub input: Option<Box<AttrInput>>,
+    /// Shared: an item tree assembled from its items' trees clones every attribute of the file
+    /// on each edit, and a clone is then one count.
+    pub input: Option<triomphe::Arc<AttrInput>>,
     pub ctxt: SyntaxContext,
 }
 
@@ -390,7 +392,7 @@ impl AttrId {
         self,
         db: &Db,
         krate: Crate,
-        owner: &dyn ast::HasAttrs,
+        owner: &dyn ast::HasAttrs, // dyn: once per item, into syntax's attrs_including_inner; a generic would copy the cfg_attr expansion per node type
     ) -> (ast::Attr, ast::Meta) {
         self.find_attr_range_with_source_opt(db, krate, owner).unwrap_or_else(|| {
             panic!("used an incorrect `AttrId`; crate={krate:?}, attr_id={self:?}");
@@ -403,7 +405,7 @@ impl AttrId {
         self,
         db: &Db,
         krate: Crate,
-        owner: &dyn ast::HasAttrs,
+        owner: &dyn ast::HasAttrs, // dyn: once per item, into syntax's attrs_including_inner; a generic would copy the cfg_attr expansion per node type
     ) -> Option<(ast::Attr, ast::Meta)> {
         let cfg_options = OnceCell::new();
         let mut index = 0;

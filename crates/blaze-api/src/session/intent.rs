@@ -35,12 +35,16 @@ pub(super) struct Intents {
     by_job: FxHashMap<JobId, Intent>,
     /// The daemon's clock as [`super::Session::tick`] last gave it.
     now_ns: u64,
+    /// The jobs a call picked ([`Intents::pick`]) and their sort's scratch, kept between calls.
+    picked: Vec<JobId>,
+    scratch: Vec<JobId>,
 }
 
 impl Intents {
     /// `job`, started on `opened`, after the connection's intents not taken over are cancelled.
     pub(super) fn add(
         &mut self,
+        // dyn: the daemon's one builder, lent by the session as `dyn`; one call per job.
         builder: &mut dyn Builder,
         conn: Conn,
         job: JobId,
@@ -55,35 +59,29 @@ impl Intents {
     }
 
     /// A request builds `root`: every open intent on it is taken over.
+    // dyn: as `add`'s.
     pub(super) fn take_over(&mut self, builder: &mut dyn Builder, root: ContentId) {
-        let mut jobs = self.jobs_where(|intent| intent.opened.view.root == root);
-        radix::sort_copy_by_key(&mut jobs, |it| it.0);
-        for job in jobs {
-            self.by_job.get_mut(&job).expect("a job just found").deadline_ns = None;
-            builder.promote(job);
-        }
+        let jobs = self.pick(|intent| intent.opened.view.root == root);
+        self.promote(builder, jobs);
     }
 
     /// `head` moved to `root`: its open intents on `root` are taken over, the rest cancelled.
+    // dyn: as `add`'s.
     pub(super) fn moved(&mut self, builder: &mut dyn Builder, head: &str, root: ContentId) {
         self.cancel_where(builder, |intent| {
             intent.head.as_deref() == Some(head) && intent.opened.view.root != root
         });
-        let mut jobs = self.jobs_where(|intent| {
-            intent.head.as_deref() == Some(head) && intent.opened.view.root == root
-        });
-        radix::sort_copy_by_key(&mut jobs, |it| it.0);
-        for job in jobs {
-            self.by_job.get_mut(&job).expect("a job just found").deadline_ns = None;
-            builder.promote(job);
-        }
+        let jobs = self.pick(|intent| intent.head.as_deref() == Some(head) && intent.opened.view.root == root);
+        self.promote(builder, jobs);
     }
 
+    // dyn: as `add`'s.
     pub(super) fn gone(&mut self, builder: &mut dyn Builder, conn: Conn) {
         self.cancel_where(builder, |intent| intent.conn == conn);
     }
 
     /// The clock is `now_ns`: every open intent whose deadline it reached is cancelled.
+    // dyn: as `add`'s.
     pub(super) fn tick(&mut self, builder: &mut dyn Builder, now_ns: u64) {
         self.now_ns = self.now_ns.max(now_ns);
         let now_ns = self.now_ns;
@@ -105,16 +103,35 @@ impl Intents {
         self.by_job.len()
     }
 
-    fn jobs_where(&self, mut keep: impl FnMut(&Intent) -> bool) -> Vec<JobId> {
-        self.by_job.iter().filter(|(_, it)| it.open() && keep(it)).map(|(job, _)| *job).collect()
+    /// The open intents' jobs `keep` picks, in job order, in the buffer kept for it: handed
+    /// back to `picked` once gone through.
+    fn pick(&mut self, mut keep: impl FnMut(&Intent) -> bool) -> Vec<JobId> {
+        let mut jobs = std::mem::take(&mut self.picked);
+        jobs.clear();
+        jobs.extend(self.by_job.iter().filter(|(_, it)| it.open() && keep(it)).map(|(job, _)| *job));
+        radix::sort_copy_by_key_in(&mut jobs, |it| it.0, &mut self.scratch);
+        jobs
     }
 
+    // dyn: as `add`'s.
+    fn promote(&mut self, builder: &mut dyn Builder, jobs: Vec<JobId>) {
+        for &job in &jobs {
+            self.by_job.get_mut(&job).expect("a job just found").deadline_ns = None;
+            builder.promote(job);
+        }
+        self.picked = jobs;
+    }
+
+    // dyn: as `add`'s.
     fn cancel_where(&mut self, builder: &mut dyn Builder, keep: impl FnMut(&Intent) -> bool) {
-        let mut jobs = self.jobs_where(keep);
-        radix::sort_copy_by_key(&mut jobs, |it| it.0);
-        for job in jobs {
+        let jobs = self.pick(keep);
+        for &job in &jobs {
             self.by_job.get_mut(&job).expect("a job just found").cancelled = true;
             builder.cancel(job);
         }
+        self.picked = jobs;
     }
 }
+
+#[cfg(test)]
+mod tests;

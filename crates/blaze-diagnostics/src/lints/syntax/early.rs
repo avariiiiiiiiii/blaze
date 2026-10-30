@@ -52,10 +52,10 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
     for (index, tree) in walk.trees.iter().enumerate() {
         let index = index as u32;
         builtin.tree(cx, tree, &mut out);
-        for node in &tree.nodes {
-            builtin.node(cx, walk, tree, node, &mut out);
+        for (node, &kind) in tree.nodes.iter().zip(&tree.kinds) {
+            builtin.node(cx, walk, tree, node, kind, &mut out);
             validation.node(cx, tree, index, node, &mut out);
-            if matches!(node.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) {
+            if matches!(kind, SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) {
                 macros::definition(cx, krate, tree, node, &mut out);
             }
         }

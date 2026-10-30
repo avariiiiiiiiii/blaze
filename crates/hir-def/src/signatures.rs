@@ -569,6 +569,9 @@ impl StructFlags {
 impl StructSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: StructId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_struct(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -669,6 +672,9 @@ pub struct UnionSignature {
 impl UnionSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: UnionId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_union(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -775,6 +781,9 @@ pub struct EnumSignature {
 impl EnumSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: EnumId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_enum(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -877,6 +886,9 @@ pub struct ConstSignature {
 impl ConstSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: ConstId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_const(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -971,6 +983,9 @@ pub struct StaticSignature {
 impl StaticSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: StaticId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_static(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -1064,6 +1079,9 @@ pub struct ImplSignature {
 impl ImplSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: ImplId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_impl(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -1181,6 +1199,9 @@ pub struct TraitSignature {
 impl TraitSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: TraitId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_trait(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -1300,6 +1321,9 @@ pub struct FunctionSignature {
 impl FunctionSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: FunctionId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_function(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -1489,6 +1513,9 @@ pub struct TypeAliasSignature {
 impl TypeAliasSignature {
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: TypeAliasId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_type_alias(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -1695,6 +1722,9 @@ impl VariantFields {
 
     #[salsa::tracked(returns(deref))]
     pub fn of(db: &Db, id: VariantId) -> Arc<Self> {
+        if let Some(it) = crate::deps::signatures::served_variant_fields(db, id) {
+            return it;
+        }
         match Self::relative(db, id) {
             Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
             // clone: an `Arc` count, for an item a macro writes
@@ -1704,6 +1734,15 @@ impl VariantFields {
 }
 
 impl VariantFields {
+    /// Fields read back from a dependency image.
+    pub(crate) fn from_parts(
+        fields: Arena<FieldData>,
+        store: ExpressionStore,
+        shape: FieldsShape,
+    ) -> VariantFields {
+        VariantFields { fields, store, shape }
+    }
+
     pub fn len(&self) -> usize {
         self.fields.len()
     }
@@ -1881,6 +1920,17 @@ impl EnumVariants {
         db: &Db,
         e: EnumId,
     ) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
+        if let Some(it) = crate::deps::signatures::served_enum_variants(db, e) {
+            return it;
+        }
+        Self::lower(db, e)
+    }
+}
+
+impl EnumVariants {
+    /// The variants lowered from syntax: what [`EnumVariants::of`] gives when no image serves
+    /// them, and what checking an image compares its record with.
+    pub(crate) fn lower(db: &Db, e: EnumId) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
         let loc = e.lookup(db);
         // The relative tree's ast ids are the file's: what a variant is interned by.
         let (source, ast_id_map) = match variants_syntax(db, e) {
@@ -1934,6 +1984,19 @@ impl EnumVariants {
         diagnostics.shrink_to_fit();
 
         (EnumVariants { variants, explicit_discriminant }, diagnostics)
+    }
+
+    /// Variants read back from a dependency image; `explicit[i]` is whether variant `i` is
+    /// written with `= expr`.
+    pub(crate) fn from_parts(
+        variants: FxIndexMap<Name, (EnumVariantId, FieldsShape)>,
+        explicit: &[bool],
+    ) -> EnumVariants {
+        let mut explicit_discriminant = VariantBits::with_len(variants.len());
+        for (index, &it) in explicit.iter().enumerate() {
+            explicit_discriminant.set(index, it);
+        }
+        EnumVariants { variants, explicit_discriminant }
     }
 }
 

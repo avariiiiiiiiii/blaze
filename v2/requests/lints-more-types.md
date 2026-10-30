@@ -20,9 +20,34 @@
   no public way to ask them. Semantics belong in the front end (semantics-in-front-end), so the
   lints ask hir rather than rebuilding the solver's answers.
 
+> forwarded to db (`crates/hir`) (from requests, pass 16; told by tmux).
+
+## db (`crates/hir`): two more for `needless_pass_by_value`
+
+- What:
+  - in `crates/hir/src/lib.rs`, `impl<'db> Type<'db> { pub fn impls_trait_fresh(&self, db: &'db Db,
+    trait_: Trait) -> bool }`: whether `self` implements `trait_` for some arguments after `Self`,
+    each a fresh inference variable (`traits::implements_trait_unique(self.ty, db, self.param_env,
+    trait_.id)` with the rest of the args fresh). clippy asks it of `RangeBounds<?T>`
+    (`implements_trait(cx, ty, range_bounds, &[])` leaves the arg to inference); `impls_trait` with
+    no args makes them error types, which never hold.
+  - on `hir::BodyAnalysis` (the lints lane's request, `crates/hir/src/body_analysis.rs`), `pub fn
+    consumes(&self, local: Local<'db>) -> bool`: whether the body moves out of a place whose base is
+    `local`: rustc's `ExprUseVisitor::for_clippy(..).consume_body(body)` with a delegate that records
+    `consume` of a non-`Copy` place based on a local (clippy's `MovedVariablesCtxt`). hir-ty's port
+    of the visitor (`hir-ty/src/infer/closure/analysis/expr_use_visitor.rs`) is crate-private and
+    runs inside inference; this needs an entry over the finished `InferenceResult`.
+- Why: without them `needless_pass_by_value` can't tell a consumed argument from one that is only
+  read (it would lint every moved `Vec`), nor skip `RangeBounds` arguments as clippy does. Which uses
+  move is semantics; it belongs in the front end (semantics-in-front-end), not re-derived in a lint.
+
+> forwarded to db (db-next2, `crates/hir/`) (requests, pass 18; told by tmux).
+
 ## lints-driver (`crates/blaze-lints/src/check.rs`, `lints/mod.rs`)
 
 Told by tmux, with the whole list in `/tmp/blaze-lanes/lints-more-types-to-driver.md`: the 12
 lints in `implemented!`, `On` widened to `u64`, `mod more_types_tests;`, the calls from the
 walks, and six `Cx` additions (`path` at item level, `resolve_type`, `fn_def`/`adt_def`,
 `is_exported`, `is_in_test`, `def_span`).
+
+> forwarded to lints (from requests, pass 16; told by tmux).

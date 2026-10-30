@@ -246,8 +246,12 @@ struct Connection {
     write: u64,
 }
 
+/// The handle `conn` names. A generation no live value has (an even one) becomes a slot past
+/// `MOST`, which no lookup finds: a free slot's generation is even too, and `Slab` would answer
+/// for it.
 fn conn_id(conn: Conn) -> ConnId {
-    ConnId::from_bits(conn.0)
+    let id = ConnId::from_bits(conn.0);
+    if id.generation() & 1 == 1 { id } else { ConnId::from_bits(u64::from(u32::MAX)) }
 }
 
 fn no_slab(error: MemError) -> io::Error {
@@ -373,6 +377,7 @@ impl Kqueue {
     }
 
     /// The driver, starting each process whose sandbox is on as `confine` makes it.
+    // dyn: the platform's sandbox, given once at setup
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Kqueue {
         self.confine = Some(confine);
         self
@@ -2199,6 +2204,13 @@ mod tests {
         driver.submit(&mut effects);
         poll_for(&mut driver, &mut out, 2);
         assert!(out.iter().all(|it| it.done == Done::HungUp), "{out:?}");
+        out.clear();
+        // A made-up `Conn` with the generation a freed slot has now.
+        let free = Conn(client.0 + (1 << 32));
+        effects.push(Effect::Recv { conn: free, most: 8, tag: Tag(22) });
+        driver.submit(&mut effects);
+        poll_for(&mut driver, &mut out, 1);
+        assert!(matches!(out[..], [Completion { tag: Tag(22), done: Done::Failed(_) }]), "{out:?}");
         out.clear();
         effects.push(Effect::Connect { at, tag: Tag(3) });
         driver.submit(&mut effects);

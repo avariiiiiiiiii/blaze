@@ -1,15 +1,17 @@
 //! What type inference records for the diagnostics that read it: the assignment an invalid
 //! left-hand side is of, scope errors of jumps and `yield`, where a body stops being reachable,
-//! an operator's unmet predicates and a call's arguments, and the goals left ambiguous.
+//! an operator's unmet predicates and a call's arguments, the goals left ambiguous, the value
+//! each path resolved to, and what a `Self: Sized` method called on a trait object picked.
 
 use hir_def::{
-    AdtId,
+    AdtId, ItemContainerId, Lookup,
     expr_store::Body,
     hir::{ArithOp, BinaryOp, Expr, ExprId, ExprOrPatId},
+    resolver::ValueNs,
     signatures::{StructSignature, TraitSignature},
 };
 use hir_ide::{
-    InferBodyId, InferenceDiagnostic, InferenceResult, Unreachable, UnreachableAt,
+    CastError, InferBodyId, InferenceDiagnostic, InferenceResult, Unreachable, UnreachableAt,
     next_solver::{TyKind, default_types},
     solver_errors::{StoredGoal, TypeAnnotationNeeded},
 };
@@ -572,5 +574,287 @@ fn an_operator_error_keeps_an_undecided_literal_type() {
         assert_eq!(at_error("decided"), [Vec::new()], "no literal undecided: `None`");
         assert_eq!(at_error("deref"), [vec![fresh_int]]);
         assert_eq!(at_error("not"), [vec![TyKind::Infer(InferTy::FreshFloatTy(0))]]);
+    });
+}
+
+/// rustc's `argument-suggestions/extra_arguments.rs`, `swapped_arguments.rs` and E0057: what
+/// `report_arg_errors` is given of each call.
+const ARGUMENTS: &str = r#"
+//- minicore: sized, fn
+fn one(_a: u8) {}
+fn two(_a: u8, _b: &str) {}
+struct S;
+impl S {
+    fn m(&self, _a: u8, _b: &str) {}
+}
+fn count() {
+    one(1, 2);
+}
+fn swapped() {
+    two("", 1);
+}
+fn method() {
+    S.m("", 1);
+}
+fn closure() {
+    let f = |_a: u8| {};
+    f(1, 2);
+}
+fn fits() {
+    two(1, "");
+}
+"#;
+
+#[test]
+fn a_call_whose_arguments_do_not_fit_carries_its_argument_matrix() {
+    let db = TestDB::with_files(ARGUMENTS);
+    crate::attach_db(&db, || {
+        let types = default_types();
+        let fresh_int = TyKind::Infer(InferTy::FreshIntTy(0));
+        // (whether the count fits, is_fn_trait_call, the call's `CallArguments`)
+        let calls = |name: &str| {
+            let (_, result) = infer(&db, name);
+            result
+                .diagnostics()
+                .iter()
+                .filter_map(|it| match it {
+                    InferenceDiagnostic::MismatchedArgCount { is_fn_trait_call, args, .. } => {
+                        Some((false, *is_fn_trait_call, (**args).clone()))
+                    }
+                    InferenceDiagnostic::IncorrectArguments { args, .. } => {
+                        Some((true, false, (**args).clone()))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = |args: &hir_ide::CallArguments| {
+            (0..args.provided.len()).map(|it| args.compatible_with(it).to_vec()).collect::<Vec<_>>()
+        };
+
+        let count = calls("count");
+        let [(fits, trait_call, args)] = &count[..] else { panic!("one count error") };
+        assert!(!fits && !trait_call && !args.is_method && args.method.is_none());
+        assert_eq!(args.formal_inputs.len(), 1);
+        let provided: Vec<_> = args.provided.iter().map(|it| it.as_ref().kind()).collect();
+        assert_eq!(provided, [types.types.u8.kind(), fresh_int], "`2` is undecided at the error");
+        assert_eq!(rows(args), [vec![0], vec![0]], "either argument fits `u8`");
+
+        for name in ["swapped", "method"] {
+            let found = calls(name);
+            let [(fits, _, args)] = &found[..] else { panic!("one error of {name}") };
+            assert!(*fits, "{name}: the count fits");
+            assert_eq!(args.is_method, name == "method");
+            assert_eq!(args.method.is_some(), name == "method");
+            assert_eq!(args.provided[1].as_ref().kind(), fresh_int);
+            assert_eq!(rows(args), [vec![1], vec![0]], "{name}: each fits only the other's input");
+        }
+
+        let closure = calls("closure");
+        let [(fits, trait_call, args)] = &closure[..] else { panic!("one E0057") };
+        assert!(!fits && *trait_call && !args.is_method);
+        assert!(matches!(args.callee.as_ref().kind(), TyKind::Closure(..)));
+        assert_eq!(rows(args), [vec![0], vec![0]]);
+
+        assert!(calls("fits").is_empty());
+    });
+}
+
+/// rustc's `error-codes/E0641.rs` (`0 as *const _`), a function pointer cast to a pointer of
+/// unknown pointee, and `cast/cast-enum-with-dtor.rs`'s field-less enum with a `Drop` impl.
+const CASTS: &str = r#"
+//- minicore: sized, drop
+enum E { A }
+impl Drop for E { fn drop(&mut self) {} }
+enum F { A }
+fn from_int() {
+    let _p = 0 as *const _;
+}
+fn from_fn_ptr(f: fn()) {
+    let _p = f as *const _;
+}
+fn known(f: fn()) {
+    let _p = 0 as *const u8;
+    let _q = f as *const u8;
+}
+fn enum_drop() {
+    let _ = E::A as u8;
+}
+fn enum_plain() {
+    let _ = F::A as u8;
+}
+"#;
+
+#[test]
+fn a_cast_to_a_pointer_of_unknown_kind_is_e0641() {
+    let db = TestDB::with_files(CASTS);
+    crate::attach_db(&db, || {
+        let errors = |name: &str| -> Vec<CastError> {
+            let (_, result) = infer(&db, name);
+            result
+                .diagnostics()
+                .iter()
+                .filter_map(|it| match *it {
+                    InferenceDiagnostic::InvalidCast { error, .. } => Some(error),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(errors("from_int"), [CastError::UnknownCastPtrKind]);
+        assert_eq!(errors("from_fn_ptr"), [CastError::UnknownCastPtrKind]);
+        assert_eq!(errors("known"), []);
+        assert_eq!(errors("enum_drop"), [CastError::CastEnumDrop]);
+        assert_eq!(errors("enum_plain"), []);
+    });
+}
+
+/// rustc's `match/match-range-fail.rs` and the tuple struct of #67037.
+const PATTERNS: &str = r#"
+//- minicore: sized
+fn one_bad_end() {
+    match "wow" {
+        10 ..= "what" => (),
+    };
+}
+fn both_bad() {
+    match "wow" {
+        "bar" ..= "foo" => {}
+    };
+}
+struct W((u8, u8));
+fn count_of_other_type() {
+    let W(_a, _b) = 0u8;
+}
+fn count() {
+    let W(_a, _b) = W((1, 2));
+}
+"#;
+
+#[test]
+fn pattern_errors_carry_what_rustc_reports() {
+    let db = TestDB::with_files(PATTERNS);
+    crate::attach_db(&db, || {
+        let ranges = |name: &str| -> Vec<(Option<(TyKind<'_>, bool)>, Option<bool>)> {
+            let (_, result) = infer(&db, name);
+            result
+                .diagnostics()
+                .iter()
+                .filter_map(|it| match it {
+                    InferenceDiagnostic::InvalidRangePatType { lhs, rhs, .. } => Some((
+                        lhs.as_ref().map(|(ty, fail)| (ty.as_ref().kind(), *fail)),
+                        rhs.as_ref().map(|&(_, fail)| fail),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        // "this is of type `{integer}`" on `10`, "... `&'static str` but it should be `char` or
+        // numeric" on `"what"`.
+        assert_eq!(
+            ranges("one_bad_end"),
+            [(Some((TyKind::Infer(InferTy::FreshIntTy(0)), false)), Some(true))]
+        );
+        let both = ranges("both_bad");
+        assert_eq!(both.len(), 1);
+        assert_eq!((both[0].0.as_ref().map(|(_, fail)| *fail), both[0].1), (Some(true), Some(true)));
+
+        let counts = |name: &str| -> Vec<bool> {
+            let (_, result) = infer(&db, name);
+            result
+                .diagnostics()
+                .iter()
+                .filter_map(|it| match *it {
+                    InferenceDiagnostic::MismatchedTupleStructPatArgCount { had_err, .. } => {
+                        Some(had_err)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // rustc suggests `W((_a, _b))` only where the pattern's type matched.
+        assert_eq!(counts("count_of_other_type"), [true]);
+        assert_eq!(counts("count"), [false]);
+    });
+}
+
+const VALUES: &str = r#"
+//- minicore: sized
+static mut STATIC_MUT: u8 = 0;
+struct P { f: u8 }
+const C: P = P { f: 1 };
+fn values() {
+    let local = P { f: 2 };
+    let _a = unsafe { &STATIC_MUT };
+    let _b = &local.f;
+    let ref _c = C;
+}
+"#;
+
+#[test]
+fn inference_records_the_value_each_path_resolved_to() {
+    let db = TestDB::with_files(VALUES);
+    crate::attach_db(&db, || {
+        let (body, result) = infer(&db, "values");
+        let values: Vec<_> = body
+            .exprs()
+            .filter(|(_, it)| matches!(it, Expr::Path(_)))
+            .map(|(id, _)| result.value_resolution(id.into()))
+            .collect();
+        let [Some(ValueNs::StaticId(_)), Some(ValueNs::LocalBinding(local)), Some(ValueNs::ConstId(_))] =
+            values[..]
+        else {
+            panic!("`STATIC_MUT`, `local` and `C` resolve through inference, not {values:?}");
+        };
+        assert_eq!(body[local].name.as_str(), "local");
+    });
+}
+
+/// rustc's `issues/issue-35976.rs`: `Future` is not in scope, so `wait` is the trait object's,
+/// and a probe of every trait picks `Future`'s for `B` instead.
+const SIZED_BOUND: &str = r#"
+//- minicore: sized, receiver
+mod private {
+    pub trait Future {
+        fn wait(&self) where Self: Sized;
+    }
+    pub struct B(pub &'static dyn Future);
+    impl core::ops::Deref for B {
+        type Target = dyn Future;
+        fn deref(&self) -> &(dyn Future + 'static) { self.0 }
+    }
+    impl Future for B {
+        fn wait(&self) {}
+    }
+}
+fn bar(arg: private::B) {
+    arg.wait();
+}
+"#;
+
+#[test]
+fn a_sized_bound_on_a_trait_object_carries_the_pick() {
+    let db = TestDB::with_files(SIZED_BOUND);
+    crate::attach_db(&db, || {
+        let (_, result) = infer(&db, "bar");
+        let found: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter_map(|it| match it {
+                InferenceDiagnostic::MethodCallIllegalSizedBound {
+                    method, bound, needs_mut, candidates, ..
+                } => Some((*method, *bound, *needs_mut, candidates.clone())),
+                _ => None,
+            })
+            .collect();
+        let [(method, bound, needs_mut, ref candidates)] = found[..] else {
+            panic!("one illegal `Sized` bound of `wait`, not {found:?}");
+        };
+        let ItemContainerId::TraitId(future) = method.lookup(&db).container else {
+            panic!("`wait` is the trait's method");
+        };
+        assert_eq!(TraitSignature::of(&db, future).name.as_str(), "Future");
+        assert_eq!(bound, Some(method.into()), "the bound is in `wait`'s where clause");
+        assert!(!needs_mut);
+        assert_eq!(&candidates[..], [future], "a probe of every trait picks `Future`'s `wait` for `B`");
     });
 }

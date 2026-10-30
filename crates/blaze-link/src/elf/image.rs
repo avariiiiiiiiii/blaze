@@ -2,7 +2,10 @@
 //! after the last region the symbol table, the debug sections and the section headers.
 //!
 //! [`file`] reads the synthetic regions' bytes from [`Placed::contents`], where the core puts
-//! what [`crate::model::Writer::synthesize`] returned, so no table is built twice.
+//! what [`crate::model::Writer::synthesize`] returned, so no table is built twice. An
+//! incremental output keeps the tail past the debug sections and, where [`Placed::delta`]
+//! spliced functions without changing any name's length, rewrites only their local symbols
+//! and names in it; the rest of the tail is small and written whole.
 
 use object::elf;
 use rayon::prelude::*;
@@ -12,7 +15,7 @@ use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, EHDR, Elf, GNU_HASH, INTERP, PHDR, PHDRS, PREINIT_ARRAY,
     RELA_DYN, Segment, VERNEED, VERSYM, error, in_file,
 };
-use crate::model::{Class, File, Placed, SymbolKind};
+use crate::model::{Class, File, Function, Placed, Region, Splice, SymbolKind};
 use crate::{LinkError, OutputKind};
 
 const SYM: usize = 24;
@@ -132,6 +135,157 @@ fn verneeds(bytes: &[u8]) -> u32 {
         at += next as usize;
     }
     count
+}
+
+/// Where the tail's tables are, from the tail's start (`tail`) past `len` bytes of debug
+/// sections: two tails of one layout put every symbol and name at the same offset.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+struct Layout {
+    tail: u64,
+    len: usize,
+    /// The named functions and the bytes their names take in `.strtab`.
+    named: usize,
+    function_names: usize,
+    /// The bytes the exports' and imports' names take, and how many there are.
+    global_names: usize,
+    globals: usize,
+    shstrtab_len: usize,
+    shdrs: usize,
+}
+
+impl Layout {
+    fn symtab(&self) -> usize {
+        self.len.next_multiple_of(8)
+    }
+
+    fn strtab(&self) -> usize {
+        self.symtab() + (1 + self.named + self.globals) * SYM
+    }
+
+    fn strtab_len(&self) -> usize {
+        1 + self.function_names + self.global_names
+    }
+
+    fn shstrtab(&self) -> usize {
+        self.strtab() + self.strtab_len()
+    }
+
+    fn shoff(&self) -> usize {
+        (self.shstrtab() + self.shstrtab_len).next_multiple_of(8)
+    }
+}
+
+/// The tail past the debug sections as [`file`] made it, kept to patch the next.
+#[derive(Default)]
+pub(crate) struct KeptSymtab {
+    synthesis: u64,
+    layout: Layout,
+    /// By function, in [`Placed::functions`] order.
+    locals: Vec<Local>,
+    bytes: Vec<u8>,
+}
+
+/// A function's local symbol: its index in `.symtab` (0 for an unnamed function, which has
+/// none), its name's offset in `.strtab` and the bytes the name takes there.
+#[derive(Clone, Copy, Default, Debug)]
+struct Local {
+    sym: u32,
+    name: u32,
+    stored: u32,
+}
+
+impl KeptSymtab {
+    /// Whether each function `splices` put in has a name where the one it replaced had, of
+    /// the length that one's had: then every local keeps its index and its name's place.
+    fn same_locals(&self, functions: &[Function], splices: &[Splice]) -> bool {
+        self.locals.len() == functions.len()
+            && splices.iter().all(|splice| {
+                let (start, end) = (splice.new.start as usize, splice.new.end as usize);
+                match (functions.get(start..end), self.locals.get(start..end)) {
+                    (Some(functions), Some(locals)) => {
+                        functions.iter().zip(locals).all(|(function, local)| match function.name.as_deref() {
+                            None => local.sym == 0,
+                            Some(name) => local.sym != 0 && local.stored as usize == stored(name),
+                        })
+                    }
+                    _ => false,
+                }
+            })
+    }
+
+    /// Rewrites the local symbol and name of each function `splices` put in, once
+    /// [`KeptSymtab::same_locals`] held; `symtab` and `strtab` are where the tables are in the
+    /// kept bytes.
+    fn patch_locals(&mut self, regions: &[Region], functions: &[Function], splices: &[Splice], symtab: usize, strtab: usize) {
+        for splice in splices {
+            for at in splice.new.start as usize..splice.new.end as usize {
+                let (function, local) = (&functions[at], self.locals[at]);
+                let Some(name) = function.name.as_deref() else { continue };
+                let symbol = local_symbol(regions, function, local.name);
+                self.bytes[symtab + SYM * local.sym as usize..][..SYM].copy_from_slice(&symbol.bytes());
+                self.bytes[strtab + local.name as usize..][..name.len()].copy_from_slice(name.as_bytes());
+            }
+        }
+    }
+}
+
+/// By chunk of [`CHUNK`] functions: how many are named and the bytes their names take.
+fn name_counts(functions: &[Function]) -> Vec<(usize, usize)> {
+    functions
+        .par_chunks(CHUNK)
+        .map(|chunk| {
+            (chunk.iter().filter_map(|it| it.name.as_deref())).fold((0, 0), |(count, len), name| (count + 1, len + stored(name)))
+        })
+        .collect() // alloc: once per image, one count per chunk of functions
+}
+
+fn local_symbol(regions: &[Region], function: &Function, name: u32) -> Sym {
+    Sym {
+        name,
+        info: info(elf::STB_LOCAL, SymbolKind::Function),
+        shndx: shndx(regions, function.addr),
+        value: function.addr,
+        size: function.size,
+    }
+}
+
+/// The cheap part of the tail, written whole on every link: the exports' and imports'
+/// symbols and names, `.shstrtab` and the section headers. `bytes` is the tail from
+/// `layout.len`, its other bytes as they are.
+fn globals_and_headers(
+    placed: &Placed<'_>,
+    layout: &Layout,
+    bytes: &mut [u8],
+    shstrtab: &[u8],
+    shdrs: &[Shdr],
+) -> Result<(), LinkError> {
+    let (base, regions) = (layout.len, placed.regions);
+    let (head, rest) = bytes.split_at_mut(layout.strtab() - base);
+    let syms = &mut head[layout.symtab() - base + SYM * (1 + layout.named)..];
+    let strs = &mut rest[1 + layout.function_names..layout.strtab_len()];
+    strs.fill(0);
+    let mut strings = Names { bytes: strs, at: 0, offset: (1 + layout.function_names) as u32 };
+    let mut out = syms.chunks_exact_mut(SYM);
+    for export in placed.exports {
+        let symbol = Sym {
+            name: strings.add(&export.name),
+            info: info(elf::STB_GLOBAL, export.kind),
+            shndx: shndx(regions, export.addr),
+            value: value(placed, &export.name, export.addr, export.kind)?,
+            size: export.size,
+        };
+        out.next().expect("a symbol counted").copy_from_slice(&symbol.bytes());
+    }
+    for import in placed.imports {
+        let bind = if import.weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
+        let symbol = Sym { name: strings.add(&import.name), info: info(bind, import.kind), ..Sym::default() };
+        out.next().expect("a symbol counted").copy_from_slice(&symbol.bytes());
+    }
+    bytes[layout.shstrtab() - base..][..shstrtab.len()].copy_from_slice(shstrtab);
+    for (shdr, out) in shdrs.iter().zip(bytes[layout.shoff() - base..].chunks_exact_mut(SHDR)) {
+        out.copy_from_slice(&shdr.bytes());
+    }
+    Ok(())
 }
 
 pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError> {
@@ -333,16 +487,28 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     // `.symtab`: the functions by name (locals, for backtraces and debuggers), then the
     // exports and the imports. Each name has its own place in `.strtab`, unshared as mold
     // writes it, so both tables are laid out by prefix sums over chunks of functions and
-    // filled in parallel, straight into the file's tail.
-    let chunks: Vec<(usize, usize)> = placed
-        .functions
-        .par_chunks(CHUNK)
-        .map(|chunk| {
-            chunk.iter().filter_map(|it| it.name.as_deref()).fold((0, 0), |(count, len), name| (count + 1, len + stored(name)))
-        })
-        .collect(); // alloc: once per image, one count per chunk of functions
-    let named: usize = chunks.iter().map(|it| it.0).sum();
-    let function_names: usize = chunks.iter().map(|it| it.1).sum();
+    // filled in parallel, straight into the file's tail. An incremental output keeps the
+    // tail and, when only functions' symbols changed and no name's length did, rewrites
+    // those in place.
+    let mut last = writer.last();
+    let mut kept = last.as_deref_mut().map(|it| &mut it.symtab);
+    let from = kept.as_deref_mut().map_or(0, |it| std::mem::replace(&mut it.synthesis, 0));
+    let patch = match (kept.as_deref(), placed.delta) {
+        (Some(kept), Some(delta)) => {
+            from != 0 && delta.patches(from, &[delta.functions]) && kept.same_locals(placed.functions, delta.functions)
+        }
+        _ => false,
+    };
+    let (mut chunks, named, function_names) = match kept.as_deref() {
+        // alloc: none, an empty Vec holds no buffer
+        Some(kept) if patch => (Vec::new(), kept.layout.named, kept.layout.function_names),
+        _ => {
+            let chunks = name_counts(placed.functions);
+            let named: usize = chunks.iter().map(|it| it.0).sum();
+            let function_names: usize = chunks.iter().map(|it| it.1).sum();
+            (chunks, named, function_names)
+        }
+    };
     let global_names = placed.exports.iter().map(|it| stored(&it.name)).sum::<usize>()
         + placed.imports.iter().map(|it| stored(&it.name)).sum::<usize>();
     let symbols = 1 + named + placed.exports.len() + placed.imports.len();
@@ -409,65 +575,94 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     let shoff_at = (shstrtab_at + names.bytes.len()).next_multiple_of(8);
     let shoff = tail + shoff_at as u64;
 
-    // The tail after the debug sections: the padding to `.symtab`, the symbol tables and the
-    // section headers, at `len` from `tail`. Each debug section is a part of its own, so a
-    // link whose debug info is as before writes none of it again.
-    // alloc: the output buffer, the file's tail past its debug info
-    let mut bytes = vec![0u8; shoff_at + shdrs.len() * SHDR - len];
-    {
-        let (head, rest) = bytes.split_at_mut(strtab_at - len);
-        let symtab = &mut head[symtab_at - len..];
-        let strtab = &mut rest[..strtab_len];
-        let (functions_syms, global_syms) = symtab.split_at_mut(SYM * (1 + named));
-        let (function_strs, global_strs) = strtab.split_at_mut(1 + function_names);
-        let (mut syms, mut strs) = (&mut functions_syms[SYM..], &mut function_strs[1..]);
-        let mut jobs = Vec::with_capacity(chunks.len());
-        let mut name_at = 1u32;
-        for (chunk, &(count, len)) in placed.functions.chunks(CHUNK).zip(&chunks) {
-            let (these_syms, rest) = std::mem::take(&mut syms).split_at_mut(SYM * count);
-            syms = rest;
-            let (these_strs, rest) = std::mem::take(&mut strs).split_at_mut(len);
-            strs = rest;
-            jobs.push((chunk, these_syms, these_strs, name_at));
-            name_at += len as u32;
-        }
-        jobs.into_par_iter().for_each(|(chunk, syms, strs, name_at)| {
-            let mut strings = Names { bytes: strs, at: 0, offset: name_at };
-            let functions = chunk.iter().filter_map(|it| it.name.as_deref().map(|name| (it, name)));
-            for ((function, name), out) in functions.zip(syms.chunks_exact_mut(SYM)) {
-                let symbol = Sym {
-                    name: strings.add(name),
-                    info: info(elf::STB_LOCAL, SymbolKind::Function),
-                    shndx: shndx(regions, function.addr),
-                    value: function.addr,
-                    size: function.size,
-                };
-                out.copy_from_slice(&symbol.bytes());
-            }
-        });
+    let layout = Layout {
+        tail,
+        len,
+        named,
+        function_names,
+        global_names,
+        globals: placed.exports.len() + placed.imports.len(),
+        shstrtab_len: names.bytes.len(),
+        shdrs: shdrs.len(),
+    };
+    debug_assert_eq!((layout.symtab(), layout.strtab(), layout.shoff()), (symtab_at, strtab_at, shoff_at));
 
-        let mut strings = Names { bytes: global_strs, at: 0, offset: name_at };
-        let mut out = global_syms.chunks_exact_mut(SYM);
-        for export in placed.exports {
-            let symbol = Sym {
-                name: strings.add(&export.name),
-                info: info(elf::STB_GLOBAL, export.kind),
-                shndx: shndx(regions, export.addr),
-                value: value(placed, &export.name, export.addr, export.kind)?,
-                size: export.size,
-            };
-            out.next().expect("a symbol counted").copy_from_slice(&symbol.bytes());
+    // The tail after the debug sections: the padding to `.symtab`, the symbol tables and the
+    // section headers, at `len` from `tail`. The debug sections are the core's
+    // (`File::debug`), so a link whose debug info is as before writes none of it again.
+    let size = shoff_at + shdrs.len() * SHDR - len;
+    let (symtab, strtab) = (symtab_at - len, strtab_at - len);
+    let bytes = match kept {
+        Some(kept) if patch && kept.layout == layout && kept.bytes.len() == size => {
+            let splices = placed.delta.map_or(&[][..], |it| it.functions);
+            kept.patch_locals(regions, placed.functions, splices, symtab, strtab);
+            globals_and_headers(placed, &layout, &mut kept.bytes, &names.bytes, &shdrs)?;
+            // alloc: the output buffer, the file's tail past its debug info
+            let mut bytes = Vec::with_capacity(size);
+            bytes.extend_from_slice(&kept.bytes);
+            kept.synthesis = placed.synthesis;
+            bytes
         }
-        for import in placed.imports {
-            let bind = if import.weak { elf::STB_WEAK } else { elf::STB_GLOBAL };
-            let symbol = Sym { name: strings.add(&import.name), info: info(bind, import.kind), ..Sym::default() };
-            out.next().expect("a symbol counted").copy_from_slice(&symbol.bytes());
+        mut kept => {
+            if patch {
+                chunks = name_counts(placed.functions);
+            }
+            // alloc: the output buffer, the file's tail past its debug info
+            let mut bytes = vec![0u8; size];
+            {
+                let locals: &mut [Local] = match kept.as_deref_mut() {
+                    Some(kept) => {
+                        kept.locals.clear();
+                        kept.locals.resize(placed.functions.len(), Local::default());
+                        &mut kept.locals[..]
+                    }
+                    None => &mut [],
+                };
+                let (head, rest) = bytes.split_at_mut(strtab);
+                let functions_syms = &mut head[symtab..symtab + SYM * (1 + named)];
+                let function_strs = &mut rest[..1 + function_names];
+                let (mut syms, mut strs, mut locals) = (&mut functions_syms[SYM..], &mut function_strs[1..], locals);
+                let mut jobs = Vec::with_capacity(chunks.len());
+                let (mut name_at, mut sym_at) = (1u32, 1u32);
+                for (chunk, &(count, len)) in placed.functions.chunks(CHUNK).zip(&chunks) {
+                    let (these_syms, rest) = std::mem::take(&mut syms).split_at_mut(SYM * count);
+                    syms = rest;
+                    let (these_strs, rest) = std::mem::take(&mut strs).split_at_mut(len);
+                    strs = rest;
+                    let kept_here = if locals.is_empty() { 0 } else { chunk.len() };
+                    let (these_locals, rest) = std::mem::take(&mut locals).split_at_mut(kept_here);
+                    locals = rest;
+                    jobs.push((chunk, these_syms, these_strs, these_locals, name_at, sym_at));
+                    name_at += len as u32;
+                    sym_at += count as u32;
+                }
+                jobs.into_par_iter().for_each(|(chunk, syms, strs, locals, name_at, sym_at)| {
+                    let mut strings = Names { bytes: strs, at: 0, offset: name_at };
+                    let mut out = syms.chunks_exact_mut(SYM);
+                    let mut sym = sym_at;
+                    for (at, function) in chunk.iter().enumerate() {
+                        let Some(name) = function.name.as_deref() else { continue };
+                        let offset = strings.add(name);
+                        let symbol = local_symbol(regions, function, offset);
+                        out.next().expect("a symbol counted").copy_from_slice(&symbol.bytes());
+                        if let Some(local) = locals.get_mut(at) {
+                            *local = Local { sym, name: offset, stored: stored(name) as u32 };
+                        }
+                        sym += 1;
+                    }
+                });
+            }
+            globals_and_headers(placed, &layout, &mut bytes, &names.bytes, &shdrs)?;
+            if let Some(kept) = kept {
+                kept.bytes.clear();
+                kept.bytes.extend_from_slice(&bytes);
+                kept.layout = layout;
+                kept.synthesis = placed.synthesis;
+            }
+            bytes
         }
-    }
-    bytes[shstrtab_at - len..shstrtab_at - len + names.bytes.len()].copy_from_slice(&names.bytes);
-    for (shdr, out) in shdrs.iter().zip(bytes[shoff_at - len..].chunks_exact_mut(SHDR)) {
-        out.copy_from_slice(&shdr.bytes());
-    }
+    };
+    drop(last);
 
     let mut head = Vec::with_capacity((EHDR + PHDR * phnum) as usize);
     head.extend_from_slice(&elf::ELFMAG);
@@ -502,26 +697,19 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     debug_assert!(head.len() as u64 <= plan.headers);
 
     // alloc: once per image, what `Writer::file` returns
-    let mut parts = Vec::with_capacity(2 + placed.debug.len());
+    let mut parts = Vec::with_capacity(2);
     parts.push((0, head));
+    // The debug sections are the core's: laid at their offsets, never copied here.
+    // alloc: once per image, an entry per debug section
+    let mut debug = Vec::with_capacity(placed.debug.len());
     let mut at = tail;
-    for (_, data) in placed.debug {
+    for (nth, (_, data)) in placed.debug.iter().enumerate() {
         if !data.is_empty() {
-            parts.push((at, copied(data)));
+            debug.push((at, nth));
         }
         at += data.len() as u64;
     }
     let file_len = at + bytes.len() as u64;
     parts.push((at, bytes));
-    Ok(File { len: file_len, parts })
-}
-
-/// `data` copied in pieces of 1 MiB in parallel, so the copy and the first touch of the new
-/// pages are spread over the cores: a debug section is the largest part of a file.
-fn copied(data: &[u8]) -> Vec<u8> {
-    const PIECE: usize = 1 << 20;
-    // alloc: once per debug section per image, what `File::parts` owns
-    let mut out = vec![0u8; data.len()];
-    out.par_chunks_mut(PIECE).zip(data.par_chunks(PIECE)).for_each(|(out, data)| out.copy_from_slice(data));
-    out
+    Ok(File { len: file_len, parts, debug })
 }

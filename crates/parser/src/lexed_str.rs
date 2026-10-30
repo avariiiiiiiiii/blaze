@@ -13,6 +13,8 @@ mod scan;
 
 use std::{borrow::Cow, ops};
 
+use blaze_mem::scratch::{self, Lent};
+
 use rustc_literal_escaper::{
     EscapeError, Mode, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char,
     unescape_str,
@@ -34,10 +36,16 @@ use crate::{
 /// sixteenth of a checkpoint's 4, 4.25 bytes, against the 6 of a kind (`u16`) and a start
 /// (`u32`) each; finding a start reads at most 15 lengths, and walking the tokens in order
 /// (`to_input`, `intersperse_trivia`) keeps a running offset instead.
+///
+/// Both columns are the worker's `u32` scratch ([`scratch::lend_u32s`]), back on the shelf of
+/// the thread that drops the `LexedStr`, so a warm lex allocates nothing. A shelf holds 4
+/// buffers: more than two `LexedStr`s alive at once on a thread allocate the extra columns.
 pub struct LexedStr<'a> {
     text: &'a str,
-    tokens: Vec<Token>,
-    checkpoints: Vec<u32>,
+    // Fields drop in declaration order: `checkpoints`, lent after `tokens`, goes back first,
+    // so the next lex takes each buffer back for the same column.
+    checkpoints: Lent<Vec<u32>>,
+    tokens: Lent<Vec<Token>>,
     long: Vec<(u32, u32)>,
     error: Vec<LexError>,
 }
@@ -219,11 +227,15 @@ struct Converter<'a> {
 
 impl<'a> Converter<'a> {
     fn new(edition: Edition, text: &'a str) -> Self {
+        let mut tokens = scratch::lend_u32s();
+        tokens.reserve(text.len() / 3);
+        let mut checkpoints = scratch::lend_u32s();
+        checkpoints.reserve(text.len() / 3 / CHECKPOINT + 1);
         Self {
             res: LexedStr {
                 text,
-                tokens: Vec::with_capacity(text.len() / 3),
-                checkpoints: Vec::with_capacity(text.len() / 3 / CHECKPOINT + 1),
+                checkpoints,
+                tokens,
                 // alloc: none until a token is 4 MiB or longer.
                 long: Vec::new(),
                 // alloc: none until the first error.

@@ -20,13 +20,13 @@ fn ui(name: &str, source: &str) -> String {
 fn ui_lint(name: &str, source: &str, lint: &str) -> String {
     let fixture = format!("//- /{name} crate:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
-    let mut sources = checked.sources();
+    let sources = checked.sources();
     let style = Style { ui_testing: true, ..Style::default() };
     let written: String = checked
         .diags
         .iter()
         .filter(|it| it.code.as_ref().is_some_and(|code| code.as_str() == lint))
-        .map(|it| emit::written(it, &mut sources, style))
+        .map(|it| emit::written(it, &sources, style))
         .collect();
     normalized(&written)
 }

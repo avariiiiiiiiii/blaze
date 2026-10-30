@@ -308,13 +308,8 @@ pub(super) mod tests {
 
     #[test]
     fn seeded_indexes_name_the_members_they_were_written_for() {
-        let mut seed = 0x2545_f491_4f6c_dd1du64;
-        let mut below = |n: u64| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed % n
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_f491_4f6c_dd1d);
+        let mut below = |n: u64| rng.below(n);
         for round in 0..64 {
             let count = 1 + below(20) as usize;
             let names: Vec<String> = (0..count)

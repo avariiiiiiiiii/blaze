@@ -9,31 +9,86 @@
 //! (`NonCamelCaseType`, `NonSnakeCaseDiag`, `NonUpperCaseGlobal`), and `lib.rs` for which
 //! pass each runs in (MIT or Apache-2.0).
 
+use std::fmt::{self, Write as _};
+
 use hir::{HasVisibility as _, InFile, Visibility};
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
 
 use crate::{
     cx::Cx,
+    lints::registry::LintId,
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
 
+/// Which of rustc's lints checks a name of hir's kind.
+#[derive(Clone, Copy)]
+enum Rule {
+    Camel,
+    Snake,
+    Upper,
+    Unknown,
+}
+
+/// hir's kind of a name as its `Display` writes it, on the stack: hir does not export the kind.
+struct Kind {
+    bytes: [u8; 16],
+    len: usize,
+}
+
+impl fmt::Write for Kind {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+fn rule(d: &hir::IncorrectCase) -> Rule {
+    let mut kind = Kind { bytes: [0; 16], len: 0 };
+    if write!(kind, "{}", d.ident_type).is_err() {
+        return Rule::Unknown;
+    }
+    match std::str::from_utf8(&kind.bytes[..kind.len]) {
+        Ok("Structure" | "Enum" | "Union" | "Trait" | "Type alias" | "Variant") => Rule::Camel,
+        Ok("Function" | "Variable" | "Parameter" | "Field" | "Module") => Rule::Snake,
+        Ok("Constant" | "Static variable") => Rule::Upper,
+        _ => Rule::Unknown,
+    }
+}
+
+/// A name in rustc's case is one check of its text: the tree is read only for a name rustc
+/// flags.
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
+    let raw = d.ident_text.as_str();
+    let name = raw.strip_prefix("r#").unwrap_or(raw);
+    let rule = rule(d);
+    const CAMEL: LintId = LintId::named("non_camel_case_types");
+    const SNAKE: LintId = LintId::named("non_snake_case");
+    const UPPER: LintId = LintId::named("non_upper_case_globals");
+    let in_case = match rule {
+        Rule::Camel => !cx.lint_may_fire(CAMEL) || is_upper_camel_case(name),
+        Rule::Snake => !cx.lint_may_fire(SNAKE) || is_snake_case(name),
+        Rule::Upper => !cx.lint_may_fire(UPPER) || name.chars().all(|c| c.to_uppercase().eq([c])),
+        Rule::Unknown => false,
+    };
+    if in_case {
+        return Vec::new();
+    }
     let name_ptr = InFile::new(d.file, d.ident);
     let name_node = cx.node(name_ptr);
     let Some(owner) = name_node.value.syntax().parent() else { return Vec::new() };
-    let raw = d.ident_text.as_str();
-    let name = raw.strip_prefix("r#").unwrap_or(raw);
-    let span = cx.span_of_ptr(name_ptr);
     let at = |node: &SyntaxNode| InFile::new(d.file, SyntaxNodePtr::new(node));
-    let found = match d.ident_type.to_string().as_str() {
-        "Structure" | "Enum" | "Union" | "Trait" | "Type alias" | "Variant" => {
+    let found = match rule {
+        Rule::Camel => {
             // rustc's early pass has no `check_foreign_item` for this lint.
             let foreign = owner.kind() == SyntaxKind::TYPE_ALIAS
                 && owner.parent().is_some_and(|it| it.kind() == SyntaxKind::EXTERN_ITEM_LIST);
-            if foreign || is_upper_camel_case(name) {
+            if foreign {
                 return Vec::new();
             }
+            let span = cx.span_of_ptr(name_ptr);
             let (sort, lint_at) = camel_sort(&owner);
             let mut diag =
                 Diag::lint("non_camel_case_types", format!("{sort} `{name}` should have an upper camel case name"), span.clone());
@@ -44,10 +99,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
             };
             Found::lint(diag, Phase::Resolve, at(&lint_at))
         }
-        "Function" | "Variable" | "Parameter" | "Field" | "Module" => {
-            if is_snake_case(name) {
-                return Vec::new();
-            }
+        Rule::Snake => {
+            let span = cx.span_of_ptr(name_ptr);
             let sort = snake_sort(&owner);
             let mut diag = Diag::lint("non_snake_case", format!("{sort} `{name}` should have a snake case name"), span.clone());
             let sc = to_snake_case(name);
@@ -68,10 +121,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
             }
             Found::lint(diag, Phase::Late, at(&owner))
         }
-        "Constant" | "Static variable" => {
-            if name.chars().all(|c| c.to_uppercase().eq([c])) {
-                return Vec::new();
-            }
+        Rule::Upper => {
+            let span = cx.span_of_ptr(name_ptr);
             let (sort, exported) = upper_sort(cx, &owner, d.file);
             let mut diag =
                 Diag::lint("non_upper_case_globals", format!("{sort} `{name}` should have an upper case name"), span.clone());
@@ -88,11 +139,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
             };
             Found::lint(diag, Phase::Late, at(&owner))
         }
-        other => {
+        Rule::Unknown => {
             let diag = Diag::error(
                 None,
-                format!("blaze does not know rustc's style lint of a name of kind `{other}`: `{name}`"),
-                span,
+                format!("blaze does not know rustc's style lint of a name of kind `{}`: `{name}`", d.ident_type),
+                cx.span_of_ptr(name_ptr),
             );
             Found::new(diag, Phase::Late)
         }
@@ -177,8 +228,8 @@ fn can_be_raw(name: &str) -> bool {
 /// `char::to_titlecase`, which rustc's lint uses and std has only unstably: Unicode's title
 /// case mapping (`UnicodeData.txt` and `SpecialCasing.txt`), which is the upper case one but
 /// for the characters below.
-fn to_titlecase(c: char) -> Vec<char> {
-    let special: &[char] = match c {
+fn to_titlecase(c: char) -> TitleCase {
+    let special: &'static [char] = match c {
         'ß' => &['S', 's'],
         '\u{FB00}' => &['F', 'f'],
         '\u{FB01}' => &['F', 'i'],
@@ -204,7 +255,7 @@ fn to_titlecase(c: char) -> Vec<char> {
         _ => &[],
     };
     if !special.is_empty() {
-        return special.to_vec();
+        return TitleCase::Special(special.iter().copied());
     }
     let offset = |by: u32| char::from_u32(c as u32 + by).expect("a letter of the Greek Extended block");
     let single = match c {
@@ -216,9 +267,28 @@ fn to_titlecase(c: char) -> Vec<char> {
         '\u{1FB3}' | '\u{1FC3}' | '\u{1FF3}' => offset(9),
         '\u{10D0}'..='\u{10FA}' | '\u{10FD}'..='\u{10FF}' => c,
         _ if is_titlecase(c) => c,
-        _ => return c.to_uppercase().collect(),
+        _ => return TitleCase::Upper(c.to_uppercase()),
     };
-    vec![single]
+    TitleCase::One(std::iter::once(single))
+}
+
+/// The characters of a title case mapping, without a buffer.
+enum TitleCase {
+    Special(std::iter::Copied<std::slice::Iter<'static, char>>),
+    One(std::iter::Once<char>),
+    Upper(std::char::ToUppercase),
+}
+
+impl Iterator for TitleCase {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        match self {
+            TitleCase::Special(it) => it.next(),
+            TitleCase::One(it) => it.next(),
+            TitleCase::Upper(it) => it.next(),
+        }
+    }
 }
 
 /// `char::is_titlecase`: the letters of Unicode's category `Lt`.
@@ -244,7 +314,7 @@ fn char_has_case(c: char) -> bool {
 }
 
 fn changes_when_titlecased(c: char) -> bool {
-    to_titlecase(c) != [c]
+    !to_titlecase(c).eq([c])
 }
 
 fn not_camel_case(s: &str) -> bool {

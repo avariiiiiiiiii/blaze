@@ -39,48 +39,49 @@ pub fn instrument(func: &mut ir::Function) -> Result<(), Error> {
         colocated: true,
         tls: false,
     });
-    // alloc: one per function compiled at tier 1, beside Cranelift's own per-function tables.
-    let mut order = vec![u32::MAX; func.dfg.num_blocks()];
-    for (at, block) in func.layout.blocks().enumerate() {
-        order[block.as_u32() as usize] = at as u32;
-    }
-    let mut edges: SmallVec<[Edge; 16]> = SmallVec::new();
-    for block in func.layout.blocks() {
-        let Some(last) = func.layout.last_inst(block) else { continue };
-        let data = &func.dfg.insts[last];
-        let from = order[block.as_u32() as usize];
-        let mut before = false;
-        let dests = data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
-        for (index, call) in dests.iter().enumerate() {
-            if order[call.block(&func.dfg.value_lists).as_u32() as usize] > from {
-                continue;
-            }
-            match data.opcode() {
-                ir::Opcode::Brif | ir::Opcode::BrTable => {
-                    edges.push(Edge::Split { inst: last, index: index as u32 });
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, |temp| -> Result<(), Error> {
+        let order = temp.alloc_slice_fill_with(func.dfg.num_blocks(), |_| u32::MAX);
+        for (at, block) in func.layout.blocks().enumerate() {
+            order[block.as_u32() as usize] = at as u32;
+        }
+        let mut edges: SmallVec<[Edge; 16]> = SmallVec::new();
+        for block in func.layout.blocks() {
+            let Some(last) = func.layout.last_inst(block) else { continue };
+            let data = &func.dfg.insts[last];
+            let from = order[block.as_u32() as usize];
+            let mut before = false;
+            let dests = data.branch_destination(&func.dfg.jump_tables, &func.dfg.exception_tables);
+            for (index, call) in dests.iter().enumerate() {
+                if order[call.block(&func.dfg.value_lists).as_u32() as usize] > from {
+                    continue;
                 }
-                _ if !before => {
-                    before = true;
-                    edges.push(Edge::Before(last));
+                match data.opcode() {
+                    ir::Opcode::Brif | ir::Opcode::BrTable => {
+                        edges.push(Edge::Split { inst: last, index: index as u32 });
+                    }
+                    _ if !before => {
+                        before = true;
+                        edges.push(Edge::Before(last));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
-    for edge in edges {
-        match edge {
-            Edge::Before(inst) => {
-                let srcloc = func.srcloc(inst);
-                let mut cursor = FuncCursor::new(func).at_inst(inst).with_srcloc(srcloc);
-                add(&mut cursor, cells, BACK_EDGES);
+        for edge in edges {
+            match edge {
+                Edge::Before(inst) => {
+                    let srcloc = func.srcloc(inst);
+                    let mut cursor = FuncCursor::new(func).at_inst(inst).with_srcloc(srcloc);
+                    add(&mut cursor, cells, BACK_EDGES);
+                }
+                Edge::Split { inst, index } => split(func, cells, inst, index as usize)?,
             }
-            Edge::Split { inst, index } => split(func, cells, inst, index as usize)?,
         }
-    }
-    let srcloc = func.layout.first_inst(entry).map(|it| func.srcloc(it)).unwrap_or_default();
-    let mut cursor = FuncCursor::new(func).at_first_insertion_point(entry).with_srcloc(srcloc);
-    add(&mut cursor, cells, CALLS);
-    Ok(())
+        let srcloc = func.layout.first_inst(entry).map(|it| func.srcloc(it)).unwrap_or_default();
+        let mut cursor = FuncCursor::new(func).at_first_insertion_point(entry).with_srcloc(srcloc);
+        add(&mut cursor, cells, CALLS);
+        Ok(())
+    })
 }
 
 /// Moves successor `index` of `inst` to a new block right after `inst`'s that counts a back
@@ -108,7 +109,7 @@ fn split(func: &mut ir::Function, cells: ir::GlobalValue, inst: ir::Inst, index:
 
 /// `cells[offset] += 1`, as a plain load and store.
 fn add(cursor: &mut FuncCursor<'_>, cells: ir::GlobalValue, offset: i64) {
-    let flags = ir::MemFlags::trusted();
+    let flags = ir::MemFlagsData::trusted();
     let at = cursor.ins().global_value(types::I64, cells);
     let count = cursor.ins().load(types::I64, flags, at, offset as i32);
     let count = cursor.ins().iadd_imm(count, 1);

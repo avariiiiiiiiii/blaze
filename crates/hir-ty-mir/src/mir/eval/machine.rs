@@ -40,10 +40,12 @@ pub enum MemKind {
     /// `const_allocate`.
     ConstHeap,
     /// The evaluator's own: program arguments, the environment, thread-local storage, the
-    /// thread shims' memory (anonymous `mmap`, `errno` cells, dispatch semaphores). Roots of
-    /// the leak check; the program frees only the shims' memory, through `munmap` and
-    /// `dispatch_release`.
+    /// thread shims' `errno` cells and dispatch semaphores. Roots of the leak check; the
+    /// program frees only the semaphores, through `dispatch_release`.
     Machine,
+    /// An anonymous `mmap`, freed by `munmap`. Like the heap, and unlike [`Self::Machine`],
+    /// it is made at the allocating thread's time (Miri's `MiriMemoryKind::Mmap`).
+    Mmap,
 }
 
 /// How bytes are accessed.
@@ -181,6 +183,10 @@ pub trait Machine<'db> {
         old: &[u8],
     ) -> MResult<()>;
     fn fence(&mut self, ord: AtomicOrd, compiler_only: bool) -> MResult<()>;
+    /// `ptr_offset_from(a, b)` (`unsigned`: `ptr_offset_from_unsigned`): both in bounds of one
+    /// allocation, as rustc's evaluation requires.
+    fn offset_from(&mut self, a: Ptr<Self::Prov>, b: Ptr<Self::Prov>, unsigned: bool)
+    -> MResult<()>;
 
     /// After every typed copy into `place`: checks the value at `ty` and retags what it holds
     /// by `mode`. `bytes` are the value's bytes, already written.
@@ -303,6 +309,10 @@ impl<'db> Machine<'db> for Plain {
     }
     #[inline(always)]
     fn fence(&mut self, _: AtomicOrd, _: bool) -> MResult<()> {
+        Ok(())
+    }
+    #[inline(always)]
+    fn offset_from(&mut self, _: Ptr<()>, _: Ptr<()>, _: bool) -> MResult<()> {
         Ok(())
     }
     #[inline(always)]

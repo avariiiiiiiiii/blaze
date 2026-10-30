@@ -27,6 +27,8 @@ pub enum Tag {
     Store,
     Vfs,
     Usercode,
+    /// Lints and diagnostics passes.
+    Diagnostics,
     /// The query database's memo tables and runs.
     Query,
     /// The plane's tasks and requests.
@@ -46,7 +48,7 @@ pub enum Tag {
 }
 
 impl Tag {
-    pub const COUNT: usize = 19;
+    pub const COUNT: usize = 20;
 
     pub const ALL: [Tag; Tag::COUNT] = [
         Tag::Parse,
@@ -59,6 +61,7 @@ impl Tag {
         Tag::Store,
         Tag::Vfs,
         Tag::Usercode,
+        Tag::Diagnostics,
         Tag::Query,
         Tag::Plane,
         Tag::Io,
@@ -86,6 +89,7 @@ impl Tag {
             Tag::Store => "store",
             Tag::Vfs => "vfs",
             Tag::Usercode => "usercode",
+            Tag::Diagnostics => "diagnostics",
             Tag::Query => "query",
             Tag::Plane => "plane",
             Tag::Io => "io",

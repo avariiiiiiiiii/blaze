@@ -180,7 +180,7 @@ impl CrateProcMacros {
         };
         proc_macros.get(idx as usize).ok_or_else(|| {
                 ExpandError::other(err_span,
-                    format!(
+                    format!( // alloc: an error's message, on the error path
                         "internal error: proc-macro index out of bounds: the length is {} but the index is {}",
                         proc_macros.len(),
                         idx
@@ -208,7 +208,7 @@ impl CrateProcMacros {
                         let name = crate::name::Name::new_symbol(it.name, def_site_ctx);
                         (name, CustomProcMacroExpander::new(idx as u32), it.disabled)
                     })
-                    .collect(),
+                    .collect(), // alloc: once per crate's def map: its proc macros' names
             ),
             _ => None,
         }

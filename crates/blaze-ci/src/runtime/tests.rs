@@ -119,7 +119,7 @@ fn the_state_file_round_trips_and_is_empty_at_first() {
 
 #[test]
 fn the_oldest_delivery_ids_are_forgotten() {
-    let mut seen = Seen::default();
+    let mut seen = Seen::new(listen::REMEMBERED);
     assert!(seen.first("a"));
     assert!(!seen.first("a"));
     for n in 0..listen::REMEMBERED {
@@ -127,6 +127,196 @@ fn the_oldest_delivery_ids_are_forgotten() {
     }
     assert!(seen.first("a"), "forgotten after REMEMBERED others");
     assert!(!seen.first(&(listen::REMEMBERED - 1).to_string()));
+}
+
+/// The ids remembered as the queue and set they were before the ring: the same answers over
+/// seeded ids, with repeats, ids longer than a slot's room, and every size from one.
+#[test]
+fn the_ring_of_ids_answers_as_a_queue_and_a_set_did() {
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for most in [1, 2, 3, 7, 64, 500] {
+        let mut seen = Seen::new(most);
+        let mut order = std::collections::VecDeque::new();
+        let mut ids = std::collections::HashSet::new();
+        for step in 0..20 * most + 200 {
+            let pick = next();
+            let id = match pick % 3 {
+                0 => format!("{:08x}-cc78-11e3-81ab-4c9367dc0958", pick % (3 * most as u64)),
+                1 => format!("{}", pick % (2 * most as u64)),
+                _ => "x".repeat(60 + (pick % 20) as usize),
+            };
+            let want = if ids.contains(&id) {
+                false
+            } else {
+                if order.len() == most
+                    && let Some(oldest) = order.pop_front()
+                {
+                    ids.remove(&oldest);
+                }
+                order.push_back(id.clone());
+                ids.insert(id.clone());
+                true
+            };
+            assert_eq!(seen.first(&id), want, "{most} {step} {id}");
+        }
+    }
+}
+
+/// A connection's bytes in, and what it was answered, in memory.
+struct Wire<'a> {
+    input: &'a [u8],
+    at: usize,
+    written: &'a mut Vec<u8>,
+}
+
+impl std::io::Read for Wire<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(self.input.len() - self.at);
+        buf[..n].copy_from_slice(&self.input[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+impl Write for Wire<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_warm_webhook_delivery_allocates_only_the_event_it_hands_on() {
+    let path = temp("webhook-budget-secret");
+    std::fs::write(&path, "It's a Secret to Everybody\n").unwrap();
+    let secret = Arc::new(Secret::read(&path).unwrap());
+    std::fs::remove_file(&path).unwrap();
+    let (service, inputs) = mpsc::channel();
+    let shared = Listener::remembering(secret.clone(), "o/r".to_owned(), service, 4);
+    let mut parser = http::RequestParser::new(crate::webhook::MOST_PAYLOAD);
+    let mut answer = listen::Answer::default();
+    let mut written = Vec::with_capacity(4096);
+    let wire = |kind: &str, id: &str, body: &str| {
+        let signature = sign(secret.expose(), body.as_bytes());
+        let headers = [
+            ("X-GitHub-Event", kind),
+            ("X-GitHub-Delivery", id),
+            ("X-Hub-Signature-256", signature.as_str()),
+            ("Content-Type", "application/json"),
+        ];
+        http::request("POST", "localhost", "/", &headers, body.as_bytes())
+    };
+    let mut exchange = |bytes: &[u8], written: &mut Vec<u8>| {
+        written.clear();
+        parser.reset();
+        let mut stream = Wire { input: bytes, at: 0, written };
+        listen::exchange(&mut stream, &shared, &mut parser, &mut answer);
+    };
+    let answered = |status: u16, said: &str| http::response(status, &listen_headers(), format!("{said}\n").as_bytes());
+
+    for n in 0..8 {
+        exchange(&wire("push", &format!("warm-{n}"), &push_body(n)), &mut written);
+        assert_eq!(written, answered(202, "accepted"), "{n}");
+    }
+    let new = wire("push", "new", &push_body(8));
+    let again = wire("push", "new", &push_body(8));
+    let ping = wire("ping", "ping", r#"{"zen":"Keep it logically awesome.","hook_id":1}"#);
+    let other = push_body(9).replace("o/r", "x/y");
+    let elsewhere = wire("push", "elsewhere", &other);
+    blaze_alloc_count::assert_at_most(
+        3,
+        "a new delivery: its event's branch and commit, handed to the service, and at most one \
+         block of the service's channel, which holds 31",
+        || exchange(&new, &mut written),
+    );
+    assert_eq!(written, answered(202, "accepted"));
+    blaze_alloc_count::assert_at_most(0, "a redelivery", || exchange(&again, &mut written));
+    assert_eq!(written, answered(202, "delivery new was already received"));
+    blaze_alloc_count::assert_at_most(0, "a ping", || exchange(&ping, &mut written));
+    assert_eq!(written, answered(202, "nothing for CI to run"));
+    exchange(&elsewhere, &mut written);
+    assert_eq!(written, answered(403, "a delivery for x/y, and this service is for o/r"));
+
+    let events: Vec<Input> = inputs.try_iter().collect();
+    assert_eq!(events.len(), 9);
+    assert_eq!(
+        events[8],
+        Input::Event(Event::Push { branch: "b8".to_owned(), commit: format!("{:040x}", 9) })
+    );
+}
+
+#[test]
+fn a_workers_warm_reads_allocate_only_what_each_response_owns() {
+    use blaze_api::{Envelope, Response, TestOutcome, TestResult, frames};
+
+    let done = |id: u64| frames::encode(&Envelope::new(id, Response::Done { ok: id % 2 == 0 })).unwrap();
+    let batch: Vec<u8> = (0..32).flat_map(|id| done(id)).collect();
+    let mut incoming = frames::Frames::new();
+    let mut seen: Vec<u64> = Vec::with_capacity(64);
+    incoming.push(&batch);
+    assert_eq!(super::worker::drain(&mut incoming, |envelope| { seen.push(envelope.id); true }), Ok(true));
+    assert_eq!(seen, (0..32).collect::<Vec<u64>>());
+    seen.clear();
+    incoming.push(&batch);
+    let read = blaze_alloc_count::assert_at_most(0, "32 `Done`s read in place", || {
+        super::worker::drain(&mut incoming, |envelope| {
+            seen.push(envelope.id);
+            true
+        })
+    });
+    assert_eq!((read, seen.len()), (Ok(true), 32));
+
+    let result = TestResult {
+        binary: "blaze_ci".to_owned(),
+        name: "a_test".to_owned(),
+        cached: None,
+        outcome: TestOutcome::Passed,
+        output: b"ok\n".to_vec(),
+        millis: 3,
+    };
+    incoming.push(&frames::encode(&Envelope::new(40, Response::TestResult(result.clone()))).unwrap());
+    let mut kept = None;
+    blaze_alloc_count::assert_at_most(3, "a test result: its binary, name and output, handed to the service", || {
+        super::worker::drain(&mut incoming, |envelope| {
+            kept = Some(envelope);
+            true
+        })
+    });
+    assert_eq!(kept.map(|it| (it.id, it.body)), Some((40, Response::TestResult(result))));
+
+    incoming.push(&done(41));
+    assert_eq!(super::worker::drain(&mut incoming, |_| false), Ok(false), "a worker gone stops the reader");
+}
+
+#[test]
+fn a_workers_warm_requests_are_written_from_one_buffer() {
+    use blaze_api::{Envelope, Request, frames};
+
+    let mut out = super::worker::Outgoing::default();
+    let mut sink: Vec<u8> = Vec::with_capacity(1 << 10);
+    assert!(out.send(&mut sink, 1, Request::Cancel { id: 7 }).is_ok());
+    assert_eq!(sink, frames::encode(&Envelope::new(1, Request::Cancel { id: 7 })).unwrap());
+    sink.clear();
+    let sent = blaze_alloc_count::assert_at_most(0, "a cancel sent", || {
+        out.send(&mut sink, 2, Request::Cancel { id: 8 }).is_ok()
+    });
+    assert!(sent);
+    assert_eq!(sink, frames::encode(&Envelope::new(2, Request::Cancel { id: 8 })).unwrap());
+}
+
+/// The headers every webhook answer has, as `http::response` was called with before.
+fn listen_headers() -> [(&'static str, &'static str); 2] {
+    [("Content-Type", "text/plain; charset=utf-8"), ("Connection", "close")]
 }
 
 /// Fails the first `failing` calls.

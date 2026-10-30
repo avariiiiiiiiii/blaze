@@ -6,4 +6,5 @@ mod calls;
 mod members;
 mod patterns;
 mod print;
+mod speed;
 mod types;

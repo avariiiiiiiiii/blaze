@@ -186,7 +186,7 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 2");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -236,10 +236,12 @@ pub struct Units {
     pub build_dir: String,
     /// The profile as cargo's `Finished` line names it: "`dev` profile [unoptimized + debuginfo]".
     pub finished: String,
+    /// The workspace's `build-script-link-dirs`, absolute.
+    pub link_dirs: Vec<String>,
 }
 
 impl Versioned for Units {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 2");
 }
 
 /// What cargo passes and writes for one unit.
@@ -268,6 +270,14 @@ pub struct UnitPlan {
     pub out_dir: Option<String>,
     /// The package's `links`.
     pub links: Option<String>,
+    /// The package is named in the workspace's `unsandboxed-build-scripts` (or a member says
+    /// `build-script = false`): the documented opt-out of docs/cargo.md, nothing else.
+    pub unsandboxed: bool,
+    /// `target.<triple>.runner` or `CARGO_TARGET_<TRIPLE>_RUNNER` of the unit's platform,
+    /// program then arguments; empty for none.
+    pub runner: Vec<String>,
+    /// The target's `harness`.
+    pub harness: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -280,6 +290,8 @@ pub struct PackagePlan {
     /// What cargo prints after the version in `Compiling`: `(/abs/path)`, `(url#rev)`, none.
     pub source: Option<String>,
     pub is_member: bool,
+    /// The manifest's `package.default-run`.
+    pub default_run: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -327,7 +339,7 @@ pub struct StdKey {
 }
 
 impl StdKey {
-    pub const DOMAIN: &'static str = "blaze v2 cargo std key 2";
+    pub const DOMAIN: &'static str = "blaze v2 cargo std key 3";
 
     pub fn id(&self) -> ContentId {
         let bytes = cbor::to_vec(self).unwrap_or_else(|error| panic!("a std key has no CBOR: {error}"));
@@ -342,7 +354,7 @@ pub enum StdPlanned {
 }
 
 impl Versioned for StdPlanned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 1");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 2");
 }
 
 /// The standard library's units: a graph of their own, whose units the user's units depend on

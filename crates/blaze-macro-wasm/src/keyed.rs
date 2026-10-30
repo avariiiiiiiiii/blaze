@@ -29,10 +29,44 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-/// What a file of `bytes` has: short, the same for the same bytes.
-pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
+/// The SHA-256 of `parts` one after the other.
+pub(crate) fn sha256_of(parts: &[&[u8]]) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"f");
-    hash.update(bytes);
-    hash.finalize().iter().take(16).map(|it| format!("{it:02x}")).collect()
+    for part in parts {
+        hash.update(part);
+    }
+    hash.finalize().into()
+}
+
+/// What a file of `bytes` has: short, the same for the same bytes ([`hex`] writes it).
+pub(crate) fn digest_bytes(bytes: &[u8]) -> [u8; 16] {
+    let digest = sha256_of(&[b"f", bytes]);
+    digest[..16].try_into().expect("16 of 32 bytes")
+}
+
+/// Appends `bytes` to `out` in lowercase hexadecimal.
+pub(crate) fn hex(bytes: &[u8], out: &mut String) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(2 * bytes.len());
+    for &byte in bytes {
+        out.push(DIGITS[usize::from(byte >> 4)] as char);
+        out.push(DIGITS[usize::from(byte & 15)] as char);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_digest_is_written_as_its_hexadecimal() {
+        let mut out = String::new();
+        hex(&[0x00, 0x0f, 0xa5, 0xff], &mut out);
+        assert_eq!(out, "000fa5ff");
+        let mut said = String::new();
+        hex(&digest_bytes(b"x"), &mut said);
+        let whole = Sha256::digest(b"fx");
+        let want: String = whole.iter().take(16).map(|it| format!("{it:02x}")).collect();
+        assert_eq!(said, want);
+    }
 }

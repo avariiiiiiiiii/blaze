@@ -269,6 +269,7 @@ impl Files {
 
     /// What `path` hashes as on the disk now, and whether that held while it was looked at.
     fn look(&self, path: &Path) -> Result<(Option<[u8; 32]>, bool), Unreadable> {
+        // alloc: error path
         let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
@@ -308,7 +309,7 @@ impl Default for Files {
 }
 
 /// An environment, sorted by name, each name once (the first, as `getenv` finds it).
-#[derive(Clone, PartialEq, Eq, Default, Debug)]
+#[derive(PartialEq, Eq, Default, Debug)]
 pub struct Env(Vec<(OsString, OsString)>);
 
 impl Env {
@@ -337,7 +338,6 @@ pub struct Now<'a> {
 }
 
 /// The machine's files as they are, through [`Files::shared`], and an environment of its own.
-#[derive(Clone)]
 pub struct Disk {
     files: &'static Files,
     env: Env,
@@ -397,6 +397,7 @@ impl Inputs for Now<'_> {
     }
 
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Unreadable> {
+        // alloc: error path
         let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
         let entries = match std::fs::read_dir(path) {
             Ok(entries) => entries,
@@ -665,6 +666,29 @@ mod tests {
         let id = Files::path_id(&roundabout);
         assert!(files.vouched.get(files.vouched.find(&id).unwrap()).cover.is_none());
         assert_eq!(dirs.len(), 1);
+        _ = std::fs::remove_dir_all(&made);
+    }
+
+    /// A file asked again, its answer vouched for or its stamp known, allocates nothing: the
+    /// path is hashed in place and `stat`ed through a name on the stack.
+    #[cfg(unix)]
+    #[test]
+    fn a_warm_file_allocates_nothing() {
+        let made = std::env::temp_dir().join(format!("blaze-files-warm-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&made);
+        std::fs::create_dir_all(&made).unwrap();
+        let path = std::fs::canonicalize(&made).unwrap().join("a");
+        std::fs::write(&path, b"one").unwrap();
+        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
+        let files = Files::watched_by(dirs);
+        let hash = Some(*blake3::hash(b"one").as_bytes());
+        assert_eq!(files.file(&path).unwrap(), hash);
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm file", || files.file(&path).unwrap());
+        assert_eq!(warm, hash);
+        let missing = path.with_file_name("gone");
+        assert_eq!(files.file(&missing).unwrap(), None);
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm missing file", || files.file(&missing).unwrap());
+        assert_eq!(warm, None);
         _ = std::fs::remove_dir_all(&made);
     }
 

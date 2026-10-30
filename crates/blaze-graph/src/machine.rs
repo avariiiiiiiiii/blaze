@@ -137,6 +137,7 @@ impl fmt::Display for Error {
                 write!(f, "node {node} waits for {dep}, which is not added")
             }
             Error::Cycle(nodes) => {
+                // alloc: an error's message, once
                 let nodes: Vec<String> = nodes.iter().map(ToString::to_string).collect();
                 write!(f, "nodes {} wait for one another", nodes.join(", "))
             }
@@ -179,6 +180,7 @@ impl Machine {
             idle: false,
         })?;
         debug_assert!(opened.is_empty(), "opening a request says nothing");
+        // alloc: none, empty: the plane's outputs, kept across steps
         Ok(Machine { config, plane, over: false, said: Vec::new() })
     }
 
@@ -221,6 +223,7 @@ impl Machine {
                         unreachable!("node {id} asked to give way: the machine opens no idle request")
                     }
                 })
+                // alloc: the step's outputs, the API's payload; the plane's own buffer is kept
                 .collect()
         });
         self.said = said;

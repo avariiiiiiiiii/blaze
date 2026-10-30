@@ -4,23 +4,23 @@
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 
-use crate::{Arch, CompiledFunction, Covered, Data, Line, Reloc, RelocKind, Target, Unwind};
+use crate::{Arch, CompiledFunction, Covered, Data, Line, RelocKind, Relocs, Target, Unwind};
 
-pub const DATA_DOMAIN: &str = "blaze v2 data 1";
-pub const CODE_DOMAIN: &str = "blaze v2 code 2";
+pub const DATA_DOMAIN: &str = "blaze v2 data 2";
+pub const CODE_DOMAIN: &str = "blaze v2 code 3";
 
 /// The content ID of a read-only data object: its alignment, bytes and relocations. Two
 /// objects with one ID are one object.
-pub fn data_id(align: u32, bytes: &[u8], relocs: &[Reloc]) -> ContentId {
+pub fn data_id(align: u32, bytes: &[u8], relocs: &Relocs) -> ContentId {
     let mut hasher = Hasher::new(DATA_DOMAIN);
     hasher.update(&align.to_le_bytes()).part(bytes);
-    relocs_into(&mut hasher, relocs);
+    relocs_into(&mut hasher, relocs, target_into);
     hasher.finish()
 }
 
 impl Data {
     /// A data object, its ID made from what it is.
-    pub fn new(align: u32, bytes: Vec<u8>, relocs: Vec<Reloc>) -> Data {
+    pub fn new(align: u32, bytes: Vec<u8>, relocs: Relocs) -> Data {
         Data { id: data_id(align, &bytes, &relocs), align, bytes, relocs }
     }
 }
@@ -33,7 +33,7 @@ pub fn code_id(function: &CompiledFunction) -> ContentId {
     let mut hasher = Hasher::new(CODE_DOMAIN);
     hasher.update(&[arch_tag(function.arch)]);
     hasher.update(&function.align.to_le_bytes()).part(&function.code);
-    relocs_into(&mut hasher, &function.relocs);
+    relocs_into(&mut hasher, &function.relocs, target_into);
     hasher.update(&(function.data.len() as u64).to_le_bytes());
     for data in &function.data {
         hasher.id(&data.id);
@@ -96,13 +96,25 @@ pub(crate) fn lines_into(hasher: &mut Hasher, lines: &[Line]) {
     }
 }
 
-pub(crate) fn relocs_into(hasher: &mut Hasher, relocs: &[Reloc]) {
+/// A table as it is kept: its rows, each distinct target once, its wide addends. A table has
+/// one form for what it holds, so this is a function of its relocations.
+pub(crate) fn relocs_into<T>(hasher: &mut Hasher, relocs: &Relocs<T>, mut target_into: impl FnMut(&mut Hasher, &T)) {
     hasher.update(&(relocs.len() as u64).to_le_bytes());
-    for reloc in relocs {
-        hasher.update(&reloc.at.to_le_bytes());
-        hasher.update(&[kind_tag(reloc.kind)]);
-        hasher.update(&reloc.addend.to_le_bytes());
-        target_into(hasher, &reloc.target);
+    // 64 rows an update: BLAKE3 runs at its streaming rate on whole kilobytes.
+    let mut buffer = [0u8; 64 * 16];
+    for rows in relocs.rows().chunks(64) {
+        for (row, out) in rows.iter().zip(buffer.chunks_exact_mut(16)) {
+            out.copy_from_slice(&row.to_le_bytes());
+        }
+        hasher.update(&buffer[..16 * rows.len()]);
+    }
+    hasher.update(&(relocs.targets().len() as u64).to_le_bytes());
+    for target in relocs.targets() {
+        target_into(hasher, target);
+    }
+    hasher.update(&(relocs.wide().len() as u64).to_le_bytes());
+    for (row, addend) in relocs.wide() {
+        hasher.update(&row.to_le_bytes()).update(&addend.to_le_bytes());
     }
 }
 
@@ -177,7 +189,8 @@ const KINDS: [RelocKind; 26] = [
     RelocKind::SectionRel32,
 ];
 
-pub(crate) fn kind_tag(kind: RelocKind) -> u8 {
+/// The byte a [`RelocKind`] hashes as in a content key, and in blaze-premap's.
+pub fn kind_tag(kind: RelocKind) -> u8 {
     match kind {
         RelocKind::Abs64 => 0,
         RelocKind::PcRel32 => 1,
@@ -215,15 +228,15 @@ pub(crate) fn kind_of(tag: u8) -> Option<RelocKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::InstanceKey;
+    use crate::{InstanceKey, Relocation};
 
-    fn function(code: &[u8], relocs: Vec<Reloc>) -> CompiledFunction {
+    fn function(code: &[u8], relocs: Vec<Relocation>) -> CompiledFunction {
         CompiledFunction {
             key: InstanceKey(ContentId([7; 32])),
             arch: Arch::X86_64,
             align: 16,
             code: code.to_vec(),
-            relocs,
+            relocs: relocs.into(),
             data: Vec::new(),
             inlined: Vec::new(),
             side: None,
@@ -286,20 +299,25 @@ mod tests {
 
     #[test]
     fn a_relocation_target_is_the_code() {
-        let reloc = |n| Reloc {
+        let reloc = |n, addend| Relocation {
             at: 1,
             kind: RelocKind::PcRel32,
             target: Target::Function(InstanceKey(ContentId([n; 32]))),
-            addend: -4,
+            addend,
         };
-        let a = function(&[0xe8, 0, 0, 0, 0], vec![reloc(1)]);
-        let b = function(&[0xe8, 0, 0, 0, 0], vec![reloc(2)]);
+        let a = function(&[0xe8, 0, 0, 0, 0], vec![reloc(1, -4)]);
+        let b = function(&[0xe8, 0, 0, 0, 0], vec![reloc(2, -4)]);
         assert_ne!(code_id(&a), code_id(&b));
+        let wide = function(&[0xe8, 0, 0, 0, 0], vec![reloc(1, 1 << 40)]);
+        let wider = function(&[0xe8, 0, 0, 0, 0], vec![reloc(1, 1 << 41)]);
+        assert_ne!(code_id(&a), code_id(&wide));
+        assert_ne!(code_id(&wide), code_id(&wider));
     }
 
     #[test]
     fn data_ids_frame_their_parts() {
-        assert_ne!(data_id(1, b"ab", &[]), data_id(2, b"ab", &[]));
-        assert_ne!(data_id(1, b"ab", &[]), data_id(1, b"abc", &[]));
+        let none = Relocs::new();
+        assert_ne!(data_id(1, b"ab", &none), data_id(2, b"ab", &none));
+        assert_ne!(data_id(1, b"ab", &none), data_id(1, b"abc", &none));
     }
 }

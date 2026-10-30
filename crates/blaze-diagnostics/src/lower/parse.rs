@@ -36,8 +36,18 @@ pub(crate) fn lower(cx: &Cx<'_, '_>) -> Vec<Found> {
     parsed(cx).found
 }
 
+/// A crate whose files all parse is one pass over its module table, one memoized read per
+/// file; only a crate with an error walks its modules in rustc's order.
 pub(crate) fn parsed(cx: &Cx<'_, '_>) -> Parsed {
     let db = cx.db;
+    let def_map = hir_def::nameres::crate_def_map(db, cx.krate.base());
+    let clean = def_map
+        .modules(db)
+        .all(|(_, data)| data.origin.file_id().is_none_or(|file| file_errors(db, file).is_empty()));
+    if clean {
+        return Parsed { found: Vec::new(), fatal: false };
+    }
+    // alloc: a crate with a syntax error, the edge
     let mut found = Vec::new();
     let mut emptied: Vec<hir::Module> = Vec::new();
     for module in crate::checks::modules(cx) {
@@ -45,11 +55,11 @@ pub(crate) fn parsed(cx: &Cx<'_, '_>) -> Parsed {
             continue;
         }
         let Some(file) = module.as_source_file_id(db) else { continue };
-        let parse = file.parse(db);
-        let errors = parse.errors_with_bodies();
+        let errors = file_errors(db, file);
         if errors.is_empty() {
             continue;
         }
+        let parse = file.parse(db);
         let (file_id, edition) = file.unpack(db);
         let text = cx.file_text(file_id);
         let tree = parse.tree().syntax().clone();
@@ -60,6 +70,17 @@ pub(crate) fn parsed(cx: &Cx<'_, '_>) -> Parsed {
         }
     }
     Parsed { found, fatal: false }
+}
+
+/// The syntax errors of `file`, its bodies' included, memoized: a file parsed in full has them
+/// in `parse_errors`, which other passes read too; a library file is an outline, whose lazy
+/// bodies' errors are their own query.
+fn file_errors(db: &base_db::Db, file: base_db::EditionedFileId) -> &[SyntaxError] {
+    let errors = match file.is_library(db) {
+        true => file.parse_errors_with_bodies(db),
+        false => file.parse_errors(db),
+    };
+    errors.unwrap_or_default()
 }
 
 enum Outcome {
@@ -134,7 +155,7 @@ fn lower_file(
     text: &str,
     edition: Edition,
     tree: SyntaxNode,
-    errors: Vec<SyntaxError>,
+    errors: &[SyntaxError],
     found: &mut Vec<Found>,
 ) -> Outcome {
     let lexed = LexedStr::new(edition, text);
@@ -175,7 +196,7 @@ fn lower_file(
     let mut literals: Vec<&SyntaxError> = Vec::new();
     let mut validation: Vec<&SyntaxError> = Vec::new();
     let mut seen: FxHashSet<(String, TextRange)> = FxHashSet::default();
-    for error in &errors {
+    for error in errors {
         if is_lexer_error(error) || !seen.insert((error.to_string(), error.range())) {
             continue;
         }

@@ -121,9 +121,20 @@ pub enum Op {
     // Each variant's fields in CBOR key order (shorter name first, then bytewise), so the
     // encoder writes the map as it comes.
     /// The whole file with its mode, created with its directories if missing.
-    Write { mode: Mode, path: String, bytes: Vec<u8> },
+    Write {
+        mode: Mode,
+        path: String,
+        #[serde(with = "blaze_protocol::bytes")]
+        bytes: Vec<u8>,
+    },
     /// `len` bytes at `at` replaced by `bytes`, as an editor's change is; the mode is kept.
-    Edit { at: u64, len: u64, path: String, bytes: Vec<u8> },
+    Edit {
+        at: u64,
+        len: u64,
+        path: String,
+        #[serde(with = "blaze_protocol::bytes")]
+        bytes: Vec<u8>,
+    },
     /// A file, or a directory with everything under it.
     Delete { path: String },
     /// A file or a directory moved; `to` must not exist.

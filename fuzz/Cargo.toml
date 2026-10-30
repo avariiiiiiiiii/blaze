@@ -251,6 +251,8 @@ hir-expand.workspace = true
 hir-ty-codegen.workspace = true
 # The object-file targets build their seeds with `object::write`.
 object = { workspace = true, features = ["write"] }
+# `Utf8PathBuf`, the library path of the proc-macro targets' requests.
+paths.workspace = true
 proc-macro-api.workspace = true
 serde = { workspace = true, features = ["derive"] }
 span.workspace = true

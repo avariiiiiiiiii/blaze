@@ -39,8 +39,24 @@ Design: docs/v2/plan/lanes/lints.md, docs/v2/plan/lanes/lints/cx.md.
       /// Where `expr` is written in `tree()`: its own range, or the outermost macro call of
       /// the tree that wrote it.
       pub fn expr_range(&self, expr: hir_def::hir::ExprId) -> Option<TextRange>;
+      // Added by lints-driver (2026-10-29), no inference either: what `Semantics` answers of
+      // a node, in the scope of the block the node is in, for nodes of `tree()` (the body's
+      // expressions, patterns and statements, and items nested in it: their fields and
+      // signatures), so that a body's lint query never reads the file's whole tree:
+      /// A written type lowered in its scope, with the body's environment
+      /// (`Semantics::resolve_type`).
+      pub fn resolve_type(&self, ty: InFile<AstPtr<ast::Type>>) -> Option<Type<'db>>;
+      /// The macro a call calls (`Semantics::resolve_macro_call`).
+      pub fn resolve_macro_call(&self, call: InFile<AstPtr<ast::MacroCall>>) -> Option<Macro>;
+      /// `name` as a path of one segment in the scope at `at`
+      /// (`SemanticsScope::speculative_resolve`).
+      pub fn resolve_name(&self, at: InFile<SyntaxNodePtr>, name: &Name) -> Option<PathResolution<'db>>;
   }
   ```
+- What the lints rely on: `body()` is the same `Body` as `Body::of(db, def)`, its `ExprId`s
+  the ones `infer()` keys; `def()` is the `hir::DefWithBody`; `ty(Ty)` is a `hir::Type` in the
+  body's environment; `expr_range(ExprId)` is a range of `tree()`'s root (the expression's,
+  or its outermost macro call's), `None` for what a macro made up with no call in that tree.
 - Where: `crates/hir/src/body_analysis.rs` (new), `crates/hir/src/lib.rs` (`mod` and `pub use`).
 - Why: blaze-lints runs each lint per body as a query over `body_syntax`'s tree (lints.md), so
   an edit lints only the bodies it changed. `Semantics` answers only for nodes of the file's

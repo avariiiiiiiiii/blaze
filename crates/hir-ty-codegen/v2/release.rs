@@ -199,11 +199,15 @@ pub(crate) fn emit(
     {
         return Err(failed(unit, "its imports are not those it was decided to have"));
     }
-    if let Built::Assembled(code, requests) = &function.code {
-        if !imported.is_empty() {
-            return Err(failed(unit, "an assembly function is given imports"));
-        }
-        return emitted(unit, &function, code, requests, refs);
+    if let Built::Assembled(..) = &function.code
+        && !imported.is_empty()
+    {
+        return Err(failed(unit, "an assembly function is given imports"));
+    }
+    if let Built::Assembled(code, requests) = function.code {
+        let (places, spans) = (&function.places, &function.spans);
+        let (variables, scopes) = (&function.variables, &function.scopes);
+        return emitted(unit, places, spans, variables, scopes, code, &requests, refs);
     }
     // Nothing summarized a unit compiled without imports, or one whose summary the store had.
     let own = match function.release.own.take() {
@@ -246,7 +250,8 @@ pub(crate) fn emit(
     let Built::Ir(pending) = &function.code else {
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
-    let mut emitted = emitted(unit, &function, &code, &pending.wants.requests, refs)?;
+    let Function { places, spans, variables, scopes, .. } = &function;
+    let mut emitted = emitted(unit, places, spans, variables, scopes, code, &pending.wants.requests, refs)?;
     // What the IR built in (MIR-inlined, `#[inline(always)]` of no member) is the code's too.
     inlined.extend_from_slice(&function.inlined);
     inlined.sort_unstable();
@@ -264,32 +269,37 @@ fn coverage(spec: &Spec, covered: crate::llvm::sanitize::Covered) -> Option<blaz
     spec.sanitize.coverage.is_on().then_some(blaze_codegen::Covered { counters, flags, guards, pcs })
 }
 
-/// `code` against `refs`, by `function`'s places, as the Cranelift backend converts its own
-/// (`super::backend::emit_cranelift`): its unwind information and lines come with it.
+/// `code` against `refs`, by the function's `places`, as the Cranelift backend converts its
+/// own (`super::backend::emit_cranelift`): its unwind information and lines come with it, and
+/// its side table of `variables` in `scopes`. `spans` are what its line rows name.
 #[cfg(feature = "llvm")]
 fn emitted(
     unit: &Unit,
-    function: &Function,
-    code: &crate::fragment::Code,
+    places: &Places,
+    spans: &[blaze_format::SpanRef],
+    variables: &[super::side::Variable],
+    scopes: &super::side::Scopes,
+    code: crate::fragment::Code,
     requests: &Requests,
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
     let isa: &dyn cranelift_codegen::isa::TargetIsa = &**crate::target().map_err(|e| failed(unit, e))?;
-    let side = super::side::of(&function.variables, &function.scopes, code)
-        .map_err(|e| failed(unit, e))?;
-    let (converted, extra) = super::places::resolve_owning(&function.places, refs, |resolve| {
-        super::convert::function(
+    let (converted, extra) = super::places::resolve_owning(places, refs, |resolve| {
+        let side = super::side::of(variables, scopes, &code, resolve.frame())?;
+        let converted = super::convert::function(
+            resolve.frame(),
             unit.instance.key(),
             unit.arch,
             isa,
             code,
             requests,
             resolve,
-            &function.spans,
+            spans,
             side.as_ref().map(|it| it.1),
-        )
+        )?;
+        Ok::<_, String>((converted, side))
     });
-    let converted = converted.map_err(|e| failed(unit, e))?;
+    let (converted, side) = converted.map_err(|e| failed(unit, e))?;
     Ok(Emitted { function: converted, side: side.map(|it| it.0), extra })
 }
 
@@ -704,7 +714,7 @@ mod tests {
         assert_eq!(optimization(&unit(), &spec(2)).unwrap().passes, Passes::Default);
         assert_eq!(optimization(&unit(), &spec(0)).unwrap().selection, Selection::Fast);
         assert!(optimization(&unit(), &spec(4)).is_err());
-        let cranelift = Spec { backend: Backend::Cranelift, ..spec(2) };
+        let cranelift = Spec { backend: Backend::Cranelift { speed: true }, ..spec(2) };
         assert!(optimization(&unit(), &cranelift).is_err());
         let without = Spec { toolchain: Toolchain { llvm: None, ..spec(2).toolchain }, ..spec(2) };
         assert!(optimization(&unit(), &without).is_err());

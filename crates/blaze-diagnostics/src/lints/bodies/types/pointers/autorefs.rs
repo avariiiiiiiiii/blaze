@@ -15,21 +15,17 @@ use rustc_type_ir::Mutability;
 
 use super::{fn_def_span, has_attr, source_callsite, span, type_info};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
 
-pub(super) struct ImplicitAutorefs;
+#[derive(Default)]
+pub(crate) struct ImplicitAutorefs;
 
 impl LatePass for ImplicitAutorefs {
-    fn name(&self) -> &'static str {
-        "ImplicitAutorefs"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["dangerous_implicit_autorefs"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Ref, ExprTag::Index, ExprTag::MethodCall, ExprTag::Field]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if let Some(found) = check(b, expr) {

@@ -25,6 +25,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+use blaze_ids::bits::Bits;
 use hashbrown::HashTable;
 use hir::{AsAssocItem, HirFileId, InFile, ModuleDef, PathResolution};
 use hir_def::{
@@ -87,47 +88,8 @@ impl Ns {
 const _: () = assert!(size_of::<Ns>() == 1 && size_of::<Used>() == 1 && size_of::<TreeKind>() == 1);
 
 /// A set of small indices (a `use` item's trees, a macro's rules): one bit each, one inline
-/// word up to 64. Insert, remove and test are O(1); iteration is one `trailing_zeros` per
-/// member, in ascending order.
-#[derive(Default)]
-pub(super) struct Bits(SmallVec<[u64; 1]>);
-
-impl Bits {
-    pub(super) fn insert(&mut self, i: usize) {
-        let word = i / 64;
-        if self.0.len() <= word {
-            self.0.resize(word + 1, 0);
-        }
-        self.0[word] |= 1 << (i % 64);
-    }
-
-    pub(super) fn remove(&mut self, i: usize) {
-        if let Some(word) = self.0.get_mut(i / 64) {
-            *word &= !(1 << (i % 64));
-        }
-    }
-
-    pub(super) fn contains(&self, i: usize) -> bool {
-        self.0.get(i / 64).is_some_and(|word| word & (1 << (i % 64)) != 0)
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.0.iter().all(|it| *it == 0)
-    }
-
-    pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(word, &bits)| {
-            let mut bits = bits;
-            std::iter::from_fn(move || {
-                (bits != 0).then(|| {
-                    let bit = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    word * 64 + bit
-                })
-            })
-        })
-    }
-}
+/// word up to 64, grown as it is inserted in.
+pub(super) type SmallSet = Bits<SmallVec<[u64; 1]>>;
 
 /// What a name is in one namespace of a scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,7 +212,7 @@ pub(super) struct Uses {
     /// The macros invoked: by a call, an attribute or a derive.
     pub(super) macros: FxHashSet<MacroId>,
     /// The rules of each `macro_rules!` a call matched.
-    pub(super) arms: FxHashMap<MacroId, Bits>,
+    pub(super) arms: FxHashMap<MacroId, SmallSet>,
     /// The macros invoked where which rule matched can't be told.
     pub(super) arms_unknown: FxHashSet<MacroId>,
     /// The names of macro calls that don't resolve: a macro of such a name may be used.
@@ -306,7 +268,7 @@ impl Uses {
             krate: cx.krate.base(),
         };
         for tree in &walk.trees {
-            for node in &tree.nodes {
+            for node in tree.of_kind(|it| matches!(it, SyntaxKind::USE | SyntaxKind::EXTERN_CRATE)) {
                 match node.kind() {
                     SyntaxKind::USE => uses.use_item(cx, InFile::new(tree.file, ast::Use::cast(node.clone()).unwrap())),
                     SyntaxKind::EXTERN_CRATE => {
@@ -341,8 +303,12 @@ impl Uses {
                 uses.used.insert(Binding::ExternCrate(it.id), Used::Other);
             }
         }
+        let read = |kind: SyntaxKind| {
+            matches!(kind, SyntaxKind::PATH | SyntaxKind::METHOD_CALL_EXPR | SyntaxKind::FIELD_EXPR | SyntaxKind::MACRO_CALL)
+                || ast::Adt::can_cast(kind)
+        };
         for tree in &walk.trees {
-            for node in &tree.nodes {
+            for node in tree.of_kind(read) {
                 uses.node(cx, walk, tree.file, node);
             }
         }
@@ -789,7 +755,7 @@ impl Uses {
                     self.macros.insert(id);
                     match cx.sema.resolve_macro_call_arm(&call) {
                         Some(arm) => {
-                            self.arms.entry(id).or_default().insert(arm as usize);
+                            self.arms.entry(id).or_default().insert_growing(arm as usize);
                         }
                         None => {
                             self.arms_unknown.insert(id);

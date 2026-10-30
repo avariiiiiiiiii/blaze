@@ -1,5 +1,6 @@
 //! File symbol extraction.
 
+use salsa::Database as _;
 use std::marker::PhantomData;
 
 use base_db::{Db, FxIndexSet, salsa::SalsaValue};

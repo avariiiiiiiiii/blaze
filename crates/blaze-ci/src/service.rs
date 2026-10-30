@@ -27,7 +27,11 @@
 #[cfg(test)]
 mod tests;
 
-use std::{collections::BTreeMap, fmt::Write as _, ops::Range};
+use std::{
+    collections::BTreeMap,
+    fmt::{self, Write as _},
+    ops::Range,
+};
 
 use blaze_api::{Diagnostic, Level, Mismatch, Request, Response, TestOutcome, TestResult, ViewRef};
 use blaze_ids::ContentId;
@@ -56,7 +60,7 @@ const TAIL_LINES: usize = 30;
 const TAIL_BYTES: usize = 4096;
 
 /// What of [`Config`] the service decides with.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Settings {
     pub default_branch: String,
     pub checks: Vec<Check>,
@@ -70,9 +74,9 @@ pub struct Settings {
 impl Settings {
     pub fn of(config: &Config) -> Settings {
         Settings {
-            default_branch: config.default_branch.clone(),
-            checks: config.checks.clone(),
-            release_checks: config.release_checks.clone(),
+            default_branch: config.default_branch.clone(), // clone: once, at start
+            checks: config.checks.clone(),                 // clone: once, at start
+            release_checks: config.release_checks.clone(), // clone: once, at start
             oracle_one_in: config.oracle.one_in,
             oracle_targets: config.oracle.targets.to_targets(),
             snapshot_every_secs: config.snapshot.every_secs,
@@ -82,7 +86,7 @@ impl Settings {
 }
 
 /// What the service keeps across restarts, in its state file.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct State {
     /// By ref: `branch/<b>`, `pr/<n>`.
@@ -92,7 +96,7 @@ pub struct State {
 }
 
 /// A ref's last checkout, held open on the daemon.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Held {
     pub checkout: Checkout,
@@ -108,7 +112,7 @@ pub struct JobId(pub u64);
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RunId(pub u64);
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Input {
     /// A delivery whose signature checked.
     Event(Event),
@@ -127,7 +131,7 @@ pub enum Input {
     Removed { id: String, result: Result<(), String> },
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(PartialEq, Debug)]
 pub enum Output {
     /// Hold `root` open once more on the pin connection.
     Pin { root: ContentId },
@@ -158,7 +162,7 @@ pub enum Output {
     Log(String),
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 enum JobKind {
     Branch { default: bool },
     Pull { number: u64, base: String },
@@ -173,7 +177,7 @@ enum Phase {
     Running,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Job {
     reference: String,
     commit: String,
@@ -221,7 +225,7 @@ enum GitHubId {
     Failed,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct Run {
     job: JobId,
     check: CheckRun,
@@ -267,7 +271,7 @@ impl Service {
             out.push(Output::Pin { root: held.checkout.root });
         }
         Service {
-            default_ref: format!("branch/{}", settings.default_branch),
+            default_ref: format!("branch/{}", settings.default_branch), // alloc: once, at start
             settings,
             state,
             now: 0,
@@ -313,9 +317,11 @@ impl Service {
         match event {
             Event::Push { branch, commit } => {
                 let default = branch == self.settings.default_branch;
+                // alloc: once per event, the new job's ref
                 self.arrive(format!("branch/{branch}"), commit, JobKind::Branch { default }, out);
             }
             Event::PullRequest { number, head, base, from_fork: _ } => {
+                // alloc: once per event, the new job's ref
                 self.arrive(format!("pr/{number}"), head, JobKind::Pull { number, base }, out);
             }
             Event::Tag { name, commit } => self.tag(name, commit, out),
@@ -325,17 +331,20 @@ impl Service {
     /// A push to a branch or pull request: the newest wins.
     fn arrive(&mut self, reference: String, commit: String, kind: JobKind, out: &mut Vec<Output>) {
         if let Some(old) = self.latest.get(&reference).copied() {
+            // alloc: once per replaced job, the summary its check runs are posted with
             self.replace(old, &format!("Cancelled: replaced by {commit}."), out);
         }
+        // clone: once per event
         let job = self.new_job(reference.clone(), commit, kind, false, out);
         self.latest.insert(reference, job);
         self.try_start(job, out);
     }
 
     fn tag(&mut self, name: String, commit: String, out: &mut Vec<Output>) {
+        // alloc: clone: once per tag, the job's ref and its kind's name
         let job = self.new_job(format!("tag/{name}"), commit, JobKind::Tag { name: name.clone() }, true, out);
         let idle = self.train.running.is_none();
-        let replaced = self.train.arrive(name.clone());
+        let replaced = self.train.arrive(name.clone()); // clone: once per tag, the train's
         if idle {
             self.release_running = Some(job);
             self.try_start(job, out);
@@ -343,11 +352,14 @@ impl Service {
         }
         let old = self.release_waiting.replace(job);
         if let (Some(old), Some(_)) = (old, replaced) {
+            // alloc: once per replaced tag, the summary its check runs are posted with
             self.replace(old, &format!("Cancelled: replaced by {name}."), out);
         }
         let running = self.train.running.as_deref().unwrap_or_default();
+        // alloc: once per tag waiting
         let summary = format!("Queued: waiting for release {running} to finish.");
         for run in self.jobs[&job].runs().map(RunId) {
+            // clone: once per check-run post
             self.set(run, CheckStatus::Queued, summary.clone(), out);
         }
     }
@@ -369,18 +381,22 @@ impl Service {
         let count = checks.len() + usize::from(sampled);
         let first = self.next_run;
         self.next_run += count as u64;
+        // alloc: once per job
         let queued = format!("Queued: waiting for the checkout of {commit}.");
         self.runs.reserve(count);
         for at in 0..count {
             let run = RunId(first + at as u64);
             let (name, work) = match checks.get(at) {
                 Some(check) => {
+                    // clone: once per check run, its name as GitHub shows it
                     (check.name.clone(), Work::Check { kind: check.kind, release, at: at as u32 })
                 }
-                None => (oracle::CHECK.to_owned(), Work::Oracle),
+                None => (oracle::CHECK.to_owned(), Work::Oracle), // alloc: once per oracle run
             };
             let check =
+                // clone: once per check run: what GitHub is posted, and the run's own copy
                 CheckRun { name, commit: commit.clone(), status: CheckStatus::Queued, summary: queued.clone() };
+            // clone: once per check run created
             out.push(Output::Create { run, job, check: check.clone() });
             let github = GitHubId::Creating;
             let report = Report::default();
@@ -415,6 +431,7 @@ impl Service {
         let phase = it.phase;
         let pending = it.pending > 0;
         for run in it.runs().map(RunId) {
+            // alloc: once per check-run post
             self.conclude(run, CheckStatus::Cancelled, summary.to_owned(), out);
         }
         match phase {
@@ -426,13 +443,17 @@ impl Service {
     }
 
     /// Where the job's checkout diffs from: the nearest tree already held.
+    ///
+    /// Once per checkout: the copy goes to the job's worker in [`Output::Checkout`].
     fn from(&self, job: &Job) -> Option<Checkout> {
+        // clone: once per checkout
         let held = |reference: &str| self.state.checkouts.get(reference).map(|it| it.checkout.clone());
         if job.kind == (JobKind::Branch { default: true }) {
             // The head `ci/<branch>` is at this ref's checkout; its commit moves from there.
             return held(&job.reference);
         }
         let with_commit = |commit: &str| {
+            // clone: once per checkout
             self.state.checkouts.values().find(|it| it.checkout.commit == commit).map(|it| it.checkout.clone())
         };
         if let Some(same) = with_commit(&job.commit) {
@@ -458,16 +479,19 @@ impl Service {
             return;
         }
         let from = self.from(it);
-        let mut fetch = Vec::new();
+        // alloc: clone: once per checkout, what the job's worker is handed
+        let mut fetch = Vec::with_capacity(2);
         if let JobKind::Pull { number, .. } = it.kind {
             fetch.push(pull_ref(number));
         }
-        fetch.push(it.commit.clone());
+        fetch.push(it.commit.clone()); // clone: once per checkout
         let head = match it.kind {
+            // alloc: once per checkout
             JobKind::Branch { default: true } => Some(format!("ci/{}", self.settings.default_branch)),
             _ => None,
         };
-        let commit = it.commit.clone();
+        let commit = it.commit.clone(); // clone: once per checkout
+        // clone: once per checkout, the key of the one in flight
         let reference = it.reference.clone();
         if let Some(from) = &from {
             out.push(Output::Pin { root: from.root });
@@ -489,6 +513,7 @@ impl Service {
         if it.phase != Phase::CheckingOut {
             return;
         }
+        // clone: once per checkout: the job may end below, and its ref picks the next
         let reference = it.reference.clone();
         if self.checking_out.get(&reference) == Some(&job) {
             self.checking_out.remove(&reference);
@@ -502,8 +527,9 @@ impl Service {
                 if matches!(it.kind, JobKind::Tag { .. }) {
                     it.owns_root = true;
                 } else {
+                    // clone: once per checkout kept
                     let checkout = Checkout { commit: it.commit.clone(), root };
-                    self.keep(reference.clone(), checkout, out);
+                    self.keep(&reference, checkout, out);
                 }
                 let it = self.jobs.get_mut(&job).expect("the job is there");
                 if it.replaced {
@@ -514,11 +540,10 @@ impl Service {
             }
             Err(what) => {
                 if !it.replaced {
-                    let summary = format!(
-                        "The checkout of {} failed, so nothing ran: {what}",
-                        it.commit
-                    );
+                    // alloc: error path
+                    let summary = format!("The checkout of {} failed, so nothing ran: {what}", it.commit);
                     for run in it.runs().map(RunId) {
+                        // clone: error path
                         self.conclude(run, CheckStatus::Failure, summary.clone(), out);
                     }
                 }
@@ -533,10 +558,17 @@ impl Service {
     }
 
     /// `checkout` becomes `reference`'s, held in place of the one it had.
-    fn keep(&mut self, reference: String, checkout: Checkout, out: &mut Vec<Output>) {
+    fn keep(&mut self, reference: &str, checkout: Checkout, out: &mut Vec<Output>) {
         let held = Held { checkout, at: self.now };
-        if let Some(old) = self.state.checkouts.insert(reference, held) {
-            out.push(Output::Unpin { root: old.checkout.root });
+        match self.state.checkouts.get_mut(reference) {
+            Some(kept) => {
+                let old = std::mem::replace(kept, held);
+                out.push(Output::Unpin { root: old.checkout.root });
+            }
+            None => {
+                // alloc: a ref's first checkout
+                self.state.checkouts.insert(reference.to_owned(), held);
+            }
         }
         let checkouts = &mut self.state.checkouts;
         let default_ref = &self.default_ref;
@@ -546,6 +578,7 @@ impl Service {
                 .iter()
                 .filter(|(reference, _)| *reference != default_ref)
                 .min_by_key(|&(reference, held)| (held.at, reference))
+                // clone: once per checkout let go past the most held
                 .map(|(reference, _)| reference.clone())
                 .expect("more than none");
             let held = checkouts.remove(&oldest).expect("it is there");
@@ -560,7 +593,7 @@ impl Service {
         let it = self.jobs.get_mut(&job).expect("the job is there");
         it.phase = Phase::Running;
         let runs = it.runs();
-        let view = ViewRef::Root(View { root });
+        let view = || ViewRef::Root(View { root });
         let mut pending = 0;
         for run in runs.map(RunId) {
             let Some(it) = self.runs.get_mut(&run) else { continue };
@@ -570,10 +603,11 @@ impl Service {
             let (request, what) = match it.work {
                 Work::Check { kind, release, at } => {
                     let checks = if release { &self.settings.release_checks } else { &self.settings.checks };
-                    (checks[at as usize].request(view.clone()), kind_name(kind))
+                    (checks[at as usize].request(view()), kind_name(kind))
                 }
                 Work::Oracle => (
-                    Request::Verify { view: view.clone(), targets: self.settings.oracle_targets.clone() },
+                    // clone: once per oracle run, handed to its request
+                    Request::Verify { view: view(), targets: self.settings.oracle_targets.clone() },
                     "verify",
                 ),
             };
@@ -581,6 +615,7 @@ impl Service {
             pending += 1;
             out.push(Output::Send { job, run, request });
             let commit = &self.jobs[&job].commit;
+            // alloc: once per check-run post
             let summary = format!("Running `{what}` on the tree of {commit} (root {root:x}).");
             self.set(run, CheckStatus::InProgress, summary, out);
         }
@@ -639,7 +674,9 @@ impl Service {
             let Some(of) = self.runs.get_mut(&run) else { continue };
             of.pending = false;
             if !of.done {
-                self.conclude(run, CheckStatus::Failure, "The job ended without a result.".to_owned(), out);
+                // alloc: once per check-run post
+                let summary = "The job ended without a result.".to_owned();
+                self.conclude(run, CheckStatus::Failure, summary, out);
             }
         }
         let green = !it.replaced
@@ -696,6 +733,7 @@ impl Service {
         it.check.status = status;
         it.check.summary = summary;
         match it.github {
+            // clone: once per check-run post, handed to the GitHub thread
             GitHubId::Id(id) => out.push(Output::Update { run, id, check: it.check.clone() }),
             GitHubId::Creating => it.unposted = true,
             GitHubId::Failed => {}
@@ -711,11 +749,13 @@ impl Service {
             Ok(id) => {
                 it.github = GitHubId::Id(id);
                 if std::mem::take(&mut it.unposted) {
+                    // clone: once per check-run post
                     out.push(Output::Update { run, id, check: it.check.clone() });
                 }
             }
             Err(what) => {
                 it.github = GitHubId::Failed;
+                // alloc: error path
                 out.push(Output::Log(format!(
                     "check run {} on {} was never created, so its result is not on GitHub: {what}",
                     it.check.name, it.check.commit
@@ -725,25 +765,28 @@ impl Service {
         self.collect(run);
     }
 
+    /// One pass over the checkouts, the lost ones' refs written straight into the line logged.
     fn unpinned(&mut self, root: ContentId, why: &str, out: &mut Vec<Output>) {
-        let lost: Vec<String> = self
-            .state
-            .checkouts
-            .iter()
-            .filter(|(_, held)| held.checkout.root == root)
-            .map(|(reference, _)| reference.clone())
-            .collect();
-        if lost.is_empty() {
+        let mut line = String::new(); // alloc: error path, the daemon lost a root
+        let mut lost = 0;
+        self.state.checkouts.retain(|reference, held| {
+            if held.checkout.root != root {
+                return true;
+            }
+            if lost == 0 {
+                let _ = write!(line, "the daemon no longer holds root {root:x}, the checkout of ");
+            } else {
+                line.push_str(", ");
+            }
+            line.push_str(reference);
+            lost += 1;
+            false
+        });
+        if lost == 0 {
             return;
         }
-        for reference in &lost {
-            self.state.checkouts.remove(reference);
-        }
-        out.push(Output::Log(format!(
-            "the daemon no longer holds root {root:x}, the checkout of {}: {why}; their next \
-             checkout diffs from another tree",
-            lost.join(", ")
-        )));
+        let _ = write!(line, ": {why}; their next checkout diffs from another tree");
+        out.push(Output::Log(line));
         out.push(Output::Save);
     }
 
@@ -764,11 +807,13 @@ impl Service {
                 self.state.snapshots.push(kept);
                 out.push(Output::Save);
                 for id in snapshot::beyond(&self.state.snapshots, self.settings.snapshot_keep) {
+                    // clone: once per snapshot removed
                     if self.removing.insert(id.clone()) {
                         out.push(Output::RemoveSnapshot { id });
                     }
                 }
             }
+            // alloc: error path
             Err(what) => out.push(Output::Log(format!(
                 "the snapshot failed, and the next green run tries again: {what}"
             ))),
@@ -782,6 +827,7 @@ impl Service {
                 self.state.snapshots.retain(|it| it.id != id);
                 out.push(Output::Save);
             }
+            // alloc: error path
             Err(what) => out.push(Output::Log(format!(
                 "removing snapshot {id} failed, and it is tried again after the next snapshot: {what}"
             ))),
@@ -811,6 +857,7 @@ impl Run {
                 }
                 _ => (
                     CheckStatus::Failure,
+                    // alloc: once per check-run post, a verification that said nothing
                     report.with_errors("The verification ended without a result.".to_owned()),
                 ),
             },
@@ -827,22 +874,37 @@ impl Run {
     }
 }
 
+/// What a summary holds besides its lists: its first line, the lists' headers and the counts
+/// of what they leave out.
+const SUMMARY_ROOM: usize = 512;
+
 /// What a request's responses said, kept for its check run's summary.
-#[derive(Clone, Default, Debug)]
+///
+/// Each list is one string, every item written into it once as the summary shows it, so a
+/// response costs no allocation of its own: a count, or a write into a buffer that grows by
+/// doubling. Only the first [`MOST_LISTED`] errors, failed tests and unexpected responses are
+/// written; the rest are counted.
+#[derive(Default, Debug)]
 struct Report {
     errors: usize,
     warnings: usize,
-    listed: Vec<String>,
+    /// Each error as `\n<error>\n`.
+    listed: String,
+    listed_count: usize,
     passed: usize,
     failed: usize,
     ignored: usize,
     unreached: usize,
-    failures: Vec<String>,
+    /// Each failed test as `\n<failure>\n`.
+    failures: String,
+    failures_count: usize,
     artifacts: usize,
     verified: Option<Vec<Mismatch>>,
-    /// The daemon's errors.
-    said: Vec<String>,
-    unexpected: Vec<String>,
+    /// The daemon's errors, each as `\n- <error>`.
+    said: String,
+    /// Each response the request should not have had as `\n- <response>`, cut to 200 bytes.
+    unexpected: String,
+    unexpected_count: usize,
 }
 
 impl Report {
@@ -851,8 +913,14 @@ impl Report {
             Response::Diagnostic(diagnostic) => match diagnostic.level {
                 Level::Error => {
                     self.errors += 1;
-                    if self.listed.len() < MOST_LISTED {
-                        self.listed.push(render_diagnostic(&diagnostic));
+                    if self.listed_count < MOST_LISTED {
+                        self.listed_count += 1;
+                        let mut len = Len(2);
+                        let _ = render_diagnostic_into(&mut len, &diagnostic);
+                        self.listed.reserve(len.0);
+                        self.listed.push('\n');
+                        let _ = render_diagnostic_into(&mut self.listed, &diagnostic);
+                        self.listed.push('\n');
                     }
                 }
                 Level::Warning => self.warnings += 1,
@@ -864,8 +932,11 @@ impl Report {
                 TestOutcome::Unreached => self.unreached += 1,
                 TestOutcome::Failed => {
                     self.failed += 1;
-                    if self.failures.len() < MOST_LISTED {
-                        self.failures.push(render_failure(&test));
+                    if self.failures_count < MOST_LISTED {
+                        self.failures_count += 1;
+                        self.failures.push('\n');
+                        render_failure_into(&mut self.failures, &test);
+                        self.failures.push('\n');
                     }
                 }
             },
@@ -876,15 +947,20 @@ impl Report {
             | Response::BuildScript(_)
             | Response::Work(_) => {}
             Response::Verified { mismatches } => self.verified = Some(mismatches),
-            Response::Error(error) => self.said.push(match error.at {
-                Some(at) => format!("{} (at {at})", error.what),
-                None => error.what,
-            }),
+            Response::Error(error) => {
+                self.said.push_str("\n- ");
+                self.said.push_str(&error.what);
+                if let Some(at) = &error.at {
+                    let _ = write!(self.said, " (at {at})");
+                }
+            }
             other => {
-                if self.unexpected.len() < MOST_LISTED {
-                    let mut shown = format!("{other:?}");
-                    cut(&mut shown, 200);
-                    self.unexpected.push(shown);
+                if self.unexpected_count < MOST_LISTED {
+                    self.unexpected_count += 1;
+                    self.unexpected.push_str("\n- ");
+                    let start = self.unexpected.len();
+                    let _ = write!(self.unexpected, "{other:?}");
+                    cut(&mut self.unexpected, start, 200);
                 }
             }
         }
@@ -892,8 +968,9 @@ impl Report {
 
     /// The run's summary, written into one string sized for what it lists.
     fn summary(&self, kind: CheckKind, ok: bool) -> String {
-        let listed: usize = self.listed.iter().chain(&self.failures).map(|it| it.len() + 2).sum();
-        let mut text = String::with_capacity(256 + listed);
+        let lists = self.listed.len() + self.failures.len() + self.said.len() + self.unexpected.len();
+        // alloc: once per check-run post, the summary GitHub is sent
+        let mut text = String::with_capacity(SUMMARY_ROOM + lists);
         let _ = write!(
             text,
             "{} error{}, {} warning{}",
@@ -917,26 +994,18 @@ impl Report {
             CheckKind::Check => {}
         }
         text.push('.');
-        if !self.listed.is_empty() {
+        if self.listed_count > 0 {
             text.push_str("\n\n## Errors\n");
-            for error in &self.listed {
-                text.push('\n');
-                text.push_str(error);
-                text.push('\n');
-            }
-            if self.errors > self.listed.len() {
-                let _ = write!(text, "\nand {} more errors\n", self.errors - self.listed.len());
+            text.push_str(&self.listed);
+            if self.errors > self.listed_count {
+                let _ = write!(text, "\nand {} more errors\n", self.errors - self.listed_count);
             }
         }
-        if !self.failures.is_empty() {
+        if self.failures_count > 0 {
             text.push_str("\n\n## Failed tests\n");
-            for failure in &self.failures {
-                text.push('\n');
-                text.push_str(failure);
-                text.push('\n');
-            }
-            if self.failed > self.failures.len() {
-                let _ = write!(text, "\nand {} more failed tests\n", self.failed - self.failures.len());
+            text.push_str(&self.failures);
+            if self.failed > self.failures_count {
+                let _ = write!(text, "\nand {} more failed tests\n", self.failed - self.failures_count);
             }
         }
         let mut text = self.with_errors(text);
@@ -952,18 +1021,12 @@ impl Report {
     fn with_errors(&self, mut text: String) -> String {
         if !self.said.is_empty() {
             text.push_str("\n\n## The daemon's errors\n");
-            for error in &self.said {
-                text.push_str("\n- ");
-                text.push_str(error);
-            }
+            text.push_str(&self.said);
             text.push('\n');
         }
         if !self.unexpected.is_empty() {
             text.push_str("\n\n## Responses this request should not have had\n");
-            for response in &self.unexpected {
-                text.push_str("\n- ");
-                text.push_str(response);
-            }
+            text.push_str(&self.unexpected);
             text.push('\n');
         }
         text
@@ -984,53 +1047,64 @@ fn level_name(level: Level) -> &'static str {
     }
 }
 
+/// How many bytes a rendering writes, counted without writing them, so the list it goes in
+/// grows once for it.
+struct Len(usize);
+
+impl fmt::Write for Len {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.0 += text.len();
+        Ok(())
+    }
+}
+
 /// An error as rustc prints its first line, its other labelled places, its notes and the facts
-/// its query read.
-fn render_diagnostic(diagnostic: &Diagnostic) -> String {
-    let mut text = String::with_capacity(64 + diagnostic.message.len());
-    text.push_str(level_name(diagnostic.level));
+/// its query read, onto the end of `text`.
+fn render_diagnostic_into(text: &mut impl fmt::Write, diagnostic: &Diagnostic) -> fmt::Result {
+    text.write_str(level_name(diagnostic.level))?;
     if let Some(code) = &diagnostic.code {
-        let _ = write!(text, "[{code}]");
+        write!(text, "[{code}]")?;
     }
     match diagnostic.spans.first() {
-        Some(span) => {
-            let _ = write!(text, " {}:{}:{}: ", span.file, span.line, span.column);
-        }
-        None => text.push_str(" (no place): "),
+        Some(span) => write!(text, " {}:{}:{}: ", span.file, span.line, span.column)?,
+        None => text.write_str(" (no place): ")?,
     }
-    text.push_str(&diagnostic.message);
+    text.write_str(&diagnostic.message)?;
     for span in &diagnostic.spans {
         if let Some(label) = &span.label {
-            let _ = write!(text, "\n  {}:{}:{}: {label}", span.file, span.line, span.column);
+            write!(text, "\n  {}:{}:{}: {label}", span.file, span.line, span.column)?;
         }
     }
     for child in &diagnostic.children {
-        let _ = write!(text, "\n  {}: {}", level_name(child.level), child.message);
+        write!(text, "\n  {}: {}", level_name(child.level), child.message)?;
     }
     for fact in &diagnostic.facts {
-        text.push_str("\n  read: ");
-        text.push_str(&fact.what);
+        text.write_str("\n  read: ")?;
+        text.write_str(&fact.what)?;
     }
-    text
+    Ok(())
 }
 
-fn render_failure(test: &TestResult) -> String {
-    format!(
-        "test {} `{}` failed after {} ms; the end of its output:\n```\n{}\n```",
-        test.binary,
-        test.name,
-        test.millis,
-        tail(&test.output)
-    )
+/// A failed test, its name and the end of its output, onto the end of `text`.
+fn render_failure_into(text: &mut String, test: &TestResult) {
+    let _ = write!(
+        text,
+        "test {} `{}` failed after {} ms; the end of its output:\n```\n",
+        test.binary, test.name, test.millis
+    );
+    tail_into(text, &test.output);
+    text.push_str("\n```");
 }
 
-/// The last [`TAIL_LINES`] lines of `output`, at most [`TAIL_BYTES`] of them.
+/// The last [`TAIL_LINES`] lines of `output`, at most [`TAIL_BYTES`] of them, with each run of
+/// three backticks made three quotes, onto the end of `out`.
 ///
 /// Only the end of the output is read: a test that printed megabytes costs what its tail does.
 /// A suffix that starts just after a newline has the same lines as the whole, both decoded (a
 /// newline ends any malformed UTF-8 sequence) and trimmed, so long as it has the lines asked
-/// for; when trailing blank lines leave it short, a suffix twice as long is tried.
-fn tail(output: &[u8]) -> String {
+/// for; when trailing blank lines leave it short, a suffix twice as long is tried. The lines
+/// are written once, into room reserved for them, and cut and escaped in place.
+fn tail_into(out: &mut String, output: &[u8]) {
     let mut newlines = TAIL_LINES + 1;
     let text = loop {
         let start = output
@@ -1043,28 +1117,44 @@ fn tail(output: &[u8]) -> String {
                 }
             })
             .map_or(0, |at| at + 1);
+        // alloc: only output that is not UTF-8 is copied; the rest is borrowed
         let text = String::from_utf8_lossy(&output[start..]);
         if start == 0 || text.trim_end().lines().count() >= TAIL_LINES {
             break text;
         }
         newlines *= 2;
     };
-    let lines: Vec<&str> = text.trim_end().lines().collect();
-    let mut tail = lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n");
-    if tail.len() > TAIL_BYTES {
-        let mut start = tail.len() - TAIL_BYTES;
-        while !tail.is_char_boundary(start) {
+    let trimmed = text.trim_end();
+    let skip = trimmed.lines().count().saturating_sub(TAIL_LINES);
+    let lines = || trimmed.lines().skip(skip);
+    let len = lines().map(|line| line.len() + 1).sum::<usize>().saturating_sub(1);
+    let base = out.len();
+    out.reserve(len + 3);
+    for (at, line) in lines().enumerate() {
+        if at > 0 {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    if len > TAIL_BYTES {
+        let mut start = out.len() - TAIL_BYTES;
+        while !out.is_char_boundary(start) {
             start += 1;
         }
-        tail = format!("...{}", &tail[start..]);
+        out.replace_range(base..start, "...");
     }
-    tail.replace("```", "'''")
+    let mut from = base;
+    while let Some(at) = out[from..].find("```") {
+        let at = from + at;
+        out.replace_range(at..at + 3, "'''");
+        from = at + 3;
+    }
 }
 
-/// `text` cut to at most `most` bytes, at a char boundary.
-fn cut(text: &mut String, most: usize) {
-    if text.len() > most {
-        let mut end = most;
+/// `text` past `from` cut to at most `most` bytes, at a char boundary.
+fn cut(text: &mut String, from: usize, most: usize) {
+    if text.len() - from > most {
+        let mut end = from + most;
         while !text.is_char_boundary(end) {
             end -= 1;
         }

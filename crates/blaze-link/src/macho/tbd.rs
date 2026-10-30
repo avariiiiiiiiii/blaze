@@ -2089,23 +2089,19 @@ e:
         }
     }
 
-    struct Rng(u64);
+    struct Rng(blaze_ids::rng::SplitMix64);
 
     impl Rng {
         fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            z ^ (z >> 31)
+            self.0.next_u64()
         }
 
         fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
+            self.0.index(n)
         }
 
         fn one_in(&mut self, n: usize) -> bool {
-            self.below(n) == 0
+            self.0.one_in(n as u64)
         }
 
         fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
@@ -2346,7 +2342,7 @@ e:
     /// block lists, comments, CRLF, and mutated bytes for the error paths.
     #[test]
     fn differential_seeded() {
-        let mut rng = Rng(0x7bd5_eed);
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(0x7bd5_eed));
         for _ in 0..600 {
             let text = generate(&mut rng);
             assert_eq!(trees(&text), reference_trees(&text), "{text}");
@@ -2358,7 +2354,7 @@ e:
 
     #[test]
     fn core_names_match_core_name() {
-        let mut rng = Rng(42);
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(42));
         for _ in 0..200 {
             let raw = NAMES[rng.below(NAMES.len())];
             let text = format!(
@@ -2423,7 +2419,7 @@ e:
                 arena_is_exact(&shared);
             }
         }
-        let mut rng = Rng(0xa7e4a);
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(0xa7e4a));
         for _ in 0..200 {
             let text = generate(&mut rng);
             let raw = documents(&text);
@@ -2469,7 +2465,7 @@ e:
     /// The word-at-a-time searches against a byte loop, from every offset.
     #[test]
     fn swar_matches_scalar() {
-        let mut rng = Rng(7);
+        let mut rng = Rng(blaze_ids::rng::SplitMix64::new(7));
         for _ in 0..300 {
             let len = rng.below(80);
             let bytes = noise(&mut rng, len);

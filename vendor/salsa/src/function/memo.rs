@@ -655,9 +655,9 @@ mod _memory_usage {
 
     // Memos are stored a lot, make sure their size doesn't randomly increase.
     const _: [(); std::mem::size_of::<super::MemoHeader>()] =
-        [(); std::mem::size_of::<[usize; 5]>()];
+        [(); std::mem::size_of::<[usize; 3]>()];
     const _: [(); std::mem::size_of::<super::Memo<DummyConfiguration>>()] =
-        [(); std::mem::size_of::<[usize; 6]>()];
+        [(); std::mem::size_of::<[usize; 4]>()];
     const _: [(); std::mem::size_of::<super::ErasedMemo<'static>>()] =
         [(); std::mem::size_of::<[usize; 4]>()];
 

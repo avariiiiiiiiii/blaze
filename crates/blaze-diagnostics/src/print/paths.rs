@@ -1,28 +1,45 @@
 //! What rustc names a definition by: its definitions and their parents (`def_key`), the
 //! children a module, enum or trait shows (`module_children`), the names it trims paths to
-//! (`trimmed_def_paths`) and the parents it reaches a dependency's items through
-//! (`visible_parent_map`). Ported from `compiler/rustc_middle/src/ty/print/pretty.rs` and
+//! (`trimmed_def_paths`), the parents it reaches a dependency's items through
+//! (`visible_parent_map`), and every declaration by its name (what `lookup_import_candidates`
+//! walks the crates for). Ported from `compiler/rustc_middle/src/ty/print/pretty.rs` and
 //! `compiler/rustc_metadata/src/rmeta/decoder/cstore_impl.rs` (MIT or Apache-2.0).
+//!
+//! The tables are the check's: [`Paths`] lives in [`Cx`] and keeps them in its frame, each built
+//! the first time it is read, and every later answer is a hash probe and a slice.
 
-use std::collections::VecDeque;
+use std::cell::OnceCell;
 
 use base_db::{CrateOrigin, LangCrateOrigin};
+use blaze_mem::Frame;
+use hashbrown::hash_map::Entry;
 use hir_def::{
-    AdtId, AssocItemId, AttrDefId, BlockId, ConstId, DefWithBodyId, EnumVariantId,
-    ExternCrateId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId,
-    ModuleId, StaticId, TraitId, TypeAliasId,
+    AdtId, AssocItemId, AttrDefId, ConstId, DefWithBodyId, EnumVariantId, ExternCrateId,
+    FunctionId, HasModule, ImplId, ItemContainerId, Lookup, MacroId, ModuleDefId, ModuleId,
+    StaticId, TraitId, TypeAliasId,
     attrs::AttrFlags,
     expr_store::Body,
     item_scope::{ImportOrExternCrate, ImportOrGlob, ItemScope},
-    nameres::{block_def_map, crate_def_map},
+    nameres::crate_def_map,
     signatures::FunctionSignature,
     visibility::Visibility,
 };
 use hir_expand::name::Name;
-use rustc_hash::{FxHashMap, FxHashSet};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, ast};
+use intern::{Symbol, sym};
+use rustc_hash::FxBuildHasher;
+use syntax::{AstNode, SyntaxKind, SyntaxNode, WalkEvent, ast};
 
 use crate::cx::Cx;
+
+/// A hash map in the check's frame.
+type Map<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
+type Set<'f, K> = hashbrown::HashSet<K, FxBuildHasher, &'f Frame>;
+/// A column in the check's frame.
+type Column<'f, T> = Vec<T, &'f Frame>;
+
+fn map<K, V>(frame: &Frame) -> Map<'_, K, V> {
+    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
+}
 
 /// A definition a path names: rustc's `DefId`, of the kinds diagnostics print.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -137,10 +154,10 @@ impl Def {
             Def::Module(it) => it.name(db),
             Def::Impl(_) => None,
             Def::ExternCrate(it) => hir::ExternCrateDecl::from(it).alias_or_name(db),
-            Def::Variant(it) => Some(it.lookup(db).name.clone()),
+            Def::Variant(it) => Some(it.lookup(db).name),
             Def::Macro(it) => Some(hir::Macro::from(it).name(db)),
             Def::Adt(it) => Some(hir::Adt::from(it).name(db)),
-            Def::Function(it) => Some(FunctionSignature::of(db, it).name.clone()),
+            Def::Function(it) => Some(FunctionSignature::of(db, it).name),
             Def::Const(it) => hir::Const::from(it).name(db),
             Def::Static(it) => Some(hir::Static::from(it).name(db)),
             Def::Trait(it) => Some(hir::Trait::from(it).name(db)),
@@ -216,6 +233,7 @@ fn block_owner(cx: &Cx<'_, '_>, module: ModuleId) -> Option<Parent> {
     let ast_id = block.ast_id(db);
     let root = cx.sema.parse_or_expand(ast_id.file_id);
     let node = ast_id.file_id.ast_id_map(db).get(ast_id.value).to_node(&root);
+    // clone: a reference count, printing a block's path
     body_parent(cx, node.syntax().clone())
 }
 
@@ -229,12 +247,14 @@ pub(crate) fn closure_path(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> 
 /// is one.
 fn body_parent(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
     let db = cx.db;
+    // alloc: printing a closure's path, the edge
     let mut closures = Vec::new();
     for ancestor in cx.sema.ancestors_with_macros(node) {
         if is_closure_like(&ancestor) {
             closures.push(ancestor);
             continue;
         }
+        // clone: a reference count per ancestor, printing a closure's path
         let owner = if let Some(it) = ast::Fn::cast(ancestor.clone()) {
             Def::Function(FunctionId::try_from(cx.sema.to_def(&it)?).ok()?)
         } else if let Some(it) = ast::Const::cast(ancestor.clone()) {
@@ -244,7 +264,8 @@ fn body_parent(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
         } else {
             continue;
         };
-        let mut indices = Vec::new();
+        // alloc: the closures of the path printed, returned in it
+        let mut indices = Vec::with_capacity(closures.len() + 1);
         if let Def::Function(f) = owner {
             let sig = FunctionSignature::of(db, f);
             if sig.is_async() || sig.is_gen() {
@@ -265,6 +286,7 @@ fn body_parent(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
 pub(crate) fn is_closure_like(node: &SyntaxNode) -> bool {
     match node.kind() {
         SyntaxKind::CLOSURE_EXPR => true,
+        // clone: a reference count, of a block only
         SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node.clone()).is_some_and(|it| {
             it.async_token().is_some() || it.gen_token().is_some()
         }),
@@ -274,70 +296,75 @@ pub(crate) fn is_closure_like(node: &SyntaxNode) -> bool {
 
 /// Whether `node` is a definition closures are numbered under: an item, or a closure.
 fn is_closure_parent(node: &SyntaxNode) -> bool {
-    is_closure_like(node) || ast::Item::can_cast(node.kind())
+    ast::Item::can_cast(node.kind()) || is_closure_like(node)
 }
 
 /// The disambiguator rustc gives `closure` among the closures of `parent`: closures are
 /// numbered as they are reached, outer before inner, each under the nearest item or closure
-/// around it.
+/// around it. One walk of `parent` up to `closure`, not entering another item or closure:
+/// what is inside one is numbered under it.
 pub(crate) fn closure_index(parent: &SyntaxNode, closure: &SyntaxNode) -> u32 {
     let mut index = 0;
-    for node in parent.descendants().skip(1) {
+    let mut walk = parent.preorder();
+    walk.next();
+    while let Some(event) = walk.next() {
+        let WalkEvent::Enter(node) = event else { continue };
         if &node == closure {
             break;
         }
-        if is_closure_like(&node)
-            && node.ancestors().skip(1).find(is_closure_parent).as_ref() == Some(parent)
-        {
-            index += 1;
+        if is_closure_parent(&node) {
+            index += u32::from(is_closure_like(&node));
+            walk.skip_subtree();
         }
     }
     index
 }
 
-/// A child `module_children` lists.
+/// A public child `module_children` lists, with what the walks over children test of it.
+/// 16 bytes or so: a name, a definition and two flags.
+#[derive(Clone, Copy)]
 struct Child {
     name: Name,
     def: Def,
-    public: bool,
+    /// Whether `trimmed_def_paths` counts it: neither `#[doc(hidden)]` nor a type alias
+    /// outside an `extern` block.
+    trim: bool,
     /// Whether the `use` or `extern crate` it is re-exported by is `#[doc(hidden)]`.
     hidden_reexport: bool,
 }
 
-fn children(cx: &Cx<'_, '_>, def: Def) -> Vec<Child> {
+/// The public children of `def`, appended to `out` in `module_children`'s order: a module's
+/// types, values then macros, an enum's variants, a trait's items.
+fn list_children(cx: &Cx<'_, '_>, def: Def, out: &mut Column<'_, Child>) {
     let db = cx.db;
+    let child = |name: &Name, def: Def, hidden_reexport: bool| Child {
+        name: *name,
+        def,
+        trim: !def.is_doc_hidden(cx)
+            && !matches!(def, Def::TypeAlias(it) if !matches!(it.lookup(db).container, ItemContainerId::ExternBlockId(_))),
+        hidden_reexport,
+    };
     match def {
         Def::Module(module) => {
             let scope = module.def_map(db).module(db, module).scope(db);
-            scope_children(cx, scope)
+            scope_children(cx, scope, out, child);
         }
-        Def::Adt(AdtId::EnumId(it)) => it
-            .enum_variants(db)
-            .variants
-            .iter()
-            .map(|(name, &(id, _))| Child {
-                name: name.clone(),
-                def: Def::Variant(id),
-                public: true,
-                hidden_reexport: false,
-            })
-            .collect(),
-        Def::Trait(it) => it
-            .trait_items(db)
-            .items
-            .iter()
-            .map(|(name, item)| Child {
-                name: name.clone(),
-                def: Def::of_assoc(*item),
-                public: true,
-                hidden_reexport: false,
-            })
-            .collect(),
-        _ => Vec::new(),
+        Def::Adt(AdtId::EnumId(it)) => {
+            out.extend(it.enum_variants(db).variants.iter().map(|(name, &(id, _))| child(name, Def::Variant(id), false)));
+        }
+        Def::Trait(it) => {
+            out.extend(it.trait_items(db).items.iter().map(|(name, item)| child(name, Def::of_assoc(*item), false)));
+        }
+        _ => {}
     }
 }
 
-fn scope_children(cx: &Cx<'_, '_>, scope: &ItemScope) -> Vec<Child> {
+fn scope_children(
+    cx: &Cx<'_, '_>,
+    scope: &ItemScope,
+    out: &mut Column<'_, Child>,
+    child: impl Fn(&Name, Def, bool) -> Child,
+) {
     let hidden = |owner: AttrDefId| AttrFlags::query(cx.db, owner).contains(AttrFlags::IS_DOC_HIDDEN);
     let reexport = |import: Option<ImportOrExternCrate>| match import {
         Some(ImportOrExternCrate::Import(it)) => hidden(AttrDefId::UseId(it.use_)),
@@ -345,120 +372,237 @@ fn scope_children(cx: &Cx<'_, '_>, scope: &ItemScope) -> Vec<Child> {
         Some(ImportOrExternCrate::ExternCrate(it)) => hidden(AttrDefId::ExternCrateId(it)),
         None => false,
     };
-    let mut out = Vec::new();
     for (name, item) in scope.types() {
-        if let Some(def) = Def::of(item.def) {
-            let public = item.vis == Visibility::Public;
-            out.push(Child { name: name.clone(), def, public, hidden_reexport: reexport(item.import) });
+        if item.vis == Visibility::Public
+            && let Some(def) = Def::of(item.def)
+        {
+            out.push(child(name, def, reexport(item.import)));
         }
     }
     for (name, item) in scope.values() {
-        if let Some(def) = Def::of(item.def) {
+        if item.vis == Visibility::Public
+            && let Some(def) = Def::of(item.def)
+        {
             let import = item.import.map(|it| match it {
                 ImportOrGlob::Import(it) => ImportOrExternCrate::Import(it),
                 ImportOrGlob::Glob(it) => ImportOrExternCrate::Glob(it),
             });
-            let public = item.vis == Visibility::Public;
-            out.push(Child { name: name.clone(), def, public, hidden_reexport: reexport(import) });
+            out.push(child(name, def, reexport(import)));
         }
     }
     for (name, item) in scope.macros() {
-        let public = item.vis == Visibility::Public;
-        let def = Def::Macro(item.def);
-        out.push(Child { name: name.clone(), def, public, hidden_reexport: reexport(item.import) });
-    }
-    out
-}
-
-/// The names glob imports bring into a scope: rustc's `glob_map` has the names used through
-/// a glob import, a name any local glob brings in counts here until the front end records
-/// which are used.
-fn glob_names(scope: &ItemScope, out: &mut FxHashSet<Name>) {
-    for (name, item) in scope.types() {
-        if matches!(item.import, Some(ImportOrExternCrate::Glob(_))) {
-            out.insert(name.clone());
-        }
-    }
-    for (name, item) in scope.values() {
-        if matches!(item.import, Some(ImportOrGlob::Glob(_))) {
-            out.insert(name.clone());
-        }
-    }
-    for (name, item) in scope.macros() {
-        if matches!(item.import, Some(ImportOrExternCrate::Glob(_))) {
-            out.insert(name.clone());
+        if item.vis == Visibility::Public {
+            out.push(child(name, Def::Macro(item.def), reexport(item.import)));
         }
     }
 }
 
-/// The names and parents paths are printed with, computed once for a crate.
-pub(crate) struct Paths {
-    trimmed: FxHashMap<Def, Name>,
-    visible_parent: FxHashMap<Def, Def>,
+/// The public children of every module, enum and trait of the direct dependencies reached
+/// through public children from their roots, listed once: both walks of printing's tables and
+/// [`Paths::reexport_name`] read them here. Node `i` is `defs[i]`, its children
+/// `rows[starts[i]..starts[i + 1]]`; the roots are the first `roots` nodes.
+struct Tree<'f> {
+    node: Map<'f, Def, u32>,
+    defs: Column<'f, Def>,
+    starts: Column<'f, u32>,
+    rows: Column<'f, Child>,
+    roots: usize,
+}
+
+impl<'f> Tree<'f> {
+    fn new(cx: &Cx<'_, '_>, frame: &'f Frame, direct: &[hir::Crate]) -> Tree<'f> {
+        let mut tree = Tree {
+            node: map(frame),
+            defs: Vec::new_in(frame),
+            starts: Vec::new_in(frame),
+            rows: Vec::new_in(frame),
+            roots: 0,
+        };
+        for krate in direct {
+            tree.add(Def::Module(krate.root_module(cx.db).into()));
+        }
+        tree.roots = tree.defs.len();
+        let mut next = 0;
+        while next < tree.defs.len() {
+            let parent = tree.defs[next];
+            let from = tree.rows.len();
+            tree.starts.push(from as u32);
+            list_children(cx, parent, &mut tree.rows);
+            for at in from..tree.rows.len() {
+                let def = tree.rows[at].def;
+                if def.is_module_like() {
+                    tree.add(def);
+                }
+            }
+            next += 1;
+        }
+        tree.starts.push(tree.rows.len() as u32);
+        tree
+    }
+
+    fn add(&mut self, def: Def) {
+        if let Entry::Vacant(it) = self.node.entry(def) {
+            it.insert(self.defs.len() as u32);
+            self.defs.push(def);
+        }
+    }
+
+    fn index(&self, def: Def) -> usize {
+        *self.node.get(&def).expect("every module-like public child of a node is a node") as usize
+    }
+
+    fn children_at(&self, node: usize) -> &[Child] {
+        &self.rows[self.starts[node] as usize..self.starts[node + 1] as usize]
+    }
+}
+
+/// The names of the crate and its direct dependencies that diagnostics print and suggest.
+/// Each table is built in the check's frame the first time it is read:
+/// - printing's (`trimmed_def_paths`, `visible_parent_map`, the crate's `extern crate` items),
+///   the first time a path is printed;
+/// - [`Decls`], every declaration by its name, the first time an import is looked for.
+pub(crate) struct Paths<'f> {
+    frame: &'f Frame,
+    printing: OnceCell<Printing<'f>>,
+    decls: OnceCell<Decls<'f>>,
+}
+
+/// Printing's tables: one hash probe per answer.
+struct Printing<'f> {
+    trimmed: Map<'f, Def, Name>,
+    visible_parent: Map<'f, Def, Def>,
     /// Each dependency the crate names by an `extern crate` item written in it.
-    extern_crates: FxHashMap<base_db::Crate, ExternCrateId>,
+    extern_crates: Map<'f, base_db::Crate, ExternCrateId>,
+    tree: Tree<'f>,
 }
 
-impl Paths {
-    pub(crate) fn new(cx: &Cx<'_, '_>) -> Paths {
-        let local = local_defs(cx);
-        let direct = direct_crates(cx, &local.extern_crates);
-        Paths {
-            trimmed: trimmed_def_paths(cx, &local, &direct),
-            visible_parent: visible_parent_map(cx, &direct),
-            extern_crates: local.extern_crates,
-        }
+impl<'f> Paths<'f> {
+    pub(crate) fn new(cx: &Cx<'f, '_>) -> Paths<'f> {
+        Paths { frame: cx.frame(), printing: OnceCell::new(), decls: OnceCell::new() }
+    }
+
+    fn printing(&self, cx: &Cx<'_, '_>) -> &Printing<'f> {
+        self.printing.get_or_init(|| Printing::new(cx, self.frame))
     }
 
     /// The one name `def` is known by across the crate and its direct dependencies.
-    pub(crate) fn trimmed(&self, def: Def) -> Option<&Name> {
-        self.trimmed.get(&def)
+    pub(crate) fn trimmed(&self, cx: &Cx<'_, '_>, def: Def) -> Option<Name> {
+        self.printing(cx).trimmed.get(&def).copied()
     }
 
-    pub(crate) fn visible_parent(&self, def: Def) -> Option<Def> {
-        self.visible_parent.get(&def).copied()
+    pub(crate) fn visible_parent(&self, cx: &Cx<'_, '_>, def: Def) -> Option<Def> {
+        self.printing(cx).visible_parent.get(&def).copied()
     }
 
     /// The `extern crate` item the crate names `krate` by, when it writes one.
-    pub(crate) fn extern_crate(&self, krate: base_db::Crate) -> Option<ExternCrateId> {
-        self.extern_crates.get(&krate).copied()
+    pub(crate) fn extern_crate(&self, cx: &Cx<'_, '_>, krate: base_db::Crate) -> Option<ExternCrateId> {
+        self.printing(cx).extern_crates.get(&krate).copied()
     }
 
     /// The name of the public child of `parent` that is `def`, other than `_`: what a
-    /// re-export calls it.
+    /// re-export calls it. `parent` is a visible parent, so its children are listed.
     pub(crate) fn reexport_name(&self, cx: &Cx<'_, '_>, parent: Def, def: Def) -> Option<Name> {
-        children(cx, parent)
-            .into_iter()
-            .find(|it| it.def == def && it.public && it.name.as_str() != "_")
+        let tree = &self.printing(cx).tree;
+        tree.children_at(tree.index(parent))
+            .iter()
+            .find(|it| it.def == def && *it.name.symbol() != sym::underscore)
             .map(|it| it.name)
+    }
+
+    /// Every declaration of the crate and its direct dependencies, by name.
+    pub(crate) fn decls(&self, cx: &Cx<'_, '_>) -> &Decls<'f> {
+        self.decls.get_or_init(|| Decls::new(cx, self.frame))
+    }
+}
+
+impl<'f> Printing<'f> {
+    fn new(cx: &Cx<'_, '_>, frame: &'f Frame) -> Printing<'f> {
+        let mut unique: Map<'f, (Ns, Name), Option<Def>> = map(frame);
+        let mut extern_crates = map(frame);
+        local_names(cx, frame, &mut unique, &mut extern_crates);
+        let direct = direct_crates(cx, frame, &extern_crates);
+        let tree = Tree::new(cx, frame, &direct);
+        trimmed_names(frame, &tree, &mut unique);
+        let mut trimmed: Map<'f, Def, Name> =
+            hashbrown::HashMap::with_capacity_and_hasher_in(unique.len(), FxBuildHasher, frame);
+        for ((_, name), def) in unique {
+            let Some(def) = def else { continue };
+            match trimmed.entry(def) {
+                Entry::Occupied(mut it) => {
+                    if it.get().symbol().cmp_order(name.symbol()).is_gt() {
+                        *it.get_mut() = name;
+                    }
+                }
+                Entry::Vacant(it) => {
+                    it.insert(name);
+                }
+            }
+        }
+        let visible_parent = visible_parent_map(cx, frame, &tree);
+        Printing { trimmed, visible_parent, extern_crates, tree }
+    }
+}
+
+/// `trimmed_def_paths`' count of a name in a namespace: the one definition it names, or none
+/// once it names two.
+fn collect(unique: &mut Map<'_, (Ns, Name), Option<Def>>, name: Name, ns: Ns, def: Def) {
+    match unique.entry((ns, name)) {
+        Entry::Occupied(mut it) => {
+            if it.get().is_some_and(|existing| existing != def) {
+                *it.get_mut() = None;
+            }
+        }
+        Entry::Vacant(it) => {
+            it.insert(Some(def));
+        }
     }
 }
 
 /// The crate's own named definitions, wherever they are written (rustc's `hir_free_items`),
-/// the names its glob imports bring in, and its `extern crate` items.
-struct LocalDefs {
-    defs: Vec<(Name, Def)>,
-    globs: FxHashSet<Name>,
-    extern_crates: FxHashMap<base_db::Crate, ExternCrateId>,
-}
-
-fn local_defs(cx: &Cx<'_, '_>) -> LocalDefs {
+/// counted into `unique`; the names its glob imports bring in, which name nothing (rustc's
+/// `glob_map` has the names used through a glob import, a name any local glob brings in counts
+/// here until the front end records which are used); and its `extern crate` items.
+fn local_names<'f>(
+    cx: &Cx<'_, '_>,
+    frame: &'f Frame,
+    unique: &mut Map<'f, (Ns, Name), Option<Def>>,
+    extern_crates: &mut Map<'f, base_db::Crate, ExternCrateId>,
+) {
     let db = cx.db;
-    let mut out = LocalDefs { defs: Vec::new(), globs: FxHashSet::default(), extern_crates: FxHashMap::default() };
-    let mut bodies: Vec<DefWithBodyId> = Vec::new();
-    let mut seen_bodies = FxHashSet::default();
+    let mut bodies: Column<'f, DefWithBodyId> = Vec::new_in(frame);
+    let mut seen_bodies: Set<'f, DefWithBodyId> = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
     let def_map = crate_def_map(db, cx.krate.into());
-    let mut scopes: Vec<&ItemScope> = def_map.modules(db).map(|(_, data)| data.scope(db)).collect();
+    let mut scopes: Column<'f, &ItemScope> = Vec::new_in(frame);
+    scopes.extend(def_map.modules(db).map(|(_, data)| data.scope(db)));
+    fn glob(unique: &mut Map<'_, (Ns, Name), Option<Def>>, name: &Name) {
+        for ns in [Ns::Type, Ns::Value, Ns::Macro] {
+            unique.insert((ns, *name), None);
+        }
+    }
     loop {
         for scope in scopes.drain(..) {
-            glob_names(scope, &mut out.globs);
+            for (name, item) in scope.types() {
+                if matches!(item.import, Some(ImportOrExternCrate::Glob(_))) {
+                    glob(unique, name);
+                }
+            }
+            for (name, item) in scope.values() {
+                if matches!(item.import, Some(ImportOrGlob::Glob(_))) {
+                    glob(unique, name);
+                }
+            }
+            for (name, item) in scope.macros() {
+                if matches!(item.import, Some(ImportOrExternCrate::Glob(_))) {
+                    glob(unique, name);
+                }
+            }
             for id in scope.extern_crate_decls() {
                 let decl = hir::ExternCrateDecl::from(id);
                 if let Some(name) = decl.alias_or_name(db) {
-                    out.defs.push((name, Def::ExternCrate(id)));
+                    collect(unique, name, Ns::Type, Def::ExternCrate(id));
                 }
                 if let Some(krate) = decl.resolved_crate(db) {
-                    out.extern_crates.entry(krate.into()).or_insert(id);
+                    extern_crates.entry(krate.into()).or_insert(id);
                 }
             }
             for id in scope.declarations() {
@@ -466,7 +610,7 @@ fn local_defs(cx: &Cx<'_, '_>) -> LocalDefs {
                 if !def.is_foreign(cx)
                     && let Some(name) = def.name(cx)
                 {
-                    out.defs.push((name, def));
+                    collect(unique, name, def.ns().unwrap_or(Ns::Type), def);
                 }
                 match id {
                     ModuleDefId::FunctionId(it) => bodies.push(it.into()),
@@ -486,12 +630,10 @@ fn local_defs(cx: &Cx<'_, '_>) -> LocalDefs {
         if !seen_bodies.insert(body) {
             continue;
         }
-        let blocks: Vec<BlockId> = Body::of(db, body).blocks(db).map(|(block, _)| block).collect();
-        for block in blocks {
-            scopes.extend(block_def_map(db, block).modules(db).map(|(_, data)| data.scope(db)));
+        for (_, block) in Body::of(db, body).blocks(db) {
+            scopes.extend(block.modules(db).map(|(_, data)| data.scope(db)));
         }
     }
-    out
 }
 
 fn body_of(item: AssocItemId) -> Option<DefWithBodyId> {
@@ -505,24 +647,27 @@ fn body_of(item: AssocItemId) -> Option<DefWithBodyId> {
 /// The crates rustc counts as the crate's direct dependencies, the ones it has loaded for
 /// the crate itself, `std` first: `std` (or `core` when there is no `std`), the crates of
 /// the crate's `extern crate` items, and the dependencies that are not the language's.
-fn direct_crates(
+fn direct_crates<'f>(
     cx: &Cx<'_, '_>,
-    extern_crates: &FxHashMap<base_db::Crate, ExternCrateId>,
-) -> Vec<hir::Crate> {
+    frame: &'f Frame,
+    extern_crates: &Map<'_, base_db::Crate, ExternCrateId>,
+) -> Column<'f, hir::Crate> {
     let db = cx.db;
-    let deps: Vec<hir::Crate> = cx.krate.dependencies(db).into_iter().map(|it| it.krate).collect();
+    // alloc: hir's list of the crate's dependencies, once per check
+    let deps = cx.krate.dependencies(db);
     let lang = |krate: hir::Crate| match krate.origin(db) {
         CrateOrigin::Lang(it) => Some(it),
         _ => None,
     };
     let injected = deps
         .iter()
-        .copied()
+        .map(|it| it.krate)
         .find(|&it| lang(it) == Some(LangCrateOrigin::Std))
-        .or_else(|| deps.iter().copied().find(|&it| lang(it) == Some(LangCrateOrigin::Core)));
-    let mut out: Vec<hir::Crate> = injected.into_iter().collect();
-    for krate in deps {
-        let named = extern_crates.contains_key(&krate.into());
+        .or_else(|| deps.iter().map(|it| it.krate).find(|&it| lang(it) == Some(LangCrateOrigin::Core)));
+    let mut out: Column<'f, hir::Crate> = Vec::with_capacity_in(deps.len(), frame);
+    out.extend(injected);
+    for krate in deps.iter().map(|it| it.krate) {
+        let named = extern_crates.contains_key(&base_db::Crate::from(krate));
         if !out.contains(&krate) && (lang(krate).is_none() || named) {
             out.push(krate);
         }
@@ -530,90 +675,62 @@ fn direct_crates(
     out
 }
 
-/// rustc's `trimmed_def_paths`: each definition whose name names nothing else, in its
-/// namespace, across the crate's own definitions and the public ones of its direct
-/// dependencies; a name glob imports bring in names nothing.
-fn trimmed_def_paths(cx: &Cx<'_, '_>, local: &LocalDefs, direct: &[hir::Crate]) -> FxHashMap<Def, Name> {
-    let mut unique: FxHashMap<(Ns, Name), Option<Def>> = FxHashMap::default();
-    for name in &local.globs {
-        for ns in [Ns::Type, Ns::Value, Ns::Macro] {
-            unique.insert((ns, name.clone()), None);
-        }
+/// rustc's `trimmed_def_paths` over the direct dependencies: the public children reached from
+/// their roots, except `#[doc(hidden)]` ones and type aliases outside `extern` blocks (nor what
+/// is below them), counted into `unique` with the crate's own.
+fn trimmed_names(frame: &Frame, tree: &Tree<'_>, unique: &mut Map<'_, (Ns, Name), Option<Def>>) {
+    let nodes = tree.defs.len();
+    let mut seen: Column<'_, u64> = Vec::with_capacity_in(nodes.div_ceil(64), frame);
+    seen.resize(nodes.div_ceil(64), 0);
+    let mut stack: Column<'_, usize> = Vec::with_capacity_in(nodes, frame);
+    for root in 0..tree.roots {
+        seen[root / 64] |= 1 << (root % 64);
+        stack.push(root);
     }
-    let mut collect = |name: &Name, ns: Ns, def: Def| {
-        unique
-            .entry((ns, name.clone()))
-            .and_modify(|it| {
-                if it.is_some_and(|existing| existing != def) {
-                    *it = None;
-                }
-            })
-            .or_insert(Some(def));
-    };
-    for (name, def) in &local.defs {
-        collect(name, def.ns().unwrap_or(Ns::Type), *def);
-    }
-    let mut queue: Vec<Def> =
-        direct.iter().map(|it| Def::Module(it.root_module(cx.db).into())).collect();
-    let mut seen = FxHashSet::default();
-    while let Some(parent) = queue.pop() {
-        for child in children(cx, parent) {
-            if !child.public {
-                continue;
-            }
-            if let Def::TypeAlias(it) = child.def
-                && !matches!(it.lookup(cx.db).container, ItemContainerId::ExternBlockId(_))
-            {
-                continue;
-            }
-            if child.def.is_doc_hidden(cx) {
+    while let Some(node) = stack.pop() {
+        for child in tree.children_at(node) {
+            if !child.trim {
                 continue;
             }
             if let Some(ns) = child.def.ns() {
-                collect(&child.name, ns, child.def);
+                collect(unique, child.name, ns, child.def);
             }
-            if child.def.is_module_like() && seen.insert(child.def) {
-                queue.push(child.def);
+            if child.def.is_module_like() {
+                let at = tree.index(child.def);
+                let bit = 1 << (at % 64);
+                if seen[at / 64] & bit == 0 {
+                    seen[at / 64] |= bit;
+                    stack.push(at);
+                }
             }
         }
     }
-    let mut map: FxHashMap<Def, Name> = FxHashMap::default();
-    for ((_, name), def) in unique {
-        let Some(def) = def else { continue };
-        map.entry(def)
-            .and_modify(|it| {
-                if it.symbol().cmp_order(name.symbol()).is_gt() {
-                    *it = name.clone();
-                }
-            })
-            .or_insert(name);
-    }
-    map
 }
 
 /// rustc's `visible_parent_map`: for each definition of a direct dependency reached through
 /// public children, breadth first over all of them so that the shortest path wins, the
 /// parent it is reached through; parents through `_`, a `#[doc(hidden)]` parent or a
 /// `#[doc(hidden)]` re-export only where there is no other.
-fn visible_parent_map(cx: &Cx<'_, '_>, direct: &[hir::Crate]) -> FxHashMap<Def, Def> {
-    let mut map: FxHashMap<Def, Def> = FxHashMap::default();
-    let mut fallback: Vec<(Def, Def)> = Vec::new();
-    let mut queue: VecDeque<Def> =
-        direct.iter().map(|it| Def::Module(it.root_module(cx.db).into())).collect();
-    while let Some(parent) = queue.pop_front() {
+fn visible_parent_map<'f>(cx: &Cx<'_, '_>, frame: &'f Frame, tree: &Tree<'_>) -> Map<'f, Def, Def> {
+    let mut map: Map<'f, Def, Def> =
+        hashbrown::HashMap::with_capacity_and_hasher_in(tree.rows.len(), FxBuildHasher, frame);
+    let mut fallback: Column<'_, (Def, Def)> = Vec::new_in(frame);
+    let mut queue: Column<'_, usize> = Vec::with_capacity_in(tree.defs.len(), frame);
+    queue.extend(0..tree.roots);
+    let mut head = 0;
+    while let Some(&node) = queue.get(head) {
+        head += 1;
+        let parent = tree.defs[node];
         let parent_hidden = parent.is_doc_hidden(cx);
-        for child in children(cx, parent) {
-            if !child.public {
-                continue;
-            }
-            if child.name.as_str() == "_" || parent_hidden || child.hidden_reexport {
+        for child in tree.children_at(node) {
+            if *child.name.symbol() == sym::underscore || parent_hidden || child.hidden_reexport {
                 fallback.push((child.def, parent));
                 continue;
             }
-            if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(child.def) {
+            if let Entry::Vacant(entry) = map.entry(child.def) {
                 entry.insert(parent);
                 if child.def.is_module_like() {
-                    queue.push_back(child.def);
+                    queue.push(tree.index(child.def));
                 }
             }
         }
@@ -622,4 +739,83 @@ fn visible_parent_map(cx: &Cx<'_, '_>, direct: &[hir::Crate]) -> FxHashMap<Def, 
         map.entry(child).or_insert(parent);
     }
     map
+}
+
+/// A declaration of the crate or of a direct dependency: what an import is suggested from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Decl {
+    pub(crate) def: hir::ModuleDef,
+    /// Whether it is the crate's own.
+    pub(crate) local: bool,
+}
+
+/// Every named declaration of the crate and its direct dependencies, the crate's first, each
+/// module's in order and an enum's variants after it, grouped by name: name `n`'s are
+/// `decls[starts[n]..starts[n + 1]]` in that order. rustc's `lookup_import_candidates` walks
+/// every module of every crate for each name it looks up; here the walk is done once per check
+/// and a lookup is one probe of `at` and a slice.
+pub(crate) struct Decls<'f> {
+    at: Map<'f, Symbol, u32>,
+    starts: Column<'f, u32>,
+    decls: Column<'f, Decl>,
+}
+
+impl<'f> Decls<'f> {
+    fn new(cx: &Cx<'_, '_>, frame: &'f Frame) -> Decls<'f> {
+        let db = cx.db;
+        let mut at: Map<'f, Symbol, u32> = map(frame);
+        let mut pairs: Column<'f, (u32, Decl)> = Vec::new_in(frame);
+        let mut push = |name: &Name, def: hir::ModuleDef, local: bool| {
+            let next = at.len() as u32;
+            let row = *at.entry(*name.symbol()).or_insert(next);
+            pairs.push((row, Decl { def, local }));
+        };
+        // alloc: hir's list of the crate's dependencies, once per check
+        let deps = cx.krate.dependencies(db);
+        for krate in std::iter::once(cx.krate).chain(deps.iter().map(|it| it.krate)) {
+            let local = krate == cx.krate;
+            for (_, data) in crate_def_map(db, krate.into()).modules(db) {
+                for id in data.scope(db).declarations() {
+                    let def = hir::ModuleDef::from(id);
+                    if let Some(name) = def.name(db) {
+                        push(&name, def, local);
+                    }
+                    if let ModuleDefId::AdtId(AdtId::EnumId(it)) = id {
+                        for (name, &(variant, _)) in it.enum_variants(db).variants.iter() {
+                            push(name, hir::ModuleDef::EnumVariant(variant.into()), local);
+                        }
+                    }
+                }
+            }
+        }
+        let rows = at.len();
+        let mut starts: Column<'f, u32> = Vec::with_capacity_in(rows + 1, frame);
+        starts.resize(rows + 1, 0);
+        for &(row, _) in &pairs {
+            starts[row as usize + 1] += 1;
+        }
+        for row in 1..=rows {
+            starts[row] += starts[row - 1];
+        }
+        let mut cursors: Column<'_, u32> = Vec::with_capacity_in(rows, frame);
+        cursors.extend_from_slice(&starts[..rows]);
+        let mut decls: Column<'f, Decl> = Vec::with_capacity_in(pairs.len(), frame);
+        if let Some(&(_, first)) = pairs.first() {
+            decls.resize(pairs.len(), first);
+        }
+        for &(row, decl) in &pairs {
+            let cursor = &mut cursors[row as usize];
+            decls[*cursor as usize] = decl;
+            *cursor += 1;
+        }
+        Decls { at, starts, decls }
+    }
+
+    /// The declarations named `name`, in the order above. A name no declaration has may not
+    /// be interned at all: then it is not looked for.
+    pub(crate) fn named(&self, name: &str) -> &[Decl] {
+        let Some(row) = Symbol::find(name).and_then(|it| self.at.get(&it)) else { return &[] };
+        let row = *row as usize;
+        &self.decls[self.starts[row] as usize..self.starts[row + 1] as usize]
+    }
 }

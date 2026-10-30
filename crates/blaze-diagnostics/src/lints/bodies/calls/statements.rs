@@ -44,23 +44,12 @@ use syntax::{AstNode as _, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
 use crate::{
     cx::item_range,
     lints::bodies::{
-        BodyCx, Hooks, LatePass,
+        BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, PatKinds, PatTag, lint_set,
         types::util::{Solver, diagnostic_item, from_expansion, path_item, path_value},
     },
     lower::{Found, Phase, break_outside_of_loop::ancestors},
     model::{Applicability, Diag, Span},
 };
-
-pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
-    vec![
-        Box::new(PathStatements),
-        Box::new(LetUnderscore),
-        Box::new(UnusedResults),
-        Box::new(UnitBindings),
-        Box::new(NonShorthandFieldPatterns),
-        Box::new(UnusedAllocation),
-    ]
-}
 
 /// Statement `index` of the block `block`.
 fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<Statement<'db>> {
@@ -133,16 +122,12 @@ fn lang_items<'db>(solver: &Solver<'db>) -> &'db LangItems {
 }
 
 /// `PathStatements`: a statement that is a path and nothing else.
-struct PathStatements;
+#[derive(Default)]
+pub(crate) struct PathStatements;
 
 impl LatePass for PathStatements {
-    fn name(&self) -> &'static str {
-        "PathStatements"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::STMT
-    }
+    const LINTS: LintSet = lint_set(["path_statements"]);
+    const HOOKS: Hooks = Hooks::STMT;
 
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         let Some(expr) = semi_expr(b, block, index) else { return };
@@ -217,16 +202,13 @@ impl Local {
 }
 
 /// `LetUnderscore`: a `_` in a `let` that drops a value with a destructor at once.
-struct LetUnderscore;
+#[derive(Default)]
+pub(crate) struct LetUnderscore;
 
 impl LatePass for LetUnderscore {
-    fn name(&self) -> &'static str {
-        "LetUnderscore"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR | Hooks::LOCAL
-    }
+    const LINTS: LintSet = lint_set(["let_underscore_drop", "let_underscore_lock"]);
+    const HOOKS: Hooks = Hooks::LOCAL;
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Assignment]);
 
     fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_stmt(b, block, index) {
@@ -332,16 +314,12 @@ enum MustUse {
 
 /// `UnusedResults`: of rustc's pass, `unused_results`: a statement's value of a type that is
 /// neither trivial nor `#[must_use]`, from no `#[must_use]` function or operator.
-struct UnusedResults;
+#[derive(Default)]
+pub(crate) struct UnusedResults;
 
 impl LatePass for UnusedResults {
-    fn name(&self) -> &'static str {
-        "UnusedResults"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::STMT
-    }
+    const LINTS: LintSet = lint_set(["unused_results"]);
+    const HOOKS: Hooks = Hooks::STMT;
 
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         let Some(stmt_expr) = semi_expr(b, block, index) else { return };
@@ -492,16 +470,13 @@ fn ty_must_use<'db>(b: &BodyCx<'_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, expr
 
 /// `UnitBindings`: a `let` that binds a value of `()` with no type written, neither side
 /// written as `()`, outside of macros.
-struct UnitBindings;
+#[derive(Default)]
+pub(crate) struct UnitBindings;
 
 impl LatePass for UnitBindings {
-    fn name(&self) -> &'static str {
-        "UnitBindings"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR | Hooks::LOCAL
-    }
+    const LINTS: LintSet = lint_set(["unit_bindings"]);
+    const HOOKS: Hooks = Hooks::LOCAL;
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Assignment]);
 
     fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(local) = Local::of_stmt(b, block, index) {
@@ -539,21 +514,17 @@ fn unit_binding(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
 }
 
 /// `NonShorthandFieldPatterns`: `Struct { x: x }` in a pattern, outside of macros.
-struct NonShorthandFieldPatterns;
+#[derive(Default)]
+pub(crate) struct NonShorthandFieldPatterns;
 
 impl LatePass for NonShorthandFieldPatterns {
-    fn name(&self) -> &'static str {
-        "NonShorthandFieldPatterns"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::PAT
-    }
+    const LINTS: LintSet = lint_set(["non_shorthand_field_patterns"]);
+    const PATS: PatKinds = PatKinds::of(&[PatTag::Record]);
 
     fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, out: &mut Vec<Found>) {
         let store = b.store();
         let Pat::Record { args, .. } = store.pat(pat) else { return };
-        if b.tainted {
+        if b.tainted() {
             return;
         }
         let Some(at) = b.pat_node(pat) else { return };
@@ -598,23 +569,22 @@ impl LatePass for NonShorthandFieldPatterns {
 
 /// `UnusedAllocation`: `Box::new(x)` borrowed at once, by an adjustment to `&` or `&mut` of
 /// what it holds.
-struct UnusedAllocation;
+#[derive(Default)]
+pub(crate) struct UnusedAllocation;
 
 impl LatePass for UnusedAllocation {
-    fn name(&self) -> &'static str {
-        "UnusedAllocation"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["unused_allocation"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Call { callee, args } = b.store().expr(expr) else { return };
-        if args.len() != 1 || path_item(b, callee) != Some(items().box_new) {
+        if args.len() != 1 {
             return;
         }
         let Some(adjustments) = b.infer.expr_adjustment(expr) else { return };
+        if path_item(b, callee) != Some(items().box_new) {
+            return;
+        }
         for adjustment in adjustments {
             let Adjust::Borrow(AutoBorrow::Ref(mutability)) = &adjustment.kind else { continue };
             if let TyKind::Ref(_, inner, _) = adjustment.target.as_ref().kind()

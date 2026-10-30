@@ -56,17 +56,16 @@ does something. The execution record adds nothing (next section).
 On 64 cores it is any test under 3.5 ms, the common case for unit tests. Every test of such a
 binary is off its bound by up to `C` times.
 
-The removal: `K` replicas of the server per binary. After the hello, the server forks `K - 1`
-copies of itself. Each copy is initialized (statics, the slot count, its own pool of regions)
-and connected on a socket of its own. The queue treats each connection as a server of the same
-binary, so tests spread across the replicas and `K` forks are in flight at once. `K` is
-`ceil(C × T_fork / T_median)`, capped at `C`.
+The removal, done: `K` replicas of the server per binary. After the hello, blaze asks the
+server for `K - 1` copies of itself (`Frame::Replicate`). Each copy is initialized (statics,
+the slot count, its own empty pool of regions) and connects on a socket of its own. The queue
+keeps a connection per replica and hands each test to the first with room, so `K` forks are in
+flight at once. How `K` is chosen, from the cores and the fork the server measured, is in
+[speed-of-light.md](speed-of-light.md), "Tests", "Replicas of a fork server".
 
-This needs:
-- the queue to keep several connections per binary, which is in these paths;
-- the replicas to connect back, which is cargo's socket and the parent's sandbox.
-
-It is asked for in `v2/requests/usercode-fast-tests.md`.
+The sandbox needs no change: a connection is allowed by the socket's path, and the copies
+inherit the filter. The driver's listen accepts every connection until the queue ends it,
+which it now does only once all `K` are in.
 
 **Smaller gaps, each under 2%:**
 - `clone3` with `CLONE_PIDFD` would fold `pidfd_open` into the fork.

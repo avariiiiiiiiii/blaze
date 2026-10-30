@@ -37,7 +37,7 @@ impl<'db> VtableLayout<'db> {
     pub(super) fn of(
         interner: DbInterner<'db>,
         trait_ref: TraitRef<'db>,
-        plain: &dyn Fn(TraitRef<'db>) -> TraitRef<'db>,
+        plain: &impl Fn(TraitRef<'db>) -> TraitRef<'db>,
     ) -> Self {
         let mut walk = Walk {
             interner,
@@ -81,9 +81,9 @@ pub(super) enum Upcast {
     Load(usize),
 }
 
-struct Walk<'a, 'db> {
+struct Walk<'a, 'db, P> {
     interner: DbInterner<'db>,
-    plain: &'a dyn Fn(TraitRef<'db>) -> TraitRef<'db>,
+    plain: &'a P,
     visited: FxHashSet<TraitRef<'db>>,
     slots: Vec<Slot<'db>>,
     prefixes: Vec<TraitRef<'db>>,
@@ -92,7 +92,7 @@ struct Walk<'a, 'db> {
     emit_vptr: bool,
 }
 
-impl<'db> Walk<'_, 'db> {
+impl<'db, P: Fn(TraitRef<'db>) -> TraitRef<'db>> Walk<'_, 'db, P> {
     /// Supertraits first, depth first in declaration order, then the trait's own methods.
     fn visit(&mut self, trait_ref: TraitRef<'db>, vptr: bool) {
         let interner = self.interner;

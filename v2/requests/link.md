@@ -1308,6 +1308,7 @@ arithmetic are in `docs/v2/plan/lanes/link/speed-of-light.md`, "ELF writer and r
 
 > Told by tmux: requests-link-fuzz-core-model-next1, requests-link-fuzz-core-stage.
 > taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> forwarded to requests-link-next (child requests-link-next-writers has 19.2 and 19.5; 19.1, 19.3, 19.4 are in) (requests, pass 18).
 
 ## dedup: `blaze-link`'s `align_up` and bump arena onto blaze-mem (from dedup-mem)
 
@@ -1378,6 +1379,8 @@ With 1, a one-function edit on Linux is: the message read (`openat`, `statx`, on
 (`openat`, `write`, `close`, `rename`), which is the bound of the live runtime section.
 
 > taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> forwarded to requests-link-next (child requests-link-next-core) (requests, pass 18).
+> applied by requests (child requests-link-next): in part (place.rs, live.rs, stage.rs). An ELF patch places its blaze functions' new CIEs and FDEs in Class::Patch after the patch's code, and live.rs ends that run with its own zero terminator in the patch's code writes (item 1 for frames, item 2, and 12 b for blaze functions). Words of existing RelRo/Got pieces already stay in place (item 3, no change). Test: tests.rs a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames. Refused: Rodata and new RelRo already go to PatchData (writable, no mprotect); RelRo in the code segment is a text relocation on ELF PIE, and literals gain nothing from executable pages. Mach-O FDEs stay in __eh_frame because __unwind_info names them by offset there. Native objects' frames stay in .eh_frame because .eh_frame_hdr finds only those, so 12 b stays open for them. Open: requests-link-next-writers adds the out-of-.eh_frame FDEs to eh_frame_hdr (elf/dynamic.rs), sent as an exact edit.
 
 ## 20. From speed-link-edge-sol-live: move v1's users onto `slots` (blaze-engine, `demo/`, `harness/live*`)
 

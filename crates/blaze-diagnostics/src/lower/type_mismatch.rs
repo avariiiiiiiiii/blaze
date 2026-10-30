@@ -769,7 +769,7 @@ fn wrap_in_variant<'t>(
         if matches!(v.kind(cx.db), hir::StructKind::Tuple)
             && let [field] = v.fields(cx.db).as_slice()
         {
-            field.ty(cx.db).instantiate_type_params(args.iter()) == *found
+            field.ty(cx.db).instantiate_type_params(cx.db, args.iter()) == *found
         } else {
             false
         }

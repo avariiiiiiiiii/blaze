@@ -12,7 +12,7 @@
 
 use std::hash::{Hash, Hasher};
 
-use blaze_build_script::apply::{GraphUnit, to_link};
+use blaze_build_script::apply::{GraphUnit, to_link_in};
 use blaze_units::{
     query::Units,
     schema::{Mode, Unit},
@@ -250,7 +250,7 @@ impl Graph {
         let mut links = Vec::new();
         link_start.push(0);
         for at in 0..count as u32 {
-            links.extend(to_link(at, &node, &mut memo).to_link);
+            links.extend_from_slice(&to_link_in(at, &node, &mut memo).to_link);
             link_start.push(links.len() as u32);
         }
         graph.link_start = link_start;

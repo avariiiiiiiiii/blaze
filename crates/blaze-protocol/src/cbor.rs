@@ -46,7 +46,7 @@ fn key_order(a: &[u8], b: &[u8]) -> Ordering {
 }
 
 /// Why a value has no encoding here, or bytes are no value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     /// The bytes are not one item in the core deterministic encoding: the first offence, at
     /// this offset.
@@ -73,12 +73,14 @@ impl std::error::Error for Error {}
 
 impl serde::ser::Error for Error {
     fn custom<T: fmt::Display>(said: T) -> Error {
+        // alloc: error path, what the type's serializer said.
         Error::Message(said.to_string())
     }
 }
 
 impl serde::de::Error for Error {
     fn custom<T: fmt::Display>(said: T) -> Error {
+        // alloc: error path, what the type's deserializer said.
         Error::Message(said.to_string())
     }
 }

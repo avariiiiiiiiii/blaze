@@ -19,37 +19,45 @@ mod reexports;
 use blaze_items::{Fact, ItemId};
 use hir::{HasSource as _, InFile};
 use hir_def::ImplId;
-use syntax::{AstNode, SyntaxNode, WalkEvent, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNode, WalkEvent, ast};
 
-use super::defs::{item_id, scopes};
-use crate::{cx::Cx, lower::Found};
+use super::defs::item_id;
+use crate::{cx::Cx, lower::Found, model::Diag};
 
-/// The imports first, as rustc finalizes them before it resolves the items.
-pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let mut found = reexports::check(cx);
-    for signature in signatures(cx) {
-        walk(cx, &signature, &mut found);
-    }
+/// The imports first, as rustc finalizes them before it resolves the items. `scopes` is
+/// `defs::scopes`, made once per check.
+pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
+    let mut found = reexports::check(cx, scopes);
+    signatures(cx, scopes, |signature| walk(cx, &signature, &mut found));
     found
 }
 
 /// An item whose signature is walked: its syntax, rooted where Semantics resolves it, and the
-/// fact of it its errors read.
+/// item whose signature its errors read.
 pub(super) struct Signature {
     pub(super) node: InFile<SyntaxNode>,
-    pub(super) fact: Option<(Fact, String)>,
+    pub(super) item: Option<ItemId>,
 }
 
-/// The items of the crate's scopes, in rustc's order, those of traits and impls after them.
-fn signatures(cx: &Cx<'_, '_>) -> Vec<Signature> {
+impl Signature {
+    /// The fact of the item's signature an error of it reads (its key is asked for here, at
+    /// the edge, not for every item walked).
+    pub(super) fn fact(&self, cx: &Cx<'_, '_>, diag: &mut Diag) {
+        if let Some(item) = self.item {
+            diag.fact(Fact::Signature(cx.key(item)), "the signature of the item");
+        }
+    }
+}
+
+/// Each item of the crate's scopes given to `visit`, in rustc's order, those of traits and
+/// impls after them.
+fn signatures(cx: &Cx<'_, '_>, scopes: &[hir::Module], mut visit: impl FnMut(Signature)) {
     let db = cx.db;
-    let mut out = Vec::new();
     let mut push = |node: Option<InFile<SyntaxNode>>, item: Option<ItemId>| {
         let Some(node) = node else { return };
-        let fact = item.map(|it| (Fact::Signature(cx.key(it)), "the signature of the item".to_owned()));
-        out.push(Signature { node, fact });
+        visit(Signature { node, item });
     };
-    for module in scopes(cx) {
+    for &module in scopes {
         for def in module.declarations(db) {
             let item = item_id(db, def);
             match def {
@@ -74,7 +82,6 @@ fn signatures(cx: &Cx<'_, '_>) -> Vec<Signature> {
             }
         }
     }
-    out
 }
 
 fn syntax_of<N: AstNode>(source: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
@@ -96,16 +103,19 @@ fn walk(cx: &Cx<'_, '_>, signature: &Signature, found: &mut Vec<Found>) {
     walk.next();
     while let Some(event) = walk.next() {
         let WalkEvent::Enter(node) = event else { continue };
-        if is_skipped(&node) {
-            walk.skip_subtree();
-            continue;
-        }
-        if let Some(ty) = ast::PathType::cast(node.clone()) {
-            if let Some(path) = ty.path() {
-                found.extend(paths::check(cx, signature, &ty, &path));
+        match node.kind() {
+            SyntaxKind::PATH_TYPE => {
+                let ty = ast::PathType::cast(node).expect("a PATH_TYPE node is a path type");
+                if let Some(path) = ty.path() {
+                    found.extend(paths::check(cx, signature, &ty, &path));
+                }
             }
-        } else if let Some(lifetime) = ast::Lifetime::cast(node) {
-            found.extend(lifetimes::check(cx, signature, &lifetime));
+            SyntaxKind::LIFETIME => {
+                let lifetime = ast::Lifetime::cast(node).expect("a LIFETIME node is a lifetime");
+                found.extend(lifetimes::check(cx, signature, &lifetime));
+            }
+            _ if is_skipped(&node) => walk.skip_subtree(),
+            _ => {}
         }
     }
 }

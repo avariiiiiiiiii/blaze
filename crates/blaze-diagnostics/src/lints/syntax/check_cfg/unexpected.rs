@@ -219,12 +219,18 @@ enum Read {
 
 impl Lints<'_, '_> {
     fn tree(&mut self, tree: &Tree) {
+        // An attribute is a child of its owner or, inner, of a list at most two nodes below it
+        // (`fn f() { #![..] }`): the owners with one are within three nodes above an `ATTR`.
+        let mut owners: FxHashSet<SyntaxNodePtr> = FxHashSet::default();
+        for attr in tree.of_kind(|it| it == SyntaxKind::ATTR) {
+            owners.extend(attr.ancestors().skip(1).take(3).map(|it| SyntaxNodePtr::new(&it)));
+        }
         let mut read: Vec<(&SyntaxNode, Read)> = Vec::new();
-        for node in &tree.nodes {
-            if ast::AnyHasAttrs::can_cast(node.kind()) {
+        for (node, &kind) in tree.nodes.iter().zip(&tree.kinds) {
+            if ast::AnyHasAttrs::can_cast(kind) && !owners.is_empty() && owners.contains(&SyntaxNodePtr::new(node)) {
                 read.push((node, Read::Attrs));
             }
-            if matches!(node.kind(), SyntaxKind::CFG_PRED_EXPR | SyntaxKind::CFG_PRED_PAT) {
+            if matches!(kind, SyntaxKind::CFG_PRED_EXPR | SyntaxKind::CFG_PRED_PAT) {
                 read.push((node, Read::Predicate));
             }
         }
@@ -630,7 +636,7 @@ impl Lints<'_, '_> {
     }
 
     /// rustc's `cargo_help_sub`: no `build.rs` help in a build script.
-    fn cargo_help(&self, diag: &mut Diag, arg: &dyn Fn(bool) -> String) {
+    fn cargo_help(&self, diag: &mut Diag, arg: &impl Fn(bool) -> String) {
         let unescaped = arg(false);
         diag.help("consider using a Cargo feature instead");
         diag.help(format!(

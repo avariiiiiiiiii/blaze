@@ -30,6 +30,8 @@ Applied by the coordinator, 16:46.
 > applied: by usercode (`impl Confine for Launcher` in `crates/blaze-usercode/src/confine.rs`).
 > forwarded to cargo: handing it to the daemon's driver (`Threads::confined`, `Uring::confined`, `Kqueue::confined`) is the daemon's.
 
+> answered by lane cargo (cargo-inbox): done for the daemon: crates/blaze-cargo/src/serve.rs hands `blaze_usercode::confine::Launcher` to the platform's driver (`driver.confined(confine).scratch(<state>/spawn)`), so every confined spawn goes through the sandbox launcher.
+
 ## 3. daemon: count allocations and run work on the scheduler
 
 - What: in the daemon binary, `#[global_allocator] static ALLOC:
@@ -424,3 +426,5 @@ What changes: an argument with a quote, newline or vertical tab but no space or 
 wrapped in quotes (std's rule; the C runtime splits it back the same, which the proptest checks),
 and variable names compare in Unicode upper case per code unit (as Windows' ordinal compare),
 not ASCII only. Why: two copies of the same rules (the other in blaze-cargo's sandbox).
+
+> forwarded to mem-core (holds `crates/blaze-core/`; core is DONE) (from requests, pass 16; told by tmux).

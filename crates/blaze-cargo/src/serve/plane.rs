@@ -31,23 +31,8 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use super::work::Readers;
 
-/// The kinds of the daemon's own tasks, for their estimates: past every query kind (`u16`).
-pub mod kinds {
-    use blaze_graph::admission::TaskKind;
-
-    /// The load's `Plan`: its query kind.
-    pub const PLAN: TaskKind = TaskKind(0x6000);
-    pub const FETCH: TaskKind = TaskKind(0x1_0001);
-    pub const LIBRARY: TaskKind = TaskKind(0x1_0002);
-    pub const LOWER: TaskKind = TaskKind(0x1_0003);
-    pub const COMPILE: TaskKind = TaskKind(0x1_0004);
-    pub const REACH: TaskKind = TaskKind(0x1_0005);
-    /// A view's queries walked for `Trace`, `Verify` or `CodegenInputs`.
-    pub const WALK: TaskKind = TaskKind(0x1_0006);
-    /// `blaze test --ub`: the tests selected, and one test evaluated.
-    pub const UB_TESTS: TaskKind = TaskKind(0x1_0007);
-    pub const EVALUATE: TaskKind = TaskKind(0x1_0008);
-}
+/// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
+pub use blaze_graph::admission::kinds;
 
 /// What a thread task came to: how the plane settles its node, and its value for the loop.
 pub struct Did<T> {
@@ -95,6 +80,9 @@ impl Fresh {
 
 /// What the plane did, for the loop to act on, in order.
 pub enum Happened<T> {
+    /// What a thread task's expansions put, for the store's one owner to keep: before the
+    /// task's [`Happened::Did`] and its node's settling.
+    Kept { id: NodeId, puts: Vec<blaze_expand::Put> },
     /// A thread task's value, before its node settles.
     Did { id: NodeId, value: T },
     /// A thread task was posted: it starts.
@@ -116,6 +104,8 @@ pub struct Ran<T> {
     pub task: Posting,
     pub ended: Ended<T>,
     pub peak: u64,
+    /// What the task's expansions left for the store's owner to keep.
+    pub puts: Vec<blaze_expand::Put>,
 }
 
 pub enum Ended<T> {
@@ -187,14 +177,14 @@ impl<T: Send + 'static> Threads<T> {
                         // the world, not on another task. One that reads goes back for new
                         // readers.
                         let mut readers = Some(job.readers);
-                        let (ended, peak) = loop {
+                        let (ended, peak, puts) = loop {
                             match run_measured(&job.work, job.task.arg, readers.take().unwrap_or_default()) {
-                                (Some(ended), peak) => break (ended, peak),
-                                (None, peak) if job.task.reads => break (Ended::GaveWay { group: None }, peak),
-                                (None, _) => {}
+                                (Some(ended), peak, puts) => break (ended, peak, puts),
+                                (None, peak, puts) if job.task.reads => break (Ended::GaveWay { group: None }, peak, puts),
+                                (None, ..) => {}
                             }
                         };
-                        _ = job.done.send(Ran { task: job.task, ended, peak });
+                        _ = job.done.send(Ran { task: job.task, ended, peak, puts });
                     }
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
@@ -204,13 +194,15 @@ impl<T: Send + 'static> Threads<T> {
 }
 
 /// Runs `work` inside a measure: `None` when it gave way (its readers dropped with it), else
-/// its value or its panic.
-fn run_measured<T>(work: &Work<T>, arg: u32, readers: Readers) -> (Option<Ended<T>>, u64) {
+/// its value or its panic; and what its expansions put once it ended. A task that gave way
+/// leaves its puts in its thread's buffer, handed on by that thread's next take (or as
+/// orphans, if the thread ends), so none is lost or kept twice.
+fn run_measured<T>(work: &Work<T>, arg: u32, readers: Readers) -> (Option<Ended<T>>, u64, Vec<blaze_expand::Put>) {
     let (result, peak) = arena::measure(|| catch_unwind(AssertUnwindSafe(|| work(arg, readers))));
     match result {
-        Ok(None) => (None, peak),
-        Ok(Some(did)) => (Some(Ended::Did(did)), peak),
-        Err(panic) => (Some(Ended::Panicked(panicked(&*panic))), peak),
+        Ok(None) => (None, peak, Vec::new()),
+        Ok(Some(did)) => (Some(Ended::Did(did)), peak, blaze_expand::take_puts()),
+        Err(panic) => (Some(Ended::Panicked(panicked(&*panic))), peak, blaze_expand::take_puts()),
     }
 }
 
@@ -228,15 +220,18 @@ fn post_work<T: Send + 'static>(task: Posting, work: Work<T>, readers: Readers, 
     let again = work.clone();
     let run = move || run_measured(&work, task.arg, readers);
     let then = move |result: std::thread::Result<_>| match result {
-        Ok((Some(ended), peak)) => _ = done.send(Ran { task, ended, peak }),
-        Ok((None, peak)) if task.reads => {
-            _ = done.send(Ran { task, ended: Ended::GaveWay { group: blaze_graph::pool::group() }, peak });
+        Ok((Some(ended), peak, puts)) => _ = done.send(Ran { task, ended, peak, puts }),
+        Ok((None, peak, puts)) if task.reads => {
+            _ = done.send(Ran { task, ended: Ended::GaveWay { group: blaze_graph::pool::group() }, peak, puts });
         }
         // Gave way: posted again behind what is ready on the group it ran on.
-        Ok((None, _)) => {
+        Ok((None, ..)) => {
             post_work(Posting { near: blaze_graph::pool::group(), ..task }, again, Readers::default(), done);
         }
-        Err(panic) => _ = done.send(Ran { task, ended: Ended::Panicked(panicked(&*panic)), peak: 0 }),
+        // A panic outside the measure: its puts stay in the thread's buffer.
+        Err(panic) => {
+            _ = done.send(Ran { task, ended: Ended::Panicked(panicked(&*panic)), peak: 0, puts: Vec::new() });
+        }
     };
     match task.critical {
         true => pool.submit_critical(task.near, run, then),
@@ -308,9 +303,9 @@ impl<T: Send + 'static> Runner<T> for Inline<T> {
         self.queue.extend(posted.drain(now..));
         for (task, work, readers) in posted.drain(..) {
             match run_measured(&work, task.arg, readers) {
-                (Some(ended), peak) => out.push(Ran { task, ended, peak }),
-                (None, peak) if task.reads => out.push(Ran { task, ended: Ended::GaveWay { group: None }, peak }),
-                (None, _) => self.queue.push_back((task, work, Readers::default())),
+                (Some(ended), peak, puts) => out.push(Ran { task, ended, peak, puts }),
+                (None, peak, puts) if task.reads => out.push(Ran { task, ended: Ended::GaveWay { group: None }, peak, puts }),
+                (None, ..) => self.queue.push_back((task, work, Readers::default())),
             }
         }
         self.posted = posted;
@@ -440,7 +435,7 @@ impl<T: Send + 'static> Plane<T> {
     pub fn open(&mut self, at: Duration, keep_going: bool) -> RequestId {
         let request = RequestId(self.next_request);
         self.next_request = self.next_request.wrapping_add(1);
-        let input = PlaneInput::Open { at_ns: ns(at), request, weight: 1, keep_going };
+        let input = PlaneInput::Open { at_ns: ns(at), request, weight: 1, keep_going, idle: false };
         self.step(input).unwrap_or_else(|error| panic!("the plane refused to open {request}: {error}"));
         request
     }
@@ -523,8 +518,11 @@ impl<T: Send + 'static> Plane<T> {
     pub fn poll(&mut self, at: Duration) {
         let mut ran = std::mem::take(&mut self.ran);
         self.runner.take(&mut ran);
-        for Ran { task, ended, peak } in ran.drain(..) {
+        for Ran { task, ended, peak, puts } in ran.drain(..) {
             let id = task.id;
+            if !puts.is_empty() {
+                self.happened.push(Happened::Kept { id, puts });
+            }
             let outcome = match ended {
                 Ended::GaveWay { group } => {
                     self.happened.push(Happened::Post { task: Posting { near: group, ..task }, again: true });
@@ -615,7 +613,77 @@ impl<T: Send + 'static> Plane<T> {
                         .unwrap_or_else(|error| panic!("the plane refused to release {request}: {error}"));
                     self.happened.push(Happened::Finished { request, ok, stats });
                 }
+                PlaneOutput::Yield { id } => {
+                    unreachable!("the plane asks node {id} to give way: the daemon opens no idle request")
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use blaze_core::Traced;
+    use blaze_ids::ContentId;
+    use blaze_usercode::RunKey;
+
+    use super::*;
+
+    fn put(what: &str) -> blaze_expand::Put {
+        let id = ContentId::of("blaze-cargo plane test put", what.as_bytes());
+        blaze_expand::Put {
+            run: RunKey { code: id, given: id },
+            traced: Traced::default(),
+            value: what.as_bytes().to_vec(),
+            what: what.to_owned(),
+        }
+    }
+
+    /// Puts of other tests may come with a take as orphans: only this test's are compared.
+    fn ours<'a>(puts: &'a [blaze_expand::Put], prefix: &str) -> Vec<&'a str> {
+        puts.iter().map(|it| it.what.as_str()).filter(|it| it.starts_with(prefix)).collect()
+    }
+
+    #[test]
+    fn a_task_hands_on_what_its_expansions_put_once_it_ends_and_not_as_it_gives_way() {
+        let gave_way = Arc::new(AtomicBool::new(false));
+        let work: Work<()> = Arc::new({
+            let gave_way = gave_way.clone();
+            move |_, _| {
+                if !gave_way.swap(true, Ordering::AcqRel) {
+                    blaze_expand::put(put("plane-a before"));
+                    return None;
+                }
+                blaze_expand::put(put("plane-a after"));
+                Some(Did { outcome: Outcome::Built, value: () })
+            }
+        });
+        let task = Posting { id: NodeId(7), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: false };
+        let mut runner = Inline::new(3);
+        runner.post(task, work, Readers::default());
+        let mut ran = Vec::new();
+        while ran.is_empty() {
+            runner.take(&mut ran);
+        }
+        let [Ran { ended: Ended::Did(_), puts, .. }] = ran.as_slice() else { panic!("one task ends") };
+        assert_eq!(ours(puts, "plane-a"), ["plane-a before", "plane-a after"]);
+    }
+
+    #[test]
+    fn a_task_that_reads_and_gave_way_leaves_its_puts_for_the_next_take() {
+        let work: Work<()> = Arc::new(|_, _| {
+            blaze_expand::put(put("plane-b gave way"));
+            None
+        });
+        let task = Posting { id: NodeId(8), pool: Pool::Work, near: None, critical: false, kind: kinds::COMPILE, arg: 0, reads: true };
+        let mut runner = Inline::new(5);
+        runner.post(task, work, Readers::default());
+        let mut ran = Vec::new();
+        runner.take(&mut ran);
+        let [Ran { ended: Ended::GaveWay { .. }, puts, .. }] = ran.as_slice() else { panic!("the task gives way") };
+        assert!(puts.is_empty());
+        assert_eq!(ours(&blaze_expand::take_puts(), "plane-b"), ["plane-b gave way"]);
     }
 }

@@ -28,6 +28,8 @@
 > forwarded to cargo: `compile_time.rs` and `own_script.rs` are lane cargo's (`crates/blaze-cargo/`), not the coordinator's.
 > forwarded to codegen: the compile itself as a daemon codegen request.
 
+> answered by lane cargo (cargo-inbox-user): done at crates/blaze-cargo/src/serve/unit/compile.rs `make` (a build script is a unit the daemon compiles with the std it has loaded; an inert script, decided by `elide` and `flags_allow` before the compile, is skipped and never compiled) and serve/unit/script.rs `prepare` (the run takes the compiled `made.main`, or `run::elided` for an inert one). No blaze process is started for it. v1's `compile_time.rs` and `own_script.rs` are not on v2's path.
+
 ## 2. Cargo's rule watches the package only when nothing was printed
 
 - What: `rule::of_directives` sets `package` whenever no `rerun-if-changed` was printed. Cargo
@@ -69,3 +71,5 @@
 
 > forwarded to codegen: `crates/blaze-engine/src/as_rustc.rs`.
 > forwarded to cargo: the daemon's socket in `crates/blaze-cargo/src/cargo/daemon.rs`.
+
+> answered by lane cargo (cargo-inbox-user): done for cargo's half at crates/blaze-cargo/src/serve/unit.rs:111 `stand_ins`. v2 gives a build script blaze's own executable as `RUSTC` and `RUSTDOC`, and a whole run, its probes included, is kept under what it read (`blaze_usercode::index`), so a repeat script runs no probe at all. The per-probe verdict store is in `as_rustc` (codegen's, as forwarded), and v1's `cargo/daemon.rs` socket is not on v2's path.

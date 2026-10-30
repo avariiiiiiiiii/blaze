@@ -15,6 +15,7 @@ use std::{
 use base_db::{Db, Crate, EditionedFileId, FileId};
 use cranelift_module::{Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use either::Either;
 use hir_def::{
     DefWithBodyId, FunctionId, HasModule, Lookup, StaticId, signatures::FunctionSignature,
 };
@@ -1578,6 +1579,7 @@ impl Base {
     pub(super) fn home(
         &mut self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         file: FileId,
         functions: &[FunctionId],
@@ -1665,6 +1667,7 @@ impl Base {
     fn home_copies(
         &mut self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         functions: &[FunctionId],
         callers: &[FunctionId],
@@ -1797,6 +1800,7 @@ impl Base {
     fn home_closures(
         &mut self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         root: FunctionId,
     ) {
@@ -1940,10 +1944,10 @@ impl Base {
         all: bool,
         part: usize,
         parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    ) -> impl Iterator<Item = usize> + '_ {
         let touched = &self.touched;
         if all || touched.any {
-            return Box::new((part..self.compiled.len()).step_by(parts));
+            return Either::Left((part..self.compiled.len()).step_by(parts));
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.roots_of_crate.get(it));
@@ -1953,7 +1957,7 @@ impl Base {
         if touched.edited() {
             asked.extend(&self.cached_roots);
         }
-        Box::new(part_of(asked, part, parts))
+        Either::Right(part_of(asked, part, parts))
     }
 
     /// The instances an edit can have changed, or all of them, one part in `parts`.
@@ -1962,10 +1966,10 @@ impl Base {
         all: bool,
         part: usize,
         parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    ) -> impl Iterator<Item = usize> + '_ {
         let touched = &self.touched;
         if all || touched.any {
-            return Box::new((part..self.instances.len()).step_by(parts));
+            return Either::Left((part..self.instances.len()).step_by(parts));
         }
         let homes = &self.homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.instances_of_crate.get(it));
@@ -1984,7 +1988,7 @@ impl Base {
                 .filter_map(|it| self.instances.get_index_of(it))
                 .map(|it| it as u32),
         );
-        Box::new(part_of(asked, part, parts))
+        Either::Right(part_of(asked, part, parts))
     }
 
     /// The code from the store an edit can have changed, or all of it, one part in `parts`.
@@ -1995,10 +1999,10 @@ impl Base {
         edited: Option<&[String]>,
         part: usize,
         parts: usize,
-    ) -> Box<dyn Iterator<Item = usize> + '_> {
+    ) -> impl Iterator<Item = usize> + '_ {
         let touched = &self.touched;
         if all || touched.any || edited.is_none() {
-            return Box::new((part..self.hydrated.len()).step_by(parts));
+            return Either::Left((part..self.hydrated.len()).step_by(parts));
         }
         let homes = &self.hydrated_homes;
         let of_crates = touched.crates.iter().filter_map(|it| homes.of_crate.get(it));
@@ -2011,7 +2015,7 @@ impl Base {
             asked.extend(&homes.of_any_crate);
         }
         asked.extend(&touched.hydrated);
-        Box::new(part_of(asked, part, parts))
+        Either::Right(part_of(asked, part, parts))
     }
 
     /// The files edited since the last look, by the names a look names them by, when nothing
@@ -2243,6 +2247,7 @@ impl Base {
     pub(super) fn stale(
         &self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: Option<&dyn SymbolResolver>,
         part: usize,
         parts: usize,
@@ -2639,6 +2644,7 @@ impl Base {
     pub(super) fn patch(
         &self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         roots: Roots<'_>,
         on_demand: &FxHashSet<FunctionId>,

@@ -640,7 +640,9 @@ from cargo's unit graph, with the build scripts (`cargo/compile_time.rs`). Elsew
 built from the load's own description of the macro's crate and what it depends on
 (`load_cargo::described`), whoever compiled the macro's library. Either build is kept in the
 store like a build script's. The macro's `proc_macro` crate is a shim
-(`crates/blaze-macro-wasm/guest/proc_macro.rs`) whose handles go to the host by imports, so
+(`crates/blaze-macro-wasm/guest/proc_macro.rs`, followed by the API it shares with the
+in-process bridge, `crates/blaze-expand/src/native/proc_macro/api.rs`) whose handles go to the
+host by imports, so
 `syn`, `quote` and `proc-macro2` build unchanged. A module is linked with the wasi-libc of
 the toolchain's `wasm32-wasip1` target. When the toolchain does not have that target, blaze
 runs `rustup target add wasm32-wasip1` for it, once.

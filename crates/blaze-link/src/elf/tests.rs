@@ -133,6 +133,9 @@ impl Fixture {
             init: None,
             fini: None,
             symbol: &|_| None,
+            synthesis: 0,
+            delta: None,
+            encoded: &[],
         })
     }
 
@@ -141,7 +144,7 @@ impl Fixture {
     }
 
     /// Synthesizes, then writes the file as the core does: regions at their offsets, then the
-    /// writer's parts.
+    /// writer's parts and the core's debug sections where the writer laid them.
     fn link(&mut self) -> Vec<u8> {
         for (class, bytes) in self.synthesize().unwrap() {
             let index = self.index(&class);
@@ -155,7 +158,8 @@ impl Fixture {
             let offsets: Vec<Option<u64>> = self.regions.iter().map(|it| self.writer.offset(placed, it)).collect();
             (self.writer.file(placed).unwrap(), offsets)
         });
-        assert_eq!(self.with(|placed| self.writer.file(placed).unwrap().parts), file.parts);
+        let again = self.with(|placed| self.writer.file(placed).unwrap());
+        assert_eq!((again.parts, again.debug), (file.parts.clone(), file.debug.clone()));
         let mut bytes = vec![0; file.len as usize];
         for ((region, contents), offset) in self.regions.iter().zip(&self.contents).zip(offsets) {
             if let Some(offset) = offset {
@@ -166,8 +170,50 @@ impl Fixture {
         for (offset, part) in &file.parts {
             bytes[*offset as usize..][..part.len()].copy_from_slice(part);
         }
+        for &(offset, nth) in &file.debug {
+            let data = &self.debug[nth].1;
+            bytes[offset as usize..][..data.len()].copy_from_slice(data);
+        }
         bytes
     }
+}
+
+/// The debug sections are where the section headers say, with the bytes the core made, and
+/// the writer copies none of them: the file allocates the same with 1 MiB of debug info as
+/// with a few bytes.
+#[test]
+fn the_debug_sections_are_the_cores_not_copies() {
+    let counts = Counts { functions: 1, function_names: 4, ..Counts::default() };
+    let mut image = Fixture::new(executable(), &[(Class::Text, 64, 16)], &counts);
+    let text = image.at(&Class::Text);
+    image.functions = vec![Function { addr: text, size: 64, fde: None, windows: None, name: Some("main".into()) }];
+    image.entry = Some(text);
+    for (class, bytes) in image.synthesize().unwrap() {
+        let index = image.index(&class);
+        image.contents[index] = bytes;
+    }
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    let used = [3usize, 1 << 20].map(|len| {
+        let line: Vec<u8> = (0..len).map(|it| (it * 7 % 251) as u8).collect();
+        image.debug = vec![(".debug_line", line), (".debug_str", Vec::new()), (".debug_info", vec![9; len / 3 + 1])];
+        let (file, used) = pool.install(|| blaze_alloc_count::measure(|| image.with(|placed| image.writer.file(placed))));
+        let file = file.unwrap();
+        assert_eq!(file.debug.iter().map(|it| it.1).collect::<Vec<_>>(), [0, 2], "an empty section is not laid");
+        let bytes = image.link();
+        let parsed = ElfFile64::<Endianness>::parse(&bytes[..]).unwrap();
+        let endian = parsed.endian();
+        let shdrs = parsed.elf_section_table();
+        let strings = shdrs.strings(endian, &bytes[..]).unwrap();
+        for (name, data) in &image.debug {
+            let (_, shdr) = (shdrs.iter().enumerate())
+                .find(|(_, it)| it.name(endian, strings).unwrap() == name.as_bytes())
+                .unwrap_or_else(|| panic!("no {name}"));
+            assert_eq!(shdr.data(endian, &bytes[..]).unwrap(), &data[..], "{name}");
+        }
+        used
+    });
+    assert_eq!(used[0].allocations, used[1].allocations, "{used:?}");
+    assert!(used[1].bytes - used[0].bytes < 4096, "the debug info is not copied: {used:?}");
 }
 
 fn c_string(data: &[u8], at: u64) -> &str {

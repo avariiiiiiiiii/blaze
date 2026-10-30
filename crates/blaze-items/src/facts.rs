@@ -17,8 +17,11 @@
 //! | macro hygiene | `Resolves` in the def-site scope for def-site names; mixed-site names resolve at the call site |
 //! | auto-trait leakage | `AutoTraits(opaque)` |
 
+use std::{alloc::Allocator, fmt::Write as _};
+
 use base_db::Db;
 use blaze_ids::{ContentId, Fingerprint, Hasher, radix};
+use blaze_mem::{Frame, Tag, frame, scratch};
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, ConstId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, HasModule,
@@ -208,18 +211,16 @@ fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
                     .id(&implements_value(db, IMPLEMENTS, it, self_ty)?);
                 // A vtable's slots are its methods in declaration order, which the trait's
                 // interface hash leaves out.
-                let methods: Vec<(&Name, FunctionId)> = it
-                    .trait_items(db)
-                    .items
-                    .iter()
-                    .filter_map(|(name, item)| match *item {
+                let items = &it.trait_items(db).items;
+                let methods = || {
+                    items.iter().filter_map(|(name, item)| match *item {
                         AssocItemId::FunctionId(f) => Some((name, f)),
                         _ => None,
                     })
-                    .collect();
-                h.update(&(methods.len() as u64).to_le_bytes());
-                let names = name_hashes(methods.iter().map(|(name, _)| name.as_str()));
-                for (name, (_, f)) in names.into_iter().zip(methods) {
+                };
+                h.update(&(methods().count() as u64).to_le_bytes());
+                let names = name_hashes(methods().map(|(name, _)| name.as_str()));
+                for (name, (_, f)) in names.into_iter().zip(methods()) {
                     h.id(&name.0).id(&hash::interface_hash(db, ItemId::Function(f))?.0);
                 }
             }
@@ -366,7 +367,10 @@ fn field_offset(
     let layout = match db.layout_of_adt(adt, GenericArgs::empty().store(), env.store()) {
         Ok(layout) => layout,
         Err(err) => {
-            h.part(b"layout error").part(err.to_string().as_bytes());
+            scratch::with_string(|text| {
+                write!(text, "{err}").expect("writing to a string cannot fail");
+                h.part(b"layout error").part(text.as_bytes());
+            });
             return Ok(());
         }
     };
@@ -392,18 +396,17 @@ fn field_offset(
 }
 
 /// The interface hashes of the items of `items` named `name`, sorted.
-fn named(
+fn named<'f>(
     db: &Db,
     items: &[(Name, AssocItemId)],
     name: NameHash,
-) -> Result<Vec<ContentId>, Unhashable> {
+    frame: &'f Frame,
+) -> Result<Vec<ContentId, &'f Frame>, Unhashable> {
     let names = name_hashes(items.iter().map(|(it, _)| it.as_str()));
-    let mut found = names
-        .into_iter()
-        .zip(items)
-        .filter(|&(it, _)| it == name)
-        .map(|(_, &(_, it))| Ok(hash::interface_hash(db, ItemId::from(it))?.0))
-        .collect::<Result<Vec<_>, Unhashable>>()?;
+    let mut found = Vec::new_in(frame);
+    for (_, &(_, it)) in names.into_iter().zip(items).filter(|&(it, _)| it == name) {
+        found.push(hash::interface_hash(db, ItemId::from(it))?.0);
+    }
     found.sort_unstable();
     Ok(found)
 }
@@ -416,36 +419,38 @@ fn write_method(
     self_ty: SimplifiedType,
     name: NameHash,
 ) -> Result<(), Unhashable> {
-    let mut inherent = Vec::new();
-    for (_, imp) in inherent_impls_of(db, self_ty, ()).iter() {
-        let items = named(db, &imp.impl_items(db).items, name)?;
-        if !items.is_empty() {
-            inherent.push((hash::interface_hash(db, ItemId::Impl(imp))?.0, items));
+    frame::task(Tag::Other, |frame| -> Result<(), Unhashable> {
+        let mut inherent: Vec<_, &Frame> = Vec::new_in(frame);
+        for (_, imp) in inherent_impls_of(db, self_ty, ()).iter() {
+            let items = named(db, &imp.impl_items(db).items, name, frame)?;
+            if !items.is_empty() {
+                inherent.push((hash::interface_hash(db, ItemId::Impl(imp))?.0, items));
+            }
         }
-    }
-    inherent.sort_unstable();
-    let mut traits = Vec::new();
-    for (_, trait_) in traits_with(db, name, ()).iter() {
-        let items = named(db, &trait_.trait_items(db).items, name)?;
-        traits.push((items, implements_value(db, IMPLEMENTS, trait_, self_ty)?));
-    }
-    traits.sort_unstable();
-    h.part(b"inherent").update(&(inherent.len() as u64).to_le_bytes());
-    for (imp, items) in &inherent {
-        h.id(imp).update(&(items.len() as u64).to_le_bytes());
-        for it in items {
-            h.id(it);
+        inherent.sort_unstable();
+        let mut traits: Vec<_, &Frame> = Vec::new_in(frame);
+        for (_, trait_) in traits_with(db, name, ()).iter() {
+            let items = named(db, &trait_.trait_items(db).items, name, frame)?;
+            traits.push((items, implements_value(db, IMPLEMENTS, trait_, self_ty)?));
         }
-    }
-    h.part(b"traits").update(&(traits.len() as u64).to_le_bytes());
-    for (items, implements) in &traits {
-        h.update(&(items.len() as u64).to_le_bytes());
-        for it in items {
-            h.id(it);
+        traits.sort_unstable();
+        h.part(b"inherent").update(&(inherent.len() as u64).to_le_bytes());
+        for (imp, items) in inherent.iter() {
+            h.id(imp).update(&(items.len() as u64).to_le_bytes());
+            for it in items.iter() {
+                h.id(it);
+            }
         }
-        h.id(implements);
-    }
-    Ok(())
+        h.part(b"traits").update(&(traits.len() as u64).to_le_bytes());
+        for (items, implements) in traits.iter() {
+            h.update(&(items.len() as u64).to_le_bytes());
+            for it in items.iter() {
+                h.id(it);
+            }
+            h.id(implements);
+        }
+        Ok(())
+    })
 }
 
 /// A const's value: evaluated for one without generics, else its code (each instance is
@@ -464,7 +469,10 @@ fn write_const_value(
     let value = match db.const_eval(konst, GenericArgs::empty(), None) {
         Ok(value) => value,
         Err(err) => {
-            h.part(b"error").part(eval_error_kind(&err).as_bytes());
+            scratch::with_string(|kind| {
+                eval_error_kind(&err, kind);
+                h.part(b"error").part(kind.as_bytes());
+            });
             return Ok(());
         }
     };
@@ -476,13 +484,14 @@ fn write_const_value(
         MemoryMap::Simple(bytes) => {
             h.part(b"simple").part(bytes);
         }
-        MemoryMap::Complex(map) => {
+        MemoryMap::Complex(map) => frame::task(Tag::Other, |frame| -> Result<(), Unhashable> {
             h.part(b"complex");
-            let mut blocks: Vec<(usize, &[u8])> =
-                map.memory.iter().map(|(&at, bytes)| (at, bytes)).collect();
+            let mut blocks: Vec<(usize, &[u8]), &Frame> =
+                Vec::with_capacity_in(map.memory.len(), frame);
+            blocks.extend(map.memory.iter().map(|(&at, bytes)| (at, &bytes[..])));
             radix::sort_copy_by_key(&mut blocks, |&(at, _)| at);
             h.update(&(blocks.len() as u64).to_le_bytes());
-            for (at, bytes) in blocks {
+            for &(at, bytes) in blocks.iter() {
                 h.update(&(at as u64).to_le_bytes()).part(bytes);
                 match value.memory_map.align_at(at) {
                     Some(align) => h.update(&[1]).update(&(align as u64).to_le_bytes()),
@@ -495,7 +504,7 @@ fn write_const_value(
                     .update(&(it.size as u64).to_le_bytes())
                     .id(&key::item_key(db, ItemId::Static(it.id)).0);
             }
-            let mut vtables = Vec::with_capacity(map.vtable.tys().len());
+            let mut vtables = Vec::with_capacity_in(map.vtable.tys().len(), frame);
             if !map.vtable.is_empty() {
                 h.update(&(hir_ty::mir::VTableMap::FIRST_ID as u64).to_le_bytes());
                 for ty in map.vtable.tys() {
@@ -503,7 +512,7 @@ fn write_const_value(
                 }
             }
             h.update(&(vtables.len() as u64).to_le_bytes());
-            for it in &vtables {
+            for it in vtables.iter() {
                 h.id(it);
             }
             h.update(&(map.type_ids.len() as u64).to_le_bytes());
@@ -513,7 +522,8 @@ fn write_const_value(
                     None => h.update(&[0]),
                 };
             }
-        }
+            Ok(())
+        })?,
     }
     Ok(())
 }
@@ -527,14 +537,25 @@ fn ty_hash<'db>(
     hash::filled(db, CONST_TYPE, sub, owner)
 }
 
-/// Which error stopped an evaluation: its stage and kind, never its text, which names spans.
-fn eval_error_kind(err: &ConstEvalError<'_>) -> String {
-    let (stage, detail) = match err {
-        ConstEvalError::MirLowerError(it) => ("lower", format!("{it:?}")),
-        ConstEvalError::MirEvalError(it) => ("eval", format!("{it:?}")),
+/// Which error stopped an evaluation, written to `out`: its stage and kind, never its text,
+/// which names spans.
+fn eval_error_kind(err: &ConstEvalError<'_>, out: &mut String) {
+    let stage = match err {
+        ConstEvalError::MirLowerError(_) => "lower",
+        ConstEvalError::MirEvalError(_) => "eval",
     };
-    let kind: String = detail.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-    format!("{stage} {kind}")
+    out.push_str(stage);
+    out.push(' ');
+    let start = out.len();
+    let written = match err {
+        ConstEvalError::MirLowerError(it) => write!(out, "{it:?}"),
+        ConstEvalError::MirEvalError(it) => write!(out, "{it:?}"),
+    };
+    written.expect("writing to a string cannot fail");
+    let kind = out[start..]
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .map_or(out.len(), |end| start + end);
+    out.truncate(kind);
 }
 
 fn name_of(db: &Db, h: &mut Hasher, id: ItemId) {
@@ -563,23 +584,28 @@ fn closure_owner<'db>(
     store: ExpressionStoreOwnerId,
     expr: ExprId,
 ) -> InferBodyId<'db> {
-    let anon_consts: Vec<AnonConstId<'db>> = match store {
-        ExpressionStoreOwnerId::Body(body) => {
-            InferenceResult::of(db, body).defined_anon_consts().to_vec()
+    let innermost = frame::task(Tag::Other, |frame| {
+        let mut anon_consts: Vec<AnonConstId<'db>, &Frame> = Vec::new_in(frame);
+        match store {
+            ExpressionStoreOwnerId::Body(body) => {
+                anon_consts.extend_from_slice(InferenceResult::of(db, body).defined_anon_consts())
+            }
+            ExpressionStoreOwnerId::Signature(def) => {
+                anon_consts.extend(AnonConstId::all_from_signature(db, def))
+            }
+            ExpressionStoreOwnerId::VariantFields(variant) => anon_consts
+                .extend_from_slice(db.field_types_with_diagnostics(variant).defined_anon_consts()),
         }
-        ExpressionStoreOwnerId::Signature(def) => {
-            AnonConstId::all_from_signature(db, def).collect()
-        }
-        ExpressionStoreOwnerId::VariantFields(variant) => {
-            db.field_types_with_diagnostics(variant).defined_anon_consts().to_vec()
-        }
-    };
-    let exprs = ExpressionStore::of(db, store);
-    let innermost = anon_consts
-        .into_iter()
-        .filter(|anon| anon.loc(db).owner == store)
-        .filter_map(|anon| Some((subtree_containing(exprs, anon.loc(db).expr, expr)?, anon)))
-        .min_by_key(|&(size, _)| size);
+        let exprs = ExpressionStore::of(db, store);
+        let mut stack = Vec::new_in(frame);
+        anon_consts
+            .iter()
+            .filter(|anon| anon.loc(db).owner == store)
+            .filter_map(|&anon| {
+                Some((subtree_containing(exprs, anon.loc(db).expr, expr, &mut stack)?, anon))
+            })
+            .min_by_key(|&(size, _)| size)
+    });
     match (innermost, store) {
         (Some((_, anon)), _) => InferBodyId::AnonConstId(anon),
         (None, ExpressionStoreOwnerId::Body(body)) => InferBodyId::DefWithBodyId(body),
@@ -587,9 +613,15 @@ fn closure_owner<'db>(
     }
 }
 
-/// The number of expressions under `root` if `target` is one of them.
-fn subtree_containing(store: &ExpressionStore, root: ExprId, target: ExprId) -> Option<usize> {
-    let (mut stack, mut size, mut found) = (vec![root], 0, false);
+/// The number of expressions under `root` if `target` is one of them; `stack` is left empty.
+fn subtree_containing<A: Allocator>(
+    store: &ExpressionStore,
+    root: ExprId,
+    target: ExprId,
+    stack: &mut Vec<ExprId, A>,
+) -> Option<usize> {
+    let (mut size, mut found) = (0, false);
+    stack.push(root);
     while let Some(at) = stack.pop() {
         size += 1;
         found |= at == target;
@@ -669,7 +701,17 @@ fn write_derive(db: &Db, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
     };
     let module = adt.module(db);
     let scope = module.def_map(db).module(db, module).scope(db);
-    let mut wrote: Vec<(Option<ItemKey>, InterfaceHash)> = Vec::new();
+    frame::task(Tag::Other, |frame| write_derived(db, h, scope, at, frame))
+}
+
+fn write_derived(
+    db: &Db,
+    h: &mut Hasher,
+    scope: &ItemScope,
+    at: AstId<ast::Adt>,
+    frame: &Frame,
+) -> Result<(), Unhashable> {
+    let mut wrote: Vec<(Option<ItemKey>, InterfaceHash), &Frame> = Vec::new_in(frame);
     for (ast, invocations) in scope.derive_macro_invocs() {
         if ast != at {
             continue;
@@ -694,7 +736,7 @@ fn write_derive(db: &Db, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
     }
     wrote.sort_unstable();
     h.update(&(wrote.len() as u64).to_le_bytes());
-    for (trait_, interface) in &wrote {
+    for (trait_, interface) in wrote.iter() {
         match trait_ {
             Some(trait_key) => h.update(&[1]).id(&trait_key.0),
             None => h.update(&[0]),
@@ -704,11 +746,11 @@ fn write_derive(db: &Db, h: &mut Hasher, adt: AdtId) -> Result<(), Unhashable> {
     Ok(())
 }
 
-fn expansion_impls(
+fn expansion_impls<A: Allocator>(
     db: &Db,
     scope: &ItemScope,
     call: MacroCallId,
-    wrote: &mut Vec<(Option<ItemKey>, InterfaceHash)>,
+    wrote: &mut Vec<(Option<ItemKey>, InterfaceHash), A>,
 ) -> Result<(), Unhashable> {
     let mut push = |imp: ImplId| -> Result<(), Unhashable> {
         let trait_ = db

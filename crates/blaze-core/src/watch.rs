@@ -296,9 +296,7 @@ fn at<'a>(names: &'a str, &(start, len): &(u32, u32)) -> &'a str {
 
 /// Whether `name` is a [`FileName`], as [`FileName::new`] says, without making one.
 pub(crate) fn valid(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('/')
-        && name.split('/').all(|it| !it.is_empty() && it != "." && it != "..")
+    FileName::is_valid(name)
 }
 
 /// Whether `name` is `dir` or under it, as [`FileName::is_under`] says.

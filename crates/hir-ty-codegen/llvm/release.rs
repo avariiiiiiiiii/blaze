@@ -138,7 +138,7 @@ pub(crate) fn prelink(
     hint: Hint,
     debug: bool,
     optimization: Optimization,
-    instances: &dyn Fn(u32) -> bool,
+    instances: &impl Fn(u32) -> bool,
     sanitize: &Sanitize,
     unsanitized: Sanitizers,
 ) -> Result<Prelinked, Unhandled> {
@@ -443,7 +443,7 @@ unsafe fn arg_of(value: LLVMValueRef) -> Arg {
 
 /// What `function`, alone in `module` after the pre-link pipeline, says of itself. Its
 /// `body` is its `attrs` until [`optimistic`] says more.
-fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: &dyn Fn(u32) -> bool) -> Facts {
+fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: &impl Fn(u32) -> bool) -> Facts {
     let params = function.count_params();
     let unused = function
         .get_param_iter()
@@ -541,7 +541,7 @@ fn optimistic<'ctx>(
     context: &'ctx Context,
     module: Module<'ctx>,
     function: FunctionValue<'ctx>,
-    instances: &dyn Fn(u32) -> bool,
+    instances: &impl Fn(u32) -> bool,
     machine: &Machinery,
 ) -> Result<Attrs, Unhandled> {
     let memory = attribute_kind("memory");

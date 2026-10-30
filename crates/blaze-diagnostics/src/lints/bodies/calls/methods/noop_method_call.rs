@@ -21,18 +21,15 @@ use syntax::{AstNode as _, SyntaxNode, TextRange, ast};
 use crate::{
     cx::def_range,
     lints::bodies::{
-        BodyCx, Hooks, LatePass,
+        BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set,
         types::util::{self, diagnostic_item, fn_item, from_expansion},
     },
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
 
-pub(super) fn pass() -> Box<dyn LatePass> {
-    Box::new(NoopMethodCall)
-}
-
-struct NoopMethodCall;
+#[derive(Default)]
+pub(crate) struct NoopMethodCall;
 
 /// The method a call resolves to in the impl for `&T`, by its diagnostic item.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -43,13 +40,8 @@ enum Noop {
 }
 
 impl LatePass for NoopMethodCall {
-    fn name(&self) -> &'static str {
-        "NoopMethodCall"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["noop_method_call", "suspicious_double_ref_op"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::MethodCall]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if let Some(found) = noop_method_call(b, expr) {
@@ -61,16 +53,6 @@ impl LatePass for NoopMethodCall {
 fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
     let hir_def::hir::Expr::MethodCall { receiver, method_name, .. } = b.store().expr(expr) else { return None };
     let db = b.db();
-    let node = util::syntax(b, expr)?;
-    let call = ast::MethodCallExpr::cast(node.value.clone())?;
-    let name = call.name_ref()?;
-    let call_span = b.cx.span(node.with_value(TextRange::new(
-        name.syntax().text_range().start(),
-        node.value.text_range().end(),
-    )));
-    if from_expansion(&call_span) {
-        return None;
-    }
     let (method, args) = b.infer.method_resolution(expr)?;
     let ItemContainerId::TraitId(trait_id) = method.lookup(db).container else { return None };
     let trait_name = diagnostic_item(db, AttrDefId::TraitId(trait_id))?;
@@ -88,6 +70,17 @@ fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
         "noop_method_deref" => Noop::Deref,
         _ => return None,
     };
+    // Last of the tests: it reads the source.
+    let node = util::syntax(b, expr)?;
+    let call = ast::MethodCallExpr::cast(node.value.clone())?;
+    let name = call.name_ref()?;
+    let call_span = b.cx.span(node.with_value(TextRange::new(
+        name.syntax().text_range().start(),
+        node.value.text_range().end(),
+    )));
+    if from_expansion(&call_span) {
+        return None;
+    }
 
     let interner = DbInterner::new_with(db, b.owner.krate(db));
     let receiver_ty = erased(interner, b.infer.expr_ty(receiver));

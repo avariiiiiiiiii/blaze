@@ -115,61 +115,15 @@ pub trait HasAttrs: AstNode {
     }
 }
 
-/// Whether a lazy block's text may start with an inner attribute: [`block_may_start_with_inner_attr`].
+/// Whether a lazy block's text may start with an inner attribute:
+/// [`crate::view::block_may_start_with_inner_attr`].
 fn may_start_with_inner_attr(block: &SyntaxNode) -> bool {
     match block.flat() {
-        Some((tree, at)) => block_may_start_with_inner_attr(&tree.source()[tree.range(at)]),
+        Some((tree, at)) => {
+            crate::view::block_may_start_with_inner_attr(&tree.source()[tree.range(at)], false)
+        }
         None => true,
     }
-}
-
-/// Whether the text of a block, its `{` included, may start with an inner attribute after
-/// whitespace and comments, as the parser's `inner_attrs` takes them: false only when it surely
-/// does not. A non-ASCII character, an unterminated comment or a text that is not a block is a
-/// maybe.
-fn block_may_start_with_inner_attr(block: &str) -> bool {
-    let Some(mut rest) = block.strip_prefix('{') else { return true };
-    loop {
-        rest = rest
-            .trim_start_matches(|c: char| matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' '));
-        if let Some(comment) = rest.strip_prefix("//") {
-            match comment.find('\n') {
-                Some(end) => rest = &comment[end..],
-                None => return true,
-            }
-        } else if let Some(comment) = rest.strip_prefix("/*") {
-            match block_comment_len(comment) {
-                Some(end) => rest = &comment[end..],
-                None => return true,
-            }
-        } else {
-            return rest.chars().next().is_none_or(|c| c == '#' || !c.is_ascii());
-        }
-    }
-}
-
-/// How long the rest of a block comment is, after its opening `/*`, to just past the `*/` that
-/// closes it, nested comments included as the lexer counts them.
-fn block_comment_len(text: &str) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let (mut depth, mut at) = (1usize, 0);
-    while at + 1 < bytes.len() {
-        match (bytes[at], bytes[at + 1]) {
-            (b'/', b'*') => {
-                depth += 1;
-                at += 2;
-            }
-            (b'*', b'/') => {
-                depth -= 1;
-                at += 2;
-                if depth == 0 {
-                    return Some(at);
-                }
-            }
-            _ => at += 1,
-        }
-    }
-    None
 }
 
 /// Returns all attributes of this node, including inner attributes that may not be directly under this node
@@ -218,10 +172,11 @@ impl<A: HasName, B: HasName> HasName for Either<A, B> {}
 
 #[cfg(test)]
 mod tests {
-    use super::{HasAttrs, attrs_including_inner, block_may_start_with_inner_attr};
+    use super::{HasAttrs, attrs_including_inner};
     use crate::{
         AstNode, Edition, SourceFile, Text,
         ast::{self, HasModuleItem},
+        view::block_may_start_with_inner_attr,
     };
 
     #[test]
@@ -239,7 +194,16 @@ mod tests {
             "not a block",
             "{",
         ] {
-            assert!(block_may_start_with_inner_attr(maybe), "{maybe:?}");
+            assert!(block_may_start_with_inner_attr(maybe, false), "{maybe:?}");
+            assert!(block_may_start_with_inner_attr(maybe, true), "{maybe:?}");
+        }
+    }
+
+    #[test]
+    fn an_inner_doc_comment_is_a_start_only_when_asked() {
+        for docs in ["{ //! inner docs\n x }", "{ /*! inner docs */ x }"] {
+            assert!(!block_may_start_with_inner_attr(docs, false), "{docs:?}");
+            assert!(block_may_start_with_inner_attr(docs, true), "{docs:?}");
         }
     }
 
@@ -253,7 +217,8 @@ mod tests {
             "{ /* #![a] /* #![b] */ #![c] */ x }",
             "{\r\n\t\u{0B}\u{0C} foo() }",
         ] {
-            assert!(!block_may_start_with_inner_attr(not), "{not:?}");
+            assert!(!block_may_start_with_inner_attr(not, false), "{not:?}");
+            assert!(!block_may_start_with_inner_attr(not, true), "{not:?}");
         }
     }
 

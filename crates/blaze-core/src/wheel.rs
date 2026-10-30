@@ -23,6 +23,8 @@ use std::time::Duration;
 use blaze_mem::{MemError, Slab, Tag as MemTag};
 
 #[cfg(test)]
+mod differential_tests;
+#[cfg(test)]
 mod reference;
 
 const BITS: u32 = 6;
@@ -114,6 +116,12 @@ impl<T> Wheel<T> {
 
     pub fn is_empty(&self) -> bool {
         self.timers.is_empty()
+    }
+
+    /// The timers made so far, set or free: what the slab holds, which a steady stream of
+    /// timers does not grow.
+    pub fn slots(&self) -> usize {
+        self.timers.slots()
     }
 
     /// The wheel's time: what the last [`Wheel::advance`] went to.

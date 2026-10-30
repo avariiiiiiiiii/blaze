@@ -35,7 +35,7 @@ use crate::{
 pub const RUN_ONLY: &[&str] = &["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"];
 
 /// What a script's run needs that the unit doesn't say.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Place {
     /// The content ID of the script's binary.
     pub code: ContentId,
@@ -49,7 +49,7 @@ pub struct Place {
 }
 
 /// A script's run, ready to begin, and the environment a check of its inputs is made in.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Prepared {
     pub spec: run::Spec,
     /// What the script sees: the environment [`crate::inputs::Disk`] answers a check with,
@@ -64,29 +64,30 @@ pub struct Prepared {
 pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -> Result<Prepared, Error> {
     let env = blaze_build_script::env(unit, inherited)?;
     let mut given = Given::new(RunKind::BuildScript);
-    let mut names = Vec::new();
+    let mut names = Vec::new(); // alloc: setup, the names the check leaves out
     for (name, value) in env.set_from_unit().filter(|(name, _)| !run_only(name)) {
-        given.env(name.to_owned(), value.to_owned());
-        names.push(name.to_owned());
+        given.env(name.to_owned(), value.to_owned()); // alloc: setup, the given variables
+        names.push(name.to_owned()); // alloc: setup, as above
     }
     given.part("program", &crate::trace::os_bytes(unit.script.as_os_str()));
     given.part("dir", &crate::trace::os_bytes(unit.package.manifest_dir.as_os_str()));
     let key = RunKey { code: place.code, given: given.finish() };
-    let vars: Vec<(OsString, OsString)> = env.vars.into_iter().collect();
+    let vars: Vec<(OsString, OsString)> = env.vars.into_iter().collect(); // alloc: setup, the script's environment
     let command = Command {
-        program: unit.script.clone(),
-        args: Vec::new(),
-        env: vars.clone(),
-        dir: unit.package.manifest_dir.clone(),
-        stdin: Vec::new(),
+        program: unit.script.clone(), // clone: setup, the command owns its program
+        args: Vec::new(), // alloc: none, an empty list
+        env: vars.clone(), // clone: setup, the command's environment; the check keeps its own
+        dir: unit.package.manifest_dir.clone(), // clone: setup, the command owns its directory
+        stdin: Vec::new(), // alloc: none, empty
         sandbox: Sandbox::On {
-            read: place.read.clone(),
-            write: vec![unit.out_dir.clone()],
+            read: place.read.clone(), // clone: setup, the sandbox owns what it may read
+            write: vec![unit.out_dir.clone()], // clone: setup, the sandbox owns what it may write
             network: place.network,
             trace: true,
         },
         memory: place.memory,
     };
+    // clone: setup, the run owns its OUT_DIR
     let spec = run::Spec { key, command, out_dir: Some(unit.out_dir.clone()), mode: place.mode };
     Ok(Prepared { spec, env: vars, given: names })
 }
@@ -126,6 +127,7 @@ pub fn inert(root: &Path, files: &BTreeMap<PathBuf, Vec<u8>>, flags: &[String]) 
 /// The result of a script that prints `stdout` and does nothing else: what a run of it would
 /// have been, with an empty `OUT_DIR`.
 pub fn elided(stdout: Vec<u8>) -> Value {
+    // alloc: none, empty lists
     Value { code: Some(0), signal: None, stdout, stderr: Vec::new(), files: Vec::<OutFile>::new() }
 }
 
@@ -133,6 +135,7 @@ pub fn elided(stdout: Vec<u8>) -> Value {
 pub fn verify_elided(elided: &Value, ran: &Value) -> Result<(), Error> {
     blaze_build_script::verify(&elided.stdout, &ran.stdout)?;
     match run::differs(elided, ran) {
+        // alloc: error path
         Some(what) => Err(Error(format!("the elided build script's run differs from what elision said: {what}"))),
         None => Ok(()),
     }

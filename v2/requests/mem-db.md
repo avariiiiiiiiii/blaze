@@ -80,6 +80,8 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
   task unwinds (`catch_unwind`) `current` outside panics again (the outer pointer is restored).
   Budget: `assert_at_most(0, ..)` over 1,000 warm `task(.., |_| current(|f| f.used()))`.
 
+> forwarded to mem (from requests, pass 16; told by tmux).
+
 ## 2. lane mem (`crates/blaze-mem/src/pool.rs`): a `Pooled`'s raw round trip
 
 - Why: request 4 below. The solver cache publishes each generation as an `AtomicPtr` in a slot
@@ -110,6 +112,8 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
 - Test: a value made, `into_raw`, `from_raw` and dropped is dropped once and its slot reused by
   the next allocation of the same cache (its `index()` is the first one's); the round trip
   allocates nothing (`assert_at_most(0, ..)`).
+
+> forwarded to mem (from requests, pass 16; told by tmux).
 
 ## 3. root `Cargo.toml` (requests): hashbrown's `nightly` feature
 
@@ -339,6 +343,8 @@ impl<K, S, T> Drop for Shared<'_, K, S, T> {
   come from the general-purpose allocator: solver-sync-glue's request 9 (solver-sync's) and
   `mem-db-solver`'s file cover them.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 5. lane db (blaze-query, `crates/blaze-query/`): each run a frame task of its query's tag
 
 - `src/lib.rs`, first line: `#![feature(allocator_api)]` (for requests 6 and 7).
@@ -399,6 +405,8 @@ fn a_run_is_a_frame_task_of_its_querys_tag() {
     assert_eq!(db.pin().get::<Tagged>(one, &"a".to_owned()), Ok(parse << 32 | 6));
 }
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 6. lane db (blaze-query): a revalidation in a new view allocates nothing
 
@@ -574,6 +582,8 @@ fn a_revalidation_that_changes_nothing_allocates_nothing() {
 ```
 
   (`MemTree::root` names a tree by its files' content, so the same files give `first`'s root.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 7. lane db (blaze-query): the collection, the sweep and same-length rehashes allocate nothing warm
 
@@ -769,6 +779,8 @@ fn a_warm_collection_allocates_nothing() {
 }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 8. blaze-query: what of its tables is on reserved regions, and what is left (no change asked)
 
 - Done (db-query's request 3): `Rows` (every map's entries, the memo rows, value rows, the
@@ -785,6 +797,8 @@ fn a_warm_collection_allocates_nothing() {
   map, and with request 6 once per view state ever made), `Column`'s chunks (once per doubling
   of the views ever opened), `Free::ready`/`retired` (grown to their high-water mark, then
   reused: the scratch pattern).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 9. Per-call scratch on blaze-query's miss paths (lane db)
 
@@ -843,3 +857,72 @@ fn a_warm_miss_allocates_at_most_a_segment() {
     assert_eq!(runs("len"), 39, "each new content a miss");
 }
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
+
+## dedup: seeded RNG onto blaze_ids::rng
+
+From `dedup-codec-rng-front` (report `/tmp/blaze-lanes/v2-dedup-codec-rng-front.md`). Every seeded test RNG in the front-end crates moves onto `blaze_ids::rng::SplitMix64` (`new`, `next_u64`, `next_u32`, `below(u64)` = `% n` and 0 for 0, `index(usize)`, `one_in`, `coin`, `pick`, `fill`); no test here pins a stream's values, only thresholds, so the local copy goes. The crate already depends on `blaze-ids`.
+
+In `crates/hir-ty/src/next_solver/interner/tls_cache.rs` (~736), the per-worker xorshift:
+
+```rust
+                    let mut seed = 0x2545_F491_4F6C_DD1Du64 ^ (worker + 1);
+                    let mut next = move || {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed
+                    };
+```
+becomes
+```rust
+                    let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_F491_4F6C_DD1D ^ (worker + 1));
+```
+and in the loop `queries[next() as usize % queries.len()]` becomes `queries[rng.index(queries.len())]`, `(next() % 64) as u32` becomes `rng.below(64) as u32`. `window` (a hash multiply, not an RNG) stays.
+
+> forwarded to db (from requests, pass 16; told by tmux).
+
+## 10. lane mem (`crates/blaze-mem/src/frame.rs`): nested tasks deeper than `DEPTH` without a reservation each (mem-db-salsa's M4)
+
+- The problem (`v2/requests/mem-db-salsa.md`, M4): with one task per query run, salsa's runs nest
+  as deep as its query stack, 50 to 300 in this front end. A thread keeps 8 spare frames
+  (`frame.rs:41`), so every run past depth 8 reserves a fresh 4 GB frame (`Frame::new`), faults
+  its pages in zeroed, and unmaps it on return (`give_spare` drops it): two system calls and a
+  fault per page per run in the warm loop, and 4 GB of address space per level per thread.
+- M4's fix, one frame per thread shared by nested tasks through markers, is unsound with
+  blaze-mem's safe API, so mem-db does not ask for it. An outer task's frame vector can be
+  pushed while an inner task runs:
+
+```rust
+frame::task(Tag::Infer, |outer| {
+    let mut v = Vec::new_in(outer);
+    frame::task(Tag::Infer, |_| v.extend_from_slice(&[1u64; 1024]));
+    v[1023] // with a shared frame, the inner task's `reset_to` freed this
+});
+```
+
+  With frames of their own, `v` grows in the outer frame and the inner reset never touches it.
+  With a shared frame, `v`'s growth lands above the inner task's marker and is freed under it.
+- What mem-db asks instead: the requirement, with the design lane mem's to choose. Nested tasks
+  to any depth make no system call and no global allocation once warm, and each task keeps a
+  frame of its own. One way: a frame is a chain of `chunks::CHUNK` (2 MB) blocks from the chunk
+  cache rather than a 4 GB reservation, so a task past the spare depth takes warm chunks and gives
+  them back at its end (one compare-and-swap each). An allocation bigger than a chunk gets a
+  dedicated region. The spare depth then only keeps frame headers warm.
+- Test: 300 nested `task`s, each pushing 1 KB through `current` and reading it back after its
+  inner task returns. The second pass allocates nothing (`assert_at_most(0, ..)`), and
+  `chunks::carved_bytes()` doesn't grow between the second and third passes.
+
+## 11. lane mem (`crates/blaze-mem/src/column.rs`): `Column::get_mut` (mem-db-salsa's M9)
+
+Forwarded as written in `v2/requests/mem-db-salsa.md`, M9: the code and its test are there.
+salsa's page table (M5) needs the published value at an index under `&mut` for its `&mut` walks.
+Sound as written: `&mut self` excludes every reader and appender.
+
+## 12. lane mem (`crates/blaze-mem/src/scratch.rs`): `Shelf<B, N>` public (mem-db-solver's request 11)
+
+Forwarded as written in `v2/requests/mem-db-solver.md`, request 11. The solver keeps hir-ty types
+(`InferTables`, `SearchStorage`, `Pending`) on per-thread shelves deeper than `DEPTH = 4`,
+because canonical goals nest 3 to 10 deep. mem-db prefers the `Option<B>` slots form
+(`[const { None }; N]`): it needs no const `Default`.

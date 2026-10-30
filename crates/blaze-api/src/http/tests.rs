@@ -126,6 +126,81 @@ fn a_request_in_place_is_the_request() {
     assert_eq!(parse(bad[2]).unwrap_err().what, "a CR inside a head line");
 }
 
+/// A stream that gives its bytes in short reads of random size, some interrupted.
+struct Pieces<'a> {
+    bytes: &'a [u8],
+    rng: Rng,
+}
+
+impl std::io::Read for Pieces<'_> {
+    fn read(&mut self, into: &mut [u8]) -> std::io::Result<usize> {
+        if self.rng.below(8) == 0 {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let len = (1 + self.rng.below(40) as usize).min(into.len()).min(self.bytes.len());
+        into[..len].copy_from_slice(&self.bytes[..len]);
+        self.bytes = &self.bytes[len..];
+        Ok(len)
+    }
+}
+
+/// Reading into the parser is pushing what was read, connection after connection on one
+/// parser reset between them, and a connection's room is kept for the next.
+#[test]
+fn a_parser_read_into_is_the_parser_pushed_to() {
+    let mut stream = request("POST", "h", "/a", &[("X-One", "1")], &[3; 20_000]);
+    stream.extend_from_slice(
+        b"POST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+    );
+    stream.extend(request("GET", "h", "/c", &[], b""));
+    let mut read = RequestParser::new(1 << 20);
+    for seed in 0..200 {
+        let mut rng = Rng::new(seed);
+        let mut pushed = RequestParser::new(1 << 20);
+        let (mut want, mut got) = (Vec::new(), Vec::new());
+        read.reset();
+        let mut from = Pieces { bytes: &stream, rng: Rng::new(seed + 1000) };
+        loop {
+            let at = stream.len() - from.bytes.len();
+            let len = read.read_from(&mut from).unwrap();
+            if len == 0 {
+                break;
+            }
+            pushed.push(&stream[at..at + len]);
+            while rng.below(3) != 0 {
+                let one = pushed.next().unwrap();
+                let two = read.next_ref().unwrap().map(|request| request.to_request());
+                assert_eq!(two, one, "seed {seed}");
+                let Some(one) = one else { break };
+                want.push(one);
+                got.push(two.unwrap());
+            }
+            assert_eq!(read.held(), pushed.held(), "seed {seed}");
+        }
+        while let Some(request) = pushed.next().unwrap() {
+            want.push(request);
+        }
+        while let Some(request) = read.next_ref().unwrap() {
+            got.push(request.to_request());
+        }
+        assert_eq!(got, want, "seed {seed}");
+        assert_eq!(want.len(), 3, "seed {seed}");
+        assert_eq!(read.held(), 0, "seed {seed}");
+    }
+    let broken = b"GET / HTTP/1.1\nHost: x\r\n\r\n";
+    read.reset();
+    let mut from = Pieces { bytes: broken, rng: Rng::new(7) };
+    while read.next_ref().is_ok() {
+        if let Ok(0) = read.read_from(&mut from) {
+            panic!("the stream ended before the bad head was refused");
+        }
+    }
+    assert_eq!(read.read_from(&mut from).unwrap(), 0, "a broken parser reads nothing");
+    read.reset();
+    read.push(&request("GET", "h", "/d", &[], b""));
+    assert_eq!(read.next_ref().unwrap().unwrap().path, "/d", "reset clears what broke it");
+}
+
 /// The API server's read of a request: nothing allocated once the bytes are here.
 #[test]
 fn a_request_in_place_allocates_nothing() {
@@ -139,6 +214,68 @@ fn a_request_in_place_allocates_nothing() {
         });
         assert_eq!((path, body), (4, 64));
     }
+}
+
+/// A parser kept from connection to connection: a warm read into its room and a chunked
+/// request decoded into its kept buffer allocate nothing.
+#[test]
+fn a_warm_read_and_chunked_request_allocate_nothing() {
+    let chunked = b"POST /b HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    let mut parser = RequestParser::new(1 << 20);
+    let mut round = |parser: &mut RequestParser| {
+        parser.reset();
+        let mut from = &chunked[..];
+        while parser.read_from(&mut from).unwrap() > 0 {}
+        let request = parser.next_ref().unwrap().expect("a whole request");
+        (request.path.len(), request.body == b"abcde")
+    };
+    round(&mut parser);
+    for _ in 0..10 {
+        let read = blaze_alloc_count::assert_at_most(0, "a warm read and a chunked request", || {
+            round(&mut parser)
+        });
+        assert_eq!(read, (2, true));
+    }
+}
+
+/// A whole response, request or chunked head is one allocation of its size, the bytes its
+/// `_into` form writes onto a kept buffer, which allocates nothing warm.
+#[test]
+fn a_message_is_one_allocation_of_its_size() {
+    let headers = [("Content-Type", "application/cbor"), ("X-Request-Id", "18446744073709551615")];
+    let body = [5; 300];
+    for status in [200, 299, 413, 431, 505] {
+        let bytes = blaze_alloc_count::assert_at_most(1, "a response", || response(status, &headers, &body));
+        let mut kept = Vec::with_capacity(1024);
+        response_into(&mut kept, status, &headers, &body);
+        assert_eq!(kept, bytes);
+        kept.clear();
+        blaze_alloc_count::assert_at_most(0, "a response onto a kept buffer", || {
+            response_into(&mut kept, status, &headers, &body)
+        });
+        assert_eq!(kept, bytes);
+        blaze_alloc_count::assert_at_most(1, "a chunked head", || chunked(status, &headers));
+    }
+    let long = "/".repeat(2000);
+    let sent = blaze_alloc_count::assert_at_most(1, "a request", || request("PATCH", "api.github.com", &long, &headers, &body));
+    let parsed = parse(&sent).unwrap().unwrap();
+    assert_eq!((parsed.method.as_str(), parsed.path.len(), parsed.body.len()), ("PATCH", 2000, 300));
+}
+
+/// A response longer than one read is read whole, its head moved out of the parser.
+#[test]
+fn a_response_of_many_reads_is_read_whole() {
+    let body: Vec<u8> = (0..100_000u32).map(|it| it as u8).collect();
+    let bytes = response(200, &[("X-One", "1")], &body);
+    let mut from = Pieces { bytes: &bytes, rng: Rng::new(3) };
+    let read = read_response(&mut from, 1 << 20).unwrap();
+    assert_eq!((read.status, read.header("x-one"), read.body == body), (200, Some("1"), true));
+    let mut chunks = chunked(200, &[]);
+    for piece in body.chunks(7_000) {
+        chunk_into(&mut chunks, piece);
+    }
+    chunks.extend_from_slice(LAST_CHUNK);
+    assert_eq!(read_response(&mut &chunks[..], 1 << 20).unwrap().body, body);
 }
 
 #[test]

@@ -16,7 +16,10 @@ use hir_def::{
 
 use super::{ancestor_in_same_ctxt, can_be_used_for_suggestions, cast_ty_span, expr_span};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util::path_value},
+    lints::bodies::{
+        BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set,
+        types::util::path_value,
+    },
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -24,16 +27,12 @@ use crate::{
 const MESSAGE: &str =
     "creating an intermediate reference implies aliasing requirements even when immediately cast to a raw pointers";
 
-pub(super) struct RawBorrowsViaReferences;
+#[derive(Default)]
+pub(crate) struct RawBorrowsViaReferences;
 
 impl LatePass for RawBorrowsViaReferences {
-    fn name(&self) -> &'static str {
-        "RawBorrowsViaReferences"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["raw_borrows_via_references"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Cast]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();

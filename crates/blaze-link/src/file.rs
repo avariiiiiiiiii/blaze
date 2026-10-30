@@ -11,17 +11,19 @@
 //! old bytes, read when a rollback needs them ([`restore`]).
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use blaze_ids::radix;
 use rayon::prelude::*;
 use smallvec::SmallVec;
 
-use crate::arena::collect_in;
+use crate::arena::{FrameVec, collect_in};
 use crate::LinkError;
 use crate::cow::CowBytes;
-use crate::model::Class;
+use crate::model::{Class, Delta, Placed, Region};
 use crate::stage::{Stage, error};
 use crate::state::{Space, State, What};
+use crate::write::{Changes, next_synthesis};
 
 /// What a stage leaves for its commit.
 pub(crate) struct Finished {
@@ -65,7 +67,7 @@ impl<'s> Layout<'s> {
         }));
         radix::sort_by_key(&mut spaces, |it| it.0);
         let mut parts = SmallVec::new();
-        parts.extend(state.parts.iter().filter(|it| !it.1.is_empty()).map(|(at, bytes)| (*at, &bytes[..])));
+        parts.extend(file_parts(state).filter(|it| !it.1.is_empty()));
         radix::sort_copy_by_key(&mut parts, |it| it.0);
         Layout { spaces, encoded: &state.encoded, parts }
     }
@@ -109,6 +111,20 @@ impl<'s> Layout<'s> {
         all.extend(self.parts.iter().map(|it| (it.0, it.1.len() as u64)));
         merge(all, gap)
     }
+}
+
+/// The byte ranges of `state`'s file outside its regions: the writer's parts, then the debug
+/// sections, borrowed from the lists ([`crate::model::File::debug`]).
+fn file_parts(state: &State) -> impl Iterator<Item = (u64, &[u8])> {
+    let debug = &state.lists.debug;
+    (state.parts.iter().map(|(at, bytes)| (*at, &bytes[..])))
+        .chain(state.debug.iter().filter_map(|&(at, nth)| Some((at, &debug.get(nth)?.1[..]))))
+}
+
+/// Whether two parts hold the same bytes: at once when they are the same bytes, as a debug
+/// section no function changed is.
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    std::ptr::eq(a, b) || a == b
 }
 
 /// Sorts ranges and merges those that overlap or are closer than `gap`.
@@ -245,14 +261,26 @@ fn changed_slots(old: &[(u64, u64)], new: &[(u64, u64)], len: u64, ranges: &mut 
 
 impl<'a> Stage<'a> {
     pub fn finish(mut self) -> Result<Finished, LinkError> {
-        self.update_lists()?;
+        let changes = self.update_lists()?;
         let mut parts = self.parts()?;
         let arena = self.arena;
+        self.new.synthesis = next_synthesis();
+        let written = self.written();
+        let same_regions = same_regions(&self.old.spaces, &parts.regions);
+        let (old, new) = (&self.old.resolved, &self.new.resolved);
+        let same_names = Arc::ptr_eq(&old.imports, &new.imports)
+            && Arc::ptr_eq(&old.libraries, &new.libraries)
+            && self.old.exports[..] == parts.exports[..];
+        let from = self.old.synthesis;
+        let changes = changes.filter(|_| from != 0);
+        // alloc: once per stage, the ranges this stage wrote
+        let pieces = merge(written.iter().map(|it| (it.0, it.1)).collect(), 0);
         let contents = collect_in(self.new.spaces.iter().map(contents), arena);
         let synthetic = {
             let refs = collect_in(contents.iter().map(|it| &**it), arena);
             let symbol = |name: &str| self.address_of(&parts.regions, name);
-            let placed = parts.placed(&self, &refs, &symbol);
+            let delta = delta(changes.as_ref(), from, same_names, same_regions, &pieces);
+            let placed = parts.placed(&self, &refs, &symbol, delta.as_ref(), &[]);
             self.writer.synthesize(&placed)?
         };
         let mut homes = Vec::with_capacity_in(synthetic.len(), arena);
@@ -276,18 +304,40 @@ impl<'a> Stage<'a> {
             parts.regions[at].size = bytes.len() as u64;
             homes.push(at);
         }
+        // What the file's writer is told was written: the pieces, and the blocks of the
+        // synthetic regions that differ from the last link's.
+        let mut all = Vec::with_capacity(pieces.len() + homes.len());
+        all.extend_from_slice(&pieces);
+        if changes.is_some() && same_regions {
+            for (at, (_, bytes)) in homes.iter().zip(&synthetic) {
+                let Some(old) = self.old.spaces.get(*at) else { continue };
+                let old = contents(old);
+                let addr = self.new.spaces[*at].region.addr;
+                changed_blocks(addr, &old[..], bytes, &mut all);
+                if old.len() > bytes.len() {
+                    all.push((addr + bytes.len() as u64, (old.len() - bytes.len()) as u64));
+                }
+            }
+        }
+        let written_all = merge(all, 0);
         let (offsets, file, encoded) = {
             let mut refs = collect_in(contents.iter().map(|it| &**it), arena);
             for (at, (_, bytes)) in homes.iter().zip(&synthetic) {
                 refs[*at] = bytes.as_slice();
             }
             let symbol = |name: &str| self.address_of(&parts.regions, name);
-            let placed = parts.placed(&self, &refs, &symbol);
+            let delta = delta(changes.as_ref(), from, same_names, same_regions, &written_all);
+            let placed = parts.placed(&self, &refs, &symbol, delta.as_ref(), &[]);
             let offsets = collect_in(parts.regions.iter().map(|it| self.writer.offset(&placed, it)), arena);
             let encoded = self.writer.encode(&placed)?;
+            let placed = Placed { encoded: &encoded, ..placed };
             (offsets, self.writer.file(&placed)?, encoded)
         };
         drop(contents);
+        if let Some(&(at, nth)) = file.debug.iter().find(|it| it.1 >= self.new.lists.debug.len()) {
+            // alloc: error path
+            return Err(error(None, format!("the writer laid debug section {nth} at {at:#x}, of no debug section")));
+        }
         for (at, (_, bytes)) in homes.into_iter().zip(synthetic) {
             let space = &mut self.new.spaces[at];
             space.region.size = bytes.len() as u64;
@@ -304,9 +354,13 @@ impl<'a> Stage<'a> {
         };
         self.new.file_len = file.len;
         // alloc: once per stage; the state shares the writer's parts
-        self.new.parts = std::sync::Arc::new(file.parts);
+        self.new.parts = Arc::new(file.parts);
+        // alloc: once per stage, a few entries; the state shares them
+        self.new.debug = Arc::new(file.debug);
+        // alloc: once per stage; the next stage compares its exports with these
+        self.new.exports = Arc::new(parts.exports);
         let message = self.output.live.is_some().then(|| self.message());
-        let writes = if self.full { whole(&self.new) } else { self.dirty() };
+        let writes = if self.full { whole(&self.new) } else { self.dirty(&written) };
         let (undo, old_len) = match (self.old.laid_out, self.full) {
             // alloc: none, an empty Vec holds no buffer
             (false, _) => (Vec::new(), 0),
@@ -324,31 +378,41 @@ impl<'a> Stage<'a> {
         Ok(Finished { full: self.full, len: self.new.file_len, writes, undo, old_len, message, state: self.new })
     }
 
-    /// The ranges of the file an incremental link changes, and their bytes.
-    fn dirty(&self) -> Vec<(u64, Vec<u8>)> {
-        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(self.write.len() + self.new.spaces.len());
+    /// What this stage wrote that differs from the last link, as (address, length, region):
+    /// each piece it wrote whose place or bytes changed, and each jump-table cell it set.
+    fn written(&self) -> FrameVec<'a, (u64, u64, u32)> {
+        let mut out = Vec::with_capacity_in(self.write.len(), self.arena);
         for id in self.write.iter() {
             let Some(piece) = self.new.piece(id) else { continue };
             let Some(space) = self.new.spaces.get(piece.region as usize) else { continue };
-            let (Some(offset), false, false) = (space.offset, space.zero, piece.zero()) else { continue };
-            let at = offset + piece.addr - space.region.addr;
+            if space.zero || piece.zero() {
+                continue;
+            }
             if piece.what() == What::Cells {
-                ranges.extend(self.dirty_cells.iter().map(|slot| (at + u64::from(slot) * 8, 8)));
+                out.extend(self.dirty_cells.iter().map(|slot| (piece.addr + u64::from(slot) * 8, 8, piece.region)));
                 continue;
             }
             if piece.size == 0 {
                 continue;
             }
             let same_place = !self.fresh.contains(id)
-                && self.old.piece(id).is_some_and(|old| {
-                    old.addr == piece.addr
-                        && old.region == piece.region
-                        && self.old.spaces.get(old.region as usize).is_some_and(|it| it.offset == space.offset)
-                });
+                && self.old.piece(id).is_some_and(|old| old.addr == piece.addr && old.region == piece.region);
             if same_place && self.old.bytes(id) == self.new.bytes(id) {
                 continue;
             }
-            ranges.push((at, piece.size));
+            out.push((piece.addr, piece.size, piece.region));
+        }
+        out
+    }
+
+    /// The ranges of the file an incremental link changes, and their bytes. A region whose
+    /// offset in the file moved is written whole, so `written` needs no check of it.
+    fn dirty(&self, written: &[(u64, u64, u32)]) -> Vec<(u64, Vec<u8>)> {
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(written.len() + self.new.spaces.len());
+        for &(addr, len, region) in written {
+            let Some(space) = self.new.spaces.get(region as usize) else { continue };
+            let Some(offset) = space.offset else { continue };
+            ranges.push((offset + addr - space.region.addr, len));
         }
         for (at, space) in self.new.spaces.iter().enumerate() {
             let Some(offset) = space.offset else { continue };
@@ -369,17 +433,51 @@ impl<'a> Stage<'a> {
         if !std::sync::Arc::ptr_eq(&self.old.encoded, &self.new.encoded) {
             changed_slots(&self.old.encoded, &self.new.encoded, self.new.file_len, &mut ranges);
         }
-        let mut old_parts = collect_in(self.old.parts.iter().map(|(at, bytes)| (*at, &bytes[..])), self.arena);
+        let mut old_parts = collect_in(file_parts(self.old), self.arena);
         radix::sort_copy_by_key(&mut old_parts, |it| it.0);
-        for (offset, bytes) in self.new.parts.iter() {
-            match old_parts.binary_search_by_key(offset, |it| it.0) {
-                Ok(at) if old_parts[at].1 == &bytes[..] => {}
-                Ok(at) => changed_blocks(*offset, old_parts[at].1, bytes, &mut ranges),
-                Err(_) => ranges.push((*offset, bytes.len() as u64)),
+        for (offset, bytes) in file_parts(&self.new) {
+            match old_parts.binary_search_by_key(&offset, |it| it.0) {
+                Ok(at) if same_bytes(old_parts[at].1, bytes) => {}
+                Ok(at) => changed_blocks(offset, old_parts[at].1, bytes, &mut ranges),
+                Err(_) => ranges.push((offset, bytes.len() as u64)),
             }
         }
         fill(&Layout::of(&self.new), &merge(ranges, GAP))
     }
+}
+
+/// Whether no region moved or changed its room, nor its size but for a synthetic one, whose
+/// size the writer makes: `old` the last link's, `new` this one's, by index.
+fn same_regions(old: &[Space], new: &[Region]) -> bool {
+    old.len() == new.len()
+        && old.iter().zip(new).all(|(old, new)| {
+            let old = &old.region;
+            old.class == new.class
+                && old.addr == new.addr
+                && old.capacity == new.capacity
+                && (old.size == new.size || matches!(new.class, Class::Synthetic(_)))
+        })
+}
+
+/// The [`Delta`] of `changes`, the runs a stage's splices replaced, from synthesis `from`.
+fn delta<'d>(
+    changes: Option<&'d Changes<'_>>,
+    from: u64,
+    same_names: bool,
+    same_regions: bool,
+    written: &'d [(u64, u64)],
+) -> Option<Delta<'d>> {
+    let changes = changes?;
+    Some(Delta {
+        functions: &changes.functions,
+        rebase: &changes.rebase,
+        got: &changes.got,
+        binds: &changes.binds,
+        same_names,
+        same_regions,
+        written,
+        from,
+    })
 }
 
 /// Pushes each `BLOCK` of `new`, at file offset `offset`, that differs from `old`, the bytes the

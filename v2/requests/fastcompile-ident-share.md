@@ -7,6 +7,8 @@ From `dedup-scan-ident` (lane `dedup`), 2026-10-29. Notes:
 `v2/requests/codegen.md`, `## dedup: one type identity (hashes.rs onto hir-ty-share)`. Apply
 this one first: codegen's edit calls what this one makes public.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### Why
 
 `crates/hir-ty-share/src/identity.rs` (`Spell`, `adt`, `variants`) is a copy of
@@ -71,6 +73,8 @@ One known dependency: the moved `with_spans` and `table_of` use `MirBody::inline
 `MirSpan::Inlined`, which are not in `hir-ty` on disk yet (they come with `codegen-inline`'s
 request to hir-ty). They move unchanged, so they compile once that lands, exactly as
 `hashes.rs` does today.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### 1. `crates/hir-ty-share/src/code.rs` (new file)
 
@@ -273,6 +277,8 @@ pub fn of_coroutine_by_move<'db>(
 
 `names` now streams into the `Hasher` instead of a `Vec`. That is the same bytes under the same
 domain (BLAKE3 is independent of how the input is split), with no allocation.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### 2. `crates/hir-ty-share/src/identity.rs` (replace the whole file)
 
@@ -779,6 +785,8 @@ Compared with today's file:
 
 Every other line is today's.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### 3. `crates/hir-ty-share/src/lib.rs`
 
 Before:
@@ -836,6 +844,7 @@ becomes:
 > and the full identity of everything else that tells types apart ([`identity`], the code
 > generator's spelling of a type too): `TypeId`, `type_name`, vtables, `dyn` calls, closures,
 > coroutines by their compiled code ([`code`]).
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### 4. `crates/hir-ty-share/src/fact.rs`: one `is_plain_data`
 
@@ -965,6 +974,8 @@ The one difference between the two old copies is that `structurally_normalize_ty
 `normalize` does not. That changes no answer: an inference variable and an error both reach
 `_ => false`. The differential test below checks this.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### 5. `crates/hir-ty-share/Cargo.toml`
 
 Before:
@@ -984,6 +995,8 @@ test-fixture.workspace = true
 
 `proptest` is already a root workspace dependency (root `Cargo.toml` line 229).
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### 6. `crates/hir-ty-share/src/tests/mod.rs`
 
 Before:
@@ -1002,6 +1015,8 @@ mod identity;
 The new module uses `declarations`, `alias` and `function` of `tests/mod.rs` through `super::`;
 they stay where they are. That they are copies of codegen's test helpers is `dedup-scan`'s
 test-database request, not this one.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### 7. `crates/hir-ty-share/src/tests/identity.rs` (new file): the differential test
 
@@ -1835,8 +1850,16 @@ What the tests check:
 `hir-ty-codegen/v2/hashes/tests.rs` keeps its tests unchanged, and they now run over this
 spelling through `ItemHashes`. That is lane codegen's half of the request.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### Done when
 
 - `rg 'is_plain_data|struct Spell|fn with_spans|fn adt_content' crates/hir-ty-codegen` finds
   only the calls into `hir_ty_share` (after codegen's half).
 - `rg 'IDENTITY_DOMAIN' crates/` finds nothing.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
+> applied by fastcompile-ident-share, 2026-10-29: steps 1 to 7 as written (`code.rs`,
+> `identity.rs`, `lib.rs`, `fact.rs`'s one `is_plain_data`, `proptest`, `tests/identity.rs`).
+> `rg IDENTITY_DOMAIN crates/` finds nothing. Codegen's half (`hashes.rs` onto `hir_ty_share::{identity, code, is_plain_data}`) can go now.

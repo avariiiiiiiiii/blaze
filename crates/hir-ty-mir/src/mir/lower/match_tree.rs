@@ -23,7 +23,7 @@ use crate::{
 };
 
 /// One step from a matched value to a part of it.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Step {
     Field(u32),
     Variant(EnumVariantId),
@@ -69,7 +69,7 @@ struct Candidate {
 }
 
 /// Where a test sends a candidate.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Branch {
     Variant(EnumVariantId),
     Int(u128),
@@ -153,7 +153,8 @@ impl Tree {
     /// outcome says something about into its branches, and matches each branch. The
     /// candidates from the first one it says nothing about are left for after.
     fn test(&mut self, start: bool, candidates: Vec<Candidate>) -> (bool, Vec<Candidate>) {
-        let Pair { place, ask, .. } = candidates[0].pairs[0].clone();
+        let first = &candidates[0].pairs[0];
+        let (place, ask) = (first.place.clone(), first.ask.clone());
         let mut branches: Vec<(Branch, Vec<Candidate>)> = Vec::new();
         let mut remaining = Vec::new();
         let mut candidates = candidates.into_iter();

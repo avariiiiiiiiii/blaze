@@ -59,7 +59,7 @@ use windows_sys::Win32::{
 };
 
 use super::sys::{self, KEY_EXIT, KEY_JOB, Port};
-use crate::{Command, Confine, Confined, Exit, Sandbox};
+use crate::{Command, Confine, Exit, Sandbox};
 
 /// What a pipe holds before its writer waits.
 const PIPE: u32 = 64 << 10;
@@ -89,29 +89,23 @@ pub(super) struct Started {
 /// What is needed to say how the process ended, once it has.
 pub(super) struct Finish {
     pub(super) command: Box<Command>,
+    // dyn: the caller's sandbox maker, asked once per sandboxed process.
     confine: Option<Arc<dyn Confine>>,
     scratch: Option<PathBuf>,
 }
 
 /// `command` made in its sandbox, made by `confine`, unless the sandbox is off; in a job of its
 /// own, suspended until the driver follows it.
+// dyn: as above.
 pub(super) fn start(root: &Path, command: Box<Command>, confine: Option<&Arc<dyn Confine>>) -> io::Result<Started> {
     let n = RUNS.fetch_add(1, Ordering::Relaxed);
     let (confined, scratch, confine) = match &command.sandbox {
-        Sandbox::Off => (
-            Confined {
-                program: command.program.clone(),
-                args: command.args.clone(),
-                env: command.env.clone(),
-                dir: command.dir.clone(),
-            },
-            None,
-            None,
-        ),
+        Sandbox::Off => (None, None, None),
         Sandbox::On { .. } => {
             let Some(confine) = confine else {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
+                    // alloc: an error path.
                     format!(
                         "{}: a sandbox is asked for and this driver was given nothing to make \
                          one (no Confine); nothing runs outside one",
@@ -119,13 +113,16 @@ pub(super) fn start(root: &Path, command: Box<Command>, confine: Option<&Arc<dyn
                     ),
                 ));
             };
+            // alloc: a sandboxed process's scratch directory, made once as it starts.
             let scratch = root.join(".blaze-spawn").join(format!("{}-{n}", std::process::id()));
             _ = std::fs::remove_dir_all(&scratch);
             std::fs::create_dir_all(&scratch)?;
             match confine.confine(&command, &scratch) {
-                Ok(confined) => (confined, Some(scratch), Some(confine.clone())),
+                // clone: one reference count, the sandbox's to ask what the process read.
+                Ok(confined) => (Some(confined), Some(scratch), Some(confine.clone())),
                 Err(why) => {
                     _ = std::fs::remove_dir_all(&scratch);
+                    // alloc: an error path.
                     return Err(io::Error::other(format!(
                         "{}: no sandbox can be made here: {why}",
                         command.program.display()
@@ -134,20 +131,38 @@ pub(super) fn start(root: &Path, command: Box<Command>, confine: Option<&Arc<dyn
             }
         }
     };
-    let made = run(&confined, &command, n);
+    let launch = match &confined {
+        Some(confined) => Launch {
+            program: &confined.program,
+            args: &confined.args,
+            env: &confined.env,
+            dir: &confined.dir,
+        },
+        None => Launch { program: &command.program, args: &command.args, env: &command.env, dir: &command.dir },
+    };
+    let made = run(&launch, &command, n);
     let started = made.map_err(|error| {
         if let Some(scratch) = &scratch {
             _ = std::fs::remove_dir_all(scratch);
         }
-        io::Error::new(error.kind(), format!("starting {}: {error}", confined.program.display()))
+        // alloc: an error path.
+        io::Error::new(error.kind(), format!("starting {}: {error}", launch.program.display()))
     })?;
     let (process, thread, job, stdin, stdout, stderr) = started;
     Ok(Started { process, thread, job, stdin, stdout, stderr, finish: Finish { command, confine, scratch } })
 }
 
+/// What a process is started as: its command's own, or what its sandbox made of it.
+struct Launch<'a> {
+    program: &'a Path,
+    args: &'a [OsString],
+    env: &'a [(OsString, OsString)],
+    dir: &'a Path,
+}
+
 type Handles = (OwnedHandle, OwnedHandle, OwnedHandle, Option<OwnedHandle>, OwnedHandle, OwnedHandle);
 
-fn run(confined: &Confined, command: &Command, n: u64) -> io::Result<Handles> {
+fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
     let job = job(command.memory)?;
     let (stdout, child_stdout) = pipe(true, n, "out")?;
     let (stderr, child_stderr) = pipe(true, n, "err")?;
@@ -159,10 +174,11 @@ fn run(confined: &Confined, command: &Command, n: u64) -> io::Result<Handles> {
         }
     };
     let inherited = [child_stdin.as_raw_handle(), child_stdout.as_raw_handle(), child_stderr.as_raw_handle()];
-    let program = sys::wide(confined.program.as_os_str())?;
-    let mut line = command_line(&confined.program, &confined.args)?;
-    let env = environment(&confined.env)?;
-    let dir = sys::wide(confined.dir.as_os_str())?;
+    // alloc: what the process is started with, made once as it starts.
+    let program = sys::wide(launch.program.as_os_str())?;
+    let mut line = command_line(launch.program, launch.args)?;
+    let env = environment(launch.env)?;
+    let dir = sys::wide(launch.dir.as_os_str())?;
     let attributes = Attributes::new(&inherited)?;
     // SAFETY: all zeros is a valid `STARTUPINFOEXW` before its fields are set.
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -198,6 +214,7 @@ fn run(confined: &Confined, command: &Command, n: u64) -> io::Result<Handles> {
     if let Err(error) = sys::check(unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) }) {
         // SAFETY: the process just made.
         unsafe { TerminateProcess(process.as_raw_handle(), KILLED) };
+        // alloc: an error path.
         return Err(io::Error::new(error.kind(), format!("into its job: {error}")));
     }
     // Its ends are its own now: the pipes end when it and what it starts close them.
@@ -271,6 +288,7 @@ static PIPES: AtomicU64 = AtomicU64::new(0);
 /// A pipe: the driver's end (overlapped, kept from children) and the child's (inheritable).
 /// `inbound` is a pipe the child writes.
 fn pipe(inbound: bool, n: u64, which: &str) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
     let name = format!(
         r"\\.\pipe\blaze-{}-{n}-{which}-{}",
         std::process::id(),
@@ -345,6 +363,7 @@ impl Attributes {
         let mut size = 0;
         // SAFETY: a query of the size, writing nothing but `size`; it fails, as it must.
         unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+        // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
         let mut memory = vec![0usize; size.div_ceil(size_of::<usize>())];
         let list: LPPROC_THREAD_ATTRIBUTE_LIST = memory.as_mut_ptr().cast();
         // SAFETY: memory of the size asked for, aligned for the pointers it holds.
@@ -380,6 +399,7 @@ impl Drop for Attributes {
 /// The program and its arguments as one command line, each quoted as the C runtime's
 /// parser (`CommandLineToArgvW`) reads it back.
 fn command_line(program: &Path, args: &[OsString]) -> io::Result<Vec<u16>> {
+    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
     let mut line = Vec::new();
     quote(program.as_os_str(), &mut line)?;
     for arg in args {
@@ -391,10 +411,12 @@ fn command_line(program: &Path, args: &[OsString]) -> io::Result<Vec<u16>> {
 }
 
 fn quote(arg: &OsStr, line: &mut Vec<u16>) -> io::Result<()> {
+    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
     let wide: Vec<u16> = arg.encode_wide().collect();
     if wide.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
+            // alloc: an error path.
             format!("{}: a NUL inside an argument", arg.to_string_lossy()),
         ));
     }
@@ -428,26 +450,32 @@ fn quote(arg: &OsStr, line: &mut Vec<u16>) -> io::Result<()> {
 /// Windows sorts them (names are of no case), a later one of a name replacing the earlier,
 /// then a NUL.
 fn environment(env: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
+    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
     let mut by_name: Vec<(Vec<u16>, &OsString, &OsString)> = Vec::new();
     for (name, value) in env {
+        // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
         let wide: Vec<u16> = name.encode_wide().collect();
         if wide.is_empty() || wide[1..].contains(&u16::from(b'=')) || wide.contains(&0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
+                // alloc: an error path.
                 format!("{}: not a name an environment holds", name.to_string_lossy()),
             ));
         }
         if value.encode_wide().any(|it| it == 0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
+                // alloc: an error path.
                 format!("{}: a NUL inside its value", name.to_string_lossy()),
             ));
         }
+        // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
         let key: Vec<u16> = wide.iter().map(|&c| upper(c)).collect();
         by_name.retain(|(it, ..)| *it != key);
         by_name.push((key, name, value));
     }
     by_name.sort_by(|a, b| a.0.cmp(&b.0));
+    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
     let mut block = Vec::new();
     for (_, name, value) in by_name {
         block.extend(name.encode_wide());
@@ -544,11 +572,6 @@ impl Finish {
         &self.command.program
     }
 
-    /// What the process is to be given on its standard input.
-    pub(super) fn stdin(&self) -> &[u8] {
-        &self.command.stdin
-    }
-
     /// How the process ended: its exit code, the most memory its job held, what its sandbox
     /// says it read. Removes what was made for it.
     pub(super) fn exited(
@@ -567,6 +590,7 @@ impl Finish {
         let traced = match (&ended, &self.command.sandbox, &self.confine, &self.scratch) {
             (Ok(_), Sandbox::On { trace: true, .. }, Some(confine), Some(scratch)) => {
                 Some(confine.traced(&self.command, scratch).map_err(|why| {
+                    // alloc: an error path.
                     io::Error::other(format!(
                         "{}: its sandbox's record of what it read: {why}",
                         self.command.program.display()

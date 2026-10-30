@@ -5,59 +5,47 @@
 use crate::{
     Options,
     emit::Style,
-    lints::CommandLine,
-    tests::{checked, checked_with, normalized},
+    tests::{Mode, checked, checked_with, compiletest, normalized},
 };
 
-/// The lint flags compiletest gives every UI test (`runtest.rs`, `make_compile_args`), with
-/// `-A unused -W unused_attributes` before them for a test that passes.
-fn compiletest(passes: bool) -> Options {
-    let mut args: Vec<&str> = Vec::new();
-    if passes {
-        args.extend(["-A", "unused", "-W", "unused_attributes"]);
-    }
-    args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
-    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() }
-}
-
-/// What rustc writes compiling `fixture` (its files named `$DIR/<path>`) as a UI test.
-fn ui(fixture: &str, passes: bool) -> String {
-    let checked = checked_with(fixture, "$DIR/", &compiletest(passes));
+/// What rustc writes compiling `fixture` (its files named `$DIR/<path>`) as compiletest runs a
+/// UI test of pass mode `mode`.
+fn ui(fixture: &str, mode: Mode) -> String {
+    let checked = checked_with(fixture, "$DIR/", &compiletest(mode, &Options::default()));
     normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }
 
 /// The UI test `source`, named `$DIR/<name>`, of edition 2015 with no other crate.
-fn one(name: &str, source: &str, passes: bool) -> String {
-    ui(&format!("//- /{name} crate:main edition:2015\n{source}"), passes)
+fn one(name: &str, source: &str, mode: Mode) -> String {
+    ui(&format!("//- /{name} crate:main edition:2015\n{source}"), mode)
 }
 
 #[test]
 fn deprecation_in_future() {
     let source = include_str!("stability/deprecation-in-future.rs");
     let expected = include_str!("stability/deprecation-in-future.stderr");
-    assert_eq!(one("deprecation-in-future.rs", source, true), expected);
+    assert_eq!(one("deprecation-in-future.rs", source, Mode::Other), expected);
 }
 
 #[test]
 fn deprecated_macro_escape() {
     let source = include_str!("stability/deprecated-macro_escape.rs");
     let expected = include_str!("stability/deprecated-macro_escape.stderr");
-    assert_eq!(one("deprecated-macro_escape.rs", source, true), expected);
+    assert_eq!(one("deprecated-macro_escape.rs", source, Mode::RunPass), expected);
 }
 
 #[test]
 fn deprecated_macro_escape_inner() {
     let source = include_str!("stability/deprecated-macro_escape-inner.rs");
     let expected = include_str!("stability/deprecated-macro_escape-inner.stderr");
-    assert_eq!(one("deprecated-macro_escape-inner.rs", source, true), expected);
+    assert_eq!(one("deprecated-macro_escape-inner.rs", source, Mode::RunPass), expected);
 }
 
 #[test]
 fn unit_and_tuple_struct() {
     let source = include_str!("stability/unit_and_tuple_struct.rs");
     let expected = include_str!("stability/unit_and_tuple_struct.stderr");
-    assert_eq!(one("unit_and_tuple_struct.rs", source, false), expected);
+    assert_eq!(one("unit_and_tuple_struct.rs", source, Mode::Other), expected);
 }
 
 #[test]
@@ -65,7 +53,7 @@ fn deprecation_lint_nested() {
     let source = include_str!("stability/deprecation-lint-nested.rs");
     let expected = include_str!("stability/deprecation-lint-nested.stderr");
     let fixture = format!("//- minicore: fmt\n//- /deprecation-lint-nested.rs crate:main edition:2015\n{source}");
-    assert_eq!(ui(&fixture, false), expected);
+    assert_eq!(ui(&fixture, Mode::Other), expected);
 }
 
 /// `auxiliary/deprecation-lint.rs` as the crate `deprecation_lint`, with the UI test `source`
@@ -96,21 +84,21 @@ pub mod prelude {
 }
 ";
     let fixture = with_deprecation_lint("deprecation-lint.rs", source, std, ",std");
-    assert_eq!(ui(&fixture, false), expected);
+    assert_eq!(ui(&fixture, Mode::Other), expected);
 }
 
 #[test]
 fn deprecation_lint_2() {
     let source = include_str!("stability/deprecation-lint-2.rs");
     let expected = include_str!("stability/deprecation-lint-2.stderr");
-    assert_eq!(ui(&with_deprecation_lint("deprecation-lint-2.rs", source, "", ""), false), expected);
+    assert_eq!(ui(&with_deprecation_lint("deprecation-lint-2.rs", source, "", ""), Mode::Other), expected);
 }
 
 #[test]
 fn deprecation_lint_3() {
     let source = include_str!("stability/deprecation-lint-3.rs");
     let expected = include_str!("stability/deprecation-lint-3.stderr");
-    assert_eq!(ui(&with_deprecation_lint("deprecation-lint-3.rs", source, "", ""), false), expected);
+    assert_eq!(ui(&with_deprecation_lint("deprecation-lint-3.rs", source, "", ""), Mode::Other), expected);
 }
 
 #[test]
@@ -129,7 +117,7 @@ fn lint_stability_deprecated() {
         include_str!("stability/auxiliary/stability_cfg1.rs"),
         include_str!("stability/auxiliary/stability-cfg2.rs"),
     );
-    assert_eq!(ui(&fixture, true), expected);
+    assert_eq!(ui(&fixture, Mode::Other), expected);
 }
 
 /// `deprecation-sanity.rs`'s `useless_deprecated`, as its `.stderr` has it. The test's other
@@ -147,7 +135,7 @@ LL | #[deprecated = \"hello\"]
    = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
    = note: `#[deny(useless_deprecated)]` on by default
 ";
-    let stderr = one("deprecation-sanity.rs", source, false);
+    let stderr = one("deprecation-sanity.rs", source, Mode::Other);
     assert!(stderr.contains(expected), "{stderr}");
 }
 

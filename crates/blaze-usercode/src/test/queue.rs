@@ -11,6 +11,14 @@
 //!   sandbox appended to the record under the test's scope (and under none) are what the test
 //!   read ([`Trace::Lines`]); the record is read after each answer, so every line of the child
 //!   is in it.
+//! - **Replicas.** One server forks one test at a time, so it starts at most one test per
+//!   fork. After the first hello the queue asks for `K - 1` copies ([`Frame::Replicate`],
+//!   `K` from the cores, the fork the server measured and the binary's median test:
+//!   `replicas`), and each copy connects on the same socket and says its own hello. The
+//!   queue keeps a connection per replica and hands each test, in the one order, to the first
+//!   replica with room (the cores over the replicas that said hello). A replica that closes its socket or breaks the
+//!   protocol loses only the tests it runs, with why; the others carry on, and the server is
+//!   killed only when none is left.
 //! - **Critical first.** Every test of every binary is in one order, the longest expected
 //!   first ([`Job::expected`], from the durations kept with the passes), and the next test
 //!   whose server is ready runs whenever a core is free ([`Config::jobs`]).
@@ -43,7 +51,7 @@ use blaze_core::{
     Address, Command, Completion, Conn, Done, Effect, Exit, FileName, Sandbox, Tag, Traced,
     wheel::{Handle, Wheel},
 };
-use blaze_ids::{ContentId, radix};
+use blaze_ids::{ContentId, bits::BitSet, radix};
 use blaze_inproc::host::{Program, Started};
 
 use super::wire::{self, End, Executed, Frame, Frames};
@@ -96,12 +104,12 @@ pub struct Binary {
     pub memory: Option<u64>,
     pub mode: Mode,
     pub jobs: Vec<Job>,
-    /// The binary as blaze's loader holds it in memory: it is started through the loader
-    /// ([`Program::command`]), never from `program` on disk.
+    /// The binary as blaze holds it in memory: [`Program::command`] writes its executable at
+    /// `program`, once per binary, and that file is what is spawned.
     pub loaded: Option<Loaded>,
 }
 
-/// A binary loaded into memory by blaze's loader. Two are the same when they are one program.
+/// A binary blaze holds in memory. Two are the same when they are one program.
 #[derive(Clone)]
 pub struct Loaded(pub Arc<Program>);
 
@@ -315,8 +323,9 @@ enum For {
     Write(u32),
     Listen(u32),
     Spawn(u32),
-    Recv(u32),
-    Send(u32),
+    /// A binary's replica, by its place in the server's.
+    Recv(u32, u32),
+    Send(u32, u32),
     Hangup,
     Read(u32),
     /// The driver timer at the wheel's soonest deadline.
@@ -341,6 +350,7 @@ enum Phase {
     Writing,
     /// Spawned and listened for; not yet said hello.
     Starting,
+    /// Said its first hello: its replicas run what they are sent.
     Ready,
     /// Told to quit; its exit is awaited.
     Quitting,
@@ -356,19 +366,73 @@ struct Ended {
     at: Duration,
 }
 
+/// A connection of a binary's fork server: the server, or a copy it forked when asked
+/// ([`Frame::Replicate`]), each a process forking tests of its own.
+struct Replica {
+    conn: Conn,
+    /// Its process id, once it said hello.
+    pid: Option<u32>,
+    /// Closed by either side: nothing more is sent to it.
+    hung_up: bool,
+    /// Closed, lost or quit: it runs nothing more, and its tests were let go.
+    ended: bool,
+    /// The tests it runs now.
+    running: u32,
+    frames: Frames,
+    /// Frames for it not yet given to the driver: what one call to the queue says to a replica
+    /// goes as one send.
+    outbox: Vec<u8>,
+    dirty: bool,
+}
+
+impl Replica {
+    fn new(conn: Conn) -> Replica {
+        Replica {
+            conn,
+            pid: None,
+            hung_up: false,
+            ended: false,
+            running: 0,
+            frames: Frames::new(),
+            outbox: Vec::new(), // alloc: empty, allocates nothing
+            dirty: false,
+        }
+    }
+
+    /// It said hello and runs what it is sent.
+    fn live(&self) -> bool {
+        self.pid.is_some() && !self.ended
+    }
+}
+
 struct Server {
     phase: Phase,
     socket: FileName,
     record: FileName,
     spawn: Option<Tag>,
-    /// Its start through the loader, said to have exited when its spawn completes.
+    /// Its start through [`Program::command`], said to have exited when its spawn completes.
     loaded: Option<Started>,
+    /// Its listen, until the queue asks to end it.
     listen: Option<Tag>,
-    conn: Option<Conn>,
-    hung_up: bool,
+    /// Its connections in the order accepted, by replica.
+    replicas: Vec<Replica>,
+    /// How many connections it may make: one until its first hello, then the replicas that
+    /// hello chose ([`replicas`]).
+    want: u32,
+    /// Hellos said, the lost replicas' among them: the first sets the tests up and is asked to
+    /// replicate.
+    hellos: u32,
+    /// The first hello's tests, which every replica's must be.
+    tests: Vec<String>,
+    /// Replicas that said hello and have not ended.
+    live: u32,
+    /// The most tests a replica runs at once: the cores over the live replicas, rounded up, so
+    /// the live replicas together always have room for every core.
+    room: u32,
+    /// The live replicas running fewer than `room`, by replica.
+    open: BitSet<u32>,
     /// Why it is being killed, said to the tests it loses.
     lost: Option<String>,
-    frames: Frames,
     /// Each job's index in the server's hello, [`NO_TEST`] for one it did not name: what a
     /// run is sent with, by direct index.
     job_index: Vec<u32>,
@@ -381,8 +445,8 @@ struct Server {
     /// The IDs in `names` of its socket's and its record's paths (as the record names them)
     /// and of the two variables blaze set for it: the lines that are blaze's own.
     ours: [u32; 4],
-    /// The tests it runs now, by id, in the order they started: those a lost server takes
-    /// end in that order.
+    /// The tests its replicas run now, by id, in the order they started: those a lost server
+    /// or replica takes end in that order.
     running: Vec<u64>,
     /// How far the record has been read, and a last line not yet whole.
     at: u64,
@@ -396,10 +460,6 @@ struct Server {
     common_kinds: Vec<u8>,
     /// `common` as the results have it, made when the first result after a change asks.
     shared: Option<Arc<Run>>,
-    /// Frames for the server not yet given to the driver: what one call to the queue says to
-    /// a server goes as one send.
-    outbox: Vec<u8>,
-    dirty: bool,
     reading: bool,
     waiting: Vec<Ended>,
     next: Vec<Ended>,
@@ -413,6 +473,8 @@ struct Attempt {
     unit: u32,
     number: u32,
     generation: u32,
+    /// The replica of its binary's server it was sent to.
+    replica: u32,
     live: bool,
     /// Sent to its server, and not yet said to have ended.
     running: bool,
@@ -425,7 +487,7 @@ struct Attempt {
 
 struct Whole {
     spawn: Tag,
-    /// Its start through the loader, said to have exited when its spawn completes.
+    /// Its start through [`Program::command`], said to have exited when its spawn completes.
     loaded: Option<Started>,
     started: Duration,
     slots: usize,
@@ -444,52 +506,45 @@ struct Bin {
     units: u32,
 }
 
-/// A set of `u32` positions as bits, with the lowest word that may have one, so the first is
-/// found by a scan that only moves forward until a lower bit is set again.
+/// A set of `u32` positions, with the lowest word that may have one, so the first is found by
+/// a scan that only moves forward until a lower bit is set again.
 #[derive(Clone, Debug)]
-struct Bits {
-    words: Vec<u64>,
+struct Ranks {
+    bits: BitSet<u32>,
     low: usize,
 }
 
-impl Bits {
-    fn empty(len: usize) -> Bits {
-        let words = vec![0; len.div_ceil(64)]; // alloc: setup, once per run
-        Bits { low: words.len(), words }
+impl Ranks {
+    fn empty(len: usize) -> Ranks {
+        let bits = BitSet::<u32>::new(len); // alloc: setup, once per run
+        Ranks { low: bits.words().len(), bits }
     }
 
-    fn full(len: usize) -> Bits {
-        let mut words = vec![u64::MAX; len.div_ceil(64)]; // alloc: setup, once per run
-        if let Some(last) = words.last_mut()
-            && len % 64 != 0
-        {
-            *last = (1 << (len % 64)) - 1;
-        }
-        Bits { words, low: 0 }
+    fn full(len: usize) -> Ranks {
+        Ranks { bits: BitSet::<u32>::filled(len), low: 0 } // alloc: setup, once per run
     }
 
     fn has(&self, at: u32) -> bool {
-        self.words[at as usize / 64] & (1 << (at % 64)) != 0
+        self.bits.contains(at)
     }
 
     fn set(&mut self, at: u32) {
-        let word = at as usize / 64;
-        self.words[word] |= 1 << (at % 64);
-        self.low = self.low.min(word);
+        self.bits.insert(at);
+        self.low = self.low.min(at as usize / 64);
     }
 
     fn clear(&mut self, at: u32) {
-        self.words[at as usize / 64] &= !(1 << (at % 64));
+        self.bits.remove(at);
     }
 
     fn clear_all(&mut self) {
-        self.words.fill(0);
-        self.low = self.words.len();
+        self.bits.clear();
+        self.low = self.bits.words().len();
     }
 
     fn first(&mut self) -> Option<u32> {
-        while self.low < self.words.len() {
-            let word = self.words[self.low];
+        let words = self.bits.words();
+        while let Some(&word) = words.get(self.low) {
             if word != 0 {
                 return Some((self.low * 64) as u32 + word.trailing_zeros());
             }
@@ -500,14 +555,7 @@ impl Bits {
 
     /// The positions set, in order.
     fn ones(&self) -> impl Iterator<Item = u32> + '_ {
-        self.words.iter().enumerate().flat_map(|(at, &word)| {
-            let mut left = word;
-            std::iter::from_fn(move || {
-                let bit = (left != 0).then(|| left.trailing_zeros())?;
-                left &= left - 1;
-                Some((at * 64) as u32 + bit)
-            })
-        })
+        self.bits.iter()
     }
 }
 
@@ -548,8 +596,8 @@ pub struct Queue {
     rank: Vec<u32>,
     /// By rank: not started yet; and of those, what can start now (its server said hello, or
     /// it is a binary run whole).
-    pending: Bits,
-    ready: Bits,
+    pending: Ranks,
+    ready: Ranks,
     /// By unit, cold: how many earlier attempts it had (retries), and their output.
     tries: Vec<u32>,
     tries_output: Vec<Vec<u8>>,
@@ -562,8 +610,8 @@ pub struct Queue {
     fired: Vec<Due>,
     /// The driver timer at the wheel's soonest deadline, and the tick it is for.
     armed: Option<(Tag, u64)>,
-    /// Servers with frames in their outbox.
-    dirty: Vec<u32>,
+    /// Replicas with frames in their outbox, by binary and replica.
+    dirty: Vec<(u32, u32)>,
     /// Binaries left with nothing to run, to let go.
     quit: Vec<u32>,
     busy: usize,
@@ -593,8 +641,8 @@ impl Queue {
             unit_job: Vec::with_capacity(count),
             order: Vec::with_capacity(count),
             rank: Vec::with_capacity(count),
-            pending: Bits::empty(0),
-            ready: Bits::empty(0),
+            pending: Ranks::empty(0),
+            ready: Ranks::empty(0),
             tries: Vec::with_capacity(count),
             tries_output: Vec::with_capacity(count),
             attempts: Vec::with_capacity(cores),
@@ -647,8 +695,8 @@ impl Queue {
         for (at, &unit) in queue.order.iter().enumerate() {
             queue.rank[unit as usize] = at as u32;
         }
-        queue.pending = Bits::full(count);
-        queue.ready = Bits::empty(count);
+        queue.pending = Ranks::full(count);
+        queue.ready = Ranks::empty(count);
         queue.tries.resize(count, 0);
         queue.tries_output.resize_with(count, Vec::new);
         for b in 0..queue.bins.len() {
@@ -766,10 +814,10 @@ impl Queue {
                 };
                 self.server_ended(b, why, output, effects);
             }
-            For::Recv(b) => self.received(b as usize, completion.done, effects),
-            For::Send(b) => {
+            For::Recv(b, r) => self.received(b as usize, r, completion.done, effects),
+            For::Send(b, r) => {
                 if let Done::Failed(error) = completion.done {
-                    self.kill_server(b as usize, format!("sending to its fork server: {error}"), effects); // alloc: error path
+                    self.lose(b as usize, r, format!("could not be sent to: {error}"), effects); // alloc: error path
                 }
             }
             For::Hangup => {}
@@ -840,6 +888,7 @@ impl Queue {
                     unit,
                     number,
                     generation: 0,
+                    replica: 0,
                     live: false,
                     running: false,
                     timed_out: false,
@@ -855,6 +904,7 @@ impl Queue {
             unit,
             number,
             generation: attempt.generation,
+            replica: 0,
             live: true,
             running: false,
             timed_out: false,
@@ -890,8 +940,8 @@ impl Queue {
                         continue;
                     }
                     attempt.timed_out = true;
-                    let b = self.unit_bin[attempt.unit as usize] as usize;
-                    self.send(b, &Frame::Kill { id });
+                    let (b, r) = (self.unit_bin[attempt.unit as usize] as usize, attempt.replica);
+                    self.send(b, r, &Frame::Kill { id });
                     let grace = self.wheel.insert(due_tick(self.now, self.config.kill_grace), Due::Grace(id));
                     self.attempts[at].grace = Some(grace);
                 }
@@ -938,10 +988,14 @@ impl Queue {
             spawn: None,
             loaded: None,
             listen: None,
-            conn: None,
-            hung_up: false,
+            replicas: Vec::new(), // alloc: empty, allocates nothing
+            want: 1,
+            hellos: 0,
+            tests: Vec::new(), // alloc: empty, allocates nothing
+            live: 0,
+            room: 0,
+            open: BitSet::<u32>::new(0),
             lost: None,
-            frames: Frames::new(),
             job_index: Vec::new(), // alloc: empty, allocates nothing
             scopes: Names::new(),
             scope_job: Vec::new(), // alloc: empty, allocates nothing
@@ -954,8 +1008,6 @@ impl Queue {
             common: Vec::new(), // alloc: empty, allocates nothing
             common_kinds: Vec::new(), // alloc: empty, allocates nothing
             shared: None,
-            outbox: Vec::new(), // alloc: empty, allocates nothing
-            dirty: false,
             reading: false,
             waiting: Vec::with_capacity(self.config.jobs),
             next: Vec::with_capacity(self.config.jobs),
@@ -1001,7 +1053,7 @@ impl Queue {
             Some(loaded) => match loaded.0.command(command, true) {
                 Ok((command, started)) => (command, Some(started)),
                 Err(error) => {
-                    let why = format!("{} could not be started through blaze's loader: {error}", plan.program.display()); // alloc: error path
+                    let why = format!("{} could not be made ready to start: {error}", plan.program.display()); // alloc: error path
                     self.server(b).phase = Phase::Ended;
                     self.server_ended(b, why, Vec::new(), effects); // alloc: empty, allocates nothing
                     return;
@@ -1023,24 +1075,24 @@ impl Queue {
         match done {
             Done::Accepted { conn } => {
                 let server = self.server(b);
-                if server.conn.is_some() || server.phase != Phase::Starting {
+                let room = matches!(server.phase, Phase::Starting | Phase::Ready | Phase::Quitting)
+                    && server.replicas.len() < server.want as usize;
+                if !room {
                     let hangup = self.tag(For::Hangup);
                     effects.push(Effect::Hangup { conn, tag: hangup });
                     return;
                 }
-                server.conn = Some(conn);
-                let recv = self.tag(For::Recv(b as u32));
+                let r = server.replicas.len() as u32;
+                server.replicas.push(Replica::new(conn));
+                let recv = self.tag(For::Recv(b as u32, r));
                 effects.push(Effect::Recv { conn, most: RECV, tag: recv });
-                effects.push(Effect::Unlisten { tag });
+                self.unlisten_when_whole(b, effects);
             }
-            Done::Unlistened => {
-                self.release_tag(tag);
-                self.server(b).listen = None;
-            }
+            Done::Unlistened => self.release_tag(tag),
             Done::Failed(error) => {
                 self.release_tag(tag);
                 self.server(b).listen = None;
-                if self.server(b).conn.is_none() {
+                if self.server(b).replicas.is_empty() {
                     let socket = self.server(b).socket.clone(); // clone: error path
                     self.kill_server(b, format!("listening on {socket}: {error}"), effects); // alloc: error path
                 }
@@ -1049,83 +1101,172 @@ impl Queue {
         }
     }
 
-    fn received(&mut self, b: usize, done: Done, effects: &mut Vec<Effect>) {
+    /// The listen ended once every connection the server may make was accepted.
+    fn unlisten_when_whole(&mut self, b: usize, effects: &mut Vec<Effect>) {
+        let server = self.server(b);
+        if server.hellos > 0 && server.replicas.len() >= server.want as usize {
+            self.unlisten(b, effects);
+        }
+    }
+
+    fn unlisten(&mut self, b: usize, effects: &mut Vec<Effect>) {
+        if let Some(listen) = self.server(b).listen.take() {
+            effects.push(Effect::Unlisten { tag: listen });
+        }
+    }
+
+    fn replica(&mut self, b: usize, r: u32) -> &mut Replica {
+        &mut self.server(b).replicas[r as usize]
+    }
+
+    fn received(&mut self, b: usize, r: u32, done: Done, effects: &mut Vec<Effect>) {
         let bytes = match done {
             Done::Read(bytes) => bytes,
             Done::Failed(error) => {
-                self.kill_server(b, format!("reading from its fork server: {error}"), effects); // alloc: error path
+                self.lose(b, r, format!("could not be read from: {error}"), effects); // alloc: error path
                 return;
             }
             _ => return,
         };
         if bytes.is_empty() {
-            let server = self.server(b);
-            server.hung_up = true;
-            if !matches!(server.phase, Phase::Quitting | Phase::Ended) {
-                self.kill_server(b, "its fork server closed its socket".to_owned(), effects); // alloc: error path
-            }
+            self.replica(b, r).hung_up = true;
+            self.lose(b, r, "closed its socket".to_owned(), effects); // alloc: error path
             return;
         }
-        self.server(b).frames.push_owned(bytes);
+        self.replica(b, r).frames.push_owned(bytes);
         loop {
-            let frame = match self.server(b).frames.pop() {
+            let frame = match self.replica(b, r).frames.pop() {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(why) => {
-                    self.kill_server(b, format!("its fork server broke the protocol: {why}"), effects); // alloc: error path
+                    self.lose(b, r, format!("broke the protocol: {why}"), effects); // alloc: error path
                     return;
                 }
             };
-            if let Err(why) = self.frame(b, frame, effects) {
-                self.kill_server(b, format!("its fork server broke the protocol: {why}"), effects); // alloc: error path
+            if let Err(why) = self.frame(b, r, frame, effects) {
+                self.lose(b, r, format!("broke the protocol: {why}"), effects); // alloc: error path
                 return;
             }
         }
-        let server = self.server(b);
-        if let Some(conn) = server.conn
-            && server.phase != Phase::Ended
-        {
-            let most = server.frames.needed().max(RECV);
-            let recv = self.tag(For::Recv(b as u32));
+        let phase = self.server(b).phase;
+        let replica = self.replica(b, r);
+        if !replica.hung_up && phase != Phase::Ended {
+            let (conn, most) = (replica.conn, replica.frames.needed().max(RECV));
+            let recv = self.tag(For::Recv(b as u32, r));
             effects.push(Effect::Recv { conn, most, tag: recv });
         }
     }
 
-    fn frame(&mut self, b: usize, frame: Frame, effects: &mut Vec<Effect>) -> Result<(), String> {
+    /// Replica `r` of `b`'s server closed, failed or broke the protocol (`what`): it is hung up
+    /// and the tests it runs are lost with why, the others carrying on. With no replica left
+    /// the server is killed. Nothing is lost of a server told to quit, which runs nothing.
+    fn lose(&mut self, b: usize, r: u32, what: String, effects: &mut Vec<Effect>) {
+        let server = self.server(b);
+        let phase = server.phase;
+        let replica = &mut server.replicas[r as usize];
+        if replica.ended {
+            return;
+        }
+        let was_live = replica.live();
+        replica.ended = true;
+        replica.outbox.clear();
+        let (conn, hang_up, pid) = (replica.conn, !replica.hung_up, replica.pid);
+        replica.hung_up = true;
+        if was_live {
+            server.live -= 1;
+        }
+        if hang_up {
+            let tag = self.tag(For::Hangup);
+            effects.push(Effect::Hangup { conn, tag });
+        }
+        if matches!(phase, Phase::Quitting | Phase::Ended) {
+            return;
+        }
+        let who = match pid {
+            Some(pid) => format!("replica {r} of its fork server (pid {pid}) {what}"), // alloc: error path
+            None => format!("connection {r} of its fork server, before its hello, {what}"), // alloc: error path
+        };
+        let why = format!("{}: {who}", self.bins[b].plan.name); // alloc: error path
+        let mut running = std::mem::take(&mut self.server(b).running);
+        let mut at = 0;
+        while at < running.len() {
+            let id = running[at];
+            match self.attempt(id) {
+                Some(slot) if self.attempts[slot].replica == r => {
+                    running.remove(at);
+                    self.busy -= 1;
+                    self.lose_attempt(slot, &why, &[]);
+                }
+                _ => at += 1,
+            }
+        }
+        self.server(b).running = running;
+        if self.server(b).live == 0 {
+            // Its tests wait for a replica that says hello, and are lost if none does.
+            for rank in self.pending_of(b) {
+                self.ready.clear(rank);
+            }
+        }
+        if self.server(b).replicas.iter().all(|it| it.ended) {
+            self.kill_server(b, who, effects);
+            return;
+        }
+        self.refresh(b);
+    }
+
+    /// The room of each replica, and which have it, after the live ones changed.
+    fn refresh(&mut self, b: usize) {
+        let cores = u32::try_from(self.config.jobs.max(1)).unwrap_or(u32::MAX);
+        let server = self.server(b);
+        server.room = match server.live {
+            0 => 0,
+            live => cores.div_ceil(live),
+        };
+        for (r, replica) in server.replicas.iter().enumerate() {
+            server.open.set_growing(r as u32, replica.live() && replica.running < server.room);
+        }
+    }
+
+    /// The first replica of `b`'s server with room for a test.
+    fn first_open(&self, b: usize) -> Option<u32> {
+        self.bins[b].server.as_ref()?.open.first()
+    }
+
+    fn frame(&mut self, b: usize, r: u32, frame: Frame, effects: &mut Vec<Effect>) -> Result<(), String> {
         match frame {
-            Frame::Hello { version, tests, .. } => {
-                if self.server(b).phase != Phase::Starting {
+            Frame::Hello { version, pid, fork, tests } => {
+                if self.replica(b, r).pid.is_some() {
                     return Err("a second hello".to_owned()); // alloc: error path
                 }
                 if version != wire::VERSION {
                     return Err(format!("its version is {version}, and blaze speaks {}", wire::VERSION)); // alloc: error path
                 }
-                let bin = &mut self.bins[b];
-                let jobs: FxHashMap<&str, u32> =
-                    bin.plan.jobs.iter().enumerate().map(|(j, it)| (it.name.as_str(), j as u32)).collect(); // alloc: setup, once per server: the hello
-                let server = bin.server.as_mut().expect("a server");
-                server.job_index = vec![NO_TEST; bin.plan.jobs.len()]; // alloc: setup, once per server: the hello
-                server.scoped = vec![Vec::new(); bin.plan.jobs.len()]; // alloc: setup, once per server: the hello
-                for (at, name) in tests.iter().enumerate() {
-                    let Some(&j) = jobs.get(name.as_str()) else { continue };
-                    server.job_index[j as usize] = at as u32;
-                    let id = server.scopes.intern(name).ok_or("it named more tests than blaze holds")?;
-                    if id as usize == server.scope_job.len() {
-                        server.scope_job.push(j);
-                    }
+                if self.server(b).hellos == 0 {
+                    self.first_hello(b, r, fork, tests)?;
+                } else if tests != self.server(b).tests {
+                    return Err("its tests are not those of the first hello".to_owned()); // alloc: error path
                 }
-                server.phase = Phase::Ready;
-                for rank in self.pending_of(b) {
-                    let unit = self.order[rank as usize];
-                    let j = self.unit_job[unit as usize] as usize;
-                    if self.server(b).job_index[j] != NO_TEST {
-                        self.ready.set(rank);
-                        continue;
+                let server = self.server(b);
+                server.hellos += 1;
+                server.replicas[r as usize].pid = Some(pid);
+                let phase = server.phase;
+                match phase {
+                    Phase::Ready => {
+                        server.live += 1;
+                        let first = server.live == 1;
+                        if first {
+                            self.ready_all(b);
+                        }
+                        self.refresh(b);
                     }
-                    self.pending.clear(rank);
-                    let why = format!("{} has no test named {}", self.bins[b].plan.name, self.bins[b].plan.jobs[j].name); // alloc: error path
-                    self.finish(unit, Went::lost(why, Vec::new())); // alloc: empty, allocates nothing
+                    // Nothing was left for it by the time it came.
+                    Phase::Quitting => {
+                        self.replica(b, r).ended = true;
+                        self.send(b, r, &Frame::Quit);
+                    }
+                    Phase::Writing | Phase::Starting | Phase::Ended => {}
                 }
+                self.unlisten_when_whole(b, effects);
                 self.maybe_quit(b, effects);
                 Ok(())
             }
@@ -1134,12 +1275,17 @@ impl Queue {
                     .attempt(id)
                     .filter(|&at| {
                         let attempt = &self.attempts[at];
-                        attempt.running && self.unit_bin[attempt.unit as usize] as usize == b
+                        attempt.running && attempt.replica == r && self.unit_bin[attempt.unit as usize] as usize == b
                     })
                     .ok_or_else(|| format!("an end of {id}, which it does not run"))?; // alloc: error path
                 let server = self.server(b);
                 if let Some(place) = server.running.iter().position(|it| *it == id) {
                     server.running.remove(place);
+                }
+                let replica = &mut server.replicas[r as usize];
+                replica.running -= 1;
+                if replica.live() && replica.running < server.room {
+                    server.open.insert(r);
                 }
                 self.busy -= 1;
                 let attempt = &mut self.attempts[at];
@@ -1161,7 +1307,7 @@ impl Queue {
                         tries.extend_from_slice(&output);
                         let rank = self.rank[unit as usize];
                         self.pending.set(rank);
-                        if self.server(b).phase == Phase::Ready {
+                        if self.accepting(b) {
                             self.ready.set(rank);
                         }
                         return Ok(());
@@ -1182,6 +1328,59 @@ impl Queue {
                 Ok(())
             }
             other => Err(format!("it sent {other:?}, which only blaze sends")), // alloc: error path
+        }
+    }
+
+    /// Whether `b`'s tests can be sent now: its server said hello and a replica of it is live.
+    fn accepting(&self, b: usize) -> bool {
+        self.bins[b].server.as_ref().is_some_and(|it| it.phase == Phase::Ready && it.live > 0)
+    }
+
+    /// The tests the server's first hello named, set up for every replica: each job's index
+    /// and scope, the replicas to make (asked of the replica that said it, before anything
+    /// else is sent to it), and the server ready.
+    fn first_hello(&mut self, b: usize, r: u32, fork: u64, tests: Vec<String>) -> Result<(), String> {
+        let cores = self.config.jobs;
+        let bin = &mut self.bins[b];
+        let jobs: FxHashMap<&str, u32> =
+            bin.plan.jobs.iter().enumerate().map(|(j, it)| (it.name.as_str(), j as u32)).collect(); // alloc: setup, once per server: the hello
+        let mut expected: Vec<u64> = Vec::with_capacity(bin.plan.jobs.len()); // alloc: setup, once per server: the hello
+        expected.extend(bin.plan.jobs.iter().map(|it| nanos(it.expected)));
+        let server = bin.server.as_mut().expect("a server");
+        server.job_index = vec![NO_TEST; bin.plan.jobs.len()]; // alloc: setup, once per server: the hello
+        server.scoped = vec![Vec::new(); bin.plan.jobs.len()]; // alloc: setup, once per server: the hello
+        for (at, name) in tests.iter().enumerate() {
+            let Some(&j) = jobs.get(name.as_str()) else { continue };
+            server.job_index[j as usize] = at as u32;
+            let id = server.scopes.intern(name).ok_or("it named more tests than blaze holds")?;
+            if id as usize == server.scope_job.len() {
+                server.scope_job.push(j);
+            }
+        }
+        let want = replicas(cores, fork, median(&mut expected), bin.units as usize);
+        server.want = want;
+        server.open = BitSet::<u32>::new(want as usize); // alloc: setup, once per server: the hello
+        server.tests = tests;
+        server.phase = Phase::Ready;
+        if want > 1 {
+            self.send(b, r, &Frame::Replicate { count: want - 1 });
+        }
+        Ok(())
+    }
+
+    /// Every test of `b` not started made ready, now that a replica of its server is live; a
+    /// test its hello did not name is lost.
+    fn ready_all(&mut self, b: usize) {
+        for rank in self.pending_of(b) {
+            let unit = self.order[rank as usize];
+            let j = self.unit_job[unit as usize] as usize;
+            if self.server(b).job_index[j] != NO_TEST {
+                self.ready.set(rank);
+                continue;
+            }
+            self.pending.clear(rank);
+            let why = format!("{} has no test named {}", self.bins[b].plan.name, self.bins[b].plan.jobs[j].name); // alloc: error path
+            self.finish(unit, Went::lost(why, Vec::new())); // alloc: empty, allocates nothing
         }
     }
 
@@ -1337,7 +1536,7 @@ impl Queue {
         }
         self.stopping = true;
         self.ready.clear_all();
-        let pending = std::mem::replace(&mut self.pending, Bits::empty(self.order.len()));
+        let pending = std::mem::replace(&mut self.pending, Ranks::empty(self.order.len()));
         for rank in pending.ones() {
             let unit = self.order[rank as usize];
             let done = std::mem::take(&mut self.tries[unit as usize]);
@@ -1363,8 +1562,13 @@ impl Queue {
         }
         let Some(server) = &self.bins[b].server else { return };
         match server.phase {
+            // A replica that has not said hello yet is told on its hello.
             Phase::Ready => {
-                self.send(b, &Frame::Quit);
+                for r in 0..server.replicas.len() as u32 {
+                    if self.replica(b, r).live() {
+                        self.send(b, r, &Frame::Quit);
+                    }
+                }
                 self.server(b).phase = Phase::Quitting;
             }
             Phase::Starting if server.lost.is_none() => {
@@ -1389,25 +1593,26 @@ impl Queue {
         std::mem::swap(&mut self.quit, &mut quit);
     }
 
-    /// `frame` to the server, in its outbox until the call ends ([`Queue::flush`]).
-    fn send(&mut self, b: usize, frame: &Frame) {
-        let server = self.server(b);
-        if server.conn.is_none() || server.hung_up {
+    /// `frame` to replica `r` of the server, in its outbox until the call ends
+    /// ([`Queue::flush`]).
+    fn send(&mut self, b: usize, r: u32, frame: &Frame) {
+        let replica = self.replica(b, r);
+        if replica.hung_up {
             return;
         }
-        frame.encode(&mut server.outbox);
-        if !server.dirty {
-            server.dirty = true;
-            self.dirty.push(b as u32);
+        frame.encode(&mut replica.outbox);
+        if !replica.dirty {
+            replica.dirty = true;
+            self.dirty.push((b as u32, r));
         }
     }
 
-    /// What this call said to each server, as one send of all its frames; then the driver
+    /// What this call said to each replica, as one send of all its frames; then the driver
     /// timer moved earlier if the wheel's soonest deadline is.
     fn flush(&mut self, effects: &mut Vec<Effect>) {
         let mut dirty = std::mem::take(&mut self.dirty);
-        for &b in &dirty {
-            self.flush_server(b as usize, effects);
+        for &(b, r) in &dirty {
+            self.flush_replica(b as usize, r, effects);
         }
         dirty.clear();
         self.dirty = dirty;
@@ -1422,17 +1627,23 @@ impl Queue {
     }
 
     fn flush_server(&mut self, b: usize, effects: &mut Vec<Effect>) {
-        let Some(server) = self.bins[b].server.as_mut() else { return };
-        server.dirty = false;
-        let conn = server.conn.filter(|_| !server.hung_up);
-        match conn {
-            Some(conn) if !server.outbox.is_empty() => {
-                let bytes = std::mem::take(&mut server.outbox);
-                let tag = self.tag(For::Send(b as u32));
-                effects.push(Effect::Send { conn, bytes, tag });
-            }
-            _ => server.outbox.clear(),
+        let Some(server) = self.bins[b].server.as_ref() else { return };
+        for r in 0..server.replicas.len() as u32 {
+            self.flush_replica(b, r, effects);
         }
+    }
+
+    fn flush_replica(&mut self, b: usize, r: u32, effects: &mut Vec<Effect>) {
+        let Some(server) = self.bins[b].server.as_mut() else { return };
+        let Some(replica) = server.replicas.get_mut(r as usize) else { return };
+        replica.dirty = false;
+        if replica.hung_up || replica.outbox.is_empty() {
+            replica.outbox.clear();
+            return;
+        }
+        let (conn, bytes) = (replica.conn, std::mem::take(&mut replica.outbox));
+        let tag = self.tag(For::Send(b as u32, r));
+        effects.push(Effect::Send { conn, bytes, tag });
     }
 
     /// Kills the server, so its tests are lost with `why` once its spawn ends.
@@ -1460,16 +1671,18 @@ impl Queue {
         let server = self.server(b);
         let was = server.phase;
         server.phase = Phase::Ended;
-        if let Some(conn) = server.conn
-            && !server.hung_up
-        {
-            server.hung_up = true;
-            let tag = self.tag(For::Hangup);
-            effects.push(Effect::Hangup { conn, tag });
+        for r in 0..server.replicas.len() as u32 {
+            let replica = self.replica(b, r);
+            replica.ended = true;
+            if !replica.hung_up {
+                replica.hung_up = true;
+                let conn = replica.conn;
+                let tag = self.tag(For::Hangup);
+                effects.push(Effect::Hangup { conn, tag });
+            }
         }
-        if let Some(listen) = self.server(b).listen {
-            effects.push(Effect::Unlisten { tag: listen });
-        }
+        self.server(b).live = 0;
+        self.unlisten(b, effects);
         let running = std::mem::take(&mut self.server(b).running);
         let why = match was {
             Phase::Quitting if running.is_empty() => return,
@@ -1478,26 +1691,7 @@ impl Queue {
         for id in running {
             self.busy -= 1;
             let Some(at) = self.attempt(id) else { continue };
-            let Attempt { unit, number, started, .. } = self.attempts[at];
-            self.free_attempt(at);
-            let outcome = match self.cancelled {
-                true => Outcome::NotRun,
-                false => Outcome::Failed(Failure::Lost(why.clone())), // clone: error path
-            };
-            self.tries[unit as usize] = 0;
-            let earlier = std::mem::take(&mut self.tries_output[unit as usize]);
-            let took = self.now.saturating_sub(started);
-            self.finish(
-                unit,
-                Went {
-                    outcome,
-                    attempts: number,
-                    output: [earlier, output.clone()].concat(), // alloc: error path
-                    took,
-                    trace: Trace::Unknown(why.clone()), // clone: error path
-                    executed: Executed::Not(why.clone()), // clone: error path
-                },
-            );
+            self.lose_attempt(at, &why, &output);
         }
         for rank in self.pending_of(b) {
             let unit = self.order[rank as usize];
@@ -1507,6 +1701,31 @@ impl Queue {
             let earlier = std::mem::take(&mut self.tries_output[unit as usize]);
             self.finish(unit, Went::lost(why.clone(), [earlier, output.clone()].concat())); // alloc: error path
         }
+    }
+
+    /// The running attempt in slot `at` lost with `why`, `output` after its earlier attempts'.
+    fn lose_attempt(&mut self, at: usize, why: &str, output: &[u8]) {
+        let Attempt { unit, number, started, .. } = self.attempts[at];
+        self.free_attempt(at);
+        let outcome = match self.cancelled {
+            true => Outcome::NotRun,
+            false => Outcome::Failed(Failure::Lost(why.to_owned())), // alloc: error path
+        };
+        self.tries[unit as usize] = 0;
+        let mut all = std::mem::take(&mut self.tries_output[unit as usize]);
+        all.extend_from_slice(output);
+        let took = self.now.saturating_sub(started);
+        self.finish(
+            unit,
+            Went {
+                outcome,
+                attempts: number,
+                output: all,
+                took,
+                trace: Trace::Unknown(why.to_owned()), // alloc: error path
+                executed: Executed::Not(why.to_owned()), // alloc: error path
+            },
+        );
     }
 
     /// The ranks of `b`'s units not started, in order.
@@ -1538,13 +1757,24 @@ impl Queue {
         let (b, j) = (self.unit_bin[unit as usize] as usize, self.unit_job[unit as usize] as usize);
         let number = self.tries[unit as usize] + 1;
         let timeout = self.bins[b].plan.jobs[j].timeout;
-        let index = self.server(b).job_index[j];
+        // A test is ready only while a replica is live, and the live replicas have room for
+        // every core together, so with a core free one of them has room.
+        let r = self.first_open(b).expect("a live replica with room while a core is free");
+        let server = self.server(b);
+        let index = server.job_index[j];
+        let room = server.room;
+        let replica = &mut server.replicas[r as usize];
+        replica.running += 1;
+        if replica.running >= room {
+            server.open.remove(r);
+        }
         let id = self.new_attempt(unit, number);
         self.server(b).running.push(id);
         self.busy += 1;
-        self.send(b, &Frame::Run { id, index });
+        self.send(b, r, &Frame::Run { id, index });
         let deadline = self.wheel.insert(due_tick(self.now, timeout), Due::Deadline(id));
         let attempt = &mut self.attempts[id as u32 as usize];
+        attempt.replica = r;
         attempt.running = true;
         attempt.deadline = Some(deadline);
     }
@@ -1575,7 +1805,7 @@ impl Queue {
             Some(loaded) => match loaded.0.command(command, false) {
                 Ok((command, started)) => (command, Some(started)),
                 Err(error) => {
-                    let why = format!("{} could not be started through blaze's loader: {error}", plan.program.display()); // alloc: once per binary run whole
+                    let why = format!("{} could not be made ready to start: {error}", plan.program.display()); // alloc: once per binary run whole
                     let unit = self.bins[b].first;
                     self.finish(
                         unit,
@@ -1644,6 +1874,32 @@ impl Queue {
         let unit = self.bins[b].first;
         self.finish(unit, Went { outcome, attempts: 1, output, took, trace, executed });
     }
+}
+
+/// How many replicas a binary's fork server runs as, itself among them: `ceil(C × F / (F + T))`
+/// for `C` cores, a fork of `F` nanoseconds (the server's own measure) and a median test of
+/// `T`, at least one and at most the cores and the tests. A replica starts a test per fork,
+/// and a core takes about `F + T` per test, so `C` cores need `C × F / (F + T)` forks going
+/// at once (docs/v2/plan/lanes/usercode/speed-of-light.md, "Tests"). A fork that costs
+/// nothing needs one.
+fn replicas(cores: usize, fork: u64, median: u64, tests: usize) -> u32 {
+    let cores = cores.max(1) as u128;
+    let most = cores.min(tests.max(1) as u128).min(u128::from(u32::MAX));
+    let fork = u128::from(fork);
+    let wanted = match fork {
+        0 => 1,
+        _ => (cores * fork).div_ceil(fork + u128::from(median)),
+    };
+    wanted.clamp(1, most) as u32
+}
+
+/// The median of `values`, reordering them; zero for none.
+fn median(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    let at = values.len() / 2;
+    *values.select_nth_unstable(at).1
 }
 
 /// `duration` in nanoseconds, saturating.

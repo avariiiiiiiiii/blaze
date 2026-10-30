@@ -28,11 +28,14 @@ use crate::{
     model::{Diag, Span},
 };
 
+/// The lints this module gives: it runs only when one may fire.
+pub(super) const LINTS: super::LintSet = super::lint_set(["unused_unsafe"]);
+
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
     // Only a written `unsafe` block can be unused: a body without one (most) is decided by a
     // scan of the store's expression tags, before hir's set of unsafe operations is built.
     let has_block = || b.store().exprs().any(|(_, it)| matches!(it, Expr::Block { unsafe_: Unsafe::Yes, .. }));
-    if b.tainted || !has_block() {
+    if !has_block() || b.tainted() {
         return Vec::new();
     }
     let mut visitor = Visitor { b, ops: operations(b), context: Context::Safe, warnings: Vec::new() };

@@ -29,19 +29,28 @@
 //! utility on the others.
 //!
 //! Every job runs as a task of [`crate::pump`]'s stack, so a wait inside it pumps this pool.
+//!
+//! A job allocates nothing once its thread is warm (docs/v2/plan/lanes/mem/core/plane.md). Its
+//! closure goes in a cell of 128, 512 or 2048 bytes from one of three process-wide
+//! [`blaze_mem::Pool`]s, through a cache of the thread that submits it, and its cell goes back
+//! to the cache of the thread that runs it before the closure runs. A closure no cell holds is
+//! a build error (`Placed::CLASS`), never a box. A group's injector is a list through the
+//! jobs' own headers behind a lock (Tokio's inject queue), so queueing a job adds no node.
 
 use std::{
     any::Any,
-    cell::Cell,
+    cell::{Cell, RefCell},
     io,
     marker::PhantomData,
+    mem::MaybeUninit,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     ptr::{self, NonNull},
     sync::Arc,
 };
 
+use blaze_mem::{Cache, MemError, Pool as CellPool, Pooled, Tag};
 use blaze_radix as radix;
-use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_deque::{Steal, Stealer, Worker};
 
 use crate::{
     pump::{Lock, PUMP_DEPTH, SPINS, depth, run_task},
@@ -76,27 +85,157 @@ const _: () = assert!(size_of::<Job>() == 8);
 // a scheduler's run, whose fields are `Send`), and is run once, by the thread that takes it.
 unsafe impl Send for Job {}
 
-/// The first field of every job: the function that runs it, given the job.
+/// The first field of every job: the function that runs it, given the job, and its link in
+/// the [`Inject`] queue it waits in. 16 bytes.
 #[repr(C)]
 pub(crate) struct Header {
     run: unsafe fn(NonNull<Header>),
+    /// The job after this one in its group's [`Inject`] list: read and written only under the
+    /// list's lock, while the job waits there.
+    next: AtomicPtr<Header>,
 }
+
+#[cfg(not(blaze_check))]
+const _: () = assert!(size_of::<Header>() == 16);
 
 impl Header {
     pub(crate) const fn new(run: unsafe fn(NonNull<Header>)) -> Header {
-        Header { run }
+        Header { run, next: AtomicPtr::new(ptr::null_mut()) }
     }
 }
 
+/// A job's cell: `N` bytes, 64-byte aligned, holding a [`Placed`].
+#[repr(C, align(64))]
+struct JobCell<const N: usize>(MaybeUninit<[u8; N]>);
+
+impl<const N: usize> JobCell<N> {
+    const EMPTY: JobCell<N> = JobCell(MaybeUninit::uninit());
+}
+
+type Small = JobCell<128>;
+type Medium = JobCell<512>;
+type Large = JobCell<2048>;
+
+/// The most cells of each size live at once, each a job submitted and not yet run: far past
+/// what a process queues. Past it a submit stops, naming the pool ([`MemError::Exhausted`]).
+const SMALL_CELLS: u32 = 1 << 22;
+const MEDIUM_CELLS: u32 = 1 << 18;
+const LARGE_CELLS: u32 = 1 << 16;
+
+/// The cells of every pool of the process: a job may be run by another pool's worker that
+/// pumps it, so they are not one pool's.
+struct Cells {
+    small: CellPool<Small>,
+    medium: CellPool<Medium>,
+    large: CellPool<Large>,
+}
+
+impl Cells {
+    fn new() -> Result<Cells, MemError> {
+        Ok(Cells {
+            small: CellPool::new(SMALL_CELLS, Tag::Plane)?,
+            medium: CellPool::new(MEDIUM_CELLS, Tag::Plane)?,
+            large: CellPool::new(LARGE_CELLS, Tag::Plane)?,
+        })
+    }
+}
+
+/// Reserved by the first [`Pool::new`], which says why it could not be, or by the first job
+/// given with no pool made. Under `blaze_check` a set `static` cell stays set across
+/// executions; the pools' atomics start each execution afresh, and so do the model threads'
+/// caches, so no execution sees another's cells.
+static CELLS: OnceLock<Cells> = OnceLock::new();
+
+fn cells() -> &'static Cells {
+    CELLS.get_or_init(|| Cells::new().unwrap_or_else(|why| panic!("the pool's job cells: {why}")))
+}
+
+/// A thread's caches into [`CELLS`], made on its first job; dropped with the thread, which
+/// gives back the cells they hold.
+struct Caches {
+    small: Cache<'static, Small>,
+    medium: Cache<'static, Medium>,
+    large: Cache<'static, Large>,
+}
+
+impl Caches {
+    fn new() -> Caches {
+        let cells = cells();
+        Caches {
+            small: cells.small.cache(),
+            medium: cells.medium.cache(),
+            large: cells.large.cache(),
+        }
+    }
+}
+
+thread_local! {
+    static CACHES: RefCell<Option<Caches>> = const { RefCell::new(None) };
+}
+
+/// A cell of a job, owned by the job it holds.
+enum Room {
+    Small(Pooled<'static, Small>),
+    Medium(Pooled<'static, Medium>),
+    Large(Pooled<'static, Large>),
+}
+
+/// A job in its cell.
 #[repr(C)]
-struct Boxed<F> {
+struct Placed<F> {
     header: Header,
+    cell: Room,
     f: F,
 }
 
+impl<F> Placed<F> {
+    /// The smallest cell that holds a job of `F` (0, 1 or 2): evaluated as `F` is compiled, so
+    /// a closure no cell holds fails the build.
+    const CLASS: usize = {
+        let (size, align) = (size_of::<Placed<F>>(), align_of::<Placed<F>>());
+        assert!(
+            align <= align_of::<Small>(),
+            "a job's closure is aligned past 64 bytes: no job cell holds it"
+        );
+        if size <= size_of::<Small>() {
+            0
+        } else if size <= size_of::<Medium>() {
+            1
+        } else if size <= size_of::<Large>() {
+            2
+        } else {
+            panic!("a job's closure is past 2 KiB with its header: no job cell holds it; capture less")
+        }
+    };
+}
+
+/// A cell of `cache`'s pool, and where its room begins.
+fn take_cell<const N: usize>(
+    cache: &mut Cache<'static, JobCell<N>>,
+    room: fn(Pooled<'static, JobCell<N>>) -> Room,
+) -> (Room, NonNull<u8>) {
+    let mut cell = cache.alloc(JobCell::EMPTY);
+    let at = NonNull::from(&mut *cell).cast::<u8>();
+    (room(cell), at)
+}
+
+/// Gives `cell` back to this thread's cache, its job's closure already read out of it. A
+/// thread whose locals are gone drops it, which gives it to its pool's strays.
+fn give_back(cell: Room) {
+    _ = CACHES.try_with(move |caches| {
+        let mut caches = caches.borrow_mut();
+        let caches = caches.get_or_insert_with(Caches::new);
+        match cell {
+            Room::Small(cell) => caches.small.recycle(cell),
+            Room::Medium(cell) => caches.medium.recycle(cell),
+            Room::Large(cell) => caches.large.recycle(cell),
+        }
+    });
+}
+
 impl Job {
-    /// `f` on the heap, freed as it runs.
-    fn boxed<F: FnOnce() + Send + 'static>(f: F) -> Job {
+    /// `f` in a cell, given back as it runs.
+    fn new<F: FnOnce() + Send + 'static>(f: F) -> Job {
         // SAFETY: `f` borrows nothing.
         unsafe { Job::erase(f) }
     }
@@ -107,16 +246,33 @@ impl Job {
     unsafe fn erase<F: FnOnce() + Send>(f: F) -> Job {
         /// # Safety
         ///
-        /// `header` is the header of the `Boxed<F>` that `erase` leaked, and this is its one
-        /// run (it frees the box).
+        /// `header` is the header of the `Placed<F>` that `erase` wrote into its cell, and
+        /// this is its one run (it gives the cell back).
         unsafe fn run<F: FnOnce()>(header: NonNull<Header>) {
-            // SAFETY: `header` is the first field of the `Boxed<F>` that `erase` leaked, run once.
-            let boxed = unsafe { Box::from_raw(header.cast::<Boxed<F>>().as_ptr()) };
-            let Boxed { f, .. } = *boxed;
+            let at = header.cast::<Placed<F>>().as_ptr();
+            // SAFETY: `at` is the live `Placed<F>` that `erase` wrote, run once: its cell and
+            // closure are each read out once, and the rest of it needs no drop.
+            let (cell, f) = unsafe { ((&raw const (*at).cell).read(), (&raw const (*at).f).read()) };
+            give_back(cell);
             f();
         }
-        let boxed = Box::leak(Box::new(Boxed { header: Header::new(run::<F>), f }));
-        Job(NonNull::from(boxed).cast())
+        let class = const { Placed::<F>::CLASS };
+        let header = Header::new(run::<F>);
+        CACHES.with(move |caches| {
+            let mut caches = caches.borrow_mut();
+            let caches = caches.get_or_insert_with(Caches::new);
+            let (cell, at) = match class {
+                0 => take_cell(&mut caches.small, Room::Small),
+                1 => take_cell(&mut caches.medium, Room::Medium),
+                _ => take_cell(&mut caches.large, Room::Large),
+            };
+            let at = at.cast::<Placed<F>>();
+            // SAFETY: the cell is this job's alone, committed, 64-byte aligned and at least
+            // `size_of::<Placed<F>>()` bytes (`CLASS` chose its size), and holds nothing that
+            // needs a drop.
+            unsafe { at.write(Placed { header, cell, f }) };
+            Job(at.cast())
+        })
     }
 
     /// # Safety
@@ -128,9 +284,9 @@ impl Job {
     }
 
     fn run(self) {
-        // SAFETY: `self.0` points at the live `Header` of a job not yet run (`erase` leaked it,
-        // or `from_header`'s caller keeps it until it has run), and running moves the `Job`, so
-        // no other `Job` names it; if not, this reads freed memory.
+        // SAFETY: `self.0` points at the live `Header` of a job not yet run (in the cell `erase`
+        // took, or kept by `from_header`'s caller until it has run), and running moves the
+        // `Job`, so no other `Job` names it; if not, this reads a cell given back.
         let run = unsafe { self.0.as_ref().run };
         // SAFETY: `run` is the function made for this header's job (`erase`'s, or the one its
         // `from_header` caller put there), called once, as its own `# Safety` asks.
@@ -138,10 +294,91 @@ impl Job {
     }
 }
 
-/// A group's own: 128-byte aligned, as its injector's ends are.
+/// A group's queue of the jobs given to it but not to a worker's own: a list through each
+/// job's [`Header::next`] behind a lock, its length readable without it (Tokio's inject
+/// queue). The jobs are its nodes, so a push allocates nothing, where a queue of blocks makes
+/// one every few dozen.
+struct Inject {
+    len: AtomicUsize,
+    list: Lock<List>,
+}
+
+/// Oldest first; both null when empty.
+struct List {
+    head: *mut Header,
+    tail: *mut Header,
+}
+
+// SAFETY: the list's nodes are `Job`s, which may move to another thread, and it is reached only
+// under `Inject::list`'s lock.
+unsafe impl Send for List {}
+
+impl Inject {
+    fn new() -> Inject {
+        let list = List { head: ptr::null_mut(), tail: ptr::null_mut() };
+        Inject { len: AtomicUsize::new(0), list: Lock::new(list) }
+    }
+
+    /// Jobs queued, as last seen: for placing a job, not for deciding there is none.
+    fn len(&self) -> usize {
+        self.len.load(Ordering::Relaxed)
+    }
+
+    /// Whether no job is queued, ordered with a push as a submit's `announce` and a sleeper's
+    /// look are.
+    fn is_empty(&self) -> bool {
+        self.len.load(Ordering::SeqCst) == 0
+    }
+
+    fn push(&self, job: Job) {
+        let at = job.0.as_ptr();
+        // SAFETY: the job's header lives until it has run, and from here until a worker takes
+        // it back out this queue is the one place that names it.
+        unsafe { (*at).next.store(ptr::null_mut(), Ordering::Relaxed) };
+        let mut list = self.list.lock();
+        match NonNull::new(list.tail) {
+            // SAFETY: the tail is a job of this list, alive until it is taken out, under this
+            // lock.
+            Some(tail) => unsafe { tail.as_ref() }.next.store(at, Ordering::Relaxed),
+            None => list.head = at,
+        }
+        list.tail = at;
+        self.len.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Up to [`BATCH`] jobs, oldest first: the first to run now, the rest to `deque`.
+    fn steal_into(&self, deque: &Worker<Job>) -> Option<Job> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut taken: [Option<NonNull<Header>>; BATCH] = [None; BATCH];
+        {
+            let mut list = self.list.lock();
+            let mut count = 0;
+            for slot in &mut taken {
+                let Some(head) = NonNull::new(list.head) else { break };
+                // SAFETY: as in `push`: the head is a job of this list, under its lock.
+                list.head = unsafe { head.as_ref() }.next.load(Ordering::Relaxed);
+                *slot = Some(head);
+                count += 1;
+            }
+            if list.head.is_null() {
+                list.tail = ptr::null_mut();
+            }
+            self.len.fetch_sub(count, Ordering::SeqCst);
+        }
+        let [first, rest @ ..] = taken;
+        for job in rest.into_iter().flatten() {
+            deque.push(Job(job));
+        }
+        first.map(Job)
+    }
+}
+
+/// A group's own: 128-byte aligned, since every submitter writes its queue's lock and length.
 #[repr(align(128))]
 struct Group {
-    injector: Injector<Job>,
+    inject: Inject,
     workers: Box<[u32]>,
     order: Box<[u32]>,
     fast: bool,
@@ -183,6 +420,7 @@ struct Shared {
     /// Of fast and slow groups both: only then does a job's being critical place it.
     mixed: bool,
     /// The first panic of a job's `done`, raised when the pool is dropped.
+    // dyn: a panic's payload, as `catch_unwind` gives it
     stray: Lock<Option<Box<dyn Any + Send>>>,
     #[cfg(test)]
     critical: AtomicUsize,
@@ -238,7 +476,16 @@ impl Pool {
         if topology.cpus.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a worker pool of no CPU"));
         }
+        if CELLS.get().is_none() {
+            let made = Cells::new().map_err(|why| {
+                // alloc: the error of a pool not made, once
+                io::Error::new(io::ErrorKind::OutOfMemory, format!("the pool's job cells: {why}"))
+            })?;
+            // Another pool made them first: these are unreserved as they drop.
+            _ = CELLS.set(made);
+        }
         let count = topology.groups() as usize;
+        // alloc: here and below, the pool's own tables, made once with it
         let mut members: Vec<Vec<u32>> = vec![Vec::new(); count];
         for (index, cpu) in topology.cpus.iter().enumerate() {
             let index = u32::try_from(index).map_err(|_| {
@@ -249,9 +496,11 @@ impl Pool {
         if let Some(empty) = members.iter().position(Vec::is_empty) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
+                // alloc: the error of a pool not made, once
                 format!("group {empty} of the topology has no CPU: groups are numbered densely"),
             ));
         }
+        // alloc: made once with the pool
         let deques: Vec<Worker<Job>> = topology.cpus.iter().map(|_| Worker::new_fifo()).collect();
         let slots = deques
             .iter()
@@ -263,12 +512,13 @@ impl Pool {
                 group: cpu.group,
                 thread: OnceLock::new(),
             })
+            // alloc: made once with the pool
             .collect();
         let groups = members
             .into_iter()
             .enumerate()
             .map(|(at, workers)| Group {
-                injector: Injector::new(),
+                inject: Inject::new(),
                 fast: workers.iter().any(|&it| topology.cpus[it as usize].fast),
                 order: topology.steal_order(at as u32).into_boxed_slice(),
                 workers: workers.into_boxed_slice(),
@@ -276,6 +526,7 @@ impl Pool {
             })
             .collect::<Box<[Group]>>();
         let mixed = groups.iter().any(|it| it.fast) && groups.iter().any(|it| !it.fast);
+        // alloc: made once with the pool
         let shared = Arc::new(Shared {
             groups,
             slots,
@@ -329,6 +580,7 @@ impl Pool {
                 Err(_) => break,
             }
         }
+        // clone: the pool keeps the topology it was made of, once
         let pool = Pool { shared, threads, topology: topology.clone() };
         match failed {
             Some(why) => {
@@ -367,7 +619,7 @@ impl Pool {
         run: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
-        self.shared.push(near, Job::boxed(move || done(catch_unwind(AssertUnwindSafe(run)))));
+        self.shared.push(near, Job::new(move || done(catch_unwind(AssertUnwindSafe(run)))));
     }
 
     /// As [`Pool::submit`], but called on one of this pool's workers the job runs next on it
@@ -377,7 +629,7 @@ impl Pool {
         run: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
-        let job = Job::boxed(move || done(catch_unwind(AssertUnwindSafe(run))));
+        let job = Job::new(move || done(catch_unwind(AssertUnwindSafe(run))));
         if let Some(job) = push_next(&self.shared, None, job) {
             self.shared.push(None, job);
         }
@@ -392,7 +644,7 @@ impl Pool {
         run: impl FnOnce() -> R + Send + 'static,
         done: impl FnOnce(thread::Result<R>) + Send + 'static,
     ) {
-        self.push_placed(near, true, Job::boxed(move || done(catch_unwind(AssertUnwindSafe(run)))));
+        self.push_placed(near, true, Job::new(move || done(catch_unwind(AssertUnwindSafe(run)))));
     }
 
     /// `job` near `near`, placed as [`Pool::submit_critical`] places a job when `critical`,
@@ -450,7 +702,9 @@ fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
 
 /// `job(0..jobs)` as jobs of a scope on `shared`'s pool; the first panic of one is raised once
 /// all have run.
+// dyn: `radix::Workers`'s signature: a sort's pass, one call per job
 fn run_jobs(shared: &Shared, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+    // dyn: a panic's payload, as `catch_unwind` gives it
     let failed: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
     scope_in(shared, |scope| {
         for at in 0..jobs {
@@ -473,6 +727,7 @@ unsafe impl radix::Workers for Pool {
         self.workers()
     }
 
+    // dyn: the trait's signature, as for `run_jobs`
     fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
         run_jobs(&self.shared, jobs, job);
     }
@@ -487,12 +742,14 @@ unsafe impl radix::Workers for Here<'_> {
         self.0.slots.len()
     }
 
+    // dyn: the trait's signature, as for `run_jobs`
     fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
         run_jobs(self.0, jobs, job);
     }
 }
 
 /// [`radix::Ambient`]: the pool this thread is a worker of.
+// dyn: `radix::Ambient`'s signature, called once per parallel sort
 fn ambient(with: &mut dyn FnMut(&dyn radix::Workers)) -> bool {
     with_local(|local| with(&Here(&*local.shared))).is_some()
 }
@@ -558,6 +815,7 @@ impl Drop for Left {
         // here, and does nothing with `Pending` after.
         let pending = unsafe { &*self.0 };
         if pending.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // clone: a reference count, so the owner is woken after `Pending` may be gone
             let owner = pending.owner.clone();
             pending.finished.store(true, Ordering::Release);
             owner.unpark();
@@ -628,7 +886,7 @@ impl Shared {
     }
 
     fn push_to(&self, group: usize, job: Job) {
-        self.groups[group].injector.push(job);
+        self.groups[group].inject.push(job);
         self.announce(group);
     }
 
@@ -663,7 +921,7 @@ impl Shared {
             let group = &self.groups[at];
             let workers = group.workers.len() as u64;
             let asleep = u64::from(group.sleepers.load(Ordering::Relaxed)).min(workers);
-            (group.injector.len() as u64 + workers - asleep, workers, group.fast)
+            (group.inject.len() as u64 + workers - asleep, workers, group.fast)
         })
     }
 
@@ -695,7 +953,7 @@ impl Shared {
     }
 
     fn any_work(&self) -> bool {
-        self.groups.iter().any(|it| !it.injector.is_empty())
+        self.groups.iter().any(|it| !it.inject.is_empty())
             || self
                 .slots
                 .iter()
@@ -767,10 +1025,8 @@ impl Local {
             let mut retry = false;
             for &at in shared.groups[self.group].order.iter() {
                 let group = &shared.groups[at as usize];
-                match group.injector.steal_batch_with_limit_and_pop(&self.deque, BATCH) {
-                    Steal::Success(job) => return Some(job),
-                    Steal::Retry => retry = true,
-                    Steal::Empty => {}
+                if let Some(job) = group.inject.steal_into(&self.deque) {
+                    return Some(job);
                 }
                 let count = group.workers.len();
                 let start = self.random() as usize % count;
@@ -846,7 +1102,7 @@ impl Local {
 
     /// Parks until woken, unless `ended` or there is work: a job queued after this says it
     /// sleeps wakes it. Whether it was woken to search, as its waker counted it.
-    fn sleep(&self, ended: &dyn Fn() -> bool) -> bool {
+    fn sleep(&self, ended: &impl Fn() -> bool) -> bool {
         let shared = &*self.shared;
         let (slot, group) = (&shared.slots[self.index], &shared.groups[self.group]);
         slot.sleeping.store(true, Ordering::SeqCst);
@@ -911,7 +1167,7 @@ pub(crate) fn run_one() -> bool {
 
 /// Parks this thread until it is unparked, unless `ended` says not to. A worker that
 /// `take_jobs` is woken by a job as a parked worker is, and runs what it finds.
-pub(crate) fn park(ended: &dyn Fn() -> bool, take_jobs: bool) {
+pub(crate) fn park(ended: &impl Fn() -> bool, take_jobs: bool) {
     let slept = take_jobs
         && with_local(|local| {
             if local.sleep(ended)
@@ -944,6 +1200,7 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
         Ok(())
     } else {
         let why = io::Error::from_raw_os_error(got);
+        // alloc: the error of a worker not bound, once
         Err(io::Error::new(why.kind(), format!("the QoS class of the worker of CPU {}: {why}", cpu.id)))
     }
 }
@@ -952,6 +1209,7 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
 fn bind_to(cpu: &Cpu) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
+        // alloc: the error of a worker not bound, once
         format!("binding the worker of CPU {} to it: not on this OS", cpu.id),
     ))
 }
@@ -967,9 +1225,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use blaze_alloc_count::measure;
+    use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::{bounded, unbounded};
 
-    use super::{Group, Job, Pending, Pool, Slot, group, searching, sleeping};
+    use super::{Group, Header, Job, Pending, Placed, Pool, Slot, group, searching, sleeping};
     use crate::{
         pump::PUMP_DEPTH,
         topology::{Cpu, Topology},
@@ -999,6 +1259,145 @@ mod tests {
         assert_eq!(align_of::<Group>(), 128);
         assert_eq!(align_of::<Pending>(), 128);
         assert_eq!(size_of::<Job>(), 8);
+        assert_eq!(size_of::<Header>(), 16);
+    }
+
+    /// The words of a closure's capture, and what the closure makes of them.
+    fn closure<const N: usize>(fill: u64, dropped: Dropped) -> impl FnOnce() -> u64 + Send + 'static {
+        let mut words = [0u64; N];
+        for (at, it) in words.iter_mut().enumerate() {
+            *it = fill.wrapping_mul(at as u64 + 1);
+        }
+        move || {
+            let _dropped = dropped;
+            words.iter().fold(0u64, |sum, &it| sum.rotate_left(5) ^ it)
+        }
+    }
+
+    /// Counts its drop.
+    struct Dropped(Arc<AtomicUsize>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn class<F>(_: &F) -> usize {
+        Placed::<F>::CLASS
+    }
+
+    /// A job takes the smallest cell its closure fits, its header and cell's handle with it.
+    #[test]
+    fn a_job_takes_the_smallest_cell_that_holds_it() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let small = closure::<2>(1, Dropped(drops.clone()));
+        let medium = closure::<40>(1, Dropped(drops.clone()));
+        let large = closure::<200>(1, Dropped(drops.clone()));
+        assert_eq!((class(&small), class(&medium), class(&large)), (0, 1, 2));
+        assert_eq!(class(&|| ()), 0);
+        let largest = [0u8; 2048 - size_of::<Placed<()>>()];
+        assert_eq!((size_of::<Placed<[u8; 2048 - size_of::<Placed<()>>()]>>(), class(&largest)), (2048, 2));
+    }
+
+    /// Jobs of every cell size, against the same closures boxed and called in place: each runs
+    /// once with what it captured intact, gives what the boxed one gives, and drops its
+    /// capture once.
+    #[test]
+    fn a_job_in_a_cell_runs_as_the_same_closure_boxed() {
+        fn one<const N: usize>(
+            pool: &Pool,
+            fill: u64,
+            drops: &Arc<AtomicUsize>,
+            tx: crossbeam_channel::Sender<(usize, u64)>,
+            job: usize,
+        ) -> u64 {
+            // dyn: the test's reference, the same closure boxed
+            let boxed: Box<dyn FnOnce() -> u64> = Box::new(closure::<N>(fill, Dropped(drops.clone())));
+            pool.submit(None, closure::<N>(fill, Dropped(drops.clone())), move |it| {
+                _ = tx.send((job, it.unwrap()));
+            });
+            boxed()
+        }
+        let pool = Pool::new(&groups_of(2, 2), false).unwrap();
+        for seed in 0..20u64 {
+            let mut rng = Rng::new(seed);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let (tx, rx) = unbounded::<(usize, u64)>();
+            let want: Vec<u64> = (0..300)
+                .map(|job| {
+                    let (fill, tx) = (rng.next_u64(), tx.clone());
+                    match rng.below(3) {
+                        0 => one::<2>(&pool, fill, &drops, tx, job),
+                        1 => one::<40>(&pool, fill, &drops, tx, job),
+                        _ => one::<200>(&pool, fill, &drops, tx, job),
+                    }
+                })
+                .collect();
+            let mut got = vec![None; want.len()];
+            for _ in 0..want.len() {
+                let (job, value) = rx.recv_timeout(LONG).unwrap();
+                assert!(got[job].replace(value).is_none(), "seed {seed}: job {job} ran twice");
+            }
+            let got: Vec<u64> = got.into_iter().map(Option::unwrap).collect();
+            assert_eq!(got, want, "seed {seed}");
+            until("every capture to drop", || drops.load(Ordering::SeqCst) == 2 * want.len());
+        }
+    }
+
+    /// On a warm worker, a scope of jobs submitted, run and waited for allocates nothing.
+    #[test]
+    fn a_warm_job_allocates_nothing() {
+        let pool = Arc::new(Pool::new(&Topology::flat(1), false).unwrap());
+        let (tx, rx) = bounded::<(u64, usize)>(1);
+        let inner = pool.clone();
+        pool.submit(
+            None,
+            move || {
+                let count = AtomicUsize::new(0);
+                let round = || {
+                    inner.scope(|scope| {
+                        for _ in 0..8 {
+                            scope.submit(None, || count.fetch_add(1, Ordering::Relaxed), |it| {
+                                it.unwrap();
+                            });
+                        }
+                    });
+                };
+                for _ in 0..4 {
+                    round();
+                }
+                let ((), used) = measure(round);
+                (used.allocations, count.load(Ordering::Relaxed))
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        assert_eq!(rx.recv_timeout(LONG).unwrap(), (0, 40), "allocations of a warm scope of 8 jobs");
+    }
+
+    /// From a thread of no pool, a warm submit allocates nothing: its cell comes from the
+    /// thread's cache and its queue's node is the job.
+    #[test]
+    fn a_warm_submit_from_outside_allocates_nothing() {
+        let pool = Pool::new(&Topology::flat(2), false).unwrap();
+        let (tx, rx) = bounded::<usize>(64);
+        let round = |senders: Vec<crossbeam_channel::Sender<usize>>| {
+            for (job, tx) in senders.into_iter().enumerate() {
+                pool.submit(None, move || job, move |it| _ = tx.send(it.unwrap()));
+            }
+        };
+        for _ in 0..8 {
+            round((0..64).map(|_| tx.clone()).collect());
+            for _ in 0..64 {
+                rx.recv_timeout(LONG).unwrap();
+            }
+        }
+        let senders = (0..64).map(|_| tx.clone()).collect();
+        let ((), used) = measure(|| round(senders));
+        assert_eq!(used.allocations, 0, "a warm submit of 64 jobs: {used:?}");
+        let mut seen: Vec<usize> = (0..64).map(|_| rx.recv_timeout(LONG).unwrap()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..64).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1236,23 +1635,6 @@ mod tests {
         assert_eq!(asleep, 6);
     }
 
-    /// SplitMix64, as `blaze-core`'s `sim::Rng`.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            if n == 0 { 0 } else { self.next() % n }
-        }
-    }
-
     #[derive(Clone, Copy)]
     enum How {
         Submit(Option<u32>),
@@ -1296,7 +1678,7 @@ mod tests {
     #[test]
     fn a_seeded_stress_runs_every_job_of_the_model_once() {
         for seed in 0..10u64 {
-            let mut rng = Rng(seed);
+            let mut rng = Rng::new(seed);
             let (count, each) = (1 + rng.below(3) as u32, 1 + rng.below(3) as u32);
             let mut children: Vec<Vec<(How, usize)>> = vec![Vec::new()];
             let mut scoping = 0;
@@ -1351,7 +1733,7 @@ mod tests {
     /// fast, index), over seeded loads, of every group or the fast ones alone.
     #[test]
     fn the_least_loaded_group_is_the_models() {
-        let mut rng = Rng(7);
+        let mut rng = Rng::new(7);
         for _ in 0..2000 {
             let count = 1 + rng.below(6) as usize;
             let groups: Vec<(u64, u64, bool)> = (0..count)
@@ -1455,7 +1837,7 @@ mod tests {
     fn a_large_radix_sort_runs_on_the_pool() {
         use blaze_radix as radix;
         fn input() -> (Vec<(u64, u32)>, Vec<(u64, u32)>) {
-            let mut rng = Rng(11);
+            let mut rng = Rng::new(11);
             let pairs: Vec<(u64, u32)> =
                 (0..radix::PARALLEL as u32 + 7).map(|at| (rng.below(1000) << 20, at)).collect();
             let mut want = pairs.clone();
@@ -1498,9 +1880,9 @@ mod tests {
 /// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-graph --release
 /// model_`), against a bag of jobs (each runs once, after it was given, and none is left):
 /// pools built by hand, without `Pool::new`'s start-up channel and binding, which the checker
-/// does not see, their workers model threads in the real [`work`] loop. The queues themselves
-/// are crossbeam's, atomic to the checker; what is checked is this module's slots, counts and
-/// parking around them.
+/// does not see, their workers model threads in the real [`work`] loop. The deques are
+/// crossbeam's, atomic to the checker; what is checked is this module's slots, counts, inject
+/// lists, job cells and parking around them.
 #[cfg(all(test, blaze_check))]
 mod model {
     use std::{cell::Cell, ptr, sync::Arc};
@@ -1509,9 +1891,9 @@ mod model {
         linear::{History, Spec},
         model,
     };
-    use crossbeam_deque::{Injector, Worker};
+    use crossbeam_deque::Worker;
 
-    use super::{Group, Idle, Job, Local, Pool, Shared, Slot, scope_in, searching, sleeping, work};
+    use super::{Group, Idle, Inject, Job, Local, Pool, Shared, Slot, scope_in, searching, sleeping, work};
     use crate::{
         pump::Lock,
         sync::{
@@ -1571,7 +1953,7 @@ mod model {
             })
             .collect();
         let group = Group {
-            injector: Injector::new(),
+            inject: Inject::new(),
             workers: (0..workers as u32).collect(),
             order: Topology::flat(workers).steal_order(0).into_boxed_slice(),
             fast: true,
@@ -1612,7 +1994,7 @@ mod model {
 
     fn job(history: &Arc<History<Bag>>, id: u8) -> Job {
         let history = history.clone();
-        Job::boxed(move || {
+        Job::new(move || {
             history.record(Op::Ran(id), |_| true);
         })
     }

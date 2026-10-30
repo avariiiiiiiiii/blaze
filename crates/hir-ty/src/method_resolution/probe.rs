@@ -12,6 +12,7 @@ use hir_def::{
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
 };
 use hir_expand::name::Name;
+use intern::Symbol;
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashSet;
 use rustc_type_ir::{
@@ -193,6 +194,10 @@ pub struct Pick<'db> {
 
     /// Candidates that were shadowed by supertraits.
     pub shadowed_candidates: Vec<CandidateId>,
+
+    /// The candidates the stable-only search set aside before this pick, each behind a feature
+    /// this crate did not enable: rustc's `unstable_candidates`.
+    pub unstable_candidates: Vec<(CandidateId, Symbol)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,6 +298,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                 private_candidate: None,
                 item_name,
                 stable_only: false,
+                unstable_candidates: RefCell::default(),
                 allow_unstable,
                 trait_items: TraitValueItems::default(),
             },
@@ -639,6 +645,8 @@ struct ProbeForNameChoice<'db> {
     /// Whether items behind a feature the crate did not enable are left out, which they are
     /// until no other item is found.
     stable_only: bool,
+    /// The items left out so far by the stable-only search, with their features.
+    unstable_candidates: RefCell<Vec<(CandidateId, Symbol)>>,
     /// Whether such items are as good as the others: the path was not written by the user.
     allow_unstable: bool,
     /// The items of `item_name` of the traits asked of so far.
@@ -671,15 +679,21 @@ impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
         self_ty: Ty<'db>,
         mut applicable_candidates: ApplicableCandidates<'_, 'db>,
     ) -> ControlFlow<Self::Choice> {
-        if this.choice.stable_only {
-            applicable_candidates.retain(|candidate| !this.is_denied_unstable(candidate.item));
-        }
-
         if applicable_candidates.len() > 1
             && let Some(pick) =
                 this.collapse_candidates_to_trait_pick(self_ty, &applicable_candidates)
         {
             return ControlFlow::Break(Ok(pick));
+        }
+
+        if this.choice.stable_only {
+            applicable_candidates.retain(|candidate| {
+                let Some(feature) = this.denied_unstable_feature(candidate.item) else {
+                    return true;
+                };
+                this.choice.unstable_candidates.borrow_mut().push((candidate.item, feature));
+                false
+            });
         }
 
         if applicable_candidates.len() > 1 {
@@ -699,7 +713,14 @@ impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
         }
 
         match applicable_candidates.pop() {
-            Some(probe) => ControlFlow::Break(Ok(probe.to_unadjusted_pick(self_ty))),
+            Some(probe) => {
+                let unstable_candidates = match this.choice.stable_only {
+                    // clone: rustc's pick takes the list found so far.
+                    true => this.choice.unstable_candidates.borrow().clone(),
+                    false => Vec::new(),
+                };
+                ControlFlow::Break(Ok(probe.to_unadjusted_pick(self_ty, unstable_candidates)))
+            }
             None => ControlFlow::Continue(()),
         }
     }
@@ -709,15 +730,20 @@ impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
         self_ty: Ty<'db>,
         instantiate_self_ty_obligations: &[PredicateObligation<'db>],
     ) {
-        if this.choice.private_candidate.is_none()
-            && let ControlFlow::Break(Ok(pick)) = this.consider_candidates(
+        if this.choice.private_candidate.is_none() {
+            // rustc's search of the private candidates neither leaves out nor records unstable
+            // ones.
+            let stable_only = std::mem::replace(&mut this.choice.stable_only, false);
+            let private = this.consider_candidates(
                 self_ty,
                 instantiate_self_ty_obligations,
                 &this.private_candidates,
                 None,
-            )
-        {
-            this.choice.private_candidate = Some(pick);
+            );
+            this.choice.stable_only = stable_only;
+            if let ControlFlow::Break(Ok(pick)) = private {
+                this.choice.private_candidate = Some(pick);
+            }
         }
     }
 
@@ -1246,12 +1272,13 @@ impl<'a, 'db> ProbeContext<'a, 'db, ProbeForNameChoice<'db>> {
         stable.or_else(|| self.pick_all_method().break_value())
     }
 
-    /// Whether using `item` needs a feature that its crate declares and this one did not enable.
-    fn is_denied_unstable(&self, item: CandidateId) -> bool {
+    /// The feature, declared by `item`'s crate, that using it needs and this crate did not
+    /// enable.
+    fn denied_unstable_feature(&self, item: CandidateId) -> Option<Symbol> {
         let db = self.db();
         let container = item.container(db);
         if container.krate(db) == self.ctx.resolver.krate() {
-            return false;
+            return None;
         }
         let owner = match item {
             CandidateId::FunctionId(id) => AttrDefId::from(id),
@@ -1266,7 +1293,7 @@ impl<'a, 'db> ProbeContext<'a, 'db, ProbeForNameChoice<'db>> {
             .into_iter()
             .flatten()
             .find_map(|owner| AttrFlags::query(db, owner).unstable_feature(db, owner))
-            .is_some_and(|feature| !self.ctx.features.is_enabled(&feature))
+            .filter(|feature| !self.ctx.features.is_enabled(feature))
     }
 
     /// Check for cases where arbitrary self types allows shadowing
@@ -1342,6 +1369,8 @@ impl<'a, 'db> ProbeContext<'a, 'db, ProbeForNameChoice<'db>> {
         // the shadowing, because the autoderef-based maths wouldn't line up.
         // This is a niche case and we can live without generating an error
         // in the case of such shadowing.
+        // rustc's shadow search records its unstable candidates in a list of its own.
+        let unstable_len = self.choice.unstable_candidates.get_mut().len();
         let potentially_shadowed_pick = self.pick_autorefd_method(
             step,
             self_ty,
@@ -1349,6 +1378,7 @@ impl<'a, 'db> ProbeContext<'a, 'db, ProbeForNameChoice<'db>> {
             mutbl,
             Some(&pick_constraints),
         );
+        self.choice.unstable_candidates.get_mut().truncate(unstable_len);
         // Look for actual pairs of shadower/shadowed which are
         // the sort of shadowing case we want to avoid. Specifically...
         if let ControlFlow::Break(Ok(possible_shadowed)) = &potentially_shadowed_pick {
@@ -2005,6 +2035,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
             self_ty,
             receiver_steps: None,
             shadowed_candidates: vec![],
+            unstable_candidates: vec![],
         })
     }
 
@@ -2087,6 +2118,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 .filter(|item| *item != child_candidate.item)
                 .collect(),
             receiver_steps: None,
+            unstable_candidates: vec![],
         })
     }
 
@@ -2199,7 +2231,11 @@ fn is_relevant_kind_for_mode(mode: Mode, kind: AssocItemId) -> Option<CandidateI
 }
 
 impl<'db> Candidate<'db> {
-    fn to_unadjusted_pick(&self, self_ty: Ty<'db>) -> Pick<'db> {
+    fn to_unadjusted_pick(
+        &self,
+        self_ty: Ty<'db>,
+        unstable_candidates: Vec<(CandidateId, Symbol)>,
+    ) -> Pick<'db> {
         Pick {
             item: self.item,
             kind: match self.kind {
@@ -2228,6 +2264,7 @@ impl<'db> Candidate<'db> {
                 _ => None,
             },
             shadowed_candidates: vec![],
+            unstable_candidates,
         }
     }
 }

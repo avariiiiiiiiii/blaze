@@ -33,33 +33,10 @@ pub(super) struct Bind<'a> {
     pub addend: i64,
 }
 
-pub(super) fn uleb(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
-pub(super) fn sleb(out: &mut Vec<u8>, mut value: i64) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
-        if done {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
+pub(super) use blaze_format::leb::{write_i64 as sleb, write_u64 as uleb};
 
 fn uleb_len(value: u64) -> u64 {
-    u64::from((64 - value.leading_zeros()).max(1).div_ceil(7))
+    blaze_format::leb::len_u64(value) as u64
 }
 
 /// The most bytes the four tables take together: `rebases` pointers to slide, `binds`,

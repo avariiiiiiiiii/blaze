@@ -15,15 +15,14 @@
 use std::{borrow::Cow, ptr, sync::Arc};
 
 use blaze_core::{FileName, Mapping};
-use blaze_format::SchemaHash;
+use blaze_format::{Aligned, SchemaHash};
 use blaze_ids::ContentId;
 use blaze_reclaim::Limbo;
-use rustc_hash::FxHashMap;
-
 use crate::{
-    ByHash, Columns, Corrupt, Entry, Heat, Key, Kind, Ticket, Use, cold, header_schema, location,
+    ByHash, Columns, Corrupt, Encodings, Entry, Heat, Key, Kind, Ticket, Use, cold, encodings_of,
+    location,
     disk::{self, Form, Loc, NO_DICTIONARY, RECORD_HEADER, RecordHeader, SCHEMA_PREFIX, content_of},
-    flags::{Bits, Flag, Row},
+    flags::{Flag, FlagColumns, Row},
     index,
     segment::{ChunkRef, Segment},
     table::{Held, Keyed, Table},
@@ -131,7 +130,7 @@ impl Drop for Shared {
 /// The store as readers see it: immutable once published.
 pub(crate) struct View {
     pub(crate) tiers: Vec<TierView>,
-    pub(crate) columns: Arc<FxHashMap<SchemaHash, Arc<dyn Columns>>>,
+    pub(crate) columns: Arc<Encodings>,
 }
 
 pub(crate) struct TierView {
@@ -169,13 +168,13 @@ pub(crate) struct ExternalView {
 pub(crate) struct Index {
     pub(crate) mapping: Mapping,
     shape: index::Shape,
-    pub(crate) bits: Bits,
+    pub(crate) bits: FlagColumns,
 }
 
 impl Index {
     pub(crate) fn new(mapping: Mapping) -> Result<Index, &'static str> {
         let table = index::Table::new(mapping.bytes())?;
-        let (shape, bits) = (table.shape(), Bits::new(table.slots()));
+        let (shape, bits) = (table.shape(), FlagColumns::new(table.slots()));
         Ok(Index { mapping, shape, bits })
     }
 
@@ -452,8 +451,8 @@ impl<'a> Look<'a> {
         out
     }
 
-    pub(crate) fn columns_of(self, bytes: &[u8]) -> Option<&'a Arc<dyn Columns>> {
-        self.view().columns.get(&header_schema(bytes)?)
+    pub(crate) fn columns_of(self, bytes: &[u8]) -> Option<&'a Columns> {
+        encodings_of(&self.view().columns, bytes)
     }
 
     /// The newest dictionary of `kind` the own tier holds, by number.
@@ -464,7 +463,7 @@ impl<'a> Look<'a> {
     }
 
     /// The encodings named by a columns payload, and the encoded bytes after the name.
-    fn columns_in<'p>(self, payload: &'p [u8]) -> Result<(&'a dyn Columns, &'p [u8]), String> {
+    fn columns_in<'p>(self, payload: &'p [u8]) -> Result<(&'a Columns, &'p [u8]), String> {
         let Some((schema, rest)) = payload.split_at_checked(SCHEMA_PREFIX) else {
             return Err("its payload is shorter than the schema it starts with".into());
         };
@@ -717,5 +716,103 @@ impl<'a> Look<'a> {
 
     pub(crate) fn has(self, key: &Key) -> bool {
         self.find(key).is_some()
+    }
+
+    /// The value of `key`, verified as [`Look::get`] verifies it, held past the task: the bytes
+    /// of its record in place when they are a whole raw record of a mapped pack or a file of
+    /// its own at a 16-byte boundary, else one aligned copy of the value made whole.
+    pub(crate) fn pinned(self, key: &Key) -> Result<Option<Pinned>, Corrupt> {
+        let Some(found) = self.find(key) else { return Ok(None) };
+        let found = found?;
+        let entry = self.read(found, key)?;
+        let bytes = match self.mapping_holding(found, &entry) {
+            Some((mapping, start)) => PinnedBytes::Mapped { mapping, start, len: entry.bytes.len() },
+            None => PinnedBytes::Copied(Arc::new(Aligned::copy_from(entry.bytes))),
+        };
+        Ok(Some(Pinned { key: entry.key, kind: entry.kind, content: entry.content, bytes }))
+    }
+
+    /// The mapping `entry`'s bytes are a range of, and where in it they start, when they are
+    /// one and start at a multiple of [`disk::ALIGN`]: a raw record of a pack, or a file of its
+    /// own. A value made whole (decompressed, from chunks or columns) or still in a writer's
+    /// segment is in none.
+    fn mapping_holding(self, found: Found<'a>, entry: &Entry<'a>) -> Option<(Mapping, usize)> {
+        let Place::Pack(loc) = found.place else { return None };
+        if entry.bytes.is_empty() || !(entry.bytes.as_ptr() as usize).is_multiple_of(disk::ALIGN as usize) {
+            return None;
+        }
+        let of = |view: &'a View| -> Option<&'a Mapping> {
+            let tier = view.tiers.get(found.tier)?;
+            match loc.form {
+                Form::Raw => tier.packs.get(loc.pack as usize)?.mapping.as_ref(),
+                Form::External => tier.externals.get(&entry.content)?.mapping.as_ref(),
+                _ => None,
+            }
+        };
+        [of(found.view), of(self.view())].into_iter().flatten().find_map(|mapping| {
+            let held = mapping.bytes().as_ptr_range();
+            let (start, end) = (entry.bytes.as_ptr(), entry.bytes.as_ptr_range().end);
+            (held.start <= start && end <= held.end)
+                // clone: a count of the mapping, which keeps the file mapped while the value is held
+                .then(|| (mapping.clone(), start as usize - held.start as usize))
+        })
+    }
+}
+
+/// A value of the store held past the task it was read in: [`crate::Reader::pinned`].
+///
+/// Its bytes start at a multiple of 16 and stay as they are while it lives: a range of its
+/// pack's or file's mapping, which a clone of the [`Mapping`] keeps mapped (the store replaces a
+/// file only by renaming another over it), or an aligned copy of a value that had to be made
+/// whole. Verified against the content hash it was put with before it was made.
+#[derive(Clone)]
+pub struct Pinned {
+    pub key: Key,
+    pub kind: Kind,
+    /// The BLAKE3 hash of the value's bytes as they were put, checked.
+    pub content: ContentId,
+    bytes: PinnedBytes,
+}
+
+#[derive(Clone)]
+enum PinnedBytes {
+    Mapped { mapping: Mapping, start: usize, len: usize },
+    Copied(Arc<Aligned>),
+}
+
+impl Pinned {
+    /// Whether its bytes are the store's own, in place, rather than a copy.
+    pub fn in_place(&self) -> bool {
+        matches!(self.bytes, PinnedBytes::Mapped { .. })
+    }
+}
+
+impl std::ops::Deref for Pinned {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match &self.bytes {
+            PinnedBytes::Mapped { mapping, start, len } => &mapping.bytes()[*start..*start + *len],
+            PinnedBytes::Copied(bytes) => bytes,
+        }
+    }
+}
+
+impl AsRef<[u8]> for Pinned {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl std::fmt::Debug for Pinned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pinned")
+            .field("key", &self.key)
+            .field("kind", &self.kind)
+            .field("len", &self.len())
+            .field("in_place", &self.in_place())
+            .finish()
     }
 }

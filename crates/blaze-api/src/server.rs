@@ -51,8 +51,10 @@ const MOST_HELD: usize = LONGEST_REQUEST as usize + (1 << 20);
 const TAGS: u64 = 1 << 32;
 /// The most bytes [`Server::line`] keeps between chunks; a longer chunk's buffer is dropped.
 const KEPT_LINE: usize = 1 << 20;
+/// The room a connection's replies are first written into after a send took its queue: most
+/// bursts of replies fit, so they cost one allocation.
+const QUEUE: usize = 4 << 10;
 
-#[derive(Clone)]
 pub struct Http {
     pub at: SocketAddr,
     /// Bearer token every HTTP request must carry; never logged or echoed.
@@ -173,23 +175,26 @@ struct Answering {
 impl Server {
     /// Asks to listen on each address.
     pub fn new(config: Config, effects: &mut Vec<Effect>) -> Server {
+        // alloc: once per server, at start; each grows to its peak and is kept.
+        let (listeners, told, line) = (Vec::with_capacity(2), Vec::new(), Vec::new());
         let mut server = Server {
             tags: config.tags,
             next_tag: 0,
             token: None,
             most_connections: config.most_connections,
-            listeners: Vec::new(),
+            listeners,
             pending: FxHashMap::default(),
             conns: FxHashMap::default(),
             failed: None,
             stopped: false,
-            told: Vec::new(),
+            told,
             writer: cbor::Writer::new(),
-            line: Vec::new(),
+            line,
             #[cfg(unix)]
             passed: None,
         };
         if config.unix.is_none() && config.http.is_none() {
+            // alloc: error path, at start.
             server.fail("the API server was given no address to listen on".to_owned());
         }
         match config.unix {
@@ -203,6 +208,7 @@ impl Server {
         }
         if let Some(Http { at, token }) = config.http {
             match token.is_empty() {
+                // alloc: error path, at start.
                 true => server.fail(format!("the API's HTTP listener at {at} has an empty token")),
                 false => {
                     server.token = Some(token);
@@ -249,12 +255,13 @@ impl Server {
             return;
         }
         match reader {
-            Reader::Unix(_) => frame(&mut self.writer, queue, id, &reply.response),
+            Reader::Unix(_) => frame(&mut self.writer, room(queue), id, &reply.response),
             Reader::Http { answering, .. } => {
                 let Some(now) = *answering else { return };
                 if now.id != id {
                     return;
                 }
+                let queue = room(queue);
                 rendered(&mut self.writer, &mut self.line, queue, id, &reply.response, now.json);
                 if matches!(reply.response, Response::Done { .. }) {
                     queue.extend_from_slice(http::LAST_CHUNK);
@@ -275,6 +282,7 @@ impl Server {
                 effects.push(Effect::Unlisten { tag: listener.tag });
             }
         }
+        // alloc: once, as the server stops.
         let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
         radix::sort_copy_by_key(&mut conns, |it| it.0);
         for conn in conns {
@@ -301,6 +309,7 @@ impl Server {
     fn listen(&mut self, side: Side, at: Address, effects: &mut Vec<Effect>) {
         let tag = self.tag();
         self.pending.insert(tag, Pending::Listen(self.listeners.len()));
+        // clone: once per listener, at start; the listener keeps its address to name it.
         effects.push(Effect::Listen { at: at.clone(), tag });
         self.listeners.push(Listener { side, at, tag, listening: Listening::Yes });
     }
@@ -315,12 +324,16 @@ impl Server {
             Done::Failed(error) => {
                 self.listeners[at].listening = Listening::Ended;
                 let address = shown(&self.listeners[at].at);
-                self.fail(format!("listening on {address}: {error}"));
+                // alloc: error path, a listener that failed.
+                let what = format!("listening on {address}: {error}");
+                self.fail(what);
             }
             other => {
                 self.listeners[at].listening = Listening::Ended;
                 let address = shown(&self.listeners[at].at);
-                self.fail(format!("listening on {address}: the driver answered {other:?}"));
+                // alloc: error path, a listener that failed.
+                let what = format!("listening on {address}: the driver answered {other:?}");
+                self.fail(what);
             }
         }
     }
@@ -337,8 +350,9 @@ impl Server {
                 answering: None,
             },
         };
-        let connection =
-            Connection { reader, receiving: None, sending: None, queue: Vec::new(), closing: false };
+        // alloc: none until a reply is queued; once per connection.
+        let queue = Vec::new();
+        let connection = Connection { reader, receiving: None, sending: None, queue, closing: false };
         self.conns.insert(conn, connection);
         self.receive(conn, effects);
     }
@@ -468,8 +482,8 @@ impl Server {
                 }
                 Ok(None) => false,
                 Err(error) => {
-                    let bytes = plain(error.status, &[("Connection", "close")], &error.what);
-                    self.queue(conn, &bytes, effects);
+                    let close = Some(("Connection", "close"));
+                    self.queue_plain(conn, error.status, close, &error.what, effects);
                     self.close(conn);
                     false
                 }
@@ -490,20 +504,23 @@ impl Server {
             it.split(',').any(|option| option.trim().eq_ignore_ascii_case("close"))
         });
         let authorized = self.token.as_deref().is_some_and(|token| authorized(&request, token));
+        let missing: String;
         let refusal = if !authorized {
-            let challenge = [("WWW-Authenticate", "Bearer")];
-            Some(plain(401, &challenge, "a missing or wrong Authorization: Bearer token"))
+            let challenge = Some(("WWW-Authenticate", "Bearer"));
+            Some((401, challenge, "a missing or wrong Authorization: Bearer token"))
         } else if request.path != "/api" {
-            Some(plain(404, &[], &format!("no such path as {}; the API is POST /api", request.path)))
+            // alloc: error path, a request for another path.
+            missing = format!("no such path as {}; the API is POST /api", request.path);
+            Some((404, None, missing.as_str()))
         } else if request.method != "POST" {
-            Some(plain(405, &[("Allow", "POST")], "the API is POST /api"))
+            Some((405, Some(("Allow", "POST")), "the API is POST /api"))
         } else if !media_is(request.header("Content-Type"), &["application/cbor"]) {
-            Some(plain(415, &[], "a body that is not application/cbor"))
+            Some((415, None, "a body that is not application/cbor"))
         } else {
             None
         };
-        if let Some(bytes) = refusal {
-            self.queue(conn, &bytes, effects);
+        if let Some((status, extra, what)) = refusal {
+            self.queue_plain(conn, status, extra, what, effects);
             if close {
                 self.close(conn);
             }
@@ -518,6 +535,7 @@ impl Server {
         else {
             return;
         };
+        let queue = room(queue);
         http::chunked_into(queue, 200, &[("Content-Type", kind)]);
         match frames::decode::<Request>(request.body) {
             Ok(envelope) => {
@@ -542,10 +560,18 @@ impl Server {
         }
     }
 
-    /// Sends `bytes` now, or after the send in flight.
-    fn queue(&mut self, conn: Conn, bytes: &[u8], effects: &mut Vec<Effect>) {
+    /// A whole plain-text response of `status` saying `what`, for a request that reaches no
+    /// session, written onto the connection's queue and sent now or after the send in flight.
+    fn queue_plain(
+        &mut self,
+        conn: Conn,
+        status: u16,
+        extra: Option<(&str, &str)>,
+        what: &str,
+        effects: &mut Vec<Effect>,
+    ) {
         let Some(connection) = self.conns.get_mut(&conn) else { return };
-        connection.queue.extend_from_slice(bytes);
+        plain_into(&mut connection.queue, status, extra, what);
         self.flush(conn, effects);
     }
 
@@ -594,12 +620,23 @@ impl Server {
     }
 }
 
+/// A connection's queue, with room for a burst of replies when a send took it.
+fn room(queue: &mut Vec<u8>) -> &mut Vec<u8> {
+    if queue.capacity() == 0 {
+        // alloc: one buffer for the replies queued until the next send, which takes it
+        // (`Effect::Send` owns its bytes; v2/requests/core.md K3 would hand it back).
+        queue.reserve(QUEUE);
+    }
+    queue
+}
+
 /// `response` to request `id` as one frame onto the end of `out`. One too long to frame is
 /// sent as the error that says so.
 fn frame(writer: &mut cbor::Writer, out: &mut Vec<u8>, id: u64, response: &Response) {
     let Err(error) = frames::encode_into(writer, out, &Envelope::new(id, response)) else {
         return;
     };
+    // alloc: error path, a response with no frame.
     let what = format!("a response that could not be sent: {}", error.what);
     let error = Response::Error(ApiError::new(what, error.at));
     frames::encode_into(writer, out, &Envelope::new(id, &error))
@@ -626,15 +663,16 @@ fn rendered(
     }
     http::chunk_into(out, line);
     if line.capacity() > KEPT_LINE {
-        *line = Vec::new();
+        drop(std::mem::take(line));
     }
 }
 
-/// A whole response of `status` saying `what`, for a request that reaches no session.
-fn plain(status: u16, extra: &[(&str, &str)], what: &str) -> Vec<u8> {
-    let mut headers = vec![("Content-Type", "text/plain; charset=utf-8")];
-    headers.extend_from_slice(extra);
-    http::response(status, &headers, what.as_bytes())
+/// A whole response of `status` saying `what` onto the end of `out`: its type, then `extra`.
+fn plain_into(out: &mut Vec<u8>, status: u16, extra: Option<(&str, &str)>, what: &str) {
+    let kind = ("Content-Type", "text/plain; charset=utf-8");
+    let both = [kind, extra.unwrap_or(kind)];
+    let headers = if extra.is_some() { &both[..] } else { &both[..1] };
+    http::response_into(out, status, headers, what.as_bytes());
 }
 
 fn authorized(request: &HttpRequestRef<'_>, token: &str) -> bool {
@@ -662,11 +700,20 @@ fn media_is(header: Option<&str>, kinds: &[&str]) -> bool {
     })
 }
 
-fn shown(at: &Address) -> String {
-    match at {
-        Address::Unix(name) => format!("the socket {name}"),
-        Address::Inherited { fd, at } => format!("the socket {at} passed as fd {fd}"),
-        Address::Tcp(at) => at.to_string(),
+/// How an address is named in an error, written where it goes.
+fn shown(at: &Address) -> Shown<'_> {
+    Shown(at)
+}
+
+struct Shown<'a>(&'a Address);
+
+impl fmt::Display for Shown<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Address::Unix(name) => write!(f, "the socket {name}"),
+            Address::Inherited { fd, at } => write!(f, "the socket {at} passed as fd {fd}"),
+            Address::Tcp(at) => write!(f, "{at}"),
+        }
     }
 }
 

@@ -7,26 +7,10 @@ use test_fixture::WithFixture;
 use super::{edit, items, single};
 use crate::{
     Fact, FactSet, ItemKey, NameHash, SimplifiedType, crate_hashes, hashes, item_key, kinds,
-    table::Bits,
 };
 
 fn id(n: u8) -> ContentId {
     ContentId([n; 32])
-}
-
-#[test]
-fn a_bitset_ranks_each_row() {
-    let pattern: Vec<bool> = (0..200).map(|it| it % 3 == 0 || it == 130).collect();
-    let bits = Bits::new(pattern.iter().copied());
-    assert_eq!(bits.len(), 200);
-    let mut set = 0;
-    for (row, &bit) in pattern.iter().enumerate() {
-        assert_eq!(bits.get(row), bit, "row {row}");
-        assert_eq!(bits.rank(row), set, "row {row}");
-        set += usize::from(bit);
-    }
-    assert_eq!(bits.count(), set);
-    assert_eq!(Bits::new([]).count(), 0);
 }
 
 fn every_kind() -> Vec<Fact> {

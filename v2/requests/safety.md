@@ -268,6 +268,15 @@ displayed as `"Undefined Behavior: {it}"`, and `From<check::OffsetFromError> for
   checker then adds `MemKind::Mmap => Kind::Mmap` and starts it at the allocating thread's
   clock: two lines, made when the variant lands.
 
+> applied by codegen-mir (2026-10-29 21:00):
+> - `MemKind::Mmap` in `machine.rs`. `Origin::Mmap` in `eval.rs` maps to it, and the `mmap`,
+>   `munmap` and `mprotect` shims use it. `Machine` stays for the errno cells and the
+>   semaphores.
+> - `hir-ty-ub`'s two exhaustive `MemKind` matches (`check.rs:394-399`, `:437-438`) need the
+>   new arm before it compiles again.
+> - Main thread: `run_function` runs `main_returned` (its `at_thread_exit` list) and then
+>   `machine.finish()`, with no `exit` for main, so `finish` does it, as you said.
+
 ## From safety-model
 
 > applied: M1 2, `"cfg(blaze_check)"` in the root `unexpected_cfgs` `check-cfg`. M1 1 (`blaze-check` workspace dependency) goes in once `crates/blaze-check/` exists (a missing path stops the workspace loading); `blaze-check` is a lock addition then. > forwarded to coordinator: M1 3 (`crates.md`).
@@ -950,3 +959,177 @@ exactly when nothing was allocated. Asked: make `blaze-fuzz` count through `blaz
 one allocator serves both kinds of test.
 
 > forwarded to the coordinator: `tools/v2/hot_lint.py` and `crates/blaze-fuzz` (with `blaze-alloc-count` keeping the largest request) are its paths; on requests' coordinator list.
+
+## dedup: bits: hir-ty-ub's GC live set and leak check onto `blaze_ids::bits::BitSet`, `Bytes`' init bits kept
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`blaze_ids::bits::BitSet` (`crates/blaze-ids/src/bits.rs`) is a `Vec<u64>` set: `reset(len)`
+(empty, resized, buffer kept: `clear` then `resize`), `insert` (whether it was new),
+`contains` (`false` past the words), `capacity`. Same members, same buffer kept between GCs,
+same allocation per leak check. `Bytes::init` stays words: empty stands for every byte
+initialized, and its words are blitted and extracted by `init_mask`'s range moves with the
+allocation's mask, so only its copies of `words_for` and the bit arithmetic go. hir-ty-ub
+depends on blaze-ids already.
+
+1. `crates/hir-ty-ub/src/borrows.rs`: imports, before `use smallvec::SmallVec;` add
+   `use blaze_ids::bits::BitSet;`.
+
+   `Borrows`, before / after:
+
+   ```rust
+       /// The GC's live set, a bit per tag; kept between runs.
+       live: Vec<u64>,
+   ```
+
+   ```rust
+       /// The GC's live set, a bit per tag; kept between runs.
+       live: BitSet,
+   ```
+
+   `Borrows::new`: `live: Vec::new(),` becomes `live: BitSet::default(),`.
+
+   `Borrows::gc`, before:
+
+   ```rust
+           set.clear();
+           set.resize((next_tag.get() as usize).div_ceil(64), 0);
+           let mut mark = |tag: BorTag| {
+               let n = tag.get() as usize;
+               if let Some(word) = set.get_mut(n / 64) {
+                   *word |= 1u64 << (n % 64);
+               }
+           };
+   ```
+
+   after (a tag past the words is left, as before):
+
+   ```rust
+           set.reset(next_tag.get() as usize);
+           let mut mark = |tag: BorTag| {
+               let n = tag.get() as usize;
+               if n < set.capacity() {
+                   set.insert(n);
+               }
+           };
+   ```
+
+   and before / after:
+
+   ```rust
+           let is_live = |tag: BorTag| {
+               let n = tag.get() as usize;
+               set.get(n / 64).is_some_and(|&word| word & (1u64 << (n % 64)) != 0)
+           };
+   ```
+
+   ```rust
+           let is_live = |tag: BorTag| set.contains(tag.get() as usize);
+   ```
+
+2. `crates/hir-ty-ub/src/memory.rs`: imports, before:
+
+   ```rust
+   use smallvec::SmallVec;
+   ```
+
+   after:
+
+   ```rust
+   use blaze_ids::bits::{BitSet, words_for};
+   use smallvec::SmallVec;
+   ```
+
+   and `bytes::{Run, offset, words},` becomes `bytes::{Run, offset},`.
+
+   `Memory::read`: `Some(false) => init.resize(words(len), 0),` becomes
+   `Some(false) => init.resize(words_for(len), 0),` and the `None` arm's
+   `init.resize(words(len), 0);` becomes `init.resize(words_for(len), 0);`.
+
+   `Memory::leaks`, before / after:
+
+   ```rust
+           let mut reachable = vec![0u64; n.div_ceil(64)];
+   ```
+
+   ```rust
+           let mut reachable = BitSet::<usize>::new(n);
+   ```
+
+   before:
+
+   ```rust
+               if reachable[i / 64] & (1 << (i % 64)) != 0 {
+                   continue;
+               }
+               reachable[i / 64] |= 1 << (i % 64);
+   ```
+
+   after:
+
+   ```rust
+               if !reachable.insert(i) {
+                   continue;
+               }
+   ```
+
+   and in the `leaked` filter, `&& reachable[i / 64] & (1 << (i % 64)) == 0` becomes
+   `&& !reachable.contains(i)`.
+
+3. `crates/hir-ty-ub/src/memory/bytes.rs`: imports, before `use smallvec::SmallVec;` add
+   `use blaze_ids::bits::{locate, words_for};`. Delete:
+
+   ```rust
+   #[inline]
+   pub(super) fn words(len: usize) -> usize {
+       len.div_ceil(64)
+   }
+   ```
+
+   and every `words(` call in the file becomes `words_for(` (six: in `uninit`, `word`,
+   `materialize`, `slice`, `put`, and `PartialEq::eq`).
+
+   `Bytes::init`'s doc, before:
+
+   ```rust
+       /// Empty: every byte is initialized. Otherwise bit `i` is byte `i`, and bits past `len` are
+       /// clear.
+       pub(super) init: SmallVec<[u64; 1]>,
+   ```
+
+   after:
+
+   ```rust
+       /// Empty: every byte is initialized. Otherwise bit `i` is byte `i`, and bits past `len` are
+       /// clear. Words, not a `blaze_ids::bits` set: empty is a state of its own, and the words
+       /// move by `init_mask`'s blits, as an allocation's mask does.
+       pub(super) init: SmallVec<[u64; 1]>,
+   ```
+
+   `Bytes::is_init`, before / after:
+
+   ```rust
+           i < self.len && (self.init.is_empty() || self.init[i / 64] & (1 << (i % 64)) != 0)
+   ```
+
+   ```rust
+           i < self.len && (self.init.is_empty() || {
+               let (word, mask) = locate(i);
+               self.init[word] & mask != 0
+           })
+   ```
+
+Status: open
+
+> taken by requests (safety is DONE): child `requests-bits` is applying it (pass 17).
+
+> applied: by `requests-bits` (pass 17), all three parts as written; the tree matched every
+> before text. `borrows.rs`: `live: BitSet` (`BitSet::default()` in `new`), `gc` on
+> `reset`/`capacity`/`insert`/`contains`. `memory.rs`: imports `BitSet, words_for`, drops
+> `words` from the `bytes` import, `read`'s two resizes on `words_for`, `leaks`'s `reachable` a
+> `BitSet::<usize>::new(n)` with `insert`/`contains`. `memory/bytes.rs`: imports
+> `locate, words_for`, `fn words` deleted, its six callers on `words_for`, `init`'s doc
+> extended, `is_init` on `locate`. `rg` finds no `bytes::words` or bare `words(` caller left in
+> hir-ty-ub (the `words` closure in `check/tests.rs` is a local of its own). `hot_lint` (its
+> `lint_file`): findings went from 5 to 4 in `borrows.rs` and 14 to 13 in `memory.rs` (the
+> `Vec::new()` and `vec![..]` this removed), and stayed at 5 in `bytes.rs`; none of the rest is on a
+> line this changed.

@@ -6,13 +6,13 @@ use super::{
     Executed, Failure, Finished, Outcome, Reported, Trace, fork_server, report,
     wire::{
         End, ExecView, Frame, Frames, HEADER, Hits, LONGEST, MAGIC, UNRECORDED, VERSION, View, closed_ranges, encode_ended,
-        header, read_region,
+        encode_hello, header, read_region,
     },
 };
 
 fn frames() -> Vec<Frame> {
     vec![
-        Frame::Hello { version: VERSION, pid: 42, tests: vec!["a::b".into(), "ünï::cødé".into(), String::new()] },
+        Frame::Hello { version: VERSION, pid: 42, fork: 51_000, tests: vec!["a::b".into(), "ünï::cødé".into(), String::new()] },
         Frame::Ended { id: 7, end: End::Exited(0), output: b"ok\n".to_vec(), executed: Executed::Hits { slots: 10, hits: vec![0, 3, 9] } },
         Frame::Ended { id: u64::MAX, end: End::Exited(-1), output: Vec::new(), executed: Executed::Hits { slots: 0, hits: Vec::new() } },
         Frame::Ended { id: 8, end: End::Signaled(9), output: vec![0, 255, 10], executed: Executed::Not("it was killed".into()) },
@@ -25,6 +25,7 @@ fn frames() -> Vec<Frame> {
         Frame::Run { id: 3, index: 2 },
         Frame::Kill { id: 3 },
         Frame::Quit,
+        Frame::Replicate { count: 63 },
     ]
 }
 
@@ -40,10 +41,11 @@ fn seeded(rng: &mut SplitMix64) -> Frame {
         1 => u64::MAX,
         _ => rng.next_u64(),
     };
-    match rng.below(5) {
+    match rng.below(6) {
         0 => {
             let count = rng.index(5);
-            Frame::Hello { version: rng.next_u32(), pid: rng.next_u32(), tests: (0..count).map(|_| text(rng)).collect() }
+            let (version, pid, fork) = (rng.next_u32(), rng.next_u32(), edge(rng));
+            Frame::Hello { version, pid, fork, tests: (0..count).map(|_| text(rng)).collect() }
         }
         1 => {
             let end = match rng.below(3) {
@@ -64,6 +66,7 @@ fn seeded(rng: &mut SplitMix64) -> Frame {
         }
         2 => Frame::Run { id: edge(rng), index: rng.next_u32() },
         3 => Frame::Kill { id: edge(rng) },
+        4 => Frame::Replicate { count: rng.next_u32() },
         _ => Frame::Quit,
     }
 }
@@ -100,6 +103,19 @@ fn every_frame_round_trips() {
             assert_eq!(tests.len(), names.len());
             assert!(tests.iter().eq(names.iter().map(String::as_str)));
         }
+    }
+}
+
+/// A server's hello from borrowed names is the bytes of the owned frame, and decodes back to it.
+#[test]
+fn a_hello_from_borrowed_names_is_the_frame() {
+    for names in [&[][..], &["a"][..], &["a::b", "", "ünï::cødé", "x"][..]] {
+        let frame = Frame::Hello { version: VERSION, pid: 9, fork: 48_500, tests: names.iter().map(|it| (*it).to_owned()).collect() };
+        let mut out = b"before".to_vec();
+        encode_hello(&mut out, VERSION, 9, 48_500, names.iter().copied());
+        assert_eq!(&out[..6], b"before");
+        assert_eq!(out[6..], frame.to_bytes()[..]);
+        assert_eq!(Frame::decode(&out[10..]), Ok(frame));
     }
 }
 
@@ -237,7 +253,7 @@ fn a_frame_that_is_not_one_is_refused() {
     assert!(Frame::decode(&quit).is_err());
     let run = Frame::Run { id: 1, index: 2 }.to_bytes();
     assert!(Frame::decode(&run[4..run.len() - 1]).is_err());
-    let mut hello = Frame::Hello { version: 1, pid: 1, tests: vec!["ab".into()] }.to_bytes()[4..].to_vec();
+    let mut hello = Frame::Hello { version: 1, pid: 1, fork: 0, tests: vec!["ab".into()] }.to_bytes()[4..].to_vec();
     let at = hello.len() - 1;
     hello[at] = 0xff;
     assert!(Frame::decode(&hello).is_err());
@@ -246,6 +262,7 @@ fn a_frame_that_is_not_one_is_refused() {
     let mut lying = vec![1];
     lying.extend_from_slice(&1u32.to_le_bytes());
     lying.extend_from_slice(&1u32.to_le_bytes());
+    lying.extend_from_slice(&0u64.to_le_bytes());
     lying.extend_from_slice(&u32::MAX.to_le_bytes());
     assert!(Frame::decode(&lying).is_err());
 }
@@ -410,7 +427,11 @@ fn the_harness_texts_are_one_module_with_the_protocol_and_the_server() {
         let opened = text.trim_start().trim_start_matches("#[allow(dead_code)]").trim_start();
         assert!(opened.starts_with("pub mod fork_server {"));
         assert!(text.contains("pub const SOCKET: &str = \"__BLAZE_FORK_SERVER\";"));
-        assert!(text.contains("pub const VERSION: u32 = 2;"));
+        assert!(text.contains("pub const VERSION: u32 = 3;"));
+        // The server measures its fork for blaze, and makes replicas only when asked.
+        assert!(text.contains("let fork = fork_cost()?;"));
+        assert!(text.contains("View::Replicate { count } =>"));
+        assert!(text.contains("exits::forked(&mut queue)?;"));
         // Both kinds of record take a region back for the next test.
         assert!(text.contains("pub fn map(&mut self) -> Result<Region, String>"));
         assert!(text.contains("pub fn give(&mut self, "));

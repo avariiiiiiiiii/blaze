@@ -13,9 +13,9 @@
 //! `can_be_used_for_suggestions`), `compiler/rustc_span/src/source_map.rs` (`end_point`)
 //! (MIT or Apache-2.0).
 
-mod for_loops_over_fallibles;
-mod if_let_rescope;
-mod shadowed_into_iter;
+pub(crate) mod for_loops_over_fallibles;
+pub(crate) mod if_let_rescope;
+pub(crate) mod shadowed_into_iter;
 mod significant_drop;
 
 use hir_def::hir::{Expr, ExprId, LoopSource, Pat, PatId};
@@ -25,15 +25,6 @@ use crate::{
     lints::bodies::BodyCx,
     model::{MacroKind, Span},
 };
-
-/// rustc's late lint passes of what `for` loops, `.into_iter()` and `if let` desugar to.
-pub(super) fn passes() -> Vec<Box<dyn crate::lints::bodies::LatePass>> {
-    vec![
-        Box::new(for_loops_over_fallibles::ForLoopsOverFallibles),
-        Box::new(shadowed_into_iter::ShadowedIntoIter::default()),
-        Box::new(if_let_rescope::IfLetRescope::default()),
-    ]
-}
 
 /// A `for <pat> in <head> { .. }` loop, as `expr`, the `match` it is desugared to.
 struct ForLoop {

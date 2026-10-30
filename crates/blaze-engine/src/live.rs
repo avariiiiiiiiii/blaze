@@ -208,11 +208,11 @@ fn wake(dir: &std::path::Path) {
     if event.is_null() {
         return;
     }
-    // SAFETY: the handle is open and this one's.
-    unsafe {
-        SetEvent(event);
-        CloseHandle(event);
-    }
+    // SAFETY: `event` is the non-null handle `OpenEventW` opened with `EVENT_MODIFY_STATE`, the
+    // right `SetEvent` needs; it is closed only below.
+    unsafe { SetEvent(event) };
+    // SAFETY: `event` is this function's own open handle, closed once here and not used after.
+    unsafe { CloseHandle(event) };
 }
 
 #[cfg(not(any(unix, windows)))]

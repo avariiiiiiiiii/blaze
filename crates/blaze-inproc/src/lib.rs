@@ -38,7 +38,8 @@
 //!    maps. The hook checks each overlay against its own image's headers ([`image`]): a code
 //!    range must be one of the image's executable segments at the same file offset, every
 //!    other overlay must be inside a reservation the executable carries. Then it maps the
-//!    fence's control words, and replaces each range with the shared mapping of the memory
+//!    fence's control words and the asks ([`ask`]: how the program asks the daemon for
+//!    anything once it runs), and replaces each range with the shared mapping of the memory
 //!    object (Linux `mmap` `MAP_FIXED|MAP_SHARED`, macOS `mach_vm_map` with
 //!    `VM_FLAGS_OVERWRITE` of the entry it got through the rendezvous; on Windows the daemon
 //!    rebuilds the image's region in the process from the section and the bytes it held).
@@ -75,6 +76,7 @@
 //! Linux on x86-64 and AArch64, macOS on AArch64 and Windows on x86-64. Elsewhere every
 //! constructor stops with an [`Error`] naming the platform.
 
+pub mod ask;
 pub mod channel;
 pub mod fence;
 pub mod frame;
@@ -265,7 +267,7 @@ pub struct CodeMemory {
     image: u64,
     arena_len: u64,
     cells_len: u64,
-    arena: alloc::Arena,
+    arena: alloc::CodeHeap,
     /// Ranges retired behind a fence: with their grace once their entry is in the control
     /// table, waiting for room in it before.
     limbo: Vec<(Option<(Grace, u32)>, CodeRange)>,
@@ -329,7 +331,7 @@ impl CodeMemory {
             image,
             arena_len: arena,
             cells_len: cells,
-            arena: alloc::Arena::new(image, arena),
+            arena: alloc::CodeHeap::new(image, arena),
             limbo: Vec::new(),
             layout: None,
             placed: None,

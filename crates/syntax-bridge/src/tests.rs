@@ -264,6 +264,173 @@ fn a_flat_tree_converts_as_the_cursor_does() {
     }
 }
 
+/// [`crate::call_input`] of a view is the token tree the cursor's walk of the same node makes:
+/// for the file, each `fn` (an attribute macro's input) and each token tree (a call's input),
+/// from a full parse and from an outline, whose `fn` bodies are lazy parts it enters.
+#[test]
+fn a_views_call_input_is_the_cursors_token_tree() {
+    use syntax::SyntaxKind::{FN, TOKEN_TREE};
+    for (path, text) in corpus() {
+        let path = path.display();
+        let full = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT);
+        let full_node = full.syntax_node();
+        let outline = ast::SourceFile::parse_outline(text, Edition::CURRENT);
+        for parse in [&full, &outline] {
+            let root = parse.root();
+            let views = std::iter::once(root)
+                .chain(root.descendants().filter(|it| matches!(it.kind(), FN | TOKEN_TREE)));
+            for view in views {
+                let range = view.text_range();
+                if range.is_empty() {
+                    continue;
+                }
+                let node = match full_node.covering_element(range) {
+                    NodeOrToken::Node(node) if node.text_range() == range => node,
+                    other => panic!("{path}: no node of {range:?} in the full parse: {other:?}"),
+                };
+                for mode in [DocCommentDesugarMode::Mbe, DocCommentDesugarMode::ProcMacro] {
+                    let new = crate::call_input(view, DummyTestSpanMap, DUMMY, mode);
+                    let cursor = syntax_node_to_token_tree_modified(
+                        &node,
+                        DummyTestSpanMap,
+                        FxHashMap::default(),
+                        FxHashSet::default(),
+                        DUMMY,
+                        mode,
+                        |_, _| (true, Vec::new()),
+                    );
+                    assert_eq!(new, cursor, "{path}: {view:?}, outline {}", parse.is_outline());
+                    assert_eq!(new.to_string(), cursor.to_string(), "{path}: {view:?}");
+                }
+            }
+        }
+    }
+}
+
+/// What a test's `on_event` does at an element, the same for the cursor's walk and the view's: a
+/// function of the element's kind and range and of whether the walk enters or leaves it.
+fn modified_action(
+    seed: u64,
+    kind: syntax::SyntaxKind,
+    range: syntax::TextRange,
+    enter: bool,
+) -> u64 {
+    let mixed = seed
+        ^ (kind as u64) << 48
+        ^ u64::from(u32::from(range.start())) << 24
+        ^ u64::from(u32::from(range.end()))
+        ^ u64::from(enter) << 63;
+    SplitMix64::new(mixed).below(16)
+}
+
+/// [`crate::call_input_modified`] removes, appends after and follows `on_event` as the cursor's
+/// [`syntax_node_to_token_tree_modified`] does: over the corpus's files and `fn`s from full and
+/// outline parses, with random removal and append sets of nodes and tokens, and an `on_event`
+/// that skips subtrees, drops events and inserts leaves.
+#[test]
+fn a_views_modified_input_is_the_cursors() {
+    use syntax::{NodeOrToken::Node, SyntaxKind::FN, WalkEvent};
+    let punct = |char| Leaf::Punct(Punct { char, spacing: Spacing::Alone, span: DUMMY });
+    for (seed, (path, text)) in (0u64..).zip(corpus()) {
+        let path = path.display();
+        let full = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT);
+        let full_node = full.syntax_node();
+        let outline = ast::SourceFile::parse_outline(text, Edition::CURRENT);
+        for parse in [&full, &outline] {
+            let root = parse.root();
+            let fns = root.descendants().filter(|it| matches!(it.kind(), FN));
+            for view in std::iter::once(root).chain(fns) {
+                let range = view.text_range();
+                if range.is_empty() {
+                    continue;
+                }
+                let node = match full_node.covering_element(range) {
+                    NodeOrToken::Node(node) if node.text_range() == range => node,
+                    other => panic!("{path}: no node of {range:?} in the full parse: {other:?}"),
+                };
+                let mut rng = SplitMix64::new(seed);
+                let (mut remove, mut view_remove) = (FxHashSet::default(), FxHashSet::default());
+                let (mut append, mut view_append) = (FxHashMap::default(), FxHashMap::default());
+                let mut views = view.preorder_with_tokens();
+                for event in node.preorder_with_tokens() {
+                    match (event, views.next()) {
+                        (WalkEvent::Enter(element), Some(WalkEvent::Enter(seen))) => {
+                            assert_eq!(
+                                (element.kind(), element.text_range()),
+                                (seen.kind(), seen.text_range()),
+                                "{path}: the walks differ"
+                            );
+                            if rng.one_in(12) {
+                                remove.insert(element.clone());
+                                view_remove.insert(seen.id());
+                            }
+                            if rng.one_in(10) {
+                                let leaves = vec![punct('$'), punct(',')];
+                                view_append.insert(seen.id(), leaves.clone());
+                                append.insert(element, leaves);
+                            }
+                        }
+                        (WalkEvent::Leave(_), Some(WalkEvent::Leave(_))) => {}
+                        (event, seen) => panic!("{path}: {event:?} walked against {seen:?}"),
+                    }
+                }
+                assert!(views.next().is_none(), "{path}: the view's walk is longer");
+                for mode in [DocCommentDesugarMode::Mbe, DocCommentDesugarMode::ProcMacro] {
+                    let cursor = syntax_node_to_token_tree_modified(
+                        &node,
+                        DummyTestSpanMap,
+                        append.clone(),
+                        remove.clone(),
+                        DUMMY,
+                        mode,
+                        |preorder, event| {
+                            let (enter, element) = match event {
+                                WalkEvent::Enter(it) => (true, it),
+                                WalkEvent::Leave(it) => (false, it),
+                            };
+                            match modified_action(seed, element.kind(), element.text_range(), enter)
+                            {
+                                0 if enter && matches!(element, Node(_)) => {
+                                    preorder.skip_subtree();
+                                    (false, vec![punct('#')])
+                                }
+                                1 => (true, vec![punct('@')]),
+                                2 => (false, Vec::new()),
+                                _ => (true, Vec::new()),
+                            }
+                        },
+                    );
+                    let new = crate::call_input_modified(
+                        view,
+                        DummyTestSpanMap,
+                        view_append.clone(),
+                        view_remove.clone(),
+                        DUMMY,
+                        mode,
+                        |preorder, event| {
+                            let (enter, element) = match *event {
+                                WalkEvent::Enter(it) => (true, it),
+                                WalkEvent::Leave(it) => (false, it),
+                            };
+                            match modified_action(seed, element.kind(), element.text_range(), enter)
+                            {
+                                0 if enter && matches!(element, Node(_)) => {
+                                    preorder.skip_subtree();
+                                    (false, vec![punct('#')])
+                                }
+                                1 => (true, vec![punct('@')]),
+                                2 => (false, Vec::new()),
+                                _ => (true, Vec::new()),
+                            }
+                        },
+                    );
+                    assert_eq!(new, cursor, "{path}: {view:?}, outline {}", parse.is_outline());
+                }
+            }
+        }
+    }
+}
+
 /// What a closure gives, or that it panicked: the new and the old conversion must fail alike too.
 fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()

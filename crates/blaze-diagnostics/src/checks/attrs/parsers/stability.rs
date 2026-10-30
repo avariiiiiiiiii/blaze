@@ -33,6 +33,7 @@ use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast};
 use super::{Accepted, Finalize, GroupId, no_args, parse_version};
 use crate::{
     checks::attrs::{
+        Lowered, is,
         accept::{Accept, Session},
         args::{ArgParser, Ident, Lit, MetaItem},
         parsed::{
@@ -247,7 +248,7 @@ pub(crate) fn finalize(state: &mut State, group: &'static str, fx: &mut Finalize
                 fx.emit_err(diag);
             }
             if stable {
-                let bounds = fx.all_attrs().filter(|(_, path)| matches!(path.as_slice(), [one] if one == "unstable_feature_bound")).count();
+                let bounds = fx.owner.attrs.iter().filter(|it| is(it, "unstable_feature_bound")).count();
                 for _ in 0..bounds {
                     let mut diag =
                         Diag::error(None, "item annotated with `#[unstable_feature_bound]` should not be stable", fx.target_span());
@@ -780,7 +781,7 @@ pub(crate) fn crate_checks(
     cx: &Cx<'_, '_>,
     session: &Session,
     owners: &[Owner],
-    parsed: &[Vec<ParsedAttr>],
+    parsed: &Lowered<'_>,
 ) -> Vec<(usize, Diag)> {
     if !session.feature("staged_api") {
         return Vec::new();
@@ -862,7 +863,7 @@ impl Def {
 struct Defs<'a, 'c, 'db> {
     cx: &'a Cx<'c, 'db>,
     owners: &'a [Owner],
-    parsed: &'a [Vec<ParsedAttr>],
+    parsed: &'a Lowered<'a>,
     crate_root: HirFileId,
     /// Each owner by its node.
     index: FxHashMap<InFile<SyntaxNodePtr>, usize>,
@@ -881,7 +882,7 @@ struct Defs<'a, 'c, 'db> {
 }
 
 impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
-    fn new(cx: &'a Cx<'c, 'db>, owners: &'a [Owner], parsed: &'a [Vec<ParsedAttr>], crate_root: HirFileId) -> Self {
+    fn new(cx: &'a Cx<'c, 'db>, owners: &'a [Owner], parsed: &'a Lowered<'a>, crate_root: HirFileId) -> Self {
         let mut index = FxHashMap::default();
         let mut file_roots = FxHashMap::default();
         for (at, owner) in owners.iter().enumerate() {
@@ -962,7 +963,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     }
 
     fn own_stability(&self, owner: usize) -> Option<&'a Stability> {
-        self.parsed.get(owner)?.iter().find_map(|it| match &it.parsed {
+        self.parsed.of(owner).iter().find_map(|it| match &it.parsed {
             Parsed::Stability(stability) => Some(stability),
             _ => None,
         })
@@ -970,7 +971,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
 
     /// The node's `#[deprecated]` and its attribute.
     fn own_deprecation(&self, owner: usize) -> Option<(&'a DeprecatedSince, usize)> {
-        self.parsed.get(owner)?.iter().find_map(|it| match &it.parsed {
+        self.parsed.of(owner).iter().find_map(|it| match &it.parsed {
             Parsed::Deprecated(since) => Some((since, it.attr)),
             _ => None,
         })
@@ -1095,9 +1096,9 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         let own_deprecation = self.own_deprecation(at);
         let cx: &'a Cx<'c, 'db> = self.cx;
         let owners: &'a [Owner] = self.owners;
-        let all: &'a [Vec<ParsedAttr>] = self.parsed;
+        let all: &'a Lowered<'a> = self.parsed;
         let owner = &owners[at];
-        let parsed = &all[at];
+        let parsed = all.of(at);
         let attr_span = |index: usize| {
             let attr = &owner.attrs[index];
             cx.span(attr.in_file(attr.range()))

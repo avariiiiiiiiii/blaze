@@ -31,7 +31,7 @@
 pub mod chunk;
 mod cold;
 mod copy;
-mod crc;
+use blaze_ids::crc32c as crc;
 mod disk;
 mod flags;
 mod index;
@@ -53,7 +53,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 use std::{collections::VecDeque, fmt, sync::Arc};
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
-use blaze_format::SchemaHash;
+use blaze_format::{SchemaHash, tiers::BufferColumns};
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_reclaim::{Grace, Limbo};
 pub use blaze_reclaim::{Guard, enter};
@@ -67,6 +67,7 @@ use crate::disk::{
 pub use crate::disk::content_of;
 use crate::flags::{FLAGS, Flag, Row};
 use crate::read::{ExternalView, Index, Look, PackView, Place, Seg, Shared, Spot, TierView, View};
+pub use crate::read::Pinned;
 use crate::segment::{COPY, Chunk, ChunkRef, FRAME, Own, Segment};
 pub use crate::segment::Writer;
 use crate::table::{Held, Table};
@@ -226,17 +227,72 @@ pub struct Entry<'a> {
 ///
 /// Each direction must give back exactly what it was given; the store decodes every encoding
 /// it makes and compares before keeping it.
-pub trait Columns: Send + Sync {
+enum Columns {
+    /// What every schema the store is given has ([`Store::encode_columns`]).
+    Buffer(BufferColumns),
+    /// The tests' own, which can be made to give back other values than it was given.
+    #[cfg(all(test, not(blaze_check)))]
+    Test(tests::OneColumn),
+}
+
+impl Columns {
     /// The schema of the values it encodes.
-    fn schema(&self) -> SchemaHash;
+    fn schema(&self) -> SchemaHash {
+        match self {
+            Columns::Buffer(it) => it.schema(),
+            #[cfg(all(test, not(blaze_check)))]
+            Columns::Test(it) => it.schema(),
+        }
+    }
+
     /// `hot` with its columns bit-packed by frame of reference: random access, read in place.
-    fn warm(&self, hot: &[u8]) -> Result<Vec<u8>, String>;
+    fn warm(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            // alloc: the message of an encoding that failed
+            Columns::Buffer(it) => it.warm(hot).map_err(|why| why.to_string()),
+            #[cfg(all(test, not(blaze_check)))]
+            Columns::Test(it) => it.warm(hot),
+        }
+    }
+
     /// The value [`Columns::warm`] was given.
-    fn hot_from_warm(&self, warm: &[u8]) -> Result<Vec<u8>, String>;
+    fn hot_from_warm(&self, warm: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            // alloc: the message of a decoding that failed
+            Columns::Buffer(it) => it.hot_from_warm(warm).map_err(|why| why.to_string()),
+            #[cfg(all(test, not(blaze_check)))]
+            Columns::Test(it) => it.hot_from_warm(warm),
+        }
+    }
+
     /// `hot` with a codec per column, then zstd: decoded when read.
-    fn cold(&self, hot: &[u8]) -> Result<Vec<u8>, String>;
+    fn cold(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            // alloc: the message of an encoding that failed
+            Columns::Buffer(it) => it.cold(hot).map_err(|why| why.to_string()),
+            #[cfg(all(test, not(blaze_check)))]
+            Columns::Test(it) => it.cold(hot),
+        }
+    }
+
     /// The value [`Columns::cold`] was given.
-    fn hot_from_cold(&self, cold: &[u8]) -> Result<Vec<u8>, String>;
+    fn hot_from_cold(&self, cold: &[u8]) -> Result<Vec<u8>, String> {
+        match self {
+            // alloc: the message of a decoding that failed
+            Columns::Buffer(it) => it.hot_from_cold(cold).map_err(|why| why.to_string()),
+            #[cfg(all(test, not(blaze_check)))]
+            Columns::Test(it) => it.hot_from_cold(cold),
+        }
+    }
+}
+
+/// The encodings the store was given, by schema. Each behind an `Arc` so publishing a new map
+/// copies no encoding (a [`blaze_format::tiers::ColdDictionary`] rebuilds its tables to clone).
+type Encodings = ByHash<SchemaHash, Arc<Columns>>;
+
+/// The encodings of the schema `bytes` are a buffer of, when the store was given them.
+fn encodings_of<'e>(encodings: &'e Encodings, bytes: &[u8]) -> Option<&'e Columns> {
+    encodings.get(&header_schema(bytes)?).map(|it| &**it)
 }
 
 /// The form of the bytes [`Store::get_in_place`] gave.
@@ -244,7 +300,7 @@ pub trait Columns: Send + Sync {
 pub enum Heat {
     /// The value's bytes as they were put.
     Hot,
-    /// [`Columns::warm`] of them, by the encoding of the value's schema.
+    /// [`BufferColumns::warm`] of them, by the encoding of the value's schema.
     Warm,
 }
 
@@ -388,7 +444,7 @@ pub struct Store {
     /// numbered afresh: a record is unread for two periods only once there have been two.
     periods: u32,
     /// The encodings of each schema whose values it keeps in columns.
-    columns: Arc<FxHashMap<SchemaHash, Arc<dyn Columns>>>,
+    columns: Arc<Encodings>,
 }
 
 /// A way to read a store from any thread, with no lock: [`Store::reader`].
@@ -406,6 +462,13 @@ impl Reader {
     /// The value of `key` as [`Store::get_in_place`] gives it.
     pub fn get_in_place<'g>(&'g self, guard: &'g Guard, key: &Key) -> Result<Option<(Heat, Entry<'g>)>, Corrupt> {
         self.look(guard).get_in_place(key)
+    }
+
+    /// The value of `key`, verified as [`Reader::get`] verifies it, held past the task:
+    /// in place, at a 16-byte boundary, when it is a raw record of a mapped pack or a file of
+    /// its own, else one aligned copy ([`Pinned`]).
+    pub fn pinned(&self, guard: &Guard, key: &Key) -> Result<Option<Pinned>, Corrupt> {
+        self.look(guard).pinned(key)
     }
 
     /// Whether it has a value of `key`, unverified: for planning, never for use.
@@ -705,7 +768,7 @@ fn header_schema(bytes: &[u8]) -> Option<SchemaHash> {
 }
 
 /// `encoded` behind the schema of the encodings that made it: a columns record's payload.
-fn columns_payload(columns: &dyn Columns, encoded: Vec<u8>) -> Vec<u8> {
+fn columns_payload(columns: &Columns, encoded: Vec<u8>) -> Vec<u8> {
     let mut payload = Vec::with_capacity(SCHEMA_PREFIX + encoded.len());
     payload.extend_from_slice(&columns.schema().0.0);
     payload.extend_from_slice(&encoded);
@@ -713,7 +776,7 @@ fn columns_payload(columns: &dyn Columns, encoded: Vec<u8>) -> Vec<u8> {
 }
 
 /// The cold columns payload of `hot`, decoded back and compared.
-fn cold_columns(columns: &dyn Columns, hot: &[u8]) -> Result<Vec<u8>, String> {
+fn cold_columns(columns: &Columns, hot: &[u8]) -> Result<Vec<u8>, String> {
     let payload = columns_payload(columns, columns.cold(hot)?);
     if columns.hot_from_cold(&payload[SCHEMA_PREFIX..])? != hot {
         return Err(format!("the cold columns of schema {:x} do not decode to the value", columns.schema().0));
@@ -723,7 +786,7 @@ fn cold_columns(columns: &dyn Columns, hot: &[u8]) -> Result<Vec<u8>, String> {
 
 /// The next colder columns of `hot`, kept at `loc`: warm from hot (or cold, where warm saves
 /// less than an eighth), cold from warm; `None` when that saves less than an eighth too.
-fn colder_columns(columns: &dyn Columns, loc: Loc, hot: &[u8]) -> Result<Option<(Form, Vec<u8>)>, String> {
+fn colder_columns(columns: &Columns, loc: Loc, hot: &[u8]) -> Result<Option<(Form, Vec<u8>)>, String> {
     let saves = |payload: &[u8]| payload.len() as u64 + loc.stored / 8 <= loc.stored;
     if loc.form != Form::Warm {
         let payload = columns_payload(columns, columns.warm(hot)?);
@@ -780,7 +843,7 @@ impl Store {
     pub fn open(config: Config, effects: &mut Vec<Effect>) -> Store {
         let mut tiers = vec![Tier::new(config.dir.clone())];
         tiers.extend(config.layers.iter().cloned().map(Tier::new));
-        let columns = Arc::<FxHashMap<SchemaHash, Arc<dyn Columns>>>::default();
+        let columns = Arc::<Encodings>::default();
         let view = View { tiers: tiers.iter().map(Tier::view).collect(), columns: columns.clone() };
         let shared = Arc::new(Shared::new(view));
         let own = Own::new(0);
@@ -867,20 +930,24 @@ impl Store {
         self.look().get_in_place(key)
     }
 
+    /// The value of `key` as [`Reader::pinned`] gives it.
+    pub fn pinned(&self, key: &Key) -> Result<Option<Pinned>, Corrupt> {
+        self.look().pinned(key)
+    }
+
     /// Gives it the encodings of one schema's values: [`Store::settle`] moves values of the
     /// schema through warm and cold columns, and a value kept in them is read through these.
     /// Until it is given them, a value of the schema kept in columns is refused, naming it.
-    pub fn encode_columns(&mut self, columns: Arc<dyn Columns>) {
-        let schema = columns.schema();
-        let old = Arc::make_mut(&mut self.columns).insert(schema, columns);
-        assert!(old.is_none(), "two encodings of schema {:x}", schema.0);
-        self.publish();
+    pub fn encode_columns(&mut self, columns: BufferColumns) {
+        self.add_columns(Columns::Buffer(columns));
     }
 
-    /// The encodings of the schema `bytes` are a buffer of, when it has been given them.
-    fn columns_of(&self, bytes: &[u8]) -> Option<Arc<dyn Columns>> {
-        let schema = header_schema(bytes)?;
-        self.columns.get(&schema).cloned()
+    fn add_columns(&mut self, columns: Columns) {
+        let schema = columns.schema();
+        // alloc: setup, once per schema the store is given.
+        let old = Arc::make_mut(&mut self.columns).insert(schema, Arc::new(columns));
+        assert!(old.is_none(), "two encodings of schema {:x}", schema.0);
+        self.publish();
     }
 
     /// Whether it has a value of `key`, unverified: for planning, never for use.
@@ -970,9 +1037,10 @@ impl Store {
     /// packs that are half replaced bytes into new packs, and commits as [`Store::flush`] does.
     ///
     /// Each call ends a period of reading. A record unread for two periods running moves a tier
-    /// colder: a value of a schema it has [`Columns`] for goes from hot to warm columns (or
-    /// straight to cold where warm saves too little) and from warm to cold columns; any other
-    /// goes from raw or LZ4 to zstd. A record read in two periods running moves hot. The daemon
+    /// colder: a value of a schema it was given encodings for ([`Store::encode_columns`]) goes
+    /// from hot to warm columns (or straight to cold where warm saves too little) and from warm
+    /// to cold columns; any other goes from raw or LZ4 to zstd. A record read in two periods
+    /// running moves hot. The daemon
     /// calls it when idle, never on the way of a get or a put, and it moves a bounded number of
     /// bytes a call.
     pub fn settle(&mut self, effects: &mut Vec<Effect>) -> Settled {
@@ -987,6 +1055,7 @@ impl Store {
             return settled;
         }
         let mut spent = 0;
+        let encodings = Arc::clone(&self.columns);
         let (mut demote, mut promote) = self.tier_moves();
         radix::sort_by_key(&mut demote, |(_, loc, _)| {
             (u128::from(loc.kind.code()) << 96) | radix::pack_64(u64::from(loc.pack), loc.offset)
@@ -1030,8 +1099,8 @@ impl Store {
                 }
                 let Some((content, bytes)) = self.movable(key, loc) else { continue };
                 spent += loc.raw;
-                if let Some(columns) = self.columns_of(&bytes) {
-                    match colder_columns(columns.as_ref(), loc, &bytes) {
+                if let Some(columns) = encodings_of(&encodings, &bytes) {
+                    match colder_columns(columns, loc, &bytes) {
                         Ok(Some((form, payload))) => {
                             self.replace(key, loc, form, 0, content, &payload);
                             settled.demoted += 1;
@@ -1254,7 +1323,7 @@ impl Store {
                 break;
             };
             if start == [0; 4] {
-                let next = disk::blocks(offset);
+                let next = offset.next_multiple_of(disk::BLOCK);
                 if next == offset {
                     why = Some(format!("at {offset} is neither a record nor padding"));
                     break;
@@ -1413,7 +1482,7 @@ impl Store {
     pub fn fetch(
         &mut self,
         key: &Key,
-        remote: &mut dyn Remote,
+        remote: &mut impl Remote,
         effects: &mut Vec<Effect>,
     ) -> Option<Tag> {
         if self.has(key) || self.fetching.contains_key(key) {
@@ -1845,7 +1914,7 @@ impl Store {
         }
         for pack in &mut self.tiers[0].packs {
             if pack.end > pack.committed {
-                let padded = disk::blocks(pack.end);
+                let padded = pack.end.next_multiple_of(disk::BLOCK);
                 pack.memory.resize(pack.memory.len() + (padded - pack.end) as usize, 0);
                 pack.end = padded;
             }
@@ -2377,7 +2446,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
         let mut at = pack.indexed.max(PACK_HEADER);
         while at < pack.committed {
             if all.get(at as usize..at as usize + 4).is_none_or(|start| start == [0; 4]) {
-                let next = disk::blocks(at);
+                let next = at.next_multiple_of(disk::BLOCK);
                 if next == at || all[at as usize..next as usize].iter().any(|&it| it != 0) {
                     return Err(fail(format!("at {at} is neither a record nor the zeros that end a commit")));
                 }

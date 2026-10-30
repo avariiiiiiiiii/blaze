@@ -1,6 +1,7 @@
 //! What Linux and macOS share: the channel's Unix socket with file descriptors passed by
-//! `SCM_RIGHTS`, the listener and its peer checks, stack walks through the system unwinder,
-//! context synchronization, randomness and the protection of an access.
+//! `SCM_RIGHTS`, the listener and its peer checks, the asks' doorbell and bells, stack walks
+//! through the system unwinder, context synchronization, randomness and the protection of an
+//! access.
 
 use std::collections::VecDeque;
 use std::ffi::{c_int, c_void};
@@ -8,6 +9,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use crate::{Access, Error};
@@ -224,6 +226,90 @@ impl Stream {
     /// The next descriptor that came with what was read.
     pub(crate) fn take_fd(&mut self) -> Option<OwnedFd> {
         self.fds.pop_front()
+    }
+
+    /// One byte, the asks' doorbell. Any number of threads ring at once: a byte carries nothing
+    /// to interleave.
+    fn ring(&self) -> Result<(), Error> {
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_NOSIGNAL;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        let byte = [1u8];
+        loop {
+            // SAFETY: one byte of a live array, to the open socket this stream owns.
+            let sent = unsafe { libc::send(self.fd.as_raw_fd(), byte.as_ptr().cast(), 1, flags) };
+            if sent == 1 {
+                return Ok(());
+            }
+            if sent < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(os("ringing the daemon"));
+        }
+    }
+
+    /// Whether the other end wrote or hung up.
+    fn spoke(&self) -> bool {
+        let mut poll = libc::pollfd { fd: self.fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        // SAFETY: one live `pollfd`; a zero timeout returns at once.
+        unsafe { libc::poll(&raw mut poll, 1, 0) != 0 }
+    }
+}
+
+pub(crate) fn ring(stream: &Stream, _: u64) -> Result<(), Error> {
+    stream.ring()
+}
+
+/// After the start the daemon sends a run process nothing, so its end speaking is its end
+/// closing.
+pub(crate) fn hung_up(stream: &Stream) -> bool {
+    stream.spoke()
+}
+
+pub(crate) fn wait_answer(word: &AtomicU64, expected: u32, _: u64, timeout: Duration) -> bool {
+    super::wait(word, expected, timeout)
+}
+
+/// Askers sleep on their slots' words, shared with the daemon, and ring on the channel.
+pub(crate) struct Bells;
+
+impl Bells {
+    pub(crate) fn new(_: &super::Remote, slots: usize) -> Result<(Bells, Vec<u64>), Error> {
+        Ok((Bells, vec![0; slots + 1]))
+    }
+
+    pub(crate) fn wake(&self, _: usize, word: &AtomicU64) {
+        super::wake(word);
+    }
+
+    pub(crate) fn wait_ring(&self, stream: &mut Stream) -> Result<bool, Error> {
+        let mut bytes = [0u8; 256];
+        Ok(stream.read(&mut bytes)? != 0)
+    }
+}
+
+/// The calling thread's `errno`, put back when dropped.
+pub(crate) struct Errno(c_int);
+
+impl Errno {
+    pub(crate) fn keep() -> Errno {
+        Errno(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    }
+}
+
+impl Drop for Errno {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: the calling thread's `errno`, a live thread-local `int`.
+        unsafe {
+            *libc::__errno_location() = self.0;
+        }
+        #[cfg(target_os = "macos")]
+        // SAFETY: as above.
+        unsafe {
+            *libc::__error() = self.0;
+        }
     }
 }
 

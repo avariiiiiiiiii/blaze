@@ -35,6 +35,8 @@ use super::{
 
 mod explain;
 mod parts;
+#[cfg(test)]
+mod tests;
 
 /// Checks `body`, given what the closures it makes need of it; in a closure, returns what it
 /// needs of its creator, with how many regions its type has, and the captures it needs the
@@ -107,7 +109,7 @@ pub(super) fn check<'db>(
         }
         _ => loans.compute_scopes(body, &cfg, &values),
     });
-    let borrows_entry = phase(Phase::EntrySets, || loans.entry_sets(ctx, body, &cfg));
+    let borrows_entry = phase(Phase::EntrySets, || loans.entry_sets(body, &cfg));
     crate::timings::count(|it| {
         it.bodies += 1;
         it.blocks += body.basic_blocks.len();
@@ -231,7 +233,7 @@ pub(super) fn check<'db>(
             }
             checker.statement(location, &it.kind, span);
             apply(body, &moves, &cfg, location, &mut checker.uninit, &mut checker.ever);
-            loans.after(ctx, body, &cfg, location, &mut checker.in_scope);
+            loans.after(&cfg, location, &mut checker.in_scope);
         }
         if let Some(terminator) = &data.terminator {
             let location = Location { block, statement: data.statements.len() };

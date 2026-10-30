@@ -24,9 +24,58 @@ static TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// A name next to `path` no other write of this process or another uses.
 pub(crate) fn temporary_next_to(path: &Path) -> PathBuf {
+    // alloc: once per caller that keeps the name (a listen's socket).
+    let mut temporary = PathBuf::new();
+    temporary_into(path, &mut temporary);
+    temporary
+}
+
+/// [`temporary_next_to`] into `into`, which is emptied first: a name made in a reused buffer.
+fn temporary_into(path: &Path, into: &mut PathBuf) {
+    use std::fmt::Write as _;
     let n = TEMPORARY.fetch_add(1, Ordering::Relaxed);
-    let name = path.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
-    path.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()))
+    into.as_mut_os_string().clear();
+    if let Some(parent) = path.parent() {
+        into.push(parent);
+    }
+    let name = path.file_name().map(|it| it.to_string_lossy()).unwrap_or_default();
+    blaze_mem::scratch::with_string(|file| {
+        _ = write!(file, ".{name}.{}-{n}.tmp", std::process::id());
+        into.push(&*file);
+    });
+}
+
+/// `f` of a NUL-terminated copy of `path`, made in the thread's byte buffer.
+#[cfg(unix)]
+fn with_c_path<R>(path: &Path, f: impl FnOnce(&std::ffi::CStr) -> io::Result<R>) -> io::Result<R> {
+    use std::os::unix::ffi::OsStrExt as _;
+    blaze_mem::scratch::with_bytes(|bytes| {
+        bytes.extend_from_slice(path.as_os_str().as_bytes());
+        bytes.push(0);
+        let path = std::ffi::CStr::from_bytes_with_nul(bytes)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))?;
+        f(path)
+    })
+}
+
+/// The [`FileName`] `{dir}/{name}`, or an error naming `path` where `name` is not UTF-8 or
+/// makes no name. The name is joined in the thread's string buffer, so only the `FileName` is
+/// made.
+fn child_name(dir: &FileName, name: &std::ffi::OsStr, path: impl FnOnce() -> PathBuf) -> io::Result<FileName> {
+    use std::fmt::Write as _;
+    let file = blaze_mem::scratch::with_string(|joined| {
+        let name = name.to_str()?;
+        _ = write!(joined, "{dir}/{name}");
+        FileName::new(joined)
+    });
+    match file {
+        Some(file) => Ok(file),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            // alloc: an error path.
+            format!("{}: a name that is not UTF-8", path().display()),
+        )),
+    }
 }
 
 pub(crate) fn make_parent(path: &Path) -> io::Result<()> {
@@ -41,17 +90,19 @@ pub(crate) fn make_parent(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     make_parent(path)?;
-    let temporary = temporary_next_to(path);
-    let written = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-    })();
-    if let Err(error) = written {
-        _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    commit_rename(&temporary, path)
+    blaze_mem::scratch::with_path(|temporary| {
+        temporary_into(path, temporary);
+        let written = (|| {
+            let mut file = OpenOptions::new().write(true).create_new(true).open(&*temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        })();
+        if let Err(error) = written {
+            _ = std::fs::remove_file(&*temporary);
+            return Err(error);
+        }
+        commit_rename(temporary, path)
+    })
 }
 
 /// `from` renamed to `to`, and `to`'s directory synced.
@@ -151,24 +202,30 @@ fn meta_of(meta: &std::fs::Metadata) -> Meta {
 /// Every file and directory under `dir` (named `name` under the root), sorted by name;
 /// symbolic links are not followed.
 pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Meta)>> {
+    // alloc: the listing's payload.
     let mut found = Vec::new();
-    let mut todo = vec![(dir.to_path_buf(), name.clone())];
-    while let Some((path, name)) = todo.pop() {
-        for entry in std::fs::read_dir(&path)
-            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?
-        {
+    // Each directory still to read, by its index in `found`; `None` for `dir` itself.
+    let mut todo: Vec<Option<usize>> = Vec::with_capacity(16); // alloc: once per listing.
+    todo.push(None);
+    while let Some(at) = todo.pop() {
+        let read = blaze_mem::scratch::with_path(|path| {
+            path.push(dir);
+            if let Some(at) = at {
+                let file: &FileName = &found[at].0;
+                path.push(&file.as_str()[name.as_str().len() + 1..]);
+            }
+            // alloc: once per directory, std's handle of it.
+            std::fs::read_dir(&*path).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
+        })?;
+        for entry in read {
             let entry = entry?;
-            let file = entry.file_name();
-            let Some(file) = file.to_str().and_then(|it| FileName::new(&format!("{name}/{it}")))
-            else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{}: a name that is not UTF-8", entry.path().display()),
-                ));
-            };
-            let meta = std::fs::symlink_metadata(entry.path())?;
+            // Of the entry itself, not followed through a symlink.
+            let meta = entry.metadata()?;
+            let under = at.map_or(name, |at| &found[at].0);
+            // alloc: std's copy of the entry's name, and the name, the listing's payload.
+            let file = child_name(under, &entry.file_name(), || entry.path())?;
             if meta.is_dir() {
-                todo.push((entry.path(), file.clone()));
+                todo.push(Some(found.len()));
             }
             found.push((file, meta_of(&meta)));
         }
@@ -201,6 +258,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     clone_file(from, to).map_err(|error| match error.raw_os_error() {
         Some(code) if refuses_sharing(code) => io::Error::new(
             io::ErrorKind::Unsupported,
+            // alloc: an error path.
             format!(
                 "the file system of {} cannot share blocks with {} ({error}); blaze does not \
                  copy instead",
@@ -247,17 +305,15 @@ fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn clone_file(from: &Path, to: &Path) -> io::Result<()> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt as _};
-    let c = |path: &Path| {
-        CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))
-    };
-    let (source, target) = (c(from)?, c(to)?);
-    // SAFETY: two NUL-terminated paths.
-    match unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } {
-        0 => Ok(()),
-        _ => Err(io::Error::last_os_error()),
-    }
+    with_c_path(from, |source| {
+        with_c_path(to, |target| {
+            // SAFETY: two NUL-terminated paths.
+            match unsafe { libc::clonefile(source.as_ptr(), target.as_ptr(), 0) } {
+                0 => Ok(()),
+                _ => Err(io::Error::last_os_error()),
+            }
+        })
+    })
 }
 
 /// The file mapped read-only and shared, for [`crate::Effect::Map`], as one [`Mapped`] that the
@@ -287,15 +343,17 @@ pub(crate) fn stamp_of(stat: &libc::stat) -> Stamp {
 /// The root's directory, opened once for a batch of `fstatat`s relative to it.
 #[cfg(unix)]
 fn open_dir(root: &Path) -> io::Result<std::os::fd::OwnedFd> {
-    use std::os::{fd::FromRawFd as _, unix::ffi::OsStrExt as _};
-    let path = std::ffi::CString::new(root.as_os_str().as_bytes())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a path with a NUL"))?;
-    // SAFETY: a NUL-terminated path; the result is a descriptor of its own or -1.
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        let error = io::Error::last_os_error();
-        return Err(io::Error::new(error.kind(), format!("{}: {error}", root.display())));
-    }
+    use std::os::fd::FromRawFd as _;
+    let fd = with_c_path(root, |path| {
+        // SAFETY: a NUL-terminated path; the result is a descriptor of its own or -1.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        match fd < 0 {
+            true => Err(io::Error::last_os_error()),
+            false => Ok(fd),
+        }
+    })
+    // alloc: an error path.
+    .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", root.display())))?;
     // SAFETY: the call returned a descriptor of its own.
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
@@ -329,6 +387,7 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
     use std::os::fd::AsRawFd as _;
     let dir = open_dir(root)?;
     let dir = dir.as_raw_fd();
+    // alloc: the batch's payload.
     let mut out = vec![Stamp::GONE; names.len()];
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get().min(8));
     if names.len() <= SWEEP_CHUNK || threads == 1 {
@@ -354,23 +413,20 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
 /// name; symbolic links are stamped themselves.
 #[cfg(unix)]
 pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
-    use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _};
+    use std::os::fd::AsRawFd as _;
     let fd = open_dir(dir)?;
+    // alloc: the listing's payload.
     let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir)
-        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())))?
-    {
+    // alloc: once per listing, std's handle of the directory.
+    let read = std::fs::read_dir(dir).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())));
+    for entry in read? {
         let entry = entry?;
-        let file = entry.file_name();
-        let Some(file) = file.to_str().and_then(|it| FileName::new(&format!("{name}/{it}"))) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: a name that is not UTF-8", entry.path().display()),
-            ));
-        };
-        let leaf = std::ffi::CString::new(entry.file_name().as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "a name with a NUL"))?;
-        found.push((file, stamp_at(fd.as_raw_fd(), &leaf)));
+        // alloc: std's copy of the entry's name.
+        let leaf = entry.file_name();
+        // alloc: the name, the listing's payload.
+        let file = child_name(name, &leaf, || entry.path())?;
+        let stamp = with_c_path(Path::new(&leaf), |leaf| Ok(stamp_at(fd.as_raw_fd(), leaf)))?;
+        found.push((file, stamp));
     }
     found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(found)

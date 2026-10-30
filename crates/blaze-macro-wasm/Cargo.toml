@@ -15,9 +15,9 @@ doctest = false
 
 [dependencies]
 blake3.workspace = true
-ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
 sha2 = "0.10"
+smallvec.workspace = true
 # The one `wasmtime` 49's Cranelift names its targets with.
 target-lexicon = "0.13"
 # The version whose Cranelift is the one hir-ty-codegen compiles with (`cranelift-codegen` 0.136).
@@ -27,7 +27,9 @@ base-db.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-expand.workspace = true
+blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 blaze-usercode.workspace = true
 salsa.workspace = true
 hir-expand.workspace = true
@@ -38,6 +40,9 @@ proc-macro-api.workspace = true
 blaze-store.workspace = true
 span.workspace = true
 tt.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
 
 [lints]
 workspace = true

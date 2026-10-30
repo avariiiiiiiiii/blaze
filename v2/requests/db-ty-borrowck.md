@@ -176,3 +176,9 @@ copies as the proptest reference.
   allocation but the arrays it returns and its cursors".
 
 Why: one counting sort in the tree.
+
+> forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-ty-d-borrowck: `Csr::build` and `Facts::freeze` build through
+> `blaze_ids::radix::Csr::build(..).into_parts()`; `starts` and `rewind` deleted; module doc
+> as asked. The existing tests (`a_relation_is_its_facts_grouped_in_order`,
+> `a_csr_keeps_each_lists_order`) cover both.

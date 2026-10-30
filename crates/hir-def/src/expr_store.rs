@@ -35,6 +35,7 @@ use crate::{
         Array, AsmOperand, Binding, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked,
         InlineAsm, Label, LabelId, Literal, MatchArm, OffsetOf, Pat, PatId, RecordFieldPat,
         RecordLitField, RecordSpread, Statement, Statements,
+        col::{Col, SlabLayout, SlabWriter},
         columns::{self, Frozen, Growing, HirColumns},
     },
     nameres::{DefMap, block_def_map},
@@ -140,23 +141,23 @@ struct ExpressionOnlyStore {
     labels: Arena<Label>,
     /// The closure/coroutine/anon const that owns each binding, by binding: [`NO_OWNER`] for a
     /// binding the top level expression owns. Empty when it owns them all.
-    binding_owners: Box<[u32]>,
+    binding_owners: Col<u32>,
     /// Block expressions in this store that may contain inner items.
-    block_scopes: Box<[BlockId]>,
+    block_scopes: Col<BlockId>,
 
     /// The hygiene of variable usages whose hygiene is not the root's, by expression or pattern
     /// in increasing order.
     ///
     /// Expressions (and destructuring patterns) that can be recorded here are single segment path, although not all single segments path refer
     /// to variables and have hygiene (some refer to items, we don't know at this stage).
-    ident_hygiene: Box<[(ExprOrPatIdPacked, HygieneId)]>,
+    ident_hygiene: Col<(ExprOrPatIdPacked, HygieneId)>,
 
     /// The edition of each block that a macro wrote, by block in increasing order: it is the
     /// macro's, not the one of the crate that uses the macro.
-    block_editions: Box<[(ExprId, Edition)]>,
+    block_editions: Col<(ExprId, Edition)>,
 
     /// The closures written with `#[rustc_inherit_overflow_checks]`, in increasing order.
-    overflow_inheriting: Box<[ExprId]>,
+    overflow_inheriting: Col<ExprId>,
 
     /// Maps expression roots to their origin.
     ///
@@ -263,6 +264,8 @@ pub struct ExpressionStoreBuilder {
 
     /// What `finish` builds the back maps in, empty until then.
     freeze: FreezeScratch,
+    /// What `finish` gathers and sorts the store's side columns in, empty until then.
+    packing: Packing,
 
     /// Whether lowering records the source map. Without it lowering pushes to none of the maps
     /// above, and `finish` gives an empty source map: the store is the same either way, as
@@ -500,6 +503,15 @@ struct Scratch {
     columns: HirColumns<Growing>,
     types: TypeColumns<Growing>,
     lists: Lists,
+    bindings: Arena<Binding>,
+    labels: Arena<Label>,
+    lifetimes: Arena<LifetimeRef>,
+    binding_owners: FxHashMap<BindingId, ExprId>,
+    block_scopes: Vec<BlockId>,
+    ident_hygiene: FxHashMap<ExprOrPatIdPacked, HygieneId>,
+    type_hygiene: Vec<(TypeRefId, HygieneId)>,
+    block_editions: FxHashMap<ExprId, Edition>,
+    overflow_inheriting: FxHashSet<ExprId>,
     expr_map: Vec<(ExprSource, ExprOrPatIdPacked)>,
     pat_map: Vec<(PatSource, ExprOrPatIdPacked)>,
     label_map: Vec<(LabelSource, LabelId)>,
@@ -512,8 +524,54 @@ struct Scratch {
     types_map_back: BackPushes<TypeRef<'static>, ast::Type>,
     lifetime_map_back: BackPushes<LifetimeRef, ast::Lifetime>,
     binding_definitions: Vec<(BindingId, PatId)>,
-    /// What [`ExpressionStoreBuilder::finish`] builds the back maps in.
+    field_map_back: Vec<(ExprId, FieldSource)>,
+    pat_field_map_back: Vec<(PatId, PatFieldSource)>,
+    /// What [`ExpressionStoreBuilder::finish`] builds the back maps and sorts the forward maps
+    /// in.
     freeze: FreezeScratch,
+    packing: Packing,
+}
+
+/// What [`ExpressionStoreBuilder::finish`] gathers the store's side columns in, and sorts them
+/// in, before it copies them into their slab.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Packing {
+    owners: Vec<u32>,
+    hygiene: Vec<(ExprOrPatIdPacked, HygieneId)>,
+    editions: Vec<(ExprId, Edition)>,
+    inheriting: Vec<ExprId>,
+    /// The radix sorts' buffers.
+    editions_sort: Vec<(ExprId, Edition)>,
+    inheriting_sort: Vec<ExprId>,
+}
+
+impl Packing {
+    fn clear(&mut self) {
+        let Packing { owners, hygiene, editions, inheriting, editions_sort, inheriting_sort } =
+            self;
+        owners.clear();
+        hygiene.clear();
+        editions.clear();
+        inheriting.clear();
+        editions_sort.clear();
+        inheriting_sort.clear();
+    }
+
+    fn capacity(&self) -> usize {
+        self.owners.capacity()
+            + self.hygiene.capacity()
+            + self.editions.capacity()
+            + self.inheriting.capacity()
+            + self.editions_sort.capacity()
+            + self.inheriting_sort.capacity()
+    }
+}
+
+/// An exact copy of a pooled arena: one allocation of its length, none when it is empty.
+fn exact_arena<T: Clone>(pooled: &Arena<T>) -> Arena<T> {
+    let mut arena = Arena::with_capacity(pooled.len());
+    arena.alloc_many(pooled.values().cloned());
+    arena
 }
 
 /// The scratch sets a thread keeps, and the elements above which a set is dropped instead of
@@ -537,8 +595,10 @@ impl Scratch {
     /// Empties `self` and keeps it for the next builder on this thread, unless the pool is
     /// full, `self` is over [`POOL_ELEMENTS`] or the thread is exiting.
     fn give(mut self) {
+        // An `Arena` reports only its length, so the size is measured before clearing.
+        let held = self.capacity();
         self.clear();
-        if self.capacity() > POOL_ELEMENTS {
+        if held > POOL_ELEMENTS {
             return;
         }
         let _exiting = POOL.try_with(move |pool| {
@@ -554,6 +614,15 @@ impl Scratch {
             columns,
             types,
             lists,
+            bindings,
+            labels,
+            lifetimes,
+            binding_owners,
+            block_scopes,
+            ident_hygiene,
+            type_hygiene,
+            block_editions,
+            overflow_inheriting,
             expr_map,
             pat_map,
             label_map,
@@ -566,11 +635,23 @@ impl Scratch {
             types_map_back,
             lifetime_map_back,
             binding_definitions,
+            field_map_back,
+            pat_field_map_back,
             freeze,
+            packing,
         } = self;
         columns.clear();
         types.clear();
         lists.clear();
+        bindings.clear();
+        labels.clear();
+        lifetimes.clear();
+        binding_owners.clear();
+        block_scopes.clear();
+        ident_hygiene.clear();
+        type_hygiene.clear();
+        block_editions.clear();
+        overflow_inheriting.clear();
         expr_map.clear();
         pat_map.clear();
         label_map.clear();
@@ -583,13 +664,25 @@ impl Scratch {
         types_map_back.clear();
         lifetime_map_back.clear();
         binding_definitions.clear();
+        field_map_back.clear();
+        pat_field_map_back.clear();
         freeze.clear();
+        packing.clear();
     }
 
     fn capacity(&self) -> usize {
         self.columns.capacity()
             + self.types.capacity()
             + self.lists.capacity()
+            + self.bindings.len()
+            + self.labels.len()
+            + self.lifetimes.len()
+            + self.binding_owners.capacity()
+            + self.block_scopes.capacity()
+            + self.ident_hygiene.capacity()
+            + self.type_hygiene.capacity()
+            + self.block_editions.capacity()
+            + self.overflow_inheriting.capacity()
             + self.expr_map.capacity()
             + self.pat_map.capacity()
             + self.label_map.capacity()
@@ -602,7 +695,10 @@ impl Scratch {
             + self.types_map_back.capacity()
             + self.lifetime_map_back.capacity()
             + self.binding_definitions.capacity()
+            + self.field_map_back.capacity()
+            + self.pat_field_map_back.capacity()
             + self.freeze.capacity()
+            + self.packing.capacity()
     }
 }
 
@@ -613,6 +709,15 @@ impl ExpressionStoreBuilder {
             columns,
             types,
             lists,
+            bindings,
+            labels,
+            lifetimes,
+            binding_owners,
+            block_scopes,
+            ident_hygiene,
+            type_hygiene,
+            block_editions,
+            overflow_inheriting,
             expr_map,
             pat_map,
             label_map,
@@ -625,23 +730,24 @@ impl ExpressionStoreBuilder {
             types_map_back,
             lifetime_map_back,
             binding_definitions,
+            field_map_back,
+            pat_field_map_back,
             freeze,
+            packing,
         } = Scratch::take();
         ExpressionStoreBuilder {
             columns,
             types,
             lists,
-            bindings: Arena::new(),
-            labels: Arena::new(),
-            lifetimes: Arena::new(),
-            binding_owners: FxHashMap::default(),
-            // alloc: empty until a block with items, once per store.
-            block_scopes: Vec::new(),
-            ident_hygiene: FxHashMap::default(),
-            // alloc: empty until a macro-expanded type, once per store.
-            type_hygiene: Vec::new(),
-            block_editions: FxHashMap::default(),
-            overflow_inheriting: FxHashSet::default(),
+            bindings,
+            labels,
+            lifetimes,
+            binding_owners,
+            block_scopes,
+            ident_hygiene,
+            type_hygiene,
+            block_editions,
+            overflow_inheriting,
             inference_roots: None,
             expr_map,
             expr_map_back,
@@ -654,15 +760,14 @@ impl ExpressionStoreBuilder {
             lifetime_map_back,
             lifetime_map,
             binding_definitions,
-            // alloc: empty until a record field, once per store.
-            field_map_back: Vec::new(),
-            // alloc: empty until a record pattern field, once per store.
-            pat_field_map_back: Vec::new(),
+            field_map_back,
+            pat_field_map_back,
             template_map: None,
             expansions,
             // alloc: empty unless lowering reports one, the error path.
             diagnostics: Vec::new(),
             freeze,
+            packing,
             record: true,
         }
     }
@@ -924,23 +1029,24 @@ impl ExpressionStoreBuilder {
     }
 
     /// The finished store and source map: each column, table and map copied out of the pooled
-    /// scratch at its exact length (one allocation per non-empty one, no `shrink_to_fit`
-    /// reallocation), the scratch given back to this thread's pool.
+    /// scratch at its exact length, the store's `Copy` columns into slabs, the scratch given
+    /// back to this thread's pool. The gathering and sorting run in the pooled scratch too, so
+    /// the copies are the only allocations.
     pub fn finish(self) -> (ExpressionStore, ExpressionStoreSourceMap) {
         let Self {
             block_scopes,
             columns,
             types,
             lists,
-            mut labels,
-            mut bindings,
+            labels,
+            bindings,
             binding_owners,
             ident_hygiene,
             type_hygiene,
             block_editions,
             overflow_inheriting,
             inference_roots: mut expr_roots,
-            mut lifetimes,
+            lifetimes,
 
             expr_map,
             expr_map_back,
@@ -959,6 +1065,7 @@ impl ExpressionStoreBuilder {
             expansions,
             diagnostics,
             freeze,
+            packing,
             record,
         } = self;
         debug_assert_eq!(lists.stacked(), None, "lowering left a list on this stack");
@@ -966,6 +1073,15 @@ impl ExpressionStoreBuilder {
             columns,
             types,
             lists,
+            bindings,
+            labels,
+            lifetimes,
+            binding_owners,
+            block_scopes,
+            ident_hygiene,
+            type_hygiene,
+            block_editions,
+            overflow_inheriting,
             expr_map,
             pat_map,
             label_map,
@@ -978,11 +1094,15 @@ impl ExpressionStoreBuilder {
             types_map_back,
             lifetime_map_back,
             binding_definitions,
+            field_map_back,
+            pat_field_map_back,
             freeze,
+            packing,
         };
         let columns = scratch.columns.freeze_into();
         let types = scratch.types.freeze_into();
-        let has_exprs = !columns.is_empty() || !labels.is_empty() || !bindings.is_empty();
+        let has_exprs =
+            !columns.is_empty() || !scratch.labels.is_empty() || !scratch.bindings.is_empty();
         let source_map = match record {
             false => ExpressionStoreSourceMap::default(),
             true => {
@@ -991,19 +1111,29 @@ impl ExpressionStoreBuilder {
                 let freeze = &mut scratch.freeze;
                 let expr_map_back = scratch.expr_map_back.freeze(columns.expr_count(), freeze);
                 let pat_map_back = scratch.pat_map_back.freeze(columns.pat_count(), freeze);
-                let label_map_back = scratch.label_map_back.freeze(labels.len(), freeze);
+                let label_map_back = scratch.label_map_back.freeze(scratch.labels.len(), freeze);
                 let types_map_back = scratch.types_map_back.freeze(types.len(), freeze);
-                let lifetime_map_back = scratch.lifetime_map_back.freeze(lifetimes.len(), freeze);
-                let binding_definitions =
-                    BindingPats::from_pushed(&mut scratch.binding_definitions, bindings.len());
-                let expr_map = SourceTable::from_pushed(&mut scratch.expr_map);
-                let pat_map = SourceTable::from_pushed(&mut scratch.pat_map);
-                let label_map = SourceTable::from_pushed(&mut scratch.label_map);
-                let types_map = SourceTable::from_pushed(&mut scratch.types_map);
-                let lifetime_map = SourceTable::from_pushed(&mut scratch.lifetime_map);
-                let expansions = SourceTable::from_pushed(&mut scratch.expansions);
-                let field_map_back = IdTable::from_pushed(field_map_back);
-                let pat_field_map_back = IdTable::from_pushed(pat_field_map_back);
+                let lifetime_map_back =
+                    scratch.lifetime_map_back.freeze(scratch.lifetimes.len(), freeze);
+                let binding_definitions = BindingPats::from_pushed(
+                    &mut scratch.binding_definitions,
+                    scratch.bindings.len(),
+                );
+                let sort = &mut freeze.sort;
+                let expr_map = SourceTable::from_pushed_in(&mut scratch.expr_map, &mut sort.exprs);
+                let pat_map = SourceTable::from_pushed_in(&mut scratch.pat_map, &mut sort.pats);
+                let label_map =
+                    SourceTable::from_pushed_in(&mut scratch.label_map, &mut sort.labels);
+                let types_map =
+                    SourceTable::from_pushed_in(&mut scratch.types_map, &mut sort.types);
+                let lifetime_map =
+                    SourceTable::from_pushed_in(&mut scratch.lifetime_map, &mut sort.lifetimes);
+                let expansions =
+                    SourceTable::from_pushed_in(&mut scratch.expansions, &mut sort.expansions);
+                let field_map_back =
+                    IdTable::from_pushed_in(&mut scratch.field_map_back, &mut sort.fields);
+                let pat_field_map_back =
+                    IdTable::from_pushed_in(&mut scratch.pat_field_map_back, &mut sort.field_pats);
                 let template_map = template_map.map(|template| {
                     let FormatTemplate {
                         format_args_to_captures,
@@ -1046,59 +1176,78 @@ impl ExpressionStoreBuilder {
                 }
             }
         };
-        scratch.give();
-
-        labels.shrink_to_fit();
-        bindings.shrink_to_fit();
-        lifetimes.shrink_to_fit();
-
-        let store = {
-            let expr_only = if has_exprs {
+        let expr_only = match has_exprs {
+            false => None,
+            true => {
                 if let Some(expr_roots) = &mut expr_roots {
                     expr_roots.shrink_to_fit();
                 }
-                let binding_owners = match binding_owners.is_empty() {
-                    true => Box::default(),
-                    false => {
-                        // alloc: the column itself, once per store.
-                        let mut column = vec![NO_OWNER; bindings.len()].into_boxed_slice();
-                        for (binding, owner) in binding_owners {
-                            column[binding.into_raw().into_u32() as usize] =
-                                owner.into_raw().into_u32();
-                        }
-                        column
-                    }
-                };
-                // alloc: the frozen sorted column, once per store.
-                let mut ident_hygiene: Box<[_]> = ident_hygiene.into_iter().collect();
-                ident_hygiene.sort_unstable_by_key(|&(id, _)| id);
-                // alloc: the frozen sorted column, once per store.
-                let mut block_editions: Box<[_]> = block_editions.into_iter().collect();
-                radix::sort_copy_by_key(&mut block_editions, |&(id, _)| id.into_raw().into_u32());
-                // alloc: the frozen sorted column, once per store.
-                let mut overflow_inheriting: Box<[_]> = overflow_inheriting.into_iter().collect();
-                radix::sort_copy_by_key(&mut overflow_inheriting, |it| it.into_raw().into_u32());
-                // alloc: once per store, keeps signature-only stores small.
-                Some(Box::new(ExpressionOnlyStore {
-                    columns,
+                let Scratch {
                     bindings,
                     labels,
                     binding_owners,
-                    block_scopes: block_scopes.into_boxed_slice(),
+                    block_scopes,
+                    ident_hygiene,
+                    block_editions,
+                    overflow_inheriting,
+                    packing,
+                    ..
+                } = &mut scratch;
+                if !binding_owners.is_empty() {
+                    packing.owners.resize(bindings.len(), NO_OWNER);
+                    for (binding, owner) in binding_owners.iter() {
+                        packing.owners[binding.into_raw().into_u32() as usize] =
+                            owner.into_raw().into_u32();
+                    }
+                }
+                packing.hygiene.extend(ident_hygiene.iter().map(|(&id, &hygiene)| (id, hygiene)));
+                packing.hygiene.sort_unstable_by_key(|&(id, _)| id);
+                packing.editions.extend(block_editions.iter().map(|(&id, &edition)| (id, edition)));
+                radix::sort_copy_by_key_in(
+                    &mut packing.editions,
+                    |&(id, _)| id.into_raw().into_u32(),
+                    &mut packing.editions_sort,
+                );
+                packing.inheriting.extend(overflow_inheriting.iter().copied());
+                radix::sort_copy_by_key_in(
+                    &mut packing.inheriting,
+                    |it| it.into_raw().into_u32(),
+                    &mut packing.inheriting_sort,
+                );
+                // Every element type here is 4-byte aligned, so no padding between columns.
+                let mut layout = SlabLayout::default();
+                layout.add::<BlockId>(block_scopes.len());
+                layout.add::<(ExprOrPatIdPacked, HygieneId)>(packing.hygiene.len());
+                layout.add::<(ExprId, Edition)>(packing.editions.len());
+                layout.add::<u32>(packing.owners.len());
+                layout.add::<ExprId>(packing.inheriting.len());
+                let mut slab = SlabWriter::new(layout);
+                let block_scopes = slab.copy(&block_scopes[..]);
+                let ident_hygiene = slab.copy(&packing.hygiene[..]);
+                let block_editions = slab.copy(&packing.editions[..]);
+                let binding_owners = slab.copy(&packing.owners[..]);
+                let overflow_inheriting = slab.copy(&packing.inheriting[..]);
+                // alloc: once per store, keeps signature-only stores small.
+                Some(Box::new(ExpressionOnlyStore {
+                    columns,
+                    bindings: exact_arena(bindings),
+                    labels: exact_arena(labels),
+                    binding_owners,
+                    block_scopes,
                     ident_hygiene,
                     block_editions,
                     overflow_inheriting,
                     expr_roots: expr_roots
                         .expect("should always finish with a `Some(_)` expr_roots"),
                 }))
-            } else {
-                None
-            };
-            let type_hygiene = (!type_hygiene.is_empty()).then(|| type_hygiene.into_boxed_slice());
-            ExpressionStore { expr_only, types, lifetimes, type_hygiene }
+            }
         };
-
-        (store, source_map)
+        let lifetimes = exact_arena(&scratch.lifetimes);
+        // alloc: the column's one exact copy, only for a store with macro-expanded types.
+        let type_hygiene = (!scratch.type_hygiene.is_empty())
+            .then(|| Box::<[_]>::from(&scratch.type_hygiene[..]));
+        scratch.give();
+        (ExpressionStore { expr_only, types, lifetimes, type_hygiene }, source_map)
     }
 }
 
@@ -1608,6 +1757,13 @@ impl ExpressionStore {
         self.expr_only.as_deref().map_or(0, |it| it.columns.expr_count())
     }
 
+    /// Whether any expression is a closure: a byte compare per expression over `expr_kind`.
+    #[inline]
+    pub fn has_closures(&self) -> bool {
+        let closure = columns::ExprKind::Closure as u8;
+        self.expr_only.as_deref().is_some_and(|it| it.columns.expr_kind.contains(&closure))
+    }
+
     /// How many patterns the store holds.
     #[inline]
     pub fn pat_count(&self) -> usize {
@@ -1826,9 +1982,11 @@ impl Index<LifetimeRefId> for ExpressionStore {
 
 #[cfg(test)]
 mod scratch_tests {
+    use blaze_alloc_count::{assert_at_most, measure};
     use syntax::SyntaxKind;
 
     use super::{source_map::tests::src, *};
+    use crate::hir::BindingAnnotation;
 
     fn empty_pool() {
         POOL.with(|pool| pool.borrow_mut().clear());
@@ -1877,6 +2035,84 @@ mod scratch_tests {
         let mut builder = ExpressionStoreBuilder::new();
         lower_one(&mut builder, shift);
         builder.finish()
+    }
+
+    /// Pushes to every table lowering fills beside the columns: the arenas, the hash maps, the
+    /// side vectors, and `n` entries of a forward map and of the field map.
+    fn lower_every_table(builder: &mut ExpressionStoreBuilder, n: u32) {
+        lower_one(builder, 0);
+        let missing = builder.alloc_expr(Expr::Missing);
+        let arm = MatchArm { pat: builder.alloc_pat(Pat::Wild), guard: None, expr: missing };
+        let matched = builder.alloc_expr(Expr::Match { expr: missing, arms: &[arm] });
+        let binding = builder.bindings.alloc(Binding {
+            name: Name::missing(),
+            mode: BindingAnnotation::Unannotated,
+            problems: None,
+            hygiene: HygieneId::ROOT,
+        });
+        builder.labels.alloc(Label { name: Name::missing() });
+        let lifetime = builder.lifetimes.alloc(LifetimeRef::Static);
+        builder.binding_owners.insert(binding, matched);
+        builder.ident_hygiene.insert(missing.into(), HygieneId::ROOT);
+        builder.block_editions.insert(matched, Edition::Edition2021);
+        builder.overflow_inheriting.insert(matched);
+        let unit = builder.alloc_type_ref(TypeRef::UNIT);
+        builder.type_hygiene.push((unit, HygieneId::ROOT));
+        for at in 0..n {
+            let (start, end) = (10 * at, 10 * at + 5);
+            let ptr = src(0, false, SyntaxKind::MATCH_EXPR, start, end);
+            builder.expr_map.push((ptr, matched.into()));
+            let field = src(0, false, SyntaxKind::RECORD_EXPR_FIELD, at, at + 1);
+            builder.field_map_back.push((missing, field));
+        }
+        builder.lifetime_map.push((src(0, false, SyntaxKind::LIFETIME, 1, 3), lifetime));
+    }
+
+    /// A warm builder lowers without allocating: every table it pushes to is pooled scratch.
+    #[test]
+    fn a_warm_lowering_allocates_nothing() {
+        empty_pool();
+        let mut cold = ExpressionStoreBuilder::new();
+        lower_every_table(&mut cold, 1000);
+        drop(cold.finish());
+        let mut warm = ExpressionStoreBuilder::new();
+        assert_at_most(0, "lowering on warm scratch", || lower_every_table(&mut warm, 1000));
+        drop(warm.finish());
+    }
+
+    /// `finish` allocates as many blocks for a body with a thousand map entries as for one with
+    /// ten: no sort takes a buffer that grows with the body.
+    #[test]
+    fn finishing_allocates_no_scratch() {
+        empty_pool();
+        let finish_of = |n| {
+            let mut builder = ExpressionStoreBuilder::new();
+            lower_every_table(&mut builder, n);
+            measure(|| builder.finish()).1.allocations
+        };
+        finish_of(1000);
+        assert_eq!(finish_of(1000), finish_of(10), "a sort's buffer grew with the body");
+    }
+
+    /// Without a source map, a warm lowering and `finish` allocate exactly the finished store's
+    /// blocks: the expression box, the column slab, the side-column slab, the three arenas,
+    /// the type slab and the type hygiene.
+    #[test]
+    fn a_warm_store_is_its_blocks_and_nothing_else() {
+        empty_pool();
+        let lowered = || {
+            let mut builder = ExpressionStoreBuilder::new();
+            builder.skip_source_map();
+            lower_every_table(&mut builder, 10);
+            builder.finish()
+        };
+        drop(lowered());
+        let ((store, _), used) = measure(lowered);
+        assert_eq!(used.allocations, 8, "a store of 8 blocks");
+        let only = store.expr_only.as_deref().expect("a store with expressions");
+        assert!(only.columns.arms.in_slab(), "match arms are in the column slab");
+        assert!(only.block_editions.in_slab() && only.binding_owners.in_slab());
+        assert_eq!(&*only.overflow_inheriting, &[only.block_editions[0].0]);
     }
 
     #[test]

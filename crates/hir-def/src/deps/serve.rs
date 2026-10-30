@@ -44,6 +44,7 @@ pub trait ImageStore: Sync {
     /// image is checked and encoded by one task, so [`serve`] and [`store`] take the larger of
     /// the work over the cores and the largest crate's. Running them in order on one thread
     /// gives the same result.
+    // dyn: one call per batch of crates, its task called once per crate
     fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
         (0..count).for_each(task);
     }
@@ -103,7 +104,9 @@ pub struct Stored {
 /// The name of `krate` in an error.
 pub(crate) fn crate_name(db: &Db, krate: Crate) -> String {
     match &krate.extra_data(db).display_name {
+        // alloc: error text
         Some(name) => name.to_string(),
+        // alloc: error text
         None => format!("of root file {:?}", krate.data(db).root_file_id),
     }
 }
@@ -121,12 +124,15 @@ pub fn serve(
     db: &mut Db,
     crates: &[Crate],
     build: ContentId,
+    // dyn: the driver's store, one call per crate per session
     images: &dyn ImageStore,
     mode: Mode,
 ) -> Result<Served, String> {
     let keys = keys(&*db, crates, build);
+    // alloc: setup: once per session
     let mut order: Vec<(Crate, ContentId)> = keys.iter().map(|(&krate, &key)| (krate, key)).collect();
     order.sort_unstable_by_key(|&(_, key)| key);
+    // alloc: setup: one slot per crate, once per session
     let found: Vec<OnceLock<Fetched>> = order.iter().map(|_| OnceLock::new()).collect();
     {
         let db = &*db;
@@ -138,7 +144,8 @@ pub fn serve(
     let mut served = FxHashMap::default();
     let mut maps = FxHashMap::default();
     let mut lang_items = FxHashMap::default();
-    let mut hits = Vec::new();
+    // alloc: setup: once per session
+    let mut hits = Vec::with_capacity(order.len());
     for (&(krate, key), found) in order.iter().zip(found) {
         let found = found.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, krate))
@@ -161,17 +168,21 @@ type Fetched = Result<Option<(Arc<Aligned>, [Range<usize>; Part::ALL.len()])>, S
 
 /// The image of `krate` under `key`, opened and its def map's files checked: one task of
 /// [`serve`].
+// dyn: the driver's store, one call per crate per session
 fn fetch(db: &Db, krate: Crate, key: ContentId, images: &dyn ImageStore) -> Fetched {
     let name = || crate_name(db, krate);
     let Some(bytes) = images
         .get(&key)
+        // alloc: error text
         .map_err(|why| format!("reading the image of crate {} (key {key:?}): {why}", name()))?
     else {
         return Ok(None);
     };
     let image = ImageRef::open(&bytes, key)
+        // alloc: error text
         .map_err(|why| format!("the image of crate {} (key {key:?}): {why}", name()))?;
     if let Some(why) = frozen::unreadable(db, krate, image.part(Part::DefMap)) {
+        // alloc: error text
         return Err(format!(
             "the image of crate {} (key {key:?}) names files that are not the crate's: \
              {why}; the key leaves out an input",
@@ -184,6 +195,7 @@ fn fetch(db: &Db, krate: Crate, key: ContentId, images: &dyn ImageStore) -> Fetc
 
 fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
     use salsa::{Durability, Setter};
+    // alloc: setup: the one input value, once per session
     let images = Arc::new(images);
     match DepImages::try_get(&*db) {
         Some(it) => {
@@ -198,14 +210,19 @@ fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
 /// Writes to `images` the image of each crate [`serve`] found none of, resolving it in `db`,
 /// one task a crate ([`ImageStore::for_each`]). A crate whose image would not cover every
 /// input is refused, with why. An image the store will not keep is an error naming the crate.
+// dyn: the driver's store, one call per crate per session
 pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored, String> {
+    // alloc: setup: once per session
     let hits: FxHashSet<Crate> = served.hits.iter().copied().collect();
+    // alloc: setup: once per session
     let mut order: Vec<(Crate, ContentId)> = (served.keys.iter())
         .filter(|(krate, _)| !hits.contains(krate))
         .map(|(&krate, &key)| (krate, key))
+        // alloc: setup: once per session
         .collect();
     order.sort_unstable_by_key(|&(_, key)| key);
     let made: Vec<OnceLock<Result<Option<Refused>, String>>> =
+        // alloc: setup: one slot per crate, once per session
         order.iter().map(|_| OnceLock::new()).collect();
     images.for_each(order.len(), &|at| {
         let (krate, key) = order[at];
@@ -229,6 +246,7 @@ fn make(
     db: &Db,
     krate: Crate,
     key: ContentId,
+    // dyn: the driver's store, one call per crate per session
     images: &dyn ImageStore,
 ) -> Result<Option<Refused>, String> {
     let parts = match refusal(db, krate).map_or_else(|| encode(db, krate), Err) {
@@ -238,6 +256,7 @@ fn make(
     let image = write_image(key, [&parts[0], &parts[1], &parts[2]]);
     drop(parts);
     images.put(key, image).map_err(|why| {
+        // alloc: error text
         format!("keeping the image of crate {} (key {key:?}): {why}", crate_name(db, krate))
     })?;
     Ok(None)
@@ -264,6 +283,7 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
         if let Some(file) = module.origin.file_id() {
             let file = file.file_id(db);
             if db.file_source_root(file).source_root_id(db) != root {
+                // alloc: why a crate is refused, once per refused crate
                 return Some(Refused::OutsideSourceRoot { what: format!("module file {file:?}") });
             }
         }
@@ -271,12 +291,14 @@ pub(super) fn refusal(db: &Db, krate: Crate) -> Option<Refused> {
             let loc = call.lookup(db);
             match &loc.def.kind {
                 MacroDefKind::ProcMacro(..) => {
+                    // alloc: why a crate is refused, once per refused crate
                     let call = format!("{:?} of crate {}", call, crate_name(db, loc.def.krate));
                     return Some(Refused::ProcMacro { call });
                 }
                 MacroDefKind::BuiltInEager(_, expander)
                     if expander.is_include_like() && include_outside(db, call, root) =>
                 {
+                    // alloc: why a crate is refused, once per refused crate
                     return Some(Refused::OutsideSourceRoot { what: format!("include {call:?}") });
                 }
                 _ => {}

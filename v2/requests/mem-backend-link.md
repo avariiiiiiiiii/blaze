@@ -16,7 +16,8 @@ a proptest against the build scripts' copy). Its workspace dependency line is re
 3. Delete `crates/blaze-link/src/macho/sha256.rs` (its tests: known digests, every path against
    portable, random states, all in `blaze-sha256/src/tests.rs`).
 
-> forwarded to requests-link-fuzz (my child; `blaze-link`'s Mach-O files are held by its `-next1` children; mem-backend-link is DONE). The root `blaze-sha256` line is in.
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): `blaze-sha256.workspace = true` in blaze-link's `[dependencies]`; `macho.rs` `mod sha256;` -> `use blaze_sha256 as sha256;` (with the other `use`s); `macho/sha256.rs` deleted. `sign.rs` and `macho/tests.rs` call `sha256::digest` unchanged.
 
 # mem-backend-link: blaze-link's tables and stage scratch onto blaze-mem
 
@@ -39,6 +40,9 @@ symbol table's shards on reserved regions, with their tests) and `crates/blaze-l
    (`blaze-mem` uses it already; `Vec<T, &Frame>` needs it.)
 2. In the `mod` list add, in alphabetical place: `mod arena;` (before `mod commit;`) and
    `mod intern;` (after `mod file;`).
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): found in the tree already (`#![feature(allocator_api)]`, `mod arena;`, `mod intern;` in `lib.rs`); checked, nothing to change.
 
 ## L2 (core-model, `symbols.rs`; core-stage, `lib.rs`): the symbol table on reserved regions
 
@@ -151,6 +155,9 @@ a one-function change, then 150 000 one-function relinks' keys, ids and names in
 allocations; every shard passes its first commit step), `a_new_table_reserves_and_commits_nothing`
 (3 allocations to make one, 10.5 GiB reserved).
 
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): found in the tree already (`symbols.rs` on `crate::intern`'s shards, the hash functions `pub(crate)`, `Symbols::new() -> Result<_, MemError>`, `key`/`id`/`len` accessors, `Image::new` calls `Symbols::new()` with the error path); checked against every edit, nothing to change.
+
 ## L3 (core-stage: `lib.rs`, `stage.rs`, `place.rs`, `write.rs`, `file.rs`, `live.rs`; core-model: `state.rs`, `native.rs`): the stage's scratch on a `Frame`
 
 Why: the stage's scratch is a `bumpalo::Bump` the image keeps and resets per stage. `reset`
@@ -204,6 +211,9 @@ collected vectors, filled slices and leaked slices on a warm frame; the same roo
 `tests.rs`'s `an_incremental_stage_allocates_a_constant_whatever_the_image_holds` and
 `relocation_allocates_nothing_per_fixup` hold the whole stage; with L3 and L4 their counts drop
 (lower `STAGE_BUDGET` to what they measure once the coordinator runs them).
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): found in the tree but one site: `native.rs` ~2966 still had `let arena: &'a bumpalo::Bump = self.arena;`, now `&'a blaze_mem::Frame` (`Frame::alloc_str`). No `Bump`, `BumpVec`, `into_bump_slice`, `alloc_slice_fill_copy` or `from_iter_in` is left in the crate, and no reader uses `bumpalo` any more, so blaze-link's `bumpalo` line is gone (`link.md` align dedup item 4).
 
 ## L4 (core-model: `cow.rs`; core-stage: `stage.rs`, `lib.rs`): a stage's sets in its frame
 
@@ -353,6 +363,9 @@ No other code names these fields' types: `place.rs` and `write.rs` make their ow
 `IdSet::default()` (heap, unchanged) and `write.rs`'s `splice(&self, drop: &IdSet, ..)` takes one
 of those.
 
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): found in the tree already (`IdSet<A>`/`SymSet<A>` with `new_in`, the stage's four sets in its frame, `sets_in_a_frame_allocate_nothing`); checked, nothing to change. `link.md` "dedup: bits" item 2 is held back by it (see there).
+
 ## L5 (lane mem, `crates/blaze-mem`): what the image state's copy-on-write chunks need
 
 Not a blaze-link edit; for `mem-backend` to take to lane mem. After L2 to L4 the warm relink's
@@ -378,6 +391,25 @@ at install (current Fedora and Arch ship 1 048 576), and the daemon reads it at 
 naming it when it is below what its image budget needs (no-fallback). Recorded in
 `docs/v2/plan/lanes/mem/backend-link.md`.
 
+> forwarded to mem (`crates/blaze-mem`, lane mem; told by tmux).
+
+> done by mem (2026-10-29). `blaze_mem::Shared<'p, T>` (`crates/blaze-mem/src/pool.rs`) is a
+> slot of a `Pool<pool::Counted<T>>` with an atomic count of its owners. `Cache::share(value)`
+> (and `try_share`) makes one with one owner. `clone` is one relaxed add, and the last drop
+> drops the value and returns the slot. `Shared::make_mut(&mut s, &mut cache)` follows `Arc`'s
+> rule (copy into a fresh slot only while shared), with `get_mut`, `owners`, `ptr_eq` and
+> `index` beside it. It is `Send + Sync` for `T: Send + Sync`. Tests: a model against `Arc`, drop
+> once, copy only while shared, owners on 8 threads, and zero allocations once warm. For
+> the image state, keep one pool per chunk type in a `static` (`OnceLock<Pool<Counted<Chunk>>>`,
+> `Tag::Link`): chunks are then `Shared<'static, _>`, the state needs no lifetime, and every
+> image's history gives slots back to the same pool. Each worker that writes keeps a `Cache` of
+> it.
+>
+> On `vm.max_map_count`: agreed, and it stays a stop, not a fallback. Raising it at install and
+> checking it at daemon start belongs to the daemon and install lanes, not blaze-mem.
+> blaze-mem's part is that a failed reservation already reports `MemError` naming its tag and
+> size.
+
 ## dedup: LEB128 and seeded RNGs onto `blaze_format::leb` and `blaze_ids::rng`
 
 From `dedup-codec-leb` (report `/tmp/blaze-lanes/v2-dedup-codec-leb.md`). The one LEB128 is
@@ -391,6 +423,9 @@ for the `32` ones) exactly as `elf/dynamic.rs` and `wasm/reader.rs` do now. The 
 `blaze_ids::rng::SplitMix64` (`new`, `next_u64`, `below`, `index`, `one_in`, `shuffle`, `fill`,
 ...). `blaze-link` already depends on both crates. Every edit below is in `crates/blaze-link/src/`.
 `macho/dylib.rs` went to `v2/requests/requests-link-fuzz.md` (it names that file).
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
 
 ### `wasm/leb.rs`: the numbers become re-exports
 
@@ -408,6 +443,9 @@ Signatures match every caller (`module.rs`, `code.rs`, `reloc.rs`, `object.rs`, 
 unchanged. In its tests, delete `unsigned`, `lengths`, `signed` and `padded` (moved to
 `blaze-format/src/leb/tests.rs`); keep `round_trips`, `writes_into_room_allocate_nothing`,
 `framing`.
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
 
 ### `wasm/reader.rs`: `unsigned`/`signed` become the shared readers
 
@@ -439,6 +477,9 @@ Delete `fn unsigned` and `fn signed`; replace `u32`, `u64`, `i32`, `i64` with:
 and `use blaze_format::leb::{self, LebError};` after `use std::ops::Range;`. Its tests
 (`numbers`, `too_long_or_too_large`, `reads_allocate_nothing`) hold unchanged.
 
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
+
 ### `stage.rs`: `uleb` becomes a wrapper
 
 ```rust
@@ -449,12 +490,18 @@ fn uleb(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
 }
 ```
 
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
+
 ### `unwind.rs`: the writers become re-exports
 
 Replace `pub(crate) fn uleb` and `pub(crate) fn sleb` with
 `pub(crate) use blaze_format::leb::{write_i64 as sleb, write_u64 as uleb};` (`dwarf.rs` imports
 them from here, unchanged). Delete the test `leb128_encodes_both_signs` (moved:
 `both_signs_in_one_buffer`).
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
 
 ### `macho/linkedit.rs`
 
@@ -467,6 +514,9 @@ fn uleb_len(value: u64) -> u64 {
     blaze_format::leb::len_u64(value) as u64
 }
 ```
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
 
 ### `elf/dynamic.rs`
 
@@ -489,12 +539,18 @@ delete `struct Rng` and its `impl`, add `use blaze_ids::rng::SplitMix64;`, and r
 `rng.next_u64()` (the draws change from xorshift64 to SplitMix64; the tests compare against
 gimli, not fixed outputs).
 
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
+
 ### `macho/unwind.rs`
 
 `Reader::uleb`/`Reader::sleb`: the same two bodies as `elf/dynamic.rs` above, same import. In
 `mod tests`: delete `struct Rng` and its `impl` (it is SplitMix64, same stream), add
 `use blaze_ids::rng::SplitMix64 as Rng;`, and replace `Rng(seed)` with `Rng::new(seed)`
 (`below` and `shuffle` are the same functions, so every case is the same).
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
 
 ### `macho/input.rs`
 
@@ -510,6 +566,9 @@ gimli, not fixed outputs).
 In `mod tests`: delete `struct Rng` and its `impl`, add `use blaze_ids::rng::SplitMix64;`,
 `let mut rng = Rng(0x9e37_...)` becomes `let mut rng = SplitMix64::new(0x9e37_...)` (same
 seed expression); every `rng.below(n)` stays.
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
 
 ### `macho/tests.rs`
 
@@ -529,6 +588,9 @@ Delete the test `uleb_and_sleb` (moved: `round_trips`). In `trie_is_the_insertio
 `uleb_len` closure becomes `let uleb_len = |value: u64| blaze_format::leb::len_u64(value) as u64;`
 and the xorshift closure becomes
 `let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15); let mut next = move || rng.next_u64();`.
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.
 
 ### RNG copies in tests (`place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`)
 
@@ -553,3 +615,6 @@ and the xorshift closure becomes
   `self.0.next_u64()`, `below` becomes `self.0.index(n)`, `one_in` becomes
   `self.0.one_in(n as u64)`; `pick`/`subset` stay; each `Rng(x)` becomes
   `Rng(blaze_ids::rng::SplitMix64::new(x))`. Outputs are bit for bit the same.
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written, in every file listed (`wasm/leb.rs`, `wasm/reader.rs`, `stage.rs`, `unwind.rs`, `macho/linkedit.rs`, `elf/dynamic.rs`, `macho/unwind.rs`, `macho/input.rs`, `macho/tests.rs`, and the test RNGs of `place.rs`, `elf/read/strings.rs`, `macho/archive.rs`, `macho/sign.rs`, `macho/tbd.rs`); the moved tests deleted. Also `macho/tests.rs` `the_locals_in_parallel_are_the_locals_one_by_one`, a later xorshift copy, onto `SplitMix64`.

@@ -228,13 +228,15 @@ impl Levels {
         }
     }
 
-    /// Every node of the crate with attributes, as rustc's walk comes to it. One without any
-    /// costs a check of its kind and of its first child.
+    /// Every node of the crate with attributes, as rustc's walk comes to it. A node of a kind
+    /// that has none costs a read of the tree's kind column; one that may, a look at its
+    /// attributes.
     pub(super) fn walk(&mut self, sh: &mut Shared<'_, '_, '_>, walk: &Walk<'_>) {
         self.walking = true;
+        let early = self.early;
         for tree in &walk.trees {
-            for node in &tree.nodes {
-                if attrs::may_own(node, self.early) {
+            for node in tree.of_kind(|kind| attrs::may_be_owner(kind, early)) {
+                if attrs::owns(node, self.early) {
                     self.set_at(sh, InFile::new(tree.file, node.clone()));
                 }
             }
@@ -368,27 +370,28 @@ impl Levels {
                     }
                     continue;
                 };
-                let at = span(item.range);
+                let range = InFile::new(file, item.range);
+                let at = || span(item.range);
                 let expect = (level == Level::Expect).then(|| sh.expect_id(file, item.range));
                 let (tool, name) = match &path[..] {
                     [tool, rest @ ..] if !rest.is_empty() => (Some(tool), attrs::path_string(rest)),
                     _ => (None, attrs::path_string(path)),
                 };
-                let full = match tool {
+                let full = || match tool {
                     Some(tool) => format!("{}::{name}", tool.name()),
                     None => name.clone().into_owned(),
                 };
-                let lint_diag = |lint: &str, message: String| Diag::lint(lint, message, at.clone());
+                let lint_diag = |lint: &str, message: String| Diag::lint(lint, message, at());
                 let (lints, named) = match sh.store.check(&name, tool.map(|it| it.name())) {
                     Checked::Ok(lints) => (lints, path.last().map_or("", |it| it.name()).to_owned()),
-                    Checked::Tool(lints, None) => (lints, full),
+                    Checked::Tool(lints, None) => (lints, full()),
                     Checked::Tool(lints, Some(new)) => {
                         if says {
                             let mut diag = lint_diag(
                                 "renamed_and_removed_lints",
                                 format!("lint name `{name}` is deprecated and may not have an effect in the future"),
                             );
-                            diag.suggestion(at.clone(), "change it to", new.clone(), Applicability::MachineApplicable);
+                            diag.suggestion(at(), "change it to", new.clone(), Applicability::MachineApplicable);
                             self.lint(sh, set, false, place(), diag, None);
                         }
                         (lints, new)
@@ -411,9 +414,9 @@ impl Levels {
                         if says {
                             let mut diag = lint_diag(
                                 "renamed_and_removed_lints",
-                                format!("lint `{full}` has been renamed to `{new}`"),
+                                format!("lint `{}` has been renamed to `{new}`", full()),
                             );
-                            diag.suggestion(at.clone(), "use the new name", new, Applicability::MachineApplicable);
+                            diag.suggestion(at(), "use the new name", new, Applicability::MachineApplicable);
                             self.lint(sh, set, false, place(), diag, None);
                         }
                         match sh.store.check(new, None) {
@@ -423,30 +426,30 @@ impl Levels {
                     }
                     Checked::Removed(why) => {
                         if says {
-                            let diag = lint_diag("renamed_and_removed_lints", format!("lint `{full}` has been removed: {why}"));
+                            let diag =
+                                lint_diag("renamed_and_removed_lints", format!("lint `{}` has been removed: {why}", full()));
                             self.lint(sh, set, false, place(), diag, None);
                         }
                         continue;
                     }
                     Checked::NoLint(suggestion) => {
                         if says {
-                            let mut diag = lint_diag("unknown_lints", format!("unknown lint: `{full}`"));
+                            let mut diag = lint_diag("unknown_lints", format!("unknown lint: `{}`", full()));
                             if let Some((replace, from_rustc)) = suggestion {
                                 let message = match from_rustc {
                                     true => "a lint with a similar name exists in `rustc` lints",
                                     false => "did you mean",
                                 };
-                                diag.suggestion(at.clone(), message, replace, Applicability::MaybeIncorrect);
+                                diag.suggestion(at(), message, replace, Applicability::MaybeIncorrect);
                             }
                             self.lint(sh, set, false, place(), diag, None);
                         }
                         continue;
                     }
                 };
-                let source =
-                    sh.source(Source::Node { name: named.into_boxed_str(), span: at.clone(), reason: reason.clone() });
+                let source = sh.source(Source::Node { name: named.into_boxed_str(), at: range, reason: reason.clone() });
                 for &lint in lints {
-                    if self.gated(sh, set, lint, Some(&at), &mut place) {
+                    if self.gated(sh, set, lint, Some(range), &mut place) {
                         self.insert_spec(sh, set, lint, Spec { level, expect, source }, &mut place);
                     }
                 }
@@ -456,7 +459,7 @@ impl Levels {
                 {
                     let is_unfulfilled = matches!(lints, [only] if only.id() == LintId::UNFULFILLED_LINT_EXPECTATIONS);
                     let reason = reason.clone();
-                    self.expectations.push(Expectation { id, key: at, reason, is_unfulfilled, node: node.clone() });
+                    self.expectations.push(Expectation { id, key: at(), reason, is_unfulfilled, node: node.clone() });
                 }
             }
         }
@@ -464,15 +467,13 @@ impl Levels {
             let range = self.range(set);
             let ignored = self.ids[range.clone()].iter().zip(&self.specs[range]).find_map(|(id, spec)| {
                 match &sh.sources[spec.source.0 as usize] {
-                    Source::Node { name, span, .. } if id.lint().crate_level_only => {
-                        Some((spec.level, name.clone(), span.clone()))
-                    }
+                    Source::Node { name, at, .. } if id.lint().crate_level_only => Some((spec.level, name.clone(), *at)),
                     _ => None,
                 }
             });
             if let Some((level, name, at)) = ignored {
                 let message = format!("{}({name}) is ignored unless specified at crate level", level.as_str());
-                self.lint(sh, set, false, place(), Diag::lint("unused_attributes", message, at), None);
+                self.lint(sh, set, false, place(), Diag::lint("unused_attributes", message, cx.span(at)), None);
             }
         }
     }
@@ -497,20 +498,21 @@ impl Levels {
                 Source::Node { name, .. } | Source::CommandLine { name, .. } => sh.store.is_lint_group(name),
             };
             if self.walking
-                && let Source::Node { name, span, .. } = &sh.sources[spec.source.0 as usize]
+                && let Source::Node { name, at, .. } = &sh.sources[spec.source.0 as usize]
             {
+                let span = sh.cx.span(*at);
                 let message = format!("{}({name}) incompatible with previous forbid", spec.level.as_str());
                 let mut diag = match groups {
                     true => Diag::lint("forbidden_lint_groups", message, span.clone()),
                     false => Diag::error(Some("E0453"), message, span.clone()),
                 };
-                diag.span_label(span.clone(), "overruled by previous forbid");
+                diag.span_label(span, "overruled by previous forbid");
                 match &sh.sources[old.source.0 as usize] {
                     Source::Default => {
                         diag.note(format!("`forbid` lint level is the default for {}", lint.name));
                     }
-                    Source::Node { span, reason, .. } => {
-                        diag.span_label(span.clone(), "`forbid` level set here");
+                    Source::Node { at, reason, .. } => {
+                        diag.span_label(sh.cx.span(*at), "`forbid` level set here");
                         if let Some(reason) = reason {
                             diag.note(&**reason);
                         }
@@ -546,7 +548,7 @@ impl Levels {
         sh: &mut Shared<'_, '_, '_>,
         set: SetId,
         lint: &'static Lint,
-        at: Option<&Span>,
+        at: Option<InFile<TextRange>>,
         place: &mut impl FnMut() -> Place,
     ) -> bool {
         let Some(feature) = lint.feature_gate else { return true };
@@ -560,7 +562,7 @@ impl Levels {
                 format!("unknown lint: `{}`", lint.name),
             );
             if let Some(at) = at {
-                diag.span = MultiSpan::of(at.clone());
+                diag.span = MultiSpan::of(sh.cx.span(at));
             }
             diag.note(format!("the `{}` lint is unstable", lint.name));
             if let Some(issue) = feature.issue {

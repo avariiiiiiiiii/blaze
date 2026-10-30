@@ -52,8 +52,9 @@ use serde::{Deserialize, Serialize};
 
 /// The version of every body's schema. A change to any type here is a new number. 11: every
 /// `Vec<u8>` (a run's output, a test's, cargo's files) is one byte string, not an array. 12:
-/// [`Request::Memory`] and [`Response::Memory`].
-pub const SCHEMA: u32 = 12;
+/// [`Request::Memory`] and [`Response::Memory`]. 13: [`Op`]'s bytes are one byte string too, and so is each [`ContentId`] and
+/// [`Fingerprint`].
+pub const SCHEMA: u32 = 13;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -148,17 +149,24 @@ mod files {
 /// The environment's values may be secrets: Debug names the variables only.
 impl std::fmt::Debug for Cargo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let env: Vec<&str> = self.env.iter().map(|(name, _)| name.as_str()).collect();
-        let files: Vec<&str> = self.files.iter().map(|(path, _)| path.as_str()).collect();
         f.debug_struct("Cargo")
             .field("command", &self.command)
             .field("args", &self.args)
             .field("root", &self.root)
             .field("cwd", &self.cwd)
-            .field("env", &env)
-            .field("files", &files)
+            .field("env", &Names(&self.env))
+            .field("files", &Names(&self.files))
             .field("color", &self.color)
             .finish()
+    }
+}
+
+/// The first of each pair, as a Debug list: names, never values.
+struct Names<'a, T>(&'a [(String, T)]);
+
+impl<T> std::fmt::Debug for Names<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0.iter().map(|(name, _)| name)).finish()
     }
 }
 

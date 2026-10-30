@@ -19,6 +19,7 @@ use std::{
     },
 };
 
+use blaze_format::cursor::Put;
 use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 use salsa::{Durability, Setter};
@@ -275,6 +276,7 @@ impl Files {
         let appended = self.input_of(&writer, file_id).and_then(|it| it.appended_root_module(&*db));
         let file = ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes());
         let content = FileText::content_of_file(file, appended);
+        let text = syntax::Text::from(text);
         self.write_text(&mut writer, db, file_id, Some((text, file, content)), durability);
         let mut changed = Roots::new();
         index_file(&mut writer, file_id, content, &mut changed);
@@ -301,7 +303,7 @@ impl Files {
         writer: &mut Writer,
         db: &mut Db,
         file_id: FileId,
-        text: Option<(&str, ContentId, ContentId)>,
+        text: Option<(syntax::Text, ContentId, ContentId)>,
         durability: Option<Durability>,
     ) -> ContentId {
         let raw = file_id.index();
@@ -309,7 +311,7 @@ impl Files {
             if let Some(input) = self.text.get(raw) {
                 // Nothing reads the text left behind: `file_text` no longer has the file.
                 self.text.set(raw, None);
-                let empty: std::sync::Arc<str> = std::sync::Arc::from("");
+                let empty = syntax::Text::from_static("");
                 let reparse = Reparse::new(&empty, ContentId::of(blaze_vfs::FILE_DOMAIN, b""));
                 set(input.set_reparse_field(db), durability, reparse);
                 set(input.set_text_field(db), durability, empty);
@@ -322,7 +324,6 @@ impl Files {
             Some(input) => Some(input),
             None => writer.parked.remove(&file_id),
         };
-        let text: std::sync::Arc<str> = std::sync::Arc::from(text);
         match existing {
             Some(input) => {
                 let reparse = input.reparse_field(&*db).after(&text, file);
@@ -847,11 +848,10 @@ impl RootContent {
     /// What [`SourceRoot::BUCKET_DOMAIN`] hashes of a bucket.
     fn bucket_bytes(&self, bucket: usize, out: &mut Vec<u8>) {
         let files = &self.buckets[bucket];
-        out.extend_from_slice(&(files.len() as u64).to_le_bytes());
+        out.put_u64(files.len() as u64);
         for (key, content) in files {
-            out.extend_from_slice(&(key.len() as u64).to_le_bytes());
-            out.extend_from_slice(key);
-            out.extend_from_slice(&content.0);
+            out.put_bytes_u64(key);
+            out.put_bytes(&content.0);
         }
     }
 

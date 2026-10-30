@@ -2848,19 +2848,22 @@ impl<'db> ExprCollector<'db> {
     }
 
     /// `in_expr_place` is whether rustc parses a call there in parentheses or brackets as an
-    /// expression (`parse_stmt_mac`): last in a block, or last in the expansion of a call it
-    /// parses so, with no `;` after it.
+    /// expression (`parse_stmt_mac`): with no `;` after it. The last call of a block is one
+    /// ([`hir_expand::ExpandTo::of_call_site`]) and expands to an expression.
     fn collect_macro_as_stmt(
         &mut self,
         mac: ast::MacroExpr,
         in_expr_place: bool,
     ) -> Option<ExprId> {
+        let mac_call = mac.macro_call()?;
+        if hir_expand::ExpandTo::of_call_site(&mac_call) == Ok(hir_expand::ExpandTo::Expr) {
+            return self.maybe_collect_expr(ast::Expr::MacroExpr(mac));
+        }
         // clone: a syntax node's count bump; `MacroExpr` alone has no `HasAttrs`.
         if !self.check_cfg(&ast::Expr::MacroExpr(mac.clone())) {
             return None;
         }
 
-        let mac_call = mac.macro_call()?;
         let as_expr =
             in_expr_place && mac_call.token_tree().is_some_and(|it| it.l_curly_token().is_none());
         let syntax_ptr = AstPtr::new(&ast::Expr::from(mac));

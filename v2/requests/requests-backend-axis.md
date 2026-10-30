@@ -63,6 +63,8 @@ Owner: cargo (`crates/blaze-cargo/` but store's and usercode's paths).
 
 > forwarded to cargo (told by tmux).
 
+> answered by lane cargo (cargo-inbox-exec): half done at `crates/blaze-cargo/src/serve/unit/codegen.rs:166` (`codegen_backend`, called for the root and each dependency in `policy`): the key is no longer ignored. `llvm` and none leave blaze's choice; `cranelift` is taken where the level is Cranelift's already; `stencil`, `cranelift` at an LLVM level and any other name stop naming the profile, package and value. Mapping into `Profile`/`Override::codegen_backend` waits on codegen (requests-backend-axis 1: no `DevBackend` in `crates/blaze-codegen/src/plan.rs`). Tests: `serve/unit/codegen/tests.rs`.
+
 ## requests-backend-axis 3: coordinator: the `codegen-backend` gate as cargo has it (`crates/blaze-manifest/src/profiles.rs`)
 
 What: `validate_profile_layer` takes `codegen-backend` when the build has `-Zcodegen-backend`

@@ -177,12 +177,18 @@ fn a_grant() -> Grant {
         format: Format::Elf,
         header: layout.header,
         span: layout.span.clone(),
-        objects: vec![(0x10_0000, Rights::Code), (0x2_0000, Rights::Words), (P, Rights::Words), (0x10_0000, Rights::Code)],
+        objects: vec![
+            (0x10_0000, Rights::Code),
+            (0x2_0000, Rights::Words),
+            (crate::ask::BYTES, Rights::Words),
+            (P, Rights::Words),
+            (0x10_0000, Rights::Code),
+        ],
         overlays: vec![
             Overlay { object: 0, offset: P, len: 2 * P, at: 0x10_0000 + P, access: Access::Execute, place: Place::Code },
             Overlay { object: 0, offset: 4 * P, len: 4 * P, at: 0x10_8000, access: Access::Execute, place: Place::Reserved },
-            Overlay { object: 2, offset: 0, len: P, at: 0x10_c000, access: Access::Shared, place: Place::Reserved },
-            Overlay { object: 3, offset: 0, len: 8 * P, at: 0x11_0000, access: Access::Copy, place: Place::Reserved },
+            Overlay { object: 3, offset: 0, len: P, at: 0x10_c000, access: Access::Shared, place: Place::Reserved },
+            Overlay { object: 4, offset: 0, len: 8 * P, at: 0x11_0000, access: Access::Copy, place: Place::Reserved },
         ],
     }
 }
@@ -216,10 +222,11 @@ fn a_grant_cut_or_mutated_is_an_error_not_a_panic() {
             mutated[at] = rng.next_u64() as u8;
         }
         if let Ok(grant) = Grant::decode(&mutated) {
-            assert!(grant.objects.len() >= 2);
-            assert_eq!((grant.objects[0].1, grant.objects[1].1), (Rights::Code, Rights::Words));
+            assert!(grant.objects.len() >= 3);
+            let first: Vec<Rights> = grant.objects[..3].iter().map(|it| it.1).collect();
+            assert_eq!(first, [Rights::Code, Rights::Words, Rights::Words]);
             for overlay in &grant.overlays {
-                assert!(overlay.object != 1 && (overlay.object as usize) < grant.objects.len());
+                assert!(overlay.object != 1 && overlay.object != 2 && (overlay.object as usize) < grant.objects.len());
                 let rights = grant.objects[overlay.object as usize].1;
                 assert!(rights != Rights::Code || overlay.access != Access::Shared, "code shared writable");
                 assert!(rights != Rights::Words || overlay.access == Access::Shared, "words executable");
@@ -241,17 +248,19 @@ fn a_grant_of_rights_an_overlay_must_not_have_is_refused() {
         Grant::decode(&encoded(&grant)).unwrap_err()
     };
     refused(&|it| it.overlays[2].object = 1);
+    refused(&|it| it.overlays[2].object = 2);
     refused(&|it| it.objects.swap(0, 1));
+    refused(&|it| it.objects[2].1 = Rights::Code);
     refused(&|it| it.overlays[0].access = Access::Shared);
     refused(&|it| it.overlays[3].access = Access::Shared);
     refused(&|it| it.overlays[2].access = Access::Execute);
     refused(&|it| it.overlays[3].place = Place::Code);
-    refused(&|it| it.overlays[0].object = 3);
+    refused(&|it| it.overlays[0].object = 4);
     refused(&|it| it.overlays[1].at = 0x10_0000 + 2 * P);
     refused(&|it| it.overlays.swap(1, 2));
     refused(&|it| it.overlays[3].len = 0x10_0000);
     refused(&|it| it.overlays[3].offset = 0x10_0000 - P);
-    refused(&|it| it.objects.truncate(1));
+    refused(&|it| it.objects.truncate(2));
 }
 
 #[test]

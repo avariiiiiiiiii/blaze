@@ -71,7 +71,7 @@ const APPLE_COND_SIG_INIT: usize = 0x3CB0_B1BB;
 /// The `pthread_key_*` state of one thread, and what else is per thread here: its `errno`
 /// and its alternate signal stack. Key numbering and destructors are the process's
 /// ([`Process`]).
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub(in crate::mir::eval) struct TlsData {
     /// The value of each key, by its number; past the end, null.
     values: Vec<Address>,
@@ -903,10 +903,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let at = addr.to_usize();
                 match block {
                     Some(block)
-                        if block.origin == Origin::Machine
+                        if block.origin == Origin::Mmap
                             && len.checked_next_multiple_of(page) == Some(block.size) =>
                     {
-                        self.deallocate(addr, Origin::Machine, "munmap")?
+                        self.deallocate(addr, Origin::Mmap, "munmap")?
                     }
                     _ => not_supported!(
                         "munmap of {len} bytes at {at:#x}: only a whole mapping mmap made"
@@ -920,7 +920,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let page = self.target()?.page;
                 let mapped = self.heap_blocks.range(..=addr.offset).next_back().is_some_and(
                     |(&start, block)| {
-                        block.origin == Origin::Machine
+                        block.origin == Origin::Mmap
                             && addr.offset + len <= start + block.size
                     },
                 );
@@ -1168,7 +1168,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let code = if len == 0 { target.errno.inval } else { target.errno.nomem };
             return self.fail(destination, Errors::Errno, code);
         };
-        let mapping = self.allocate(size, target.page, Origin::Machine, true)?;
+        let mapping = self.allocate(size, target.page, Origin::Mmap, true)?;
         self.write_pointer(destination.addr, mapping)
     }
 

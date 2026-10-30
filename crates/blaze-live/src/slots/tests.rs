@@ -214,6 +214,11 @@ fn patch(generation: u64, base: u64, cells: Vec<(u32, u64)>) -> Patch {
     Patch { id: ID, generation, base, functions: cells.len() as u64, cells, ..Patch::default() }
 }
 
+/// An owned copy of `answer`, read back from its bytes as the linker reads it.
+fn read_back(answer: &Answer) -> Answer {
+    Answer::decode(&answer.encode()).expect("an answer reads back")
+}
+
 fn applied(switch: &mut Switch<Fake>, patch: Patch) {
     let generation = patch.generation;
     let (outcome, answer) = switch.handle(Message::Patch(patch));
@@ -304,15 +309,16 @@ fn patches_switch_the_table_and_roll_back() {
     assert_eq!(program.cell.load(Ordering::Relaxed), image_table);
 
     // Code rolled back stays: a thread can be in it still.
-    let mut third = patch(3, 0, vec![(1, unslid(address(one)))]);
-    third.code = vec![(unslid(program.code_at(0)), vec![0x90; 8])];
-    let (outcome, _) = switch.handle(Message::Patch(third.clone()));
+    let mut over = patch(3, 0, vec![(1, unslid(address(one)))]);
+    over.code = vec![(unslid(program.code_at(0)), vec![0x90; 8])];
+    let (outcome, _) = switch.handle(Message::Patch(over));
     assert!(
         matches!(&outcome, Outcome::Declined { why, .. }
             if why.contains("generation 1's code") && why.contains("can be running")),
         "{outcome}"
     );
     assert_eq!(program.code[0], address(one));
+    let mut third = patch(3, 0, vec![(1, unslid(address(one)))]);
     third.code = vec![(unslid(program.code_at(128)), vec![0x90; 8])];
     applied(&mut switch, third);
     assert_eq!(switch.kept(), vec![0, 1, 2, 3]);
@@ -487,7 +493,7 @@ fn a_panic_in_a_generations_code_rolls_it_back() {
     applied(&mut switch, first);
 
     let mut answers = Vec::new();
-    let result = switch.guard(|| program.call(0), &mut |it| answers.push(it.clone()));
+    let result = switch.guard(|| program.call(0), &mut |it| answers.push(read_back(it)));
     let why = match result {
         Err(Outcome::RolledBack { generation: 1, to: 0, why }) => why,
         other => panic!("{other:?}"),
@@ -511,7 +517,7 @@ fn a_panic_elsewhere_is_resumed() {
 
     let mut answers = Vec::new();
     let resumed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        switch.guard(|| -> u32 { panic!("not in a patch") }, &mut |it| answers.push(it.clone()))
+        switch.guard(|| -> u32 { panic!("not in a patch") }, &mut |it| answers.push(read_back(it)))
     }));
     let payload = resumed.expect_err("the panic is resumed");
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"not in a patch"));
@@ -695,9 +701,9 @@ fn outcomes_say_what_became_of_a_patch() {
 }
 
 /// A warm patch's table work allocates nothing: the log's columns and the lasting ranges
-/// are reserved regions, the pool is full and the scratch buffers are at their high-water
-/// mark. Each patch sets one cell of a 16-slot table and is taken from encoded bytes, as
-/// `Live::poll` takes a message from its kept buffer.
+/// start with room for a program's first thousand generations, the pool is full and the
+/// scratch buffers are at their high-water mark. Each patch sets one cell of a 16-slot table
+/// and is taken from encoded bytes, as `Live::poll` takes a message from its kept buffer.
 #[test]
 fn a_warm_patch_allocates_nothing() {
     const SLOTS: u64 = 16;
@@ -726,29 +732,30 @@ fn a_warm_patch_allocates_nothing() {
     assert_eq!(switch.current(), first + 64);
 }
 
-/// The lasting ranges merge as `Vec::splice` would: against a model kept in a `Vec`.
+/// Rolling back to a kept generation whose table the pool still holds, and forward again, is
+/// the cell's store and nothing allocated.
 #[test]
-fn lasting_ranges_merge_as_a_sorted_list_would() {
-    use super::switch::{Holds, Lasting};
-    let mut lasting = Lasting::new().expect("reserved");
-    let mut model: Vec<(Range<u64>, u64, Holds)> = Vec::new();
-    let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
-    for number in 0..3000u64 {
-        let seed = rng.next_u64();
-        let start = seed % 4096 * 16;
-        let range = start..start + 1 + seed % 64;
-        let holds = if seed % 3 == 0 { Holds::Unwind } else { Holds::Code };
-        lasting.add(range.clone(), number, holds);
-        let at = model.partition_point(|it| it.0.end <= range.start);
-        let (mut merged, mut kind, mut end) = (range, holds, at);
-        while let Some((next, _, other)) = model.get(end).filter(|it| it.0.start < merged.end) {
-            merged = merged.start.min(next.start)..merged.end.max(next.end);
-            if *other == Holds::Code {
-                kind = Holds::Code;
-            }
-            end += 1;
-        }
-        model.splice(at..end, [(merged, number, kind)]);
-        assert_eq!(&lasting.ranges[..], &model[..]);
+fn a_warm_roll_back_allocates_nothing() {
+    let program = Program::with_slots(4);
+    let mut switch = program.switch(false);
+    for _ in 0..POOL + 2 {
+        let base = switch.current();
+        let cell = ((base % 4) as u32, unslid(address(two)));
+        applied(&mut switch, patch(base + 1, base, vec![cell]));
     }
+    let (newest, before) = (switch.current(), switch.current() - 1);
+    let back = Message::RollBack { id: ID, to: before }.encode();
+    let ahead = Message::RollBack { id: ID, to: newest }.encode();
+    // Once each, so the outcome's reason and the answer are the only allocations left.
+    for bytes in [&back, &ahead] {
+        let view = Message::view(bytes).expect("an encoded message reads back");
+        assert!(matches!(switch.take(&view).0, Outcome::RolledBack { .. }));
+    }
+    let what = "a warm rollback: its reason, once for the program and once for the linker";
+    blaze_alloc_count::assert_at_most(2, what, || {
+        let view = Message::view(&back).expect("an encoded message reads back");
+        let (outcome, _) = switch.take(&view);
+        assert!(matches!(outcome, Outcome::RolledBack { .. }), "{outcome:?}");
+    });
+    assert_eq!(switch.current(), before);
 }

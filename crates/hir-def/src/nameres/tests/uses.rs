@@ -10,10 +10,14 @@ use syntax::{AstNode, ast};
 
 use super::*;
 use crate::{
-    Lookup, ModuleDefId,
+    AssocItemId, Lookup, ModuleDefId, ModuleId, TraitId,
     item_scope::{GlobId, ImportId, ImportOrExternCrate, ItemInNs},
-    nameres::uses::{MacroVia, NameRecords, used_imports},
+    nameres::{
+        assoc::ImplItems,
+        uses::{MacroVia, NameRecords, UsedImports, used_imports, used_imports_with},
+    },
     per_ns::Namespace,
+    resolver::{HasResolver, Resolver},
     src::use_tree_to_ast,
     test_db::TestDBExt,
 };
@@ -41,7 +45,25 @@ fn import_text(db: &TestDB, import: ImportOrExternCrate) -> String {
 /// [`used_imports`] of `krate`, a line for each import, `#[macro_use]` and ambiguous use,
 /// sorted.
 pub(super) fn render_used(db: &TestDB, krate: Crate) -> String {
-    let used = used_imports(db, krate);
+    render(db, used_imports(db, krate))
+}
+
+/// [`used_imports_with`] the uses of each trait of `traits` found from `resolver`, as type
+/// inference records a method call of it.
+pub(super) fn render_used_with_traits(
+    db: &TestDB,
+    krate: Crate,
+    resolver: &Resolver<'_>,
+    traits: impl IntoIterator<Item = TraitId>,
+) -> String {
+    let mut more = Vec::new();
+    for it in traits {
+        resolver.record_trait_uses(db, it, &mut more);
+    }
+    render(db, &used_imports_with(db, krate, &more))
+}
+
+fn render(db: &TestDB, used: &UsedImports) -> String {
     let mut lines = Vec::new();
     for (import, how) in used.imports() {
         let mut line = format!("{} {how:?}", import_text(db, import));
@@ -426,4 +448,195 @@ use m::S;
         };
         assert_ne!(Some(def), declared.types.map(|it| it.def));
     }
+}
+
+fn name(text: &str) -> Name {
+    Name::new_symbol_root(intern::Symbol::intern(text))
+}
+
+/// The module `path` (names from the crate root) of `krate`.
+fn module_at(db: &TestDB, krate: Crate, path: &[&str]) -> ModuleId {
+    let def_map = crate_def_map(db, krate);
+    let mut at = def_map.root;
+    for segment in path {
+        at = def_map.module(db, at).children(db)[&name(segment)];
+    }
+    at
+}
+
+fn trait_at(db: &TestDB, krate: Crate, path: &[&str], trait_name: &str) -> TraitId {
+    let module = module_at(db, krate, path);
+    let scope = module.def_map(db).module(db, module).scope(db);
+    match scope.get(&name(trait_name)).types.unwrap().def {
+        ModuleDefId::TraitId(it) => it,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn root_fn(db: &TestDB, krate: Crate, fn_name: &str) -> crate::FunctionId {
+    let module = module_at(db, krate, &[]);
+    let scope = module.def_map(db).module(db, module).scope(db);
+    match scope.get(&name(fn_name)).values.unwrap().def {
+        ModuleDefId::FunctionId(it) => it,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The uses of the test crate with a method of trait `trait_path::trait_name` called in the
+/// root function `in_fn`.
+fn check_trait_used(
+    #[rust_analyzer::rust_fixture] ra_fixture: &str,
+    trait_path: &[&str],
+    trait_name: &str,
+    expect: Expect,
+) {
+    let db = TestDB::with_files(ra_fixture);
+    let krate = db.fetch_test_crate();
+    let tr = trait_at(&db, krate, trait_path, trait_name);
+    let resolver = root_fn(&db, krate, "f").resolver(&db);
+    expect.assert_eq(&render_used_with_traits(&db, krate, &resolver, [tr]));
+}
+
+#[test]
+fn a_method_of_an_imported_trait_uses_the_import() {
+    check_trait_used(
+        r#"
+mod m { pub trait Tr { fn go(&self) {} } impl Tr for () {} }
+use m::Tr;
+fn f() { ().go(); }
+"#,
+        &["m"],
+        "Tr",
+        expect![[r#"
+            m::Tr Other
+        "#]],
+    );
+}
+
+#[test]
+fn a_method_of_an_unnamed_trait_read_through_a_glob_uses_the_glob_and_the_import() {
+    let fixture = r#"
+mod m { pub trait Tr { fn go(&self) {} } impl Tr for () {} }
+mod p { pub use super::m::Tr as _; }
+use p::*;
+fn f() { ().go(); }
+"#;
+    check_used(fixture, expect![[""]]);
+    check_trait_used(
+        fixture,
+        &["m"],
+        "Tr",
+        expect![[r#"
+            p::* Other [_]
+            super::m::Tr as _ Other
+        "#]],
+    );
+    let db = TestDB::with_files(fixture);
+    let krate = db.fetch_test_crate();
+    let root = module_at(&db, krate, &[]);
+    let scope = root.def_map(&db).module(&db, root).scope(&db);
+    let tr = trait_at(&db, krate, &["m"], "Tr");
+    let Some((bound, Some(ImportOrExternCrate::Glob(glob)))) = scope.trait_binding(tr) else {
+        panic!("{:?}", scope.trait_binding(tr))
+    };
+    assert_eq!(bound.as_str(), "_");
+    assert_eq!(import_text(&db, ImportOrExternCrate::Glob(glob)), "p::*");
+}
+
+#[test]
+fn a_method_of_a_named_trait_read_through_globs_uses_each() {
+    check_trait_used(
+        r#"
+mod m { pub trait Tr { fn go(&self) {} } impl Tr for () {} }
+mod p { pub use super::m::*; }
+use p::*;
+fn f() { ().go(); }
+"#,
+        &["m"],
+        "Tr",
+        expect![[r#"
+            p::* Other [Tr]
+            super::m::* Other [Tr]
+        "#]],
+    );
+}
+
+#[test]
+fn a_trait_read_through_globs_that_import_each_other_ends() {
+    check_trait_used(
+        r#"
+mod m { pub trait Tr { fn go(&self) {} } impl Tr for () {} }
+mod a { pub use super::b::*; pub use super::m::Tr as _; }
+mod b { pub use super::a::*; }
+use b::*;
+fn f() { ().go(); }
+"#,
+        &["m"],
+        "Tr",
+        expect![[r#"
+            b::* Other [_]
+            super::a::* Other [_]
+            super::m::Tr as _ Other
+        "#]],
+    );
+}
+
+#[test]
+fn a_trait_declared_where_it_is_found_uses_no_import() {
+    check_trait_used(
+        r#"
+mod m { pub trait Tr { fn go(&self) {} } impl Tr for () {} }
+use m::*;
+trait Tr { fn go(&self) {} }
+impl Tr for () {}
+fn f() { ().go(); }
+"#,
+        &[],
+        "Tr",
+        expect![[""]],
+    );
+}
+
+#[test]
+fn a_trait_of_the_std_prelude_uses_no_import() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: clone
+fn f() { ().clone(); }
+"#,
+    );
+    let krate = db.fetch_test_crate();
+    let def_map = crate_def_map(&db, krate);
+    let ModuleDefId::TraitId(clone) = def_map.resolve_in_prelude(&db, &name("Clone")).types.unwrap().def
+    else {
+        panic!()
+    };
+    let resolver = root_fn(&db, krate, "f").resolver(&db);
+    expect![[""]].assert_eq(&render_used_with_traits(&db, krate, &resolver, [clone]));
+}
+
+#[test]
+fn the_impl_s_own_trait_uses_no_import() {
+    let db = TestDB::with_files(
+        r#"
+mod m { pub trait Tr { fn go(&self) {} } }
+use m::*;
+struct S;
+impl m::Tr for S { fn go(&self) { self.go() } }
+fn f() {}
+"#,
+    );
+    let krate = db.fetch_test_crate();
+    let tr = trait_at(&db, krate, &["m"], "Tr");
+    let root = module_at(&db, krate, &[]);
+    let scope = root.def_map(&db).module(&db, root).scope(&db);
+    let impl_ = scope.impls().next().unwrap();
+    let [(_, AssocItemId::FunctionId(go))] = &*ImplItems::of(&db, impl_).0.items else { panic!() };
+    let resolver = go.resolver(&db);
+    expect![[""]].assert_eq(&render_used_with_traits(&db, krate, &resolver, [tr]));
+    let in_fn = root_fn(&db, krate, "f").resolver(&db);
+    expect![[r#"
+        m::* Other [Tr]
+    "#]]
+    .assert_eq(&render_used_with_traits(&db, krate, &in_fn, [tr]));
 }

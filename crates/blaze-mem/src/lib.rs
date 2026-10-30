@@ -9,6 +9,7 @@
 //! | a view's revision | [`Revisions`]: two arenas, the next revision built while the current one is read, the old one reused once no task can still read it ([`blaze_reclaim`]) |
 //! | fixed-size objects that come and go across workers | [`Pool`]: a slab per type with free lists, a worker's [`Cache`] in front, refilled and returned 64 at a time |
 //! | objects one owner names by ID (plane tasks, I/O operations, timers, watch slots) | [`Slab`] with generational [`Handle`]s: a stale handle is detected, not dereferenced |
+//! | chunks shared by several owners, copied on write | [`pool::Shared`]: a pooled `Arc`, the last owner returns the slot |
 //! | objects retired while readers may hold them | [`pool::Limbo`]: kept in their slots until their grace passes, then back to the pool |
 //! | tables, interners and columns | [`RegionVec`] (one owner), [`AppendVec`] (one writer, lock-free readers) and [`Column`] (any number of appenders): address space reserved up front, pages committed as they grow, never moved |
 //! | per-call scratch | [`scratch`]: buffers per worker, grown once to their high-water mark, lent for a closure or until dropped |
@@ -22,6 +23,9 @@
 //! system through [`Region`]s and the [`chunks`] cache, never from the global allocator: a
 //! warm frame, arena, pool or slab makes no call to it (the allocation-budget tests hold them
 //! to zero).
+//!
+//! Rounding to power-of-two alignments is [`align`]'s, one copy for the whole tree; the
+//! SwissTable group probe every interner shares is [`swiss`]'s.
 //!
 //! Unsafe code is confined to [`os`] (the kernel's virtual memory) and the few lines in each
 //! allocator that turn a committed address into a typed place; every block says which
@@ -54,7 +58,7 @@ pub use column::Column;
 pub use error::MemError;
 pub use frame::{Frame, Marker};
 pub use handle::{Handle, Slab};
-pub use pool::{Cache, Pool, Pooled};
+pub use pool::{Cache, Pool, Pooled, Shared};
 pub use region::Region;
 pub use region_vec::RegionVec;
 pub use revision::{Built, Revisions};

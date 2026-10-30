@@ -143,7 +143,7 @@ mod os {
 }
 
 /// What became of a message, or of a panic under [`Live::guard`].
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Outcome {
     /// The program runs `generation` now.
     Applied { generation: u64, functions: u64, statics: u64 },
@@ -237,7 +237,9 @@ impl Answers {
     fn new(dir: &Path) -> Answers {
         Answers {
             path: dir.join(ANSWER),
+            // alloc: setup, once at start
             partial: dir.join(format!("{ANSWER}.{}", std::process::id())),
+            // alloc: grown to the largest answer once, then reused for every answer
             bytes: Vec::new(),
         }
     }
@@ -276,6 +278,7 @@ impl Live {
     /// panic hook [`Live::guard`] needs and starts watching for messages.
     pub fn start() -> Result<Live, String> {
         if STARTED.swap(true, Ordering::AcqRel) {
+            // alloc: error path
             return Err("blaze-live's slots were started already in this program".to_owned());
         }
         let live = Live::open();
@@ -288,8 +291,10 @@ impl Live {
     fn open() -> Result<Live, String> {
         let (at, bytes) = os::descriptor()?;
         let descriptor = Descriptor::decode(bytes).ok_or_else(|| {
+            // alloc: error path
             format!(
                 "{DESCRIPTOR} at {at:#x} does not start with {}",
+                // alloc: error path
                 String::from_utf8_lossy(&DESCRIPTOR_MAGIC)
             )
         })?;
@@ -302,6 +307,7 @@ impl Live {
             crate::sample::Code {
                 slide,
                 image: image.start.wrapping_sub(slide)..image.end.wrapping_sub(slide),
+                // clone: setup, a Range<u64> of two words, once at start
                 patches: layout.code.clone(),
             }
         };
@@ -310,14 +316,20 @@ impl Live {
         create.recursive(true);
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut create, 0o700);
+        // alloc: error path
         create.create(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
+        // clone: setup, the directory handed once to `DIR`
         _ = crate::DIR.set(dir.clone());
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        // clone: setup, the directory handed once to the sampler's thread
         crate::sample::start(dir.clone(), sampled);
         hook::install();
+        // alloc: setup, the one `Events` the watcher's thread shares
         let events = Arc::new(Events::default());
+        // clone: setup, the watcher thread's handle, once
         os::watch(&dir, events.clone())?;
         let answers = Answers::new(&dir);
+        // alloc: grown to a message file's name once, then reused
         let mut name = String::new();
         message_file_into(switch.current(), &mut name);
         let path = dir.join(&name);
@@ -327,7 +339,8 @@ impl Live {
             answers,
             events,
             looked: None,
-            taken: VecDeque::new(),
+            taken: VecDeque::with_capacity(KEPT),
+            // alloc: grown to the largest message once, then reused for every message
             message: Vec::new(),
             path,
             name,
@@ -376,6 +389,7 @@ impl Live {
             }
         };
         std::thread::Builder::new()
+            // alloc: setup, the thread's name, once
             .name("blaze-live-apply".to_owned())
             .spawn(applying)
             .expect("spawning the thread that applies patches");
@@ -396,10 +410,12 @@ impl Live {
         let file = match File::open(path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            // alloc: error path
             Err(error) => return Some(self.unread(generation, path, &error.to_string())),
         };
         let meta = match file.metadata() {
             Ok(meta) => meta,
+            // alloc: error path
             Err(error) => return Some(self.unread(generation, path, &error.to_string())),
         };
         let identity = Identity::of(&meta);
@@ -417,14 +433,17 @@ impl Live {
         self.message.clear();
         self.message.reserve(usize::try_from(meta.len()).unwrap_or(0));
         if let Err(error) = (&file).take(meta.len()).read_to_end(&mut self.message) {
+            // alloc: error path
             return Some(self.unread(generation, path, &error.to_string()));
         }
         drop(file);
         let (outcome, said) = match Message::view(&self.message) {
             Ok(message) => self.switch.take(&message),
             Err(why) => {
+                // alloc: error path
                 let why = format!("{}: {why}", path.display());
                 (
+                    // alloc: error path
                     Outcome::Declined { generation, why: why.clone() },
                     Some(Answer::Declined { generation, why }),
                 )
@@ -438,7 +457,9 @@ impl Live {
 
     /// Declines the message file at `path`, which could not be read.
     fn unread(&mut self, generation: u64, path: &Path, why: &str) -> Outcome {
+        // alloc: error path
         let why = format!("{}: {why}", path.display());
+        // alloc: error path
         self.answers.write(&Answer::Declined { generation, why: why.clone() });
         Outcome::Declined { generation, why }
     }
@@ -465,14 +486,17 @@ impl Drop for Live {
 fn directory(layout: &Layout, memory: &os::Os) -> Result<PathBuf, String> {
     let [at, len] = layout.dir;
     if len == 0 {
+        // alloc: error path
         return Err(format!("{DESCRIPTOR} names no directory to take patches through"));
     }
     let at = layout.slid(at);
     let end = at
         .checked_add(len)
+        // alloc: error path
         .ok_or_else(|| format!("{DESCRIPTOR} names a directory past the end of memory"))?;
     let bytes = memory.bytes(&(at..end))?;
     let path = std::str::from_utf8(bytes)
+        // alloc: error path
         .map_err(|_| format!("{DESCRIPTOR} names a directory that is not UTF-8"))?;
     Ok(PathBuf::from(path))
 }

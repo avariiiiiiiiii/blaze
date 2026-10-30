@@ -752,7 +752,7 @@ fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> bool {
     let args: Vec<hir::Type<'_>> = self_ty.type_arguments().collect();
     let has_rhs = matches!(name, "PartialEq" | "PartialOrd");
     let holds = |field: hir::Field| {
-        let ty = field.ty(cx.db).instantiate_type_params(args.iter());
+        let ty = field.ty(cx.db).instantiate_type_params(cx.db, args.iter());
         let rhs: &[hir::Type<'_>] = if has_rhs { std::slice::from_ref(&ty) } else { &[] };
         ty.impls_trait(cx.db, trait_, rhs)
     };

@@ -237,6 +237,8 @@ impl Image {
             owned: Vec::new_in(arena),
             scratch: &mut self.scratch,
             spans_changed: false,
+            sancov: [None; 4],
+            frames_end: None,
         };
         stage.inputs(&change)?;
         stage.apply(&change)?;

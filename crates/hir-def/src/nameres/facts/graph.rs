@@ -116,65 +116,14 @@ impl ImportGraph {
     /// target, then stably by source), so it depends on the set of edges only, not their order
     /// or repeats.
     pub(super) fn from_edges(nodes: u32, edges: &[(u32, u32)]) -> ImportGraph {
-        let n = nodes as usize;
-        let mut cursor: Vec<u32> = Vec::with_capacity(n + 1);
-        cursor.resize(n + 1, 0);
-        let mut kept = 0usize;
-        for &(src, dst) in edges {
+        let kept = edges.iter().copied().filter(move |&(src, dst)| {
             assert!(src < nodes && dst < nodes, "import graph edge {src} -> {dst} outside {nodes} modules");
-            if src != dst {
-                cursor[dst as usize + 1] += 1;
-                kept += 1;
-            }
-        }
-        for at in 0..n {
-            cursor[at + 1] += cursor[at];
-        }
-        let mut by_target: Vec<(u32, u32)> = Vec::with_capacity(kept);
-        by_target.resize(kept, (0, 0));
-        for &(src, dst) in edges {
-            if src != dst {
-                let at = &mut cursor[dst as usize];
-                by_target[*at as usize] = (src, dst);
-                *at += 1;
-            }
-        }
-
-        let mut offsets: Vec<u32> = Vec::with_capacity(n + 1);
-        offsets.resize(n + 1, 0);
-        for &(src, _) in &by_target {
-            offsets[src as usize + 1] += 1;
-        }
-        for at in 0..n {
-            offsets[at + 1] += offsets[at];
-        }
-        cursor[..n].copy_from_slice(&offsets[..n]);
-        let mut targets: Vec<u32> = Vec::with_capacity(kept);
-        targets.resize(kept, 0);
-        for &(src, dst) in &by_target {
-            let at = &mut cursor[src as usize];
-            targets[*at as usize] = dst;
-            *at += 1;
-        }
-
-        // Each source's targets are ascending now, so a repeat is next to its first.
-        let (mut read, mut write) = (0usize, 0usize);
-        for src in 0..n {
-            let end = offsets[src + 1] as usize;
-            offsets[src] = write as u32;
-            let mut last = NONE;
-            while read < end {
-                let dst = targets[read];
-                read += 1;
-                if dst != last {
-                    targets[write] = dst;
-                    write += 1;
-                    last = dst;
-                }
-            }
-        }
-        offsets[n] = write as u32;
-        targets.truncate(write);
+            src != dst
+        });
+        let mut graph = blaze_ids::radix::Csr::graph(nodes as usize, kept);
+        // Each source's targets are ascending, so a repeat is next to its first.
+        graph.dedup_rows();
+        let (offsets, targets) = graph.into_parts();
         ImportGraph { offsets, targets }
     }
 
@@ -286,23 +235,13 @@ pub(super) fn components(graph: &ImportGraph) -> Partition {
         *at = n - 1 - *at;
     }
     let count = found as usize;
-    let mut starts: Vec<u32> = Vec::with_capacity(count + 1);
-    starts.resize(count + 1, 0);
-    for &component in &rindex {
-        starts[component as usize + 1] += 1;
-    }
-    for at in 0..count {
-        starts[at + 1] += starts[at];
-    }
-    stack.clear();
-    stack.extend_from_slice(&starts[..count]);
-    let mut members: Vec<u32> = Vec::with_capacity(n as usize);
-    members.resize(n as usize, 0);
-    for (module, &component) in rindex.iter().enumerate() {
-        let at = &mut stack[component as usize];
-        members[*at as usize] = module as u32;
-        *at += 1;
-    }
+    let mut partition = blaze_ids::radix::Csr::new();
+    partition.rebuild(
+        count,
+        rindex.iter().enumerate().map(|(module, &component)| (component, module as u32)),
+        &mut stack,
+    );
+    let (starts, members) = partition.into_parts();
     Partition {
         of: rindex.into_boxed_slice(),
         starts: starts.into_boxed_slice(),

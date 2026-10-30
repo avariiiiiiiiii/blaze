@@ -159,7 +159,7 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
             Expr::InlineAsm(asm) => {
                 for (_, operand) in asm.operands.iter() {
                     if let AsmOperand::Sym(path) = operand {
-                        let r = self.resolve(None, path, Site::Value, HygieneId::ROOT);
+                        let r = self.resolve(None, store.path_at(*path), Site::Value, HygieneId::ROOT);
                         self.handle(r);
                     }
                 }
@@ -293,7 +293,7 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         self.m.in_pat = false;
     }
 
-    fn pat_path(&mut self, pat: PatId, path: &Path, site: Site) -> Resolved {
+    fn pat_path(&mut self, pat: PatId, path: Path<'_>, site: Site) -> Resolved {
         if let Some(at) = self.arm_paths.iter().position(|&(it, _)| it == pat) {
             return self.arm_paths.swap_remove(at).1;
         }
@@ -335,7 +335,7 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
     }
 
     /// `path` at `at`, resolved as `hir::Semantics` resolves the node it was lowered from.
-    fn resolve(&mut self, at: Option<ExprOrPatId>, path: &Path, site: Site, hygiene: HygieneId) -> Resolved {
+    fn resolve(&mut self, at: Option<ExprOrPatId>, path: Path<'_>, site: Site, hygiene: HygieneId) -> Resolved {
         let Some(mod_path) = path.mod_path() else { return Resolved::NONE };
         let defs = self.m.k.defs;
         let db = self.m.k.cx.db;
@@ -552,7 +552,7 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         }
     }
 
-    fn local(&mut self, expr: ExprId, path: &Path) -> Option<BindingId> {
+    fn local(&mut self, expr: ExprId, path: Path<'_>) -> Option<BindingId> {
         let db = self.m.k.cx.db;
         let hygiene = self.store.expr_path_hygiene(expr);
         let scope = self.scope.replace(expr);
@@ -622,7 +622,7 @@ impl StoreVisitor for Walk<'_, '_, '_, '_, '_> {
 }
 
 /// A one-segment path's name: a local's, if it names one.
-fn ident(path: &Path) -> Option<&Name> {
+fn ident(path: Path<'_>) -> Option<&Name> {
     match path {
         Path::BarePath(it) => it.as_ident(),
         _ => None,

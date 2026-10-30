@@ -15,14 +15,14 @@
 //! index and sort in parallel.
 
 use blaze_ids::radix;
+use blaze_mem::align::align_up_u64;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::arena::{FrameVec, collect_in};
-use crate::LinkError;
+use crate::{Format, LinkError};
 use crate::cow::{CowBytes, IdSet};
 use crate::model::{Apply, Class, Counts, Region, Sym};
-use crate::reloc::align_up;
 use crate::stage::{Stage, error, function_of};
 use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What, zeroed};
 use crate::symbols::{SymKey, Symbols};
@@ -188,6 +188,8 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         Stubs => 20,
         Descriptor => 21,
         LiveDir => 22,
+        Coverage(..) => 23,
+        CoveragePcs(_) => 24,
     };
     let seven = |bytes: &[u8]| {
         let mut out = [0u8; 8];
@@ -197,7 +199,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
     };
     let rest = match key {
         Body(id) | Slot(id) | Data(id) | Cie(id) | Fde(id) | WinInfo(id) | Static(id, _) | Tlv(id, _)
-        | Position(id, _) => seven(&symbols.content(id).0),
+        | Position(id, _) | Coverage(id, _) | CoveragePcs(id) => seven(&symbols.content(id).0),
         Local(obj, _) | Section(obj, _) | Frame(obj, ..) => seven(&symbols.content(obj.native).0),
         Name(name) | FileName(name) | IatEnd(name) | Common(name) => seven(symbols.str(name).as_bytes()),
         Got(kind, _) => (kind as u64) << 48,
@@ -241,6 +243,42 @@ impl<'a> Stage<'a> {
             Class::Rodata | Class::RelRo | Class::Data | Class::Bss => &PATCH_DATA,
             other => other,
         }
+    }
+
+    /// Whether an incremental link puts the core's new call frame entries of `class` in
+    /// [`Class::Patch`] after the code, each link's run ending in its own zero length, so a
+    /// patch writes no read-only page for them and a run never ends where an earlier one did.
+    /// ELF's alone: `.eh_frame_hdr` finds them by their functions, where Mach-O's
+    /// `__unwind_info` names an FDE by its offset in `__eh_frame`.
+    fn patch_frames(&self, class: &Class) -> bool {
+        *class == Class::EhFrame && !self.plan.indexed_code && self.output.format == Format::Elf
+    }
+
+    /// Whether a piece of [`Class::EhFrame`] is one the core made: a function's FDE or a CIE.
+    /// A native object's entries stay in `.eh_frame`, which has nothing else to find them by.
+    fn core_frame(&self, id: PieceId, sym: Sym) -> bool {
+        let piece = self.new.piece(id).expect("live");
+        matches!(piece.what(), What::Fde) || matches!(self.symbols.key(sym), SymKey::Cie(_))
+    }
+
+    /// Room for the zero length after the call frame entries just placed at the end of the
+    /// patch code region `space`: the stage's [`Stage::frames_end`].
+    fn end_frames(&mut self, space: usize) -> Result<(), LinkError> {
+        let region = &mut self.new.spaces[space].region;
+        let at = align_up_u64(region.addr + region.size, 4) - region.addr;
+        if at + 4 > region.capacity {
+            return Err(error(
+                None,
+                // alloc: error path
+                format!(
+                    "the end of the call frame entries does not fit in {:?} ({} of {} bytes used): link the image from scratch",
+                    region.class, region.size, region.capacity
+                ),
+            ));
+        }
+        region.size = at + 4;
+        self.frames_end = Some(region.addr + at);
+        Ok(())
     }
 
     /// What the piece sums of the image are: from every piece in a full link, from the last
@@ -356,7 +394,7 @@ impl<'a> Stage<'a> {
         let mut size = 0;
         for id in ids {
             let hot = self.new.hot_mut(*id);
-            size = align_up(start + size, hot.align()) - start;
+            size = align_up_u64(start + size, hot.align()) - start;
             hot.addr = start + size;
             hot.region = region;
             hot.set_zero(zero);
@@ -441,7 +479,7 @@ impl<'a> Stage<'a> {
             let this = self.writer.prot(&class);
             let indexed = self.plan.indexed_code && this.exec;
             if !indexed && prot != Some(this) {
-                addr = align_up(addr, self.plan.page);
+                addr = align_up_u64(addr, self.plan.page);
                 prot = Some(this);
             }
             let align = ids
@@ -450,7 +488,7 @@ impl<'a> Stage<'a> {
                 .max()
                 .unwrap_or(1)
                 .max(if matches!(class, Class::Synthetic(_)) { 8 } else { 1 });
-            let start = if indexed { code_addr } else { align_up(addr, align) };
+            let start = if indexed { code_addr } else { align_up_u64(addr, align) };
             let zero = zeroed(&class);
             let size = self.put(start, &ids, spaces.len() as u32, zero);
             match &class {
@@ -460,14 +498,14 @@ impl<'a> Stage<'a> {
             }
             let bound = synthetic.iter().find(|it| it.0 == class).map(|it| it.1);
             let capacity = match (&class, incremental) {
-                (Class::Patch, true) => align_up(text_size.max(PATCH), self.plan.page),
-                (Class::PatchData, true) => align_up(data_size.max(PATCH), self.plan.page),
+                (Class::Patch, true) => align_up_u64(text_size.max(PATCH), self.plan.page),
+                (Class::PatchData, true) => align_up_u64(data_size.max(PATCH), self.plan.page),
                 (Class::Synthetic(_), true) => {
                     let bound = bound.unwrap_or(size);
-                    align_up((bound * 2).max(bound + ROOM), 16)
+                    align_up_u64((bound * 2).max(bound + ROOM), 16)
                 }
                 (Class::Synthetic(_), false) => bound.unwrap_or(size),
-                (class, true) if grows(class) => align_up((size * 2).max(size + ROOM), 16),
+                (class, true) if grows(class) => align_up_u64((size * 2).max(size + ROOM), 16),
                 _ => size,
             };
             let synthetic = matches!(class, Class::Synthetic(_));
@@ -535,9 +573,13 @@ impl<'a> Stage<'a> {
             let class = self.new.class(class_id);
             let ordered = self.ordered(class);
             let target_space = self.new.space_of(self.patch_class(class));
+            let patch_frames = self.patch_frames(class);
+            let code_space = if patch_frames { self.new.space_of(&Class::Patch) } else { None };
+            let mut framed = false;
             for Entry { id, sym, .. } in entries {
-                let space = target_space.ok_or_else(|| {
-                    let target = self.patch_class(self.new.class(class_id));
+                let in_code = patch_frames && self.core_frame(id, sym);
+                let space = if in_code { code_space } else { target_space }.ok_or_else(|| {
+                    let target = if in_code { &Class::Patch } else { self.patch_class(self.new.class(class_id)) };
                     error(
                         None,
                         // alloc: error path
@@ -547,6 +589,7 @@ impl<'a> Stage<'a> {
                         ),
                     )
                 })?;
+                framed |= in_code;
                 if ordered {
                     relay.push(space);
                     self.new.hot_mut(id).region = space as u32;
@@ -555,7 +598,7 @@ impl<'a> Stage<'a> {
                 let region = &self.new.spaces[space].region;
                 let zero = self.new.spaces[space].zero;
                 let piece = self.new.piece(id).expect("live");
-                let at = align_up(region.addr + region.size, piece.align()) - region.addr;
+                let at = align_up_u64(region.addr + region.size, piece.align()) - region.addr;
                 let end = at + piece.size;
                 if end > region.capacity {
                     let target = &region.class;
@@ -576,6 +619,9 @@ impl<'a> Stage<'a> {
                 hot.addr = addr;
                 hot.region = space as u32;
                 hot.set_zero(zero);
+            }
+            if let (true, Some(space)) = (framed, code_space) {
+                self.end_frames(space)?;
             }
         }
         radix::sort(&mut relay);
@@ -630,7 +676,7 @@ impl<'a> Stage<'a> {
         let mut moved: FrameVec<'a, (PieceId, u64)> = Vec::new_in(arena);
         for id in ids.iter() {
             let piece = self.new.piece(*id).expect("live");
-            size = align_up(start + size, piece.align()) - start;
+            size = align_up_u64(start + size, piece.align()) - start;
             let addr = start + size;
             if piece.addr != addr || self.fresh.contains(*id) {
                 moved.push((*id, addr));
@@ -696,13 +742,8 @@ mod tests {
     /// some bytes vary, and many keys tie (stability keeps ties in input order).
     #[test]
     fn radix_sort_agrees_with_a_comparison_sort() {
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        let mut next = || rng.next_u64();
         for len in [0usize, 1, 2, 300, 5000] {
             let entries: Vec<Entry> = (0..len)
                 .map(|at| {
@@ -734,6 +775,8 @@ mod tests {
             syms.push(symbols.intern(SymKey::Body(id)));
             syms.push(symbols.intern(SymKey::Data(id)));
             syms.push(symbols.intern(SymKey::Fde(id)));
+            syms.push(symbols.intern(SymKey::Coverage(id, n % 3)));
+            syms.push(symbols.intern(SymKey::CoveragePcs(id)));
         }
         syms.push(symbols.intern(SymKey::Cells));
         syms.push(symbols.intern(SymKey::Stubs));

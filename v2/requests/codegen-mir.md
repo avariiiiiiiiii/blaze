@@ -207,3 +207,32 @@ inference already resolved it, and finds each expression's adjustments by a hash
 - `expr_adjustments` as an `ArenaMap<ExprId, Box<[Adjustment]>>` (or one flat array with
   per-expression ranges) instead of a hash map.
 Then `lower.rs` reads both by index and its resolver calls for values go.
+
+> forwarded to db (`crates/hir-ty/src/infer.rs`) (from requests, pass 16; told by tmux).
+
+## dedyn: crates/hir-ty-mir/src/mir/eval: three `dyn` lines kept, justified (from dedyn-codegen, 2026-10-29)
+
+From `dedyn-codegen` (report `/tmp/blaze-lanes/v2-dedyn-codegen.md`). hot_lint flags these three;
+each stays, with a `// dyn:` line inserted above it (indented as the line). No code changes.
+
+1. `eval/shim/reflection.rs`, above `type FieldBytes<'a, 'db, M> = &'a mut dyn FnMut(`:
+
+   ```rust
+   // dyn: once per reflected field (`type_info`, once per constant), which allocates; ~20 closures would each copy the walkers
+   ```
+
+2. `eval/shim/reflection.rs` `reflected_slice`, above
+   `element: &mut dyn FnMut(&mut Self, Ty<'db>, usize) -> Result<'db, Made<M::Shadow>>,`:
+
+   ```rust
+   // dyn: once per element of a reflected slice, which allocates; as `FieldBytes`
+   ```
+
+3. `eval/unwind.rs` `payload_message`, above `Ok("Box<dyn Any>".to_owned())`:
+
+   ```rust
+   // dyn: rustc's text for a payload that is no string, not a trait object
+   ```
+
+`mir/location.rs`'s `type SourcePaths = dyn Fn(..)` (codegen-mir-store's) already has its
+`// dyn:` line.

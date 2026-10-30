@@ -21,7 +21,7 @@
 //! members compare equal when they have as many words, which every caller keeps by sizing
 //! the sets of one domain alike.
 
-use std::{fmt, hash, iter::FusedIterator, marker::PhantomData, ops::Range};
+use std::{alloc::Allocator, fmt, hash, iter::FusedIterator, marker::PhantomData, ops::Range};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smallvec::SmallVec;
@@ -121,7 +121,7 @@ pub trait WordsMut: Words {
 }
 
 /// Storage whose word count changes.
-pub trait GrowWords: WordsMut + Default {
+pub trait GrowWords: WordsMut {
     /// Makes it `len` words, the new ones zero.
     fn resize_words(&mut self, len: usize);
 
@@ -129,21 +129,21 @@ pub trait GrowWords: WordsMut + Default {
     fn shrink_words(&mut self);
 }
 
-impl Words for Vec<u64> {
+impl<A: Allocator> Words for Vec<u64, A> {
     #[inline]
     fn words(&self) -> &[u64] {
         self
     }
 }
 
-impl WordsMut for Vec<u64> {
+impl<A: Allocator> WordsMut for Vec<u64, A> {
     #[inline]
     fn words_mut(&mut self) -> &mut [u64] {
         self
     }
 }
 
-impl GrowWords for Vec<u64> {
+impl<A: Allocator> GrowWords for Vec<u64, A> {
     fn resize_words(&mut self, len: usize) {
         self.resize(len, 0); // alloc: a growable set's words, grown to its domain once
     }
@@ -537,7 +537,9 @@ impl<S: WordsMut, I: BitIndex> Bits<S, I> {
     }
 }
 
-impl<S: GrowWords, I: BitIndex> Bits<S, I> {
+/// Sets whose storage starts empty on its own; one in an allocator's `Vec` starts from
+/// [`Bits::from_words`] of `Vec::new_in`.
+impl<S: GrowWords + Default, I: BitIndex> Bits<S, I> {
     /// The empty set with room for the bits below `len`.
     pub fn new(len: usize) -> Self {
         let mut words = S::default();
@@ -552,7 +554,9 @@ impl<S: GrowWords, I: BitIndex> Bits<S, I> {
         range_masks(0..len, |word, mask| words[word] |= mask);
         out
     }
+}
 
+impl<S: GrowWords, I: BitIndex> Bits<S, I> {
     /// Room for the bits below `len`; it never shrinks.
     #[inline]
     pub fn grow(&mut self, len: usize) {
@@ -735,7 +739,7 @@ impl<'de, S: Deserialize<'de>, I> Deserialize<'de> for Bits<S, I> {
     }
 }
 
-impl<S: GrowWords, I: BitIndex> FromIterator<I> for Bits<S, I> {
+impl<S: GrowWords + Default, I: BitIndex> FromIterator<I> for Bits<S, I> {
     fn from_iter<T: IntoIterator<Item = I>>(members: T) -> Self {
         let mut set: Self = Bits::from_words(S::default());
         set.extend(members);
@@ -902,12 +906,14 @@ fn subtract_words(into: &mut [u64], from: &[u64]) -> bool {
     changed != 0
 }
 
-/// A set of `columns` bits per row, every row in one buffer, a row found by one multiply: the
-/// entry sets of every block of a body.
-pub struct BitMatrix<I = usize> {
+/// A set of `columns` bits per row, every row in one buffer `S`, a row found by one multiply:
+/// the entry sets of every block of a body. The index type comes first, unlike [`Bits`],
+/// because an owned matrix (`BitMatrix<Local>`) is what nearly every caller names; a matrix
+/// over a frame's words is `BitMatrix<I, &'f mut [u64]>`.
+pub struct BitMatrix<I = usize, S = Vec<u64>> {
     rows: usize,
     row_words: usize,
-    data: Vec<u64>,
+    data: S,
     index: PhantomData<fn(I) -> I>,
 }
 
@@ -925,6 +931,24 @@ impl<I: BitIndex> BitMatrix<I> {
         self.data.clear();
         self.data.resize(rows * self.row_words, 0); // alloc: grown to the largest analysis, then reused
     }
+}
+
+impl<I: BitIndex, S: Words> BitMatrix<I, S> {
+    /// The matrix of `rows` rows of `columns` bits in `data`, which holds exactly their words.
+    pub fn from_words(rows: usize, columns: usize, data: S) -> Self {
+        let row_words = words_for(columns);
+        assert_eq!(
+            data.words().len(),
+            rows * row_words,
+            "{rows} rows of {columns} bits in {} words",
+            data.words().len()
+        );
+        BitMatrix { rows, row_words, data, index: PhantomData }
+    }
+
+    pub fn into_words(self) -> S {
+        self.data
+    }
 
     pub fn rows(&self) -> usize {
         self.rows
@@ -937,17 +961,31 @@ impl<I: BitIndex> BitMatrix<I> {
 
     #[inline]
     pub fn row(&self, row: usize) -> BitSlice<'_, I> {
-        Bits::from_words(&self.data[row * self.row_words..(row + 1) * self.row_words])
-    }
-
-    #[inline]
-    pub fn row_mut(&mut self, row: usize) -> BitSliceMut<'_, I> {
-        Bits::from_words(&mut self.data[row * self.row_words..(row + 1) * self.row_words])
+        Bits::from_words(&self.data.words()[row * self.row_words..(row + 1) * self.row_words])
     }
 
     #[inline]
     pub fn contains(&self, row: usize, at: I) -> bool {
         self.row(row).contains(at)
+    }
+
+    /// The members of `row`, ascending.
+    pub fn iter_row(&self, row: usize) -> Ones<'_, I> {
+        let words = self.row_words;
+        Ones::new(&self.data.words()[row * words..(row + 1) * words])
+    }
+
+    /// Every row's words, row after row.
+    pub fn words(&self) -> &[u64] {
+        self.data.words()
+    }
+}
+
+impl<I: BitIndex, S: WordsMut> BitMatrix<I, S> {
+    #[inline]
+    pub fn row_mut(&mut self, row: usize) -> BitSliceMut<'_, I> {
+        let words = self.row_words;
+        Bits::from_words(&mut self.data.words_mut()[row * words..(row + 1) * words])
     }
 
     /// Adds `at` to `row`; whether it was not there.
@@ -961,12 +999,6 @@ impl<I: BitIndex> BitMatrix<I> {
         self.row_mut(row).remove(at)
     }
 
-    /// The members of `row`, ascending.
-    pub fn iter_row(&self, row: usize) -> Ones<'_, I> {
-        let words = self.row_words;
-        Ones::new(&self.data[row * words..(row + 1) * words])
-    }
-
     /// Row `into` gains the members of row `from`; whether it gained any.
     pub fn union_rows(&mut self, into: usize, from: usize) -> bool {
         assert!(into < self.rows && from < self.rows, "rows {into} and {from} of a matrix of {}", self.rows);
@@ -974,11 +1006,12 @@ impl<I: BitIndex> BitMatrix<I> {
             return false;
         }
         let words = self.row_words;
+        let data = self.data.words_mut();
         let (into, from) = if into < from {
-            let (low, high) = self.data.split_at_mut(from * words);
+            let (low, high) = data.split_at_mut(from * words);
             (&mut low[into * words..(into + 1) * words], &high[..words])
         } else {
-            let (low, high) = self.data.split_at_mut(into * words);
+            let (low, high) = data.split_at_mut(into * words);
             (&mut high[..words], &low[from * words..(from + 1) * words])
         };
         union_words(into, from)
@@ -991,44 +1024,40 @@ impl<I: BitIndex> BitMatrix<I> {
 
     /// Takes out every member of every row.
     pub fn clear(&mut self) {
-        self.data.fill(0);
-    }
-
-    /// Every row's words, row after row.
-    pub fn words(&self) -> &[u64] {
-        &self.data
+        self.data.words_mut().fill(0);
     }
 
     pub fn words_mut(&mut self) -> &mut [u64] {
-        &mut self.data
+        self.data.words_mut()
     }
 }
 
-impl<I> Clone for BitMatrix<I> {
+impl<I, S: Clone> Clone for BitMatrix<I, S> {
     fn clone(&self) -> Self {
         // clone: a matrix's buffer, where its owner copies the analysis
         BitMatrix { rows: self.rows, row_words: self.row_words, data: self.data.clone(), index: PhantomData }
     }
 }
 
-impl<I> PartialEq for BitMatrix<I> {
+impl<I, S: Words> PartialEq for BitMatrix<I, S> {
     fn eq(&self, other: &Self) -> bool {
-        (self.rows, self.row_words) == (other.rows, other.row_words) && self.data == other.data
+        (self.rows, self.row_words) == (other.rows, other.row_words) && self.data.words() == other.data.words()
     }
 }
 
-impl<I> Eq for BitMatrix<I> {}
+impl<I, S: Words> Eq for BitMatrix<I, S> {}
 
-impl<I> Default for BitMatrix<I> {
+impl<I, S: Default> Default for BitMatrix<I, S> {
     fn default() -> Self {
-        BitMatrix { rows: 0, row_words: 0, data: Vec::new(), index: PhantomData } // alloc: none, empty
+        BitMatrix { rows: 0, row_words: 0, data: S::default(), index: PhantomData } // alloc: none, empty
     }
 }
 
-impl<I> fmt::Debug for BitMatrix<I> {
+impl<I, S: Words> fmt::Debug for BitMatrix<I, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let words = self.row_words;
-        let rows = (0..self.rows).map(|row| DebugOnes(Ones::new(&self.data[row * words..(row + 1) * words])));
+        let data = self.data.words();
+        let rows = (0..self.rows).map(|row| DebugOnes(Ones::new(&data[row * words..(row + 1) * words])));
         f.debug_list().entries(rows).finish()
     }
 }

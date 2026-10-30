@@ -10,7 +10,8 @@
 
 use std::hash::{Hash as _, Hasher};
 
-use blaze_codegen::backend::Shape;
+use blaze_codegen::{Unit, backend::Shape};
+use blaze_mem::Frame;
 use cranelift_codegen::ir::{self, UserExternalName};
 
 use super::{
@@ -48,101 +49,113 @@ mod part {
     pub(super) const UNSANITIZED: u8 = 12;
 }
 
-pub(crate) fn of(function: &Function) -> Result<Shape, String> {
+pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shape, String> {
     let places = &function.places;
     let requests = function.requests();
-    let data = Data::of(places, requests)?;
-    let mut out = Out::with_capacity(estimate(function));
-    out.u8(VERSION);
-    out.u32(places.refs);
-    match &function.code {
-        Built::Ir(pending) => {
-            let func = &pending.func;
-            out.u8(part::IR);
-            func.stencil.hash(&mut out);
-            out.u8(part::NAMES);
-            let names = func.params.user_named_funcs();
-            out.u32(names.len() as u32);
-            for (_, name) in names.iter() {
-                let canonical = match name.namespace {
-                    0 => UserExternalName::new(namespace::PLACE, place(places, name.index)?),
-                    1 => data.name(name.index)?,
-                    fragment::INLINED => return Err("a reference of a body built in".to_owned()),
-                    other => return Err(format!("a name in the unknown namespace {other}")),
-                };
-                out.name(canonical);
+    let data = Data::of(places, requests, frame)?;
+    // The bytes are hashed into the shape's key ([`Shape::of`]) once written: the thread's
+    // buffer's, never the shape's.
+    blaze_mem::scratch::with_bytes(|bytes| {
+        bytes.reserve(estimate(function));
+        let mut out = Out(bytes);
+        out.u8(VERSION);
+        out.u32(places.refs);
+        match &function.code {
+            Built::Ir(pending) => {
+                let func = &pending.func;
+                out.u8(part::IR);
+                func.stencil.hash(&mut out);
+                out.u8(part::NAMES);
+                let names = func.params.user_named_funcs();
+                out.u32(names.len() as u32);
+                for (_, name) in names.iter() {
+                    let canonical = match name.namespace {
+                        0 => UserExternalName::new(namespace::PLACE, place(places, name.index)?),
+                        1 => data.name(name.index)?,
+                        fragment::INLINED => {
+                            return Err("a reference of a body built in".to_owned());
+                        }
+                        other => return Err(format!("a name in the unknown namespace {other}")),
+                    };
+                    out.name(canonical);
+                }
+                out.u8(part::NAMED);
+                out.u32(pending.named.len() as u32);
+                for slot in &pending.named {
+                    out.u32(slot.as_u32());
+                }
+                pending.wants.pointees.hash(&mut out);
             }
-            out.u8(part::NAMED);
-            out.u32(pending.named.len() as u32);
-            for slot in &pending.named {
-                out.u32(slot.as_u32());
-            }
-            pending.wants.pointees.hash(&mut out);
-        }
-        Built::Assembled(code, _) => {
-            out.u8(part::ASM);
-            out.bytes(&code.bytes);
-            out.u64(code.align);
-            out.u32(code.relocs.len() as u32);
-            for reloc in code.relocs.iter() {
-                out.u32(reloc.offset);
-                out.u8(reloc_kind(reloc.kind));
-                out.u64(reloc.addend as u64);
-                match reloc.name {
-                    RelocName::Func(index) => {
-                        out.name(UserExternalName::new(namespace::PLACE, place(places, index)?));
+            Built::Assembled(code, _) => {
+                out.u8(part::ASM);
+                out.bytes(&code.bytes);
+                out.u64(code.align);
+                out.u32(code.relocs.len() as u32);
+                for reloc in code.relocs.iter() {
+                    out.u32(reloc.offset);
+                    out.u8(reloc_kind(reloc.kind));
+                    out.u64(reloc.addend as u64);
+                    match reloc.name {
+                        RelocName::Func(index) => {
+                            let at = place(places, index)?;
+                            out.name(UserExternalName::new(namespace::PLACE, at));
+                        }
+                        RelocName::Data(index) => out.name(data.name(index)?),
+                        other => return Err(format!("assembly naming {other:?}")),
                     }
-                    RelocName::Data(index) => out.name(data.name(index)?),
-                    other => return Err(format!("assembly naming {other:?}")),
+                }
+                let typed = code.relocs.iter().filter_map(|it| Some((it.offset, it.elf_type?)));
+                out.u32(typed.clone().count() as u32);
+                for (at, kind) in typed {
+                    out.u32(at);
+                    out.u32(kind);
                 }
             }
-            let typed = code.relocs.iter().filter_map(|it| Some((it.offset, it.elf_type?)));
-            out.u32(typed.clone().count() as u32);
-            for (at, kind) in typed {
-                out.u32(at);
-                out.u32(kind);
-            }
         }
-    }
-    data.write(&mut out, requests, places)?;
-    out.u8(part::SPANS);
-    out.u32(function.spans.len() as u32);
-    for span in &function.spans {
-        out.raw(&span.anchor.0);
-        out.u32(span.index);
-    }
-    out.u8(part::VARIABLES);
-    variables(&mut out, &function.variables);
-    out.u8(part::SCOPES);
-    scopes(&mut out, &function.scopes);
-    // Equal shapes are one template, which says what its code has built in.
-    out.u8(part::INLINED);
-    out.u32(function.inlined.len() as u32);
-    for code in &function.inlined {
-        out.raw(&code.0.0);
-    }
-    out.u8(part::HINT);
-    out.u8(match function.hint {
-        Hint::None => 0,
-        Hint::Inline => 1,
-        Hint::Always => 2,
-        Hint::Never => 3,
-    });
-    out.u8(part::UNSANITIZED);
-    out.u8(function.unsanitized.0);
-    Ok(Shape(out.0))
+        data.write(&mut out, requests, places)?;
+        out.u8(part::SPANS);
+        out.u32(function.spans.len() as u32);
+        for span in &function.spans {
+            out.raw(&span.anchor.0);
+            out.u32(span.index);
+        }
+        out.u8(part::VARIABLES);
+        variables(&mut out, &function.variables);
+        out.u8(part::SCOPES);
+        scopes(&mut out, &function.scopes);
+        // Equal shapes are one template, which says what its code has built in.
+        out.u8(part::INLINED);
+        out.u32(function.inlined.len() as u32);
+        for code in &function.inlined {
+            out.raw(&code.0.0);
+        }
+        out.u8(part::HINT);
+        out.u8(match function.hint {
+            Hint::None => 0,
+            Hint::Inline => 1,
+            Hint::Always => 2,
+            Hint::Never => 3,
+        });
+        out.u8(part::UNSANITIZED);
+        out.u8(function.unsanitized.0);
+        Ok(Shape::of(unit, out.0))
+    })
 }
 
 /// The canonical bytes of a static's value, as [`of`] has a function's data.
 pub(crate) fn value(blob: &ConstBlob, requests: &Requests, places: &Places) -> Result<Vec<u8>, String> {
-    let data = Data::of(places, requests)?;
-    let mut out = Out::with_capacity(64 + 2 * blob.bytes.len());
-    out.u8(VERSION);
-    out.u32(places.refs);
-    data.write(&mut out, requests, places)?;
-    out.u8(part::VALUE);
-    data.blob(&mut out, blob, places)?;
-    Ok(out.0)
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+        let data = Data::of(places, requests, frame)?;
+        // alloc: the static's key bytes, returned to its caller
+        let mut bytes = Vec::with_capacity(64 + 2 * blob.bytes.len());
+        let mut out = Out(&mut bytes);
+        out.u8(VERSION);
+        out.u32(places.refs);
+        data.write(&mut out, requests, places)?;
+        out.u8(part::VALUE);
+        data.blob(&mut out, blob, places)?;
+        Ok(bytes)
+    })
 }
 
 /// A shape's size, give or take: the stencil's `Hash` writes a few words per value, instruction
@@ -176,13 +189,9 @@ fn estimate(function: &Function) -> usize {
 
 /// The shape being written. As a [`Hasher`] it keeps every byte it is given: the stencil's
 /// derived `Hash` is a serialization of it, so equal bytes are equal IR, with no hash between.
-struct Out(Vec<u8>);
+struct Out<'b>(&'b mut Vec<u8>);
 
-impl Out {
-    fn with_capacity(capacity: usize) -> Out {
-        Out(Vec::with_capacity(capacity))
-    }
-
+impl Out<'_> {
     fn u8(&mut self, it: u8) {
         self.0.push(it);
     }
@@ -210,7 +219,7 @@ impl Out {
     }
 }
 
-impl Hasher for Out {
+impl Hasher for Out<'_> {
     fn finish(&self) -> u64 {
         self.0.len() as u64
     }
@@ -226,12 +235,12 @@ fn place(places: &Places, index: u32) -> Result<u32, String> {
 
 /// What each data request is in a shape: a place, or the number of the object among the
 /// function's own data and positions in the order they are first asked for.
-struct Data {
-    names: Vec<UserExternalName>,
+struct Data<'f> {
+    names: &'f [UserExternalName],
 }
 
-impl Data {
-    fn of(places: &Places, requests: &Requests) -> Result<Data, String> {
+impl<'f> Data<'f> {
+    fn of(places: &Places, requests: &Requests, frame: &'f Frame) -> Result<Data<'f>, String> {
         if places.datas.len() != requests.datas.len() {
             return Err(format!(
                 "{} data requests and {} places",
@@ -240,21 +249,17 @@ impl Data {
             ));
         }
         let (mut own, mut positions) = (0, 0);
-        let names = places
-            .datas
-            .iter()
-            .map(|place| match place {
-                DataPlace::Place(place) => UserExternalName::new(namespace::STATIC, *place),
-                DataPlace::Position(_) => {
-                    positions += 1;
-                    UserExternalName::new(namespace::POSITION, positions - 1)
-                }
-                DataPlace::Own | DataPlace::Text(_) | DataPlace::Nowhere => {
-                    own += 1;
-                    UserExternalName::new(namespace::OWN, own - 1)
-                }
-            })
-            .collect();
+        let names = frame.alloc_slice_from_iter(places.datas.iter().map(|place| match place {
+            DataPlace::Place(place) => UserExternalName::new(namespace::STATIC, *place),
+            DataPlace::Position(_) => {
+                positions += 1;
+                UserExternalName::new(namespace::POSITION, positions - 1)
+            }
+            DataPlace::Own | DataPlace::Text(_) | DataPlace::Nowhere => {
+                own += 1;
+                UserExternalName::new(namespace::OWN, own - 1)
+            }
+        }));
         Ok(Data { names })
     }
 
@@ -263,7 +268,7 @@ impl Data {
     }
 
     /// The content of the function's own data and its positions, in their order.
-    fn write(&self, out: &mut Out, requests: &Requests, places: &Places) -> Result<(), String> {
+    fn write(&self, out: &mut Out<'_>, requests: &Requests, places: &Places) -> Result<(), String> {
         out.u8(part::DATA);
         out.u32(places.datas.len() as u32);
         for (index, place) in places.datas.iter().enumerate() {
@@ -295,7 +300,7 @@ impl Data {
         Ok(())
     }
 
-    fn blob(&self, out: &mut Out, blob: &ConstBlob, places: &Places) -> Result<(), String> {
+    fn blob(&self, out: &mut Out<'_>, blob: &ConstBlob, places: &Places) -> Result<(), String> {
         if !blob.type_ids.is_empty() {
             return Err("a constant with a `TypeId` not filled in".to_owned());
         }
@@ -323,7 +328,7 @@ fn reloc_kind(kind: cranelift_codegen::binemit::Reloc) -> u8 {
     kind as u8
 }
 
-fn variables(out: &mut Out, variables: &[Variable]) {
+fn variables(out: &mut Out<'_>, variables: &[Variable]) {
     out.u32(variables.len() as u32);
     for variable in variables {
         out.bytes(variable.name.as_str().as_bytes());
@@ -335,7 +340,7 @@ fn variables(out: &mut Out, variables: &[Variable]) {
     }
 }
 
-fn scopes(out: &mut Out, scopes: &Scopes) {
+fn scopes(out: &mut Out<'_>, scopes: &Scopes) {
     out.u32(scopes.parents.len() as u32);
     for &parent in &scopes.parents {
         option(out, parent);
@@ -363,7 +368,7 @@ fn scopes(out: &mut Out, scopes: &Scopes) {
     }
 }
 
-fn option(out: &mut Out, it: Option<u32>) {
+fn option(out: &mut Out<'_>, it: Option<u32>) {
     match it {
         Some(it) => {
             out.u8(1);

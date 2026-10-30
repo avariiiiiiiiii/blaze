@@ -1,9 +1,13 @@
 //! One script of effects on every driver: they must end the same.
 
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use crate::{
-    Done, Driver, Effect, FileName, Tag, run_until_idle,
+    Completion, Done, Driver, Effect, FileName, Tag, run_until_idle,
     sim::{Faults, Sim},
     threads::Threads,
 };
@@ -483,4 +487,308 @@ fn a_mapping_is_the_file() {
         other => panic!("{other:?}"),
     });
     assert_eq!(mapped.expect("mapped").bytes(), b"packed");
+}
+
+/// Rounds that grow a driver's slabs, queues and buffers (and its threads') to a cycle's
+/// working set before the measured ones.
+const WARM: u64 = 8;
+/// Measured rounds of a warm cycle.
+const ROUNDS: u64 = 50;
+
+/// Polls until `out` holds `n` completions.
+fn poll_for(driver: &mut impl Driver, out: &mut Vec<Completion>, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while out.len() < n {
+        assert!(Instant::now() < deadline, "{} of {n} completions: {out:?}", out.len());
+        driver.poll(out, Duration::from_millis(50));
+    }
+}
+
+/// `rounds` of a Sync, a Stat and a Read of the file `f`: what they allocated on the polling
+/// thread.
+fn file_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
+    let file = name("f");
+    let (mut effects, mut out) = (Vec::with_capacity(3), Vec::with_capacity(16));
+    let mut used = 0;
+    for round in 0..rounds {
+        // The caller's: made before the cycle.
+        effects.extend([
+            Effect::Sync { file: file.clone(), tag: Tag(10) },
+            Effect::Stat { file: file.clone(), tag: Tag(11) },
+            Effect::Read { file: file.clone(), at: 1, len: 3, tag: Tag(12) },
+        ]);
+        let ((), cycle) = blaze_alloc_count::measure(|| {
+            driver.submit(&mut effects);
+            poll_for(driver, &mut out, 3);
+        });
+        used += cycle.allocations;
+        out.sort_by_key(|it| it.tag);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [
+                    Completion { done: Done::Synced, .. },
+                    Completion { done: Done::Stat(Some(_)), .. },
+                    Completion { done: Done::Read(bytes), .. },
+                ] if bytes == b"yte"
+            ),
+            "round {round}: {out:?}"
+        );
+        out.clear();
+    }
+    assert_eq!(driver.in_flight(), 0);
+    used
+}
+
+/// A Sync, a Stat and a Read, once the driver has grown to them: on `Sim` only the Read's
+/// `Vec<u8>`; on `Threads` nothing on the polling thread, and on its file thread only the
+/// Read's `Vec<u8>`.
+#[test]
+fn a_warm_file_cycle_allocates_only_the_reads_bytes() {
+    let write = |driver: &mut dyn Driver| {
+        let mut effects = vec![Effect::Write { file: name("f"), bytes: b"bytes".to_vec(), tag: Tag(1) }];
+        run_until_idle(driver, &mut effects, |it, _| assert_eq!(it.done, Done::Written));
+    };
+    let mut sim = Sim::new(11, Faults::default());
+    write(&mut sim);
+    file_rounds(&mut sim, WARM);
+    let used = file_rounds(&mut sim, ROUNDS);
+    assert!(
+        used <= ROUNDS,
+        "the simulation: {used} allocations over {ROUNDS} warm cycles; each may make the Read's Vec<u8> only"
+    );
+    let root = dir("budget-files");
+    let mut threads = Threads::new(&root, 1);
+    write(&mut threads);
+    file_rounds(&mut threads, WARM);
+    threads.off_thread();
+    let used = file_rounds(&mut threads, ROUNDS);
+    assert_eq!(used, 0, "threads: {ROUNDS} warm Sync, Stat and Read cycles, on the polling thread");
+    let (off, payload) = threads.off_thread();
+    assert!(
+        off - payload <= ROUNDS,
+        "threads: the file thread made {} allocations over {ROUNDS} warm cycles; each may make the Read's Vec<u8> only",
+        off - payload
+    );
+    drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// `rounds` of a timer armed and fired: what they allocated on the polling thread.
+fn timer_rounds(driver: &mut impl Driver, rounds: u64) -> u64 {
+    let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
+    let mut used = 0;
+    for round in 0..rounds {
+        let ((), cycle) = blaze_alloc_count::measure(|| {
+            effects.push(Effect::Timer { after: Duration::ZERO, tag: Tag(round) });
+            driver.submit(&mut effects);
+            poll_for(driver, &mut out, 1);
+        });
+        used += cycle.allocations;
+        assert_eq!(out.as_slice(), [Completion { tag: Tag(round), done: Done::Fired }]);
+        out.clear();
+    }
+    used
+}
+
+#[test]
+fn a_warm_timer_arm_and_fire_allocates_nothing() {
+    let mut sim = Sim::new(12, Faults::default());
+    timer_rounds(&mut sim, WARM);
+    assert_eq!(timer_rounds(&mut sim, 10 * ROUNDS), 0, "the simulation: warm timers armed and fired");
+    let root = dir("budget-timers");
+    let mut threads = Threads::new(&root, 1);
+    timer_rounds(&mut threads, WARM);
+    threads.off_thread();
+    assert_eq!(timer_rounds(&mut threads, 10 * ROUNDS), 0, "threads: warm timers armed and fired");
+    assert_eq!(threads.off_thread(), (0, 0), "threads: a timer is the polling thread's alone");
+    drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// `rounds` of a watch of `src` added, a change under it (`edit`, the world's, not counted)
+/// heard, and the watch removed: what they allocated on the polling thread.
+fn watch_rounds<D: Driver>(driver: &mut D, rounds: u64, mut edit: impl FnMut(&mut D)) -> u64 {
+    let (src, edited) = (name("src"), name("src/edit"));
+    let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(64));
+    let mut used = 0;
+    for round in 0..rounds {
+        // The caller's: made before the cycle.
+        effects.push(Effect::Watch { dir: src.clone(), tag: Tag(7) });
+        let ((), added) = blaze_alloc_count::measure(|| driver.submit(&mut effects));
+        used += added.allocations;
+        let (mut heard, deadline) = (false, Instant::now() + Duration::from_secs(10));
+        while !heard {
+            assert!(Instant::now() < deadline, "round {round}: the change was never heard");
+            edit(driver);
+            let (_, polled) = blaze_alloc_count::measure(|| driver.poll(&mut out, Duration::from_millis(50)));
+            used += polled.allocations;
+            for it in out.drain(..) {
+                match it.done {
+                    Done::Changed { files, .. } => heard |= files.contains(&edited),
+                    other => panic!("round {round}: {other:?}"),
+                }
+            }
+        }
+        effects.push(Effect::Unwatch { tag: Tag(7) });
+        let ((), removed) = blaze_alloc_count::measure(|| {
+            driver.submit(&mut effects);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !matches!(out.last(), Some(Completion { done: Done::Unwatched, .. })) {
+                assert!(Instant::now() < deadline, "round {round}: the watch never ended");
+                driver.poll(&mut out, Duration::from_millis(50));
+            }
+        });
+        used += removed.allocations;
+        for it in out.drain(..) {
+            assert!(matches!(it.done, Done::Changed { .. } | Done::Unwatched), "round {round}: {it:?}");
+        }
+        assert_eq!(driver.in_flight(), 0, "round {round}");
+    }
+    used
+}
+
+/// A watch added, a change heard and the watch removed, once the driver keeps a stopped watch
+/// for the next: nothing allocated by the driver beyond the names `Done::Changed` carries.
+#[test]
+fn a_warm_watch_add_change_and_remove_allocates_only_the_changes() {
+    let mut sim = Sim::new(13, Faults::default());
+    // The simulated world changed, which makes the change's payload.
+    let edit = |sim: &mut Sim| sim.change(&name("src/edit"), b"edited");
+    watch_rounds(&mut sim, WARM, edit);
+    assert_eq!(watch_rounds(&mut sim, ROUNDS, edit), 0, "the simulation: warm watch cycles");
+    assert_eq!(sim.stale(), 0, "no change raced an end");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let root = dir("budget-watch");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let path = root.join("src/edit");
+        let edit = |_: &mut Threads| std::fs::write(&path, b"edited").unwrap();
+        let mut threads = Threads::new(&root, 1);
+        watch_rounds(&mut threads, 2, edit);
+        threads.off_thread();
+        assert_eq!(watch_rounds(&mut threads, 4, edit), 0, "threads: warm watch cycles, on the polling thread");
+        let (off, payload) = threads.off_thread();
+        assert_eq!(
+            off - payload,
+            0,
+            "threads: the watch's errand or callbacks made {off} allocations, {payload} of them the changes' names"
+        );
+        drop(threads);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// A listen at `at` as `Tag(1)` and a connect to it as `connect`: the accepted end and the
+/// connecting one.
+#[cfg(unix)]
+fn connected(driver: &mut impl Driver, at: &crate::Address, connect: Tag, listen: bool) -> (crate::Conn, crate::Conn) {
+    let mut effects = Vec::with_capacity(2);
+    if listen {
+        effects.push(Effect::Listen { at: at.clone(), tag: Tag(1) });
+    }
+    effects.push(Effect::Connect { at: at.clone(), tag: connect });
+    driver.submit(&mut effects);
+    let mut out = Vec::with_capacity(4);
+    poll_for(driver, &mut out, 2);
+    let (mut server, mut client) = (None, None);
+    for it in out {
+        match it.done {
+            Done::Accepted { conn } if it.tag == Tag(1) => server = Some(conn),
+            Done::Connected { conn } if it.tag == connect => client = Some(conn),
+            other => panic!("{other:?}"),
+        }
+    }
+    (server.expect("accepted"), client.expect("connected"))
+}
+
+/// `rounds` of "ping" sent on `client` and received on `server`: what they allocated on the
+/// polling thread.
+#[cfg(unix)]
+fn send_rounds(driver: &mut impl Driver, (server, client): (crate::Conn, crate::Conn), rounds: u64) -> u64 {
+    let (mut effects, mut out) = (Vec::with_capacity(2), Vec::with_capacity(16));
+    let mut used = 0;
+    for round in 0..rounds {
+        // The caller's: made before the cycle.
+        effects.push(Effect::Send { conn: client, bytes: b"ping".to_vec(), tag: Tag(10) });
+        effects.push(Effect::Recv { conn: server, most: 64, tag: Tag(11) });
+        let ((), cycle) = blaze_alloc_count::measure(|| {
+            driver.submit(&mut effects);
+            poll_for(driver, &mut out, 2);
+        });
+        used += cycle.allocations;
+        out.sort_by_key(|it| it.tag);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Completion { done: Done::Sent, .. }, Completion { done: Done::Read(bytes), .. }] if bytes == b"ping"
+            ),
+            "round {round}: {out:?}"
+        );
+        out.clear();
+    }
+    used
+}
+
+/// Both ends of a connection hung up, and a new connection made in their slots: the old
+/// `Conn`s name nothing, a receive and a send on them fail, and the new one carries bytes.
+#[cfg(unix)]
+fn hung_up_conns_name_nothing(driver: &mut impl Driver, at: &crate::Address, (server, client): (crate::Conn, crate::Conn)) {
+    let mut effects = vec![Effect::Hangup { conn: client, tag: Tag(20) }, Effect::Hangup { conn: server, tag: Tag(21) }];
+    let mut out = Vec::new();
+    driver.submit(&mut effects);
+    poll_for(driver, &mut out, 2);
+    assert!(out.iter().all(|it| it.done == Done::HungUp), "{out:?}");
+    out.clear();
+    let again = connected(driver, at, Tag(3), false);
+    assert!(again.0 != server && again.0 != client && again.1 != server && again.1 != client);
+    effects.extend([
+        Effect::Recv { conn: client, most: 8, tag: Tag(30) },
+        Effect::Send { conn: server, bytes: b"x".to_vec(), tag: Tag(31) },
+        Effect::Hangup { conn: client, tag: Tag(32) },
+    ]);
+    driver.submit(&mut effects);
+    poll_for(driver, &mut out, 3);
+    assert!(out.iter().all(|it| matches!(it.done, Done::Failed(_))), "stale: {out:?}");
+    out.clear();
+    send_rounds(driver, again, 1);
+    effects.extend([
+        Effect::Hangup { conn: again.0, tag: Tag(40) },
+        Effect::Hangup { conn: again.1, tag: Tag(41) },
+        Effect::Unlisten { tag: Tag(1) },
+    ]);
+    let mut done = BTreeMap::new();
+    run_until_idle(driver, &mut effects, |it, _| _ = done.insert(it.tag.0, it.done));
+    assert_eq!(done, BTreeMap::from([(1, Done::Unlistened), (40, Done::HungUp), (41, Done::HungUp)]));
+}
+
+/// A send on one end and a receive on the other of a warm connection: only the received
+/// bytes allocated, on `Sim` by the poll and on `Threads` by the receive's errand, nothing on
+/// its polling thread. Then the connection's `Conn`s are stale once hung up.
+#[cfg(unix)]
+#[test]
+fn a_warm_send_and_receive_allocates_only_the_bytes_received() {
+    let at = crate::Address::Unix(name("s"));
+    let mut sim = Sim::new(14, Faults::default());
+    let conns = connected(&mut sim, &at, Tag(2), true);
+    send_rounds(&mut sim, conns, WARM);
+    let used = send_rounds(&mut sim, conns, ROUNDS);
+    assert!(
+        used <= ROUNDS,
+        "the simulation: {used} allocations over {ROUNDS} warm sends and receives; each may make the received Vec<u8> only"
+    );
+    hung_up_conns_name_nothing(&mut sim, &at, conns);
+    let root = dir("budget-conn");
+    let mut threads = Threads::new(&root, 1);
+    let conns = connected(&mut threads, &at, Tag(2), true);
+    send_rounds(&mut threads, conns, WARM);
+    threads.off_thread();
+    let used = send_rounds(&mut threads, conns, ROUNDS);
+    assert_eq!(used, 0, "threads: {ROUNDS} warm sends and receives, on the polling thread");
+    let (off, payload) = threads.off_thread();
+    assert_eq!(off - payload, 0, "threads: the errands made {off} allocations, {payload} of them the received bytes");
+    assert!(payload <= ROUNDS, "threads: {payload} allocations of received bytes over {ROUNDS} receives");
+    hung_up_conns_name_nothing(&mut threads, &at, conns);
+    drop(threads);
+    std::fs::remove_dir_all(root).unwrap();
 }

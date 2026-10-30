@@ -2,10 +2,12 @@
 //! rustc ignores after the expression a macro other than a `macro_rules!` one expands to: each as
 //! rustc prints it, its message and code, the text at each of its primary spans, and the notes and
 //! helps under it. The macros' cases are rustc's `tests/ui/macros/macros-nonfatal-errors.rs`.
+//! Also what a `macro_rules!` call no rule matches carries of the rule that got furthest.
 
 use expect_test::{Expect, expect};
 use hir_expand::{
-    BuiltinChild, ExpandErrorKind, FileRange, InFile, MacroCallId, MacroCallKind, resolve_span,
+    BuiltinChild, ExpandErrorKind, ExpandTo, FileRange, InFile, MacroCallId, MacroCallKind,
+    MbeErrorKind, resolve_span,
 };
 use span::Span;
 use stdx::format_to;
@@ -26,7 +28,7 @@ fn text_at(db: &TestDB, span: Span) -> String {
 
 /// The macro calls of the test crate: those written in its root file, in items and in bodies,
 /// and its derives.
-fn macro_calls(db: &TestDB) -> Vec<MacroCallId> {
+pub(super) fn macro_calls(db: &TestDB) -> Vec<MacroCallId> {
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(db, krate);
     let source = def_map.module(db, def_map.root).definition_source(db);
@@ -301,6 +303,114 @@ builtin-macro-error: macro expansion ignores `;` and any tokens following
   at `;`
   = note: the usage of `proc_macros::mirror!` is likely invalid in expression context
 "#]],
+    );
+}
+
+/// rustc's `parse_stmt_mac`: the last call of a block, not in braces and with no `;` after it,
+/// is an expression, so statements are not what it can expand to.
+#[test]
+fn a_blocks_last_call_expands_to_an_expression() {
+    let db = TestDB::with_files(
+        r#"
+macro_rules! m { () => { let x = 1; x } }
+
+fn f() -> i32 { m!() }
+fn g() { m!(); }
+fn h() -> i32 { m! {} }
+"#,
+    );
+    let mut found = Vec::new();
+    for call in macro_calls(&db) {
+        let MacroCallKind::FnLike { expand_to, .. } = call.loc(&db).kind else {
+            panic!("the calls are function-like")
+        };
+        let parse_errors = !call.parse_macro_expansion(&db).value.0.errors().is_empty();
+        found.push((expand_to, parse_errors));
+    }
+    assert_eq!(
+        found,
+        [(ExpandTo::Expr, true), (ExpandTo::Statements, false), (ExpandTo::Statements, false)]
+    );
+}
+
+#[test]
+fn the_dropped_semicolon_is_in_the_expansion_span_map() {
+    let text = r#"
+macro_rules! m { () => { 1; } }
+macro_rules! n { () => { 1 } }
+
+fn main() {
+    let y = m!();
+    let z = n!();
+}
+"#;
+    let db = TestDB::with_files(text);
+    let mut found = Vec::new();
+    for call in macro_calls(&db) {
+        let map = call.expansion_span_map(&db);
+        found.push(map.dropped_semicolon.map(|span| {
+            let FileRange { file_id, range } = resolve_span(&db, span);
+            let written = file_id.parse(&db).syntax_node().text().to_string();
+            let body = written.find("1; }").expect("m's body");
+            (usize::from(range.start()) - body, text_at(&db, span))
+        }));
+    }
+    assert_eq!(found, [Some((1, ";".to_owned())), None]);
+}
+
+/// rustc's `failed_to_match_macro`: the token the rule that got furthest stopped at, what it
+/// was trying to match there, and whether a `,` makes a rule match, carried in the error's kind.
+#[test]
+fn a_call_no_rule_matches_carries_the_best_failure() {
+    let text = r#"
+macro_rules! m { ($a:ident ,) => {} }
+macro_rules! n { ($a:ident, $b:ident) => {} }
+m!(x);
+n!(x y);
+"#;
+    let db = TestDB::with_files(text);
+    let mut found = Vec::new();
+    for call in macro_calls(&db) {
+        let err = call.parse_macro_expansion(&db).err.clone().expect("no rule matches");
+        let ExpandErrorKind::Mbe(MbeErrorKind::MatchFailure(failure)) = err.kind() else {
+            panic!("a match failure, not {:?}", err.kind())
+        };
+        let comma = failure.missing_comma.map(|span| {
+            let FileRange { file_id, range } = resolve_span(&db, span);
+            assert!(range.is_empty(), "the comma's place is empty");
+            let written = file_id.parse(&db).syntax_node().text().to_string();
+            let call = written.find("n!(x y)").expect("n's call");
+            written[call..usize::from(range.start())].to_owned()
+        });
+        found.push((
+            failure.token.as_deref().map(str::to_owned),
+            text_at(&db, err.span()),
+            failure.label(),
+            failure.remaining.to_string(),
+            failure.remaining_span.map(|span| text_at(&db, span)),
+            comma,
+        ));
+    }
+    assert_eq!(
+        found,
+        [
+            (
+                None,
+                ")".to_owned(),
+                "missing tokens in macro arguments",
+                "`,`".to_owned(),
+                Some(",".to_owned()),
+                None,
+            ),
+            (
+                Some("`y`".to_owned()),
+                "y".to_owned(),
+                "no rules expected this token in macro call",
+                "`,`".to_owned(),
+                Some(",".to_owned()),
+                Some("n!(x".to_owned()),
+            ),
+        ]
     );
 }
 

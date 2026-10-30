@@ -25,8 +25,12 @@ use crate::{
 /// rustc's `CAP_COVERED_BY_MANY`.
 const COVERED_BY_MANY: usize = 4;
 
+/// The lints this module gives: it runs only when one may fire.
+pub(super) const LINTS: super::LintSet =
+    super::lint_set(["unreachable_patterns", "irrefutable_let_patterns", "bindings_with_variant_name"]);
+
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
-    if b.tainted {
+    if b.tainted() {
         return Vec::new();
     }
     let lints = DefWithBody::from(b.owner).match_lints(b.db());

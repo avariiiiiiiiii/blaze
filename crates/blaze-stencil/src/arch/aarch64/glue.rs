@@ -109,7 +109,7 @@ pub(super) fn bound_fixed(frame: &Frame) -> u32 {
 
 /// The prologue: the frame with its rows, `x20`, the StructReturn pointer's own slot, the
 /// parameters from their registers and the caller's stack to their slots, and the count.
-pub(super) fn prologue<'f>(cx: &mut impl Ctx<'f>) -> Result<(), Error> {
+pub(super) fn prologue<'f, 'm>(cx: &mut impl Ctx<'f, 'm>) -> Result<(), Error> {
     let (func, frame) = (cx.func(), cx.frame());
     // Cranelift's `gen_prologue_frame_setup` says it before anything on Apple's ("the macOS
     // unwinder seems to require this"), with return addresses left unsigned.
@@ -144,7 +144,7 @@ pub(super) fn prologue<'f>(cx: &mut impl Ctx<'f>) -> Result<(), Error> {
 }
 
 /// Stores the parameter at `place` to `loc`; a stack one is above the frame record.
-fn param(buf: &mut Buf, place: Place, loc: Loc) -> Result<(), Error> {
+fn param(buf: &mut Buf<'_>, place: Place, loc: Loc) -> Result<(), Error> {
     let off = match loc {
         Loc::Dead => return Ok(()),
         Loc::Slot(off) => off,
@@ -166,7 +166,7 @@ fn param(buf: &mut Buf, place: Place, loc: Loc) -> Result<(), Error> {
 
 /// Copies `bytes` (1, 2, 4, 8 or 16) from `[from + at]` to `[to + off]` through `x17`: a
 /// 16-byte value as two 8-byte halves.
-fn copy(buf: &mut Buf, (from, at): (u8, u32), (to, off): (u8, u32), bytes: u32) {
+fn copy(buf: &mut Buf<'_>, (from, at): (u8, u32), (to, off): (u8, u32), bytes: u32) {
     if bytes == 16 {
         for half in [0, 8] {
             inst::ldst(buf, inst::LDRX, X17, from, at + half, X16);
@@ -180,7 +180,7 @@ fn copy(buf: &mut Buf, (from, at): (u8, u32), (to, off): (u8, u32), bytes: u32) 
 
 /// Adds one to the function's counter cell at `addend` (`Name::Counter`). Cranelift's
 /// relocations have no 64-bit load's low 12 bits, so the cell's address is made whole first.
-pub(super) fn count(buf: &mut Buf, addend: i64) {
+pub(super) fn count(buf: &mut Buf<'_>, addend: i64) {
     let at = buf.len();
     buf.reloc(at, Reloc::Aarch64AdrPrelPgHi21, Name::Counter, addend);
     buf.put4(inst::adrp(X16));
@@ -193,12 +193,12 @@ pub(super) fn count(buf: &mut Buf, addend: i64) {
 }
 
 /// Copies `bytes` (8 or 16) between two slots, either past `NEAR`, through `x16` and `x17`.
-pub(super) fn relay(buf: &mut Buf, from: u32, to: u32, bytes: u8) {
+pub(super) fn relay(buf: &mut Buf<'_>, from: u32, to: u32, bytes: u8) {
     copy(buf, (X20, from), (X20, to), u32::from(bytes));
 }
 
 /// Writes `inst`, which [`takes`] says the glue writes.
-pub(super) fn inst<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
+pub(super) fn inst<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     let func = cx.func();
     match func.dfg.insts[inst].opcode() {
         Opcode::Return => ret(cx, inst),
@@ -249,14 +249,14 @@ pub(super) fn inst<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Erro
 }
 
 /// Stores the X register `reg` to the slot of `inst`'s result.
-fn result<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst, reg: u8) -> Result<(), Error> {
+fn result<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst, reg: u8) -> Result<(), Error> {
     let value = cx.func().dfg.first_result(inst);
     let loc = cx.loc(value);
     store(cx.buf(), inst, Place::Reg(Reg::X(reg), types::I64), loc)
 }
 
 /// Stores what is at the register `place` to `loc`, as the value's own width.
-fn store(buf: &mut Buf, inst: ir::Inst, place: Place, loc: Loc) -> Result<(), Error> {
+fn store(buf: &mut Buf<'_>, inst: ir::Inst, place: Place, loc: Loc) -> Result<(), Error> {
     let off = match loc {
         Loc::Dead => return Ok(()),
         Loc::Slot(off) => off,
@@ -290,7 +290,7 @@ fn extended(value: i64, ty: ir::Type, ext: Option<bool>) -> u64 {
 /// Puts the value at `loc` where `place` says, extended as `ext` says: a register (an X
 /// one, a V one, a pair) or, for a call's argument, the outgoing stack at `sp`.
 fn load(
-    buf: &mut Buf,
+    buf: &mut Buf<'_>,
     inst: ir::Inst,
     place: Place,
     loc: Loc,
@@ -348,7 +348,7 @@ fn load(
 
 /// The value at `loc` into the X register `rd`, extended as `ext` says.
 fn load_loc(
-    buf: &mut Buf,
+    buf: &mut Buf<'_>,
     inst: ir::Inst,
     rd: u8,
     loc: Loc,
@@ -364,14 +364,14 @@ fn load_loc(
 }
 
 /// The value of `ty` at slot `off` into the X register `rd`, extended as `ext` says.
-fn load_x(buf: &mut Buf, rd: u8, off: u32, ty: ir::Type, ext: Option<bool>) {
+fn load_x(buf: &mut Buf<'_>, rd: u8, off: u32, ty: ir::Type, ext: Option<bool>) {
     let tmp = if rd == X16 { X17 } else { X16 };
     inst::ldst(buf, inst::ldr_ext(ty.bytes(), ext == Some(true)), rd, X20, off, tmp);
 }
 
 /// `return`: the values to their registers (Apple's convention extending them as the
 /// signature says), the StructReturn pointer back into `x8`, and the epilogue.
-fn ret<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
+fn ret<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     let (func, frame) = (cx.func(), cx.frame());
     let sig = &func.signature;
     let args = func.dfg.inst_args(inst);
@@ -401,7 +401,7 @@ enum Callee {
 /// `call`, `call_indirect`, `try_call`, `try_call_indirect`: the arguments to their
 /// registers and the outgoing area, the callee, the call, its site and the results to their
 /// slots. A `try_call`'s normal edge is written next by the patcher.
-fn call<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
+fn call<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     let (func, target) = (cx.func(), cx.target());
     let data = &func.dfg.insts[inst];
     let sig = frame::call_signature(func, inst)
@@ -484,7 +484,7 @@ fn call<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
 }
 
 /// A `try_call`'s landing pad: the exception payload (`x0`, `x1`) to its slots.
-pub(super) fn landing<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
+pub(super) fn landing<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     for (k, reg) in [X0, X1].into_iter().enumerate() {
         let loc = cx.payload(inst, k);
         store(cx.buf(), inst, Place::Reg(Reg::X(reg), types::I64), loc)?;
@@ -495,7 +495,7 @@ pub(super) fn landing<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), E
 /// `br_table` as Cranelift's `JTSequence`: the index (zero-extended) checked against the
 /// table's length with the default taken at or past it, clamped to zero by `csel` (Spectre),
 /// then a 32-bit offset of each target from the table's start, which follows the `br`.
-fn br_table<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
+fn br_table<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     let func = cx.func();
     let Data::BranchTable { arg, table, .. } = func.dfg.insts[inst] else {
         return Err(Error::at(inst, "a `br_table` with no table"));
@@ -534,7 +534,7 @@ fn br_table<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
 /// `name + offset` into `rd`, as Cranelift's `load_ext_name`: through the GOT in
 /// position-independent code (the offset added after), `adrp` and `add` when it is near, and
 /// otherwise an absolute literal jumped over.
-fn load_name(buf: &mut Buf, target: &Target, rd: u8, name: Name, near: bool, offset: i64) {
+fn load_name(buf: &mut Buf<'_>, target: &Target, rd: u8, name: Name, near: bool, offset: i64) {
     let tmp = if rd == X16 { X17 } else { X16 };
     if target.pic {
         let at = buf.len();
@@ -564,7 +564,7 @@ fn load_name(buf: &mut Buf, target: &Target, rd: u8, name: Name, near: bool, off
 }
 
 /// `func_addr`, `symbol_value`: the address into `x16`, then to the result's slot.
-fn address<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
+fn address<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     let (func, target) = (cx.func(), cx.target());
     let (name, near, offset) = match func.dfg.insts[inst] {
         Data::FuncAddr { func_ref, .. } => {
@@ -601,7 +601,7 @@ fn address<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
 /// `tls_value`, as Cranelift's `ElfTlsGetAddr` (a TLS descriptor call, the thread pointer
 /// added after) and `MachOTlsGetAddr` (the variable's `tlv` thunk called with its descriptor
 /// in `x0`): each a call, recorded as one.
-fn tls<'f>(cx: &mut impl Ctx<'f>, inst: ir::Inst) -> Result<(), Error> {
+fn tls<'f, 'm>(cx: &mut impl Ctx<'f, 'm>, inst: ir::Inst) -> Result<(), Error> {
     let (func, target) = (cx.func(), cx.target());
     let Data::UnaryGlobalValue { global_value, .. } = func.dfg.insts[inst] else {
         return Err(Error::at(inst, "a `tls_value` of no global"));

@@ -7,6 +7,7 @@ mod matcher;
 pub(crate) mod model;
 mod transcriber;
 
+use base_db::Db;
 use span::Span;
 
 pub(crate) use self::matcher::Matcher;
@@ -19,7 +20,7 @@ use crate::{
 const NONE: u32 = u32::MAX;
 
 pub(crate) fn expand_rules(
-    db: &dyn salsa::Database,
+    db: &Db,
     rules: &[crate::Rule],
     input: &tt::TopSubtree,
     marker: impl Fn(&mut Span) + Copy,
@@ -67,7 +68,11 @@ pub(crate) fn expand_rules(
         let rule = &rules[idx];
         let ExpandResult { value, err: transcribe_err } =
             transcriber::transcribe(&rule.rhs, &match_.bindings, marker, call_site);
-        ExpandResult { value: (value, idx.try_into().ok()), err: match_.err.or(transcribe_err) }
+        // What rustc says when no rule matches; its ambiguity errors are the matcher's own.
+        let match_err = match_.err.map(|err| {
+            matcher::match_failure(db, rules, input, call_style).unwrap_or(err)
+        });
+        ExpandResult { value: (value, idx.try_into().ok()), err: match_err.or(transcribe_err) }
     } else {
         ExpandResult::new(
             (tt::TopSubtree::empty(tt::DelimSpan::from_single(call_site)), None),

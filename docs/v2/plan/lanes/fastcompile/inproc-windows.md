@@ -1,12 +1,14 @@
 ---
 status: plan
-summary: blaze v2 fastcompile, the Windows x86-64 half of in-process runs (crates/blaze-inproc sys/windows.rs and load/pe.rs) - dual-mapped code from a pagefile-backed section mapped into the run process by the daemon through placeholders, a named pipe for this user only, and blaze's own loader for PE images (three 64 KiB views, never writable and executable, imports, TLS in the loader's reserve, unwind tables, the program's command line), with what blaze-link must lay out.
+summary: blaze v2 fastcompile, the Windows x86-64 half of in-process runs (crates/blaze-inproc sys/windows.rs) - the program started from its own executable, its image region rebuilt by the daemon before main so the code ranges are views of a pagefile-backed section the daemon writes (placeholders, every other page put back as it was), a named pipe for this user only, and what blaze-link must lay out.
 date: 2026-10-29
 ---
-# fastcompile-inproc-windows: dual-mapped code and a PE loader
+# fastcompile-inproc-windows: a running image laid over by a shared section
 
 The Windows x86-64 platform layer of [inproc.md](inproc.md): `crates/blaze-inproc/src/sys/windows.rs`
-(+ `sys/windows/pipe.rs`) and the loader `crates/blaze-inproc/src/load/pe.rs` (+ `load/pe/parse.rs`).
+and `sys/windows/pipe.rs`. The program is its own executable, started by the kernel; its start
+hook (a TLS callback, so before the CRT's start) asks the daemon to lay the code memory over its
+image. The PE loader that used to run programs (`load/pe.rs`) is gone.
 
 ## State of the art matched
 
@@ -19,11 +21,10 @@ The Windows x86-64 platform layer of [inproc.md](inproc.md): `crates/blaze-inpro
   split with `VirtualFree(MEM_PRESERVE_PLACEHOLDER)`, replaced with `MEM_REPLACE_PLACEHOLDER`) are
   Microsoft's documented way to do this. Chromium and Wine's `ntdll` use them to place views
   exactly. Nothing else can take the range between reserving it and mapping it.
-- **Loading from memory:** MemoryModule and reflective loaders map a PE image from memory, relocate
-  it, resolve its imports and call TLS callbacks. blaze's loader does the same but goes further:
-  it registers `.pdata` with `RtlAddFunctionTable` so stack walks and SEH work, gives the program
-  real static thread-locals, and makes Rust panics (C++ exceptions) work through the image (see
-  "Panics").
+- **The system loader does the loading.** Imports, relocations, TLS, `.pdata`, the CRT start and
+  the command line are the NT loader's, as in a whole build: `GetModuleHandle(NULL)`,
+  `GetModuleFileName`, `current_exe`, resources, `RtlPcToFileHeader` (so C++ exceptions and Rust
+  panics) and stack walks all see the program's own module.
 
 ## Memory
 
@@ -31,20 +32,13 @@ The Windows x86-64 platform layer of [inproc.md](inproc.md): `crates/blaze-inpro
   The whole object is charged against the commit limit when created, so no write can fault for
   lack of commit later. The daemon maps it read-write here.
 - **Granularity:** every view starts and ends on the 64 KiB allocation granularity, which is what
-  `sys::page()` returns. All offsets, lengths and addresses of the image, the arena, the control
-  object and fixed maps are multiples of it.
-- **MAP frames:** the loader's `Granted::map`, `Granted::view` and `reserve` work as follows.
-  - The loader keeps its placeholders in a list.
-  - To map into one, it carves out exactly `[at, at + len)` and asks the daemon with MAP (object
-    u32, offset u64, len u64, at u64, access u8).
-  - The daemon checks the object's rights (code may not be mapped shared-writable; control words
-    are only shared or read), the granularity and the bounds. It then reads the target's state
-    with `VirtualQueryEx`: free means a plain map, a placeholder means `MEM_REPLACE_PLACEHOLDER`,
-    anything else is refused as taken. It answers MAPPED with the address, or REFUSED with why.
-  - On a refusal the loader puts the placeholder back.
-- **Object lengths:** these reach the loader in a second GRANT frame, at sequence number 1, after
-  the grant. Its body is a count, then for each object its length (u64) and rights (u8). The
-  daemon keeps the handles.
+  `sys::page()` returns. All offsets, lengths and addresses of the overlays are multiples of it.
+- **Objects:** after the GRANT, a second GRANT frame at sequence number 1 lists each object's
+  length (u64) and rights (u8). The daemon keeps the handles.
+- **MAP frames:** the hook maps a whole object anywhere (the control words, shared) by asking the
+  daemon with MAP (object u32, access u8). The daemon checks the object's rights (never
+  executable anywhere, the image never shared writable) and answers MAPPED with the address, or
+  REFUSED with why.
 - **Channel:** a named pipe `\\.\pipe\blaze-inproc-<pid>-<random>`, with remote clients rejected.
   - The DACL gives the user everything and gives ALL APPLICATION PACKAGES connect rights only, so
     a program in the `blaze.sandbox` AppContainer can connect.
@@ -56,113 +50,61 @@ The Windows x86-64 platform layer of [inproc.md](inproc.md): `crates/blaze-inpro
 - **Other functions:**
   - `threads`: a Toolhelp32 walk. A walk that fails partway is an error, never a shorter list,
     because the fence reaps the slots of threads that aren't listed.
-  - `backtrace`: a walk with `RtlLookupFunctionEntry` and `RtlVirtualUnwind`. It covers every
-    frame with unwind information, including the program's, once `.pdata` is registered. It
-    returns `None` at a frame with no function entry or when the buffer is full.
+  - `backtrace`: a walk with `RtlLookupFunctionEntry` and `RtlVirtualUnwind`, through the
+    program's `.pdata` as the system loader registered it. It returns `None` at a frame with no
+    function entry or when the buffer is full.
   - `publish`: `FlushInstructionCache`.
   - `random`: `ProcessPrng`.
+  - `own_image`: `GetModuleHandleW(NULL)` and the headers' `SizeOfHeaders` bytes there.
+  - `clone_file`: none (NTFS has no clones; ReFS block cloning is not asked for), so the
+    executable is written.
 
-## The PE loader
+## The rebuild (`Remote::overlay`)
 
-**One object, three views.** The file must be laid out as it is in memory: each section's
-`PointerToRawData == VirtualAddress`. Otherwise the loader stops with an error naming the section.
-The object is mapped as three views:
+The image is one view of an image section, which can't be partly unmapped or replaced. When the
+hook sends OVERLAY (after checking the grant against its own headers, as on every platform), the
+daemon, holding the process with `PROCESS_VM_OPERATION | VM_READ | VM_WRITE |
+QUERY_INFORMATION | TERMINATE`:
 
-| Range | Access | Why |
-| --- | --- | --- |
-| `[0, code_end)` | execute-read, shared | headers and code: the daemon's patches show at once |
-| `[code_end, image_len)` | write-copy | data: private on first write |
-| `[image_len, len)` | execute-read, shared | the lazy arena |
+1. checks every overlay: granular, its object's rights allow its access;
+2. walks the image's span with `VirtualQueryEx`: every committed region must be of the image's
+   own allocation (`MEM_IMAGE`, allocation base the header);
+3. reads every committed page outside the overlays with `ReadProcessMemory` (`Kept`), refusing
+   any that is executable or a guard page outside them (code runs only from the code memory)
+   and turning `PAGE_WRITECOPY` into `PAGE_READWRITE` (a private page is what a written
+   copy-on-write page becomes anyway);
+4. unmaps the image (`UnmapViewOfFile2`) and reserves its span, rounded to the granule, as one
+   placeholder (`VirtualAlloc2` `MEM_RESERVE_PLACEHOLDER`);
+5. splits it at the overlays (`VirtualFreeEx` `MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER`) and fills
+   each piece: an overlay's view (`MapViewOfFile3` `MEM_REPLACE_PLACEHOLDER`), or reserved private
+   memory (`VirtualAlloc2` `MEM_RESERVE | MEM_REPLACE_PLACEHOLDER`);
+6. commits the kept pages, writes their bytes back (`WriteProcessMemory`) and gives them their
+   protection (`VirtualProtectEx`);
+7. answers OVERLAID.
 
-`code_end` is the end of the last code section, rounded up to 64 KiB. Every code section must come
-before every data section, and the first data section must start at or after `code_end`. Otherwise
-the error names the section and says what blaze-link must do.
-
-**Why not 4 KiB sections?** Views can't split a 64 KiB granule, so a granule holding both code and
-data would need one view that is both writable and executable. The other options are worse:
-
-- Copying the data out to private memory loses sharing and doubles the bytes.
-- Remapping each section's pages separately is impossible, because offsets must be 64 KiB-aligned
-  too.
-
-Padding the start of data to 64 KiB costs at most 60 KiB of address space, and no memory: the
-padding is never touched.
-
-After relocation and imports, read-only data sections are protected read-only. Writable data stays
-`PAGE_WRITECOPY`, which Windows turns into private read-write pages on first write. A code section
-whose memory size is larger than its raw size must have zeros past its raw bytes in the object,
-since that view can't be written. Data sections past their raw bytes are zeroed only where the
-object holds anything else there.
-
-**Base:** exactly the address the grant says, which the daemon's code memory chose when it was
-created. If that address is taken, or the grant gives no base, the load stops with an error; it
-never maps anywhere else. An image without relocations must have that address as its `ImageBase`.
-
-**Relocations:** DIR64 only, and into data only. A relocation into code is an error even when the
-image doesn't move, so a layout bug shows whatever the address. The code is shared with the daemon
-and is never written.
-
-**Imports:** each library is loaded with `LoadLibraryExW` (standard search order), and each symbol
-is resolved with `GetProcAddress`, by name or by ordinal. Delay-load imports and .NET headers are
-errors. Bound imports are ignored, because blaze resolves every import itself.
-
-**Thread-locals:**
-- The loader keeps 64 KiB of its own static TLS block: a `thread_local!` with a nonzero `const`
-  initializer, so the bytes are raw data of `.tls` and every new thread is started from them.
-- `reserve()` reports the reserve's offset from the start of the loader's block, 64 KiB, and an
-  alignment of 16. The NT loader allocates blocks from the heap, so no larger alignment holds.
-- A program whose template is larger, or more aligned, is refused.
-- The program's `AddressOfIndex` gets the loader's `_tls_index`. blaze-link biases the program's
-  TLS offsets by the reserve's offset, so `gs:[0x58][_tls_index] + offset` lands in the reserve.
-- The relocated template is copied into the calling thread's reserve, and into the loader's raw
-  template, which is made writable for the copy. Each later thread therefore starts with it.
-- A loader TLS callback (`.CRT$XLM`) forwards THREAD_ATTACH, THREAD_DETACH and PROCESS_DETACH to
-  the program's callbacks once the program is entered. The program's PROCESS_ATTACH callbacks are
-  called once, before the entry.
-
-**Unwinding:** `.pdata` is checked (sorted, inside the code) and registered with
-`RtlAddFunctionTable`.
-
-**Panics:** `_CxxThrowException`, which Rust's MSVC panics go through, asks `RtlPcToFileHeader`
-which image holds the throw's type information. The system only knows modules it loaded itself.
-The loader therefore interposes a wrapper that answers the program's base for addresses in the
-program's object and calls the real function for everything else:
-- in the program's own imports of `RtlPcToFileHeader`;
-- in the import address tables of each library the program imports (in practice
-  `vcruntime140.dll`), for slots holding ntdll's or kernel32's `RtlPcToFileHeader`.
-
-**Command line:** the daemon spawns `loader argv0 args...`. The loader drops the first argument
-(its own path, read by the C runtime's argv[0] rule) in place:
-- in the PEB's `ProcessParameters->CommandLine`, updating its length;
-- in `GetCommandLineW`'s buffer, if that's a separate buffer;
-- in `GetCommandLineA`'s buffer.
-
-The C runtime's `_wcmdln` and `_acmdln` point at these same buffers. The program's
-`mainCRTStartup` parses `argv` from them, and Rust's std reads `GetCommandLineW`. So every reader
-sees `argv0 args...`.
-
-**Entry:** `AddressOfEntryPoint`, which is the image's C runtime start (`mainCRTStartup`), called
-with the PEB as the system's thread start passes it, then `ExitProcess` with what it returns. The
-program runs on the loader's main thread, so a program asking for a larger stack reserve than that
-thread has is refused.
+Every byte at every address is what it was. The hook's thread is the only one running the
+program (TLS callbacks at process attach come before any thread the program makes) and waits in
+`ReadFile` on the pipe, on its own stack and a heap buffer, so it touches no page of the image
+until OVERLAID. A failure after step 4 ends the process with `TerminateProcess(127)`: an image
+half replaced must not run. The planning (`pieces`, `outside`, `private_protection`) is pure and
+unit-tested.
 
 ## What blaze-link must do
 
-- Put every code section before every data section, and start the first data section on a 64 KiB
-  RVA.
-- Keep `PointerToRawData == VirtualAddress`.
-- Write no base relocation into code: from code, address RIP-relative only.
-- Bias thread-local offsets (SECREL to `.tls`) by `TlsReserve.bias`, keep the template within
-  `TlsReserve.size`, and keep its alignment at 16 or less.
-- Write no delay-load imports.
-- The entry is the CRT start (`mainCRTStartup`).
-- Link the loader with a stack reserve at least as large as any program's.
+- Put the code sections together, starting on a 64 KiB RVA, and start the first section after
+  them on the next 64 KiB RVA: views can't split a granule, so a granule holding both code and
+  data would need a view both writable and executable.
+- Keep `PointerToRawData == VirtualAddress` for code, so a file offset is an object offset.
+- Write no base relocation into code (address RIP-relative only): the NT loader would write the
+  file's code pages, which then differ from the object's at the swap.
+- Disable CFG for dev runs: the loader's CFG bitmap describes the image section's pages, and the
+  rebuilt region is a view the bitmap does not cover.
+- Put the TLS callback pointing at `blaze_inproc_start` first in `.CRT$XLA*` (`.CRT$XLAB`).
+- Carry reservations for the arena, cells and fixed maps: sections with no access and no raw data.
 
-## Known differences from running the executable
+## Known differences from a whole build
 
-- `GetModuleHandle(NULL)`, `GetModuleFileName`, `current_exe` and `_pgmptr` name the loader.
-- Resources aren't found through the module handle.
-- Threads created with stack size 0 get the loader's default stack size.
-- ntdll worker threads that existed before the load keep the loader's pattern in the reserve.
-- The arena's functions have no function tables until blaze-lazy registers unwind information for
-  them.
+- Software breakpoints in the code ranges can't be written (`WriteProcessMemory` into a
+  read-execute view fails); hardware breakpoints work.
+- `VirtualQuery` of the image's addresses says `MEM_MAPPED` (code) and `MEM_PRIVATE` (the rest)
+  where it said `MEM_IMAGE`.

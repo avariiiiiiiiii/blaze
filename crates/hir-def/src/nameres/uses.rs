@@ -27,7 +27,7 @@ use syntax::{AstNode, ast};
 
 use crate::{
     AdtId, AssocItemId, AstId, ExpressionStoreOwnerId, ExternCrateId, FxIndexMap, GenericDefId,
-    HasModule, Lookup, MacroId, ModuleDefId, ModuleId, VariantId,
+    HasModule, Lookup, MacroId, ModuleDefId, ModuleId, TraitId, VariantId,
     expr_store::{
         ExpressionStore, StoreVisitor,
         scope::{ExprScopes, ScopeId},
@@ -404,11 +404,33 @@ impl UsedImports {
 }
 
 /// The uses of the imports of `krate` by every path of the crate: its imports, macro calls,
-/// signatures and bodies, block def maps included.
+/// signatures and bodies, block def maps included. The traits method resolution picks are
+/// not paths: [`used_imports_with`] adds them.
 #[salsa::tracked(returns(ref))]
 pub fn used_imports(db: &Db, krate: Crate) -> UsedImports {
+    finish(db, krate, crate_uses(db, krate), &[])
+}
+
+/// [`used_imports`] with `more` uses besides the paths': type inference's, the bindings
+/// [`Resolver::record_trait_uses`] gives for each trait a method call or an associated item
+/// path resolved through (rustc's `used_trait_imports`). Reads the same walk of the crate, so
+/// a caller that keeps the result in a query of its own walks nothing twice.
+pub fn used_imports_with(db: &Db, krate: Crate, more: &[Use]) -> UsedImports {
+    finish(db, krate, crate_uses(db, krate), more)
+}
+
+/// What the walk of a crate's paths found, before glob imports are followed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CrateUses {
+    uses: Box<[Use]>,
+    unresolved: Box<[ImportOrExternCrate]>,
+    glob_targets: Box<[(GlobId, ModuleId)]>,
+}
+
+#[salsa::tracked(returns(ref))]
+pub(crate) fn crate_uses(db: &Db, krate: Crate) -> CrateUses {
     let def_map = crate_def_map(db, krate);
-    let mut walk = Walk::new(db, krate, def_map);
+    let mut walk = Walk::new(db);
     walk.def_map(def_map);
     walk_bodies(
         db,
@@ -421,29 +443,63 @@ pub fn used_imports(db: &Db, krate: Crate) -> UsedImports {
             }
         },
     );
-    walk.finish()
+    CrateUses {
+        uses: walk.uses.into_boxed_slice(),
+        unresolved: walk.unresolved.into_boxed_slice(),
+        glob_targets: walk.glob_targets.into_boxed_slice(),
+    }
+}
+
+/// Appends to `out` the uses of `trait_` through `binding`, the import of this crate that has
+/// it in scope where a method or associated item of it was found, and on through each glob it
+/// came by to the binding of the trait in the glob's module: rustc's `find_transitive_imports`
+/// of a `TraitCandidate`. A single import stops the chain; its own path's uses are the def
+/// map's records already. `name` is the binding's name, `_` for an unnamed one.
+pub(crate) fn trait_uses(
+    db: &Db,
+    krate: Crate,
+    trait_: TraitId,
+    binding: (Name, ImportOrExternCrate),
+    out: &mut Vec<Use>,
+) {
+    let (mut name, mut import) = binding;
+    let start = out.len();
+    loop {
+        // Two modules may glob-import each other: a chain ends where it meets itself.
+        if import_krate(db, import) != krate || out[start..].iter().any(|it| it.import == import)
+        {
+            return;
+        }
+        out.push(Use { import, name, ns: Namespace::Types, used: Used::Other });
+        let ImportOrExternCrate::Glob(glob) = import else { return };
+        let module = glob.use_.lookup(db).container;
+        let names = &module.def_map(db).names;
+        let Some(&(_, target)) = names.glob_targets.iter().find(|&&(it, _)| it == glob) else {
+            return;
+        };
+        let scope = target.def_map(db).module(db, target).scope(db);
+        let Some((next_name, Some(next))) = scope.trait_binding(trait_) else { return };
+        (name, import) = (next_name, next);
+    }
 }
 
 struct Walk<'db> {
     db: &'db Db,
-    krate: Crate,
-    not_introducing: &'db [ExternCrateId],
     uses: Vec<Use>,
     unresolved: Vec<ImportOrExternCrate>,
-    glob_targets: FxHashMap<GlobId, ModuleId>,
+    glob_targets: Vec<(GlobId, ModuleId)>,
 }
 
 impl<'db> Walk<'db> {
-    fn new(db: &'db Db, krate: Crate, def_map: &'db DefMap) -> Self {
+    fn new(db: &'db Db) -> Self {
         Walk {
             db,
-            krate,
-            not_introducing: &def_map.names.not_introducing,
-            // alloc: the crate's uses, gathered once per `used_imports`.
+            // alloc: the crate's uses, gathered once per `crate_uses`.
             uses: Vec::new(),
             // alloc: as above.
             unresolved: Vec::new(),
-            glob_targets: FxHashMap::default(),
+            // alloc: as above.
+            glob_targets: Vec::new(),
         }
     }
 
@@ -605,16 +661,25 @@ impl<'db> Walk<'db> {
         }
         resolver.record_macro_path_uses(db, &path, subns, &mut self.uses);
     }
+}
 
-    fn finish(self) -> UsedImports {
-        let db = self.db;
-        let mut imports: FxIndexMap<ImportOrExternCrate, Used> = FxIndexMap::default();
-        let mut macro_use: FxIndexMap<ExternCrateId, Used> = FxIndexMap::default();
-        let mut globs: FxIndexMap<GlobId, Vec<Name>> = FxIndexMap::default();
-        // alloc: part of the result.
-        let mut ambiguous = Vec::new();
-        let mut seen: FxHashSet<Use> = FxHashSet::default();
-        let mut queue = self.uses;
+/// Marks each use in `walked` and `more`, in that order, following glob imports on to the
+/// binding they read (`find_transitive_imports`), into the crate's [`UsedImports`].
+fn finish(db: &Db, krate: Crate, walked: &CrateUses, more: &[Use]) -> UsedImports {
+    let not_introducing = &*crate_def_map(db, krate).names.not_introducing;
+    // alloc: once per `finish`, which runs once per crate.
+    let glob_targets: FxHashMap<GlobId, ModuleId> = walked.glob_targets.iter().copied().collect();
+    let mut imports: FxIndexMap<ImportOrExternCrate, Used> = FxIndexMap::default();
+    let mut macro_use: FxIndexMap<ExternCrateId, Used> = FxIndexMap::default();
+    let mut globs: FxIndexMap<GlobId, Vec<Name>> = FxIndexMap::default();
+    // alloc: part of the result.
+    let mut ambiguous = Vec::new();
+    let mut seen: FxHashSet<Use> = FxHashSet::default();
+    // alloc: the worklist, the walk's uses and the globs they read through.
+    let mut queue: Vec<Use> = Vec::with_capacity(walked.uses.len() + more.len());
+    queue.extend_from_slice(&walked.uses);
+    queue.extend_from_slice(more);
+    {
         let mut at = 0;
         while let Some(&it) = queue.get(at) {
             at += 1;
@@ -630,7 +695,7 @@ impl<'db> Walk<'db> {
             }
             if let ImportOrExternCrate::ExternCrate(extern_crate) = import
                 && used == Used::Scope
-                && self.not_introducing.contains(&extern_crate)
+                && not_introducing.contains(&extern_crate)
             {
                 continue;
             }
@@ -647,7 +712,7 @@ impl<'db> Walk<'db> {
                 ambiguous.push((glob, name, ns));
             }
             // `find_transitive_imports`: the binding the glob read the name from.
-            let Some(&target) = self.glob_targets.get(&glob) else { continue };
+            let Some(&target) = glob_targets.get(&glob) else { continue };
             let res = target.def_map(db).module(db, target).scope(db).get(&name);
             let source = match ns {
                 Namespace::Types => res.types.and_then(|it| it.import),
@@ -655,21 +720,21 @@ impl<'db> Walk<'db> {
                 Namespace::Macros => res.macros.and_then(|it| it.import),
             };
             if let Some(source) = source
-                && import_krate(db, source) == self.krate
+                && import_krate(db, source) == krate
             {
                 queue.push(Use { import: source, name, ns, used: Used::Other });
             }
         }
-        for import in self.unresolved {
-            imports.insert(import, Used::Other);
-        }
-        UsedImports {
-            imports,
-            macro_use,
-            // alloc: the result, built once.
-            globs: globs.into_iter().map(|(k, v)| (k, v.into_boxed_slice())).collect(),
-            ambiguous: ambiguous.into_boxed_slice(),
-        }
+    }
+    for &import in &walked.unresolved {
+        imports.insert(import, Used::Other);
+    }
+    UsedImports {
+        imports,
+        macro_use,
+        // alloc: the result, built once.
+        globs: globs.into_iter().map(|(k, v)| (k, v.into_boxed_slice())).collect(),
+        ambiguous: ambiguous.into_boxed_slice(),
     }
 }
 

@@ -30,6 +30,7 @@ mod exhaustive;
 #[cfg(test)]
 mod tests;
 
+use blaze_ids::bits::BitSet;
 use smallvec::SmallVec;
 
 pub use self::diagnostics::{AliasError, AliasErrorKind, Event};
@@ -194,7 +195,7 @@ pub struct Borrows {
     thread: usize,
     retags_since_gc: u32,
     /// The GC's live set, a bit per tag; kept between runs.
-    live: Vec<u64>,
+    live: BitSet,
     /// The per-byte states of the retag being done; kept between retags.
     inside: RangeMap<LocationState>,
     /// The accesses the last retag did.
@@ -226,7 +227,7 @@ impl Borrows {
             threads: vec![ThreadFrames::default()],
             thread: ThreadId::MAIN.index(),
             retags_since_gc: 0,
-            live: Vec::new(),
+            live: BitSet::default(),
             inside: RangeMap::new(0, LocationState::new_accessed(Permission::new_disabled(), IdempotentForeignAccess::None)),
             retag_accesses: Vec::new(),
         }
@@ -460,12 +461,11 @@ impl Borrows {
     pub fn gc(&mut self, mut live: impl FnMut(&mut dyn FnMut(AllocId, BorTag))) {
         self.retags_since_gc = 0;
         let Borrows { trees, threads, live: set, next_tag, .. } = self;
-        set.clear();
-        set.resize((next_tag.get() as usize).div_ceil(64), 0);
+        set.reset(next_tag.get() as usize);
         let mut mark = |tag: BorTag| {
             let n = tag.get() as usize;
-            if let Some(word) = set.get_mut(n / 64) {
-                *word |= 1u64 << (n % 64);
+            if n < set.capacity() {
+                set.insert(n);
             }
         };
         live(&mut |_, tag| mark(tag));
@@ -478,10 +478,7 @@ impl Borrows {
             tree.visit_provenance(&mut mark);
         }
         let set = &*set;
-        let is_live = |tag: BorTag| {
-            let n = tag.get() as usize;
-            set.get(n / 64).is_some_and(|&word| word & (1u64 << (n % 64)) != 0)
-        };
+        let is_live = |tag: BorTag| set.contains(tag.get() as usize);
         for tree in trees.iter_mut().flatten() {
             tree.remove_unreachable_tags(&is_live);
         }

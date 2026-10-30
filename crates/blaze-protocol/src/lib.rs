@@ -18,7 +18,15 @@ pub mod follow;
 #[cfg(test)]
 mod tests;
 
-use std::io::{self, IoSlice, Read, Write};
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+use std::{
+    cell::RefCell,
+    io::{self, IoSlice, Read, Write},
+    thread::LocalKey,
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -31,6 +39,7 @@ pub const LONGEST_FRAME: u32 = 16 << 20;
 
 /// One frame's item: a body of [`SCHEMA`], answering or asking request `id`. Replies and
 /// events carry the id of the request they belong to, so a connection can carry several.
+// clone: two words and `T`, `Clone` only where `T` is; the daemon hands one to each subscriber.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Message<T> {
     pub schema: u32,
@@ -57,6 +66,7 @@ fn frame_len(len: usize) -> Result<u32, String> {
     u32::try_from(len)
         .ok()
         .filter(|&len| len <= LONGEST_FRAME)
+        // alloc: error path, a frame too long to send.
         .ok_or_else(|| format!("a frame of {len} bytes, longer than {LONGEST_FRAME}"))
 }
 
@@ -105,6 +115,7 @@ pub fn append_frame<T: Serialize + ?Sized>(
 /// The item of the next frame, or `None` when the stream ends before one begins. A stream
 /// that ends inside a frame is one whose writer did not live to finish it.
 pub fn read_frame(from: &mut impl Read) -> io::Result<Option<Vec<u8>>> {
+    // alloc: the item is handed out; `read_frame_into` and `receive` keep their buffer.
     let mut item = Vec::new();
     Ok(read_frame_into(from, &mut item)?.then_some(item))
 }
@@ -126,6 +137,7 @@ pub fn read_frame_into(from: &mut impl Read, item: &mut Vec<u8>) -> io::Result<b
     }
     let len = u32::from_be_bytes(len);
     if len > LONGEST_FRAME {
+        // alloc: error path, a peer's frame too long to read.
         let said = format!("a frame of {len} bytes, longer than {LONGEST_FRAME}");
         return Err(io::Error::new(io::ErrorKind::InvalidData, said));
     }
@@ -139,20 +151,58 @@ pub fn read_frame_into(from: &mut impl Read, item: &mut Vec<u8>) -> io::Result<b
     Ok(true)
 }
 
-/// Writes `value` as one frame, in one write.
+/// Writes `value` as one frame, in one write, encoded into a buffer this thread keeps: a warm
+/// send allocates nothing.
 pub fn send<T: Serialize + ?Sized>(to: &mut impl Write, value: &T) -> io::Result<()> {
-    let mut frame = Vec::new();
-    append_frame(&mut cbor::Writer::new(), &mut frame, value)?;
-    to.write_all(&frame)
+    with_kept(&SENDING, |kept| {
+        kept.frame.clear();
+        append_frame(&mut kept.writer, &mut kept.frame, value)?;
+        to.write_all(&kept.frame)
+    })
 }
 
-/// The value of the next frame, or `None` when the stream ends before one begins. An item
-/// not in the deterministic encoding is refused, naming the first offence.
+/// The value of the next frame, or `None` when the stream ends before one begins, read into a
+/// buffer this thread keeps. An item not in the deterministic encoding is refused, naming the
+/// first offence.
 pub fn receive<T: DeserializeOwned>(from: &mut impl Read) -> io::Result<Option<T>> {
-    match read_frame(from)? {
-        Some(item) => cbor::from_slice(&item).map(Some).map_err(invalid),
-        None => Ok(None),
-    }
+    with_kept(&RECEIVING, |kept| {
+        if !read_frame_into(from, &mut kept.frame)? {
+            return Ok(None);
+        }
+        cbor::from_slice(&kept.frame).map(Some).map_err(invalid)
+    })
+}
+
+/// The most bytes [`send`] and [`receive`] keep between frames: one big frame does not hold
+/// its size for good.
+const KEPT_FRAME: usize = 1 << 20;
+
+/// A frame buffer and encoder kept on a thread from one [`send`] or [`receive`] to the next.
+#[derive(Default)]
+struct Kept {
+    writer: cbor::Writer,
+    frame: Vec<u8>,
+}
+
+thread_local! {
+    static SENDING: RefCell<Kept> = RefCell::default();
+    static RECEIVING: RefCell<Kept> = RefCell::default();
+}
+
+/// `f` on this thread's `kept`, trimmed after to [`KEPT_FRAME`].
+fn with_kept<R>(kept: &'static LocalKey<RefCell<Kept>>, f: impl FnOnce(&mut Kept) -> R) -> R {
+    kept.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut kept) => {
+            let out = f(&mut kept);
+            if kept.frame.capacity() > KEPT_FRAME {
+                drop(std::mem::take(&mut kept.frame));
+            }
+            out
+        }
+        // A value whose own `Serialize` or `Deserialize` sends or receives on this thread: its
+        // frame gets a buffer of its own.
+        Err(_) => f(&mut Kept::default()),
+    })
 }
 
 fn invalid(error: cbor::Error) -> io::Error {

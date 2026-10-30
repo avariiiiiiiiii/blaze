@@ -75,10 +75,12 @@ pub fn file_name(path: &Path) -> anyhow::Result<FileName> {
 struct Args {
     socket: Option<PathBuf>,
     http: Option<SocketAddr>,
+    /// Listen on the socket systemd or launchd passed, never one of its own.
+    activated: bool,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
-    let mut parsed = Args { socket: None, http: None };
+    let mut parsed = Args { socket: None, http: None, activated: false };
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let arg = arg.into_string().map_err(|it| anyhow::anyhow!("{} is not UTF-8", it.to_string_lossy()))?;
@@ -97,18 +99,33 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Args> {
             }
         };
         match flag.as_str() {
+            "--activated" if inline.is_none() => parsed.activated = true,
             "--socket" => parsed.socket = Some(PathBuf::from(value()?)),
             "--http" => {
                 let at = value()?;
                 parsed.http = Some(at.parse().with_context(|| format!("--http {at} is no address and port"))?);
             }
-            _ => bail!("blaze serve takes `--socket PATH` and `--http ADDR`, not `{arg}`"),
+            _ => bail!("blaze serve takes `--socket PATH`, `--http ADDR` and `--activated`, not `{arg}`"),
         }
     }
     Ok(parsed)
 }
 
-/// `blaze serve [--socket PATH] [--http ADDR]`.
+/// The socket systemd or launchd passed `blaze serve --activated` (the units of
+/// `blaze daemon install`, [`blaze_api::units`]).
+#[cfg(unix)]
+fn activated() -> anyhow::Result<blaze_api::activation::Passed> {
+    use blaze_api::activation::{Manager, take};
+    let manager = Manager::here().context(
+        "blaze serve --activated: no service manager blaze is socket-activated by runs here (systemd on Linux, launchd on macOS)",
+    )?;
+    // SAFETY: `cli::main` dispatches `serve` before anything else runs, and `serve` calls this
+    // first, before it starts a thread: no other thread touches the environment. Nothing in
+    // the process has opened or owns the descriptors the manager passed (systemd's from 3).
+    Ok(unsafe { take(manager) }?)
+}
+
+/// `blaze serve [--socket PATH] [--http ADDR] [--activated]`.
 pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     match serve(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -121,6 +138,17 @@ pub fn main(args: impl IntoIterator<Item = OsString>) -> ExitCode {
 
 fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     let args = parse(args)?;
+    // First, before any thread starts: taking the passed socket reads and clears the
+    // environment.
+    #[cfg(unix)]
+    let activated = match args.activated {
+        true => Some(activated()?),
+        false => None,
+    };
+    #[cfg(not(unix))]
+    if args.activated {
+        bail!("blaze serve --activated: socket activation is systemd's and launchd's, and this system has neither");
+    }
     let socket = match args.socket {
         Some(socket) => std::path::absolute(&socket).with_context(|| format!("the socket {}", socket.display()))?,
         None => socket()?,
@@ -161,6 +189,9 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
             .context("blaze has no target triple for this machine's architecture and system")?
             .to_owned(),
         color: false,
+        outside: blaze_vfs::outside::dirs(),
+        #[cfg(unix)]
+        activated,
     };
     signals::catch();
     let steps: Arc<dyn work::Steps> = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
@@ -197,7 +228,18 @@ fn run<D: Driver>(
     steps: Arc<dyn work::Steps>,
     runner: Box<dyn plane::Runner<job::Value>>,
 ) -> anyhow::Result<()> {
+    let host = options.host.clone();
     let mut daemon = Daemon::start(driver, options, steps, runner).map_err(|why| anyhow::anyhow!(why))?;
+    // Once a process: every expansion from here on reads the daemon's store with no lock.
+    let toolchain = hir_ty_codegen::v2::toolchain(&host, &[])
+        .map_err(|why| anyhow::anyhow!("the toolchain proc macros are built with, for {host}: {why}"))?
+        .id;
+    blaze_expand::install(blaze_expand::Expansions {
+        store: daemon.store().reader(),
+        toolchain,
+        environment: proc_macro_api::warm::Environment::new(),
+    })
+    .map_err(|why| anyhow::anyhow!("keeping proc-macro expansions: {why}"))?;
     eprintln!("blaze serve: listening on {}", daemon.listening());
     loop {
         if signals::signalled() {

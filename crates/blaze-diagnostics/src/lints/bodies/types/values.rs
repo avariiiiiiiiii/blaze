@@ -15,10 +15,10 @@
 //! messages) and `compiler/rustc_middle/src/ty/inhabitedness/` (MIT or Apache-2.0).
 
 mod inhabited;
-mod interior;
-mod intrinsics;
-mod invalid;
-mod transmutes;
+pub(crate) mod interior;
+pub(crate) mod intrinsics;
+pub(crate) mod invalid;
+pub(crate) mod transmutes;
 
 use base_db::Db;
 use hir_def::{FunctionId, HasModule as _, hir::ExprId};
@@ -28,18 +28,7 @@ use hir_ty::{
 };
 use syntax::AstNode as _;
 
-use crate::lints::bodies::{BodyCx, LatePass, types::util};
-
-/// rustc's late lint passes of the values made, transmuted and named in bodies.
-pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
-    vec![
-        Box::new(invalid::InvalidValue),
-        Box::new(intrinsics::EnumIntrinsicsNonEnums),
-        Box::new(transmutes::MutableTransmutes),
-        Box::new(transmutes::CheckTransmutes::default()),
-        Box::new(interior::InteriorMutableConsts),
-    ]
-}
+use crate::lints::bodies::{BodyCx, types::util};
 
 /// rustc's `is_intrinsic(def, sym::transmute)`: `def` is the intrinsic `transmute`. An
 /// intrinsic rustc doesn't have is none of rustc's, `transmute` included; MIR lowering refuses

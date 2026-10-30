@@ -162,6 +162,27 @@ def calls_any(text: str, methods: frozenset[str]) -> bool:
 DB_CALL = re.compile(r"\b(?:self\.)?db\s*\.\s*(\w+)\s*(?:::<[^>]*>)?\(")
 
 
+SALSA_METHODS = frozenset({
+    "trigger_lru_eviction", "synthetic_write", "trigger_cancellation", "cancellation_token",
+    "report_untracked_read", "ingredient_debug_name", "unwind_if_revision_cancelled", "attach",
+})
+SALSA_IMPORT = re.compile(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?use\s[^;]*\bDatabase\b")
+
+
+def DB_CALL_NAMES(text: str) -> set[str]:
+    return {m.group(1) for m in DB_CALL.finditer(text)}
+
+
+def salsa_database_path(crate: str, manifest: Path) -> str | None:
+    """How `crate`'s files name `salsa::Database`: salsa itself, or base-db's re-export."""
+    deps = manifest.read_text() if manifest.is_file() else ""
+    if re.search(r"^salsa\s*[.=]", deps, re.MULTILINE):
+        return "salsa::Database"
+    if crate == "base-db" or re.search(r"^base-db\s*[.=]", deps, re.MULTILINE):
+        return "crate::salsa::Database" if crate == "base-db" else "base_db::salsa::Database"
+    return None
+
+
 def hir_database_path(crate: str, manifest: Path) -> str | None:
     """How `crate`'s files name `HirDatabase`: its own `db` module, or the nearest dependency's."""
     if crate in ("hir-ty", "hir", "hir-ide"):
@@ -173,7 +194,7 @@ def hir_database_path(crate: str, manifest: Path) -> str | None:
     return None
 
 
-def migrate(text: str, crate: str, methods: frozenset[str] = frozenset(), hir_db: str | None = None) -> tuple[str, FileResult]:
+def migrate(text: str, crate: str, methods: frozenset[str] = frozenset(), hir_db: str | None = None, salsa_db: str | None = None) -> tuple[str, FileResult]:
     result = FileResult()
     had_own_db = bool(OWN_DB.search(text))
 
@@ -226,6 +247,11 @@ def migrate(text: str, crate: str, methods: frozenset[str] = frozenset(), hir_db
             first_use = re.search(r"(?m)^use\s", new)
             at = first_use.start() if first_use else 0
             new = new[:at] + f"use {hir_db};\n" + new[at:]
+    # `salsa::Database`'s own methods too: a supertrait of the `dyn` trait, now a trait to import.
+    if DB_CALL_NAMES(code_only_text(new)) & SALSA_METHODS and not SALSA_IMPORT.search(new) and salsa_db:
+        first_use = re.search(r"(?m)^use\s", new)
+        at = first_use.start() if first_use else 0
+        new = new[:at] + f"use {salsa_db} as _;\n" + new[at:]
     for i, line in enumerate(new.splitlines(), 1):
         code = code_only(line)
         for pattern, why in LEFT:
@@ -258,6 +284,7 @@ def main() -> None:
         rewrites = 0
         left: list[str] = []
         hir_db = hir_database_path(crate, base / "Cargo.toml")
+        salsa_db = salsa_database_path(crate, base / "Cargo.toml")
         for path in sorted(base.rglob("*.rs")):
             if "target" in path.parts:
                 continue
@@ -265,7 +292,7 @@ def main() -> None:
             if cfg.paths and not any(rel.as_posix().startswith(it) for it in cfg.paths):
                 continue
             text = path.read_text()
-            new, result = migrate(text, crate, methods, hir_db)
+            new, result = migrate(text, crate, methods, hir_db, salsa_db)
             rewrites += result.rewrites
             left.extend(f"{rel}:{it}" for it in result.left)
             if cfg.write and new != text:

@@ -50,10 +50,17 @@ The fastest known way:
   the same state but for `static`s that the hello's list touched (none: the list is static
   data).
 
-Where we fall short: one fork server per binary, so a binary's tests can't use more cores
-than the queue gives, and a server that dies loses what it ran (its tests come back lost, not
-rerun). A forked child of a multithreaded server would be unsound; the server has one
-thread, and the queue never asks it for more.
+One server forks one test at a time, so after its hello it is asked for `K - 1` replicas
+(`Frame::Replicate`, wire version 3): copies forked before any test runs, in halving rounds,
+each connecting anew on the same socket with its own hello. The queue hands each test, in the
+one order, to the first replica with room, and `K` comes from the cores, the fork the server
+measured and the binary's median test (speed-of-light.md, "Tests"). A replica that dies loses
+only the tests it ran, with which replica and why; the server is killed only when none is
+left. The first server's own end (the process blaze waits for) still ends them all.
+
+Where we fall short: a dead replica's tests come back lost, not rerun. A forked child of a
+multithreaded server would be unsound; the server has one thread, and the queue never asks it
+for more.
 
 ## The wire (`test/wire.rs`)
 

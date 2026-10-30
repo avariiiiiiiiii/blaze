@@ -47,6 +47,8 @@ test-fixture.workspace = true
 `blaze-alloc-count` is solver-sync-glue's request 6 (one line, not two). `test-fixture` depends
 on base-db, hir-expand and span, not on hir-ty, so this is no cycle. Run the manifest lint after.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 2. lane db: `crates/hir-ty/src/lib.rs`
 
 Before (line 4):
@@ -87,6 +89,8 @@ New file `crates/hir-ty/src/tests.rs`:
 mod budget;
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 3. lane db: the tags, `crates/hir-ty/src/db.rs`
 
 After the `use` block (after line 41, `};` closing `use crate::{..}`):
@@ -125,6 +129,8 @@ every tracked fn with its line and tag is in "Tags of every query" below, from t
 The `HirDatabase` trait's MIR methods (`mir_body` and the rest, `db.rs:55` to `211`) are
 implemented in hir-ty-mir (`hir_ty_mir::provide`, frontend-db's `hir_ty::providers`): their tag
 is `MIR_TAG` there, which is mem-db-checks' or codegen's to file for hir-ty-mir, not here.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 4. lane db: the budget tests, `crates/hir-ty/src/tests/budget.rs`
 
@@ -311,10 +317,52 @@ Notes for whoever applies it:
 - The second holds mem-db-solver's part too (inference variables and goals in the frame).
 - `peak()` is the most the frame's cursor was since the task began (`frame.rs:88`).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## Tags of every query
 
 Filled in from the parts (each part lists its tracked fns with line and tag).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## What the parts found
 
 Filled in when the parts are done.
+
+> forwarded to db (from requests, pass 16; told by tmux).
+
+## dedup: byte cursor onto blaze_format::cursor
+
+From `dedup-cursor-front` (report `/tmp/blaze-lanes/v2-dedup-cursor-front.md`; the cursor is
+`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/lanes/dedup/cursor.md`). `hir-ty`
+already depends on `blaze-format`; no `Cargo.toml` change.
+
+`crates/hir-ty/src/method_resolution/frozen.rs`:
+
+1. Imports: add `use blaze_format::cursor::{Put, Reader};`.
+2. `fn part` becomes
+   ```rust
+   /// Part `which` of frozen bytes: the first is after its length.
+   fn part(bytes: &[u8], which: usize) -> R<&[u8]> {
+       let mut at = Reader::new(bytes);
+       let first = at.bytes_u32()?;
+       Ok(if which == 0 { first } else { at.take_rest() })
+   }
+   ```
+3. At the end of the writer (the fn that ends `let inherent = enc.finish()?;`):
+   ```rust
+       let mut out = len.to_le_bytes().to_vec();
+       out.extend_from_slice(&traits);
+   ```
+   becomes
+   ```rust
+       let mut out = Vec::with_capacity(4 + traits.len() + inherent.len());
+       out.put_u32(len);
+       out.put_bytes(&traits);
+   ```
+   (the `let len = u32::try_from(..).map_err(|_| "impls over 4 GiB")?;` line above it stays).
+
+Same bytes written, same accepted; the two error words ("no length", "a part past the end")
+become the cursor's ("at byte 0: 4 bytes wanted, 2 left"), which no test matches.
+
+> applied: `method_resolution/frozen.rs` is items' (DONE): `part` reads through `Reader::bytes_u32`/`take_rest`, the writer puts `len` and both parts through `Put` into one `Vec` sized once (same bytes) (requests, pass 18).

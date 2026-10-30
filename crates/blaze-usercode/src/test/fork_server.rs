@@ -7,8 +7,11 @@
 // `::std` and `::core`.
 //
 // What happens once per binary happens before the first test: the names of the hello, the
-// child-exit queue, the slot count. A test costs one socket pair, one fork and one frame; the
-// buffers of the loop and the execution records (with slots) are kept across tests.
+// child-exit queue, the slot count, the measure of one fork. A test costs one socket pair, one
+// fork and one frame; the buffers of the loop and the execution records (with slots) are kept
+// across tests. One server forks one test at a time, so blaze may ask for replicas
+// (`Frame::Replicate`): copies forked before any test runs, each a server on a connection of
+// its own.
 
 /// Serves `tests` to blaze over the socket at `socket` (the value of [`SOCKET`]), then exits:
 /// what the harness's `main` calls when the variable is set.
@@ -36,7 +39,7 @@ mod unix {
     use super::super::test;
     use super::exec::{Exec, Region};
     use super::{
-        End, EndView, ExecView, Frame, Frames, Hits, LONGEST_OUTPUT, MARK, SOCKET, VERSION, View, encode_ended,
+        End, EndView, ExecView, Frames, Hits, LONGEST_OUTPUT, MARK, SOCKET, VERSION, View, encode_ended, encode_hello,
     };
     use ::std::io::{Read, Write};
     use ::std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
@@ -120,6 +123,11 @@ mod unix {
         }
 
         pub fn clear(_queue: &Option<OwnedFd>) {}
+
+        /// In a replica just forked: nothing, as there is no queue.
+        pub fn forked(_queue: &mut Option<OwnedFd>) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos", target_os = "visionos"))]
@@ -216,6 +224,18 @@ mod unix {
                 }
             }
         }
+
+        /// In a replica just forked: a kqueue of its own. The one it was forked with is not
+        /// its (a fork does not inherit a kqueue), so its descriptor is let go unclosed: that
+        /// number may be open again for something else of the replica's by the time it would
+        /// close.
+        pub fn forked(queue: &mut Option<OwnedFd>) -> Result<(), String> {
+            if let Some(old) = queue.take() {
+                ::core::mem::forget(old);
+            }
+            *queue = self::queue()?;
+            Ok(())
+        }
     }
 
     #[cfg(not(any(
@@ -239,6 +259,10 @@ mod unix {
         }
 
         pub fn clear(_queue: &Option<OwnedFd>) {}
+
+        pub fn forked(_queue: &mut Option<OwnedFd>) -> Result<(), String> {
+            Err("no way to wait on a child here".to_owned()) // alloc: error path
+        }
     }
 
     // What a test's child closes: every descriptor of the server's (its socket to blaze, its
@@ -353,17 +377,11 @@ mod unix {
             ::std::env::remove_var(SOCKET);
         }
         let kept = fds::Kept::now()?;
-        let queue = exits::queue()?;
+        let fork = fork_cost()?;
+        let mut queue = exits::queue()?;
         let mut exec = Exec::open();
         // A child ended before its end could be watched: the next poll doesn't wait.
         let mut now = false;
-        let mut stream = connect(socket)?;
-        let names: Vec<String> = tests.iter().map(|it| it.desc.name.as_slice().to_owned()).collect(); // alloc: setup, once per server
-        send(&mut stream, &Frame::Hello { version: VERSION, pid: ::std::process::id(), tests: names })?;
-        let mut frames = Frames::new();
-        let mut children: Vec<Child> = Vec::new(); // alloc: empty, allocates nothing
-        let mut quitting = false;
-        let mut buffer = vec![0u8; 1 << 16]; // alloc: setup, once per server
         // Kept across turns of the loop, so a turn allocates nothing: what is polled, which
         // children's outputs those are, the frames to send (one write a turn), the output
         // buffers of children that ended, for the next ones, and the hits of the last.
@@ -372,6 +390,15 @@ mod unix {
         let mut out: Vec<u8> = Vec::new(); // alloc: empty, allocates nothing
         let mut spare: Vec<Vec<u8>> = Vec::new(); // alloc: empty, allocates nothing
         let mut hits: Vec<u8> = Vec::new(); // alloc: empty, allocates nothing
+        let mut stream = connect(socket)?;
+        hello(&mut stream, &mut out, tests, fork)?;
+        let mut frames = Frames::new();
+        let mut children: Vec<Child> = Vec::new(); // alloc: empty, allocates nothing
+        let mut quitting = false;
+        // Whether blaze's first frame has come: replicas are made only before it, so a copy
+        // has no test running, no region of the server's and no frame meant for the server.
+        let mut first = true;
+        let mut buffer = vec![0u8; 1 << 16]; // alloc: setup, once per server
         loop {
             if quitting && children.is_empty() {
                 return Ok(());
@@ -426,7 +453,22 @@ mod unix {
                             return Err(why);
                         }
                     };
+                    let was_first = ::core::mem::replace(&mut first, false);
                     match frame {
+                        View::Replicate { count } => {
+                            if !was_first {
+                                kill_all(&mut children);
+                                return Err(format!("blaze asked for {} replicas after its first frame", count)); // alloc: error path
+                            }
+                            if replicate(count)? {
+                                // A copy: what came after the request is the server's, not its.
+                                exits::forked(&mut queue)?;
+                                stream = connect(socket)?;
+                                frames = Frames::new();
+                                hello(&mut stream, &mut out, tests, fork)?;
+                                break;
+                            }
+                        }
                         View::Run { id, index } => match start(tests, &mut exec, &kept, id, index, &stream, &children, spare.pop().unwrap_or_default()) {
                             Ok(mut child) => {
                                 match exits::watch(&queue, child.pid) {
@@ -533,8 +575,72 @@ mod unix {
         }
     }
 
-    fn send(stream: &mut UnixStream, frame: &Frame) -> Result<(), String> {
-        stream.write_all(&frame.to_bytes()).map_err(|error| format!("writing to the socket: {}", error)) // alloc: the hello, once per server
+    /// The hello, encoded in `out` (left empty) from the tests' own names.
+    fn hello(
+        stream: &mut UnixStream,
+        out: &mut Vec<u8>,
+        tests: &'static [&'static test::TestDescAndFn],
+        fork: u64,
+    ) -> Result<(), String> {
+        out.clear();
+        encode_hello(out, VERSION, ::std::process::id(), fork, tests.iter().map(|it| it.desc.name.as_slice()));
+        let sent = stream.write_all(&out[..]).map_err(|error| format!("writing to the socket: {}", error)); // alloc: error path
+        out.clear();
+        sent
+    }
+
+    /// How long one fork of the server takes, in nanoseconds, the least of three: what blaze
+    /// sizes its replicas by. Each child leaves at once and is reaped here, so it reads nothing
+    /// and leaves no line in the sandbox's record.
+    fn fork_cost() -> Result<u64, String> {
+        let mut least = u64::MAX;
+        for _ in 0..3 {
+            let start = ::std::time::Instant::now();
+            // SAFETY: the server has one thread (see `serve`), so the child is a whole copy of
+            // it; the child does nothing but `_exit`, which runs no destructor and no `atexit`
+            // handler, so nothing of the server's is used or freed twice.
+            let pid = unsafe { fork() };
+            if pid < 0 {
+                return Err(format!("fork: {}", ::std::io::Error::last_os_error())); // alloc: error path
+            }
+            if pid == 0 {
+                // SAFETY: as above.
+                unsafe { _exit(0) }
+            }
+            let took = start.elapsed();
+            let mut status: Int = 0;
+            // SAFETY: `status` is a live `int` the call writes once; `pid` is the child just
+            // forked, not yet reaped, so the wait is for it alone and ends once it has left.
+            unsafe { waitpid(pid, &mut status, 0) };
+            least = least.min(u64::try_from(took.as_nanos()).unwrap_or(u64::MAX));
+        }
+        Ok(least)
+    }
+
+    /// Forks `count` copies of the server before it runs any test, `true` in each copy. Each
+    /// process gives about half of what is left to the copy it forks, so the copies come in
+    /// about `log2(count + 1)` rounds of forks made side by side, not `count` one after another.
+    fn replicate(count: u32) -> Result<bool, String> {
+        let mut left = count;
+        let mut copy = false;
+        while left > 0 {
+            let given = (left - 1) / 2;
+            // SAFETY: the server has one thread (see `serve`), so the copy is a whole one and no
+            // lock is left held by a thread that isn't there. No test runs yet (`Replicate` is
+            // only blaze's first frame), so the copy shares no child and no execution region with
+            // the server; its socket to blaze is the server's until it connects its own.
+            let pid = unsafe { fork() };
+            if pid < 0 {
+                return Err(format!("forking a replica: {}", ::std::io::Error::last_os_error())); // alloc: error path
+            }
+            if pid == 0 {
+                left = given;
+                copy = true;
+            } else {
+                left -= given + 1;
+            }
+        }
+        Ok(copy)
     }
 
     fn start(

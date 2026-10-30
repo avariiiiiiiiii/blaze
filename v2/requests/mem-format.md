@@ -209,6 +209,9 @@ Hashing, probing, ID assignment (`take_id`) and every image layout stay exactly 
 where the memory comes from changes. Written as one new module plus swap points named by function,
 so it applies to the swiss.rs restructuring too.
 
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> applied by requests (child requests-ids): `crates/intern/src/space.rs` (the 64 GiB `Tag::Intern` huge region: `claim`, `zeroed`, `place`, with its disjoint/zero and zero-allocation tests); arena tables, grown-table headers, bump chunks and large values claimed from it (model build keeps boxed tables); `fn chunk`, `fn own`, `madvise` and the Linux libc dependency gone; `table.rs` `Column` one slot per ID over a reserved `Region`; tests `interning_allocates_nothing`, `misses_allocate_nothing`, `the_id_column_publishes_each_slot_once`. Manifest lint clean.
+
 ### `crates/intern/Cargo.toml`
 
 Under `[dependencies]`: `blaze-mem.workspace = true` (a root workspace dependency already). The
@@ -216,9 +219,15 @@ Under `[dependencies]`: `blaze-mem.workspace = true` (a root workspace dependenc
 `arena.rs` `chunk`, is gone (the region is reserved with `Region::reserve_huge`, which advises
 `MADV_HUGEPAGE` itself). Run the manifest lint after.
 
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> applied by requests (child requests-ids): `crates/intern/src/space.rs` (the 64 GiB `Tag::Intern` huge region: `claim`, `zeroed`, `place`, with its disjoint/zero and zero-allocation tests); arena tables, grown-table headers, bump chunks and large values claimed from it (model build keeps boxed tables); `fn chunk`, `fn own`, `madvise` and the Linux libc dependency gone; `table.rs` `Column` one slot per ID over a reserved `Region`; tests `interning_allocates_nothing`, `misses_allocate_nothing`, `the_id_column_publishes_each_slot_once`. Manifest lint clean.
+
 ### `crates/intern/src/lib.rs`
 
 `mod space;` beside the other modules.
+
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> applied by requests (child requests-ids): `crates/intern/src/space.rs` (the 64 GiB `Tag::Intern` huge region: `claim`, `zeroed`, `place`, with its disjoint/zero and zero-allocation tests); arena tables, grown-table headers, bump chunks and large values claimed from it (model build keeps boxed tables); `fn chunk`, `fn own`, `madvise` and the Linux libc dependency gone; `table.rs` `Column` one slot per ID over a reserved `Region`; tests `interning_allocates_nothing`, `misses_allocate_nothing`, `the_id_column_publishes_each_slot_once`. Manifest lint clean.
 
 ### New file `crates/intern/src/space.rs`
 
@@ -363,6 +372,9 @@ mod tests {
 }
 ```
 
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> applied by requests (child requests-ids): `crates/intern/src/space.rs` (the 64 GiB `Tag::Intern` huge region: `claim`, `zeroed`, `place`, with its disjoint/zero and zero-allocation tests); arena tables, grown-table headers, bump chunks and large values claimed from it (model build keeps boxed tables); `fn chunk`, `fn own`, `madvise` and the Linux libc dependency gone; `table.rs` `Column` one slot per ID over a reserved `Region`; tests `interning_allocates_nothing`, `misses_allocate_nothing`, `the_id_column_publishes_each_slot_once`. Manifest lint clean.
+
 ### Swap points in `crates/intern/src/arena.rs`
 
 - `Table`'s two columns become region memory in a normal build; a model build keeps its boxes,
@@ -426,6 +438,9 @@ struct Table {
 - The test `bump_aligns_and_never_overlaps` keeps passing unchanged (its 1 MiB and 4096-aligned
   values now come from `space::claim`).
 
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> applied by requests (child requests-ids): `crates/intern/src/space.rs` (the 64 GiB `Tag::Intern` huge region: `claim`, `zeroed`, `place`, with its disjoint/zero and zero-allocation tests); arena tables, grown-table headers, bump chunks and large values claimed from it (model build keeps boxed tables); `fn chunk`, `fn own`, `madvise` and the Linux libc dependency gone; `table.rs` `Column` one slot per ID over a reserved `Region`; tests `interning_allocates_nothing`, `misses_allocate_nothing`, `the_id_column_publishes_each_slot_once`. Manifest lint clean.
+
 ### Swap point in `crates/intern/src/table.rs`: the ID column
 
 `Column` (with `FIRST_BUCKET`, `BUCKETS`, `locate`, both `slots`) becomes one slot per ID past
@@ -481,6 +496,9 @@ impl Column {
 Imports: `use blaze_mem::{Region, Tag};`; `Ordering` there is `crate::sync::atomic::Ordering`,
 which in a model build is the checker's: use `std::sync::atomic::Ordering` for the two slot
 accesses (they are std atomics).
+
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> applied by requests (child requests-ids): `crates/intern/src/space.rs` (the 64 GiB `Tag::Intern` huge region: `claim`, `zeroed`, `place`, with its disjoint/zero and zero-allocation tests); arena tables, grown-table headers, bump chunks and large values claimed from it (model build keeps boxed tables); `fn chunk`, `fn own`, `madvise` and the Linux libc dependency gone; `table.rs` `Column` one slot per ID over a reserved `Region`; tests `interning_allocates_nothing`, `misses_allocate_nothing`, `the_id_column_publishes_each_slot_once`. Manifest lint clean.
 
 ### Tests (budget and model)
 
@@ -559,6 +577,9 @@ Why: the brief (lane mem, `mem-format`): interners' storage on reserved regions 
 chunk, table and ID bucket is a global-allocator call that is never freed, so it is a reserved
 region's job (docs/v2/plan/design/memory.md), and the warm loop's misses allocate too.
 
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> applied by requests (child requests-ids): `crates/intern/src/space.rs` (the 64 GiB `Tag::Intern` huge region: `claim`, `zeroed`, `place`, with its disjoint/zero and zero-allocation tests); arena tables, grown-table headers, bump chunks and large values claimed from it (model build keeps boxed tables); `fn chunk`, `fn own`, `madvise` and the Linux libc dependency gone; `table.rs` `Column` one slot per ID over a reserved `Region`; tests `interning_allocates_nothing`, `misses_allocate_nothing`, `the_id_column_publishes_each_slot_once`. Manifest lint clean.
+
 ## 3. dedup-intern and the dedup codec children (crates/blaze-ids): `Sharded`'s values onto a `Column`, `of_many`'s scratch
 
 Depends on request 1 (`Column::claim`, `Column::fill`, `Block`). Owners: `dedup-intern` (its brief
@@ -566,10 +587,16 @@ covers `blaze_ids::Sharded`); `dedup-codec-rng` and the codec children are addin
 `crc32c.rs` to the same `lib.rs`, so the changes below touch only `Sharded`, its tests and
 `many.rs`.
 
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> held by requests: waits for blaze_mem::Column::claim/fill (mem)
+
 ### `crates/blaze-ids/Cargo.toml`
 
 `[dependencies]`: `blaze-mem.workspace = true`. `[dev-dependencies]`:
 `blaze-alloc-count.workspace = true`. No cycle: blaze-mem depends on blaze-reclaim and libc only.
+
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> held by requests: waits for blaze_mem::Column::claim/fill (mem)
 
 ### `crates/blaze-ids/src/lib.rs`
 
@@ -749,6 +776,9 @@ impl<T: Send + Sync> Sharded<T> {
   `Model::finish`'s "every value made is dropped once" holds (the column drops what it published,
   the losers are dropped by `intern`).
 
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> held by requests: waits for blaze_mem::Column::claim/fill (mem)
+
 ### `crates/blaze-ids/src/many.rs`: `of_many`'s per-call buffers
 
 `order`, `cvs`, `prefixes` and `bytes` are made on every call. After: `order` is
@@ -872,6 +902,10 @@ Why: the brief (lane mem, `mem-format`): the storage behind each interner become
 lookups allocate nothing, ID assignment exact; per-call buffers into `scratch`. Today every index
 chunk is a boxed slice of `OnceLock`s, and `of_many` makes four buffers a call.
 
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> held by requests: waits for blaze_mem::Column::claim/fill (mem)
+> applied, against today's `many.rs` (it groups with `radix::Csr` now, not `order`/`starts`): `of_many_into` (also `ContentId::of_many_into`), the grouping, its cursors and the chaining values in one thread-local `Kept` reused through `Csr::rebuild`, `hash_leading` in batches of 64 from stack arrays; test `a_warm_of_many_into_allocates_nothing`. `Sharded` onto a `Column` (the rest of 3) stays held: `blaze_mem::Column` has no `claim`/`fill` yet (requests, pass 18).
+
 ## 4. db-expand-macros-next1 (crates/span/src/ast_id.rs): a map build's temporaries onto the task's `Frame`, its sorts onto kept scratch (2026-10-29)
 
 `crates/span` is in your brief and db-expand is not DONE, so this is yours to apply (frontend-tree
@@ -886,14 +920,20 @@ shrunk by `into_boxed_slice`; `found` grows; `place_bodies` collects `placed`; `
 `radix::sort_copy_by_key`/`sort_by_key` above 32 items makes its scratch `Vec`. `body_ids` (a body's
 first lookup) and `relative` (each item lowered) do the same.
 
+> forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
+
 ### `crates/span/Cargo.toml`
 
 Under `[dependencies]`, `# local deps`: `blaze-mem.workspace = true` (then `python3
 tools/v2/manifest_lint.py '{"root": "."}'`).
 
+> forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
+
 ### `crates/span/src/lib.rs`
 
 After `#![deny(unsafe_code)]`: `#![feature(allocator_api)]`.
+
+> forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
 
 ### `crates/span/src/ast_id.rs`
 
@@ -1077,6 +1117,9 @@ entries: Vec<Entry, &Frame> = Vec::new_in(frame);`, `let mut placed: Vec<Placed,
 Vec::new_in(frame);` (their three `// alloc:` lines go), and the last line `AstIdMap::new(&entries,
 Bodies::new(relative_tree, &mut placed))`.
 
+> forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
+> db-expand-macros: not mine (`crates/span/` is format's in my brief); see the end of this section.
+
 ### Budget tests, in `mod tests` beside `lookups_allocate_nothing_once_bodies_are_walked`
 
 ```rust
@@ -1131,3 +1174,28 @@ Why: the brief (lane mem, `mem-format`): per-call scratch on the parse and lower
 task's `Frame` or a kept `Scratch`, with a budget test of a warm build. `map.rs` and `lines.rs` build
 their results at exact length already; their remaining sorts are of fragments (macro output only)
 or lazy and once, so they stay.
+
+> forwarded to db (db-expand-macros-next1) (from requests, pass 16; told by tmux).
+> db-expand-macros: not applied, not mine. My brief lists `crates/span/` (with `crates/mbe/`, `crates/syntax/`) as format's, not db-expand-macros'; I have no edit in `crates/span/`. frontend-tree has `ast_id.rs` now (it asked in `v2/requests/db.md`, "## frontend-tree: to db-expand-macros-next1", and I said yes), so this section goes to frontend-tree or format, to apply with its view change.
+> mem-format: forwarded to frontend-tree (holds `ast_id.rs` now); told by tmux.
+
+## speed-hir: `ExpressionStore::has_closures` (for `upvars`; 2026-10-29)
+
+`crates/hir-def/src/expr_store.rs`, after `pub fn expr_count` (~L1606):
+
+```rust
+    /// Whether any expression is a closure: a byte compare per expression over `expr_kind`.
+    #[inline]
+    pub fn has_closures(&self) -> bool {
+        let closure = columns::ExprKind::Closure as u8;
+        self.expr_only.as_deref().is_some_and(|it| it.columns.expr_kind.contains(&closure))
+    }
+```
+
+(`columns` is imported at :38; `ExprKind` and `expr_kind` are `pub(crate)`; `Col<u8>` derefs to
+`[u8]`.) Why: `upvars_mentioned` runs for every body and today decodes every `Expr` view to find
+none is a closure; this reads one byte per expression and allocates nothing. The caller's edit is
+in `v2/requests/db-expand.md`, "## speed-hir: four edits", item 3.
+
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> applied by mem-format: `ExpressionStore::has_closures` after `expr_count` in `crates/hir-def/src/expr_store.rs`, as written (`columns` is imported through `hir::columns::{self, ..}`; `expr_kind` is a `Col<u8>`).

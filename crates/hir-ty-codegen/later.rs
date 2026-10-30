@@ -70,6 +70,7 @@ pub(super) struct Made {
 /// What a [`Later`] is made with: what of the object it reads, and its own names.
 pub(super) struct Keeper<'k, 'db> {
     pub(super) db: &'db Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     pub(super) symbols: &'k dyn SymbolResolver,
     pub(super) names: &'k stable::StableNames<'k, 'db>,
     pub(super) stable_names: &'k mut FxHashMap<Instance, Option<StableName>>,

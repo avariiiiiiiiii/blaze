@@ -25,7 +25,13 @@ pub const CHUNK: usize = crate::HUGE_PAGE;
 
 /// The address space reserved for chunks: 256 GB, 131,072 chunks. Free on a 64-bit machine
 /// (x86-64 and arm64 give user space 128 TB).
+#[cfg(target_pointer_width = "64")]
 pub const SPACE_BYTES: usize = 256 << 30;
+
+/// The address space reserved for chunks on a 32-bit target: 256 MB, 128 chunks. There
+/// (wasm32) a reservation is memory taken whole, so it is a budget, not free address space.
+#[cfg(not(target_pointer_width = "64"))]
+pub const SPACE_BYTES: usize = 256 << 20;
 
 const COUNT: u32 = (SPACE_BYTES / CHUNK) as u32;
 

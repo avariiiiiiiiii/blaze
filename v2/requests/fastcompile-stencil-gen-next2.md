@@ -25,3 +25,5 @@ after:
         for _ in 0..100_000 {
             let key = rng.next_u32();
 ```
+
+> forwarded to fastcompile (its window is gone) (from requests, pass 16; told by tmux).

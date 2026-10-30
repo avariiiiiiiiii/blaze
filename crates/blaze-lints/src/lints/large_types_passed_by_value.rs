@@ -66,18 +66,6 @@ fn skipped_item_fn(function: ast::Fn<'_>) -> bool {
         })
 }
 
-/// clippy's `is_self_ty`: the type written is `Self`.
-pub(super) fn is_self_ty(ty: ast::Type<'_>) -> bool {
-    let ast::Type::PathType(path) = ty else { return false };
-    path.path().is_some_and(|it| {
-        it.qualifier().is_none()
-            && it.segment().is_some_and(|it| {
-                it.generic_arg_list().is_none()
-                    && it.syntax().first_token().is_some_and(|it| it.text() == "Self")
-            })
-    })
-}
-
 pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
     if !cx.on(LINT) {
         return;

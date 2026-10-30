@@ -26,6 +26,7 @@
 // Denied, not forbidden: the one unsafe module is the tests' `tests/exec.rs`, which maps code
 // and calls it.
 #![deny(unsafe_code)]
+#![feature(allocator_api)]
 
 pub mod arch;
 pub mod buf;
@@ -39,11 +40,11 @@ pub mod tier;
 #[cfg(test)]
 mod tests;
 
-use std::{cell::RefCell, fmt};
+use std::fmt;
 
 use cranelift_codegen::ir;
 
-pub use code::Code;
+pub use code::{Code, CodeRef};
 
 /// The platform a function is compiled for, as its glue needs it: everything besides the
 /// architecture that changes the bytes of a prologue, a call or an address. Each field is
@@ -120,35 +121,32 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-thread_local! {
-    /// Each compiling thread's columns and buffer, cleared between functions, never freed.
-    static SCRATCH: RefCell<patch::Scratch> = RefCell::new(patch::Scratch::new());
-}
-
-/// Compiles one function of Cranelift IR, after ABI lowering, for `target`, in this thread's
-/// scratch.
+/// Compiles one function of Cranelift IR, after ABI lowering, for `target`.
 pub fn compile(func: &ir::Function, target: &Target) -> Result<Code, Error> {
-    SCRATCH.with(|scratch| match scratch.try_borrow_mut() {
-        Ok(mut scratch) => compile_with(&mut scratch, func, target),
-        // A compile that compiles another on its thread: only a panic unwinding through
-        // `compile_with` and caught above could, and that one gets fresh columns.
-        Err(_) => compile_with(&mut patch::Scratch::new(), func, target),
-    })
+    compile_to(func, target, |code| code.to_code())
 }
 
-/// [`compile`] in the caller's scratch.
-pub fn compile_with(
-    scratch: &mut patch::Scratch,
+/// [`compile`] into `out`, whose vectors are reused: a worker that keeps one `Code` allocates
+/// only for a function bigger than any before it.
+pub fn compile_into(func: &ir::Function, target: &Target, out: &mut Code) -> Result<(), Error> {
+    compile_to(func, target, |code| out.copy_from(code))
+}
+
+/// [`compile`], handing the code to `sink` while it is still in the compile's frame
+/// (`blaze_mem::frame::task`): the consumer copies what it keeps once, straight to where it
+/// goes.
+pub fn compile_to<R>(
     func: &ir::Function,
     target: &Target,
-) -> Result<Code, Error> {
+    sink: impl FnOnce(&CodeRef<'_>) -> R,
+) -> Result<R, Error> {
     let library = table::Library::get(table::Variant::of(target)?)?;
     match target.arch {
         blaze_codegen::Arch::X86_64 => {
-            patch::compile::<arch::x64::X64>(scratch, func, target, library)
+            patch::compile::<arch::x64::X64, R>(func, target, library, sink)
         }
         blaze_codegen::Arch::Aarch64 => {
-            patch::compile::<arch::aarch64::Aarch64>(scratch, func, target, library)
+            patch::compile::<arch::aarch64::Aarch64, R>(func, target, library, sink)
         }
         blaze_codegen::Arch::Wasm32 => {
             Err(Error::new("wasm32 has no stencils: its code is written from the IR as a module"))

@@ -24,9 +24,10 @@ pub use frame::Frame;
 /// AArch64.
 pub struct Aarch64;
 
-/// What the glue bodies read and record: [`Cx`], or a test's stand-in for the patcher.
-trait Ctx<'f> {
-    fn buf(&mut self) -> &mut Buf;
+/// What the glue bodies read and record: [`Cx`], or a test's stand-in for the patcher. `'f` is
+/// the function's borrows, `'m` the compile's memory frame the buffer is on.
+trait Ctx<'f, 'm> {
+    fn buf(&mut self) -> &mut Buf<'m>;
     fn func(&self) -> &'f ir::Function;
     fn target(&self) -> &'f Target;
     fn frame(&self) -> &'f Frame;
@@ -39,8 +40,8 @@ trait Ctx<'f> {
     fn name(&self, name: &ir::ExternalName) -> Result<Name, Error>;
 }
 
-impl<'a> Ctx<'a> for Cx<'a, Aarch64> {
-    fn buf(&mut self) -> &mut Buf {
+impl<'a, 'm> Ctx<'a, 'm> for Cx<'a, 'm, Aarch64> {
+    fn buf(&mut self) -> &mut Buf<'m> {
         self.buf
     }
 
@@ -114,41 +115,39 @@ impl Glue for Aarch64 {
         glue::bound_fixed(frame)
     }
 
-    fn prologue(cx: &mut Cx<'_, Aarch64>) -> Result<(), Error> {
+    fn prologue(cx: &mut Cx<'_, '_, Aarch64>) -> Result<(), Error> {
         glue::prologue(cx)
     }
 
-    fn inst(cx: &mut Cx<'_, Aarch64>, inst: ir::Inst) -> Result<(), Error> {
+    fn inst(cx: &mut Cx<'_, '_, Aarch64>, inst: ir::Inst) -> Result<(), Error> {
         glue::inst(cx, inst)
     }
 
-    fn landing(cx: &mut Cx<'_, Aarch64>, inst: ir::Inst) -> Result<(), Error> {
+    fn landing(cx: &mut Cx<'_, '_, Aarch64>, inst: ir::Inst) -> Result<(), Error> {
         glue::landing(cx, inst)
     }
 
-    fn trap(cx: &mut Cx<'_, Aarch64>, code: ir::TrapCode) {
+    fn trap(cx: &mut Cx<'_, '_, Aarch64>, code: ir::TrapCode) {
         let _ = code;
         cx.buf.put4(inst::UDF);
     }
 
-    fn count_back_edge(cx: &mut Cx<'_, Aarch64>) {
+    fn count_back_edge(cx: &mut Cx<'_, '_, Aarch64>) {
         glue::count(cx.buf, glue::BACK_EDGES);
     }
 
-    fn relay(cx: &mut Cx<'_, Aarch64>, from: u32, to: u32, bytes: u8) {
+    fn relay(cx: &mut Cx<'_, '_, Aarch64>, from: u32, to: u32, bytes: u8) {
         glue::relay(cx.buf, from, to, bytes);
     }
 
-    fn unwind(cx: &mut Cx<'_, Aarch64>) -> Result<Option<code::Unwind>, Error> {
+    fn unwind(cx: &mut Cx<'_, '_, Aarch64>) -> Result<Option<code::UnwindKind>, Error> {
         let len = cx.buf.len();
         if cx.frame.windows {
-            return Ok(Some(code::Unwind::WindowsArm64 {
-                len,
-                codes: frame::windows_codes(cx.frame),
-            }));
+            let layout = cx.frame;
+            frame::windows_codes(layout, cx.windows_info());
+            return Ok(Some(code::UnwindKind::WindowsArm64 { len }));
         }
-        // alloc: once per function, the unwind information it hands back.
-        Ok(Some(code::Unwind::Dwarf { len, rows: cx.rows().to_vec() }))
+        Ok(Some(code::UnwindKind::Dwarf { len }))
     }
 
     fn slot_base(frame: &Frame) -> (u16, i32) {

@@ -36,9 +36,10 @@ use syntax::{
     ast::{self, HasName},
 };
 
-use super::used::{Binding, Bits, Entry, ExternCrate, Ns, Tree, TreeKind, UseItem, Used, Uses, entry};
+use super::used::{Binding, Entry, ExternCrate, Ns, SmallSet, Tree, TreeKind, UseItem, Used, Uses, entry};
 use crate::{
     cx::{Cx, item_range},
+    lints::registry::LintId,
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -59,11 +60,16 @@ impl Unused {
     pub(super) fn of(cx: &Cx<'_, '_>, uses: &Uses) -> Unused {
         let mut out =
             Unused { resolve: Vec::new(), bodies: Vec::new(), unused: FxHashSet::default(), redundant: FxHashSet::default() };
+        let extern_crates = cx.lint_may_fire(LintId::named("unused_extern_crates"));
         let mut maybe_unused_crates = FxHashSet::default();
         for krate in &uses.crates {
             out.macro_use(cx, uses, krate);
             let binding = Binding::ExternCrate(krate.id);
-            if !krate.public && !uses.used.contains_key(&binding) && krate.krate.is_some_and(|it| may_be_unused(cx, it)) {
+            if extern_crates
+                && !krate.public
+                && !uses.used.contains_key(&binding)
+                && krate.krate.is_some_and(|it| may_be_unused(cx, it))
+            {
                 maybe_unused_crates.insert(krate.id);
             }
         }
@@ -80,7 +86,7 @@ impl Unused {
                         && tree.underscore
                         && !matches!(entry(&tree.imported, Ns::Types), Some(Entry { def: ModuleDefId::TraitId(_), .. }))
                     {
-                        unused.insert(j);
+                        unused.insert_growing(j);
                     }
                     candidates.swap_remove(binding);
                     continue;
@@ -88,7 +94,7 @@ impl Unused {
                 match tree.kind {
                     TreeKind::List => {
                         if tree.node.use_tree_list().is_none_or(|it| it.use_trees().next().is_none()) {
-                            unused.insert(j);
+                            unused.insert_growing(j);
                         }
                     }
                     TreeKind::Simple | TreeKind::Glob => {
@@ -97,7 +103,7 @@ impl Unused {
                             candidates.swap_remove(binding);
                             unused.remove(j);
                         } else if !candidates.contains(binding) {
-                            unused.insert(j);
+                            unused.insert_growing(j);
                         }
                     }
                 }
@@ -112,15 +118,23 @@ impl Unused {
             }
         }
 
-        for krate in &uses.crates {
-            out.extern_crate(cx, uses, krate, &maybe_unused_crates);
+        if extern_crates {
+            for krate in &uses.crates {
+                out.extern_crate(cx, uses, krate, &maybe_unused_crates);
+            }
         }
         for (i, unused) in &unused_trees {
             out.unused_imports(cx, &uses.items[*i], unused);
         }
 
-        let mut seen: FxHashSet<ModuleId> = FxHashSet::with_capacity_and_hasher(uses.by_module.len(), Default::default());
-        for module in uses.items.iter().map(|it| it.module) {
+        // What is redundant is read by `unused_qualifications` too.
+        let redundant = cx.lint_may_fire(LintId::named("redundant_imports"))
+            || cx.lint_may_fire(LintId::named("unused_qualifications"));
+        let mut seen: FxHashSet<ModuleId> = match redundant {
+            true => FxHashSet::with_capacity_and_hasher(uses.by_module.len(), Default::default()),
+            false => FxHashSet::default(),
+        };
+        for module in uses.items.iter().map(|it| it.module).filter(|_| redundant) {
             if !seen.insert(module) {
                 continue;
             }
@@ -171,8 +185,16 @@ impl Unused {
             {
                 continue;
             }
+            let used = uses.macro_uses.contains(&(krate.id, name.clone()));
+            let lint = match used {
+                true => LintId::named("macro_use_extern_crate"),
+                false => LintId::named("unused_imports"),
+            };
+            if !cx.lint_may_fire(lint) {
+                continue;
+            }
             let span = cx.span(InFile::new(krate.node.file_id, *range));
-            let mut diag = if uses.macro_uses.contains(&(krate.id, name.clone())) {
+            let mut diag = if used {
                 let mut diag = Diag::lint(
                     "macro_use_extern_crate",
                     "applying the `#[macro_use]` attribute to an `extern crate` item is deprecated",
@@ -320,7 +342,7 @@ impl Candidates {
 }
 
 /// A set of an item's trees by index.
-type Trees = Bits;
+type Trees = SmallSet;
 
 /// Whether name resolution used `binding`, or it did not resolve (rustc's dummy binding of
 /// an unresolved import counts as used).

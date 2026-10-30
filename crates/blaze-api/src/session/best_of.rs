@@ -51,6 +51,7 @@ impl Candidate {
 
 impl BestOf {
     pub(super) fn new(base: ContentId) -> BestOf {
+        // alloc: the candidates, once per best-of request.
         BestOf { base, candidates: Vec::new(), running: 0 }
     }
 
@@ -103,6 +104,7 @@ impl BestOf {
         self.running
     }
 
+    // dyn: the daemon's one builder, lent by the session as `dyn`; one call per candidate.
     pub(super) fn cancel(&mut self, builder: &mut dyn Builder) {
         for candidate in &mut self.candidates {
             if let (Some(job), false) = (candidate.job, candidate.cancelled) {
@@ -125,26 +127,26 @@ impl BestOf {
     /// apply or whose job could not run has no counts to rank by, so it goes last, in its place
     /// in the request. Such a candidate's root is the base's.
     pub(super) fn ranked(&self) -> Vec<Ranked> {
-        let mut ranked: Vec<(bool, Ranked)> = self
+        // alloc: the ranking handed out in its response, once per best-of request.
+        let mut ranked: Vec<Ranked> = self
             .candidates
             .iter()
             .zip(0..)
-            .map(|(it, candidate)| {
-                let ranked = Ranked {
-                    candidate,
-                    root: it.root.unwrap_or(self.base),
-                    errors: it.errors,
-                    warnings: it.warnings,
-                    passed: it.passed,
-                    failed: it.failed,
-                    ok: it.ok,
-                };
-                (it.ran, ranked)
+            .map(|(it, candidate)| Ranked {
+                candidate,
+                root: it.root.unwrap_or(self.base),
+                errors: it.errors,
+                warnings: it.warnings,
+                passed: it.passed,
+                failed: it.failed,
+                ok: it.ok,
             })
+            // alloc: as above, the one allocation of `ranked`.
             .collect();
-        ranked.sort_by_key(|(ran, it)| {
+        ranked.sort_by_key(|it| {
+            let ran = self.candidates[it.candidate as usize].ran;
             (!ran, it.errors, it.failed, Reverse(it.passed), it.warnings, it.candidate)
         });
-        ranked.into_iter().map(|(_, it)| it).collect()
+        ranked
     }
 }

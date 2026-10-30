@@ -132,9 +132,6 @@ fn string_value(cx: &mut Accept<'_, '_, '_>, value: Option<&NameValue>) -> bool 
 
 /// The gates of the predicate `item` alone (a name, an empty `target()` or a `version(..)`).
 fn gates(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit) {
-    if !cx.emits() {
-        return;
-    }
     for diag in attributes::cfg_entry(cx.cx, &cx.session.features, cx.attr.file, item) {
         cx.emit_err(diag);
     }

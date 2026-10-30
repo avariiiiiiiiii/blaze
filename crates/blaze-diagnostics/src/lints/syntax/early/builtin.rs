@@ -24,7 +24,10 @@ use syntax::{
 use super::{Expansions, allows_unsafe, ctxt, range_from_expansion};
 use crate::{
     cx::{Cx, item_range},
-    lints::syntax::{Emitted, Pass, Tree, Walk, from_expansion, source_fact},
+    lints::{
+        registry::LintId,
+        syntax::{Emitted, Pass, Tree, Walk, from_expansion, source_fact},
+    },
     lower::Phase,
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -36,6 +39,10 @@ use crate::{
 pub(super) struct Builtin<'a, 'w> {
     expansions: &'a Expansions<'w>,
     anonymous: bool,
+    /// Whether `unsafe_code` and `ambiguous_negative_literals`, allowed by default, may fire:
+    /// the nodes they look at are not read otherwise.
+    unsafe_code: bool,
+    negative_literals: bool,
     stmts: Vec<Stmt>,
     /// The range pattern of the tree whose `...` was linted with the `&` before it: nothing in
     /// it is linted again (`EllipsisInclusiveRangePatterns::node_id`).
@@ -44,7 +51,14 @@ pub(super) struct Builtin<'a, 'w> {
 
 impl<'a, 'w> Builtin<'a, 'w> {
     pub(super) fn new(cx: &Cx<'_, '_>, expansions: &'a Expansions<'w>) -> Builtin<'a, 'w> {
-        Builtin { expansions, anonymous: cx.edition == Edition::Edition2015, stmts: Vec::new(), linted_ref: None }
+        Builtin {
+            expansions,
+            anonymous: cx.edition == Edition::Edition2015,
+            unsafe_code: cx.lint_may_fire(LintId::named("unsafe_code")),
+            negative_literals: cx.lint_may_fire(LintId::named("ambiguous_negative_literals")),
+            stmts: Vec::new(),
+            linted_ref: None,
+        }
     }
 
     /// What is checked once for the crate: `special_module_name`.
@@ -55,19 +69,36 @@ impl<'a, 'w> Builtin<'a, 'w> {
     /// What is checked once for a tree, before its nodes: `global_asm!`.
     pub(super) fn tree(&mut self, cx: &Cx<'_, '_>, tree: &Tree, out: &mut Vec<Emitted>) {
         self.linted_ref = None;
-        global_asm(cx, tree, out);
+        if self.unsafe_code {
+            global_asm(cx, tree, out);
+        }
     }
 
-    pub(super) fn node(&mut self, cx: &Cx<'_, '_>, walk: &Walk<'_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
-        match node.kind() {
+    /// The checks of `node`, of kind `kind`.
+    pub(super) fn node(
+        &mut self,
+        cx: &Cx<'_, '_>,
+        walk: &Walk<'_>,
+        tree: &Tree,
+        node: &SyntaxNode,
+        kind: SyntaxKind,
+        out: &mut Vec<Emitted>,
+    ) {
+        match kind {
             SyntaxKind::BLOCK_EXPR
             | SyntaxKind::TRAIT
             | SyntaxKind::IMPL
             | SyntaxKind::EXTERN_BLOCK
             | SyntaxKind::MACRO_RULES
-            | SyntaxKind::MACRO_DEF => unsafe_code(cx, walk, tree, node, out),
+            | SyntaxKind::MACRO_DEF => {
+                if self.unsafe_code {
+                    unsafe_code(cx, walk, tree, node, out);
+                }
+            }
             SyntaxKind::FN => {
-                unsafe_code(cx, walk, tree, node, out);
+                if self.unsafe_code {
+                    unsafe_code(cx, walk, tree, node, out);
+                }
                 if self.anonymous {
                     anonymous_parameters(cx, tree, node, out);
                 }
@@ -83,7 +114,9 @@ impl<'a, 'w> Builtin<'a, 'w> {
             SyntaxKind::WHILE_EXPR => while_true(cx, tree, node, out),
             SyntaxKind::STMT_LIST => redundant_semicolons(cx, self.expansions, tree, node, &mut self.stmts, out),
             SyntaxKind::PREFIX_EXPR => {
-                ambiguous_negative_literal(cx, tree, node, out);
+                if self.negative_literals {
+                    ambiguous_negative_literal(cx, tree, node, out);
+                }
                 double_negation(cx, tree, node, out);
             }
             SyntaxKind::LABEL => super::labels::shadowing(cx, tree, node, out),

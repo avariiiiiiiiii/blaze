@@ -182,6 +182,14 @@ impl Symbol {
         known.then_some(Symbol { id })
     }
 
+    /// The symbol of an ID [`Symbol::id`] gave in this process, with no lookup: for columns of
+    /// IDs that were symbols when written (`tt`'s token trees). An ID that names no symbol
+    /// panics when its text is read, as a symbol whose value the image's GC freed does.
+    #[inline]
+    pub fn from_held_id(id: u32) -> Symbol {
+        Symbol { id: NonZeroU32::new(id).expect("a symbol's ID is never 0") }
+    }
+
     pub fn empty() -> Self {
         symbols::__empty
     }
@@ -319,6 +327,8 @@ mod tests {
             assert_eq!(Symbol::intern(s), Symbol::intern(&s.to_owned()));
             assert_eq!(Symbol::find(s), Some(Symbol::intern(s)));
             assert_eq!(Symbol::from_id(Symbol::intern(s).id()), Some(Symbol::intern(s)));
+            assert_eq!(Symbol::from_held_id(Symbol::intern(s).id()), Symbol::intern(s));
+            assert_eq!(Symbol::from_held_id(Symbol::intern(s).id()).as_str(), s);
         }
         let long = "y".repeat(1 << 20);
         assert_eq!(Symbol::intern(&long).as_str(), long);

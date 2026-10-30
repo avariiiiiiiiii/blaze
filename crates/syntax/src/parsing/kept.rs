@@ -91,4 +91,35 @@ mod tests {
             super::keep(key, &parse)
         });
     }
+
+    /// The parse of a file whose text did not change allocates nothing, however often: it is
+    /// the kept parse, and every count dropped on the way is not its tree's last, so nothing
+    /// goes to the drop thread (whose channel allocates a block every 31 sends).
+    #[test]
+    fn an_unchanged_file_parses_again_allocating_nothing() {
+        for outline in [false, true] {
+            let key = 13 + 4 * outline as u32 + super::SLOTS as u32 * 9;
+            let text = Text::from("fn f() { 1 + 2 }\nstruct S { a: u8 }\n");
+            let first = SourceFile::parse_file(key, text.clone(), Edition::CURRENT, outline);
+            let again = blaze_alloc_count::assert_at_most(0, "an unchanged file parsed again", || {
+                SourceFile::parse_file(key, text.clone(), Edition::CURRENT, outline)
+            });
+            assert!(std::sync::Arc::ptr_eq(
+                again.tree.as_ref().unwrap().flat(),
+                first.tree.as_ref().unwrap().flat()
+            ));
+            // Equal bytes at another address: compared, and the same parse.
+            let copy = Text::from(&*text);
+            let same = SourceFile::parse_file(key, copy.clone(), Edition::CURRENT, outline);
+            assert!(std::sync::Arc::ptr_eq(
+                same.tree.as_ref().unwrap().flat(),
+                first.tree.as_ref().unwrap().flat()
+            ));
+            blaze_alloc_count::assert_at_most(0, "an unchanged file parsed 100 times", || {
+                for _ in 0..100 {
+                    drop(SourceFile::parse_file(key, text.clone(), Edition::CURRENT, outline));
+                }
+            });
+        }
+    }
 }

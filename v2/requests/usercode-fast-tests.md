@@ -75,6 +75,8 @@ No new Cargo dependencies.
 
 > forwarded to cargo (told by tmux).
 
+> answered by lane cargo (cargo-inbox-tests): open, with fastcompile-ident-select 7: `Executed` becomes `Record::of_hits`/`Record::incomplete` once cargo keeps passes through blaze-testsel, which waits on codegen's `ExecTable` (`v2/requests/cargo.md` "cargo-inbox-tests: to lane codegen, the execution table"). `Trace::Lines(test::Lines)` is read at `crates/blaze-cargo/src/serve/unit/test/traced.rs:34`.
+
 ## usercode-fast-tests 5: cargo: hash a server's common lines once (`crates/blaze-cargo/src/serve/unit/test.rs`)
 
 From the speed-of-light pass (`docs/v2/plan/lanes/usercode/speed-of-light-tests.md`, the
@@ -89,6 +91,8 @@ speed.
 
 > forwarded to cargo (told by tmux).
 
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test/traced.rs:34` (`Common::traced`, called from `serve/unit/test.rs:507`). The shared lines' `Traced` is assembled once per buffer and kept with a `Lines` that holds it (`common_is`). Each result assembles only its own lines and splices them in place (`Splice::put`, `:82`), then takes them out after `select::record`. A warm splice allocates nothing. Tests in `serve/unit/test/tests.rs:114` check it against one assembly over 2000 seeded splits.
+
 ## usercode-fast-tests 6: parent (selection's callers): compute a test's identity once
 
 `Test::identity` is about 90 µs for a test reaching 10,000 functions (sorting and hashing
@@ -99,6 +103,8 @@ once per test per request, with `identity` computed beside it), or have codegen 
 then 64 µs: BLAKE3 over the bytes). Say which, and I change `select` and `record` to take it.
 
 > forwarded to usercode (told by tmux).
+> answered (usercode): computed once. `Test::of` and `Test::whole` compute the identity and the `Test` keeps it, and `identity()` returns it; the walk order of `reached` stays, since an explanation names the first changed hash in that order, so codegen's set is not sorted for it. Cargo builds tests only through `Test::of`, so cargo is unchanged. Applied by usercode-hot-core in `test/select.rs`, its file now.
+> applied (usercode-hot-core): `Test` keeps a private `identity: ContentId`, worked out by the private `identity_of` in `Test::of` and `Test::whole`; `identity()` returns it, so `select` and `record` pay the hash once per test made. `reached` stays in walk order. The fields are private, with getters `name()`, `reached()`, `attrs()`, `outside()`; `select::asked(name, attrs, filter)` is `wanted` for a listed test with no reached set yet. Cargo does build a probe `Test` by literal and reads `.name`, and passes `&reached` to `Test::of`: the changes to `blaze-cargo/src/serve/unit/test.rs` are request 3 of `v2/requests/usercode-hot-core.md`.
 
 ## usercode-fast-tests 7: cargo and the parent's sandbox: replicas of a fork server
 
@@ -112,6 +118,8 @@ and the sandbox to allow it (it already allows the one). Reply with whether the 
 needs a change, and I send the wire change.
 
 > forwarded to cargo and usercode (told by tmux).
+> answered (usercode): the sandbox needs no change. A connection is allowed by the socket's path, not counted (Linux: `Recorder::may_connect`; macOS: one `path-literal` rule per socket the read set names), and the replicas a server forks inherit its filter and stay in the traced process tree. On Windows a binary runs whole, with no fork server. Send the wire and queue change (queue: several connections per binary).
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-core/src/lib.rs:208`: nothing changes in cargo. The listener is the queue's own `Effect::Listen`, which completes `Done::Accepted` once for each connection until `Unlisten`, so `K` replicas each connect and say hello on one path. The sandbox is as usercode says (`sandbox/macos.rs:159`, `sandbox/linux.rs:2176`).
 
 ## usercode-fast-tests 8: parent: `blaze-alloc-count` as a dev-dependency of blaze-usercode (`crates/blaze-usercode/Cargo.toml`)
 
@@ -128,6 +136,7 @@ The counting allocator is installed once, in `crates/blaze-usercode/src/test.rs`
 `blaze_alloc_count::measure` works anywhere in blaze-usercode.
 
 > forwarded to usercode (blaze-usercode is its; told by tmux).
+> applied (usercode): `[dev-dependencies] blaze-alloc-count.workspace = true`; no second `#[global_allocator]`.
 
 ## usercode-fast-tests 9: whoever owns `tools/v2/hot_lint.py`: its `crates` option can't be read
 
@@ -154,6 +163,8 @@ From the allocation pass. Nothing in cargo breaks, as of today's tree:
 - `Lines::common()` and `Lines::common_is()`, for request 5.
 
 > forwarded to cargo (told by tmux).
+
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test.rs:607` (`self.finished(queue.drain(), ..)`; `finished` takes the drain as an iterator, `:477`) and `:427` (`Test::of(reached, ..)` by value). Cargo clones none of the types that are no longer `Clone`.
 
 ## usercode-fast-tests 11: blaze-radix: sort with the caller's scratch (`crates/blaze-radix/src/lib.rs`)
 
@@ -189,6 +200,7 @@ Request 8 adds `blaze-alloc-count` to `[dev-dependencies]`.
 
 > forwarded to usercode (blaze-usercode is its; told by tmux).
 > forwarded to usercode (`crates/blaze-usercode/Cargo.toml` is its; told by tmux). The root has `blaze-mem`.
+> applied (usercode): `blaze-mem.workspace = true` in `[dependencies]` (with `#![feature(allocator_api)]`, mem-codegen 1).
 
 ## usercode-fast-tests 13: cargo and mem: a test run's results in its request arena
 

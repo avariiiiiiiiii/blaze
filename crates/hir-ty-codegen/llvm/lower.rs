@@ -1423,7 +1423,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 }
                 _ => return Err(Unhandled::Opcode(opcode)),
             },
-            InstructionData::AtomicRmw { args: [address, operand], op, .. } => {
+            InstructionData::AtomicRmw { args: [address, operand], op, flags, .. } => {
+                let counter = dfg.mem_flags[flags].alias_region().is_some_and(|region| {
+                    dfg.alias_regions.get(crate::tier::COUNTER_REGION) == Some(region)
+                });
                 let address = self.pointer(address)?;
                 let operand = self.int(operand)?;
                 let op = match op {
@@ -1439,7 +1442,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                     AtomicRmwOp::Smin => AtomicRMWBinOp::Min,
                     AtomicRmwOp::Smax => AtomicRMWBinOp::Max,
                 };
-                let ordering = AtomicOrdering::SequentiallyConsistent;
+                let ordering = match counter {
+                    true => AtomicOrdering::Monotonic,
+                    false => AtomicOrdering::SequentiallyConsistent,
+                };
                 let old = self.builder.build_atomicrmw(op, address, operand, ordering)?;
                 self.set(inst, Operand::Int(old));
             }

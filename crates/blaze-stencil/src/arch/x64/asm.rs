@@ -45,7 +45,7 @@ pub const MEM_MAX: u32 = 1 + 1 + 2 + 1 + 1 + 4;
 pub const MOVABS: u32 = 10;
 
 #[inline]
-fn rex(buf: &mut Buf, w: bool, reg: u8, index: u8, base: u8) {
+fn rex(buf: &mut Buf<'_>, w: bool, reg: u8, index: u8, base: u8) {
     let byte = 0x40 | (u8::from(w) << 3) | ((reg >> 3) << 2) | ((index >> 3) << 1) | (base >> 3);
     if byte != 0x40 {
         buf.put1(byte);
@@ -58,7 +58,7 @@ const fn modrm(mode: u8, reg: u8, rm: u8) -> u8 {
 }
 
 #[inline]
-fn mem(buf: &mut Buf, reg: u8, m: Mem) {
+fn mem(buf: &mut Buf<'_>, reg: u8, m: Mem) {
     let base = m.base & 7;
     let mode = if m.disp == 0 && base != 5 {
         0
@@ -80,7 +80,7 @@ fn mem(buf: &mut Buf, reg: u8, m: Mem) {
 
 /// `prefix? REX opcode ModRM(reg, [m])`.
 #[inline]
-fn op_mem(buf: &mut Buf, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8, m: Mem) {
+fn op_mem(buf: &mut Buf<'_>, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8, m: Mem) {
     if let Some(prefix) = prefix {
         buf.put1(prefix);
     }
@@ -91,7 +91,7 @@ fn op_mem(buf: &mut Buf, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8, m:
 
 /// `prefix? REX opcode ModRM(reg, rm)`, register to register.
 #[inline]
-fn op_rr(buf: &mut Buf, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8, rm: u8) {
+fn op_rr(buf: &mut Buf<'_>, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8, rm: u8) {
     if let Some(prefix) = prefix {
         buf.put1(prefix);
     }
@@ -103,7 +103,7 @@ fn op_rr(buf: &mut Buf, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8, rm:
 /// `prefix? REX opcode ModRM(reg, [rip + disp32])`; the offset of the disp32, which is
 /// relative to the end of the instruction only when nothing follows it.
 #[inline]
-pub fn rip(buf: &mut Buf, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8) -> u32 {
+pub fn rip(buf: &mut Buf<'_>, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8) -> u32 {
     if let Some(prefix) = prefix {
         buf.put1(prefix);
     }
@@ -116,18 +116,18 @@ pub fn rip(buf: &mut Buf, prefix: Option<u8>, w: bool, opcode: &[u8], reg: u8) -
 }
 
 /// `mov r64, [m]`.
-pub fn load(buf: &mut Buf, dst: u8, m: Mem) {
+pub fn load(buf: &mut Buf<'_>, dst: u8, m: Mem) {
     op_mem(buf, None, true, &[0x8b], dst, m);
 }
 
 /// `mov [m], r64`.
-pub fn store(buf: &mut Buf, m: Mem, src: u8) {
+pub fn store(buf: &mut Buf<'_>, m: Mem, src: u8) {
     op_mem(buf, None, true, &[0x89], src, m);
 }
 
 /// A load of `bits` (8, 16, 32 or 64) extended to 64: `movzx`/`movsx`/`movsxd`, or `mov
 /// r32` for 32 bits zero-extended.
-pub fn load_ext(buf: &mut Buf, dst: u8, m: Mem, bits: u32, signed: bool) {
+pub fn load_ext(buf: &mut Buf<'_>, dst: u8, m: Mem, bits: u32, signed: bool) {
     match (bits, signed) {
         (8, false) => op_mem(buf, None, false, &[0x0f, 0xb6], dst, m),
         (8, true) => op_mem(buf, None, true, &[0x0f, 0xbe], dst, m),
@@ -140,18 +140,18 @@ pub fn load_ext(buf: &mut Buf, dst: u8, m: Mem, bits: u32, signed: bool) {
 }
 
 /// `lea r64, [m]`.
-pub fn lea(buf: &mut Buf, dst: u8, m: Mem) {
+pub fn lea(buf: &mut Buf<'_>, dst: u8, m: Mem) {
     op_mem(buf, None, true, &[0x8d], dst, m);
 }
 
 /// `mov dst, src`, 64 bits.
-pub fn mov(buf: &mut Buf, dst: u8, src: u8) {
+pub fn mov(buf: &mut Buf<'_>, dst: u8, src: u8) {
     op_rr(buf, None, true, &[0x89], src, dst);
 }
 
 /// A constant into `dst` as Cranelift's `Inst::imm` writes it: `mov r32, imm32` when it
 /// zero-extends from 32 bits, `mov r64, simm32` when it sign-extends, `movabs` otherwise.
-pub fn imm(buf: &mut Buf, dst: u8, value: u64) {
+pub fn imm(buf: &mut Buf<'_>, dst: u8, value: u64) {
     if u32::try_from(value).is_ok() {
         rex(buf, false, 0, 0, dst);
         buf.put1(0xb8 | (dst & 7));
@@ -167,7 +167,7 @@ pub fn imm(buf: &mut Buf, dst: u8, value: u64) {
 }
 
 /// `movabs dst, imm64`; the offset of the immediate.
-pub fn movabs(buf: &mut Buf, dst: u8, value: u64) -> u32 {
+pub fn movabs(buf: &mut Buf<'_>, dst: u8, value: u64) -> u32 {
     rex(buf, true, 0, 0, dst);
     buf.put1(0xb8 | (dst & 7));
     let at = buf.len();
@@ -181,7 +181,7 @@ pub const AND: u8 = 4;
 pub const SUB: u8 = 5;
 
 /// `op r64, imm`: the imm8 form when it fits (`addq_mi_sxb`), else imm32.
-pub fn alu_imm(buf: &mut Buf, op: u8, dst: u8, value: i32) {
+pub fn alu_imm(buf: &mut Buf<'_>, op: u8, dst: u8, value: i32) {
     rex(buf, true, 0, 0, dst);
     if let Ok(byte) = i8::try_from(value) {
         buf.put1(0x83);
@@ -195,7 +195,7 @@ pub fn alu_imm(buf: &mut Buf, op: u8, dst: u8, value: i32) {
 }
 
 /// `op r64, imm32`, always the imm32 form (`addq_mi_sxl`).
-pub fn alu_imm32(buf: &mut Buf, op: u8, dst: u8, value: i32) {
+pub fn alu_imm32(buf: &mut Buf<'_>, op: u8, dst: u8, value: i32) {
     rex(buf, true, 0, 0, dst);
     buf.put1(0x81);
     buf.put1(modrm(3, op, dst));
@@ -203,22 +203,22 @@ pub fn alu_imm32(buf: &mut Buf, op: u8, dst: u8, value: i32) {
 }
 
 /// `add dst, src`, 64 bits (`addq_rm`).
-pub fn add(buf: &mut Buf, dst: u8, src: u8) {
+pub fn add(buf: &mut Buf<'_>, dst: u8, src: u8) {
     op_rr(buf, None, true, &[0x03], dst, src);
 }
 
 /// `cmp a, b`, 64 bits (`cmpq_rm`): the flags of `a - b`.
-pub fn cmp(buf: &mut Buf, a: u8, b: u8) {
+pub fn cmp(buf: &mut Buf<'_>, a: u8, b: u8) {
     op_rr(buf, None, true, &[0x3b], a, b);
 }
 
 /// `cmovcc dst, src`, 64 bits.
-pub fn cmov(buf: &mut Buf, cc: u8, dst: u8, src: u8) {
+pub fn cmov(buf: &mut Buf<'_>, cc: u8, dst: u8, src: u8) {
     op_rr(buf, None, true, &[0x0f, 0x40 | cc], dst, src);
 }
 
 /// `movsxd dst, dword [base + index * 4]`; `base` is not `rbp` or `r13`.
-pub fn movsxd_index4(buf: &mut Buf, dst: u8, base: u8, index: u8) {
+pub fn movsxd_index4(buf: &mut Buf<'_>, dst: u8, base: u8, index: u8) {
     debug_assert!(base & 7 != 5 && index != RSP);
     rex(buf, true, dst, index, base);
     buf.put1(0x63);
@@ -227,30 +227,30 @@ pub fn movsxd_index4(buf: &mut Buf, dst: u8, base: u8, index: u8) {
 }
 
 /// `mov dword [m], imm32`.
-pub fn store_imm32(buf: &mut Buf, m: Mem, value: u32) {
+pub fn store_imm32(buf: &mut Buf<'_>, m: Mem, value: u32) {
     op_mem(buf, None, false, &[0xc7], 0, m);
     buf.put4(value);
 }
 
 /// `add qword [rip + disp32], 1`; the offset of the disp32, 5 bytes before the end.
-pub fn add_rip_one(buf: &mut Buf) -> u32 {
+pub fn add_rip_one(buf: &mut Buf<'_>) -> u32 {
     let at = rip(buf, None, true, &[0x83], ADD);
     buf.put1(1);
     at
 }
 
-pub fn push(buf: &mut Buf, reg: u8) {
+pub fn push(buf: &mut Buf<'_>, reg: u8) {
     rex(buf, false, 0, 0, reg);
     buf.put1(0x50 | (reg & 7));
 }
 
-pub fn pop(buf: &mut Buf, reg: u8) {
+pub fn pop(buf: &mut Buf<'_>, reg: u8) {
     rex(buf, false, 0, 0, reg);
     buf.put1(0x58 | (reg & 7));
 }
 
 /// `call rel32`; the offset of the rel32.
-pub fn call_rel32(buf: &mut Buf) -> u32 {
+pub fn call_rel32(buf: &mut Buf<'_>) -> u32 {
     buf.put1(0xe8);
     let at = buf.len();
     buf.put4(0);
@@ -258,41 +258,41 @@ pub fn call_rel32(buf: &mut Buf) -> u32 {
 }
 
 /// `call reg`.
-pub fn call_reg(buf: &mut Buf, reg: u8) {
+pub fn call_reg(buf: &mut Buf<'_>, reg: u8) {
     rex(buf, false, 0, 0, reg);
     buf.put1(0xff);
     buf.put1(modrm(3, 2, reg));
 }
 
 /// `call qword [m]`.
-pub fn call_mem(buf: &mut Buf, m: Mem) {
+pub fn call_mem(buf: &mut Buf<'_>, m: Mem) {
     op_mem(buf, None, false, &[0xff], 2, m);
 }
 
 /// `jmp reg`.
-pub fn jmp_reg(buf: &mut Buf, reg: u8) {
+pub fn jmp_reg(buf: &mut Buf<'_>, reg: u8) {
     rex(buf, false, 0, 0, reg);
     buf.put1(0xff);
     buf.put1(modrm(3, 4, reg));
 }
 
 /// `jcc rel32`; the offset of the rel32.
-pub fn jcc(buf: &mut Buf, cc: u8) -> u32 {
+pub fn jcc(buf: &mut Buf<'_>, cc: u8) -> u32 {
     buf.put(&[0x0f, 0x80 | cc]);
     let at = buf.len();
     buf.put4(0);
     at
 }
 
-pub fn ret(buf: &mut Buf) {
+pub fn ret(buf: &mut Buf<'_>) {
     buf.put1(0xc3);
 }
 
-pub fn ud2(buf: &mut Buf) {
+pub fn ud2(buf: &mut Buf<'_>) {
     buf.put(&[0x0f, 0x0b]);
 }
 
-pub fn int3(buf: &mut Buf) {
+pub fn int3(buf: &mut Buf<'_>) {
     buf.put1(0xcc);
 }
 
@@ -328,19 +328,19 @@ impl Sse {
 }
 
 /// `movss`/`movsd`/`movdqu xmm, [m]`.
-pub fn xload(buf: &mut Buf, sse: Sse, xmm: u8, m: Mem) {
+pub fn xload(buf: &mut Buf<'_>, sse: Sse, xmm: u8, m: Mem) {
     let (prefix, opcode) = sse.code();
     op_mem(buf, Some(prefix), false, &[0x0f, opcode], xmm, m);
 }
 
 /// `movss`/`movsd`/`movdqu [m], xmm`.
-pub fn xstore(buf: &mut Buf, sse: Sse, m: Mem, xmm: u8) {
+pub fn xstore(buf: &mut Buf<'_>, sse: Sse, m: Mem, xmm: u8) {
     let (prefix, opcode) = sse.code();
     let opcode = if sse == Sse::Dqu { 0x7f } else { opcode + 1 };
     op_mem(buf, Some(prefix), false, &[0x0f, opcode], xmm, m);
 }
 
 /// `movq xmm, r64`.
-pub fn movq_to_xmm(buf: &mut Buf, xmm: u8, src: u8) {
+pub fn movq_to_xmm(buf: &mut Buf<'_>, xmm: u8, src: u8) {
     op_rr(buf, Some(0x66), true, &[0x0f, 0x6e], xmm, src);
 }

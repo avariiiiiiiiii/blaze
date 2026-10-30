@@ -63,7 +63,7 @@ kinds! {
     CRATE_ROOT = 0x220d, "crate_root";
     CRATE_DATA = 0x220e, "crate_data";
     ROOT_DECL = 0x220f, "root_decl";
-    CHILD_KEY = 0x2210, "child_key";
+    /// `child_key` is a look-up in `module_decls`' children, no query; the number stays unused.
     DECL_HANDLE = 0x2211, "decl_handle";
     ROUND_MODULES = 0x2212, "round_modules";
     ROUND_ENV = 0x2213, "round_env";
@@ -71,6 +71,7 @@ kinds! {
     ROUND_PROGRESS = 0x2215, "round_progress";
     ROUND_KIND = 0x2216, "round_kind";
     ROW = 0x2217, "row";
+    ROUND_ACTIVE = 0x2218, "round_active";
 }
 
 #[cfg(test)]
@@ -85,6 +86,7 @@ mod tests {
             assert_eq!(of(query), Some(kind));
         }
         assert_eq!(name(QueryKind(0x2206)), None);
+        assert_eq!(name(QueryKind(0x2210)), None);
         assert_eq!(name(QueryKind(RANGE.end)), None);
     }
 }

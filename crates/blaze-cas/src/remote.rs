@@ -36,6 +36,7 @@
 use std::collections::{VecDeque, hash_map};
 
 use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, Tag};
+use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_ids::{ContentId, radix};
 use rustc_hash::FxHashMap;
 
@@ -154,71 +155,50 @@ impl Parsed<'_> {
     }
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, len: usize, what: &str) -> Result<&'a [u8], String> {
-        let left = self.bytes.len() - self.at;
-        if left < len {
-            return Err(format!(
-                "truncated: {what} needs {len} bytes at offset {}, {left} are left",
-                self.at
-            ));
-        }
-        let taken = &self.bytes[self.at..self.at + len];
-        self.at += len;
-        Ok(taken)
-    }
-
-    fn id(&mut self, what: &str) -> Result<ContentId, String> {
-        let mut id = [0; 32];
-        id.copy_from_slice(self.take(32, what)?);
-        Ok(ContentId(id))
-    }
-
-    fn u64(&mut self, what: &str) -> Result<u64, String> {
-        let mut word = [0; 8];
-        word.copy_from_slice(self.take(8, what)?);
-        Ok(u64::from_le_bytes(word))
-    }
+/// A read past the end of an answer, in the words `parse`'s errors use.
+fn truncated(error: cursor::Error) -> String {
+    // alloc: an error path.
+    format!("truncated: {error}")
 }
 
 /// [`Answer::decode`] without the copy: an answer's bytes (not its frame) read in place.
 pub(crate) fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
-    let mut reader = Reader { bytes, at: 0 };
-    let header = reader.take(8, "the header")?;
+    let mut reader = Reader::new(bytes);
+    let header = reader.array::<8>().map_err(truncated)?;
     if header[..6] != ANSWER_MAGIC[..] {
+        // alloc: an error path.
         return Err(format!("not an answer: its magic is {:?}", header[..6].escape_ascii().to_string()));
     }
     let version = u16::from_le_bytes([header[6], header[7]]);
     if version != VERSION {
+        // alloc: an error path.
         return Err(format!("an answer of version {version}; this blaze speaks version {VERSION}"));
     }
-    let which = reader.take(1, "which answer")?[0];
-    let key = Key(reader.id("the key")?);
+    let which = reader.u8().map_err(truncated)?;
+    let key = Key(ContentId(*reader.array().map_err(truncated)?));
     let parsed = match which {
         MISSING => Parsed::Missing { key },
         VALUE => {
-            let code = reader.take(1, "the kind")?[0];
+            let code = reader.u8().map_err(truncated)?;
+            // alloc: an error path.
             let kind = Kind::from_code(code).ok_or_else(|| format!("an unknown kind code {code}"))?;
-            let content = reader.id("the content hash")?;
-            let len = reader.u64("the value's length")?;
+            let content = ContentId(*reader.array().map_err(truncated)?);
+            let len = reader.u64().map_err(truncated)?;
             if len > LONGEST_VALUE {
+                // alloc: an error path.
                 return Err(format!(
                     "a value of {len} bytes, longer than the {LONGEST_VALUE} an answer may carry"
                 ));
             }
-            let bytes = reader.take(len as usize, "the value")?;
+            let bytes = reader.take(len as usize).map_err(truncated)?;
             Parsed::Value { key, kind, content, bytes }
         }
+        // alloc: an error path.
         other => return Err(format!("an unknown answer {other} (0 is missing, 1 a value)")),
     };
-    let trailing = bytes.len() - reader.at;
-    if trailing != 0 {
-        return Err(format!("{trailing} trailing bytes after the answer"));
+    if !reader.is_done() {
+        // alloc: an error path.
+        return Err(format!("{} trailing bytes after the answer", reader.left()));
     }
     Ok(parsed)
 }
@@ -244,7 +224,7 @@ fn write_value(out: &mut Vec<u8>, key: &Key, kind: Kind, content: &ContentId, by
     out.extend_from_slice(&key.0.0);
     out.push(kind.code());
     out.extend_from_slice(&content.0);
-    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.put_u64(bytes.len() as u64);
     crate::copy::append(out, bytes);
 }
 
@@ -256,10 +236,10 @@ fn write_ask(out: &mut Vec<u8>, key: &Key) {
 /// Appends one frame to `out`: the length of what `write` appends, then that.
 fn write_frame(out: &mut Vec<u8>, write: impl FnOnce(&mut Vec<u8>)) {
     let start = out.len();
-    out.extend_from_slice(&[0; 8]);
+    out.put_u64(0);
     write(out);
     let len = (out.len() - start - 8) as u64;
-    out[start..start + 8].copy_from_slice(&len.to_le_bytes());
+    out.patch_u64(start, len);
 }
 
 /// Appends the answer frame for `key`, written from its value (a verified get) in place.

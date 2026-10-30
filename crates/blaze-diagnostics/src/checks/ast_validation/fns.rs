@@ -231,7 +231,6 @@ fn splatting(
     if splatted.is_empty() {
         return;
     }
-    let spans = |ranges: &mut dyn Iterator<Item = TextRange>| -> Vec<Span> { ranges.map(|it| v.span(it)).collect() };
     let at = splatted.partition_point(|(index, _)| *index < NO_SPLATTED_ARG_INDEX);
     let (valid, invalid) = splatted.split_at(at);
     if let Some(&(first, _)) = invalid.first() {
@@ -239,7 +238,7 @@ fn splatting(
             "`#[rustc_splat]` is only supported on argument index {} or less, this `#[rustc_splat]` is on index {first}",
             NO_SPLATTED_ARG_INDEX - 1
         );
-        let spans = spans(&mut invalid.iter().map(|it| it.1));
+        let spans: Vec<Span> = invalid.iter().map(|it| v.span(it.1)).collect();
         let mut diag = Diag::error(None, message, spans[0].clone());
         for span in &spans[1..] {
             diag.primary(span.clone());
@@ -252,7 +251,7 @@ fn splatting(
     }
     let Some(&(first_index, _)) = valid.first() else { return };
     let many = |message: String, help: &str, extra: Option<TextRange>| {
-        let spans = spans(&mut valid.iter().map(|it| it.1).chain(extra));
+        let spans: Vec<Span> = valid.iter().map(|it| it.1).chain(extra).map(|it| v.span(it)).collect();
         let mut diag = Diag::error(None, message, spans[0].clone());
         for span in &spans[1..] {
             diag.primary(span.clone());

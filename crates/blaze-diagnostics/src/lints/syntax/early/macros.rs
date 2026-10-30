@@ -145,7 +145,7 @@ fn dropped_semicolon(cx: &Cx<'_, '_>, call: MacroCallId) -> Option<span::Span> {
     let loc = call.loc(db);
     let MacroDefKind::Declarative(def, _) = loc.def.kind else { return None };
     let (arg, _, span) = call.macro_arg_considering_derives(db, &loc.kind);
-    let expanded = def.decl_macro_expander(db, loc.def.krate).expand(db, arg, call, *span);
+    let expanded = def.decl_macro_expander(db, loc.def.krate).expand(db, arg, call, span);
     if expanded.err.is_some() {
         return None;
     }

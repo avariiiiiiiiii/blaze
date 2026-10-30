@@ -423,36 +423,39 @@ fn check_wire(tree: &TopSubtree, damage: bool) {
 fn a_leaf_is_16_bytes_and_a_subtree_24() {
     assert_eq!(size_of::<Node>() + size_of::<PackedSpan>(), 16);
     assert_eq!(size_of::<Node>() + 2 * size_of::<PackedSpan>(), 24);
-    let mut gen = Gen::new(3, 2);
-    let tokens = gen.tree(200);
+    let mut trees = Gen::new(3, 2);
+    let tokens = trees.tree(200);
     let tree = TopSubtree::from_serialized(tokens.clone());
     let subtrees = tokens.iter().filter(|it| matches!(it, TokenTree::Subtree(_))).count();
-    assert_eq!(tree.nodes.len(), tokens.len());
-    assert_eq!(tree.spans.len(), tokens.len() + subtrees - 1);
+    assert_eq!(tree.nodes().len(), tokens.len());
+    assert_eq!(tree.spans().len(), tokens.len() + subtrees - 1);
+    let rows = 2 * tree.nodes().len() + 2 * tree.spans().len();
+    let tables = 3 * tree.wide().len() + 3 * tree.parts().len() + tree.symbol_ids().len();
+    assert_eq!(tree.block.len(), HEADER + rows + tables, "a block is its header and columns");
 }
 
 #[test]
 fn random_trees_match_the_old_encoding() {
     for seed in 0..300 {
-        let mut gen = Gen::new(seed, 1 + (seed % 12) as usize);
-        let tokens = gen.tree(1 + seed % 60);
-        check(&tokens, &mut gen.rng);
+        let mut trees = Gen::new(seed, 1 + (seed % 12) as usize);
+        let tokens = trees.tree(1 + seed % 60);
+        check(&tokens, &mut trees.rng);
     }
 }
 
 #[test]
 fn equality_and_hash_are_those_of_the_token_trees() {
-    let mut gen = Gen::new(77, 3);
+    let mut trees = Gen::new(77, 3);
     let mut cases: Vec<Vec<TokenTree>> = Vec::new();
     for _ in 0..30 {
-        let tokens = gen.tree(12);
+        let tokens = trees.tree(12);
         let mut changed = tokens.clone();
-        let at = gen.rng.below(changed.len() as u64) as usize;
+        let at = trees.rng.below(changed.len() as u64) as usize;
         match &mut changed[at] {
-            TokenTree::Leaf(Leaf::Punct(punct)) => punct.spacing = gen.spacing(),
-            TokenTree::Leaf(Leaf::Ident(ident)) => ident.sym = gen.symbol(),
-            TokenTree::Leaf(Leaf::Literal(literal)) => literal.span = gen.span(),
-            TokenTree::Subtree(subtree) => subtree.delimiter.close = gen.span(),
+            TokenTree::Leaf(Leaf::Punct(punct)) => punct.spacing = trees.spacing(),
+            TokenTree::Leaf(Leaf::Ident(ident)) => ident.sym = trees.symbol(),
+            TokenTree::Leaf(Leaf::Literal(literal)) => literal.span = trees.span(),
+            TokenTree::Subtree(subtree) => subtree.delimiter.close = trees.span(),
         }
         cases.push(tokens.clone());
         cases.push(tokens);
@@ -500,8 +503,8 @@ fn spans_too_wide_to_pack_and_more_parts_than_fit() {
         len: 70_000,
     });
     let tree = check(&tokens, &mut SplitMix64::new(5));
-    assert!(tree.parts.len() > NARROW_LIMIT as usize);
-    assert!(!tree.wide.is_empty());
+    assert!(tree.parts().len() > NARROW_LIMIT as usize);
+    assert!(!tree.wide().is_empty());
 }
 
 #[test]
@@ -524,12 +527,12 @@ fn a_literal_keeps_a_suffix_of_any_length_a_node_holds() {
 
 #[test]
 fn changing_a_tree_in_place_gives_the_tree_of_its_new_token_trees() {
-    let mut gen = Gen::new(11, 4);
+    let mut trees = Gen::new(11, 4);
     for _ in 0..40 {
-        let tokens = gen.tree(20);
+        let tokens = trees.tree(20);
 
         let mut tree = TopSubtree::from_serialized(tokens.clone());
-        let span = DelimSpan { open: gen.span(), close: gen.span() };
+        let span = DelimSpan { open: trees.span(), close: trees.span() };
         tree.set_top_subtree_delimiter_span(span);
         tree.set_top_subtree_delimiter_kind(DelimiterKind::Bracket);
         let mut expected = tokens.clone();
@@ -539,7 +542,7 @@ fn changing_a_tree_in_place_gives_the_tree_of_its_new_token_trees() {
         assert_eq!(flat(&tree), expected);
 
         if let Some(at) = tokens.iter().position(|it| matches!(it, TokenTree::Leaf(_))) {
-            let leaf = gen.leaf();
+            let leaf = trees.leaf();
             let mut tree = TopSubtree::from_serialized(tokens.clone());
             tree.set_token(at, leaf.clone());
             let mut expected = tokens.clone();
@@ -814,15 +817,16 @@ fn literals_display_as_they_did() {
     }
 }
 
-/// Walking a built tree allocates nothing, writing it allocates nothing when the buffer has room,
-/// and reading one allocates its columns and the checks' buffers only, however big it is.
+/// Walking a built tree allocates nothing, building one with a warm builder allocates its block
+/// only, writing it allocates nothing when the buffer has room, and reading one allocates its
+/// block and the checks' buffers only, however big it is.
 #[test]
 fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
     let small = lex(0, "fn f() {}");
     // With a literal longer than `NARROW_LIMIT`, so that a wide span is written and read too.
     let text = "fn f(a: u32) -> u32 { (a + 1) * [2][0] }\n".repeat(2000);
     let big = lex(0, &format!("{text} const S: &str = \"{}\";", "x".repeat(0x1_0000)));
-    assert!(!big.wide.is_empty());
+    assert!(!big.wide().is_empty());
     for tree in [&small, &big] {
         let view = tree.token_trees();
         view.for_each_token(|_, _| ());
@@ -835,6 +839,15 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
         blaze_alloc_count::assert_at_most(0, "a tree's token trees", || {
             view.iter_flat_tokens().count()
         });
+
+        // The first build leaves the builder's and the encoder's buffers at this size.
+        let delimiter = tree.top_subtree().delimiter;
+        let warm = TopSubtree::from_token_trees(delimiter, view);
+        let built = blaze_alloc_count::assert_at_most(1, "building a tree with a warm builder", || {
+            TopSubtree::from_token_trees(delimiter, view)
+        });
+        assert!(built == warm && built == *tree);
+        assert_eq!(built.block, tree.block);
 
         let mut bytes = Vec::new();
         tree.write_wire(&mut bytes);
@@ -853,9 +866,9 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
                 .map(|&(_, it)| it)
                 .ok_or_else(|| "a part the tree didn't have".to_owned())
         };
-        // Nodes, spans, wide spans, parts and symbols, the nodes' check's stack of open subtrees,
-        // and the set of parts the canonical check makes when there are more than it scans.
-        let (read, _) = blaze_alloc_count::assert_at_most(7, "reading a tree", || {
+        // The block, the nodes' check's stack of open subtrees, and the set of parts the
+        // canonical check makes when there are more than it scans.
+        let (read, _) = blaze_alloc_count::assert_at_most(3, "reading a tree", || {
             TopSubtree::read_wire(&bytes, &mut resolve)
         })
         .expect("a tree's own bytes");
@@ -863,3 +876,110 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
     }
 }
 
+proptest::proptest! {
+    /// A tree built, written to the wire and read back has the very block it was built with,
+    /// and its header describes that block.
+    #[test]
+    fn a_tree_read_from_the_wire_has_the_built_block(
+        seed in proptest::num::u64::ANY,
+        parts in 1usize..12,
+        budget in 0u64..80,
+    ) {
+        let mut trees = Gen::new(seed, parts);
+        let tree = TopSubtree::from_serialized(trees.tree(budget));
+        proptest::prop_assert_eq!(Layout::of_header(&tree.block), Some(tree.layout));
+        let mut bytes = Vec::new();
+        tree.write_wire(&mut bytes);
+        let parts = wire::parts_of(&tree);
+        let mut resolve = |part: WirePart| {
+            parts
+                .iter()
+                .find(|(it, _)| *it == part)
+                .map(|&(_, it)| it)
+                .ok_or_else(|| "a part the tree didn't have".to_owned())
+        };
+        let (read, used) =
+            TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes");
+        proptest::prop_assert_eq!(used, bytes.len());
+        proptest::prop_assert_eq!(&read.block, &tree.block);
+        proptest::prop_assert_eq!(read.layout, tree.layout);
+        proptest::prop_assert_eq!((read.top_open, read.top_close), (tree.top_open, tree.top_close));
+    }
+}
+
+
+/// Every kind, with 0, 1 and 255 `#`s for a raw one, comes back from its number.
+#[test]
+fn a_literal_kind_round_trips_through_its_code() {
+    for hashes in [0, 1, 255] {
+        for kind in [
+            LitKind::Byte,
+            LitKind::Char,
+            LitKind::Integer,
+            LitKind::Float,
+            LitKind::Str,
+            LitKind::StrRaw(hashes),
+            LitKind::ByteStr,
+            LitKind::ByteStrRaw(hashes),
+            LitKind::CStr,
+            LitKind::CStrRaw(hashes),
+            LitKind::Err(()),
+        ] {
+            let (code, kept) = kind.code();
+            assert_eq!(LitKind::from_code(code, kept), Some(kind), "{kind:?}");
+        }
+    }
+    for code in 11..=255 {
+        for hashes in [0, 1, 255] {
+            assert_eq!(LitKind::from_code(code, hashes), None, "code {code}");
+        }
+    }
+}
+
+/// The numbering as `Node::literal` and `Node::lit_kind` wrote it out before they shared
+/// [`LitKind::code`]: the reference the shared one is held to.
+fn old_code(kind: LitKind) -> (u8, u8) {
+    match kind {
+        LitKind::Byte => (0, 0),
+        LitKind::Char => (1, 0),
+        LitKind::Integer => (2, 0),
+        LitKind::Float => (3, 0),
+        LitKind::Str => (4, 0),
+        LitKind::StrRaw(hashes) => (5, hashes),
+        LitKind::ByteStr => (6, 0),
+        LitKind::ByteStrRaw(hashes) => (7, hashes),
+        LitKind::CStr => (8, 0),
+        LitKind::CStrRaw(hashes) => (9, hashes),
+        LitKind::Err(()) => (10, 0),
+    }
+}
+
+fn old_lit_kind(code: u8, hashes: u8) -> LitKind {
+    match code {
+        0 => LitKind::Byte,
+        1 => LitKind::Char,
+        2 => LitKind::Integer,
+        3 => LitKind::Float,
+        4 => LitKind::Str,
+        5 => LitKind::StrRaw(hashes),
+        6 => LitKind::ByteStr,
+        7 => LitKind::ByteStrRaw(hashes),
+        8 => LitKind::CStr,
+        9 => LitKind::CStrRaw(hashes),
+        _ => LitKind::Err(()),
+    }
+}
+
+proptest::proptest! {
+    /// `code`, and a node's literal kind read back, are the old `match`es for any number and
+    /// count of `#`s.
+    #[test]
+    fn literal_codes_are_the_old_ones(code in 0u8..16, hashes in proptest::num::u8::ANY) {
+        let kind = old_lit_kind(code, hashes);
+        proptest::prop_assert_eq!(kind.code(), old_code(kind));
+        let node = Node::literal(kind, 0, 0);
+        proptest::prop_assert_eq!(node.lit_kind(), kind);
+        let head = LITERAL | u32::from(code) << 2 | u32::from(hashes) << 6;
+        proptest::prop_assert_eq!(Node { head, data: 0 }.lit_kind(), old_lit_kind(code, hashes));
+    }
+}

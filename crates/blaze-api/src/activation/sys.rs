@@ -16,6 +16,7 @@ pub(super) unsafe fn systemd(want: &str) -> Result<OwnedFd, ActivationError> {
     for (value, name) in read.iter_mut().zip(VARIABLES) {
         if let Some(raw) = std::env::var_os(name) {
             let text = raw.into_string().map_err(|it| {
+                // alloc: error path, a daemon that cannot start.
                 ActivationError::new(format!("{name}={:?} is not UTF-8", it.to_string_lossy()))
             })?;
             *value = Some(text);
@@ -45,12 +46,14 @@ unsafe extern "C" {
 #[cfg(target_os = "macos")]
 pub(super) fn launchd(want: &str) -> Result<OwnedFd, ActivationError> {
     let name = std::ffi::CString::new(want)
+        // alloc: error path, a daemon that cannot start.
         .map_err(|_| ActivationError::new(format!("the socket name {want:?} holds a NUL")))?;
     let mut fds: *mut libc::c_int = std::ptr::null_mut();
     let mut count: libc::size_t = 0;
     // SAFETY: `name` is NUL-terminated and outlives the call; `fds` and `count` are valid for
     // writes.
     let code = unsafe { launch_activate_socket(name.as_ptr(), &raw mut fds, &raw mut count) };
+    // alloc: launchd's descriptors, once per daemon start.
     let mut owned = Vec::new();
     let mut failed = None;
     if code == 0 && !fds.is_null() {
@@ -82,6 +85,7 @@ pub(super) fn launchd(want: &str) -> Result<OwnedFd, ActivationError> {
 
 #[cfg(not(target_os = "macos"))]
 pub(super) fn launchd(_: &str) -> Result<OwnedFd, ActivationError> {
+    // alloc: error path, a daemon that cannot start.
     Err(ActivationError::new("launchd is macOS's, and this is not macOS".to_owned()))
 }
 
@@ -97,6 +101,7 @@ pub(super) fn uid() -> u32 {
 /// `fd` was passed to this process to own and nothing else owns it.
 unsafe fn adopt(fd: RawFd, by: Manager) -> Result<OwnedFd, ActivationError> {
     let failed = |what: &str| {
+        // alloc: error path, a daemon that cannot start.
         ActivationError::new(format!("fd {fd}, which {by} passed: {what}: {}", std::io::Error::last_os_error()))
     };
     // SAFETY: no pointers; an fd that is not open fails with EBADF.

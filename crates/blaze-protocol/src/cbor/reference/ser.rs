@@ -6,6 +6,7 @@ use super::{ARRAY, BYTES, Error, FALSE, MAP, NEGATIVE, NULL, TEXT, TRUE, UNSIGNE
 
 /// The deterministic encoding of `value`.
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
+    // alloc: test and fuzz reference only.
     let mut out = Vec::new();
     value.serialize(Encoder(&mut out))?;
     Ok(out)
@@ -316,6 +317,7 @@ pub(crate) struct Map<'a> {
 
 impl<'a> Map<'a> {
     fn new(out: &'a mut Vec<u8>) -> Map<'a> {
+        // alloc: test and fuzz reference only.
         Map { out, entries: Vec::new(), keys: Vec::new() }
     }
 
@@ -334,6 +336,7 @@ impl<'a> Map<'a> {
         let Map { out, entries, keys } = self;
         let ends = keys.iter().skip(1).map(|it| it.0).chain([entries.len()]);
         let mut spans: Vec<(usize, usize, usize)> =
+            // alloc: test and fuzz reference only.
             keys.iter().zip(ends).map(|(&(start, key), end)| (start, key, end)).collect();
         let key = |&(start, key_end, _): &(usize, usize, usize)| &entries[start..key_end];
         spans.sort_unstable_by(|a, b| key(a).cmp(key(b)));

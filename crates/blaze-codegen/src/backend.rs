@@ -103,20 +103,27 @@ pub trait Frontend: Sync {
     ) -> Result<DescribedStatic<Self::Instance, Self::Static>, CodegenError>;
 }
 
-/// The canonical bytes of a prepared function: its IR with every reference by its place in
-/// [`Described::refs`] and every setting that changes its code. Two with equal bytes compile
+/// What a prepared function compiles to, up to what fills its places: the content ID of its
+/// canonical bytes (its IR with every reference by its place in [`Described::refs`] and every
+/// setting that changes its code), its unit's settings and architecture. Two with one compile
 /// to one [`crate::template::Template`].
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct Shape(pub Vec<u8>);
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Shape(ContentId);
 
 pub const SHAPE_DOMAIN: &str = "blaze v2 shape 1";
 
 impl Shape {
-    pub fn key(&self, unit: &Unit) -> ContentId {
+    /// The shape of `bytes`, the canonical bytes of a prepared function of `unit`: hashed as
+    /// given, kept nowhere.
+    pub fn of(unit: &Unit, bytes: &[u8]) -> Shape {
         let mut hasher = blaze_ids::Hasher::new(SHAPE_DOMAIN);
         hasher.id(&unit.instance.settings.0);
-        hasher.update(&[crate::content::arch_tag(unit.arch)]).part(&self.0);
-        hasher.finish()
+        hasher.update(&[crate::content::arch_tag(unit.arch)]).part(bytes);
+        Shape(hasher.finish())
+    }
+
+    pub fn key(&self) -> ContentId {
+        self.0
     }
 }
 
@@ -155,12 +162,15 @@ impl<E> Copy for Import<'_, E> {}
 /// The references of a release compile: its own, then each imported function's, in
 /// [`Imports::imported`]'s order, each target once. The places of its template.
 pub fn release_refs(own: &Refs, imported: &[&Refs]) -> Vec<crate::Target> {
-    let mut seen: std::collections::HashSet<ContentId> =
-        own.iter().map(crate::content::target_id).collect();
+    let mut seen: rustc_hash::FxHashSet<ContentId> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(own.len(), Default::default());
+    seen.extend(own.iter().map(crate::content::target_id));
+    // alloc: the release unit's references, kept by its job
     let mut refs = own.to_vec();
     for import in imported {
         for target in import.iter() {
             if seen.insert(crate::content::target_id(target)) {
+                // clone: as `refs`, once per target an import adds
                 refs.push(target.clone());
             }
         }

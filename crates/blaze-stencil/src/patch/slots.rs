@@ -16,6 +16,7 @@
 //! - **Area.** The glue's two scratch slots, the patcher's relay slots when some slot is past
 //!   [`crate::arch::Glue::NEAR`], the value slots, then the stack slots at their alignment.
 
+use blaze_mem::frame::Frame;
 use cranelift_codegen::ir::{self, BlockArg};
 
 use super::{Kind, NONE, Places, Plan, RELAYS, SCRATCH, scan::{each_use, reset}};
@@ -32,7 +33,7 @@ pub(super) const GLOBAL: u32 = u32::MAX;
 const MAX_VALUES: usize = 1 << 27;
 
 pub(super) fn run(
-    plan: &mut Plan,
+    plan: &mut Plan<'_>,
     func: &ir::Function,
     library: &Reader<'_>,
     near: [u32; 2],
@@ -130,7 +131,7 @@ fn too_big() -> Error {
 
 /// Whether `inst`'s result `k` gets a slot: a stencil's that it writes to a slot and something
 /// reads, or a glue instruction's that something reads.
-fn wants(plan: &Plan, inst: ir::Inst, k: usize, result: ir::Value) -> bool {
+fn wants(plan: &Plan<'_>, inst: ir::Inst, k: usize, result: ir::Value) -> bool {
     let sel = &plan.sels[inst.as_u32() as usize];
     if plan.uses[result.as_u32() as usize] == 0 {
         return false;
@@ -149,7 +150,7 @@ pub(super) fn bytes_of(func: &ir::Function, value: ir::Value) -> u8 {
 
 /// A new slot of `bytes` at the top of the value slots. A 16-byte slot after an odd number of
 /// 8-byte ones leaves an 8-byte gap, which the next 8-byte slot fills.
-fn bump(top: &mut u32, bytes: u8, free: &mut [Vec<u32>; 2]) -> u32 {
+fn bump(top: &mut u32, bytes: u8, free: &mut [Vec<u32, &Frame>; 2]) -> u32 {
     if bytes == 16 && *top % 16 != 0 {
         free[0].push(*top);
         *top += 8;
@@ -160,7 +161,7 @@ fn bump(top: &mut u32, bytes: u8, free: &mut [Vec<u32>; 2]) -> u32 {
 }
 
 /// A free local slot of `bytes`, or a new one.
-fn take(top: &mut u32, bytes: u8, free: &mut [Vec<u32>; 2]) -> u32 {
+fn take(top: &mut u32, bytes: u8, free: &mut [Vec<u32, &Frame>; 2]) -> u32 {
     match free[usize::from(bytes == 16)].pop() {
         Some(at) => at,
         None => bump(top, bytes, free),
@@ -168,7 +169,7 @@ fn take(top: &mut u32, bytes: u8, free: &mut [Vec<u32>; 2]) -> u32 {
 }
 
 /// Frees `value`'s slot if `at` is its last use.
-fn release(plan: &mut Plan, func: &ir::Function, value: ir::Value, at: u32) {
+fn release(plan: &mut Plan<'_>, func: &ir::Function, value: ir::Value, at: u32) {
     let v = value.as_u32() as usize;
     if plan.last[v] != at || plan.released[v] {
         return;
@@ -184,7 +185,7 @@ fn release(plan: &mut Plan, func: &ir::Function, value: ir::Value, at: u32) {
 /// `try_call` a 16-byte slot for each `TryCallRet` and `TryCallExn` an edge reads. The range of
 /// [`Plan::pseudo`] to free after the instruction: a `try_call`'s, whose values only its edges
 /// read.
-fn places(plan: &mut Plan, func: &ir::Function, inst: ir::Inst, top: &mut u32) -> std::ops::Range<u32> {
+fn places(plan: &mut Plan<'_>, func: &ir::Function, inst: ir::Inst, top: &mut u32) -> std::ops::Range<u32> {
     let first = plan.pseudo.len() as u32;
     let data = &func.dfg.insts[inst];
     let Some(table) = data.exception_table() else {
@@ -232,7 +233,7 @@ fn places(plan: &mut Plan, func: &ir::Function, inst: ir::Inst, top: &mut u32) -
 }
 
 /// Keeps results in the accumulators, block by block.
-fn accumulators(plan: &mut Plan, func: &ir::Function, library: &Reader<'_>) {
+fn accumulators(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>) {
     for block in func.layout.blocks() {
         let mut prev = None;
         for inst in func.layout.block_insts(block) {
@@ -251,7 +252,7 @@ fn accumulators(plan: &mut Plan, func: &ir::Function, library: &Reader<'_>) {
 }
 
 /// Passes `from`'s result 0 to `to` in the accumulator, if both shapes are in the library.
-fn chain(plan: &mut Plan, func: &ir::Function, library: &Reader<'_>, from: ir::Inst, to: ir::Inst) {
+fn chain(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, from: ir::Inst, to: ir::Inst) {
     let Some(&value) = func.dfg.inst_results(from).first() else { return };
     let (f, t) = (from.as_u32() as usize, to.as_u32() as usize);
     let producer = plan.sels[f].shape;

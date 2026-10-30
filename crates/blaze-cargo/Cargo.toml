@@ -41,7 +41,6 @@ cfg.workspace = true
 cargo-platform = "0.3.3"
 toolchain.workspace = true
 intern.workspace = true
-memmap2 = "0.9"
 object = { version = "0.37", default-features = false, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 # Writes an rlib again whose objects had statics made linkable (`weaken::shared`): rustc's own
 # archive writer.
@@ -65,8 +64,11 @@ blaze-lints.workspace = true
 blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-new.workspace = true
+blaze-expand.workspace = true
 blaze-graph.workspace = true
+blaze-mem.workspace = true
 blaze-protocol.workspace = true
+proc-macro-api.workspace = true
 blaze-tree.workspace = true
 blaze-ui.workspace = true
 blaze-web.workspace = true

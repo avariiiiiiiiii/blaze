@@ -13,11 +13,19 @@
 //! parsed one at a time as they are walked into (`syntax::SourceFile::parse_outline`).
 //! `blaze check` of the workspace checks its own crates, which are never dependencies, fully.
 //!
-//! An image is read in place: its parts are slices of the one buffer, each found by its tag
-//! with no copy, and a signature is decoded when its item is asked for, alone.
+//! An image is read in place: its parts are slices of the one buffer the store holds, each
+//! found by its tag with no copy, and a signature is decoded when its item is asked for, alone.
+//!
+//! What a crate reads that is known only once it is resolved (the process variables its
+//! `env!`s read, the files and variables its proc-macro expansions read) is its [`reads`]: a
+//! crate with any is filed under its key and the values of those reads now, the way a run of
+//! user code is (`blaze_usercode::index`), so an image is used only while what it read is
+//! unchanged. The key has no absolute path in it ([`key`]), so a checkout at another path, or
+//! another machine through the global cache ([`ReadThrough`]), finds the same image.
 
 mod image;
 mod key;
+mod reads;
 mod serve;
 pub(crate) mod signatures;
 #[cfg(test)]
@@ -29,18 +37,19 @@ use base_db::{Db, Crate};
 use rustc_hash::FxHashMap;
 
 pub use crate::deps::{
-    image::{IMAGE_SCHEMA, ImageError, ImageRef, Part, PartBytes, write_image},
+    image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
     key::{KEY_DOMAIN, PRODUCER, eligible, keys},
-    serve::{ImageStore, Refused, Served, Stored, serve, store},
+    reads::{READS_DOMAIN, Reads, SLOTS},
+    serve::{ImageStore, ReadThrough, Refused, Served, Stored, serve, store},
 };
 pub use crate::nameres::frozen::Mode;
 
-/// An image a database was given: the buffer, which [`serve`] opened and checked against its
-/// key, where its parts are, and what is done with it.
+/// An image a database was given: the buffer, which [`serve`] opened and checked against the
+/// key it is filed under, where its parts are, and what is done with it.
 #[derive(Clone)]
 pub struct Image {
     key: base_db::ContentId,
-    bytes: Arc<blaze_format::Aligned>,
+    bytes: ImageBuf,
     parts: [std::ops::Range<usize>; Part::ALL.len()],
     mode: Mode,
 }
@@ -50,14 +59,16 @@ impl Image {
     /// one signature pays no check of the image.
     #[inline]
     pub fn view(&self) -> ImageRef<'_> {
-        ImageRef::at(&self.bytes, &self.parts)
+        ImageRef::at(self.bytes.bytes(), &self.parts)
     }
 
-    /// The buffer the image is read from: what a value read from it in place borrows.
-    pub fn bytes(&self) -> &Arc<blaze_format::Aligned> {
+    /// What holds the bytes the image is read from: what a value read from it in place borrows.
+    pub fn bytes(&self) -> &ImageBuf {
         &self.bytes
     }
 
+    /// The key the image is filed under: the crate's key ([`keys`]) for a crate with no
+    /// [`Reads`], else that and the values its reads had.
     pub fn key(&self) -> base_db::ContentId {
         self.key
     }
@@ -88,7 +99,7 @@ impl std::fmt::Debug for Image {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Image")
             .field("key", &self.key)
-            .field("len", &self.bytes.len())
+            .field("len", &self.bytes.bytes().len())
             .field("mode", &self.mode)
             .finish()
     }

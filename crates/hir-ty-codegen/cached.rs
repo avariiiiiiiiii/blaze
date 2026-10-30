@@ -24,7 +24,7 @@ use serde_derive::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConstBlob, DataIdentity,
+    ConstBlob, DataIdentity, SymbolResolver,
     debuginfo::{FunctionDebug, LineRow, SlotPlaces, TypeSet},
     fragment::Code,
     store::{KEY, Store},
@@ -492,8 +492,11 @@ impl Entry {
         datas && self.code.sound(|namespace| if namespace == 0 { funcs } else { self.datas.len() })
     }
 
-    /// Whether the program has everything of rustc's that the entry was linked against.
-    pub(super) fn links(&self, defines: &dyn Fn(&str) -> bool) -> bool {
+    /// Whether the program has everything of rustc's that the entry was linked against: what
+    /// `symbols` provides and the executable has.
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
+    pub(super) fn links(&self, symbols: &dyn SymbolResolver) -> bool {
+        let defines = |symbol: &str| symbols.provides(symbol) && symbols.linked(symbol);
         let funcs = self.funcs.iter().all(|it| match &it.target {
             CachedTarget::Import { symbol, checked } => !checked || defines(symbol),
             CachedTarget::Copy { symbol, .. } => defines(symbol),
@@ -962,14 +965,15 @@ impl Entries {
     }
 
     /// Whether there is an entry for `name` and for everything it calls, and what they import
-    /// is in the program, as `defines` tells.
-    pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str) -> bool) -> bool {
+    /// is in the program, as [`Entry::links`] tells.
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
+    pub(super) fn usable(&self, name: &str, symbols: &dyn SymbolResolver) -> bool {
         let settled = |name: &str| self.usable.shard(name).get(name).copied();
         if let Some(usable) = settled(name) {
             return usable;
         }
         let name: Arc<str> = Arc::from(name);
-        let Some(entry) = self.get(&name).filter(|it| it.links(defines)) else {
+        let Some(entry) = self.get(&name).filter(|it| it.links(symbols)) else {
             self.settle(name, false);
             return false;
         };
@@ -1005,7 +1009,7 @@ impl Entries {
             let found = match settled(callee) {
                 Some(true) => continue,
                 Some(false) => None,
-                None => self.get(callee).filter(|it| it.links(defines)),
+                None => self.get(callee).filter(|it| it.links(symbols)),
             };
             let callee: Arc<str> = Arc::from(callee);
             let Some(entry) = found else {
@@ -1343,7 +1347,7 @@ mod tests {
             .map(|at| Scope { parent: at.checked_sub(1), ranges: vec![(0, 8)] })
             .collect();
         chain.variables[0].scope = Some(39_999);
-        let isa = Target::selected().and_then(|it| it.isa("backtracking", false)).unwrap();
+        let isa = Target::selected().and_then(|it| it.isa("backtracking", false, cranelift_codegen::settings::OptLevel::None)).unwrap();
         // Only ELF and Mach-O have the tables.
         let Some(mut context) = DebugContext::new(&*isa, "/", true, None, false) else { return };
         for (at, debug) in [deep.debug.unwrap(), ring, chain].iter().enumerate() {

@@ -16,10 +16,13 @@ pub(crate) fn read<'a, R: BufRead + ?Sized>(
         bytes.clear();
         let ended = read_frame(inp, b'\n', LONGEST, &mut bytes)?;
         if !ended && !bytes.is_empty() {
+            // alloc: error path, naming the length.
             return Err(invalid(format!("a last line of {} bytes with no newline", bytes.len())));
         }
         bytes.pop();
+        // alloc: none, the reused buffer's bytes become the `String`.
         *buf = String::from_utf8(bytes)
+            // alloc: error path.
             .map_err(|e| invalid(format!("a line that is not UTF-8: {}", e.utf8_error())))?;
 
         if buf.is_empty() {

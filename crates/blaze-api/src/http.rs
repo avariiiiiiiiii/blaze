@@ -13,8 +13,13 @@ use std::{fmt, io};
 const LONGEST_LINE: usize = 8 << 10;
 /// The most header lines of a head, and of a chunked body's trailers.
 const MOST_HEADERS: usize = 100;
+/// What [`RequestParser::read_from`] reads at once while it does not know how much is coming.
+const READ: usize = 16 << 10;
+/// The most room [`RequestParser::reset`] keeps for the next connection: one large body is
+/// not held by every handler from then on.
+const KEPT: usize = 1 << 20;
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct HttpRequest {
     pub method: String,
     pub path: String,
@@ -29,7 +34,7 @@ impl HttpRequest {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -69,14 +74,19 @@ impl<'a> HttpRequestRef<'a> {
         pairs(self.lines)
     }
 
-    // alloc: the owned request, for a caller that keeps it past the parser's next call.
+    /// The owned request, for a caller that keeps it past the parser's next call.
     pub fn to_request(&self) -> HttpRequest {
-        HttpRequest {
-            method: self.method.to_owned(),
-            path: self.path.to_owned(),
-            headers: self.headers().map(|(name, value)| (name.to_owned(), value.to_owned())).collect(),
-            body: self.body.to_vec(),
-        }
+        let (method, path, headers) = self.owned_head();
+        // alloc: the owned request's body, as above.
+        HttpRequest { method, path, headers, body: self.body.to_vec() }
+    }
+
+    /// Its method, path and headers, owned.
+    fn owned_head(&self) -> (String, String, Vec<(String, String)>) {
+        // alloc: an owned request, for a caller that keeps it past the parser's next call.
+        let owned = |(name, value): (&str, &str)| (name.to_owned(), value.to_owned());
+        // alloc: as above.
+        (self.method.to_owned(), self.path.to_owned(), self.headers().map(owned).collect())
     }
 }
 
@@ -89,6 +99,7 @@ fn pairs(lines: &str) -> impl Iterator<Item = (&str, &str)> {
 }
 
 /// Bytes refused: the status a server answers them with, and what was wrong.
+// clone: error path; a parser out of step gives its error again on every later call.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HttpError {
     pub status: u16,
@@ -114,7 +125,10 @@ impl std::error::Error for HttpError {}
 #[derive(Debug)]
 pub struct RequestParser {
     most_body: usize,
+    /// The connection's bytes are `bytes[..end]`. What is past `end` is room a read fills,
+    /// zeroed once, when it grew.
     bytes: Vec<u8>,
+    end: usize,
     state: RequestState,
     /// A chunked body, decoded; kept from request to request.
     chunked: Vec<u8>,
@@ -148,20 +162,64 @@ struct Whole {
 
 impl RequestParser {
     pub fn new(most_body: usize) -> RequestParser {
-        RequestParser {
-            most_body,
-            bytes: Vec::new(),
-            state: RequestState::Head(HeadScan::default()),
-            chunked: Vec::new(),
-            broken: None,
-        }
+        // alloc: none until a push; the room then grows once and `reset` keeps it.
+        let (bytes, chunked) = (Vec::new(), Vec::new());
+        let state = RequestState::Head(HeadScan::default());
+        RequestParser { most_body, bytes, end: 0, state, chunked, broken: None }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
-        if self.broken.is_none() {
-            self.release();
-            self.bytes.extend_from_slice(bytes);
+        if self.broken.is_some() {
+            return;
         }
+        self.release();
+        let room = (self.bytes.len() - self.end).min(bytes.len());
+        let (here, rest) = bytes.split_at(room);
+        self.bytes[self.end..self.end + room].copy_from_slice(here);
+        self.bytes.extend_from_slice(rest);
+        self.end += bytes.len();
+    }
+
+    /// One read from `from` into the room after what it holds: the rest of a body whose length
+    /// is known, else up to 16 KiB, or all the room it has if that is more. `Ok(0)` is the end
+    /// of the stream. Once the stream is out of step ([`RequestParser::next`]'s error) it
+    /// reads nothing and gives `Ok(0)`.
+    pub fn read_from(&mut self, from: &mut impl io::Read) -> io::Result<usize> {
+        if self.broken.is_some() {
+            return Ok(0);
+        }
+        self.release();
+        let rest = match self.state {
+            RequestState::Body { end, body: BodyRead::Length(len), .. } => {
+                (end + len).saturating_sub(self.end)
+            }
+            _ => 0,
+        };
+        let want = if rest > 0 { rest } else { READ };
+        if self.bytes.len() < self.end + want {
+            // alloc: room grows to the largest request a connection sends, kept by `reset`.
+            self.bytes.resize(self.end + want, 0);
+        }
+        let got = loop {
+            match from.read(&mut self.bytes[self.end..]) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                got => break got?,
+            }
+        };
+        self.end += got;
+        Ok(got)
+    }
+
+    /// Back to the start of a connection, with the room it reads into kept (up to 1 MiB), so a
+    /// handler keeps one parser for every connection it serves.
+    pub fn reset(&mut self) {
+        if self.bytes.len() > KEPT {
+            drop(std::mem::take(&mut self.bytes));
+        }
+        self.end = 0;
+        self.state = RequestState::Head(HeadScan::default());
+        self.chunked.clear();
+        self.broken = None;
     }
 
     /// [`RequestParser::push`] of a buffer that is the caller's no more: kept as it is,
@@ -171,9 +229,12 @@ impl RequestParser {
             return;
         }
         self.release();
-        match self.bytes.is_empty() {
-            true => self.bytes = bytes,
-            false => self.bytes.extend_from_slice(&bytes),
+        match self.end == 0 {
+            true => {
+                self.bytes = bytes;
+                self.end = self.bytes.len();
+            }
+            false => self.push(&bytes),
         }
     }
 
@@ -181,17 +242,15 @@ impl RequestParser {
     /// After an error every call gives it again: the connection is not in step any more.
     pub fn next(&mut self) -> Result<Option<HttpRequest>, HttpError> {
         let Some(whole) = self.whole()? else { return Ok(None) };
-        // alloc: the owned request (the webhook's); the API server reads in place (`next_ref`).
-        let (method, path, headers) = {
-            let head = self.lend(whole);
-            let headers = head.headers().map(|(name, value)| (name.to_owned(), value.to_owned()));
-            (head.method.to_owned(), head.path.to_owned(), headers.collect())
-        };
+        // The owned request (the webhook's); the API server reads in place (`next_ref`).
+        let (method, path, headers) = self.lend(whole).owned_head();
         let body = match whole.body {
             Some((from, to)) => {
+                self.bytes.truncate(self.end);
                 let rest = self.bytes.split_off(to);
                 let mut body = std::mem::replace(&mut self.bytes, rest);
                 body.drain(..from);
+                self.end = self.bytes.len();
                 body
             }
             None => {
@@ -214,26 +273,30 @@ impl RequestParser {
     /// How many bytes it holds: of the request it is reading and of any after it.
     pub(crate) fn held(&self) -> usize {
         match self.state {
-            RequestState::Lent { used } => self.bytes.len() - used,
-            _ => self.bytes.len(),
+            RequestState::Lent { used } => self.end - used,
+            _ => self.end,
         }
     }
 
     fn whole(&mut self) -> Result<Option<Whole>, HttpError> {
         if let Some(error) = &self.broken {
+            // clone: error path, a connection out of step.
             return Err(error.clone());
         }
         self.release();
         self.step().inspect_err(|error| {
+            // clone: error path, once per connection out of step.
             self.broken = Some(error.clone());
-            self.bytes = Vec::new();
+            drop(std::mem::take(&mut self.bytes));
+            self.end = 0;
         })
     }
 
     /// Drops the request lent out last.
     fn release(&mut self) {
         if let RequestState::Lent { used } = self.state {
-            self.bytes.drain(..used);
+            self.bytes.copy_within(used..self.end, 0);
+            self.end -= used;
             self.chunked.clear();
             self.state = RequestState::Head(HeadScan::default());
         }
@@ -253,7 +316,7 @@ impl RequestParser {
             match &mut self.state {
                 RequestState::Lent { .. } => unreachable!("a lent request is released first"),
                 RequestState::Head(scan) => {
-                    let Some(end) = scan.scan(&self.bytes)? else { return Ok(None) };
+                    let Some(end) = scan.scan(&self.bytes[..self.end])? else { return Ok(None) };
                     let start = scan.start;
                     let head = check_head(&self.bytes[start..end])?;
                     let body = match framing(pairs(head.lines), self.most_body)? {
@@ -268,7 +331,7 @@ impl RequestParser {
                 }
                 RequestState::Body { start, end, body: BodyRead::Length(len) } => {
                     let (start, end, len) = (*start, *end, *len);
-                    if self.bytes.len() - end < len {
+                    if self.end - end < len {
                         return Ok(None);
                     }
                     self.state = RequestState::Lent { used: end + len };
@@ -277,7 +340,8 @@ impl RequestParser {
                 RequestState::Body { start, end, body: BodyRead::Chunked { chunks, at } } => {
                     let mut decoded = self.chunked.len();
                     let most = self.most_body;
-                    if !chunks.decode(&self.bytes, at, &mut self.chunked, &mut decoded, most)? {
+                    let bytes = &self.bytes[..self.end];
+                    if !chunks.decode(bytes, at, &mut self.chunked, &mut decoded, most)? {
                         return Ok(None);
                     }
                     let (whole, used) = (Whole { start: *start, end: *end, body: None }, *at);
@@ -316,21 +380,15 @@ enum ResponseBody {
 
 impl ResponseParser {
     pub fn new(most_body: usize) -> ResponseParser {
-        ResponseParser {
-            most_body,
-            bytes: Vec::new(),
-            scan: HeadScan::default(),
-            head: None,
-            body: ResponseBody::Done,
-            out: Vec::new(),
-            decoded: 0,
-            ended: false,
-            broken: None,
-        }
+        // alloc: none until a push; once per response, a client's.
+        let (bytes, out) = (Vec::new(), Vec::new());
+        let (scan, body) = (HeadScan::default(), ResponseBody::Done);
+        ResponseParser { most_body, bytes, scan, head: None, body, out, decoded: 0, ended: false, broken: None }
     }
 
     pub fn push(&mut self, bytes: &[u8]) -> Result<(), HttpError> {
         if let Some(error) = &self.broken {
+            // clone: error path, a response out of step.
             return Err(error.clone());
         }
         match bytes.is_empty() {
@@ -338,13 +396,19 @@ impl ResponseParser {
             false => self.bytes.extend_from_slice(bytes),
         }
         self.step().inspect_err(|error| {
+            // clone: error path, once per response out of step.
             self.broken = Some(error.clone());
-            self.bytes = Vec::new();
+            drop(std::mem::take(&mut self.bytes));
         })
     }
 
     pub fn head(&self) -> Option<(u16, &[(String, String)])> {
         self.head.as_ref().map(|(status, headers)| (*status, headers.as_slice()))
+    }
+
+    /// The head, moved out for a caller done with the parser.
+    fn take_head(&mut self) -> Option<(u16, Vec<(String, String)>)> {
+        self.head.take()
     }
 
     /// Body bytes decoded since the last call.
@@ -423,6 +487,7 @@ impl ResponseParser {
             ResponseBody::UntilEnd => {
                 self.decoded += self.bytes.len();
                 if self.decoded > self.most_body {
+                    // alloc: error path, a body past the bound.
                     let said = format!("a body of more than {} bytes", self.most_body);
                     return Err(HttpError::new(413, said));
                 }
@@ -540,6 +605,7 @@ fn check_head(head: &[u8]) -> Result<Head<'_>, HttpError> {
     match version {
         "HTTP/1.1" | "HTTP/1.0" => {}
         _ if version.starts_with("HTTP/") => {
+            // alloc: error path, another HTTP version.
             let said = format!("{version}; this speaks HTTP/1.1");
             return Err(HttpError::new(505, said));
         }
@@ -569,6 +635,7 @@ fn response_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>), HttpError>
     }
     let status = status.parse().map_err(|_| bad())?;
     let headers = header_lines(lines)
+        // alloc: the head `ResponseParser::head` hands out, once per response, a client's.
         .map(|line| header_line(line).map(|(name, value)| (name.to_owned(), value.to_owned())))
         .collect::<Result<_, _>>()?;
     Ok((status, headers))
@@ -617,6 +684,7 @@ fn framing<'a>(
                 return Err(HttpError::new(400, "more than one Transfer-Encoding"));
             }
             if !value.eq_ignore_ascii_case("chunked") {
+                // alloc: error path, another transfer coding.
                 let said = format!("the transfer coding {value:?}; only chunked is read");
                 return Err(HttpError::new(501, said));
             }
@@ -630,6 +698,7 @@ fn framing<'a>(
         (Some(len), false) => match usize::try_from(len).ok().filter(|&len| len <= most_body) {
             Some(len) => Ok(Framing::Length(len)),
             None => {
+                // alloc: error path, a body past the bound.
                 let said = format!("a body of {len} bytes, more than {most_body}");
                 Err(HttpError::new(413, said))
             }
@@ -677,6 +746,7 @@ impl Chunks {
                         {
                             Some(size) => Chunks::Data(size),
                             None => {
+                                // alloc: error path, a chunked body past the bound.
                                 let said = format!("a chunked body of more than {most} bytes");
                                 return Err(HttpError::new(413, said));
                             }
@@ -820,20 +890,36 @@ fn status_line(status: u16, digits: &mut [u8; 20]) -> [&str; 4] {
     ["HTTP/1.1 ", decimal(usize::from(status), digits), " ", reason(status)]
 }
 
-/// A whole response, with its Content-Length.
+/// The most bytes of a head that are not its headers: the longest start line, the length or
+/// coding header, CRLFs.
+const HEAD_FRAME: usize = 96;
+
+/// What `headers` add to a head.
+fn headers_len(headers: &[(&str, &str)]) -> usize {
+    headers.iter().map(|(name, value)| name.len() + value.len() + 4).sum()
+}
+
+/// A whole response, with its Content-Length, in one allocation of its size.
 pub fn response(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
+    // alloc: the response handed out; `response_into` writes onto a buffer the caller keeps.
+    let mut out = Vec::with_capacity(HEAD_FRAME + headers_len(headers) + body.len());
+    response_into(&mut out, status, headers, body);
+    out
+}
+
+/// [`response`] onto the end of `out`.
+pub fn response_into(out: &mut Vec<u8>, status: u16, headers: &[(&str, &str)], body: &[u8]) {
     let (mut digits, mut len) = ([0; 20], [0; 20]);
     let start = status_line(status, &mut digits);
     let length = ("Content-Length", decimal(body.len(), &mut len));
-    head_into(&mut out, &start, None, headers, length);
+    head_into(out, &start, None, headers, length);
     out.extend_from_slice(body);
-    out
 }
 
 /// The head of a response whose body comes in [`chunk`]s, ended by [`last_chunk`].
 pub fn chunked(status: u16, headers: &[(&str, &str)]) -> Vec<u8> {
-    let mut out = Vec::new();
+    // alloc: the head handed out; `chunked_into` writes onto a buffer the caller keeps.
+    let mut out = Vec::with_capacity(HEAD_FRAME + headers_len(headers));
     chunked_into(&mut out, status, headers);
     out
 }
@@ -847,6 +933,7 @@ pub fn chunked_into(out: &mut Vec<u8>, status: u16, headers: &[(&str, &str)]) {
 
 /// `bytes` as one chunk; no bytes give no output, never the last chunk.
 pub fn chunk(bytes: &[u8]) -> Vec<u8> {
+    // alloc: the chunk handed out (sized by `chunk_into`, once); it writes onto a kept buffer.
     let mut out = Vec::new();
     chunk_into(&mut out, bytes);
     out
@@ -872,10 +959,11 @@ pub fn chunk_into(out: &mut Vec<u8>, bytes: &[u8]) {
 pub const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
 
 pub fn last_chunk() -> Vec<u8> {
+    // alloc: the chunk handed out; `LAST_CHUNK` is the same bytes, unallocated.
     LAST_CHUNK.to_vec()
 }
 
-/// A whole request to `host`, with its Content-Length.
+/// A whole request to `host`, with its Content-Length, in one allocation of its size.
 pub fn request(
     method: &str,
     host: &str,
@@ -883,7 +971,9 @@ pub fn request(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::new();
+    let named = method.len() + path.len() + host.len() + headers_len(headers);
+    // alloc: the request handed out, once per request, a client's.
+    let mut out = Vec::with_capacity(HEAD_FRAME + named + body.len());
     request_head_into(&mut out, method, host, path, headers, body.len());
     out.extend_from_slice(body);
     out
@@ -909,8 +999,9 @@ pub(crate) fn request_head_into(
 /// dropped, so the peer must send nothing more until asked (one request per connection).
 pub fn read_response(from: &mut impl io::Read, most_body: usize) -> io::Result<HttpResponse> {
     let mut parser = ResponseParser::new(most_body);
+    // alloc: the body handed out, once per response, a client's.
     let mut body = Vec::new();
-    let mut buffer = vec![0; 64 << 10];
+    let mut buffer = [0; READ];
     while !parser.finished() {
         let read = match from.read(&mut buffer) {
             Ok(read) => read,
@@ -918,15 +1009,19 @@ pub fn read_response(from: &mut impl io::Read, most_body: usize) -> io::Result<H
             Err(error) => return Err(error),
         };
         parser.push(&buffer[..read]).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        body.extend(parser.take_body());
+        // The parser's first piece is taken whole, not copied.
+        match body.is_empty() {
+            true => body = parser.take_body(),
+            false => body.extend_from_slice(&parser.take_body()),
+        }
         if read == 0 && !parser.finished() {
             return Err(io::ErrorKind::UnexpectedEof.into());
         }
     }
-    let Some((status, headers)) = parser.head() else {
+    let Some((status, headers)) = parser.take_head() else {
         return Err(io::ErrorKind::UnexpectedEof.into());
     };
-    Ok(HttpResponse { status, headers: headers.to_vec(), body })
+    Ok(HttpResponse { status, headers, body })
 }
 
 #[cfg(test)]

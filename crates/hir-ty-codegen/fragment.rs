@@ -867,6 +867,7 @@ pub(super) const INLINED: u32 = u32::MAX;
 /// Collects the requests of one function while its IR is built.
 pub(super) struct Recorder<'db> {
     pub(super) db: &'db Db,
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     pub(super) isa: &'static dyn TargetIsa,
     /// What `isa` generates code for.
     pub(super) target: &'static Target,
@@ -920,6 +921,7 @@ pub(super) struct Recorder<'db> {
 /// the part of a [`Recorder`] that has nothing of the database, which LLVM is run with
 /// once the database is let go of (see `tier::Prepared`).
 pub(super) struct Wants {
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     pub(super) isa: &'static dyn TargetIsa,
     pub(super) requests: Requests,
     /// The places in `requests.funcs`, by the hash of the request there ([`func_hash`]): 16
@@ -1037,6 +1039,7 @@ impl BlobView<'_> {
 }
 
 impl Wants {
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {
         Wants {
             isa,
@@ -1409,6 +1412,7 @@ impl<'db> Recorder<'db> {
 
     pub(super) fn new(
         db: &'db Db,
+        // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
         isa: &'static dyn TargetIsa,
         target: &'static Target,
         checked: bool,

@@ -281,7 +281,7 @@ impl<'a> ArenaLocal<'a> {
     pub fn try_alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
         if let Some(block) = NonNull::new(self.block.get()) {
             let at = block.as_ptr() as usize + self.used.get();
-            let from = ((at + layout.align() - 1) & !(layout.align() - 1)) - block.as_ptr() as usize;
+            let from = crate::align::align_up(at, layout.align()) - block.as_ptr() as usize;
             let end = from + layout.size();
             if end <= BLOCK {
                 self.used.set(end);

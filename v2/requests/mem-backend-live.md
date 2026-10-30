@@ -289,6 +289,8 @@ not memory).
 > (61 bytes a row × 2^32 rows) plus 2 GiB for the lasting ranges, in the user's program, so
 > `Live::open` now fails under an address-space limit (`ulimit -v`, valgrind) where it
 > didn't. blaze-mem is `publish = false`, so blaze-live can't be published until it is.
+> taken by requests (link and speed-link-edge-sol-live are DONE): child `requests-live`; the outcome follows.
+> refused by requests (child requests-live): blaze-mem can't be a dependency of blaze-live, so items 1-8 (applied by speed-link-edge-sol-live and committed in the v2 checkpoint) are undone: `Log` and `Lasting` are `Vec`s again with `Vec::splice`, the extra `LASTING` check, the test allocator and the two tests are gone, and `blaze-mem`/`blaze-alloc-count` are out of `Cargo.toml` (`blaze-ids` stays, for the tests that already used it). The types themselves would be fine in the program (`RegionVec` and `Tag` take memory from mmap/VirtualAlloc, install no global allocator, and budgets default to unlimited); the dependency is not. blaze-live is linked into user programs that build outside this workspace: it is published (`blaze-live = "0.1"`, its README), `demo/life` and `demo/lifebench` build it as a path dependency from their own `[workspace]` with `--locked` lock files that list it with no dependencies, and `flake.nix` `lifeSource`, `tools/nix/life_launch.py` and `harness/tiers.py` copy `crates/blaze-live` alone. blaze-mem is `publish = false`, has no version in the root (path only), takes `#![feature(allocator_api)]`, and pulls libc, windows-sys and blaze-reclaim into the user's lock. It also reserved about 264 GB of address space in the user's program, so `Live::open` failed under `ulimit -v` or valgrind. A zero-allocation log has to be blaze-live's own (a reserved column over the mmap and VirtualAlloc calls it already declares), not blaze-mem.
 
 ## mem-backend-live 2: blaze-lazy's waiters onto a Slab (for lane `fastcompile`)
 
@@ -494,6 +496,8 @@ output, so the fetcher stays a deterministic state machine.
    ```
    Budget: a warm miss allocates nothing on the success path, held by a test in
    `tests/exec.rs` that resolves two functions and measures the second.
+
+> forwarded to fastcompile (`crates/blaze-lazy/`; told by tmux).
 
 ## dedup: `blaze-splice` LEB128 onto `blaze_format::leb`
 

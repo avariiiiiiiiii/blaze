@@ -963,11 +963,7 @@ impl Prepared {
         let branches = branches(pending.func()).len() as u32;
         let counters = counters
             .filter(|_| level == Level::Llvm)
-            .and_then(|(first, room)| {
-                let first = first.checked_next_multiple_of(COUNTER_ALIGN)?;
-                let end = first.checked_add(1)?.checked_add(branches.checked_mul(2)?)?;
-                (end <= room).then_some(first)
-            });
+            .and_then(|(first, room)| counted_from(first, room, branches));
         let request = Request { level, counters, profile, branches: std::cell::Cell::new(0) };
         let code = pending.produce(&request).map_err(|e| e.to_string())?;
         Ok(Tiered {
@@ -983,6 +979,15 @@ impl Prepared {
     }
 }
 
+/// The first counter of a function of `branches` two-way branches whose counters are handed
+/// out from `first` on, of `room`: the next multiple of [`COUNTER_ALIGN`], if the entry's and
+/// two for each branch fit.
+fn counted_from(first: u32, room: u32, branches: u32) -> Option<u32> {
+    let first = first.checked_next_multiple_of(COUNTER_ALIGN)?;
+    let end = first.checked_add(1)?.checked_add(branches.checked_mul(2)?)?;
+    (end <= room).then_some(first)
+}
+
 /// The two-way branches of `func`, in the order of its layout.
 fn branches(func: &ir::Function) -> Vec<ir::Inst> {
     func.layout
@@ -993,7 +998,9 @@ fn branches(func: &ir::Function) -> Vec<ir::Inst> {
 }
 
 /// Has `func` count, in the counters from `first` on, how often it is entered and which way
-/// each of `branches` goes. The counters are found by a call at the entry.
+/// each of `branches` goes. The counters are found by a call at the entry. Each add is an
+/// atomic one, relaxed ([`COUNTER_REGION`]): two threads in the function lose no count, and
+/// the sampler's loads race no plain store.
 fn count(
     recorder: &mut Wants,
     func: &mut ir::Function,
@@ -1009,15 +1016,18 @@ fn count(
     let Some(entry) = func.layout.entry_block() else {
         return Err(CodegenError::Unsupported("a function without blocks".to_owned()));
     };
-    let flags = super::MEM;
+    let region = func.dfg.alias_regions.insert(ir::AliasRegionData {
+        user_id: COUNTER_REGION,
+        description: std::borrow::Cow::Borrowed(COUNTERS),
+    });
+    let flags = super::MEM.with_aligned().with_alias_region(Some(region));
     let mut cursor = FuncCursor::new(func).at_first_insertion_point(entry);
     let call = cursor.ins().call(callee, &[]);
     let base = cursor.func.dfg.first_result(call);
     let add = |cursor: &mut FuncCursor<'_>, offset: ir::Value| {
         let at = cursor.ins().iadd(base, offset);
-        let count = cursor.ins().load(types::I64, flags, at, 0);
-        let count = cursor.ins().iadd_imm_s(count, 1);
-        cursor.ins().store(flags, count, at, 0);
+        let one = cursor.ins().iconst(types::I64, 1);
+        cursor.ins().atomic_rmw(types::I64, flags, ir::AtomicRmwOp::Add, at, one);
     };
     let entered = cursor.ins().iconst(pointer, i64::from(first) * 8);
     add(&mut cursor, entered);
@@ -1089,4 +1099,37 @@ fn produce(
     _: Option<&Weights>,
 ) -> Result<super::fragment::Code> {
     Err(CodegenError::Unsupported("blaze was built without `--features llvm`".to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COUNTER_ALIGN, counted_from};
+
+    #[test]
+    fn functions_count_on_line_pairs_of_their_own() {
+        let room = 1 << 16;
+        let mut next = 0;
+        let mut ranges = Vec::new();
+        for branches in [0, 3, 7, 8, 1, 40] {
+            let first = counted_from(next, room, branches).expect("room for it");
+            assert_eq!(first % COUNTER_ALIGN, 0);
+            assert!(first >= next && first - next < COUNTER_ALIGN);
+            next = first + 1 + 2 * branches;
+            ranges.push((first, next));
+        }
+        for pair in ranges.windows(2) {
+            let last_pair = (pair[0].1 - 1) / COUNTER_ALIGN;
+            assert!(pair[1].0 / COUNTER_ALIGN > last_pair, "{pair:?} share 128 bytes");
+        }
+    }
+
+    #[test]
+    fn a_function_past_the_room_counts_nothing() {
+        assert_eq!(counted_from(0, 16, 7), Some(0));
+        assert_eq!(counted_from(0, 16, 8), None);
+        assert_eq!(counted_from(1, 32, 7), Some(16));
+        assert_eq!(counted_from(1, 32, 8), None);
+        assert_eq!(counted_from(u32::MAX - 3, u32::MAX, 0), None);
+        assert_eq!(counted_from(0, u32::MAX, u32::MAX), None);
+    }
 }

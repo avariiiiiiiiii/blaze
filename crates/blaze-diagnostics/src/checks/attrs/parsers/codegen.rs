@@ -17,7 +17,7 @@ use crate::{
         attrs::{
             accept::{Accept, BinaryFormat},
             args::{ArgParser, MetaItem, MetaItemOrLit, MetaList, NameValue},
-            cfg,
+            cfg, is, with_path,
             parsed::{Inline, Optimize, Parsed, ParsedAttr, Repr},
         },
         features::attributes,
@@ -210,9 +210,8 @@ pub(crate) fn check(group: GroupId, first: usize, fx: &mut Finalize<'_, '_, '_>,
             if fx.session.target.is_like_wasm() {
                 return;
             }
-            let lang = fx
-                .all_attrs()
-                .find_map(|(_, path)| ["panic_handler", "lang"].into_iter().find(|it| matches!(path.as_slice(), [one] if one == it)));
+            let lang =
+                fx.owner.attrs.iter().find_map(|attr| ["panic_handler", "lang"].into_iter().find(|it| is(attr, it)));
             if let Some(kind) = lang {
                 let what = match kind {
                     "panic_handler" => "`#[panic_handler]`",
@@ -224,7 +223,7 @@ pub(crate) fn check(group: GroupId, first: usize, fx: &mut Finalize<'_, '_, '_>,
             }
         }
         GroupId::Single(["ffi_pure"]) => {
-            if fx.all_attrs().any(|(_, path)| matches!(path.as_slice(), [one] if one == "ffi_const")) {
+            if fx.owner.attrs.iter().any(|it| is(it, "ffi_const")) {
                 let diag = Diag::error(Some("E0757"), "`#[ffi_const]` function cannot be `#[ffi_pure]`", fx.attr_span(first));
                 fx.emit_err(diag);
             }
@@ -326,31 +325,29 @@ fn naked_compatible(fx: &mut Finalize<'_, '_, '_>, naked: usize) {
         "naked",
         "doc",
     ];
-    let naked_span = fx.attr_span(naked);
-    let others: Vec<(usize, Vec<String>)> = fx.all_attrs().collect();
-    for (index, path) in others {
-        if path.first().is_some_and(|it| fx.session.is_tool(it)) {
-            continue;
-        }
-        let word = match path.as_slice() {
-            [one] => Some(one.as_str()),
-            _ => None,
-        };
-        if word.is_some_and(|it| ALLOW_LIST.contains(&it)) {
-            continue;
-        }
+    for index in 0..fx.owner.attrs.len() {
         let attr = fx.attr(index);
-        let path_span = fx.span(index, attr.path_range());
-        if word == Some("target_feature") {
+        if attr.is_doc_comment() {
+            continue;
+        }
+        let session = fx.session;
+        let allowed = with_path(attr, |path| {
+            path.first().is_some_and(|it| session.is_tool(it)) || matches!(path, [one] if ALLOW_LIST.contains(one))
+        });
+        if allowed {
+            continue;
+        }
+        if is(attr, "target_feature") {
             let diag = attributes::naked_target_feature(fx.cx, &fx.session.features, attr.in_file(attr.path_range()));
             if let Some(diag) = diag {
                 fx.emit_err(diag);
             }
             continue;
         }
+        let path_span = fx.span(index, attr.path_range());
         let mut diag = Diag::error(Some("E0736"), "attribute incompatible with `#[unsafe(naked)]`", path_span.clone());
-        diag.span_label(path_span, format!("the `{}` attribute is incompatible with `#[unsafe(naked)]`", path.join("::")));
-        diag.span_label(naked_span.clone(), "function marked with `#[unsafe(naked)]` here");
+        diag.span_label(path_span, format!("the `{}` attribute is incompatible with `#[unsafe(naked)]`", attr.name()));
+        diag.span_label(fx.attr_span(naked), "function marked with `#[unsafe(naked)]` here");
         fx.emit_err(diag);
     }
 }

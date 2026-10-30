@@ -10,8 +10,8 @@ use std::{
 };
 
 use ide_db::{
-    RootDatabase,
-    base_db::{SourceDatabase, SourceRoot, SourceRootId, salsa::Durability},
+    RootDatabase, RootDatabaseExt as _,
+    base_db::{SourceRoot, SourceRootId, salsa::Durability},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;

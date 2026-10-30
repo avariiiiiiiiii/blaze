@@ -6,6 +6,7 @@
 
 use std::{io::Write as _, ops::Range};
 
+use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, Hasher};
 use cfg::{CfgAtom, CfgOptions};
 use vfs::VfsPath;
@@ -36,12 +37,12 @@ pub fn cfg_options_content(cfg: &CfgOptions) -> ContentId {
         match atom {
             CfgAtom::Flag(name) => {
                 bytes.push(0);
-                frame(&mut bytes, name.as_str());
+                bytes.put_bytes_u64(name.as_str().as_bytes());
             }
             CfgAtom::KeyValue { key, value } => {
                 bytes.push(1);
-                frame(&mut bytes, key.as_str());
-                frame(&mut bytes, value.as_str());
+                bytes.put_bytes_u64(key.as_str().as_bytes());
+                bytes.put_bytes_u64(value.as_str().as_bytes());
             }
         }
         atoms.push(start..bytes.len());
@@ -53,11 +54,6 @@ pub fn cfg_options_content(cfg: &CfgOptions) -> ContentId {
         hasher.part(&bytes[atom]);
     }
     hasher.finish()
-}
-
-fn frame(bytes: &mut Vec<u8>, part: &str) {
-    bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(part.as_bytes());
 }
 
 /// A path as content: whether it is on disk (0) or virtual (1), then its text.
@@ -85,7 +81,7 @@ pub(crate) fn opt_bytes(out: &mut Vec<u8>, part: Option<&str>) {
         None => out.push(0),
         Some(part) => {
             out.push(1);
-            frame(out, part);
+            out.put_bytes_u64(part.as_bytes());
         }
     }
 }

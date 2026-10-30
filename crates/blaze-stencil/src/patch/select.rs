@@ -40,7 +40,7 @@ use crate::{
 };
 
 pub(super) fn run<A: Glue>(
-    plan: &mut Plan,
+    plan: &mut Plan<'_>,
     func: &ir::Function,
     target: &Target,
     library: &Reader<'_>,
@@ -97,7 +97,7 @@ pub(super) fn run<A: Glue>(
 
 /// What writes `inst`, and its base shape if a stencil does.
 fn one<A: Glue>(
-    plan: &Plan,
+    plan: &Plan<'_>,
     func: &ir::Function,
     target: &Target,
     library: &Reader<'_>,
@@ -219,7 +219,7 @@ fn one<A: Glue>(
 /// The shape of `shape`'s op with as many of `args` folded as immediates as one of the set
 /// takes, and every other operand from its slot.
 fn base(
-    plan: &Plan,
+    plan: &Plan<'_>,
     func: &ir::Function,
     library: &Reader<'_>,
     info: &Info,
@@ -249,7 +249,7 @@ fn base(
 }
 
 /// Whether `value` is an `iconst` a stencil can take as its 32-bit immediate.
-fn folds(plan: &Plan, func: &ir::Function, value: ir::Value) -> bool {
+fn folds(plan: &Plan<'_>, func: &ir::Function, value: ir::Value) -> bool {
     match plan.konst[value.as_u32() as usize] {
         Konst::Int(it) => func.dfg.value_type(value).bits() <= 32 || i32::try_from(it).is_ok(),
         _ => false,
@@ -269,7 +269,7 @@ pub(super) fn immediate(konst: Konst) -> (i64, bool) {
 
 /// Fuses `inst` (a `brif` or `select`) with the `icmp` right before it that only it uses,
 /// when the fused shape exists.
-fn fuse(plan: &mut Plan, func: &ir::Function, library: &Reader<'_>, inst: ir::Inst, sel: &mut Sel) {
+fn fuse(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, inst: ir::Inst, sel: &mut Sel) {
     let op = sel.shape.op;
     if !matches!(op, Op::Brif | Op::Select) {
         return;

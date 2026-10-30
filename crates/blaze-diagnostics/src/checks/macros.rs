@@ -16,6 +16,9 @@ pub(crate) fn check(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Found> {
     let mut found = Vec::new();
     for tree in &walk.trees {
         for node in &tree.nodes {
+            if !ast::Macro::can_cast(node.kind()) {
+                continue;
+            }
             let Some(mac) = ast::Macro::cast(node.clone()) else { continue };
             found.extend(macro_def_error::check(cx, InFile::new(tree.file, &mac)));
         }

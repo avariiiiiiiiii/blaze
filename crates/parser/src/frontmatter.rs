@@ -74,6 +74,7 @@ impl<'s> ScriptSource<'s> {
             1 | 2 => {
                 // either not a frontmatter or invalid frontmatter opening
                 return Err(FrontmatterError::new(
+                    // alloc: the error path.
                     format!(
                         "found {fence_length} `{FENCE_CHAR}` in rust frontmatter, expected at least 3"
                     ),
@@ -85,6 +86,7 @@ impl<'s> ScriptSource<'s> {
         source.open = Some(open_start..open_end);
         let Some(info_nl) = input.find_slice("\n") else {
             return Err(FrontmatterError::new(
+                // alloc: the error path.
                 format!("unclosed frontmatter; expected `{fence_pattern}`"),
                 raw.len()..raw.len(),
             )
@@ -100,6 +102,7 @@ impl<'s> ScriptSource<'s> {
         }
 
         // Ends with a line that starts with a matching number of `-` only followed by whitespace
+        // alloc: setup, once a script that has frontmatter.
         let nl_fence_pattern = format!("\n{fence_pattern}");
         let Some(frontmatter_nl) = input.find_slice(nl_fence_pattern.as_str()) else {
             for prefix_len in (2..=(nl_fence_pattern.len() - 1)).rev() {
@@ -116,6 +119,7 @@ impl<'s> ScriptSource<'s> {
                 let close_end = input.current_token_start();
                 let fewer_dashes = fence_length - close_len;
                 return Err(FrontmatterError::new(
+                    // alloc: the error path.
                     format!(
                         "closing code fence has {fewer_dashes} less `-` than the opening fence"
                     ),
@@ -124,6 +128,7 @@ impl<'s> ScriptSource<'s> {
                 .push_visible_span(open_start..open_end));
             }
             return Err(FrontmatterError::new(
+                // alloc: the error path.
                 format!("unclosed frontmatter; expected `{fence_pattern}`"),
                 raw.len()..raw.len(),
             )
@@ -147,6 +152,7 @@ impl<'s> ScriptSource<'s> {
             let extra_start = close_end;
             let extra_end = extra_start + extra_dashes;
             return Err(FrontmatterError::new(
+                // alloc: the error path.
                 format!("closing code fence has {extra_dashes} more `-` than the opening fence"),
                 extra_start..extra_end,
             )
@@ -159,6 +165,7 @@ impl<'s> ScriptSource<'s> {
                 let after_start = after_closing_fence.offset_from(&raw);
                 let after_end = after_start + after_closing_fence.len();
                 return Err(FrontmatterError::new(
+                    // alloc: the error path.
                     format!("unexpected characters after frontmatter close"),
                     after_start..after_end,
                 )
@@ -180,6 +187,7 @@ impl<'s> ScriptSource<'s> {
             let fence_start = input.current_token_start();
             let fence_end = fence_start + fence_length;
             return Err(FrontmatterError::new(
+                // alloc: the error path.
                 format!("only one frontmatter is supported"),
                 fence_start..fence_end,
             )
@@ -191,42 +199,52 @@ impl<'s> ScriptSource<'s> {
     }
 
     pub fn shebang(&self) -> Option<&'s str> {
+        // clone: a range, two words and no heap.
         self.shebang.clone().map(|span| &self.raw[span])
     }
 
     pub fn shebang_span(&self) -> Option<Span> {
+        // clone: a range, two words and no heap.
         self.shebang.clone()
     }
 
     pub fn open_span(&self) -> Option<Span> {
+        // clone: a range, two words and no heap.
         self.open.clone()
     }
 
     pub fn info(&self) -> Option<&'s str> {
+        // clone: a range, two words and no heap.
         self.info.clone().map(|span| &self.raw[span])
     }
 
     pub fn info_span(&self) -> Option<Span> {
+        // clone: a range, two words and no heap.
         self.info.clone()
     }
 
     pub fn frontmatter(&self) -> Option<&'s str> {
+        // clone: a range, two words and no heap.
         self.frontmatter.clone().map(|span| &self.raw[span])
     }
 
     pub fn frontmatter_span(&self) -> Option<Span> {
+        // clone: a range, two words and no heap.
         self.frontmatter.clone()
     }
 
     pub fn close_span(&self) -> Option<Span> {
+        // clone: a range, two words and no heap.
         self.close.clone()
     }
 
     pub fn content(&self) -> &'s str {
+        // clone: a range, two words and no heap.
         &self.raw[self.content.clone()]
     }
 
     pub fn content_span(&self) -> Span {
+        // clone: a range, two words and no heap.
         self.content.clone()
     }
 }
@@ -322,6 +340,7 @@ pub struct FrontmatterError {
 
 impl FrontmatterError {
     pub fn new(message: impl Into<String>, span: Span) -> Self {
+        // alloc: the error path.
         Self { message: message.into(), primary_span: span, visible_spans: Vec::new() }
     }
 
@@ -335,6 +354,7 @@ impl FrontmatterError {
     }
 
     pub fn primary_span(&self) -> Span {
+        // clone: a range, two words and no heap.
         self.primary_span.clone()
     }
 

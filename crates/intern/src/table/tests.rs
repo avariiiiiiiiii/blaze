@@ -395,3 +395,37 @@ fn hits_allocate_nothing() {
         assert_eq!(restored.get(3), Some(&b"a"[..]));
     });
 }
+
+/// Interning new values into a table allocates nothing: the overlay's bytes come from the
+/// store's region and its ID column is a reserved region of its own.
+#[test]
+fn misses_allocate_nothing() {
+    let table = Table::new(shape());
+    table.intern(b"warm");
+    let ids = blaze_alloc_count::assert_at_most(0, "interning new values", || {
+        (0..20_000u32).map(|n| table.intern(&n.to_le_bytes())).fold(0u64, |sum, id| sum + u64::from(id))
+    });
+    assert!(ids > 0);
+    for n in 0..20_000u32 {
+        assert_eq!(table.find(&n.to_le_bytes()).and_then(|id| table.get(id)), Some(&n.to_le_bytes()[..]));
+    }
+}
+
+/// IDs set from many threads at once, in no order and far apart, read back from every thread.
+#[test]
+fn the_id_column_publishes_each_slot_once() {
+    let table = Table::new(shape());
+    std::thread::scope(|scope| {
+        for worker in 0..8u32 {
+            let table = &table;
+            scope.spawn(move || {
+                for n in 0..5_000u32 {
+                    let bytes = (worker << 24 | n).to_le_bytes();
+                    let id = table.intern(&bytes);
+                    assert_eq!(table.get(id), Some(&bytes[..]));
+                }
+            });
+        }
+    });
+    assert_eq!(table.end() - table.first, 40_000);
+}

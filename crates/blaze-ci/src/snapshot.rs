@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::SnapshotConfig;
 
 /// A snapshot taken, as the state file keeps it.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Kept {
     /// What the command printed.
@@ -25,7 +25,7 @@ pub struct Kept {
     pub at: u64,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct SnapshotError {
     pub what: String,
 }
@@ -49,27 +49,31 @@ pub fn due(kept: &[Kept], now: u64, every_secs: u64) -> bool {
 /// The name of a snapshot of `commit` taken at `now`: the commit's first 12 characters (only
 /// letters and digits) and the time.
 pub fn name(commit: &str, now: u64) -> String {
+    // alloc: once per snapshot, its name
     let short: String = commit.chars().filter(char::is_ascii_alphanumeric).take(12).collect();
-    format!("blaze-ci-{short}-{now}")
+    format!("blaze-ci-{short}-{now}") // alloc: once per snapshot, its name
 }
 
 /// The ids to remove so that `keep` remain, oldest first.
 pub fn beyond(kept: &[Kept], keep: usize) -> Vec<String> {
+    // alloc: once per snapshot, the kept ones by age
     let mut by_age: Vec<&Kept> = kept.iter().collect();
     by_age.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
     let over = by_age.len().saturating_sub(keep);
+    // alloc: once per snapshot, the ids removed
     by_age.into_iter().take(over).map(|it| it.id.clone()).collect()
 }
 
 /// `argv` with every `{key}` in each argument replaced by `value`.
 pub fn substitute(argv: &[String], key: &str, value: &str) -> Vec<String> {
-    let pattern = format!("{{{key}}}");
+    let pattern = format!("{{{key}}}"); // alloc: once per snapshot, its argv
+    // alloc: once per snapshot, its argv
     argv.iter().map(|arg| arg.replace(&pattern, value)).collect()
 }
 
 /// The last line of `bytes` with something besides whitespace in it, trimmed.
 pub fn last_line(bytes: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(bytes)
+    String::from_utf8_lossy(bytes) // alloc: once per snapshot, the id it printed
         .lines()
         .rev()
         .map(str::trim)
@@ -81,15 +85,18 @@ pub fn last_line(bytes: &[u8]) -> Option<String> {
 pub fn run(argv: &[String]) -> Result<Vec<u8>, SnapshotError> {
     let shown = argv.join(" ");
     let Some((program, args)) = argv.split_first() else {
-        return Err(SnapshotError { what: "an empty command".to_owned() });
+        return Err(SnapshotError { what: "an empty command".to_owned() }); // alloc: error path
     };
     let output = Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
+        // alloc: error path
         .map_err(|error| SnapshotError { what: format!("`{shown}` did not start: {error}") })?;
     if !output.status.success() {
+        // alloc: error path
         let said = last_line(&output.stderr).unwrap_or_else(|| "nothing on stderr".to_owned());
+        // alloc: error path
         return Err(SnapshotError { what: format!("`{shown}` failed ({}): {said}", output.status) });
     }
     Ok(output.stdout)
@@ -99,7 +106,7 @@ pub fn run(argv: &[String]) -> Result<Vec<u8>, SnapshotError> {
 pub fn run_for_id(argv: &[String]) -> Result<String, SnapshotError> {
     let stdout = run(argv)?;
     last_line(&stdout).ok_or_else(|| SnapshotError {
-        what: format!("`{}` succeeded and printed no id", argv.join(" ")),
+        what: format!("`{}` succeeded and printed no id", argv.join(" ")), // alloc: error path
     })
 }
 
@@ -107,7 +114,7 @@ pub fn run_for_id(argv: &[String]) -> Result<String, SnapshotError> {
 /// durable.
 pub fn take(config: &SnapshotConfig, name: &str, now: u64) -> Result<Kept, SnapshotError> {
     let id = run_for_id(&substitute(&config.command, "name", name))?;
-    Ok(Kept { id, name: name.to_owned(), at: now })
+    Ok(Kept { id, name: name.to_owned(), at: now }) // alloc: once per snapshot, the one kept
 }
 
 /// Removes snapshot `id` with the configured command.

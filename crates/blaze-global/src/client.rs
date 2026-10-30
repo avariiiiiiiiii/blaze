@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 
 use blaze_cas::{Key, Remote, Store, remote::Answer};
 use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, Tag};
+use blaze_format::cursor::Reader;
 
 use crate::{
     ByHash, Refused, Tags,
@@ -23,7 +24,7 @@ use crate::{
     public::{Private, Public, Secrets},
     sign::{Publisher, Record, Signed, Trust},
     tls::{Channel, Channels, TlsClient},
-    wire::{self, BATCH_MOST, BODY_MOST, Reader, RecvWindow, SendWindow},
+    wire::{self, BATCH_MOST, BODY_MOST, Fields as _, RecvWindow, SendWindow},
 };
 
 /// The most connections to the cache at once.
@@ -640,7 +641,7 @@ fn answer(
 
 fn bundle_answer(reader: &mut Reader<'_>, id: BundleId, trust: &Trust) -> Result<Option<Manifest>, String> {
     reader.header(wire::BUNDLE_ANSWER, "a bundle's answer")?;
-    let manifest = match reader.u8("which answer")? {
+    let manifest = match reader.u8().map_err(wire::truncated)? {
         wire::MISSING => None,
         wire::FOUND => {
             let manifest = Manifest::decode(reader)?;
@@ -676,8 +677,8 @@ fn fetched(
     }
     let mut deferred = Vec::new();
     for &(tag, key) in keys {
-        let which = reader.u8("which answer")?;
-        let said = reader.key("a key")?;
+        let which = reader.u8().map_err(wire::truncated)?;
+        let said = reader.key()?;
         if said != key {
             return Err(format!("an answer for {:x} in place of one for {:x}", said.0, key.0));
         }

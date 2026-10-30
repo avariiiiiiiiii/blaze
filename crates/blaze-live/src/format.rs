@@ -31,6 +31,7 @@ pub const WAKE: &str = "wake";
 /// The event the daemon sets on Windows once it wrote a patch in `dir`, where it has no socket
 /// to wake the program on: named after the directory, which is named after the executable.
 pub fn wake_event(dir: &Path) -> String {
+    // alloc: setup, once when the program starts and once per patch the daemon writes
     format!("Local\\blaze-live-{}", dir.file_name().unwrap_or_default().to_string_lossy())
 }
 
@@ -91,7 +92,18 @@ pub fn unescape(line: &str) -> String {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|it| format!("{it:02x}")).collect()
+    let mut out = String::with_capacity(2 * bytes.len());
+    push_hex(&mut out, bytes);
+    out
+}
+
+/// `bytes` as lowercase hex, two digits each, appended to `out`.
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for &byte in bytes {
+        out.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        out.push(char::from(DIGITS[usize::from(byte & 0xf)]));
+    }
 }
 
 /// What the daemon has for a running program.
@@ -148,8 +160,34 @@ pub struct Write {
 }
 
 impl Patch {
+    /// The size of its encoding.
+    pub fn encoded_len(&self) -> usize {
+        let writes = |writes: &[Write]| -> usize {
+            writes.iter().map(|it| 8 + 8 + it.bytes.len() + 8 + 8 * it.pointers.len()).sum()
+        };
+        let body = match &self.body {
+            Body::Restart(why) => 8 + why.len(),
+            Body::Code(code) => {
+                8 + 8
+                    + code.text.len()
+                    + 8
+                    + code.data.len()
+                    + 16
+                    + 8
+                    + 8 * code.pointers.len()
+                    + 16
+                    + 8
+                    + writes(&code.lasting)
+                    + writes(&code.writes)
+                    + 8
+            }
+        };
+        MAGIC.len() + 16 + 8 + 8 + body
+    }
+
+    /// Its encoding, in one buffer of the exact size.
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&self.uuid);
         put(&mut out, self.sequence);
@@ -184,26 +222,37 @@ impl Patch {
         out
     }
 
+    /// The patch in `bytes`, owned: v1's watcher thread decodes each patch once and hands it
+    /// to the thread that applies it. The jump-table runtime reads its messages in place
+    /// (`crate::patch::Message::view`).
     pub fn decode(bytes: &[u8]) -> Result<Patch, String> {
-        let mut reader = Reader(bytes);
+        let mut reader = Fields(bytes);
         if reader.take(8)? != MAGIC {
+            // alloc: error path
             return Err("not a patch of this version of blaze".to_owned());
         }
         let uuid = reader.take(16)?.try_into().map_err(|_| "a short patch")?;
         let sequence = reader.u64()?;
         let body = match reader.u64()? {
+            // alloc: the reason handed to the program, once per patch that has it start again
             0 => Body::Restart(String::from_utf8_lossy(reader.bytes()?).into_owned()),
             1 => {
                 let base = reader.u64()?;
+                // alloc: v1's owned patch, once per patch (see above)
                 let text = reader.bytes()?.to_vec();
+                // alloc: v1's owned patch, once per patch (see above)
                 let data = reader.bytes()?.to_vec();
                 let frames = (reader.u64()?, reader.u64()?);
                 let pointers = reader.list()?;
                 let redirected = reader.u64()?;
                 let statics = reader.u64()?;
-                let mut writes = Vec::new();
-                for _ in 0..reader.u64()? {
+                let count = reader.u64()?;
+                // Each write is at least 24 bytes, which bounds a count the bytes can't hold.
+                let room = usize::try_from(count).unwrap_or(usize::MAX).min(reader.0.len() / 24);
+                let mut writes = Vec::with_capacity(room);
+                for _ in 0..count {
                     let address = reader.u64()?;
+                    // alloc: v1's owned patch, one per write of it (see above)
                     let bytes = reader.bytes()?.to_vec();
                     writes.push(Write { address, bytes, pointers: reader.list()? });
                 }
@@ -211,6 +260,7 @@ impl Patch {
                 let lasting = if reader.0.is_empty() { 0 } else { reader.u64()? };
                 let lasting = usize::try_from(lasting).map_err(|_| "a patch too large")?;
                 if lasting > writes.len() {
+                    // alloc: error path
                     return Err("a short patch".to_owned());
                 }
                 let rest = writes.split_off(lasting);
@@ -227,6 +277,7 @@ impl Patch {
                     lasting,
                 })
             }
+            // alloc: error path
             other => return Err(format!("a patch of kind {other}")),
         };
         Ok(Patch { uuid, sequence, body })
@@ -248,11 +299,17 @@ pub struct Process {
 
 impl Process {
     pub fn encode(&self) -> String {
-        let uuid = hex(&self.uuid);
-        format!(
-            "pid {}\nuuid {uuid}\nstarted {}\nnext {:#x}\nend {:#x}\n",
-            self.pid, self.started, self.next, self.end
-        )
+        let mut out = String::with_capacity(128);
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// [`Process::encode`] appended to `out`: nothing allocated once it has room.
+    pub fn encode_into(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        _ = write!(out, "pid {}\nuuid ", self.pid);
+        push_hex(out, &self.uuid);
+        _ = write!(out, "\nstarted {}\nnext {:#x}\nend {:#x}\n", self.started, self.next, self.end);
     }
 
     pub fn decode(text: &str) -> Option<Process> {
@@ -301,6 +358,7 @@ pub struct Sample {
 
 impl Sample {
     pub fn encode(&self) -> String {
+        // alloc: the daemon's, once each time it asks a program to sample
         format!(
             "interval_us {}\ncounters {}\nreader {}\n",
             self.interval_us, self.counters, self.reader
@@ -324,7 +382,7 @@ impl Sample {
 
 /// Where a program's threads were, since its sampler started. Counts only go up: the daemon
 /// takes the difference of two to know where the time went between them.
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, PartialEq, Default)]
 pub struct Profile {
     pub pid: u32,
     /// When the sampler started and when this was written, in milliseconds since the epoch.
@@ -346,8 +404,17 @@ pub struct Profile {
 
 impl Profile {
     pub fn encode(&self) -> String {
+        let mut out = String::with_capacity(160 + 24 * (self.pcs.len() + self.counters.len()));
+        self.encode_into(&mut out);
+        out
+    }
+
+    /// [`Profile::encode`] appended to `out`: the sampler's own buffer, so a profile written
+    /// a few times a second allocates nothing once it has room.
+    pub fn encode_into(&self, out: &mut String) {
         use std::fmt::Write as _;
-        let mut out = format!(
+        _ = write!(
+            out,
             "pid {}\nstarted {}\nat {}\nticks {}\nsamples {}\nelsewhere {}\nsampler_ns {}\n",
             self.pid,
             self.started,
@@ -363,7 +430,6 @@ impl Profile {
         for (at, count) in &self.counters {
             _ = writeln!(out, "c {at} {count}");
         }
-        out
     }
 
     pub fn decode(text: &str) -> Option<Profile> {
@@ -401,7 +467,7 @@ pub fn level_name(level: u8) -> &'static str {
 }
 
 /// What the daemon says of the tiers of a running program.
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, PartialEq, Default)]
 pub struct Tiers {
     /// When it was written, in milliseconds since the epoch.
     pub at: u64,
@@ -417,7 +483,7 @@ pub struct Tiers {
     pub events: Vec<TierEvent>,
 }
 
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, PartialEq, Default)]
 pub struct TierFunction {
     /// 1, 2 or 3 ([`level_name`]); 0 for code the daemon did not compile and can't tier.
     pub level: u8,
@@ -429,6 +495,7 @@ pub struct TierFunction {
     pub note: String,
 }
 
+// clone: the daemon copies its recent events into each `Tiers` it writes, a few times a second
 #[derive(Debug, PartialEq, Clone, Default)]
 pub struct TierEvent {
     /// In milliseconds since the epoch.
@@ -437,30 +504,37 @@ pub struct TierEvent {
 }
 
 impl Tiers {
+    /// Its text, written by the daemon a few times a second, every name and note on one line:
+    /// a tab or a newline in one is written as a space.
     pub fn encode(&self) -> String {
         use std::fmt::Write as _;
-        let clean = |text: &str| text.replace(['\t', '\n'], " ");
-        let mut out = format!(
+        let mut out = String::with_capacity(
+            96 + (self.functions.iter().map(|f| 48 + f.name.len() + f.note.len()))
+                .chain(self.events.iter().map(|event| 32 + event.text.len()))
+                .sum::<usize>(),
+        );
+        _ = write!(
+            out,
             "at {}\nwindow_ms {}\nsamples {}\nsampler_permille {}\n",
             self.at, self.window_ms, self.samples, self.sampler_permille
         );
         for f in &self.functions {
-            _ = writeln!(
-                out,
-                "fn\t{}\t{}\t{}\t{}\t{}",
-                f.level,
-                f.samples,
-                f.share,
-                clean(&f.name),
-                clean(&f.note)
-            );
+            _ = write!(out, "fn\t{}\t{}\t{}\t", f.level, f.samples, f.share);
+            push_clean(&mut out, &f.name);
+            out.push('\t');
+            push_clean(&mut out, &f.note);
+            out.push('\n');
         }
         for event in &self.events {
-            _ = writeln!(out, "event\t{}\t{}", event.at, clean(&event.text));
+            _ = write!(out, "event\t{}\t", event.at);
+            push_clean(&mut out, &event.text);
+            out.push('\n');
         }
         out
     }
 
+    /// What [`Tiers::encode`] wrote, owned: the program's copy, read from the daemon's file a
+    /// few times a second ([`crate::tiers`]), not per frame.
     pub fn decode(text: &str) -> Option<Tiers> {
         let mut tiers = Tiers::default();
         for line in text.lines() {
@@ -471,13 +545,16 @@ impl Tiers {
                     level: next()?.parse().ok()?,
                     samples: next()?.parse().ok()?,
                     share: next()?.parse().ok()?,
+                    // alloc: the program's copy (see above)
                     name: next()?.to_owned(),
+                    // alloc: the program's copy (see above)
                     note: next().unwrap_or_default().to_owned(),
                 });
                 continue;
             }
             if let Some(rest) = line.strip_prefix("event\t") {
                 let (at, text) = rest.split_once('\t')?;
+                // alloc: the program's copy (see above)
                 tiers.events.push(TierEvent { at: at.parse().ok()?, text: text.to_owned() });
                 continue;
             }
@@ -510,11 +587,19 @@ fn list(out: &mut Vec<u8>, values: &[u64]) {
     }
 }
 
-struct Reader<'a>(&'a [u8]);
+/// `text` appended to `out` with each tab and newline a space.
+fn push_clean(out: &mut String, text: &str) {
+    out.extend(text.chars().map(|c| if c == '\t' || c == '\n' { ' ' } else { c }));
+}
 
-impl<'a> Reader<'a> {
+/// A patch's fields, read in order. Not `blaze_format::cursor::Reader`: this crate runs
+/// inside the patched program and depends on no other crate.
+struct Fields<'a>(&'a [u8]);
+
+impl<'a> Fields<'a> {
     fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
         if self.0.len() < len {
+            // alloc: error path
             return Err("a patch that ends early".to_owned());
         }
         let (taken, rest) = self.0.split_at(len);
@@ -531,8 +616,16 @@ impl<'a> Reader<'a> {
         self.take(len)
     }
 
+    /// A list of `u64`s, owned for v1's patch ([`Patch::decode`]), sized once.
     fn list(&mut self) -> Result<Vec<u64>, String> {
-        (0..self.u64()?).map(|_| self.u64()).collect()
+        let count = self.u64()?;
+        // Each value is 8 bytes, which bounds a count the bytes can't hold.
+        let room = usize::try_from(count).unwrap_or(usize::MAX).min(self.0.len() / 8);
+        let mut values = Vec::with_capacity(room);
+        for _ in 0..count {
+            values.push(self.u64()?);
+        }
+        Ok(values)
     }
 }
 
@@ -555,8 +648,12 @@ mod tests {
         };
         let patch = Patch { uuid: [7; 16], sequence: 3, body: Body::Code(code) };
         assert_eq!(Patch::decode(&patch.encode()).unwrap(), patch);
+        assert_eq!(patch.encode().len(), patch.encoded_len());
         let restart = Patch { uuid: [1; 16], sequence: 4, body: Body::Restart("why".into()) };
         assert_eq!(Patch::decode(&restart.encode()).unwrap(), restart);
+        assert_eq!(restart.encode().len(), restart.encoded_len());
+        let empty = Patch { uuid: [0; 16], sequence: 0, body: Body::Code(Code::default()) };
+        assert_eq!(empty.encode().len(), empty.encoded_len());
         let process = Process {
             pid: 42,
             uuid: [0xab; 16],
@@ -565,6 +662,17 @@ mod tests {
             end: 0x2_0000_0000,
         };
         assert_eq!(Process::decode(&process.encode()), Some(process));
+        // The text as it was written with one `format!` and a hex string.
+        let uuid: String = process.uuid.iter().map(|it| format!("{it:02x}")).collect();
+        let was = format!(
+            "pid {}\nuuid {uuid}\nstarted {}\nnext {:#x}\nend {:#x}\n",
+            process.pid, process.started, process.next, process.end
+        );
+        assert_eq!(process.encode(), was);
+        let mut reused = String::from("x");
+        process.encode_into(&mut reused);
+        assert_eq!(reused, format!("x{was}"));
+        assert_eq!(hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
     }
 
     #[test]
@@ -582,6 +690,9 @@ mod tests {
             pcs: vec![(0x1_0000_4abc, 9)],
             counters: vec![(3, 100)],
         };
+        let mut reused = String::from("x");
+        profile.encode_into(&mut reused);
+        assert_eq!(reused, format!("x{}", profile.encode()));
         assert_eq!(Profile::decode(&profile.encode()), Some(profile));
         let tiers = Tiers {
             at: 10,
@@ -599,5 +710,56 @@ mod tests {
         };
         assert_eq!(Tiers::decode(&tiers.encode()), Some(tiers));
         assert_eq!(level_name(3), "LLVM -O3 + PGO");
+    }
+
+    #[test]
+    fn tiers_write_tabs_and_newlines_in_text_as_spaces() {
+        let tiers = Tiers {
+            at: 1,
+            functions: vec![TierFunction {
+                level: 1,
+                samples: 2,
+                share: 3,
+                name: "a\tb\nc".into(),
+                note: "\t".into(),
+            }],
+            events: vec![TierEvent { at: 4, text: "x\ny".into() }],
+            ..Tiers::default()
+        };
+        let text = tiers.encode();
+        assert_eq!(
+            text,
+            "at 1\nwindow_ms 0\nsamples 0\nsampler_permille 0\nfn\t1\t2\t3\ta b c\t \n\
+             event\t4\tx y\n"
+        );
+        let read = Tiers::decode(&text).expect("tiers");
+        assert_eq!((&read.functions[0].name[..], &read.events[0].text[..]), ("a b c", "x y"));
+    }
+
+    /// The sampler writes its profile a few times a second into the same buffer: once it has
+    /// room, that allocates nothing.
+    #[test]
+    fn a_profile_encoded_into_a_reused_buffer_allocates_nothing() {
+        let profile = Profile {
+            pid: 7,
+            started: 1,
+            at: 2,
+            pcs: (0..512).map(|it| (0x1_0000_0000 + 4 * it, it)).collect(),
+            counters: (0..64).map(|it| (it as u32, it)).collect(),
+            ..Profile::default()
+        };
+        let mut text = String::new();
+        profile.encode_into(&mut text);
+        let mut process = String::new();
+        let it = Process { pid: 1, uuid: [0xab; 16], started: 2, next: 3, end: 4 };
+        it.encode_into(&mut process);
+        blaze_alloc_count::assert_at_most(0, "a warm profile and process text", || {
+            for _ in 0..16 {
+                text.clear();
+                profile.encode_into(&mut text);
+                process.clear();
+                it.encode_into(&mut process);
+            }
+        });
     }
 }

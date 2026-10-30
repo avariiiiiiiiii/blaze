@@ -40,6 +40,16 @@ inference, which the check has done. Which lints may be on is one scan of the te
 `clippy::`, `blaze::` and level attributes (memchr, about 10 GB/s: 4 ms for 40 MB, once per
 file, not once per lint), each name found looked up by the registry's perfect hash.
 
+## `redundant_clone`
+
+The one lint that walks more than its node: for a `.clone()` that passes the syntactic and
+type filters (a local, by autoref, not `Copy`), it walks the body's tree once for the local's
+other mentions, a compare of a node kind each and a resolution (a memo hit) for each path.
+A body of 2,000 elements with 4 such clones is 8,000 elements, about 20 µs at 2.5 ns, and
+clones that pass the filters are a few per body. **Bound: one extra walk of the body per
+candidate clone**, reached because every cheaper test runs first; a body with none pays
+nothing past the filters.
+
 ## blaze's `reaches_alloc`
 
 One query per function, memoized for the daemon's life: a function's answer is its calls'

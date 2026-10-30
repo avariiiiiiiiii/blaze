@@ -12,26 +12,22 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{is_zero, layout, span};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::Diag,
 };
 
 #[derive(Default)]
-pub(super) struct DerefNullPtr {
+pub(crate) struct DerefNullPtr {
     /// The places of the body being walked that are borrowed raw (`&raw const <place>`): the
     /// parents rustc's `parent_hir_node` finds, seen before the places in them.
     raw_borrowed: FxHashSet<ExprId>,
 }
 
 impl LatePass for DerefNullPtr {
-    fn name(&self) -> &'static str {
-        "DerefNullPtr"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::BODY | Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["deref_nullptr"]);
+    const HOOKS: Hooks = Hooks::BODY;
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Ref, ExprTag::UnaryOp]);
 
     fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.raw_borrowed.clear();

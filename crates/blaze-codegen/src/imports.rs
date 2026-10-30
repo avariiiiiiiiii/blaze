@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 
+use blaze_ids::bits::BitSet;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -138,27 +139,6 @@ pub fn decide(
 /// No node: a callee without a summary, an unset slot.
 const NONE: u32 = u32::MAX;
 
-/// A set of node numbers, one bit each.
-struct Bits(Vec<u64>);
-
-impl Bits {
-    fn new(len: usize) -> Bits {
-        Bits(vec![0; len.div_ceil(64)])
-    }
-
-    fn get(&self, at: u32) -> bool {
-        self.0[at as usize / 64] >> (at % 64) & 1 != 0
-    }
-
-    fn set(&mut self, at: u32) {
-        self.0[at as usize / 64] |= 1 << (at % 64);
-    }
-
-    fn unset(&mut self, at: u32) {
-        self.0[at as usize / 64] &= !(1 << (at % 64));
-    }
-}
-
 /// Node numbers by key: open addressing on the key's first 8 bytes, which are already a
 /// content hash's and are never hashed again. 4 bytes per slot at most half full; a lookup
 /// is one probe and one 32-byte compare, as a rule.
@@ -213,7 +193,7 @@ struct Graph<'a> {
     unused_start: Vec<u32>,
     unused: Vec<u32>,
     /// Neither external nor addressed by any summary: every caller has a summary.
-    closed: Bits,
+    closed: BitSet<u32>,
 }
 
 impl<'a> Graph<'a> {
@@ -234,12 +214,12 @@ impl<'a> Graph<'a> {
             to: Vec::with_capacity(calls),
             unused_start: Vec::with_capacity(len + 1),
             unused: Vec::new(),
-            closed: Bits::new(len),
+            closed: BitSet::new(len),
             keys: Vec::new(),
         };
         graph.start.push(0);
         graph.unused_start.push(0);
-        let mut addressed = Bits::new(len);
+        let mut addressed = BitSet::<u32>::new(len);
         for (at, summary) in summaries {
             if summary.key != *at {
                 return Err(ImportError::Key { at: *at, says: summary.key });
@@ -268,14 +248,14 @@ impl<'a> Graph<'a> {
             for key in &summary.addressed {
                 let node = index.get(&keys, key);
                 if node != NONE {
-                    addressed.set(node);
+                    addressed.insert(node);
                 }
             }
             graph.summaries.push(summary);
         }
         for (node, summary) in graph.summaries.iter().enumerate() {
-            if !summary.external && !addressed.get(node as u32) {
-                graph.closed.set(node as u32);
+            if !summary.external && !addressed.contains(node as u32) {
+                graph.closed.insert(node as u32);
             }
         }
         graph.keys = keys;
@@ -303,21 +283,21 @@ impl<'a> Graph<'a> {
         start.push(0u32);
         let mut total = 0u32;
         for (node, summary) in self.summaries.iter().enumerate() {
-            if self.closed.get(node as u32) {
+            if self.closed.contains(node as u32) {
                 total = total.checked_add(summary.params).expect("fewer than 2^32 parameters in all");
             }
             start.push(total);
         }
-        let mut passed = Passed { start, slots: vec![None; total as usize], reached: Bits::new(self.keys.len()) };
+        let mut passed = Passed { start, slots: vec![None; total as usize], reached: BitSet::new(self.keys.len()) };
         for (caller, summary) in self.summaries.iter().enumerate() {
             for (call, &callee) in std::iter::zip(&summary.calls, self.calls(caller as u32)) {
-                if callee == NONE || !self.closed.get(callee) || call.count == 0 {
+                if callee == NONE || !self.closed.contains(callee) || call.count == 0 {
                     continue;
                 }
                 let range = passed.start[callee as usize] as usize..passed.start[callee as usize + 1] as usize;
                 let slots = &mut passed.slots[range];
-                if !passed.reached.get(callee) {
-                    passed.reached.set(callee);
+                if !passed.reached.contains(callee) {
+                    passed.reached.insert(callee);
                     for (at, slot) in slots.iter_mut().enumerate() {
                         *slot = match call.args.get(at) {
                             Some(arg @ Arg::Int { .. }) => Some(*arg),
@@ -419,7 +399,7 @@ impl<'a> Graph<'a> {
             }
         }
         blaze_ids::radix::sort(&mut callees[..]);
-        let constants = match passed.reached.get(importer) {
+        let constants = match passed.reached.contains(importer) {
             true => passed
                 .of(importer)
                 .iter()
@@ -438,7 +418,7 @@ impl<'a> Graph<'a> {
                 .collect(),
             dead: callees
                 .iter()
-                .filter(|&&it| self.closed.get(it) && !self.unused(it).is_empty())
+                .filter(|&&it| self.closed.contains(it) && !self.unused(it).is_empty())
                 .map(|&it| (self.keys[it as usize], self.unused(it).to_vec()))
                 .collect(),
         }
@@ -486,7 +466,7 @@ impl<'a> Graph<'a> {
 struct Passed {
     start: Vec<u32>,
     slots: Vec<Option<Arg>>,
-    reached: Bits,
+    reached: BitSet<u32>,
 }
 
 impl Passed {
@@ -550,7 +530,7 @@ fn components(start: &[u32], edges: &[u32]) -> (Vec<u32>, Vec<u32>) {
     let len = start.len() - 1;
     let mut index = vec![NONE; len];
     let mut low = vec![0u32; len];
-    let mut on_stack = Bits::new(len);
+    let mut on_stack = BitSet::<u32>::new(len);
     let mut stack = Vec::new();
     let mut order = Vec::with_capacity(len);
     let mut bounds = vec![0u32];
@@ -564,7 +544,7 @@ fn components(start: &[u32], edges: &[u32]) -> (Vec<u32>, Vec<u32>) {
         low[root as usize] = next;
         next += 1;
         stack.push(root);
-        on_stack.set(root);
+        on_stack.insert(root);
         work.push((root, start[root as usize]));
         while let Some(&(node, edge)) = work.last() {
             if edge < start[node as usize + 1] {
@@ -575,9 +555,9 @@ fn components(start: &[u32], edges: &[u32]) -> (Vec<u32>, Vec<u32>) {
                     low[to as usize] = next;
                     next += 1;
                     stack.push(to);
-                    on_stack.set(to);
+                    on_stack.insert(to);
                     work.push((to, start[to as usize]));
-                } else if on_stack.get(to) {
+                } else if on_stack.contains(to) {
                     low[node as usize] = low[node as usize].min(index[to as usize]);
                 }
                 continue;
@@ -590,7 +570,7 @@ fn components(start: &[u32], edges: &[u32]) -> (Vec<u32>, Vec<u32>) {
                 let from = order.len();
                 loop {
                     let member = stack.pop().expect("the component's root is on the stack");
-                    on_stack.unset(member);
+                    on_stack.remove(member);
                     order.push(member);
                     if member == node {
                         break;

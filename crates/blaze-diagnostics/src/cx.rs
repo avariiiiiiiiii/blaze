@@ -1,9 +1,15 @@
 //! What a diagnostic is lowered with: the crate it is of, the names rustc gives files, spans
 //! as rustc gives them (in the file a macro was called in, or in the macro's own definition
 //! when it is the crate's), the text of what a span covers, rustc's printing of types and
-//! paths, and the keys of the facts a diagnostic read.
+//! paths, and the keys of the facts a diagnostic read. It also holds what every pass of one
+//! check shares, each made the first time a pass asks: the walk of the crate's syntax, the
+//! HIR lint levels, and the set of lints that may fire.
 
-use std::cell::{OnceCell, RefCell};
+use std::{
+    cell::{OnceCell, RefCell},
+    collections::HashMap,
+    sync::LazyLock,
+};
 
 use base_db::Db;
 use blaze_items::{Fact, ItemId, ItemKey, NameHash, SimplifiedType};
@@ -17,19 +23,47 @@ use syntax::{
     ast::{self, HasAttrs as _},
 };
 
-use crate::model::{Expansion, MacroKind, Span};
+use crate::{
+    lints::{
+        ItemWalk, LevelMap,
+        registry::{LintId, LintSet},
+        syntax::Walk,
+    },
+    model::{Expansion, MacroKind, Span},
+};
 
-/// The names files are shown by.
-pub trait Files {
-    /// The name rustc gives `file` in a diagnostic: from the root of the workspace when it is
-    /// below it, as cargo runs rustc there, else its whole path.
-    fn name(&self, file: FileId) -> String;
+/// The names files are shown by: the front end's path of each file, and the root of the
+/// workspace they are named from.
+#[derive(Clone, Copy)]
+pub struct Files<'a> {
+    paths: &'a HashMap<FileId, String>,
+    root: &'a str,
 }
 
-/// Files named by a map, as the tests and a caller that knows every file's name have them.
-impl Files for FxHashMap<FileId, String> {
-    fn name(&self, file: FileId) -> String {
-        self.get(&file).cloned().unwrap_or_else(|| panic!("no name given for file {file:?}"))
+impl<'a> Files<'a> {
+    /// `paths` named from `root`; a `root` of `""` keeps each relative path whole, as the tests'
+    /// paths, already names, are.
+    pub fn new(paths: &'a HashMap<FileId, String>, root: &'a str) -> Files<'a> {
+        Files { paths, root }
+    }
+
+    /// The name rustc gives `file` in a diagnostic, by [`Files::relative`]; a file the front end
+    /// has no path for is `<file N>`.
+    pub fn name(&self, file: FileId) -> String {
+        match self.paths.get(&file) {
+            Some(path) => Files::relative(path, self.root).to_owned(),
+            None => format!("<file {}>", file.index()),
+        }
+    }
+
+    /// The name rustc gives `path`: from `root` when it is below it, as cargo runs rustc there,
+    /// else the whole path, as `root` itself keeps it.
+    pub fn relative<'p>(path: &'p str, root: &str) -> &'p str {
+        let root = root.trim_end_matches('/');
+        match path.strip_prefix(root).and_then(|rest| rest.strip_prefix('/')) {
+            Some(rest) if !rest.is_empty() => rest,
+            _ => path,
+        }
     }
 }
 
@@ -40,7 +74,7 @@ pub struct Cx<'a, 'db> {
     pub krate: hir::Crate,
     pub edition: Edition,
     pub display_target: DisplayTarget,
-    files: &'a dyn Files,
+    files: Files<'a>,
     /// The check's task frame: what a pass builds for the crate (numberings, worklists,
     /// bitsets) is allocated here, `Vec<T, &Frame>`, and freed when the check returns.
     frame: &'a Frame,
@@ -51,13 +85,21 @@ pub struct Cx<'a, 'db> {
     named: RefCell<FxHashMap<String, FileId>>,
     /// The paths types are printed by, made the first time one is printed.
     paths: OnceCell<crate::print::Paths>,
+    /// The crate as rustc's early lint pass walks it, made the first time a pass asks.
+    walk: OnceCell<Walk<'db>>,
+    /// The crate's items as rustc's item passes visit them, made the first time a pass asks.
+    items: OnceCell<ItemWalk>,
+    /// The HIR lint levels, made the first time a level is asked and filled in as levels are.
+    levels: RefCell<Option<LevelMap<'db>>>,
+    /// The lints that may fire anywhere in the crate, made the first time a pass asks.
+    may_fire: OnceCell<LintSet>,
 }
 
 impl<'a, 'db> Cx<'a, 'db> {
     pub fn new(
         sema: &'a Semantics<'db>,
         krate: hir::Crate,
-        files: &'a dyn Files,
+        files: Files<'a>,
         frame: &'a Frame,
     ) -> Cx<'a, 'db> {
         let db = sema.db;
@@ -72,6 +114,10 @@ impl<'a, 'db> Cx<'a, 'db> {
             lints: None,
             named: RefCell::new(FxHashMap::default()),
             paths: OnceCell::new(),
+            walk: OnceCell::new(),
+            items: OnceCell::new(),
+            levels: RefCell::new(None),
+            may_fire: OnceCell::new(),
         }
     }
 
@@ -80,23 +126,70 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.frame
     }
 
+    /// The names the check's files are shown by.
+    pub fn files(&self) -> Files<'a> {
+        self.files
+    }
+
     /// What rustc's printing of paths reads: the crate's visible names, for trimmed paths.
     pub(crate) fn paths(&self) -> &crate::print::Paths {
         self.paths.get_or_init(|| crate::print::Paths::new(self))
     }
 
-    /// The context checking with the lint flags `lints`.
+    /// The context checking with the lint flags `lints`, before anything was asked of it.
     pub fn with_lints(self, lints: &'a crate::lints::CommandLine) -> Cx<'a, 'db> {
+        assert!(
+            self.walk.get().is_none() && self.levels.borrow().is_none() && self.may_fire.get().is_none(),
+            "the lint flags are given before a level is asked"
+        );
         Cx { lints: Some(lints), ..self }
     }
 
-    /// The level `lint` has at `at`, from the attributes there and the lint flags, as rustc
-    /// decides it (`unsafe_op_in_unsafe_fn`'s level changes E0133's words).
-    pub fn lint_level(&self, lint: &str, at: InFile<SyntaxNodePtr>) -> crate::lints::Level {
-        match self.lints {
-            Some(cmd) => crate::lints::level_at(self, cmd, lint, at),
-            None => crate::lints::level_at(self, &crate::lints::CommandLine::default(), lint, at),
-        }
+    /// The lint flags the crate is checked with: rustc's defaults when none were given.
+    pub fn lint_flags(&self) -> &'a crate::lints::CommandLine {
+        static DEFAULT: LazyLock<crate::lints::CommandLine> = LazyLock::new(crate::lints::CommandLine::default);
+        self.lints.unwrap_or(&*DEFAULT)
+    }
+
+    /// The crate as rustc's early lint pass walks it: made once per check, for every pass that
+    /// walks the crate's syntax.
+    pub(crate) fn walk(&self) -> &Walk<'db> {
+        self.walk.get_or_init(|| Walk::of(self))
+    }
+
+    /// The crate's items in the order rustc's item passes visit them: made once per check, for
+    /// the item lints before the abort and after it.
+    pub(crate) fn items(&self) -> &ItemWalk {
+        self.items.get_or_init(|| ItemWalk::of(self))
+    }
+
+    /// The level `lint` has at `at`, from the attributes there and around it and the lint
+    /// flags, as rustc's HIR levels decide it (`unsafe_op_in_unsafe_fn`'s level changes E0133's
+    /// words). The levels are rustc's `ShallowLintLevelMap`, kept for the check: asked again at
+    /// a node, or at one whose set is known, it is one hash probe, with nothing allocated.
+    pub fn lint_level(&self, lint: LintId, at: InFile<SyntaxNodePtr>) -> crate::lints::Level {
+        let cmd = self.lint_flags();
+        let mut levels = self.levels.borrow_mut();
+        let levels = levels.get_or_insert_with(|| LevelMap::new(self, cmd));
+        levels.level(self, cmd, lint, at)
+    }
+
+    /// Whether a diagnostic of `lint` may be shown anywhere in the crate: false when the lint
+    /// flags and every lint attribute leave it allowed (rustc's `lints_that_dont_need_to_run`),
+    /// so a pass that gives nothing but it can be skipped. The set is made once per check from
+    /// one scan of the walk's attributes; after that this is one bit test.
+    pub fn lint_may_fire(&self, lint: LintId) -> bool {
+        self.lints_that_may_fire().contains(lint)
+    }
+
+    /// Whether a diagnostic of some lint of `lints` may be shown: [`Cx::lint_may_fire`] of a
+    /// pass's lints at once, one AND per word.
+    pub fn any_may_fire(&self, lints: &LintSet) -> bool {
+        self.lints_that_may_fire().intersects(lints)
+    }
+
+    fn lints_that_may_fire(&self) -> &LintSet {
+        self.may_fire.get_or_init(|| crate::lints::may_fire(self, self.lint_flags(), self.walk()))
     }
 
     /// Whether cargo runs the compile (rustc's `was_invoked_from_cargo`: `CARGO_CRATE_NAME` is
@@ -108,7 +201,10 @@ impl<'a, 'db> Cx<'a, 'db> {
     /// The name rustc shows `file` by.
     pub fn file_name(&self, file: FileId) -> String {
         let name = self.files.name(file);
-        self.named.borrow_mut().entry(name.clone()).or_insert(file);
+        let mut named = self.named.borrow_mut();
+        if !named.contains_key(name.as_str()) {
+            named.insert(name.clone(), file); // alloc: once per file named
+        }
         name
     }
 
@@ -217,7 +313,15 @@ impl<'a, 'db> Cx<'a, 'db> {
                 let item = id.to_node(db);
                 Some(self.span_in_file(file, signature_range(&item)))
             }
-            _ => None,
+            MacroDefKind::Declarative(id, _)
+            | MacroDefKind::BuiltIn(id, _)
+            | MacroDefKind::BuiltInAttr(id, _)
+            | MacroDefKind::BuiltInDerive(id, _)
+            | MacroDefKind::BuiltInEager(id, _)
+            | MacroDefKind::UnimplementedBuiltIn(id) => {
+                let item = id.to_node(db);
+                Some(self.span(id.with_value(item_range(item.syntax()))))
+            }
         };
         Some(Expansion { call_site, kind, name, def_site })
     }
@@ -400,5 +504,22 @@ mod tests {
         let attr = first::<ast::Attr>(text);
         let paths: Vec<_> = derive_paths(&attr).into_iter().map(|(range, it)| (&text[range], it)).collect();
         assert_eq!(paths, [("Debug", "Debug".to_owned()), ("serde::Serialize", "serde::Serialize".to_owned())]);
+    }
+
+    #[test]
+    fn files_are_named_from_the_root_below_it() {
+        assert_eq!(Files::relative("/ws/src/lib.rs", "/ws"), "src/lib.rs");
+        assert_eq!(Files::relative("/ws/src/lib.rs", "/ws/"), "src/lib.rs");
+        assert_eq!(Files::relative("/ws", "/ws"), "/ws");
+        assert_eq!(Files::relative("/ws/", "/ws"), "/ws/");
+        assert_eq!(Files::relative("/wsx/lib.rs", "/ws"), "/wsx/lib.rs");
+        assert_eq!(Files::relative("/std/lib.rs", "/ws"), "/std/lib.rs");
+        assert_eq!(Files::relative("src/lib.rs", ""), "src/lib.rs");
+        assert_eq!(Files::relative("$DIR/a.rs", ""), "$DIR/a.rs");
+
+        let paths = HashMap::from([(FileId::from_raw(0), "/ws/src/main.rs".to_owned())]);
+        let files = Files::new(&paths, "/ws");
+        assert_eq!(files.name(FileId::from_raw(0)), "src/main.rs");
+        assert_eq!(files.name(FileId::from_raw(7)), "<file 7>");
     }
 }

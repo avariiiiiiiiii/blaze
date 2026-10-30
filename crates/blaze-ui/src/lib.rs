@@ -30,10 +30,14 @@ mod plain;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 pub use live::{FRAME_NS, Live};
 pub use plain::Plain;
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::hash::BuildHasher;
 
 use blaze_ids::radix;
@@ -110,7 +114,7 @@ struct Index {
     nodes: FxHashMap<u32, u32>,
     /// The steps under way, by index in [`Build::steps`], in the order they began.
     open: Vec<u32>,
-    /// Each kind of step begun, in the order it first began ([`Build::strip`]).
+    /// Each kind of step begun, in the order it first began ([`Build::strip_into`]).
     kinds: Vec<Kind>,
     /// The functions of every crate together.
     fns: Fns,
@@ -139,6 +143,9 @@ struct Index {
     flips: Vec<u32>,
     /// The order of the nodes of an [`Event::Nodes`] as it is read, kept for the next.
     order: Order,
+    /// Entries of [`Build::compiling`] a shorter list dropped, their names' buffers kept for
+    /// a longer one.
+    spare: Vec<(Slow, u64)>,
 }
 
 /// A kind of step begun: how many of it are under way, how long those done took, and the
@@ -295,9 +302,9 @@ pub struct Unnamed {
 /// that takes long has a name.
 pub const UNNAMED_NS: u64 = 1_000_000_000;
 
-/// A kind of step in the line of steps ([`Build::strip`]): under way or done, how long all
+/// A kind of step in the line of steps ([`Build::strip_into`]): under way or done, how long all
 /// of its kind took, and the count of the last.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Strip {
     pub step: Step,
     pub running: bool,
@@ -305,7 +312,7 @@ pub struct Strip {
     pub count: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Stepped {
     pub step: Step,
     pub of: Option<String>,
@@ -315,7 +322,7 @@ pub struct Stepped {
     pub progress: Option<Progress>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Progress {
     pub done: u64,
     pub total: u64,
@@ -331,6 +338,7 @@ impl Stepped {
     /// `3/14 files`, or `1200 fns` while the total is not known; nothing before a count.
     pub fn count(&self) -> Option<String> {
         let progress = self.progress.as_ref()?;
+        // alloc: the CLI's form, once per ask; the renderers write `Count` in place
         Some(Count(progress, self.step).to_string())
     }
 }
@@ -432,7 +440,7 @@ fn crate_state(kind: NodeKind, state: &NodeState) -> CrateState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Crated {
     pub name: String,
     pub state: CrateState,
@@ -452,6 +460,7 @@ pub struct Crated {
 impl Crated {
     fn waiting(name: &str, at: u64) -> Crated {
         let (fns, state) = (Fns::default(), CrateState::Waiting);
+        // alloc: once per row, its name kept for the build (the index hashes it, not a copy)
         let name = name.to_owned();
         let doing = None;
         Crated { name, state, doing, fns, began_ns: at, ended_ns: None, since_ns: at, busy_ns: 0 }
@@ -505,7 +514,7 @@ fn busy(state: CrateState) -> bool {
     matches!(state, CrateState::Resolving | CrateState::Checking | CrateState::Running)
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Finished {
     pub ok: bool,
     pub summary: Summary,
@@ -550,12 +559,14 @@ impl Build {
         self.last_ns = self.last_ns.max(at);
         match &record.event {
             Event::Began { command, .. } => {
+                // clone: once per build, the command it was asked for
                 self.command = Some(command.clone());
                 Change::Nothing
             }
             Event::Started { step, of } => {
                 self.named(at);
                 let index = self.steps.len();
+                // clone: kept for the build, one per step begun
                 let (of, began_ns, ended_ns, progress) = (of.clone(), at, None, None);
                 self.steps.push(Stepped { step: *step, of, began_ns, ended_ns, progress });
                 self.index.open.push(index as u32);
@@ -572,6 +583,7 @@ impl Build {
                             progress.longest.clone_from(longest);
                         }
                         none => {
+                            // clone: once per step, its first progress; later ones reuse it
                             let longest = longest.clone();
                             *none = Some(Progress { done: *done, total: *total, longest });
                         }
@@ -599,6 +611,7 @@ impl Build {
                         Change::Nothing
                     }
                     Err(why) => {
+                        // alloc: error path, a record that could not be read
                         self.malformed.push(why.to_string());
                         Change::Malformed(self.malformed.len() - 1)
                     }
@@ -618,6 +631,7 @@ impl Build {
                 None => Change::Nothing,
             },
             Event::Cache { cache } => {
+                // clone: once per build
                 self.cache = Some(cache.clone());
                 Change::Nothing
             }
@@ -658,6 +672,7 @@ impl Build {
                 Change::Crate { at: index, moved }
             }
             Event::Rebuilt { name, krate, cause } => {
+                // clone: kept for the last line, one per function the daemon lists as rebuilt
                 self.rebuilt.push((name.clone(), krate.clone(), cause.clone()));
                 Change::Rebuilt(self.rebuilt.len() - 1)
             }
@@ -666,18 +681,25 @@ impl Build {
                 Change::Nothing
             }
             Event::Refused { name, why } => {
+                // clone: error path, a crate blaze does not build
                 self.refused.push((name.clone(), why.clone()));
                 Change::Refused(self.refused.len() - 1)
             }
             Event::Said { level, text } => Change::Said(*level, text),
             Event::Finished { ok, summary } => {
                 self.named(at);
-                let (chain, chain_ns) = self.critical_path(at);
-                let chain = chain.iter().rev().map(|&it| self.crates[it].name.clone()).collect();
+                // alloc: once per build, the rows that held it up
+                let mut rows = Vec::new();
+                let chain_ns = self.critical_path_into(at, &mut rows);
+                // clone: once per build, the names of what held it up
+                let chain = rows.iter().rev().map(|&it| self.crates[it].name.clone()).collect();
+                // clone: once per build, the summary it ends with
                 let (ok, summary, unnamed) = (*ok, summary.clone(), self.unnamed);
+                // alloc: once per build
                 let cores = summary.slowest.iter().map(|it| self.busy_in(it, at)).collect();
                 let cores_of = self.cores_of;
                 self.compiling.clear();
+                // clone: once per build; `Build::slowest` stays as the records said it
                 let slowest = self.slowest.clone();
                 self.finished = Some(Finished {
                     ok,
@@ -706,15 +728,30 @@ impl Build {
             }
             Event::Compiling { functions } => {
                 let since = |it: &Slow| at.saturating_sub(it.ns);
-                self.compiling.truncate(functions.len());
-                for (kept, it) in self.compiling.iter_mut().zip(functions) {
+                let spare = &mut self.index.spare;
+                while self.compiling.len() > functions.len() {
+                    spare.extend(self.compiling.pop());
+                }
+                let write = |kept: &mut (Slow, u64), it: &Slow| {
                     kept.0.krate.clone_from(&it.krate);
                     kept.0.name.clone_from(&it.name);
                     kept.0.ns = it.ns;
                     kept.1 = since(it);
+                };
+                for (kept, it) in self.compiling.iter_mut().zip(functions) {
+                    write(kept, it);
                 }
-                let kept = self.compiling.len();
-                self.compiling.extend(functions[kept..].iter().map(|it| (it.clone(), since(it))));
+                for it in &functions[self.compiling.len()..] {
+                    let entry = match spare.pop() {
+                        Some(mut entry) => {
+                            write(&mut entry, it);
+                            entry
+                        }
+                        // clone: a list longer than any said before
+                        None => (it.clone(), since(it)),
+                    };
+                    self.compiling.push(entry);
+                }
                 Change::Nothing
             }
             Event::Slowest { functions } => {
@@ -782,7 +819,8 @@ impl Build {
     }
 
     /// The functions of crate `krate` compiling for [`SLOW_NS`] or more by `now_ns`, longest
-    /// first: their names and for how long.
+    /// first: their names and for how long. The scan the tests check `compiling_top` with.
+    #[cfg(test)]
     pub fn compiling_of(&self, krate: &str, now_ns: u64) -> Vec<(&str, u64)> {
         let of = self.compiling.iter().filter(|(it, _)| it.krate == krate);
         let of = of.map(|(it, since)| (it.name.as_str(), now_ns.saturating_sub(*since)));
@@ -791,8 +829,9 @@ impl Build {
         of
     }
 
-    /// The first `N` of [`Build::compiling_of`], each as its index in [`Build::compiling`],
-    /// with no allocation, and how many there are of them.
+    /// The functions of crate `krate` compiling for [`SLOW_NS`] or more by `now_ns`, longest
+    /// first, the first `N` of them, each as its index in [`Build::compiling`], with no
+    /// allocation, and how many there are of them.
     fn compiling_top<const N: usize>(
         &self,
         krate: &str,
@@ -827,7 +866,9 @@ impl Build {
     }
 
     /// Each kind of step begun, in the order it first began: whether one of it is under way,
-    /// and how long they took by `now_ns`. Done ones too quick to matter are left out.
+    /// and how long they took by `now_ns`. Done ones too quick to matter are left out. The
+    /// form the tests compare with the old renderer's; the region reads `strip_into`.
+    #[cfg(test)]
     pub fn strip(&self, now_ns: u64) -> Vec<Strip> {
         let mut rows = Vec::new();
         self.strip_into(now_ns, &mut rows);
@@ -841,8 +882,10 @@ impl Build {
         strip.collect()
     }
 
-    /// [`Build::strip`] into `rows`, from the kinds' totals: what a step of each kind under
-    /// way took so far is all it adds up, not every step begun.
+    /// Each kind of step begun, in the order it first began, into `rows` (what [`Strip`]
+    /// says, its count as the step that has it), from the kinds' totals: what a step of each
+    /// kind under way took so far is all it adds up, not every step begun. Done ones too quick
+    /// to matter are left out.
     pub(crate) fn strip_into(&self, now_ns: u64, rows: &mut Vec<StripRow>) {
         rows.clear();
         rows.extend(self.index.kinds.iter().map(|it| StripRow {
@@ -868,11 +911,9 @@ impl Build {
         // Shorter steps say nothing of where the time went.
         const GAP_NS: u64 = 50_000_000;
         const STEP_NS: u64 = 10_000_000;
-        let cores = |from: u64, to: u64| match self.busy_between(from, to) {
-            Some((busy, _)) => format!("  {busy:.1}/{} cores", self.cores_of),
-            None => String::new(),
-        };
-        let mut rows: Vec<(String, u64, String)> = Vec::new();
+        let cores = |from: u64, to: u64| self.busy_between(from, to).map(|it| it.0);
+        // alloc: `blaze why`, once per command: a row per step
+        let mut rows: Vec<(String, u64, Option<f64>)> = Vec::new();
         let mut free = 0;
         for stepped in &self.steps {
             if stepped.began_ns.saturating_sub(free) >= GAP_NS {
@@ -885,11 +926,14 @@ impl Build {
             if took_ns < STEP_NS {
                 continue;
             }
-            let mut what = short(stepped.step, stepped.of.as_deref());
-            // `check 74 files` has its count already.
+            // alloc: `blaze why`, once per command
+            let mut what = Short(stepped.step, stepped.of.as_deref()).to_string();
+            // `check 74 files` has its count already: the count's last word is what it is of.
             let of = stepped.of.as_deref().and_then(|it| it.rsplit(' ').next());
-            if let Some(count) = stepped.count().filter(|it| it.rsplit(' ').next() != of) {
-                what = format!("{what} {count}");
+            if let Some(progress) = &stepped.progress
+                && stepped.step.counts().rsplit(' ').next() != of
+            {
+                put!(&mut what, " {}", Count(progress, stepped.step));
             }
             rows.push((what, took_ns, cores(stepped.began_ns, ended)));
         }
@@ -897,9 +941,17 @@ impl Build {
             rows.push(("at no step".into(), now_ns - free, cores(free, now_ns)));
         }
         let width = rows.iter().map(|it| it.0.chars().count()).max().unwrap_or(0);
-        rows.iter()
-            .map(|(what, ns, cores)| format!("{what:<width$}  {:>6}{cores}", took(*ns)))
-            .collect()
+        let cores_of = self.cores_of;
+        let line = |(what, ns, busy): &(String, u64, Option<f64>)| {
+            // alloc: `blaze why`, once per command: a line per row
+            let mut line = format!("{what:<width$}  {:>6}", took(*ns));
+            if let Some(busy) = busy {
+                put!(&mut line, "  {busy:.1}/{cores_of} cores");
+            }
+            line
+        };
+        // alloc: `blaze why`, once per command
+        rows.iter().map(line).collect()
     }
 
     /// How many cores the worker kept busy at `at`, in hundredths: as it said last before.
@@ -948,9 +1000,11 @@ impl Build {
     pub fn summary(&self, took_ns: u64, error: Option<String>) -> Summary {
         const LISTED: usize = 8;
         let rebuilt = self.rebuilt.iter().take(LISTED);
+        // clone: once per build, the summary handed out
         let rebuilt = rebuilt.map(|(name, _, cause)| (name.clone(), cause.clone())).collect();
         let more = self.rebuilt.len().saturating_sub(LISTED) as u64 + self.unlisted;
         let crates = self.crates.len() - self.in_state(CrateState::Waiting);
+        // clone: once per build, the summary handed out
         let (fns, cache, slowest) = (self.fns(), self.cache.clone(), self.slowest(took_ns));
         Summary { took_ns, crates: crates as u64, fns, rebuilt, more, error, cache, slowest }
     }
@@ -960,6 +1014,7 @@ impl Build {
     /// a part of the build worth naming.
     pub fn slowest(&self, now_ns: u64) -> Vec<Took> {
         const LISTED: usize = 3;
+        // alloc: once per build, for its summary
         let mut by_step: Vec<Took> = Vec::new();
         for stepped in &self.steps {
             let took_ns = stepped.ended_ns.unwrap_or(now_ns).saturating_sub(stepped.began_ns);
@@ -973,6 +1028,7 @@ impl Build {
                         took.of = None;
                     }
                 }
+                // clone: once per build, for its summary
                 None => by_step.push(Took { step: stepped.step, of: stepped.of.clone(), took_ns }),
             }
         }
@@ -989,7 +1045,15 @@ impl Build {
     /// with; and the time from that one's start to the last one's end, by `now_ns` if it is
     /// not done. Empty before the graph says it.
     pub fn critical_path(&self, now_ns: u64) -> (Vec<usize>, u64) {
-        let mut chain: Vec<usize> = Vec::new();
+        // alloc: once per `blaze why`; the region reuses its own (`critical_path_into`)
+        let mut chain = Vec::new();
+        let took_ns = self.critical_path_into(now_ns, &mut chain);
+        (chain, took_ns)
+    }
+
+    /// [`Build::critical_path`], its rows written into `chain`.
+    pub(crate) fn critical_path_into(&self, now_ns: u64, chain: &mut Vec<usize>) -> u64 {
+        chain.clear();
         for &node in self.critical.iter().rev() {
             let row = self.graph[node].row as usize;
             if !chain.contains(&row) {
@@ -997,7 +1061,7 @@ impl Build {
             }
         }
         let (Some(&last), Some(&first)) = (chain.first(), chain.last()) else {
-            return (Vec::new(), 0);
+            return 0;
         };
         let last = &self.crates[last];
         let ended = match (last.ended_ns, last.is_busy()) {
@@ -1006,7 +1070,7 @@ impl Build {
             // Resolved and waiting to be compiled: done with what it did last.
             (None, false) => last.since_ns,
         };
-        (chain, ended.saturating_sub(self.crates[first].began_ns))
+        ended.saturating_sub(self.crates[first].began_ns)
     }
 
     /// The functions of every crate together.
@@ -1018,15 +1082,29 @@ impl Build {
 /// The last `most` characters of `text`, after an ellipsis when it is longer: a function's
 /// path says which it is at its end.
 pub fn tail(text: &str, most: usize) -> String {
-    let count = text.chars().count();
-    match count > most {
-        true => ['\u{2026}'].into_iter().chain(text.chars().skip(count + 1 - most)).collect(),
-        false => text.to_owned(),
+    // alloc: the CLI's form; the last lines write [`Tail`] in place
+    Tail(text, most).to_string()
+}
+
+/// [`tail`] as it is written.
+#[derive(Clone, Copy)]
+struct Tail<'a>(&'a str, usize);
+
+impl fmt::Display for Tail<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (text, most) = (self.0, self.1);
+        let count = text.chars().count();
+        if count <= most {
+            return f.write_str(text);
+        }
+        f.write_char('\u{2026}')?;
+        text.chars().skip(count + 1 - most).try_for_each(|it| f.write_char(it))
     }
 }
 
 /// A duration as a person reads it: `0.21s`, `33.2s`, `1m17s`.
 pub fn took(ns: u64) -> String {
+    // alloc: the CLI's form, padded by its callers; the renderers write [`Dur`] in place
     Dur(ns).to_string()
 }
 
@@ -1076,10 +1154,11 @@ fn took_ns(finished: &Finished) -> u64 {
 pub fn last_lines(finished: &Finished, color: bool, errors_said: bool) -> Vec<String> {
     let quick = took_ns(finished) < WHY_NS;
     if fresh(finished) && quick || !finished.ok && errors_said {
+        // alloc: none, an empty `Vec` holds no buffer
         return Vec::new();
     }
-    let mut lines = vec![summary_line(finished, color)];
-    lines.extend(why_lines(finished, color));
+    let mut lines = why_lines(finished, color);
+    lines.insert(0, summary_line(finished, color));
     lines
 }
 
@@ -1096,62 +1175,93 @@ pub fn last_lines(finished: &Finished, color: bool, errors_said: bool) -> Vec<St
 pub fn why_lines(finished: &Finished, color: bool) -> Vec<String> {
     let summary = &finished.summary;
     let took_ns = took_ns(finished);
-    if took_ns < WHY_NS || !finished.ok {
-        return Vec::new();
-    }
-    let status =
-        |word: &str, rest: &str| format!("{} {rest}", paint(GREEN, &format!("{word:>12}"), color));
+    // alloc: once per build, its last lines
     let mut lines = Vec::new();
+    if took_ns < WHY_NS || !finished.ok {
+        return lines;
+    }
+    // alloc: once per build, a last line
+    let new_line = String::new;
+    let started = |word: &str| {
+        let mut line = new_line();
+        status(&mut line, word, color);
+        line
+    };
     if !summary.slowest.is_empty() {
-        let steps: Vec<String> = summary
-            .slowest
-            .iter()
-            .enumerate()
-            .map(|(at, it)| {
-                let cores = match finished.cores.get(at).copied().flatten() {
-                    Some(busy) if at == 0 => format!(" ({busy:.1}/{} cores)", finished.cores_of),
-                    Some(busy) => format!(" ({busy:.1}/{})", finished.cores_of),
-                    None => String::new(),
-                };
-                format!("{} {}{cores}", short(it.step, it.of.as_deref()), took(it.took_ns))
-            })
-            .collect();
-        lines.push(status("Took", &format!("{}: {}", took(took_ns), steps.join(", "))));
+        let mut line = started("Took");
+        put!(&mut line, "{}: ", Dur(took_ns));
+        let of = finished.cores_of;
+        for (at, it) in summary.slowest.iter().enumerate() {
+            if at > 0 {
+                line.push_str(", ");
+            }
+            put!(&mut line, "{} {}", Short(it.step, it.of.as_deref()), Dur(it.took_ns));
+            match finished.cores.get(at).copied().flatten() {
+                Some(busy) if at == 0 => put!(&mut line, " ({busy:.1}/{of} cores)"),
+                Some(busy) => put!(&mut line, " ({busy:.1}/{of})"),
+                None => {}
+            }
+        }
+        lines.push(line);
     }
     if !finished.slowest.is_empty() {
         const LISTED: usize = 5;
-        let listed = finished.slowest.iter().take(LISTED);
-        let listed: Vec<String> =
-            listed.map(|it| format!("{} {}", tail(&it.name, 48), took(it.ns))).collect();
-        let more = match finished.slowest.len().saturating_sub(LISTED) {
-            0 => String::new(),
-            more => format!(" (and {more} more)"),
-        };
-        lines.push(status("Slowest", &format!("fns: {}{more}", listed.join(", "))));
+        let mut line = started("Slowest");
+        line.push_str("fns: ");
+        for (at, it) in finished.slowest.iter().take(LISTED).enumerate() {
+            if at > 0 {
+                line.push_str(", ");
+            }
+            put!(&mut line, "{} {}", Tail(&it.name, 48), Dur(it.ns));
+        }
+        match finished.slowest.len().saturating_sub(LISTED) {
+            0 => {}
+            more => put!(&mut line, " (and {more} more)"),
+        }
+        lines.push(line);
     }
     // The line before says what was compiled and kept; this says what it does not.
     if let Some(cache) = &summary.cache {
-        let rest = match &cache.cold {
-            Some(why) => Some(format!("cold: {why}")),
-            None if cache.fetched > 0 => Some(format!(
-                "{} found here, {} fetched from the remote store",
-                cache.found, cache.fetched
-            )),
-            None => None,
-        };
-        lines.extend(rest.map(|rest| status("Cache", &rest)));
+        match &cache.cold {
+            Some(why) => {
+                let mut line = started("Cache");
+                put!(&mut line, "cold: {why}");
+                lines.push(line);
+            }
+            None if cache.fetched > 0 => {
+                let mut line = started("Cache");
+                let (found, fetched) = (cache.found, cache.fetched);
+                put!(&mut line, "{found} found here, {fetched} fetched from the remote store");
+                lines.push(line);
+            }
+            None => {}
+        }
     }
     if finished.chain.len() > 1 && finished.chain_ns > 0 {
-        let chain = finished.chain.join(" \u{2192} ");
-        lines.push(status("Chain", &format!("{chain} {}", took(finished.chain_ns))));
+        let mut line = started("Chain");
+        for (at, name) in finished.chain.iter().enumerate() {
+            if at > 0 {
+                line.push_str(" \u{2192} ");
+            }
+            line.push_str(name);
+        }
+        put!(&mut line, " {}", Dur(finished.chain_ns));
+        lines.push(line);
     }
     if let Some(unnamed) = finished.unnamed.filter(|it| it.took_ns >= UNNAMED_NS) {
-        let after = unnamed.after.whole();
-        let rest = format!("{} with no step named, after {after}", took(unnamed.took_ns));
-        lines.push(said_line(Level::Warning, &rest, color));
+        let (mut line, after, took) = (new_line(), unnamed.after.whole(), Dur(unnamed.took_ns));
+        let warning = Level::Warning;
+        said(&mut line, warning, format_args!("{took} with no step named, after {after}"), color);
+        lines.push(line);
     }
     if !lines.is_empty() {
-        lines.push(paint(DIM, &format!("{:>12} `blaze why` says more", ""), color));
+        let mut line = new_line();
+        put!(
+            &mut line,
+            "{}",
+            Painted(DIM, format_args!("{:>12} `blaze why` says more", ""), color)
+        );
+        lines.push(line);
     }
     lines
 }
@@ -1178,13 +1288,19 @@ pub fn label(step: Step) -> &'static str {
 }
 
 /// A step as the steps line names it, with what it is of: `codegen anim`, `std of build scripts`.
-fn short(step: Step, of: Option<&str>) -> String {
-    match of {
-        None => label(step).to_owned(),
-        Some(of) => match of.strip_prefix("the standard library ") {
-            Some(rest) => format!("{} {rest}", label(step)),
-            None => format!("{} {of}", label(step)),
-        },
+#[derive(Clone, Copy)]
+struct Short<'a>(Step, Option<&'a str>);
+
+impl fmt::Display for Short<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = label(self.0);
+        match self.1 {
+            None => f.write_str(label),
+            Some(of) => {
+                let of = of.strip_prefix("the standard library ").unwrap_or(of);
+                write!(f, "{label} {of}")
+            }
+        }
     }
 }
 
@@ -1192,40 +1308,39 @@ fn short(step: Step, of: Option<&str>) -> String {
 /// Not cargo's `Finished`, which `blaze` says after it.
 pub fn summary_line(finished: &Finished, color: bool) -> String {
     let summary = &finished.summary;
-    let took = took(took_ns(finished));
+    let took = Dur(took_ns(finished));
+    // alloc: once per build, its last line
+    let mut line = String::new();
     if !finished.ok {
         let why = summary.error.as_deref().unwrap_or("the build failed");
-        return format!("{}: {why} (after {took})", paint(RED, "error", color));
+        put!(&mut line, "{}: {why} (after {took})", Painted(RED, "error", color));
+        return line;
     }
     let compiled = summary.fns.compiled();
-    let (word, what) = if !summary.rebuilt.is_empty() {
+    if !summary.rebuilt.is_empty() {
+        status(&mut line, "Rebuilt", color);
         let listed = summary.rebuilt.len() as u64 + summary.more;
-        let mut said = format!("{listed} {}: {}", plural(listed, "fn"), causes(&summary.rebuilt));
+        put!(&mut line, "{listed} fn{}: ", plural_s(listed));
+        causes(&mut line, &summary.rebuilt);
         if summary.more > 0 {
-            put!(&mut said, " and {} more", summary.more);
+            put!(&mut line, " and {} more", summary.more);
         }
-        ("Rebuilt", said)
     } else if compiled > 0 {
-        let kept = summary.fns.kept;
-        let crates = summary.crates;
-        let said = format!(
-            "{compiled} {} in {crates} {}, {kept} kept",
-            plural(compiled, "fn"),
-            plural(crates, "crate")
-        );
-        ("Compiled", said)
+        status(&mut line, "Compiled", color);
+        let (kept, crates) = (summary.fns.kept, summary.crates);
+        let (fns, crates_s) = (plural_s(compiled), plural_s(crates));
+        put!(&mut line, "{compiled} fn{fns} in {crates} crate{crates_s}, {kept} kept");
     } else if let Some(cache) = summary.cache.as_ref().filter(|it| it.found + it.fetched > 0) {
+        status(&mut line, "Built", color);
         let found = cache.found + cache.fetched;
-        let said = format!(
-            "from the store: {found} {} found, {} compiled",
-            plural(found, "fn"),
-            cache.compiled
-        );
-        ("Built", said)
+        let (fns, compiled) = (plural_s(found), cache.compiled);
+        put!(&mut line, "from the store: {found} fn{fns} found, {compiled} compiled");
     } else {
-        ("Fresh", "nothing to rebuild".to_owned())
-    };
-    format!("{} {what}; {took}", paint(GREEN, &format!("{word:>12}"), color))
+        status(&mut line, "Fresh", color);
+        line.push_str("nothing to rebuild");
+    }
+    put!(&mut line, "; {took}");
+    line
 }
 
 /// The word a step is said done with.
@@ -1334,22 +1449,23 @@ fn status(out: &mut String, word: &str, color: bool) {
     put!(out, "{} ", Painted(GREEN, format_args!("{word:>12}"), color));
 }
 
-/// `render (body edited), draw, tick (calls render)`: names with the same cause one after
-/// another say it once, after the last of them.
-fn causes(rebuilt: &[(String, Cause)]) -> String {
-    let mut said = String::new();
+/// `render (body edited), draw, tick (calls render)`, written into `out`: names with the same
+/// cause one after another say it once, after the last of them.
+fn causes(out: &mut String, rebuilt: &[(String, Cause)]) {
     for (at, (name, cause)) in rebuilt.iter().enumerate() {
         if at > 0 {
-            said.push_str(", ");
+            out.push_str(", ");
         }
-        said.push_str(name);
+        out.push_str(name);
         if rebuilt.get(at + 1).is_none_or(|next| next.1 != *cause) {
-            put!(&mut said, " ({})", cause.short());
+            put!(out, " ({})", cause.short());
         }
     }
-    said
 }
 
+/// `word`, plural but for one: the old renderer's (`tests/old.rs`); this one writes
+/// [`plural_s`].
+#[cfg(test)]
 fn plural(n: u64, word: &str) -> String {
     if n == 1 { word.to_owned() } else { format!("{word}s") }
 }
@@ -1365,11 +1481,8 @@ const RED: &str = "\x1b[1m\x1b[91m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
-fn paint(color: &str, text: &str, colored: bool) -> String {
-    if colored { format!("{color}{text}{RESET}") } else { text.to_owned() }
-}
-
-/// [`paint`] as it is written. It takes no width: pad what it paints.
+/// `T` written in `color` when `colored`, then the reset. It takes no width: pad what it
+/// paints.
 struct Painted<T>(&'static str, T, bool);
 
 impl<T: fmt::Display> fmt::Display for Painted<T> {
@@ -1381,14 +1494,7 @@ impl<T: fmt::Display> fmt::Display for Painted<T> {
     }
 }
 
-/// A line of `level`, as cargo writes them.
-fn said_line(level: Level, text: &str, color: bool) -> String {
-    let mut line = String::new();
-    said(&mut line, level, text, color);
-    line
-}
-
-/// [`said_line`], written into `out` with no newline.
+/// A line of `level`, as cargo writes them, written into `out` with no newline.
 fn said(out: &mut String, level: Level, text: impl fmt::Display, color: bool) {
     let (word, color_of) = match level {
         Level::Note => ("note", GREEN),

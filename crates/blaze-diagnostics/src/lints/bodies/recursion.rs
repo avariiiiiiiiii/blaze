@@ -13,6 +13,7 @@
 //! function, as rustc's does through its `UnwindResume`.
 
 use base_db::Db;
+use blaze_ids::bits::BitSet;
 use either::Either;
 use hir::InFile;
 use hir_def::{CallableDefId, DefWithBodyId, FunctionId, GenericDefId, ItemContainerId, Lookup, generics::GenericParams};
@@ -31,12 +32,15 @@ use rustc_type_ir::{
 };
 use syntax::{AstNode as _, ast};
 
-use super::{BodyCx, bits::Bits};
+use super::BodyCx;
 use crate::{
     cx::signature_range,
     lower::{Found, Phase},
     model::{Diag, Span},
 };
+
+/// The lints this module gives: it runs only when one may fire.
+pub(super) const LINTS: super::LintSet = super::lint_set(["unconditional_recursion"]);
 
 /// `CheckCallRecursion`: the calls of the function to itself, in `mir_promoted`.
 pub(super) fn calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
@@ -78,7 +82,7 @@ fn has_terminator(mir: &MirBody<'_>, kind: impl Fn(&TerminatorKind) -> bool) -> 
 /// that did not.
 fn function(b: &BodyCx<'_, '_>) -> Option<FunctionId> {
     match b.owner {
-        DefWithBodyId::FunctionId(it) if !b.mir_tainted => Some(it),
+        DefWithBodyId::FunctionId(it) if !b.mir_tainted() => Some(it),
         _ => None,
     }
 }
@@ -111,7 +115,8 @@ fn lint(b: &BodyCx<'_, '_>, calls: Option<Vec<MirSpan>>) -> Vec<Found> {
 /// count, nothing allocated per block or edge.
 fn search(mir: &MirBody<'_>, recursive: impl Fn(&Terminator) -> bool) -> Option<Vec<MirSpan>> {
     let blocks = mir.basic_blocks.len();
-    let (mut visited, mut settled, mut is_recursive) = (Bits::new(blocks), Bits::new(blocks), Bits::new(blocks));
+    let (mut visited, mut settled, mut is_recursive): (BitSet, BitSet, BitSet) =
+        (BitSet::new(blocks), BitSet::new(blocks), BitSet::new(blocks));
     let mut stack: Vec<(BasicBlockId, bool)> = Vec::with_capacity(blocks);
     stack.push((mir.start_block, false));
     let mut calls = Vec::new();

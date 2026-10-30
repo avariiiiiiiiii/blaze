@@ -49,6 +49,7 @@ pub enum How {
 
 /// What is told the functions of an object, a batch at a time: the number of the object,
 /// whether it is of the whole program rather than a patch, and the batch.
+// dyn: the observer blaze-engine installs once per process, told once per batch of functions
 pub type Sink = dyn Fn(u32, bool, Vec<Placed>) + Send + Sync;
 
 static SINK: RwLock<Option<Arc<Sink>>> = RwLock::new(None);

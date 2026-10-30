@@ -1187,8 +1187,7 @@ impl<'a> Cursor<'a> {
 
     /// An unsigned or signed LEB128, skipped.
     fn uleb(&mut self) -> Result<(), &'static str> {
-        while self.u8()? & 0x80 != 0 {}
-        Ok(())
+        blaze_format::leb::skip(self.bytes, &mut self.at).map_err(|_| "a truncated call frame entry")
     }
 
     fn string(&mut self) -> Result<&'a [u8], &'static str> {
@@ -1252,6 +1251,7 @@ fn x86_64_name(kind: u8) -> &'static str {
 #[cfg(test)]
 pub(super) mod tests {
     use blaze_codegen::Arch;
+    use blaze_ids::rng::SplitMix64;
     use object::macho;
 
     use super::read;
@@ -1985,18 +1985,6 @@ pub(super) mod tests {
         }
     }
 
-    /// xorshift64: the differential test's seeded inputs.
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0 % n
-        }
-    }
-
     /// An atom as the reader had it before it read in place: its section's name, its alignment,
     /// a copy of its bytes (`Data::Bytes`) or `Data::Zero`, its own fixups.
     type Atom = (String, u64, Data, Vec<NativeFixup>);
@@ -2131,7 +2119,7 @@ pub(super) mod tests {
     /// alternate entries at random places; `BRANCH26` and extern and non-extern `UNSIGNED`
     /// relocations in a shuffled table.
     fn seeded(seed: u64) -> Obj {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (seed + 1).wrapping_mul(0x2545_f491_4f6c_dd1d));
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15 ^ (seed + 1).wrapping_mul(0x2545_f491_4f6c_dd1d));
         const KINDS: [(&str, &str, u32); 4] = [
             ("__TEXT", "__text", TEXT),
             ("__DATA", "__data", 0),

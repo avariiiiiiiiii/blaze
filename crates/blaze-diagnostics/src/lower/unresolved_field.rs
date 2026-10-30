@@ -144,7 +144,7 @@ fn take_value_of_method(
     field: &str,
     ty: &str,
     field_span: Span,
-    at: &dyn Fn(TextRange) -> Span,
+    at: &impl Fn(TextRange) -> Span,
 ) -> Diag {
     let message = format!("attempted to take value of method `{field}` on type `{ty}`");
     let mut diag = Diag::error(Some("E0615"), message, field_span.clone());
@@ -243,7 +243,7 @@ fn no_such_field(
     ty: &str,
     field_span: Span,
     module: Option<hir::Module>,
-    at: &dyn Fn(TextRange) -> Span,
+    at: &impl Fn(TextRange) -> Span,
 ) -> Diag {
     let message = format!("no field `{field}` on type `{ty}`");
     let mut diag = Diag::error(Some("E0609"), message, field_span.clone());

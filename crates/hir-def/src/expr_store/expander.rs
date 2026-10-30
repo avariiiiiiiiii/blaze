@@ -109,7 +109,16 @@ impl<'db> Expander<'db> {
         let result = self.within_limit(db, |this| {
             let macro_call = this.in_file(&macro_call);
 
-            let expands_to = hir_expand::ExpandTo::from_call_site(macro_call.value);
+            let expands_to = match hir_expand::ExpandTo::of_call_site(macro_call.value) {
+                Ok(it) => it,
+                Err(parent) => {
+                    return ExpandResult::only_err(ExpandError::other(
+                        this.span_map.span_for_range(macro_call.value.syntax().text_range()),
+                        // alloc: an error's message, on the error path
+                        format!("blaze can't tell what a macro call in a `{parent:?}` expands to"),
+                    ));
+                }
+            };
             let ast_id = AstId::new(macro_call.file_id, this.ast_id_map().ast_id(macro_call.value));
             let path = macro_call.value.path().and_then(|path| {
                 let range = path.syntax().text_range();

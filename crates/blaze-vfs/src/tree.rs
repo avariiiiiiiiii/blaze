@@ -15,7 +15,11 @@ use std::{
     sync::Arc,
 };
 
-use blaze_ids::ContentId;
+use blaze_format::cursor::Put as _;
+use blaze_ids::{
+    ContentId,
+    bits::{BitIndex, BitSet},
+};
 use blaze_image::Corrupt;
 use hashbrown::{HashTable, hash_table};
 
@@ -29,6 +33,18 @@ use crate::{
 /// A node of a [`Tree`]. Only meaningful for the tree that made it, and only until it collects.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub(crate) struct NodeId(pub(crate) u32);
+
+impl BitIndex for NodeId {
+    #[inline]
+    fn to_bit(self) -> usize {
+        self.0 as usize
+    }
+
+    #[inline]
+    fn from_bit(bit: usize) -> NodeId {
+        NodeId(u32::from_bit(bit))
+    }
+}
 
 /// An interned entry name.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -293,10 +309,9 @@ impl Tree {
                 mode.git()
             };
             let name = self.name_bytes(name);
-            bytes.extend_from_slice(&code.to_le_bytes());
-            bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
-            bytes.extend_from_slice(name);
-            bytes.extend_from_slice(&self.id(child).0);
+            bytes.put_u32(code);
+            bytes.put_bytes_u64(name);
+            bytes.put_bytes(&self.id(child).0);
         }
         let id = ContentId::of(DIR_DOMAIN, &bytes);
         self.scratch = bytes;
@@ -789,28 +804,23 @@ impl Tree {
     /// node's new one, `None` for a node dropped.
     pub(crate) fn collect(&mut self, live: &mut [NodeId]) -> Vec<Option<NodeId>> {
         let len = self.len();
-        let mut reached = vec![0u64; len.div_ceil(64)];
+        let mut reached = BitSet::<NodeId>::new(len);
         let mut stack: Vec<NodeId> = live.iter().copied().chain([self.empty]).collect();
         while let Some(node) = stack.pop() {
-            let (word, bit) = (node.0 as usize / 64, 1u64 << (node.0 % 64));
-            if reached[word] & bit != 0 {
+            if !reached.insert(node) {
                 continue;
             }
-            reached[word] |= bit;
             if let Some(entries) = self.entries(node) {
                 stack.extend(entries.0.nodes.iter().map(|&it| NodeId(it)));
             }
         }
-        let count = reached.iter().map(|it| it.count_ones() as usize).sum();
+        let count = reached.count();
         let old = self.store.table();
         let mut next = Building::after(old, count);
         let mut renumbered: Vec<Option<NodeId>> = vec![None; len];
         let mut columns = Vec::new();
         // Children have smaller numbers than their parents, so they are renumbered first.
-        for at in 0..len as u32 {
-            if reached[at as usize / 64] & (1 << (at % 64)) == 0 {
-                continue;
-            }
+        for NodeId(at) in reached.iter() {
             let (id, shape) = (*old.id(at), old.shape(at));
             let node = if shape.is_dir() {
                 let from = old.entries(shape);

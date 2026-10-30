@@ -135,11 +135,6 @@ impl Features {
     }
 }
 
-/// The features the crate enables, as attribute parsing and the gates read them.
-pub(crate) fn enabled(cx: &Cx<'_, '_>, owners: &[Owner]) -> Features {
-    configured(cx, owners, &Flags::default()).0
-}
-
 /// The crate's `#![feature(..)]`s: each feature it names, with the attribute it is in.
 fn crate_features<'a>(owners: &'a [Owner]) -> Vec<Named<'a>> {
     owners.iter().find(|it| it.target == Target::Crate).map(|it| named(it).collect()).unwrap_or_default()

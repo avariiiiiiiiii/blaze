@@ -12,8 +12,8 @@ use std::{
 };
 
 use blaze_api::{
-    ApiError, Artifact, Envelope, FetchVerb, Level, Reach, Request, Response, SCHEMA, Table, Targets, TestOutcome,
-    TestResult, Ub, Verb, ViewRef,
+    ApiError, Artifact, Diagnostic, Envelope, FetchVerb, Level, Reach, Request, Response, SCHEMA, Table, Targets,
+    TestOutcome, TestResult, Ub, UnitOf, UnitTarget, Verb, ViewRef,
     frames::{self, Frames},
 };
 use blaze_cas::Store;
@@ -76,10 +76,37 @@ thread_local! {
     static LIBRARY_READS: Cell<usize> = const { Cell::new(0) };
     /// Whether the program's compile gives [`APP`] as its output at [`APP_AT`].
     static OUTPUT: Cell<bool> = const { Cell::new(false) };
+    /// Whether the program's compile warns twice, as its unit.
+    static WARNS: Cell<bool> = const { Cell::new(false) };
 }
 
 const APP: &[u8] = b"\x7fELF the program\n";
 const APP_AT: &str = "/w/target/debug/app";
+
+/// A warning of the program's unit, as its compile gives it.
+fn warning_of_app(message: &str) -> Diagnostic {
+    let target = UnitTarget {
+        doc: true,
+        kind: vec!["bin".into()],
+        name: "app".into(),
+        test: true,
+        doctest: false,
+        edition: "2021".into(),
+        src_path: "/w/src/main.rs".into(),
+        crate_types: vec!["bin".into()],
+    };
+    let unit = UnitOf { test: false, target, package_id: "app".into(), manifest_path: "/w/Cargo.toml".into() };
+    Diagnostic {
+        level: Level::Warning,
+        code: None,
+        message: message.to_owned(),
+        spans: Vec::new(),
+        children: Vec::new(),
+        facts: Vec::new(),
+        rendered: format!("warning: {message}\n\n"),
+        unit: Some(unit),
+    }
+}
 
 fn needed() -> Vec<Fetch> {
     vec![
@@ -465,7 +492,11 @@ impl Front for FakeFront {
             puts.push(Put { key, kind: blaze_cas::Kind::Output, bytes: APP.to_vec() });
             outputs.push(Output { path: APP_AT.into(), key, executable: true });
         }
-        Ok(Compiled { diagnostics: Vec::new(), ok: true, puts, outputs, artifact: None, macros: None })
+        let diagnostics = match unit == 3 && WARNS.get() {
+            true => vec![warning_of_app("unused variable: `x`"), warning_of_app("unused import: `y`")],
+            false => Vec::new(),
+        };
+        Ok(Compiled { diagnostics, ok: true, puts, outputs, artifact: None, macros: None })
     }
 
     fn script(&self, unit: usize, _: u64) -> Result<Box<dyn Runs>, ApiError> {
@@ -490,7 +521,7 @@ impl Front for FakeFront {
             "a::overflows" => (TestOutcome::Failed, format!("undefined behavior\nseed: {}\n", ub.seed.unwrap_or(0)).into_bytes()),
             _ => (TestOutcome::Passed, Vec::new()),
         };
-        Ok(TestResult { name: test.to_owned(), binary: "a".into(), millis: 0, output, outcome })
+        Ok(TestResult { name: test.to_owned(), binary: "a".into(), millis: 0, output, outcome, cached: None })
     }
 
     fn run(&self, _: &[Artifact], _: Option<&str>, _: &[String], _: u64) -> Result<Box<dyn Runs>, ApiError> {
@@ -523,6 +554,10 @@ fn options() -> Options {
         env: vec![("PATH".into(), "/bin".into()), ("HOME".into(), "/home/u".into())],
         host: "x86_64-unknown-linux-gnu".into(),
         color: false,
+        // A table of its own: each daemon drives one, and tests run at once.
+        outside: Box::leak(Box::new(blaze_vfs::outside::Dirs::new())),
+        #[cfg(unix)]
+        activated: None,
     }
 }
 
@@ -662,6 +697,33 @@ fn a_build_of_a_checkout_goes_from_the_server_to_built() {
     assert!(built.is_some() && built < worked, "`Built`, then `Work`: {got:#?}");
     assert_eq!(daemon.driver().contents(&name("w/Cargo.lock")), b"# a lock\n");
     assert!(daemon.mounts().has(DEP) && daemon.mounts().has(INDEX) && daemon.mounts().has(LIBRARY));
+}
+
+#[test]
+fn a_unit_that_warned_ends_after_its_warnings_and_built_counts_the_members() {
+    let mut sim = Sim::new(31, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 31);
+    WARNS.set(true);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
+    let got = client.wait(&mut daemon, id);
+    WARNS.set(false);
+
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    let of_app = |it: &Response| matches!(it, Response::Diagnostic(it) if it.unit.is_some());
+    let said: Vec<usize> = (0..got.len()).filter(|&at| of_app(&got[at])).collect();
+    let ended: Vec<usize> = (0..got.len()).filter(|&at| matches!(got[at], Response::UnitEnded(_))).collect();
+    assert_eq!(said.len(), 2, "{got:#?}");
+    assert_eq!(ended, [said[1] + 1], "the unit ends once, right after its last warning: {got:#?}");
+    let Response::UnitEnded(unit) = &got[ended[0]] else { unreachable!() };
+    assert_eq!(unit.target.name, "app");
+    let built = got.iter().find_map(|it| match it {
+        Response::Built { members, .. } => Some(*members),
+        _ => None,
+    });
+    assert_eq!(built, Some(1), "`app` is the one member; `dep` is from the registry");
 }
 
 #[test]
@@ -1054,4 +1116,31 @@ fn every_request_ends_once_over_many_seeds() {
         }
         turn_until(&mut daemon, |it| it.settled());
     }
+}
+
+#[test]
+fn serve_takes_activated_alone_and_names_it_among_its_flags() {
+    let parse = |args: &[&str]| super::parse(args.iter().map(std::ffi::OsString::from));
+    let args = parse(&["--activated", "--socket", "/run/b.sock"]).unwrap();
+    assert!(args.activated);
+    assert_eq!(args.socket.as_deref(), Some(std::path::Path::new("/run/b.sock")));
+    assert!(!parse(&[]).unwrap().activated);
+    let refused = parse(&["--activated=yes"]).err().unwrap().to_string();
+    assert!(refused.contains("`--activated`, not `--activated=yes`"), "{refused}");
+}
+
+#[test]
+fn status_says_the_daemons_pid() {
+    let mut sim = Sim::new(32, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 32);
+    let mut client = dial(&mut daemon);
+    let id = client.send(&mut daemon, Request::Status);
+    let got = client.wait(&mut daemon, id);
+    let pid = got.iter().find_map(|it| match it {
+        Response::Status(status) => Some(status.pid),
+        _ => None,
+    });
+    assert_eq!(pid, Some(std::process::id()), "{got:#?}");
 }

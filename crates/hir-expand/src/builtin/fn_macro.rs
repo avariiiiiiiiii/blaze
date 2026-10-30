@@ -4,7 +4,7 @@ mod args;
 
 use std::{borrow::Cow, sync::OnceLock};
 
-use base_db::{Db, AnchoredPath, FileText};
+use base_db::{AnchoredPath, Db};
 use cfg::CfgExpr;
 use either::Either;
 use intern::{Symbol, sym};
@@ -236,8 +236,8 @@ fn place_expand(
         Some(place) => pick(place),
         None => {
             // alloc: an error's message, on the error path
-            let err =
-                ExpandError::other(span, format!("`{name}`: the call is not in its file's text"));
+            let message = format!("`{name}`: the call is not in its file's text");
+            let err = ExpandError::other(span, message);
             return ExpandResult::new(tt::TopSubtree::empty(DelimSpan::from_single(span)), err);
         }
     };
@@ -316,31 +316,12 @@ fn written_range(node: &SyntaxNode) -> TextRange {
 }
 
 /// The line and column, from 1, where `range` begins, as rustc's source map counts them: a
-/// line ends at each `'\n'`, a column is a code point, and a byte order mark that starts the
-/// file is no column.
+/// line ends at each `'\n'`, a column is a code point, a byte order mark that starts the
+/// file is no column, and the `\r` of a `\r\n` is no column of its `\n`.
 pub fn line_and_column(db: &Db, range: FileRange) -> Option<(u32, u32)> {
     let text = db.file_text(range.file_id.file_id(db));
-    let starts = line_starts(db, text);
-    let at = u32::from(range.range.start());
-    let line = starts.partition_point(|&start| start <= at);
-    let line_start = *starts.get(line.checked_sub(1)?)? as usize;
-    let mut written = text.text(db).get(line_start..at as usize)?;
-    if line == 1 {
-        written = written.strip_prefix('\u{feff}').unwrap_or(written);
-    }
-    Some((line as u32, written.chars().count() as u32 + 1))
-}
-
-/// Where each line of a file begins, the first at 0.
-#[salsa::tracked(returns(deref))]
-pub fn line_starts(db: &Db, text: FileText) -> Box<[u32]> {
-    let text = text.text(db).as_bytes();
-    let mut starts = Vec::with_capacity(text.len() / 32 + 1);
-    starts.push(0);
-    starts.extend(
-        text.iter().enumerate().filter(|&(_, &byte)| byte == b'\n').map(|(at, _)| at as u32 + 1),
-    );
-    starts.into_boxed_slice()
+    let place = base_db::line_index(db, text).place(range.range.start())?;
+    Some((place.line(), place.char_column(text.text(db))?))
 }
 
 fn log_syntax_expand(

@@ -492,16 +492,19 @@ where
     ///
     /// # Safety
     ///
-    /// The `MemoTable` must belong to a `Value` of the correct type. The caller must
-    /// ensure exclusive access to the database's storage for the duration of this call.
+    /// The `MemoTable` must belong to a `Value` of the correct type, and `row` must be its slot's
+    /// memo row. The caller must ensure exclusive access to the database's storage for the
+    /// duration of this call.
     #[cfg(all(not(feature = "shuttle"), feature = "salsa_unstable"))]
-    unsafe fn memory_usage(&self, memo_table_types: &MemoTableTypes) -> crate::database::SlotInfo {
+    unsafe fn memory_usage(
+        &self,
+        memo_table_types: &MemoTableTypes,
+        row: u32,
+    ) -> crate::database::SlotInfo {
         let heap_size = C::heap_size(self.fields());
-        // SAFETY: The caller guarantees exclusive access to the database's storage,
-        // so the value's memos cannot be modified while we read them.
-        let memos = unsafe { &*self.memos.get() };
-        // SAFETY: The caller guarantees this is the correct types table.
-        let memos = unsafe { memo_table_types.attach_memos(memos) };
+        // SAFETY: The caller guarantees this is the correct types table and the slot's row, and
+        // exclusive access to the database's storage, so the memos cannot change while we read.
+        let memos = unsafe { memo_table_types.attach_memos(row) };
 
         crate::database::SlotInfo {
             debug_name: C::DEBUG_NAME,
@@ -1014,8 +1017,10 @@ where
             memo_table: &mut MemoTable,
             id: Id,
         ) {
-            // SAFETY: The caller guarantees this is the correct types table.
-            let table = unsafe { memo_table_types.attach_memos_mut(memo_table) };
+            let row = zalsa.table().memo_row(id);
+            // SAFETY: The caller guarantees this is the correct types table, and `row` is the
+            // row of `id`, the slot `memo_table` belongs to.
+            let table = unsafe { memo_table_types.attach_memos_mut(row, memo_table) };
 
             // `Database::salsa_event` is a user supplied callback which may panic
             // in that case we need a drop guard to free the memo table
@@ -1355,10 +1360,15 @@ where
         // SAFETY: The caller guarantees exclusive access to the database's storage.
         let entries = unsafe { self.entries_inner(false, db.zalsa()) };
 
+        let zalsa = db.zalsa();
         let memory_usage = entries
-            // SAFETY: The memo table belongs to a value that we allocated, so it
-            // has the correct type. The caller guarantees exclusive database access.
-            .map(|entry| unsafe { entry.value.memory_usage(&self.memo_table_types) })
+            .map(|entry| {
+                let row = zalsa.table().memo_row(entry.key.key_index());
+                // SAFETY: The memo table belongs to a value that we allocated, so it has the
+                // correct type, and `row` is its slot's. The caller guarantees exclusive
+                // database access.
+                unsafe { entry.value.memory_usage(&self.memo_table_types, row) }
+            })
             // alloc: the edge: memory-usage reports, run with `&mut` outside builds
             .collect();
 
@@ -2084,8 +2094,8 @@ mod _static_assertions {
     use super::{Configuration, Member, Value};
     use crate::{Id, plumbing};
 
-    // A value is its fields, the ID, `last_interned_at`, and one word holding the shard, the
-    // durability and the 4-byte memo row: 24 bytes besides the fields.
+    // A value is its fields, the ID, `last_interned_at`, and one word holding the shard and the
+    // durability (the memo row comes from the page, not the slot): 24 bytes besides the fields.
     const _: [(); mem::size_of::<Value<DummyConfiguration>>()] = [(); 3 * mem::size_of::<usize>()];
 
     // A reusable value's entry in its shard's sweep list.

@@ -7,46 +7,61 @@
 //! and `diagnostics/mod.rs` (`IsPrivate`, `NoteAndRefersToTheItemDefinedHere`) (MIT or
 //! Apache-2.0).
 
-use hir::{HasVisibility as _, InFile, ModuleDef, PathResolution};
+use hir::{HasVisibility as _, InFile, ModuleDef, PathResolution, Visibility};
 use syntax::ast;
 
-use super::{
-    Signature,
-    failure::Segment,
-    paths::{def_descr, def_span},
+use super::{Signature, failure::Segment};
+use crate::{
+    cx::Cx,
+    lower::unresolved_ident::{Ns, def_descr, def_span},
+    model::Diag,
 };
-use crate::{cx::Cx, model::Diag};
 
-/// The E0603 of the first segment after the first whose item `current` can't see; `prefixes`
-/// and `segments` are the path's prefixes and segments, one for one.
-pub(super) fn check(
+/// The first segment after the first whose item the module the path is in (`current`, asked
+/// for only when an item is not `pub`) can't see: its index among `prefixes`, its item, and
+/// that module. `prefixes` are the path's prefixes, outermost first; `defs` what all but the
+/// last were resolved to, which are not resolved again.
+pub(super) fn private(
     cx: &Cx<'_, '_>,
-    signature: &Signature,
     prefixes: &[ast::Path],
-    segments: &[Segment],
-    current: hir::Module,
-) -> Option<Diag> {
-    let file = signature.node.file_id;
+    defs: &[ModuleDef],
+    current: impl FnOnce() -> Option<hir::Module>,
+) -> Option<(usize, ModuleDef, hir::Module)> {
+    let mut current = Some(current);
+    let mut from: Option<hir::Module> = None;
     let mut parent: Option<ModuleDef> = None;
-    for (prefix, segment) in prefixes.iter().zip(segments) {
-        let def = match cx.sema.resolve_path(prefix)? {
-            PathResolution::Def(def) => def,
-            _ => return None,
+    for (at, prefix) in prefixes.iter().enumerate() {
+        let def = match defs.get(at) {
+            Some(def) => *def,
+            None => match cx.sema.resolve_path(prefix)? {
+                PathResolution::Def(def) => def,
+                _ => return None,
+            },
         };
         if let Some(ModuleDef::Module(module)) = parent
-            && !def.is_visible_from(cx.db, current)
-            && module.declarations(cx.db).contains(&def)
+            && def.visibility(cx.db) != Visibility::Public
         {
-            let descr = def_descr(cx, def)?;
-            let span = cx.span(InFile::new(file, segment.range));
-            let mut diag = Diag::error(Some("E0603"), format!("{descr} `{}` is private", segment.name), span.clone());
-            diag.span_label(span, format!("private {descr}"));
-            if let Some(at) = def_span(cx, def) {
-                diag.span_note(at, format!("the {descr} `{}` is defined here", segment.name));
+            let module_of_path = match from {
+                Some(it) => it,
+                None => *from.insert(current.take()?()?),
+            };
+            if !def.is_visible_from(cx.db, module_of_path) && module.declarations(cx.db).contains(&def) {
+                return Some((at, def, module_of_path));
             }
-            return Some(diag);
         }
         parent = Some(def);
     }
     None
+}
+
+/// The E0603 of `segment`, which names `def`, an item the path's module can't see.
+pub(super) fn diag(cx: &Cx<'_, '_>, signature: &Signature, segment: &Segment, def: ModuleDef) -> Option<Diag> {
+    let descr = def_descr(cx, Ns::Type, def)?;
+    let span = cx.span(InFile::new(signature.node.file_id, segment.range));
+    let mut diag = Diag::error(Some("E0603"), format!("{descr} `{}` is private", segment.name), span.clone());
+    diag.span_label(span, format!("private {descr}"));
+    if let Some(at) = def_span(cx, Ns::Type, def) {
+        diag.span_note(at, format!("the {descr} `{}` is defined here", segment.name));
+    }
+    Some(diag)
 }

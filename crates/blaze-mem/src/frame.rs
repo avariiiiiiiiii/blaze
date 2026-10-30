@@ -29,7 +29,13 @@ use std::{
 use crate::{MemError, Region, Tag, error::fail, tag};
 
 /// The address space one frame reserves: what one task may take at most.
+#[cfg(target_pointer_width = "64")]
 pub const FRAME_RESERVE: usize = 4 << 30;
+
+/// What one frame reserves on a 32-bit target: 16 MB. There (wasm32) a reservation is memory
+/// taken whole, and the whole address space is 4 GB.
+#[cfg(not(target_pointer_width = "64"))]
+pub const FRAME_RESERVE: usize = 16 << 20;
 
 /// Frames a thread keeps between tasks: the nesting depth whose frames are kept warm.
 const DEPTH: usize = 8;
@@ -114,7 +120,7 @@ impl Frame {
     pub fn try_alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, MemError> {
         let base = self.region.base().as_ptr() as usize;
         let at = base + self.cursor.get();
-        let aligned = (at + layout.align() - 1) & !(layout.align() - 1);
+        let aligned = crate::align::align_up(at, layout.align());
         let offset = aligned - base;
         let end = offset + layout.size();
         if end > self.limit.get() {
@@ -445,9 +451,12 @@ fn give_spare(frame: Frame) {
 /// global allocation); after that a task costs two thread-local accesses.
 #[track_caller]
 pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
-    struct Back(Option<Frame>);
+    /// The frame, and the frame `CURRENT` named before this task.
+    struct Back(Option<Frame>, *const Frame);
     impl Drop for Back {
         fn drop(&mut self) {
+            // A thread being torn down has no `CURRENT` left to put back.
+            let _ = CURRENT.try_with(|current| current.set(self.1));
             if let Some(mut frame) = self.0.take() {
                 frame.reset();
                 give_spare(frame);
@@ -462,11 +471,41 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
         },
     };
     frame.set_tag(tag);
-    let back = Back(Some(frame));
+    let outer = CURRENT.try_with(Cell::get).unwrap_or(ptr::null());
+    let back = Back(Some(frame), outer);
     match &back.0 {
-        Some(frame) => f(frame),
+        Some(frame) => {
+            let _ = CURRENT.try_with(|current| current.set(frame));
+            f(frame)
+        }
         None => unreachable!("the frame is taken back only on drop"),
     }
+}
+
+thread_local! {
+    /// The frame of the innermost [`task`] this thread is in; null in none.
+    static CURRENT: Cell<*const Frame> = const { Cell::new(ptr::null()) };
+}
+
+/// Runs `f` with the frame of the innermost [`task`] the calling thread is in: for code a task
+/// reaches through calls that don't pass its frame (a query's body, run by the db's executor).
+/// Stops, naming the caller, when it is in none: code that allocates for a task runs in one
+/// (no-fallback). What `f` returns cannot borrow the frame.
+#[track_caller]
+pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R {
+    let frame = CURRENT.try_with(Cell::get).unwrap_or(ptr::null());
+    assert!(!frame.is_null(), "frame::current outside any frame::task");
+    // SAFETY: `task` points `CURRENT` at the frame its `Back` holds on `task`'s own stack (never
+    // moved while its closure runs) and points it back at the outer task's before that frame
+    // is reset and shelved. This call is inside that closure, deeper on the same thread's
+    // stack, so the frame is alive until `f` returns, and no reset happens meanwhile: a reset
+    // takes `&mut Frame`, which nothing has while `task` lends `&Frame`.
+    f(unsafe { &*frame })
+}
+
+/// Whether the calling thread is in a [`task`], so [`current`] has a frame to give.
+pub fn in_task() -> bool {
+    CURRENT.try_with(|current| !current.get().is_null()).unwrap_or(false)
 }
 
 /// Frames the calling thread keeps warm between tasks.

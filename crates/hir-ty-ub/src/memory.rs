@@ -19,11 +19,12 @@ mod tests;
 
 use std::fmt;
 
+use blaze_ids::bits::{BitSet, words_for};
 use smallvec::SmallVec;
 
 pub use self::bytes::Bytes;
 use self::{
-    bytes::{Run, offset, words},
+    bytes::{Run, offset},
     init_mask::InitMask,
     prov_map::{Frag, ProvMap},
 };
@@ -786,9 +787,9 @@ impl Memory {
         let mut init = SmallVec::new();
         match shadow.init.lazy_state() {
             Some(true) => {}
-            Some(false) => init.resize(words(len), 0),
+            Some(false) => init.resize(words_for(len), 0),
             None => {
-                init.resize(words(len), 0);
+                init.resize(words_for(len), 0);
                 shadow.init.bits(span.range(), &mut init);
             }
         }
@@ -1023,7 +1024,7 @@ impl Memory {
     // Miri: interpret/memory.rs, `take_leaked_allocations`; diagnostics.rs, `report_leaks`.
     pub fn leaks(&self) -> Result<(), Leaks> {
         let n = self.infos.len();
-        let mut reachable = vec![0u64; n.div_ceil(64)];
+        let mut reachable = BitSet::<usize>::new(n);
         let mut todo: Vec<AllocId> = self
             .live
             .iter()
@@ -1034,10 +1035,9 @@ impl Memory {
             .collect();
         while let Some(id) = todo.pop() {
             let i = id.index();
-            if reachable[i / 64] & (1 << (i % 64)) != 0 {
+            if !reachable.insert(i) {
                 continue;
             }
-            reachable[i / 64] |= 1 << (i % 64);
             if self.infos[i].live {
                 todo.extend(self.shadows[i].prov.provenances().filter_map(|p| match p {
                     Prov::Concrete { alloc, .. } => Some(alloc),
@@ -1052,7 +1052,7 @@ impl Memory {
             .filter(|&(i, info)| {
                 info.live
                     && !info.kind.may_leak(info.made_global)
-                    && reachable[i / 64] & (1 << (i % 64)) == 0
+                    && !reachable.contains(i)
             })
             .map(|(i, info)| Leak {
                 alloc: AllocId::new(i as u32 + 1).expect("an index of the column"),

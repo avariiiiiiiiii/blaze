@@ -13,6 +13,11 @@ diagnostic_item, macro_reach, lib.rs), `speed-hir-defs-sigs-next2` (signatures.r
 Line numbers are of the tree at 2026-10-29 20:40 (after frontend-db moved these files to
 `db: &Db`). Every change is against the code as it was then; reread the lines before applying.
 
+Lane dedyn may have replaced a `dyn` in these files with a concrete type, enum or generic since.
+Where the "before" code here shows a `dyn` the file no longer has (I4.2's `extract_docs` takes
+`resolver: &dyn Fn() -> Resolver<'db>` and `get_cfg_options: &dyn Fn() -> &'a CfgOptions`),
+apply the change to the parameters as the file has them now. These requests add no `dyn`.
+
 ### Where those lines are at 21:00
 
 Rechecked at 2026-10-29 21:00: the code each section rewrites is unchanged, but `signatures.rs`
@@ -42,12 +47,16 @@ diagnostic_item, upvars, src and deps are where the sections say.
 | I10 `MacroReachable` | 73-77 | 74 |
 | I2.7 `parse_link_tt` | (its `value` at 1062-1067) | fn at 1038; the `value` `let` inside it |
 
+> forwarded to db (db-expand-next2, owner of these hir-def files) (requests, pass 18; told by tmux).
+
 ### I6.2, two doc comments the FST's removal leaves stale
 
 - `import_map.rs` 47-49, the struct doc's size line "plus the FST's share of the names' bytes"
   becomes "plus each run's lowercased name and 8 bytes for its two offsets".
 - 398-399, `PartialEq`'s doc "`fst` and `importables` are built from those" becomes
   "`importables` and the keys are built from those".
+
+> forwarded to db (db-expand-next2) (requests, pass 18; told by tmux).
 
 ## What this assumes
 
@@ -67,6 +76,8 @@ diagnostic_item, upvars, src and deps are where the sections say.
   drops), never `frame.alloc_slice_*` (which forgets them): `Name`, `Symbol`, `SyntaxNode`,
   `ImportInfo`, `CfgExpr`, `NativeLib`, `Own`, `ModPath` hold counts. `alloc_slice_*` only for
   `Copy` data (`u32`, `SyntaxNodePtr`, `TextRange`, `AttrFlags`).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## Tags (contract 3), for mem-db-salsa's tracked attribute
 
@@ -89,6 +100,8 @@ Every tracked function of this slice runs under `Tag::Nameres`:
 
 ---
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I0. For mem-format-hir: one frame parameter on the lowering entry points
 
 The signature queries lower through `expr_store/lower.rs` (format's). For their temporaries to be
@@ -98,9 +111,17 @@ parameter and hands it to `ExprCollector::with_maps(.., frame)`:
 `lower_type_ref` (lower.rs:262), `lower_generic_params` (277), `lower_generic_params_within`
 (292), `lower_impl` (311), `lower_trait` (342), `lower_type_alias` (367), `lower_function` (416),
 `ExprCollector::with_maps` (777). Once that lands, the call sites in signatures.rs add `frame`
-as listed in I1.6. Until it does, I1.1 to I1.5 stand alone (they need no format change).
+as listed in I1.6. Until it does, I1.1 to I1.4 stand alone (they need no format change).
+
+At 21:00, mem-format-hir has reported DONE without this change, so it was resent to its parent,
+`mem-format`. The entry points are now at lower.rs 260, 274, 288, 306, 336, 360 and 409, and
+`with_maps` is at 761.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## I1. `signatures.rs`
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I1.1 `file_outline` (339-380): its three buffers onto the frame
 
@@ -184,6 +205,8 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
 Memo: `FileOutline` = the outline tree (`Arc<FlatTree>`, made by `clone_subtree_without`), its
 `AstIdMap` and `RealSpanMap` (span's, made exact there), `cuts: Box<[SyntaxNodePtr]>` exact.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I1.2 `SignatureSyntax::new` (145-200) and `item_syntax` (386-402): `elided` and `ptrs`
 
 Per signature syntax query run: `elided: SmallVec<[SyntaxNode; 1]>` (161) spills for an item
@@ -210,6 +233,8 @@ anchored at an impl, trait or module around it (one entry per body under the anc
 
 Memo: `SignatureSyntax` = the item's own tree (`Arc<FlatTree>` from `clone_subtree_without`),
 its relative `AstIdMap` and `RealSpanMap` (`within`), two `SyntaxNodePtr`s.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I1.3 `lower_fields` (1771-1834): fields lowered into the frame, the arena made exact
 
@@ -251,6 +276,8 @@ Per `VariantFields` run: `Arena::with_capacity(count)` (1797) sized to every wri
 
 Memo: `(Arc<VariantFields>, ExpressionStoreSourceMap)`: one `Arc`, the field arena (one exact
 allocation, none for no field), the store and source map (format's).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I1.4 `EnumVariants::of` (1896-1954): variants and diagnostics into the frame, results exact
 
@@ -331,6 +358,8 @@ Memo: `EnumVariants` = an `FxIndexMap` (entries and index table: two exact alloc
 for an enum with no variant) and `VariantBits` (inline up to 64); the `ThinVec` of
 diagnostics (none unless a variant is cfg'd out).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I1.6 The nine signatures' `relative` and `with_source_map`: one frame per run, to the lowering
 
 Once I0 lands. For each of `StructSignature` (596, 582), `UnionSignature` (698, 684),
@@ -358,13 +387,19 @@ Once I0 lands. For each of `StructSignature` (596, 582), `UnionSignature` (698, 
 mem-format), `FunctionSignature::params` / `TypeAliasSignature::bounds` (`Box<[_]>` drained from
 the store's list mark, format's), `Name`s (a symbol each).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I1.7 Nothing else in signatures.rs allocates per run
 
 `child_tokens` (72) is a fixed array; `flags_from_attrs!` shifts; `extern_block_abi` parses an
 ABI string in place; `VariantBits` is inline up to 64 variants; `moved_to_file`/`moved` are
 format's (`ExpressionStoreSourceMap::moved`).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I2. `attrs.rs`
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I2.1 `has_word` (1392-1409): every name a caller asks becomes a flag, no walk on a hit
 
@@ -473,6 +508,8 @@ attributes, I2.2). Bits 78 and up of `AttrFlags` are free.
   so it sees it. The foreign fn of the `extern` block is reached through its own scope only;
   the block's flag reads the same either way.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I2.2 `parse_extra_crate_attrs` (714-742): memoized, the concat in scratch
 
 Today every call concatenates `crate_attrs` into a new `String` and parses it: on every
@@ -529,6 +566,8 @@ string goes back to the shelf. `syntax::Parse<SourceFile>` is `PartialEq + Eq`
 parse (its flat tree and errors). `.tree()` is a node over the memo's tree (an `Arc` count).
 Add `extra_crate_attrs` to the tag table (`Nameres`).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I2.3 `field_attr_flags` (1160-1173): flags in the frame, the memo exact
 
 `SmallVec::<[AttrFlags; 8]>` spills past eight fields and `into_boxed_slice` then shrinks.
@@ -554,6 +593,8 @@ Add `extra_crate_attrs` to the tag table (`Nameres`).
 ```
 
 Memo: `Box<[AttrFlags]>`, 16 bytes a field, one exact allocation (none for no field).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I2.4 `generic_params_attr_flags` (1190-1229): the two maps exact
 
@@ -622,6 +663,8 @@ fn exact_arena_map<T, V: Clone>(entries: &[(la_arena::Idx<T>, V)]) -> ArenaMap<l
 `HasChildSource::child_source` is `src.rs`'s, which builds an `InFile<ArenaMap<..>>` per call:
 I9.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I2.5 `collect_field_attrs` (919-933) and its three users: per-field values in the frame
 
 `ArenaMap::new()` grown by `insert`, then `shrink_to_fit`. Its users: `fields_doc_aliases`
@@ -657,6 +700,8 @@ for a field with no alias); `extract_doc_aliases` (992) takes
 `extract_cfgs` (1133) takes `result: &mut Vec<CfgExpr, &Frame>`; the
 `1 => result.into_iter().next()` arms stay; `_ => Some(CfgExpr::All(result.into_boxed_slice()))`
 (1740, 1760) become `_ => Some(CfgExpr::All(result.drain(..).collect()))`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I2.6 The value queries that build a list: frame, then exact
 
@@ -696,6 +741,8 @@ for a field with no alias); `extract_doc_aliases` (992) takes
 
 Memo of each: the `Box<[_]>` / set at its exact length (none when empty: `Box<[T]>` of length 0
 allocates nothing).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I2.7 `#[link]` parsing: no `String` per key, no `format!` per `cfg`
 
@@ -763,6 +810,8 @@ allocates nothing).
   }
   ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I2.8 Hit paths of the attribute lookups: what is zero after I2.1 and I2.2
 
 Outside any query run, per IDE request or per use in a later query, each of these is a memo
@@ -781,6 +830,8 @@ per call, named for their owners and left as they are because their callers are 
 called inside query runs only (item and field lowering, `for_each_field`), where the parse is
 the run's work; it returns the failing `CfgExpr` as the diagnostic, so it stays owned.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I3. `attrs/stability.rs`
 
 - `own_of_fields` (354-374): `let mut fields = Vec::new();` becomes, inside
@@ -793,12 +844,16 @@ the run's work; it returns the failing `CfgExpr` as the diagnostic, so it stays 
 - `own_of_def` (341-351): no buffer (a `Reader` on the stack). Memo: `Own` (two options of
   symbols).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I4. `attrs/docs.rs`: `docs` and `fields_docs` (IDE only, lru'd)
 
 Per doc string with a newline: `lines: Vec<(&str, TextSize)>` (289) and two
 `raw_lines: Vec<&str>` (297, 303), and `get_horizontal_trim` returns a `String` (517, 563). Per
 `extract_docs` (824-899): `Docs::docs: String`, `docs_source_map: Vec`, `Indent::lines: Vec`
 grown by `push` and shrunk (`shrink_to_fit`, 476-490 and 896).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I4.1 The trims over `doc.lines()`, nothing collected
 
@@ -983,6 +1038,8 @@ would push), `reference_vertical_trim`, `reference_horizontal_trim`, and a test 
 
 (`ast::CommentShape` derives `Debug` and `Copy`; check, else print with `{:?}` of a `match`.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I4.2 `extract_docs`' buffers from the worker, the memo copied out exact
 
 Beside `Indent` (75):
@@ -1087,6 +1144,8 @@ and goes. Memo: `Option<Box<Docs>>`: the box, the text and source map each exact
 `ThinVec` of macro calls (none without a doc macro). The tests that build a `Docs` by hand
 (947, 1124, 1193, 1228, 1312) are unchanged: `Indent` keeps `Default`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I5. `lang_item.rs`
 
 - `crate_notable_traits` (324-340):
@@ -1118,7 +1177,11 @@ and goes. Memo: `Option<Box<Docs>>`: the box, the text and source map each exact
 - The lookup (`lang_items(db, krate).Foo`, `LangItemEnum::from_lang_items`): a memo read and a
   field load: zero (test I12.2).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I6. `import_map.rs`: the collection into the frame, the search over sorted keys
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I6.1 The collection (`Collector`, 197-394) and the build (98-166) onto the frame
 
@@ -1274,6 +1337,8 @@ unchanged.) `import_map_query_impl` (98) becomes:
         }
     }
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I6.2 The FST goes: sorted keys, binary search, a scan for fuzzy
 
@@ -1431,6 +1496,8 @@ lowercases into a `String` once per request: the edge.
 Manifest (owner's): `fst` moves from `[dependencies]` to `[dev-dependencies]` of
 `crates/hir-def/Cargo.toml` (line 24, the same spec), used only by the tests' reference model.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I6.3 The differential test (1563-1645): keys against the reference FST
 
 1593-1597 (`assert_eq!(new.fst.as_fst().as_bytes(), old.fst.as_fst().as_bytes(), ..)`)
@@ -1463,6 +1530,8 @@ Memo: `ImportMap` = `items` (an `FxIndexSet`: entries and index table, exact), `
 (`rows + 1` u32s), `infos` (24 bytes each), `trait_assoc_items` (a bit a row), `importables`
 (a u32 an info), `keys` (the runs' names' bytes), `key_start` and `run_start` (a u32 a run, plus
 one): nine exact allocations, built once.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## I7. `diagnostic_item.rs`
 
@@ -1572,6 +1641,8 @@ one): nine exact allocations, built once.
   `std::collections::hash_map::Entry` imports go.
 - `DiagnosticItems::get` (38): a memo read and one probe: zero (test I12.1 covers it).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I8. `upvars.rs`
 
 `upvars_mentioned_impl` (105-133): per body with a closure, `binding_names: FxHashSet<Symbol>`
@@ -1634,6 +1705,8 @@ Memo: `Option<Box<FxHashMap<ExprId, Upvars>>>`: the box, the map (exact), each c
 `Upvars(Box<[BindingId]>)` exact (`[..].into()` from a slice). The `Resolver` the visitor walks
 with is mem-db-def-resolve's.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I9. `src.rs` (IDE and attribute lowering; owned returns)
 
 `HasChildSource::child_source` returns an owned `InFile<ArenaMap<..>>` by its public signature,
@@ -1645,6 +1718,8 @@ in `Unit` `ArenaMap::new()` (the `let` moves into the arms, each returning
 `InFile::new(src.file_id, map)`). Room for every written field: cfg'd-out ones leave room
 unused, never a regrow. `use_tree_source_map` (50) and `UseId::child_source` (66) are the
 IDE's (source-to-def of a `use` tree), at the edge.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## I10. `macro_reach.rs`: the walk's set and stack in the caller's frame
 
@@ -1675,6 +1750,8 @@ impl<'f> MacroReachable<'f> {
 165, 190): `let mut reachable = MacroReachable::default();` and what uses it go inside
 `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| { let mut reachable =
 MacroReachable::new_in(frame); .. })`. `symbol_attr` (38) is attrs.rs's (no buffer).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## I11. `lib.rs`, `unstable_features.rs`, `deps/`, the rest
 
@@ -1714,12 +1791,16 @@ MacroReachable::new_in(frame); .. })`. `symbol_attr` (38) is attrs.rs's (no buff
   `bytes: SmallVec` (101): inline.
 - `builtin_derive.rs`, `builtin_type.rs`, `test_db.rs`: no allocation on a query or hit path.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## I12. Budget tests (written in full)
 
 Each needs H3's counting allocator in hir-def's test binary. Counts are per thread; salsa runs
 each query on the calling thread. "Warm" means asked once before the measure. The misses
 assume salsa stores a memo with no heap allocation of its own and interns into regions
 (mem-db-salsa's contract 5): what is left is the value's own allocations.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I12.1 `attrs/tests.rs`: attribute lookups on a warm item are zero
 
@@ -1790,6 +1871,8 @@ pub fn f() {}
 to the test module: `either::Either`, `crate::{AdtId, VariantId}` are there; add `ModuleDefId`
 if not.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### I12.2 `lang_item.rs` tests: a lang-item lookup is zero; a notable-traits miss is its box
 
 ```rust
@@ -1839,6 +1922,8 @@ pub trait Other {}
         assert_eq!(traits, Some(1));
     }
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I12.3 `import_map.rs` tests: a search after its buffers have grown is zero; a build is its nine
 
@@ -1906,6 +1991,8 @@ pub mod m { pub fn f() {} pub use super::S as R; }
         assert!(built == *memo);
     }
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### I12.4 `signatures.rs` tests: every signature query's warm re-request is zero; a miss is its value
 
@@ -1990,3 +2077,5 @@ pub type A<T> = (T, T);
 interned per variant goes to salsa's intern tables, on regions. The test module imports
 `crate::{AdtId, ModuleDefId, test_db::TestDB}`, `test_fixture::WithFixture`, and the signature
 types from `super::*`.)
+
+> forwarded to db (from requests, pass 16; told by tmux).

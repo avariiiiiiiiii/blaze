@@ -2,14 +2,15 @@
 //! type of the initializer of each `let` of a fixture, in order. Where rustc's UI tests show a
 //! form, the test is one of theirs and says which; the others follow `pretty.rs`.
 
+use std::collections::HashMap;
+
 use hir::Semantics;
-use rustc_hash::FxHashMap;
 use span::FileId;
 use syntax::{AstNode as _, ast};
 use test_fixture::WithFixture;
 
 use crate::{
-    cx::Cx,
+    cx::{Cx, Files},
     print,
     tests::{db::TestDB, paths},
 };
@@ -18,7 +19,7 @@ use crate::{
 /// its files named `$DIR/<path>` as rustc's UI tests name them.
 fn each_let(fixture: &str, f: impl Fn(&Cx<'_, '_>, &hir::Type<'_>) -> String) -> Vec<String> {
     let (db, files) = TestDB::with_many_files(fixture);
-    let names: FxHashMap<FileId, String> = files
+    let names: HashMap<FileId, String> = files
         .iter()
         .zip(paths(fixture))
         .map(|(file, path)| (file.file_id(&db), format!("$DIR/{path}")))
@@ -27,7 +28,7 @@ fn each_let(fixture: &str, f: impl Fn(&Cx<'_, '_>, &hir::Type<'_>) -> String) ->
         let sema = Semantics::new(&db);
         let krate = hir::check::workspace_crates(&db)[0];
         let frame = crate::tests::frame();
-        let cx = Cx::new(&sema, krate, &names, &frame);
+        let cx = Cx::new(&sema, krate, Files::new(&names, ""), &frame);
         let source = sema.parse(files[0]);
         source
             .syntax()

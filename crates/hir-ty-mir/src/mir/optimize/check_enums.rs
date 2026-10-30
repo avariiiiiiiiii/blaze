@@ -8,6 +8,7 @@
 //! `transmute` and `transmute_unchecked`; this MIR keeps the call, and the check goes before
 //! it, where rustc's goes before the statement at the end of the block.
 
+use blaze_mem::Frame;
 use hir_def::AdtId;
 use rustc_abi::{Scalar, Size};
 use rustc_type_ir::inherent::IntoKind;
@@ -17,15 +18,15 @@ use crate::{
     layout::{TagEncoding, Variants},
     mir::{
         AssertKind, BasicBlock, BasicBlockId, BinOp, CastKind, MirBody, MirLowerError, MirSpan,
-        Operand, OperandKind, ProjectionElem, Rvalue, Statement, StatementKind, SwitchTargets,
-        Terminator, TerminatorKind, transform::Ctx,
+        Operand, OperandKind, ProjectionElem, Rvalue, StatementKind, SwitchTargets, Terminator,
+        TerminatorKind, framed::block_id, transform::Ctx,
     },
     next_solver::{GenericArgs, Ty, TyKind},
 };
 
 use super::check_pointers::{
-    Consts, Lowered, Site, assign, copy_of, project, site_span, sites, split_block, split_index,
-    temp,
+    Consts, Lowered, Setup, Site, append, assign, copy_of, project, site_span, sites,
+    split_block, split_index, temp,
 };
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
@@ -38,26 +39,32 @@ struct Discr<'db> {
 }
 
 /// rustc's `EnumCheckType`.
-enum Check<'db> {
+enum Check<'f, 'db> {
     /// An enum with no variants made of a value of an inhabited type.
     Uninhabited,
     /// An enum with a tag and no niche: the tag is one of the variants' discriminants.
-    Direct { source: Operand, discr: Discr<'db>, op_size: Size, valid: Vec<u128> },
+    Direct { source: Operand, discr: Discr<'db>, op_size: Size, valid: Vec<u128, &'f Frame> },
     /// An enum with a niche: the tag at `offset` is in `start..=end`, wrapping.
     WithNiche { source: Operand, discr: Discr<'db>, op_size: Size, offset: Size, start: u128, end: u128 },
 }
 
-pub(super) fn check_enums<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) -> Result<'db, ()> {
+pub(super) fn check_enums<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    frame: &Frame,
+) -> Result<'db, ()> {
     // A crate with no panic handler would not build with the panic this adds.
     if ctx.infcx.interner.lang_items().PanicImpl.is_none() {
         return Ok(());
     }
     let consts = Consts::new(ctx)?;
-    let blocks: Vec<BasicBlockId> = body.basic_blocks.iter().map(|(id, _)| id).collect();
-    for &block in blocks.iter().rev() {
+    let mut setup: Setup<'_> = Vec::new_in(frame);
+    // The blocks there were before any check: the ones splits make come after them.
+    for index in (0..body.basic_blocks.len()).rev() {
+        let block = block_id(index);
         for site in sites(body, block) {
             let Some((source, ty)) = transmute_at(ctx, body, block, site) else { continue };
-            let Some(check) = find(ctx, body, &source, ty)? else { continue };
+            let Some(check) = find(ctx, body, source, ty, frame)? else { continue };
             let span = site_span(body, block, site);
             let at = split_index(body, block, site);
             let next = split_block(body, block, at);
@@ -70,13 +77,14 @@ pub(super) fn check_enums<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) -> Resul
                     body.basic_blocks[block].terminator =
                         Some(Terminator { span, kind: TerminatorKind::Goto { target: next } });
                 }
-                Check::Direct { source, discr, op_size, valid } => {
-                    direct_check(ctx, &consts, body, block, source, discr, op_size, valid, span, next)?
-                }
+                Check::Direct { source, discr, op_size, valid } => direct_check(
+                    ctx, &consts, body, block, source, discr, op_size, valid, span, next,
+                    &mut setup,
+                )?,
                 Check::Uninhabited => uninhabited_check(&consts, body, block, span, next),
                 Check::WithNiche { source, discr, op_size, offset, start, end } => niche_check(
                     ctx, &consts, body, block, source, discr, op_size, offset, start, end, span,
-                    next,
+                    next, &mut setup,
                 )?,
             }
         }
@@ -85,17 +93,17 @@ pub(super) fn check_enums<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) -> Resul
 }
 
 /// The value a site transmutes and the type it transmutes it to.
-fn transmute_at<'db>(
-    ctx: &Ctx<'db>,
-    body: &MirBody<'db>,
+fn transmute_at<'a, 'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &'a MirBody<'db>,
     block: BasicBlockId,
     site: Site,
-) -> Option<(Operand, Ty<'db>)> {
+) -> Option<(&'a Operand, Ty<'db>)> {
     let data = &body.basic_blocks[block];
     match site {
         Site::Statement(at) => match &data.statements[at].kind {
             StatementKind::Assign(_, Rvalue::Cast(CastKind::Transmute, source, ty)) => {
-                Some((source.clone(), ty.as_ref()))
+                Some((source, ty.as_ref()))
             }
             _ => None,
         },
@@ -103,7 +111,7 @@ fn transmute_at<'db>(
             TerminatorKind::Call { args, destination, .. } => {
                 let [source] = &args[..] else { return None };
                 let ty = destination.as_ref().ty(body, &ctx.infcx, ctx.env).ty;
-                Some((source.clone(), ty))
+                Some((source, ty))
             }
             _ => None,
         },
@@ -112,12 +120,13 @@ fn transmute_at<'db>(
 }
 
 /// rustc's `EnumFinder::visit_rvalue`.
-fn find<'db>(
-    ctx: &Ctx<'db>,
+fn find<'f, 'db>(
+    ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
     source: &Operand,
     ty: Ty<'db>,
-) -> Result<'db, Option<Check<'db>>> {
+    frame: &'f Frame,
+) -> Result<'db, Option<Check<'f, 'db>>> {
     let ty = ctx.normalize(ty);
     let TyKind::Adt(adt, _) = ty.kind() else { return Ok(None) };
     let AdtId::EnumId(id) = adt.def_id() else { return Ok(None) };
@@ -132,8 +141,9 @@ fn find<'db>(
     };
     let Some(op_layout) = ctx.layout_of(ctx.normalize(source_ty)) else { return Ok(None) };
     let source = match &source.kind {
+        // clone: the place the check reads, kept in the body: a refcount
         OperandKind::Move(place) => Operand { kind: OperandKind::Copy(place.clone()), span: None },
-        _ => source.clone(),
+        _ => source.clone(), // clone: the operand the check reads, kept in the body: a handle
     };
     let op_size = op_layout.size;
     Ok(match &enum_layout.variants {
@@ -146,8 +156,9 @@ fn find<'db>(
             ..
         } => {
             let discr = discr_of(ctx, *value)?;
-            let mut valid = Vec::new();
-            for (variant, _) in id.enum_variants(ctx.db).variants.values() {
+            let variants = &id.enum_variants(ctx.db).variants;
+            let mut valid = Vec::with_capacity_in(variants.len(), frame);
+            for (variant, _) in variants.values() {
                 let value = ctx.db.const_eval_discriminant(*variant).map_err(|error| {
                     // alloc: error path
                     MirLowerError::ConstEvalError("the discriminant".into(), Box::new(error))
@@ -173,7 +184,7 @@ fn find<'db>(
 }
 
 /// rustc's `Primitive::to_int_ty` and `size` of a tag.
-fn discr_of<'db>(ctx: &Ctx<'db>, value: rustc_abi::Primitive) -> Result<'db, Discr<'db>> {
+fn discr_of<'db>(ctx: &Ctx<'_, 'db>, value: rustc_abi::Primitive) -> Result<'db, Discr<'db>> {
     use rustc_abi::{Integer, Primitive};
     use rustc_type_ir::{IntTy, UintTy};
     let interner = ctx.infcx.interner;
@@ -202,7 +213,7 @@ fn discr_of<'db>(ctx: &Ctx<'db>, value: rustc_abi::Primitive) -> Result<'db, Dis
     Ok(Discr { ty, size: Size::from_bytes(size) })
 }
 
-fn uint_of_size<'db>(ctx: &Ctx<'db>, size: Size) -> Result<'db, Ty<'db>> {
+fn uint_of_size<'db>(ctx: &Ctx<'_, 'db>, size: Size) -> Result<'db, Ty<'db>> {
     use rustc_type_ir::UintTy;
     let uint = match size.bytes() {
         1 => UintTy::U8,
@@ -220,20 +231,20 @@ fn uint_of_size<'db>(ctx: &Ctx<'db>, size: Size) -> Result<'db, Ty<'db>> {
     Ok(Ty::new_uint(ctx.infcx.interner, uint))
 }
 
-/// rustc's `insert_discr_cast_to_u128`: the tag of `source`, as a `u128`.
+/// rustc's `insert_discr_cast_to_u128`: the tag of `source`, as a `u128`, computed by what it
+/// adds to `setup`.
 #[allow(clippy::too_many_arguments)]
 fn discr_to_u128<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
-    block: BasicBlockId,
     source: Operand,
     discr: Discr<'db>,
     op_size: Size,
     offset: Option<Size>,
     span: MirSpan,
+    setup: &mut Setup<'_>,
 ) -> Result<'db, crate::mir::LocalId> {
     let interner = ctx.infcx.interner;
-    let mut setup: Vec<Statement> = Vec::new();
     let (cast, bits) = if discr.size.bytes() < op_size.bytes() {
         // The tag is narrower than the value: the value as `[MaybeUninit<u8>; N]`, and the
         // bytes of the tag out of it.
@@ -267,7 +278,6 @@ fn discr_to_u128<'db>(
     let u128_ty = Ty::new_uint(interner, rustc_type_ir::UintTy::U128);
     let wide = temp(body, u128_ty);
     setup.push(assign(wide, Rvalue::Cast(CastKind::IntToInt, copy_of(tag), u128_ty.store()), span));
-    body.basic_blocks[block].statements.extend(setup);
     Ok(wide)
 }
 
@@ -289,31 +299,31 @@ fn assert(cond: Operand, value: Operand, span: MirSpan, next: BasicBlockId) -> T
 /// rustc's `insert_direct_enum_check`.
 #[allow(clippy::too_many_arguments)]
 fn direct_check<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     consts: &Consts<'db>,
     body: &mut MirBody<'db>,
     block: BasicBlockId,
     source: Operand,
     discr: Discr<'db>,
     op_size: Size,
-    valid: Vec<u128>,
+    valid: Vec<u128, &Frame>,
     span: MirSpan,
     next: BasicBlockId,
+    setup: &mut Setup<'_>,
 ) -> Result<'db, ()> {
     let is_cleanup = body.basic_blocks[block].is_cleanup;
     let invalid = body.basic_blocks.alloc(BasicBlock {
-        statements: Vec::new(),
+        statements: Vec::new(), // alloc: none, a kept block with no statements
         terminator: None,
         is_cleanup,
     });
-    let wide = discr_to_u128(ctx, body, block, source, discr, op_size, None, span)?;
+    let wide = discr_to_u128(ctx, body, source, discr, op_size, None, span, setup)?;
     let masked = temp(body, consts.u128_ty);
     let mask = consts.u128(discr.size.unsigned_int_max());
-    let statement = assign(masked, Rvalue::BinaryOp(BinOp::BitAnd, copy_of(wide), mask), span);
-    let data = &mut body.basic_blocks[block];
-    data.statements.push(statement);
+    setup.push(assign(masked, Rvalue::BinaryOp(BinOp::BitAnd, copy_of(wide), mask), span));
+    append(body, block, setup);
     let targets = valid.into_iter().map(|value| (discr.size.truncate(value), next));
-    data.terminator = Some(Terminator {
+    body.basic_blocks[block].terminator = Some(Terminator {
         span,
         kind: TerminatorKind::SwitchInt {
             discr: copy_of(masked),
@@ -343,7 +353,7 @@ fn uninhabited_check<'db>(
 /// rustc's `insert_niche_check`.
 #[allow(clippy::too_many_arguments)]
 fn niche_check<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     consts: &Consts<'db>,
     body: &mut MirBody<'db>,
     block: BasicBlockId,
@@ -355,16 +365,18 @@ fn niche_check<'db>(
     end: u128,
     span: MirSpan,
     next: BasicBlockId,
+    setup: &mut Setup<'_>,
 ) -> Result<'db, ()> {
-    let wide = discr_to_u128(ctx, body, block, source, discr, op_size, Some(offset), span)?;
+    let wide = discr_to_u128(ctx, body, source, discr, op_size, Some(offset), span, setup)?;
     let diff = temp(body, consts.u128_ty);
     let is_ok = temp(body, consts.bool_ty);
     let below = Rvalue::BinaryOp(BinOp::Sub, copy_of(wide), consts.u128(start));
     // A `WrappingRange`: what is past `start` by at most `end - start`, wrapping.
     let within = Rvalue::BinaryOp(BinOp::Le, copy_of(diff), consts.u128(end.wrapping_sub(start)));
-    let data = &mut body.basic_blocks[block];
-    data.statements.push(assign(diff, below, span));
-    data.statements.push(assign(is_ok, within, span));
-    data.terminator = Some(assert(copy_of(is_ok), copy_of(wide), span, next));
+    setup.push(assign(diff, below, span));
+    setup.push(assign(is_ok, within, span));
+    append(body, block, setup);
+    body.basic_blocks[block].terminator =
+        Some(assert(copy_of(is_ok), copy_of(wide), span, next));
     Ok(())
 }

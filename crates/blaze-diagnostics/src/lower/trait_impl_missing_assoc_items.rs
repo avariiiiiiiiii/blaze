@@ -139,7 +139,7 @@ fn fn_signature(cx: &Cx<'_, '_>, at: &ImplAt, f: hir::Function) -> Option<String
         .iter()
         .enumerate()
         .map(|(i, param)| {
-            let ty = param.ty().instantiate_type_params(args.iter());
+            let ty = param.ty().instantiate_type_params(db, args.iter());
             if is_method && i == 0 && ty.as_type_param(db).is_some() {
                 return "self".to_owned();
             }
@@ -171,7 +171,7 @@ fn fn_signature(cx: &Cx<'_, '_>, at: &ImplAt, f: hir::Function) -> Option<String
         true => ("async ", f.async_ret_type(db)?),
         false => ("", f.ret_type(db)),
     };
-    let output = output.instantiate_type_params(args.iter());
+    let output = output.instantiate_type_params(db, args.iter());
     let output = match output.is_unit() {
         true => String::new(),
         false => format!(" -> {}", cx.ty(&output)),

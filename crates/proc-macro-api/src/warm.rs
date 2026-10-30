@@ -105,6 +105,7 @@ pub struct LinkReader {
 }
 
 impl LinkReader {
+    // dyn: the link is any `Link` (the bridge, a test's script, a fuzz target's), once a reader.
     pub fn new(link: Arc<dyn Link>) -> LinkReader {
         LinkReader { link, buffer: Vec::new(), at: 0 }
     }

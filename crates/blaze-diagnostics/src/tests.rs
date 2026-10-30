@@ -8,14 +8,15 @@ mod emit;
 mod items;
 mod lints;
 
+use std::collections::HashMap;
+
 use hir::Semantics;
-use rustc_hash::FxHashMap;
 use span::FileId;
 use test_fixture::WithFixture;
 
 use self::db::TestDB;
 use crate::{
-    Options,
+    Files, Options,
     emit::{Sources, Style},
     model::Diag,
 };
@@ -23,11 +24,16 @@ use crate::{
 /// A fixture checked: its database, the names of its files and what rustc would say.
 pub(crate) struct Checked {
     pub(crate) db: TestDB,
-    pub(crate) names: FxHashMap<FileId, String>,
+    pub(crate) names: HashMap<FileId, String>,
     pub(crate) diags: Vec<Diag>,
 }
 
 impl Checked {
+    /// The names of the fixture's files, already relative.
+    pub(crate) fn files(&self) -> Files<'_> {
+        Files::new(&self.names, "")
+    }
+
     /// The sources of the fixture's files, by the names diagnostics give them.
     pub(crate) fn sources(&self) -> Sources {
         let files = self.names.iter().map(|(file, name)| {
@@ -42,8 +48,8 @@ impl Checked {
     }
 
     pub(crate) fn stderr_with(&self, style: Style) -> String {
-        let mut sources = self.sources();
-        self.diags.iter().map(|it| crate::emit::written(it, &mut sources, style)).collect()
+        let sources = self.sources();
+        self.diags.iter().map(|it| crate::emit::written(it, &sources, style)).collect()
     }
 
     /// The messages of the diagnostics, with their codes: `E0308: mismatched types`.
@@ -73,7 +79,7 @@ fn paths(fixture: &str) -> Vec<String> {
 /// names it, with `prefix` before it.
 pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Checked {
     let (db, files) = TestDB::with_many_files(fixture);
-    let names: FxHashMap<FileId, String> = files
+    let names: HashMap<FileId, String> = files
         .iter()
         .zip(paths(fixture))
         .map(|(file, path)| (file.file_id(&db), format!("{prefix}{path}")))
@@ -82,10 +88,15 @@ pub(crate) fn checked_with(fixture: &str, prefix: &str, options: &Options) -> Ch
         let sema = Semantics::new(&db);
         hir::check::workspace_crates(&db)
             .into_iter()
-            .flat_map(|krate| crate::check::check_crate_with(&sema, krate, &names, options))
+            .flat_map(|krate| crate::check::check_crate_with(&sema, krate, Files::new(&names, ""), options))
             .collect()
     });
     Checked { db, names, diags }
+}
+
+/// A frame for a test that makes its own [`crate::Cx`], as a check's task has one.
+pub(crate) fn frame() -> blaze_mem::Frame {
+    blaze_mem::Frame::new(blaze_mem::Tag::Diagnostics).expect("a test's frame reserves its region")
 }
 
 /// The workspace crates of `fixture`, checked as `blaze build` checks them.

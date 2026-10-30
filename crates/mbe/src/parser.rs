@@ -101,7 +101,16 @@ pub(crate) const NO_BINDER: Binder = u32::MAX;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Op {
-    Var { name: MetaVar, kind: Option<MetaVarKind>, id: Span, binder: Binder },
+    /// `spec` is a pattern's fragment specifier as written (`pat`, `pat_param`, `expr_2021`),
+    /// and `decl` the span of `$name:spec` (a template's `$name`): rustc's `MetaVarDecl`.
+    Var {
+        name: MetaVar,
+        kind: Option<MetaVarKind>,
+        id: Span,
+        binder: Binder,
+        spec: Option<Symbol>,
+        decl: Span,
+    },
     Ignore { name: MetaVar, id: Span, binder: Binder },
     Index { depth: usize },
     Len { depth: usize },
@@ -273,16 +282,20 @@ fn next_op(
                         })
                     }
                     tt::Leaf::Ident(ident) => {
-                        let kind = eat_fragment_kind(edition, src, mode)?;
+                        let (kind, spec) = eat_fragment_kind(edition, src, mode)?;
                         let name = MetaVar::new(ident.sym, ident.span);
                         let id = ident.span;
-                        Op::Var { name, kind, id, binder: NO_BINDER }
+                        let decl = p.span.cover(spec.map_or(id, |it| it.span));
+                        let spec = spec.map(|it| it.sym);
+                        Op::Var { name, kind, id, binder: NO_BINDER, spec, decl }
                     }
                     tt::Leaf::Literal(lit) if is_boolean_literal(&lit) => {
-                        let kind = eat_fragment_kind(edition, src, mode)?;
+                        let (kind, spec) = eat_fragment_kind(edition, src, mode)?;
                         let name = MetaVar::new(lit.text_and_suffix, lit.span);
                         let id = lit.span;
-                        Op::Var { name, kind, id, binder: NO_BINDER }
+                        let decl = p.span.cover(spec.map_or(id, |it| it.span));
+                        let spec = spec.map(|it| it.sym);
+                        Op::Var { name, kind, id, binder: NO_BINDER, spec, decl }
                     }
                     tt::Leaf::Punct(punct @ tt::Punct { char: '$', .. }) => match mode {
                         Mode::Pattern => {
@@ -336,7 +349,7 @@ fn eat_fragment_kind(
     edition: impl Copy + Fn(SyntaxContext) -> Edition,
     src: &mut TtIter<'_>,
     mode: Mode,
-) -> Result<Option<MetaVarKind>, ParseError> {
+) -> Result<(Option<MetaVarKind>, Option<tt::Ident>), ParseError> {
     if let Mode::Pattern = mode {
         src.expect_char(':').map_err(|()| ParseError::unexpected("missing fragment specifier"))?;
         let ident = src
@@ -370,11 +383,11 @@ fn eat_fragment_kind(
             "tt" => MetaVarKind::Tt,
             "lifetime" => MetaVarKind::Lifetime,
             "literal" => MetaVarKind::Literal,
-            _ => return Ok(None),
+            _ => return Ok((None, Some(ident))),
         };
-        return Ok(Some(kind));
+        return Ok((Some(kind), Some(ident)));
     };
-    Ok(None)
+    Ok((None, None))
 }
 
 fn is_boolean_literal(lit: &tt::Literal) -> bool {

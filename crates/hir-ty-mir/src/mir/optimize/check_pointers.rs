@@ -17,6 +17,7 @@
 //!
 //! [`MirOptions::ub_checks`]: crate::mir::MirOptions::ub_checks
 
+use blaze_mem::Frame;
 use intern::Symbol;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use smallvec::SmallVec;
@@ -28,7 +29,7 @@ use crate::{
         AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind, FieldIndex, Local,
         LocalId, MirBody, MirLowerError, MirSpan, Operand, OperandKind, Place, Projection,
         ProjectionElem, Rvalue, Statement, StatementKind, StoredPlace, Terminator,
-        TerminatorKind, UnOp, transform::Ctx,
+        TerminatorKind, UnOp, framed::block_id, transform::Ctx,
     },
     next_solver::{Const, GenericArgs, Ty, TyKind, UnevaluatedConst},
 };
@@ -134,12 +135,15 @@ pub(super) enum Site {
 }
 
 /// The sites of `block` in the order rustc visits them: backwards, so that a split leaves the
-/// sites still to come where they were.
-pub(super) fn sites(body: &MirBody<'_>, block: BasicBlockId) -> SmallVec<[Site; 8]> {
+/// sites still to come where they were. It doesn't borrow the body, which the splits change.
+pub(super) fn sites(
+    body: &MirBody<'_>,
+    block: BasicBlockId,
+) -> impl Iterator<Item = Site> + use<> {
     let data = &body.basic_blocks[block];
     let call = data.terminator.as_ref().and_then(|it| lowered_intrinsic(&it.kind));
     let statements = (0..data.statements.len()).rev().map(Site::Statement);
-    call.map(Site::Call).into_iter().chain(statements).collect()
+    call.map(Site::Call).into_iter().chain(statements)
 }
 
 /// The statement index a site splits its block at.
@@ -186,14 +190,14 @@ struct Found<'db> {
 
 /// rustc's `PointerFinder`: the pointers a statement reads, writes or borrows through, in the
 /// order rustc's visitor finds them.
-struct Finder<'a, 'db> {
-    ctx: &'a Ctx<'db>,
+struct Finder<'a, 'f, 'db> {
+    ctx: &'a Ctx<'f, 'db>,
     body: &'a MirBody<'db>,
     check: PointerCheck,
     found: SmallVec<[Found<'db>; 2]>,
 }
 
-impl<'db> Finder<'_, 'db> {
+impl<'db> Finder<'_, '_, 'db> {
     fn ty_of(&self, place: &StoredPlace) -> Ty<'db> {
         self.ctx.normalize(place.as_ref().ty(self.body, &self.ctx.infcx, self.ctx.env).ty)
     }
@@ -326,17 +330,20 @@ pub(super) fn project(place: &StoredPlace, elem: ProjectionElem<LocalId>) -> Sto
 
 /// rustc's `check_pointers` with the check of `check`, when the crate checks UB.
 pub(super) fn check_pointers<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     check: PointerCheck,
+    frame: &Frame,
 ) -> Result<'db, ()> {
     // A crate with no panic handler would not build with the panics these add.
     if ctx.infcx.interner.lang_items().PanicImpl.is_none() {
         return Ok(());
     }
     let consts = Consts::new(ctx)?;
-    let blocks: Vec<BasicBlockId> = body.basic_blocks.iter().map(|(id, _)| id).collect();
-    for &block in blocks.iter().rev() {
+    let mut setup: Setup<'_> = Vec::new_in(frame);
+    // The blocks there were before any check: the ones splits make come after them.
+    for index in (0..body.basic_blocks.len()).rev() {
+        let block = block_id(index);
         for site in sites(body, block) {
             let found = {
                 let mut finder = Finder { ctx, body, check, found: SmallVec::new() };
@@ -359,18 +366,16 @@ pub(super) fn check_pointers<'db>(
             let at = split_index(body, block, site);
             for found in found {
                 let next = split_block(body, block, at);
-                let mut setup = Vec::new();
                 let (cond, msg) = match check {
                     PointerCheck::Alignment => {
                         alignment_check(ctx, &consts, body, &found, &mut setup, span)?
                     }
                     PointerCheck::Null => null_check(ctx, &consts, body, &found, &mut setup, span)?,
                 };
-                let data = &mut body.basic_blocks[block];
-                data.statements.extend(setup);
+                append(body, block, &mut setup);
                 // The panics are `#[rustc_nounwind]`: a failed check does not unwind
                 // (rustc's `UnwindAction::Unreachable`).
-                data.terminator = Some(Terminator {
+                body.basic_blocks[block].terminator = Some(Terminator {
                     span,
                     kind: TerminatorKind::Assert {
                         cond,
@@ -396,7 +401,7 @@ pub(super) struct Consts<'db> {
 }
 
 impl<'db> Consts<'db> {
-    pub(super) fn new(ctx: &Ctx<'db>) -> Result<'db, Consts<'db>> {
+    pub(super) fn new(ctx: &Ctx<'_, 'db>) -> Result<'db, Consts<'db>> {
         let interner = ctx.infcx.interner;
         let usize_ty = Ty::new_uint(interner, rustc_type_ir::UintTy::Usize);
         let Some(word) = ctx.size_of(usize_ty) else {
@@ -423,8 +428,19 @@ impl<'db> Consts<'db> {
     }
 
     pub(super) fn bool(&self, value: bool) -> Operand {
+        // alloc: the constant's bytes, kept in the body
         Operand::from_bytes(Box::new([u8::from(value)]), self.bool_ty)
     }
+}
+
+/// The statements a check computes its condition with, before they go into their block.
+pub(super) type Setup<'f> = Vec<Statement, &'f Frame>;
+
+/// `setup`'s statements moved to the end of `block`'s, which grow to exactly their new length.
+pub(super) fn append(body: &mut MirBody<'_>, block: BasicBlockId, setup: &mut Setup<'_>) {
+    let statements = &mut body.basic_blocks[block].statements;
+    statements.reserve_exact(setup.len());
+    statements.extend(setup.drain(..));
 }
 
 pub(super) fn temp<'db>(body: &mut MirBody<'db>, ty: Ty<'db>) -> LocalId {
@@ -442,7 +458,7 @@ pub(super) fn copy_of(local: LocalId) -> Operand {
 /// `<ty as SizedTypeProperties>::SIZE` or `ALIGN`, the lang item `item` of core, unevaluated:
 /// what rustc's `Operand::unevaluated_constant` makes of the `SizeOf` or `AlignOf` lang item.
 fn type_property<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     consts: &Consts<'db>,
     item: Option<hir_def::ConstId>,
     name: &str,
@@ -467,14 +483,15 @@ fn type_property<'db>(
 
 /// The pointer `found` goes through as a `*const ()`, then its address (`ptr.addr()`).
 fn address<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     consts: &Consts<'db>,
     body: &mut MirBody<'db>,
     found: &Found<'db>,
-    setup: &mut Vec<Statement>,
+    setup: &mut Setup<'_>,
     span: MirSpan,
 ) -> LocalId {
     let pointer = match &found.pointer {
+        // clone: the pointer's place, kept in the body: a refcount
         Pointer::Raw(place) => Operand { kind: OperandKind::Copy(place.clone()), span: None },
         Pointer::Box(place, boxed) => {
             let raw_ty = Ty::new_imm_ptr(ctx.infcx.interner, *boxed);
@@ -496,17 +513,18 @@ fn address<'db>(
 
 /// rustc's `insert_alignment_check`.
 fn alignment_check<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     consts: &Consts<'db>,
     body: &mut MirBody<'db>,
     found: &Found<'db>,
-    setup: &mut Vec<Statement>,
+    setup: &mut Setup<'_>,
     span: MirSpan,
 ) -> Result<'db, (Operand, AssertKind)> {
     let addr = address(ctx, consts, body, found, setup, span);
     let align_of = ctx.infcx.interner.lang_items().AlignOf;
     let alignment = type_property(ctx, consts, align_of, "mem_align_const", found.pointee)?;
     let mask = temp(body, consts.usize_ty);
+    // clone: an interned constant's handle, read twice in the body
     let minus_one = Rvalue::BinaryOp(BinOp::Sub, alignment.clone(), consts.usize(1));
     setup.push(assign(mask, minus_one, span));
     if let Some(max) = max_reliable_alignment(ctx) {
@@ -523,7 +541,7 @@ fn alignment_check<'db>(
 
 /// rustc's `Target::max_reliable_alignment`: MSVC on 32-bit x86 aligns the stack to 4 bytes,
 /// so a larger alignment is not one a pointer can be relied on to have.
-fn max_reliable_alignment(ctx: &Ctx<'_>) -> Option<u64> {
+fn max_reliable_alignment(ctx: &Ctx<'_, '_>) -> Option<u64> {
     let cfg = ctx.krate().cfg_options(ctx.db);
     let is = |key: &str, value: &str| {
         cfg.check_atom(&cfg::CfgAtom::KeyValue {
@@ -537,11 +555,11 @@ fn max_reliable_alignment(ctx: &Ctx<'_>) -> Option<u64> {
 
 /// rustc's `insert_null_check`.
 fn null_check<'db>(
-    ctx: &Ctx<'db>,
+    ctx: &Ctx<'_, 'db>,
     consts: &Consts<'db>,
     body: &mut MirBody<'db>,
     found: &Found<'db>,
-    setup: &mut Vec<Statement>,
+    setup: &mut Setup<'_>,
     span: MirSpan,
 ) -> Result<'db, (Operand, AssertKind)> {
     let addr = address(ctx, consts, body, found, setup, span);

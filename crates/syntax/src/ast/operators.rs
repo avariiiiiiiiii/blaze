@@ -62,6 +62,22 @@ pub enum ArithOp {
     BitAnd,
 }
 
+impl ArithOp {
+    /// Every operator, in declaration order: persisted codes index into it.
+    pub const ALL: [ArithOp; 10] = [
+        ArithOp::Add,
+        ArithOp::Mul,
+        ArithOp::Sub,
+        ArithOp::Div,
+        ArithOp::Rem,
+        ArithOp::Shl,
+        ArithOp::Shr,
+        ArithOp::BitXor,
+        ArithOp::BitOr,
+        ArithOp::BitAnd,
+    ];
+}
+
 impl fmt::Display for LogicOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let res = match self {

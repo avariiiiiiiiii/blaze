@@ -14,7 +14,7 @@ use cranelift_codegen::ir;
 use crate::{
     Error, Target,
     buf::{Buf, Label},
-    code::{self, Name, Rule},
+    code::{Name, Rule, UnwindKind},
     patch,
 };
 
@@ -78,29 +78,30 @@ pub trait Glue: Sized + 'static {
 
     /// Writes the prologue: the frame, the saved registers, the probe, the frame register, the
     /// calls counter ([`crate::tier`]), and each entry block parameter stored to its [`Loc`].
-    fn prologue(cx: &mut Cx<'_, Self>) -> Result<(), Error>;
+    fn prologue(cx: &mut Cx<'_, '_, Self>) -> Result<(), Error>;
 
     /// Writes `inst`, which [`Glue::takes`]. A `try_call`'s normal edge is written next by
     /// the patcher, so the glue falls through to it.
-    fn inst(cx: &mut Cx<'_, Self>, inst: ir::Inst) -> Result<(), Error>;
+    fn inst(cx: &mut Cx<'_, '_, Self>, inst: ir::Inst) -> Result<(), Error>;
 
     /// At a landing pad of `inst` (a `try_call`, at the label of one of its handler edges):
     /// stores the exception payload registers to [`Cx::payload`].
-    fn landing(cx: &mut Cx<'_, Self>, inst: ir::Inst) -> Result<(), Error>;
+    fn landing(cx: &mut Cx<'_, '_, Self>, inst: ir::Inst) -> Result<(), Error>;
 
     /// Writes the trap stub of `code`, at the label the patcher bound.
-    fn trap(cx: &mut Cx<'_, Self>, code: ir::TrapCode);
+    fn trap(cx: &mut Cx<'_, '_, Self>, code: ir::TrapCode);
 
     /// Adds one to the function's back-edge cell ([`crate::tier`]).
-    fn count_back_edge(cx: &mut Cx<'_, Self>);
+    fn count_back_edge(cx: &mut Cx<'_, '_, Self>);
 
     /// Copies `bytes` (8 or 16) from the slot at `from` to the slot at `to`, either beyond
     /// [`Glue::NEAR`].
-    fn relay(cx: &mut Cx<'_, Self>, from: u32, to: u32, bytes: u8);
+    fn relay(cx: &mut Cx<'_, '_, Self>, from: u32, to: u32, bytes: u8);
 
-    /// The function's unwind information, from the rows recorded ([`Cx::rows`]) once all of
-    /// it is written.
-    fn unwind(cx: &mut Cx<'_, Self>) -> Result<Option<code::Unwind>, Error>;
+    /// The function's unwind information, once all of it is written: the rows recorded
+    /// ([`Cx::rows`], trimmed by [`Cx::retain_rows`]) for DWARF, or Windows' `UNWIND_INFO` or
+    /// ARM64 unwind codes written into [`Cx::windows_info`].
+    fn unwind(cx: &mut Cx<'_, '_, Self>) -> Result<Option<UnwindKind>, Error>;
 
     /// The DWARF register named slots are found from (the frame pointer), and where the
     /// frame register points from it.
@@ -108,16 +109,34 @@ pub trait Glue: Sized + 'static {
 }
 
 /// What the glue is given to write one piece of a function.
-pub struct Cx<'a, A: Glue> {
-    pub buf: &'a mut Buf,
+///
+/// `'f` is the compile's memory frame (`blaze_mem::frame::task`), which the buffer and the
+/// patcher's columns are on; `'a` the borrows of one piece.
+pub struct Cx<'a, 'f, A: Glue> {
+    pub buf: &'a mut Buf<'f>,
     pub func: &'a ir::Function,
     pub target: &'a Target,
     pub frame: &'a A::Frame,
-    pub(crate) plan: &'a patch::Plan,
-    pub(crate) side: &'a mut patch::Side,
+    pub(crate) plan: &'a patch::Plan<'f>,
+    pub(crate) side: &'a mut patch::Side<'f>,
 }
 
-impl<A: Glue> Cx<'_, A> {
+impl<'f, A: Glue> Cx<'_, 'f, A> {
+    /// The compile's memory frame, for the glue's temporaries.
+    pub fn temp(&self) -> &'f blaze_mem::Frame {
+        self.buf.temp()
+    }
+
+    /// Keeps the recorded rows `keep` says, in order: what a glue drops from the DWARF rows.
+    pub fn retain_rows(&mut self, keep: impl FnMut(&(u32, Rule)) -> bool) {
+        self.side.retain_rows(keep);
+    }
+
+    /// Where the glue writes Windows' unwind information, empty until it does.
+    pub fn windows_info(&mut self) -> &mut Vec<u8, &'f blaze_mem::Frame> {
+        self.side.windows_info()
+    }
+
     /// Where `value` is (its aliases resolved).
     pub fn loc(&self, value: ir::Value) -> Loc {
         self.plan.loc(self.func, value)

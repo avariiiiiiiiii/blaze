@@ -40,6 +40,7 @@ use std::{
 };
 
 use anyhow::{Context, bail, ensure};
+use blaze_format::cursor::Reader;
 use blaze_ids::radix;
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget, SectionFlags,
@@ -82,10 +83,6 @@ fn put32(bytes: &mut [u8], at: usize, value: u32) {
 
 fn put64(bytes: &mut [u8], at: usize, value: u64) {
     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-fn uleb(bytes: &[u8], at: &mut usize) -> anyhow::Result<u64> {
-    Ok(blaze_format::leb::read_u64(bytes, at)?)
 }
 
 /// What a splice has to know of the executable. Nothing of the file is read again but the
@@ -369,15 +366,14 @@ struct Rebases;
 impl Rebases {
     fn read(stream: &[u8], segments: &[Segment]) -> anyhow::Result<Vec<u64>> {
         let mut found = Vec::new();
-        let (mut at, mut address) = (0, 0u64);
+        let (mut opcodes, mut address) = (Reader::new(stream), 0u64);
         let mut rebase = |address: &mut u64, times: u64, skip: u64| {
             for _ in 0..times {
                 found.push(*address);
                 *address = address.wrapping_add(8 + skip);
             }
         };
-        while let Some(&byte) = stream.get(at) {
-            at += 1;
+        while let Ok(byte) = opcodes.u8() {
             let immediate = u64::from(byte & 0x0f);
             match byte & 0xf0 {
                 macho::REBASE_OPCODE_DONE => break,
@@ -390,22 +386,22 @@ impl Rebases {
                 macho::REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB => {
                     let segment =
                         segments.get(immediate as usize).context("a fixup in no segment")?;
-                    address = segment.address + uleb(stream, &mut at)?;
+                    address = segment.address + opcodes.uleb()?;
                 }
                 macho::REBASE_OPCODE_ADD_ADDR_ULEB => {
-                    address = address.wrapping_add(uleb(stream, &mut at)?)
+                    address = address.wrapping_add(opcodes.uleb()?)
                 }
                 macho::REBASE_OPCODE_ADD_ADDR_IMM_SCALED => address += immediate * 8,
                 macho::REBASE_OPCODE_DO_REBASE_IMM_TIMES => rebase(&mut address, immediate, 0),
                 macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES => {
-                    rebase(&mut address, uleb(stream, &mut at)?, 0);
+                    rebase(&mut address, opcodes.uleb()?, 0);
                 }
                 macho::REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB => {
-                    rebase(&mut address, 1, uleb(stream, &mut at)?);
+                    rebase(&mut address, 1, opcodes.uleb()?);
                 }
                 macho::REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB => {
-                    let times = uleb(stream, &mut at)?;
-                    rebase(&mut address, times, uleb(stream, &mut at)?);
+                    let times = opcodes.uleb()?;
+                    rebase(&mut address, times, opcodes.uleb()?);
                 }
                 other => bail!("a fixup of kind {other:#x}"),
             }
@@ -786,41 +782,39 @@ impl Pointer {
         let mut found = Vec::new();
         // How the frames of a common entry write addresses of code and of landing pads.
         let mut common = FxHashMap::<usize, (u8, Option<u8>)>::default();
-        let mut at = 0;
-        while at + 4 <= section.len() {
-            let len = u32_at(section, at)? as usize;
+        let mut records = Reader::new(section);
+        while records.left() >= 4 {
+            let at = records.at();
+            let len = records.u32()? as usize;
             if len == 0 {
                 break;
             }
             ensure!(len != u32::MAX as usize, "an unwind table in the 64-bit format");
-            let back = u32_at(section, at + 4)? as usize;
+            let back = records.u32()? as usize;
             if back == 0 {
-                let mut next = at + 9;
-                let augmentation: Vec<u8> =
-                    section[next..].iter().copied().take_while(|it| *it != 0).collect();
-                next += augmentation.len() + 1;
+                // Past the version.
+                let mut entry = Reader::starting_at(section, at + 9)?;
+                let augmentation = entry.cstr()?;
                 // The alignment of code and of data, the register of the return address,
                 // and the length of what the augmentation adds.
                 for _ in 0..3 {
-                    uleb(section, &mut next)?;
+                    entry.skip_leb()?;
                 }
                 let (mut code, mut pads) = (0, None);
                 if augmentation.first() == Some(&b'z') {
-                    uleb(section, &mut next)?;
+                    entry.skip_leb()?;
                     for letter in &augmentation[1..] {
-                        let encoding =
-                            *section.get(next).context("a common entry that ends early")?;
+                        let encoding = entry.u8().context("a common entry that ends early")?;
                         match letter {
                             b'R' => code = encoding,
                             b'L' => pads = Some(encoding),
                             b'P' => {
-                                let pointer = Pointer::encoded(encoding, next + 1)?;
-                                next += pointer.len;
+                                let pointer = Pointer::encoded(encoding, entry.at())?;
+                                entry.skip(pointer.len)?;
                                 found.push(pointer);
                             }
                             other => bail!("a common entry augmented with {:?}", *other as char),
                         }
-                        next += 1;
                     }
                 }
                 common.insert(at, (code, pads));
@@ -828,18 +822,19 @@ impl Pointer {
                 let entry = (at + 4).checked_sub(back).and_then(|it| common.get(&it));
                 let &(code, pads) = entry.context("a frame of no common entry")?;
                 let start = Pointer::encoded(code, at + 8)?;
-                let mut next = start.at + 2 * start.len;
+                let after = start.at + 2 * start.len;
                 found.push(start);
                 if let Some(pads) = pads {
-                    uleb(section, &mut next)?;
-                    let pad = Pointer::encoded(pads, next)?;
+                    let mut augmentation = Reader::starting_at(section, after)?;
+                    augmentation.skip_leb()?;
+                    let pad = Pointer::encoded(pads, augmentation.at())?;
                     // Nothing is written for code that throws to nowhere.
                     if pad.value(section)? != 0 {
                         found.push(pad);
                     }
                 }
             }
-            at += 4 + len;
+            records.seek(at + 4 + len)?;
         }
         Ok(found)
     }
@@ -2178,17 +2173,20 @@ impl Unwinding {
     /// The `__eh_frame` of an object: its bytes, and a function for each frame (FDE) in it.
     pub fn add_frames(&mut self, section: &[u8]) -> anyhow::Result<()> {
         self.frames += section.len();
-        let mut at = 0;
-        while at + 8 <= section.len() {
-            let (len, id_at) = match u32_at(section, at)? {
+        let mut records = Reader::new(section);
+        while records.left() >= 8 {
+            let len = match records.u32()? {
                 0 => break,
-                0xffff_ffff => (usize::try_from(u64_at(section, at + 4)?)?, at + 12),
-                len => (len as usize, at + 4),
+                0xffff_ffff => usize::try_from(records.u64()?)?,
+                len => len as usize,
             };
-            if u32_at(section, id_at)? != 0 {
+            let id_at = records.at();
+            if records.u32()? != 0 {
                 self.functions += 1;
             }
-            at = id_at + len;
+            if records.seek(id_at.saturating_add(len)).is_err() {
+                break;
+            }
         }
         Ok(())
     }

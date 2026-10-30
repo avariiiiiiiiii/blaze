@@ -13,14 +13,14 @@ use either::Either;
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
     VariantId,
-    expr_store::{Body, ExpressionStore, HygieneId},
+    expr_store::{Body, HygieneId},
     item_tree::FieldsShape,
     lang_item::LangItems,
     layout::{TagEncoding, Variants},
     resolver::{HasResolver, ValueNs},
     signatures::{EnumSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
-use hir_expand::{InFile, mod_path::path};
+use hir_expand::mod_path::path;
 use la_arena::ArenaMap;
 use rustc_abi::{Size, TargetDataLayout};
 use rustc_apfloat::{
@@ -29,13 +29,12 @@ use rustc_apfloat::{
 };
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::{SmallVec, smallvec};
 use rustc_type_ir::{
     AliasTyKind,
     inherent::{GenericArgs as _, IntoKind, Region as _, SliceLike, Ty as _},
 };
-use span::FileId;
 use stdx::never;
-use syntax::{SyntaxNodePtr, TextRange};
 use triomphe::Arc;
 
 use crate::{
@@ -109,13 +108,13 @@ fn apfloat_to_int<F: Float>(value: F, bits: usize, signed: bool) -> u128 {
 
 /// The bytes of a float converted to the float type `to` as rustc's evaluation does: rounded
 /// to nearest, ties to even, and a NaN made the positive quiet NaN without a payload.
-fn convert_apfloat<F>(value: F, to: rustc_type_ir::FloatTy) -> Vec<u8>
+fn convert_apfloat<F>(value: F, to: rustc_type_ir::FloatTy) -> OwnedBytes
 where
     F: FloatConvert<f16> + FloatConvert<Single> + FloatConvert<Double> + FloatConvert<f128>,
 {
-    fn to_float<F: FloatConvert<T>, T: Float>(value: F, bytes: usize) -> Vec<u8> {
+    fn to_float<F: FloatConvert<T>, T: Float>(value: F, bytes: usize) -> OwnedBytes {
         let converted = if value.is_nan() { T::NAN } else { value.convert(&mut false).value };
-        converted.to_bits().to_le_bytes()[0..bytes].to_vec()
+        OwnedBytes::from_slice(&converted.to_bits().to_le_bytes()[0..bytes])
     }
     match to {
         rustc_type_ir::FloatTy::F16 => to_float::<F, f16>(value, 2),
@@ -216,7 +215,7 @@ struct Raised<'db> {
     statement: Option<usize>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 enum MirOrDynIndex<'db> {
     Mir(&'db MirBody<'db>),
     Dyn(usize),
@@ -246,9 +245,11 @@ enum Origin {
     /// `const_allocate`, freed by `const_deallocate`. A constant's value may point to it once
     /// `const_make_global` has made it global.
     ConstHeap { global: bool },
-    /// The thread shims' (anonymous `mmap`, `errno` cells, dispatch semaphores), freed only
-    /// by their shims (`munmap`, `dispatch_release`).
+    /// The thread shims' `errno` cells and dispatch semaphores, freed only by their shim
+    /// (`dispatch_release`).
     Machine,
+    /// An anonymous `mmap`, freed only by `munmap`.
+    Mmap,
 }
 
 impl Origin {
@@ -258,6 +259,7 @@ impl Origin {
             Origin::Allocator => MemKind::Rust,
             Origin::ConstHeap { .. } => MemKind::ConstHeap,
             Origin::Machine => MemKind::Machine,
+            Origin::Mmap => MemKind::Mmap,
         }
     }
 }
@@ -330,6 +332,10 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// every use of the constant reads the same copy.
     constants: FxHashMap<Either<Const<'db>, Allocation<'db>>, Interval>,
     code_stack: Vec<StackFrame<'db>>,
+    /// Emptied `code_stack`s, for the nested runs of [`Self::interpret_mir`].
+    spare_code_stacks: Vec<Vec<StackFrame<'db>>>,
+    /// Emptied buffers of a call's evaluated arguments, one per call being made at once.
+    spare_args: Vec<Vec<IntervalAndTy<'db>>>,
     /// The `callee` and `span` of the frame being run, which is not on `code_stack`.
     running: Option<Running<'db>>,
     /// The body of the frame being run.
@@ -474,7 +480,7 @@ struct Interval {
     size: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct IntervalAndTy<'db> {
     interval: Interval,
     ty: Ty<'db>,
@@ -526,11 +532,15 @@ impl<'db> IntervalAndTy<'db> {
     }
 }
 
+/// The bytes of a computed value, inline up to 16: every scalar up to `u128` and a wide
+/// pointer. Only SIMD vectors and aggregates spill.
+type OwnedBytes = SmallVec<[u8; 16]>;
+
 /// A value: in memory, or computed. `Owned` bytes are all initialized and carry no
 /// provenance; `Shadowed` ones say which are and what they carry.
 enum IntervalOrOwned<S = ()> {
-    Owned(Vec<u8>),
-    Shadowed(Vec<u8>, S),
+    Owned(OwnedBytes),
+    Shadowed(OwnedBytes, S),
     Borrowed(Interval),
 }
 
@@ -838,6 +848,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             drop_glue: FxHashMap::default(),
             constants: FxHashMap::default(),
             code_stack: vec![],
+            spare_code_stacks: Vec::new(),
+            spare_args: Vec::new(),
             running: None,
             body_running: None,
             threads: Vec::new(),
@@ -919,37 +931,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.cached_ptr_size
     }
 
-    fn resolve_mir_span(
-        &self,
-        owner: InferBodyId<'db>,
-        span: MirSpan,
-    ) -> Option<(FileId, TextRange)> {
-        let (source_map, self_param_syntax) = match owner {
-            InferBodyId::DefWithBodyId(def) => {
-                let body = &Body::with_source_map(self.db, def).1;
-                (&**body, body.self_param_syntax())
-            }
-            InferBodyId::AnonConstId(def) => {
-                (ExpressionStore::with_source_map(self.db, def.loc(self.db).owner).1, None)
-            }
-        };
-        let span: InFile<SyntaxNodePtr> = match span {
-            MirSpan::ExprId(e) | MirSpan::ExprEnd(e) => {
-                source_map.expr_syntax(e).ok()?.map(|it| it.into())
-            }
-            MirSpan::PatId(p) => source_map.pat_syntax(p).ok()?.map(|it| it.syntax_node_ptr()),
-            MirSpan::BindingId(b) => source_map
-                .patterns_for_binding(b)
-                .iter()
-                .find_map(|p| source_map.pat_syntax(*p).ok())?
-                .map(|it| it.syntax_node_ptr()),
-            MirSpan::SelfParam => self_param_syntax?.map(|it| it.syntax_node_ptr()),
-            MirSpan::Unknown => return None,
-        };
-        let file_id = span.file_id.original_file(self.db);
-        Some((file_id.file_id(self.db), span.value.text_range()))
-    }
-
     fn projected_ty(&self, ty: PlaceTy<'db>, proj: PlaceElem) -> PlaceTy<'db> {
         let pair = (ty, proj);
         if let Some(r) = self.projected_ty_cache.borrow().get(&pair) {
@@ -1022,9 +1003,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     metadata = match metadata {
                         Some(it) => {
                             let prev_len = from_bytes!(usize, self.scalar(&it)?) as u64;
-                            Some(IntervalOrOwned::Owned(
-                                word_bytes((prev_len - from - to) as usize).to_vec(),
-                            ))
+                            Some(IntervalOrOwned::Owned(OwnedBytes::from_slice(&word_bytes(
+                                (prev_len - from - to) as usize,
+                            ))))
                         }
                         None => None,
                     };
@@ -1176,7 +1157,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         }
         let (mut locals, prev_stack_ptr) = self.create_locals_for_body(body, None)?;
         self.enter_frame(body, &mut locals, args, false)?;
-        let prev_code_stack = mem::take(&mut self.code_stack);
+        let spare = self.spare_code_stacks.pop().unwrap_or_default();
+        let prev_code_stack = mem::replace(&mut self.code_stack, spare);
         let prev_running = self.running;
         let prev_body = self.body_running;
         let (callee, span) = match called {
@@ -1187,10 +1169,15 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.nesting += 1;
         let result = self.run_stack(body.start_block);
         self.nesting -= 1;
-        let my_code_stack = mem::replace(&mut self.code_stack, prev_code_stack);
+        let mut my_code_stack = mem::replace(&mut self.code_stack, prev_code_stack);
         self.running = prev_running;
         self.body_running = prev_body;
         self.stack_depth_limit = depth_limit;
+        if result.is_ok() {
+            my_code_stack.clear();
+            self.spare_code_stacks.push(my_code_stack);
+            return result;
+        }
         result.map_err(|e| {
             if mem::take(&mut self.escaped) {
                 return e;
@@ -1369,69 +1356,91 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Option<Ran<'db>>> {
         let destination_interval = self.place_interval(destination, locals)?;
         let fn_ty = self.operand_ty(func, locals)?;
-        let args_evaluated = args
-            .iter()
-            .map(|it| self.operand_ty_and_eval(it, locals))
-            .collect::<Result<'db, Vec<_>>>()?;
-        if M::CHECKS {
-            self.moved_args.clear();
-            for (operand, arg) in args.iter().zip(&args_evaluated) {
-                if matches!(operand.kind, OperandKind::Move(_)) && arg.interval.size != 0 {
-                    self.moved_args.push(arg.interval);
+        // From a pool, not one field: a shim may run a nested `interpret_mir` that calls again.
+        let mut args_evaluated = self.spare_args.pop().unwrap_or_default();
+        for it in args.iter() {
+            match self.operand_ty_and_eval(it, locals) {
+                Ok(it) => args_evaluated.push(it),
+                Err(error) => {
+                    args_evaluated.clear();
+                    self.spare_args.push(args_evaluated);
+                    return Err(error);
                 }
             }
         }
-        let then = target.map_or(Then::Diverges, Then::Block);
-        self.call_then = then;
-        let callee = match (fn_ty.kind(), intrinsic) {
-            (TyKind::FnPtr(..), _) => {
-                let bytes = self.eval_operand(func, locals)?;
-                self.exec_fn_pointer(bytes, destination_interval, &args_evaluated, locals, then, span)?
+        let ran = (|| -> Result<'db, Option<Ran<'db>>> {
+            if M::CHECKS {
+                self.moved_args.clear();
+                for (operand, arg) in args.iter().zip(&args_evaluated) {
+                    if matches!(operand.kind, OperandKind::Move(_)) && arg.interval.size != 0 {
+                        self.moved_args.push(arg.interval);
+                    }
+                }
             }
-            (TyKind::FnDef(def, generic_args), Some(intrinsic)) => {
-                let CallableDefId::FunctionId(def) = def.0 else {
-                    return Err(MirEvalError::InternalError(
-                        "an intrinsic call of a constructor".into(),
-                    ));
-                };
-                self.exec_intrinsic_fn(
-                    def,
-                    intrinsic,
-                    &args_evaluated,
+            let then = target.map_or(Then::Diverges, Then::Block);
+            self.call_then = then;
+            let callee = match (fn_ty.kind(), intrinsic) {
+                (TyKind::FnPtr(..), _) => {
+                    let bytes = self.eval_operand(func, locals)?;
+                    let args = &args_evaluated;
+                    self.exec_fn_pointer(bytes, destination_interval, args, locals, then, span)?
+                }
+                (TyKind::FnDef(def, generic_args), Some(intrinsic)) => {
+                    let CallableDefId::FunctionId(def) = def.0 else {
+                        return Err(MirEvalError::InternalError(
+                            "an intrinsic call of a constructor".into(),
+                        ));
+                    };
+                    self.exec_intrinsic_fn(
+                        def,
+                        intrinsic,
+                        &args_evaluated,
+                        generic_args,
+                        locals,
+                        destination_interval,
+                        then,
+                        span,
+                    )?
+                }
+                (TyKind::FnDef(def, generic_args), None) => self.exec_fn_def(
+                    def.0,
                     generic_args,
-                    locals,
                     destination_interval,
+                    &args_evaluated,
+                    locals,
                     then,
                     span,
-                )?
+                )?,
+                (it, _) => not_supported!("unknown function type {it:?}"),
+            };
+            self.moved_args.clear();
+            self.call_then = Then::Nested;
+            if let Some(callee) = callee.or_else(|| self.pending.take()) {
+                return Ok(Some(Ran::Called(callee)));
             }
-            (TyKind::FnDef(def, generic_args), None) => self.exec_fn_def(
-                def.0,
-                generic_args,
-                destination_interval,
-                &args_evaluated,
-                locals,
-                then,
-                span,
-            )?,
-            (it, _) => not_supported!("unknown function type {it:?}"),
-        };
-        self.moved_args.clear();
-        self.call_then = Then::Nested;
-        if let Some(callee) = callee.or_else(|| self.pending.take()) {
-            return Ok(Some(Ran::Called(callee)));
-        }
-        let Some(target) = target else {
-            // alloc: error path
-            return Err(MirEvalError::UndefinedBehavior("Diverging function returned".to_owned()));
-        };
-        *block = target;
-        if let Some(wait) = self.waiting.take()
-            && self.block_call(wait, destination_interval)?
-        {
-            return Ok(Some(Ran::Switch(None)));
-        }
-        Ok(None)
+            let Some(target) = target else {
+                // alloc: error path
+                return Err(MirEvalError::UndefinedBehavior(
+                    "Diverging function returned".to_owned(),
+                ));
+            };
+            *block = target;
+            if let Some(wait) = self.waiting.take()
+                && self.block_call(wait, destination_interval)?
+            {
+                return Ok(Some(Ran::Switch(None)));
+            }
+            // A shim or intrinsic wrote the destination, and the call goes on at its target.
+            if M::CHECKS && destination_interval.size != 0 {
+                let ty = self.place_ty(destination, locals)?;
+                let Interval { addr, size } = destination_interval;
+                self.typed_copy(addr, ty, size, RetagMode::Default)?;
+            }
+            Ok(None)
+        })();
+        args_evaluated.clear();
+        self.spare_args.push(args_evaluated);
+        ran
     }
 
     /// `frame` returned; `block` is set to where its caller goes on. The result of the run
@@ -1443,6 +1452,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Option<Interval>> {
         self.machine.ret()?;
         let return_interval = frame.locals.ptr[return_slot()];
+        let returned_ty = frame.locals.body.locals[return_slot()].ty.as_ref();
         let StackFrame { locals, then, drops, prev_stack_ptr, .. } = frame;
         self.unused_locals_store.borrow_mut().entry(locals.body.owner).or_default().push(locals);
         if then == Then::Nested {
@@ -1454,6 +1464,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.free_stack(prev_stack_ptr)?;
         match then {
             Then::Block(target) => {
+                // The callee's return slot is the call's destination, now complete.
+                if M::CHECKS && return_interval.size != 0 {
+                    let Interval { addr, size } = return_interval;
+                    self.typed_copy(addr, returned_ty, size, RetagMode::Default)?;
+                }
                 *block = target;
                 self.finish_drops(drops, then, block)?;
             }
@@ -1779,10 +1794,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             // Arguments, the return place and locals without storage statements are live for
             // the whole frame.
             let marked = self.storage_marked(body);
-            let ids: Vec<LocalId> = locals.ptr.iter().map(|(id, _)| id).collect();
-            for id in ids {
-                let frame_start = Address::stack(self.stack_base() + prev_stack_pointer);
-                let in_frame = locals.ptr[id].addr.to_usize() >= frame_start.to_usize();
+            let frame_start = Address::stack(self.stack_base() + prev_stack_pointer);
+            // In index order, as `locals.ptr` is, without borrowing it across `set_storage`.
+            for (id, _) in body.locals.iter() {
+                let Some(at) = locals.ptr.get(id) else { continue };
+                let in_frame = at.addr.to_usize() >= frame_start.to_usize();
                 if !marked.contains(&id) && in_frame {
                     self.set_storage(id, &mut locals, true)?;
                 }
@@ -1832,23 +1848,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     match f {
                         rustc_type_ir::FloatTy::F16 => {
                             let c = -from_bytes!(f16, u16, c);
-                            Owned(u16::try_from(c.to_bits()).unwrap().to_le_bytes().into())
+                            Owned(OwnedBytes::from_slice(&u16::try_from(c.to_bits()).unwrap().to_le_bytes()))
                         }
                         rustc_type_ir::FloatTy::F32 => {
                             let c = -from_bytes!(f32, c);
-                            Owned(c.to_le_bytes().into())
+                            Owned(OwnedBytes::from_slice(&c.to_le_bytes()))
                         }
                         rustc_type_ir::FloatTy::F64 => {
                             let c = -from_bytes!(f64, c);
-                            Owned(c.to_le_bytes().into())
+                            Owned(OwnedBytes::from_slice(&c.to_le_bytes()))
                         }
                         rustc_type_ir::FloatTy::F128 => {
                             let c = -from_bytes!(f128, u128, c);
-                            Owned(c.to_bits().to_le_bytes().into())
+                            Owned(OwnedBytes::from_slice(&c.to_bits().to_le_bytes()))
                         }
                     }
                 } else {
-                    let mut c = c.to_vec();
+                    let mut c = OwnedBytes::from_slice(c);
                     if matches!(ty.kind(), TyKind::Bool) {
                         c[0] = 1 - c[0];
                     } else {
@@ -1902,13 +1918,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         let ls = from_bytes!(usize, self.read_scalar(lv.slice(ps..ps * 2))?);
                         let rs = from_bytes!(usize, self.read_scalar(rv.slice(ps..ps * 2))?);
                         if ls != rs {
-                            break 'binary_op Owned(vec![0]);
+                            break 'binary_op Owned(smallvec![0]);
                         }
                         let la = self.read_pointer(lv.addr)?.aligned(element_align);
                         let ra = self.read_pointer(rv.addr)?.aligned(element_align);
                         let lc = self.read_scalar(Interval::new(la, ls * element))?;
                         let rc = self.read_scalar(Interval::new(ra, ls * element))?;
-                        break 'binary_op Owned(vec![u8::from(lc == rc)]);
+                        break 'binary_op Owned(smallvec![u8::from(lc == rc)]);
                     } else {
                         self.size_align_of_sized(ty, locals, "operand of binary op")?
                     };
@@ -1931,7 +1947,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 | BinOp::Eq
                                 | BinOp::Ne => {
                                     let r = op.run_compare(l, r) as u8;
-                                    Owned(vec![r])
+                                    Owned(smallvec![r])
                                 }
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
@@ -1942,12 +1958,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                         BinOp::Rem => l % r,
                                         _ => unreachable!(),
                                     };
-                                    Owned(
-                                        u16::try_from(r.value.to_bits())
-                                            .unwrap()
-                                            .to_le_bytes()
-                                            .into(),
-                                    )
+                                    Owned(OwnedBytes::from_slice(
+                                        &u16::try_from(r.value.to_bits()).unwrap().to_le_bytes(),
+                                    ))
                                 }
                                 it => not_supported!(
                                     "invalid binop {it:?} on floating point operators"
@@ -1965,7 +1978,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 | BinOp::Eq
                                 | BinOp::Ne => {
                                     let r = op.run_compare(l, r) as u8;
-                                    Owned(vec![r])
+                                    Owned(smallvec![r])
                                 }
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
@@ -1979,7 +1992,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                     // rustc's const eval makes every NaN it computes the
                                     // positive quiet one, where the host's can be negative.
                                     let r = if r.is_nan() { f32::NAN } else { r };
-                                    Owned(r.to_le_bytes().into())
+                                    Owned(OwnedBytes::from_slice(&r.to_le_bytes()))
                                 }
                                 it => not_supported!(
                                     "invalid binop {it:?} on floating point operators"
@@ -1997,7 +2010,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 | BinOp::Eq
                                 | BinOp::Ne => {
                                     let r = op.run_compare(l, r) as u8;
-                                    Owned(vec![r])
+                                    Owned(smallvec![r])
                                 }
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
@@ -2011,7 +2024,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                     // rustc's const eval makes every NaN it computes the
                                     // positive quiet one, where the host's can be negative.
                                     let r = if r.is_nan() { f64::NAN } else { r };
-                                    Owned(r.to_le_bytes().into())
+                                    Owned(OwnedBytes::from_slice(&r.to_le_bytes()))
                                 }
                                 it => not_supported!(
                                     "invalid binop {it:?} on floating point operators"
@@ -2029,7 +2042,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 | BinOp::Eq
                                 | BinOp::Ne => {
                                     let r = op.run_compare(l, r) as u8;
-                                    Owned(vec![r])
+                                    Owned(smallvec![r])
                                 }
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                                     let r = match op {
@@ -2040,7 +2053,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                         BinOp::Rem => l % r,
                                         _ => unreachable!(),
                                     };
-                                    Owned(r.value.to_bits().to_le_bytes().into())
+                                    Owned(OwnedBytes::from_slice(&r.value.to_bits().to_le_bytes()))
                                 }
                                 it => not_supported!(
                                     "invalid binop {it:?} on floating point operators"
@@ -2055,7 +2068,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     match op {
                         BinOp::Ge | BinOp::Gt | BinOp::Le | BinOp::Lt | BinOp::Eq | BinOp::Ne => {
                             let r = op.run_compare(l128, r128) as u8;
-                            Owned(vec![r])
+                            Owned(smallvec![r])
                         }
                         BinOp::BitAnd
                         | BinOp::BitOr
@@ -2155,7 +2168,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 let ty = self.place_ty(p, locals)?;
                 let place = self.eval_place(p, locals)?;
                 let result = self.read_discriminant(ty, place)?;
-                Owned(result.to_le_bytes().to_vec())
+                Owned(OwnedBytes::from_slice(&result.to_le_bytes()))
             }
             Rvalue::Repeat(it, len) => {
                 let len = match try_const_usize(self.db, len.as_ref()) {
@@ -2225,7 +2238,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         if let TyKind::FnDef(_, _) | TyKind::Closure(_, _) = current_ty.kind() {
                             let id = self.vtable_map.id(current_ty);
                             let ptr_size = self.ptr_size();
-                            Owned(id.to_le_bytes()[0..ptr_size].to_vec())
+                            Owned(OwnedBytes::from_slice(&id.to_le_bytes()[0..ptr_size]))
                         } else {
                             not_supported!(
                                 "creating a fn pointer from a non FnDef or Closure type"
@@ -2274,7 +2287,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                             self.machine.expose(Ptr { addr, prov })?;
                         }
                     }
-                    let bytes = pad16(bytes, is_signed)[0..dest_size].to_vec();
+                    let bytes = OwnedBytes::from_slice(&pad16(bytes, is_signed)[0..dest_size]);
                     if M::CHECKS && *kind == CastKind::PointerFromExposedAddress {
                         let addr = u128::from_le_bytes(pad16(&bytes, IsSigned::No)) as u64;
                         let prov = self.machine.from_exposed(addr);
@@ -2309,7 +2322,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         _ => None,
                     };
                     if let Some(bits) = soft {
-                        return Ok(Owned(bits.to_le_bytes()[0..dest_size].to_vec()));
+                        return Ok(Owned(OwnedBytes::from_slice(&bits.to_le_bytes()[0..dest_size])));
                     }
                     let value = match ty {
                         rustc_type_ir::FloatTy::F32 => {
@@ -2338,7 +2351,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     } else {
                         (value as i128).min(max).max(min).to_le_bytes()
                     };
-                    Owned(result[0..dest_size].to_vec())
+                    Owned(OwnedBytes::from_slice(&result[0..dest_size]))
                 }
                 CastKind::FloatToFloat => {
                     let ty = self.operand_ty(operand, locals)?;
@@ -2373,8 +2386,8 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         }
                     };
                     match target_ty {
-                        rustc_type_ir::FloatTy::F32 => Owned((value as f32).to_le_bytes().to_vec()),
-                        rustc_type_ir::FloatTy::F64 => Owned(value.to_le_bytes().to_vec()),
+                        rustc_type_ir::FloatTy::F32 => Owned(OwnedBytes::from_slice(&(value as f32).to_le_bytes())),
+                        rustc_type_ir::FloatTy::F64 => Owned(OwnedBytes::from_slice(&value.to_le_bytes())),
                         rustc_type_ir::FloatTy::F16 | rustc_type_ir::FloatTy::F128 => {
                             unreachable!("converted above")
                         }
@@ -2404,13 +2417,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     }
                     let signed = matches!(current_ty.kind(), TyKind::Int(_));
                     match target_ty {
-                        rustc_type_ir::FloatTy::F32 => Owned(single.to_le_bytes().to_vec()),
-                        rustc_type_ir::FloatTy::F64 => Owned(double.to_le_bytes().to_vec()),
+                        rustc_type_ir::FloatTy::F32 => Owned(OwnedBytes::from_slice(&single.to_le_bytes())),
+                        rustc_type_ir::FloatTy::F64 => Owned(OwnedBytes::from_slice(&double.to_le_bytes())),
                         rustc_type_ir::FloatTy::F16 => {
-                            Owned((of::<f16>(value, signed) as u16).to_le_bytes().to_vec())
+                            Owned(OwnedBytes::from_slice(&(of::<f16>(value, signed) as u16).to_le_bytes()))
                         }
                         rustc_type_ir::FloatTy::F128 => {
-                            Owned(of::<f128>(value, signed).to_le_bytes().to_vec())
+                            Owned(OwnedBytes::from_slice(&of::<f128>(value, signed).to_le_bytes()))
                         }
                     }
                 }
@@ -2635,7 +2648,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         metadata: &[u8],
     ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
         let (bytes, mut shadow) = self.read_shadowed(ptr.addr, ptr.size)?;
-        let mut r = Vec::with_capacity(bytes.len() + metadata.len());
+        let mut r = OwnedBytes::with_capacity(bytes.len() + metadata.len());
         r.extend_from_slice(bytes);
         r.extend_from_slice(metadata);
         if !M::CHECKS {
@@ -2758,7 +2771,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         tag: Option<(usize, usize, i128)>,
         fields: impl Iterator<Item = (usize, Interval)>,
     ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
-        let mut result = vec![0; size];
+        let mut result: OwnedBytes = smallvec![0; size];
         let mut shadow = M::Shadow::default();
         if let Some((offset, tag_size, value)) = tag {
             match result.get_mut(offset..offset + tag_size) {
@@ -3199,19 +3212,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.write_memory(addr, b)?;
             Ok(addr.to_usize())
         })?;
-        let v: Cow<'_, [u8]> = if size != v.len() {
+        let padded;
+        let v: &[u8] = if size != v.len() {
             // Handle self enum
             if size == 16 && v.len() < 16 {
-                Cow::Owned(pad16(v, IsSigned::No).to_vec())
+                padded = pad16(v, IsSigned::No);
+                &padded
             } else if size < 16 && v.len() == 16 {
-                Cow::Borrowed(&v[0..size])
+                &v[0..size]
             } else {
                 return Err(MirEvalError::InvalidConst);
             }
         } else {
-            Cow::Borrowed(v)
+            v
         };
-        self.write_memory(addr, &v)?;
+        self.write_memory(addr, v)?;
         self.patch_addresses(
             &patch_map,
             memory_map,
@@ -3462,7 +3477,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         to: Address,
         metadata: Option<&IntervalOrOwned<M::Shadow>>,
     ) -> Result<'db, IntervalOrOwned<M::Shadow>> {
-        let mut bytes = to.to_bytes().to_vec();
+        let mut bytes = OwnedBytes::from_slice(&to.to_bytes());
         let Some(metadata) = metadata else {
             return Ok(match M::CHECKS {
                 true => {
@@ -4666,7 +4681,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, MirOrDynIndex<'db>> {
         let pair = (def, generic_args);
         if let Some(r) = self.mir_or_dyn_index_cache.borrow().get(&pair) {
-            return Ok(r.clone());
+            return Ok(*r);
         }
         let (def, generic_args) = pair;
         let r = if let Some(self_ty_idx) =
@@ -4698,7 +4713,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             })?;
             MirOrDynIndex::Mir(mir_body)
         };
-        self.mir_or_dyn_index_cache.borrow_mut().insert((def, generic_args), r.clone());
+        self.mir_or_dyn_index_cache.borrow_mut().insert((def, generic_args), r);
         Ok(r)
     }
 
@@ -4922,7 +4937,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 };
                 self.exec_fn_with_args(
                     def,
-                    &[arg0.clone(), arg1],
+                    &[*arg0, arg1],
                     generic_args,
                     locals,
                     destination,
@@ -5372,7 +5387,7 @@ pub fn render_const_using_debug_impl<'db>(
     evaluator.write_memory(arguments.offset(ptr_size), &argument.to_bytes())?;
     let Some(ValueNs::FunctionId(format_fn)) = resolver.resolve_path_in_value_ns_fully(
         db,
-        &hir_def::expr_store::path::Path::from_known_path_with_no_generic(path![std::fmt::format]),
+        hir_def::expr_store::path::Path::from_known_path_with_no_generic(&path![std::fmt::format]),
         HygieneId::ROOT,
     ) else {
         not_supported!("std::fmt::format not found");
@@ -5497,11 +5512,11 @@ impl IntValue {
         }
     }
 
-    fn to_bytes(self) -> Vec<u8> {
+    fn to_bytes(self) -> OwnedBytes {
         macro_rules! m {
             ( [] $( $int_ty:ident )+ ) => {
                 match self {
-                    $( Self::$int_ty(v) => v.to_le_bytes().to_vec() ),+
+                    $( Self::$int_ty(v) => OwnedBytes::from_slice(&v.to_le_bytes()) ),+
                 }
             };
         }

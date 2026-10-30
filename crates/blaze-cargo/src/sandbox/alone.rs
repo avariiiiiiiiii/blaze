@@ -65,6 +65,7 @@ pub(super) fn probe(kind: Probe) -> Result<(), String> {
 
 /// [`super::v2::launch`], in a process of its own.
 pub(super) fn launch(spec: &confine::Spec) -> i32 {
+    // clone: once per sandbox a test makes, the job it is sent as.
     match alone(Job::Launch(spec.clone())) {
         Ok(code) => code,
         Err(why) => panic!("`launch` answers a status, not an error: {why}"),
@@ -75,6 +76,7 @@ pub(super) fn launch(spec: &confine::Spec) -> i32 {
 #[cfg(target_os = "linux")]
 pub(super) fn run(spec: &super::Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     let program = program.map(<[OsString]>::to_vec);
+    // clone: once per sandbox a test makes, the job it is sent as.
     alone(Job::Run { spec: spec.clone(), program, unshared: None })
 }
 
@@ -86,6 +88,7 @@ pub(super) fn run_as(
     unshared: String,
 ) -> Result<i32, String> {
     let program = program.map(<[OsString]>::to_vec);
+    // clone: once per sandbox a test makes, the job it is sent as.
     alone(Job::Run { spec: spec.clone(), program, unshared: Some(unshared) })
 }
 
@@ -93,11 +96,15 @@ pub(super) fn run_as(
 /// wrote is written to this test's stderr.
 fn alone(job: Job) -> Result<i32, String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    // Once per sandbox a test makes: where its answer goes, and the job, for the process that
+    // makes it.
+    // alloc: as above.
     let answer = std::env::temp_dir().join(format!(
         "blaze-sandbox-alone-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    // clone: as above.
     let asked = serde_json::to_string(&Asked { job, answer: answer.clone() }).unwrap();
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .arg(FLAG)
@@ -105,6 +112,7 @@ fn alone(job: Job) -> Result<i32, String> {
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap();
+    // alloc: once per sandbox a test makes, what it wrote, read as text.
     eprint!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let answered = std::fs::read(&answer);
     _ = std::fs::remove_file(&answer);

@@ -70,6 +70,7 @@
 //! is built. The trees the transcriber reads are built from the cells once, when the match is
 //! over ([`Arena::build`]).
 
+use base_db::Db;
 use arrayvec::ArrayVec;
 use intern::sym;
 use tt::{
@@ -77,6 +78,10 @@ use tt::{
     iter::{TtElement, TtIter},
 };
 
+mod failure;
+
+pub(super) use self::failure::match_failure;
+use self::failure::Tracker;
 use super::{Binding, Bindings, Fragment, NONE, TokensOrigin};
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate, ValueResult, expect_fragment,
@@ -97,6 +102,10 @@ pub(crate) struct Matcher {
     separators: Box<[Separator]>,
     /// How many binders the rule has ([`crate::parser::resolve_binders`]).
     binders: u32,
+    /// Each `Var` location's declaration, by location, for what rustc says of a failed match.
+    var_decls: Box<[(u32, failure::VarDecl)]>,
+    /// Each visible group's `Open` and `Close` locations and delimiter, for the same.
+    groups: Box<[failure::Group]>,
 }
 
 /// A place the dot of a position can be at. 8 bytes.
@@ -147,7 +156,17 @@ impl Matcher {
         let mut builder = MatcherBuilder::default();
         builder.flatten(pattern);
         builder.locs.push(Loc::Eof);
-        let MatcherBuilder { locs, reps, rep_vars, literals, idents, puncts, separators } = builder;
+        let MatcherBuilder {
+            locs,
+            reps,
+            rep_vars,
+            literals,
+            idents,
+            puncts,
+            separators,
+            var_decls,
+            groups,
+        } = builder;
         Matcher {
             locs: locs.into_boxed_slice(),
             reps: reps.into_boxed_slice(),
@@ -157,6 +176,8 @@ impl Matcher {
             puncts: puncts.into_boxed_slice(),
             separators: separators.into_boxed_slice(),
             binders,
+            var_decls: var_decls.into_boxed_slice(),
+            groups: groups.into_boxed_slice(),
         }
     }
 
@@ -174,6 +195,8 @@ struct MatcherBuilder {
     idents: Vec<tt::Ident>,
     puncts: Vec<ArrayVec<tt::Punct, MAX_GLUED_PUNCT_LEN>>,
     separators: Vec<Separator>,
+    var_decls: Vec<(u32, failure::VarDecl)>,
+    groups: Vec<failure::Group>,
 }
 
 impl MatcherBuilder {
@@ -195,18 +218,23 @@ impl MatcherBuilder {
                     // clone: a glued punct, inline. Built once per rule, when the macro is defined.
                     self.puncts.push((**it).clone());
                 }
-                Op::Var { binder, kind, .. } => {
+                Op::Var { binder, kind, name, spec, decl, .. } => {
                     debug_assert_ne!(*binder, NO_BINDER, "a pattern's metavariable is unresolved");
+                    let decl = failure::VarDecl { name: *name.sym(), spec: *spec, span: *decl };
+                    self.var_decls.push((self.locs.len() as u32, decl));
                     self.locs.push(Loc::Var { binder: *binder, kind: *kind });
                 }
                 Op::Subtree { tokens, delimiter } => {
-                    self.locs.push(Loc::Subtree(delimiter.kind));
                     let visible = delimiter.kind != DelimiterKind::Invisible;
+                    self.locs.push(Loc::Subtree(delimiter.kind));
+                    let open = self.locs.len() as u32;
                     if visible {
                         self.locs.push(Loc::Open);
                     }
                     self.flatten(tokens);
                     if visible {
+                        let group = failure::Group { open, close: self.locs.len() as u32, delimiter: *delimiter };
+                        self.groups.push(group);
                         self.locs.push(Loc::Close);
                     }
                 }
@@ -617,13 +645,13 @@ impl<'t> Bindings<'t> {
 
 /// Matching errors are added to the `Match`.
 pub(super) fn match_<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     matcher: &Matcher,
     input: &'t tt::TopSubtree,
     arena: &mut Arena<'t>,
     res: &mut Match<'t>,
 ) {
-    match_loop(db, matcher, input, arena, res);
+    match_loop(db, matcher, input, arena, res, None);
     let bindings = &res.bindings;
     res.bound_count = bindings
         .roots
@@ -656,12 +684,13 @@ fn token_span(token: &Option<TtElement<'_>>, delim_span: DelimSpan) -> span::Spa
 ///   errors, used for error-resilient parsing. And `stack`, the "parent" frames of the input.
 #[inline]
 fn match_loop_inner<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     matcher: &Matcher,
     src: &TtIter<'t>,
     res: &mut Match<'t>,
     a: &mut Arena<'t>,
     delim_span: DelimSpan,
+    mut track: Option<&mut Tracker>,
 ) {
     let is_delim_closed = src.is_empty() && !a.stack.is_empty();
     // The token at the dot, decoded once for every position, and the punctuation glued from it.
@@ -682,6 +711,9 @@ fn match_loop_inner<'t>(
     }
 
     while let Some(mut item) = a.cur_items.pop() {
+        if let Some(track) = track.as_deref_mut() {
+            track.before_loc(matcher, item.dot, item.sep_matched, a.cur_items.is_empty());
+        }
         match matcher.locs[item.dot as usize] {
             // At the end of the matcher, not in a repetition: being at the end of a matcher
             // means that we have reached the potential end of the input.
@@ -894,17 +926,21 @@ fn match_loop_inner<'t>(
 }
 
 fn match_loop<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     matcher: &Matcher,
     input: &'t tt::TopSubtree,
     a: &mut Arena<'t>,
     res: &mut Match<'t>,
+    mut track: Option<&mut Tracker>,
 ) {
     let span = input.top_subtree().delimiter.delim_span();
     let mut src = input.iter();
     a.clear();
     res.clear();
     let mut error_recover_item = None;
+    if let Some(track) = track.as_deref_mut() {
+        track.start(span);
+    }
 
     a.cur_items.push(Pos::start());
 
@@ -915,7 +951,7 @@ fn match_loop<'t>(
 
         stdx::always!(a.next_items.is_empty());
 
-        match_loop_inner(db, matcher, &src, res, a, span);
+        match_loop_inner(db, matcher, &src, res, a, span, track.as_deref_mut());
         stdx::always!(a.cur_items.is_empty());
 
         if let Some(item) = a.error_items.pop() {
@@ -938,6 +974,12 @@ fn match_loop<'t>(
                     a.build(matcher, item, &mut res.bindings);
                 }
                 res.add_err(ExpandError::new(span.open, ExpandErrorKind::UnexpectedToken));
+                // More than one is rustc's ambiguity error, not a failure.
+                if a.eof_items.is_empty()
+                    && let Some(track) = track
+                {
+                    track.fail(db, None);
+                }
             }
             return;
         }
@@ -953,6 +995,13 @@ fn match_loop<'t>(
         if has_leftover_tokens {
             res.unmatched_tts += src.remaining().len();
             res.add_err(ExpandError::new(span.open, ExpandErrorKind::LeftoverTokens));
+            // Positions waiting on more than one thing are rustc's ambiguity error.
+            if a.bb_items.is_empty()
+                && a.next_items.is_empty()
+                && let Some(track) = track
+            {
+                track.fail(db, Some(&src));
+            }
 
             if let Some(item) = error_recover_item {
                 a.build(matcher, item, &mut res.bindings);
@@ -971,8 +1020,15 @@ fn match_loop<'t>(
                 for item in &mut a.next_items {
                     item.meta = NONE;
                 }
+                if let Some(track) = track.as_deref_mut() {
+                    track.bump(1);
+                }
             } else {
-                match src.next() {
+                let next = src.next();
+                if let Some(track) = track.as_deref_mut() {
+                    track.step(next.as_ref());
+                }
+                match next {
                     Some(TtElement::Subtree(_, subtree_iter)) => {
                         // clone: a cursor, one view.
                         a.stack.push(src.clone());
@@ -1003,6 +1059,9 @@ fn match_loop<'t>(
             let entry =
                 if fragment != NONE { EntryKind::Fragment(fragment) } else { EntryKind::Optional };
             a.push(&mut item.cur, binder, entry);
+            if let Some(track) = track.as_deref_mut() {
+                track.bump(failure::tokens(iter.from_savepoint(src.savepoint())));
+            }
             src = iter;
             item.dot += 1;
             a.cur_items.push(item);
@@ -1012,7 +1071,7 @@ fn match_loop<'t>(
 }
 
 fn match_meta_var<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     kind: MetaVarKind,
     input: &mut TtIter<'t>,
     delim_span: DelimSpan,

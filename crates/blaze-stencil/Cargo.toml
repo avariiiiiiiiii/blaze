@@ -16,6 +16,7 @@ doctest = false
 
 [dependencies]
 blaze-codegen.workspace = true
+blaze-mem.workspace = true
 cranelift-codegen.workspace = true
 smallvec.workspace = true
 
@@ -30,6 +31,11 @@ blake3.workspace = true
 [dev-dependencies]
 cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
 cranelift-frontend.workspace = true
+# The reference each stencil is checked against, and the reader of the CLIF corpus.
+cranelift-interpreter.workspace = true
+cranelift-reader.workspace = true
+# The tests' `.eh_frame`, written with the same gimli cranelift-codegen's `to_fde` gives.
+gimli.workspace = true
 # The tests' global allocator, declared once in `src/tier/tests.rs`: proves hot paths allocate nothing.
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true

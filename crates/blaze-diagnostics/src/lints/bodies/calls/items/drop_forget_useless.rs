@@ -24,7 +24,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::FnItems;
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -36,7 +36,7 @@ const IGNORE: &str = "use `let _ = ...` to ignore the expression or result";
 
 pub(crate) struct DropForgetUseless {
     items: FnItems,
-    /// The values of the arms of the body's matches visited so far.
+    /// The values of the arms of the body's matches visited so far that are calls.
     arm_values: FxHashSet<ExprId>,
     /// The expression of the statement last visited, when the statement ends in `;`.
     semi_stmt: Option<ExprId>,
@@ -53,13 +53,15 @@ impl Default for DropForgetUseless {
 }
 
 impl LatePass for DropForgetUseless {
-    fn name(&self) -> &'static str {
-        "DropForgetUseless"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::BODY | Hooks::EXPR | Hooks::STMT | Hooks::ARM
-    }
+    const LINTS: LintSet = lint_set([
+        "dropping_references",
+        "forgetting_references",
+        "dropping_copy_types",
+        "forgetting_copy_types",
+        "undropped_manually_drops",
+    ]);
+    const HOOKS: Hooks = Hooks::BODY.and(Hooks::STMT).and(Hooks::ARM);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
 
     fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.arm_values.clear();
@@ -77,8 +79,11 @@ impl LatePass for DropForgetUseless {
     }
 
     fn check_arm(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, index: usize, _out: &mut Vec<Found>) {
-        if let Expr::Match { arms, .. } = b.store().expr(expr)
+        let store = b.store();
+        // Only a call is looked up in `arm_values`.
+        if let Expr::Match { arms, .. } = store.expr(expr)
             && let Some(arm) = arms.get(index)
+            && let Expr::Call { .. } = store.expr(arm.expr)
         {
             self.arm_values.insert(arm.expr);
         }

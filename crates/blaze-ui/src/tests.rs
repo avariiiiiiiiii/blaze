@@ -2,11 +2,14 @@ use std::hash::BuildHasher;
 
 use blaze_protocol::events::{
     Cache, Cause, CrateState, Event, Fns, Level, NodeKind, NodeState, Record, Slow, Step, Summary,
+    Took,
 };
 use blaze_ids::rng::SplitMix64;
 use rustc_hash::FxBuildHasher;
 
-use crate::{Build, Count, Dur, Live, Plain, Progress, summary_line, took};
+use crate::{
+    Build, Count, Dur, Finished, Live, Plain, Progress, Unnamed, summary_line, took, why_lines,
+};
 
 mod old;
 
@@ -277,8 +280,8 @@ fn an_edit_says_what_it_rebuilt_and_why() {
             "     Rebuilt 3 fns: render (body edited), draw, tick (calls render); 0.21s",
         ]
     );
-    let finished = plain.build().finished.clone().unwrap();
-    assert!(summary_line(&finished, true).contains("\x1b["));
+    let finished = plain.build().finished.as_ref().unwrap();
+    assert!(summary_line(finished, true).contains("\x1b["));
 }
 
 #[test]
@@ -1187,5 +1190,144 @@ fn plain_lines_are_the_old_ones() {
             assert_eq!(new.record(record), was.record(record), "seed {seed}, record {at}");
             same_build(new.build(), &was.build, now);
         }
+    }
+}
+
+/// A build's end from `rng`, each of its parts there or not, so that every kind of last line
+/// is said: what it rebuilt or compiled, the store, its slowest steps with their cores, its
+/// slowest functions with long names, the chain, time unnamed, a failure.
+fn finished_whole(rng: &mut Rng) -> Finished {
+    let causes = [Cause::Body, Cause::Signature, Cause::Callee { name: "render".into() }];
+    let rebuilt = (0..rng.below(4))
+        .map(|_| (rng.pick(&FUNCTIONS).to_owned(), causes[rng.below(3) as usize].clone()))
+        .collect();
+    let cache = rng.chance(2).then(|| Cache {
+        found: rng.below(100),
+        fetched: rng.below(3),
+        compiled: rng.below(9),
+        cold: rng.chance(2).then(|| "the store is empty".to_owned()),
+    });
+    let took = |rng: &mut Rng| Took {
+        step: rng.pick(&STEPS),
+        of: rng.pick(&OFS).map(str::to_owned),
+        took_ns: rng.below(200) * S / 3,
+    };
+    let summary = Summary {
+        took_ns: if rng.chance(4) { 0 } else { rng.below(300) * S / 7 },
+        crates: rng.below(3),
+        fns: Fns { total: 10, done: rng.below(11), kept: rng.below(3) },
+        rebuilt,
+        more: rng.below(3),
+        error: rng.chance(4).then(|| "it failed".to_owned()),
+        cache,
+        slowest: (0..rng.below(4)).map(|_| took(rng)).collect(),
+    };
+    let long = |rng: &mut Rng| "x::\u{e9}".repeat(rng.below(20) as usize) + rng.pick(&FUNCTIONS);
+    let slow = |rng: &mut Rng| {
+        let krate = rng.pick(&NAMES).to_owned();
+        Slow { krate, name: long(rng), ns: rng.below(2000) * MS }
+    };
+    let busy = |rng: &mut Rng| rng.chance(2).then(|| rng.below(1600) as f64 / 100.0);
+    let cores = summary.slowest.iter().map(|_| busy(rng)).collect();
+    let unnamed = |rng: &mut Rng| Unnamed { took_ns: rng.below(4) * S / 2, after: rng.pick(&STEPS) };
+    Finished {
+        ok: !rng.chance(4),
+        summary,
+        at_ns: rng.below(100) * S / 9,
+        chain: (0..rng.below(4)).map(|_| rng.pick(&NAMES).to_owned()).collect(),
+        chain_ns: rng.below(3) * S,
+        unnamed: rng.chance(2).then(|| unnamed(rng)),
+        cores,
+        cores_of: 1 + rng.below(16) as u32,
+        slowest: (0..rng.below(8)).map(|_| slow(rng)).collect(),
+    }
+}
+
+/// The last lines and `blaze why`'s steps, written in place, are the ones joined from a
+/// `String` per piece, byte for byte, in color and not.
+#[test]
+fn the_last_lines_written_in_place_are_the_old_ones() {
+    for seed in 0..2000 {
+        let mut rng = Rng::new(7000 + seed);
+        let finished = finished_whole(&mut rng);
+        for color in [false, true] {
+            let (now, was) = (summary_line(&finished, color), old::summary_line(&finished, color));
+            assert_eq!(now, was, "seed {seed}");
+            assert_eq!(why_lines(&finished, color), old::why_lines(&finished, color), "seed {seed}");
+        }
+        let text = "x::\u{e9}".repeat(rng.below(30) as usize);
+        let most = rng.below(60) as usize;
+        assert_eq!(crate::tail(&text, most), old::tail(&text, most), "seed {seed}");
+    }
+    for seed in 0..300 {
+        let mut rng = Rng::new(8000 + seed);
+        let (mut build, mut now) = (Build::default(), 0);
+        for record in records(&mut rng, 120) {
+            now = now.max(record.at_ns);
+            build.apply(&record);
+        }
+        let now = now + rng.below(5) * S;
+        assert_eq!(build.why_steps(now), old::why_steps(&build, now), "seed {seed}");
+    }
+}
+
+/// A record that moves what the region shows, warm (once the rows it names exist and every
+/// buffer has held a draw as long): applying it to the build, drawing the region, diffing it
+/// with the one shown and writing what changed allocate nothing. Neither does a tick. With a
+/// graph, the tree and its longest chain are drawn too.
+#[test]
+fn a_warm_record_to_the_terminal_allocates_nothing() {
+    let t = 5 * S;
+    let slow = |name: &str| Slow { krate: "anim".into(), name: name.into(), ns: 3 * S };
+    let progress = |done, longest: &str| Event::Progress {
+        step: Step::Codegen,
+        done,
+        total: 9,
+        longest: Some(longest.into()),
+    };
+    // It ends as it began, so each round draws what the one before it did.
+    let round = [
+        at(t, anim(CrateState::Running, 1000, 10)),
+        at(t, progress(3, "anim::scene::render")),
+        at(t, Event::Moved { id: 2, state: NodeState::Running }),
+        at(t, Event::Compiling { functions: vec![slow("anim::a"), slow("anim::b")] }),
+        at(t, Event::Said { level: Level::Warning, text: "unused variable".into() }),
+        at(t, anim(CrateState::Running, 2000, 20)),
+        at(t, Event::Compiling { functions: vec![slow("anim::c")] }),
+        at(t, Event::Moved { id: 2, state: NodeState::Built }),
+        at(t, progress(4, "anim::scene::draw")),
+        at(t, anim(CrateState::Running, 1000, 10)),
+    ];
+    for graph in [false, true] {
+        let mut setup = vec![
+            at(0, Event::Began { build: 1, command: "build".into(), root: "/w/anim".into() }),
+            at(MS, Event::Started { step: Step::Codegen, of: None }),
+            at(MS, Event::Cores { busy: 300, of: 8 }),
+        ];
+        if graph {
+            let node = |id, name: &str, deps: &[u32]| {
+                let (kind, name, deps) = (NodeKind::Codegen, name.into(), deps.to_vec());
+                at(MS, Event::Node { id, kind, name, deps })
+            };
+            setup.extend([node(1, "syn", &[]), node(2, "anim", &[1])]);
+            setup.push(at(MS, Event::Critical { path: vec![1, 2] }));
+        }
+        let mut live = every_record(100, true);
+        let mut out = String::new();
+        live.records_into(&setup, t, &mut out);
+        let play = |live: &mut Live, out: &mut String| {
+            for record in &round {
+                out.clear();
+                live.record_into(record, t, out);
+            }
+            out.clear();
+            live.tick_into(t, out);
+        };
+        play(&mut live, &mut out);
+        play(&mut live, &mut out);
+        blaze_alloc_count::assert_at_most(0, "a warm record to the terminal, drawn and diffed", || {
+            play(&mut live, &mut out);
+        });
+        assert!(live.drawn() > 0, "graph {graph}: the region is drawn");
     }
 }

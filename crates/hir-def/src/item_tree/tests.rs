@@ -19,14 +19,18 @@ fn check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
     assert_assembled_is_whole(&db, file_id, ra_fixture);
 }
 
-/// The tree of `file` assembled from its items' ([`super::items`]) is the one it lowers to
-/// whole, to the byte: the tree [`crate::file_item_tree`] gives.
+/// The tree of `file` made from its kept one ([`super::items`]) is the one it lowers to whole,
+/// to the byte, and so is the tree [`crate::file_item_tree`] gives. Made three times, so each
+/// of a first lowering, a keyed one and one from the kept tree is checked, whichever the slot
+/// held.
 pub(super) fn assert_assembled_is_whole(db: &TestDB, file: EditionedFileId, what: &str) {
     let krate = db.test_crate();
     let whole = super::lower_whole(db, file.into(), krate);
-    let assembled = super::items::file_item_tree(db, file, krate);
-    assert_eq!(assembled, whole, "the tree of\n{what}");
-    assert_eq!(blaze_format::to_bytes(&assembled), blaze_format::to_bytes(&whole), "{what}");
+    for _ in 0..3 {
+        let made = super::items::file_item_tree(db, file, krate);
+        assert_eq!(*made, whole, "the tree of\n{what}");
+        assert_eq!(blaze_format::to_bytes(&*made), blaze_format::to_bytes(&whole), "{what}");
+    }
     match crate::file_item_tree(db, file.into(), krate) {
         tree if whole.is_empty() => assert!(tree.is_empty(), "{what}"),
         tree => assert_eq!(*tree, whole, "{what}"),
@@ -486,4 +490,216 @@ fn constructor_visibilities_keep_the_order_of_their_fields() {
         })
         .collect();
     assert_eq!(paths, ["crate::b", "crate::a"]);
+}
+
+#[test]
+fn attributes_are_found_as_a_search_of_their_owners_finds_them() {
+    use crate::item_tree::{AttrsOrCfgRef, ModItemId};
+
+    fn same(a: AttrsOrCfgRef<'_>, b: AttrsOrCfgRef<'_>) -> bool {
+        match (a, b) {
+            (AttrsOrCfgRef::Enabled { attrs: a }, AttrsOrCfgRef::Enabled { attrs: b }) => {
+                (a.as_ptr(), a.len()) == (b.as_ptr(), b.len())
+            }
+            (AttrsOrCfgRef::CfgDisabled(c, a), AttrsOrCfgRef::CfgDisabled(d, b)) => {
+                std::ptr::eq(c, d) && (a.as_ptr(), a.len()) == (b.as_ptr(), b.len())
+            }
+            _ => false,
+        }
+    }
+
+    let items: String = (0..200)
+        .map(|i| match i % 3 {
+            0 => format!("#[a{i}] fn f{i}() {{}}\n"),
+            1 => format!("struct S{i};\n"),
+            _ => format!("#[cfg(false)] mod m{i} {{ #[b] fn g() {{}} fn h() {{}} }}\n"),
+        })
+        .collect();
+    let (db, file_id) = TestDB::with_single_file(&format!("#![c]\n{items}"));
+    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    assert!(tree.kinds.len() > 128, "more than two blocks of items");
+    for index in 0..tree.kinds.len() as u32 {
+        let id = ModItemId::new(index);
+        let searched = (tree.attr_owners.binary_search_by_key(&id, |owner| owner.owner).ok())
+            .map(|at| tree.attrs_of(&tree.attr_owners[at]));
+        match (tree.attrs(id), searched) {
+            (None, None) => {}
+            (Some(found), Some(searched)) => assert!(same(found, searched), "item {index}"),
+            (found, searched) => panic!("item {index}: {found:?} against {searched:?}"),
+        }
+    }
+    assert!(tree.top_level_attrs().is_some());
+    crate::item_tree::persist::assert_round_trip(tree);
+}
+
+/// A file with every kind of item, and attributes with no input.
+const EVERY_KIND: &str = r#"
+#![no_std]
+extern crate core as c;
+pub use a::{b::{c, d}, e::*, f as g};
+#[my_attr] pub(crate) struct S(pub u8, pub(in crate::m) u16);
+pub struct R { a: u8 }
+pub union U { a: u8 }
+pub enum E { A }
+pub trait T {}
+impl T for S {}
+pub type A = S;
+pub const C: u8 = 0;
+const _: () = ();
+pub static ST: u8 = 0;
+pub mod m { #[my_attr] pub fn inner() {} mod deeper; }
+extern "C" { fn ext(); static X: u8; }
+macro_rules! mac { () => {} }
+pub macro m2() {}
+mac!();
+pub fn f() {}
+"#;
+
+/// The columns of `tree` that hold anything: lowering on a warm builder and decoding allocate
+/// once for each.
+fn non_empty_columns(tree: &ItemTree) -> u64 {
+    let lens = [
+        tree.top_level.len(),
+        tree.kinds.len(),
+        tree.data.len(),
+        tree.ast_ids.len(),
+        tree.children.len(),
+        tree.consts.len(),
+        tree.enums.len(),
+        tree.extern_blocks.len(),
+        tree.extern_crates.len(),
+        tree.functions.len(),
+        tree.impls.len(),
+        tree.macro2s.len(),
+        tree.macro_calls.len(),
+        tree.macro_rules.len(),
+        tree.mods.len(),
+        tree.statics.len(),
+        tree.structs.len(),
+        tree.traits.len(),
+        tree.type_aliases.len(),
+        tree.unions.len(),
+        tree.uses.len(),
+        tree.use_trees.len(),
+        tree.use_tree_lists.len(),
+        tree.ctor_vis.len(),
+        tree.names.len(),
+        tree.paths.len(),
+        tree.vis.len(),
+        tree.attr_owners.len(),
+        tree.attr_index.len(),
+        tree.attrs.len(),
+        tree.cfgs.len(),
+    ];
+    lens.iter().filter(|&&len| len > 0).count() as u64
+}
+
+/// Reads every item under `items` through the accessors the def map collector uses; returns how
+/// many it read.
+fn read_all(tree: &ItemTree, items: &[crate::item_tree::ModItemId]) -> usize {
+    use crate::item_tree::ModKind;
+    use std::hint::black_box;
+
+    let mut read = 0;
+    for &item in items {
+        read += 1;
+        black_box((item.ast_id(tree), tree.attrs(item)));
+        match tree.index(item) {
+            ModItemKind::Mod(_, m) => {
+                black_box((tree.get_name(m.name), &tree[m.visibility]));
+                if let ModKind::Inline { items } = tree.mod_kind(m) {
+                    read += read_all(tree, items);
+                }
+            }
+            ModItemKind::ExternBlock(_, block) => read += read_all(tree, tree.items(block.children)),
+            ModItemKind::Struct(_, s) => {
+                black_box((tree.get_name(s.name), &tree[s.visibility], tree.value_ns_ctor(s)));
+            }
+            ModItemKind::Use(_, u) => {
+                black_box((&tree[u.visibility], tree.use_tree(u.use_tree).kind(tree)));
+            }
+            ModItemKind::ExternCrate(_, e) => {
+                black_box((tree.get_name(e.name), tree.import_alias(e.alias)));
+            }
+            ModItemKind::MacroCall(_, call) => {
+                black_box(&tree[call.path]);
+            }
+            other => {
+                black_box(other);
+            }
+        }
+    }
+    read
+}
+
+#[test]
+fn reading_a_tree_allocates_nothing() {
+    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
+    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    assert_eq!(read_all(tree, tree.top_level_items()), tree.kinds.len(), "every item read");
+    blaze_alloc_count::assert_at_most(0, "reading every item of a tree", || {
+        std::hint::black_box(read_all(tree, tree.top_level_items()));
+        std::hint::black_box(tree.top_level_attrs());
+    });
+}
+
+#[test]
+fn expanding_use_trees_whose_paths_are_interned_allocates_nothing() {
+    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
+    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let expand = || {
+        let mut imports = 0;
+        for &item in tree.top_level_items() {
+            if let ModItemKind::Use(_, it) = tree.index(item) {
+                it.expand(tree, |idx, path, kind, alias| {
+                    std::hint::black_box((idx, path, kind, alias));
+                    imports += 1;
+                });
+            }
+        }
+        imports
+    };
+    assert_eq!(expand(), 4, "`a::b::c`, `a::b::d`, `a::e::*` and `a::f as g`");
+    blaze_alloc_count::assert_at_most(0, "expanding the use trees again", || expand());
+}
+
+#[test]
+fn a_warm_builder_lowers_a_file_in_one_allocation_a_column() {
+    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
+    let (file, krate) = (HirFileId::from(file_id), db.test_crate());
+    let cold = super::lower_whole(&db, file, krate);
+    let columns = non_empty_columns(&cold);
+    let warm = blaze_alloc_count::assert_at_most(columns, "lowering on a warm builder", || {
+        super::lower_whole(&db, file, krate)
+    });
+    assert_eq!(warm, cold);
+}
+
+#[test]
+fn decoding_a_tree_allocates_once_a_column() {
+    let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
+    let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
+    let buffer = blaze_format::Aligned::copy_from(&blaze_format::to_bytes(tree));
+    let read = ItemTree::read(&buffer).expect("a tree written");
+    assert_eq!(read.decode().expect("a tree written"), *tree);
+    let decoded = blaze_alloc_count::assert_at_most(
+        non_empty_columns(tree),
+        "decoding a tree whose names are interned",
+        || read.decode().expect("a tree written"),
+    );
+    assert_eq!(decoded, *tree);
+}
+
+#[test]
+fn a_builder_after_an_item_of_many_names_lowers_as_a_fresh_one() {
+    let small = "pub fn a() {}\nmod m { struct S; }\nuse x::{y, z};\n";
+    let names: String = (0..600).map(|i| format!("fn f{i}() {{}}\n")).collect();
+    let big = format!("mod many {{\n{names}}}\n");
+    let lower = |text: &str| {
+        let (db, file_id) = TestDB::with_single_file(text);
+        owned_tree(&db, file_id.into()).1
+    };
+    let first = lower(small);
+    lower(&big);
+    assert_eq!(lower(small), first, "a tree lowered after an item of 600 names, same thread");
 }

@@ -35,7 +35,7 @@ impl Serialize for Bytes<'_> {
 }
 
 /// Bytes read back from one byte string, as [`deserialize`] reads them.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct Buf(pub Vec<u8>);
 
 impl<'de> Deserialize<'de> for Buf {

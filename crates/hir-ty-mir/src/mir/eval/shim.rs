@@ -23,7 +23,7 @@ use crate::{
     mir::eval::{
         Address, AdtId, Arc, Evaluator, FunctionId, GenericArgs, HasModule, Interval,
         IntervalAndTy, IntervalOrOwned, IsSigned, ItemContainerId, Layout, Locals, Lookup,
-        MirEvalError, MirSpan, Mutability, Origin, Result, Then, Ty, TyKind, TypeIdOf,
+        MirEvalError, MirSpan, Mutability, Origin, OwnedBytes, Result, Then, Ty, TyKind, TypeIdOf,
         VTableOfBytes,
         VariantId, from_bytes, not_supported, pad16, try_const_usize,
         machine::{Access, AtomicOrd, Machine, RetagMode, Shadow},
@@ -922,13 +922,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     };
                     (ans, overflow || ans.to_le_bytes()[op_size..].iter().any(|&it| it != 0))
                 };
-                let is_overflow = vec![u8::from(is_overflow)];
+                let is_overflow = smallvec::smallvec![u8::from(is_overflow)];
                 let layout = self.layout(result_ty)?;
                 let result = self.construct_with_layout(
                     layout.size.bytes_usize(),
                     &layout,
                     None,
-                    [ans.to_le_bytes()[0..op_size].to_vec(), is_overflow]
+                    [OwnedBytes::from_slice(&ans.to_le_bytes()[0..op_size]), is_overflow]
                         .into_iter()
                         .map(IntervalOrOwned::Owned),
                 )?;
@@ -1231,7 +1231,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                         "const_eval_select args are not provided".into(),
                     ));
                 };
-                let mut args = vec![const_fn.clone()];
+                let mut args = vec![*const_fn];
                 let TyKind::Tuple(fields) = tuple.ty.kind() else {
                     return Err(MirEvalError::InternalError(
                         "const_eval_select arg[0] is not a tuple".into(),
@@ -2110,11 +2110,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             Ok(IntervalOrOwned::Owned(match field.name.as_str() {
                 "filename" | "file" => {
                     file_field = Some(i);
-                    [addr.to_bytes(), super::word_bytes(name.len())].concat()
+                    let mut it = OwnedBytes::from_slice(&addr.to_bytes());
+                    it.extend_from_slice(&super::word_bytes(name.len()));
+                    it
                 }
-                "line" => line.to_le_bytes().into(),
-                "col" => col.to_le_bytes().into(),
-                "_filename" => Vec::new(),
+                "line" => OwnedBytes::from_slice(&line.to_le_bytes()),
+                "col" => OwnedBytes::from_slice(&col.to_le_bytes()),
+                "_filename" => OwnedBytes::new(),
                 other => not_supported!("a field `{other}` of `Location`"),
             }))
         });
@@ -2156,7 +2158,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         let Some(variant) = variant else { not_supported!("no `Option` in core") };
         let args = GenericArgs::new_from_slice(&[inner.into()]);
         let (size, layout, tag) = self.layout_of_variant(variant.into(), args, locals)?;
-        let fields = value.map(|it| IntervalOrOwned::Owned(it.as_ref().to_vec()));
+        let fields = value.map(|it| IntervalOrOwned::Owned(OwnedBytes::from_slice(it.as_ref())));
         let bytes = self.construct_with_layout(size, &layout, tag, fields.into_iter())?;
         destination.write_from_bytes(self, &bytes)
     }

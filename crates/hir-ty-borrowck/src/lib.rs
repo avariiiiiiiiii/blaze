@@ -787,25 +787,33 @@ impl<'a, 'db> Ctx<'a, 'db> {
     pub(crate) fn drop_glue(&self, ty: Ty<'db>) -> hir_ty::drop::DropGlue {
         use hir_ty::drop::DropGlue;
         use rustc_type_ir::TypeVisitableExt as _;
-        let interner = self.infcx.interner;
-        let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        // The type as given first: folding its regions interns a new type on every call.
         if let Some(&known) = self.glue.borrow().get(&ty) {
             return known;
         }
-        let known = if ty.has_non_region_infer() {
-            hir_ty::drop::has_drop_glue(&self.infcx, ty, self.env)
-        } else {
-            match *drop_glue_query(
+        let interner = self.infcx.interner;
+        let erased = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        let cached = self.glue.borrow().get(&erased).copied();
+        let known = match cached {
+            Some(known) => known,
+            None if erased.has_non_region_infer() => {
+                hir_ty::drop::has_drop_glue(&self.infcx, erased, self.env)
+            }
+            None => match *drop_glue_query(
                 self.db,
                 hir_ty::ParamEnvAndCrate { param_env: self.env, krate: self.krate }.store(),
-                ty.store(),
+                erased.store(),
             ) {
                 0 => DropGlue::None,
                 1 => DropGlue::DependOnParams,
                 _ => DropGlue::HasDropGlue,
-            }
+            },
         };
-        self.glue.borrow_mut().insert(ty, known);
+        let mut glue = self.glue.borrow_mut();
+        glue.insert(erased, known);
+        if erased != ty {
+            glue.insert(ty, known);
+        }
         known
     }
 
@@ -815,21 +823,30 @@ impl<'a, 'db> Ctx<'a, 'db> {
 
     pub(crate) fn is_copy(&self, ty: Ty<'db>) -> bool {
         // Modulo regions, so asked once per type whatever its free regions are: each local's
-        // type has region variables of its own.
-        let interner = self.infcx.interner;
-        let ty = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        // type has region variables of its own. The type as given first: folding its regions
+        // interns a new type on every call.
         if let Some(&known) = self.copy.borrow().get(&ty) {
             return known;
         }
-        let known = match rustc_type_ir::TypeVisitableExt::has_non_region_infer(&ty) {
-            true => self.infcx.type_is_copy_modulo_regions(self.env, ty),
-            false => *is_copy_query(
-                self.db,
-                hir_ty::ParamEnvAndCrate { param_env: self.env, krate: self.krate }.store(),
-                ty.store(),
-            ),
+        let interner = self.infcx.interner;
+        let erased = rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_static(interner));
+        let cached = self.copy.borrow().get(&erased).copied();
+        let known = match cached {
+            Some(known) => known,
+            None => match rustc_type_ir::TypeVisitableExt::has_non_region_infer(&erased) {
+                true => self.infcx.type_is_copy_modulo_regions(self.env, erased),
+                false => *is_copy_query(
+                    self.db,
+                    hir_ty::ParamEnvAndCrate { param_env: self.env, krate: self.krate }.store(),
+                    erased.store(),
+                ),
+            },
         };
-        self.copy.borrow_mut().insert(ty, known);
+        let mut copy = self.copy.borrow_mut();
+        copy.insert(erased, known);
+        if erased != ty {
+            copy.insert(ty, known);
+        }
         known
     }
 

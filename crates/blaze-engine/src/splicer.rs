@@ -130,6 +130,7 @@ fn splice_when_quiet() {
     let mut state = lock(state);
     loop {
         let now = Instant::now();
+        // A scan, not a timing wheel: one entry per binary being spliced, a handful at most.
         let Some(due) = state.pending.values().map(|it| it.due).min() else {
             state.thread = false;
             return;

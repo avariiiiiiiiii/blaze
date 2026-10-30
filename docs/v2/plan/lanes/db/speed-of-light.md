@@ -19,7 +19,7 @@ Figures in ns use 3.5 GHz.
 
 ## vendor/salsa: the front end's query database (speed-salsa)
 
-Costs are counted from the code as of 10-29 19:55, not measured: S1–S4, S5's edges and
+Costs are counted from the code as of 10-29 20:40, not measured: S1–S4, S5's edges and
 claim-free verify, the 24-byte memo header and memos as columns are in the tree, none of it built
 yet. The before/after and benchmarks are in [speed-salsa.md](speed-salsa.md). "Off" is today's
 cost over the bound. A "line" is a dependent cache-line load: about 4.5 cycles from L1, 110 ns
@@ -37,32 +37,37 @@ The most frequent operation in a warm build.
   with the last edge and a 4-byte store). Hot: 2 × 4.5 + 20 / 2 ≈ 19 cycles, **5.4 ns**. Cold:
   independent callers' misses overlap, about 20 in flight, so **≈ 5.5 ns** per hit per core in
   throughput, 220 ns latency.
-- **Today (memos as columns on blaze-mem regions, 20:15):** 5 lines, 4 deep:
+- **Today (rows by page, 20:40):** 4 lines on the address chain, 4 deep:
   1. the `boxcar` bucket;
-  2. the `Page`, which keeps its ingredient's column slice beside its `Arc`;
-  3. the slot (validation and the 4-byte row number), and the `Column`, loaded in parallel
-     since both depend only on the page. The column's first line holds the rows region's base
-     and committed length and the type id (`repr(C, align(64))`, held by a `const` assertion);
-  4. the row pointer, at `rows.base + 8 * row`: computed, no row-page directory;
+  2. the `Page`, which keeps its ingredient's column slice and its first memo row
+     (`memo_rows`, 128 rows taken from the ingredient's `MemoTableTypes` when the page is made)
+     beside its `Arc`;
+  3. the `Column`. Its first line holds the rows region's base and committed length and the
+     type id (`repr(C, align(64))`, held by a `const` assertion);
+  4. the row pointer, at `rows.base + 8 * (memo_rows + slot)`: computed from the page line and
+     the `Id`, no load of the slot;
   5. the memo, at `slab.base + size * slot`.
 
-  About 45 instructions. Hot: 4 × 4.5 + 22 ≈ 40 cycles, 11 ns, **2× off**. Cold: 4 dependent
-  misses, 440 ns latency, **2× off**. With columns on boxed pages it was 6 lines, 5 deep; before
-  columns, 7 lines, 7 deep (ingredient cache, bucket, `Page`, slot, the slot's memo table array,
-  the `MemoEntry` pointer, the boxed memo), 18 ns hot.
-- **What stands in the way, and the change that removes it:**
-  1. The bucket and the `Page`: two lines found again on every hit though neither moves once
-     published.
-  2. The row number, which lives in the slot, so the row page waits for the slot.
-
-  The change: index a column's rows by the `Id`'s page and slot (a directory by table page of
-  128-entry row blocks, made on the function's first memo in that page) instead of a number
-  stored in the slot. `MemoTable` then holds nothing. Add a per-task cache of
-  `(column, table page) → row block`, beside the node cache. A hit on a page the task has seen
-  is then the row entry and the memo: 2 lines, with slot validation in parallel, which is the
-  bound. Immortal interned keys (hir-def's IDs) already skip validation. It changes every caller
-  of `memo_table_for` to pass the task's cache. Owner: speed-salsa, the first change after the
-  first compile of S5, so that change is measured against a build that works.
+  The slot is no longer on the chain. An input's hit doesn't touch it. A tracked struct's read
+  lock and an interned value's validation still load it, in parallel with the column, and
+  nothing waits on it but the branch. About 42 instructions. Hot: 4 × 4.5 + 21 ≈ 39 cycles,
+  11 ns, **2× off**. Cold: 4 dependent misses, 440 ns latency, **2× off**; but a hit now takes
+  one line fewer (4 against 5), so it takes one in-flight miss fewer, ≈ 5.5 ns less in
+  throughput per cold hit, and it keeps one line fewer in L1. Before this change the slot was
+  loaded beside the column for its 4-byte row number: 5 lines, the same depth. With columns on
+  boxed pages it was 6 lines, 5 deep; before columns, 7 lines, 7 deep (ingredient cache,
+  bucket, `Page`, slot, the slot's memo table array, the `MemoEntry` pointer, the boxed memo),
+  18 ns hot.
+- **What stands in the way, and the change that removes it:** the bucket and the `Page`, two
+  lines found again on every hit though neither moves once published. The change: a per-task
+  direct-mapped cache of `table page → (column slice, memo_rows)`, 64 entries of 24 bytes beside
+  the node cache, filled on a miss. A hit on a page the task has seen is then the cache entry
+  (L1), the column, the row pointer and the memo. The column line is the same for every key of
+  a function, so it stays in L1 across a task's hits. That leaves 2 lines that miss, the row
+  and the memo, which is the bound. A page's entry can't go stale: a page and its
+  `memo_rows` never change once published, and the database outlives the task. It changes
+  `Zalsa::memo_table_for`'s callers (fetch, maybe_changed_after, execute, specify, function.rs:
+  about 15 sites) to pass the task's `ZalsaLocal`. Owner: speed-salsa, next.
 
 ### Recording a read
 
@@ -77,10 +82,10 @@ The most frequent operation in a warm build.
   seen.
 - **What stands in the way:** the read doesn't know the dependency's node. The 24-byte header
   has no room for a 4-byte node (the origin word's span uses 61 bits). The change: a node
-  column beside each column's row blocks (4 bytes per row, in the row block's line once rows are
-  by page, above), set when the row's first memo is published, plus a node column beside input,
-  interned and tracked struct slots. Then the frame records the node directly and finishing a
-  query copies words with no probe. Owner: speed-salsa, with the row-by-page change.
+  region beside each column's rows (4 bytes per row at `4 * row`, the row computed from the page
+  as for the row pointer), set when the row's first memo is published, plus a node column
+  beside input, interned and tracked struct slots. Then the frame records the node directly and
+  finishing a query copies words with no probe. Owner: speed-salsa, with the per-task page cache.
 
 ### Edges at rest
 
@@ -105,8 +110,9 @@ The most frequent operation in a warm build.
   16 bits: 4 + 4 + 1 + 4 + 2 ≈ **16 bytes** plus the value. The 16-byte value fingerprint
   belongs in a side table, only for memos that have one.
 - **Today (19:55):** the 24-byte header and the value in its column's slab, no box; an 8-byte
-  row pointer in its own column only; a 4-byte row number per slot, which fits in padding in all
-  three struct kinds. For an 8-byte value that is 40 bytes against 24, **1.67× off**. Before:
+  row pointer in its own column only; nothing in the slot, since the row is the page's first row
+  plus the slot index (20:40; the 4-byte row number it replaced sat in padding, so no struct
+  shrank). For an 8-byte value that is 40 bytes against 24, **1.67× off**. Before:
   48 bytes boxed, 8 per sibling function and a 16-byte table per slot, 2.3× and more.
 - **What stands in the way:**
   1. `Revision` is a `usize`, 8 bytes in `verified_at` and in the stamp. Narrowing it to `u32`
@@ -180,30 +186,29 @@ The most frequent operation in a warm build.
   about 4 atomic operations and two probes, ≈ 40 to 60 ns. Under 3% of a query that runs for
   microseconds; for an accessor-sized query (about 100 ns of work) **≈ 4× off** and a third of
   the query.
-- **The change:** a claim word per row (free, claimed by a task, claimed with waiters) beside
-  the row's entry in the row block, claimed by a CAS; the shard table only parks waiters. That is
-  the bound. It sits with the row-by-page change, since that is where the word lives. Owner:
+- **The change:** a claim word per row (free, claimed by a task, claimed with waiters) in a
+  region beside the column's rows, at the row the page gives, claimed by a CAS; the shard table
+  only parks waiters. That is the bound. It sits with the node column, which lives the same way. Owner:
   speed-salsa; db-salsa owns cycle handling, which reads claims.
 
 ### Summary
 
 | component | bound | today | off | removes the gap |
 |---|---|---|---|---|
-| memo hit | 2 lines, 5 ns hot | 5 lines (4 deep), 11 ns | 2× | rows by page plus a per-task row-block cache |
+| memo hit | 2 lines, 5 ns hot | 4 lines (4 deep), 11 ns; rows by page are in | 2× | a per-task page cache |
 | record a read | 4-byte store, 3 ns | node probe at finish, ≈ 15 ns | 5× | a node column beside the rows and the struct slots |
 | edges at rest | 25 bits, 312 MB (nushell) | 4 bytes, 400 MB | 1.28× | bit-packed compaction |
 | memo at rest | 16 + value | 24 + value + 8 | 1.67× (8-byte value) | `u32` revisions |
 | deep verify | 1 random load per edge; 13 ms for all of nushell | ≈ 8 dependent loads, 460 ms | 35× | a node-indexed color column with prefetch |
 | intern hit | 2 lines | 2 lines | 1× | — |
 | LRU scan | 17 µs per 1M rows (all cores) | 3.3 ms (one core) | 12× in bytes, once per revision | a parallel scan by page, merged in page order: ≈ 0.2 ms |
-| claim | 12 ns | 40 to 60 ns | 4× for tiny queries | a claim word in the row block |
+| claim | 12 ns | 40 to 60 ns | 4× for tiny queries | a claim word per row beside the column's rows |
 
-Only interning is at its bound. Every other gap has a named change, all owned by speed-salsa,
-and all wait for one thing: the first compile of S5. Each rewrites a path S5 already rewrote
-(the hit, the edge readers, every revision compare), and stacking a second unbuilt rewrite on the
-first would leave the first compile's errors with two possible causes. Order: rows by page with
-the task cache, node column and claim word (one change, the hit path and recording); the color
-column (deep verify); bit-packed compaction; `u32` revisions; the parallel LRU scan.
+Only interning is at its bound. Every other gap has a named change, all owned by speed-salsa.
+Rows by page are in (20:40): the row comes from the page, not the slot. The rest are written
+blind like everything else here (building.md section 19), in this order: the per-task page
+cache, the node column and the claim word (the hit path and recording); the color column (deep
+verify); bit-packed compaction; `u32` revisions; the parallel LRU scan.
 
 ## hir-ty's trait selection and trait-error leaf search (db-ty-port-infer-errors)
 
@@ -1019,7 +1024,11 @@ body that didn't change.
   - The lowered patterns live in one `Vec` per match, which the report borrows.
   - The scrutinee validity check (`is_known_valid_scrutinee`) builds a `Resolver` for a path
     scrutinee, to see whether it names a static: ≈ 85 ns.
-  - A path pattern that is not a variant (a constant) builds one too.
+  - A path pattern that is not a variant (a constant) builds one too. It also asks the trait
+    solver once per ADT in the constant's value (`StructuralPartialEq`, unless the ADT's module
+    records a builtin `PartialEq` derive, which is a scan of that scope's derives) and once
+    for an ADT-typed constant (`PartialEq`), each ≈ 0.15 µs. Constant patterns are few, so this
+    is off the common path.
   - In all, analysis + ≈ 0.2 µs, **within 10% for a match of more than a few arms** and ≈ 1.15×
     for the smallest.
   - The guard-free second analysis (`would_be_exhaustive_without_guards`) runs only for a

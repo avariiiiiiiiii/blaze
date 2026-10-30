@@ -12,7 +12,7 @@ const USAGE: &str = "usage: blaze-ci serve <config.json>\n       blaze-ci standb
 
 #[allow(clippy::print_stderr)]
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect(); // alloc: once, at start
     let (command, path) = match args.as_slice() {
         [command, path] if command == "serve" || command == "standby" => (command.as_str(), path),
         _ => {

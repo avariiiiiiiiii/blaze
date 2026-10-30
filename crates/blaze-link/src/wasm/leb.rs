@@ -1,85 +1,10 @@
 //! LEB128 as the wasm binary format writes numbers, the 5-byte padded form an object leaves
 //! where the linker writes an index or an address, and the framing of sections and names.
 
-/// How many bytes an object leaves for an index or an address it relocates.
-pub(super) const PADDED: usize = 5;
-
-pub(super) fn uleb(out: &mut Vec<u8>, value: u64) {
-    let mut bytes = [0; 10];
-    let len = uleb_into(&mut bytes, value);
-    out.extend_from_slice(&bytes[..len]);
-}
-
-/// How many bytes [`uleb`] writes for `value`.
-pub(super) const fn uleb_len(value: u64) -> usize {
-    let bits = 64 - (value | 1).leading_zeros() as usize;
-    bits.div_ceil(7)
-}
-
-/// Writes `value` as a LEB128 at the start of `place`, which has room for it
-/// ([`uleb_len`]), and says how many bytes that took.
-pub(super) fn uleb_into(place: &mut [u8], mut value: u64) -> usize {
-    let mut at = 0;
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            place[at] = byte;
-            return at + 1;
-        }
-        place[at] = byte | 0x80;
-        at += 1;
-    }
-}
-
-pub(super) fn sleb(out: &mut Vec<u8>, value: i64) {
-    let mut bytes = [0; 10];
-    let len = sleb_into(&mut bytes, value);
-    out.extend_from_slice(&bytes[..len]);
-}
-
-/// Writes `value` as a signed LEB128 at the start of `place`, which has room for it (10
-/// bytes hold any), and says how many bytes that took.
-pub(super) fn sleb_into(place: &mut [u8], mut value: i64) -> usize {
-    let mut at = 0;
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
-        if done {
-            place[at] = byte;
-            return at + 1;
-        }
-        place[at] = byte | 0x80;
-        at += 1;
-    }
-}
-
-/// `value` as a LEB128 of exactly [`PADDED`] bytes.
-pub(super) fn padded_uleb(mut value: u32) -> [u8; PADDED] {
-    let mut bytes = [0; PADDED];
-    for (at, byte) in bytes.iter_mut().enumerate() {
-        *byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if at < PADDED - 1 {
-            *byte |= 0x80;
-        }
-    }
-    bytes
-}
-
-/// `value` as a signed LEB128 of exactly [`PADDED`] bytes.
-pub(super) fn padded_sleb(mut value: i32) -> [u8; PADDED] {
-    let mut bytes = [0; PADDED];
-    for (at, byte) in bytes.iter_mut().enumerate() {
-        *byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if at < PADDED - 1 {
-            *byte |= 0x80;
-        }
-    }
-    bytes
-}
+pub(super) use blaze_format::leb::{
+    PADDED, len_u64 as uleb_len, padded_i32 as padded_sleb, padded_u32 as padded_uleb,
+    put_i64 as sleb_into, put_u64 as uleb_into, write_i64 as sleb, write_u64 as uleb,
+};
 
 pub(super) fn name(out: &mut Vec<u8>, name: &str) {
     uleb(out, name.len() as u64);
@@ -123,56 +48,6 @@ mod tests {
         let mut out = Vec::new();
         sleb(&mut out, value);
         out
-    }
-
-    #[test]
-    fn unsigned() {
-        assert_eq!(u(0), [0]);
-        assert_eq!(u(127), [0x7f]);
-        assert_eq!(u(128), [0x80, 0x01]);
-        assert_eq!(u(624_485), [0xe5, 0x8e, 0x26]);
-        assert_eq!(u(u32::MAX.into()), [0xff, 0xff, 0xff, 0xff, 0x0f]);
-        assert_eq!(u(u64::MAX).len(), 10);
-    }
-
-    #[test]
-    fn lengths() {
-        for value in [0, 1, 127, 128, 16_383, 16_384, u64::from(u32::MAX), u64::MAX] {
-            assert_eq!(uleb_len(value), u(value).len(), "{value}");
-            let mut place = [0xaa; 11];
-            assert_eq!(uleb_into(&mut place, value), u(value).len());
-            assert_eq!(&place[..u(value).len()], u(value));
-        }
-    }
-
-    #[test]
-    fn signed() {
-        assert_eq!(s(0), [0]);
-        assert_eq!(s(-1), [0x7f]);
-        assert_eq!(s(63), [0x3f]);
-        assert_eq!(s(64), [0xc0, 0x00]);
-        assert_eq!(s(-64), [0x40]);
-        assert_eq!(s(-65), [0xbf, 0x7f]);
-        assert_eq!(s(-123_456), [0xc0, 0xbb, 0x78]);
-        assert_eq!(s(i32::MIN.into()), [0x80, 0x80, 0x80, 0x80, 0x78]);
-        for value in [0, -1, 63, 64, -64, -65, i64::MIN, i64::MAX] {
-            let mut place = [0xaa; 11];
-            let len = sleb_into(&mut place, value);
-            assert_eq!(&place[..len], s(value), "{value}");
-        }
-    }
-
-    #[test]
-    fn padded() {
-        assert_eq!(padded_uleb(0), [0x80, 0x80, 0x80, 0x80, 0x00]);
-        assert_eq!(padded_uleb(5), [0x85, 0x80, 0x80, 0x80, 0x00]);
-        assert_eq!(padded_uleb(624_485), [0xe5, 0x8e, 0xa6, 0x80, 0x00]);
-        assert_eq!(padded_uleb(u32::MAX), [0xff, 0xff, 0xff, 0xff, 0x0f]);
-        assert_eq!(padded_sleb(0), [0x80, 0x80, 0x80, 0x80, 0x00]);
-        assert_eq!(padded_sleb(-1), [0xff, 0xff, 0xff, 0xff, 0x7f]);
-        assert_eq!(padded_sleb(i32::MIN), [0x80, 0x80, 0x80, 0x80, 0x78]);
-        assert_eq!(padded_sleb(i32::MAX), [0xff, 0xff, 0xff, 0xff, 0x07]);
-        assert_eq!(padded_sleb(0x10_0000), [0x80, 0x80, 0xc0, 0x80, 0x00]);
     }
 
     #[test]

@@ -166,12 +166,16 @@ impl World for Threads {
         // SAFETY: the right `mach_thread_self` gave above, given back once.
         unsafe { mach_port_deallocate(task, me) };
         stopped.map_err(|stuck| match stuck {
+            // alloc: error path
             Stuck::Many => format!("the program runs more than {MOST_THREADS} threads to stop"),
+            // alloc: error path
             Stuck::Listing(code) => format!("listing the program's threads: kern_return {code}"),
             Stuck::Suspending(port, code) => {
+                // alloc: error path
                 format!("suspending thread {port:#x}: kern_return {code}")
             }
             Stuck::State(port, code) => {
+                // alloc: error path
                 format!("reading where thread {port:#x} is: kern_return {code}")
             }
         })

@@ -48,7 +48,7 @@ use syntax::{SyntaxKind, T, TextSize};
 use triomphe::Arc;
 
 use crate::{
-    InferenceDiagnostic, Span, all_super_traits,
+    Span, all_super_traits,
     db::HirDatabase,
     infer::{InferenceContext, unify::InferenceTable},
     lower::GenericPredicates,
@@ -68,7 +68,8 @@ use crate::{
 };
 
 pub use self::probe::{
-    Candidate, CandidateKind, CandidateStep, CandidateWithPrivate, Mode, Pick, PickKind,
+    AutorefOrPtrAdjustment, Candidate, CandidateKind, CandidateStep, CandidateWithPrivate, Mode,
+    Pick, PickKind,
 };
 
 pub struct MethodResolutionContext<'a, 'db> {
@@ -161,8 +162,9 @@ impl<'db> InferenceContext<'db> {
         let result = self.confirm_method(&pick, self_ty, call_expr, generic_args);
         debug!("result = {:?}", result);
 
-        if result.illegal_sized_bound {
-            self.push_diagnostic(InferenceDiagnostic::MethodCallIllegalSizedBound { call_expr });
+        if let Some(bound) = result.illegal_sized_bound {
+            let method = result.callee.def_id;
+            self.push_illegal_sized_bound(&pick, self_ty, call_expr, receiver, method, bound);
         }
 
         self.write_expr_adj(receiver, result.adjustments);
@@ -1433,7 +1435,7 @@ impl<'db> InherentImpls<'db> {
         db: &'db Db,
         krate: Crate,
         block: Option<BlockIdLt<'db>>,
-        for_each: &mut dyn FnMut(&InherentImpls<'db>),
+        for_each: &mut impl FnMut(&InherentImpls<'db>),
     ) {
         let blocks = std::iter::successors(block, |block| block.module(db).block(db));
         blocks.filter_map(|block| Self::for_block(db, block).as_deref()).for_each(&mut *for_each);
@@ -1770,9 +1772,9 @@ impl<'db> TraitImpls<'db> {
         db: &'db Db,
         krate: Crate,
         block: Option<BlockIdLt<'db>>,
-        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
+        for_each: &mut impl FnMut(&TraitImpls<'db>) -> R,
     ) -> R {
-        try_visit!(Self::for_each_block(db, block, for_each));
+        try_visit!(Self::for_each_block(db, block, &mut *for_each));
         for impl_ in Self::for_crate_and_deps(db, krate) {
             try_visit!(for_each(impl_));
         }
@@ -1783,7 +1785,7 @@ impl<'db> TraitImpls<'db> {
     pub fn for_each_block<R: VisitorResult>(
         db: &'db Db,
         block: Option<BlockIdLt<'db>>,
-        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
+        for_each: &mut impl FnMut(&TraitImpls<'db>) -> R,
     ) -> R {
         let blocks = std::iter::successors(block, |block| block.module(db).block(db));
         for impl_ in blocks.filter_map(|block| Self::for_block(db, block)) {
@@ -1798,7 +1800,7 @@ impl<'db> TraitImpls<'db> {
         krate: Crate,
         type_block: Option<BlockIdLt<'db>>,
         trait_block: Option<BlockIdLt<'db>>,
-        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
+        for_each: &mut impl FnMut(&TraitImpls<'db>) -> R,
     ) -> R {
         let in_self_and_deps = TraitImpls::for_crate_and_deps(db, krate);
         for impl_ in in_self_and_deps {
@@ -1813,7 +1815,7 @@ impl<'db> TraitImpls<'db> {
         db: &'db Db,
         type_block: Option<BlockIdLt<'db>>,
         trait_block: Option<BlockIdLt<'db>>,
-        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,
+        for_each: &mut impl FnMut(&TraitImpls<'db>) -> R,
     ) -> R {
         // We must not provide duplicate impls to the solver. Therefore we work with the following strategy:
         // start from each block, and walk ancestors until you meet the other block. If they never meet,

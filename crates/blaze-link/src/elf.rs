@@ -17,6 +17,8 @@ mod read;
 #[cfg(test)]
 mod tests;
 
+use std::sync::{Mutex, MutexGuard};
+
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 
@@ -52,12 +54,25 @@ pub(crate) fn writer(output: &Output) -> Result<Elf, LinkError> {
         Arch::X86_64 | Arch::Aarch64 => {}
         Arch::Wasm32 => return Err(error("an ELF image for wasm32: wasm is linked as wasm".into())),
     }
+    let last = output.incremental.then(Mutex::default);
     // clone: once per link, the writer owns its `Output` (the public API's type)
-    Ok(Elf { output: output.clone() })
+    Ok(Elf { output: output.clone(), last })
 }
 
 pub(crate) struct Elf {
     pub(crate) output: Output,
+    /// An incremental output's last tables, which the next synthesis patches when its
+    /// [`crate::model::Delta`] is from theirs.
+    pub(crate) last: Option<Mutex<Last>>,
+}
+
+/// The tables the writer made last, each with the [`Placed::synthesis`] it was made in (0
+/// when it holds none: never made, or a build of it failed).
+#[derive(Default)]
+pub(crate) struct Last {
+    pub(crate) rela: dynamic::KeptRela,
+    pub(crate) eh_frame_hdr: dynamic::KeptHdr,
+    pub(crate) symtab: image::KeptSymtab,
 }
 
 /// Which `PT_LOAD` a class goes in, in address order.
@@ -384,6 +399,19 @@ impl Writer for Elf {
 }
 
 impl Elf {
+    /// The kept tables, locked; `None` for an output that keeps none. A lock poisoned by a
+    /// panic mid-build drops what it held.
+    pub(crate) fn last(&self) -> Option<MutexGuard<'_, Last>> {
+        self.last.as_ref().map(|it| match it.lock() {
+            Ok(last) => last,
+            Err(poisoned) => {
+                let mut last = poisoned.into_inner();
+                *last = Last::default();
+                last
+            }
+        })
+    }
+
     /// lld's maximum page size: what a `PT_LOAD` is aligned to.
     fn page(&self) -> u64 {
         match self.output.arch {

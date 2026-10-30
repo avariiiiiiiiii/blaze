@@ -986,6 +986,7 @@ impl<'a> View<'a> {
                 unwind: match &code.unwind {
                     Some(code::Unwind::Dwarf { len, rows }) => Frame::Rows(*len, rows),
                     Some(code::Unwind::Windows { .. }) => panic!("Windows unwind info on a Unix host"),
+                    Some(code::Unwind::WindowsArm64 { .. }) => panic!("Windows unwind info on a Unix host"),
                     None => Frame::None,
                 },
                 sig,
@@ -1080,6 +1081,11 @@ impl Frames {
                             code::Rule::RememberState => Cfi::RememberState,
                             code::Rule::RestoreState => Cfi::RestoreState,
                             code::Rule::ArgsSize(size) => Cfi::ArgsSize(size),
+                            code::Rule::RaSignState(signed) => {
+                                let mut expr = gimli::write::Expression::new();
+                                expr.op(if signed { gimli::DW_OP_lit1 } else { gimli::DW_OP_lit0 });
+                                Cfi::ValExpression(reg(34), expr)
+                            }
                         };
                         fde.add_instruction(*offset, cfi);
                     }

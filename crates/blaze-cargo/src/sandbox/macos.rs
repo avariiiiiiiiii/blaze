@@ -347,13 +347,15 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
     let live = also.live.filter(|_| recording);
 
     // What the library is told.
-    let mut config = String::new();
+    let mut config = String::with_capacity(4096);
     for (at, overlay) in spec.overlays.iter().enumerate() {
         std::fs::create_dir_all(overlay)
+            // alloc: the error, once, and no sandbox is made.
             .map_err(|error| format!("{}: {error}", overlay.display()))?;
-        let upper = stand_in(&scratch.dir.join("up").join(at.to_string()), overlay)?;
+        // alloc: once per overlay, its upper directory's name.
+        let upper = stand_in(&scratch.dir.join(format!("up/{at}")), overlay)?;
         for it in spellings(overlay) {
-            config.push_str(&format!("O\t{at}\t{it}\t{}\n", upper.display()));
+            _ = writeln!(config, "O\t{at}\t{it}\t{}", upper.display());
         }
     }
     let user = user_temp();
@@ -364,17 +366,20 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         Some(it) => stand_in(&users, it)?,
         None => users,
     };
-    let mut temps = Vec::new();
+    let mut temps = Vec::with_capacity(4);
     for (temp, to) in [("/private/tmp", "tmp"), ("/private/var/tmp", "var")] {
         let temp = PathBuf::from(temp);
         let empty = stand_in(&scratch.dir.join("tmp").join(to), &temp)?;
         temps.push((temp, empty));
     }
+    // Both of the user's temporary directories are answered from one empty one.
+    // clone: once per run, as above.
     temps.extend(user.map(|it| (it, user_in.clone())));
+    // clone: as above.
     temps.extend(env_temp.map(|it| (it, user_in.clone())));
     for (temp, to) in &temps {
         for it in spellings(temp) {
-            config.push_str(&format!("B\t{it}\t{}\n", to.display()));
+            _ = writeln!(config, "B\t{it}\t{}", to.display());
         }
     }
     // A directory passed through or overlaid below a temporary one is reached through the
@@ -394,15 +399,19 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             let Some(below) = below.filter(|it| !it.as_os_str().is_empty()) else { continue };
             let made = to.join(below);
             std::fs::create_dir_all(&made)
+                // alloc: the error, once, and no sandbox is made.
                 .map_err(|error| format!("{}: {error}", made.display()))?;
         }
     }
-    let mut writes = vec![dir.clone()];
+    let mut writes = Vec::with_capacity(1 + 4 * spec.writable.len());
+    // clone: once per run, the run's own directory as the profile's first parameter.
+    writes.push(dir.clone());
     for writable in &spec.writable {
         std::fs::create_dir_all(writable)
+            // alloc: the error, once, and no sandbox is made.
             .map_err(|error| format!("{}: {error}", writable.display()))?;
         for it in spellings(writable) {
-            config.push_str(&format!("W\t{it}\n"));
+            _ = writeln!(config, "W\t{it}");
             writes.push(it);
         }
     }
@@ -410,14 +419,14 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
     // library takes it as it takes a writable one, and Seatbelt still refuses its writes.
     for readable in &spec.readable {
         for it in spellings(readable) {
-            config.push_str(&format!("W\t{it}\n"));
+            _ = writeln!(config, "W\t{it}");
         }
     }
     // What is seen as it is and is no input: the devices. The program is named in the record
     // as any path: it is no input of the run's own process alone, which `Recorder` keeps
     // to the unscoped lines.
     for it in spellings(Path::new("/dev")) {
-        config.push_str(&format!("Q\t{it}\n"));
+        _ = writeln!(config, "Q\t{it}");
     }
     if recording {
         config.push_str("L\n");
@@ -429,52 +438,52 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         Some(live) => {
             let path = live.path.to_str().filter(|it| !it.contains(['\t', '\n']));
             let path = path.ok_or_else(|| {
+                // alloc: the error, once, and no sandbox is made.
                 format!("the live record {} is not a path the library can be told", live.path.display())
             })?;
-            config.push_str(&format!("V\t{path}\n"));
+            _ = writeln!(config, "V\t{path}");
             spellings(&live.path)
         }
-        None => Vec::new(),
+        None => Vec::with_capacity(0),
     };
     if also.network {
         config.push_str("I\n");
     }
     let config_path = scratch.dir.join("config");
     std::fs::write(&config_path, config)
+        // alloc: the error, once, and no sandbox is made.
         .map_err(|error| format!("{}: {error}", config_path.display()))?;
 
-    // Everything the child uses is made before the fork.
+    // Everything the child uses is made before the fork, once per run: the profile, its
+    // parameters, the program's command line and environment, for the kernel.
     // A socket the read set names (a test's fork server's) is one it connects to.
     let sockets: Vec<String> = spec
         .readable
         .iter()
         .filter(|it| std::fs::metadata(it).is_ok_and(|it| std::os::unix::fs::FileTypeExt::is_socket(&it.file_type())))
         .flat_map(|it| spellings(it))
+        // alloc: once per run, as above.
         .collect();
     let profile = c(profile(writes.len(), lives.len(), sockets.len(), also.network).as_bytes());
-    let params: Vec<CString> = writes
-        .iter()
-        .enumerate()
-        .flat_map(|(at, it)| [c(format!("WRITE{at}").as_bytes()), c(it.as_bytes())])
-        .chain(
-            lives
-                .iter()
-                .enumerate()
-                .flat_map(|(at, it)| [c(format!("LIVE{at}").as_bytes()), c(it.as_bytes())]),
-        )
-        .chain(
-            sockets
-                .iter()
-                .enumerate()
-                .flat_map(|(at, it)| [c(format!("SOCKET{at}").as_bytes()), c(it.as_bytes())]),
-        )
-        .collect();
-    let mut param_ptrs: Vec<*const libc::c_char> = params.iter().map(|it| it.as_ptr()).collect();
+    let mut params = Vec::with_capacity(2 * (writes.len() + lives.len() + sockets.len()));
+    let mut name = String::with_capacity(16);
+    for (kind, values) in [("WRITE", &writes), ("LIVE", &lives), ("SOCKET", &sockets)] {
+        for (at, it) in values.iter().enumerate() {
+            name.clear();
+            _ = write!(name, "{kind}{at}");
+            params.extend([c(name.as_bytes()), c(it.as_bytes())]);
+        }
+    }
+    let mut param_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(params.len() + 1);
+    param_ptrs.extend(params.iter().map(|it| it.as_ptr()));
     param_ptrs.push(std::ptr::null());
-    let argv: Vec<CString> =
-        program.unwrap_or_default().iter().map(|it| c(it.as_bytes())).collect();
-    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|it| it.as_ptr()).collect();
+    let program_argv = program.unwrap_or_default();
+    let mut argv: Vec<CString> = Vec::with_capacity(program_argv.len());
+    argv.extend(program_argv.iter().map(|it| c(it.as_bytes())));
+    let mut argv_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(argv.len() + 1);
+    argv_ptrs.extend(argv.iter().map(|it| it.as_ptr()));
     argv_ptrs.push(std::ptr::null());
+    // alloc: once per run, as above.
     let nonce = format!("{}.top", std::process::id());
     // The program's environment is the spec's (as it is with `also.env`), its `TMPDIR` the
     // run's empty one.
@@ -484,33 +493,40 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             .env
             .iter()
             .filter(|(name, _)| name != "TMPDIR" && !OURS.contains(&name.as_str()))
+            // alloc: once per run, as above.
             .map(|(name, value)| c(format!("{name}={value}").as_bytes()))
+            // alloc: as above.
             .collect(),
     };
     // The program's own `DYLD_INSERT_LIBRARIES` loads after the library, which takes it away
     // again before the program starts.
-    let theirs: Option<OsString> = match also.env {
-        Some(given) => given.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES").map(|it| it.1.clone()),
-        None => spec.env.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES").map(|it| it.1.clone().into()),
+    let theirs: Option<&std::ffi::OsStr> = match also.env {
+        Some(given) => given.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES").map(|it| it.1.as_os_str()),
+        None => spec.env.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES").map(|it| std::ffi::OsStr::new(&it.1)),
     };
-    let mut insert = library.as_os_str().to_owned();
-    if let Some(theirs) = theirs.filter(|it| !it.is_empty()) {
-        insert.push(":");
-        insert.push(theirs);
-    }
     let mut insert_var = OsString::from("DYLD_INSERT_LIBRARIES=");
-    insert_var.push(insert);
+    insert_var.push(library.as_os_str());
+    if let Some(theirs) = theirs.filter(|it| !it.is_empty()) {
+        insert_var.push(":");
+        insert_var.push(theirs);
+    }
     env.push(c(insert_var.as_bytes()));
+    // alloc: once per run, as above.
     env.push(c(format!("TMPDIR={}/", user_in.display()).as_bytes()));
+    // alloc: once per run, as above.
     env.push(c(format!("__BLAZE_SANDBOX={dir}").as_bytes()));
+    // alloc: once per run, as above.
     env.push(c(format!("__BLAZE_SANDBOX_EXEC={nonce}").as_bytes()));
-    let mut env_ptrs: Vec<*const libc::c_char> = env.iter().map(|it| it.as_ptr()).collect();
+    let mut env_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(env.len() + 1);
+    env_ptrs.extend(env.iter().map(|it| it.as_ptr()));
     env_ptrs.push(std::ptr::null());
     let cwd = c(spec.cwd.as_os_str().as_bytes());
     let raw = scratch.dir.join("record");
     if recording {
         let program = program.unwrap_or_default().first().map(|it| it.to_string_lossy());
+        // alloc: once per run, the record's first line.
         let line = format!("P\t{nonce}\t\t{}\n", program.unwrap_or_default());
+        // alloc: the error, once, and no sandbox is made.
         std::fs::write(&raw, line).map_err(|error| format!("{}: {error}", raw.display()))?;
     }
 
@@ -558,6 +574,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         // SAFETY: `cwd` is a nul-terminated string of this frame, live for the call, which
         // only reads it.
         if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
+            // alloc: the error, once, and the program does not run.
             let error = os(&format!("the working directory {}", spec.cwd.display()));
             eprintln!("blaze: the sandbox could not be made: {error}");
             // SAFETY: as for `_exit` above.
@@ -613,19 +630,21 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
     };
     if recording {
         // The paths the library saw are as the program spelled them, so the overlays and what
-        // is no input are known by each of their spellings.
+        // is no input are known by each of their spellings. Once per run, as it ends.
         let spelled = |dirs: &[PathBuf]| -> Vec<PathBuf> {
+            // alloc: as above.
             dirs.iter().flat_map(|it| spellings(it)).map(PathBuf::from).collect()
         };
+        // clone: as above, the spec the recorder is made from.
         let mut known = spec.clone();
         known.overlays = spelled(&spec.overlays);
         known.not_inputs = spelled(&spec.not_inputs);
-        let own: Vec<String> = ["/dev"]
-            .into_iter()
-            .map(str::to_owned)
-            .chain(temps.iter().flat_map(|(it, _)| spellings(it)))
-            .collect();
-        let own: Vec<&str> = own.iter().map(String::as_str).collect();
+        let mut own = Vec::with_capacity(1 + 4 * temps.len());
+        own.extend(["/dev"].into_iter().map(str::to_owned));
+        own.extend(temps.iter().flat_map(|(it, _)| spellings(it)));
+        let mut own_names: Vec<&str> = Vec::with_capacity(own.len());
+        own_names.extend(own.iter().map(String::as_str));
+        let own = own_names;
         let mut recorder = Recorder::new(&known, &own);
         if let Some(live) = live
             && let Err(why) = recorder.live(&live.path)
@@ -633,8 +652,10 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             live.failed(why);
         }
         let lost = match std::fs::read(&raw) {
+            // alloc: once, as the run ends: the record read as text, where it is not UTF-8.
             Ok(bytes) => merge(&String::from_utf8_lossy(&bytes), &mut recorder),
             Err(error) => {
+                // alloc: the error, once, as the run ends.
                 let why = format!("the sandbox's record {}: {error}", raw.display());
                 recorder.reached(Seen::Incomplete, "", &why);
                 None
@@ -649,6 +670,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         }
         if let Some(live) = live {
             if let Some(why) = lost {
+                // alloc: the error, once, as the run ends.
                 live.failed(format!("the sandbox's library could not add a line to it: {why}"));
             }
             if let Some(why) = recorder.live_failed() {
@@ -715,6 +737,7 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
             }
             (Some("S"), Some(pid), None, None) if pid.parse::<libc::pid_t>().is_ok_and(|it| it > 0) => {
                 if still_runs(pid.parse().unwrap_or_default()) {
+                    // alloc: once per process left running, and the record is not whole.
                     let why = format!(
                         "process {pid} of the run left its process group and still ran after the \
                          run ended, so what it read is not known"
@@ -725,7 +748,9 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
             }
             (Some("Z"), Some(errno), None, None) => {
                 let why = match errno.parse::<i32>() {
+                    // alloc: the error, and the live record is not whole.
                     Ok(errno) if errno > 0 => std::io::Error::from_raw_os_error(errno).to_string(),
+                    // alloc: as above.
                     _ => "it was written short".to_owned(),
                 };
                 lost.get_or_insert(why);
@@ -737,7 +762,9 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
         match seen {
             Some((seen, test, what)) => recorder.reached(seen, test, what),
             None => {
+                // alloc: a line that is not one, and the record is not whole.
                 let shown: String = line.chars().take(200).collect();
+                // alloc: as above.
                 let why = format!("the sandbox's record has a line that is not one: {shown:?}");
                 recorder.reached(Seen::Incomplete, "", &why);
             }
@@ -745,6 +772,7 @@ fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
     }
     for (nonce, test, path) in ran {
         if !loaded.contains(nonce) {
+            // alloc: once per program run without the library, and the record is not whole.
             let why = format!(
                 "{path} ran without the recorder (macOS keeps DYLD_INSERT_LIBRARIES from a \
                  program it protects), so what it read is not known"

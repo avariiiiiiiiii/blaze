@@ -10,7 +10,7 @@ Part of lane mem ([memory.md](../../design/memory.md)). Paths: `crates/blaze-cor
 `crates/blaze-graph/`, `crates/blaze-api/` (lanes core and ci, and every speed agent there, DONE).
 Nothing was built or run; the tests are written beside the code for the coordinator's run.
 
-Children, each with its own notes under [core/](core/):
+Children, each with its own notes under `docs/v2/plan/lanes/mem/core/`:
 
 | child | paths | notes |
 |---|---|---|
@@ -152,6 +152,10 @@ codec identity test, which now generates both variants.
 
 - `blaze_mem::frame::measure` (lane mem), then the frame half of a task's peak in
   `exec::measured`.
+- `arena::Bump` (a second frame, dedup-mem's finding) stays until blaze-mem can hand work its
+  task's frame, bind a frame to a NUMA node, and cap a frame's growth with `Cap`'s spill and
+  cancel-the-newest backstop (request C6). Without the last, the move would drop the daemon's
+  hard backstop for task memory.
 - `v2/requests/mem-core.md`: the daemon's `cx!` sets `Daemon::memory`, and its kinds come from
   `admission::kinds`; `blaze-ui` renders `Response::Memory`; lane db writes the front and back
   sub-ranges into `blaze_query::kinds`.

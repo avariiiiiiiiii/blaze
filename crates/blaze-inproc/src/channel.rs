@@ -43,6 +43,11 @@ impl Channel {
         &mut self.stream
     }
 
+    /// The stream, once nothing more is framed on it: the asks' doorbell.
+    pub(crate) fn into_stream(self) -> sys::Stream {
+        self.stream
+    }
+
     /// How long a [`Channel::recv`] waits before it fails; `None` waits for ever.
     pub fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
         self.stream.set_timeout(timeout)

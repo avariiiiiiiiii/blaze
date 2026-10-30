@@ -128,6 +128,7 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     if !keepable {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
+            // alloc: an error path.
             format!(
                 "{}: mode {mode:o} asks for what Windows does not keep: only the owner's write \
                  bit (the read-only attribute), with group and others reading and running as \
@@ -141,6 +142,7 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
     if attributes == INVALID_FILE_ATTRIBUTES {
         let error = io::Error::last_os_error();
+        // alloc: an error path.
         return Err(io::Error::new(error.kind(), format!("{}: {error}", path.display())));
     }
     let wanted = match owner & 0o2 {
@@ -156,6 +158,7 @@ pub(crate) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     };
     // SAFETY: a NUL-terminated path.
     sys::check(unsafe { SetFileAttributesW(wide.as_ptr(), wanted) })
+        // alloc: an error path.
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
@@ -174,6 +177,7 @@ fn plain(path: &Path, rights: u32, disposition: u32) -> io::Result<OwnedHandle> 
             std::ptr::null_mut(),
         )
     };
+    // alloc: an error path.
     sys::owned(handle).map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))
 }
 
@@ -196,6 +200,7 @@ fn file_system(handle: &OwnedHandle) -> io::Result<(String, bool)> {
         )
     })?;
     let len = name.iter().position(|&it| it == 0).unwrap_or(name.len());
+    // alloc: a clone's check of its volume, once per clone, for its error.
     Ok((String::from_utf16_lossy(&name[..len]), flags & FILE_SUPPORTS_BLOCK_REFCOUNTING != 0))
 }
 
@@ -232,6 +237,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
     if !shares {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
+            // alloc: an error path.
             format!(
                 "the file system of {} ({system}) cannot share blocks with {}; ReFS can, and \
                  blaze does not copy instead",
@@ -287,6 +293,7 @@ pub(crate) fn clone(from: &Path, to: &Path) -> io::Result<()> {
         _ = std::fs::remove_file(to);
     }
     cloned.map_err(|error: io::Error| {
+        // alloc: an error path.
         io::Error::new(error.kind(), format!("cloning {} to {}: {error}", from.display(), to.display()))
     })
 }

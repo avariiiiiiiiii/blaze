@@ -1,13 +1,10 @@
 //! A mapped image, read in place: [`Image::open`] reads only the spine, and each group is checked
 //! by its CRC32C the first time a read reaches it.
 
-use std::{
-    ops::Range,
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
-};
+use std::{ops::Range, sync::atomic::Ordering::Relaxed};
 
 use blaze_format::{Record, SchemaHash};
-use blaze_ids::{ContentId, crc32c::crc32c};
+use blaze_ids::{ContentId, bits::AtomicBits, crc32c::crc32c};
 
 use crate::{
     Cause, Corrupt, OpenError, Refused, Section, SectionId, raw,
@@ -72,9 +69,9 @@ pub struct Image<S: Stable> {
     spine: Spine,
     /// Bit `g` of the words: data group `g` matched its CRC. Then bit `groups + t`: CRC table
     /// group `t` matched its top CRC.
-    checked: Box<[AtomicU64]>,
+    checked: AtomicBits,
     /// The same bits for a group that did not match: read again, it fails again, with no CRC.
-    bad: Box<[AtomicU64]>,
+    bad: AtomicBits,
     pub(crate) touched: Touched,
 }
 
@@ -89,9 +86,9 @@ const _: fn() = || {
 #[derive(Default)]
 pub(crate) struct Touched {
     #[cfg(test)]
-    pub(crate) bytes: AtomicU64,
+    pub(crate) bytes: std::sync::atomic::AtomicU64,
     #[cfg(test)]
-    pub(crate) end: AtomicU64,
+    pub(crate) end: std::sync::atomic::AtomicU64,
 }
 
 impl Touched {
@@ -106,14 +103,10 @@ impl Touched {
     }
 }
 
-fn words(bits: u64) -> Box<[AtomicU64]> {
-    // alloc: the checked and bad bitmaps, once an image opened
-    (0..bits.div_ceil(64)).map(|_| AtomicU64::new(0)).collect()
-}
-
-/// The word and bit of bit `index`.
-fn bit(index: u64) -> (usize, u64) {
-    ((index / 64) as usize, 1 << (index % 64))
+/// Bit `index` of the checked and bad sets: an image has at most `u32::MAX` groups and as many
+/// CRC table groups, so it fits a `usize` on every target blaze runs on.
+fn bit_of(index: u64) -> usize {
+    usize::try_from(index).expect("an image's groups fit a usize")
 }
 
 impl<S: Stable> Image<S> {
@@ -127,7 +120,13 @@ impl<S: Stable> Image<S> {
             &bytes[..prefix]
         })?;
         let bits = u64::from(spine.groups) + spine.tops.len() as u64;
-        Ok(Image { owner, spine, checked: words(bits), bad: words(bits), touched })
+        Ok(Image {
+            owner,
+            spine,
+            checked: AtomicBits::new(bit_of(bits)),
+            bad: AtomicBits::new(bit_of(bits)),
+            touched,
+        })
     }
 
     /// The image's hash: the BLAKE3 of its spine, which holds every group's CRC.
@@ -253,8 +252,7 @@ impl<S: Stable> Image<S> {
 
     /// Whether group `group` of `section` was read and matched its CRC.
     pub fn is_checked(&self, section: &Section, group: u32) -> bool {
-        let (word, bit) = bit(u64::from(section.first + group));
-        self.checked[word].load(Relaxed) & bit != 0
+        self.checked.contains(bit_of(u64::from(section.first + group)), Relaxed)
     }
 
     /// Group `group` of `section` checked, once.
@@ -262,8 +260,7 @@ impl<S: Stable> Image<S> {
     fn ensure(&self, section: &Section, group: u32) -> Result<(), Corrupt> {
         // Relaxed: the image's bytes are never written after it is opened, so a set bit orders
         // nothing; a thread that misses one checks the group again and sets it again.
-        let (word, bit) = bit(u64::from(section.first + group));
-        if self.checked[word].load(Relaxed) & bit != 0 {
+        if self.checked.contains(bit_of(u64::from(section.first + group)), Relaxed) {
             return Ok(());
         }
         self.check(section, group)
@@ -277,12 +274,12 @@ impl<S: Stable> Image<S> {
         let wanted = self.table_entry(global).map_err(corrupt)?;
         let at = self.spine.group_len() * (1 + u64::from(global));
         let found = crc32c(self.span(at, self.spine.group_len()));
-        let (word, bit) = bit(u64::from(global));
+        let bit = bit_of(u64::from(global));
         if found != wanted {
-            self.bad[word].fetch_or(bit, Relaxed);
+            self.bad.insert(bit, Relaxed);
             return Err(corrupt(Cause::Crc { found, wanted }));
         }
-        self.checked[word].fetch_or(bit, Relaxed);
+        self.checked.insert(bit, Relaxed);
         Ok(())
     }
 
@@ -292,15 +289,15 @@ impl<S: Stable> Image<S> {
         let entry_at = u64::from(global) * 4;
         let table_group = (entry_at / group) as u32;
         let index = u64::from(self.spine.groups) + u64::from(table_group);
-        let (word, bit) = bit(index);
-        if self.checked[word].load(Relaxed) & bit == 0 {
+        let bit = bit_of(index);
+        if !self.checked.contains(bit, Relaxed) {
             let wanted = self.spine.tops[table_group as usize];
             let found = crc32c(self.span(self.spine.crc_at + u64::from(table_group) * group, group));
             if found != wanted {
-                self.bad[word].fetch_or(bit, Relaxed);
+                self.bad.insert(bit, Relaxed);
                 return Err(Cause::CrcTable { table_group, found, wanted });
             }
-            self.checked[word].fetch_or(bit, Relaxed);
+            self.checked.insert(bit, Relaxed);
         }
         let bytes = self.span(self.spine.crc_at + entry_at, 4);
         Ok(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
@@ -308,8 +305,7 @@ impl<S: Stable> Image<S> {
 
     /// Whether a read of group `group` of `section` failed before.
     pub fn is_bad(&self, section: &Section, group: u32) -> bool {
-        let (word, bit) = bit(u64::from(section.first + group));
-        self.bad[word].load(Relaxed) & bit != 0
+        self.bad.contains(bit_of(u64::from(section.first + group)), Relaxed)
     }
 
     /// The bytes the image is held in, for an owner that hands them on (the database keeps

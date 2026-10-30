@@ -33,11 +33,12 @@ pub fn runs(name: &str, native: &[String], wasm: Option<&str>) -> Result<Runs, S
         None | Some("1" | "on") => {}
         Some("0" | "off") => return Ok(Runs::Native(Why::TurnedOff)),
         Some(other) => {
+            // alloc: the message of a setting refused.
             return Err(format!("{WASM}={other}: it is `0` or `off` to run proc macros natively"));
         }
     }
-    let crate_name = |it: &str| it.replace('-', "_");
-    if native.iter().any(|it| crate_name(it) == crate_name(name)) {
+    let crate_name = |it: &str| it.bytes().map(|byte| if byte == b'-' { b'_' } else { byte });
+    if native.iter().any(|it| crate_name(it).eq(crate_name(name))) {
         return Ok(Runs::Native(Why::Listed));
     }
     Ok(Runs::Wasm)
@@ -46,6 +47,7 @@ pub fn runs(name: &str, native: &[String], wasm: Option<&str>) -> Result<Runs, S
 /// The error of a proc macro that runs as a module and could not be built or run as one, for
 /// `why`.
 pub fn refused(name: &str, why: &str) -> String {
+    // alloc: the message of a macro that can't run as a module.
     format!(
         "the proc macro `{name}` runs as a WebAssembly module and can't: {why}. List its package \
          in `[workspace.metadata.blaze] {NATIVE_KEY}` to run it natively, in a sandboxed server"

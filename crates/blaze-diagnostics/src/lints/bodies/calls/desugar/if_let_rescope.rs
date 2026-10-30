@@ -27,7 +27,7 @@ use smallvec::SmallVec;
 
 use super::{between, can_be_used_for_suggestions, edition, end_point, significant_drop::SignificantDrops};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Level, Span, SuggestionStyle},
 };
@@ -53,54 +53,52 @@ pub(crate) struct IfLetRescope {
 }
 
 impl LatePass for IfLetRescope {
-    fn name(&self) -> &'static str {
-        "IfLetRescope"
-    }
+    // The overflow error is given only while probing for the lint: rustc's `check_expr` returns
+    // first when `if_let_rescope` is in `lints_that_dont_need_to_run`, so skipping skips both.
+    const LINTS: LintSet = lint_set(["if_let_rescope"]);
+    const HOOKS: Hooks = Hooks::BODY;
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Block, ExprTag::Match, ExprTag::If, ExprTag::Loop]);
 
-    fn hooks(&self) -> Hooks {
-        Hooks::BODY | Hooks::EXPR
-    }
-
-    fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.skip.clear();
         self.parents.clear();
+    }
+
+    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();
+        // An `if` is visited after its parent, which places it, whatever the parent's edition.
         let parents = &mut self.parents;
         let mut place = |expr: ExprId, parent: Parent| {
             if let Expr::If { .. } = store.expr(expr) {
                 parents.insert(expr, parent);
             }
         };
-        for &expr in b.exprs() {
-            match store.expr(expr) {
-                Expr::Block { statements, tail, .. } => {
-                    for statement in statements {
-                        if let Statement::Expr { expr, .. } = statement {
-                            place(expr, Parent::Stmt);
-                        }
-                    }
-                    if let Some(tail) = tail {
-                        place(tail, Parent::Stmt);
+        match store.expr(expr) {
+            Expr::Block { statements, tail, .. } => {
+                for statement in statements {
+                    if let Statement::Expr { expr, .. } = statement {
+                        place(expr, Parent::Stmt);
                     }
                 }
-                Expr::Match { arms, .. } => {
-                    for arm in arms {
-                        place(arm.expr, Parent::Stmt);
-                    }
+                if let Some(tail) = tail {
+                    place(tail, Parent::Stmt);
                 }
-                Expr::If { else_branch: Some(alt), .. } => place(alt, Parent::Else),
-                // rustc's `loop` is of a block, whose value the `if` of a `while` is.
-                Expr::Loop { body, .. } => place(body, Parent::Stmt),
-                _ => {}
+                return;
             }
+            Expr::Match { arms, .. } => {
+                for arm in arms {
+                    place(arm.expr, Parent::Stmt);
+                }
+                return;
+            }
+            Expr::If { else_branch: Some(alt), .. } => place(alt, Parent::Else),
+            // rustc's `loop` is of a block, whose value the `if` of a `while` is.
+            Expr::Loop { body, .. } => place(body, Parent::Stmt),
+            _ => {}
         }
-    }
-
-    fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         if edition(b, expr).at_least_2024() {
             return;
         }
-        let store = b.store();
         if let Expr::Loop { body, source: LoopSource::While, .. } = store.expr(expr)
             && let Expr::If { condition, .. } = store.expr(body)
             && let Expr::Let { .. } = store.expr(condition)

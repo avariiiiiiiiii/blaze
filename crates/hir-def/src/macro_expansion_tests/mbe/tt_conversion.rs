@@ -117,7 +117,7 @@ fn f() { m!('a); }
         expect![[r#"
 macro_rules! m { ($t:ident) => { $t } }
 
-fn f() { /* error: expected ident */missing; }
+fn f() { /* error: no rules expected `'a` */missing; }
 "#]],
     )
 }

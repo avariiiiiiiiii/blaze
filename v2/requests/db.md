@@ -2295,6 +2295,11 @@ Already done, thanks: `EditionedFileId::parse` parses library source roots as an
 (`crates/base-db/src/editioned_file_id.rs:25-34`), which item 5 needed.
 
 > forwarded to db (window `db-next2`, told by tmux): `crates/hir-def/` is its.
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): `pub mod deps;` between
+> `pub mod nameres;` and `pub mod src;` in `crates/hir-def/src/lib.rs`. Checked `deps/` against
+> `frozen.rs` as it is now (`set`/`set_lang_items` take `&mut Db`, `Frozen.bytes: Arc<[u8]>` with
+> `From<PartBytes>`). `deps/signatures/table.rs` also needs frontend-deps-sigs §1 (frozen's
+> `Enc`/`Dec` id methods `pub(crate)`), which is left for db-expand-names-next2 (below).
 
 ## frontend-deps-reparse: parse a file from its previous parse (frontend.md item 14; 2026-10-29)
 
@@ -2350,6 +2355,11 @@ and as outlines), so which one runs changes the time only. The outline/full choi
   changed. No new dependency: base-db already depends on `syntax`.
 
 > forwarded to db (window `db-next2`, told by tmux).
+> frontend-hooks (2026-10-29): not applied, superseded. db did item 14 its own way (decision D8
+> above): `crates/base-db/src/reparse.rs`, a `Reparse` set with each `FileText` that carries the
+> edit, and `EditionedFileId::parse` is `input.reparse_field(db).parse(..)`. Replacing that with
+> `parse_file` would undo db's design. `syntax::SourceFile::parse_file` and
+> `syntax/src/parsing/kept.rs` now have no caller outside syntax; whether they go is frontend's call.
 
 ## frontend-text: one lazy line index per file text (frontend.md item 6; 2026-10-29)
 
@@ -2500,6 +2510,11 @@ same heading).
 Why: frontend.md item 6 ("v2 maps files from the VFS, read in place"): today every file's text
 is copied once on load and kept, as much memory again as the VFS holds.
 
+> frontend-hooks (2026-10-29, Andrew's decision 2026-10-29 20:45): §2 left for
+> db-expand-macros-next2 (`crates/hir-expand/` is its, running; `line_starts` is still in
+> `builtin/fn_macro.rs`); told by tmux. §3 applied in the form the two later frontend-text sections
+> give it (the second replaces the amendment): see "the parse tree's source is a `Text`" below.
+
 ## speed-hir-store: one counting allocator for hir-def's tests, from `blaze-alloc-count`
 
 What: hir-def's allocation-budget tests share one `#[global_allocator]`. A binary can only have
@@ -2645,6 +2660,15 @@ interning). `ModPath` and `PathSegments` (`hir-expand`, `Interned<T>` today) mov
 - `crates/blaze-format/src/tests.rs`: `symbols_of` finds every `Sym` inline, behind `Rel`, in
   slices, in a record holding a slice of itself.
 
+> frontend-hooks (2026-10-29): §1-4 were already applied by db-query (turn 5 of its report;
+> `blaze-query/Cargo.toml` has both lines, `from_image_with` checks `intern::restored_from()`,
+> `write_image(&self, &mut Builder, &mut intern::Live)` at lib.rs:1184). Not applied: §5 and §6
+> are design asks, not exact edits. §5 is in lane format's `expr_store/persist.rs` and db-ty's
+> `hir-ty/src/next_solver/persist.rs` (still `intern::Symbol::intern(text)` at L278), and needs
+> db's answer on whether those bytes ever leave the daemon image (the store, the global cache),
+> where a symbol ID means nothing without the same restored table. §6 is `vendor/salsa`
+> (speed-salsa, running). Left for db.
+
 ## frontend-text: amendment to "one lazy line index per file text", section 3: `Bytes` and `Text` (2026-10-29)
 
 frontend-journal-tree is changing blaze-vfs's reads to open the tree in place from the image:
@@ -2679,6 +2703,9 @@ Load-cargo's side (it matches `ViewError` exhaustively) is the amendment of the 
 Status: open
 
 > forwarded to db (window `db-next2`, told by tmux).
+> frontend-hooks (2026-10-29): superseded by "the parse tree's source is a `Text`" §2 below (no
+> `ViewError::Mapped`, no `shared()`), which is applied; its `ViewFile::bytes: &blaze_vfs::Bytes`
+> is in.
 
 ## frontend-nameres-graph: proptest for hir-def's tests (2026-10-29)
 
@@ -2693,6 +2720,9 @@ dependency`). The allocation-budget test in `facts/tests/graph.rs` also needs sp
 Status: open
 
 > forwarded to db (window `db-next2`, told by tmux); the root `proptest` line is in (requests).
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): `proptest.workspace = true`
+> after `expect-test` in `crates/hir-def/Cargo.toml` `[dev-dependencies]` (manifest lint clean).
+> The counting allocator (speed-hir-store items 2-4) is not part of this section.
 
 ## frontend-nameres-impls: re-export module_impls (2026-10-29)
 
@@ -2720,6 +2750,10 @@ items 2-4 above.
 Status: open
 
 > forwarded to db (window `db-next2`, told by tmux).
+> left for db-expand-names-next2 (frontend-hooks, 2026-10-29): owns `nameres.rs` (running, file
+> touched minutes before); lands with frontend-nameres-core's `mod facts;`. Told by tmux.
+> applied by db-expand-names (2026-10-29 ~21:00): the line after
+> `ResolvePathResultPrefixInfo`, with frontend-nameres-core's `mod facts;` (also applied). Status: applied.
 
 ## speed-hir-store-stmts: statements become columns, `Statement` a view (hir-ty, hir-ty-borrowck, hir-ty-unsafeck)
 
@@ -2842,6 +2876,8 @@ These are private today:
 - Why: one encoding of a portable id, not a second copy of it in `deps/`.
 
 > forwarded to db (hir-def is its; told by tmux).
+> left for db-expand-names-next2 (frontend-hooks, 2026-10-29): owns `nameres/frozen.rs` (running,
+> touched 2 min before); the ten methods are still private there. Told by tmux.
 
 ### 2. `crates/hir-def/src/signatures.rs`: the hook at the head of each `of`
 
@@ -2869,6 +2905,8 @@ In each of `StructSignature::of` (L439), `UnionSignature::of` (L541), `EnumSigna
   the record names is made by the query (blocks are tracked structs).
 
 > forwarded to db (hir-def is its; told by tmux).
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): the hook at the head of all ten
+> `of`s in `crates/hir-def/src/signatures.rs` (`of(db: &Db, ..)` now, before `match Self::relative`).
 
 ### 3. `crates/hir-def/src/signatures.rs`: `EnumVariants::of` split into hook and lowering
 
@@ -2896,6 +2934,9 @@ In each of `StructSignature::of` (L439), `UnionSignature::of` (L541), `EnumSigna
   record, which `of` itself no longer does once it serves.
 
 > forwarded to db (hir-def is its; told by tmux).
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): `EnumVariants::of` is the hook
+> then `Self::lower(db, e)`; `lower(db: &Db, e)` in a new plain `impl EnumVariants` holds the old
+> body unchanged.
 
 ### 4. `crates/hir-def/src/signatures.rs`: build the two values from their parts
 
@@ -2939,6 +2980,9 @@ allocation tests in `deps/signatures/tests.rs` use `blaze_alloc_count::assert_at
 Status: open
 
 > forwarded to db (hir-def is its; told by tmux).
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): §4, both `from_parts` as written
+> (`impl VariantFields` before `len`, `impl EnumVariants` after `lower`) in
+> `crates/hir-def/src/signatures.rs`; §2-3 above. §1 left for db-expand-names-next2.
 
 ## frontend-nameres-core: crate_local_def_map and block_def_map on the per-module resolver
 
@@ -3178,6 +3222,8 @@ blaze-query does not depend on hir-def). Why: `facts/kinds.rs` gives the resolve
 `blaze_query::QueryKind` numbers, as `hir_ty::db::kinds` does.
 
 > forwarded to db (hir-def is its; told by tmux).
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): `blaze-query.workspace = true`
+> after `blaze-phf` in `crates/hir-def/Cargo.toml` `[dependencies]` (manifest lint clean).
 
 ### 9. Other `collector::` uses
 
@@ -3188,6 +3234,16 @@ working with `#[cfg(test)] mod collector;`. Nothing else to move.
 Status: open
 
 > forwarded to db (hir-def is its; told by tmux).
+> left for db-expand-names-next2 (frontend-hooks, 2026-10-29 ~20:55): sections 1-7 edit
+> `nameres.rs` (touched 2 min before), `nameres/mod_resolution.rs` and `item_scope.rs` (10 min),
+> all owned by the running db-expand-names-next2; told by tmux. Section 8 is applied (above).
+> applied by db-expand-names (2026-10-29 ~21:00): sections 1-7. 1-4 and 6 as written. 5 with
+> `ScopeSlot::handle(&self, db: &Db)` (not `&dyn SourceDatabase`: no `dyn`, every function takes
+> `&Db`); `frozen.rs` does not match on `ScopeSlot`. 7: `PerNsGlobImports` is now
+> `PerNsGlobImports<A: Allocator + Clone = Global>` on `hashbrown` (mem-db-def-resolve R3), so it
+> derives `Clone` and has hand-written `PartialEq`/`Eq` (a derive would need `Global: PartialEq`,
+> which it isn't); its `Debug`/`Default` were already hand-written. Not built (lane rule).
+> Status: applied.
 
 ## frontend-text: the parse tree's source is a `Text`; `FileText` and `BodySyntax` hold one (2026-10-29)
 
@@ -3239,6 +3295,33 @@ image file's text is held as it is, with no copy and nothing refused.
 Status: open
 
 > forwarded to db (told by tmux).
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45), base-db's part of §1-2 and of
+> "one lazy line index" §3, re-derived against the tree as it is now (db's D8 reparse,
+> `write_text`'s `(text, file, content)`):
+> - `lib.rs`: `FileText`'s field is `text: syntax::Text`; `FileText::text` returns
+>   `&'db syntax::Text`.
+> - `files.rs`: `write_text` takes `Option<(syntax::Text, ContentId, ContentId)>` and stores it as
+>   given (the `Arc::from(text)` copy is gone); `set_text` (a `&str` from outside a view) makes
+>   `syntax::Text::from(text)`, one copy as before; a file losing its text gets
+>   `Text::from_static("")` (no allocation).
+> - `reparse.rs`: `Slot::text`, `Reparse::{new, after, parse}`, `whole` and `assert_whole` take
+>   `Text`/`&Text`; the debug check is `text.ptr_eq(&self.slot.text)`.
+> - `view.rs`: `ViewFile { path, id: ContentId, bytes: &'a blaze_vfs::Bytes }`; `plan_view` reads
+>   `file.id` and `&bytes[..]`; `write_view` keeps `blaze_vfs::text_of(bytes.clone()).ok()`, a
+>   `Vec<Option<syntax::Text>>`, and matches `(&text, ..)`. No `ViewError::Mapped`.
+> - `tests.rs`: `vfs_bytes` + `view_file` replace `vfs_file` at the four view sites;
+>   `a_files_parse_shares_its_text` asserts `tree.source().ptr_eq(..)`; new
+>   `a_views_text_is_its_bytes` (the text's pointer is the view's bytes').
+> - `budget_tests.rs`: `texts` makes `blaze_vfs::Bytes`, `view_files` the new `ViewFile`, and
+>   `PER_CHANGED_FILE` is 1 (the reparse slot; the text is no longer a copy).
+> - `editioned_file_id.rs`: nothing; `reparse_field(db).parse(input.text(db), ..)` takes `&Text`.
+>   The bullet "`EditionedFileId::parse` passes the text to `SourceFile::parse_file`" is superseded
+>   by D8.
+> Not db's, sent on: `BodySyntax::text` and `body.rs:418` (lane format, `v2/requests/format.md`,
+> "frontend-hooks: `BodySyntax::text` is a `syntax::Text`"); `hir_expand::FileRange::file_text`'s
+> return type (`v2/requests/db-expand.md`, db-expand-macros-next2 told); load-cargo's
+> `ViewFile { path, id, bytes }` at `v2.rs:754` (cargo, `cargo-inbox` told). Until those land
+> those three files don't compile against base-db.
 
 ## frontend-tree: views of a file's tree, borrowed from the database (2026-10-29)
 
@@ -3288,6 +3371,8 @@ Status: open
 
 > forwarded to db (told by tmux).
 > applied by db-expand: both as written (`HirFileId::root` after `parse_or_expand` in `crates/hir-expand/src/lib.rs`, `AstId::to_view` after `impl<N: AstNode> AstId<N>` in `files.rs`); `ignored_semicolon` (lib.rs) reads the call's path through `to_view`.
+> frontend-hooks (2026-10-29): nothing left; both are in (`hir-expand/src/lib.rs` `HirFileId::root`,
+> `files.rs` `AstId::to_view`).
 
 ## frontend-tree: to db-expand-macros-next1, hand over `crates/span/src/ast_id.rs` (2026-10-29)
 
@@ -3315,6 +3400,7 @@ Status: open
 > db-expand-macros: I don't touch `crates/span/` (my brief gives it to format, not me) and have no edit in `ast_id.rs`; frontend-tree may edit it.
 
 > forwarded to db-expand-macros-next1 (told by tmux).
+> frontend-hooks (2026-10-29): nothing to apply; answered above (frontend-tree may edit `ast_id.rs`).
 
 ## frontend-db: the concrete database, `base_db::Db` (frontend.md item 15; 2026-10-29)
 
@@ -3547,6 +3633,10 @@ left).
 > `pub(crate) type TestDB = base_db::Db;` with `use hir_ty_mir as _;` (no `provide()`, no
 > `set_expand_proc_attr_macros`), and the tests' `&*db` became `&db`.
 
+> frontend-hooks (2026-10-29): nothing left to apply; §1-7 each have an applied answer above. The
+> `compile_fail` test that doesn't run is its own section ("frontend-db: the `compile_fail` test
+> ...").
+
 ## frontend-journal-tree: `Reader::file` is a `Result` of `Bytes` (blaze-query's `Tree`; 2026-10-29)
 
 Why: restore.md, "The VFS tree itself is in the mapped image". A file of a restored tree is a
@@ -3577,6 +3667,9 @@ then every file is a heap file.
 Status: open
 
 > forwarded to db (`blaze-query/src/tree.rs` is its; db-query-next2 told).
+> frontend-hooks (2026-10-29): nothing to apply; already in (db-query). `Tree::file` returns
+> `Result<Option<(ContentId, Mode, Bytes)>, Corrupt>` and `Reader`'s impl passes
+> `blaze_vfs::Reader::file` through with no clone (`crates/blaze-query/src/tree.rs:18,29`).
 
 ## frontend-nameres-core-macros: `PerNsGlobImports::of_scope` (2026-10-29)
 
@@ -3621,6 +3714,11 @@ are private to `item_scope.rs`, hence the hook.
 Status: open
 
 > forwarded to db (running; `db-next2` was told by the asker and again by requests).
+> left for db-expand-names-next2 (frontend-hooks, 2026-10-29): owns `item_scope.rs` (running,
+> touched 10 min before). Told by tmux.
+> applied by db-expand-names (2026-10-29 ~21:00): `of_scope` is in, through mem-db-def-resolve R3
+> (`of_scope_in(module, scope, Global)`, each set sized to its glob entries first; the same marks).
+> Status: applied.
 
 ## dedup: frozen trees take LitKind's number from tt (from dedup-macros, 2026-10-29)
 
@@ -4415,8 +4513,16 @@ Status: withdrawn by frontend-nameres-core-macros (2026-10-29, at core's request
 carries `bang: bool`). Whether collector.rs's `derive(Debug)` needs it is db-expand-names' call.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> frontend-hooks (2026-10-29): nothing to apply. Withdrawn, and `nameres.rs:1277` already has
+> `#[derive(Debug, Clone, Copy, PartialEq, Eq)]` (db-expand-names added `Debug`).
 
 ## dedup: bits: hir-ty-borrowck onto `blaze_ids::bits` (from dedup-bits-db)
+
+**Superseded (2026-10-29, 20:55): don't apply this section.** It puts borrowck's sets in a
+global `Vec`, which conflicts with mem-db-checks B2.1 (frame slices; T1 needs zero global
+allocations for a clean body; `v2/requests/mem-db-checks-check.md` B7.13). Apply
+`## dedup: bits: hir-ty-borrowck on frame words (supersedes the one above)` instead, after B2
+and B7.
 
 From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
 
@@ -5023,7 +5129,7 @@ After:
             from_closure: self.from_closure.contains(at),
 ```
 
-Status: open
+Status: superseded by `## dedup: bits: hir-ty-borrowck on frame words (supersedes the one above)`
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
@@ -6085,6 +6191,8 @@ Answer with a `>` line.
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> frontend-hooks (2026-10-29): not applied, a choice for db (owner of `crates/hir-ty/`,
+> db-ty-next2), not an exact edit. Left for db.
 
 ## dedup: blaze_query::query_kinds! (from dedup-scan)
 
@@ -6154,6 +6262,8 @@ Numbers and names are unchanged, so traces and the explainer read as before.
 `hir-def/src/expr_store/persist.rs`'s `kinds!` is another macro (column enums) and stays.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+
+> applied in part by db (db-next3, 21:05): `blaze_query::query_kinds!` is in `crates/blaze-query/src/lib.rs` as written, with a test in `tests.rs`. The two users (`hir-def/src/nameres/facts/kinds.rs`, `hir-ty/src/db.rs` `pub mod kinds`) go to db-apply-def and db-apply-ty.
 
 ## dedup: bits: hir-def `item_scope.rs` `Bits`, `signatures.rs` `VariantBits`, `import_map.rs` `trait_assoc_items` onto `blaze_ids::bits` (from dedup-bits-db)
 
@@ -6688,6 +6798,8 @@ After:
 
 Status: open
 
+> applied by db (db-next3, 21:05): `Marks` is gone; collection and reclaim use `BitSet<MemoId>` with `insert_growing`, and the test is as written.
+
 > forwarded to db (from requests, pass 16; told by tmux).
 
 ## dedup: bits: vendor/salsa `capture.rs` `Frame::old` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
@@ -6832,6 +6944,8 @@ After:
 
 Status: open
 
+> sent by db (db-next3, 21:05) to speed-salsa-next3 (window 22), which holds `vendor/salsa` now, with the `Sip` section above.
+
 > forwarded to db (from requests, pass 16; told by tmux).
 
 ## 13. Forwards from db-matchck and db-unsafeck (db, 21:50)
@@ -6852,3 +6966,433 @@ db-unsafeck's requests (`v2/requests/db-unsafeck.md`):
   with db-ty.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+## frontend: frontend applies its own `## frontend-*` hooks in db's files (Andrew's decision, 2026-10-29 20:45)
+
+Notice, not a request. Child `frontend-hooks` (window `frontend-hooks`) applies the unapplied
+`## frontend-*` sections of this file and `db-expand.md` itself, one file at a time, and only
+where no running db child owns the file or touched it in the last 20 minutes (else it tells that
+child and leaves the section). Each section gets `> applied by frontend-hooks ...`, and a summary
+of every edit goes at the end of this file for db to review in one read. The design asks of
+"frontend: what frontend.md items 7-12 still need" stay db's.
+
+> applied: nothing to apply (a notice); requests routes `## frontend-*` sections of db.md and db-expand.md to frontend-hooks from now on (requests, pass 19).
+
+## dedup: bits: hir-ty-borrowck on frame words (supersedes the one above)
+
+From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), with
+`mem-db-checks-check` (`v2/requests/mem-db-checks-check.md` B7.13, whose design this is).
+
+Why: borrowck's `bitset.rs` is a copy of `blaze_ids::bits`, and mem-db-checks B2.1 moves its
+words into the body's frame, because T1 (`a_clean_body_allocates_nothing`) and B7.10 need zero
+global allocations for a clean body. Both hold if borrowck's sets are `blaze_ids::bits` sets
+over frame words: `Bits<&'f mut [u64]>` (`BitSliceMut<'f>`) and
+`BitMatrix<usize, &'f mut [u64]>` (the matrix's index type comes first).
+`bitset.rs` keeps only the two aliases, the frame constructors and the `Transfer` trait; its own
+bit logic is deleted.
+
+**Order.** Apply after mem-db-checks B2 (`v2/requests/mem-db-checks.md`, B2.1 to B2.5 and the
+call sites it lists), B7 (`v2/requests/mem-db-checks-check.md`), mem-db-checks-regions'
+`known: BitMatrix<'f>`. `blaze_ids::bits::BitMatrix<I = usize, S = Vec<u64>>` already has its
+storage parameter (`from_words(rows, columns, data: S)`, reads for `S: Words`, writes for
+`S: WordsMut`, `Default` for `S: Default`). This section is written against the text those requests produce. Where it
+differs from them, this section wins. Behavior is unchanged: the same members, the same panics
+(`insert` and ranges past the words, `copy_from` of a set with a member past them), and
+`contains` past the words is false.
+
+> forwarded to db (db-ty-d-borrowck, in `crates/hir-ty-borrowck/`) (requests, pass 19; told by tmux).
+> db-ty-d-borrowck (2026-10-29 20:59): not applied, waits on its own order: mem-db-checks B2
+> and B7 and mem-db-checks-regions, none in the tree (no `crate::mem`, no `blaze-mem` dependency,
+> `Regions<'db>` still). `bitset.rs` is unchanged until then.
+
+### 1. `crates/hir-ty-borrowck/src/bitset.rs`: the whole file becomes
+
+```rust
+//! The analyses' sets: `blaze_ids::bits` sets over words in the body's frame, fixed in size
+//! (no capacity word and no growth), so a clean body takes no global memory. Ranges are set
+//! and cleared a word at a time, so a move path's subtree (a contiguous range of path ids)
+//! costs a few word ops.
+
+use std::ops::Range;
+
+use blaze_ids::bits::{self as shared, BitSliceMut, Bits, WordsMut};
+pub(super) use blaze_ids::bits::{range_masks, words_for};
+
+use crate::mem::Frame;
+
+/// A set of bits in the frame.
+pub(super) type BitSet<'f> = BitSliceMut<'f>;
+
+/// Rows of one width in the frame, a row found by one multiply: the entry sets of every block.
+pub(super) type BitMatrix<'f> = shared::BitMatrix<usize, &'f mut [u64]>;
+
+/// An empty set of `len` bits in `frame`.
+pub(super) fn bits(frame: &Frame, len: usize) -> BitSet<'_> {
+    Bits::from_words(frame.alloc_slice_fill_with(words_for(len), |_| 0))
+}
+
+/// The set of every bit below `len`, in `frame`.
+pub(super) fn filled_bits(frame: &Frame, len: usize) -> BitSet<'_> {
+    let mut out = bits(frame, len);
+    out.insert_range(0..len);
+    out
+}
+
+/// An empty set of a row's size of `matrix`, in `frame`, to copy its rows into.
+pub(super) fn bits_for_rows_of<'f>(frame: &'f Frame, matrix: &BitMatrix<'_>) -> BitSet<'f> {
+    Bits::from_words(frame.alloc_slice_fill_with(matrix.row_words(), |_| 0))
+}
+
+/// A copy of `set` in `frame`.
+pub(super) fn bits_copy<'f>(frame: &'f Frame, set: &BitSet<'_>) -> BitSet<'f> {
+    Bits::from_words(frame.alloc_slice_copy(set.words()))
+}
+
+/// An empty matrix of `rows` rows of `columns` bits in `frame`.
+pub(super) fn matrix(frame: &Frame, rows: usize, columns: usize) -> BitMatrix<'_> {
+    let data = frame.alloc_slice_fill_with(rows * words_for(columns), |_| 0);
+    shared::BitMatrix::from_words(rows, columns, data)
+}
+
+/// What a statement does to a set: adds and removes bits, whatever is in it. Applied to a set
+/// as a walk goes, or composed into a block's gen and kill sets
+/// ([`crate::dataflow::GenKill::row`]), from the one function either way.
+pub(super) trait Transfer {
+    fn gen_range(&mut self, range: Range<usize>);
+    fn kill_range(&mut self, range: Range<usize>);
+
+    #[inline]
+    fn gen_(&mut self, bit: usize) {
+        self.gen_range(bit..bit + 1);
+    }
+
+    #[inline]
+    fn kill(&mut self, bit: usize) {
+        self.kill_range(bit..bit + 1);
+    }
+}
+
+impl<S: WordsMut> Transfer for Bits<S> {
+    #[inline]
+    fn gen_range(&mut self, range: Range<usize>) {
+        self.insert_range(range);
+    }
+
+    #[inline]
+    fn kill_range(&mut self, range: Range<usize>) {
+        self.remove_range(range);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Transfer, bits, matrix};
+
+    #[test]
+    fn a_set_and_a_matrix_take_no_global_memory() {
+        blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
+            let _ = bits(frame, 1);
+            let _ = matrix(frame, 1, 1);
+            blaze_alloc_count::assert_at_most(0, "a bitset and a matrix in the frame", || {
+                let mut set = bits(frame, 1000);
+                let mut rows = matrix(frame, 64, 1000);
+                set.gen_range(3..900);
+                rows.insert(63, 999);
+                set.copy_from(&rows.row(63));
+                assert!(set.contains(999) && !set.contains(3));
+            });
+        });
+    }
+}
+```
+
+(The first two allocations warm the frame's reservation, as in B2.1. B2.1's other tests of
+`bitset.rs` are already in `crates/blaze-ids/src/bits/tests.rs`, against the same operations
+over `Vec` words; drop them from this file.)
+
+### 2. Spellings at every call site B2 and B7 write
+
+Apply this rename across `crates/hir-ty-borrowck/src/` (B2's and B7's text uses the left
+column):
+
+| B2/B7 spelling | becomes |
+|---|---|
+| `BitSet::new(frame, n)`, `BitSet::new(ctx.frame, n)` | `bits(frame, n)`, `bits(ctx.frame, n)` |
+| `BitSet::filled(frame, n)` | `filled_bits(frame, n)` |
+| `BitSet::for_rows_of(frame, &m)` | `bits_for_rows_of(frame, &m)` |
+| `a.clone_in(frame)` | `bits_copy(frame, &a)` |
+| `BitMatrix::new(frame, r, c)` (also `self.ctx.frame`) | `matrix(frame, r, c)` |
+| `set.load(m.row(r))` | `set.copy_from(&m.row(r))` (equal lengths, as B2.1 requires) |
+| `set.union(&other)` on a `BitSet` | `set.union_with(&other)` (`IntervalSet::union` is unchanged) |
+| `iter_words(m.row(r))` | `m.iter_row(r)` |
+| `masks(range, ..)` | `range_masks(range, ..)` |
+| `m.row(r)` / `m.row_mut(r)` where a `&[u64]` / `&mut [u64]` is wanted | `m.row(r).words()` / `m.row_mut(r).words_mut()` (they are `BitSlice`/`BitSliceMut` views now) |
+| `BitSet<'f>`, `BitMatrix<'f>`, `BitSet::default()`, `BitMatrix::default()` | unchanged (the aliases; `&mut [u64]` is `Default`) |
+| `insert`, `contains`, `remove`, `clear`, `first_in`, `iter`, `words`, `words_mut` | unchanged |
+
+Imports: `bitset::{...}` lists drop `union_words` and `iter_words`, rename `masks` to
+`range_masks`, and gain whichever of `bits`, `filled_bits`, `bits_for_rows_of`, `bits_copy` and
+`matrix` the file calls.
+
+Two places where the shared type returns a `bool` the old one didn't. A closure or match arm
+that must be `()` gains braces. In `liveness.rs` `maybe_initialized_at_drops`:
+
+```rust
+        locals_in(moves, &state, |local| {
+            exit.insert(index(block), local);
+        });
+```
+
+and the same for `returned.insert(index(block), local)`. In `InitAtExit::restrict`,
+`live.iter_mut().zip(mask)` becomes `live.iter_mut().zip(mask.words())`.
+
+### 3. `crates/hir-ty-borrowck/src/dataflow.rs`: the scratch rows become frame sets
+
+`forward`, from `let mut entry` to the end of the loop (B2.3's text), becomes:
+
+```rust
+    let mut entry = matrix(frame, count, blocks.words * 64);
+    if count == 0 {
+        return entry;
+    }
+    entry.row_mut(index(start)).copy_from(boundary);
+    let mut out = bits(frame, blocks.words * 64);
+    let mut along = bits(frame, blocks.words * 64);
+    let mut queue = WorkQueue::new(frame, count, cfg.order.iter().copied());
+    while let Some(at) = queue.pop() {
+        out.copy_from(&entry.row(index(at)));
+        blocks.apply(index(at), out.words_mut());
+        for &to in cfg.successors(at) {
+            along.copy_from(&out);
+            edge(at, to, along.words_mut());
+            if entry.union_row_with(index(to), &along) {
+                queue.push(to);
+            }
+        }
+    }
+```
+
+`backward`, likewise:
+
+```rust
+    let mut entry = matrix(frame, count, blocks.words * 64);
+    let mut exit = bits(frame, blocks.words * 64);
+    let mut along = bits(frame, blocks.words * 64);
+    let mut queue = WorkQueue::new(frame, count, cfg.order.iter().rev().copied());
+    while let Some(at) = queue.pop() {
+        exit.clear();
+        for &to in cfg.successors(at) {
+            along.copy_from(&entry.row(index(to)));
+            edge(at, to, along.words_mut());
+            exit.union_with(&along);
+        }
+        blocks.apply(index(at), exit.words_mut());
+        if entry.row(index(at)).words() != exit.words() {
+            entry.row_mut(index(at)).copy_from(&exit);
+```
+
+(the predecessor loop after it is unchanged). `WorkQueue::queued` is `bits(frame, blocks)`.
+In the tests, `rows(entry: &crate::bitset::BitMatrix<'_>, ..)` becomes
+`(0..blocks).map(|b| entry.iter_row(b).collect()).collect()`.
+
+### 4. `crates/hir-ty-borrowck/src/liveness.rs` `live_ranges`
+
+B2's `let mut live = BitSet::new(frame, locals);` and its frame `along` slice become:
+
+```rust
+    let mut live = bits(frame, locals);
+    let mut along = bits(frame, locals);
+    for &block in &cfg.order {
+        live.clear();
+        for &successor in cfg.successors(block) {
+            along.copy_from(&entry.row(index(successor)));
+            edge(block, successor, along.words_mut());
+            live.union_with(&along);
+        }
+```
+
+### 5. `crates/hir-ty-borrowck/src/constraints.rs` `from_closure`
+
+B2 keeps it as `FVec<'f, u64>`, growing in the frame. A frame `Vec` isn't a `GrowWords` storage
+(`blaze_ids` has no allocator parameter), so the words stay in the `FVec`, and the bit logic
+goes through a view. In `push`, before:
+
+```rust
+        if it.from_closure {
+            self.from_closure[at / 64] |= 1 << (at % 64);
+        }
+```
+
+After (the `is_multiple_of(64)` push of a zero word before it stays):
+
+```rust
+        BitSliceMut::from_words(&mut self.from_closure[..]).set(at, it.from_closure);
+```
+
+In `get`, before:
+
+```rust
+            from_closure: self.from_closure[at / 64] & (1 << (at % 64)) != 0,
+```
+
+After:
+
+```rust
+            from_closure: BitSlice::from_words(&self.from_closure[..]).contains(at),
+```
+
+with `use blaze_ids::bits::{BitSlice, BitSliceMut};`.
+
+Status: open
+
+## frontend-db: stop every reader through `&Db` (`Database::stop_readers`; 2026-10-29)
+
+Why: `base_db::Db` has no `Clone`, so blaze-engine's three places that cancelled readers by
+writing to the owner of a database fork (`lower_until`, `compile_tiered`, `run_holding`'s detached
+builds, through `Builds::settle`; frontend-db-share's report) need a stop that works while readers
+hold `&Db`. A task's own `CancellationToken` isn't enough: `DisableLocalCancellationGuard` turns
+it off inside every cycle head, and inference and MIR building, which take the time, run there.
+Upstream salsa's pending-write flag was checked at the same point and was never disabled in a
+cycle. This brings it back, set through `&self` and cleared by the next write.
+`tests/parallel/cancellation_in_fixpoint.rs` already shows that a `PendingWrite` thrown inside a
+fixpoint, followed by `trigger_cancellation`, leaves nothing reusable behind. base-db's
+`Db::stop_readers`/`readers_stopped` and `base_db::Shared` (frontend-db, `crates/base-db/src/db/shared.rs`)
+call these two methods and are complete once they exist.
+
+1. `vendor/salsa/src/runtime.rs`, the struct: after `cancellation_count: AtomicU8,` add
+   ```rust
+       /// Set by [`Database::stop_readers`](crate::Database::stop_readers): every query that
+       /// starts from now unwinds with [`Cancelled::PendingWrite`], cycle heads included, until
+       /// the next write clears it. Read on every query call next to `revisions[0]`.
+       #[cfg_attr(feature = "persistence", serde(skip))]
+       readers_stopped: AtomicBool,
+   ```
+   (`AtomicBool` to the `std::sync::atomic` import.) In `Default`: `readers_stopped: Default::default(),`.
+   Methods, after `bump_cancellation_count`:
+   ```rust
+       #[inline]
+       pub(crate) fn readers_stopped(&self) -> bool {
+           self.readers_stopped.load(Ordering::Relaxed)
+       }
+
+       pub(crate) fn stop_readers(&self) {
+           self.readers_stopped.store(true, Ordering::Relaxed);
+       }
+
+       pub(crate) fn clear_stop(&mut self) {
+           *self.readers_stopped.get_mut() = false;
+       }
+   ```
+   `Relaxed` is enough: the flag orders nothing else; the write that follows is ordered by the
+   `&mut` the writer gets only once every reader has let go (an `Arc` count or a scope's join).
+2. `vendor/salsa/src/storage.rs`, `prepare_write`: after `let zalsa = &mut *self.zalsa_impl;` add
+   `zalsa.runtime_mut().clear_stop();`. The epoch bump that follows is what tells apart the
+   provisional memos the stopped readers left behind (as in `cancellation_in_fixpoint.rs`).
+3. `vendor/salsa/src/zalsa.rs`, `unwind_if_revision_cancelled`: before
+   `if zalsa_local.should_trigger_local_cancellation() {` add
+   ```rust
+           if self.runtime.readers_stopped() {
+               Cancelled::PendingWrite.throw();
+           }
+   ```
+   (`use crate::Cancelled;` if not in scope.) Cost on a memo hit: one `Relaxed` load from
+   `Runtime`, which the hit reads anyway for `current_revision`, and a never-taken branch:
+   about 0.3 ns against the hit's 6-8 ns (`docs/v2/plan/lanes/frontend/db.md`, speed of light).
+4. `vendor/salsa/src/database.rs`, after `trigger_cancellation`:
+   ```rust
+       /// Has every query running on this database, on any thread and inside cycles too, unwind
+       /// with [`Cancelled::PendingWrite`] at its next query call, and every query started
+       /// after it as well, until the next write (`&mut`, [`Self::trigger_cancellation`]
+       /// included) clears it. For an owner that must write while other threads read through
+       /// `&Self`: it stops them, waits for them to let go, then writes.
+       fn stop_readers(&self) {
+           self.zalsa().runtime().stop_readers();
+       }
+
+       /// Whether [`Self::stop_readers`] was called since the last write.
+       fn readers_stopped(&self) -> bool {
+           self.zalsa().runtime().readers_stopped()
+       }
+   ```
+   If `Zalsa` has no `runtime()` accessor, add `#[inline] pub(crate) fn runtime(&self) -> &Runtime { &self.runtime }`.
+5. `vendor/salsa/src/cancelled.rs`, the `PendingWrite` doc: replace "Salsa never throws it: a
+   write takes the database by `&mut`, so no query runs during one. Hosts throw it to abandon
+   work for a write they are about to make." with "Thrown at a query call after
+   [`Database::stop_readers`](crate::Database::stop_readers), until the next write; hosts also
+   throw it to abandon work for a write they are about to make."
+6. Test, `vendor/salsa/tests/parallel/stop_readers.rs` (and `mod stop_readers;` in
+   `tests/parallel/main.rs`), next to `cancellation_in_fixpoint.rs` and using its setup:
+   ```rust
+   // Shuttle doesn't like panics inside of its runtime.
+   #![cfg(not(feature = "shuttle"))]
+
+   //! `stop_readers` reaches a query inside a fixpoint cycle, where a task's own token is
+   //! ignored, and the next write clears it, leaving no provisional memo to reuse.
+
+   use std::sync::atomic::{AtomicBool, Ordering};
+
+   use salsa::{Cancelled, Database};
+
+   use crate::setup::{Knobs, KnobsDatabase};
+
+   static STOP: AtomicBool = AtomicBool::new(false);
+
+   #[salsa::input]
+   struct Input {
+       #[returns(copy)]
+       value: u32,
+   }
+
+   #[salsa::tracked(returns(copy), cycle_fn = cycle_fn, cycle_initial = cycle_initial)]
+   fn cycle_a(db: &dyn KnobsDatabase, input: Input) -> u32 {
+       let value = cycle_b(db, input);
+       if STOP.swap(false, Ordering::Relaxed) {
+           db.cancellation_token().cancel();
+           db.stop_readers();
+       }
+       inside(db, input);
+       value
+   }
+
+   #[salsa::tracked(returns(copy), cycle_fn = cycle_fn, cycle_initial = cycle_initial)]
+   fn cycle_b(db: &dyn KnobsDatabase, input: Input) -> u32 {
+       let value = cycle_a(db, input);
+       value.saturating_add(1).min(input.value(db))
+   }
+
+   #[salsa::tracked]
+   fn inside(db: &dyn KnobsDatabase, input: Input) {
+       input.value(db);
+   }
+
+   fn cycle_initial(_db: &dyn KnobsDatabase, _id: salsa::Id, _input: Input) -> u32 {
+       0
+   }
+
+   fn cycle_fn(
+       _db: &dyn KnobsDatabase,
+       _cycle: &salsa::Cycle,
+       _last_provisional_value: &u32,
+       value: u32,
+       _input: Input,
+   ) -> u32 {
+       value
+   }
+
+   #[test]
+   fn stop_readers_unwinds_a_cycle_head_and_a_write_clears_it() {
+       let mut db = Knobs::default();
+       let input = Input::new(&db, 3);
+       STOP.store(true, Ordering::Relaxed);
+       assert!(matches!(Cancelled::catch(|| cycle_a(&db, input)), Err(Cancelled::PendingWrite)));
+       assert!(db.readers_stopped());
+       assert!(matches!(Cancelled::catch(|| inside(&db, input)), Err(Cancelled::PendingWrite)));
+       db.trigger_cancellation();
+       assert!(!db.readers_stopped());
+       assert_eq!(cycle_a(&db, input), 3);
+   }
+   ```
+   The token is cancelled too, to show which of the two stops the cycle: the token alone is
+   disabled there, so a `Cancelled::Local` would mean the guard leaked.
+
+Status: open

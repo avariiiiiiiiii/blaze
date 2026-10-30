@@ -111,22 +111,28 @@ impl Client {
     #[cfg(unix)]
     pub fn unix(path: &Path) -> Result<Client, ClientError> {
         let stream = std::os::unix::net::UnixStream::connect(path)
+            // alloc: error path, a connect that failed.
             .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", path.display())))?;
         Ok(Client::over(Link::Unix(stream)))
     }
 
     pub fn http(at: SocketAddr, token: String) -> Result<Client, ClientError> {
         let stream = TcpStream::connect(at)
+            // alloc: error path, a connect that failed.
             .map_err(|error| io::Error::new(error.kind(), format!("{at}: {error}")))?;
         stream.set_nodelay(true)?;
         Ok(Client::over(Link::Http(HttpLink {
             stream,
+            // alloc: once per connection, as are the next four.
             host: at.to_string(),
+            // alloc: once per connection.
             authorization: format!("Bearer {token}"),
             response: None,
             checked: false,
             waiting: None,
+            // alloc: none until a response reads past its end.
             rest: Vec::new(),
+            // alloc: once per connection, every read's.
             buffer: vec![0; RECEIVE],
         })))
     }
@@ -138,7 +144,9 @@ impl Client {
             next_id: 1,
             kept: VecDeque::new(),
             writer: cbor::Writer::new(),
+            // alloc: none until the first send; kept for every one after.
             out: Vec::new(),
+            // alloc: as `out`.
             head: Vec::new(),
         }
     }
@@ -161,10 +169,12 @@ impl Client {
             }
             Link::Http(link) => {
                 self.writer.append(&mut self.out, &envelope).map_err(|error| {
+                    // alloc: error path, a request serde refused.
                     ClientError::Refused(ApiError::new(format!("a request with no encoding: {error}"), None))
                 })?;
                 let item = self.out.as_slice();
                 if item.len() > LONGEST_REQUEST as usize {
+                    // alloc: error path, a request too long.
                     let said = format!("a request of {} bytes, longer than {LONGEST_REQUEST}", item.len());
                     return Err(ClientError::Refused(ApiError::new(said, None)));
                 }
@@ -228,6 +238,7 @@ impl Client {
     pub fn until_hung_up(&mut self, patience: std::time::Duration) -> Result<(), ClientError> {
         let deadline = std::time::Instant::now() + patience;
         let waited = || {
+            // alloc: error path, called only once the wait is over.
             let said = format!("the daemon still holds the connection after {} ms", patience.as_millis());
             ClientError::Io(io::Error::new(io::ErrorKind::TimedOut, said))
         };
@@ -237,6 +248,7 @@ impl Client {
             }
             let Link::Unix(stream) = &mut self.link else {
                 let said = "a wait for the daemon to hang up is the Unix socket's: HTTP keeps no connection open for it";
+                // alloc: error path, a wait over HTTP.
                 return Err(ClientError::Refused(ApiError::new(said.to_owned(), None)));
             };
             let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -321,6 +333,7 @@ impl Client {
             link.response = None;
             link.rest = rest;
             if let Some(id) = link.waiting.take() {
+                // alloc: error path, an answer cut short.
                 let said = format!("the daemon's answer to request {id} ended before its Done");
                 return Err(ClientError::Refused(ApiError::new(said, Some(url(&link.host)))));
             }
@@ -346,12 +359,15 @@ impl Client {
                 link.rest = response.rest();
                 link.response = None;
                 link.waiting = None;
+                // alloc: error path, an HTTP error's body, once per error.
                 let body = String::from_utf8_lossy(&body);
+                // alloc: error path, as above.
                 let said = format!("HTTP {status}: {}", body.trim());
                 return Err(ClientError::Refused(ApiError::new(said, Some(url(&link.host)))));
             }
             let kind = http_header(headers, "Content-Type").unwrap_or_default();
             if !kind.eq_ignore_ascii_case("application/cbor") {
+                // alloc: error path, an answer that is not CBOR.
                 let said = format!("an answer of Content-Type {kind:?}, not application/cbor");
                 return Err(ClientError::Refused(ApiError::new(said, Some(url(&link.host)))));
             }
@@ -366,6 +382,7 @@ fn http_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a st
 }
 
 fn url(host: &str) -> String {
+    // alloc: error path: an error's `at`, made only for errors.
     format!("http://{host}/api")
 }
 

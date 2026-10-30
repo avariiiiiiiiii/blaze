@@ -8,6 +8,7 @@
 //! module read through [`decl_row`] (`nameres-core.md` §3, "Round 0 reads").
 
 use base_db::{BuiltDependency, Crate, CrateOrigin, Db, LangCrateOrigin};
+use blaze_mem::Tag;
 use cfg::CfgExpr;
 use either::Either;
 use hir_expand::{
@@ -214,7 +215,7 @@ pub(crate) fn root_decl(
     // The def maps are collected as one batch of the database's tasks, then put in the extern
     // prelude in the order of the dependencies.
     if prelude.len() > 1 {
-        db.run_all(prelude.len(), |db, at| {
+        db.run_all(Tag::Nameres, prelude.len(), |db, at| {
             crate_def_map(db, prelude[at].1);
         });
     }
@@ -291,7 +292,7 @@ pub(crate) fn expand_all(
     calls: &[MacroCallId],
 ) {
     if calls.len() > 1 {
-        db.run_all(calls.len(), |db, at| {
+        db.run_all(Tag::Expand, calls.len(), |db, at| {
             file_item_tree(db, calls[at].into(), krate);
         });
     }
@@ -638,12 +639,18 @@ impl<'a, 'db> DeclSink<'a, 'db> {
         let decl = self.decl;
         let row = self.def_map.module(db, decl.module);
         let scope = row.scope(db);
-        let modules = scope
-            .types()
-            .filter(|(_, it)| matches!(it.def, ModuleDefId::ModuleId(_)))
-            .map(|(name, it)| (*name, PerNs { types: Some(it), values: None, macros: None }))
-            // alloc: a child's env holds its ancestors' module bindings, once per child module
-            .collect();
+        let is_module = |it: &(&Name, Item<ModuleDefId, ImportOrExternCrate>)| {
+            matches!(it.1.def, ModuleDefId::ModuleId(_))
+        };
+        let mut modules = Vec::with_capacity(scope.types().filter(is_module).count());
+        modules.extend(
+            scope
+                .types()
+                .filter(is_module)
+                .map(|(name, it)| (*name, PerNs { types: Some(it), values: None, macros: None })),
+        );
+        // Exact: filled to its capacity, so the box takes the vector's allocation.
+        let modules = modules.into_boxed_slice();
         // alloc: as above, the parent's children so far
         let children = row.children(db).iter().map(|(name, module)| (*name, *module)).collect();
         let mut ancestors = Vec::with_capacity(1 + self.env.ancestors.len());
@@ -667,12 +674,7 @@ impl<'a, 'db> DeclSink<'a, 'db> {
     fn finish(self, side: SideTables) -> ModuleDecls {
         let db = self.cx.db;
         let row = self.def_map.module(db, self.decl.module);
-        let legacy = row
-            .scope(db)
-            .legacy_macros()
-            .map(|(name, macs)| (*name, Box::from(macs)))
-            // alloc: the module's textual scope, the value `legacy_exports` reads
-            .collect();
+        let legacy = textual_scope(row.scope(db));
         #[cfg(test)]
         {
             let crate::nameres::ScopeSlot::Building(held) = &row.scope else {
@@ -683,7 +685,9 @@ impl<'a, 'db> DeclSink<'a, 'db> {
         }
         let mut ops = self.log;
         ops.shrink_to_fit();
-        ModuleDecls { ops, children: self.children.into_boxed_slice(), legacy, side }
+        let children = self.children.into_boxed_slice();
+        // alloc: one per module, the tables its first macro step starts from
+        ModuleDecls { ops, children, legacy, side: Arc::new(side) }
     }
 }
 
@@ -812,6 +816,15 @@ pub(crate) fn decl_row(
         parent: found_decl.parent,
         scope: queries::fact_slot(db, Scope::Decl(found)),
     })
+}
+
+/// `scope`'s textual (`macro_rules!`) scope, every definition of each name, at exact size: a
+/// module's `legacy` and the scope a child starts with.
+fn textual_scope(scope: &ItemScope) -> Inherited {
+    let mut out = Vec::with_capacity(scope.legacy_macros().count());
+    // alloc: one exact box per name, the result's own
+    out.extend(scope.legacy_macros().map(|(name, macs)| (*name, Box::from(macs))));
+    out.into_boxed_slice()
 }
 
 /// An ancestor's row: its module bindings and children, as the chain toward the key's module
@@ -1684,15 +1697,7 @@ impl<'db, S: Sink<'db>> ModCollector<'_, 'db, S> {
             )
             .to_static()
         };
-        let inherited: Inherited = self
-            .sink
-            .def_map()
-            .module(db, self.module_id)
-            .scope(db)
-            .legacy_macros()
-            .map(|(name, macs)| (*name, Box::from(macs)))
-            // alloc: the child's textual scope as declared, once per child module
-            .collect();
+        let inherited = textual_scope(self.sink.def_map().module(db, self.module_id).scope(db));
         let parent = self.module_id;
         self.sink.apply(DeclOp::PushChild { parent, name, child: module });
 

@@ -271,7 +271,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 shadow.put(layout.fields.offset(i).bytes_usize(), it);
             }
         }
-        let fields = fields.into_iter().map(|(bytes, _)| IntervalOrOwned::Owned(bytes));
+        let fields = fields
+            .into_iter()
+            .map(|(bytes, _)| IntervalOrOwned::Owned(OwnedBytes::from_vec(bytes)));
         let bytes = self.construct_with_layout(size, layout, tag, fields)?;
         Ok((bytes, shadow))
     }

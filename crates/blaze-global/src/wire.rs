@@ -28,6 +28,7 @@
 use std::collections::VecDeque;
 
 use blaze_cas::Key;
+use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_ids::ContentId;
 
 use crate::{
@@ -78,90 +79,59 @@ const SEEN: u8 = 1;
 const PIECE_DOMAIN: &str = "blaze v2 global piece 1";
 
 pub(crate) fn header(magic: &[u8; 6], out: &mut Vec<u8>) {
-    out.extend_from_slice(magic);
-    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.put_bytes(magic);
+    out.put_u16(VERSION);
 }
 
-/// Bytes read in place, every read checked against what is left.
-pub(crate) struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
+/// A read past the end of a body, in the words the wire's errors use.
+pub(crate) fn truncated(error: cursor::Error) -> String {
+    // alloc: an error path.
+    format!("truncated: {error}")
 }
 
-impl<'a> Reader<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Reader<'a> {
-        Reader { bytes, at: 0 }
-    }
-
-    pub(crate) fn left(&self) -> usize {
-        self.bytes.len() - self.at
-    }
-
-    pub(crate) fn take(&mut self, len: usize, what: &str) -> Result<&'a [u8], String> {
-        let left = self.left();
-        if left < len {
-            return Err(format!("truncated: {what} needs {len} bytes at offset {}, {left} are left", self.at));
-        }
-        let taken = &self.bytes[self.at..self.at + len];
-        self.at += len;
-        Ok(taken)
-    }
-
-    pub(crate) fn array<const N: usize>(&mut self, what: &str) -> Result<&'a [u8; N], String> {
-        Ok(self.take(N, what)?.try_into().expect("N bytes"))
-    }
-
-    pub(crate) fn u8(&mut self, what: &str) -> Result<u8, String> {
-        Ok(self.take(1, what)?[0])
-    }
-
-    pub(crate) fn u16(&mut self, what: &str) -> Result<u16, String> {
-        Ok(u16::from_le_bytes(*self.array(what)?))
-    }
-
-    pub(crate) fn u32(&mut self, what: &str) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(*self.array(what)?))
-    }
-
-    pub(crate) fn u64(&mut self, what: &str) -> Result<u64, String> {
-        Ok(u64::from_le_bytes(*self.array(what)?))
-    }
-
-    pub(crate) fn key(&mut self, what: &str) -> Result<Key, String> {
-        Ok(Key(ContentId(*self.array(what)?)))
-    }
-
-    pub(crate) fn signed(&mut self) -> Result<Signed, String> {
-        Signed::decode(self.array::<SIGNED_LEN>("a signed record")?)
-    }
-
+/// The wire's own fields, read with the byte cursor.
+pub(crate) trait Fields {
+    fn key(&mut self) -> Result<Key, String>;
+    fn signed(&mut self) -> Result<Signed, String>;
     /// The magic and version a body starts with.
-    pub(crate) fn header(&mut self, magic: &[u8; 6], what: &str) -> Result<(), String> {
-        let found = self.take(6, "the magic")?;
+    fn header(&mut self, magic: &[u8; 6], what: &str) -> Result<(), String>;
+    /// A `u32` count of at most `most` items of at least `each` bytes, checked against what is
+    /// left before anything is allocated for them.
+    fn count(&mut self, each: usize, most: usize, what: &str) -> Result<usize, String>;
+    fn end(&self, what: &str) -> Result<(), String>;
+}
+
+impl Fields for Reader<'_> {
+    fn key(&mut self) -> Result<Key, String> {
+        Ok(Key(ContentId(*self.array().map_err(truncated)?)))
+    }
+
+    fn signed(&mut self) -> Result<Signed, String> {
+        Signed::decode(self.array::<SIGNED_LEN>().map_err(truncated)?)
+    }
+
+    fn header(&mut self, magic: &[u8; 6], what: &str) -> Result<(), String> {
+        let found = self.array::<6>().map_err(truncated)?;
         if found != magic {
             return Err(format!("not {what}: its magic is {:?}", found.escape_ascii().to_string()));
         }
-        let version = self.u16("the version")?;
+        let version = self.u16().map_err(truncated)?;
         if version != VERSION {
             return Err(format!("{what} of version {version}; this blaze speaks version {VERSION}"));
         }
         Ok(())
     }
 
-    /// A count of items of at least `each` bytes, checked against what is left before
-    /// anything is allocated for them.
-    pub(crate) fn count(&mut self, each: usize, most: usize, what: &str) -> Result<usize, String> {
-        let count = self.u32(what)? as usize;
+    fn count(&mut self, each: usize, most: usize, what: &str) -> Result<usize, String> {
+        let mut peek = *self;
+        let count = peek.u32().map_err(truncated)? as usize;
         if count > most {
             return Err(format!("{count} {what}, more than the {most} allowed"));
         }
-        if count.saturating_mul(each) > self.left() {
-            return Err(format!("truncated: {count} {what} need at least {} bytes, {} are left", count * each, self.left()));
-        }
-        Ok(count)
+        self.count_u32(each).map_err(truncated)
     }
 
-    pub(crate) fn end(&self, what: &str) -> Result<(), String> {
+    fn end(&self, what: &str) -> Result<(), String> {
         match self.left() {
             0 => Ok(()),
             left => Err(format!("{left} trailing bytes after {what}")),
@@ -193,18 +163,17 @@ impl SendWindow {
     /// `value` as its pieces: each one held a reference, the rest their bytes, then held.
     pub(crate) fn write(&mut self, value: &[u8], out: &mut Vec<u8>) {
         let pieces = pieces(value);
-        out.extend_from_slice(&(pieces.len() as u32).to_le_bytes());
+        out.put_u32(pieces.len() as u32);
         for range in pieces {
             let piece = &value[range];
             let hash = ContentId::of(PIECE_DOMAIN, piece);
             if let Some(&seq) = self.by_hash.get(&hash) {
-                out.push(SEEN);
-                out.extend_from_slice(&seq.to_le_bytes());
+                out.put_u8(SEEN);
+                out.put_u64(seq);
                 continue;
             }
-            out.push(NEW);
-            out.extend_from_slice(&(piece.len() as u32).to_le_bytes());
-            out.extend_from_slice(piece);
+            out.put_u8(NEW);
+            out.put_bytes_u32(piece);
             let seq = self.first + self.held.len() as u64;
             self.by_hash.insert(hash, seq);
             self.held.push_back((hash, piece.len() as u32));
@@ -242,18 +211,18 @@ impl RecvWindow {
         let mut value = keep.then(|| Vec::with_capacity(len as usize));
         let mut total = 0u64;
         for _ in 0..count {
-            let piece: &[u8] = match reader.u8("a piece")? {
+            let piece: &[u8] = match reader.u8().map_err(truncated)? {
                 NEW => {
-                    let n = reader.u32("a piece's length")? as usize;
+                    let n = reader.u32().map_err(truncated)? as usize;
                     if n == 0 || n > PIECE_MOST {
                         return Err(format!("a piece of {n} bytes (1 to {PIECE_MOST} are allowed)"));
                     }
-                    let bytes = reader.take(n, "a piece")?;
+                    let bytes = reader.take(n).map_err(truncated)?;
                     self.hold(bytes);
                     bytes
                 }
                 SEEN => {
-                    let seq = reader.u64("a piece's number")?;
+                    let seq = reader.u64().map_err(truncated)?;
                     let at = seq.checked_sub(self.first).filter(|at| *at < self.held.len() as u64).ok_or_else(|| {
                         format!(
                             "a reference to piece {seq}, outside the {} to {} this side holds",
@@ -294,9 +263,9 @@ impl RecvWindow {
 pub(crate) fn fetch_ask(keys: &[Key], out: &mut Vec<u8>) {
     out.reserve(12 + 32 * keys.len());
     header(FETCH_ASK, out);
-    out.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    out.put_u32(keys.len() as u32);
     for key in keys {
-        out.extend_from_slice(&key.0.0);
+        out.put_bytes(&key.0.0);
     }
 }
 
@@ -306,7 +275,7 @@ pub(crate) fn parse_fetch_ask(body: &[u8]) -> Result<Vec<Key>, String> {
     let count = reader.count(32, BATCH_MOST, "keys")?;
     let mut keys = Vec::with_capacity(count);
     for _ in 0..count {
-        keys.push(reader.key("a key")?);
+        keys.push(reader.key()?);
     }
     reader.end("a fetch")?;
     Ok(keys)
@@ -317,16 +286,16 @@ pub(crate) fn reason(why: &str, out: &mut Vec<u8>) {
     while !why.is_char_boundary(end) {
         end -= 1;
     }
-    out.extend_from_slice(&(end as u16).to_le_bytes());
-    out.extend_from_slice(&why.as_bytes()[..end]);
+    out.put_u16(end as u16);
+    out.put_bytes(&why.as_bytes()[..end]);
 }
 
 pub(crate) fn read_reason(reader: &mut Reader<'_>) -> Result<String, String> {
-    let len = reader.u16("a reason's length")? as usize;
+    let len = reader.u16().map_err(truncated)? as usize;
     if len > REASON_MOST {
         return Err(format!("a reason of {len} bytes, more than the {REASON_MOST} allowed"));
     }
-    let bytes = reader.take(len, "a reason")?;
+    let bytes = reader.take(len).map_err(truncated)?;
     String::from_utf8(bytes.to_vec()).map_err(|_| "a reason that is not UTF-8".to_owned())
 }
 
@@ -337,8 +306,8 @@ pub(crate) fn parse_publish_answer(body: &[u8], most: usize) -> Result<Vec<(Key,
     let count = reader.count(33, most, "statuses")?;
     let mut out = Vec::with_capacity(count);
     for _ in 0..count {
-        let key = reader.key("a key")?;
-        let status = match reader.u8("a status")? {
+        let key = reader.key()?;
+        let status = match reader.u8().map_err(truncated)? {
             KEPT => Ok(()),
             REFUSED => Err(read_reason(&mut reader)?),
             other => return Err(format!("an unknown status {other} (0 is kept, 1 refused)")),
@@ -351,13 +320,13 @@ pub(crate) fn parse_publish_answer(body: &[u8], most: usize) -> Result<Vec<(Key,
 
 pub(crate) fn publish_answer(statuses: &[(Key, Result<(), String>)], out: &mut Vec<u8>) {
     header(PUBLISH_ANSWER, out);
-    out.extend_from_slice(&(statuses.len() as u32).to_le_bytes());
+    out.put_u32(statuses.len() as u32);
     for (key, status) in statuses {
-        out.extend_from_slice(&key.0.0);
+        out.put_bytes(&key.0.0);
         match status {
-            Ok(()) => out.push(KEPT),
+            Ok(()) => out.put_u8(KEPT),
             Err(why) => {
-                out.push(REFUSED);
+                out.put_u8(REFUSED);
                 reason(why, out);
             }
         }

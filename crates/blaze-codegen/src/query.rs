@@ -40,11 +40,11 @@ pub mod keys {
     }
 
     pub fn template(instance: &InstanceKey) -> Key {
-        key("blaze v2 store template 1", &[&instance.0])
+        key("blaze v2 store template 2", &[&instance.0])
     }
 
     pub fn release(blob: &ContentId) -> Key {
-        key("blaze v2 store release template 1", &[blob])
+        key("blaze v2 store release template 2", &[blob])
     }
 
     pub fn summary(instance: &InstanceKey) -> Key {
@@ -56,15 +56,15 @@ pub mod keys {
     }
 
     pub fn folded(group: &InstanceKey) -> Key {
-        key("blaze v2 store folded 1", &[&group.0])
+        key("blaze v2 store folded 2", &[&group.0])
     }
 
     pub fn thunk(group: &InstanceKey, member: &InstanceKey) -> Key {
-        key("blaze v2 store thunk 1", &[&group.0, &member.0])
+        key("blaze v2 store thunk 2", &[&group.0, &member.0])
     }
 
     pub fn static_value(value: &ContentId, settings: &Settings) -> Key {
-        key("blaze v2 store static 1", &[value, &settings.0])
+        key("blaze v2 store static 2", &[value, &settings.0])
     }
 
     pub fn side(id: &ContentId) -> Key {

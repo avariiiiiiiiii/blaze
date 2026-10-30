@@ -894,3 +894,174 @@ impl Plain {
         format!("{word} {}{count} ({took})\n", step.what())
     }
 }
+
+// The last lines and `blaze why`'s steps as they were before each was written in place: a
+// `String` per piece, joined.
+
+pub fn tail(text: &str, most: usize) -> String {
+    let count = text.chars().count();
+    match count > most {
+        true => ['\u{2026}'].into_iter().chain(text.chars().skip(count + 1 - most)).collect(),
+        false => text.to_owned(),
+    }
+}
+
+fn short(step: Step, of: Option<&str>) -> String {
+    match of {
+        None => label(step).to_owned(),
+        Some(of) => match of.strip_prefix("the standard library ") {
+            Some(rest) => format!("{} {rest}", label(step)),
+            None => format!("{} {of}", label(step)),
+        },
+    }
+}
+
+fn causes(rebuilt: &[(String, blaze_protocol::events::Cause)]) -> String {
+    let mut said = String::new();
+    for (at, (name, cause)) in rebuilt.iter().enumerate() {
+        if at > 0 {
+            said.push_str(", ");
+        }
+        said.push_str(name);
+        if rebuilt.get(at + 1).is_none_or(|next| next.1 != *cause) {
+            said.push_str(&format!(" ({})", cause.short()));
+        }
+    }
+    said
+}
+
+pub fn why_steps(build: &crate::Build, now_ns: u64) -> Vec<String> {
+    const GAP_NS: u64 = 50_000_000;
+    const STEP_NS: u64 = 10_000_000;
+    let cores = |from: u64, to: u64| match build.busy_between(from, to) {
+        Some((busy, _)) => format!("  {busy:.1}/{} cores", build.cores_of),
+        None => String::new(),
+    };
+    let mut rows: Vec<(String, u64, String)> = Vec::new();
+    let mut free = 0;
+    for stepped in &build.steps {
+        if stepped.began_ns.saturating_sub(free) >= GAP_NS {
+            let gap = stepped.began_ns - free;
+            rows.push(("at no step".into(), gap, cores(free, stepped.began_ns)));
+        }
+        let ended = stepped.ended_ns.unwrap_or(now_ns);
+        free = free.max(ended);
+        let took_ns = ended.saturating_sub(stepped.began_ns);
+        if took_ns < STEP_NS {
+            continue;
+        }
+        let mut what = short(stepped.step, stepped.of.as_deref());
+        let of = stepped.of.as_deref().and_then(|it| it.rsplit(' ').next());
+        if let Some(count) = stepped.count().filter(|it| it.rsplit(' ').next() != of) {
+            what = format!("{what} {count}");
+        }
+        rows.push((what, took_ns, cores(stepped.began_ns, ended)));
+    }
+    if !rows.is_empty() && now_ns.saturating_sub(free) >= GAP_NS {
+        rows.push(("at no step".into(), now_ns - free, cores(free, now_ns)));
+    }
+    let width = rows.iter().map(|it| it.0.chars().count()).max().unwrap_or(0);
+    rows.iter()
+        .map(|(what, ns, cores)| format!("{what:<width$}  {:>6}{cores}", took(*ns)))
+        .collect()
+}
+
+pub fn why_lines(finished: &Finished, color: bool) -> Vec<String> {
+    let summary = &finished.summary;
+    let took_ns = crate::took_ns(finished);
+    if took_ns < crate::WHY_NS || !finished.ok {
+        return Vec::new();
+    }
+    let status =
+        |word: &str, rest: &str| format!("{} {rest}", paint(GREEN, &format!("{word:>12}"), color));
+    let mut lines = Vec::new();
+    if !summary.slowest.is_empty() {
+        let steps: Vec<String> = summary
+            .slowest
+            .iter()
+            .enumerate()
+            .map(|(at, it)| {
+                let cores = match finished.cores.get(at).copied().flatten() {
+                    Some(busy) if at == 0 => format!(" ({busy:.1}/{} cores)", finished.cores_of),
+                    Some(busy) => format!(" ({busy:.1}/{})", finished.cores_of),
+                    None => String::new(),
+                };
+                format!("{} {}{cores}", short(it.step, it.of.as_deref()), took(it.took_ns))
+            })
+            .collect();
+        lines.push(status("Took", &format!("{}: {}", took(took_ns), steps.join(", "))));
+    }
+    if !finished.slowest.is_empty() {
+        const LISTED: usize = 5;
+        let listed = finished.slowest.iter().take(LISTED);
+        let listed: Vec<String> =
+            listed.map(|it| format!("{} {}", tail(&it.name, 48), took(it.ns))).collect();
+        let more = match finished.slowest.len().saturating_sub(LISTED) {
+            0 => String::new(),
+            more => format!(" (and {more} more)"),
+        };
+        lines.push(status("Slowest", &format!("fns: {}{more}", listed.join(", "))));
+    }
+    if let Some(cache) = &summary.cache {
+        let rest = match &cache.cold {
+            Some(why) => Some(format!("cold: {why}")),
+            None if cache.fetched > 0 => Some(format!(
+                "{} found here, {} fetched from the remote store",
+                cache.found, cache.fetched
+            )),
+            None => None,
+        };
+        lines.extend(rest.map(|rest| status("Cache", &rest)));
+    }
+    if finished.chain.len() > 1 && finished.chain_ns > 0 {
+        let chain = finished.chain.join(" \u{2192} ");
+        lines.push(status("Chain", &format!("{chain} {}", took(finished.chain_ns))));
+    }
+    if let Some(unnamed) = finished.unnamed.filter(|it| it.took_ns >= crate::UNNAMED_NS) {
+        let after = unnamed.after.whole();
+        let rest = format!("{} with no step named, after {after}", took(unnamed.took_ns));
+        lines.push(said_line(Level::Warning, &rest, color));
+    }
+    if !lines.is_empty() {
+        lines.push(paint(DIM, &format!("{:>12} `blaze why` says more", ""), color));
+    }
+    lines
+}
+
+pub fn summary_line(finished: &Finished, color: bool) -> String {
+    let summary = &finished.summary;
+    let took = took(crate::took_ns(finished));
+    if !finished.ok {
+        let why = summary.error.as_deref().unwrap_or("the build failed");
+        return format!("{}: {why} (after {took})", paint(RED, "error", color));
+    }
+    let compiled = summary.fns.compiled();
+    let (word, what) = if !summary.rebuilt.is_empty() {
+        let listed = summary.rebuilt.len() as u64 + summary.more;
+        let mut said = format!("{listed} {}: {}", plural(listed, "fn"), causes(&summary.rebuilt));
+        if summary.more > 0 {
+            said.push_str(&format!(" and {} more", summary.more));
+        }
+        ("Rebuilt", said)
+    } else if compiled > 0 {
+        let kept = summary.fns.kept;
+        let crates = summary.crates;
+        let said = format!(
+            "{compiled} {} in {crates} {}, {kept} kept",
+            plural(compiled, "fn"),
+            plural(crates, "crate")
+        );
+        ("Compiled", said)
+    } else if let Some(cache) = summary.cache.as_ref().filter(|it| it.found + it.fetched > 0) {
+        let found = cache.found + cache.fetched;
+        let said = format!(
+            "from the store: {found} {} found, {} compiled",
+            plural(found, "fn"),
+            cache.compiled
+        );
+        ("Built", said)
+    } else {
+        ("Fresh", "nothing to rebuild".to_owned())
+    };
+    format!("{} {what}; {took}", paint(GREEN, &format!("{word:>12}"), color))
+}

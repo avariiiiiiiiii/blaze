@@ -23,16 +23,13 @@ use syntax::{AstNode, SyntaxNodePtr, TextRange, ast};
 
 use crate::{
     cx::Cx,
-    lints::bodies::{BodyCx, Hooks, LatePass},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
 
-pub(super) fn pass() -> Box<dyn LatePass> {
-    Box::new(AsmLabels { arch: None })
-}
-
-struct AsmLabels {
+#[derive(Default)]
+pub(crate) struct AsmLabels {
     /// The crate's asm arch, once an `asm!` asked for it.
     arch: Option<Option<Arch>>,
 }
@@ -63,13 +60,8 @@ fn asm_arch(cx: &Cx<'_, '_>) -> Option<Arch> {
 }
 
 impl LatePass for AsmLabels {
-    fn name(&self) -> &'static str {
-        "AsmLabels"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["named_asm_labels", "binary_asm_labels"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::InlineAsm]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::InlineAsm(asm) = b.store().expr(expr) else { return };

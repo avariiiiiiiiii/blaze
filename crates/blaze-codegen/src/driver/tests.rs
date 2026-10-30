@@ -141,14 +141,14 @@ impl Prepare for Machine {
     fn prepare(
         &self,
         program: &Program,
-        _: &Unit,
+        unit: &Unit,
         _: &Spec,
         id: &u32,
         refs: &crate::template::Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
         self.prepared.fetch_add(1, Ordering::Relaxed);
         let prepared = Prepared { body: program.functions[id].body, refs: refs.len() };
-        Ok((Shape(code(&prepared)), prepared))
+        Ok((Shape::of(unit, &code(&prepared)), prepared))
     }
 
     fn summarize(
@@ -192,8 +192,8 @@ impl Prepare for Machine {
         imports: Option<(&Imports, &[Import<'_, u8>])>,
     ) -> Result<Emitted, CodegenError> {
         self.emitted.fetch_add(1, Ordering::Relaxed);
-        let mut relocs: Vec<Reloc> = (0..prepared.refs)
-            .map(|at| Reloc {
+        let mut relocs: Vec<crate::Relocation> = (0..prepared.refs)
+            .map(|at| crate::Relocation {
                 at: 2 + 5 * at as u32,
                 kind: RelocKind::PcRel32,
                 target: refs[at].clone(),
@@ -203,7 +203,7 @@ impl Prepare for Machine {
         // A release compile calls `bcmp` of its own accord, as LLVM does for a `memcmp`.
         let mut extra = Vec::new();
         if imports.is_some() {
-            relocs.push(Reloc { at: 0, kind: RelocKind::PcRel32, target: bcmp(), addend: -4 });
+            relocs.push(crate::Relocation { at: 0, kind: RelocKind::PcRel32, target: bcmp(), addend: -4 });
             extra.push("bcmp".to_owned());
         }
         let mut code = code(&prepared);
@@ -216,7 +216,7 @@ impl Prepare for Machine {
             arch: unit.arch,
             align: 16,
             code,
-            relocs,
+            relocs: relocs.into(),
             data: Vec::new(),
             inlined: Vec::new(),
             side: None,
@@ -252,7 +252,7 @@ impl Prepare for Machine {
             item: static_item(*id),
             instance: ContentId::default(),
             align: 8,
-            init: Init::Bytes { bytes: vec![*value; 8], relocs: Vec::new() },
+            init: Init::Bytes { bytes: vec![*value; 8], relocs: crate::Relocs::new() },
             data: Vec::new(),
             mutable: false,
             thread_local: false,
@@ -265,8 +265,8 @@ impl Prepare for Machine {
 struct Store(BTreeMap<Key, Vec<u8>>);
 
 impl Lookup for Store {
-    fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, String> {
-        Ok(self.0.get(key).cloned())
+    fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
+        Ok(self.0.get(key).map(Vec::as_slice))
     }
 }
 
@@ -372,9 +372,9 @@ fn a_callee_edit_renames_its_callers_and_compiles_only_it() {
     let (old, new) = (key_of(&before, 0x44), key_of(&after, 0x45));
     assert_ne!(old, new);
     // 2 is the same template; its call now names the new 4.
-    let caller = after.functions.iter().find(|it| it.relocs.iter().any(|r| r.target == Target::Direct(new)));
+    let caller = after.functions.iter().find(|it| it.relocs.targets().contains(&Target::Direct(new)));
     assert!(caller.is_some_and(|it| it.code[0] == 0x22));
-    assert!(after.functions.iter().all(|it| it.relocs.iter().all(|r| r.target != Target::Direct(old))));
+    assert!(after.functions.iter().all(|it| !it.relocs.targets().contains(&Target::Direct(old))));
 }
 
 #[test]
@@ -445,7 +445,7 @@ fn a_release_build_summarizes_decides_and_keeps_by_imports() {
     assert_eq!(cold.functions.len(), 5);
     assert!(cold.functions.iter().all(|it| it.arch == Arch::X86_64));
     // What the backend called of its own accord is kept by name, though no reference lists it.
-    assert!(cold.functions.iter().all(|it| it.relocs.iter().any(|r| r.target == bcmp())));
+    assert!(cold.functions.iter().all(|it| it.relocs.targets().contains(&bcmp())));
     store.keep(&cold.puts);
 
     let warm = Machine::default();
@@ -471,7 +471,7 @@ fn a_live_build_starts_at_cranelift_and_tiers_up() {
     assert_eq!(built.tiered.len(), 1);
     // Members and the tiered function are reached through their slots.
     let tiered = built.tiered[0];
-    assert!(built.functions.iter().any(|it| it.relocs.iter().any(|r| r.target == Target::Function(tiered))));
+    assert!(built.functions.iter().any(|it| it.relocs.targets().contains(&Target::Function(tiered))));
     assert_eq!(machine.summarized.load(Ordering::Relaxed), 0);
     let up = build.tier_up(&Store::default()).unwrap();
     assert_eq!(up.replaced.len(), 1);

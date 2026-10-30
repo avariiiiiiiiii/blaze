@@ -440,7 +440,7 @@ pub struct ProvenanceSplit {
     pub lifetimes: usize,
 }
 
-fn parent_generic_def(db: &Db, def: GenericDefId) -> Option<GenericDefId> {
+pub(crate) fn parent_generic_def(db: &Db, def: GenericDefId) -> Option<GenericDefId> {
     let container = match def {
         GenericDefId::FunctionId(it) => it.lookup(db).container,
         GenericDefId::TypeAliasId(it) => it.lookup(db).container,

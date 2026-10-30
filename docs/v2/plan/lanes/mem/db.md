@@ -41,6 +41,14 @@ Every change in every part programs against these, so the pieces fit.
    (`HashMap::with_hasher_in(FxBuildHasher, frame)`; root request 3 turns on hashbrown's
    `nightly` feature, which makes its `A` parameter `core::alloc::Allocator`). A crate that
    names `Vec<T, A>` adds `#![feature(allocator_api)]`.
+   The one exception is a context made and dropped many times within one run, such as the trait
+   solver's `InferCtxt` per canonical goal (thousands per `infer`) and its search graph's
+   storage. Code holding `&Frame` can't roll back, so those would pile up in the frame until the
+   run ends. They take storage the worker keeps instead, emptied with its capacity kept and
+   given back when the context ends, as upstream's `obtain_canonicalizer_state` does
+   (`v2/requests/mem-db-solver.md`, "The one design decision").
+   Nested runs each have a frame of their own. Sharing one frame through markers would be
+   unsound (`v2/requests/mem-db.md` request 10, which asks lane mem to make deep nesting cheap).
 3. **The tag is the query's subsystem** (`blaze_mem::Tag`): base-db's file and parse inputs
    `Parse`; hir-expand `Expand`; hir-def's name resolution, scopes, signatures and body
    lowering `Nameres`, its item tree `Parse`; hir-ty's inference, lowering, method resolution,

@@ -73,6 +73,13 @@ Mem's choice; format-lexer moves the columns as soon as either one exists.
 
 > forwarded to mem (running; told by tmux).
 
+> done by mem (2026-10-29), the first design: `scratch::lend_u32s() -> Lent<Vec<u32>>` (and
+> `lend_bytes`, `lend_u64s`, `lend_string`, `lend_path`). It gives out the calling thread's
+> buffer, empty. It is `Send` and derefs to `Vec<u32>`, and `into_inner` keeps the buffer. On
+> drop it goes to the shelf of the dropping thread, which keeps its largest buffers. It is freed
+> when the shelf has larger ones or the thread is ending. Tested: return across threads, and
+> zero allocations once warm with a token and a checkpoint column.
+
 ## format-lexer: `blaze-mem` as a dependency of `parser` (coordinator, `crates/parser/Cargo.toml`)
 
 What: add `blaze-mem.workspace = true` under `[dependencies]` in `crates/parser/Cargo.toml`.

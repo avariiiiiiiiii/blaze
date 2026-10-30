@@ -20,6 +20,7 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-image.workspace = true
 blaze-mem.workspace = true
+blaze-protocol.workspace = true
 blaze-reclaim.workspace = true
 hashbrown.workspace = true
 rustc-hash.workspace = true

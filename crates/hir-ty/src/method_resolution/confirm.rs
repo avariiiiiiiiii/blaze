@@ -19,6 +19,7 @@ use crate::{
     Adjust, Adjustment, AutoBorrow, IncorrectGenericsLenKind, InferenceDiagnostic,
     LifetimeElisionKind, PointerCast, Span,
     db::HirDatabase,
+    generics::parent_generic_def,
     infer::{AllowTwoPhase, AutoBorrowMutability, ExplicitDropMethodUseKind, InferenceContext},
     lower::{
         GenericPredicates,
@@ -26,7 +27,7 @@ use crate::{
     },
     method_resolution::{CandidateId, MethodCallee, probe},
     next_solver::{
-        Binder, Clause, ClauseKind, Const, DbInterner, EarlyParamRegion, ErrorGuaranteed, FnSig,
+        Binder, ClauseKind, Const, DbInterner, EarlyParamRegion, ErrorGuaranteed, FnSig,
         GenericArg, GenericArgs, ParamConst, PolyExistentialTraitRef, PolyTraitRef, Region,
         TraitRef, Ty, TyKind, Unnormalized,
         infer::{
@@ -46,7 +47,9 @@ struct ConfirmContext<'a, 'db> {
 #[derive(Debug)]
 pub(crate) struct ConfirmResult<'db> {
     pub(crate) callee: MethodCallee<'db>,
-    pub(crate) illegal_sized_bound: bool,
+    /// rustc's `Option<Span>` of the `Self: Sized` bound on a trait object: whose own clauses
+    /// hold it, or `None` in it where only elaboration gives it (rustc's `DUMMY_SP`).
+    pub(crate) illegal_sized_bound: Option<Option<GenericDefId>>,
     pub(crate) adjustments: Box<[Adjustment]>,
 }
 
@@ -136,11 +139,7 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
                 }
             },
         );
-        let illegal_sized_bound = self.predicates_require_illegal_sized_bound(
-            GenericPredicates::query_all(self.db(), self.candidate.into())
-                .iter_instantiated(self.interner(), filler_args.as_slice())
-                .map(Unnormalized::skip_norm_wip),
-        );
+        let illegal_sized_bound = self.predicates_require_illegal_sized_bound(filler_args);
 
         // Unify the (adjusted) self type with what the method expects.
         //
@@ -164,7 +163,7 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
         // Add any trait/regions obligations specified on the method's type parameters.
         // We won't add these if we encountered an illegal sized bound, so that we can use
         // a custom error in that case.
-        if !illegal_sized_bound {
+        if illegal_sized_bound.is_none() {
             self.add_obligations(method_sig, all_args, method_predicates);
         }
 
@@ -563,21 +562,32 @@ impl<'a, 'db> ConfirmContext<'a, 'db> {
 
     fn predicates_require_illegal_sized_bound(
         &self,
-        predicates: impl Iterator<Item = Clause<'db>>,
-    ) -> bool {
-        let Some(sized_def_id) = self.ctx.lang_items.Sized else {
-            return false;
+        filler_args: GenericArgs<'db>,
+    ) -> Option<Option<GenericDefId>> {
+        let sized_def_id = self.ctx.lang_items.Sized?;
+        let predicates = GenericPredicates::query(self.db(), self.candidate.into());
+        let clauses = || {
+            predicates
+                .all_predicates()
+                .iter_instantiated(self.interner(), filler_args.as_slice())
+                .map(Unnormalized::skip_norm_wip)
         };
 
-        elaborate(self.interner(), predicates)
+        let clause = elaborate(self.interner(), clauses())
             // We don't care about regions here.
-            .filter_map(|pred| match pred.kind().skip_binder() {
-                ClauseKind::Trait(trait_pred) if trait_pred.def_id().0 == sized_def_id => {
-                    Some(trait_pred)
+            .find(|pred| match pred.kind().skip_binder() {
+                ClauseKind::Trait(trait_pred) => {
+                    trait_pred.def_id().0 == sized_def_id
+                        && matches!(trait_pred.self_ty().kind(), TyKind::Dynamic(..))
                 }
-                _ => None,
-            })
-            .any(|trait_pred| matches!(trait_pred.self_ty().kind(), TyKind::Dynamic(..)))
+                _ => false,
+            })?;
+        let at = clauses().position(|it| it == clause);
+        Some(at.map(|at| match at < predicates.own_predicates_start as usize {
+            true => parent_generic_def(self.db(), self.candidate.into())
+                .expect("a function with its parent's clauses is in a trait or impl"),
+            false => self.candidate.into(),
+        }))
     }
 
     fn check_for_illegal_method_calls(&self) {

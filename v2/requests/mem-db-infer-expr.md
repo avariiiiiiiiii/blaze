@@ -36,6 +36,8 @@ stack (`PatInfo` is a `Copy` value passed down), slice patterns borrow their pre
 from the store (`before: &[PatId]`, `after: &[PatId]`), subpattern type lists are interned
 `Tys`, and `PatOrigin` is a `Copy` enum. Those need no change.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## Prerequisites (other parts)
 
 - **mem-db-infer** (`lib.rs`, `Cargo.toml`): `#![feature(allocator_api)]` in
@@ -47,10 +49,14 @@ from the store (`before: &[PatId]`, `after: &[PatId]`), subpattern type lists ar
   files becomes `impl<'db, 'f> InferenceContext<'db, 'f>`. That is entry E0 below, written out per
   file, so this file and ctx's can be applied in either order.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## Cross-part interfaces these files program against
 
 Each is a change in a file of another part. The exact code is given, so mem-db-infer can hand
 it to that part's owner together with the part's own entries.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### X1. `write_expr_adj` takes `&[Adjustment]` (mem-db-infer-ctx, `infer.rs` about line 2281)
 
@@ -101,6 +107,8 @@ After:
 files, `crates/hir-ty/src/method_resolution.rs:168`
 `self.write_expr_adj(receiver, result.adjustments);`, becomes
 `self.write_expr_adj(receiver, &result.adjustments);` (mem-db-infer-method's file).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### X2. `adjust_steps_as_infer_ok` builds its list in a frame (mem-db-infer-ctx, `infer/autoderef.rs:32`)
 
@@ -180,6 +188,8 @@ with `use blaze_mem::Frame;`. The caller outside my files,
 (`autoderef.rs`, `Steps: Default`, `PredicateObligations`) are mem-db-infer-method's and the
 solver's.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### X3. `InferenceContextAutoderef` carries `'f` (mem-db-infer-method, `autoderef.rs:135,167`)
 
 R2: `InferenceContextAutoderefCtx<'a, 'db, 'f>(&'a mut InferenceContext<'db, 'f>)` and
@@ -187,6 +197,8 @@ R2: `InferenceContextAutoderefCtx<'a, 'db, 'f>(&'a mut InferenceContext<'db, 'f>
 with `ctx(&mut self) -> &mut InferenceContext<'db, 'f>` and
 `new_from_inference_context(ctx: &'a mut InferenceContext<'db, 'f>, ..)`. My files name it as
 `InferenceContextAutoderef<'_, 'db, 'f>` (lifetimes in that order).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### X4. The context's fields these files fill (mem-db-infer-ctx, `infer.rs` about lines 1770 to 1800, 261, 2224, 2346)
 
@@ -228,6 +240,8 @@ and `struct BreakableContext<'db, 'f> { .. coerce: Option<DynamicCoerceMany<'db,
     }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## E0. `impl` headers and `&mut InferenceContext` signatures (all seven files)
 
 R2. Each `impl<'db> InferenceContext<'db> {` becomes `impl<'db, 'f> InferenceContext<'db, 'f> {`:
@@ -241,7 +255,11 @@ The ones that need the named `'f` are in the entries below (`InferenceCoercionDe
 Each file that names `Frame` adds `use blaze_mem::Frame;`; each that names a hashbrown map adds
 `rustc_hash::FxBuildHasher` to its `rustc_hash` import.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## coerce.rs
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E1. `Coerce` holds the frame; `CoerceResult` is a frame list (lines 88 to 220, 233 to 237, 340, 530 to 543)
 
@@ -377,6 +395,8 @@ after (X2; the `adjustments.push(..)` of the autoref that follows is unchanged):
             autoderef.adjust_steps_as_infer_ok(self.frame);
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### E2. `InferenceCoercionDelegate` and `InferenceContext::coerce` (lines 867 to 926)
 
 Before:
@@ -434,6 +454,8 @@ after:
         self.write_expr_adj(expr, &adjustments);
         Ok(target)
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E3. `try_find_coercion_lub` (lines 945 to 1157)
 
@@ -497,6 +519,8 @@ Before (1118) `self.write_expr_adj(new, adjustments.into_boxed_slice());`, after
 `self.write_expr_adj(expr, adjustments.as_slice().into());`, after
 `self.write_expr_adj(expr, &adjustments);`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### E4. `CoerceMany` keeps its expressions in the frame (lines 1201 to 1242)
 
 Per `match`, block, value-`loop`, `return` site. The `SmallVec<[ExprId; 4]>` spilled to the
@@ -556,6 +580,8 @@ where a shorter `'exprs` is. `coerce_inner` passes `exprs` (`&Vec<ExprId, &Frame
 `try_find_coercion_lub(&[ExprId], ..)` by deref, unchanged; `buffer.push(expression)` is
 unchanged. Remove `use smallvec::SmallVec;` (line 53, its only use).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### E5. `could_coerce` runs only what decides its answer, in a task (lines 1445 to 1625; R1 entry point)
 
 Callers outside any query: `crates/hir/src/lib.rs:6169` (`Type::could_coerce_to`, through the
@@ -606,7 +632,11 @@ Const, ConstKind, ErrorGuaranteed, RegionKind`. (Checked by `rg` on the file: ea
 in `Resolver`; `has_infer` was the only `TypeVisitableExt` method.) What remains global here is
 the solver's `InferCtxt` (mem-db-solver's).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## expr.rs
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E6. Match arms reserve their count; breakables take the frame (lines 514, 2291 to 2302)
 
@@ -636,6 +666,8 @@ after:
             }
         });
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E7. Tuple expression element types (lines 777 to 796)
 
@@ -676,6 +708,8 @@ After:
 ```
 
 (the loop and `Ty::new_tup(self.interner(), &tys)` after it are unchanged).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E8. Struct literal field maps (lines 1120 to 1190)
 
@@ -723,6 +757,8 @@ After:
 
 Imports: `use rustc_hash::FxHashMap;` (24, used only here) becomes `use rustc_hash::FxBuildHasher;`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### E9. `lookup_field` and its two callers (lines 1716 to 1792, 1815, 1938)
 
 Per field access and per unresolved method call. Before:
@@ -744,6 +780,8 @@ Its two `self.table.register_infer_ok(autoderef.adjust_steps_as_infer_ok());` be
 `self.table.register_infer_ok(autoderef.adjust_steps_as_infer_ok(frame));` (X2). The callers'
 `self.write_expr_adj(receiver, adjustments.into_boxed_slice());` (1815, 1938) become
 `self.write_expr_adj(receiver, &adjustments);`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E10. `check_call_arguments`' input lists (lines 2050 to 2285)
 
@@ -925,7 +963,11 @@ Before (2183) `let demand_compatible = |this: &mut InferenceContext<'db>, idx| {
 `let demand_compatible = |this: &mut InferenceContext<'db, 'f>, idx: usize| {` (its body indexes
 both lists as before).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## pat.rs
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E11. Record pattern field maps (lines 1158 to 1257)
 
@@ -1019,7 +1061,11 @@ Imports: `collections::hash_map::Entry::{Occupied, Vacant},` leaves the `std::{.
 (3 to 7), which keeps `cmp, iter`; add `use hashbrown::hash_map::Entry::{Occupied, Vacant};`;
 `use rustc_hash::FxHashMap;` (20, used only here) becomes `use rustc_hash::FxBuildHasher;`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## callee.rs
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E12. Adjustments of the callee (lines 107 to 260)
 
@@ -1064,6 +1110,8 @@ After:
                 autoderef.ctx().write_expr_adj(callee_expr, &adjustments);
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### E13. `DeferredCallResolution` (lines 538 to 593)
 
 Per call of a closure whose kind is not known yet; it lives in ctx's frame list (X4). Before:
@@ -1100,6 +1148,8 @@ impl<'db, 'f> DeferredCallResolution<'db, 'f> {
 
 and (584) `ctx.write_expr_adj(self.callee_expr, adjustments.into_boxed_slice());` becomes
 `ctx.write_expr_adj(self.callee_expr, &adjustments);`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E14. `check_legacy_const_generics` (lines 358 to 426, 465)
 
@@ -1198,7 +1248,11 @@ from the `radix::sort` call):
 
 The caller (465 to 471) `&indices_to_skip` stays (it derefs to `&[u32]`).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## cast.rs
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E15. The auto-trait set of a dyn-to-dyn pointer cast (lines 388 to 405)
 
@@ -1238,7 +1292,11 @@ After (a handful of auto traits: a linear `contains` over a frame list beats has
 (10, its only use). `CastCheck<'db>` itself is unchanged: 24 bytes, no heap; ctx keeps it in a
 frame list (X4). Its methods take `&mut InferenceContext<'db, '_>` (E0).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## op.rs
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E16. The left operand's autoref (line 228)
 
@@ -1247,7 +1305,11 @@ Per overloaded binary operator by reference. Before:
 After: `self.write_expr_adj(lhs_expr, &[autoref]);`
 (the commented-out line 245 stays a comment.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## place_op.rs
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### E17. Overloaded deref and index adjustments (lines 64 to 70, 106 to 175)
 
@@ -1288,12 +1350,16 @@ Per overloaded `x[i]`: `try_index_step`'s `autoderef: &mut InferenceContextAutod
 `autoderef.ctx().write_expr_adj(base_expr, adjustments.into_boxed_slice());` becomes
 `autoderef.ctx().write_expr_adj(base_expr, &adjustments);`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## Tracked functions (R4, R6)
 
 None in these seven files (`rg 'salsa::tracked'` finds nothing): they run inside `infer_query`
 (and the closure and anon-const queries), whose memoized result and tag are ctx's and
 mem-db-infer's. No memoized result is built here: everything above is a run temporary or a
 value copied into ctx's tables.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## Entry points outside any query (R1)
 
@@ -1304,10 +1370,14 @@ value copied into ctx's tables.
 - Nothing else in these files is reachable from outside inference: `CastTy::from_ty` (`pub`) and
   `CastError` allocate nothing.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## Helpers on hit paths (R7)
 
 None: these files run only when `infer_query` (or a closure or anon const in it) executes, which
 is a miss. A memo hit or a deep verification that changes nothing never enters them.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## Left as they are, with why
 
@@ -1338,6 +1408,8 @@ the entries above:
 - `callee.rs:310` `Ty::new_tup_from_iter`, `pat.rs:1128` `Tys::new_from_iter`, `pat.rs:1144`
   `Ty::new_tup_from_iter`, `cast.rs:353, 365` `BoundExistentialPredicates::new_from_iter`:
   interned values (`Tag::Intern`), not temporaries.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## Tests
 
@@ -1438,6 +1510,8 @@ fn test() {
 `&[u8]`, which coerces the array reference by unsizing, as rustc does. The closure call takes
 the deferred, tupled path of E10 and E13.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## Speed
 
 The bound for these files' temporaries, on a 1,000-expression body (about 250 calls of two
@@ -1466,3 +1540,5 @@ of 1 to 3, return and break lists), the frame grows the top block in place. That
 written once, within 10% of the bound. The remaining global allocations on these paths are the
 solver's (`PredicateObligations`, `InferCtxt`, `goal.candidates()`) and autoderef's `steps`,
 which belong to mem-db-solver and mem-db-infer-method.
+
+> forwarded to db (from requests, pass 16; told by tmux).

@@ -358,6 +358,14 @@ pub(crate) struct State {
     pub tls: Option<Tls>,
     pub file_len: u64,
     pub parts: Arc<Vec<(u64, Vec<u8>)>>,
+    /// The debug sections in the file ([`crate::model::File::debug`]): (file offset, index into
+    /// [`crate::write::Lists::debug`]).
+    pub debug: Arc<Vec<(u64, usize)>>,
+    /// What the image exported, as the writer was given it: the next link's
+    /// [`crate::model::Delta::same_names`] compares with it.
+    pub exports: Arc<Vec<crate::model::Export>>,
+    /// The [`crate::model::Placed::synthesis`] the writer last made this state's tables in.
+    pub synthesis: u64,
     /// The 8-byte slots the writer encodes in the file ([`crate::model::Writer::encode`]), as
     /// (file offset, value), sorted by offset. The regions keep the plain values, which the
     /// next link and live patches read; only the file holds these.
@@ -414,6 +422,9 @@ impl State {
             tls: None,
             file_len: 0,
             parts: Arc::default(),
+            debug: Arc::default(),
+            exports: Arc::default(),
+            synthesis: 0,
             encoded: Arc::default(),
             lineage: [0; 16],
             laid_out: false,

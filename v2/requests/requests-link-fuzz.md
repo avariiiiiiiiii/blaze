@@ -53,7 +53,8 @@ until then they are here, exact. Bounds and arithmetic: `docs/v2/plan/lanes/link
 "Mach-O writer and readers". None changes an output byte except A2, which is opt-in by
 deployment target.
 
-> forwarded to requests-link-fuzz (its own request file; told by tmux).
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> forwarded to requests-link-next (A1, A3 in; A2, A4, A5 with requests-link-next-writers; A6, A8 told) (requests, pass 18; told by tmux).
 
 ### A1. `macho.rs` `MachO::symbols`: the locals in parallel, and no hash per function
 
@@ -222,4 +223,6 @@ the shared API. In `crates/blaze-link/src/macho/dylib.rs`:
 > difference is an input that ends right after a 10th byte with the continuation bit set: the old
 > reader said "runs past the end", the new one says "too long". Both are errors, and neither test
 > sees it. The RNG gives the same stream for every `n > 0`, which is all the tests use.
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): checked; requests-link-fuzz's edit above is in the tree as written. `trie_exports`' `seen` is now a `BitSet` (`link.md` dedup bits 4).
 

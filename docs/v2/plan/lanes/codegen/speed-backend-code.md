@@ -38,12 +38,13 @@ store key moves.
   `Elf64_Rela`) and keeps per-section arrays with no per-relocation allocation. Rows here are
   smaller than either.
 
-**Still to match.** `blaze_codegen::Reloc`, the form v2 hands the linker, holds its `Target`
-inline, with an owned `String` for externs. `v2/convert.rs` widens every row back into one.
-The 16-byte layout with a deduplicated `targets` table is asked of the lead in
-`v2/requests/codegen.md`. That is the size mold's arrays get, and lld does not reach it.
-Owed: time `emit` and `define_code` on nushell's largest functions (dev-aws, then ix) before
-and after.
+**Since (codegen-v2, 2026-10-29).** `blaze_codegen::Reloc`, the form v2 hands the linker,
+is a 16-byte row too (`at`, `target` index, `i32` addend, kind), in a `blaze_codegen::Relocs`
+table with each distinct target once (`crates/blaze-codegen/src/relocs.rs`). `v2/convert.rs`
+resolves each distinct name of a function once (`Relocs<RelocName>` mapped to
+`Relocs<Target>`), and templates are `Relocs<Ref>`, so making and filling one maps the targets
+and copies the rows. That is the size mold's arrays get, and lld does not reach it. Owed: time
+`emit` and `define_code` on nushell's largest functions (dev-aws, then ix) before and after.
 
 ## Requests: `Wants` and `Recorder`
 

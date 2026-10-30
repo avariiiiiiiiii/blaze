@@ -34,6 +34,7 @@ impl<'db> InferenceContext<'db> {
         id: ExprOrPatIdPacked,
     ) -> Option<(ValueNs, Ty<'db>)> {
         let (value, self_subst) = self.resolve_value_path_inner(path, id, false)?;
+        self.write_value_resolution(id, value);
 
         if let ValueNs::FunctionId(f) = value
             && self.lang_items.Drop_drop.is_some_and(|drop_fn| drop_fn == f)

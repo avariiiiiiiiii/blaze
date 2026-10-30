@@ -55,32 +55,11 @@ fn written(writer: &dyn Writer, placed: &Placed<'_>) -> Vec<u8> {
 }
 
 fn uleb(bytes: &[u8], at: &mut usize) -> u64 {
-    let (mut value, mut shift) = (0u64, 0);
-    loop {
-        let byte = bytes[*at];
-        *at += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return value;
-        }
-        shift += 7;
-    }
+    blaze_format::leb::read_u64(bytes, at).expect("a ULEB128")
 }
 
 fn sleb(bytes: &[u8], at: &mut usize) -> i64 {
-    let (mut value, mut shift) = (0i64, 0);
-    loop {
-        let byte = bytes[*at];
-        *at += 1;
-        value |= i64::from(byte & 0x7f) << shift;
-        shift += 7;
-        if byte & 0x80 == 0 {
-            if shift < 64 && byte & 0x40 != 0 {
-                value |= -1 << shift;
-            }
-            return value;
-        }
-    }
+    blaze_format::leb::read_i64(bytes, at).expect("an SLEB128")
 }
 
 fn c_string(bytes: &[u8], at: &mut usize) -> Vec<u8> {
@@ -284,24 +263,6 @@ fn names_cross_the_edge_both_ways() {
         assert_eq!(names.at(name), core_name(raw).unwrap());
     }
     assert!(super::push_core_name(&mut names, &[b'_', 0xff]).is_err());
-}
-
-#[test]
-fn uleb_and_sleb() {
-    for value in [0u64, 1, 127, 128, 300, 1 << 35, u64::MAX] {
-        let mut out = Vec::new();
-        linkedit::uleb(&mut out, value);
-        let mut at = 0;
-        assert_eq!(uleb(&out, &mut at), value);
-        assert_eq!(at, out.len());
-    }
-    for value in [0i64, 1, -1, 63, 64, -64, -65, 1 << 40, -(1 << 40), i64::MIN, i64::MAX] {
-        let mut out = Vec::new();
-        linkedit::sleb(&mut out, value);
-        let mut at = 0;
-        assert_eq!(sleb(&out, &mut at), value, "{value}");
-        assert_eq!(at, out.len());
-    }
 }
 
 #[test]
@@ -1225,7 +1186,7 @@ fn trie_by_insertion(exports: &mut [(Vec<u8>, u64, u64)]) -> Vec<u8> {
         terminal: Option<(u64, u64)>,
         offset: u64,
     }
-    let uleb_len = |value: u64| u64::from((64 - value.leading_zeros()).max(1).div_ceil(7));
+    let uleb_len = |value: u64| blaze_format::leb::len_u64(value) as u64;
     let info_len = |node: &Node| node.terminal.map_or(0, |(f, a)| uleb_len(f) + uleb_len(a));
     exports.sort_unstable();
     let mut nodes = vec![Node::default()];
@@ -1301,13 +1262,8 @@ fn trie_by_insertion(exports: &mut [(Vec<u8>, u64, u64)]) -> Vec<u8> {
 
 #[test]
 fn trie_is_the_insertion_trie() {
-    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        seed
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+    let mut next = move || rng.next_u64();
     for round in 0..200 {
         // Names over a small alphabet, so prefixes are shared, split and ended often.
         let count = 1 + (next() % 300) as usize;
@@ -1513,13 +1469,8 @@ fn locals_one_by_one(
 
 #[test]
 fn the_locals_in_parallel_are_the_locals_one_by_one() {
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        state
-    };
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+    let mut next = move || rng.next_u64();
     let names: Vec<String> = (0..10_000)
         .map(|nth| {
             let len = (next() % 120) as usize;

@@ -30,6 +30,10 @@ pub struct SpanMap {
     /// Index of the matched macro arm on successful expansion for declarative macros.
     // FIXME: Does it make sense to have this here?
     pub matched_arm: Option<u32>,
+    /// The `;` an expression's expansion ended in, which the expansion's text leaves out
+    /// (rustc's `ParserAnyMacro::make` drops it): where `semicolon_in_expressions_from_macros`
+    /// is linted.
+    pub dropped_semicolon: Option<Span>,
     /// Where the macro fragments start and where they end, each in order. A fragment is one
     /// token tree to the macro it is passed on to, which the text does not show.
     fragment_starts: Vec<TextSize>,
@@ -83,6 +87,7 @@ impl PartialEq for SpanMap {
         self.ends == other.ends
             && self.spans == other.spans
             && self.matched_arm == other.matched_arm
+            && self.dropped_semicolon == other.dropped_semicolon
             && self.fragment_starts == other.fragment_starts
             && self.fragment_ends == other.fragment_ends
     }
@@ -95,6 +100,7 @@ impl Hash for SpanMap {
         self.ends.hash(state);
         self.spans.hash(state);
         self.matched_arm.hash(state);
+        self.dropped_semicolon.hash(state);
         self.fragment_starts.hash(state);
         self.fragment_ends.hash(state);
     }
@@ -106,6 +112,7 @@ impl fmt::Debug for SpanMap {
             // alloc: `Debug` output, the edge
             .field("spans", &self.iter().collect::<Vec<_>>())
             .field("matched_arm", &self.matched_arm)
+            .field("dropped_semicolon", &self.dropped_semicolon)
             .field("fragment_starts", &self.fragment_starts)
             .field("fragment_ends", &self.fragment_ends)
             .finish()
@@ -125,6 +132,7 @@ impl SpanMap {
             spans: Vec::with_capacity(pieces),
             by_anchor: OnceLock::new(),
             matched_arm: None,
+            dropped_semicolon: None,
             // alloc: none; `Vec::new` allocates only when a fragment is pushed
             fragment_starts: Vec::new(),
             // alloc: as `fragment_starts`
@@ -592,7 +600,7 @@ impl RealSpanMap {
 
 #[cfg(test)]
 mod tests {
-    use blaze_ids::ContentId;
+    use blaze_ids::{ContentId, rng::SplitMix64};
 
     use super::*;
     use crate::FileId;
@@ -651,20 +659,20 @@ mod tests {
     /// what is left before it.
     #[test]
     fn without_agrees_with_cutting_the_pairs() {
-        let mut state = 5;
+        let mut rng = SplitMix64::new(5);
         for n in [1usize, 2, 3, 17, 100] {
-            let (pairs, end) = anchors(&mut state, n, 4);
+            let (pairs, end) = anchors(&mut rng, n, 4);
             let map = RealSpanMap::from_file(file(), pairs.clone(), at(end));
             let mut elided = Vec::new();
             let mut from = 1;
             while from < end {
-                let start = from + (next(&mut state) % 12) as u32;
-                let stop = start + (next(&mut state) % 9) as u32;
+                let start = from + rng.below(12) as u32;
+                let stop = start + rng.below(9) as u32;
                 if stop > end {
                     break;
                 }
                 elided.push(range(start, stop));
-                from = stop + (next(&mut state) % 4) as u32;
+                from = stop + rng.below(4) as u32;
             }
             let removed_before = |offset: u32| {
                 elided
@@ -727,18 +735,9 @@ mod tests {
         map(10).write_spans(ContentId::default(), id(2), [range(12, 15)]);
     }
 
-    /// splitmix64: the seeded inputs of the tests below.
-    fn next(state: &mut u64) -> u64 {
-        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = *state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
     /// `n` anchors with gaps of 0 to 7 bytes, and a text 5 past the last; ids from `ids`.
     fn anchors(
-        state: &mut u64,
+        rng: &mut SplitMix64,
         n: usize,
         ids: u32,
     ) -> (Box<[(TextSize, ErasedFileAstId)]>, u32) {
@@ -746,9 +745,9 @@ mod tests {
         let pairs = (0..n)
             .map(|i| {
                 if i > 0 {
-                    start += (next(state) % 8) as u32;
+                    start += rng.below(8) as u32;
                 }
-                (at(start), id((next(state) % u64::from(ids)) as u32))
+                (at(start), id(rng.below(u64::from(ids)) as u32))
             })
             .collect();
         (pairs, start + 5)
@@ -759,9 +758,9 @@ mod tests {
     #[test]
     fn anchors_agree_with_a_search_of_the_pairs() {
         use std::hash::BuildHasher;
-        let mut state = 3;
+        let mut rng = SplitMix64::new(3);
         for n in [1usize, 2, 3, 15, 16, 17, 100, 1000] {
-            let (pairs, end) = anchors(&mut state, n, 1 << 20);
+            let (pairs, end) = anchors(&mut rng, n, 1 << 20);
             let map = RealSpanMap::from_file(file(), pairs.clone(), at(end));
             assert_eq!(map.end(), at(end));
             for offset in 0..=end {
@@ -796,9 +795,9 @@ mod tests {
     /// From any hint, the search finds what a binary search of the whole does.
     #[test]
     fn a_search_from_any_hint_is_a_binary_search() {
-        let mut state = 8;
+        let mut rng = SplitMix64::new(8);
         for len in 0..40 {
-            let mut keys = (0..len).map(|_| (next(&mut state) % 16) as u32).collect::<Vec<_>>();
+            let mut keys = (0..len).map(|_| rng.below(16) as u32).collect::<Vec<_>>();
             keys.sort_unstable();
             for offset in 0..=16 {
                 let want = keys.partition_point(|&it| it <= offset);
@@ -815,22 +814,22 @@ mod tests {
     #[cfg(feature = "salsa")]
     #[test]
     fn a_cursor_gives_the_spans_a_search_does() {
-        let mut state = 7;
+        let mut rng = SplitMix64::new(7);
         for n in [1usize, 2, 3, 17, 100, 1000] {
-            let (pairs, end) = anchors(&mut state, n, 1 << 20);
+            let (pairs, end) = anchors(&mut rng, n, 1 << 20);
             let map = RealSpanMap::from_file(file(), pairs, at(end));
             let mut hint = 0;
             for offset in 0..end {
                 let range = range(offset, offset + 1);
                 let want = map.span_for_range(range);
                 assert_eq!(map.span_for_range_from(range, &mut hint), want, "{n}, at {offset}");
-                let from = (next(&mut state) % (n as u64 + 2)) as u32;
+                let from = rng.below(n as u64 + 2) as u32;
                 let found = map.span_for_range_from(range, &mut { from });
                 assert_eq!(found, want, "{n} anchors, from {from}, at {offset}");
             }
             let mut hint = u32::MAX;
             for _ in 0..200 {
-                let offset = (next(&mut state) % u64::from(end)) as u32;
+                let offset = rng.below(u64::from(end)) as u32;
                 let range = range(offset, end);
                 let found = map.span_for_range_from(range, &mut hint);
                 assert_eq!(found, map.span_for_range(range), "{n} anchors, {range:?}");
@@ -843,11 +842,11 @@ mod tests {
     #[test]
     fn real_maps_are_equal_when_their_lengths_and_ids_are() {
         use std::hash::BuildHasher;
-        let mut state = 4;
+        let mut rng = SplitMix64::new(4);
         let maps: Vec<_> = (0..200)
             .map(|_| {
-                let n = 1 + (next(&mut state) % 4) as usize;
-                let (pairs, end) = anchors(&mut state, n, 2);
+                let n = 1 + rng.below(4) as usize;
+                let (pairs, end) = anchors(&mut rng, n, 2);
                 let lengths: Vec<_> = pairs
                     .iter()
                     .enumerate()
@@ -924,10 +923,10 @@ mod tests {
     #[cfg(feature = "salsa")]
     #[test]
     fn lookups_allocate_nothing() {
-        let mut state = 11;
-        let (pairs, end) = anchors(&mut state, 300, 1 << 20);
+        let mut rng = SplitMix64::new(11);
+        let (pairs, end) = anchors(&mut rng, 300, 1 << 20);
         let real = RealSpanMap::from_file(file(), pairs, at(end));
-        let (expansion, _) = spans(&mut state, 500);
+        let (expansion, _) = spans(&mut rng, 500);
         let last = expansion.iter().last().map_or(0, |(end, _)| u32::from(end));
         let _ = expansion.ranges_with_span_exact(expansion.span_at(at(0))).count();
         blaze_alloc_count::assert_at_most(0, "span map lookups", || {
@@ -947,16 +946,16 @@ mod tests {
 
     /// A map of `n` spans over pieces of 1 to 4 bytes, with the same as [`Pairs`].
     #[cfg(feature = "salsa")]
-    fn spans(state: &mut u64, n: usize) -> (SpanMap, Pairs) {
+    fn spans(rng: &mut SplitMix64, n: usize) -> (SpanMap, Pairs) {
         let ctx = SyntaxContext::root(crate::Edition::CURRENT);
         let (mut map, mut pairs) = (SpanMap::empty(), Pairs::default());
         let mut end = 0;
         for _ in 0..n {
-            end += 1 + (next(state) % 4) as u32;
-            let ast_id = id((next(state) % 3) as u32);
+            end += 1 + rng.below(4) as u32;
+            let ast_id = id(rng.below(3) as u32);
             let anchor = crate::SpanAnchor { file_id: file(), ast_id };
-            let start = (next(state) % 8) as u32;
-            let span = Span { range: range(start, start + (next(state) % 4) as u32), anchor, ctx };
+            let start = rng.below(8) as u32;
+            let span = Span { range: range(start, start + rng.below(4) as u32), anchor, ctx };
             map.push(at(end), span);
             pairs.0.push((at(end), span));
         }
@@ -965,7 +964,7 @@ mod tests {
     }
 
     #[cfg(feature = "salsa")]
-    fn check_same(map: &SpanMap, pairs: &Pairs, state: &mut u64) {
+    fn check_same(map: &SpanMap, pairs: &Pairs, rng: &mut SplitMix64) {
         assert_eq!(map.iter().collect::<Vec<_>>(), pairs.0);
         let Some(&(last, _)) = pairs.0.last() else { return };
         let mut hint = 0;
@@ -973,27 +972,27 @@ mod tests {
             let want = pairs.span_at(at(offset));
             assert_eq!(map.span_at(at(offset)), want, "at {offset}");
             assert_eq!(map.span_at_from(at(offset), &mut hint), want, "in order, at {offset}");
-            let from = (next(state) % (pairs.0.len() as u64 + 2)) as u32;
+            let from = rng.below(pairs.0.len() as u64 + 2) as u32;
             assert_eq!(map.span_at_from(at(offset), &mut { from }), want, "from {from}, at {offset}");
         }
         let mut hint = u32::MAX;
         for _ in 0..50 {
-            let offset = at((next(state) % u64::from(last)) as u32);
+            let offset = at(rng.below(u64::from(last)) as u32);
             assert_eq!(map.span_at_from(offset, &mut hint), pairs.span_at(offset), "at {offset:?}");
         }
         let ctx = SyntaxContext::root(crate::Edition::CURRENT);
         for _ in 0..20 {
-            let anchor = crate::SpanAnchor { file_id: file(), ast_id: id((next(state) % 4) as u32) };
-            let start = (next(state) % 9) as u32;
-            let span = Span { range: range(start, start + (next(state) % 5) as u32), anchor, ctx };
+            let anchor = crate::SpanAnchor { file_id: file(), ast_id: id(rng.below(4) as u32) };
+            let start = rng.below(9) as u32;
+            let span = Span { range: range(start, start + rng.below(5) as u32), anchor, ctx };
             let exact = map.ranges_with_span_exact(span).collect::<Vec<_>>();
             assert_eq!(exact, pairs.ranges_with(span, true), "{span:?}");
             let containing = map.ranges_with_span(span).collect::<Vec<_>>();
             assert_eq!(containing, pairs.ranges_with(span, false), "{span:?}");
         }
         for _ in 0..50 {
-            let start = (next(state) % u64::from(last)) as u32;
-            let range = range(start, start + (next(state) % 12) as u32);
+            let start = rng.below(u64::from(last)) as u32;
+            let range = range(start, start + rng.below(12) as u32);
             assert_eq!(map.spans_for_range(range).collect::<Vec<_>>(), pairs.spans_for_range(range));
         }
         for &(_, span) in pairs.0.iter().step_by(5) {
@@ -1008,20 +1007,20 @@ mod tests {
     #[cfg(feature = "salsa")]
     #[test]
     fn expansion_maps_agree_with_the_pairs() {
-        let mut state = 5;
+        let mut rng = SplitMix64::new(5);
         for n in [1usize, 2, 16, 17, 300] {
-            let (mut map, mut pairs) = spans(&mut state, n);
-            check_same(&map, &pairs, &mut state);
+            let (mut map, mut pairs) = spans(&mut rng, n);
+            check_same(&map, &pairs, &mut rng);
             for _ in 0..8 {
-                let other_n = 1 + (next(&mut state) % 20) as usize;
-                let (other, other_pairs) = spans(&mut state, other_n);
+                let other_n = 1 + rng.below(20) as usize;
+                let (other, other_pairs) = spans(&mut rng, other_n);
                 let last = u32::from(pairs.0.last().expect("a span").0);
-                let start = (next(&mut state) % u64::from(last + 1)) as u32;
-                let end = start + (next(&mut state) % u64::from(last - start + 1)) as u32;
+                let start = rng.below(u64::from(last + 1)) as u32;
+                let end = start + rng.below(u64::from(last - start + 1)) as u32;
                 let size = other_pairs.0.last().expect("a span").0;
                 map.merge(range(start, end), size, &other);
                 pairs.merge(range(start, end), size, &other_pairs);
-                check_same(&map, &pairs, &mut state);
+                check_same(&map, &pairs, &mut rng);
             }
         }
     }
@@ -1031,11 +1030,11 @@ mod tests {
     #[test]
     fn expansion_maps_are_equal_when_their_pairs_are() {
         use std::hash::BuildHasher;
-        let mut state = 6;
+        let mut rng = SplitMix64::new(6);
         let maps: Vec<_> = (0..100)
             .map(|_| {
-                let n = (next(&mut state) % 3) as usize;
-                spans(&mut state, n)
+                let n = rng.below(3) as usize;
+                spans(&mut rng, n)
             })
             .collect();
         for (a, a_pairs) in &maps {

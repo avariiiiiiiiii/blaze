@@ -119,6 +119,17 @@ impl<F: Fn(Key) -> Option<Outcome>> Memo for F {
     }
 }
 
+/// No database: nothing is settled before it runs. The memo of every [`Plane::new`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoMemo;
+
+impl Memo for NoMemo {
+    #[inline]
+    fn settled(&self, _key: Key) -> Option<Outcome> {
+        None
+    }
+}
+
 /// The memory the plane may grant, and what says so, for the error of a task that cannot fit.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Budget {
@@ -311,7 +322,9 @@ impl Nodes {
         Spec {
             id: self.id(at),
             kind: self.kinds[at],
+            // alloc: a `Spec` owns its name and deps; the plane reads `Nodes` without this
             name: self.name(at).to_owned(),
+            // alloc: as above
             deps: self.deps(at).to_vec(),
             pool: self.pools[at],
             cost: self.costs[at],
@@ -339,6 +352,7 @@ impl Nodes {
     /// [`Event::Node`]s would say them, in the order given.
     fn record(self) -> Event {
         let Nodes { first, kinds, names, name_at, deps, deps_at, .. } = self;
+        // alloc: none: collected in place, `NodeId` being a `u32`
         let deps = deps.into_iter().map(|it| it.0).collect();
         Event::Nodes { first: first.0, kinds, names, name_at, deps, deps_at }
     }
@@ -373,18 +387,22 @@ impl TryFrom<Columns> for Nodes {
         ];
         for (column, its) in columns {
             if its != len {
+                // alloc: a refused trace's message, once
                 return Err(format!("{len} nodes but {its} {column}"));
             }
         }
         if u32::try_from(len).ok().and_then(|len| it.first.0.checked_add(len)).is_none() {
+            // alloc: a refused trace's message, once
             return Err(format!("{len} ids from {} past u32", it.first.0));
         }
         let cuts = |column: &str, at: &[u32], end: usize| {
             if at.len() != len + 1 || at[0] != 0 || at[len] as usize != end {
                 let offsets = at.len();
+                // alloc: a refused trace's message, once
                 return Err(format!("{column} of {offsets} offsets for {len} nodes and {end} entries"));
             }
             match at.windows(2).position(|pair| pair[0] > pair[1]) {
+                // alloc: a refused trace's message, once
                 Some(i) => Err(format!("{column} goes back at node {i}")),
                 None => Ok(()),
             }
@@ -392,6 +410,7 @@ impl TryFrom<Columns> for Nodes {
         cuts("name_at", &it.name_at, it.names.len())?;
         cuts("deps_at", &it.deps_at, it.deps.len())?;
         if let Some(i) = it.name_at.iter().position(|&at| !it.names.is_char_boundary(at as usize)) {
+            // alloc: a refused trace's message, once
             return Err(format!("name_at cuts a character at node {i}"));
         }
         Ok(Nodes {
@@ -426,6 +445,7 @@ struct Parts<'a> {
 impl From<Spec> for Parts<'static> {
     fn from(spec: Spec) -> Parts<'static> {
         let Spec { id, kind, name, deps, pool, cost, key, memory } = spec;
+        // alloc: none: collected in place, `NodeId` being a `u32`
         let deps = Some(deps.into_iter().map(|it| it.0).collect());
         Parts { id, kind, name: Cow::Owned(name), deps, pool, cost, key, memory }
     }
@@ -841,8 +861,9 @@ struct Batch {
     /// For Kahn's order: each place's deps of the batch not yet placed; the places that wait
     /// for each, as CSR; the places that can go, least first.
     waiting: Vec<u32>,
-    then_at: Vec<u32>,
-    then: Vec<u32>,
+    then: radix::Csr<u32>,
+    /// `then`'s rebuild cursors, kept.
+    cursors: Vec<u32>,
     can: BinaryHeap<Reverse<u32>>,
 }
 
@@ -851,44 +872,23 @@ impl Batch {
     /// given first among those that can go; or the ids of the nodes in a cycle, sorted.
     fn sort(&mut self, nodes: &(impl Given + ?Sized)) -> Result<(), Vec<NodeId>> {
         let len = nodes.len();
+        let (deps, deps_at) = (&self.deps, &self.deps_at);
+        let of = |at: usize| {
+            let deps = &deps[deps_at[at] as usize..deps_at[at + 1] as usize];
+            deps.iter().filter(|&&dep| dep & NEW != 0)
+        };
         self.waiting.clear();
-        self.waiting.resize(len, 0);
-        self.then_at.clear();
-        self.then_at.resize(len + 1, 0);
-        for at in 0..len {
-            for &dep in &self.deps[self.deps_at[at] as usize..self.deps_at[at + 1] as usize] {
-                if dep & NEW != 0 {
-                    self.waiting[at] += 1;
-                    self.then_at[(dep & !NEW) as usize + 1] += 1;
-                }
-            }
-        }
-        for at in 0..len {
-            self.then_at[at + 1] += self.then_at[at];
-        }
-        self.then.clear();
-        self.then.resize(self.then_at[len] as usize, 0);
-        for at in 0..len {
-            for &dep in &self.deps[self.deps_at[at] as usize..self.deps_at[at + 1] as usize] {
-                if dep & NEW != 0 {
-                    let fill = &mut self.then_at[(dep & !NEW) as usize];
-                    self.then[*fill as usize] = at as u32;
-                    *fill += 1;
-                }
-            }
-        }
-        for at in (1..=len).rev() {
-            self.then_at[at] = self.then_at[at - 1];
-        }
-        self.then_at[0] = 0;
+        self.waiting.extend((0..len).map(|at| of(at).count() as u32));
+        let pairs = (0..len).flat_map(|at| of(at).map(move |&dep| (dep & !NEW, at as u32)));
+        self.then.rebuild(len, pairs, &mut self.cursors);
         self.can.clear();
         self.can.extend((0..len as u32).filter(|&at| self.waiting[at as usize] == 0).map(Reverse));
         self.order.clear();
         while let Some(Reverse(at)) = self.can.pop() {
             self.order.push(at);
             let at = at as usize;
-            for then in self.then_at[at]..self.then_at[at + 1] {
-                let next = self.then[then as usize] as usize;
+            for &next in self.then.row(at) {
+                let next = next as usize;
                 self.waiting[next] -= 1;
                 if self.waiting[next] == 0 {
                     self.can.push(Reverse(next as u32));
@@ -896,7 +896,7 @@ impl Batch {
             }
         }
         if self.order.len() < len {
-            let mut cycle: Vec<NodeId> =
+            let mut cycle: Vec<NodeId> = // alloc: the payload of the batch's refusal
                 (0..len).filter(|&at| self.waiting[at] > 0).map(|at| nodes.id(at)).collect();
             radix::sort_copy_by_key(&mut cycle, |it| it.0);
             self.order.clear();
@@ -929,7 +929,7 @@ impl Hasher for KeyHasher {
     }
 }
 
-pub struct Plane {
+pub struct Plane<M = NoMemo> {
     config: PlaneConfig,
     /// The node columns, by slot, and which slots are live.
     rows: RegionVec<NodeRow>,
@@ -948,7 +948,8 @@ pub struct Plane {
     request_slots: Slots<RequestSlot>,
     request_index: FxHashMap<RequestId, RequestHandle>,
     next_seq: u64,
-    memo: Option<Box<dyn Memo + Send>>, // dyn: the database's memo, asked once a keyed node is ready
+    /// The database's memo, asked once a keyed node is ready and its key is not in flight.
+    memo: M,
     /// Keys of tasks not yet settled.
     flight: ByKey<TaskHandle>,
     running: [usize; 2],
@@ -997,6 +998,7 @@ fn pool_at(pool: Pool) -> usize {
 }
 
 fn gb(bytes: u64) -> String {
+    // alloc: for a message of a node refused or held back for memory, once each
     format!("{:.2} GB", bytes as f64 / f64::from(1 << 30))
 }
 
@@ -1004,15 +1006,14 @@ impl Plane {
     /// A plane with no database: every node with a key runs, joined only to a task of its key
     /// that has not settled. For one build of a graph, as [`crate::machine::Machine`] is.
     pub fn new(config: PlaneConfig) -> Result<Plane, Error> {
-        Plane::build(config, None)
+        Plane::with_memo(config, NoMemo)
     }
+}
 
-    /// A plane that asks `memo` before it runs a node with a key.
-    pub fn with_memo(config: PlaneConfig, memo: Box<dyn Memo + Send>) -> Result<Plane, Error> {
-        Plane::build(config, Some(memo))
-    }
-
-    fn build(config: PlaneConfig, memo: Option<Box<dyn Memo + Send>>) -> Result<Plane, Error> {
+impl<M: Memo> Plane<M> {
+    /// A plane that asks `memo` before it runs a node with a key: one database for the plane's
+    /// life, so the ask is a static call.
+    pub fn with_memo(config: PlaneConfig, memo: M) -> Result<Plane<M>, Error> {
         for (pool, threads) in [(Pool::Io, config.io), (Pool::Work, config.work)] {
             if threads == 0 {
                 return Err(Error::NoThreads(pool));
@@ -1040,25 +1041,27 @@ impl Plane {
             held: 0,
             vclock: [0; 2],
             idle_vclock: [0; 2],
-            idle_running: Vec::new(),
+            // Each `Vec` here is empty scratch the plane keeps: it grows to the most a step needs
+            // and is reused, so a warm step allocates nothing.
+            idle_running: Vec::new(), // alloc: kept scratch
             yielding: [0; 2],
             yielding_memory: 0,
-            yields: Vec::new(),
-            active: [Vec::new(), Vec::new()],
+            yields: Vec::new(), // alloc: kept scratch
+            active: [Vec::new(), Vec::new()], // alloc: kept scratch
             hold: None,
             passes: 0,
-            deferred: Vec::new(),
+            deferred: Vec::new(), // alloc: kept scratch
             last_ns: 0,
             counts: Counts::default(),
             batch: Batch::default(),
-            touched: Vec::new(),
-            added: Vec::new(),
-            rising: Vec::new(),
-            skipping: Vec::new(),
-            order: Vec::new(),
-            passed: Vec::new(),
+            touched: Vec::new(), // alloc: kept scratch
+            added: Vec::new(), // alloc: kept scratch
+            rising: Vec::new(), // alloc: kept scratch
+            skipping: Vec::new(), // alloc: kept scratch
+            order: Vec::new(), // alloc: kept scratch
+            passed: Vec::new(), // alloc: kept scratch
             scan: BinaryHeap::new(),
-            sorting: Vec::new(),
+            sorting: Vec::new(), // alloc: kept scratch
         })
     }
 
@@ -1184,6 +1187,7 @@ impl Plane {
     }
 
     pub fn step(&mut self, input: PlaneInput) -> Result<Vec<PlaneOutput>, Error> {
+        // alloc: the caller asked for the outputs as their own; `step_into` takes a kept buffer
         let mut out = Vec::new();
         self.step_into(input, &mut out)?;
         Ok(out)
@@ -1265,13 +1269,14 @@ impl Plane {
                 // once the nodes are added from them, into the place kept for it.
                 let record_at = out.len();
                 if !nodes.is_empty() {
+                    // Empty, so allocating nothing: the place the record takes below.
                     let kept = Event::Nodes {
                         first: 0,
-                        kinds: Vec::new(),
-                        names: String::new(),
-                        name_at: Vec::new(),
-                        deps: Vec::new(),
-                        deps_at: Vec::new(),
+                        kinds: Vec::new(), // alloc: none, empty
+                        names: String::new(), // alloc: none, empty
+                        name_at: Vec::new(), // alloc: none, empty
+                        deps: Vec::new(), // alloc: none, empty
+                        deps_at: Vec::new(), // alloc: none, empty
                     };
                     out.push(said(request, at, kept));
                     self.add_with(at, r, nodes.len(), |place| nodes.parts(place), out);
@@ -1334,6 +1339,7 @@ impl Plane {
     /// not ok. It takes no more [`PlaneInput::Add`] or [`PlaneInput::Close`]; a second cancel
     /// does nothing.
     pub fn cancel(&mut self, at_ns: u64, request: RequestId) -> Result<Vec<PlaneOutput>, Error> {
+        // alloc: as for `step`
         let mut out = Vec::new();
         self.cancel_into(at_ns, request, &mut out)?;
         Ok(out)
@@ -1355,6 +1361,7 @@ impl Plane {
             out.push(said(
                 request,
                 at,
+                // alloc: the payload of a request's one cancel note
                 Event::Said { level: Level::Note, text: format!("{request} is cancelled") },
             ));
             if let Some(&first) = self.requests[ri].nodes.first() {
@@ -1730,6 +1737,7 @@ impl Plane {
         if was && !now {
             request.running_now -= 1;
         }
+        // clone: a `NodeState` but `Failed` holds no heap; the event owns its copy
         out.push(said(request.id, at, Event::Moved { id: row.id.0, state: state.clone() }));
         self.states[me as usize] = state;
         if now && !was {
@@ -1826,7 +1834,7 @@ impl Plane {
                 }
                 Entry::Vacant(it) => it,
             };
-            if let Some(outcome) = self.memo.as_ref().and_then(|memo| memo.settled(key)) {
+            if let Some(outcome) = self.memo.settled(key) {
                 self.counts.remembered += 1;
                 self.requests[r].stats.cached += 1;
                 let state = match outcome {
@@ -2104,7 +2112,7 @@ impl Plane {
             touched.push(r);
             // Every member is running: a node that leaves a running task is taken out of it.
             debug_assert_eq!(self.states[m], NodeState::Running);
-            let state =
+            let state = // clone: each member settles with the outcome; the last takes it
                 if next == NONE { std::mem::replace(&mut state, NodeState::Waiting) } else { state.clone() };
             self.settle(at, member, state, out);
             member = next;
@@ -2380,7 +2388,7 @@ impl Plane {
         let cold = &self.cold[unfit as usize];
         let request = &self.requests[r as usize];
         Pick::Fail(
-            unfit,
+            unfit, // alloc: below, the message of a node that fails for memory, once
             format!(
                 "{} needs {} of memory as predicted, and with nothing of blaze's running \
                  the process holds {} of the {} it may use ({})",
@@ -2472,6 +2480,7 @@ fn said(request: RequestId, at_ns: u64, event: Event) -> PlaneOutput {
 fn too_big(config: &PlaneConfig, request: &Request, cold: &NodeCold) -> Option<String> {
     let budget = config.budget.as_ref()?;
     (cold.memory > budget.bytes).then(|| {
+        // alloc: the message of a node refused for memory, once
         format!(
             "{} needs {} of memory as predicted, more than blaze may use here: {} ({})",
             request.name(cold),

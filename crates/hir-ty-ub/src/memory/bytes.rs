@@ -6,6 +6,7 @@
 
 use std::ops::Range;
 
+use blaze_ids::bits::{locate, words_for};
 use smallvec::SmallVec;
 
 use super::{MemError, Uninit, init_mask};
@@ -49,18 +50,14 @@ impl Run {
 pub struct Bytes {
     pub(super) len: usize,
     /// Empty: every byte is initialized. Otherwise bit `i` is byte `i`, and bits past `len` are
-    /// clear.
+    /// clear. Words, not a `blaze_ids::bits` set: empty is a state of its own, and the words
+    /// move by `init_mask`'s blits, as an allocation's mask does.
     pub(super) init: SmallVec<[u64; 1]>,
     /// Sorted by `at`, disjoint, and joined where they continue each other.
     pub(super) prov: SmallVec<[Run; 1]>,
     /// The allocation and offset these bytes were read from, while they are still exactly that
     /// read: it names the memory in an error about uninitialized bytes, as Miri's.
     pub(super) origin: Option<(AllocId, u64)>,
-}
-
-#[inline]
-pub(super) fn words(len: usize) -> usize {
-    len.div_ceil(64)
 }
 
 /// The bits of a word holding the last `len % 64` bytes.
@@ -113,7 +110,7 @@ impl Bytes {
     /// `len` uninitialized bytes.
     pub fn uninit(len: usize) -> Bytes {
         let mut init = SmallVec::new();
-        init.resize(words(len), 0);
+        init.resize(words_for(len), 0);
         if len == 0 {
             return Bytes::init(0);
         }
@@ -139,7 +136,10 @@ impl Bytes {
     /// Whether byte `i` is initialized (bytes past the end are not).
     #[inline]
     pub fn is_init(&self, i: usize) -> bool {
-        i < self.len && (self.init.is_empty() || self.init[i / 64] & (1 << (i % 64)) != 0)
+        i < self.len && (self.init.is_empty() || {
+            let (word, mask) = locate(i);
+            self.init[word] & mask != 0
+        })
     }
 
     /// Whether any byte of `range` carries provenance.
@@ -152,7 +152,7 @@ impl Bytes {
     #[inline]
     fn word(&self, w: usize) -> u64 {
         if self.init.is_empty() {
-            if w + 1 == words(self.len) { tail_mask(self.len) } else { u64::MAX }
+            if w + 1 == words_for(self.len) { tail_mask(self.len) } else { u64::MAX }
         } else {
             self.init[w]
         }
@@ -160,7 +160,7 @@ impl Bytes {
 
     fn materialize(&mut self) {
         if self.init.is_empty() && self.len > 0 {
-            let n = words(self.len);
+            let n = words_for(self.len);
             self.init.resize(n, u64::MAX);
             self.init[n - 1] = tail_mask(self.len);
         }
@@ -193,7 +193,7 @@ impl Bytes {
         let len = range.end - range.start;
         let mut init = SmallVec::new();
         if !self.init.is_empty() && len > 0 {
-            init.resize(words(len), 0);
+            init.resize(words_for(len), 0);
             init_mask::extract(&self.init, range.start as u64, &mut init);
             let n = init.len();
             init[n - 1] &= tail_mask(len);
@@ -235,7 +235,7 @@ impl Bytes {
         if end > old_len {
             if !self.init.is_empty() || at > old_len || !other.init.is_empty() {
                 self.materialize();
-                self.init.resize(words(end), 0);
+                self.init.resize(words_for(end), 0);
             }
             self.len = end;
         }
@@ -411,7 +411,7 @@ impl PartialEq for Bytes {
     /// Equal initialization and provenance; where the bytes came from is not compared.
     fn eq(&self, other: &Bytes) -> bool {
         self.len == other.len
-            && (0..words(self.len)).all(|w| self.word(w) == other.word(w))
+            && (0..words_for(self.len)).all(|w| self.word(w) == other.word(w))
             && self.prov == other.prov
     }
 }

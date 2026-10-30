@@ -91,8 +91,21 @@ fn suite() -> Suite {
     Suite { package: "parser".into(), target: "lib".into(), context: ContentId::of("blaze v2 test context 1", b"x86_64") }
 }
 
+/// A test as cargo makes one, through [`Test::of`].
+fn made(name: &str, reached: Vec<CodeHash>, attrs: Attrs, outside: bool) -> Test {
+    Test::of(crate::Reached { test: name.into(), binary: ContentId::default(), reached }, attrs, outside)
+}
+
 fn test(name: &str, reached: &[u8]) -> Test {
-    Test { name: name.into(), reached: reached.iter().map(|it| code(*it)).collect(), attrs: Attrs::default(), outside: false }
+    made(name, reached.iter().map(|it| code(*it)).collect(), Attrs::default(), false)
+}
+
+fn ignored(name: &str) -> Test {
+    made(name, vec![code(1)], Attrs { ignore: true, ..Attrs::default() }, false)
+}
+
+fn panics(message: &str) -> Test {
+    made("tests::a", vec![code(1)], Attrs { should_panic: ShouldPanic::WithMessage(message.into()), ..Attrs::default() }, false)
 }
 
 /// What a test that read `/ws/data` and `$FOO` read, in `world`.
@@ -165,12 +178,9 @@ fn attributes_are_part_of_a_test() {
     let given = suite().given();
     let a = test("tests::a", &[1]);
     pass(&mut store, given, &a, &Traced::default(), 1);
-    let mut panicking = test("tests::a", &[1]);
-    panicking.attrs.should_panic = ShouldPanic::WithMessage("boom".into());
+    let panicking = panics("boom");
     assert_eq!(decide(&store, given, &panicking, &mut world), Decision::Run { why: Why::Attributes, expected: Some(Duration::from_millis(1)) });
-    let mut other = test("tests::a", &[1]);
-    other.attrs.should_panic = ShouldPanic::WithMessage("bang".into());
-    assert_ne!(panicking.identity(), other.identity());
+    assert_ne!(panicking.identity(), panics("bang").identity());
     assert_ne!(a.identity(), test("tests::b", &[1]).identity());
 }
 
@@ -179,13 +189,12 @@ fn the_outside_world_always_runs() {
     let mut store = Mem::default();
     let mut world = World::default();
     let given = suite().given();
-    let mut a = test("tests::net", &[1]);
-    a.outside = true;
+    let a = made("tests::net", vec![code(1)], Attrs::default(), true);
     assert_eq!(decide(&store, given, &a, &mut world), Decision::Run { why: Why::Outside, expected: None });
     pass(&mut store, given, &a, &Traced::default(), 5);
     assert_eq!(decide(&store, given, &a, &mut world), Decision::Run { why: Why::Outside, expected: Some(Duration::from_millis(5)) });
     // And no pass was kept for it: the same test not marked has none.
-    a.outside = false;
+    let a = test("tests::net", &[1]);
     assert_eq!(decide(&store, given, &a, &mut world), Decision::Run { why: Why::NoPass, expected: Some(Duration::from_millis(5)) });
 }
 
@@ -309,31 +318,29 @@ fn a_binary_run_whole_is_one_test_of_all_of_them() {
     let mut store = Mem::default();
     let mut world = World::default();
     let suite = suite();
-    let made = || vec![test("a", &[1, 2]), test("b", &[2, 3])];
-    let tests = made();
+    let made_both = || vec![test("a", &[1, 2]), test("b", &[2, 3])];
+    let tests = made_both();
     let given = suite.given_whole(&tests);
     let whole = Test::whole(&tests);
-    assert_eq!(whole.reached, vec![code(1), code(2), code(3)]);
+    assert_eq!(whole.reached(), [code(1), code(2), code(3)]);
+    assert_eq!(whole.identity(), identity_of(WHOLE, whole.reached(), &Attrs::default()));
     assert_ne!(given, suite.given());
     assert_eq!(decide(&store, given, &whole, &mut world), Decision::Run { why: Why::New, expected: None });
     pass(&mut store, given, &whole, &Traced::default(), 100);
     assert_eq!(decide(&store, given, &whole, &mut world), Decision::Skip { took: Some(Duration::from_millis(100)) });
     // A test marked ignored makes it another run.
-    let mut marked = made();
-    marked[1].attrs.ignore = true;
+    let marked = vec![test("a", &[1, 2]), made("b", vec![code(2), code(3)], Attrs { ignore: true, ..Attrs::default() }, false)];
     assert_ne!(suite.given_whole(&marked), given);
     // The order they are named in does not.
-    let reversed: Vec<Test> = made().into_iter().rev().collect();
+    let reversed: Vec<Test> = made_both().into_iter().rev().collect();
     assert_eq!(suite.given_whole(&reversed), given);
-    let mut outside = made();
-    outside[0].outside = true;
-    assert!(Test::whole(&outside).outside);
+    let outside = vec![made("a", vec![code(1), code(2)], Attrs::default(), true), test("b", &[2, 3])];
+    assert!(Test::whole(&outside).outside());
 }
 
 #[test]
 fn filters_and_ignored_tests_as_libtest_has_them() {
-    let mut ignored = test("parse::slow", &[1]);
-    ignored.attrs.ignore = true;
+    let ignored = ignored("parse::slow");
     let quick = test("parse::quick", &[1]);
     let all = Filter::default();
     assert_eq!(wanted(&quick, &all), Wanted::Yes);
@@ -348,6 +355,9 @@ fn filters_and_ignored_tests_as_libtest_has_them() {
     assert_eq!(wanted(&quick, &exact), Wanted::Filtered);
     let skip = Filter { skip: vec!["parse::".into()], ..Filter::default() };
     assert_eq!(wanted(&quick, &skip), Wanted::Filtered);
+    // A listed test, before its reached set is known, is asked for the same way.
+    assert_eq!(asked(ignored.name(), ignored.attrs(), &all), Wanted::Ignored);
+    assert_eq!(asked("parse::quick", &Attrs::default(), &exact), Wanted::Filtered);
 }
 
 #[test]
@@ -406,7 +416,7 @@ fn the_reached_set_sorts_as_a_comparison_sort_does() {
 #[test]
 fn the_identity_is_the_hash_of_each_reached_hash_in_order() {
     for reached in seeded_sets() {
-        let test = Test { name: "tests::a".into(), reached, attrs: Attrs::default(), outside: false };
+        let test = made("tests::a", reached, Attrs::default(), false);
         let mut set = test.reached.clone();
         set.sort_unstable();
         set.dedup();
@@ -420,18 +430,20 @@ fn the_identity_is_the_hash_of_each_reached_hash_in_order() {
     }
 }
 
-/// A test's identity sorts in its worker's scratch (the radix sort's buffer included, its
-/// counters on the stack) and hashes from the stack: warm, it allocates nothing, small or
-/// large.
+/// A test's identity, worked out once as it is made, sorts in its worker's scratch (the radix
+/// sort's buffer included, its counters on the stack) and hashes from the stack: warm, it
+/// allocates nothing, small or large. Asking for it after is a copy.
 #[test]
 fn a_warm_identity_allocates_nothing() {
-    let small = Test { name: "tests::a".into(), reached: (0..50u8).map(code).collect(), attrs: Attrs::default(), outside: false };
-    std::hint::black_box(small.identity());
-    blaze_alloc_count::assert_at_most(0, "the identity of a test reaching 50 functions, warm", || small.identity());
-    let large = Test { reached: seeded_sets().pop().unwrap(), ..small };
-    assert_eq!(large.reached.len(), 10_000);
-    std::hint::black_box(large.identity());
-    blaze_alloc_count::assert_at_most(0, "the identity of a test reaching 10,000 functions, warm", || large.identity());
+    let attrs = Attrs::default();
+    for reached in [(0..50u8).map(code).collect(), seeded_sets().pop().unwrap()] {
+        let test = made("tests::a", reached, Attrs::default(), false);
+        std::hint::black_box(identity_of(&test.name, &test.reached, &attrs));
+        let what = format!("the identity of a test reaching {} functions, warm", test.reached.len());
+        let identity = blaze_alloc_count::assert_at_most(0, &what, || identity_of(&test.name, &test.reached, &attrs));
+        assert_eq!(identity, test.identity());
+        blaze_alloc_count::assert_at_most(0, "a test's identity asked for", || test.identity());
+    }
 }
 
 /// A test whose pass is kept is skipped with nothing allocated, warm: its history's end is
@@ -443,7 +455,7 @@ fn a_warm_skip_allocates_nothing() {
     let mut store = Mem::default();
     let mut world = World::with(1, "1");
     let given = suite().given();
-    let a = Test { reached: (0..50u8).map(code).collect(), ..test("tests::a", &[]) };
+    let a = made("tests::a", (0..50u8).map(code).collect(), Attrs::default(), false);
     let traced = reads(&mut world);
     for took in 1..=5 {
         pass(&mut store, given, &a, &traced, took);
@@ -460,8 +472,7 @@ fn a_warm_skip_allocates_nothing() {
 #[test]
 fn a_filter_allocates_nothing() {
     let quick = test("parse::quick", &[1]);
-    let mut ignored = test("parse::slow", &[1]);
-    ignored.attrs.ignore = true;
+    let ignored = ignored("parse::slow");
     let filters = [
         Filter::default(),
         Filter { names: vec!["quick".into(), "lex".into()], ..Filter::default() },

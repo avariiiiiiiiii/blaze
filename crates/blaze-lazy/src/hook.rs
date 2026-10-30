@@ -1,17 +1,19 @@
 //! The run process's side: what the resolver ([`crate::stub`]) calls on a lazy function's
 //! first call, linked into the program's image and compiled ahead with it.
 //!
-//! [`blaze_lazy_resolve`] asks the daemon for the function's code over blaze-inproc's
-//! channel and returns where the daemon published it; the resolver jumps there. The daemon
-//! writes the hook's address (the image's [`SYMBOL`]) into the stub region's cell before
-//! the program starts. An answer that the function can't be compiled, a channel that fails
+//! [`blaze_lazy_resolve`] asks the daemon for the function's code (blaze-inproc's asks,
+//! `blaze_inproc::ask`) and returns where the daemon published it; the resolver jumps there.
+//! The daemon writes the hook's address (the image's [`SYMBOL`]) into the stub region's cell
+//! before the program starts. An answer that the function can't be compiled, an ask that fails
 //! or an answer that is not this ask's stops the process with that error on stderr: the
 //! resolver never jumps anywhere the daemon did not publish.
 //!
 //! Many threads may miss at once: each asks, and the daemon compiles the function once and
 //! answers each of them (single flight, [`crate::fetch`]). A thread that loaded the slot
 //! before the daemon stored it misses too, and is answered at once with the published
-//! address.
+//! address. Until it fails, an ask takes no lock and allocates nothing (its answer lands in a
+//! buffer on the stack), so a first call from a signal handler, from a TLS destructor or from
+//! inside the allocator is answered too.
 //!
 //! The hook must never reach a quiescent point (`blaze_inproc::runtime::quiesce`): between
 //! the answer and the resolver's jump to it, the thread's stack doesn't show the target, and
@@ -21,9 +23,9 @@
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use blaze_inproc::runtime;
+use blaze_inproc::{ask, runtime};
 
-use crate::wire::{self, ASK_KIND, Frame, READY_LEN};
+use crate::wire::{self, ASK_KIND, Frame};
 
 /// The hook's symbol, which the daemon looks up in the placed image.
 pub const SYMBOL: &str = "blaze_lazy_resolve";
@@ -35,11 +37,12 @@ static REQUESTS: AtomicU64 = AtomicU64::new(1);
 pub fn fetch(lazy: u32) -> Result<u64, String> {
     let attached = runtime::attach().map_err(|it| format!("asking the daemon for its code: {it}"))?;
     let request = REQUESTS.fetch_add(1, Ordering::Relaxed);
-    let mut answer = Vec::with_capacity(READY_LEN);
-    let kind = attached
-        .request(ASK_KIND, &wire::ask(request, lazy), &mut answer)
+    let mut answer = [0u8; ask::MOST_BODY];
+    let (kind, len) = attached
+        .request_into(ASK_KIND, &wire::ask(request, lazy), &mut answer)
         .map_err(|it| format!("asking the daemon for its code: {it}"))?;
-    let frame = Frame::decode(&answer).map_err(|it| format!("the daemon's answer: {it}"))?;
+    let answer = answer.get(..len).ok_or_else(|| format!("the daemon's answer of {len} bytes, past the {} asked for", ask::MOST_BODY))?;
+    let frame = Frame::decode(answer).map_err(|it| format!("the daemon's answer: {it}"))?;
     if wire::channel_kind(&frame) != kind {
         return Err(format!("the daemon's answer of kind {:#06x} carries {frame:?}", kind.0));
     }

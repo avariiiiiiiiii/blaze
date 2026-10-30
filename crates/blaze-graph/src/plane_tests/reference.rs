@@ -14,7 +14,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::{
     machine::{Error, NodeId, Outcome, Pool, Spec},
     plane::{
-        Counts, Key, Memo, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
+        Counts, Key, Memo, NoMemo, PlaneConfig, PlaneInput, PlaneOutput, RequestId, RequestStats,
     },
 };
 
@@ -89,7 +89,7 @@ struct Request {
     stats: RequestStats,
 }
 
-pub(crate) struct Plane {
+pub(crate) struct Plane<M = NoMemo> {
     config: PlaneConfig,
     nodes: Vec<Node>,
     index: FxHashMap<NodeId, usize>,
@@ -101,7 +101,7 @@ pub(crate) struct Plane {
     free_tasks: Vec<usize>,
     free_requests: Vec<usize>,
     next_seq: u64,
-    memo: Option<Box<dyn Memo + Send>>,
+    memo: M,
     /// Keys of tasks not yet settled.
     flight: FxHashMap<Key, usize>,
     running: [usize; 2],
@@ -140,15 +140,13 @@ impl Plane {
     /// A plane with no database: every node with a key runs, joined only to a task of its key
     /// that has not settled. For one build of a graph, as [`crate::machine::Machine`] is.
     pub(crate) fn new(config: PlaneConfig) -> Result<Plane, Error> {
-        Plane::build(config, None)
+        Plane::with_memo(config, NoMemo)
     }
+}
 
+impl<M: Memo> Plane<M> {
     /// A plane that asks `memo` before it runs a node with a key.
-    pub(crate) fn with_memo(config: PlaneConfig, memo: Box<dyn Memo + Send>) -> Result<Plane, Error> {
-        Plane::build(config, Some(memo))
-    }
-
-    fn build(config: PlaneConfig, memo: Option<Box<dyn Memo + Send>>) -> Result<Plane, Error> {
+    pub(crate) fn with_memo(config: PlaneConfig, memo: M) -> Result<Plane<M>, Error> {
         for (pool, threads) in [(Pool::Io, config.io), (Pool::Work, config.work)] {
             if threads == 0 {
                 return Err(Error::NoThreads(pool));
@@ -754,7 +752,7 @@ impl Plane {
                 }
                 return;
             }
-            if let Some(outcome) = self.memo.as_ref().and_then(|memo| memo.settled(key)) {
+            if let Some(outcome) = self.memo.settled(key) {
                 self.counts.remembered += 1;
                 self.requests[self.nodes[me].request].stats.cached += 1;
                 let state = match outcome {

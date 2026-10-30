@@ -122,6 +122,8 @@ The callers' edits are in `v2/requests/diagnostics.md`, `v2/requests/db.md` (hir
 `v2/requests/db-matchck.md` (hir-ty-matchck), each under `## dedup: stdx::edit_distance`; the cargo
 crates' edits are below (they are the coordinator's too).
 
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
+
 ### 1. `crates/stdx/src/lib.rs`: add the module
 
 Before:
@@ -139,6 +141,8 @@ pub mod assert;
 pub mod edit_distance;
 ```
 
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
+
 ### 2. `crates/stdx/Cargo.toml`: proptest for the differential test
 
 Append (proptest is already a root workspace dependency):
@@ -147,6 +151,8 @@ Append (proptest is already a root workspace dependency):
 [dev-dependencies]
 proptest.workspace = true
 ```
+
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
 
 ### 3. New file `crates/stdx/src/edit_distance.rs`
 
@@ -385,6 +391,8 @@ pub mod cargo {
 #[cfg(test)]
 mod tests;
 ```
+
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
 
 ### 4. New file `crates/stdx/src/edit_distance/tests.rs`
 
@@ -655,6 +663,8 @@ proptest! {
 }
 ```
 
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
+
 ### 5. `crates/blaze-manifest` and `crates/blaze-resolve` (the coordinator's): onto `stdx`
 
 Both files are cargo's `src/util/edit_distance.rs` verbatim, the same as each other but for doc
@@ -679,6 +689,8 @@ way and leaves the move nothing to merge.)
 
 Status: open
 
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
+
 ## dedup: delete `stdx::thread::Pool`, a thread pool nothing uses (from dedup-mem)
 
 - What: delete `crates/stdx/src/thread/pool.rs`. In `crates/stdx/src/thread.rs` remove
@@ -693,6 +705,8 @@ Status: open
 - Check: `rg -n 'stdx::thread::Pool|thread::\{[^}]*Pool' crates` stays empty.
 
 Status: open
+
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
 
 ## dedup: workspace dependency `blaze-sha256`
 
@@ -887,6 +901,8 @@ equal text, so blaze-fmt's `Symbol(&'static str)` keeps its type, its text equal
     }
 ```
 
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
+
 ## dedup: `blaze-lints` uses `blaze-diagnostics`' diagnostic model, `Level`, `CommandLine` and emitter (from dedup-scan-diag)
 
 From `dedup-scan-diag` (report `/tmp/blaze-lanes/v2-dedup-scan-diag.md`, notes
@@ -905,10 +921,14 @@ line as it is); `level::Level` is `blaze_diagnostics::lints::Level` (whose `of_c
 `blaze_diagnostics::lints::CommandLine::parse` (whose errors are rustc's words). No cycle:
 `blaze-diagnostics` depends on neither `blaze-lints` nor anything that does.
 
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+
 ### 1. `crates/blaze-lints/Cargo.toml`
 
 Add `blaze-diagnostics.workspace = true` to `[dependencies]`; remove the line
 `annotate-snippets = "=0.12.16"` and the two comment lines above it (only `emit.rs` used it).
+
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
 
 ### 2. `crates/blaze-lints/src/diag.rs`: the whole file becomes
 
@@ -1034,12 +1054,16 @@ rewrite writes becomes `diag::place_diag(&mut diagnostic, ..)`, `diag::place(&mu
 here, and this naming is the lint queries' own, not the model's. `Diag` derives `Eq` and `Hash`,
 so the queries' values still backdate.
 
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+
 ### 3. `crates/blaze-lints/src/emit.rs`: delete the file
 
 `lib.rs`: delete `pub mod emit;`, and in its doc comment `[`diag`] is a diagnostic as data and
 [`emit`] writes it as rustc does, in text and in JSON.` becomes `[`diag`] is a diagnostic as
 data, written by [`blaze_diagnostics::emit`] as rustc writes it, in text and in JSON.` Nothing
 outside the crate names `blaze_lints::emit` or `blaze_lints::diag`.
+
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
 
 ### 4. `crates/blaze-lints/src/level.rs`
 
@@ -1102,6 +1126,8 @@ outside the crate names `blaze_lints::emit` or `blaze_lints::diag`.
 ```
 
   and `proptest.workspace = true` to `Cargo.toml`'s `[dev-dependencies]`.
+
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
 
 ### 5. `crates/blaze-lints/src/check.rs`
 
@@ -1199,6 +1225,8 @@ fn written_at(level: Level) -> model::Level {
   nodes (`docs/v2/plan/lanes/lints/cx.md`), that one is of another tree and stays, under its
   own name (`view_item_range`), and only the `SyntaxNode` ones go.
 
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+
 ### 6. `crates/blaze-lints/src/serve.rs`
 
 - The `use crate::{...}` drops `Level`, `diag::Diagnostic` and `emit::{self, Sources, Style}`;
@@ -1295,12 +1323,16 @@ mod tests {
   same. `cargo_order` is cargo's rule from `/tmp/cargo-src/src_compiler_mod.rs`: `code` is a field
   of its own after the flattened map, so it comes last.)
 
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+
 ### 7. `crates/blaze-lints/src/tests.rs`
 
 `emit::{self, Sources, Style},` leaves the `use crate::{...}`; add
 `use blaze_diagnostics::emit::{self, Sources, Style};`. The expectations stay as they are: none
 has a macro expansion, and on what they have the two emitters write the same bytes
 (`blaze_diagnostics::emit::reference`'s proptest).
+
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
 
 ### 8. `docs/v2/plan/lanes/lints/cx.md`
 
@@ -1313,6 +1345,8 @@ and `span_help` take `impl Into<MultiSpan>`, which a `Span` is).
 
 Status: open
 
+> forwarded to lints (holds `crates/blaze-lints/`) (from requests, pass 16; told by tmux).
+
 ## dedup: the v1 cargo crates call blaze-units' copies (from dedup-scan-cargo, 2026-10-29)
 
 The v1 half of `v2/requests/cargo.md` "dedup: one copy of each piece the load ported from v1's
@@ -1323,6 +1357,8 @@ coordinator's paths today; lane cargo's request 1 (the grant of the five cargo c
 all of this lane cargo's, and it is fine for lane cargo to do both halves once granted. Items 4
 and 5 do not wait on lane cargo. No dependency cycle: `blaze-units` (without `query`) depends on
 `blaze-manifest`, `blaze-resolve`, `blaze-source` only.
+
+> forwarded to the coordinator ("every other path"; lane cargo once request 1's grant lands) (from requests, pass 16; on requests' coordinator list).
 
 ### 1. `blaze-metadata/src/summary.rs` goes (lane cargo item 1)
 
@@ -1365,12 +1401,16 @@ and 5 do not wait on lane cargo. No dependency cycle: `blaze-units` (without `qu
 - delete `crates/blaze-metadata/src/summary.rs`. Its tests not already in `blaze-units/src/read.rs`
   move there (lane cargo item 1 lists them).
 
+> forwarded to the coordinator ("every other path"; lane cargo once request 1's grant lands) (from requests, pass 16; on requests' coordinator list).
+
 ### 2. `blaze-resolve/examples/metadata_resolve.rs` moves to blaze-units (lane cargo item 1)
 
 Delete `crates/blaze-resolve/examples/metadata_resolve.rs` once lane cargo has written
 `crates/blaze-units/examples/metadata_resolve.rs`; in `harness/resolve_graph.py` 84-85 the build's
 `"-p", "blaze-resolve"` becomes `"-p", "blaze-units"` and the docstring's "The `metadata_resolve`
 example of blaze-resolve" (line 11) names blaze-units; the binary path (line 86) is unchanged.
+
+> forwarded to the coordinator ("every other path"; lane cargo once request 1's grant lands) (from requests, pass 16; on requests' coordinator list).
 
 ### 3. blaze-registry on `blaze_units::{index, sources}` (lane cargo items 2, 3)
 
@@ -1414,6 +1454,8 @@ example of blaze-resolve" (line 11) names blaze-units; the binary path (line 86)
   "Which name comes first" (v1 and v2 disagree; cargo's is the one).
 - `src/git.rs:658`: delete `normalize` and call `blaze_manifest::paths::normalize_path`.
 - `src/lib.rs:34`: `SourceMap` is still exported (now blaze-units').
+
+> forwarded to the coordinator ("every other path"; lane cargo once request 1's grant lands) (from requests, pass 16; on requests' coordinator list).
 
 ### 4. blaze-manifest: one feature map, one `CrateType`/`TargetKind`
 
@@ -1545,6 +1587,7 @@ Both enums already derive `Clone, Debug, PartialEq, Eq, Hash` with cargo's varia
 order, which is what the hash needs.
 
 > held by requests: the root line `blaze-resolve = { path = "crates/blaze-resolve" }` is in (after `blaze-metadata`; already in the lock). The `blaze-manifest`/`blaze-resolve` edits are the coordinator's ("every other path", lane cargo once request 1's grant lands): on requests' coordinator list.
+> forwarded to the coordinator ("every other path"; lane cargo once request 1's grant lands) (from requests, pass 16; on requests' coordinator list).
 
 ### 5. blaze-registry's `LimitErrorReader` public (lane cargo item 9)
 
@@ -1552,10 +1595,14 @@ order, which is what the hash needs.
 becomes `pub struct LimitErrorReader<R> { pub inner: R, pub left: u64 }`, so
 `blaze-cargo/src/serve/fetch/archive.rs` drops its copy.
 
+> forwarded to the coordinator ("every other path"; lane cargo once request 1's grant lands) (from requests, pass 16; on requests' coordinator list).
+
 ### 6. `harness/answers.py` writes the one `rustc.json` (lane cargo item 6)
 
 `harness/answers.py:26`: `DATA = os.path.join(ROOT, "crates/blaze-units/src/stdlib", "rustc.json")`,
 and line 10's text names that path; lane cargo deletes `crates/blaze-cargo/src/answers/rustc.json`.
+
+> forwarded to the coordinator ("every other path"; lane cargo once request 1's grant lands) (from requests, pass 16; on requests' coordinator list).
 
 ### 7. Found, not requested here
 
@@ -1567,6 +1614,8 @@ and line 10's text names that path; lane cargo deletes `crates/blaze-cargo/src/a
   these, for after request 1.
 
 Status: open
+
+> forwarded to the coordinator ("every other path"; lane cargo once request 1's grant lands) (from requests, pass 16; on requests' coordinator list).
 
 ## dedup: test_utils::rust_files (from dedup-scan)
 
@@ -1595,3 +1644,5 @@ pub fn rust_files(dir: &Path) -> Vec<PathBuf> {
 ```
 (with `std::path::{Path, PathBuf}` imported). test-utils depends only on stdx, paths, profile,
 dissimilar, text-size and rustc-hash, so no caller makes a cycle.
+
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).

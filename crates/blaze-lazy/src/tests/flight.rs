@@ -17,7 +17,7 @@ use crate::{
     LazyId, Purpose, Session,
     fetch::Priority,
     plan::{Function, Plan},
-    runner::{Answers, Closed, Compiler, Config, Placer, Runner},
+    runner::{self, Answers, Closed, Compiler, Config, Placer, Runner},
     stub::{Abi, Isa, X86Save},
     wire::{self, ASK_KIND, Frame, READY_KIND},
 };
@@ -221,6 +221,18 @@ fn a_failed_or_panicking_compile_answers_every_asker_and_stops_the_run_once() {
     assert!(stopped.contains(&Some(key(3))) && stopped.contains(&Some(key(5))));
     let closed = runner.close();
     assert_eq!(closed.failures.len(), 2);
+}
+
+#[test]
+fn a_failure_reason_is_cut_to_what_an_ask_slot_carries() {
+    let most = blaze_inproc::ask::MOST_BODY - wire::FAILED_LEN;
+    assert_eq!(runner::fit("short"), "short");
+    let long = "é".repeat(most);
+    let cut = runner::fit(&long);
+    assert!(cut.len() <= most && cut.len() >= most - 1 && long.starts_with(cut));
+    let mut frame = Vec::new();
+    Frame::Failed { request: 1, lazy: 2, why: cut }.encode(&mut frame);
+    assert!(frame.len() <= blaze_inproc::ask::MOST_BODY);
 }
 
 #[test]

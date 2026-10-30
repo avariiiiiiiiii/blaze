@@ -9,10 +9,10 @@
 use syntax::{AstNode, NodeOrToken, TextRange, TextSize, ast};
 
 use super::{
-    Krate,
-    visibility::{self, Effective},
+    Krate, visibility,
     walk::{Container, Item},
 };
+use crate::lints::names::effective::Effective;
 use crate::{
     cx::Cx,
     lower::{Found, Phase},

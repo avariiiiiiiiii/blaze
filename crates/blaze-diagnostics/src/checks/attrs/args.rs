@@ -304,9 +304,9 @@ struct Reader<'a, 'c, 'db> {
 
 /// rustc's `ArgParser::from_attr_args` of `attr`, whose path is `path`: its arguments, or `None`
 /// for arguments rustc cannot read, with the errors of reading them in `errors`.
-pub(crate) fn parse(cx: &Cx<'_, '_>, attr: &Attr, path: &[String], errors: &mut Vec<Diag>) -> Option<ArgParser> {
+pub(crate) fn parse(cx: &Cx<'_, '_>, attr: &Attr, path: &[&str], errors: &mut Vec<Diag>) -> Option<ArgParser> {
     let edition = attr.file.edition(cx.db);
-    let lenient = matches!(path, [it] if it == "rustc_dummy") || path.first().is_some_and(|it| it == "diagnostic");
+    let lenient = matches!(path, ["rustc_dummy"] | ["diagnostic", ..]);
     let mut reader = Reader { cx, attr, edition, forbidden: false, errors };
     match attr.args() {
         Args::Word => Some(ArgParser::NoArgs),

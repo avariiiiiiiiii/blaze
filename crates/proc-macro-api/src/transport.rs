@@ -32,6 +32,7 @@ pub(crate) fn read_frame<R: BufRead + ?Sized>(
             None => (available.len(), false),
         };
         if buf.len() + taken > longest {
+            // alloc: error path, naming the length.
             return Err(invalid(format!(
                 "a frame of more than {longest} bytes: {} read and no end yet",
                 buf.len() + taken

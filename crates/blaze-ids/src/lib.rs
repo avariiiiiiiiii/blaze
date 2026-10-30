@@ -10,13 +10,13 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/lanes/items.md
 //!   section 6.2).
 
+#![feature(allocator_api)]
 #![deny(unsafe_code)]
 
 use std::{fmt, hash, marker::PhantomData};
 
 use blake3::hazmat::{self, ContextKey, HasherExt};
 use blaze_mem::swiss::Index;
-use serde::{Deserialize, Serialize};
 
 use crate::sync::{
     Mutex, OnceLock, PoisonError,
@@ -32,6 +32,7 @@ pub use blaze_radix as radix;
 pub mod rng;
 mod std_hash;
 mod sync;
+mod wire;
 
 pub use crate::std_hash::StdHash;
 
@@ -41,7 +42,8 @@ pub use crate::std_hash::StdHash;
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 /// The BLAKE3 hash of what something is. Two things with one content ID are the same thing.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+/// Serialized as one byte string of 32 bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[repr(transparent)]
 pub struct ContentId(pub [u8; 32]);
 
@@ -71,6 +73,12 @@ impl ContentId {
     /// uses SIMD within it.
     pub fn of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId> {
         many::of_many(context_key(domain), inputs)
+    }
+
+    /// [`ContentId::of_many`] into `out` (cleared first): a warm call with room allocates
+    /// nothing.
+    pub fn of_many_into(domain: &'static str, inputs: &[&[u8]], out: &mut Vec<ContentId>) {
+        many::of_many_into(context_key(domain), inputs, out)
     }
 
     /// The first 128 bits, as a result's fingerprint.
@@ -197,22 +205,11 @@ impl Hasher {
 
 /// 128 bits that stand for a result's value: a rerun that produces the same fingerprint stops
 /// there (early cutoff). Kept with every dependency edge and when the value is evicted.
-/// Serialized as 16 little-endian bytes: CBOR has no integer this wide.
+/// Serialized as one byte string of its 16 little-endian bytes: CBOR has no integer
+/// this wide.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[repr(transparent)]
 pub struct Fingerprint(pub u128);
-
-impl Serialize for Fingerprint {
-    fn serialize<S: serde::Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
-        self.0.to_le_bytes().serialize(to)
-    }
-}
-
-impl<'de> Deserialize<'de> for Fingerprint {
-    fn deserialize<D: serde::Deserializer<'de>>(from: D) -> Result<Fingerprint, D::Error> {
-        <[u8; 16]>::deserialize(from).map(|bytes| Fingerprint(u128::from_le_bytes(bytes)))
-    }
-}
 
 impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -506,6 +503,22 @@ mod tests {
             assert_eq!(ContentId::of_many(domain, &inputs), expected, "{domain:?}");
         }
         assert_eq!(ContentId::of_many("blaze v2 a 1", &[]), Vec::new());
+    }
+
+    /// `of_many_into` is `of_many`, and a warm one into a buffer with room allocates nothing.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn a_warm_of_many_into_allocates_nothing() {
+        let bytes: Vec<u8> = (0..2_000u32).map(|n| n as u8).collect();
+        let inputs: Vec<&[u8]> = (0..600).map(|n| &bytes[n % 7..n % 7 + n % 1_100]).collect();
+        let expected = ContentId::of_many("blaze v2 a 1", &inputs);
+        let mut out = Vec::new();
+        ContentId::of_many_into("blaze v2 a 1", &inputs, &mut out);
+        assert_eq!(out, expected);
+        blaze_alloc_count::assert_at_most(0, "a warm of_many_into", || {
+            ContentId::of_many_into("blaze v2 a 1", &inputs, &mut out);
+        });
+        assert_eq!(out, expected);
     }
 
     #[test]

@@ -137,12 +137,12 @@ fn lazy_expand<'db>(
     def: &MacroDefId,
     macro_call: &ast::MacroCall,
     ast_id: AstId<ast::MacroCall>,
+    expand_to: ExpandTo,
     krate: Crate,
     call_site: SyntaxContext,
     macro_depth: u32,
     eager_callback: EagerCallBackFn<'_>,
 ) -> ExpandResult<(InFile<SyntaxNode>, &'db ExpansionSpanMap)> {
-    let expand_to = ExpandTo::from_call_site(macro_call);
     let id = def.make_call(
         db,
         krate,
@@ -276,11 +276,24 @@ fn eager_macro_recur(
             | MacroDefKind::BuiltInDerive(..)
             | MacroDefKind::ProcMacro(..)
             | MacroDefKind::UnimplementedBuiltIn(..) => {
+                let expand_to = match ExpandTo::of_call_site(&call) {
+                    Ok(it) => it,
+                    Err(parent) => {
+                        error = Some(ExpandError::other(
+                            span_map.span_at(call.syntax().text_range().start()),
+                            // alloc: an error's message, on the error path
+                            format!("blaze can't tell what a macro call in a `{parent:?}` expands to"),
+                        ));
+                        offset += call.syntax().text_range().len();
+                        continue;
+                    }
+                };
                 let ExpandResult { value: (parse, tm), err } = lazy_expand(
                     db,
                     &def,
                     &call,
                     curr.with_value(ast_id),
+                    expand_to,
                     krate,
                     call_site,
                     macro_depth,

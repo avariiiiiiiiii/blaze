@@ -265,12 +265,14 @@ impl DeclOp {
                 origin: *origin,
                 visibility: *visibility,
                 parent: *parent,
+                // clone: the op module_round hands to the module that gains it, once per op and round
                 inherited: inherited.clone(),
             },
             &DeclOp::PushChild { parent, name, child } => DeclOp::PushChild { parent, name, child },
             &DeclOp::Declare { module, def } => DeclOp::Declare { module, def },
             DeclOp::Update { module, resolutions, vis, import } => DeclOp::Update {
                 module: *module,
+                // clone: the op module_round hands to the module that gains it, once per op and round
                 resolutions: resolutions.clone(),
                 vis: *vis,
                 import: *import,
@@ -303,9 +305,11 @@ impl DeclOp {
                     adt: *adt,
                     attr: *attr,
                     attr_call: *attr_call,
+                    // clone: the op module_round hands to the module that gains it, once per op and round
                     derive_calls: derive_calls.clone(),
                 }
             }
+            // clone: the op module_round hands to the module that gains it, once per op and round
             DeclOp::Import(it) => DeclOp::Import(it.clone()),
             DeclOp::Macro(_)
             | DeclOp::Splice { .. }
@@ -334,6 +338,7 @@ impl DeclOp {
             DeclOp::Update { module, resolutions, vis, import } if *module == root => {
                 Some(DeclOp::Update {
                     module: *module,
+                    // clone: a #[macro_export] op copied to the crate root, once per op
                     resolutions: resolutions.clone(),
                     vis: *vis,
                     import: *import,
@@ -366,15 +371,53 @@ impl DeclOp {
     }
 }
 
-/// The ops of one collection, in the order they were made.
+/// The ops of one collection, in the order they were made, with what a reader checks before it
+/// scans them ([`OpLog::has_children`], [`OpLog::writes_elsewhere`]), kept as they are pushed.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpLog {
     pub(crate) ops: Vec<DeclOp>,
+    /// The module of the log's first `Init`: in a round-0 log, the module that made it.
+    owner: Option<ModuleId>,
+    flags: u8,
 }
+
+/// A `Splice`: the module has round-0 children, each collected by its own query.
+const SPLICE: u8 = 1;
+/// A scope op (`Declare`, `Update`) of a module other than the owner.
+const ELSEWHERE: u8 = 2;
 
 impl OpLog {
     pub(crate) fn push(&mut self, op: DeclOp) {
+        match &op {
+            &DeclOp::Init { module, .. } if self.owner.is_none() => self.owner = Some(module),
+            DeclOp::Splice { .. } => self.flags |= SPLICE,
+            &DeclOp::Declare { module, .. } | &DeclOp::Update { module, .. }
+                if self.owner != Some(module) =>
+            {
+                self.flags |= ELSEWHERE;
+            }
+            _ => {}
+        }
         self.ops.push(op);
+    }
+
+    pub(crate) fn extend(&mut self, ops: impl IntoIterator<Item = DeclOp>) {
+        for op in ops {
+            self.push(op);
+        }
+    }
+
+    /// Whether the log declares a round-0 child (a `Splice`), whose subtree may make ops in the
+    /// crate root.
+    pub(crate) fn has_children(&self) -> bool {
+        self.flags & SPLICE != 0
+    }
+
+    /// Whether a scope op names a module other than the log's first `Init`'s: in a module's
+    /// round-0 log, a `#[macro_export]` or proc macro made in the crate root. Without one,
+    /// [`OpLog::root_ops`] of any root but the owner is empty.
+    pub(crate) fn writes_elsewhere(&self) -> bool {
+        self.flags & ELSEWHERE != 0
     }
 
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, DeclOp> {

@@ -28,12 +28,17 @@ use syntax::{
 
 use crate::{
     cx::{Cx, item_range, signature_range},
-    lints::{body_item, code_fact},
+    lints::{body_item, code_fact, registry::LintId},
     lower::{Found, Phase, break_outside_of_loop::ancestors},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingUnsafe) -> Vec<Found> {
+    const UNSAFE_OP: LintId = LintId::named("unsafe_op_in_unsafe_fn");
+    const DEPRECATED_SAFE: LintId = LintId::named("deprecated_safe_2024");
+    if matches!(d.lint, UnsafeLint::UnsafeOpInUnsafeFn) && !cx.lint_may_fire(UNSAFE_OP) {
+        return Vec::new();
+    }
     let ptr = d.node.map(|it| it.syntax_node_ptr());
     let node = cx.syntax(ptr);
     let span = cx.span_of(ptr);
@@ -46,6 +51,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MissingUnsafe) -> Vec<Found> {
             op.facts(cx, &mut diag);
             code_fact(cx, &mut diag, ptr);
             Found::lint(diag, Phase::Mir, lint_at(cx, &node))
+        }
+        // Allowed everywhere, a call whose attribute says what to audit gives nothing; one
+        // without is E0133 whatever the lint's level.
+        UnsafeLint::DeprecatedSafe2024
+            if !cx.lint_may_fire(DEPRECATED_SAFE)
+                && matches!(op, Op::Call(Some(function)) if audit_that(cx, function).is_some()) =>
+        {
+            return Vec::new();
         }
         UnsafeLint::DeprecatedSafe2024 => match deprecated_safe(cx, &op, span.clone()) {
             Some(mut diag) => {

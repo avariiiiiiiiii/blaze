@@ -163,6 +163,29 @@ where
     convert_tokens(&mut c, 0)
 }
 
+/// A macro's input, or any node's tokens as a token tree, from a view of the node
+/// (`syntax::view`, docs/v2/plan/lanes/frontend/tree.md): one pass over the flat tree's tokens
+/// in the node's range, through the parts of the lazy nodes in it (an attribute macro's `fn`
+/// whose body an outline left unparsed), with each span from `map`, the file's side table, read
+/// in order. No syntax handle is made and nothing is counted.
+///
+/// The tree's parser words ([`tree_words`]) are made the first time a matcher or the parser
+/// reads it, not here: a proc macro's input goes over the wire and never needs them.
+pub fn call_input<SpanMap>(
+    node: syntax::view::Node<'_>,
+    map: SpanMap,
+    call_site: Span,
+    mode: DocCommentDesugarMode,
+) -> tt::TopSubtree
+where
+    SpanMap: SpanMapper,
+{
+    let (tree, at) = node.flat();
+    let mut c = FlatConverter::new(tree, at, map, call_site, mode);
+    let len = c.tokens.len_hint();
+    convert_tokens(&mut c, len)
+}
+
 /// Converts a syntax tree to a [`tt::Subtree`] using the provided span map to populate the
 /// subtree's spans. Additionally using the append and remove parameters, the additional tokens can
 /// be injected or hidden from the output.
@@ -180,6 +203,30 @@ where
     OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Vec<tt::Leaf>),
 {
     let mut c = Converter::new(node, map, append, remove, call_site, mode, on_enter);
+    convert_tokens(&mut c, 0)
+}
+
+/// [`syntax_node_to_token_tree_modified`] on a view (cfg stripping and fixup of a macro's
+/// input): elements are removed and appended after by their [`syntax::view::NodeId`], which is
+/// unique within the file's tree `node` is in, and `on_event` sees the view's walk. No syntax
+/// handle is made and nothing is counted.
+pub fn call_input_modified<'t, SpanMap, OnEvent>(
+    node: syntax::view::Node<'t>,
+    map: SpanMap,
+    append: FxHashMap<syntax::view::NodeId, Vec<tt::Leaf>>,
+    remove: FxHashSet<syntax::view::NodeId>,
+    call_site: Span,
+    mode: DocCommentDesugarMode,
+    on_event: OnEvent,
+) -> tt::TopSubtree
+where
+    SpanMap: SpanMapper,
+    OnEvent: FnMut(
+        &mut syntax::view::PreorderWithTokens<'t>,
+        &WalkEvent<syntax::view::Element<'t>>,
+    ) -> (bool, Vec<tt::Leaf>),
+{
+    let mut c = ViewConverter::new(node, map, append, remove, call_site, mode, on_event);
     convert_tokens(&mut c, 0)
 }
 
@@ -1150,6 +1197,221 @@ where
             FlatToken::Ordinary(curr)
         };
         Some(token)
+    }
+
+    fn span_for(&self, range: TextRange) -> Span {
+        self.map.span_for(range)
+    }
+
+    fn fragment_bounds(&self, range: TextRange) -> FragmentBounds {
+        self.map.fragment_bounds(range)
+    }
+    fn call_site(&self) -> Span {
+        self.call_site
+    }
+}
+
+/// [`Converter`] on a view: the same walk, removals and appends, keyed by element id.
+struct ViewConverter<'t, SpanMap, OnEvent> {
+    current: Option<syntax::view::Token<'t>>,
+    current_leaves: VecDeque<tt::Leaf>,
+    preorder: syntax::view::PreorderWithTokens<'t>,
+    range: TextRange,
+    punct_offset: Option<(syntax::view::Token<'t>, TextSize)>,
+    map: SpanMap,
+    append: FxHashMap<syntax::view::NodeId, Vec<tt::Leaf>>,
+    remove: FxHashSet<syntax::view::NodeId>,
+    call_site: Span,
+    mode: DocCommentDesugarMode,
+    on_event: OnEvent,
+}
+
+impl<'t, SpanMap, OnEvent> ViewConverter<'t, SpanMap, OnEvent>
+where
+    OnEvent: FnMut(
+        &mut syntax::view::PreorderWithTokens<'t>,
+        &WalkEvent<syntax::view::Element<'t>>,
+    ) -> (bool, Vec<tt::Leaf>),
+{
+    fn new(
+        node: syntax::view::Node<'t>,
+        map: SpanMap,
+        append: FxHashMap<syntax::view::NodeId, Vec<tt::Leaf>>,
+        remove: FxHashSet<syntax::view::NodeId>,
+        call_site: Span,
+        mode: DocCommentDesugarMode,
+        on_event: OnEvent,
+    ) -> Self {
+        let mut converter = ViewConverter {
+            current: None,
+            preorder: node.preorder_with_tokens(),
+            range: node.text_range(),
+            punct_offset: None,
+            map,
+            append,
+            remove,
+            call_site,
+            current_leaves: VecDeque::new(),
+            mode,
+            on_event,
+        };
+        converter.current = converter.next_token();
+        converter
+    }
+
+    fn next_token(&mut self) -> Option<syntax::view::Token<'t>> {
+        while let Some(ev) = self.preorder.next() {
+            let (keep_event, insert_leaves) = (self.on_event)(&mut self.preorder, &ev);
+            self.current_leaves.extend(insert_leaves);
+            if !keep_event {
+                continue;
+            }
+            match ev {
+                WalkEvent::Enter(element) => {
+                    if self.remove.contains(&element.id()) {
+                        if let syntax::NodeOrToken::Node(node) = element {
+                            self.preorder.skip_subtree();
+                            if let Some(v) = self.append.remove(&node.id()) {
+                                self.current_leaves.extend(v);
+                            }
+                        }
+                        continue;
+                    }
+                    if let syntax::NodeOrToken::Token(token) = element {
+                        return Some(token);
+                    }
+                }
+                WalkEvent::Leave(element) => {
+                    if let Some(v) = self.append.remove(&element.id()) {
+                        self.current_leaves.extend(v);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug)]
+enum ViewToken<'t> {
+    Ordinary(syntax::view::Token<'t>),
+    Punct { token: syntax::view::Token<'t>, offset: usize },
+    Leaf(tt::Leaf),
+}
+
+impl<'t> ViewToken<'t> {
+    fn token(&self) -> syntax::view::Token<'t> {
+        match self {
+            ViewToken::Ordinary(it) | ViewToken::Punct { token: it, offset: _ } => *it,
+            ViewToken::Leaf(_) => unreachable!(),
+        }
+    }
+}
+
+impl<'t, SpanMap, OnEvent> SrcToken<ViewConverter<'t, SpanMap, OnEvent>> for ViewToken<'t> {
+    fn kind(&self, _ctx: &ViewConverter<'t, SpanMap, OnEvent>) -> SyntaxKind {
+        match self {
+            ViewToken::Ordinary(token) => token.kind(),
+            ViewToken::Punct { token, offset: i } => {
+                SyntaxKind::from_char(punct_char(token.text(), *i).unwrap()).unwrap()
+            }
+            ViewToken::Leaf(_) => {
+                never!();
+                SyntaxKind::ERROR
+            }
+        }
+    }
+    fn to_char(&self, _ctx: &ViewConverter<'t, SpanMap, OnEvent>) -> Option<char> {
+        match self {
+            ViewToken::Ordinary(_) | ViewToken::Leaf(_) => None,
+            ViewToken::Punct { token, offset: i } => punct_char(token.text(), *i),
+        }
+    }
+    fn to_text<'a>(&'a self, _ctx: &'a ViewConverter<'t, SpanMap, OnEvent>) -> &'a str {
+        match self {
+            ViewToken::Ordinary(token) | ViewToken::Punct { token, offset: _ } => token.text(),
+            ViewToken::Leaf(_) => {
+                never!();
+                ""
+            }
+        }
+    }
+    fn as_leaf(&self) -> Option<&tt::Leaf> {
+        match self {
+            ViewToken::Ordinary(_) | ViewToken::Punct { .. } => None,
+            ViewToken::Leaf(it) => Some(it),
+        }
+    }
+}
+
+impl<'t, SpanMap, OnEvent> TokenConverter for ViewConverter<'t, SpanMap, OnEvent>
+where
+    SpanMap: SpanMapper,
+    OnEvent: FnMut(
+        &mut syntax::view::PreorderWithTokens<'t>,
+        &WalkEvent<syntax::view::Element<'t>>,
+    ) -> (bool, Vec<tt::Leaf>),
+{
+    type Token = ViewToken<'t>;
+    fn convert_doc_comment(
+        &self,
+        token: &Self::Token,
+        is_inner: bool,
+        span: Span,
+        builder: &mut tt::TopSubtreeBuilder,
+    ) {
+        convert_doc_comment(token.token().text(), is_inner, span, self.mode, builder);
+    }
+
+    fn bump(&mut self) -> Option<(Self::Token, TextRange)> {
+        if let Some((punct, offset)) = &mut self.punct_offset
+            && usize::from(*offset) + 1 < punct.text().len()
+        {
+            *offset += TextSize::of('.');
+            let range = TextRange::at(punct.text_range().start() + *offset, TextSize::of('.'));
+            let offset = u32::from(*offset) as usize;
+            return Some((ViewToken::Punct { token: *punct, offset }, range));
+        }
+
+        if let Some(leaf) = self.current_leaves.pop_front() {
+            return Some((ViewToken::Leaf(leaf), TextRange::empty(TextSize::new(0))));
+        }
+
+        let curr = self.current.take()?;
+        if !self.range.contains_range(curr.text_range()) {
+            self.current = Some(curr);
+            return None;
+        }
+
+        self.current = self.next_token();
+        let range = curr.text_range();
+        let token = if curr.kind().is_punct() {
+            self.punct_offset = Some((curr, 0.into()));
+            let range = TextRange::at(range.start(), TextSize::of('.'));
+            (ViewToken::Punct { token: curr, offset: 0 }, range)
+        } else {
+            self.punct_offset = None;
+            (ViewToken::Ordinary(curr), range)
+        };
+        Some(token)
+    }
+
+    fn peek(&self) -> Option<Self::Token> {
+        if let Some((punct, offset)) = self.punct_offset {
+            let offset = offset + TextSize::of('.');
+            if usize::from(offset) < punct.text().len() {
+                return Some(ViewToken::Punct { token: punct, offset: usize::from(offset) });
+            }
+        }
+
+        let curr = self.current?;
+        if !self.range.contains_range(curr.text_range()) {
+            return None;
+        }
+        Some(match curr.kind().is_punct() {
+            true => ViewToken::Punct { token: curr, offset: 0 },
+            false => ViewToken::Ordinary(curr),
+        })
     }
 
     fn span_for(&self, range: TextRange) -> Span {

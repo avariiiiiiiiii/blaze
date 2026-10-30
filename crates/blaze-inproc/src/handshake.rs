@@ -4,11 +4,11 @@
 //! 1. HELLO, hook to daemon: the token from `BLAZE_INPROC`, the process ID, [`VERSION`], the
 //!    page, and where the image's headers are in the process ([`Hello`]).
 //! 2. GRANT, daemon to hook: the format, the linked header and span, the objects (the image's
-//!    code memory, the fence's control words, the cells, the objects of fixed maps) and the
-//!    overlays ([`Grant`]); the objects come with it or after it ([`crate::sys`]).
-//! 3. On Windows only, MAP for the control words (the daemon maps every view) and OVERLAY,
-//!    with which the hook asks the daemon to lay the overlays over its image; OVERLAID or
-//!    REFUSED answers.
+//!    code memory, the fence's control words, the asks, the cells, the objects of fixed maps)
+//!    and the overlays ([`Grant`]); the objects come with it or after it ([`crate::sys`]).
+//! 3. On Windows only, MAP for the control words and the asks (the daemon maps every view) and
+//!    OVERLAY, with which the hook asks the daemon to lay the overlays over its image;
+//!    OVERLAID or REFUSED answers.
 //! 4. STARTED, hook to daemon: the thread that runs `main`. Or FAILED, with why.
 //!
 //! Every body is bounds-checked and refused whole when any field is out of its range.
@@ -25,7 +25,7 @@ use crate::{Access, Error, Format};
 pub const HOST_VAR: &str = "BLAZE_INPROC";
 
 /// The version of the handshake; a host and a hook of another refuse each other.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
 /// The most objects and overlays one grant carries.
 const MOST: usize = 64;
@@ -92,8 +92,8 @@ impl Overlay {
 }
 
 /// What the daemon gives a start hook. Objects: the image's code memory first (rights
-/// [`Rights::Code`]), the fence's control words second ([`Rights::Words`]), then the cells
-/// and the objects of fixed maps.
+/// [`Rights::Code`]), the fence's control words second and the asks ([`crate::ask`]) third
+/// (both [`Rights::Words`]), then the cells and the objects of fixed maps.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Grant {
     pub(crate) format: Format,
@@ -151,7 +151,7 @@ impl Grant {
         let header = read.u64().map_err(&bad)?;
         let span = read.u64().map_err(&bad)?..read.u64().map_err(&bad)?;
         let count = read.count(9).map_err(&bad)?;
-        if !(2..=MOST).contains(&count) {
+        if !(3..=MOST).contains(&count) {
             return Err(Error::new(format!("a grant of {count} objects")));
         }
         let mut objects = Vec::with_capacity(count);
@@ -164,8 +164,8 @@ impl Grant {
             };
             objects.push((len, rights));
         }
-        if objects[0].1 != Rights::Code || objects[1].1 != Rights::Words {
-            return Err(Error::new("a grant whose first objects are not the code memory and the control words"));
+        if objects[0].1 != Rights::Code || objects[1].1 != Rights::Words || objects[2].1 != Rights::Words {
+            return Err(Error::new("a grant whose first objects are not the code memory, the control words and the asks"));
         }
         let count = read.count(34).map_err(&bad)?;
         if count > MOST {
@@ -185,7 +185,7 @@ impl Grant {
                 other => return Err(Error::new(format!("an overlay of place {other}"))),
             };
             let overlay = Overlay { object, offset, len, at, access, place };
-            let Some(&(object_len, rights)) = objects.get(object as usize).filter(|_| object != 1) else {
+            let Some(&(object_len, rights)) = objects.get(object as usize).filter(|_| object != 1 && object != 2) else {
                 return Err(Error::new(format!("an overlay of object {object} of {}", objects.len())));
             };
             let allowed = match (rights, place, access) {

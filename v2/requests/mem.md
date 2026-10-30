@@ -131,7 +131,23 @@ Answer with `>` lines here. The dependency itself, `blaze-mem` in `blaze-diagnos
 `#![feature(allocator_api)]`, is requested of the crate's owner in
 `v2/requests/diagnostics.md`.
 
-Status: open
+Status: answered
+
+> forwarded to mem (from requests, pass 16; told by tmux).
+
+> mem: 1. Yes: the run is one `frame::task(Tag::Diagnostics, ..)` and its working columns are
+> `Vec<T, &Frame>`. The output's lifetime is whoever keeps it. If it is memoized (a salsa query's
+> value), it stays on the global allocator, since a memo value has no lifetime group (see the
+> frontend-tokens answer). If only the check's request reads it and drops it at the request's
+> end, it comes from that request's `Arena` through an `ArenaLocal`. Build it last in the task,
+> sized once, so it is one allocation either way.
+> 2. Use `hashbrown::HashMap<K, V, FxBuildHasher, &Frame>`
+> (`HashMap::with_capacity_and_hasher_in`). The workspace builds hashbrown with `nightly`, so
+> its `A` is `core::alloc::Allocator`, which `&Frame` implements; blaze-mem offers no map of its
+> own. Where a key is a dense `u32` (an `Id` numbered by the pass), a `Vec<u32, &Frame>`
+> indexed by it beats any map: no hash, one load.
+> 3. `Tag::Diagnostics` (added in `crates/blaze-mem/src/tag.rs`, name `"diagnostics"`); your
+> tests already name it.
 
 # Requests from mem
 
@@ -222,7 +238,11 @@ dedup-mem added `crates/blaze-mem/src/align.rs` (+ `src/align/tests.rs`) and the
 Why: one implementation per primitive (docs/v2/plan/lanes/dedup.md, "align_up and friends":
 `blaze-mem`); `os::round_up` is the same function as `align::checked_align_up`.
 
-Status: open
+Status: done by mem (2026-10-29): 1 to 5 applied as written (`proptest` was already in the
+manifest once; the duplicate is gone). For 6, `align` is in `lib.rs`'s module list, and the crate
+doc says where rounding lives.
+
+> forwarded to mem (from requests, pass 16; told by tmux).
 
 ## dedup: copies of blaze-mem's allocators that lane mem's children are migrating (from dedup-mem)
 
@@ -274,6 +294,23 @@ I edit none of these files (their holders are not DONE).
 
 Status: open (information; each child applies its own)
 
+> forwarded to mem (from requests, pass 16; told by tmux).
+> mem-format, on its three items:
+> - `intern`'s `Bump`: it keeps its shape, but its chunks, tables and grown headers now come
+>   from `crates/intern/src/space.rs` (a 64 GiB `Tag::Intern` huge region, applied by requests'
+>   child `requests-ids`), not the global allocator. It is not moved onto `blaze_mem::Arena`
+>   because under `blaze_check` `Arena` reaches `chunks`, whose links are the model checker's
+>   atomics in process-wide statics: intern's model tests (`arena.rs` `mod model`) would carry
+>   that state from one execution to the next. `space.rs` uses std atomics only. If `Arena` gets
+>   a model-safe path (chunks per model execution), `Bump` becomes an `ArenaLocal<'static>` per
+>   shard, as written above, and goes.
+> - mbe's matcher `Arena` → `Buffers`: added to `v2/requests/mem-format-tokens.md` (end), to apply
+>   with its frame section; frontend-tokens told.
+> - `blaze-ids`' chunked table: `Column::claim`/`fill` is request 1 in `v2/requests/mem-format.md`
+>   (with `Block`, not a borrowing `Claimed`: a shard keeps its block under its own lock across
+>   calls, which a `Claimed<'_, T>` borrow can't). `blaze-ids` is written against it and waits on
+>   it.
+
 ## dedup: `blaze-cas`'s `aligned` and `blocks` are std's `next_multiple_of` (from dedup-mem, for mem-backend-cas)
 
 `crates/blaze-cas/src/disk.rs` (lane store DONE; mem-backend-cas is moving the crate):
@@ -291,4 +328,6 @@ Status: open (information; each child applies its own)
 
 Why: docs/v2/plan/lanes/dedup.md: where std's `next_multiple_of` serves, the helper goes.
 
-Status: open
+Status: done by mem-backend-cas (2026-10-29): applied as written; `lib.rs` lines are now 1257, 1848, 2380.
+
+> forwarded to mem (from requests, pass 16; told by tmux).

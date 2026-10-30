@@ -26,7 +26,10 @@ use syntax::{AstNode, ast};
 
 use super::{Inits, has_attr, layout, peel_casts, span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::{
+        bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
+        registry::LintId,
+    },
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -34,24 +37,42 @@ use crate::{
 const DESTRUCTORS: &str = "for more information, see <https://doc.rust-lang.org/reference/destructors.html>";
 const SAFE: &str = "a dangling pointer is safe, but dereferencing one is undefined behavior";
 
+const TEMPORARIES: &str = "dangling_pointers_from_temporaries";
+const LOCALS: &str = "dangling_pointers_from_locals";
+
+/// The searcher is a walk of its own, as rustc's `check_fn` makes one: the lints of a function
+/// come before those of the nodes in it, and the shared walk reaches them after. Each half runs
+/// only when its lint may fire in the crate.
 #[derive(Default)]
-pub(super) struct DanglingPointers {
+pub(crate) struct DanglingPointers {
     inits: Inits,
+    /// Whether `TEMPORARIES` and `LOCALS` may fire, found at the crate's first body.
+    runs: Option<(bool, bool)>,
+}
+
+impl DanglingPointers {
+    fn runs(&mut self, b: &BodyCx<'_, '_>) -> (bool, bool) {
+        *self.runs.get_or_insert_with(|| {
+            (b.cx.lint_may_fire(LintId::named(TEMPORARIES)), b.cx.lint_may_fire(LintId::named(LOCALS)))
+        })
+    }
 }
 
 impl LatePass for DanglingPointers {
-    fn name(&self) -> &'static str {
-        "DanglingPointers"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::BODY | Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set([TEMPORARIES, LOCALS]);
+    const HOOKS: Hooks = Hooks::BODY;
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Closure]);
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, out: &mut Vec<Found>) {
         let DefWithBodyId::FunctionId(function) = b.owner else { return };
+        let (temporaries, locals) = self.runs(b);
         let root = b.body.root_expr();
-        Searcher { b, inside_call_args: false, out }.expr(root);
+        if temporaries {
+            Searcher { b, inside_call_args: false, out }.expr(root);
+        }
+        if !locals {
+            return;
+        }
         let sig = FunctionSignature::of(b.db(), function);
         if sig.is_async() || sig.flags.contains(FnFlags::GEN) {
             return;
@@ -63,8 +84,11 @@ impl LatePass for DanglingPointers {
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Closure { body, closure_kind, .. } = b.store().expr(expr) else { return };
-        Searcher { b, inside_call_args: false, out }.expr(body);
-        if !matches!(closure_kind, ClosureKind::Closure) {
+        let (temporaries, locals) = self.runs(b);
+        if temporaries {
+            Searcher { b, inside_call_args: false, out }.expr(body);
+        }
+        if !locals || !matches!(closure_kind, ClosureKind::Closure) {
             return;
         }
         let Some(fn_ret) = closure_return(b, expr) else { return };
@@ -149,7 +173,7 @@ fn temporary(b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
     };
     let callee = name.text().to_string();
     let mut diag = Diag::lint(
-        "dangling_pointers_from_temporaries",
+        TEMPORARIES,
         format!("this creates a dangling pointer because temporary `{ty}` is dropped at end of statement"),
         ptr_span.clone(),
     );
@@ -338,7 +362,7 @@ impl Locals<'_, '_, '_> {
         let name = store[from].name.as_str().to_owned();
         let FnRet { ret_ty, ret_ty_span, fn_kind } = self.fn_ret;
         let mut diag = Diag::lint(
-            "dangling_pointers_from_locals",
+            LOCALS,
             format!("{fn_kind} returns a dangling pointer to dropped local variable `{name}`"),
             expr_span,
         );

@@ -166,30 +166,7 @@ fn finish(bytes: &mut Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn uleb(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
-pub(crate) fn sleb(out: &mut Vec<u8>, mut value: i64) {
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
-        if done {
-            out.push(byte);
-            return;
-        }
-        out.push(byte | 0x80);
-    }
-}
+pub(crate) use blaze_format::leb::{write_i64 as sleb, write_u64 as uleb};
 
 /// A record of a native `.eh_frame` section.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -330,15 +307,5 @@ mod tests {
         fde_two[4..8].copy_from_slice(&((bad.len() + 4 - first) as u32).to_le_bytes());
         bad.extend_from_slice(&fde_two);
         assert!(split(&bad).unwrap_err().contains("no CIE"));
-    }
-
-    #[test]
-    fn leb128_encodes_both_signs() {
-        let mut out = Vec::new();
-        sleb(&mut out, -8);
-        sleb(&mut out, 63);
-        sleb(&mut out, 64);
-        uleb(&mut out, 300);
-        assert_eq!(out, [0x78, 0x3f, 0xc0, 0x00, 0xac, 0x02]);
     }
 }

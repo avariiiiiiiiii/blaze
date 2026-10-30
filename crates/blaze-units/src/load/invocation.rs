@@ -102,7 +102,7 @@ pub(crate) struct Configured {
 }
 
 impl Versioned for Configured {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 2");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo configured 3");
 }
 
 impl Versioned for Asked {

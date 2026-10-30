@@ -59,6 +59,8 @@ use blaze_units::{
 use blaze_vfs::{Ticket, ViewId, Vfs};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::cli::print::Format;
+
 use super::{
     heads::Heads,
     mounts::Mounts,
@@ -116,6 +118,8 @@ pub struct Setup {
     pub host: String,
     /// The daemon's `PATH` and `HOME`: an agent's invocation's whole environment.
     pub env: Vec<(String, String)>,
+    /// Whether an agent's diagnostics are rendered in colour; a cargo command line's are as
+    /// its client resolved `--color` against its terminal ([`blaze_api::Cargo::color`]).
     pub color: bool,
     /// The lock writes and modes: `tags..tags + 2^32`.
     pub tags: u64,
@@ -282,6 +286,21 @@ pub fn invocation(work: &Work, targets: Option<&Targets>, root: &str, env: &[(St
         env: env.to_vec(),
         files: Vec::new(),
     }
+}
+
+/// Whether cargo's `args` ask for diagnostics a line each (`--message-format=short` or
+/// `json-diagnostic-short`), read as cargo reads each `--message-format`.
+fn short(args: &[String]) -> Result<bool, String> {
+    let mut values = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if let Some(value) = arg.strip_prefix("--message-format=") {
+            values.push(value.to_owned());
+        } else if arg == "--message-format" {
+            values.extend(args.next().cloned());
+        }
+    }
+    Ok(matches!(crate::cli::print::format(&values)?, Format::Short | Format::Json { short: true, .. }))
 }
 
 /// A view being made ready: its config, its database view, and what its load asked.
@@ -779,6 +798,7 @@ impl Jobs {
     pub fn happened(&mut self, w: &mut World<'_>, happened: &mut Vec<Happened<Value>>) {
         for it in happened.drain(..) {
             match it {
+                Happened::Kept { id, puts } => self.kept(w, id, puts),
                 Happened::Did { id, value } => self.did(w, id, value),
                 Happened::Started { id } => self.started_unit(w, id),
                 Happened::Post { task, again } => self.post(w, task, again),
@@ -788,6 +808,19 @@ impl Jobs {
             }
         }
         self.wind_up(w);
+    }
+
+    /// Keeps what a task's expansions put, from the store's one owner: a refused one fails the
+    /// task's job, naming the expansion.
+    fn kept(&mut self, w: &mut World<'_>, node: NodeId, puts: Vec<blaze_expand::Put>) {
+        let published = blaze_expand::publish(w.store, puts);
+        if let Some(ticket) = published.tickets.last() {
+            self.put = Some(*ticket);
+        }
+        let Some(refused) = published.refused.into_iter().next() else { return };
+        if let Some(job) = self.job_of(node).and_then(|id| self.jobs.get_mut(&id)) {
+            job.over.get_or_insert((false, Some(ApiError::new(refused, None))));
+        }
     }
 
     fn did(&mut self, w: &mut World<'_>, node: NodeId, value: Value) {
@@ -1039,6 +1072,13 @@ impl Jobs {
         for warning in &units.warnings {
             w.said.push(Said::Report(id, Response::Diagnostic(warned(warning))));
         }
+        let short = match short(&prep.config.invocation.args) {
+            Ok(short) => short,
+            Err(why) => {
+                self.end(w, id, false, Some(ApiError::new(why, Some("--message-format".to_owned()))));
+                return;
+            }
+        };
         let input = JobInput {
             db: w.db.clone(),
             queries: prep.queries,
@@ -1047,7 +1087,8 @@ impl Jobs {
             config: prep.config,
             units,
             store: w.store.reader(),
-            color: self.setup.color,
+            color: targets_of(&job.work).and_then(|it| it.cargo.as_ref()).map_or(self.setup.color, |it| it.color),
+            short,
             goal: goal_of(&job.work),
             cancelled: job.cancelled.clone(),
         };
@@ -1373,8 +1414,15 @@ impl Jobs {
         {
             job.over.get_or_insert((false, Some(error)));
         }
+        // Said once its last diagnostic is, so the client prints cargo's "generated N warnings"
+        // or "could not compile" there and not at the build's end. A unit that said nothing has
+        // no such line.
+        let ended = compiled.diagnostics.iter().find_map(|it| it.unit.clone());
         for diagnostic in compiled.diagnostics {
             w.said.push(Said::Report(id, Response::Diagnostic(diagnostic)));
+        }
+        if let Some(unit) = ended {
+            w.said.push(Said::Report(id, Response::UnitEnded(unit)));
         }
         for put in compiled.puts {
             let key = put.key;
@@ -1577,9 +1625,11 @@ impl Jobs {
             self.fronts.insert(input.config.invocation.root.clone(), kept);
         }
         let profile = input.units.finished.clone();
+        let members = input.units.packages.iter().filter(|it| it.is_member).count();
+        let members = u32::try_from(members).unwrap_or(u32::MAX);
         if !runs {
             let ok = ok && evaluation.is_none_or(|it| !it.failed);
-            w.said.push(Said::Report(id, Response::Built { artifacts, profile }));
+            w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
             self.worked(w, id);
             self.end(w, id, ok, None);
             return;
@@ -1592,7 +1642,7 @@ impl Jobs {
             Work::Run { bin, args, .. } => front.run(&artifacts, bin.as_deref(), args, tags),
             _ => unreachable!("checked above"),
         };
-        w.said.push(Said::Report(id, Response::Built { artifacts, profile }));
+        w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
         let mut runs = match started {
             Ok(runs) => runs,
             Err(error) => {
@@ -1920,6 +1970,19 @@ mod tests {
         assert_eq!(made.args, vec!["--workspace".to_owned()]);
         assert_eq!(made.cwd, "/w/a");
         assert_eq!(made.env, vec![("RUSTFLAGS".to_owned(), "-Dwarnings".to_owned())]);
+    }
+
+    #[test]
+    fn diagnostics_are_short_as_cargos_message_format_says() {
+        let short = |args: &[&str]| short(&args.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>());
+        assert_eq!(short(&[]), Ok(false));
+        assert_eq!(short(&["--message-format=short"]), Ok(true));
+        assert_eq!(short(&["--message-format", "short", "-p", "a"]), Ok(true));
+        assert_eq!(short(&["--message-format=json,json-diagnostic-short"]), Ok(true));
+        assert_eq!(short(&["--message-format=json-diagnostic-rendered-ansi"]), Ok(false));
+        assert_eq!(short(&["--message-format=human"]), Ok(false));
+        assert!(short(&["--message-format=short", "--message-format=human"]).is_err());
+        assert!(short(&["--message-format=terse"]).is_err());
     }
 
     #[test]

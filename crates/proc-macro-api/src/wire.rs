@@ -60,6 +60,7 @@ impl WireSpan {
     ) -> Result<Span, String> {
         let (anchor, ctx) = part(self.part())?;
         let Some(end) = self.start.checked_add(self.len) else {
+            // alloc: error path, naming the site.
             return Err(format!("a span at {} of {} bytes, ending past 4 GiB", self.start, self.len));
         };
         Ok(Span { range: TextRange::new(TextSize::new(self.start), TextSize::new(end)), anchor, ctx })
@@ -95,6 +96,7 @@ struct Ids<K, V> {
 
 impl<K: Copy + Eq + std::hash::Hash, V: Copy> Ids<K, V> {
     fn new() -> Self {
+        // alloc: none until the first insert; the ids of one request to another process (the edge).
         Ids { list: Vec::new(), map: FxHashMap::default() }
     }
 
@@ -122,20 +124,26 @@ impl<K: Copy + Eq + std::hash::Hash, V: Copy> Ids<K, V> {
 }
 
 /// The anchors and contexts a request sent, by their raw ids: what its answer may name.
-pub(crate) struct Sent {
+pub struct Sent {
     anchors: Ids<(u32, u32), SpanAnchor>,
     contexts: Ids<u32, SyntaxContext>,
     last: Option<(SpanAnchor, SyntaxContext)>,
 }
 
+impl Default for Sent {
+    fn default() -> Sent {
+        Sent::new()
+    }
+}
+
 impl Sent {
-    pub(crate) fn new() -> Sent {
+    pub fn new() -> Sent {
         Sent { anchors: Ids::new(), contexts: Ids::new(), last: None }
     }
 
     /// Notes the anchor and context of `span` as sent.
     #[inline]
-    pub(crate) fn span(&mut self, span: &Span) {
+    pub fn span(&mut self, span: &Span) {
         if self.last == Some((span.anchor, span.ctx)) {
             return;
         }
@@ -148,19 +156,21 @@ impl Sent {
     /// The anchor and context of `part`, which must both have been sent.
     pub(crate) fn part(&self, part: WirePart) -> Result<(SpanAnchor, SyntaxContext), String> {
         let Some(anchor) = self.anchors.get((part.file_id, part.ast_id)) else {
+            // alloc: error path, naming the part.
             return Err(format!(
                 "file {:#x} and AST id {} are no anchor the request sent",
                 part.file_id, part.ast_id
             ));
         };
         let Some(ctx) = self.contexts.get(part.ctx) else {
+            // alloc: error path, naming the part.
             return Err(format!("context {} is none the request sent", part.ctx));
         };
         Ok((anchor, ctx))
     }
 
     /// Whether `span`'s anchor and context were both sent.
-    pub(crate) fn has(&self, span: &Span) -> bool {
+    pub fn has(&self, span: &Span) -> bool {
         let anchor = (span.anchor.file_id.as_u32(), span.anchor.ast_id.into_raw());
         self.anchors.get(anchor) == Some(span.anchor)
             && self.contexts.get(span.ctx.into_u32()) == Some(span.ctx)
@@ -189,7 +199,7 @@ impl Sent {
     }
 
     /// Of every span of a request's span table.
-    pub(crate) fn of_table(table: &SpanDataIndexMap) -> Sent {
+    pub fn of_table(table: &SpanDataIndexMap) -> Sent {
         let mut sent = Sent::new();
         table.iter().for_each(|span| sent.span(span));
         sent
@@ -211,6 +221,7 @@ pub(crate) fn flat_answer(
     };
     let answered = deserialize_span_data_index_map(answered)?;
     if let Some((at, span)) = answered.iter().enumerate().find(|(_, span)| !sent.has(span)) {
+        // alloc: error path, naming the span.
         return Err(format!(
             "span {at} of the answer's span table, {span:?}, has an anchor or a context the \
              request did not send"
@@ -246,6 +257,7 @@ pub(crate) fn write_tree(subtree: tt::SubtreeView<'_>, sent: &mut Sent, out: &mu
                 sent.span(&inner.delimiter.open);
                 sent.span(&inner.delimiter.close);
                 builder.open(inner.delimiter.kind, inner.delimiter.open);
+                // clone: a slice iterator, no allocation.
                 let contents = fragment_contents(&inner, contents.clone()).unwrap_or(contents);
                 open.push((std::mem::replace(&mut trees, contents), inner.delimiter.close));
             }
@@ -256,15 +268,17 @@ pub(crate) fn write_tree(subtree: tt::SubtreeView<'_>, sent: &mut Sent, out: &mu
 
 /// The one tree of a server's answer `bytes`, each part one `sent` sent. `scratch` holds the
 /// bytes when they don't start at a word, which `read_wire` asks for.
-pub(crate) fn read_tree(
+pub fn read_tree(
     bytes: &[u8],
     sent: &Sent,
     scratch: &mut Vec<u8>,
 ) -> Result<tt::TopSubtree, String> {
     let bytes = aligned(bytes, scratch);
     let (tree, used) = tt::TopSubtree::read_wire(bytes, &mut |part| sent.part(part))
+        // alloc: error path.
         .map_err(|error| format!("the server's answer: {error}"))?;
     if used != bytes.len() {
+        // alloc: error path.
         return Err(format!(
             "the server's answer has {} bytes after its token tree",
             bytes.len() - used
@@ -299,10 +313,12 @@ pub fn raw_part(part: WirePart) -> Result<(SpanAnchor, SyntaxContext), String> {
 
 pub(crate) fn raw_file_id(raw: u32) -> Result<EditionedFileId, String> {
     if raw & EditionedFileId::RESERVED_MASK != 0 {
+        // alloc: error path, naming the id.
         return Err(format!("file id {raw:#x} has the reserved bit set"));
     }
     let edition = (raw & EditionedFileId::EDITION_MASK) >> EditionedFileId::FILE_ID_BITS;
     if edition > Edition::LATEST as u32 {
+        // alloc: error path, naming the id.
         return Err(format!("file id {raw:#x} has edition {edition}, past the latest"));
     }
     Ok(EditionedFileId::from_raw(raw))
@@ -310,6 +326,7 @@ pub(crate) fn raw_file_id(raw: u32) -> Result<EditionedFileId, String> {
 
 pub(crate) fn raw_context(raw: u32) -> Result<SyntaxContext, String> {
     if raw == u32::MAX {
+        // alloc: error path, naming the id.
         return Err(format!("context {raw:#x} is none `into_u32` gives"));
     }
     // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts. A server

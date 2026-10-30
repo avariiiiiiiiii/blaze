@@ -326,8 +326,9 @@ pub(super) fn region_liveness<'db>(
             next += 1;
         }
     }
+    let block_end = |point| cfg.block_end(body, cfg.location(point).block);
     radix::sort_by_key(&mut dropped, |&local| {
-        let first = drop_live[local].iter().map(|point| rank[point]).min().unwrap_or(usize::MAX);
+        let first = least_rank(&drop_live[local], &rank, cfg.points, block_end);
         radix::pack_64(first as u64, local as u64)
     });
     let mut components = DropComponents::new(ctx, regions);
@@ -339,6 +340,28 @@ pub(super) fn region_liveness<'db>(
         }
     }
     values
+}
+
+/// The least of `rank` over `points`, of `count` points in all, where `block_end` is the last
+/// point of a point's block. Ranks fall as points rise within a block (each block is numbered
+/// from its end), so a run's least is at the last point of each block it covers: one look per
+/// block a run covers, not per point.
+fn least_rank(
+    points: &IntervalSet,
+    rank: &[usize],
+    count: usize,
+    block_end: impl Fn(usize) -> usize,
+) -> usize {
+    let mut first = usize::MAX;
+    for (start, end) in points.runs_in(0, count.saturating_sub(1)) {
+        let mut at = start;
+        while at <= end {
+            let last = block_end(at).min(end);
+            first = first.min(rank[last]);
+            at = last + 1;
+        }
+    }
+    first
 }
 
 /// Which drops drop what may be initialized there, by point; and for each edge between
@@ -353,20 +376,30 @@ fn maybe_initialized_at_drops(
     let blocks = body.basic_blocks.len();
     let locals = body.locals.len();
     let mut transfer = GenKill::new(blocks, paths);
-    let mut on_return = GenKill::new(blocks, paths);
-    let mut returns_to: Vec<Option<BasicBlockId>> = vec![None; blocks];
+    let returning = |block: BasicBlockId| match body.basic_blocks[block].terminator.as_ref() {
+        Some(it) => match it.kind {
+            TerminatorKind::Call { target: Some(target), .. } => Some(target),
+            _ => None,
+        },
+        None => None,
+    };
+    // A call's return: a row per reachable call rather than per block.
+    let calls = cfg.order.iter().filter(|&&block| returning(block).is_some()).count();
+    let mut on_return = GenKill::new(calls, paths);
+    // Per block, the block its call returns to and the call's row.
+    let mut returns_to: Vec<Option<(BasicBlockId, usize)>> = vec![None; blocks];
+    let mut call = 0;
     for &block in &cfg.order {
         let data = &body.basic_blocks[block];
         let mut row = transfer.row(index(block));
         for statement in 0..=data.statements.len() {
             maybe_init_effect(moves, cfg, Location { block, statement }, &mut row, false);
         }
-        if let Some(TerminatorKind::Call { target: Some(target), .. }) =
-            data.terminator.as_ref().map(|it| &it.kind)
-        {
-            returns_to[index(block)] = Some(*target);
+        if let Some(target) = returning(block) {
+            returns_to[index(block)] = Some((target, call));
             let terminator = Location { block, statement: data.statements.len() };
-            maybe_init_effect(moves, cfg, terminator, &mut on_return.row(index(block)), true);
+            maybe_init_effect(moves, cfg, terminator, &mut on_return.row(call), true);
+            call += 1;
         }
     }
     let mut start = BitSet::new(paths);
@@ -374,8 +407,10 @@ fn maybe_initialized_at_drops(
         start.gen_range(moves.subtree(init.path));
     }
     let entry = forward(cfg, &transfer, body.start_block, &start, |from, to, state| {
-        if returns_to[index(from)] == Some(to) {
-            on_return.apply(index(from), state);
+        if let Some((target, call)) = returns_to[index(from)]
+            && target == to
+        {
+            on_return.apply(call, state);
         }
     });
     let mut exit = BitMatrix::new(blocks, locals);
@@ -447,7 +482,8 @@ fn locals_in(moves: &MoveData, state: &BitSet, mut found: impl FnMut(usize)) {
 struct InitAtExit {
     exit: BitMatrix,
     returned: BitMatrix,
-    returns_to: Vec<Option<BasicBlockId>>,
+    /// Per block, the block its call returns to (and the call's row of the analysis).
+    returns_to: Vec<Option<(BasicBlockId, usize)>>,
     /// The blocks the analysis reached, which nothing leaves otherwise.
     reached: BitSet,
 }
@@ -462,7 +498,7 @@ impl InitAtExit {
             return;
         }
         let mask = match self.returns_to[at] {
-            Some(target) if target == successor => self.returned.row(at),
+            Some((target, _)) if target == successor => self.returned.row(at),
             _ => self.exit.row(at),
         };
         for (word, mask) in live.iter_mut().zip(mask) {
@@ -923,4 +959,59 @@ pub(super) fn normalize_erased<'db>(ctx: &Ctx<'_, 'db>, ty: Ty<'db>) -> Option<T
             |_, _| Region::new_static(interner),
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_ids::rng::SplitMix64;
+
+    use super::{IntervalSet, least_rank};
+
+    #[test]
+    fn the_least_rank_per_run_is_the_least_per_point() {
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..2000 {
+            // Blocks of 1 to 6 points, laid out one after another.
+            let blocks: Vec<usize> = (0..1 + rng.index(8)).map(|_| 1 + rng.index(6)).collect();
+            let starts: Vec<usize> = blocks
+                .iter()
+                .scan(0, |at, &len| {
+                    let start = *at;
+                    *at += len;
+                    Some(start)
+                })
+                .collect();
+            let count: usize = blocks.iter().sum();
+            let block_of = |point: usize| starts.partition_point(|&it| it <= point) - 1;
+            // Some blocks walked in a shuffled order, each from its end; the rest unreached.
+            let mut order: Vec<usize> = (0..blocks.len()).collect();
+            rng.shuffle(&mut order);
+            order.truncate(1 + rng.index(blocks.len()));
+            let mut rank = vec![usize::MAX; count];
+            let mut next = 0;
+            for &block in &order {
+                for point in (starts[block]..starts[block] + blocks[block]).rev() {
+                    rank[point] = next;
+                    next += 1;
+                }
+            }
+            let mut points = IntervalSet::default();
+            for point in 0..count {
+                if rng.index(3) == 0 {
+                    points.insert(point);
+                }
+            }
+            let want = points.iter().map(|point| rank[point]).min().unwrap_or(usize::MAX);
+            let block_end = |point| {
+                let block = block_of(point);
+                starts[block] + blocks[block] - 1
+            };
+            assert_eq!(
+                least_rank(&points, &rank, count, block_end),
+                want,
+                "blocks {blocks:?}, order {order:?}, points {:?}",
+                points.iter().collect::<Vec<_>>()
+            );
+        }
+    }
 }

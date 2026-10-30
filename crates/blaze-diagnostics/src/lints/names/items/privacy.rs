@@ -4,126 +4,39 @@
 //! its bounds and `where` clauses `private_bounds`. In an associated type a type less visible than
 //! the type's nominal visibility is E0446, rustc's hard error of the same pass.
 //!
-//! The visibility an item is reachable at is rustc's effective visibility at its `Reachable`
-//! level, a module restriction or `pub`: from resolve, the least of its visibility and its
-//! module's (raised by `use`s); from the embargo visitor, raised for the items of impls and for
-//! what a reachable item's interface names. An item private to its module has none, and is not
-//! checked.
+//! The visibility an item is reachable at is its effective visibility at `Level::Reachable`
+//! (`names::effective`), a module restriction or `pub`; an item with none is not checked.
 //!
 //! Types are walked as rustc's `DefIdVisitorSkeleton` walks them: each ADT and trait they name,
 //! aliases expanded in place, `<T as Trait>::Assoc` as its associated type, its trait and then
 //! `T`, `impl Trait` as its bounds; an impl's associated types not looked into.
 //!
-//! Follows `compiler/rustc_privacy/src/lib.rs` (`EmbargoVisitor`, `SearchInterfaceForPrivateItems
-//! Visitor`, `PrivateItemsInPublicInterfacesChecker`, `check_private_in_public`),
-//! `compiler/rustc_resolve/src/effective_visibilities.rs`, `compiler/rustc_middle/src/ty/mod.rs`
+//! Follows `compiler/rustc_privacy/src/lib.rs` (`SearchInterfaceForPrivateItemsVisitor`,
+//! `PrivateItemsInPublicInterfacesChecker`, `check_private_in_public`),
+//! `compiler/rustc_middle/src/ty/mod.rs`
 //! (`Visibility::to_string`) and `compiler/rustc_privacy/src/diagnostics.rs`
 //! (`PrivateInterfacesOrBoundsLint`, `InPublicInterface`) (MIT or Apache-2.0).
 
 use std::cell::OnceCell;
 
 use blaze_items::Fact;
-use hir::{AsAssocItem as _, AssocItemContainer, HasSource, HasVisibility, InFile, ModuleDef, PathResolution};
-use rustc_hash::{FxHashMap, FxHashSet};
+use hir::{AsAssocItem as _, AssocItemContainer, HasSource, InFile, ModuleDef, PathResolution};
+use rustc_hash::FxHashSet;
 use syntax::{
     AstNode, AstPtr, SyntaxKind, SyntaxNode, SyntaxNodePtr,
     ast::{self, HasGenericArgs, HasTypeBounds},
 };
 
 use super::{
-    def_span,
-    visibility::{self, Def},
+    def_span, visibility,
     walk::{self, Container, Item},
 };
 use crate::{
     cx::Cx,
+    lints::names::effective::{self, Def, Effective, Level, Vis, greater, is_local, min, module_of, nominal},
     lower::{Found, Phase},
     model::Diag,
 };
-
-/// A visibility: everywhere, or in a module and the modules in it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Vis {
-    Public,
-    In(hir::Module),
-}
-
-fn vis_of(cx: &Cx<'_, '_>, vis: hir::Visibility) -> Vis {
-    match vis {
-        hir::Visibility::Public => Vis::Public,
-        hir::Visibility::PubCrate(_) => Vis::In(cx.krate.root_module(cx.db)),
-        hir::Visibility::Module(id, _) => Vis::In(hir::Module::from(id).nearest_non_block_module(cx.db)),
-    }
-}
-
-/// rustc's `is_at_least`.
-fn at_least(cx: &Cx<'_, '_>, a: Vis, b: Vis) -> bool {
-    match (a, b) {
-        (Vis::Public, _) => true,
-        (_, Vis::Public) => false,
-        (Vis::In(a), Vis::In(b)) => {
-            let mut at = Some(b);
-            while let Some(module) = at {
-                if module == a {
-                    return true;
-                }
-                at = module.parent(cx.db);
-            }
-            false
-        }
-    }
-}
-
-fn min(cx: &Cx<'_, '_>, a: Vis, b: Vis) -> Vis {
-    if at_least(cx, a, b) { b } else { a }
-}
-
-fn max(cx: &Cx<'_, '_>, a: Vis, b: Vis) -> Vis {
-    if at_least(cx, a, b) { a } else { b }
-}
-
-/// rustc's `greater_than`.
-fn greater(cx: &Cx<'_, '_>, a: Vis, b: Vis) -> bool {
-    a != b && at_least(cx, a, b)
-}
-
-/// The module a def is in, not counting blocks: rustc's `parent_module_from_def_id`.
-fn module_of(cx: &Cx<'_, '_>, def: Def) -> Option<hir::Module> {
-    let db = cx.db;
-    let module = match def {
-        Def::Item(it) => it.module(db)?,
-        Def::Field(it) => it.parent_def(db).module(db),
-        Def::Impl(it) => it.module(db),
-    };
-    Some(module.nearest_non_block_module(db))
-}
-
-fn is_local(cx: &Cx<'_, '_>, def: Def) -> bool {
-    module_of(cx, def).is_some_and(|it| it.krate(cx.db) == cx.krate)
-}
-
-/// What a def is visible in as it is written: an enum's variants and their fields as the enum,
-/// a trait's items as the trait.
-fn nominal(cx: &Cx<'_, '_>, def: Def) -> Vis {
-    let db = cx.db;
-    match def {
-        Def::Item(ModuleDef::EnumVariant(it)) => vis_of(cx, it.parent_enum(db).visibility(db)),
-        Def::Item(it) => vis_of(cx, it.visibility(db)),
-        Def::Field(it) => match it.parent_def(db) {
-            hir::Variant::EnumVariant(variant) => vis_of(cx, variant.parent_enum(db).visibility(db)),
-            _ => vis_of(cx, it.visibility(db)),
-        },
-        Def::Impl(_) => Vis::Public,
-    }
-}
-
-/// The visibility of a def private to its module.
-fn private(cx: &Cx<'_, '_>, def: Def) -> Vis {
-    match module_of(cx, def) {
-        Some(module) => Vis::In(module),
-        None => Vis::Public,
-    }
-}
 
 /// rustc's `Visibility::to_string` of `vis` for `def`.
 fn vis_str(cx: &Cx<'_, '_>, vis: Vis, def: Def) -> String {
@@ -144,200 +57,9 @@ fn vis_str(cx: &Cx<'_, '_>, vis: Vis, def: Def) -> String {
     }
 }
 
-/// The effective visibilities at rustc's `Reachable` level.
-struct Levels {
-    ev: FxHashMap<Def, Vis>,
-}
-
-impl Levels {
-    fn of(cx: &Cx<'_, '_>, items: &[Item]) -> Levels {
-        let db = cx.db;
-        let mut levels = Levels { ev: FxHashMap::default() };
-        let root = cx.krate.root_module(db);
-        levels.ev.insert(Def::Item(ModuleDef::Module(root)), Vis::Public);
-        let modules = crate::checks::modules(cx);
-        loop {
-            let mut changed = false;
-            for &module in &modules {
-                let inherited = levels.or_private(cx, Def::Item(ModuleDef::Module(module)));
-                let id: hir_def::ModuleId = module.into();
-                let scope = id.def_map(db).module(db, id).scope(db);
-                let names: Vec<(hir_def::ModuleDefId, hir::Visibility)> = scope
-                    .types()
-                    .map(|(_, it)| (it.def, it.vis))
-                    .chain(scope.values().map(|(_, it)| (it.def, it.vis)))
-                    .collect();
-                for (def, vis) in names {
-                    let def = Def::Item(ModuleDef::from(def));
-                    let vis = vis_of(cx, vis);
-                    if vis == Vis::In(module) || !is_local(cx, def) {
-                        continue;
-                    }
-                    changed |= levels.update(cx, def, min(cx, vis, inherited));
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        let defs: Vec<Def> = items.iter().filter_map(|it| visibility::def(cx, it)).collect();
-        for &def in &defs {
-            levels.members(cx, def);
-        }
-        let impls: Vec<hir::Impl> = defs
-            .iter()
-            .filter_map(|it| match it {
-                Def::Impl(imp) => Some(*imp),
-                _ => None,
-            })
-            .collect();
-        // Each def's interface is walked once per level it reaches, not once per round: what it
-        // raises depends only on its level. What it names is resolved once.
-        let mut walked: FxHashMap<Def, Vis> = FxHashMap::default();
-        let mut named: FxHashMap<Def, Vec<Def>> = FxHashMap::default();
-        let mut reached: Vec<(Def, Vis)> = Vec::new();
-        loop {
-            let mut changed = false;
-            for &imp in &impls {
-                let ev = levels.impl_ev(cx, imp, true);
-                changed |= levels.update(cx, Def::Impl(imp), ev);
-                let inherent = imp.trait_(db).is_none();
-                for assoc in imp.items(db) {
-                    let def = Def::Item(assoc.into());
-                    let ev = match inherent {
-                        true => {
-                            let vis = nominal(cx, def);
-                            if vis == private(cx, def) {
-                                continue;
-                            }
-                            min(cx, ev, vis)
-                        }
-                        false => ev,
-                    };
-                    changed |= levels.update(cx, def, ev);
-                }
-            }
-            reached.clear();
-            reached.extend(levels.ev.iter().filter(|&(def, ev)| walked.get(def) != Some(ev)).map(|(def, ev)| (*def, *ev)));
-            for &(def, ev) in &reached {
-                walked.insert(def, ev);
-                let nexts = named.entry(def).or_insert_with(|| match visibility::interface_node(cx, def) {
-                    Some(node) => visibility::named(cx, &node),
-                    None => Vec::new(),
-                });
-                for &next in nexts.iter() {
-                    if !is_local(cx, next) {
-                        continue;
-                    }
-                    let vis = nominal(cx, next);
-                    if vis == private(cx, next) {
-                        continue;
-                    }
-                    changed |= levels.update(cx, next, min(cx, ev, vis));
-                }
-            }
-            if !changed {
-                return levels;
-            }
-        }
-    }
-
-    fn get(&self, def: Def) -> Option<Vis> {
-        self.ev.get(&def).copied()
-    }
-
-    fn or_private(&self, cx: &Cx<'_, '_>, def: Def) -> Vis {
-        self.get(def).unwrap_or_else(|| private(cx, def))
-    }
-
-    /// Raises `def` to `vis`, and its members with it; whether it changed.
-    fn update(&mut self, cx: &Cx<'_, '_>, def: Def, vis: Vis) -> bool {
-        let old = self.get(def);
-        let new = match old {
-            Some(old) => max(cx, old, vis),
-            None => vis,
-        };
-        if old == Some(new) {
-            return false;
-        }
-        self.ev.insert(def, new);
-        self.members(cx, def);
-        true
-    }
-
-    /// An ADT's variants and fields, a trait's items: each at the least of its own visibility
-    /// and its parent's effective one, unless it is private.
-    fn members(&mut self, cx: &Cx<'_, '_>, def: Def) {
-        let db = cx.db;
-        let members: Vec<Def> = match def {
-            Def::Item(ModuleDef::Adt(hir::Adt::Enum(it))) => it
-                .variants(db)
-                .into_iter()
-                .flat_map(|variant| {
-                    std::iter::once(Def::Item(ModuleDef::EnumVariant(variant)))
-                        .chain(variant.fields(db).into_iter().map(Def::Field))
-                })
-                .collect(),
-            Def::Item(ModuleDef::Adt(hir::Adt::Struct(it))) => it.fields(db).into_iter().map(Def::Field).collect(),
-            Def::Item(ModuleDef::Adt(hir::Adt::Union(it))) => it.fields(db).into_iter().map(Def::Field).collect(),
-            Def::Item(ModuleDef::Trait(it)) => it.items(db).into_iter().map(|it| Def::Item(it.into())).collect(),
-            _ => return,
-        };
-        let inherited = self.or_private(cx, def);
-        for member in members {
-            let vis = nominal(cx, member);
-            if vis == private(cx, member) {
-                continue;
-            }
-            let ev = min(cx, vis, inherited);
-            let new = match self.get(member) {
-                Some(old) => max(cx, old, ev),
-                None => ev,
-            };
-            self.ev.insert(member, new);
-        }
-    }
-
-    /// `EffectiveVisibility::of_impl`: the least effective visibility of the local types and
-    /// traits its self type and trait name; only the outermost ones when `shallow`.
-    fn impl_ev(&self, cx: &Cx<'_, '_>, imp: hir::Impl, shallow: bool) -> Vis {
-        impl_defs(cx, imp, shallow).into_iter().fold(Vis::Public, |at, def| min(cx, self.or_private(cx, def), at))
-    }
-}
-
-/// The local types and traits an impl's self type and trait name.
-fn impl_defs(cx: &Cx<'_, '_>, imp: hir::Impl, shallow: bool) -> Vec<Def> {
-    let db = cx.db;
-    let mut defs = Vec::new();
-    let self_ty = imp.self_ty(db);
-    match shallow {
-        true => {
-            if let Some(adt) = self_ty.as_adt() {
-                defs.push(Def::Item(ModuleDef::Adt(adt)));
-            }
-            if let Some(it) = self_ty.as_dyn_trait() {
-                defs.push(Def::Item(ModuleDef::Trait(it)));
-            }
-        }
-        false => self_ty.walk(db, |ty| {
-            if let Some(adt) = ty.as_adt() {
-                defs.push(Def::Item(ModuleDef::Adt(adt)));
-            }
-            if let Some(it) = ty.as_dyn_trait() {
-                defs.push(Def::Item(ModuleDef::Trait(it)));
-            }
-        }),
-    }
-    if let Some(it) = imp.trait_(db) {
-        defs.push(Def::Item(ModuleDef::Trait(it)));
-    }
-    defs.retain(|it| is_local(cx, *it));
-    defs
-}
-
-pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
-    let levels = Levels::of(cx, items);
-    let mut checker = Checker { cx, levels: &levels, found: Vec::new(), seen: FxHashSet::default() };
+pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item], effective: &Effective) -> Vec<Found> {
+    // alloc: the pass's output, once per crate
+    let mut checker = Checker { cx, effective, found: Vec::new(), seen: FxHashSet::default() };
     let mut at = 0;
     while at < items.len() {
         let module = items[at].module;
@@ -373,9 +95,14 @@ struct Check<'i> {
     owner: &'i Item,
 }
 
+/// The visibility a def is reachable at: its effective visibility at `Level::Reachable`.
+fn reachable(effective: &Effective, def: Def) -> Option<Vis> {
+    effective.get(def).map(|ev| ev.at(Level::Reachable))
+}
+
 struct Checker<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
-    levels: &'c Levels,
+    effective: &'c Effective,
     found: Vec<Found>,
     /// rustc emits a diagnostic it already emitted once.
     seen: FxHashSet<String>,
@@ -402,7 +129,7 @@ impl Checker<'_, '_, '_> {
         let Some(def) = visibility::def(cx, item) else { return };
         let node = item.syntax();
         let vis = nominal(cx, def);
-        let ev = self.levels.get(def);
+        let ev = reachable(self.effective, def);
         match &item.node.value {
             ast::Item::Const(_) | ast::Item::Static(_) | ast::Item::Fn(_) | ast::Item::TypeAlias(_) => {
                 let mut check = self.check(item, def, node.clone(), descr_kind(item, false), vis, ev);
@@ -431,17 +158,17 @@ impl Checker<'_, '_, '_> {
                 let mut check = self.check(item, def, node.clone(), descr_kind(item, false), vis, ev);
                 self.generics(&mut check, &item.node.value);
                 self.clauses(&mut check, &item.node.value);
-                let levels = self.levels;
+                let effective = self.effective;
                 for field in walk::fields(item) {
-                    self.field(item, field, |field| (min(cx, vis, nominal(cx, field)), levels.get(field)));
+                    self.field(item, field, |field| (min(cx, vis, nominal(cx, field)), reachable(effective, field)));
                 }
             }
             ast::Item::Impl(imp) => {
                 let Def::Impl(id) = def else { return };
                 let of_trait = imp.trait_().is_some();
-                let defs = impl_defs(cx, id, false);
+                let defs = effective::impl_defs(cx, id, false);
                 let impl_vis = defs.iter().fold(Vis::Public, |at, it| min(cx, nominal(cx, *it), at));
-                let impl_ev = self.levels.impl_ev(cx, id, false);
+                let impl_ev = self.effective.of_impl(cx, id).at(Level::Reachable);
                 let mut check = self.check(item, def, node.clone(), "implementation", impl_vis, Some(impl_ev));
                 if !of_trait {
                     self.generics(&mut check, &item.node.value);
@@ -462,7 +189,7 @@ impl Checker<'_, '_, '_> {
                     let (vis, ev) = match of_trait {
                         false => (
                             min(cx, nominal(cx, assoc_def), impl_vis),
-                            self.levels.get(assoc_def).map(|ev| min(cx, ev, impl_ev)),
+                            reachable(self.effective, assoc_def).map(|ev| min(cx, ev, impl_ev)),
                         ),
                         true => (impl_vis, Some(impl_ev)),
                     };
@@ -477,7 +204,7 @@ impl Checker<'_, '_, '_> {
     fn foreign_item(&mut self, item: &Item) {
         let Some(def) = visibility::def(self.cx, item) else { return };
         let vis = nominal(self.cx, def);
-        let ev = self.levels.get(def);
+        let ev = reachable(self.effective, def);
         let mut check = self.check(item, def, item.syntax(), descr_kind(item, false), vis, ev);
         self.generics(&mut check, &item.node.value);
         self.clauses(&mut check, &item.node.value);

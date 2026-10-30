@@ -4,13 +4,9 @@
 //! sub-request this thread is answering from the database, another is opened: as many
 //! connections as expansions in flight, so no expansion waits on another and none can wait on
 //! itself.
-use std::{
-    fmt, io,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-};
+use std::{fmt, io, sync::Arc};
+
+use blaze_mem::{Column, Tag};
 
 use crate::{
     MacroDylib, ProcMacro, ServerError,
@@ -20,52 +16,33 @@ use crate::{
 /// Opens another connection to the same server program.
 pub(crate) type Open = Box<dyn Fn() -> io::Result<ProcMacroServerProcess> + Send + Sync>;
 
-/// Chunk `k` holds `FIRST << k` connections, so a connection never moves once added and a
-/// reader never locks; `CHUNKS` of them hold more than any machine runs at once.
-const FIRST: usize = 4;
-const CHUNKS: usize = 24;
+/// More connections to one server than any machine runs expansions at once.
+const MAX_CONNECTIONS: usize = 4096;
 
-/// The connections, append-only: one is added with a release store into a slot of its own.
-struct Connections {
-    chunks: [OnceLock<Box<[OnceLock<ProcMacroServerProcess>]>>; CHUNKS],
-    /// How many slots were handed out; a slot handed out and not set yet is skipped.
-    next: AtomicUsize,
-}
-
-fn chunk_of(n: usize) -> (usize, usize) {
-    let biased = n / FIRST + 1;
-    let chunk = (usize::BITS - 1 - biased.leading_zeros()) as usize;
-    (chunk, n - FIRST * ((1 << chunk) - 1))
-}
+/// The connections, append-only and never moved, so a reader takes no lock.
+struct Connections(Column<ProcMacroServerProcess>);
 
 impl Connections {
-    fn new() -> Connections {
-        Connections { chunks: std::array::from_fn(|_| OnceLock::new()), next: AtomicUsize::new(0) }
+    fn new() -> Result<Connections, ServerError> {
+        Column::new(MAX_CONNECTIONS, Tag::Expand).map(Connections).map_err(|error| ServerError {
+            // alloc: error path, once a server is started.
+            message: format!("reserving the proc-macro server's connection table: {error}"),
+            io: None,
+        })
     }
 
     fn push(&self, process: ProcMacroServerProcess) -> Result<(), ServerError> {
-        let n = self.next.fetch_add(1, Ordering::AcqRel);
-        let (chunk, at) = chunk_of(n);
-        if chunk >= CHUNKS {
-            return Err(ServerError {
-                message: format!("{n} connections to one proc-macro server are open at once"),
-                io: None,
-            });
-        }
-        let slots =
-            self.chunks[chunk].get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
-        if slots[at].set(process).is_err() {
-            unreachable!("connection slot {n} handed out twice");
-        }
-        Ok(())
+        self.0.push(process).map(drop).map_err(|error| ServerError {
+            // alloc: error path, naming the limit.
+            message: format!(
+                "more than {MAX_CONNECTIONS} connections to one proc-macro server at once: {error}"
+            ),
+            io: None,
+        })
     }
 
     fn iter(&self) -> impl Iterator<Item = &ProcMacroServerProcess> {
-        let len = self.next.load(Ordering::Acquire);
-        (0..len).filter_map(|n| {
-            let (chunk, at) = chunk_of(n);
-            self.chunks.get(chunk)?.get()?.get(at)?.get()
-        })
+        self.0.iter().map(|(_, process)| process)
     }
 }
 
@@ -91,7 +68,7 @@ impl ProcMacroServerPool {
     /// The pool of the connections `first`, which are at least one, that opens more by `open`.
     pub(crate) fn new(first: Vec<ProcMacroServerProcess>, open: Open) -> Result<Self, ServerError> {
         let version = first.first().expect("a pool of at least one connection").version();
-        let inner = Inner { connections: Connections::new(), version, open };
+        let inner = Inner { connections: Connections::new()?, version, open };
         for process in first {
             inner.connections.push(process)?;
         }
@@ -175,22 +152,5 @@ impl ProcMacroServerPool {
 
     pub(crate) fn version(&self) -> u32 {
         self.0.version
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn slots_cover_every_index_in_order() {
-        let mut expected = (0, 0);
-        for n in 0..10_000 {
-            assert_eq!(chunk_of(n), expected, "{n}");
-            expected.1 += 1;
-            if expected.1 == FIRST << expected.0 {
-                expected = (expected.0 + 1, 0);
-            }
-        }
     }
 }

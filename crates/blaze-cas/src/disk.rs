@@ -2,22 +2,19 @@
 //! the head. Every number is little-endian, every record 16-byte aligned, so a pack is read in
 //! place wherever it is mapped.
 
+use blaze_format::cursor::{Put as _, Reader};
 use blaze_ids::ContentId;
 
 use crate::{Key, Kind, crc};
 
 pub(crate) const ALIGN: u64 = 16;
 
-pub(crate) const fn aligned(n: u64) -> u64 {
-    (n + ALIGN - 1) & !(ALIGN - 1)
-}
-
 /// The bytes a record of `stored` payload bytes takes in its pack, padding included; `None`
 /// for a length no record can have, as an unverified header or index slot may say.
 pub(crate) const fn span_of(stored: u64) -> Option<u64> {
     match RECORD_HEADER.checked_add(stored) {
-        Some(n) if n <= u64::MAX - (ALIGN - 1) => Some(aligned(n)),
-        _ => None,
+        Some(n) => n.checked_next_multiple_of(ALIGN),
+        None => None,
     }
 }
 
@@ -25,10 +22,6 @@ pub(crate) const fn span_of(stored: u64) -> Option<u64> {
 /// ends on a block and can be written with `O_DIRECT`. The rest of a commit's last block is
 /// zeros, which a record header never starts with.
 pub(crate) const BLOCK: u64 = 4096;
-
-pub(crate) const fn blocks(n: u64) -> u64 {
-    (n + BLOCK - 1) & !(BLOCK - 1)
-}
 
 /// The domain of [`crate::Entry::content`]: what a value's bytes hash to.
 pub(crate) const VALUE_DOMAIN: &str = "blaze v2 store value 1";
@@ -244,8 +237,8 @@ pub(crate) fn record(header: &RecordHeader, payload: &[u8]) -> Vec<u8> {
 
 /// Appends one entry of a list of chunks to `out`: its key, then its length, `CHUNK_REF` bytes.
 pub(crate) fn encode_chunk(out: &mut Vec<u8>, key: Key, len: u64) {
-    out.extend_from_slice(&key.0.0);
-    out.extend_from_slice(&len.to_le_bytes());
+    out.put_bytes(&key.0.0);
+    out.put_u64(len);
 }
 
 pub(crate) fn decode_chunks(payload: &[u8]) -> Result<Vec<(Key, u64)>, &'static str> {
@@ -351,49 +344,49 @@ impl Head {
                 + self.units.len() * UNIT_REF
                 + HEAD_CHECK,
         );
-        out.extend_from_slice(&HEAD_MAGIC);
-        out.extend_from_slice(&crate::FORMAT.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&self.generation.to_le_bytes());
+        out.put_bytes(&HEAD_MAGIC);
+        out.put_u32(crate::FORMAT);
+        out.put_u32(0);
+        out.put_u64(self.generation);
         let index = self.index.unwrap_or(IndexRef {
             slot: u8::MAX,
             len: 0,
             check: 0,
             count: 0,
         });
-        out.extend_from_slice(&u64::from(index.slot).to_le_bytes());
-        out.extend_from_slice(&index.len.to_le_bytes());
-        out.extend_from_slice(&index.check.to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        out.extend_from_slice(&index.count.to_le_bytes());
-        out.extend_from_slice(&(self.packs.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.dictionaries.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.externals.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(self.units.len() as u32).to_le_bytes());
+        out.put_u64(u64::from(index.slot));
+        out.put_u64(index.len);
+        out.put_u32(index.check);
+        out.put_u32(0);
+        out.put_u64(index.count);
+        out.put_u32(self.packs.len() as u32);
+        out.put_u32(self.dictionaries.len() as u32);
+        out.put_u32(self.externals.len() as u32);
+        out.put_u32(self.units.len() as u32);
         debug_assert_eq!(out.len(), HEAD_FIXED);
         for pack in &self.packs {
-            out.push(u8::from(pack.removed));
-            out.extend_from_slice(&[0; 3]);
-            out.extend_from_slice(&pack.unit.to_le_bytes());
-            out.extend_from_slice(&pack.committed.to_le_bytes());
-            out.extend_from_slice(&pack.indexed.to_le_bytes());
-            out.extend_from_slice(&pack.dead.to_le_bytes());
+            out.put_u8(u8::from(pack.removed));
+            out.put_bytes(&[0; 3]);
+            out.put_u32(pack.unit);
+            out.put_u64(pack.committed);
+            out.put_u64(pack.indexed);
+            out.put_u64(pack.dead);
         }
         for dictionary in &self.dictionaries {
-            out.push(dictionary.kind.code());
-            out.extend_from_slice(&[0; 3]);
-            out.extend_from_slice(&dictionary.pack.to_le_bytes());
-            out.extend_from_slice(&dictionary.offset.to_le_bytes());
+            out.put_u8(dictionary.kind.code());
+            out.put_bytes(&[0; 3]);
+            out.put_u32(dictionary.pack);
+            out.put_u64(dictionary.offset);
         }
         for external in &self.externals {
-            out.extend_from_slice(&external.content.0);
-            out.extend_from_slice(&external.len.to_le_bytes());
+            out.put_bytes(&external.content.0);
+            out.put_u64(external.len);
         }
         for unit in &self.units {
-            out.extend_from_slice(&unit.0);
+            out.put_bytes(&unit.0);
         }
         let check = crc::crc32c(&out);
-        out.extend_from_slice(&check.to_le_bytes());
+        out.put_u32(check);
         out
     }
 
@@ -440,47 +433,41 @@ impl Head {
         if want != Some(body.len()) {
             return Err("its length is not what its counts say".into());
         }
-        let mut at = HEAD_FIXED;
+        let mut read = Reader::starting_at(body, HEAD_FIXED)?;
         let mut head = Head { generation, index, ..Head::default() };
         for _ in 0..packs {
-            let removed = match body[at] {
+            let removed = match read.u8()? {
                 0 => false,
                 1 => true,
                 _ => return Err("a pack neither kept nor removed".into()),
             };
-            if body[at + 1..at + 4].iter().any(|&it| it != 0) {
+            if *read.array::<3>()? != [0; 3] {
                 return Err("a pack has bytes set that no head sets".into());
             }
-            head.packs.push(PackRef {
-                unit: u32_at(body, at + 4),
-                committed: u64_at(body, at + 8),
-                indexed: u64_at(body, at + 16),
-                dead: u64_at(body, at + 24),
-                removed,
-            });
-            at += PACK_REF;
+            let unit = read.u32()?;
+            let (committed, indexed, dead) = (read.u64()?, read.u64()?, read.u64()?);
+            head.packs.push(PackRef { unit, committed, indexed, dead, removed });
         }
         for _ in 0..dictionaries {
-            let kind = Kind::from_code(body[at]).ok_or("a dictionary of no kind")?;
-            let pack = u32_at(body, at + 4);
+            let kind = Kind::from_code(read.u8()?).ok_or("a dictionary of no kind")?;
+            read.skip(3)?;
+            let pack = read.u32()?;
             if pack as usize >= head.packs.len() {
                 return Err("a dictionary in a pack it does not have".into());
             }
-            head.dictionaries.push(DictionaryRef { kind, pack, offset: u64_at(body, at + 8) });
-            at += DICTIONARY_REF;
+            head.dictionaries.push(DictionaryRef { kind, pack, offset: read.u64()? });
         }
         for _ in 0..externals {
-            head.externals.push(ExternalRef { content: id_at(body, at), len: u64_at(body, at + 32) });
-            at += EXTERNAL_REF;
+            let content = ContentId(*read.array()?);
+            head.externals.push(ExternalRef { content, len: read.u64()? });
         }
         let mut seen = rustc_hash::FxHashSet::default();
         for _ in 0..units {
-            let unit = id_at(body, at);
+            let unit = ContentId(*read.array()?);
             if unit == ContentId::default() || !seen.insert(unit) {
                 return Err("it lists a unit twice, or one of no crate".into());
             }
             head.units.push(unit);
-            at += UNIT_REF;
         }
         for (number, pack) in head.packs.iter().enumerate() {
             if pack.indexed > pack.committed

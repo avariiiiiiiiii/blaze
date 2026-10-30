@@ -21,7 +21,7 @@ use rustc_type_ir::{
 
 use super::{Inits, LayoutFacts, callee_item, expr_or_init, layout, peel_casts, span, type_info};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -30,7 +30,7 @@ const LINT: &str = "invalid_reference_casting";
 const NOTE: &str = "for more information, visit <https://doc.rust-lang.org/book/ch15-05-interior-mutability.html>";
 
 #[derive(Default)]
-pub(super) struct InvalidReferenceCasting {
+pub(crate) struct InvalidReferenceCasting {
     inits: Inits,
 }
 
@@ -42,13 +42,9 @@ enum PatternKind {
 }
 
 impl LatePass for InvalidReferenceCasting {
-    fn name(&self) -> &'static str {
-        "InvalidReferenceCasting"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set([LINT]);
+    const EXPRS: ExprKinds =
+        ExprKinds::of(&[ExprTag::Ref, ExprTag::Assignment, ExprTag::BinaryOp, ExprTag::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some((e, pat)) = borrow_or_assign(b, expr) else { return };

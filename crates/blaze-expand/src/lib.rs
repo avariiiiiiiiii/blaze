@@ -30,6 +30,7 @@
 //!
 //! [`compare`] holds the toolchain's server against blaze's, and keeps nothing while it does.
 
+pub mod bridge;
 mod compare;
 pub mod native;
 pub mod puts;
@@ -334,7 +335,7 @@ fn encoded(value: &impl serde::Serialize) -> Vec<u8> {
 thread_local! {
     /// The buffer a call's parts are encoded into before [`Given::part`] takes them: one per
     /// thread, grown to the largest call, so a key allocates no encoding.
-    static ENCODING: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static ENCODING: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; // alloc: none, an empty buffer
 }
 
 fn part_encoded(given: &mut Given, name: &'static str, value: &impl serde::Serialize) {
@@ -360,6 +361,7 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
     let attrs =
         call.attrs.map(|it| FlatTree::from_subtree(it.view(), CURRENT_API_VERSION, &mut table));
     let mut spans = Spans::default();
+    // alloc: the call's span shapes, beside the flat trees proc-macro-api makes, as a key is made
     let shapes: Vec<Shape> = table.iter().map(|span| spans.shape_new(span)).collect();
     let mut given = Given::new(RunKind::ProcMacro);
     given
@@ -380,17 +382,19 @@ pub fn given(toolchain: &ContentId, call: &Call<'_>) -> (Given, Spans) {
 pub fn written(output: &tt::TopSubtree, spans: &Spans) -> Option<Vec<u8>> {
     let mut table = SpanDataIndexMap::default();
     let flat = FlatTree::from_subtree(output.view(), CURRENT_API_VERSION, &mut table);
-    let shapes: Option<Vec<Shape>> = table.iter().map(|span| spans.shape(span)).collect();
+    let shapes: Option<Vec<Shape>> = table.iter().map(|span| spans.shape(span)).collect(); // alloc: once, as an expansion is kept
     Some(encoded(&(shapes?, flat)))
 }
 
 /// What [`written`] wrote, against the call's `spans`.
 pub fn read(bytes: &[u8], spans: &Spans) -> Result<tt::TopSubtree, String> {
     let (shapes, flat): (Vec<Shape>, FlatTree) =
-        postcard::from_bytes(bytes).map_err(|error| format!("not a kept expansion: {error}"))?;
+        postcard::from_bytes(bytes).map_err(|error| format!("not a kept expansion: {error}"))?; // alloc: error path
+    // alloc: the span table the tree read back is resolved against, as proc-macro-api's reader takes it
     let table: Option<SpanDataIndexMap> = shapes.into_iter().map(|it| spans.span(it)).collect();
     let table = table.ok_or("a kept expansion has a span of an anchor or context its call has not")?;
-    Ok(flat.to_subtree_resolved(CURRENT_API_VERSION, &table))
+    // alloc: error path
+    flat.to_subtree_resolved(CURRENT_API_VERSION, &table).map_err(|error| format!("a kept expansion: {error}"))
 }
 
 /// The first expansion that failed for a reason that is not the macro's own (its server died,
@@ -398,7 +402,7 @@ pub fn read(bytes: &[u8], spans: &Spans) -> Result<tt::TopSubtree, String> {
 static SERVER_FAILED: OnceLock<String> = OnceLock::new();
 
 fn system(said: String) -> ProcMacroExpansionError {
-    if SERVER_FAILED.set(said.clone()).is_ok() {
+    if SERVER_FAILED.set(said.clone()).is_ok() { // clone: error path, said once and returned
         eprintln!("proc macros: {said}");
     }
     ProcMacroExpansionError::System(said)
@@ -418,7 +422,7 @@ impl Kept {
         expanded: Result<tt::TopSubtree, ProcMacroExpansionError>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         match expanded {
-            Err(ProcMacroExpansionError::System(why)) => Err(system(format!(
+            Err(ProcMacroExpansionError::System(why)) => Err(system(format!( // alloc: error path
                 "the proc-macro server failed to expand `{}` of {}: {why}; what it did not \
                  expand is missing from the program, so nothing is built from it",
                 self.name, self.dylib.path
@@ -428,7 +432,7 @@ impl Kept {
     }
 
     fn error(&self, why: impl std::fmt::Display) -> ProcMacroExpansionError {
-        system(format!("{}: {why}", self.what()))
+        system(format!("{}: {why}", self.what())) // alloc: error path
     }
 
     /// Expands by the macro's server or module, through the store.
@@ -480,7 +484,7 @@ impl Kept {
                 Ok(Found::Miss { .. }) => Ok(Lookup::Nothing),
                 Err(FindError::Corrupt(corrupt)) => Err(self.error(corrupt)),
                 Err(FindError::NotAShape { key, why }) => {
-                    Err(self.error(format!("the store's {key:?} is not a shape: {why}")))
+                    Err(self.error(format!("the store's {key:?} is not a shape: {why}"))) // alloc: error path
                 }
                 Err(FindError::Inputs(unreadable)) => Err(self.error(unreadable)),
             }
@@ -511,7 +515,7 @@ impl Kept {
         let bytes = written(&output, &spans);
         if let Some(kept) = &found {
             if bytes.as_deref().map(checked).as_ref() != Some(kept) {
-                return Err(self.error(format!(
+                return Err(self.error(format!( // alloc: error path
                     "{CACHE}=check: it expanded otherwise than the store kept it, under a key \
                      of every input it was traced to read"
                 )));
@@ -535,7 +539,7 @@ impl Kept {
 
     /// This macro, as an error about one of its expansions begins.
     fn what(&self) -> String {
-        format!("the expansion of `{}` of {}", self.name, self.dylib.path)
+        format!("the expansion of `{}` of {}", self.name, self.dylib.path) // alloc: an error, or what a put said owns
     }
 
     /// What the expansion read, when it can be kept by it: `None` when it can't be, counted
@@ -603,7 +607,7 @@ impl ProcMacroExpander for Kept {
                 def_site,
                 call_site,
                 mixed_site,
-                current_dir.clone(),
+                current_dir.clone(), // clone: compare mode only, which expands the call twice
             );
             compare::again(
                 &self.dylib.path,
@@ -670,8 +674,8 @@ impl ProcMacroExpander for Kept {
         self.failed(expanded)
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        (other as &dyn Any)
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: the database's expander trait, the edge
+        (other as &dyn Any) // dyn: as above, told apart by type
             .downcast_ref::<Kept>()
             .is_some_and(|other| self.name == other.name && self.inner.eq_dyn(&*other.inner))
     }
@@ -736,6 +740,7 @@ pub fn report() -> Option<String> {
         return None;
     }
     let (_, keying) = counted(Counted::Keyed);
+    // alloc: the edge, a line of the daemon's log, said once as a build ends
     let mut said = format!(
         "proc macros: {expanded} expanded in {expanding:.2}s, {found} from the store in \
          {finding:.2}s, {keying:.2}s to key and look for them"
@@ -749,11 +754,11 @@ pub fn report() -> Option<String> {
         .into_iter()
         .filter_map(|(what, kind)| {
             let (calls, took) = counted(kind);
-            (calls != 0).then(|| format!("{calls} {what} in {took:.2}s"))
+            (calls != 0).then(|| format!("{calls} {what} in {took:.2}s")) // alloc: the edge, as above
         })
-        .collect();
+        .collect(); // alloc: the edge, as above
     if !kinds.is_empty() {
-        said += &format!(" ({})", kinds.join(", "));
+        said += &format!(" ({})", kinds.join(", ")); // alloc: the edge, as above
     }
     let rest = [
         ("kept", Counted::Kept),
@@ -767,14 +772,67 @@ pub fn report() -> Option<String> {
     for (what, which) in rest {
         let (calls, _) = counted(which);
         if calls != 0 {
-            said += &format!("; {calls} {what}");
+            said += &format!("; {calls} {what}"); // alloc: the edge, as above
         }
     }
     if let Some(compared) = compare::report() {
-        said += &format!("; {compared}");
+        said += &format!("; {compared}"); // alloc: the edge, as above
     }
     Some(said)
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod budget {
+    use blaze_cas::{Config, Store};
+    use blaze_core::{
+        FileName, run_until_idle,
+        sim::{Faults, Sim},
+    };
+
+    use super::*;
+
+    /// A call whose expansion is kept is found through [`Seen`], each variable its shape names
+    /// looked up where it is and each file stamped, with no allocation: the hit is read in
+    /// place.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_expansion_is_found_with_no_allocation() {
+        let mut sim = Sim::new(5, Faults::default());
+        let mut effects = Vec::new();
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+        let mut store = Store::open(config, &mut effects);
+        run_until_idle(&mut sim, &mut effects, |completion, effects| {
+            store.complete(completion, effects);
+        });
+        assert!(store.ready());
+        let lib = std::env::temp_dir().join(format!("blaze-expand-budget-{}", std::process::id()));
+        std::fs::write(&lib, b"a macro's library").unwrap();
+        let hash = inputs::hash_reader(b"a macro's library".as_slice()).unwrap();
+        let run = RunKey { code: ContentId::of("blaze v2 test 1", b"macro"), given: ContentId::default() };
+        let traced = Traced {
+            files: vec![(lib.clone(), Some(hash))],
+            env: vec![
+                ("CARGO_PKG_NAME".into(), Some("a".into())),
+                ("PATH".into(), Some("/bin".into())),
+                ("UNSET".into(), None),
+            ],
+            ..Traced::default()
+        };
+        index::keep(&mut store, &run, &traced, b"expansion".to_vec()).unwrap();
+        let passed = [("PATH".to_owned(), "/bin".to_owned())];
+        let call: Env = [("CARGO_PKG_NAME".to_owned(), "a".to_owned())].into_iter().collect();
+        let mut seen = Seen { passed: &passed, call: &call, made: None, none: inputs::Env::default() };
+        let reader = store.reader();
+        let guard = blaze_cas::enter();
+        let mut find = || {
+            matches!(index::find(&reader, &guard, &run, &mut seen), Ok(Found::Hit { value: b"expansion", .. }))
+        };
+        assert!(find());
+        assert!(blaze_alloc_count::assert_at_most(0, "a kept expansion found through Seen", &mut find));
+        drop(guard);
+        _ = std::fs::remove_file(&lib);
+    }
+}

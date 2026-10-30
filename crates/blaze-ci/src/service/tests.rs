@@ -232,10 +232,10 @@ fn a_push_end_to_end() {
     assert_eq!(*name, snapshot::name("c1", sim.now));
     assert_eq!(sim.service.jobs(), 0);
 
-    let kept = Kept { id: "snap-1".to_owned(), name: name.clone(), at: sim.now };
-    let out = sim.step(Input::Snapshotted(Ok(kept.clone())));
+    let kept = |at| Kept { id: "snap-1".to_owned(), name: name.clone(), at };
+    let out = sim.step(Input::Snapshotted(Ok(kept(sim.now))));
     assert_eq!(out, [Output::Save]);
-    assert_eq!(sim.service.state().snapshots, [kept.clone()]);
+    assert_eq!(sim.service.state().snapshots, [kept(sim.now)]);
 
     // Not due again within the interval.
     sim.now += 60;
@@ -772,6 +772,12 @@ fn random_orders_complete_every_check_run_and_post_only_to_named_commits() {
     }
 }
 
+fn tail(output: &[u8]) -> String {
+    let mut out = String::new();
+    tail_into(&mut out, output);
+    out
+}
+
 /// The tail as it was found before only the end of the output was read.
 fn tail_of_whole(output: &[u8]) -> String {
     let text = String::from_utf8_lossy(output);
@@ -819,4 +825,253 @@ fn the_tail_of_a_test_output_is_the_tail_of_the_whole_output() {
     let long: Vec<u8> = (0..10_000).flat_map(|line| format!("line {line} of a long output\n").into_bytes()).collect();
     assert_eq!(tail(&long), tail_of_whole(&long));
     assert_eq!(tail(b""), tail_of_whole(b""));
+    let wide: Vec<u8> = "é```".repeat(3000).into_bytes();
+    assert_eq!(tail(&wide), tail_of_whole(&wide));
+    let mut after = "kept ```".to_owned();
+    tail_into(&mut after, b"a```b\n");
+    assert_eq!(after, "kept ```a'''b", "only the tail is escaped, after what was there");
+}
+
+/// What a request's responses said, as the report kept them before its lists were one string
+/// each: a string per item, joined at the summary.
+#[derive(Default)]
+struct OldReport {
+    errors: usize,
+    warnings: usize,
+    listed: Vec<String>,
+    passed: usize,
+    failed: usize,
+    ignored: usize,
+    unreached: usize,
+    failures: Vec<String>,
+    artifacts: usize,
+    said: Vec<String>,
+    unexpected: Vec<String>,
+}
+
+impl OldReport {
+    fn add(&mut self, response: &Response) {
+        match response {
+            Response::Diagnostic(diagnostic) => match diagnostic.level {
+                Level::Error => {
+                    self.errors += 1;
+                    if self.listed.len() < MOST_LISTED {
+                        let mut text = String::new();
+                        render_diagnostic_into(&mut text, diagnostic).unwrap();
+                        self.listed.push(text);
+                    }
+                }
+                Level::Warning => self.warnings += 1,
+                Level::Note | Level::Help | Level::FailureNote => {}
+            },
+            Response::TestResult(test) => match test.outcome {
+                TestOutcome::Passed => self.passed += 1,
+                TestOutcome::Ignored => self.ignored += 1,
+                TestOutcome::Unreached => self.unreached += 1,
+                TestOutcome::Failed => {
+                    self.failed += 1;
+                    if self.failures.len() < MOST_LISTED {
+                        self.failures.push(format!(
+                            "test {} `{}` failed after {} ms; the end of its output:\n```\n{}\n```",
+                            test.binary,
+                            test.name,
+                            test.millis,
+                            tail_of_whole(&test.output)
+                        ));
+                    }
+                }
+            },
+            Response::Built { artifacts, .. } => self.artifacts += artifacts.len(),
+            Response::Error(error) => self.said.push(match &error.at {
+                Some(at) => format!("{} (at {at})", error.what),
+                None => error.what.clone(),
+            }),
+            Response::Done { .. } | Response::Snapshotted { .. } => {
+                if self.unexpected.len() < MOST_LISTED {
+                    let mut shown = format!("{response:?}");
+                    if shown.len() > 200 {
+                        let mut end = 200;
+                        while !shown.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        shown.truncate(end);
+                        shown.push_str("...");
+                    }
+                    self.unexpected.push(shown);
+                }
+            }
+            _ => unreachable!("not made by the test"),
+        }
+    }
+
+    fn summary(&self, kind: CheckKind, ok: bool) -> String {
+        let mut text = format!(
+            "{} error{}, {} warning{}",
+            self.errors,
+            plural(self.errors),
+            self.warnings,
+            plural(self.warnings)
+        );
+        match kind {
+            CheckKind::Test => text += &format!(
+                "; tests: {} passed, {} failed, {} ignored, {} not reached by the change (their \
+                 last results stand)",
+                self.passed, self.failed, self.ignored, self.unreached
+            ),
+            CheckKind::Build => text += &format!("; {} artifacts built", self.artifacts),
+            CheckKind::Check => {}
+        }
+        text.push('.');
+        if !self.listed.is_empty() {
+            text.push_str("\n\n## Errors\n");
+            for error in &self.listed {
+                text += &format!("\n{error}\n");
+            }
+            if self.errors > self.listed.len() {
+                text += &format!("\nand {} more errors\n", self.errors - self.listed.len());
+            }
+        }
+        if !self.failures.is_empty() {
+            text.push_str("\n\n## Failed tests\n");
+            for failure in &self.failures {
+                text += &format!("\n{failure}\n");
+            }
+            if self.failed > self.failures.len() {
+                text += &format!("\nand {} more failed tests\n", self.failed - self.failures.len());
+            }
+        }
+        if !self.said.is_empty() {
+            text.push_str("\n\n## The daemon's errors\n");
+            for error in &self.said {
+                text += &format!("\n- {error}");
+            }
+            text.push('\n');
+        }
+        if !self.unexpected.is_empty() {
+            text.push_str("\n\n## Responses this request should not have had\n");
+            for response in &self.unexpected {
+                text += &format!("\n- {response}");
+            }
+            text.push('\n');
+        }
+        if !ok && self.errors == 0 && self.failed == 0 && self.said.is_empty() {
+            text.push_str("\n\nThe daemon ended the request as failed and said nothing more.");
+        }
+        text
+    }
+}
+
+#[test]
+fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
+    let mut rng = SplitMix64::new(0x5eed_0f_5e1f);
+    let outputs = ["", "ok\n", "a```b\nline two\r\n\n", "é\xff\n", "panicked at src/lib.rs:3:5\n"];
+    for round in 0..300 {
+        let (mut new, mut old) = (Report::default(), OldReport::default());
+        let count = if round % 10 == 0 { 2 * MOST_LISTED + 20 } else { rng.index(30) };
+        for at in 0..count {
+            let response = match rng.index(9) {
+                0 | 1 => error(&format!("mismatched types {at}"), "src/lib.rs"),
+                2 => Response::Diagnostic(Diagnostic {
+                    level: [Level::Warning, Level::Note, Level::Help][rng.index(3)],
+                    code: None,
+                    message: "unused".to_owned(),
+                    spans: Vec::new(),
+                    children: Vec::new(),
+                    facts: Vec::new(),
+                    rendered: String::new(),
+                    unit: None,
+                }),
+                3 | 4 => {
+                    let outcome = [TestOutcome::Passed, TestOutcome::Failed, TestOutcome::Ignored, TestOutcome::Unreached]
+                        [rng.index(4)];
+                    let output = outputs[rng.index(outputs.len())].repeat(1 + rng.index(40));
+                    Response::TestResult(TestResult {
+                        binary: "blaze_ci".to_owned(),
+                        name: format!("t{at}"),
+                        cached: None,
+                        outcome,
+                        output: output.into_bytes(),
+                        millis: at as u64,
+                    })
+                }
+                5 => Response::Error(ApiError::new(format!("lost {at}"), (at % 2 == 0).then(|| "a.sock".to_owned()))),
+                6 => Response::Done { ok: at % 2 == 0 },
+                7 => Response::Snapshotted { heads: vec![("é".repeat(150), ContentId([5; 32]))] },
+                _ => Response::Built { members: 1, profile: "dev".to_owned(), artifacts: Vec::new() },
+            };
+            old.add(&response);
+            new.add(response);
+        }
+        let ok = rng.index(2) == 0;
+        for kind in [CheckKind::Check, CheckKind::Build, CheckKind::Test] {
+            assert_eq!(new.summary(kind, ok), old.summary(kind, ok), "round {round} {kind:?}");
+        }
+    }
+}
+
+/// A pull request's job with its checkout done and its two requests sent, each run with its id
+/// from GitHub.
+fn running_pull(sim: &mut Sim) -> Vec<(JobId, RunId, Request)> {
+    let event = Event::PullRequest { number: 7, head: "h1".repeat(20), base: "b1".repeat(20), from_fork: false };
+    let started = checkout(&sim.event(event)).unwrap();
+    sends(&sim.step(Input::CheckedOut { job: started.job, result: Ok(root("h1")) }))
+}
+
+#[test]
+fn a_warm_service_step_allocates_only_what_it_posts() {
+    let mut sim = Sim::new(0);
+    let sent = running_pull(&mut sim);
+    let ((job, check_run, _), (_, test_run, _)) = (sent[0].clone(), sent[1].clone());
+    let now = sim.now;
+    let mut out = Vec::with_capacity(64);
+    let mut step = |service: &mut Service, input: Input, out: &mut Vec<Output>| {
+        out.clear();
+        service.step(now, input, out);
+    };
+
+    for (what, response) in [
+        ("a passed test", test_result("a", TestOutcome::Passed, "")),
+        ("an ignored test", test_result("b", TestOutcome::Ignored, "")),
+        ("a test the change did not reach", test_result("c", TestOutcome::Unreached, "")),
+    ] {
+        let input = Input::Response { job, run: test_run, response };
+        blaze_alloc_count::assert_at_most(0, what, || step(&mut sim.service, input, &mut out));
+    }
+    let warning = Response::Diagnostic(Diagnostic {
+        level: Level::Warning,
+        code: None,
+        message: "unused".to_owned(),
+        spans: Vec::new(),
+        children: Vec::new(),
+        facts: Vec::new(),
+        rendered: String::new(),
+        unit: None,
+    });
+    let input = Input::Response { job, run: check_run, response: warning };
+    blaze_alloc_count::assert_at_most(0, "a warning", || step(&mut sim.service, input, &mut out));
+    for at in 0..MOST_LISTED + 50 {
+        let input = Input::Response { job, run: check_run, response: error(&format!("e{at}"), "a.rs") };
+        let budget = u64::from(at < MOST_LISTED);
+        blaze_alloc_count::assert_at_most(
+            budget,
+            "an error: listed, at most its list's buffer growing; past the most listed, counted",
+            || step(&mut sim.service, input, &mut out),
+        );
+    }
+    assert!(out.is_empty(), "a response posts nothing: {out:?}");
+
+    let ended = Input::Ended { job, run: test_run, ok: true };
+    blaze_alloc_count::assert_at_most(
+        4,
+        "a green run's end: its summary, and the check run handed to the GitHub thread (its name, \
+         commit and summary)",
+        || step(&mut sim.service, ended, &mut out),
+    );
+    assert!(matches!(&out[..], [Output::Update { check, .. }] if check.status == CheckStatus::Success), "{out:?}");
+
+    let ignored = Input::Ended { job, run: test_run, ok: true };
+    blaze_alloc_count::assert_at_most(0, "an end already ended", || step(&mut sim.service, ignored, &mut out));
+    let late = Input::Created { run: test_run, result: Ok(github_id(test_run)) };
+    blaze_alloc_count::assert_at_most(0, "a creation already answered", || step(&mut sim.service, late, &mut out));
+    assert!(out.is_empty(), "{out:?}");
 }

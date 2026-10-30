@@ -6,6 +6,8 @@
 //! The daemon stops the results a mismatch names; the service only posts what it found as the
 //! check run [`CHECK`].
 
+use std::fmt::Write as _;
+
 use blaze_api::Mismatch;
 use blaze_ids::ContentId;
 
@@ -29,24 +31,29 @@ pub fn sampled(commit: &str, one_in: u64) -> bool {
 /// should have changed its edge and did not.
 pub fn summary(mismatches: &[Mismatch]) -> String {
     if mismatches.is_empty() {
+        // alloc: once per sampled view verified, its summary
         return "Built again from nothing, every result matched the daemon's.".to_owned();
     }
-    let mut text = format!(
+    let mut text = format!( // alloc: once per sampled view verified, its summary
         "Built again from nothing, {} result{} differed from the daemon's; the daemon stopped \
          them.\n",
         mismatches.len(),
         if mismatches.len() == 1 { "" } else { "s" }
     );
     for mismatch in mismatches {
-        text.push_str(&format!(
-            "\n- query of kind {} on input {:x}: incremental {:?}, from nothing {:?}\n",
+        writeln!(
+            text,
+            "\n- query of kind {} on input {:x}: incremental {:?}, from nothing {:?}",
             mismatch.query.kind.0, mismatch.query.input, mismatch.incremental, mismatch.scratch
-        ));
+        )
+        .expect("a String takes every byte");
         match &mismatch.fact {
-            Some(fact) => text.push_str(&format!(
-                "  the fact that missed: {} (kind {} on input {:x})\n",
+            Some(fact) => writeln!(
+                text,
+                "  the fact that missed: {} (kind {} on input {:x})",
                 fact.what, fact.key.kind.0, fact.key.input
-            )),
+            )
+            .expect("a String takes every byte"),
             None => text.push_str("  the oracle found no fact whose edge missed\n"),
         }
     }

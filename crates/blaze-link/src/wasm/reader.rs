@@ -2,6 +2,8 @@
 
 use std::ops::Range;
 
+use blaze_format::leb::{self, LebError};
+
 pub(super) struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -46,69 +48,25 @@ impl<'a> Reader<'a> {
         rest
     }
 
-    fn unsigned(&mut self, bits: u32) -> Result<u64, String> {
-        let mut value = 0u64;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            if shift >= bits {
-                // alloc: error path
-                return Err(format!("a LEB128 longer than {bits} bits"));
-            }
-            let low = u64::from(byte & 0x7f);
-            if bits - shift < 7 && low >> (bits - shift) != 0 {
-                // alloc: error path
-                return Err(format!("a LEB128 past {bits} bits"));
-            }
-            value |= low << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-    }
-
-    fn signed(&mut self, bits: u32) -> Result<i64, String> {
-        let mut value = 0i64;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            if shift >= bits {
-                // alloc: error path
-                return Err(format!("a LEB128 longer than {bits} bits"));
-            }
-            value |= i64::from(byte & 0x7f) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                if shift < 64 && byte & 0x40 != 0 {
-                    value |= -1i64 << shift;
-                }
-                if bits < 64 {
-                    let half = 1i64 << (bits - 1);
-                    if value < -half || value >= half {
-                        // alloc: error path
-                        return Err(format!("a signed LEB128 past {bits} bits"));
-                    }
-                }
-                return Ok(value);
-            }
-        }
+    fn leb<T>(&mut self, read: fn(&[u8], &mut usize) -> Result<T, LebError>) -> Result<T, String> {
+        // alloc: error path
+        read(self.bytes, &mut self.at).map_err(|error| error.to_string())
     }
 
     pub(super) fn u32(&mut self) -> Result<u32, String> {
-        Ok(self.unsigned(32)? as u32)
+        self.leb(leb::read_u32)
     }
 
     pub(super) fn u64(&mut self) -> Result<u64, String> {
-        self.unsigned(64)
+        self.leb(leb::read_u64)
     }
 
     pub(super) fn i32(&mut self) -> Result<i32, String> {
-        Ok(self.signed(32)? as i32)
+        self.leb(leb::read_i32)
     }
 
     pub(super) fn i64(&mut self) -> Result<i64, String> {
-        self.signed(64)
+        self.leb(leb::read_i64)
     }
 
     /// A count of things that follow, each at least a byte: more than the bytes left is

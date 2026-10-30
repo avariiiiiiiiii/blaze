@@ -287,7 +287,7 @@ fn missing_parentheses<'db>(cx: &Cx<'_, 'db>, pat: &Pat<'db>, fields: &[hir::Fie
     if ty.as_adt().is_none() {
         return false;
     }
-    let field_ty = field.ty(cx.db).instantiate_type_params(ty.type_arguments());
+    let field_ty = field.ty(cx.db).instantiate_type_params(cx.db, ty.type_arguments());
     field_ty.is_tuple() && field_ty.tuple_fields(cx.db).len() == pat.subpats.len()
 }
 

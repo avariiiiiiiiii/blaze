@@ -35,6 +35,8 @@ mod pat;
 mod path;
 pub mod persist;
 mod place_op;
+pub mod prelude_lints;
+mod sized_bound;
 pub(crate) mod unify;
 
 use std::{
@@ -330,6 +332,12 @@ pub enum InferenceDiagnostic {
     InvalidRangePatType {
         #[type_visitable(ignore)]
         pat: PatId,
+        /// Each end's type as inference had it when it checked that end (see
+        /// `types_at_error`), and whether that end is not `char` or numeric.
+        #[type_visitable(ignore)]
+        lhs: Option<(StoredTy, bool)>,
+        #[type_visitable(ignore)]
+        rhs: Option<(StoredTy, bool)>,
     },
     DuplicateField {
         #[type_visitable(ignore)]
@@ -456,6 +464,11 @@ pub enum InferenceDiagnostic {
         expected: usize,
         #[type_visitable(ignore)]
         found: usize,
+        #[type_visitable(ignore)]
+        variant: VariantId,
+        /// Whether the pattern's type did not match the scrutinee's (rustc's `had_err`).
+        #[type_visitable(ignore)]
+        had_err: bool,
     },
     ExpectedFunction {
         #[type_visitable(ignore)]
@@ -567,6 +580,46 @@ pub enum InferenceDiagnostic {
     MethodCallIllegalSizedBound {
         #[type_visitable(ignore)]
         call_expr: ExprId,
+        #[type_visitable(ignore)]
+        method: FunctionId,
+        /// Whose own clauses (the method's, or its trait's or impl's) hold the `Self: Sized`
+        /// bound, as rustc's span of it; `None` where only elaboration gives it.
+        #[type_visitable(ignore)]
+        bound: Option<GenericDefId>,
+        #[type_visitable(ignore)]
+        needs_mut: bool,
+        /// The traits a probe over every crate's traits picks the method from instead.
+        #[type_visitable(ignore)]
+        candidates: Box<[TraitId]>,
+    },
+    /// rustc's `lint_edition_dependent_dot_call`: a method call `lint`'s edition resolves to
+    /// another method.
+    EditionDependentMethodCall {
+        #[type_visitable(ignore)]
+        call_expr: ExprId,
+        #[type_visitable(ignore)]
+        receiver: ExprId,
+        #[type_visitable(ignore)]
+        lint: prelude_lints::EditionLint,
+        #[type_visitable(ignore)]
+        method: FunctionId,
+        /// An inherent or object pick, whose receiver rustc writes with its adjustments; else
+        /// it writes the call fully qualified.
+        #[type_visitable(ignore)]
+        inherent: bool,
+        #[type_visitable(ignore)]
+        autoderefs: u32,
+        #[type_visitable(ignore)]
+        autoref: Option<prelude_lints::ReceiverAdjustment>,
+    },
+    /// rustc's `lint_fully_qualified_call_from_2018`: `T::try_from`, `T::try_into` or
+    /// `T::from_iter` of a trait the 2021 prelude adds one of that name beside.
+    FullyQualifiedCallFrom2018 {
+        #[type_visitable(ignore)]
+        node: ExprOrPatIdPacked,
+        #[type_visitable(ignore)]
+        item: CandidateId,
+        self_ty: StoredTy,
     },
     MethodCallIncorrectGenericsOrder {
         #[type_visitable(ignore)]
@@ -717,6 +770,44 @@ pub enum UnreachableAt {
     IfBlock(ExprId),
     /// "block in `let` expression": `check_expr_let`, its initializer.
     LetInit(ExprId),
+}
+
+/// What rustc's `report_arg_errors` reads of a call whose arguments do not fit its inputs
+/// (`check_argument_types` with `call_appears_satisfied` false). Every type is as found
+/// then: an undecided integer or float literal's type a `FreshIntTy` / `FreshFloatTy`
+/// (`{integer}`, `{float}`), any other variable an error. For printing only: no solver may
+/// see them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CallArguments {
+    /// rustc's `callee_ty`: the adjusted type of a call's callee (a function's, constructor's
+    /// or method's `FnDef`, a closure, a function pointer, or a type called through
+    /// `Fn`/`FnMut`/`FnOnce`), or of a method call's receiver.
+    pub callee: StoredTy,
+    /// The method of a method call (rustc's `type_dependent_def`); `None` for a call.
+    pub method: Option<FunctionId>,
+    /// A method call (rustc's `is_method`): the receiver is not among the arguments.
+    pub is_method: bool,
+    /// The callee is C-variadic (E0060).
+    pub c_variadic: bool,
+    /// `formal_and_expected_inputs`: the signature's inputs (untupled for a `Fn*` call).
+    pub formal_inputs: Box<[StoredTy]>,
+    /// What the expected output makes of `formal_inputs`, the same when it makes nothing.
+    pub expected_inputs: Box<[StoredTy]>,
+    /// `provided_arg_tys`: each argument's type after adjustments, in order, without those
+    /// taken as legacy const generics (all of them past the inputs of a C-variadic callee).
+    pub provided: Box<[StoredTy]>,
+    /// The compatible cells of `ArgMatrix::new`, by provided argument: argument `i` fits the
+    /// inputs `compatible[compatible_ends[i - 1]..compatible_ends[i]]`, the first from 0.
+    pub compatible_ends: Box<[u32]>,
+    pub compatible: Box<[u32]>,
+}
+
+impl CallArguments {
+    /// The inputs provided argument `provided` fits (`Compatibility::Compatible`).
+    pub fn compatible_with(&self, provided: usize) -> &[u32] {
+        let start = provided.checked_sub(1).map_or(0, |it| self.compatible_ends[it] as usize);
+        &self.compatible[start..self.compatible_ends[provided] as usize]
+    }
 }
 
 /// Represents coercing a value to a different type of value.
@@ -924,6 +1015,9 @@ pub struct InferenceResult<'db> {
     pub(crate) field_resolutions: FieldColumn,
     /// For each struct literal or pattern, records the variant it resolves to.
     pub(crate) variant_resolutions: ExprOrPatColumn<VariantId>,
+    /// For each value path, expression or pattern, what it resolves to (an associated item's
+    /// path as its function or const, which [`Self::assoc_resolutions`] gives with arguments).
+    pub(crate) value_resolutions: ExprOrPatColumn<ValueNs>,
     /// For each associated item record what it resolves to
     pub(crate) assoc_resolutions: ExprOrPatColumn<(CandidateId, StoredGenericArgs)>,
     /// Whenever a tuple field expression access a tuple field, we allocate a tuple id in
@@ -1017,6 +1111,7 @@ pub(crate) struct InferenceTables<'db> {
     method_resolutions: ArenaMap<ExprId, (FunctionId, StoredGenericArgs)>,
     field_resolutions: ArenaMap<ExprId, Either<FieldId, TupleFieldId>>,
     variant_resolutions: ExprOrPatMap<VariantId>,
+    value_resolutions: ExprOrPatMap<ValueNs>,
     assoc_resolutions: ExprOrPatMap<(CandidateId, StoredGenericArgs)>,
     type_of_expr: ArenaMap<ExprId, StoredTy>,
     type_of_pat: ArenaMap<PatId, StoredTy>,
@@ -1043,6 +1138,7 @@ impl<'db> InferenceTables<'db> {
             method_resolutions: ArenaMap::default(),
             field_resolutions: ArenaMap::default(),
             variant_resolutions: ExprOrPatMap::default(),
+            value_resolutions: ExprOrPatMap::default(),
             assoc_resolutions: ExprOrPatMap::default(),
             type_of_expr: ArenaMap::default(),
             type_of_pat: ArenaMap::default(),
@@ -1140,6 +1236,7 @@ impl<'db> InferenceTables<'db> {
             method_resolutions,
             field_resolutions,
             variant_resolutions,
+            value_resolutions,
             assoc_resolutions,
             type_of_expr,
             type_of_pat,
@@ -1168,6 +1265,7 @@ impl<'db> InferenceTables<'db> {
             method_resolutions: IndexColumn::from_entries(method_resolutions),
             field_resolutions: FieldColumn::from_entries(field_resolutions),
             variant_resolutions: variant_resolutions.freeze(),
+            value_resolutions: value_resolutions.freeze(),
             assoc_resolutions: assoc_resolutions.freeze(),
             tuple_field_access_types,
             type_of_expr: TyColumn::from_entries(type_of_expr),
@@ -1554,6 +1652,7 @@ impl<'db> InferenceResult<'db> {
             method_resolutions: Default::default(),
             field_resolutions: Default::default(),
             variant_resolutions: Default::default(),
+            value_resolutions: Default::default(),
             assoc_resolutions: Default::default(),
             tuple_field_access_types: Default::default(),
             diagnostics: Default::default(),
@@ -1596,6 +1695,14 @@ impl<'db> InferenceResult<'db> {
             ExprOrPatId::ExprId(id) => self.variant_resolution_for_expr(id),
             ExprOrPatId::PatId(id) => self.variant_resolution_for_pat(id),
         }
+    }
+    /// What the value path `id` (a path expression or pattern) resolved to.
+    pub fn value_resolution(&self, id: ExprOrPatId) -> Option<ValueNs> {
+        let node = match id {
+            ExprOrPatId::ExprId(id) => id.into(),
+            ExprOrPatId::PatId(id) => id.into(),
+        };
+        self.value_resolutions.get(node).copied()
     }
     pub fn assoc_resolutions_for_expr<'a>(
         &self,
@@ -1925,6 +2032,7 @@ impl<'db> InferenceContext<'db> {
             method_resolutions,
             field_resolutions,
             variant_resolutions,
+            value_resolutions,
             assoc_resolutions,
             type_of_expr,
             type_of_pat,
@@ -1948,6 +2056,10 @@ impl<'db> InferenceContext<'db> {
         for (node, variant) in other.variant_resolutions.iter() {
             debug_assert!(variant_resolutions.get(node).is_none_or(|it| it == variant));
             variant_resolutions.insert(node, *variant);
+        }
+        for (node, value) in other.value_resolutions.iter() {
+            debug_assert!(value_resolutions.get(node).is_none_or(|it| it == value));
+            value_resolutions.insert(node, *value);
         }
         for (node, resolution) in other.assoc_resolutions.iter() {
             debug_assert!(assoc_resolutions.get(node).is_none_or(|it| it == resolution));
@@ -2101,6 +2213,7 @@ impl<'db> InferenceContext<'db> {
             method_resolutions,
             field_resolutions: _,
             variant_resolutions: _,
+            value_resolutions: _,
             assoc_resolutions,
             type_of_expr,
             type_of_pat,
@@ -2346,6 +2459,10 @@ impl<'db> InferenceContext<'db> {
 
     fn write_variant_resolution(&mut self, id: ExprOrPatIdPacked, variant: VariantId) {
         self.result.variant_resolutions.insert(id, variant);
+    }
+
+    fn write_value_resolution(&mut self, id: ExprOrPatIdPacked, value: ValueNs) {
+        self.result.value_resolutions.insert(id, value);
     }
 
     fn write_assoc_resolution(

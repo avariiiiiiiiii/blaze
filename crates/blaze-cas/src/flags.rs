@@ -10,6 +10,8 @@
 
 use std::fmt;
 
+use blaze_ids::bits::AtomicBitSlice;
+
 use crate::{
     sync::atomic::{AtomicU64, Ordering},
     words::Words,
@@ -48,58 +50,53 @@ pub(crate) const FLAGS: usize = 6;
 /// A flag is a hint about bytes that never change at a place, so no ordering is needed.
 const RELAXED: Ordering = Ordering::Relaxed;
 
-/// The flag columns of a fixed number of rows (an index table's slots).
-pub(crate) struct Bits {
+/// The flag columns of a fixed number of rows (an index table's slots). Its words are on the
+/// store's region (`words.rs`), not in a `blaze_ids::bits::AtomicBits`' box; each column is
+/// read and written as an `AtomicBitSlice` of them.
+pub(crate) struct FlagColumns {
     /// `FLAGS` columns of `words` words each, one stretch.
     bits: Words<AtomicU64>,
     words: usize,
 }
 
-impl fmt::Debug for Bits {
+impl fmt::Debug for FlagColumns {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Bits").field("rows", &(self.words * 64)).finish_non_exhaustive()
+        f.debug_struct("FlagColumns").field("rows", &(self.words * 64)).finish_non_exhaustive()
     }
 }
 
-impl Bits {
-    pub(crate) fn new(rows: u64) -> Bits {
+impl FlagColumns {
+    pub(crate) fn new(rows: u64) -> FlagColumns {
         let words = rows.div_ceil(64) as usize;
         let bits = Words::new(FLAGS * words);
         bits.make(0, 0, FLAGS * words);
-        Bits { bits, words }
+        FlagColumns { bits, words }
     }
 
-    fn all(&self) -> &[AtomicU64] {
-        self.bits.get(0, 0, FLAGS * self.words)
-    }
-
-    fn word(&self, row: u64, flag: Flag) -> Option<(&AtomicU64, u64)> {
-        let at = usize::try_from(row / 64).ok().filter(|&at| at < self.words)?;
-        Some((&self.all()[flag as usize * self.words + at], 1 << (row % 64)))
+    fn column(&self, flag: Flag) -> AtomicBitSlice<'_> {
+        let at = flag as usize * self.words;
+        AtomicBitSlice::from_words(&self.bits.get(0, 0, FLAGS * self.words)[at..at + self.words])
     }
 
     pub(crate) fn get(&self, row: u64, flag: Flag) -> bool {
-        self.word(row, flag).is_some_and(|(word, bit)| word.load(RELAXED) & bit != 0)
+        usize::try_from(row).is_ok_and(|row| self.column(flag).contains(row, RELAXED))
     }
 
     /// Sets `flag` of `row`; a row past the table's is none of its records and is left.
     pub(crate) fn set(&self, row: u64, flag: Flag) {
-        if let Some((word, bit)) = self.word(row, flag)
-            && word.load(RELAXED) & bit == 0
+        let column = self.column(flag);
+        if let Ok(row) = usize::try_from(row)
+            && row < column.capacity()
         {
-            word.fetch_or(bit, RELAXED);
+            column.insert_if_clear(row, RELAXED);
         }
     }
 
     /// A new period of reading: what was read becomes read before, what was made made before.
     /// Only the store calls it; a flag set meanwhile lands in one period or the other.
     pub(crate) fn rotate(&self) {
-        let bits = self.all();
         for (from, to) in [(Flag::Read, Flag::ReadBefore), (Flag::New, Flag::NewBefore)] {
-            for at in 0..self.words {
-                let moved = bits[from as usize * self.words + at].swap(0, RELAXED);
-                bits[to as usize * self.words + at].store(moved, RELAXED);
-            }
+            self.column(from).move_into(self.column(to), RELAXED);
         }
     }
 }
@@ -110,7 +107,7 @@ mod tests {
 
     #[test]
     fn a_flag_is_set_per_row_and_reading_rotates() {
-        let bits = Bits::new(701);
+        let bits = FlagColumns::new(701);
         bits.set(3, Flag::Read);
         bits.set(700, Flag::Verified);
         bits.set(5, Flag::New);
@@ -134,7 +131,7 @@ mod tests {
     #[cfg(not(blaze_check))]
     fn the_columns_answer_as_vecs_of_bools_do() {
         let rows = 3 << 20;
-        let bits = Bits::new(rows);
+        let bits = FlagColumns::new(rows);
         let flags = [Flag::Verified, Flag::Read, Flag::ReadBefore, Flag::Tried, Flag::New, Flag::NewBefore];
         let mut model = vec![vec![false; rows as usize]; FLAGS];
         let mut rng = blaze_ids::rng::SplitMix64::new(5);
@@ -163,7 +160,7 @@ mod tests {
     fn flags_set_from_many_threads_at_once_all_land() {
         use std::{sync::Arc, thread};
 
-        let bits = Arc::new(Bits::new(64 * 64));
+        let bits = Arc::new(FlagColumns::new(64 * 64));
         let threads: Vec<_> = (0..8u64)
             .map(|t| {
                 let bits = bits.clone();

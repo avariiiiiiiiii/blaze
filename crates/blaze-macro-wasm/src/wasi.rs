@@ -81,16 +81,18 @@ impl Files {
     /// The files of a module whose package is at `root`, or of one with no package to read
     /// when `None`.
     pub(crate) fn new(root: Option<&Path>) -> Files {
-        let mut fds = vec![Some(Open::Stdio), Some(Open::Stdio), Some(Open::Stdio)];
+        // alloc: setup, once per instance: its descriptors.
+        let mut fds = Vec::with_capacity(8);
+        fds.extend([Some(Open::Stdio), Some(Open::Stdio), Some(Open::Stdio)]);
         if root.is_some() {
-            fds.push(Some(Open::Dir { rel: String::new() }));
+            fds.push(Some(Open::Dir { rel: String::default() }));
         }
         Files {
             root: root.map(Path::to_path_buf).unwrap_or_default(),
             fds,
             traced: Traced::default(),
             unreadable: None,
-            output: Vec::new(),
+            output: Vec::default(),
         }
     }
 
@@ -118,29 +120,54 @@ impl Files {
         self.fds.get_mut(usize::try_from(fd).ok()?)?.as_mut()
     }
 
-    fn dir(&mut self, fd: i32) -> Result<String, i32> {
-        match self.get(fd) {
-            Some(Open::Dir { rel }) => Ok(rel.clone()),
+    /// The package's directory open at `fd`.
+    fn dir(&self, fd: i32) -> Result<&str, i32> {
+        let open = usize::try_from(fd).ok().and_then(|at| self.fds.get(at)?.as_ref());
+        match open {
+            Some(Open::Dir { rel }) => Ok(rel),
             Some(_) => Err(ENOTDIR),
             None => Err(EBADF),
+        }
+    }
+
+    /// The package's directory open at `fd`, taken out of its descriptor until
+    /// [`Files::give_dir`] puts it back.
+    fn take_dir(&mut self, fd: i32) -> Result<String, i32> {
+        match self.get(fd) {
+            Some(Open::Dir { rel }) => Ok(std::mem::take(rel)),
+            Some(_) => Err(ENOTDIR),
+            None => Err(EBADF),
+        }
+    }
+
+    fn give_dir(&mut self, fd: i32, rel: String) {
+        if let Some(Open::Dir { rel: open }) = self.get(fd) {
+            *open = rel;
         }
     }
 
     /// The package's path of `path` from the directory `rel`, or why the module may not
     /// have it: it leaves the package, by `..` or by a link.
     fn resolve(&self, rel: &str, path: &str) -> Result<(String, PathBuf), i32> {
-        let mut parts: Vec<&str> = rel.split('/').filter(|it| !it.is_empty()).collect();
         if path.starts_with('/') {
             return Err(ENOTCAPABLE);
         }
-        for part in path.split('/') {
+        // `rel` is one this made, of no `.` or `..`, so its parts go through as they are.
+        let mut out = String::with_capacity(rel.len() + 1 + path.len());
+        for part in rel.split('/').chain(path.split('/')) {
             match part {
                 "" | "." => {}
-                ".." => _ = parts.pop().ok_or(ENOTCAPABLE)?,
-                part => parts.push(part),
+                ".." if out.is_empty() => return Err(ENOTCAPABLE),
+                ".." => out.truncate(out.rfind('/').unwrap_or(0)),
+                part => {
+                    if !out.is_empty() {
+                        out.push('/');
+                    }
+                    out.push_str(part);
+                }
             }
         }
-        let rel = parts.join("/");
+        let rel = out;
         let real = self.root.join(&rel);
         // A link may point anywhere: what it leads to must be in the package.
         if let Ok(found) = real.canonicalize() {
@@ -199,6 +226,7 @@ impl Files {
     }
 
     fn cant(&mut self, real: &Path, error: std::io::Error) {
+        // alloc: the message of a file that can't be read.
         self.unreadable.get_or_insert_with(|| format!("{}: {error}", real.display()));
     }
 }
@@ -209,10 +237,13 @@ fn missing(error: &std::io::Error) -> bool {
 
 /// The path the module has for the package's `rel`.
 pub(crate) fn placed(rel: &str) -> PathBuf {
-    match rel.is_empty() {
-        true => PathBuf::from(PACKAGE),
-        false => PathBuf::from(format!("{PACKAGE}/{rel}")),
+    let mut path = String::with_capacity(PACKAGE.len() + 1 + rel.len());
+    path.push_str(PACKAGE);
+    if !rel.is_empty() {
+        path.push('/');
+        path.push_str(rel);
     }
+    path.into()
 }
 
 /// The package's `rel` of a path the module has, `None` for one not under [`PACKAGE`].
@@ -264,23 +295,22 @@ fn put(mem: &mut [u8], ptr: i32, value: &[u8]) -> Result<(), i32> {
     Ok(())
 }
 
-fn text(mem: &[u8], ptr: i32, len: i32) -> Result<String, i32> {
-    String::from_utf8(bytes(mem, ptr, len)?.to_vec()).map_err(|_| EINVAL)
+fn text(mem: &[u8], ptr: i32, len: i32) -> Result<&str, i32> {
+    std::str::from_utf8(bytes(mem, ptr, len)?).map_err(|_| EINVAL)
 }
 
-/// The (pointer, length) pairs of an iovec array.
-fn iovecs(mem: &[u8], iovs: i32, count: i32) -> Result<Vec<(i32, i32)>, i32> {
-    let all = bytes(mem, iovs, count.checked_mul(8).ok_or(EINVAL)?)?;
-    Ok(all
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|it| {
-            let ptr = i32::from_le_bytes(it[..4].try_into().unwrap());
-            let len = i32::from_le_bytes(it[4..].try_into().unwrap());
-            (ptr, len)
-        })
-        .collect())
+/// Where an iovec array of `count` pairs at `iovs` starts and how many it has, checked to lie
+/// in memory.
+fn iovecs(mem: &[u8], iovs: i32, count: i32) -> Result<(usize, usize), i32> {
+    bytes(mem, iovs, count.checked_mul(8).ok_or(EINVAL)?)?;
+    Ok((iovs as u32 as usize, count as u32 as usize))
+}
+
+/// The (pointer, length) pair `index` of the iovec array [`iovecs`] checked at `start`.
+fn iovec(mem: &[u8], start: usize, index: usize) -> (i32, i32) {
+    let at = start + 8 * index;
+    let word = |at: usize| i32::from_le_bytes(mem[at..at + 4].try_into().expect("four bytes"));
+    (word(at), word(at + 4))
 }
 
 fn errno(result: Result<(), i32>) -> i32 {
@@ -299,7 +329,12 @@ fn filestat(ino: u64, filetype: u8, size: u64) -> [u8; 64] {
 }
 
 fn ino(rel: &str) -> u64 {
-    let digest = keyed::sha256(rel.as_bytes());
+    ino_of(&[rel.as_bytes()])
+}
+
+/// The inode of the package's path that is `parts` one after the other.
+fn ino_of(parts: &[&[u8]]) -> u64 {
+    let digest = keyed::sha256_of(parts);
     u64::from_le_bytes(digest[..8].try_into().unwrap()) | 1
 }
 
@@ -421,6 +456,7 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
     )?;
     linker.func_wrap(MODULE, "sched_yield", || SUCCESS)?;
     linker.func_wrap(MODULE, "proc_exit", |code: i32| -> wasmtime::Result<()> {
+        // alloc: the message of a module that ended its expansion.
         Err(wasmtime::Error::msg(format!("the proc macro exited the process, with status {code}")))
     })?;
     linker.func_wrap(
@@ -432,12 +468,13 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             if !matches!(state.files.get(fd), Some(Open::Stdio)) {
                 return Ok(EBADF);
             }
-            let vecs = match iovecs(mem, iovs, count) {
+            let (start, count) = match iovecs(mem, iovs, count) {
                 Ok(it) => it,
                 Err(e) => return Ok(e),
             };
             let mut total = 0u32;
-            for (ptr, len) in vecs {
+            for index in 0..count {
+                let (ptr, len) = iovec(mem, start, index);
                 let Ok(chunk) = bytes(mem, ptr, len) else { return Ok(EINVAL) };
                 let room = KEPT_OUTPUT.saturating_sub(state.files.output.len());
                 state.files.output.extend_from_slice(&chunk[..chunk.len().min(room)]);
@@ -455,30 +492,38 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
         count: i32,
         at: Option<u64>,
     ) -> Result<u32, i32> {
-        let vecs = iovecs(mem, iovs, count)?;
+        let (start, count) = iovecs(mem, iovs, count)?;
         let (bytes, pos) = match state.files.get(fd) {
             Some(Open::File { bytes, at: pos }) => (bytes, pos),
             Some(Open::Stdio) => return Ok(0),
             Some(Open::Dir { .. }) => return Err(EISDIR),
             None => return Err(EBADF),
         };
-        let from = usize::try_from(at.unwrap_or(*pos)).unwrap_or(usize::MAX);
-        let mut from = from.min(bytes.len());
-        let mut total = 0u32;
-        for (ptr, len) in vecs {
-            let end = from.saturating_add(len as u32 as usize).min(bytes.len());
-            let chunk = &bytes[from..end];
-            put(mem, ptr, chunk)?;
-            from = end;
-            total = total.checked_add(chunk.len() as u32).ok_or(EINVAL)?;
-            if chunk.len() < len as u32 as usize {
-                break;
+        // The pairs as they are before any is filled: a chunk may land on the array itself.
+        blaze_mem::scratch::with_u64s(|pairs| {
+            pairs.extend((0..count).map(|index| {
+                let (ptr, len) = iovec(mem, start, index);
+                u64::from(ptr as u32) | u64::from(len as u32) << 32
+            }));
+            let from = usize::try_from(at.unwrap_or(*pos)).unwrap_or(usize::MAX);
+            let mut from = from.min(bytes.len());
+            let mut total = 0u32;
+            for &pair in pairs.iter() {
+                let (ptr, len) = (pair as u32 as i32, (pair >> 32) as u32);
+                let end = from.saturating_add(len as usize).min(bytes.len());
+                let chunk = &bytes[from..end];
+                put(mem, ptr, chunk)?;
+                from = end;
+                total = total.checked_add(chunk.len() as u32).ok_or(EINVAL)?;
+                if chunk.len() < len as usize {
+                    break;
+                }
             }
-        }
-        if at.is_none() {
-            *pos = from as u64;
-        }
-        Ok(total)
+            if at.is_none() {
+                *pos = from as u64;
+            }
+            Ok(total)
+        })
     }
     linker.func_wrap(
         MODULE,
@@ -699,57 +744,75 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
             let memory = memory(&mut caller)?;
             let (mem, state) = memory.data_and_store_mut(&mut caller);
             let files = &mut state.files;
-            let rel = match files.dir(fd) {
+            let rel = match files.take_dir(fd) {
                 Ok(it) => it,
                 Err(e) => return Ok(e),
             };
-            let real = files.root.join(&rel);
-            let mut all = Vec::new();
-            match std::fs::read_dir(&real) {
-                Ok(entries) => {
-                    for entry in entries {
-                        match entry {
-                            Ok(entry) => all.push(entry.file_name()),
-                            Err(error) => {
-                                files.cant(&real, error);
-                                return Ok(EIO);
-                            }
-                        }
-                    }
-                }
-                Err(error) => {
-                    files.cant(&real, error);
-                    return Ok(EIO);
-                }
-            }
-            // Recorded with every name, as a native sandbox's listing is, though a name that is
-            // not UTF-8 can't be given to the module.
-            files.listed(&rel, &all);
-            let mut names: Vec<String> =
-                all.into_iter().filter_map(|it| it.into_string().ok()).collect();
-            names.sort();
-            let mut out = Vec::new();
-            for (index, name) in names.iter().enumerate().skip(cookie as u64 as usize) {
-                let child = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-                let filetype = match std::fs::metadata(files.root.join(&child)) {
-                    Ok(meta) if meta.is_dir() => FILETYPE_DIRECTORY,
-                    Ok(meta) if meta.is_file() => FILETYPE_REGULAR_FILE,
-                    _ => FILETYPE_UNKNOWN,
-                };
-                out.extend_from_slice(&(index as u64 + 1).to_le_bytes());
-                out.extend_from_slice(&ino(&child).to_le_bytes());
-                out.extend_from_slice(&(name.len() as u32).to_le_bytes());
-                out.extend_from_slice(&[filetype, 0, 0, 0]);
-                out.extend_from_slice(name.as_bytes());
-                if out.len() >= len as u32 as usize {
-                    break;
-                }
-            }
-            out.truncate(len as u32 as usize);
-            Ok(errno(put(mem, buf, &out).and(put(mem, used, &(out.len() as u32).to_le_bytes()))))
+            let said = readdir(files, &rel, mem, [buf, len, used], cookie);
+            files.give_dir(fd, rel);
+            Ok(said)
         },
     )?;
     Ok(())
+}
+
+/// `fd_readdir` of the package's directory `rel`: its entries from `cookie` on, sorted by
+/// name, into the module's `buf` of `len` bytes, and how many bytes they took at `used`.
+fn readdir(files: &mut Files, rel: &str, mem: &mut [u8], [buf, len, used]: [i32; 3], cookie: i64) -> i32 {
+    let real = files.root.join(rel);
+    // alloc: the edge: the names the system lists, which the module's trace keeps.
+    let mut all = Vec::with_capacity(16);
+    match std::fs::read_dir(&real) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry) => all.push(entry.file_name()),
+                    Err(error) => {
+                        files.cant(&real, error);
+                        return EIO;
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            files.cant(&real, error);
+            return EIO;
+        }
+    }
+    // Recorded with every name, as a native sandbox's listing is, though a name that is not
+    // UTF-8 can't be given to the module.
+    files.listed(rel, &all);
+    // An `OsString` sorts by its bytes, as a `String` of the same text does.
+    all.sort_unstable();
+    let len = len as u32 as usize;
+    blaze_mem::scratch::with_bytes(|out| {
+        let mut child = blaze_mem::scratch::lend_path();
+        child.push(&real);
+        let names = all.iter().filter_map(|it| it.to_str());
+        for (index, name) in names.enumerate().skip(cookie as u64 as usize) {
+            child.push(name);
+            let filetype = match std::fs::metadata(&*child) {
+                Ok(meta) if meta.is_dir() => FILETYPE_DIRECTORY,
+                Ok(meta) if meta.is_file() => FILETYPE_REGULAR_FILE,
+                _ => FILETYPE_UNKNOWN,
+            };
+            child.pop();
+            let ino = match rel.is_empty() {
+                true => ino(name),
+                false => ino_of(&[rel.as_bytes(), b"/", name.as_bytes()]),
+            };
+            out.extend_from_slice(&(index as u64 + 1).to_le_bytes());
+            out.extend_from_slice(&ino.to_le_bytes());
+            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            out.extend_from_slice(&[filetype, 0, 0, 0]);
+            out.extend_from_slice(name.as_bytes());
+            if out.len() >= len {
+                break;
+            }
+        }
+        out.truncate(len);
+        errno(put(mem, buf, out).and(put(mem, used, &(out.len() as u32).to_le_bytes())))
+    })
 }
 
 /// Adds to `linker`, for each function of WASI's that `module` imports and [`add`] does not
@@ -764,7 +827,9 @@ pub(crate) fn rest(linker: &mut Linker<State>, module: &Module) -> wasmtime::Res
         if linker.get_by_import(&mut store, &import).is_some() {
             continue;
         }
+        // alloc: setup, once per module linked: the results the stand-in answers.
         let results: Vec<ValType> = ty.results().collect();
+        // clone: setup, once per module linked: the type keeps its own results.
         let ty = FuncType::new(module.engine(), ty.params(), results.clone());
         linker.func_new(MODULE, import.name(), ty, move |_, _, out| {
             for (slot, ty) in out.iter_mut().zip(&results) {

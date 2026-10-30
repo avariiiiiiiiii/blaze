@@ -9,6 +9,8 @@ use syntax::TextRange;
 
 /// The level of a diagnostic: rustc's `Level`, of those a diagnostic of the compiler is
 /// written at.
+/// Not [`blaze_api::Level`]: that is the agent API's versioned schema, which changes only with
+/// its version.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Level {
     Error,
@@ -150,6 +152,29 @@ impl Span {
 
     pub fn is_empty(&self) -> bool {
         self.lo == self.hi
+    }
+
+    /// rustc's `Span::macro_backtrace`: the expansions it is in, innermost first, leaving out
+    /// a macro's recursive calls of itself.
+    pub fn macro_backtrace(&self) -> impl Iterator<Item = &Expansion> {
+        let mut prev: Option<&Span> = None;
+        let mut at = self;
+        std::iter::from_fn(move || {
+            loop {
+                let expansion = at.expansion.as_deref()?;
+                let recursive = prev.is_some_and(|it| it.source_equal(&expansion.call_site));
+                prev = Some(at);
+                at = &expansion.call_site;
+                if !recursive {
+                    return Some(expansion);
+                }
+            }
+        })
+    }
+
+    /// rustc's `Span::source_equal`: the same bytes of the same file.
+    pub fn source_equal(&self, other: &Span) -> bool {
+        self.file == other.file && self.lo == other.lo && self.hi == other.hi
     }
 }
 
@@ -521,35 +546,40 @@ impl Diag {
         }
     }
 
-    /// rustc's note on a diagnostic in a macro's expansion: which macro it came from
-    /// (`DiagCtxtInner::emit_diagnostic`'s `fix_multispans_in_extern_macros_and_render_macro_backtrace`
-    /// without `-Z macro-backtrace`).
+    /// rustc's note on a diagnostic in a macro's expansion, as a child: which macro it came
+    /// from (`fix_multispans_in_extern_macros_and_render_macro_backtrace` without
+    /// `-Z macro-backtrace`). The emitter writes it itself when no child has it.
     pub fn originates_in(&mut self) -> &mut Diag {
-        let level = match self.level {
-            Level::Error => "error",
-            _ => "warning",
-        };
+        match self.origin_note() {
+            Some(note) => self.note(note),
+            None => self,
+        }
+    }
+
+    /// The text of [`Diag::originates_in`]'s note, when a primary span of it or of a child is
+    /// in a macro's expansion: the innermost macro, and the outermost when it is another.
+    pub fn origin_note(&self) -> Option<String> {
         let spans = self.span.primary.iter().chain(self.children.iter().flat_map(|it| &it.span.primary));
-        let backtrace: Vec<&Expansion> = spans
-            .flat_map(|span| {
-                std::iter::successors(span.expansion.as_deref(), |it| it.call_site.expansion.as_deref())
-            })
-            .collect();
-        let (Some(first), Some(last)) = (backtrace.first(), backtrace.last()) else { return self };
+        let mut macros = spans.flat_map(Span::macro_backtrace);
+        let first = macros.next()?;
+        let last = macros.last().unwrap_or(first);
         let and_then = match last.name != first.name {
-            true => format!(
-                " which comes from the expansion of the {} `{}`",
-                last.kind.descr(),
-                last.name
-            ),
+            true => format!(" which comes from the expansion of the {} `{}`", last.kind.descr(), last.name),
             false => String::new(),
         };
-        let note = format!(
-            "this {level} originates in the {} `{}`{and_then} (in Nightly builds, run with -Z macro-backtrace for more info)",
+        Some(format!(
+            "this {} originates in the {} `{}`{and_then} (in Nightly builds, run with -Z macro-backtrace for more info)",
+            self.level.name(),
             first.kind.descr(),
             first.name
-        );
-        self.note(note)
+        ))
+    }
+
+    /// Whether cargo counts it as one `cargo fix` (`cargo clippy --fix`) applies: it has a
+    /// suggestion rustfix takes as it is.
+    pub fn is_fixable(&self) -> bool {
+        !self.suggestions_disabled
+            && self.suggestions.iter().any(|it| it.applicability == Applicability::MachineApplicable)
     }
 }
 
@@ -626,5 +656,68 @@ mod tests {
             diag.children[0].message,
             "this error originates in the macro `assert_eq` (in Nightly builds, run with -Z macro-backtrace for more info)"
         );
+    }
+
+    fn expanded(lo: u32, hi: u32, name: &str, call_site: Span) -> Span {
+        Span {
+            file: "a.rs".to_owned(),
+            lo,
+            hi,
+            expansion: Some(Box::new(Expansion {
+                call_site,
+                kind: MacroKind::Bang,
+                name: name.to_owned(),
+                def_site: None,
+            })),
+        }
+    }
+
+    #[test]
+    fn the_backtrace_is_innermost_first() {
+        let root = Span { file: "a.rs".to_owned(), lo: 0, hi: 10, expansion: None };
+        let at = expanded(3, 4, "inner", expanded(20, 30, "outer", root));
+        let names: Vec<&str> = at.macro_backtrace().map(|it| it.name.as_str()).collect();
+        assert_eq!(names, ["inner", "outer"]);
+    }
+
+    #[test]
+    fn a_call_where_the_span_two_steps_back_is_is_left_out_of_the_backtrace() {
+        let root = Span { file: "a.rs".to_owned(), lo: 3, hi: 4, expansion: None };
+        let at = expanded(3, 4, "m", expanded(20, 30, "m", root));
+        let names: Vec<&str> = at.macro_backtrace().map(|it| it.name.as_str()).collect();
+        assert_eq!(names, ["m"]);
+    }
+
+    #[test]
+    fn the_note_leaves_out_a_recursive_call_as_the_emitter_does() {
+        let root = Span { file: "a.rs".to_owned(), lo: 3, hi: 4, expansion: None };
+        let at = expanded(3, 4, "a", expanded(20, 30, "b", root));
+        let mut diag = Diag::error(None, "x", at);
+        diag.originates_in();
+        assert_eq!(
+            diag.children[0].message,
+            "this error originates in the macro `a` (in Nightly builds, run with -Z macro-backtrace for more info)"
+        );
+        assert_eq!(diag.origin_note().as_deref(), Some(diag.children[0].message.as_str()));
+    }
+
+    #[test]
+    fn the_note_names_the_level_as_rustc_does() {
+        let root = Span { file: "a.rs".to_owned(), lo: 0, hi: 10, expansion: None };
+        let mut diag = Diag::new(Level::Note, None, "x");
+        diag.span = MultiSpan::of(expanded(3, 4, "m", root));
+        assert!(diag.origin_note().unwrap().starts_with("this note originates in the macro `m`"));
+    }
+
+    #[test]
+    fn a_machine_applicable_suggestion_is_fixable_unless_suggestions_are_off() {
+        let mut diag = Diag::lint("clippy::needless_bool", "x", span(0, 1));
+        assert!(!diag.is_fixable());
+        diag.suggestion(span(0, 1), "y", "z", Applicability::MaybeIncorrect);
+        assert!(!diag.is_fixable());
+        diag.suggestion(span(0, 1), "y", "z", Applicability::MachineApplicable);
+        assert!(diag.is_fixable());
+        diag.suggestions_disabled = true;
+        assert!(!diag.is_fixable());
     }
 }

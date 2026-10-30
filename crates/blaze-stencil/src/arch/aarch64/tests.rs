@@ -5,6 +5,8 @@
 //! variant. The glue runs on a stand-in for the patcher that puts every value in a slot of
 //! its own.
 
+use std::sync::OnceLock;
+
 use cranelift_codegen::{
     Context, FinalizedRelocTarget,
     binemit::Reloc,
@@ -12,7 +14,7 @@ use cranelift_codegen::{
     ir::{
         self, AbiParam, ArgumentPurpose, InstBuilder,
         immediates::Imm64,
-        types::{F32, I8, I32, I64, I128},
+        types::{F32, F64, I8, I32, I64, I128},
     },
     isa::{self, CallConv, OwnedTargetIsa, unwind::UnwindInfo},
     settings::{self, Configurable},
@@ -28,8 +30,17 @@ use crate::{
     Cpu, Error, Os, Target, TlsModel,
     arch::{Area, Glue, Loc},
     buf::{Buf, Label},
-    code::{self, Name, Rule},
+    code::{self, Code, Name, Rule, Unwind},
+    enc::Form,
+    patch::compile_in,
+    shape::{self, Dst, Isa, Op, Shape, Src},
+    table::format::{Hole, HoleKind, Reader, Variant, Writer},
 };
+
+/// Runs `f` on a compile's memory frame, as the patcher does.
+fn on_frame<R>(f: impl FnOnce(&blaze_mem::Frame) -> R) -> R {
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, f)
+}
 
 const LINUX: Target = Target {
     arch: blaze_codegen::Arch::Aarch64,
@@ -139,8 +150,8 @@ fn cranelift(func: &ir::Function, target: &Target) -> Clif {
 }
 
 /// The patcher's stand-in.
-struct Run<'f> {
-    buf: Buf,
+struct Run<'f, 'm> {
+    buf: Buf<'m>,
     func: &'f ir::Function,
     target: &'f Target,
     frame: &'f Frame,
@@ -149,16 +160,21 @@ struct Run<'f> {
     sites: Vec<(u32, ir::Inst)>,
 }
 
-impl<'f> Run<'f> {
-    fn new(func: &'f ir::Function, target: &'f Target, frame: &'f Frame) -> Run<'f> {
-        let mut buf = Buf::new();
+impl<'f, 'm> Run<'f, 'm> {
+    fn new(
+        func: &'f ir::Function,
+        target: &'f Target,
+        frame: &'f Frame,
+        temp: &'m blaze_mem::Frame,
+    ) -> Run<'f, 'm> {
+        let mut buf = Buf::new_in(temp);
         let edges = std::array::from_fn(|_| buf.label());
         Run { buf, func, target, frame, edges, rows: Vec::new(), sites: Vec::new() }
     }
 }
 
-impl<'f> Ctx<'f> for Run<'f> {
-    fn buf(&mut self) -> &mut Buf {
+impl<'f, 'm> Ctx<'f, 'm> for Run<'f, 'm> {
+    fn buf(&mut self) -> &mut Buf<'m> {
         &mut self.buf
     }
 
@@ -230,7 +246,11 @@ impl Out {
 
 fn whole(func: &ir::Function, target: &Target) -> Out {
     let frame = Aarch64::frame(func, target, AREA).unwrap_or_else(|e| panic!("{e}"));
-    let mut run = Run::new(func, target, &frame);
+    on_frame(|temp| whole_on(func, target, frame, temp))
+}
+
+fn whole_on(func: &ir::Function, target: &Target, frame: Frame, temp: &blaze_mem::Frame) -> Out {
+    let mut run = Run::new(func, target, &frame, temp);
     glue::prologue(&mut run).unwrap_or_else(|e| panic!("{e}"));
     let prologue = run.buf.len();
     let mut spans = Vec::new();
@@ -250,9 +270,10 @@ fn whole(func: &ir::Function, target: &Target) -> Out {
         run.buf.put4(0xd503_201f);
     }
     run.buf.resolve().unwrap_or_else(|e| panic!("{e}"));
-    let (bytes, relocs) = run.buf.take();
+    run.buf.sort_relocs();
+    let (words, relocs) = (words(run.buf.bytes()), run.buf.relocs().to_vec());
     let Run { rows, sites, .. } = run;
-    Out { words: words(&bytes), relocs, prologue, spans, edges, rows, sites, frame }
+    Out { words, relocs, prologue, spans, edges, rows, sites, frame }
 }
 
 fn sig(conv: CallConv, params: &[ir::Type], rets: &[ir::Type]) -> ir::Signature {
@@ -454,10 +475,13 @@ fn realigned_frames_round_x20_up() {
     let frame = Aarch64::frame(&func, &LINUX, Area { size: 1024, align: 64 })
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(frame.stack, 1024 + 48);
-    let mut buf = Buf::new();
-    frame::set_base(&mut buf, &frame);
+    let base = on_frame(|temp| {
+        let mut buf = Buf::new_in(temp);
+        frame::set_base(&mut buf, &frame);
+        words(buf.bytes())
+    });
     // `add x20, sp, #63`, `and x20, x20, #-64`.
-    assert_eq!(words(buf.bytes()), [0x9100_fff4, 0x927a_e694]);
+    assert_eq!(base, [0x9100_fff4, 0x927a_e694]);
     assert_eq!(Aarch64::slot_base(&frame), (20, 0));
     let frame = Aarch64::frame(&func, &LINUX, AREA).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(Aarch64::slot_base(&frame), (29, -(1024 + frame::SAVES as i32)));
@@ -483,9 +507,11 @@ fn probes_are_cranelifts() {
             Area { size: size - frame::SAVES, align: 16 },
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        let mut buf = Buf::new();
-        frame::enter(&mut buf, &frame, &mut frame::Rows::default());
-        let ours = words(buf.bytes());
+        let ours = on_frame(|temp| {
+            let mut buf = Buf::new_in(temp);
+            frame::enter(&mut buf, &frame, &mut frame::Rows::default());
+            words(buf.bytes())
+        });
         assert_eq!(ours[2..2 + len], clif.words[2..2 + len], "{size}");
     }
 }
@@ -512,7 +538,9 @@ fn windows_codes_are_in_cranelifts_order() {
     }
     codes.extend_from_slice(&theirs[..2]);
     codes.resize(codes.len().div_ceil(4) * 4, 0);
-    assert_eq!(frame::windows_codes(&frame), codes);
+    let mut written = Vec::new();
+    frame::windows_codes(&frame, &mut written);
+    assert_eq!(written, codes);
 }
 
 #[test]
@@ -666,13 +694,15 @@ fn never_writes_x18() {
 
 #[test]
 fn relays_and_counters_use_only_x16_and_x17() {
-    let mut buf = Buf::new();
-    glue::relay(&mut buf, 40_000, 80_016, 16);
-    glue::relay(&mut buf, 40_000, 80_000, 8);
-    let relays = buf.len();
-    glue::count(&mut buf, glue::BACK_EDGES);
-    let (bytes, relocs) = buf.take();
-    let words = words(&bytes);
+    let (relays, words, relocs) = on_frame(|temp| {
+        let mut buf = Buf::new_in(temp);
+        glue::relay(&mut buf, 40_000, 80_016, 16);
+        glue::relay(&mut buf, 40_000, 80_000, 8);
+        let relays = buf.len();
+        glue::count(&mut buf, glue::BACK_EDGES);
+        buf.sort_relocs();
+        (relays, words(buf.bytes()), buf.relocs().to_vec())
+    });
     // Each instruction's first register (what it writes, or a store's data) is a scratch one.
     assert!(words.iter().all(|w| matches!(w & 31, 16 | 17)), "{words:x?}");
     assert_eq!(
@@ -700,12 +730,15 @@ fn relays_and_counters_use_only_x16_and_x17() {
 fn landing_pads_store_the_payload() {
     let func = leaf(CallConv::SystemV);
     let frame = Aarch64::frame(&func, &LINUX, AREA).unwrap_or_else(|e| panic!("{e}"));
-    let mut run = Run::new(&func, &LINUX, &frame);
     let inst =
         func.layout.first_inst(func.layout.entry_block().expect("a block")).expect("an inst");
-    glue::landing(&mut run, inst).unwrap_or_else(|e| panic!("{e}"));
+    let written = on_frame(|temp| {
+        let mut run = Run::new(&func, &LINUX, &frame, temp);
+        glue::landing(&mut run, inst).unwrap_or_else(|e| panic!("{e}"));
+        words(run.buf.bytes())
+    });
     // `str x0, [x20, #3072]`, `str x1, [x20, #3088]`.
-    assert_eq!(words(run.buf.bytes()), [0xf906_0280, 0xf906_0a81]);
+    assert_eq!(written, [0xf906_0280, 0xf906_0a81]);
 }
 
 #[test]
@@ -715,10 +748,13 @@ fn tail_calls_and_other_conventions_are_errors() {
         b.ins().return_call(f, &[]);
     });
     let frame = Aarch64::frame(&func, &LINUX, AREA).unwrap_or_else(|e| panic!("{e}"));
-    let mut run = Run::new(&func, &LINUX, &frame);
     let inst =
         func.layout.first_inst(func.layout.entry_block().expect("a block")).expect("an inst");
-    assert_eq!(glue::inst(&mut run, inst).map_err(|e| e.inst), Err(Some(inst)));
+    let error = on_frame(|temp| {
+        let mut run = Run::new(&func, &LINUX, &frame, temp);
+        glue::inst(&mut run, inst).map_err(|e| e.inst)
+    });
+    assert_eq!(error, Err(Some(inst)));
     assert!(Aarch64::frame(&leaf(CallConv::Tail), &LINUX, AREA).is_err());
 }
 
@@ -758,4 +794,103 @@ fn places_are_aapcs64s_and_apples() {
     assert_eq!(got, [Place::Reg(Reg::X(8), I64), Place::Reg(Reg::X(0), I64)]);
     // Nine `i64` returns do not fit: Cranelift asks for a StructReturn argument.
     assert!(abi::rets(&sig(CallConv::SystemV, &[], &[I64; 9]), |_, _, _| Ok(())).is_err());
+}
+
+// A mock library for the patcher on AArch64, as x86-64's tests make one: each stencil a
+// header, one field per hole and a tail jump. Only what the glue does not write needs one.
+
+const HEADER: u8 = 0x5c;
+const OPS: [Op; 4] = [Op::Copy, Op::Iconst, Op::Fconst, Op::Jump];
+
+fn fields(shape: Shape) -> Vec<(HoleKind, Form)> {
+    let info = shape.op.info();
+    let mut out = Vec::new();
+    match shape.op {
+        Op::Iconst | Op::Fconst => {
+            out.push((HoleKind::Imm0, if shape.aux == 1 { Form::Abs64 } else { Form::Abs32S }));
+        }
+        _ => {
+            for (n, src) in shape.srcs.into_iter().enumerate() {
+                if src == Src::Slot {
+                    out.push(([HoleKind::Slot0, HoleKind::Slot1, HoleKind::Slot2][n], Form::Abs32S));
+                }
+            }
+        }
+    }
+    if matches!(shape.dst, Dst::Slot | Dst::Both) {
+        out.push((HoleKind::Result0, Form::Abs32S));
+    }
+    if info.branches {
+        out.push((HoleKind::Target, Form::Rel32));
+    }
+    out
+}
+
+fn stencil(shape: Shape) -> (Vec<u8>, Vec<Hole>) {
+    let mut code = vec![HEADER];
+    code.extend_from_slice(&shape.key().to_le_bytes());
+    let mut holes = Vec::new();
+    for (kind, form) in fields(shape) {
+        let addend = if form.pc_relative() { -4 } else { 0 };
+        holes.push(Hole { at: code.len() as u16, form, kind, addend });
+        code.resize(code.len() + usize::from(form.bytes()), 0);
+    }
+    code.push(0xe9);
+    holes.push(Hole { at: code.len() as u16, form: Form::Rel32, kind: HoleKind::Next, addend: -4 });
+    code.extend_from_slice(&[0; 4]);
+    (code, holes)
+}
+
+fn mock() -> Reader<'static> {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    let bytes = BYTES.get_or_init(|| {
+        let mut writer = Writer::new(Variant::Aarch64);
+        shape::each_on(Isa::Aarch64, |shape| {
+            if OPS.contains(&shape.op) {
+                let (code, holes) = stencil(shape);
+                writer.push(shape, &code, 5, &holes).unwrap();
+            }
+        });
+        writer.finish(|_| [0; 32]).unwrap()
+    });
+    Reader::new(bytes).unwrap()
+}
+
+#[test]
+fn a_warm_compile_through_the_glue_into_a_reused_code_allocates_nothing() {
+    let library = mock();
+    for target in [LINUX, MACOS, WINDOWS] {
+        let conv = conv(&target);
+        let func = build(sig(conv, &[I64, F64], &[I64]), |b, p| {
+            let callee = import(b, 0, sig(conv, &[I64, I64, F64], &[I64]), true);
+            let k = b.ins().iconst(I64, 0x1234_5678_9abc);
+            let call = b.ins().call(callee, &[p[0], k, p[1]]);
+            let ret = b.inst_results(call)[0];
+            b.ins().return_(&[ret]);
+        });
+        // What `compile_into` does, with the mock library.
+        let into = |code: &mut Code| {
+            compile_in::<Aarch64, _>(&func, &target, &library, |it, _| code.copy_from(it))
+                .unwrap_or_else(|e| panic!("{e}"));
+        };
+        let mut code = Code::default();
+        into(&mut code);
+        let ((), used) = blaze_alloc_count::measure(|| into(&mut code));
+        assert_eq!(
+            used,
+            blaze_alloc_count::Used::default(),
+            "a warm compile with the AArch64 glue for {:?}",
+            target.os
+        );
+        assert!(!code.relocs.is_empty());
+        let fresh = compile_in::<Aarch64, _>(&func, &target, &library, |it, _| it.to_code()).unwrap();
+        assert_eq!(code, fresh, "the reused code is the fresh one");
+        match (&code.unwind, target.os) {
+            (Some(Unwind::WindowsArm64 { codes, .. }), Os::Windows) => {
+                assert!(!codes.is_empty() && codes.len() % 4 == 0);
+            }
+            (Some(Unwind::Dwarf { rows, .. }), Os::Linux | Os::MacOs) => assert!(!rows.is_empty()),
+            (unwind, os) => panic!("{os:?}: {unwind:?}"),
+        }
+    }
 }

@@ -25,12 +25,12 @@ fn ui_fixture(fixture: &str) -> String {
 /// [`ui_fixture`] with only the diagnostics `keep` takes, without the closing ones.
 fn ui_only(fixture: &str, keep: impl Fn(&Diag) -> bool) -> String {
     let checked = checked_with(fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
-    let mut sources = checked.sources();
+    let sources = checked.sources();
     let stderr: String = checked
         .diags
         .iter()
         .filter(|it| keep(it))
-        .map(|it| written(it, &mut sources, ui_testing()))
+        .map(|it| written(it, &sources, ui_testing()))
         .collect();
     built_on(&normalized(&stderr))
 }

@@ -1302,6 +1302,10 @@ impl HirColumns<Growing> {
         let mut layout = SlabLayout::default();
         layout.add::<MacroDefId>(self.macro_defs.len());
         layout.add::<Option<TypeRefId>>(self.type_lists.len());
+        layout.add::<MatchArm>(self.arms.len());
+        layout.add::<RecordLitField>(self.record_fields.len());
+        layout.add::<RecordFieldPat>(self.field_pats.len());
+        layout.add::<Name>(self.names.len());
         layout.add::<u32>(self.expr_data.len());
         layout.add::<u32>(self.pat_data.len());
         layout.add::<u32>(self.extra.len());
@@ -1314,6 +1318,10 @@ impl HirColumns<Growing> {
         let mut slab = SlabWriter::new(layout);
         let macro_defs = slab.take(&mut self.macro_defs);
         let type_lists = slab.take(&mut self.type_lists);
+        let arms = slab.take(&mut self.arms);
+        let record_fields = slab.take(&mut self.record_fields);
+        let field_pats = slab.take(&mut self.field_pats);
+        let names = slab.take(&mut self.names);
         let expr_data = slab.take(&mut self.expr_data);
         let pat_data = slab.take(&mut self.pat_data);
         let extra = slab.take(&mut self.extra);
@@ -1333,11 +1341,11 @@ impl HirColumns<Growing> {
             pat_lists,
             stmt_kind,
             stmt_data,
-            arms: take_exact(&mut self.arms).into(),
-            record_fields: take_exact(&mut self.record_fields).into(),
-            field_pats: take_exact(&mut self.field_pats).into(),
+            arms,
+            record_fields,
+            field_pats,
             type_lists,
-            names: take_exact(&mut self.names).into(),
+            names,
             literals: take_exact(&mut self.literals).into(),
             offset_ofs: take_exact(&mut self.offset_ofs).into(),
             asms: take_exact(&mut self.asms).into(),

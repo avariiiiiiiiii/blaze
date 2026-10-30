@@ -19,16 +19,17 @@ use std::{
 
 use blaze_cas::{Corrupt, Guard, Key, Kind, Mismatch, Reader, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
+use blaze_format::cursor::{self, Put};
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Tag, frame};
 
 use crate::{
     RunKey,
-    trace::{self, ALL_ENV_NAME, At, Inputs, os_from},
+    trace::{self, ALL_ENV_NAME, Inputs, os_from},
 };
 
 /// What a run read, without the values.
-#[derive(Clone, PartialEq, Eq, Default, Debug)]
+#[derive(PartialEq, Eq, Default, Debug)]
 pub struct Shape {
     pub files: Vec<PathBuf>,
     pub dirs: Vec<PathBuf>,
@@ -65,16 +66,17 @@ impl Shape {
 
     /// The inputs of this shape as `inputs` has them: what a run that read them would have
     /// recorded. A directory that is no longer there is a file that is not there, as
-    /// [`trace::assemble`] has it.
+    /// [`trace::assemble`] has it. The [`Traced`] is the caller's to keep: a cache check
+    /// hashes the inputs in place instead ([`find`]).
     pub fn values<I: Inputs>(&self, inputs: &mut I) -> Result<Traced, I::Error> {
         let mut traced = Traced::default();
         for path in &self.files {
             match trace::walked(path) {
                 Some((dir, package)) => match trace::walk(inputs, dir, package)? {
-                    Some(hash) => traced.dirs.push((path.clone(), hash)),
-                    None => traced.files.push((path.clone(), None)),
+                    Some(hash) => traced.dirs.push((path.clone(), hash)), // clone: the Traced the caller keeps
+                    None => traced.files.push((path.clone(), None)), // clone: the Traced the caller keeps
                 },
-                None => traced.files.push((path.clone(), inputs.file(path)?)),
+                None => traced.files.push((path.clone(), inputs.file(path)?)), // clone: the Traced the caller keeps
             }
         }
         for path in &self.dirs {
@@ -83,71 +85,71 @@ impl Shape {
                 None => inputs.dir(path)?,
             };
             match hash {
-                Some(hash) => traced.dirs.push((path.clone(), hash)),
-                None => traced.files.push((path.clone(), None)),
+                Some(hash) => traced.dirs.push((path.clone(), hash)), // clone: the Traced the caller keeps
+                None => traced.files.push((path.clone(), None)), // clone: the Traced the caller keeps
             }
         }
         for name in &self.env {
             if name == ALL_ENV_NAME {
                 let all = inputs.env_all();
                 traced.env.push((ALL_ENV_NAME.into(), Some(trace::names_hash(all).into())));
+                // clone: the Traced the caller keeps
                 traced.env.extend(all.iter().map(|(name, value)| (name.clone(), Some(value.clone()))));
             } else {
-                traced.env.push((name.clone(), inputs.env(name).map(OsStr::to_owned)));
+                traced.env.push((name.clone(), inputs.env(name).map(OsStr::to_owned))); // clone: kept, as above
             }
         }
-        traced.untraceable = self.untraceable.clone();
+        traced.untraceable = self.untraceable.clone(); // clone: kept, as above
         trace::normalize(&mut traced);
         Ok(traced)
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = SHAPE_MAGIC.to_vec();
-        let part = |out: &mut Vec<u8>, bytes: &[u8]| {
-            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            out.extend_from_slice(bytes);
-        };
+        let mut out = SHAPE_MAGIC.to_vec(); // alloc: the bytes the caller keeps
         for list in [&self.files, &self.dirs] {
-            out.extend_from_slice(&(list.len() as u64).to_le_bytes());
+            out.put_u64(list.len() as u64);
             for path in list {
-                part(&mut out, &trace::os_bytes(path.as_os_str()));
+                out.put_bytes_u64(&trace::os_bytes(path.as_os_str()));
             }
         }
-        out.extend_from_slice(&(self.env.len() as u64).to_le_bytes());
+        out.put_u64(self.env.len() as u64);
         for name in &self.env {
-            part(&mut out, &trace::os_bytes(name));
+            out.put_bytes_u64(&trace::os_bytes(name));
         }
-        out.extend_from_slice(&(self.untraceable.len() as u64).to_le_bytes());
+        out.put_u64(self.untraceable.len() as u64);
         for it in &self.untraceable {
-            part(&mut out, trace::untraceable_name(*it).as_bytes());
+            out.put_bytes_u64(trace::untraceable_name(*it).as_bytes());
         }
         out
     }
 
+    /// The shape [`Shape::encode`] wrote, which the caller keeps (an explanation of a rerun).
+    /// Each list's count is checked against the bytes left at one byte an entry.
     pub fn decode(bytes: &[u8]) -> Result<Shape, String> {
         let rest = bytes
             .strip_prefix(SHAPE_MAGIC.as_slice())
-            .ok_or_else(|| "not a shape".to_owned())?;
-        let mut at = At(rest);
+            .ok_or_else(|| "not a shape".to_owned())?; // alloc: error path
+        let mut at = cursor::Reader::new(rest);
         let mut shape = Shape::default();
-        for _ in 0..at.len()? {
-            shape.files.push(PathBuf::from(os_from(at.part()?)?));
+        for _ in 0..at.count_u64(1)? {
+            shape.files.push(PathBuf::from(os_from(at.bytes_u64()?)?));
         }
-        for _ in 0..at.len()? {
-            shape.dirs.push(PathBuf::from(os_from(at.part()?)?));
+        for _ in 0..at.count_u64(1)? {
+            shape.dirs.push(PathBuf::from(os_from(at.bytes_u64()?)?));
         }
-        for _ in 0..at.len()? {
-            shape.env.push(os_from(at.part()?)?);
+        for _ in 0..at.count_u64(1)? {
+            shape.env.push(os_from(at.bytes_u64()?)?);
         }
-        for _ in 0..at.len()? {
-            let name = String::from_utf8_lossy(at.part()?).into_owned();
-            shape.untraceable.push(
-                trace::untraceable_of(&name).ok_or_else(|| format!("no untraceable is {name:?}"))?,
-            );
+        for _ in 0..at.count_u64(1)? {
+            let name = at.bytes_u64()?;
+            let untraceable = std::str::from_utf8(name).ok().and_then(trace::untraceable_of);
+            // alloc: error path
+            let why = || format!("no untraceable is {:?}", String::from_utf8_lossy(name));
+            shape.untraceable.push(untraceable.ok_or_else(why)?);
         }
-        match at.0.is_empty() {
+        match at.is_done() {
             true => Ok(shape),
-            false => Err("the shape has bytes after its end".to_owned()),
+            false => Err("the shape has bytes after its end".to_owned()), // alloc: error path
         }
     }
 }
@@ -249,12 +251,14 @@ enum Keyed<E> {
 /// not their bytes').
 fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option<ContentId>, Keyed<I::Error>> {
     let bad = Keyed::NotAShape;
+    let short = |error: cursor::Error| Keyed::NotAShape(error.into());
     let all_name = trace::os_bytes(OsStr::new(ALL_ENV_NAME));
+    // alloc: error path
     let rest = bytes.strip_prefix(SHAPE_MAGIC.as_slice()).ok_or_else(|| bad("not a shape".to_owned()))?;
-    let mut at = At(rest);
+    let mut at = cursor::Reader::new(rest);
     let mut keyer = trace::Keyer::new(run);
-    for _ in 0..at.len().map_err(bad)? {
-        let bytes = at.part().map_err(bad)?;
+    for _ in 0..at.count_u64(1).map_err(short)? {
+        let bytes = at.bytes_u64().map_err(short)?;
         let path = trace::path_in(bytes).map_err(bad)?;
         let hash = match trace::walked(&path) {
             // A walked directory that was not there: one there now is what the run did not
@@ -267,8 +271,8 @@ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option
         };
         keyer.file(bytes, hash.as_ref());
     }
-    for _ in 0..at.len().map_err(bad)? {
-        let bytes = at.part().map_err(bad)?;
+    for _ in 0..at.count_u64(1).map_err(short)? {
+        let bytes = at.bytes_u64().map_err(short)?;
         let path = trace::path_in(bytes).map_err(bad)?;
         let hash = match trace::walked(&path) {
             Some((dir, package)) => trace::walk(inputs, dir, package),
@@ -279,11 +283,11 @@ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option
             None => return Ok(None),
         }
     }
-    let names = at.len().map_err(bad)?;
-    let mut asked = At(at.0);
+    let names = at.count_u64(1).map_err(short)?;
+    let mut asked = at;
     let mut whole = false;
     for _ in 0..names {
-        whole |= asked.part().map_err(bad)? == &*all_name;
+        whole |= asked.bytes_u64().map_err(short)? == &*all_name;
     }
     if whole {
         let all = inputs.env_all();
@@ -291,7 +295,7 @@ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option
         let hex = trace::os_bytes(OsStr::new(std::str::from_utf8(&hex).expect("a hash in hex is ASCII")));
         let mut all = all.iter().peekable();
         for _ in 0..names {
-            let name = at.part().map_err(bad)?;
+            let name = at.bytes_u64().map_err(short)?;
             let named = trace::os_in(name).map_err(bad)?;
             while let Some((set, value)) = all.next_if(|it| it.0.as_os_str() < &*named) {
                 keyer.env(&trace::os_bytes(set), Some(&*trace::os_bytes(value)));
@@ -310,22 +314,22 @@ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option
         }
     } else {
         for _ in 0..names {
-            let name = at.part().map_err(bad)?;
+            let name = at.bytes_u64().map_err(short)?;
             let value = inputs.env(&trace::os_in(name).map_err(bad)?).map(trace::os_bytes);
             keyer.env(name, value.as_deref());
         }
     }
-    for _ in 0..at.len().map_err(bad)? {
-        let name = at.part().map_err(bad)?;
+    for _ in 0..at.count_u64(1).map_err(short)? {
+        let name = at.bytes_u64().map_err(short)?;
         std::str::from_utf8(name)
             .ok()
             .and_then(trace::untraceable_of)
-            .ok_or_else(|| bad(format!("no untraceable is {:?}", String::from_utf8_lossy(name))))?;
+            .ok_or_else(|| bad(format!("no untraceable is {:?}", String::from_utf8_lossy(name))))?; // alloc: error path
         keyer.untraceable(name);
     }
-    match at.0.is_empty() {
+    match at.is_done() {
         true => Ok(Some(keyer.finish())),
-        false => Err(bad("the shape has bytes after its end".to_owned())),
+        false => Err(bad("the shape has bytes after its end".to_owned())), // alloc: error path
     }
 }
 
@@ -346,7 +350,7 @@ pub fn keep(
     traced: &Traced,
     value: Vec<u8>,
 ) -> Result<Vec<Ticket>, KeepError> {
-    let mut tickets = Vec::new();
+    let mut tickets = Vec::with_capacity(2);
     let key = result_key(run, traced);
     tickets.push(store.put(key, Kind::Run, value).map_err(KeepError::Mismatch)?);
     let shape = Shape::of(traced).encode();
@@ -357,6 +361,7 @@ pub fn keep(
         match same {
             Some(true) => return Ok(tickets),
             Some(false) => n += 1,
+            // clone: the store owns what it keeps, and a slot another took first needs the shape again
             None => match store.put(at, Kind::Run, shape.clone()) {
                 Ok(ticket) => {
                     tickets.push(ticket);
@@ -394,7 +399,7 @@ mod tests {
         };
         let shape = Shape::of(&traced);
         assert_eq!(shape.files, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
-        assert_eq!(Shape::decode(&shape.encode()), Ok(shape.clone()));
+        assert_eq!(Shape::decode(&shape.encode()).as_ref(), Ok(&shape));
         let mut other = traced.clone();
         other.files[0].1 = Some([9; 32]);
         assert_eq!(Shape::of(&other), shape);

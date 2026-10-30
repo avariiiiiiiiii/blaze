@@ -7,8 +7,8 @@
 use std::borrow::Cow;
 
 use base_db::{
-    BuiltDependency, ConstEvalBudget, Crate, CrateName, CrateOrigin, CrateWorkspaceData,
-    LangCrateOrigin, TargetKind, Version,
+    BuiltDependency, ConstEvalBudget, Crate, CrateName, CrateOrigin, CrateType, CrateTypes,
+    CrateWorkspaceData, LangCrateOrigin, TargetKind, Version,
     target::{Arch, TargetData},
 };
 use blaze_units::{
@@ -293,6 +293,21 @@ pub(crate) fn origin(package: &PackagePlan, unit: &Unit) -> CrateOrigin {
         true => CrateOrigin::Local { repo: None, name: Some(Symbol::intern(&package.name)) },
         false => CrateOrigin::Library { repo: None, name: Symbol::intern(&package.name) },
     }
+}
+
+/// The `--crate-type`s cargo passes for the unit, by rustc's names. A `--test` crate is an
+/// executable whatever its target's types (rustc's `collect_crate_types`).
+pub(crate) fn crate_types(unit: &Unit, plan: &UnitPlan, what: &str) -> Result<CrateTypes, LowerError> {
+    if is_test(unit, plan) {
+        return Ok(CrateTypes::of(&[CrateType::Bin]));
+    }
+    let named = |name: &String| {
+        CrateType::ALL.into_iter().find(|it| it.as_str() == name).ok_or_else(|| {
+            LowerError::at(format!("{what} has the crate type `{name}`, which blaze does not know"), what)
+        })
+    };
+    let types = unit.target.crate_types.iter().map(named).collect::<Result<Vec<_>, _>>()?;
+    Ok(CrateTypes::of(&types))
 }
 
 /// What the crate is: a `--test` crate is a test (a bench's a bench), whatever its target.

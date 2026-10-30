@@ -752,3 +752,57 @@ fn any_split_of_an_http_stream_gives_the_same_arrivals_and_answers() {
         assert_eq!(got, (arrived.clone(), out.clone()), "seed {seed}");
     }
 }
+
+/// A warm request on a Unix connection, read from the bytes received and handed over,
+/// allocates nothing; its reply is one allocation, the send buffer `Effect::Send` takes, and
+/// each send's end none. On an HTTP connection kept alive the request's read also writes the
+/// reply's head into a send buffer of its own: one allocation.
+#[test]
+fn a_warm_request_allocates_nothing_and_its_reply_one_buffer() {
+    for unix in [true, false] {
+        let mut rig = Rig::new(config(unix, !unix));
+        let conn = rig.accept(unix, 1);
+        let (mut effects, mut arrived) = (Vec::with_capacity(16), Vec::with_capacity(16));
+        for id in 0..20u64 {
+            let warm = id >= 2;
+            let bytes = match unix {
+                true => frame_of(id, Request::Cancel { id }),
+                false => authorized_post(id, Request::Cancel { id }),
+            };
+            let tag = rig.receiving(conn).expect("a receive in flight");
+            rig.in_flight.retain(|it| it.tag() != tag);
+            let (_, read) = blaze_alloc_count::measure(|| {
+                rig.server.complete(Completion { tag, done: Done::Read(bytes) }, &mut effects, &mut arrived)
+            });
+            let head = u64::from(!unix);
+            assert!(!warm || read.allocations <= head, "{unix}: a warm request read: {read:?}");
+            assert!(matches!(arrived[..], [Arrived::Request { request: Request::Cancel { id: got }, .. }] if got == id));
+            arrived.clear();
+            rig.in_flight.extend(effects.drain(..));
+            let to = RequestRef { conn, id };
+            let (_, replied) = blaze_alloc_count::measure(|| {
+                rig.server.reply(Reply { to, response: Response::Done { ok: true } }, &mut effects)
+            });
+            assert!(!warm || replied.allocations <= 1, "{unix}: a warm reply: {replied:?}");
+            rig.in_flight.extend(effects.drain(..));
+            let sending = |rig: &Rig| {
+                rig.in_flight.iter().find_map(|it| match it {
+                    Effect::Send { conn: of, tag, .. } if *of == conn => Some(*tag),
+                    _ => None,
+                })
+            };
+            let mut sends = 0;
+            while let Some(sent) = sending(&rig) {
+                rig.in_flight.retain(|it| it.tag() != sent);
+                let (_, done) = blaze_alloc_count::measure(|| {
+                    rig.server.complete(Completion { tag: sent, done: Done::Sent }, &mut effects, &mut arrived)
+                });
+                assert!(!warm || done.allocations == 0, "{unix}: a warm send's end: {done:?}");
+                rig.in_flight.extend(effects.drain(..));
+                sends += 1;
+            }
+            assert_eq!(sends, 1 + head, "{unix}: the reply, and on HTTP its head before it");
+            assert!(arrived.is_empty() && !rig.hung_up(conn), "{unix}");
+        }
+    }
+}

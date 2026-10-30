@@ -8,12 +8,12 @@
 //!
 //! [`View`]: crate::wire::View
 
-use std::{ops::Range, thread};
+use std::{ops::Range, sync::OnceLock, thread};
 
-use blaze_ids::Fingerprint;
+use blaze_ids::{Fingerprint, bits::BitSet};
 use blaze_query::QueryKey;
 
-use crate::{Bits, Stale, Trace, Work};
+use crate::{Stale, Trace, Work};
 
 /// A trace's columns, read by index: implemented by [`Trace`] and by [`crate::wire::View`], and
 /// monomorphized for each, so nothing here is dispatched at run time.
@@ -39,11 +39,11 @@ impl Columns for Trace {
     }
 
     fn has(&self, i: usize) -> bool {
-        self.has.get(i as u32)
+        self.has.contains(i as u32)
     }
 
     fn ran(&self, i: usize) -> bool {
-        self.ran.get(i as u32)
+        self.ran.contains(i as u32)
     }
 
     fn fingerprint(&self, i: usize) -> Fingerprint {
@@ -67,28 +67,50 @@ impl Columns for Trace {
 /// that many keys joined).
 const LEAST_PIECE: usize = 1 << 14;
 
+/// The cores this process may run on, asked once: on Linux each ask reads the cgroup's quota
+/// files, a few syscalls and allocations.
+pub(crate) fn cores() -> usize {
+    static CORES: OnceLock<usize> = OnceLock::new();
+    *CORES.get_or_init(|| thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
 /// How many pieces to split `len` elements into: one per core, none smaller than [`LEAST_PIECE`].
 pub(crate) fn pieces(len: usize) -> usize {
-    let cores = thread::available_parallelism().map_or(1, |n| n.get());
-    (len / LEAST_PIECE).clamp(1, cores)
+    (len / LEAST_PIECE).clamp(1, cores())
 }
 
 /// `work` over `0..len` cut into `pieces` consecutive ranges, the first on this thread and the
-/// rest each on a scoped thread of its own, the answers in range order.
-pub(crate) fn split<T: Send>(len: usize, pieces: usize, work: impl Fn(Range<usize>) -> T + Sync) -> Vec<T> {
+/// rest each on a scoped thread of its own, each answer handed to `take` in range order. One
+/// piece runs on this thread with nothing allocated.
+pub(crate) fn split<T: Send>(
+    len: usize,
+    pieces: usize,
+    work: impl Fn(Range<usize>) -> T + Sync,
+    mut take: impl FnMut(T),
+) {
     let pieces = pieces.clamp(1, len.max(1));
     let range = |p: usize| p * len / pieces..(p + 1) * len / pieces;
     if pieces == 1 {
-        return vec![work(0..len)];
+        return take(work(0..len));
     }
     thread::scope(|scope| {
         let work = &work;
+        // alloc: one handle a core, once a join that spawns its threads (each spawn allocates too).
         let others: Vec<_> = (1..pieces).map(|p| scope.spawn(move || work(range(p)))).collect();
-        let mut out = Vec::with_capacity(pieces);
-        out.push(work(range(0)));
-        out.extend(others.into_iter().map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))));
-        out
-    })
+        take(work(range(0)));
+        for other in others {
+            take(other.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic)));
+        }
+    });
+}
+
+/// `piece` added to the end of `all`, which takes it whole when it is the first.
+fn append<T>(all: &mut Vec<T>, mut piece: Vec<T>) {
+    if all.is_empty() {
+        *all = piece;
+    } else {
+        all.append(&mut piece);
+    }
 }
 
 fn result<C: Columns>(c: &C, i: usize) -> Option<Fingerprint> {
@@ -133,24 +155,23 @@ fn same_edges<A: Columns, B: Columns>(a: &A, i: usize, b: &B, j: usize) -> bool 
 
 /// The keys reachable from `roots`, the roots included; `None`, every result, when there are no
 /// roots.
-fn reachable<C: Columns>(c: &C, roots: &[QueryKey]) -> Option<Bits> {
+fn reachable<C: Columns>(c: &C, roots: &[QueryKey]) -> Option<BitSet<u32>> {
     if roots.is_empty() {
         return None;
     }
-    let mut seen = Bits::with_len(c.keys());
+    let mut seen = BitSet::new(c.keys());
     let mut next: Vec<usize> = roots
         .iter()
         .filter_map(|k| {
             let at = seek(c, 0, k);
             (at < c.keys() && c.key(at) == *k).then_some(at)
         })
+        // alloc: once a join given roots, the stack of the walk; none without roots.
         .collect();
     while let Some(i) = next.pop() {
-        if seen.get(i as u32) {
-            continue;
+        if seen.insert(i as u32) {
+            next.extend(c.edges_of(i).map(|e| c.read(e) as usize));
         }
-        seen.set(i as u32);
-        next.extend(c.edges_of(i).map(|e| c.read(e) as usize));
     }
     Some(seen)
 }
@@ -162,11 +183,14 @@ pub fn under<A: Columns, B: Columns>(incremental: &A, scratch: &B, roots: &[Quer
 
 fn under_in<A: Columns, B: Columns>(incremental: &A, scratch: &B, roots: &[QueryKey], pieces: usize) -> Vec<Stale> {
     let reached = reachable(scratch, roots);
-    let found = split(scratch.keys(), pieces, |range| {
+    // alloc: the answer, which stays unallocated while nothing is stale.
+    let mut stale = Vec::new();
+    let work = |range: Range<usize>| {
+        // alloc: as above, this piece's.
         let mut stale = Vec::new();
         let mut cursor = start_in(incremental, scratch, range.start);
         for i in range {
-            let reaches = reached.as_ref().is_none_or(|r| r.get(i as u32));
+            let reaches = reached.as_ref().is_none_or(|r| r.contains(i as u32));
             let Some(theirs) = result(scratch, i).filter(|_| reaches) else { continue };
             let query = scratch.key(i);
             let found = index_from(incremental, &mut cursor, &query);
@@ -194,9 +218,11 @@ fn under_in<A: Columns, B: Columns>(incremental: &A, scratch: &B, roots: &[Query
             });
         }
         stale
-    });
-    let mut stale: Vec<Stale> = found.into_iter().flatten().collect();
-    stale.sort_by_key(|s| (s.rank(), s.query()));
+    };
+    split(scratch.keys(), pieces, work, |piece| append(&mut stale, piece));
+    // A query is stale at most once (one answer a key, the keys distinct), so no two have one
+    // sort key and the unstable sort, which needs no buffer, orders them as the stable one did.
+    stale.sort_unstable_by_key(|s| (s.rank(), s.query()));
     stale
 }
 
@@ -206,8 +232,12 @@ pub fn over<A: Columns, B: Columns>(before: &A, after: &B) -> (Work, Vec<QueryKe
 }
 
 fn over_in<A: Columns, B: Columns>(before: &A, after: &B, pieces: usize) -> (Work, Vec<QueryKey>) {
-    let found = split(after.keys(), pieces, |range| {
+    let mut work = Work::default();
+    // alloc: the answer, which stays unallocated while nothing reran for nothing.
+    let mut needless = Vec::new();
+    let found = |range: Range<usize>| {
         let mut work = Work::default();
+        // alloc: as above, this piece's.
         let mut needless = Vec::new();
         let mut cursor = start_in(before, after, range.start);
         for i in range {
@@ -225,26 +255,73 @@ fn over_in<A: Columns, B: Columns>(before: &A, after: &B, pieces: usize) -> (Wor
             }
         }
         (work, needless)
-    });
-    let mut work = Work::default();
-    let mut needless = Vec::new();
-    for (piece, keys) in found {
+    };
+    split(after.keys(), pieces, found, |(piece, keys)| {
         work.ran += piece.ran;
         work.needless += piece.needless;
         work.cut_off += piece.cut_off;
         work.new += piece.new;
-        needless.extend(keys);
-    }
+        append(&mut needless, keys);
+    });
     (work, needless)
 }
 
 #[cfg(test)]
 mod tests {
-    use blaze_ids::Fingerprint;
-    use blaze_query::QueryKey;
+    use blaze_ids::{ContentId, Fingerprint};
+    use blaze_query::{Edge, QueryKey, QueryKind};
 
     use super::{over_in, under_in};
-    use crate::{Trace, wire::View, wire::tests::seeded};
+    use crate::{Trace, TraceBuilder, Work, wire::View, wire::tests::seeded};
+
+    /// `n` results, each reading up to four earlier ones and seeing what they are, none of them
+    /// run: joined with itself, nothing is stale and nothing reran.
+    fn settled(seed: u64, n: u64) -> Trace {
+        let mut rng = crate::Rng::new(seed);
+        let key = |i: u64| QueryKey {
+            kind: QueryKind(0x2000 + (i % 5) as u16),
+            input: ContentId::of("blaze v2 proof join test key 1", &i.to_le_bytes()),
+        };
+        let fingerprint = |i: u64| Fingerprint(u128::from(i) * 7 + 1);
+        let mut builder = TraceBuilder::default();
+        let mut edges = Vec::new();
+        for i in 0..n {
+            edges.clear();
+            for _ in 0..rng.below(5).min(i) {
+                let read = rng.below(i);
+                edges.push(Edge { read: key(read), saw: fingerprint(read) });
+            }
+            builder.insert(key(i), fingerprint(i), &edges, false);
+        }
+        builder.finish()
+    }
+
+    /// The oracle's steady state, a build that agrees with the one from scratch and reran
+    /// nothing, joined on one piece, owned or in place: nothing allocated, as the answers are
+    /// empty.
+    #[test]
+    fn a_join_of_traces_that_agree_allocates_nothing() {
+        let trace = settled(8, 3000);
+        let bytes = blaze_protocol::cbor::to_vec(&trace).unwrap();
+        let view = View::parse(&bytes).unwrap();
+        assert!(crate::under(&trace, &trace, &[]).is_empty(), "the settled trace agrees with itself");
+        for _ in 0..2 {
+            let stale = blaze_alloc_count::assert_at_most(0, "under, a trace and itself, owned", || {
+                under_in(&trace, &trace, &[], 1)
+            });
+            assert!(stale.is_empty());
+            let stale = blaze_alloc_count::assert_at_most(0, "under, a trace and itself, in place", || {
+                under_in(&view, &view, &[], 1)
+            });
+            assert!(stale.is_empty());
+            let (work, needless) =
+                blaze_alloc_count::assert_at_most(0, "over, nothing ran, owned", || over_in(&trace, &trace, 1));
+            assert_eq!((work, needless.len()), (Work::default(), 0));
+            let (work, needless) =
+                blaze_alloc_count::assert_at_most(0, "over, nothing ran, in place", || over_in(&view, &view, 1));
+            assert_eq!((work, needless.len()), (Work::default(), 0));
+        }
+    }
 
     /// A trace of the same keys as `base` with some results changed, kept or dropped by `seed`,
     /// so `under` and `over` against `base` find every kind of answer.
@@ -254,8 +331,10 @@ mod tests {
         for i in 0..trace.keys.len() as u32 {
             match rng.below(8) {
                 0 => trace.fingerprints[i as usize] = Fingerprint(trace.fingerprints[i as usize].0 + 1),
-                1 => trace.ran.0[i as usize / 64] ^= 1 << (i % 64),
-                2 if trace.has.get(i) => trace.has.0[i as usize / 64] &= !(1 << (i % 64)),
+                1 => trace.ran.set(i, !trace.ran.contains(i)),
+                2 if trace.has.contains(i) => {
+                    trace.has.remove(i);
+                }
                 _ => {}
             }
         }

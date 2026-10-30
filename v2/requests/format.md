@@ -1453,6 +1453,7 @@ grammar's structure (speed-syntax's postorder rewrite).
 > taken by requests (format is DONE): child `requests-parser`; the outcome follows.
 > applied by requests (child requests-parser): items 1-3. (1) The step counter is a plain u32 in Parser, checked in start, error (every failed expect and every err_recover path go through it), and the EOF branches of bump_any/bump_remap. Same PARSER_STEP_LIMIT and message, not in nth. Termination is a property test, not a fuzz target, because fuzz/Cargo.toml was being edited by another lane and blaze-fuzz has its own global allocator: tests.rs termination::every_entry_point_finishes_on_every_input runs every Top/Prefix entry point, outlines and Reparser::top_level_item over 2000 changed token sequences, with a deadline. (2) Input and frontend-tokens new parser::Tokens end in Tokens::PAD = 4 EOF words, and len() leaves them out. kind, contextual_kind and is_joint are a slice load, and kind is transmuted with no SyntaxKind::from assert; Tokens::new checks the pad and every kind field. No change in grammar/. (3) Marker is a u32 and a bool with its own Drop, same message, and drop_bomb is gone from Cargo.toml. Tests are beside the code (input.rs, parser.rs). Arithmetic is in docs/v2/plan/lanes/format/speed-of-light.md: about 2.5x the bound, from about 5x. Items 4 and 5 were not in this brief. Nothing built.
 > forwarded to frontend-tokens (items 4 and 5): `crates/parser/` is held by frontend-tokens, still running (design item 4), and item 4 also changes `tests/top_entries.rs`' budget. Items 1-3 were applied above. Told by tmux.
+> items 4 and 5 done by frontend-tokens: (4) events are sized at 3.25 a token (requests-parser's `lend_events`), and with the output words on a shelf too the budget in `src/tests/top_entries.rs` is 0 for a second parse, not 5; (5) `Parser::errors`, `event::process` and `Output`'s error table are `Cow<'static, str>`, `error` takes `Into<Cow<'static, str>>`, and `err_and_bump`, `err_recover`, `error_block`, `error_let_stmt` take `&'static str` (every caller passes a literal), so a fixed message allocates nothing. Nothing built.
 
 ## format-grammar: `tools/v2/hot_lint.py` refuses its own `crates` field (to the coordinator)
 
@@ -1479,6 +1480,7 @@ live until the tree is built, so either the caller lends them too or they come f
 > taken by requests (format is DONE): child `requests-parser`, with the speed-of-light request on the same files; the outcome follows.
 > forwarded to frontend-tokens: `parser.rs`/`event.rs` are held by frontend-tokens, still running; requests-parser did not take this one after all. Told by tmux, cc mem-format.
 > applied by requests (child requests-parser): the event list and the forward-parent list are per-thread blaze_mem::scratch buffers. event.rs has a per_thread_buffer! macro (a Shelved newtype over its own thread-local, which keeps the larger of two coming back), Events and ForwardParents. Parser::new takes the thread's list through lend_events, sized at 3.25 events a token so a cold list seldom doubles, and process borrows ForwardParents through scratch::with. A warm parse now allocates only the output's words. Those are built in output.rs, which is not mine; the exact three-edit change (Output's words as a Lent<Words> from the same macro) is in v2/requests/requests.md, From requests-parser: the parse's output words on a per-thread shelf. Tests in tests.rs warm_parse: a warm parse makes at most 1 allocation (outline 2), and a small parse keeps the large list warm. These budgets and top_entries.rs' 6 go to 0 once output.rs lands. blaze_mem::scratch has no tag argument, so these buffers carry no parse tag. Nothing built.
+> done: requests-parser moved the event and forward-parent lists onto per-thread `blaze_mem::scratch` buffers; frontend-tokens applied its `output.rs` change (`v2/requests/requests.md`). A warm parse and a warm outline assert 0 allocations (`warm_parse::a_warm_parse_allocates_nothing`, `a_small_parse_keeps_the_large_list_warm`, `top_entries.rs`). The buffers carry no tag, since `blaze_mem::scratch` takes none. Nothing built.
 
 ## frontend-tokens: `crates/parser/src/input.rs` and `parser.rs` (to requests-parser)
 
@@ -1500,6 +1502,7 @@ Then `Parser` reads `Tokens<'t>` in place of `&'t Input`. `outline::lazy_block_l
 
 > forwarded to frontend-tokens: requests-parser is DONE and out of `input.rs` and `parser.rs` (it kept `Input`'s 4 `EOF` words of padding; `Parser` still takes `&Input`), so both additions are frontend-tokens' to make. Told by tmux.
 > requests-parser: out of input.rs and parser.rs for good (frontend-tokens told by tmux at 20:12). frontend-tokens has since added both: Tokens::without_first_fragment (field first_fragment) and Input::extend_from_words. Checked against the padding: Input::into_words returns the words with their 4 EOF_WORD pad, which Tokens::new requires. extend_from_words checks has_valid_kinds of each word, cuts the pad, appends the words and puts the 4 EOF_WORDs back, so kind_of's SAFETY argument and the pos+3 lookahead still hold. One more thing for the Tokens switch: parser.rs' events are a scratch Lent<event::Events> (buffers request), and do_bump debug-asserts pos <= len, which the lookahead into the pad relies on.
+> done by frontend-tokens (20:15-20:25): `Tokens::without_first_fragment`, `Tokens::ignoring_fragments` and `Input::extend_from_words` (checks kinds, keeps the pad), with tests in `input.rs`; `Parser` reads `Tokens<'t>` and every entry point takes `impl Into<Tokens<'t>>`. Nothing built.
 
 ## From speed-link-edge-sol-wire: `ContentId` and `Fingerprint` as one CBOR byte string (2026-10-29)
 
@@ -1527,3 +1530,656 @@ big build), `Response::Trace` (a `QueryKey` per edge), `Snapshotted`, every root
    inside 11 if this lands before the first build; tell speed-link-edge or lane ci).
 3. Why: the bound for a frame is its bytes ÷ memory bandwidth; a byte-per-item encoding is 30
    to 60 times that for these ids, and they are most of a trace's bytes.
+
+> taken by requests (format and dedup-intern are DONE): child `requests-ids`; the outcome follows.
+> applied by requests (child requests-ids): item 1 in `crates/blaze-ids/src/wire.rs` (byte-string Serialize, exact-length Deserialize, arrays only from human-readable readers) with tests in `wire/tests.rs` (postcard and a binary test reader, since blaze-protocol depends on blaze-ids; JSON); item 2 listed in `v2/requests/requests.md` "From requests-ids (2026-10-29): bumps for `ContentId` and `Fingerprint` as one byte string" (blaze-api `SCHEMA` inside 13, six domain/version bumps with owners).
+
+## dedup: bits: syntax-tree `flat.rs` ranks, `rank_in`, `Kept` and `append_bits` onto `blaze_ids::bits`
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`blaze_ids::bits` (`crates/blaze-ids/src/bits.rs`) has what `flat.rs` wrote by hand:
+`ranks_of(words) -> Option<Box<[u32]>>` (the members before each word) and
+`rank_in(words, ranks, at)` (one popcount) for the tree's `nodes`/`ranks` columns, which stay
+two columns of `FlatTree`; `Ranked` (words, the same `u32` count a word, a length) for `Kept`'s
+`bits`/`ranks`, with `place(rank)` = the slot index when kept; and `Bits::or_range_at(at,
+from, range)`, `append_bits`' splice, written for this caller. Same bits, same ranks, same
+column lengths and allocations (each column once at its final length); `heap_size` counts the
+same bytes. syntax-tree depends on blaze-ids already. The ranks of `Kept` and of the edit's
+node bitmap were sums with no overflow check; `ranks_of` is checked and gives `None` past
+`u32::MAX`, which a tree (fewer than `NO_PARENT` elements, asserted) never reaches.
+
+`crates/syntax-tree/src/flat.rs`:
+
+1. Imports, before: `use blaze_ids::{radix, Domain};` after:
+
+   ```rust
+   use blaze_ids::{
+       Domain,
+       bits::{BitSet, BitSlice, Ranked, rank_in, ranks_of},
+       radix,
+   };
+   ```
+
+2. `Kept`, before:
+
+   ```rust
+   #[derive(Default)]
+   struct Kept {
+       /// The nodes, ascending.
+       elements: Box<[u32]>,
+       /// Bit `n % 64` of word `n / 64`: whether the node of rank `n` among the nodes is kept.
+       /// Empty when none is.
+       bits: Box<[u64]>,
+       /// How many are kept before each word of `bits`.
+       ranks: Box<[u32]>,
+       /// Their hashes, as `elements`.
+       hashes: Box<[Slot]>,
+   }
+
+   impl Clone for Kept {
+       fn clone(&self) -> Kept {
+           let Kept { elements, bits, ranks, hashes } = self;
+           let hashes = hashes.iter().map(|it| Slot::new(it.value()));
+           // clone: a tree copied whole (a part moved by an edit) copies its columns
+           let (elements, bits, ranks) = (elements.clone(), bits.clone(), ranks.clone());
+           // alloc: a column of the copy, as those above
+           Kept { elements, bits, ranks, hashes: hashes.collect() }
+       }
+   }
+   ```
+
+   after:
+
+   ```rust
+   #[derive(Default)]
+   struct Kept {
+       /// The nodes, ascending.
+       elements: Box<[u32]>,
+       /// Whether the node of rank `n` among the nodes is kept, ranked: a kept node's rank in
+       /// it is its place in `hashes`. Of no bits when none is.
+       bits: Ranked,
+       /// Their hashes, as `elements`.
+       hashes: Box<[Slot]>,
+   }
+
+   impl Clone for Kept {
+       fn clone(&self) -> Kept {
+           let Kept { elements, bits, hashes } = self;
+           let hashes = hashes.iter().map(|it| Slot::new(it.value()));
+           // clone: a tree copied whole (a part moved by an edit) copies its columns
+           let (elements, bits) = (elements.clone(), bits.clone());
+           // alloc: a column of the copy, as those above
+           Kept { elements, bits, hashes: hashes.collect() }
+       }
+   }
+   ```
+
+3. `Kept::new`, before (the body after the `debug_assert!` of ascending nodes):
+
+   ```rust
+           // alloc: the tree's columns of kept nodes, made once with the tree
+           let mut bits = vec![0u64; count.div_ceil(64)];
+           for &(at, _) in kept {
+               debug_assert!((nodes[at as usize / 64] >> (at % 64)) & 1 == 1, "element {at} is a node");
+               let rank = rank_in(nodes, ranks, at);
+               bits[rank / 64] |= 1 << (rank % 64);
+           }
+           let mut before = 0;
+           let ranks = bits.iter().map(|it| {
+               let rank = before;
+               before += it.count_ones();
+               rank
+           });
+           // alloc: as `bits`
+           let (ranks, elements) = (ranks.collect(), kept.iter().map(|it| it.0).collect());
+           // alloc: as `bits`
+           let hashes = kept.iter().map(|it| Slot::new(it.1)).collect();
+           Kept { elements, bits: bits.into_boxed_slice(), ranks, hashes }
+   ```
+
+   after:
+
+   ```rust
+           // alloc: the tree's columns of kept nodes, made once with the tree
+           let mut set = BitSet::<usize>::new(count);
+           for &(at, _) in kept {
+               debug_assert!(BitSlice::from_words(nodes).contains(at as usize), "element {at} is a node");
+               set.insert(rank_in(nodes, ranks, at as usize));
+           }
+           // alloc: as `set`, its ranks
+           let bits = Ranked::from_words(set.into_words(), count).expect("a tree of fewer than 2^32 nodes");
+           // alloc: as `set`
+           let elements = kept.iter().map(|it| it.0).collect();
+           // alloc: as `set`
+           let hashes = kept.iter().map(|it| Slot::new(it.1)).collect();
+           Kept { elements, bits, hashes }
+   ```
+
+4. `Kept::slot`, before:
+
+   ```rust
+       fn slot(&self, rank: usize) -> Option<&Slot> {
+           let (word, bit) = (rank / 64, rank % 64);
+           let bits = *self.bits.get(word)?;
+           ((bits >> bit) & 1 == 1).then(|| {
+               let before = (bits & ((1u64 << bit) - 1)).count_ones();
+               &self.hashes[self.ranks[word] as usize + before as usize]
+           })
+       }
+   ```
+
+   after (`place` is `None` past its length, as `get(word)?` was past its words; a node's
+   rank is below `count`):
+
+   ```rust
+       fn slot(&self, rank: usize) -> Option<&Slot> {
+           self.bits.place(rank).map(|at| &self.hashes[at])
+       }
+   ```
+
+5. `Kept::heap_size`, before / after:
+
+   ```rust
+           (self.elements.len() + self.ranks.len()) * 4 + self.bits.len() * 8 + self.hashes.len() * 16
+   ```
+
+   ```rust
+           (self.elements.len() + self.bits.ranks().len()) * 4 + self.bits.words().len() * 8 + self.hashes.len() * 16
+   ```
+
+   (`subtree_hash`'s `NODE if !self.kept.bits.is_empty()` stays: `Ranked::is_empty` is "of no
+   bits", which `Kept::default` is and every `Kept::new` of a kept node is not.)
+
+6. Delete the local `fn rank_in` (with its doc comment, `/// How many nodes come before
+   element `at` ...`). `FlatTree::rank`, before / after:
+
+   ```rust
+           rank_in(&self.nodes, &self.ranks, at)
+   ```
+
+   ```rust
+           rank_in(&self.nodes, &self.ranks, at as usize)
+   ```
+
+7. `fn nodes`, before:
+
+   ```rust
+   fn nodes(words: &[u32]) -> (Box<[u64]>, Box<[u32]>) {
+       let mut nodes = Vec::with_capacity(words.len().div_ceil(64));
+       let mut ranks = Vec::with_capacity(words.len().div_ceil(64));
+       let mut before = 0;
+       for chunk in words.chunks(64) {
+           let mut bits = 0u64;
+           for (bit, &word) in chunk.iter().enumerate() {
+               if word & TAG == NODE {
+                   bits |= 1 << bit;
+               }
+           }
+           ranks.push(before);
+           nodes.push(bits);
+           before += bits.count_ones();
+       }
+       (nodes.into_boxed_slice(), ranks.into_boxed_slice())
+   }
+   ```
+
+   after:
+
+   ```rust
+   fn nodes(words: &[u32]) -> (Box<[u64]>, Box<[u32]>) {
+       let mut nodes = Vec::with_capacity(words.len().div_ceil(64));
+       for chunk in words.chunks(64) {
+           let mut bits = 0u64;
+           for (bit, &word) in chunk.iter().enumerate() {
+               if word & TAG == NODE {
+                   bits |= 1 << bit;
+               }
+           }
+           nodes.push(bits);
+       }
+       let ranks = ranks_of(&nodes).expect("a tree of fewer than 2^32 elements");
+       (nodes.into_boxed_slice(), ranks)
+   }
+   ```
+
+8. Delete `fn append_bits` (with its doc comment `/// Appends bits `from..to` of `src` to
+   `dst`, ...`). In the edit (~line 1271), before:
+
+   ```rust
+           // alloc: as `words`
+           let mut nodes = Vec::with_capacity((len as usize).div_ceil(64));
+           let mut bits = 0;
+           append_bits(&mut nodes, &mut bits, &self.nodes, 0, lo as usize);
+           append_bits(&mut nodes, &mut bits, &with.nodes, 0, added as usize);
+           append_bits(&mut nodes, &mut bits, &self.nodes, hi as usize, self.len() as usize);
+           let mut counted = 0;
+           let ranks = nodes.iter().map(|it| {
+               let rank = counted;
+               counted += it.count_ones();
+               rank
+           });
+           // alloc: as `words`
+           let ranks: Box<[u32]> = ranks.collect();
+           debug_assert_eq!(counted as usize, node_parents.len(), "a node bit for each node");
+   ```
+
+   after (`len` is `lo + added + (self.len() - hi)`, so the three ranges fill the new set's
+   bits exactly; `nodes` stays a `Vec<u64>` for `Kept::new(&nodes, ...)` and `exact(nodes)`
+   below):
+
+   ```rust
+           // alloc: as `words`
+           let mut set = BitSet::<usize>::new(len as usize);
+           let old_nodes = BitSlice::<usize>::from_words(&self.nodes[..]);
+           let with_nodes = BitSlice::<usize>::from_words(&with.nodes[..]);
+           set.or_range_at(0, &old_nodes, 0..lo as usize);
+           set.or_range_at(lo as usize, &with_nodes, 0..added as usize);
+           set.or_range_at((lo + added) as usize, &old_nodes, hi as usize..self.len() as usize);
+           debug_assert_eq!(set.count(), node_parents.len(), "a node bit for each node");
+           let nodes = set.into_words();
+           // alloc: as `words`
+           let ranks = ranks_of(&nodes).expect("a tree of fewer than 2^32 elements");
+   ```
+
+Status: open
+
+> forwarded to frontend-tree (holds the syntax crates; format is DONE) (from requests, pass 17; told by tmux).
+> frontend-tree (2026-10-29): handed to mem-format-tree, which holds `flat.rs` for its
+> `v2/requests/mem-format-tree.md` sections 2 and 3. Section 2 rewrites the same columns
+> (`Kept`'s `bits`/`ranks`, `nodes`/`ranks`, the edit's node bitmap) into one block of `Col<T>`s,
+> so the two edits can't both apply as written. mem-format-tree folds this in. It keeps
+> `blaze_ids::bits`' `rank_in`/`ranks_of` and the `BitSet` splice for the edit's bitmap, and
+> places their results in the block. If `Ranked` can't live in the block, `Kept` keeps two
+> `Col`s read through `rank_in`. Same bits, ranks and `heap_size` either way.
+
+## dedup: bits: span `ast_id.rs` body slots onto `blaze_ids::bits::BitArray`, and `lines.rs`'s `below`
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`blaze_ids::bits::BitArray<W, I>` (`crates/blaze-ids/src/bits.rs`) is `W` words inline:
+`contains`, `insert_range` (a word at a time) and `EMPTY`. span depends on blaze-ids already.
+Same slots found (the same scan, `rfind` of a taken slot in the window), same marks, same
+stack array of `SLOTS / 64` words.
+
+1. `crates/span/src/ast_id.rs`: imports, before: `use blaze_ids::radix;` after:
+   `use blaze_ids::{bits::BitArray, radix};`
+
+   Above `fn take_slots` add:
+
+   ```rust
+   /// A bit per hash value a body may be named by: taken or not.
+   type Slots = BitArray<{ (SLOTS / 64) as usize }, u32>;
+   ```
+
+   `take_slots`, before:
+
+   ```rust
+   fn take_slots(used: &mut [u64], start: u16, slots: u32) -> u32 {
+       assert!(slots <= SLOTS, "a fn body too long to number its nodes ({slots} slots)");
+       let taken = |used: &[u64], it: u32| used[(it / 64) as usize] & (1 << (it % 64)) != 0;
+       let mut first = u32::from(start);
+       for _ in 0..2 * SLOTS {
+           if first + slots > SLOTS {
+               first = 0;
+           }
+           match (first..first + slots).rfind(|&it| taken(used, it)) {
+               Some(it) => first = it + 1,
+               None => {
+                   for it in first..first + slots {
+                       used[(it / 64) as usize] |= 1 << (it % 64);
+                   }
+                   return first;
+               }
+           }
+       }
+   ```
+
+   after:
+
+   ```rust
+   fn take_slots(used: &mut Slots, start: u16, slots: u32) -> u32 {
+       assert!(slots <= SLOTS, "a fn body too long to number its nodes ({slots} slots)");
+       let mut first = u32::from(start);
+       for _ in 0..2 * SLOTS {
+           if first + slots > SLOTS {
+               first = 0;
+           }
+           match (first..first + slots).rfind(|&it| used.contains(it)) {
+               Some(it) => first = it + 1,
+               None => {
+                   used.insert_range(first..first + slots);
+                   return first;
+               }
+           }
+       }
+   ```
+
+   `place_bodies`, before: `let mut used = [0u64; (SLOTS / 64) as usize];` after:
+   `let mut used = Slots::EMPTY;` (`take_slots(&mut used, ...)` is unchanged).
+
+2. `crates/span/src/lines.rs` stays its own structure: `LineIndex` keeps one `u32` rank per
+   eight words (512 bytes of text, 1/16 bit a byte) and a select, where a
+   `blaze_ids::bits::Ranked` keeps one a word (1/2 bit a byte, 8x the table, for a bitmap as
+   long as the text). Only its copy of `below` goes. Imports, after `use std::fmt;` add a
+   blank line and `use blaze_ids::bits::below;` (in the `text_size`/`unicode_width` group:
+   `use blaze_ids::bits::below;` then `use text_size::TextSize;`). Delete:
+
+   ```rust
+   /// The bits of a word below bit `n`, for `n` below 64.
+   fn below(n: usize) -> u64 {
+       (1u64 << n) - 1
+   }
+   ```
+
+   and in `rank` and `start_before`, `below(at % 64)` becomes `below(at)` (two sites;
+   `bits::below(bit)` is the bits of `bit`'s word below it, `bit % 64` taken inside). Add to
+   the doc of `LineIndex::bits`, before:
+
+   ```rust
+       /// Bit `i % 64` of word `i / 64` is set when byte `i` is `\n`. 1 bit a byte.
+       bits: Box<[u64]>,
+   ```
+
+   after:
+
+   ```rust
+       /// Bit `i % 64` of word `i / 64` is set when byte `i` is `\n`. 1 bit a byte. Ranked a
+       /// block of [`BLOCK`] words at a time, not a word at a time as a `blaze_ids::bits::Ranked`.
+       bits: Box<[u64]>,
+   ```
+
+Status: open
+
+> forwarded to db (db-expand-macros-next1 holds `crates/span/`) (from requests, pass 17; told by tmux).
+
+## dedup: bits: parser `TokenSet` onto `blaze_ids::bits::BitArray`, and `scan.rs` kept
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`blaze_ids::bits::BitArray<3>` (`crates/blaze-ids/src/bits.rs`) is three words inline with
+`const fn`s `EMPTY`, `with_bit`, `or`, `has_bit`. `TokenSet` keeps its invariant (token kinds
+only, the `debug_assert!`s) and its `const` API, so the grammar's `const` sets don't change;
+only its bit arithmetic goes. Same bits; `has_bit` past the words is `false` where the array
+index panicked, and no kind reaches past them (each is at most `SHEBANG`, asserted).
+
+1. `crates/parser/Cargo.toml`: move `blaze-ids.workspace = true` from `[dev-dependencies]` to
+   `[dependencies]` (after `blaze-mem.workspace = true`). blaze-ids depends on blake3,
+   blaze-radix, serde, smallvec, thin-vec (and blaze-check under `cfg(blaze_check)`), none of
+   which depends on parser.
+
+2. `crates/parser/src/token_set.rs`, before:
+
+   ```rust
+   use crate::SyntaxKind;
+
+   /// A bit-set of `SyntaxKind`s
+   #[derive(Clone, Copy)]
+   pub(crate) struct TokenSet([u64; 3]);
+   ```
+
+   after:
+
+   ```rust
+   use blaze_ids::bits::BitArray;
+
+   use crate::SyntaxKind;
+
+   /// A bit-set of `SyntaxKind`s
+   #[derive(Clone, Copy)]
+   pub(crate) struct TokenSet(BitArray<3>);
+   ```
+
+   before:
+
+   ```rust
+       pub(crate) const EMPTY: TokenSet = TokenSet([0; 3]);
+
+       pub(crate) const fn new(kinds: &[SyntaxKind]) -> TokenSet {
+           let mut res = [0; 3];
+           let mut i = 0;
+           while i < kinds.len() {
+               let discriminant = kinds[i] as usize;
+               debug_assert!(
+                   discriminant <= LAST_TOKEN_KIND_DISCRIMINANT,
+                   "Expected a token `SyntaxKind`"
+               );
+               let idx = discriminant / 64;
+               res[idx] |= 1 << (discriminant % 64);
+               i += 1;
+           }
+           TokenSet(res)
+       }
+
+       pub(crate) const fn union(self, other: TokenSet) -> TokenSet {
+           TokenSet([self.0[0] | other.0[0], self.0[1] | other.0[1], self.0[2] | other.0[2]])
+       }
+
+       pub(crate) const fn contains(&self, kind: SyntaxKind) -> bool {
+           let discriminant = kind as usize;
+           debug_assert!(
+               discriminant <= LAST_TOKEN_KIND_DISCRIMINANT,
+               "Expected a token `SyntaxKind`"
+           );
+           let idx = discriminant / 64;
+           let mask = 1 << (discriminant % 64);
+           self.0[idx] & mask != 0
+       }
+   ```
+
+   after:
+
+   ```rust
+       pub(crate) const EMPTY: TokenSet = TokenSet(BitArray::EMPTY);
+
+       pub(crate) const fn new(kinds: &[SyntaxKind]) -> TokenSet {
+           let mut res: BitArray<3> = BitArray::EMPTY;
+           let mut i = 0;
+           while i < kinds.len() {
+               let discriminant = kinds[i] as usize;
+               debug_assert!(
+                   discriminant <= LAST_TOKEN_KIND_DISCRIMINANT,
+                   "Expected a token `SyntaxKind`"
+               );
+               res = res.with_bit(discriminant);
+               i += 1;
+           }
+           TokenSet(res)
+       }
+
+       pub(crate) const fn union(self, other: TokenSet) -> TokenSet {
+           TokenSet(self.0.or(&other.0))
+       }
+
+       pub(crate) const fn contains(&self, kind: SyntaxKind) -> bool {
+           let discriminant = kind as usize;
+           debug_assert!(
+               discriminant <= LAST_TOKEN_KIND_DISCRIMINANT,
+               "Expected a token `SyntaxKind`"
+           );
+           self.0.has_bit(discriminant)
+       }
+   ```
+
+   The test `token_set_works_for_tokens` stays.
+
+3. `crates/parser/src/lexed_str/scan.rs` keeps its blocks: each 64 bytes of text is one
+   `[u64; 4]` of four classes side by side, so one step of the lexer loads the bits of every
+   class it asks from one place, and a search runs to the sentinel bits set past the text's
+   end with no bound check; four `blaze_ids::bits` sets would put each class in its own
+   buffer. Add to the doc of `Block`, before:
+
+   ```rust
+   /// The classes of 64 bytes: a bit per byte in each of [`IDENT`], [`START`] (first [`SPACE`]),
+   /// [`NEWLINE`] and [`QUOTE`].
+   type Block = [u64; 4];
+   ```
+
+   after:
+
+   ```rust
+   /// The classes of 64 bytes: a bit per byte in each of [`IDENT`], [`START`] (first [`SPACE`]),
+   /// [`NEWLINE`] and [`QUOTE`]. Interleaved, not four `blaze_ids::bits` sets: a step of the
+   /// lexer reads every class of its bytes from one block.
+   type Block = [u64; 4];
+   ```
+
+Status: open
+
+> forwarded to frontend-tokens (holds `crates/parser/`) (from requests, pass 17; told by tmux).
+
+## dedup: bits: intern `table.rs` `Live` and the image's live bits onto `blaze_ids::bits`
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`dedup-intern`, which was editing this file, is done; `mem-format` names `crates/intern` and is told.
+`blaze_ids::bits` (`crates/blaze-ids/src/bits.rs`): `BitSet<u32>` for `Live` (`insert_growing`
+grows the `Vec` to the marked word exactly as `resize(word + 1, 0)` did, so its words, `count`
+and `PartialEq` are the same; `Debug` prints members); `BitSlice<'static>` for the image's
+mapped live words (`contains` is `false` past them where the index panicked; every caller asks
+an index below `count`); `BitSet<usize>` for the words `write` emits, written as the same
+`u64`s. No layout, schema or byte of the image changes. intern depends on blaze-ids already.
+
+`crates/intern/src/table.rs`:
+
+1. Imports: after `use blaze_format::SchemaHash;` add
+   `use blaze_ids::bits::{BitSet, BitSlice};` (before `use blaze_image::...`).
+
+2. `Base`, before: `    live: &'static [u64],` after: `    live: BitSlice<'static>,`
+   (`#[derive(Default)]` still holds: an empty slice). `Base::is_live`, before / after:
+
+   ```rust
+           self.live[index / 64] >> (index % 64) & 1 == 1
+   ```
+
+   ```rust
+           self.live.contains(index)
+   ```
+
+3. In the restore (~line 419), before / after:
+
+   ```rust
+               live: image.slice::<u64>(section, root.live, count.div_ceil(64))?,
+   ```
+
+   ```rust
+               live: BitSlice::from_words(image.slice::<u64>(section, root.live, count.div_ceil(64))?),
+   ```
+
+4. In the check (~line 471), before / after:
+
+   ```rust
+           if count % 64 != 0 && base.live[count / 64] >> (count % 64) != 0 {
+   ```
+
+   ```rust
+           if base.live.first_in(count..base.live.capacity()).is_some() {
+   ```
+
+   (`count` is a `usize` there, as `count / 64` indexed with it.)
+
+5. `Live`, before:
+
+   ```rust
+   pub struct Live {
+       bits: Vec<u64>,
+   }
+
+   impl Live {
+       pub fn new() -> Live {
+           Live::default()
+       }
+
+       pub fn mark_id(&mut self, id: u32) {
+           let word = id as usize / 64;
+           if word >= self.bits.len() {
+               self.bits.resize(word + 1, 0);
+           }
+           self.bits[word] |= 1 << (id % 64);
+       }
+
+       pub fn contains(&self, id: u32) -> bool {
+           self.bits.get(id as usize / 64).is_some_and(|word| word >> (id % 64) & 1 == 1)
+       }
+
+       /// How many IDs are marked.
+       pub fn count(&self) -> usize {
+           self.bits.iter().map(|word| word.count_ones() as usize).sum()
+       }
+   }
+   ```
+
+   after:
+
+   ```rust
+   pub struct Live {
+       bits: BitSet<u32>,
+   }
+
+   impl Live {
+       pub fn new() -> Live {
+           Live::default()
+       }
+
+       pub fn mark_id(&mut self, id: u32) {
+           self.bits.insert_growing(id);
+       }
+
+       pub fn contains(&self, id: u32) -> bool {
+           self.bits.contains(id)
+       }
+
+       /// How many IDs are marked.
+       pub fn count(&self) -> usize {
+           self.bits.count()
+       }
+   }
+   ```
+
+6. `Table::write`, before / after:
+
+   ```rust
+           let mut live_bits = vec![0u64; count.div_ceil(64)];
+   ```
+
+   ```rust
+           let mut live_bits = BitSet::<usize>::new(count);
+   ```
+
+   ```rust
+                   live_bits[index / 64] |= 1 << (index % 64);
+   ```
+
+   ```rust
+                   live_bits.insert(index);
+   ```
+
+   ```rust
+               live: out.slice(&live_bits),
+   ```
+
+   ```rust
+               live: out.slice(live_bits.words()),
+   ```
+
+Status: open
+
+> forwarded to requests-ids (requests child holding `crates/intern/`) (from requests, pass 17; told by tmux).
+> applied by requests (child requests-ids): all six edits in `crates/intern/src/table.rs` as written (`Live` on `BitSet<u32>`, `Base.live` a `BitSlice<static>`, the past-the-end check via `first_in`, `write` emits `BitSet<usize>` words); no layout or schema change.
+
+## frontend-hooks: `BodySyntax::text` is a `syntax::Text` (lane format, `crates/hir-def/src/expr_store/body.rs`; 2026-10-29)
+
+From frontend-hooks, which applied db's side of frontend-text's "the parse tree's source is a
+`Text`; `FileText` and `BodySyntax` hold one" (`v2/requests/db.md`): `FileText::text` returns
+`&syntax::Text` now (`crates/base-db/src/lib.rs`). `BodySyntax` is format's, so its part is here:
+
+- `body.rs:352`, in `pub struct BodySyntax`: old `text: Arc<str>,` (triomphe's), new
+  `text: syntax::Text,`.
+- `body.rs:418`: old
+  `true => ast::SourceFile::parse_outline(std::sync::Arc::from(self.text()), self.edition),`
+  new `true => ast::SourceFile::parse_outline(self.text(), self.edition),` (`parse_outline` takes
+  `impl Into<syntax::Text>`, so `Arc::from` no longer infers; a `&str` is a copy into an `Arc`, as
+  before).
+- `body.rs:635-636`: the fill `text: db.file_text(file).text(db).clone(),` is unchanged; its
+  comment `// clone: an \`Arc<str>\` of the file's text (a refcount)` becomes
+  `// clone: a count of the file's text`.
+
+`&self.text[self.range]` (L411) compiles as is (`Text: Deref<Target = str>`). Why: frontend.md
+item 6, the file's text is the VFS's bytes from the VFS to the parse tree, with no copy; without
+the first line `body.rs` doesn't compile against base-db.

@@ -17,6 +17,8 @@
 //! `x20` points at the area's bottom, so its first `NEAR` bytes (most of a function's slots)
 //! are one `ldr`/`str` away.
 
+use std::alloc::Allocator;
+
 use cranelift_codegen::ir::{self, ArgumentPurpose, GlobalValueData, InstructionData, Opcode};
 
 use super::{
@@ -240,7 +242,7 @@ pub(super) fn enter_bound(frame: &Frame) -> u32 {
 /// Writes the frame record, the probe, the saves and the frame's allocation, with the rows
 /// Cranelift's `create_unwind_info_from_insts` makes of the same prologue: the CFA from `sp`
 /// once the record is pushed, from `x29` once the saves begin, and each saved register.
-pub(super) fn enter(buf: &mut Buf, frame: &Frame, rows: &mut Rows) {
+pub(super) fn enter(buf: &mut Buf<'_>, frame: &Frame, rows: &mut Rows) {
     buf.put4(inst::stp_pre(FP, LR, SP, -16));
     let at = buf.len();
     rows.push(at, Rule::CfaOffset(16));
@@ -270,7 +272,7 @@ pub(super) fn enter(buf: &mut Buf, frame: &Frame, rows: &mut Rows) {
     }
 }
 
-fn write_probe(buf: &mut Buf, probe: Probe) {
+fn write_probe(buf: &mut Buf<'_>, probe: Probe) {
     match probe {
         Probe::None => {}
         Probe::Unroll { count, guard } => {
@@ -296,7 +298,7 @@ pub(super) const EXIT_MAX: u32 = inst::ADD_ANY_MAX + 4 * (D_PAIRS.len() + X_PAIR
 
 /// Frees the frame, restores the saved registers and the frame record and returns, as
 /// `gen_epilogue` does. Like Cranelift's, it records no rows: the CFA stays said from `x29`.
-pub(super) fn exit(buf: &mut Buf, frame: &Frame) {
+pub(super) fn exit(buf: &mut Buf<'_>, frame: &Frame) {
     if frame.stack > 0 {
         inst::add_any(buf, SP, SP, u64::from(frame.stack), false, X16);
     }
@@ -315,7 +317,7 @@ pub(super) const BASE_MAX: u32 = inst::ADD_ANY_MAX + 4;
 
 /// Points `x20` at the area: `sp + base`, rounded up to the area's alignment when it asks for
 /// more than `sp`'s 16.
-pub(super) fn set_base(buf: &mut Buf, frame: &Frame) {
+pub(super) fn set_base(buf: &mut Buf<'_>, frame: &Frame) {
     if frame.align > 16 {
         let up = u64::from(frame.base) + u64::from(frame.align) - 1;
         inst::add_any(buf, inst::X20, SP, up, false, X16);
@@ -327,10 +329,10 @@ pub(super) fn set_base(buf: &mut Buf, frame: &Frame) {
 
 /// The Windows ARM64 unwind codes of the prologue [`enter`] writes, as Cranelift's
 /// `winarm64::create_unwind_info_from_insts` makes them and `UnwindInfo::emit` writes them:
-/// last code first, each big-endian, padded with zero bytes to whole words.
-pub(super) fn windows_codes(frame: &Frame) -> Vec<u8> {
-    // alloc: once per function, the unwind information it hands back.
-    let mut codes: Vec<u8> = Vec::with_capacity(32);
+/// last code first, each big-endian, padded with zero bytes to whole words, onto `codes`
+/// (empty).
+pub(super) fn windows_codes(frame: &Frame, codes: &mut Vec<u8, impl Allocator>) {
+    codes.reserve(32);
     if frame.stack > 0 {
         let units = frame.stack / 16;
         if frame.stack < 32 * 16 {
@@ -355,7 +357,6 @@ pub(super) fn windows_codes(frame: &Frame) -> Vec<u8> {
     codes.push(0b1000_0000 | (16 / 8 - 1));
     let words = codes.len().div_ceil(4);
     codes.resize(words * 4, 0);
-    codes
 }
 
 /// Whether the frame's slots are said from `x29` or, realigned, from `x20` itself.

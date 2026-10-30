@@ -39,12 +39,12 @@ use crate::{
 };
 
 /// What rustc says of the definitions of `cx.krate` that `hir` does not.
-pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let scopes = scopes(cx);
-    let mut found = conflicts::check(cx, &scopes);
-    found.extend(generics::check(cx, &scopes));
+/// `scopes` is [`scopes`], made once per check.
+pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
+    let mut found = conflicts::check(cx, scopes);
+    found.extend(generics::check(cx, scopes));
     found.extend(bindings::check(cx));
-    let adts = adts(cx, &scopes);
+    let adts = adts(cx, scopes);
     found.extend(fields::check(cx, &adts));
     let mut infinite = recursive::Cycles::default();
     for &adt in &adts {

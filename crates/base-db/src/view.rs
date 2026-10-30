@@ -39,8 +39,11 @@ use crate::{
 pub struct ViewFile<'a> {
     /// Relative to the view's root and `/`-separated, as blaze-vfs names it.
     pub path: &'a str,
-    /// Its blaze-vfs content ID and its bytes.
-    pub file: blaze_vfs::File<'a>,
+    /// Its blaze-vfs content ID.
+    pub id: ContentId,
+    /// Its bytes as blaze-vfs holds them (a heap file's allocation or a range of the mapped
+    /// image): a file with text keeps them as its text ([`blaze_vfs::text_of`]), with no copy.
+    pub bytes: &'a blaze_vfs::Bytes,
 }
 
 /// Every file of one view, and where the database's source roots put them.
@@ -280,7 +283,7 @@ impl Files {
             };
             let in_root = known.and_then(|id| writer.roots_of(id).first().copied());
             if let (Some(id), Some(_)) = (known, in_root)
-                && writer.view_ids.get(id) == Some(&file.file.id)
+                && writer.view_ids.get(id) == Some(&file.id)
             {
                 continue;
             }
@@ -311,15 +314,15 @@ impl Files {
         }
 
         // alloc: one list per call, of the changed files only (empty, no allocation, when none is).
-        let bytes: Vec<&[u8]> = plan.writes.iter().map(|it| view.files[it.at].file.bytes).collect();
+        let bytes: Vec<&[u8]> = plan.writes.iter().map(|it| &view.files[it.at].bytes[..]).collect();
         let ids = ContentId::of_many(blaze_vfs::FILE_DOMAIN, &bytes);
         for (write, &bytes) in plan.writes.iter().zip(&ids) {
             let file = &view.files[write.at];
-            if bytes != file.file.id {
+            if bytes != file.id {
                 return Err(ViewError::Mismatch {
                     // alloc: the refusal's message (an error path).
                     path: file.path.to_owned(),
-                    given: file.file.id,
+                    given: file.id,
                     bytes,
                 });
             }
@@ -351,10 +354,10 @@ impl Files {
         plan: Plan,
     ) -> ViewChange {
         let mut change = ViewChange::default();
-        let texts: Vec<Option<&str>> = plan
+        let texts: Vec<Option<syntax::Text>> = plan
             .writes
             .iter()
-            .map(|it| std::str::from_utf8(view.files[it.at].file.bytes).ok())
+            .map(|it| blaze_vfs::text_of(view.files[it.at].bytes.clone()).ok()) // clone: a count, the text holds the bytes
             .collect(); // alloc: per call, of the changed files only.
         // alloc: per call, of the changed files only.
         let mut bytes = Vec::new();
@@ -366,7 +369,7 @@ impl Files {
             }
             let appended = self.input_of(writer, write.id).and_then(|it| it.appended_root_module(&*db));
             let start = bytes.len();
-            FileText::content_bytes(&view.files[write.at].file.id, appended, &mut bytes);
+            FileText::content_bytes(&view.files[write.at].id, appended, &mut bytes);
             ranges.push(start..bytes.len());
         }
         let mut contents = content::hash_ranges(FileText::DOMAIN, &bytes, &ranges).into_iter();
@@ -383,7 +386,7 @@ impl Files {
             if write.added {
                 change.added.push(write.id);
             }
-            let unchanged = match (text, self.text_input(write.id)) {
+            let unchanged = match (&text, self.text_input(write.id)) {
                 (Some(_), Some(input)) => input.content(&*db) == content,
                 (None, None) => true,
                 (Some(_), None) | (None, Some(_)) => false,
@@ -397,7 +400,7 @@ impl Files {
                 .expect("a source root's content is kept from when it is set")
                 .is_library;
             let durability = if is_library { Durability::HIGH } else { Durability::LOW };
-            let file = view.files[write.at].file.id;
+            let file = view.files[write.at].id;
             let content = self.write_text(
                 writer,
                 db,
@@ -431,7 +434,7 @@ impl Files {
             change.removed.push(id);
         }
         for write in &plan.writes {
-            writer.view_ids.insert(write.id, view.files[write.at].file.id);
+            writer.view_ids.insert(write.id, view.files[write.at].id);
         }
         writer.next_file = plan.next_file;
         change.roots = roots;

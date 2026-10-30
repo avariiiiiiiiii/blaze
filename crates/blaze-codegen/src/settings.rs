@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Arch, Backend, Settings};
 
-pub const SETTINGS_DOMAIN: &str = "blaze v2 codegen settings 2";
+pub const SETTINGS_DOMAIN: &str = "blaze v2 codegen settings 3";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Panic {
@@ -203,7 +203,7 @@ impl Spec {
         };
         hasher.update(&[*frame_pointers as u8, *relocation as u8]);
         match backend {
-            Backend::Cranelift => hasher.update(&[0]),
+            Backend::Cranelift { speed } => hasher.update(&[0, u8::from(*speed)]),
             Backend::Llvm { opt } => hasher.update(&[1, *opt]),
         };
         hasher.update(&[
@@ -245,7 +245,7 @@ mod tests {
                 frame_pointers: false,
                 relocation: Relocation::Pic,
             },
-            backend: Backend::Cranelift,
+            backend: Backend::Cranelift { speed: false },
             overflow_checks: true,
             debug_assertions: true,
             panic: Panic::Unwind,
@@ -272,6 +272,7 @@ mod tests {
             |it| it.toolchain.frame_pointers = true,
             |it| it.toolchain.relocation = Relocation::Static,
             |it| it.backend = Backend::Llvm { opt: 3 },
+            |it| it.backend = Backend::Cranelift { speed: true },
             |it| it.overflow_checks = false,
             |it| it.debug_assertions = false,
             |it| it.panic = Panic::Abort,

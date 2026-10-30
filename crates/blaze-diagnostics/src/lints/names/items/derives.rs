@@ -19,9 +19,9 @@ use syntax::{
 
 use super::{
     Krate,
-    visibility::{Def, Effective},
     walk::{self, Item},
 };
+use crate::lints::names::effective::{Def, Effective};
 use crate::{
     cx::{Cx, item_range},
     lower::{Found, Phase},

@@ -24,7 +24,6 @@ mod archive;
 mod dylib;
 mod input;
 mod linkedit;
-mod sha256;
 mod sign;
 mod tbd;
 #[cfg(test)]
@@ -41,6 +40,7 @@ use std::sync::Mutex;
 
 use blaze_codegen::Arch;
 use blaze_ids::radix;
+use blaze_sha256 as sha256;
 use object::macho;
 use rayon::prelude::*;
 
@@ -976,26 +976,28 @@ impl MachO {
             .max()
             .unwrap_or(0);
 
-        // The debug info, in a segment no one runs.
-        let debug = || placed.debug.iter().filter(|it| !it.1.is_empty());
-        let mut dwarf = Vec::with_capacity(debug().map(|it| it.1.len()).sum());
+        // The debug info, in a segment no one runs: the core's sections where `File::debug`
+        // says, which the file lays out without a copy here.
+        let debug = || placed.debug.iter().enumerate().filter(|it| !it.1.1.is_empty());
+        let mut debug_at: Vec<(u64, usize)> = Vec::with_capacity(debug().count());
         if debug().next().is_some() {
             let (vmaddr, fileoff) = (vm_next, file_next);
             let mut sections = Vec::with_capacity(debug().count());
-            for (name, bytes) in debug() {
+            let mut filesize = 0u64;
+            for (nth, (name, bytes)) in debug() {
                 sections.push(SectionOut {
                     name: dwarf_name(name),
                     segment: "__DWARF",
-                    addr: vmaddr + dwarf.len() as u64,
+                    addr: vmaddr + filesize,
                     size: bytes.len() as u64,
-                    offset: u32_of(fileoff + dwarf.len() as u64, "a debug section's offset")?,
+                    offset: u32_of(fileoff + filesize, "a debug section's offset")?,
                     align: 0,
                     flags: macho::S_REGULAR | macho::S_ATTR_DEBUG,
                     indirect: 0,
                 });
-                dwarf.extend_from_slice(bytes);
+                debug_at.push((fileoff + filesize, nth));
+                filesize += bytes.len() as u64;
             }
-            let filesize = dwarf.len() as u64;
             segments.push(SegmentOut {
                 name: "__DWARF",
                 vmaddr,
@@ -1059,17 +1061,43 @@ impl MachO {
             end: it.vmaddr + it.vmsize,
             writable: it.prot & macho::VM_PROT_WRITE != 0,
         }));
-        let rebase = linkedit::rebases(placed.rebase, &spans).map_err(error)?;
+        let chained = chained::chained(&self.platform);
+        if !chained && !placed.encoded.is_empty() {
+            return Err(error("chained slots for an image fixed up by opcodes"));
+        }
+
+        // What an incremental image kept from its last link, and whether this link's changes
+        // are from it: the same regions, and the core's synthesis the kept tables are of.
+        let mut kept = self.cache.as_ref().map(lock);
+        let last = kept.as_deref().map_or(0, |it| it.synthesis);
+        if let Some(kept) = kept.as_deref_mut() {
+            kept.synthesis = 0;
+        }
+        let delta = placed.delta.filter(|it| last != 0 && it.from == last && it.same_regions);
 
         // The symbol table first: its strings are the names the binds and the trie use.
         let mut sections: Vec<&mut SectionOut> =
             Vec::with_capacity(segments.iter().map(|it| it.sections.len()).sum());
         sections.extend(segments.iter_mut().flat_map(|it| it.sections.iter_mut()));
-        let symbols = self.symbols(placed, &mut sections, &ordinals)?;
+        let ranges = section_ranges(&sections)?;
+        let symbols = match (kept.as_deref_mut().and_then(|it| it.symbols.take()), delta) {
+            (Some(mut symbols), Some(delta))
+                if delta.same_names
+                    && delta.patches(last, &[delta.functions])
+                    && patch_locals(&mut symbols, placed, delta, &ranges)? =>
+            {
+                symbols
+            }
+            _ => self.symbols(placed, &ranges, &ordinals, kept.is_some())?,
+        };
+        let (indirect, indirect_count) = indirect(placed, &mut sections, &symbols.index_of)?;
         let name_at = |(at, len): (u32, u32)| &symbols.strings[at as usize..(at + len) as usize];
+        // Each segment before `__LINKEDIT`, (start, size): the chained fixups' page starts.
+        let laid: SmallVec<[(u64, u64); 6]> = segments.iter().map(|it| (it.vmaddr, it.vmsize)).collect();
 
-        let mut binds = Vec::with_capacity(placed.binds.len() + placed.got.len());
-        for bind in placed.binds {
+        // alloc: none for a chained image, whose binds are its slots
+        let mut binds = Vec::with_capacity(if chained { 0 } else { placed.binds.len() + placed.got.len() });
+        for bind in placed.binds.iter().filter(|_| !chained) {
             let import = placed.imports.get(bind.import as usize);
             binds.push(linkedit::Bind {
                 addr: bind.addr,
@@ -1079,7 +1107,7 @@ impl MachO {
                 addend: bind.addend,
             });
         }
-        for cell in placed.got {
+        for cell in placed.got.iter().filter(|_| !chained) {
             match &cell.holds {
                 Holds::Local(_) => {}
                 &Holds::Import(import) => binds.push(linkedit::Bind {
@@ -1098,42 +1126,101 @@ impl MachO {
                 }
             }
         }
-        let bind = linkedit::binds(&mut binds, &spans).map_err(error)?;
-
         // What the image gives other images: what the symbol table defines, in its order.
         let mut exports: Vec<(&[u8], u64, u64)> = (symbols.exports.iter())
             .map(|&(name, flags, offset)| (name_at(name), flags, offset))
             // alloc: one buffer per link, of exactly the exports
             .collect();
-        let trie = linkedit::trie(&mut exports).map_err(error)?;
 
-        // alloc: one buffer per link, of exactly the functions
-        let starts: Vec<u64> = placed.functions.iter().map(|it| it.addr).collect();
-        let function_starts = linkedit::function_starts(base, &starts);
-
-        // `__LINKEDIT`, laid out as ld64 does: the signature last, at 16 bytes.
+        // `__LINKEDIT`, laid out as ld64 does: the signature last, at 16 bytes. A table whose
+        // inputs this link didn't change is the kept one's bytes.
         let linkedit_at = file_next;
-        let tables = [&rebase, &bind, &trie, &function_starts, &symbols.nlist, &symbols.indirect];
+        let fixups_len = match chained {
+            true => {
+                let pages = laid.iter().map(|it| it.1.div_ceil(chained::PAGE) as usize).sum::<usize>();
+                let names = placed.imports.iter().map(|it| it.name.len() + 2).sum::<usize>();
+                64 + 40 * laid.len() + 2 * pages + 8 * placed.imports.len() + names
+            }
+            false => 0,
+        };
+        let rebases = if chained { 0 } else { placed.rebase.len() };
         let mut linkedit = Out(Vec::with_capacity(
-            tables.iter().map(|it| it.len()).sum::<usize>() + symbols.strings.len() + 64,
+            linkedit::capacity(rebases, &binds, &exports, placed.functions.len())
+                + fixups_len
+                + symbols.nlist.len()
+                + indirect.len()
+                + symbols.strings.len()
+                + 64,
         ));
-        let table = |bytes: &[u8], linkedit: &mut Out| -> Result<(u32, u32), LinkError> {
-            if bytes.is_empty() {
+        let reuse = [
+            delta.is_some_and(|it| it.rebase.is_empty()),
+            delta.is_some_and(|it| it.same_names && it.binds.is_empty() && it.got.is_empty()),
+            delta.is_some_and(|it| it.same_names),
+            delta.is_some_and(|it| it.functions.is_empty()),
+        ];
+        let kept_table = |nth: usize| -> Option<&[u8]> {
+            let kept = kept.as_deref().filter(|_| reuse[nth])?;
+            let at: usize = kept.lengths[..nth].iter().sum();
+            Some(&kept.tables[at..at + kept.lengths[nth]])
+        };
+        let at_of = |start: usize, len: usize| -> Result<(u32, u32), LinkError> {
+            if len == 0 {
                 return Ok((0, 0));
             }
-            let at = u32_of(linkedit_at + linkedit.0.len() as u64, "`__LINKEDIT`'s offsets")?;
-            linkedit.0.extend_from_slice(bytes);
-            linkedit.align(8);
-            Ok((at, bytes.len() as u32))
+            Ok((u32_of(linkedit_at + start as u64, "`__LINKEDIT`'s offsets")?, len as u32))
         };
-        let rebase_at = table(&rebase, &mut linkedit)?;
-        let bind_at = table(&bind, &mut linkedit)?;
-        let trie_at = table(&trie, &mut linkedit)?;
-        let starts_at = table(&function_starts, &mut linkedit)?;
-        let in_code_at = (u32_of(linkedit_at + linkedit.0.len() as u64, "`__LINKEDIT`")?, 0);
-        let nlist_at = table(&symbols.nlist, &mut linkedit)?;
-        let indirect_at = table(&symbols.indirect, &mut linkedit)?;
-        let strings_at = table(&symbols.strings, &mut linkedit)?;
+        // Each kept table's (start, length) in `linkedit`: rebases, binds, trie, starts.
+        let mut tables = [(0usize, 0usize); 4];
+        let out = &mut linkedit.0;
+        let mut fixups_at = (0, 0);
+        if chained {
+            let start = out.len();
+            let name = |import: u32| name_at(symbols.import_names[import as usize]);
+            let len = chained::fixups(placed, placed.encoded, &laid, &ordinal, name, out)?;
+            fixups_at = at_of(start, len)?;
+        } else {
+            let start = out.len();
+            let len = match kept_table(0) {
+                Some(bytes) => copy_into(out, bytes),
+                None => linkedit::rebases(placed.rebase, &spans, out).map_err(error)?,
+            };
+            tables[0] = (start, len);
+            let start = out.len();
+            let len = match kept_table(1) {
+                Some(bytes) => copy_into(out, bytes),
+                None => linkedit::binds(&mut binds, &spans, out).map_err(error)?,
+            };
+            tables[1] = (start, len);
+        }
+        let start = out.len();
+        let len = match kept_table(2) {
+            Some(bytes) => copy_into(out, bytes),
+            None => linkedit::trie(&mut exports, out).map_err(error)?,
+        };
+        tables[2] = (start, len);
+        let start = out.len();
+        let len = match kept_table(3) {
+            Some(bytes) => copy_into(out, bytes),
+            None => {
+                // alloc: one buffer per link, of exactly the functions
+                let starts: Vec<u64> = placed.functions.iter().map(|it| it.addr).collect();
+                linkedit::function_starts(base, &starts, out)
+            }
+        };
+        tables[3] = (start, len);
+        let [rebase_at, bind_at, trie_at, starts_at] =
+            [tables[0], tables[1], tables[2], tables[3]].map(|(start, len)| at_of(start, len));
+        let (rebase_at, bind_at, trie_at, starts_at) = (rebase_at?, bind_at?, trie_at?, starts_at?);
+        let in_code_at = (u32_of(linkedit_at + out.len() as u64, "`__LINKEDIT`")?, 0);
+        let mut append = |bytes: &[u8]| -> Result<(u32, u32), LinkError> {
+            let at = at_of(out.len(), bytes.len())?;
+            out.extend_from_slice(bytes);
+            out.resize(out.len().next_multiple_of(8), 0);
+            Ok(at)
+        };
+        let nlist_at = append(&symbols.nlist)?;
+        let indirect_at = append(&indirect)?;
+        let strings_at = append(&symbols.strings)?;
         linkedit.align(16);
         let code_limit = linkedit_at + linkedit.0.len() as u64;
         let identifier = placed.name;
@@ -1187,12 +1274,24 @@ impl MachO {
                 commands.u32(0);
             }
         }
-        count += 1;
-        commands.u32(macho::LC_DYLD_INFO_ONLY);
-        commands.u32(48);
-        for (at, len) in [rebase_at, bind_at, (0, 0), (0, 0), trie_at] {
-            commands.u32(at);
-            commands.u32(len);
+        if chained {
+            for (command, (at, len)) in
+                [(macho::LC_DYLD_CHAINED_FIXUPS, fixups_at), (macho::LC_DYLD_EXPORTS_TRIE, trie_at)]
+            {
+                count += 1;
+                commands.u32(command);
+                commands.u32(16);
+                commands.u32(at);
+                commands.u32(len);
+            }
+        } else {
+            count += 1;
+            commands.u32(macho::LC_DYLD_INFO_ONLY);
+            commands.u32(48);
+            for (at, len) in [rebase_at, bind_at, (0, 0), (0, 0), trie_at] {
+                commands.u32(at);
+                commands.u32(len);
+            }
         }
         count += 1;
         commands.u32(macho::LC_SYMTAB);
@@ -1218,7 +1317,7 @@ impl MachO {
             0,
             0,
             indirect_at.0,
-            symbols.indirect_count,
+            indirect_count,
             0,
             0,
             0,
@@ -1312,34 +1411,34 @@ impl MachO {
         headers.u32(0);
         headers.0.extend_from_slice(&commands.0);
 
-        // The file as the loader reads it, hashed where its bytes are.
-        let dwarf_at = segments.iter().find(|it| it.name == "__DWARF").map(|it| it.fileoff);
-        let mut pieces: Vec<(u64, &[u8])> = Vec::with_capacity(placed.regions.len() + 3);
+        // The file as the loader reads it, hashed where its bytes are: the chained slots
+        // over the regions.
+        let mut pieces: Vec<(u64, &[u8])> = Vec::with_capacity(placed.regions.len() + debug_at.len() + 2);
         pieces.push((0, &headers.0[..]));
         for (index, region) in placed.regions.iter().enumerate() {
             if let Some(at) = self.offset(placed, region) {
                 pieces.push((at, placed.bytes(index)));
             }
         }
-        if let Some(at) = dwarf_at {
-            pieces.push((at, &dwarf[..]));
-        }
+        pieces.extend(debug_at.iter().map(|&(at, nth)| (at, &placed.debug[nth].1[..])));
         pieces.push((linkedit_at, &linkedit.0[..]));
-        let file = sign::View::new(code_limit, pieces).map_err(error)?;
+        let file = sign::View::new(code_limit, pieces)
+            .and_then(|it| it.with_slots(placed.encoded, base))
+            .map_err(error)?;
         let text = &segments[usize::from(!shared)];
+        let (text_at, text_len) = (text.fileoff, text.filesize);
         let mut signature = Vec::with_capacity(signature_len as usize);
-        {
-            let mut cache = self.cache.as_ref().map(|it| match it.lock() {
-                Ok(cache) => cache,
-                // A panic while signing may have left a page without its hash: start over.
-                Err(poisoned) => {
-                    let mut cache = poisoned.into_inner();
-                    *cache = sign::Cache::default();
-                    cache
-                }
-            });
-            let (at, len) = (text.fileoff, text.filesize);
-            sign::signature(&file, identifier, at, len, !shared, cache.as_deref_mut(), &mut signature);
+        match kept.as_deref_mut() {
+            None => sign::signature(&file, identifier, text_at, text_len, !shared, None, &mut signature),
+            Some(kept) => {
+                let written = written_since(placed, kept, &debug_at);
+                let since = (written.as_deref())
+                    .zip(placed.delta)
+                    .map(|(written, delta)| sign::Since { from: delta.from, written });
+                let compared = [(0, placed.plan.headers), (linkedit_at, code_limit - linkedit_at)];
+                let cached = sign::Cached { cache: &mut kept.sign, synthesis: placed.synthesis, since, kept: &compared };
+                sign::signature(&file, identifier, text_at, text_len, !shared, Some(cached), &mut signature);
+            }
         }
         if signature.len() as u64 != signature_len {
             // alloc: error path
@@ -1348,57 +1447,51 @@ impl MachO {
                 signature.len()
             )));
         }
+        if let Some(kept) = kept.as_deref_mut() {
+            kept.keep(placed, &linkedit.0, tables, symbols, &debug_at);
+        }
 
         // The signature is one part: an incremental link, which changes few of its hashes,
         // writes only the blocks of it that changed.
-        let mut parts = Vec::with_capacity(4);
+        let mut parts = Vec::with_capacity(3);
         parts.push((0, headers.0));
-        if let Some(at) = dwarf_at {
-            parts.push((at, dwarf));
-        }
         parts.push((linkedit_at, linkedit.0));
         parts.push((code_limit, signature));
-        Ok(File { len: linkedit_at + linkedit_size, parts })
+        Ok(File { len: linkedit_at + linkedit_size, parts, debug: debug_at })
     }
 
     /// The symbol table: the functions' names, then what the image exports, then what it
-    /// imports, each with its library's ordinal; and the indirect symbols of the `__got`s.
+    /// imports, each with its library's ordinal. `keep` for an image linked again in place,
+    /// whose next link may patch the locals ([`Symbols::locals_of`]).
     fn symbols(
         &self,
         placed: &Placed<'_>,
-        sections: &mut [&mut SectionOut],
+        ranges: &[(u64, u64, u8)],
         ordinals: &[u32],
+        keep: bool,
     ) -> Result<Symbols, LinkError> {
         let base = placed.plan.base;
-        let mut ranges: Vec<(u64, u64, u8)> = Vec::with_capacity(sections.len());
-        for (nth, section) in sections.iter().enumerate() {
-            if section.segment != "__DWARF" {
-                let ordinal = u8::try_from(nth + 1)
-                    .map_err(|_| error("more than 255 sections: symbols can't name them"))?;
-                ranges.push((section.addr, section.addr + section.size, ordinal));
-            }
-        }
-        radix::sort_copy_by_key(&mut ranges, |&(start, end, _)| radix::pack_64(start, end));
-        let section_at = |addr: u64, what: &str| -> Result<u8, LinkError> {
-            let at = ranges.partition_point(|it| it.0 <= addr);
-            (ranges[..at].iter().rev())
-                .find(|it| addr <= it.1)
-                .map(|it| it.2)
-                // alloc: error path
-                .ok_or_else(|| error(format!("the symbol {what} at {addr:#x} is in no section")))
-        };
+        let section_at = |addr: u64, what: &str| section_in(ranges, addr, what);
 
         let exported: rustc_hash::FxHashSet<&str> =
             // alloc: one set per link, sized once by the exports
             placed.exports.iter().map(|it| it.name.as_str()).collect();
         let mut locals: Vec<(u64, &str)> = Vec::with_capacity(placed.functions.len());
-        locals.extend(
-            (placed.functions.iter())
-                .filter_map(|it| Some((it.addr, it.name.as_deref()?)))
-                .filter(|it| !exported.contains(it.1)),
-        );
+        // alloc: none unless kept, one index per function
+        let mut locals_of = Vec::with_capacity(if keep { placed.functions.len() } else { 0 });
+        for function in placed.functions {
+            let local = function.name.as_deref().filter(|it| !exported.contains(it));
+            if keep {
+                locals_of.push(if local.is_some() { locals.len() as u32 } else { u32::MAX });
+            }
+            if let Some(name) = local {
+                locals.push((function.addr, name));
+            }
+        }
         if !locals.is_sorted() {
             locals.sort_unstable();
+            // The locals aren't in the functions' order: a patch can't find them by it.
+            locals_of = Vec::new();
         }
 
         // The defined: what the image exports and, in an executable, its header.

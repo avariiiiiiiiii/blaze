@@ -22,11 +22,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::{HashMap, HashSet},
-    ops::Range,
-    time::Duration,
-};
+use std::{collections::HashMap, ops::Range, time::Duration};
 
 use crate::format::{Code, Process, Write};
 
@@ -60,6 +56,7 @@ impl From<String> for Failed {
 
 impl From<&str> for Failed {
     fn from(why: &str) -> Failed {
+        // alloc: error path
         Failed::Declined(why.to_owned())
     }
 }
@@ -75,9 +72,11 @@ pub(crate) fn claim(process: &mut Process, code: &Code, page: u64) -> Result<u64
         .and_then(|it| it.checked_next_multiple_of(page))
         .ok_or("a patch larger than memory")?;
     let end = code.base.checked_add(len).ok_or_else(|| {
+        // alloc: error path
         format!("a patch at {:#x} of {len:#x} bytes, past the end of memory", code.base)
     })?;
     if code.base < process.next || end > process.end {
+        // alloc: error path
         return Err(format!(
             "laid out at {:#x}..{end:#x}, where this program has no room ({:#x}..{:#x}): build \
              again",
@@ -85,6 +84,7 @@ pub(crate) fn claim(process: &mut Process, code: &Code, page: u64) -> Result<u64
         ));
     }
     if !(code.base.is_multiple_of(page) && text.is_multiple_of(page)) {
+        // alloc: error path
         return Err(format!("a patch at {:#x} whose code is not whole pages", code.base));
     }
     process.next = end;
@@ -99,6 +99,7 @@ pub(crate) fn in_image(writes: &[Write], slide: u64, image: &Range<u64>) -> Resu
         match (start, end) {
             (Some(start), Some(end)) if start >= image.start && end <= image.end => {}
             _ => {
+                // alloc: error path
                 return Err(format!(
                     "a write at {:#x} of {} bytes, outside the executable at {:#x}..{:#x}",
                     write.address.wrapping_add(slide),
@@ -117,6 +118,7 @@ pub(crate) fn slide_at(bytes: &mut [u8], at: u64, slide: u64) -> Result<(), Stri
     let field = usize::try_from(at)
         .ok()
         .and_then(|at| bytes.get_mut(at..at.checked_add(8)?))
+        // alloc: error path
         .ok_or_else(|| format!("an address at {at:#x}, past the end of the patch"))?;
     let value =
         u64::from_le_bytes(field.try_into().map_err(|_| "an address shorter than 8 bytes")?);
@@ -132,6 +134,7 @@ fn section(text: &[u8], (start, len): (u64, u64)) -> Result<(usize, usize), Stri
         .and_then(|(start, len)| Some((start, start.checked_add(len)?)))
         .filter(|&(_, end)| end <= text.len())
         .ok_or_else(|| {
+            // alloc: error path
             format!("unwind tables at {start:#x} of {len:#x} bytes, past the end of the patch")
         })
 }
@@ -141,17 +144,20 @@ fn section(text: &[u8], (start, len): (u64, u64)) -> Result<(usize, usize), Stri
 fn entry(text: &[u8], at: usize, end: usize) -> Result<(u32, usize), String> {
     let length = text
         .get(at..at.checked_add(4).ok_or("an unwind entry past the end of memory")?)
+        // alloc: error path
         .ok_or_else(|| format!("an unwind entry at {at:#x}, past the end of the patch"))?;
     let length = u32::from_le_bytes(length.try_into().map_err(|_| "a short unwind length")?);
     if length == 0 {
         return Ok((0, at + 4));
     }
     if length == u32::MAX {
+        // alloc: error path
         return Err("64-bit unwind entries, which the patch format has none of".to_owned());
     }
     let after = (at + 4)
         .checked_add(length as usize)
         .filter(|&after| after <= end)
+        // alloc: error path
         .ok_or_else(|| format!("the unwind entry at {at:#x} ends past its section"))?;
     Ok((length, after))
 }
@@ -168,6 +174,7 @@ pub(crate) fn frame_run(text: &[u8], frames: (u64, u64)) -> Result<Option<usize>
     let mut at = start;
     loop {
         if at > end {
+            // alloc: error path
             return Err("unwind entries with no zero length ending them in the patch".to_owned());
         }
         let (length, after) = entry(text, at, end)?;
@@ -178,12 +185,19 @@ pub(crate) fn frame_run(text: &[u8], frames: (u64, u64)) -> Result<Option<usize>
     }
 }
 
-/// Where each FDE at `frames` starts in `text`, for Apple's unwinder, which takes one FDE at
-/// a time and reads its CIE through the FDE's pointer: each checked to end inside the
-/// section, and its CIE pointer to name a CIE of the section before it.
-pub(crate) fn fdes(text: &[u8], frames: (u64, u64)) -> Result<Vec<usize>, String> {
+/// Puts in `fdes` where each FDE at `frames` starts in `text`, for Apple's unwinder, which
+/// takes one FDE at a time and reads its CIE through the FDE's pointer: each checked to end
+/// inside the section, and its CIE pointer to name a CIE of the section before it. `cies` is
+/// the caller's buffer for the CIEs, like `fdes` kept from one patch to the next.
+pub(crate) fn fdes(
+    text: &[u8],
+    frames: (u64, u64),
+    cies: &mut Vec<usize>,
+    fdes: &mut Vec<usize>,
+) -> Result<(), String> {
+    cies.clear();
+    fdes.clear();
     let (start, end) = section(text, frames)?;
-    let (mut cies, mut fdes) = (Vec::new(), Vec::new());
     let mut at = start;
     while at + 8 <= end {
         let (length, after) = entry(text, at, end)?;
@@ -191,6 +205,7 @@ pub(crate) fn fdes(text: &[u8], frames: (u64, u64)) -> Result<Vec<usize>, String
             break;
         }
         if length < 4 {
+            // alloc: error path
             return Err(format!("the unwind entry at {at:#x} is {length} bytes"));
         }
         let pointer = u32::from_le_bytes(text[at + 4..at + 8].try_into().expect("4 bytes"));
@@ -199,13 +214,14 @@ pub(crate) fn fdes(text: &[u8], frames: (u64, u64)) -> Result<Vec<usize>, String
         } else {
             let cie = (at + 4).checked_sub(pointer as usize);
             if !cie.is_some_and(|cie| cie >= start && cies.contains(&cie)) {
+                // alloc: error path
                 return Err(format!("the FDE at {at:#x} names no CIE of the patch"));
             }
             fdes.push(at);
         }
         at = after;
     }
-    Ok(fdes)
+    Ok(())
 }
 
 /// How many `RUNTIME_FUNCTION`s the table at `functions` (offset and length in `memory`, the
@@ -218,6 +234,7 @@ pub(crate) fn functions(memory: &[u8], functions: (u64, u64), patch: u64) -> Res
     }
     let (start, end) = section(memory, functions)?;
     if !(end - start).is_multiple_of(FUNCTION) || !start.is_multiple_of(4) {
+        // alloc: error path
         return Err(format!("a table of functions at {start:#x} that is not whole entries"));
     }
     let inside =
@@ -232,6 +249,7 @@ pub(crate) fn functions(memory: &[u8], functions: (u64, u64), patch: u64) -> Res
             && inside.contains(&unwind)
             && unwind + 4 <= inside.end;
         if !named {
+            // alloc: error path
             return Err(format!(
                 "the RUNTIME_FUNCTION at {at:#x} names {begin:#x}..{until:#x} and {unwind:#x}, \
                  outside the patch at {:#x}..{:#x}",
@@ -239,13 +257,15 @@ pub(crate) fn functions(memory: &[u8], functions: (u64, u64), patch: u64) -> Res
             ));
         }
     }
+    // alloc: error path
     u32::try_from((end - start) / FUNCTION).map_err(|_| "too many RUNTIME_FUNCTIONs".to_owned())
 }
 
 /// One write over the image, in memory.
 pub(crate) struct Step {
     pub(crate) address: u64,
-    pub(crate) bytes: Vec<u8>,
+    /// Where its bytes are in the plan's buffer ([`Plan::bytes`]).
+    bytes: Range<usize>,
     /// A jump over a function's entry, rather than a static or something put back.
     pub(crate) jump: bool,
     /// How much of what was there first is known once this is read: what the original lacks
@@ -256,27 +276,49 @@ pub(crate) struct Step {
     keeps: Option<usize>,
 }
 
-/// The writes a patch makes over the image, each in it ([`in_image`]), and their ranges by
-/// where they start with the furthest end of any up to each, to find a pc inside one.
+impl Step {
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.end - self.bytes.start
+    }
+}
+
+/// The writes a patch makes over the image, each in it ([`in_image`]), their bytes one after
+/// another, and their ranges by where they start with the furthest end of any up to each, to
+/// find a pc inside one. Kept from one patch to the next: once its buffers have grown,
+/// planning allocates nothing.
+#[derive(Default)]
 pub(crate) struct Plan {
     pub(crate) steps: Vec<Step>,
+    bytes: Vec<u8>,
     reach: Vec<(u64, u64, u64)>,
 }
 
 impl Plan {
-    fn new(steps: Vec<Step>) -> Plan {
-        let mut ranges: Vec<(u64, u64)> =
-            steps.iter().map(|it| (it.address, it.address + it.bytes.len() as u64)).collect();
-        ranges.sort_unstable();
-        let mut reach = Vec::with_capacity(ranges.len());
+    pub(crate) fn bytes(&self, step: &Step) -> &[u8] {
+        &self.bytes[step.bytes.start..step.bytes.end]
+    }
+
+    fn clear(&mut self) {
+        self.steps.clear();
+        self.bytes.clear();
+        self.reach.clear();
+    }
+
+    /// Ends a plan whose steps were pushed: their ranges sorted, with the furthest end up to
+    /// each.
+    fn index(&mut self) {
+        self.reach.clear();
+        let ranges = self.steps.iter().map(|it| (it.address, it.address + it.len() as u64, 0));
+        self.reach.extend(ranges);
+        self.reach.sort_unstable();
         let (mut furthest, mut of) = (0, 0);
-        for (start, end) in ranges {
+        for entry in &mut self.reach {
+            let (start, end, _) = *entry;
             if end > furthest {
                 (furthest, of) = (end, start);
             }
-            reach.push((start, furthest, of));
+            *entry = (start, furthest, of);
         }
-        Plan { steps, reach }
     }
 
     /// The first of `pcs` strictly inside a write, with where that write starts: a thread
@@ -294,44 +336,55 @@ impl Plan {
 /// at each address, and how long the last patch's write there was.
 #[derive(Default)]
 pub(crate) struct Overwrites {
+    /// One per address a patch ever wrote: grown when a write there is longer than any before.
     originals: HashMap<u64, Vec<u8>>,
     written: HashMap<u64, usize>,
+    /// The addresses the patch being planned writes, sorted; kept from one plan to the next.
+    kept: Vec<u64>,
 }
 
 impl Overwrites {
-    /// The writes `code` makes, `slide` from where it says (checked in the image by
-    /// [`in_image`]): first what the last patch wrote and this one does not, put back as it
-    /// first was, then the patch's own, each with what a longer write there before left
-    /// behind put back after it. Reserves the room what is read of the originals takes.
-    pub(crate) fn plan(&mut self, code: &Code, slide: u64) -> Result<Plan, String> {
-        let kept: HashSet<u64> =
-            code.writes.iter().map(|it| it.address.wrapping_add(slide)).collect();
-        let mut undone: Vec<u64> =
-            self.written.keys().copied().filter(|it| !kept.contains(it)).collect();
-        undone.sort_unstable();
-        let mut steps = Vec::with_capacity(undone.len() + code.writes.len());
-        for address in undone {
+    /// Puts in `plan` the writes `code` makes, `slide` from where it says (checked in the
+    /// image by [`in_image`]): first what the last patch wrote and this one does not, put
+    /// back as it first was, then the patch's own, each with what a longer write there before
+    /// left behind put back after it. Reserves the room what is read of the originals takes.
+    pub(crate) fn plan(&mut self, code: &Code, slide: u64, plan: &mut Plan) -> Result<(), String> {
+        plan.clear();
+        self.kept.clear();
+        self.kept.extend(code.writes.iter().map(|it| it.address.wrapping_add(slide)));
+        self.kept.sort_unstable();
+        for &address in self.written.keys() {
+            if self.kept.binary_search(&address).is_ok() {
+                continue;
+            }
             let original = &self.originals[&address];
-            let (bytes, read_to) = (original.clone(), original.len());
-            steps.push(Step { address, bytes, jump: false, read_to, keeps: None });
+            let from = plan.bytes.len();
+            plan.bytes.extend_from_slice(original);
+            let (bytes, read_to) = (from..plan.bytes.len(), original.len());
+            plan.steps.push(Step { address, bytes, jump: false, read_to, keeps: None });
         }
+        plan.steps.sort_unstable_by_key(|it| it.address);
         for (nth, write) in code.writes.iter().enumerate() {
-            let mut bytes = write.bytes.clone();
+            let (from, len) = (plan.bytes.len(), write.bytes.len());
+            plan.bytes.extend_from_slice(&write.bytes);
             for &pointer in &write.pointers {
-                slide_at(&mut bytes, pointer, slide)?;
+                slide_at(&mut plan.bytes[from..], pointer, slide)?;
             }
             let address = write.address.wrapping_add(slide);
+            // alloc: the first write at an address only: its original is kept for good
             let original = self.originals.entry(address).or_default();
-            let read_to = original.len().max(bytes.len());
+            let read_to = original.len().max(len);
             original.reserve(read_to - original.len());
             let last = self.written.get(&address).copied().unwrap_or(0);
-            if last > bytes.len() {
-                bytes.extend_from_slice(&original[bytes.len()..last]);
+            if last > len {
+                plan.bytes.extend_from_slice(&original[len..last]);
             }
             let jump = (nth as u64) < code.redirected;
-            steps.push(Step { address, bytes, jump, read_to, keeps: Some(write.bytes.len()) });
+            let bytes = from..plan.bytes.len();
+            plan.steps.push(Step { address, bytes, jump, read_to, keeps: Some(len) });
         }
-        Ok(Plan::new(steps))
+        plan.index();
+        Ok(())
     }
 
     /// Reads what the originals lack for `plan` by `read(address, into)`, called only with
@@ -360,8 +413,8 @@ impl Overwrites {
         };
         plan.steps.iter().filter(|it| it.jump).find_map(|step| {
             let original = self.originals.get(&step.address)?;
-            let words = original.get(..step.bytes.len())?.chunks_exact(4);
-            let before_last = (step.bytes.len() / 4).saturating_sub(1);
+            let words = original.get(..step.len())?.chunks_exact(4);
+            let before_last = (step.len() / 4).saturating_sub(1);
             words
                 .take(before_last)
                 .any(|it| call(u32::from_le_bytes(it.try_into().expect("4 bytes"))))
@@ -406,8 +459,8 @@ enum Round {
 }
 
 /// Makes `plan`'s writes with every other thread stopped and none inside them, reading the
-/// originals first. `read` reads the image at the bytes of a step and `write(n, step)` makes
-/// step `n`; both are called only with the threads stopped, and must not allocate. `calls`
+/// originals first. `read` reads the image at the bytes of a step and `write(n, step, bytes)`
+/// makes step `n`; both are called only with the threads stopped, and must not allocate. `calls`
 /// refuses a jump over a function whose first words call ([`Overwrites::calls`]).
 pub(crate) fn write_stopped(
     world: &mut impl World,
@@ -415,7 +468,7 @@ pub(crate) fn write_stopped(
     plan: &Plan,
     calls: bool,
     mut read: impl FnMut(u64, &mut [u8]),
-    mut write: impl FnMut(usize, &Step) -> Result<(), Broke>,
+    mut write: impl FnMut(usize, &Step, &[u8]) -> Result<(), Broke>,
 ) -> Result<(), Failed> {
     if plan.steps.is_empty() {
         return Ok(());
@@ -434,7 +487,7 @@ pub(crate) fn write_stopped(
                 return Round::Calls(at);
             }
             for (n, step) in plan.steps.iter().enumerate() {
-                if let Err(broke) = write(n, step) {
+                if let Err(broke) = write(n, step, plan.bytes(step)) {
                     return Round::Broke(n, broke);
                 }
             }
@@ -447,6 +500,7 @@ pub(crate) fn write_stopped(
             }
             Round::Inside(pc, at) => inside = (pc, at),
             Round::Calls(at) => {
+                // alloc: error path
                 return Err(Failed::Declined(format!(
                     "the function at {at:#x} calls within the bytes its jump covers: a thread in \
                      what it calls would return into the middle of the jump"
@@ -455,6 +509,7 @@ pub(crate) fn write_stopped(
             Round::Broke(n, broke) => {
                 let done = n + usize::from(broke.written);
                 overwrites.record(plan, done);
+                // alloc: error path
                 let why = format!(
                     "{} at {:#x}: error {}, after {done} of {} writes",
                     broke.what,
@@ -467,6 +522,7 @@ pub(crate) fn write_stopped(
         }
     }
     let (pc, at) = inside;
+    // alloc: error path
     Err(Failed::Declined(format!(
         "a thread was at {pc:#x}, inside the bytes written over the function at {at:#x}, each of \
          {TRIES} times the threads were stopped: apply the patch again"

@@ -4,7 +4,9 @@
 
 use blaze_alloc_count::measure;
 
-use super::{SplitMix, add, built, close, config, done, keyed, open, runs, work};
+use blaze_ids::rng::SplitMix64;
+
+use super::{add, built, close, config, done, keyed, open, runs, work};
 use crate::{
     machine::{Error, NodeId, Outcome, Spec},
     plane::{Plane, PlaneInput, PlaneOutput, RequestId, Slots, TaskHandle, TaskSlot},
@@ -48,7 +50,7 @@ fn parts(handle: TaskHandle) -> (u32, u32) {
 #[test]
 fn the_slots_take_what_the_free_lists_took() {
     for seed in 0..200 {
-        let mut rng = SplitMix(seed);
+        let mut rng = SplitMix64::new(seed);
         let mut slots = Slots::<TaskSlot>::new(1 << 10);
         let mut model = Model::default();
         let mut live: Vec<TaskHandle> = Vec::new();

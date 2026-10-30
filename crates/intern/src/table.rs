@@ -28,12 +28,14 @@
 use std::{alloc::Layout, fmt, ptr::NonNull};
 
 use blaze_format::SchemaHash;
+use blaze_ids::bits::{BitSet, BitSlice};
 use blaze_image::{Corrupt, Image, Refused, Section, SectionId, SectionWriter, Stable};
+use blaze_mem::{Region, Tag};
 
 use crate::{
     arena::{Entry, Store},
     swiss::{self, Ctrl},
-    sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 /// What every table of one kind shares.
@@ -126,7 +128,7 @@ struct Base {
     end: u32,
     starts: &'static [u32],
     keys: &'static [u64],
-    live: &'static [u64],
+    live: BitSlice<'static>,
     ctrl: &'static [u64],
     ids: &'static [u32],
     free: &'static [u32],
@@ -135,7 +137,7 @@ struct Base {
 
 impl Base {
     fn is_live(&self, index: usize) -> bool {
-        self.live[index / 64] >> (index % 64) & 1 == 1
+        self.live.contains(index)
     }
 }
 
@@ -169,80 +171,47 @@ fn record_layout(len: usize) -> Layout {
     Layout::from_size_align(size_of::<Head>() + len, MAX_ALIGN).expect("an interned value's layout")
 }
 
-/// ID to header for the values this process made, in buckets that double: bucket `b` holds
-/// `FIRST_BUCKET << b` slots, allocated the first time an ID in it is made.
+/// ID to header for the values this process made: slot `id - first` over a region reserved
+/// for every `u32` (32 GiB of address space, committed as IDs are made, counted under
+/// [`Tag::Intern`]). A slot is set once, before the index publishes its value.
+///
+/// Region memory is plain words, so a slot is std's atomic in a model build too.
 struct Column {
-    buckets: [AtomicPtr<AtomicPtr<Head>>; BUCKETS],
+    slots: Region,
 }
 
-const FIRST_BUCKET: usize = 1024;
-/// Enough for every `u32`.
-const BUCKETS: usize = 23;
-
-/// The bucket and slot of index `index`.
-fn locate(index: usize) -> (usize, usize) {
-    let k = index / FIRST_BUCKET + 1;
-    let bucket = (usize::BITS - 1 - k.leading_zeros()) as usize;
-    (bucket, index - FIRST_BUCKET * ((1 << bucket) - 1))
-}
-
-#[cfg(not(blaze_check))]
-fn slots(len: usize) -> Box<[AtomicPtr<Head>]> {
-    // SAFETY: all-zero bytes are a null `AtomicPtr`.
-    unsafe { Box::<[AtomicPtr<Head>]>::new_zeroed_slice(len).assume_init() }
-}
-
-/// The checker's atomics are not plain words, so a model build makes each one.
-#[cfg(blaze_check)]
-fn slots(len: usize) -> Box<[AtomicPtr<Head>]> {
-    // alloc: the model checker's build only, once a table
-    (0..len).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect()
-}
+const SLOT: usize = size_of::<std::sync::atomic::AtomicPtr<Head>>();
 
 impl Column {
     fn new() -> Column {
-        Column { buckets: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())) }
+        Column {
+            slots: Region::reserve(u32::MAX as usize * SLOT, Tag::Intern)
+                .unwrap_or_else(|error| panic!("intern: {error}")),
+        }
+    }
+
+    fn slot(&self, index: usize) -> Option<&std::sync::atomic::AtomicPtr<Head>> {
+        if (index + 1) * SLOT > self.slots.committed() {
+            return None;
+        }
+        // SAFETY: the slot is committed (checked just now) and aligned (a page-aligned base plus
+        // a multiple of 8); committed pages are zeroed by the kernel and never decommitted, and
+        // zero bytes are a null `AtomicPtr`; it lives as long as `self`.
+        Some(unsafe { self.slots.at(index * SLOT).cast::<std::sync::atomic::AtomicPtr<Head>>().as_ref() })
     }
 
     fn get(&self, index: usize) -> Option<&'static Head> {
-        let (bucket, slot) = locate(index);
-        let bucket = self.buckets.get(bucket)?.load(Ordering::Acquire);
-        if bucket.is_null() {
-            return None;
-        }
-        // SAFETY: a published bucket is leaked, `FIRST_BUCKET << b` slots long, and `slot` is
-        // below that (`locate`).
-        let slot = unsafe { &*bucket.add(slot) };
-        let at = NonNull::new(slot.load(Ordering::Acquire))?;
+        let at = NonNull::new(self.slot(index)?.load(std::sync::atomic::Ordering::Acquire))?;
         Some(Head::at(at.cast()))
     }
 
     fn set(&self, index: usize, head: NonNull<Head>) {
-        let (bucket, slot) = locate(index);
-        let bucket = self.bucket(bucket);
-        // SAFETY: as in `get`: `bucket` is a published bucket and `slot` is in it.
-        let slot = unsafe { &*bucket.add(slot) };
+        if let Err(error) = self.slots.ensure((index + 1) * SLOT) {
+            panic!("intern: {error}");
+        }
+        let slot = self.slot(index).expect("a slot committed just now");
         // Release: a reader that loads the header sees it written.
-        slot.store(head.as_ptr(), Ordering::Release);
-    }
-
-    fn bucket(&self, bucket: usize) -> *mut AtomicPtr<Head> {
-        let cell = &self.buckets[bucket];
-        let found = cell.load(Ordering::Acquire);
-        if !found.is_null() {
-            return found;
-        }
-        let len = FIRST_BUCKET << bucket;
-        let made = Box::into_raw(slots(len)).cast::<AtomicPtr<Head>>();
-        match cell.compare_exchange(std::ptr::null_mut(), made, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => made,
-            Err(other) => {
-                let made = std::ptr::slice_from_raw_parts_mut(made, len);
-                // SAFETY: `made` is the `Box` of `len` slots made just above, never published.
-                drop(unsafe { Box::from_raw(made) });
-                other
-            }
-        }
+        slot.store(head.as_ptr(), std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -250,7 +219,7 @@ impl Column {
 /// written: a value whose ID is not marked is not kept.
 #[derive(Default, Debug, PartialEq, Eq)]
 pub struct Live {
-    bits: Vec<u64>,
+    bits: BitSet<u32>,
 }
 
 impl Live {
@@ -259,20 +228,16 @@ impl Live {
     }
 
     pub fn mark_id(&mut self, id: u32) {
-        let word = id as usize / 64;
-        if word >= self.bits.len() {
-            self.bits.resize(word + 1, 0);
-        }
-        self.bits[word] |= 1 << (id % 64);
+        self.bits.insert_growing(id);
     }
 
     pub fn contains(&self, id: u32) -> bool {
-        self.bits.get(id as usize / 64).is_some_and(|word| word >> (id % 64) & 1 == 1)
+        self.bits.contains(id)
     }
 
     /// How many IDs are marked.
     pub fn count(&self) -> usize {
-        self.bits.iter().map(|word| word.count_ones() as usize).sum()
+        self.bits.count()
     }
 }
 
@@ -416,7 +381,7 @@ impl Table {
             end,
             starts: image.slice::<u32>(section, root.starts, count + 1)?,
             keys: image.slice::<u64>(section, root.keys, count)?,
-            live: image.slice::<u64>(section, root.live, count.div_ceil(64))?,
+            live: BitSlice::from_words(image.slice::<u64>(section, root.live, count.div_ceil(64))?),
             ctrl: image.slice::<u64>(section, root.ctrl, groups)?,
             ids: image.slice::<u32>(section, root.ids, groups * GROUP as u64)?,
             free: image.slice::<u32>(section, root.free, u64::from(root.frees))?,
@@ -468,7 +433,7 @@ impl Table {
         if base.starts[0] != 0 || base.starts[count] as usize != base.bytes.len() {
             return Err("starts that do not span the values");
         }
-        if count % 64 != 0 && base.live[count / 64] >> (count % 64) != 0 {
+        if base.live.first_in(count..base.live.capacity()).is_some() {
             return Err("live bits past the last ID");
         }
         in_chunks(jobs, count, CHUNK, |indices| {
@@ -658,7 +623,7 @@ impl Table {
         let mut starts = Vec::with_capacity(count + 1);
         let mut keys = Vec::with_capacity(count);
         // alloc: `Table::write`'s columns, once an image written at the daemon's stop
-        let mut live_bits = vec![0u64; count.div_ceil(64)];
+        let mut live_bits = BitSet::<usize>::new(count);
         // alloc: as the starts
         let mut bytes = Vec::new();
         // alloc: as the starts
@@ -670,7 +635,7 @@ impl Table {
             if live.contains(id) {
                 bytes.extend_from_slice(self.bytes(id));
                 keys.push(self.key(id));
-                live_bits[index / 64] |= 1 << (index % 64);
+                live_bits.insert(index);
                 kept.push(id);
             } else {
                 keys.push(0);
@@ -709,7 +674,7 @@ impl Table {
         let at = Root {
             starts: out.slice(&starts),
             keys: out.slice(&keys),
-            live: out.slice(&live_bits),
+            live: out.slice(live_bits.words()),
             ctrl: out.slice(&ctrl),
             ids: out.slice(&ids),
             free: out.slice(&free),

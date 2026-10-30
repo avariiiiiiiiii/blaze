@@ -18,7 +18,7 @@ use cranelift_codegen::{
 };
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{
-    ObjectProduct,
+    ObjectModule, ObjectProduct,
     object::{
         BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, macho,
         write::{Relocation, StandardSection},
@@ -30,6 +30,7 @@ mod gcc_except_table;
 mod lsda;
 pub(super) mod seh;
 
+pub(super) use blaze_codegen::unwind::FrameRule;
 use lsda::CallEntry;
 
 /// Exception tag of a landing pad that runs destructors and resumes unwinding.
@@ -81,53 +82,42 @@ pub(super) struct FrameRows {
     pub(super) rows: Vec<(u32, FrameRule)>,
 }
 
-/// A DWARF call frame instruction. Registers are DWARF register numbers, offsets are bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
-pub(super) enum FrameRule {
-    Cfa(u16, i32),
-    CfaRegister(u16),
-    CfaOffset(i32),
-    Offset(u16, i32),
-    Restore(u16),
-    SameValue(u16),
-    Undefined(u16),
-    RememberState,
-    RestoreState,
-    ArgsSize(u32),
+/// What holds where a function is entered, which the entry every function shares says.
+/// On x86-64 the frame is eight bytes above the stack pointer, and the return address
+/// is at its bottom. On AArch64 the frame is at the stack pointer, and the return
+/// address is in a register.
+#[cfg(feature = "llvm")]
+pub(super) fn on_entry(arch: super::Arch) -> &'static [FrameRule] {
+    match arch {
+        super::Arch::Aarch64 => &[FrameRule::Cfa(31, 0)],
+        super::Arch::Wasm32 => &[],
+        super::Arch::X86_64 => &[FrameRule::Cfa(7, 8), FrameRule::Offset(16, -8)],
+    }
 }
 
-impl FrameRule {
-    /// What holds where a function is entered, which the entry every function shares says.
-    /// On x86-64 the frame is eight bytes above the stack pointer, and the return address
-    /// is at its bottom. On AArch64 the frame is at the stack pointer, and the return
-    /// address is in a register.
-    #[cfg(feature = "llvm")]
-    pub(super) fn on_entry(arch: super::Arch) -> &'static [FrameRule] {
-        match arch {
-            super::Arch::Aarch64 => &[FrameRule::Cfa(31, 0)],
-            super::Arch::Wasm32 => &[],
-            super::Arch::X86_64 => &[FrameRule::Cfa(7, 8), FrameRule::Offset(16, -8)],
-        }
-    }
-
-    fn instruction(self) -> CallFrameInstruction {
-        let register = gimli::Register;
-        match self {
-            FrameRule::Cfa(reg, offset) => CallFrameInstruction::Cfa(register(reg), offset),
-            FrameRule::CfaRegister(reg) => CallFrameInstruction::CfaRegister(register(reg)),
-            FrameRule::CfaOffset(offset) => CallFrameInstruction::CfaOffset(offset),
-            FrameRule::Offset(reg, offset) => CallFrameInstruction::Offset(register(reg), offset),
-            FrameRule::Restore(reg) => CallFrameInstruction::Restore(register(reg)),
-            FrameRule::SameValue(reg) => CallFrameInstruction::SameValue(register(reg)),
-            FrameRule::Undefined(reg) => CallFrameInstruction::Undefined(register(reg)),
-            FrameRule::RememberState => CallFrameInstruction::RememberState,
-            FrameRule::RestoreState => CallFrameInstruction::RestoreState,
-            FrameRule::ArgsSize(size) => CallFrameInstruction::ArgsSize(size),
+fn instruction(rule: FrameRule) -> CallFrameInstruction {
+    let register = gimli::Register;
+    match rule {
+        FrameRule::Cfa(reg, offset) => CallFrameInstruction::Cfa(register(reg), offset),
+        FrameRule::CfaRegister(reg) => CallFrameInstruction::CfaRegister(register(reg)),
+        FrameRule::CfaOffset(offset) => CallFrameInstruction::CfaOffset(offset),
+        FrameRule::Offset(reg, offset) => CallFrameInstruction::Offset(register(reg), offset),
+        FrameRule::Restore(reg) => CallFrameInstruction::Restore(register(reg)),
+        FrameRule::SameValue(reg) => CallFrameInstruction::SameValue(register(reg)),
+        FrameRule::Undefined(reg) => CallFrameInstruction::Undefined(register(reg)),
+        FrameRule::RememberState => CallFrameInstruction::RememberState,
+        FrameRule::RestoreState => CallFrameInstruction::RestoreState,
+        FrameRule::ArgsSize(size) => CallFrameInstruction::ArgsSize(size),
+        FrameRule::RaSignState(signed) => {
+            let mut expression = gimli::write::Expression::new();
+            expression.op(if signed { gimli::DW_OP_lit1 } else { gimli::DW_OP_lit0 });
+            CallFrameInstruction::ValExpression(register(34), expression)
         }
     }
 }
 
 impl FunctionUnwind {
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     pub(super) fn of(isa: &dyn TargetIsa, context: &Context) -> Result<Option<Self>, String> {
         let Some(code) = context.compiled_code() else { return Ok(None) };
         let info = match code.create_unwind_info(isa).map_err(|e| e.to_string())? {
@@ -210,7 +200,7 @@ impl FunctionUnwind {
             Frame::Rows(FrameRows { len, rows }) => {
                 let mut fde = FrameDescriptionEntry::new(address, *len);
                 for &(offset, rule) in rows {
-                    fde.add_instruction(offset, rule.instruction());
+                    fde.add_instruction(offset, instruction(rule));
                 }
                 fde
             }
@@ -223,7 +213,7 @@ pub(super) const PERSONALITY: &str = "rust_eh_personality";
 
 /// The function the unwinder asks about a frame with landing pads: the program's own of that
 /// name when it defines one, the runtime's otherwise.
-fn personality(module: &mut dyn Module) -> Result<FuncId, String> {
+fn personality(module: &mut ObjectModule) -> Result<FuncId, String> {
     const NAME: &str = PERSONALITY;
     if let Some(cranelift_module::FuncOrDataId::Func(own)) = module.declarations().get_name(NAME) {
         return Ok(own);
@@ -260,7 +250,7 @@ struct Cies {
 }
 
 impl UnwindContext {
-    pub(super) fn new(module: &mut dyn Module) -> Result<Self, String> {
+    pub(super) fn new(module: &mut ObjectModule) -> Result<Self, String> {
         let mut frame_table = FrameTable::default();
         let seh = seh::Tables::default();
         let dwarf = module.isa().triple().binary_format != target_lexicon::BinaryFormat::Coff;
@@ -320,7 +310,7 @@ impl UnwindContext {
 
     /// Points the frames at the personality. Done once every function of the program is
     /// declared: a program without `std` may define the personality itself.
-    pub(super) fn name_personality(&self, module: &mut dyn Module) -> Result<(), String> {
+    pub(super) fn name_personality(&self, module: &mut ObjectModule) -> Result<(), String> {
         let Some(personality_ref) = self.personality_ref else { return Ok(()) };
         let personality = personality(module)?;
         let mut data = DataDescription::new();
@@ -336,7 +326,7 @@ impl UnwindContext {
     /// rather than one the build has.
     pub(super) fn runtime(
         &mut self,
-        module: &mut dyn Module,
+        module: &mut ObjectModule,
         symbol: &str,
     ) -> Result<Option<FuncId>, String> {
         self.seh.runtime(module, symbol)
@@ -345,7 +335,7 @@ impl UnwindContext {
     /// Records the frame layout and the landing pads of a compiled function.
     pub(super) fn add_function(
         &mut self,
-        module: &mut dyn Module,
+        module: &mut ObjectModule,
         func: FuncId,
         unwind: &FunctionUnwind,
     ) -> Result<(), String> {

@@ -12,7 +12,6 @@ keywords = ["hot-reload", "live-reload", "jit", "compiler"]
 categories = ["development-tools"]
 
 [dependencies]
-blaze-mem.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

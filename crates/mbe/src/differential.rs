@@ -8,6 +8,7 @@
 
 use std::fmt::Write;
 
+use base_db::Db;
 use blaze_ids::rng::SplitMix64;
 
 use span::{
@@ -48,7 +49,7 @@ fn call_site() -> Span {
 /// Expands `input` with `mac` by both expanders in every call style, with no marker and, when
 /// `marked`, with one that moves every span, and asserts they agree. Returns the expansions.
 fn assert_same(
-    db: &dyn salsa::Database,
+    db: &Db,
     mac: &DeclarativeMacro,
     input: &tt::TopSubtree,
     marked: bool,
@@ -93,7 +94,7 @@ fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
 /// columns and through the one the old cursor conversion made, and asserts the trees, their
 /// errors and their span maps are the same, and so are the inputs, as a parser's and as a
 /// matcher's.
-fn assert_same_parses(db: &dyn salsa::Database, tt: &tt::TopSubtree, what: &dyn Fn() -> String) {
+fn assert_same_parses(db: &Db, tt: &tt::TopSubtree, what: &dyn Fn() -> String) {
     use syntax_bridge::reference;
     let mut edition = |ctx: SyntaxContext| ctx.edition(db);
     for view in [tt.view().strip_invisible(), tt.token_trees(), tt.view().as_token_trees()] {
@@ -146,7 +147,7 @@ fn entry_point(idx: usize) -> parser::PrefixEntryPoint {
 /// Takes fragments of every kind from every position of `input` by both
 /// [`crate::expect_fragment`] and the model's, and asserts they agree.
 fn assert_same_fragments(
-    db: &dyn salsa::Database,
+    db: &Db,
     input: &tt::TopSubtree,
     what: &dyn Fn() -> String,
 ) {
@@ -279,7 +280,7 @@ const EDITION_PAIRS: [(Edition, Edition); 3] = [
 
 #[test]
 fn corpus() {
-    let db = salsa::DatabaseImpl::default();
+    let db = base_db::Db::for_tests();
     for &(decl, inputs) in CORPUS {
         for (pair, (def_edition, call_edition)) in EDITION_PAIRS.into_iter().enumerate() {
             let def = token_tree(0, def_edition, decl).expect("a corpus macro lexes");
@@ -308,7 +309,7 @@ fn corpus() {
 
 #[test]
 fn long_fragments() {
-    let db = salsa::DatabaseImpl::default();
+    let db = base_db::Db::for_tests();
     let mut texts = vec![
         "a < b < c < d < e < f < g < h < i < j > > > > > > > > > , x".to_owned(),
         "Vec :: < u8 > :: new ( ) . iter ( ) . map ( | x | x + 1 ) . collect :: < Vec < _ > > ( ) ;"
@@ -342,7 +343,7 @@ fn benchmark_macros() {
     if test_utils::skip_slow_tests() {
         return;
     }
-    let db = salsa::DatabaseImpl::default();
+    let db = base_db::Db::for_tests();
     let rules = crate::benchmark::macro_rules_fixtures();
     let invocations = crate::benchmark::invocation_fixtures(&db, &rules);
     for (id, input) in &invocations {
@@ -670,7 +671,7 @@ const INPUTS_PER_MACRO: usize = 5;
 
 #[test]
 fn random_macros() {
-    let db = salsa::DatabaseImpl::default();
+    let db = base_db::Db::for_tests();
     let seeds = if test_utils::skip_slow_tests() { SEEDS } else { SLOW_SEEDS };
     let mut checked = 0;
     for seed in 0..seeds {

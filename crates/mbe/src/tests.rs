@@ -22,7 +22,7 @@ fn check_(
     expect: expect_test::Expect,
     parse: parser::TopEntryPoint,
 ) {
-    let db = salsa::DatabaseImpl::default();
+    let db = base_db::Db::for_tests();
     let decl_tt = &syntax_bridge::parse_to_token_tree(
         def_edition,
         SpanAnchor {
@@ -265,7 +265,16 @@ fn expr_2021() {
             ExpandError {
                 inner: (
                     1:Root[0000, 0]@5..6#ROOT2024,
-                    NoMatchingRule,
+                    MatchFailure(
+                        MatchFailure {
+                            token: Some(
+                                "reserved identifier `_`",
+                            ),
+                            remaining: "sequence start",
+                            remaining_span: None,
+                            missing_comma: None,
+                        },
+                    ),
                 ),
             }
 
@@ -289,7 +298,16 @@ fn expr_2021() {
             ExpandError {
                 inner: (
                     1:Root[0000, 0]@5..10#ROOT2024,
-                    NoMatchingRule,
+                    MatchFailure(
+                        MatchFailure {
+                            token: Some(
+                                "keyword `const`",
+                            ),
+                            remaining: "sequence start",
+                            remaining_span: None,
+                            missing_comma: None,
+                        },
+                    ),
                 ),
             }
 
@@ -361,7 +379,16 @@ fn expr_2021() {
             ExpandError {
                 inner: (
                     1:Root[0000, 0]@5..6#ROOT2024,
-                    NoMatchingRule,
+                    MatchFailure(
+                        MatchFailure {
+                            token: Some(
+                                "reserved identifier `_`",
+                            ),
+                            remaining: "sequence start",
+                            remaining_span: None,
+                            missing_comma: None,
+                        },
+                    ),
                 ),
             }
 
@@ -475,8 +502,17 @@ fn minus_belongs_to_literal() {
             ExpandError {
                 inner: (
                     1:Root[0000, 0]@1..2#ROOT2024,
-                    BindingError(
-                        "expected literal",
+                    MatchFailure(
+                        MatchFailure {
+                            token: Some(
+                                "`-`",
+                            ),
+                            remaining: "meta-variable `$lit:literal`",
+                            remaining_span: Some(
+                                0:Root[0000, 0]@53..65#ROOT2024,
+                            ),
+                            missing_comma: None,
+                        },
                     ),
                 ),
             }
@@ -492,7 +528,7 @@ fn minus_belongs_to_literal() {
 /// window of the level, not the rest of it, into the input kept from the last fragment.
 #[test]
 fn a_fragment_allocates_the_same_however_much_follows_it() {
-    let db = salsa::DatabaseImpl::default();
+    let db = base_db::Db::for_tests();
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,

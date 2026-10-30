@@ -19,3 +19,5 @@
 - **Note for whoever adds a second budget test elsewhere in `blaze-cargo`**: a test binary can
   have only one `#[global_allocator]`, and this one is in `sandbox.rs`. Don't add another: call
   `blaze_alloc_count::measure` from anywhere in the crate.
+
+> forwarded to cargo (`crates/blaze-cargo/Cargo.toml`) (from requests, pass 16; told by tmux).

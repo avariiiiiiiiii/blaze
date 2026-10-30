@@ -1,6 +1,6 @@
 //! The run process's side, linked into the program: the start hook that attaches it to the
 //! daemon before `main` (the crate docs' "The start of a run"), its quiescent points, its
-//! threads' fence slots, and requests to the daemon over the channel.
+//! threads' fence slots, and its asks to the daemon ([`crate::ask`]).
 //!
 //! The link puts a pointer to [`blaze_inproc_start`] first among the executable's initializers:
 //! the ELF `.preinit_array`, the Mach-O `__mod_init_func`, a PE TLS callback in `.CRT$XLAB`. The
@@ -9,19 +9,20 @@
 //! [`quiesce`] does nothing.
 
 use std::cell::Cell;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 
 use crate::channel::Channel;
 use crate::fence::{MOST_FRAMES, Thread};
 use crate::frame::{Kind, Reader, Writer, kinds};
 use crate::handshake::{Grant, HOST_VAR, Hello, VERSION, host_var};
-use crate::{Access, Error, Format, image, sys};
+use crate::{Access, Error, Format, ask, image, sys};
 
 pub struct Attached {
-    control: &'static [std::sync::atomic::AtomicU64],
-    /// Taken for one request and its answer, by the thread that asks: requests are stub misses
-    /// and the like, never a hot path, and nothing is called with it held.
-    channel: Mutex<Channel>,
+    control: &'static [AtomicU64],
+    asks: &'static [AtomicU64],
+    /// Only rung and looked at once the start is over: nothing reads it here.
+    stream: sys::Stream,
     slide: u64,
     pid: u32,
 }
@@ -148,7 +149,7 @@ pub unsafe extern "system" fn blaze_inproc_start(_: *mut std::ffi::c_void, reaso
 
 /// Attaches, or stops the process: a run whose code memory can't be laid over its image must
 /// not run the file's code in its place.
-#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), expect(dead_code, reason = "no start hook here"))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code, reason = "no start hook here"))]
 fn start(var: Option<Vec<u8>>) {
     if ATTACHED.get().is_some() {
         return;
@@ -174,6 +175,7 @@ fn start(var: Option<Vec<u8>>) {
     }
 }
 
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code, reason = "no start hook here"))]
 fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
     let (address, token) = host_var(var)?;
     let format = Format::host().ok_or_else(|| Error::new("no executable format on this platform"))?;
@@ -206,9 +208,15 @@ fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
     let slide = header.wrapping_sub(grant.header);
     let control = &objects[1];
     let at = control.map_anywhere(channel, Access::Shared)?;
-    let words = sys::adopt_words(at, control.len())?;
+    let words = sys::adopt_words(at, control.len(), crate::fence::CONTROL_BYTES)?;
     if !Thread::ready(&words) {
         return Err(Error::new(format!("the control words at {at:#x} are not set up")));
+    }
+    let asks = &objects[2];
+    let at = asks.map_anywhere(channel, Access::Shared)?;
+    let asks = sys::adopt_words(at, asks.len(), ask::BYTES)?;
+    if !ask::ready(&asks) {
+        return Err(Error::new(format!("the asks at {at:#x} are not set up")));
     }
     sys::overlay(channel, &objects, &grant.overlays, slide)?;
 
@@ -216,7 +224,7 @@ fn open(var: &[u8], out: &mut Option<Channel>) -> Result<Attached, Error> {
     Writer::new(&mut started).u64(sys::thread_id());
     channel.send(kinds::STARTED, 0, &started)?;
     let channel = out.take().ok_or_else(|| Error::new("the channel went away while starting"))?;
-    Ok(Attached { control: words, channel: Mutex::new(channel), slide, pid: std::process::id() })
+    Ok(Attached { control: words, asks, stream: channel.into_stream(), slide, pid: std::process::id() })
 }
 
 /// The calling thread's slot and the epoch it last reported, and its release when it ends.
@@ -312,13 +320,14 @@ impl Attached {
         });
     }
 
-    /// Sends a request of `kind` with `body` and puts the answer's body in `answer`; says the
-    /// answer's kind. One request at a time over the process; a thread waits its turn.
-    pub fn request(&self, kind: Kind, body: &[u8], answer: &mut Vec<u8>) -> Result<Kind, Error> {
-        let mut channel = self.channel.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let frame = channel.request(kind, body)?;
-        answer.clear();
-        answer.extend_from_slice(frame.body);
-        Ok(frame.kind)
+    /// Asks the daemon `kind` with `body` (at most [`ask::MOST_BODY`] bytes) and waits for its
+    /// answer: the answer's kind and whole length, with as much of its body as fits in
+    /// `answer` (the rest is lost: a longer answer than the caller can take is its error).
+    ///
+    /// From any thread, any number at once, and from a signal handler, also one that
+    /// interrupted its own thread inside this call: it takes no lock, allocates nothing, and
+    /// leaves `errno` as it found it. Errors are made only on failure, and allocate.
+    pub fn request_into(&self, kind: Kind, body: &[u8], answer: &mut [u8]) -> Result<(Kind, usize), Error> {
+        ask::request(&self.asks, &self.stream, kind, body, answer)
     }
 }

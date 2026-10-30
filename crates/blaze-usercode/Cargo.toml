@@ -18,6 +18,7 @@ blake3.workspace = true
 blaze-build-script.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
+blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-inproc = { workspace = true, features = ["host"] }
 blaze-items.workspace = true

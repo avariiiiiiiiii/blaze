@@ -5,7 +5,7 @@
 
 use blaze_codegen::Arch;
 use blaze_format::leb::LebError;
-use blaze_ids::radix;
+use blaze_ids::{bits::BitSet, radix};
 use object::Endianness;
 use object::macho;
 use object::read::macho::{MachHeader as _, Nlist as _, Section as _, Segment as _, SymbolTable};
@@ -279,17 +279,15 @@ fn trie_exports(
     // the edge to it at least 2 (an empty label's NUL, its offset): at most one export per 6
     // bytes of a trie whose nodes don't overlap, so `out` is sized once.
     let mut out = Vec::with_capacity(data.len() / 6 + 1);
-    let mut seen = vec![0u64; data.len().div_ceil(64)]; // alloc: one bitset per trie, sized exactly
+    let mut seen = BitSet::<usize>::new(data.len()); // alloc: one bitset per trie, sized exactly
     let mut name: SmallVec<[u8; NAME_INLINE]> = SmallVec::new();
     let mut stack: SmallVec<[Edge; EDGES_INLINE]> = SmallVec::new();
     let mut node = 0usize;
     loop {
-        let (word, bit) = (node / 64, 1u64 << (node % 64));
-        if seen[word] & bit != 0 {
+        if !seen.insert(node) {
             // alloc: error path
             return Err(format!("node {node:#x} is reached twice (a cycle)"));
         }
-        seen[word] |= bit;
         let mut at = node;
         let terminal = uleb(data, &mut at)?;
         if terminal != 0 {

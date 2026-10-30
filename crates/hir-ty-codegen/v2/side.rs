@@ -7,7 +7,9 @@ use std::borrow::Cow;
 
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
+use blaze_mem::Frame;
 use intern::Symbol;
+use serde::Serializer;
 use serde_derive::{Deserialize, Serialize};
 
 use crate::debuginfo::{LineRow, SlotPlaces, VariablePlace};
@@ -123,6 +125,63 @@ pub(crate) enum Place {
     Ranges(Vec<(u32, u32, Vec<u8>)>),
 }
 
+/// [`Side`] as [`encode`] writes it, its lists in the unit's frame: the same fields in the
+/// same order, so postcard writes the bytes a `Side` of them would, and [`decode`] reads them
+/// back as one.
+#[derive(Serialize)]
+struct Written<'a, 'f> {
+    version: u32,
+    frame_base: Cow<'a, [u8]>,
+    #[serde(serialize_with = "seq")]
+    scopes: Vec<WrittenScope<'f>, &'f Frame>,
+    #[serde(serialize_with = "seq")]
+    variables: Vec<WrittenTold<'a>, &'f Frame>,
+    #[serde(serialize_with = "seq")]
+    inlined: Vec<WrittenInlined<'f>, &'f Frame>,
+}
+
+/// [`Scope`] as written.
+#[derive(Serialize)]
+struct WrittenScope<'f> {
+    parent: Option<u32>,
+    #[serde(serialize_with = "seq")]
+    ranges: Vec<(u32, u32), &'f Frame>,
+}
+
+/// [`Inlined`] as written.
+#[derive(Serialize)]
+struct WrittenInlined<'f> {
+    parent: Option<u32>,
+    call_site: SpanRef,
+    #[serde(serialize_with = "seq")]
+    ranges: Vec<(u32, u32), &'f Frame>,
+}
+
+/// [`Told`] as written: its place borrowed from the function's slots unless it is a pointee's.
+#[derive(Serialize)]
+struct WrittenTold<'a> {
+    name: &'a str,
+    param: bool,
+    ty: ContentId,
+    place: WrittenPlace<'a>,
+    scope: Option<u32>,
+}
+
+/// [`Place`] as written, its variants in `Place`'s order.
+#[derive(Serialize)]
+enum WrittenPlace<'a> {
+    Frame(i64),
+    Ranges(Cow<'a, [(u32, u32, Vec<u8>)]>),
+}
+
+/// A list in a frame as serde writes a `Vec`: its length, then each item.
+fn seq<T: serde::Serialize, S: Serializer>(
+    items: &Vec<T, &Frame>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(items.iter())
+}
+
 /// The side table of a function whose variables Cranelift put where `slots` says, with its
 /// content ID; `None` for one with nothing to tell. The code of each scope is from `lines`,
 /// the function's line rows, and `len`, where its code ends.
@@ -132,19 +191,23 @@ pub(crate) fn encode(
     slots: &SlotPlaces,
     lines: &[LineRow],
     len: u32,
+    frame: &Frame,
 ) -> Result<Option<(Vec<u8>, ContentId)>, String> {
-    let mut told = Vec::with_capacity(variables.len());
+    let mut told: Vec<WrittenTold<'_>, &Frame> = Vec::with_capacity_in(variables.len(), frame);
     told.extend(variables.iter().filter_map(|variable| {
         let place = slots.of(variable.slot)?;
-        let place = match variable.pointer {
-            Some(offset) => place.pointee(offset),
-            None => place.clone(),
+        let place = match (variable.pointer, place) {
+            // alloc: a pointee's place, made for it
+            (Some(offset), place) => match place.pointee(offset) {
+                VariablePlace::Frame(offset) => WrittenPlace::Frame(offset),
+                VariablePlace::Ranges(ranges) => WrittenPlace::Ranges(Cow::Owned(ranges)),
+            },
+            (None, VariablePlace::Frame(offset)) => WrittenPlace::Frame(*offset),
+            (None, VariablePlace::Ranges(ranges)) => {
+                WrittenPlace::Ranges(Cow::Borrowed(&ranges[..]))
+            }
         };
-        let place = match place {
-            VariablePlace::Frame(offset) => Place::Frame(offset),
-            VariablePlace::Ranges(ranges) => Place::Ranges(ranges),
-        };
-        Some(Told {
+        Some(WrittenTold {
             name: variable.name.as_str(),
             param: variable.param,
             ty: variable.ty,
@@ -155,11 +218,15 @@ pub(crate) fn encode(
     if told.is_empty() && scopes.inlined.is_empty() {
         return Ok(None);
     }
-    let inlined = inlined_ranges(scopes, lines, len)?;
-    let scopes = if told.is_empty() { Vec::new() } else { ranges(scopes, lines, len)? };
+    let inlined = inlined_ranges(scopes, lines, len, frame)?;
+    let scopes =
+        if told.is_empty() { Vec::new_in(frame) } else { ranges(scopes, lines, len, frame)? };
     let frame_base = Cow::Borrowed(&slots.frame_base[..]);
-    let side = Side { version: VERSION, frame_base, scopes, variables: told, inlined };
-    let bytes = postcard::to_allocvec(&side).map_err(|e| e.to_string())?;
+    let side = Written { version: VERSION, frame_base, scopes, variables: told, inlined };
+    let size = postcard::experimental::serialized_size(&side).map_err(|e| e.to_string())?;
+    // alloc: the side table's bytes, kept in the store: one allocation of their exact size
+    let bytes =
+        postcard::to_extend(&side, Vec::<u8>::with_capacity(size)).map_err(|e| e.to_string())?;
     let id = ContentId::of(SIDE_DOMAIN, &bytes);
     Ok(Some((bytes, id)))
 }
@@ -169,16 +236,25 @@ pub(crate) fn of(
     variables: &[Variable],
     scopes: &Scopes,
     code: &crate::fragment::Code,
+    frame: &Frame,
 ) -> Result<Option<(Vec<u8>, ContentId)>, String> {
     let len = u32::try_from(code.bytes.len()).map_err(|e| e.to_string())?;
-    encode(variables, scopes, &code.slots, &code.lines, len)
+    encode(variables, scopes, &code.slots, &code.lines, len, frame)
 }
 
 /// The code of each scope: that of each line row whose statement is of it or of a scope
 /// inside it, up to the next row's offset or `len`.
-fn ranges(scopes: &Scopes, lines: &[LineRow], len: u32) -> Result<Vec<Scope>, String> {
-    let mut out: Vec<Scope> =
-        scopes.parents.iter().map(|&parent| Scope { parent, ranges: Vec::new() }).collect();
+fn ranges<'f>(
+    scopes: &Scopes,
+    lines: &[LineRow],
+    len: u32,
+    frame: &'f Frame,
+) -> Result<Vec<WrittenScope<'f>, &'f Frame>, String> {
+    let mut out: Vec<WrittenScope<'f>, &'f Frame> =
+        Vec::with_capacity_in(scopes.parents.len(), frame);
+    out.extend(
+        scopes.parents.iter().map(|&parent| WrittenScope { parent, ranges: Vec::new_in(frame) }),
+    );
     if out.is_empty() {
         return Ok(out);
     }
@@ -200,10 +276,19 @@ fn ranges(scopes: &Scopes, lines: &[LineRow], len: u32) -> Result<Vec<Scope>, St
 
 /// The code of each of `scopes.inlined`, as [`ranges`] has a scope's: that of each line row
 /// whose statement is of it or of one inlined inside it.
-fn inlined_ranges(scopes: &Scopes, lines: &[LineRow], len: u32) -> Result<Vec<Inlined>, String> {
-    let mut out: Vec<Inlined> = (scopes.inlined.iter())
-        .map(|it| Inlined { parent: it.parent, call_site: it.call_site, ranges: Vec::new() })
-        .collect();
+fn inlined_ranges<'f>(
+    scopes: &Scopes,
+    lines: &[LineRow],
+    len: u32,
+    frame: &'f Frame,
+) -> Result<Vec<WrittenInlined<'f>, &'f Frame>, String> {
+    let mut out: Vec<WrittenInlined<'f>, &'f Frame> =
+        Vec::with_capacity_in(scopes.inlined.len(), frame);
+    out.extend(scopes.inlined.iter().map(|it| WrittenInlined {
+        parent: it.parent,
+        call_site: it.call_site,
+        ranges: Vec::new_in(frame),
+    }));
     if out.is_empty() {
         return Ok(out);
     }
@@ -221,9 +306,9 @@ fn inlined_ranges(scopes: &Scopes, lines: &[LineRow], len: u32) -> Result<Vec<In
 
 /// Adds the code from `from` up to `to` to `scope` and the scopes it is inside of, joining
 /// it to a range it follows.
-fn extend<T>(
+fn extend<'f, T>(
     out: &mut [T],
-    parts: impl Fn(&mut T) -> (Option<u32>, &mut Vec<(u32, u32)>),
+    parts: impl Fn(&mut T) -> (Option<u32>, &mut Vec<(u32, u32), &'f Frame>),
     scope: Option<u32>,
     (from, to): (u32, u32),
 ) -> Result<(), String> {
@@ -274,7 +359,11 @@ mod tests {
             scope: None,
         };
         let variables = [variable("a", 0, None), variable("gone", 1, None), variable("b", 2, Some(4))];
-        let encoded = || encode(&variables, &Scopes::default(), &slots, &[], 16);
+        let encoded = || {
+            blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+                encode(&variables, &Scopes::default(), &slots, &[], 16, frame)
+            })
+        };
         let (bytes, id) = encoded().expect("encoded").expect("variables");
         let side = decode(&bytes).expect("decoded");
         let names: Vec<_> = side.variables.iter().map(|it| it.name).collect();
@@ -286,7 +375,10 @@ mod tests {
 
     #[test]
     fn nothing_to_tell_is_no_table() {
-        assert_eq!(encode(&[], &Scopes::default(), &SlotPlaces::default(), &[], 0), Ok(None));
+        let none = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            encode(&[], &Scopes::default(), &SlotPlaces::default(), &[], 0, frame)
+        });
+        assert_eq!(none, Ok(None));
     }
 
     /// A scope's code is that of its rows and of its inner scopes', joined where they meet;
@@ -300,11 +392,13 @@ mod tests {
         };
         let row = |offset, span| LineRow { offset, span };
         let lines = [row(0, 0), row(4, 1), row(8, 2), row(12, 3), row(16, 0)];
-        let ranges = ranges(&scopes, &lines, 20).expect("the ranges");
-        assert_eq!(ranges[0], Scope { parent: None, ranges: vec![(4, 16)] });
-        assert_eq!(ranges[1], Scope { parent: Some(0), ranges: vec![(8, 16)] });
-        let unknown = [row(0, 9)];
-        assert!(super::ranges(&scopes, &unknown, 4).is_err());
+        blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            let ranges = ranges(&scopes, &lines, 20, frame).expect("the ranges");
+            assert_eq!((ranges[0].parent, &ranges[0].ranges[..]), (None, &[(4, 16)][..]));
+            assert_eq!((ranges[1].parent, &ranges[1].ranges[..]), (Some(0), &[(8, 16)][..]));
+            let unknown = [row(0, 9)];
+            assert!(super::ranges(&scopes, &unknown, 4, frame).is_err());
+        });
     }
 
     /// An inlined body's code is that of its statements' rows and of the bodies inlined into
@@ -323,9 +417,11 @@ mod tests {
         };
         let row = |offset, span| LineRow { offset, span };
         let lines = [row(0, 0), row(4, 1), row(8, 2), row(12, 1), row(16, 0)];
-        let (bytes, _) = encode(&[], &scopes, &SlotPlaces::default(), &lines, 20)
-            .expect("encoded")
-            .expect("a table of the inlined code");
+        let (bytes, _) = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            encode(&[], &scopes, &SlotPlaces::default(), &lines, 20, frame)
+        })
+        .expect("encoded")
+        .expect("a table of the inlined code");
         let side = decode(&bytes).expect("decoded");
         assert!(side.variables.is_empty() && side.scopes.is_empty());
         assert_eq!(side.inlined, [
@@ -333,6 +429,57 @@ mod tests {
             Inlined { parent: Some(0), call_site: site(2), ranges: vec![(8, 12)] },
         ]);
         let unknown = [row(0, 9)];
-        assert!(inlined_ranges(&scopes, &unknown, 4).is_err());
+        blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            assert!(inlined_ranges(&scopes, &unknown, 4, frame).is_err());
+        });
+    }
+
+    /// What `encode` writes is, byte for byte, what postcard writes of the `Side` it reads back
+    /// as: writing from the frame changes no byte of the format. A warm encode allocates only
+    /// the bytes it returns.
+    #[test]
+    fn a_table_is_postcard_of_its_side_and_allocates_only_its_bytes() {
+        let slots = SlotPlaces {
+            frame_base: vec![0x56],
+            slots: vec![
+                (0, VariablePlace::Frame(-16)),
+                (2, VariablePlace::Ranges(vec![(0, 8, vec![0x50])])),
+            ],
+        };
+        let ty = ContentId::of("test", b"u32");
+        let variable = |name: &str, slot, scope| Variable {
+            name: Symbol::intern(name),
+            param: false,
+            ty,
+            slot,
+            pointer: None,
+            scope,
+        };
+        let variables = [variable("a", 0, None), variable("b", 2, Some(1))];
+        let scopes = Scopes {
+            parents: vec![None, Some(0)],
+            of_span: vec![SpanScope::Outside, SpanScope::In(0), SpanScope::In(1)],
+            ..Scopes::default()
+        };
+        let row = |offset, span| LineRow { offset, span };
+        let lines = [row(0, 0), row(4, 1), row(8, 2), row(12, 0)];
+        let encoded = || {
+            blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+                encode(&variables, &scopes, &slots, &lines, 16, frame)
+            })
+        };
+        let (bytes, id) = encoded().expect("encoded").expect("a table");
+        let side = decode(&bytes).expect("decoded");
+        assert_eq!(postcard::to_allocvec(&side).expect("postcard"), bytes);
+        assert_eq!(side.scopes, [
+            Scope { parent: None, ranges: vec![(4, 12)] },
+            Scope { parent: Some(0), ranges: vec![(8, 12)] },
+        ]);
+        assert_eq!(side.variables[1].place, Place::Ranges(vec![(0, 8, vec![0x50])]));
+        let (warm, warm_id) =
+            blaze_alloc_count::assert_at_most(1, "a warm side table: its bytes", encoded)
+                .expect("encoded")
+                .expect("a table");
+        assert_eq!((warm, warm_id), (bytes, id));
     }
 }

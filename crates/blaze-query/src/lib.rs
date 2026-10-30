@@ -59,7 +59,7 @@ use std::{
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{FormatError, Persist, SchemaHash, Writer};
 use blaze_graph::pump::{self, Flights};
-use blaze_ids::{ContentId, Fingerprint, Hasher, Idx};
+use blaze_ids::{ContentId, Fingerprint, Hasher, Idx, bits::BitSet};
 use blaze_image::{Builder, Corrupt, Image, Refused, SectionId};
 use blaze_protocol::cbor;
 use blaze_reclaim::{Grace, Guard, Limbo};
@@ -80,6 +80,58 @@ pub use crate::tree::{MemTree, Tree};
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 #[serde(transparent)]
 pub struct QueryKind(pub u16);
+
+/// The kind numbers of one crate's queries: `RANGE`, a constant for each kind, [`ALL`] with
+/// each query's name, `of(name)`, and `name(kind)` from a table built when compiled, which
+/// refuses a number outside `RANGE` or given twice.
+#[macro_export]
+macro_rules! query_kinds {
+    (
+        range: $range:expr, owner: $owner:literal;
+        $($(#[$meta:meta])* $name:ident = $number:literal, $query:literal;)*
+    ) => {
+        pub use $crate::QueryKind;
+
+        #[doc = ::core::concat!("The numbers ", $owner, " may give.")]
+        pub const RANGE: ::core::ops::Range<u16> = $range;
+
+        $($(#[$meta])* pub const $name: QueryKind = QueryKind($number);)*
+
+        /// Every kind, with its query as its crate names it: a function's name, or
+        /// `Type::method` for a method of a tracked `impl`.
+        pub const ALL: &[(QueryKind, &str)] = &[$(($name, $query)),*];
+
+        /// The kind of the query named `name`, as [`ALL`] names it.
+        pub fn of(name: &str) -> Option<QueryKind> {
+            match name {
+                $($query => Some($name),)*
+                _ => None,
+            }
+        }
+
+        const NAMES: [Option<&str>; (RANGE.end - RANGE.start) as usize] = {
+            let mut names = [None; (RANGE.end - RANGE.start) as usize];
+            let mut at = 0;
+            while at < ALL.len() {
+                let (kind, name) = ALL[at];
+                ::core::assert!(
+                    RANGE.start <= kind.0 && kind.0 < RANGE.end,
+                    ::core::concat!("a kind outside ", $owner, "'s range"),
+                );
+                let slot = (kind.0 - RANGE.start) as usize;
+                ::core::assert!(names[slot].is_none(), "a kind given to two queries");
+                names[slot] = Some(name);
+                at += 1;
+            }
+            names
+        };
+
+        /// The query of `kind`, if it is this crate's: one bounds check and one load.
+        pub fn name(kind: QueryKind) -> Option<&'static str> {
+            NAMES.get(kind.0.wrapping_sub(RANGE.start) as usize).copied().flatten()
+        }
+    };
+}
 
 /// The database's own kinds, and the ranges given to others.
 pub mod kinds {
@@ -676,46 +728,6 @@ struct ViewState {
     reruns: Map<Rerun>,
 }
 
-/// A set of memo IDs as a bit each, sized by the IDs handed out: marking or testing one is a
-/// shift and a word, with no hash. 1 bit a memo of the store.
-struct Marks(Vec<u64>);
-
-impl Marks {
-    fn new(end: u32) -> Marks {
-        // alloc: one bitset a collection, 1 bit a memo.
-        Marks(vec![0; (end as usize).div_ceil(64)])
-    }
-
-    /// Marks `memo`; `false` when it was marked already.
-    fn insert(&mut self, memo: MemoId) -> bool {
-        let (word, bit) = (memo as usize / 64, memo % 64);
-        if word >= self.0.len() {
-            self.0.resize(word + 1, 0);
-        }
-        let was = self.0[word] >> bit & 1;
-        self.0[word] |= 1 << bit;
-        was == 0
-    }
-
-    fn contains(&self, memo: MemoId) -> bool {
-        self.0.get(memo as usize / 64).is_some_and(|word| word >> (memo % 64) & 1 != 0)
-    }
-
-    /// The marked IDs, in order.
-    fn iter(&self) -> impl Iterator<Item = MemoId> + '_ {
-        self.0.iter().enumerate().flat_map(|(at, &word)| {
-            let mut bits = word;
-            std::iter::from_fn(move || {
-                (bits != 0).then(|| {
-                    let bit = bits.trailing_zeros();
-                    bits &= bits - 1;
-                    at as u32 * 64 + bit
-                })
-            })
-        })
-    }
-}
-
 /// How many edges ahead [`Database::verify`] starts a lookup: about the misses a core keeps in
 /// flight (20) over the two each lookup takes.
 const AHEAD: usize = 8;
@@ -1059,15 +1071,16 @@ impl Database {
         // Before the views are walked: a memo unlinked earlier is checked against what they
         // hold now (see `memo`'s comment).
         let dying = self.store.to_check();
-        let mut reached = Marks::new(self.store.end());
-        let mut hot = Marks::new(self.store.end());
+        // alloc: one bitset a collection each, 1 bit a memo.
+        let mut reached = BitSet::<MemoId>::new(self.store.end() as usize);
+        let mut hot = BitSet::<MemoId>::new(self.store.end() as usize);
         let mut inputs_kept: FxSet<QueryKey> = FxSet::default();
         // alloc: once a collection, as are `live`, `unlinked` and `cold` below.
         let mut work: Vec<MemoId> = Vec::new();
         self.views.for_each(&task, |state| {
             state.results.for_each(&task, |_, resolved| {
                 let memo = resolved.memo;
-                hot.insert(memo);
+                hot.insert_growing(memo);
                 work.push(memo);
             });
             state.inputs.for_each(&task, |key, _| {
@@ -1083,7 +1096,7 @@ impl Database {
             }
         }
         while let Some(memo) = work.pop() {
-            if !reached.insert(memo) {
+            if !reached.insert_growing(memo) {
                 continue;
             }
             for edge in self.store.edges(&task, memo) {
@@ -1319,12 +1332,13 @@ impl Database {
         self.slots.reclaim();
         self.inputs.reclaim();
         self.born.reclaim();
-        let mut held = Marks::new(self.store.end());
+        // alloc: one bitset a reclaim, 1 bit a memo.
+        let mut held = BitSet::<MemoId>::new(self.store.end() as usize);
         {
             let task = blaze_reclaim::enter();
             self.views.for_each(&task, |state| {
                 state.results.for_each(&task, |_, resolved| {
-                    held.insert(resolved.memo);
+                    held.insert_growing(resolved.memo);
                 });
             });
         }

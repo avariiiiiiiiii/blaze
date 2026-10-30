@@ -47,6 +47,8 @@ frame, scratch for per-call buffers, a budget test per change) and lane mem's ru
 - **What depends on other crates** is in §11. Two of those changes are in `hir-ty`, and the
   exact lowering budget waits for them.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ## 1. Manifest and crate root
 
 `crates/hir-ty-mir/Cargo.toml`, under `[dependencies]` after `blaze-ids.workspace = true`
@@ -88,6 +90,8 @@ pub mod type_name;
 pub mod budget;
 mod framed;
 ```
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ## 2. New module `src/mir/framed.rs`: bit sets and maps in the frame
 
@@ -209,14 +213,18 @@ body (each such case is checked in its section), so the output is the same bytes
 uses the same `FxBuildHasher` as the `FxHashMap` it replaces, so iteration order is also
 unchanged where a map is iterated.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ## 3. The runtime pipeline: `src/mir/transform.rs`
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 3.1 `Ctx` gains the frame (lines 47-129)
 
 ```rust
 // before
 pub(super) struct Ctx<'db> {
-    pub(super) db: &'db dyn HirDatabase,
+    pub(super) db: &'db Db,
     pub(super) infcx: InferCtxt<'db>,
     pub(super) env: ParamEnv<'db>,
     krate: Crate,
@@ -224,13 +232,13 @@ pub(super) struct Ctx<'db> {
 }
 
 impl<'db> Ctx<'db> {
-    pub(super) fn new(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> Self {
+    pub(super) fn new(db: &'db Db, owner: InferBodyId<'db>) -> Self {
         ..
         Ctx { db, infcx, env, krate, needs_drop: RefCell::default() }
     }
 // after
 pub(super) struct Ctx<'f, 'db> {
-    pub(super) db: &'db dyn HirDatabase,
+    pub(super) db: &'db Db,
     pub(super) infcx: InferCtxt<'db>,
     pub(super) env: ParamEnv<'db>,
     krate: Crate,
@@ -240,7 +248,7 @@ pub(super) struct Ctx<'f, 'db> {
 }
 
 impl<'f, 'db> Ctx<'f, 'db> {
-    pub(super) fn new(db: &'db dyn HirDatabase, owner: InferBodyId<'db>, frame: &'f Frame) -> Self {
+    pub(super) fn new(db: &'db Db, owner: InferBodyId<'db>, frame: &'f Frame) -> Self {
         ..
         Ctx { db, infcx, env, krate, frame, needs_drop: RefCell::new(framed::map_in(frame)) }
     }
@@ -270,11 +278,13 @@ Callers: every `ctx: &Ctx<'db>` in the crate becomes `ctx: &Ctx<'_, 'db>`. That 
 Imports: `use rustc_hash::FxHashMap;` (line 28) goes;
 `use blaze_mem::{Frame, Tag, frame};` and `use super::framed;` come in.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 3.2 `run_passes` (lines 131-159): one task for the body, one per pass
 
 ```rust
 // before
-fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
+fn run_passes<'db>(db: &'db Db, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
     let mut body = built.clone();
     let ctx = Ctx::new(db, body.owner);
     for (_, block) in body.basic_blocks.iter_mut() { .. FalseEdge .. }
@@ -294,7 +304,7 @@ fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db
     Ok(body)
 }
 // after
-fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
+fn run_passes<'db>(db: &'db Db, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
     // The copy the query keeps: the passes change it in place.
     let mut body = built.clone();
     frame::task(Tag::Mir, |outer| -> Result<'db, ()> {
@@ -362,7 +372,12 @@ pub(super) fn run_one<'db>(
 unwinds), with its result dropped. It is the only new function, and it is what
 `elaborate_drops` calls first, so the test measures the code that runs.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+> applied by codegen-mir-store (2026-10-29), uncompiled: §3.1 and §3.2 as written (`db: &'db Db`): `Ctx<'f, 'db>` with `frame` and the `needs_drop` `FrameMap`, `run_passes` in an outer task with one task per pass and `promoted_constants` counted first, and `transform::run_one` (it returns `NotSupported` for an optimization instead of `unreachable!`; `optimize::run_one` sends only the runtime passes to it).
+
 ## 4. The runtime passes: `src/mir/transform/*`
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 4.1 `asserts.rs`
 
@@ -397,6 +412,9 @@ frame: &Frame)`.
   `vec![one]`).
 - Lines 365-373, the `index_spans` collect: a frame `Vec` (`Vec::with_capacity_in(n, frame)`).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+> applied by codegen-mir-store (2026-10-29), uncompiled: as written; `index_spans` is a frame `Vec<Option<MirSpan>>` by local index (last marker wins, as the map's collect had it), and a block `assert` splits off gets room for the statements after the check.
+
 ### 4.2 `cleanup.rs`
 
 `remove_noop_landing_pads(body)` becomes `remove_noop_landing_pads(body, frame: &Frame)`.
@@ -407,6 +425,9 @@ frame: &Frame)`.
 - It is only probed, so the output is unchanged.
 - `optimize.rs:149` calls this, from the optimize pipeline, with the pass's frame (§6.1).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+> applied by codegen-mir-store (2026-10-29), uncompiled: the fixpoint is `noop_in(body, frame) -> Bits` over block indices; `remove_noop_landing_pads(body, frame)` and codegen's public `noop_landing_pads(body)` (one task, the kept `FxHashSet` at its size) both use it.
+
 ### 4.3 `upvars.rs`
 
 `upvars_in_place(body)` becomes `upvars_in_place(body, frame: &Frame)`.
@@ -415,6 +436,9 @@ frame: &Frame)`.
 - `body.upvars_in_place`, the kept list, is built once with `Vec::with_capacity(count)` and
   then filled.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+> applied by codegen-mir-store (2026-10-29), uncompiled: as written.
+
 ### 4.4 `packed_drops.rs`
 
 `add_moves_for_packed_drops(ctx, body)` becomes `(ctx, body, frame: &Frame)`. The `frame`
@@ -422,6 +446,9 @@ parameter is unused today and is kept for symmetry with the other passes.
 - Line 18: `let ids: Vec<_> = body.basic_blocks.iter().map(|(id, _)| id).collect();` becomes
   `let blocks = body.basic_blocks.len(); for index in 0..blocks { let id = block_id(index); .. }`.
 - The moved-to blocks it allocates are kept body.
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+> applied by codegen-mir-store (2026-10-29), uncompiled: as written.
 
 ### 4.5 `move_paths.rs`: the dataflow
 
@@ -694,11 +721,15 @@ pub(super) fn edges(&self, targets: &SwitchTargets, out: &mut Edges<'_>) {
 or the function returned early. The edges, their order and their paths are the same, and so is
 the cost: `named.contains` was already linear.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 4.6 What the tests hold `move_paths` to
 
 The `Pass::DropAnalysis` warm test (§10, `warm_runtime_analyses_allocate_nothing`): live blocks,
 `gather`, both `InitAnalysis::run`s and `dead_unwinds` allocate 0 on the global allocator, on a
 body with moves, drops, a conditional move and a `match` on an enum.
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 4.7 `elaborate_drops.rs`
 
@@ -799,7 +830,11 @@ Budgets:
   elaborate, `run_passes_allocates_the_kept_body_only` holds the whole pipeline to the clone
   count.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ## 5. Lowering: `src/mir/lower.rs`, `lower/match_tree.rs`, `lower/pattern_matching.rs`
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 5.1 `MirLowerCtx<'a, 'f, 'db>`: the body under construction lives in the frame
 
@@ -992,6 +1027,8 @@ Each lowering entry opens the frame:
   `framed::map_in(frame)` / `framed::set_in(frame)`.
 - What the closure returns (`MirBody<'db>`) is owned, so nothing borrows the frame past the task.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 5.2 The per-body maps and lists of `MirLowerCtx` (lines 140-224)
 
 | Field | Before | After |
@@ -1060,6 +1097,8 @@ does, so the probe finds the entry.
 
   `partition` keeps each side's order, so `[temporaries, before, operands]` is the same
   sequence.
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 5.3 The per-statement unwind path (lines 2997-3043)
 
@@ -1135,6 +1174,8 @@ fn in_scope_into(&self, out: &mut Vec<LocalId, &Frame>) {
   aliasing issue.
 - `unwind_node`'s new blocks (3106) are kept body (§5.1).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 5.4 Leaving scopes early (`exit_to`, `drop_until_scope`, `exits_end_at`, `emit_drop_and_storage_dead_for_scope`)
 
 - `exit_to` (4042-4091): the `storage` `Vec`, `ended` (4060, a collect per local) and `before`
@@ -1166,6 +1207,8 @@ fn in_scope_into(&self, out: &mut Vec<LocalId, &Frame>) {
   - 3719 and 3740;
   - 3782: bindings.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 5.5 `match_tree.rs` and `pattern_matching.rs`
 
 The match tree is built per `match` and dropped once the arms are lowered, so all of it goes in
@@ -1184,6 +1227,8 @@ the frame:
   `MirLowerCtx::frame`, and the tree builder takes `frame: &'f Frame`.
 - `pattern_matching.rs` 143, 151, 215-228 (`expansions: vec![Vec::new()]` becomes a frame `Vec`
   of frame `Vec`s), 364 (above), 1022 and 1076: frame `Vec`s.
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 5.6 `mir_body_query`'s tracing detail (lines 4920-4941)
 
@@ -1207,6 +1252,8 @@ let _p = span.entered();
 `field::debug(&String)` records what `?detail` recorded. The span is the same, and the field is
 only filled in when the span is enabled.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 5.7 `lower_body_to_mir` (line 5013)
 
 `let resolver = owner.resolver(db); let interner = DbInterner::new_with(db, resolver.krate());`
@@ -1215,7 +1262,11 @@ builds a whole `Resolver` (a `Vec` of scopes) only to read its crate. It becomes
 resolver's module is the owner's, and `transform::Ctx::new` already does this. That is one
 `Resolver` fewer per body.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ## 6. The optimizations: `src/mir/optimize.rs` and `optimize/*`
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 6.1 `optimize` (lines 89-158): one task per pass
 
@@ -1321,6 +1372,8 @@ pub(super) fn run_one<'db>(
 }
 ```
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 6.2 The shared helpers in `optimize.rs`
 
 - **`validate`** (lines 360-407, debug builds only) takes `frame`. The
@@ -1385,6 +1438,8 @@ pub(super) fn run_one<'db>(
     one exact arena when something went is the least the body allows.
   - `unreached` and `panic_unwinds` become `retain_mut` in place, as above.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 6.3 `optimize/cfg.rs`
 
 - **`simplify_cfg`** (lines 53-59) moves every block out of the arena into a fresh `Vec`
@@ -1441,6 +1496,8 @@ pub(super) fn run_one<'db>(
   - `SwitchTargets::new(kept.iter().copied(), otherwise)` builds the kept terminator, so it
     stays.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 6.4 `optimize/locals.rs`
 
 - `UsedLocals { count: Vec<u32>, always: Vec<bool> }` (lines 27-48) becomes
@@ -1478,6 +1535,8 @@ pub(super) fn run_one<'db>(
   - `la_arena::Arena: IntoIterator<Item = (Idx<T>, T)>` yields in index order.
 - **`remove_storage_markers`**: in place, unchanged (gains the `frame` parameter only).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 6.5 `optimize/dse.rs`
 
 - `struct Bits(Vec<u64>)` (lines 21-42) goes; it uses `framed::Bits<'f>`.
@@ -1498,6 +1557,8 @@ pub(super) fn run_one<'db>(
 - `dead_store_elimination(body)` becomes `dead_store_elimination(body, frame)`, and
   `remove_unused_storage_markers(body)` becomes `(body, frame)`.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 6.6 `optimize/copy_prop.rs`
 
 - `Ssa { assignments: Vec<Assignments>, order: Vec<LocalId>, borrowed: Vec<bool> }` (lines
@@ -1516,6 +1577,8 @@ pub(super) fn run_one<'db>(
   entries in the same slots, so the same `v`.
 - `copy_prop(ctx, body, lifetimes)` becomes `copy_prop(ctx, body, lifetimes, frame)`.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 6.7 `optimize/inst_simplify.rs`
 
 - `single_use_consts(body)` (lines 238-300) becomes `single_use_consts(body, frame)`:
@@ -1524,6 +1587,8 @@ pub(super) fn run_one<'db>(
 - `inst_simplify` (line 72) does `std::mem::take(&mut body.basic_blocks)` and puts it back. That
   allocates nothing; unchanged.
 - `lower_slice_len_calls`: in place; unchanged.
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 6.8 `optimize/check_pointers.rs`, `optimize/check_enums.rs`
 
@@ -1537,6 +1602,8 @@ pub(super) fn run_one<'db>(
   per statement. Unchanged.
 - `check_enums.rs:44,148`: `valid: Vec<u128>` becomes a frame `Vec`. Line 232's `setup` gets
   the same treatment as `check_pointers`' `setup`.
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ## 7. The inliner (`optimize/inline.rs`, `optimize/inline/*`): not compiled yet
 
@@ -1563,6 +1630,8 @@ on the frame from the start:
 
 Budget: `Pass::Inline` joins `budget::OPTIMIZATIONS` when it is registered, and the warm test
 (`warm_optimizations_allocate_nothing`) then covers it.
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ## 8. Monomorphization: `src/mir/monomorphization.rs`
 
@@ -1604,7 +1673,20 @@ Budget: `Pass::Inline` joins `budget::OPTIMIZATIONS` when it is registered, and 
 
 Budget: `monomorphize_allocates_the_kept_body_only` (§10).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+> applied by codegen-mir-store (2026-10-29), uncompiled: the `Allocation` arm keeps the handle when
+> the type fills to itself, and `opaque_of_impl`'s `vars` carries its `// alloc:`. Not applied:
+> `universes` in the frame, because the solver's `BoundVarReplacer::replace_bound_vars` takes
+> `&mut Vec<Option<UniverseIndex>>` on the global allocator (an empty `Vec` allocates nothing
+> until a binder is entered, so this costs nothing for most bodies); with that the frame task
+> around `monomorphized` would hold nothing and is left out. Test:
+> `tests/mir/alloc_budget.rs` `monomorphize_allocates_the_kept_body_only`, through the public
+> `monomorphized` (no `budget` hook): a body with 1 and one with 12 constants allocate the same
+> beyond their copy.
+
 ## 9. Per-call paths outside the pipelines
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 9.1 The interpreter, `src/mir/eval.rs`
 
@@ -1685,6 +1767,8 @@ its caller. Its per-call work is made allocation-free by reuse instead:
 
 Budget: `warm_interpreter_calls_allocate_nothing` (§10).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 9.2 `src/mir/storage.rs`, `frame_storage_conflicts` (codegen calls it per function)
 
 Today it allocates per statement: `before = storage.clone()`, `storage_at.push(..)`,
@@ -1745,6 +1829,8 @@ impl StorageConflicts {
 
 Budget: `storage_conflicts_allocate_their_result_only` (§10).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 9.3 `src/mir/type_name.rs` (codegen calls `rustc_debug_function` per function)
 
 `Spelled.text` starts as `String::new()` and grows by doubling, and every entry function returns
@@ -1792,6 +1878,8 @@ impl Spelled {
 
 Budget: `type_names_allocate_the_name_only` (§10).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ### 9.4 `src/mir/purity.rs`, `operands(rvalue) -> Vec<&Operand>` (codegen's `fncache.rs` calls it per statement)
 
 ```rust
@@ -1825,13 +1913,25 @@ pub fn operands(rvalue: &Rvalue) -> impl Iterator<Item = &Operand> {
   the walk's sets) become frame `Vec`s and sets in one `frame::task` per call.
 - The `Impure` strings are its result (`// alloc: the reason, kept`).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir-store (2026-10-29), uncompiled: `operands` is the iterator as written (codegen-mir's edit, checked); `const_purity` has no temporaries left to move (the terminator's operands are a slice of `args`, no walk sets), and `Impure`'s strings carry `// alloc:`.
+
 ### 9.5 `src/mir/const_check.rs`
 
 `const_check` (line 87) runs once per body for diagnostics. Its walk (lines 298-300: `seen`
 `FxHashSet`, `stack`, `order`) goes into one `frame::task` as `Bits` and frame `Vec`s. The
 `format!` messages are its result (`// alloc: the diagnostic's text, kept`).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+> applied by codegen-mir-store (2026-10-29), uncompiled: the check's block walk runs in one
+> `frame::task(Tag::Mir, ..)`; `reachable` keeps `seen` as `framed::Bits` and `stack`/`order` as
+> frame `Vec`s, and reads a `SwitchInt`'s targets directly (no spilled `SmallVec`). The messages
+> already carry their `// alloc:` lines.
+
 ## 10. The budget tests
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 10.1 Hook: `src/mir/budget.rs` (new, `#[doc(hidden)] pub mod budget` in `mir.rs`)
 
@@ -1839,6 +1939,7 @@ pub fn operands(rvalue: &Rvalue) -> impl Iterator<Item = &Operand> {
 //! What `tests/mir/alloc_budget.rs` measures: the pipelines' steps one at a time, outside
 //! salsa, so a test can count what one step allocates.
 
+use base_db::Db;
 use blaze_mem::{Frame, Tag, frame};
 
 use crate::{
@@ -1904,7 +2005,7 @@ pub struct Passes<'f, 'db>(Ctx<'f, 'db>);
 
 /// Runs `f` with the passes' context for `owner`'s body, in a frame of its own.
 pub fn with_passes<'db, R>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     owner: InferBodyId<'db>,
     f: impl FnOnce(&Passes<'_, 'db>) -> R,
 ) -> R {
@@ -1920,7 +2021,7 @@ impl<'db> Passes<'_, 'db> {
 
 /// What `mir_body_query` builds for `def`, without salsa.
 pub fn lower<'db>(
-    db: &'db dyn HirDatabase,
+    db: &'db Db,
     def: InferBodyId<'db>,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
     super::lower::lower_body(db, def)
@@ -1929,7 +2030,7 @@ pub fn lower<'db>(
 /// What lowering `def` builds that this crate does not own: the `Resolver` `MirLowerCtx::new`
 /// makes, moved to the scopes of `tail` as a path there moves it, the `InferCtxt`, and the
 /// function's signature with its late-bound regions freed, as `lower_body_to_mir` asks for it.
-pub fn lowering_setup<'db>(db: &'db dyn HirDatabase, def: InferBodyId<'db>, tail: hir_def::hir::ExprId) {
+pub fn lowering_setup<'db>(db: &'db Db, def: InferBodyId<'db>, tail: hir_def::hir::ExprId) {
     // As `MirLowerCtx::new` (lower.rs:319-324) makes them.
     let mut resolver = def.resolver(db);
     let guard = resolver.update_to_inner_scope(db, def.expression_store_owner(db), tail);
@@ -1946,18 +2047,18 @@ pub fn lowering_setup<'db>(db: &'db dyn HirDatabase, def: InferBodyId<'db>, tail
 }
 
 /// The `InferCtxt` that `Ctx::new`, `Filler::new` and `MirLowerCtx::new` build for `owner`.
-pub fn new_infer_ctxt<'db>(db: &'db dyn HirDatabase, owner: InferBodyId<'db>) -> InferCtxt<'db> {
+pub fn new_infer_ctxt<'db>(db: &'db Db, owner: InferBodyId<'db>) -> InferCtxt<'db> {
     DbInterner::new_with(db, owner.krate(db)).infer_ctxt().build(TypingMode::non_body_analysis())
 }
 
 /// `run_passes`, `optimize` and `monomorphized`, as their queries call them.
-pub fn run_passes<'db>(db: &'db dyn HirDatabase, built: &MirBody<'db>) -> Result<MirBody<'db>, MirLowerError<'db>> {
+pub fn run_passes<'db>(db: &'db Db, built: &MirBody<'db>) -> Result<MirBody<'db>, MirLowerError<'db>> {
     super::transform::run_passes(db, built)
 }
-pub fn optimize<'db>(db: &'db dyn HirDatabase, body: &MirBody<'db>, options: MirOptions) -> Result<MirBody<'db>, MirLowerError<'db>> {
+pub fn optimize<'db>(db: &'db Db, body: &MirBody<'db>, options: MirOptions) -> Result<MirBody<'db>, MirLowerError<'db>> {
     super::optimize::optimize(db, body, options)
 }
-pub fn monomorphize<'db>(db: &'db dyn HirDatabase, body: &MirBody<'db>, subst: &StoredGenericArgs, env: &StoredParamEnvAndCrate) -> Result<MirBody<'db>, MirLowerError<'db>> {
+pub fn monomorphize<'db>(db: &'db Db, body: &MirBody<'db>, subst: &StoredGenericArgs, env: &StoredParamEnvAndCrate) -> Result<MirBody<'db>, MirLowerError<'db>> {
     super::monomorphization::monomorphized(db, body, subst, env)
 }
 ```
@@ -1970,6 +2071,9 @@ Notes:
   deepest path is at `tail` costs. A `Vec` grows by doubling from the same start, so the count
   depends only on the deepest stack reached, and `tail` is that point in the fixtures below.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+> applied by codegen-mir-store (2026-10-29), uncompiled: `src/mir/budget.rs` and `#[doc(hidden)] pub mod budget;` in `mir.rs`, with `db: &'db Db`; without `lower` and `lowering_setup`, which come with §5's lowering test (step 6), as nothing names `lower::lower_body` yet. `Passes::run` calls `optimize::run_one` (codegen-mir's, §6.1).
+
 ### 10.2 `tests/mir/main.rs`
 
 ```rust
@@ -1980,6 +2084,8 @@ mod alloc_budget;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 ```
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
 ### 10.3 `tests/mir/alloc_budget.rs` (new)
 
@@ -2294,6 +2400,16 @@ add `Assert` blocks and drop ladders, those are kept-body growth (amortized `Vec
 by `shrink_to_fit`, §3.2). The analyses that decide them are held to 0 by
 `warm_runtime_analyses_allocate_nothing`.
 
+> applied by codegen-mir-store (2026-10-29), uncompiled: in `tests/mir/alloc_budget.rs` (beside
+> codegen-mir's three memo-hit tests and its storage and type-name budgets): the two warm
+> optimization tests, the warm drop analyses, `run_passes_`/`optimize_allocates_the_kept_body_only`
+> and `warm_interpreter_calls_allocate_nothing` (which holds once §9.1 is in), as written;
+> `monomorphize_allocates_the_kept_body_only` compares a body of 1 and of 12 constants through
+> the public `monomorphized`. Not yet: `lowering_allocates_the_kept_body_and_its_setup_only`,
+> with §5 (step 6, after D1/D2).
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ## 11. Needed from outside this crate
 
 - **D1, `hir-ty` (`src/mir.rs:118-130` and `next_solver/allocation.rs`): intern a constant from
@@ -2328,6 +2444,8 @@ by `shrink_to_fit`, §3.2). The analyses that decide them are held to 0 by
 - Nothing is needed from `hir-ty-codegen`: `operands` stays source-compatible (§9.4), and
   `StorageConflicts`' API is unchanged (§9.2).
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ## 12. What stays on the global allocator, with its `// alloc:` justification
 
 The hot lint (`tools/v2/hot_lint.py`) reports 901 findings in this crate today. Sections 3-9
@@ -2356,6 +2474,8 @@ Each of these is a setup or error path, or output that is kept. Write the commen
 - `monomorphization::opaque_of_impl` (§8).
 - `set_*_capacity`, the query declarations, `passes_not_ported`: no allocation.
 
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
 ## 13. Order to land in
 
 Each step builds and keeps the output bytes the same:
@@ -2373,3 +2493,30 @@ Each step builds and keeps the output bytes the same:
 5. The interpreter (§9.1), with its test.
 6. Lowering (§5), with its test, once D1 and D2 are in. §5.6 and §5.7 can land in step 1.
 7. The inliner (§7), when it is registered.
+
+> applied by codegen-mir (2026-10-29), step 1, uncompiled (the crate waits on speed-hir-store's
+> Statement-columns change; this lane builds nothing):
+> - §1: `blaze-mem` and `hashbrown` deps, `#![feature(allocator_api)]`, `mod framed;`.
+>   `pub mod budget` waits for step 2: its `Passes` holds the `Ctx<'f, 'db>` of §3.1.
+> - §2: `framed.rs` with `Bits` and the methods `storage.rs` uses. `FrameMap`/`FrameSet`,
+>   `is_empty` and the `Bits` of dse/move_paths arrive with their users in steps 2 and 3,
+>   so nothing is dead code meanwhile.
+> - §9.2 `storage.rs`, as written, plus one thing the spec missed: `successors()` copies a
+>   `SwitchInt`'s targets into a `SmallVec<[_; 2]>`, which spills for a `match` with a third
+>   target (an enum's `otherwise`), so the walk reads `all_targets()` itself (`next_blocks`).
+>   Without that the budget of 2 fails on `work`.
+> - §9.3 `type_name.rs` (`Lent<String>`, `into_name`), §9.4 `operands` as an iterator
+>   (`hir-ty-codegen/fncache.rs:1619`'s `.into_iter()` is now clippy's `useless_conversion`;
+>   codegen's to drop), §5.6, §5.7.
+> - §10.2, and §10.3's `storage_conflicts_allocate_their_result_only` and
+>   `type_names_allocate_the_name_only` in `tests/mir/alloc_budget.rs`, with three memo-hit
+>   tests (`mir_body`, `optimized_mir_body`, `const_eval`: 0 allocations).
+> - Next: step 2 (§6 with `Ctx<'f>`), then 3, 4, 5. Step 6 waits on D1 and D2 (hir-ty).
+> - §10.1's `budget.rs` is written against `&'db dyn HirDatabase`; the database is concrete
+>   now (`base_db::Db`, common.md), so it lands taking `db: &'db Db`.
+
+> forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> mem-codegen (2026-10-29 20:53): every `&'db dyn HirDatabase` in this request's code is now
+> `&'db Db` (`base_db::Db`, as the tree has it: `optimize.rs:36`), so no request brings back a
+> `dyn` database; `budget.rs` gains `use base_db::Db;`. Told codegen-mir.

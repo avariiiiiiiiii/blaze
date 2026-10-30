@@ -17,8 +17,8 @@
 //! table pointers, which change when a table grows; writers lock a separate, padded array, so a
 //! write never dirties a line a reader loads.
 //!
-//! Chunks grow to 2 MiB; on Linux those are aligned to 2 MiB and backed by huge pages
-//! (docs/v2/plan/design/hardware.md, "memory").
+//! Chunks grow to 2 MiB, claimed from [`crate::space`]'s region, which is backed by huge pages
+//! where the kernel offers them (docs/v2/plan/design/hardware.md, "memory").
 //!
 //! Cost: a value takes one 8-byte pointer and one tag byte in its group's line (9.1 bytes a
 //! slot) and an 8-byte hash in a column only growth reads, at a load of a quarter to a half: 34
@@ -27,13 +27,14 @@
 //! load from the same line and the caller's `Eq`.
 
 use std::{
-    alloc::{self, Layout},
+    alloc::Layout,
     ptr::{self, NonNull},
     sync::OnceLock,
 };
 
 use self::lock::{InsertLock, Locked};
 use crate::{
+    space,
     swiss::{self, Ctrl},
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
@@ -93,35 +94,27 @@ struct Group {
 #[cfg(not(blaze_check))]
 const _: () = assert!(size_of::<Group>() == 64);
 
+/// Region memory in a normal build; a model build keeps boxes, as the model checker's atomics
+/// are not plain words.
+#[cfg(not(blaze_check))]
+type Cells<T> = &'static [T];
+#[cfg(blaze_check)]
+type Cells<T> = Box<[T]>;
+
 struct Table {
-    groups: Box<[Group]>,
+    groups: Cells<Group>,
     /// The hash of `groups[i / GROUP].values[i % GROUP]`, written with it and read only by
     /// the writer growing the table, so growing never rehashes a value.
-    hashes: Box<[AtomicU64]>,
-}
-
-/// A zeroed boxed slice of `len` `T`s: the allocator's zeroed pages, where building the slice
-/// element by element would write every byte of a table that is mostly never touched.
-///
-/// # Safety
-///
-/// All zero bytes must be a valid `T`.
-#[cfg(not(blaze_check))]
-unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
-    // SAFETY: The caller's precondition: zero bytes are a `T`, so every element is initialized.
-    unsafe { Box::<[T]>::new_zeroed_slice(len).assume_init() }
+    hashes: Cells<AtomicU64>,
 }
 
 impl Table {
     #[cfg(not(blaze_check))]
     fn new(groups: usize) -> Table {
         debug_assert!(groups.is_power_of_two());
-        // SAFETY: All-zero bytes are a `Group`: a zero control word (every slot empty) and null
-        // pointers.
-        let slots: Box<[Group]> = unsafe { zeroed(groups) };
-        // SAFETY: All-zero bytes are an `AtomicU64` of 0.
-        let hashes: Box<[AtomicU64]> = unsafe { zeroed(groups * GROUP) };
-        Table { groups: slots, hashes }
+        // SAFETY: All-zero bytes are a `Group` (a zero control word, every slot empty, and null
+        // pointers) and an `AtomicU64` of 0.
+        unsafe { Table { groups: space::zeroed(groups), hashes: space::zeroed(groups * GROUP) } }
     }
 
     /// The checker's atomics are not plain words, so a model build makes each one.
@@ -215,7 +208,7 @@ impl Store {
         matches: impl FnMut(NonNull<u8>) -> bool,
     ) -> Option<NonNull<u8>> {
         let table = self.tables[self.shard(hash)].load(Ordering::Acquire);
-        // SAFETY: A published table is leaked and never freed or written but to fill an empty
+        // SAFETY: A published table is kept for good, never freed or written but to fill an empty
         // slot (see `Group`).
         unsafe { table.as_ref() }?.find(hash, matches)
     }
@@ -271,7 +264,7 @@ impl Vacant<'_> {
     /// The table to insert one more value into, at most half full after it.
     fn table_for_one_more(&mut self) -> &'static Table {
         let current = self.table.load(Ordering::Acquire);
-        // SAFETY: As in `Store::find`; tables are leaked, so `'static`.
+        // SAFETY: As in `Store::find`; tables are never freed, so `'static`.
         let current: Option<&'static Table> = unsafe { current.as_ref() };
         let capacity = current.map_or(0, Table::capacity);
         if let Some(table) = current
@@ -290,8 +283,13 @@ impl Vacant<'_> {
                 }
             }
         }
-        // alloc: the grown table, once a doubling; leaked as readers may hold the last
+        // A model build's table holds boxes, so it is leaked as one.
+        #[cfg(blaze_check)]
+        // alloc: the model checker's build only, once a doubling
         let grown: &'static Table = Box::leak(Box::new(grown));
+        // Kept for good, as readers may hold the last.
+        #[cfg(not(blaze_check))]
+        let grown: &'static Table = space::place(grown);
         // Release: a reader that loads the new table sees its slots and, through the lock's
         // order, the values they point to.
         self.table.store(ptr::from_ref(grown).cast_mut(), Ordering::Release);
@@ -358,7 +356,7 @@ struct Bump {
     next: usize,
 }
 
-// SAFETY: `cursor` points into chunks owned by no thread (leaked), and is only used by the
+// SAFETY: `cursor` points into chunks owned by no thread (claimed, never freed), and is only used by the
 // holder of the shard's lock.
 unsafe impl Send for Bump {}
 
@@ -373,14 +371,15 @@ impl Bump {
         let size = layout.size().max(1);
         let align = layout.align();
         if align > CHUNK_ALIGN || size > LAST_CHUNK / 4 {
-            return own(Layout::from_size_align(size, align).expect("a value's layout"));
+            return space::claim(Layout::from_size_align(size, align).expect("a value's layout"));
         }
         let addr = self.cursor.addr();
         let mut pad = addr.next_multiple_of(align) - addr;
         if pad + size > self.left {
             let bytes = self.next.max(size.next_multiple_of(CHUNK_ALIGN));
             self.next = (self.next * 2).min(LAST_CHUNK);
-            self.cursor = chunk(bytes).as_ptr();
+            self.cursor =
+                space::claim(Layout::from_size_align(bytes, CHUNK_ALIGN).expect("a chunk's layout")).as_ptr();
             self.left = bytes;
             pad = 0;
         }
@@ -390,37 +389,9 @@ impl Bump {
         // SAFETY: As for `at`: `at + size` is at most one past the chunk's last byte.
         self.cursor = unsafe { at.add(size) };
         self.left -= pad + size;
-        // SAFETY: `at` is inside a chunk from `chunk`, an allocation `own` never returns null.
+        // SAFETY: `at` is inside a chunk from `space::claim`, which is never null.
         unsafe { NonNull::new_unchecked(at) }
     }
-}
-
-/// A chunk of `bytes`, never freed. A chunk of `LAST_CHUNK` bytes is one huge page.
-fn chunk(bytes: usize) -> NonNull<u8> {
-    if bytes != LAST_CHUNK {
-        return own(Layout::from_size_align(bytes, CHUNK_ALIGN).expect("a chunk's layout"));
-    }
-    let at = own(Layout::from_size_align(LAST_CHUNK, LAST_CHUNK).expect("a chunk's layout"));
-    #[cfg(target_os = "linux")]
-    {
-        // SAFETY: `at..at + LAST_CHUNK` is one allocation of ours, aligned to the huge page
-        // size; `MADV_HUGEPAGE` changes only how it is backed, not its contents.
-        let advised = unsafe { libc::madvise(at.as_ptr().cast(), LAST_CHUNK, libc::MADV_HUGEPAGE) };
-        assert!(
-            advised == 0,
-            "intern: madvise(MADV_HUGEPAGE) of a 2 MiB interner chunk failed: {} \
-             (the kernel needs transparent huge pages in `madvise` or `always` mode)",
-            std::io::Error::last_os_error(),
-        );
-    }
-    at
-}
-
-/// An allocation of its own, never freed. `layout` has a non-zero size.
-fn own(layout: Layout) -> NonNull<u8> {
-    // SAFETY: The size is not zero.
-    let at = unsafe { alloc::alloc(layout) };
-    NonNull::new(at).unwrap_or_else(|| alloc::handle_alloc_error(layout))
 }
 
 /// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release

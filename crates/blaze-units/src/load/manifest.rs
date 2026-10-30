@@ -52,7 +52,7 @@ impl Query for ManifestQuery {
     type Value = Cbor<ManifestRead>;
 
     fn input(key: &ManifestKey) -> ContentId {
-        key_input("blaze v2 cargo manifest key 1", key)
+        key_input("blaze v2 cargo manifest key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &ManifestKey) -> Result<Cbor<ManifestRead>, Cancelled> {
@@ -134,7 +134,7 @@ impl Query for WorkspaceQuery {
     type Value = Cbor<Result<WorkspaceRead, LoadError>>;
 
     fn input(key: &WorkspaceKey) -> ContentId {
-        key_input("blaze v2 cargo workspace key 1", key)
+        key_input("blaze v2 cargo workspace key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &WorkspaceKey) -> Result<Cbor<Result<WorkspaceRead, LoadError>>, Cancelled> {

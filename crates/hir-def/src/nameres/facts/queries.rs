@@ -82,7 +82,9 @@ pub(crate) struct RoundKey {
     pub(crate) round: u32,
 }
 
-/// A module at a round: `fact_handle`, `module_round`, `macro_step`, `unresolved_named`.
+/// A module at a round: `fact_handle`, `module_round`, `macro_step`, `unresolved_named`. Only
+/// a round that can change the module makes one: readers name an idle module's facts by the
+/// round they last changed at (`fact_key`).
 #[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
 pub(crate) struct FactKey {
     pub(crate) module: ModuleId,
@@ -176,18 +178,112 @@ pub(crate) struct ModuleRow {
     pub(crate) decl: Option<DeclKey>,
 }
 
+/// A round's module column that names no round (`RoundModules::last_step`, `ran`, `since`).
+pub(crate) const NO_ROUND: u32 = u32::MAX;
+
 /// Every module of a round, in the round's module order: round 0's DFS of `module_decls`,
-/// then each later round's new modules in the order their steps declared them.
+/// then each later round's new modules in the order their steps declared them. With them, what
+/// the round can change of each, known before its import fixed point (`nameres-core.md` §9):
+/// whose macro step runs and who gains ops (`active`), and where the rest stand.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RoundModules {
     pub(crate) order: Box<[ModuleId]>,
     pub(crate) rows: Box<[ModuleRow]>,
     pub(crate) index: FxHashMap<ModuleId, u32>,
+    /// Per module: [`RoundModules::STEP`], [`RoundModules::GAINS`], [`RoundModules::PENDING`].
+    pub(crate) flags: Box<[u8]>,
+    /// The modules with `STEP` or `GAINS`, ascending: those with a directive this round or ops
+    /// to replay. Every other module's component runs only if what it read changes this round
+    /// (`round_active`).
+    pub(crate) active: Box<[u32]>,
+    /// Per module, the round of its last macro step before this one: the step whose directives
+    /// and tables it carries ([`NO_ROUND`]: it has not stepped).
+    pub(crate) last_step: Box<[u32]>,
+    /// Per module, the last round before this one at which its component ran: where its
+    /// `scc_state` is ([`NO_ROUND`]: declared at this round).
+    pub(crate) ran: Box<[u32]>,
+    /// Per module, the last round before this one at which its facts changed: `fact_handle` of
+    /// that round names them until its component runs again ([`NO_ROUND`]: declared at this
+    /// round).
+    pub(crate) since: Box<[u32]>,
 }
 
 impl RoundModules {
+    /// Its macro step runs this round: it has a directive and the round resolves, or the round
+    /// reseeds it.
+    pub(crate) const STEP: u8 = 1;
+    /// `module_round` may hand it ops this round: the round's first module ops (round 0), its own
+    /// step of the round before made ops in it, it was declared by one, or it is the crate root
+    /// and another module's step made ops in it.
+    pub(crate) const GAINS: u8 = 2;
+    /// It has macro directives left as the round starts.
+    pub(crate) const PENDING: u8 = 4;
+
     pub(crate) fn row(&self, module: ModuleId) -> Option<&ModuleRow> {
         self.index.get(&module).map(|&at| &self.rows[at as usize])
+    }
+
+    pub(crate) fn at(&self, module: ModuleId) -> Option<u32> {
+        self.index.get(&module).copied()
+    }
+
+    pub(crate) fn steps(&self, at: u32) -> bool {
+        self.flags[at as usize] & Self::STEP != 0
+    }
+
+    pub(crate) fn gains(&self, at: u32) -> bool {
+        self.flags[at as usize] & Self::GAINS != 0
+    }
+
+    pub(crate) fn has_pending(&self, at: u32) -> bool {
+        self.flags[at as usize] & Self::PENDING != 0
+    }
+
+    /// The modules whose macro step runs, ascending.
+    pub(crate) fn stepping(&self) -> impl Iterator<Item = u32> + '_ {
+        self.active.iter().copied().filter(|&at| self.steps(at))
+    }
+
+    pub(crate) fn last_step(&self, at: u32) -> Option<u32> {
+        some_round(self.last_step[at as usize])
+    }
+
+    pub(crate) fn ran(&self, at: u32) -> Option<u32> {
+        some_round(self.ran[at as usize])
+    }
+
+    pub(crate) fn since(&self, at: u32) -> Option<u32> {
+        some_round(self.since[at as usize])
+    }
+}
+
+fn some_round(round: u32) -> Option<u32> {
+    (round != NO_ROUND).then_some(round)
+}
+
+/// Which components of a round's partition run at the round (`nameres-core.md` §9): every one
+/// at round 0 and at the final round; else those with a member that gains ops, those whose
+/// members changed since they last ran, and those that read a module of one that runs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RoundActive {
+    /// One bit per component.
+    pub(crate) bits: Box<[u64]>,
+}
+
+impl RoundActive {
+    pub(crate) fn all(components: u32) -> RoundActive {
+        // alloc: the query's value, one word per 64 components
+        let mut bits = vec![u64::MAX; (components as usize).div_ceil(64)];
+        if components % 64 != 0
+            && let Some(last) = bits.last_mut()
+        {
+            *last = (1 << (components % 64)) - 1;
+        }
+        RoundActive { bits: bits.into_boxed_slice() }
+    }
+
+    pub(crate) fn runs(&self, component: u32) -> bool {
+        self.bits[(component / 64) as usize] & (1 << (component % 64)) != 0
     }
 }
 
@@ -205,9 +301,10 @@ pub(crate) struct SccState {
     /// The `#[prelude_import]` this component resolved, if it holds it.
     pub(crate) prelude: Option<(ModuleId, Option<UseId>)>,
     /// Every module of another component the state read (a path's `PathRead::Slot`, a glob's
-    /// source), with the `ModuleScope` it read, ascending by module: the next round keeps this
-    /// state when its members gain no op and each of these is still the round's
-    /// `fact_handle`.
+    /// source), with the `ModuleScope` it read, ascending by module: the next round the
+    /// component runs at keeps this state when its members gain no op and each of these is
+    /// still the module's `fact_handle` (`fact_key`); a round at which none of these modules'
+    /// components runs and no member gains an op does not run the component (`round_active`).
     pub(crate) upstream: Box<[(ModuleId, salsa::Id)]>,
     /// At a `RoundKind::Final` round, every import of the members in import order with what it
     /// resolved to (`PartialResolvedImport::namespaces`; `None` while still unresolved), for
@@ -294,19 +391,35 @@ pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> Box<[(Name, MacroId)]> {
         .legacy
         .iter()
         .filter_map(|(name, macs)| Some((*name, *macs.last()?)))
+        // alloc: the query's value, once per execution
         .collect()
 }
 
 /// The ops the module and its round-0 descendants make in the crate root (`#[macro_export]`),
-/// in DFS order. Backdates unless they change.
+/// in DFS order. Backdates unless they change. Asked of the root's children (the firewall
+/// between the root's collection and their subtrees) and of each descendant that has children
+/// of its own; a leaf's ops are read off its log in place, and only when its log writes the
+/// root at all (`OpLog::writes_elsewhere`).
 #[salsa::tracked(returns(ref))]
 pub(crate) fn subtree_macro_exports(db: &Db, key: DeclKey) -> Box<[DeclOp]> {
     let root = crate_root(db, key.decl(db).krate);
+    // alloc: the query's value, once per execution
     let mut out = Vec::new();
-    for op in module_decls(db, key).ops.iter() {
+    let ops = &module_decls(db, key).ops;
+    if !ops.writes_elsewhere() && !ops.has_children() {
+        return Box::default();
+    }
+    // In log order: a later `#[macro_export]` of a name replaces an earlier one in the root.
+    for op in ops.iter() {
         match op {
-            DeclOp::Splice { key, .. } => {
-                out.extend(subtree_macro_exports(db, *key).iter().filter_map(|it| it.clone_root_op(root)));
+            DeclOp::Splice { key: child, .. } => {
+                let child_ops = &module_decls(db, *child).ops;
+                if child_ops.has_children() {
+                    let exports = subtree_macro_exports(db, *child).iter();
+                    out.extend(exports.filter_map(|it| it.clone_root_op(root)));
+                } else if child_ops.writes_elsewhere() {
+                    out.extend(child_ops.iter().filter_map(|it| it.clone_root_op(root)));
+                }
             }
             op => out.extend(op.clone_root_op(root)),
         }
@@ -314,8 +427,8 @@ pub(crate) fn subtree_macro_exports(db: &Db, key: DeclKey) -> Box<[DeclOp]> {
     out.into_boxed_slice()
 }
 
-/// The key of `child`, a round-0 child of the module of `parent`.
-#[salsa::tracked]
+/// The key of `child`, a round-0 child of the module of `parent`: a look-up in the children of
+/// `parent`'s `module_decls`, no query of its own.
 pub(crate) fn child_key(db: &Db, parent: DeclKey, child: ModuleId) -> Option<DeclKey> {
     module_decls(db, parent).children.iter().copied().find(|it| it.decl(db).module == child)
 }
@@ -333,6 +446,44 @@ pub(crate) fn decl_handle(db: &Db, key: DeclKey) -> salsa::Id {
 #[salsa::tracked(returns(ref))]
 pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
     driver::round_modules(db, round)
+}
+
+/// Which components of the round's partition run at the round.
+#[salsa::tracked(returns(ref))]
+pub(crate) fn round_active(db: &Db, round: RoundKey) -> RoundActive {
+    unit::round_active(db, round)
+}
+
+/// Whether the component of the module at `at` of the round runs at the round.
+pub(crate) fn runs(db: &Db, round: RoundKey, at: u32) -> bool {
+    round_active(db, round).runs(partition(db, round).of(at))
+}
+
+/// The key that names the facts of the module at `at` of the round: the round's own while its
+/// component runs, else that of the round its facts last changed at, whose memo made them.
+pub(crate) fn fact_key(db: &Db, round: RoundKey, at: u32) -> FactKey {
+    let (krate, r) = (round.krate(db), round.round(db));
+    let modules = round_modules(db, round);
+    let module = modules.order[at as usize];
+    let t = match runs(db, round, at) {
+        true => r,
+        false => modules.since(at).unwrap_or_else(|| {
+            panic!("nameres facts: {module:?}, new at round {r}, is in a component that does not run")
+        }),
+    };
+    FactKey::new(db, module, krate, t)
+}
+
+/// The last round up to `round` at which the component of the module at `at` ran: where its
+/// state is.
+pub(crate) fn ran_by(db: &Db, round: RoundKey, at: u32) -> u32 {
+    let r = round.round(db);
+    if runs(db, round, at) {
+        return r;
+    }
+    round_modules(db, round).ran(at).unwrap_or_else(|| {
+        panic!("nameres facts: module {at} of round {r} is new and in a component that does not run")
+    })
 }
 
 /// What the module gains at a round `>= 1`.

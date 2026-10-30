@@ -31,8 +31,8 @@ and hands the daemon's builder an `Opened`. The builder opens the same root agai
 with a `BuildConfig` (`Database::open_with(view, &config.encode())`), the only thing
 `Cx::config` reads:
 
-- `invocation`: the cargo command line (`blaze_api::Cargo`, schema 5: `v2/requests/cargo.md`
-  request 3), or one the daemon makes of an agent's `Targets` (`-p`, `--profile`, `--target`,
+- `invocation`: the cargo command line (`blaze_api::Cargo`, added in schema 5 by
+  `v2/requests/cargo.md` request 3), or one the daemon makes of an agent's `Targets` (`-p`, `--profile`, `--target`,
   `-F`, `--all-features`, `--no-default-features`, cwd at the root, an empty environment but
   `PATH` and `HOME` of the daemon).
 - `mounts`: where every directory cargo names is: the view at the client's checkout path, each
@@ -203,3 +203,23 @@ before costs two Fx lookups by `&str` and allocates nothing. Diagnostics are ded
 64-bit Fx hash of their text, as cargo's `DiagDedupe` does, and units are indexed by package.
 `--reached` groups its results in one Fx pass, and libtest's text is built in one preallocated
 `String`.
+
+## 8. State of the art, by part
+
+What each part matches or beats (bounds and arithmetic: [speed-of-light.md](speed-of-light.md);
+the rules: [principles.md](../../goals/principles.md), "Fast code, line by line"):
+
+| Part | Measured against | How it matches or beats it |
+|---|---|---|
+| Workspace load | Buck2's DICE, rust-analyzer's salsa project load, rustc's red-green graph | an edge per file read, early cutoff on canonical TOML and on directory listings, so a source edit reruns no load query |
+| Mounts and file reads | a kernel's mount hash | binary search per ancestor over sorted columns read in place; a hit allocates nothing |
+| Resolve | cargo's resolver guided by the lock | the lock taken as the answer, the resolve rerun only when a manifest's dependencies change |
+| Standard library | `-Zbuild-std` | the same pipeline, keyed by none of the view: one graph per target and profile in the shared base layer |
+| Daemon start | Bazel's and buck2's servers | the database image mapped in place; nothing loaded again on start |
+| Heads | watchman's cookies | one cookie per request through the watcher; nothing walked |
+| Front end per job | rust-analyzer's incremental database | one `Sync` database by reference, kept across jobs, new views applied as tree diffs; writes batched per wave |
+| Fetch | cargo's HTTP/2 multiplexed downloads | one connection per registry, checked and unpacked in memory, mounted as content-addressed roots |
+| CLI | buck2's and Bazel's thin clients | one socket round trip, one buffer per response, zero allocation per response once warm |
+
+Each child applies the rules to its code as written, not only to new code; the gaps left are in
+speed-of-light.md, each with its owner.

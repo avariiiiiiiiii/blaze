@@ -8,8 +8,9 @@
 //!   there ([`fact`]: its layout, its fields' facts, a pointee's size and alignment), each
 //!   constant's value, each callee by its own key ([`walk`]), each drop by its glue's key
 //!   ([`drop`]), each intrinsic by what rustc's definition of it reads ([`intrinsics`]), and
-//!   the full identity of everything else that tells types apart ([`identity`]): `TypeId`,
-//!   `type_name`, vtables, `dyn` calls, closures. A place of the generic body that names no
+//!   the full identity of everything else that tells types apart ([`identity`], the code
+//!   generator's spelling of a type too): `TypeId`, `type_name`, vtables, `dyn` calls, closures,
+//!   coroutines by their compiled code ([`code`]). A place of the generic body that names no
 //!   parameter is the same in every instance and is not read.
 //! - Equal keys mean equal code: the code generator puts the key in place of the arguments in
 //!   the instance's code identity, so instances of one body with equal keys are one instance.
@@ -24,15 +25,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod code;
 mod drop;
 mod fact;
-mod identity;
+pub mod identity;
 mod intrinsics;
 mod layout;
 mod walk;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::fmt;
 
@@ -46,16 +52,13 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
 };
 
+pub use fact::is_plain_data;
 pub use intrinsics::{Class, classify};
 
 /// The domain of a share key.
 pub const SHARE_DOMAIN: &str = "blaze v2 share key 1";
 /// The domain of a type's fact.
 pub const FACT_DOMAIN: &str = "blaze v2 share fact 1";
-/// The domain of a type's, constant's or arguments' full identity.
-pub const IDENTITY_DOMAIN: &str = "blaze v2 share identity 1";
-/// The domain of an ADT's identity: its key, interface, layout and the drop impls it reaches.
-pub const ADT_DOMAIN: &str = "blaze v2 share adt 1";
 /// The domain of the records of one walk of a body.
 pub const WALK_DOMAIN: &str = "blaze v2 share walk 1";
 /// The domain of what a call, or an argument list, is keyed by.
@@ -186,7 +189,7 @@ pub enum Unshared {
     ConstEval(String),
     /// An item has no hash in [`blaze_items`].
     Unhashable(String),
-    /// The monomorphized body is not the generic body's shape.
+    /// The body has a place whose type the key does not read.
     Shape(&'static str),
 }
 
@@ -203,7 +206,7 @@ impl fmt::Display for Unshared {
             Unshared::NoContent(what) => write!(f, "no content: {what}"),
             Unshared::ConstEval(what) => write!(f, "a constant: {what}"),
             Unshared::Unhashable(what) => f.write_str(what),
-            Unshared::Shape(what) => write!(f, "its monomorphized body differs from the generic one in {what}"),
+            Unshared::Shape(what) => write!(f, "its body has {what}, whose type the key does not read"),
         }
     }
 }
@@ -216,5 +219,5 @@ pub fn share_key<'db>(
     env: &StoredParamEnvAndCrate,
     options: BodyOptions,
 ) -> &'db Result<ShareKey, Unshared> {
-    hir_ty::attach_db(db, || walk::share(db, instance.clone(), env.clone(), options))
+    hir_ty::attach_db(db, || walk::share(db, instance.clone(), env.clone(), options)) // clone: the query's keys, reference counts
 }

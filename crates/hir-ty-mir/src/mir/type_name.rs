@@ -37,7 +37,7 @@ use crate::{
 pub fn rustc_type_name<'db>(db: &'db Db, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::TypeName);
     write_ty(db, &mut out, ty)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// What the symbol of `func` with `args` demangles to, which is how a backtrace names it.
@@ -48,7 +48,7 @@ pub fn rustc_function_name<'db>(
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
     write_function(db, &mut out, func, args)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// The same of the closure or `async` block written at `expr` of `func`.
@@ -60,7 +60,7 @@ pub fn rustc_closure_name<'db>(
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
     write_closure(db, &mut out, func, args, expr, Named::Code)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// What rustc writes after the path of the function a closure is written in: `::{closure#0}`,
@@ -73,7 +73,7 @@ pub fn rustc_closure_suffix(
     let around = closures_around(db, owner, expr)?;
     let mut out = Spelled::new(Spelling::Symbol);
     out.closures(&around);
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// The places rustc numbers a closure by, `n` of each `{closure#n}` from the one outermost in
@@ -84,6 +84,7 @@ pub fn rustc_closure_places(
     expr: ExprId,
 ) -> Option<Vec<usize>> {
     let around = closures_around(db, owner, expr)?;
+    // alloc: the places, the caller's to keep
     (!around.is_empty()).then(|| around.iter().map(|&(place, _)| place).collect())
 }
 
@@ -96,14 +97,14 @@ pub fn rustc_debug_closure<'db>(
 ) -> Option<String> {
     let mut out = Spelled::new(Spelling::Debug);
     write_closure(db, &mut out, func, args, expr, Named::Code)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// The same of a type, as it stands among the generic arguments of a symbol.
 pub fn rustc_symbol_type<'db>(db: &'db Db, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::Symbol);
     write_ty(db, &mut out, ty)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// What rustc calls a type where it tells a debugger of it: every generic argument that is
@@ -112,7 +113,7 @@ pub fn rustc_symbol_type<'db>(db: &'db Db, ty: Ty<'db>) -> Option<String> {
 pub fn rustc_debug_name<'db>(db: &'db Db, ty: Ty<'db>) -> Option<String> {
     let mut out = Spelled::new(Spelling::Debug);
     write_ty(db, &mut out, ty)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// The path rustc tells a debugger a function by: the modules it is written in, then the
@@ -128,7 +129,7 @@ pub fn rustc_debug_function<'db>(
     write_container(db, &mut out, func, args)?;
     write!(out, "::{}", FunctionSignature::of(db, func).name.as_str()).ok()?;
     write_args(db, &mut out, args)?;
-    Some(out.text)
+    Some(out.into_name())
 }
 
 /// What a function is written in, as a debugger is told of it.
@@ -226,16 +227,21 @@ enum Spelling {
     Debug,
 }
 
-/// A name being written.
+/// A name being written, into one of the thread's scratch strings.
 struct Spelled {
-    text: String,
+    text: blaze_mem::scratch::Lent<String>,
     spelling: Spelling,
 }
 
 impl Spelled {
     fn new(spelling: Spelling) -> Self {
-        // alloc: the text `type_name` returns is the result
-        Self { text: String::new(), spelling }
+        Self { text: blaze_mem::scratch::lend_string(), spelling }
+    }
+
+    /// The name written, allocated once at its length.
+    fn into_name(self) -> String {
+        // alloc: the name is the result
+        String::from(self.text.as_str())
     }
 
     fn push_str(&mut self, text: &str) {
@@ -510,20 +516,23 @@ fn write_dyn<'db>(
     out: &mut Spelled,
     bounds: BoundExistentialPredicates<'db>,
 ) -> Option<()> {
+    // alloc: a trait object's parts, sorted as rustc sorts them; only on `dyn` types
     let mut parts = Vec::new();
     if let Some(principal) = bounds.principal() {
         let mut part = Spelled::new(out.spelling);
         let projections: Vec<_> =
+            // alloc: a trait object's projections; only on `dyn` types
             bounds.projection_bounds().into_iter().map(|it| it.skip_binder()).collect();
         write_principal(db, &mut part, principal.skip_binder(), &projections)?;
-        parts.push(part.text);
+        parts.push(part.into_name());
     }
+    // alloc: a trait object's parts, sorted as rustc sorts them; only on `dyn` types
     let mut autos = Vec::new();
     for auto in bounds.auto_traits() {
         let mut part = Spelled::new(out.spelling);
         write_module(db, &mut part, auto.0.module(db))?;
         write!(part, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
-        autos.push(part.text);
+        autos.push(part.into_name());
     }
     autos.sort();
     parts.extend(autos);
@@ -722,12 +731,13 @@ fn write_dyn_debug<'db>(
     out: &mut Spelled,
     bounds: crate::next_solver::BoundExistentialPredicates<'db>,
 ) -> Option<()> {
+    // alloc: a trait object's parts, sorted as rustc sorts them; only on `dyn` types
     let mut autos = Vec::new();
     for auto in bounds.auto_traits() {
         let mut name = Spelled::new(Spelling::Debug);
         write_module(db, &mut name, auto.0.module(db))?;
         write!(name, "::{}", TraitSignature::of(db, auto.0).name.as_str()).ok()?;
-        autos.push(name.text);
+        autos.push(name.into_name());
     }
     autos.sort_unstable();
     let principal = bounds.principal();
@@ -752,8 +762,8 @@ fn write_dyn_debug<'db>(
             write_ty(db, &mut part, bound.term.as_type()?)?;
             inner = Some(match inner {
                 // alloc: the text `type_name` returns is the result
-                Some(inner) => format!("{inner}, {}", part.text),
-                None => part.text,
+                Some(inner) => format!("{inner}, {}", part.text.as_str()),
+                None => part.into_name(),
             });
         }
         if let Some(inner) = inner {
@@ -908,26 +918,32 @@ fn closures_around(
     db: &Db,
     owner: DefWithBodyId,
     target: ExprId,
-) -> Option<Vec<(usize, ClosureKind)>> {
-    closures_around_query(db, owner, target).clone()
+) -> Option<&[(usize, ClosureKind)]> {
+    closures_around_query(db, owner, target).as_deref()
 }
 
-/// [`closures_around`], kept: it reads the source map, which changes with every edit above
-/// the body, and what it finds does not.
+/// [`closures_around`], kept: it may read the source map, which changes with every edit above
+/// the body, and what it finds does not. The map orders closures by the macro calls they are
+/// in, so a body that called no macro is ordered without it, as every closure of it is in
+/// the same file.
 #[salsa::tracked(returns(ref))]
 fn closures_around_query(
     db: &Db,
     owner: DefWithBodyId,
     target: ExprId,
 ) -> Option<Vec<(usize, ClosureKind)>> {
-    let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
+    let body = Body::of(db, owner);
+    // alloc: once per closure, in the query that keeps its result
     let mut around = Vec::new();
     if !find_closures(body, body.root_expr(), target, &mut around) {
         return None;
     }
-    let order = |closure: ExprId| MacroCalls::around(db, source_map, closure);
+    let expanded = !body.macro_calls().is_empty();
+    let order =
+        |closure: ExprId| MacroCalls::around(db, Body::unmoved_source_map(db, owner), closure);
     let mut inside = None;
     let places = around.iter().map(|&closure| {
+        // alloc: once per closure, in the query that keeps its result
         let mut beside = Vec::new();
         match inside.replace(closure) {
             Some(it) => {
@@ -936,10 +952,13 @@ fn closures_around_query(
             None => closures_in(body, body.root_expr(), &mut beside),
         }
         // Stable, so those of one expansion stay in the order they are written in.
-        beside.sort_by_cached_key(|&it| order(it));
+        if expanded && beside.len() > 1 {
+            beside.sort_by_cached_key(|&it| order(it));
+        }
         let Expr::Closure { closure_kind, .. } = body.expr(closure) else { return None };
         Some((beside.iter().position(|&it| it == closure)?, closure_kind))
     });
+    // alloc: the result the query keeps
     places.collect()
 }
 
@@ -1006,6 +1025,7 @@ struct MacroCalls(Vec<u32>);
 
 impl MacroCalls {
     fn around(db: &Db, source_map: &BodySourceMap, expr: ExprId) -> Self {
+        // alloc: a sort key, only in a body that called a macro, once per query run
         let mut calls = Vec::new();
         let mut file = source_map.expr_syntax(expr).ok().map(|it| it.file_id);
         while let Some(call) = file.and_then(|it| it.macro_file()) {

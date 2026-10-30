@@ -230,6 +230,28 @@ pub enum MatchError {
     ComplexityLimit { at: ExprOrPatId },
     /// "mix of deref patterns and normal constructors".
     MixedDerefPatterns { deref_pat: PatId, normal_pat: PatId },
+    /// `const_to_pat` refused the constant the path pattern `pat` names. A value it can't
+    /// make a valtree of gets one error; else each part of the value `valtree_to_pat` refuses
+    /// gets one, outermost first.
+    ConstPattern { pat: PatId, error: ConstPatternError },
+}
+
+/// What `const_to_pat` refuses in a constant used as a pattern.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConstPatternError {
+    /// `UnionPattern`: "cannot use unions in constant patterns".
+    Union,
+    /// `PointerPattern`: a function pointer, or a raw pointer into an allocation.
+    Pointer,
+    /// `InvalidPattern`: "{prefix} `{ty}` cannot be used in patterns", at the part of the
+    /// value of this type.
+    Invalid(StoredTy),
+    /// `TypeNotStructural`: the value holds this ADT, which doesn't derive `PartialEq`.
+    NotStructural(StoredTy),
+    /// `TypeNotPartialEq`: the constant's type doesn't implement `PartialEq`.
+    NotPartialEq(StoredTy),
+    /// `NaNPattern`: "cannot use NaN in patterns".
+    NaN,
 }
 
 /// Match checking of `def`, once per body: the closures and inline constants written in it are

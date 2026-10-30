@@ -16,6 +16,7 @@
 use std::borrow::Cow;
 
 use blaze_codegen::Arch;
+use blaze_format::leb::LebError;
 use blaze_ids::radix;
 use smallvec::SmallVec;
 
@@ -842,38 +843,11 @@ impl<'a> Reader<'a> {
     }
 
     fn uleb(&mut self) -> Result<u64, &'static str> {
-        let mut value = 0u64;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            if shift == 63 && byte > 1 {
-                return Err("an unsigned LEB128 past 64 bits");
-            }
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-            shift += 7;
-        }
+        blaze_format::leb::read_u64(self.bytes, &mut self.at).map_err(LebError::as_str)
     }
 
     fn sleb(&mut self) -> Result<i64, &'static str> {
-        let mut value = 0i64;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            if shift == 63 && byte != 0 && byte != 0x7f {
-                return Err("a signed LEB128 past 64 bits");
-            }
-            value |= i64::from(byte & 0x7f) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                if shift < 64 && byte & 0x40 != 0 {
-                    value |= !0 << shift;
-                }
-                return Ok(value);
-            }
-        }
+        blaze_format::leb::read_i64(self.bytes, &mut self.at).map_err(LebError::as_str)
     }
 
     fn cstr(&mut self) -> Result<&'a [u8], &'static str> {
@@ -968,6 +942,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use blaze_codegen::Arch;
+    use blaze_ids::rng::SplitMix64 as Rng;
     use gimli::read::{BaseAddresses, CieOrFde, UnwindSection};
     use gimli::write::{
         Address, CommonInformationEntry, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable,
@@ -1258,6 +1233,9 @@ mod tests {
             id: [0; 16],
             debug: &[],
             symbol: &no_symbol,
+            synthesis: 0,
+            delta: None,
+            encoded: &[],
         };
         let bytes = build(&placed, Arch::Aarch64).unwrap();
         assert!(bytes.len() as u64 <= bound(functions.len() as u64, 8, cu.len() as u64));
@@ -1535,30 +1513,6 @@ mod tests {
         assert!(gimli_fdes(&placed).is_err());
     }
 
-    /// SplitMix64.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n
-        }
-
-        fn shuffle<T>(&mut self, items: &mut [T]) {
-            for i in (1..items.len()).rev() {
-                let j = self.below(i as u64 + 1) as usize;
-                items.swap(i, j);
-            }
-        }
-    }
-
     /// A seeded image: functions with FDEs (of two CIEs, one with a personality and LSDA),
     /// compact entries (dead ones, DWARF-mode ones, duplicates, up to 3 or 4 personalities
     /// held by address or by a bind, LSDAs), both out of address order, gaps past 24 bits.
@@ -1572,7 +1526,7 @@ mod tests {
     }
 
     fn case(seed: u64) -> Case {
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let (arch, dwarf) = match seed % 2 {
             0 => (Arch::Aarch64, ARM64_MODE_DWARF),
             _ => (Arch::X86_64, X86_64_MODE_DWARF),
@@ -2024,6 +1978,9 @@ mod tests {
             id: [0; 16],
             debug: &[],
             symbol: &no_symbol,
+            synthesis: 0,
+            delta: None,
+            encoded: &[],
         }
     }
 }

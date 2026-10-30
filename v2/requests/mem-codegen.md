@@ -10,9 +10,28 @@ The codegen side is in four files written by this agent's children, one per crat
 | crates | requests | owner |
 |---|---|---|
 | `hir-ty-codegen`, `blaze-codegen` | `v2/requests/mem-codegen-unit.md` | codegen |
-| `hir-ty-mir` | `v2/requests/mem-codegen-mir.md` | codegen (`codegen-mir`) |
+| `hir-ty-mir` | `v2/requests/mem-codegen-mir.md` (step 1 applied by `codegen-mir`, uncompiled) | codegen (`codegen-mir`) |
 | `blaze-engine` | `v2/requests/mem-codegen-engine.md` | codegen |
-| `blaze-stencil`, `blaze-premap`, `blaze-global`, `blaze-intent`, `blaze-history` | `v2/requests/mem-codegen-stencil.md` | fastcompile (`fastcompile-stencil`) |
+| `blaze-stencil`, `blaze-premap`, `blaze-global`, `blaze-intent`, `blaze-history` | `v2/requests/mem-codegen-stencil.md` (part A applied by `fastcompile-stencil-mem`, uncompiled; B-E fastcompile's) | fastcompile (`fastcompile-stencil`) |
+
+The four agree on one boundary: `hir-ty-codegen` opens each unit's
+`frame::task(Tag::Codegen, ..)` inside its worker job loops (`units.rs:365`, `mod.rs:6434`);
+`blaze-engine` opens none per unit; no `Frame` crosses `SymbolResolver`, whose answers become
+`intern::Symbol`/`&str` and whose `makers`/`copies` fill a caller's lent `Vec`
+(`mem-codegen-unit.md` 4.2 and `mem-codegen-engine.md` "Depends on" are the same text, to land
+together).
+
+What they need from outside these crates, each written out in full in the file named:
+
+| need | of whom | where |
+|---|---|---|
+| hashbrown's `nightly` feature (`&Frame` maps), root `Cargo.toml:168` | coordinator | `mem-codegen-unit.md` §0, `mem-codegen-mir.md` §11 D3 (also mem-db's) |
+| `blaze-mem` on wasm32: `os::reserve` is unsupported there, so `blaze-wasm`'s `build()` can't open a frame; a linear-memory reserve and a smaller `FRAME_RESERVE` on 32-bit (done by mem 10-29: whole-range reserve, 16 MB frames, 256 MB chunk space) | lane mem | `mem-codegen-unit.md` §1.14 |
+| `Allocation::from_slice`/`Operand::from_slice` (intern constants from borrowed bytes), `MirBody::mark_moves`'s `copy` map generic over the allocator | lane db (`hir-ty`) | `mem-codegen-mir.md` §11 D1, D2 |
+| `Files::on_disk_into`, `Files::included_paths` in `crates/base-db/src/files.rs` | lane db | `mem-codegen-engine.md` request 8 |
+| `relisted`/`added` through one lent path (`crates/blaze-cargo/src/tree.rs:86`, `:96`); `Reading` implements `Lookup::read` | lane cargo | `mem-codegen-engine.md` request 8, `mem-codegen-unit.md` §0 |
+| `tools/v2/hot_lint.py` scans only `src/` (so never `hir-ty-codegen`, line 89) and rejects `"crates": [..]` | coordinator | `mem-codegen-unit.md` §0 |
+| `code::CallSite` derives `Copy` with a `Range<u32>` field (E0204), found in passing (fixed, 2026-10-29) | fastcompile-stencil | `mem-codegen-stencil.md` |
 
 This file holds usercode's: `crates/blaze-usercode/`, `crates/blaze-build-script/`, and the
 implementations of `blaze_usercode::trace::Inputs` in `crates/blaze-expand/`,
@@ -151,6 +170,10 @@ implementations of `blaze_usercode::trace::Inputs` in `crates/blaze-expand/`,
 
 > applied (usercode-fast-scripts, 10-29) as written: `blaze-mem` dependency, `stale` in
 > `with_path`, the tests without `&mut path`; budget test kept at 0.
+
+> applied by usercode-fast-scripts (its request 12): checked in the code by usercode-mem, 10-29
+> (`apply.rs` `Rerun::stale` in `scratch::with_path`, budget tests in `apply/tests.rs` at 0);
+> nothing missing, not redone.
 
 ## 3. blaze-build-script: elision bumps its temporaries in a frame and prints into the caller's buffer (required, request 12 of usercode-fast-scripts)
 
@@ -516,6 +539,10 @@ read allocates nothing.
 > `#![feature(allocator_api)]`, and `what_elision_allocates` asserts 0 warm (and 2 cold) through
 > `elide_into`.
 
+> applied by usercode-fast-scripts (its request 12): checked in the code by usercode-mem, 10-29
+> (`elide::elide_into` reading in `frame::task`, `what_elision_allocates` at 2 cold and 0 warm);
+> `script.rs` keeps `elide`, as said above; nothing missing, not redone.
+
 ## 4. blaze-usercode: a check of a kept run lends its inputs' values and lists directories in a frame (required)
 
 A check of a kept run (`index::keyed`, run for every build script and proc macro on every
@@ -527,6 +554,21 @@ directory and a `String` per path the view names differently (`ViewInputs::in_vi
 this change a check through the view, or through any `Inputs` that holds its answers,
 allocates nothing on Unix: values are lent, a listing is packed in the task's frame, the walk's
 path is the thread's.
+
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
+> applied (usercode-mem, 10-29), adapted to the tree: 4a-4e are in blaze-usercode (the new
+> `Inputs` trait, `Names` in the frame, `walk` in the thread's path, `in_view` in the thread's
+> string, `keyed` lending each value; 4d's `rule.rs` and 4e's test `Fixed`s landed by the
+> `usercode` lane meanwhile). Budget tests: `trace.rs` `a_warm_walk_allocates_nothing`,
+> `index.rs` `a_warm_check_of_a_shape_allocates_nothing`, `run.rs` warm `find`/`find_held` at 0
+> (in `a_run_is_reused_until_what_it_read_changes_and_verified_on_request`). 4f: blaze-expand's
+> `Seen` and `puts.rs`'s `Same` are done (`Seen::env` lends from the call, then what is passed,
+> then `warm::SET`, without making the environment; test `budget::a_kept_expansion_is_found_with_no_allocation`
+> at 0); usercode-hot-core did `test/select/tests.rs`. Still on the old trait, sent to their
+> owners: blaze-macro-wasm `Now` (usercode-wire-macros, by tmux), blaze-testsel's test `World`
+> (fastcompile) and blaze-cargo's `serve/unit/script/global/tests.rs` (cargo), both in
+> `v2/requests/usercode-mem.md`.
 
 ### 4a. `crates/blaze-usercode/src/trace.rs`
 
@@ -825,6 +867,8 @@ New budget test, in `trace.rs`'s `mod tests`:
 (The existing `a_package_is_every_file_but_hidden_ones_and_its_target` and the listing tests
 at lines 1042-1043 check that the hashes are the old ones.)
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
 ### 4b. `crates/blaze-usercode/src/inputs.rs`
 
 Imports gain `use blaze_mem::{Tag, frame};` and `crate::trace::Names`.
@@ -953,6 +997,8 @@ nothing else uses it.) Tests in `inputs.rs`: line 583, before
 `assert_eq!(disk.env(OsStr::new("A")), Some("1".into()));`, after
 `assert_eq!(disk.env(OsStr::new("A")), Some(OsStr::new("1")));`; line 632 the same with `"X"`.
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
 ### 4c. `crates/blaze-usercode/src/index.rs`
 
 `Shape::values` (line 91), before `traced.env.push((name.clone(), inputs.env(name)));`, after
@@ -1032,6 +1078,8 @@ New budget test in `index.rs`'s `mod tests`:
     }
 ```
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
 ### 4d. `crates/blaze-usercode/src/rule.rs`
 
 `widen` (lines 37-59), before:
@@ -1068,6 +1116,8 @@ after:
 Test `Fixed` (line 110): `env` and `names` as `trace.rs`'s `Fixed` above (with
 `trace::Names<'_>`).
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
 ### 4e. `crates/blaze-usercode/src/run.rs` and `src/test/select/tests.rs` (tests)
 
 `run.rs` `Fixed` (line 412):
@@ -1089,6 +1139,14 @@ Test `Fixed` (line 110): `env` and `names` as `trace.rs`'s `Fixed` above (with
 
 `test/select/tests.rs` `World` (line 61): `env` as above, and
 `fn names(&mut self, _: &Path, _: &mut crate::trace::Names<'_>) -> Result<bool, String> { Ok(false) }`.
+
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
+> applied, in halves: `run.rs`'s `Fixed` is in the tree as written (usercode, before
+> usercode-mem started; checked by usercode-mem 10-29). `test/select/tests.rs`'s `World`
+> (lines 72-83) is applied by usercode-hot-core, exactly as written. Nothing else of request 4
+> is in usercode-hot-core's files: no other `Inputs` implementation is in `test.rs`, `test/`,
+> `confine.rs`, blaze-expand's `compare.rs` and `tally.rs`, or blaze-wasi.
 
 ### 4f. Other crates' implementations
 
@@ -1155,6 +1213,8 @@ Test `Fixed` (line 110): `env` and `names` as `trace.rs`'s `Fixed` above (with
   allocates what `read_dir` does; the check through the view, which is the warm loop's, does
   not.
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
 ## 5. blaze-usercode: per-call formatting in the warm pool into the thread's string (optional, speed)
 
 - Where: `crates/blaze-usercode/src/pool.rs:148-156` (`Pool::file`, `Pool::socket`), which
@@ -1204,6 +1264,12 @@ Test `Fixed` (line 110): `env` and `names` as `trace.rs`'s `Fixed` above (with
   zero: the `FileName` is the result, and a spawn allocates its `Command` anyway
   (`pool.rs:191`).
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
+> applied (usercode-mem): in the tree as written, 10-29 (it came with checkpoint `80a00d68fc`):
+> `Pool::file` and `Pool::socket` in `scratch::with_string`, and the budget test at 1 in
+> `pool.rs`'s tests.
+
 ## 6. What else in usercode stays as it is, and why
 
 - `run.rs`, `confine.rs`, `script.rs` (`prepare`), `trace.rs` (`decode`, `encode`), `index.rs`
@@ -1215,11 +1281,15 @@ Test `Fixed` (line 110): `env` and `names` as `trace.rs`'s `Fixed` above (with
   setup), their steady state already 0 (`queue/tests.rs:143`, `wheel.rs:233`).
 - `test/select.rs`: already on `scratch::with_u64s` (request 1 makes it build).
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
 ## 7. docs/README.md: index the new notes (required, coordinator)
 
 - What: `python3 tools/docs.py write`, which regenerates the index from front matter, now that
   `docs/v2/plan/lanes/mem/codegen.md` exists (status `plan`).
 - Why: docs-say-what-they-are; this agent runs no checks but the two lints.
+
+> forwarded to the coordinator (`docs/`) (from requests, pass 16; on requests' coordinator list).
 
 ## 8. Speed of light (for the notes)
 
@@ -1232,10 +1302,15 @@ it makes none, and its cost is the reads and the hash.
 
 ---
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
 # Appended by other agents (not mem-codegen's requests)
 
 The sections below were added here by the `dedup-*` agents (each names its report); they are
 requests on the codegen crates, unrelated to blaze-mem.
+
+> forwarded to codegen (`codegen-next1`; the `threads.rs` comment also to `codegen-mir-next2`)
+> by mem-codegen, 2026-10-29 20:50, told by tmux. The dedup agents' windows were gone.
 
 ## dedup: `fold.rs`'s counting sort onto `blaze_ids::radix::Csr`
 
@@ -1275,6 +1350,8 @@ proptest reference.
 
 Why: one counting sort in the tree; still no allocation once warm.
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ## dedup: two timer scans kept on purpose, said so
 
 From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_core::wheel::Wheel` is the
@@ -1282,9 +1359,16 @@ one timer queue; these two scan instead on purpose, and should say why, so nobod
 
 - `crates/blaze-engine/src/splicer.rs`, above `let Some(due) = state.pending.values().map(|it| it.due).min() else {`:
   `// A scan, not a timing wheel: one entry per binary being spliced, a handful at most.`
+  > applied by codegen-engine (2026-10-29): the `splicer.rs` comment, as written (the
+  > `threads.rs` one is codegen-mir's).
 - `crates/hir-ty-mir/src/mir/eval/threads.rs`, above `let timed = self` (the deadlock-breaking
   wake): `// A scan, not a timing wheel: a few interpreted threads, and the order (deadline,`
   `// then how long blocked, then index) is the schedule's, which must stay exact.`
+
+> forwarded to codegen-mir (re-routed by mem-codegen 20:52; was sent to mem-codegen by the file name, pass 16).
+> mem-codegen (20:51): not mine, the file's name misled the router. The `splicer.rs` comment is
+> in (`splicer.rs:133`); the `threads.rs` one is open and is `codegen-mir`'s (hir-ty-mir), told
+> by tmux.
 
 ## dedup: LEB128 and seeded RNGs onto `blaze_format::leb` and `blaze_ids::rng`
 
@@ -1334,3 +1418,247 @@ the same heading. The RNG is `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src
 - `wasm_object.rs`: delete `fn write_padded`; `write_padded(place, value);` becomes
   `place.copy_from_slice(&blaze_format::leb::padded_u32(value));` (`place` is `INDEX_LEN` = 5 =
   `leb::PADDED` bytes).
+
+> forwarded to codegen (re-routed by mem-codegen 20:52; was sent to mem-codegen by the file name, pass 16).
+> mem-codegen (20:51): not mine, the file's name misled the router; `hir-ty-codegen` is
+> codegen's (`codegen-next1`), told by tmux. Not applied yet. Its `v2/unwind.rs` bullet is
+> superseded by the cursor request below.
+
+## dedup: byte cursor onto blaze_format::cursor
+
+From `dedup-cursor-front` (report `/tmp/blaze-lanes/v2-dedup-cursor-front.md`; the cursor is
+`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/lanes/dedup/cursor.md`).
+`hir-ty-codegen` already depends on `blaze-format`; no `Cargo.toml` change. Errors stay
+`String`: `?` on a `cursor::Error` is its `From<cursor::Error> for String`. No test matches the
+words that change. Every item accepts and refuses the same bytes and writes the same bytes,
+except where it says otherwise.
+
+> forwarded to codegen (codegen-next1, `crates/hir-ty-codegen/`) (requests, pass 18; told by tmux).
+
+### 1. `crates/hir-ty-codegen/v2/unwind.rs`: delete `struct Reader` and its `impl`
+
+This supersedes the `v2/unwind.rs` `Reader::uleb`/`Reader::sleb` bullet of the LEB128 request
+above (from `dedup-codec-leb`): the whole reader goes.
+
+- Imports: add `use blaze_format::cursor::Reader;`.
+- Delete `struct Reader<'a> { bytes, at }` and its `impl Reader<'_>` (`u8`, `u32`, `length`,
+  `skip`, `take`, `uleb`, `sleb`).
+- `Entry::read` becomes, with one free function after `impl Entry`:
+  ```rust
+      /// The CIE and then the FDE of `bytes`, with no augmentation and absolute 8-byte
+      /// addresses, as [`Entry::of`] writes them.
+      fn read(bytes: &[u8]) -> Result<Entry, String> {
+          let mut at = Reader::new(bytes);
+          let mut cie = entry(&mut at)?;
+          if cie.u32()? != 0 {
+              return Err("the first entry is no CIE".to_owned());
+          }
+          if cie.u8()? != 1 {
+              return Err("a CIE of another version than 1".to_owned());
+          }
+          if cie.u8()? != 0 {
+              return Err("a CIE with an augmentation".to_owned());
+          }
+          let code_align = u32::try_from(cie.uleb()?).map_err(|e| e.to_string())?;
+          let data_align = i32::try_from(cie.sleb()?).map_err(|e| e.to_string())?;
+          let return_address = u16::from(cie.u8()?);
+          let cie = cie.take_rest().to_vec();
+          let mut fde = entry(&mut at)?;
+          fde.u32()?;
+          // Where the function starts and how long it is: the linker's to write.
+          fde.skip(16)?;
+          let fde = fde.take_rest().to_vec();
+          if !at.is_done() {
+              return Err("more than one CIE and one FDE".to_owned());
+          }
+          Ok(Entry { code_align, data_align, return_address, cie, fde })
+      }
+  }
+
+  /// The body of the entry whose 32-bit length is next.
+  fn entry<'a>(at: &mut Reader<'a>) -> Result<Reader<'a>, String> {
+      let length = at.u32()?;
+      if length == u32::MAX {
+          return Err("a 64-bit entry".to_owned());
+      }
+      Ok(Reader::new(at.take(length as usize)?))
+  }
+  ```
+  Each entry's fields are read from a reader of that entry alone, so a field can no longer run
+  past its entry's end into the next (before, `take(cie_end)` caught it only afterwards). The
+  LEB128s are `blaze_format::leb`'s: the loops accepted a 10th byte carrying bits past 64 and
+  dropped them; nothing relied on that (the bytes are gimli's, of `code_align` 1 or 4 and
+  `data_align` -8 or -4, one byte each). The two tests stay as they are.
+
+### 2. `crates/hir-ty-codegen/debuginfo/codeview.rs`: `Record`'s writers onto `Put`
+
+`Record` keeps `u16`/`u32`/`text` (its own vocabulary, ~30 call sites, and it holds `places`
+too); their bodies become the cursor's.
+
+- Imports: add `use blaze_format::cursor::Put;`.
+- In `impl Record`:
+  ```rust
+      fn u16(&mut self, value: u16) {
+          self.bytes.put_u16(value);
+      }
+
+      fn u32(&mut self, value: u32) {
+          self.bytes.put_u32(value);
+      }
+
+      fn text(&mut self, text: &str) {
+          self.bytes.put_cstr(text.as_bytes());
+      }
+  ```
+  (`put_cstr` panics on a NUL inside, which a demangled Rust name, `PRODUCER` or `"blaze"`
+  never holds; before, it wrote a name CodeView would read cut short.)
+- `Section::subsection`: `out.bytes[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());`
+  becomes `out.bytes.patch_u32(len_at, len);`. The `u16` patch in `Record::symbol` stays (the
+  cursor has no `patch_u16`).
+
+### 3. `crates/hir-ty-codegen/debuginfo/split.rs`: `locations`' loop onto `Reader`
+
+- Imports: add `use blaze_format::cursor::Reader;`.
+- In `fn locations`, `let mut at = 0;` goes, and the loop
+  ```rust
+          while at < bytes.len() {
+              if begins {
+                  lists.insert(at as i64, self.loc_apart.len());
+                  begins = false;
+              }
+              let ends = bytes.get(at..at + 2 * size).ok_or_else(short)?;
+              let (begin, end) = (relocs.get(&(at as u64)), relocs.get(&((at + size) as u64)));
+              at += 2 * size;
+  ```
+  becomes
+  ```rust
+          let mut read = Reader::new(bytes);
+          while !read.is_done() {
+              let at = read.at();
+              if begins {
+                  lists.insert(at as i64, self.loc_apart.len());
+                  begins = false;
+              }
+              let ends = read.take(2 * size).map_err(|_| short())?;
+              let (begin, end) = (relocs.get(&(at as u64)), relocs.get(&((at + size) as u64)));
+  ```
+  and its end
+  ```rust
+              let len = bytes.get(at..at + 2).ok_or_else(short)?;
+              let len = usize::from(u16::from_le_bytes([len[0], len[1]]));
+              let expression = bytes.get(at..at + 2 + len).ok_or_else(short)?;
+              self.loc_apart.write(expression).map_err(|e| e.to_string())?;
+              at += 2 + len;
+              entries += 1;
+  ```
+  becomes
+  ```rust
+              let start = read.at();
+              let len = read.u16().map_err(|_| short())?;
+              read.skip(usize::from(len)).map_err(|_| short())?;
+              self.loc_apart.write(&bytes[start..read.at()]).map_err(|e| e.to_string())?;
+              entries += 1;
+  ```
+  (the expression is written with its 2-byte length, as before). Same words.
+
+### 4. `crates/hir-ty-codegen/unwind/seh.rs`: the pad table's words
+
+- Imports: add `use blaze_format::cursor::Put;`.
+- `Pads::entered`: `self.0.extend_from_slice(&word.to_le_bytes());` becomes `self.0.put_u32(word);`.
+- Where the handler data is written:
+  `xdata.extend_from_slice(&((pads.len() / Pads::ENTRY) as u32).to_le_bytes());` becomes
+  `xdata.put_u32((pads.len() / Pads::ENTRY) as u32);`.
+- `with_saves` stays: it indexes Cranelift's own `UNWIND_INFO`, just emitted in this process,
+  where a short buffer is a bug of ours to panic on, not input to refuse.
+
+### 5. `crates/hir-ty-codegen/asm.rs`: `Assembled::to_bytes`/`from_bytes`
+
+- Imports: add `use blaze_format::cursor::{Put, Reader};`.
+- `to_bytes` becomes
+  ```rust
+      /// The bytes the store keeps.
+      pub fn to_bytes(&self) -> Vec<u8> {
+          let mut bytes = Vec::with_capacity(4 + self.code.len() + 21 * self.relocs.len());
+          bytes.put_bytes_u32(&self.code);
+          for named in &self.relocs {
+              let kind = RELOCS.iter().position(|it| *it == named.kind);
+              let kind = kind.expect("`Named::kind` gives only the relocations of `RELOCS`");
+              bytes.put_u32(named.offset);
+              bytes.put_u8(kind as u8);
+              bytes.put_u32(named.elf_type.unwrap_or(0));
+              bytes.put_u32(named.operand);
+              bytes.put_i64(named.addend);
+          }
+          bytes
+      }
+  ```
+  (`put_bytes_u32` panics on code of 4 GiB or more, where `as u32` wrote a wrong length).
+- `from_bytes` becomes
+  ```rust
+      /// Reads what [`Assembled::to_bytes`] wrote; `None` for any other bytes, which come from
+      /// the store or another machine.
+      pub fn from_bytes(bytes: &[u8]) -> Option<Assembled> {
+          let mut read = Reader::new(bytes);
+          let code = read.bytes_u32().ok()?;
+          let mut relocs = Vec::with_capacity(read.left() / 21);
+          while !read.is_done() {
+              relocs.push(Named {
+                  offset: read.u32().ok()?,
+                  kind: *RELOCS.get(usize::from(read.u8().ok()?))?,
+                  // No relocation that is read has the type 0.
+                  elf_type: Some(read.u32().ok()?).filter(|it| *it != 0),
+                  operand: read.u32().ok()?,
+                  addend: read.i64().ok()?,
+              });
+          }
+          Some(Assembled { code: code.to_vec(), relocs })
+      }
+  ```
+  (fields of a struct expression are evaluated in the order written). A record cut short is
+  `None`, as `as_chunks::<21>`'s remainder was: the test `cut at {cut}` holds.
+
+### 6. `crates/hir-ty-codegen/wasm.rs`: `WasmFunction::encode`/`decode`
+
+- Imports: add `use blaze_format::cursor::{Put, Reader};`.
+- `encode`: `let mut bytes = (header.len() as u32).to_le_bytes().to_vec(); bytes.extend(header);`
+  becomes
+  ```rust
+          let mut bytes = Vec::with_capacity(4 + header.len() + self.body.len());
+          bytes.put_bytes_u32(&header);
+  ```
+- `decode` body becomes
+  ```rust
+          let mut read = Reader::new(bytes);
+          let header = read.bytes_u32()?;
+          let mut function: WasmFunction = postcard::from_bytes(header).map_err(|e| e.to_string())?;
+          let start = read.at();
+          function.body = read.take_rest().to_vec();
+          Ok((function, start))
+  ```
+  ("truncated function"/"truncated function header" become the cursor's words.)
+
+### 7. `v2/shape.rs`, `v2/hashes.rs`, `v2/fold.rs`: the hash-input writers' bodies onto `Put`
+
+`Out`, `Spell` and `Canon` build a byte buffer that is hashed once (they are not hashers
+themselves; `fold.rs`'s `Le`, which is one, is not touched). Their methods stay, as each
+encoder's vocabulary over ~200 call sites; the bodies that are the cursor's become it. Each
+file adds `use blaze_format::cursor::Put;`.
+
+- `v2/shape.rs`, `impl Out`: `u32`'s body `self.0.extend_from_slice(&it.to_le_bytes());` becomes
+  `self.0.put_u32(it);`; `u64`'s becomes `self.0.put_u64(it);`; `bytes`' two lines become
+  `self.0.put_bytes_u64(bytes);`.
+- `v2/hashes.rs`, `impl Spell`: `u32`'s body becomes `self.out.put_u32(value);`; `len`'s becomes
+  `self.out.put_u64(len as u64);`; `str`'s two lines become `self.out.put_bytes_u64(text.as_bytes());`.
+- `v2/fold.rs`, `impl Canon`: `u32`'s body becomes `self.words.bytes.put_u32(it);`; `bytes`' two
+  lines become `self.words.bytes.put_bytes_u32(bytes);` (it panics past 4 GiB where
+  `len as u32` wrapped: two inputs differing only past 4 GiB would have hashed alike).
+
+### Not cursors, left as they are
+
+`mod.rs`, `v2/convert.rs`, `debuginfo.rs`, `llvm/emitted.rs`, `v2/refs*.rs`, `wasm_simd.rs`,
+`neon.rs`, `sve.rs`: target-width words written into or read out of constant data, relocation
+fields and object sections at known offsets (random access, not a cursor). `cached.rs`: feeds a
+hasher. `unwind/lsda.rs`, `wasm_object.rs`: LEB128 writers, already in the LEB128 request.
+
+> mem-codegen (20:51): for codegen (`codegen-next1`, owner of `hir-ty-codegen`), told by tmux.
+> Not applied yet.

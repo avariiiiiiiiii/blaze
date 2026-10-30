@@ -63,16 +63,19 @@ pub(super) fn is_clone(k: &Known<'_>, callee: hir_def::FunctionId) -> bool {
 
 /// The finding of a clone of `ty`, if it is not copy-like: its message and, when the cost is
 /// in a part of it, a note naming that part.
-pub(super) fn finding(k: &Known<'_>, ty: &hir::Type<'_>) -> Option<(String, Option<String>)> {
+pub(super) fn finding<'db>(
+    k: &Known<'db>,
+    ty: &hir::Type<'db>,
+) -> Option<(String, Option<String>)> {
     let costly = copy_like(k, ty, 0).err()?;
-    let shown = |ty: &hir::Type<'_>| ty.display(k.db, k.target).to_string();
+    let shown = |ty: &hir::Type<'db>| ty.display(k.db, k.target).to_string();
     let message = format!("this `clone` of `{}` {}", shown(ty), costly.why.says());
     let note = (costly.ty != *ty)
         .then(|| format!("`{}` in it {}", shown(&costly.ty), costly.why.says()));
     Some((message, note))
 }
 
-fn copy_like<'db>(k: &Known<'_>, ty: &hir::Type<'db>, depth: u8) -> Result<(), Costly<'db>> {
+fn copy_like<'db>(k: &Known<'db>, ty: &hir::Type<'db>, depth: u8) -> Result<(), Costly<'db>> {
     let db = k.db;
     if ty.is_unknown()
         || ty.is_reference()
@@ -129,7 +132,7 @@ fn derives_clone(k: &Known<'_>, adt: AdtId) -> bool {
 
 /// Why the hand-written `Clone` of `ty` costs: a reference count for `Arc`, `Rc` and their
 /// `Weak`s, an allocation when it reaches the allocator, else its own code.
-fn hand_written(k: &Known<'_>, ty: &hir::Type<'_>, adt: AdtId) -> Why {
+fn hand_written<'db>(k: &Known<'db>, ty: &hir::Type<'db>, adt: AdtId) -> Why {
     let name = hir::Adt::from(adt).name(k.db);
     if matches!(name.as_str(), "Arc" | "Rc" | "Weak") {
         return Why::Counts;

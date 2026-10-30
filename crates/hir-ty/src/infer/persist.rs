@@ -22,6 +22,7 @@ use hir_def::{
         ArithOp, BinaryOp, CmpOp, ExprId, ExprOrPatId, ExprOrPatIdPacked, LogicOp, Ordering,
         UnaryOp,
     },
+    resolver::ValueNs,
 };
 use hir_expand::name::Name;
 use intern::Symbol;
@@ -36,17 +37,17 @@ use crate::{
     Span,
     db::{AnonConstId, InternedOpaqueTyId},
     infer::{
-        Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CaptureInfo,
+        Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments, CaptureInfo,
         CaptureSourceStack, CapturedPlace, ClosureData, ExplicitDropMethodUseKind,
         InferenceDiagnostic, InferenceResult, OverloadedDeref, PatAdjust, PatAdjustment,
         PointerCast, ReturnKind, Unreachable, UnreachableAt,
-        cast::CastError,
+        cast::{CastError, CastPointerKind, CastPointers},
         closure::analysis::{
             BorrowKind,
             expr_use_visitor::{FakeReadCause, Place, PlaceBase, Projection, ProjectionKind},
         },
         columns::{
-            Csr, DenseKey, ExprOrPatColumn, ExprOrPatSet, FieldColumn, IdxSet, IndexColumn,
+            Csr, DenseKey, ExprOrPatColumn, ExprOrPatMap, ExprOrPatSet, FieldColumn, IdxSet, IndexColumn,
             ModeColumn, SortedMap, TyColumn,
         },
     },
@@ -705,6 +706,7 @@ impl InferenceRecord {
             method_resolutions,
             field_resolutions,
             variant_resolutions,
+            value_resolutions,
             assoc_resolutions,
             tuple_field_access_types,
             type_of_expr,
@@ -812,6 +814,11 @@ impl InferenceRecord {
         record.diagnostics = u32::try_from(diagnostics.len()).expect("2^32 diagnostics");
         record.put32(C32::ClosureExprs, closures_data.keys().map(|&it| local(it)));
         closures_data.values().for_each(|it| words.closure(tys, it));
+        words.len(value_resolutions.iter().count());
+        value_resolutions.iter().for_each(|(node, &value)| {
+            words.node(node);
+            words.value_ns(value);
+        });
         record.put32(C32::Words, words.words);
         record.put8(C8::Text, words.text);
 
@@ -865,7 +872,7 @@ impl Placed {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(4),
+        Part::U64(5),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -1179,7 +1186,16 @@ impl<'a> InferenceRecordRef<'a> {
                 .collect::<Result<_, FormatError>>()?;
             SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
         };
-        self.ensure(words.is_done(), "words after the last closure")?;
+        let value_resolutions = {
+            let mut map = ExprOrPatMap::default();
+            for _ in 0..words.len()? {
+                let node = words.node()?;
+                let value = words.value_ns()?;
+                self.ensure(map.insert(node, value).is_none(), "a node with two value path resolutions")?;
+            }
+            map.freeze()
+        };
+        self.ensure(words.is_done(), "words after the last value path resolution")?;
 
         let defined_anon_consts = self
             .u64s(C64::AnonConsts)
@@ -1192,6 +1208,7 @@ impl<'a> InferenceRecordRef<'a> {
             method_resolutions,
             field_resolutions,
             variant_resolutions,
+            value_resolutions,
             assoc_resolutions,
             tuple_field_access_types,
             type_of_expr: self.ty_column(tys, [C32::ExprTyAt, C32::ExprTys])?,
@@ -1330,6 +1347,26 @@ impl Sink {
         self.u64(bits);
     }
 
+    fn cast_pointer_kind(&mut self, kind: Option<CastPointerKind>) {
+        match kind {
+            None => self.word(0),
+            Some(CastPointerKind::Thin) => self.word(1),
+            Some(CastPointerKind::VTable(principal)) => {
+                self.word(2);
+                self.bool(principal.is_some());
+                if let Some(principal) = principal {
+                    self.id(principal);
+                }
+            }
+            Some(CastPointerKind::Length) => self.word(3),
+            Some(CastPointerKind::OfAlias) => self.word(4),
+            Some(CastPointerKind::OfParam(param)) => {
+                self.word(5);
+                self.generic_param(param.into());
+            }
+        }
+    }
+
     fn generic_param(&mut self, param: GenericParamId) {
         let (tag, parent, local) = match param {
             GenericParamId::TypeParamId(it) => (0, it.parent(), local(it.local_id())),
@@ -1339,6 +1376,44 @@ impl Sink {
         self.word(tag);
         self.generic_def(parent);
         self.word(local);
+    }
+
+    fn value_ns(&mut self, value: ValueNs) {
+        match value {
+            ValueNs::ImplSelf(it) => {
+                self.word(0);
+                self.id(it);
+            }
+            ValueNs::LocalBinding(it) => {
+                self.word(1);
+                self.local(it);
+            }
+            ValueNs::FunctionId(it) => {
+                self.word(2);
+                self.id(it);
+            }
+            ValueNs::ConstId(it) => {
+                self.word(3);
+                self.id(it);
+            }
+            ValueNs::StaticId(it) => {
+                self.word(4);
+                self.id(it);
+            }
+            ValueNs::StructId(it) => {
+                self.word(5);
+                self.id(it);
+            }
+            ValueNs::EnumVariantId(it) => {
+                self.word(6);
+                self.id(it);
+            }
+            ValueNs::GenericParam(it) => {
+                self.word(7);
+                self.generic_def(it.parent());
+                self.word(local(it.local_id()));
+            }
+        }
     }
 
     fn generics_len_kind(&mut self, kind: IncorrectGenericsLenKind) {
@@ -1374,6 +1449,37 @@ impl Sink {
             ClausePolarity::Positive => 0,
             ClausePolarity::Negative => 1,
         });
+    }
+
+    fn call_arguments<'db>(&mut self, tys: &mut impl TyEncode<'db>, args: &CallArguments) {
+        let CallArguments {
+            callee,
+            method,
+            is_method,
+            c_variadic,
+            formal_inputs,
+            expected_inputs,
+            provided,
+            compatible_ends,
+            compatible,
+        } = args;
+        self.ty(tys, callee);
+        match method {
+            None => self.word(0),
+            Some(method) => {
+                self.word(1);
+                self.id(*method);
+            }
+        }
+        self.bool(*is_method);
+        self.bool(*c_variadic);
+        for list in [formal_inputs, expected_inputs, provided] {
+            self.len(list.len());
+            list.iter().for_each(|it| self.ty(tys, it));
+        }
+        self.words.extend(compatible_ends.iter().copied());
+        self.len(compatible.len());
+        self.words.extend(compatible.iter().copied());
     }
 
     fn polarity(&mut self, polarity: ClausePolarity) {
@@ -1515,7 +1621,15 @@ impl Sink {
                 self.words.extend([3, local(*pat)]);
                 self.ty(tys, found);
             }
-            D::InvalidRangePatType { pat } => self.words.extend([4, local(*pat)]),
+            D::InvalidRangePatType { pat, lhs, rhs } => {
+                self.words.extend([4, local(*pat)]);
+                for side in [lhs, rhs] {
+                    self.opt_ty(tys, side.as_ref().map(|(ty, _)| ty));
+                    if let Some((_, fail)) = side {
+                        self.bool(*fail);
+                    }
+                }
+            }
             D::DuplicateField { field, variant } => {
                 self.word(5);
                 self.node(*field);
@@ -1592,16 +1706,23 @@ impl Sink {
             D::FunctionalRecordUpdateOnNonStruct { base_expr } => {
                 self.words.extend([17, local(*base_expr)])
             }
-            D::MismatchedArgCount { call_expr, expected, found, is_fn_trait_call } => {
+            D::MismatchedArgCount { call_expr, expected, found, is_fn_trait_call, args } => {
                 self.words.extend([18, local(*call_expr)]);
                 self.usize(*expected);
                 self.usize(*found);
                 self.bool(*is_fn_trait_call);
+                self.call_arguments(tys, args);
             }
-            D::MismatchedTupleStructPatArgCount { pat, expected, found } => {
+            D::IncorrectArguments { call_expr, args } => {
+                self.words.extend([52, local(*call_expr)]);
+                self.call_arguments(tys, args);
+            }
+            D::MismatchedTupleStructPatArgCount { pat, expected, found, variant, had_err } => {
                 self.words.extend([19, local(*pat)]);
                 self.usize(*expected);
                 self.usize(*found);
+                self.variant(*variant);
+                self.bool(*had_err);
             }
             D::ExpectedFunction { call_expr, found } => {
                 self.words.extend([20, local(*call_expr)]);
@@ -1686,7 +1807,19 @@ impl Sink {
                 self.generics_len_kind(*kind);
                 self.generic_def(*def);
             }
-            D::MethodCallIllegalSizedBound { call_expr } => self.words.extend([33, local(*call_expr)]),
+            D::MethodCallIllegalSizedBound { call_expr, method, bound, needs_mut, candidates } => {
+                self.words.extend([33, local(*call_expr)]);
+                self.id(*method);
+                self.bool(bound.is_some());
+                if let Some(bound) = bound {
+                    self.generic_def(*bound);
+                }
+                self.bool(*needs_mut);
+                self.len(candidates.len());
+                for &trait_ in candidates {
+                    self.id(trait_);
+                }
+            }
             D::MethodCallIncorrectGenericsOrder { expr, param_id, arg_idx, has_self_arg } => {
                 self.words.extend([34, local(*expr)]);
                 self.generic_param(*param_id);
@@ -1694,7 +1827,7 @@ impl Sink {
                 self.bool(*has_self_arg);
             }
             D::MethodCallLateBoundLifetimeArgs { expr, def } => {
-                self.words.extend([52, local(*expr)]);
+                self.words.extend([60, local(*expr)]);
                 self.generic_def(*def);
             }
             D::InvalidLhsOfAssignment { lhs, assign, op } => {
@@ -2070,6 +2203,21 @@ impl Source<'_> {
         })
     }
 
+    fn cast_pointer_kind(&mut self) -> Result<Option<CastPointerKind>, FormatError> {
+        Ok(Some(match self.word()? {
+            0 => return Ok(None),
+            1 => CastPointerKind::Thin,
+            2 => CastPointerKind::VTable(if self.bool()? { Some(self.id()?) } else { None }),
+            3 => CastPointerKind::Length,
+            4 => CastPointerKind::OfAlias,
+            5 => match self.generic_param()? {
+                GenericParamId::TypeParamId(param) => CastPointerKind::OfParam(param),
+                _ => return Err(self.invalid("a pointer kind of a parameter that is not a type")),
+            },
+            _ => return Err(self.invalid("a pointer kind of no kind")),
+        }))
+    }
+
     fn generic_param(&mut self) -> Result<GenericParamId, FormatError> {
         let tag = self.word()?;
         let parent = self.generic_def()?;
@@ -2080,6 +2228,24 @@ impl Source<'_> {
             1 => ConstParamId::from_unchecked(type_or_const).into(),
             2 => LifetimeParamId { parent, local_id: local_of(local) }.into(),
             _ => return Err(self.invalid("a generic parameter of no kind")),
+        })
+    }
+
+    fn value_ns(&mut self) -> Result<ValueNs, FormatError> {
+        Ok(match self.word()? {
+            0 => ValueNs::ImplSelf(self.id()?),
+            1 => ValueNs::LocalBinding(self.local()?),
+            2 => ValueNs::FunctionId(self.id()?),
+            3 => ValueNs::ConstId(self.id()?),
+            4 => ValueNs::StaticId(self.id()?),
+            5 => ValueNs::StructId(self.id()?),
+            6 => ValueNs::EnumVariantId(self.id()?),
+            7 => {
+                let parent = self.generic_def()?;
+                let local_id = self.local()?;
+                ValueNs::GenericParam(ConstParamId::from_unchecked(TypeOrConstParamId { parent, local_id }))
+            }
+            _ => return Err(self.invalid("a value path resolution of no kind")),
         })
     }
 
@@ -2140,6 +2306,46 @@ impl Source<'_> {
 
     fn args(&mut self, tys: &impl TyDecode) -> Result<StoredGenericArgs, FormatError> {
         tys.args(self.word()?)
+    }
+
+    fn call_arguments(&mut self, tys: &impl TyDecode) -> Result<Box<CallArguments>, FormatError> {
+        let callee = self.ty(tys)?;
+        let method = match self.word()? {
+            0 => None,
+            1 => Some(self.id()?),
+            _ => return Err(self.invalid("an optional method of no kind")),
+        };
+        let is_method = self.bool()?;
+        let c_variadic = self.bool()?;
+        let mut tys_list = || -> Result<Box<[StoredTy]>, FormatError> {
+            let len = self.len()?;
+            (0..len).map(|_| self.ty(tys)).collect()
+        };
+        let formal_inputs = tys_list()?;
+        let expected_inputs = tys_list()?;
+        let provided = tys_list()?;
+        let compatible_ends: Box<[u32]> =
+            (0..provided.len()).map(|_| self.word()).collect::<Result<_, _>>()?;
+        let len = self.len()?;
+        let compatible: Box<[u32]> = (0..len).map(|_| self.word()).collect::<Result<_, _>>()?;
+        if formal_inputs.len() != expected_inputs.len()
+            || compatible_ends.windows(2).any(|it| it[0] > it[1])
+            || compatible_ends.last().map_or(0, |&it| it as usize) != compatible.len()
+            || compatible.iter().any(|&it| it as usize >= expected_inputs.len())
+        {
+            return Err(self.invalid("call arguments of no shape"));
+        }
+        Ok(Box::new(CallArguments {
+            callee,
+            method,
+            is_method,
+            c_variadic,
+            formal_inputs,
+            expected_inputs,
+            provided,
+            compatible_ends,
+            compatible,
+        }))
     }
 
     fn goal(&mut self, tys: &impl TyDecode) -> Result<StoredGoal, FormatError> {
@@ -2213,7 +2419,18 @@ impl Source<'_> {
             },
             2 => D::ArrayPatternWithoutFixedLength { pat: self.local()? },
             3 => D::ExpectedArrayOrSlicePat { pat: self.local()?, found: self.ty(tys)? },
-            4 => D::InvalidRangePatType { pat: self.local()? },
+            4 => {
+                let pat = self.local()?;
+                let mut side = || -> Result<_, FormatError> {
+                    Ok(match self.opt_ty(tys)? {
+                        Some(ty) => Some((ty, self.bool()?)),
+                        None => None,
+                    })
+                };
+                let lhs = side()?;
+                let rhs = side()?;
+                D::InvalidRangePatType { pat, lhs, rhs }
+            }
             5 => D::DuplicateField { field: self.node()?, variant: self.variant()? },
             6 => D::PrivateField {
                 expr: self.local()?,
@@ -2271,11 +2488,18 @@ impl Source<'_> {
                 expected: self.usize()?,
                 found: self.usize()?,
                 is_fn_trait_call: self.bool()?,
+                args: self.call_arguments(tys)?,
+            },
+            52 => D::IncorrectArguments {
+                call_expr: self.local()?,
+                args: self.call_arguments(tys)?,
             },
             19 => D::MismatchedTupleStructPatArgCount {
                 pat: self.local()?,
                 expected: self.usize()?,
                 found: self.usize()?,
+                variant: self.variant()?,
+                had_err: self.bool()?,
             },
             20 => D::ExpectedFunction { call_expr: self.local()?, found: self.ty(tys)? },
             21 => D::CannotBeDereferenced {
@@ -2334,6 +2558,18 @@ impl Source<'_> {
                 },
                 expr_ty: self.ty(tys)?,
                 cast_ty: self.ty(tys)?,
+                pointers: if self.bool()? {
+                    Some(Box::new(CastPointers {
+                        expr: self.cast_pointer_kind()?,
+                        cast: self.cast_pointer_kind()?,
+                        added_auto_traits: {
+                            let len = self.len()?;
+                            (0..len).map(|_| self.id()).collect::<Result<_, _>>()?
+                        },
+                    }))
+                } else {
+                    None
+                },
             },
             30 => D::TyDiagnostic { diag: self.lowering_words(|words| words.diagnostic())? },
             31 => D::PathDiagnostic {
@@ -2347,14 +2583,23 @@ impl Source<'_> {
                 kind: self.generics_len_kind()?,
                 def: self.generic_def()?,
             },
-            33 => D::MethodCallIllegalSizedBound { call_expr: self.local()? },
+            33 => D::MethodCallIllegalSizedBound {
+                call_expr: self.local()?,
+                method: self.id()?,
+                bound: if self.bool()? { Some(self.generic_def()?) } else { None },
+                needs_mut: self.bool()?,
+                candidates: {
+                    let len = self.len()?;
+                    (0..len).map(|_| self.id()).collect::<Result<_, _>>()?
+                },
+            },
             34 => D::MethodCallIncorrectGenericsOrder {
                 expr: self.local()?,
                 param_id: self.generic_param()?,
                 arg_idx: self.word()?,
                 has_self_arg: self.bool()?,
             },
-            52 => D::MethodCallLateBoundLifetimeArgs {
+            60 => D::MethodCallLateBoundLifetimeArgs {
                 expr: self.local()?,
                 def: self.generic_def()?,
             },
@@ -2736,7 +2981,12 @@ mod tests {
             D::MismatchedArrayPatLen { pat: pat(1), expected: 1 << 40, found: 3, has_rest: true },
             D::ArrayPatternWithoutFixedLength { pat: pat(2) },
             D::ExpectedArrayOrSlicePat { pat: pat(3), found: ty(types.u8) },
-            D::InvalidRangePatType { pat: pat(4) },
+            D::InvalidRangePatType { pat: pat(4), lhs: None, rhs: None },
+            D::InvalidRangePatType {
+                pat: pat(4),
+                lhs: Some((ty(types.str), true)),
+                rhs: Some((Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store(), false)),
+            },
             D::DuplicateField { field: pat(5).into(), variant },
             D::PrivateField { expr: expr(2), field: FieldId { parent: enum_variant, local_id: local_of(7) } },
             D::PrivateAssocItem { id: expr(3).into(), item: AssocItemId::TypeAliasId(TypeAliasId::from_id(id(6))) },
@@ -2775,8 +3025,45 @@ mod tests {
             D::UnionPatMustHaveExactlyOneField { pat: pat(8) },
             D::UnionPatHasRest { pat: pat(9) },
             D::FunctionalRecordUpdateOnNonStruct { base_expr: expr(10) },
-            D::MismatchedArgCount { call_expr: expr(11), expected: 2, found: 5, is_fn_trait_call: true },
-            D::MismatchedTupleStructPatArgCount { pat: pat(10), expected: 1, found: 0 },
+            D::MismatchedArgCount {
+                call_expr: expr(11),
+                expected: 2,
+                found: 5,
+                is_fn_trait_call: true,
+                args: Box::new(CallArguments {
+                    callee: ty(types.unit),
+                    method: None,
+                    is_method: false,
+                    c_variadic: true,
+                    formal_inputs: [ty(types.u8), ty(types.bool)].into(),
+                    expected_inputs: [ty(types.u8), ty(types.error)].into(),
+                    provided: [types.u8, types.i32, types.bool, types.u8, types.u8].map(ty).into(),
+                    compatible_ends: [1, 1, 2, 3, 3].into(),
+                    compatible: [0, 1, 0].into(),
+                }),
+            },
+            D::IncorrectArguments {
+                call_expr: expr(12),
+                args: Box::new(CallArguments {
+                    callee: Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store(),
+                    method: Some(FunctionId::from_id(id(12))),
+                    is_method: true,
+                    c_variadic: false,
+                    formal_inputs: Box::default(),
+                    expected_inputs: Box::default(),
+                    provided: Box::default(),
+                    compatible_ends: Box::default(),
+                    compatible: Box::default(),
+                }),
+            },
+            D::MismatchedTupleStructPatArgCount { pat: pat(10), expected: 1, found: 0, variant, had_err: false },
+            D::MismatchedTupleStructPatArgCount {
+                pat: pat(10),
+                expected: 2,
+                found: 3,
+                variant: enum_variant,
+                had_err: true,
+            },
             D::ExpectedFunction { call_expr: expr(12), found: ty(types.never) },
             D::CannotBeDereferenced { expr: expr(13), found: ty(types.u8), at_error: None },
             D::CannotBeDereferenced {
@@ -2815,7 +3102,20 @@ mod tests {
                 kind: IncorrectGenericsLenKind::Lifetimes,
                 def: AdtId::UnionId(UnionId::from_id(id(10))).into(),
             },
-            D::MethodCallIllegalSizedBound { call_expr: expr(18) },
+            D::MethodCallIllegalSizedBound {
+                call_expr: expr(18),
+                method: FunctionId::from_id(id(40)),
+                bound: Some(TraitId::from_id(id(41)).into()),
+                needs_mut: true,
+                candidates: Box::new([TraitId::from_id(id(42)), TraitId::from_id(id(43))]),
+            },
+            D::MethodCallIllegalSizedBound {
+                call_expr: expr(19),
+                method: FunctionId::from_id(id(40)),
+                bound: None,
+                needs_mut: false,
+                candidates: Box::new([]),
+            },
             D::MethodCallIncorrectGenericsOrder {
                 expr: expr(19),
                 param_id: LifetimeParamId { parent: def, local_id: local_of(0) }.into(),
@@ -2963,6 +3263,27 @@ mod tests {
             error: error.clone(),
             expr_ty: ty(types.i32),
             cast_ty: ty(types.bool),
+            pointers: None,
+        }));
+        let pointer_kinds = [
+            None,
+            Some(CastPointerKind::Thin),
+            Some(CastPointerKind::VTable(None)),
+            Some(CastPointerKind::VTable(Some(trait_))),
+            Some(CastPointerKind::Length),
+            Some(CastPointerKind::OfAlias),
+            Some(CastPointerKind::OfParam(TypeParamId::from_unchecked(param))),
+        ];
+        all.extend(pointer_kinds.iter().enumerate().map(|(i, &kind)| D::InvalidCast {
+            expr: expr(28),
+            error: CastError::DifferingKinds,
+            expr_ty: ty(types.i32),
+            cast_ty: ty(types.bool),
+            pointers: Some(Box::new(CastPointers {
+                expr: kind,
+                cast: pointer_kinds[(i + 1) % pointer_kinds.len()],
+                added_auto_traits: if i == 0 { Box::new([]) } else { Box::new([trait_, trait_]) },
+            })),
         }));
         let paths = [
             PathLoweringDiagnostic::GenericArgsProhibited {
@@ -3066,6 +3387,19 @@ mod tests {
             variant_resolutions: ExprOrPatColumn {
                 exprs: IndexColumn::from_entries([(expr(4), UnionId::from_id(id(23)).into())]),
                 pats: IndexColumn::from_entries([(pat(1), EnumVariantId::from_id(id(24)).into())]),
+            },
+            value_resolutions: {
+                let param = TypeOrConstParamId { parent: FunctionId::from_id(id(33)).into(), local_id: local_of(1) };
+                let mut values = ExprOrPatMap::default();
+                values.insert(expr(12).into(), ValueNs::ImplSelf(ImplId::from_id(id(34))));
+                values.insert(expr(13).into(), ValueNs::LocalBinding(binding(2)));
+                values.insert(expr(14).into(), ValueNs::FunctionId(FunctionId::from_id(id(35))));
+                values.insert(expr(15).into(), ValueNs::ConstId(ConstId::from_id(id(36))));
+                values.insert(expr(16).into(), ValueNs::StaticId(StaticId::from_id(id(37))));
+                values.insert(pat(5).into(), ValueNs::StructId(StructId::from_id(id(38))));
+                values.insert(pat(6).into(), ValueNs::EnumVariantId(EnumVariantId::from_id(id(39))));
+                values.insert(expr(17).into(), ValueNs::GenericParam(ConstParamId::from_unchecked(param)));
+                values.freeze()
             },
             assoc_resolutions: ExprOrPatColumn {
                 exprs: IndexColumn::from_entries([(expr(6), (ConstId::from_id(id(25)).into(), args(&[types.u8])))]),

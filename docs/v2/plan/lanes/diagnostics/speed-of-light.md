@@ -46,7 +46,7 @@ with nothing extra, which is also the most rustc can do.
 | --- | --- | --- | --- |
 | `Defs` | one visit per definition | about 0.6 ms | about 10 ms |
 | `level` | one lookup per owner | about 0.15 ms | about 1.4 ms |
-| `reach` | one visit per definition and per type in a public signature | the same as `items` | the same, maybe computed twice |
+| `reach` | one visit per definition and per type in a public signature | the same as `items` | computed once, shared with `items`; then one bit per definition |
 | `seed` | one attribute-bit test per definition | about 0.3 ms | about 0.6 ms |
 | `mark` (bodies) | one visit per body node and one read per resolution | about 5.6 ms | about 20 ms (was about 150 ms) |
 | `report` | one bit test per definition, text only for what fires | under 0.1 ms | at the bound, except that it runs when the lint can't fire |
@@ -83,11 +83,15 @@ that owns `Cx`'s levels; this pass would read it unchanged through `Levels::at`.
 **`reach`: what is reachable from outside.** The bound is rustc's
 `effective_visibilities`, computed once per crate for every pass that reads it.
 
-The fixpoint costs two or three bit tests per impl per round, and there are at most a few
-rounds. Nominal visibility is one pass in definition order. Both are at the bound. What
-stands in the way is that `items` may compute the same facts again, which halves the pass's
-share of the bound. What removes it: `names::after_abort` passing one `Defs` and `Reach` to
-both passes. That is requested of the parent in `v2/requests/diagnostics.md`.
+`names::effective` computes it once: `names::after_abort` builds one `Effective` and passes
+it to `dead` and to `items` (`check_private_in_public` and the late item lints). Each
+definition is numbered once into a hash map, and its visibilities, its own visibility and its
+private one are columns over that numbering. The fixpoints re-walk a definition only when it
+rises, so the cost is one walk of each interface per rise; a rise moves a level up the module
+tree, so a definition rises at most once per level per enclosing module, in practice once or
+twice.
+`dead`'s `Reach` then reads it into a bitset over its own numbering: one hash lookup per
+definition, once per crate, and after that a bit test per question.
 
 **`seed`: the worklist's first entries.** The bound is one memoized `AttrFlags` read per
 definition at about 100 cycles: 10,000 of them is 1 million cycles, about 0.3 ms.
@@ -183,8 +187,7 @@ a borrow or a move would do:
 - the syntax walk takes owned children;
 - `Levels::at` takes `InFile<&SyntaxNode>`;
 - a block's modifiers are read as tokens, with no cast;
-- `reach` drops its module index, since the set of modules it reached is the set of public
-  ones;
+- `reach` reads the shared `names::effective` table, and keeps no walk of its own;
 - `Bits` and `Live` no longer derive `Clone`. The one copy rustc's pass needs, the liveness
   before deferred seeding, is `Live::snapshot`, once per crate.
 
@@ -258,3 +261,494 @@ What stands in the way:
 On one core, `Defs` from the `ItemTree` plus the value-path column put the pass at about 90%
 of its bound. rustc's pass is also serial, so it is a peer of the one-core bound; the 16-core
 bound is the per-body query design above.
+
+## Names: imports, stability and item lints (`diagnostics-lints-names`)
+
+`crates/blaze-diagnostics/src/lints/names/`, apart from `dead/` (its own section above):
+`imports` (rustc_resolve's lints), `stability` (`deprecated`, E0658), `items` (the item
+lints before the abort, `check_private_in_public`, the late item passes,
+`clashing_extern_declarations`), and `effective` (`effective_visibilities`, shared with
+`dead`). It uses the same reference crate as `dead_code`: 800,000 syntax nodes, 180,000 paths,
+method calls and field accesses in bodies, 10,000 definitions, 3,000 bodies, and about 2,000
+`use` trees.
+
+**The state of the art** is rustc's own passes:
+
+- resolve marks each import used as it resolves (`record_use`), and `check_unused` then reads
+  only the imports;
+- `Checker` (stability) and the late lint pass walk HIR once, with each path's `Res` already
+  recorded on it;
+- `effective_visibilities` is computed once;
+- `lints_that_dont_need_to_run` drops every pass whose lints are all allowed.
+
+The bounds below are that design with nothing extra.
+
+### Bounds and where the passes stand
+
+| Component | Work | Bound | Now |
+| --- | --- | --- | --- |
+| skip of allowed lints | one AND of a `LintSet` per pass | under 1 µs | at the bound: every pass gates on `cx.any_may_fire` / `lint_may_fire`; `stability` runs anyway for E0658 |
+| syntax walk | one pass over the crate's nodes, shared | about 0.5 ms | `imports` reads `cx.walk()`; `stability` walks again (about 10 ms) |
+| item walk | one pass over the items, shared | about 0.3 ms | at the bound: `cx.items()`, made once for both sides of the abort |
+| `imports` | one bit per import, then one visit per `use` tree | about 0.1 ms | about 150 ms: every path is resolved again |
+| `stability` | one table probe per resolved use | about 2.6 ms | about 160 ms: every path is resolved again, in a walk of its own |
+| `items`, after the abort | 17 checks at each of 10,000 items | about 2.4 ms | near the bound, plus on-demand path resolutions in five passes |
+| `effective` | one walk of each public interface per rise | the `dead` section's `reach` row | computed once, shared |
+
+The arithmetic behind each row follows.
+
+**Skipping allowed lints.** `cx.any_may_fire(&GIVES)` is one AND per word of a bitset built
+once per check. `imports` and `dead` test their whole set before any other work, and each
+sub-pass of `items` and `imports` tests its own. So under `--cap-lints allow` (every
+dependency cargo builds) `imports`, with its 150 ms of resolving paths again, and `dead` cost
+nothing. `stability` can't be skipped that way: E0658 is an error, not a lint, and std is a
+`staged_api` crate every crate uses, so its walk and resolutions run in every build. Its lints
+are skipped one by one (`deprecated` and `deprecated_in_future` before any text is made). E0446
+and the `#[macro_escape]` warning are not lints either.
+
+**The syntax walk.** One read of a node's kind from the walk's pre-order columns is about 2
+cycles; 800,000 nodes is 1.6 million cycles, about 0.5 ms. `imports` reads `cx.walk()`, the
+early lint pass's walk, which `lints::syntax` builds once. `stability/walk.rs` still walks the
+expanded syntax with rowan cursors: at about 45 cycles a node (a cursor allocated and freed,
+and a `SyntaxKind` dispatch) that is 36 million cycles, about 10 ms, 20 times the bound.
+What removes it: walk `cx.walk()`'s trees instead. The visit order is the same pre-order, and
+`stability` already sorts what it reports by its own key. It is a rewrite of the walk's
+traversal that I did not make blind, without a build, because its typeck order inside a body
+(a receiver before its method, a `let`'s initializer before its pattern) is easy to break.
+
+**`imports`.** rustc's bound: resolve already recorded the uses, so the lint is one bit test
+per binding plus one visit of each `use` tree to group what is unused. 2,000 trees at about
+200 cycles is 0.4 million cycles, about 0.1 ms. Now, without that record, `imports/used.rs`
+resolves every path again. Its own prefix lookups are memoized in one `HashTable`, at about
+100 cycles a hit: 180,000 paths cost 18 million cycles, about 5 ms. Each path is also checked
+against `sema.resolve_path`, whose `analyze_impl` (`find_container`, a `SourceAnalyzer` for
+the body, a source-map lookup, a resolver for the scope) costs about 3,000 cycles: 540
+million cycles, about 150 ms. That is three orders of magnitude over the bound. What removes
+it is in the front end: imports' request 1 (`used_imports`, recorded as nameres resolves) and
+the request "one table of a crate's path resolutions" in `v2/requests/diagnostics.md`. With
+both, the pass is a read of two tables.
+
+**`stability`.** rustc's bound: for each use, one probe of the deprecation and stability
+index, which `stability/lookup.rs` already is: a `HashTable` hashed once, its 8-byte slots in
+`u32`-numbered arenas, at about 50 cycles a probe. 180,000 uses cost 9 million cycles, about
+2.6 ms. Now each use's resolution is a `sema.resolve_path`, or a `resolve_method_call` for
+method calls and fields, at about 3,000 cycles: about 150 ms, plus the 10 ms walk above. The
+same resolution table removes it. A name pre-filter (skip a path whose last segment names no
+deprecated or unstable definition) is not sound: `use old as new` renames, and std has
+deprecated items in every crate's scope.
+
+**`items` after the abort.** The bound is the 17 checks of `BuiltinCombinedLateLintModPass`
+at each item, most a `SyntaxKind` test or an attribute bit at about 50 cycles: 10,000 items
+times 17 is 8.5 million cycles, about 2.4 ms. The walk is shared, the crate's features and
+lang items are read once (`items::Krate`), and text is made only for what fires. It is near
+the bound except where five passes resolve a path on demand (`bounds::drop`, `c_void`,
+`lifetime_syntax`, `naming`'s path patterns, `privacy::visit`), each at about 3,000 cycles.
+Those paths are few (bounds, return types, patterns of consts), and the same resolution table
+removes their cost.
+
+**`effective`.** See `reach` in the `dead_code` section: computed once in
+`names::after_abort` and passed to `dead` and to `items`.
+
+### The whole pass
+
+Bound: about 6 ms for the 100,000-line crate on one core: the shared walks about 0.8 ms,
+`imports` 0.1 ms, `stability` 2.6 ms, `items` 2.4 ms. Now: about 320 ms, nearly all of it
+paths resolved again through `Semantics`, once by `imports` and once by `stability`.
+
+What stands in the way of the 90% mark is in the front end, not in these passes: hir-def
+recording which imports each resolution went through (imports' request 1), and one table of
+path resolutions recorded as lowering and inference make them (filed by
+`diagnostics-lints-names`). With both, `imports` and `stability` drop to their bounds without
+changing their rules. The one change in these passes still to make is `stability`'s walk onto
+`cx.walk()`, after the first build (about 10 ms to 0.5 ms).
+
+None of these passes does I/O or a syscall, and none is parallel. Modules are independent for
+`items` and `stability`, so the passes could split across cores by module. At a 6 ms bound
+on one core, with the driver already running crates in parallel, that is not where the time is.
+
+## The driver, dedup and closing lines (`diagnostics`, the parent)
+
+`check.rs`, `model.rs`, `emit/` and `api.rs`. The parts that run on every check of a crate
+that has nothing to report are `check_crate_with`'s glue: the task frame, the phase sort, the
+partition of stashed warnings, `finish` and `summary`. Everything else here runs per
+diagnostic, so it is the edge (principles.md: formatting happens there).
+
+| Component | Work | Bound | Now |
+| --- | --- | --- | --- |
+| A check's task | one `frame::task`, one frame reset | under 1 µs | at the bound |
+| Phase sort | radix sort on a `u8` key over what was found | about 2 cycles per diagnostic | at the bound (`blaze_ids::radix`) |
+| `finish` (dedup, once-notes) | one 128-bit hash per diagnostic and per once-note | about 200 ns per diagnostic of about 200 bytes | at the bound; no copy kept |
+| `summary` | one pass counting levels, codes sorted only when an error has one | zero allocations with nothing to say | at the bound (budget test) |
+| Rendering (`emit`) | annotate-snippets per diagnostic | rustc's own emitter | the same library and version as rustc |
+
+**The state of the art.** rustc's `DiagCtxtInner::emit_diagnostic` dedups with a set of
+`Hash128` per diagnostic emitted (a StableHasher, SipHash-128). Ours is the same design with a
+faster hash: BLAKE3 cut to 128 bits, the hash principles.md names, whose SIMD paths run at
+several GB/s against SipHash's about 1 to 2. Before this pass the set held a clone of every
+diagnostic, and the closing count a second clone. It now holds 16 bytes per diagnostic and
+counts by `u32` index into what is written.
+
+**Memory.** A check is one `blaze_mem::frame::task(Tag::Diagnostics, ..)`. `Cx::frame()`
+gives it to every pass, so their crate-sized tables are `Vec<T, &Frame>` and are freed in one
+reset when the check returns. Only the `Vec<Diag>` it returns outlives the task, and on a crate
+with nothing to report that `Vec` is empty and unallocated.
+
+**Budget test.** `check.rs`, `a_crate_with_nothing_to_say_costs_the_driver_no_allocation`:
+`written` with nothing found makes zero allocations.
+
+**What stands in the way.**
+- `Tag::Diagnostics` is requested of mem (`v2/requests/diagnostics.md` 9).
+- The passes the driver calls are the rest of the cost. Their sections follow, one per part:
+  `diagnostics-speed-{checks,lower,lints,bodies}`.
+- Every check walks the whole crate. The edit bound ("recomputing only what changed") needs
+  each pass's results per item, as queries, so an edit rechecks only the items it touched. That
+  is the next step after the per-pass speed work. It needs the passes to read per-item inputs,
+  which they mostly do (the store's bodies and the item tree).
+
+## Lowering and printing (`diagnostics-speed-lower`)
+
+`crates/blaze-diagnostics/src/lower/` turns each `hir::AnyDiagnostic` into rustc's
+diagnostic. `print/` prints types and paths as rustc does. Most lowerings run only when
+something is wrong, which is the edge. Five things run on a crate with nothing to report, or
+once per suggestion over the whole crate:
+
+- `lower/parse.rs` (every file);
+- the style and `unused_*` lints lowered from hir;
+- the typo and import-candidate helpers of `lower/unresolved_ident.rs`;
+- `lower/unresolved_import.rs`'s `Resolver`;
+- `print::Paths`, rustc's `trimmed_def_paths` and `visible_parent_map`.
+
+**The reference crate** is `dead_code`'s, about 100,000 lines and 800,000 syntax nodes,
+taken as about 300 files and 300 modules. Its direct dependencies are taken to add about
+90,000 declarations to the crate's 10,000, so about 100,000 (`D`). About 50,000 of those are
+public children reached from the dependencies' roots (`T`). These two numbers are
+assumptions; only the ratios matter.
+
+| Component | Work | Bound | Now |
+| --- | --- | --- | --- |
+| `parse`, clean crate | one memoized read per file | about 10 µs | at the bound, a dependency's outline included (`parse_errors_with_bodies`) |
+| Style lints from hir (`incorrect_case`) | one case check of the name's text | about 50 cycles per name | at the bound; one bit test when the lint is allowed everywhere |
+| `elided_lifetimes_in_paths` | nothing, being allow-by-default | one bit test per report | at the bound |
+| `Paths` (printing) | one listing of the public children, two walks over it | about 2 ms, once per check that prints a path | at the bound; nothing on a clean crate |
+| `Decls` (imports) | one pass over `D` declarations, then one probe per name | about 1.7 ms once, then about 50 ns per lookup | at the bound |
+| `typo` | names in scope, an edit distance each, one span | rustc's `lookup_typo_candidate` | at the bound |
+
+**`parse`.** rustc lexes and parses each file once and stores its errors. Before this pass the
+clean path called `errors_with_bodies()` on every file. On a file parsed in full that runs
+`validation::validate` over the whole tree each time: 800,000 nodes at about 30 cycles is
+24 million cycles, about 7 ms per check. It also allocated two `Vec`s per module
+(`checks::modules`' children and `path_to_root`). Now a crate whose files all parse is one pass
+over the def map's module table, reading the memoized `parse_errors` of each file: 300 salsa
+memo hits at about 100 cycles, about 10 µs, with no allocation. The ordered walk of rustc's
+module order runs only when some file has an error.
+
+**Style lints.** hir finds names by rust-analyzer's rules and rustc's rules drop some of them.
+Before, every name was turned into a syntax node and a span before rustc's check ran. The check
+also allocated a `Vec` per character (`to_titlecase`), plus a `String` for the kind. Now
+rustc's check of the text runs first, and the case mapping is an iterator. `lint_may_fire`, one
+bit test, skips the lowering where the lint is allowed everywhere (`--cap-lints allow` on a
+dependency, or `#![allow(..)]` at the crate root). `elided_lifetimes_in_paths` is allowed by
+default and hir reports every elided path, so the same test turns about a thousand full
+`Diag`s per crate, built and then dropped, into a thousand bit tests. `unused_must_use`,
+`borrowck_error`'s `unused_mut` and `missing_unsafe`'s `unsafe_op_in_unsafe_fn` get the same
+test. So does `deprecated_safe_2024` for a call whose attribute says what to audit; without one,
+the call is E0133 at any level. Under `--cap-lints allow` they cost a
+dependency nothing.
+
+**`Paths`.** rustc's `trimmed_def_paths` builds one map per crate session by walking the
+visible children of every crate. `visible_parent_map` is a second breadth-first walk. Before,
+blaze listed every module's children twice, once per table, each time into a fresh `Vec`. Now
+`Tree` lists the public children once into frame columns (`T` rows, about 50,000). The
+trimmed-name walk (depth first, a `u64` bitset for what it has seen) and the visible-parent walk
+(breadth first, a queue column with a head index) read those rows. At about 150 cycles per row
+(a hash insert and a `#[doc(hidden)]` check), that is 7.5 million cycles, about 2 ms, which is
+rustc's one map per crate. It is built only when a path is first printed, so it costs nothing
+on a clean crate. Every lookup afterwards is one probe: `trimmed`, `visible_parent`,
+`extern_crate`, and `reexport_name`, which also scans one node's rows.
+
+**`Decls`, the import candidates.** rustc's `lookup_import_candidates` walks every module of
+every crate for each name it looks up: `O(D)`, about 1.7 ms, per unresolved name. blaze did the
+same, collecting each module's declarations into a `Vec` on the way. Now `Decls` walks the
+`D` declarations once per check, in the frame, at about 60 cycles each (one `FxHash` entry on
+the interned `Symbol`, one push). It then groups them by name with a counting placement: two
+sequential passes, no comparison sort. A lookup is `Symbol::find`, which interns nothing, plus
+one probe, and returns a slice, with zero allocations. For `k` unresolved names that is
+`O(D + k)` against rustc's `O(k·D)`, which beats rustc from the second name on.
+`unresolved_import`'s `module_candidate` uses `Decls` too, instead of every module's name.
+`checks/names/paths.rs` is to use it for `named` and `variant_enums`
+(`v2/requests/diagnostics-speed-lower.md` 4).
+
+**`typo`.** rustc's `lookup_typo_candidate` collects the names in scope of the namespace,
+sorts them and takes `find_best_match_for_name`, an edit distance per candidate. The shared
+`typo` (`pub(crate)`, taking `Names` and `PathSource`) does the same, matching it. Before, the
+value-namespace copy also computed the definition's head span for every candidate. That is a
+`to_string` of the item's whole text, so it cost the total length of every item in scope. Now
+names stay `&'static str` from the interner, and one span is computed, for the candidate
+chosen. `unresolved_import`'s `Resolver` asks Semantics for its module once (`current`, in a
+`OnceCell`), not once per path segment.
+
+**Budget tests.** In `tests/bodies/speed.rs`:
+
+- `a_clean_crate_parses_in_constant_allocations`: `parse::parsed` of 4 clean files and of 32
+  makes the same number of allocations, at most 2.
+- `path_and_import_lookups_allocate_nothing`: once the tables are built, `Decls::named`,
+  `trimmed`, `visible_parent` and `reexport_name` make zero allocations.
+
+**What stands in the way.**
+- `cx.rs` must hold `Paths<'a>` (`v2/requests/diagnostics-speed-lower.md` 1). The crate does not
+  compile without it.
+- `incorrect_case` reads hir's kind through its `Display` into a stack buffer until hir exports
+  `IdentType` (request 2).
+- `checks/names/paths.rs` keeps its own copies of `typo` and the import candidates, scanning
+  every module per lookup, until it uses the shared ones (request 4).
+- `typo` still copies the names in scope into a `Vec` per diagnostic, which is rustc's design.
+  Below that, the bound is a per-module index of names by length for the edit-distance cutoff.
+  That only pays off when many typos are reported in one scope.
+
+## Bodies (`diagnostics-speed-bodies`)
+
+`crates/blaze-diagnostics/src/lints/bodies.rs` and `lints/bodies/`: what rustc lints in
+bodies. Before the abort, there are six passes per body: typeck's `unreachable_code`, match
+checking, `unused_unsafe`, `unconditional_recursion`, liveness and the known-panics lint.
+After the abort, there are rustc's 31 late lint passes of expressions, statements and patterns
+(`BuiltinCombinedLateLintModPass`).
+
+**The reference crate** is the one `dead_code` uses: 100,000 lines, 500,000 body nodes and
+3,000 bodies, about 170 nodes each. Of the nodes, about 120,000 are paths, about 60,000
+method calls and about 60,000 calls. The MIR is about two statements per body node, so about
+1 million statements. Cycles are at 3 GHz.
+
+**The state of the art.** rustc's late lints are one HIR walk with every builtin pass in one
+combined pass. Each pass's `check_expr` is inlined at every node and tests the node's kind
+itself. Only the non-builtin passes are dropped by `lints_that_dont_need_to_run`; of the
+builtin ones, `IfLetRescope` checks it itself. Liveness is `check_liveness` on MIR
+(`rustc_mir_transform/src/liveness.rs`): one dataflow per body over MIR that borrow checking
+builds anyway.
+
+### Bounds and where the passes stand
+
+None of the "now" figures below are timed: this lane runs no build. Each one counts the
+operations in the code, using the costs of the `dead_code` section.
+
+| Component | Work | Bound | Now | Was |
+| --- | --- | --- | --- | --- |
+| The late walk | one decode and one tag dispatch per node | about 2.5 ms | at the bound | about 130 ms |
+| The late passes at the nodes they look at | one shared callee per call, one compare per pass | about 6 ms | about 15 ms | about 19 ms |
+| A fully allowed pass | none | 0 | 0 | as if it fired |
+| Liveness | one dataflow over the MIR | about 7 ms | about 12 ms | about 12 ms |
+| `unused_unsafe` | one tag scan of a body without `unsafe` | about 1 ms | about 3 ms | about 3 ms |
+
+**The late walk.** The bound is one visit per node: a decode from the store's columns and a
+tag dispatch, about 15 cycles. 500,000 nodes is 7.5 million cycles, about 2.5 ms.
+
+The walk was 31 passes behind `Box<dyn LatePass>`, every pass called at every node, each one
+decoding the node again to test its kind. At about 25 cycles a call, that was 500,000 × 31 ×
+25 = 390 million cycles, about 130 ms. Now each node is decoded once. Its tag indexes a table,
+built once per crate, of the passes that look at that kind (`LatePass::EXPRS`, `PATS`,
+`HOOKS`). Each pass is a variant of the `Pass` enum, called by `match`. A literal reaches 1
+pass, a path 1, and a block, `let` or field access 0 to 4. That is what rustc's combined pass
+does, minus the kind test of every pass at every node, so it matches or beats rustc's walk.
+
+**The late passes at the nodes they look at.** 12 passes look at a call and 9 at a method
+call. Each one decodes the node again, reads a type from `InferenceResult` and compares the
+callee or the method with what it lints. That is about 45 cycles per pass:
+60,000 × 12 × 45 + 60,000 × 9 × 45 is about 57 million cycles, about 19 ms. Resolving a
+path's value goes through one per-body cache (`BodyCx::path_value`), so the passes that ask
+about one callee pay for the scope resolver once.
+
+Some per-node work now comes after the cheapest test that can rule a node out:
+- `MutableTransmutes` tests the path's `FnDef` before resolving the path.
+- `UnusedAllocation` reads the adjustments before resolving the path.
+- `noop_method_call` resolves the impl before reading the source.
+- `map_unit_fn` resolves the method before walking ancestors.
+- `CheckTransmutes` builds its closure and const map only for a body with a transmute in it.
+- `IfLetRescope` records parents during the walk, with no prescan of the body.
+- `DropForgetUseless` records only the match arms that are calls.
+
+With those, "now" is about 15 ms. The bound is a fact computed once per call node and shared
+by the passes: the callee's `FunctionId` and diagnostic item, then a compare per pass. That
+is 120,000 × (100 + 10 × 5) cycles, about 6 ms.
+
+**A fully allowed pass.** Each pass declares its lints as a `LintSet` made at compile time
+(`lint_set`, through `LintId::named`, so a misspelled name fails to build).
+`Passes::new` leaves a pass out of every table when `Cx::any_may_fire` says none of its lints
+can fire. `before_abort` does the same for its six passes (`Runs`). The test is one AND per
+word, once per crate. rustc runs its builtin passes even when they are allowed, so on a crate
+with `#![allow(...)]` this beats rustc. `DanglingPointers` checks each of its two halves
+against its own lint. A crate that allows every body lint returns before it looks up a body.
+
+**Liveness and the MIR lints.** The bound is one dataflow per body over MIR that is built
+once. Borrow checking builds that MIR, and `BodyCx::mir` and `runtime_mir` fetch it once per
+body for every pass. 1 million statements at about 20 cycles is about 7 ms. Now, before the
+dataflow, `is_naked` scans the statements and the guard scan scans them again. Liveness also
+builds an `InferCtxt` per body, about 5 µs, so 15 ms over 3,000 bodies; it is paid only by
+bodies with a variable to check. Together that is about 12 ms.
+
+The fastest technique is to fold `is_naked` into an attribute bit and to share one
+`InferCtxt` of `TypingMode::non_body_analysis` across the crate's bodies. Neither can be done
+inside this lane's paths (see the blockers below).
+
+**Preorders and buffers.** `BodyCx::exprs` is built only when a pass asks for it: liveness,
+the pointer lints, `invalid_from_utf8` and literals. It is built in `Scratch` buffers handed
+from body to body, and the `path_value` cache uses the same scratch. The crate grows them to
+its largest body once. The taint of a body, and the macro-expansion errors behind it, is
+worked out when a pass first asks, no longer for every body up front.
+
+**Budget tests.** In `lints/bodies/tests.rs`:
+
+- `dispatch_tables`: building `Passes::new` makes 0 allocations.
+- `preorder_reuses_scratch`: once the buffers are grown, the preorders of 8 bodies make 0
+  allocations.
+- `late_passes_per_crate`: `after_abort` makes no more allocations at 64 bodies than at 4.
+
+**What blocks the last 10%.**
+- hir-def keeps the kind byte of each expression as a column but does not expose it. A
+  `kinds_present() -> u64` per store would let a body skip the walk for passes whose kinds it
+  lacks, and let `unused_unsafe` and liveness's closure loop skip their scans. Request 1.
+- `#[naked]` and `#[automatically_derived]` are not in `AttrFlags`. `is_naked` scans MIR, and
+  `source::skipped` parses the impl's source for every method of a trait impl. Request 2.
+- `body_owners` (each body's file rank and offset, then a radix sort) runs in both
+  `before_abort` and `after_abort`. The parent could compute it once. Request 3.
+- A shared per-call callee fact needs the passes to take it from the walk. That is a rewrite
+  of 21 passes' `check_expr`; no build could verify it in this lane.
+
+## The checks hir does not make (`diagnostics-speed-checks`)
+
+`crates/blaze-diagnostics/src/checks.rs` and `checks/`: feature gates, attribute parsing and
+`check_mod_attrs`, AST validation, definitions and their conflicts, the resolver's errors in
+signatures, impls and the entry point. `checks::check` runs them in rustc's order, on every
+crate, and almost always finds nothing.
+
+**The reference crate** is the one `dead_code` uses: 800,000 syntax nodes and 10,000
+definitions. On top of those counts: about 20,000 attributes (doc comments included) on about
+10,000 owners, about 40,000 paths of types and traits in signatures and about 10,000 named
+lifetimes, about 2,000 impls of about 200 traits, and a few dozen staged dependencies at most
+(std's crates). Cycles are at 3.5 GHz.
+
+**The state of the art** is rustc's. `rustc_ast_passes` makes two AST walks, `AstValidator`
+and the post-expansion feature-gate visitor, and `rustc_attr_parsing` lowers each attribute
+once, when the AST is lowered to HIR. `check_mod_attrs` then reads the parsed attributes from
+HIR without parsing them again. rustc's resolver resolves each path once, in its late pass,
+with ribs pushed per item. A path it can see in a rib is found without a module lookup.
+`lib_features` is a query per crate, read once per session.
+
+### Bounds and where the checks stand
+
+None of the "now" figures below is timed: this lane runs no build. Each one counts the
+operations in the code, using the costs of the `dead_code` section.
+
+| Component | Work | Bound | Now | Was |
+| --- | --- | --- | --- | --- |
+| The walk | one per check, shared with the early lints and the levels | about 3.5 ms, once | once | twice |
+| The AST passes | one kind dispatch per node | about 0.7 ms | about 1.5 ms (three scans) | about 1.5 ms |
+| Attribute parsing and `check_mod_attrs` | one lowering per attribute | about 2 ms | at the bound | two lowerings, two `Session`s |
+| Signature paths | one resolution per path that needs one | about 10 ms | about 14 ms | about 30 ms |
+| Signature lifetimes | one ancestor walk per lifetime | about 0.5 ms | at the bound | a `Vec` and a node clone per binder |
+| Item scopes | one list per check | about 1 ms, once | once | four times |
+| Impls by trait | one hash probe per impl | under 0.1 ms | at the bound | a linear search and a `Vec` per trait |
+| Staged dependencies' features | one walk per dependency, only when needed | 0 for a crate with no library feature | 0 | every dependency, every check |
+
+**The walk.** `Walk::of` visits 800,000 nodes at about 15 cycles each (cursor arithmetic on the
+flat tree and a kind test), about 12 million cycles, about 3.5 ms. `checks::check` built its
+own walk while the early lints and the levels used `Cx::walk`. It now uses `Cx::walk` too, so
+the crate is walked once per check, not twice.
+
+**The AST passes.** `ast_validation::check` is rustc's `AstValidator` written as one scan of
+the walk's node array with a `SyntaxKind` dispatch, which matches rustc. `macros::check` and
+the post-expansion gates scan the same array again. With a kind test first (no cast, no node
+clone for nodes that are not macros), a scan is about 2 cycles per node, about 0.5 ms each.
+One fused scan with a kind-to-check table, as the bodies' late walk has, would save two of
+the three scans. It would need the passes' outputs merged in their current order, and that
+is not worth doing without a build.
+
+**Attribute parsing and `check_mod_attrs`.** rustc lowers each attribute once. Here,
+`parsed` and `checked` each built a `Session` (the features, the target and the registered
+tools) and each lowered every attribute: `checked` lowered them again quietly to get what
+`parsed` had already made. Now `checks::check` builds one `Session` from the features
+`configured` found. `parsed` lowers each owner's attributes once, into one CSR list in the
+check's frame (`Lowered`: two allocations per crate), and `checked` and the stability pass
+read that list back as slices. Paths are matched against rustc's tables through `with_path`,
+a `SmallVec` of `&str` borrowed from the syntax, and `is`, which compares one name, instead of
+building `Vec<String>`s. The builtin tools are a `const` array, so a crate that registers no
+tool has an empty list. At about 300 cycles per attribute (a table lookup, an argument parse,
+a parser's accept), 20,000 attributes cost about 6 million cycles, about 2 ms, which is the
+bound.
+
+**Signature paths.** The work is to resolve each path that can fail. rustc resolves each path
+once, and a type parameter is found in the item's rib. Here, each `PathType` paid for:
+- a `String` per segment;
+- the Semantics scope of the path, which builds a source analyzer;
+- `resolve_path_per_ns`;
+- for a path of several segments, every prefix resolved twice, once by the prefix loop and
+  once by the privacy test.
+
+Now the checks run in this order, cheapest first:
+- The syntax is checked first, with nothing copied (`is_named`).
+- A one-segment path naming a type parameter that the item, or the impl or trait around it,
+  declares is ruled out from the syntax (`is_own_type_param`). That is rustc's rib lookup
+  done without Semantics, and it only applies in a file of source, where hygiene cannot
+  change what the name means.
+- The scope (the module the path is in) is asked for only when an error or the privacy test
+  needs it. The privacy test asks for it only when an item is not `pub`.
+- A one-segment path skips the privacy test, which can never fire for it.
+- The privacy test reuses the prefixes' resolutions.
+- Segment names are copied only to build a diagnostic.
+
+The item key of a signature's fact is a query, and it is now asked only when a diagnostic
+fires. The signatures are visited as they are found instead of being collected. At about
+1,000 cycles per resolution, for the roughly 60% of the 40,000 paths that are not ruled out
+from the syntax, the cost is about 7 ms, plus about 2 ms for the syntax; the bound is about
+10 ms. The rest is primitive types (`u8`, `str`, `bool`), which still go to Semantics. They
+can't be ruled out from the syntax, because a module or import of that name changes what hir
+resolves them to. A per-crate fact "no name in the type namespace shadows a primitive" would
+rule them out with one bit test (request 2).
+
+**Signature lifetimes.** A lifetime is almost always declared by a binder around it. That
+binder is now found by one ancestor walk with nothing collected. The binders are gathered
+into a `Vec` only for the error, by a second walk. About 10,000 lifetimes at about 150 cycles
+is about 0.5 ms, which is the bound.
+
+**Item scopes.** `defs::scopes` lists every module, plus the block scopes of every body
+(3,000 `Body::of` reads). It was rebuilt by `defs`, `names`, `reexports` and `impls`, and is
+now made once in `checks::check` and passed down. `checks::modules` pushes each module's
+children onto its stack and reverses them in place, with no `Vec` per module.
+
+**Impls by trait.** rustc's `local_trait_impls` is a map from each trait to its impls. Here,
+the grouping searched a `Vec` of traits linearly for every impl and kept a `Vec` per trait,
+asked each impl for its trait twice, and searched the incoherent traits linearly. Now there is
+one `FxHashMap` probe per impl. The impls of each trait are a CSR list built by counting
+sort, and the incoherent traits are a `bool` per trait slot, all in the check's frame. The
+per-module buffer of `impls` is reused. `denies_explicit_impls` still parses each implemented
+trait's source to read one attribute, std's traits included (request 3).
+
+**Staged dependencies.** rustc reads `lib_features` per crate, once. `library::check` reads a
+dependency's library features (a full `Walk::of` of it) only when a feature the crate enables
+is not found in the crates before it. Each dependency is read at most once per check, through
+`Libraries`. Every crate's implications are read only for a stable feature, and only when
+`stable_features` may fire (`Cx::lint_may_fire`), because they word nothing else. A crate that
+enables no library feature reads none, which beats rustc, whose query runs once for each
+dependency it loads.
+
+**Budget tests.** In `checks/tests.rs`:
+- `names_of_a_clean_crate_cost_the_same_at_any_size`: `names::check` of a crate whose
+  signatures name only their own type parameters and lifetimes makes as many allocations at
+  64 items as at 8, and at most 8.
+- `attribute_paths_are_read_without_allocating`: `with_path` and `is` over every attribute
+  make 0 allocations.
+- `an_owners_lowering_is_read_without_allocating`: `Lowered::of` for every owner makes 0
+  allocations.
+
+**What blocks the last 10%.** Each item is a request in
+`v2/requests/diagnostics-speed-checks.md`.
+- `owners` is computed twice per check, once by `checks::check` and once by the attribute
+  lints. A `Cx::owners()` cache next to `Cx::walk()` would make it once, saving about 0.6 ms
+  (request 1).
+- Primitive types in signatures go to Semantics. A per-crate bit, "nothing shadows a
+  primitive in the type namespace", made once from the def maps, would rule them out
+  (request 2).
+- `#[rustc_deny_explicit_impl]` is not in `TraitFlags`, so the attribute is read by parsing
+  each trait's source (request 3).
+- `hot_lint.py` still reports about 1,200 findings in `checks/`. The entry loops of every
+  check were audited, and what they run before a diagnostic is certain is fixed above. The
+  findings inside the checks' own helpers (`attrs/args.rs`, `ast_validation/*`, `defs/*`,
+  `impls/*`) have not been audited line by line, and none is marked `// alloc:` yet.

@@ -32,7 +32,7 @@ edit costs O(file) hashing (about 70 µs for 400 KB). With the hash carried, an 
 anchor's hash is one load, and an edit rehashes only the anchors it changed. The values are the
 same as before, so nothing stored or compared changes.
 
-> forwarded to speed-hir-store (window `speed-hir-store-next1`, told by tmux).
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 
 > applied by speed-hir-store (2026-10-29 20:35): `subtree_hash` is `tree.subtree_hash(at)`, the
 > `Blake3` adapter is gone (nothing else used it), `tree_hash`'s doc says the hash is carried.
@@ -46,7 +46,7 @@ What: `fn tree_hash(tree: &FlatTree) -> u128` becomes `tree.subtree_hash(0)` (or
 for a signature's tree hash" asks; after the change above that is the same call).
 Why: one pass, and a signature's tree that is rebuilt keeps its root's hash once made.
 
-> forwarded to speed-hir (for speed-hir-defs-sigs, which has no window; the lead told by tmux).
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 
 > speed-hir-defs-sigs (2026-10-29): nothing to change. `tree_hash` was already gone:
 > `SignatureSyntax`, and now `FileOutline`, compare the tree by content (`FlatTree: PartialEq`),

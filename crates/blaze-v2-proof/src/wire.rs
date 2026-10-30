@@ -6,14 +6,18 @@
 //!
 //! [`View`] reads the columns in place, the file mapped, after one check across cores that every
 //! index is in bounds and the keys are sorted; [`Trace`]'s `Deserialize` copies them out of the
-//! same view.
+//! same view. Writing one fills a single column buffer eight times over, in the order of the
+//! keys' encoding, so the encoder writes the map straight through and never sorts it.
 
-use blaze_ids::{ContentId, Fingerprint};
+use blaze_ids::{
+    ContentId, Fingerprint,
+    bits::{self, BitSet},
+};
 use blaze_query::{QueryKey, QueryKind};
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de, ser::SerializeStruct as _};
 
 use crate::{
-    Bits, Trace,
+    Trace,
     join::{self, Columns},
 };
 
@@ -36,8 +40,8 @@ impl<'de: 'a, 'a> Deserialize<'de> for Bytes<'a> {
     }
 }
 
-/// The file: `n` keys and `m` edges.
-#[derive(Serialize, Deserialize)]
+/// The file: `n` keys and `m` edges. Read by its derive; written by [`Trace`]'s `Serialize`.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File<'a> {
     version: u64,
@@ -84,12 +88,15 @@ fn exact<'a, const N: usize>(bytes: Bytes<'a>, what: &str) -> Result<&'a [[u8; N
     if rest.is_empty() {
         Ok(whole)
     } else {
+        // alloc: error path, and the trace is refused.
         Err(format!("the trace's `{what}` has {} bytes, not a multiple of {N}", bytes.0.len()))
     }
 }
 
+/// Bit `i` of mapped little-endian words, which need not be aligned for a `BitSlice`.
 fn bit(words: &[[u8; 8]], i: usize) -> bool {
-    (u64::from_le_bytes(words[i / 64]) >> (i % 64)) & 1 == 1
+    let (word, mask) = bits::locate(i);
+    u64::from_le_bytes(words[word]) & mask != 0
 }
 
 impl<'a> View<'a> {
@@ -97,12 +104,14 @@ impl<'a> View<'a> {
     /// order and ending at the last edge, every edge reading a key of the trace, the keys strictly
     /// ascending. Nothing past the check can index out of bounds or join out of order.
     pub fn parse(bytes: &'a [u8]) -> Result<View<'a>, String> {
+        // alloc: error path, and the trace is refused.
         let file: File<'a> = blaze_protocol::cbor::from_slice(bytes).map_err(|e| format!("the trace: {e}"))?;
         View::of(file)
     }
 
     fn of(file: File<'a>) -> Result<View<'a>, String> {
         if file.version != VERSION {
+            // alloc: error path, and the trace is refused.
             return Err(format!("a trace of version {}; this reads version {VERSION}", file.version));
         }
         let view = View {
@@ -125,7 +134,7 @@ impl<'a> View<'a> {
 
     fn check(&self) -> Result<(), String> {
         let (n, m) = (self.kinds.len(), self.reads.len());
-        let words = n.div_ceil(64);
+        let words = bits::words_for(n);
         let lengths = [
             ("inputs", self.inputs.len(), n),
             ("has", self.has.len(), words),
@@ -134,38 +143,56 @@ impl<'a> View<'a> {
             ("saw", self.saw.len(), m),
         ];
         if let Some((what, got, want)) = lengths.into_iter().find(|&(_, got, want)| got != want) {
+            // alloc: error path, and the trace is refused.
             return Err(format!("the trace has {n} keys and {m} edges, and {got} elements of `{what}`, not {want}"));
         }
         if n == 0 && self.edges_from.is_empty() {
+            // alloc: error path, and the trace is refused.
             return if m == 0 { Ok(()) } else { Err(format!("the trace has no keys and {m} edges")) };
         }
         if self.edges_from.len() != n + 1 || self.from(0) != 0 || self.from(n) != m {
+            // alloc: error path, and the trace is refused.
             return Err(format!("the trace's `edges_from` does not run from 0 to its {m} edges over its {n} keys"));
         }
-        let pieces = join::pieces(n);
-        let unsorted = join::split(n, pieces, |range| {
-            range.into_iter().find(|&i| self.from(i) > self.from(i + 1) || (i > 0 && self.key(i - 1) >= self.key(i)))
-        });
-        if let Some(i) = unsorted.into_iter().flatten().next() {
+        let mut unsorted = None;
+        join::split(
+            n,
+            join::pieces(n),
+            |range| range.into_iter().find(|&i| self.from(i) > self.from(i + 1) || (i > 0 && self.key(i - 1) >= self.key(i))),
+            |piece| unsorted = unsorted.or(piece),
+        );
+        if let Some(i) = unsorted {
+            // alloc: error path, and the trace is refused.
             return Err(format!("the trace's key {i} is not above the one before it, or its edges end before they start"));
         }
-        let highest = join::split(m, join::pieces(m), |range| {
-            range.into_iter().map(|e| u32::from_le_bytes(self.reads[e])).max()
-        });
-        match highest.into_iter().flatten().max() {
+        let mut highest = None;
+        join::split(
+            m,
+            join::pieces(m),
+            |range| range.into_iter().map(|e| u32::from_le_bytes(self.reads[e])).max(),
+            |piece| highest = highest.max(piece),
+        );
+        match highest {
+            // alloc: error path, and the trace is refused.
             Some(read) if read as usize >= n => Err(format!("an edge of the trace reads key {read}; it has {n}")),
             _ => Ok(()),
         }
     }
 
-    /// The trace as owned columns: one copy of each.
+    /// The trace as owned columns: one copy of each, each allocated once at its length.
     pub fn to_trace(&self) -> Trace {
-        let words = |column: &[[u8; 8]]| -> Bits { Bits(column.iter().map(|w| u64::from_le_bytes(*w)).collect()) };
+        let words = |column: &[[u8; 8]]| -> BitSet<u32> {
+            // alloc: the owned copy is the answer, once a trace.
+            BitSet::from_words(column.iter().map(|w| u64::from_le_bytes(*w)).collect())
+        };
         let fingerprints = |column: &[[u8; 16]]| -> Vec<Fingerprint> {
+            // alloc: as above.
             column.iter().map(|f| Fingerprint(u128::from_le_bytes(*f))).collect()
         };
+        // alloc: as above.
         let indices = |column: &[[u8; 4]]| -> Vec<u32> { column.iter().map(|w| u32::from_le_bytes(*w)).collect() };
         Trace {
+            // alloc: as above.
             keys: (0..self.kinds.len()).map(|i| self.key(i)).collect(),
             has: words(self.has),
             ran: words(self.ran),
@@ -211,33 +238,52 @@ impl Columns for View<'_> {
     }
 }
 
+/// `items` as `column`, each one's fixed-width little-endian bytes after the last's, written over
+/// what `column` held.
+fn fill<'c, T, const N: usize>(column: &'c mut Vec<u8>, items: &[T], bytes: impl Fn(&T) -> [u8; N]) -> Bytes<'c> {
+    column.clear();
+    for item in items {
+        column.extend_from_slice(&bytes(item));
+    }
+    Bytes(column)
+}
+
+/// A bitset's words, for [`fill`].
+fn words(set: &BitSet<u32>) -> &[u64] {
+    set.words()
+}
+
 impl Serialize for Trace {
+    /// [`File`]'s fields in the order of their keys' encoding (shorter first, then bytewise), the
+    /// order the deterministic encoding gives them: the encoder writes each straight through, where
+    /// fields in declaration order would be put in order at the end through a copy the size of the
+    /// whole trace. Each column is filled into the one buffer, sized once for the longest, and
+    /// written before the next is filled.
     fn serialize<S: Serializer>(&self, to: S) -> Result<S::Ok, S::Error> {
-        let n = self.keys.len();
-        let mut kinds = Vec::with_capacity(2 * n);
-        let mut inputs = Vec::with_capacity(32 * n);
-        for key in &self.keys {
-            kinds.extend_from_slice(&key.kind.0.to_le_bytes());
-            inputs.extend_from_slice(&key.input.0);
-        }
-        let words = |bits: &Bits| bits.0.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
-        let wide = |column: &[Fingerprint]| column.iter().flat_map(|f| f.0.to_le_bytes()).collect::<Vec<u8>>();
-        let narrow = |column: &[u32]| column.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
         let (has, ran) = (words(&self.has), words(&self.ran));
-        let (fingerprints, saw) = (wide(&self.fingerprints), wide(&self.saw));
-        let (edges_from, reads) = (narrow(&self.edges_from), narrow(&self.reads));
-        File {
-            version: VERSION,
-            kinds: Bytes(&kinds),
-            inputs: Bytes(&inputs),
-            has: Bytes(&has),
-            ran: Bytes(&ran),
-            fingerprints: Bytes(&fingerprints),
-            edges_from: Bytes(&edges_from),
-            reads: Bytes(&reads),
-            saw: Bytes(&saw),
-        }
-        .serialize(to)
+        let longest = [
+            2 * self.keys.len(),
+            32 * self.keys.len(),
+            8 * has.len(),
+            8 * ran.len(),
+            16 * self.fingerprints.len(),
+            4 * self.edges_from.len(),
+            4 * self.reads.len(),
+            16 * self.saw.len(),
+        ];
+        // alloc: once a trace written, the one buffer every column is filled into.
+        let mut column = Vec::with_capacity(longest.into_iter().max().unwrap_or(0));
+        let mut file = to.serialize_struct("File", 9)?;
+        file.serialize_field("has", &fill(&mut column, has, |w| w.to_le_bytes()))?;
+        file.serialize_field("ran", &fill(&mut column, ran, |w| w.to_le_bytes()))?;
+        file.serialize_field("saw", &fill(&mut column, &self.saw, |f| f.0.to_le_bytes()))?;
+        file.serialize_field("kinds", &fill(&mut column, &self.keys, |k| k.kind.0.to_le_bytes()))?;
+        file.serialize_field("reads", &fill(&mut column, &self.reads, |r| r.to_le_bytes()))?;
+        file.serialize_field("inputs", &fill(&mut column, &self.keys, |k| k.input.0))?;
+        file.serialize_field("version", &VERSION)?;
+        file.serialize_field("edges_from", &fill(&mut column, &self.edges_from, |e| e.to_le_bytes()))?;
+        file.serialize_field("fingerprints", &fill(&mut column, &self.fingerprints, |f| f.0.to_le_bytes()))?;
+        file.end()
     }
 }
 
@@ -253,7 +299,7 @@ pub(crate) mod tests {
     use blaze_ids::{ContentId, Fingerprint};
     use blaze_query::{Edge, QueryKey, QueryKind};
 
-    use super::View;
+    use super::{Bytes, View};
     use crate::{Rng, Trace, TraceBuilder, join::Columns};
 
     /// A trace of `results` results over `keys` keys, each reading up to 6 of them, by `seed`.
@@ -301,6 +347,82 @@ pub(crate) mod tests {
         for e in 0..trace.reads.len() {
             assert_eq!((view.read(e), view.saw(e)), (trace.read(e), trace.saw(e)));
         }
+    }
+
+    /// The file as `Trace` wrote it before: [`super::File`]'s fields in declaration order, each
+    /// column a buffer of its own, which the encoder puts in key order at the end.
+    #[derive(serde::Serialize)]
+    struct Declared<'a> {
+        version: u64,
+        kinds: Bytes<'a>,
+        inputs: Bytes<'a>,
+        has: Bytes<'a>,
+        ran: Bytes<'a>,
+        fingerprints: Bytes<'a>,
+        edges_from: Bytes<'a>,
+        reads: Bytes<'a>,
+        saw: Bytes<'a>,
+    }
+
+    fn declared(trace: &Trace) -> (Vec<u8>, u64) {
+        let le = |words: &[u64]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let wide = |column: &[Fingerprint]| column.iter().flat_map(|f| f.0.to_le_bytes()).collect::<Vec<u8>>();
+        let narrow = |column: &[u32]| column.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
+        let kinds: Vec<u8> = trace.keys.iter().flat_map(|k| k.kind.0.to_le_bytes()).collect();
+        let inputs: Vec<u8> = trace.keys.iter().flat_map(|k| k.input.0).collect();
+        let (has, ran) = (le(super::words(&trace.has)), le(super::words(&trace.ran)));
+        let (fingerprints, saw) = (wide(&trace.fingerprints), wide(&trace.saw));
+        let (edges_from, reads) = (narrow(&trace.edges_from), narrow(&trace.reads));
+        let file = Declared {
+            version: super::VERSION,
+            kinds: Bytes(&kinds),
+            inputs: Bytes(&inputs),
+            has: Bytes(&has),
+            ran: Bytes(&ran),
+            fingerprints: Bytes(&fingerprints),
+            edges_from: Bytes(&edges_from),
+            reads: Bytes(&reads),
+            saw: Bytes(&saw),
+        };
+        let (mut writer, mut out) = (blaze_protocol::cbor::Writer::new(), Vec::new());
+        writer.append(&mut out, &file).unwrap();
+        (out, writer.permuted())
+    }
+
+    #[test]
+    fn a_trace_is_written_in_key_order_as_the_same_bytes() {
+        for seed in 0..20 {
+            let trace = seeded(seed, 1 + seed * 11, (seed * 17) as usize);
+            for trace in [trace, Trace::default(), TraceBuilder::default().finish()] {
+                let (want, permuted) = declared(&trace);
+                assert_eq!(permuted, 1, "seed {seed}: the declaration order is not the keys'");
+                let (mut writer, mut out) = (blaze_protocol::cbor::Writer::new(), Vec::new());
+                writer.append(&mut out, &trace).unwrap();
+                assert_eq!(out, want, "seed {seed}");
+                assert_eq!(writer.permuted(), 0, "seed {seed}: the fields came out of key order");
+            }
+        }
+    }
+
+    /// Writing a trace costs its one column buffer; reading one in place costs nothing.
+    #[test]
+    fn a_trace_is_written_with_one_buffer_and_read_with_none() {
+        let trace = seeded(12, 2000, 6000);
+        let bytes = blaze_protocol::cbor::to_vec(&trace).unwrap();
+        let (mut writer, mut out) = (blaze_protocol::cbor::Writer::new(), Vec::with_capacity(bytes.len()));
+        blaze_alloc_count::assert_at_most(1, "a trace written: its one column buffer", || {
+            writer.append(&mut out, &trace).unwrap()
+        });
+        assert_eq!(out, bytes);
+        View::parse(&bytes).unwrap();
+        let view = blaze_alloc_count::assert_at_most(0, "a trace parsed and checked in place, one piece", || {
+            View::parse(&bytes).unwrap()
+        });
+        assert_eq!(view.keys(), trace.keys());
+        let owned = blaze_alloc_count::assert_at_most(8, "a trace copied out: one allocation a column", || {
+            view.to_trace()
+        });
+        assert_eq!(owned, trace);
     }
 
     #[test]

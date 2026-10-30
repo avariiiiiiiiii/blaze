@@ -27,7 +27,7 @@ use std::{
 
 use blaze_ids::ContentId;
 use span::Edition;
-use syntax::{Parse, SourceFile, TextRange, TextSize, WeakParse};
+use syntax::{Parse, SourceFile, Text, TextRange, TextSize, WeakParse};
 
 /// How many parses of one text a slot keeps: one per edition and kind it is parsed in, and
 /// again after salsa let one go. Past that, the file's next edit is a whole parse.
@@ -43,7 +43,7 @@ pub struct Reparse {
 /// One text of a file and the parses made of it.
 struct Slot {
     /// The text, shared with its `FileText` and its parse's tree.
-    text: Arc<str>,
+    text: Text,
     /// Its blaze-vfs content ID ([`blaze_vfs::FILE_DOMAIN`]).
     id: ContentId,
     kept: [OnceLock<Kept>; KEPT],
@@ -75,7 +75,7 @@ impl fmt::Debug for Reparse {
 }
 
 impl Slot {
-    fn new(text: &Arc<str>, id: ContentId) -> Arc<Slot> {
+    fn new(text: &Text, id: ContentId) -> Arc<Slot> {
         // alloc: one slot per text set, in the setter; `text.clone()` is a refcount.
         Arc::new(Slot { text: text.clone(), id, kept: [const { OnceLock::new() }; KEPT] })
     }
@@ -88,13 +88,13 @@ impl Slot {
 
 impl Reparse {
     /// The first text of a file, `id` its blaze-vfs content ID: parsed whole.
-    pub(crate) fn new(text: &Arc<str>, id: ContentId) -> Reparse {
+    pub(crate) fn new(text: &Text, id: ContentId) -> Reparse {
         Reparse { slot: Slot::new(text, id), from: None }
     }
 
     /// The text a file is set to after the one `self` is of: made from that text's parse if
     /// one is kept, else from the parse the text before it was made from.
-    pub(crate) fn after(&self, text: &Arc<str>, id: ContentId) -> Reparse {
+    pub(crate) fn after(&self, text: &Text, id: ContentId) -> Reparse {
         let base = match self.slot.has_parse() {
             true => Some(&self.slot),
             false => self.from.as_ref().map(|(slot, _)| slot),
@@ -112,8 +112,8 @@ impl Reparse {
 
     /// The parse of `text` (this one's text) in `edition`, an outline when `outline`, made from
     /// the kept parse when there is one; kept for the next text.
-    pub(crate) fn parse(&self, text: &Arc<str>, edition: Edition, outline: bool) -> Parse<SourceFile> {
-        debug_assert!(Arc::ptr_eq(text, &self.slot.text), "a reparse of another text");
+    pub(crate) fn parse(&self, text: &Text, edition: Edition, outline: bool) -> Parse<SourceFile> {
+        debug_assert!(text.ptr_eq(&self.slot.text), "a reparse of another text");
         let parse = match self.previous(edition, outline) {
             Some((previous, delete)) => {
                 #[cfg(test)]
@@ -180,7 +180,7 @@ thread_local! {
     pub(crate) static REPARSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub(crate) fn whole(text: Arc<str>, edition: Edition, outline: bool) -> Parse<SourceFile> {
+pub(crate) fn whole(text: Text, edition: Edition, outline: bool) -> Parse<SourceFile> {
     match outline {
         true => SourceFile::parse_outline(text, edition),
         false => SourceFile::parse_shared(text, edition),
@@ -188,7 +188,7 @@ pub(crate) fn whole(text: Arc<str>, edition: Edition, outline: bool) -> Parse<So
 }
 
 /// Panics unless `made` is the parse a whole parse of `text` makes: the same tree and errors.
-pub(crate) fn assert_whole(made: &Parse<SourceFile>, text: &Arc<str>, edition: Edition, outline: bool) {
+pub(crate) fn assert_whole(made: &Parse<SourceFile>, text: &Text, edition: Edition, outline: bool) {
     // clone: the check of debug builds and tests, not of a release parse.
     let whole = whole(text.clone(), edition, outline);
     let tree = |parse: &Parse<SourceFile>| parse.syntax_node().flat_tree().cloned();

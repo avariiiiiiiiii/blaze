@@ -1285,3 +1285,18 @@ fn collecting_rewrites_the_journal_as_what_the_heads_reach() {
     vfs.flush(&mut effects);
     assert_eq!(effects, vec![]);
 }
+
+/// An op's bytes go over the wire as one byte string (the last field written), and the array
+/// serde writes by default is a second encoding of them, so it is refused.
+#[test]
+fn an_ops_bytes_are_one_byte_string() {
+    for op in [write("a/b", "\u{1}\u{2}\u{3}"), edit("a/b", 1, 2, "\u{1}\u{2}\u{3}")] {
+        let item = blaze_protocol::cbor::to_vec(&op).unwrap();
+        assert!(item.ends_with(&[0x43, 1, 2, 3]), "{item:x?}");
+        assert_eq!(blaze_protocol::cbor::from_slice::<Op>(&item).unwrap(), op);
+        let mut array = item.clone();
+        let head = array.len() - 4;
+        array[head] = 0x83;
+        assert!(blaze_protocol::cbor::from_slice::<Op>(&array).is_err(), "{array:x?}");
+    }
+}

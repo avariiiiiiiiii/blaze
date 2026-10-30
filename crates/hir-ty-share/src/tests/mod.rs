@@ -5,6 +5,7 @@
 //! nightly's rustc prints for each, for a differential run with sharing on.
 
 mod db;
+mod identity;
 
 use hir_def::{
     FunctionId, ModuleDefId, TypeAliasId,
@@ -19,7 +20,7 @@ use hir_ty::{
     mir::{MirOptLevel, MirOptions},
     next_solver::{GenericArg, GenericArgs, ParamEnv},
 };
-use hir_ty_mir::mir::{monomorphized, print_mir_body};
+use hir_ty_mir::mir::{monomorphized, monomorphized_args, print_mir_body};
 use test_fixture::WithFixture;
 
 use crate::{
@@ -439,6 +440,50 @@ fn equal_keys_mean_one_monomorphized_body() {
         }
         assert!(shared > 0, "some instances of `{body}` share");
     }
+}
+
+/// A key asked for again is one memo hit, and a hit allocates nothing.
+#[test]
+fn a_key_hit_allocates_nothing() {
+    let db = fixture();
+    hir_ty::attach_db(&db, || {
+        let instance = instance(&db, "outer", &[Ty("RefP")]);
+        let env = env(&db);
+        share_key(&db, &instance, &env, RUNTIME).as_ref().expect("a key");
+        let (hit, used) =
+            blaze_alloc_count::measure(|| share_key(&db, &instance, &env, RUNTIME).is_ok());
+        assert!(hit);
+        assert_eq!(used.allocations, 0, "a memo hit allocates nothing");
+    });
+}
+
+/// The key substitutes a body's sites at once, never the whole body: each local's type it reads
+/// is the one `monomorphized` puts in the body the code generator compiles.
+#[test]
+fn sites_are_filled_as_the_body_is() {
+    let db = fixture();
+    let pool = ["RefP", "RefQ", "RefD", "OwnP", "OwnD", "U32"];
+    let bodies = ["id", "outer", "size", "nd", "hold", "counter", "with_closure", "rec"];
+    hir_ty::attach_db(&db, || {
+        for body in bodies {
+            let owner = hir_ty::InferBodyId::DefWithBodyId(function(&db, body).into());
+            let generic = db.runtime_mir_body(owner).expect("a body");
+            let sites = crate::walk::sites(&db, ShareDef::Fn(function(&db, body)), OFF)
+                .as_ref()
+                .unwrap_or_else(|why| panic!("`{body}` has no sites: {why}"));
+            for arg in pool {
+                let instance = instance(&db, body, &[Ty(arg)]);
+                let whole = monomorphized(&db, generic, &instance.args, &env(&db)).expect("monomorphized");
+                let filled = monomorphized_args(&db, sites.filled.as_ref(), &instance.args, &env(&db))
+                    .expect("the sites filled");
+                let locals = filled.as_slice();
+                assert!(locals.len() >= whole.locals.len(), "`{body}`: every local is a site");
+                for (at, (_, local)) in whole.locals.iter().enumerate() {
+                    assert_eq!(locals[at].ty(), Some(local.ty.as_ref()), "`{body}` of `{arg}`, local {at}");
+                }
+            }
+        }
+    });
 }
 
 /// The monomorphized runtime body of `func` with the alias `arg`, printed, with the name of the

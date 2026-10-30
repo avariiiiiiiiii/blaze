@@ -104,6 +104,8 @@ struct Scratch {
     /// The dependencies of a node to show: how long each was busy, its place among the
     /// node's, and the node.
     deps: Vec<(u64, u32, u32)>,
+    /// The rows that held the build up ([`Build::critical_path_into`]).
+    chain: Vec<usize>,
 }
 
 /// A node of the tree to show: what its lines start with, and whether it is its parent's
@@ -150,6 +152,7 @@ impl Live {
             shown: Frame::default(),
             next: Frame::default(),
             stale: false,
+            // alloc: none until the first line that stays, then kept from draw to draw
             said: String::new(),
             scratch: Scratch::default(),
             least_ns: FRAME_NS,
@@ -191,6 +194,7 @@ impl Live {
     /// What to write for `record` at `now_ns`: the lines it adds that stay, and what changed
     /// of the region below them; at the build's end, the summary in the region's place.
     pub fn record(&mut self, record: &Record, now_ns: u64) -> String {
+        // alloc: the one-call form for the CLI; a loop writes `records_into` one buffer
         let mut out = String::new();
         self.record_into(record, now_ns, &mut out);
         out
@@ -236,6 +240,7 @@ impl Live {
 
     /// What changed of the region for the time that passed.
     pub fn tick(&mut self, now_ns: u64) -> String {
+        // alloc: the one-call form for the CLI; a loop writes `tick_into` one buffer
         let mut out = String::new();
         self.tick_into(now_ns, &mut out);
         out
@@ -250,6 +255,7 @@ impl Live {
     /// The region cleared, and the summary in its place when the build finished; lines
     /// held for a draw are written first.
     pub fn finish(&mut self) -> String {
+        // alloc: once per build, its end
         let mut out = String::new();
         let said = std::mem::take(&mut self.said);
         self.finish_with(&said, &mut out);
@@ -302,9 +308,11 @@ impl Live {
         let (mut frame, mut scratch) = (Frame::default(), Scratch::default());
         let Some(finished) = &self.build.finished else {
             pen.region(now_ns, &mut frame, &mut scratch);
+            // alloc: `blaze status`, once per ask
             return frame.lines().map(str::to_owned).collect();
         };
         pen.strip(finished.at_ns, &mut frame, &mut scratch.strip);
+        // alloc: `blaze status`, once per ask
         let mut lines: Vec<String> = frame.lines().map(str::to_owned).collect();
         lines.extend(last_lines(finished, self.color, false));
         lines
@@ -614,7 +622,7 @@ impl Pen<'_> {
         let build = self.build;
         let (graph, index) = (&build.graph, &build.index);
         let krate = |node: u32| &build.crates[graph[node as usize].row as usize];
-        let Scratch { shown, stack, deps, .. } = scratch;
+        let Scratch { shown, stack, deps, chain, .. } = scratch;
         // By row: the nodes of a crate are one line.
         shown.clear();
         shown.resize(build.crates.len(), false);
@@ -712,7 +720,8 @@ impl Pen<'_> {
         let busy_now =
             state(CrateState::Resolving) + state(CrateState::Checking) + state(CrateState::Running);
         let waiting = build.crates.len() - done - busy_now;
-        let (chain, chain_ns) = build.critical_path(now_ns);
+        let chain_ns = build.critical_path_into(now_ns, chain);
+        let chain = &*chain;
         self.fit(out, DIM, blank, |out| {
             put!(out, "{done} done");
             if up_to_date > 0 {
@@ -731,7 +740,7 @@ impl Pen<'_> {
         });
     }
 
-    /// The functions of crate `krate` compiling longest ([`Build::compiling_of`]), the top
+    /// The functions of crate `krate` compiling longest (`Build::compiling_top`), the top
     /// [`FUNCTIONS`] of them, each a line under the crate's starting with `under`.
     ///
     /// ```text

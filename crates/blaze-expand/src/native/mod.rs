@@ -3,7 +3,7 @@
 //! host that answers it ([`host`]), for the proc macros that run on blaze's own compiler
 //! (docs/v2/plan/design/compile-time.md, change 20). A macro sees what it sees as a module:
 //! the same span words (of the def, call and mixed sites' parts, then the input's and the
-//! attribute's as they first appear, as [`wire::Parts`] gives them), the same answers to what
+//! attribute's as they first appear, as [`Parts`] gives them), the same answers to what
 //! it asks of them, the same text of a stream, so its output is the module's token for token
 //! and span for span. [`difference`] names the first token where two outputs part.
 //!
@@ -12,10 +12,6 @@
 //! stream and the output built straight into blaze's tree, with no bytes between.
 
 mod host;
-#[allow(dead_code)]
-mod lex;
-#[allow(dead_code)]
-mod wire;
 
 #[cfg(test)]
 mod tests;
@@ -29,7 +25,8 @@ pub use native_proc_macro::TokenStream;
 use span::Span;
 use tt::{Leaf, TokenTree, TopSubtree};
 
-use self::{host::Host, wire::Parts};
+use self::host::Host;
+use crate::bridge::wire::Parts;
 
 /// A macro's entry point, compiled against the bridge's `proc_macro`.
 #[derive(Clone, Copy, Debug)]
@@ -78,8 +75,9 @@ pub fn expand(
 }
 
 /// The first difference of an output of the bridge (`native`) from what the macro gives
-/// elsewhere (`normal`: its wasm module, or rustc), or `None` when they are the same: every token tree, each delimiter, character, spacing, text, literal kind and
-/// suffix, and of every span its range, anchor and syntax context.
+/// elsewhere (`normal`: its wasm module, or rustc), or `None` when they are the same: every
+/// token tree, each delimiter, character, spacing, text, literal kind and suffix, and of every
+/// span its range, anchor and syntax context.
 pub fn difference(native: &TopSubtree, normal: &TopSubtree) -> Option<String> {
     let mut natively = native.as_token_trees().iter_flat_tokens();
     let mut normally = normal.as_token_trees().iter_flat_tokens();
@@ -89,10 +87,12 @@ pub fn difference(native: &TopSubtree, normal: &TopSubtree) -> Option<String> {
             (None, None) => return None,
             (Some(ours), Some(theirs)) => {
                 if let Some(what) = tree_difference(&ours, &theirs) {
+                    // alloc: the message of a difference, made only when there is one.
                     return Some(format!("token tree {at}, {}: {what}", shown(&theirs)));
                 }
             }
             (None, Some(theirs)) => {
+                // alloc: the message of a difference, made only when there is one.
                 return Some(format!(
                     "the native output ends after {at} token trees, where the macro's goes on \
                      with {}",
@@ -100,6 +100,7 @@ pub fn difference(native: &TopSubtree, normal: &TopSubtree) -> Option<String> {
                 ));
             }
             (Some(ours), None) => {
+                // alloc: the message of a difference, made only when there is one.
                 return Some(format!(
                     "the native output goes on after the macro's {at} token trees with {}",
                     shown(&ours),
@@ -115,6 +116,7 @@ fn tree_difference(ours: &TokenTree, theirs: &TokenTree) -> Option<String> {
         (TokenTree::Subtree(ours), TokenTree::Subtree(theirs)) => {
             let (a, b) = (ours.delimiter, theirs.delimiter);
             if a.kind != b.kind {
+                // alloc: the message of a difference, made only when there is one.
                 return Some(format!(
                     "its delimiter is {:?} natively and {:?} by the macro",
                     a.kind, b.kind
@@ -124,6 +126,7 @@ fn tree_difference(ours: &TokenTree, theirs: &TokenTree) -> Option<String> {
                 .or_else(|| span_difference("its closing delimiter's", a.close, b.close))
                 .or_else(|| {
                     (ours.len != theirs.len).then(|| {
+                        // alloc: the message of a difference, made only when there is one.
                         format!(
                             "it holds {} token trees natively and {} by the macro",
                             ours.len, theirs.len
@@ -132,6 +135,7 @@ fn tree_difference(ours: &TokenTree, theirs: &TokenTree) -> Option<String> {
                 })
         }
         (TokenTree::Leaf(ours), TokenTree::Leaf(theirs)) => leaf_difference(ours, theirs),
+        // alloc: the message of a difference, made only when there is one.
         _ => Some(format!(
             "it is {} natively and {} by the macro",
             tree_kind(ours),
@@ -142,6 +146,7 @@ fn tree_difference(ours: &TokenTree, theirs: &TokenTree) -> Option<String> {
 
 fn leaf_difference(ours: &Leaf, theirs: &Leaf) -> Option<String> {
     let differs = |what: &str, a: &dyn std::fmt::Debug, b: &dyn std::fmt::Debug| {
+        // alloc: the message of a difference, made only when there is one.
         Some(format!("its {what} is {a:?} natively and {b:?} by the macro"))
     };
     match (ours, theirs) {
@@ -175,6 +180,7 @@ fn leaf_difference(ours: &Leaf, theirs: &Leaf) -> Option<String> {
             }
             span_difference("its", a.span, b.span)
         }
+        // alloc: the message of a difference, made only when there is one.
         _ => Some(format!(
             "it is {} natively and {} by the macro",
             leaf_kind(ours),
@@ -185,18 +191,21 @@ fn leaf_difference(ours: &Leaf, theirs: &Leaf) -> Option<String> {
 
 fn span_difference(whose: &str, ours: Span, theirs: Span) -> Option<String> {
     if ours.range != theirs.range {
+        // alloc: the message of a difference, made only when there is one.
         return Some(format!(
             "{whose} range is {:?} natively and {:?} by the macro",
             ours.range, theirs.range
         ));
     }
     if ours.anchor != theirs.anchor {
+        // alloc: the message of a difference, made only when there is one.
         return Some(format!(
             "{whose} anchor is {:?} natively and {:?} by the macro",
             ours.anchor, theirs.anchor
         ));
     }
     if ours.ctx != theirs.ctx {
+        // alloc: the message of a difference, made only when there is one.
         return Some(format!(
             "{whose} syntax context is {:?} natively and {:?} by the macro",
             ours.ctx, theirs.ctx
@@ -224,13 +233,20 @@ fn leaf_kind(leaf: &Leaf) -> &'static str {
 fn shown(tree: &TokenTree) -> String {
     match tree {
         TokenTree::Subtree(subtree) => match subtree.delimiter.kind {
+            // alloc: the message of a difference, made only when there is one.
             tt::DelimiterKind::Parenthesis => "the group `(`".to_owned(),
+            // alloc: the message of a difference, made only when there is one.
             tt::DelimiterKind::Brace => "the group `{`".to_owned(),
+            // alloc: the message of a difference, made only when there is one.
             tt::DelimiterKind::Bracket => "the group `[`".to_owned(),
+            // alloc: the message of a difference, made only when there is one.
             tt::DelimiterKind::Invisible => "a group without delimiters".to_owned(),
         },
+        // alloc: the message of a difference, made only when there is one.
         TokenTree::Leaf(Leaf::Ident(it)) => format!("`{}{}`", it.is_raw.as_str(), it.sym.as_str()),
+        // alloc: the message of a difference, made only when there is one.
         TokenTree::Leaf(Leaf::Punct(it)) => format!("`{}`", it.char),
+        // alloc: the message of a difference, made only when there is one.
         TokenTree::Leaf(Leaf::Literal(it)) => format!("the literal `{}{}`", it.text(), it.suffix()),
     }
 }

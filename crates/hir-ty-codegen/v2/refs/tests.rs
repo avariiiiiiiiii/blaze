@@ -15,11 +15,7 @@ use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemId, ItemKey};
 use cranelift_codegen::ir;
-use hir_def::{
-    DefWithBodyId, FunctionId, ModuleDefId, StaticId,
-    nameres::crate_def_map,
-    signatures::{FunctionSignature, StaticSignature},
-};
+use hir_def::{DefWithBodyId, FunctionId, StaticId, signatures::FunctionSignature};
 use hir_ty::{
     db::HirDatabase,
     next_solver::{Const, Ty},
@@ -90,45 +86,14 @@ fn frontend(text: &str) -> (&'static TestDB, HirFrontend<'static>) {
     (db, HirFrontend::new(Databases::new(db), Box::new(ById), BuildTime(Default::default())))
 }
 
-fn declarations(db: &TestDB) -> Vec<ModuleDefId> {
-    crate_def_map(db, db.test_crate())
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
-        .collect()
-}
-
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    let found: Vec<FunctionId> = declarations(db)
-        .into_iter()
-        .filter_map(|def| match def {
-            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
-                Some(it)
-            }
-            _ => None,
-        })
-        .collect();
-    match found[..] {
-        [one] => one,
-        _ => panic!("{} functions named `{name}`", found.len()),
-    }
+    hir_def::test_items::function(db, db.test_crate(), name)
 }
 
 #[track_caller]
 fn static_named(db: &TestDB, name: &str) -> StaticId {
-    let found: Vec<StaticId> = declarations(db)
-        .into_iter()
-        .filter_map(|def| match def {
-            ModuleDefId::StaticId(it) if StaticSignature::of(db, it).name.as_str() == name => {
-                Some(it)
-            }
-            _ => None,
-        })
-        .collect();
-    match found[..] {
-        [one] => one,
-        _ => panic!("{} statics named `{name}`", found.len()),
-    }
+    hir_def::test_items::static_item(db, db.test_crate(), name)
 }
 
 fn spec() -> Spec {
@@ -145,13 +110,13 @@ fn spec() -> Spec {
             target: target.triple().to_owned(),
             arch,
             cpu: target.cpu().to_owned(),
-            features: Vec::new(),
+            features: target.features().to_vec(),
             cranelift: "0.136".to_owned(),
             llvm: None,
             frame_pointers: crate::backend::frame_pointers(),
             relocation: if pic { Relocation::Pic } else { Relocation::Static },
         },
-        backend: Backend::Cranelift,
+        backend: Backend::Cranelift { speed: false },
         overflow_checks: false,
         debug_assertions: false,
         panic: Panic::Unwind,

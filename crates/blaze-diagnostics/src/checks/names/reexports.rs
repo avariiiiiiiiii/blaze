@@ -18,7 +18,7 @@ use syntax::{
 };
 
 use crate::{
-    checks::defs::{item_id, scopes},
+    checks::defs::item_id,
     cx::{Cx, item_range},
     lower::{Found, Phase},
     model::{Applicability, Diag},
@@ -31,9 +31,9 @@ enum Reach {
     In(hir::Module),
 }
 
-pub(super) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
+pub(super) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     let mut found = Vec::new();
-    for module in scopes(cx) {
+    for &module in scopes {
         for decl in module.use_decls(cx.db) {
             let item = decl.source(cx.db);
             let Some(vis) = item.value.visibility() else { continue };

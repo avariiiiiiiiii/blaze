@@ -800,10 +800,10 @@ fn extract_const_value<'db>(ct: Const<'db>) -> Result<ValueConst<'db>, LayoutErr
     }
 }
 
-pub fn struct_tail_erasing_lifetimes<'a>(
+pub fn struct_tail_erasing_lifetimes<'a, F: Fn(Ty<'a>) -> Ty<'a>>(
     db: &'a Db,
     pointee: Ty<'a>,
-    normalize: &dyn Fn(Ty<'a>) -> Ty<'a>,
+    normalize: &F,
 ) -> Ty<'a> {
     match pointee.kind() {
         TyKind::Adt(def, args) => {

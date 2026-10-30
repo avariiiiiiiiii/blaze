@@ -129,6 +129,15 @@ impl<'db, M: Machine<'db>> Hooks<M> {
         stopped(self.with(|m| m.fence(ord, compiler_only)))
     }
     #[inline(always)]
+    pub(super) fn offset_from(
+        &self,
+        a: Ptr<M::Prov>,
+        b: Ptr<M::Prov>,
+        unsigned: bool,
+    ) -> Result<'db, ()> {
+        stopped(self.with(|m| m.offset_from(a, b, unsigned)))
+    }
+    #[inline(always)]
     pub(super) fn typed(
         &self,
         cx: &TypedCx<'_, 'db>,

@@ -20,7 +20,9 @@ use crate::stage::{Content, Stage, error};
 use crate::state::{PieceId, State, What};
 use crate::symbols::SymKey;
 
-/// The 4 zero bytes that end a `.eh_frame`, written after the frames a patch adds.
+/// The 4 zero bytes that end a run of call frame entries: written after the core's entries a
+/// patch adds in its code region ([`Stage::frames_end`]), and after a native object's it adds
+/// to `.eh_frame`.
 const EH_FRAME_END: [u8; 4] = [0; 4];
 
 impl Stage<'_> {
@@ -94,6 +96,8 @@ impl Stage<'_> {
         let mut slots: FrameVec<'_, (u32, u64)> = Vec::new_in(arena);
         let mut frames: FrameVec<'_, (u64, u64)> = Vec::new_in(arena);
         let mut windows: FrameVec<'_, (u64, u64, u64)> = Vec::new_in(arena);
+        // Whether a native object's entries grew `.eh_frame` in place.
+        let mut in_eh_frame = false;
         for id in ids {
             let Some(piece) = self.new.piece(id) else { continue };
             let space = &self.new.spaces[piece.region as usize];
@@ -145,7 +149,10 @@ impl Stage<'_> {
                 continue;
             }
             match piece.what() {
-                What::Fde | What::NativeFrame { fde: true, .. } => frames.push((piece.addr, piece.size)),
+                What::Fde | What::NativeFrame { fde: true, .. } => {
+                    frames.push((piece.addr, piece.size));
+                    in_eh_frame |= space.region.class == Class::EhFrame;
+                }
                 What::Function(_) => {
                     let unwind = piece.function().and_then(|it| it.windows).and_then(|it| self.new.home(it.0));
                     if let Some((at, offset)) = unwind {
@@ -156,7 +163,10 @@ impl Stage<'_> {
                 _ => {}
             }
         }
-        if !frames.is_empty() && self.output.format == Format::Elf {
+        if let Some(end) = self.frames_end {
+            code.push((end, &EH_FRAME_END));
+        }
+        if in_eh_frame && self.output.format == Format::Elf {
             let Some(space) = self.new.space_of(&Class::EhFrame) else {
                 // alloc: a restart's reason, which the message carries: once per message
                 return restart("its new call frame information has no region".to_owned());

@@ -724,8 +724,8 @@ mod tr {
     "#,
         expect![[r#"
             crate
-            - _ : type
-            - _ : type
+            - _ : type (import)
+            - _ : type (import)
             - tr : type
 
             crate::tr
@@ -752,13 +752,13 @@ use crate::reex::*;
     "#,
         expect![[r#"
             crate
-            - _ : type
+            - _ : type (glob)
             - reex : type
             - tr : type
 
             crate::reex
-            - _ : type
-            - _ : type
+            - _ : type (import)
+            - _ : type (import)
 
             crate::tr
             - PrivTr : type
@@ -785,7 +785,7 @@ mod tr {
     "#,
         expect![[r#"
             crate
-            - _ : type
+            - _ : type (glob)
         "#]],
     );
 }
@@ -829,7 +829,7 @@ mod tr {
     "#,
         expect![[r#"
             crate
-            - _ : type
+            - _ : type (import)
             - Tr : type value
             - tr : type
 

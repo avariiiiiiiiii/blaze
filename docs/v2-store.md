@@ -177,7 +177,7 @@ moves records between tiers by how recently they were read, copying each into a 
 leaving the old one dead. A record of 4 KiB or more moves a tier colder once it was neither read
 nor made in the last two periods:
 
-- a value of a schema the store was given `Columns` for (`Store::encode_columns`) goes from hot
+- a value of a schema the store was given `BufferColumns` for (`Store::encode_columns`) goes from hot
   to warm columns, or straight to cold where warm saves less than an eighth, and from warm to
   cold columns;
 - any other raw or LZ4 record goes to zstd, batched by kind with that kind's dictionary (trained

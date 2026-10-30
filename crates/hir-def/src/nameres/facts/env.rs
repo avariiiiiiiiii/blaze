@@ -67,34 +67,36 @@ impl CrateEnv {
     pub(crate) fn after(&self, op: &DeclOp) -> Option<CrateEnv> {
         let mut next = match op {
             DeclOp::ExternPrelude { .. } | DeclOp::MacroUsePrelude { .. } | DeclOp::Prelude { .. } => {
-                // clone: a crate-level op, made by the root's `extern crate`s and its prelude
-                // injection only: a handful per crate.
+                // clone: a crate-level op (the root's `extern crate`s, its prelude): a handful per crate
                 self.clone()
             }
             _ => return None,
         };
         match *op {
             DeclOp::ExternPrelude { name, root, extern_crate } => {
-                let mut list = std::mem::take(&mut next.extern_prelude).into_vec();
-                match list.iter_mut().find(|it| it.0 == name) {
-                    Some(it) => *it = (name, root, extern_crate),
-                    None => list.push((name, root, extern_crate)),
-                }
-                next.extern_prelude = list.into_boxed_slice();
+                set_or_push(&mut next.extern_prelude, (name, root, extern_crate));
             }
             DeclOp::MacroUsePrelude { name, mac, extern_crate } => {
-                let mut list = std::mem::take(&mut next.macro_use).into_vec();
-                match list.iter_mut().find(|it| it.0 == name) {
-                    Some(it) => *it = (name, mac, extern_crate),
-                    None => list.push((name, mac, extern_crate)),
-                }
-                next.macro_use = list.into_boxed_slice();
+                set_or_push(&mut next.macro_use, (name, mac, extern_crate));
             }
             DeclOp::Prelude { module, import } => next.prelude = Some((module, import)),
             _ => unreachable!("matched above"),
         }
         Some(next)
     }
+}
+
+/// Replaces the entry of `entry.0` in `list`, or appends `entry`, keeping the list exact-size.
+fn set_or_push<T: Copy>(list: &mut Box<[(Name, T, Option<ExternCrateId>)]>, entry: (Name, T, Option<ExternCrateId>)) {
+    if let Some(it) = list.iter_mut().find(|it| it.0 == entry.0) {
+        *it = entry;
+        return;
+    }
+    // alloc: a crate-level op, a handful per crate.
+    let mut grown = Vec::with_capacity(list.len() + 1);
+    grown.extend_from_slice(list);
+    grown.push(entry);
+    *list = grown.into_boxed_slice();
 }
 
 /// An ancestor of a module, as it was when the chain toward the module was declared in it: what

@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Line, Reloc, RelocKind, Static, Target};
+use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, Reloc, RelocKind, Static, Target, Unwind};
 use blaze_core::{Completion, Done, Effect, FileName, IoError};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -66,6 +66,7 @@ fn function(n: u8, code: &[u8], relocs: Vec<Reloc>) -> CompiledFunction {
         side: None,
         unwind: None,
         lines: Vec::new(),
+        coverage: None,
     }
 }
 
@@ -515,6 +516,181 @@ fn a_live_image_names_its_table_and_patches_say_what_changed() {
     assert_eq!(Message::decode(bytes.bytes()).unwrap(), Message::RollBack { id: descriptor.id, to: 1 });
 }
 
+/// `lea rax, [rip + literal]; ret`, the literal its own data, and a call frame entry.
+fn framed(n: u8) -> CompiledFunction {
+    let mut it = function(n, &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], vec![rel32(3, Target::Data(id(60)))]);
+    it.data = vec![Data { id: id(60), align: 1, bytes: b"literal".to_vec(), relocs: Default::default() }];
+    it.unwind = Some(Unwind::Dwarf {
+        code_align: 1,
+        data_align: -8,
+        return_address: 16,
+        cie: vec![0x0c, 7, 8, 0x90, 1],
+        fde: vec![0x41, 0x0e, 0x10],
+        personality: None,
+        lsda: None,
+    });
+    it
+}
+
+/// Of each FDE in a call frame section at `base`, the address it covers from (`pcrel|sdata4`
+/// at offset 8, as the core writes them), up to its zero length.
+fn fde_starts(base: u64, bytes: &[u8]) -> Vec<u64> {
+    let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 4 <= bytes.len() && word(at) != 0 {
+        if word(at + 4) != 0 {
+            let field = base + at as u64 + 8;
+            out.push((field as i64 + i64::from(word(at + 8) as i32)) as u64);
+        }
+        at += 4 + word(at) as usize;
+    }
+    out
+}
+
+#[test]
+fn a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames() {
+    let (start, g) = program(Target::Function);
+    let g2 = framed(3);
+    let mut image = Image::new(name(TO), live()).unwrap();
+    let mut disk = Disk::default();
+    disk.link(&mut image, first(&start, &g)).unwrap();
+    let a = Linked::of(disk.file(TO));
+    let descriptor = Descriptor::decode(a.at(a.dynamic_symbol(blaze_live::patch::DESCRIPTOR), Descriptor::SIZE)).unwrap();
+    let ([code, code_end], [data, data_end]) = (descriptor.patch_code, descriptor.patch_data);
+
+    disk.link(&mut image, edit(&g2)).unwrap();
+    let b = Linked::of(disk.file(TO));
+    let new = b.symbol("g2");
+    let literal = b.rel32(new + 3);
+    assert!((data..data_end).contains(&literal), "the literal at {literal:#x}, in the patch data region");
+    assert_eq!(b.at(literal, 7), b"literal");
+    let message = disk.file(&format!("live/{}", message_file(1)));
+    let bytes = &Linked { words: message.words(), len: message.len as usize };
+    let Message::Patch(patch) = Message::decode(bytes.bytes()).unwrap() else { panic!("not a patch") };
+    let [(fde, len)] = patch.frames[..] else { panic!("one FDE: {:?}", patch.frames) };
+    assert!(code <= new && new < fde && fde + len + 4 <= code_end, "the FDE after the code, in the patch code region");
+    assert_eq!(fde_starts(fde, b.at(fde, len as usize)), vec![new], "the FDE covers g2");
+    let cie = fde + 4 - u64::from(b.u32_at(fde + 4));
+    assert!(new < cie && cie < fde, "the new CIE in the patch code region, before the FDE");
+    let written = |at: u64| patch.code.iter().find(|it| it.0 == at).map(|it| &it.1[..]);
+    assert!(written(cie).is_some() && written(fde).is_some(), "the CIE and the FDE are code writes");
+    assert_eq!(written(fde + len), Some(&[0u8; 4][..]), "the patch's frames end in their own zero length");
+    let file = b.elf();
+    for (at, bytes) in &patch.data {
+        let section = file.sections().find(|it| (it.address()..it.address() + it.size()).contains(at)).unwrap();
+        let object::SectionFlags::Elf { sh_flags } = section.flags() else { panic!("an ELF section") };
+        assert!(sh_flags & u64::from(elf::SHF_WRITE) != 0, "{} bytes written at {at:#x}, in {}", bytes.len(), section.name().unwrap());
+    }
+
+    // A full link of the same functions puts the FDE in `.eh_frame`.
+    let start = function(1, &CALLER, vec![rel32(1, Target::Function(key(3)))]);
+    let mut full = Image::new(name(TO), live()).unwrap();
+    let mut other = Disk::default();
+    let change = Change {
+        added: vec![&start, &g2],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into()), (key(3), "g2".into())],
+        ..Change::default()
+    };
+    other.link(&mut full, change).unwrap();
+    let c = Linked::of(other.file(TO));
+    let file = c.elf();
+    let eh_frame = file.section_by_name(".eh_frame").unwrap();
+    assert_eq!(fde_starts(eh_frame.address(), eh_frame.data().unwrap()), vec![c.symbol("g2")]);
+}
+
+/// `lea rax, [rip + array + addend]` of its own SanitizerCoverage array, then `ret`.
+fn covered(n: u8, array: u32, addend: i64, coverage: Covered) -> CompiledFunction {
+    let mut reloc = rel32(3, Target::Coverage(array));
+    reloc.addend += addend;
+    let mut it = function(n, &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xc3], vec![reloc]);
+    it.coverage = Some(coverage);
+    it
+}
+
+/// A section's address and size.
+fn section_of(linked: &Linked, name: &str) -> (u64, u64) {
+    let file = linked.elf();
+    let it = file.section_by_name(name).unwrap_or_else(|| panic!("no section {name}"));
+    (it.address(), it.size())
+}
+
+/// The `(pc, flags)` entries of `__sancov_pcs`.
+fn pcs(linked: &Linked) -> Vec<(u64, u64)> {
+    let (at, size) = section_of(linked, "__sancov_pcs");
+    (0..size / 16).map(|n| (linked.u64_at(at + 16 * n), linked.u64_at(at + 16 * n + 8))).collect()
+}
+
+#[test]
+fn coverage_arrays_and_pcs_are_laid_out_in_the_functions_order() {
+    let start = covered(1, 1, 3, Covered { counters: 3, flags: 5, guards: 0, pcs: vec![(0, 1), (7, 0)] });
+    let g = covered(2, 0, 1, Covered { counters: 2, flags: 2, guards: 8, pcs: vec![(0, 1), (3, 0), (7, 0)] });
+    let mut image = Image::new(name(TO), output(false)).unwrap();
+    let mut disk = Disk::default();
+    let change = Change {
+        added: vec![&g, &start],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into()), (key(2), "g".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).unwrap();
+    let linked = Linked::of(disk.file(TO));
+    let (s, g) = (linked.symbol("start"), linked.symbol("g"));
+    assert!(s < g, "the functions in their keys' order");
+    let (counters, counters_len) = section_of(&linked, "__sancov_cntrs");
+    let (flags, flags_len) = section_of(&linked, "__sancov_bools");
+    let (guards, guards_len) = section_of(&linked, "__sancov_guards");
+    assert_eq!((counters_len, flags_len, guards_len), (5, 7, 8));
+    assert_eq!(linked.rel32(s + 3), flags + 3, "start's `Coverage(1)` + 3: its flags, 3 in");
+    assert_eq!(linked.rel32(g + 3), counters + 3 + 1, "g's counters after start's 3");
+    assert_eq!(guards % 4, 0);
+    assert_eq!(linked.at(counters, 5), [0; 5]);
+    assert_eq!(linked.at(flags, 7), [0; 7]);
+    assert_eq!(pcs(&linked), vec![(s, 1), (s + 7, 0), (g, 1), (g + 3, 0), (g + 7, 0)]);
+
+    let none = covered(1, 2, 0, Covered { counters: 1, flags: 0, guards: 0, pcs: Vec::new() });
+    let mut image = Image::new(name(TO), output(false)).unwrap();
+    let change = Change { added: vec![&none], names: vec![("_start".into(), Target::Direct(key(1)))], ..Change::default() };
+    let error = image.stage(change).unwrap_err();
+    assert!(error.what.contains("SanitizerCoverage array 2"), "an array the function has not: {error}");
+}
+
+#[test]
+fn a_relink_that_drops_a_covered_function_drops_its_entries() {
+    // `lea rax, [rip + counters]; call h; ret`
+    let mut start = function(
+        1,
+        &[0x48, 0x8d, 0x05, 0, 0, 0, 0, 0xe8, 0, 0, 0, 0, 0xc3],
+        vec![rel32(3, Target::Coverage(0)), rel32(8, Target::Function(key(3)))],
+    );
+    start.coverage = Some(Covered { counters: 1, flags: 0, guards: 0, pcs: vec![(0, 1)] });
+    let g = covered(2, 0, 0, Covered { counters: 2, flags: 0, guards: 0, pcs: vec![(0, 1), (7, 0)] });
+    let h = covered(3, 0, 0, Covered { counters: 4, flags: 0, guards: 0, pcs: vec![(0, 1)] });
+    let mut image = Image::new(name(TO), output(true)).unwrap();
+    let mut disk = Disk::default();
+    let change = Change {
+        added: vec![&start, &g, &h],
+        names: vec![("_start".into(), Target::Direct(key(1)))],
+        debug_names: vec![(key(1), "start".into()), (key(2), "g".into()), (key(3), "h".into())],
+        ..Change::default()
+    };
+    disk.link(&mut image, change).unwrap();
+    let a = Linked::of(disk.file(TO));
+    let (s, g_at, h_at) = (a.symbol("start"), a.symbol("g"), a.symbol("h"));
+    let (counters, len) = section_of(&a, "__sancov_cntrs");
+    assert_eq!(len, 7);
+    assert_eq!(a.rel32(h_at + 3), counters + 3, "h's counters after start's and g's");
+    assert_eq!(pcs(&a), vec![(s, 1), (g_at, 1), (g_at + 7, 0), (h_at, 1)]);
+
+    disk.link(&mut image, Change { removed: vec![key(2)], ..Change::default() }).unwrap();
+    let b = Linked::of(disk.file(TO));
+    assert_eq!(section_of(&b, "__sancov_cntrs"), (counters, 5), "g's counters are gone");
+    assert_eq!(b.rel32(s + 3), counters);
+    assert_eq!(b.rel32(h_at + 3), counters + 1, "h's counters moved down, and h was relocated to them");
+    assert_eq!(pcs(&b), vec![(s, 1), (h_at, 1)], "g's PC entries are gone, the rest in order");
+}
+
 #[test]
 fn positions_are_filled_from_span_tables_and_a_reformat_rewrites_only_them() {
     let anchor = id(50);
@@ -781,6 +957,46 @@ fn relocation_allocates_nothing_per_fixup() {
     assert!(
         many.allocations <= few.allocations + GROWTH,
         "relocation allocates per fixup: {few:?} with 64 fixups, {many:?} with 2048"
+    );
+}
+
+/// What staging a replacement of `g` allocates when `g` is covered, its arrays `pcs` bytes and
+/// its PC table `pcs` entries, in an incremental image of `_start` and `g` (covered from the
+/// first link, so the image has the sections), `g` already replaced once. One worker thread.
+fn staged_covered(pcs: u32) -> blaze_alloc_count::Used {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+    pool.install(|| {
+        let covered = |n: u8| CompiledFunction {
+            coverage: Some(Covered { counters: pcs, flags: 0, guards: 0, pcs: vec![(0, 0); pcs as usize] }),
+            ..calls(n, 1)
+        };
+        let (start, _) = program(Target::Function);
+        let g = covered(2);
+        let mut image = Image::new(name(TO), output(true)).unwrap();
+        let mut disk = Disk::default();
+        disk.link(&mut image, first(&start, &g)).unwrap();
+        let g2 = covered(3);
+        disk.link(&mut image, edit(&g2)).unwrap();
+        let g3 = covered(4);
+        let next = Change { added: vec![&g3], removed: vec![key(3)], slots: vec![(key(2), key(4))], ..Change::default() };
+        let (staged, used) = blaze_alloc_count::measure(|| image.stage(next));
+        let mut effects = Vec::new();
+        image.commit(staged.unwrap(), &mut effects).unwrap();
+        disk.run(&mut image, effects).unwrap();
+        assert_eq!(image.generation(), 3);
+        used
+    })
+}
+
+#[test]
+fn coverage_allocates_nothing_per_pc_entry() {
+    let few = staged_covered(4);
+    let many = staged_covered(2048);
+    eprintln!("a covered one-function stage: {few:?} with 4 PC entries, {many:?} with 2048");
+    assert!(many.allocations <= STAGE_BUDGET, "a covered stage of 2048 PC entries: {many:?}, budget {STAGE_BUDGET}");
+    assert!(
+        many.allocations <= few.allocations + GROWTH,
+        "coverage allocates per PC entry: {few:?} with 4, {many:?} with 2048"
     );
 }
 

@@ -97,19 +97,27 @@ struct NameresFound {
 }
 
 fn nameres_found(finding: &Finding) -> NameresFound {
+    // alloc: each arm is the CLI's output, written once a finding.
     let detail = match finding {
         Finding::Changed { what, changed, min, max, keys, .. } => {
+            // alloc: as above.
             let keys: Vec<String> = keys.iter().take(8).map(name).collect();
+            // alloc: as above.
             format!("{changed} {what} changed, the facts allow {min} to {max}: {}", keys.join(", "))
         }
+        // alloc: as above.
         Finding::Unrecorded { what, kind } => format!("neither trace has {what} (kind {:#06x})", kind.0),
         Finding::Kept { query, read, saw, now } => {
+            // alloc: as above.
             format!("{} was kept though it read {} at {saw:?}, which is now {now:?}", name(query), name(read))
         }
+        // alloc: as above.
         Finding::Unexplained { query } => format!("{} reran though nothing it read changed", name(query)),
+        // alloc: as above.
         Finding::Needless { query } => format!("{} reran, read and made what it did before", name(query)),
         Finding::Stale(stale) => {
             let f = found(stale);
+            // alloc: as above.
             format!("{} {}: {}", f.what, f.query, f.detail)
         }
     };
@@ -132,17 +140,22 @@ fn name(key: &QueryKey) -> String {
 }
 
 fn found(stale: &Stale) -> Found {
+    // alloc: each arm is the CLI's output, written once a stale result.
     let (what, detail) = match stale {
         Stale::Unverified { read, saw, now, .. } => (
             "unverified",
+            // alloc: as above.
             format!("kept though it read {} at {saw:?}, which is now {now:?}", name(read)),
         ),
         Stale::UnrecordedRead { incremental, scratch, .. } => (
             "unrecorded-read",
+            // alloc: as above.
             format!("read the same as from scratch; {incremental:?} against {scratch:?}"),
         ),
+        // alloc: as above.
         Stale::Absent { .. } => ("absent", "the build from scratch has it, the incremental build not".to_owned()),
         Stale::Downstream { incremental, scratch, .. } => {
+            // alloc: as above.
             ("downstream", format!("read stale results; {incremental:?} against {scratch:?}"))
         }
     };
@@ -151,25 +164,32 @@ fn found(stale: &Stale) -> Found {
 
 fn read_input(arg: &str) -> Result<Given, String> {
     let text = if arg == "-" {
+        // alloc: the CLI's input, read once a run.
         let mut text = String::new();
+        // alloc: error path; the CLI exits 2.
         std::io::stdin().read_to_string(&mut text).map_err(|e| format!("stdin: {e}"))?;
         text
     } else if arg.trim_start().starts_with('{') {
+        // alloc: the CLI's input, once a run.
         arg.to_owned()
     } else {
+        // alloc: the CLI's input, once a run, or the error that exits 2.
         fs::read_to_string(arg).map_err(|e| format!("{arg}: {e}"))?
     };
     serde_json::from_str(&text).map_err(|e| {
+        // alloc: error path; the CLI exits 2.
         format!("the input: {{\"incremental\", \"scratch\", \"before\"?, \"slot\"?}} or {{\"first\", \"second\"}}: {e}")
     })
 }
 
 /// A trace's file mapped with no page faulted in: the joins across cores fault in their own.
 fn mapped(path: &Path) -> Result<Mapped, String> {
+    // alloc: error path; the CLI exits 2.
     Mapped::open_lazily(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn view<'a>(path: &Path, mapped: &'a Mapped) -> Result<View<'a>, String> {
+    // alloc: error path; the CLI exits 2.
     View::parse(mapped.bytes()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
@@ -182,12 +202,15 @@ fn compare(input: &Input) -> Result<Output, String> {
         (Some(path), Some(file)) => Some(view(path, file)?),
         _ => None,
     };
+    // alloc: the CLI's output, once a run.
     let stale: Vec<Found> = join::under(&incremental, &scratch, &[]).iter().map(found).collect();
     let (work, needless) = match &before {
         Some(before) => {
             let (work, needless) = join::over(before, &incremental);
+            // alloc: as above.
             (Some(work), needless.iter().map(name).collect())
         }
+        // alloc: none: an empty `Vec`.
         None => (None, Vec::new()),
     };
     let nameres = match (input.slot.as_deref().and_then(nameres::case), &before) {
@@ -197,9 +220,11 @@ fn compare(input: &Input) -> Result<Output, String> {
             findings: nameres::check(case, &before.to_trace(), &incremental.to_trace(), &scratch.to_trace())
                 .iter()
                 .map(nameres_found)
+                // alloc: the CLI's output, once a run with a fixture slot.
                 .collect(),
         }),
         (Some(case), None) => {
+            // alloc: error path; the CLI exits 2.
             return Err(format!("the `{}` case needs `before`, the trace of the build before the edit", case.slot));
         }
         (None, _) => None,
@@ -211,6 +236,7 @@ fn compare(input: &Input) -> Result<Output, String> {
 fn compare_files(files: &Files) -> ExitCode {
     match blaze_v2_proof::bytes::first_file_difference(&files.first, &files.second) {
         Ok(at) => {
+            // alloc: the CLI's output, once a run.
             let simd = format!("{:?}", blaze_v2_proof::bytes::fastest());
             println!("{}", serde_json::json!({ "differs_at": at, "simd": simd }));
             if at.is_some() { ExitCode::from(1) } else { ExitCode::SUCCESS }
@@ -223,6 +249,7 @@ fn compare_files(files: &Files) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // alloc: the CLI's arguments, once a run.
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [arg] = args.as_slice() else {
         eprintln!(

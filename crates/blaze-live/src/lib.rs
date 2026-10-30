@@ -43,6 +43,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 /// The setting `BLAZE_<name>`.
 fn setting(name: &str) -> Option<std::ffi::OsString> {
+    // alloc: setup, read when the runtime starts and when a program asks for its tiers
     std::env::var_os(format!("BLAZE_{name}"))
 }
 
@@ -135,6 +136,7 @@ impl Live {
             all(target_os = "linux", target_arch = "x86_64"),
             all(windows, target_arch = "x86_64")
         )))]
+        // alloc: error path, once at start on a platform it doesn't run on
         Err("live edits run on macOS AArch64, Linux x86-64 and Windows x86-64".to_owned())
     }
 
@@ -210,6 +212,7 @@ pub fn tiers() -> Option<format::Tiers> {
 pub fn edit(path: &std::path::Path, text: &str) -> Result<String, String> {
     use std::io::{BufRead as _, Write as _};
     let socket = daemon_socket().ok_or("no home directory to find the daemon in")?;
+    // alloc: error path
     let path = std::path::absolute(path).map_err(|it| format!("{}: {it}", path.display()))?;
     let path = path.to_str().ok_or("a path that is not UTF-8")?;
     let mut line = String::with_capacity(text.len() + path.len() + 8);
@@ -222,18 +225,27 @@ pub fn edit(path: &std::path::Path, text: &str) -> Result<String, String> {
     let stream = std::os::unix::net::UnixStream::connect(&socket);
     #[cfg(windows)]
     let stream = windows::Socket::connect(&socket);
+    // alloc: error path
     let mut stream = stream.map_err(|it| format!("no daemon at {}: {it}", socket.display()))?;
+    // alloc: error path
     stream.write_all(line.as_bytes()).map_err(|it| format!("sending the edit: {it}"))?;
+    // alloc: the daemon's answer, handed to the caller: once per edit
     let mut reply = String::new();
     std::io::BufReader::new(stream)
         .read_line(&mut reply)
+        // alloc: error path
         .map_err(|it| format!("reading the daemon's answer: {it}"))?;
-    let reply = reply.trim_end();
+    reply.truncate(reply.trim_end().len());
+    if reply.is_empty() {
+        // alloc: error path
+        return Err("the daemon hung up without an answer".to_owned());
+    }
+    if reply.starts_with("ok") {
+        return Ok(reply);
+    }
     match reply.strip_prefix("error: ") {
-        _ if reply.is_empty() => Err("the daemon hung up without an answer".to_owned()),
-        _ if reply.starts_with("ok") => Ok(reply.to_owned()),
         Some(why) => Err(format::unescape(why)),
-        None => Err(reply.to_owned()),
+        None => Err(reply),
     }
 }
 

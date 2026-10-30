@@ -19,7 +19,7 @@ macro_rules! m { ($x:literal) => (literal!();); ($x:tt) => (not_a_literal!();); 
 literal!();
 literal!();
 literal!();
-/* error: leftover tokens */not_a_literal!();
+/* error: no rules expected `-` */not_a_literal!();
 "#]],
     )
 }
@@ -49,7 +49,7 @@ m!(&k");
 "#,
         expect![[r#"
 macro_rules! m { ($i:literal) => {}; }
-/* error: expected literal */"#]],
+/* error: no rules expected `&` */"#]],
     );
 }
 
@@ -171,7 +171,7 @@ macro_rules! foo {
 }
 
 fn test() {
-    /* error: no rule matches input tokens */missing;
+    /* error: no rules expected keyword `let` */missing;
 }
 "#]],
     );
@@ -196,7 +196,7 @@ macro_rules! foo {
 }
 
 fn test() {
-    /* error: no rule matches input tokens */missing;
+    /* error: no rules expected keyword `const` */missing;
 }
 "#]],
     );

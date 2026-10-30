@@ -26,8 +26,8 @@ use rustc_hash::FxHashMap;
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
 use crate::model::{
-    Apply, Bind, Class, Export, Fixup, Formats, Function, GotEntry, Holds, Import, Placed, Region, Special, Sym,
-    SymbolKind, Tls, WindowsUnwind, Writer,
+    Apply, Bind, Class, Delta, Export, Fixup, Formats, Function, GotEntry, Holds, Import, Placed, Region, Special,
+    Splice, Sym, SymbolKind, Tls, WindowsUnwind, Writer,
 };
 use crate::place::Totals;
 use crate::reloc::{self, Bad, Ctx, GotKind};
@@ -972,8 +972,12 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
         Owned { items: Arc::new(items), owners: Arc::new(owners) }
     }
 
-    /// The list without the entries of `drop`'s pieces, and with `entries`: one pass.
-    fn splice(&self, drop: &IdSet, mut entries: Vec<(PieceId, T)>) -> Owned<T> {
+    /// The list without the entries of `drop`'s pieces, and with `entries`: one pass. Each run
+    /// it replaces is pushed to `runs`, unless the run's new entries equal its old ones.
+    fn splice(&self, drop: &IdSet, mut entries: Vec<(PieceId, T)>, runs: &mut FrameVec<'_, Splice>) -> Owned<T>
+    where
+        T: PartialEq,
+    {
         if drop.is_empty() && entries.is_empty() {
             // clone: two reference counts; the list is shared, not copied
             return self.clone();
@@ -982,25 +986,69 @@ impl<T: Addr + Clone + Send + Sync> Owned<T> {
         let mut items = Vec::with_capacity(self.items.len() + entries.len());
         let mut owners = Vec::with_capacity(items.capacity());
         let mut new = entries.into_iter().peekable();
-        for (item, owner) in self.items.iter().zip(self.owners.iter()) {
+        // Where the open run started: in the old list, in the new one.
+        let mut open: Option<(usize, usize)> = None;
+        for (at, (item, owner)) in self.items.iter().zip(self.owners.iter()).enumerate() {
             if drop.contains(*owner) {
+                open.get_or_insert((at, items.len()));
                 continue;
             }
             while let Some((id, it)) = new.next_if(|(id, it)| (it.addr(), *id) < (item.addr(), *owner)) {
+                open.get_or_insert((at, items.len()));
                 items.push(it);
                 owners.push(id);
+            }
+            if let Some((old, from)) = open.take() {
+                run(&self.items[old..at], &items[from..], old, from, runs);
             }
             // clone: an entry is addresses and ids, and a function's name an `Arc<str>`: no allocation
             items.push(item.clone());
             owners.push(*owner);
         }
         for (id, it) in new {
+            open.get_or_insert((self.items.len(), items.len()));
             items.push(it);
             owners.push(id);
+        }
+        if let Some((old, from)) = open {
+            run(&self.items[old..], &items[from..], old, from, runs);
         }
         // alloc: once per list a stage changes; the state shares the list
         Owned { items: Arc::new(items), owners: Arc::new(owners) }
     }
+}
+
+/// Pushes the run of `old` (from `old_at` in the last list) replaced by `new` (from `new_at`),
+/// unless they are the same entries.
+fn run<T: PartialEq>(old: &[T], new: &[T], old_at: usize, new_at: usize, runs: &mut FrameVec<'_, Splice>) {
+    if old == new {
+        return;
+    }
+    let span = |at: usize, len: usize| at as u32..(at + len) as u32;
+    runs.push(Splice { old: span(old_at, old.len()), new: span(new_at, new.len()) });
+}
+
+/// The runs each list's splice replaced in a stage that spliced them: [`Delta`]'s lists.
+pub(crate) struct Changes<'f> {
+    pub functions: FrameVec<'f, Splice>,
+    pub rebase: FrameVec<'f, Splice>,
+    pub got: FrameVec<'f, Splice>,
+    pub binds: FrameVec<'f, Splice>,
+}
+
+/// The one run that replaces all of a list rebuilt whole, of `old` entries then `new`.
+fn whole(old: usize, new: usize, runs: &mut FrameVec<'_, Splice>) {
+    if old + new > 0 {
+        runs.push(Splice { old: 0..old as u32, new: 0..new as u32 });
+    }
+}
+
+/// A number for each synthesis in the process ([`crate::model::Placed::synthesis`]); 0 is none.
+static SYNTHESES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The next synthesis's number.
+pub(crate) fn next_synthesis() -> u64 {
+    SYNTHESES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The lists the writer reads, kept across links: [`State::lists`]. Each list is shared on
@@ -1157,8 +1205,9 @@ pub(crate) struct Parts {
 
 impl<'a> Stage<'a> {
     /// The writer's lists for the image as placed: made from every piece in a full link,
-    /// spliced in an incremental one.
-    pub fn update_lists(&mut self) -> Result<(), LinkError> {
+    /// spliced in an incremental one, and then the runs each splice replaced (`None` when the
+    /// lists were made from every piece).
+    pub fn update_lists(&mut self) -> Result<Option<Changes<'a>>, LinkError> {
         let totals = self.totals();
         let regions = self.new.regions();
         let entries = Entries {
@@ -1169,7 +1218,7 @@ impl<'a> Stage<'a> {
         };
         let all = Want { loader: true, got: true, functions: true };
         let arena = self.arena;
-        let (mut lists, functions_changed) = if self.full || !self.old.laid_out {
+        let (mut lists, functions_changed, changes) = if self.full || !self.old.laid_out {
             let batch = entries.collect((0..self.new.piece_count()).into_par_iter(), all)?;
             let lists = Lists {
                 rebase: Owned::build(batch.rebase),
@@ -1179,8 +1228,14 @@ impl<'a> Stage<'a> {
                 debug: Arc::default(),
                 totals,
             };
-            (lists, true)
+            (lists, true, None)
         } else {
+            let mut changes = Changes {
+                functions: Vec::new_in(arena),
+                rebase: Vec::new_in(arena),
+                got: Vec::new_in(arena),
+                binds: Vec::new_in(arena),
+            };
             let old = &self.old.lists;
             let mut affected = IdSet::default();
             affected.extend(self.write.iter());
@@ -1207,9 +1262,15 @@ impl<'a> Stage<'a> {
                     })
                     // alloc: only when the imports change: every bind made again, as in a full link
                     .collect();
-                (Owned::build(binds), Owned::build(more.got))
+                let (binds, got) = (Owned::build(binds), Owned::build(more.got));
+                whole(old.binds.items.len(), binds.items.len(), &mut changes.binds);
+                whole(old.got.items.len(), got.items.len(), &mut changes.got);
+                (binds, got)
             } else {
-                (old.binds.splice(&affected, batch.binds), old.got.splice(&affected, batch.got))
+                (
+                    old.binds.splice(&affected, batch.binds, &mut changes.binds),
+                    old.got.splice(&affected, batch.got, &mut changes.got),
+                )
             };
             let mut stale = IdSet::default();
             if !self.changed.is_empty() {
@@ -1241,15 +1302,15 @@ impl<'a> Stage<'a> {
                 function(self.old) || function(&self.new)
             });
             let lists = Lists {
-                rebase: old.rebase.splice(&affected, batch.rebase),
+                rebase: old.rebase.splice(&affected, batch.rebase, &mut changes.rebase),
                 binds,
                 got,
-                functions: old.functions.splice(&affected, functions),
+                functions: old.functions.splice(&affected, functions, &mut changes.functions),
                 // clone: a reference count; the sections are shared until a function changes
                 debug: old.debug.clone(),
                 totals,
             };
-            (lists, touched)
+            (lists, touched, Some(changes))
         };
         drop(entries);
         lists.debug = match self.output.debug {
@@ -1259,7 +1320,7 @@ impl<'a> Stage<'a> {
         };
         // alloc: once per stage; the state shares the lists
         self.new.lists = Arc::new(lists);
-        Ok(())
+        Ok(changes)
     }
 
     /// The image as the writer reads it, besides [`State::lists`].
@@ -1403,6 +1464,8 @@ impl Parts {
         contents: &'p [&'p [u8]],
         // dyn: `Placed::symbol`'s type (model.rs); a writer asks it a few fixed names per link
         symbol: &'p dyn Fn(&str) -> Option<u64>,
+        delta: Option<&'p Delta<'p>>,
+        encoded: &'p [(u64, u64)],
     ) -> Placed<'p> {
         let lists = &stage.new.lists;
         Placed {
@@ -1425,6 +1488,9 @@ impl Parts {
             id: self.id,
             debug: &lists.debug,
             symbol,
+            synthesis: stage.new.synthesis,
+            delta,
+            encoded,
         }
     }
 }

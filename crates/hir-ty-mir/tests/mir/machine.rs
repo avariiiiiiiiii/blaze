@@ -295,6 +295,10 @@ impl<'db> Machine<'db> for Recorder {
         Ok(())
     }
 
+    fn offset_from(&mut self, _: Ptr<u32>, _: Ptr<u32>, _: bool) -> MResult<()> {
+        Ok(())
+    }
+
     fn typed(
         &mut self,
         _: &TypedCx<'_, 'db>,

@@ -1390,11 +1390,11 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
     };
     unit.resolve_imports();
 
-    let mut imports = Vec::new();
+    let mut imports: Box<[(ImportOp, Option<PerNs>)]> = Box::default();
     if kind == RoundKind::Final {
         unit.record_unresolved();
         // clone: the final round's imports, once, for `finish`'s diagnostics and `NameRecords`.
-        imports.extend(unit.import_outcomes().map(|(import, status)| (import.clone(), status)));
+        imports = unit.import_outcomes().map(|(import, status)| (import.clone(), status)).collect();
         let root = unit.def_map.root;
         if unit.def_map.data.proc_macro && members.contains(&root) {
             // A crate exporting procedural macros is not allowed to export anything else.
@@ -1403,6 +1403,13 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
             // exported in type/value namespace. This function reduces the visibility of all items
             // in the crate root that aren't proc macros.
             unit.scope_mut(root).censor_non_proc_macros(krate);
+        }
+        // The old `DefMap::shrink_to_fit` at the end of collection: these scopes are the
+        // crate's, handed over below, so they never reach it.
+        for &module in &members {
+            if !unit.def_map.module(db, module).scope(db).glob_ambiguities().is_empty() {
+                unit.scope_mut(module).settle_glob_ambiguities();
+            }
         }
     }
 
@@ -1459,7 +1466,7 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
         handles: handles.into(),
         prelude,
         upstream: upstream.into(),
-        imports: imports.into(),
+        imports,
         // alloc: the state the next round carries on from, once per run that is not the quick path.
         state: Arc::new(state),
     }
@@ -1537,7 +1544,8 @@ pub(crate) fn unresolved_named(db: &Db, key: FactKey) -> Box<[(Name, ModPath)]> 
                 && it.op.module == module
                 && it.op.source.kind == ImportKind::Plain
         })
-        .filter_map(|(it, _)| Some((it.op.bound_name()?, it.op.path)))
+        // clone: each path into the query's value, once per module and round.
+        .filter_map(|(it, _)| Some((it.op.bound_name()?, it.op.path.clone())))
         // alloc: the query's value, once per module and round.
         .collect()
 }

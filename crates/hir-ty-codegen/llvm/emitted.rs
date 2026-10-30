@@ -1007,7 +1007,7 @@ impl<'data, 'file> Emitted<'data, 'file> {
             if !entry_rules
                 .iter()
                 .copied()
-                .eq(FrameRule::on_entry(arch).iter().map(|&rule| (0, rule)))
+                .eq(crate::unwind::on_entry(arch).iter().map(|&rule| (0, rule)))
             {
                 return Err(Unhandled::Shape("an unwind table that starts from other rules"));
             }

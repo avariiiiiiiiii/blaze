@@ -77,7 +77,7 @@ impl FileRange {
     }
 
     #[inline]
-    pub fn file_text(self, db: &Db) -> &std::sync::Arc<str> {
+    pub fn file_text(self, db: &Db) -> &syntax::Text {
         db.file_text(self.file_id.file_id(db)).text(db)
     }
 

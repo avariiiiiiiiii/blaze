@@ -51,7 +51,7 @@ use crate::{
 
 /// The errors `check_attributes` gives of `owner`'s attributes, parsed to `parsed`.
 pub(crate) fn check(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, parsed: &[ParsedAttr], errors: &mut Vec<Diag>) {
-    let mut fx = Finalize::new(cx, session, owner, true, errors);
+    let mut fx = Finalize::new(cx, session, owner, errors);
     non_exported_macro(&mut fx, parsed);
     for attr in parsed {
         one(&mut fx, parsed, attr);

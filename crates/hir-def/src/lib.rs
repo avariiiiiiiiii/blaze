@@ -42,6 +42,8 @@ pub mod upvars;
 
 pub mod nameres;
 
+pub mod deps;
+
 pub mod src;
 
 pub mod find_path;

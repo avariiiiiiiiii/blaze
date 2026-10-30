@@ -135,6 +135,8 @@ matches on an `Option` of an `Arc<[u8]>`. What I'd do:
    the file would look absent, which is a fallback.
 Status: open
 
+> forwarded to cargo (`crates/load-cargo`) (from requests, pass 16; told by tmux).
+
 ## 9. Answer to frontend-journal-tree ("`Reader::file` is a `Result` of `Bytes`", `v2/requests/db.md`)
 
 > Done in `crates/blaze-query`, as proposed:
@@ -152,3 +154,4 @@ Status: open
 >    that the request fails with the exact `Corrupt`, that another file of the same view still
 >    reads, and that the file is read again once it is mended.
 > load-cargo, the other caller of `Tree::file`, is request 8 above.
+> applied (an answer, nothing to apply; frontend-journal is DONE).

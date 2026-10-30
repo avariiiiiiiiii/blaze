@@ -16,6 +16,7 @@ loans.after(&cfg, location, &mut checker.in_scope);
 ```
 
 > forwarded to db-ty-d-borrowck (hir-ty-borrowck is db's, running; told by tmux).
+> applied by db-ty-d-borrowck: both calls in `check.rs` take the new signatures.
 
 ## 2. `lib.rs`: look up the type before folding its regions
 
@@ -51,6 +52,8 @@ pub(crate) fn is_copy(&self, ty: Ty<'db>) -> bool {
 Do the same for `drop_glue` with `self.glue`.
 
 > forwarded to db-ty-d-borrowck (hir-ty-borrowck is db's, running; told by tmux).
+> applied by db-ty-d-borrowck: `is_copy` and `drop_glue` look up the type as given, then the
+> erased one, and store both.
 
 ## 3. `liveness.rs`: `on_return` rows per call
 
@@ -62,6 +65,9 @@ many rows, and keep `returns_to: Vec<Option<(BasicBlockId, usize)>>` (target, ro
 block-only meaning (`.map(|(target, _)| target)`).
 
 > forwarded to db-ty-d-borrowck (hir-ty-borrowck is db's, running; told by tmux).
+> applied by db-ty-d-borrowck: `maybe_initialized_at_drops` has a row of `on_return` per
+> reachable call and `returns_to: Vec<Option<(BasicBlockId, usize)>>`; `InitAtExit` keeps the
+> pair and `restrict` reads only the target.
 
 ## 4. `liveness.rs`: the drop-order rank per run, not per point
 
@@ -92,3 +98,7 @@ A test against the per-point minimum over random interval sets and block layouts
 beside it.
 
 > forwarded to db-ty-d-borrowck (hir-ty-borrowck is db's, running; told by tmux).
+> applied by db-ty-d-borrowck: `liveness.rs` `least_rank(points, rank, count, block_end)`, the
+> per-run form, used in `region_liveness`; test `the_least_rank_per_run_is_the_least_per_point`
+> (2000 seeded cases of random block layouts, walk orders with unreached blocks, and point
+> sets, against the per-point minimum). db-ty-sol-borrowck need not make it.

@@ -7,18 +7,21 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 /// One thing a build said, `at_ns` after it began.
+// clone: the edge; the daemon hands a build's records to each subscriber, and the plane's and
+// UI's models keep the ones they are told.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub at_ns: u64,
     pub event: Event,
 }
 
+// clone: as `Record`, which holds it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// A build began: the command that asked for it, in the workspace at `root`.
@@ -120,6 +123,7 @@ pub struct NodeOf<'a> {
 
 impl NodeOf<'_> {
     pub fn event(&self) -> Event {
+        // alloc: an owned event handed out, for a reader that wants one; a batch reads in place.
         let (name, deps) = (self.name.to_owned(), self.deps.to_vec());
         Event::Node { id: self.id, kind: self.kind, name, deps }
     }
@@ -127,7 +131,7 @@ impl NodeOf<'_> {
 
 /// Why an [`Event::Nodes`] cannot be read: its columns disagree, or its nodes wait for each
 /// other in a cycle.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Malformed(pub String);
 
 impl fmt::Display for Malformed {
@@ -140,7 +144,7 @@ impl std::error::Error for Malformed {}
 
 /// What reads [`Event::Nodes`] records keeps from one to the next: the order of the last one
 /// read ([`Order::places`]) and the buffers that found it.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct Order {
     places: Vec<u32>,
     waiting: Vec<u32>,
@@ -166,10 +170,12 @@ impl Order {
 fn offsets(column: &str, at: &[u32], len: usize, end: usize) -> Result<(), Malformed> {
     if at.len() != len + 1 || at[0] != 0 || at[len] as usize != end {
         let offsets = at.len();
+        // alloc: error path, a malformed record.
         let why = format!("{column} of {offsets} offsets for {len} nodes and {end} entries");
         return Err(Malformed(why));
     }
     match at.windows(2).position(|pair| pair[0] > pair[1]) {
+        // alloc: error path, a malformed record.
         Some(i) => Err(Malformed(format!("{column} goes back at node {i}"))),
         None => Ok(()),
     }
@@ -190,11 +196,13 @@ impl<'a> NodeBatch<'a> {
         order.places.clear();
         let len = kinds.len();
         if u32::try_from(len).ok().and_then(|it| first.checked_add(it)).is_none() {
+            // alloc: error path, a malformed record.
             return Err(Malformed(format!("{len} ids from {first} past u32")));
         }
         offsets("name_at", name_at, len, names.len())?;
         offsets("deps_at", deps_at, len, deps.len())?;
         if let Some(i) = name_at.iter().position(|&at| !names.is_char_boundary(at as usize)) {
+            // alloc: error path, a malformed record.
             return Err(Malformed(format!("name_at cuts a character at node {i}")));
         }
         let batch = NodeBatch { first, kinds, names, name_at, deps, deps_at };
@@ -288,16 +296,30 @@ impl<'a> NodeBatch<'a> {
         if places.len() == len {
             return Ok(());
         }
-        const SHOWN: usize = 8;
-        let stuck: Vec<u32> =
-            (0..len).filter(|&at| waiting[at] > 0).map(|at| self.first + at as u32).collect();
-        let shown: Vec<String> = stuck.iter().take(SHOWN).map(u32::to_string).collect();
-        let more = match stuck.len().saturating_sub(SHOWN) {
-            0 => String::new(),
-            more => format!(" and {more} more"),
-        };
         places.clear();
-        Err(Malformed(format!("nodes {}{more} wait for each other", shown.join(", "))))
+        Err(self.cycle(waiting))
+    }
+
+    /// Why the nodes still `waiting` cannot go: they wait for each other.
+    #[cold]
+    fn cycle(&self, waiting: &[u32]) -> Malformed {
+        const SHOWN: usize = 8;
+        let mut stuck =
+            (0..self.len()).filter(|&at| waiting[at] > 0).map(|at| self.first + at as u32);
+        // alloc: error path, a record of nodes that wait for each other.
+        let mut why = String::from("nodes ");
+        for (i, id) in stuck.by_ref().take(SHOWN).enumerate() {
+            if i > 0 {
+                why.push_str(", ");
+            }
+            let _ = write!(why, "{id}");
+        }
+        let more = stuck.count();
+        if more > 0 {
+            let _ = write!(why, " and {more} more");
+        }
+        why.push_str(" wait for each other");
+        Malformed(why)
     }
 }
 
@@ -305,6 +327,7 @@ impl<'a> NodeBatch<'a> {
 pub const SLOW_NS: u64 = 200_000_000;
 
 /// A function slow to compile, of crate `krate`: `ns` is how long it took, or has so far.
+// clone: as `Record`, whose `Event::Compiling` holds it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Slow {
     pub krate: String,
@@ -313,6 +336,7 @@ pub struct Slow {
 }
 
 /// A function or instance of the program a build writes: what the build page draws.
+// clone: as `Record`, whose `Event::Functions` holds it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     /// Its number in its object, which the `calls` of the object's others name it by.
@@ -375,6 +399,7 @@ pub enum NodeKind {
 
 /// Where a node of the build's graph is. A node only moves down this list, from `Waiting`
 /// to one of the last five.
+// clone: the plane hands each subscriber the state a node moved to.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NodeState {
     /// A node it waits for is not done.
@@ -564,6 +589,7 @@ impl Fns {
 }
 
 /// Why something was compiled again.
+// clone: as `Record`; the UI keeps the causes it is told for the summary.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum Cause {
     /// Nothing was kept of it: no store entry, or no store.
@@ -588,15 +614,29 @@ pub enum Cause {
 impl Cause {
     /// A few words for a summary line: "body edited", "call it".
     pub fn short(&self) -> String {
-        match self {
-            Cause::Cold => "not kept".to_owned(),
-            Cause::Edited { file } => format!("{} edited", file.display()),
-            Cause::Body => "body edited".to_owned(),
-            Cause::Signature => "signature changed".to_owned(),
-            Cause::Callee { name } => format!("calls {name}"),
-            Cause::Uses => "uses what changed".to_owned(),
-            Cause::Dependency { name } => format!("{name} changed"),
-            Cause::Flags { what } => format!("{what} changed"),
+        // alloc: a string handed out; `Cause::shown` writes where it goes.
+        self.shown().to_string()
+    }
+
+    /// [`Cause::short`], written straight into a formatter.
+    pub fn shown(&self) -> impl fmt::Display + '_ {
+        Short(self)
+    }
+}
+
+struct Short<'a>(&'a Cause);
+
+impl fmt::Display for Short<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Cause::Cold => f.write_str("not kept"),
+            Cause::Edited { file } => write!(f, "{} edited", file.display()),
+            Cause::Body => f.write_str("body edited"),
+            Cause::Signature => f.write_str("signature changed"),
+            Cause::Callee { name } => write!(f, "calls {name}"),
+            Cause::Uses => f.write_str("uses what changed"),
+            Cause::Dependency { name } => write!(f, "{name} changed"),
+            Cause::Flags { what } => write!(f, "{what} changed"),
         }
     }
 }
@@ -609,6 +649,7 @@ pub enum Level {
 }
 
 /// What a finished build did, for its last line.
+// clone: as `Record`, whose `Event::Finished` holds it.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Summary {
     pub took_ns: u64,
@@ -627,6 +668,7 @@ pub struct Summary {
 
 /// The entries of compiled code a build asked the store for: found on this machine, fetched
 /// from the remote store, or compiled because neither had them.
+// clone: as `Record`; the UI keeps the last one for the summary.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Cache {
     pub found: u64,
@@ -638,6 +680,7 @@ pub struct Cache {
 }
 
 /// How long a step took, of what.
+// clone: as `Summary`, which holds it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Took {
     pub step: Step,
@@ -646,7 +689,7 @@ pub struct Took {
 }
 
 /// What a client asks the daemon of builds.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum Subscribe {
     /// The records of the build under way in the workspace at `root`, or the last one, from
     /// its first, then each as it comes until it finishes.

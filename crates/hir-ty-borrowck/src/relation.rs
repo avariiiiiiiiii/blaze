@@ -1,8 +1,8 @@
 //! Facts as columnar relations: rows `(kind, a, b)` gathered as they are found, then frozen
 //! into a CSR over `(kind, a)`, so the `b`s of one `a` are one range: the moves at a point, the
-//! loans of a local, the uses at a point. Freezing is a counting sort in place (count, prefix
-//! sum, scatter with the start array as the cursor): two passes, and no allocation but the
-//! arrays it returns, whatever the number of kinds. A lookup is three loads.
+//! loans of a local, the uses at a point. Freezing is `blaze_radix`'s counting sort (count,
+//! prefix sum, scatter): two passes, and no allocation but the arrays it returns and its
+//! cursors, whatever the number of kinds. A lookup is three loads.
 
 /// That `a` relates to `b` by `kind`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,27 +28,6 @@ impl<T> Default for Csr<T> {
     }
 }
 
-/// `start` (one longer than the nodes) from the node of each item: `start[n]` where node `n`'s
-/// items begin. Returns the number of items.
-fn starts(start: &mut [u32], nodes: impl Iterator<Item = usize>) -> usize {
-    for node in nodes {
-        start[node + 1] += 1;
-    }
-    for at in 1..start.len() {
-        start[at] += start[at - 1];
-    }
-    start.last().map_or(0, |&it| it as usize)
-}
-
-/// After a scatter that used `start[n]` as node `n`'s cursor, which leaves it where node `n`
-/// ends, puts each start back.
-fn rewind(start: &mut [u32]) {
-    for at in (1..start.len()).rev() {
-        start[at] = start[at - 1];
-    }
-    start[0] = 0;
-}
-
 impl<T: Copy> Csr<T> {
     /// The lists of `nodes` nodes from `(node, item)` pairs, each list in the order its pairs
     /// come in (a counting sort, which is stable). The pairs are walked twice and never
@@ -58,19 +37,7 @@ impl<T: Copy> Csr<T> {
         I: IntoIterator<Item = (u32, T)>,
         I::IntoIter: Clone,
     {
-        let pairs = pairs.into_iter();
-        let mut start = vec![0u32; nodes + 1];
-        let total = starts(&mut start, pairs.clone().map(|(node, _)| node as usize));
-        let Some((_, filler)) = pairs.clone().next() else {
-            return Csr { start, items: Vec::new() };
-        };
-        let mut items = vec![filler; total];
-        for (node, item) in pairs {
-            let at = &mut start[node as usize];
-            items[*at as usize] = item;
-            *at += 1;
-        }
-        rewind(&mut start);
+        let (start, items) = blaze_ids::radix::Csr::build(nodes, pairs).into_parts();
         Csr { start, items }
     }
 
@@ -154,16 +121,12 @@ impl Facts {
             nodes += domain as u32;
         }
         base.push(nodes);
-        let node = |fact: &Fact| (base[fact.kind as usize] + fact.a) as usize;
-        let mut start = vec![0u32; nodes as usize + 1];
-        let total = starts(&mut start, self.rows.iter().map(node));
-        let mut items = vec![0u32; total];
-        for fact in &self.rows {
-            let at = &mut start[node(fact)];
-            items[*at as usize] = fact.b;
-            *at += 1;
-        }
-        rewind(&mut start);
+        let node = |fact: &Fact| base[fact.kind as usize] + fact.a;
+        let (start, items) = blaze_ids::radix::Csr::build(
+            nodes as usize,
+            self.rows.iter().map(|fact| (node(fact), fact.b)),
+        )
+        .into_parts();
         Relation { base, start, items }
     }
 }

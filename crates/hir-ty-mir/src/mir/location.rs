@@ -3,6 +3,7 @@
 //! `#[track_caller]` and panics report. The evaluator of constants and the code generator
 //! both read them.
 
+use salsa::Database as _;
 use base_db::Db;
 use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId, Lookup, attrs::AttrFlags, expr_store::Body,
@@ -14,7 +15,6 @@ use hir_expand::{
 };
 use rustc_hash::FxHashMap;
 use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
-use unicode_width::UnicodeWidthChar;
 
 use crate::{
     InferenceResult,
@@ -35,6 +35,22 @@ pub fn written_range(node: &SyntaxNode) -> TextRange {
     TextRange::new(start, node.text_range().end())
 }
 
+/// Whether lowering `body` met a call of `line!`, `column!`, `file!` or `concat!`: only then
+/// can a literal of it be what one of them expanded to, and only then is its source map read.
+fn calls_location_macros(db: &Db, body: &Body) -> bool {
+    body.macro_calls().iter().any(|call| {
+        matches!(
+            call.loc(db).def.kind,
+            MacroDefKind::BuiltIn(
+                _,
+                BuiltinFnLikeExpander::Line
+                    | BuiltinFnLikeExpander::Column
+                    | BuiltinFnLikeExpander::File
+            ) | MacroDefKind::BuiltInEager(_, EagerExpander::Concat)
+        )
+    })
+}
+
 /// The literals of a body that `line!()`, `column!()` or `file!()` expanded to. The source map
 /// changes with every edit above the body, and this keeps code without such literals from
 /// changing with it.
@@ -43,7 +59,11 @@ pub fn location_macros<'db>(
     db: &'db Db,
     owner: DefWithBodyId,
 ) -> FxHashMap<ExprId, (BuiltinFnLikeExpander, HirFileId)> {
-    let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
+    let body = Body::of(db, owner);
+    if !calls_location_macros(db, body) {
+        return FxHashMap::default();
+    }
+    let source_map = Body::unmoved_source_map(db, owner);
     body.exprs()
         .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
         .filter_map(|(id, _)| {
@@ -59,6 +79,7 @@ pub fn location_macros<'db>(
             )
             .then_some((id, (expander, file_id)))
         })
+        // alloc: the query's value, of a body that called a location macro
         .collect()
 }
 
@@ -69,7 +90,11 @@ pub fn located_concats<'db>(
     db: &'db Db,
     owner: DefWithBodyId,
 ) -> FxHashMap<ExprId, HirFileId> {
-    let (body, source_map) = (Body::of(db, owner), Body::unmoved_source_map(db, owner));
+    let body = Body::of(db, owner);
+    if !calls_location_macros(db, body) {
+        return FxHashMap::default();
+    }
+    let source_map = Body::unmoved_source_map(db, owner);
     body.exprs()
         .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Literal(_)))
         .filter_map(|(id, _)| {
@@ -79,6 +104,7 @@ pub fn located_concats<'db>(
                 matches!(loc.def.kind, MacroDefKind::BuiltInEager(_, EagerExpander::Concat));
             (concat && names_location(&loc.to_node(db).value)).then_some((id, file_id))
         })
+        // alloc: the query's value, of a body that called a location macro
         .collect()
 }
 
@@ -88,6 +114,7 @@ pub enum Placed {
     Text(String),
 }
 
+// dyn: the build's rule, told once a build and called once per file (`file_source_path`)
 type SourcePaths = dyn Fn(&Db, base_db::FileId) -> Option<String> + Send + Sync;
 
 /// How a build names files, told by [`name_sources`]. Two rules with the same `key` name every
@@ -120,6 +147,7 @@ pub fn name_sources(
     key: &str,
     paths: impl Fn(&Db, base_db::FileId) -> Option<String> + Send + Sync + 'static,
 ) {
+    // alloc: once per naming rule a build tells
     let rule = NamingRule { key: key.into(), paths: std::sync::Arc::new(paths) };
     match SourceNames::try_get(db) {
         Some(names) if names.rule(db).key == rule.key => {}
@@ -156,16 +184,18 @@ fn file_source_path<'db>(db: &'db Db, file: base_db::FileText) -> Option<String>
 pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
     let path = |file| source_path(db, file);
     if let Some(file_id) = located_concats(db, owner).get(&expr) {
+        use std::fmt::Write;
         let call = file_id.macro_file()?.loc(db).to_node(db);
+        // alloc: the value of the `concat!`, made only where one of a place is evaluated
         let mut text = String::new();
         for part in concat_parts(&call.value)? {
             match part {
                 ConcatPart::Text(part) => text.push_str(&part),
                 ConcatPart::Location(expander, range) => {
-                    let (file, line, col) = location_of(db, call.file_id, range)?;
+                    let (file, line, col) = macro_location_of(db, call.file_id, range)?;
                     match expander {
-                        BuiltinFnLikeExpander::Line => text.push_str(&line.to_string()),
-                        BuiltinFnLikeExpander::Column => text.push_str(&col.to_string()),
+                        BuiltinFnLikeExpander::Line => _ = write!(text, "{line}"),
+                        BuiltinFnLikeExpander::Column => _ = write!(text, "{col}"),
                         _ => text.push_str(path(file)?),
                     }
                 }
@@ -177,10 +207,11 @@ pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
     let site = written_call(db, file_id)?;
     let range = InFile::new(site.file_id, written_range(&site.value));
     let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
-    let (file, line, col) = location_of(db, file_id.into(), range)?;
+    let (file, line, col) = macro_location_of(db, file_id.into(), range)?;
     Some(match expander {
         BuiltinFnLikeExpander::Line => Placed::Number(line),
         BuiltinFnLikeExpander::Column => Placed::Number(col),
+        // alloc: the value of `file!()`, made only where one is evaluated
         _ => Placed::Text(path(file)?.to_owned()),
     })
 }
@@ -217,8 +248,10 @@ pub enum ConcatPart {
 /// The arguments of a `concat!` call, when each is a literal or a call of `line!`, `column!`
 /// or `file!`.
 pub fn concat_parts(call: &SyntaxNode) -> Option<Vec<ConcatPart>> {
+    // clone: a syntax node handle (a refcount)
     let tree = ast::MacroCall::cast(call.clone())?.token_tree()?;
     let mut inside: Vec<SyntaxElement> =
+        // alloc: the call's arguments, read only where a `concat!` of a place is evaluated
         tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
     inside.pop()?;
     let inside = inside.get(1..)?;
@@ -226,17 +259,22 @@ pub fn concat_parts(call: &SyntaxNode) -> Option<Vec<ConcatPart>> {
         .split(|it| it.kind() == SyntaxKind::COMMA)
         .filter(|argument| !argument.is_empty())
         .map(concat_part)
+        // alloc: the parts, made only where a `concat!` of a place is evaluated
         .collect()
 }
 
 fn concat_part(argument: &[SyntaxElement]) -> Option<ConcatPart> {
     if let [SyntaxElement::Token(token)] = argument {
         let text = match token.kind() {
+            // clone: a token handle; alloc: the part's text
             SyntaxKind::STRING => ast::String::cast(token.clone())?.value().ok()?.into_owned(),
             SyntaxKind::INT_NUMBER => {
+                // clone: a token handle; alloc: the part's text
                 ast::IntNumber::cast(token.clone())?.value().ok()?.to_string()
             }
+            // clone: a token handle; alloc: the part's text
             SyntaxKind::CHAR => ast::Char::cast(token.clone())?.value().ok()?.to_string(),
+            // alloc: the part's text
             SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => token.text().to_owned(),
             _ => return None,
         };
@@ -267,58 +305,52 @@ pub fn written_call(db: &Db, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
     Some(call)
 }
 
+/// File, line and column of where `range` of `file_id` begins as rustc reports it (the column
+/// in display width, as [`line_and_column`] gives it).
 pub fn location_of(
     db: &Db,
     file_id: HirFileId,
     range: TextRange,
 ) -> Option<(base_db::FileId, u32, u32)> {
-    // What a macro writes itself is reported from where the outermost macro is called;
-    // what it is passed keeps its own place.
+    line_and_column(db, reported_file_range(db, file_id, range))
+}
+
+/// [`location_of`] as `line!()` and `column!()` expand to it: the column is rustc's
+/// `lookup_char_pos(..).col + 1`, in chars (a tab is one), not the display width.
+pub fn macro_location_of(
+    db: &Db,
+    file_id: HirFileId,
+    range: TextRange,
+) -> Option<(base_db::FileId, u32, u32)> {
+    let FileRange { file_id, range } = reported_file_range(db, file_id, range);
+    let file_id = file_id.file_id(db);
+    let text = db.file_text(file_id);
+    let place = base_db::line_index(db, text).place(range.start())?;
+    Some((file_id, place.line(), place.char_column(text.text(db))?))
+}
+
+/// Where in a file rustc reports `range` of `file_id`: what a macro writes itself from where
+/// the outermost macro is called, and what it is passed at its own place.
+fn reported_file_range(db: &Db, file_id: HirFileId, range: TextRange) -> FileRange {
     let own_tokens = file_id.macro_file().is_some()
         && !file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root();
-    let FileRange { file_id, range } = match written_call(db, file_id) {
+    match written_call(db, file_id) {
         Some(call) if own_tokens => InFile::new(call.file_id, written_range(&call.value))
             .original_node_file_range_rooted(db),
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
-    };
-    line_and_column(db, FileRange { file_id, range })
+    }
 }
 
-/// File, line and column of where a range of a file begins.
+/// File, line and column of where a range of a file begins: rustc's line, and its
+/// `col_display + 1` (what `Location::caller` and debug info are given).
 pub fn line_and_column(
     db: &Db,
     FileRange { file_id, range }: FileRange,
 ) -> Option<(base_db::FileId, u32, u32)> {
     let file_id = file_id.file_id(db);
     let text = db.file_text(file_id);
-    let starts = line_starts(db, text);
-    let at = u32::from(range.start());
-    let line = starts.partition_point(|&start| start <= at);
-    let line_start = *starts.get(line.checked_sub(1)?)?;
-    let written = text.text(db).get(line_start as usize..at as usize)?;
-    Some((file_id, line as u32, written.chars().map(column_width).sum::<usize>() as u32 + 1))
-}
-
-/// Where each line of a file begins, the first of them at 0.
-#[salsa::tracked(returns(ref))]
-fn line_starts(db: &Db, text: base_db::FileText) -> Vec<u32> {
-    let ends = text.text(db).bytes().enumerate().filter(|&(_, byte)| byte == b'\n');
-    std::iter::once(0).chain(ends.map(|(at, _)| at as u32 + 1)).collect()
-}
-
-/// How many columns rustc counts a character of a source line as (`rustc_span::char_width`):
-/// its display width, four for a tab, and one for the control characters rustc prints a
-/// visible character for.
-pub fn column_width(ch: char) -> usize {
-    match ch {
-        '\t' => 4,
-        '\0'..='\u{8}'
-        | '\u{b}'..='\u{1f}'
-        | '\u{7f}'
-        | '\u{202a}'..='\u{202e}'
-        | '\u{2066}'..='\u{2069}' => 1,
-        _ => UnicodeWidthChar::width(ch).unwrap_or(1),
-    }
+    let place = base_db::line_index(db, text).place(range.start())?;
+    Some((file_id, place.line(), place.display_column(text.text(db))?))
 }
 
 /// File, line and column of a place in a body, as rustc reports them, found from where the
@@ -385,9 +417,11 @@ pub fn reported_range(
     node: &SyntaxNode,
 ) -> Option<TextRange> {
     let end = node.text_range().end();
+    // clone: a syntax node handle (a refcount)
     if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
         return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
     }
+    // clone: a syntax node handle (a refcount)
     if let Some(written) = ast::IndexExpr::cast(node.clone())
         && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner).expr(expr)
         && !is_builtin_index(InferenceResult::of(db, owner), base, index)

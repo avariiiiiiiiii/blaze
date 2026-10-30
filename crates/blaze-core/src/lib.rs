@@ -82,10 +82,14 @@ pub struct FileName(Box<str>);
 impl FileName {
     /// `None` for a name that would leave the driver's root or names nothing.
     pub fn new(name: &str) -> Option<FileName> {
-        let ok = !name.is_empty()
+        FileName::is_valid(name).then(|| FileName(name.into()))
+    }
+
+    /// Whether [`FileName::new`] takes `name`, without making one.
+    pub(crate) fn is_valid(name: &str) -> bool {
+        !name.is_empty()
             && !name.starts_with('/')
-            && name.split('/').all(|it| !it.is_empty() && it != "." && it != "..");
-        ok.then(|| FileName(name.into()))
+            && name.split('/').all(|it| !it.is_empty() && it != "." && it != "..")
     }
 
     pub fn as_str(&self) -> &str {
@@ -348,6 +352,8 @@ pub struct Exit {
 /// as any clone of it lives (the store and the image only ever replace a file by renaming
 /// another over it, never write one in place).
 #[derive(Clone)]
+// dyn: who keeps the bytes (a mapped file, an owned buffer), dropped with the last clone; a
+// read is one call for the slice
 pub struct Mapping(pub std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>);
 
 impl Mapping {
@@ -456,7 +462,7 @@ pub trait Driver {
 /// effects all complete; a timer far ahead holds it until it fires, and a watch until it is
 /// unwatched.
 pub fn run_until_idle(
-    driver: &mut dyn Driver,
+    driver: &mut (impl Driver + ?Sized),
     effects: &mut Vec<Effect>,
     mut on: impl FnMut(Completion, &mut Vec<Effect>),
 ) {

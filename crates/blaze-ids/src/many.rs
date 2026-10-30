@@ -5,6 +5,8 @@
 //! `compress_lanes` is ours: `of_many_is_of_for_each` holds both to the hasher at every length
 //! and grouping, so a change in either fails there and not in an ID.
 
+use std::cell::RefCell;
+
 use blake3::{
     BLOCK_LEN, CHUNK_LEN, IncrementCounter,
     hazmat::ContextKey,
@@ -12,6 +14,27 @@ use blake3::{
 };
 
 use crate::{ContentId, radix};
+
+/// A thread's buffers for [`of_many_into`], kept warm across calls: the inputs grouped by
+/// leading blocks, the grouping's cursors and one group's chaining values.
+struct Kept {
+    groups: radix::Csr<u32>,
+    cursors: Vec<u32>,
+    cvs: Vec<[u32; 8]>,
+}
+
+thread_local! {
+    static KEPT: RefCell<Kept> = const {
+        RefCell::new(Kept {
+            groups: radix::Csr::new(),
+            cursors: Vec::new(), // alloc: empty until a thread's first call, then reused
+            cvs: Vec::new(),     // alloc: empty until a thread's first call, then reused
+        })
+    };
+}
+
+/// Inputs `hash_many` takes at once: a multiple of every SIMD degree (16 for AVX-512).
+const BATCH: usize = 64;
 
 /// BLAKE3's block flags.
 const CHUNK_START: u8 = 1;
@@ -25,16 +48,31 @@ fn leading(len: usize) -> usize {
 }
 
 pub(crate) fn of_many(key: &ContextKey, inputs: &[&[u8]]) -> Vec<ContentId> {
+    // alloc: the result, which the caller keeps; `of_many_into` fills one of the caller's
+    let mut out = Vec::with_capacity(inputs.len());
+    of_many_into(key, inputs, &mut out);
+    out
+}
+
+/// [`of_many`] into `out`, cleared first: a warm call with room allocates nothing.
+pub(crate) fn of_many_into(key: &ContextKey, inputs: &[&[u8]], out: &mut Vec<ContentId>) {
+    out.clear();
+    out.resize(inputs.len(), ContentId::default());
+    KEPT.with_borrow_mut(|kept| hash_into(key, inputs, out, kept));
+}
+
+fn hash_into(key: &ContextKey, inputs: &[&[u8]], out: &mut [ContentId], kept: &mut Kept) {
     let platform = Platform::detect();
     let words = platform::words_from_le_bytes_32(key);
-    let mut out = vec![ContentId::default(); inputs.len()];
-    let groups = radix::Csr::build(
+    let Kept { groups, cursors, cvs } = kept;
+    groups.rebuild(
         CHUNK_LEN / BLOCK_LEN,
         inputs
             .iter()
             .enumerate()
             .filter(|(_, input)| input.len() <= CHUNK_LEN)
             .map(|(at, input)| (leading(input.len()) as u32, at as u32)),
+        cursors,
     );
     for (at, input) in inputs.iter().enumerate() {
         if input.len() > CHUNK_LEN {
@@ -43,7 +81,6 @@ pub(crate) fn of_many(key: &ContextKey, inputs: &[&[u8]]) -> Vec<ContentId> {
             out[at] = ContentId(*hasher.finalize().as_bytes());
         }
     }
-    let mut cvs = Vec::new();
     for group in 0..groups.rows() {
         let members = groups.row(group);
         if members.is_empty() {
@@ -53,7 +90,7 @@ pub(crate) fn of_many(key: &ContextKey, inputs: &[&[u8]]) -> Vec<ContentId> {
         if group == 0 {
             cvs.resize(members.len(), words);
         } else {
-            leading_blocks(platform, &words, inputs, members, group, &mut cvs);
+            leading_blocks(platform, &words, inputs, members, group, cvs);
         }
         let first = if group == 0 { CHUNK_START } else { 0 };
         let flags = u32::from(DERIVE_KEY_MATERIAL | first | CHUNK_END | ROOT);
@@ -83,7 +120,6 @@ pub(crate) fn of_many(key: &ContextKey, inputs: &[&[u8]]) -> Vec<ContentId> {
             }
         }
     }
-    out
 }
 
 /// Last blocks compressed together, a lane each: one AVX2 register of `u32`s, two NEON ones.
@@ -188,22 +224,26 @@ fn hash_leading<const N: usize>(
     members: &[u32],
     cvs: &mut Vec<[u32; 8]>,
 ) {
-    let prefixes: Vec<&[u8; N]> = members
-        .iter()
-        .map(|&at| inputs[at as usize][..N].try_into().expect("a member has more than N bytes"))
-        .collect();
-    let mut bytes = vec![0; members.len() * blake3::OUT_LEN];
-    platform.hash_many(
-        &prefixes,
-        key,
-        0,
-        IncrementCounter::No,
-        DERIVE_KEY_MATERIAL,
-        CHUNK_START,
-        0,
-        &mut bytes,
-    );
-    cvs.extend(bytes.chunks_exact(blake3::OUT_LEN).map(|cv| {
-        platform::words_from_le_bytes_32(cv.try_into().expect("a 32-byte chaining value"))
-    }));
+    let mut bytes = [0u8; BATCH * blake3::OUT_LEN];
+    for batch in members.chunks(BATCH) {
+        // Lanes past the batch repeat its last member; only `..batch.len()` is hashed.
+        let prefixes: [&[u8; N]; BATCH] = std::array::from_fn(|lane| {
+            let at = batch[lane.min(batch.len() - 1)];
+            inputs[at as usize][..N].try_into().expect("a member has more than N bytes")
+        });
+        let out = &mut bytes[..batch.len() * blake3::OUT_LEN];
+        platform.hash_many(
+            &prefixes[..batch.len()],
+            key,
+            0,
+            IncrementCounter::No,
+            DERIVE_KEY_MATERIAL,
+            CHUNK_START,
+            0,
+            out,
+        );
+        cvs.extend(out.chunks_exact(blake3::OUT_LEN).map(|cv| {
+            platform::words_from_le_bytes_32(cv.try_into().expect("a 32-byte chaining value"))
+        }));
+    }
 }

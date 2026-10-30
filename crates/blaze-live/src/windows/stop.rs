@@ -168,11 +168,15 @@ impl World for Threads {
             unsafe { CloseHandle(handle as *mut c_void) };
         }
         stopped.map_err(|stuck| match stuck {
+            // alloc: error path
             Stuck::Many => format!("the program runs more than {MOST_THREADS} threads to stop"),
             Stuck::Walking(status) => {
+                // alloc: error path
                 format!("walking the program's threads: NTSTATUS {status:#x}")
             }
+            // alloc: error path
             Stuck::Suspending(id, code) => format!("suspending thread {id}: error {code}"),
+            // alloc: error path
             Stuck::Context(id, code) => format!("reading where thread {id} is: error {code}"),
         })
     }

@@ -412,6 +412,29 @@ mod tests {
         let longer: InternedRef<'static, GcString> = r.change_lifetime();
         assert_eq!(longer, r);
     }
+
+    #[cfg(not(blaze_check))]
+    #[derive(PartialEq, Eq, Hash, Debug)]
+    struct Counted(u64);
+    #[cfg(not(blaze_check))]
+    impl_internable!(Counted);
+
+    /// A hit, a read and, once the type's store exists, a miss all allocate nothing: values,
+    /// chunks and tables come from `crate::space`'s region.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn interning_allocates_nothing() {
+        let held = Interned::new(Counted(u64::MAX));
+        blaze_alloc_count::assert_at_most(0, "an interned hit and a read", || {
+            assert!(Interned::new(Counted(u64::MAX)) == held);
+            assert_eq!(held.0, u64::MAX);
+        });
+        blaze_alloc_count::assert_at_most(0, "interning new values, tables growing", || {
+            for n in 0..100_000 {
+                assert_eq!(Interned::new(Counted(n)).0, n);
+            }
+        });
+    }
 }
 
 /// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release

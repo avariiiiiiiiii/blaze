@@ -33,7 +33,7 @@ use syntax::{SyntaxNodePtr, TextRange};
 
 use crate::{
     cx::Cx,
-    lints::syntax::Walk,
+    lints::registry::{LintId, LintSet},
     lower::{Found, Phase},
 };
 
@@ -41,14 +41,31 @@ use crate::{
 /// the order they were buffered, nodes in the order the early lint pass comes to them, then
 /// what type checking finds of trait imports.
 pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let walk = Walk::of(cx);
+    const GIVES: LintSet = LintSet::of(&[
+        LintId::named("unused_imports"),
+        LintId::named("redundant_imports"),
+        LintId::named("unused_extern_crates"),
+        LintId::named("macro_use_extern_crate"),
+        LintId::named("unused_macros"),
+        LintId::named("unused_macro_rules"),
+        LintId::named("unused_qualifications"),
+        LintId::named("ambiguous_glob_reexports"),
+        LintId::named("hidden_glob_reexports"),
+        LintId::named("pub_use_of_private_extern_crate"),
+    ]);
+    if !cx.any_may_fire(&GIVES) {
+        return Vec::new();
+    }
+    let walk = cx.walk();
     let places = Places::of(cx);
-    let uses = used::Uses::of(cx, &walk, &places);
-    let mut buffered = macros::lints(cx, &walk, &uses);
+    let uses = used::Uses::of(cx, walk, &places);
+    let mut buffered = macros::lints(cx, walk, &uses);
     buffered.extend(globs::lints(cx, &uses));
     let mut unused = unused::Unused::of(cx, &uses);
     buffered.append(&mut unused.resolve);
-    buffered.extend(qualifications::lints(cx, &walk, &uses, &unused));
+    if cx.lint_may_fire(LintId::named("unused_qualifications")) {
+        buffered.extend(qualifications::lints(cx, walk, &uses, &unused));
+    }
     let mut keyed: Vec<_> = buffered
         .into_iter()
         .map(|found| (found.lint_at.clone().map(|at| places.place(cx, at)).unwrap_or_default(), found))

@@ -21,7 +21,8 @@ mod names;
 pub mod registry;
 pub(crate) mod syntax;
 
-pub(crate) use levels::level_at;
+pub(crate) use levels::{LevelMap, may_fire};
+pub(crate) use names::ItemWalk;
 pub use levels::{CommandLine, Level};
 pub use self::syntax::CheckCfg;
 
@@ -78,7 +79,9 @@ pub(crate) fn body_item(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(I
     let mut node: InFile<SyntaxNode> = cx.syntax(at);
     loop {
         for ancestor in node.value.ancestors() {
-            let name = |it: &dyn HasName| it.name().map(|it| it.text().to_string());
+            fn name(it: &impl HasName) -> Option<String> {
+                it.name().map(|it| it.text().to_string())
+            }
             if let Some(it) = ast::Fn::cast(ancestor.clone()) {
                 let def = cx.sema.to_def2(node.with_value(&it))?;
                 let id = hir_def::FunctionId::try_from(def).ok()?;
@@ -115,6 +118,36 @@ pub(crate) fn body_path(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(I
         _ => return None,
     };
     Some((item, cx.def_path(hir::ModuleDef::from(id))))
+}
+
+/// `check` given the context of the first workspace crate of `fixture`, checked with the lint
+/// flags `args`: for the tests that measure what a pass costs.
+#[cfg(test)]
+pub(crate) fn with_cx(fixture: &str, args: &[&str], check: impl FnOnce(&Cx<'_, '_>)) {
+    let checked = crate::tests::checked(fixture);
+    let args: Vec<String> = args.iter().map(|it| (*it).to_owned()).collect();
+    let cmd = CommandLine::parse(&args).unwrap();
+    let db = &checked.db;
+    hir::attach_db(db, || {
+        let sema = hir::Semantics::new(db);
+        let krate = hir::check::workspace_crates(db)[0];
+        let frame = crate::tests::frame();
+        let cx = Cx::new(&sema, krate, checked.files(), &frame).with_lints(&cmd);
+        check(&cx);
+    });
+}
+
+/// A library of edition 2021 with `fns` public functions, ASCII throughout, that no lint of
+/// rustc's defaults fires in: the crate a budget is checked at two sizes of.
+#[cfg(test)]
+pub(crate) fn quiet_crate(fns: usize) -> String {
+    use std::fmt::Write as _;
+
+    let mut text = String::from("//- /lib.rs crate:main edition:2021\n//! A crate.\n");
+    for at in 0..fns {
+        writeln!(text, "/// Adds {at}.\npub fn add_{at}(x: u32) -> u32 {{\n    x.wrapping_add({at})\n}}").unwrap();
+    }
+    text
 }
 
 /// Records on `diag` the fact of the code of the body `at` is in: what to change to make it

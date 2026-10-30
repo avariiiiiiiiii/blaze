@@ -403,6 +403,8 @@ A `#[path = ..]` on such a declaration is not followed (none in the hot crates t
 Why: the brief's rule is "tests count as the edge"; this makes the lint see it without
 comments inside test fixtures.
 
+> forwarded to the coordinator (`tools/`) (from requests, pass 16; on requests' coordinator list).
+
 ## speed-hir-sol-expand: the same `hot_lint` fix, for hir-expand too
 
 `speed-hir-sol-defs`'s request just above ("`tools/v2/hot_lint.py` skips the files of a module
@@ -411,6 +413,8 @@ declared `#[cfg(test)]`") also clears 71 findings in hir-expand:
 in `builtin/derive_macro.rs` (the old derive code, kept only as the tests' reference). It also
 covers the new `crates/hir-def/src/macro_expansion_tests/budgets.rs` I asked of db-expand-macros.
 Nothing more to change: one fix for both.
+
+> forwarded to the coordinator (`tools/`) (from requests, pass 16; on requests' coordinator list).
 
 ## speed-link-edge-sol-ci
 
@@ -437,5 +441,10 @@ change I add a differential test that runs both decoders over GitHub's recorded 
 asserts equal outcomes and equal `Delivery`s. The wording of a refusal's 400 body changes: it
 carries the decoder's own error text ("the pull_request payload is not one: ..."). Nothing reads
 that body except a person looking at the delivery in GitHub's settings.
+
+> applied (2026-10-29): the root entry is in. `crates/blaze-ci/Cargo.toml` has
+> `sonic-rs.workspace = true`. `webhook::parse` decodes through `parse_by::<Sonic>`, and
+> `webhook/tests.rs` `sonic_rs_takes_and_refuses_the_payloads_serde_json_did` holds it to
+> serde_json. Not yet run.
 
 > applied by requests: root `sonic-rs = { version = "0.5", default-features = false }` after `serde_json`, with a comment. New to the lock: on requests' lock additions list. The blaze-ci side is speed-link-edge-sol-ci's (told).

@@ -876,6 +876,7 @@ impl<'a> Carried<'a> {
                         side.mod_dirs.insert(module, dir);
                     }
                 }
+                // alloc: once per module an expansion declares, at its first step.
                 Arc::new(side)
             }
         }

@@ -122,6 +122,9 @@ pub struct JobInput {
     /// [`blaze_cas::enter`] guard is held); written only by the loop.
     pub store: blaze_cas::Reader,
     pub color: bool,
+    /// Diagnostics are rendered a line each: cargo's `--message-format=short` or
+    /// `json-diagnostic-short`.
+    pub short: bool,
     pub goal: Goal,
     /// Set once the job is cancelled: long work looks at it between pieces and stops with
     /// [`Failed::Again`], which the loop drops for a cancelled job.

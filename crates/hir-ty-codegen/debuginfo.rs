@@ -219,6 +219,7 @@ impl SlotPlaces {
     /// The places in a frame Cranelift laid out for `func`, which it finds by the frame
     /// pointer.
     pub(super) fn of_frame(
+        // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
         isa: &dyn TargetIsa,
         frame: &cranelift_codegen::MachBufferFrameLayout,
         func: &ir::Function,
@@ -419,6 +420,7 @@ impl DebugContext {
     /// With `grouped`, each unit linked on ELF has sections of its own (see
     /// [`Dwarf::sections`]).
     pub(super) fn new(
+        // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
         isa: &dyn TargetIsa,
         directory: &str,
         variables: bool,
@@ -637,6 +639,7 @@ impl Dwarf {
     /// variables of the functions are left out unless `variables` asks for them. Their
     /// entries are kept apart from what is linked when `apart` names the file a debugger
     /// reads them from.
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     fn new(isa: &dyn TargetIsa, directory: &str, variables: bool, apart: Option<String>) -> Self {
         let encoding =
             Encoding { format: Format::Dwarf32, version: 4, address_size: isa.pointer_bytes() };

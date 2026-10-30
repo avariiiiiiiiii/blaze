@@ -13,10 +13,7 @@ use hir::InFile;
 use span::Edition;
 use syntax::{TextRange, TextSize};
 
-use super::{
-    args::{ArgParser, Ident, Lit, MetaItem, MetaItemOrLit, MetaList, NameValue},
-    parsed::ParsedAttr,
-};
+use super::args::{ArgParser, Ident, Lit, MetaItem, MetaItemOrLit, MetaList, NameValue};
 use crate::{
     checks::features::Features,
     cx::Cx,
@@ -35,8 +32,8 @@ pub(crate) struct Session {
     pub(crate) krate: Krate,
     pub(crate) features: Features,
     pub(crate) target: TargetInfo,
-    /// rustc's `registered_tools`: the builtin tools and those of `#![register_tool(..)]`.
-    pub(crate) tools: Vec<String>,
+    /// rustc's `registered_tools`, besides the builtin ones: those of `#![register_tool(..)]`.
+    tools: Vec<String>,
 }
 
 /// What the parsers read of the target (rustc's `sess.target`), from the crate's cfg.
@@ -101,30 +98,32 @@ impl TargetInfo {
     }
 }
 
+/// rustc's builtin tools, which `#![register_tool(..)]` adds to.
+const BUILTIN_TOOLS: [&str; 5] = ["clippy", "rustfmt", "diagnostic", "miri", "rust_analyzer"];
+
 impl Session {
-    pub(crate) fn of(cx: &Cx<'_, '_>, owners: &[Owner]) -> Session {
-        let mut tools: Vec<String> =
-            ["clippy", "rustfmt", "diagnostic", "miri", "rust_analyzer"].iter().map(|it| (*it).to_owned()).collect();
+    /// Built once per check, by `checks::check`, from the crate's attributes and `features`
+    /// (what `checks::features::configured` found).
+    pub(crate) fn of(cx: &Cx<'_, '_>, owners: &[Owner], features: Features) -> Session {
+        let mut tools = Vec::new();
         let crate_attrs = owners.iter().filter(|it| it.target == Target::Crate).flat_map(|it| &it.attrs);
-        for attr in crate_attrs.filter(|it| it.is("register_tool")) {
+        for attr in crate_attrs.filter(|it| super::is(it, "register_tool")) {
             let mut quiet = Vec::new();
-            let Some(ArgParser::List(list)) = super::args::parse(cx, attr, &attr.path(), &mut quiet) else { continue };
+            let Some(ArgParser::List(list)) = super::args::parse(cx, attr, &["register_tool"], &mut quiet) else {
+                continue;
+            };
             for item in list.mixed() {
                 if let Some(ident) = item.meta_item_no_args().and_then(MetaItem::ident) {
+                    // alloc: once per tool a crate registers, at setup.
                     tools.push(ident.name.clone());
                 }
             }
         }
-        Session {
-            krate: Krate::of(cx, owners),
-            features: crate::checks::features::enabled(cx, owners),
-            target: TargetInfo::of(cx),
-            tools,
-        }
+        Session { krate: Krate::of(cx, owners), features, target: TargetInfo::of(cx), tools }
     }
 
     pub(crate) fn is_tool(&self, name: &str) -> bool {
-        self.tools.iter().any(|it| it == name)
+        BUILTIN_TOOLS.contains(&name) || self.tools.iter().any(|it| it == name)
     }
 
     /// rustc's `Features::enabled`.
@@ -156,29 +155,22 @@ pub(crate) struct Accept<'a, 'c, 'db> {
     /// Its index in the owner's attributes.
     pub(crate) index: usize,
     pub(crate) builtin: &'static Builtin,
-    /// What the node's attributes before it were parsed to, in the order rustc keeps them.
-    pub(crate) earlier: &'a [ParsedAttr],
-    /// `ShouldEmit::ErrorsAndLints`, or `ShouldEmit::Nothing` (the attribute was parsed once
-    /// already, as `check_mod_attrs` reads it parsed).
-    emit: bool,
     errors: &'a mut Vec<Diag>,
+    /// Rarely more than one; empty until a parser pushes a suggestion.
     custom: Vec<Custom>,
 }
 
 impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         cx: &'a Cx<'c, 'db>,
         session: &'a Session,
         owner: &'a Owner,
         index: usize,
         builtin: &'static Builtin,
-        earlier: &'a [ParsedAttr],
-        emit: bool,
         errors: &'a mut Vec<Diag>,
     ) -> Accept<'a, 'c, 'db> {
         let attr = &owner.attrs[index];
-        Accept { cx, session, owner, attr, index, builtin, earlier, emit, errors, custom: Vec::new() }
+        Accept { cx, session, owner, attr, index, builtin, errors, custom: Vec::new() }
     }
 
     /// A range of the attribute's file.
@@ -237,31 +229,12 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
         self.session.feature(name)
     }
 
-    /// Whether what it says is emitted (rustc's `ShouldEmit::ErrorsAndLints`).
-    pub(crate) fn emits(&self) -> bool {
-        self.emit
-    }
-
     /// rustc's `emit_err`.
     pub(crate) fn emit_err(&mut self, diag: Diag) {
-        if self.emit {
-            self.errors.push(diag);
-        }
+        self.errors.push(diag);
     }
 
     /// `parse`, the errors it gives fatal (rustc's `ShouldEmit::EarlyFatal`).
-    pub(crate) fn fatal<T>(&mut self, parse: impl FnOnce(&mut Self) -> T) -> T {
-        let from = self.errors.len();
-        let parsed = parse(self);
-        for diag in &mut self.errors[from..] {
-            if diag.is_error() && !diag.is_lint() {
-                diag.stop();
-            }
-        }
-        parsed
-    }
-
-    /// `parse`, its errors fatal (rustc's `ShouldEmit::EarlyFatal`).
     pub(crate) fn fatal<T>(&mut self, parse: impl FnOnce(&mut Self) -> T) -> T {
         let from = self.errors.len();
         let parsed = parse(self);
@@ -527,9 +500,6 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     /// rustc's `emit_parse_error` and `AttributeParseError::into_diag`.
     fn parse_error(&mut self, range: TextRange, reason: Reason) {
         let custom = std::mem::take(&mut self.custom);
-        if !self.emit {
-            return;
-        }
         let inner = self.inner_range();
         let range = if range == self.attr_range() { inner } else { range };
         let span = self.span(range);
@@ -588,9 +558,6 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     /// (`AllowedTargets::ManuallyChecked`), with its arguments as the message names them
     /// (`"(C)"`): the errors; the lints are `lints::syntax::attrs`'.
     pub(crate) fn check_target(&mut self, args: &str, targets: Targets) {
-        if !self.emit {
-            return;
-        }
         if let Some(diag) = target_error(self.cx, &self.session.krate, self.owner, self.attr, targets, args) {
             self.errors.push(diag);
         }

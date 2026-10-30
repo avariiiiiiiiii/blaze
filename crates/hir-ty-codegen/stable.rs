@@ -58,7 +58,7 @@ enum Declared {
 
 /// Lowers what [`StableNames`] lists of `crates`, so that a build that lists them later
 /// finds it done. `lower` is given the bodies of each round to lower at once.
-pub fn lower_declared(db: &Db, crates: &[Crate], lower: &dyn Fn(&[DefWithBodyId])) {
+pub fn lower_declared(db: &Db, crates: &[Crate], lower: &impl Fn(&[DefWithBodyId])) {
     declared(db, crates, lower, &mut |_| ());
 }
 
@@ -78,8 +78,8 @@ pub(super) fn declared_statics(db: &Db, crates: &[Crate]) -> Vec<StaticId> {
 fn declared(
     db: &Db,
     crates: &[Crate],
-    lower: &dyn Fn(&[DefWithBodyId]),
-    found: &mut dyn FnMut(Declared),
+    lower: &impl Fn(&[DefWithBodyId]),
+    found: &mut impl FnMut(Declared),
 ) {
     let mut bodies: Vec<DefWithBodyId> = Vec::new();
     let mut scope = |scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>| {
@@ -164,6 +164,7 @@ struct Listed {
 
 pub(super) struct StableNames<'a, 'db> {
     db: &'db Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &'a dyn SymbolResolver,
     /// The crates whose code changes under the daemon.
     owned: FxHashSet<Crate>,
@@ -194,6 +195,7 @@ pub(super) struct StableNames<'a, 'db> {
 impl<'a, 'db> StableNames<'a, 'db> {
     pub(super) fn new(
         db: &'db Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &'a dyn SymbolResolver,
         owned: FxHashSet<Crate>,
         by_content: bool,
@@ -870,10 +872,11 @@ impl<'a, 'db> StableNames<'a, 'db> {
 /// A file by its path as `named` has it, or for what a macro wrote by the call that wrote it.
 fn file_name(
     db: &Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &dyn SymbolResolver,
     out: &mut String,
     file: HirFileId,
-    named: &dyn Fn(Option<String>) -> Option<String>,
+    named: &impl Fn(Option<String>) -> Option<String>,
 ) -> Option<()> {
     let written_at = |out: &mut String, file: HirFileId, id: ErasedFileAstId| {
         file_name(db, symbols, out, file, named)?;
@@ -952,6 +955,7 @@ const INSTALLED_LIBRARY: &str = "/lib/rustlib/src/rust/";
 /// by the name their place gives them: under a path of this machine's, std's `thread_local!`s
 /// and `thread::min_stack`'s `MIN` were not found, and a program that spawned a thread or made
 /// a `HashMap` was refused (#840).
+// dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
 fn place_path(symbols: &dyn SymbolResolver, path: Option<String>) -> Option<String> {
     let library = symbols.library_sources().map(|it| it.here);
     Some(path_everywhere(path?, symbols.cargo_home().as_deref(), library.as_deref()))
@@ -978,6 +982,7 @@ fn path_everywhere(path: String, cargo_home: Option<&str>, library: Option<&str>
 /// `None` for a function outside of any block.
 pub fn block_place(
     db: &Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &dyn SymbolResolver,
     func: FunctionId,
 ) -> Option<String> {
@@ -994,6 +999,7 @@ pub fn block_place(
 /// constant), the place names it instead.
 pub fn function_place(
     db: &Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &dyn SymbolResolver,
     func: FunctionId,
 ) -> Option<String> {
@@ -1007,6 +1013,7 @@ pub fn function_place(
 /// Where a static inside a block is written, as [`block_place`] has it of a function.
 pub fn static_place(
     db: &Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &dyn SymbolResolver,
     id: hir_def::StaticId,
 ) -> Option<String> {

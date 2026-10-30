@@ -9,12 +9,58 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
 
 use blaze_api::{ApiError, Artifact, Response};
 use blaze_cas::Store;
+use blaze_codegen::plan::{Mode as BuildMode, Policy};
 use blaze_core::{Command, Completion, Done, Effect, Sandbox, Tag};
+use blaze_lazy::{Purpose, Refused};
 use blaze_units::schema::Mode;
 use rustc_hash::FxHashMap;
 
-use super::{Job, package_of};
+use super::{Job, codegen, package_of};
 use crate::serve::work::{Runs, Writer};
+
+#[cfg(test)]
+mod tests;
+
+/// How a process the daemon runs for a unit starts: a `run`'s program or a test binary.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Launch {
+    /// From its executable as linked: a profile compiled whole (a release one, as
+    /// `blaze_lazy::allow` decides), or a run under `target.<triple>.runner`, which takes a file.
+    File,
+}
+
+/// What a dev profile's process needs of blaze that it does not have yet.
+pub(crate) const NOT_IN_PROCESS: &str = "blaze runs a dev profile's process on its code memory, \
+    compiled lazily and tiered (docs/v2/plan/lanes/fastcompile/inproc.md, lazy.md), and this \
+    blaze can't yet: its linker does not lay a dev executable out for the start hook's overlay \
+    or commit it into code memory (the reservations in `Output`, `Image::commit_into`) and has \
+    no lazy placement, and its code generator has no lazy build (`Build::run` with `later`, \
+    `Build::compile_one`) or tiered mode";
+
+/// How the process of unit `unit` starts; `runner` says it runs under a
+/// `target.<triple>.runner`. What a `run` and a test binary both start through.
+pub(crate) fn launch(job: &Job, unit: usize, runner: bool) -> Result<Launch, String> {
+    if runner {
+        return Ok(Launch::File);
+    }
+    let u = job.unit(unit).map_err(|it| it.what)?;
+    let policy = codegen::policy(job, unit, codegen::toolchain(job, unit)?)?;
+    launch_of(&u.profile.name, &u.target.name, &policy)
+}
+
+/// How a process of `target` built as `policy` under profile `profile` starts, with no runner.
+/// A profile that may compile lazily (a process the daemon runs, writing no output) runs in
+/// process, and while blaze can't, that is an error naming what it lacks: never a quiet start
+/// from a file.
+pub(crate) fn launch_of(profile: &str, target: &str, policy: &Policy) -> Result<Launch, String> {
+    // clone: once per process started, of a policy a few hundred bytes long.
+    let live = Policy { mode: BuildMode::Live, ..policy.clone() };
+    match blaze_lazy::allow(&Purpose { profile, policy: &live, output: None }) {
+        Ok(()) => Err(format!("`{target}` runs under profile `{profile}`: {NOT_IN_PROCESS}")),
+        Err(Refused::Release { .. }) => Ok(Launch::File),
+        Err(refused) => Err(refused.to_string()),
+    }
+}
 
 /// The environment `artifact`'s program runs in: the job's, cargo's variables of it over it,
 /// and the job's dynamic library search path after cargo's directories, as
@@ -130,6 +176,9 @@ pub(crate) fn start(
         .ok_or_else(|| ApiError::new(format!("no unit of `{}` is in the build", target.name), None))? as usize;
     let unit = &units.graph.units[at];
     let package = package_of(units, unit)?;
+    match launch(job, at, !chosen.runner.is_empty()).map_err(|what| ApiError::new(what, None))? {
+        Launch::File => {}
+    }
     let config = &job.input.config;
     let env = process_env(&config.invocation.env, chosen, std::env::consts::OS);
     // cargo's `target.<triple>.runner`: the runner, its arguments, then the program's.

@@ -237,7 +237,7 @@ fn invalid(spec: &str, notes: Vec<String>) -> Diag {
 
 /// An error of the command line as rustc writes it: it points into no file.
 fn rendered(diag: &Diag) -> String {
-    crate::emit::rendered(diag, &mut Sources::of(std::iter::empty()), Style::default())
+    crate::emit::rendered(diag, &Sources::of(std::iter::empty()), Style::default())
 }
 
 /// One `--cfg` value as rustc's `parse_cfg` reads it for a crate of `edition`: its name, and

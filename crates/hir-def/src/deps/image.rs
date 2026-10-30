@@ -40,6 +40,25 @@ pub const IMAGE_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     SchemaPart::Schema(<Root as Record>::SCHEMA),
 ]);
 
+/// What holds the bytes of an image or a crate's reads as the store gave them: the store's own
+/// mapping, held in place (`blaze_cas::Reader::pinned`, through the driver's adapter), or a
+/// buffer of its own. The bytes start at a multiple of [`blaze_format::ALIGN`] (an image whose
+/// parts are not aligned does not open) and neither move nor change while it lives.
+pub trait Held: Send + Sync + 'static {
+    fn bytes(&self) -> &[u8];
+}
+
+impl Held for Aligned {
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+/// The bytes a store gave, held where it keeps them.
+// dyn: the store's holder of one image, one per crate per session; parts are read through `ImageRef`
+pub type ImageBuf = Arc<dyn Held>;
+
 /// What a part of an image is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u32)]
@@ -147,6 +166,7 @@ impl<'a> ImageRef<'a> {
     /// it: three slices, no check of the buffer.
     #[inline]
     pub(crate) fn at(buffer: &'a [u8], ranges: &[Range<usize>; Part::ALL.len()]) -> ImageRef<'a> {
+        // clone: three `Range<usize>`s, which are not `Copy`
         ImageRef { parts: ranges.clone().map(|it| &buffer[it]) }
     }
 }
@@ -156,12 +176,13 @@ impl<'a> ImageRef<'a> {
 #[derive(Clone)]
 pub enum PartBytes {
     Owned(Arc<[u8]>),
-    In { buffer: Arc<Aligned>, range: Range<usize> },
+    In { buffer: ImageBuf, range: Range<usize> },
 }
 
 impl PartBytes {
     /// Part `part` of the image in `buffer` whose parts are `ranges` ([`ImageRef::ranges`]).
-    pub fn of(buffer: &Arc<Aligned>, ranges: &[Range<usize>; Part::ALL.len()], part: Part) -> PartBytes {
+    pub fn of(buffer: &ImageBuf, ranges: &[Range<usize>; Part::ALL.len()], part: Part) -> PartBytes {
+        // clone: a count of the image buffer, which the part borrows, and a `Range<usize>`
         PartBytes::In { buffer: buffer.clone(), range: ranges[part as usize].clone() }
     }
 }
@@ -173,7 +194,8 @@ impl std::ops::Deref for PartBytes {
     fn deref(&self) -> &[u8] {
         match self {
             PartBytes::Owned(bytes) => bytes,
-            PartBytes::In { buffer, range } => &buffer[range.clone()],
+            // clone: a `Range<usize>`, which is not `Copy`
+            PartBytes::In { buffer, range } => &buffer.bytes()[range.clone()],
         }
     }
 }
@@ -238,18 +260,17 @@ pub fn write_image(key: ContentId, parts: [&[u8]; Part::ALL.len()]) -> Vec<u8> {
         placed[at] = (out.push_slice(bytes), bytes.len());
     }
     let recs_at = out.next::<PartRec>();
-    let recs: Vec<PartRec> = (Part::ALL.iter().zip(placed).enumerate())
-        .map(|(index, (&part, (bytes_at, len)))| {
-            let field = recs_at
-                + (index * size_of::<PartRec>()) as u64
-                + std::mem::offset_of!(PartRec, bytes) as u64;
-            let bytes = match len {
-                0 => Slice::EMPTY,
-                len => Slice::between(field, bytes_at, len),
-            };
-            PartRec { tag: part as u32, bytes }
-        })
-        .collect();
+    let recs: [PartRec; Part::ALL.len()] = std::array::from_fn(|index| {
+        let (bytes_at, len) = placed[index];
+        let field = recs_at
+            + (index * size_of::<PartRec>()) as u64
+            + std::mem::offset_of!(PartRec, bytes) as u64;
+        let bytes = match len {
+            0 => Slice::EMPTY,
+            len => Slice::between(field, bytes_at, len),
+        };
+        PartRec { tag: Part::ALL[index] as u32, bytes }
+    });
     let written = out.push_slice(&recs);
     debug_assert_eq!(written, recs_at, "`Writer::next` is not where `push_slice` writes");
     let root_at = out.next::<Root>();

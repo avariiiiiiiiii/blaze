@@ -3,6 +3,12 @@
 //! spelling, and the items of that name elsewhere to import. E0424 for `self` where there is no
 //! `self` parameter, and E0531 for a name a pattern needs.
 //!
+//! [`typo`], [`imports`] and [`show_imports`] are rustc's for every path that resolves to
+//! nothing, in either namespace: `checks::names::paths` gives them for a type or trait.
+//! [`imports`] reads the check's [`Decls`](crate::print::paths::Decls), every declaration by
+//! name, built once; [`typo`] chooses among the names in scope by their text and finds where
+//! only the chosen one is defined.
+//!
 //! Follows rustc's `compiler/rustc_resolve/src/late/diagnostics.rs`
 //! (`smart_resolve_report_errors`, `suggest_self_value`, `suggest_typo`,
 //! `lookup_typo_candidate`), `compiler/rustc_resolve/src/late.rs` (`PathSource::descr_expected`,
@@ -12,7 +18,7 @@
 //! (`guess_head_span`) (MIT or Apache-2.0).
 
 use either::Either;
-use hir::{HasAttrs as _, InFile};
+use hir::{HasAttrs as _, InFile, ModuleDef};
 use span::Edition;
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
@@ -21,8 +27,8 @@ use syntax::{
 
 use crate::{
     cx::{Cx, item_range},
-    lints::code_fact,
-    lower::{Found, Phase, unresolved_field::find_best_match_for_name},
+    lints::{code_fact, edit_distance::find_best_match_for_name},
+    lower::{Found, Phase},
     model::{Applicability, Diag, MultiSpan, Span, SuggestionStyle},
 };
 
@@ -43,7 +49,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
         }
         None => (base.clone(), written_name(&node.value)),
     };
-    let source = Source::of(&node.value, in_node.is_some(), &name);
+    let source = PathSource::of(&node.value, in_node.is_some(), &name);
     let syntax = node.value.as_ref().either(|it| it.syntax().clone(), |it| it.syntax().clone());
     let scope = cx.sema.scope(&syntax);
     let module = scope.as_ref().map(|it| it.module());
@@ -53,12 +59,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
     } else {
         let message = format!("cannot find {} `{name}` in this scope", source.expected());
         let mut diag = Diag::error(Some(source.code()), message, span.clone());
-        let suggested = scope.as_ref().is_some_and(|scope| typo(cx, &mut diag, scope, source, &name, &span));
+        let suggested =
+            scope.as_ref().is_some_and(|scope| typo(cx, &mut diag, Names::Scope(scope), source, &name, &span, &[]));
         if !suggested {
             diag.span_label(span.clone(), "not found in this scope");
         }
         if let Some(module) = module {
-            import_candidates(cx, &mut diag, module, source, &name);
+            let found = imports(cx, module, source, &name, None);
+            show_imports(cx, &mut diag, module, found, false);
         }
         diag
     };
@@ -86,20 +94,35 @@ fn written_name(node: &Either<ast::Expr, ast::Pat>) -> String {
     }
 }
 
-/// What rustc's resolver looked for the name as: its `PathSource`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Source {
+/// The namespace a path is resolved in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Ns {
+    Type,
+    Value,
+}
+
+/// What rustc's resolver looked for a name as: its `PathSource`, of the places blaze reports a
+/// name that resolves to nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PathSource {
+    /// An expression.
     Value,
     /// The callee of a call; with whether the name starts upper case.
     Callee(bool),
+    /// A pattern that is a path.
     Pat,
+    /// The path of a tuple struct pattern.
     TupleStruct,
+    /// A type.
+    Type,
+    /// A trait: a bound, the trait of an impl, `<T as Trait>`.
+    Trait,
 }
 
-impl Source {
-    fn of(node: &Either<ast::Expr, ast::Pat>, captured: bool, name: &str) -> Source {
+impl PathSource {
+    fn of(node: &Either<ast::Expr, ast::Pat>, captured: bool, name: &str) -> PathSource {
         match node {
-            Either::Left(_) if captured => Source::Value,
+            Either::Left(_) if captured => PathSource::Value,
             Either::Left(expr) => {
                 let callee = expr
                     .syntax()
@@ -108,50 +131,64 @@ impl Source {
                     .and_then(|call| call.expr())
                     .is_some_and(|callee| callee.syntax() == expr.syntax());
                 match callee {
-                    true => Source::Callee(name.chars().next().is_some_and(char::is_uppercase)),
-                    false => Source::Value,
+                    true => PathSource::Callee(name.chars().next().is_some_and(char::is_uppercase)),
+                    false => PathSource::Value,
                 }
             }
-            Either::Right(ast::Pat::TupleStructPat(_)) => Source::TupleStruct,
-            Either::Right(_) => Source::Pat,
+            Either::Right(ast::Pat::TupleStructPat(_)) => PathSource::TupleStruct,
+            Either::Right(_) => PathSource::Pat,
+        }
+    }
+
+    pub(crate) fn ns(self) -> Ns {
+        match self {
+            PathSource::Value | PathSource::Callee(_) | PathSource::Pat | PathSource::TupleStruct => Ns::Value,
+            PathSource::Type | PathSource::Trait => Ns::Type,
         }
     }
 
     /// `descr_expected`.
-    fn expected(self) -> &'static str {
+    pub(crate) fn expected(self) -> &'static str {
         match self {
-            Source::Value => "value",
-            Source::Callee(false) => "function",
-            Source::Callee(true) => "function, tuple struct or tuple variant",
-            Source::Pat => "unit struct, unit variant or constant",
-            Source::TupleStruct => "tuple struct or tuple variant",
+            PathSource::Value => "value",
+            PathSource::Callee(false) => "function",
+            PathSource::Callee(true) => "function, tuple struct or tuple variant",
+            PathSource::Pat => "unit struct, unit variant or constant",
+            PathSource::TupleStruct => "tuple struct or tuple variant",
+            PathSource::Type => "type",
+            PathSource::Trait => "trait",
         }
     }
 
-    /// `error_code` with no resolution in the namespace.
+    /// `error_code` of a value path with no resolution in the namespace.
     fn code(self) -> &'static str {
         match self {
-            Source::Value | Source::Callee(_) => "E0425",
-            Source::Pat | Source::TupleStruct => "E0531",
+            PathSource::Pat | PathSource::TupleStruct => "E0531",
+            _ => "E0425",
         }
     }
 
-    /// `is_expected` of a thing rustc's `Res::descr` names `descr`.
-    fn is_expected(self, descr: &str) -> bool {
+    /// `is_expected` of a thing rustc's `Res::descr` names `descr`, in the source's namespace.
+    pub(crate) fn is_expected(self, descr: &str) -> bool {
         match self {
-            Source::Value | Source::Callee(_) => true,
-            Source::Pat => matches!(descr, "unit struct" | "unit variant" | "constant"),
-            Source::TupleStruct => matches!(descr, "tuple struct" | "tuple variant"),
+            PathSource::Value | PathSource::Callee(_) => true,
+            PathSource::Pat => matches!(descr, "unit struct" | "unit variant" | "constant"),
+            PathSource::TupleStruct => matches!(descr, "tuple struct" | "tuple variant"),
+            PathSource::Type => matches!(
+                descr,
+                "struct" | "enum" | "union" | "trait" | "type alias" | "builtin type" | "type parameter" | "self type"
+            ),
+            PathSource::Trait => descr == "trait",
         }
     }
 }
 
 /// E0424 (`suggest_self_value`): `self` where no `self` parameter is.
-fn self_value(cx: &Cx<'_, '_>, syntax: &SyntaxNode, file: hir::HirFileId, source: Source, span: Span) -> Diag {
+fn self_value(cx: &Cx<'_, '_>, syntax: &SyntaxNode, file: hir::HirFileId, source: PathSource, span: Span) -> Diag {
     let message = format!("cannot find {} `self` in this scope", source.expected());
     let mut diag = Diag::error(Some("E0424"), message, span.clone());
     let at = |range: TextRange| cx.span(InFile::new(file, range));
-    if matches!(source, Source::Pat | Source::TupleStruct) {
+    if matches!(source, PathSource::Pat | PathSource::TupleStruct) {
         diag.span_label(span, "`self` value is a keyword and may not be bound to variables or shadowed");
         diag.note("a module named `self` exists in another namespace");
         return diag;
@@ -195,38 +232,39 @@ fn self_value(cx: &Cx<'_, '_>, syntax: &SyntaxNode, file: hir::HirFileId, source
     diag
 }
 
-/// A name in scope a typo may have meant: rustc's `TypoSuggestion`.
-struct Candidate {
-    name: String,
-    descr: &'static str,
-    /// Where it is defined: an item's head, or a local's binding.
-    def: Option<Span>,
-    is_local: bool,
-}
-
-/// rustc's `Res::descr` of what a name in scope is, in the value namespace.
-fn scope_descr(cx: &Cx<'_, '_>, def: &hir::ScopeDef<'_>) -> Option<&'static str> {
+/// rustc's `Res::descr` of an item in namespace `ns`: in the value namespace, the constructor
+/// of a struct or variant that has one.
+pub(crate) fn def_descr(cx: &Cx<'_, '_>, ns: Ns, def: ModuleDef) -> Option<&'static str> {
+    if ns == Ns::Type {
+        return Some(match def {
+            ModuleDef::Module(_) => "module",
+            ModuleDef::Function(_) => "function",
+            ModuleDef::Adt(hir::Adt::Struct(_)) => "struct",
+            ModuleDef::Adt(hir::Adt::Enum(_)) => "enum",
+            ModuleDef::Adt(hir::Adt::Union(_)) => "union",
+            ModuleDef::EnumVariant(_) => "variant",
+            ModuleDef::Const(_) => "constant",
+            ModuleDef::Static(_) => "static",
+            ModuleDef::Trait(_) => "trait",
+            ModuleDef::TypeAlias(_) => "type alias",
+            ModuleDef::BuiltinType(_) => "builtin type",
+            ModuleDef::Macro(it) => match it.kind(cx.db) {
+                hir::MacroKind::Attr | hir::MacroKind::AttrBuiltIn => "attribute macro",
+                hir::MacroKind::Derive | hir::MacroKind::DeriveBuiltIn => "derive macro",
+                _ => "macro",
+            },
+        });
+    }
     Some(match def {
-        hir::ScopeDef::Local(_) => "local variable",
-        hir::ScopeDef::GenericParam(hir::GenericParam::ConstParam(_)) => "const parameter",
-        hir::ScopeDef::ModuleDef(def) => return def_descr(cx, *def),
-        _ => return None,
-    })
-}
-
-/// rustc's `Res::descr` of an item in the value namespace: its constructor for a struct or
-/// variant that has one.
-fn def_descr(cx: &Cx<'_, '_>, def: hir::ModuleDef) -> Option<&'static str> {
-    Some(match def {
-        hir::ModuleDef::Function(_) => "function",
-        hir::ModuleDef::Const(_) => "constant",
-        hir::ModuleDef::Static(_) => "static",
-        hir::ModuleDef::Adt(hir::Adt::Struct(it)) => match it.kind(cx.db) {
+        ModuleDef::Function(_) => "function",
+        ModuleDef::Const(_) => "constant",
+        ModuleDef::Static(_) => "static",
+        ModuleDef::Adt(hir::Adt::Struct(it)) => match it.kind(cx.db) {
             hir::StructKind::Tuple => "tuple struct",
             hir::StructKind::Unit => "unit struct",
             hir::StructKind::Record => return None,
         },
-        hir::ModuleDef::EnumVariant(it) => match it.kind(cx.db) {
+        ModuleDef::EnumVariant(it) => match it.kind(cx.db) {
             hir::StructKind::Tuple => "tuple variant",
             hir::StructKind::Unit => "unit variant",
             hir::StructKind::Record => return None,
@@ -238,7 +276,7 @@ fn def_descr(cx: &Cx<'_, '_>, def: hir::ModuleDef) -> Option<&'static str> {
 /// rustc's `guess_head_span` of an item's `source_span`: up to its first `{`.
 fn head_range(node: &SyntaxNode) -> TextRange {
     let range = item_range(node);
-    let text = node.to_string();
+    let text = node.to_string(); // alloc: the definition suggested, once per diagnostic
     let base = node.text_range().start();
     let from = usize::from(range.start() - base);
     let item = &text[from..usize::from(range.end() - base)];
@@ -246,43 +284,106 @@ fn head_range(node: &SyntaxNode) -> TextRange {
     TextRange::at(range.start(), TextSize::of(head))
 }
 
-/// The head span of an item's definition.
-fn def_span(cx: &Cx<'_, '_>, def: hir::ModuleDef) -> Option<Span> {
-    let source: InFile<SyntaxNode> = match def {
-        hir::ModuleDef::Function(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        hir::ModuleDef::Const(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        hir::ModuleDef::Static(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        hir::ModuleDef::Adt(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        hir::ModuleDef::EnumVariant(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
+/// The head span of an item's definition, of the kinds a path in `ns` may name.
+pub(crate) fn def_span(cx: &Cx<'_, '_>, ns: Ns, def: ModuleDef) -> Option<Span> {
+    let source: InFile<SyntaxNode> = match (ns, def) {
+        (Ns::Value, ModuleDef::Function(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
+        (Ns::Value, ModuleDef::Const(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
+        (Ns::Value, ModuleDef::Static(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
+        (Ns::Value, ModuleDef::EnumVariant(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
+        (Ns::Type, ModuleDef::Module(it)) => it.declaration_source(cx.db)?.map(|it| it.syntax().clone()),
+        (Ns::Type, ModuleDef::Trait(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
+        (Ns::Type, ModuleDef::TypeAlias(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
+        (_, ModuleDef::Adt(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
         _ => return None,
     };
     Some(cx.span(source.map(|it| head_range(&it))))
 }
 
-/// rustc's `suggest_typo`: the name in scope, of a kind the place expects, closest to `name`;
-/// whether it suggested one.
-fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, scope: &hir::SemanticsScope<'_>, source: Source, name: &str, span: &Span) -> bool {
-    let mut candidates: Vec<Candidate> = Vec::new();
-    scope.process_all_names(&mut |found, def| {
-        let Some(descr) = scope_descr(cx, &def).filter(|it| source.is_expected(it)) else { return };
-        let (def_at, is_local) = match &def {
-            hir::ScopeDef::Local(local) => {
-                let binding = local.primary_source(cx.db).name().map(|it| cx.span(it.map(|it| it.syntax().text_range())));
-                (binding, true)
+/// Where a type parameter is declared: its name.
+fn param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<Span> {
+    let source = cx.sema.source(param.merge())?;
+    let range = match &source.value {
+        Either::Left(ast::TypeOrConstParam::Type(it)) => it.name()?.syntax().text_range(),
+        _ => return None,
+    };
+    Some(cx.span(source.with_value(range)))
+}
+
+/// rustc's `Res::descr` of what a name in scope is, in namespace `ns`.
+fn scope_descr(cx: &Cx<'_, '_>, ns: Ns, def: &hir::ScopeDef<'_>) -> Option<&'static str> {
+    Some(match (ns, def) {
+        (Ns::Value, hir::ScopeDef::Local(_)) => "local variable",
+        (Ns::Value, hir::ScopeDef::GenericParam(hir::GenericParam::ConstParam(_))) => "const parameter",
+        (Ns::Type, hir::ScopeDef::GenericParam(hir::GenericParam::TypeParam(_))) => "type parameter",
+        (Ns::Type, hir::ScopeDef::ImplSelfType(_) | hir::ScopeDef::AdtSelfType(_)) => "self type",
+        (_, hir::ScopeDef::ModuleDef(def)) => return def_descr(cx, ns, *def),
+        _ => return None,
+    })
+}
+
+/// Where a name in scope is defined, and whether it is a local's binding: an item's head, a
+/// local's name, a type parameter's name.
+fn scope_span(cx: &Cx<'_, '_>, ns: Ns, def: &hir::ScopeDef<'_>) -> (Option<Span>, bool) {
+    match def {
+        hir::ScopeDef::Local(local) => {
+            let binding = local.primary_source(cx.db).name().map(|it| cx.span(it.map(|it| it.syntax().text_range())));
+            (binding, true)
+        }
+        hir::ScopeDef::GenericParam(hir::GenericParam::TypeParam(it)) => (param_span(cx, *it), false),
+        hir::ScopeDef::ModuleDef(it) => (def_span(cx, ns, *it), false),
+        _ => (None, false),
+    }
+}
+
+/// The names [`typo`] chooses from: those in scope at a place, or those of a module a path's
+/// prefix names.
+#[derive(Clone, Copy)]
+pub(crate) enum Names<'s, 'db> {
+    Scope(&'s hir::SemanticsScope<'db>),
+    Module(hir::Module),
+}
+
+/// rustc's `suggest_typo`: the name of `names`, of a kind the place expects, closest to `name`
+/// and not one of `exclude` (what another suggestion already names); whether it suggested one.
+pub(crate) fn typo<'db>(
+    cx: &Cx<'_, 'db>,
+    diag: &mut Diag,
+    names: Names<'_, 'db>,
+    source: PathSource,
+    name: &str,
+    span: &Span,
+    exclude: &[String],
+) -> bool {
+    let ns = source.ns();
+    // alloc: the names in scope of a name that resolves to nothing, once per diagnostic
+    let mut candidates: Vec<(hir::Name, &'static str, hir::ScopeDef<'db>)> = Vec::new();
+    let mut consider = |found: hir::Name, def: hir::ScopeDef<'db>| {
+        if let Some(descr) = scope_descr(cx, ns, &def).filter(|it| source.is_expected(it)) {
+            candidates.push((found, descr, def));
+        }
+    };
+    match names {
+        Names::Scope(scope) => scope.process_all_names(&mut |found, def| consider(found, def)),
+        Names::Module(module) => {
+            for (found, def) in module.scope(cx.db, None) {
+                consider(found, def);
             }
-            hir::ScopeDef::ModuleDef(it) => (def_span(cx, *it), false),
-            _ => (None, false),
-        };
-        candidates.push(Candidate { name: found.as_str().to_owned(), descr, def: def_at, is_local });
-    });
-    candidates.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: Vec<String> = candidates.iter().map(|it| it.name.clone()).collect();
-    let Some(found) = find_best_match_for_name(&names, name, None) else { return false };
-    if found == name || found == "_" {
+        }
+    }
+    candidates.sort_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
+    // alloc: the candidates' texts, borrowed from the interner
+    let texts: Vec<&'static str> = candidates.iter().map(|it| it.0.symbol().as_str()).collect();
+    let Some(best) = find_best_match_for_name(&texts, name, None) else { return false };
+    if best == name || best == "_" || exclude.iter().any(|it| it == best) {
         return false;
     }
-    let Some(candidate) = candidates.into_iter().find(|it| it.name == found) else { return false };
-    if let Some(def) = &candidate.def
+    let Some(&(found, descr, def)) = candidates.iter().find(|it| it.0.symbol().as_str() == best) else {
+        return false;
+    };
+    let (def, is_local) = scope_span(cx, ns, &def);
+    let found = found.symbol().as_str();
+    if let Some(def) = &def
         && def.file == span.file
         && def.lo < span.hi
         && span.lo < def.hi
@@ -290,21 +391,19 @@ fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, scope: &hir::SemanticsScope<'_>, sourc
         return false;
     }
     let mut labelled = false;
-    if !candidate.is_local
-        && let Some(def) = &candidate.def
-    {
-        diag.span_label(def.clone(), format!("similarly named {} `{}` defined here", candidate.descr, candidate.name));
+    if !is_local && let Some(def) = &def {
+        diag.span_label(def.clone(), format!("similarly named {descr} `{found}` defined here"));
         labelled = true;
     }
     let snippet = cx.snippet(span);
-    match (&candidate.def, candidate.name.strip_prefix('_')) {
-        (Some(binding), Some(unused)) if snippet == Some(unused) && candidate.is_local => {
+    match (&def, found.strip_prefix('_')) {
+        (Some(binding), Some(unused)) if snippet == Some(unused) && is_local => {
             if !labelled {
-                diag.span_label(binding.clone(), format!("`{}` defined here", candidate.name));
+                diag.span_label(binding.clone(), format!("`{found}` defined here"));
             }
             diag.suggestion_verbose(
                 binding.clone(),
-                format!("the leading underscore in `{}` marks it as unused, consider renaming it to `{unused}`", candidate.name),
+                format!("the leading underscore in `{found}` marks it as unused, consider renaming it to `{unused}`"),
                 unused,
                 Applicability::MaybeIncorrect,
             );
@@ -312,8 +411,8 @@ fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, scope: &hir::SemanticsScope<'_>, sourc
         _ => {
             diag.suggestion_verbose(
                 span.clone(),
-                format!("a {} with a similar name exists", candidate.descr),
-                candidate.name,
+                format!("a {descr} with a similar name exists"),
+                found,
                 Applicability::MaybeIncorrect,
             );
         }
@@ -323,61 +422,79 @@ fn typo(cx: &Cx<'_, '_>, diag: &mut Diag, scope: &hir::SemanticsScope<'_>, sourc
 
 /// An item named as the name looked for, of the crate or one it depends on: rustc's
 /// `ImportSuggestion`.
-struct Import {
-    path: String,
+pub(crate) struct Import {
+    pub(crate) path: String,
     /// Of this crate: rustc lists those first, by their `crate::` path.
     of_crate: bool,
-    descr: &'static str,
-    def: hir::ModuleDef,
+    pub(crate) descr: &'static str,
+    def: ModuleDef,
 }
 
-/// rustc's `lookup_import_candidates` and `show_candidates`: the items of the name in this
-/// crate and those it names as dependencies, to `use`, or that exist but are not visible here.
-fn import_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, source: Source, name: &str) {
+/// The items [`imports`] found in namespace `ns`: those to `use`, and those of the crate that
+/// exist but are not visible from where the name is.
+pub(crate) struct Imports {
+    ns: Ns,
+    pub(crate) accessible: Vec<Import>,
+    pub(crate) inaccessible: Vec<Import>,
+}
+
+impl Imports {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.accessible.is_empty() && self.inaccessible.is_empty()
+    }
+}
+
+/// rustc's `lookup_import_candidates`: the items named `name` of a kind `source` expects,
+/// other than `own` (what the path names), in this crate and those it names as dependencies,
+/// that `module` can import (a foreign `#[doc(hidden)]` one not) and the crate's own it can't.
+pub(crate) fn imports(
+    cx: &Cx<'_, '_>,
+    module: hir::Module,
+    source: PathSource,
+    name: &str,
+    own: Option<ModuleDef>,
+) -> Imports {
+    let ns = source.ns();
     let cfg = hir::FindPathConfig {
         prefer_no_std: false,
         prefer_prelude: false,
         prefer_absolute: false,
         allow_unstable: true,
     };
-    let crates = std::iter::once(cx.krate).chain(cx.krate.dependencies(cx.db).into_iter().map(|it| it.krate));
-    let mut accessible: Vec<Import> = Vec::new();
-    let mut inaccessible: Vec<Import> = Vec::new();
-    for krate in crates {
-        let local = krate == cx.krate;
-        for of in krate.modules(cx.db) {
-            for def in of.declarations(cx.db) {
-                let mut consider = |def: hir::ModuleDef| {
-                    if def.name(cx.db).is_none_or(|it| it.as_str() != name) {
-                        return;
-                    }
-                    let Some(descr) = def_descr(cx, def).filter(|it| source.is_expected(it)) else { return };
-                    let hidden = is_doc_hidden(cx, def);
-                    let item = hir::ItemInNs::Values(def);
-                    match module.find_use_path(cx.db, item, hir::PrefixKind::ByCrate, cfg) {
-                        Some(path) if local || !hidden => {
-                            let path = path.display(cx.db, cx.edition).to_string();
-                            let of_crate = path.starts_with("crate::");
-                            accessible.push(Import { path: in_edition(cx, path), of_crate, descr, def });
-                        }
-                        Some(_) => {}
-                        None if local => {
-                            let path = def.canonical_path(cx.db, cx.edition).unwrap_or_else(|| name.to_owned());
-                            let path = in_edition(cx, format!("crate::{path}"));
-                            inaccessible.push(Import { path, of_crate: true, descr, def });
-                        }
-                        None => {}
-                    }
-                };
-                match def {
-                    hir::ModuleDef::Adt(hir::Adt::Enum(it)) => {
-                        it.variants(cx.db).into_iter().for_each(|it| consider(hir::ModuleDef::EnumVariant(it)));
-                    }
-                    def => consider(def),
-                }
+    let mut found = Imports { ns, accessible: Vec::new(), inaccessible: Vec::new() };
+    for decl in cx.paths().decls(cx).named(name) {
+        let def = decl.def;
+        if own == Some(def) {
+            continue;
+        }
+        let Some(descr) = def_descr(cx, ns, def).filter(|it| source.is_expected(it)) else { continue };
+        let item = match ns {
+            Ns::Value => hir::ItemInNs::Values(def),
+            Ns::Type => hir::ItemInNs::Types(def),
+        };
+        match module.find_use_path(cx.db, item, hir::PrefixKind::ByCrate, cfg) {
+            Some(path) if decl.local || !is_doc_hidden(cx, def) => {
+                let path = path.display(cx.db, cx.edition).to_string();
+                let of_crate = path.starts_with("crate::");
+                found.accessible.push(Import { path: in_edition(cx, path), of_crate, descr, def });
             }
+            Some(_) => {}
+            None if decl.local => {
+                let path = def.canonical_path(cx.db, cx.edition).unwrap_or_else(|| name.to_owned());
+                let path = in_edition(cx, format!("crate::{path}"));
+                found.inaccessible.push(Import { path, of_crate: true, descr, def });
+            }
+            None => {}
         }
     }
+    found
+}
+
+/// rustc's `show_candidates` of what [`imports`] found: the `use` to add, or the items that
+/// exist but are not accessible; `instead` when the path named something else.
+pub(crate) fn show_imports(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, found: Imports, instead: bool) {
+    let Imports { ns, mut accessible, mut inaccessible } = found;
+    let instead = if instead { " instead" } else { "" };
     for found in [&mut accessible, &mut inaccessible] {
         found.sort_by(|a, b| a.path.cmp(&b.path));
         found.dedup_by(|a, b| a.path == b.path);
@@ -394,14 +511,14 @@ fn import_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, sour
     }
     if !accessible.is_empty() {
         let msg = match accessible.as_slice() {
-            [only] => format!("consider importing this {}", only.descr),
+            [only] => format!("consider importing this {}{instead}", only.descr),
             many => {
                 let kind = match many.iter().all(|it| it.descr == many[0].descr) {
                     true => many[0].descr,
                     false => "item",
                 };
                 let s = if kind.ends_with('s') { "es" } else { "s" };
-                format!("consider importing one of these {kind}{s}")
+                format!("consider importing one of these {kind}{s}{instead}")
             }
         };
         match use_placement(cx, module) {
@@ -421,11 +538,12 @@ fn import_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, sour
             }
         }
     }
+    let span_of = |it: &Import| def_span(cx, ns, it.def);
     match inaccessible.as_slice() {
         [] => {}
         [only] => {
             let msg = format!("{} `{}` exists but is inaccessible", only.descr, only.path);
-            match def_span(cx, only.def) {
+            match span_of(only) {
                 Some(span) => {
                     let mut multi = MultiSpan::of(span.clone());
                     multi.labels.push((span, "not accessible".to_owned()));
@@ -446,7 +564,7 @@ fn import_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, sour
             let mut multi = MultiSpan::default();
             let mut colon = false;
             for it in many {
-                match def_span(cx, it.def) {
+                match span_of(it) {
                     Some(span) => {
                         multi.primary.push(span.clone());
                         multi.labels.push((span, format!("`{}`: not accessible", it.path)));
@@ -468,13 +586,15 @@ fn import_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, sour
 
 /// Whether an item is `#[doc(hidden)]`, which rustc does not suggest importing from another
 /// crate.
-fn is_doc_hidden(cx: &Cx<'_, '_>, def: hir::ModuleDef) -> bool {
+fn is_doc_hidden(cx: &Cx<'_, '_>, def: ModuleDef) -> bool {
     match def {
-        hir::ModuleDef::Function(it) => it.attrs(cx.db).is_doc_hidden(),
-        hir::ModuleDef::Const(it) => it.attrs(cx.db).is_doc_hidden(),
-        hir::ModuleDef::Static(it) => it.attrs(cx.db).is_doc_hidden(),
-        hir::ModuleDef::Adt(it) => it.attrs(cx.db).is_doc_hidden(),
-        hir::ModuleDef::EnumVariant(it) => it.attrs(cx.db).is_doc_hidden(),
+        ModuleDef::Function(it) => it.attrs(cx.db).is_doc_hidden(),
+        ModuleDef::Const(it) => it.attrs(cx.db).is_doc_hidden(),
+        ModuleDef::Static(it) => it.attrs(cx.db).is_doc_hidden(),
+        ModuleDef::Adt(it) => it.attrs(cx.db).is_doc_hidden(),
+        ModuleDef::EnumVariant(it) => it.attrs(cx.db).is_doc_hidden(),
+        ModuleDef::Trait(it) => it.attrs(cx.db).is_doc_hidden(),
+        ModuleDef::TypeAlias(it) => it.attrs(cx.db).is_doc_hidden(),
         _ => false,
     }
 }
@@ -493,14 +613,16 @@ fn in_edition(cx: &Cx<'_, '_>, path: String) -> String {
 fn use_placement(cx: &Cx<'_, '_>, module: hir::Module) -> Option<(Span, bool)> {
     let module = module.nearest_non_block_module(cx.db);
     let source = module.definition_source(cx.db);
-    let items: Vec<ast::Item> = match &source.value {
-        hir::ModuleSource::SourceFile(it) => it.items().collect(),
-        hir::ModuleSource::Module(it) => it.item_list()?.items().collect(),
+    fn first(mut items: impl Iterator<Item = ast::Item> + Clone) -> Option<(ast::Item, bool)> {
+        match items.clone().find(|it| matches!(it, ast::Item::Use(_))) {
+            Some(it) => Some((it, true)),
+            None => items.next().map(|it| (it, false)),
+        }
+    }
+    let (item, found_use) = match &source.value {
+        hir::ModuleSource::SourceFile(it) => first(it.items())?,
+        hir::ModuleSource::Module(it) => first(it.item_list()?.items())?,
         hir::ModuleSource::BlockExpr(_) => return None,
-    };
-    let (item, found_use) = match items.iter().find(|it| matches!(it, ast::Item::Use(_))) {
-        Some(it) => (it, true),
-        None => (items.first()?, false),
     };
     let start = item
         .syntax()

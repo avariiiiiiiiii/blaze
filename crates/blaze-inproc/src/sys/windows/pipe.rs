@@ -27,7 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PeekNamedPipe,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::SystemServices::{SECURITY_DESCRIPTOR_REVISION, SYSTEM_MANDATORY_LABEL_NO_WRITE_UP};
@@ -162,6 +162,16 @@ impl Stream {
             return Err(Error::new(format!("{what}: nothing within {} ms", self.timeout)));
         }
         Err(Error::new(format!("Windows: {what}: {error}")))
+    }
+
+    /// Whether the other end hung up; it waits for nothing.
+    pub(super) fn closed(&self) -> bool {
+        let mut available = 0u32;
+        // SAFETY: peeks no bytes, writes only `available`; the pipe is open while `self` is.
+        let ok = unsafe {
+            PeekNamedPipe(self.pipe.as_raw_handle(), std::ptr::null_mut(), 0, std::ptr::null_mut(), &mut available, std::ptr::null_mut())
+        };
+        ok == 0 && hung_up(&std::io::Error::last_os_error())
     }
 
     pub(crate) fn set_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {

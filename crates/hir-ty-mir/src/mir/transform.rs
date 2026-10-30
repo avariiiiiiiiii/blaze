@@ -19,13 +19,14 @@ mod move_paths;
 mod packed_drops;
 mod upvars;
 
+pub use cleanup::noop_landing_pads;
 pub(super) use cleanup::remove_noop_landing_pads;
 
 use std::cell::RefCell;
 
 use base_db::{Db, Crate};
+use blaze_mem::{Frame, Tag, frame};
 use hir_def::HasModule;
-use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 
 use crate::{
@@ -40,26 +41,33 @@ use crate::{
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
-use super::{MirBody, MirLowerError, MirPhase, TerminatorKind, monomorphization::monomorphized};
+use super::{
+    MirBody, MirLowerError, MirPhase, TerminatorKind,
+    budget::Pass,
+    framed::{self, FrameMap},
+    monomorphization::monomorphized,
+};
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
 /// What the passes ask of the types of a body.
-pub(super) struct Ctx<'db> {
+pub(super) struct Ctx<'f, 'db> {
     pub(super) db: &'db Db,
     pub(super) infcx: InferCtxt<'db>,
     pub(super) env: ParamEnv<'db>,
     krate: Crate,
-    needs_drop: RefCell<FxHashMap<Ty<'db>, bool>>,
+    /// The frame of the body's pipeline, which outlives each pass's own.
+    pub(super) frame: &'f Frame,
+    needs_drop: RefCell<FrameMap<'f, Ty<'db>, bool>>,
 }
 
-impl<'db> Ctx<'db> {
-    pub(super) fn new(db: &'db Db, owner: InferBodyId<'db>) -> Self {
+impl<'f, 'db> Ctx<'f, 'db> {
+    pub(super) fn new(db: &'db Db, owner: InferBodyId<'db>, frame: &'f Frame) -> Self {
         let krate = owner.krate(db);
         let env = db.trait_environment(owner.generic_def(db));
         let interner = DbInterner::new_with(db, krate);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-        Ctx { db, infcx, env, krate, needs_drop: RefCell::default() }
+        Ctx { db, infcx, env, krate, frame, needs_drop: RefCell::new(framed::map_in(frame)) }
     }
 
     /// Whether a value of `ty` may have something to drop: a type parameter may.
@@ -129,33 +137,86 @@ impl<'db> Ctx<'db> {
 }
 
 /// `built` after the passes.
-fn run_passes<'db>(db: &'db Db, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
+pub(super) fn run_passes<'db>(db: &'db Db, built: &MirBody<'db>) -> Result<'db, MirBody<'db>> {
+    // clone: the copy the query keeps; the passes change it in place
     let mut body = built.clone();
-    let ctx = Ctx::new(db, body.owner);
-    // rustc's `CleanupPostBorrowck` before these: a false edge, which only borrow checking
-    // follows, is a jump to its real target.
-    for (_, block) in body.basic_blocks.iter_mut() {
-        if let Some(terminator) = &mut block.terminator
-            && let TerminatorKind::FalseEdge { real_target, .. } = terminator.kind
-        {
-            terminator.kind = TerminatorKind::Goto { target: real_target };
+    frame::task(Tag::Mir, |outer| -> Result<'db, ()> {
+        let ctx = Ctx::new(db, body.owner, outer);
+        // rustc's `CleanupPostBorrowck` before these: a false edge, which only borrow
+        // checking follows, is a jump to its real target.
+        for (_, block) in body.basic_blocks.iter_mut() {
+            if let Some(terminator) = &mut block.terminator
+                && let TerminatorKind::FalseEdge { real_target, .. } = terminator.kind
+            {
+                terminator.kind = TerminatorKind::Goto { target: real_target };
+            }
         }
-    }
-    // `Assert`s first: lowering says where each panicking statement unwinds by its position.
-    asserts::add_asserts(&ctx, &mut body);
-    upvars::upvars_in_place(&mut body);
-    body.promoted_constants = body
-        .promoted_locals
-        .iter()
-        .map(|&(local, _)| local)
-        .filter(|&local| ctx.is_plain(body.locals[local].ty.as_ref()))
-        .collect();
-    cleanup::remove_noop_landing_pads(&mut body);
-    elaborate_drops::elaborate_drops(&ctx, &mut body)?;
-    packed_drops::add_moves_for_packed_drops(&ctx, &mut body);
+        // `Assert`s first: lowering says where each panicking statement unwinds by its
+        // position.
+        frame::task(Tag::Mir, |frame| asserts::add_asserts(&ctx, &mut body, frame));
+        frame::task(Tag::Mir, |frame| upvars::upvars_in_place(&mut body, frame));
+        // Counted first, so the kept list is made once at its length; the second
+        // `is_plain` of a local hits the `needs_drop` cache.
+        let plain = body
+            .promoted_locals
+            .iter()
+            .filter(|&&(local, _)| ctx.is_plain(body.locals[local].ty.as_ref()))
+            .count();
+        let mut promoted_constants = Vec::with_capacity(plain);
+        promoted_constants.extend(
+            body.promoted_locals
+                .iter()
+                .map(|&(local, _)| local)
+                .filter(|&local| ctx.is_plain(body.locals[local].ty.as_ref())),
+        );
+        body.promoted_constants = promoted_constants;
+        frame::task(Tag::Mir, |frame| cleanup::remove_noop_landing_pads(&mut body, frame));
+        frame::task(Tag::Mir, |frame| elaborate_drops::elaborate_drops(&ctx, &mut body, frame))?;
+        frame::task(Tag::Mir, |frame| {
+            packed_drops::add_moves_for_packed_drops(&ctx, &mut body, frame)
+        });
+        Ok(())
+    })?;
     body.phase = MirPhase::Runtime;
     body.shrink_to_fit();
     Ok(body)
+}
+
+/// One of these passes alone, or drop elaboration's analyses without its rewrite, in `frame`.
+pub(super) fn run_one<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &mut MirBody<'db>,
+    pass: Pass,
+    frame: &Frame,
+) -> Result<'db, ()> {
+    match pass {
+        Pass::AddAsserts => asserts::add_asserts(ctx, body, frame),
+        Pass::RemoveNoopLandingPads => cleanup::remove_noop_landing_pads(body, frame),
+        Pass::ElaborateDrops => elaborate_drops::elaborate_drops(ctx, body, frame)?,
+        Pass::DropAnalysis => elaborate_drops::analyse(ctx, body, frame),
+        Pass::CleanupPostBorrowck
+        | Pass::SimplifyCfg
+        | Pass::RemoveStorageMarkers
+        | Pass::RemoveUnneededDrops
+        | Pass::UnreachablePropagation
+        | Pass::InstSimplify
+        | Pass::LowerSliceLenCalls
+        | Pass::SimplifyConstCondition
+        | Pass::SimplifyLocals
+        | Pass::SingleUseConsts
+        | Pass::DeadStoreElimination
+        | Pass::CopyProp
+        | Pass::CriticalCallEdges
+        | Pass::CheckAlignment
+        | Pass::CheckNull
+        | Pass::CheckEnums => {
+            // alloc: error path
+            return Err(MirLowerError::NotSupported(format!(
+                "{pass:?} is an optimization, which `optimize::run_one` runs"
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn compute_runtime_mir_body<'db>(

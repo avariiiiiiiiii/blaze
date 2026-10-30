@@ -9,6 +9,7 @@
 //! write unit-tests (in fact, we used to do that), but that makes tests brittle
 //! and harder to understand.
 
+mod budgets;
 mod builtin_derive_macro;
 mod builtin_errors;
 mod builtin_fn_macro;

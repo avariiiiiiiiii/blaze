@@ -12,6 +12,7 @@
 //! `resolve_block`) and `compiler/rustc_resolve/src/late/diagnostics.rs`
 //! (`signal_label_shadowing`) (MIT or Apache-2.0).
 
+use blaze_ids::bits::BitSet;
 use hir::{HirFileId, InFile};
 use hir_def::{expr_store::Body, hir::Expr, nameres::demand::every_body};
 use span::SyntaxContext;
@@ -28,42 +29,20 @@ use crate::{
     model::{Diag, Level, MultiSpan},
 };
 
-/// A set of a body's labels by their arena index: one bit each, a word per 64 labels.
-#[derive(Default)]
-struct Bits(Vec<u64>);
-
-impl Bits {
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    fn insert(&mut self, index: u32) {
-        let word = (index / 64) as usize;
-        if word >= self.0.len() {
-            self.0.resize(word + 1, 0);
-        }
-        self.0[word] |= 1 << (index % 64);
-    }
-
-    fn contains(&self, index: u32) -> bool {
-        self.0.get((index / 64) as usize).is_some_and(|word| word & (1 << (index % 64)) != 0)
-    }
-}
-
 /// `unused_labels`: each label of a loop or block no `break` or `continue` resolved to, but
 /// those whose name starts with `'_`. A desugared label (of a `try` block) is not one.
 pub(super) fn unused(cx: &Cx<'_, '_>) -> Vec<Emitted> {
     let mut out = Vec::new();
-    let (mut declared, mut used) = (Vec::new(), Bits::default());
+    let (mut declared, mut used) = (Vec::new(), BitSet::<u32>::default());
     for owner in every_body(cx.db, cx.krate.base()) {
         let (body, source_map) = Body::with_source_map(cx.db, owner);
         declared.clear();
-        used.clear();
+        used.reset(0);
         for (_, expr) in body.exprs() {
             match expr {
                 Expr::Loop { label: Some(label), .. } | Expr::Block { label: Some(label), .. } => declared.push(label),
                 Expr::Break { label: Some(label), .. } | Expr::Continue { label: Some(label) } => {
-                    used.insert(u32::from(label.into_raw()))
+                    used.insert_growing(u32::from(label.into_raw()));
                 }
                 _ => {}
             }

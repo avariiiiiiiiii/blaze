@@ -308,7 +308,7 @@ fn reserved(key: &str) -> bool {
 
 /// Whether `flag` starts with a reserved key and its `=`: cargo's prefix check, the same as
 /// the first `=` ending a reserved key, since no key has an `=` in it.
-fn has_reserved_prefix(flag: &str) -> bool {
+pub fn has_reserved_prefix(flag: &str) -> bool {
     flag.split_once('=').is_some_and(|(key, _)| reserved(key))
 }
 

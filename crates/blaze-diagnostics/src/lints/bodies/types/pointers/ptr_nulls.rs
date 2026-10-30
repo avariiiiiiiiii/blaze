@@ -19,7 +19,7 @@ use rustc_type_ir::inherent::IntoKind as _;
 
 use super::{Inits, callee_fn, callee_item, has_attr, is_zero, layout, method_item, peel_casts, span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -27,7 +27,7 @@ use crate::{
 const NULL_ARGUMENTS_HELP: &str = "for more information, visit <https://doc.rust-lang.org/std/ptr/index.html> and <https://doc.rust-lang.org/reference/behavior-considered-undefined.html>";
 
 #[derive(Default)]
-pub(super) struct PtrNullChecks {
+pub(crate) struct PtrNullChecks {
     inits: Inits,
 }
 
@@ -39,13 +39,8 @@ enum Useless {
 }
 
 impl LatePass for PtrNullChecks {
-    fn name(&self) -> &'static str {
-        "PtrNullChecks"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["useless_ptr_null_checks", "invalid_null_arguments"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call, ExprTag::MethodCall, ExprTag::BinaryOp]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();

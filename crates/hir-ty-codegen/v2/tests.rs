@@ -14,9 +14,7 @@ use blaze_codegen::{
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemId, ItemKey};
-use hir_def::{
-    DefWithBodyId, FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
-};
+use hir_def::{DefWithBodyId, FunctionId, signatures::FunctionSignature};
 use hir_ty::{
     db::HirDatabase,
     next_solver::{Const, Ty},
@@ -121,20 +119,7 @@ fn inlines(spec: &Spec) -> bool {
 
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    let found: Vec<FunctionId> = crate_def_map(db, db.test_crate())
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
-        .filter_map(|def| match def {
-            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
-                Some(it)
-            }
-            _ => None,
-        })
-        .collect();
-    match found[..] {
-        [one] => one,
-        _ => panic!("{} functions named `{name}`", found.len()),
-    }
+    hir_def::test_items::function(db, db.test_crate(), name)
 }
 
 fn spec() -> Spec {
@@ -151,13 +136,13 @@ fn spec() -> Spec {
             target: target.triple().to_owned(),
             arch,
             cpu: target.cpu().to_owned(),
-            features: Vec::new(),
+            features: target.features().to_vec(),
             cranelift: "0.136".to_owned(),
             llvm: None,
             frame_pointers: crate::backend::frame_pointers(),
             relocation: if pic { Relocation::Pic } else { Relocation::Static },
         },
-        backend: Backend::Cranelift,
+        backend: Backend::Cranelift { speed: false },
         overflow_checks: false,
         debug_assertions: false,
         panic: Panic::Unwind,
@@ -268,6 +253,44 @@ fn a_shape_is_the_same_each_time() {
     let (db, frontend) = frontend(SIBLINGS);
     let root = frontend.root(function(&db, "roots"));
     assert_eq!(shape(&frontend, &root), shape(&frontend, &root));
+}
+
+/// A warm unit's shape takes nothing of the global allocator: its bytes are the thread's
+/// buffer, hashed as written, and its tables the frame's. The key is the one the prepare gave.
+#[test]
+fn a_warm_shape_allocates_nothing() {
+    let (db, frontend) = frontend(SIBLINGS);
+    let root = frontend.root(function(&db, "roots"));
+    let spec = spec();
+    let unit = unit(&spec);
+    let (shape, prepared) = prepared(&frontend, &spec, &root);
+    let super::Prepared::Cranelift(function) = &prepared else { panic!("a Cranelift unit") };
+    let of = || {
+        blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            super::shape::of(&unit, function, frame)
+        })
+    };
+    let cold = of().expect("a shape");
+    let warm = blaze_alloc_count::assert_at_most(0, "a warm unit's shape", of).expect("a shape");
+    assert_eq!(cold, warm);
+    assert_eq!(warm, shape);
+}
+
+/// Preparing an instance again takes fewer of the global allocator's blocks than the first
+/// time, and its frame is used. The rest is Cranelift's IR, salsa's results and the prepared
+/// function, which it keeps: no prepare can take none.
+#[test]
+fn a_warm_prepare_takes_its_tables_from_its_frame() {
+    let (db, frontend) = frontend(SIBLINGS);
+    let root = frontend.root(function(&db, "roots"));
+    let spec = spec();
+    let (_, cold) = blaze_alloc_count::measure(|| prepared(&frontend, &spec, &root));
+    let before = blaze_mem::tag::snapshot().get(blaze_mem::Tag::Codegen).allocated;
+    let ((shape, _), warm) = blaze_alloc_count::measure(|| prepared(&frontend, &spec, &root));
+    let after = blaze_mem::tag::snapshot().get(blaze_mem::Tag::Codegen).allocated;
+    assert!(warm.allocations < cold.allocations, "warm {warm:?}, cold {cold:?}");
+    assert!(after > before, "the prepare's tables went to no frame");
+    assert_eq!(shape, prepared(&frontend, &spec, &root).0);
 }
 
 const REFERRING: &str = r#"
@@ -590,7 +613,8 @@ fn a_units_bodies_are_inlined_as_rustcs() {
         .expect("minicore's crate");
     let inline = |build: Build, written| build.options(db, written, krate).inline;
     let backends = [
-        (Backend::Cranelift, false),
+        (Backend::Cranelift { speed: false }, false),
+        (Backend::Cranelift { speed: true }, false),
         (Backend::Llvm { opt: 0 }, false),
         (Backend::Llvm { opt: 1 }, false),
         (Backend::Llvm { opt: 2 }, true),

@@ -8,8 +8,8 @@
 //!   (`externs`' `improper_ctypes`, `naming`, `derives`, `bounds`, `mangle`, `publicity`,
 //!   `track_caller`, `docs`, `traits`, `non_local`, `runtime_symbols`, `lifetime_syntax`, `c_void`), and `clashing_extern_declarations` (`externs`).
 //!
-//! `walk` gives the items in the order rustc's passes visit them; `visibility` their effective
-//! visibilities, as `rustc_privacy` computes them.
+//! `walk` gives the items in the order rustc's passes visit them; `visibility` the defs their
+//! effective visibilities (`super::effective`) are kept by.
 //!
 //! Follows `compiler/rustc_interface/src/passes.rs` (`run_required_analyses`, `analysis`,
 //! `misc_checking_3`), `compiler/rustc_lint/src/late.rs` (`late_lint_mod_inner`: the crate's
@@ -47,62 +47,164 @@ use syntax::{
 };
 
 use self::walk::Item;
+use super::effective::Effective;
 use crate::{
     cx::{Cx, def_range, item_range, signature_range},
+    lints::registry::LintSet,
     lower::Found,
 };
 
+/// The lints each pass gives, all of them lints: a pass none of whose lints may fire in the
+/// crate ([`Cx::any_may_fire`], rustc's `lints_that_dont_need_to_run`) is not run.
+mod gives {
+    use crate::lints::registry::{LintId, LintSet};
+
+    pub(super) const LIFETIMES: LintSet =
+        LintSet::of(&[LintId::named("single_use_lifetimes"), LintId::named("unused_lifetimes")]);
+    pub(super) const STATICS: LintSet =
+        LintSet::of(&[LintId::named("invalid_type_param_default"), LintId::named("uninhabited_static")]);
+    pub(super) const CTYPES: LintSet = LintSet::of(&[
+        LintId::named("improper_ctypes"),
+        LintId::named("improper_ctypes_definitions"),
+        LintId::named("uses_power_alignment"),
+    ]);
+    pub(super) const NAMING: LintSet =
+        LintSet::of(&[LintId::named("non_snake_case"), LintId::named("non_upper_case_globals")]);
+    pub(super) const COPY: LintSet = LintSet::of(&[LintId::named("missing_copy_implementations")]);
+    pub(super) const TYPE_ALIAS_BOUNDS: LintSet = LintSet::of(&[LintId::named("type_alias_bounds")]);
+    pub(super) const MANGLE: LintSet =
+        LintSet::of(&[LintId::named("no_mangle_const_items"), LintId::named("no_mangle_generic_items")]);
+    pub(super) const PUBLICITY: LintSet = LintSet::of(&[LintId::named("unreachable_pub")]);
+    pub(super) const TRACK_CALLER: LintSet = LintSet::of(&[LintId::named("ungated_async_fn_track_caller")]);
+    pub(super) const DROP: LintSet = LintSet::of(&[LintId::named("drop_bounds"), LintId::named("dyn_drop")]);
+    pub(super) const DEBUG: LintSet = LintSet::of(&[LintId::named("missing_debug_implementations")]);
+    pub(super) const DOCS: LintSet = LintSet::of(&[LintId::named("missing_docs")]);
+    pub(super) const ASYNC_FN: LintSet = LintSet::of(&[LintId::named("async_fn_in_trait")]);
+    pub(super) const NON_LOCAL: LintSet = LintSet::of(&[LintId::named("non_local_definitions")]);
+    pub(super) const RUNTIME_SYMBOLS: LintSet = LintSet::of(&[
+        LintId::named("invalid_runtime_symbol_definitions"),
+        LintId::named("suspicious_runtime_symbol_definitions"),
+    ]);
+    pub(super) const LIFETIME_SYNTAX: LintSet = LintSet::of(&[LintId::named("mismatched_lifetime_syntaxes")]);
+    pub(super) const C_VOID: LintSet = LintSet::of(&[LintId::named("c_void_returns")]);
+    pub(super) const CLASHING: LintSet = LintSet::of(&[LintId::named("clashing_extern_declarations")]);
+}
+
 /// What `rustc_hir_analysis` and resolve's late pass lint of items, given whatever else failed.
 pub(super) fn before_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let items = walk::items(cx);
-    let mut found = lifetimes::lints(cx, &items);
-    for item in &items {
-        found.extend(statics::item(cx, item));
+    let (lifetimes, statics) = (cx.any_may_fire(&gives::LIFETIMES), cx.any_may_fire(&gives::STATICS));
+    if !lifetimes && !statics {
+        return Vec::new();
+    }
+    let items = &cx.items().items;
+    let mut found = Vec::new();
+    if lifetimes {
+        found = lifetimes::lints(cx, items);
+    }
+    if statics {
+        for item in items {
+            found.extend(statics::item(cx, item));
+        }
     }
     found
 }
 
-/// The crate's items in the order rustc visits them, walked once for every pass after the abort.
-pub(super) struct Walk {
+/// The crate's items in the order rustc visits them, walked once per check ([`Cx::items`]) for
+/// every pass before the abort and after it.
+pub(crate) struct Walk {
     items: Vec<Item>,
 }
 
 impl Walk {
-    pub(super) fn of(cx: &Cx<'_, '_>) -> Walk {
+    pub(crate) fn of(cx: &Cx<'_, '_>) -> Walk {
         Walk { items: walk::items(cx) }
     }
 }
 
 /// `check_private_in_public`: `private_interfaces` and `private_bounds`.
-pub(super) fn private_in_public(cx: &Cx<'_, '_>, walk: &Walk) -> Vec<Found> {
-    privacy::lints(cx, &walk.items)
+pub(super) fn private_in_public(cx: &Cx<'_, '_>, walk: &Walk, effective: &Effective) -> Vec<Found> {
+    privacy::lints(cx, &walk.items, effective)
 }
 
 /// rustc's late module pass over each item, in the order of `BuiltinCombinedLateLintModPass`.
-pub(super) fn after_abort(cx: &Cx<'_, '_>, walk: &Walk) -> Vec<Found> {
+pub(super) fn after_abort(cx: &Cx<'_, '_>, walk: &Walk, effective: &Effective) -> Vec<Found> {
     let items = &walk.items;
-    let effective = visibility::Effective::of(cx, items);
-    let canonical = runtime_symbols::Canonical::of(cx, items);
+    let may = |lints: &LintSet| cx.any_may_fire(lints);
+    let (ctypes, naming, copy, type_alias, mangle, publicity) = (
+        may(&gives::CTYPES),
+        may(&gives::NAMING),
+        may(&gives::COPY),
+        may(&gives::TYPE_ALIAS_BOUNDS),
+        may(&gives::MANGLE),
+        may(&gives::PUBLICITY),
+    );
+    let (track_caller, drop, debug, docs, async_fn, non_local) = (
+        may(&gives::TRACK_CALLER),
+        may(&gives::DROP),
+        may(&gives::DEBUG),
+        may(&gives::DOCS),
+        may(&gives::ASYNC_FN),
+        may(&gives::NON_LOCAL),
+    );
+    let (lifetime_syntax, c_void) = (may(&gives::LIFETIME_SYNTAX), may(&gives::C_VOID));
+    let canonical = may(&gives::RUNTIME_SYMBOLS).then(|| runtime_symbols::Canonical::of(cx, items));
     let krate = Krate::of(cx);
-    let mut found = docs::krate(cx);
-    found.extend(naming::krate(cx));
+    let mut found = Vec::new();
+    if docs {
+        found.extend(docs::krate(cx));
+    }
+    if naming {
+        found.extend(naming::krate(cx));
+    }
     for (index, item) in items.iter().enumerate() {
-        found.extend(externs::ctypes_item(cx, item, &krate));
-        found.extend(naming::item(cx, item));
-        found.extend(derives::copy(cx, item, &effective, &krate));
-        found.extend(bounds::type_alias(cx, item, &krate));
-        found.extend(mangle::item(cx, item));
-        found.extend(publicity::item(cx, item, &effective));
-        found.extend(track_caller::item(cx, item, krate.async_fn_track_caller));
-        found.extend(bounds::drop(cx, item, &krate));
-        found.extend(derives::debug(cx, item, &effective, &krate));
-        found.extend(docs::item(cx, item, &effective));
-        found.extend(traits::async_fn(cx, item, &effective, &krate));
-        found.extend(non_local::item(cx, item));
-        found.extend(runtime_symbols::item(cx, item, item.held(items, index), &canonical));
-        found.extend(externs::ctypes_nested(cx, item));
-        found.extend(lifetime_syntax::item(cx, item, krate.anonymous_lifetime_in_impl_trait));
-        found.extend(c_void::item(cx, item, &krate));
+        if ctypes {
+            found.extend(externs::ctypes_item(cx, item, &krate));
+        }
+        if naming {
+            found.extend(naming::item(cx, item));
+        }
+        if copy {
+            found.extend(derives::copy(cx, item, effective, &krate));
+        }
+        if type_alias {
+            found.extend(bounds::type_alias(cx, item, &krate));
+        }
+        if mangle {
+            found.extend(mangle::item(cx, item));
+        }
+        if publicity {
+            found.extend(publicity::item(cx, item, effective));
+        }
+        if track_caller {
+            found.extend(track_caller::item(cx, item, krate.async_fn_track_caller));
+        }
+        if drop {
+            found.extend(bounds::drop(cx, item, &krate));
+        }
+        if debug {
+            found.extend(derives::debug(cx, item, effective, &krate));
+        }
+        if docs {
+            found.extend(docs::item(cx, item, effective));
+        }
+        if async_fn {
+            found.extend(traits::async_fn(cx, item, effective, &krate));
+        }
+        if non_local {
+            found.extend(non_local::item(cx, item));
+        }
+        if let Some(canonical) = &canonical {
+            found.extend(runtime_symbols::item(cx, item, item.held(items, index), canonical));
+        }
+        if ctypes {
+            found.extend(externs::ctypes_nested(cx, item));
+        }
+        if lifetime_syntax {
+            found.extend(lifetime_syntax::item(cx, item, krate.anonymous_lifetime_in_impl_trait));
+        }
+        if c_void {
+            found.extend(c_void::item(cx, item, &krate));
+        }
     }
     found
 }
@@ -149,6 +251,9 @@ impl Krate {
 
 /// `clashing_extern_declarations`, its own query after the late lint passes.
 pub(super) fn clashing_extern_declarations(cx: &Cx<'_, '_>, walk: &Walk) -> Vec<Found> {
+    if !cx.any_may_fire(&gives::CLASHING) {
+        return Vec::new();
+    }
     externs::lints(cx, &walk.items)
 }
 
@@ -238,7 +343,9 @@ fn core_path(cx: &Cx<'_, '_>, module: &str, name: &str) -> Option<String> {
 /// The item `item` defines, and its name, for the facts of its lints.
 fn item_id(cx: &Cx<'_, '_>, item: &Item) -> Option<(ItemId, String)> {
     let node = item.node.as_ref();
-    let name = |it: &dyn HasName| it.name().map_or_else(|| "_".to_owned(), |it| it.text().to_string());
+    fn name(it: &impl HasName) -> String {
+        it.name().map_or_else(|| "_".to_owned(), |it| it.text().to_string())
+    }
     let id = match node.value {
         ast::Item::Fn(it) => ItemId::Function(FunctionId::try_from(cx.sema.to_def2(node.with_value(it))?).ok()?),
         ast::Item::Struct(it) => ItemId::Adt(AdtId::StructId(cx.sema.to_def2(node.with_value(it))?.into())),

@@ -9,16 +9,7 @@
 //! Follows rustc's `compiler/rustc_lint/src/lib.rs` (`BuiltinCombinedLateLintModPass`) (MIT or
 //! Apache-2.0).
 
-mod desugar;
-mod items;
-mod methods;
-mod statements;
-
-/// rustc's late lint passes of calls, statements, `let`s and patterns in bodies.
-pub(super) fn passes() -> Vec<Box<dyn super::LatePass>> {
-    let mut passes = statements::passes();
-    passes.extend(items::passes());
-    passes.extend(desugar::passes());
-    passes.extend(methods::passes());
-    passes
-}
+pub(super) mod desugar;
+pub(super) mod items;
+pub(super) mod methods;
+pub(super) mod statements;

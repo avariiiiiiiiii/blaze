@@ -12,6 +12,8 @@ group's word, so salsa keeps its own (shuttle) atomics and orderings. salsa alre
 `tags_are_never_dead`, `live_skips_empty_and_dead`) moved into `blaze_mem::swiss`'s tests, with a
 proptest differential against the old copies.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### `vendor/salsa/src/graph/nodes.rs`
 
 1. Module doc: `The map from a key to its node is the SwissTable of `crates/intern/src/arena.rs``
@@ -49,6 +51,8 @@ proptest differential against the old copies.
                 }
             }
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### `vendor/salsa/src/interned/table.rs`
 
@@ -99,6 +103,8 @@ proptest differential against the old copies.
    with the body unchanged.
 8. Tests: delete `tags_are_never_dead`, `matching_finds_every_equal_byte` and
    `live_skips_empty_and_dead` (now in `blaze_mem::swiss`'s tests); the rest stay.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 # From mem-db-salsa (to lane db, owner of `vendor/salsa*`; window `db-next2`)
 
@@ -192,6 +198,8 @@ After:
 No manifest change: salsa already depends on `blaze-mem` (`vendor/salsa/Cargo.toml`), and
 `frame::task` needs no `allocator_api` in salsa. Held by M8's `tests/mem_frames.rs`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## M2. The `mem_tag` option (`salsa-macros`, `salsa-macro-rules`)
 
 `#[salsa::tracked(mem_tag = Infer)]` on a function or a tracked method; the value is a variant
@@ -263,6 +271,8 @@ inner `#[salsa::tracked(..)]` (`tracked_impl.rs:100` to `135`), so methods get i
 Which tag each front-end query takes is contract item 3 (`docs/v2/plan/lanes/mem/db.md`); the
 front-end lanes add `mem_tag = ..` to their tracked attributes (mem-db-def, mem-db-infer,
 mem-db-solver, mem-db-checks file those).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## M3. A run's fingerprint buffer is reused, the memo gets an exact copy (`active_query.rs`, `function/execute.rs`)
 
@@ -379,6 +389,8 @@ fn flattened_edge_fingerprints(
    Its doc comment stays. Held by `tests/lru_fingerprint.rs` and `tests/cycle*.rs` (the values),
    and by M8's warm re-check budget.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## M4. Frames past the spare depth (to lane mem, through mem-db; not a salsa change)
 
 `blaze_mem::frame::task` keeps `DEPTH = 8` spare frames per thread (`crates/blaze-mem/src/frame.rs:35`,
@@ -400,6 +412,11 @@ peak, so an inner reset never frees what the outer run holds (contract item 1's 
 frame per thread, one reservation, warm pages reused at every depth. `frame::current` then
 names that frame and its current tag. M8's `a_nested_run_has_a_frame_of_its_own` holds both
 designs to the contract (the outer run's bytes and tag are unchanged by an inner run).
+
+> forwarded to db (from requests, pass 16; told by tmux).
+> mem-db: the problem is real; the shared frame is unsound (an outer frame vector pushed during an
+> inner task lands above its marker), so it goes to lane mem as a requirement instead:
+> `v2/requests/mem-db.md` request 10. Nothing for salsa to change; M1 stands.
 
 ## M5. Tables onto reserved regions (`table.rs`, `interned.rs`)
 
@@ -747,6 +764,8 @@ gone):
 
 `boxcar` stays a dependency (`views.rs:18`).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## M6. Graph pages from the kernel, not the allocator (`graph.rs`, `graph/edges.rs`, `graph/nodes.rs`)
 
 The edge array's and node key columns' pages (`graph.rs:183` to `229`, used at
@@ -852,6 +871,8 @@ dedup-intern's request above rewrites the probe bodies of `graph/nodes.rs` and
 `interned/table.rs`; M5 and M6 touch neither those bodies nor the key tables' fields, so the
 two apply in either order.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## M7. The claim-free walk reuses the thread's stack (`function/maybe_changed_after.rs`)
 
 The per-call buffers on the hit and revalidation paths, after S1 to S5:
@@ -938,6 +959,8 @@ fn walk_unclaimed<'db>(
    local.) A walk that unwinds drops the lent `Vec`; the next one starts an empty one.
 4. Held by M8's `a_deep_verify_that_changes_nothing_allocates_nothing` and by
    `tests/unclaimed_verify.rs` (a 300-deep chain, backdating, eight threads).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## M8. Tests
 
@@ -1176,6 +1199,8 @@ fn an_immediate_fallback_runs_in_a_frame() {
 }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## M9. `Column::get_mut` (to lane mem, `crates/blaze-mem/src/column.rs`; window `mem-next1`)
 
 M5's table needs, for its `&mut` paths (`force_page`, `memos_mut`, `for_each_memo_table_mut`),
@@ -1205,3 +1230,5 @@ fn get_mut_changes_a_published_value() {
     assert!(column.get_mut(index + 1).is_none());
 }
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).

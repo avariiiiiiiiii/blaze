@@ -8,6 +8,7 @@
 //! probe run.
 
 use std::{
+    alloc::{Allocator, Global},
     fmt,
     hash::{BuildHasher, Hash},
     marker::PhantomData,
@@ -16,11 +17,12 @@ use std::{
 
 use base_db::{Db, Crate};
 use blaze_ids::radix;
+use blaze_mem::scratch;
 use either::Either;
 use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
-use itertools::Itertools;
+use intern::sym;
 use la_arena::{Idx, RawIdx};
-use rustc_hash::{FxBuildHasher, FxHashSet};
+use rustc_hash::FxBuildHasher;
 use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 use span::Edition;
@@ -36,11 +38,38 @@ use crate::{
     visibility::{Visibility, VisibilityExplicitness},
 };
 
-#[derive(Debug, Default)]
-pub struct PerNsGlobImports {
-    types: FxHashSet<(ModuleId, Name)>,
-    values: FxHashSet<(ModuleId, Name)>,
-    macros: FxHashSet<(ModuleId, Name)>,
+/// The names of a scope being collected that a glob gave their binding, per namespace: a
+/// build-time table, in the collector's frame or (for the facts engine's carried state) the heap.
+#[derive(Clone)]
+pub struct PerNsGlobImports<A: Allocator + Clone = Global> {
+    types: hashbrown::HashSet<(ModuleId, Name), FxBuildHasher, A>,
+    values: hashbrown::HashSet<(ModuleId, Name), FxBuildHasher, A>,
+    macros: hashbrown::HashSet<(ModuleId, Name), FxBuildHasher, A>,
+}
+
+/// By the marks alone: `Global` is not `PartialEq`, so a derive would not cover the default.
+impl<A: Allocator + Clone> PartialEq for PerNsGlobImports<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.types == other.types && self.values == other.values && self.macros == other.macros
+    }
+}
+
+impl<A: Allocator + Clone> Eq for PerNsGlobImports<A> {}
+
+impl<A: Allocator + Clone> fmt::Debug for PerNsGlobImports<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PerNsGlobImports")
+            .field("types", &self.types)
+            .field("values", &self.values)
+            .field("macros", &self.macros)
+            .finish()
+    }
+}
+
+impl Default for PerNsGlobImports {
+    fn default() -> Self {
+        PerNsGlobImports::new_in(Global)
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
@@ -122,7 +151,39 @@ pub struct GlobId {
     pub idx: Idx<ast::UseTree>,
 }
 
-impl PerNsGlobImports {
+impl<A: Allocator + Clone> PerNsGlobImports<A> {
+    pub(crate) fn new_in(alloc: A) -> Self {
+        PerNsGlobImports {
+            types: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc.clone()),
+            values: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc.clone()),
+            macros: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc),
+        }
+    }
+
+    /// The glob marks of `scope`, the scope of `module`, sized to them.
+    pub(crate) fn of_scope_in(module: ModuleId, scope: &ItemScope, alloc: A) -> Self {
+        let types = || {
+            scope.types.iter().filter(|(_, it)| matches!(it.import, Some(ImportOrExternCrate::Glob(_))))
+        };
+        let values =
+            || scope.values.iter().filter(|(_, it)| matches!(it.import, Some(ImportOrGlob::Glob(_))));
+        let macros = || {
+            scope.macros.iter().filter(|(_, it)| matches!(it.import, Some(ImportOrExternCrate::Glob(_))))
+        };
+        let set = |len: usize, alloc: A| {
+            hashbrown::HashSet::with_capacity_and_hasher_in(len, FxBuildHasher, alloc)
+        };
+        let mut marks = PerNsGlobImports {
+            types: set(types().count(), alloc.clone()),
+            values: set(values().count(), alloc.clone()),
+            macros: set(macros().count(), alloc),
+        };
+        marks.types.extend(types().map(|(name, _)| (module, *name)));
+        marks.values.extend(values().map(|(name, _)| (module, *name)));
+        marks.macros.extend(macros().map(|(name, _)| (module, *name)));
+        marks
+    }
+
     pub(crate) fn contains_type(&self, module_id: ModuleId, name: Name) -> bool {
         self.types.contains(&(module_id, name))
     }
@@ -131,6 +192,12 @@ impl PerNsGlobImports {
     }
     pub(crate) fn contains_macro(&self, module_id: ModuleId, name: Name) -> bool {
         self.macros.contains(&(module_id, name))
+    }
+}
+
+impl PerNsGlobImports {
+    pub(crate) fn of_scope(module: ModuleId, scope: &ItemScope) -> PerNsGlobImports {
+        PerNsGlobImports::of_scope_in(module, scope, Global)
     }
 }
 
@@ -602,6 +669,18 @@ impl<D: PackedDef, I: PackedImport> Column<D, I> {
 /// none while small. Two are equal when they map the same keys to the same values in any order,
 /// as the hash maps they replace were.
 #[derive(Clone)]
+/// `v` again at exactly its length: one allocation for a non-empty column, none for an empty one
+/// or one already exact.
+fn exact<T>(v: &mut ThinVec<T>) {
+    if v.capacity() == v.len() {
+        return;
+    }
+    // alloc: the memo's column, at its length
+    let mut out = ThinVec::with_capacity(v.len());
+    out.extend(v.drain(..));
+    *v = out;
+}
+
 pub(crate) struct Keyed<K, V> {
     entries: ThinVec<(K, V)>,
     index: Index,
@@ -712,8 +791,9 @@ impl<K: Copy + Eq + Hash, V> Keyed<K, V> {
         self.entries.iter().map(|(_, v)| v)
     }
 
-    fn shrink_to_fit(&mut self) {
-        self.entries.shrink_to_fit();
+    /// The map again at its length, indexed with no spare room.
+    fn settle(&mut self) {
+        exact(&mut self.entries);
         let unique = self.reindex(self.entries.len());
         debug_assert!(unique, "a map of a scope with a key twice");
     }
@@ -802,8 +882,9 @@ pub struct ItemScope {
     pub(crate) builtin_derive_impls: ThinVec<BuiltinDeriveImplId>,
     pub(crate) extern_blocks: ThinVec<ExternBlockId>,
     pub(crate) unnamed_consts: ThinVec<ConstId>,
-    /// Traits imported via `use Trait as _;`.
-    pub(crate) unnamed_trait_imports: ThinVec<(TraitId, Item<()>)>,
+    /// Traits imported via `use Trait as _;`, each with the binding's own import: that `use`,
+    /// or the glob that brought another scope's unnamed trait in.
+    pub(crate) unnamed_trait_imports: ThinVec<(TraitId, Item<(), ImportOrExternCrate>)>,
     /// Every `use path as _;` of this scope, in the order they resolved.
     pub(crate) underscore_imports: ThinVec<UnderscoreImport>,
     /// The names two globs give different items, in the order the second glob came.
@@ -1105,15 +1186,64 @@ impl ItemScope {
         unique
     }
 
-    /// Every name once, by text.
+    /// Every name once, by text, in a scope of more than [`LINEAR`] names: made by
+    /// [`Self::settle`] or [`Self::seal`] for the memo's scope, and here only for a scope still
+    /// being collected, once per change it is read after.
     fn sorted(&self) -> &[u32] {
-        self.sorted.get_or_init(|| {
-            let mut all: Vec<u32> =
-                self.all_names().map(|(ns, pos, _)| ns << 30 | pos as u32).collect();
-            all.sort_unstable_by(|&a, &b| self.sorted_name(a).cmp(self.sorted_name(b)));
-            all.dedup_by(|a, b| self.sorted_name(*a) == self.sorted_name(*b));
-            all.into_boxed_slice()
+        // alloc: a scope being collected, once per change; a settled one has its table
+        self.sorted.get_or_init(|| self.sorted_table())
+    }
+
+    /// Every name once, by text, for a scope of at most [`LINEAR`] names.
+    fn sorted_small(&self) -> SmallVec<[u32; LINEAR]> {
+        // alloc: none, at most `LINEAR` positions inline
+        let mut all: SmallVec<[u32; LINEAR]> =
+            self.all_names().map(|(ns, pos, _)| ns << 30 | pos as u32).collect();
+        let kept = self.by_name(&mut all);
+        all.truncate(kept);
+        all
+    }
+
+    /// The table [`Self::sorted`] keeps, sorted in scratch and copied out at its length.
+    fn sorted_table(&self) -> Box<[u32]> {
+        scratch::with_u32s(|all| {
+            all.extend(self.all_names().map(|(ns, pos, _)| ns << 30 | pos as u32));
+            let kept = self.by_name(all);
+            // alloc: the table, at its exact length
+            Box::from(&all[..kept])
         })
+    }
+
+    /// Sorts `all` by name and moves the first position of each name to the front, returning how
+    /// many names there are.
+    fn by_name(&self, all: &mut [u32]) -> usize {
+        all.sort_unstable_by(|&a, &b| self.sorted_name(a).cmp(self.sorted_name(b)));
+        let mut kept = 0;
+        for at in 0..all.len() {
+            if kept == 0 || self.sorted_name(all[kept - 1]) != self.sorted_name(all[at]) {
+                all[kept] = all[at];
+                kept += 1;
+            }
+        }
+        kept
+    }
+
+    /// Builds the tables a settled scope is read by when it has more than [`LINEAR`] names, and
+    /// drops them when it has fewer (a small scope scans its columns).
+    fn fill_tables(&mut self) {
+        if self.indexed_len() <= LINEAR {
+            self.sorted = OnceLock::new();
+            self.by_def = OnceLock::new();
+            return;
+        }
+        if self.sorted.get().is_none() {
+            let table = self.sorted_table();
+            self.sorted = OnceLock::from(table);
+        }
+        if self.by_def.get().is_none() {
+            let table = self.by_def_table();
+            self.by_def = OnceLock::from(table);
+        }
     }
 
     /// Indexes a scope `frozen` read column by column, or says what in it is there twice.
@@ -1134,6 +1264,7 @@ impl ItemScope {
         if unique.contains(&false) {
             return Err("a scope with a key twice in one of its maps");
         }
+        self.fill_tables();
         Ok(())
     }
 }
@@ -1143,7 +1274,11 @@ impl ItemScope {
 impl ItemScope {
     pub fn entries(&self) -> impl Iterator<Item = (&Name, PerNs)> + '_ {
         // FIXME: shadowing
-        self.sorted().iter().map(move |&at| {
+        let order = match self.indexed_len() <= LINEAR {
+            true => Either::Left(self.sorted_small().into_iter()),
+            false => Either::Right(self.sorted().iter().copied()),
+        };
+        order.map(move |at| {
             let name = self.sorted_name(at);
             (name, self.get(name))
         })
@@ -1161,17 +1296,6 @@ impl ItemScope {
 
     pub fn macros(&self) -> impl Iterator<Item = (&Name, Item<MacroId, ImportOrExternCrate>)> + '_ {
         self.macros.iter()
-    }
-
-    pub fn imports(&self) -> impl Iterator<Item = ImportId> + '_ {
-        self.use_imports_types
-            .keys()
-            .chain(self.use_imports_macros.keys())
-            .filter_map(ImportOrExternCrate::import_or_glob)
-            .chain(self.use_imports_values.keys())
-            .filter_map(ImportOrGlob::into_import)
-            .sorted()
-            .dedup()
     }
 
     pub fn fully_resolve_import(&self, db: &Db, mut import: ImportId) -> PerNs {
@@ -1383,29 +1507,45 @@ impl ItemScope {
         }
     }
 
-    /// The entries of the three namespaces, by namespace, def and then position.
+    /// The entries of the three namespaces, by namespace, def and then position, for a scope of
+    /// more than [`LINEAR`] names: made by [`Self::settle`] or [`Self::seal`], and here only for a
+    /// scope still being collected.
     fn by_def(&self) -> &[u32] {
-        self.by_def.get_or_init(|| {
-            let mut all: Vec<u32> = (named(TYPES, &self.types.entries))
-                .chain(named(VALUES, &self.values.entries))
-                .chain(named(MACROS, &self.macros.entries))
-                .map(|(ns, pos, _)| ns << 30 | pos as u32)
-                .collect();
+        // alloc: a scope being collected, once per change; a settled one has its table
+        self.by_def.get_or_init(|| self.by_def_table())
+    }
+
+    /// The table [`Self::by_def`] keeps, sorted in scratch and copied out at its length.
+    fn by_def_table(&self) -> Box<[u32]> {
+        scratch::with_u32s(|all| {
+            all.extend(
+                (named(TYPES, &self.types.entries))
+                    .chain(named(VALUES, &self.values.entries))
+                    .chain(named(MACROS, &self.macros.entries))
+                    .map(|(ns, pos, _)| ns << 30 | pos as u32),
+            );
             // The position last keeps a def's names in column order, which is the order
             // `name_of` (the first) and `names_of` (the first `Some`) answer in.
             // `(at >> 30, it.def_tag, it.def, at & POS_MASK)` packed in order: an `Option<Id>`
             // orders `None` first, then by index and generation.
-            radix::sort_by_key(&mut all, |&at| {
-                let it = self.entry_at(at);
-                let def = it.def.map_or(0, |id| {
-                    1u128 << 64 | u128::from(radix::pack_32(id.index(), id.generation()))
-                });
-                u128::from(at >> 30) << 97
-                    | u128::from(it.def_tag) << 89
-                    | def << 24
-                    | u128::from(at & POS_MASK)
+            scratch::with_u32s(|spare| {
+                radix::sort_copy_by_key_in(
+                    all,
+                    |&at| {
+                        let it = self.entry_at(at);
+                        let def = it.def.map_or(0, |id| {
+                            1u128 << 64 | u128::from(radix::pack_32(id.index(), id.generation()))
+                        });
+                        u128::from(at >> 30) << 97
+                            | u128::from(it.def_tag) << 89
+                            | def << 24
+                            | u128::from(at & POS_MASK)
+                    },
+                    spare,
+                )
             });
-            all.into_boxed_slice()
+            // alloc: the table, at its exact length
+            Box::from(&all[..])
         })
     }
 
@@ -1437,7 +1577,8 @@ impl ItemScope {
         found.map(|it| (&it.name, it.vis(), it.declared()))
     }
 
-    /// A binary search of the scope's entries by def (built on the first call after a change).
+    /// A binary search of the scope's entries by def (built at settle, or on the first call after
+    /// a change while the scope is being collected).
     pub(crate) fn name_of(&self, item: ItemInNs) -> Option<(&Name, Visibility, /*declared*/ bool)> {
         self.naming(item).next()
     }
@@ -1466,11 +1607,7 @@ impl ItemScope {
             self.unnamed_trait_imports.iter().map(|(tr, trait_)| {
                 (
                     None,
-                    PerNs::types(
-                        ModuleDefId::TraitId(*tr),
-                        trait_.vis,
-                        trait_.import.map(ImportOrExternCrate::Import),
-                    ),
+                    PerNs::types(ModuleDefId::TraitId(*tr), trait_.vis, trait_.import),
                 )
             }),
         )
@@ -1609,7 +1746,33 @@ impl ItemScope {
         vis: Visibility,
         import: Option<ImportId>,
     ) {
+        self.push_unnamed_trait_through(tr, vis, import.map(ImportOrExternCrate::Import));
+    }
+
+    /// Records `tr` as in scope unnamed, bound by `import`: a `use Tr as _` of this scope, or
+    /// the glob that read it from another scope's unnamed traits.
+    pub(crate) fn push_unnamed_trait_through(
+        &mut self,
+        tr: TraitId,
+        vis: Visibility,
+        import: Option<ImportOrExternCrate>,
+    ) {
         self.unnamed_trait_imports.push((tr, Item { def: (), vis, import }));
+    }
+
+    /// How this scope has `tr` in scope, as rustc's `traits_in_module` lists it (named
+    /// bindings in column order, then unnamed ones, named `_`): the binding's name and its
+    /// import, `None` for a declaration; `None` where `tr` is not in scope here.
+    pub fn trait_binding(&self, tr: TraitId) -> Option<(Name, Option<ImportOrExternCrate>)> {
+        let item = ItemInNs::Types(ModuleDefId::TraitId(tr));
+        let named = self.names_of(item, |name, _, declared| match declared {
+            true => Some((*name, None)),
+            false => Some((*name, self.get(name).types.and_then(|it| it.import))),
+        });
+        named.or_else(|| {
+            let (_, it) = self.unnamed_trait_imports.iter().find(|&&(t, _)| t == tr)?;
+            Some((Name::new_symbol_root(sym::underscore), it.import))
+        })
     }
 
     /// Records `it`, in place of what an earlier resolution of the same import recorded.
@@ -1672,9 +1835,9 @@ impl ItemScope {
         }
     }
 
-    pub(crate) fn push_res_with_import(
+    pub(crate) fn push_res_with_import<A: Allocator + Clone>(
         &mut self,
-        glob_imports: &mut PerNsGlobImports,
+        glob_imports: &mut PerNsGlobImports<A>,
         lookup: (ModuleId, Name),
         def: PerNs,
         import: Option<ImportOrExternCrate>,
@@ -1942,9 +2105,11 @@ impl ItemScope {
         }
     }
 
-    /// Called once when collection is done: every column and map exactly its length, and the
-    /// index as small as its load allows.
-    pub(crate) fn shrink_to_fit(&mut self) {
+    /// Called once when collection is done, to make the scope the memo keeps: every column and
+    /// map made again at its length, the index as small as its load allows, and, for a scope of
+    /// more than [`LINEAR`] names, the by-name and by-def tables, so that no read of it
+    /// allocates.
+    pub(crate) fn settle(&mut self) {
         // Exhaustive match to require handling new fields.
         let Self {
             types,
@@ -1975,32 +2140,39 @@ impl ItemScope {
             macro_invocations,
             extern_blocks,
         } = self;
-        underscore_imports.shrink_to_fit();
-        glob_ambiguities.shrink_to_fit();
-        shadowed_imports.shrink_to_fit();
-        extern_blocks.shrink_to_fit();
-        types.entries.shrink_to_fit();
-        values.entries.shrink_to_fit();
-        macros.entries.shrink_to_fit();
-        use_imports_types.shrink_to_fit();
-        use_imports_values.shrink_to_fit();
-        use_imports_macros.shrink_to_fit();
-        unresolved.shrink_to_fit();
-        declarations.shrink_to_fit();
-        impls.shrink_to_fit();
-        trait_impl.0.shrink_to_fit();
-        reservation_impl.0.shrink_to_fit();
-        builtin_derive_impls.shrink_to_fit();
-        unnamed_consts.shrink_to_fit();
-        unnamed_trait_imports.shrink_to_fit();
-        legacy_macros.shrink_to_fit();
-        attr_macros.shrink_to_fit();
-        derive_macros.shrink_to_fit();
-        extern_crate_decls.shrink_to_fit();
-        use_decls.shrink_to_fit();
-        macro_invocations.shrink_to_fit();
+        exact(&mut underscore_imports);
+        exact(&mut glob_ambiguities);
+        exact(&mut shadowed_imports);
+        exact(&mut extern_blocks);
+        exact(&mut types.entries);
+        exact(&mut values.entries);
+        exact(&mut macros.entries);
+        use_imports_types.settle();
+        use_imports_values.settle();
+        use_imports_macros.settle();
+        exact(&mut unresolved);
+        exact(&mut declarations);
+        exact(&mut impls);
+        exact(&mut trait_impl.0);
+        exact(&mut reservation_impl.0);
+        exact(&mut builtin_derive_impls);
+        exact(&mut unnamed_consts);
+        exact(&mut unnamed_trait_imports);
+        for (_, macs) in legacy_macros.entries.iter_mut() {
+            macs.shrink_to_fit();
+        }
+        for (_, calls) in derive_macros.entries.iter_mut() {
+            calls.shrink_to_fit();
+        }
+        legacy_macros.settle();
+        attr_macros.settle();
+        derive_macros.settle();
+        exact(&mut extern_crate_decls);
+        exact(&mut use_decls);
+        macro_invocations.settle();
         let unique = self.reindex(self.indexed_len());
         debug_assert!(unique, "a namespace of a scope with a name twice");
+        self.fill_tables();
     }
 }
 
@@ -2138,9 +2310,13 @@ impl ItemInNs {
 
 #[cfg(test)]
 mod tests {
+    mod budgets;
+
+    use blaze_ids::rng::SplitMix64;
     use indexmap::map::Entry as MapEntry;
     use intern::Symbol;
-    use rustc_hash::FxHashMap;
+    use itertools::Itertools;
+    use rustc_hash::{FxHashMap, FxHashSet};
 
     use super::*;
     use crate::{
@@ -2153,30 +2329,11 @@ mod tests {
         T::from_id(salsa::Id::from_bits((n % 7 + 1) | (n / 7) << 32))
     }
 
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n
-        }
-
-        fn chance(&mut self, one_in: u64) -> bool {
-            self.below(one_in) == 0
-        }
-    }
-
     fn names() -> Vec<Name> {
         (0..40).map(|it| Name::new_symbol_root(Symbol::intern(&format!("scope_test_{it}")))).collect()
     }
 
-    fn def(rng: &mut Rng) -> ModuleDefId {
+    fn def(rng: &mut SplitMix64) -> ModuleDefId {
         let n = rng.below(6);
         match rng.below(8) {
             0 => ModuleDefId::ModuleId(id(n)),
@@ -2190,7 +2347,7 @@ mod tests {
         }
     }
 
-    fn makro(rng: &mut Rng) -> MacroId {
+    fn makro(rng: &mut SplitMix64) -> MacroId {
         let n = rng.below(6);
         match rng.below(3) {
             0 => MacroId::Macro2Id(id(n)),
@@ -2199,7 +2356,7 @@ mod tests {
         }
     }
 
-    fn vis(rng: &mut Rng) -> Visibility {
+    fn vis(rng: &mut SplitMix64) -> Visibility {
         match rng.below(4) {
             0 => Visibility::Public,
             1 => Visibility::PubCrate(id(rng.below(2))),
@@ -2208,7 +2365,7 @@ mod tests {
         }
     }
 
-    fn import(rng: &mut Rng) -> Option<ImportOrExternCrate> {
+    fn import(rng: &mut SplitMix64) -> Option<ImportOrExternCrate> {
         let use_ = id(rng.below(4));
         let idx = tree_at(rng.below(3) as u32);
         match rng.below(4) {
@@ -2219,19 +2376,19 @@ mod tests {
         }
     }
 
-    fn per_ns(rng: &mut Rng) -> PerNs {
+    fn per_ns(rng: &mut SplitMix64) -> PerNs {
         let import = import(rng);
-        let item = |rng: &mut Rng| (def(rng), vis(rng));
+        let item = |rng: &mut SplitMix64| (def(rng), vis(rng));
         PerNs {
-            types: rng.chance(2).then(|| {
+            types: rng.one_in(2).then(|| {
                 let (def, vis) = item(rng);
                 Item { def, vis, import }
             }),
-            values: rng.chance(2).then(|| {
+            values: rng.one_in(2).then(|| {
                 let (def, vis) = item(rng);
                 Item { def, vis, import: import.and_then(ImportOrExternCrate::import_or_glob) }
             }),
-            macros: rng.chance(3).then(|| Item { def: makro(rng), vis: vis(rng), import }),
+            macros: rng.one_in(3).then(|| Item { def: makro(rng), vis: vis(rng), import }),
         }
     }
 
@@ -2481,7 +2638,7 @@ mod tests {
     fn columns_answer_as_the_maps_did() {
         let names = names();
         for seed in [1u64, 0x9e37_79b9, 0xdead_beef_cafe] {
-            let mut rng = Rng(seed);
+            let mut rng = SplitMix64::new(seed);
             let (mut scope, mut model) = (ItemScope::default(), Model::default());
             let (mut globs, mut model_globs) =
                 (PerNsGlobImports::default(), PerNsGlobImports::default());
@@ -2491,7 +2648,7 @@ mod tests {
                     0..=8 => {
                         let lookup = (id(rng.below(2)), name);
                         let def =
-                            if rng.chance(8) { PerNs::none() } else { per_ns(&mut rng) };
+                            if rng.one_in(8) { PerNs::none() } else { per_ns(&mut rng) };
                         let import = import(&mut rng);
                         assert_eq!(
                             scope.push_res_with_import(&mut globs, lookup, def, import),
@@ -2542,12 +2699,12 @@ mod tests {
                         scope.define_legacy_macro(name, mac);
                         model.legacy_macros.entry(name).or_default().push(mac);
                     }
-                    13 if rng.chance(8) => {
+                    13 if rng.one_in(8) => {
                         let krate = id(rng.below(2));
                         scope.censor_non_proc_macros(krate);
                         model.censor_non_proc_macros(krate);
                     }
-                    14 if rng.chance(4) => scope.shrink_to_fit(),
+                    14 if rng.one_in(4) => scope.settle(),
                     _ => {}
                 }
                 check(&scope, &model, &names);
@@ -2590,7 +2747,7 @@ mod tests {
         reversed.reverse();
         assert_eq!(scope_of(&many, &reversed), scope_of(&many, &all[10..30]));
         let mut sealed = scope_of(&many, &reversed);
-        sealed.shrink_to_fit();
+        sealed.settle();
         assert_eq!(sealed, scope_of(&many, &reversed));
     }
 
@@ -2611,20 +2768,20 @@ mod tests {
     /// `Keyed` maps as a hash map does, past the size it starts indexing at.
     #[test]
     fn keyed_maps_as_a_hash_map() {
-        let mut rng = Rng(7);
+        let mut rng = SplitMix64::new(7);
         let mut keyed: Keyed<u32, u64> = Keyed::default();
         let mut map: FxHashMap<u32, u64> = FxHashMap::default();
         for step in 0..3000u64 {
             let key = rng.below(400) as u32;
-            if rng.chance(3) {
+            if rng.one_in(3) {
                 *keyed.or_insert_with(key, || 0) += step;
                 *map.entry(key).or_insert(0) += step;
             } else {
                 keyed.insert(key, step);
                 map.insert(key, step);
             }
-            if rng.chance(500) {
-                keyed.shrink_to_fit();
+            if rng.one_in(500) {
+                keyed.settle();
             }
             assert_eq!(keyed.len(), map.len());
             for probe in 0..400 {
@@ -2661,7 +2818,7 @@ mod tests {
     /// Every definition, visibility and import packs and reads back as itself.
     #[test]
     fn entries_read_back_what_was_packed() {
-        let mut rng = Rng(11);
+        let mut rng = SplitMix64::new(11);
         let name = names()[0];
         for _ in 0..2000 {
             let item = Item { def: def(&mut rng), vis: vis(&mut rng), import: import(&mut rng) };

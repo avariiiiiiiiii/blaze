@@ -46,6 +46,8 @@ pub(crate) fn exact_thin<T>(
 
 (If mem-db-infer prefers these in `lib.rs` for every part, they move there unchanged.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 2. lane db: `TyLoweringContext` takes its run's frame (R2), `lower.rs`
 
 `ImplTraitLoweringState`. Before:
@@ -184,6 +186,8 @@ makes no global allocation (the `SmallVec` is inline), but a push of a `for<'a>`
 allocates its names (`binder.to_vec()`). After this change no context makes a global allocation
 until it lowers something that has diagnostics.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 3. lane db: binder names in one list, `lower.rs`
 
 `push_bound_vars` and `pop_bound_vars`. Before:
@@ -276,20 +280,50 @@ After (the same first match, innermost binder first):
         } else {
 ```
 
-Test (in `lower.rs`'s `mod tests`): the hir-ty lowering tests of `for<'a>` already cover
-`find_and_lower_hrtb_lifetime`'s result. Add one for the nested and `X: for<'b>` cases:
+Test. hir-ty has no test database: its lowering tests are hir's, in
+`crates/hir/src/tests/lower.rs`, beside `a_for_lifetime_binds_its_name` and in its style. Every
+test here that needs a database goes there. This one holds nested binders, which the flat names
+change:
 
 ```rust
-    #[test]
-    fn nested_binders_resolve_innermost_first() {
-        // `for<'a> fn(for<'a, 'b> fn(&'a u8, &'b u8))`: the inner `'a` is the inner binder's
-        // var 0, `'b` its var 1, the outer `'a` unused.
-        check_types(r#"
-fn f(x: for<'a> fn(for<'a, 'b> fn(&'a u8, &'b u8))) { x; }
-                                                   //^ for<'a> fn(for<'a, 'b> fn(&'a u8, &'b u8))
-"#);
-    }
+#[test]
+fn a_lifetime_is_the_innermost_binders_that_names_it() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+type G = for<'a> fn(&'a u8, for<'a, 'b> fn(&'a u8, &'b u8));
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (_, ModuleDefId::TypeAliasId(alias)) = type_item(&db, "G") else {
+            panic!("`G` is a type alias")
+        };
+        let ty = db.ty(TyDefId::TypeAliasId(alias)).skip_binder();
+        let TyKind::FnPtr(outer, _) = ty.kind() else { panic!("`G` is a fn pointer: {ty:?}") };
+        let outer = outer.skip_binder().inputs();
+        let TyKind::FnPtr(inner, _) = outer[1].kind() else { panic!("a fn pointer: {ty:?}") };
+        let inner = inner.skip_binder().inputs();
+        // (binder, var) of a reference's region, the binder counted from the innermost.
+        let bound = |ty: Ty<'_>| match ty.kind() {
+            TyKind::Ref(region, ..) => match region.kind() {
+                RegionKind::ReBound(BoundVarIndexKind::Bound(binder), it) => {
+                    (binder.as_u32(), it.var.as_u32())
+                }
+                it => panic!("a bound region, not {it:?}"),
+            },
+            it => panic!("a reference, not {it:?}"),
+        };
+        assert_eq!(bound(outer[0]), (0, 0), "the outer `'a`");
+        assert_eq!(bound(inner[0]), (0, 0), "the inner `'a` shadows the outer");
+        assert_eq!(bound(inner[1]), (0, 1), "`'b`");
+    });
+}
 ```
+
+(`Ty` from `hir_ide::next_solver`, and `RegionKind` and `BoundVarIndexKind` from wherever
+`lower.rs` imports them.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 4. lane db: owned results made once, and the frame form of a lowering, `lower.rs`
 
@@ -445,6 +479,8 @@ and one new test:
     }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 5. lane db: `lower_closure_params` fills the caller's list, `lower.rs`
 
 A frame `Vec` cannot leave `with_ty_lowering`'s higher-ranked closure, so the caller passes its
@@ -487,11 +523,15 @@ After:
 
 The caller (`infer/closure.rs`, part closure) is in 22.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 6. lane db: `lower_fn_ptr`'s arguments, `lower.rs`
 
 Before: `let mut args = Vec::with_capacity(fn_.params.len());`. After:
 `let mut args = Vec::with_capacity_in(fn_.params.len(), self.frame);`. It runs once per fn pointer
 type, its length is exact (the parameters and the return type), and it is interned by `Tys`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 7. lane db: bounds without a list per bound, `lower.rs`
 
@@ -553,20 +593,11 @@ After (needs 2's `with_shifted_in(impl FnOnce(&mut Self))`):
         };
 ```
 
-Test: the existing `generic_predicates` and where-clause tests (`tests/traits.rs`,
-`tests/regression.rs`) hold the order of clauses. Add one with an `Iterator<Item = T>` bound
-under a `for<'a>` binder, which checks the associated bound's binder after this change:
+Test: none new. This removes a copy of a list that is already computed, and the order and
+binders of the clauses are what they were. The type-check corpus and the existing where-clause
+tests hold them.
 
-```rust
-    #[test]
-    fn a_where_clause_with_a_binder_keeps_its_associated_bound() {
-        check_types(r#"
-//- minicore: iterator
-fn f<T>(x: T) where for<'a> &'a T: Iterator<Item = u8> { let y = (&x).next(); y; }
-                                                                          //^ Option<u8>
-"#);
-    }
-```
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 8. lane db: `lower_dyn_trait`'s lists, `lower.rs`
 
@@ -646,6 +677,8 @@ map is read only by key and never iterated, so a frame hash map is the same as t
 `dyn` tests (`tests/traits.rs` `dyn_trait*`, `tests/display_source_code.rs`) hold the
 projection order, which comes from `ordered_associated_types`, not from the map.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 9. lane db: `lower_impl_trait` (the context's method), `lower.rs`
 
 Before:
@@ -664,6 +697,8 @@ After:
 
 `predicates.extend(assoc_ty_bounds)` and `Clauses::new_from_slice(&predicates)` are unchanged
 (the clauses are interned).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 10. lane db: the tracked queries of `lower.rs` (R1, R4, R6)
 
@@ -696,6 +731,8 @@ one more allocation when the item has diagnostics, or defines anonymous constant
 | `fn_sig_for_enum_variant_constructor` (4271) | same | none | 0, no frame |
 
 The per-query changes:
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10a. `impl_trait_of_impl`, `lower_impl_trait` (the free fn)
 
@@ -764,6 +801,8 @@ pub(crate) fn lower_impl_trait<'db, 'f>(
 }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 10b. `impl_self_ty_of_impl`, `lower_impl_self_ty`
 
 The same shape. `lower_impl_self_ty<'db, 'f>(db, impl_id, frame: &'f Frame) ->
@@ -771,12 +810,16 @@ FrameLowered<'f, 'db, StoredEarlyBinder<StoredTy>>` ends with
 `FrameLowered::from_ctx(StoredEarlyBinder::bind(ctx.interner, ty.store()), ctx, frame)`. The query
 body is `blaze_mem::frame::current(|frame| lower_impl_self_ty(db, impl_id, frame).owned())`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 10c. `type_for_const_with_diagnostics`, `type_for_static_with_diagnostics`, `type_for_type_alias_with_diagnostics`, `resolve_type_param_assoc_type_shorthand`
 
 Each wraps its body in `blaze_mem::frame::current(|frame| { .. })` and passes `frame` last to its
 `TyLoweringContext::new`. Their `TyLoweringResult::from_ctx(.., ctx)` calls are unchanged (they
 use 4's new `from_ctx`). `type_for_type_alias_with_diagnostics` reads `take_defined_opaques`,
 which is exact after 4. Its `impl_traits: ThinVec::new()` arms (empty, no allocation) stay.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10d. `const_param_types_with_diagnostics`: one exact column
 
@@ -829,19 +872,40 @@ the same order):
     })
 ```
 
-Test:
+Test (`crates/hir/src/tests/lower.rs`):
 
 ```rust
-    #[test]
-    fn const_param_types_are_one_exact_column() {
-        let (db, file) = TestDB::with_single_file("struct S<T, const N: usize, U, const M: bool>;");
-        let def = /* the GenericDefId of `S`, as the tests' `def_of` helper finds it */;
-        let tys = &const_param_types_with_diagnostics(&db, def).value.tys;
-        assert_eq!(tys.len(), 4);
-        assert_eq!(tys.capacity(), 4);
-        assert!(tys[0].is_none() && tys[1].is_some() && tys[2].is_none() && tys[3].is_some());
-    }
+#[test]
+fn const_parameters_between_type_parameters_have_their_types() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+struct S<T, const N: usize, U, const M: bool>([T; N], U);
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
+        let def = hir_def::GenericDefId::AdtId(adt);
+        let tys: Vec<String> = hir_def::hir::generics::GenericParams::of(&db, def)
+            .iter_type_or_consts()
+            .filter(|(_, it)| matches!(it, hir_def::hir::generics::TypeOrConstParamData::ConstParamData(_)))
+            .map(|(local_id, _)| {
+                let id = hir_def::ConstParamId::from_unchecked(hir_def::TypeOrConstParamId {
+                    parent: def,
+                    local_id,
+                });
+                format!("{:?}", db.const_param_ty(id))
+            })
+            .collect();
+        assert_eq!(tys, ["usize", "bool"]);
+    });
+}
 ```
+
+(The `Debug` form of a `Ty` as the other hir tests print it. Use the file's
+`DisplayTarget`/`display` helper if it has one.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10e. `field_types_of_variant`, `lower_field_types`
 
@@ -892,6 +956,8 @@ pub(crate) fn lower_field_types<'db, 'f>(
 
 One allocation per variant with fields, as today, now made from the frame list at its exact
 length.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10f. `supertraits_info`: frame lists, two exact boxes
 
@@ -991,6 +1057,8 @@ new test:
     }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 10g. `type_alias_bounds_with_diagnostics` and `remap_gat_vars_and_recurse_into_nested_projections`
 
 Before:
@@ -1070,6 +1138,8 @@ and `impl<'db> TypeFolder<DbInterner<'db>> for MapAndCompressBoundVars<'db, '_>`
 `FxIndexMap` import goes if nothing else uses it. Test: the GAT item-bound tests
 (`tests/traits.rs` `gat_*`) hold the compressed binders.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 10h. `generic_predicates_of`, `generic_predicates`, `push_const_arg_has_type_predicates`
 
 Before:
@@ -1144,24 +1214,14 @@ fn push_const_arg_has_type_predicates<'db>(
 ```
 
 The two `mem::take` lines go: `add_sized_clause`'s borrow of `ctx` ends at its last use, before
-`from_ctx`. (`predicates` is the `GenericPredicates` value in `FrameLowered::from_ctx(predicates,
-..)`, as in today's last line; the list is named `all` there if the names clash.) Test: the
-existing predicate tests hold the order. Add a budget assertion beside them:
+`from_ctx`. Today's last line builds the `GenericPredicates` value from the list, so the list is
+renamed `all` and the value keeps the name `predicates`, as in
+`FrameLowered::from_ctx(predicates, ctx, frame)`. Test: the existing predicate tests hold the
+order (the batch tests compare the batch with the per-item query). The allocation budget, at
+most the interner's for one `Clauses` and nothing for an item without findings, is a line of
+mem-db-infer's `tests/budget.rs` (its request 4).
 
-```rust
-    #[test]
-    fn generic_predicates_of_an_item_without_findings_allocate_nothing_of_their_own() {
-        let (db, _) = TestDB::with_single_file("trait A {} trait B {} fn f<T: A + B, U: A>() where U: B {}");
-        let def = /* `f`'s GenericDefId */;
-        let _ = generic_predicates_of(&db, def); // the parents and lang items, warm
-        db.clear_memo_of_generic_predicates_of(def); // or a fresh db with the same file
-        let (_, used) = blaze_alloc_count::measure(|| generic_predicates_of(&db, def).value.predicates);
-        assert!(used.allocations <= /* the interner's for one Clauses */ 2, "{used:?}");
-    }
-```
-
-(If salsa gives no way to drop one memo, mem-db-infer's `tests/budget.rs` holds this budget
-instead.)
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10i. `const_conditions_query`
 
@@ -1169,6 +1229,8 @@ Before: `let mut conditions = Vec::new();` and
 `StoredEarlyBinder::bind(interner, Clauses::new_from_iter(conditions).store())`. After: the body
 in `blaze_mem::frame::current(|frame| { .. })`, `let mut conditions = Vec::new_in(frame);`, the
 context taking `frame`, and `Clauses::new_from_slice(&conditions)`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10j. `generic_defaults_with_diagnostics`: one exact column
 
@@ -1214,18 +1276,27 @@ the parent's, as `push` already asserts by its subtraction):
 ```
 
 The body is in `blaze_mem::frame::current(|frame| { .. })`. `GenericDefaults::push` goes.
-`GenericDefaults` keeps `Clone`, which other code may use. Test:
+`GenericDefaults` keeps `Clone`, which other code may use. Test (`crates/hir/src/tests/lower.rs`):
 
 ```rust
-    #[test]
-    fn generic_defaults_are_one_exact_column() {
-        let (db, _) = TestDB::with_single_file("struct S<A, B = u8, C = u16>(A, B, C);");
-        let def = /* `S`'s GenericDefId */;
-        let defaults = &generic_defaults_with_diagnostics(&db, def).value.0;
-        assert_eq!((defaults.len(), defaults.capacity()), (3, 3));
-        assert!(defaults[0].is_none() && defaults[1].is_some() && defaults[2].is_some());
-    }
+#[test]
+fn defaults_follow_the_parameters_they_are_of() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+struct S<A, B = u8, C = u16>(A, B, C);
+"#,
+    );
+    crate::attach_db(&db, || {
+        let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
+        let defaults = db.generic_defaults(hir_def::GenericDefId::AdtId(adt));
+        let has: Vec<bool> = (0..4).map(|idx| defaults.get(idx).is_some()).collect();
+        assert_eq!(has, [false, true, true, false]);
+    });
+}
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10k. `fn_sig_for_fn`
 
@@ -1233,6 +1304,8 @@ The body in `blaze_mem::frame::current(|frame| { .. })`. Both contexts take `fra
 `ctx_params.diagnostics.extend(ctx_ret.diagnostics)` and the `defined_anon_consts` line are
 unchanged (frame lists of the same lifetime). `take_defined_opaques` is exact after 4. One
 allocation if the function returns `impl Trait`, + d + a.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10l. `elided_lifetimes`, `input_lifetimes`, `path_lifetimes`
 
@@ -1353,9 +1426,13 @@ With this, `frame` is not needed by `path_lifetimes` itself, only passed on to
 `input_lifetimes`. Drop the parameter if nothing else uses it. Test: the existing
 `elided_lifetimes` tests (`tests/regression.rs`, the `impl Trait` capture tests) hold the result.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 10m. `trait_environment_query`, the constructor signatures
 
 Only the tag. They make no temporaries of their own, so they open no frame.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 11. lane db: `ElidedLifetimes::regions` fills the caller's list, `lower.rs`
 
@@ -1387,6 +1464,8 @@ frame lists):
 The body is otherwise unchanged (`regions.extend(..)` once per arm, with
 `regions.extend([Some(*first)])` in place of `push`). The final `regions` line goes. The callers'
 changes are in 22.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 12. lane db: `bind_elided_lifetimes` takes its caller's frame, `lower.rs`
 
@@ -1423,6 +1502,8 @@ pub(crate) fn bind_elided_lifetimes<'db>(
 
 and at the end `BoundVarKinds::new_from_slice(&vars)` in place of `new_from_iter(vars)`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 13. lane db: the R7 helpers of `lower.rs` (no change)
 
 These are called on the hit path of many queries and make nothing:
@@ -1437,10 +1518,14 @@ These are called on the hit path of many queries and make nothing:
 
 Each reads memos or interns, and takes no frame.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 14. lane db: `crates/hir-ty/src/lower/path.rs`
 
 `PathLoweringContext` holds `ctx: &'a mut TyLoweringContext<'db, 'b>`, so it reaches the frame as
 `self.ctx.frame` (`&'b Frame`) and needs no field of its own (R2).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 14a. `substs_from_args_and_bindings` (the free fn): the run's frame
 
@@ -1462,6 +1547,8 @@ After (a new last parameter `frame: &Frame`):
 `object_lifetime_default` are unchanged (they are slices). Callers:
 - `path.rs`, the method `substs_from_args_and_bindings`, passes `self.ctx.frame`;
 - `method_resolution/confirm.rs:464`, part method, passes its inference's frame (22).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 14b. `assoc_type_bindings_from_type_bound`: the bounds of a binding
 
@@ -1496,6 +1583,8 @@ After (`Item: A + B` and `Item = T` with bounds spill today. A frame list does n
 The return type `impl Iterator<..> + use<'a, 'b, 'db>` already covers `&'b Frame`. If nothing
 else uses `smallvec::SmallVec` in `path.rs`, its import goes.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 14c. Left as they are
 
 - `prohibit_generic_args(segments: Vec<u32>, ..)`, `with_args`, the `vec![..]` of one segment,
@@ -1504,7 +1593,11 @@ else uses `smallvec::SmallVec` in `path.rs`, its import goes.
   error, and the list becomes the diagnostic's own `Box<[u32]>`.
 - `binding.name.clone()`, `assoc_name.clone()`: a 4-byte `Name`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 15. lane db: `crates/hir-ty/src/lower/batch.rs`
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 15a. `SideTableBuilder` in the frame, exact columns
 
@@ -1570,6 +1663,8 @@ fn exact<T>(items: &mut Vec<T, &Frame>) -> Box<[T]> {
 }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 15b. `Batch::build`: one task per item
 
 Before:
@@ -1630,6 +1725,8 @@ microseconds of lowering per item. mem-db-infer has been told.
 `values.into_boxed_slice()` does not reallocate: the capacity is exact and every key pushes one
 value.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 15c. `CrateFieldTypes::build`
 
 Before:
@@ -1689,6 +1786,8 @@ After:
     }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 15d. `module_variants`, `module_impls`: in the caller's allocator
 
 Before: `fn module_variants(db: &Db, krate: Crate) -> Vec<VariantId> { let mut variants =
@@ -1711,6 +1810,8 @@ The queries pass their frame. The cycle results (only code rustc rejects reaches
 `radix::sort_copy_by_key` allocates its scratch with the global allocator, once per crate's sort.
 blaze-radix's `sort_copy_by_key_in` takes a `&mut Vec<T>` (Global), so it is left. A
 `Vec<T, A>` form there (fix-radix's file) would make it a frame list.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 15e. The four queries
 
@@ -1819,6 +1920,8 @@ fn crate_impl_predicates<'db>(db: &'db Db, krate: Crate) -> CrateImplPredicates<
 Plus each item's own owned parts, which it moves into the values: a `TyLoweringDiagnostic`'s
 boxed sites, made once when the diagnostic is.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 15f. Tests
 
 Before: `let mut side = SideTableBuilder::<'static>::default();` and
@@ -1860,6 +1963,8 @@ Before: `let mut side = SideTableBuilder::<'static>::default();` and
 
 A batch's result must equal the per-item queries'. The existing persist round-trip tests and the
 `hir` batch tests (`crates/hir/src/tests.rs:794`) compare them. Keep them.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 16. lane db: `crates/hir-ty/src/lower/persist.rs`
 
@@ -1927,6 +2032,8 @@ exact already, and the other two go through `exact(len, ..)`. Test: the existing
     }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 17. lane db: `crates/hir-ty/src/lower/diagnostics.rs`, `generics.rs`, `utils.rs`: no change
 
 - `lower/diagnostics.rs`: the diagnostic types. Their `Box<[..]>` sites are the diagnostic's own
@@ -1937,6 +2044,8 @@ exact already, and the other two go through `exact(len, ..)`. Test: the existing
 - `utils.rs`: `direct_super_traits` and `all_super_traits` read `SupertraitsInfo`'s memo (R7, no
   allocation). `detect_variant_from_bytes`' `Cow::Owned(Layout::for_variant(..))` is const eval's
   rendering result, owned and cold.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 18. lane db: `crates/hir-ty/src/variance.rs`: the solution in the frame
 
@@ -1996,22 +2105,30 @@ impl<'db, 'f> Context<'db, 'f> {
 
 (`let mut variances = self.variances;` in `solve` stays: indexing and `iter_mut` are a slice's.)
 The `Variances` alias and the `smallvec` import go. This means no global allocation for any
-parameter count (today one past 16), at about 2 ns. Test: the existing `variance` tests
-(`tests/variance.rs` or `variance.rs`'s `mod tests`) hold the results. Add one with 20
-parameters, so the old spill is covered:
+parameter count (today one past 16), at about 2 ns. Test (`crates/hir/src/tests/lower.rs`), with
+more than 16 parameters so the old spill is covered:
 
 ```rust
-    #[test]
-    fn many_parameters_vary_on_their_own() {
-        check(r#"
-struct S<'a, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, T>(&'a A, fn(B), core::cell::Cell<C>, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, T);
-"#, expect![[r#"
-            S['a: covariant, A: covariant, B: contravariant, C: invariant, D: covariant, E: covariant, F: covariant, G: covariant, H: covariant, I: covariant, J: covariant, K: covariant, L: covariant, M: covariant, N: covariant, O: covariant, P: covariant, Q: covariant, R: covariant, T: covariant]
-        "#]]);
-    }
+#[test]
+fn the_variances_of_many_parameters() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+struct S<'a, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R>(&'a A, fn(B), fn(C) -> C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R);
+"#,
+    );
+    crate::attach_db(&db, || {
+        use rustc_type_ir::Variance::{Contravariant, Covariant, Invariant};
+        let (_, ModuleDefId::AdtId(adt)) = type_item(&db, "S") else { panic!("`S` is an ADT") };
+        let variances = db.variances_of(hir_def::GenericDefId::AdtId(adt));
+        let mut expected = vec![Covariant, Covariant, Contravariant, Invariant];
+        expected.extend(std::iter::repeat_n(Covariant, 15));
+        assert_eq!(variances.as_slice(), &expected[..]);
+    });
+}
 ```
 
-(in the file's `check` format. Use minicore's `cell` for `Cell`.)
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 19. lane db: `crates/hir-ty/src/variance/unused.rs`
 
@@ -2092,24 +2209,42 @@ mut FrameSet<'f, GenericParamId> }`. `has_error_deep(db, adt, frame: &Frame)` wi
 go. `inputs.is_subset(&constrained)` works: both are `FrameSet<'_, GenericParamId>` of the same
 frame. The returned `Vec` stays: it is the public result, and its callers own it. Test: the
 existing E0392 tests (`blaze-diagnostics`' unused-parameter tests through hir) hold the result.
-Add:
+Add (`crates/hir/src/tests/lower.rs`) one where a projection constrains a parameter, the
+fixpoint's case:
 
 ```rust
-    #[test]
-    fn unused_params_make_only_the_result() {
-        let (db, _) = TestDB::with_single_file("struct S<A, B, C>(A); trait T { type X; } struct U<P, Q>(Q) where P: T<X = Q>;");
-        let s = /* `S`'s AdtId */;
-        let _ = adt_unused_params(&db, s); // warm the queries it reads
-        let (unused, used) = blaze_alloc_count::measure(|| adt_unused_params(&db, s));
-        assert_eq!(unused.len(), 2);
-        assert_eq!(used.allocations, 1, "the returned list");
-    }
+#[test]
+fn a_parameter_a_projection_constrains_is_used() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+trait T { type X; }
+struct S<A, B, C>(A);
+struct U<P, Q>(P) where P: T<X = Q>;
+"#,
+    );
+    crate::attach_db(&db, || {
+        let adt = |name| match type_item(&db, name) {
+            (_, ModuleDefId::AdtId(it)) => it,
+            it => panic!("`{name}` is an ADT, not {it:?}"),
+        };
+        assert_eq!(hir_ide::adt_unused_params(&db, adt("S")).len(), 2);
+        assert!(hir_ide::adt_unused_params(&db, adt("U")).is_empty());
+    });
+}
 ```
+
+Its budget (one allocation, the returned list, once the queries it reads are warm) is a line of
+mem-db-infer's `tests/budget.rs`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 20. lane db: `crates/hir-ty/src/dyn_compatibility.rs`
 
 `dyn_compatibility_of_trait_query` (126) and `generics_require_sized_self` (140) add the tag.
 They make no temporaries after this change and open no frame.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 20a. The supertraits are a memo already
 
@@ -2154,26 +2289,43 @@ After:
     let mut visitor = IllegalSelfTypeVisitor { db, trait_, allow_self_projection };
 ```
 
-A differential test holds the equivalence:
+A differential test holds the equivalence (`crates/hir/src/tests/lower.rs`):
 
 ```rust
-    #[test]
-    fn the_memo_supertraits_are_elaborates() {
-        let (db, _) = TestDB::with_single_file(r#"
-trait A {} trait B: A {} trait C: A {} trait D: B + C where Self: Sized {}
-trait E: for<'a> F<'a> {} trait F<'a> {}
-"#);
-        for trait_ in /* every TraitId of the file */ {
-            let interner = DbInterner::new_no_crate(&db);
+#[test]
+fn the_memo_supertraits_are_what_elaboration_finds() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+trait A {}
+trait B: A {}
+trait C: A {}
+trait D: B + C where Self: Sized {}
+trait F<'a> {}
+trait E: for<'a> F<'a> {}
+trait G where Self: D + E {}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let interner = DbInterner::new_no_crate(&db);
+        for name in ["A", "B", "C", "D", "E", "F", "G"] {
+            let (_, ModuleDefId::TraitId(trait_)) = type_item(&db, name) else {
+                panic!("`{name}` is a trait")
+            };
             let mut elaborated: Vec<_> =
-                rustc_type_ir::elaborate::supertrait_def_ids(interner, trait_.into()).map(|it| it.0).collect();
-            let mut memo = crate::utils::all_super_traits(&db, trait_).to_vec();
+                rustc_type_ir::elaborate::supertrait_def_ids(interner, trait_.into())
+                    .map(|it| it.0)
+                    .collect();
+            let mut memo = hir_ide::all_super_traits(&db, trait_).to_vec();
             elaborated.sort();
             memo.sort();
-            assert_eq!(elaborated, memo, "{trait_:?}");
+            assert_eq!(elaborated, memo, "`{name}`");
         }
-    }
+    });
+}
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 20b. The first `impl Trait` in the return type, without a set
 
@@ -2248,12 +2400,16 @@ The `FxHashSet` and `SmallVec` imports go if nothing else uses them. Test: the e
 dyn-compatibility tests (`dyn_compatibility/tests.rs`, `ReferencesImplTraitInTrait` cases) hold
 the answer.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 20c. Left
 
 `receiver_is_dispatchable` builds an inference context and interned clauses: the solver's
 allocations (mem-db-solver). The pub entry points `dyn_compatibility` and
 `dyn_compatibility_with_callback` (called by hir and the IDE) make nothing of their own after
 20a and 20b, so they open no task.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 21. lane db: `crates/hir-ty/src/builtin_derive.rs` and `crates/hir-ty/src/effects.rs`
 
@@ -2302,6 +2458,8 @@ fn extend_assoc_type_bounds<'db>(
 - `non_const_calls` (pub, `hir-ide/src/tests/const_effects.rs:38`) returns its `Walk.found` list.
   It is owned, and it makes no other temporaries, so it opens no task.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 22. Dependent edits in other parts' files
 
 These are in files of other parts of mem-db-infer and of other lanes. Each goes in the same change
@@ -2318,6 +2476,8 @@ as the signature it follows, or the crate does not build. mem-db-infer passes th
 | `hir/src/source_analyzer.rs:459`, `:1888`, `:2093` (lane frontend/hir) | `TyLoweringContext::new` outside queries | each in `blaze_mem::frame::task(blaze_mem::Tag::Infer, \|frame\| ..)`, `frame` last. hir adds the `blaze-mem` dependency |
 | `hir-ty-borrowck/src/regions.rs:4312`, `:4676` (mem-db-checks regions) | `hir_ty::TyLoweringContext::new` inside borrowck's query | passes its run's frame (`frame::current` at its query's top) |
 | `hir-ty-borrowck/src/regions.rs:1166`, `:5686`, `hir-ty-wfcheck/src/lib.rs:328` (mem-db-checks) | `.regions(&errors)` | `let mut regions = Vec::new_in(frame); elided.regions_into(&errors, &mut regions);` (or a global `Vec::new()` until that crate is on the frame) |
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 23. Every `TyLoweringContext::new` and the frame it passes
 
@@ -2342,6 +2502,8 @@ as the signature it follows, or the crate does not build. mem-db-infer passes th
 | `hir/src/source_analyzer.rs:459`, `:1888`, `:2093` | IDE, outside queries | a task each (22) |
 | `hir-ty-borrowck/src/regions.rs:4312`, `:4676` | borrowck's query | its run's frame (22) |
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 24. R1 entry points of these files called outside queries
 
 | entry point | callers | frame |
@@ -2351,6 +2513,8 @@ as the signature it follows, or the crate does not build. mem-db-infer passes th
 | `ElidedLifetimes::regions_into` | borrowck and wfcheck queries | the caller's list (11) |
 | `TyLoweringContext::new` (pub) | hir's source analyzer | the caller's task (22) |
 | `dyn_compatibility`, `dyn_compatibility_with_callback`, `builtin_derive::param_env`, `effects::non_const_calls`, `effects::const_call_error`, `effects::const_param_env` | hir, IDE, the interner | none: they make no temporaries of their own after 20 and 21 |
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 25. Tags
 
@@ -2373,6 +2537,8 @@ as the signature it follows, or the crate does not build. mem-db-infer passes th
 
 For one with more options, the tag goes last:
 `#[salsa::tracked(returns(ref), cycle_result = X, mem_tag = crate::db::INFER_TAG)]`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 26. What stays, and why
 
@@ -2405,6 +2571,8 @@ Every remaining `.clone()`, `Vec::new()`, `vec![`, `.collect()`, `.to_vec()`, `B
 | `effects.rs` `builtin_derive_const_conditions`' `Vec::new()`/`collect` | the interner interface's owned value (mem-db-solver to change, 21) |
 | `effects.rs` `const_call_error`'s `unsatisfied` `collect` | the returned error's list, owned, an error path |
 | `effects.rs` `non_const_calls`' `Vec::new()`s and `found` | the returned list, owned |
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 27. Speed
 
@@ -2448,3 +2616,5 @@ other byte of lowering is interned or in the frame. Lowering a path costs 50 to 
 resolution, `generics`, interning `GenericArgs`). The 2 ns of frame per temporary leaves the
 allocator under 2% of lowering, against about 10% for a lowering that allocated each temporary
 globally.
+
+> forwarded to db (from requests, pass 16; told by tmux).

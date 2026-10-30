@@ -8,7 +8,7 @@
 //! CI host covers. Compiling for every target the IR builder makes code for, and the
 //! interpreter's side, run everywhere.
 
-mod host;
+pub(crate) mod host;
 mod interp;
 mod rng;
 

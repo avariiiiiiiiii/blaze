@@ -79,8 +79,35 @@ the same split `trace::os_bytes` and `os_in` already make. The two usercode zero
   docs/v2/plan/lanes/usercode/speed-of-light.md) plus the bytes it prints. The three
   allocations it made per read cost more than lexing a 200-byte script; warm, it now makes none.
 
+## Per crate group
+
+- **Codegen units** (`hir-ty-codegen`, `blaze-codegen`): the backend opens one frame per unit
+  in its worker job loops (`units.rs:365`, `mod.rs:6434`). `FunctionCx`'s maps and lists and
+  the other per-unit tables live in it, through a new `frame_map.rs` (`FrameHashMap`,
+  `FrameHashSet`, `FrameMap<Idx, V>`, with hashbrown's `nightly` feature). Only maps that are
+  never iterated move into the frame, so output order is unchanged. Relocation and line rows
+  are reused per worker beside the Cranelift contexts, which `spare.rs` already reuses with
+  `ctx.clear()`. Kept outputs are written once at their exact size. Cranelift's IR, its
+  `MachBuffer` and postcard's `to_allocvec` take only global `Vec`s, so they stay on the heap,
+  each named.
+- **MIR** (`hir-ty-mir`): one frame per lowering, per pass of `run_passes` and `optimize`, per
+  `monomorphized` and per `frame_storage_conflicts`. The per-body `Ctx` gains its frame
+  lifetime. The memoized body stays the query's owned result, copied once at its exact size
+  (`MirLowerCtx::finish`). Warm passes are budgeted at 0.
+- **The engine** (`blaze-engine`): no frame per unit. It gets per-build memo tables on
+  `Column` plus `swiss::Index`, so a warm unit's questions to the resolver are borrowed
+  answers. Per-build lists go in a request `Arena`, and the no-op rebuild's walk and the
+  unwatched-file query use lent buffers.
+- **Stencils** (`blaze-stencil`): each compile's buffer, plan and side tables are frame values
+  (`Buf<'f>`, `Plan<'f>`, `Side<'f>`). The output is lent as a `CodeRef<'_>` and copied once
+  into a `Code` the caller reuses, so a warm compile into a reused `Code` allocates nothing.
+  The other fastcompile crates move their request temporaries onto frames: `blaze-global`
+  (`Tag::Store`), `blaze-intent` (`Tag::Api`) and `blaze-premap` (`Tag::Link`).
+  `blaze-history` already allocated nothing.
+- **Usercode**: the check of a kept run, elision and the rerun check, described above.
+
 ## State
 
-Written: the usercode requests (`v2/requests/mem-codegen.md`, 1 to 5). The children write the
-codegen, MIR, engine and stencil requests; this table and the budget table are updated as each
-of them finishes.
+Every request is written (`v2/requests/mem-codegen.md` and its four children's files), and each
+owner has been told. Nothing is applied yet: the owners apply the requests, or the coordinator
+does once the owners' lanes are done.

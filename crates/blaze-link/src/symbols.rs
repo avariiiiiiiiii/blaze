@@ -18,7 +18,7 @@ use std::hash::Hasher as _;
 
 use blaze_codegen::InstanceKey;
 use blaze_format::SpanRef;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, radix};
 use blaze_items::ItemKey;
 use blaze_mem::MemError;
 use rayon::prelude::*;
@@ -107,6 +107,10 @@ pub(crate) enum SymKey {
     /// The live descriptor, and the path of the directory it names.
     Descriptor,
     LiveDir,
+    /// A function's own SanitizerCoverage array, by the function's instance key and the
+    /// array's index ([`blaze_codegen::Target::Coverage`]), and its PC table's entries.
+    Coverage(IdNo, u32),
+    CoveragePcs(IdNo),
 }
 
 const _: () = assert!(size_of::<SymKey>() == 20);
@@ -141,6 +145,8 @@ impl SymKey {
             Stubs => [20, 0, 0, 0, 0],
             Descriptor => [21, 0, 0, 0, 0],
             LiveDir => [22, 0, 0, 0, 0],
+            Coverage(a, b) => [23, a.0, b, 0, 0],
+            CoveragePcs(a) => [24, a.0, 0, 0, 0],
         }
     }
 }
@@ -156,6 +162,8 @@ pub(crate) enum Wide<'a> {
     Data(&'a ContentId),
     Static(&'a ItemKey, &'a ContentId),
     Position(&'a SpanRef),
+    /// [`SymKey::Coverage`]: the function the array is of, and the array.
+    Coverage(&'a InstanceKey, u32),
 }
 
 const K0: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -206,7 +214,7 @@ fn split(it: u32) -> (usize, usize) {
     ((it >> SHIFT) as usize, (it & LOCAL) as usize)
 }
 
-/// Interns a batch: each key hashed once, partitioned by shard (a stable counting sort, so
+/// Interns a batch: each key hashed once, partitioned by shard (a stable radix sort by shard, so
 /// each shard's keys keep the batch's order), each shard's keys interned by one task. Appends
 /// `wrap` of the joined (shard, index) of each key to `out`. Below [`PARALLEL`] keys nothing is
 /// allocated but `out`'s growth; above, two buffers of a pair per key.
@@ -227,25 +235,13 @@ where
     }
     let mut hashed: Vec<(u32, u64)> = Vec::with_capacity(keys.len());
     keys.par_iter().enumerate().map(|(at, key)| (at as u32, hash(*key))).collect_into_vec(&mut hashed);
-    let mut starts = [0usize; SHARDS + 1];
-    for (_, hash) in &hashed {
-        starts[shard_of(*hash) + 1] += 1;
-    }
-    for shard in 0..SHARDS {
-        starts[shard + 1] += starts[shard];
-    }
-    let mut sorted: Vec<(u32, u64)> = Vec::with_capacity(hashed.len());
-    sorted.resize(hashed.len(), (0, 0));
-    let mut next = starts;
-    for item in &hashed {
-        let shard = shard_of(item.1);
-        sorted[next[shard]] = *item;
-        next[shard] += 1;
-    }
+    // Stable, so each shard's keys keep the batch's order; one 8-bit pass.
+    radix::sort_copy_by_key(&mut hashed, |it| shard_of(it.1) as u8);
     let mut parts: SmallVec<[&mut [(u32, u64)]; SHARDS]> = SmallVec::new();
-    let mut rest = sorted.as_mut_slice();
+    let mut rest = hashed.as_mut_slice();
     for shard in 0..SHARDS {
-        let (part, tail) = std::mem::take(&mut rest).split_at_mut(starts[shard + 1] - starts[shard]);
+        let len = rest.partition_point(|it| shard_of(it.1) == shard);
+        let (part, tail) = std::mem::take(&mut rest).split_at_mut(len);
         parts.push(part);
         rest = tail;
     }
@@ -256,7 +252,7 @@ where
     });
     let base = out.len();
     out.resize(base + keys.len(), wrap(0));
-    for (at, it) in &sorted {
+    for (at, it) in &hashed {
         out[base + *at as usize] = wrap(*it as u32);
     }
 }
@@ -373,7 +369,7 @@ impl Symbols {
             match *key {
                 Wide::Key(_) => {}
                 Wide::Name(name) => names.push(name),
-                Wide::Body(it) | Wide::Slot(it) => ids.push(&it.0),
+                Wide::Body(it) | Wide::Slot(it) | Wide::Coverage(it, _) => ids.push(&it.0),
                 Wide::Data(it) => ids.push(it),
                 Wide::Static(item, instance) => {
                     ids.push(&item.0);
@@ -398,6 +394,7 @@ impl Symbols {
                 SymKey::Static(item, next())
             }
             Wide::Position(span) => SymKey::Position(next(), span.index),
+            Wide::Coverage(_, array) => SymKey::Coverage(next(), array),
         }));
         self.intern_all(&compact)
     }
@@ -464,13 +461,14 @@ impl Symbols {
             | (Data(x), Data(y))
             | (Cie(x), Cie(y))
             | (Fde(x), Fde(y))
-            | (WinInfo(x), WinInfo(y)) => id(x, y),
+            | (WinInfo(x), WinInfo(y))
+            | (CoveragePcs(x), CoveragePcs(y)) => id(x, y),
             (Static(x, i), Static(y, j)) | (Tlv(x, i), Tlv(y, j)) => id(x, y).then_with(|| id(i, j)),
             (Name(x), Name(y)) | (FileName(x), FileName(y)) | (IatEnd(x), IatEnd(y)) | (Common(x), Common(y)) => {
                 name(x, y)
             }
             (Local(x, i), Local(y, j)) | (Section(x, i), Section(y, j)) => obj(x, y).then(i.cmp(&j)),
-            (Position(x, i), Position(y, j)) => id(x, y).then(i.cmp(&j)),
+            (Position(x, i), Position(y, j)) | (Coverage(x, i), Coverage(y, j)) => id(x, y).then(i.cmp(&j)),
             (Frame(x, s, i), Frame(y, t, j)) => obj(x, y).then(s.cmp(&t)).then(i.cmp(&j)),
             (Got(k, x), Got(l, y)) => k.cmp(&l).then_with(|| self.cmp(x, y)),
             (Plt(x), Plt(y)) => self.cmp(x, y),
@@ -487,6 +485,10 @@ impl Symbols {
             SymKey::Static(item, instance) => write!(out, "the static {:?} ({:?})", self.item(item), self.content(instance)),
             SymKey::Name(name) => write!(out, "`{}`", self.str(name)),
             SymKey::Data(id) => write!(out, "the data {:?}", self.content(id)),
+            SymKey::Coverage(key, array) => {
+                write!(out, "SanitizerCoverage array {array} of the function {:?}", self.instance(key))
+            }
+            SymKey::CoveragePcs(key) => write!(out, "the SanitizerCoverage PC table of the function {:?}", self.instance(key)),
             key => self.write_debug(key, &mut out),
         };
         out
@@ -548,6 +550,8 @@ impl Symbols {
             SymKey::Stubs => write!(out, "Stubs"),
             SymKey::Descriptor => write!(out, "Descriptor"),
             SymKey::LiveDir => write!(out, "LiveDir"),
+            SymKey::Coverage(it, array) => write!(out, "Coverage({:?}, {array})", self.instance(it)),
+            SymKey::CoveragePcs(it) => write!(out, "CoveragePcs({:?})", self.instance(it)),
         }
     }
 
@@ -565,9 +569,13 @@ impl Symbols {
         };
         let word = |out: &mut Vec<u8>, it: u32| out.extend_from_slice(&it.to_le_bytes());
         match key {
-            SymKey::Body(a) | SymKey::Slot(a) | SymKey::Data(a) | SymKey::Cie(a) | SymKey::Fde(a) | SymKey::WinInfo(a) => {
-                id(out, a)
-            }
+            SymKey::Body(a)
+            | SymKey::Slot(a)
+            | SymKey::Data(a)
+            | SymKey::Cie(a)
+            | SymKey::Fde(a)
+            | SymKey::WinInfo(a)
+            | SymKey::CoveragePcs(a) => id(out, a),
             SymKey::Static(a, b) | SymKey::Tlv(a, b) => {
                 id(out, a);
                 id(out, b);
@@ -578,7 +586,7 @@ impl Symbols {
                 word(out, o.member);
                 word(out, a);
             }
-            SymKey::Position(a, index) => {
+            SymKey::Position(a, index) | SymKey::Coverage(a, index) => {
                 id(out, a);
                 word(out, index);
             }

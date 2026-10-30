@@ -25,12 +25,13 @@ use syntax::AstNode as _;
 use super::inhabited::{Pred, Preds};
 use crate::{
     cx::def_range,
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
 
-pub(super) struct InvalidValue;
+#[derive(Default)]
+pub(crate) struct InvalidValue;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Init {
@@ -61,13 +62,8 @@ impl InitError {
 }
 
 impl LatePass for InvalidValue {
-    fn name(&self) -> &'static str {
-        "InvalidValue"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["invalid_value"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call, ExprTag::MethodCall]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some(init) = dangerous_init(b, expr) else { return };

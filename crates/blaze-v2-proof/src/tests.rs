@@ -96,7 +96,7 @@ fn only_what_the_roots_reach_is_compared() {
     assert_eq!(under(&incremental, &scratch, &[key(5)]).len(), 1);
     let reached = scratch.reachable(&[key(3)]);
     let names: Vec<QueryKey> =
-        (0..scratch.keys.len() as u32).filter(|&i| reached.get(i)).map(|i| scratch.keys[i as usize]).collect();
+        (0..scratch.keys.len() as u32).filter(|&i| reached.contains(i)).map(|i| scratch.keys[i as usize]).collect();
     let mut want = vec![key(1), key(2), key(3)];
     want.sort();
     assert_eq!(names, want);
@@ -261,23 +261,11 @@ fn the_builder_keeps_the_last_insert_and_names_every_read() {
     assert_eq!(trace.results(), 1);
     let two = trace.index(&key(2)).unwrap();
     assert_eq!(trace.result(two), Some(Fingerprint(21)));
-    assert!(!trace.ran.get(two));
+    assert!(!trace.ran.contains(two));
     let read: Vec<(QueryKey, Fingerprint)> = trace.edges(two).map(|(r, s)| (trace.keys[r as usize], s)).collect();
     assert_eq!(read, vec![(key(1), Fingerprint(11)), (key(3), Fingerprint(30))]);
     assert_eq!(trace.result(trace.index(&key(1)).unwrap()), None);
     assert_eq!(trace.edges_from.len(), trace.keys.len() + 1);
-}
-
-#[test]
-fn bits_cross_word_boundaries() {
-    let mut bits = Bits::with_len(130);
-    for i in [0, 63, 64, 129] {
-        bits.set(i);
-    }
-    assert_eq!(bits.0.len(), 3);
-    assert!([0, 63, 64, 129].iter().all(|&i| bits.get(i)));
-    assert!(!bits.get(1) && !bits.get(65) && !bits.get(128));
-    assert_eq!(bits.count(), 4);
 }
 
 fn le_bytes(column: &[u32]) -> Vec<u8> {
@@ -342,10 +330,10 @@ fn a_frame_of_reference_packing_reads_in_place() {
 mod model {
     use std::collections::BTreeMap;
 
-    use blaze_ids::Fingerprint;
+    use blaze_ids::{Fingerprint, bits::BitSet};
     use blaze_query::{Edge, QueryKey};
 
-    use crate::{Apart, Bits, Stale, Trace, Work};
+    use crate::{Apart, Stale, Trace, Work};
 
     pub fn finish(rows: &[(QueryKey, Fingerprint, Vec<Edge>, bool)]) -> Trace {
         let mut results: BTreeMap<QueryKey, (Fingerprint, bool, &[Edge])> = BTreeMap::new();
@@ -360,17 +348,17 @@ mod model {
         keys.dedup();
         let n = keys.len();
         let mut trace = Trace {
-            has: Bits::with_len(n),
-            ran: Bits::with_len(n),
+            has: BitSet::new(n),
+            ran: BitSet::new(n),
             fingerprints: vec![Fingerprint(0); n],
             edges_from: vec![0],
             ..Trace::default()
         };
         for (i, key) in keys.iter().enumerate() {
             if let Some(&(fingerprint, ran, edges)) = results.get(key) {
-                trace.has.set(i as u32);
+                trace.has.insert(i as u32);
                 if ran {
-                    trace.ran.set(i as u32);
+                    trace.ran.insert(i as u32);
                 }
                 trace.fingerprints[i] = fingerprint;
                 for edge in edges {
@@ -394,13 +382,13 @@ mod model {
         let reached = scratch.reachable(roots);
         let mut stale = Vec::new();
         for i in 0..scratch.keys.len() as u32 {
-            let Some(theirs) = scratch.result(i).filter(|_| reached.get(i)) else { continue };
+            let Some(theirs) = scratch.result(i).filter(|_| reached.contains(i)) else { continue };
             let query = scratch.keys[i as usize];
             let Some((j, ours)) = incremental.index(&query).and_then(|j| Some((j, incremental.result(j)?))) else {
                 stale.push(Stale::Absent { query });
                 continue;
             };
-            if !incremental.ran.get(j)
+            if !incremental.ran.contains(j)
                 && let Some((read, saw)) = incremental.edges(j).find(|&(read, saw)| incremental.result(read) != Some(saw))
             {
                 let now = incremental.result(read);
@@ -424,7 +412,7 @@ mod model {
         let mut work = Work::default();
         let mut needless = Vec::new();
         for i in 0..after.keys.len() as u32 {
-            let Some(now) = after.result(i).filter(|_| after.ran.get(i)) else { continue };
+            let Some(now) = after.result(i).filter(|_| after.ran.contains(i)) else { continue };
             work.ran += 1;
             let key = after.keys[i as usize];
             match before.index(&key).and_then(|j| Some((j, before.result(j)?))) {

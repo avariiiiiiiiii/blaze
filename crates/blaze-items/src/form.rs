@@ -20,7 +20,11 @@ use std::{
 };
 
 use base_db::{Db, Crate};
-use blaze_ids::{ContentId, radix};
+use blaze_ids::{
+    ContentId,
+    bits::{self, Bits},
+    radix,
+};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     AdtId, AssocItemId, AttrDefId, CallableDefId, DefWithBodyId, ExpressionStoreOwnerId, FieldId,
@@ -71,6 +75,7 @@ use rustc_type_ir::{
     PatternKind, RegionKind, TermKind, ValTreeKind,
     inherent::{GenericArgs as _, IntoKind},
 };
+use smallvec::SmallVec;
 use syntax::{
     AstNode,
     ast::{self, HasVisibility},
@@ -592,13 +597,16 @@ impl<'db> Cx<'db> {
             f.len(1);
             return self.nest(f, first);
         };
+        // alloc: a set of two forms or more; spelling nests as types do, deeper than frames.
         let forms: Vec<Form> = [first, second].into_iter().chain(forms).collect();
+        // alloc: as above.
         let digests: Vec<&[u8]> = forms.iter().map(|it| it.digest.as_slice()).collect();
         let digests = ContentId::of_many(DOMAIN, &digests);
         let positioned: Vec<&[u8]> = forms
             .iter()
             .filter(|it| !it.spans.is_empty())
             .map(|it| it.spans.as_slice())
+            // alloc: as above.
             .collect();
         let mut positioned = ContentId::of_many(SPANS_DOMAIN, &positioned).into_iter();
         let mut finished: Vec<(ContentId, ContentId, &Form)> = forms
@@ -612,6 +620,7 @@ impl<'db> Cx<'db> {
                 };
                 (digest, spans, form)
             })
+            // alloc: as above.
             .collect();
         let db = self.db;
         finished.sort_by(|a, b| {
@@ -956,8 +965,8 @@ impl<'db> Cx<'db> {
                 self.trait_ref(f, trait_ref);
                 // Each item of the trait, in its order, with what implements it here.
                 let trait_items = &trait_ref.def_id.0.trait_items(db).items;
-                // The impl items used, as a bit each; past 64 of them, a set.
-                let (mut used, mut used_past) = (0u64, FxHashSet::default());
+                // The impl items used, a bit each, inline up to 64 of them.
+                let mut used: Bits<SmallVec<[u64; 1]>> = Bits::new(items.len());
                 f.len(trait_items.len());
                 for (name, of_trait) in trait_items.iter() {
                     f.item((*of_trait).into());
@@ -966,18 +975,14 @@ impl<'db> Cx<'db> {
                     });
                     match found {
                         Some(at) => {
-                            if at < 64 {
-                                used |= 1 << at;
-                            } else {
-                                used_past.insert(at);
-                            }
+                            used.insert(at);
                             f.u8(1);
                             f.item(items[at].1.into());
                         }
                         None => f.u8(0),
                     }
                 }
-                if used.count_ones() as usize + used_past.len() != items.len() {
+                if used.count() != items.len() {
                     f.error(Missed::ImplItemNotInTrait);
                 }
             }
@@ -1887,6 +1892,7 @@ impl<'db> Cx<'db> {
     /// The key and path of every nominal type in `args`: what `type_name` prints of them and
     /// what `type_id` hashes.
     fn names(&self, f: &mut Form, args: GenericArgs<'db>) {
+        // alloc: spelling nests as types do, deeper than frames; most args name few types.
         let mut found = Vec::new();
         for arg in args.iter() {
             for inner in arg.walk() {
@@ -1899,6 +1905,7 @@ impl<'db> Cx<'db> {
     }
 
     fn names_of_ty(&self, f: &mut Form, ty: Ty<'db>) {
+        // alloc: as in `names`.
         let mut found = Vec::new();
         for inner in ty.walk() {
             if let Some(ty) = inner.ty() {
@@ -2343,6 +2350,7 @@ impl<'db> Cx<'db> {
             }
             MemoryMap::Complex(map) => {
                 f.u8(2);
+                // alloc: a complex constant's pieces, sorted to spell; spelling nests as types do.
                 let mut pieces: Vec<_> = map.memory.iter().collect();
                 radix::sort_copy_by_key(&mut pieces, |it| *it.0);
                 f.len(pieces.len());
@@ -2850,7 +2858,8 @@ struct CanonBuffers {
     /// `(place of the block, statement, cleanup block)` of each statement that unwinds,
     /// sorted: the walk reads it in order with a cursor.
     unwinds: Vec<(u32, usize, BasicBlockId)>,
-    /// A bit for each local the first walk found used.
+    /// A bit for each local the first walk found used, in cells rather than a
+    /// `blaze_ids::bits::BitSet`: the walk marks them through `&self`.
     uses: Vec<Cell<u64>>,
     /// Each local's number in the order the second walk meets it, [`UNNUMBERED`] before.
     numbers: Vec<Cell<u32>>,
@@ -2897,7 +2906,7 @@ impl<'b, 'db> Canon<'b, 'db> {
         radix::sort_copy_by_key(&mut c.unwinds, |&(number, at, _)| {
             radix::pack_64(u64::from(number), at as u64)
         });
-        c.uses.resize_with(body.locals.len().div_ceil(64), || Cell::new(0));
+        c.uses.resize_with(bits::words_for(body.locals.len()), || Cell::new(0));
         c.numbers.resize_with(body.locals.len(), || Cell::new(UNNUMBERED));
         Canon {
             body,
@@ -2933,14 +2942,14 @@ impl<'b, 'db> Canon<'b, 'db> {
     }
 
     fn used(&self, local: LocalId) -> bool {
-        let at = local_index(local);
-        (self.c.uses[at / 64].get() >> (at % 64)) & 1 == 1
+        let (word, mask) = bits::locate(local_index(local));
+        self.c.uses[word].get() & mask != 0
     }
 
     fn mark_used(&self, local: LocalId) {
-        let at = local_index(local);
-        let word = &self.c.uses[at / 64];
-        word.set(word.get() | 1 << (at % 64));
+        let (word, mask) = bits::locate(local_index(local));
+        let word = &self.c.uses[word];
+        word.set(word.get() | mask);
     }
 
     /// The local's number, and whether the walk meets it here first.

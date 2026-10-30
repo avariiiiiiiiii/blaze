@@ -13,8 +13,13 @@
 //! [`Frames::pop_view`]); [`Frame`] is the owned form.
 //!
 //! - The server, once connected and before any test runs: [`Frame::Hello`] (kind 1) with
-//!   [`VERSION`], its process id and the name of every test of the binary in order; a test is
-//!   named by its index in this list from then on.
+//!   [`VERSION`], its process id, how long one fork of it took (nanoseconds, measured before the
+//!   hello) and the name of every test of the binary in order; a test is named by its index in
+//!   this list from then on.
+//! - blaze, only as its first frame to the server: [`Frame::Replicate`] (kind 132), make `count`
+//!   copies of yourself. Each copy is a server of its own: it connects anew on the same socket,
+//!   says its own hello (the same tests) and runs what blaze sends it there, so a binary's forks
+//!   run `count + 1` at a time. The server that was asked goes on as it was.
 //! - blaze: [`Frame::Run`] (kind 129), the test at an index under an id of blaze's choosing.
 //!   The server forks a child that marks its scope (`access(MARK + name)`), runs the one test
 //!   as libtest would, with its output (standard output and error, together) going to the
@@ -42,7 +47,7 @@ pub const SOCKET: &str = "__BLAZE_FORK_SERVER";
 pub const MARK: &str = "/.blaze-test/";
 
 /// The protocol's version, said by [`Frame::Hello`].
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// The most bytes a frame's body may have.
 pub const LONGEST: u32 = 64 << 20;
@@ -66,6 +71,7 @@ const ENDED: u8 = 2;
 const RUN: u8 = 129;
 const KILL: u8 = 130;
 const QUIT: u8 = 131;
+const REPLICATE: u8 = 132;
 
 const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const HIGH: u64 = 0x8080_8080_8080_8080;
@@ -257,22 +263,25 @@ fn push_set(hits: &mut Vec<u8>, n: usize, value: u64) {
 /// A frame. [`View`] is the same read in place.
 #[derive(PartialEq, Eq, Debug)]
 pub enum Frame {
-    Hello { version: u32, pid: u32, tests: Vec<String> },
+    /// `fork` is how long one fork of the server took, in nanoseconds.
+    Hello { version: u32, pid: u32, fork: u64, tests: Vec<String> },
     Ended { id: u64, end: End, output: Vec<u8>, executed: Executed },
     Run { id: u64, index: u32 },
     Kill { id: u64 },
     Quit,
+    Replicate { count: u32 },
 }
 
 /// A frame read in place from the bytes it came in: every length checked against them, every
 /// string checked UTF-8, nothing copied.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View<'a> {
-    Hello { version: u32, pid: u32, tests: Names<'a> },
+    Hello { version: u32, pid: u32, fork: u64, tests: Names<'a> },
     Ended { id: u64, end: EndView<'a>, output: &'a [u8], executed: ExecView<'a> },
     Run { id: u64, index: u32 },
     Kill { id: u64 },
     Quit,
+    Replicate { count: u32 },
 }
 
 /// The names of a hello, read in place: `count` strings, each checked when the frame was read.
@@ -297,6 +306,8 @@ impl<'a> Names<'a> {
     }
 }
 
+// These writers and `Cursor` are not `blaze_format::cursor`'s: this file is also the text of
+// every test binary's harness, which links nothing of blaze.
 fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -308,6 +319,32 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     put_u32(out, bytes.len() as u32);
     out.extend_from_slice(bytes);
+}
+
+/// [`Frame::Hello`] of these parts, with its length, added to `out`: the bytes
+/// [`Frame::encode`] adds for it, from borrowed names, so a server says hello straight from its
+/// tests' names, with no list of its own.
+pub fn encode_hello<'a>(out: &mut Vec<u8>, version: u32, pid: u32, fork: u64, tests: impl Iterator<Item = &'a str>) {
+    let start = out.len();
+    put_u32(out, 0);
+    put_hello(out, version, pid, fork, tests);
+    let len = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&len.to_le_bytes());
+}
+
+fn put_hello<'a>(out: &mut Vec<u8>, version: u32, pid: u32, fork: u64, tests: impl Iterator<Item = &'a str>) {
+    out.push(HELLO);
+    put_u32(out, version);
+    put_u32(out, pid);
+    put_u64(out, fork);
+    let count = out.len();
+    put_u32(out, 0);
+    let mut names = 0u32;
+    for name in tests {
+        put_bytes(out, name.as_bytes());
+        names += 1;
+    }
+    out[count..count + 4].copy_from_slice(&names.to_le_bytes());
 }
 
 /// [`Frame::Ended`] of these parts, with its length, added to `out`: the bytes
@@ -387,15 +424,7 @@ impl Frame {
         let start = out.len();
         put_u32(out, 0);
         match self {
-            Frame::Hello { version, pid, tests } => {
-                out.push(HELLO);
-                put_u32(out, *version);
-                put_u32(out, *pid);
-                put_u32(out, tests.len() as u32);
-                for name in tests {
-                    put_bytes(out, name.as_bytes());
-                }
-            }
+            Frame::Hello { version, pid, fork, tests } => put_hello(out, *version, *pid, *fork, tests.iter().map(String::as_str)),
             Frame::Ended { id, end, output, executed } => {
                 out.push(ENDED);
                 put_u64(out, *id);
@@ -426,6 +455,10 @@ impl Frame {
                 put_u64(out, *id);
             }
             Frame::Quit => out.push(QUIT),
+            Frame::Replicate { count } => {
+                out.push(REPLICATE);
+                put_u32(out, *count);
+            }
         }
         let len = (out.len() - start - 4) as u32;
         out[start..start + 4].copy_from_slice(&len.to_le_bytes());
@@ -451,12 +484,13 @@ impl<'a> View<'a> {
             HELLO => {
                 let version = at.u32()?;
                 let pid = at.u32()?;
+                let fork = at.u64()?;
                 let count = at.u32()?;
                 let from = at.at;
                 for _ in 0..count {
                     at.string()?;
                 }
-                View::Hello { version, pid, tests: Names { count, bytes: &body[from..at.at] } }
+                View::Hello { version, pid, fork, tests: Names { count, bytes: &body[from..at.at] } }
             }
             ENDED => {
                 let id = at.u64()?;
@@ -496,6 +530,7 @@ impl<'a> View<'a> {
             }
             KILL => View::Kill { id: at.u64()? },
             QUIT => View::Quit,
+            REPLICATE => View::Replicate { count: at.u32()? },
             other => return Err(format!("no frame is of kind {}", other)), // alloc: error path
         };
         match at.at == body.len() {
@@ -506,10 +541,10 @@ impl<'a> View<'a> {
 
     pub fn to_frame(self) -> Frame {
         match self {
-            View::Hello { version, pid, tests } => {
+            View::Hello { version, pid, fork, tests } => {
                 let mut names = Vec::with_capacity(tests.len());
                 names.extend(tests.iter().map(str::to_owned));
-                Frame::Hello { version, pid, tests: names }
+                Frame::Hello { version, pid, fork, tests: names }
             }
             View::Ended { id, end, output, executed } => {
                 Frame::Ended { id, end: end.to_end(), output: output.to_vec(), executed: executed.to_executed() } // alloc: the owned frame: what a result keeps
@@ -517,6 +552,7 @@ impl<'a> View<'a> {
             View::Run { id, index } => Frame::Run { id, index },
             View::Kill { id } => Frame::Kill { id },
             View::Quit => Frame::Quit,
+            View::Replicate { count } => Frame::Replicate { count },
         }
     }
 }

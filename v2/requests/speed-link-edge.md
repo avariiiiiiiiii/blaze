@@ -51,6 +51,8 @@ after:
         }
 ```
 
+> forwarded to speed-link-edge (from requests, pass 16; told by tmux).
+
 ## dedup: seeded RNG onto blaze_ids::rng
 
 From `dedup-codec-rng` (report `/tmp/blaze-lanes/v2-dedup-codec-rng.md`). `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src/rng.rs`) is the one seeded test RNG: `new`, `next_u64`, `below` (`% n`, 0 for 0), `index`, `one_in`, `shuffle`, `fill`, and more. Each local copy below gives the same stream; please delete it and use the shared one.
@@ -62,3 +64,7 @@ pub use blaze_ids::rng::SplitMix64 as Rng;
 ```
 
 Every user (`bench.rs`, `wire.rs`, `columns.rs`, `bytes.rs`, `tests.rs`, `crates/blaze-format/src/tiers/tests.rs`) calls only `Rng::new`, `next_u64` and `below`, which keep their names. Two differences: `below` is `next_u64() % n` instead of Lemire's multiply-high (no test pins a drawn value: `rng_is_the_same_from_one_seed_and_stays_below` checks `next_u64` from 0, which is unchanged, and bounds), and `below(0)` returns 0 instead of panicking (`sample` never passes 0).
+
+> forwarded to speed-link-edge (from requests, pass 16; told by tmux).
+
+> applied by dedup-codec-rng at 20:59, after speed-link-edge-sol-proof said it had stopped editing the crate. This also covers its new users in `bench.rs`, `join.rs` tests, `wire.rs` tests and `bytes.rs` tests, which call only `new`, `next_u64` and `below(u64)`.

@@ -72,3 +72,18 @@ impl LitKind {
      `proptest` is already a root workspace dependency.
 
 > forwarded to frontend-tokens (`crates/tt/` is held by it, still running; told).
+> done by frontend-tokens: items 1-3 as written (`LitKind::code`/`from_code` in `lib.rs`, `Node::literal`/`lit_kind` in `storage.rs` on them, `proptest.workspace = true` in tt's dev-dependencies); tests `a_literal_kind_round_trips_through_its_code` and the proptest `literal_codes_are_the_old_ones` in `storage/tests.rs`. manifest_lint clean. Nothing built.
+
+## dedup: seeded RNG onto blaze_ids::rng
+
+From `dedup-codec-rng-front` (report `/tmp/blaze-lanes/v2-dedup-codec-rng-front.md`). Every seeded test RNG in the front-end crates moves onto `blaze_ids::rng::SplitMix64` (`new`, `next_u64`, `next_u32`, `below(u64)` = `% n` and 0 for 0, `index(usize)`, `one_in`, `coin`, `pick`, `fill`); no test here pins a stream's values, only thresholds, so the local copy goes.
+
+`crates/syntax-bridge/src/tests.rs` and `crates/mbe/src/differential.rs` are already moved onto `blaze_ids::rng::SplitMix64`, so both crates need the dev-dependency to build their tests:
+
+- `crates/syntax-bridge/Cargo.toml`: add `blaze-ids.workspace = true` under `[dev-dependencies]` (in sorted place).
+- `crates/mbe/Cargo.toml`: add `blaze-ids.workspace = true` under `[dev-dependencies]` (in sorted place).
+
+Then run `PYTHONPATH=python/typed-input/src python3 tools/v2/manifest_lint.py '{"root": "."}'`.
+
+> forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+> done by frontend-tokens: `blaze-ids.workspace = true` under `[dev-dependencies]` in syntax-bridge's and mbe's Cargo.toml; manifest_lint clean.

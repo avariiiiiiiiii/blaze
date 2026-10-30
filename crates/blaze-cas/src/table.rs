@@ -31,6 +31,7 @@ use std::{
     ptr::{self, NonNull},
 };
 
+use blaze_ids::bits::AtomicBitSlice;
 use blaze_mem::{MemError, Region, RegionVec, Tag};
 use blaze_reclaim::{Grace, Guard};
 
@@ -468,8 +469,14 @@ impl<T: Keyed> Table<T> {
         self.made().map(|(_, level)| level.used.load(Ordering::Relaxed)).sum()
     }
 
-    /// The word and bit of `column` for `row`; `None` past the rows made.
-    fn word(&self, row: u64, column: usize) -> Option<(&AtomicU64, u64)> {
+    /// Column `column` of level `level`'s flags: it is made.
+    fn flag_column(&self, level: usize, column: usize) -> AtomicBitSlice<'_> {
+        let words = self.cap(level) / 64;
+        AtomicBitSlice::from_words(&self.bits_of(level)[column * words..(column + 1) * words])
+    }
+
+    /// `column` of `row`'s level and the row's bit in it; `None` past the rows made.
+    fn flag_bit(&self, row: u64, column: usize) -> Option<(AtomicBitSlice<'_>, usize)> {
         debug_assert!(column < self.columns);
         let (mut number, mut at) = (0, row);
         while at >= self.cap(number) as u64 {
@@ -480,20 +487,17 @@ impl<T: Keyed> Table<T> {
             }
         }
         self.levels[number].get()?;
-        let words = self.cap(number) / 64;
-        Some((&self.bits_of(number)[column * words + (at / 64) as usize], 1 << (at % 64)))
+        Some((self.flag_column(number, column), at as usize))
     }
 
     pub(crate) fn flag(&self, row: u64, column: usize) -> bool {
-        self.word(row, column).is_some_and(|(word, bit)| word.load(Ordering::Relaxed) & bit != 0)
+        self.flag_bit(row, column).is_some_and(|(bits, at)| bits.contains(at, Ordering::Relaxed))
     }
 
     /// Sets a flag: a hint about bytes that never change at a place, so relaxed.
     pub(crate) fn set_flag(&self, row: u64, column: usize) {
-        if let Some((word, bit)) = self.word(row, column)
-            && word.load(Ordering::Relaxed) & bit == 0
-        {
-            word.fetch_or(bit, Ordering::Relaxed);
+        if let Some((bits, at)) = self.flag_bit(row, column) {
+            bits.insert_if_clear(at, Ordering::Relaxed);
         }
     }
 
@@ -501,12 +505,7 @@ impl<T: Keyed> Table<T> {
     /// Only the store calls it; a flag set meanwhile lands in one period or the other.
     pub(crate) fn rotate(&self, from: usize, to: usize) {
         for (number, _) in self.made() {
-            let bits = self.bits_of(number);
-            let words = self.cap(number) / 64;
-            for at in 0..words {
-                let moved = bits[from * words + at].swap(0, Ordering::Relaxed);
-                bits[to * words + at].store(moved, Ordering::Relaxed);
-            }
+            self.flag_column(number, from).move_into(self.flag_column(number, to), Ordering::Relaxed);
         }
     }
 }

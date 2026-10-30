@@ -30,7 +30,7 @@ const COUNT: u32 = 8;
 
 /// Adds one to the counter cell `cell` bytes into the function's cells: the field is 5 bytes
 /// before the end of the instruction, which the addend takes back.
-fn count(cx: &mut Cx<'_, X64>, cell: i64) {
+fn count(cx: &mut Cx<'_, '_, X64>, cell: i64) {
     let field = asm::add_rip_one(cx.buf);
     cx.buf.reloc(field, cranelift_codegen::binemit::Reloc::X86PCRel4, Name::Counter, cell - 5);
 }
@@ -63,7 +63,7 @@ impl Glue for X64 {
         frame.prologue.max(inst::LANDING).max(COUNT).max(2)
     }
 
-    fn prologue(cx: &mut Cx<'_, X64>) -> Result<(), Error> {
+    fn prologue(cx: &mut Cx<'_, '_, X64>) -> Result<(), Error> {
         let start = cx.buf.len();
         let frame = *cx.frame;
         {
@@ -87,7 +87,7 @@ impl Glue for X64 {
         Ok(())
     }
 
-    fn inst(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
+    fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         let start = cx.buf.len();
         inst::inst(cx, inst)?;
         debug_assert!(
@@ -97,20 +97,20 @@ impl Glue for X64 {
         Ok(())
     }
 
-    fn landing(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
+    fn landing(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
         inst::landing(cx, inst)
     }
 
-    fn trap(cx: &mut Cx<'_, X64>, code: ir::TrapCode) {
+    fn trap(cx: &mut Cx<'_, '_, X64>, code: ir::TrapCode) {
         let _ = code;
         asm::ud2(cx.buf);
     }
 
-    fn count_back_edge(cx: &mut Cx<'_, X64>) {
+    fn count_back_edge(cx: &mut Cx<'_, '_, X64>) {
         count(cx, tier::BACK_EDGES);
     }
 
-    fn relay(cx: &mut Cx<'_, X64>, from: u32, to: u32, bytes: u8) {
+    fn relay(cx: &mut Cx<'_, '_, X64>, from: u32, to: u32, bytes: u8) {
         let _ = (cx, from, to, bytes);
         unreachable!(
             "a relay on x86-64, where every slot is a disp32 away (`NEAR`) and `frame` refuses \
@@ -118,17 +118,17 @@ impl Glue for X64 {
         );
     }
 
-    fn unwind(cx: &mut Cx<'_, X64>) -> Result<Option<code::Unwind>, Error> {
+    fn unwind(cx: &mut Cx<'_, '_, X64>) -> Result<Option<code::UnwindKind>, Error> {
         let len = cx.buf.len();
         if cx.frame.win_unwind {
-            let raw = frame::win_raw(cx.rows(), cx.frame.clobber)?;
-            let info = frame::with_saves(&raw)?;
-            return Ok(Some(code::Unwind::Windows { len, info }));
+            let mut raw = Vec::new_in(cx.temp());
+            frame::win_raw(cx.rows(), cx.frame.clobber, &mut raw)?;
+            frame::with_saves(&raw, cx.windows_info())?;
+            return Ok(Some(code::UnwindKind::Windows { len }));
         }
         // An epilogue at the very end leaves a row at `len`, past the code.
-        // alloc: once per function, the unwind information it hands back.
-        let rows = cx.rows().iter().filter(|row| row.0 < len).copied().collect();
-        Ok(Some(code::Unwind::Dwarf { len, rows }))
+        cx.retain_rows(|row| row.0 < len);
+        Ok(Some(code::UnwindKind::Dwarf { len }))
     }
 
     fn slot_base(frame: &Frame) -> (u16, i32) {

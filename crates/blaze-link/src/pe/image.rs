@@ -702,7 +702,7 @@ fn pdata(image: Image<'_>) -> Result<Vec<u8>, LinkError> {
 const RELOC_PIECE: usize = 1 << 16;
 
 fn page_of(addr: u64) -> u64 {
-    addr & !(PAGE - 1)
+    blaze_mem::align::align_down_u64(addr, PAGE)
 }
 
 /// The base relocations: a block per 4 KiB page, a `DIR64` entry per rebased address in it,
@@ -1164,5 +1164,5 @@ pub(super) fn file(pe: &Pe, placed: &Placed<'_>) -> Result<File, LinkError> {
         }
     }
     // alloc: once per link: the one part `File` holds, the headers
-    Ok(File { len, parts: vec![(0, out.0)] })
+    Ok(File { len, parts: vec![(0, out.0)], debug: Vec::new() })
 }

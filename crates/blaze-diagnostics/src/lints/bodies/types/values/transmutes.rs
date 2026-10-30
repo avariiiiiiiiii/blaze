@@ -12,12 +12,12 @@
 
 use blaze_items::{Fact, ItemId};
 use hir_def::{
-    DefWithBodyId, ItemContainerId, Lookup as _,
+    CallableDefId, DefWithBodyId, ItemContainerId, Lookup as _,
     hir::{Expr, ExprId, Literal},
     resolver::ValueNs,
     signatures::FunctionSignature,
 };
-use hir_ty::next_solver::{Ty, TyKind};
+use hir_ty::next_solver::{CallableIdWrapper, Ty, TyKind};
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     IntTy, UintTy,
@@ -25,21 +25,17 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
 
-pub(super) struct MutableTransmutes;
+#[derive(Default)]
+pub(crate) struct MutableTransmutes;
 
 impl LatePass for MutableTransmutes {
-    fn name(&self) -> &'static str {
-        "MutableTransmutes"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["mutable_transmutes"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Path]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some((from, to)) = transmute_types(b, expr) else { return };
@@ -61,7 +57,12 @@ impl LatePass for MutableTransmutes {
 /// names the intrinsic `transmute` (rustc's `qpath_res` of it is a `DefKind::Fn`).
 fn transmute_types<'db>(b: &BodyCx<'_, 'db>, path: ExprId) -> Option<(Ty<'db>, Ty<'db>)> {
     let Expr::Path(_) = b.store().expr(path) else { return None };
-    let TyKind::FnDef(_, args) = util::ty(b, path).kind() else { return None };
+    let TyKind::FnDef(CallableIdWrapper(callable), args) = util::ty(b, path).kind() else { return None };
+    // The path's type names the function it can resolve to: test that before resolving it.
+    let CallableDefId::FunctionId(named) = callable else { return None };
+    if !super::is_transmute(b.db(), named) {
+        return None;
+    }
     let ValueNs::FunctionId(def) = util::path_value(b, path)? else { return None };
     if !super::is_transmute(b.db(), def) {
         return None;
@@ -77,11 +78,14 @@ enum Inner {
 }
 
 /// The expressions of the body that are in a closure or an inline `const`, with the innermost
-/// one: rustc's `hir_enclosing_body_owner` of each when it is not the body's owner.
+/// one: rustc's `hir_enclosing_body_owner` of each when it is not the body's owner. Built by a
+/// walk of the body the first time a transmute in it is found, which most bodies never have.
 #[derive(Default)]
-pub(super) struct CheckTransmutes {
+pub(crate) struct CheckTransmutes {
     inner: FxHashMap<ExprId, Inner>,
     stack: Vec<(ExprId, Option<Inner>)>,
+    /// Whether `inner` is of the body being walked.
+    built: bool,
 }
 
 /// rustc's `hir_body_const_context` of the body an expression is in, and whether that body is
@@ -94,7 +98,30 @@ struct ConstContext {
 }
 
 impl CheckTransmutes {
-    fn context(&self, b: &BodyCx<'_, '_>, expr: ExprId) -> ConstContext {
+    fn build(&mut self, b: &BodyCx<'_, '_>) {
+        let store = b.store();
+        self.built = true;
+        self.inner.clear();
+        self.stack.clear();
+        self.stack.push((b.body.root_expr(), None));
+        while let Some((expr, inner)) = self.stack.pop() {
+            if let Some(inner) = inner {
+                self.inner.insert(expr, inner);
+            }
+            let children = match store.expr(expr) {
+                Expr::Closure { .. } => Some(Inner::Closure),
+                Expr::Const(_) => Some(Inner::Const),
+                _ => inner,
+            };
+            let stack = &mut self.stack;
+            store.walk_child_exprs(expr, |it| stack.push((it, children)));
+        }
+    }
+
+    fn context(&mut self, b: &BodyCx<'_, '_>, expr: ExprId) -> ConstContext {
+        if !self.built {
+            self.build(b);
+        }
         let db = b.db();
         match self.inner.get(&expr) {
             Some(Inner::Closure) => ConstContext { any: false, const_fn: false, assoc_const: false },
@@ -118,31 +145,13 @@ impl CheckTransmutes {
 }
 
 impl LatePass for CheckTransmutes {
-    fn name(&self) -> &'static str {
-        "CheckTransmutes"
-    }
+    const LINTS: LintSet =
+        lint_set(["ptr_to_integer_transmute_in_consts", "unnecessary_transmutes", "integer_to_ptr_transmutes"]);
+    const HOOKS: Hooks = Hooks::BODY;
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
 
-    fn hooks(&self) -> Hooks {
-        Hooks::BODY | Hooks::EXPR
-    }
-
-    fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
-        let store = b.store();
-        self.inner.clear();
-        self.stack.clear();
-        self.stack.push((b.body.root_expr(), None));
-        while let Some((expr, inner)) = self.stack.pop() {
-            if let Some(inner) = inner {
-                self.inner.insert(expr, inner);
-            }
-            let children = match store.expr(expr) {
-                Expr::Closure { .. } => Some(Inner::Closure),
-                Expr::Const(_) => Some(Inner::Const),
-                _ => inner,
-            };
-            let stack = &mut self.stack;
-            store.walk_child_exprs(expr, |it| stack.push((it, children)));
-        }
+    fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
+        self.built = false;
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {

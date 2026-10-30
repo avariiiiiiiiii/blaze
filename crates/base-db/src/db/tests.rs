@@ -1,5 +1,6 @@
 use std::sync::Mutex;
 
+use blaze_mem::Tag;
 use span::{FileId, TextSize};
 
 use super::{Db, RunOrder, set_run_order};
@@ -41,7 +42,7 @@ fn run_all_runs_each_task_in_the_order_asked() {
     for (order, expected) in cases {
         let before = set_run_order(order);
         let ran = Mutex::new(Vec::new());
-        db.run_all(5, |_, at| ran.lock().unwrap().push(at));
+        db.run_all(Tag::Query, 5, |_, at| ran.lock().unwrap().push(at));
         set_run_order(before);
         assert_eq!(ran.into_inner().unwrap(), expected, "{order:?}");
     }
@@ -50,7 +51,23 @@ fn run_all_runs_each_task_in_the_order_asked() {
 #[test]
 fn run_all_of_nothing_runs_nothing() {
     let db = Db::for_tests();
-    db.run_all(0, |_, _| panic!("no task to run"));
+    db.run_all(Tag::Query, 0, |_, _| panic!("no task to run"));
+}
+
+#[test]
+fn a_batch_run_here_allocates_nothing_and_frames_each_task() {
+    let db = Db::for_tests();
+    let seen = std::sync::atomic::AtomicUsize::new(0);
+    let task = |_: &Db, _: usize| {
+        let tag = blaze_mem::frame::current(|frame| frame.tag());
+        assert_eq!(tag, Tag::Expand);
+        seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    };
+    db.run_all(Tag::Expand, 8, task);
+    blaze_alloc_count::assert_at_most(0, "a batch of 8 run on the calling thread", || {
+        db.run_all(Tag::Expand, 8, task)
+    });
+    assert_eq!(seen.load(std::sync::atomic::Ordering::Relaxed), 16);
 }
 
 #[test]

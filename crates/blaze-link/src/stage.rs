@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use blaze_codegen::{Arch, CompiledFunction, Data, Init, InstanceKey, Reloc, Static, Target, Unwind};
+use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Reloc, Static, Target, Unwind};
 use blaze_ids::{Hasher, radix};
 use blaze_mem::Frame;
 use rayon::prelude::*;
@@ -30,9 +30,18 @@ use crate::state::{ClassId, Def, NewPiece, PieceId, PieceRef, State, What};
 use crate::symbols::{IdNo, Obj, SymKey, Symbols, Wide};
 use crate::table;
 use crate::unwind::{self, Field};
-use crate::{Change, LinkError, Output};
+use crate::{Change, Format, LinkError, Output};
 
 const CIE_DOMAIN: &str = "blaze v2 link cie 1";
+
+/// SanitizerCoverage's sections as LLVM's `getSectionName` names them in each format: the
+/// counters, flags and guards (one array per covered function each), then the PC table.
+const SANCOV_ELF: [&str; 4] = ["__sancov_cntrs", "__sancov_bools", "__sancov_guards", "__sancov_pcs"];
+const SANCOV_MACHO: [&str; 4] =
+    ["__DATA,__sancov_cntrs", "__DATA,__sancov_bools", "__DATA,__sancov_guards", "__DATA,__sancov_pcs"];
+const SANCOV_COFF: [&str; 4] = [".SCOV$CM", ".SCOV$BM", ".SCOV$GM", ".SCOVP$M"];
+/// [`Stage::sancov`]'s index of the PC table, after the arrays.
+const SANCOV_PCS: usize = Covered::ARRAYS as usize;
 
 /// What a stage made or rewrote a piece as: bytes borrowed from the change or the stage's
 /// arena, or zeros (a GOT cell, the cells array, a descriptor: nothing allocated).
@@ -161,15 +170,23 @@ pub(crate) struct Stage<'a> {
     pub scratch: &'a mut Vec<u8>,
     /// Whether [`Stage::spans`] replaced any span table.
     pub spans_changed: bool,
+    /// The class and rank of each SanitizerCoverage section, asked of the writer once per
+    /// stage: the arrays by [`blaze_codegen::Target::Coverage`]'s index, then the PC table.
+    pub sancov: [Option<(ClassId, u32)>; SANCOV_PCS + 1],
+    /// Where the zero length ending the call frame entries this patch placed in
+    /// [`Class::Patch`] is ([`crate::place`]).
+    pub frames_end: Option<u64>,
 }
 
 pub(crate) fn error(function: Option<InstanceKey>, what: impl Into<String>) -> LinkError {
     LinkError { function, what: what.into() }
 }
 
-/// The key a codegen target is, and whether it is referred to weakly.
-fn wide(target: &Target, table: bool) -> (Wide<'_>, bool) {
-    match target {
+/// The key a codegen target is, and whether it is referred to weakly. `of` is the function
+/// whose code or data refers to it: a coverage array is that function's own, and outside a
+/// function (`None`) there is none to name.
+fn wide<'t>(target: &'t Target, table: bool, of: Option<&'t InstanceKey>) -> Option<(Wide<'t>, bool)> {
+    Some(match target {
         Target::Function(key) if table => (Wide::Slot(key), false),
         Target::Function(key) | Target::Direct(key) => (Wide::Body(key), false),
         Target::Static { item, instance } => (Wide::Static(item, instance), false),
@@ -177,7 +194,8 @@ fn wide(target: &Target, table: bool) -> (Wide<'_>, bool) {
         Target::Extern(name) => (Wide::Name(name), false),
         Target::Weak(name) => (Wide::Name(name), true),
         Target::Position(span) => (Wide::Position(span), false),
-    }
+        Target::Coverage(array) => (Wide::Coverage(of?, *array), false),
+    })
 }
 
 /// The keys of a function's symbols, in the order [`Stage::add_function`] reads them: its
@@ -188,14 +206,15 @@ fn function_keys<'f>(function: &'f CompiledFunction, table: bool, out: &mut [Wid
         out[at] = key;
         at += 1;
     };
+    let of = Some(&function.key);
     put(Wide::Body(&function.key));
     for reloc in &function.relocs {
-        put(wide(&reloc.target, table).0);
+        put(wide(reloc.target, table, of).expect("a function's own target").0);
     }
     for data in &function.data {
         put(Wide::Data(&data.id));
         for reloc in &data.relocs {
-            put(wide(&reloc.target, table).0);
+            put(wide(reloc.target, table, of).expect("a function's own target").0);
         }
     }
 }
@@ -213,8 +232,13 @@ impl<'a> Stage<'a> {
         self.symbols.sym_name(name)
     }
 
-    fn target_sym(&mut self, target: &Target) -> Sym {
-        let key = match wide(target, self.table).0 {
+    /// The symbol of a target outside a function's code and data: a static's, a name's, a
+    /// personality routine's.
+    fn target_sym(&mut self, target: &Target) -> Result<Sym, LinkError> {
+        let Some((key, _)) = wide(target, self.table, None) else {
+            return Err(error(None, "a SanitizerCoverage array named outside the function it is of"));
+        };
+        let key = match key {
             Wide::Key(key) => key,
             Wide::Name(name) => SymKey::Name(self.symbols.name(name)),
             Wide::Body(key) => SymKey::Body(self.symbols.id(&key.0)),
@@ -222,17 +246,18 @@ impl<'a> Stage<'a> {
             Wide::Data(id) => SymKey::Data(self.symbols.id(id)),
             Wide::Static(item, instance) => SymKey::Static(self.symbols.id(&item.0), self.symbols.id(instance)),
             Wide::Position(span) => SymKey::Position(self.symbols.id(&span.anchor), span.index),
+            Wide::Coverage(key, array) => SymKey::Coverage(self.symbols.id(&key.0), array),
         };
-        self.symbols.intern(key)
+        Ok(self.symbols.intern(key))
     }
 
     /// The symbols of relocations' targets, in the stage's arena.
-    fn reloc_syms(&mut self, relocs: &[Reloc]) -> &'a [Sym] {
+    fn reloc_syms(&mut self, relocs: &[Reloc]) -> Result<&'a [Sym], LinkError> {
         let mut out = Vec::with_capacity_in(relocs.len(), self.arena);
         for reloc in relocs {
-            out.push(self.target_sym(&reloc.target));
+            out.push(self.target_sym(&reloc.target)?);
         }
-        out.leak()
+        Ok(out.leak())
     }
 
     /// Defines `sym`, noting a change.
@@ -355,7 +380,7 @@ impl<'a> Stage<'a> {
         let mut named = Vec::with_capacity_in(change.names.len(), self.arena);
         for (name, target) in &change.names {
             let name = self.symbols.name(name);
-            let sym = self.target_sym(target);
+            let sym = self.target_sym(target)?;
             named.push((name, sym));
         }
         let symbols = &*self.symbols;
@@ -446,7 +471,15 @@ impl<'a> Stage<'a> {
             return;
         };
         self.unmake(piece);
-        for sym in info.fde.into_iter().chain(info.windows.map(|it| it.0)) {
+        // Its FDE, its UNWIND_INFO, its coverage arrays and its PC table entries.
+        let mut owned = [None; SANCOV_PCS + 3];
+        owned[0] = info.fde;
+        owned[1] = info.windows.map(|it| it.0);
+        for (kind, out) in owned[2..].iter_mut().enumerate() {
+            let key = if kind == SANCOV_PCS { SymKey::CoveragePcs(info.id) } else { SymKey::Coverage(info.id, kind as u32) };
+            *out = self.symbols.find(key);
+        }
+        for sym in owned.into_iter().flatten() {
             if let Def::Piece { piece, .. } = self.new.def(sym) {
                 self.unmake(piece);
             }
@@ -607,7 +640,7 @@ impl<'a> Stage<'a> {
         let mut windows = None;
         match &function.unwind {
             Some(Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda }) => {
-                let personality = personality.as_ref().map(|it| self.target_sym(it));
+                let personality = personality.as_ref().map(|it| self.target_sym(it)).transpose()?;
                 let mut hasher = Hasher::new(CIE_DOMAIN);
                 hasher
                     .part(&code_align.to_le_bytes())
@@ -683,7 +716,7 @@ impl<'a> Stage<'a> {
                 fde_sym = Some(sym);
             }
             Some(Unwind::Windows { info: bytes, handler, lsda }) => {
-                let handler = handler.as_ref().map(|it| self.target_sym(it));
+                let handler = handler.as_ref().map(|it| self.target_sym(it)).transpose()?;
                 let lsda = lsda.map(|id| {
                     let id = self.symbols.id(&id);
                     self.sym(SymKey::Data(id))
@@ -709,6 +742,7 @@ impl<'a> Stage<'a> {
             None => {}
         }
         let id = self.symbols.id(&function.key.0);
+        self.add_coverage(function, id, body)?;
         let info = self.new.add_function(function.key, id, fde_sym, windows, &function.lines);
         let (class, rank) = self.own(Class::Text);
         let mut piece = Self::piece_in(
@@ -750,6 +784,75 @@ impl<'a> Stage<'a> {
         Ok(())
     }
 
+    /// The class and rank of SanitizerCoverage's section `kind` ([`Stage::sancov`]).
+    fn sancov_class(&mut self, kind: usize, function: InstanceKey) -> Result<(ClassId, u32), LinkError> {
+        if let Some(it) = self.sancov[kind] {
+            return Ok(it);
+        }
+        let names = match self.output.format {
+            Format::Elf => &SANCOV_ELF,
+            Format::MachO => &SANCOV_MACHO,
+            Format::Pe => &SANCOV_COFF,
+            Format::Wasm => {
+                return Err(error(Some(function), "SanitizerCoverage on wasm: a module has no sections for its arrays"));
+            }
+        };
+        // Writable, PC table too: it holds addresses the loader relocates, and LLVM marks it so.
+        let (class, rank) = self.writer.section(names[kind], true, false, false).map_err(|it| error(Some(function), it))?;
+        let it = (self.new.class_id(&class), rank);
+        self.sancov[kind] = Some(it);
+        Ok(it)
+    }
+
+    /// A covered function's arrays (zeroed) and its PC table entries, a piece each in its
+    /// kind's section. A section's pieces are in the order of their functions' keys, as the
+    /// functions' code is in a full link, so every section lists the functions alike; they are
+    /// the function's, made and removed with it.
+    fn add_coverage(&mut self, function: &'a CompiledFunction, id: IdNo, body: Sym) -> Result<(), LinkError> {
+        let Some(covered) = &function.coverage else { return Ok(()) };
+        let key = Some(function.key);
+        if covered.guards % 4 != 0 {
+            // alloc: error path
+            return Err(error(key, format!("{} bytes of SanitizerCoverage guards, which are 4 bytes each", covered.guards)));
+        }
+        let arrays = [(covered.counters, 1), (covered.flags, 1), (covered.guards, 4)];
+        for (kind, (size, align)) in arrays.into_iter().enumerate() {
+            if size == 0 {
+                continue;
+            }
+            let (class, rank) = self.sancov_class(kind, function.key)?;
+            let sym = self.sym(SymKey::Coverage(id, kind as u32));
+            let mut piece = Self::piece_in(sym, class, align, u64::from(size), &[], What::Fixed);
+            piece.rank = rank;
+            self.make(&piece, Content::Zero);
+        }
+        if covered.pcs.is_empty() {
+            return Ok(());
+        }
+        let len = function.code.len() as u64;
+        if let Some((at, _)) = covered.pcs.iter().find(|(at, _)| u64::from(*at) >= len) {
+            // alloc: error path
+            return Err(error(key, format!("a SanitizerCoverage PC at {at}, past its {len} bytes of code")));
+        }
+        let (class, rank) = self.sancov_class(SANCOV_PCS, function.key)?;
+        let bytes: &'a mut [u8] = self.arena.alloc_slice_fill_with(covered.pcs.len() * 16, |_| 0);
+        for (out, (_, flags)) in bytes.chunks_exact_mut(16).zip(&covered.pcs) {
+            out[8..].copy_from_slice(&flags.to_le_bytes());
+        }
+        let fixups = self.fixup_slice(covered.pcs.iter().enumerate().map(|(n, (at, _))| Fixup {
+            at: 16 * n as u64,
+            apply: Apply::Abs64,
+            target: body,
+            addend: i64::from(*at),
+            minus: None,
+        }));
+        let sym = self.sym(SymKey::CoveragePcs(id));
+        let mut piece = Self::piece_in(sym, class, 8, bytes.len() as u64, fixups, What::Fixed);
+        piece.rank = rank;
+        self.make(&piece, Content::Bytes(bytes));
+        Ok(())
+    }
+
     fn add_data(
         &mut self,
         data: &'a Data,
@@ -779,14 +882,14 @@ impl<'a> Stage<'a> {
         for data in &it.data {
             let id = self.symbols.id(&data.id);
             let data_sym = self.sym(SymKey::Data(id));
-            let relocs = self.reloc_syms(&data.relocs);
+            let relocs = self.reloc_syms(&data.relocs)?;
             self.add_data(data, data_sym, relocs, None)?;
         }
         let (bytes, relocs, size, zero): (&'a [u8], &'a [Reloc], u64, bool) = match &it.init {
             Init::Bytes { bytes, relocs } => (&bytes[..], &relocs[..], bytes.len() as u64, false),
             Init::Zeroed { size } => (&[][..], &[][..], *size, true),
         };
-        let syms = self.reloc_syms(relocs);
+        let syms = self.reloc_syms(relocs)?;
         let (fixups, weak) = self.fixups(relocs, syms, None, false)?;
         if self.arch() == Arch::Wasm32 {
             self.wasm_imports(&it.imports);
@@ -1295,17 +1398,8 @@ fn special_at(state: &State, mut sym: Sym) -> Option<(Sym, u32)> {
 
 /// Reads a LEB128 at `*at`, moving past it.
 fn uleb(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
-    let mut value = 0u64;
-    for shift in (0..64).step_by(7) {
-        let byte = *bytes.get(*at).ok_or("wasm: a truncated code header")?;
-        *at += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
     // alloc: error path
-    Err("wasm: a LEB128 past 64 bits in a code header".to_owned())
+    blaze_format::leb::read_u64(bytes, at).map_err(|error| format!("wasm: {error} in a code header"))
 }
 
 /// Moves `*at` past a function type (`0x60`, the parameters, the results).

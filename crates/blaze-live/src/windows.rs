@@ -62,7 +62,6 @@ const REACH: u64 = 2 << 30;
 const LOOK_EVERY: Duration = Duration::from_millis(30);
 
 pub(crate) struct Live {
-    dir: PathBuf,
     id: [u8; 16],
     slide: u64,
     /// Where the image is loaded, which the tables of functions are relative to.
@@ -75,15 +74,23 @@ pub(crate) struct Live {
     /// How long the executable's image is from `loaded`: every write over it is checked to be
     /// in it.
     image_len: u64,
+    /// The writes of a patch, kept from one to the next.
+    plan: Plan,
+    /// The file the daemon reads `process` from, the one it is written to first, and its text.
+    process_file: PathBuf,
+    partial: PathBuf,
+    text: String,
 }
 
 impl Live {
     pub(crate) fn start() -> Result<Live, String> {
         let executable =
+            // alloc: error path
             std::env::current_exe().map_err(|it| format!("finding the executable: {it}"))?;
         let image = Image::read(&executable)?;
         let dir = format::dir(&image.id).ok_or("no home directory to take edits through")?;
         forget_exited();
+        // alloc: error path
         std::fs::create_dir_all(&dir).map_err(|it| format!("{}: {it}", dir.display()))?;
         // SAFETY: no name asks for the executable of the process, which is always loaded.
         let loaded = unsafe { GetModuleHandleW(std::ptr::null()) } as u64;
@@ -93,9 +100,11 @@ impl Live {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |it| it.as_millis() as u64);
         let process = Process { pid: std::process::id(), uuid: image.id, started, next, end };
-        let live = Live {
+        let process_file = dir.join("process");
+        // alloc: setup, once at start
+        let partial = dir.join(format!("process.{}", process.pid));
+        let mut live = Live {
             patches: watch(&dir, image.id),
-            dir,
             id: image.id,
             slide,
             loaded,
@@ -104,6 +113,11 @@ impl Live {
             threads: stop::Threads::new(),
             sequence: 0,
             image_len: image.len,
+            plan: Plan::default(),
+            process_file,
+            partial,
+            // alloc: setup, the one buffer `publish` writes the process's text into
+            text: String::with_capacity(256),
         };
         live.publish()?;
         Ok(live)
@@ -133,6 +147,7 @@ impl Live {
             }
         };
         std::thread::Builder::new()
+            // alloc: setup, the thread's name, once
             .name("blaze-live-apply".to_owned())
             .spawn(applying)
             .expect("spawning the thread that applies edits");
@@ -144,6 +159,7 @@ impl Live {
         }
         self.sequence = patch.sequence;
         if patch.uuid != self.id {
+            // alloc: once, the program was linked again and has to start
             return Some(Outcome::Restart("the program was linked again".to_owned()));
         }
         Some(match patch.body {
@@ -168,18 +184,25 @@ impl Live {
     }
 
     fn apply(&mut self, code: &Code) -> Result<(), Failed> {
+        let mut plan = std::mem::take(&mut self.plan);
+        let applied = self.apply_with(code, &mut plan);
+        self.plan = plan;
+        applied
+    }
+
+    fn apply_with(&mut self, code: &Code, plan: &mut Plan) -> Result<(), Failed> {
         // Every write over the executable is checked, and planned, before anything is mapped.
         let image = self.loaded..self.loaded.saturating_add(self.image_len);
         apply::in_image(&code.writes, self.slide, &image)?;
-        let plan = self.overwrites.plan(code, self.slide)?;
-        readable(&plan)?;
+        self.overwrites.plan(code, self.slide, plan)?;
+        readable(plan)?;
         // From here the room up to `end` is used, whatever becomes of the patch: jumps or the
         // unwinder may reach what is committed there.
         let end = apply::claim(&mut self.process, code, PAGE)?;
         let len = end - code.base;
         // A patch that only puts back what earlier ones wrote has nothing to map.
         let mapped = if len == 0 { Ok(()) } else { self.map(code, len) };
-        let applied = mapped.map_err(Failed::from).and_then(|()| self.redirect(&plan));
+        let applied = mapped.map_err(Failed::from).and_then(|()| self.redirect(plan));
         let published = self.publish().map_err(Failed::from);
         applied.and(published)
     }
@@ -196,7 +219,7 @@ impl Live {
                 std::ptr::copy_nonoverlapping(address as *const u8, into.as_mut_ptr(), into.len())
             }
         };
-        let write = |_: usize, step: &Step| put(step);
+        let write = |_: usize, step: &Step, bytes: &[u8]| put(step, bytes);
         apply::write_stopped(&mut self.threads, &mut self.overwrites, plan, false, read, write)
     }
 
@@ -213,6 +236,7 @@ impl Live {
             VirtualAlloc(mapped as *mut c_void, len as usize, MEM_COMMIT, PAGE_READWRITE)
         };
         if result as u64 != mapped {
+            // alloc: error path
             return Err(format!(
                 "mapping the patch at {mapped:#x}: {}",
                 std::io::Error::last_os_error()
@@ -241,6 +265,7 @@ impl Live {
                 )
             };
             if protected == 0 {
+                // alloc: error path
                 return Err(format!(
                     "making the patch executable: {}",
                     std::io::Error::last_os_error()
@@ -276,17 +301,19 @@ impl Live {
         // (`apply::functions`); the patch is never released or rewritten (`apply::claim` moved
         // `next` past it before it was committed).
         if unsafe { RtlAddFunctionTable(table, count, self.loaded) } == 0 {
+            // alloc: error path
             return Err("the unwinder refused the patch's table of functions".to_owned());
         }
         Ok(())
     }
 
-    fn publish(&self) -> Result<(), String> {
-        let path = self.dir.join("process");
-        let partial = self.dir.join(format!("process.{}", self.process.pid));
-        std::fs::write(&partial, self.process.encode())
-            .and_then(|()| std::fs::rename(&partial, &path))
-            .map_err(|it| format!("{}: {it}", path.display()))
+    fn publish(&mut self) -> Result<(), String> {
+        self.text.clear();
+        self.process.encode_into(&mut self.text);
+        std::fs::write(&self.partial, &self.text)
+            .and_then(|()| std::fs::rename(&self.partial, &self.process_file))
+            // alloc: error path
+            .map_err(|it| format!("{}: {it}", self.process_file.display()))
     }
 }
 
@@ -302,12 +329,14 @@ struct Image {
 impl Image {
     fn read(path: &Path) -> Result<Image, String> {
         let bytes =
+            // alloc: error path
             std::fs::read(path).map_err(|it| format!("reading {}: {it}", path.display()))?;
         let u16_at = |at: usize| -> Result<u16, String> {
             bytes
                 .get(at..at + 2)
                 .and_then(|it| it.try_into().ok())
                 .map(u16::from_le_bytes)
+                // alloc: error path
                 .ok_or("PE header ends early".to_owned())
         };
         let u32_at = |at: usize| -> Result<u32, String> {
@@ -315,6 +344,7 @@ impl Image {
                 .get(at..at + 4)
                 .and_then(|it| it.try_into().ok())
                 .map(u32::from_le_bytes)
+                // alloc: error path
                 .ok_or("PE header ends early".to_owned())
         };
         let u64_at = |at: usize| -> Result<u64, String> {
@@ -322,15 +352,18 @@ impl Image {
                 .get(at..at + 8)
                 .and_then(|it| it.try_into().ok())
                 .map(u64::from_le_bytes)
+                // alloc: error path
                 .ok_or("PE header ends early".to_owned())
         };
         let nt = u32_at(0x3c)? as usize;
         if bytes.get(..2) != Some(b"MZ") || bytes.get(nt..nt + 4) != Some(b"PE\0\0") {
+            // alloc: error path
             return Err("the executable is not a PE image".to_owned());
         }
         let header = nt + 4;
         let optional = header + 20;
         if u16_at(header)? != 0x8664 || u16_at(optional)? != 0x20b {
+            // alloc: error path
             return Err("the executable is not a PE32+ image for x86-64".to_owned());
         }
         let sections = optional + usize::from(u16_at(header + 16)?);
@@ -347,9 +380,11 @@ impl Image {
                     return Ok((u32_at(at + 20)? + (address - start)) as usize);
                 }
             }
+            // alloc: error path
             Err(format!("nothing in the file is loaded at {address:#x}"))
         };
         if u32_at(optional + 108)? <= 6 {
+            // alloc: error path
             return Err("the executable has no debug directory".to_owned());
         }
         let (debug, debug_len) = (u32_at(optional + 112 + 6 * 8)?, u32_at(optional + 116 + 6 * 8)?);
@@ -383,6 +418,7 @@ fn reserve(image: &Image, loaded: u64, slide: u64) -> Result<(u64, u64), String>
         }
         at += GRANULE;
     }
+    // alloc: error path
     Err("nothing near the program is free to put edits in".to_owned())
 }
 
@@ -420,14 +456,17 @@ fn watch(dir: &Path, id: [u8; 16]) -> Receiver<(Patch, Instant)> {
     let (send, receive) = std::sync::mpsc::channel();
     let path = dir.join("patch");
     let mut seen = stamp(&path);
+    // alloc: setup, the wake event's name, once
     let name: Vec<u16> = format::wake_event(dir).encode_utf16().chain([0]).collect();
     // SAFETY: the name ends with a zero. The event is never closed: the thread below waits on
     // it as long as the program runs. A handle is not `Send`, its value is.
     let wake = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) } as usize;
     if let Some(executable) = std::env::current_exe().ok() {
+        // clone: setup, the second watcher thread's sender, once
         let send = send.clone();
         let mut linked = stamp(&executable);
         std::thread::Builder::new()
+            // alloc: setup, the thread's name, once
             .name("blaze-live-linked".to_owned())
             .spawn(move || {
                 loop {
@@ -446,6 +485,7 @@ fn watch(dir: &Path, id: [u8; 16]) -> Receiver<(Patch, Instant)> {
                         let patch = Patch {
                             uuid: other,
                             sequence,
+                            // alloc: once, the program was linked again and has to start
                             body: Body::Restart("the program was linked again".to_owned()),
                         };
                         if send.send((patch, Instant::now())).is_err() {
@@ -457,6 +497,7 @@ fn watch(dir: &Path, id: [u8; 16]) -> Receiver<(Patch, Instant)> {
             .expect("spawning the thread that watches the executable");
     }
     std::thread::Builder::new()
+        // alloc: setup, the thread's name, once
         .name("blaze-live".to_owned())
         .spawn(move || {
             loop {
@@ -508,7 +549,7 @@ struct MemoryBasicInformation {
 /// readable region: its originals are read with the threads suspended.
 fn readable(plan: &Plan) -> Result<(), String> {
     for step in &plan.steps {
-        let end = step.address + step.bytes.len() as u64;
+        let end = step.address + step.len() as u64;
         let mut info = MemoryBasicInformation {
             base: std::ptr::null_mut(),
             allocation_base: std::ptr::null_mut(),
@@ -522,6 +563,7 @@ fn readable(plan: &Plan) -> Result<(), String> {
         let len = size_of::<MemoryBasicInformation>();
         // SAFETY: `info` is a whole MEMORY_BASIC_INFORMATION.
         if unsafe { VirtualQuery(step.address as *const c_void, &mut info, len) } != len {
+            // alloc: error path
             return Err(format!(
                 "querying {:#x}: {}",
                 step.address,
@@ -535,6 +577,7 @@ fn readable(plan: &Plan) -> Result<(), String> {
             || protect == PAGE_NOACCESS
             || info.protect & PAGE_GUARD != 0
         {
+            // alloc: error path
             return Err(format!(
                 "a write at {:#x}..{end:#x}, in no one readable region of the executable",
                 step.address
@@ -544,11 +587,11 @@ fn readable(plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes `step` over the image: made writable for the write, given its protection back,
-/// and the instruction cache flushed over it. Called with every other thread suspended; it
-/// allocates nothing.
-fn put(step: &Step) -> Result<(), Broke> {
-    let (address, len) = (step.address as *mut c_void, step.bytes.len());
+/// Writes `bytes`, `step`'s, over the image: made writable for the write, given its
+/// protection back, and the instruction cache flushed over it. Called with every other thread
+/// suspended; it allocates nothing.
+fn put(step: &Step, bytes: &[u8]) -> Result<(), Broke> {
+    let (address, len) = (step.address as *mut c_void, bytes.len());
     let broke = |what, written| Broke {
         what,
         at: step.address,
@@ -565,7 +608,7 @@ fn put(step: &Step) -> Result<(), Broke> {
     // SAFETY: the bytes were made writable above; every other thread is suspended and none
     // inside them (`apply::write_stopped`), so nothing runs, reads or writes them meanwhile.
     // `bytes` is the plan's own buffer.
-    unsafe { std::ptr::copy_nonoverlapping(step.bytes.as_ptr(), address as *mut u8, len) };
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, len) };
     let mut was = 0;
     // SAFETY: the same bytes, given back the protection `old` VirtualProtect said they had.
     if unsafe { VirtualProtect(address, len, old, &mut was) } == 0 {

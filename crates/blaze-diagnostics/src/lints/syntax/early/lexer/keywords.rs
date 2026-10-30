@@ -21,15 +21,27 @@ use syntax::{
 
 use crate::{
     cx::Cx,
-    lints::syntax::{Emitted, Pass, Tree, source_fact},
+    lints::{
+        registry::LintId,
+        syntax::{Emitted, Pass, Tree, source_fact},
+    },
     lower::Phase,
     model::{Applicability, Diag},
 };
 
-/// The lints of `tree`, a file of the crate, into `out`.
+const KEYWORD_IDENTS_2018: LintId = LintId::named("keyword_idents_2018");
+const KEYWORD_IDENTS_2024: LintId = LintId::named("keyword_idents_2024");
+
+/// The lints of `tree`, a file of the crate, into `out`. Both are allowed by default: a file
+/// whose edition leaves no lint that may fire is not walked.
 pub(super) fn lints(cx: &Cx<'_, '_>, tree: &Tree, out: &mut Vec<Emitted>) {
     let edition = tree.file.edition(cx.db);
-    if edition.at_least_2024() {
+    let may_fire = match edition {
+        _ if edition.at_least_2024() => false,
+        Edition::Edition2015 => cx.lint_may_fire(KEYWORD_IDENTS_2018) || cx.lint_may_fire(KEYWORD_IDENTS_2024),
+        _ => cx.lint_may_fire(KEYWORD_IDENTS_2024),
+    };
+    if !may_fire {
         return;
     }
     let mut keywords = Keywords { cx, tree, edition, out };

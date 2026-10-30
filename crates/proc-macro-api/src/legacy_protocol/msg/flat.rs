@@ -74,13 +74,16 @@ pub fn serialize_span_data_index_map(map: &SpanDataIndexMap) -> Vec<u32> {
 pub fn deserialize_span_data_index_map(map: &[u32]) -> Result<SpanDataIndexMap, String> {
     let (chunks, remainder) = map.as_chunks::<5>();
     if !remainder.is_empty() {
+        // alloc: error path.
         return Err(format!("a span table of {} numbers, not five a span", map.len()));
     }
     let mut table = SpanDataIndexMap::default();
     table.reserve(chunks.len());
     for (at, &[file_id, ast_id, start, end, ctx]) in chunks.iter().enumerate() {
+        // alloc: error path, naming the span.
         let span_at = |why: String| format!("span {at} of the span table: {why}");
         if start > end {
+            // alloc: error path.
             return Err(span_at(format!("its range {start}..{end} ends before it starts")));
         }
         let span = Span {
@@ -92,6 +95,7 @@ pub fn deserialize_span_data_index_map(map: &[u32]) -> Result<SpanDataIndexMap, 
             ctx: raw_context(ctx).map_err(span_at)?,
         };
         if !table.insert(span) {
+            // alloc: error path.
             return Err(span_at("the table has it twice".to_owned()));
         }
     }
@@ -336,12 +340,15 @@ fn read_vec<T, const N: usize>(
 ) -> Result<Vec<T>, String> {
     let (chunks, remainder) = xs.as_chunks::<N>();
     if !remainder.is_empty() {
+        // alloc: error path.
         return Err(format!("a {what} column of {} numbers, not {N} a row", xs.len()));
     }
     chunks
         .iter()
         .enumerate()
+        // alloc: error path, naming the row.
         .map(|(at, &chunk)| f(chunk).map_err(|why| format!("{what} {at}: {why}")))
+        // alloc: an older server's column, once an answer; `WIRE_TREES` reads columns in place.
         .collect()
 }
 
@@ -351,6 +358,7 @@ fn delimiter_kind(kind: u32) -> Result<tt::DelimiterKind, String> {
         1 => tt::DelimiterKind::Parenthesis,
         2 => tt::DelimiterKind::Brace,
         3 => tt::DelimiterKind::Bracket,
+        // alloc: error path.
         other => return Err(format!("delimiter kind {other}")),
     })
 }
@@ -370,6 +378,7 @@ fn lit_kind(kind: u16) -> Result<tt::LitKind, String> {
         [8, r] => Kind::ByteStrRaw(r),
         [9, 0] => Kind::CStr,
         [10, r] => Kind::CStrRaw(r),
+        // alloc: error path.
         _ => return Err(format!("literal kind {kind:#06x}")),
     })
 }
@@ -419,6 +428,7 @@ impl LiteralRepr {
     }
     fn read_with_kind([id, text, kind, suffix]: [u32; 4]) -> Result<LiteralRepr, String> {
         let Ok(kind) = u16::try_from(kind) else {
+            // alloc: error path.
             return Err(format!("literal kind {kind:#x}"));
         };
         Ok(LiteralRepr { id: SpanId(id), text, kind, suffix })
@@ -437,9 +447,11 @@ impl PunctRepr {
         let spacing = match spacing {
             0 => tt::Spacing::Alone,
             1 => tt::Spacing::Joint,
+            // alloc: error path.
             other => return Err(format!("spacing {other}")),
         };
         let Some(char) = char::from_u32(char) else {
+            // alloc: error path.
             return Err(format!("{char:#x}, which is no char"));
         };
         Ok(PunctRepr { id: SpanId(id), char, spacing })
@@ -460,6 +472,7 @@ impl IdentRepr {
         let is_raw = match is_raw {
             0 => false,
             1 => true,
+            // alloc: error path.
             other => return Err(format!("rawness {other}")),
         };
         Ok(IdentRepr { id: SpanId(id), text, is_raw })
@@ -493,6 +506,7 @@ impl SpanTransformer for Span {
     fn span_for_token_id(table: &Self::Table, id: SpanId) -> Result<Self::Span, String> {
         match table.get_index(id.0 as usize) {
             Some(span) => Ok(*span),
+            // alloc: error path, naming the id.
             None => Err(format!("span id {} past the span table of {}", id.0, table.len())),
         }
     }
@@ -802,6 +816,7 @@ impl<S: SpanTransformer> Reader<'_, S> {
     /// much as the columns are long.
     fn check(&self) -> Result<(), String> {
         if self.subtree.is_empty() {
+            // alloc: error path.
             return Err("a tree with no subtree".to_owned());
         }
         let mut next_held = 1;
@@ -809,6 +824,7 @@ impl<S: SpanTransformer> Reader<'_, S> {
         for (at, repr) in self.subtree.iter().enumerate() {
             let [lo, hi] = repr.tt.map(|it| it as usize);
             if lo != end || hi < lo || hi > self.token_tree.len() {
+                // alloc: error path, naming the subtree.
                 return Err(format!(
                     "subtree {at} holds token trees {lo}..{hi}, not those from {end}, the last \
                      subtree's end, within the {}",
@@ -821,6 +837,7 @@ impl<S: SpanTransformer> Reader<'_, S> {
                 let (what, len) = match idx_tag & 0b11 {
                     0b00 => {
                         if idx != next_held || idx <= at {
+                            // alloc: error path, naming the subtree.
                             return Err(format!(
                                 "subtree {at} holds subtree {idx}, where the next held is \
                                  {next_held}"
@@ -834,14 +851,17 @@ impl<S: SpanTransformer> Reader<'_, S> {
                     _ => ("ident", self.ident.len()),
                 };
                 if idx >= len {
+                    // alloc: error path, naming the index.
                     return Err(format!("subtree {at} holds {what} {idx}, past the {len}"));
                 }
             }
         }
         if end != self.token_tree.len() {
+            // alloc: error path.
             return Err(format!("token trees {end}.. are in no subtree"));
         }
         if next_held != self.subtree.len() {
+            // alloc: error path.
             return Err(format!("subtrees {next_held}.. are held by none"));
         }
         Ok(())
@@ -854,6 +874,7 @@ impl<S: SpanTransformer> Reader<'_, S> {
     fn string(&self, at: u32) -> Result<&str, String> {
         match self.text.get(at as usize) {
             Some(text) => Ok(text),
+            // alloc: error path, naming the text.
             None => Err(format!("text {at} past the {}", self.text.len())),
         }
     }
@@ -864,6 +885,7 @@ impl<S: SpanTransformer> Reader<'_, S> {
         let text = self.string(repr.text)?;
         let suffix = if repr.suffix != !0 { self.string(repr.suffix)? } else { "" };
         if suffix.len() > LONGEST_SUFFIX {
+            // alloc: error path, naming the suffix.
             return Err(format!(
                 "literal {idx} has a suffix of {} bytes, past the {LONGEST_SUFFIX} a token tree \
                  holds",
@@ -960,6 +982,7 @@ impl<T: SpanTransformer<Span = span::Span>> Reader<'_, T> {
             None => tt::token_to_literal(text, span),
         };
         if literal.suffix_len as usize > LONGEST_SUFFIX {
+            // alloc: error path, naming the suffix.
             return Err(format!(
                 "literal {idx} has a suffix of {} bytes, past the {LONGEST_SUFFIX} a token tree \
                  holds",
@@ -989,12 +1012,14 @@ impl<T: SpanTransformer> Reader<'_, T> {
                 stream.push(match idx_tag & 0b11 {
                     0b00 => match res[idx].take() {
                         Some(group) => proc_macro_srv::TokenTree::Group(group),
+                        // alloc: error path, naming the subtree.
                         None => return Err(format!("subtree {idx} held twice")),
                     },
                     0b01 => proc_macro_srv::TokenTree::Literal(self.server_literal(idx)?),
                     0b10 => {
                         let repr = &self.punct[idx];
                         if !repr.char.is_ascii() {
+                            // alloc: error path, naming the punct.
                             return Err(format!("punct {idx} is {:?}, not ASCII", repr.char));
                         }
                         proc_macro_srv::TokenTree::Punct(proc_macro_srv::Punct {
@@ -1036,6 +1061,7 @@ impl<T: SpanTransformer> Reader<'_, T> {
             res[i] = Some(g);
         }
         let Some(group) = res[0].take() else {
+            // alloc: error path.
             return Err("the top subtree is held by another".to_owned());
         };
         Ok(if group.delimiter == proc_macro_srv::Delimiter::None {
@@ -1051,6 +1077,7 @@ impl<T: SpanTransformer> Reader<'_, T> {
         let span = self.read_span(repr.id)?;
         if self.version < EXTENDED_LEAF_DATA {
             return proc_macro_srv::literal_from_str(text, span)
+                // alloc: error path, naming the literal.
                 .map_err(|_| format!("literal {idx}, {text:?}, is not one literal"));
         }
         use proc_macro_srv::LitKind as Kind;
@@ -1080,7 +1107,9 @@ mod tests {
     use super::*;
 
     /// What the client makes of a corpus input of the fuzz target `proc_macro_flat_tree`: a byte
-    /// picking the version (`4 + byte % 4`), then the postcard tree and span table of an answer.
+    /// picking the version, then the postcard tree and span table of an answer. The target picks
+    /// `4 + byte % 5`; here it is `4 + byte % 4`, which reads the corpus's version bytes, 0 and 3,
+    /// the same: as 4 and 7.
     fn resolved(hex: &str) -> Result<tt::TopSubtree, String> {
         let bytes: Vec<u8> = hex
             .split_whitespace()

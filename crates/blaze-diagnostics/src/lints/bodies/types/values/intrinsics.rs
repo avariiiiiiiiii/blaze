@@ -13,21 +13,17 @@ use rustc_type_ir::{
 };
 
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::Diag,
 };
 
-pub(super) struct EnumIntrinsicsNonEnums;
+#[derive(Default)]
+pub(crate) struct EnumIntrinsicsNonEnums;
 
 impl LatePass for EnumIntrinsicsNonEnums {
-    fn name(&self) -> &'static str {
-        "EnumIntrinsicsNonEnums"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["enum_intrinsics_non_enums"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();

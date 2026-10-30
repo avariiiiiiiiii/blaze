@@ -872,6 +872,63 @@ pub(crate) struct Placed<'a> {
     /// directories point at the CRT's `_tls_used` and `_load_config_used`).
     // dyn: a handful of calls per image (PE's data directories), never per element
     pub symbol: &'a dyn Fn(&str) -> Option<u64>,
+    /// This link's synthesis: a number no other synthesis in the process has. A writer that
+    /// keeps its last tables records it, and patches them only for a [`Delta::from`] equal to
+    /// it (a rollback brings back a state its last tables are not of).
+    pub synthesis: u64,
+    /// What changed since the last link's synthesis, when the core knows it: `None` on a full
+    /// link and on an image's first.
+    pub delta: Option<&'a Delta<'a>>,
+    /// The slots [`Writer::encode`] gave, (address, value) in address order: what the file
+    /// holds there in place of the placed bytes. Empty for [`Writer::synthesize`] and
+    /// [`Writer::encode`] itself; set for [`Writer::file`].
+    pub encoded: &'a [(u64, u64)],
+}
+
+/// One run of a `Placed` list replaced since the last link: `old` in the last link's list,
+/// `new` in this one's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Splice {
+    pub old: Range<u32>,
+    pub new: Range<u32>,
+}
+
+impl Splice {
+    /// Whether it replaces as many entries as it removes, each in its place.
+    #[inline]
+    pub fn same_len(&self) -> bool {
+        self.old.len() == self.new.len()
+    }
+}
+
+/// What changed since the last `synthesize` of this image, when the core knows it. Each list's
+/// splices are in order and disjoint; a run whose entries are all equal is not one.
+pub(crate) struct Delta<'a> {
+    pub functions: &'a [Splice],
+    pub rebase: &'a [Splice],
+    pub got: &'a [Splice],
+    pub binds: &'a [Splice],
+    /// `imports`, `exports` and `libraries` are the last link's (the same `Arc`s, and exports
+    /// of the same names, addresses, sizes and kinds).
+    pub same_names: bool,
+    /// No region moved or changed size, but for the writer's own synthetic regions, whose
+    /// size it makes.
+    pub same_regions: bool,
+    /// Address ranges of the regions the core wrote since the last link, by address, none
+    /// overlapping. In the [`Placed`] that [`Writer::file`] sees, they include the blocks of
+    /// the synthetic regions that differ from the last link's.
+    pub written: &'a [(u64, u64)],
+    /// The [`Placed::synthesis`] of the last link, which these changes are from.
+    pub from: u64,
+}
+
+impl Delta<'_> {
+    /// Whether a writer's last tables, made by synthesis `last`, may be patched with this:
+    /// they are of the link this is from, no region moved and every splice of `lists` keeps
+    /// its length.
+    pub fn patches(&self, last: u64, lists: &[&[Splice]]) -> bool {
+        self.from == last && self.same_regions && lists.iter().all(|it| it.iter().all(Splice::same_len))
+    }
 }
 
 impl Placed<'_> {
@@ -925,6 +982,10 @@ pub(crate) struct File {
     /// tables outside the address space (symbol tables, a signature). Regions themselves
     /// are written by the core at [`Writer::offset`].
     pub parts: Vec<(u64, Vec<u8>)>,
+    /// The debug sections in the file, outside the address space: (file offset, index into
+    /// [`Placed::debug`]). The core lays them from the sections it made, so no writer copies
+    /// them, and compares them by block with the last link's as it does parts.
+    pub debug: Vec<(u64, usize)>,
 }
 
 /// An object format.

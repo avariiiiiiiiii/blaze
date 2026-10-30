@@ -14,7 +14,7 @@
 
 use std::ops::ControlFlow;
 
-use blaze_ids::radix;
+use blaze_ids::{bits::BitSet, radix};
 use cfg::CfgExpr;
 use hir::{HirFileId, InFile, ModuleSource, Name};
 use hir_def::{
@@ -35,34 +35,7 @@ use crate::cx::Cx;
 pub(super) type DefIdx = u32;
 
 /// A set of definitions: one bit each, `len / 8` bytes, O(1) test and insert.
-#[derive(Debug, Default)]
-pub(super) struct Bits(Vec<u64>);
-
-impl Bits {
-    pub(super) fn new(len: usize) -> Bits {
-        Bits(vec![0; len.div_ceil(64)]) // alloc: setup, one buffer per set, sized once
-    }
-
-    /// A copy of the set, for `mark`'s pre-deferred liveness.
-    pub(super) fn snapshot(&self) -> Bits {
-        Bits(self.0.clone()) // clone: once per crate, rustc's pre-deferred summary
-    }
-
-    #[inline]
-    pub(super) fn get(&self, at: DefIdx) -> bool {
-        (self.0[at as usize / 64] >> (at % 64)) & 1 != 0
-    }
-
-    /// Adds `at`, returning whether it was not in the set.
-    #[inline]
-    pub(super) fn insert(&mut self, at: DefIdx) -> bool {
-        let word = &mut self.0[at as usize / 64];
-        let bit = 1u64 << (at % 64);
-        let new = *word & bit == 0;
-        *word |= bit;
-        new
-    }
-}
+pub(super) type DefSet = BitSet<DefIdx>;
 
 /// What a definition is, by the front end's ids. A `use` has none and is its node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -161,8 +134,6 @@ pub(super) struct Def {
     pub(super) name: Option<Name>,
     pub(super) parent: Parent,
     pub(super) foreign: bool,
-    /// Its visibility is written `pub`, with no restriction.
-    pub(super) written_pub: bool,
 }
 
 impl Def {
@@ -364,21 +335,8 @@ impl std::ops::Index<DefIdx> for Defs {
 /// The CSR of `edges` (owner, child), each owner's children in the order they were added: a
 /// counting sort by owner, two passes.
 fn csr(len: usize, edges: &[(DefIdx, DefIdx)]) -> (Vec<u32>, Vec<DefIdx>) {
-    let mut at = vec![0u32; len + 1]; // alloc: setup, the CSR's offsets, once per crate
-    for &(owner, _) in edges {
-        at[owner as usize + 1] += 1;
-    }
-    for i in 0..len {
-        at[i + 1] += at[i];
-    }
-    let mut next: Vec<u32> = at[..len].to_vec(); // alloc: setup, the sort's cursors, once per crate
-    let mut list = vec![0; edges.len()]; // alloc: setup, the CSR's list, once per crate
-    for &(owner, child) in edges {
-        let slot = &mut next[owner as usize];
-        list[*slot as usize] = child;
-        *slot += 1;
-    }
-    (at, list)
+    // alloc: setup, the CSR's offsets and list and the sort's cursors, once per crate
+    radix::Csr::build(len, edges.iter().copied()).into_parts()
 }
 
 /// What an item is an item of.
@@ -540,8 +498,7 @@ impl Walk<'_, '_, '_> {
             Container::Trait(it) | Container::Impl(it) => Parent::Def(it),
             Container::Module | Container::Extern => parent,
         };
-        let written_pub = written_pub(item.value.syntax());
-        let def = |id, kind, name| Def { id, kind, node, name, parent, foreign, written_pub };
+        let def = |id, kind, name| Def { id, kind, node, name, parent, foreign };
         let (def, adt) = match &item.value {
             ast::Item::Fn(it) => {
                 let function = cx.sema.to_def2(item.with_value(it))?;
@@ -649,7 +606,6 @@ impl Walk<'_, '_, '_> {
                         name: Some(id.name(db)),
                         parent: Parent::Def(adt),
                         foreign: false,
-                        written_pub: false,
                     });
                     self.edges.push((adt, index));
                     self.fields(item.file_id, variant.field_list(), index);
@@ -692,7 +648,6 @@ impl Walk<'_, '_, '_> {
             name: Some(field.name(self.cx.db)),
             parent: Parent::Def(owner),
             foreign: false,
-            written_pub: written_pub(node),
         });
         self.edges.push((owner, index));
     }
@@ -721,7 +676,6 @@ impl Walk<'_, '_, '_> {
                 name: None,
                 parent,
                 foreign: false,
-                written_pub: false,
             });
             self.free_owners.push(index);
             self.current().free.push(index);
@@ -733,19 +687,12 @@ impl Walk<'_, '_, '_> {
                     name: Some(Name::new_symbol_root(method.name())),
                     parent: Parent::Def(index),
                     foreign: false,
-                    written_pub: false,
                 });
                 self.edges.push((index, method));
                 self.impl_items.push(method);
             }
         }
     }
-}
-
-/// Whether the visibility of `node` is written `pub`, with no restriction: rustc's
-/// `local_visibility` is `Visibility::Public` for what has a visibility of its own.
-fn written_pub(node: &SyntaxNode) -> bool {
-    node.children().find_map(ast::Visibility::cast).is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub))
 }
 
 /// Whether `node` is an item of HIR's: an item, an associated item or an item of an `extern`

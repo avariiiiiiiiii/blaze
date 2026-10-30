@@ -59,7 +59,9 @@ its file, its line, the code before and after, and why:
 
 Some tests depend on other lanes:
 
-- The "owned result alone" tests need `InferCtxt` and the solver on frames (mem-db-infer,
+- The "owned result alone" tests need `InferCtxt`'s tables recycled per worker (they don't come
+  from the checks' frames, so nothing is threaded into them) and the solver allocating nothing
+  once warm (mem-db-infer,
   mem-db-solver).
 - They also need check.rs's diagnostics to make each owned `String` in one allocation, which
   is in the check child's file.
@@ -87,7 +89,8 @@ Some tests depend on other lanes:
   final bytes, the same as on the global heap.
 - **What the bound leaves on the global heap**:
   - the result's own blocks;
-  - hir-ty's `InferCtxt` and solver state until their lanes land;
+  - hir-ty's `InferCtxt` tables until their per-worker recycling lands, and solver state until
+    its lane does;
   - `outlives::components` for a type of five or more components (a `SmallVec` of four,
     listed as open);
   - wfcheck's per-input error lists, which hir-ty's `ElidedLifetimes::regions` takes as

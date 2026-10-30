@@ -406,10 +406,26 @@ fn spoke(fd: i64) -> bool {
     got != 0
 }
 
-/// The daemon's side of a run process: nothing, since the start hook maps what it is given.
-pub(crate) struct Remote;
+/// The daemon's side of a run process: its process ID, since the start hook maps what it is
+/// given. macOS has no descriptor for a process, so a kill names it by ID: one sent after the
+/// process was reaped and its ID reused would reach another process, and its launcher must
+/// not reap it while it may still be killed.
+pub(crate) struct Remote {
+    pid: u32,
+}
 
 impl Remote {
+    pub(crate) fn kill(&self) -> Result<(), Error> {
+        let Ok(pid) = libc::pid_t::try_from(self.pid) else {
+            return Err(Error::new(format!("process ID {} past pid_t", self.pid)));
+        };
+        // SAFETY: kill takes a process ID and a signal and touches no memory of ours.
+        if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(Error::new(format!("kill of process {pid}: {}", std::io::Error::last_os_error())));
+        }
+        Ok(())
+    }
+
     pub(crate) fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
         Err(Error::new(format!("a start hook asked the daemon to map object {object}: on macOS the hook maps it")))
     }
@@ -453,7 +469,7 @@ pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], object
     let deadline = Instant::now() + HANDOFF;
     loop {
         match finished.recv_timeout(LOOK) {
-            Ok(result) => return result.map(|()| Remote),
+            Ok(result) => return result.map(|()| Remote { pid }),
             Err(RecvTimeoutError::Disconnected) => return Err(Error::new("the rendezvous service dropped a grant")),
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -469,10 +485,10 @@ pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], object
                     service_name(std::process::id()).to_string_lossy()
                 )));
             }
-            return Ok(Remote);
+            return Ok(Remote { pid });
         }
         return match finished.recv_timeout(HANDOFF) {
-            Ok(result) => result.map(|()| Remote),
+            Ok(result) => result.map(|()| Remote { pid }),
             Err(_) => Err(Error::new("the rendezvous service took a grant and never said how it went")),
         };
     }

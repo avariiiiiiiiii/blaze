@@ -123,6 +123,52 @@ impl Remote {
     pub(crate) fn overlay(&self, _: u64, _: &Grant) -> Result<(), Error> {
         match *self {}
     }
+
+    pub(crate) fn kill(&self) -> Result<(), Error> {
+        match *self {}
+    }
+}
+
+pub(crate) enum Bells {}
+
+impl Bells {
+    pub(crate) fn new(remote: &Remote, _: usize) -> Result<(Bells, Vec<u64>), Error> {
+        match *remote {}
+    }
+
+    pub(crate) fn wake(&self, _: usize, _: &AtomicU64) {
+        match *self {}
+    }
+
+    pub(crate) fn wait_ring(&self, _: &mut Stream) -> Result<bool, Error> {
+        match *self {}
+    }
+}
+
+pub(crate) fn ring(stream: &Stream, _: u64) -> Result<(), Error> {
+    match *stream {}
+}
+
+pub(crate) fn hung_up(stream: &Stream) -> bool {
+    match *stream {}
+}
+
+pub(crate) fn wait(_: &AtomicU64, _: u32, _: Duration) -> bool {
+    false
+}
+
+pub(crate) fn wake(_: &AtomicU64) {}
+
+pub(crate) fn wait_answer(_: &AtomicU64, _: u32, _: u64, _: Duration) -> bool {
+    false
+}
+
+pub(crate) struct Errno;
+
+impl Errno {
+    pub(crate) fn keep() -> Errno {
+        Errno
+    }
 }
 
 pub(crate) fn send_objects(_: &mut Channel, _: u32, _: &[u8], _: &[(&Object, Rights)]) -> Result<Remote, Error> {

@@ -559,7 +559,7 @@ fn a_record_header_of_a_length_no_record_has_is_refused() {
     };
     for stored in [0, 1 << 40, u64::MAX - RECORD_HEADER - 15] {
         let decoded = RecordHeader::decode(&header(stored).encode()).unwrap();
-        assert_eq!(decoded.span(), disk::aligned(RECORD_HEADER + stored));
+        assert_eq!(decoded.span(), (RECORD_HEADER + stored).next_multiple_of(disk::ALIGN));
     }
     for stored in [u64::MAX - RECORD_HEADER - 14, u64::MAX - RECORD_HEADER + 1, u64::MAX] {
         assert!(RecordHeader::decode(&header(stored).encode()).is_err(), "{stored}");
@@ -934,7 +934,7 @@ fn a_pack_left_behind_by_a_crash_is_removed_at_the_next_open() {
 
 /// A schema of one `u32` column, encoded by blaze-format's tiers: what a query's result made
 /// of columns is to the store. `broken` encodings give back other values from warm.
-struct OneColumn {
+pub(super) struct OneColumn {
     schema: SchemaHash,
     warm_schema: SchemaHash,
     broken: bool,
@@ -977,12 +977,12 @@ impl OneColumn {
     }
 }
 
-impl Columns for OneColumn {
-    fn schema(&self) -> SchemaHash {
+impl OneColumn {
+    pub(super) fn schema(&self) -> SchemaHash {
         self.schema
     }
 
-    fn warm(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
+    pub(super) fn warm(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
         let packed = blaze_format::tiers::Packed::pack(&self.values(hot)?);
         let mut out = blaze_format::MAGIC.to_vec();
         out.extend(self.warm_schema.0.0);
@@ -993,7 +993,7 @@ impl Columns for OneColumn {
         Ok(out)
     }
 
-    fn hot_from_warm(&self, warm: &[u8]) -> Result<Vec<u8>, String> {
+    pub(super) fn hot_from_warm(&self, warm: &[u8]) -> Result<Vec<u8>, String> {
         if warm.len() < WARM_HEAD || warm[8..40] != self.warm_schema.0.0 {
             return Err("not warm columns of the schema".into());
         }
@@ -1011,11 +1011,11 @@ impl Columns for OneColumn {
         Ok(self.hot(&values))
     }
 
-    fn cold(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
+    pub(super) fn cold(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
         Ok(blaze_format::tiers::encode_cold(&self.values(hot)?, None))
     }
 
-    fn hot_from_cold(&self, cold: &[u8]) -> Result<Vec<u8>, String> {
+    pub(super) fn hot_from_cold(&self, cold: &[u8]) -> Result<Vec<u8>, String> {
         let values = blaze_format::tiers::decode_cold(cold, None).map_err(|it| it.to_string())?;
         Ok(self.hot(&values))
     }
@@ -1028,7 +1028,7 @@ fn column_values(n: u32) -> Vec<u32> {
 
 fn with_columns(sim: &mut Sim, broken: bool) -> Store {
     let mut store = open(sim, "store");
-    store.encode_columns(Arc::new(one_column(broken)));
+    store.add_columns(Columns::Test(one_column(broken)));
     store
 }
 
@@ -1121,6 +1121,62 @@ fn a_cold_kind_of_columns_is_put_in_cold_columns() {
     let store = with_columns(&mut sim, false);
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
     assert_eq!(store.verify(None), Vec::new());
+}
+
+/// A span table whose starts climb by 12 and whose lengths cycle through eight: a `blaze_format`
+/// buffer of the kind every schema given to [`Store::encode_columns`] is.
+fn spans_buffer() -> Vec<u8> {
+    let mut spans = blaze_format::Spans::new(ContentId::of("blaze v2 store test", b"spans"));
+    for at in 0..4096 {
+        _ = spans.push(at * 12, 4 + at % 8);
+    }
+    blaze_format::to_bytes(&spans)
+}
+
+fn with_spans(sim: &mut Sim) -> Store {
+    let mut store = open(sim, "store");
+    store.encode_columns(blaze_format::Spans::columns());
+    store
+}
+
+#[test]
+fn a_buffer_given_its_buffer_columns_goes_warm_then_cold_and_reads_back() {
+    let mut sim = Sim::new(44, quiet());
+    let mut store = with_spans(&mut sim);
+    let hot = spans_buffer();
+    store.put(key(1), Kind::Query, hot.clone()).unwrap();
+    flush(&mut sim, &mut store);
+    for _ in 0..2 {
+        assert_eq!(settle(&mut sim, &mut store).demoted, 0);
+    }
+    assert_eq!(settle(&mut sim, &mut store).demoted, 1);
+    assert_eq!(form_of(&store, &key(1)), Form::Warm);
+    let warm = blaze_format::Spans::columns().warm(&hot).unwrap();
+    let (heat, entry) = store.get_in_place(&key(1)).unwrap().unwrap();
+    assert_eq!((heat, entry.bytes, entry.content), (Heat::Warm, warm.as_slice(), content_of(&hot)));
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+    assert_eq!(settle(&mut sim, &mut store).demoted, 0, "a warm record made last period stays");
+    assert_eq!(settle(&mut sim, &mut store).demoted, 1);
+    assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+    flush(&mut sim, &mut store);
+    drop(store);
+    let store = open(&mut sim, "store");
+    assert!(store.get(&key(1)).unwrap_err().what.contains("no encoding"));
+    drop(store);
+    let store = with_spans(&mut sim);
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn a_cold_kind_of_buffer_is_put_in_its_cold_columns() {
+    let mut sim = Sim::new(45, quiet());
+    let mut store = with_spans(&mut sim);
+    let hot = spans_buffer();
+    store.put(key(1), Kind::Run, hot.clone()).unwrap();
+    assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
 }
 
 #[test]
@@ -1547,4 +1603,56 @@ fn hits_and_warm_puts_allocate_nothing() {
     };
     hits(&store, "hits in packs and the index");
     hits(&store, "hits again");
+}
+
+/// A pinned value is the value put, at a 16-byte boundary, held past the task and the store:
+/// in place (the store's own bytes) for a raw record of a mapped pack at a 16-byte boundary,
+/// a copy for one in a writer's segment or kept compressed. A pinned hit in place allocates
+/// nothing but the count of its mapping.
+#[test]
+fn a_pinned_value_is_held_in_place_past_its_task_and_its_store() {
+    let mut sim = Sim::new(33, quiet());
+    let mut store = open(&mut sim, "store");
+    let values: Vec<Vec<u8>> = (0..8).map(|n| text(n, (8 << 10) + n as usize * 7)).collect();
+    for (n, value) in values.iter().enumerate() {
+        store.put(key(n as u64), Kind::Code, value.clone()).unwrap();
+    }
+    let aligned = |bytes: &[u8]| (bytes.as_ptr() as usize).is_multiple_of(16);
+    let in_segment = store.pinned(&key(0)).unwrap().unwrap();
+    assert!(!in_segment.in_place(), "a record in a writer's segment is copied");
+    assert_eq!(&*in_segment, values[0].as_slice());
+    assert!(aligned(&in_segment));
+    flush(&mut sim, &mut store);
+    let mut pinned = Vec::new();
+    for (n, value) in values.iter().enumerate() {
+        let it = store.pinned(&key(n as u64)).unwrap().unwrap();
+        assert_eq!((&*it, it.kind, it.content), (value.as_slice(), Kind::Code, content_of(value)), "{n}");
+        assert!(aligned(&it), "{n}");
+        let kept = store.get(&key(n as u64)).unwrap().unwrap().bytes;
+        assert_eq!(it.in_place(), aligned(kept), "{n}: in place exactly when the record is aligned");
+        if it.in_place() {
+            assert_eq!(it.as_ptr(), kept.as_ptr(), "{n}: the store's own bytes");
+        }
+        pinned.push(it);
+    }
+    assert!(store.pinned(&key(99)).unwrap().is_none());
+    // Unread for two periods, all but key 0 go to zstd; a pinned read of one is a copy.
+    settle(&mut sim, &mut store);
+    settle(&mut sim, &mut store);
+    assert_eq!(bytes_of(&store, &key(0)).unwrap(), values[0]);
+    settle(&mut sim, &mut store);
+    assert_eq!(form_of(&store, &key(1)), Form::Zstd);
+    let cold = store.pinned(&key(1)).unwrap().unwrap();
+    assert!(!cold.in_place());
+    assert_eq!(&*cold, values[1].as_slice());
+    let reader = store.reader();
+    let guard = enter();
+    let read = reader.pinned(&guard, &key(0)).unwrap().unwrap();
+    drop(guard);
+    reclaim_all(&mut store);
+    drop(store);
+    for (n, it) in pinned.iter().enumerate() {
+        assert_eq!(&**it, values[n].as_slice(), "{n}: held past the settle and the store");
+    }
+    assert_eq!(&*read, values[0].as_slice());
 }

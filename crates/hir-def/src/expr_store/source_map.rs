@@ -12,6 +12,7 @@
 
 use std::{fmt, marker::PhantomData};
 
+use blaze_ids::radix;
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId, name::Name};
 use la_arena::{Idx, RawIdx};
@@ -75,6 +76,27 @@ impl<K: Ord + Copy, V> IdTable<K, V> {
     }
 }
 
+impl<T, V: Copy + Send + Sync> IdTable<Idx<T>, V> {
+    /// [`IdTable::from_pushed`] of a pooled column, sorted in `scratch` (a stable radix sort by
+    /// id, allocation-free once `scratch` has held as many): the same table. `pushed` is left
+    /// empty with its capacity; the table is one allocation of its length.
+    pub(crate) fn from_pushed_in(
+        pushed: &mut Vec<(Idx<T>, V)>,
+        scratch: &mut Vec<(Idx<T>, V)>,
+    ) -> Self {
+        radix::sort_copy_by_key_in(pushed, |&(id, _)| id.into_raw().into_u32(), scratch);
+        // Stable, so equal ids stay in push order; keep the last of each run.
+        pushed.dedup_by(|later, kept| {
+            let same = later.0 == kept.0;
+            if same {
+                std::mem::swap(later, kept);
+            }
+            same
+        });
+        IdTable(take_exact(pushed))
+    }
+}
+
 /// The order of a [`SourceTable`]'s keys, total and the same on every run (a hash map's is
 /// neither): the file (files before macro files, each by its salsa id's bits), the range's start
 /// and end, the syntax kind. `expr_store/persist/source_map.rs` writes and checks tables in
@@ -117,6 +139,41 @@ impl<K: SourceKey, V> SourceTable<K, V> {
     pub(crate) fn from_pushed(pushed: &mut Vec<(K, V)>) -> Self {
         pushed.sort_by_key(|(key, _)| key.source_key());
         // Stable, so equal keys stay in push order; keep the last of each run.
+        pushed.dedup_by(|later, kept| {
+            let same = later.0.source_key() == kept.0.source_key();
+            if same {
+                std::mem::swap(later, kept);
+            }
+            same
+        });
+        SourceTable(take_exact(pushed))
+    }
+
+    /// [`Self::from_pushed`] sorting in `scratch`, a buffer of the caller's that keeps its
+    /// capacity: allocation-free but for the table once `scratch` has held as many. Two stable
+    /// radix sorts, by the key's last three fields and then by its first two, are one stable
+    /// sort by the whole key, so the table is the same.
+    pub(crate) fn from_pushed_in(pushed: &mut Vec<(K, V)>, scratch: &mut Vec<(K, V)>) -> Self
+    where
+        K: Copy + Send + Sync,
+        V: Copy + Send + Sync,
+    {
+        radix::sort_copy_by_key_in(
+            pushed,
+            |(key, _)| {
+                let (_, _, start, end, kind) = key.source_key();
+                (u128::from(start) << 48) | (u128::from(end) << 16) | u128::from(kind)
+            },
+            scratch,
+        );
+        radix::sort_copy_by_key_in(
+            pushed,
+            |(key, _)| {
+                let (file_kind, file, ..) = key.source_key();
+                (u128::from(file_kind) << 64) | u128::from(file)
+            },
+            scratch,
+        );
         pushed.dedup_by(|later, kept| {
             let same = later.0.source_key() == kept.0.source_key();
             if same {
@@ -369,6 +426,8 @@ pub(in crate::expr_store) struct FreezeScratch {
     pushes: Vec<u32>,
     run_starts: Vec<u32>,
     run_files: Vec<HirFileId>,
+    /// The buffers `finish` sorts the forward maps in.
+    pub(in crate::expr_store) sort: SortScratch,
 }
 
 const NO_PUSH: u32 = u32::MAX;
@@ -378,10 +437,54 @@ impl FreezeScratch {
         self.pushes.clear();
         self.run_starts.clear();
         self.run_files.clear();
+        self.sort.clear();
     }
 
     pub(in crate::expr_store) fn capacity(&self) -> usize {
-        self.pushes.capacity() + self.run_starts.capacity() + self.run_files.capacity()
+        self.pushes.capacity()
+            + self.run_starts.capacity()
+            + self.run_files.capacity()
+            + self.sort.capacity()
+    }
+}
+
+/// The buffers of `finish`'s stable sorts, one per forward map ([`SourceTable::from_pushed_in`],
+/// [`IdTable::from_pushed_in`]): their contents are unspecified after a sort.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(in crate::expr_store) struct SortScratch {
+    pub(in crate::expr_store) exprs: Vec<(ExprSource, ExprOrPatIdPacked)>,
+    pub(in crate::expr_store) pats: Vec<(PatSource, ExprOrPatIdPacked)>,
+    pub(in crate::expr_store) labels: Vec<(LabelSource, LabelId)>,
+    pub(in crate::expr_store) types: Vec<(TypeSource, TypeRefId)>,
+    pub(in crate::expr_store) lifetimes: Vec<(LifetimeSource, LifetimeRefId)>,
+    pub(in crate::expr_store) expansions: Vec<(InFile<MacroCallPtr>, MacroCallId)>,
+    pub(in crate::expr_store) fields: Vec<(ExprId, FieldSource)>,
+    pub(in crate::expr_store) field_pats: Vec<(PatId, PatFieldSource)>,
+}
+
+impl SortScratch {
+    fn clear(&mut self) {
+        let SortScratch { exprs, pats, labels, types, lifetimes, expansions, fields, field_pats } =
+            self;
+        exprs.clear();
+        pats.clear();
+        labels.clear();
+        types.clear();
+        lifetimes.clear();
+        expansions.clear();
+        fields.clear();
+        field_pats.clear();
+    }
+
+    fn capacity(&self) -> usize {
+        self.exprs.capacity()
+            + self.pats.capacity()
+            + self.labels.capacity()
+            + self.types.capacity()
+            + self.lifetimes.capacity()
+            + self.expansions.capacity()
+            + self.fields.capacity()
+            + self.field_pats.capacity()
     }
 }
 
@@ -444,7 +547,7 @@ impl<T, N: AstNode> BackPushes<T, N> {
             assert!(self.0.is_empty(), "syntax for an id of an empty arena");
             return BackMap::default();
         }
-        let FreezeScratch { pushes, run_starts, run_files } = scratch;
+        let FreezeScratch { pushes, run_starts, run_files, sort: _ } = scratch;
         pushes.clear();
         pushes.resize(len, NO_PUSH);
         for (at, &(id, _)) in self.0.iter().enumerate() {
@@ -1005,6 +1108,46 @@ pub(in crate::expr_store) mod tests {
                 assert_eq!(SourceTable::from_sorted(reversed.into_boxed_slice()), None);
             }
         }
+    }
+
+    /// The tables `from_pushed_in` sorts in a kept buffer are those `from_pushed` makes, past
+    /// std's stack buffer (600 pushes), and a warm sort allocates only the table.
+    #[test]
+    fn sorting_in_scratch_makes_the_same_table() {
+        let mut scratch = Vec::new();
+        for seed in 0..64 {
+            let mut rng = SplitMix64::new(seed);
+            let mut pushed: Vec<(ExprSource, u32)> =
+                (0..rng.below(600) as u32).map(|value| (seeded_src(&mut rng), value)).collect();
+            let mut model = pushed.clone();
+            let room = pushed.capacity();
+            let table = SourceTable::from_pushed_in(&mut pushed, &mut scratch);
+            assert!(pushed.is_empty() && pushed.capacity() == room, "the column keeps its room");
+            assert_eq!(table, SourceTable::from_pushed(&mut model));
+        }
+
+        let mut ids = Vec::new();
+        for seed in 0..64 {
+            let mut rng = SplitMix64::new(seed);
+            let mut pushed: Vec<(ExprId, u32)> = (0..rng.below(600) as u32)
+                .map(|value| (ExprId::from_raw(RawIdx::from_u32(rng.below(40) as u32)), value))
+                .collect();
+            let model = pushed.clone();
+            let table = IdTable::from_pushed_in(&mut pushed, &mut ids);
+            assert!(pushed.is_empty(), "the column is left empty");
+            assert_eq!(table, IdTable::from_pushed(model));
+        }
+
+        // Reversed, so the sort runs its passes through `scratch` rather than finding them sorted.
+        let mut pushed: Vec<(ExprSource, u32)> = (0..600)
+            .rev()
+            .map(|at| (src(0, false, SyntaxKind::CALL_EXPR, at, at + 1), at))
+            .collect();
+        let mut again = pushed.clone();
+        drop(SourceTable::from_pushed_in(&mut again, &mut scratch));
+        blaze_alloc_count::assert_at_most(1, "a warm sort in scratch: the table alone", || {
+            SourceTable::from_pushed_in(&mut pushed, &mut scratch)
+        });
     }
 
     #[test]

@@ -49,9 +49,12 @@
 
 pub mod assoc;
 pub mod attr_resolution;
+#[cfg(test)]
 mod collector;
 pub mod demand;
 pub mod diagnostics;
+mod facts;
+pub use self::facts::kinds;
 pub mod frozen;
 pub use hir_expand::proc_macro::may_have_session_macros;
 mod mod_resolution;
@@ -97,6 +100,7 @@ use crate::{
 };
 
 pub use self::path_resolution::ResolvePathResultPrefixInfo;
+pub use self::facts::impls::{ModuleImpls, module_impls};
 
 #[cfg(test)]
 thread_local! {
@@ -466,7 +470,7 @@ impl ModulesSlot {
     /// The modules of a `DefMap` that is being collected.
     fn building(&mut self) -> &mut ModulesMap {
         match self {
-            ModulesSlot::Building(modules) => modules,
+            ModulesSlot::Building(modules) | ModulesSlot::Unit { own: modules, .. } => modules,
             ModulesSlot::Collected(_) => {
                 panic!("the modules of a collected `DefMap` are read-only")
             }
@@ -480,6 +484,9 @@ enum ModulesSlot {
     Building(ModulesMap),
     /// A `Modules`, once it is.
     Collected(salsa::Id),
+    /// A view of the per-module resolver (`facts`): the modules it holds, and every other
+    /// module of its crate read through `facts::row` of `rows` (a `facts` `RowsKey`).
+    Unit { own: ModulesMap, rows: salsa::Id },
 }
 
 /// The items of one module, held by the database on their own. A query that reads the scope of
@@ -531,6 +538,19 @@ enum ScopeSlot {
     Building(Box<BuildingScope>),
     /// A `ModuleScope`, once it is.
     Collected(salsa::Id),
+    /// The `ModuleScope` a resolver fact names (a `facts` `ScopeRef`), looked up on first read.
+    Fact(salsa::Id),
+}
+
+impl ScopeSlot {
+    /// The `ModuleScope` of a handed-over or fact slot.
+    fn handle(&self, db: &Db) -> Option<salsa::Id> {
+        match self {
+            ScopeSlot::Building(_) => None,
+            ScopeSlot::Collected(id) => Some(*id),
+            ScopeSlot::Fact(fact) => Some(facts::fact_scope(db, *fact)),
+        }
+    }
 }
 
 const _: () = assert!(size_of::<ScopeSlot>() <= 16);
@@ -551,7 +571,6 @@ pub(crate) struct DefMapPair<'db> {
 
 #[salsa::tracked(returns(ref))]
 pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
-    let krate = crate_id.data(db);
     let _p = tracing::info_span!(
         "crate_def_map_query",
         name=?crate_id
@@ -566,23 +585,7 @@ pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
     if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
         return DefMapPair::new(db, def_map, local_def_map);
     }
-    let root_file_id = crate_id.root_file_id(db);
-    let module_data = ModuleData::new(
-        ModuleOrigin::CrateRoot { definition: root_file_id },
-        Visibility::Public,
-        None,
-    );
-
-    let def_map = DefMap::empty(
-        db,
-        crate_id,
-        Arc::new(DefMapCrateData::new(krate.edition)),
-        module_data,
-        None,
-    );
-    let (mut def_map, local_def_map) =
-        collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
-    def_map.hand_over_scopes(db);
+    let (def_map, local_def_map) = facts::collect_crate(db, crate_id);
     frozen::check(db, crate_id, &def_map, &local_def_map);
 
     DefMapPair::new(db, def_map, local_def_map)
@@ -614,14 +617,12 @@ pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
         Some(BlockInfo { block: block_id, parent: module }),
     );
 
-    let (mut def_map, _) = collector::collect_defs(
+    facts::collect_block(
         db,
         def_map,
         TreeId::new(ast_id.file_id, Some(block_id)),
-        Some(local_def_map.local(db)),
-    );
-    def_map.hand_over_scopes(db);
-    def_map
+        local_def_map.local(db),
+    )
 }
 
 impl DefMap {
@@ -694,7 +695,7 @@ impl DefMap {
             for (_, module) in modules.iter_mut() {
                 module.children_mut().shrink_to_fit();
                 module.scope_mut().settle_glob_ambiguities();
-                module.scope_mut().shrink_to_fit();
+                module.scope_mut().settle();
             }
         }
     }
@@ -725,6 +726,10 @@ impl DefMap {
         let id = unsafe { id.to_static() };
         let found = match &self.modules {
             ModulesSlot::Building(modules) => modules.get(&id),
+            ModulesSlot::Unit { own, rows } => match own.get(&id) {
+                Some(it) => Some(it),
+                None => facts::row(db, *rows, id),
+            },
             ModulesSlot::Collected(modules) => {
                 <Modules<'a> as salsa::plumbing::FromId>::from_id(*modules).module(db, id).as_ref()
             }
@@ -737,6 +742,7 @@ impl DefMap {
     fn table<'a>(&'a self, db: &'a Db) -> &'a ModulesMap {
         match &self.modules {
             ModulesSlot::Building(modules) => modules,
+            ModulesSlot::Unit { .. } => panic!("the modules of a resolver view are not listed"),
             ModulesSlot::Collected(id) => {
                 <Modules<'a> as salsa::plumbing::FromId>::from_id(*id).table(db)
             }
@@ -1134,8 +1140,9 @@ impl ModuleData {
     pub fn scope<'a>(&'a self, db: &'a Db) -> &'a ItemScope {
         match &self.scope {
             ScopeSlot::Building(building) => &building.scope,
-            ScopeSlot::Collected(id) => {
-                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).scope(db)
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+                let id = self.scope.handle(db).expect("a handed-over slot");
+                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id).scope(db)
             }
         }
     }
@@ -1144,8 +1151,9 @@ impl ModuleData {
     pub fn name_in_scope(&self, db: &Db, name: &Name) -> PerNs {
         match &self.scope {
             ScopeSlot::Building(building) => building.scope.get(name),
-            ScopeSlot::Collected(id) => {
-                *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(*id).name(db, name.clone())
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+                let id = self.scope.handle(db).expect("a handed-over slot");
+                *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(id).name(db, name.clone())
             }
         }
     }
@@ -1157,9 +1165,12 @@ impl ModuleData {
     ) -> Option<&'a [MacroId]> {
         match &self.scope {
             ScopeSlot::Building(building) => building.scope.get_legacy_macro(name),
-            ScopeSlot::Collected(id) => <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
-                .legacy_macro(db, name.clone())
-                .as_deref(),
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+                let id = self.scope.handle(db).expect("a handed-over slot");
+                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id)
+                    .legacy_macro(db, name.clone())
+                    .as_deref()
+            }
         }
     }
 
@@ -1170,10 +1181,10 @@ impl ModuleData {
     ) -> impl Iterator<Item = crate::TraitId> + 'a {
         let (building, collected) = match &self.scope {
             ScopeSlot::Building(building) => (Some(building.scope.traits()), None),
-            ScopeSlot::Collected(id) => (
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => (
                 None,
                 Some(
-                    <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id)
+                    <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(self.scope.handle(db).expect("a handed-over slot"))
                         .traits(db)
                         .iter()
                         .copied(),
@@ -1187,8 +1198,9 @@ impl ModuleData {
     pub fn children<'a>(&'a self, db: &'a Db) -> &'a FxIndexMap<Name, ModuleId> {
         match &self.scope {
             ScopeSlot::Building(building) => &building.children,
-            ScopeSlot::Collected(id) => {
-                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(*id).children(db)
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+                let id = self.scope.handle(db).expect("a handed-over slot");
+                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id).children(db)
             }
         }
     }
@@ -1196,7 +1208,9 @@ impl ModuleData {
     pub(crate) fn children_mut(&mut self) -> &mut FxIndexMap<Name, ModuleId> {
         match &mut self.scope {
             ScopeSlot::Building(building) => &mut building.children,
-            ScopeSlot::Collected(_) => panic!("the children of a collected module are read-only"),
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+                panic!("the children of a collected module are read-only")
+            },
         }
     }
 
@@ -1204,7 +1218,9 @@ impl ModuleData {
     pub(crate) fn scope_mut(&mut self) -> &mut ItemScope {
         match &mut self.scope {
             ScopeSlot::Building(building) => &mut building.scope,
-            ScopeSlot::Collected(_) => panic!("the scope of a collected module is read-only"),
+            ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
+                panic!("the scope of a collected module is read-only")
+            },
         }
     }
 
@@ -1274,7 +1290,7 @@ impl ModuleSource {
 }
 
 /// See `sub_namespace_match()`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MacroSubNs {
     /// Function-like macros, suffixed with `!`.
     Bang,

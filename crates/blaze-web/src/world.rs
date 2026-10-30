@@ -7,7 +7,7 @@
 //!   build put a function of, `Crate`, named as the crate, and in a crate its modules, `Module`,
 //!   named as the module, one in another as in the crate;
 //! - a function: `Function { key, name, how, ns, build }`, unnamed, in the module its path is
-//!   in ([`module_path`]: a type's path is a module here, as on the page), or the crate when
+//!   in ([`each_module`]: a type's path is a module here, as on the page), or the crate when
 //!   it is in none, and `Callees`, the functions it calls;
 //! - a module's `Callees`, the other modules its functions call, and `(Calls, crate)` on a
 //!   crate one of whose functions calls one of that crate's. A call that is gone stays until
@@ -100,10 +100,12 @@ pub struct Program {
     /// Each function, in the snapshot's order.
     nodes: Vec<Node>,
     by_key: FxHashMap<u64, u32>,
-    /// The nodes of each object of the build under way, by their ids in it.
+    /// The nodes of each object of the build under way, by their ids in it, and the maps of
+    /// the builds before, emptied, for the next build's objects.
     ids: FxHashMap<u32, FxHashMap<u32, u32>>,
+    spare_ids: Vec<FxHashMap<u32, u32>>,
     /// The nodes each node calls.
-    out: Vec<Vec<u32>>,
+    out: Calls,
     edges: usize,
     /// The modules that call one another, and the crates.
     calls: rustc_hash::FxHashSet<(Entity, Entity)>,
@@ -121,6 +123,94 @@ pub struct Program {
     /// Where the record told last begins in `told`, and how many have been told in all.
     told_last: usize,
     appended: u64,
+    /// What encodes each record told: its buffers are reused.
+    writer: blaze_protocol::cbor::Writer,
+}
+
+/// The nodes each node calls, in the order its calls were made: each node's a chain through one
+/// list of edges, so a node allocates nothing of its own, and the edges of a node said again
+/// are reused.
+pub(crate) struct Calls {
+    /// Each node's first and last edge, or [`END`].
+    ends: Vec<(u32, u32)>,
+    /// Each edge: the node it calls, and the next of its node's or [`END`].
+    edges: Vec<(u32, u32)>,
+    /// The first edge free, the rest chained through their next, or [`END`].
+    free: u32,
+}
+
+impl Calls {
+    pub(crate) fn new() -> Calls {
+        // alloc: none until they fill
+        let (ends, edges) = (Vec::new(), Vec::new());
+        Calls { ends, edges, free: END }
+    }
+
+    pub(crate) fn nodes(&self) -> usize {
+        self.ends.len()
+    }
+
+    /// Another node, calling none.
+    pub(crate) fn push_node(&mut self) {
+        self.ends.push((END, END));
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ends.clear();
+        self.edges.clear();
+        self.free = END;
+    }
+
+    /// Makes node `at` call none, and says how many it called.
+    pub(crate) fn clear_node(&mut self, at: u32) -> usize {
+        let (first, last) = std::mem::replace(&mut self.ends[at as usize], (END, END));
+        if first == END {
+            return 0;
+        }
+        let (mut edge, mut count) = (first, 1);
+        while edge != last {
+            edge = self.edges[edge as usize].1;
+            count += 1;
+        }
+        self.edges[last as usize].1 = self.free;
+        self.free = first;
+        count
+    }
+
+    pub(crate) fn contains(&self, at: u32, to: u32) -> bool {
+        self.of(at).any(|it| it == to)
+    }
+
+    /// Makes node `at` call `to` after the others it calls.
+    pub(crate) fn push(&mut self, at: u32, to: u32) {
+        let edge = match self.free {
+            END => {
+                self.edges.push((to, END));
+                self.edges.len() as u32 - 1
+            }
+            free => {
+                self.free = self.edges[free as usize].1;
+                self.edges[free as usize] = (to, END);
+                free
+            }
+        };
+        let ends = &mut self.ends[at as usize];
+        match ends.1 {
+            END => ends.0 = edge,
+            last => self.edges[last as usize].1 = edge,
+        }
+        ends.1 = edge;
+    }
+
+    /// The nodes `at` calls, in the order it was made to.
+    pub(crate) fn of(&self, at: u32) -> impl Iterator<Item = u32> + '_ {
+        let mut edge = self.ends[at as usize].0;
+        std::iter::from_fn(move || {
+            let &(to, next) = self.edges.get(edge as usize)?;
+            edge = next;
+            Some(to)
+        })
+    }
 }
 
 struct Node {
@@ -138,29 +228,37 @@ impl World {
     /// A program of the workspace at `root`, with no functions yet.
     pub fn program(&mut self, root: &Path) -> Program {
         let entity = self.workspace_of(root, 0);
+        // alloc: once per workspace
+        let root = root.to_owned();
+        // alloc: none until they fill
+        let (crates, crates_of, nodes) = (Vec::new(), Vec::new(), Vec::new());
+        // alloc: none until they fill
+        let (waiting, told, spare_ids) = (Vec::new(), Vec::new(), Vec::new());
         Program {
-            root: root.to_owned(),
+            root,
             entity,
             build: 0,
             changes: 0,
-            crates: Vec::new(),
-            crates_of: Vec::new(),
+            crates,
+            crates_of,
             crate_of: FxHashMap::default(),
             last_crate: 0,
             modules: FxHashMap::default(),
-            nodes: Vec::new(),
+            nodes,
             by_key: FxHashMap::default(),
             ids: FxHashMap::default(),
-            out: Vec::new(),
+            spare_ids,
+            out: Calls::new(),
             edges: 0,
             calls: Default::default(),
             module_calls: FxHashMap::default(),
             unnamed: FxHashMap::default(),
-            waiting: Vec::new(),
-            told: Vec::new(),
+            waiting,
+            told,
             told_count: 0,
             told_last: 0,
             appended: 0,
+            writer: blaze_protocol::cbor::Writer::new(),
         }
     }
 
@@ -176,7 +274,10 @@ impl World {
             Event::Began { .. } => {
                 program.build = build;
                 program.changes += 1;
-                program.ids.clear();
+                program.spare_ids.extend(program.ids.drain().map(|(_, mut ids)| {
+                    ids.clear();
+                    ids
+                }));
                 program.unnamed.clear();
                 program.waiting.clear();
                 program.told.clear();
@@ -237,10 +338,11 @@ impl World {
             text(&mut out, function.name);
         }
         out.extend((program.edges as u32).to_le_bytes());
+        // alloc: once per snapshot, which is made once per change a page asks for
         let mut sorted = Vec::new();
-        for (from, calls) in program.out.iter().enumerate() {
+        for from in 0..program.out.nodes() {
             sorted.clear();
-            sorted.extend_from_slice(calls);
+            sorted.extend(program.out.of(from as u32));
             radix::sort(&mut sorted);
             for &to in &sorted {
                 out.extend((from as u32).to_le_bytes());
@@ -301,8 +403,7 @@ impl World {
                 Some(&at) => {
                     // What it calls is said again below.
                     program.nodes[at as usize].krate = krate;
-                    program.edges -= program.out[at as usize].len();
-                    program.out[at as usize].clear();
+                    program.edges -= program.out.clear_node(at);
                     at
                 }
                 None => {
@@ -312,7 +413,7 @@ impl World {
                     self.flecs.set_parent(entity, parent);
                     let at = program.nodes.len() as u32;
                     program.nodes.push(Node { entity, krate, module: parent });
-                    program.out.push(Vec::new());
+                    program.out.push_node();
                     program.by_key.insert(function.key, at);
                     at
                 }
@@ -326,7 +427,9 @@ impl World {
             let entity = program.nodes[at as usize].entity;
             let (key, name) = (function.key, function.name.as_bytes());
             self.flecs.set_function(entity, key, name, how, ns, program.build);
-            program.ids.entry(object).or_default().insert(function.id, at);
+            let spare = &mut program.spare_ids;
+            let ids = program.ids.entry(object).or_insert_with(|| spare.pop().unwrap_or_default());
+            ids.insert(function.id, at);
             placed.push(at);
         }
         let mut calls = std::mem::take(&mut self.scratch.calls);
@@ -377,11 +480,10 @@ impl World {
         changed.extend_from_slice(&placed);
         changed_modules.clear();
         for &(from, to) in &calls {
-            let out = &mut program.out[from as usize];
-            if out.contains(&to) {
+            if program.out.contains(from, to) {
                 continue;
             }
-            out.push(to);
+            program.out.push(from, to);
             program.edges += 1;
             changed.push(from);
             let (from, to) = (&program.nodes[from as usize], &program.nodes[to as usize]);
@@ -405,8 +507,7 @@ impl World {
         let mut callees = std::mem::take(&mut self.scratch.callees);
         for &at in &changed {
             callees.clear();
-            let out = &program.out[at as usize];
-            callees.extend(out.iter().map(|&to| program.nodes[to as usize].entity));
+            callees.extend(program.out.of(at).map(|to| program.nodes[to as usize].entity));
             self.flecs.set_callees(program.nodes[at as usize].entity, &callees);
         }
         radix::sort(&mut changed_modules);
@@ -434,14 +535,15 @@ impl World {
         }
         let entity = self.flecs.named(program.entity, name.as_bytes(), Tag::Crate);
         let it = (program.crates.len() as u32, entity);
-        program.crates.push(name.to_owned());
         program.crates_of.push(entity);
-        program.crate_of.insert(name.to_owned(), it);
+        // alloc: once per crate of the program, its name by index and by name
+        program.crates.push(name.to_owned());
+        program.crate_of.insert(name.to_owned(), it); // alloc: as above
         program.last_crate = it.0;
         it
     }
 
-    /// The module a function is in ([`module_path`]), under its crate, from the crate's name on.
+    /// The module a function is in ([`each_module`]), under its crate, from the crate's name on.
     fn module_of(
         &mut self,
         program: &mut Program,
@@ -539,7 +641,7 @@ impl Program {
 
     fn tell(&mut self, record: &Record) {
         let at = self.told.len();
-        match blaze_protocol::cbor::append(&mut self.told, record) {
+        match self.writer.append(&mut self.told, record) {
             Ok(()) => {
                 self.told_last = at;
                 self.told_count += 1;
@@ -557,9 +659,19 @@ fn key(object: u32, id: u32) -> u64 {
     (u64::from(object) << 32) | u64::from(id)
 }
 
-/// The path a function is in, from how a backtrace names it: its path but its last segment,
-/// without generic arguments or closures, and of a method of `<T as Trait>` or `<T>`, `T`'s
-/// path. As the page's `moduleOf` (assets/names.js), so the world's modules are the page's:
+/// The segments of [`each_module`], collected.
+#[cfg(test)]
+pub fn module_path(name: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    each_module(name, &mut |it| out.push(it));
+    out
+}
+
+/// Each segment of the path a function is in, in order, each a slice of `name`, with nothing
+/// allocated. The path is read from how a backtrace names the function: its path but its last
+/// segment, without generic arguments or closures, and of a method of `<T as Trait>` or `<T>`,
+/// `T`'s path. As the page's `moduleOf` (assets/names.js), so the world's modules are the
+/// page's:
 ///
 /// ```text
 /// anim::scene::render                                  anim::scene
@@ -568,13 +680,6 @@ fn key(object: u32, id: u32) -> u64 {
 /// <alloc::vec::Vec<T> as core::ops::drop::Drop>::drop  alloc::vec::Vec
 /// <&[u8] as core::fmt::Debug>::fmt                     (none: a slice has no path)
 /// ```
-pub fn module_path(name: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    each_module(name, &mut |it| out.push(it));
-    out
-}
-
-/// Each segment of [`module_path`], in order, each a slice of `name`, with nothing allocated.
 fn each_module<'a>(name: &'a str, f: &mut impl FnMut(&'a str)) {
     if name.starts_with('<') {
         if let Some(end) = closing(name, 0) {

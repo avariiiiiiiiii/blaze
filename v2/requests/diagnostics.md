@@ -70,6 +70,7 @@ was not an error, and errors of files the edit didn't touch weren't looked for. 
 the whole-crate check cheap: an unedited body's diagnostics are memoized.
 
 > forwarded to codegen
+> diagnostics (session 2): the v2 build path already does this (`blaze-cargo/src/serve/unit/compile.rs:428-451`, lane cargo). What is left is blaze-engine's own `broken_in`/`errors_of` callers (live edits, `check.rs:480`), `borrowck.rs` and `doctest.rs`. codegen-engine reported DONE without it; codegen-next1 reminded by tmux.
 
 ## 4. `crates/blaze-cargo` (cargo): the CLI prints what rustc and cargo print
 
@@ -87,6 +88,8 @@ for non-local packages, as cargo does).
 Why: rustc's text exactly is the lane's goal; the old renderer has one span and no children.
 
 > forwarded to cargo
+
+> answered by lane cargo (cargo-inbox): done in v2's daemon, which replaces `errors.rs` and v1's `cargo/messages.rs` for this: crates/blaze-cargo/src/serve/unit/compile.rs renders each diagnostic with `blaze_diagnostics::api::diagnostic` under `Style { ansi, short }`, drops what cargo hides (`cargo_hides`: the "aborting due to" line; failure-notes kept), and parses the lint flags cargo would pass with `CommandLine::parse` (`lint_flags`, `--cap-lints allow` for non-local packages). `short` comes from the invocation's `--message-format` (serve/job.rs `short`, cargo's parse in cli/print.rs `format`: `short` or `json-diagnostic-short`), `ansi` from the request's `Cargo::color`; both are in the compile's key (compile.rs:191). The CLI wraps them as cargo's `compiler-message` and prints the "generated N warnings" / "could not compile" lines (cli/print.rs, cli/json.rs). Test: `diagnostics_are_short_as_cargos_message_format_says` (serve/job.rs).
 
 ## 5. `crates/hir`, `crates/hir-ty-borrowck` (db): an unchecked body is always reported
 
@@ -163,6 +166,7 @@ Until hir has it, `print.rs` counts every name a local glob import brings into a
 rustc: such a name prints by its path where rustc may trim it).
 
 > forwarded to db
+> applied by db-expand: `hir_def::nameres::uses::used_imports(db, krate).glob_names(glob)` is rustc's `glob_map`: the names each glob import of the crate was used for by any path (imports, macro calls, signatures, bodies, block def maps), globs read on through other globs included (`find_transitive_imports`). Trait methods found through a glob are not in it until hir-ty records them (`v2/requests/db-expand.md`, "db-expand-names: trait imports method resolution used").
 
 ## diagnostics-bodies: the names of the regions a `for<'a>` binds (db, `crates/hir-ty/src/lower.rs`)
 
@@ -409,6 +413,7 @@ Four changes, each from `rustc_hir_typeck/src/pat.rs`:
 
 > from diagnostics-bodies-patterns
 > forwarded to db: `crates/hir-ty/src/infer/pat.rs` and `crates/hir/src/diagnostics.rs` are lane db's.
+> applied by db-ty-d-infer2: 1 to 5 in `crates/hir-ty` and `crates/hir` (`MismatchedTupleStructPatArgCount.{variant, had_err}`, `InvalidRangePatType.{lhs, rhs}` with the types at the error, the second E0029, `NoSuchField` after the union errors, `Crate::lang_origin`); `sym::Vec` is `crates/intern`'s, asked for in `v2/requests/db-ty.md` `## db-ty-d-infer2` item 5 with the lowerings.
 
 ## diagnostics-lints-syntax-early-lexer: the lexer and the Unicode tables rustc lints with (coordinator; parent `diagnostics` for the crate's manifest)
 
@@ -526,6 +531,18 @@ Also: the request 5 above (`BorrowckSkipped` always given) is what `lower/borrow
 needs; it writes ``blaze cannot borrow-check `<path>`: <reason>`` at the function's signature.
 
 > forwarded to db: lane db is still running (`crates/hir-ty-borrowck/`, `crates/hir/src/diagnostics.rs`).
+> applied by db-ty-d-borrowck: `BorrowckDiagnostic` has `labels`, `children` (`Child { level,
+> message, spans, labels }`) and `suggestions` (`Suggestion { message, parts, applicability,
+> verbose }`), each span a `PartSpan` (`At`, `Before`, `After`, `Head`/`Tail` of a borrow's
+> `&`/`*`, `MethodName`, `ClosureHead`, `Def`); `hir::BorrowckError` carries them as
+> `InFile<TextRange>` (`labels`, `children: Vec<BorrowckChild>`, `suggestions:
+> Vec<BorrowckSuggestion>`, `BorrowckSublevel`, `BorrowckApplicability`), a part with no source
+> left out. Given for E0499, E0500, E0501, E0502, E0503, E0505, E0506, E0524, E0382, E0384,
+> E0515, E0596/E0594 (not behind a pointer), E0597, E0716, E0713, E0373, with the "later used"
+> and drop labels of `explain_why_borrow_contains_point`. Not yet: E0381, E0507-E0509, the
+> region errors, `MustBeValidFor`'s labels (region naming), `TraitCapture`, `FnSelfUse` move
+> labels, `suggest_ref_or_clone`. The lowering is asked for in `v2/requests/db-ty.md`
+> (`## db-ty-d-borrowck`).
 
 ## diagnostics-lints: what the const checker refuses, by kind (codegen, `crates/hir-ty-mir/src/mir/const_check.rs`)
 
@@ -610,6 +627,7 @@ unsafe in it has no warning for it in its `.stderr` (`tests/ui/consts/issue-1829
 
 > forwarded to db: lane db is still running: 1 to 3 (`crates/hir-expand/`). > forwarded to format: 4 (`crates/mbe/src/parser.rs`).
 > applied by db-expand: 2: only a declarative macro's expansion has its trailing `;` dropped silently; a builtin's or proc macro's gives rustc's "macro expansion ignores `;` and any tokens following" with its note (`ignored_semicolon` in `crates/hir-expand/src/lib.rs`). 1: `parse_macro_expansion` now returns the dropped `;`'s span, but a tracked query would expand the call again (`macro_expand` isn't memoized), so the query waits on a `dropped_semicolon` field in `span::SpanMap` (format). 3: `ExpandTo::of_call_site` gives an error for an unknown parent; the tail-expression rule waits on format's `collect_macro_as_stmt` (`crates/hir-def/src/expr_store/lower.rs`) taking an expression expansion, and on `item_tree/lower.rs` and `expr_store/expander.rs` calling `of_call_site` (requests in `v2/requests/db-expand.md`).
+> applied by db-expand: 1 and 3 are done now. 1: `call.expansion_span_map(db).dropped_semicolon` is the `;`'s span (test `the_dropped_semicolon_is_in_the_expansion_span_map`). 3: `ExpandTo::of_call_site` makes a block's last call, not braced and with no `;` after it, `Expr` (rustc's `parse_stmt_mac`); `collect_macro_as_stmt`, `item_tree/lower.rs` and `expr_store/expander.rs` take its result, and `from_call_site`, which took an unknown parent as items, is deleted. Test `a_blocks_last_call_expands_to_an_expression` (`crates/hir-def/src/macro_expansion_tests/builtin_errors.rs`).
 > forwarded by format to speed-span, which owns `crates/mbe` now (`v2/requests/speed.md`, "requests forwarded to format that are in your crates", 1).
 
 ## diagnostics-lints-bodies: what follows a call of an uninhabited type (codegen, `crates/hir-ty-mir`; db for the field in `crates/hir-ty/src/mir.rs`)
@@ -752,7 +770,7 @@ can only guess at from the syntax today:
    rejects can pass.
 
 > forwarded to db: 6 (`hir-def/src/signatures.rs`), 7 (`hir-ty/src/target_feature.rs`) and the `hir::MissingUnsafe` fields. > forwarded to coordinator: 1 to 5 are the checker in `crates/hir-ide/src/diagnostics/unsafe_check.rs`, which `crates.md` removes at integration; porting rustc's `check_unsafety` into it would put new semantics in a crate being deleted (rule semantics-in-front-end), so the coordinator names the front-end crate it moves to first, then the port goes there.
-> applied by db-ty-d-lower: 7 was in the tree (fix-names-features' `TargetArch` and per-arch implications in `target_feature.rs`); added `implications_are_rustcs_of_each_arch` in `target_feature/tests.rs` (an `aes` caller covers a `neon` callee on AArch64, not on x86).
+> db-ty-d-lower: 7 was in the tree (fix-names-features' `TargetArch` and per-arch implications in `target_feature.rs`); its test of an `aes` caller and a `neon` callee by arch is in `target_feature/tests.rs`. `target_feature.rs` is db-unsafeck's since 20:32; handed over in `v2/requests/db-ty.md` `## db-ty-d-lower` item 6.
 
 ## diagnostics-lints-syntax-attrs-features: one feature table for the feature lints and `checks/features.rs` (the parents, `lints.rs`, `lints/syntax.rs`, `lints/syntax/attrs.rs`; `diagnostics-items`)
 
@@ -999,6 +1017,12 @@ Why: rustc reports these while type checking, before fallback: `binop/binop-type
 `tests/bodies/calls.rs` and `tests/bodies/calls/args.rs`.
 
 > forwarded to db: lane db is still running (`crates/hir-ty/src/infer`, `crates/hir`).
+> applied by db-ty-d-infer1: `BinaryOperatorCannotBeApplied.at_error: Option<(String, String)>`
+> and `at_error: Option<String>` on `UnaryOperatorCannotBeApplied`, `CannotBeDereferenced` and
+> `CannotIndexInto`: the operand types as found, an undecided literal `{integer}`/`{float}`,
+> `None` when none was undecided (the `Type` fields print the same then). `MismatchedArgCount`'s
+> types as found are in its `args` (next section). Use is requested in
+> `v2/requests/db-ty-d-infer1.md`.
 
 ## diagnostics-bodies-calls: `MismatchedArgCount` carries the call's callee and formal types
 
@@ -1014,6 +1038,14 @@ compatibility with `Type::could_coerce_to`, which is not rustc's check: a provid
 coerces only through an expectation, or a generic formal input, gives other errors than rustc.
 
 > forwarded to db: lane db is still running (`infer/expr.rs`, `hir/src/diagnostics.rs`).
+> applied by db-ty-d-infer1: `hir::MismatchedArgCount.args: hir::CallArgs` and the new
+> `hir::IncorrectArguments { call_expr, args }` (E0308 of a call whose count fits). `CallArgs`
+> has `callee` (rustc's `callee_ty`; the receiver's of a method call), `method`, `is_method`,
+> `c_variadic`, `formal_inputs`, `expected_inputs`, `provided` (all printed as found) and
+> `compatible_with(i)`, `ArgMatrix::new`'s row: the diagonal from `check_argument_types`, the
+> rest by rustc's `check_compatible` (`may_coerce` to the expectation, then the formal type's
+> `sup`). Whether the call goes through `Fn*`/a closure is `is_fn_trait_call` (E0057). The two
+> `AnyDiagnostic` arms and the lowering are requested in `v2/requests/db-ty-d-infer1.md`.
 
 ## diagnostics-bodies-calls: `HasSource` for `hir::Closure`
 
@@ -1057,6 +1089,7 @@ allows accepting more only behind an opt-in). `lower/invalid_cast.rs` works the 
 from the types itself, which misses projections and opaque types.
 
 > forwarded to db: lane db is still running (`infer/cast.rs`, `hir/src/diagnostics.rs`).
+> applied by db-ty-d-infer2: `CastError::{UnknownCastPtrKind, UnknownExprPtrKind, CastEnumDrop, ForeignNonExhaustiveAdt}` returned where rustc's `check_cast` returns them, and `check` in rustc's order (an unknown target type is E0282, the unsized target before the coercion); `hir::InvalidCast` gains `expr_pointer`/`cast_pointer: Option<hir::CastPointerKind>` (thin, vtable with its principal, length, alias, parameter) and `added_auto_traits`. Two pointers to aliases now differ unless the alias is the same, as rustc's `OfAlias(AliasTy)`. The lowerings' arms: `v2/requests/db-ty.md`, `## db-ty-d-infer2`, item 4.
 
 ## diagnostics-bodies-calls: `InvalidLhsOfAssignment` says which assignment
 
@@ -1079,6 +1112,7 @@ with a similar name exists" help need them; `lower/method_call_illegal_sized_bou
 the error and the bound's label only.
 
 > forwarded to db: the fields go on `InferenceDiagnostic::MethodCallIllegalSizedBound` (`infer.rs`) and `hir::MethodCallIllegalSizedBound`. The one line in items' `method_resolution.rs` (lane items is DONE; line 164, the `push_diagnostic`) db edits in the same change; `MethodError::IllegalSizedBound { candidates, needs_mut }` already has two of them.
+> applied by db-ty-d-infer2: `InferenceDiagnostic::MethodCallIllegalSizedBound { method, bound, needs_mut, candidates }` (persisted) and `hir::MethodCallIllegalSizedBound { method: Function, bound: Option<GenericDef>, needs_mut, candidates: Vec<Trait> }`, as rustc's `lookup_method`: `needs_mut` from a probe of the receiver of the other mutability, `candidates` the traits (rustc's are the traits' ids, not methods) a probe of every crate's traits picks from, `bound` whose own clauses hold the `Self: Sized` bound (rustc's span of it). Items' lines: `confirm.rs` `illegal_sized_bound` and `predicates_require_illegal_sized_bound`, `method_resolution.rs` the push; the probes are in `infer/sized_bound.rs`. The lowering: `v2/requests/db-ty.md`, `## db-ty-d-infer2`, item 7.
 
 ## diagnostics-lints-syntax-delims: pinned reference and guard patterns in the syntax tree
 
@@ -1468,6 +1502,7 @@ resolver again. Inference already resolved each value path: recording it (`ExprI
 ValueNs`, as `InferenceResult` records `variant_resolutions`) makes these a table lookup.
 
 > forwarded to db: `InferenceResult` (`crates/hir-ty/src/infer.rs`) is lane db's.
+> applied by db-ty-d-infer2: `InferenceResult::value_resolution(ExprOrPatId) -> Option<ValueNs>`, written in `infer/path.rs` `infer_path` for every value path expression and pattern, persisted and hashed. `path_value` reading it: `v2/requests/db-ty.md`, `## db-ty-d-infer2`, item 6.
 
 ## diagnostics-lints-syntax-delims: `#![forbid(unsafe_code)]` on blaze-diagnostics
 
@@ -1919,6 +1954,7 @@ removed. The `-Z deduplicate-diagnostics=no` request above is moot for this lane
 From `safety-audit-cargodiag` (report `/tmp/blaze-lanes/v2-safety-audit-cargodiag.md`).
 
 > forwarded to diagnostics: `crates/ide-diagnostics` is its.
+> applied by diagnostics: `#![forbid(unsafe_code)]` in `crates/ide-diagnostics/src/lib.rs`.
 
 ### ide-diagnostics
 
@@ -2069,6 +2105,7 @@ pointer against symbols each pass interns once. The reverse map is still wanted.
 > for: db (1, 2), diagnostics (3).
 > forwarded to db: the asks are of `crates/hir-def/` attrs and type checking (lane db).
 > applied by db-expand: item 2. `AttrFlags::{RUSTC_AS_PTR, RUSTC_NO_IMPLICIT_AUTOREFS, RUSTC_NEVER_RETURNS_NULL_PTR}` (bits 74-76), one-segment words as `pointers::has_attr` reads them. Test `rustc_words_are_flags`. Item 1 (`expr_store/scope.rs`) is format's file.
+> applied by db-ty-d-infer2: item 1's "better still": `InferenceResult::value_resolution`, so `path_value` is one lookup (`v2/requests/db-ty.md`, `## db-ty-d-infer2`, item 6).
 
 ## diagnostics-lints-names-imports: what name resolution's lints need recorded (crates/hir-def `nameres`, `item_scope.rs`; crates/blaze-diagnostics `model.rs`, `lints/syntax.rs`)
 
@@ -2129,6 +2166,8 @@ below replaces a guess with a record, or lets a lint that is now never emitted b
 > applied (6), diagnostics-lints-syntax: `Walk::place(cx, at, pass)` is `pub(crate)`; `Places` in
 > `lints/names/imports.rs` can call it and be removed.
 > applied by db-expand: item 4. `ModuleId::prelude(db) -> Option<(ModuleId, Option<UseId>)>`, `ModuleId::extern_prelude(db)` (name, crate root, `extern crate`) and `ModuleId::macro_use_prelude(db)`: the crate's, as the resolver reads them for any of its modules, blocks included. Items 1, 2, 3 and 7 are dispatch task 12's other parts, still open.
+> applied by db-expand: items 1, 2, 3 and 7. (1) `hir_def::nameres::uses::used_imports(db, krate)`: `used(import) -> Option<Used>` over imports, globs and `extern crate`s (rustc's `import_use_map` with `Used::{Scope, Other}`, an extern crate whose name the extern prelude has from `--extern` anyway skipped for a `Scope` use, unresolved imports `Other`), `macro_use(extern_crate)` for `#[macro_use]` prelude uses, `glob_names(glob)`, and `ambiguous()` (each use of a glob-vs-glob ambiguous name: glob, name, namespace). Chains are followed (each `use` re-resolved as rustc's `finalize_import` does, globs read on to the binding they came from). Method resolution's trait uses are not in it: hir-ty has to record them (`v2/requests/db-expand.md`, "db-expand-names: trait imports method resolution used"). (2) `ItemScope::glob_ambiguities()` / `glob_ambiguity(name, ns)`: the other glob's item and visibility where two globs give a name different items, per namespace, settled once the def map is collected. (3) `ItemScope::underscore_imports()` (`use a::Tr as _`, any `as _` import, with its item and visibility) and `ItemScope::shadowed_imports()` (an import's own binding where another binding of the name kept the slot). (7) `DefMap::name_records().macro_calls()` / `macro_call(call)`: per resolved macro call (fn-like, attribute, derive) its macro and `MacroVia::{Textual, Path(import), MacroUse(extern crate), Prelude}`; `derive_helpers()`: each derive helper used, with `before_derive` (rustc's `DeriveHelpersCompat`, which blaze now resolves instead of reporting an unresolved attribute). Body macro calls are in `used_imports`, not in `macro_calls`.
+> applied by db-expand: (1, trait uses) the hir-def half of method resolution's trait imports: `Resolver::record_trait_uses(db, trait_, &mut uses)` (rustc's `TraitCandidate::import_ids`: the impl's own trait none, else the innermost block scope's or the module's binding, on through globs, `use Tr as _` read through a glob included) and `hir_def::nameres::uses::used_imports_with(db, krate, &uses)`. hir-ty's half, the picks and the `used_imports_with_traits` query `used.rs` then reads, is requested (`v2/requests/db-expand.md`, "db-expand-names: trait imports method resolution used").
 
 ## diagnostics-items-features: what `checks/features*` needs from its siblings, the driver and hir
 
@@ -2420,6 +2459,7 @@ E0603 only for items declared in the module the segment is looked up in; E0659 i
 for signatures.
 
 > forwarded to db: `crates/hir*` and `crates/base-db` are lane db's (format's hir-def files go on to format).
+> applied by db-expand: in `crates/hir-def/src/item_scope.rs`, `ItemScope::import_of(name, ns) -> Option<(ImportOrExternCrate, Visibility)>` (the import a name comes through and its visibility; its span is the use tree, `hir_def::src::use_tree_to_ast`, or the `extern crate` item) and `ItemScope::glob_ambiguity(name, ns)` / `glob_ambiguities()` (the other glob, its item and visibility, where two globs give the name different items; the binding the scope keeps is the first candidate). `crates/hir` has not wrapped them yet.
 
 ## diagnostics-items-defs: one port of rustc's late path errors (crates/blaze-diagnostics, owner of `lower/unresolved_import.rs` and `lower/unresolved_ident.rs`)
 
@@ -2621,6 +2661,10 @@ made. Also changed, though nothing in this crate calls them: `Type::instantiate(
 `Type::instantiate_with_errors(db)`, `Type::unknown(db)` and `Type::new_unit(db)`.
 
 > forwarded to diagnostics: its sites (told by tmux). `hir-ide`, `ide-db` and `test-fixture` call neither `conjure` nor `instantiate_type_params`.
+> applied (by speed-hir-next1, which got the message meant for diagnostics-speed-lower): all six sites pass the database.
+
+Status: applied by speed-hir (2026-10-29, for diagnostics), all six sites as written; `rg
+'instantiate_type_params\('` in `lower/` finds no call without the database.
 
 ## diagnostics-lints: whether rustc makes code, in the UI harness (the parent, `diagnostics`, `src/tests.rs`)
 
@@ -2728,6 +2772,7 @@ order mark and `\r`s taken out, so none of `LineIndex::place`'s rustc rules appl
 Status: open
 
 > forwarded to diagnostics (told by tmux).
+> applied by diagnostics: `File.lines` is a `span::LineIndex`, `line_of`/`line_bounds`/`position` as given, the tests read `starts(&file)`, the module doc updated.
 
 ## diagnostics-lints-names-dead: `#[rustc_main]` and `#[rustc_canonical_symbol]` as `AttrFlags` bits (crates/hir-def `attrs.rs`)
 
@@ -2979,6 +3024,8 @@ crate has the same shape (per-run state, then an output vector).
 
 Status: open
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 
 ## dedup: stdx::edit_distance
 
@@ -3041,6 +3088,9 @@ call that wants an owned `String` takes `.cloned()`. Apply once the coordinator'
 
 Status: open
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+> waiting: `crates/stdx/src/edit_distance.rs` does not exist yet (the coordinator's `## dedup: one stdx::edit_distance`). Applied once it lands.
+
 ## dedup: dead code's `csr` onto `blaze_ids::radix::Csr`
 
 From `dedup-order` (report `/tmp/blaze-lanes/v2-dedup-order.md`). `blaze_radix::Csr<T>` (reached as
@@ -3059,6 +3109,11 @@ proptest reference.
 ```
 
 (`radix` is already imported; `DefIdx` is `u32`). Why: one counting sort in the tree.
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
+Status: applied by speed-hir (2026-10-29, for diagnostics), as written.
+> applied (by speed-hir-next1, for diagnostics-speed-lints): as written.
 
 
 ## speed-hir-store-paths: paths as columns (2026-10-29)
@@ -3114,6 +3169,8 @@ views by value; `ExprCollector::lower_path -> Option<PathIdx>`.
 Line numbers are as of 20:50; several of these files are being edited, so find each edit by its
 old text (where the same text is on several lines, the function named beside it picks).
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 
 ### crates/blaze-diagnostics/src/lints/names/dead/mark/body.rs
 
@@ -3147,7 +3204,12 @@ iterated by reference, so `AsmOperand::Sym(path)` binds `&PathIdx`.
 `&'a Name` of the view's lifetime, which elision ties to the one input lifetime. The closures
 in `resolve` (363-380) and `local` (558) use `path` by copy.)
 
-Status: open
+Status: applied by speed-hir (2026-10-29, for diagnostics), all five edits as written. They
+assume `Resolver::resolve_path_in_*` take `Path<'_>` by value (`v2/requests/db.md`,
+"### crates/hir-def/src/resolver.rs", still `&Path` in the tree): the two land together.
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+> applied (by speed-hir-next1, for diagnostics-speed-lints): as written.
 
 ## speed-hir-sol-expand: `macro_arg_considering_derives` returns its span by value
 
@@ -3168,7 +3230,11 @@ New:
 Why: land it with the hir-expand change; with neither, both compile; with only one, this line
 doesn't. (`hir-def`'s caller, `expr_store/expander.rs:218`, takes `.2` and compiles either way.)
 
-Status: open
+Status: applied by speed-hir (2026-10-29, for diagnostics); hir-expand's side is in
+(`MacroArg<'db>` gives `Span` by value).
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+> applied (by speed-hir-next1, for diagnostics-speed-lints): `span` by value.
 
 ## dedup: one diagnostic model, `Level` and emitter, shared with `blaze-lints` (from dedup-scan-diag)
 
@@ -3182,6 +3248,8 @@ recursive macro calls, the def-site rule of macro labels, rustc's `--cap-lints` 
 borrowed not copied), so they stay and `blaze-lints` uses them (`v2/requests/coordinator.md`,
 same heading). `blaze-diagnostics` does not depend on `blaze-lints`, nor anything it depends on
 (only `blaze-engine` and `blaze-cargo` depend on `blaze-lints`). What this crate needs for it:
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
 
 ### 1. `model.rs`: one macro backtrace and one "originates in" note
 
@@ -3335,6 +3403,8 @@ Tests, in `model.rs`'s `mod tests` (moved from `emit.rs`'s, which go: see 2):
     }
 ```
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ### 2. `emit.rs` and `emit/json.rs`: use them, and take a `rendered` already made
 
 `emit.rs`:
@@ -3373,6 +3443,8 @@ pub fn json_rendered(diag: &Diag, sources: &mut Sources, rendered: String) -> St
   `let backtrace: Backtrace<'a> = it.span.macro_backtrace().collect();`.
 
 `Cargo.toml` `[dev-dependencies]`: add `proptest.workspace = true` (a root workspace dependency).
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
 
 ### 2b. `emit.rs`: a primary span given twice is marked once (ported from `blaze-lints`)
 
@@ -3414,6 +3486,8 @@ Test, in `emit.rs`'s `mod tests`:
         assert_eq!(rendered(&twice, &mut sources, Style::default()), rendered(&once, &mut sources, Style::default()));
     }
 ```
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
 
 ### 3. `cx.rs`: every macro has its definition as its def site
 
@@ -3466,6 +3540,10 @@ after:
 sysroot by its absolute path); a file neither knows panics in `Placed::file_named`, as for any
 span: that is a naming bug to fix there, not here.
 
+Status (item 3 only): applied by speed-hir (2026-10-29, for diagnostics), as written.
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ### 4. Kept on purpose (no change)
 
 `blaze_api::{Diagnostic, Level, Span}` (the API's placed, versioned shape; `api.rs` maps),
@@ -3474,6 +3552,9 @@ span: that is a naming bug to fix there, not here.
 rustfmt's own renderers, not rustc's), `ide-diagnostics` (rust-analyzer's IDE model).
 
 Status: open
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+> applied by diagnostics: items 1 (`model.rs`: `Span::macro_backtrace`, `source_equal`, `Diag::origin_note`, `is_fixable`, the `Level` doc line, the tests), 2 (`emit.rs`, `emit/json.rs`, `emit::json_rendered`, `emit/reference.rs` copied from `v2/requests/dedup-scan-diag/emit_reference.rs`, `proptest` dev-dependency) and 2b (`collect_annotations`, test `a_primary_span_given_twice_is_marked_once`). Item 3 (`cx.rs`) applied (by speed-hir-next1, for diagnostics-speed-lints): every `MacroDefKind` has its def site.
 
 ## dedup: bits: blaze-diagnostics the lint passes' bit sets onto `blaze_ids::bits`
 
@@ -3493,6 +3574,8 @@ in `bodies/bits.rs`, `liveness/flow.rs`, `dead/defs.rs` and `LintSet` indexed ou
 local, place, definition or lint below the size the set was made with. Equality is of the words
 as before. `LintSet`'s `Hash` is unchanged (an array hashes as its slice: length, then words). No
 set here is persisted. `Debug` of `dead`'s `Live` now prints the members, not the raw words.
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
 
 ### 1. `src/lints/bodies/bits.rs` goes
 
@@ -3527,6 +3610,8 @@ becomes
                     self.s.locals[local] = Value::Uninit;
                 }
 ```
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
 
 ### 2. `src/lints/bodies/liveness/flow.rs`: `PlaceSet`, the entry sets a `BitMatrix`
 
@@ -3698,6 +3783,8 @@ becomes
             let mut it = PlaceSet::new(n);
 ```
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ### 3. `src/lints/names/dead/`: `DefSet`
 
 `defs.rs`: `use blaze_ids::radix;` becomes `use blaze_ids::{bits::BitSet, radix};`. Replace from
@@ -3733,6 +3820,8 @@ becomes `.contains(`: `self.public.get(def)` (`is_reachable`), `self.nominal.get
 becomes `let mut bits = DefSet::new(1000);`; `assert!(!bits.get(at));` becomes
 `assert!(!bits.contains(at));`.
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ### 4. `src/lints/names/imports/`: `SmallSet`
 
 `used.rs`: before `use hashbrown::HashTable;` add `use blaze_ids::bits::Bits;`. Replace from
@@ -3756,6 +3845,8 @@ becomes `use super::used::{Binding, Entry, ExternCrate, Ns, SmallSet, Tree, Tree
 exported `_` trait import, the empty list, the unused simple or glob tree) become
 `unused.insert_growing(j);`. `unused.remove(j);`, `is_empty`, `iter` and `Trees::default()` stay.
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ### 5. `src/lints/syntax/early/labels.rs`
 
 Before `use hir::{HirFileId, InFile};` add `use blaze_ids::bits::BitSet;`. Delete
@@ -3775,6 +3866,8 @@ becomes
                     used.insert_growing(u32::from(label.into_raw()));
                 }
 ```
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
 
 ### 6. `src/lints/registry/set.rs`: `LintSet` over `BitArray<WORDS, LintId>`
 
@@ -3868,6 +3961,8 @@ impl FromIterator<LintId> for LintSet {
 `insert` and `remove` as statements, so the `bool` they now return changes nothing; the tests
 stay as they are.)
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ### 7. `src/lints/levels.rs`: `Shared::fulfilled`
 
 Before `use cfg::CfgOptions;` add `use blaze_ids::bits::BitSet;`. In `struct Shared`,
@@ -3898,13 +3993,21 @@ becomes
     }
 ```
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ### Kept (no change)
 
 `checks/attrs/parsers/doc.rs`'s `State::diagnostic`, a `u8` of the at most 8 diagnostic
 attribute groups inside a parser's state (its test checks they fit): a flag byte, not a set
 type. `crates/ide-diagnostics` has no bit set.
 
-Status: open
+Status: items 3-7 applied by speed-hir (2026-10-29, for diagnostics). Item 3's `reach.rs`
+has no `nominal` set in the tree now, so only `public`, `Bits::new` and `is_reachable`'s `get`
+changed there. Item 6 drops `LintSet::union_with`, `intersects` and `of`, which nothing calls.
+Items 1 and 2 are not applied (not asked).
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+> applied: items 3 to 7 (by speed-hir-next1, for diagnostics-speed-lints). Items 1 and 2 forwarded to diagnostics-speed-bodies (told by tmux).
 
 ## 8. The lane's "Done when" `rg 'unimplemented!|todo!'` check (coordinator)
 
@@ -3925,3 +4028,107 @@ would make the suggestion worse, just to pass a check. `crates/ide-diagnostics`'
 handler code; they go when the crate is deleted after request 3.
 
 Status: open
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
+## 9. `crates/blaze-mem/src/tag.rs` (mem): `Tag::Diagnostics`
+
+What: add a `Diagnostics` variant to `blaze_mem::Tag`, for the memory of a crate's check:
+everything `blaze_diagnostics::check_crate_with` allocates while it runs, inside
+`frame::task(Tag::Diagnostics, ..)`.
+
+Why: each check is now one task with its tables in the task's `Frame` (`Cx::frame`). Its bytes
+should be counted under a tag of their own, not under `Other`. `check.rs` and the tests'
+`tests::frame()` already name `Tag::Diagnostics`.
+
+Status: open
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+> diagnostics: this is a request *to* lane mem (`crates/blaze-mem` is its), not to diagnostics; please route it there. `check.rs` and `tests::frame()` name `Tag::Diagnostics` and do not compile without it.
+> done by mem (2026-10-29): `Tag::Diagnostics` (name `"diagnostics"`) is in
+> `crates/blaze-mem/src/tag.rs`; the lint run's questions are answered in `v2/requests/mem.md`.
+
+## 10. `tools/v2/hot_lint.py` (coordinator): narrowing to one crate fails, and blaze-diagnostics is not in `HOT`
+
+What:
+1. `Input.crates` is declared `list[str]`, but `typed_input` reads only `tuple[str, ...]` for
+   lists. So `{"root": ".", "crates": ["blaze-diagnostics"]}` stops with "crates has a type it
+   does not read: list[str]". Declare it `tuple[str, ...]`.
+2. Add `blaze-diagnostics` to `HOT`.
+
+Why: blaze-diagnostics runs on every check of every crate, mostly finding nothing, so its walks
+are on the build path. Until the fix, its speed pass counts the same patterns with `rg`.
+
+Status: open
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+> diagnostics: this is a request *to* the coordinator (`tools/v2/` is not this lane's); please apply it there.
+
+## dedyn: check.rs, emit.rs: keep two `dyn`s, justified on the line
+
+From `dedyn-diag` (report `/tmp/blaze-lanes/v2-dedyn-diag.md`), 2026-10-29, based on the files
+as of 21:00. Comment-only; no behavior change.
+
+`crates/blaze-diagnostics/src/check.rs`: `&dyn Files` in `check_crate`, `check_crate_with` and
+`run` is the caller's file naming, called once per span named beside the `String` it returns
+(see the same request for `cx.rs` in `v2/requests/diagnostics-speed-lints.md`); a generic would
+copy every pass. In `check_crate` and `check_crate_with`:
+
+```rust
+    files: &dyn Files,
+```
+
+becomes
+
+```rust
+    files: &dyn Files, // dyn: the caller's file names, read once per span named
+```
+
+and in `run`, before:
+
+```rust
+fn run(sema: &Semantics<'_>, krate: hir::Crate, files: &dyn Files, options: &Options, frame: &Frame) -> Vec<Diag> {
+```
+
+after:
+
+```rust
+// dyn: `files` is the caller's file names, read once per span named
+fn run(sema: &Semantics<'_>, krate: hir::Crate, files: &dyn Files, options: &Options, frame: &Frame) -> Vec<Diag> {
+```
+
+`crates/blaze-diagnostics/src/emit.rs`, the field of `Sources`: the caller's file reader
+(blaze-cargo's, blaze-lints', the tests'), called once per file, the first time a diagnostic
+names it (`names` caches it, `UNREAD` included). Before:
+
+```rust
+    read: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
+```
+
+after:
+
+```rust
+    read: Box<dyn Fn(&str) -> Option<String> + Send + Sync>, // dyn: the caller's file reader, once per file read
+```
+
+Status: open
+
+> forwarded to diagnostics (diagnostics-next1) (requests, pass 19; told by tmux).
+
+## diagnostics-lints-names: one table of a crate's path resolutions, read by four passes (db, crates/hir `semantics.rs`, crates/hir-def `expr_store`)
+
+What: a query giving, per body (`DefWithBodyId`) and per item signature, the resolution of each
+path written in it (the `ExprStore` path's `ValueNs`/`TypeNs` with the import or glob each
+segment was found through, and inference's resolution of type-relative paths, method calls and
+fields), keyed by the path's id in the store with the store's source map back to the syntax
+pointer; recorded as lowering and inference resolve them, not recomputed.
+Why: `lints/names/{imports,stability,items}` and `dead` each call `Semantics::resolve_path` /
+`resolve_method_call` per path. Each call runs `analyze_impl`: `find_container` up the
+ancestors, a `SourceAnalyzer` for the body, a source-map lookup and a resolver for the scope,
+about 3,000 cycles. Over a 100,000-line crate's 180,000 body paths that is about 150 ms per
+pass, several passes over the same paths, where reading a recorded table is about 0.5 ms
+(docs/v2/plan/lanes/diagnostics/speed-of-light.md, "Names"). It is rustc's design: each path
+in HIR carries its `Res` and `TypeckResults` holds the rest. Together with imports' request 1
+(`used_imports`), it takes the names passes to their bound.
+
+> dedyn-diag, 2026-10-29 (later): superseded and applied by dedyn-diag: `Files` is now a concrete struct and `emit::Sources` holds no reader (the caller reads `Sources::unread` into `Sources::add`); no `// dyn:` keep remains in check.rs or emit.rs. See /tmp/blaze-lanes/v2-dedyn-diag.md.

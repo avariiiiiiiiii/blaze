@@ -24,7 +24,7 @@ use syntax::{
 };
 
 use crate::{
-    lints::registry::{Level, LintId},
+    lints::registry::{Level, Lint, LintId, LintSet, Store},
     model::{MacroKind, Span},
 };
 
@@ -126,7 +126,7 @@ pub(super) fn owner(node: &SyntaxNode, generics: bool) -> Option<ast::AnyHasAttr
 }
 
 /// Whether a node of `kind` may be an [`owner`], by its kind alone.
-fn may_be_owner(kind: SyntaxKind, generics: bool) -> bool {
+pub(super) fn may_be_owner(kind: SyntaxKind, generics: bool) -> bool {
     use SyntaxKind::*;
     match kind {
         MACRO_CALL | MACRO_EXPR | MACRO_PAT | MACRO_TYPE | MACRO_STMTS | MACRO_ITEMS => false,
@@ -135,10 +135,9 @@ fn may_be_owner(kind: SyntaxKind, generics: bool) -> bool {
     }
 }
 
-/// Whether `node` is an [`owner`] with an attribute: for most nodes of a crate, a check of
-/// the kind and nothing else.
-pub(super) fn may_own(node: &SyntaxNode, generics: bool) -> bool {
-    may_be_owner(node.kind(), generics) && owner(node, generics).is_some_and(|it| attrs_of(&it).next().is_some())
+/// Whether `node`, of a kind [`may_be_owner`] lets through, is an [`owner`] with an attribute.
+pub(super) fn owns(node: &SyntaxNode, generics: bool) -> bool {
+    owner(node, generics).is_some_and(|it| attrs_of(&it).next().is_some())
 }
 
 /// The attributes of `owner`, outer then inner: a block's list has its own, inner ones only.
@@ -162,6 +161,31 @@ pub(super) fn read(owner: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition)
         ControlFlow::<()>::Continue(())
     });
     found
+}
+
+/// Adds to `set` each lint `attr`, with `cfg_attr` expanded against `cfg`, gives a level other
+/// than `allow`: what [`super::may_fire`] scans the crate for. A name that sets nothing (an
+/// unknown one, a removed one, a tool's not in the tables) adds nothing; nothing is checked of
+/// where the attribute is, which can only add a lint the levels leave allowed.
+pub(super) fn not_allowed(attr: ast::Attr, store: &Store, cfg: &CfgOptions, edition: Edition, set: &mut LintSet) {
+    hir_expand::attrs::expand_cfg_attr::<()>(std::iter::once(attr), || cfg, |meta, _| {
+        if let Some(Read::Level(level, items, _)) = read_meta(&meta, edition, false)
+            && level != Level::Allow
+        {
+            for item in &items {
+                let ItemKind::Word(path) = &item.kind else { continue };
+                let lints: &[&Lint] = match &path[..] {
+                    [only] => store.lints_named(None, only.name()),
+                    [tool, name] => store.lints_named(Some(tool.name()), name.name()),
+                    _ => &[],
+                };
+                for lint in lints {
+                    set.insert(lint.id());
+                }
+            }
+        }
+        ControlFlow::Continue(())
+    });
 }
 
 /// The attributes the lint levels read: the five that set a level, at the indices of their

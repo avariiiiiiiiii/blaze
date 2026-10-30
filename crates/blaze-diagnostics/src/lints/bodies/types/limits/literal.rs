@@ -26,7 +26,7 @@ use crate::{
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
-const LINT: &str = "overflowing_literals";
+pub(super) const LINT: &str = "overflowing_literals";
 
 /// A literal as rustc's `check_lit` is given it.
 struct Lit {

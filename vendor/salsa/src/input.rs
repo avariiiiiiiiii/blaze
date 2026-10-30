@@ -370,11 +370,16 @@ impl<C: Configuration> Ingredient for IngredientImpl<C> {
         &self,
         db: &dyn crate::Database,
     ) -> Option<Vec<crate::database::SlotInfo>> {
+        let zalsa = db.zalsa();
         let memory_usage = self
-            .entries(db.zalsa())
-            // SAFETY: The memo table belongs to a value that we allocated, so it
-            // has the correct type. The caller guarantees exclusive database access.
-            .map(|entry| unsafe { entry.value.memory_usage(&self.memo_table_types) })
+            .entries(zalsa)
+            .map(|entry| {
+                let row = zalsa.table().memo_row(entry.key.key_index());
+                // SAFETY: The memo table belongs to a value that we allocated, so it has the
+                // correct type, and `row` is its slot's. The caller guarantees exclusive
+                // database access.
+                unsafe { entry.value.memory_usage(&self.memo_table_types, row) }
+            })
             // alloc: the edge: memory-usage reports, run with `&mut` outside builds
             .collect();
 
@@ -463,13 +468,18 @@ where
     ///
     /// # Safety
     ///
-    /// The `MemoTable` must belong to a `Value` of the correct type. The caller must
-    /// ensure exclusive access to the database's storage for the duration of this call.
+    /// The `MemoTable` must belong to a `Value` of the correct type, and `row` must be its slot's
+    /// memo row. The caller must ensure exclusive access to the database's storage for the
+    /// duration of this call.
     #[cfg(feature = "salsa_unstable")]
-    unsafe fn memory_usage(&self, memo_table_types: &MemoTableTypes) -> crate::database::SlotInfo {
+    unsafe fn memory_usage(
+        &self,
+        memo_table_types: &MemoTableTypes,
+        row: u32,
+    ) -> crate::database::SlotInfo {
         let heap_size = C::heap_size(&self.fields);
-        // SAFETY: The caller guarantees this is the correct types table.
-        let memos = unsafe { memo_table_types.attach_memos(&self.memos) };
+        // SAFETY: The caller guarantees this is the correct types table and the slot's row.
+        let memos = unsafe { memo_table_types.attach_memos(row) };
 
         crate::database::SlotInfo {
             debug_name: C::DEBUG_NAME,

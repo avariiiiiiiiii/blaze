@@ -206,6 +206,7 @@ impl<'a, F: FnMut(OutlineStrStep<'_>) + ?Sized> Builder<'a, '_, F> {
             (self.pos..self.lexed.len()).take_while(|&it| self.lexed.kind(it).is_trivia()).count();
         let leading_trivias = self.pos..self.pos + n_trivias;
         let lexed = self.lexed;
+        // clone: a range of token indices, no heap.
         let end = self.offset + leading_trivias.clone().map(|it| lexed.token_len(it)).sum::<usize>();
         let n_attached_trivias = n_attached_trivias(
             kind,

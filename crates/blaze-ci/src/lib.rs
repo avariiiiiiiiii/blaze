@@ -19,6 +19,10 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 pub mod checkout;
 pub mod config;
 pub mod github;
@@ -33,7 +37,7 @@ use blaze_ids::ContentId;
 use serde::{Deserialize, Serialize};
 
 /// What GitHub said happened, after its signature was checked.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub enum Event {
     Push { branch: String, commit: String },
     PullRequest { number: u64, head: String, base: String, from_fork: bool },
@@ -41,6 +45,7 @@ pub enum Event {
 }
 
 /// A check run as GitHub's API takes it.
+// clone: once per check-run post, the copy handed to the GitHub lane
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct CheckRun {
     pub name: String,
@@ -59,7 +64,7 @@ pub enum CheckStatus {
 }
 
 /// The release train: at most one running and one waiting; a newer tag replaces the waiting.
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
 pub struct Train {
     pub running: Option<String>,
     pub waiting: Option<String>,
@@ -83,6 +88,7 @@ impl Train {
 }
 
 /// A commit's tree as a root of the daemon's VFS.
+// clone: once per checkout, the tree a job starts from
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Checkout {
     pub commit: String,

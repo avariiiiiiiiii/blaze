@@ -13,12 +13,16 @@ use syntax::{AstNode, SyntaxKind, SyntaxNodePtr, ast};
 
 use crate::{
     cx::Cx,
-    lints::code_fact,
+    lints::{code_fact, registry::LintId},
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
 
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnusedMustUse<'db>) -> Vec<Found> {
+    const LINT: LintId = LintId::named("unused_must_use");
+    if !cx.lint_may_fire(LINT) {
+        return Vec::new();
+    }
     let at = d.expr.map(|it| it.syntax_node_ptr());
     let node = cx.syntax(at);
     let Some(expr) = ast::Expr::cast(node.value.clone()) else { return Vec::new() };
@@ -105,12 +109,24 @@ fn must_use_adt<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, post: &str) -> Optio
     let adt = ty.as_adt()?;
     let lang = matches!(adt.module(cx.db).krate(cx.db).origin(cx.db), base_db::CrateOrigin::Lang(_));
     let name = adt.name(cx.db);
-    let args: Vec<hir::Type<'db>> = ty.type_arguments().collect();
-    if lang && name.as_str() == "Result" && args.len() == 2 && args[1].is_never() {
-        return must_use_adt(cx, &args[0], &format!(" in a `Result` with an uninhabited error{post}"));
+    let two = |ty: &hir::Type<'db>| {
+        let mut args = ty.type_arguments();
+        let pair = (args.next()?, args.next()?);
+        args.next().is_none().then_some(pair)
+    };
+    if lang
+        && name.as_str() == "Result"
+        && let Some((ok, err)) = two(ty)
+        && err.is_never()
+    {
+        return must_use_adt(cx, &ok, &format!(" in a `Result` with an uninhabited error{post}"));
     }
-    if lang && name.as_str() == "ControlFlow" && args.len() == 2 && args[0].is_never() {
-        return must_use_adt(cx, &args[1], &format!(" in a `ControlFlow` with an uninhabited break {post}"));
+    if lang
+        && name.as_str() == "ControlFlow"
+        && let Some((brk, cont)) = two(ty)
+        && brk.is_never()
+    {
+        return must_use_adt(cx, &cont, &format!(" in a `ControlFlow` with an uninhabited break {post}"));
     }
     AttrFlags::must_use_message(cx.db, hir_def::AdtId::from(adt).into())?;
     Some((adt, post.to_owned()))

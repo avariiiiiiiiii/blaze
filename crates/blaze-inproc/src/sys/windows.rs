@@ -22,7 +22,10 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_NO_MORE_FILES, ERROR_TIMEOUT, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    SetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows_sys::Win32::Security::Cryptography::ProcessPrng;
 use windows_sys::Win32::System::Diagnostics::Debug::{
     CONTEXT, FlushInstructionCache, ReadProcessMemory, RtlCaptureContext, RtlLookupFunctionEntry, RtlVirtualUnwind,
@@ -41,8 +44,9 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThreadId, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_TERMINATE,
-    PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, TerminateProcess,
+    CreateEventW, GetCurrentProcess, GetCurrentThreadId, INFINITE, OpenProcess, PROCESS_DUP_HANDLE,
+    PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, SetEvent,
+    TerminateProcess, WaitForMultipleObjects, WaitForSingleObject, WaitOnAddress, WakeByAddressAll,
 };
 
 pub(crate) use pipe::{Listener, Stream, connect};
@@ -298,7 +302,13 @@ pub(crate) fn send_objects(
     grant: &[u8],
     objects: &[(&Object, Rights)],
 ) -> Result<Remote, Error> {
-    let access = PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE;
+    let access = PROCESS_VM_OPERATION
+        | PROCESS_VM_READ
+        | PROCESS_VM_WRITE
+        | PROCESS_QUERY_INFORMATION
+        | PROCESS_TERMINATE
+        | PROCESS_DUP_HANDLE
+        | PROCESS_SYNCHRONIZE;
     // SAFETY: value-only arguments; the handle it returns is checked and owned below.
     let process = unsafe { OpenProcess(access, 0, pid) };
     if process.is_null() {
@@ -394,7 +404,136 @@ fn private_protection(protect: u32) -> Result<u32, Error> {
     }
 }
 
+/// The asks' events: the doorbell the run process sets, and one per slot the daemon sets once
+/// it answered there, each auto-reset and duplicated into the run process; and the process, to
+/// see it end.
+pub(crate) struct Bells {
+    doorbell: OwnedHandle,
+    slots: Vec<OwnedHandle>,
+    process: OwnedHandle,
+}
+
+impl Bells {
+    pub(crate) fn new(remote: &Remote, slots: usize) -> Result<(Bells, Vec<u64>), Error> {
+        let process = remote.process.try_clone().map_err(|it| Error::new(format!("Windows: DuplicateHandle of a process: {it}")))?;
+        let mut names = Vec::with_capacity(slots + 1);
+        let doorbell = bell(&remote.process, &mut names)?;
+        let mut kept = Vec::with_capacity(slots);
+        for _ in 0..slots {
+            kept.push(bell(&remote.process, &mut names)?);
+        }
+        Ok((Bells { doorbell, slots: kept, process }, names))
+    }
+
+    pub(crate) fn wake(&self, slot: usize, _: &AtomicU64) {
+        if let Some(event) = self.slots.get(slot) {
+            // SAFETY: an event this daemon made and holds.
+            unsafe { SetEvent(event.as_raw_handle()) };
+        }
+    }
+
+    pub(crate) fn wait_ring(&self, _: &mut Stream) -> Result<bool, Error> {
+        let handles = [self.doorbell.as_raw_handle(), self.process.as_raw_handle()];
+        // SAFETY: two handles this daemon holds, live for the call.
+        let waited = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+        match waited {
+            WAIT_OBJECT_0 => Ok(true),
+            it if it == WAIT_OBJECT_0 + 1 => Ok(false),
+            _ => Err(os("WaitForMultipleObjects on a run process's doorbell")),
+        }
+    }
+}
+
+/// A new auto-reset event, and its name in `process` put in `names`.
+fn bell(process: &OwnedHandle, names: &mut Vec<u64>) -> Result<OwnedHandle, Error> {
+    // SAFETY: an unnamed auto-reset event, not signaled; value-only arguments.
+    let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(os("CreateEventW for an asks bell"));
+    }
+    // SAFETY: just made, owned by nothing else.
+    let event = unsafe { OwnedHandle::from_raw_handle(event) };
+    let mut theirs: HANDLE = std::ptr::null_mut();
+    // SAFETY: duplicates an event this daemon holds into the run process, opened with
+    // PROCESS_DUP_HANDLE; writes only `theirs`, a handle value in that process.
+    let ok = unsafe {
+        DuplicateHandle(GetCurrentProcess(), event.as_raw_handle(), process.as_raw_handle(), &mut theirs, 0, 0, DUPLICATE_SAME_ACCESS)
+    };
+    if ok == 0 {
+        return Err(os("DuplicateHandle of an asks bell into the run process"));
+    }
+    names.push(theirs as u64);
+    Ok(event)
+}
+
+pub(crate) fn ring(_: &Stream, doorbell: u64) -> Result<(), Error> {
+    // SAFETY: the doorbell the daemon duplicated into this process; a handle that is not an
+    // event fails the call, which is checked.
+    if unsafe { SetEvent(doorbell as HANDLE) } == 0 {
+        return Err(os("SetEvent on the asks doorbell"));
+    }
+    Ok(())
+}
+
+pub(crate) fn hung_up(stream: &Stream) -> bool {
+    stream.closed()
+}
+
+fn millis(timeout: std::time::Duration) -> u32 {
+    u32::try_from(timeout.as_millis()).unwrap_or(INFINITE - 1).clamp(1, INFINITE - 1)
+}
+
+pub(crate) fn wait_answer(_: &AtomicU64, _: u32, bell: u64, timeout: std::time::Duration) -> bool {
+    // SAFETY: the slot's event the daemon duplicated into this process; a handle that is not
+    // one fails the wait, and the caller looks at the state word either way.
+    unsafe { WaitForSingleObject(bell as HANDLE, millis(timeout)) != WAIT_TIMEOUT }
+}
+
+/// Within this process only: on Windows the run process sleeps for a slot of its own.
+pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: std::time::Duration) -> bool {
+    // SAFETY: `word` is live and 8-aligned; WaitOnAddress compares its first four bytes, the
+    // low half, with `expected`, which is live for the call.
+    let ok = unsafe { WaitOnAddress(word.as_ptr().cast(), (&raw const expected).cast(), 4, millis(timeout)) };
+    // SAFETY: GetLastError reads this thread's last error.
+    ok != 0 || unsafe { GetLastError() } != ERROR_TIMEOUT
+}
+
+pub(crate) fn wake(word: &AtomicU64) {
+    // SAFETY: wakes the threads waiting on `word`'s address; reads nothing.
+    unsafe { WakeByAddressAll(word.as_ptr().cast()) };
+}
+
+/// The calling thread's last error, put back when dropped.
+pub(crate) struct Errno(u32);
+
+impl Errno {
+    pub(crate) fn keep() -> Errno {
+        // SAFETY: reads this thread's last error.
+        Errno(unsafe { GetLastError() })
+    }
+}
+
+impl Drop for Errno {
+    fn drop(&mut self) {
+        // SAFETY: sets this thread's last error.
+        unsafe { SetLastError(self.0) };
+    }
+}
+
 impl Remote {
+    pub(crate) fn kill(&self) -> Result<(), Error> {
+        // SAFETY: the run process's own handle, opened with PROCESS_TERMINATE.
+        if unsafe { TerminateProcess(self.process.as_raw_handle(), 137) } == 0 {
+            // SAFETY: the process handle, opened with PROCESS_SYNCHRONIZE; a zero wait returns
+            // at once.
+            if unsafe { WaitForSingleObject(self.process.as_raw_handle(), 0) } == WAIT_OBJECT_0 {
+                return Ok(());
+            }
+            return Err(os("TerminateProcess of the run process"));
+        }
+        Ok(())
+    }
+
     /// Maps the whole of object `object` into the run process anywhere, if its rights allow
     /// `access`.
     pub(crate) fn map(&self, object: u32, access: Access) -> Result<u64, Error> {

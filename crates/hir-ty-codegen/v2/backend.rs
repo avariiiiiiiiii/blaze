@@ -13,8 +13,9 @@ use blaze_codegen::{
     template::Refs,
 };
 use blaze_format::SpanRef;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, bits::Bits};
 use blaze_items::{CodeHash, ItemId, ItemKey};
+use blaze_mem::Frame;
 use cranelift_codegen::{ir, isa::TargetIsa};
 use hir_def::{
     DefWithBodyId, HasModule,
@@ -28,8 +29,6 @@ use hir_def::{
 };
 use hir_ty::{ParamEnvAndCrate, db::HirDatabase, next_solver::ParamEnv};
 use hir_ty_mir::mir::MirSpan;
-use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 
 use super::{
     Built, DataPlace, Function, Hashes, HirFrontend, HirInstance, Kind, Places, Prepared,
@@ -42,6 +41,7 @@ use crate::{
     Detach, Instance, InstanceDef, Produced, compile_as,
     debuginfo::SlotPlaces,
     fragment::{self, Hint, Requests},
+    frame_map::{self, FrameHashMap},
     home::Homes,
     instance_code,
 };
@@ -100,13 +100,15 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
             toolchain.cpu
         )));
     }
-    if spec.backend == Backend::Cranelift && !toolchain.features.is_empty() {
+    let cranelift = spec.backend.is_cranelift();
+    if cranelift && target.features() != toolchain.features.as_slice() {
         return Err(fail(format!(
-            "target features {:?}: the IR builder's Cranelift has the target's baseline only",
+            "the process compiles with the target features {:?}, the unit with {:?}",
+            target.features(),
             toolchain.features
         )));
     }
-    if spec.backend == Backend::Cranelift && !spec.sanitize.is_empty() {
+    if cranelift && !spec.sanitize.is_empty() {
         return Err(fail(
             "-Zsanitizer and SanitizerCoverage are instrumented by the LLVM back end \
              (Backend::Llvm), which this unit is not compiled by"
@@ -142,6 +144,7 @@ fn set_knob() -> Option<&'static str> {
     *SET.get_or_init(|| CHANGES_CODE.iter().copied().find(|it| std::env::var_os(it).is_some()))
 }
 
+// dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
 fn isa(unit: &Unit) -> Result<&'static dyn TargetIsa, CodegenError> {
     crate::target().map(|it| &**it).map_err(|e| failed(unit, e))
 }
@@ -159,84 +162,92 @@ impl Backends<'_> {
         (instance, inlined): (&HirInstance, bool),
         refs: &Refs,
     ) -> Result<(Shape, Prepared), CodegenError> {
-        let fail = |what: String| failed(unit, format!("{instance:?}: {what}"));
-        let build = Build::of(spec);
-        if build.inlines && !inlined {
-            return Err(fail(format!(
-                "a unit whose MIR is inlined ({:?}) of references listed for units that inline \
-                 none: what the inlined code calls is not among them",
-                unit.backend
-            )));
-        }
-        let walked = refs::listed(db, instance, inlined).map_err(fail)?;
-        if walked.len() != refs.len() {
-            return Err(fail(format!(
-                "{} references given for an instance of {}",
-                refs.len(),
-                walked.len()
-            )));
-        }
-        let mut placer = Placer::listed(walked);
-        let mut code = build::with(build, || built(db, instance, spec.overflow_checks))
-            .map_err(fail)?
-            .map_err(fail)?;
-        let krate = compiled_in(db, instance);
-        let (places, source, variables) = match &mut code {
-            Built::Ir(pending) => {
-                let requests = &mut pending.wants.requests;
-                let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
-                    .map_err(fail)?;
-                (places, pending.source.take(), pending.variables.take())
+        // What preparing one instance makes and lets go of (the placer's index, the scope
+        // tables, the shape's tables) is in a frame of the worker's, reset when it returns;
+        // what it keeps (the IR, its places, spans, variables and scopes) is the heap's.
+        blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            let fail = |what: String| failed(unit, format!("{instance:?}: {what}"));
+            let build = Build::of(spec);
+            if build.inlines && !inlined {
+                return Err(fail(format!(
+                    "a unit whose MIR is inlined ({:?}) of references listed for units that \
+                     inline none: what the inlined code calls is not among them",
+                    unit.backend
+                )));
             }
-            Built::Assembled(_, requests) => {
-                let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
-                    .map_err(fail)?;
-                (places, None, None)
+            let walked = refs::listed(db, instance, inlined).map_err(fail)?;
+            if walked.len() != refs.len() {
+                return Err(fail(format!(
+                    "{} references given for an instance of {}",
+                    refs.len(),
+                    walked.len()
+                )));
             }
-        };
-        let lines = spec.debuginfo != DebugInfo::None;
-        let spans = match (&source, lines) {
-            (Some(source), true) => written_spans(db, hashes, source).map_err(fail)?,
-            _ => Vec::new(),
-        };
-        let told = matches!(spec.debuginfo, DebugInfo::Limited | DebugInfo::Full);
-        let (variables, mut scopes) = match (&source, variables) {
-            (Some(source), Some((env, variables))) if told => {
-                let krate = env.as_ref(db).krate;
-                named(db, hashes, krate, source.owner, &variables, &source.spans).map_err(fail)?
+            let mut placer = Placer::listed_in(walked, frame);
+            let mut code = build::with(build, || built(db, instance, spec.overflow_checks))
+                .map_err(fail)?
+                .map_err(fail)?;
+            let krate = compiled_in(db, instance);
+            let (places, source, variables) = match &mut code {
+                Built::Ir(pending) => {
+                    let requests = &mut pending.wants.requests;
+                    let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
+                        .map_err(fail)?;
+                    (places, pending.source.take(), pending.variables.take())
+                }
+                Built::Assembled(_, requests) => {
+                    let places = place_requests(db, homes, hashes, krate, &mut placer, requests)
+                        .map_err(fail)?;
+                    (places, None, None)
+                }
+            };
+            let lines = spec.debuginfo != DebugInfo::None;
+            let spans = match (&source, lines) {
+                (Some(source), true) => written_spans(db, hashes, source).map_err(fail)?,
+                _ => Vec::new(),
+            };
+            let told = matches!(spec.debuginfo, DebugInfo::Limited | DebugInfo::Full);
+            let (variables, mut scopes) = match (&source, variables) {
+                (Some(source), Some((env, variables))) if told => {
+                    let krate = env.as_ref(db).krate;
+                    named(db, hashes, krate, source.owner, &variables, &source.spans, frame)
+                        .map_err(fail)?
+                }
+                _ => Default::default(),
+            };
+            if let (Some(source), true) = (&source, lines) {
+                inlined_scopes(db, hashes, source, &mut scopes).map_err(fail)?;
             }
-            _ => Default::default(),
-        };
-        if let (Some(source), true) = (&source, lines) {
-            inlined_scopes(db, hashes, source, &mut scopes).map_err(fail)?;
-        }
-        if let Built::Ir(pending) = &mut code {
-            if !lines {
-                pending.func.stencil.srclocs.clear();
+            if let Built::Ir(pending) = &mut code {
+                if !lines {
+                    pending.func.stencil.srclocs.clear();
+                }
+                if unit.backend.is_cranelift() {
+                    colocate(&mut pending.func, &places, placer.refs(), frame);
+                }
             }
-            if unit.backend == Backend::Cranelift {
-                colocate(&mut pending.func, &places, placer.refs());
-            }
-        }
-        let inlined = super::frontend::inlined(db, hashes, (instance, inlined)).map_err(fail)?;
-        let function = Function {
-            code,
-            places,
-            spans,
-            variables,
-            scopes,
-            inlined,
-            hint: hint(db, instance),
-            unsanitized: unsanitized(db, spec, instance).map_err(fail)?,
-            release: Default::default(),
-            foldable: foldable(db, instance),
-        };
-        let shape = shape::of(&function).map_err(fail)?;
-        let prepared = match unit.backend {
-            Backend::Cranelift => Prepared::Cranelift(Box::new(function)),
-            Backend::Llvm { .. } => Prepared::Llvm(Box::new(function)),
-        };
-        Ok((shape, prepared))
+            let inlined =
+                super::frontend::inlined(db, hashes, (instance, inlined)).map_err(fail)?;
+            let function = Function {
+                code,
+                places,
+                spans,
+                variables,
+                scopes,
+                inlined,
+                hint: hint(db, instance),
+                unsanitized: unsanitized(db, spec, instance).map_err(fail)?,
+                release: Default::default(),
+                foldable: foldable(db, instance),
+            };
+            let shape = shape::of(unit, &function, frame).map_err(fail)?;
+            // alloc: the prepared function, kept by the driver until its emit
+            let prepared = match unit.backend {
+                Backend::Cranelift { .. } => Prepared::Cranelift(Box::new(function)),
+                Backend::Llvm { .. } => Prepared::Llvm(Box::new(function)),
+            };
+            Ok((shape, prepared))
+        })
     }
 }
 
@@ -414,13 +425,15 @@ fn named(
     owner: DefWithBodyId,
     variables: &[fragment::Variable],
     spans: &[MirSpan],
+    frame: &Frame,
 ) -> Result<(Vec<side::Variable>, side::Scopes), String> {
     let body = Body::of(db, owner);
-    let variables: Vec<_> =
-        variables.iter().filter(|it| !body[it.binding].name.as_str().starts_with('<')).collect();
-    let (scopes, of_binding) = scoped(db, owner, &variables, spans);
-    let mut named = Vec::with_capacity(variables.len());
-    for variable in variables {
+    let mut told: Vec<&fragment::Variable, &Frame> = Vec::with_capacity_in(variables.len(), frame);
+    told.extend(variables.iter().filter(|it| !body[it.binding].name.as_str().starts_with('<')));
+    let (scopes, of_binding) = scoped(db, owner, &told, spans, frame);
+    // alloc: the named locals, kept in the prepared function
+    let mut named = Vec::with_capacity(told.len());
+    for variable in told.iter().copied() {
         named.push(side::Variable {
             name: *body[variable.binding].name.symbol(),
             param: variable.param,
@@ -438,25 +451,31 @@ fn named(
 /// scope, which a parameter is, is known in all of the function and is of none. The code that
 /// tries the pattern of an arm is of the scope its `match` is in; other code of no expression
 /// is of the scope of the code before it.
-fn scoped(
+fn scoped<'f>(
     db: &Db,
     owner: DefWithBodyId,
     variables: &[&fragment::Variable],
     spans: &[MirSpan],
-) -> (side::Scopes, FxHashMap<BindingId, u32>) {
+    frame: &'f Frame,
+) -> (side::Scopes, FrameHashMap<'f, BindingId, u32>) {
     let scopes = ExprScopes::of(db, owner);
     let body = Body::of(db, owner);
     let outermost = scopes.scope_chain(scopes.scope_for(body.root_expr())).last();
     // The scope of each binding told of, and of no other: the walk stops once all are found.
-    let mut wanted: SmallVec<[BindingId; 16]> = variables.iter().map(|it| it.binding).collect();
-    blaze_ids::radix::sort_copy_by_key(&mut wanted, |it| it.into_raw().into_u32());
+    // By their raw index, which is what the sort keyed them by before: the radix sort's
+    // buffer is the thread's.
+    let mut wanted: Vec<u32, &Frame> = Vec::with_capacity_in(variables.len(), frame);
+    wanted.extend(variables.iter().map(|it| it.binding.into_raw().into_u32()));
+    blaze_mem::scratch::with_u32s(|scratch| {
+        blaze_ids::radix::sort_copy_by_key_in(&mut wanted, |&it| it, scratch);
+    });
     wanted.dedup();
-    let mut bound = FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
-    let mut seen = FxHashSet::default();
+    let mut bound = frame_map::hash_map_with_capacity(wanted.len(), frame);
+    let mut seen = frame_map::hash_set(frame);
     'scopes: for (_, &scope) in scopes.scope_by_expr().iter() {
         for scope in scopes.scope_chain(Some(scope)).take_while(|&it| seen.insert(it)) {
             for entry in scopes.entries(scope) {
-                if wanted.binary_search(&entry.binding()).is_ok() {
+                if wanted.binary_search(&entry.binding().into_raw().into_u32()).is_ok() {
                     bound.insert(entry.binding(), scope);
                     if bound.len() == wanted.len() {
                         break 'scopes;
@@ -465,20 +484,26 @@ fn scoped(
             }
         }
     }
-    let mut told: FxHashMap<ScopeId, u32> = FxHashMap::default();
+    let mut told: FrameHashMap<'_, ScopeId, u32> = frame_map::hash_map(frame);
+    // alloc: the scopes' parents, kept in the prepared function
     let mut parents = Vec::new();
-    let mut of_binding = FxHashMap::default();
+    let mut of_binding = frame_map::hash_map(frame);
+    // A binding's scopes not told of yet, outermost first: one list for the unit, refilled
+    // for each binding.
+    let mut chain: Vec<ScopeId, &Frame> = Vec::new_in(frame);
     for variable in variables {
         let Some(&scope) = bound.get(&variable.binding).filter(|&&it| Some(it) != outermost) else {
             continue;
         };
-        let mut chain: Vec<ScopeId> = scopes
-            .scope_chain(Some(scope))
-            .take_while(|it| Some(*it) != outermost && !told.contains_key(it))
-            .filter(|&it| it == scope || !scopes.entries(it).is_empty())
-            .collect();
+        chain.clear();
+        chain.extend(
+            scopes
+                .scope_chain(Some(scope))
+                .take_while(|it| Some(*it) != outermost && !told.contains_key(it))
+                .filter(|&it| it == scope || !scopes.entries(it).is_empty()),
+        );
         chain.reverse();
-        for scope in chain {
+        for &scope in chain.iter() {
             let parent =
                 scopes.scope_chain(Some(scope)).skip(1).find_map(|it| told.get(&it).copied());
             told.insert(scope, parents.len() as u32);
@@ -489,7 +514,7 @@ fn scoped(
     if told.is_empty() {
         return (side::Scopes::default(), of_binding);
     }
-    let mut tried = FxHashMap::default();
+    let mut tried = frame_map::hash_map(frame);
     if spans.iter().any(|it| matches!(it, MirSpan::PatId(_))) {
         for (expr, it) in body.exprs() {
             if let hir_def::hir::Expr::Match { arms, .. } = it {
@@ -521,7 +546,7 @@ fn scoped(
 /// places them all, so nothing of them goes through the GOT. A symbol of outside code is
 /// called directly too (through the PLT where it is in another object), but its address is
 /// left as the IR builder takes it.
-fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref]) {
+fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref], frame: &Frame) {
     let outside = |place: u32| {
         matches!(refs.get(place as usize), Some(FrontRef::Extern(_) | FrontRef::Weak(_)) | None)
     };
@@ -541,14 +566,13 @@ fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref]) {
             _ => None,
         }
     };
-    // One bit a callee: no allocation for the usual few hundred.
-    let mut addressed: SmallVec<[u64; 4]> = SmallVec::new();
-    addressed.resize(stencil.dfg.ext_funcs.len().div_ceil(64), 0);
+    // One bit a callee, in the frame.
+    let words = frame.alloc_slice_fill_with(stencil.dfg.ext_funcs.len().div_ceil(64), |_| 0);
+    let mut addressed: Bits<&mut [u64]> = Bits::from_words(words);
     for block in stencil.layout.blocks() {
         for inst in stencil.layout.block_insts(block) {
             if let ir::InstructionData::FuncAddr { func_ref, .. } = stencil.dfg.insts[inst] {
-                let at = func_ref.as_u32() as usize;
-                addressed[at / 64] |= 1 << (at % 64);
+                addressed.insert(func_ref.as_u32() as usize);
             }
         }
     }
@@ -556,7 +580,7 @@ fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref]) {
         let at = func_ref.as_u32() as usize;
         match own(&ext.name) {
             Some(true) => ext.colocated = true,
-            Some(false) if addressed[at / 64] & (1 << (at % 64)) == 0 => ext.colocated = true,
+            Some(false) if !addressed.contains(at) => ext.colocated = true,
             _ => {}
         }
     }
@@ -644,9 +668,10 @@ fn told(
         )));
     }
     let isa = isa(unit)?;
-    let side = side::of(variables, scopes, &code).map_err(fail)?;
-    let compiled = resolve(places, refs, |resolve| {
-        super::convert::function(
+    let (compiled, side) = resolve(places, refs, |resolve| {
+        let side = side::of(variables, scopes, &code, resolve.frame())?;
+        let compiled = super::convert::function(
+            resolve.frame(),
             unit.instance.key(),
             unit.arch,
             isa,
@@ -655,7 +680,8 @@ fn told(
             resolve,
             spans,
             side.as_ref().map(|it| it.1),
-        )
+        )?;
+        Ok::<_, String>((compiled, side))
     })
     .map_err(fail)?;
     let function = CompiledFunction { inlined, ..compiled };
@@ -693,16 +719,20 @@ fn emit_ir(
     }
 }
 
-/// Cranelift's code of the IR, `named` being the stack slots of its named locals.
+/// Cranelift's code of the IR at the unit's level, `named` being the stack slots of its
+/// named locals.
 fn compiled(
     unit: &Unit,
     func: ir::Function,
     named: &[ir::StackSlot],
 ) -> Result<fragment::Code, CodegenError> {
+    let Backend::Cranelift { speed } = unit.backend else {
+        return Err(failed(unit, format!("Cranelift's code of a unit for {:?}", unit.backend)));
+    };
     let isa = isa(unit)?;
     crate::with_context(func, |context| {
         let pairs = crate::float_pair::lower(&mut context.func);
-        let mut code = crate::emit(context).map_err(|e| failed(unit, e))?;
+        let mut code = crate::emit_lent(context, speed).map_err(|e| failed(unit, e))?;
         if let Some(frame) = context.compiled_code().and_then(|it| it.buffer.frame_layout()) {
             code.slots = SlotPlaces::of_frame(isa, frame, &context.func, named.iter().copied());
         }

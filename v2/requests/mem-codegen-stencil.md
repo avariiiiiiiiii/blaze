@@ -28,6 +28,8 @@ parameter; each such struct and its callers are listed.
 
 ## A. blaze-stencil: every emit on the task's frame
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### Today
 
 `lib.rs:123-157` keeps one `patch::Scratch { buf: Buf, plan: Plan, side: Side }` per thread in a
@@ -39,6 +41,8 @@ relocations with the stable `sort_by_key`, which allocates a buffer above 20 ent
 `Side::finish_calls` (patch.rs:485-486) sorts the call sites the same way. The unwind information is
 a fresh `Vec` per function (`arch/x64.rs:121-132`, `arch/aarch64.rs:142-149`,
 `x64/frame.rs::win_raw`/`with_saves`, `aarch64/frame.rs::windows_codes`).
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### After
 
@@ -69,6 +73,8 @@ result. `compile_with` and `patch::Scratch` go (no crate outside blaze-stencil n
 `rg 'blaze_stencil::' crates` finds no caller). New: `compile_into` (into a reused `Code`) and
 `compile_to` (hand the borrowed code to a closure).
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### A1. `crates/blaze-stencil/Cargo.toml`
 
 Under `[dependencies]`, after `blaze-codegen.workspace = true`:
@@ -79,6 +85,9 @@ blaze-mem.workspace = true
 
 `[dev-dependencies]` already has `blaze-alloc-count.workspace = true`, and the tests' allocator is
 already declared once, in `src/tier/tests.rs:16-17`; nothing else changes there.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. `manifest_lint` clean.
 
 ### A2. `crates/blaze-stencil/src/lib.rs`
 
@@ -129,6 +138,9 @@ pub fn compile_to<R>(
 
 The old nested-compile case (a `try_borrow_mut` that failed got fresh columns) is gone: frame tasks
 nest, so a compile inside another compile on the same thread just gets a frame of its own.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. `compile` is `compile_to(func, target, |code| code.to_code())`: a closure, since the path `CodeRef::to_code` binds the impl's lifetime early and misses the higher-ranked bound.
 
 ### A3. `crates/blaze-stencil/src/buf.rs`
 
@@ -237,6 +249,9 @@ pub(crate) fn sort_by_key_in_place<T: Copy, K: Ord>(items: &mut [T], key: impl F
 (The closing `}` of `impl Buf` moves above the free function, as shown.) `labels` and `fixups` no
 longer need clearing at the end: the frame drops them.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. `Buf<'_>` is written out at every use: the workspace warns on `elided_lifetimes_in_paths`, so the elided form this request allowed would warn. Relocations are sorted by `buf::sort_by_key_in_place` (stable insertion sort, no buffer) through `Buf::sort_relocs`.
+
 ### A4. `crates/blaze-stencil/src/code.rs`
 
 **A bug to fix first**: `CallSite` (lines 83-88) derives `Copy` but holds a
@@ -343,6 +358,9 @@ fn refill<T: Clone>(mine: &mut Vec<T>, theirs: &[T]) {
 `to_code` gives a `Code` equal (`PartialEq`) to the one `compile_in` built before: same fields, same
 order (the capacities may differ, which `PartialEq` doesn't see).
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. `Unwind` had gained a third variant, `WindowsArm64 { len, codes }`, which the request did not know: `UnwindRef` and `UnwindKind` have it too, and `copy_from` refills it. `Code`, `Unwind` and `Slots` stay not `Clone`.
+
 ### A5. `crates/blaze-stencil/src/arch.rs`
 
 Imports: add `use blaze_mem::frame::Frame;`, and `code::UnwindKind` beside the existing `code`
@@ -413,6 +431,9 @@ impl<'f, A: Glue> Cx<'_, 'f, A> {
 ```
 
 (the methods already in the `impl` follow unchanged).
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. `Cx<'a, 'f, A>`; the frame is named `blaze_mem::Frame` in place. `Cx::windows_info` gives the glue `Side::info`, which holds both Windows x64 info and Windows ARM64 codes.
 
 ### A6. `crates/blaze-stencil/src/patch.rs`
 
@@ -619,6 +640,9 @@ pub(crate) fn compile_in<A: Glue, R>(
 The `frame` name stays the glue's frame layout, as before; the memory frame is `temp`. The order of
 every step is the old one; `buf.sort_relocs()` is where `buf.take()` sorted.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. The side table is `Side::trap_sites` (the request called it `stubs`). `compile_in` checks for an entry block before the task, so a blockless function fails before touching a frame, as before.
+
 ### A7. `crates/blaze-stencil/src/patch/scan.rs`
 
 Line 81, before: `pub(super) fn reset<T: Clone>(column: &mut Vec<T>, len: usize, fill: T) {` after:
@@ -629,10 +653,16 @@ pub(super) fn reset<T: Clone, A: std::alloc::Allocator>(column: &mut Vec<T, A>, 
 
 The callers (scan.rs, select.rs, slots.rs, emit.rs) are unchanged.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29.
+
 ### A8. `crates/blaze-stencil/src/patch/slots.rs`
 
 Lines 152 and 163, before: `free: &mut [Vec<u32>; 2]` after: `free: &mut [Vec<u32, &Frame>; 2]`,
 with `use blaze_mem::frame::Frame;` added to the imports. The bodies are unchanged.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29.
 
 ### A9. `crates/blaze-stencil/src/patch/emit.rs`
 
@@ -683,6 +713,9 @@ lifetimes).
 gives it back as before).
 
 `parallel`, line 703, before: `moves: &mut Vec<Move>` after: `moves: &mut Vec<Move, &Frame>`.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29.
 
 ### A10. `crates/blaze-stencil/src/arch/aarch64.rs`, `aarch64/glue.rs`, `aarch64/frame.rs`
 
@@ -753,6 +786,9 @@ pub(super) fn windows_codes(frame: &Frame, codes: &mut Vec<u8, impl std::alloc::
 and the last line, before: `codes` (the return) after: nothing (delete it). The pushes, the
 `extend_from_slice`s and the final `codes.resize(words * 4, 0)` are unchanged: `codes` starts empty
 (`Side::info` is fresh each compile), so `codes.len()` means what it did.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. `windows_codes` writes into `Cx::windows_info` and returns nothing; `unwind` returns `UnwindKind::WindowsArm64 { len }` there.
 
 ### A11. `crates/blaze-stencil/src/arch/x64.rs`, `x64/frame.rs`, `x64/inst.rs`
 
@@ -858,6 +894,8 @@ and `out.resize(out.len().next_multiple_of(4), 0)` mean what they did. The `exte
 > none of which has landed yet, so whoever applies A3-A6 may apply A11 and the x64 tests in the
 > same change: no need to wait for me. If they land without it, tell `fastcompile-stencil-x64-next2`
 > and I apply A11 at once.
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. `win_raw` writes into an out-vector on the frame (`Cx::temp`), and `with_saves` into `Cx::windows_info`; both return `Result<(), Error>`.
 
 ### A12. The tests that name what changed
 
@@ -1113,6 +1151,9 @@ before: `assert_eq!(frame::windows_codes(&frame), codes);` after:
     assert_eq!(written, codes);
 ```
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. The constants test uses 20 distinct `vconst` I8X16 values through `band` (the mock library has no other constant-pool user) and checks the pool's bytes and order. The x86-64 warm test (name kept) now covers Linux and Windows. Added an AArch64 mock library and `a_warm_compile_through_the_glue_into_a_reused_code_allocates_nothing` over Linux, macOS and Windows. `src/tests/` needed no change.
+
 ### A13. `crates/blaze-stencil/src/tier/instrument.rs` (tier 1, per function)
 
 Line 42-43, before:
@@ -1135,6 +1176,9 @@ The `SmallVec<[Edge; 16]>` stays. No budget test: the same function adds a globa
 imported function and instructions to `func`'s Cranelift tables, which allocate by nature; the
 change takes the one temporary of blaze-stencil's own off the heap.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29. The body from `order` on runs in one `frame::task(Tag::Codegen, ..)`, `order` on the frame.
+
 ### A14. Left as is, and why
 
 - `tier.rs` (`Tiering`, `Counters` setup): once per unit; `Driver` already reuses its `read`
@@ -1142,6 +1186,9 @@ change takes the one temporary of blaze-stencil's own off the heap.
 - `table/format.rs` `check_index` (once per library load) and `Writer` (build time, `gen/`).
 - `shape.rs:1289` (tests only).
 - The `Error` messages (`format!` with `// alloc: the error's message`): a failed compile only.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29: nothing changed there; `hot_lint` over `src/` (outside tests) reports 0.
 
 ### Budget tests of part A
 
@@ -1154,10 +1201,15 @@ change takes the one temporary of blaze-stencil's own off the heap.
 
 ---
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+> applied by fastcompile-stencil-mem, 2026-10-29 (part A, and its budget tests): all four budget tests are in `patch/tests.rs`, plus the x86-64 and AArch64 glue tests named in A12.
+
 ## B. blaze-global: the fetch and publish paths' temporaries
 
 There are no consumers outside the crate (`rg blaze_global crates` finds only itself and its
 `Remote` impl of `blaze-cas`'s one-method trait).
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### B1. `crates/blaze-global/Cargo.toml`
 
@@ -1171,6 +1223,8 @@ blaze-alloc-count.workspace = true
 
 (each in its section, sorted with the others).
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### B2. `crates/blaze-global/src/lib.rs`
 
 After `#![forbid(unsafe_code)]` (line 31): `#![feature(allocator_api)]`. Before `#[cfg(test)] mod
@@ -1183,6 +1237,8 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 ```
 
 (`blaze-items` and `blaze-units` declare it the same way under `forbid(unsafe_code)`.)
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### B3. `client.rs` `Client::pump` (lines 481-540): request buffers from the thread's shelf, the batch's lists on a frame
 
@@ -1262,6 +1318,8 @@ stays and gets `// alloc: what the batch asks, kept with its request until the a
 `http::write_request_head` take; `up.channel.send(&head)` / `send(&body)` coerce to `&[u8]`. Same
 bytes on the wire: the body is cleared at the top of each request as the fresh `Vec` was empty.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### B4. `client.rs` `fetched` (lines 662-725): the deferred keys on a frame
 
 Before:
@@ -1296,6 +1354,8 @@ After (the loop body unchanged):
 
 The completions' bytes (`Answer::..encode_framed()`) and `RecvWindow::read`'s kept value outlive
 the call (they go to the store), so they stay.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### B5. `wire.rs` `SendWindow::write`: no list for a value of one piece
 
@@ -1347,6 +1407,8 @@ after, the body in the closure:
 
 The tests: `wire.rs:444` `pieces(&value).len()` becomes `with_pieces(&value, <[_]>::len)`;
 `wire.rs:490` `for range in pieces(&value) {` becomes `for range in with_pieces(&value, <[_]>::to_vec) {`.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### B6. `wire.rs` `RecvWindow`: one buffer for the pieces held, not a `Box` each
 
@@ -1426,6 +1488,8 @@ after:
 The pieces' bytes, numbers and window accounting are unchanged, so every reference resolves to the
 same bytes as before.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### B7. `wire.rs` `parse_fetch_ask` and `server.rs` `fetch`: the request's keys and answers on a frame
 
 wire.rs line 303, before: `pub(crate) fn parse_fetch_ask(body: &[u8]) -> Result<Vec<Key>, String>
@@ -1466,6 +1530,8 @@ fn fetch(body: &[u8], store: &mut Store, window: &mut SendWindow) -> Result<Resp
 with `use blaze_mem::{Tag, frame};`. `out` stays a heap `Vec` (`// alloc: the response's body,
 which the connection sends after the request`): it is the response.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### B8. Left as is
 
 - `complete()`/`close()` return `Vec<Completion>` by `mem::take(&mut self.undelivered)`: one per
@@ -1474,6 +1540,8 @@ which the connection sends after the request`): it is the response.
 - `Effect::Send { bytes: mem::take(&mut up.staged) }`: the bytes go to the I/O layer
   (`blaze-core`'s `Effect`), whose API owns them.
 - Connection setup, TLS, config and bundle manifests: once per link or per bundle.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### Budget tests of part B (in `wire.rs`'s tests)
 
@@ -1544,6 +1612,8 @@ about 128 MiB through the window; it is the one that holds the steady state of B
 
 ---
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ## C. blaze-intent: a path lookup with no allocation
 
 `path::find` (path.rs 267-306) is the lookup every edit starts with. Today it allocates the split
@@ -1551,6 +1621,8 @@ parts, a `members` list per container, a `String` per member compared (`name_of`
 two squeezed `String`s per impl compared (`impl_of`), and the `found` list per step. The tree
 itself (`syntax-tree`'s flat tree) walks without allocating once a lazy part is made
 (`cursor.rs::part_root` makes each once and keeps it).
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### C1. `crates/blaze-intent/Cargo.toml`
 
@@ -1562,6 +1634,8 @@ blaze-mem.workspace = true
 blaze-alloc-count.workspace = true
 ```
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### C2. `crates/blaze-intent/src/lib.rs`
 
 After `#![forbid(unsafe_code)]` (line 16): `#![feature(allocator_api)]`. Before `#[cfg(test)] mod
@@ -1572,6 +1646,8 @@ tests;` (line 24):
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 ```
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### C3. `crates/blaze-intent/src/path.rs`
 
@@ -1766,6 +1842,8 @@ the frame `Vec`'s slice. `swap(0, nth)` then `truncate(1)` keeps the `nth` match
 
 `squeeze`, `impl_of` and `name_of` stay for `path::of`, `edit.rs` and `rename.rs`.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### C4. `crates/blaze-intent/src/edit.rs` `AddUse`: compare without the strings
 
 Lines 146-153, before:
@@ -1794,6 +1872,8 @@ after:
 
 The rest of an edit's application (the splice's text, `Working`'s reparse, the `Applied` it
 returns) makes what outlives the request, so it is left as it is.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### Budget test of part C (`crates/blaze-intent/src/tests/budget.rs`, `mod budget;` in `tests/mod.rs`)
 
@@ -1824,6 +1904,8 @@ pin that `find` finds what it found before.
 
 ---
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ## D. blaze-premap: the image key's temporaries, and no copy of every name
 
 premap's reads (`View::parse`/`reopen`, `TableView::get`/`find`, `segments()` and the iterators)
@@ -1831,6 +1913,8 @@ allocate nothing already. `Images::pick` is FxHashMap lookups and an `Arc` clone
 per build is the image key (`ImageKey::of`: a 64-byte record per function and 96 per static, sorted)
 and the split, which clones every `(String, Target)` name and every `(InstanceKey, String)` debug
 name of the build into the two parts, a `String` per function.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### D1. `crates/blaze-premap/Cargo.toml`
 
@@ -1842,6 +1926,8 @@ blaze-mem.workspace = true
 blaze-alloc-count.workspace = true
 ```
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### D2. `crates/blaze-premap/src/lib.rs`
 
 After `#![forbid(unsafe_code)]` (line 18): `#![feature(allocator_api)]`; before the `#[cfg(test)]
@@ -1852,6 +1938,8 @@ mod tests;` (line 35):
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 ```
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### D3. `key.rs` `ImageKey::of` (163-214): its sorted records on a frame
 
@@ -1896,6 +1984,8 @@ the same: the same records in the same sorted order.
 `GraphKey::of`, `set`, `toolchain_into`: left as they are, once per run over units (hundreds) and
 features (tens); `natives` is sorted by `radix::sort_copy_by_key`, whose own scratch is
 blaze-radix's.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### D4. `split.rs`: the parts borrow the names instead of cloning them
 
@@ -1961,10 +2051,14 @@ debug_names: &debug_names })` borrows the same way (two `Vec<&_>` made first). L
 407-408 pass `&part.names`/`&workspace.names`, which coerce. Line 544's `debug_names: &[]` is
 unchanged.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### D5. Left as is
 
 `Ready::open`, `Memory::of`, `image::encode`, `prelink::build`, `table::build`, `Job::make`,
 `start::plan`: once per image made or per run, and what they make is the image.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### Budget tests of part D (in `tests.rs`)
 
@@ -1999,6 +2093,8 @@ type to theirs.)
 
 ---
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ## E. blaze-history: budget tests only
 
 `History::predict`, `observe` and `record` already allocate nothing: the key table is a fixed
@@ -2006,6 +2102,8 @@ type to theirs.)
 `Times::observe` grows its `FxHashMap` only for a kind it has not seen (bounded by the number of
 task kinds). `codec::encode`/`decode` run once per save and load, so they are left as they are.
 `Estimates` is blaze-graph's.
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### E1. `crates/blaze-history/Cargo.toml`
 
@@ -2016,6 +2114,8 @@ blaze-alloc-count.workspace = true
 
 (blaze-history needs no `blaze-mem`.)
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ### E2. `crates/blaze-history/src/lib.rs`
 
 Before `#[cfg(test)] mod tests;` (line 26):
@@ -2025,6 +2125,8 @@ Before `#[cfg(test)] mod tests;` (line 26):
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 ```
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
 
 ### E3. The budget test (`tests.rs`)
 
@@ -2054,3 +2156,5 @@ fn predicting_and_learning_a_seen_kind_allocate_nothing() {
 (`config`, `KIND` and `same_bucket` are the file's own helpers, lines 31-41. If blaze-graph's
 `Estimates::observe` turns out to allocate per call, this assertion fails on it, and that change
 goes to blaze-graph's owner.)
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).

@@ -1,19 +1,27 @@
 //! The full identity of a type, constant or argument list, spelled by content: what tells two
-//! types apart where the program can (a `TypeId`, a `type_name`, a vtable, a `dyn` call, a
-//! closure's body). It says at least what the code generator's own spelling of an instance's
-//! arguments does (`hir-ty-codegen`'s `v2/hashes.rs`): an ADT by its key, its interface, its
-//! layout and the `Drop` impls its drop glue reads; a coroutine by its code. So two places
-//! with one identity are one thing to the code generator, in this revision and after an edit.
+//! types apart wherever a program or its code can (a `TypeId`, a `type_name`, a vtable, a
+//! `dyn` call, debug info, a closure's or coroutine's body). This is the one spelling of a type
+//! by content. The code generator's `Hashes::ty` and `Hashes::konst` (instance arguments,
+//! `TypeId` values, the types of its debug info) are this, and so are the share key's identity
+//! records, so a share key covers every type id a template holds.
+//!
+//! - An ADT by its key, its interface, its layout and the `Drop` impls its drop glue reads
+//!   ([`adt`], a tracked query); its arguments the same way.
+//! - A closure by its key and arguments; a coroutine by its key, its compiled code
+//!   ([`crate::code`]: its code hash, its bindings' names, its positions) and its arguments.
+//! - Regions are left out.
+//!
+//! Each spelling streams into one [`Hasher`]: nothing is allocated but a trait object's
+//! bounds past four, which are sorted.
 
 use base_db::Db;
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::{
-    ItemId, ItemKey, Unhashable, coroutine_code, interface_hash, item_key, key, layout_hash,
-};
+use blaze_items::{ItemId, ItemKey, Unhashable, interface_hash, item_key, key, layout_hash};
 use either::Either;
 use hir_def::{AdtId, CallableDefId, VariantId};
 use hir_ty::{
     db::HirDatabase,
+    mir::is_by_move_coroutine,
     next_solver::{Binder, Const, ConstKind, GenericArgs, Pattern, TermId, Ty, TyKind, ValTree},
 };
 use rustc_hash::FxHashSet;
@@ -24,28 +32,36 @@ use rustc_type_ir::{
 };
 use smallvec::SmallVec;
 
-use crate::{ADT_DOMAIN, IDENTITY_DOMAIN, Unshared};
+use crate::{Unshared, code};
 
-pub(crate) fn ty<'db>(db: &'db Db, ty: Ty<'db>) -> Result<ContentId, Unshared> {
-    let mut spell = Spell::new(db);
+/// The domain of a type's identity.
+pub const TY_DOMAIN: &str = "blaze v2 identity type 1";
+/// The domain of a constant's identity.
+pub const CONST_DOMAIN: &str = "blaze v2 identity const 1";
+/// The domain of an argument list's identity.
+pub const ARGS_DOMAIN: &str = "blaze v2 identity args 1";
+/// The domain of one bound of a trait object, hashed alone so the bounds can be sorted.
+pub const BOUND_DOMAIN: &str = "blaze v2 identity bound 1";
+/// The domain of an ADT's identity: its key, interface, layout and the drop impls it reaches.
+pub const ADT_DOMAIN: &str = "blaze v2 identity adt 1";
+
+/// The identity of `ty`. Call it with the database attached (`hir_ty::attach_db`).
+pub fn ty<'db>(db: &'db Db, ty: Ty<'db>) -> Result<ContentId, Unshared> {
+    let mut spell = Spell::new(db, TY_DOMAIN);
     spell.ty(ty)?;
     Ok(spell.out.finish())
 }
 
-pub(crate) fn args<'db>(
-    db: &'db Db,
-    args: GenericArgs<'db>,
-) -> Result<ContentId, Unshared> {
-    let mut spell = Spell::new(db);
+/// The identity of `args`: each type and constant, and a lifetime as a placeholder.
+pub fn args<'db>(db: &'db Db, args: GenericArgs<'db>) -> Result<ContentId, Unshared> {
+    let mut spell = Spell::new(db, ARGS_DOMAIN);
     spell.args(args)?;
     Ok(spell.out.finish())
 }
 
-pub(crate) fn konst<'db>(
-    db: &'db Db,
-    konst: Const<'db>,
-) -> Result<ContentId, Unshared> {
-    let mut spell = Spell::new(db);
+/// The identity of `konst`: its value and its type's identity.
+pub fn konst<'db>(db: &'db Db, konst: Const<'db>) -> Result<ContentId, Unshared> {
+    let mut spell = Spell::new(db, CONST_DOMAIN);
     spell.konst(konst)?;
     Ok(spell.out.finish())
 }
@@ -59,9 +75,10 @@ fn no_content(what: String) -> Unshared {
 }
 
 /// An ADT as its identity says it: its key, its interface (fields, variants, `repr`), its
-/// layout, and the `Drop` impls of it and of every ADT its fields' types name, transitively.
+/// layout, and the `Drop` impls of it and of every ADT its fields' types name, transitively,
+/// which drop glue reads.
 #[salsa::tracked(returns(ref))]
-pub(crate) fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
+pub fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
     let item = ItemId::Adt(adt);
     let mut h = Hasher::new(ADT_DOMAIN);
     h.id(&item_key(db, item).0)
@@ -100,10 +117,7 @@ pub(crate) fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
 }
 
 /// The variants of `adt` in declaration order: one for a struct or union.
-pub(crate) fn variants<'db>(
-    db: &'db Db,
-    adt: AdtId,
-) -> impl Iterator<Item = VariantId> + 'db {
+pub(crate) fn variants<'db>(db: &'db Db, adt: AdtId) -> impl Iterator<Item = VariantId> + 'db {
     match adt {
         AdtId::StructId(it) => Either::Left(std::iter::once(it.into())),
         AdtId::UnionId(it) => Either::Left(std::iter::once(it.into())),
@@ -114,9 +128,9 @@ pub(crate) fn variants<'db>(
 }
 
 /// A type or constant spelled by content straight into its hash: nothing is buffered.
-pub(crate) struct Spell<'db> {
+struct Spell<'db> {
     db: &'db Db,
-    pub(crate) out: Hasher,
+    out: Hasher,
 }
 
 /// `fmt::Write` into a spelling: a `Debug` name hashed without a `String`.
@@ -130,8 +144,8 @@ impl std::fmt::Write for Text<'_> {
 }
 
 impl<'db> Spell<'db> {
-    pub(crate) fn new(db: &'db Db) -> Spell<'db> {
-        Spell { db, out: Hasher::new(IDENTITY_DOMAIN) }
+    fn new(db: &'db Db, domain: &'static str) -> Spell<'db> {
+        Spell { db, out: Hasher::new(domain) }
     }
 
     fn u8(&mut self, value: u8) {
@@ -170,7 +184,7 @@ impl<'db> Spell<'db> {
         self.key(item_key(self.db, item));
     }
 
-    pub(crate) fn ty(&mut self, ty: Ty<'db>) -> Result<(), Unshared> {
+    fn ty(&mut self, ty: Ty<'db>) -> Result<(), Unshared> {
         let db = self.db;
         match ty.kind() {
             TyKind::Bool => self.u8(0),
@@ -264,7 +278,7 @@ impl<'db> Spell<'db> {
                 // The order the bounds are written in is not the type's.
                 let mut each: SmallVec<[ContentId; 4]> = SmallVec::new();
                 for predicate in predicates.iter() {
-                    let mut inner = Spell::new(db);
+                    let mut inner = Spell::new(db, BOUND_DOMAIN);
                     inner.len(predicate.bound_vars().len());
                     match predicate.skip_binder() {
                         ExistentialPredicate::Trait(it) => {
@@ -314,17 +328,22 @@ impl<'db> Spell<'db> {
                 self.args(args)?;
             }
             // A coroutine's layout is of the locals its body keeps across its yields, which
-            // its arguments do not say: its code does.
+            // its arguments do not say, and its debug info names them: its compiled code says
+            // both.
             TyKind::Coroutine(id, args) => {
                 self.u8(19);
                 self.key(key::coroutine_key(db, id.0));
-                self.id(&coroutine_code(db, id.0).map_err(unhashable(db))?.0);
+                let code = match is_by_move_coroutine(db, id.0, args.as_coroutine()) {
+                    true => code::of_coroutine_by_move(db, id.0),
+                    false => code::of_coroutine(db, id.0),
+                };
+                self.id(code.as_ref().map_err(Clone::clone)?);
                 self.args(args)?;
             }
             TyKind::CoroutineWitness(id, args) => {
                 self.u8(20);
                 self.key(key::coroutine_key(db, id.0));
-                self.id(&coroutine_code(db, id.0).map_err(unhashable(db))?.0);
+                self.id(code::of_coroutine(db, id.0).as_ref().map_err(Clone::clone)?);
                 self.args(args)?;
             }
             TyKind::Never => self.u8(21),
@@ -378,7 +397,7 @@ impl<'db> Spell<'db> {
         }
     }
 
-    pub(crate) fn args(&mut self, args: GenericArgs<'db>) -> Result<(), Unshared> {
+    fn args(&mut self, args: GenericArgs<'db>) -> Result<(), Unshared> {
         self.len(args.len());
         for arg in args.iter() {
             match arg.kind() {
@@ -396,7 +415,7 @@ impl<'db> Spell<'db> {
         Ok(())
     }
 
-    pub(crate) fn pattern(&mut self, pattern: Pattern<'db>) -> Result<(), Unshared> {
+    fn pattern(&mut self, pattern: Pattern<'db>) -> Result<(), Unshared> {
         match pattern.kind() {
             PatternKind::Range { start, end } => {
                 self.u8(0);
@@ -416,7 +435,7 @@ impl<'db> Spell<'db> {
     }
 
     /// A constant by its value and its type's identity.
-    pub(crate) fn konst(&mut self, konst: Const<'db>) -> Result<(), Unshared> {
+    fn konst(&mut self, konst: Const<'db>) -> Result<(), Unshared> {
         match konst.kind() {
             ConstKind::Value(value) => {
                 self.u8(0);

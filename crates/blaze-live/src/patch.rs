@@ -32,6 +32,7 @@ pub const FIRST_GENERATION: u64 = 0;
 /// read-only data, every address as linked (unslid); the slide is where the descriptor is
 /// in memory minus `this`.
 #[repr(C)]
+// clone: 112 bytes of plain data mirroring the symbol's, read once at start
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Descriptor {
     pub magic: [u8; 8],
@@ -81,7 +82,7 @@ impl Descriptor {
     /// The descriptor at the start of `bytes`: none when they are too short or don't start
     /// with [`DESCRIPTOR_MAGIC`]. The version is the reader's to check.
     pub fn decode(bytes: &[u8]) -> Option<Descriptor> {
-        let mut reader = Reader(bytes.get(..Self::SIZE)?);
+        let mut reader = Fields(bytes.get(..Self::SIZE)?);
         let magic: [u8; 8] = reader.array().ok()?;
         if magic != DESCRIPTOR_MAGIC {
             return None;
@@ -108,7 +109,7 @@ impl Descriptor {
 
 const _: () = assert!(Descriptor::SIZE == size_of::<Descriptor>());
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct Patch {
     pub id: [u8; 16],
     /// Generations count commits of the image; a patch applies on `base` only.
@@ -134,7 +135,9 @@ pub struct Patch {
 impl Patch {
     /// The patch with its bytes borrowed, which encodes to the same message.
     pub fn with<R>(&self, f: impl FnOnce(&PatchRef<'_>) -> R) -> R {
+        // alloc: owned patches (tests, decoded ones); the linker writes `PatchRef`
         let code: Vec<(u64, &[u8])> = self.code.iter().map(|(at, it)| (*at, &it[..])).collect();
+        // alloc: as `code` above
         let data: Vec<(u64, &[u8])> = self.data.iter().map(|(at, it)| (*at, &it[..])).collect();
         f(&PatchRef {
             id: self.id,
@@ -154,6 +157,7 @@ impl Patch {
 
 /// A [`Patch`] whose bytes are borrowed: what the linker encodes straight from its own
 /// buffers, copying each byte once, into the message.
+// clone: 144 bytes of borrowed slices: a copy copies no byte of the patch
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PatchRef<'a> {
     pub id: [u8; 16],
@@ -237,7 +241,7 @@ impl PatchRef<'_> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Message {
     Patch(Patch),
     /// Back to the table of `to` (a generation the program applied or started at).
@@ -256,6 +260,8 @@ pub enum Message {
 /// A patch read in place from its message ([`Message::view`]): the bytes of its writes are
 /// the message's, and its lists are read from them as they are iterated. Every bound was
 /// checked when it was read, so nothing here fails.
+// clone: 176 bytes of borrowed slices, taken by value by its lists: a copy copies no byte of
+// the message
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PatchView<'a> {
     pub id: [u8; 16],
@@ -292,6 +298,7 @@ impl<'a> PatchView<'a> {
     }
 
     pub fn to_patch(&self) -> Patch {
+        // alloc: an owned copy the caller asks for; the runtime reads views
         let owned = |writes: WriteList<'_>| writes.map(|(at, it)| (at, it.to_vec())).collect();
         Patch {
             id: self.id,
@@ -299,9 +306,13 @@ impl<'a> PatchView<'a> {
             base: self.base,
             code: owned(self.code),
             data: owned(self.data),
+            // alloc: as `owned` above
             rebase: self.rebase().collect(),
+            // alloc: as `owned` above
             cells: self.cells().collect(),
+            // alloc: as `owned` above
             frames: self.frames().collect(),
+            // alloc: as `owned` above
             windows: self.windows().collect(),
             functions: self.functions,
             statics: self.statics,
@@ -341,6 +352,7 @@ impl<'a> Iterator for WriteList<'a> {
 impl ExactSizeIterator for WriteList<'_> {}
 
 /// A [`Message`] read in place ([`Message::view`]).
+// clone: a `PatchView` or less (see there)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MessageView<'a> {
     Patch(PatchView<'a>),
@@ -354,6 +366,7 @@ impl MessageView<'_> {
             MessageView::Patch(patch) => Message::Patch(patch.to_patch()),
             MessageView::RollBack { id, to } => Message::RollBack { id, to },
             MessageView::Restart { id, generation, why } => {
+                // alloc: an owned copy, asked for by the caller; the runtime reads views
                 Message::Restart { id, generation, why: why.to_owned() }
             }
         }
@@ -412,7 +425,7 @@ impl Message {
     /// The message in `bytes`, read in place: every length is checked against the bytes
     /// there are in one pass over the headers, and nothing is copied or allocated.
     pub fn view(bytes: &[u8]) -> Result<MessageView<'_>, String> {
-        let mut reader = Reader(bytes);
+        let mut reader = Fields(bytes);
         reader.header(MESSAGE_MAGIC, "message")?;
         let view = match reader.u32()? {
             0 => MessageView::Patch(PatchView {
@@ -435,6 +448,7 @@ impl Message {
                 generation: reader.u64()?,
                 why: reader.str()?,
             },
+            // alloc: error path
             other => return Err(format!("a message of kind {other}")),
         };
         reader.end("message")?;
@@ -464,7 +478,7 @@ pub fn message_file_into(generation: u64, name: &mut String) {
 /// What the program answers, in the file `ANSWER` of the directory (replaced each time).
 pub const ANSWER: &str = "answer";
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Answer {
     Applied { generation: u64 },
     RolledBack { generation: u64, to: u64, why: String },
@@ -511,16 +525,19 @@ impl Answer {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Answer, String> {
-        let mut reader = Reader(bytes);
+        let mut reader = Fields(bytes);
         reader.header(ANSWER_MAGIC, "answer")?;
         let answer = match reader.u32()? {
             0 => Answer::Applied { generation: reader.u64()? },
             1 => Answer::RolledBack {
                 generation: reader.u64()?,
                 to: reader.u64()?,
+                // alloc: the reason, for the linker: once per rollback
                 why: reader.str()?.to_owned(),
             },
+            // alloc: the reason, for the linker: once per declined patch
             2 => Answer::Declined { generation: reader.u64()?, why: reader.str()?.to_owned() },
+            // alloc: error path
             other => return Err(format!("an answer of kind {other}")),
         };
         reader.end("answer")?;
@@ -568,11 +585,14 @@ impl<'o> Writer<'o> {
     }
 }
 
-struct Reader<'a>(&'a [u8]);
+/// The patch's fields, read in order. Not `blaze_format::cursor::Reader`: this crate runs
+/// inside the patched program and depends on no other crate.
+struct Fields<'a>(&'a [u8]);
 
-impl<'a> Reader<'a> {
+impl<'a> Fields<'a> {
     fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
         if self.0.len() < len {
+            // alloc: error path
             return Err(format!("ends early: {len} bytes wanted, {} left", self.0.len()));
         }
         let (taken, rest) = self.0.split_at(len);
@@ -599,6 +619,7 @@ impl<'a> Reader<'a> {
         let count = self.u64()?;
         let left = (self.0.len() / each) as u64;
         if count > left {
+            // alloc: error path
             return Err(format!("{count} entries where {left} fit"));
         }
         Ok(count as usize)
@@ -610,6 +631,7 @@ impl<'a> Reader<'a> {
     }
 
     fn str(&mut self) -> Result<&'a str, String> {
+        // alloc: error path
         std::str::from_utf8(self.bytes()?).map_err(|_| "text that is not UTF-8".to_owned())
     }
 
@@ -632,10 +654,12 @@ impl<'a> Reader<'a> {
 
     fn header(&mut self, magic: [u8; 8], what: &str) -> Result<(), String> {
         if self.array::<8>().ok() != Some(magic) {
+            // alloc: error path
             return Err(format!("not a blaze-live {what}"));
         }
         match self.u32()? {
             MESSAGE_VERSION => Ok(()),
+            // alloc: error path
             other => Err(format!(
                 "a {what} of version {other}, where this program reads {MESSAGE_VERSION}"
             )),
@@ -646,6 +670,7 @@ impl<'a> Reader<'a> {
         if self.0.is_empty() {
             Ok(())
         } else {
+            // alloc: error path
             Err(format!("{} bytes after the {what}", self.0.len()))
         }
     }
@@ -825,8 +850,8 @@ mod tests {
 
     #[test]
     fn a_view_reads_what_decode_does_in_place() {
+        let bytes = Message::Patch(patch()).encode();
         let patch = patch();
-        let bytes = Message::Patch(patch.clone()).encode();
         let Ok(MessageView::Patch(view)) = Message::view(&bytes) else { panic!("a patch") };
         assert_eq!((view.id, view.generation, view.base), (patch.id, patch.generation, patch.base));
         assert_eq!(view.code.len(), patch.code.len());

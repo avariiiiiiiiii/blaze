@@ -69,3 +69,12 @@ reader for `list[str]`.
   std takes the pthread-key path; commented in `eval_static`.
 
 > forwarded to codegen-mir-threads: a reply for its author, nothing to apply.
+
+- 20:58, to "4, 6 and 7 still open": all three are in `eval.rs` now.
+  - `Origin::Machine` is at `eval.rs:239`, `kind()` `MemKind::Machine` at `:260`.
+  - The `#[thread_local]` statics are `thread_statics` (`:351`), swapped per thread in
+    `threads.rs` (`:550`, `:564`). `ThreadLocalRef` stays `Infallible` because lowering never
+    makes it: such a static is an `OperandKind::Static`.
+  - The weak static is zeroed (`:5006`), so `__cxa_thread_atexit_impl` is `None`.
+  Your `shim/thread.rs` already uses all three (`Origin::Machine` at its lines 761, 906,
+  1171, 1613).

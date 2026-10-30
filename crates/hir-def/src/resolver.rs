@@ -1,14 +1,14 @@
 //! Name resolution façade.
-use std::{fmt, mem};
+use std::{cell::RefCell, fmt, iter, mem, ops::ControlFlow};
 
 use base_db::{Db, Crate};
+use blaze_mem::scratch::Scratch;
 use hir_expand::{
     MacroDefId,
     mod_path::{ModPath, PathKind},
     name::{AsName, Name},
 };
 use intern::{Symbol, sym};
-use itertools::Itertools as _;
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use span::SyntaxContext;
@@ -41,6 +41,15 @@ use crate::{
     type_ref::LifetimeRef,
     visibility::{RawVisibility, Visibility},
 };
+
+/// What [`Resolver::names_in_scope`] returns: each name with its meanings, innermost first.
+pub type NamesInScope = FxIndexMap<Name, SmallVec<[ScopeDef; 1]>>;
+
+thread_local! {
+    /// The `macro_use` prelude of [`Resolver::names_in_scope_into`], put in name order.
+    static MACRO_USE_PRELUDE: RefCell<Scratch<(Name, MacroId)>> =
+        const { RefCell::new(Scratch::new()) };
+}
 
 /// A stack of [`Scope`]s over the scope of a module. A body walk keeps one: entering an
 /// expression pushes its scopes onto the same `Vec` and leaving truncates it
@@ -716,6 +725,41 @@ impl<'db> Resolver<'db> {
         );
     }
 
+    /// Appends to `out` the imports of this crate that have `trait_` in scope here, for a
+    /// method or associated item type inference found in it through the traits in scope (rustc's
+    /// `TraitCandidate::import_ids`, which `used_trait_imports` marks used). The candidate is
+    /// rustc's first: the impl's own trait, which no import brings; else the innermost block
+    /// scope that has the trait, then the module's. A trait the std prelude gives records
+    /// nothing: the prelude's glob is the injected import, which rustc never lints.
+    pub fn record_trait_uses(&self, db: &Db, trait_: TraitId, out: &mut Vec<Use>) {
+        let is_impl_trait = |scope: Scope<'_>| match scope {
+            Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
+                let impl_data = ImplSignature::of(db, impl_);
+                impl_data.target_trait.is_some_and(|target| {
+                    self.resolve_path_in_type_ns_fully(db, &impl_data.store[target.path])
+                        == Some(TypeNs::TraitId(trait_))
+                })
+            }
+            _ => false,
+        };
+        if self.scopes().any(is_impl_trait) {
+            return;
+        }
+        let in_blocks = self.scopes().find_map(|scope| match scope {
+            Scope::BlockScope { def_map, module_id } => {
+                def_map.module(db, module_id).scope(db).trait_binding(trait_)
+            }
+            _ => None,
+        });
+        let binding = in_blocks.or_else(|| {
+            let ModuleItemMap { def_map, module_id, .. } = self.module_scope;
+            def_map.module(db, module_id).scope(db).trait_binding(trait_)
+        });
+        if let Some((name, Some(import))) = binding {
+            crate::nameres::uses::trait_uses(db, self.krate(), trait_, (name, import), out);
+        }
+    }
+
     pub fn resolve_lifetime(&self, lifetime: &LifetimeRef) -> Option<LifetimeNs> {
         match lifetime {
             LifetimeRef::Static => Some(LifetimeNs::Static),
@@ -771,36 +815,41 @@ impl<'db> Resolver<'db> {
     /// The result is ordered *roughly* from the innermost scope to the
     /// outermost: when the name is introduced in two namespaces in two scopes,
     /// we use the position of the first scope.
-    pub fn names_in_scope(
-        &self,
-        db: &Db,
-    ) -> FxIndexMap<Name, SmallVec<[ScopeDef; 1]>> {
-        let mut res = ScopeNames::default();
+    pub fn names_in_scope(&self, db: &Db) -> NamesInScope {
+        let mut names = NamesInScope::default();
+        self.names_in_scope_into(db, &mut names);
+        names
+    }
+
+    /// [`Self::names_in_scope`] into `names`, which it empties first: a caller that keeps one map
+    /// allocates only while the map grows, and for a name with more than one meaning (its list
+    /// leaves its inline slot).
+    pub fn names_in_scope_into(&self, db: &Db, names: &mut NamesInScope) {
+        names.clear();
+        let mut res = ScopeNames { map: names };
         for scope in self.scopes() {
             self.process_names(scope, &mut res, db);
         }
         let ModuleItemMap { def_map, module_id, local_def_map } = self.module_scope;
         // FIXME: should we provide `self` here?
-        // f(
-        //     Name::self_param(),
-        //     PerNs::types(Resolution::Def {
-        //         def: m.module.into(),
-        //     }),
-        // );
         def_map.module(db, module_id).scope(db).entries().for_each(|(name, def)| {
             res.add_per_ns(name, def);
         });
-
         def_map.module(db, module_id).scope(db).legacy_macros().for_each(|(name, macs)| {
             macs.iter().for_each(|&mac| {
                 res.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
             })
         });
-        def_map.macro_use_prelude().iter().sorted_by(|a, b| a.0.cmp(b.0)).for_each(
-            |(name, &(def, _extern_crate))| {
-                res.add(name, ScopeDef::ModuleDef(def.into()));
-            },
-        );
+        // The `macro_use` prelude is a map, so its names are unique and an unstable sort keeps
+        // the order; `res.add` doesn't reenter the resolver, so the borrow is taken once.
+        MACRO_USE_PRELUDE.with_borrow_mut(|sorted| {
+            let sorted = sorted.take();
+            sorted.extend(def_map.macro_use_prelude().iter().map(|(name, &(def, _))| (*name, def)));
+            sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            for &(name, def) in sorted.iter() {
+                res.add(&name, ScopeDef::ModuleDef(def.into()));
+            }
+        });
         local_def_map.extern_prelude().for_each(|(name, (def, _extern_crate))| {
             res.add(name, ScopeDef::ModuleDef(ModuleDefId::ModuleId(def)));
         });
@@ -813,7 +862,6 @@ impl<'db> Resolver<'db> {
                 res.add_per_ns(name, def)
             }
         }
-        res.map
     }
 
     /// Note: Not to be used directly within hir-def/hir-ty
@@ -843,7 +891,7 @@ impl<'db> Resolver<'db> {
         self.module_scope
             .local_def_map
             .extern_prelude()
-            .map(|(name, module_id)| (name.clone(), module_id.0))
+            .map(|(name, module_id)| (*name, module_id.0))
     }
 
     pub fn traits_in_scope(&self, db: &Db) -> FxHashSet<TraitId> {
@@ -853,16 +901,44 @@ impl<'db> Resolver<'db> {
     }
 
     /// Adds the traits in scope to `traits`, for a caller that refills one set as it walks
-    /// (clear it first for exactly [`Self::traits_in_scope`]). The resolver's
-    /// [`Self::module`] names which traits these are: two positions of one walk with the same
-    /// module have the same traits in scope.
-    pub fn traits_in_scope_into(&self, db: &Db, traits: &mut FxHashSet<TraitId>) {
+    /// (clear it first for exactly [`Self::traits_in_scope`]), or that keeps it in its frame.
+    /// The resolver's [`Self::module`] names which traits these are: two positions of one walk
+    /// with the same module have the same traits in scope.
+    pub fn traits_in_scope_into(&self, db: &Db, traits: &mut impl Extend<TraitId>) {
+        self.for_each_trait_in_scope(db, |it| traits.extend(iter::once(it)));
+    }
+
+    /// Calls `f` with each trait in scope, innermost scope first. A trait in scope twice (from
+    /// a block and from the module) comes twice.
+    pub fn for_each_trait_in_scope(&self, db: &Db, mut f: impl FnMut(TraitId)) {
+        let _ = self.try_for_each_trait_in_scope(db, &mut |it| {
+            f(it);
+            ControlFlow::<()>::Continue(())
+        });
+    }
+
+    /// Whether `trait_` is in scope: [`Self::for_each_trait_in_scope`]'s walk, stopping at it.
+    pub fn has_trait_in_scope(&self, db: &Db, trait_: TraitId) -> bool {
+        self.try_for_each_trait_in_scope(db, &mut |it| match it == trait_ {
+            true => ControlFlow::Break(()),
+            false => ControlFlow::Continue(()),
+        })
+        .is_break()
+    }
+
+    fn try_for_each_trait_in_scope<B>(
+        &self,
+        db: &Db,
+        f: &mut impl FnMut(TraitId) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
         // FIXME(trait_alias): Trait alias brings aliased traits in scope! Note that supertraits of
         // aliased traits are NOT brought in scope (unless also aliased).
         for scope in self.scopes() {
             match scope {
                 Scope::BlockScope { def_map, module_id } => {
-                    traits.extend(def_map.module(db, module_id).traits_in_scope(db))
+                    for it in def_map.module(db, module_id).traits_in_scope(db) {
+                        f(it)?;
+                    }
                 }
                 Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
                     let impl_data = ImplSignature::of(db, impl_);
@@ -870,22 +946,23 @@ impl<'db> Resolver<'db> {
                         && let Some(TypeNs::TraitId(trait_)) = self
                             .resolve_path_in_type_ns_fully(db, &impl_data.store[target_trait.path])
                     {
-                        traits.insert(trait_);
+                        f(trait_)?;
                     }
                 }
                 _ => (),
             }
         }
-
-        // Fill in the prelude traits
         if let Some((prelude, _use)) = self.module_scope.def_map.prelude() {
             let prelude_def_map = prelude.def_map(db);
-            traits.extend(prelude_def_map.module(db, prelude).traits_in_scope(db));
+            for it in prelude_def_map.module(db, prelude).traits_in_scope(db) {
+                f(it)?;
+            }
         }
-        // Fill in module visible traits
-        traits.extend(
-            self.module_scope.def_map.module(db, self.module_scope.module_id).traits_in_scope(db),
-        );
+        let module = self.module_scope.def_map.module(db, self.module_scope.module_id);
+        for it in module.traits_in_scope(db) {
+            f(it)?;
+        }
+        ControlFlow::Continue(())
     }
 
     pub fn traits_in_scope_from_block_scopes<'a>(
@@ -1279,7 +1356,7 @@ pub enum ScopeDef {
 }
 
 impl<'db> Resolver<'db> {
-    fn process_names(&self, scope: Scope<'db>, acc: &mut ScopeNames, db: &Db) {
+    fn process_names(&self, scope: Scope<'db>, acc: &mut ScopeNames<'_>, db: &Db) {
         match scope {
             Scope::BlockScope { def_map, module_id } => {
                 def_map.module(db, module_id).scope(db).entries().for_each(|(name, def)| {
@@ -1524,14 +1601,13 @@ fn to_type_ns(per_ns: PerNs) -> Option<(TypeNs, Option<ImportOrExternCrate>, Vis
     Some((res, def.import, def.vis))
 }
 
-#[derive(Default)]
-struct ScopeNames {
-    map: FxIndexMap<Name, SmallVec<[ScopeDef; 1]>>,
+struct ScopeNames<'a> {
+    map: &'a mut NamesInScope,
 }
 
-impl ScopeNames {
+impl ScopeNames<'_> {
     fn add(&mut self, name: &Name, def: ScopeDef) {
-        let set = self.map.entry(name.clone()).or_default();
+        let set = self.map.entry(*name).or_default();
         if !set.contains(&def) {
             set.push(def)
         }
@@ -1551,7 +1627,7 @@ impl ScopeNames {
         }
     }
     fn add_local(&mut self, name: &Name, binding: BindingId) {
-        let set = self.map.entry(name.clone()).or_default();
+        let set = self.map.entry(*name).or_default();
         // XXX: hack, account for local (and only local) shadowing.
         //
         // This should be somewhat more principled and take namespaces into
@@ -1756,3 +1832,6 @@ fn lookup_resolver(
 ) -> Resolver<'_> {
     lookup.lookup(db).container().resolver(db)
 }
+
+#[cfg(test)]
+mod tests;

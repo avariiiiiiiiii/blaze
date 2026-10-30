@@ -236,3 +236,216 @@ through the `for end in ends { ... }` split loop with
 tree; the shared one places without first filling the run with `Slot::default()`.
 
 > applied by requests (store DONE): `sorted` buckets with `radix::Csr::build(256, ..).into_parts()` and splits the run by `starts`, as written; `drop(pieces)` after; `total` still feeds `threads`.
+
+## dedup: bits: blaze-cas flag columns onto `blaze_ids::bits::AtomicBitSlice`
+
+From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
+`blaze_ids::bits::AtomicBitSlice<'a>` (`crates/blaze-ids/src/bits.rs`) is the atomic bit
+operations over `&'a [AtomicU64]` held elsewhere: `contains(at, order)` (a load, `false` past
+the capacity), `insert_if_clear(at, order)` (a relaxed load, then `fetch_or` only when clear),
+and `move_into(to, order)` (each word `to.store(from.swap(0, order), order)`: the rotation).
+The words stay where they are, on the `Tag::Store` region `words.rs` commits a level at a time;
+only the bit arithmetic and the rotation loop move. Its `AtomicU64` is `blaze_ids`'s
+`sync::atomic`, which is `std`'s, or blaze-check's under `cfg(blaze_check)`, exactly as
+blaze-cas's own `sync::atomic` is, so `Words<AtomicU64>` stretches are its words in both
+builds. Same loads, same `fetch_or`s, same orderings (relaxed), same rows ignored past the end.
+`flags::Bits` keeps its own invariant (six columns in one stretch, a rotation of two pairs), so
+it stays a struct, renamed `FlagColumns` (not a bit-set name). blaze-cas depends on blaze-ids
+already. The thread test of the shared type is in `crates/blaze-ids/src/bits/tests.rs`; the
+three tests in `flags.rs` stay, renamed.
+
+1. `crates/blaze-cas/src/flags.rs`: imports, before:
+
+   ```rust
+   use std::fmt;
+
+   use crate::{
+       sync::atomic::{AtomicU64, Ordering},
+       words::Words,
+   };
+   ```
+
+   after:
+
+   ```rust
+   use std::fmt;
+
+   use blaze_ids::bits::AtomicBitSlice;
+
+   use crate::{
+       sync::atomic::{AtomicU64, Ordering},
+       words::Words,
+   };
+   ```
+
+   Replace from `/// The flag columns of a fixed number of rows (an index table's slots).`
+   through the `}` closing `impl Bits` with:
+
+   ```rust
+   /// The flag columns of a fixed number of rows (an index table's slots). Its words are on the
+   /// store's region (`words.rs`), not in a `blaze_ids::bits::AtomicBits`' box; each column is
+   /// read and written as an `AtomicBitSlice` of them.
+   pub(crate) struct FlagColumns {
+       /// `FLAGS` columns of `words` words each, one stretch.
+       bits: Words<AtomicU64>,
+       words: usize,
+   }
+
+   impl fmt::Debug for FlagColumns {
+       fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+           f.debug_struct("FlagColumns").field("rows", &(self.words * 64)).finish_non_exhaustive()
+       }
+   }
+
+   impl FlagColumns {
+       pub(crate) fn new(rows: u64) -> FlagColumns {
+           let words = rows.div_ceil(64) as usize;
+           let bits = Words::new(FLAGS * words);
+           bits.make(0, 0, FLAGS * words);
+           FlagColumns { bits, words }
+       }
+
+       fn column(&self, flag: Flag) -> AtomicBitSlice<'_> {
+           let at = flag as usize * self.words;
+           AtomicBitSlice::from_words(&self.bits.get(0, 0, FLAGS * self.words)[at..at + self.words])
+       }
+
+       pub(crate) fn get(&self, row: u64, flag: Flag) -> bool {
+           usize::try_from(row).is_ok_and(|row| self.column(flag).contains(row, RELAXED))
+       }
+
+       /// Sets `flag` of `row`; a row past the table's is none of its records and is left.
+       pub(crate) fn set(&self, row: u64, flag: Flag) {
+           let column = self.column(flag);
+           if let Ok(row) = usize::try_from(row)
+               && row < column.capacity()
+           {
+               column.insert_if_clear(row, RELAXED);
+           }
+       }
+
+       /// A new period of reading: what was read becomes read before, what was made made before.
+       /// Only the store calls it; a flag set meanwhile lands in one period or the other.
+       pub(crate) fn rotate(&self) {
+           for (from, to) in [(Flag::Read, Flag::ReadBefore), (Flag::New, Flag::NewBefore)] {
+               self.column(from).move_into(self.column(to), RELAXED);
+           }
+       }
+   }
+   ```
+
+   In `mod tests`, every `Bits::new(` becomes `FlagColumns::new(` (three: `Bits::new(701)`,
+   `Bits::new(rows)`, `Arc::new(Bits::new(64 * 64))`).
+
+2. `crates/blaze-cas/src/read.rs`: `flags::{Bits, Flag, Row},` becomes
+   `flags::{Flag, FlagColumns, Row},`; in `Index`, `pub(crate) bits: Bits,` becomes
+   `pub(crate) bits: FlagColumns,`; in `Index::new`, `Bits::new(table.slots())` becomes
+   `FlagColumns::new(table.slots())`. (`index.bits.get`/`set`/`rotate` in `read.rs` and
+   `lib.rs` are unchanged.)
+
+3. `crates/blaze-cas/src/model.rs`: `flags::{Bits, Flag},` becomes `flags::{Flag, FlagColumns},`;
+   `impl Periodic for Bits {` becomes `impl Periodic for FlagColumns {`;
+   `flags_land_in_one_period_or_the_other(|| Bits::new(128), 65);` becomes
+   `flags_land_in_one_period_or_the_other(|| FlagColumns::new(128), 65);`.
+
+4. `crates/blaze-cas/src/table.rs`: imports, after `use blaze_mem::{MemError, Region, RegionVec, Tag};`
+   add `use blaze_ids::bits::AtomicBitSlice;` (sorted before `blaze_mem`:
+   `use blaze_ids::bits::AtomicBitSlice;` then `use blaze_mem::{...};` then `use blaze_reclaim::...`).
+
+   Replace `fn word`, `flag`, `set_flag` and `rotate`, before:
+
+   ```rust
+       /// The word and bit of `column` for `row`; `None` past the rows made.
+       fn word(&self, row: u64, column: usize) -> Option<(&AtomicU64, u64)> {
+           debug_assert!(column < self.columns);
+           let (mut number, mut at) = (0, row);
+           while at >= self.cap(number) as u64 {
+               at -= self.cap(number) as u64;
+               number += 1;
+               if number >= self.most {
+                   return None;
+               }
+           }
+           self.levels[number].get()?;
+           let words = self.cap(number) / 64;
+           Some((&self.bits_of(number)[column * words + (at / 64) as usize], 1 << (at % 64)))
+       }
+
+       pub(crate) fn flag(&self, row: u64, column: usize) -> bool {
+           self.word(row, column).is_some_and(|(word, bit)| word.load(Ordering::Relaxed) & bit != 0)
+       }
+
+       /// Sets a flag: a hint about bytes that never change at a place, so relaxed.
+       pub(crate) fn set_flag(&self, row: u64, column: usize) {
+           if let Some((word, bit)) = self.word(row, column)
+               && word.load(Ordering::Relaxed) & bit == 0
+           {
+               word.fetch_or(bit, Ordering::Relaxed);
+           }
+       }
+
+       /// Moves column `from` into column `to` and clears `from`: a new period of reading.
+       /// Only the store calls it; a flag set meanwhile lands in one period or the other.
+       pub(crate) fn rotate(&self, from: usize, to: usize) {
+           for (number, _) in self.made() {
+               let bits = self.bits_of(number);
+               let words = self.cap(number) / 64;
+               for at in 0..words {
+                   let moved = bits[from * words + at].swap(0, Ordering::Relaxed);
+                   bits[to * words + at].store(moved, Ordering::Relaxed);
+               }
+           }
+       }
+   ```
+
+   after:
+
+   ```rust
+       /// Column `column` of level `level`'s flags: it is made.
+       fn flag_column(&self, level: usize, column: usize) -> AtomicBitSlice<'_> {
+           let words = self.cap(level) / 64;
+           AtomicBitSlice::from_words(&self.bits_of(level)[column * words..(column + 1) * words])
+       }
+
+       /// `column` of `row`'s level and the row's bit in it; `None` past the rows made.
+       fn flag_bit(&self, row: u64, column: usize) -> Option<(AtomicBitSlice<'_>, usize)> {
+           debug_assert!(column < self.columns);
+           let (mut number, mut at) = (0, row);
+           while at >= self.cap(number) as u64 {
+               at -= self.cap(number) as u64;
+               number += 1;
+               if number >= self.most {
+                   return None;
+               }
+           }
+           self.levels[number].get()?;
+           Some((self.flag_column(number, column), at as usize))
+       }
+
+       pub(crate) fn flag(&self, row: u64, column: usize) -> bool {
+           self.flag_bit(row, column).is_some_and(|(bits, at)| bits.contains(at, Ordering::Relaxed))
+       }
+
+       /// Sets a flag: a hint about bytes that never change at a place, so relaxed.
+       pub(crate) fn set_flag(&self, row: u64, column: usize) {
+           if let Some((bits, at)) = self.flag_bit(row, column) {
+               bits.insert_if_clear(at, Ordering::Relaxed);
+           }
+       }
+
+       /// Moves column `from` into column `to` and clears `from`: a new period of reading.
+       /// Only the store calls it; a flag set meanwhile lands in one period or the other.
+       pub(crate) fn rotate(&self, from: usize, to: usize) {
+           for (number, _) in self.made() {
+               self.flag_column(number, from).move_into(self.flag_column(number, to), Ordering::Relaxed);
+           }
+       }
+   ```
+
+   (`at` is below the level's `cap`, a `usize`, so `at as usize` is exact and in the column.)
+
+Status: done by mem-backend-cas (2026-10-29): applied as written (flags.rs, read.rs, model.rs, table.rs).
+
+> forwarded to mem-backend-cas (holds `crates/blaze-cas/`; store is DONE) (from requests, pass 16; told by tmux).
+
+> mem-backend-cas: done (2026-10-29).

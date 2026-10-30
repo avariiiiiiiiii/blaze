@@ -1,30 +1,112 @@
 ---
 status: plan
-summary: blaze v2 lane fastcompile, idea 6 (no binary on disk for dev runs): crates/blaze-inproc, code memory mapped writable in the daemon and executable in the run process from one OS memory object, the run-process base chosen up front, blaze's own loader binary and its handshake, fences for running threads (epochs, stack walks, the OS thread list, model-checked), the arena allocator, the channel's frames, the platforms, the hooks requested of link, cargo and usercode, and the state of the art it matches or beats.
+summary: blaze v2 lane fastcompile, idea 6 (no link and no rewrite for dev runs): crates/blaze-inproc, the dev executable written once per content key to cargo's path and started by the kernel, a start hook linked into the program that lays the daemon's code memory over its code before main with every byte equal at the swap, linked addresses and the slide, the handshake and its checks against the image's own headers, fences for running threads (epochs, stack walks, the OS thread list, model-checked), the arena allocator, the channel's frames, the platforms, the requests of link, cargo, usercode, core and the coordinator, and the speed of light.
 date: 2026-10-29
 ---
-# fastcompile: no binary on disk for dev runs (`crates/blaze-inproc`)
+# fastcompile: no link and no rewrite for dev runs (`crates/blaze-inproc`)
 
-Idea 6 of [compile-time.md](../../design/compile-time.md). The daemon places a dev run's or
-test's program into a memory object and runs it from there: no executable is written, no link
-step turns placed bytes into a file, and a patch is a write into the daemon's view plus one
-atomic store. The executable is written only when a build asks for one (`blaze build`,
-release). Owned here: `crates/blaze-inproc/` and this file. The boundary siblings program
-against is in [notes.md](notes.md) ("The boundary of `blaze-inproc`"); hooks in other lanes
-are requests in `v2/requests/fastcompile.md` (`fastcompile-inproc 1` to `4`).
+Idea 6 of [compile-time.md](../../design/compile-time.md). It was "no binary on disk"; it is
+now **no link and no rewrite**: a dev run's or test's program is a real executable at the
+path cargo gives it, written once per content key and never again for a patch, and the code
+it runs is the daemon's code memory, laid over the file's code before `main`. A patch is a
+write into the daemon's view plus one atomic store, as before. Owned here:
+`crates/blaze-inproc/`, this file and [inproc-windows.md](inproc-windows.md). Hooks in other
+lanes are requests in `v2/requests/fastcompile.md` (`fastcompile-inproc-exec 1` and on; the
+earlier `fastcompile-inproc` and `fastcompile-inproc-macos` requests are superseded there).
+
+## Why the change
+
+blaze's own loader (`blaze-inproc-run`, removed) mapped the image, relocated it, set up
+thread-locals and ran it in a process whose executable was the loader. Every reader of "my own
+executable" saw the loader: `current_exe`, `/proc/self/exe`, dyld's image 0, the PEB,
+`GetModuleFileName`, `dl_iterate_phdr`, and with them backtrace symbolization and anything a
+program finds beside itself. Fixing each one was a list that never ends, and superset-of-rust
+allows none of them to differ. Now the kernel and the system's dynamic linker start the
+program from its own file, exactly as in a whole build, so they are all right by
+construction. What blaze adds is one swap of mappings whose bytes are equal.
+
+## How a run starts
+
+1. **The file.** `host::Host::write_executable` writes the image part of the code memory (the
+   linker's file, byte for byte) to cargo's path, keyed by the store's content hash: nothing
+   when this host wrote that key there and the file is unchanged since (same length, mtime,
+   device and inode), else a clone of the store's file (`FICLONE`, `clonefile`) where the
+   filesystem has clones, else one write. Always into a new file renamed over the path, so a
+   process still running the old one keeps it. It is never written from a code memory patched
+   since it was laid out (`CodeMemory::is_pristine`): that is an error, never a file that
+   differs from what the overlay swaps in.
+2. **The spawn.** `host::Program::command` (or `Host::launch`) makes a `blaze-core` `Command`
+   for `Effect::Spawn`: the program is the file itself, in the run's sandbox, which gains the
+   file to read and the host's socket to connect to. `BLAZE_INPROC` names the socket and a
+   128-bit random token.
+3. **The start hook.** The program's runtime (`runtime.rs`, linked into the executable) has
+   `blaze_inproc_start`, and the link puts a pointer to it first among the executable's
+   initializers: ELF `.preinit_array`, Mach-O `__mod_init_func`, a PE TLS callback in
+   `.CRT$XLAB`. Only the dynamic linker's own work runs before it (mapping, relocating, the
+   executable's IFUNC resolvers, which therefore must be resolved eagerly, never lazily).
+4. **The handshake** (`handshake.rs`). The hook takes `BLAZE_INPROC` out of the environment
+   (on Linux out of `envp` in place, since libc's `environ` is not set yet at preinit), so
+   neither the program nor its children see it. It connects and says HELLO: the token, its
+   process ID, the version, the page and where its image's header is. The host checks the
+   token names a waiting launch, the process ID is what the OS says of the peer
+   (`SO_PEERCRED`, `LOCAL_PEERPID`, `GetNamedPipeClientProcessId`) and the peer is this user,
+   then answers GRANT: the format, the linked header and span, the objects (the image and
+   arena's object, the fence's control words, the cells, the objects of fixed maps) and the
+   overlays.
+5. **The checks.** Before mapping anything the hook reads its own image's headers as the system
+   loader mapped them (`image::layout`) and checks the grant against them, each relative to its
+   own header: the same span; every overlay whole pages; an overlay over code is exactly one
+   of the image's code segments, from the same file offset of the image object, executable;
+   every other overlay is inside a reservation the executable carries; every code segment is
+   covered. Decoding already refused any object or overlay a hook must not map: the image
+   object shared writable, the control words or cells executable, code from any object but the
+   image's, anything outside its object or the span, overlays out of order or overlapping.
+6. **The swap.** The hook maps the control words, then replaces each overlay's pages with the
+   mapping of its object at the linked address plus the slide (Linux `mmap` `MAP_FIXED`,
+   macOS `mach_vm_map` with `VM_FLAGS_OVERWRITE`; on Windows the daemon rebuilds the image's
+   region, below). The bytes are equal at the moment of the swap: the file was written from the
+   object, and the daemon writes only code no thread can reach yet. The hook says STARTED and
+   returns; the C runtime, the program's initializers and `main` run as anywhere.
+
+A hook that can't attach says FAILED (when the channel is up), prints why on stderr and exits
+with 127: a run never runs the file's code in place of the object's. A program started with no
+`BLAZE_INPROC` (run by hand) runs its file as it is: `runtime::attach` says so and
+`runtime::quiesce` does nothing. A link without the hook pointer makes `attach` say the hook
+never ran.
+
+## Addresses
+
+Every address the crate deals in is *linked*, as the linker placed it. Each run process has its
+own slide (ASLR), the same for the whole image: where its header is minus the linked header
+(`image::Layout::header`). The arena, cells and fixed maps go into reservations the executable
+carries in its own address range (first the arena, then the cells, then fixed maps): an ELF
+`PT_LOAD` with no flags and no file bytes, a Mach-O segment of `initprot` 0 and no file bytes, a
+PE section with no access and no raw data. So they slide with the image, and:
+
+- bytes every process shares (code, the arena, stub words, cells) must not depend on the slide:
+  code is position-independent and a word naming code names it relative to itself;
+- `CodeMemory::linked` gives an offset's linked address; a process has it at that plus
+  `host::Session::slide` (the daemon's view) or `runtime::Attached::slide` (the process's own);
+- the fence's ranges are linked; each thread subtracts its slide from its return addresses
+  before comparing.
 
 ## The state of the art, and where this stands
 
 - **Dual mapping.** .NET 7's W^X mode and Firefox's JIT map one shared-memory object twice,
   writable and executable, and still flip protections or remap per write in places. Here the
   writable view is in another process (the daemon) for good, so there is no protection change
-  after setup, ever: a write is a `memcpy`, a patch is one release store. On AArch64 the
+  after the start, ever: a write is a `memcpy`, a patch is one release store. On AArch64 the
   publish is the architecture's minimum (`dc cvau`/`ic ivau` per line only where `CTR_EL0`'s
   `IDC`/`DIC` say they're needed, one `dsb ish`, one `isb`).
 - **Hot patching a running program.** Live++ and Unreal's Live Coding load a patch DLL and hook
   functions; Dioxus's `subsecond` loads a patch dylib and swaps a jump table. Each goes through
-  a file and the system loader. Here nothing goes through a file: the code lands in the mapped
-  object and a stub's target word is stored.
+  a file and the system loader per patch. Here a patch goes through neither; only the first
+  start of a layout touches a file, and that file is the program itself, so nothing about the
+  process differs from its whole build.
+- **Starting from a file, running from memory.** Checkpoint/restore and some JITs remap a
+  running image (CRIU's restorer, `PR_SET_MM_MAP`); none do it before `main` with the bytes
+  proved equal. Here the swap is checked against the image's own headers and the bytes are
+  equal by construction, so the program can't tell the moment it happened.
 - **Reclaiming replaced code.** Userspace RCU's QSBR flavor frees after every *registered*
   thread passes a quiescent state; the Linux kernel's livepatch consistency model switches a
   task once its stack holds no frame of the old function. The fence here does both: epochs
@@ -41,44 +123,46 @@ are requests in `v2/requests/fastcompile.md` (`fastcompile-inproc 1` to `4`).
 
 ### Code memory (`lib.rs`, `sys/`)
 
-A `CodeMemory` is one OS memory object of `image + arena` bytes: the first `image` bytes are
-the program image as the linker lays out its file (a file offset is an offset in the object),
-the arena after them is TLSF-allocated (`alloc.rs`) for code placed while the program runs
-(`blaze-lazy`'s functions). The daemon maps it once, shared and writable. Each run process
-maps it from blaze's loader: code shared and executable, data as private copies, so a
-program's writes to its statics stay its own and the daemon's writes to code show at once.
-
-The run-process base is chosen when the memory is made: at random, 2 MiB-aligned, in
-`BASES` (64 GiB to 256 GiB), which is free in a fresh loader process on every target (above a
-4 GiB zero page and the dyld shared cache, below the top of a 39-bit AArch64 address space,
-below where Linux, macOS and Windows put mmaps, heaps and PIE images). Every process maps it
-there (`MAP_FIXED_NOREPLACE`, placeholders on Windows), so a test queue's processes and every
-fence entry agree on addresses, and `blaze-lazy` can place code for run-process addresses
-before any process exists. A base taken in a process is an error naming it, never another
-address.
+A `CodeMemory` holds three parts at offsets `0..len()`: the program image as the linker lays out
+its file (a file offset is an offset here), the arena after it, TLSF-allocated (`alloc.rs`) for
+code placed while the program runs (`blaze-lazy`'s functions), and the cells after that, words
+shared both ways. The image and arena are one OS object (memfd, Mach memory entry, pagefile
+section); the cells are a second, so the image's object is never granted writable. The daemon
+maps both once, shared and writable. `lay_out` reads the image's headers and places the arena
+and cells in the executable's reservations; it marks the memory pristine, and any write, fill
+or store into the image part clears that.
 
 Changes: `write` (bytes nothing can reach yet), `publish` (the instruction-cache maintenance),
 `store_word` (one aligned release store of a slot or a stub's target word; x86-64 and AArch64
 stubs load it) and on AArch64 `store_instruction` for the instructions Arm lets one thread
 change while another runs them (`B`, `BL`, `NOP`, `BRK`, `ISB`, `SVC`; Arm ARM B2.2.5).
 
+### The image's headers (`image.rs`, `image/`)
+
+One reader per format gives the code segments (file offset, linked address, length), the
+reservations and the linked header, and refuses what a run can't overlay whole pages of: a code
+segment writable, with bytes past its file bytes, off a page, sharing a page with anything
+else, or (PE) off the 64 KiB granule. The daemon reads the file's bytes, the hook its own
+headers in memory; both are untrusted bytes, and `image/tests.rs` fuzzes mutated and cut
+headers (an error or a layout, never a panic).
+
 ### Fences (`fence.rs`)
 
 A page of words shared by the daemon and every run process (the control object): the epoch
-(the daemon's), a table of 256 ranges being retired by run-process address with their grace,
+(the daemon's), a table of 256 ranges being retired by linked address with their grace,
 1024 thread slots of 128 bytes each (written by their thread only: process, thread ID, `seen`),
 and `births`. `retire` posts a range unlinked by stores already made under grace `g`, then the
 epoch becomes `g + 1`. At a quiescent point (`runtime::quiesce`, called where `blaze-live`
 already polls, and at a thread's end through a thread-local's destructor) a thread reads the
 epoch `e`, and while it has not changed since its last report that is all it does (one
-load). Otherwise it serializes (`isb`; `cpuid`), walks its stack through the unwinder, and
-reports `e`, or the oldest grace of a posted range one of its return addresses falls in. A
-range is freed once every live thread of every process has a slot past its grace: the daemon
-reads `births`, lists each process's threads from the OS, reads the slots, reads `births`
-again, and trusts the slots only if `births` did not move and each process has exactly as many
-online slots as listed threads. Slots of threads no longer listed are reaped; a thread whose
-ID the OS reused adopts the slot its dead namesake left, so a long-lived thread never stalls
-the count.
+load). Otherwise it serializes (`isb`; `cpuid`), walks its stack through the unwinder, takes
+its slide off each return address, and reports `e`, or the oldest grace of a posted range one
+of its return addresses falls in. A range is freed once every live thread of every process
+has a slot past its grace: the daemon reads `births`, lists each process's threads from the OS,
+reads the slots, reads `births` again, and trusts the slots only if `births` did not move and
+each process has exactly as many online slots as listed threads. Slots of threads no longer
+listed are reaped; a thread whose ID the OS reused adopts the slot its dead namesake left, so a
+long-lived thread never stalls the count.
 
 What the fence rests on, which `blaze-lazy` keeps: replaced code is reachable only through
 slot and stub words and from stacks. A function pointer the program holds is a stub's address,
@@ -102,109 +186,115 @@ real code's rules one by one and stress-tests it: threads calling through a slot
 keeps moving while it poisons every range the fence frees, with thread churn, reused IDs and
 threads dying with their slot held; a thread reading poison fails the test.
 
-### The loader (`load/`, `bin/blaze-inproc-run.rs`)
-
-A separate small binary, not a mode of the daemon's: the program's thread-locals live in a
-64 KiB reserve of the loader's own static TLS block (ELF, PE), which has to be the loader's and
-nothing else's, and a run process should not map the daemon's whole image (its size, its
-threads' state, its secrets). `blaze-inproc-run --reserve` prints the reserve
-(`bias size align`), which the linker places the program's thread-locals at.
-
-Linux can't `execveat` the memfd instead: exec refuses a file with a writable mapping
-(`ETXTBSY`), and a loader of our own is needed on macOS and Windows anyway.
-
-The daemon spawns the loader through `blaze-core`'s `Effect::Spawn` with the run's own
-sandbox, which gains the loader's path to read and, on Unix, the host's socket (only the
-socket, not its directory: the program can't touch other runs' sockets). `BLAZE_INPROC` names
-the socket and a 128-bit random token; the loader removes it from its environment, connects,
-and says hello (token, its process ID, version, page, reserve). The host checks the token
-names a waiting launch and that the process ID matches what the OS says of the peer
-(`SO_PEERCRED`, `LOCAL_PEERPID`, `GetNamedPipeClientProcessId`) and that the peer is this user,
-then grants the objects: the image as a descriptor that can't be mapped writable shared (on
-Linux a read-only reopen through `/proc/self/fd`), the control words, and the objects of fixed
-maps (`blaze-premap`'s image). The loader maps them, the format's loader (ELF, Mach-O, PE)
-maps segments, links to the system's libraries, sets up thread-locals and unwind info, says
-STARTED with its base, and runs the program's initializers and `main` in its own process with
-the program's `argv`. A loader's failure is a FAILED frame naming it, and its exit code 127.
-
 ### The channel (`frame.rs`, `channel.rs`)
 
 12-byte little-endian headers (kind `u16`, zero `u16`, length `u32`, sequence `u32`), bodies
 of at most 64 MiB, kinds partitioned by crate (`0x000` inproc, `0x100` `blaze-lazy`, `0x200`
 `blaze-premap`). Every read is bounds-checked; a short buffer, reserved bits, a long body,
 trailing bytes, bad UTF-8 or a count larger than the bytes left are each an error, never a
-panic or an allocation for bytes that are not there (fuzzed in `tests.rs`).
+panic or an allocation for bytes that are not there (fuzzed in `tests.rs`, with the HELLO and
+GRANT bodies).
 
 ## Platforms
 
 - **Linux x86-64 and AArch64**: a `memfd` sealed against growing and shrinking, mapped
-  `PROT_READ|PROT_WRITE` shared in the daemon; the loader gets a read-only reopen over
-  `SCM_RIGHTS` and maps it `PROT_READ|PROT_EXEC`; `vm.memfd_noexec=2` is an error naming the
-  sysctl. AArch64 checks `CTR_EL0` at `CodeMemory::new`: an instruction cache that aliases by
-  virtual address (VIPT with ways larger than a page, or AIVIVT) is an error, since code is
-  written through one mapping and run through another. Threads from `/proc/<pid>/task`.
-- **macOS AArch64** (`sys/macos.rs`, `sys/macos/rendezvous.rs`, `load/macho.rs`): a Mach
-  memory entry (`mach_make_memory_entry_64`, `MAP_MEM_NAMED_CREATE`, R|W|X), each access a
-  sub-entry mapped with `mach_vm_map`. What the hardened runtime allows, from XNU and dyld:
+  `PROT_READ|PROT_WRITE` shared in the daemon. The hook gets the image's object as a read-only
+  reopen over `SCM_RIGHTS` (so it can't be mapped writable shared) and the words objects as
+  is; each overlay is one `mmap` `MAP_FIXED|MAP_SHARED` (`MAP_PRIVATE` for a copy).
+  `vm.memfd_noexec=2` is an error naming the sysctl. AArch64 checks `CTR_EL0` at
+  `CodeMemory::new`: an instruction cache that aliases by virtual address (VIPT with ways
+  larger than a page, or AIVIVT) is an error, since code is written through one mapping and run
+  through another. Threads from `/proc/<pid>/task`. The image's header is the first
+  `dl_iterate_phdr` entry's `PT_LOAD` at file offset 0. Exec of the file is plain `execve`: the
+  file has no writable mapping anywhere (the daemon writes a new file and renames it), so no
+  `ETXTBSY`.
+- **macOS AArch64** (`sys/macos.rs`, `sys/macos/rendezvous.rs`): a Mach memory entry
+  (`mach_make_memory_entry_64`, `MAP_MEM_NAMED_CREATE`, R|W|X), each grant a sub-entry of the
+  rights it allows. Each overlay is one `mach_vm_map` with `VM_FLAGS_FIXED|VM_FLAGS_OVERWRITE`;
+  a copy is anonymous memory filled from a read mapping, since a mapping can't gain rights its
+  entry lacks. What the system allows, from XNU and dyld:
   - a POSIX shared-memory mapping is never executable, so it has to be a memory entry;
   - W^X holds per mapping, not per object: the daemon's R|W and the run's R|X mappings of the
     same pages are allowed;
   - unsigned executable pages kill a process only under `CS_ENFORCEMENT`, which the hardened
-    runtime sets unless `allow-unsigned-executable-memory` is granted; `allow-jit` does not
-    help, since a shared entry can't be `MAP_JIT`. So `blaze-inproc-run` is signed without the
-    hardened runtime (request `fastcompile-inproc-macos 3`), and the loader reads `csops`
-    first and stops with an error naming the entitlement instead of being killed;
-  - a mapping can't gain rights its entry lacks, even copied, so `Access::Copy` is a snapshot
-    in anonymous memory taken when it is mapped;
+    runtime sets; so the dev executable is signed ad hoc without the hardened runtime (request
+    to link), and the hook reads `csops` first and stops with an error naming it instead of
+    being killed;
   - `CTR_EL0` traps at EL0, so the instruction-cache check reads `hw.optional.arm64`, and a
     publish is `sys_icache_invalidate`.
 
   A Unix socket can't carry Mach ports, so the entries go through a bootstrap service the
   daemon checks in (`dev.blaze.inproc.<daemon pid>`, as Chromium's rendezvous does), each side
   checking the other's audit token against the channel's `LOCAL_PEERTOKEN`. A sandboxed run
-  must be allowed to look it up (request `fastcompile-inproc-macos 2`; until it lands such a
-  run stops with an error naming the service). The Mach-O loader applies rebase and bind
-  opcodes (no chained fixups), fills `__thread_vars` with its own thunk over a pthread key,
-  registers unwind sections with libunwind's dynamic finder and runs `LC_MAIN` with dyld's
-  `ProgramVars`. Unverified until a Mac run: whether the code-signing monitor on newer Apple
-  silicon polices unsigned pages without `CS_ENFORCEMENT`, and `bootstrap_check_in` of an
-  undeclared name.
-- **Windows x86-64** (`sys/windows.rs`, `sys/windows/pipe.rs`, `load/pe.rs`): a
-  pagefile-backed `SEC_COMMIT` section that the daemon maps into the run process with
-  `MapViewOfFile3` into placeholders the loader reserved (MAP and MAPPED frames), so the run
-  process never holds a handle it could map writable. Views are whole 64 KiB granules, so the
-  image maps as three views (code shared executable, data copy-on-write, the arena
-  executable), and blaze-link starts the first data section on a 64 KiB RVA (request 1, item
-  6). The channel is a named pipe whose DACL admits this user (and AppContainers, to connect
-  only), with a low integrity label and the peer's token checked. Threads come from Toolhelp32,
-  stack walks from `RtlVirtualUnwind`. The thread-local reserve's alignment is 16, all the NT
-  loader's heap-allocated TLS blocks promise. Details in [inproc-windows.md](inproc-windows.md).
+  must be allowed to look it up (request to core). The image's header is
+  `_NSGetMachExecuteHeader`. Unverified until a Mac run: whether the code-signing monitor on
+  newer Apple silicon polices pages of an ad hoc signed process replaced by `VM_FLAGS_OVERWRITE`,
+  and `bootstrap_check_in` of an undeclared name.
+- **Windows x86-64** (`sys/windows.rs`, `sys/windows/pipe.rs`): a pagefile-backed `SEC_COMMIT`
+  section the daemon maps into the run process itself (`MapViewOfFile3` on the process handle),
+  so the run process never holds a handle it could map writable. An image section's view can't
+  be partly replaced, so on the hook's OVERLAY the daemon rebuilds the image's region while the
+  hook waits on the pipe: it reads every committed page outside the overlays, unmaps the image,
+  reserves its span as one placeholder, splits it at the overlays, maps each overlay's view
+  (`MEM_REPLACE_PLACEHOLDER`), and puts the pages it read back as private memory with their
+  protection. A failure past the unmap ends the process. Details in
+  [inproc-windows.md](inproc-windows.md).
 - Elsewhere every constructor stops with an error naming the platform (`sys/none.rs`).
 
-## Wiring (requests)
+## What a program sees of itself
 
-- `fastcompile-inproc 1` (link): `Image::commit_into`, committing a staged image into a
-  `CodeMemory` instead of a file, and an in-process image's layout (entry `main`, no C runtime
-  start object, thread-locals at the loader's reserve).
-- `fastcompile-inproc 2` (cargo): the dev `run` path links into a `CodeMemory` and spawns
-  through `host::Program::command`; `blaze build` and release write the executable as today.
-  A configured `target.<triple>.runner` takes a file, so that run writes its executable: the
-  configuration decides, not a failure.
-- `fastcompile-inproc 3` (usercode): the test queue spawns a binary through
-  `host::Program::command` when it has one, forking servers attached as forking.
-- `fastcompile-inproc 4` (coordinator): the loader binary installed beside `blaze` (on
-  Windows with an 8 MiB stack reserve and the CRT's `tlssup`), and `windows-sys` features.
-- `fastcompile-inproc-macos 1` to `3` (link, core and cargo, coordinator): the in-process
-  Mach-O layout, the sandbox's `mach-lookup` of the rendezvous service, and signing the loader
-  without the hardened runtime.
+Its executable is its own file at cargo's path: `current_exe`, `/proc/self/exe`,
+`_NSGetExecutablePath`, dyld's image 0, `GetModuleFileName(NULL)`, the PEB, `dl_iterate_phdr`,
+`dladdr` and the backtrace symbolizer (which reads the file's debug info) all name it, as in a
+whole build. `crates/blaze-inproc/programs/exact.rs` (`inproc-exact`) checks this in a real
+dev run: `current_exe` names the path, the hook attached and took `BLAZE_INPROC` out, and a
+backtrace names the program's own functions.
 
-## Open: what a program sees of its own executable
+What still differs, stated here rather than hidden:
 
-Under the loader, the process's executable is `blaze-inproc-run`: `std::env::current_exe()`,
-`/proc/self/exe`, `_NSGetExecutablePath`, `GetModuleFileName(NULL)` and image 0 of dyld name
-it, not the program. A program that finds files beside itself through them behaves
-differently from its rustc build, which superset-of-rust does not allow. Linux could point
-`/proc/self/exe` at the program's path only with `PR_SET_MM_EXE_FILE` (`CAP_SYS_RESOURCE`, and
-it needs a file); the other platforms have no call for it. Until the lane settles it (an
-interposed `current_exe` in the program's std, or writing the executable for programs whose
-std calls it), this is a known difference, stated here and in the report rather than hidden.
+- **Software breakpoints in code ranges.** A debugger's write into code goes through the
+  run's read-only shared mapping and is refused (Linux `ptrace` `POKETEXT`, macOS
+  `mach_vm_write`, Windows `WriteProcessMemory` on a view without write access). Hardware
+  breakpoints and everything read-only work. The way out is a debugger that writes through the
+  daemon (the agent API), not a writable mapping in the run.
+- **Mapping names.** `/proc/self/maps` names the code ranges `/memfd:<name> (deleted)`, not the
+  file; macOS `vmmap` shows a shared memory region; Windows `VirtualQuery` says `MEM_MAPPED` and
+  `MEM_PRIVATE` where the image was `MEM_IMAGE`. Module lists, unwinding and symbolization don't
+  read these.
+
+## Wiring (requests in `v2/requests/fastcompile.md`)
+
+- link: the start hook's pointer first among the initializers; code segments on their own
+  pages (PE: 64 KiB granules), never writable; reservations for the arena, cells and fixed
+  maps; IFUNC resolved eagerly; no base relocation into code; Mach-O signed ad hoc without the
+  hardened runtime; the image committed into a `CodeMemory` as the bytes of the file it would
+  write.
+- cargo: the dev `run` path keeps the executable's path, makes a `host::Program` with the
+  store's key and spawns through `Program::command`; `blaze build` and release unchanged.
+- usercode: unchanged calls (`Program::command`, `Program::exited`); a test binary's path is
+  where its executable goes.
+- core: the sandbox lets a run read and exec its executable, and on macOS look up the
+  rendezvous service.
+- coordinator: no `blaze-inproc-run` to install; the `windows-sys` features; the line in
+  compile-time.md's change 6.
+
+## Speed of light
+
+- **A patch** is a write of the new code into the arena, `publish`, and one release store of a
+  stub's word: no syscall, no file, no link. Nothing faster is possible without the program
+  checking for patches itself.
+- **The first start of a layout** writes the file once: a reflink is a metadata update (no
+  bytes copied); a write is a `memcpy` into the page cache at memory bandwidth, about 10 ms for
+  a 100 MiB debug executable, and never fsynced (nothing needs it durable; a lost file is
+  written again from the key). Every later start with the same key does no I/O at all: one
+  `stat` of the path.
+- **Each start** costs what a whole build's start costs (exec, the dynamic linker, its
+  relocations) plus one round trip on a Unix socket (tens of microseconds), one `recvmsg`
+  with the descriptors, and one `mmap` per overlay (a code segment or three, the arena, the
+  cells, any fixed maps), each mapping pages already resident in the daemon's object, so the
+  later faults are minor. On Windows the rebuild adds a `ReadProcessMemory` and
+  `WriteProcessMemory` of the image's pages outside the code (its data, typically a few MiB:
+  about a millisecond) and a dozen placeholder calls.
+- **Against the old loader** this does strictly less per start: no relocation pass of our own,
+  no thread-local setup, no import resolution twice. The system's dynamic linker already does
+  them, and does them once.

@@ -2,7 +2,7 @@
 //! It is intended to be completely decoupled from the
 //! parser, so as to allow to evolve the tree representation
 //! and the parser algorithm independently.
-use std::{mem, num::NonZeroU32};
+use std::{borrow::Cow, mem, num::NonZeroU32};
 
 use blaze_mem::scratch;
 
@@ -173,7 +173,10 @@ pub(crate) fn lend_events(tokens: usize) -> scratch::Lent<Events> {
 
 /// Generate the syntax tree with the control of events. `errors` is the
 /// side table of error messages built up alongside the `events` stream.
-pub(super) fn process(mut events: scratch::Lent<Events>, errors: Vec<String>) -> Output {
+pub(super) fn process(
+    mut events: scratch::Lent<Events>,
+    errors: Vec<Cow<'static, str>>,
+) -> Output {
     scratch::with::<ForwardParents, _>(|forward_parents| {
         process_with(&mut events, errors, forward_parents)
     })
@@ -181,7 +184,7 @@ pub(super) fn process(mut events: scratch::Lent<Events>, errors: Vec<String>) ->
 
 fn process_with(
     events: &mut [Event],
-    mut errors: Vec<String>,
+    mut errors: Vec<Cow<'static, str>>,
     forward_parents: &mut Vec<SyntaxKind>,
 ) -> Output {
     // Each event becomes roughly one u32 in Output, so preallocate to avoid
@@ -234,8 +237,8 @@ fn process_with(
                 assert!(matches!(ev, Event::Finish), "{ev:?}");
             }
             Event::Error { err } => {
-                // Move the string out of the side table; each index is visited
-                // exactly once, so swapping with an empty String is cheap and
+                // Move the message out of the side table; each index is visited
+                // exactly once, so swapping with an empty one is cheap and
                 // avoids any clone.
                 let msg = mem::take(&mut errors[err as usize]);
                 res.error(msg);

@@ -9,24 +9,15 @@
 //! Follows rustc's `compiler/rustc_lint/src/lib.rs` (`BuiltinCombinedLateLintModPass`) (MIT or
 //! Apache-2.0).
 
-mod drop_forget_useless;
-mod invalid_atomic_ordering;
-mod invalid_from_utf8;
+pub(crate) mod drop_forget_useless;
+pub(crate) mod invalid_atomic_ordering;
+pub(crate) mod invalid_from_utf8;
 
 use base_db::Db;
 use hir_def::FunctionId;
 use rustc_hash::FxHashMap;
 
 use crate::lints::bodies::types::util;
-
-/// rustc's late lint passes of calls of std's `drop`, `forget`, `from_utf8` and atomics.
-pub(super) fn passes() -> Vec<Box<dyn crate::lints::bodies::LatePass>> {
-    vec![
-        Box::new(drop_forget_useless::DropForgetUseless::default()),
-        Box::new(invalid_from_utf8::InvalidFromUtf8::default()),
-        Box::new(invalid_atomic_ordering::InvalidAtomicOrdering::default()),
-    ]
-}
 
 /// Which of the diagnostic items a pass looks for each function called is, read from its
 /// attributes once per function.

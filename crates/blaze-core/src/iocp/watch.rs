@@ -48,7 +48,17 @@ pub(super) struct Watching {
 #[derive(Default)]
 pub(super) struct Scratch {
     name: String,
+    /// Every name of a buffer's records, joined to the watched directory, one after another.
     joined: String,
+    spans: Vec<Span>,
+}
+
+/// A record's name in [`Scratch::joined`], and whether it says the name came in (made, or
+/// renamed to), so a directory it names is walked.
+struct Span {
+    start: u32,
+    end: u32,
+    came: bool,
 }
 
 impl Watching {
@@ -101,39 +111,56 @@ impl Watching {
     }
 
     /// What `got` bytes of records say changed. A directory made or moved in is walked, and
-    /// what is in it named, as nothing told of it.
+    /// what is in it named, as nothing told of it. The names are sorted and deduplicated in
+    /// the scratch before any [`FileName`] is made, so a change costs its list and one name
+    /// for each file it names.
     pub(super) fn take(&self, got: usize, paths: &mut Paths, scratch: &mut Scratch) -> Done {
         if got == 0 {
+            // alloc: none, an empty `Vec`.
             return Done::Changed { files: Vec::new(), lost: true };
         }
         // SAFETY: the read's completion was taken, so the system writes the buffer no more; it
         // wrote `got` bytes of it, read here as bytes while the watch holds it.
         let bytes = unsafe { std::slice::from_raw_parts(self.buffer.ptr().cast_const(), got.min(BUFFER)) };
-        let Scratch { name, joined } = scratch;
-        let mut count = 0;
-        parse(bytes, name, |_, _| count += 1);
-        // alloc: `Done::Changed`'s payload, once, as long as the records it can name.
-        let mut files = Vec::with_capacity(count);
-        let mut lost = false;
-        let cut = parse(bytes, name, |action, name| {
-            joined.clear();
-            joined.push_str(self.dir.as_str());
+        let Scratch { name, joined, spans } = scratch;
+        joined.clear();
+        spans.clear();
+        let dir = self.dir.as_str();
+        let mut lost = parse(bytes, name, |action, name| {
+            let start = joined.len() as u32;
+            joined.push_str(dir);
             joined.push('/');
             joined.push_str(name);
-            let Some(named) = named(paths.root(), joined) else {
+            let came = matches!(action, FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME);
+            // alloc: grown once to the most records a buffer holds, then kept.
+            spans.push(Span { start, end: joined.len() as u32, came });
+        });
+        let text = |span: &Span| &joined[span.start as usize..span.end as usize];
+        spans.sort_unstable_by(|a, b| text(a).cmp(text(b)));
+        spans.dedup_by(|later, kept| {
+            let same = text(later) == text(kept);
+            kept.came |= same && later.came;
+            same
+        });
+        // alloc: `Done::Changed`'s payload, once, as long as the names it can hold.
+        let mut files = Vec::with_capacity(spans.len());
+        for span in spans.iter() {
+            let Some(named) = named(paths.root(), text(span)) else {
                 lost = true;
-                return;
+                continue;
             };
-            if matches!(action, FILE_ACTION_ADDED | FILE_ACTION_RENAMED_NEW_NAME) && is_dir(paths, &named) {
+            if span.came && is_dir(paths, &named) {
                 let path = paths.root().join(named.as_str());
                 // alloc: a directory come in, walked once, as std lists it.
                 lost |= walk(&path, &named, &mut files).is_err();
             }
             files.push(named);
-        });
-        lost |= cut;
-        files.sort_unstable();
-        files.dedup();
+        }
+        // What a walk added, or a short name made long, may be out of order.
+        if files.windows(2).any(|pair| pair[0] >= pair[1]) {
+            files.sort_unstable();
+            files.dedup();
+        }
         Done::Changed { files, lost }
     }
 }

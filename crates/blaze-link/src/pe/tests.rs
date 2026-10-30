@@ -187,6 +187,9 @@ impl Fixture {
             id: *b"blaze image id!!",
             debug: &[],
             symbol: &symbol,
+            synthesis: 0,
+            delta: None,
+            encoded: &[],
         })
     }
 

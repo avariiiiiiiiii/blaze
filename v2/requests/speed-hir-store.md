@@ -65,6 +65,8 @@ copies as the proptest reference.
 are reserved exactly, so boxing them does not reallocate). The doc comment's "one pass to count,
 one to sum, one to place" stays true. Why: one counting sort in the tree.
 
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+
 ## speed-hir-sol-items: `hir/persist.rs` costs the item tree's decode and encode pay (2026-10-29)
 
 From `speed-hir-sol-items`. `item_tree/persist.rs` reads and writes its tables through your
@@ -177,3 +179,5 @@ The arithmetic is in `docs/v2/plan/lanes/format/speed-of-light.md`, "The item tr
    `hashbrown.workspace = true` in hir-def's manifest, which is lane db's file.
 
 Status: open
+
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).

@@ -61,6 +61,7 @@
 
 use std::{rc::Rc, sync::Arc};
 
+use base_db::Db;
 use intern::sym;
 use smallvec::{SmallVec, smallvec};
 use tt::{
@@ -111,7 +112,7 @@ impl Match<'_> {
 
 /// Matching errors are added to the `Match`.
 pub(super) fn match_<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     pattern: &'t MetaTemplate,
     input: &'t tt::TopSubtree,
 ) -> Match<'t> {
@@ -364,7 +365,7 @@ struct MatchState<'t> {
 /// - `error_items`: the set of items in errors, used for error-resilient parsing
 #[inline]
 fn match_loop_inner<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     src: TtIter<'t>,
     stack: &[TtIter<'t>],
     res: &mut Match<'t>,
@@ -623,7 +624,7 @@ fn match_loop_inner<'t>(
 }
 
 fn match_loop<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     pattern: &'t MetaTemplate,
     src: &'t tt::TopSubtree,
 ) -> Match<'t> {
@@ -774,7 +775,7 @@ fn match_loop<'t>(
 }
 
 fn match_meta_var<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     kind: MetaVarKind,
     input: &mut TtIter<'t>,
     delim_span: DelimSpan,

@@ -100,6 +100,7 @@ impl Os {
             u64::try_from(page).ok().filter(|it| it.is_power_of_two()).ok_or("no page size")?;
         let code = layout.code_in_memory();
         if !code.start.is_multiple_of(page) || !code.end.is_multiple_of(page) {
+            // alloc: error path
             return Err(format!(
                 "the patch code region {:#x}..{:#x} is not whole pages of {page:#x}",
                 code.start, code.end
@@ -111,6 +112,7 @@ impl Os {
         } else {
             maps.each(&code, |piece, protection| {
                 if protection & PROT_READ == 0 {
+                    // alloc: error path
                     return Err(format!("the patch code at {:#x} can't be read", piece.start));
                 }
                 Ok(())
@@ -144,6 +146,7 @@ impl Os {
         // adding write access changes no byte and keeps them readable and, if they were,
         // runnable.
         if unsafe { mprotect(start, len, protection | PROT_WRITE) } != 0 {
+            // alloc: error path
             return Err(format!(
                 "making {:#x} writable: {}",
                 pages.start,
@@ -155,6 +158,7 @@ impl Os {
         unsafe { writes.store(pages, pages.start as *mut u8) };
         // SAFETY: as for making them writable: their protection from before.
         if unsafe { mprotect(start, len, protection) } != 0 {
+            // alloc: error path
             return Err(format!(
                 "protecting {:#x} again: {}",
                 pages.start,
@@ -162,17 +166,20 @@ impl Os {
             ));
         }
         if protection & PROT_EXEC != 0 {
-            flush(std::iter::once(pages.clone()), 0);
+            flush(std::iter::once(pages.start..pages.end), 0);
         }
         Ok(())
     }
 }
 
+// Not blaze-inproc's `View`: this crate links into the program with no dependencies, and
+// the region it maps over is live code that threads may be running.
 /// Puts a memory file under `code`, with the bytes it has, mapped read and run there; the
 /// address it is mapped read and write at.
 fn map_twice(code: &Range<u64>) -> Result<u64, String> {
     let len = (code.end - code.start) as usize;
     let error =
+        // alloc: error path
         |what: &str| format!("{what} for the patch code: {}", std::io::Error::last_os_error());
     // SAFETY: the name ends in a zero.
     let fd = unsafe { memfd_create(c"blaze-live-code".as_ptr(), MFD_CLOEXEC) };
@@ -234,6 +241,7 @@ impl Memory for Os {
         self.segments.check(range)?;
         self.maps.each(range, |piece, protection| {
             if protection & PROT_READ == 0 {
+                // alloc: error path
                 return Err(format!("{:#x}, in pages with no access", piece.start));
             }
             Ok(())
@@ -270,6 +278,7 @@ impl Memory for Os {
             self.segments.check(&span.range())?;
             self.maps.each(&span.range(), |piece, protection| {
                 if protection & PROT_READ == 0 {
+                    // alloc: error path
                     return Err(format!("data at {:#x}, in pages with no access", piece.start));
                 }
                 if protection & PROT_WRITE != 0 {
@@ -310,6 +319,7 @@ impl Memory for Os {
     }
 
     fn functions(&mut self, functions: &[(u64, u64, u64)]) -> Result<(), String> {
+        // alloc: error path
         if functions.is_empty() { Ok(()) } else { Err("RUNTIME_FUNCTIONs on Linux".to_owned()) }
     }
 
@@ -326,6 +336,7 @@ impl Memory for Os {
         let (start, len) = (pages.start as *mut c_void, (pages.end - pages.start) as usize);
         // SAFETY: the cell's page is the image's, mapped; it is writable only for the store.
         if unsafe { mprotect(start, len, self.cell | PROT_WRITE) } != 0 {
+            // alloc: error path
             return Err(format!(
                 "making the table cell at {cell:#x} writable: {}",
                 std::io::Error::last_os_error()
@@ -334,6 +345,7 @@ impl Memory for Os {
         store();
         // SAFETY: as above.
         if unsafe { mprotect(start, len, self.cell) } != 0 {
+            // alloc: error path
             return Err(format!(
                 "protecting the table cell at {cell:#x} again: {}",
                 std::io::Error::last_os_error()
@@ -349,7 +361,9 @@ struct Maps(Vec<(u64, u64, i32)>);
 impl Maps {
     fn read() -> Result<Maps, String> {
         let text = std::fs::read_to_string("/proc/self/maps")
+            // alloc: error path
             .map_err(|it| format!("reading /proc/self/maps: {it}"))?;
+        // alloc: setup, the process's mappings, read once at start
         let mut maps = Vec::new();
         for line in text.lines() {
             let mut fields = line.split_whitespace();
@@ -360,6 +374,7 @@ impl Maps {
             let (Ok(start), Ok(end)) =
                 (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
             else {
+                // alloc: error path
                 return Err(format!("/proc/self/maps has a line {line:?}"));
             };
             let permissions = permissions.as_bytes();
@@ -390,6 +405,7 @@ impl Maps {
             f(piece, protection)?;
         }
         if at < range.end {
+            // alloc: error path
             return Err(format!("nothing is mapped at {at:#x}"));
         }
         Ok(())
@@ -399,8 +415,10 @@ impl Maps {
 /// Watches `dir` for message files on a thread of its own, telling `events` of each.
 pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
     let path = CString::new(dir.as_os_str().as_bytes())
+        // alloc: error path
         .map_err(|_| format!("{}: a directory with a zero byte", dir.display()))?;
     let error =
+        // alloc: error path
         |what: &str| format!("{what} {}: {}", dir.display(), std::io::Error::last_os_error());
     // SAFETY: it takes no pointer.
     let fd = unsafe { inotify_init1(IN_NONBLOCK | IN_CLOEXEC) };
@@ -447,9 +465,11 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
         unsafe { close(fd) };
     };
     std::thread::Builder::new()
+        // alloc: setup, the thread's name, once
         .name("blaze-live-slots".to_owned())
         .spawn(watching)
         .map(drop)
+        // alloc: error path
         .map_err(|it| format!("starting the thread that watches for patches: {it}"))
 }
 
@@ -499,6 +519,7 @@ fn flush(ranges: impl Iterator<Item = Range<u64>> + Clone, delta: u64) {
     } else {
         // Cleaning and invalidating caches by address of memory that is mapped changes no
         // memory, as __clear_cache does; each address below is of a range just written.
+        // clone: an iterator over the ranges written, walked twice; it copies no element
         for range in ranges.clone() {
             let (start, end) = (range.start.wrapping_add(delta), range.end.wrapping_add(delta));
             let mut at = start & !(data_line - 1);

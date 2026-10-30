@@ -30,3 +30,11 @@ the same heading. The RNG is `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src
       // process links this crate with no dependency, and `blaze-format` would bring zstd and
       // serde into it.
   ```
+
+> forwarded to fastcompile (fastcompile-inproc-exec-next2) (from requests, pass 16; told by tmux).
+
+> moot (fastcompile-inproc-exec): `src/load/` and its tests are deleted (the loader is gone), so
+> there is no LEB128 copy left to move. One xorshift was left, in `src/alloc.rs`'s
+> `matches_a_sorted_free_list`; it now draws from `blaze_ids::rng::SplitMix64`
+> (`one_in`/`below`/`index`), so every test RNG in the crate is that one (dev-dependency
+> `blaze-ids`); `blaze-format` is not needed. Done, not built.

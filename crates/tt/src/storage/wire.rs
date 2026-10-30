@@ -7,18 +7,22 @@
 //! [`WirePart`]), each symbol's end offset, the top subtree's two spans (five words each: start,
 //! length and a [`WirePart`]), then the symbols' UTF-8, padded to a word.
 //!
+//! The nodes, spans, wide spans and parts are the words of the tree's block as they lie (a
+//! part's words are a [`WirePart`]'s), so writing them is one copy; the symbols go as text.
+//!
 //! Reading checks everything a tree's methods rely on (tags, lengths nesting, ordinals, indices,
 //! chars, UTF-8, ranges) and that the columns are the ones the builder makes for those token
-//! trees, so that a tree read compares and hashes as the same tree built. It allocates at most a
-//! constant times the bytes it is given, so their length bounds it.
+//! trees, so that a tree read compares and hashes as the same tree built. Then it writes the
+//! tree's block, its one allocation, no larger than the bytes it is read from; the checks' own
+//! buffers are the only others.
 
 use intern::Symbol;
 use span::{SpanAnchor, SyntaxContext, TextRange, TextSize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::{
-    CompressedSpanPart, IDENT, LITERAL, NARROW_LIMIT, Node, PUNCT, PackedSpan, SUBTREE,
-    SYMBOL_WINDOW, TopSubtree, WIDE, WideSpan, has_duplicates,
+    Columns, CompressedSpanPart, HEADER, IDENT, LITERAL, Layout, NARROW_LIMIT, Node, PUNCT,
+    PackedSpan, SUBTREE, SYMBOL_WINDOW, TopSubtree, WIDE, WideSpan, has_duplicates, symbol,
 };
 
 /// The first word, naming the layout; a change to it changes this.
@@ -46,11 +50,8 @@ impl WirePart {
     }
 
     fn of(part: CompressedSpanPart) -> WirePart {
-        WirePart {
-            file_id: part.anchor.file_id.as_u32(),
-            ast_id: part.anchor.ast_id.into_raw(),
-            ctx: part.ctx.into_u32(),
-        }
+        let [file_id, ast_id, ctx] = part.row();
+        WirePart { file_id, ast_id, ctx }
     }
 }
 
@@ -95,17 +96,14 @@ fn malformed<T>(what: &'static str, at: usize) -> Result<T, WireError> {
 
 impl TopSubtree {
     /// Appends the tree's columns to `out`, as [`TopSubtree::read_wire`] reads them: at most one
-    /// allocation, the nodes and spans copied as their bytes and the rest written as rows.
+    /// allocation, the nodes, spans, wide spans and parts one copy of the block's words, and the
+    /// symbols and top spans written as rows.
     pub fn write_wire(&self, out: &mut Vec<u8>) {
         let len = |it: usize| u32::try_from(it).expect("a token tree column fits in u32");
-        let symbol_bytes: usize = self.symbols.iter().map(|it| it.as_str().len()).sum();
-        let words = HEADER_WORDS
-            + 2 * self.nodes.len()
-            + 2 * self.spans.len()
-            + 3 * self.wide.len()
-            + 3 * self.parts.len()
-            + self.symbols.len()
-            + 10;
+        let columns = self.columns();
+        let symbol_bytes: usize = columns.symbols.iter().map(|&it| symbol(it).as_str().len()).sum();
+        let rows = &self.block[HEADER..self.layout.symbols as usize];
+        let words = HEADER_WORDS + rows.len() + columns.symbols.len() + 10;
         let base = out.len();
         let end_of_tree = base + 4 * words + symbol_bytes.next_multiple_of(4);
         out.reserve(end_of_tree - base);
@@ -113,22 +111,19 @@ impl TopSubtree {
             out,
             [[
                 MAGIC,
-                len(self.nodes.len()),
-                len(self.wide.len()),
-                len(self.parts.len()),
-                len(self.symbols.len()),
+                len(columns.nodes.len()),
+                len(columns.wide.len()),
+                len(columns.parts.len()),
+                len(columns.symbols.len()),
                 len(symbol_bytes),
             ]],
         );
-        out.extend_from_slice(self.nodes.as_bytes());
-        out.extend_from_slice(self.spans.as_bytes());
-        out.extend_from_slice(self.wide.as_bytes());
-        put_rows(out, self.parts.iter().map(|&it| WirePart::of(it).words()));
+        out.extend_from_slice(rows.as_bytes());
         let mut end = 0;
         put_rows(
             out,
-            self.symbols.iter().map(|it| {
-                end += it.as_str().len();
+            columns.symbols.iter().map(|&it| {
+                end += symbol(it).as_str().len();
                 [end as u32]
             }),
         );
@@ -140,8 +135,8 @@ impl TopSubtree {
                 [span.range.start().into(), span.range.len().into(), file_id, ast_id, ctx]
             }),
         );
-        for symbol in &self.symbols {
-            out.extend_from_slice(symbol.as_str().as_bytes());
+        for &id in columns.symbols {
+            out.extend_from_slice(symbol(id).as_str().as_bytes());
         }
         debug_assert_eq!(out.len(), base + 4 * words + symbol_bytes, "the rows are the words counted");
         out.resize(end_of_tree, 0);
@@ -166,13 +161,14 @@ impl TopSubtree {
         if nodes_len == 0 {
             return malformed("a tree without its top subtree", 0);
         }
-        // The node and span columns are checked where they lie in the bytes, and copied only
-        // once the whole tree is, so the allocations are at most the bytes given.
-        let nodes: &[Node] = words.column(nodes_len)?;
-        let subtrees = check_nodes(nodes, symbols_len)?;
-        let spans: &[PackedSpan] = words.column(nodes_len + subtrees)?;
-        let wide: &[WideSpan] = words.column(wide_len)?;
-        for (at, it) in wide.iter().enumerate() {
+        // Every column is checked where it lies in the bytes, and the block written only once
+        // the whole tree is, so the block is at most the bytes given.
+        let node_words: &[u32] = words.column(nodes_len.saturating_mul(2))?;
+        let subtrees = check_nodes(node_words.as_chunks::<2>().0, symbols_len)?;
+        let span_words: &[u32] = words.column((nodes_len + subtrees).saturating_mul(2))?;
+        let wide_words: &[u32] = words.column(wide_len.saturating_mul(3))?;
+        for (at, &row) in wide_words.as_chunks::<3>().0.iter().enumerate() {
+            let it = WideSpan::from_row(row);
             if it.part as usize >= parts_len {
                 return malformed("a wide span's part past the parts", at);
             }
@@ -180,11 +176,8 @@ impl TopSubtree {
                 return malformed("a wide span ending past 4 GiB", at);
             }
         }
-        check_spans(spans, wide_len, parts_len)?;
-        let mut parts = Vec::with_capacity(parts_len);
-        for (at, [file_id, ast_id, ctx]) in words.rows::<3>(parts_len)?.enumerate() {
-            parts.push(resolve(part, WirePart { file_id, ast_id, ctx }, at)?);
-        }
+        check_spans(span_words.as_chunks::<2>().0, wide_len, parts_len)?;
+        let wire_parts = words.rows::<3>(parts_len)?;
         // Read twice from the bytes, checked now and used once the text is read.
         let mut ends = Words { bytes, at: words.at };
         let mut last = 0;
@@ -198,8 +191,34 @@ impl TopSubtree {
         if last != symbol_bytes {
             return malformed("symbols' bytes past the last symbol", symbols_len);
         }
+        let tops = words.rows::<5>(2)?;
+        let text = words.bytes(symbol_bytes)?;
+        let text = std::str::from_utf8(text).map_err(|e| WireError::Malformed {
+            what: "symbols that are not UTF-8",
+            at: e.valid_up_to(),
+        })?;
+        let ends = ends.rows::<1>(symbols_len)?;
+        words.pad()?;
+
+        let total = HEADER
+            + 2 * (2 * nodes_len + subtrees)
+            + 3 * (wide_len + parts_len)
+            + symbols_len;
+        if u32::try_from(total).is_err() {
+            return malformed("a tree of 2^32 words or more", 0);
+        }
+        let layout = Layout::new(nodes_len, nodes_len + subtrees, wide_len, parts_len, symbols_len);
+        // alloc: the tree, one block of its exact size.
+        let mut block = Vec::with_capacity(layout.end as usize);
+        block.extend_from_slice(&layout.header());
+        block.extend_from_slice(node_words);
+        block.extend_from_slice(span_words);
+        block.extend_from_slice(wide_words);
+        for (at, [file_id, ast_id, ctx]) in wire_parts.enumerate() {
+            block.extend_from_slice(&resolve(part, WirePart { file_id, ast_id, ctx }, at)?.row());
+        }
         let mut top = [None; 2];
-        for (at, [start, len, file_id, ast_id, ctx]) in words.rows::<5>(2)?.enumerate() {
+        for (at, [start, len, file_id, ast_id, ctx]) in tops.enumerate() {
             let Some(end) = start.checked_add(len) else {
                 return malformed("a top span ending past 4 GiB", at);
             };
@@ -208,37 +227,26 @@ impl TopSubtree {
             top[at] = Some(resolved.recombine(range));
         }
         let [Some(top_open), Some(top_close)] = top else { unreachable!("two top spans are read") };
-        let text = words.bytes(symbol_bytes)?;
-        let text = std::str::from_utf8(text).map_err(|e| WireError::Malformed {
-            what: "symbols that are not UTF-8",
-            at: e.valid_up_to(),
-        })?;
-        let mut symbols = Vec::with_capacity(symbols_len);
         let mut from = 0;
-        for (at, [end]) in ends.rows::<1>(symbols_len)?.enumerate() {
+        for (at, [end]) in ends.enumerate() {
             let end = end as usize;
             let Some(symbol) = text.get(from..end) else {
                 return malformed("a symbol ending inside a char", at);
             };
-            symbols.push(Symbol::intern(symbol));
+            block.push(Symbol::intern(symbol).id());
             from = end;
         }
-        words.pad()?;
+        debug_assert_eq!(block.len(), layout.end as usize, "the columns are the layout's");
         let tree = TopSubtree {
-            // alloc: the tree's columns, each its exact size.
-            nodes: Box::from(nodes),
-            // alloc: as above.
-            spans: Box::from(spans),
-            // alloc: as above.
-            wide: Box::from(wide),
-            parts: parts.into_boxed_slice(),
-            symbols: symbols.into_boxed_slice(),
+            block: block.into_boxed_slice(),
+            layout,
             top_open,
             top_close,
             words: Default::default(),
         };
-        check_literals(&tree)?;
-        check_canonical(&tree)?;
+        let columns = tree.columns();
+        check_literals(columns)?;
+        check_canonical(columns)?;
         Ok((tree, words.at))
     }
 }
@@ -249,7 +257,7 @@ fn resolve(
     at: usize,
 ) -> Result<CompressedSpanPart, WireError> {
     match part(wire) {
-        Ok((anchor, ctx)) => Ok(CompressedSpanPart { anchor, ctx }),
+        Ok((anchor, ctx)) => Ok(CompressedSpanPart::new(anchor, ctx)),
         Err(why) => Err(WireError::Part { at, part: wire, why }),
     }
 }
@@ -257,8 +265,8 @@ fn resolve(
 /// Checks each node is one a constructor makes, every subtree's children end inside its parent,
 /// and ordinals count the subtrees in order. Returns how many subtrees there are, the top's
 /// aside.
-fn check_nodes(nodes: &[Node], symbols: usize) -> Result<usize, WireError> {
-    let top = nodes[0];
+fn check_nodes(nodes: &[[u32; 2]], symbols: usize) -> Result<usize, WireError> {
+    let top = Node::from_row(nodes[0]);
     if top.tag() != SUBTREE
         || top != Node::subtree(top.delimiter_kind(), 0, top.data)
         || top.data as usize != nodes.len() - 1
@@ -269,7 +277,8 @@ fn check_nodes(nodes: &[Node], symbols: usize) -> Result<usize, WireError> {
     // alloc: one buffer per tree read, as deep as its nesting.
     let mut ends: Vec<usize> = vec![nodes.len()];
     let mut ordinal = 0;
-    for (at, &node) in nodes.iter().enumerate().skip(1) {
+    for (at, &row) in nodes.iter().enumerate().skip(1) {
+        let node = Node::from_row(row);
         while ends.last() == Some(&at) {
             ends.pop();
         }
@@ -314,11 +323,12 @@ fn check_nodes(nodes: &[Node], symbols: usize) -> Result<usize, WireError> {
 }
 
 /// Checks each packed span indexes what is there and ends below 4 GiB.
-fn check_spans(spans: &[PackedSpan], wide: usize, parts: usize) -> Result<(), WireError> {
-    if spans[0] != PackedSpan::UNUSED {
+fn check_spans(spans: &[[u32; 2]], wide: usize, parts: usize) -> Result<(), WireError> {
+    if PackedSpan::from_row(spans[0]) != PackedSpan::UNUSED {
         return malformed("the top subtree's unused span set", 0);
     }
-    for (at, span) in spans.iter().enumerate().skip(1) {
+    for (at, &row) in spans.iter().enumerate().skip(1) {
+        let span = PackedSpan::from_row(row);
         if span.len_part == WIDE {
             if span.start as usize >= wide {
                 return malformed("a wide span past the wide spans", at);
@@ -340,12 +350,13 @@ fn check_spans(spans: &[PackedSpan], wide: usize, parts: usize) -> Result<(), Wi
 }
 
 /// Checks each literal's suffix is a tail of its text, as a literal's methods slice it.
-fn check_literals(tree: &TopSubtree) -> Result<(), WireError> {
-    for (at, node) in tree.nodes.iter().enumerate() {
+fn check_literals(tree: Columns<'_>) -> Result<(), WireError> {
+    for (at, &row) in tree.nodes.iter().enumerate() {
+        let node = Node::from_row(row);
         if node.tag() != LITERAL {
             continue;
         }
-        let text = tree.symbols[node.data as usize].as_str();
+        let text = tree.symbol(node.data).as_str();
         let suffix = node.suffix_len() as usize;
         if suffix > text.len() || !text.is_char_boundary(text.len() - suffix) {
             return malformed("a literal's suffix longer than its text or inside a char", at);
@@ -359,17 +370,18 @@ fn check_literals(tree: &TopSubtree) -> Result<(), WireError> {
 /// part already used or the next one, the parts are distinct, a span is wide exactly when it
 /// doesn't pack and the wide ones are in order, and each ident or literal has the index the
 /// builder's window gives its symbol. No span is unpacked and no part compared but once.
-fn check_canonical(tree: &TopSubtree) -> Result<(), WireError> {
+fn check_canonical(tree: Columns<'_>) -> Result<(), WireError> {
     let not = |what, at| Err(WireError::NotCanonical { what, at });
     let len = tree.nodes.len();
     let mut order = Order { parts: 0, wide: 0 };
     let mut symbols = 0;
-    for (at, &node) in tree.nodes.iter().enumerate().skip(1) {
-        order.span(tree, tree.spans[at], at)?;
+    for (at, &row) in tree.nodes.iter().enumerate().skip(1) {
+        let node = Node::from_row(row);
+        order.span(tree, tree.span(at), at)?;
         match node.tag() {
             SUBTREE => {
                 let at = len + node.ordinal() as usize - 1;
-                order.span(tree, tree.spans[at], at)?;
+                order.span(tree, tree.span(at), at)?;
             }
             PUNCT => {}
             _ => {
@@ -398,7 +410,7 @@ fn check_canonical(tree: &TopSubtree) -> Result<(), WireError> {
     if symbols != tree.symbols.len() {
         return not("a symbol no node uses", symbols);
     }
-    if has_duplicates(&tree.parts) {
+    if has_duplicates(tree.parts) {
         return not("a part twice", 0);
     }
     Ok(())
@@ -412,14 +424,14 @@ struct Order {
 
 impl Order {
     #[inline]
-    fn span(&mut self, tree: &TopSubtree, span: PackedSpan, at: usize) -> Result<(), WireError> {
+    fn span(&mut self, tree: Columns<'_>, span: PackedSpan, at: usize) -> Result<(), WireError> {
         let not = |what| Err(WireError::NotCanonical { what, at });
         let part = if span.len_part == WIDE {
             if span.start as usize != self.wide {
                 return not("a wide span out of order");
             }
             self.wide += 1;
-            let wide = tree.wide[span.start as usize];
+            let wide = tree.wide(span.start);
             if wide.len < NARROW_LIMIT && wide.part < NARROW_LIMIT {
                 return not("a wide span that packs");
             }
@@ -505,9 +517,10 @@ impl<'a> Words<'a> {
 
 #[cfg(test)]
 pub(super) fn parts_of(tree: &TopSubtree) -> Vec<(WirePart, (SpanAnchor, SyntaxContext))> {
-    tree.parts
+    tree.parts()
         .iter()
-        .chain([tree.top_open, tree.top_close].map(|it| CompressedSpanPart::from_span(&it)).iter())
-        .map(|&it| (WirePart::of(it), (it.anchor, it.ctx)))
+        .map(|&row| CompressedSpanPart::from_row(row))
+        .chain([tree.top_open, tree.top_close].map(|it| CompressedSpanPart::from_span(&it)))
+        .map(|it| (WirePart::of(it), (it.anchor(), it.ctx())))
         .collect()
 }

@@ -387,9 +387,9 @@ impl LintId {
     pub const SINGLE_USE_LIFETIMES: LintId = LintId::named("single_use_lifetimes");
     pub const MISSING_DOCS: LintId = LintId::named("missing_docs");
 
-    /// The builtin lint named `name`, found at compile time: a name that is no builtin lint's
-    /// fails to compile.
-    const fn named(name: &str) -> LintId {
+    /// The builtin lint named `name`, found at compile time when it is a `const`: a name that
+    /// is no builtin lint's fails to compile.
+    pub const fn named(name: &str) -> LintId {
         match index::scan(name, BUILTIN_END) {
             Some(at) => LintId(at as u16),
             None => panic!("a named `LintId` names no builtin lint"),
@@ -444,6 +444,12 @@ pub fn lint(name: &str) -> Option<&'static Lint> {
 /// The lints rustc declares and does not register; their names are unknown to attributes.
 pub fn unregistered() -> &'static [Lint] {
     &ALL[INTERNAL_END..]
+}
+
+/// Every lint of the tables, by [`LintId`]: the builtin ones, blaze's, the internal ones and
+/// the unregistered ones.
+pub fn all() -> &'static [Lint] {
+    &ALL
 }
 
 /// The lint a diagnostic named `name` is of: a builtin one, an internal one, or one rustc
@@ -637,6 +643,36 @@ impl Store {
             Entry::Ignored => Some(&[][..]),
             Entry::Group(at) => Some(groups()[usize::from(at)].lints.as_slice()),
             Entry::InternalGroup => self.internal.then(|| &internal_group().lints[..]),
+        }
+    }
+
+    /// The lints a lint attribute's or a lint flag's name `name`, of `tool` when one is
+    /// written, sets the level of: those [`Store::check`] gives it, the new name's for a
+    /// renamed one, none for an unknown one. Two perfect hashes at most, and nothing allocated
+    /// or suggested; a tool this store does not know of is not told apart from one it does,
+    /// as no lint of the tables is an unknown tool's.
+    pub fn lints_named(&self, tool: Option<&str>, name: &str) -> &'static [&'static Lint] {
+        let joined = tool.map(|tool| Joined::new(tool, name));
+        let complete = match &joined {
+            Some(joined) => joined.bytes(),
+            None => name.as_bytes(),
+        };
+        if let Some(lint) = self.by_name(complete) {
+            return lint.id.alone();
+        }
+        match other(complete) {
+            Some(Entry::Renamed(new)) => self.find_lints(new).unwrap_or(&[]),
+            Some(Entry::Group(at)) => &groups()[usize::from(at)].lints[..],
+            Some(Entry::InternalGroup) if self.internal => &internal_group().lints[..],
+            Some(_) => &[],
+            None if tool.is_some() => &[],
+            None => {
+                let clippy = Joined::new("clippy", name);
+                match self.by_name(clippy.bytes()) {
+                    Some(lint) => lint.id.alone(),
+                    None => self.group(clippy.bytes()).map_or(&[][..], |it| &it.lints[..]),
+                }
+            }
         }
     }
 

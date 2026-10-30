@@ -6,12 +6,12 @@ use blaze_alloc_count::assert_at_most;
 use hir::Semantics;
 
 use super::{
-    defs::{Bits, Defs},
+    defs::{DefSet, Defs},
     level::Levels,
     reach::Reach,
     seed::Crate,
 };
-use crate::cx::Cx;
+use crate::{cx::Cx, lints::names::effective::Effective};
 
 const FIXTURE: &str = r#"
 //- /main.rs crate:main
@@ -43,10 +43,11 @@ fn with_crate(check: impl FnOnce(&Crate<'_, '_, '_>)) {
         let sema = Semantics::new(db);
         let krate = hir::check::workspace_crates(db)[0];
         let frame = crate::tests::frame();
-        let cx = Cx::new(&sema, krate, &checked.names, &frame);
+        let cx = Cx::new(&sema, krate, checked.files(), &frame);
         let defs = Defs::of(&cx);
         let levels = Levels::new();
-        let reach = Reach::of(&cx, &defs);
+        let effective = Effective::of(&cx);
+        let reach = Reach::of(&cx, &defs, &effective);
         let k = Crate::new(&cx, &defs, &levels, &reach);
         check(&k);
     });
@@ -91,10 +92,10 @@ fn numbering_lookups() {
 /// A bitset over the definitions tests and inserts in place.
 #[test]
 fn bitset_test_and_insert() {
-    let mut bits = Bits::new(1000);
+    let mut bits = DefSet::new(1000);
     assert_at_most(0, "a bitset's test and insert", || {
         for at in 0..1000 {
-            assert!(!bits.get(at));
+            assert!(!bits.contains(at));
             assert!(bits.insert(at));
             assert!(!bits.insert(at));
         }

@@ -1,8 +1,12 @@
 //! Memos as columns (docs/v2/plan/lanes/db/speed-salsa.md, "Memos as columns").
 //!
 //! Every salsa struct ingredient has one [`MemoTableTypes`], shared by all its slots, and in it one
-//! [`Column`] per tracked function keyed on the struct. A slot's [`MemoTable`] is only its row
-//! number. A column holds, for each row, a pointer to the row's current memo, and the memos
+//! [`Column`] per tracked function keyed on the struct. A slot's row is its table page's first
+//! row plus its index in the page: each page takes [`PAGE_LEN`] rows from its ingredient's types
+//! when it is made, so a lookup computes the row from the page line it already loaded and the
+//! `Id`, without loading the slot. A slot's [`MemoTable`] holds nothing; `&mut MemoTable` only
+//! proves exclusive access to the slot's memos. A column holds, for each row, a pointer to the
+//! row's current memo, and the memos
 //! themselves in a slab of the memo type. Both are blaze-mem regions (docs/v2/plan/design/
 //! memory.md): address space reserved when the column is made, committed as it fills, never
 //! moved, so a row's pointer is at `8 * row` and a slot at `size * slot`. The slab fills from a
@@ -31,6 +35,7 @@ use std::fmt::Debug;
 use std::mem;
 use std::ptr::{self, NonNull};
 
+use super::PAGE_LEN;
 use crate::DatabaseKeyIndex;
 use crate::function::ErasedMemo;
 use blaze_mem::{Region, Tag};
@@ -46,26 +51,26 @@ use crate::zalsa::Zalsa;
 // dyn: one vtable per memo column, used when a slot is cleared, at reclaim and in reports, never on a hit
 pub(crate) type ToDynMemo = fn(NonNull<DummyMemo>) -> NonNull<dyn Memo>;
 
-/// The "memo table" of a salsa struct slot: its row in each of its ingredient's memo columns.
+/// The "memo table" of a salsa struct slot. Its memos sit in its ingredient's memo columns at
+/// the slot's row, which comes from the slot's page ([`MemoTableTypes::next_page_rows`]), so the
+/// slot stores nothing; `&mut MemoTable` stands for exclusive access to the slot's memos.
 /// Every tracked function must take a salsa struct as its first argument and memos are attached
 /// to those salsa structs as auxiliary data.
 pub struct MemoTable {
-    row: u32,
+    _private: (),
 }
 
-#[cfg(not(feature = "shuttle"))]
-const _: [(); mem::size_of::<MemoTable>()] = [(); 4];
+const _: () = assert!(mem::size_of::<MemoTable>() == 0);
 
 impl MemoTable {
-    /// Create a `MemoTable` with a fresh row in `types`' columns.
+    /// Create the `MemoTable` of a new slot of `types`' ingredient.
     ///
     /// # Safety
     ///
     /// The created memo table must only be accessed with the same `MemoTableTypes`.
     pub unsafe fn new(types: &MemoTableTypes) -> Self {
-        Self {
-            row: types.next_row(),
-        }
+        let _ = types;
+        Self { _private: () }
     }
 
     /// Reset any memos in the table.
@@ -161,9 +166,12 @@ impl Drop for DummyMemo {
     }
 }
 
-/// Rows a struct ingredient can hand out. Each column reserves an 8-byte row pointer for every
-/// one: 2 GB of address space, committed only as far as rows hold memos.
+/// Rows a struct ingredient can hand out, [`PAGE_LEN`] per table page of it. Each column
+/// reserves an 8-byte row pointer for every one: 2 GB of address space, committed only as far as
+/// rows hold memos.
 const MAX_ROWS: usize = 1 << 28;
+
+const _: () = assert!(MAX_ROWS % PAGE_LEN == 0 && MAX_ROWS <= u32::MAX as usize);
 
 /// Memos one column can hold at once, current, retired or free.
 const MAX_MEMOS: usize = 1 << 24;
@@ -444,13 +452,19 @@ impl MemoTableTypes {
             .is_some_and(|column| column.type_.type_id == TypeId::of::<M>())
     }
 
-    fn next_row(&self) -> u32 {
-        let row = self.rows.fetch_add(1, Ordering::Relaxed);
-        assert!(
-            (row as usize) < MAX_ROWS,
-            "salsa: a struct ingredient made more than {MAX_ROWS} slots, its memo columns' reservation"
-        );
-        row
+    /// The first of [`PAGE_LEN`] fresh rows, for a new table page of this ingredient: its slot
+    /// `s` has row `first + s`.
+    pub(crate) fn next_page_rows(&self) -> u32 {
+        let first = self.rows.fetch_add(PAGE_LEN as u32, Ordering::Relaxed);
+        if first as usize > MAX_ROWS - PAGE_LEN {
+            self.rows.fetch_sub(PAGE_LEN as u32, Ordering::Relaxed);
+            panic!(
+                "salsa: a struct ingredient made more than {} pages, its memo columns' reservation",
+                MAX_ROWS / PAGE_LEN
+            );
+        }
+        debug_assert_eq!(first as usize % PAGE_LEN, 0);
+        first
     }
 
     /// The columns' address, for a page to keep beside its `Arc` of these types
@@ -472,34 +486,48 @@ impl MemoTableTypes {
         }
     }
 
+    /// The memos at `row`.
+    ///
     /// # Safety
     ///
-    /// The types table must be the correct one of `memos`.
+    /// `row` must be the row of a slot of this ingredient ([`Table::memo_row`]).
+    ///
+    /// [`Table::memo_row`]: crate::table::Table::memo_row
     #[inline]
-    pub(crate) unsafe fn attach_memos<'a>(
-        &'a self,
-        memos: &'a MemoTable,
-    ) -> MemoTableWithTypes<'a> {
-        debug_assert!(memos.row < self.rows.load(Ordering::Relaxed));
+    pub(crate) unsafe fn attach_memos(&self, row: u32) -> MemoTableWithTypes<'_> {
+        debug_assert!(row < self.rows.load(Ordering::Relaxed));
         MemoTableWithTypes {
             columns: &self.columns,
-            memos,
+            row,
         }
     }
 
+    /// The memos at `row`, of the slot whose `memos` these are, exclusively.
+    ///
     /// # Safety
     ///
-    /// The types table must be the correct one of `memos`.
+    /// `row` must be the row of the slot `memos` belongs to, a slot of this ingredient
+    /// ([`Table::memo_row`]).
+    ///
+    /// [`Table::memo_row`]: crate::table::Table::memo_row
     #[inline]
     pub(crate) unsafe fn attach_memos_mut<'a>(
         &'a self,
+        row: u32,
         memos: &'a mut MemoTable,
     ) -> MemoTableWithTypesMut<'a> {
-        debug_assert!(memos.row < self.rows.load(Ordering::Relaxed));
+        debug_assert!(row < self.rows.load(Ordering::Relaxed));
         MemoTableWithTypesMut {
             columns: &self.columns,
-            memos,
+            row,
+            _exclusive: memos,
         }
+    }
+
+    /// Rows handed out so far, for debug checks.
+    #[cfg(debug_assertions)]
+    pub(crate) fn rows_handed_out(&self) -> u32 {
+        self.rows.load(Ordering::Relaxed)
     }
 }
 
@@ -526,20 +554,20 @@ impl MemoColumns {
     ///
     /// The `MemoTableTypes` these columns came from is alive for `'a`, unchanged since
     /// [`MemoTableTypes::columns`] (it can only change through `Arc::get_mut`, so holding a clone
-    /// of its `Arc` is enough), and is the correct one of `memos`.
+    /// of its `Arc` is enough), and `row` is the row of one of its ingredient's slots.
     #[inline]
-    pub(crate) unsafe fn attach<'a>(self, memos: &'a MemoTable) -> MemoTableWithTypes<'a> {
+    pub(crate) unsafe fn attach<'a>(self, row: u32) -> MemoTableWithTypes<'a> {
         MemoTableWithTypes {
             // SAFETY: Our contract: the columns are alive, unmoved and shared for `'a`.
             columns: unsafe { self.0.as_ref() },
-            memos,
+            row,
         }
     }
 }
 
 pub struct MemoTableWithTypes<'a> {
     columns: &'a [Column],
-    memos: &'a MemoTable,
+    row: u32,
 }
 
 /// A memo table slot whose observed allocations remain valid for shared access for `'a`.
@@ -590,7 +618,7 @@ impl<'a> MemoTableWithTypes<'a> {
         // AcqRel: release publishes the memo to readers of the row; acquire orders the old memo's
         // writes before we retire it.
         let old = column
-            .row_or_init(self.memos.row)
+            .row_or_init(self.row)
             .swap(slot.cast::<DummyMemo>().as_ptr(), Ordering::AcqRel);
         if let Some(old) = NonNull::new(old) {
             debug_assert_ne!(old, slot.cast::<DummyMemo>());
@@ -610,7 +638,7 @@ impl<'a> MemoTableWithTypes<'a> {
             type_assert_failed(memo_ingredient_index);
         }
         // Acquire: pairs with the release in `insert`, so the memo's writes are visible.
-        NonNull::new(column.row(self.memos.row)?.load(Ordering::Acquire)).map(NonNull::cast)
+        NonNull::new(column.row(self.row)?.load(Ordering::Acquire)).map(NonNull::cast)
     }
 
     /// Returns a type-erased view with the column's type metadata.
@@ -625,7 +653,7 @@ impl<'a> MemoTableWithTypes<'a> {
         memo_ingredient_index: MemoIngredientIndex,
     ) -> Option<ErasedMemo<'a>> {
         let column = self.columns.get(memo_ingredient_index.as_usize())?;
-        let memo = NonNull::new(column.row(self.memos.row)?.load(Ordering::Acquire))?;
+        let memo = NonNull::new(column.row(self.row)?.load(Ordering::Acquire))?;
 
         // SAFETY: `insert` type-checks and release-publishes a pointer to a slab slot holding a
         // memo of the column's type, with the provenance of its slab page; the acquire load
@@ -647,7 +675,7 @@ impl<'a> MemoTableWithTypes<'a> {
         let mut memory_usage = Vec::new();
         for column in self.columns {
             let Some(memo) = column
-                .row(self.memos.row)
+                .row(self.row)
                 .and_then(|row| NonNull::new(row.load(Ordering::Acquire)))
             else {
                 continue;
@@ -666,7 +694,8 @@ impl<'a> MemoTableWithTypes<'a> {
 
 pub(crate) struct MemoTableWithTypesMut<'a> {
     columns: &'a [Column],
-    memos: &'a mut MemoTable,
+    row: u32,
+    _exclusive: &'a mut MemoTable,
 }
 
 impl MemoTableWithTypesMut<'_> {
@@ -679,7 +708,7 @@ impl MemoTableWithTypesMut<'_> {
         f: impl FnOnce(&mut M),
     ) {
         let column = column_of::<M>(self.columns, memo_ingredient_index);
-        let Some(row) = column.row(self.memos.row) else {
+        let Some(row) = column.row(self.row) else {
             return;
         };
         let Some(memo) = NonNull::new(row.load(Ordering::Acquire)) else {
@@ -702,7 +731,7 @@ impl MemoTableWithTypesMut<'_> {
     #[inline]
     pub unsafe fn drop(&mut self) {
         for column in self.columns {
-            column.retire_row(self.memos.row);
+            column.retire_row(self.row);
         }
     }
 
@@ -715,7 +744,7 @@ impl MemoTableWithTypesMut<'_> {
     // dyn: clearing a slot (a struct deleted or reused), once per memo it held
     pub(crate) unsafe fn take_memos(&mut self, mut f: impl FnMut(MemoIngredientIndex, &dyn Memo)) {
         for (index, column) in self.columns.iter().enumerate() {
-            let Some(memo) = column.retire_row(self.memos.row) else {
+            let Some(memo) = column.retire_row(self.row) else {
                 continue;
             };
             // SAFETY: The memo is of the column's type, and retired memos stay valid until the
@@ -736,7 +765,7 @@ fn type_assert_failed(memo_ingredient_index: MemoIngredientIndex) -> ! {
 
 impl std::fmt::Debug for MemoTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemoTable").field("row", &self.row).finish()
+        f.debug_struct("MemoTable").finish_non_exhaustive()
     }
 }
 
@@ -746,7 +775,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{MAX_ROWS, Memo, MemoEntryType, MemoTable, MemoTableTypes, ROW_BYTES};
+    use super::{MAX_ROWS, Memo, MemoEntryType, MemoTable, MemoTableTypes, PAGE_LEN, ROW_BYTES};
     use crate::DatabaseKeyIndex;
     use crate::zalsa::{MemoIngredientIndex, Zalsa};
 
@@ -818,6 +847,39 @@ mod tests {
         }
     }
 
+    /// `n` rows, taken a page at a time the way table pages take them.
+    fn rows(types: &MemoTableTypes, n: usize) -> Vec<u32> {
+        (0..n.div_ceil(PAGE_LEN))
+            .flat_map(|_| {
+                let first = types.next_page_rows();
+                first..first + PAGE_LEN as u32
+            })
+            .take(n)
+            .collect()
+    }
+
+    #[test]
+    fn pages_take_disjoint_aligned_rows() {
+        let types = types(1);
+        let firsts: Vec<u32> = (0..5).map(|_| types.next_page_rows()).collect();
+        assert_eq!(firsts, [0, 128, 256, 384, 512]);
+        assert_eq!(types.rows.load(Ordering::Relaxed), 5 * PAGE_LEN as u32);
+    }
+
+    #[test]
+    fn the_row_reservation_is_a_whole_number_of_pages() {
+        let types = types(1);
+        types
+            .rows
+            .store((MAX_ROWS - PAGE_LEN) as u32, Ordering::Relaxed);
+        assert_eq!(types.next_page_rows() as usize, MAX_ROWS - PAGE_LEN);
+        let past = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            types.next_page_rows()
+        }));
+        assert!(past.is_err(), "no page takes rows past the reservation");
+        assert_eq!(types.rows.load(Ordering::Relaxed) as usize, MAX_ROWS);
+    }
+
     const FIRST: MemoIngredientIndex = MemoIngredientIndex::from_usize(0);
     const SECOND: MemoIngredientIndex = MemoIngredientIndex::from_usize(1);
 
@@ -827,13 +889,13 @@ mod tests {
         let types = types(1);
         let column = &types.columns[0];
         assert!(column.row(5000).is_none(), "nothing is committed before a memo is stored");
-        // SAFETY: The tables are used with `types` only.
-        let tables: Vec<MemoTable> = (0..5001).map(|_| unsafe { MemoTable::new(&types) }).collect();
-        // SAFETY: `types` is the tables' types table.
+        let rows = rows(&types, 5001);
+        assert_eq!(rows[5000], 5000);
+        // SAFETY: The rows were handed out by `types`.
         let (first, last) = unsafe {
             (
-                types.attach_memos(&tables[0]).insert(FIRST, counted(0, &drops)),
-                types.attach_memos(&tables[5000]).insert(FIRST, counted(5000, &drops)),
+                types.attach_memos(rows[0]).insert(FIRST, counted(0, &drops)),
+                types.attach_memos(rows[5000]).insert(FIRST, counted(5000, &drops)),
             )
         };
         let base = column.rows.base().as_ptr() as usize;
@@ -856,23 +918,23 @@ mod tests {
     fn rows_keep_their_own_memos_per_column() {
         let drops = Arc::new(AtomicUsize::new(0));
         let types = types(2);
-        // SAFETY: The tables are used with `types` only.
-        let (a, b) = unsafe { (MemoTable::new(&types), MemoTable::new(&types)) };
-        assert_ne!(a.row, b.row);
-        // SAFETY: `types` is the tables' types table.
+        let rows = rows(&types, 2);
+        let (a, b) = (rows[0], rows[1]);
+        assert_ne!(a, b);
+        // SAFETY: The rows were handed out by `types`.
         unsafe {
-            types.attach_memos(&a).insert(FIRST, counted(1, &drops));
-            types.attach_memos(&b).insert(SECOND, counted(2, &drops));
-            let get = |table: &MemoTable, index| {
+            types.attach_memos(a).insert(FIRST, counted(1, &drops));
+            types.attach_memos(b).insert(SECOND, counted(2, &drops));
+            let get = |row: u32, index| {
                 types
-                    .attach_memos(table)
+                    .attach_memos(row)
                     .get::<Counted>(index)
                     .map(|memo| memo.as_ref().value)
             };
-            assert_eq!(get(&a, FIRST), Some(1));
-            assert_eq!(get(&a, SECOND), None);
-            assert_eq!(get(&b, FIRST), None);
-            assert_eq!(get(&b, SECOND), Some(2));
+            assert_eq!(get(a, FIRST), Some(1));
+            assert_eq!(get(a, SECOND), None);
+            assert_eq!(get(b, FIRST), None);
+            assert_eq!(get(b, SECOND), Some(2));
         }
         drop(types);
         assert_eq!(drops.load(Ordering::Relaxed), 2);
@@ -882,24 +944,23 @@ mod tests {
     fn replaced_memos_live_until_reclaim_and_their_slots_are_reused() {
         let drops = Arc::new(AtomicUsize::new(0));
         let types = types(1);
-        // SAFETY: The table is used with `types` only.
-        let table = unsafe { MemoTable::new(&types) };
-        // SAFETY: `types` is the table's types table; `reclaim` runs with no memo borrowed.
+        let row = types.next_page_rows();
+        // SAFETY: The row was handed out by `types`; `reclaim` runs with no memo borrowed.
         unsafe {
-            let first = types.attach_memos(&table).insert(FIRST, counted(1, &drops));
-            let second = types.attach_memos(&table).insert(FIRST, counted(2, &drops));
+            let first = types.attach_memos(row).insert(FIRST, counted(1, &drops));
+            let second = types.attach_memos(row).insert(FIRST, counted(2, &drops));
             assert_eq!(first.as_ref().value, 1, "a replaced memo stays readable");
             assert_eq!(drops.load(Ordering::Relaxed), 0);
             types.reclaim();
             assert_eq!(drops.load(Ordering::Relaxed), 1);
-            let third = types.attach_memos(&table).insert(FIRST, counted(3, &drops));
+            let third = types.attach_memos(row).insert(FIRST, counted(3, &drops));
             assert_eq!(third.cast::<u8>(), first.cast::<u8>(), "the freed slot is reused");
             assert_eq!(second.as_ref().value, 2);
             types.reclaim();
             assert_eq!(drops.load(Ordering::Relaxed), 2);
             assert_eq!(
                 types
-                    .attach_memos(&table)
+                    .attach_memos(row)
                     .get::<Counted>(FIRST)
                     .map(|memo| memo.as_ref().value),
                 Some(3)
@@ -913,20 +974,22 @@ mod tests {
     fn taking_memos_retires_them() {
         let drops = Arc::new(AtomicUsize::new(0));
         let types = types(2);
+        let row = types.next_page_rows();
         // SAFETY: The table is used with `types` only.
         let mut table = unsafe { MemoTable::new(&types) };
-        // SAFETY: `types` is the table's types table; nothing else reaches the slot's memos.
+        // SAFETY: `row` was handed out by `types` and is `table`'s; nothing else reaches the
+        // slot's memos.
         unsafe {
-            types.attach_memos(&table).insert(FIRST, counted(1, &drops));
-            types.attach_memos(&table).insert(SECOND, counted(2, &drops));
+            types.attach_memos(row).insert(FIRST, counted(1, &drops));
+            types.attach_memos(row).insert(SECOND, counted(2, &drops));
             let mut seen = Vec::new();
             types
-                .attach_memos_mut(&mut table)
+                .attach_memos_mut(row, &mut table)
                 .take_memos(|index, memo| seen.push((index, memo.has_value())));
             assert_eq!(seen, vec![(FIRST, true), (SECOND, true)]);
             assert_eq!(drops.load(Ordering::Relaxed), 0);
-            assert!(types.attach_memos(&table).get::<Counted>(FIRST).is_none());
-            types.attach_memos_mut(&mut table).drop();
+            assert!(types.attach_memos(row).get::<Counted>(FIRST).is_none());
+            types.attach_memos_mut(row, &mut table).drop();
             types.reclaim();
         }
         assert_eq!(drops.load(Ordering::Relaxed), 2);
@@ -937,17 +1000,18 @@ mod tests {
     fn map_memo_changes_the_memo_in_place() {
         let drops = Arc::new(AtomicUsize::new(0));
         let types = types(1);
+        let row = types.next_page_rows();
         // SAFETY: The table is used with `types` only.
         let mut table = unsafe { MemoTable::new(&types) };
-        // SAFETY: `types` is the table's types table.
+        // SAFETY: `row` was handed out by `types` and is `table`'s.
         unsafe {
-            types.attach_memos(&table).insert(FIRST, counted(1, &drops));
+            types.attach_memos(row).insert(FIRST, counted(1, &drops));
             types
-                .attach_memos_mut(&mut table)
+                .attach_memos_mut(row, &mut table)
                 .map_memo(FIRST, |memo: &mut Counted| memo.value = 7);
             assert_eq!(
                 types
-                    .attach_memos(&table)
+                    .attach_memos(row)
                     .get::<Counted>(FIRST)
                     .map(|memo| memo.as_ref().value),
                 Some(7)
@@ -959,10 +1023,9 @@ mod tests {
     #[should_panic(expected = "inconsistent type-id")]
     fn the_wrong_memo_type_panics() {
         let types = types(1);
-        // SAFETY: The table is used with `types` only.
-        let table = unsafe { MemoTable::new(&types) };
-        // SAFETY: `types` is the table's types table.
-        unsafe { types.attach_memos(&table).insert(FIRST, Other(0)) };
+        let row = types.next_page_rows();
+        // SAFETY: The row was handed out by `types`.
+        unsafe { types.attach_memos(row).insert(FIRST, Other(0)) };
     }
 
     /// Many tasks insert into their own rows and replace memos at once; after reclaim, every
@@ -971,18 +1034,17 @@ mod tests {
     fn racing_inserts_keep_every_row() {
         let drops = Arc::new(AtomicUsize::new(0));
         let types = types(1);
-        // SAFETY: The tables are used with `types` only.
-        let tables: Vec<MemoTable> = (0..4000).map(|_| unsafe { MemoTable::new(&types) }).collect();
+        let tables = rows(&types, 4000);
         for round in 0..3u64 {
             std::thread::scope(|scope| {
                 for chunk in tables.chunks(500) {
                     let (types, drops) = (&types, &drops);
                     scope.spawn(move || {
-                        for (i, table) in chunk.iter().enumerate() {
-                            // SAFETY: `types` is the table's types table.
+                        for (i, &row) in chunk.iter().enumerate() {
+                            // SAFETY: The row was handed out by `types`.
                             unsafe {
                                 types
-                                    .attach_memos(table)
+                                    .attach_memos(row)
                                     .insert(FIRST, counted(round * 10_000 + i as u64, drops))
                             };
                         }
@@ -993,12 +1055,12 @@ mod tests {
             unsafe { types.reclaim() };
         }
         for chunk in tables.chunks(500) {
-            for (i, table) in chunk.iter().enumerate() {
-                // SAFETY: `types` is the table's types table, and the memo stays valid while
+            for (i, &row) in chunk.iter().enumerate() {
+                // SAFETY: The row was handed out by `types`, and the memo stays valid while
                 // `types` lives and nothing reclaims.
                 let value = unsafe {
                     types
-                        .attach_memos(table)
+                        .attach_memos(row)
                         .get::<Counted>(FIRST)
                         .map(|memo| memo.as_ref().value)
                 };

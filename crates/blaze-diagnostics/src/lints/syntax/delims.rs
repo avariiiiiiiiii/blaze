@@ -27,6 +27,7 @@ use syntax::{
 use super::{Emitted, Pass, Tree, Walk};
 use crate::{
     cx::Cx,
+    lints::registry::{LintId, LintSet},
     lower::Phase,
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -36,7 +37,23 @@ use crate::{
 const MACRO_DEPTH: usize = 128;
 
 pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut check = Check { cx, walk, here: None, call: CallMemo::default(), last: None, emitted: Vec::new() };
+    const GIVES: LintSet = LintSet::of(&[
+        LintId::named("unused_parens"),
+        LintId::named("unused_braces"),
+        LintId::named("unused_import_braces"),
+    ]);
+    if !cx.any_may_fire(&GIVES) {
+        return Vec::new();
+    }
+    let mut check = Check {
+        cx,
+        walk,
+        here: None,
+        call: CallMemo::default(),
+        last: None,
+        import_braces: cx.lint_may_fire(LintId::named("unused_import_braces")),
+        emitted: Vec::new(),
+    };
     for tree in &walk.trees {
         check.here = Some(tree);
         for node in &tree.nodes {
@@ -174,6 +191,9 @@ struct Check<'c, 'a, 'db, 'w> {
     /// The last macro call in a value position and what it expands to: both lints check the
     /// same values in turn, so the second finds the first's expansion here.
     last: Option<(SyntaxNode, InFile<ast::Expr>)>,
+    /// Whether `unused_import_braces`, allowed by default, may fire: `use` items are not read
+    /// otherwise.
+    import_braces: bool,
     emitted: Vec<Emitted>,
 }
 
@@ -226,7 +246,8 @@ impl Check<'_, '_, '_, '_> {
                 self.item_value(body, file, at);
             }
             SyntaxKind::USE => {
-                if let Some(item) = ast::Use::cast(node.clone())
+                if self.import_braces
+                    && let Some(item) = ast::Use::cast(node.clone())
                     && let Some(tree) = item.use_tree()
                 {
                     self.use_tree(&tree, file, &item, at);

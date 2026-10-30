@@ -197,8 +197,10 @@ fn of_kind(trace: &Trace, kind: QueryKind) -> std::ops::Range<usize> {
 /// the kind, by one merge of the sorted columns with nothing allocated but the answer.
 fn differ(before: &Trace, after: &Trace, kind: QueryKind) -> (Vec<QueryKey>, bool) {
     let (xs, ys) = (of_kind(before, kind), of_kind(after, kind));
-    let any = xs.clone().any(|i| before.has.get(i as u32)) || ys.clone().any(|i| after.has.get(i as u32));
+    let any = (xs.start..xs.end).any(|i| before.has.contains(i as u32))
+        || (ys.start..ys.end).any(|i| after.has.contains(i as u32));
     let (mut x, mut y) = (xs.start, ys.start);
+    // alloc: the answer, the keys that changed; unallocated while none did.
     let mut keys = Vec::new();
     while x < xs.end && y < ys.end {
         match before.keys[x].cmp(&after.keys[y]) {
@@ -228,6 +230,7 @@ fn differ(before: &Trace, after: &Trace, kind: QueryKind) -> (Vec<QueryKey>, boo
 /// the build before, and [`under`]'s one pass: the traces are read once each.
 pub fn check(case: &Case, before: &Trace, incremental: &Trace, scratch: &Trace) -> Vec<Finding> {
     let watched = |kind: QueryKind| kinds::RESOLVER.contains(&kind.0) || case.expect.iter().any(|e| e.kind == kind);
+    // alloc: the answer, once a check of a fixture slot's edit; unallocated while nothing is found.
     let mut found = Vec::new();
     for e in case.expect {
         let (keys, any) = differ(before, incremental, e.kind);
@@ -241,11 +244,12 @@ pub fn check(case: &Case, before: &Trace, incremental: &Trace, scratch: &Trace) 
             found.push(Finding::Changed { what: e.what, kind: e.kind, changed, min, max, keys });
         }
     }
+    // alloc: as above, the needless reruns, put after the rest.
     let mut needless = Vec::new();
     let mut cursor = 0;
     for i in 0..incremental.keys.len() as u32 {
         let query = incremental.keys[i as usize];
-        if !incremental.ran.get(i) || !watched(query.kind) {
+        if !incremental.ran.contains(i) || !watched(query.kind) {
             continue;
         }
         let Some(now) = incremental.result(i) else { continue };

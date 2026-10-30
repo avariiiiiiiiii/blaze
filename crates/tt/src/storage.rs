@@ -1,6 +1,7 @@
-//! A token tree's storage: columns over `u32` indices, the top subtree first and every token
-//! tree after it in preorder.
+//! A token tree's storage: one block of `u32` words, a header and then columns over `u32`
+//! indices, the top subtree first and every token tree after it in preorder.
 //!
+//! - the header: each column's offset and length in words, in the order below ([`HEADER`]).
 //! - `nodes`: one [`Node`] (8 bytes) per token tree: a tag with small fields in one word, and a
 //!   symbol index, a character or a subtree's length in the other. A subtree's children are the
 //!   `len` nodes after it, so skipping one is one add, and any token tree is one index away.
@@ -8,15 +9,18 @@
 //!   (the top subtree's slot is unused), then one per subtree but the top for its closing span,
 //!   in the subtrees' order. A packed span is a range and an index into `parts`, the (anchor,
 //!   context) pairs the tree uses; a range or an index too large to pack goes to `wide`.
-//! - `symbols`: the symbols of idents and literals.
-//! - the top subtree's two spans, whole, so that they can be changed in place.
+//! - `symbols`: the IDs ([`Symbol::id`]) of the symbols of idents and literals.
 //!
-//! A leaf costs 16 bytes and a subtree 24, with no allocation of its own: a tree is four boxed
-//! slices whatever its shape. The tables list entries in the order the tree first uses them, so
-//! the columns are a function of the token trees alone: two trees are equal, and hash equal,
-//! exactly when their token trees are, whichever builder calls made them.
+//! Beside the block, the top subtree's two spans, whole, so that they can be changed in place.
+//! Every reference in the block is an offset, never a pointer, and every accessor reads it as
+//! `&[u32]`, so the same words can be a tree in memory or a checked view of mapped bytes.
+//!
+//! A leaf costs 16 bytes and a subtree 24, and a tree is one allocation whatever its shape. The
+//! tables list entries in the order the tree first uses them, so the block is a function of the
+//! token trees alone: two trees are equal, and hash equal, exactly when their token trees are,
+//! whichever builder calls made them.
 
-use std::{cell::Cell, sync::LazyLock};
+use std::{cell::Cell, hash::Hash, sync::LazyLock};
 
 use intern::Symbol;
 use rustc_hash::FxHashMap;
@@ -36,32 +40,11 @@ mod wire;
 
 pub use wire::{WireError, WirePart};
 mod columns;
-use columns::{Node, PackedSpan, WideSpan};
+use columns::{CompressedSpanPart, Node, PackedSpan, WideSpan};
 mod words;
 pub use words::{TreeWords, ViewWords};
 #[cfg(test)]
 mod varint;
-
-/// The parts of a span that tokens near each other share: all but the range. 12 bytes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct CompressedSpanPart {
-    anchor: SpanAnchor,
-    ctx: SyntaxContext,
-}
-
-const _: () = assert!(size_of::<CompressedSpanPart>() == 12);
-
-impl CompressedSpanPart {
-    #[inline]
-    fn from_span(span: &Span) -> Self {
-        Self { anchor: span.anchor, ctx: span.ctx }
-    }
-
-    #[inline]
-    fn recombine(&self, range: TextRange) -> Span {
-        Span { range, anchor: self.anchor, ctx: self.ctx }
-    }
-}
 
 const _: () = assert!(size_of::<Node>() == 8);
 
@@ -141,19 +124,8 @@ impl Node {
             suffix_len <= MAX_SUFFIX,
             "a literal with a suffix of {suffix_len} bytes: a token tree holds at most {MAX_SUFFIX}"
         );
-        let (code, hashes) = match kind {
-            LitKind::Byte => (0, 0),
-            LitKind::Char => (1, 0),
-            LitKind::Integer => (2, 0),
-            LitKind::Float => (3, 0),
-            LitKind::Str => (4, 0),
-            LitKind::StrRaw(hashes) => (5, hashes),
-            LitKind::ByteStr => (6, 0),
-            LitKind::ByteStrRaw(hashes) => (7, hashes),
-            LitKind::CStr => (8, 0),
-            LitKind::CStrRaw(hashes) => (9, hashes),
-            LitKind::Err(()) => (10, 0),
-        };
+        let (code, hashes) = kind.code();
+        let code = u32::from(code);
         Node {
             head: LITERAL | code << 2 | u32::from(hashes) << 6 | suffix_len << SUFFIX_SHIFT,
             data: symbol,
@@ -163,19 +135,9 @@ impl Node {
     #[inline]
     fn lit_kind(self) -> LitKind {
         let hashes = (self.head >> 6) as u8;
-        match (self.head >> 2) & 0xF {
-            0 => LitKind::Byte,
-            1 => LitKind::Char,
-            2 => LitKind::Integer,
-            3 => LitKind::Float,
-            4 => LitKind::Str,
-            5 => LitKind::StrRaw(hashes),
-            6 => LitKind::ByteStr,
-            7 => LitKind::ByteStrRaw(hashes),
-            8 => LitKind::CStr,
-            9 => LitKind::CStrRaw(hashes),
-            _ => LitKind::Err(()),
-        }
+        // A node's code is one `literal` wrote, so it is at most 10; 11 to 15 read as `Err`, as
+        // before.
+        LitKind::from_code(((self.head >> 2) & 0xF) as u8, hashes).unwrap_or(LitKind::Err(()))
     }
 
     #[inline]
@@ -195,17 +157,25 @@ impl PackedSpan {
 
 /// Distinct entries in the order they are first asked for, each found by a scan while there are
 /// few and through a map after.
+#[derive(Debug)]
 struct Table<T> {
     list: Vec<T>,
     map: FxHashMap<T, u32>,
 }
 
+impl<T> Default for Table<T> {
+    fn default() -> Self {
+        // alloc: kept per thread with the builder's buffers, grown at the first parts.
+        Table { list: Vec::new(), map: FxHashMap::default() }
+    }
+}
+
 const SCAN: usize = 8;
 
-impl<T: Copy + Eq + std::hash::Hash> Table<T> {
-    fn new() -> Self {
-        // alloc: the tree's parts column, allocated at its first part.
-        Table { list: Vec::new(), map: FxHashMap::default() }
+impl<T: Copy + Eq + Hash> Table<T> {
+    fn clear(&mut self) {
+        self.list.clear();
+        self.map.clear();
     }
 
     #[inline]
@@ -236,27 +206,40 @@ impl<T: Copy + Eq + std::hash::Hash> Table<T> {
 /// bytes where finding it would cost a hash per ident.
 const SYMBOL_WINDOW: usize = 16;
 
-/// The symbols of a tree, an index each: the same symbol has one while the tree has at most
-/// [`SYMBOL_WINDOW`], and after that when it was among the last [`SYMBOL_WINDOW`] added.
+/// The symbols of a tree, as their IDs, an index each: the same symbol has one while the tree
+/// has at most [`SYMBOL_WINDOW`], and after that when it was among the last [`SYMBOL_WINDOW`]
+/// added.
+#[derive(Debug, Default)]
 struct Symbols {
-    list: Vec<Symbol>,
+    list: Vec<u32>,
 }
 
 impl Symbols {
     #[inline]
     fn index(&mut self, symbol: Symbol) -> u32 {
+        let id = symbol.id();
         let from = self.list.len().saturating_sub(SYMBOL_WINDOW);
-        if let Some(at) = self.list[from..].iter().rposition(|&it| it == symbol) {
+        if let Some(at) = self.list[from..].iter().rposition(|&it| it == id) {
             return (from + at) as u32;
         }
-        self.list.push(symbol);
+        self.list.push(id);
         (self.list.len() - 1) as u32
     }
 }
 
-/// What a tree's columns are built with: its tables, filled in the order spans and symbols are
-/// encoded.
+/// The symbol of an ID in a tree's symbols column, which a [`Symbol`] of this process gave.
+#[inline]
+fn symbol(id: u32) -> Symbol {
+    Symbol::from_held_id(id)
+}
+
+/// What a tree's columns are built in: the columns, and the tables filled in the order spans
+/// and symbols are encoded. Kept per thread with the builder's buffers, so that a build
+/// allocates only its tree's block.
+#[derive(Debug, Default)]
 struct Encoder {
+    nodes: Vec<Node>,
+    spans: Vec<PackedSpan>,
     parts: Table<CompressedSpanPart>,
     last_part: Option<(CompressedSpanPart, u32)>,
     wide: Vec<WideSpan>,
@@ -264,14 +247,13 @@ struct Encoder {
 }
 
 impl Encoder {
-    fn new(symbols: usize) -> Self {
-        Encoder {
-            parts: Table::new(),
-            last_part: None,
-            // alloc: the tree's wide spans, allocated only for one too wide to pack.
-            wide: Vec::new(),
-            symbols: Symbols { list: Vec::with_capacity(symbols) },
-        }
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.spans.clear();
+        self.parts.clear();
+        self.last_part = None;
+        self.wide.clear();
+        self.symbols.list.clear();
     }
 
     #[inline]
@@ -300,16 +282,153 @@ impl Encoder {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// The words of a tree's header: the offset and the length in words of each column, the nodes,
+/// spans, wide spans, parts and symbols in that order.
+const HEADER: usize = 10;
+
+/// Where each column after the nodes starts in a tree's block, in words, and where the block
+/// ends: its header, held beside it so that slicing a column loads no word of the block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    spans: u32,
+    wide: u32,
+    parts: u32,
+    symbols: u32,
+    end: u32,
+}
+
+impl Layout {
+    /// The layout of columns of these many rows.
+    fn new(nodes: usize, spans: usize, wide: usize, parts: usize, symbols: usize) -> Layout {
+        let at = |words: usize| u32::try_from(words).expect("a token tree of fewer than 2^32 words");
+        let spans_at = HEADER + 2 * nodes;
+        let wide_at = spans_at + 2 * spans;
+        let parts_at = wide_at + 3 * wide;
+        let symbols_at = parts_at + 3 * parts;
+        Layout {
+            spans: at(spans_at),
+            wide: at(wide_at),
+            parts: at(parts_at),
+            symbols: at(symbols_at),
+            end: at(symbols_at + symbols),
+        }
+    }
+
+    fn header(self) -> [u32; HEADER] {
+        let nodes = HEADER as u32;
+        [
+            nodes,
+            self.spans - nodes,
+            self.spans,
+            self.wide - self.spans,
+            self.wide,
+            self.parts - self.wide,
+            self.parts,
+            self.symbols - self.parts,
+            self.symbols,
+            self.end - self.symbols,
+        ]
+    }
+
+    /// The layout `block`'s header describes, if it describes `block`: the columns one after
+    /// the other from the header on, each whole rows, the last ending where the block does.
+    #[cfg(test)]
+    fn of_header(block: &[u32]) -> Option<Layout> {
+        let header: [u32; HEADER] = block.get(..HEADER)?.try_into().ok()?;
+        let layout = Layout {
+            spans: header[2],
+            wide: header[4],
+            parts: header[6],
+            symbols: header[8],
+            end: header[8].checked_add(header[9])?,
+        };
+        let ordered = HEADER as u32 <= layout.spans
+            && layout.spans <= layout.wide
+            && layout.wide <= layout.parts
+            && layout.parts <= layout.symbols;
+        let whole = (layout.spans - HEADER as u32) % 2 == 0
+            && (layout.wide - layout.spans) % 2 == 0
+            && (layout.parts - layout.wide) % 3 == 0
+            && (layout.symbols - layout.parts) % 3 == 0;
+        (ordered && whole && layout.header() == header && layout.end as usize == block.len())
+            .then_some(layout)
+    }
+}
+
+#[derive(Clone)]
 pub struct TopSubtree {
-    nodes: Box<[Node]>,
-    spans: Box<[PackedSpan]>,
-    wide: Box<[WideSpan]>,
-    parts: Box<[CompressedSpanPart]>,
-    symbols: Box<[Symbol]>,
+    /// [`HEADER`], then the columns at the offsets it gives.
+    block: Box<[u32]>,
+    layout: Layout,
     top_open: Span,
     top_close: Span,
     words: words::WordsCache,
+}
+
+/// The block and the top spans: the layout follows from the block, and the words from both.
+impl PartialEq for TopSubtree {
+    fn eq(&self, other: &TopSubtree) -> bool {
+        self.block == other.block
+            && self.top_open == other.top_open
+            && self.top_close == other.top_close
+    }
+}
+
+impl Eq for TopSubtree {}
+
+impl Hash for TopSubtree {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.block.hash(state);
+        self.top_open.hash(state);
+        self.top_close.hash(state);
+    }
+}
+
+/// A tree's columns, sliced from its block once for a walk over many token trees.
+#[derive(Clone, Copy)]
+struct Columns<'t> {
+    nodes: &'t [[u32; 2]],
+    spans: &'t [[u32; 2]],
+    wide: &'t [[u32; 3]],
+    parts: &'t [[u32; 3]],
+    symbols: &'t [u32],
+}
+
+impl Columns<'_> {
+    #[inline]
+    fn node(&self, at: usize) -> Node {
+        Node::from_row(self.nodes[at])
+    }
+
+    #[inline]
+    fn span(&self, slot: usize) -> PackedSpan {
+        PackedSpan::from_row(self.spans[slot])
+    }
+
+    #[inline]
+    fn wide(&self, at: u32) -> WideSpan {
+        WideSpan::from_row(self.wide[at as usize])
+    }
+
+    #[inline]
+    fn part(&self, at: u32) -> CompressedSpanPart {
+        CompressedSpanPart::from_row(self.parts[at as usize])
+    }
+
+    #[inline]
+    fn symbol(&self, at: u32) -> Symbol {
+        symbol(self.symbols[at as usize])
+    }
+
+    /// The context of a packed span: its part's, with no range unpacked.
+    #[inline]
+    fn ctx_of(&self, span: PackedSpan) -> SyntaxContext {
+        let part = match span.len_part {
+            WIDE => self.wide(span.start).part,
+            len_part => len_part >> 16,
+        };
+        self.part(part).ctx()
+    }
 }
 
 /// The tree [`TokenTreesView::empty`] views none of.
@@ -368,7 +487,7 @@ impl TopSubtree {
     }
 
     pub fn view(&self) -> SubtreeView<'_> {
-        SubtreeView(TokenTreesView { tree: self, start: 0, end: self.nodes.len() as u32 })
+        SubtreeView(TokenTreesView { tree: self, start: 0, end: self.node_count() as u32 })
     }
 
     pub fn iter(&self) -> TtIter<'_> {
@@ -380,7 +499,8 @@ impl TopSubtree {
     }
 
     pub fn set_top_subtree_delimiter_kind(&mut self, kind: DelimiterKind) {
-        self.nodes[0] = Node::subtree(kind, 0, self.nodes[0].data);
+        let top = Node::subtree(kind, 0, self.node(0).data);
+        self.block[HEADER..HEADER + 2].copy_from_slice(&top.row());
         self.words = Default::default();
     }
 
@@ -396,7 +516,7 @@ impl TopSubtree {
     pub fn set_token(&mut self, idx: usize, leaf: Leaf) {
         assert!(idx > 0 && !self.is_subtree(idx as u32), "cannot change a subtree to a leaf");
         let mut builder =
-            TopSubtreeBuilder::with_capacity(self.top_subtree().delimiter, self.nodes.len() - 1);
+            TopSubtreeBuilder::with_capacity(self.top_subtree().delimiter, self.node_count() - 1);
         let mut leaf = Some(leaf);
         for (at, tt) in (1..).zip(self.token_trees().iter_flat_tokens()) {
             match at == idx {
@@ -415,17 +535,118 @@ impl TopSubtree {
         self.view().as_token_trees()
     }
 
+    /// Changes the AST id of every span in place, and rebuilds the tree only when that made two
+    /// of its parts one.
     pub fn change_every_ast_id(&mut self, mut callback: impl FnMut(&mut span::ErasedFileAstId)) {
-        for part in &mut self.parts {
-            callback(&mut part.anchor.ast_id);
+        let parts = self.layout.parts as usize..self.layout.symbols as usize;
+        for row in self.block[parts].as_chunks_mut::<3>().0 {
+            *row = CompressedSpanPart::from_row(*row).with_ast_id(&mut callback).row();
         }
         callback(&mut self.top_open.anchor.ast_id);
         callback(&mut self.top_close.anchor.ast_id);
         // Two parts made one would leave the table with a part twice, which a tree built from
         // the same token trees doesn't have.
-        if has_duplicates(&self.parts) {
+        if has_duplicates(self.parts()) {
             *self = TopSubtree::from_token_trees(self.top_subtree().delimiter, self.token_trees());
         }
+    }
+
+    /// The tree of these columns and top spans: one allocation, each column one copy.
+    fn from_columns(
+        nodes: &[Node],
+        spans: &[PackedSpan],
+        wide: &[WideSpan],
+        parts: &[CompressedSpanPart],
+        symbols: &[u32],
+        top_open: Span,
+        top_close: Span,
+    ) -> TopSubtree {
+        let layout = Layout::new(nodes.len(), spans.len(), wide.len(), parts.len(), symbols.len());
+        // alloc: the tree, one block of its exact size.
+        let mut block = Vec::with_capacity(layout.end as usize);
+        block.extend_from_slice(&layout.header());
+        block.extend_from_slice(columns::words(nodes));
+        block.extend_from_slice(columns::words(spans));
+        block.extend_from_slice(columns::words(wide));
+        block.extend_from_slice(columns::words(parts));
+        block.extend_from_slice(symbols);
+        debug_assert_eq!(block.len(), layout.end as usize, "the columns are the layout's");
+        TopSubtree {
+            block: block.into_boxed_slice(),
+            layout,
+            top_open,
+            top_close,
+            words: Default::default(),
+        }
+    }
+
+    /// The number of token trees, the top subtree's included.
+    #[inline]
+    fn node_count(&self) -> usize {
+        (self.layout.spans as usize - HEADER) / 2
+    }
+
+    /// The number of packed spans: one a node, then one a subtree but the top.
+    #[inline]
+    fn span_count(&self) -> usize {
+        (self.layout.wide - self.layout.spans) as usize / 2
+    }
+
+    #[inline]
+    fn nodes(&self) -> &[[u32; 2]] {
+        self.block[HEADER..self.layout.spans as usize].as_chunks::<2>().0
+    }
+
+    #[inline]
+    fn spans(&self) -> &[[u32; 2]] {
+        self.block[self.layout.spans as usize..self.layout.wide as usize].as_chunks::<2>().0
+    }
+
+    #[inline]
+    fn wide(&self) -> &[[u32; 3]] {
+        self.block[self.layout.wide as usize..self.layout.parts as usize].as_chunks::<3>().0
+    }
+
+    #[inline]
+    fn parts(&self) -> &[[u32; 3]] {
+        self.block[self.layout.parts as usize..self.layout.symbols as usize].as_chunks::<3>().0
+    }
+
+    #[inline]
+    fn symbol_ids(&self) -> &[u32] {
+        &self.block[self.layout.symbols as usize..]
+    }
+
+    /// Every column, sliced once.
+    #[inline]
+    fn columns(&self) -> Columns<'_> {
+        Columns {
+            nodes: self.nodes(),
+            spans: self.spans(),
+            wide: self.wide(),
+            parts: self.parts(),
+            symbols: self.symbol_ids(),
+        }
+    }
+
+    #[inline]
+    fn node(&self, at: u32) -> Node {
+        Node::from_row(self.nodes()[at as usize])
+    }
+
+    #[inline]
+    fn packed_span(&self, slot: usize) -> PackedSpan {
+        PackedSpan::from_row(self.spans()[slot])
+    }
+
+    #[inline]
+    fn part(&self, at: u32) -> CompressedSpanPart {
+        CompressedSpanPart::from_row(self.parts()[at as usize])
+    }
+
+    #[inline]
+    fn symbol(&self, at: u32) -> Symbol {
+        symbol(self.symbol_ids()[at as usize])
     }
 
     #[inline]
@@ -434,68 +655,63 @@ impl TopSubtree {
             return self.unpack_wide(span.start);
         }
         let len = TextSize::new(span.len_part & NARROW_LIMIT);
-        self.parts[(span.len_part >> 16) as usize]
-            .recombine(TextRange::at(TextSize::new(span.start), len))
+        self.part(span.len_part >> 16).recombine(TextRange::at(TextSize::new(span.start), len))
     }
 
     #[cold]
     fn unpack_wide(&self, at: u32) -> Span {
-        let WideSpan { start, len, part } = self.wide[at as usize];
-        self.parts[part as usize].recombine(TextRange::at(TextSize::new(start), TextSize::new(len)))
+        let WideSpan { start, len, part } = WideSpan::from_row(self.wide()[at as usize]);
+        self.part(part).recombine(TextRange::at(TextSize::new(start), TextSize::new(len)))
     }
 
     #[inline]
     pub(crate) fn is_subtree(&self, at: u32) -> bool {
-        self.nodes[at as usize].tag() == SUBTREE
+        self.node(at).tag() == SUBTREE
     }
 
     /// The length of the subtree at `at`, which is one.
     #[inline]
     pub(crate) fn subtree_len(&self, at: u32) -> u32 {
-        self.nodes[at as usize].data
+        self.node(at).data
     }
 
     /// The delimiter kind of the subtree at `at`, which is one.
     #[inline]
     pub(crate) fn delimiter_kind_at(&self, at: u32) -> DelimiterKind {
-        self.nodes[at as usize].delimiter_kind()
+        self.node(at).delimiter_kind()
     }
 
     /// The subtree at `at`, which is one.
     #[inline]
     pub(crate) fn subtree_at(&self, at: u32) -> Subtree {
-        let node = self.nodes[at as usize];
+        let node = self.node(at);
         debug_assert_eq!(node.tag(), SUBTREE);
         let (open, close) = match at {
             0 => (self.top_open, self.top_close),
-            _ => (self.unpack(self.spans[at as usize]), self.close_span(node)),
+            _ => (self.unpack(self.packed_span(at as usize)), self.close_span(node)),
         };
         Subtree { delimiter: Delimiter { open, close, kind: node.delimiter_kind() }, len: node.data }
     }
 
     #[inline]
     fn close_span(&self, node: Node) -> Span {
-        self.unpack(self.spans[self.nodes.len() + node.ordinal() as usize - 1])
+        self.unpack(self.packed_span(self.node_count() + node.ordinal() as usize - 1))
     }
 
     /// The leaf at `at`, which is one.
     #[inline]
     pub(crate) fn leaf_at(&self, at: u32) -> Leaf {
-        let node = self.nodes[at as usize];
-        let span = self.unpack(self.spans[at as usize]);
+        let node = self.node(at);
+        let span = self.unpack(self.packed_span(at as usize));
         match node.tag() {
             PUNCT => Leaf::Punct(Punct {
                 char: char::from_u32(node.data).expect("a punct's node holds a char"),
                 spacing: node.spacing(),
                 span,
             }),
-            IDENT => Leaf::Ident(Ident {
-                sym: self.symbols[node.data as usize],
-                span,
-                is_raw: node.is_raw(),
-            }),
+            IDENT => Leaf::Ident(Ident { sym: self.symbol(node.data), span, is_raw: node.is_raw() }),
             LITERAL => Leaf::Literal(Literal {
-                text_and_suffix: self.symbols[node.data as usize],
+                text_and_suffix: self.symbol(node.data),
                 span,
                 kind: node.lit_kind(),
                 suffix_len: node.suffix_len(),
@@ -517,18 +733,18 @@ impl TopSubtree {
     pub(crate) fn first_span_at(&self, at: u32) -> Span {
         match at {
             0 => self.top_open,
-            _ => self.unpack(self.spans[at as usize]),
+            _ => self.unpack(self.packed_span(at as usize)),
         }
     }
 
     /// A leaf's span, or a subtree's closing one.
     #[inline]
     pub(crate) fn last_span_at(&self, at: u32) -> Span {
-        let node = self.nodes[at as usize];
+        let node = self.node(at);
         match (node.tag(), at) {
             (SUBTREE, 0) => self.top_close,
             (SUBTREE, _) => self.close_span(node),
-            _ => self.unpack(self.spans[at as usize]),
+            _ => self.unpack(self.packed_span(at as usize)),
         }
     }
 }
@@ -541,34 +757,6 @@ thread_local! {
 }
 
 impl TopSubtree {
-    /// The context of a packed span: its part's, with no range unpacked.
-    #[inline]
-    fn ctx_of(&self, span: PackedSpan) -> SyntaxContext {
-        let part = match span.len_part {
-            WIDE => self.wide[span.start as usize].part,
-            len_part => len_part >> 16,
-        };
-        self.parts[part as usize].ctx
-    }
-
-    /// The context of the closing span of the subtree at `at`.
-    #[inline]
-    fn close_ctx_at(&self, at: u32) -> SyntaxContext {
-        match at {
-            0 => self.top_close.ctx,
-            _ => {
-                let ordinal = self.nodes[at as usize].ordinal() as usize;
-                self.ctx_of(self.spans[self.nodes.len() + ordinal - 1])
-            }
-        }
-    }
-
-    #[inline]
-    fn close_token(&self, subtree: u32) -> (crate::FlatToken, SyntaxContext) {
-        let kind = self.nodes[subtree as usize].delimiter_kind();
-        (crate::FlatToken::Close(kind), self.close_ctx_at(subtree))
-    }
-
     /// Calls `f` with each token of the token trees `start..end` in order, a subtree being its
     /// opening delimiter, its token trees and its closing delimiter, with the context of each.
     /// Reads the columns: no span's range and no leaf is unpacked, and nothing is allocated
@@ -586,15 +774,15 @@ impl TopSubtree {
     /// The number of token slots: one a node, one a subtree's closing delimiter.
     #[inline]
     pub fn token_slots(&self) -> usize {
-        self.spans.len() + 1
+        self.span_count() + 1
     }
 
     /// The slot of the closing delimiter of the subtree at `at`.
     #[inline]
     fn close_slot(&self, at: u32) -> u32 {
         match at {
-            0 => self.spans.len() as u32,
-            _ => (self.nodes.len() + self.nodes[at as usize].ordinal() as usize - 1) as u32,
+            0 => self.span_count() as u32,
+            _ => (self.node_count() + self.node(at).ordinal() as usize - 1) as u32,
         }
     }
 
@@ -602,7 +790,7 @@ impl TopSubtree {
     /// opening delimiter's node, or its subtree's [`TopSubtree::token_slots`] entry for a
     /// closing one. What [`TreeWords`] are made from.
     pub fn for_each_slotted_token(&self, f: impl FnMut(u32, crate::FlatToken, SyntaxContext)) {
-        self.walk_tokens(0, self.nodes.len() as u32, f)
+        self.walk_tokens(0, self.node_count() as u32, f)
     }
 
     fn walk_tokens(
@@ -612,24 +800,39 @@ impl TopSubtree {
         mut f: impl FnMut(u32, crate::FlatToken, SyntaxContext),
     ) {
         use crate::FlatToken;
+        let columns = self.columns();
+        let node_count = columns.nodes.len();
+        // The slot, token and context of the closing delimiter of the subtree at `at`.
+        let close = |at: u32| {
+            let node = columns.node(at as usize);
+            let (slot, ctx) = match at {
+                0 => (columns.spans.len(), self.top_close.ctx),
+                _ => {
+                    let slot = node_count + node.ordinal() as usize - 1;
+                    (slot, columns.ctx_of(columns.span(slot)))
+                }
+            };
+            (slot as u32, FlatToken::Close(node.delimiter_kind()), ctx)
+        };
         let mut open = OPEN.take();
         open.clear();
         let mut from = start as usize;
         if start == 0 && end > 0 {
-            let top = self.nodes[0];
+            let top = columns.node(0);
             open.push((1 + top.data, 0));
             f(0, FlatToken::Open(top.delimiter_kind()), self.top_open.ctx);
             from = 1;
         }
         let end = end as usize;
-        let columns = self.nodes[from..end].iter().zip(&self.spans[from..end]);
-        for (at, (&node, &span)) in (from as u32..).zip(columns) {
+        let rows = columns.nodes[from..end].iter().zip(&columns.spans[from..end]);
+        for (at, (&node, &span)) in (from as u32..).zip(rows) {
+            let (node, span) = (Node::from_row(node), PackedSpan::from_row(span));
             while let Some(&(after, subtree)) = open.last()
                 && after == at
             {
                 open.pop();
-                let (close, ctx) = self.close_token(subtree);
-                f(self.close_slot(subtree), close, ctx);
+                let (slot, token, ctx) = close(subtree);
+                f(slot, token, ctx);
             }
             let token = match node.tag() {
                 SUBTREE => {
@@ -640,26 +843,25 @@ impl TopSubtree {
                     char: char::from_u32(node.data).expect("a punct's node holds a char"),
                     spacing: node.spacing(),
                 },
-                IDENT => {
-                    FlatToken::Ident { sym: self.symbols[node.data as usize], is_raw: node.is_raw() }
-                }
+                IDENT => FlatToken::Ident { sym: columns.symbol(node.data), is_raw: node.is_raw() },
                 _ => FlatToken::Literal {
-                    sym: self.symbols[node.data as usize],
+                    sym: columns.symbol(node.data),
                     kind: node.lit_kind(),
                     suffix_len: node.suffix_len(),
                 },
             };
-            f(at, token, self.ctx_of(span));
+            f(at, token, columns.ctx_of(span));
         }
         while let Some((_, subtree)) = open.pop() {
-            let (close, ctx) = self.close_token(subtree);
-            f(self.close_slot(subtree), close, ctx);
+            let (slot, token, ctx) = close(subtree);
+            f(slot, token, ctx);
         }
         OPEN.set(open);
     }
 }
 
-fn has_duplicates(parts: &[CompressedSpanPart]) -> bool {
+/// Whether a column holds a row twice.
+fn has_duplicates<T: Copy + Eq + Hash>(parts: &[T]) -> bool {
     if parts.len() <= SCAN {
         return parts.iter().enumerate().any(|(at, part)| parts[..at].contains(part));
     }
@@ -668,8 +870,8 @@ fn has_duplicates(parts: &[CompressedSpanPart]) -> bool {
     !parts.iter().all(|part| seen.insert(*part))
 }
 
-/// A builder's buffers, kept per thread between builds, so that building allocates only the
-/// tree.
+/// A builder's buffers and its encoder's, kept per thread between builds, so that building
+/// allocates only the tree's block.
 #[derive(Default)]
 struct Scratch {
     nodes: Vec<Node>,
@@ -677,6 +879,7 @@ struct Scratch {
     closes: Vec<Span>,
     symbols: Vec<Symbol>,
     unclosed: Vec<u32>,
+    encoder: Encoder,
 }
 
 /// The most token trees whose buffers are kept for the next build.
@@ -700,6 +903,7 @@ impl Scratch {
         self.closes.clear();
         self.symbols.clear();
         self.unclosed.clear();
+        self.encoder.clear();
         SCRATCH.with(|it| it.set(Some(self)));
     }
 }
@@ -716,6 +920,8 @@ pub struct TopSubtreeBuilder {
     symbols: Vec<Symbol>,
     unclosed_subtree_indices: Vec<u32>,
     last_closed_subtree: Option<u32>,
+    /// Empty until [`Self::build`] packs the token trees into it.
+    encoder: Encoder,
 }
 
 impl TopSubtreeBuilder {
@@ -725,7 +931,8 @@ impl TopSubtreeBuilder {
 
     /// A builder with room for `len` token trees besides the top subtree.
     pub fn with_capacity(top_delimiter: Delimiter, len: usize) -> Self {
-        let Scratch { mut nodes, mut spans, mut closes, symbols, unclosed } = Scratch::take();
+        let Scratch { mut nodes, mut spans, mut closes, symbols, unclosed, encoder } =
+            Scratch::take();
         nodes.reserve(len + 1);
         spans.reserve(len + 1);
         nodes.push(Node::subtree(top_delimiter.kind, 0, 0));
@@ -738,6 +945,7 @@ impl TopSubtreeBuilder {
             symbols,
             unclosed_subtree_indices: unclosed,
             last_closed_subtree: None,
+            encoder,
         }
     }
 
@@ -866,24 +1074,34 @@ impl TopSubtreeBuilder {
         self.finish(1, top)
     }
 
-    /// The tree of `top` holding the token trees from `first` on, packed in one pass.
+    /// The tree of `top` holding the token trees from `first` on, encoded in one pass into the
+    /// encoder's columns, then copied into the tree's block, its one allocation.
     fn finish(self, first: usize, top: Delimiter) -> TopSubtree {
-        let TopSubtreeBuilder { nodes, spans, closes, symbols, unclosed_subtree_indices, .. } =
-            self;
+        let TopSubtreeBuilder {
+            nodes,
+            spans,
+            closes,
+            symbols,
+            unclosed_subtree_indices,
+            mut encoder,
+            ..
+        } = self;
         let len = nodes.len() - first + 1;
         let subtrees = nodes[first..].iter().filter(|it| it.tag() == SUBTREE).count();
-        let mut out_nodes = Vec::with_capacity(len);
-        // alloc: the tree's span column, its exact size.
-        let mut out_spans = vec![PackedSpan::UNUSED; len + subtrees];
-        let mut encoder = Encoder::new(symbols.len().min(len));
-        out_nodes.push(Node::subtree(top.kind, 0, (len - 1) as u32));
+        encoder.clear();
+        encoder.nodes.reserve(len);
+        encoder.spans.resize(len + subtrees, PackedSpan::UNUSED);
+        encoder.symbols.list.reserve(symbols.len().min(len));
+        encoder.nodes.push(Node::subtree(top.kind, 0, (len - 1) as u32));
         let mut ordinal = 0;
         for (at, (&node, span)) in nodes[first..].iter().zip(&spans[first..]).enumerate() {
-            out_spans[at + 1] = encoder.span(span);
-            out_nodes.push(match node.tag() {
+            let packed = encoder.span(span);
+            encoder.spans[at + 1] = packed;
+            let node = match node.tag() {
                 SUBTREE => {
                     ordinal += 1;
-                    out_spans[len + ordinal - 1] = encoder.span(&closes[node.ordinal() as usize]);
+                    let close = encoder.span(&closes[node.ordinal() as usize]);
+                    encoder.spans[len + ordinal - 1] = close;
                     node.with_ordinal(ordinal as u32)
                 }
                 PUNCT => node,
@@ -891,19 +1109,20 @@ impl TopSubtreeBuilder {
                     head: node.head,
                     data: encoder.symbols.index(symbols[node.data as usize]),
                 },
-            });
+            };
+            encoder.nodes.push(node);
         }
-        let tree = TopSubtree {
-            nodes: out_nodes.into_boxed_slice(),
-            spans: out_spans.into_boxed_slice(),
-            wide: encoder.wide.into_boxed_slice(),
-            parts: encoder.parts.list.into_boxed_slice(),
-            symbols: encoder.symbols.list.into_boxed_slice(),
-            top_open: top.open,
-            top_close: top.close,
-            words: Default::default(),
-        };
-        Scratch { nodes, spans, closes, symbols, unclosed: unclosed_subtree_indices }.give_back();
+        let tree = TopSubtree::from_columns(
+            &encoder.nodes,
+            &encoder.spans,
+            &encoder.wide,
+            &encoder.parts.list,
+            &encoder.symbols.list,
+            top.open,
+            top.close,
+        );
+        Scratch { nodes, spans, closes, symbols, unclosed: unclosed_subtree_indices, encoder }
+            .give_back();
         tree
     }
 

@@ -394,6 +394,138 @@ impl<T: fmt::Debug> fmt::Debug for Pooled<'_, T> {
     }
 }
 
+/// The slot of a [`Shared`] value: the value and the count of its owners. A pool of shared
+/// values is a `Pool<Counted<T>>`, and its caches make them with [`Cache::share`].
+pub struct Counted<T> {
+    owners: AtomicU32,
+    value: T,
+}
+
+/// Owners past this abort, as `Arc` does: a count that wraps would free a value still held.
+const MAX_OWNERS: u32 = i32::MAX as u32;
+
+impl<'p, T> Cache<'p, Counted<T>> {
+    /// Places `value` in a slot of the pool with one owner.
+    #[inline]
+    pub fn try_share(&mut self, value: T) -> Result<Shared<'p, T>, MemError> {
+        let pooled = self.try_alloc(Counted { owners: AtomicU32::new(1), value })?;
+        let pooled = mem::ManuallyDrop::new(pooled);
+        Ok(Shared { pool: pooled.pool, index: pooled.index, ptr: pooled.ptr })
+    }
+
+    /// Places `value` in a slot of the pool with one owner; stops when the pool is full.
+    #[inline]
+    #[track_caller]
+    pub fn share(&mut self, value: T) -> Shared<'p, T> {
+        match self.try_share(value) {
+            Ok(shared) => shared,
+            Err(error) => fail(error),
+        }
+    }
+}
+
+/// A `T` in a slot of a [`Pool`], owned like an `Arc<T>`: [`Clone`] adds an owner (one atomic
+/// add), the last owner's drop drops the value and returns the slot, and [`Shared::make_mut`]
+/// copies into a fresh slot only while the value is shared. For copy-on-write chunks that come
+/// and go at a steady rate: their slots are reused, never freed to the global allocator.
+pub struct Shared<'p, T> {
+    pool: &'p Pool<Counted<T>>,
+    index: u32,
+    ptr: NonNull<Counted<T>>,
+}
+
+// SAFETY: as for `Arc`: owners on several threads read the value and the last one drops it.
+unsafe impl<T: Send + Sync> Send for Shared<'_, T> {}
+// SAFETY: as for `Arc`: `&Shared<T>` gives `&T` and can make another owner.
+unsafe impl<T: Send + Sync> Sync for Shared<'_, T> {}
+
+impl<'p, T> Shared<'p, T> {
+    fn counted(&self) -> &Counted<T> {
+        // SAFETY: the slot holds a value while any owner, such as `self`, lives.
+        unsafe { self.ptr.as_ref() }
+    }
+
+    /// The slot's index: a `u32` ID, stable while any owner lives.
+    pub fn index(this: &Self) -> u32 {
+        this.index
+    }
+
+    /// How many owners the value has now.
+    pub fn owners(this: &Self) -> u32 {
+        this.counted().owners.load(Ordering::Acquire)
+    }
+
+    /// Whether both are owners of the same slot.
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr == other.ptr
+    }
+
+    /// The value to change in place, if `this` is its one owner.
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        if Shared::owners(this) != 1 {
+            return None;
+        }
+        // SAFETY: `this` is the one owner and is borrowed uniquely, so no other `Shared` of the
+        // slot exists and none can be made meanwhile (only cloning `this` makes one). The
+        // acquire load ordered every former owner's reads before this write.
+        Some(unsafe { &mut (*this.ptr.as_ptr()).value })
+    }
+
+    /// The value to change in place: first copied into a fresh slot from `cache` while other
+    /// owners share it, which then keep the old one.
+    #[inline]
+    #[track_caller]
+    pub fn make_mut(this: &mut Self, cache: &mut Cache<'p, Counted<T>>) -> &mut T
+    where
+        T: Clone,
+    {
+        if Shared::owners(this) != 1 {
+            *this = cache.share(T::clone(this));
+        }
+        match Shared::get_mut(this) {
+            Some(value) => value,
+            None => unreachable!("a value just placed has one owner"),
+        }
+    }
+}
+
+impl<T> Clone for Shared<'_, T> {
+    fn clone(&self) -> Self {
+        let before = self.counted().owners.fetch_add(1, Ordering::Relaxed);
+        if before >= MAX_OWNERS {
+            std::process::abort();
+        }
+        Shared { pool: self.pool, index: self.index, ptr: self.ptr }
+    }
+}
+
+impl<T> Deref for Shared<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.counted().value
+    }
+}
+
+impl<T> Drop for Shared<'_, T> {
+    fn drop(&mut self) {
+        if self.counted().owners.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // SAFETY: the count reached zero here, so this was the last owner, and the acquire half
+        // ordered every other owner's reads before it: the value is dropped once, then the
+        // slot returned.
+        unsafe { self.ptr.drop_in_place() };
+        self.pool.give_one(self.index);
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Shared<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Retired {
     grace: Grace,

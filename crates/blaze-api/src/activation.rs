@@ -89,39 +89,48 @@ pub fn systemd(listen: Listen<'_>, own: u32, want: &str) -> Result<i32, Activati
             (None, Some(_)) => "LISTEN_PID",
             _ => "LISTEN_FDS",
         };
+        // alloc: error path, a daemon that cannot start.
         return Err(ActivationError::new(format!(
             "systemd passed no socket: {missing} not set (is blaze.service started by blaze.socket?)"
         )));
     };
+    // alloc: error path, a daemon that cannot start.
     let pid = decimal(pid).ok_or_else(|| ActivationError::new(format!("LISTEN_PID={pid:?} is no process ID")))?;
     if pid != u64::from(own) {
+        // alloc: error path, a daemon that cannot start.
         return Err(ActivationError::new(format!(
             "LISTEN_PID={pid} names another process than this one ({own}): its sockets are not this daemon's"
         )));
     }
+    // alloc: error path, a daemon that cannot start.
     let count = decimal(fds).ok_or_else(|| ActivationError::new(format!("LISTEN_FDS={fds:?} is no count")))?;
     match count {
+        // alloc: error path, a daemon that cannot start.
         0 => return Err(ActivationError::new("systemd passed no socket (LISTEN_FDS=0)".to_owned())),
         1 => {}
         n => {
             let last = u64::from(FIRST_FD.unsigned_abs()).saturating_add(n - 1);
+            // alloc: error path, a daemon that cannot start.
             return Err(ActivationError::new(format!(
                 "systemd passed {n} sockets (fds {FIRST_FD} to {last}); blaze.socket listens on one, named {want}"
             )));
         }
     }
     let Some(names) = listen.names else {
+        // alloc: error path, a daemon that cannot start.
         return Err(ActivationError::new(format!(
             "systemd named no socket (no LISTEN_FDNAMES); blaze.socket names its one {want} (FileDescriptorName={want})"
         )));
     };
     let given = names.split(':').count();
     if given != 1 {
+        // alloc: error path, a daemon that cannot start.
         return Err(ActivationError::new(format!(
             "LISTEN_FDNAMES={names:?} names {given} sockets and LISTEN_FDS says 1"
         )));
     }
     if names != want {
+        // alloc: error path, a daemon that cannot start.
         return Err(ActivationError::new(format!(
             "systemd passed fd {FIRST_FD} named {names:?}, not {want:?}: it is another unit's socket"
         )));
@@ -147,16 +156,22 @@ pub enum Launchd {
 pub fn launchd(said: Launchd, want: &str) -> Result<(), ActivationError> {
     let what = match said {
         Launchd::Fds(1) => return Ok(()),
+        // alloc: error path, a daemon that cannot start, as is each arm below.
         Launchd::Fds(0) => format!("launchd passed no descriptor for its socket {want}"),
+        // alloc: error path, as above.
         Launchd::Fds(n) => format!(
             "launchd passed {n} descriptors for its socket {want}; the plist's Sockets entry {want} is one Unix socket"
         ),
         Launchd::NotManaged => {
             "no launchd job started this process (launch_activate_socket: ESRCH); `blaze daemon install` loads one"
+                // alloc: error path, as above.
                 .to_owned()
         }
+        // alloc: error path, as above.
         Launchd::NoSuchSocket => format!("the launchd job that started it has no socket named {want} in its plist's Sockets"),
+        // alloc: error path, as above.
         Launchd::Already => format!("launchd's socket {want} was taken already in this process"),
+        // alloc: error path, as above.
         Launchd::Other(code) => format!(
             "launch_activate_socket({want}) failed: {}",
             std::io::Error::from_raw_os_error(code)

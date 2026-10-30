@@ -15,10 +15,16 @@ copying the library's stencils and filling their holes, with `arch::Glue` for th
 ## The passes
 
 Each pass writes columns of `patch::Plan`, flat `Vec`s indexed by `ir::Inst`, `ir::Value`,
-`ir::Block` or `ir::StackSlot`. A `Scratch` holds the plan, the buffer and the side tables
-(`Side`) per thread. They are cleared, not freed, between compiles, and
-`Scratch::recycle(code)` takes back a `Code`'s vectors, so a warm compile allocates nothing
-(the test `a_warm_compile_allocates_only_what_the_code_does_not_give_back` counts it).
+`ir::Block` or `ir::StackSlot`. `patch::compile_in` runs the passes as one blaze-mem task
+(`frame::task(Tag::Codegen, ..)`): the plan, the buffer (`Buf<'f>`) and the side tables
+(`Side<'f>`) are vectors on the task's frame, so growing one never calls the global allocator
+and the frame's reset frees them all. The glue's own temporaries (Windows unwind info) go on
+the same frame through `Cx::temp`. The result is a `CodeRef` borrowed from the frame, handed
+to the caller's sink; `Code::copy_from` refills a reused `Code` from it, so a warm compile
+into a reused `Code` allocates nothing (the tests
+`a_warm_compile_into_a_reused_code_allocates_nothing` here, and the ones through the x86-64
+and AArch64 glue, count it). Relocations are sorted by an in-place insertion sort
+(`buf::sort_by_key_in_place`) where a stable sort would take a buffer.
 
 1. **scan** (`patch/scan.rs`): layout order of instructions and blocks, use counts, the last
    use of each value read only in its own block (`slots::GLOBAL` otherwise), constants

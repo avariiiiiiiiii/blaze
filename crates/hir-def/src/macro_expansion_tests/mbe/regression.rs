@@ -1159,7 +1159,7 @@ mod any {
     }
     pub use nameable;
 
-    /* error: unexpected token in input */$crate::any::nameable! {
+    /* error: no rules expected `Name` */$crate::any::nameable! {
         struct $name[$a]a
     }
 }

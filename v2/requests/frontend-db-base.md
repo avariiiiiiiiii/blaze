@@ -663,3 +663,46 @@ without it `budget_tests.rs` is not compiled.
 > got `// alloc: none, an empty `Vec`.`, hot_lint's one finding left. hot_lint on base-db is now
 > clean outside the tests. Block 8 is not applied: `crates/base-db/src/budgets.rs` doesn't
 > exist yet, and `mod budgets;` without it fails the build. Tell me when it is written.
+
+> applied by frontend-db-basereq (10-29): block 8 as written (`#[cfg(test)] mod budget_tests;`
+> before `mod tests;` in `lib.rs`; the file is `budget_tests.rs`, not the `budgets.rs` asked
+> after above). Block 9 was already in (`ByFile::default`'s `// alloc:` comment, worded by
+> frontend-db-base). Blocks 1-7 stay as frontend-db-base applied them. All of
+> "speed-hir-sol-basedb: hot_lint and budgets" is applied.
+
+## dedup: byte cursor onto blaze_format::cursor
+
+From `dedup-cursor-front` (report `/tmp/blaze-lanes/v2-dedup-cursor-front.md`; the cursor is
+`crates/blaze-format/src/cursor.rs`, API in `docs/v2/plan/lanes/dedup/cursor.md`). Two copies of
+`Put::put_bytes_u64` (a `u64` length, then the bytes) in base-db's hash inputs. Same bytes
+written, so every content ID stays what it is.
+
+- `crates/base-db/Cargo.toml` `[dependencies]`, under `# local deps` beside `blaze-ids`:
+  `blaze-format.workspace = true`. No cycle: `blaze-format` depends on `blaze-ids`, `serde`,
+  `zstd` only, and is already in every build of base-db's dependents through `hir-def`.
+- `crates/base-db/src/content.rs`: add `use blaze_format::cursor::Put;`; delete `fn frame`; its
+  three calls in `cfg_options_content` become `bytes.put_bytes_u64(name.as_str().as_bytes());`,
+  `bytes.put_bytes_u64(key.as_str().as_bytes());`, `bytes.put_bytes_u64(value.as_str().as_bytes());`,
+  and the one in `opt_bytes` becomes `out.put_bytes_u64(part.as_bytes());`.
+- `crates/base-db/src/files.rs`, `fn bucket_bytes`: add `use blaze_format::cursor::Put;`; the body
+  becomes
+  ```rust
+          let files = &self.buckets[bucket];
+          out.put_u64(files.len() as u64);
+          for (key, content) in files {
+              out.put_bytes_u64(key);
+              out.put_bytes(&content.0);
+          }
+  ```
+
+Not cursors, left: `named.rs`, `input.rs`, `lib.rs` feed a `Hasher` directly; `reparse.rs`'s
+`lane` reads a fixed 8-byte lane of a block.
+
+> applied by frontend-db-basereq (10-29) as written: `blaze-format.workspace = true` in
+> base-db's `[dependencies]`; `content.rs` has no `fn frame`, its four calls are `put_bytes_u64`;
+> `files.rs` `bucket_bytes` writes through `Put`. Same bytes (`put_bytes_u64` is the `u64` LE
+> length, then the bytes). Note for mem-db-def's B1: it makes `content::frame` and `opt_bytes`
+> generic over `A: Allocator`; `frame` is gone now, and `Put` is implemented for `Vec<u8>` only,
+> so B1's `opt_bytes<A>` needs `Put for Vec<u8, A>` from lane format, or it keeps
+> `extend_from_slice` there.
+> forwarded to frontend-db (parent of frontend-db-base, which holds `crates/base-db/`; its window is gone) (requests, pass 18; told by tmux).

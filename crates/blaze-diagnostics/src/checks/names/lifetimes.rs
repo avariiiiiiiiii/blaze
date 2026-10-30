@@ -139,21 +139,30 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Life
         return None;
     }
     let inner = outer::inner_item(&signature.node.value);
-    let mut binders: Vec<Binder> = Vec::new();
-    for node in lifetime.syntax().ancestors() {
+    // Almost every lifetime is declared by a binder around it: that is found first, with
+    // nothing collected; the binders are gathered for the error alone.
+    let stop = &inner;
+    let ribs = || {
+        let mut ancestors = lifetime.syntax().ancestors();
+        let mut done = false;
+        std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
+            let node = ancestors.next()?;
+            done = node == *stop;
+            Some(node)
+        })
+    };
+    for node in ribs() {
         if ast::ConstParam::can_cast(node.kind()) {
             return None;
         }
-        if let Some(binder) = Binder::of(&node) {
-            if binder.declares(name).is_some() {
-                return None;
-            }
-            binders.push(binder);
-        }
-        if node == inner {
-            break;
+        if Binder::of(&node).is_some_and(|it| it.declares(name).is_some()) {
+            return None;
         }
     }
+    let binders: Vec<Binder> = ribs().filter_map(|it| Binder::of(&it)).collect();
     let outer = inner
         .ancestors()
         .skip(1)
@@ -231,8 +240,6 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Life
             }
         }
     }
-    if let Some((fact, what)) = &signature.fact {
-        diag.fact(fact.clone(), what.clone());
-    }
+    signature.fact(cx, &mut diag);
     Some(Found::new(diag, Phase::Resolve))
 }

@@ -55,8 +55,8 @@ impl Key {
             .strip_prefix("-----BEGIN ")
             .and_then(|it| it.strip_suffix("-----"))
             .ok_or_else(|| GitHubError::new("the App's key is not PEM: no -----BEGIN line first"))?;
-        let end = format!("-----END {label}-----");
-        let mut base64 = String::new();
+        let end = format!("-----END {label}-----"); // alloc: once, at start, the App's key
+        let mut base64 = String::new(); // alloc: once, at start, the App's key
         let mut ended = false;
         for line in lines.by_ref() {
             if line == end {
@@ -71,6 +71,7 @@ impl Key {
             base64.push_str(line);
         }
         if !ended {
+            // alloc: error path
             return Err(GitHubError::new(format!("the App's key PEM has no {end} line")));
         }
         if lines.any(|line| !line.is_empty()) {
@@ -78,17 +79,19 @@ impl Key {
         }
         let der = STANDARD
             .decode(base64.as_bytes())
+            // alloc: error path
             .map_err(|_| GitHubError::new(format!("the App's key PEM's {label} is not base64")))?;
         let pair = match label {
             "RSA PRIVATE KEY" => RsaKeyPair::from_der(&der),
             "PRIVATE KEY" => RsaKeyPair::from_pkcs8(&der),
             _ => {
-                return Err(GitHubError::new(format!(
+                return Err(GitHubError::new(format!( // alloc: error path
                     "the App's key PEM is a {label}, not an RSA PRIVATE KEY or a PRIVATE KEY"
                 )));
             }
         };
         pair.map(Key)
+            // alloc: error path
             .map_err(|error| GitHubError::new(format!("the App's {label} was refused: {error}")))
     }
 
@@ -96,8 +99,11 @@ impl Key {
     /// for clock drift, expiring in nine minutes (GitHub's limit is ten).
     fn jwt(&self, app: u64, now: u64) -> Result<String, GitHubError> {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        // alloc: once per token minted, about once an hour
         let claims = format!(r#"{{"iat":{},"exp":{},"iss":{app}}}"#, now.saturating_sub(60), now + 540);
+        // alloc: once per token minted, about once an hour
         let mut jwt = format!("{header}.{}", URL_SAFE_NO_PAD.encode(claims));
+        // alloc: once per token minted, about once an hour
         let mut signature = vec![0; self.0.public().modulus_len()];
         self.0
             .sign(&RSA_PKCS1_SHA256, &SystemRandom::new(), jwt.as_bytes(), &mut signature)
@@ -130,6 +136,7 @@ pub struct App {
 }
 
 /// An installation token; Debug never shows it.
+// clone: once per token per lane, out of the shared cache
 #[derive(Clone)]
 pub struct Token(String);
 
@@ -149,7 +156,7 @@ impl fmt::Debug for Token {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct GitHubError {
     pub what: String,
     /// GitHub's HTTP status, when it answered.
@@ -254,11 +261,11 @@ fn exchange(
     request: &[u8],
 ) -> Result<HttpResponse, Failed> {
     if let Err(error) = stream.write_all(request).and_then(|()| stream.flush()) {
-        return Err(Failed { what: format!("sending: {error}"), stale: true });
+        return Err(Failed { what: format!("sending: {error}"), stale: true }); // alloc: error path
     }
     let mut counted = Counted { from: stream, read: 0 };
     http::read_response(&mut counted, MOST_ANSWER).map_err(|error| Failed {
-        what: format!("reading the answer: {error}"),
+        what: format!("reading the answer: {error}"), // alloc: error path
         stale: counted.read == 0,
     })
 }
@@ -287,13 +294,16 @@ impl GitHub {
                 && it.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
         };
         if !matches!(repo.split_once('/'), Some((owner, name)) if part(owner) && part(name)) {
+            // alloc: error path
             return Err(GitHubError::new(format!("{repo:?} is not a repository's owner/name")));
         }
         if app.api.is_empty()
             || !app.api.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-.".contains(&byte))
         {
+            // alloc: error path
             return Err(GitHubError::new(format!("{:?} is not a host name for GitHub's API", app.api)));
         }
+        // alloc: none until the first call, then reused
         let (body, request) = (Vec::new(), Vec::new());
         let minted = Arc::new(Mutex::new(None)); // alloc: once per App, shared by its lanes
         let app = Arc::new(app); // alloc: once per App, shared by its lanes
@@ -361,15 +371,18 @@ impl GitHub {
         let tls: &Arc<ClientConfig> = tls;
         let path = PathOf { route, installation: app.installation, repo: repo.as_str() };
         let api = app.api.as_str();
+        // alloc: error path, called only for an error's text
         let what = || format!("{method} https://{api}{path}");
         let authorization = match auth {
             Auth::Bearer(jwt) => ("Bearer ", jwt),
             Auth::Installation => match token {
                 Some((token, _)) => ("token ", token.expose()),
+                // alloc: error path
                 None => return Err(GitHubError::new(format!("{}: no installation token", what()))),
             },
         };
         write_request(request, method, api, &path, authorization, body);
+        // alloc: error path
         let dial = || connect(api, tls).map_err(|error| GitHubError::new(format!("{}: {error}", what())));
         let held = kept.take().filter(|it| it.idle_since.elapsed() < KEEP_IDLE);
         let reused = held.is_some();
@@ -382,6 +395,7 @@ impl GitHub {
             stream = dial()?;
             exchanged = exchange(&mut stream, request);
         }
+        // alloc: error path
         let answer = exchanged.map_err(|failed| GitHubError::new(format!("{}: {}", what(), failed.what)))?;
         let closes = answer
             .header("Connection")
@@ -393,15 +407,17 @@ impl GitHub {
             return Ok(answer);
         }
         let message = serde_json::from_slice::<Message>(&answer.body)
-            .map_or_else(|_| "no message".to_owned(), |it| it.message);
+            .map_or_else(|_| "no message".to_owned(), |it| it.message); // alloc: error path
+        // alloc: error path
         Err(GitHubError { what: format!("{}: {message}", what()), status: Some(answer.status) })
     }
 }
 
 /// A TLS connection to `api`'s port 443, with the timeouts set.
 fn connect(api: &str, tls: &Arc<ClientConfig>) -> Result<StreamOwned<ClientConnection, TcpStream>, String> {
+    // alloc: error path
     let addresses = (api, 443).to_socket_addrs().map_err(|error| format!("resolving {api}: {error}"))?;
-    let mut last = format!("{api} resolved to no address");
+    let mut last = None;
     let mut connected = None;
     for address in addresses {
         match TcpStream::connect_timeout(&address, TIMEOUT) {
@@ -409,15 +425,19 @@ fn connect(api: &str, tls: &Arc<ClientConfig>) -> Result<StreamOwned<ClientConne
                 connected = Some(tcp);
                 break;
             }
-            Err(error) => last = format!("connecting to {address}: {error}"),
+            // alloc: error path
+            Err(error) => last = Some(format!("connecting to {address}: {error}")),
         }
     }
-    let tcp = connected.ok_or(last)?;
+    // alloc: error path
+    let tcp = connected.ok_or_else(|| last.unwrap_or_else(|| format!("{api} resolved to no address")))?;
     tcp.set_read_timeout(Some(TIMEOUT))
         .and_then(|()| tcp.set_write_timeout(Some(TIMEOUT)))
-        .map_err(|error| format!("setting timeouts: {error}"))?;
+        .map_err(|error| format!("setting timeouts: {error}"))?; // alloc: error path
     let name =
+        // alloc: once per connection, the TLS name rustls keeps
         ServerName::try_from(api.to_owned()).map_err(|error| format!("{api:?} as a TLS server name: {error}"))?;
+    // alloc: error path
     let tls = ClientConnection::new(Arc::clone(tls), name).map_err(|error| format!("starting TLS: {error}"))?;
     Ok(StreamOwned::new(tls, tcp))
 }
@@ -453,6 +473,7 @@ impl Checks for GitHub {
         check_run(&mut self.body, run, true);
         let answer = self.call("POST", Route::CheckRuns, Auth::Installation, false)?;
         let created: Created = serde_json::from_slice(&answer.body).map_err(|error| {
+            // alloc: error path
             GitHubError::new(format!("GitHub's answer to creating check run {}: {error}", run.name))
         })?;
         Ok(created.id)
@@ -584,18 +605,21 @@ fn tls() -> Result<Arc<ClientConfig>, GitHubError> {
     let mut roots = RootCertStore::empty();
     let (added, _) = roots.add_parsable_certificates(found.certs);
     if added == 0 {
+        // alloc: error path
         let errors: Vec<String> = found.errors.iter().map(ToString::to_string).collect();
-        return Err(GitHubError::new(format!(
+        return Err(GitHubError::new(format!( // alloc: error path
             "no root certificate to verify GitHub with was found on this machine ({})",
+            // alloc: error path
             if errors.is_empty() { "no errors loading them".to_owned() } else { errors.join("; ") },
         )));
     }
+    // alloc: once, at start, the TLS config
     let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
         .with_safe_default_protocol_versions()
-        .map_err(|error| GitHubError::new(format!("TLS versions: {error}")))?
+        .map_err(|error| GitHubError::new(format!("TLS versions: {error}")))? // alloc: error path
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(Arc::new(config))
+    Ok(Arc::new(config)) // alloc: once, at start, the TLS config
 }
 
 fn now() -> Result<u64, GitHubError> {
@@ -608,6 +632,7 @@ fn now() -> Result<u64, GitHubError> {
 /// An RFC 3339 time in UTC (`2016-07-11T22:14:10Z`, fractions of a second allowed) as Unix
 /// seconds. Another offset is refused.
 fn unix_seconds(time: &str) -> Result<u64, GitHubError> {
+    // alloc: error path
     let refuse = |why: &str| GitHubError::new(format!("expires_at {time:?} {why}"));
     let bytes = time.as_bytes();
     if bytes.len() < 19 {

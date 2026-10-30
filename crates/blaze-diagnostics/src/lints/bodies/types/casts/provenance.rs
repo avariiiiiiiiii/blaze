@@ -15,23 +15,19 @@ use syntax::SyntaxKind;
 
 use super::{can_be_used_for_suggestions, cast_ty_span, expr_span, ty_text};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set},
     lower::{Found, Phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
 
 const NOTE: &str = "for more information, visit <https://doc.rust-lang.org/std/ptr/index.html#provenance>";
 
-pub(super) struct ImplicitProvenanceCasts;
+#[derive(Default)]
+pub(crate) struct ImplicitProvenanceCasts;
 
 impl LatePass for ImplicitProvenanceCasts {
-    fn name(&self) -> &'static str {
-        "ImplicitProvenanceCasts"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["implicit_provenance_casts"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Cast]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Expr::Cast { expr: from, .. } = b.store().expr(expr) else { return };

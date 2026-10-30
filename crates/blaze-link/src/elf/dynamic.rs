@@ -1,11 +1,14 @@
 //! The regions only the ELF writer fills, from the placed image: `.interp`, the build ID,
 //! the dynamic symbol table with its strings, GNU hash table and versions, `.rela.dyn`,
 //! `.dynamic` and `.eh_frame_hdr`. A pure function of [`Placed`]: an incremental link asks
-//! again and gets the same bytes for the same image, on any number of cores.
+//! again and gets the same bytes for the same image, on any number of cores. An incremental
+//! output keeps its last `.rela.dyn` and `.eh_frame_hdr` and patches them where
+//! [`Placed::delta`] says what changed; a patched table is the one a build makes.
 
 use std::collections::hash_map::Entry;
 
 use blaze_codegen::Arch;
+use blaze_format::leb::LebError;
 use blaze_ids::radix;
 use object::elf;
 use rayon::prelude::*;
@@ -16,7 +19,7 @@ use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, Elf, GNU_HASH, INTERP, RELA_DYN, Segment, VERNEED,
     VERSYM, error,
 };
-use crate::model::{Class, Counts, Holds, Placed, Region, SymbolKind, Tls};
+use crate::model::{Class, Counts, Delta, Holds, Placed, Region, SymbolKind, Tls};
 use crate::{LinkError, Output, OutputKind};
 
 /// `.dynamic` entries besides `DT_NEEDED`: at most one of each tag [`Tables::of`] writes.
@@ -33,13 +36,15 @@ pub(crate) fn first_error(results: Vec<Result<(), LinkError>>) -> Result<(), Lin
 }
 
 /// Sorts relocations in their derived order: by addend, then stably by the fields before it.
-/// Free when they are sorted already (the core hands over addresses in order).
-fn sort_rela(items: &mut [Rela]) {
+/// Free when they are sorted already (the core hands over addresses in order), which it
+/// returns.
+fn sort_rela(items: &mut [Rela]) -> bool {
     if items.is_sorted() {
-        return;
+        return true;
     }
     radix::sort_copy_by_key(items, |it| radix::signed_64(it.addend));
     radix::sort_copy_by_key(items, |it| radix::pack_64(it.at, radix::pack_32(it.r_type, it.sym)));
+    false
 }
 
 /// Every synthetic region, `.interp` first.
@@ -464,16 +469,10 @@ impl Tables {
             gnu_hash.u32((hash & !1) | last as u32);
         }
 
-        let (relocations, relative) = relocations(writer, placed, shared)?;
-        // alloc: the output buffer, `.rela.dyn`'s bytes
-        let mut rela = vec![0; relocations.len() * RELA as usize];
-        rela.par_chunks_mut(RELA as usize * CHUNK).zip(relocations.par_chunks(CHUNK)).for_each(|(out, chunk)| {
-            for (out, it) in out.chunks_exact_mut(RELA as usize).zip(chunk) {
-                out.copy_from_slice(&it.bytes());
-            }
-        });
-
-        let eh_frame_hdr = eh_frame_hdr(placed)?;
+        let mut last = writer.last();
+        let (rela, relative, tpoff) = rela_dyn(writer, placed, shared, last.as_deref_mut().map(|it| &mut it.rela))?;
+        let eh_frame_hdr = eh_frame_hdr(placed, last.as_deref_mut().map(|it| &mut it.eh_frame_hdr))?;
+        drop(last);
 
         let address = |name: &'static str| {
             placed
@@ -492,8 +491,7 @@ impl Tables {
         if let Some(soname) = soname {
             entry(elf::DT_SONAME, u64::from(soname));
         }
-        let tpoff64 = types(output.arch).tpoff64;
-        let static_tls = shared && relocations[relative..].iter().any(|it| it.r_type == tpoff64);
+        let static_tls = shared && tpoff;
         let flags = elf::DF_BIND_NOW
             | if shared { elf::DF_SYMBOLIC } else { 0 }
             | if static_tls { elf::DF_STATIC_TLS } else { 0 };
@@ -524,7 +522,7 @@ impl Tables {
         if !shared {
             entry(elf::DT_DEBUG, 0);
         }
-        if !relocations.is_empty() {
+        if !rela.is_empty() {
             entry(elf::DT_RELA, address(RELA_DYN)?);
             entry(elf::DT_RELASZ, rela.len() as u64);
             entry(elf::DT_RELAENT, RELA);
@@ -603,20 +601,149 @@ fn writable(regions: &[Region], at: u64, what: &str) -> Result<usize, LinkError>
     Ok(region)
 }
 
-/// `.rela.dyn`: `RELATIVE` for every slid address (sorted, first, counted by
-/// `DT_RELACOUNT`), then what binds to imports and thread-locals, by address; and how many
-/// are `RELATIVE`. One buffer of room for both: the slid addresses, most of the table, are
-/// read into it in parallel, and the rest pushed after them and sorted in place.
-fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<Rela>, usize), LinkError> {
-    let types = types(writer.output.arch);
-    let import = |index: u32| -> Result<u32, LinkError> {
-        if index as usize >= placed.imports.len() {
-            return Err(error(format!("a dynamic relocation to import {index}, of no import"))); // alloc: error path
-        }
-        Ok(1 + index)
+/// `.rela.dyn` as [`relocations`] makes it, a kept table that patches the next.
+#[derive(Default)]
+pub(crate) struct KeptRela {
+    synthesis: u64,
+    /// The table's bytes, its first `relative` entries the `RELATIVE` run in the order of
+    /// [`Placed::rebase`] (kept only when the slid addresses came sorted, so entry `i` is
+    /// `rebase[i]`'s).
+    bytes: Vec<u8>,
+    relative: usize,
+}
+
+/// `.rela.dyn`'s bytes, how many of its entries are `RELATIVE`, and whether another is a
+/// `TPOFF64`. With `kept` (an incremental output's) of the synthesis `placed.delta` is from,
+/// and every splice of the slid addresses of equal length, the `RELATIVE` run is patched and
+/// the binds and GOT cells built; otherwise all of it is built.
+fn rela_dyn(writer: &Elf, placed: &Placed<'_>, shared: bool, kept: Option<&mut KeptRela>) -> Result<(Vec<u8>, usize, bool), LinkError> {
+    let tpoff64 = types(writer.output.arch).tpoff64;
+    let Some(kept) = kept else {
+        let (relocations, relative, _) = relocations(writer, placed, shared)?;
+        let tpoff = relocations[relative..].iter().any(|it| it.r_type == tpoff64);
+        return Ok((rela_bytes(&relocations), relative, tpoff));
     };
+    let last = std::mem::replace(&mut kept.synthesis, 0);
+    let patches = placed.delta.filter(|delta| {
+        last != 0 && kept.relative == placed.rebase.len() && delta.patches(last, &[delta.rebase])
+    });
+    if let Some(delta) = patches
+        && patch_relative(writer, placed, delta, kept)
+    {
+        // alloc: once per relink, the binds and GOT cells (a few hundred)
+        let mut others = Vec::with_capacity(placed.binds.len() + 2 * placed.got.len());
+        push_others(writer, placed, shared, &mut others)?;
+        sort_rela(&mut others);
+        let head = RELA as usize * kept.relative;
+        kept.bytes.truncate(head);
+        kept.bytes.resize(head + RELA as usize * others.len(), 0);
+        put_relas(&others, &mut kept.bytes[head..]);
+        // alloc: the output buffer, `.rela.dyn`'s bytes
+        let mut bytes = Vec::with_capacity(kept.bytes.len());
+        bytes.extend_from_slice(&kept.bytes);
+        kept.synthesis = placed.synthesis;
+        return Ok((bytes, kept.relative, others.iter().any(|it| it.r_type == tpoff64)));
+    }
+    let (relocations, relative, in_order) = relocations(writer, placed, shared)?;
+    let tpoff = relocations[relative..].iter().any(|it| it.r_type == tpoff64);
+    let bytes = rela_bytes(&relocations);
+    if in_order {
+        kept.bytes.clear();
+        kept.bytes.extend_from_slice(&bytes);
+        kept.relative = relative;
+        kept.synthesis = placed.synthesis;
+    }
+    Ok((bytes, relative, tpoff))
+}
+
+/// Rewrites the kept `RELATIVE` run for `placed`: the entries of each splice of the slid
+/// addresses, and those whose 8 bytes the core wrote (a range of `delta.written`, a local GOT
+/// cell spliced), each read as [`relocations`] reads it. False, with the run left half
+/// patched, when that is not the table a build makes: a spliced address out of order, or one
+/// a build refuses (it gives the error).
+fn patch_relative(writer: &Elf, placed: &Placed<'_>, delta: &Delta<'_>, kept: &mut KeptRela) -> bool {
+    let rebase = placed.rebase;
+    if kept.bytes.len() < RELA as usize * rebase.len() {
+        return false;
+    }
+    // The run was sorted and every entry outside the splices is as it was: it stays sorted
+    // (so a build sorts nothing) when each splice is with its neighbours.
+    for splice in delta.rebase {
+        let (start, end) = (splice.new.start as usize, splice.new.end as usize);
+        if end > rebase.len() || !rebase[start.saturating_sub(1)..(end + 1).min(rebase.len())].is_sorted() {
+            return false;
+        }
+    }
+    let relative = types(writer.output.arch).relative;
+    let bytes = &mut kept.bytes;
+    let mut put = |at: usize| match slid(placed, rebase[at], relative) {
+        Ok(rela) => {
+            bytes[RELA as usize * at..][..RELA as usize].copy_from_slice(&rela.bytes());
+            true
+        }
+        Err(_) => false,
+    };
+    // The slid addresses whose 8 bytes overlap `addr..addr + len`.
+    let overlapping = |addr: u64, len: u64| {
+        rebase.partition_point(|&it| it.saturating_add(8) <= addr)..rebase.partition_point(|&it| it < addr.saturating_add(len))
+    };
+    for splice in delta.rebase {
+        if !(splice.new.start as usize..splice.new.end as usize).all(&mut put) {
+            return false;
+        }
+    }
+    for &(addr, len) in delta.written {
+        if !overlapping(addr, len).all(&mut put) {
+            return false;
+        }
+    }
+    for splice in delta.got {
+        let cells = placed.got.get(splice.new.start as usize..splice.new.end as usize).unwrap_or_default();
+        for cell in cells.iter().filter(|it| matches!(it.holds, Holds::Local(_))) {
+            if !overlapping(cell.addr, 8).all(&mut put) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Each relocation's `Elf64_Rela`, in parallel chunks.
+fn put_relas(relocations: &[Rela], out: &mut [u8]) {
+    out.par_chunks_mut(RELA as usize * CHUNK).zip(relocations.par_chunks(CHUNK)).for_each(|(out, chunk)| {
+        for (out, it) in out.chunks_exact_mut(RELA as usize).zip(chunk) {
+            out.copy_from_slice(&it.bytes());
+        }
+    });
+}
+
+fn rela_bytes(relocations: &[Rela]) -> Vec<u8> {
+    // alloc: the output buffer, `.rela.dyn`'s bytes
+    let mut rela = vec![0; relocations.len() * RELA as usize];
+    put_relas(relocations, &mut rela);
+    rela
+}
+
+/// The `RELATIVE` relocation of the slid address `at`: its addend the 8 bytes placed there.
+fn slid(placed: &Placed<'_>, at: u64, r_type: u32) -> Result<Rela, LinkError> {
     let regions = placed.regions;
-    let relative_type = types.relative;
+    let region = writable(regions, at, "a slid address")?;
+    let offset = (at - regions[region].addr) as usize;
+    let value = placed
+        .bytes(region)
+        .get(offset..offset + 8)
+        .ok_or_else(|| error(format!("a slid address at {at:#x}, outside the bytes of its region")))?; // alloc: error path
+    let value = u64::from_le_bytes(value.try_into().expect("8 bytes"));
+    Ok(Rela { at, r_type, sym: 0, addend: value as i64 })
+}
+
+/// `.rela.dyn`: `RELATIVE` for every slid address (sorted, first, counted by
+/// `DT_RELACOUNT`), then what binds to imports and thread-locals, by address; how many are
+/// `RELATIVE`; and whether the slid addresses came sorted. One buffer of room for both: the
+/// slid addresses, most of the table, are read into it in parallel, and the rest pushed
+/// after them and sorted in place.
+fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<Rela>, usize, bool), LinkError> {
+    let relative_type = types(writer.output.arch).relative;
     let other_cells = placed.binds.len() + 2 * placed.got.len();
     let mut relative = Vec::with_capacity(placed.rebase.len() + other_cells);
     relative.resize(placed.rebase.len(), Rela::default());
@@ -625,23 +752,30 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
         .zip(placed.rebase.par_chunks(CHUNK))
         .map(|(out, ats)| {
             for (out, &at) in out.iter_mut().zip(ats) {
-                let region = writable(regions, at, "a slid address")?;
-                let offset = (at - regions[region].addr) as usize;
-                let value = placed
-                    .bytes(region)
-                    .get(offset..offset + 8)
-                    .ok_or_else(|| error(format!("a slid address at {at:#x}, outside the bytes of its region")))?; // alloc: error path
-                let value = u64::from_le_bytes(value.try_into().expect("8 bytes"));
-                *out = Rela { at, r_type: relative_type, sym: 0, addend: value as i64 };
+                *out = slid(placed, at, relative_type)?;
             }
             Ok(())
         })
         .collect(); // alloc: once per image, one result per chunk of slid addresses
     first_error(results)?;
-    sort_rela(&mut relative);
+    let in_order = sort_rela(&mut relative);
     let count = relative.len();
+    push_others(writer, placed, shared, &mut relative)?;
+    sort_rela(&mut relative[count..]);
+    Ok((relative, count, in_order))
+}
 
-    let other = &mut relative;
+/// Onto `other`, unsorted: what binds to imports and thread-locals, the binds then the GOT
+/// cells.
+fn push_others(writer: &Elf, placed: &Placed<'_>, shared: bool, other: &mut Vec<Rela>) -> Result<(), LinkError> {
+    let types = types(writer.output.arch);
+    let import = |index: u32| -> Result<u32, LinkError> {
+        if index as usize >= placed.imports.len() {
+            return Err(error(format!("a dynamic relocation to import {index}, of no import"))); // alloc: error path
+        }
+        Ok(1 + index)
+    };
+    let regions = placed.regions;
     let writable = |at: u64, what: &str| writable(regions, at, what);
     for bind in placed.binds {
         writable(bind.addr, "a bound address")?;
@@ -686,8 +820,7 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
             }
         }
     }
-    sort_rela(&mut relative[count..]);
-    Ok((relative, count))
+    Ok(())
 }
 
 /// The offset in the TLS template of the thread-local at `tp` from the thread pointer: the
@@ -742,12 +875,142 @@ fn rel32(to: u64, from: u64, what: &str) -> Result<u32, LinkError> {
 /// lld writes them: `pcrel|sdata4` to `.eh_frame`, a `udata4` count, `datarel|sdata4` pairs.
 ///
 /// One pass over the records' headers ([`fdes`]), in parallel pieces split where the core
-/// placed the functions' FDEs.
-fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
+/// placed the functions' FDEs. With `kept` (an incremental output's) of the synthesis
+/// `placed.delta` is from, the table is patched where that is exact ([`patch_hdr`]).
+fn eh_frame_hdr(placed: &Placed<'_>, kept: Option<&mut KeptHdr>) -> Result<Vec<u8>, LinkError> {
     let hdr = placed
         .region(&Class::Synthetic(EH_FRAME_HDR))
         .map(|(_, it)| it.addr)
         .ok_or_else(|| error(format!("the image has no `{EH_FRAME_HDR}` region")))?; // alloc: error path
+    let Some(kept) = kept else {
+        return Ok(build_hdr(placed, hdr)?.0);
+    };
+    let last = std::mem::replace(&mut kept.synthesis, 0);
+    let patches = placed.delta.filter(|delta| last != 0 && delta.patches(last, &[delta.functions]));
+    if let Some(delta) = patches
+        && patch_hdr(placed, delta, hdr, kept)
+    {
+        // alloc: the output buffer, `.eh_frame_hdr`'s bytes
+        let mut bytes = Vec::with_capacity(kept.bytes.len());
+        bytes.extend_from_slice(&kept.bytes);
+        kept.synthesis = placed.synthesis;
+        return Ok(bytes);
+    }
+    let (bytes, table, in_order) = build_hdr(placed, hdr)?;
+    if in_order && fdes_start_records(placed, &table) {
+        kept.table = table;
+        kept.bytes.clear();
+        kept.bytes.extend_from_slice(&bytes);
+        kept.synthesis = placed.synthesis;
+    }
+    Ok(bytes)
+}
+
+/// `.eh_frame_hdr` as [`eh_frame_hdr`] made it, kept to patch the next.
+#[derive(Default)]
+pub(crate) struct KeptHdr {
+    synthesis: u64,
+    /// The table as (address covered, FDE), in section order, which was its address order
+    /// (kept only then), so sorted both ways.
+    table: Vec<(u64, u64)>,
+    bytes: Vec<u8>,
+    /// The FDEs of the records walked again, reused.
+    scratch: Vec<(u64, u64)>,
+}
+
+/// Whether every FDE a function names in `.eh_frame` is one of `table` (sorted by FDE): then
+/// whichever of them [`crate::unwind::fde_splits`] picks starts a record, and a patch that keeps
+/// the FDEs where they were keeps the splits a build would refuse none of. Only checked where
+/// the build splits at all.
+fn fdes_start_records(placed: &Placed<'_>, table: &[(u64, u64)]) -> bool {
+    if placed.functions.len() < 2 * CHUNK {
+        return true;
+    }
+    let Some((index, region)) = placed.region(&Class::EhFrame) else { return true };
+    let (section, end) = (region.addr, region.addr + placed.bytes(index).len() as u64);
+    placed.functions.par_iter().with_min_len(CHUNK).all(|it| match it.fde {
+        Some(fde) if fde > section && fde < end => table.binary_search_by_key(&fde, |it| it.1).is_ok(),
+        _ => true,
+    })
+}
+
+/// Patches the kept table for `placed`. Each range of `delta.written` in `.eh_frame` has its
+/// records walked again, from the last kept FDE at or before it to the first record start
+/// past it where a kept FDE starts (or to the section's end or its zero length), and the FDEs
+/// found replace those the span had. That is the walk a build makes from there, as the bytes
+/// before were as before. False, the kept table left half patched, unless the result is
+/// exactly the table a build makes: no CIE in a written range (its FDEs would read
+/// differently), the FDEs where they were (so the build's splits stay record starts), the
+/// table still sorted (so the build sorts nothing), every entry in reach, and each FDE a
+/// spliced function names one of the table.
+fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHdr) -> bool {
+    let Some((index, region)) = placed.region(&Class::EhFrame) else { return true };
+    let (bytes, section) = (placed.bytes(index), region.addr);
+    let end = section + bytes.len() as u64;
+    let KeptHdr { table, bytes: out, scratch, .. } = kept;
+    if out.len() != 12 + 8 * table.len() {
+        return false;
+    }
+    for &(addr, len) in delta.written {
+        let (from, to) = (addr.max(section), addr.saturating_add(len).min(end));
+        if from >= to {
+            continue;
+        }
+        let (s, e) = ((from - section) as usize, (to - section) as usize);
+        let Some(k) = table.partition_point(|it| it.1 <= from).checked_sub(1) else { return false };
+        let first = (table[k].1 - section) as usize;
+        let mut at = first;
+        let j = loop {
+            if at >= e
+                && let Ok(j) = table.binary_search_by_key(&(section + at as u64), |it| it.1)
+            {
+                break j;
+            }
+            if at == bytes.len() {
+                break table.len();
+            }
+            match entry(bytes, at) {
+                Ok(Some((body, next))) => {
+                    let cie = bytes.get(body..body + 4).is_none_or(|id| id == [0; 4]);
+                    if at < e && next > s && cie {
+                        return false;
+                    }
+                    at = next;
+                }
+                Ok(None) if table.last().is_none_or(|it| it.1 < section + at as u64) => break table.len(),
+                _ => return false,
+            }
+        };
+        scratch.clear();
+        if walk(bytes, section, first, at, scratch).is_err() || scratch.len() != j - k {
+            return false;
+        }
+        if scratch.iter().zip(&table[k..j]).any(|(new, old)| new.1 != old.1) {
+            return false;
+        }
+        table[k..j].copy_from_slice(scratch);
+        if !table[k.saturating_sub(1)..(j + 1).min(table.len())].is_sorted() {
+            return false;
+        }
+        for (nth, &(pc, fde)) in table[k..j].iter().enumerate() {
+            let (Ok(pc), Ok(fde)) = (rel32(pc, hdr, "a function"), rel32(fde, hdr, "an FDE")) else { return false };
+            let cell = &mut out[12 + 8 * (k + nth)..][..8];
+            cell[..4].copy_from_slice(&pc.to_le_bytes());
+            cell[4..].copy_from_slice(&fde.to_le_bytes());
+        }
+    }
+    delta.functions.iter().all(|splice| {
+        let functions = placed.functions.get(splice.new.start as usize..splice.new.end as usize).unwrap_or_default();
+        functions.iter().all(|it| match it.fde {
+            Some(fde) if fde > section && fde < end => table.binary_search_by_key(&fde, |it| it.1).is_ok(),
+            _ => true,
+        })
+    })
+}
+
+/// `.eh_frame_hdr` built from `.eh_frame`: its bytes, its table, and whether the table came
+/// in address order.
+fn build_hdr(placed: &Placed<'_>, hdr: u64) -> Result<(Vec<u8>, Vec<(u64, u64)>, bool), LinkError> {
     let eh_frame = placed.region(&Class::EhFrame);
     let mut table = match eh_frame {
         Some((index, region)) => {
@@ -759,7 +1022,8 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
         // alloc: empty, which allocates nothing
         None => Vec::new(),
     };
-    if !table.is_sorted() {
+    let in_order = table.is_sorted();
+    if !in_order {
         radix::sort_copy_by_key(&mut table, |&(pc, fde): &(u64, u64)| radix::pack_64(pc, fde));
     }
     let mut bytes = Vec::with_capacity(12 + 8 * table.len());
@@ -783,7 +1047,7 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
         })
         .collect(); // alloc: once per image, one result per chunk of FDEs
     first_error(results)?;
-    Ok(bytes)
+    Ok((bytes, table, in_order))
 }
 
 const DW_EH_PE_OMIT: u8 = 0xff;
@@ -1027,38 +1291,11 @@ impl<'a> Cursor<'a> {
     }
 
     fn uleb(&mut self) -> Result<u64, &'static str> {
-        let mut value = 0u64;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            if shift == 63 && byte > 1 {
-                return Err("an unsigned LEB128 past 64 bits");
-            }
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-            shift += 7;
-        }
+        blaze_format::leb::read_u64(self.bytes, &mut self.at).map_err(LebError::as_str)
     }
 
     fn sleb(&mut self) -> Result<i64, &'static str> {
-        let mut value = 0i64;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            if shift == 63 && byte != 0 && byte != 0x7f {
-                return Err("a signed LEB128 past 64 bits");
-            }
-            value |= i64::from(byte & 0x7f) << shift;
-            shift += 7;
-            if byte & 0x80 == 0 {
-                if shift < 64 && byte & 0x40 != 0 {
-                    value |= !0 << shift;
-                }
-                return Ok(value);
-            }
-        }
+        blaze_format::leb::read_i64(self.bytes, &mut self.at).map_err(LebError::as_str)
     }
 
     fn cstr(&mut self) -> Result<&'a [u8], &'static str> {
@@ -1099,6 +1336,7 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
     use gimli::UnwindSection;
     use rustc_hash::FxHashMap;
 
@@ -1129,29 +1367,6 @@ mod tests {
             }
         }
         Ok(table)
-    }
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-    }
-
-    fn uleb(out: &mut Vec<u8>, mut value: u64) {
-        loop {
-            let byte = (value & 0x7f) as u8;
-            value >>= 7;
-            if value == 0 {
-                out.push(byte);
-                return;
-            }
-            out.push(byte | 0x80);
-        }
     }
 
     /// The kinds of CIE compilers write: no augmentation (absolute 8-byte pointers), `zR`
@@ -1187,12 +1402,12 @@ mod tests {
             Cie::Personality => b"zPLR\0".as_slice(),
             Cie::Signal => b"zRS\0".as_slice(),
         });
-        uleb(&mut body, 1);
+        blaze_format::leb::write_u64(&mut body, 1);
         body.push(0x78);
         if version == 1 {
             body.push(16);
         } else {
-            uleb(&mut body, 16);
+            blaze_format::leb::write_u64(&mut body, 16);
         }
         match kind {
             Cie::Plain => {}
@@ -1216,7 +1431,7 @@ mod tests {
         at
     }
 
-    fn push_fde(out: &mut Vec<u8>, section: u64, cie: usize, kind: Cie, pc: u64, rng: &mut Rng) -> usize {
+    fn push_fde(out: &mut Vec<u8>, section: u64, cie: usize, kind: Cie, pc: u64, rng: &mut SplitMix64) -> usize {
         let at = out.len();
         let mut body = Vec::new();
         body.extend_from_slice(&((at + 4 - cie) as u32).to_le_bytes());
@@ -1243,7 +1458,7 @@ mod tests {
             }
             _ => body.push(0),
         }
-        for _ in 0..rng.next() % 12 {
+        for _ in 0..rng.next_u64() % 12 {
             body.push(0);
         }
         while (body.len() + 4) % 4 != 0 {
@@ -1256,18 +1471,18 @@ mod tests {
 
     /// A section of `n` FDEs under a few CIEs (some placed after their first FDE's CIE use
     /// moves on), out of address order; and every FDE's start.
-    fn section(rng: &mut Rng, n: usize, section: u64) -> (Vec<u8>, Vec<usize>) {
+    fn section(rng: &mut SplitMix64, n: usize, section: u64) -> (Vec<u8>, Vec<usize>) {
         let kinds = [Cie::Plain, Cie::Pcrel, Cie::Personality, Cie::Udata8, Cie::Signal];
         let mut out = Vec::new();
         let mut cies: Vec<(usize, Cie)> = Vec::new();
         let mut starts = Vec::new();
         for nth in 0..n {
-            if cies.is_empty() || rng.next() % 64 == 0 {
-                let kind = kinds[(rng.next() % kinds.len() as u64) as usize];
+            if cies.is_empty() || rng.next_u64() % 64 == 0 {
+                let kind = kinds[(rng.next_u64() % kinds.len() as u64) as usize];
                 cies.push((push_cie(&mut out, kind), kind));
             }
-            let (cie, kind) = cies[(rng.next() % cies.len() as u64) as usize];
-            let pc = 0x10_0000 + (rng.next() % (4 * n as u64 + 1)) * 16 + if nth % 97 == 0 { 0 } else { 1 };
+            let (cie, kind) = cies[(rng.next_u64() % cies.len() as u64) as usize];
+            let pc = 0x10_0000 + (rng.next_u64() % (4 * n as u64 + 1)) * 16 + if nth % 97 == 0 { 0 } else { 1 };
             starts.push(push_fde(&mut out, section, cie, kind, pc, rng));
         }
         (out, starts)
@@ -1279,9 +1494,9 @@ mod tests {
 
     #[test]
     fn the_scan_reads_what_gimli_reads() {
-        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
         for round in 0..64 {
-            let n = 1 + (rng.next() % 600) as usize;
+            let n = 1 + (rng.next_u64() % 600) as usize;
             let base = 0x40_0000 + 0x1000 * round as u64;
             let (mut bytes, starts) = section(&mut rng, n, base);
             if round % 3 == 0 {
@@ -1298,7 +1513,7 @@ mod tests {
 
     #[test]
     fn a_terminator_ends_the_section_in_any_piece() {
-        let mut rng = Rng(77);
+        let mut rng = SplitMix64::new(77);
         let base = 0x20_0000;
         let (mut bytes, mut starts) = section(&mut rng, 300, base);
         let cut = starts[150];
@@ -1316,7 +1531,7 @@ mod tests {
 
     #[test]
     fn errors_are_the_first_in_section_order() {
-        let mut rng = Rng(5);
+        let mut rng = SplitMix64::new(5);
         let base = 0x30_0000;
         let (bytes, starts) = section(&mut rng, 200, base);
         // A bad CIE version in the first CIE, and a reserved length late in the section.

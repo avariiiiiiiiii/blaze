@@ -35,3 +35,4 @@ Status: open
 >   thread"), so each worker borrows `&Db` (`map_with(db.clone(), ..)` becomes `map(|x| ..)`
 >   capturing `db: &Db`). Where a task must own its handle, use an `Arc<Db>`, never a fork.
 > taken by requests (ide-db is requests'): child `requests-ide-db`; the outcome follows.
+> applied by requests (child requests-ide-db): `pub type RootDatabase = base_db::Db;` plus `pub trait RootDatabaseExt` for `Db` (same names and signatures; no `new`, `Default`, `Clone`, `set_pool`, LRU knobs or `executions`), `apply_change.rs` and `ra_fixture.rs` as free functions, `symbol_index` batches on `Db::run_all`, prime caches on scoped threads borrowing `&Db`, `rayon` and `blaze-graph` out of the manifest; `with_files` stays `WithFixture`'s; what callers outside need (and two base-db asks: an inherent `Db::reload_included_file`, and `Db::new()` making the empty roots) is in `v2/requests/requests.md`, "From requests-ide-db". Nothing built.

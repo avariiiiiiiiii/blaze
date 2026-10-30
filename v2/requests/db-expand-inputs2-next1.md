@@ -7,3 +7,5 @@ From `dedup-codec-rng` (report `/tmp/blaze-lanes/v2-dedup-codec-rng.md`). `blaze
 1. Delete `/// splitmix64: the seeded inputs of the model tests.` and `struct Rng(u64);` with its `impl Rng { next, below }` (lines 404-419 today).
 2. Add `use blaze_ids::rng::SplitMix64 as Rng;` after `use cfg::{CfgAtom, CfgOptions};`.
 3. Replace each `Rng(N)` constructor with `Rng::new(N)`: `Rng(7)`, `Rng(thread)`, `Rng(11)`, `Rng(3)`, `Rng(19)`, `Rng(23)`, `Rng(seed)`. Any `rng.next()` becomes `rng.next_u64()`. `fn seeded_view(rng: &mut Rng)` stays as it is.
+
+> forwarded to db (its window is gone) (from requests, pass 16; told by tmux).

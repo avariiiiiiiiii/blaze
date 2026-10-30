@@ -19,22 +19,22 @@ smallvec.workspace = true
 either.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 rustc-hash.workspace = true
+hashbrown.workspace = true
 la-arena.workspace = true
 triomphe.workspace = true
 inventory.workspace = true
 rustc_apfloat = "0.2.3"
 oorandom = "11.1.5"
-unicode-width.workspace = true
 salsa.workspace = true
 
 rustc_abi.workspace = true
-ra-ap-rustc_index.workspace = true
 ra-ap-rustc_ast_ir.workspace = true
 rustc_type_ir.workspace = true
 rustc_next_trait_solver.workspace = true
 
 # local deps
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 stdx.workspace = true
 macros.workspace = true
 intern.workspace = true
@@ -47,6 +47,7 @@ syntax.workspace = true
 span.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 hir.workspace = true
 test-fixture.workspace = true
 

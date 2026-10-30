@@ -1,7 +1,8 @@
 //! The kernel's virtual memory: reserve address space, commit pages of it, give pages back,
 //! release it. Linux and macOS through `mmap`/`mprotect`/`madvise`, Windows through
 //! `VirtualAlloc`/`VirtualFree`. Every other function of the crate reaches the kernel through
-//! these.
+//! these. Elsewhere (wasm32) there is no address space to reserve, and a reservation is
+//! memory taken whole.
 //!
 //! A reservation is `PROT_NONE` (`PAGE_NOACCESS`, `MEM_RESERVE`): it costs address space and a
 //! mapping, no memory. Committing makes a prefix readable and writable; Linux backs it with
@@ -40,16 +41,11 @@ fn query_page_size() -> usize {
     usize::try_from(page).ok().filter(|page| page.is_power_of_two()).unwrap_or(4096)
 }
 
-/// Windows' page is 4 KB on every architecture it runs blaze on (x86-64, arm64).
+/// Windows' page is 4 KB on every architecture it runs blaze on (x86-64, arm64); without
+/// virtual memory it is only the unit regions commit in.
 #[cfg(not(unix))]
 fn query_page_size() -> usize {
     4096
-}
-
-/// Rounds `bytes` up to a multiple of `to`, a power of two; `None` when that overflows.
-pub(crate) fn round_up(bytes: usize, to: usize) -> Option<usize> {
-    debug_assert!(to.is_power_of_two());
-    Some(bytes.checked_add(to - 1)? & !(to - 1))
 }
 
 /// Reserves `bytes` (a multiple of [`page_size`]) of address space, aligned to
@@ -108,12 +104,23 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     NonNull::new(base.cast::<u8>()).ok_or_else(io::Error::last_os_error)
 }
 
+/// Without virtual memory (wasm32's linear memory only grows at its end) a reservation is the
+/// whole range taken at once, zeroed, from the global allocator: it never moves, as on the
+/// kernels, but costs its full size from the start.
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn reserve(_bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "blaze-mem reserves address space on Linux, macOS and Windows only",
-    ))
+pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
+    let layout = whole(bytes)?;
+    // SAFETY: `layout` has a nonzero size (`whole` refuses zero).
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    NonNull::new(base).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::OutOfMemory, "the reservation is more than memory holds")
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
+    std::alloc::Layout::from_size_align(bytes.max(1), RESERVE_ALIGN)
+        .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "reservation overflows"))
 }
 
 /// Makes `[ptr, ptr + bytes)` readable and writable.
@@ -141,9 +148,10 @@ pub(crate) unsafe fn commit(ptr: NonNull<u8>, bytes: usize) -> io::Result<()> {
     if got.is_null() { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
+/// The whole reservation is memory already.
 #[cfg(not(any(unix, windows)))]
 pub(crate) unsafe fn commit(_ptr: NonNull<u8>, _bytes: usize) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
+    Ok(())
 }
 
 /// Gives `[ptr, ptr + bytes)` back to the kernel and makes it inaccessible again, still
@@ -187,9 +195,13 @@ pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io
     if ok != 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
+/// Keeps the memory and zeroes it, so a range committed again reads zeros as on Linux.
 #[cfg(not(any(unix, windows)))]
-pub(crate) unsafe fn decommit(_ptr: NonNull<u8>, _bytes: usize, _huge: bool) -> io::Result<()> {
-    Err(io::Error::from(io::ErrorKind::Unsupported))
+pub(crate) unsafe fn decommit(ptr: NonNull<u8>, bytes: usize, _huge: bool) -> io::Result<()> {
+    // SAFETY: the caller says the range is inside a live reservation of ours that nothing
+    // uses; the reservation is memory we own, so it is writable.
+    unsafe { ptr.as_ptr().write_bytes(0, bytes) };
+    Ok(())
 }
 
 /// Lets the kernel take the pages of `[ptr, ptr + bytes)` back while they stay committed: the
@@ -239,4 +251,10 @@ pub(crate) unsafe fn release(ptr: NonNull<u8>, _bytes: usize) {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) unsafe fn release(_ptr: NonNull<u8>, _bytes: usize) {}
+pub(crate) unsafe fn release(ptr: NonNull<u8>, bytes: usize) {
+    if let Ok(layout) = whole(bytes) {
+        // SAFETY: the caller hands over exactly what `reserve` returned for `bytes`, which
+        // `reserve` took from the global allocator with this same layout.
+        unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+    }
+}

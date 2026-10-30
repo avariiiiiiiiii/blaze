@@ -7,11 +7,10 @@
 //! parent, as when they were in hir-ty.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 #![allow(rustdoc::private_intra_doc_links)]
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
-extern crate ra_ap_rustc_index as rustc_index;
-
 use hir_def::CallableDefId;
 #[allow(unused_imports, reason = "hir-ty's root, which the passes name as `crate::`")]
 use hir_ty::*;

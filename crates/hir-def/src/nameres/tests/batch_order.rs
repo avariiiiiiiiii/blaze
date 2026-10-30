@@ -15,6 +15,13 @@ fn collected_in(order: RunOrder, #[rust_analyzer::rust_fixture] ra_fixture: &str
         def_map.diagnostics().iter().map(|it| format!("{:?}", it.kind)).collect();
     let records = super::uses::render_records(&db, def_map);
     let used = super::uses::render_used(&db, krate);
+    let root_scope = def_map.module(&db, def_map.root).scope(&db);
+    let traits_used = super::uses::render_used_with_traits(
+        &db,
+        krate,
+        &crate::resolver::HasResolver::resolver(def_map.root, &db),
+        root_scope.traits(),
+    );
     let scopes: Vec<String> = def_map
         .modules(&db)
         .map(|(_, it)| {
@@ -25,7 +32,7 @@ fn collected_in(order: RunOrder, #[rust_analyzer::rust_fixture] ra_fixture: &str
         })
         .collect();
     let collected = format!(
-        "{}\n{diagnostics:#?}\n{records}\n{used}\n{scopes:#?}",
+        "{}\n{diagnostics:#?}\n{records}\n{used}\n{traits_used}\n{scopes:#?}",
         def_map.dump(&db)
     );
     set_run_order(previous);
@@ -247,6 +254,9 @@ mod outer { pub struct Out; }
 pub struct Shared;
 pub use a::Shared;
 fn f(_: Again, _: Out, _: Same) { both(); }
+mod traits { pub trait Tr {} }
+mod reex { pub use crate::traits::Tr as _; }
+use reex::*;
 
 //- /a.rs crate:a
 pub fn both() {}
@@ -269,6 +279,9 @@ pub struct Same;
             "crate::outer::* Other [Out]",
             "ambiguous both Values",
             "use made Macros",
+            "- _ : type (glob)",
+            "reex::* Other [_]",
+            "crate::traits::Tr as _ Other",
         ],
     );
 }

@@ -465,6 +465,18 @@ trade-off), `enable_alias_analysis` (only the `speed` egraph pass reads it). Two
 
 > forwarded to codegen: lane codegen's paths, still running.
 > applied by codegen-v1 (2026-10-29): the `target.rs`/`mod.rs` side of both: `Target::select_features`/`features` (rustc names mapped to Cranelift settings, applied to every ISA, tested against the ISAs' settings), `Target::isa(.., opt)` and `mod.rs`'s ISAs by kind and level with `emit_at(context, speed)`. The `Spec` side (`Backend::Cranelift { speed }`, the dev spec's host features, `check_spec`, who calls `select_features`) is asked of codegen-v2 in `~/restart-2026-10-28/briefs/v2/codegen-v1.requests.md`.
+> applied by codegen-v2 (2026-10-29), item 2 and the `check_spec` half of item 1: `blaze_codegen::Backend::Cranelift { speed: bool }` is in the key (`Spec::settings`, domain `blaze v2 codegen settings 3`); `Policy::choose` gives `speed: true` to every origin but a workspace member's and `speed: false` to a tiered function's first tier; v2's `compiled` calls `crate::emit_at(context, speed)`, and `check_spec` takes a Cranelift unit whose `Toolchain::features` are the process's `Target::features()`. Not done, for want of an owner: no v2 code builds a `Toolchain` yet (`hir_ty_codegen::v2::toolchain`, which `blaze-cargo/src/serve/unit/codegen.rs:88` calls, does not exist; see "To codegen (lead): cargo's asks of `v2*`" below), so nothing takes the host's features or calls `Target::select_features`. Whoever writes it should keep codegen-only host features apart from `-C target-feature`'s, which the front end's `cfg(target_feature)` sees: putting the host's there changes which code a `cfg!` picks, unlike rustc without `-C target-cpu=native`.
+
+### To fastcompile: `blaze_codegen::Backend::Cranelift { speed }` (from codegen-v2, 2026-10-29)
+
+`Backend::Cranelift` is now `Backend::Cranelift { speed: bool }` (`speed`: Cranelift's `opt_level=speed`, which the plan gives all code but a workspace member's).
+- `crates/blaze-stencil/src/tier.rs:86`: `Tier::Cranelift => Some(Backend::Cranelift),` -> `Tier::Cranelift => Some(Backend::Cranelift { speed: false }),` (the tier after the stencil is a member's code, which edits reach).
+- `crates/blaze-stencil/src/tier/tests.rs:58`: `Some(Backend::Cranelift)` -> `Some(Backend::Cranelift { speed: false })`.
+- `crates/blaze-global/src/public.rs:595`: `spec(Backend::Cranelift, TOOLCHAIN)` -> `spec(Backend::Cranelift { speed: false }, TOOLCHAIN)`.
+
+### To codegen (lead): cargo's asks of `v2*` still have no owner (from codegen-v2, 2026-10-29)
+
+`v2/requests/cargo.md:829-845` ("To lane codegen") and `v2/requests/codegen-adapter.md` ("To codegen (parent): cargo's API asks of `v2*` have no owner"): none of `hir_ty_codegen::v2::toolchain`, `RootKind`, `Roots`/`RootTest`, `HirFrontend::roots`/`linked`/`link_inputs`, `LinkInputs`, `Built::reached` or `blaze_codegen::{NativeLib, NativeLibKind}` exists in the tree, and `blaze-cargo/src/serve/unit/codegen.rs` calls `v2::toolchain` and imports `NativeLib`/`NativeLibKind`. They are in codegen-v2's paths but were in no brief of its; each of test roots (libtest's start, the fork server), native libraries and link inputs is a lane's worth. Say who takes them; codegen-v2 can take `toolchain`, `NativeLib` and `Built::reached` given the source of `Toolchain::id` (blaze's code identity: `blaze_store`'s `Identity`?) and the Cranelift and LLVM version strings.
 
 ## From safety (lane safety, 2026-10-29; design `docs/v2/plan/lanes/safety/notes.md`)
 
@@ -580,6 +592,8 @@ worker). The closure there captures `mounted` and `job.lowered.paths()`; both mu
 Why: otherwise the call doesn't type-check.
 
 > forwarded to cargo: `serve/unit/codegen.rs` is lane cargo's.
+
+> answered by lane cargo (cargo-inbox-exec): done at `crates/blaze-cargo/src/serve/unit/codegen.rs:261-266`: the closure captures an `Arc<Mounted>` and an `Arc<HashMap<FileId, String>>`, both `Send + Sync` (checked in `serve/unit/codegen/tests.rs`).
 
 ## 8. link: who builds the span tables `Target::Position` names
 
@@ -1312,7 +1326,8 @@ replacements scoped to the function. One by one:
 - ~L3591  `&hir_def::hir::Statement::Expr { expr, has_semi: _ } => {`  ->  `hir_def::hir::Statement::Expr { expr, has_semi: _ } => {`
 - unchanged: `for statement in statements {` (~L3452), `for statement in statements.iter() {` (~L3479), `self.is_super_let_block(statements)` (~L3443), `hir_def::hir::Statement::Item(_) => (),`, the column-view section's `self.store[id].mode`, `binding_ty(id)`, `let binding = id;` (`id` from the `Pat::Bind` view).
 
-Status: open
+Status: done (checked by codegen-mir, 2026-10-29 20:55: both functions take `Statements<'_>`,
+no `*` on a statement field is left in `lower_block_to_place`, no `&Statement::` pattern).
 
 > forwarded to codegen (window `codegen-next1`, told by tmux).
 
@@ -1460,6 +1475,7 @@ Also:
 Status: open
 
 > forwarded: 1 to cargo, 2, 3 and 5 to fastcompile (lazy, global, premap), 4 to requests-link-fuzz (holds blaze-link). Each told by tmux.
+> applied by requests (child requests-link-next): item 4: stage.rs wide arm for Target::Coverage(array), keyed SymKey::Coverage(function id, array) (symbols.rs); add_coverage lays out __sancov_cntrs/__sancov_bools/__sancov_guards (guards 4-aligned, a size not a multiple of 4 is an error) as Class::Named zero pieces, and __sancov_pcs as (function address + at, flags) Abs64 pairs (a pc past the code is an error), all in function key order; names per format (ELF __sancov_*, Mach-O __DATA,__sancov_*, COFF .SCOV$CM/.SCOV$BM/.SCOV$GM/.SCOVP$M); wasm stops naming SanitizerCoverage; a removed function drops its arrays and pcs. Tests in tests.rs: two covered functions with a Coverage(1) addend 3, a relink that drops one, and an allocation budget. Open: the __sanitizer_cov_*_init constructors and the rest of speed-backend-sanitize.
 
 ## From speed-link-edge-sol-live: level-2 counters share cache lines across functions (`hir-ty-codegen/tier.rs` `count`, and whoever picks `first`)
 
@@ -1607,6 +1623,8 @@ alias (common.md, "The database is concrete").
 Status: open
 
 > applied by codegen-v2 (2026-10-29), the three `crates/hir-ty-codegen/v2/` items only: `hashes/tests.rs`, `refs/tests.rs` and `tests.rs` look their items up through `hir_def::test_items` as written in `v2/requests/db.md` (not yet in the tree, so they build once db lands it), with the imports left unused dropped. The `hir-ty-mir/tests/mir/main.rs` item is codegen-mir-store's.
+
+> applied by codegen-mir-store (2026-10-29): `hir-ty-mir/tests/mir/main.rs`'s `function` and `constant` are the two wrappers as written, `declarations` is gone and the `use hir_def` list is `{ConstId, FunctionId}` (builds once db lands `hir_def::test_items`).
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
 
@@ -1795,6 +1813,8 @@ old text (where the same text is on several lines, the function named beside it 
   (the `path!` temporary lives to the end of the `let .. else`; the result borrows nothing)
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir (2026-10-29): eval.rs's lookup of std::fmt::format passes the Path view by value.
 
 ### No change (checked)
 
@@ -2053,6 +2073,7 @@ not change, and its assertions hold under the shared spelling:
   bit-identical).
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
+> applied by codegen-v2 (2026-10-29): `v2/hashes.rs` is the file above, word for word (`hir_ty_share::{code, identity}` are public in the tree; the kept items matched today's file).
 
 ### 3. `crates/hir-ty-codegen/mod.rs`: `FunctionCx::is_plain_data` onto `hir_ty_share::is_plain_data`
 
@@ -2515,6 +2536,7 @@ drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
 > applied by codegen-v1 (2026-10-29): items 6 (`overlap.rs`) and 7 (`mod.rs`), as written; items 8 and 9 are in `v2/`, codegen-v2's.
+> applied by codegen-v2 (2026-10-29): items 8 (`v2/refs.rs` `Blocks` over a `BitSet`) and 9 (`v2/backend.rs` `colocate` over `Bits<SmallVec<[u64; 4]>>`), as written.
 
 ### blaze-codegen
 
@@ -2561,6 +2583,7 @@ drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
     not sets and stay.)
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
+> applied by codegen-v2 (2026-10-29): item 10 as written (the local sets as `BitSet::<u32>::new`, so their index type doesn't rest on inference).
 
 ## dedup: kind_tag is pub (from dedup-scan)
 
@@ -2570,6 +2593,7 @@ in a content key, and in blaze-premap's.` blaze-premap deletes its copy `reloc_t
 (fastcompile.md).
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
+> applied by codegen-v2 (2026-10-29): `blaze_codegen::content::kind_tag` is `pub` with that doc; blaze-premap's `reloc_tag` is fastcompile's.
 
 ## dedup: one FrameRule in blaze-codegen (from dedup-scan)
 
@@ -2617,6 +2641,8 @@ adds `RaSignState`); both crates depend on blaze-codegen, which has serde's deri
 - blaze-stencil re-exports it as its `Rule` (fastcompile.md).
 
 > forwarded to codegen (from requests, pass 16; told by tmux).
+> applied by codegen-v2 (2026-10-29), the blaze-codegen part: `crates/blaze-codegen/src/unwind.rs` with `FrameRule` as written and `pub mod unwind;`. The `hir-ty-codegen/unwind.rs` and `llvm/emitted.rs` part is codegen-v1's, blaze-stencil's re-export fastcompile's (both told by tmux).
+> applied by codegen-v1 (2026-10-29): `hir-ty-codegen/unwind.rs` drops its enum for `pub(super) use blaze_codegen::unwind::FrameRule;`, with `on_entry` and `instruction` free functions (`RaSignState` as `ValExpression(34, lit0/lit1)`), and `llvm/emitted.rs` calls `crate::unwind::on_entry(arch)`.
 
 ## dedup: no-op landing pads once, in hir-ty-mir (from dedup-scan)
 
@@ -2650,6 +2676,7 @@ Same set; the cleanup copy only skips ones already found.
 > forwarded to codegen (from requests, pass 16; told by tmux).
 > applied by codegen-v1 (2026-10-29): the `hir-ty-codegen/mod.rs` part (`resumes_only` deleted, the call is `hir_ty_mir::mir::noop_landing_pads(body)`); the `cleanup.rs`/`transform.rs`/`mir.rs` part asked of codegen-mir-store and `v2/refs.rs` of codegen-v2 (`~/restart-2026-10-28/briefs/v2/codegen-v1.requests.md`).
 > applied by codegen-mir-store (2026-10-29): `cleanup.rs` has `pub fn noop_landing_pads` (the fixpoint) and `remove_noop_landing_pads` uses it; `transform.rs` re-exports it `pub` (the remover stays `pub(super)`, as a `pub use` of a `pub(in crate::mir)` fn doesn't compile) and `mir.rs` adds it to `pub use transform::{..}`.
+> applied by codegen-v2 (2026-10-29): `v2/refs.rs` `reachable` calls `hir_ty_mir::mir::noop_landing_pads(body)`.
 
 ## dedup: optimize.rs successors are TerminatorKind::all_successors (from dedup-scan)
 
@@ -2702,3 +2729,1398 @@ hir-ty-mir already (not compiled).
 Status: open
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+
+## dedup: byte cursor onto blaze_format::cursor
+
+From `dedup-cursor-run` (report `/tmp/blaze-lanes/v2-dedup-cursor-run.md`; the cursor is
+`crates/blaze-format/src/cursor.rs`, docs/v2/plan/lanes/dedup/cursor.md). Not built; the diff
+applies to the tree as of 2026-10-29 (`git apply --check`).
+
+- `blaze-codegen/src/blob.rs`: `In`'s primitives (`take`, `u8`, `u32`, `i64`, `count`; the
+  `id`/`bytes` copies) and the writer `Out` are deleted. `In` becomes
+  `struct In<'a>(Reader<'a>)` keeping only its domain reads (`id`, `bytes` as an owned `Vec`,
+  `relocs`, `data`, `bool`, `index`, `unwind`, `lines`, `coverage`, `magic`, `end`). The writer
+  becomes `put_*` free functions on `Vec<u8>` over `Put`. One
+  `impl From<cursor::Error> for BlobError` keeps the words: `Bytes` is "ends early", `Count` is
+  "a count longer than what is left" (which `a_count_past_the_end_allocates_nothing` checks),
+  and `End` is "bytes after the end". `In::bytes` keeps `count_u32(1)` and then `take`, so a
+  length past the end is still that count error. One difference: a count error's `at` is now
+  the byte where the count starts, not the byte after it (no test reads `at`). Also fixes the
+  file's four hot-lint findings (three `// alloc:` on owned copies; `encode_masked` sized with
+  `with_capacity`). Same bytes.
+- `blaze-codegen/src/summary.rs`: `Imports::encode`'s `len` closure and `to_le_bytes` appends
+  become `Put` (same bytes, so the same `blob_key`s). Also justifies the thread's empty reused
+  buffer for the hot lint. `blaze-codegen` already depends on `blaze-format`.
+- `blaze-engine/src/manifest.rs`: `Encoder` and `Decoder` are deleted for `Put` and `Reader`
+  (`?` through `.ok()`, since `decode` returns `Option`). Two helpers stay, for the tag-then-bytes
+  option. Counts are now bounded by what is left (`count_u64(1)`); before, they were unbounded
+  but harmless. Same bytes. `blaze-engine/Cargo.toml` gains `blaze-format.workspace = true`
+  (`blaze-format` depends on nothing of the engine's).
+- Kept on purpose: `blaze-engine/src/lib.rs`'s `metadata_hash` (one fixed-offset `u64` of an
+  rmeta header), `link/split.rs` and `frozen.rs` (random-access words of `.eh_frame` and a
+  2-part split, not cursors), and `relocs.rs`'s 16-byte row (a fixed layout).
+
+```diff
+--- a/crates/blaze-codegen/src/blob.rs
++++ b/crates/blaze-codegen/src/blob.rs
+@@ -3,7 +3,10 @@
+ //! what is left and every tag against what it can be, so bytes that are not a template are an
+ //! error, never a panic or an allocation of what a length claims.
+ 
+-use blaze_format::SpanRef;
++use blaze_format::{
++    SpanRef,
++    cursor::{self, Put, Reader, Wanted},
++};
+ use blaze_ids::ContentId;
+ use blaze_items::CodeHash;
+ 
+@@ -30,145 +33,130 @@
+     }
+ }
+ 
+-struct Out(Vec<u8>);
+-
+-impl Out {
+-    fn u8(&mut self, it: u8) {
+-        self.0.push(it);
++impl From<cursor::Error> for BlobError {
++    fn from(error: cursor::Error) -> BlobError {
++        let what = match error.wanted {
++            Wanted::Bytes { .. } => "ends early",
++            Wanted::Count { .. } => "a count longer than what is left",
++            Wanted::End { .. } => "bytes after the end",
++            _ => error.as_str(),
++        };
++        BlobError { at: error.at, what }
+     }
++}
+ 
+-    fn u32(&mut self, it: u32) {
+-        self.0.extend_from_slice(&it.to_le_bytes());
+-    }
++fn put_len(out: &mut Vec<u8>, len: usize) {
++    out.put_u32(u32::try_from(len).expect("a template's parts are under 4 GiB"));
++}
+ 
+-    fn i64(&mut self, it: i64) {
+-        self.0.extend_from_slice(&it.to_le_bytes());
++/// Rows as their 16 bytes, then each reference, then the wide addends.
++fn put_relocs(out: &mut Vec<u8>, relocs: &Relocs<Ref>) {
++    put_len(out, relocs.len());
++    for row in relocs.rows() {
++        out.put_bytes(&row.to_le_bytes());
+     }
+-
+-    fn id(&mut self, it: &ContentId) {
+-        self.0.extend_from_slice(&it.0);
+-    }
+-
+-    fn len(&mut self, len: usize) {
+-        self.u32(u32::try_from(len).expect("a template's parts are under 4 GiB"));
+-    }
+-
+-    fn bytes(&mut self, it: &[u8]) {
+-        self.len(it.len());
+-        self.0.extend_from_slice(it);
+-    }
+-
+-    /// Rows as their 16 bytes, then each reference, then the wide addends.
+-    fn relocs(&mut self, relocs: &Relocs<Ref>) {
+-        self.len(relocs.len());
+-        for row in relocs.rows() {
+-            self.0.extend_from_slice(&row.to_le_bytes());
+-        }
+-        self.len(relocs.targets().len());
+-        for target in relocs.targets() {
+-            match *target {
+-                Ref::Place(at) => {
+-                    self.u8(0);
+-                    self.u32(at);
+-                }
+-                Ref::Data(at) => {
+-                    self.u8(1);
+-                    self.u32(at);
+-                }
+-                Ref::Position(SpanRef { anchor, index }) => {
+-                    self.u8(2);
+-                    self.id(&anchor);
+-                    self.u32(index);
+-                }
+-                Ref::Extern(at) => {
+-                    self.u8(3);
+-                    self.u32(at);
+-                }
+-                Ref::Coverage(array) => {
+-                    self.u8(4);
+-                    self.u32(array);
+-                }
++    put_len(out, relocs.targets().len());
++    for target in relocs.targets() {
++        match *target {
++            Ref::Place(at) => {
++                out.put_u8(0);
++                out.put_u32(at);
+             }
++            Ref::Data(at) => {
++                out.put_u8(1);
++                out.put_u32(at);
++            }
++            Ref::Position(SpanRef { anchor, index }) => {
++                out.put_u8(2);
++                out.put_bytes(&anchor.0);
++                out.put_u32(index);
++            }
++            Ref::Extern(at) => {
++                out.put_u8(3);
++                out.put_u32(at);
++            }
++            Ref::Coverage(array) => {
++                out.put_u8(4);
++                out.put_u32(array);
++            }
+         }
+-        self.len(relocs.wide().len());
+-        for &(row, addend) in relocs.wide() {
+-            self.u32(row);
+-            self.i64(addend);
+-        }
+     }
+-
+-    fn data(&mut self, data: &[TemplateData]) {
+-        self.len(data.len());
+-        for it in data {
+-            self.u32(it.align);
+-            self.bytes(&it.bytes);
+-            self.relocs(&it.relocs);
+-        }
++    put_len(out, relocs.wide().len());
++    for &(row, addend) in relocs.wide() {
++        out.put_u32(row);
++        out.put_i64(addend);
+     }
++}
+ 
+-    fn index(&mut self, it: Option<u32>) {
+-        match it {
+-            Some(at) => {
+-                self.u8(1);
+-                self.u32(at);
+-            }
+-            None => self.u8(0),
+-        }
++fn put_data(out: &mut Vec<u8>, data: &[TemplateData]) {
++    put_len(out, data.len());
++    for it in data {
++        out.put_u32(it.align);
++        out.put_bytes_u32(&it.bytes);
++        put_relocs(out, &it.relocs);
+     }
++}
+ 
+-    fn unwind(&mut self, unwind: Option<&TemplateUnwind>) {
+-        match unwind {
+-            None => self.u8(0),
+-            Some(TemplateUnwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda }) => {
+-                self.u8(1);
+-                self.u32(*code_align);
+-                self.0.extend_from_slice(&data_align.to_le_bytes());
+-                self.0.extend_from_slice(&return_address.to_le_bytes());
+-                self.bytes(cie);
+-                self.bytes(fde);
+-                self.index(*personality);
+-                self.index(*lsda);
+-            }
+-            Some(TemplateUnwind::Windows { info, handler, lsda }) => {
+-                self.u8(2);
+-                self.bytes(info);
+-                self.index(*handler);
+-                self.index(*lsda);
+-            }
++fn put_index(out: &mut Vec<u8>, it: Option<u32>) {
++    match it {
++        Some(at) => {
++            out.put_u8(1);
++            out.put_u32(at);
+         }
++        None => out.put_u8(0),
+     }
++}
+ 
+-    fn lines(&mut self, lines: &[Line]) {
+-        self.len(lines.len());
+-        for line in lines {
+-            self.u32(line.at);
+-            self.id(&line.span.anchor);
+-            self.u32(line.span.index);
++fn put_unwind(out: &mut Vec<u8>, unwind: Option<&TemplateUnwind>) {
++    match unwind {
++        None => out.put_u8(0),
++        Some(TemplateUnwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda }) => {
++            out.put_u8(1);
++            out.put_u32(*code_align);
++            out.put_i32(*data_align);
++            out.put_u16(*return_address);
++            out.put_bytes_u32(cie);
++            out.put_bytes_u32(fde);
++            put_index(out, *personality);
++            put_index(out, *lsda);
+         }
++        Some(TemplateUnwind::Windows { info, handler, lsda }) => {
++            out.put_u8(2);
++            out.put_bytes_u32(info);
++            put_index(out, *handler);
++            put_index(out, *lsda);
++        }
+     }
++}
+ 
+-    fn coverage(&mut self, covered: Option<&Covered>) {
+-        let Some(Covered { counters, flags, guards, pcs }) = covered else {
+-            self.u8(0);
+-            return;
+-        };
+-        self.u8(1);
+-        self.u32(*counters);
+-        self.u32(*flags);
+-        self.u32(*guards);
+-        self.len(pcs.len());
+-        for (at, pc_flags) in pcs {
+-            self.u32(*at);
+-            self.0.extend_from_slice(&pc_flags.to_le_bytes());
+-        }
++fn put_lines(out: &mut Vec<u8>, lines: &[Line]) {
++    put_len(out, lines.len());
++    for line in lines {
++        out.put_u32(line.at);
++        out.put_bytes(&line.span.anchor.0);
++        out.put_u32(line.span.index);
+     }
+ }
+ 
+-struct In<'a> {
+-    bytes: &'a [u8],
+-    at: usize,
++fn put_coverage(out: &mut Vec<u8>, covered: Option<&Covered>) {
++    let Some(Covered { counters, flags, guards, pcs }) = covered else {
++        out.put_u8(0);
++        return;
++    };
++    out.put_u8(1);
++    out.put_u32(*counters);
++    out.put_u32(*flags);
++    out.put_u32(*guards);
++    put_len(out, pcs.len());
++    for (at, pc_flags) in pcs {
++        out.put_u32(*at);
++        out.put_u64(*pc_flags);
++    }
+ }
+ 
++/// A template's fields read off a [`Reader`], each tag checked against what it can be.
++struct In<'a>(Reader<'a>);
++
+ /// The bytes of one relocation row, and the least one reference and one data object take:
+ /// what bounds a count.
+ const RELOC_BYTES: usize = 16;
+@@ -177,85 +165,57 @@
+ 
+ impl<'a> In<'a> {
+     fn fail<T>(&self, what: &'static str) -> Result<T, BlobError> {
+-        Err(BlobError { at: self.at, what })
++        Err(BlobError { at: self.0.at(), what })
+     }
+ 
+-    fn take(&mut self, len: usize) -> Result<&'a [u8], BlobError> {
+-        match self.bytes.get(self.at..).and_then(|rest| rest.get(..len)) {
+-            Some(it) => {
+-                self.at += len;
+-                Ok(it)
+-            }
+-            None => self.fail("ends early"),
+-        }
+-    }
+-
+-    fn u8(&mut self) -> Result<u8, BlobError> {
+-        Ok(self.take(1)?[0])
+-    }
+-
+-    fn u32(&mut self) -> Result<u32, BlobError> {
+-        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
+-    }
+-
+-    fn i64(&mut self) -> Result<i64, BlobError> {
+-        Ok(i64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
+-    }
+-
+     fn id(&mut self) -> Result<ContentId, BlobError> {
+-        Ok(ContentId(self.take(32)?.try_into().expect("32 bytes")))
+-    }
+-
+-    /// A count of things at least `each` bytes long, checked against what is left.
+-    fn count(&mut self, each: usize) -> Result<usize, BlobError> {
+-        let count = self.u32()? as usize;
+-        match count.checked_mul(each) {
+-            Some(need) if need <= self.bytes.len() - self.at => Ok(count),
+-            _ => self.fail("a count longer than what is left"),
+-        }
++        Ok(ContentId(*self.0.array()?))
+     }
+ 
++    /// A `u32` length, then that many bytes, copied: a length past what is left is a count
++    /// longer than what is left.
+     fn bytes(&mut self) -> Result<Vec<u8>, BlobError> {
+-        let len = self.count(1)?;
+-        Ok(self.take(len)?.to_vec())
++        let len = self.0.count_u32(1)?;
++        Ok(self.0.take(len)?.to_vec()) // alloc: the template owns its bytes
+     }
+ 
+     fn relocs(&mut self) -> Result<Relocs<Ref>, BlobError> {
+-        let count = self.count(RELOC_BYTES)?;
++        let count = self.0.count_u32(RELOC_BYTES)?;
+         let mut rows = Vec::with_capacity(count);
+         for _ in 0..count {
+-            let row = self.take(RELOC_BYTES)?.try_into().expect("a row's bytes");
+-            let Some(row) = Reloc::from_le_bytes(row) else { return self.fail("no such relocation kind, or padding") };
++            let Some(row) = Reloc::from_le_bytes(*self.0.array::<RELOC_BYTES>()?) else {
++                return self.fail("no such relocation kind, or padding");
++            };
+             rows.push(row);
+         }
+-        let count = self.count(REF_BYTES)?;
++        let count = self.0.count_u32(REF_BYTES)?;
+         let mut targets = Vec::with_capacity(count);
+         for _ in 0..count {
+-            targets.push(match self.u8()? {
+-                0 => Ref::Place(self.u32()?),
+-                1 => Ref::Data(self.u32()?),
+-                2 => Ref::Position(SpanRef { anchor: self.id()?, index: self.u32()? }),
+-                3 => Ref::Extern(self.u32()?),
+-                4 => match self.u32()? {
++            targets.push(match self.0.u8()? {
++                0 => Ref::Place(self.0.u32()?),
++                1 => Ref::Data(self.0.u32()?),
++                2 => Ref::Position(SpanRef { anchor: self.id()?, index: self.0.u32()? }),
++                3 => Ref::Extern(self.0.u32()?),
++                4 => match self.0.u32()? {
+                     array if array < Covered::ARRAYS => Ref::Coverage(array),
+                     _ => return self.fail("no such coverage array"),
+                 },
+                 _ => return self.fail("no such reference"),
+             });
+         }
+-        let count = self.count(4 + 8)?;
++        let count = self.0.count_u32(4 + 8)?;
+         let mut wide = Vec::with_capacity(count);
+         for _ in 0..count {
+-            wide.push((self.u32()?, self.i64()?));
++            wide.push((self.0.u32()?, self.0.i64()?));
+         }
+-        Relocs::from_parts(rows, targets, wide).map_err(|what| BlobError { at: self.at, what })
++        Relocs::from_parts(rows, targets, wide).map_err(|what| BlobError { at: self.0.at(), what })
+     }
+ 
+     fn data(&mut self) -> Result<Vec<TemplateData>, BlobError> {
+-        let count = self.count(DATA_BYTES)?;
++        let count = self.0.count_u32(DATA_BYTES)?;
+         let mut data = Vec::with_capacity(count);
+         for _ in 0..count {
+-            let align = self.u32()?;
++            let align = self.0.u32()?;
+             let bytes = self.bytes()?;
+             let relocs = self.relocs()?;
+             data.push(TemplateData { align, bytes, relocs });
+@@ -264,7 +224,7 @@
+     }
+ 
+     fn bool(&mut self) -> Result<bool, BlobError> {
+-        match self.u8()? {
++        match self.0.u8()? {
+             0 => Ok(false),
+             1 => Ok(true),
+             _ => self.fail("not a bool"),
+@@ -273,18 +233,18 @@
+ 
+     fn index(&mut self) -> Result<Option<u32>, BlobError> {
+         Ok(match self.bool()? {
+-            true => Some(self.u32()?),
++            true => Some(self.0.u32()?),
+             false => None,
+         })
+     }
+ 
+     fn unwind(&mut self) -> Result<Option<TemplateUnwind>, BlobError> {
+-        Ok(match self.u8()? {
++        Ok(match self.0.u8()? {
+             0 => None,
+             1 => Some(TemplateUnwind::Dwarf {
+-                code_align: self.u32()?,
+-                data_align: i32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")),
+-                return_address: u16::from_le_bytes(self.take(2)?.try_into().expect("two bytes")),
++                code_align: self.0.u32()?,
++                data_align: self.0.i32()?,
++                return_address: self.0.u16()?,
+                 cie: self.bytes()?,
+                 fde: self.bytes()?,
+                 personality: self.index()?,
+@@ -296,11 +256,11 @@
+     }
+ 
+     fn lines(&mut self) -> Result<Vec<Line>, BlobError> {
+-        let count = self.count(4 + 32 + 4)?;
++        let count = self.0.count_u32(4 + 32 + 4)?;
+         let mut lines = Vec::with_capacity(count);
+         for _ in 0..count {
+-            let at = self.u32()?;
+-            lines.push(Line { at, span: SpanRef { anchor: self.id()?, index: self.u32()? } });
++            let at = self.0.u32()?;
++            lines.push(Line { at, span: SpanRef { anchor: self.id()?, index: self.0.u32()? } });
+         }
+         Ok(lines)
+     }
+@@ -309,73 +269,70 @@
+         if !self.bool()? {
+             return Ok(None);
+         }
+-        let (counters, flags, guards) = (self.u32()?, self.u32()?, self.u32()?);
+-        let count = self.count(4 + 8)?;
++        let (counters, flags, guards) = (self.0.u32()?, self.0.u32()?, self.0.u32()?);
++        let count = self.0.count_u32(4 + 8)?;
+         let mut pcs = Vec::with_capacity(count);
+         for _ in 0..count {
+-            let at = self.u32()?;
+-            pcs.push((at, u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes"))));
++            let at = self.0.u32()?;
++            pcs.push((at, self.0.u64()?));
+         }
+         Ok(Some(Covered { counters, flags, guards, pcs }))
+     }
+ 
+     fn magic(&mut self, magic: [u8; 4]) -> Result<(), BlobError> {
+-        if self.take(4)? != magic {
++        if *self.0.array::<4>()? != magic {
+             return self.fail("another kind of blob, or another version of this one");
+         }
+         Ok(())
+     }
+ 
+     fn end(&self) -> Result<(), BlobError> {
+-        if self.at != self.bytes.len() {
+-            return self.fail("bytes after the end");
+-        }
+-        Ok(())
++        Ok(self.0.finish()?)
+     }
+ }
+ 
+ pub fn encode(template: &Template) -> Vec<u8> {
+-    let mut out = Out(Vec::with_capacity(64 + template.code.len()));
+-    out.0.extend_from_slice(&TEMPLATE_MAGIC);
+-    out.u8(arch_tag(template.arch));
+-    out.u32(template.align);
+-    out.bytes(&template.code);
+-    out.relocs(&template.relocs);
+-    out.data(&template.data);
+-    out.len(template.inlined.len());
++    let mut out = Vec::with_capacity(64 + template.code.len());
++    out.put_bytes(&TEMPLATE_MAGIC);
++    out.put_u8(arch_tag(template.arch));
++    out.put_u32(template.align);
++    out.put_bytes_u32(&template.code);
++    put_relocs(&mut out, &template.relocs);
++    put_data(&mut out, &template.data);
++    put_len(&mut out, template.inlined.len());
+     for code in &template.inlined {
+-        out.id(&code.0);
++        out.put_bytes(&code.0.0);
+     }
+     match &template.side {
+         Some(side) => {
+-            out.u8(1);
+-            out.id(side);
++            out.put_u8(1);
++            out.put_bytes(&side.0);
+         }
+-        None => out.u8(0),
++        None => out.put_u8(0),
+     }
+-    out.unwind(template.unwind.as_ref());
+-    out.lines(&template.lines);
+-    out.u32(template.refs);
+-    out.len(template.externs.len());
++    put_unwind(&mut out, template.unwind.as_ref());
++    put_lines(&mut out, &template.lines);
++    out.put_u32(template.refs);
++    put_len(&mut out, template.externs.len());
+     for name in &template.externs {
+-        out.bytes(name.as_bytes());
++        out.put_bytes_u32(name.as_bytes());
+     }
+-    out.coverage(template.coverage.as_ref());
+-    out.0
++    put_coverage(&mut out, template.coverage.as_ref());
++    out
+ }
+ 
+ pub fn decode(bytes: &[u8]) -> Result<Template, BlobError> {
+-    let mut input = In { bytes, at: 0 };
++    let mut input = In(Reader::new(bytes));
+     input.magic(TEMPLATE_MAGIC)?;
+-    let Some(arch) = arch_of(input.u8()?) else { return input.fail("no such architecture") };
+-    let align = input.u32()?;
++    let Some(arch) = arch_of(input.0.u8()?) else { return input.fail("no such architecture") };
++    let align = input.0.u32()?;
+     if !align.is_power_of_two() {
+         return input.fail("an alignment that is not a power of two");
+     }
+     let code = input.bytes()?;
+     let relocs = input.relocs()?;
+     let data = input.data()?;
+-    let count = input.count(32)?;
++    let count = input.0.count_u32(32)?;
+     let inlined = (0..count).map(|_| input.id().map(CodeHash)).collect::<Result<_, _>>()?;
+     let side = match input.bool()? {
+         true => Some(input.id()?),
+@@ -383,10 +340,11 @@
+     };
+     let unwind = input.unwind()?;
+     let lines = input.lines()?;
+-    let refs = input.u32()?;
+-    let count = input.count(4)?;
++    let refs = input.0.u32()?;
++    let count = input.0.count_u32(4)?;
+     let mut externs = Vec::with_capacity(count);
+     for _ in 0..count {
++        // alloc: the template owns its names, moved out of the bytes read for them
+         match String::from_utf8(input.bytes()?) {
+             Ok(name) => externs.push(name),
+             Err(_) => return input.fail("a symbol name that is not UTF-8"),
+@@ -398,57 +356,58 @@
+ }
+ 
+ pub fn encode_static(template: &StaticTemplate) -> Vec<u8> {
+-    let mut out = Out(Vec::with_capacity(64));
+-    out.0.extend_from_slice(&STATIC_MAGIC);
+-    out.u32(template.align);
++    let mut out = Vec::with_capacity(64);
++    out.put_bytes(&STATIC_MAGIC);
++    out.put_u32(template.align);
+     match &template.init {
+         TemplateInit::Bytes { bytes, relocs } => {
+-            out.u8(0);
+-            out.bytes(bytes);
+-            out.relocs(relocs);
++            out.put_u8(0);
++            out.put_bytes_u32(bytes);
++            put_relocs(&mut out, relocs);
+         }
+         TemplateInit::Zeroed { size } => {
+-            out.u8(1);
+-            out.0.extend_from_slice(&size.to_le_bytes());
++            out.put_u8(1);
++            out.put_u64(*size);
+         }
+     }
+-    out.data(&template.data);
+-    out.u8(template.mutable as u8);
+-    out.u8(template.thread_local as u8);
++    put_data(&mut out, &template.data);
++    out.put_u8(template.mutable as u8);
++    out.put_u8(template.thread_local as u8);
+     match &template.section {
+         Some(section) => {
+-            out.u8(1);
+-            out.bytes(section.as_bytes());
++            out.put_u8(1);
++            out.put_bytes_u32(section.as_bytes());
+         }
+-        None => out.u8(0),
++        None => out.put_u8(0),
+     }
+-    out.u32(template.refs);
+-    out.0
++    out.put_u32(template.refs);
++    out
+ }
+ 
+ pub fn decode_static(bytes: &[u8]) -> Result<StaticTemplate, BlobError> {
+-    let mut input = In { bytes, at: 0 };
++    let mut input = In(Reader::new(bytes));
+     input.magic(STATIC_MAGIC)?;
+-    let align = input.u32()?;
++    let align = input.0.u32()?;
+     if !align.is_power_of_two() {
+         return input.fail("an alignment that is not a power of two");
+     }
+-    let init = match input.u8()? {
++    let init = match input.0.u8()? {
+         0 => TemplateInit::Bytes { bytes: input.bytes()?, relocs: input.relocs()? },
+-        1 => TemplateInit::Zeroed { size: u64::from_le_bytes(input.take(8)?.try_into().expect("eight bytes")) },
++        1 => TemplateInit::Zeroed { size: input.0.u64()? },
+         _ => return input.fail("no such initializer"),
+     };
+     let data = input.data()?;
+     let mutable = input.bool()?;
+     let thread_local = input.bool()?;
+     let section = match input.bool()? {
++        // alloc: the template owns its section name, moved out of the bytes read for it
+         true => match String::from_utf8(input.bytes()?) {
+             Ok(it) => Some(it),
+             Err(_) => return input.fail("a section name that is not UTF-8"),
+         },
+         false => None,
+     };
+-    let refs = input.u32()?;
++    let refs = input.0.u32()?;
+     input.end()?;
+     Ok(StaticTemplate { align, init, data, mutable, thread_local, section, refs })
+ }
+@@ -458,59 +417,63 @@
+ /// What a function is with its constants masked (#1292), or that it can't be folded: kept per
+ /// instance, so a warm build groups without building any IR.
+ pub fn encode_masked(masked: Option<&Masked>) -> Vec<u8> {
+-    let mut out = Out(MASKED_MAGIC.to_vec());
+-    let Some(masked) = masked else {
+-        out.u8(0);
+-        return out.0;
++    // The magic, the tag, the shape and its length, the size, the count, and at most 18 bytes
++    // a constant.
++    let most = masked.map_or(0, |it| it.shape.len() + 18 * it.constants.len());
++    let mut out = Vec::with_capacity(MASKED_MAGIC.len() + 1 + 4 + 4 + 4 + most);
++    out.put_bytes(&MASKED_MAGIC);
++    let Some(masked) = masked else {
++        out.put_u8(0);
++        return out;
+     };
+-    out.u8(1);
+-    out.bytes(&masked.shape);
+-    out.u32(masked.size);
+-    out.len(masked.constants.len());
++    out.put_u8(1);
++    out.put_bytes_u32(&masked.shape);
++    out.put_u32(masked.size);
++    put_len(&mut out, masked.constants.len());
+     for constant in &masked.constants {
+         match *constant {
+             Constant::Int { bits, value } => {
+-                out.u8(0);
+-                out.u8(bits);
+-                out.0.extend_from_slice(&value.to_le_bytes());
++                out.put_u8(0);
++                out.put_u8(bits);
++                out.put_u128(value);
+             }
+             Constant::F32(bits) => {
+-                out.u8(1);
+-                out.u32(bits);
++                out.put_u8(1);
++                out.put_u32(bits);
+             }
+             Constant::F64(bits) => {
+-                out.u8(2);
+-                out.0.extend_from_slice(&bits.to_le_bytes());
++                out.put_u8(2);
++                out.put_u64(bits);
+             }
+             Constant::Place(at) => {
+-                out.u8(3);
+-                out.u32(at);
++                out.put_u8(3);
++                out.put_u32(at);
+             }
+         }
+     }
+-    out.0
++    out
+ }
+ 
+ pub fn decode_masked(bytes: &[u8]) -> Result<Option<Masked>, BlobError> {
+-    let mut input = In { bytes, at: 0 };
++    let mut input = In(Reader::new(bytes));
+     input.magic(MASKED_MAGIC)?;
+     if !input.bool()? {
+         input.end()?;
+         return Ok(None);
+     }
+     let shape = input.bytes()?;
+-    let size = input.u32()?;
+-    let count = input.count(5)?;
++    let size = input.0.u32()?;
++    let count = input.0.count_u32(5)?;
+     let mut constants = Vec::with_capacity(count);
+     for _ in 0..count {
+-        constants.push(match input.u8()? {
++        constants.push(match input.0.u8()? {
+             0 => {
+-                let bits = input.u8()?;
+-                Constant::Int { bits, value: u128::from_le_bytes(input.take(16)?.try_into().expect("16 bytes")) }
++                let bits = input.0.u8()?;
++                Constant::Int { bits, value: input.0.u128()? }
+             }
+-            1 => Constant::F32(input.u32()?),
+-            2 => Constant::F64(u64::from_le_bytes(input.take(8)?.try_into().expect("8 bytes"))),
+-            3 => Constant::Place(input.u32()?),
++            1 => Constant::F32(input.0.u32()?),
++            2 => Constant::F64(input.0.u64()?),
++            3 => Constant::Place(input.0.u32()?),
+             _ => return input.fail("no such constant"),
+         });
+     }
+--- a/crates/blaze-codegen/src/summary.rs
++++ b/crates/blaze-codegen/src/summary.rs
+@@ -12,6 +12,7 @@
+ 
+ use std::cell::RefCell;
+ 
++use blaze_format::cursor::Put;
+ use blaze_ids::{ContentId, Hasher};
+ use serde::{Deserialize, Serialize};
+ 
+@@ -43,10 +44,10 @@
+     /// Its bytes in [`Imports::blob_key`]: a tag, the width and the value, 10 in all.
+     fn encode(self, out: &mut Vec<u8>) {
+         match self {
+-            Arg::Unknown => out.extend_from_slice(&[0; 10]),
++            Arg::Unknown => out.put_bytes(&[0; 10]),
+             Arg::Int { bits, value } => {
+-                out.extend_from_slice(&[1, bits]);
+-                out.extend_from_slice(&value.to_le_bytes());
++                out.put_bytes(&[1, bits]);
++                out.put_u64(value);
+             }
+         }
+     }
+@@ -151,7 +152,7 @@
+     /// every field laid out in a buffer the thread reuses.
+     pub fn blob_key(&self, key: InstanceKey) -> ContentId {
+         thread_local! {
+-            static BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
++            static BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) }; // alloc: empty, the buffer the thread reuses
+         }
+         BYTES.with_borrow_mut(|bytes| {
+             bytes.clear();
+@@ -165,29 +166,28 @@
+     /// Every field, each list as its length then its elements at fixed widths, little-endian:
+     /// two different `Imports` never give the same bytes.
+     fn encode(&self, out: &mut Vec<u8>) {
+-        let len = |n: usize| (n as u32).to_le_bytes();
+         let dead: usize = self.dead.iter().map(|it| 36 + 4 * it.1.len()).sum();
+         out.reserve(16 + 32 * self.imported.len() + 14 * self.constants.len() + 33 * self.callees.len() + dead);
+-        out.extend_from_slice(&len(self.imported.len()));
++        out.put_u32(self.imported.len() as u32);
+         for key in &self.imported {
+-            out.extend_from_slice(&key.0.0);
++            out.put_bytes(&key.0.0);
+         }
+-        out.extend_from_slice(&len(self.constants.len()));
++        out.put_u32(self.constants.len() as u32);
+         for &(param, arg) in &self.constants {
+-            out.extend_from_slice(&param.to_le_bytes());
++            out.put_u32(param);
+             arg.encode(out);
+         }
+-        out.extend_from_slice(&len(self.callees.len()));
++        out.put_u32(self.callees.len() as u32);
+         for (key, attrs) in &self.callees {
+-            out.extend_from_slice(&key.0.0);
+-            out.push(attrs.bits());
++            out.put_bytes(&key.0.0);
++            out.put_u8(attrs.bits());
+         }
+-        out.extend_from_slice(&len(self.dead.len()));
++        out.put_u32(self.dead.len() as u32);
+         for (key, params) in &self.dead {
+-            out.extend_from_slice(&key.0.0);
+-            out.extend_from_slice(&len(params.len()));
++            out.put_bytes(&key.0.0);
++            out.put_u32(params.len() as u32);
+             for param in params {
+-                out.extend_from_slice(&param.to_le_bytes());
++                out.put_u32(*param);
+             }
+         }
+     }
+--- a/crates/blaze-engine/Cargo.toml
++++ b/crates/blaze-engine/Cargo.toml
+@@ -76,6 +76,7 @@
+ blaze-macro-wasm.workspace = true
+ blaze-store.workspace = true
+ blaze-doc.workspace = true
++blaze-format.workspace = true
+ blaze-lints.workspace = true
+ blaze-graph.workspace = true
+ blaze-ids.workspace = true
+--- a/crates/blaze-engine/src/manifest.rs
++++ b/crates/blaze-engine/src/manifest.rs
+@@ -25,6 +25,7 @@
+     time::{Duration, Instant},
+ };
+ 
++use blaze_format::cursor::{Put, Reader};
+ use ide_db::{RootDatabase, base_db::Crate};
+ use rustc_hash::FxHashMap;
+ use sha2::{Digest, Sha256};
+@@ -291,111 +292,74 @@
+ }
+ 
+ const MAGIC: &[u8] = b"blaze manifest 1\n";
+-
+-struct Encoder(Vec<u8>);
+-
+-impl Encoder {
+-    fn bytes(&mut self, bytes: &[u8]) {
+-        self.0.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+-        self.0.extend_from_slice(bytes);
+-    }
+ 
+-    fn count(&mut self, count: usize) {
+-        self.0.extend_from_slice(&(count as u64).to_le_bytes());
+-    }
+-
+-    fn option(&mut self, bytes: Option<&[u8]>) {
+-        match bytes {
+-            Some(bytes) => {
+-                self.0.push(1);
+-                self.bytes(bytes);
+-            }
+-            None => self.0.push(0),
++/// A tag, then the bytes when there are some.
++fn put_option(out: &mut Vec<u8>, bytes: Option<&[u8]>) {
++    match bytes {
++        Some(bytes) => {
++            out.put_u8(1);
++            out.put_bytes_u64(bytes);
+         }
++        None => out.put_u8(0),
+     }
+ }
+ 
+-struct Decoder<'a>(&'a [u8]);
+-
+-impl<'a> Decoder<'a> {
+-    fn count(&mut self) -> Option<usize> {
+-        let (it, rest) = self.0.split_first_chunk::<8>()?;
+-        self.0 = rest;
+-        usize::try_from(u64::from_le_bytes(*it)).ok()
+-    }
+-
+-    fn bytes(&mut self) -> Option<&'a [u8]> {
+-        let len = self.count()?;
+-        let (it, rest) = self.0.split_at_checked(len)?;
+-        self.0 = rest;
+-        Some(it)
+-    }
+-
+-    fn string(&mut self) -> Option<String> {
+-        String::from_utf8(self.bytes()?.to_vec()).ok()
+-    }
+-
+-    fn hash(&mut self) -> Option<Hash> {
+-        self.bytes()?.try_into().ok()
+-    }
+-
+-    fn option(&mut self) -> Option<Option<&'a [u8]>> {
+-        let (&tag, rest) = self.0.split_first()?;
+-        self.0 = rest;
+-        match tag {
+-            0 => Some(None),
+-            1 => Some(Some(self.bytes()?)),
+-            _ => None,
+-        }
++fn option<'a>(input: &mut Reader<'a>) -> Option<Option<&'a [u8]>> {
++    match input.u8().ok()? {
++        0 => Some(None),
++        1 => Some(Some(input.bytes_u64().ok()?)),
++        _ => None,
+     }
+ }
+ 
+ impl Manifest {
+     fn encode(&self) -> Vec<u8> {
+-        let mut out = Encoder(MAGIC.to_vec());
+-        out.count(self.reads.vars.len());
++        let mut out = MAGIC.to_vec();
++        out.put_u64(self.reads.vars.len() as u64);
+         for (name, value) in &self.reads.vars {
+-            out.bytes(name.as_bytes());
+-            out.option(value.as_deref().map(str::as_bytes));
++            out.put_bytes_u64(name.as_bytes());
++            put_option(&mut out, value.as_deref().map(str::as_bytes));
+         }
+-        out.count(self.reads.files.len());
++        out.put_u64(self.reads.files.len() as u64);
+         for (path, hash) in &self.reads.files {
+-            out.bytes(path.as_bytes());
+-            out.option(hash.as_ref().map(|it| &it[..]));
++            out.put_bytes_u64(path.as_bytes());
++            put_option(&mut out, hash.as_ref().map(|it| &it[..]));
+         }
+-        out.count(self.files.len());
++        out.put_u64(self.files.len() as u64);
+         for file in &self.files {
+-            out.bytes(file.path.as_bytes());
+-            out.bytes(&file.content);
++            out.put_bytes_u64(file.path.as_bytes());
++            out.put_bytes_u64(&file.content);
+         }
+-        out.0
++        out
+     }
+ 
++    /// Each list's count is checked against the bytes left at one byte an entry.
+     fn decode(bytes: &[u8]) -> Option<Manifest> {
+-        let mut input = Decoder(bytes.strip_prefix(MAGIC)?);
++        let mut input = Reader::new(bytes.strip_prefix(MAGIC)?);
+         let mut vars = Vec::new();
+-        for _ in 0..input.count()? {
+-            let name = input.string()?;
+-            let value = match input.option()? {
+-                Some(it) => Some(String::from_utf8(it.to_vec()).ok()?),
++        for _ in 0..input.count_u64(1).ok()? {
++            let name = input.str_u64().ok()?.to_owned();
++            let value = match option(&mut input)? {
++                Some(it) => Some(std::str::from_utf8(it).ok()?.to_owned()),
+                 None => None,
+             };
+             vars.push((name, value));
+         }
+         let mut files = Vec::new();
+-        for _ in 0..input.count()? {
+-            let path = input.string()?;
+-            let hash = match input.option()? {
++        for _ in 0..input.count_u64(1).ok()? {
++            let path = input.str_u64().ok()?.to_owned();
++            let hash = match option(&mut input)? {
+                 Some(it) => Some(it.try_into().ok()?),
+                 None => None,
+             };
+             files.push((path, hash));
+         }
+         let mut written = Vec::new();
+-        for _ in 0..input.count()? {
+-            written.push(Written { path: input.string()?, content: input.hash()? });
++        for _ in 0..input.count_u64(1).ok()? {
++            let path = input.str_u64().ok()?.to_owned();
++            written.push(Written { path, content: input.bytes_u64().ok()?.try_into().ok()? });
+         }
+-        input.0.is_empty().then_some(Manifest { reads: Reads { vars, files }, files: written })
++        input.is_done().then_some(Manifest { reads: Reads { vars, files }, files: written })
+     }
+ }
+ 
+```
+
+> applied by codegen-v2 (2026-10-29): the `blaze-codegen` hunks (`blob.rs`, `summary.rs`) applied as written (`git apply --check` clean, hot lint clean on both); the `blaze-engine` hunks (`Cargo.toml`, `manifest.rs`) are codegen-engine's, asked in `codegen-v2.requests.md` "To codegen-engine".
+
+## dedyn: crates/hir-ty-codegen (outside `v2/`): the `dyn` sites (from dedyn-codegen, 2026-10-29)
+
+From `dedyn-codegen` (child of lane `dedyn`, report `/tmp/blaze-lanes/v2-dedyn-codegen.md`). Every
+`dyn` in these files outside tests, by what it becomes. Anchored on code text: the line numbers are
+as of 2026-10-29 21:30 and move. Nothing here changes behavior; the tests named are updated in the
+same item. hot_lint accepts a `// dyn:` on the line or the line above.
+
+### dedyn 1: `unwind.rs`, `unwind/seh.rs`: `dyn Module` becomes `ObjectModule`
+
+`cranelift_module::Module` has one implementation, `cranelift_object::ObjectModule`, and every
+caller passes `ObjectCodegen::module` (`mod.rs` `UnwindContext::new(&mut module)`,
+`self.unwind.name_personality(&mut self.module)`, `.add_function(&mut self.module, id, unwind)`,
+`self.unwind.runtime(&mut self.module, symbol)`). No caller changes.
+
+`unwind.rs`: add `ObjectModule` to the `cranelift_object` import:
+
+```rust
+use cranelift_object::{
+    ObjectModule, ObjectProduct,
+```
+
+and replace each of these lines (keep `use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};`: the methods are `Module`'s):
+
+```rust
+fn personality(module: &mut dyn Module) -> Result<FuncId, String> {
+    pub(super) fn new(module: &mut dyn Module) -> Result<Self, String> {
+    pub(super) fn name_personality(&self, module: &mut dyn Module) -> Result<(), String> {
+        module: &mut dyn Module,          // in `runtime` and in `add_function`
+```
+
+with
+
+```rust
+fn personality(module: &mut ObjectModule) -> Result<FuncId, String> {
+    pub(super) fn new(module: &mut ObjectModule) -> Result<Self, String> {
+    pub(super) fn name_personality(&self, module: &mut ObjectModule) -> Result<(), String> {
+        module: &mut ObjectModule,
+```
+
+`unwind/seh.rs`: the same import (`use cranelift_object::{ ObjectModule, ObjectProduct, object::{..} };`),
+and every `&mut dyn Module` becomes `&mut ObjectModule` (`Tables::add_function`, `Tables::runtime`,
+`Tables::personality`, `Tables::define`, the field `module: &'a mut dyn Module` of `Shim`, which
+becomes `module: &'a mut ObjectModule`), and
+
+```rust
+fn signature(module: &dyn Module, params: &[ir::Type], returns: &[ir::Type]) -> Signature {
+```
+
+becomes
+
+```rust
+fn signature(module: &ObjectModule, params: &[ir::Type], returns: &[ir::Type]) -> Signature {
+```
+
+(`signature(self.module, ..)` in `Shim` and `signature(module, ..)` in `define` coerce `&mut` to `&`
+as before.)
+
+### dedyn 2: `cached.rs`: `links` and `usable` take the resolver, not a predicate
+
+All seven callers pass the same closure, `|symbol| symbols.provides(symbol) && symbols.linked(symbol)`,
+and `usable` memoizes its answer by name alone (`self.usable`), so the predicate must be that one.
+The closure's virtual call goes; the resolver's stays (dedyn 11). No test calls either.
+
+`cached.rs`: add `SymbolResolver` to the `use super::{..}` list, and
+
+```rust
+    /// Whether the program has everything of rustc's that the entry was linked against.
+    pub(super) fn links(&self, defines: &dyn Fn(&str) -> bool) -> bool {
+        let funcs = self.funcs.iter().all(|it| match &it.target {
+```
+
+becomes
+
+```rust
+    /// Whether the program has everything of rustc's that the entry was linked against: what
+    /// `symbols` provides and the executable has.
+    // dyn: the build's one resolver (dedyn 11)
+    pub(super) fn links(&self, symbols: &dyn SymbolResolver) -> bool {
+        let defines = |symbol: &str| symbols.provides(symbol) && symbols.linked(symbol);
+        let funcs = self.funcs.iter().all(|it| match &it.target {
+```
+
+(the body is unchanged: it calls `defines(symbol)`), and
+
+```rust
+    /// Whether there is an entry for `name` and for everything it calls, and what they import
+    /// is in the program, as `defines` tells.
+    pub(super) fn usable(&self, name: &str, defines: &dyn Fn(&str) -> bool) -> bool {
+```
+
+becomes
+
+```rust
+    /// Whether there is an entry for `name` and for everything it calls, and what they import
+    /// is in the program, as [`Entry::links`] tells.
+    // dyn: the build's one resolver (dedyn 11)
+    pub(super) fn usable(&self, name: &str, symbols: &dyn SymbolResolver) -> bool {
+```
+
+with its two `it.links(defines)` becoming `it.links(symbols)` (`links` is on `impl Entry`,
+`usable` on `impl Entries`).
+
+Callers:
+- `mod.rs` (`stable_name` of a root, ~5911):
+  `entries.usable(&name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))` becomes
+  `entries.usable(&name, symbols)`.
+- `mod.rs` (~5960, in `in_parallel(threads, &|_, symbols, _| { .. })`): delete
+  `let usable = |symbol: &str| symbols.provides(symbol) && symbols.linked(symbol);` and
+  `entries.usable(name, &usable)` becomes `entries.usable(name, symbols)`.
+- `mod.rs` (~6309) `entries.usable(name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))`
+  becomes `entries.usable(name, symbols)`.
+- `mod.rs` (~6819) the same; and (~6823) `if !it.links(&|symbol| symbols.provides(symbol) && symbols.linked(symbol)) =>`
+  becomes `if !it.links(symbols) =>`.
+- `units.rs` (~144) `entries.usable(&name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))`
+  becomes `entries.usable(&name, symbols)`; (~614)
+  `entries.usable(&name, &|symbol| {\n symbols.provides(symbol) && symbols.linked(symbol)\n })`
+  becomes `entries.usable(&name, symbols)`.
+
+### dedyn 3: `imports.rs`: `chosen_for` takes the set of instances it has
+
+Its three callers pass "none" (`&|_| false`, twice) or `&|it| defined.contains(it)` over an
+`FxHashSet<Instance>`. An empty `FxHashSet` allocates nothing.
+
+```rust
+pub(super) fn chosen_for(
+    recorder: &mut Recorder<'_>,
+    defined: &dyn Fn(&Instance) -> bool,
+    budget: usize,
+) -> Vec<Import> {
+```
+
+becomes
+
+```rust
+pub(super) fn chosen_for(
+    recorder: &mut Recorder<'_>,
+    defined: &FxHashSet<Instance>,
+    budget: usize,
+) -> Vec<Import> {
+```
+
+and in its body `if !super::tier::shared(db, instance) || defined(instance) {` becomes
+`if !super::tier::shared(db, instance) || defined.contains(instance) {`. Callers:
+- `imports.rs` `tallied(chosen_for(recorder, &|_| false, BUDGET))` becomes
+  `tallied(chosen_for(recorder, &FxHashSet::default(), BUDGET))`.
+- `units.rs` (~195) `imports::chosen_for(&mut recorder, &|_| false, imports::BUDGET)` becomes
+  `imports::chosen_for(&mut recorder, &FxHashSet::default(), imports::BUDGET)` (`units.rs` imports
+  `FxHashSet` already: `let mut defined: FxHashSet<Instance>`).
+- `units.rs` (~755) `imports::chosen_for(&mut recorder, &|it| defined.contains(it), budget)` becomes
+  `imports::chosen_for(&mut recorder, &defined, budget)`.
+
+### dedyn 4: `fncache/dispatch.rs`, `fncache.rs`: `is_cache` is a generic
+
+One closure (`fncache.rs`, `let cache = |id| self.dispatch_cache(id);`), so one instance; nothing
+is copied. Asked per assignment of a function pointer the walk follows.
+
+`fncache/dispatch.rs`: in `loaded_from` and in `loaded`, `is_cache: &dyn Fn(StaticId) -> bool,`
+becomes `is_cache: &impl Fn(StaticId) -> bool,`. `fncache.rs` `fn_from_data`:
+`cache: &dyn Fn(StaticId) -> bool,` becomes `cache: &impl Fn(StaticId) -> bool,`. Callers pass
+`&cache` / `is_cache` as now; `.is_some_and(is_cache)` takes the `&impl Fn` as before.
+
+### dedyn 5: `llvm/release.rs`: `instances` is a generic
+
+One closure in production (`v2/release.rs` `prelinked`, `let instances = |request: u32| ..`) and
+one in the test `the_facts_of_a_function_alone`: one instance of `prelink` and `optimistic`, two
+of `facts` (~60 lines).
+
+In `prelink`, `optimistic`: `instances: &dyn Fn(u32) -> bool,` becomes
+`instances: &impl Fn(u32) -> bool,`; in `facts`:
+
+```rust
+fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: &dyn Fn(u32) -> bool) -> Facts {
+```
+
+becomes
+
+```rust
+fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: &impl Fn(u32) -> bool) -> Facts {
+```
+
+Callers (`&instances`, `facts(&module, function, instances)`, `optimistic(.., instances, ..)`)
+are unchanged.
+
+### dedyn 6: `vtable.rs`: `plain` is a generic
+
+Two callers: `FunctionCx::vtable_layout` (`&|it| self.plain_trait(it)`) and `debuginfo/types.rs`
+(`&|it| vtable::without_lifetimes(interner, it)`): two copies of `VtableLayout::of` and
+`Walk::visit` (~45 lines together).
+
+```rust
+    pub(super) fn of(
+        interner: DbInterner<'db>,
+        trait_ref: TraitRef<'db>,
+        plain: &dyn Fn(TraitRef<'db>) -> TraitRef<'db>,
+    ) -> Self {
+```
+
+becomes
+
+```rust
+    pub(super) fn of(
+        interner: DbInterner<'db>,
+        trait_ref: TraitRef<'db>,
+        plain: &impl Fn(TraitRef<'db>) -> TraitRef<'db>,
+    ) -> Self {
+```
+
+and
+
+```rust
+struct Walk<'a, 'db> {
+    interner: DbInterner<'db>,
+    plain: &'a dyn Fn(TraitRef<'db>) -> TraitRef<'db>,
+```
+
+becomes
+
+```rust
+struct Walk<'a, 'db, P> {
+    interner: DbInterner<'db>,
+    plain: &'a P,
+```
+
+with `impl<'db> Walk<'_, 'db> {` becoming
+`impl<'db, P: Fn(TraitRef<'db>) -> TraitRef<'db>> Walk<'_, 'db, P> {`. (`.map(self.plain)` takes
+the `&P` as before.)
+
+### dedyn 7: `stable.rs`: `declared`'s callbacks and `file_name`'s `named` are generics
+
+`declared` has two callers (`lower_declared` with blaze-engine's `lower` and a no-op `found`;
+`declared_statics` with a no-op `lower` and a pushing `found`): two copies of ~70 lines.
+`lower_declared` has one caller (`blaze-engine` `lower_declared(db, &crates, &lower)`): one copy.
+`file_name` has four closures (`StableNames::file`'s and the three `place_path` ones): four copies
+of ~40 lines. `found` is called per item declared, `named` per file named.
+
+```rust
+pub fn lower_declared(db: &Db, crates: &[Crate], lower: &dyn Fn(&[DefWithBodyId])) {
+```
+becomes
+```rust
+pub fn lower_declared(db: &Db, crates: &[Crate], lower: &impl Fn(&[DefWithBodyId])) {
+```
+
+```rust
+fn declared(
+    db: &Db,
+    crates: &[Crate],
+    lower: &dyn Fn(&[DefWithBodyId]),
+    found: &mut dyn FnMut(Declared),
+) {
+```
+becomes
+```rust
+fn declared(
+    db: &Db,
+    crates: &[Crate],
+    lower: &impl Fn(&[DefWithBodyId]),
+    found: &mut impl FnMut(Declared),
+) {
+```
+
+and in `file_name`, `named: &dyn Fn(Option<String>) -> Option<String>,` becomes
+`named: &impl Fn(Option<String>) -> Option<String>,`. Callers unchanged (`&|_| ()`, `&mut |_| ()`,
+`&mut |it| {..}`, `&named`, `&|path| place_path(symbols, path)`; the recursive
+`file_name(db, symbols, out, file, named)` passes the same type).
+
+### dedyn 8: `patch.rs`: the parts to ask are an `Either`, not a `Box<dyn Iterator>`
+
+Each of `roots_to_ask`, `instances_to_ask`, `hydrated_to_ask` returns one of two iterators; the
+`Box` was one allocation per call. `either` is a dependency already. Add `use either::Either;`.
+In each of the three:
+
+```rust
+    ) -> Box<dyn Iterator<Item = usize> + '_> {
+```
+becomes
+```rust
+    ) -> impl Iterator<Item = usize> + '_ {
+```
+
+and
+- `return Box::new((part..self.compiled.len()).step_by(parts));` becomes
+  `return Either::Left((part..self.compiled.len()).step_by(parts));`
+- `return Box::new((part..self.instances.len()).step_by(parts));` becomes
+  `return Either::Left((part..self.instances.len()).step_by(parts));`
+- `return Box::new((part..self.hydrated.len()).step_by(parts));` becomes
+  `return Either::Left((part..self.hydrated.len()).step_by(parts));`
+- each `Box::new(part_of(asked, part, parts))` becomes `Either::Right(part_of(asked, part, parts))`.
+
+Callers (`for i in self.roots_to_ask(..)` and the two others) are unchanged.
+
+### dedyn 9: `mod.rs`: three closures become concrete
+
+(a) `Spelling::symbol_type`'s `list` takes two iterator types: a method of two instances.
+Delete
+
+```rust
+        let list = |tys: &mut dyn Iterator<Item = Ty<'db>>| {
+            tys.map(|it| self.symbol_type(it)).collect::<Option<Vec<_>>>().map(|it| it.join(", "))
+        };
+```
+
+replace `list(&mut tys.iter())` (twice, the two `TyKind::Tuple` arms) with
+`self.symbol_types(tys.iter())` and `list(&mut sig.inputs().iter().copied())` with
+`self.symbol_types(sig.inputs().iter().copied())`, and add to `impl<'db> Spelling<'_, 'db>`, after
+`symbol_type`:
+
+```rust
+    /// [`Self::symbol_type`] of each of `tys`, between commas.
+    fn symbol_types(&self, tys: impl Iterator<Item = Ty<'db>>) -> Option<String> {
+        tys.map(|it| self.symbol_type(it)).collect::<Option<Vec<_>>>().map(|it| it.join(", "))
+    }
+```
+
+(b) `settled_function`'s `nameless` has one caller (`&nameless` in `settled`): one instance.
+`nameless: &dyn Fn() -> Result<bool>,` becomes `nameless: &impl Fn() -> Result<bool>,`.
+
+(c) The pass counting a body's whole-local mentions (~19611) has one `plain`. Replace
+
+```rust
+    let read = |operand: &Operand, plain: &mut dyn FnMut(&StoredPlace)| {
+        if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
+            plain(place);
+        }
+    };
+```
+
+with
+
+```rust
+    fn read(operand: &Operand, plain: &mut impl FnMut(&StoredPlace)) {
+        if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
+            plain(place);
+        }
+    }
+```
+
+The calls `read(operand, &mut plain)` are unchanged. (If `Operand` there carries a lifetime the
+closure inferred, write it: `fn read(operand: &Operand<'_>, ..)`.)
+
+### dedyn 10: `cranelift`'s `dyn TargetIsa`: kept, at cranelift's API
+
+`Context::compile`, `Context::compile_stencil` and `CompiledCode::create_unwind_info` take
+`&dyn TargetIsa`, and cranelift's backends are private (`X64Backend` is `pub(crate)`), so there is
+nothing concrete to hold; the one ISA is made once per process (`crate::target()`). Insert above
+each of these lines:
+
+```rust
+// dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
+```
+
+(indented as the line): `fragment.rs` `pub(super) isa: &'static dyn TargetIsa,` (both fields),
+`pub(super) fn new(isa: &'static dyn TargetIsa) -> Wants {`, `isa: &'static dyn TargetIsa,` (the
+parameter, ~1412); `debuginfo.rs` `isa: &dyn TargetIsa,` (twice) and
+`fn new(isa: &dyn TargetIsa, directory: &str, variables: bool, apart: Option<String>) -> Self {`;
+`unwind.rs` `pub(super) fn of(isa: &dyn TargetIsa, context: &Context) -> Result<Option<Self>, String> {`.
+
+### dedyn 11: `dyn SymbolResolver`: kept, the v1 resolver chosen once per build
+
+`SymbolResolver` is only on the v1 crate-at-a-time path (`ObjectCodegen`, `Spelling`, `later`,
+`units`, `stable`, `patch`, `type_id`, `settled`, `fncache`); v2 never takes one (`FunctionCx`
+holds a concrete `Recorder`). Its three implementations (`blaze-engine` `Resolver`, `blaze-wasm`
+`names::Resolver` and `Names`, the last two chosen per build at `blaze-wasm/src/lib.rs`
+`let resolver: &dyn SymbolResolver = match host {`) are in crates that depend on this one, so no
+enum here can name them, and a generic would copy `ObjectCodegen` (most of `mod.rs`) three times.
+Each call is a lookup that returns an allocated `String`. Insert above each line below (indented
+as it):
+
+```rust
+// dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
+```
+
+- `fncache.rs`: `symbols: &dyn SymbolResolver,` (~202),
+  `fn compile_ahead(symbols: &dyn SymbolResolver, nodes: &[&Node]) {`
+- `later.rs`: `pub(super) symbols: &'k dyn SymbolResolver,`
+- `mod.rs`: every `symbols: &dyn SymbolResolver,` / `symbols: &'a dyn SymbolResolver,` /
+  `symbols: Option<&dyn SymbolResolver>,` (~792, 826, 1358, 1530, 1603, 1910, 2236, 2932, 2956,
+  2986, 4055, 5497), and the closures `let run = |db: &Db, symbols: &dyn SymbolResolver| {`,
+  `let work = |db: &Db, symbols: &dyn SymbolResolver, _: usize| {` (twice)
+- `patch.rs`: `symbols: &dyn SymbolResolver,` (~1581, 1668, 1800, 2642), `symbols: Option<&dyn SymbolResolver>,` (~2246)
+- `settled.rs`: `symbols: &dyn SymbolResolver,`
+- `stable.rs`: `symbols: &'a dyn SymbolResolver,` (~167, 197), `symbols: &dyn SymbolResolver,`
+  (~873, 981, 997, 1010), `fn place_path(symbols: &dyn SymbolResolver, path: Option<String>) -> Option<String> {`
+- `type_id.rs`: `symbols: &'a dyn SymbolResolver,` (~115, 141)
+- `units.rs`: `symbols: &dyn SymbolResolver,` (~135, 552, 595, 654),
+  `fn add(&mut self, symbols: &dyn SymbolResolver, found: Found, wave: &mut Vec<Kind>) {`,
+  `fn found(&mut self, symbols: &dyn SymbolResolver) {`
+
+And above `pub type ParallelWork<'a> = dyn Fn(&Db, &dyn SymbolResolver, usize) + Sync + 'a;` and
+`fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {`:
+
+```rust
+// dyn: a method of the object-safe `SymbolResolver`, run once per parallel phase of a build
+```
+
+### dedyn 12: the other kept callbacks
+
+Insert above each (indented as it):
+
+- `mod.rs` `compile_or_hold`'s `hold: &dyn Fn() -> bool,` and `compile_ahead`'s
+  `beside: &mut dyn FnMut(&mut Self, Option<&mut Ready<'_>>),`:
+  `// dyn: called once per build`
+- `mod.rs` `pub fn compile_unnamed(db: &Db, unnamed: &Unnamed, done: &dyn Fn() -> bool) {`:
+  `// dyn: blaze-engine's stop signal (itself a `&dyn Fn`), asked once per function compiled`
+- `watch.rs` `pub type Sink = dyn Fn(u32, bool, Vec<Placed>) + Send + Sync;`:
+  `// dyn: the observer blaze-engine installs once per process, told once per batch of functions`
+
+### Tests
+
+No test calls what dedyn 1-3 and 8-9 change. dedyn 5's test `the_facts_of_a_function_alone`
+passes `&instances` as before. Nothing new to dispatch: each is a concrete type or a generic.

@@ -44,7 +44,9 @@ struct Block {
     next: u32,
 }
 
-pub(crate) struct Arena {
+/// Not a bump arena (`blaze_mem::Arena`): ranges of code memory are given back one by one and
+/// reused, so it is a TLSF heap over offsets.
+pub(crate) struct CodeHeap {
     blocks: Vec<Block>,
     /// Indices of `blocks` not in use.
     spare: Vec<u32>,
@@ -78,10 +80,10 @@ fn class_at_least(len: u64) -> (usize, usize) {
     class(rounded)
 }
 
-impl Arena {
-    /// An arena of the `len` bytes from `start`, all free.
-    pub(crate) fn new(start: u64, len: u64) -> Arena {
-        let mut arena = Arena {
+impl CodeHeap {
+    /// A heap of the `len` bytes from `start`, all free.
+    pub(crate) fn new(start: u64, len: u64) -> CodeHeap {
+        let mut arena = CodeHeap {
             blocks: Vec::new(),
             spare: Vec::new(),
             heads: vec![NONE; FIRST * SECOND],
@@ -92,7 +94,7 @@ impl Arena {
             free: 0,
         };
         let start = start.next_multiple_of(GRAIN);
-        let len = len & !(GRAIN - 1);
+        let len = blaze_mem::align::align_down_u64(len, GRAIN);
         if len != 0 {
             arena.insert(start, len);
         }
@@ -141,7 +143,7 @@ impl Arena {
         Some(CodeRange { offset, len })
     }
 
-    /// Gives back `range`, as [`Arena::take`] gave it, merged with free neighbours.
+    /// Gives back `range`, as [`CodeHeap::take`] gave it, merged with free neighbours.
     pub(crate) fn give(&mut self, range: CodeRange) {
         let mut offset = range.offset;
         let mut len = range.len.next_multiple_of(GRAIN);
@@ -294,26 +296,19 @@ mod tests {
         }
     }
 
-    fn rng(state: &mut u64) -> u64 {
-        *state ^= *state << 13;
-        *state ^= *state >> 7;
-        *state ^= *state << 17;
-        *state
-    }
-
     #[test]
     fn matches_a_sorted_free_list() {
         for seed in 1..40u64 {
-            let mut state = seed * 0x2545_f491_4f6c_dd1d;
+            let mut rng = blaze_ids::rng::SplitMix64::new(seed * 0x2545_f491_4f6c_dd1d);
             let start = 0x10000;
             let len = 1 << 20;
-            let mut arena = Arena::new(start, len);
+            let mut arena = CodeHeap::new(start, len);
             let mut model = Model { free: vec![(start, len)] };
             let mut taken: Vec<CodeRange> = Vec::new();
             for _ in 0..2000 {
-                if rng(&mut state) % 3 != 0 || taken.is_empty() {
-                    let want = rng(&mut state) % 4096 + 1;
-                    let align = 1 << (rng(&mut state) % 8 + 4);
+                if !rng.one_in(3) || taken.is_empty() {
+                    let want = rng.below(4096) + 1;
+                    let align = 1 << (rng.below(8) + 4);
                     if let Some(range) = arena.take(want, align) {
                         assert!(range.len >= want && range.offset.is_multiple_of(align));
                         assert!(model.contains(range.offset, range.len), "{range:?} was not free");
@@ -324,7 +319,7 @@ mod tests {
                         assert!(model.free.iter().all(|it| it.1 < need), "a range of {need} was free and not found");
                     }
                 } else {
-                    let index = (rng(&mut state) as usize) % taken.len();
+                    let index = rng.index(taken.len());
                     let range = taken.swap_remove(index);
                     arena.give(range);
                     model.give(range.offset, range.len);

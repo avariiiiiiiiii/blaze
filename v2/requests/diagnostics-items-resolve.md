@@ -20,6 +20,7 @@ call", not rustc's "no rules expected `x`"; and the note and comma help, which e
 `no rules expected` has, can't be given at all.
 
 > forwarded to db: `hir` and `hir-expand` are lane db's.
+> applied by db-expand: `hir_expand::ExpandErrorKind::Mbe` carries format's `mbe::ExpandErrorKind::MatchFailure` (re-exported as `hir_expand::{MbeErrorKind, MatchFailure}`): the failing token (`None` at the end of the input, rustc's "unexpected end of macro invocation"), the error's span at that token or the input's closing delimiter, `label()`, the remaining matcher and its span (the "while trying to match" note), and `missing_comma` (the "missing comma here" help). Test `a_call_no_rule_matches_carries_the_best_failure` in `crates/hir-def/src/macro_expansion_tests/builtin_errors.rs`. `hir::MacroError` carrying the kind is db-ty-next1's (`v2/requests/db-expand.md`).
 
 ## 2. Run `macro_def_error::check` on every local `macro_rules!` (diagnostics-items)
 

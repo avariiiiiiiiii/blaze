@@ -87,17 +87,34 @@ fn a_run_of_entries_ends_in_a_zero_length_inside_the_patch() {
     assert!(frame_run(&unended, (16, 12)).is_err());
 }
 
+/// [`fdes`] into buffers of its own.
+fn fdes_of(text: &[u8], frames: (u64, u64)) -> Result<Vec<usize>, String> {
+    let (mut cies, mut found) = (Vec::new(), Vec::new());
+    fdes(text, frames, &mut cies, &mut found).map(|()| found)
+}
+
 #[test]
 fn each_fde_is_inside_its_section_and_names_a_cie_before_it() {
     let text = [vec![0xaa; 16], eh_frame()].concat();
-    assert_eq!(fdes(&text, (16, 28)), Ok(vec![28]));
+    assert_eq!(fdes_of(&text, (16, 28)), Ok(vec![28]));
     // An FDE past its section.
-    assert!(fdes(&text, (16, 20)).unwrap_err().contains("past its section"));
+    assert!(fdes_of(&text, (16, 20)).unwrap_err().contains("past its section"));
     // An FDE whose CIE pointer goes before the section, or at no CIE.
     let before = [vec![0xaa; 16], le(&[8, 0, 0x0101, 8, 40, 0x0202, 0])].concat();
-    assert!(fdes(&before, (16, 28)).unwrap_err().contains("names no CIE"));
+    assert!(fdes_of(&before, (16, 28)).unwrap_err().contains("names no CIE"));
     let between = [vec![0xaa; 16], le(&[8, 0, 0x0101, 8, 12, 0x0202, 0])].concat();
-    assert!(fdes(&between, (16, 28)).unwrap_err().contains("names no CIE"));
+    assert!(fdes_of(&between, (16, 28)).unwrap_err().contains("names no CIE"));
+}
+
+/// Buffers that held a longer list before give the same FDEs, and allocate nothing.
+#[test]
+fn fdes_reuse_their_buffers() {
+    let text = [vec![0xaa; 16], eh_frame()].concat();
+    let (mut cies, mut found) = (vec![1, 2, 3], vec![4, 5, 6]);
+    blaze_alloc_count::assert_at_most(0, "the FDEs of a patch, into kept buffers", || {
+        fdes(&text, (16, 28), &mut cies, &mut found).expect("FDEs")
+    });
+    assert_eq!((cies, found), (vec![16], vec![28]));
 }
 
 #[test]
@@ -133,12 +150,23 @@ fn patch_of(writes: Vec<Write>, redirected: u64) -> Code {
     Code { writes, redirected, ..Code::default() }
 }
 
+/// [`Overwrites::plan`] into a plan of its own.
+fn planned(overwrites: &mut Overwrites, code: &Code, slide: u64) -> Result<Plan, String> {
+    let mut plan = Plan::default();
+    overwrites.plan(code, slide, &mut plan).map(|()| plan)
+}
+
+/// Each step's address and bytes.
+fn steps(plan: &Plan) -> Vec<(u64, Vec<u8>)> {
+    plan.steps.iter().map(|it| (it.address, plan.bytes(it).to_vec())).collect()
+}
+
 #[test]
 fn a_plan_puts_back_what_the_next_patch_drops_and_what_a_longer_write_left() {
     let mut overwrites = Overwrites::default();
     let slide = 0x1_0000;
     let first = patch_of(vec![write(0x100, &[1; 12]), write(0x200, &[2; 8])], 1);
-    let plan = overwrites.plan(&first, slide).expect("a plan");
+    let plan = planned(&mut overwrites, &first, slide).expect("a plan");
     assert_eq!(plan.steps.iter().map(|it| it.address).collect::<Vec<_>>(), [0x1_0100, 0x1_0200]);
     assert!(plan.steps[0].jump && !plan.steps[1].jump);
     overwrites.read(&plan, read_image);
@@ -146,9 +174,8 @@ fn a_plan_puts_back_what_the_next_patch_drops_and_what_a_longer_write_left() {
 
     // Slid addresses are what is kept: the jump at 0x100, shorter now, is not put back first.
     let second = patch_of(vec![write(0x100, &[3; 5])], 1);
-    let plan = overwrites.plan(&second, slide).expect("a plan");
-    let steps: Vec<(u64, Vec<u8>)> =
-        plan.steps.iter().map(|it| (it.address, it.bytes.clone())).collect();
+    let plan = planned(&mut overwrites, &second, slide).expect("a plan");
+    let steps = steps(&plan);
     let original =
         |address: u64, len: u64| (address..address + len).map(image_byte).collect::<Vec<_>>();
     let shorter = [vec![3; 5], original(0x1_0105, 7)].concat();
@@ -163,9 +190,8 @@ fn a_plan_puts_back_what_the_next_patch_drops_and_what_a_longer_write_left() {
 #[test]
 fn reading_the_originals_allocates_nothing() {
     let mut overwrites = Overwrites::default();
-    let plan = overwrites
-        .plan(&patch_of(vec![write(0x100, &[1; 40]), write(0x300, &[1; 3])], 2), 0)
-        .unwrap();
+    let writes = vec![write(0x100, &[1; 40]), write(0x300, &[1; 3])];
+    let plan = planned(&mut overwrites, &patch_of(writes, 2), 0).unwrap();
     let before: HashMap<u64, usize> =
         overwrites.originals.iter().map(|(at, it)| (*at, it.capacity())).collect();
     overwrites.read(&plan, read_image);
@@ -182,7 +208,7 @@ fn reading_the_originals_allocates_nothing() {
 fn a_pc_strictly_inside_a_write_is_found() {
     let mut overwrites = Overwrites::default();
     let writes = vec![write(0x100, &[0; 5]), write(0x200, &[0; 12]), write(0x204, &[0; 2])];
-    let plan = overwrites.plan(&patch_of(writes, 3), 0).unwrap();
+    let plan = planned(&mut overwrites, &patch_of(writes, 3), 0).unwrap();
     assert_eq!(plan.inside(&[0x100, 0x105, 0x1ff, 0x20c]), None);
     assert_eq!(plan.inside(&[0x50, 0x104]), Some((0x104, 0x100)));
     assert_eq!(plan.inside(&[0x101]), Some((0x101, 0x100)));
@@ -204,7 +230,7 @@ fn words(words: &[u32]) -> impl FnMut(u64, &mut [u8]) {
 fn a_call_among_the_words_a_jump_covers_is_found() {
     let calls = |code: &[u32]| {
         let mut overwrites = Overwrites::default();
-        let plan = overwrites.plan(&patch_of(vec![write(0, &[0; 12])], 1), 0).unwrap();
+        let plan = planned(&mut overwrites, &patch_of(vec![write(0, &[0; 12])], 1), 0).unwrap();
         overwrites.read(&plan, words(code));
         overwrites.calls(&plan)
     };
@@ -235,22 +261,24 @@ impl World for Fake {
 #[test]
 fn writes_wait_for_a_thread_inside_them_and_then_refuse() {
     let mut overwrites = Overwrites::default();
-    let plan = overwrites.plan(&patch_of(vec![write(0x100, &[0xe9; 5])], 1), 0).unwrap();
+    let plan = planned(&mut overwrites, &patch_of(vec![write(0x100, &[0xe9; 5])], 1), 0).unwrap();
     let mut world = Fake { rounds: vec![vec![0x102], vec![0x102], vec![0x100, 0x200]], stopped: 0 };
     let mut written = Vec::new();
-    let done = write_stopped(&mut world, &mut overwrites, &plan, false, read_image, |n, step| {
-        written.push((n, step.address));
+    let put = |n: usize, step: &Step, bytes: &[u8]| {
+        written.push((n, step.address, bytes.to_vec()));
         Ok(())
-    });
+    };
+    let done = write_stopped(&mut world, &mut overwrites, &plan, false, read_image, put);
     assert_eq!(done, Ok(()));
-    assert_eq!((world.stopped, written), (3, vec![(0, 0x100)]));
+    assert_eq!((world.stopped, written), (3, vec![(0, 0x100, vec![0xe9; 5])]));
     assert_eq!(overwrites.written, HashMap::from([(0x100, 5)]));
 
-    let plan = overwrites.plan(&patch_of(vec![write(0x100, &[0xe9; 5])], 1), 0).unwrap();
+    let plan = planned(&mut overwrites, &patch_of(vec![write(0x100, &[0xe9; 5])], 1), 0).unwrap();
     let mut world = Fake { rounds: vec![vec![0x101]], stopped: 0 };
-    let refused = write_stopped(&mut world, &mut overwrites, &plan, false, read_image, |_, _| {
+    let inside = |_: usize, _: &Step, _: &[u8]| -> Result<(), Broke> {
         panic!("written with a thread inside")
-    });
+    };
+    let refused = write_stopped(&mut world, &mut overwrites, &plan, false, read_image, inside);
     let why = match refused {
         Err(Failed::Declined(why)) => why,
         other => panic!("{other:?}"),
@@ -263,9 +291,9 @@ fn writes_wait_for_a_thread_inside_them_and_then_refuse() {
 fn a_write_that_breaks_after_others_says_restart() {
     let mut overwrites = Overwrites::default();
     let writes = vec![write(0x100, &[0xe9; 5]), write(0x200, &[0xe9; 5])];
-    let plan = overwrites.plan(&patch_of(writes, 2), 0).unwrap();
+    let plan = planned(&mut overwrites, &patch_of(writes, 2), 0).unwrap();
     let mut world = Fake { rounds: vec![vec![]], stopped: 0 };
-    let broke = |n: usize, step: &Step| match n {
+    let broke = |n: usize, step: &Step, _: &[u8]| match n {
         0 => Ok(()),
         _ => Err(Broke { what: "making it writable", at: step.address, code: 12, written: false }),
     };
@@ -278,11 +306,102 @@ fn a_write_that_breaks_after_others_says_restart() {
     assert_eq!(overwrites.written, HashMap::from([(0x100, 5)]));
 
     let mut fresh = Overwrites::default();
-    let plan = fresh.plan(&patch_of(vec![write(0x100, &[0xe9; 5])], 1), 0).unwrap();
-    let first = |_: usize, step: &Step| {
+    let plan = planned(&mut fresh, &patch_of(vec![write(0x100, &[0xe9; 5])], 1), 0).unwrap();
+    let first = |_: usize, step: &Step, _: &[u8]| {
         Err(Broke { what: "making it writable", at: step.address, code: 12, written: false })
     };
     let failed = write_stopped(&mut world, &mut fresh, &plan, false, read_image, first);
     assert!(matches!(failed, Err(Failed::Declined(_))), "{failed:?}");
     assert!(fresh.written.is_empty());
+}
+
+/// The steps [`Overwrites::plan`] made when each owned its bytes: what the last patch wrote
+/// and `code` does not, sorted, then `code`'s own writes with what a longer write left.
+fn owned_plan(overwrites: &Overwrites, code: &Code, slide: u64) -> Vec<(u64, Vec<u8>)> {
+    let kept: std::collections::HashSet<u64> =
+        code.writes.iter().map(|it| it.address.wrapping_add(slide)).collect();
+    let mut undone: Vec<u64> =
+        overwrites.written.keys().copied().filter(|it| !kept.contains(it)).collect();
+    undone.sort_unstable();
+    let mut steps: Vec<(u64, Vec<u8>)> =
+        undone.iter().map(|it| (*it, overwrites.originals[it].clone())).collect();
+    for write in &code.writes {
+        let mut bytes = write.bytes.clone();
+        for &pointer in &write.pointers {
+            slide_at(&mut bytes, pointer, slide).expect("a pointer inside the write");
+        }
+        let address = write.address.wrapping_add(slide);
+        let last = overwrites.written.get(&address).copied().unwrap_or(0);
+        if last > bytes.len() {
+            bytes.extend_from_slice(&overwrites.originals[&address][bytes.len()..last]);
+        }
+        steps.push((address, bytes));
+    }
+    steps
+}
+
+/// A seeded patch of up to six writes at distinct addresses of a pool of 16, some with a
+/// pointer to slide.
+fn seeded_patch(rng: &mut blaze_ids::rng::SplitMix64) -> Code {
+    let mut addresses: Vec<u64> = (0..16).map(|it| 0x1000 + it * 0x40).collect();
+    let count = 1 + rng.below(6) as usize;
+    let mut writes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let address = addresses.swap_remove(rng.below(addresses.len() as u64) as usize);
+        let len = 1 + rng.below(24) as usize;
+        let bytes: Vec<u8> = (0..len).map(|_| rng.next_u64() as u8).collect();
+        let pointers = if len >= 8 && rng.below(2) == 0 { vec![0] } else { Vec::new() };
+        writes.push(Write { address, bytes, pointers });
+    }
+    let redirected = rng.below(count as u64 + 1);
+    patch_of(writes, redirected)
+}
+
+/// One plan kept from patch to patch gives what a fresh plan with owned bytes did, over a
+/// seeded run of patches that each put back, shorten and lengthen what the last wrote.
+#[test]
+fn a_kept_plan_gives_what_owned_steps_did() {
+    let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+    let mut overwrites = Overwrites::default();
+    let mut plan = Plan::default();
+    let slide = 0x7_0000;
+    for round in 0..500 {
+        let code = seeded_patch(&mut rng);
+        let expected = owned_plan(&overwrites, &code, slide);
+        overwrites.plan(&code, slide, &mut plan).expect("a plan");
+        assert_eq!(steps(&plan), expected, "round {round}");
+        for (nth, step) in plan.steps.iter().enumerate() {
+            let redirected = nth >= plan.steps.len() - code.writes.len()
+                && ((nth + code.writes.len() - plan.steps.len()) as u64) < code.redirected;
+            assert_eq!(step.jump, redirected, "round {round}, step {nth}");
+        }
+        overwrites.read(&plan, read_image);
+        overwrites.record(&plan, plan.steps.len());
+    }
+}
+
+/// Planning, reading and recording a patch over addresses written before allocates nothing
+/// once the plan's buffers have grown.
+#[test]
+fn a_warm_plan_allocates_nothing() {
+    let mut overwrites = Overwrites::default();
+    let mut plan = Plan::default();
+    let code = |fill: u8| {
+        let (long, short) = ([fill; 12], [fill; 5]);
+        patch_of(vec![write(0x100, &long), write(0x200, &long[..8]), write(0x300, &short)], 2)
+    };
+    let (first, second) = (code(1), code(2));
+    for code in [&first, &second] {
+        overwrites.plan(code, 0, &mut plan).expect("a plan");
+        overwrites.read(&plan, read_image);
+        overwrites.record(&plan, plan.steps.len());
+    }
+    blaze_alloc_count::assert_at_most(0, "a warm v1 plan, its reads and its record", || {
+        for code in [&first, &second, &first] {
+            overwrites.plan(code, 0, &mut plan).expect("a plan");
+            overwrites.read(&plan, read_image);
+            overwrites.record(&plan, plan.steps.len());
+        }
+    });
+    assert_eq!(steps(&plan)[0], (0x100, vec![1; 12]));
 }

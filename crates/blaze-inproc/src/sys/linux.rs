@@ -13,8 +13,11 @@ use std::ops::Range;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::time::Duration;
 
-pub(crate) use super::unix::{Listener, Stream, backtrace, connect, random, serialize};
+pub(crate) use super::unix::{
+    Bells, Errno, Listener, Stream, backtrace, connect, hung_up, random, ring, serialize, wait_answer,
+};
 use super::Rights;
 use super::unix::protection;
 use crate::channel::Channel;
@@ -285,10 +288,23 @@ fn map_anywhere(fd: RawFd, len: u64, access: Access) -> Result<u64, Error> {
     Ok(mapped as u64)
 }
 
-/// The daemon's side of a run process: nothing, since the start hook maps what it is given.
-pub(crate) struct Remote;
+/// The daemon's side of a run process: a pidfd of it, which names that process even once its
+/// ID is reused; the start hook maps what it is given itself.
+pub(crate) struct Remote {
+    process: OwnedFd,
+}
 
 impl Remote {
+    pub(crate) fn of(pid: u32) -> Result<Remote, Error> {
+        // SAFETY: pidfd_open takes a process ID and flags and returns a new descriptor or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        if fd < 0 {
+            return Err(os(&format!("pidfd_open of process {pid}")));
+        }
+        // SAFETY: just made, owned by nothing else.
+        Ok(Remote { process: unsafe { OwnedFd::from_raw_fd(fd as RawFd) } })
+    }
+
     pub(crate) fn map(&self, object: u32, _: Access) -> Result<u64, Error> {
         Err(Error::new(format!("a start hook asked the daemon to map object {object}: on Linux the hook maps it")))
     }
@@ -296,9 +312,42 @@ impl Remote {
     pub(crate) fn overlay(&self, _: u64, _: &crate::handshake::Grant) -> Result<(), Error> {
         Err(Error::new("a start hook asked the daemon to lay its overlays: on Linux the hook lays them"))
     }
+
+    pub(crate) fn kill(&self) -> Result<(), Error> {
+        // SAFETY: `process` is an open pidfd; no siginfo, no flags.
+        let sent = unsafe {
+            libc::syscall(libc::SYS_pidfd_send_signal, self.process.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0u32)
+        };
+        if sent != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+            return Err(os("pidfd_send_signal"));
+        }
+        Ok(())
+    }
 }
 
-pub(crate) fn send_objects(channel: &mut Channel, _pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
+/// Sleeps on a futex that is not private, so a word of a shared mapping is the same futex in
+/// every process that maps it.
+pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
+    let time = libc::timespec {
+        tv_sec: timeout.as_secs().min(i32::MAX as u64) as libc::time_t,
+        tv_nsec: timeout.subsec_nanos() as libc::c_long,
+    };
+    // SAFETY: `word` is live and 8-aligned, so its first four bytes are an aligned `u32`, the
+    // low half on these little-endian targets, which the kernel reads atomically; `time` is
+    // live for the call; FUTEX_WAIT reads nothing else.
+    let got = unsafe {
+        libc::syscall(libc::SYS_futex, word.as_ptr().cast::<u32>(), libc::FUTEX_WAIT, expected, &raw const time, 0usize, 0u32)
+    };
+    got == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ETIMEDOUT)
+}
+
+pub(crate) fn wake(word: &AtomicU64) {
+    // SAFETY: as in `wait`; FUTEX_WAKE reads nothing of the word.
+    unsafe { libc::syscall(libc::SYS_futex, word.as_ptr().cast::<u32>(), libc::FUTEX_WAKE, i32::MAX, 0usize, 0usize, 0u32) };
+}
+
+pub(crate) fn send_objects(channel: &mut Channel, pid: u32, grant: &[u8], objects: &[(&Object, Rights)]) -> Result<Remote, Error> {
+    let remote = Remote::of(pid)?;
     let mut fds: Vec<OwnedFd> = Vec::with_capacity(objects.len());
     for (object, rights) in objects {
         fds.push(match rights {
@@ -317,7 +366,7 @@ pub(crate) fn send_objects(channel: &mut Channel, _pid: u32, grant: &[u8], objec
         )));
     }
     channel.stream().send(&bytes, &raw)?;
-    Ok(Remote)
+    Ok(remote)
 }
 
 pub(crate) struct Granted {

@@ -10,6 +10,7 @@
 
 use std::{collections::VecDeque, rc::Rc};
 
+use blaze_ids::bits::{BitMatrix, BitSet};
 use hir_ty::mir::{
     AggregateKind, AsmOperand, BasicBlockId, LocalId, MirBody, MirSpan, Operand, OperandKind, PlaceElem,
     ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
@@ -24,36 +25,7 @@ pub(super) type Index = u32;
 const NONE: Index = Index::MAX;
 
 /// A set of checked places: rustc's `DenseBitSet<PlaceIndex>`.
-#[derive(Clone, PartialEq, Eq)]
-pub(super) struct Bits(Vec<u64>);
-
-impl Bits {
-    pub(super) fn new(len: usize) -> Bits {
-        Bits(vec![0; len.div_ceil(64)])
-    }
-
-    pub(super) fn insert(&mut self, at: Index) {
-        self.0[at as usize / 64] |= 1 << (at % 64);
-    }
-
-    fn remove(&mut self, at: Index) {
-        self.0[at as usize / 64] &= !(1 << (at % 64));
-    }
-
-    pub(super) fn contains(&self, at: Index) -> bool {
-        self.0[at as usize / 64] >> (at % 64) & 1 == 1
-    }
-
-    fn union(&mut self, other: &Bits) {
-        for (it, other) in self.0.iter_mut().zip(&other.0) {
-            *it |= *other;
-        }
-    }
-
-    fn clear(&mut self) {
-        self.0.fill(0);
-    }
-}
+pub(super) type PlaceSet = BitSet<Index>;
 
 /// What a checked place is: rustc's `LocalInfo` of its local, or a capture.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -201,11 +173,6 @@ enum Ctx {
 /// every capture live.
 pub(super) type DeadCaptures = Option<Rc<[bool]>>;
 
-/// The analysis of a closure the body makes, decided the first time it is needed.
-pub(super) trait Closures<'db> {
-    fn dead_captures(&mut self, closure: Ty<'db>) -> DeadCaptures;
-}
-
 /// The body's control flow, with rustc's `FnMut` closure that is called again after it
 /// returns or unwinds (`Goto { target: START_BLOCK }`).
 pub(super) struct Cfg {
@@ -221,9 +188,9 @@ impl Cfg {
     pub(super) fn new(mir: &MirBody<'_>, again: bool) -> Cfg {
         let n = mir.basic_blocks.len();
         let start = mir.start_block;
-        let mut unreached = vec![false; n];
+        let mut unreached: BitSet = BitSet::new(n);
         for &it in &mir.unreached {
-            unreached[raw(it)] = true;
+            unreached.insert(raw(it));
         }
         let mut succ = vec![SmallVec::new(); n];
         for (block, data) in mir.basic_blocks.iter() {
@@ -235,12 +202,12 @@ impl Cfg {
                 }
                 kind => kind.successors().into_iter().chain(kind.unwind()).collect(),
             };
-            succ[raw(block)] = edges.into_iter().filter(|it| !unreached[raw(*it)]).collect();
+            succ[raw(block)] = edges.into_iter().filter(|it| !unreached.contains(raw(*it))).collect();
         }
-        let mut visited = vec![false; n];
+        let mut visited: BitSet = BitSet::new(n);
         let mut postorder = Vec::new();
         let mut stack: Vec<(BasicBlockId, usize)> = vec![(start, succ[raw(start)].len())];
-        visited[raw(start)] = true;
+        visited.insert(raw(start));
         while let Some(top) = stack.len().checked_sub(1) {
             let (block, left) = stack[top];
             if left == 0 {
@@ -250,8 +217,7 @@ impl Cfg {
             }
             stack[top].1 = left - 1;
             let next = succ[raw(block)][left - 1];
-            if !visited[raw(next)] {
-                visited[raw(next)] = true;
+            if visited.insert(raw(next)) {
                 stack.push((next, succ[raw(next)].len()));
             }
         }
@@ -269,10 +235,10 @@ impl Cfg {
         if from.block == to.block && from.index < to.index {
             return true;
         }
-        let mut visited = vec![false; self.pred.len()];
+        let mut visited: BitSet = BitSet::new(self.pred.len());
         let mut queue: Vec<BasicBlockId> = self.pred[raw(to.block)].to_vec();
         while let Some(block) = queue.pop() {
-            if std::mem::replace(&mut visited[raw(block)], true) {
+            if !visited.insert(raw(block)) {
                 continue;
             }
             queue.extend(self.pred[raw(block)].iter().copied());
@@ -308,8 +274,8 @@ pub(super) enum Access {
 /// What the dataflow found: rustc's `AssignmentResult` before it reports.
 pub(super) struct Seen<'m> {
     pub(super) sightings: Vec<Sighting<'m>>,
-    pub(super) ever_live: Bits,
-    pub(super) ever_dropped: Bits,
+    pub(super) ever_live: PlaceSet,
+    pub(super) ever_dropped: PlaceSet,
 }
 
 /// The liveness of the checked places of one body: rustc's `MaybeLivePlaces`.
@@ -319,8 +285,8 @@ pub(super) struct Flow<'m, 'p, 'db> {
     specials: &'p FxHashMap<(u32, u32), Special>,
     cfg: &'p Cfg,
     kind: CaptureKind,
-    /// The state where each block starts.
-    entry: Vec<Bits>,
+    /// The state where each block starts, a row per block.
+    entry: BitMatrix<Index>,
 }
 
 impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
@@ -331,28 +297,28 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         cfg: &'p Cfg,
         kind: CaptureKind,
     ) -> Self {
-        let entry = vec![Bits::new(places.len()); mir.basic_blocks.len()];
+        let entry = BitMatrix::new(mir.basic_blocks.len(), places.len());
         Flow { mir, places, specials, cfg, kind, entry }
     }
 
     /// Runs the backward analysis to its fixpoint, the blocks first in postorder.
-    pub(super) fn solve(&mut self, closures: &mut dyn Closures<'db>) {
+    pub(super) fn solve(&mut self, closures: &mut super::Liveness<'_, '_, 'db>) {
         let n = self.mir.basic_blocks.len();
-        let mut queued = vec![false; n];
+        let mut queued: BitSet = BitSet::new(n);
         let mut queue: VecDeque<BasicBlockId> = VecDeque::with_capacity(self.cfg.postorder.len());
         for &block in &self.cfg.postorder {
-            queued[raw(block)] = true;
+            queued.insert(raw(block));
             queue.push_back(block);
         }
-        let mut state = Bits::new(self.places.len());
+        let mut state = PlaceSet::new(self.places.len());
         while let Some(block) = queue.pop_front() {
-            queued[raw(block)] = false;
+            queued.remove(raw(block));
             self.exit(block, &mut state);
             self.block(block, &mut state, closures);
-            if state != self.entry[raw(block)] {
-                self.entry[raw(block)].clone_from(&state);
+            if state.as_slice() != self.entry.row(raw(block)) {
+                self.entry.row_mut(raw(block)).copy_from(&state);
                 for &pred in &self.cfg.pred[raw(block)] {
-                    if !std::mem::replace(&mut queued[raw(pred)], true) {
+                    if queued.insert(raw(pred)) {
                         queue.push_back(pred);
                     }
                 }
@@ -360,14 +326,14 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn exit(&self, block: BasicBlockId, state: &mut Bits) {
+    fn exit(&self, block: BasicBlockId, state: &mut PlaceSet) {
         state.clear();
         for &next in &self.cfg.succ[raw(block)] {
-            state.union(&self.entry[raw(next)]);
+            state.union_with(&self.entry.row(raw(next)));
         }
     }
 
-    fn block(&self, block: BasicBlockId, state: &mut Bits, closures: &mut dyn Closures<'db>) {
+    fn block(&self, block: BasicBlockId, state: &mut PlaceSet, closures: &mut super::Liveness<'_, '_, 'db>) {
         let data = &self.mir.basic_blocks[block];
         if let Some(terminator) = &data.terminator {
             self.terminator(&terminator.kind, state);
@@ -377,7 +343,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn statement(&self, kind: &StatementKind, loc: (u32, u32), live: &mut Bits, closures: &mut dyn Closures<'db>) {
+    fn statement(&self, kind: &StatementKind, loc: (u32, u32), live: &mut PlaceSet, closures: &mut super::Liveness<'_, '_, 'db>) {
         let special = self.specials.get(&loc).copied();
         if special == Some(Special::Skip) {
             return;
@@ -420,7 +386,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn terminator(&self, kind: &TerminatorKind, live: &mut Bits) {
+    fn terminator(&self, kind: &TerminatorKind, live: &mut PlaceSet) {
         let again = self.kind == CaptureKind::FnMut;
         match kind {
             TerminatorKind::Return | TerminatorKind::Yield { .. } | TerminatorKind::Call { target: None, .. }
@@ -462,7 +428,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
 
     /// What the closure's caller can read after it returns, yields or unwinds: what it
     /// captured by reference.
-    fn by_ref_captures(&self, live: &mut Bits) {
+    fn by_ref_captures(&self, live: &mut PlaceSet) {
         for at in 0..self.places.len() as Index {
             if self.places.is_by_ref_capture(at) {
                 live.insert(at);
@@ -470,7 +436,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn rvalue(&self, rvalue: &Rvalue, live: &mut Bits, closures: &mut dyn Closures<'db>) {
+    fn rvalue(&self, rvalue: &Rvalue, live: &mut PlaceSet, closures: &mut super::Liveness<'_, '_, 'db>) {
         match rvalue {
             Rvalue::Use(it) | Rvalue::Repeat(it, _) | Rvalue::Cast(_, it, _) | Rvalue::UnaryOp(_, it) => {
                 self.operand(it, live)
@@ -505,7 +471,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
     }
 
-    fn operand(&self, operand: &Operand, live: &mut Bits) {
+    fn operand(&self, operand: &Operand, live: &mut PlaceSet) {
         if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
             self.place(place, Ctx::Use, live);
         }
@@ -513,7 +479,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
 
     /// rustc's `TransferFunction::visit_place`: an index local in the projections is read,
     /// then the place is defined or used as [`def_use`] says.
-    fn place(&self, place: &StoredPlace, ctx: Ctx, live: &mut Bits) {
+    fn place(&self, place: &StoredPlace, ctx: Ctx, live: &mut PlaceSet) {
         let projection = place.projection.as_slice();
         for elem in projection {
             if let ProjectionElem::Index(local) = elem
@@ -524,8 +490,12 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         }
         let Some((at, extra)) = self.places.get(place.local, projection) else { return };
         match def_use(extra, ctx) {
-            Some(true) => live.remove(at),
-            Some(false) => live.insert(at),
+            Some(true) => {
+                live.remove(at);
+            }
+            Some(false) => {
+                live.insert(at);
+            }
             None => {}
         }
     }
@@ -533,15 +503,15 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
     /// Every assignment of a checked place in the blocks reachable from the start, with its
     /// liveness after it, and of the parameters and captures where the body starts: rustc's
     /// `find_dead_assignments`.
-    pub(super) fn assignments(&self, closures: &mut dyn Closures<'db>) -> Seen<'m> {
+    pub(super) fn assignments(&self, closures: &mut super::Liveness<'_, '_, 'db>) -> Seen<'m> {
         let n = self.places.len();
-        let mut found = Seen { sightings: Vec::new(), ever_live: Bits::new(n), ever_dropped: Bits::new(n) };
-        let mut state = Bits::new(n);
+        let mut found = Seen { sightings: Vec::new(), ever_live: PlaceSet::new(n), ever_dropped: PlaceSet::new(n) };
+        let mut state = PlaceSet::new(n);
         let mir: &'m MirBody<'db> = self.mir;
         for &block in &self.cfg.postorder {
             let data = &mir.basic_blocks[block];
             self.exit(block, &mut state);
-            found.ever_live.union(&state);
+            found.ever_live.union_with(&state);
             let end = Loc { block, index: data.statements.len() as u32 };
             if let Some(terminator) = &data.terminator {
                 let span = terminator.span;
@@ -560,7 +530,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
                 self.terminator(&terminator.kind, &mut state);
             }
             for (index, statement) in data.statements.iter().enumerate().rev() {
-                found.ever_live.union(&state);
+                found.ever_live.union_with(&state);
                 let loc = Loc { block, index: index as u32 };
                 let key = (raw(block) as u32, index as u32);
                 if self.specials.get(&key) != Some(&Special::Skip) {
@@ -579,8 +549,8 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
                 self.statement(&statement.kind, key, &mut state, closures);
             }
         }
-        let start = &self.entry[raw(self.cfg.start)];
-        found.ever_live.union(start);
+        let start = self.entry.row(raw(self.cfg.start));
+        found.ever_live.union_with(&start);
         let at_start = Loc { block: self.cfg.start, index: 0 };
         for at in 0..n as Index {
             let kind = match self.places.kinds[at as usize] {
@@ -606,7 +576,7 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
         self.mir.param_locals.iter().any(|&local| self.places.of_local(local) == Some(at))
     }
 
-    fn sight(&self, found: &mut Seen<'m>, place: &'m StoredPlace, span: MirSpan, loc: Loc, live: &Bits) {
+    fn sight(&self, found: &mut Seen<'m>, place: &'m StoredPlace, span: MirSpan, loc: Loc, live: &PlaceSet) {
         let Some((at, extra)) = self.places.get(place.local, place.projection.as_slice()) else { return };
         if is_indirect(extra) {
             return;

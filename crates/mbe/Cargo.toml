@@ -18,10 +18,10 @@ rustc-hash.workspace = true
 smallvec.workspace = true
 arrayvec.workspace = true
 ra-ap-rustc_lexer.workspace = true
-salsa.workspace = true
 bitflags.workspace = true
 
 # local deps
+base-db.workspace = true
 parser.workspace = true
 tt.workspace = true
 stdx.workspace = true
@@ -31,6 +31,7 @@ syntax-bridge.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+blaze-ids.workspace = true
 test-utils.workspace = true
 expect-test.workspace = true
 syntax.workspace = true

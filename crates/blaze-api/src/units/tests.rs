@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    Installed, LABEL, Place, Step, Unit, UnitFile, captured, files, install, installed, main_file, socket_of, uninstall,
-    unit_dir,
+    Installed, LABEL, PLIST_FILE, Place, Step, Unit, UnitFile, captured, files, install, installed, main_file, socket_of,
+    uninstall, unit_dir,
 };
 use crate::activation::Manager;
 
@@ -139,6 +139,19 @@ fn special_text_is_escaped() {
     let service = &made[1].text;
     assert!(service.contains("\nExecStart=\"/opt/a\\\"b\\\\c$$d;\" serve --activated --socket /run/100%%/v2.sock\n"), "{service}");
     assert!(service.contains("\nEnvironment=\"BLAZE_HOME=/home/\\\"q\\\"\\\\$x\"\n"), "{service}");
+}
+
+#[test]
+fn a_plain_word_doubles_its_specifiers_and_dollars() {
+    let (mut unit, place) = linux();
+    unit.program = "/opt/a$b%c".into();
+    unit.log = "/var/log/100%".into();
+    unit.env = vec![("PATH".into(), "/a%$b".into())];
+    let service = &files(&unit, &place).unwrap()[1].text;
+    assert!(service.contains("\nExecStart=/opt/a$$b%%c serve --activated --socket "), "{service}");
+    assert!(service.contains("\nEnvironment=\"PATH=/a%%$b\"\n"), "{service}");
+    assert!(service.contains("\nStandardOutput=append:/var/log/100%%\nStandardError=append:/var/log/100%%\n"), "{service}");
+    assert_eq!(PLIST_FILE, format!("{LABEL}.plist"));
 }
 
 #[test]

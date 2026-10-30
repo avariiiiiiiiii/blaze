@@ -52,3 +52,41 @@ has a type parameter (with `Output = {output}` for a binop whose output is sugge
 "the trait `..` is not implemented for `..`" exactly when `unmet` is empty, in place of
 knowing only the operator's own trait. Tests: `binop/issue-93927.rs`,
 `suggestions/invalid-bin-op.rs`, `binop/binary-op-not-allowed-issue-125631.rs`.
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
+## To diagnostics (`lower/{binary,unary}_operator_cannot_be_applied.rs`, `cannot_be_dereferenced.rs`, `cannot_index_into.rs`)
+
+`hir::BinaryOperatorCannotBeApplied.at_error: Option<(String, String)>` and
+`hir::{UnaryOperatorCannotBeApplied, CannotBeDereferenced, CannotIndexInto}.at_error:
+Option<String>` are the operand types as rustc prints them when it reports the error, before
+integer fallback (`{integer}`/`{float}` for an undecided literal; `true + 1` is "cannot add
+`{integer}` to `bool`", `*1` is "type `{integer}` cannot be dereferenced"). They are `None`
+when no operand held an undecided literal, which is when the `Type` fields already print the
+same. Each message and label printing those types takes `at_error` when it is `Some`. Tests:
+`binop/binop-typeck.rs`, `error-codes/E0614.rs`, `error-codes/E0600.rs`.
+
+> forwarded to diagnostics (from requests, pass 17; told by tmux).
+
+## To diagnostics and ide-diagnostics: `MismatchedArgCount.args`, new `IncorrectArguments`
+
+`hir::MismatchedArgCount` now carries `args: hir::CallArgs`, and the new
+`hir::IncorrectArguments { call_expr: InFile<ExprOrPatPtr>, args: CallArgs }` is a call whose
+argument count fits but some argument does not (rustc's `report_arg_errors` reached with
+`call_appears_satisfied` false: E0308 "arguments to this function are incorrect"). Each such
+argument also has its own `TypeMismatch`, so ide-diagnostics may leave it silent, but both `crates/blaze-diagnostics/src/lower/mod.rs` and
+`crates/ide-diagnostics/src/lib.rs` match `AnyDiagnostic` exhaustively and need an arm.
+
+`CallArgs` is what `report_arg_errors` starts from, every type a `String` as rustc prints it at
+the error: `callee` (rustc's `callee_ty`, the receiver's type of a method call), `method`
+(`Option<Function>`), `is_method`, `c_variadic`, `formal_inputs`, `expected_inputs`, `provided`
+(the arguments' adjusted types; of a C-variadic call only those of fixed inputs), and
+`compatible_with(i)`, `ArgMatrix::new`'s row of the `i`th provided argument (the inputs it
+fits, the diagonal as `check_argument_types` found it and the rest by `check_compatible`).
+With it the lowering can port `ArgMatrix::find_issue`'s loop (missing, extra, swapped,
+permuted, invalid arguments) and its labels and suggestions, for both E0061/E0057 and
+E0308, in place of knowing only the counts. Tests: `argument-suggestions/extra_arguments.rs`,
+`missing_arguments.rs`, `swapped_arguments.rs`, `permuted_arguments.rs`,
+`invalid_arguments.rs`, `error-codes/E0057.rs`.
+
+> forwarded to diagnostics (from requests, pass 17; told by tmux).

@@ -53,7 +53,6 @@ const REACH: u64 = 2 << 30;
 const LOOK_EVERY: Duration = Duration::from_millis(30);
 
 pub(crate) struct Live {
-    dir: PathBuf,
     id: [u8; 16],
     slide: u64,
     process: Process,
@@ -62,18 +61,37 @@ pub(crate) struct Live {
     threads: stop::Threads,
     sequence: u64,
     /// The statics new since the executable that a patch gave a first value, by address, and
-    /// the pages of the room they are in.
-    lasting: std::collections::HashSet<u64>,
-    lasting_pages: std::collections::HashSet<u64>,
+    /// the pages of the room they are in, each sorted.
+    lasting: Vec<u64>,
+    lasting_pages: Vec<u64>,
     /// Where the room ends, above those statics: the `end` published is below them.
     room_end: u64,
     /// The executable's image in memory, which every write over it is checked to be in.
     image: std::ops::Range<u64>,
+    scratch: Scratch,
+    /// The file the daemon reads `process` from, the one it is written to first, and its text.
+    process_file: PathBuf,
+    partial: PathBuf,
+    text: String,
+}
+
+/// Buffers a patch is planned and written with, kept from one to the next.
+#[derive(Default)]
+struct Scratch {
+    plan: Plan,
+    /// The protection of the mapping each step of the plan is in.
+    protections: Vec<i32>,
+    /// /proc/self/maps, read for each patch, and its mappings sorted.
+    maps: String,
+    mapped: Vec<(u64, u64, i32)>,
+    /// A static's first value, slid.
+    value: Vec<u8>,
 }
 
 impl Live {
     pub(crate) fn start() -> Result<Live, String> {
         let executable =
+            // alloc: error path
             std::env::current_exe().map_err(|it| format!("finding the executable: {it}"))?;
         let image = Image::read(&executable)?;
         let dir = format::dir(&image.id).ok_or("no home directory to take edits through")?;
@@ -82,6 +100,7 @@ impl Live {
             .recursive(true)
             .mode(0o700)
             .create(&dir)
+            // alloc: error path
             .map_err(|it| format!("{}: {it}", dir.display()))?;
         let threads = stop::Threads::new()?;
         let (next, end) = reserve(&image)?;
@@ -89,19 +108,28 @@ impl Live {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_or(0, |it| it.as_millis() as u64);
         let process = Process { pid: std::process::id(), uuid: image.id, started, next, end };
-        let live = Live {
+        let process_file = dir.join("process");
+        // alloc: setup, once at start
+        let partial = dir.join(format!("process.{}", process.pid));
+        let mut live = Live {
             patches: watch(&dir, image.id),
-            dir,
             id: image.id,
             slide: image.slide,
             process,
             overwrites: Overwrites::default(),
             threads,
             sequence: 0,
-            lasting: std::collections::HashSet::new(),
-            lasting_pages: std::collections::HashSet::new(),
+            // alloc: none until a patch gives a static its first value, then once per doubling
+            lasting: Vec::new(),
+            // alloc: as `lasting`
+            lasting_pages: Vec::new(),
             room_end: end,
             image: image.start.saturating_add(image.slide)..image.end.saturating_add(image.slide),
+            scratch: Scratch::default(),
+            process_file,
+            partial,
+            // alloc: setup, the one buffer `publish` writes the process's text into
+            text: String::with_capacity(256),
         };
         live.publish()?;
         Ok(live)
@@ -131,6 +159,7 @@ impl Live {
             }
         };
         std::thread::Builder::new()
+            // alloc: setup, the thread's name, once
             .name("blaze-live-apply".to_owned())
             .spawn(applying)
             .expect("spawning the thread that applies edits");
@@ -142,6 +171,7 @@ impl Live {
         }
         self.sequence = patch.sequence;
         if patch.uuid != self.id {
+            // alloc: once, the program was linked again and has to start
             return Some(Outcome::Restart("the program was linked again".to_owned()));
         }
         Some(match patch.body {
@@ -166,19 +196,26 @@ impl Live {
     }
 
     fn apply(&mut self, code: &Code) -> Result<(), Failed> {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let applied = self.apply_with(code, &mut scratch);
+        self.scratch = scratch;
+        applied
+    }
+
+    fn apply_with(&mut self, code: &Code, s: &mut Scratch) -> Result<(), Failed> {
         // Every write over the executable is checked, and planned, before anything is mapped.
         apply::in_image(&code.writes, self.slide, &self.image)?;
-        let plan = self.overwrites.plan(code, self.slide)?;
-        let protections = protections(&plan)?;
+        self.overwrites.plan(code, self.slide, &mut s.plan)?;
+        protections(&s.plan, &mut s.maps, &mut s.mapped, &mut s.protections)?;
         let mapped = code.base.checked_add(self.slide).ok_or("a patch past the end of memory")?;
         // From here the room up to `end` is used, whatever becomes of the patch: jumps or the
         // unwinder may reach what is mapped there.
         let end = apply::claim(&mut self.process, code, PAGE)?;
         let len = end - code.base;
         let applied = (if len == 0 { Ok(()) } else { self.map(code, mapped, len) })
-            .and_then(|()| self.first_values(code, end))
+            .and_then(|()| self.first_values(code, end, &mut s.value))
             .map_err(Failed::from)
-            .and_then(|()| self.redirect(&plan, &protections));
+            .and_then(|()| self.redirect(&s.plan, &s.protections));
         let published = self.publish().map_err(Failed::from);
         applied.and(published)
     }
@@ -195,7 +232,7 @@ impl Live {
                 std::ptr::copy_nonoverlapping(address as *const u8, into.as_mut_ptr(), into.len())
             }
         };
-        let write = |n: usize, step: &Step| put(step, protections[n]);
+        let write = |n: usize, step: &Step, bytes: &[u8]| put(step, bytes, protections[n]);
         apply::write_stopped(&mut self.threads, &mut self.overwrites, plan, false, read, write)
     }
 
@@ -221,6 +258,7 @@ impl Live {
             )
         };
         if result == MAP_FAILED || result as u64 != mapped {
+            // alloc: error path
             return Err(format!(
                 "mapping the patch at {mapped:#x}: {}",
                 std::io::Error::last_os_error()
@@ -242,6 +280,7 @@ impl Live {
             && unsafe { mprotect(mapped as *mut c_void, text_len as usize, PROT_READ | PROT_EXEC) }
                 != 0
         {
+            // alloc: error path
             return Err(format!(
                 "making the patch executable: {}",
                 std::io::Error::last_os_error()
@@ -258,6 +297,7 @@ impl Live {
                 )
             } != 0
         {
+            // alloc: error path
             return Err(format!("making patch data writable: {}", std::io::Error::last_os_error()));
         }
         register_frames(&memory[..code.text.len()], code.frames)
@@ -265,21 +305,21 @@ impl Live {
 
     /// Writes the first value of each static new since the executable that the patch refers
     /// to and no patch before gave one, in the room above the patch, which ends at `end`.
-    fn first_values(&mut self, code: &Code, end: u64) -> Result<(), String> {
+    /// `bytes` is the buffer a value is slid in.
+    fn first_values(&mut self, code: &Code, end: u64, bytes: &mut Vec<u8>) -> Result<(), String> {
         for value in &code.lasting {
             // Above every patch, in the room: nothing else of the program is mapped there.
             let len = value.bytes.len() as u64;
             if value.address < end || value.address.saturating_add(len) > self.room_end {
+                // alloc: error path
                 return Err(format!("a static at {:#x}, outside the room", value.address));
             }
             let address = value.address + self.slide;
-            if self.lasting.contains(&address) {
-                continue;
-            }
+            let Err(new) = self.lasting.binary_search(&address) else { continue };
             let last = address + len;
             let mut page = address & !(PAGE - 1);
             while page < last {
-                if !self.lasting_pages.contains(&page) {
+                if let Err(unmapped) = self.lasting_pages.binary_search(&page) {
                     // SAFETY: `page` is a page of the room above every patch (`value.address
                     // >= end` and below `room_end`, checked above), which `reserve` set aside
                     // and nothing else maps; `lasting_pages` says it is not mapped yet, so
@@ -295,40 +335,46 @@ impl Live {
                         )
                     };
                     if result == MAP_FAILED || result as u64 != page {
+                        // alloc: error path
                         return Err(format!(
                             "mapping a static's page at {page:#x}: {}",
                             std::io::Error::last_os_error()
                         ));
                     }
-                    self.lasting_pages.insert(page);
+                    // alloc: a page newly mapped for statics, kept for good
+                    self.lasting_pages.insert(unmapped, page);
                 }
                 page += PAGE;
             }
-            let mut bytes = value.bytes.clone();
+            bytes.clear();
+            bytes.extend_from_slice(&value.bytes);
             for &pointer in &value.pointers {
-                apply::slide_at(&mut bytes, pointer, self.slide)?;
+                apply::slide_at(bytes, pointer, self.slide)?;
             }
             // SAFETY: `address..last` is in pages mapped read-write just above (or by an earlier
             // patch, in `lasting_pages`); `lasting` says no first value was written here, so no
-            // code reads the static yet; `bytes` is a fresh vector, so they cannot overlap.
+            // code reads the static yet; `bytes` is the runtime's own buffer, so they cannot
+            // overlap.
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len())
             };
-            self.lasting.insert(address);
+            // alloc: a static given its first value, kept for good
+            self.lasting.insert(new, address);
         }
         // A daemon started again knows none of them, and places what it has below.
-        if let Some(&low) = self.lasting_pages.iter().min() {
+        if let Some(&low) = self.lasting_pages.first() {
             self.process.end = self.process.end.min(low - self.slide);
         }
         Ok(())
     }
 
-    fn publish(&self) -> Result<(), String> {
-        let path = self.dir.join("process");
-        let partial = self.dir.join(format!("process.{}", self.process.pid));
-        std::fs::write(&partial, self.process.encode())
-            .and_then(|()| std::fs::rename(&partial, &path))
-            .map_err(|it| format!("{}: {it}", path.display()))
+    fn publish(&mut self) -> Result<(), String> {
+        self.text.clear();
+        self.process.encode_into(&mut self.text);
+        std::fs::write(&self.partial, &self.text)
+            .and_then(|()| std::fs::rename(&self.partial, &self.process_file))
+            // alloc: error path
+            .map_err(|it| format!("{}: {it}", self.process_file.display()))
     }
 }
 
@@ -342,11 +388,13 @@ struct Image {
 impl Image {
     fn read(path: &Path) -> Result<Image, String> {
         let bytes =
+            // alloc: error path
             std::fs::read(path).map_err(|it| format!("reading {}: {it}", path.display()))?;
         if bytes.get(..4) != Some(b"\x7fELF")
             || bytes.get(4) != Some(&2)
             || bytes.get(5) != Some(&1)
         {
+            // alloc: error path
             return Err("the executable is not a little-endian ELF64 image".to_owned());
         }
         let u16_at = |at: usize| -> Result<u16, String> {
@@ -354,6 +402,7 @@ impl Image {
                 .get(at..at + 2)
                 .and_then(|it| it.try_into().ok())
                 .map(u16::from_le_bytes)
+                // alloc: error path
                 .ok_or("ELF header ends early".to_owned())
         };
         let u32_at = |at: usize| -> Result<u32, String> {
@@ -361,6 +410,7 @@ impl Image {
                 .get(at..at + 4)
                 .and_then(|it| it.try_into().ok())
                 .map(u32::from_le_bytes)
+                // alloc: error path
                 .ok_or("ELF header ends early".to_owned())
         };
         let u64_at = |at: usize| -> Result<u64, String> {
@@ -368,6 +418,7 @@ impl Image {
                 .get(at..at + 8)
                 .and_then(|it| it.try_into().ok())
                 .map(u64::from_le_bytes)
+                // alloc: error path
                 .ok_or("ELF header ends early".to_owned())
         };
         let kind = u16_at(16)?;
@@ -377,6 +428,7 @@ impl Image {
         let mut start = u64::MAX;
         let mut end = 0;
         let mut first = None;
+        // alloc: setup, the executable's notes, read once at start
         let mut notes = Vec::new();
         for nth in 0..phnum {
             let at = phoff + nth * phentsize;
@@ -430,8 +482,10 @@ fn build_id(mut bytes: &[u8]) -> Option<[u8; 16]> {
 
 fn load_bias(path: &Path, first_offset: u64, first_address: u64) -> Result<u64, String> {
     let wanted =
+        // alloc: error path
         std::fs::canonicalize(path).map_err(|it| format!("canonicalizing executable: {it}"))?;
     let maps = std::fs::read_to_string("/proc/self/maps")
+        // alloc: error path
         .map_err(|it| format!("reading process maps: {it}"))?;
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
@@ -447,12 +501,15 @@ fn load_bias(path: &Path, first_offset: u64, first_address: u64) -> Result<u64, 
             continue;
         }
         let address =
+            // alloc: error path
             u64::from_str_radix(start, 16).map_err(|_| "invalid process map address".to_owned())?;
         return address
             .checked_sub(first_address & !(PAGE - 1))
             .and_then(|it| it.checked_sub(first_offset))
+            // alloc: error path
             .ok_or("invalid ELF load bias".to_owned());
     }
+    // alloc: error path
     Err("the executable is not mapped at a known address".to_owned())
 }
 
@@ -481,6 +538,7 @@ fn reserve(image: &Image) -> Result<(u64, u64), String> {
         }
         at = at.saturating_add(ROOM);
     }
+    // alloc: error path
     Err("nothing near the program is free to put edits in".to_owned())
 }
 
@@ -515,6 +573,7 @@ fn watch(dir: &Path, id: [u8; 16]) -> Receiver<(Patch, Instant)> {
     let executable = std::env::current_exe().ok();
     let mut linked = executable.as_ref().and_then(|path| stamp(path));
     std::thread::Builder::new()
+        // alloc: setup, the thread's name, once
         .name("blaze-live".to_owned())
         .spawn(move || {
             loop {
@@ -538,6 +597,7 @@ fn watch(dir: &Path, id: [u8; 16]) -> Receiver<(Patch, Instant)> {
                             let patch = Patch {
                                 uuid: other,
                                 sequence,
+                                // alloc: once, the program was linked again and has to start
                                 body: Body::Restart("the program was linked again".to_owned()),
                             };
                             if send.send((patch, Instant::now())).is_err() {
@@ -563,19 +623,30 @@ fn watch(dir: &Path, id: [u8; 16]) -> Receiver<(Patch, Instant)> {
     receive
 }
 
-/// The protection of the mapping each step of `plan` is in, from one read of
-/// /proc/self/maps before the threads are stopped: each step checked to be in one readable
-/// mapping, so its pages, made writable for it, are given back one protection.
-fn protections(plan: &Plan) -> Result<Vec<i32>, String> {
-    let maps = std::fs::read_to_string("/proc/self/maps")
+/// Puts in `protections` the protection of the mapping each step of `plan` is in, from one
+/// read of /proc/self/maps (into `maps`, its mappings into `mapped`) before the threads are
+/// stopped: each step checked to be in one readable mapping, so its pages, made writable for
+/// it, are given back one protection. The buffers are kept from one patch to the next.
+fn protections(
+    plan: &Plan,
+    maps: &mut String,
+    mapped: &mut Vec<(u64, u64, i32)>,
+    protections: &mut Vec<i32>,
+) -> Result<(), String> {
+    use std::io::Read as _;
+    maps.clear();
+    std::fs::File::open("/proc/self/maps")
+        .and_then(|mut it| it.read_to_string(maps))
+        // alloc: error path
         .map_err(|it| format!("reading process maps: {it}"))?;
-    let mut mapped = Vec::new();
+    mapped.clear();
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
         let (Some(range), Some(perms)) = (fields.next(), fields.next()) else { continue };
         let Some((start, end)) = range.split_once('-') else { continue };
         let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
         else {
+            // alloc: error path
             return Err(format!("/proc/self/maps has a line {line:?}"));
         };
         let perms = perms.as_bytes();
@@ -585,32 +656,34 @@ fn protections(plan: &Plan) -> Result<Vec<i32>, String> {
         mapped.push((start, end, protection));
     }
     mapped.sort_unstable();
-    plan.steps
-        .iter()
-        .map(|step| {
-            let end = step.address + step.bytes.len() as u64;
-            let at = mapped.partition_point(|it| it.1 <= step.address);
-            match mapped.get(at) {
-                Some(&(start, until, protection))
-                    if start <= step.address && end <= until && protection & PROT_READ != 0 =>
-                {
-                    Ok(protection)
-                }
-                _ => Err(format!(
+    protections.clear();
+    for step in &plan.steps {
+        let end = step.address + step.len() as u64;
+        let at = mapped.partition_point(|it| it.1 <= step.address);
+        match mapped.get(at) {
+            Some(&(start, until, protection))
+                if start <= step.address && end <= until && protection & PROT_READ != 0 =>
+            {
+                protections.push(protection);
+            }
+            _ => {
+                // alloc: error path
+                return Err(format!(
                     "a write at {:#x}..{end:#x}, in no one readable mapping of the executable",
                     step.address
-                )),
+                ));
             }
-        })
-        .collect()
+        }
+    }
+    Ok(())
 }
 
-/// Writes `step` over the image, whose pages have `protection`: made writable for the write
-/// if they are not, then given it back. Called with every other thread stopped; it allocates
-/// nothing.
-fn put(step: &Step, protection: i32) -> Result<(), Broke> {
+/// Writes `bytes`, `step`'s, over the image, whose pages have `protection`: made writable for
+/// the write if they are not, then given it back. Called with every other thread stopped; it
+/// allocates nothing.
+fn put(step: &Step, bytes: &[u8], protection: i32) -> Result<(), Broke> {
     let page = step.address & !(PAGE - 1);
-    let len = ((step.address + step.bytes.len() as u64).next_multiple_of(PAGE) - page) as usize;
+    let len = ((step.address + bytes.len() as u64).next_multiple_of(PAGE) - page) as usize;
     let broke = |what, written| Broke {
         what,
         at: step.address,
@@ -627,13 +700,7 @@ fn put(step: &Step, protection: i32) -> Result<(), Broke> {
     // none inside them (`apply::write_stopped`), so nothing runs, reads or writes them while
     // they are written, and a thread let go fetches them after `cpuid` (`stop`). `bytes` is
     // the plan's own buffer.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            step.bytes.as_ptr(),
-            step.address as *mut u8,
-            step.bytes.len(),
-        )
-    };
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), step.address as *mut u8, bytes.len()) };
     // SAFETY: the same pages, given back the protection their mapping has.
     if !writable && unsafe { mprotect(page as *mut c_void, len, protection) } != 0 {
         return Err(broke("protecting the executable again", true));

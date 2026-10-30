@@ -36,33 +36,15 @@ pub mod join;
 pub mod nameres;
 pub mod wire;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use std::collections::BTreeMap;
 
-use blaze_ids::{Fingerprint, radix};
+use blaze_ids::{Fingerprint, bits::BitSet, radix};
 use blaze_query::{Edge, Memo, QueryKey};
 use serde::{Deserialize, Serialize};
-
-/// A bit per index, 64 to a word.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
-pub struct Bits(pub Vec<u64>);
-
-impl Bits {
-    pub fn with_len(len: usize) -> Bits {
-        Bits(vec![0; len.div_ceil(64)])
-    }
-
-    pub fn get(&self, i: u32) -> bool {
-        (self.0[i as usize / 64] >> (i % 64)) & 1 == 1
-    }
-
-    pub fn set(&mut self, i: u32) {
-        self.0[i as usize / 64] |= 1 << (i % 64);
-    }
-
-    pub fn count(&self) -> usize {
-        self.0.iter().map(|w| w.count_ones() as usize).sum()
-    }
-}
 
 /// What one build left in the database: every key it names (its results and what they read),
 /// sorted, and per key index whether there is a result, its fingerprint, whether this build
@@ -70,9 +52,9 @@ impl Bits {
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Trace {
     pub keys: Vec<QueryKey>,
-    pub has: Bits,
+    pub has: BitSet<u32>,
     /// Executed by this build, rather than kept from an earlier one.
-    pub ran: Bits,
+    pub ran: BitSet<u32>,
     /// `Fingerprint(0)` where there is no result.
     pub fingerprints: Vec<Fingerprint>,
     /// Key `i`'s edges are `edges_from[i]..edges_from[i + 1]` of `reads` and `saw`.
@@ -151,8 +133,8 @@ impl TraceBuilder {
         let n = distinct.len();
         let mut trace = Trace {
             keys: order.iter().map(|&id| distinct[id as usize]).collect(),
-            has: Bits::with_len(n),
-            ran: Bits::with_len(n),
+            has: BitSet::new(n),
+            ran: BitSet::new(n),
             fingerprints: vec![Fingerprint(0); n],
             edges_from: Vec::with_capacity(n + 1),
             reads: Vec::with_capacity(self.edges.len()),
@@ -164,9 +146,9 @@ impl TraceBuilder {
             if r != NONE {
                 let row = &self.rows[r as usize];
                 let i = i as u32;
-                trace.has.set(i);
+                trace.has.insert(i);
                 if row.ran {
-                    trace.ran.set(i);
+                    trace.ran.insert(i);
                 }
                 trace.fingerprints[i as usize] = row.fingerprint;
                 let edges = row.from as usize..(row.from + row.len) as usize;
@@ -266,7 +248,7 @@ impl Trace {
 
     /// Key `i`'s fingerprint, `None` when the build has no result for it.
     pub fn result(&self, i: u32) -> Option<Fingerprint> {
-        self.has.get(i).then(|| self.fingerprints[i as usize])
+        self.has.contains(i).then(|| self.fingerprints[i as usize])
     }
 
     pub fn results(&self) -> usize {
@@ -281,18 +263,18 @@ impl Trace {
 
     /// The key indices reachable from `roots` through edges, the roots included, as a bitset;
     /// every result when `roots` is empty. A root the trace does not name is not reachable.
-    pub fn reachable(&self, roots: &[QueryKey]) -> Bits {
+    pub fn reachable(&self, roots: &[QueryKey]) -> BitSet<u32> {
         if roots.is_empty() {
+            // clone: the answer, every result, once a join.
             return self.has.clone();
         }
-        let mut seen = Bits::with_len(self.keys.len());
+        let mut seen = BitSet::new(self.keys.len());
+        // alloc: once a join given roots, the stack of the walk.
         let mut next: Vec<u32> = roots.iter().filter_map(|k| self.index(k)).collect();
         while let Some(i) = next.pop() {
-            if seen.get(i) {
-                continue;
+            if seen.insert(i) {
+                next.extend(self.edges(i).map(|(read, _)| read));
             }
-            seen.set(i);
-            next.extend(self.edges(i).map(|(read, _)| read));
         }
         seen
     }
@@ -360,14 +342,14 @@ pub fn under(incremental: &Trace, scratch: &Trace, roots: &[QueryKey]) -> Vec<St
     let mut stale = Vec::new();
     let mut cursor = 0;
     for i in 0..scratch.keys.len() as u32 {
-        let Some(theirs) = scratch.result(i).filter(|_| reached.get(i)) else { continue };
+        let Some(theirs) = scratch.result(i).filter(|_| reached.contains(i)) else { continue };
         let query = scratch.keys[i as usize];
         let found = incremental.index_from(&mut cursor, &query);
         let Some((j, ours)) = found.and_then(|j| Some((j, incremental.result(j)?))) else {
             stale.push(Stale::Absent { query });
             continue;
         };
-        if !incremental.ran.get(j) {
+        if !incremental.ran.contains(j) {
             if let Some((read, saw)) = incremental.edges(j).find(|&(read, saw)| incremental.result(read) != Some(saw)) {
                 let now = incremental.result(read);
                 stale.push(Stale::Unverified { query, read: incremental.keys[read as usize], saw, now });
@@ -406,7 +388,7 @@ pub fn over(before: &Trace, after: &Trace) -> (Work, Vec<QueryKey>) {
     let mut needless = Vec::new();
     let mut cursor = 0;
     for i in 0..after.keys.len() as u32 {
-        let Some(now) = after.result(i).filter(|_| after.ran.get(i)) else { continue };
+        let Some(now) = after.result(i).filter(|_| after.ran.contains(i)) else { continue };
         work.ran += 1;
         let key = after.keys[i as usize];
         match before.index_from(&mut cursor, &key).and_then(|j| Some((j, before.result(j)?))) {
@@ -470,28 +452,7 @@ pub fn apart<K: Ord + Clone, V: PartialEq + Clone>(
 }
 
 /// SplitMix64: the same numbers from the same seed on every machine.
-#[derive(Clone, Debug)]
-pub struct Rng(u64);
-
-impl Rng {
-    pub fn new(seed: u64) -> Rng {
-        Rng(seed)
-    }
-
-    pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    /// A number in `0..n`; `n` is at least 1.
-    pub fn below(&mut self, n: u64) -> u64 {
-        assert!(n > 0, "Rng::below(0)");
-        ((u128::from(self.next_u64()) * u128::from(n)) >> 64) as u64
-    }
-}
+pub use blaze_ids::rng::SplitMix64 as Rng;
 
 /// `n` of `items` chosen by `seed` (all of them when there are no more), in their order.
 pub fn sample<T: Clone>(items: &[T], n: usize, seed: u64) -> Vec<T> {

@@ -185,7 +185,9 @@ server then decoded the body from the owned copy.
 header lines and body all borrow the parser's buffer, and they are given back on the next call.
 The server reads requests this way and decodes the CBOR body in place. The head is checked
 without allocating: UTF-8 first, then a bare CR found with `memchr`, in the same order and with
-the same errors as before. `next` (owned, `HttpRequest` unchanged) stays for blaze-ci's webhook.
+the same errors as before. blaze-ci's webhook reads in place too, so `next` (owned, `HttpRequest`
+unchanged) is kept for callers that keep the request past the next call, and the tests compare
+against it.
 - Tests in `http/tests.rs`:
   - `a_request_in_place_is_the_request`: 300 seeds feed 4 pipelined requests to an owned and a
     lent parser, including a chunked one with a trailer. The test compares what is held and
@@ -268,6 +270,10 @@ With HMAC and the kernel's share, that is about 60 µs: 2.3 times the bound.
 - **Read in place.** The handler reads with `RequestParser::next_ref`, and
   `webhook::receive_ref` checks the lent head and body. `receive` (owned) stays, and both go
   through one function, so what is taken and refused is the same.
+- **sonic-rs for the decode.** `webhook::parse` decodes with `sonic_rs::from_slice` into the
+  same serde payload types, at 2 to 3 GB/s instead of serde_json's 1.5 to 2. That is about
+  10 µs instead of 15. `parse_by` takes the decoder as a type, so the tests hold sonic-rs to
+  serde_json.
 - Tests:
   - `runtime/tests.rs`: `needs_loopback_deliveries_at_once_are_each_answered_by_a_kept_handler`
     (three rounds of 16 deliveries at once) and
@@ -276,25 +282,29 @@ With HMAC and the kernel's share, that is about 60 µs: 2.3 times the bound.
     requests (good, unsigned, tampered, wrong method, missing headers, other content types, a
     header given twice) through both parsers, the in-place one fed 7 bytes at a time, and asks
     for equal answers.
+  - `webhook/tests.rs`: `sonic_rs_takes_and_refuses_the_payloads_serde_json_did` decodes 11
+    payloads with both decoders, plus every prefix of each, every byte of each replaced by 21
+    others, a field given twice, trailing bytes, and edge numbers, escapes and nesting. It asks
+    for the same delivery, or the same status and words up to the decoder's own message.
+
+- **A parser that reads into its own room** (speed-link-edge, `blaze_api::http`).
+  `RequestParser::read_from(&mut impl Read)` reads into the room after what the parser holds:
+  the rest of the body once the head has given its `Content-Length`, else 16 KiB. The room is
+  zeroed once, when it grows, and an end mark says how much of it is the stream, as in
+  `frames.rs`. `reset()` keeps the room (up to 1 MiB) for the next connection, so each handler
+  keeps one parser and no read buffer of its own. That saves the copy into the parser and its
+  regrowth, about 5.5 µs. Test: `http/tests.rs`
+  `a_parser_read_into_is_the_parser_pushed_to` (200 seeds of short and interrupted reads,
+  against `push`, on one parser reset between connections, and a broken stream).
 
 **Where it is now.**
 - The hand-off to a waiting handler is one futex wake, about 3 µs.
-- The copy into the parser and its regrowth: about 5.5 µs.
 - HMAC: 12.5 µs.
-- serde_json: about 15 µs.
+- sonic-rs: about 10 µs.
 - The kernel's share: about 3.25 µs.
 
-That is about 39 µs, 1.5 times the bound. Two requests close the gap:
-- **`sonic-rs` for the decode** (`v2/requests/speed.md`, "speed-link-edge-sol-ci"). It is
-  serde-compatible and validates what it skips, at 2 to 3 GB/s. It saves about 5 µs.
-- **A `RequestParser` that reads into its own buffer** (for blaze-api's owner, through
-  speed-link-edge). `read_from(&mut impl Read)` would read into spare capacity, reserved to the
-  `Content-Length` once the head is read, and `reset()` would keep the capacity, so one parser
-  serves a handler's connections. It saves the copy and the regrowth, about 5.5 µs, and the
-  handler's own read buffer.
-
-With both, a delivery is about 28 µs, within the budget. The 3 µs hand-off is what is left over
-the bound. Removing it means each handler blocks in `accept` itself, and then a connection over
+That is about 28 µs, within the 28.6 µs budget. The 3 µs hand-off is what is left over the
+bound. Removing it means each handler blocks in `accept` itself, and then a connection over
 the most open waits in the kernel's backlog instead of being answered 503.
 
 **What `proof` measures.** The time from the connection's first byte to the event in the
@@ -487,9 +497,6 @@ precision on the GPU side until cosmos takes partial updates.
 
 ### What stands in the way
 
-- **`sonic-rs`** for the webhook decode: `v2/requests/speed.md`.
-- **`RequestParser::read_from` and `reset`** for the webhook's copy: blaze-api's owner, through
-  speed-link-edge.
 - **The terminal caller's tick and batching**: `v2/requests/cargo.md`.
 - **Partial uploads in cosmos.gl**: a patched build under `assets/vendor/build/`, with npm.
 - **`Request::Move` and `Op` byte strings** for the checkout's daemon side: blaze-api and

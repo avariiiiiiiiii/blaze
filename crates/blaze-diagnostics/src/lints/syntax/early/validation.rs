@@ -33,7 +33,10 @@ use syntax::{
 
 use crate::{
     cx::{Cx, item_range},
-    lints::syntax::{Emitted, Pass, Tree, Walk, source_fact},
+    lints::{
+        registry::LintId,
+        syntax::{Emitted, Pass, Tree, Walk, source_fact},
+    },
     lower::{
         Phase,
         incorrect_case::{is_upper_camel_case, to_upper_camel_case},
@@ -88,7 +91,7 @@ fn validate(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitt
     match node.kind() {
         SyntaxKind::EXTERN_BLOCK => {
             let Some(block) = ast::ExternBlock::cast(node.clone()) else { return };
-            if block.unsafe_token().is_none() {
+            if block.unsafe_token().is_none() && cx.lint_may_fire(LintId::named("missing_unsafe_on_extern")) {
                 missing_unsafe_on_extern(cx, tree, node, out);
             }
             if let Some(abi) = block.abi() {

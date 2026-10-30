@@ -49,6 +49,8 @@ So the contract's "where the `&'f Frame` comes from" has this answer for the sol
 mem-db-checks' B4 (`v2/requests/mem-db-checks.md`, line 1522) expected these tables to come from
 the body's frame. They don't need to: they recycle without one.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## What is made, how often, and where it goes (the inventory)
 
 "Per goal" means per canonical goal computed, that is, a global-cache miss. "Hit" means a goal
@@ -80,6 +82,8 @@ answered from the global cache.
 | stalled-on lists | `eval_ctxt/mod.rs:922-968` (`GoalStalledOn { stalled_vars, sub_roots }`) | 2 `ThinVec`s | per ambiguous goal without progress | unchanged: it is stored in the fulfillment pending set and the nested-goal lists. It is a result, built from the borrowed original values (req 3) |
 | external constraints | `eval_ctxt/mod.rs:1668, 1775` | the `Vec`s of `ExternalConstraintsData` | per response with region, opaque or normalization constraints | built in pooled `Vec`s and interned from a borrow (req 4) |
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### Caches that outlive a goal (not frame values)
 
 - **The `GlobalCache`** (`rustc_type_ir/src/search_graph/global_cache.rs`, patch 0003) is the
@@ -101,6 +105,8 @@ answered from the global cache.
   is per thread and per revision, so it is a cache too, not a temporary. Its entries clone
   `variables`, `var_kinds` and `variable_lookup_table` (`canonicalizer.rs:154-188`) once per
   param-env per revision. That is not per goal, and stays.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 1. solver-sync / lane db (`vendor/rustc_type_ir`, new patch 0006): cycle heads and candidate usages without heap nodes
 
@@ -1220,3 +1226,4 @@ They stay with their owners' annotations.
 - **Test:** the existing `scratch` tests, plus `a_shelf_keeps_its_n_largest` at `N = 8`.
 
 > to mem-db by tmux: lane mem's, as are its other blaze-mem requests.
+> forwarded to db (from requests, pass 16; told by tmux).

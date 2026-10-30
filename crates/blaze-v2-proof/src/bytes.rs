@@ -24,7 +24,8 @@ pub enum Simd {
 
 /// The paths this CPU can run, fastest first; [`Simd::Scalar`] is always last.
 pub fn available() -> Vec<Simd> {
-    let mut paths = Vec::new();
+    // Once per process through `fastest`, and in the tests that run every path.
+    let mut paths = Vec::with_capacity(5);
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("avx512bw") {
@@ -430,10 +431,10 @@ const BLOCK: usize = 4 << 20;
 /// [`first_difference`] with the bytes cut into one piece per core, each compared by
 /// [`fastest`] on a thread of its own: memory-bound on every core at once rather than one. A
 /// piece stops once an earlier one has found a difference; the earliest piece with one never
-/// stops, so the answer is the same offset as on one core.
+/// stops, so the answer is the same offset as on one core. The pieces are consecutive, so the
+/// least offset any piece finds is the answer: one atomic minimum, nothing collected.
 pub fn first_difference_across_cores(a: &[u8], b: &[u8]) -> Option<usize> {
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    first_difference_in(fastest(), a, b, cores, BLOCK)
+    first_difference_in(fastest(), a, b, crate::join::cores(), BLOCK)
 }
 
 fn first_difference_in(path: Simd, a: &[u8], b: &[u8], pieces: usize, block: usize) -> Option<usize> {
@@ -444,28 +445,28 @@ fn first_difference_in(path: Simd, a: &[u8], b: &[u8], pieces: usize, block: usi
         return first_difference_with(path, a, b);
     }
     let longer = a.len() != b.len();
-    let earliest = AtomicUsize::new(usize::MAX);
-    let piece = |p: usize| -> Option<usize> {
+    let first = AtomicUsize::new(usize::MAX);
+    let piece = |p: usize| {
         let (start, end) = (p * n / pieces, (p + 1) * n / pieces);
         let mut at = start;
-        while at < end && earliest.load(Relaxed) > p {
+        while at < end && first.load(Relaxed) >= start {
             let to = (at + block).min(end);
             if let Some(found) = first_difference_with(path, &a[at..to], &b[at..to]) {
-                earliest.fetch_min(p, Relaxed);
-                return Some(at + found);
+                first.fetch_min(at + found, Relaxed);
+                return;
             }
             at = to;
         }
-        None
     };
-    let found = std::thread::scope(|scope| {
+    std::thread::scope(|scope| {
         let piece = &piece;
-        let others: Vec<_> = (1..pieces).map(|p| scope.spawn(move || piece(p))).collect();
-        let mut found = vec![piece(0)];
-        found.extend(others.into_iter().map(|h| h.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))));
-        found
+        for p in 1..pieces {
+            scope.spawn(move || piece(p));
+        }
+        piece(0);
     });
-    found.into_iter().flatten().next().or(longer.then_some(n))
+    let first = first.into_inner();
+    (first != usize::MAX).then_some(first).or(longer.then_some(n))
 }
 
 /// A file's bytes, mapped read-only; an empty file maps nothing.
@@ -547,5 +548,34 @@ mod tests {
             assert_eq!(first_difference_in(Simd::Scalar, &a, &longer, pieces, BLOCK), Some(len));
             assert_eq!(first_difference_in(Simd::Scalar, &longer, &a, pieces, BLOCK), Some(len));
         }
+    }
+
+    /// The first difference on one core, by every path, reads the two slices in place and
+    /// allocates nothing once the path is detected.
+    #[test]
+    fn a_first_difference_allocates_nothing() {
+        let mut rng = Rng::new(31);
+        let len = 3 * 4096 + 77;
+        let a: Vec<u8> = (0..len).map(|_| rng.below(256) as u8).collect();
+        let mut b = a.clone();
+        b[len - 3] ^= 1;
+        let fastest = super::fastest();
+        for path in super::available() {
+            let found =
+                blaze_alloc_count::assert_at_most(0, "a first difference", || first_difference_with(path, &a, &b));
+            assert_eq!(found, Some(len - 3), "{path:?}");
+            let short = blaze_alloc_count::assert_at_most(0, "a first difference of a short input", || {
+                first_difference_with(path, &a[..9], &b[..10])
+            });
+            assert_eq!(short, Some(9), "{path:?}");
+        }
+        let same = blaze_alloc_count::assert_at_most(0, "equal bytes by the fastest path", || {
+            super::first_difference(&a, &a)
+        });
+        assert_eq!(same, None);
+        let one = blaze_alloc_count::assert_at_most(0, "one piece, on this thread", || {
+            first_difference_in(fastest, &a, &b, 1, 4096)
+        });
+        assert_eq!(one, Some(len - 3));
     }
 }

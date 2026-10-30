@@ -10,11 +10,11 @@
 //! What they share follows rustc's `compiler/rustc_lint/src/utils.rs` (`peel_casts`),
 //! `compiler/rustc_lint/src/context.rs` (`LateContext::expr_or_init`) (MIT or Apache-2.0).
 
-mod autorefs;
-mod dangling;
-mod deref_null;
-mod ptr_nulls;
-mod reference_casting;
+pub(crate) mod autorefs;
+pub(crate) mod dangling;
+pub(crate) mod deref_null;
+pub(crate) mod ptr_nulls;
+pub(crate) mod reference_casting;
 
 use std::ops::ControlFlow;
 
@@ -37,17 +37,6 @@ use syntax::{
 
 use super::util;
 use crate::{lints::bodies::BodyCx, model::Span};
-
-/// rustc's late lint passes of null, dangling and cast pointers and of references in bodies.
-pub(super) fn passes() -> Vec<Box<dyn crate::lints::bodies::LatePass>> {
-    vec![
-        Box::new(reference_casting::InvalidReferenceCasting::default()),
-        Box::new(autorefs::ImplicitAutorefs),
-        Box::new(ptr_nulls::PtrNullChecks::default()),
-        Box::new(deref_null::DerefNullPtr::default()),
-        Box::new(dangling::DanglingPointers::default()),
-    ]
-}
 
 pub(super) use util::span;
 

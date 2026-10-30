@@ -489,12 +489,12 @@ impl<'db> Witness<'db> {
         (reader.at == text.len()).then_some(witness)
     }
 
-    fn fields(&self) -> Box<dyn Iterator<Item = &Witness<'db>> + '_> {
+    fn fields(&self) -> Fields<'_, 'db> {
         match self {
-            Witness::Ref { inner, .. } => Box::new(std::iter::once(&**inner)),
-            Witness::Tuple(fields) => Box::new(fields.iter()),
-            Witness::Adt { fields, .. } => Box::new(fields.iter().map(|(_, it)| it)),
-            Witness::Wild | Witness::Never(_) | Witness::Bool(_) => Box::new(std::iter::empty()),
+            Witness::Ref { inner, .. } => Fields::Witnesses(std::slice::from_ref(&**inner).iter()),
+            Witness::Tuple(fields) => Fields::Witnesses(fields.iter()),
+            Witness::Adt { fields, .. } => Fields::Named(fields.iter()),
+            Witness::Wild | Witness::Never(_) | Witness::Bool(_) => Fields::Witnesses(Default::default()),
         }
     }
 
@@ -589,6 +589,24 @@ impl<'db> Witness<'db> {
     }
 }
 
+/// The fields of a [`Witness`], in order.
+enum Fields<'w, 'db> {
+    Witnesses(std::slice::Iter<'w, Witness<'db>>),
+    Named(std::slice::Iter<'w, (hir::Field, Witness<'db>)>),
+}
+
+impl<'w, 'db> Iterator for Fields<'w, 'db> {
+    type Item = &'w Witness<'db>;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'w Witness<'db>> {
+        match self {
+            Fields::Witnesses(it) => it.next(),
+            Fields::Named(it) => it.next().map(|(_, it)| it),
+        }
+    }
+}
+
 /// rustc names the variants of `Option` and `Result` (its diagnostic items) without their enum.
 fn is_option_or_result(cx: &Cx<'_, '_>, adt: Adt) -> bool {
     let lang = matches!(adt.module(cx.db).krate(cx.db).origin(cx.db), base_db::CrateOrigin::Lang(_));
@@ -660,7 +678,7 @@ impl<'t, 'db> Reader<'t, '_, '_, 'db> {
             Adt::Struct(it) => (None, it.fields(db), it.kind(db)),
             Adt::Union(it) => (None, it.fields(db), it.kind(db)),
         };
-        let field_ty = |field: &hir::Field| field.ty(db).instantiate_type_params(ty.type_arguments());
+        let field_ty = |field: &hir::Field| field.ty(db).instantiate_type_params(db, ty.type_arguments());
         let mut fields = Vec::with_capacity(all.len());
         match kind {
             StructKind::Record => {
@@ -734,5 +752,16 @@ mod tests {
         let at = text.find("A =>").unwrap() as u32;
         assert_eq!(indentation_before(text, at), "        ");
         assert_eq!(extend_while(text, at + 7, |c| c.is_whitespace() || c == ','), text.find("    }").unwrap() as u32 + 4);
+    }
+
+    #[test]
+    fn a_witness_gives_its_fields_in_order() {
+        let tuple = Witness::Tuple(vec![Witness::Bool(true), Witness::Wild, Witness::Bool(false)]);
+        let fields: Vec<_> = tuple.fields().collect();
+        assert!(matches!(fields[..], [Witness::Bool(true), Witness::Wild, Witness::Bool(false)]));
+        let reference = Witness::Ref { mutable: false, inner: Box::new(Witness::Bool(true)) };
+        assert!(matches!(reference.fields().collect::<Vec<_>>()[..], [Witness::Bool(true)]));
+        assert_eq!(Witness::Wild.fields().count(), 0);
+        assert_eq!(Witness::Bool(true).fields().count(), 0);
     }
 }

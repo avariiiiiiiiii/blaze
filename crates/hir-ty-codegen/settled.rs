@@ -37,6 +37,7 @@ impl Mixed {
     /// instance behaves as every other, and none of this is asked.
     pub(super) fn of(
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         built: &FxHashSet<Crate>,
     ) -> Option<Mixed> {

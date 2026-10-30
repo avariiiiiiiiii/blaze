@@ -19,3 +19,5 @@ must change, each in its owner's lane:
 The MIR-level `AsmOperand::Sym` matches (hir-ty-mir pretty/optimize/monomorphization, hir-ty-share
 walk, hir-ty-borrowck, hir-ty-codegen, blaze-items form.rs) are a different type and unaffected,
 as are the `Sym(_)` arms in hir-ide, hir-ty-unsafeck, blaze-diagnostics unsafety.
+
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).

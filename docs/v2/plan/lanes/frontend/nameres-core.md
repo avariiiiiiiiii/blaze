@@ -252,6 +252,18 @@ order, then position; (3) a macro whose path goes through a name another module'
 in the same round resolves one round later; a `#[macro_export]` from a non-root module's
 expansion reaches the root's scope at the next round.
 
+Not differences, but where the old end-of-collection steps moved. `DefMap::shrink_to_fit`'s
+`settle_glob_ambiguities` runs in `scc_state` at the `Final` round, after the proc-macro
+censor, for each member with an ambiguity. A crate's scopes are handed over there, so they
+never reach `shrink_to_fit`. A block still settles in `shrink_to_fit`. The partition check
+covers `PathRead::Slot` reads only. Two `Unscoped` reads also read a scope fact, unchecked:
+`declared_enum_visibility` (the enum's container's whole scope) and the test-harness check
+(the parent's children). They hold by transitivity. The binding the path reached came through
+a chain of imports from the container, each one an edge of the graph. The path reached the
+harness module through its parent. So either module is a member or upstream. A miss shows up
+as a salsa cycle, not a wrong answer; the differential tests hunt it. Only the first
+`#[prelude_import]` holder is used.
+
 ## 7. Speed
 
 Per edit, nameres.md §6 and its speed-of-light. Core's costs on top: one `DeclKey`/`FactKey`
@@ -271,4 +283,5 @@ memoizes below the crate.
 | a one-member unit equals the old collector on single-module fixtures | `unit.rs` tests, against `collector::collect_defs` |
 | a read the partition forbids stops, naming the import | `unit.rs` test with a hand-built `Partition`-violating read (`#[should_panic(expected = "nameres facts: import")]`) |
 | the round kinds follow the old loop | `driver.rs` tests: eager-with-errors and reseed fixtures |
+| the final scopes' glob ambiguities are settled as the old end of collection settled them | `driver.rs` `glob_ambiguities_are_settled_as_the_old_collector_settles_them` (the projection compares `glob_ambiguities`, `shadowed_imports`, `underscore_imports`) |
 | crate-wide equality, trace | `facts/tests/` (frontend-nameres-diff) |

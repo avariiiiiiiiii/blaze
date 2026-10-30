@@ -10,38 +10,18 @@ mod reference;
 
 use std::sync::{Arc, Mutex};
 
+use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Order, Record};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     machine::{Config, Error, Input, Machine, NodeId, Outcome, Output, Pool, Spec},
     plane::{
-        Budget, Counts, Key, NodeRef, Nodes, Plane, PlaneConfig, PlaneInput, PlaneOutput,
+        Budget, Counts, Key, Memo, NodeRef, Nodes, Plane, PlaneConfig, PlaneInput, PlaneOutput,
         RequestId, RequestStats,
     },
     trace::{Trace, render},
 };
-
-/// SplitMix64, so the simulation needs no dependency and every seed is the same run.
-struct SplitMix(u64);
-
-impl SplitMix {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next_u64() % n.max(1)
-    }
-
-    fn one_in(&mut self, n: u64) -> bool {
-        self.below(n) == 0
-    }
-}
 
 fn key(k: u8) -> Key {
     Key([k; 32])
@@ -80,21 +60,21 @@ fn budget(bytes: u64) -> Option<Budget> {
     Some(Budget { bytes, from: "the test's budget".to_owned() })
 }
 
-fn open(plane: &mut Plane, request: u32, weight: u32, keep_going: bool) {
+fn open(plane: &mut Plane<impl Memo>, request: u32, weight: u32, keep_going: bool) {
     open_as(plane, request, weight, keep_going, false);
 }
 
-fn open_as(plane: &mut Plane, request: u32, weight: u32, keep_going: bool, idle: bool) {
+fn open_as(plane: &mut Plane<impl Memo>, request: u32, weight: u32, keep_going: bool, idle: bool) {
     let request = RequestId(request);
     let input = PlaneInput::Open { at_ns: 0, request, weight, keep_going, idle };
     assert!(plane.step(input).unwrap().is_empty());
 }
 
-fn add(plane: &mut Plane, request: u32, nodes: Vec<Spec>) -> Vec<PlaneOutput> {
+fn add(plane: &mut Plane<impl Memo>, request: u32, nodes: Vec<Spec>) -> Vec<PlaneOutput> {
     plane.step(PlaneInput::Add { at_ns: 0, request: RequestId(request), nodes }).unwrap()
 }
 
-fn close(plane: &mut Plane, request: u32) -> Vec<PlaneOutput> {
+fn close(plane: &mut Plane<impl Memo>, request: u32) -> Vec<PlaneOutput> {
     plane.step(PlaneInput::Close { at_ns: 0, request: RequestId(request) }).unwrap()
 }
 
@@ -102,7 +82,7 @@ fn done(id: u32, outcome: Outcome, added: Vec<Spec>) -> PlaneInput {
     PlaneInput::Done { at_ns: 0, id: NodeId(id), outcome, added, group: None, peak: 0 }
 }
 
-fn built(plane: &mut Plane, id: u32) -> Vec<PlaneOutput> {
+fn built(plane: &mut Plane<impl Memo>, id: u32) -> Vec<PlaneOutput> {
     plane.step(done(id, Outcome::Built, Vec::new())).unwrap()
 }
 
@@ -222,7 +202,7 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
     assert_eq!(render(&outputs).trim_end(), include_str!("../traces/cold-small.out").trim_end());
 
     for seed in 0..300u64 {
-        let mut random = SplitMix(seed);
+        let mut random = SplitMix64::new(seed);
         let config = Config {
             io: 1 + random.below(3) as usize,
             work: 1 + random.below(4) as usize,
@@ -232,7 +212,7 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
         let mut plane = one_request(config);
         let mut next = 0u32;
         let mut ids: Vec<u32> = Vec::new();
-        let mut make = |random: &mut SplitMix, ids: &mut Vec<u32>, count: u64| {
+        let mut make = |random: &mut SplitMix64, ids: &mut Vec<u32>, count: u64| {
             let mut nodes = Vec::new();
             for _ in 0..count {
                 let mut deps: Vec<u32> = (0..random.below(4))
@@ -286,13 +266,18 @@ fn one_request_without_keys_or_budget_says_what_the_machine_says() {
 /// task's value in it before its `Done`, as the work does.
 type Db = Arc<Mutex<FxHashMap<Key, Outcome>>>;
 
-fn with_db(config: PlaneConfig) -> (Plane, Db) {
+/// A test's [`Db`] as the plane's memo.
+struct DbMemo(Db);
+
+impl Memo for DbMemo {
+    fn settled(&self, key: Key) -> Option<Outcome> {
+        self.0.lock().expect("the test's database").get(&key).cloned()
+    }
+}
+
+fn with_db(config: PlaneConfig) -> (Plane<DbMemo>, Db) {
     let db = Db::default();
-    let memo = {
-        let db = db.clone();
-        move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
-    };
-    (Plane::with_memo(config, Box::new(memo)).unwrap(), db)
+    (Plane::with_memo(config, DbMemo(db.clone())).unwrap(), db)
 }
 
 #[test]
@@ -332,8 +317,8 @@ fn a_key_the_database_has_runs_nothing() {
 #[test]
 fn a_request_says_what_it_ran_and_its_measured_critical_path() {
     let (mut plane, db) = with_db(config(1, 2));
-    let at = |plane: &mut Plane, input: PlaneInput| plane.step(input).unwrap();
-    let add_at = |plane: &mut Plane, at_ns: u64, request: u32, nodes: Vec<Spec>| {
+    let at = |plane: &mut Plane<DbMemo>, input: PlaneInput| plane.step(input).unwrap();
+    let add_at = |plane: &mut Plane<DbMemo>, at_ns: u64, request: u32, nodes: Vec<Spec>| {
         plane.step(PlaneInput::Add { at_ns, request: RequestId(request), nodes }).unwrap()
     };
     let done_at = |id: u32, at_ns: u64| PlaneInput::Done {
@@ -468,7 +453,7 @@ fn nodes_as_columns_say_what_nodes_as_specs_say() {
     let kinds = [NodeKind::Codegen, NodeKind::Std, NodeKind::Link];
     let mut batches = 0;
     for seed in 0..300 {
-        let mut random = SplitMix(seed);
+        let mut random = SplitMix64::new(seed);
         let config = config(1 + random.below(2) as usize, 1 + random.below(3) as usize);
         let mut specs = Plane::new(config.clone()).unwrap();
         let mut columns = Plane::new(config).unwrap();
@@ -888,7 +873,7 @@ fn one_thread_is_shared_by_weight() {
 #[test]
 fn fair_share_keeps_each_request_to_its_weight_within_one_task() {
     for seed in 0..200u64 {
-        let mut random = SplitMix(seed);
+        let mut random = SplitMix64::new(seed);
         let threads = 1 + random.below(6) as usize;
         let mut plane = Plane::new(config(1, threads)).unwrap();
         // A request that takes every thread first, so the others all come in at once.
@@ -999,7 +984,7 @@ impl Model {
 
     /// Takes the outputs of one step, checking each; `holding` is the node the plane said held
     /// back the others before it.
-    fn take(&mut self, plane: &Plane, outputs: Vec<PlaneOutput>, holding: Option<NodeId>) {
+    fn take(&mut self, plane: &Plane<DbMemo>, outputs: Vec<PlaneOutput>, holding: Option<NodeId>) {
         let seed = self.seed;
         let mut first_with_memory = true;
         let mut held_settled = false;
@@ -1231,7 +1216,7 @@ struct Seen {
 }
 
 impl Seen {
-    fn of(plane: &Plane, requests: u32, nodes: u32) -> Seen {
+    fn of(plane: &Plane<DbMemo>, requests: u32, nodes: u32) -> Seen {
         Seen {
             holding: plane.holding(),
             granted: plane.granted(),
@@ -1241,7 +1226,7 @@ impl Seen {
         }
     }
 
-    fn of_reference(plane: &reference::Plane, requests: u32, nodes: u32) -> Seen {
+    fn of_reference(plane: &reference::Plane<impl Memo>, requests: u32, nodes: u32) -> Seen {
         Seen {
             holding: plane.holding(),
             granted: plane.granted(),
@@ -1255,7 +1240,7 @@ impl Seen {
 /// A simulation's plane, driven through one buffer of outputs as a long-lived caller would,
 /// and what was done to it.
 struct Driver {
-    plane: Plane,
+    plane: Plane<DbMemo>,
     db: Db,
     buffer: Vec<PlaneOutput>,
     requests: u32,
@@ -1292,7 +1277,7 @@ struct Simulated {
 }
 
 /// Fisher-Yates, by the seeded generator.
-fn shuffle<T>(random: &mut SplitMix, items: &mut [T]) {
+fn shuffle<T>(random: &mut SplitMix64, items: &mut [T]) {
     for at in (1..items.len()).rev() {
         items.swap(at, random.below(at as u64 + 1) as usize);
     }
@@ -1303,7 +1288,7 @@ fn shuffle<T>(random: &mut SplitMix, items: &mut [T]) {
 /// and a task asked to give way mostly does. Without, the run is that of before idle
 /// requests were.
 fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
-    let mut random = SplitMix(seed);
+    let mut random = SplitMix64::new(seed);
     let budget = (!random.one_in(3)).then(|| 100 + random.below(900));
     let starve_after = random.below(5) as u32;
     let config = PlaneConfig {
@@ -1314,7 +1299,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
     };
     let (plane, db) = with_db(config.clone());
     let keys = 1 + random.below(12) as u8;
-    let memory = |random: &mut SplitMix| match budget {
+    let memory = |random: &mut SplitMix64| match budget {
         None => random.below(1000),
         Some(budget) if random.one_in(15) => budget + 1 + random.below(budget),
         Some(budget) if random.one_in(4) => 0,
@@ -1340,7 +1325,7 @@ fn simulate(seed: u64, release: bool, idle: bool) -> Simulated {
     // Each node after its deps, a third of the batches then shuffled: the plane puts them in
     // order.
     let new_nodes =
-        |random: &mut SplitMix, model: &Model, next_id: &mut u32, request: u32, count: u64| {
+        |random: &mut SplitMix64, model: &Model, next_id: &mut u32, request: u32, count: u64| {
             let mut nodes: Vec<Spec> = Vec::new();
             let mut known: Vec<u32> = model.nodes_of.get(&request).cloned().unwrap_or_default();
             for _ in 0..count {
@@ -1570,11 +1555,7 @@ fn releasing_requests_changes_no_output() {
 /// same to each act and of itself after it.
 fn replay(seed: u64, simulated: &Simulated) {
     let db = Db::default();
-    let memo = {
-        let db = db.clone();
-        move |key: Key| db.lock().expect("the test's database").get(&key).cloned()
-    };
-    let mut model = reference::Plane::with_memo(simulated.config.clone(), Box::new(memo)).unwrap();
+    let mut model = reference::Plane::with_memo(simulated.config.clone(), DbMemo(db.clone())).unwrap();
     assert_eq!(model.config(), &simulated.config);
     let requests = simulated.acts.first().map_or(0, |(_, _, seen)| seen.stats.len() as u32);
     for (at, (act, said, seen)) in simulated.acts.iter().enumerate() {
@@ -1630,7 +1611,7 @@ fn the_plane_says_what_the_reference_says() {
 /// one refused changes nothing.
 #[test]
 fn batches_in_any_order_and_refused_ones_match_the_reference() {
-    let batch = |random: &mut SplitMix, known: &[u32], next: &mut u32| {
+    let batch = |random: &mut SplitMix64, known: &[u32], next: &mut u32| {
         let count = 1 + random.below(8) as u32;
         let fresh: Vec<u32> = (*next..*next + count).collect();
         *next += count;
@@ -1666,7 +1647,7 @@ fn batches_in_any_order_and_refused_ones_match_the_reference() {
     };
     let mut refused = 0;
     for seed in 0..400u64 {
-        let mut random = SplitMix(seed);
+        let mut random = SplitMix64::new(seed);
         let config = PlaneConfig {
             io: 1 + random.below(2) as usize,
             work: 1 + random.below(3) as usize,
@@ -1743,7 +1724,7 @@ fn a_long_lived_plane_says_to_each_request_what_a_fresh_one_says() {
     let mut long = Plane::new(config(2, 3)).unwrap();
     let mut buffer = Vec::new();
     for round in 0..50u32 {
-        let mut random = SplitMix(u64::from(round));
+        let mut random = SplitMix64::new(u64::from(round));
         let count = 1 + random.below(40) as u32;
         let nodes: Vec<Spec> = (0..count)
             .map(|id| {

@@ -20,6 +20,10 @@ mod kept;
 mod tests;
 pub mod world;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use std::{
     io::Write,
     net::TcpListener,
@@ -123,6 +127,7 @@ impl Graphs {
     /// What Flecs's REST answers `method` of `path`, over the world.
     pub fn rest(&self, method: &str, path: &str) -> Result<Answer, String> {
         let (answer, answered) = mpsc::channel();
+        // alloc: the edge, once per REST request
         self.ask(Asked::Rest { method: method.to_owned(), path: path.to_owned(), answer })?;
         answered.recv().map_err(|_| gone())?
     }
@@ -148,11 +153,13 @@ impl Graphs {
 
     fn thread(&self) -> Result<&mpsc::Sender<Asked>, String> {
         let roots = &self.roots;
+        // clone: an Arc's count, once, as the thread starts; the error's is an error path
         self.thread.get_or_init(|| spawn(roots.clone())).as_ref().map_err(Clone::clone)
     }
 }
 
 fn gone() -> String {
+    // alloc: an error path
     "the build page's world is gone".to_owned()
 }
 
@@ -221,6 +228,7 @@ impl Roots {
                         }
                         let (level, at) = Roots::place(id);
                         let slots = self.levels[level].get_or_init(|| {
+                            // alloc: once per level, 29 in all, as its first root is added
                             (0..FIRST << level).map(|_| OnceLock::new()).collect()
                         });
                         let _ = slots[at].set(root.into());
@@ -241,6 +249,7 @@ fn spawn(roots: Arc<Roots>) -> Result<mpsc::Sender<Asked>, String> {
     std::thread::Builder::new()
         .name("blaze-web-world".into())
         .spawn(move || Thread { roots, kept: Kept::default(), world: None }.run(asked))
+        // alloc: an error path
         .map_err(|e| format!("no thread for the build page's world: {e}"))?;
     Ok(to)
 }
@@ -307,6 +316,7 @@ impl Thread {
                 state.flush();
                 Ok(state)
             }
+            // clone: an error path, said to each page asked for after
             Err(why) => Err(why.clone()),
         }
     }
@@ -321,8 +331,10 @@ struct State {
     /// The workspace whose build began last: the one the pages show.
     shown: Option<usize>,
     followers: Vec<Follower>,
-    /// What the followers are sent next: a CBOR sequence of records, one frame once flushed.
+    /// What the followers are sent next: a CBOR sequence of records, one frame once flushed,
+    /// and what encodes a record into it.
     pending: Vec<u8>,
+    writer: blaze_protocol::cbor::Writer,
     /// The gzipped snapshot of the program of a root as of its `changes`.
     snapshot: Option<(u32, u64, Arc<[u8]>)>,
 }
@@ -334,15 +346,12 @@ struct Follower {
 
 impl State {
     fn new(world: World) -> State {
-        State {
-            world,
-            programs: Vec::new(),
-            roots: Vec::new(),
-            shown: None,
-            followers: Vec::new(),
-            pending: Vec::new(),
-            snapshot: None,
-        }
+        // alloc: none until they fill, once per daemon
+        let (programs, roots) = (Vec::new(), Vec::new());
+        // alloc: as above
+        let (followers, pending) = (Vec::new(), Vec::new());
+        let writer = blaze_protocol::cbor::Writer::new();
+        State { world, programs, roots, shown: None, followers, pending, writer, snapshot: None }
     }
 
     fn record(&mut self, roots: &Roots, root: u32, build: u64, record: &Record) {
@@ -383,6 +392,7 @@ impl State {
         if moved || applied == Applied::Anew {
             self.flush();
             let Some(snapshot) = self.snapshot(at) else { return };
+            // clone: an Arc's count, once per page a build begins
             self.followers.retain(|it| it.send(snapshot.clone()));
         }
         // The functions of a record that made the program anew are in its snapshot.
@@ -391,7 +401,7 @@ impl State {
             if now != told {
                 self.pending.extend_from_slice(last);
             } else if matches!(record.event, Event::Functions { .. }) {
-                if let Err(error) = blaze_protocol::cbor::append(&mut self.pending, record) {
+                if let Err(error) = self.writer.append(&mut self.pending, record) {
                     eprintln!("build page: a record does not encode: {error}");
                 }
             }
@@ -408,6 +418,7 @@ impl State {
         }
         let frame: Arc<[u8]> = Arc::from(&self.pending[..]);
         self.pending.clear();
+        // clone: an Arc's count, once per page a frame: the frame is encoded once for all
         self.followers.retain(|it| it.send(frame.clone()));
     }
 
@@ -415,6 +426,7 @@ impl State {
         self.flush();
         let (to, told) = mpsc::channel();
         let follower = Follower { to, waiting: Arc::default() };
+        // clone: an Arc's count, once per page
         let waiting = follower.waiting.clone();
         match self.shown {
             Some(at) => {
@@ -445,9 +457,11 @@ impl State {
         if let Some((of, as_of, snapshot)) = &self.snapshot
             && (*of, *as_of) == (root, changes)
         {
+            // clone: an Arc's count
             return Some(snapshot.clone());
         }
         let snapshot = gzip(&self.world.snapshot(&self.programs[at]))?;
+        // clone: an Arc's count
         self.snapshot = Some((root, changes, snapshot.clone()));
         Some(snapshot)
     }
@@ -486,19 +500,25 @@ pub struct Served {
 /// Serves the page of `graphs` on a port of 127.0.0.1 the system picks, on threads of its
 /// own, until the process exits, its world made from the records kept until now. `asked` is
 /// called for each request: the daemon is in use.
+// dyn: the daemon's hook, called once per connection
 pub fn serve(graphs: Arc<Graphs>, asked: Arc<dyn Fn() + Send + Sync>) -> std::io::Result<Served> {
     graphs.start().map_err(std::io::Error::other)?;
     let listener = TcpListener::bind(("127.0.0.1", 0))?;
     let port = listener.local_addr()?.port();
     let mut token = [0u8; 16];
+    // alloc: an error path
     getrandom::fill(&mut token).map_err(|error| std::io::Error::other(error.to_string()))?;
+    // alloc: once per server, its token and where the page is
     let token: String = token.iter().map(|it| format!("{it:02x}")).collect();
+    // alloc: as above
     let url = format!("http://127.0.0.1:{port}/{token}/");
+    // alloc: once per server
     let site = Arc::new(http::Site { port, token, graphs });
     std::thread::Builder::new().name("blaze-web".into()).spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             asked();
+            // clone: an Arc's count, once per connection
             let site = site.clone();
             let spawned = std::thread::Builder::new()
                 .name("blaze-web-request".into())

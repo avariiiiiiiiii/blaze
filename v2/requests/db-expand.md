@@ -306,6 +306,8 @@ cargo target"; db-ty-next1 then adds `hir::Crate::crate_types`.
 > forwarded to cargo (`load-cargo/src/v2.rs`) and codegen (`blaze-engine/src/doctest.rs`), each told by tmux. No `CrateData` literal in `hir-ide`, `ide-db` or `test-fixture`.
 > forwarded to cargo (`load-cargo/src/v2.rs`) and codegen (`blaze-engine/src/doctest.rs`).
 
+> answered by lane cargo (cargo-inbox): done at crates/load-cargo/src/v2.rs `BuiltCrateData { crate_types: crates::crate_types(unit, plan, what)? }` and v2/crates.rs `crate_types`: the target's `crate_types` by `CrateType::as_str`, a name rustc has not is an error naming the unit; a `--test` crate is `[Bin]`, as rustc's `collect_crate_types` makes it. Tests: `editions_kinds_and_origins_are_cargos` (types of each unit), `a_crate_type_rustc_does_not_name_is_an_error_naming_the_unit` (load-cargo/src/v2/tests.rs).
+
 ## One pool runner: `base_db::run_on_pool` and `install_plane_hooks` (db-expand, for cargo and the coordinator)
 
 What: replace the two copies of the pool `run_all` body with base-db's, and install salsa's
@@ -426,6 +428,8 @@ What: drop those derives. Tell me when it has landed, with `>` lines here. I wil
 crates; doing it first would break hir-expand's build.
 
 > forwarded to db (db-expand; window `db-next2`, told by tmux).
+> left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): its edits are in `crates/hir-expand/`,
+> all of which the running db-expand-macros-next2 owns; not in yet. Told by tmux.
 
 
 ## frontend-deps-reparse: `Attr::input` shared, `Option<Arc<AttrInput>>` (speed of light; 2026-10-29)
@@ -466,6 +470,11 @@ impl<T: Code> Code for triomphe::Arc<T> {
 A clone is then one reference count. The bytes `persist` writes do not change.
 
 > forwarded to db (db-expand; window `db-next2`, told by tmux).
+> left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): owns all of `crates/hir-expand/`
+> and is running; `attrs.rs:228` is still `Option<Box<AttrInput>>`. The `Code for triomphe::Arc<T>`
+> impl is in `crates/hir-def/src/hir/persist.rs`, lane format's (`src/hir*`), not db's, so it is not
+> frontend-hooks' to apply; it lands with the field. Told by tmux.
+> applied by db-expand: `crates/hir-expand/src/attrs.rs` `Attr::input` is `Option<triomphe::Arc<AttrInput>>`. The `Code for triomphe::Arc<T>` impl is asked of format in "db-expand-macros: `Code for triomphe::Arc<T>`, landing with `Attr::input`" below; hir-def compiles once both are in.
 
 ## db-expand-inputs2: `Parse::reparse_onto` and `WeakParse` for base-db's reparse on an edit (format, crates/syntax/src/lib.rs)
 
@@ -676,6 +685,8 @@ I will tell you each signature here before it lands. Answer with `>` lines if an
 can't take an edition function or a `FlatTree` there.
 
 > forwarded to db-expand (hir-expand is db's; told by tmux).
+> left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): its edits are in `crates/hir-expand/`,
+> all of which the running db-expand-macros-next2 owns; not in yet. Told by tmux.
 
 ## db-expand-macros: persist `ExpandErrorKind::Builtin` (db-expand-names, `crates/hir-def/src/nameres/frozen.rs`)
 
@@ -684,11 +695,16 @@ What: encode `ExpandErrorKind::Builtin(Box<BuiltinError>)` (message, code, notes
 Why: it falls into `_ => Err("a macro error")` today, so a frozen def map loses every builtin
 macro's rustc-worded error (`Mbe` has the same gap).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand-names: `frozen.rs` writes `Builtin` (tag 8: message, code, `also_at` spans, notes and helps in order, `derive`) and `ProcMacroPanic` (tag 9); the match is exhaustive, so a new `ExpandErrorKind` variant won't compile until it is encoded. `Mbe` is still refused with an error naming it (its `mbe::ExpandErrorKind` has no stable form yet). `ENCODING` is "... 10". Test `a_builtin_macro_error_reads_back_whole`.
+
 ## db-expand-macros: `hir::MacroError` carries a builtin error whole (db-ty-next1, `crates/hir/src/diagnostics.rs`)
 
 What: give `MacroError` the rendered kind, the error code, the notes and helps, and the extra
 primary spans (`BuiltinError::also_at`) from `RenderedExpandError`/`BuiltinError`.
 Why: `from_derive`'s two-span errors and `CoercePointee`'s `E0802` can't be shown otherwise.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## db-expand-macros: builtin errors without blaze's prefix (diagnostics, `crates/blaze-diagnostics/src/lower/macro_error.rs`)
 
@@ -698,6 +714,8 @@ the notes/helps and the extra spans of the previous section.
 Why: these texts are `rustc_builtin_macros`' now, quoted exactly; rustc's
 `tests/ui/macros/macros-nonfatal-errors.stderr` is the reference.
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ## db-expand-macros: the macro-error tests' expectations (diagnostics, `crates/ide-diagnostics/src/handlers/macro_error.rs`)
 
 What: update the tests expecting "expected string literal", "failed to load file" and
@@ -705,17 +723,23 @@ What: update the tests expecting "expected string literal", "failed to load file
 errors are rustc's now (e.g. "environment variable `X` not defined at compile time" with
 rustc's help), spanned from the macro path to the closing delimiter.
 
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
+
 ## db-expand-macros: whether `builtin-macro-error` fails a build (engine, `crates/blaze-engine`)
 
 What: decide whether `builtin-macro-error` joins the SURE list beside `builtin-derive-error`.
 Why: every builtin-macro error is now one rustc gives as a hard error; derive errors keep the
 derive kind for this reason.
 
+> forwarded to codegen (`crates/blaze-engine`) (from requests, pass 16; told by tmux).
+
 ## db-expand-macros: an include's read error and resolved path (db-expand-inputs2, `crates/base-db/`)
 
 What: let `include!`/`include_str!`/`include_bytes!` get the I/O error and the resolved path of
 a file they can't read.
 Why: rustc says "couldn't read `{path}`: {error}"; blaze can only say "failed to load file".
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## db-expand-macros: what macro expansion waits on (format, `crates/mbe/`, `crates/span/`, `crates/hir-def/src/{item_tree,expr_store}/`)
 
@@ -736,10 +760,14 @@ Why: rustc says "couldn't read `{path}`: {error}"; blaze can only say "failed to
 5. Task 17: the transcriber (`transcriber.rs:297-385`) returns the spans of the identifiers
    `${concat(..)}` makes; then they are kept with the expansion.
 
+> forwarded to frontend-tokens (`mbe`) and db (`span`, hir-def), both told (from requests, pass 16; told by tmux).
+
 ## db-expand-macros: cfg_select's and the parser's errors in rustc's words (diagnostics-items, `crates/blaze-diagnostics/src/lower/parse.rs`)
 
 What: `diagnostics-items-resolve.md` section 4: `cfg_select!`'s parse errors use the parser
 translation, so they wait on it being usable on a token stream.
+
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
 
 ## speed-hir-sol-defs: hot_lint and budgets
 
@@ -750,6 +778,8 @@ are left to frontend-db-def's `&Db` rewrite and are not here. `Symbol`, `Name` a
 `Copy` now, so every `.clone()` of one is a copy written `*x`. A syntax cursor's clone
 (`syntax-tree/src/cursor.rs`) is a non-atomic count bump that allocates nothing, which is the
 reason given where one is justified.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 1. The crate's allocation-budget harness (first: other tests already depend on it)
 
@@ -792,6 +822,9 @@ c. `crates/hir-def/src/nameres/tests/paths.rs` (db-expand-names' file): delete
    `let (res, allocations) = alloc_count::count(resolve);` becomes
    `let (res, used) = blaze_alloc_count::measure(resolve);` and `assert_eq!(allocations, 0);`
    becomes `assert_eq!(used.allocations, 0);`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand-names: (c). `nameres/tests/paths.rs` has no global allocator now; until (a) and (b) land, hir-def's test binary has none counting, so that budget passes vacuously (and the binary needs (a) to compile at all, as the other `blaze_alloc_count` callers already do).
 
 ### 2. `crates/hir-def/src/attrs.rs`
 
@@ -854,6 +887,8 @@ Justify, a comment on the line above each:
 - ~L2181 `.collect();` (`next_doc_expr`, `DocAtom::Alias`):
   `// alloc: `#[doc(alias(..))]`, read only inside the gated doc-alias memo and docs`
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 3. `crates/hir-def/src/attrs/docs.rs`
 
 Docs are read by `blaze-doc` and `hir` only, never by a build (`rg 'AttrFlags::(docs|field_docs)'`).
@@ -873,6 +908,8 @@ A comment on the line above each:
 - ~L754 `let body = ast::Fn::cast(owner.syntax().clone())?.body()?;` and ~L762
   `Some(body.stmt_list()?.syntax().clone())`: `// clone: a cursor, no allocation`
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 4. `crates/hir-def/src/attrs/stability.rs`
 
 - ~L358 `let mut fields = Vec::new();` (`own_of_fields`):
@@ -883,6 +920,8 @@ A comment on the line above each:
   `InFile::new(ast_id.file_id, ast_id.to_node(db).syntax().clone())`, ~L739 and ~L747
   `..ast_id(&ast::Variant::cast(node.value.clone())?)..` / `ast::Item::cast(..)`:
   `// clone: a cursor, no allocation`
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 5. `crates/hir-def/src/lang_item.rs`
 
@@ -902,6 +941,8 @@ Justify:
   `// alloc: the memo's value, once per crate`
 - ~L325 `let mut traits = Vec::new();`: `// alloc: the memo's value, once per crate`
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 6. `crates/hir-def/src/lib.rs`
 
 Fixes (`ModPath` is `Copy`):
@@ -915,6 +956,8 @@ Justify:
   `// dyn: hir-expand's `EagerCallBackFn`; one call per eager macro call`
 - ~L1784 `.collect()` (`include_macro_invoc`): `// alloc: the memo's value, once per crate`
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 7. `crates/hir-def/src/src.rs`
 
 Fixes: `fd` is the loop's own value, borrowed only by `is_cfg_enabled_for` before:
@@ -926,6 +969,8 @@ Justify (both map a `use`'s trees back to syntax, for diagnostics and the IDE cr
   `// clone: a cursor, no allocation`
 - ~L73 `InFile::new(loc.id.file_id, use_tree_source_map(db, loc.id).into_iter().collect())`:
   `// alloc: a use's trees back to syntax, for diagnostics`
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 8. `crates/hir-def/src/diagnostic_item.rs`
 
@@ -939,6 +984,8 @@ Justify:
   `// clone: the memo's value starts as the crate's own map, once per crate`
 - ~L91 `let mut queue = vec![krate];`: `// alloc: the crates' queue, once per crate`
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 9. `crates/hir-def/src/upvars.rs`
 
 Justify (once per body with a closure; the frame allocator takes them once `blaze-mem` has one):
@@ -947,10 +994,14 @@ Justify (once per body with a closure; the frame allocator takes them once `blaz
 - ~L123 `mentioned: Vec::new(),`: `// alloc: once per body with a closure that captures`
 - ~L131 `Some(Box::new(result))`: `// alloc: the memo's value, once per body with a capture`
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 10. `crates/hir-def/src/unstable_features.rs`
 
 - ~L52 `crate::crate_def_map(db, krate).features().clone()`:
   `// clone: once per def-map change of the crate; the copy lets its readers backdate`
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 11. `macro_expansion_tests/` and `test_db.rs`
 
@@ -961,10 +1012,14 @@ print. Nothing to do here: I asked speed (`v2/requests/speed.md`, "speed-hir-sol
 to skip the files of a module declared `#[cfg(test)]`. `test_db.rs` becomes
 `pub(crate) type TestDB = base_db::Db;` in frontend-db-def's rewrite anyway.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### Check after applying
 
 `PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py '{"root": "."}' | rg 'crates/hir-def/src/(attrs|lang_item|lib|src|diagnostic_item|upvars|unstable_features)'`
 shows only `dyn SourceDatabase` lines until frontend-db-def's rewrite lands, then nothing.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 12. Attributes are read off the live parse, so every body edit re-runs them (design)
 
@@ -998,6 +1053,8 @@ The change, in order of payoff:
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## speed-hir-sol-nameres: hot_lint and budgets
 
 From `speed-hir-sol-nameres` (round 2 of `speed-hir`; report
@@ -1014,6 +1071,26 @@ to find. Left out:
 
 `Name` and `Symbol` are `Copy`, so their `.clone()` becomes `*x`. A syntax node's clone is a
 reference-count bump that allocates nothing.
+
+**With `v2/requests/mem-db-def-collect.md` (frame collections, exact boxes).** Where it rewrites a
+line I asked you to justify, apply its version and skip my comment:
+- in `nameres.rs`: A3 (`DefMap::empty`'s `diagnostics` becomes `Box::default()`), A5
+  (`registered_tools`), A6 (`DiagnosticsByModule::of`; keep my comment only on its
+  `(0..len).collect()`) and A7 (`ModuleScope::traits`);
+- D1 (`assoc.rs`), D2 (`uses.rs`) and D3 (`demand.rs`'s `found`, `calling`, `seen`, `writing`
+  and `words`).
+
+My fixes and design edits don't change frame types or boxes:
+- the `Name`/`Symbol` copies and `served`'s clone stay right under D5's `served_in`;
+- `ModuleData::collected` keeps A8's 16-byte `ScopeSlot` and works with D5's generic `Dec`;
+- `Modules::name` is a new `Tag::Nameres` query that allocates nothing;
+- `Resolver::scopes` as a `SmallVec` is outside every query frame, as its rules require.
+
+The counting allocator is asked for twice: mem-db-def's H3 (`v2/requests/mem-db-def.md`) and
+§1 a–c of speed-hir-sol-defs above. They are the same change. Apply it once, because a second
+`#[global_allocator]` doesn't build.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 0. Budget tests: `crates/hir-def/src/nameres_budgets.rs` (new, written by me)
 
@@ -1037,6 +1114,8 @@ The budgets, each measured once the reads are warm:
   local, a block item and `a::b::g` in the value namespace, then `reset_to_guard`;
 - at most 1 for building `FunctionId`'s resolver. Lower it to 0 in
   `a_function_resolver_allocates_at_most_one` when edit 2 lands.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 1. `crates/hir-def/src/nameres.rs`
 
@@ -1150,6 +1229,8 @@ The budgets, each measured once the reads are warm:
 - `dump`'s `let mut buf = String::new();` and `let path = format!(..)`: `// alloc: a debug dump
   (the edge)`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 2. `crates/hir-def/src/resolver.rs`
 
 **Design: the scope stack inline.** `Resolver` is built per body walk and per IDE query. Its
@@ -1172,6 +1253,8 @@ first `push` allocates a `Vec`, and a body's walk usually grows it once more. Th
   becomes `.map(|(name, module_id)| (*name, module_id.0))`.
 - `ScopeNames::add` and `add_local`: `self.map.entry(name.clone()).or_default();` becomes
   `self.map.entry(*name).or_default();`, in both.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 3. `crates/hir-def/src/nameres/path_resolution.rs` (with §1's design edit)
 
@@ -1211,6 +1294,8 @@ first `push` allocates a `Vec`, and a body's walk usually grows it once more. Th
 
 Results are the same: `Modules::name` reads the scope `name_in_scope` reads. The `PathRead`s
 are unchanged.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 4. `crates/hir-def/src/nameres/frozen.rs`
 
@@ -1265,6 +1350,8 @@ with the file unchanged during it:
   2029–2032 (`Dec::new`'s columns), 2050, 2156, 2179, 2184, 2272, 2287, 2471, 2974, 2984,
   3020, 3118, 3135, 3150–3152, 3220.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 5. `crates/hir-def/src/nameres/demand.rs`
 
 **Fixes:**
@@ -1290,6 +1377,8 @@ with the file unchanged during it:
   `let mut names: Vec<Symbol> = known.into_iter().collect();`, `let mut words = Vec::new();`
   and the `writing` set.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 6. `crates/hir-def/src/item_scope.rs`
 
 **Justify:**
@@ -1310,6 +1399,8 @@ with the file unchanged during it:
   `let mut legacy_macros = self.legacy_macros().collect::<Vec<_>>();`: `// alloc: a debug dump
   (the edge)`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 7. `crates/hir-def/src/find_path.rs`
 
 **Fixes:**
@@ -1323,7 +1414,14 @@ with the file unchanged during it:
 The rest of the file (the `name.clone()`s from ~L2564 on) is test code. dedup-codec-rng has an
 edit in those tests, so the three fixes above don't touch it.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 8. `crates/hir-def/src/import_map.rs`
+
+**Superseded** by mem-db-def-items' I6 (`v2/requests/mem-db-def-items.md`). It moves the build
+onto the query frame with its own `// alloc:` comments, and replaces the FST search with sorted
+keys, so the search allocates nothing. Apply I6 and skip this block. What follows applies only
+if I6 doesn't land.
 
 **Justify**, as `// alloc: once per ImportMap::of execution (per crate, on the IDE's import
 search)`: `let mut out = String::new();` (~L87), `vec![0u32; rows + 1]`, `vec![0u32;
@@ -1335,6 +1433,8 @@ The crate-list `..map(|dep| ImportMap::of(db, dep.crate_id)).collect()` (~L572) 
 `// alloc: once per search request (the edge)`.
 `dump`'s three `format!("- {it:?} ..")` and its `.collect();` get `// alloc: a debug dump
 (the edge)`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 9. Smaller files under `nameres/`
 
@@ -1356,6 +1456,8 @@ The crate-list `..map(|dep| ImportMap::of(db, dep.crate_id)).collect()` (~L572) 
   execution, the result's storage`. The `globs: ..collect(),` gets `// alloc: the result`. If
   `todo` is a worklist that runs per module, `SmallVec<[_; 8]>` keeps it inline instead.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### Check after applying
 
 `PYTHONPATH=python/typed-input/src python3 tools/v2/hot_lint.py '{"root": "."}' | rg 'crates/hir-def/src/(nameres|item_scope|resolver|find_path|import_map)'`
@@ -1364,3 +1466,403 @@ shows only `collector.rs` (until it is `#[cfg(test)]`), `facts/` (frontend-namer
 nameres_budgets` passes.
 
 Status: open
+
+> forwarded to db (from requests, pass 16; told by tmux).
+
+## frontend-tokens: a macro's input from a view, `syntax_bridge::call_input` (item 4)
+
+Why: item 4 (docs/v2/plan/design/frontend.md) says a macro call's input is read from the
+file's flat tokens, with no syntax handle. Item 16 (frontend-tree) makes views the way to read
+syntax.
+
+What: `syntax_bridge::call_input(node: syntax::view::Node<'_>, map, call_site, mode) ->
+tt::TopSubtree` is in `crates/syntax-bridge/src/lib.rs`. It is `syntax_node_to_token_tree` on a
+view: the same one pass over the flat tree's tokens, through lazy parts, with spans from `map`
+in order. `a_views_call_input_is_the_cursors_token_tree` holds it to the cursor's walk.
+
+Exact edits, both in `crates/hir-expand/src/lib.rs`, `MacroCallId::macro_arg`, the
+`MacroCallKind::FnLike` arm (the one input made for every fn-like call of a build):
+
+1. Old:
+
+```rust
+            MacroCallKind::FnLike { ast_id, .. } => {
+                let node = &ast_id.to_ptr(db).to_node(&root);
+```
+
+New:
+
+```rust
+            MacroCallKind::FnLike { ast_id, .. } => {
+                use syntax::view::AstNode as _;
+                let node = ast_id.to_view(db);
+```
+
+The rest of the arm reads the same names on the view (`path`, `syntax().text_range()`,
+`token_tree`, `left_delimiter_token`, `right_delimiter_token`, a token's `kind`), all in
+`syntax::view` (`node_ext.rs:1057,1064`, `generated/nodes.rs:1052,1054`). `to_view` reads the
+tree `parse_with_map` gives `root` from (`HirFileId::root`, `lib.rs:1905`), so the spans of `map`
+are of the same tokens.
+
+2. Old:
+
+```rust
+                let mut tt = match loc.def.kind {
+                    MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => {
+                        syntax_bridge::syntax_node_to_token_tree(
+                            tt.syntax(),
+                            MacroRulesArgs(InOrder::new(map)),
+                            span,
+                            mode,
+                        )
+                    }
+                    _ => syntax_bridge::syntax_node_to_token_tree(
+                        tt.syntax(),
+                        InOrder::new(map),
+                        span,
+                        mode,
+                    ),
+                };
+```
+
+New:
+
+```rust
+                let mut tt = match loc.def.kind {
+                    MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => {
+                        syntax_bridge::call_input(
+                            tt.syntax(),
+                            MacroRulesArgs(InOrder::new(map)),
+                            span,
+                            mode,
+                        )
+                    }
+                    _ => syntax_bridge::call_input(tt.syntax(), InOrder::new(map), span, mode),
+                };
+```
+
+Left as they are, on purpose:
+- `declarative.rs:136, 160, 167` (a definition's arguments and body): once a definition, and
+  `syntax_node_to_token_tree` of a flat node already takes the same pass (`FlatConverter`), so a
+  view saves one handle a definition.
+- `lib.rs:922, 935, 987, 1007`: `expand_speculative`, IDE only, on a node that may be an edited
+  green tree, which only the cursor reads.
+
+mbe now takes `db: &Db` (`DeclarativeMacro::expand`, `expect_fragment`); hir-expand's callers
+already pass `&Db`, so they need no edit.
+
+`syntax_node_to_token_tree_modified` (cfg stripping and fixup: `cfg_process.rs:319`,
+`fixup.rs`) stays on handles, because it removes and appends elements by `SyntaxElement`. Its
+view version needs a view of a removal set, which is frontend-tree's to design. I'll take that
+up with them.
+
+The tree's parser words are made lazily, at the first fragment a matcher tries. A proc macro's
+input never pays for them. Nothing built.
+
+> forwarded to db (from requests, pass 17; told by tmux).
+> left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): its edits are in `crates/hir-expand/`,
+> all of which the running db-expand-macros-next2 owns; not in yet. Told by tmux.
+
+## speed-hir: four edits in db-expand's files (dedup, upvars, `ModPath`; 2026-10-29)
+
+speed-hir's children are done; these were forwarded to speed-hir after them and the files are
+yours again. Each is mechanical; the full edits are written out in `v2/requests/speed-hir.md`.
+
+1. `crates/hir-def/src/import_map.rs`, `import_map_query_impl`: the hand-written counting sort
+   becomes `blaze_ids::radix::Csr::build` (one counting sort in the tree). Edit as written in
+   `v2/requests/speed-hir.md`, "## dedup: `import_map.rs`'s counting sort onto
+   `blaze_ids::radix::Csr`". Checked: `Csr::build(rows, pairs)`, `items()` and `into_parts()`
+   exist (`crates/blaze-radix/src/csr.rs:47,100,129`), `blaze_ids::radix` re-exports
+   `blaze_radix`, and hir-def depends on `blaze-ids`. Same order, same bytes.
+2. `crates/base-db/src/table.rs`: `Table`'s per-shard leveled tables become one
+   `intern::swiss::Index` per shard, and `fn shard_count` becomes `blaze_ids::shard_count()`.
+   Edit as written in `v2/requests/speed-hir.md`, "## dedup: base-db's `Table` onto
+   `blaze_mem::swiss::Index`", steps 1-8. Checked: `Index::new`, `find(hash, is)`,
+   `insert(len, hash, value, hash_of)` (`crates/blaze-mem/src/swiss.rs:257,269,283`),
+   `intern::swiss` (`crates/intern/src/lib.rs:21`), `blaze_ids::shard_count`
+   (`crates/blaze-ids/src/lib.rs:326`); base-db depends on `intern` and `blaze-ids`.
+3. `crates/hir-def/src/upvars.rs`, `upvars_mentioned_impl` (~L112), once mem-format adds
+   `ExpressionStore::has_closures` (requested in `v2/requests/mem-format.md`, "## speed-hir"):
+   old
+   ```rust
+       if !store.exprs().any(|(_, expr)| matches!(expr, Expr::Closure { .. })) {
+   ```
+   new
+   ```rust
+       if !store.has_closures() {
+   ```
+   Why: `exprs()` decodes a full `Expr` view (kind byte, data word, extra words) for every
+   expression of every body to learn it has no closure, which most don't; `has_closures` is a
+   byte compare over the `expr_kind` column (`memchr`-speed, ~200 bytes for a 200-expression
+   body). `Expr` stays imported (the visitor matches on it).
+4. `crates/hir-expand/src/mod_path.rs:34`: delete `intern::impl_internable!(ModPath);`. Every
+   `Interned<ModPath>` is gone (`rg 'Interned<ModPath>' crates` finds none, including
+   `crates/hir/src/semantics.rs`); `ModPath` is 16 bytes and `Copy`, stored by value. Removing
+   the impl drops its sharded intern table from every database and makes a reintroduced
+   second intern a compile error.
+
+> forwarded to db (from requests, pass 17; told by tmux).
+
+## db-expand-names: trait imports method resolution used (db-ty, `crates/hir-ty/src/method_resolution/probe.rs`, `infer.rs`, `infer/path.rs`)
+
+What: rustc's `used_trait_imports`. When a method call or a type-relative path (`Type::item`,
+`<T>::item`) picks an item through a trait in scope (`CandidateKind::TraitCandidate`, from
+`assemble_extension_candidates_for_traits_in_scope`, `probe.rs:1193`; not an inherent,
+`ObjectCandidate` or `WhereClauseCandidate` pick, and not an operator's
+`lookup_method_for_operator`), record the trait and the expression or pattern:
+1. `InferenceResult` gains `pub traits_in_scope_used: Box<[(ExprOrPatId, TraitId)]>`, in the
+   order inference made the picks (no sort, so its bytes are the same each run), each pair once.
+   Fill it where `method_resolutions` is filled for a `TraitPick` that came from a
+   `TraitCandidate`, and in `infer/path.rs` `resolve_ty_assoc_item` for the same kind of pick.
+   Persist it with the rest of `InferenceResult` (`infer/persist.rs`).
+2. A tracked query in hir-ty, `used_imports_with_traits(db: &Db, krate: Crate) ->
+   hir_def::nameres::uses::UsedImports` (`returns(ref)`): for each body owner of the crate
+   (`hir_def::nameres::demand::crate_body_owners(db, krate)`), for each
+   `(at, trait_)` of its inference result, build the resolver at `at`
+   (`hir_def::resolver::resolver_for_scope(db, owner.into(), ExprScopes::of(db, owner).scope_for(expr))`,
+   the expression's for a pattern), call `resolver.record_trait_uses(db, trait_, &mut uses)`, then
+   return `hir_def::nameres::uses::used_imports_with(db, krate, &uses)`.
+Why: without it, `use m::Tr;` used only by `x.method()` and a `use foo::prelude::*;` read only
+for its traits look unused (rustc keeps them: `TraitCandidate::import_ids` from
+`find_transitive_imports`, marked by `lookup_method` and `resolve_fully_qualified_call`). The
+hir-def half is in place: `Resolver::record_trait_uses` gives the import of the candidate rustc
+picks (the impl's own trait none; the innermost block scope, then the module; the std
+prelude none) and follows globs to the binding each read, `use Tr as _` through a glob included;
+`used_imports_with` merges those uses into the same walk `used_imports` reads, so nothing is walked
+twice. Tests of the hir-def half: `nameres/tests/uses.rs` (`a_method_of_...`, `the_impl_s_own_trait_uses_no_import`,
+`a_trait_of_the_std_prelude_uses_no_import`). For diagnostics: `lints/names/imports/used.rs`
+then reads `hir_ty::used_imports_with_traits` in place of `used_imports`.
+
+> forwarded to db (db-ty-next2, which holds hir-ty's inference; the hir-def half to db-expand-names-next2) (requests, pass 18; told by tmux).
+
+## db-expand-names: an unnamed trait binding names its own import (frontend-nameres, `crates/hir-def/src/nameres/facts/`)
+
+What: `ItemScope::unnamed_trait_imports` is now `ThinVec<(TraitId, Item<(), ImportOrExternCrate>)>`
+and records the binding's own import (the `use Tr as _`, or the glob that read it from another
+scope), as `collector.rs`'s `update_recursive` now does. Before, it was the source scope's
+binding's import. Exact edits:
+1. `facts/macros.rs` (~L1077, the `None =>` arm over `resolutions`):
+   `let (tr, import) = match res.take_types_full() {` / `Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import }) => (tr, import),`
+   becomes
+   `let tr = match res.take_types_full() {` / `Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import: _ }) => tr,`
+   and below, `self.scope_mut(module).push_unnamed_trait(tr, vis, import.and_then(ImportOrExternCrate::import));`
+   becomes `self.scope_mut(module).push_unnamed_trait_through(tr, vis, import);`
+   (`import` is then the function's own `Option<ImportOrExternCrate>`, as for the named arm).
+2. `facts/unit.rs` `update_recursive` (~L931 and ~L962): the same two edits, with
+   `self.scope_mut(module_id)`.
+3. `facts/tests.rs` (~L691): `import: import.map(|it| self.import_id(it)),` becomes
+   `import: import.map(|it| self.import_or_extern_crate(it)),`.
+Why: a method found through a glob's unnamed trait marks that glob used (rustc's
+`find_transitive_imports` walks `Import { import: glob, binding }`); with the old value the glob
+was unknown. Until 1 and 2 land, facts and the collector disagree on these imports; the frozen
+encoding is bumped (`ENCODING` "... 10") with it.
+
+> forwarded to frontend-nameres (frontend-nameres-next1, holds `nameres/facts/`) (requests, pass 18; told by tmux).
+
+## db-expand-names: a dumped `_` names its import (format, `crates/hir-def/src/expr_store/tests/body/block.rs`)
+
+What: in `underscore_import` (~L428), `            - _ : type` becomes
+`            - _ : type (import)`.
+Why: `ItemScope::dump` prints an unnamed trait's import as it prints a named one's, now that the
+scope records it (above).
+
+> forwarded to mem-format (holds hir-def's `expr_store` files; format is DONE) (requests, pass 18; told by tmux).
+
+## frontend-tokens: attribute and derive inputs from a view, `syntax_bridge::call_input_modified` (item 4)
+
+Why: every attribute and derive macro's input goes through `attr_macro_input_to_token_tree`
+(`crates/hir-expand/src/cfg_process.rs:303`), which walks handles (`PreorderWithTokens` over
+`SyntaxNode`, one count a step) to strip cfgs. Item 4 (docs/v2/plan/design/frontend.md) wants
+no syntax handle on a macro input's path.
+
+What is ready (`crates/syntax-bridge/src/lib.rs`, after `syntax_node_to_token_tree_modified`):
+
+```rust
+pub fn call_input_modified<'t, SpanMap, OnEvent>(
+    node: syntax::view::Node<'t>,
+    map: SpanMap,
+    append: FxHashMap<syntax::view::NodeId, Vec<tt::Leaf>>,
+    remove: FxHashSet<syntax::view::NodeId>,
+    call_site: Span,
+    mode: DocCommentDesugarMode,
+    on_event: OnEvent,
+) -> tt::TopSubtree
+where
+    SpanMap: SpanMapper,
+    OnEvent: FnMut(
+        &mut syntax::view::PreorderWithTokens<'t>,
+        &WalkEvent<syntax::view::Element<'t>>,
+    ) -> (bool, Vec<tt::Leaf>),
+```
+
+It is `syntax_node_to_token_tree_modified` case for case (removed tokens, removed nodes with
+their subtree skipped and their append taken, appends on leave, `on_event`'s drop, skip and
+inserted leaves). `a_views_modified_input_is_the_cursors` (syntax-bridge `tests.rs`) holds it to
+the handle version over the corpus, full and outline parses, with random removal and append sets
+and an `on_event` that skips, drops and inserts.
+
+What to change (db-expand's code; mechanical but long, so described, not diffed):
+1. `cfg_process.rs` `macro_input_callback`: the returned closure takes
+   `&mut syntax::view::PreorderWithTokens<'t>` and `&WalkEvent<syntax::view::Element<'t>>`;
+   every `ast::X::cast(node.clone())` becomes `syntax::view::X::cast(node)` (views are `Copy`),
+   and its attribute and cfg reads use the view accessors of the same names.
+2. `fixup.rs` `fixup_syntax`: take `syntax::view::Node<'_>`; `SyntaxFixups::append` becomes
+   `FxHashMap<syntax::view::NodeId, Vec<tt::Leaf>>` and `remove` `FxHashSet<syntax::view::NodeId>`,
+   keyed by `element.id()` where `SyntaxElement`s are inserted now.
+3. `attr_macro_input_to_token_tree` takes `node: syntax::view::Node<'_>` and calls
+   `syntax_bridge::call_input_modified(node, InOrder::new(span_map), fixups.append, fixups.remove,
+   span, DocCommentDesugarMode::ProcMacro, macro_input_callback(..))`. `macro_arg`'s Attr arm
+   passes `ast_id.to_view(db).syntax()` (`AstId::to_view`, `files.rs:122`).
+4. `expand_speculative` (IDE, a possibly edited green tree) keeps the handle path:
+   `syntax_node_to_token_tree_modified` stays for it, and for `derive_macro.rs:1087`.
+
+Nothing built.
+
+> forwarded to frontend-hooks (frontend applies its own `## frontend-*` sections in db's files, db.md's notice of 20:45; it tells db-expand-macros-next1, which holds `crates/hir-expand/`) (requests, pass 18, corrected; told by tmux).
+> left for db-expand-macros-next2 (frontend-hooks, 2026-10-29): its edits are in `crates/hir-expand/`,
+> all of which the running db-expand-macros-next2 owns; not in yet. Told by tmux.
+
+## dedyn: hir-def and hir-expand: generics for the small per-node callbacks, the rest justified
+
+Each edit below is self-contained; call sites stay as they are unless said.
+
+> forwarded to db by file (requests, pass 19; each told by tmux): `nameres.rs` to frontend-nameres-next1; `lib.rs`, `attrs.rs`, `attrs/docs.rs` to db-expand-next2; `expr_store/lower.rs` to mem-format (format's file, mem-format holds hir-def's store files); `item_scope.rs` to db-expand-names-next2; hir-expand `attrs.rs` to db-expand-macros-next1.
+> applied by db-expand-macros (hir-expand `attrs.rs` subsection): the three `owner: &dyn ast::HasAttrs,` lines (`collect_item_tree_attrs`, `AttrId::find_attr_range_with_source`, `AttrId::find_attr_range_with_source_opt`) keep their `&dyn` and carry the `// dyn:` justification as written.
+
+### crates/hir-def/src/nameres.rs: `DefMap::with_ancestor_maps`
+
+Called per path search (find_path, five callers, each its own closure; a 15-line body: five
+small instances).
+before `        f: &mut dyn FnMut(&DefMap, ModuleIdLt<'db>) -> Option<T>,`
+after  `        f: &mut impl FnMut(&DefMap, ModuleIdLt<'db>) -> Option<T>,`
+
+### crates/hir-def/src/lib.rs: `macro_call_as_call_id` names hir-expand's justified alias
+
+The callback is hir-expand's `EagerCallBackFn` (justified there: one call per macro call an
+eager input holds; a generic would copy the recursive eager expander into each of the nine
+callers). Spell it once:
+before
+```rust
+    eager_callback: &mut dyn FnMut(
+        InFile<(syntax::AstPtr<ast::MacroCall>, span::FileAstId<ast::MacroCall>)>,
+        MacroCallId,
+    ),
+```
+after
+```rust
+    eager_callback: EagerCallBackFn<'_>,
+```
+and in `use hir_expand::{ .. }`: `eager::expand_eager_macro_input,` becomes
+`eager::{EagerCallBackFn, expand_eager_macro_input},`.
+
+### crates/hir-def/src/expr_store/lower.rs: `check_cfg` and `may_have_attrs` per expression
+
+`check_cfg` runs for every expression, statement, arm, field and parameter lowered;
+`may_have_attrs` is its fast path (two virtual calls per node today). Both bodies are small
+(15 and 4 lines) over about 15 node types, so generics; the full cfg evaluation
+(`Expander::is_cfg_enabled` → `AttrFlags::is_cfg_enabled_for`) is reached only for a node that
+carries an attribute and keeps its justified `&dyn` (the `&impl` coerces to it).
+- before `    fn check_cfg(&mut self, owner: &dyn ast::HasAttrs) -> bool {`
+  after  `    fn check_cfg(&mut self, owner: &impl ast::HasAttrs) -> bool {`
+- before `pub(in crate::expr_store) fn may_have_attrs(owner: &dyn ast::HasAttrs) -> bool {`
+  after  `pub(in crate::expr_store) fn may_have_attrs(owner: &impl ast::HasAttrs) -> bool {`
+  (`tests/cfg_attrs.rs` passes `&ast::AnyHasAttrs`: unchanged.)
+
+### crates/hir-def/src/attrs.rs: `AttrFlags::is_cfg_enabled_for` keeps its `&dyn`, justified
+
+before `        owner: &dyn HasAttrs,`
+after  `        owner: &dyn HasAttrs, // dyn: once per field, variant or node with an attribute; a generic would copy the cfg expansion per node type`
+
+### crates/hir-def/src/attrs/docs.rs: `extend_with_attrs`, `extract_docs`
+
+Two callers (`AttrFlags::docs`, `fields_docs`), each with its own closures: two instances of
+the two functions (about 210 lines together). Call sites unchanged (`&|| ..`).
+- in `extend_with_attrs`:
+  `    get_cfg_options: &dyn Fn() -> &'a CfgOptions,` becomes
+  `    get_cfg_options: &impl Fn() -> &'a CfgOptions,`, and
+  `    make_resolver: &dyn Fn() -> Resolver<'db>,` becomes
+  `    make_resolver: &impl Fn() -> Resolver<'db>,`
+- in `extract_docs`:
+  `    resolver: &dyn Fn() -> Resolver<'db>,` becomes `    resolver: &impl Fn() -> Resolver<'db>,`,
+  and `    get_cfg_options: &dyn Fn() -> &'a CfgOptions,` becomes
+  `    get_cfg_options: &impl Fn() -> &'a CfgOptions,`
+
+### crates/hir-def/src/item_scope.rs: the dump's display name, justified
+
+before `            let display_name: &dyn fmt::Display = match &name {`
+after  `            let display_name: &dyn fmt::Display = match &name { // dyn: the debug dump, formatting text anyway`
+
+### crates/hir-expand/src/attrs.rs: `&dyn ast::HasAttrs`, justified
+
+These three take an item-tree owner once per item and hand it to syntax's
+`ast::attrs_including_inner(&dyn HasAttrs)`; the vtable serves only `syntax()` and the trait's
+default methods. A generic would copy the cfg_attr expansion per node type, and the concrete
+`ast::AnyHasAttrs` costs a node refcount per call, no cheaper. Put on each of the three
+`owner: &dyn ast::HasAttrs,` lines (in `collect_item_tree_attrs`,
+`AttrId::find_attr_range_with_source`, `AttrId::find_attr_range_with_source_opt`):
+`// dyn: once per item, into syntax's attrs_including_inner; a generic would copy the cfg_attr expansion per node type`
+
+## db-expand-macros: what tasks 16 and 17 still wait on, and `Mbe` in the frozen def map (format, `crates/mbe/`, `crates/span/`; db-expand-names, `crates/hir-def/src/nameres/frozen.rs`)
+
+State at 10-29 21:10. Format's best failure (task 13), `SpanMap::dropped_semicolon` (15.1) and the
+`of_call_site` callers (15.3) are in, and hir-expand uses them. Still missing:
+
+1. Task 16 (format, `crates/mbe/src/expander/transcriber.rs` `expand_var`, `crates/span/src/map.rs`):
+   - `stmt` and `block` fragments are `Fragment::Tokens`, pushed with `extend_with_tt_alone` and no
+     group. Wrap them, as `Fragment::Expr`/`Path`/`Ty` are, in an invisible group spanned by the
+     metavariable (`id` after `marker`).
+   - `SpanMap::push_fragment` keeps only a fragment's range. An invisible delimiter has no text, so
+     its span is in no piece of the map. Keep the group's span beside its range (for example
+     `push_fragment(range, span)` and `fragment_span(range) -> Option<Span>` for a range that is
+     exactly one fragment's), and keep it through `merge`.
+   - Then hir-expand's `map_node_range_up`, `map_node_range_up_rooted` and
+     `map_node_range_up_rooted_span` give a node whose range
+     is exactly a fragment's the fragment's span. Why: rustc lints a `$x:stmt`'s statement at the
+     metavariable (`suggest-remove-semi-in-macro-expansion-issue-142143.rs`).
+2. Task 17 (format, `transcriber.rs` `Op::Concat`): return the spans of the identifiers
+   `${concat(..)}` makes, for example in the `ExpandResult`'s value beside `matched_arm`, or as a
+   `SpanMap` column. hir-expand then keeps them with the expansion. Why: the lexer lints
+   (`diagnostics-lints-syntax-early-lexer`) skip a made identifier, and only the transcriber knows
+   which ones it made.
+3. db-expand-names: `frozen.rs` refuses `ExpandErrorKind::Mbe` because mbe's kind had no stable
+   form. `mbe::ExpandErrorKind` is now a closed enum (`BindingError`, `UnresolvedBinding`,
+   `LeftoverTokens`, `LimitExceeded`, `NoMatchingRule`, `UnexpectedToken`, and
+   `MatchFailure { token, remaining, remaining_span, missing_comma }`). Please encode it, so a
+   frozen def map keeps a `macro_rules!` call's error rather than refusing the map.
+
+## frontend-hooks: `FileRange::file_text` returns `&syntax::Text` (db-expand-macros, `crates/hir-expand/src/files.rs`; 2026-10-29)
+
+From frontend-hooks, which applied base-db's side of frontend-text's "the parse tree's source is
+a `Text`" (`v2/requests/db.md`): `FileText::text` returns `&'db syntax::Text` now
+(`crates/base-db/src/lib.rs`). `crates/hir-expand/src/files.rs:80` names the old type:
+
+- old: `    pub fn file_text(self, db: &Db) -> &std::sync::Arc<str> {`
+- new: `    pub fn file_text(self, db: &Db) -> &syntax::Text {`
+
+The body and its one caller, `&self.file_text(db)[self.range]` (L86), are unchanged
+(`Text: Deref<Target = str>`); nothing else calls it (`rg '\.file_text\(' crates`). hir-expand
+already depends on `syntax`. Without it `files.rs` doesn't compile against base-db.
+
+> applied by db-expand-macros: `crates/hir-expand/src/files.rs` `FileRange::file_text` returns `&syntax::Text`, as written. hir-expand's other file-text reads (`builtin/fn_macro.rs` `line_and_column`, `line_starts`, `source_joined`, the include bytes) go through `Text`'s `Deref<Target = str>` unchanged.
+
+## db-expand-macros: `Code for triomphe::Arc<T>`, landing with `Attr::input` (format, `crates/hir-def/src/hir/persist.rs`)
+
+What: beside `impl<T: Code> Code for Box<T>` (`:658`), with the same bodies:
+
+```rust
+impl<T: Code> Code for triomphe::Arc<T> {
+    fn put(&self, w: &mut Words) {
+        (**self).put(w);
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+        T::get(r).map(triomphe::Arc::new)
+    }
+}
+```
+
+Why: `hir_expand::attrs::Attr::input` is now `Option<triomphe::Arc<AttrInput>>` (frontend-deps-reparse's
+request above, applied in `crates/hir-expand/src/attrs.rs`), and `item_tree/persist.rs`'s `Code for Attr`
+puts and gets `self.input`. hir-def does not compile until this impl is in; the bytes written don't change.
+Nothing else needs editing: the builders in `item_tree/attrs.rs` use `.into()` (triomphe has `From<T>`),
+and the readers (`pretty.rs:102`, `attr_resolution.rs:121`, `attrs.rs`) go through `as_ref`/`as_deref`.

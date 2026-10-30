@@ -35,18 +35,20 @@ macro_rules! docs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
-pub(crate) enum Lint {
+pub enum Lint {
     HotClone,
     HotAlloc,
     HotDyn,
     StdHashmap,
 }
 
-/// The group `blaze::hot`: every lint of hot code.
-pub(crate) const HOT: &[Lint] = &Lint::ALL;
+/// The group `blaze::hot`: every lint of hot code, SipHash maps included as `hot_lint.py`
+/// checks them.
+pub(crate) const HOT: &[Lint] = Lint::ALL;
 
 impl Lint {
-    pub(crate) const ALL: [Lint; 4] = [Lint::HotClone, Lint::HotAlloc, Lint::HotDyn, Lint::StdHashmap];
+    /// In discriminant order.
+    pub(crate) const ALL: &[Lint] = &[Lint::HotClone, Lint::HotAlloc, Lint::HotDyn, Lint::StdHashmap];
 
     /// The name after `blaze::`.
     pub(crate) const fn name(self) -> &'static str {
@@ -119,7 +121,7 @@ pub(crate) fn check_node<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
 
 /// What a body's walk knows: the database, the body's environment, and the items its lints
 /// compare against.
-pub(super) struct Known<'db> {
+struct Known<'db> {
     db: &'db Db,
     interner: DbInterner<'db>,
     env: ParamEnvAndCrate<'db>,

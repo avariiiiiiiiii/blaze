@@ -39,7 +39,9 @@ struct Filler<'db> {
     infcx: InferCtxt<'db>,
     trait_env: ParamEnvAndCrate<'db>,
     subst: GenericArgs<'db>,
-    /// One entry for each binder the fold is inside of, as normalization wants them.
+    /// One entry for each binder the fold is inside of, as normalization wants them. On the
+    /// global allocator because the solver's `BoundVarReplacer` takes a `&mut Vec`; it stays
+    /// unallocated for a body whose types have no binders.
     universes: Vec<Option<UniverseIndex>>,
 }
 
@@ -150,6 +152,7 @@ impl<'db> Filler<'db> {
     fn new(db: &'db Db, env: ParamEnvAndCrate<'db>, subst: GenericArgs<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        // alloc: none until a binder is entered; the solver's replacer takes a `&mut Vec`
         Self { infcx, trait_env: env, subst, universes: Vec::new() }
     }
 
@@ -193,46 +196,36 @@ impl<'db> Filler<'db> {
         (in_trait || hidden.has_type_flags(TypeFlags::HAS_TY_OPAQUE)).then_some(hidden)
     }
 
-    fn fill_ty(&mut self, t: &mut StoredTy) -> Result<(), MirLowerError<'db>> {
+    /// `t` with the arguments in place of its parameters and its aliases normalized: how every
+    /// type, constant and argument list of a body is filled, and one alone
+    /// ([`monomorphized_ty`] and the rest).
+    fn fill<T>(&mut self, t: T) -> Result<T, MirLowerError<'db>>
+    where
+        T: TypeFoldable<DbInterner<'db>> + TypeVisitableExt<DbInterner<'db>> + std::fmt::Debug,
+    {
         // Can't deep normalized as that'll try to normalize consts and fail.
-        *t = t.as_ref().try_fold_with(self)?.store();
-        if references_non_lt_error(&t.as_ref()) {
+        let t = t.try_fold_with(self)?;
+        if references_non_lt_error(&t) {
             // alloc: error path
-            Err(MirLowerError::NotSupported(format!(
-                "monomorphization resulted in errors: {:?}",
-                t.as_ref()
-            )))
+            Err(MirLowerError::NotSupported(format!("monomorphization resulted in errors: {t:?}")))
         } else {
-            Ok(())
+            Ok(t)
         }
+    }
+
+    fn fill_ty(&mut self, t: &mut StoredTy) -> Result<(), MirLowerError<'db>> {
+        *t = self.fill(t.as_ref())?.store();
+        Ok(())
     }
 
     fn fill_const(&mut self, t: &mut StoredConst) -> Result<(), MirLowerError<'db>> {
-        // Can't deep normalized as that'll try to normalize consts and fail.
-        *t = t.as_ref().try_fold_with(self)?.store();
-        if references_non_lt_error(&t.as_ref()) {
-            // alloc: error path
-            Err(MirLowerError::NotSupported(format!(
-                "monomorphization resulted in errors: {:?}",
-                t.as_ref()
-            )))
-        } else {
-            Ok(())
-        }
+        *t = self.fill(t.as_ref())?.store();
+        Ok(())
     }
 
     fn fill_args(&mut self, t: &mut StoredGenericArgs) -> Result<(), MirLowerError<'db>> {
-        // Can't deep normalized as that'll try to normalize consts and fail.
-        *t = t.as_ref().try_fold_with(self)?.store();
-        if references_non_lt_error(&t.as_ref()) {
-            // alloc: error path
-            Err(MirLowerError::NotSupported(format!(
-                "monomorphization resulted in errors: {:?}",
-                t.as_ref()
-            )))
-        } else {
-            Ok(())
-        }
+        *t = self.fill(t.as_ref())?.store();
+        Ok(())
     }
 
     fn fill_operand(&mut self, op: &mut Operand) -> Result<(), MirLowerError<'db>> {
@@ -243,12 +236,16 @@ impl<'db> Filler<'db> {
             }
             OperandKind::Allocation { allocation } => {
                 let alloc = allocation.as_ref();
-                let mut ty = alloc.ty.store();
-                self.fill_ty(&mut ty)?;
+                let ty = self.fill(alloc.ty)?;
+                if ty == alloc.ty {
+                    return Ok(());
+                }
                 *allocation = Allocation::new(AllocationData {
-                    ty: ty.as_ref(),
+                    ty,
+                    // clone: a constant whose type changed, interned once per instance
                     memory: alloc.memory.clone(),
                     // FIXME: Do we need to fill the memory map too?
+                    // clone: its memory map, with it
                     memory_map: alloc.memory_map.clone(),
                 })
                 .store();
@@ -384,9 +381,41 @@ pub fn monomorphized<'db>(
     trait_env: &StoredParamEnvAndCrate,
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
     let mut filler = Filler::new(db, trait_env.as_ref(db), subst.as_ref());
+    // clone: the copy the query keeps; the fold changes it in place
     let mut body = body.clone();
     filler.fill_body(&mut body)?;
     Ok(body)
+}
+
+/// `ty` as [`monomorphized`] fills it in a body with `subst` and `trait_env`: one value, by the
+/// same fold, so the two agree by construction.
+pub fn monomorphized_ty<'db>(
+    db: &'db Db,
+    ty: Ty<'db>,
+    subst: &StoredGenericArgs,
+    trait_env: &StoredParamEnvAndCrate,
+) -> Result<Ty<'db>, MirLowerError<'db>> {
+    Filler::new(db, trait_env.as_ref(db), subst.as_ref()).fill(ty)
+}
+
+/// `konst` as [`monomorphized`] fills it in a body, as [`monomorphized_ty`] a type.
+pub fn monomorphized_const<'db>(
+    db: &'db Db,
+    konst: Const<'db>,
+    subst: &StoredGenericArgs,
+    trait_env: &StoredParamEnvAndCrate,
+) -> Result<Const<'db>, MirLowerError<'db>> {
+    Filler::new(db, trait_env.as_ref(db), subst.as_ref()).fill(konst)
+}
+
+/// `args` as [`monomorphized`] fills a list of them in a body, as [`monomorphized_ty`] a type.
+pub fn monomorphized_args<'db>(
+    db: &'db Db,
+    args: GenericArgs<'db>,
+    subst: &StoredGenericArgs,
+    trait_env: &StoredParamEnvAndCrate,
+) -> Result<GenericArgs<'db>, MirLowerError<'db>> {
+    Filler::new(db, trait_env.as_ref(db), subst.as_ref()).fill(args)
 }
 
 /// The type of the impl's method that `opaque`, the `impl Trait` a trait's method returns,
@@ -448,6 +477,7 @@ pub fn opaque_of_impl<'db>(
     // trait's. Its concrete types need not declare any opaque types in the same positions.
     let bounds = crate::SelfAndAssocBounds::return_type_impl_traits(db, func);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    // alloc: once per opaque type of a trait method, not per body
     let vars: Vec<_> = bounds.iter().map(|_| infcx.next_ty_var(crate::Span::Dummy)).collect();
     let mut folder = crate::next_solver::util::BottomUpFolder {
         interner,
@@ -474,6 +504,7 @@ pub fn opaque_of_impl<'db>(
                     });
                 ocx.register_obligation(crate::next_solver::infer::traits::Obligation::new(
                     interner,
+                    // clone: an obligation's cause, once per bound of an opaque type
                     cause.clone(),
                     env.param_env,
                     clause.fold_with(&mut folder),

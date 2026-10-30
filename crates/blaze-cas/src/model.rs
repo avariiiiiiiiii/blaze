@@ -19,7 +19,7 @@ use blaze_reclaim::enter;
 use crate::{
     Key, Kind, Unit,
     disk::{Form, RECORD_HEADER, RecordHeader, content_of},
-    flags::{Bits, Flag},
+    flags::{Flag, FlagColumns},
     segment::{FRAME, Own, Segment},
     sync::atomic::{AtomicUsize, Ordering},
     table::{Held, Keyed, Table},
@@ -221,7 +221,7 @@ trait Periodic: Send + Sync + 'static {
     fn periods(&self, row: u64) -> (bool, bool);
 }
 
-impl Periodic for Bits {
+impl Periodic for FlagColumns {
     fn set_now(&self, row: u64) {
         self.set(row, Flag::Read);
     }
@@ -317,7 +317,7 @@ fn flags_land_in_one_period_or_the_other<P: Periodic>(make: fn() -> P, far: u64)
 
 #[test]
 fn model_flag_bits_land_in_one_period_or_the_other() {
-    flags_land_in_one_period_or_the_other(|| Bits::new(128), 65);
+    flags_land_in_one_period_or_the_other(|| FlagColumns::new(128), 65);
 }
 
 #[test]

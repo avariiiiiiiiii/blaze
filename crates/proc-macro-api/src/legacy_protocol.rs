@@ -96,11 +96,14 @@ pub(crate) fn expand(
             current_dir,
             &mut sent,
         );
+        // alloc: the request, sent to another process (the edge).
         return match send_task(process, Request::ExpandMacroWire(Box::new(task)))? {
             Response::ExpandMacroWire(Ok(tree)) => {
+                // alloc: none unless the answer's bytes are off a word.
                 Ok(Ok(read_tree(&tree, &sent, &mut Vec::new()).map_err(answer_error)?))
             }
             Response::ExpandMacroWire(Err(msg)) => Ok(Err(msg.0)),
+            // alloc: error path.
             _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
         };
     }
@@ -139,6 +142,7 @@ pub(crate) fn expand(
         Response::ExpandMacro(Err(msg)) | Response::ExpandMacroExtended(Err(msg)) => {
             return Ok(Err(msg.0));
         }
+        // alloc: error path.
         _ => return Err(ServerError { message: "unexpected response".to_owned(), io: None }),
     };
     let sent = Sent::of_table(&span_data_table);
@@ -153,6 +157,7 @@ pub(crate) fn expand(
 /// A server's answer that is no tree, or names what the request did not send: the server's
 /// fault, never the macro's.
 pub(crate) fn answer_error(why: String) -> ServerError {
+    // alloc: error path, naming what the server sent.
     ServerError { message: format!("the proc-macro server's answer: {why}"), io: None }
 }
 
@@ -171,6 +176,7 @@ impl ExpandMacroWire {
             sent.span(&site);
         }
         let has_attributes = attr.is_some();
+        // alloc: the request's trees, sent to another process (the edge).
         let mut trees = Vec::new();
         write_tree(subtree, sent, &mut trees);
         if let Some(attr) = attr {
@@ -180,6 +186,7 @@ impl ExpandMacroWire {
             lib: proc_macro.dylib_path.to_path_buf().into(),
             env,
             current_dir: Some(current_dir),
+            // alloc: a field of the request, sent to another process (the edge).
             macro_name: proc_macro.name.to_string(),
             trees,
             has_attributes,

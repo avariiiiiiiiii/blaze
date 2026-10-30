@@ -811,6 +811,30 @@ Wanted: `crates/blaze-diagnostics/src/lints/bodies/types/util.rs` `path_value`, 
 `resolver_for_scope` steps (drop their imports). A path that does not resolve gives `None`, as
 now.
 
+### 7. Diagnostics (blaze-diagnostics): `MethodCallIllegalSizedBound` carries the pick (task 29)
+
+`hir::MethodCallIllegalSizedBound` gains what rustc's `lookup_method` gathers
+(`compiler/rustc_hir_typeck/src/method/mod.rs` at 16d1ffac): `method: Function` (the picked,
+the trait's for an object pick), `bound: Option<GenericDef>` (whose own bounds or where clause
+hold the `Self: Sized` clause: the method's, or its trait's or impl's; `None` where only
+elaboration implies it, rustc's `DUMMY_SP`), `needs_mut` and `candidates: Vec<Trait>` (rustc's
+traits found by the probe of all traits; traits in other bodies' blocks are not in that probe).
+
+Wanted, in `crates/blaze-diagnostics/src/lower/method_call_illegal_sized_bound.rs`, rustc's
+`report_method_error` arm for `IllegalSizedBound` (`method/suggest.rs`):
+
+- the message "the `{name}` method cannot be invoked on `{rcvr_ty}`" when `d.needs_mut` (the
+  receiver's type from the call's receiver), else "... on a trait object";
+- the "this has a `Sized` requirement" label only when `!d.needs_mut`, on the `Sized` bound on
+  `Self` in `d.bound`'s own where clause or bounds (a direct `Sized`, not a trait that implies
+  it), none when `d.bound` is `None`; `sized_bound`'s name match on `Self` and its
+  `all_supertraits` test go;
+- the "{an}other candidate{s} {were} found in the following trait{s}, perhaps add a `use` for
+  {it|one of them}:" help with `use` suggestions of `d.candidates`;
+- when `needs_mut` and the receiver is a reference, "you need `{&mut T}` instead of `{&T}`": the
+  `mut ` suggestion before the parameter's type when the receiver is a `&`-typed parameter,
+  else a help.
+
 ## db-ty-d-hir
 
 > forwarded to diagnostics (blaze-diagnostics is its, running; told by tmux).
@@ -996,3 +1020,196 @@ and notes ... are not given yet") becomes untrue with this. `unused_mut` keeps i
 the borrow checker gives it no parts.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+## dedyn: crates/hir-ty/src/lower.rs: the lowering's inference variables are an enum, not `&mut dyn TyLoweringInferVarsCtx`
+
+`TyLoweringInferVarsCtx` has three implementations and no others can appear: type inference
+(`infer/diagnostics.rs` `InferenceTyLoweringVarsCtx`), the borrow checker
+(`hir-ty-borrowck/src/regions.rs` `InferVars`, a body's `InferCtxt`) and the IDE
+(`hir/src/source_analyzer.rs` `VarsCtx`, a finished `InferenceResult`). Every `_`, elided
+lifetime and const `_` in a body's types goes through it. `TyLoweringContext` is thousands of
+lines, so a generic would copy it three times: an enum with a `match`. The enum holds the
+inference variant's two `&'a mut` fields directly, not a `&'a mut` of the bundle struct, so
+`TyLoweringContext<'db, 'a>` stays covariant in `'a` as it is now. It is `pub(crate)` in a
+private field; outside hir-ty each variant has its own `pub` builder taking public types only.
+
+> forwarded to db (requests, pass 19; told by tmux): `lower.rs`, `lib.rs`, `infer/diagnostics.rs`, `consteval.rs` to db-ty-next2; `hir-ty-borrowck/src/regions.rs` to db-ty-d-borrowck; `hir/src/source_analyzer.rs` to db-next2.
+> db-ty-d-borrowck (2026-10-29 20:59): `regions.rs` part not applied yet: `with_infer_ctxt_vars`
+> is not in `hir-ty/src/lower.rs` (db-ty-next2's part), and the section says to apply them
+> together. Applied as soon as db-ty-next2's `lower.rs` part lands.
+
+### lower.rs
+
+1. Delete the trait (the whole item, `pub trait TyLoweringInferVarsCtx<'db> { .. }` with
+   `as_table` and its `#[expect(private_interfaces)]`) and put in its place:
+
+```rust
+/// Where lowering a type written in a body gets a variable for a `_`, a lifetime left out or a
+/// const `_`: type inference's table, a body's inference context (the borrow checker), or a
+/// finished inference's answers (the IDE: `_` is what inference gave it, all else an error).
+pub(crate) enum InferVars<'a, 'db> {
+    Inference {
+        table: &'a mut InferenceTable<'db>,
+        type_of_type_placeholder: &'a mut ArenaMap<TypeRefId, StoredTy>,
+    },
+    Context(&'a InferCtxt<'db>),
+    Answered(Option<&'a InferenceResult<'db>>),
+}
+
+impl<'db> InferVars<'_, 'db> {
+    fn next_ty_var(&mut self, span: Span, types: &DefaultAny<'db>) -> Ty<'db> {
+        match self {
+            InferVars::Inference { table, type_of_type_placeholder } => {
+                let ty = table.infer_ctxt.next_ty_var(span);
+                if let Span::TypeRefId(type_ref) = span {
+                    type_of_type_placeholder.insert(type_ref, ty.store());
+                }
+                ty
+            }
+            InferVars::Context(infcx) => infcx.next_ty_var(span),
+            InferVars::Answered(infer) => match span {
+                Span::TypeRefId(type_ref) => infer
+                    .and_then(|infer| infer.type_of_type_placeholder(type_ref))
+                    .unwrap_or(types.types.error),
+                _ => types.types.error,
+            },
+        }
+    }
+
+    fn next_const_var(&mut self, span: Span, types: &DefaultAny<'db>) -> Const<'db> {
+        match self {
+            InferVars::Inference { table, .. } => table.infer_ctxt.next_const_var(span),
+            InferVars::Context(infcx) => infcx.next_const_var(span),
+            InferVars::Answered(_) => types.consts.error,
+        }
+    }
+
+    fn next_region_var(&mut self, span: Span, types: &DefaultAny<'db>) -> Region<'db> {
+        match self {
+            InferVars::Inference { table, .. } => table.infer_ctxt.next_region_var(span),
+            InferVars::Context(infcx) => infcx.next_region_var(span),
+            InferVars::Answered(_) => types.regions.error,
+        }
+    }
+}
+```
+
+2. Imports: add `InferenceResult` to `use crate::{ .. }` and, in its `infer::` part,
+   `infer::{diagnostics::InferenceTyLoweringVarsCtx, unify::InferenceTable}` (replacing
+   `infer::unify::InferenceTable`); add `infer::InferCtxt` to its `next_solver::{ .. }` list;
+   add `use la_arena::ArenaMap;`.
+
+3. The field in `TyLoweringContext`:
+   before `    infer_vars: Option<&'a mut dyn TyLoweringInferVarsCtx<'db>>,`
+   after  `    infer_vars: Option<InferVars<'a, 'db>>,`
+
+4. Replace `pub fn with_infer_vars_behavior(..) -> Self { .. }` with:
+
+```rust
+    pub(crate) fn with_inference_vars(
+        mut self,
+        vars: &'a mut InferenceTyLoweringVarsCtx<'_, 'db>,
+    ) -> Self {
+        self.infer_vars = Some(InferVars::Inference {
+            table: &mut *vars.table,
+            type_of_type_placeholder: &mut *vars.type_of_type_placeholder,
+        });
+        self
+    }
+
+    /// `_` and lifetimes left out become variables of `infcx`, as the borrow checker lowers a
+    /// type written in a body; with `None` they are refused.
+    pub fn with_infer_ctxt_vars(mut self, infcx: Option<&'a InferCtxt<'db>>) -> Self {
+        self.infer_vars = infcx.map(InferVars::Context);
+        self
+    }
+
+    /// `_` is the type `infer` gave it and every other variable an error, as the IDE lowers a
+    /// type written in a finished body.
+    pub fn with_answered_infer_vars(mut self, infer: Option<&'a InferenceResult<'db>>) -> Self {
+        self.infer_vars = Some(InferVars::Answered(infer));
+        self
+    }
+```
+
+5. `expect_table`:
+
+```rust
+    #[track_caller]
+    pub(crate) fn expect_table(&mut self) -> &mut InferenceTable<'db> {
+        match &mut self.infer_vars {
+            Some(InferVars::Inference { table, .. }) => table,
+            _ => panic!("only type inference lowers a type with an inference table"),
+        }
+    }
+```
+
+6. In `next_ty_var`, `next_const_var`, `next_region_var` of `TyLoweringContext`, the `Some`
+   arms pass the types:
+   `Some(infer_vars) => infer_vars.next_ty_var(span),` becomes
+   `Some(infer_vars) => infer_vars.next_ty_var(span, self.types),` (and the same for
+   `next_const_var` and `next_region_var`).
+
+7. `lower_expr_as_const`:
+
+```rust
+        let types = self.types;
+        #[expect(clippy::manual_map, reason = "a `map()` here generates a borrowck error")]
+        let create_var = match &mut self.infer_vars {
+            Some(infer_vars) => Some(&mut |span| infer_vars.next_const_var(span, types)),
+            None => None,
+        };
+```
+
+### lib.rs
+
+In `pub use lower::{ .. }` drop `TyLoweringInferVarsCtx,`.
+
+### infer/diagnostics.rs
+
+- `pub(super) struct InferenceTyLoweringVarsCtx<'a, 'db>` and its two fields become
+  `pub(crate)` (lower.rs reads them).
+- Delete `impl<'db> TyLoweringInferVarsCtx<'db> for InferenceTyLoweringVarsCtx<'_, 'db> { .. }`.
+- Drop `TyLoweringInferVarsCtx` from the `lower::{ .. }` import; drop `Const` and `Region`
+  from `next_solver::{ .. }` if nothing else in the file names them (`rg -w 'Const|Region'`).
+- In `InferenceTyLoweringContext::new`:
+  before `        .with_infer_vars_behavior(Some(infer_vars));`
+  after  `        .with_inference_vars(infer_vars);`
+
+### consteval.rs: generics instead of `&dyn Fn` (one or two callers each, small bodies)
+
+- `path_to_const`: `generics: &dyn Fn() -> &'a Generics<'db>,` becomes
+  `generics: &impl Fn() -> &'a Generics<'db>,` (three callers: lower.rs, infer.rs, and
+  `create_anon_const` passing its own through).
+- `create_anon_const`: the same for `generics`, and
+  `create_var: Option<&mut dyn FnMut(Span) -> Const<'db>>,` becomes
+  `create_var: Option<&mut impl FnMut(Span) -> Const<'db>>,` (two callers, lower.rs and
+  infer.rs, each a closure: two instances of a 60-line function).
+- `write_memory_map`: `ty: &mut dyn FnMut(Ty<'db>) -> u32,` becomes
+  `ty: &mut impl FnMut(Ty<'db>) -> u32,`; `read_memory_map`:
+  `ty: &dyn Fn(u32) -> Result<Ty<'db>, FormatError>,` becomes
+  `ty: &impl Fn(u32) -> Result<Ty<'db>, FormatError>,` (one caller each outside the tests,
+  whose closures are the only other instance). Call sites are unchanged.
+
+### hir-ty-borrowck/src/regions.rs (held by mem-db-checks-regions; told too)
+
+- Delete `struct InferVars<'a, 'db>(..);` and its `impl hir_ty::TyLoweringInferVarsCtx`.
+- In `elided_groups`: delete `let mut infer_vars = InferVars(&self.ctx.infcx);`; then
+  before `        .with_infer_vars_behavior(Some(&mut infer_vars as _))`
+  after  `        .with_infer_ctxt_vars(Some(&self.ctx.infcx))`
+- In the second site (the `let mut ctx = hir_ty::TyLoweringContext::new(` with
+  `vars.then_some`): delete `let mut infer_vars = InferVars(&self.ctx.infcx);`; then
+  before `        .with_infer_vars_behavior(vars.then_some(&mut infer_vars as _));`
+  after  `        .with_infer_ctxt_vars(vars.then_some(&self.ctx.infcx));`
+
+### hir/src/source_analyzer.rs (the `type_of_type` lowering)
+
+- Delete `let interner = DbInterner::new_no_crate(db);` and
+  `let mut vars_cts = VarsCtx { types: interner.default_types(), infer: self.infer() };` at
+  the top of the function, and the `struct VarsCtx` with its `impl TyLoweringInferVarsCtx`
+  after the lowering.
+- before `        .with_infer_vars_behavior(Some(&mut vars_cts))`
+  after  `        .with_answered_infer_vars(self.infer())`
+- Imports: drop `TyLoweringInferVarsCtx` from `use hir_ide::{ .. }`, and `DefaultAny` and
+  `Region` from its `next_solver::{ .. }` (their only uses were in `VarsCtx`; `DbInterner`
+  stays if `rg -w DbInterner` still finds a use).

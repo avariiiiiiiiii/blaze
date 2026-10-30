@@ -93,7 +93,7 @@ impl Query for ConfigChain {
     type Value = Cbor<Result<ConfigRead, LoadError>>;
 
     fn input(key: &ConfigOf) -> ContentId {
-        key_input("blaze v2 cargo config key 1", key)
+        key_input("blaze v2 cargo config key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &ConfigOf) -> Result<Cbor<Result<ConfigRead, LoadError>>, Cancelled> {

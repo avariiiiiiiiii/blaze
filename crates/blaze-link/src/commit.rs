@@ -12,6 +12,7 @@
 use std::collections::VecDeque;
 
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
+use blaze_ids::bits::BitSet;
 use blaze_live::patch::message_file;
 
 use crate::state::State;
@@ -53,7 +54,7 @@ pub(crate) struct Pending {
     /// The step in flight: its first tag's low half, how many effects, which are done.
     from: u32,
     count: u32,
-    done: Vec<u64>,
+    done: BitSet,
     left: u32,
     failed: Option<LinkError>,
     /// What the image goes back to if an effect fails before the rename.
@@ -152,7 +153,7 @@ impl Image {
             steps,
             from,
             count: 0,
-            done: Vec::with_capacity(most.div_ceil(64)),
+            done: BitSet::from_words(Vec::with_capacity(most.div_ceil(64))),
             left: 0,
             failed: None,
             revert: Some(revert),
@@ -166,8 +167,7 @@ impl Image {
         pending.from = pending.from.wrapping_add(pending.count);
         pending.count = count;
         pending.left = count;
-        pending.done.clear();
-        pending.done.resize((count as usize).div_ceil(64), 0);
+        pending.done.reset(count as usize);
         effects.extend(pending.steps.effects.drain(..count as usize));
     }
 
@@ -189,7 +189,7 @@ impl Image {
             return None;
         }
         let at = at as usize;
-        (pending.done[at / 64] & (1 << (at % 64)) == 0).then_some(at)
+        (!pending.done.contains(at)).then_some(at)
     }
 
     /// Whether `tag` is one of this image's effects in flight.
@@ -203,7 +203,7 @@ impl Image {
     pub fn complete(&mut self, completion: &Completion, effects: &mut Vec<Effect>) -> Option<Result<u64, LinkError>> {
         let at = self.in_flight(completion.tag)?;
         let pending = self.pending.as_mut().expect("in flight");
-        pending.done[at / 64] |= 1 << (at % 64);
+        pending.done.insert(at);
         pending.left -= 1;
         match &completion.done {
             Done::Failed(why) => {

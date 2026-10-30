@@ -46,7 +46,7 @@ impl Region {
     fn with(bytes: usize, huge: bool, tag: Tag) -> Result<Region, MemError> {
         let page = os::page_size();
         let granule = if huge { crate::HUGE_PAGE.max(page) } else { page.max(64 << 10) };
-        let reserved = os::round_up(bytes.max(1), granule).ok_or(MemError::TooLarge {
+        let reserved = crate::align::checked_align_up(bytes.max(1), granule).ok_or(MemError::TooLarge {
             tag,
             what: "a reservation",
             wanted: bytes,
@@ -110,10 +110,10 @@ impl Region {
             return Ok(());
         }
         let step = (from / 4).clamp(self.granule, MAX_STEP.max(self.granule));
-        let target = os::round_up(len.max(from + step), self.granule)
+        let target = crate::align::checked_align_up(len.max(from + step), self.granule)
             .unwrap_or(self.reserved)
             .min(self.reserved);
-        let start = from & !(self.granule - 1);
+        let start = crate::align::align_down(from, self.granule);
         // SAFETY: `[start, target)` is granule-aligned (so page-aligned) and inside the
         // reservation (`target <= reserved`), which lives as long as `self`.
         unsafe { os::commit(self.at(start), target - start) }.map_err(|os| {
@@ -133,7 +133,9 @@ impl Region {
     /// kernel: what a frame or table does after a burst, so resident memory returns to the
     /// working set.
     pub fn decommit_after(&mut self, keep: usize) -> io::Result<()> {
-        let keep = os::round_up(keep, self.granule).unwrap_or(self.reserved).min(self.reserved);
+        let keep = crate::align::checked_align_up(keep, self.granule)
+            .unwrap_or(self.reserved)
+            .min(self.reserved);
         let committed = *self.committed.get_mut();
         if keep >= committed {
             return Ok(());
@@ -155,8 +157,8 @@ impl Region {
     /// Nothing reads the range's contents again before writing them.
     pub unsafe fn purge(&self, from: usize, len: usize) {
         let page = os::page_size();
-        let Some(start) = os::round_up(from, page) else { return };
-        let end = (from.saturating_add(len) & !(page - 1)).min(self.committed());
+        let Some(start) = crate::align::checked_align_up(from, page) else { return };
+        let end = crate::align::align_down(from.saturating_add(len), page).min(self.committed());
         if end > start {
             // SAFETY: `[start, end)` is page-aligned, committed, and the caller says nothing
             // holds data in it.

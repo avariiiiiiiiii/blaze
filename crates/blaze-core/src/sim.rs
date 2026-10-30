@@ -82,7 +82,8 @@ struct End {
     peer_closed: bool,
 }
 
-/// SplitMix64: small, fast, and the same everywhere.
+/// SplitMix64, a copy of `blaze_ids::rng::SplitMix64` (the same stream from a seed): `blaze-core`
+/// stays below `blake3`, so it can't depend on `blaze-ids`.
 #[derive(Clone, Debug)]
 pub struct Rng(u64);
 

@@ -22,7 +22,7 @@ use crate::channel::Channel;
 use crate::frame::{Reader, Writer, kinds};
 use crate::handshake::{Grant, HOST_VAR, Hello, Overlay, Place, VERSION, decode_map, hex};
 use crate::sys::{self, Rights};
-use crate::{Access, CodeMemory, CodeRange, Error, FixedMap};
+use crate::{Access, CodeMemory, CodeRange, Error, FixedMap, ask};
 
 /// How long a start hook may take between its frames during the handshake.
 const HANDSHAKE: Duration = Duration::from_secs(30);
@@ -93,6 +93,8 @@ pub struct Launch<'a> {
 /// What waits for a start hook to connect, by token.
 struct Waiting {
     objects: Vec<(sys::Object, Rights)>,
+    /// The daemon's view of the asks object, `objects[2]`.
+    asks: sys::View,
     grant: Grant,
     encoded: Vec<u8>,
     done: mpsc::Sender<Result<Session, Error>>,
@@ -200,13 +202,15 @@ impl Host {
     /// session.
     pub fn launch(&self, launch: &Launch<'_>) -> Result<(Command, Pending), Error> {
         let (objects, grant) = grant(launch)?;
+        let asks = objects[2].0.map_here(Access::Shared)?;
+        ask::prepare(&asks);
         let mut encoded = Vec::new();
         grant.encode(&mut encoded);
 
         let mut token = [0u8; 16];
         sys::random(&mut token)?;
         let (done, wait) = mpsc::channel();
-        self.table().insert(token, Waiting { objects, grant, encoded, done });
+        self.table().insert(token, Waiting { objects, asks, grant, encoded, done });
 
         let mut var = OsString::from(&self.address);
         var.push("\t");
@@ -241,13 +245,19 @@ impl Host {
 }
 
 /// The objects a run of `launch` is given and its grant: every code segment from the image
-/// part, the arena, the cells and the fixed maps in their reservations.
+/// part, the arena, the cells and the fixed maps in their reservations; the control words and
+/// a new asks object, mapped by the start hook itself.
 fn grant(launch: &Launch<'_>) -> Result<(Vec<(sys::Object, Rights)>, Grant), Error> {
     let memory = launch.image;
     let layout = memory
         .layout()
         .ok_or_else(|| Error::new("a launch of a code memory not laid out (CodeMemory::lay_out)"))?;
-    let mut objects = vec![(memory.object().duplicate()?, Rights::Code), (memory.control().duplicate()?, Rights::Words)];
+    let asks = sys::Object::create("the asks", ask::BYTES.next_multiple_of(sys::page()))?;
+    let mut objects = vec![
+        (memory.object().duplicate()?, Rights::Code),
+        (memory.control().duplicate()?, Rights::Words),
+        (asks, Rights::Words),
+    ];
     let mut overlays: Vec<Overlay> = layout
         .code
         .iter()
@@ -358,7 +368,7 @@ impl Pending {
     }
 }
 
-/// A started run: its process, its slide, and the channel to its runtime.
+/// A started run: its process, its slide, and what reads and answers its asks.
 pub struct Session {
     pub pid: u32,
     /// What the process adds to a linked address ([`CodeMemory::linked`]).
@@ -366,13 +376,25 @@ pub struct Session {
     /// The thread that runs `main`.
     pub thread: u64,
     channel: Channel,
-    /// What acts in the process (Windows maps from here); kept while the run lives.
-    _remote: sys::Remote,
+    /// Holds what acts in the process (Windows maps from here) while the run lives.
+    run: Arc<ask::Run>,
 }
 
 impl Session {
-    pub fn channel(&mut self) -> &mut Channel {
-        &mut self.channel
+    /// Where its asks are read, on one thread, and what answers them, from any.
+    pub fn split(self) -> (ask::Reader, ask::Sender) {
+        (ask::Reader::new(self.channel, self.run.clone()), ask::Sender::new(self.run))
+    }
+
+    /// Ends the process, `why` its run's error ([`Session::killed`]): for a run whose asks
+    /// can't be answered. Before it is reaped: on macOS a process ID is all that names it.
+    pub fn kill(&self, why: &str) -> Result<(), Error> {
+        self.run.kill(why)
+    }
+
+    /// Why [`Session::kill`] or [`ask::Sender::kill`] ended the process, the first time.
+    pub fn killed(&self) -> Option<String> {
+        self.run.killed()
     }
 }
 
@@ -383,8 +405,7 @@ const START: Duration = Duration::from_secs(60);
 /// dev `run` and test paths hold for an executable. Each [`Program::command`] writes the
 /// executable to the command's path when it is not there yet and is a launch of it; a thread
 /// of its own waits for the start hook, attaches the process to the memory and hands the
-/// session on (to whoever serves the process's requests on its channel: `blaze-lazy`'s
-/// runner).
+/// session on (to whoever answers the process's asks: `blaze-lazy`'s runner).
 pub struct Program {
     host: Arc<Host>,
     memory: Arc<Mutex<CodeMemory>>,
@@ -577,9 +598,11 @@ fn handshake(mut channel: Channel, peer: u32, waiting: &Table) {
     };
     let mut seq = 0;
     let session = match serve(&mut channel, peer, &hello, &launch, &mut seq) {
-        Ok((remote, thread)) => {
+        Ok((remote, bells, thread)) => {
             let _ = channel.set_timeout(None);
-            Ok(Session { pid: peer, slide: hello.header.wrapping_sub(launch.grant.header), thread, channel, _remote: remote })
+            let slide = hello.header.wrapping_sub(launch.grant.header);
+            let run = Arc::new(ask::Run::new(launch.asks, bells, remote, peer));
+            Ok(Session { pid: peer, slide, thread, channel, run })
         }
         Err(error) => {
             let mut body = Vec::new();
@@ -593,7 +616,13 @@ fn handshake(mut channel: Channel, peer: u32, waiting: &Table) {
 
 /// Serves one start hook until it started, `seq` the sequence number of the last frame it
 /// sent: what a refusal answers.
-fn serve(channel: &mut Channel, peer: u32, hello: &Hello, launch: &Waiting, seq: &mut u32) -> Result<(sys::Remote, u64), Error> {
+fn serve(
+    channel: &mut Channel,
+    peer: u32,
+    hello: &Hello,
+    launch: &Waiting,
+    seq: &mut u32,
+) -> Result<(sys::Remote, sys::Bells, u64), Error> {
     if hello.pid != peer {
         return Err(Error::new(format!(
             "a start hook that says it is process {} on a connection from process {peer}",
@@ -609,6 +638,8 @@ fn serve(channel: &mut Channel, peer: u32, hello: &Hello, launch: &Waiting, seq:
     let slide = hello.header.wrapping_sub(launch.grant.header);
     let objects: Vec<(&sys::Object, Rights)> = launch.objects.iter().map(|(it, rights)| (it, *rights)).collect();
     let remote = sys::send_objects(channel, peer, &launch.encoded, &objects)?;
+    let (bells, names) = sys::Bells::new(&remote, ask::SLOTS)?;
+    ask::name_bells(&launch.asks, &names);
     loop {
         let frame = channel.recv()?;
         let (kind, body) = (frame.kind, frame.body.to_vec());
@@ -636,7 +667,7 @@ fn serve(channel: &mut Channel, peer: u32, hello: &Hello, launch: &Waiting, seq:
                 let mut read = Reader::new(&body);
                 let thread = read.u64().map_err(bad)?;
                 read.finish().map_err(bad)?;
-                return Ok((remote, thread));
+                return Ok((remote, bells, thread));
             }
             kinds::FAILED => {
                 let why = Reader::new(&body).str().map_err(bad)?.to_owned();

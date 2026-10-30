@@ -208,6 +208,13 @@ impl<T> Slab<T> {
         self.entry(handle).is_some()
     }
 
+    /// The handle of the value in slot `index`, if the slot holds one: for an owner that names
+    /// its values by slot alone, such as an I/O tag that completes exactly once.
+    pub fn handle_at(&self, index: u32) -> Option<Handle<T>> {
+        let entry = self.entries.get(index as usize)?;
+        entry.occupied().then_some(Handle { index, generation: entry.generation, _of: PhantomData })
+    }
+
     /// Takes the value `handle` names out; every handle to it is stale from now on.
     pub fn remove(&mut self, handle: Handle<T>) -> Option<T> {
         let entry = self.entries.get_mut(handle.index as usize)?;

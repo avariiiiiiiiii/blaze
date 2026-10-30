@@ -126,7 +126,8 @@ pub(super) fn check<'t>(cx: &mut Cx<'_, 't>, node: ast::Node<'t>) {
         .find(|it| it.name().is_some_and(|it| it.text() == name) && cx.local(*it) == Some(local))
         .map(|it| it.syntax().text_range());
     // A parameter's binding is outside the tree, and so outside every loop and closure in it.
-    let encloses = |outer: ast::Node<'t>| binding.is_some_and(|it| outer.text_range().contains_range(it));
+    let encloses =
+        |outer: ast::Node<'t>| binding.is_some_and(|it| outer.text_range().contains_range(it));
     if node.ancestors().skip(1).any(|it| (runs_again(it) || defers(it)) && !encloses(it)) {
         return;
     }
@@ -233,7 +234,8 @@ fn ends_borrowed<'t>(cx: &Cx<'_, 't>, mention: Mention<'t>, before: TextSize) ->
         Some(ast::Expr::MethodCallExpr(call))
             if call.receiver().is_some_and(|it| it.syntax() == place) =>
         {
-            ends_before(call.syntax()) && call_keeps_no_borrow(cx, ast::Expr::MethodCallExpr(call), place)
+            ends_before(call.syntax())
+                && call_keeps_no_borrow(cx, ast::Expr::MethodCallExpr(call), place)
         }
         Some(ast::Expr::BinExpr(bin)) if matches!(bin.op_kind(), Some(ast::BinaryOp::CmpOp(_))) => {
             ends_before(bin.syntax())
@@ -297,7 +299,9 @@ fn holds_no_borrow(db: &base_db::Db, ty: &hir::Type<'_>) -> bool {
             || it.is_array()
             || it.is_slice()
             || it.is_fn()
-            || it.as_adt().is_some_and(|adt| hir::GenericDef::Adt(adt).lifetime_params(db).is_empty());
+            || it
+                .as_adt()
+                .is_some_and(|adt| hir::GenericDef::Adt(adt).lifetime_params(db).is_empty());
     });
     free
 }

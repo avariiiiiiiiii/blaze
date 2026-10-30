@@ -12,9 +12,10 @@
 //! Apache-2.0).
 
 use hir::{HasAttrs as _, InFile, ModuleDef, PathResolution};
+use smallvec::SmallVec;
 use span::Edition;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
+    AstNode, SyntaxKind, SyntaxNode, TextRange,
     ast::{self, HasGenericArgs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
 };
 
@@ -24,9 +25,11 @@ use super::{
     outer, privacy,
 };
 use crate::{
-    cx::{Cx, item_range},
-    lints::edit_distance::find_best_match_for_name,
-    lower::{Found, Phase},
+    cx::Cx,
+    lower::{
+        Found, Phase,
+        unresolved_ident::{Names, Ns, PathSource, def_descr, imports, show_imports, typo},
+    },
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
@@ -79,14 +82,11 @@ impl Source {
         }
     }
 
-    /// rustc's `is_expected` of a name in scope rustc's `Res::descr` names `descr`.
-    fn is_expected_descr(self, descr: &str) -> bool {
+    /// The resolver's `PathSource` the shared suggestions (`lower::unresolved_ident`) take.
+    fn path(self) -> PathSource {
         match self {
-            Source::Type => matches!(
-                descr,
-                "struct" | "enum" | "union" | "trait" | "type alias" | "builtin type" | "type parameter" | "self type"
-            ),
-            Source::Trait => descr == "trait",
+            Source::Type => PathSource::Type,
+            Source::Trait => PathSource::Trait,
         }
     }
 
@@ -101,43 +101,56 @@ impl Source {
     }
 }
 
+/// The error of the path of type or trait `path` (of `ty`) in `signature`. What a path that
+/// resolves costs is its resolutions alone: its segments' names are copied, and the module it
+/// is in asked of Semantics, only for an error or a privacy test that needs them.
 pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, path: &ast::Path) -> Option<Found> {
     let file = signature.node.file_id;
     let source = Source::of(ty);
-    let mut prefixes: Vec<ast::Path> = std::iter::successors(Some(path.clone()), |it| it.qualifier()).collect();
+    let mut prefixes: SmallVec<[ast::Path; 4]> = std::iter::successors(Some(path.clone()), |it| it.qualifier()).collect();
     prefixes.reverse();
     let first = prefixes.first()?.segment()?;
     if first.type_anchor().is_some() {
         return None;
     }
-    let root = first.coloncolon_token().map(|it| Segment { name: ROOT.to_owned(), range: it.text_range() });
-    let offset = usize::from(root.is_some());
-    let mut segments: Vec<Segment> = root.into_iter().collect();
-    for prefix in &prefixes {
-        segments.push(segment(&prefix.segment()?)?);
+    if !prefixes.iter().all(|it| it.segment().is_some_and(|it| is_named(&it))) {
+        return None;
     }
+    let offset = usize::from(first.coloncolon_token().is_some());
+    let single = offset == 0 && prefixes.len() == 1;
+    if single && source == Source::Type && is_own_type_param(signature, path, &first) {
+        return None;
+    }
+    let segments = || segments(&first, &prefixes);
+    let current = || Some(cx.sema.scope(path.syntax())?.module());
     let place = At { file, node: path.syntax() };
-    let current = cx.sema.scope(path.syntax())?.module();
 
     let mut module: Option<ModuleDef> = None;
+    let mut defs: SmallVec<[ModuleDef; 4]> = SmallVec::new();
     for (at, prefix) in prefixes[..prefixes.len() - 1].iter().enumerate() {
         match cx.sema.resolve_path(prefix) {
-            Some(PathResolution::Def(def @ ModuleDef::Module(_))) => module = Some(def),
+            Some(PathResolution::Def(def @ ModuleDef::Module(_))) => {
+                module = Some(def);
+                defs.push(def);
+            }
             Some(PathResolution::Def(def @ ModuleDef::Adt(hir::Adt::Enum(_)))) if at + 2 == prefixes.len() => {
                 module = Some(def);
+                defs.push(def);
             }
             Some(res) => {
-                let name = &segments[offset + at].name;
-                if at == 0
-                    && offset == 0
-                    && is_from_outer(cx, signature, &res)
-                    && let Some(diag) = outer::check(cx, signature, prefix, name, false)
-                {
-                    return Some(found(cx, diag, signature, current, name));
+                if at == 0 && offset == 0 && is_from_outer(cx, signature, &res) {
+                    let current = current()?;
+                    let segments = segments();
+                    let name = &segments[at].name;
+                    if let Some(diag) = outer::check(cx, signature, prefix, name, false) {
+                        return Some(found(cx, diag, signature, current, name));
+                    }
                 }
                 return None;
             }
             None => {
+                let current = current()?;
+                let segments = segments();
                 let name = &segments[offset + at].name;
                 if at == 0
                     && offset == 0
@@ -151,27 +164,39 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
         }
     }
 
-    let last = segments.last()?.clone();
-    let span = cx.span(InFile::new(file, path.syntax().text_range()));
     let per_ns = cx.sema.resolve_path_per_ns(path);
     let res = per_ns
         .as_ref()
         .and_then(|it| it.type_ns.clone().or_else(|| it.value_ns.clone()).or_else(|| it.macro_ns.clone()));
-    let single = segments.len() == 1;
     if let Some(res) = &res {
-        if single
-            && is_from_outer(cx, signature, res)
-            && let Some(diag) = outer::check(cx, signature, path, &last.name, true)
-        {
-            return Some(found(cx, diag, signature, current, &last.name));
+        if single && is_from_outer(cx, signature, res) {
+            let current = current()?;
+            let name = segments().pop()?.name;
+            if let Some(diag) = outer::check(cx, signature, path, &name, true) {
+                return Some(found(cx, diag, signature, current, &name));
+            }
         }
         if source.is_expected(res) {
-            return privacy::check(cx, signature, &prefixes, &segments[offset..], current)
-                .map(|diag| found(cx, diag, signature, current, &last.name));
+            // The first segment is looked up in scope, not in a module: no E0603 of one segment.
+            if prefixes.len() == 1 {
+                return None;
+            }
+            let (at, def, current) = privacy::private(cx, &prefixes, &defs, current)?;
+            let segments = segments();
+            let diag = privacy::diag(cx, signature, &segments[offset + at], def)?;
+            return Some(found(cx, diag, signature, current, &segments.last()?.name));
         }
-    } else if single && let Some(diag) = outer::check(cx, signature, path, &last.name, true) {
+    }
+    let current = current()?;
+    let segments = segments();
+    let last = segments.last()?.clone();
+    if res.is_none()
+        && single
+        && let Some(diag) = outer::check(cx, signature, path, &last.name, true)
+    {
         return Some(found(cx, diag, signature, current, &last.name));
     }
+    let span = cx.span(InFile::new(file, path.syntax().text_range()));
     // What the path names in the type namespace makes the error "expected type, found ..";
     // in another one (`smart_resolve_report_errors`' `cross_namespace_res`) it is not found.
     let same = per_ns.as_ref().and_then(|it| it.type_ns.clone());
@@ -199,7 +224,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
                 }
                 _ => {
                     let prefix = match module {
-                        Some(def) => format!("{} ", def_descr(cx, def).unwrap_or("module")),
+                        Some(def) => format!("{} ", def_descr(cx, Ns::Type, def).unwrap_or("module")),
                         None => String::new(),
                     };
                     ("`", prefix, names_to_string(mod_path), module_of(module))
@@ -229,17 +254,21 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
         Some(PathResolution::Def(def)) => Some(*def),
         _ => None,
     };
-    let (accessible, inaccessible) =
-        if single { imports(cx, current, source, &last.name, own) } else { (Vec::new(), Vec::new()) };
+    let found = single.then(|| imports(cx, current, source.path(), &last.name, own)).filter(|it| !it.is_empty());
     let mut suggested: Vec<String> = Vec::new();
-    if accessible.is_empty() && inaccessible.is_empty() && source == Source::Type {
+    if found.is_none() && source == Source::Type {
         suggested = variant_enums(cx, &mut diag, current, &last.name, res.is_none(), &span);
     }
     let at = cx.span(InFile::new(file, last.range));
     // `lookup_typo_candidate` of a longer path looks in the module its prefix names, if any.
     let lookup = if single { None } else { in_module.or(module_of(module)) };
-    let typo = (single || lookup.is_some())
-        && typo(cx, &mut diag, path.syntax(), lookup, source, &last.name, &at, &suggested);
+    let typo = match lookup {
+        Some(module) => typo(cx, &mut diag, Names::Module(module), source.path(), &last.name, &at, &suggested),
+        None if single => cx.sema.scope(path.syntax()).is_some_and(|scope| {
+            typo(cx, &mut diag, Names::Scope(&scope), source.path(), &last.name, &at, &suggested)
+        }),
+        None => false,
+    };
     if !typo {
         if res.is_none() && ["true", "false"].contains(&last.name.to_lowercase().as_str()) {
             diag.suggestion_verbose(
@@ -253,8 +282,8 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
     }
 
     // `report_with_use_injections`: the imports, else a generic parameter to add.
-    if !accessible.is_empty() || !inaccessible.is_empty() {
-        show_imports(cx, &mut diag, current, accessible, inaccessible, res.is_some());
+    if let Some(found) = found {
+        show_imports(cx, &mut diag, current, found, res.is_some());
     } else if res.is_none()
         && source == Source::Type
         && single
@@ -353,9 +382,7 @@ fn missing_parameter(cx: &Cx<'_, '_>, signature: &Signature, path: &ast::Path, n
 
 fn found(cx: &Cx<'_, '_>, mut diag: Diag, signature: &Signature, module: hir::Module, name: &str) -> Found {
     diag.fact(cx.resolves_fact(module, name), format!("what `{name}` names in its scope"));
-    if let Some((fact, what)) = &signature.fact {
-        diag.fact(fact.clone(), what.clone());
-    }
+    signature.fact(cx, &mut diag);
     Found::new(diag, Phase::Resolve)
 }
 
@@ -385,6 +412,53 @@ fn module_of(def: Option<ModuleDef>) -> Option<hir::Module> {
         Some(ModuleDef::Module(it)) => Some(it),
         _ => None,
     }
+}
+
+/// Whether [`segment`] names `segment`, read with nothing copied.
+fn is_named(segment: &ast::PathSegment) -> bool {
+    match segment.kind() {
+        Some(ast::PathSegmentKind::Name(_)) => true,
+        Some(ast::PathSegmentKind::SelfTypeKw) => segment.self_type_token().is_some(),
+        Some(ast::PathSegmentKind::SelfKw) => segment.self_token().is_some(),
+        Some(ast::PathSegmentKind::SuperKw) => segment.super_token().is_some(),
+        Some(ast::PathSegmentKind::CrateKw) => segment.crate_token().is_some(),
+        Some(ast::PathSegmentKind::Type { .. }) | None => false,
+    }
+}
+
+/// The segments of the path whose first segment is `first` and whose prefixes are `prefixes`
+/// (outermost first), with the crate root of a leading `::`: for an error, once each prefix's
+/// segment is known to be [`is_named`].
+fn segments(first: &ast::PathSegment, prefixes: &[ast::Path]) -> Vec<Segment> {
+    let root = first.coloncolon_token().map(|it| Segment { name: ROOT.to_owned(), range: it.text_range() });
+    root.into_iter().chain(prefixes.iter().filter_map(|it| segment(&it.segment()?))).collect()
+}
+
+/// Whether the one-segment `path`, of first segment `first`, names a type parameter its item
+/// (or the impl or trait around it) declares, outside the list that declares it: hir resolves
+/// it to that parameter, which the place expects, and no error is given. Read from the syntax
+/// before anything is asked of Semantics; only in a file of source, where no macro's hygiene
+/// can make the name mean another.
+fn is_own_type_param(signature: &Signature, path: &ast::Path, first: &ast::PathSegment) -> bool {
+    if signature.node.file_id.is_macro() || first.generic_arg_list().is_some() {
+        return false;
+    }
+    let Some(ast::PathSegmentKind::Name(name)) = first.kind() else { return false };
+    let name = name.text();
+    let at = path.syntax().text_range();
+    let item = &signature.node.value;
+    let inner = outer::inner_item(item);
+    let declares = |node: &SyntaxNode| {
+        let Some(list) = ast::AnyHasGenericParams::cast(node.clone()).and_then(|it| it.generic_param_list()) else {
+            return false;
+        };
+        !list.syntax().text_range().contains_range(at)
+            && list.type_or_const_params().any(|it| match it {
+                ast::TypeOrConstParam::Type(param) => param.name().is_some_and(|it| it.text() == name),
+                ast::TypeOrConstParam::Const(_) => false,
+            })
+    };
+    declares(item) || (inner != *item && declares(&inner))
 }
 
 /// A segment as rustc's resolver names it: its keyword or its name.
@@ -417,7 +491,7 @@ fn names_to_string(segments: &[Segment]) -> String {
 /// rustc's `Res::descr` of a resolution.
 fn res_descr(cx: &Cx<'_, '_>, res: &PathResolution<'_>) -> &'static str {
     match res {
-        PathResolution::Def(def) => def_descr(cx, *def).unwrap_or("item"),
+        PathResolution::Def(def) => def_descr(cx, Ns::Type, *def).unwrap_or("item"),
         PathResolution::Local(_) => "local variable",
         PathResolution::TypeParam(_) => "type parameter",
         PathResolution::ConstParam(_) => "const parameter",
@@ -428,28 +502,6 @@ fn res_descr(cx: &Cx<'_, '_>, res: &PathResolution<'_>) -> &'static str {
     }
 }
 
-/// rustc's `Res::descr` of an item.
-pub(super) fn def_descr(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<&'static str> {
-    Some(match def {
-        ModuleDef::Module(_) => "module",
-        ModuleDef::Function(_) => "function",
-        ModuleDef::Adt(hir::Adt::Struct(_)) => "struct",
-        ModuleDef::Adt(hir::Adt::Enum(_)) => "enum",
-        ModuleDef::Adt(hir::Adt::Union(_)) => "union",
-        ModuleDef::EnumVariant(_) => "variant",
-        ModuleDef::Const(_) => "constant",
-        ModuleDef::Static(_) => "static",
-        ModuleDef::Trait(_) => "trait",
-        ModuleDef::TypeAlias(_) => "type alias",
-        ModuleDef::BuiltinType(_) => "builtin type",
-        ModuleDef::Macro(it) => match it.kind(cx.db) {
-            hir::MacroKind::Attr | hir::MacroKind::AttrBuiltIn => "attribute macro",
-            hir::MacroKind::Derive | hir::MacroKind::DeriveBuiltIn => "derive macro",
-            _ => "macro",
-        },
-    })
-}
-
 /// Where a type parameter is declared: its name.
 fn param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<Span> {
     let source = cx.sema.source(param.merge())?;
@@ -458,153 +510,6 @@ fn param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<Span> {
         _ => return None,
     };
     Some(cx.span(source.with_value(range)))
-}
-
-/// The span rustc points at an item's definition with: the head of its item.
-pub(super) fn def_span(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<Span> {
-    let source: InFile<SyntaxNode> = match def {
-        ModuleDef::Module(it) => it.declaration_source(cx.db)?.map(|it| it.syntax().clone()),
-        ModuleDef::Adt(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        ModuleDef::Trait(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        ModuleDef::TypeAlias(it) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        _ => return None,
-    };
-    Some(cx.span(source.map(|it| head_range(&it))))
-}
-
-/// rustc's `guess_head_span` of an item's `source_span`: up to its first `{`.
-fn head_range(node: &SyntaxNode) -> TextRange {
-    let range = item_range(node);
-    let text = node.to_string();
-    let base = node.text_range().start();
-    let from = usize::from(range.start() - base);
-    let item = &text[from..usize::from(range.end() - base)];
-    let head = item.find('{').map_or(item, |at| &item[..at]).trim_end();
-    TextRange::at(range.start(), TextSize::of(head))
-}
-
-/// A name a typo may have meant: rustc's `TypoSuggestion`.
-struct Candidate {
-    name: String,
-    descr: &'static str,
-    def: Option<Span>,
-}
-
-/// rustc's `Res::descr` of what a name in scope is, in the type namespace.
-fn scope_descr(cx: &Cx<'_, '_>, def: &hir::ScopeDef<'_>) -> Option<(&'static str, Option<Span>)> {
-    Some(match def {
-        hir::ScopeDef::GenericParam(hir::GenericParam::TypeParam(it)) => ("type parameter", param_span(cx, *it)),
-        hir::ScopeDef::ImplSelfType(_) | hir::ScopeDef::AdtSelfType(_) => ("self type", None),
-        hir::ScopeDef::ModuleDef(def) => (def_descr(cx, *def)?, def_span(cx, *def)),
-        _ => return None,
-    })
-}
-
-/// rustc's `suggest_typo`: the name of the scope (or of the module the path names), of a kind
-/// the place expects, closest to `name`; whether it suggested one.
-fn typo(
-    cx: &Cx<'_, '_>,
-    diag: &mut Diag,
-    node: &SyntaxNode,
-    module: Option<hir::Module>,
-    source: Source,
-    name: &str,
-    span: &Span,
-    suggested: &[String],
-) -> bool {
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut consider = |found: &hir::Name, def: hir::ScopeDef<'_>| {
-        let Some((descr, def_at)) = scope_descr(cx, &def).filter(|(it, _)| source.is_expected_descr(it)) else {
-            return;
-        };
-        candidates.push(Candidate { name: found.as_str().to_owned(), descr, def: def_at });
-    };
-    match module {
-        Some(module) => {
-            for (found, def) in module.scope(cx.db, None) {
-                consider(&found, def);
-            }
-        }
-        None => {
-            let Some(scope) = cx.sema.scope(node) else { return false };
-            scope.process_all_names(&mut |found, def| consider(&found, def));
-        }
-    }
-    candidates.sort_by(|a, b| a.name.cmp(&b.name));
-    let names: Vec<&str> = candidates.iter().map(|it| it.name.as_str()).collect();
-    let Some(best) = find_best_match_for_name(&names, name, None) else { return false };
-    if best == name || best == "_" || suggested.iter().any(|it| it == best) {
-        return false;
-    }
-    let best = best.to_owned();
-    let Some(candidate) = candidates.into_iter().find(|it| it.name == best) else { return false };
-    if let Some(def) = &candidate.def
-        && def.file == span.file
-        && def.lo < span.hi
-        && span.lo < def.hi
-    {
-        return false;
-    }
-    if let Some(def) = &candidate.def {
-        diag.span_label(def.clone(), format!("similarly named {} `{}` defined here", candidate.descr, candidate.name));
-    }
-    diag.suggestion_verbose(
-        span.clone(),
-        format!("a {} with a similar name exists", candidate.descr),
-        candidate.name,
-        Applicability::MaybeIncorrect,
-    );
-    true
-}
-
-/// An item named as the name looked for: rustc's `ImportSuggestion`.
-struct Import {
-    path: String,
-    of_crate: bool,
-    descr: &'static str,
-    def: ModuleDef,
-}
-
-/// rustc's `lookup_import_candidates` in the type namespace: the items named `name` the place
-/// expects, other than `own` (what the path names), that `module` can and can't import.
-fn imports(
-    cx: &Cx<'_, '_>,
-    module: hir::Module,
-    source: Source,
-    name: &str,
-    own: Option<ModuleDef>,
-) -> (Vec<Import>, Vec<Import>) {
-    let mut accessible: Vec<Import> = Vec::new();
-    let mut inaccessible: Vec<Import> = Vec::new();
-    for (local, def) in named(cx, name) {
-        if own == Some(def) {
-            continue;
-        }
-        let Some(descr) = def_descr(cx, def).filter(|it| source.is_expected_descr(it)) else { continue };
-        match import_path(cx, module, def, local) {
-            Some(Ok((path, of_crate))) => accessible.push(Import { path, of_crate, descr, def }),
-            Some(Err(path)) => inaccessible.push(Import { path, of_crate: true, descr, def }),
-            None => {}
-        }
-    }
-    (accessible, inaccessible)
-}
-
-/// The items of the crate and its dependencies named `name`, and whether each is the crate's.
-fn named(cx: &Cx<'_, '_>, name: &str) -> Vec<(bool, ModuleDef)> {
-    let crates = std::iter::once(cx.krate).chain(cx.krate.dependencies(cx.db).into_iter().map(|it| it.krate));
-    let mut out = Vec::new();
-    for krate in crates {
-        let local = krate == cx.krate;
-        for of in krate.modules(cx.db) {
-            for def in of.declarations(cx.db) {
-                if def.name(cx.db).is_some_and(|it| it.as_str() == name) {
-                    out.push((local, def));
-                }
-            }
-        }
-    }
-    out
 }
 
 /// The path `module` imports `def` by (and whether it is from the crate root), or the path of
@@ -627,31 +532,23 @@ fn import_path(cx: &Cx<'_, '_>, module: hir::Module, def: ModuleDef, local: bool
 }
 
 /// `try_lookup_name_relaxed`'s enums of the variants named `name`, suggested for the path at
-/// `span`; the enums' paths, which no typo then repeats.
+/// `span`; the enums' paths, which no typo then repeats. The variants are read from the
+/// declarations of the name in the crate and its direct dependencies (`Paths::decls`, one
+/// probe), not from every enum of every module.
 fn variant_enums(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, name: &str, unresolved: bool, span: &Span) -> Vec<String> {
-    let crates = std::iter::once(cx.krate).chain(cx.krate.dependencies(cx.db).into_iter().map(|it| it.krate));
     let mut found: Vec<(String, String)> = Vec::new();
-    for krate in crates {
-        let local = krate == cx.krate;
-        for of in krate.modules(cx.db) {
-            for def in of.declarations(cx.db) {
-                let ModuleDef::Adt(hir::Adt::Enum(it)) = def else { continue };
-                for variant in it.variants(cx.db) {
-                    if variant.name(cx.db).as_str() != name {
-                        continue;
-                    }
-                    let path = match import_path(cx, module, ModuleDef::EnumVariant(variant), local) {
-                        Some(Ok((path, _))) => path,
-                        _ => continue,
-                    };
-                    let Some((enum_path, _)) = path.rsplit_once("::") else { continue };
-                    if enum_path.starts_with("std::prelude::") {
-                        continue;
-                    }
-                    found.push((path.clone(), enum_path.to_owned()));
-                }
-            }
+    for decl in cx.paths().decls(cx).named(name) {
+        let ModuleDef::EnumVariant(_) = decl.def else { continue };
+        let path = match import_path(cx, module, decl.def, decl.local) {
+            Some(Ok((path, _))) => path,
+            _ => continue,
+        };
+        let Some((enum_path, _)) = path.rsplit_once("::") else { continue };
+        if enum_path.starts_with("std::prelude::") {
+            continue;
         }
+        let enum_path = enum_path.to_owned();
+        found.push((path, enum_path));
     }
     if found.is_empty() {
         return Vec::new();
@@ -679,99 +576,6 @@ fn variant_enums(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, name: &s
     enums
 }
 
-/// rustc's `show_candidates` of the imports `lookup_import_candidates` found; `instead` when
-/// the path named something else.
-fn show_imports(
-    cx: &Cx<'_, '_>,
-    diag: &mut Diag,
-    module: hir::Module,
-    mut accessible: Vec<Import>,
-    mut inaccessible: Vec<Import>,
-    instead: bool,
-) {
-    let instead = if instead { " instead" } else { "" };
-    for found in [&mut accessible, &mut inaccessible] {
-        found.sort_by(|a, b| a.path.cmp(&b.path));
-        found.dedup_by(|a, b| a.path == b.path);
-        let (mut local, rest): (Vec<Import>, Vec<Import>) = found.drain(..).partition(|it| it.of_crate);
-        let (core, rest): (Vec<Import>, Vec<Import>) = rest.into_iter().partition(|it| it.path.starts_with("core::"));
-        let (std, foreign): (Vec<Import>, Vec<Import>) = rest.into_iter().partition(|it| it.path.starts_with("std::"));
-        let both = std.len() == core.len();
-        local.extend(std);
-        if !both {
-            local.extend(core);
-        }
-        local.extend(foreign);
-        *found = local;
-    }
-    if !accessible.is_empty() {
-        let msg = match accessible.as_slice() {
-            [only] => format!("consider importing this {}{instead}", only.descr),
-            many => {
-                let kind = if many.iter().all(|it| it.descr == many[0].descr) { many[0].descr } else { "item" };
-                let s = if kind.ends_with('s') { "es" } else { "s" };
-                format!("consider importing one of these {kind}{s}{instead}")
-            }
-        };
-        match use_placement(cx, module) {
-            Some((span, found_use)) => {
-                let newline = if found_use { "" } else { "\n" };
-                diag.suggestions(
-                    span,
-                    msg,
-                    accessible.iter().map(|it| format!("use {};\n{newline}", it.path)),
-                    Applicability::MaybeIncorrect,
-                    SuggestionStyle::ShowAlways,
-                );
-            }
-            None => {
-                let paths: String = accessible.iter().map(|it| format!("\n{}", it.path)).collect();
-                diag.help(format!("{msg}:{paths}"));
-            }
-        }
-    }
-    match inaccessible.as_slice() {
-        [] => {}
-        [only] => {
-            let msg = format!("{} `{}` exists but is inaccessible", only.descr, only.path);
-            match def_span(cx, only.def) {
-                Some(span) => {
-                    let mut multi = crate::model::MultiSpan::of(span.clone());
-                    multi.labels.push((span, "not accessible".to_owned()));
-                    diag.span_note(multi, msg);
-                }
-                None => {
-                    diag.note(msg);
-                }
-            }
-        }
-        many => {
-            let descr = if many.iter().all(|it| it.descr == many[0].descr) { many[0].descr } else { "item" };
-            let plural = if descr.ends_with('s') { format!("{descr}es") } else { format!("{descr}s") };
-            let mut msg = format!("these {plural} exist but are inaccessible");
-            let mut multi = crate::model::MultiSpan::default();
-            let mut colon = false;
-            for it in many {
-                match def_span(cx, it.def) {
-                    Some(span) => {
-                        multi.primary.push(span.clone());
-                        multi.labels.push((span, format!("`{}`: not accessible", it.path)));
-                    }
-                    None => {
-                        if !colon {
-                            msg.push(':');
-                            colon = true;
-                        }
-                        msg.push('\n');
-                        msg.push_str(&it.path);
-                    }
-                }
-            }
-            diag.span_note(multi, msg);
-        }
-    }
-}
-
 /// Whether an item is `#[doc(hidden)]`, which rustc does not suggest importing from another
 /// crate.
 fn is_doc_hidden(cx: &Cx<'_, '_>, def: ModuleDef) -> bool {
@@ -790,33 +594,4 @@ fn in_edition(cx: &Cx<'_, '_>, path: String) -> String {
         (Edition::Edition2015, Some(rest)) => rest.to_owned(),
         _ => path,
     }
-}
-
-/// rustc's `UsePlacementFinder`: where a `use` goes in the module (not a block) `module` is
-/// in, the first `use` item there or else its first item, and whether it was a `use`.
-fn use_placement(cx: &Cx<'_, '_>, module: hir::Module) -> Option<(Span, bool)> {
-    use ast::HasModuleItem as _;
-    use syntax::AstToken as _;
-    let module = module.nearest_non_block_module(cx.db);
-    let source = module.definition_source(cx.db);
-    let items: Vec<ast::Item> = match &source.value {
-        hir::ModuleSource::SourceFile(it) => it.items().collect(),
-        hir::ModuleSource::Module(it) => it.item_list()?.items().collect(),
-        hir::ModuleSource::BlockExpr(_) => return None,
-    };
-    let (item, found_use) = match items.iter().find(|it| matches!(it, ast::Item::Use(_))) {
-        Some(it) => (it, true),
-        None => (items.first()?, false),
-    };
-    let start = item
-        .syntax()
-        .children_with_tokens()
-        .find(|it| match it {
-            syntax::NodeOrToken::Node(_) => true,
-            syntax::NodeOrToken::Token(token) => {
-                !token.kind().is_trivia() || ast::Comment::cast(token.clone()).is_some_and(|it| it.kind().doc.is_some())
-            }
-        })
-        .map_or(item.syntax().text_range().start(), |it| it.text_range().start());
-    Some((cx.span(InFile::new(source.file_id, TextRange::empty(start))), found_use))
 }

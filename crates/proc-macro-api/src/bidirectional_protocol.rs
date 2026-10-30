@@ -162,6 +162,7 @@ pub(crate) fn expand(
 ) -> Result<Result<tt::TopSubtree, String>, crate::ServerError> {
     let version = process.version();
     if let Some(err) = process.exited() {
+        // clone: error path, the server's exit told to each caller.
         return Err(err.clone());
     }
     if version >= version::WIRE_TREES {
@@ -176,14 +177,17 @@ pub(crate) fn expand(
             &mut sent,
         );
         let sent = RefCell::new(sent);
+        // alloc: the request, sent to another process (the edge).
         let task = BidirectionalMessage::Request(Request::ExpandMacroWire(Box::new(task)));
         let answer = process.run_expansion(task, &noting(&sent, callback), seen)?;
         return match answer {
             BidirectionalMessage::Response(Response::ExpandMacroWire(Ok(resp))) => {
+                // alloc: none unless the answer's bytes are off a word.
                 let tree = read_tree(&resp.tree, &sent.borrow(), &mut Vec::new());
                 Ok(Ok(tree.map_err(answer_error)?))
             }
             BidirectionalMessage::Response(Response::ExpandMacroWire(Err(msg))) => Ok(Err(msg.0)),
+            // alloc: error path.
             _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
         };
     }

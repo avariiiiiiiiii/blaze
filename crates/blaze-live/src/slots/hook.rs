@@ -30,6 +30,7 @@ pub(crate) fn install() {
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
         let previous = panic::take_hook();
+        // alloc: setup, the panic hook, installed once per process
         panic::set_hook(Box::new(move |info| {
             if GUARDED.try_with(Cell::get).unwrap_or(0) != 0 {
                 let mut pcs = Vec::with_capacity(FRAMES);
@@ -50,6 +51,7 @@ pub(crate) fn install() {
 #[allow(clippy::type_complexity)]
 pub(crate) fn catch<R>(
     f: impl FnOnce() -> R,
+// dyn: std's panic payload, as `catch_unwind` hands it
 ) -> Result<R, (Box<dyn Any + Send + 'static>, Option<Panic>)> {
     GUARDED.with(|it| it.set(it.get() + 1));
     // The guard is where the program says what `f` touched may be dropped half done.
@@ -65,9 +67,12 @@ fn describe(info: &PanicHookInfo<'_>) -> String {
         .downcast_ref::<&str>()
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        // dyn: none: the text a payload of no known type is described as
         .unwrap_or("Box<dyn Any>");
     match info.location() {
+        // alloc: once per panic under the guard: the reason the program and the linker get
         Some(at) => format!("panicked at {}:{}:{}: {message}", at.file(), at.line(), at.column()),
+        // alloc: as above
         None => format!("panicked: {message}"),
     }
 }

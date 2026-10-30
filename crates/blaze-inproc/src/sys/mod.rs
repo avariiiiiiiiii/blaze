@@ -1,6 +1,7 @@
 //! The platform: memory objects and their mappings, the channel's transport, handing objects
 //! to a run process and laying them over its executable, its threads, the instruction cache
-//! and stack walks. Every `unsafe` of the crate is under this module, behind the safe API each
+//! and stack walks. Every `unsafe` of the crate is under this module (but the start hooks'
+//! entry points and their environment, `crate::runtime`'s), behind the safe API each
 //! platform module exports with the same names and these signatures (`Error` is
 //! `crate::Error`, `Channel` is `crate::channel::Channel`, `Access` is `crate::Access`,
 //! `Overlay` and `Grant` are `crate::handshake`'s):
@@ -72,6 +73,29 @@
 //! - `fn backtrace(out: &mut [u64]) -> Option<usize>`: the return addresses of the calling
 //!   thread's frames, all of them up to its outermost; `None` when they don't fit or the walk
 //!   could not finish.
+//! - `Remote::kill(&self) -> Result<(), Error>` (daemon): ends the run process (a pidfd on
+//!   Linux, the process handle on Windows, its process ID on macOS); one already gone is fine.
+//!
+//! The asks ([`crate::ask`]), each async-signal-safe on the run process's side:
+//!
+//! - `fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool`: sleeps while the
+//!   word's low 32 bits (its first four bytes) are `expected`, until woken or `timeout`; `false`
+//!   when the timeout passed. Across processes for a word of a shared mapping on Unix (a futex
+//!   that is not private, `__ulock_wait` shared); within the process on Windows.
+//!   `fn wake(word: &AtomicU64)` wakes every thread sleeping on it.
+//! - `struct Bells` (daemon, `Send + Sync`): what wakes a run process's askers and what they
+//!   ring. `fn new(remote: &Remote, slots: usize) -> Result<(Bells, Vec<u64>), Error>`, with
+//!   what the run process names the doorbell and each slot's bell by (Windows: the events,
+//!   duplicated into it; 0 elsewhere); `fn wake(&self, slot: usize, word: &AtomicU64)` after an
+//!   answer is stored in `word`; `fn wait_ring(&self, stream: &mut Stream) -> Result<bool,
+//!   Error>`, until the doorbell rang (`true`) or the process ended (`false`).
+//! - `fn ring(stream: &Stream, doorbell: u64) -> Result<(), Error>` (run): one byte on the
+//!   channel, or the doorbell's event. `fn wait_answer(word: &AtomicU64, expected: u32, bell:
+//!   u64, timeout: Duration) -> bool`, as `wait` (Windows: on the slot's event).
+//!   `fn hung_up(stream: &Stream) -> bool`: the daemon's end wrote or closed, which after the
+//!   start means it is gone.
+//! - `struct Errno` (run): `fn keep() -> Errno`, the thread's `errno` (last error on Windows),
+//!   put back when dropped.
 
 #[cfg(any(
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
@@ -113,20 +137,21 @@ pub(crate) enum Rights {
     /// Map it to read, execute or copy, never to write it shared: the image and arena, a
     /// fixed map's.
     Code,
-    /// Map it shared and writable, never executable: the fence's control words, the cells.
+    /// Map it shared and writable, never executable: the fence's control words, the asks, the
+    /// cells.
     Words,
 }
 
-/// The control words the start hook mapped at `at`, `len` bytes, for the rest of the process.
-pub(crate) fn adopt_words(at: u64, len: u64) -> Result<&'static [std::sync::atomic::AtomicU64], crate::Error> {
-    if at == 0 || !at.is_multiple_of(8) || len < crate::fence::CONTROL_BYTES || len > isize::MAX as u64 {
-        return Err(crate::Error::new(format!("control words of {len} bytes at {at:#x}")));
+/// The words of an object the start hook mapped at `at`, `len` bytes and at least `least`, for
+/// the rest of the process: the control words, the asks.
+pub(crate) fn adopt_words(at: u64, len: u64, least: u64) -> Result<&'static [std::sync::atomic::AtomicU64], crate::Error> {
+    if at == 0 || !at.is_multiple_of(8) || len < least || len > isize::MAX as u64 {
+        return Err(crate::Error::new(format!("words of {len} bytes at {at:#x}, where {least} are needed")));
     }
-    // SAFETY: the start hook mapped the control object shared and writable at `at`, `len`
-    // bytes, with `Granted::map_anywhere`, which never unmaps it. It is non-null, 8-aligned
-    // and of `len / 8` whole words (checked above). Every access to it, here and in the
-    // daemon's process, is atomic, so a `&[AtomicU64]` to it is sound for the rest of the
-    // process.
+    // SAFETY: the start hook mapped a words object shared and writable at `at`, `len` bytes,
+    // with `Granted::map_anywhere`, which never unmaps it. It is non-null, 8-aligned and of
+    // `len / 8` whole words (checked above). Every access to it, here and in the daemon's
+    // process, is atomic, so a `&[AtomicU64]` to it is sound for the rest of the process.
     Ok(unsafe { std::slice::from_raw_parts(at as *const std::sync::atomic::AtomicU64, (len / 8) as usize) })
 }
 

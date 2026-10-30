@@ -1,7 +1,7 @@
 //! The daemon's loop: one driver, and every state machine of the daemon stepped by it.
 //!
 //! - A completion goes to what asked for it, by its tag: the server, the VFS, the database, the
-//!   store, the checkouts' watchers and cookies, the jobs (their lock writes, modes and user
+//!   store, the checkouts' watchers and cookies and the watches outside views, the jobs (their lock writes, modes and user
 //!   code), or the loop's own (the start, the estimates).
 //! - What arrives goes through [`Heads`] (a request on a checkout waits for its watcher) to the
 //!   session; what the session answers goes to the server. The VFS is flushed after every
@@ -23,14 +23,14 @@ use std::{
 
 use blaze_api::{
     Arrived, Reply, Request,
-    server::{Config as ServerConfig, Http, Server},
+    server::{Config as ServerConfig, Http, Server, Unix},
     session::{self, Session},
 };
 use blaze_cas::Store;
 use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, Mapping, Tag};
 use blaze_graph::{Budget, PlaneConfig, admission::Estimates, arena};
 use blaze_query::{Database, DbError};
-use blaze_vfs::{Ticket, Vfs};
+use blaze_vfs::{Outside, Ticket, Vfs};
 
 use super::{
     heads::{Heads, Out},
@@ -49,6 +49,9 @@ const STORE: u64 = 4 << 32;
 const COOKIES: u64 = 5 << 32;
 const JOBS: u64 = 6 << 32;
 const JOBS_END: u64 = 7 << 32;
+/// The watches of directories outside views ([`blaze_vfs::Outside`]).
+const OUTSIDE: u64 = 7 << 32;
+const OUTSIDE_END: u64 = OUTSIDE + blaze_vfs::outside::TAGS;
 const WATCHERS: u64 = 1 << 40;
 const RUNS: u64 = 1 << 50;
 const RUNS_END: u64 = 1 << 62;
@@ -76,8 +79,10 @@ macro_rules! cx {
             vfs: &mut $daemon.vfs,
             db: &$daemon.db,
             builder: &mut $daemon.jobs,
-            memory_bytes: arena::held(),
+            pid: $daemon.pid,
+            memory_bytes: arena::own(),
             budget_bytes: $daemon.plane.budget().map_or(0, |it| it.bytes),
+            memory: blaze_mem::tag::snapshot,
         }
     };
 }
@@ -116,6 +121,13 @@ pub struct Options {
     pub env: Vec<(String, String)>,
     pub host: String,
     pub color: bool,
+    /// The table of directories outside views that user code's checks read
+    /// ([`blaze_vfs::outside::dirs`]); the daemon drives its watches for its whole life.
+    pub outside: &'static blaze_vfs::outside::Dirs,
+    /// The socket systemd or launchd passed (`blaze serve --activated`), listened on in place
+    /// of one made at `socket`, where it must be bound. Its file is the manager's.
+    #[cfg(unix)]
+    pub activated: Option<blaze_api::activation::Passed>,
 }
 
 fn under(dir: &FileName, name: &str) -> FileName {
@@ -154,6 +166,7 @@ pub struct Daemon<D: Driver> {
     stop_asked: bool,
     settling: bool,
     failed: Option<String>,
+    pid: u32,
 }
 
 /// The buffers the loop's calls borrow and give back, so a warm turn allocates none: a call
@@ -189,15 +202,23 @@ impl<D: Driver> Daemon<D> {
         let db_dir = under(&state, "db");
         let image = under(&db_dir, "image");
         let estimates_file = under(&state, "estimates");
+        // A passed socket is neither dialed (that reaches this daemon's own backlog) nor
+        // unlinked (its file is the manager's).
+        #[cfg(unix)]
+        let activated = options.activated.is_some();
+        #[cfg(not(unix))]
+        let activated = false;
         let mut effects = vec![
             Effect::Stat { file: journal.clone(), tag: STAT_JOURNAL },
             Effect::Stat { file: image.clone(), tag: STAT_IMAGE },
             Effect::Stat { file: estimates_file.clone(), tag: STAT_ESTIMATES },
-            Effect::Connect { at: Address::Unix(options.socket.clone()), tag: DIAL },
         ];
+        if !activated {
+            effects.push(Effect::Connect { at: Address::Unix(options.socket.clone()), tag: DIAL });
+        }
         let store_config = blaze_cas::Config { dir: under(&state, "store"), layers: Vec::new(), tags: STORE };
         let mut store = Store::open(store_config, &mut effects);
-        let mut read = Read::default();
+        let mut read = Read { socket_free: activated, ..Read::default() };
         let mut done = Vec::new();
         let socket = format!("/{}", options.socket);
         loop {
@@ -278,11 +299,21 @@ impl<D: Driver> Daemon<D> {
         let plane = Plane::new(plane_config, estimates, runner).map_err(|error| format!("the plane: {error}"))?;
         let mounts = Mounts::recover(&vfs);
         let mut listening = socket.clone();
+        #[cfg(unix)]
+        let unix = match options.activated {
+            Some(passed) => {
+                listening.push_str(&format!(" (passed by {})", passed.by()));
+                Unix::Passed { socket: passed, at: options.socket.clone() }
+            }
+            None => Unix::Bind(options.socket.clone()),
+        };
+        #[cfg(not(unix))]
+        let unix = Unix::Bind(options.socket.clone());
         if let Some((at, _)) = &options.http {
             listening.push_str(&format!(" and http://{at}"));
         }
         let server_config = ServerConfig {
-            unix: Some(options.socket.clone()),
+            unix: Some(unix),
             http: options.http.map(|(at, token)| Http { at, token }),
             tags: SERVER,
             most_connections: 1024,
@@ -310,7 +341,7 @@ impl<D: Driver> Daemon<D> {
             store,
             plane,
             mounts,
-            heads: Heads::new(COOKIES, WATCHERS, RUNS),
+            heads: Heads::new(COOKIES, WATCHERS, RUNS, Outside::new(options.outside, "/", OUTSIDE)),
             jobs,
             steps,
             replies: Vec::new(),
@@ -319,6 +350,7 @@ impl<D: Driver> Daemon<D> {
             stop_asked: false,
             settling: false,
             failed: None,
+            pid: std::process::id(),
         })
     }
 
@@ -353,6 +385,11 @@ impl<D: Driver> Daemon<D> {
 
     pub fn db(&self) -> &Database {
         &self.db
+    }
+
+    /// Written only by the loop; read elsewhere through [`Store::reader`].
+    pub fn store(&self) -> &Store {
+        &self.store
     }
 
     pub fn mounts(&self) -> &Mounts {
@@ -442,7 +479,7 @@ impl<D: Driver> Daemon<D> {
                 self.jobs.placed(&mut world!(self, said), placed);
                 self.said(said);
             }
-            COOKIES..JOBS | WATCHERS..RUNS => {
+            COOKIES..JOBS | OUTSIDE..OUTSIDE_END | WATCHERS..RUNS => {
                 debug_assert!(self.heads.owns(completion.tag), "the checkouts' tags are theirs");
                 let mut out = self.spare.out.pop().unwrap_or_default();
                 self.heads.complete(&mut self.vfs, completion, &mut self.effects, &mut out);

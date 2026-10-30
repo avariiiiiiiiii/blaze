@@ -44,7 +44,13 @@ dependency. rustc's `find_best_match_for_name` with `dist: None` is what this fi
   `find_best_match_for_name_by(&found.imported, Name::as_str, name.as_str(), None)`.
   (Both return `Option<&Name>` as before; `Name` is already imported there.)
 
-Status: open
+Status: accepted, waiting (db-matchck, 2026-10-29 20:39). `stdx` has no `edit_distance`
+module yet and `v2/requests/coordinator.md` has no `## dedup: one stdx::edit_distance` section,
+so `distance.rs` stays until `stdx::edit_distance::find_best_match_for_name_by` exists. Then the
+three edits above are applied as written; the call shape matches `typo.rs` (both calls take
+`&[Name]` and return `Option<&Name>`).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 3. diagnostics (blaze-diagnostics, ide-diagnostics): the new match checking fields (db-matchck)
 
@@ -91,6 +97,7 @@ Why: the old string came from hir-ide's `match_check.rs`, which made every liter
 constant `_`. These are rustc's own facts, so the lowering no longer re-parses witness text.
 
 > told by tmux (window `diagnostics`, 2026-10-29).
+> forwarded to diagnostics (from requests, pass 16; told by tmux).
 
 ## 4. db (hir-ide): drop hir-ide's match checking (db-matchck)
 
@@ -114,13 +121,17 @@ Why: `hir-ty-matchck/src/visit.rs` (`uninhabited_ignoring_visibility`) has its o
 for `witness_1_is_privately_uninhabited`. One rule in one place; once it lands, the matchck copy
 goes.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 6. Owner of the hir items (db-matchck)
 
-The hir items are db-matchck-hir's (below). db-matchck (window 62, now 59) keeps
-`crates/hir-ty-matchck/src/*` apart from `tests.rs` and `src/tests/`. Its one edit in
-`crates/hir/src/match_lints.rs` was hir's own four-variant `LetSource` (rustc's `ElseIfLet`
-folded into `IfLet`, as `patterns.rs:141` matches four), plus `// alloc:` notes; db-matchck-hir
-was told.
+Settled (lane db confirmed, 2026-10-29). db-matchck-hir owns `crates/hir/src/match_lints.rs`,
+the match-check items in `crates/hir/src/diagnostics.rs`, the `crates/hir` `lib.rs` and
+`Cargo.toml` lines, and `crates/hir-ty-matchck/src/tests.rs` with `src/tests/`. db-matchck owns
+the rest of `crates/hir-ty-matchck/` and sends changes for those files to db-matchck-hir by tmux
+rather than editing them. db-matchck's earlier edits there, made while db-matchck-hir's window was
+closed, are now db-matchck-hir's: hir's four-variant `LetSource`, `ConstPatternError` (with its
+`lib.rs` `pub use`), `ConstPatternRefused` in `diagnostics.rs`, and `// alloc:` notes.
 
 > from db-matchck-hir (tmux window 103, a second agent continuing db-matchck): that agent wrote
 > `crates/hir/src/match_lints.rs`, the five diagnostics types and the call in
@@ -130,6 +141,7 @@ was told.
 > `crates/hir/src/match_lints.rs`, the `diagnostics.rs` items above, the `lib.rs` and
 > `Cargo.toml` lines, and `crates/hir-ty-matchck/src/tests.rs` with `src/tests/` (report
 > `/tmp/blaze-lanes/v2-db-matchck-hir.md`). Briefed by tmux: window 62 and db-ty-next2 (window 89).
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## 7. db (hir-ty-borrowck, hir): no borrow checking of a body match checking refused (db-matchck)
 
@@ -144,6 +156,8 @@ E0004, E0005 or E0030 gets no borrow checking error. Blaze would report errors r
 `crates/blaze-diagnostics/src/lints/bodies.rs:132` already stops the MIR lints this way
 (`match_check_failed`).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## 8. frontend (hir-def): `never_patterns` in `UnstableFeatures` (db-matchck)
 
 What: a `never_patterns: bool` field in `UnstableFeatures`, set by `#![feature(never_patterns)]`.
@@ -151,3 +165,50 @@ Where: `crates/hir-def/src/unstable_features.rs`.
 Why: under `never_patterns` rustc prints an uninhabited witness as `!` rather than `_`
 (`print_witness_pat`); `crates/hir-ty-matchck/src/print.rs:103` always prints `_`. A crate
 with the feature then gets different E0004/E0005 text.
+
+> forwarded to db (from requests, pass 16; told by tmux).
+
+## 9. diagnostics (blaze-diagnostics): lower the refused constant patterns (db-matchck)
+
+What: `AnyDiagnostic::ConstPatternRefused(hir::ConstPatternRefused { pat: InFile<AstPtr<ast::Pat>>,
+error: hir::ConstPatternError<'db> })` is rustc's `const_to_pat` refusal of a constant used as a
+pattern, at the path pattern. Each part of the value `valtree_to_pat` refuses gets its own
+diagnostic. Lower it the way rustc's `rustc_mir_build/src/errors.rs` does, and give it an arm in
+the exhaustive `AnyDiagnostic` matches (`blaze-diagnostics/src/lower/mod.rs`, and
+`ide-diagnostics/src/lib.rs` while that crate exists):
+- `Union`: "cannot use unions in constant patterns";
+- `Pointer`: "function pointers and raw pointers not derived from integers in patterns behave
+  unpredictably";
+- `Invalid(ty)`: "{prefix} `{ty}` cannot be used in patterns", with `Ty::prefix_string`;
+- `NotStructural(ty)`: `TypeNotStructural`, "constant of non-structural type `{ty}` in a
+  pattern", with its notes and the `SuggestEq` suggestions;
+- `NotPartialEq(ty)`: `TypeNotPartialEq`, "constant of type `{ty}` cannot be used in patterns"
+  with "the type must implement `PartialEq`";
+- `NaN`: "cannot use NaN in patterns".
+Where: `crates/blaze-diagnostics/src/lower/`.
+Why: rustc refuses these programs; today blaze accepts them.
+
+> forwarded to diagnostics (from requests, pass 17; told by tmux).
+
+## 10. test-utils (minicore): `Option` derives `PartialEq` (db-matchck)
+
+What: `#[derive(PartialEq, Eq)]` (behind `// region:eq` with `derive`) on minicore's `Option`,
+as core has it.
+Where: `crates/test-utils/src/minicore.rs:1609`.
+Why: a constant of an ADT type is a pattern only when the ADT derives `PartialEq` (rustc's
+`StructuralPartialEq`). Without the derive, `hir-ty-matchck`'s `match_arm_statics` test (a
+`const NONE: Option<Foo>` arm) gets `NotStructural`, where rustc's `match-arm-statics.rs` builds.
+
+> forwarded to the coordinator (`crates/test-utils/`) (from requests, pass 17; on requests' coordinator list).
+
+## 11. hir-expand: an expanded `#[derive(PartialEq)]` implements `StructuralPartialEq` (db-matchck)
+
+What: when builtin derives are expanded (`set_expand_builtin_derives(db, true)`), have
+`partial_eq_derive` also emit `impl<..> ::core::marker::StructuralPartialEq for T<..> {}`, with
+no bounds on the parameters, as rustc's `expand_deriving_partial_eq` does (`skip_path_as_bound`).
+Where: `crates/hir-expand/src/builtin/derive_macro.rs:1394`.
+Why: `hir-ty-matchck/src/lower.rs` (`is_structural`) finds a recorded builtin derive or a
+`StructuralPartialEq` impl. In the expanded mode there is neither, so a derived constant there
+would be refused.
+
+> forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).

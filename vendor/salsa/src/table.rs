@@ -59,10 +59,6 @@ pub unsafe trait Slot: Any + Send + Sync {
 type SlotMemosFnErased = unsafe fn(*const (), current_revision: Revision) -> *const MemoTable;
 /// [Slot::memos]
 type SlotMemosFn<T> = unsafe fn(*const T, current_revision: Revision) -> *const MemoTable;
-/// [Slot::memos_unchecked]
-type SlotMemosUncheckedFnErased = unsafe fn(*const ()) -> *const MemoTable;
-/// [Slot::memos_unchecked]
-type SlotMemosUncheckedFn<T> = unsafe fn(*const T) -> *const MemoTable;
 /// [Slot::memos_mut]
 type SlotMemosMutFnErased = unsafe fn(*mut ()) -> *mut MemoTable;
 /// [Slot::memos_mut]
@@ -72,28 +68,31 @@ struct SlotVTable {
     layout: Layout,
     /// [`Slot`] methods
     memos: SlotMemosFnErased,
-    memos_unchecked: SlotMemosUncheckedFnErased,
     memos_mut: SlotMemosMutFnErased,
     /// The type name of what is stored as entries in data.
     type_name: fn() -> &'static str,
     /// A drop impl to call when the own page drops
     /// SAFETY: The caller is required to supply a valid pointer to a `Box<PageDataEntry<T>>`, and
-    /// the correct initialized length and memo types.
-    drop_impl: unsafe fn(data: *mut (), initialized: usize, memo_types: &MemoTableTypes),
+    /// the correct initialized length, memo types and the page's first memo row.
+    drop_impl:
+        unsafe fn(data: *mut (), initialized: usize, memo_types: &MemoTableTypes, first_row: u32),
 }
 
 impl SlotVTable {
     const fn of<T: Slot>() -> &'static Self {
         const {
             &Self {
-                drop_impl: |data, initialized, memo_types| {
+                drop_impl: |data, initialized, memo_types, first_row| {
                     // SAFETY: The caller is required to provide a valid data pointer.
                     let data = unsafe { Box::from_raw(data.cast::<PageData<T>>()) };
                     for i in 0..initialized {
                         let item = data[i].get().cast::<T>();
-                        // SAFETY: The caller is required to provide a valid initialized length.
+                        // SAFETY: The caller is required to provide a valid initialized length,
+                        // and the page's first row, so slot `i`'s row is `first_row + i`.
                         unsafe {
-                            memo_types.attach_memos_mut((*item).memos_mut()).drop();
+                            memo_types
+                                .attach_memos_mut(first_row + i as u32, (*item).memos_mut())
+                                .drop();
                             ptr::drop_in_place(item);
                         }
                     }
@@ -102,12 +101,6 @@ impl SlotVTable {
                 type_name: std::any::type_name::<T>,
                 // SAFETY: The signatures are ABI-compatible.
                 memos: unsafe { mem::transmute::<SlotMemosFn<T>, SlotMemosFnErased>(T::memos) },
-                // SAFETY: The signatures are ABI-compatible.
-                memos_unchecked: unsafe {
-                    mem::transmute::<SlotMemosUncheckedFn<T>, SlotMemosUncheckedFnErased>(
-                        T::memos_unchecked,
-                    )
-                },
                 // SAFETY: The signatures are ABI-compatible.
                 memos_mut: unsafe {
                     mem::transmute::<SlotMemosMutFn<T>, SlotMemosMutFnErased>(T::memos_mut)
@@ -139,6 +132,9 @@ struct Page {
 
     /// `memo_types`' columns, read by memo lookups from this line instead of through the `Arc`.
     memo_columns: MemoColumns,
+
+    /// The memo row of slot 0; slot `s`'s is `memo_rows + s` (`MemoTableTypes::next_page_rows`).
+    memo_rows: u32,
 
     memo_types: Arc<MemoTableTypes>,
 }
@@ -352,13 +348,14 @@ impl Table {
     ) -> MemoTableWithTypes<'_> {
         let (page, slot) = split_id(id);
         let page = self.pages[page.0].assert_type::<T>();
-        let slot = &page.data()[slot.0];
+        let slot_data = &page.data()[slot.0];
 
+        // Validates the slot (a tracked struct's read lock); the row doesn't wait for it.
         // SAFETY: The caller is required to pass the `current_revision`.
-        let memos = unsafe { &*T::memos(slot, current_revision) };
+        let _ = unsafe { T::memos(slot_data, current_revision) };
 
-        // SAFETY: The `Page` keeps the correct memo types, alive and frozen by its `Arc`.
-        unsafe { page.0.attach_memos(memos) }
+        // SAFETY: `slot` is an allocated slot of this page (`data` checked it).
+        unsafe { page.0.attach_memos(slot) }
     }
 
     /// Get the memo table associated with `id`.
@@ -374,9 +371,9 @@ impl Table {
         let (page, slot) = split_id(id);
         let page = &self.pages[page.0];
         // SAFETY: We supply a proper slot pointer and the caller is required to pass the `current_revision`.
-        let memos = unsafe { &*(page.slot_vtable.memos)(page.get(slot), current_revision) };
-        // SAFETY: The `Page` keeps the correct memo types, alive and frozen by its `Arc`.
-        unsafe { page.attach_memos(memos) }
+        let _ = unsafe { (page.slot_vtable.memos)(page.get(slot), current_revision) };
+        // SAFETY: `slot` is an allocated slot of this page (`Page::get` checked it).
+        unsafe { page.attach_memos(slot) }
     }
 
     /// Get the memo table without validating or locking its slot.
@@ -388,10 +385,22 @@ impl Table {
     pub(crate) unsafe fn dyn_memos_unchecked(&self, id: Id) -> MemoTableWithTypes<'_> {
         let (page, slot) = split_id(id);
         let page = &self.pages[page.0];
-        // SAFETY: `Page::get` checks initialization, and the caller prevents reuse and destruction.
-        let memos = unsafe { &*(page.slot_vtable.memos_unchecked)(page.get(slot)) };
-        // SAFETY: The `Page` keeps the correct memo types, alive and frozen by its `Arc`.
-        unsafe { page.attach_memos(memos) }
+        page.assert_allocated(slot);
+        // SAFETY: `slot` is an allocated slot of this page, checked above; the caller prevents
+        // its reuse and destruction.
+        unsafe { page.attach_memos(slot) }
+    }
+
+    /// The memo row of the slot `id`, in its ingredient's memo columns.
+    ///
+    /// # Panics
+    ///
+    /// If `id` is not an allocated slot.
+    pub(crate) fn memo_row(&self, id: Id) -> u32 {
+        let (page, slot) = split_id(id);
+        let page = &self.pages[page.0];
+        page.assert_allocated(slot);
+        page.memo_row(slot)
     }
 
     /// Get the memo table associated with `id`
@@ -402,10 +411,11 @@ impl Table {
             .pages
             .get_mut(page_index)
             .unwrap_or_else(|| panic!("index `{page_index}` is uninitialized"));
+        let row = page.memo_row(slot);
         // SAFETY: We supply a proper slot pointer and the caller is required to pass the `current_revision`.
         let memos = unsafe { &mut *(page.slot_vtable.memos_mut)(page.get(slot)) };
-        // SAFETY: The `Page` keeps the correct memo types.
-        unsafe { page.memo_types.attach_memos_mut(memos) }
+        // SAFETY: `row` is the row of the slot `memos` belongs to, of this page's ingredient.
+        unsafe { page.memo_types.attach_memos_mut(row, memos) }
     }
 
     /// Calls `f` with the memo table of every allocated slot on the pages that hold memos of type
@@ -426,12 +436,15 @@ impl Table {
                 continue;
             }
             for slot in 0..*page.allocated.get_mut() {
-                let slot = page.get(SlotIndex::new(slot));
+                let slot = SlotIndex::new(slot);
+                let row = page.memo_row(slot);
+                let slot = page.get(slot);
                 // SAFETY: `slot` points to an initialized slot of this page, whose vtable matches
                 // its slot type, and `&mut self` makes this the only access to it.
                 let memos = unsafe { &mut *(page.slot_vtable.memos_mut)(slot) };
-                // SAFETY: The `Page` keeps the correct memo types.
-                let memos = unsafe { page.memo_types.attach_memos_mut(memos) };
+                // SAFETY: `row` is the row of the slot `memos` belongs to, of this page's
+                // ingredient.
+                let memos = unsafe { page.memo_types.attach_memos_mut(row, memos) };
                 f(memos, memo_ingredient_index);
             }
         }
@@ -575,22 +588,33 @@ impl<'db, T: Slot> PageView<'db, T> {
 }
 
 impl Page {
+    /// The memos of slot `slot`, at its row: computed from this page's line, not read from the
+    /// slot.
+    ///
     /// # Safety
     ///
-    /// `memos` belongs to a slot of this page.
+    /// `slot` is an allocated slot of this page.
     #[inline]
-    unsafe fn attach_memos<'a>(&'a self, memos: &'a MemoTable) -> MemoTableWithTypes<'a> {
-        // Checks in debug builds that the row was handed out by these types.
-        #[cfg(debug_assertions)]
-        // SAFETY: Our contract.
-        let _ = unsafe { self.memo_types.attach_memos(memos) };
+    unsafe fn attach_memos(&self, slot: SlotIndex) -> MemoTableWithTypes<'_> {
+        debug_assert!(slot.0 < self.allocated.load(Ordering::Relaxed));
         debug_assert!(std::ptr::eq(
             self.memo_columns.as_ptr(),
             self.memo_types.columns().as_ptr()
         ));
         // SAFETY: `memo_columns` came from `memo_types`, which this page keeps alive; it can't
-        // change while shared (`Arc::get_mut`), and `memos` is of this page (our contract).
-        unsafe { self.memo_columns.attach(memos) }
+        // change while shared (`Arc::get_mut`), and the row is of a slot of this page, so of
+        // its ingredient (our contract).
+        unsafe { self.memo_columns.attach(self.memo_row(slot)) }
+    }
+
+    /// Slot `slot`'s memo row.
+    #[inline]
+    fn memo_row(&self, slot: SlotIndex) -> u32 {
+        debug_assert!(slot.0 < PAGE_LEN);
+        let row = self.memo_rows + slot.0 as u32;
+        #[cfg(debug_assertions)]
+        debug_assert!(row < self.memo_types.rows_handed_out());
+        row
     }
 
     #[inline]
@@ -616,6 +640,7 @@ impl Page {
         Self {
             ingredient,
             memo_columns: memo_types.columns(),
+            memo_rows: memo_types.next_page_rows(),
             memo_types,
             slot_vtable: SlotVTable::of::<T>(),
             slot_type_id: TypeId::of::<T>(),
@@ -630,11 +655,7 @@ impl Page {
     ///
     /// If slot is out of bounds
     fn get(&self, slot: SlotIndex) -> *mut () {
-        let len = self.allocated.load(Ordering::Acquire);
-        assert!(
-            slot.0 < len,
-            "out of bounds access `{slot:?}` (maximum slot `{len}`)"
-        );
+        self.assert_allocated(slot);
 
         // SAFETY: We have checked that the resulting pointer will be within bounds.
         unsafe {
@@ -642,6 +663,15 @@ impl Page {
                 .as_ptr()
                 .byte_add(slot.0 * self.slot_vtable.layout.size())
         }
+    }
+
+    #[inline]
+    fn assert_allocated(&self, slot: SlotIndex) {
+        let len = self.allocated.load(Ordering::Acquire);
+        assert!(
+            slot.0 < len,
+            "out of bounds access `{slot:?}` (maximum slot `{len}`)"
+        );
     }
 
     #[inline]
@@ -668,8 +698,11 @@ fn type_assert_failed<T: 'static>(page: &Page) -> ! {
 impl Drop for Page {
     fn drop(&mut self) {
         let len = *self.allocated.get_mut();
-        // SAFETY: We supply the data pointer and the initialized length
-        unsafe { (self.slot_vtable.drop_impl)(self.data.as_ptr(), len, &self.memo_types) };
+        // SAFETY: We supply the data pointer, the initialized length, and the page's own memo
+        // types and first row.
+        unsafe {
+            (self.slot_vtable.drop_impl)(self.data.as_ptr(), len, &self.memo_types, self.memo_rows)
+        };
     }
 }
 

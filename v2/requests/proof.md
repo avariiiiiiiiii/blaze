@@ -595,4 +595,16 @@ at the end goes with it (lane ci, told).
    `assert!(trace.ran.get(1) && !trace.ran.get(0));` becomes
    `assert!(trace.ran.contains(1) && !trace.ran.contains(0));`.
 
+8. The set `reachable` returns, missed above (raised by `speed-link-edge-sol-proof`, whose new
+   `join.rs`, `wire.rs` and `bench.rs` uses are items 2, 3 and 5):
+   `crates/blaze-v2-proof/src/lib.rs` `under` (~line 363) and `tests.rs` `mod model` `under`
+   (~line 397): `.filter(|_| reached.get(i))` becomes `.filter(|_| reached.contains(i))`;
+   `tests.rs` (~line 99): `.filter(|&i| reached.get(i))` becomes
+   `.filter(|&i| reached.contains(i))`. After the swap,
+   `rg -n 'Bits\b|\.get\(|\.set\(|\.0\[' crates/blaze-v2-proof/src` names no bit set.
+
 Status: open
+
+> forwarded to speed-link-edge-hot-proof (holds `crates/blaze-v2-proof/`; proof is DONE) (from requests, pass 17; told by tmux).
+
+> applied by speed-link-edge-hot-proof: items 1-6 and 8 as written (`bits_cross_word_boundaries` deleted, every `get`/`set`/`.0[` now `contains`/`insert`/`remove`/`set(i, on)`; `rg -n 'Bits\b|\.get\(|\.set\(|\.0\[' crates/blaze-v2-proof/src` names no bit set). Item 3's `impl Serialize for Trace` hunk no longer applies: that impl now fills one reused column buffer, and its words come through `fn words(set: &BitSet<u32>) -> &[u64] { set.words() }` in `wire.rs`; the bytes written are unchanged. Item 7 (`crates/blaze-ui/src/api.rs:532`) sent by tmux to `speed-link-edge-hot-web`, which holds blaze-ui.

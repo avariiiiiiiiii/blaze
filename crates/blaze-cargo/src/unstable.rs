@@ -14,6 +14,11 @@
 //!   with a reason that names the flag. A flag the table does not have is refused too.
 //!
 //! The names are those of `rustc -Z help` of the toolchain in `harness/toolchain`.
+//!
+//! [`sanitize`] reads the sanitizer flags into the build's [`Sanitize`] for blaze's own code
+//! generator; the table still refuses them until blaze's linker links an instrumented program.
+
+use blaze_codegen::settings::{Coverage, Sanitize, Sanitizers};
 
 /// What blaze does with one `-Z` flag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -383,6 +388,231 @@ pub fn refusal<'a, S: AsRef<str> + 'a>(words: impl IntoIterator<Item = &'a S>) -
     flags(words).iter().find_map(Flag::refusal)
 }
 
+/// Why a build whose [`sanitize`] is not empty stops, until blaze's linker links what an
+/// instrumented program calls.
+pub const UNLINKED: &str = "the build is sanitized (`-Z sanitizer`, or SanitizerCoverage by `-C \
+    passes=sancov-module`), and blaze's linker has no sanitizer runtimes or SanitizerCoverage \
+    sections yet, so the program can't be linked";
+
+/// Sanitizers rustc has that blaze's code generator does not instrument with.
+const UNSANITIZED: &[&str] = &[
+    "cfi",
+    "dataflow",
+    "hwaddress",
+    "kcfi",
+    "kernel-address",
+    "kernel-hwaddress",
+    "leak",
+    "memtag",
+    "realtime",
+    "safestack",
+    "shadow-call-stack",
+];
+
+/// The pairs rustc refuses together (`SanitizerSet::MUTUALLY_EXCLUSIVE`), of those blaze has.
+const EXCLUSIVE: [(Sanitizers, Sanitizers); 3] = [
+    (Sanitizers::ADDRESS, Sanitizers::MEMORY),
+    (Sanitizers::ADDRESS, Sanitizers::THREAD),
+    (Sanitizers::MEMORY, Sanitizers::THREAD),
+];
+
+/// SanitizerCoverage's switches, `-sanitizer-coverage-<name>`, as LLVM names them.
+const COVERAGE_SWITCHES: &[(&str, u16)] = &[
+    ("control-flow", Coverage::CONTROL_FLOW),
+    ("inline-8bit-counters", Coverage::INLINE_8BIT_COUNTERS),
+    ("inline-bool-flag", Coverage::INLINE_BOOL_FLAG),
+    ("pc-table", Coverage::PC_TABLE),
+    ("stack-depth", Coverage::STACK_DEPTH),
+    ("trace-compares", Coverage::TRACE_CMP),
+    ("trace-divs", Coverage::TRACE_DIV),
+    ("trace-geps", Coverage::TRACE_GEP),
+    ("trace-loads", Coverage::TRACE_LOADS),
+    ("trace-pc", Coverage::TRACE_PC),
+    ("trace-pc-entry-exit", Coverage::TRACE_PC_ENTRY_EXIT),
+    ("trace-pc-guard", Coverage::TRACE_PC_GUARD),
+    ("trace-stores", Coverage::TRACE_STORES),
+];
+
+fn sanitizer_name(one: Sanitizers) -> &'static str {
+    match one {
+        Sanitizers::ADDRESS => "address",
+        Sanitizers::THREAD => "thread",
+        _ => "memory",
+    }
+}
+
+/// A name of `-Z sanitizer`'s list as rustc reads it (`parse_sanitizers`): one blaze instruments
+/// with, else an error naming it.
+fn sanitizer(name: &str, given: &str) -> Result<Sanitizers, String> {
+    match name {
+        "address" => Ok(Sanitizers::ADDRESS),
+        "thread" => Ok(Sanitizers::THREAD),
+        "memory" => Ok(Sanitizers::MEMORY),
+        _ if UNSANITIZED.contains(&name) => {
+            Err(format!("-Z {given}: blaze's code generator does not instrument with the `{name}` sanitizer"))
+        }
+        _ => Err(format!("-Z {given}: rustc has no sanitizer `{name}`")),
+    }
+}
+
+/// The comma-separated names of a list flag; rustc refuses one with no value.
+fn names<'a>(flag: &Flag<'a>) -> Result<std::str::Split<'a, char>, String> {
+    flag.value
+        .map(|value| value.split(','))
+        .ok_or_else(|| format!("-Z {}: rustc wants a comma-separated list of sanitizers", flag.given))
+}
+
+/// The build's sanitizers as rustc takes them from the words of its command line:
+/// `-Z sanitizer`, `-Z sanitizer-recover` and `-Z sanitizer-memory-track-origins`, each list
+/// adding to the last as rustc's does, and SanitizerCoverage (`coverage`). Canonical, so two
+/// builds whose code is the same have one key: what recovers is only what is on and can
+/// recover (rustc passes LLVM nothing else), and origins are tracked only under `memory`.
+pub fn sanitize<S: AsRef<str>>(words: &[S]) -> Result<Sanitize, String> {
+    let mut sanitizers = Sanitizers::NONE;
+    let mut recover = Sanitizers::NONE;
+    let mut track_origins = 0;
+    for flag in flags(words) {
+        match flag.name.as_str() {
+            "sanitizer" => {
+                for name in names(&flag)? {
+                    sanitizers = sanitizers.union(sanitizer(name, flag.given)?);
+                }
+            }
+            "sanitizer-recover" => {
+                for name in names(&flag)? {
+                    recover = recover.union(match name {
+                        "address" => Sanitizers::ADDRESS,
+                        "memory" => Sanitizers::MEMORY,
+                        "thread" => Sanitizers::NONE,
+                        _ if UNSANITIZED.contains(&name) => Sanitizers::NONE,
+                        _ => return Err(format!("-Z {}: rustc has no sanitizer `{name}`", flag.given)),
+                    });
+                }
+            }
+            "sanitizer-memory-track-origins" => {
+                track_origins = match flag.value {
+                    None | Some("2") => 2,
+                    Some("1") => 1,
+                    Some("0") => 0,
+                    Some(_) => return Err(format!("-Z {}: rustc takes 0, 1 or 2", flag.given)),
+                };
+            }
+            _ => {}
+        }
+    }
+    if let Some((a, b)) = EXCLUSIVE.into_iter().find(|(a, b)| sanitizers.contains(*a) && sanitizers.contains(*b)) {
+        return Err(format!(
+            "`-Zsanitizer={}` is incompatible with `-Zsanitizer={}`",
+            sanitizer_name(a),
+            sanitizer_name(b)
+        ));
+    }
+    Ok(Sanitize {
+        sanitizers,
+        recover: Sanitizers(recover.0 & sanitizers.0),
+        track_origins: if sanitizers.contains(Sanitizers::MEMORY) { track_origins } else { 0 },
+        coverage: coverage(words)?,
+    })
+}
+
+/// The `-C` flags among the words of a rustc command line, each `(name, value)` with `_`
+/// spelled `-`: `-C name=value`, `-Cname=value`, `--codegen name=value`, `--codegen=name=value`.
+fn codegen_flags<'a, S: AsRef<str> + 'a>(
+    words: impl IntoIterator<Item = &'a S>,
+) -> Vec<(String, Option<&'a str>)> {
+    let mut words = words.into_iter().map(AsRef::as_ref);
+    let mut found = Vec::new();
+    while let Some(word) = words.next() {
+        let given = match word.strip_prefix("-C").or_else(|| word.strip_prefix("--codegen")) {
+            Some("") => match words.next() {
+                Some(next) => next,
+                None => break,
+            },
+            Some(joined) if word.starts_with("--codegen") => match joined.strip_prefix('=') {
+                Some(given) => given,
+                None => continue,
+            },
+            Some(joined) => joined,
+            None => continue,
+        };
+        let (name, value) = match given.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (given, None),
+        };
+        found.push((name.replace('_', "-"), value));
+    }
+    found
+}
+
+/// A `cl::opt<bool>`'s value as LLVM reads one: none is on.
+fn llvm_bool(value: Option<&str>, arg: &str) -> Result<bool, String> {
+    match value {
+        None | Some("true" | "TRUE" | "True" | "1") => Ok(true),
+        Some("false" | "FALSE" | "False" | "0") => Ok(false),
+        Some(_) => Err(format!("-C llvm-args={arg}: LLVM takes true or false")),
+    }
+}
+
+/// SanitizerCoverage as rustc gets it: `-C passes` naming `sancov-module`, with
+/// `-sanitizer-coverage-level=N` and the switches of `-C llvm-args`, the last of each winning as
+/// in LLVM's options. LLVM instruments nothing at a level other than 1 to 4, and without the
+/// pass nothing reads the options: both are `Coverage::default()`, a plain build's key. An
+/// option blaze does not instrument with is an error only when the pass runs.
+fn coverage<S: AsRef<str>>(words: &[S]) -> Result<Coverage, String> {
+    let mut pass = false;
+    let mut level: i64 = 0;
+    let mut flags = 0u16;
+    let mut unknown: Option<&str> = None;
+    for (name, value) in codegen_flags(words) {
+        let Some(value) = value else { continue };
+        match name.as_str() {
+            "passes" => pass |= value.split_whitespace().any(|it| it == "sancov-module"),
+            "llvm-args" => {
+                for arg in value.split_whitespace() {
+                    let option = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'));
+                    let Some(option) = option.and_then(|it| it.strip_prefix("sanitizer-coverage-")) else {
+                        continue;
+                    };
+                    let (option, given) = match option.split_once('=') {
+                        Some((option, given)) => (option, Some(given)),
+                        None => (option, None),
+                    };
+                    match option {
+                        "level" => {
+                            level = given.and_then(|it| it.parse().ok()).ok_or_else(|| {
+                                format!("-C llvm-args={arg}: LLVM takes a number for the level")
+                            })?;
+                        }
+                        "prune-blocks" => match llvm_bool(given, arg)? {
+                            true => flags &= !Coverage::NO_PRUNE,
+                            false => flags |= Coverage::NO_PRUNE,
+                        },
+                        _ => match COVERAGE_SWITCHES.iter().find(|it| it.0 == option) {
+                            Some(&(_, bit)) => match llvm_bool(given, arg)? {
+                                true => flags |= bit,
+                                false => flags &= !bit,
+                            },
+                            None => {
+                                unknown.get_or_insert(arg);
+                            }
+                        },
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !pass || !(1..=4).contains(&level) {
+        return Ok(Coverage::default());
+    }
+    if let Some(arg) = unknown {
+        return Err(format!(
+            "-C llvm-args={arg}: blaze's code generator does not instrument with that SanitizerCoverage option"
+        ));
+    }
+    Ok(Coverage { level: level as u8, flags })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,5 +660,72 @@ mod tests {
         assert_eq!(refusal(&["-Zthreads=8", "-Z", "embed-metadata=no"]), None);
         let why = refusal(&["-Zthreads=8", "-Z", "no_such_flag=3"]).unwrap();
         assert_eq!(why, format!("-Z no_such_flag=3: {UNKNOWN}"));
+    }
+
+    #[test]
+    fn the_sanitizer_flags_stay_refused_until_they_link() {
+        for given in ["sanitizer=address", "sanitizer-recover=address", "sanitizer-memory-track-origins"] {
+            assert!(matches!(flag(given).treatment(), Treatment::Refused(_)), "{given}");
+        }
+    }
+
+    #[test]
+    fn sanitizers_as_rustc_reads_them() {
+        assert_eq!(sanitize(&["-Copt-level=0", "-Zthreads=8"]).unwrap(), Sanitize::default());
+        let address = sanitize(&["-Zsanitizer=address", "-Z", "sanitizer_recover=address,thread,memory"]).unwrap();
+        assert_eq!((address.sanitizers, address.recover), (Sanitizers::ADDRESS, Sanitizers::ADDRESS));
+        assert!(!address.is_empty());
+        let memory = sanitize(&["-Zsanitizer=memory", "-Zsanitizer-memory-track-origins"]).unwrap();
+        assert_eq!((memory.sanitizers, memory.track_origins), (Sanitizers::MEMORY, 2));
+        let origins = sanitize(&["-Zsanitizer=address", "-Zsanitizer-memory-track-origins=1"]).unwrap();
+        assert_eq!(origins.track_origins, 0);
+        // A recover of what is not on changes no code, as in rustc.
+        assert_eq!(sanitize(&["-Zsanitizer-recover=address"]).unwrap(), Sanitize::default());
+        // Each list adds to the last.
+        let twice = sanitize(&["-Zsanitizer=thread", "-Zsanitizer=thread"]).unwrap();
+        assert_eq!(twice.sanitizers, Sanitizers::THREAD);
+        assert_eq!(
+            sanitize(&["-Zsanitizer=address", "-Zsanitizer=thread"]).unwrap_err(),
+            "`-Zsanitizer=address` is incompatible with `-Zsanitizer=thread`"
+        );
+        assert!(sanitize(&["-Zsanitizer=memory,address"]).unwrap_err().contains("incompatible"));
+        assert!(sanitize(&["-Zsanitizer=memory,thread"]).unwrap_err().contains("incompatible"));
+        assert!(sanitize(&["-Zsanitizer=cfi"]).unwrap_err().contains("the `cfi` sanitizer"));
+        assert!(sanitize(&["-Zsanitizer=nope"]).unwrap_err().contains("no sanitizer `nope`"));
+        assert!(sanitize(&["-Zsanitizer-recover=nope"]).unwrap_err().contains("no sanitizer `nope`"));
+        assert!(sanitize(&["-Zsanitizer"]).is_err());
+        assert!(sanitize(&["-Zsanitizer-memory-track-origins=3"]).is_err());
+    }
+
+    #[test]
+    fn sanitizer_coverage_as_cargo_fuzz_passes_it() {
+        let fuzz = [
+            "-Cpasses=sancov-module",
+            "-Cllvm-args=-sanitizer-coverage-level=4",
+            "-C",
+            "llvm-args=-sanitizer-coverage-inline-8bit-counters -sanitizer-coverage-pc-table",
+            "--codegen=llvm-args=--sanitizer-coverage-trace-compares",
+        ];
+        let flags = Coverage::INLINE_8BIT_COUNTERS | Coverage::PC_TABLE | Coverage::TRACE_CMP;
+        assert_eq!(sanitize(&fuzz).unwrap().coverage, Coverage { level: 4, flags });
+        // Without the pass, or at level 0, LLVM instruments nothing: a plain build's key.
+        assert_eq!(sanitize(&fuzz[1..]).unwrap(), Sanitize::default());
+        let level0 = ["-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-trace-pc"];
+        assert_eq!(sanitize(&level0).unwrap().coverage, Coverage::default());
+        let level5 = ["-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-level=5"];
+        assert_eq!(sanitize(&level5).unwrap().coverage, Coverage::default());
+        // The last of a switch wins; `prune-blocks=0` is `NO_PRUNE`.
+        let last = [
+            "-C",
+            "passes=sancov-module",
+            "-Cllvm-args=-sanitizer-coverage-level=2 -sanitizer-coverage-trace-pc \
+             -sanitizer-coverage-trace-pc=false -sanitizer-coverage-prune-blocks=0",
+        ];
+        assert_eq!(sanitize(&last).unwrap().coverage, Coverage { level: 2, flags: Coverage::NO_PRUNE });
+        let unknown = ["-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-level=1 -sanitizer-coverage-drop-ctors"];
+        assert!(sanitize(&unknown).unwrap_err().contains("-sanitizer-coverage-drop-ctors"));
+        assert_eq!(sanitize(&unknown[1..]).unwrap(), Sanitize::default());
+        assert!(sanitize(&["-Cllvm-args=-sanitizer-coverage-level=x"]).is_err());
+        assert!(sanitize(&["-Cllvm-args=-sanitizer-coverage-pc-table=maybe"]).is_err());
     }
 }

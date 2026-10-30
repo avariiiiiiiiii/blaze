@@ -160,8 +160,8 @@ pub use crate::{
     diagnostics::*,
     has_source::HasSource,
     match_lints::{
-        BindingOrigin, BindingWithVariantName, IrrefutableLet, LetSource, MatchLint,
-        NonContiguousRangeEndpoints, OverlappingRangeEndpoints, PatternTypo, SpecialTy,
+        BindingOrigin, BindingWithVariantName, ConstPatternError, IrrefutableLet, LetSource,
+        MatchLint, NonContiguousRangeEndpoints, OverlappingRangeEndpoints, PatternTypo, SpecialTy,
         UnreachablePattern,
     },
     semantics::{
@@ -274,8 +274,16 @@ impl Crate {
         self.id.data(db).origin.clone()
     }
 
+    /// Which of the language's crates this is, without cloning [`Self::origin`].
+    pub fn lang_origin(self, db: &Db) -> Option<LangCrateOrigin> {
+        match self.id.data(db).origin {
+            CrateOrigin::Lang(origin) => Some(origin),
+            _ => None,
+        }
+    }
+
     pub fn is_builtin(self, db: &Db) -> bool {
-        matches!(self.origin(db), CrateOrigin::Lang(_))
+        self.lang_origin(db).is_some()
     }
 
     pub fn dependencies(self, db: &Db) -> Vec<CrateDependency> {

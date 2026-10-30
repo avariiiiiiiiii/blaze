@@ -4,13 +4,13 @@ use std::{borrow::Cow, iter, mem};
 
 use arrayvec::ArrayVec;
 use base_db::{Db, Crate};
-use blaze_ids::radix;
+use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     AdtId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId,
     LocalFieldId, Lookup,
     expr_store::{
         Body, ExpressionStore, HygieneId,
-        body::{Param, body_syntax},
+        body::Param,
     },
     hir::{
         ArithOp, Array, AsmOperand, BinaryOp, BindingAnnotation, BindingId, ClosureKind,
@@ -26,7 +26,7 @@ use hir_expand::name::Name;
 use itertools::{Either, EitherOrBoth, Itertools};
 use la_arena::{ArenaMap, RawIdx};
 use rustc_apfloat::Float;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     CoroutineArgs, CoroutineArgsParts, TypeVisitableExt,
     inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _},
@@ -65,7 +65,10 @@ use crate::{
     },
 };
 
-use super::{MirLowerError, OperandKind, Place};
+use super::{
+    MirLowerError, OperandKind, Place,
+    framed::{self, FrameMap, FrameSet},
+};
 
 mod as_place;
 mod deref_pattern;
@@ -81,10 +84,10 @@ struct LoopBlocks {
     drop_scope_index: usize,
 }
 
-#[derive(Debug, Clone, Default)]
-struct DropScope {
+#[derive(Debug, Clone)]
+struct DropScope<'f> {
     /// locals, in order of definition (so we should run drop glues in reverse order)
-    locals: Vec<LocalId>,
+    locals: Vec<LocalId, &'f Frame>,
     /// Whether this scope only holds the temporaries of a `let` initializer. The bindings the
     /// `let` declares outlive it.
     temporaries: bool,
@@ -95,23 +98,111 @@ struct DropScope {
     /// The blocks where leaving early (`break`, `continue`, `return`, a future dropped at an
     /// `await`) dropped this scope's locals. Those drops are written at the end of the scope
     /// once it is popped, as rustc writes every drop it schedules.
-    exits: Vec<BasicBlockId>,
+    exits: Vec<BasicBlockId, &'f Frame>,
 }
 
-impl DropScope {
-    /// The locals in the order they were declared, which is the reverse of the order they are
-    /// dropped in. The temporaries of a tail before the 2024 edition come before the block's
-    /// locals, as `outlive_block` leaves them once the tail is lowered.
-    fn in_order(&self, operands: &FxHashSet<LocalId>) -> Cow<'_, [LocalId]> {
-        match self.tail {
-            Some(declared) if declared < self.locals.len() => {
-                let (operands, temporaries): (Vec<LocalId>, Vec<LocalId>) =
-                    self.locals[declared..].iter().partition(|it| operands.contains(it));
-                Cow::Owned([temporaries, self.locals[..declared].to_vec(), operands].concat())
-            }
-            _ => Cow::Borrowed(&self.locals),
+impl<'f> DropScope<'f> {
+    fn new_in(frame: &'f Frame) -> Self {
+        DropScope {
+            locals: Vec::new_in(frame),
+            temporaries: false,
+            tail: None,
+            exits: Vec::new_in(frame),
         }
     }
+
+    /// Appends the locals in the order they were declared, which is the reverse of the order
+    /// they are dropped in. The temporaries of a tail before the 2024 edition come before the
+    /// block's locals, as `outlive_block` leaves them once the tail is lowered.
+    fn in_order_into(&self, operands: &FrameSet<'_, LocalId>, out: &mut Vec<LocalId, &Frame>) {
+        match self.tail {
+            Some(declared) if declared < self.locals.len() => {
+                let tail = &self.locals[declared..];
+                out.extend(tail.iter().filter(|it| !operands.contains(*it)));
+                out.extend_from_slice(&self.locals[..declared]);
+                out.extend(tail.iter().filter(|it| operands.contains(*it)));
+            }
+            _ => out.extend_from_slice(&self.locals),
+        }
+    }
+}
+
+/// Moves the locals of `locals[from..]` that `last` picks to the end, each part in the order it
+/// was in, holding the picked ones in `picked` meanwhile. Gives where they start.
+fn move_to_end(
+    locals: &mut Vec<LocalId, &Frame>,
+    from: usize,
+    last: impl Fn(LocalId) -> bool,
+    picked: &mut Vec<LocalId, &Frame>,
+) -> usize {
+    picked.clear();
+    let mut kept = from;
+    for at in from..locals.len() {
+        let local = locals[at];
+        if last(local) {
+            picked.push(local);
+        } else {
+            locals[kept] = local;
+            kept += 1;
+        }
+    }
+    locals.truncate(kept);
+    locals.extend_from_slice(picked);
+    kept
+}
+
+/// A block while lowering builds it, in the frame; `finish` copies it into the body.
+struct FrameBlock<'f> {
+    statements: Vec<Statement, &'f Frame>,
+    terminator: Option<Terminator>,
+    is_cleanup: bool,
+}
+
+/// What lowering builds of a body before it is finished, in the frame. Ids number from 0 in
+/// the order they are made, as the body's `Arena`s number them.
+struct Building<'f, 'db> {
+    blocks: Vec<FrameBlock<'f>, &'f Frame>,
+    locals: Vec<Local, &'f Frame>,
+    /// By binding index: its local.
+    binding_locals: Vec<Option<LocalId>, &'f Frame>,
+    param_locals: Vec<LocalId, &'f Frame>,
+    promoted_locals: Vec<(LocalId, ExprId), &'f Frame>,
+    closures: Vec<InternedClosureId<'db>, &'f Frame>,
+    unreached: Vec<BasicBlockId, &'f Frame>,
+    scope_ends: Vec<LocalId, &'f Frame>,
+    panic_unwinds: Vec<(BasicBlockId, usize, BasicBlockId), &'f Frame>,
+}
+
+impl<'f> Building<'f, '_> {
+    fn new_in(frame: &'f Frame) -> Self {
+        Building {
+            blocks: Vec::new_in(frame),
+            locals: Vec::new_in(frame),
+            binding_locals: Vec::new_in(frame),
+            param_locals: Vec::new_in(frame),
+            promoted_locals: Vec::new_in(frame),
+            closures: Vec::new_in(frame),
+            unreached: Vec::new_in(frame),
+            scope_ends: Vec::new_in(frame),
+            panic_unwinds: Vec::new_in(frame),
+        }
+    }
+}
+
+/// A key of `exit_nodes` borrowed for a probe.
+#[derive(Hash)]
+struct ExitKey<'q>(BasicBlockId, LocalId, &'q [LocalId]);
+
+impl<'f> hashbrown::Equivalent<(BasicBlockId, LocalId, &'f [LocalId])> for ExitKey<'_> {
+    fn equivalent(&self, key: &(BasicBlockId, LocalId, &'f [LocalId])) -> bool {
+        self.0 == key.0 && self.1 == key.1 && self.2 == key.2
+    }
+}
+
+/// The list `items` is of the body, allocated once at its length; nothing when it is empty.
+fn exact<T: Copy>(items: &[T]) -> Vec<T> {
+    // alloc: a list of the kept body, at its final size
+    items.to_vec()
 }
 
 /// A binding of a guarded match arm that is moved into once its guard holds, and is live
@@ -137,24 +228,28 @@ enum AssignTarget {
     Place(ExprId),
 }
 
-struct MirLowerCtx<'a, 'db> {
+struct MirLowerCtx<'a, 'f, 'db> {
+    /// The scalar fields of the body; its lists stay empty until `finish` copies `building`
+    /// into them.
     result: MirBody<'db>,
+    frame: &'f Frame,
+    building: Building<'f, 'db>,
     owner: InferBodyId<'db>,
     store_owner: ExpressionStoreOwnerId,
     current_loop_blocks: Option<LoopBlocks>,
-    labeled_loop_blocks: FxHashMap<LabelId, LoopBlocks>,
+    labeled_loop_blocks: FrameMap<'f, LabelId, LoopBlocks>,
     discr_temp: Option<StoredPlace>,
     db: &'db Db,
     store: &'a ExpressionStore,
     infer: &'a InferenceResult<'db>,
     types: &'db crate::next_solver::DefaultAny<'db>,
     resolver: Resolver<'db>,
-    drop_scopes: Vec<DropScope>,
+    drop_scopes: Vec<DropScope<'f>, &'f Frame>,
     /// Expressions whose temporary lives as long as the `let` they initialize, with the index of
     /// the scope that `let` is in.
-    extended_temporaries: FxHashMap<ExprId, usize>,
+    extended_temporaries: FrameMap<'f, ExprId, usize>,
     /// Blocks whose `super let`s a `let` extends, with the index of the scope that `let` is in.
-    extended_blocks: FxHashMap<ExprId, usize>,
+    extended_blocks: FrameMap<'f, ExprId, usize>,
     /// The scope that owns what the `super let` being lowered binds.
     super_let: Option<usize>,
     /// How many `const { .. }` blocks deep the expression being lowered is.
@@ -162,22 +257,22 @@ struct MirLowerCtx<'a, 'db> {
     /// The expressions that end their own temporaries: the body, and from the 2024 edition the
     /// tail of a block. The operands of such an expression are in one scope with its
     /// temporaries, where those of any other expression are in a scope inside it.
-    ends_temporaries: FxHashSet<ExprId>,
+    ends_temporaries: FrameSet<'f, ExprId>,
     /// The tails rustc wraps in `DropTemps`, whose temporaries are dropped where they end, in
     /// any edition: the body of an `async fn` or `async` closure, so that its temporaries are
     /// dropped before the parameters it was given (rustc's
     /// `lower_coroutine_body_with_moved_arguments`).
-    drop_temps: FxHashSet<ExprId>,
+    drop_temps: FrameSet<'f, ExprId>,
     /// The bindings of the body that have no local yet. rustc declares a binding where its
     /// pattern is lowered (a `let` before its initializer), so locals are numbered in that
     /// order, which decides the order of what an `async` block keeps in its future.
-    undeclared: FxHashSet<BindingId>,
+    undeclared: FrameSet<'f, BindingId>,
     /// rustc's unwind drop tree (`build/scope.rs`): a cleanup block per drop that scopes
     /// schedule, keyed by the block unwinding goes on to after it, the local, and whether it
     /// drops the value or ends the storage. Unwinding from anywhere goes through what is in
     /// scope there, innermost first, and ways out of sibling scopes share what they have in
     /// common, so what is in scope in one never meets what is in scope in another.
-    unwind_nodes: FxHashMap<(BasicBlockId, LocalId, bool), BasicBlockId>,
+    unwind_nodes: FrameMap<'f, (BasicBlockId, LocalId, bool), BasicBlockId>,
     unwind_resume: Option<BasicBlockId>,
     /// rustc's exit drop trees: the way out of a `break`, `continue` or `return`, or of a
     /// future dropped at an `await`, drops each value it leaves in a block keyed by the block
@@ -185,42 +280,58 @@ struct MirLowerCtx<'a, 'db> {
     /// out to the same place share the drops of what they both leave: a struct literal whose
     /// fields each `?` drops what the fields before made once, not once for every field after
     /// them.
-    exit_nodes: FxHashMap<(BasicBlockId, LocalId, Vec<LocalId>), BasicBlockId>,
+    exit_nodes: FrameMap<'f, (BasicBlockId, LocalId, &'f [LocalId]), BasicBlockId>,
     /// The block every `return` goes to once it has dropped what it leaves.
     returned: Option<BasicBlockId>,
     /// The block a future dropped at an `await` ends in once what is in scope is dropped.
     coroutine_dropped: Option<BasicBlockId>,
     /// The locals that hold an operand of an aggregate or a call lowered so far.
-    operand_locals: FxHashSet<LocalId>,
+    operand_locals: FrameSet<'f, LocalId>,
     /// The temporaries an expression is being written to. rustc's `as_temp` schedules the drop
     /// of a temporary's value once the expression is done, so what unwinds out of it, the drops
     /// of its own temporaries after it wrote the value say, ends their storage only.
-    unscheduled: FxHashSet<LocalId>,
+    unscheduled: FrameSet<'f, LocalId>,
     /// Set for the pattern that is lowered next: it is of a match arm that rustc builds no
     /// way into.
     arm_unreached: bool,
     /// The alternative to match for an or-pattern, while an arm is lowered once per
     /// combination of alternatives.
-    or_choices: FxHashMap<PatId, usize>,
+    or_choices: FrameMap<'f, PatId, usize>,
     /// While the pattern of a match arm that has a guard is lowered: what it binds by value,
     /// which is bound only once the guard holds. The guard reads each
     /// through a shared reference to the place it comes out of (`guard_refs`), as rustc lowers
     /// it, so a guard that reads the value matched on does not read a moved value.
-    guarded_moves: Option<Vec<GuardedMove<'db>>>,
+    guarded_moves: Option<Vec<GuardedMove<'db>, &'f Frame>>,
     /// The reference a guard reads each binding of `guarded_moves` through.
-    guard_refs: FxHashMap<BindingId, LocalId>,
+    guard_refs: FrameMap<'f, BindingId, LocalId>,
     /// The reference each deref pattern through a smart pointer that is not a `Box` was
     /// tested through, for binding after the test.
-    deref_temps: FxHashMap<deref_pattern::DerefKey, LocalId>,
+    deref_temps: FrameMap<'f, deref_pattern::DerefKey, LocalId>,
     /// While the pattern of a destructuring assignment is lowered: what it assigns, and the
     /// value it destructures, where a part that cannot be moved out of it is reported.
-    assigned: Vec<Assigned>,
+    assigned: Vec<Assigned, &'f Frame>,
     assigned_from: MirSpan,
     /// Whether each type asked about is `Copy`. Every statement that may panic asks of every
     /// local in scope, which in a long body is the most of lowering it.
+    // alloc: mark_moves (hir-ty) takes this map by type; frame once D2 lands
     copy: FxHashMap<Ty<'db>, bool>,
     env: ParamEnv<'db>,
     infcx: InferCtxt<'db>,
+    /// Buffers reused across statements, each taken out while it is in use and put back.
+    /// What is in scope where lowering is, for the way out of a panic or a drop.
+    in_scope_buf: Vec<LocalId, &'f Frame>,
+    /// A scope's locals in the order leaving it drops them.
+    order_buf: Vec<LocalId, &'f Frame>,
+    /// The blocks a scope's drops were written in.
+    written_buf: Vec<BasicBlockId, &'f Frame>,
+    /// What `move_to_end` holds while it moves locals.
+    picked_buf: Vec<LocalId, &'f Frame>,
+    /// `exit_to`'s: the storage it ends with its scope, a scope's locals, the locals of an
+    /// exit key, and what is in scope before a drop.
+    exit_storage_buf: Vec<(usize, LocalId), &'f Frame>,
+    exit_locals_buf: Vec<LocalId, &'f Frame>,
+    exit_ended_buf: Vec<LocalId, &'f Frame>,
+    exit_before_buf: Vec<LocalId, &'f Frame>,
 }
 
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
@@ -814,8 +925,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                             .resolve_path_in_value_ns_fully(self.db, p, hygiene)
                             .ok_or_else(|| MirLowerError::UnresolvedName {
                                 owner: self.owner.expression_store_owner(self.db),
-                                // clone: error path
-                                path: p.clone(),
+                                path: p.mod_path().copied(),
                             })?;
                         self.resolver.reset_to_guard(resolver_guard);
                         result
@@ -1363,8 +1473,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                     self.infer.variant_resolution_for_expr(expr_id).ok_or_else(|| {
                         MirLowerError::UnresolvedName {
                             owner: self.owner.expression_store_owner(self.db),
-                            // clone: error path
-                            path: path.clone(),
+                            path: path.mod_path().copied(),
                         }
                     })?;
                 let subst = match self.expr_ty_without_adjust(expr_id).kind() {
@@ -2165,8 +2274,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 }
                 let unresolved_name = || MirLowerError::UnresolvedName {
                     owner: self.owner.expression_store_owner(self.db),
-                    // clone: error path
-                    path: c.clone(),
+                    path: c.mod_path().copied(),
                 };
                 let pr = self
                     .resolver
@@ -4459,43 +4567,28 @@ fn check_expansions<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Result<'db, ()
     Ok(())
 }
 
-/// What is wrong with the first macro call of the body that failed to expand or whose
-/// expansion is not what rustc parses it as. A query of its own: the source map it reads
-/// changes with every edit above the body, and what it finds does not.
+/// What is wrong with the first macro call of the body, in the order lowering met them, that
+/// failed to expand or whose expansion is not what rustc parses it as. It reads the store's
+/// macro calls and their sites, not the source map, so lowering a body never builds its map.
 #[salsa::tracked(returns(ref))]
 fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String> {
     use syntax::AstNode;
-    let (source_map, own) = match owner.expression_store_owner(db) {
-        ExpressionStoreOwnerId::Body(def) => {
-            // The map of [`Body::relative`] is of the body's own tree, which an edit elsewhere
-            // in its file leaves as it is: a call in the file is found in that tree.
-            let own = match Body::relative(db, def) {
-                Some(_) => body_syntax(db, def).as_ref().map(|it| (it.file_id, it.root(db))),
-                None => None,
-            };
-            (&Body::unmoved_source_map(db, def).store, own)
-        }
-        owner => (ExpressionStore::with_source_map(db, owner).1, None),
+    let calls = ExpressionStore::of(db, owner.expression_store_owner(db)).macro_calls();
+    if calls.is_empty() {
+        return None;
+    }
+    let site_of = |call: hir_expand::MacroCallId| {
+        let site = call.loc(db).to_node(db);
+        Some((syntax::ast::MacroCall::cast(site.value)?, site.file_id))
     };
-    let root_of = |file: hir_expand::HirFileId| match &own {
-        Some((own_file, root)) if *own_file == file => root.clone(),
-        _ => file.parse_or_expand(db),
-    };
-    let site_of = |ptr: hir_expand::InFile<hir_def::expr_store::MacroCallPtr>| {
-        let site = ptr.value.syntax_node_ptr().try_to_node(&root_of(ptr.file_id))?;
-        syntax::ast::MacroCall::cast(site)
-    };
-    // The call each macro file of the body is the expansion of, for one last in it.
-    let calls: rustc_hash::FxHashMap<_, _> =
-        source_map.macro_calls().map(|(ptr, call)| (call, ptr)).collect();
-    let enclosing = |file: hir_expand::MacroCallId| {
-        let ptr = *calls.get(&file)?;
-        Some((site_of(ptr)?, ptr.file_id))
-    };
-    source_map.macro_calls().find_map(|(ptr, call)| {
+    // The call a macro file of the body is the expansion of, for one last in it.
+    let enclosing =
+        |file: hir_expand::MacroCallId| if calls.contains(&file) { site_of(file) } else { None };
+    calls.iter().find_map(|&call| {
         let expansion = call.parse_macro_expansion(db);
         if let Some(error) = &expansion.err {
             let message = error.render_to_string(db).message;
+            // alloc: the refusal's message, made only for a body that is refused
             return Some(format!("macro call that failed to expand: {message}"));
         }
         // A builtin's expansion is rust-analyzer's own stand-in (`builtin #asm (..)`), not
@@ -4511,10 +4604,11 @@ fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String>
         // expression, so its expansion is to be one expression (`parse_stmt_mac`); the
         // parser here takes it as statements, which a call of a macro of several statements
         // in the parentheses of another's expands to (#154).
-        let Some(call_site) = site_of(ptr) else {
-            return Some("macro call whose site is not in its tree".to_owned());
+        let Some((call_site, file)) = site_of(call) else {
+            // alloc: the refusal's message, made only for a body that is refused
+            return Some("macro call whose site is not a macro call".to_owned());
         };
-        if !is_expression_call(&call_site, ptr.file_id, &enclosing) {
+        if !is_expression_call(&call_site, file, &enclosing) {
             return None;
         }
         let statements = syntax::ast::MacroStmts::cast(expansion.value.0.syntax_node())?;
@@ -4540,14 +4634,18 @@ fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String>
                 "macro call in parentheses or brackets with no `;` after it, whose expansion \
                  is one expression and a `;`, which rustc's `semicolon_in_expressions_from_macros` \
                  refuses for a macro of the same crate"
+                    // alloc: the refusal's message, made only for a body that is refused
                     .to_owned(),
             );
         }
         let what = match (count, statements.expr().is_some()) {
-            (0, false) => "nothing".to_owned(),
-            (n, false) => format!("{n} statements and no expression"),
-            (n, true) => format!("{n} statements before its expression"),
+            (0, false) => Cow::Borrowed("nothing"),
+            // alloc: the refusal's message, made only for a body that is refused
+            (n, false) => format!("{n} statements and no expression").into(),
+            // alloc: the refusal's message, made only for a body that is refused
+            (n, true) => format!("{n} statements before its expression").into(),
         };
+        // alloc: the refusal's message, made only for a body that is refused
         Some(format!(
             "macro call in parentheses or brackets with no `;` after it, which rustc \
              parses as one expression, whose expansion is {what}"
@@ -4559,13 +4657,14 @@ fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String>
 /// in parentheses or brackets, with no `;` after it. One last in another call's expansion
 /// ends where the expansion does, and is what that call is: a statement where the call was
 /// one, as `m!(..);` or `m! { .. }`. `enclosing` finds the call a macro file expands.
-fn is_expression_call(
+fn is_expression_call<F>(
     call: &syntax::ast::MacroCall,
     file: hir_expand::HirFileId,
-    enclosing: &dyn Fn(
-        hir_expand::MacroCallId,
-    ) -> Option<(syntax::ast::MacroCall, hir_expand::HirFileId)>,
-) -> bool {
+    enclosing: &F,
+) -> bool
+where
+    F: Fn(hir_expand::MacroCallId) -> Option<(syntax::ast::MacroCall, hir_expand::HirFileId)>,
+{
     use syntax::{AstNode, SyntaxKind::*, ast};
     let Some(parent) = call.syntax().parent().filter(|it| it.kind() == MACRO_EXPR) else {
         return false;
@@ -4908,28 +5007,32 @@ pub(crate) fn compute_mir_body<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
 ) -> Result<'db, MirBody<'db>> {
-    let krate = def.krate(db);
-    let edition = krate.data(db).edition;
-    let detail = match def {
-        InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) => {
-            FunctionSignature::of(db, it).name.display(db, edition).to_string()
-        }
-        InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(it)) => {
-            StaticSignature::of(db, it).name.display(db, edition).to_string()
-        }
-        InferBodyId::DefWithBodyId(DefWithBodyId::ConstId(it)) => ConstSignature::of(db, it)
-            .name
-            .clone()
-            .unwrap_or_else(Name::missing)
-            .display(db, edition)
-            .to_string(),
-        InferBodyId::DefWithBodyId(DefWithBodyId::VariantId(it)) => {
-            let loc = it.lookup(db);
-            loc.name.display(db, edition).to_string()
-        }
-        InferBodyId::AnonConstId(_) => "{const}".to_owned(),
-    };
-    let _p = tracing::info_span!("mir_body_query", ?detail).entered();
+    let span = tracing::info_span!("mir_body_query", detail = tracing::field::Empty);
+    if !span.is_disabled() {
+        // alloc: only while a subscriber records this span
+        let edition = def.krate(db).data(db).edition;
+        let detail = match def {
+            InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) => {
+                FunctionSignature::of(db, it).name.display(db, edition).to_string()
+            }
+            InferBodyId::DefWithBodyId(DefWithBodyId::StaticId(it)) => {
+                StaticSignature::of(db, it).name.display(db, edition).to_string()
+            }
+            InferBodyId::DefWithBodyId(DefWithBodyId::ConstId(it)) => ConstSignature::of(db, it)
+                .name
+                .clone()
+                .unwrap_or_else(Name::missing)
+                .display(db, edition)
+                .to_string(),
+            InferBodyId::DefWithBodyId(DefWithBodyId::VariantId(it)) => {
+                let loc = it.lookup(db);
+                loc.name.display(db, edition).to_string()
+            }
+            InferBodyId::AnonConstId(_) => "{const}".to_owned(),
+        };
+        span.record("detail", tracing::field::debug(&detail));
+    }
+    let _p = span.entered();
     let (store, root_expr, self_param, params) = match def {
         InferBodyId::DefWithBodyId(def) => {
             let body = Body::of(db, def);
@@ -4992,8 +5095,7 @@ pub fn lower_body_to_mir<'db>(
     // Extract params and self_param only when lowering the body's root expression for a function.
     if let Some(fid) = owner.as_function() {
         let callable_sig = {
-            let resolver = owner.resolver(db);
-            let interner = DbInterner::new_with(db, resolver.krate());
+            let interner = DbInterner::new_with(db, owner.krate(db));
             interner.liberate_late_bound_regions(
                 fid.into(),
                 db.callable_item_signature(fid.into()).instantiate_identity().skip_norm_wip(),

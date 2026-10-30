@@ -9,6 +9,7 @@
 
 use std::fmt;
 
+use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_graph::admission::{self, Estimates, TaskKind};
 use blaze_ids::radix;
 
@@ -77,12 +78,6 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-fn put(out: &mut Vec<u8>, words: &[u64]) {
-    for word in words {
-        out.extend_from_slice(&word.to_le_bytes());
-    }
-}
-
 pub(crate) fn encode(history: &History) -> Vec<u8> {
     let estimates = history.estimates.encode();
     let kinds = history.times.sorted();
@@ -90,62 +85,42 @@ pub(crate) fn encode(history: &History) -> Vec<u8> {
     let mut out = Vec::with_capacity(
         MAGIC.len() + 32 + estimates.len() + 8 + kinds.len() * KIND_BYTES + 8 + records.len() * RECORD_BYTES,
     );
-    out.extend_from_slice(MAGIC);
-    put(&mut out, &[history.keys.slots() as u64, history.keys.clock(), history.keys.evicted()]);
-    put(&mut out, &[estimates.len() as u64]);
-    out.extend_from_slice(&estimates);
-    put(&mut out, &[kinds.len() as u64]);
+    out.put_bytes(MAGIC);
+    out.put_u64(history.keys.slots() as u64);
+    out.put_u64(history.keys.clock());
+    out.put_u64(history.keys.evicted());
+    out.put_bytes_u64(&estimates);
+    out.put_u64(kinds.len() as u64);
     for (kind, time) in kinds {
-        out.extend_from_slice(&kind.0.to_le_bytes());
-        out.extend_from_slice(&[0; 4]);
-        put(&mut out, &[time.seen, time.mean_ns]);
+        out.put_u32(kind.0);
+        out.put_u32(0);
+        out.put_u64(time.seen);
+        out.put_u64(time.mean_ns);
     }
-    put(&mut out, &[records.len() as u64]);
+    out.put_u64(records.len() as u64);
     for (slot, record) in records {
         for half in [slot as u32, record.kind.0, record.seen, 0] {
-            out.extend_from_slice(&half.to_le_bytes());
+            out.put_u32(half);
         }
-        put(&mut out, &[record.stamp, record.key[0], record.key[1], record.peak]);
+        for word in [record.stamp, record.key[0], record.key[1], record.peak] {
+            out.put_u64(word);
+        }
         for run in record.runs {
-            out.extend_from_slice(&run.to_le_bytes());
+            out.put_u32(run);
         }
     }
     out
 }
 
-/// Reads bytes in order, each read bounds-checked.
-struct Bytes<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Bytes<'a> {
-    fn take(&mut self, len: usize) -> Result<&'a [u8], DecodeError> {
-        let it = self
-            .at
-            .checked_add(len)
-            .and_then(|end| self.bytes.get(self.at..end))
-            .ok_or(DecodeError::Short { at: self.at })?;
-        self.at += len;
-        Ok(it)
-    }
-
-    fn u64(&mut self) -> Result<u64, DecodeError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes")))
-    }
-
-    fn u32(&mut self) -> Result<u32, DecodeError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("4 bytes")))
-    }
-
-    fn left(&self) -> usize {
-        self.bytes.len() - self.at
+impl From<cursor::Error> for DecodeError {
+    fn from(error: cursor::Error) -> DecodeError {
+        DecodeError::Short { at: error.at }
     }
 }
 
 pub(crate) fn decode(bytes: &[u8], config: &Config) -> Result<History, DecodeError> {
-    let mut read = Bytes { bytes, at: 0 };
-    if read.take(MAGIC.len())? != MAGIC {
+    let mut read = Reader::new(bytes);
+    if read.array::<8>()? != MAGIC {
         return Err(DecodeError::Version);
     }
     let slots = read.u64()?;
@@ -154,15 +129,11 @@ pub(crate) fn decode(bytes: &[u8], config: &Config) -> Result<History, DecodeErr
     }
     let slots = slots as usize;
     let (clock, evicted) = (read.u64()?, read.u64()?);
-    let estimates_len = usize::try_from(read.u64()?).map_err(|_| DecodeError::Short { at: read.at })?;
-    let mut estimates = Estimates::decode(read.take(estimates_len)?).map_err(DecodeError::Estimates)?;
+    let mut estimates = Estimates::decode(read.bytes_u64()?).map_err(DecodeError::Estimates)?;
     estimates.unseen = config.unseen_bytes;
 
-    let kind_count = read.u64()?;
-    if kind_count.checked_mul(KIND_BYTES as u64).is_none_or(|it| it > read.left() as u64) {
-        return Err(DecodeError::Short { at: read.at });
-    }
-    let mut kinds = Vec::with_capacity(kind_count as usize);
+    let kind_count = read.count_u64(KIND_BYTES)?;
+    let mut kinds = Vec::with_capacity(kind_count);
     let mut last: Option<u32> = None;
     for _ in 0..kind_count {
         let kind = read.u32()?;

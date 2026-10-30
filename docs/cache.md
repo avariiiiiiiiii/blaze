@@ -76,29 +76,54 @@ change still prints what cargo's build prints.
 
 ### Proc-macro expansions
 
-The store also keeps what derive and attribute macros expand to, so a daemon that loads a
-workspace again does not run them again (`crates/blaze-expand`). This output cache applies
-to native proc macros. Default WASM proc macros retain session state and rerun expansions
-at every new database revision, including client requests without source changes ([cargo.md](cargo.md#proc-macros-run-as-webassembly)). The key is a SHA-256 of
-the macro library's content, the macro's name and kind, its input with each span replaced
-by its place in the call's table of spans, that table (each span's byte range within the
-item it is anchored to, and which of the call's anchors and hygiene contexts it has), the
-environment and the current directory the macro is given. The output is kept with its spans
-written the same way, so tokens the macro made from a string at the call site come back
-anchored where the next call is. An expansion is not kept when it failed, when it asked
-rust-analyzer anything while it ran (a span's text, file or line), or when its output has a
-span anchored where no span of its input is.
+The store also keeps what proc macros expand to, so a daemon that loads a workspace again,
+here or on any machine sharing the remote, does not run them again (`crates/blaze-expand`).
+Every kind of macro is kept: derive, attribute and function-like. An expansion is a run of
+user code, keyed as a build script's run is (`blaze_usercode::RunKey`). Its code is the
+content ID of the macro's library. What it is given is:
 
-A macro that reads a file or an environment variable by itself is pure to the key and is
-not: name it in `BLAZE_PROC_MACRO_CACHE_SKIP` (a comma-separated list of macro names) to
-expand it every time. `BLAZE_PROC_MACRO_CACHE=all` keeps function-like macros too, which
-are off by default because they are the ones that read outside their input (`sqlx::query!`,
-`include_dir!`). `BLAZE_PROC_MACRO_CACHE=check` expands every call anyway and says which
-macro expanded otherwise than it was kept. `BLAZE_PROC_MACRO_CACHE=off` keeps nothing. The
-daemon's log has a line per load: how many expansions ran and in how long, how many came
-from the store, and why the rest were not kept. rustc's own cache, `-Zcache-proc-macros`,
-keeps derives only ([research/proc-macro-cache.md](research/proc-macro-cache.md)).
-`harness/expansions.py` tests it.
+- the macro's name and kind;
+- its input and attribute tokens, with each span written relative: its byte range from the
+  item it is anchored to, and which of the call's anchors and hygiene contexts it has;
+- the call's three sites;
+- the variables of the crate it expands for, the directory it runs in, the toolchain and the
+  proc-macro ABI.
+
+So the next call with the same input, in another database or revision, has the same key.
+The output is kept with its spans written the same way. What else the macro read (files,
+listings, variables of the shell) is traced: by the sandbox of a native macro's server, and
+by the host for a macro run as WebAssembly, which records every read of its package. The
+result is found by exactly those inputs' values now, through `blaze_usercode::index`. A
+macro that reads a file or a variable by itself is therefore keyed by it, with nothing to
+name.
+
+An expansion is not kept when:
+
+- it failed;
+- its output has an anchor or a context its input has not;
+- it read what can't be traced (the clock, randomness);
+- its server could not trace it (`BLAZE_SANDBOX=off`);
+- a native macro asked rust-analyzer about a span (its text, file or line).
+
+A module run as WebAssembly is kept with each question it asked and the answer, and is found
+while the database answers each the same. A module seen keeping state between expansions
+keeps an instance per calling crate for one database revision instead, and nothing it makes
+is kept ([cargo.md](cargo.md#proc-macros-run-as-webassembly)).
+
+The variables of v1 changed:
+
+- `BLAZE_PROC_MACRO_CACHE=check` stays. It expands every call it finds kept anyway, and an
+  output other than the kept one is an error naming the macro.
+- `BLAZE_PROC_MACRO_CACHE=all` is gone: every kind of macro is kept.
+- `BLAZE_PROC_MACRO_CACHE=off` is gone: with `BLAZE_CACHE=off` there is no store, so nothing
+  is kept.
+- v1's list of macros to expand every time is gone: what a macro reads by itself is traced
+  and keyed.
+
+Any other value of `BLAZE_PROC_MACRO_CACHE` is an error naming the two modes. rustc's own
+cache, `-Zcache-proc-macros`, keeps derives only
+([research/proc-macro-cache.md](research/proc-macro-cache.md)). `harness/expansions.py` tests
+it.
 
 ## The disk store
 

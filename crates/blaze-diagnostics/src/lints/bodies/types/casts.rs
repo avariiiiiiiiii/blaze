@@ -13,10 +13,10 @@
 //! what parentheses hold is theirs), `compiler/rustc_ast_lowering/src/lib.rs` (`TyKind::Paren`
 //! lowers to what it holds) and `compiler/rustc_span/src/lib.rs` (MIT or Apache-2.0).
 
-mod function_casts;
-mod provenance;
-mod raw_borrows;
-mod static_mut_refs;
+pub(crate) mod function_casts;
+pub(crate) mod provenance;
+pub(crate) mod raw_borrows;
+pub(crate) mod static_mut_refs;
 
 use hir::InFile;
 use hir_def::hir::ExprId;
@@ -27,16 +27,6 @@ use crate::{
     lints::bodies::BodyCx,
     model::{MacroKind, Span},
 };
-
-/// rustc's late lint passes of casts and borrows of statics and places in bodies.
-pub(super) fn passes() -> Vec<Box<dyn crate::lints::bodies::LatePass>> {
-    vec![
-        Box::new(static_mut_refs::StaticMutRefs),
-        Box::new(function_casts::FunctionCastsAsInteger),
-        Box::new(provenance::ImplicitProvenanceCasts),
-        Box::new(raw_borrows::RawBorrowsViaReferences),
-    ]
-}
 
 /// rustc's span of the type of the cast `cast` (`ExprKind::Cast`'s `hir::Ty`), its parentheses
 /// left out as rustc's lowering leaves them.

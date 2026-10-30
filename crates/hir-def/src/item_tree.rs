@@ -42,8 +42,8 @@
 //! the tree's tables ([`NameId`], [`PathId`]); visibilities ([`RawVisibilityId`]) and attributes
 //! (keyed by item, in [`ItemTree::attrs`]) sit in side tables. [`persist`] writes the columns as
 //! they are. Names, paths and visibilities are deduplicated within each top-level item, not
-//! across them, so a source file's tree is its items' trees concatenated: it is assembled from
-//! them, each lowered on its own ([`items`]).
+//! across them, so a source file's tree is its items' rows one after the other: an edit keeps
+//! the rows of the items it did not change and lowers the others alone ([`items`]).
 
 mod attrs;
 mod items;
@@ -57,6 +57,7 @@ use std::{
     fmt,
     mem::size_of,
     ops::{Index, Range},
+    sync::Arc,
 };
 
 use base_db::{Db, Crate};
@@ -209,18 +210,21 @@ pub fn file_item_tree(db: &Db, file_id: HirFileId, krate: Crate) -> &ItemTree {
     file_item_tree_query(db, file_id, krate)
 }
 
-/// A source file's tree is assembled from its items' ([`items`]), so an edit lowers only the
-/// items it touches; a macro file's is lowered whole, as each expansion is made anew.
-#[salsa::tracked(returns(ref))]
+/// A source file's tree is made from its last one where it was edited ([`items`]), so an edit
+/// lowers only the items it touches, and one that touches none returns the last tree itself;
+/// a macro file's is lowered whole, as each expansion is made anew. The tree is behind an
+/// `Arc` so the last one is kept beside salsa without a copy.
+#[salsa::tracked(returns(deref))]
 fn file_item_tree_query(
     db: &Db,
     file_id: HirFileId,
     krate: Crate,
-) -> ItemTree {
+) -> Arc<ItemTree> {
     let _p = tracing::info_span!("file_item_tree_query", ?file_id).entered();
     match file_id {
         HirFileId::FileId(file) => items::file_item_tree(db, file, krate),
-        HirFileId::MacroFile(_) => lower_whole(db, file_id, krate),
+        // alloc: the tree's handle, once an expansion's tree
+        HirFileId::MacroFile(_) => Arc::new(lower_whole(db, file_id, krate)),
     }
 }
 
@@ -316,6 +320,9 @@ pub struct ItemTree {
 
     /// Sorted by owner. The last, if its owner is [`ModItemId::TOP_OWNER`], is the top level's.
     attr_owners: Box<[AttrOwner]>,
+    /// Which items have an owner in `attr_owners`, and where: made from it ([`attr_index`]),
+    /// so not written ([`persist`]).
+    attr_index: Box<[AttrBlock]>,
     /// Every item's attributes, each item's an [`IdRange`] of this.
     attrs: Box<[Attr]>,
     /// The `cfg`s that disable items.
@@ -327,6 +334,33 @@ pub struct ItemTree {
 pub const ITEM_BYTES: usize =
     size_of::<ItemKind>() + size_of::<u32>() + size_of::<FileAstId<ast::Item>>();
 const _: () = assert!(ITEM_BYTES == 9);
+
+/// 64 items: which of them have attributes (bit `i % 64` of item `i`), and how many items
+/// before them do, so an item's [`AttrOwner`] is found with a `popcnt`. 16 bytes per 64 items.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct AttrBlock {
+    bits: u64,
+    before: u32,
+}
+
+const _: () = assert!(size_of::<AttrBlock>() == 16);
+
+/// The [`AttrBlock`]s of a tree of `items` items whose attribute owners are `owners`, sorted
+/// and in the tree (what `persist`'s `check` holds a decoded tree to).
+fn attr_index(owners: &[AttrOwner], items: usize) -> Box<[AttrBlock]> {
+    // alloc: the tree's column, once a tree at its length; none for a tree of no items
+    let mut blocks = vec![AttrBlock::default(); items.div_ceil(64)].into_boxed_slice();
+    for owner in owners.iter().filter(|owner| owner.owner != ModItemId::TOP_OWNER) {
+        let at = owner.owner.index as usize;
+        blocks[at / 64].bits |= 1 << (at % 64);
+    }
+    let mut before = 0;
+    for block in blocks.iter_mut() {
+        block.before = before;
+        before += block.bits.count_ones();
+    }
+    blocks
+}
 
 impl ItemTree {
     /// Returns an iterator over all items located at the top level of the `HirFileId` this
@@ -352,8 +386,13 @@ impl ItemTree {
 
     #[inline]
     pub(crate) fn attrs(&self, of: ModItemId) -> Option<AttrsOrCfgRef<'_>> {
-        let at = self.attr_owners.binary_search_by_key(&of, |owner| owner.owner).ok()?;
-        Some(self.attrs_of(&self.attr_owners[at]))
+        let block = self.attr_index.get(of.index as usize / 64)?;
+        let bit = 1u64 << (of.index % 64);
+        if block.bits & bit == 0 {
+            return None;
+        }
+        let at = block.before + (block.bits & (bit - 1)).count_ones();
+        Some(self.attrs_of(&self.attr_owners[at as usize]))
     }
 
     #[inline]

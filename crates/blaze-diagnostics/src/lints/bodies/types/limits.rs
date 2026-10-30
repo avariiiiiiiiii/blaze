@@ -23,14 +23,12 @@ use syntax::{AstNode as _, ast};
 
 use super::util::{self, Solver};
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass},
+    lints::bodies::{
+        BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, PatKinds, PatTag, lint_set,
+    },
     lower::{Found, Phase},
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
-
-pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
-    vec![Box::new(TypeLimits::new())]
-}
 
 /// The pass runs at every expression of every body, so each check is gated on what costs least
 /// first: the expression's kind (a `u8` tag of the store's columns), then the type inference
@@ -38,7 +36,7 @@ pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
 /// paths, the trait solver and strings are reached only by an expression that lints, or that
 /// only the source can tell apart (a pattern's literal, whose `-` the lowering folded in).
 /// Nothing is allocated on the path that doesn't lint; the per-crate caches are filled once.
-struct TypeLimits {
+pub(crate) struct TypeLimits {
     /// rustc's `negated_expr_id`: the last `-` visited, and its operand. Its span is built only
     /// when the operand overflows.
     last_negation: Option<(ExprId, ExprId)>,
@@ -63,8 +61,8 @@ struct Names {
     cmpops: [(Symbol, ComparisonOp); 10],
 }
 
-impl TypeLimits {
-    fn new() -> TypeLimits {
+impl Default for TypeLimits {
+    fn default() -> TypeLimits {
         let names = Names {
             nan: ["f16_nan", "f32_nan", "f64_nan", "f128_nan"].map(Symbol::intern),
             non_null: Symbol::intern("NonNull"),
@@ -92,7 +90,9 @@ impl TypeLimits {
             non_null: FxHashMap::default(),
         }
     }
+}
 
+impl TypeLimits {
     fn crate_of(&mut self, b: &BodyCx<'_, '_>) {
         let db = b.db();
         let krate = b.owner.krate(db);
@@ -199,16 +199,28 @@ fn peel_refs(mut ty: Ty<'_>) -> (Ty<'_>, usize) {
 }
 
 impl LatePass for TypeLimits {
-    fn name(&self) -> &'static str {
-        "TypeLimits"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::BODY | Hooks::EXPR | Hooks::PAT
-    }
+    const LINTS: LintSet = lint_set([
+        literal::LINT,
+        "unused_comparisons",
+        "invalid_nan_comparisons",
+        "ambiguous_wide_pointer_comparisons",
+        "unpredictable_function_pointer_comparisons",
+    ]);
+    const HOOKS: Hooks = Hooks::BODY;
+    const EXPRS: ExprKinds = ExprKinds::of(&[
+        ExprTag::Literal,
+        ExprTag::UnaryOp,
+        ExprTag::BinaryOp,
+        ExprTag::Call,
+        ExprTag::MethodCall,
+    ]);
+    const PATS: PatKinds = PatKinds::of(&[PatTag::Lit, PatTag::Range]);
 
     fn check_body(&mut self, b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {
         self.crate_of(b);
+        // Expression ids are of the body: one of the body before is no node of this one.
+        self.last_negation = None;
+        self.pat_lits = [None; 2];
     }
 
     fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, _out: &mut Vec<Found>) {

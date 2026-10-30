@@ -16,9 +16,9 @@ use std::{
 };
 
 use blaze_core::{Traced, Untraceable};
+use blaze_format::cursor::{Put, Reader};
 use blaze_ids::{ContentId, Hasher};
 use blaze_mem::{Frame, Tag, frame, scratch};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 /// The hash domain `$domain` of something [`os_bytes`] encodes names into: as it is where a
 /// name is its bytes, and another on Windows, where a name is its UTF-16 units, so what an
@@ -128,32 +128,34 @@ impl Line {
     /// The line, or an `X` line when `scope` or `what` can't be written in one.
     pub fn new(seen: Seen, scope: &str, what: &str) -> Line {
         let bad = |it: &str| it.contains(['\t', '\n']);
+        // alloc: the edge, a line of the sandbox's record, which the line owns
         match (bad(scope), bad(what)) {
+            // alloc: as above
             (false, false) => Line { seen, scope: scope.to_owned(), what: what.to_owned() },
             (true, _) => Line {
                 seen: Seen::Incomplete,
-                scope: String::new(),
-                what: "a scope with a tab or a line break in it".to_owned(),
+                scope: String::new(), // alloc: none, empty
+                what: "a scope with a tab or a line break in it".to_owned(), // alloc: a line that is an error
             },
             (false, true) => Line {
                 seen: Seen::Incomplete,
-                scope: scope.to_owned(),
-                what: "a path or a name with a tab or a line break in it".to_owned(),
+                scope: scope.to_owned(), // alloc: a line that is an error
+                what: "a path or a name with a tab or a line break in it".to_owned(), // alloc: as above
             },
         }
     }
 
     /// The line as the record has it, with its line break.
     pub fn text(&self) -> String {
-        format!("{}\t{}\t{}\n", self.seen.letter(), self.scope, self.what)
+        format!("{}\t{}\t{}\n", self.seen.letter(), self.scope, self.what) // alloc: the edge, the record written
     }
 
     /// The line `text` is, without its line break.
     pub fn parse(text: &str) -> Option<Line> {
         let mut parts = text.splitn(3, '\t');
         let seen = Seen::of(parts.next()?)?;
-        let scope = parts.next()?.to_owned();
-        let what = parts.next()?.to_owned();
+        let scope = parts.next()?.to_owned(); // alloc: the edge, a line of the sandbox's record
+        let what = parts.next()?.to_owned(); // alloc: as above
         Some(Line { seen, scope, what })
     }
 }
@@ -162,13 +164,13 @@ impl Line {
 /// writing as it was read, and is left for the next read; any other line that is not a line
 /// is an error: the record is not whole.
 pub fn parse(text: &str) -> Result<(Vec<Line>, usize), BadRecord> {
-    let mut lines = Vec::new();
+    let mut lines = Vec::new(); // alloc: the edge, the lines the caller keeps
     let mut used = 0;
     for (number, piece) in text.split_inclusive('\n').enumerate() {
         let Some(line) = piece.strip_suffix('\n') else { break };
         lines.push(Line::parse(line).ok_or_else(|| BadRecord {
             line: number + 1,
-            text: line.chars().take(200).collect(),
+            text: line.chars().take(200).collect(), // alloc: error path
         })?);
         used += piece.len();
     }
@@ -432,73 +434,80 @@ pub fn assemble_seen<'a, I: Inputs>(
     lines: impl IntoIterator<Item = (Seen, &'a str)>,
     inputs: &mut I,
 ) -> Result<Traced, I::Error> {
-    let mut files = FxHashSet::default();
-    let mut dirs = FxHashSet::default();
-    let mut env = FxHashSet::default();
-    let mut all_env = false;
-    let mut untraceable = FxHashSet::default();
-    for (seen, what) in lines {
-        match seen {
-            Seen::Read | Seen::Looked => _ = files.insert(what),
-            Seen::Listed => _ = dirs.insert(what),
-            Seen::Env if what == ALL_ENV => all_env = true,
-            Seen::Env => _ = env.insert(what),
-            Seen::Untraceable => {
+    frame::task(Tag::Usercode, |frame| {
+        let mut files: Vec<&str, &Frame> = Vec::new_in(frame);
+        let mut dirs: Vec<&str, &Frame> = Vec::new_in(frame);
+        let mut env: Vec<&str, &Frame> = Vec::new_in(frame);
+        let mut all_env = false;
+        let mut untraceable = Vec::new_in(frame);
+        for (seen, what) in lines {
+            match seen {
+                Seen::Read | Seen::Looked => files.push(what),
+                Seen::Listed => dirs.push(what),
+                Seen::Env if what == ALL_ENV => all_env = true,
+                Seen::Env => env.push(what),
                 // A name this blaze doesn't know is something it can't trace either.
-                untraceable.insert(untraceable_of(what).unwrap_or(Untraceable::Descriptor));
+                Seen::Untraceable => untraceable.push(untraceable_of(what).unwrap_or(Untraceable::Descriptor)),
+                Seen::Incomplete => untraceable.push(Untraceable::Descriptor),
+                Seen::RefusedWrite | Seen::RefusedNet => {}
             }
-            Seen::Incomplete => _ = untraceable.insert(Untraceable::Descriptor),
-            Seen::RefusedWrite | Seen::RefusedNet => {}
         }
-    }
-    // Each set sorted once here: `inputs` is asked, and `traced` filled, in that order.
-    fn sorted<T: Ord>(set: impl IntoIterator<Item = T>) -> Vec<T> {
-        let mut set: Vec<T> = set.into_iter().collect();
-        set.sort_unstable();
-        set
-    }
-    let (files, dirs, env): (Vec<PathBuf>, Vec<PathBuf>, Vec<OsString>) = (
-        sorted(files.into_iter().map(PathBuf::from)),
-        sorted(dirs.into_iter().map(PathBuf::from)),
-        sorted(env.into_iter().map(OsString::from)),
-    );
-    let mut traced = Traced::default();
-    for path in files {
-        let hash = inputs.file(&path)?;
-        traced.files.push((path, hash));
-    }
-    for path in dirs {
-        match inputs.dir(&path)? {
-            Some(hash) => traced.dirs.push((path, hash)),
-            // A listing of nothing is a look that found nothing.
-            None if !traced.files.iter().any(|it| it.0 == path) => {
-                traced.files.push((path, None));
+        // Each list sorted once here, as paths and names sort, each name once: `inputs` is
+        // asked, and `traced` filled, in that order.
+        for paths in [&mut files, &mut dirs] {
+            paths.sort_unstable_by(|a, b| Path::new(a).cmp(Path::new(b)).then(a.cmp(b)));
+            paths.dedup();
+        }
+        env.sort_unstable();
+        env.dedup();
+        untraceable.sort_unstable();
+        untraceable.dedup();
+        let mut traced = Traced::default();
+        for &path in &files {
+            let path = Path::new(path);
+            let hash = inputs.file(path)?;
+            traced.files.push((path.to_path_buf(), hash)); // alloc: the Traced the caller keeps
+        }
+        for &path in &dirs {
+            let path = Path::new(path);
+            match inputs.dir(path)? {
+                Some(hash) => traced.dirs.push((path.to_path_buf(), hash)), // alloc: kept, as above
+                // A listing of nothing is a look that found nothing.
+                None if !traced.files.iter().any(|it| it.0 == path) => {
+                    traced.files.push((path.to_path_buf(), None)); // alloc: kept, as above
+                }
+                None => {}
             }
-            None => {}
         }
-    }
-    traced.files.sort();
-    let mut values: FxHashMap<OsString, Option<OsString>> = FxHashMap::default();
-    if all_env {
-        let all = inputs.env_all();
-        values.insert(ALL_ENV_NAME.into(), Some(names_hash(all).into()));
-        for (name, value) in all {
-            values.insert(name.clone(), Some(value.clone()));
+        traced.files.sort();
+        // The whole environment, sorted and each name once, then what was asked by a name it
+        // has not: each name once, as a run sees it.
+        let mut whole = 0;
+        if all_env {
+            let all = inputs.env_all();
+            traced.env.push((ALL_ENV_NAME.into(), Some(names_hash(all).into())));
+            // clone: the Traced the caller keeps
+            traced.env.extend(all.iter().map(|(name, value)| (name.clone(), Some(value.clone()))));
+            whole = traced.env.len();
         }
-    }
-    for name in env {
-        let value = inputs.env(&name).map(OsStr::to_owned);
-        values.entry(name).or_insert(value);
-    }
-    traced.env = values.into_iter().collect();
-    traced.env.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    traced.untraceable = sorted(untraceable);
-    Ok(traced)
+        for &name in &env {
+            let name = OsStr::new(name);
+            let had = whole > 0
+                && (name == ALL_ENV_NAME || traced.env[1..whole].binary_search_by(|it| it.0.as_os_str().cmp(name)).is_ok());
+            if !had {
+                let value = inputs.env(name).map(OsStr::to_owned);
+                traced.env.push((name.to_owned(), value)); // alloc: kept, as above
+            }
+        }
+        traced.env.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        traced.untraceable = untraceable.iter().copied().collect(); // alloc: kept, as above
+        Ok(traced)
+    })
 }
 
 /// The value [`ALL_ENV_NAME`] has for the environment `all`.
 pub fn names_hash(all: &[(OsString, OsString)]) -> String {
-    names_hex(all).iter().map(|&it| char::from(it)).collect()
+    names_hex(all).iter().map(|&it| char::from(it)).collect() // alloc: the value the Traced keeps
 }
 
 /// [`names_hash`]'s bytes, made on the stack: what a cache check hashes into a key.
@@ -706,11 +715,11 @@ pub fn os_bytes(name: &OsStr) -> Cow<'_, [u8]> {
 pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
     #[cfg(unix)]
     {
-        Ok(std::os::unix::ffi::OsStrExt::from_bytes(bytes).to_owned())
+        Ok(std::os::unix::ffi::OsStrExt::from_bytes(bytes).to_owned()) // alloc: the name the caller keeps
     }
     #[cfg(target_os = "wasi")]
     {
-        Ok(std::os::wasi::ffi::OsStrExt::from_bytes(bytes).to_owned())
+        Ok(std::os::wasi::ffi::OsStrExt::from_bytes(bytes).to_owned()) // alloc: the name the caller keeps
     }
     #[cfg(windows)]
     {
@@ -720,7 +729,7 @@ pub(crate) fn os_from(bytes: &[u8]) -> Result<OsString, String> {
     {
         std::str::from_utf8(bytes)
             .map(OsString::from)
-            .map_err(|_| "a name is not UTF-8".to_owned())
+            .map_err(|_| "a name is not UTF-8".to_owned()) // alloc: error path
     }
 }
 
@@ -761,13 +770,13 @@ fn le_of_wide(units: impl Iterator<Item = u16>, hint: usize) -> Vec<u8> {
 fn wide_of_le(bytes: &[u8]) -> Result<Vec<u16>, String> {
     let units = bytes.chunks_exact(2);
     if !units.remainder().is_empty() {
-        return Err("a name is an odd number of bytes, not UTF-16 units".to_owned());
+        return Err("a name is an odd number of bytes, not UTF-16 units".to_owned()); // alloc: error path
     }
-    Ok(units.map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect())
+    Ok(units.map(|unit| u16::from_le_bytes([unit[0], unit[1]])).collect()) // alloc: the units a name is made of
 }
 
 /// What a sandbox's launcher leaves for the driver that ran it ([`encode`]).
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Report {
     /// The sandbox was made and the program ran; what it read when the sandbox traces.
     Ran(Option<Traced>),
@@ -782,137 +791,99 @@ const MAGIC: &[u8; 16] = if cfg!(windows) { b"blaze v2 report2" } else { b"blaze
 /// `report` as bytes: the magic, then each part length-prefixed, little-endian. Equal reports
 /// are equal bytes.
 pub fn encode(report: &Report) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
-    let part = |out: &mut Vec<u8>, bytes: &[u8]| {
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(bytes);
-    };
+    let mut out = MAGIC.to_vec(); // alloc: the edge, the bytes the launcher leaves the driver
     match report {
         Report::NotMade(why) => {
-            out.push(0);
-            part(&mut out, why.as_bytes());
+            out.put_u8(0);
+            out.put_bytes_u64(why.as_bytes());
         }
-        Report::Ran(None) => out.push(1),
+        Report::Ran(None) => out.put_u8(1),
         Report::Ran(Some(traced)) => {
-            out.push(2);
-            out.extend_from_slice(&(traced.files.len() as u64).to_le_bytes());
+            out.put_u8(2);
+            out.put_u64(traced.files.len() as u64);
             for (path, hash) in &traced.files {
-                part(&mut out, &os_bytes(path.as_os_str()));
+                out.put_bytes_u64(&os_bytes(path.as_os_str()));
                 match hash {
                     Some(hash) => {
-                        out.push(1);
-                        out.extend_from_slice(hash);
+                        out.put_u8(1);
+                        out.put_bytes(hash);
                     }
-                    None => out.push(0),
+                    None => out.put_u8(0),
                 }
             }
-            out.extend_from_slice(&(traced.dirs.len() as u64).to_le_bytes());
+            out.put_u64(traced.dirs.len() as u64);
             for (path, hash) in &traced.dirs {
-                part(&mut out, &os_bytes(path.as_os_str()));
-                out.extend_from_slice(hash);
+                out.put_bytes_u64(&os_bytes(path.as_os_str()));
+                out.put_bytes(hash);
             }
-            out.extend_from_slice(&(traced.env.len() as u64).to_le_bytes());
+            out.put_u64(traced.env.len() as u64);
             for (name, value) in &traced.env {
-                part(&mut out, &os_bytes(name));
+                out.put_bytes_u64(&os_bytes(name));
                 match value {
                     Some(value) => {
-                        out.push(1);
-                        part(&mut out, &os_bytes(value));
+                        out.put_u8(1);
+                        out.put_bytes_u64(&os_bytes(value));
                     }
-                    None => out.push(0),
+                    None => out.put_u8(0),
                 }
             }
-            out.extend_from_slice(&(traced.untraceable.len() as u64).to_le_bytes());
+            out.put_u64(traced.untraceable.len() as u64);
             for it in &traced.untraceable {
-                part(&mut out, untraceable_name(*it).as_bytes());
+                out.put_bytes_u64(untraceable_name(*it).as_bytes());
             }
         }
     }
     out
 }
 
-/// Reads what [`encode`] and [`crate::index::Shape::encode`] write.
-pub(crate) struct At<'a>(pub(crate) &'a [u8]);
-
-impl<'a> At<'a> {
-    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
-        if self.0.len() < len {
-            return Err("it ends early".to_owned());
-        }
-        let (head, rest) = self.0.split_at(len);
-        self.0 = rest;
-        Ok(head)
-    }
-
-    pub(crate) fn byte(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
-    }
-
-    pub(crate) fn len(&mut self) -> Result<usize, String> {
-        let len = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
-        // Each entry takes at least a byte: a count past what is left is not one written.
-        usize::try_from(len)
-            .ok()
-            .filter(|it| *it <= self.0.len())
-            .ok_or_else(|| "it counts more than it holds".to_owned())
-    }
-
-    pub(crate) fn part(&mut self) -> Result<&'a [u8], String> {
-        let len = self.len()?;
-        self.take(len)
-    }
-
-    fn hash(&mut self) -> Result<[u8; 32], String> {
-        Ok(self.take(32)?.try_into().unwrap())
-    }
-}
-
-/// The report `bytes` are, or why they are not one.
+/// The report `bytes` are, or why they are not one. Each list's count is checked against the
+/// bytes left at one byte an entry, so no count makes a loop run past what was written.
 pub fn decode(bytes: &[u8]) -> Result<Report, String> {
-    let mut at = At(bytes);
+    let mut at = Reader::new(bytes);
     if at.take(MAGIC.len())? != MAGIC {
-        return Err("not a sandbox's report".to_owned());
+        return Err("not a sandbox's report".to_owned()); // alloc: error path
     }
-    let report = match at.byte()? {
-        0 => Report::NotMade(String::from_utf8_lossy(at.part()?).into_owned()),
+    let report = match at.u8()? {
+        0 => Report::NotMade(String::from_utf8_lossy(at.bytes_u64()?).into_owned()), // alloc: why a sandbox was not made
         1 => Report::Ran(None),
         2 => {
             let mut traced = Traced::default();
-            for _ in 0..at.len()? {
-                let path = PathBuf::from(os_from(at.part()?)?);
-                let hash = match at.byte()? {
+            for _ in 0..at.count_u64(1)? {
+                let path = PathBuf::from(os_from(at.bytes_u64()?)?);
+                let hash = match at.u8()? {
                     0 => None,
-                    1 => Some(at.hash()?),
-                    _ => return Err("a file's hash is neither there nor not".to_owned()),
+                    1 => Some(*at.array()?),
+                    _ => return Err("a file's hash is neither there nor not".to_owned()), // alloc: error path
                 };
                 traced.files.push((path, hash));
             }
-            for _ in 0..at.len()? {
-                let path = PathBuf::from(os_from(at.part()?)?);
-                traced.dirs.push((path, at.hash()?));
+            for _ in 0..at.count_u64(1)? {
+                let path = PathBuf::from(os_from(at.bytes_u64()?)?);
+                traced.dirs.push((path, *at.array()?));
             }
-            for _ in 0..at.len()? {
-                let name = os_from(at.part()?)?;
-                let value = match at.byte()? {
+            for _ in 0..at.count_u64(1)? {
+                let name = os_from(at.bytes_u64()?)?;
+                let value = match at.u8()? {
                     0 => None,
-                    1 => Some(os_from(at.part()?)?),
-                    _ => return Err("a variable's value is neither there nor not".to_owned()),
+                    1 => Some(os_from(at.bytes_u64()?)?),
+                    _ => return Err("a variable's value is neither there nor not".to_owned()), // alloc: error path
                 };
                 traced.env.push((name, value));
             }
-            for _ in 0..at.len()? {
-                let name = String::from_utf8_lossy(at.part()?).into_owned();
-                traced.untraceable.push(
-                    untraceable_of(&name).ok_or_else(|| format!("no untraceable is {name:?}"))?,
-                );
+            for _ in 0..at.count_u64(1)? {
+                let name = at.bytes_u64()?;
+                let untraceable = std::str::from_utf8(name).ok().and_then(untraceable_of);
+                // alloc: error path
+                let why = || format!("no untraceable is {:?}", String::from_utf8_lossy(name));
+                traced.untraceable.push(untraceable.ok_or_else(why)?);
             }
             Report::Ran(Some(traced))
         }
-        other => return Err(format!("no report is of kind {other}")),
+        other => return Err(format!("no report is of kind {other}")), // alloc: error path
     };
-    match at.0.is_empty() {
+    match at.is_done() {
         true => Ok(report),
-        false => Err("the report has bytes after its end".to_owned()),
+        false => Err("the report has bytes after its end".to_owned()), // alloc: error path
     }
 }
 

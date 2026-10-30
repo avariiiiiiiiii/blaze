@@ -39,6 +39,7 @@ pub(crate) struct Started {
 /// What is needed to say how the process ended, once it has.
 pub(crate) struct Finish {
     pub(crate) command: Box<Command>,
+    // dyn: the platform's sandbox, given by whoever owns it; asked once per spawn.
     confine: Option<Arc<dyn Confine>>,
     scratch: Option<PathBuf>,
     limit: Limit,
@@ -58,24 +59,17 @@ enum Limit {
 pub(crate) fn start(
     root: &Path,
     command: Box<Command>,
+    // dyn: as `Finish::confine`.
     confine: Option<&Arc<dyn Confine>>,
 ) -> io::Result<Started> {
     let n = RUNS.fetch_add(1, Ordering::Relaxed);
-    let (confined, scratch, confine) = match &command.sandbox {
-        Sandbox::Off => (
-            Confined {
-                program: command.program.clone(),
-                args: command.args.clone(),
-                env: command.env.clone(),
-                dir: command.dir.clone(),
-            },
-            None,
-            None,
-        ),
+    let (confined, scratch, confine): (Option<Confined>, _, _) = match &command.sandbox {
+        Sandbox::Off => (None, None, None),
         Sandbox::On { .. } => {
             let Some(confine) = confine else {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
+                    // alloc: an error path.
                     format!(
                         "{}: a sandbox is asked for and this driver was given nothing to make \
                          one (no Confine); nothing runs outside one",
@@ -83,13 +77,16 @@ pub(crate) fn start(
                     ),
                 ));
             };
+            // alloc: once per sandboxed spawn, its scratch directory, kept until it exits.
             let scratch = root.join(".blaze-spawn").join(format!("{}-{n}", std::process::id()));
             _ = std::fs::remove_dir_all(&scratch);
             std::fs::create_dir_all(&scratch)?;
             match confine.confine(&command, &scratch) {
-                Ok(confined) => (confined, Some(scratch), Some(confine.clone())),
+                // clone: the sandbox maker, kept to ask what the process read.
+                Ok(confined) => (Some(confined), Some(scratch), Some(confine.clone())),
                 Err(why) => {
                     _ = std::fs::remove_dir_all(&scratch);
+                    // alloc: an error path.
                     return Err(io::Error::other(format!(
                         "{}: no sandbox can be made here: {why}",
                         command.program.display()
@@ -97,6 +94,16 @@ pub(crate) fn start(
                 }
             }
         }
+    };
+    // What the sandbox starts, else the command itself, borrowed either way.
+    let program = match &confined {
+        Some(it) => spawn::Program { program: &it.program, args: &it.args, env: &it.env, dir: &it.dir },
+        None => spawn::Program {
+            program: &command.program,
+            args: &command.args,
+            env: &command.env,
+            dir: &command.dir,
+        },
     };
     let removing = |error: io::Error| {
         if let Some(scratch) = &scratch {
@@ -109,6 +116,7 @@ pub(crate) fn start(
         Some(bytes) => Some(crate::cgroup::Cgroup::new(bytes).map_err(|error| {
             removing(io::Error::new(
                 error.kind(),
+                // alloc: an error path.
                 format!(
                     "{}: no cgroup can hold its memory to {bytes} bytes: {error}",
                     command.program.display()
@@ -125,16 +133,18 @@ pub(crate) fn start(
     if let Some(bytes) = command.memory {
         return Err(removing(io::Error::new(
             io::ErrorKind::Unsupported,
+            // alloc: an error path.
             format!(
                 "{}: no limit of {bytes} bytes can be held on this system",
                 command.program.display()
             ),
         )));
     }
-    let spawned = spawn::spawn(&confined, !command.stdin.is_empty(), procs).map_err(|error| {
+    let spawned = spawn::spawn(&program, !command.stdin.is_empty(), procs).map_err(|error| {
         removing(io::Error::new(
             error.kind(),
-            format!("starting {}: {error}", confined.program.display()),
+            // alloc: an error path.
+            format!("starting {}: {error}", program.program.display()),
         ))
     })?;
     let pid = spawned.pid;
@@ -197,6 +207,7 @@ impl Finish {
         let traced = match (&self.command.sandbox, &self.confine, &self.scratch) {
             (Sandbox::On { trace: true, .. }, Some(confine), Some(scratch)) => {
                 Some(confine.traced(&self.command, scratch).map_err(|why| {
+                    // alloc: an error path.
                     io::Error::other(format!(
                         "{}: its sandbox's record of what it read: {why}",
                         self.command.program.display()
@@ -254,4 +265,101 @@ pub(crate) fn wait_exited(pid: libc::pid_t) -> io::Result<()> {
 pub(crate) fn kill(pid: libc::pid_t) {
     // SAFETY: no pointers; the pid is a child not yet reaped, so no one else's.
     unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+/// What one read of a pipe takes at most.
+const CHUNK: usize = 16 << 10;
+
+/// Writes `input` to `stdin` and reads `stdout` and `stderr` until both end, on this thread in
+/// one poll loop: what a driver that blocks does in place of a thread per pipe. Returns what
+/// each said. A process that ends without reading all of its input, or a pipe that fails, is
+/// not an error of the driver's: what was read is what it said, and its end says how it went.
+/// Fails only where the loop cannot wait, and then the process is the caller's to kill.
+pub(crate) fn communicate(
+    stdin: Option<OwnedFd>,
+    input: &[u8],
+    stdout: OwnedFd,
+    stderr: OwnedFd,
+) -> io::Result<(Vec<u8>, Vec<u8>)> {
+    use std::os::fd::AsRawFd as _;
+    let mut stdin = stdin.filter(|_| !input.is_empty());
+    if let Some(fd) = &stdin {
+        // SAFETY: an open descriptor of the caller's.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        // SAFETY: as above.
+        if flags < 0 || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let mut written = 0;
+    let mut outputs = [Some(stdout), Some(stderr)];
+    // alloc: none until the process writes; what it writes is the exit's payload.
+    let mut said: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+    let mut chunk = [0u8; CHUNK];
+    loop {
+        // Which pipe each pollfd is: the input, or an output by its index.
+        let mut fds = [libc::pollfd { fd: -1, events: 0, revents: 0 }; 3];
+        let mut which = [None; 3];
+        let mut n = 0;
+        if let Some(fd) = &stdin {
+            fds[n] = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+            n += 1;
+        }
+        for (at, fd) in outputs.iter().enumerate() {
+            if let Some(fd) = fd {
+                fds[n] = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                which[n] = Some(at);
+                n += 1;
+            }
+        }
+        if n == 0 {
+            let [stdout, stderr] = said;
+            return Ok((stdout, stderr));
+        }
+        // SAFETY: `n` pollfds of open descriptors.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), n as libc::nfds_t, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        for (fd, which) in fds[..n].iter().zip(which) {
+            if fd.revents == 0 {
+                continue;
+            }
+            match which {
+                None => {
+                    // SAFETY: the rest of `input`, to an open descriptor.
+                    let wrote =
+                        unsafe { libc::write(fd.fd, input[written..].as_ptr().cast(), input.len() - written) };
+                    let again = wrote < 0
+                        && matches!(
+                            io::Error::last_os_error().kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        );
+                    if wrote > 0 {
+                        written += wrote as usize;
+                    }
+                    // Done, or the process is not reading (EPIPE and the rest): its input ends.
+                    if written == input.len() || (wrote < 0 && !again) || fd.revents & libc::POLLOUT == 0 {
+                        stdin = None;
+                    }
+                }
+                Some(at) => {
+                    // SAFETY: room for `CHUNK` bytes, from an open descriptor.
+                    let read = unsafe { libc::read(fd.fd, chunk.as_mut_ptr().cast(), CHUNK) };
+                    match read {
+                        1.. => said[at].extend_from_slice(&chunk[..read as usize]),
+                        0 => outputs[at] = None,
+                        _ => match io::Error::last_os_error().kind() {
+                            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock => {}
+                            _ => outputs[at] = None,
+                        },
+                    }
+                }
+            }
+        }
+    }
 }

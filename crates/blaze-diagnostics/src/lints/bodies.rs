@@ -21,8 +21,16 @@
 //! each node's `check_*` before its children's, every pass at each node) and
 //! `compiler/rustc_lint/src/lib.rs` (`BuiltinCombinedLateLintModPass`: the order of the passes)
 //! (MIT or Apache-2.0).
+//!
+//! Speed (`docs/v2/plan/lanes/diagnostics/speed-of-light.md`, "Bodies"): a pass whose every lint
+//! is allowed in the crate is not run (rustc's `lints_that_dont_need_to_run`). The late passes
+//! are one walk per body, each node's tag indexing a table, built once per crate, of the passes
+//! that look at that kind of node; a pass is a variant of [`Pass`], called by `match`, never
+//! through a vtable. What a body needs only for some passes (its preorder, its taint, its MIR)
+//! is computed the first time one asks, into buffers reused from body to body.
 
-mod bits;
+#[cfg(test)]
+mod tests;
 mod calls;
 mod liveness;
 mod panics;
@@ -31,6 +39,8 @@ mod reachable;
 mod recursion;
 mod types;
 mod unsafety;
+
+use std::cell::{Cell, OnceCell, RefCell};
 
 use base_db::Db;
 use blaze_ids::radix;
@@ -42,6 +52,7 @@ use hir_def::{
     expr_store::{Body, BodySourceMap, ExpressionStore, ExpressionStoreDiagnostics},
     hir::{Array, BindingId, Expr, ExprId, Pat, PatId, Statement},
     nameres::demand::every_body,
+    resolver::ValueNs,
     signatures::FunctionSignature,
     src::HasSource as _,
 };
@@ -55,6 +66,7 @@ use syntax::{AstNode as _, SyntaxNodePtr, TextRange, TextSize, ast};
 
 use crate::{
     cx::Cx,
+    lints::registry::{LintId, LintSet},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -65,18 +77,43 @@ use crate::{
 /// code of the crate (`--emit` asks for more than metadata: `cargo build`, not `cargo check`),
 /// which runs the lints after drop elaboration on every body, not only on those of consts.
 pub(crate) fn before_abort(cx: &Cx<'_, '_>, codegen: bool) -> Vec<Found> {
+    let runs = Runs::of(cx);
+    if !runs.any() {
+        // alloc: an empty `Vec` allocates nothing.
+        return Vec::new();
+    }
+    // alloc: the lints found, empty until one is.
     let mut found = Vec::new();
+    let mut scratch = Scratch::default();
     for owner in body_owners(cx) {
         let Some(mut b) = BodyCx::new(cx, owner) else { continue };
+        b.lend(std::mem::take(&mut scratch));
         b.elaborated = codegen || b.is_const_context();
-        found.extend(reachable::lints(&b));
-        found.extend(patterns::lints(&b));
-        found.extend(unsafety::lints(&b));
-        found.extend(reachable::after_calls(&b));
-        found.extend(recursion::calls(&b));
-        found.extend(liveness::lints(&b));
-        found.extend(recursion::drops(&b));
-        found.extend(panics::lints(&b));
+        if runs.reachable {
+            found.extend(reachable::lints(&b));
+        }
+        if runs.patterns {
+            found.extend(patterns::lints(&b));
+        }
+        if runs.unsafety {
+            found.extend(unsafety::lints(&b));
+        }
+        if runs.reachable {
+            found.extend(reachable::after_calls(&b));
+        }
+        if runs.recursion {
+            found.extend(recursion::calls(&b));
+        }
+        if runs.liveness {
+            found.extend(liveness::lints(&b));
+        }
+        if runs.recursion {
+            found.extend(recursion::drops(&b));
+        }
+        if runs.panics {
+            found.extend(panics::lints(&b));
+        }
+        scratch = b.into_scratch();
     }
     found
 }
@@ -85,13 +122,76 @@ pub(crate) fn before_abort(cx: &Cx<'_, '_>, codegen: bool) -> Vec<Found> {
 /// `overflowing_literals`, ..), run only when nothing failed: each pass at each node of each
 /// body, in rustc's order.
 pub(crate) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let mut passes = late_passes();
+    let mut passes = Passes::new(cx);
+    if !passes.any {
+        // alloc: an empty `Vec` allocates nothing.
+        return Vec::new();
+    }
+    // alloc: the lints found, empty until one is.
     let mut found = Vec::new();
+    let mut scratch = Scratch::default();
     for owner in body_owners(cx) {
-        let Some(b) = BodyCx::new(cx, owner) else { continue };
+        let Some(mut b) = BodyCx::new(cx, owner) else { continue };
+        b.lend(std::mem::take(&mut scratch));
         Late { b: &b, passes: &mut passes, out: &mut found }.body();
+        scratch = b.into_scratch();
     }
     found
+}
+
+/// Whether one of `lints` can be given in the crate: rustc's `lints_that_dont_need_to_run`
+/// leaves it out. One AND per word of the set.
+pub(crate) fn may_fire(cx: &Cx<'_, '_>, lints: &LintSet) -> bool {
+    cx.any_may_fire(lints)
+}
+
+/// The builtin lints `names`, as a set made at compile time: a name of no builtin lint fails
+/// to compile.
+pub(crate) const fn lint_set<const N: usize>(names: [&str; N]) -> LintSet {
+    let mut ids = [LintId::WARNINGS; N];
+    let mut at = 0;
+    while at < N {
+        ids[at] = LintId::named(names[at]);
+        at += 1;
+    }
+    LintSet::of(&ids)
+}
+
+/// Which passes of [`before_abort`] run in the crate: those one of whose lints may fire.
+#[derive(Clone, Copy)]
+struct Runs {
+    reachable: bool,
+    patterns: bool,
+    unsafety: bool,
+    recursion: bool,
+    liveness: bool,
+    panics: bool,
+}
+
+impl Runs {
+    fn of(cx: &Cx<'_, '_>) -> Runs {
+        Runs {
+            reachable: may_fire(cx, &reachable::LINTS),
+            patterns: may_fire(cx, &patterns::LINTS),
+            unsafety: may_fire(cx, &unsafety::LINTS),
+            recursion: may_fire(cx, &recursion::LINTS),
+            liveness: may_fire(cx, &liveness::LINTS),
+            panics: may_fire(cx, &panics::LINTS),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.reachable || self.patterns || self.unsafety || self.recursion || self.liveness || self.panics
+    }
+}
+
+/// The buffers a body's [`BodyCx::exprs`] and [`BodyCx::path_value`] are built in, handed
+/// from body to body so that a crate's bodies grow them to the largest body's size once.
+#[derive(Default)]
+pub(crate) struct Scratch {
+    exprs: Vec<ExprId>,
+    stack: Vec<ExprId>,
+    values: FxHashMap<ExprId, Option<ValueNs>>,
 }
 
 /// One body being linted, with what it was lowered to and inferred as.
@@ -101,20 +201,23 @@ pub(crate) struct BodyCx<'a, 'db> {
     pub(crate) body: &'db Body,
     pub(crate) source_map: &'db BodySourceMap,
     pub(crate) infer: &'db InferenceResult<'db>,
-    /// rustc's `tainted_by_errors`: type checking the body gave an error, or AST lowering gave
-    /// it an error expression or loop destination, so rustc builds no THIR of it and runs none
-    /// of its MIR lints (match checking, unsafety, liveness, known panics).
-    pub(crate) tainted: bool,
-    /// rustc's `mir_built` is `construct_error`'s body, with no lint to give: `tainted`, or
-    /// match checking failed (E0004, E0005), which leaves unsafety checking of the THIR.
-    pub(crate) mir_tainted: bool,
     /// rustc runs `mir_drops_elaborated_and_const_checked` on the body before it aborts, so
     /// its lints (the known-panics lint, a `Drop` impl's `unconditional_recursion`): it makes
     /// code, or the body is in a const context. Set by [`before_abort`].
     pub(crate) elaborated: bool,
+    /// [`BodyCx::tainted`] and [`BodyCx::mir_tainted`], once asked.
+    tainted: Cell<Option<bool>>,
+    mir_tainted: Cell<Option<bool>>,
+    /// [`BodyCx::mir`] and [`BodyCx::runtime_mir`], once asked: one query fetch per body.
+    mir: OnceCell<Option<&'db MirBody<'db>>>,
+    runtime_mir: OnceCell<Option<&'db MirBody<'db>>>,
     /// The expressions of the body in the order rustc visits them, each before those in it;
-    /// those of an anonymous const in it (an array length) are the const's.
-    exprs: Vec<ExprId>,
+    /// those of an anonymous const in it (an array length) are the const's. Built the first
+    /// time a pass asks ([`BodyCx::exprs`]), in `scratch`'s buffers.
+    exprs: OnceCell<Vec<ExprId>>,
+    /// What each path asked of [`BodyCx::path_value`] names: the passes ask of the same callee.
+    values: RefCell<FxHashMap<ExprId, Option<ValueNs>>>,
+    scratch: Cell<Scratch>,
 }
 
 impl<'a, 'db> BodyCx<'a, 'db> {
@@ -128,10 +231,50 @@ impl<'a, 'db> BodyCx<'a, 'db> {
             return None;
         }
         let infer = InferenceResult::of(db, owner);
-        let tainted = infer.diagnostics().iter().any(taints) || lowering_failed(db, source_map);
-        let mir_tainted = tainted || DefWithBody::from(owner).match_check_failed(db);
-        let exprs = preorder(&body.store, body.root_expr());
-        Some(BodyCx { cx, owner, body, source_map, infer, tainted, mir_tainted, elaborated: false, exprs })
+        Some(BodyCx {
+            cx,
+            owner,
+            body,
+            source_map,
+            infer,
+            elaborated: false,
+            tainted: Cell::new(None),
+            mir_tainted: Cell::new(None),
+            mir: OnceCell::new(),
+            runtime_mir: OnceCell::new(),
+            exprs: OnceCell::new(),
+            values: RefCell::new(FxHashMap::default()),
+            scratch: Cell::new(Scratch::default()),
+        })
+    }
+
+    /// Builds [`BodyCx::exprs`] and [`BodyCx::path_value`] in `scratch`'s buffers, those of
+    /// the body linted before.
+    fn lend(&mut self, mut scratch: Scratch) {
+        scratch.values.clear();
+        *self.values.get_mut() = std::mem::take(&mut scratch.values);
+        *self.scratch.get_mut() = scratch;
+    }
+
+    /// The buffers back, for the next body.
+    fn into_scratch(self) -> Scratch {
+        let mut scratch = self.scratch.into_inner();
+        if let Some(exprs) = self.exprs.into_inner() {
+            scratch.exprs = exprs;
+        }
+        scratch.values = self.values.into_inner();
+        scratch
+    }
+
+    /// What the path `expr` names in the value namespace, `resolve`d the first time it is asked
+    /// of the body. `resolve` must not ask it again.
+    pub(crate) fn path_value(&self, expr: ExprId, resolve: impl FnOnce() -> Option<ValueNs>) -> Option<ValueNs> {
+        if let Some(&value) = self.values.borrow().get(&expr) {
+            return value;
+        }
+        let value = resolve();
+        self.values.borrow_mut().insert(expr, value);
+        value
     }
 
     pub(crate) fn db(&self) -> &'db Db {
@@ -142,9 +285,38 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         &self.body.store
     }
 
+    /// rustc's `tainted_by_errors`: type checking the body gave an error, or AST lowering gave
+    /// it an error expression or loop destination, so rustc builds no THIR of it and runs none
+    /// of its MIR lints (match checking, unsafety, liveness, known panics).
+    pub(crate) fn tainted(&self) -> bool {
+        if let Some(tainted) = self.tainted.get() {
+            return tainted;
+        }
+        let tainted = self.infer.diagnostics().iter().any(taints) || lowering_failed(self.db(), self.source_map);
+        self.tainted.set(Some(tainted));
+        tainted
+    }
+
+    /// rustc's `mir_built` is `construct_error`'s body, with no lint to give: `tainted`, or
+    /// match checking failed (E0004, E0005), which leaves unsafety checking of the THIR.
+    pub(crate) fn mir_tainted(&self) -> bool {
+        if let Some(tainted) = self.mir_tainted.get() {
+            return tainted;
+        }
+        let tainted = self.tainted() || DefWithBody::from(self.owner).match_check_failed(self.db());
+        self.mir_tainted.set(Some(tainted));
+        tainted
+    }
+
     /// The expressions of the body, each before those in it, in the order rustc visits them.
     pub(crate) fn exprs(&self) -> &[ExprId] {
-        &self.exprs
+        self.exprs.get_or_init(|| {
+            let Scratch { mut exprs, mut stack, values } = self.scratch.take();
+            preorder(self.store(), self.body.root_expr(), &mut exprs, &mut stack);
+            // alloc: an empty `Vec` allocates nothing; the scratch's buffer is put back after.
+            self.scratch.set(Scratch { exprs: Vec::new(), stack, values });
+            exprs
+        })
     }
 
     /// The node `expr` is written as, if it is written (not made by lowering).
@@ -203,12 +375,12 @@ impl<'a, 'db> BodyCx<'a, 'db> {
 
     /// The MIR the body is built to, before rustc's runtime passes, if it can be built.
     pub(crate) fn mir(&self) -> Option<&'db MirBody<'db>> {
-        self.db().mir_body(InferBodyId::DefWithBodyId(self.owner)).ok()
+        *self.mir.get_or_init(|| self.db().mir_body(InferBodyId::DefWithBodyId(self.owner)).ok())
     }
 
     /// The MIR of the body after drop elaboration (`MirPhase::Runtime`), if it can be built.
     pub(crate) fn runtime_mir(&self) -> Option<&'db MirBody<'db>> {
-        self.db().runtime_mir_body(InferBodyId::DefWithBodyId(self.owner)).ok()
+        *self.runtime_mir.get_or_init(|| self.db().runtime_mir_body(InferBodyId::DefWithBodyId(self.owner)).ok())
     }
 
     /// rustc's `hir_body_const_context` is some: a const, a static, a discriminant or a
@@ -308,18 +480,19 @@ impl<'a, 'db> BodyCx<'a, 'db> {
 
 /// The expressions from `root` down, in rustc's order ([`Late`]'s): one pass over an explicit
 /// stack, each node's children pushed and then reversed in place, so nothing is allocated per
-/// node and deep bodies need no native stack. Both buffers are sized from the store's count.
-fn preorder(store: &ExpressionStore, root: ExprId) -> Vec<ExprId> {
-    let mut out = Vec::with_capacity(store.expr_count());
-    let mut stack = Vec::with_capacity(64);
+/// node and deep bodies need no native stack. Both buffers are the caller's, reused from body
+/// to body; `out` is reserved to the store's count.
+fn preorder(store: &ExpressionStore, root: ExprId, out: &mut Vec<ExprId>, stack: &mut Vec<ExprId>) {
+    out.clear();
+    out.reserve(store.expr_count());
+    stack.clear();
     stack.push(root);
     while let Some(expr) = stack.pop() {
         out.push(expr);
         let start = stack.len();
-        child_exprs(store, expr, &mut stack);
+        child_exprs(store, expr, stack);
         stack[start..].reverse();
     }
-    out
 }
 
 /// Whether rustc's type checking of a body taints it for an inference diagnostic: every one
@@ -443,14 +616,18 @@ fn owner_node(db: &Db, owner: DefWithBodyId) -> InFile<SyntaxNodePtr> {
 
 /// A late lint pass of rustc's, of what it checks in bodies (`rustc_lint::LateLintPass`): each
 /// method is called at each node of each body, before the methods at the nodes in it, as
-/// `LateContextAndPass` calls them. Passes are boxed once per crate, and only [`Passes`]'
-/// per-hook index lists decide who is called at a node.
-pub(crate) trait LatePass {
-    /// rustc's name of the pass (`TypeLimits`), which places it in [`PASS_ORDER`].
-    fn name(&self) -> &'static str;
-    /// The methods below the pass has: the walker calls a method only on the passes whose
-    /// hooks have its bit, so a pass costs nothing at the nodes it does not look at.
-    fn hooks(&self) -> Hooks;
+/// `LateContextAndPass` calls them, but only at the nodes the pass's constants say it looks
+/// at. Its state is made once per crate and reset by [`LatePass::check_body`], not remade per
+/// body.
+pub(crate) trait LatePass: Default {
+    /// The lints the pass gives: it doesn't run in a crate where none of them may fire.
+    const LINTS: LintSet;
+    /// The methods below, other than `check_expr` and `check_pat`, the pass has.
+    const HOOKS: Hooks = Hooks::NONE;
+    /// The kinds of expression `check_expr` is called at.
+    const EXPRS: ExprKinds = ExprKinds::NONE;
+    /// The kinds of pattern `check_pat` is called at.
+    const PATS: PatKinds = PatKinds::NONE;
     /// The body, before anything in it.
     fn check_body(&mut self, _b: &BodyCx<'_, '_>, _out: &mut Vec<Found>) {}
     fn check_expr(&mut self, _b: &BodyCx<'_, '_>, _expr: ExprId, _out: &mut Vec<Found>) {}
@@ -463,116 +640,386 @@ pub(crate) trait LatePass {
     fn check_pat(&mut self, _b: &BodyCx<'_, '_>, _pat: PatId, _out: &mut Vec<Found>) {}
 }
 
-/// Which of [`LatePass`]'s `check_*` methods a pass has, a bit each.
+/// Which of [`LatePass`]'s `check_body`, `check_stmt`, `check_local` and `check_arm` a pass
+/// has, a bit each.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Hooks(u8);
 
 impl Hooks {
+    pub(crate) const NONE: Hooks = Hooks(0);
     pub(crate) const BODY: Hooks = Hooks(1 << 0);
-    pub(crate) const EXPR: Hooks = Hooks(1 << 1);
-    pub(crate) const STMT: Hooks = Hooks(1 << 2);
-    pub(crate) const LOCAL: Hooks = Hooks(1 << 3);
-    pub(crate) const ARM: Hooks = Hooks(1 << 4);
-    pub(crate) const PAT: Hooks = Hooks(1 << 5);
+    pub(crate) const STMT: Hooks = Hooks(1 << 1);
+    pub(crate) const LOCAL: Hooks = Hooks(1 << 2);
+    pub(crate) const ARM: Hooks = Hooks(1 << 3);
 
-    fn has(self, hook: Hooks) -> bool {
+    /// Both sets: `const`, as a pass's [`LatePass::HOOKS`] is.
+    pub(crate) const fn and(self, other: Hooks) -> Hooks {
+        Hooks(self.0 | other.0)
+    }
+
+    const fn has(self, hook: Hooks) -> bool {
         self.0 & hook.0 != 0
     }
 }
 
-impl std::ops::BitOr for Hooks {
-    type Output = Hooks;
-
-    fn bitor(self, other: Hooks) -> Hooks {
-        Hooks(self.0 | other.0)
-    }
+/// The tag of an [`Expr`]: one per variant, in variant order, as hir-def's columns number them.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExprTag {
+    Missing,
+    Path,
+    If,
+    Let,
+    Block,
+    Const,
+    Loop,
+    Call,
+    MethodCall,
+    Match,
+    Continue,
+    Break,
+    Return,
+    Become,
+    Yield,
+    Yeet,
+    RecordLit,
+    Field,
+    Await,
+    Cast,
+    Ref,
+    UnaryOp,
+    BinaryOp,
+    Assignment,
+    Index,
+    Closure,
+    Tuple,
+    Array,
+    Literal,
+    Underscore,
+    OffsetOf,
+    InlineAsm,
+    IncludeBytes,
 }
 
-/// The passes, in [`PASS_ORDER`], and for each hook the indices of those that have it, in the
-/// same order: what [`Late`] calls at a node is one slice of `u8`s, built once per crate.
-/// A pass index is a `u8` (at most 64 passes, asserted).
-struct Passes {
-    all: Vec<Box<dyn LatePass>>,
-    body: Vec<u8>,
-    expr: Vec<u8>,
-    stmt: Vec<u8>,
-    local: Vec<u8>,
-    arm: Vec<u8>,
-    pat: Vec<u8>,
-}
+const EXPR_TAGS: usize = ExprTag::IncludeBytes as usize + 1;
 
-const _: () = assert!(PASS_ORDER.len() <= 64);
-
-impl Passes {
-    fn new(all: Vec<Box<dyn LatePass>>) -> Passes {
-        let with = |hook: Hooks| -> Vec<u8> {
-            (0..all.len()).filter(|&i| all[i].hooks().has(hook)).map(|i| i as u8).collect()
-        };
-        Passes {
-            body: with(Hooks::BODY),
-            expr: with(Hooks::EXPR),
-            stmt: with(Hooks::STMT),
-            local: with(Hooks::LOCAL),
-            arm: with(Hooks::ARM),
-            pat: with(Hooks::PAT),
-            all,
+impl ExprTag {
+    /// A `match` on the decoded variant, which compiles to its discriminant.
+    #[inline]
+    pub(crate) fn of(expr: &Expr<'_>) -> ExprTag {
+        match expr {
+            Expr::Missing => ExprTag::Missing,
+            Expr::Path(_) => ExprTag::Path,
+            Expr::If { .. } => ExprTag::If,
+            Expr::Let { .. } => ExprTag::Let,
+            Expr::Block { .. } => ExprTag::Block,
+            Expr::Const(_) => ExprTag::Const,
+            Expr::Loop { .. } => ExprTag::Loop,
+            Expr::Call { .. } => ExprTag::Call,
+            Expr::MethodCall { .. } => ExprTag::MethodCall,
+            Expr::Match { .. } => ExprTag::Match,
+            Expr::Continue { .. } => ExprTag::Continue,
+            Expr::Break { .. } => ExprTag::Break,
+            Expr::Return { .. } => ExprTag::Return,
+            Expr::Become { .. } => ExprTag::Become,
+            Expr::Yield { .. } => ExprTag::Yield,
+            Expr::Yeet { .. } => ExprTag::Yeet,
+            Expr::RecordLit { .. } => ExprTag::RecordLit,
+            Expr::Field { .. } => ExprTag::Field,
+            Expr::Await { .. } => ExprTag::Await,
+            Expr::Cast { .. } => ExprTag::Cast,
+            Expr::Ref { .. } => ExprTag::Ref,
+            Expr::UnaryOp { .. } => ExprTag::UnaryOp,
+            Expr::BinaryOp { .. } => ExprTag::BinaryOp,
+            Expr::Assignment { .. } => ExprTag::Assignment,
+            Expr::Index { .. } => ExprTag::Index,
+            Expr::Closure { .. } => ExprTag::Closure,
+            Expr::Tuple { .. } => ExprTag::Tuple,
+            Expr::Array(_) => ExprTag::Array,
+            Expr::Literal(_) => ExprTag::Literal,
+            Expr::Underscore => ExprTag::Underscore,
+            Expr::OffsetOf(_) => ExprTag::OffsetOf,
+            Expr::InlineAsm(_) => ExprTag::InlineAsm,
+            Expr::IncludeBytes => ExprTag::IncludeBytes,
         }
     }
 }
 
-/// The late passes of rustc's that look at bodies, in the order `BuiltinCombinedLateLintModPass`
-/// lists them, which is the order rustc gives their lints at one node.
-const PASS_ORDER: &[&str] = &[
-    "ForLoopsOverFallibles",
-    "DropForgetUseless",
-    "InvalidFromUtf8",
-    "PathStatements",
-    "LetUnderscore",
-    "InvalidReferenceCasting",
-    "ImplicitAutorefs",
-    "UnusedResults",
-    "UnitBindings",
-    "NonShorthandFieldPatterns",
-    "UnusedAllocation",
-    "PtrNullChecks",
-    "MutableTransmutes",
-    "TypeLimits",
-    "InvalidValue",
-    "DerefNullPtr",
-    "ShadowedIntoIter",
-    "DanglingPointers",
-    "NonPanicFmt",
-    "NoopMethodCall",
-    "EnumIntrinsicsNonEnums",
-    "InvalidAtomicOrdering",
-    "AsmLabels",
-    "MapUnitFn",
-    "InteriorMutableConsts",
-    "IfLetRescope",
-    "StaticMutRefs",
-    "FunctionCastsAsInteger",
-    "CheckTransmutes",
-    "ImplicitProvenanceCasts",
-    "RawBorrowsViaReferences",
-];
+/// A set of [`ExprTag`]s, a bit each.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ExprKinds(u64);
 
-/// Every late pass of the children, in rustc's order, indexed by hook.
-fn late_passes() -> Passes {
-    let mut passes: Vec<Box<dyn LatePass>> = Vec::new();
-    passes.extend(types::passes());
-    passes.extend(calls::passes());
-    let place = |pass: &Box<dyn LatePass>| {
-        let name = pass.name();
-        PASS_ORDER
-            .iter()
-            .position(|it| *it == name)
-            .unwrap_or_else(|| panic!("the late pass `{name}` is not in `PASS_ORDER`"))
-    };
-    radix::sort_by_key(&mut passes, |it| place(it));
-    Passes::new(passes)
+impl ExprKinds {
+    pub(crate) const NONE: ExprKinds = ExprKinds(0);
+
+    pub(crate) const fn of(tags: &[ExprTag]) -> ExprKinds {
+        let mut bits = 0u64;
+        let mut at = 0;
+        while at < tags.len() {
+            bits |= 1u64 << tags[at] as u8;
+            at += 1;
+        }
+        ExprKinds(bits)
+    }
+
+    const fn has(self, tag: usize) -> bool {
+        self.0 & (1u64 << tag) != 0
+    }
 }
 
-/// rustc's `LateContextAndPass` over one body: every pass at each node, in its visitor's order.
+/// The tag of a [`Pat`], one per variant, in variant order.
+#[repr(u8)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PatTag {
+    Missing,
+    Rest,
+    Wild,
+    Tuple,
+    Or,
+    Record,
+    Range,
+    Slice,
+    Path,
+    Lit,
+    Bind,
+    TupleStruct,
+    Ref,
+    Box,
+    Deref,
+    NotNull,
+    Expr,
+}
+
+const PAT_TAGS: usize = PatTag::Expr as usize + 1;
+
+impl PatTag {
+    #[inline]
+    pub(crate) fn of(pat: &Pat<'_>) -> PatTag {
+        match pat {
+            Pat::Missing => PatTag::Missing,
+            Pat::Rest => PatTag::Rest,
+            Pat::Wild => PatTag::Wild,
+            Pat::Tuple { .. } => PatTag::Tuple,
+            Pat::Or(_) => PatTag::Or,
+            Pat::Record { .. } => PatTag::Record,
+            Pat::Range { .. } => PatTag::Range,
+            Pat::Slice { .. } => PatTag::Slice,
+            Pat::Path(_) => PatTag::Path,
+            Pat::Lit(_) => PatTag::Lit,
+            Pat::Bind { .. } => PatTag::Bind,
+            Pat::TupleStruct { .. } => PatTag::TupleStruct,
+            Pat::Ref { .. } => PatTag::Ref,
+            Pat::Box { .. } => PatTag::Box,
+            Pat::Deref { .. } => PatTag::Deref,
+            Pat::NotNull => PatTag::NotNull,
+            Pat::Expr(_) => PatTag::Expr,
+        }
+    }
+}
+
+/// A set of [`PatTag`]s, a bit each.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct PatKinds(u32);
+
+impl PatKinds {
+    pub(crate) const NONE: PatKinds = PatKinds(0);
+
+    pub(crate) const fn of(tags: &[PatTag]) -> PatKinds {
+        let mut bits = 0u32;
+        let mut at = 0;
+        while at < tags.len() {
+            bits |= 1u32 << tags[at] as u8;
+            at += 1;
+        }
+        PatKinds(bits)
+    }
+
+    const fn has(self, tag: usize) -> bool {
+        self.0 & (1u32 << tag) != 0
+    }
+}
+
+/// The late passes: one variant of [`Pass`] each, listed in the order
+/// `BuiltinCombinedLateLintModPass` lists them, which is the order rustc gives their lints at
+/// one node. A call into one is a `match` on the variant that the compiler can inline, and
+/// their constants are tables indexed by the variant's position.
+macro_rules! late_passes {
+    ($($pass:ident: $ty:ty,)*) => {
+        enum Pass {
+            $($pass($ty),)*
+        }
+
+        const PASSES: usize = [$(stringify!($pass),)*].len();
+
+        /// Of each pass, by its index: [`LatePass::LINTS`], `HOOKS`, `EXPRS` and `PATS`.
+        const PASS_LINTS: [LintSet; PASSES] = [$(<$ty as LatePass>::LINTS,)*];
+        const PASS_HOOKS: [Hooks; PASSES] = [$(<$ty as LatePass>::HOOKS,)*];
+        const PASS_EXPRS: [ExprKinds; PASSES] = [$(<$ty as LatePass>::EXPRS,)*];
+        const PASS_PATS: [PatKinds; PASSES] = [$(<$ty as LatePass>::PATS,)*];
+
+        impl Pass {
+            fn all() -> [Pass; PASSES] {
+                [$(Pass::$pass(<$ty>::default()),)*]
+            }
+
+            fn check_body(&mut self, b: &BodyCx<'_, '_>, out: &mut Vec<Found>) {
+                match self {
+                    $(Pass::$pass(it) => it.check_body(b, out),)*
+                }
+            }
+
+            fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
+                match self {
+                    $(Pass::$pass(it) => it.check_expr(b, expr, out),)*
+                }
+            }
+
+            fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+                match self {
+                    $(Pass::$pass(it) => it.check_stmt(b, block, index, out),)*
+                }
+            }
+
+            fn check_local(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
+                match self {
+                    $(Pass::$pass(it) => it.check_local(b, block, index, out),)*
+                }
+            }
+
+            fn check_arm(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, index: usize, out: &mut Vec<Found>) {
+                match self {
+                    $(Pass::$pass(it) => it.check_arm(b, expr, index, out),)*
+                }
+            }
+
+            fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, out: &mut Vec<Found>) {
+                match self {
+                    $(Pass::$pass(it) => it.check_pat(b, pat, out),)*
+                }
+            }
+        }
+    };
+}
+
+late_passes! {
+    ForLoopsOverFallibles: calls::desugar::for_loops_over_fallibles::ForLoopsOverFallibles,
+    DropForgetUseless: calls::items::drop_forget_useless::DropForgetUseless,
+    InvalidFromUtf8: calls::items::invalid_from_utf8::InvalidFromUtf8,
+    PathStatements: calls::statements::PathStatements,
+    LetUnderscore: calls::statements::LetUnderscore,
+    InvalidReferenceCasting: types::pointers::reference_casting::InvalidReferenceCasting,
+    ImplicitAutorefs: types::pointers::autorefs::ImplicitAutorefs,
+    UnusedResults: calls::statements::UnusedResults,
+    UnitBindings: calls::statements::UnitBindings,
+    NonShorthandFieldPatterns: calls::statements::NonShorthandFieldPatterns,
+    UnusedAllocation: calls::statements::UnusedAllocation,
+    PtrNullChecks: types::pointers::ptr_nulls::PtrNullChecks,
+    MutableTransmutes: types::values::transmutes::MutableTransmutes,
+    TypeLimits: types::limits::TypeLimits,
+    InvalidValue: types::values::invalid::InvalidValue,
+    DerefNullPtr: types::pointers::deref_null::DerefNullPtr,
+    ShadowedIntoIter: calls::desugar::shadowed_into_iter::ShadowedIntoIter,
+    DanglingPointers: types::pointers::dangling::DanglingPointers,
+    NonPanicFmt: calls::methods::non_fmt_panic::NonPanicFmt,
+    NoopMethodCall: calls::methods::noop_method_call::NoopMethodCall,
+    EnumIntrinsicsNonEnums: types::values::intrinsics::EnumIntrinsicsNonEnums,
+    InvalidAtomicOrdering: calls::items::invalid_atomic_ordering::InvalidAtomicOrdering,
+    AsmLabels: calls::methods::asm_labels::AsmLabels,
+    MapUnitFn: calls::methods::map_unit_fn::MapUnitFn,
+    InteriorMutableConsts: types::values::interior::InteriorMutableConsts,
+    IfLetRescope: calls::desugar::if_let_rescope::IfLetRescope,
+    StaticMutRefs: types::casts::static_mut_refs::StaticMutRefs,
+    FunctionCastsAsInteger: types::casts::function_casts::FunctionCastsAsInteger,
+    CheckTransmutes: types::values::transmutes::CheckTransmutes,
+    ImplicitProvenanceCasts: types::casts::provenance::ImplicitProvenanceCasts,
+    RawBorrowsViaReferences: types::casts::raw_borrows::RawBorrowsViaReferences,
+}
+
+const _: () = assert!(PASSES <= u8::MAX as usize);
+
+/// Indices of passes, in [`Pass`]'s order: those a hook calls. A fixed array, so the tables
+/// are built without allocating.
+#[derive(Clone, Copy)]
+struct Ids {
+    len: u8,
+    at: [u8; PASSES],
+}
+
+impl Ids {
+    const EMPTY: Ids = Ids { len: 0, at: [0; PASSES] };
+
+    fn push(&mut self, pass: u8) {
+        self.at[usize::from(self.len)] = pass;
+        self.len += 1;
+    }
+
+    #[inline]
+    fn ids(&self) -> &[u8] {
+        &self.at[..usize::from(self.len)]
+    }
+}
+
+/// The passes, and for each hook, expression tag and pattern tag the indices of the passes that
+/// run there, in rustc's order: what [`Late`] calls at a node is the slice its tag indexes.
+/// Built once per crate; a pass none of whose lints may fire is in no list.
+struct Passes {
+    all: [Pass; PASSES],
+    body: Ids,
+    stmt: Ids,
+    local: Ids,
+    arm: Ids,
+    expr: [Ids; EXPR_TAGS],
+    pat: [Ids; PAT_TAGS],
+    /// Whether any pass runs.
+    any: bool,
+}
+
+impl Passes {
+    fn new(cx: &Cx<'_, '_>) -> Passes {
+        let mut passes = Passes {
+            all: Pass::all(),
+            body: Ids::EMPTY,
+            stmt: Ids::EMPTY,
+            local: Ids::EMPTY,
+            arm: Ids::EMPTY,
+            expr: [Ids::EMPTY; EXPR_TAGS],
+            pat: [Ids::EMPTY; PAT_TAGS],
+            any: false,
+        };
+        for index in 0..PASSES {
+            if !may_fire(cx, &PASS_LINTS[index]) {
+                continue;
+            }
+            passes.any = true;
+            let id = index as u8;
+            let hooks = PASS_HOOKS[index];
+            for (hook, ids) in [
+                (Hooks::BODY, &mut passes.body),
+                (Hooks::STMT, &mut passes.stmt),
+                (Hooks::LOCAL, &mut passes.local),
+                (Hooks::ARM, &mut passes.arm),
+            ] {
+                if hooks.has(hook) {
+                    ids.push(id);
+                }
+            }
+            for (tag, ids) in passes.expr.iter_mut().enumerate() {
+                if PASS_EXPRS[index].has(tag) {
+                    ids.push(id);
+                }
+            }
+            for (tag, ids) in passes.pat.iter_mut().enumerate() {
+                if PASS_PATS[index].has(tag) {
+                    ids.push(id);
+                }
+            }
+        }
+        passes
+    }
+}
+
+/// rustc's `LateContextAndPass` over one body, in its visitor's order: at each node, the passes
+/// its tag's list names. Each node is decoded once, for its tag and its children.
 struct Late<'s, 'a, 'db> {
     b: &'s BodyCx<'a, 'db>,
     passes: &'s mut Passes,
@@ -583,7 +1030,7 @@ impl Late<'_, '_, '_> {
     fn body(&mut self) {
         let b = self.b;
         let Passes { all, body, .. } = &mut *self.passes;
-        for &i in body.iter() {
+        for &i in body.ids() {
             all[usize::from(i)].check_body(b, self.out);
         }
         for param in b.body.params.iter() {
@@ -594,17 +1041,18 @@ impl Late<'_, '_, '_> {
 
     fn expr(&mut self, expr: ExprId) {
         let b = self.b;
+        let decoded = b.store().expr(expr);
         let Passes { all, expr: on, .. } = &mut *self.passes;
-        for &i in on.iter() {
+        for &i in on[ExprTag::of(&decoded) as usize].ids() {
             all[usize::from(i)].check_expr(b, expr, self.out);
         }
-        stdx::ensure_sufficient_stack(|| self.expr_children(expr));
+        stdx::ensure_sufficient_stack(|| self.expr_children(expr, decoded));
     }
 
-    fn expr_children(&mut self, expr: ExprId) {
+    fn expr_children(&mut self, expr: ExprId, decoded: Expr<'_>) {
         let b = self.b;
         let store = b.store();
-        match store.expr(expr) {
+        match decoded {
             Expr::Let { pat, expr } => {
                 self.expr(expr);
                 self.pat(pat);
@@ -615,13 +1063,13 @@ impl Late<'_, '_, '_> {
                         continue;
                     }
                     let Passes { all, stmt, .. } = &mut *self.passes;
-                    for &i in stmt.iter() {
+                    for &i in stmt.ids() {
                         all[usize::from(i)].check_stmt(b, expr, index, self.out);
                     }
                     match statement {
                         Statement::Let { pat, initializer, else_branch, .. } => {
                             let Passes { all, local, .. } = &mut *self.passes;
-                            for &i in local.iter() {
+                            for &i in local.ids() {
                                 all[usize::from(i)].check_local(b, expr, index, self.out);
                             }
                             if let Some(it) = initializer {
@@ -644,7 +1092,7 @@ impl Late<'_, '_, '_> {
                 self.expr(scrutinee);
                 for (index, arm) in arms.iter().enumerate() {
                     let Passes { all, arm: on, .. } = &mut *self.passes;
-                    for &i in on.iter() {
+                    for &i in on.ids() {
                         all[usize::from(i)].check_arm(b, expr, index, self.out);
                     }
                     self.pat(arm.pat);
@@ -673,12 +1121,13 @@ impl Late<'_, '_, '_> {
 
     fn pat(&mut self, pat: PatId) {
         let b = self.b;
+        let store = b.store();
+        let decoded = store.pat(pat);
         let Passes { all, pat: on, .. } = &mut *self.passes;
-        for &i in on.iter() {
+        for &i in on[PatTag::of(&decoded) as usize].ids() {
             all[usize::from(i)].check_pat(b, pat, self.out);
         }
-        let store = b.store();
-        match store.pat(pat) {
+        match decoded {
             Pat::Lit(expr) | Pat::Expr(expr) => self.expr(expr),
             Pat::Range { start, end, .. } => {
                 if let Some(it) = start {

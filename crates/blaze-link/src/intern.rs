@@ -502,6 +502,7 @@ mod tests {
             side: None,
             unwind: None,
             lines: Vec::new(),
+            coverage: None,
         }
     }
 

@@ -103,6 +103,7 @@ fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
         Address::Unix(name) => {
             let path = std::path::absolute(root.join(name.as_str()))?;
             let text = path.to_str().ok_or_else(|| {
+                // alloc: an error path.
                 io::Error::new(io::ErrorKind::InvalidInput, format!("{}: not Unicode", path.display()))
             })?;
             // SAFETY: `SOCKADDR_STORAGE` is large and aligned enough for any address.
@@ -110,6 +111,7 @@ fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
             if text.len() >= un.sun_path.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
+                    // alloc: an error path.
                     format!("{text}: longer than a socket's path may be"),
                 ));
             }
@@ -122,6 +124,7 @@ fn sockaddr(root: &Path, at: &Address) -> io::Result<SockAddr> {
         Address::Inherited { fd, at } => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
+                // alloc: an error path.
                 format!("the socket {at} passed as fd {fd}: socket activation is systemd's and launchd's, and Windows has neither"),
             ));
         }
@@ -208,6 +211,7 @@ pub(super) fn listen(root: &Path, at: &Address) -> io::Result<Listener> {
                 if connect_blocking(root, at).is_ok() {
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
+                        // alloc: an error path.
                         format!("{}: something listens on it already", path.display()),
                     ));
                 }
@@ -428,10 +432,17 @@ pub(super) fn connect_blocking(root: &Path, at: &Address) -> io::Result<OwnedSoc
     Ok(socket)
 }
 
-/// A receive into `bytes`, completing through `overlapped`; both, and `flags` (which Winsock
-/// may write as it completes), are the request's, kept until its completion is taken.
-pub(super) fn recv(socket: SOCKET, bytes: &mut [u8], flags: *mut u32, overlapped: *mut OVERLAPPED) -> io::Result<()> {
-    let buffer = WSABUF { len: bytes.len().min(u32::MAX as usize) as u32, buf: bytes.as_mut_ptr() };
+/// A receive into the `len` bytes at `into` (which need not be initialized: the kernel only
+/// writes them), completing through `overlapped`; they, and `flags` (which Winsock may write as
+/// it completes), are the request's, kept until its completion is taken.
+pub(super) fn recv(
+    socket: SOCKET,
+    into: *mut u8,
+    len: usize,
+    flags: *mut u32,
+    overlapped: *mut OVERLAPPED,
+) -> io::Result<()> {
+    let buffer = WSABUF { len: len.min(u32::MAX as usize) as u32, buf: into };
     // SAFETY: the request's flags, which nothing reads or writes while no receive is in flight.
     unsafe { flags.write(0) };
     // SAFETY: an open socket; Winsock takes the `WSABUF` before it returns, and the bytes it

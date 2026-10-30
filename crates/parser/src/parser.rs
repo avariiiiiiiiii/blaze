@@ -1,6 +1,6 @@
 //! See [`Parser`].
 
-use std::num::NonZeroU32;
+use std::{borrow::Cow, num::NonZeroU32};
 
 use crate::{
     Edition,
@@ -35,7 +35,7 @@ pub(crate) struct Parser<'t> {
     events: blaze_mem::scratch::Lent<Events>,
     /// Side table of error messages. `Event::Error { err }` carries an index
     /// into this vec, keeping `Event` itself a flat 8-byte enum.
-    errors: Vec<String>,
+    errors: Vec<Cow<'static, str>>,
     /// Nodes started and errors made since the last token was consumed. A loop that consumes
     /// nothing still starts a node or makes an error each turn (or asks to bump at `EOF`), so
     /// counting those, and not every kind test, catches it.
@@ -86,7 +86,7 @@ impl<'t> Parser<'t> {
         self.outline = outline;
     }
 
-    pub(crate) fn finish(self) -> (blaze_mem::scratch::Lent<Events>, Vec<String>) {
+    pub(crate) fn finish(self) -> (blaze_mem::scratch::Lent<Events>, Vec<Cow<'static, str>>) {
         (self.events, self.errors)
     }
 
@@ -309,7 +309,8 @@ impl<'t> Parser<'t> {
     ///
     /// A failed [`Parser::expect`] and every path of [`Parser::err_recover`] come through
     /// here, so each counts as a step.
-    pub(crate) fn error<T: Into<String>>(&mut self, message: T) {
+    /// A fixed message is kept borrowed; only a formatted one is an owned `String`.
+    pub(crate) fn error<T: Into<Cow<'static, str>>>(&mut self, message: T) {
         self.step();
         let err = self.errors.len() as u32;
         self.errors.push(message.into());
@@ -327,7 +328,7 @@ impl<'t> Parser<'t> {
     }
 
     /// Create an error node and consume the next token.
-    pub(crate) fn err_and_bump(&mut self, message: &str) {
+    pub(crate) fn err_and_bump(&mut self, message: &'static str) {
         let m = self.start();
         self.error(message);
         self.bump_any();
@@ -337,7 +338,7 @@ impl<'t> Parser<'t> {
     /// Create an error node and consume the next token unless it is in the recovery set.
     ///
     /// Returns true if recovery kicked in.
-    pub(crate) fn err_recover(&mut self, message: &str, recovery: TokenSet) -> bool {
+    pub(crate) fn err_recover(&mut self, message: &'static str, recovery: TokenSet) -> bool {
         if matches!(self.current(), T!['{'] | T!['}']) {
             self.error(message);
             return true;

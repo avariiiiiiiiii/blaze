@@ -39,7 +39,7 @@ use super::{
     macros,
     ops::{DeclOp, ImportOp, ImportSource, MacroOp, OpLog},
     queries::{
-        self, CrateEnvKey, FactKey, MacroStep, ModuleRound, ModuleRow, RoundKey, RoundKind,
+        self, CrateEnvKey, FactKey, ModuleRound, ModuleRow, NO_ROUND, RoundKey, RoundKind,
         RoundModules, RoundOutcome, SccKey, SccState, Scope,
     },
     unit::Unit,
@@ -52,13 +52,16 @@ const FIXED_POINT_LIMIT: u32 = 8192;
 
 /// Every module of the round in the round's module order: round 0's DFS preorder of
 /// `module_decls` from the root (the old map's insertion order), then each later round's new
-/// modules in the order their steps declared them, steps in module order.
+/// modules in the order their steps declared them, steps in module order. With them, the
+/// round's active set (`nameres-core.md` §9): read off the steps of the round before that ran,
+/// so a module no step touched costs a copy of its columns and no query.
 pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
     let krate = round.krate(db);
     let r = round.round(db);
     if r == 0 {
         let mut order = Vec::new(); // alloc: the round's value, once per crate.
         let mut rows = Vec::new(); // alloc: as `order`.
+        let mut flags = Vec::new(); // alloc: as `order`.
         let mut index = FxHashMap::default();
         let mut stack = vec![queries::root_decl(db, krate)]; // alloc: the walk's stack, once per crate.
         while let Some(key) = stack.pop() {
@@ -73,24 +76,61 @@ pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
                 since: 0,
                 decl: Some(key),
             });
-            stack.extend(queries::module_decls(db, key).children.iter().rev().copied());
+            let decls = queries::module_decls(db, key);
+            // Round 0 is `Normal`: a module with a directive steps.
+            flags.push(match has_directive(&decls.ops, decl.module) {
+                true => RoundModules::GAINS | RoundModules::PENDING | RoundModules::STEP,
+                false => RoundModules::GAINS,
+            });
+            stack.extend(decls.children.iter().rev().copied());
         }
+        let n = order.len();
         return RoundModules {
             order: order.into_boxed_slice(),
             rows: rows.into_boxed_slice(),
             index,
+            flags: flags.into_boxed_slice(),
+            // alloc: the round's columns, once per crate.
+            active: (0..n as u32).collect(),
+            // alloc: as `active`.
+            last_step: vec![NO_ROUND; n].into_boxed_slice(),
+            // alloc: as `active`.
+            ran: vec![NO_ROUND; n].into_boxed_slice(),
+            // alloc: as `active`.
+            since: vec![NO_ROUND; n].into_boxed_slice(),
         };
     }
 
-    let previous = queries::round_modules(db, RoundKey::new(db, krate, r - 1));
+    let before = RoundKey::new(db, krate, r - 1);
+    let previous = queries::round_modules(db, before);
+    let root = queries::crate_root(db, krate);
     // alloc: a round's order is the round before's plus its new modules: `O(m)` per round.
     let mut order = previous.order.to_vec();
     // clone: a round's table is the round before's plus its new modules: `O(m)` per round.
     let mut rows = previous.rows.to_vec();
     // clone: as `rows`.
     let mut index = previous.index.clone();
-    for &module in previous.order.iter() {
+    // A module that did not step keeps its directives; one that did has what its step left.
+    // alloc: as `order`.
+    let mut flags: Vec<u8> = previous.flags.iter().map(|&it| it & RoundModules::PENDING).collect();
+    // clone: as `rows`.
+    let mut last_step = previous.last_step.to_vec();
+    for at in previous.stepping() {
+        let module = previous.order[at as usize];
         let step = queries::macro_step(db, FactKey::new(db, module, krate, r - 1));
+        last_step[at as usize] = r - 1;
+        let mut own = match step.pending.is_empty() {
+            true => 0,
+            false => RoundModules::PENDING,
+        };
+        for op in step.ops.iter() {
+            match op.target() {
+                Some(target) if target == module && op.is_resolution_op() => own |= RoundModules::GAINS,
+                Some(target) if target == root && module != root => flags[0] |= RoundModules::GAINS,
+                _ => {}
+            }
+        }
+        flags[at as usize] = (flags[at as usize] & RoundModules::GAINS) | own;
         for (new, row) in step.new_modules.iter() {
             debug_assert_eq!(row.since, r, "a module the step of round {} declared", r - 1);
             let fresh = index.insert(*new, order.len() as u32).is_none();
@@ -98,15 +138,90 @@ pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
             order.push(*new);
             // clone: a new module's row, once.
             rows.push(row.clone());
+            flags.push(match has_directive(&step.ops, *new) {
+                true => RoundModules::GAINS | RoundModules::PENDING,
+                false => RoundModules::GAINS,
+            });
+            last_step.push(NO_ROUND);
         }
     }
-    RoundModules { order: order.into_boxed_slice(), rows: rows.into_boxed_slice(), index }
+
+    let kind = queries::round_kind(db, round);
+    match kind {
+        RoundKind::Normal | RoundKind::EagerWithErrors => {
+            for it in flags.iter_mut().filter(|it| **it & RoundModules::PENDING != 0) {
+                *it |= RoundModules::STEP;
+            }
+        }
+        RoundKind::Reseed { module, .. } => {
+            let at = index_of_in(&index, module, r);
+            flags[at as usize] |= RoundModules::STEP;
+        }
+        RoundKind::Final => {}
+    }
+
+    // Where each module of the round before stands after it: the round its component last ran
+    // at, and the round its facts last changed at.
+    let n = previous.order.len();
+    // clone: as `rows`.
+    let mut ran = previous.ran.to_vec();
+    // clone: as `rows`.
+    let mut since = previous.since.to_vec();
+    let active_before = (r > 1).then(|| (queries::round_active(db, before), queries::partition(db, before)));
+    for at in 0..n {
+        let module = previous.order[at];
+        let ran_before = match active_before {
+            Some((active, partition)) => active.runs(partition.of(at as u32)),
+            None => true,
+        };
+        if !ran_before {
+            continue;
+        }
+        ran[at] = r - 1;
+        since[at] = match previous.since(at as u32) {
+            None => r - 1,
+            Some(t) => {
+                let now = queries::fact_handle(db, FactKey::new(db, module, krate, r - 1));
+                match now == queries::fact_handle(db, FactKey::new(db, module, krate, t)) {
+                    true => t,
+                    false => r - 1,
+                }
+            }
+        };
+    }
+    ran.resize(order.len(), NO_ROUND);
+    since.resize(order.len(), NO_ROUND);
+
+    let touched = RoundModules::STEP | RoundModules::GAINS;
+    let active = (0u32..).zip(flags.iter()).filter(|&(_, &it)| it & touched != 0).map(|(at, _)| at);
+    // alloc: the round's active modules, a few.
+    let active = active.collect();
+    RoundModules {
+        order: order.into_boxed_slice(),
+        rows: rows.into_boxed_slice(),
+        index,
+        flags: flags.into_boxed_slice(),
+        active,
+        last_step: last_step.into_boxed_slice(),
+        ran: ran.into_boxed_slice(),
+        since: since.into_boxed_slice(),
+    }
+}
+
+/// Whether `log` holds a macro directive of `module`: what its first step starts from.
+fn has_directive(log: &OpLog, module: ModuleId) -> bool {
+    log.iter().any(|op| matches!(op, DeclOp::Macro(it) if it.module == module))
+}
+
+fn index_of_in(index: &FxHashMap<ModuleId, u32>, module: ModuleId, round: u32) -> u32 {
+    *index.get(&module).unwrap_or_else(|| panic!("nameres facts: {module:?} is not a module of round {round}"))
 }
 
 /// What module `key.module` gains at round `key.round >= 1` (the contract's §3 rule): the
 /// resolution ops its own step of the round before made in it or, for a module that step
 /// declared, the ops of the declaring step with it as their target; then, for the crate root,
-/// the root ops of every other step of that round, steps in module order.
+/// the root ops of every other step of that round, steps in module order. Only the steps that
+/// ran are read: a module that did not step at the round before made no op.
 pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
     let (module, krate, r) = (key.module(db), key.krate(db), key.round(db));
     assert!(r >= 1, "nameres facts: module_round of {module:?} at round 0, whose ops are module_decls'");
@@ -114,17 +229,18 @@ pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
     let row = modules
         .row(module)
         .unwrap_or_else(|| panic!("nameres facts: {module:?} is not a module of round {r}"));
+    let previous = queries::round_modules(db, RoundKey::new(db, krate, r - 1));
     let mut ops = OpLog::default();
     if row.since == r {
         let declarer = declaring_module(modules, module, row, r);
         let step = queries::macro_step(db, FactKey::new(db, declarer, krate, r - 1));
         // clone: every op a module gains is copied once, from the step (a query value read in
         // place) to the module's round.
-        ops.ops.extend(step.ops.iter().filter(|op| op.target() == Some(module)).filter_map(carried_op));
-    } else {
+        ops.extend(step.ops.iter().filter(|op| op.target() == Some(module)).filter_map(carried_op));
+    } else if previous.at(module).is_some_and(|at| previous.steps(at)) {
         let step = queries::macro_step(db, FactKey::new(db, module, krate, r - 1));
         // clone: as above.
-        ops.ops.extend(
+        ops.extend(
             step.ops
                 .iter()
                 .filter(|op| op.target() == Some(module))
@@ -134,8 +250,11 @@ pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
 
     let root = queries::crate_root(db, krate);
     if module == root {
-        let previous = queries::round_modules(db, RoundKey::new(db, krate, r - 1));
-        for &other in previous.order.iter().filter(|&&it| it != root) {
+        for at in previous.stepping() {
+            let other = previous.order[at as usize];
+            if other == root {
+                continue;
+            }
             let step = queries::macro_step(db, FactKey::new(db, other, krate, r - 1));
             for op in step.ops.iter().filter(|op| op.target() == Some(root)) {
                 // clone: a `#[macro_export]` (or proc-macro) op of another module, once.
@@ -208,6 +327,14 @@ pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
     let mut out = Vec::with_capacity(modules.order.len());
     let mut scratch = ShapeScratch::default();
     for (at, (&module, row)) in modules.order.iter().zip(modules.rows.iter()).enumerate() {
+        let before = previous.and_then(|it| it.modules.get(at));
+        if let Some(before) = before
+            && !modules.gains(at as u32)
+        {
+            // clone: a module that gains no op this round keeps its shape.
+            out.push(before.clone());
+            continue;
+        }
         let ops = match r {
             0 => {
                 let key = row.decl.unwrap_or_else(|| {
@@ -217,7 +344,6 @@ pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
             }
             _ => &queries::module_round(db, FactKey::new(db, module, krate, r)).ops,
         };
-        let before = previous.and_then(|it| it.modules.get(at));
         if let Some(before) = before
             && !ops.iter().any(|op| shapes(op, module, root))
         {
@@ -331,7 +457,7 @@ impl ShapeScratch {
 
 /// The crate env the round's units and steps start from: `root_decl`'s env folded with the
 /// root's round-0 log's crate-level ops (round 0), or the round before's folded with the root's
-/// step of that round.
+/// step of that round, if the root stepped.
 pub(crate) fn round_env(db: &Db, round: RoundKey) -> CrateEnvKey {
     let (krate, r) = (round.krate(db), round.round(db));
     if r == 0 {
@@ -339,7 +465,12 @@ pub(crate) fn round_env(db: &Db, round: RoundKey) -> CrateEnvKey {
         let start = root.decl(db).env.env(db).krate;
         return after_all(db, start, &queries::module_decls(db, root).ops);
     }
-    let start = queries::round_env(db, RoundKey::new(db, krate, r - 1));
+    let before = RoundKey::new(db, krate, r - 1);
+    let start = queries::round_env(db, before);
+    // The crate root is the first module of every round.
+    if !queries::round_modules(db, before).steps(0) {
+        return start;
+    }
     let root = queries::crate_root(db, krate);
     after_all(db, start, &queries::macro_step(db, FactKey::new(db, root, krate, r - 1)).ops)
 }
@@ -362,7 +493,8 @@ fn after_all(db: &Db, start: CrateEnvKey, ops: &OpLog) -> CrateEnvKey {
 
 /// The fold of the round's macro steps over its modules in order: whether any made progress or
 /// left an eager call for the error round, and the first attribute left, by module order then
-/// position. A reseed round always makes progress.
+/// position. A reseed round always makes progress. Only the steps that ran are read; a module
+/// that did not step left its directives as they were.
 pub(crate) fn round_progress(db: &Db, round: RoundKey) -> RoundOutcome {
     let (krate, r) = (round.krate(db), round.round(db));
     let kind = queries::round_kind(db, round);
@@ -371,14 +503,24 @@ pub(crate) fn round_progress(db: &Db, round: RoundKey) -> RoundOutcome {
         deferred_eager: false,
         first_attr: None,
     };
-    for &module in queries::round_modules(db, round).order.iter() {
-        let step = queries::macro_step(db, FactKey::new(db, module, krate, r));
+    let modules = queries::round_modules(db, round);
+    for at in modules.stepping() {
+        let step = queries::macro_step(db, FactKey::new(db, modules.order[at as usize], krate, r));
         out.progress |= step.progress;
         out.deferred_eager |= step.deferred_eager;
-        if out.first_attr.is_none()
-            && let Some(index) = macros::first_attr(&step.pending)
-        {
+    }
+    let with_directives = (0u32..).zip(modules.flags.iter()).filter(|&(_, &it)| {
+        it & (RoundModules::STEP | RoundModules::PENDING) != 0
+    });
+    for (at, _) in with_directives {
+        let module = modules.order[at as usize];
+        let index = match modules.steps(at) {
+            true => macros::first_attr(queries::macro_step(db, FactKey::new(db, module, krate, r)).pending.iter()),
+            false => macros::first_attr(macros::Carried::at(db, krate, modules, at).directives()),
+        };
+        if let Some(index) = index {
             out.first_attr = Some((module, index));
+            break;
         }
     }
     out
@@ -414,10 +556,12 @@ pub(crate) fn round_kind(db: &Db, round: RoundKey) -> RoundKind {
 }
 
 /// The row of `module` in the views of the round: its declaration, and its scope as the
-/// round's fact.
+/// round's fact, named by the round it last changed at if its component does not run.
 pub(crate) fn round_row(db: &Db, round: RoundKey, module: ModuleId) -> Option<ModuleData> {
-    let row = queries::round_modules(db, round).row(module)?;
-    let fact = FactKey::new(db, module, round.krate(db), round.round(db));
+    let modules = queries::round_modules(db, round);
+    let at = modules.at(module)?;
+    let row = &modules.rows[at as usize];
+    let fact = queries::fact_key(db, round, at);
     Some(ModuleData {
         origin: row.origin,
         visibility: row.visibility,
@@ -472,7 +616,9 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
         crate_ops.take(&queries::module_decls(db, key).ops);
     }
     for at in 0..r {
-        for &module in queries::round_modules(db, RoundKey::new(db, krate, at)).order.iter() {
+        let modules = queries::round_modules(db, RoundKey::new(db, krate, at));
+        for it in modules.stepping() {
+            let module = modules.order[it as usize];
             crate_ops.take(&queries::macro_step(db, FactKey::new(db, module, krate, at)).ops);
         }
     }
@@ -489,11 +635,14 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
         }
     }
 
+    // The final round steps no module: each has the directives and tables of its last step, or
+    // those it started with.
     let mut derive_helpers_in_scope = FxHashMap::default();
-    let mut pending: Vec<&'db MacroStep> = Vec::new(); // alloc: only when a step left a call.
-    for &module in modules.order.iter() {
-        let step = queries::macro_step(db, FactKey::new(db, module, krate, r));
-        let SideTables { derive_helpers, deferred_derives, .. } = &*step.side;
+    let mut pending: Vec<macros::Carried<'db>> = Vec::new(); // alloc: only when a module left a call.
+    for (at, &module) in (0u32..).zip(modules.order.iter()) {
+        let carried = macros::Carried::at(db, krate, modules, at);
+        let tables = carried.tables();
+        let SideTables { derive_helpers, deferred_derives, .. } = &*tables;
         always!(
             deferred_derives.is_empty(),
             "the deferred builtin derives of {module:?}: {deferred_derives:#?}"
@@ -502,8 +651,8 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
             // clone: the final tables are query values; each helper is copied into the map once.
             derive_helpers_in_scope.entry(item).or_insert_with(Vec::new).extend(helpers.iter().cloned());
         }
-        if !step.pending.is_empty() {
-            pending.push(step);
+        if modules.has_pending(at) {
+            pending.push(carried);
         }
     }
 
@@ -535,8 +684,8 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
     } else {
         let cx = collect::cx(db, krate, false);
         let mut sink = FinishSink { db, def_map, local, states: &states };
-        for step in &pending {
-            macros::unresolved_macro_diagnostics(&cx, &mut sink, &step.pending);
+        for carried in &pending {
+            macros::unresolved_macro_diagnostics(&cx, &mut sink, carried.directives());
         }
         (sink.def_map, sink.local)
     };
@@ -1159,6 +1308,28 @@ pub mod deep {
 }
 #[macro_export]
 macro_rules! exported { () => { pub struct Exported; } }
+"#,
+        );
+    }
+
+    /// The old collector settles glob ambiguities when collection ends; a crate's scopes are
+    /// handed over by `scc_state`, which must settle them itself at the final round.
+    #[test]
+    fn glob_ambiguities_are_settled_as_the_old_collector_settles_them() {
+        assert_same_as_old(
+            "glob_ambiguities_are_settled_as_the_old_collector_settles_them",
+            r#"
+//- /lib.rs
+mod a { pub struct X; }
+mod b { pub struct X; }
+mod c { pub struct X; }
+use a::*;
+use b::*;
+use c::X;
+mod still {
+    pub use crate::a::*;
+    pub use crate::b::*;
+}
 "#,
         );
     }

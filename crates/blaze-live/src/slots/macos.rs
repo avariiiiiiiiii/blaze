@@ -128,6 +128,7 @@ impl Os {
     pub(super) fn new(layout: &Layout) -> Result<Os, String> {
         let code = layout.code_in_memory();
         if !code.start.is_multiple_of(PAGE) || !code.end.is_multiple_of(PAGE) {
+            // alloc: error path
             return Err(format!(
                 "the patch code region {:#x}..{:#x} is not whole pages of {PAGE:#x}",
                 code.start, code.end
@@ -139,6 +140,7 @@ impl Os {
             let (region, this) = region_at(at)?;
             match protection {
                 Some(other) if other != this => {
+                    // alloc: error path
                     return Err(format!(
                         "the patch code region has pages of protection {other:#x} and, at \
                          {at:#x}, {this:#x}"
@@ -173,6 +175,7 @@ impl Memory for Os {
         while at < range.end {
             let (region, protection) = region_at(at)?;
             if protection & READ == 0 {
+                // alloc: error path
                 return Err(format!("{at:#x}, in pages with no access"));
             }
             at = region.end;
@@ -217,10 +220,12 @@ impl Memory for Os {
             while at < span.end() {
                 let (found, protection) = match &region {
                     Some((found, protection)) if found.contains(&at) => {
+                        // clone: a Range<u64> of two words; Range isn't Copy
                         (found.clone(), *protection)
                     }
                     _ => {
                         let looked = region_at(at)?;
+                        // clone: as above
                         region = Some(looked.clone());
                         looked
                     }
@@ -228,6 +233,7 @@ impl Memory for Os {
                 let piece = at..found.end.min(span.end());
                 at = piece.end;
                 if protection & READ == 0 {
+                    // alloc: error path
                     return Err(format!("data at {:#x}, in pages with no access", piece.start));
                 }
                 if protection & WRITE != 0 {
@@ -270,6 +276,7 @@ impl Memory for Os {
     }
 
     fn functions(&mut self, functions: &[(u64, u64, u64)]) -> Result<(), String> {
+        // alloc: error path
         if functions.is_empty() { Ok(()) } else { Err("RUNTIME_FUNCTIONs on macOS".to_owned()) }
     }
 
@@ -305,6 +312,7 @@ fn pages(range: &Range<u64>) -> Range<u64> {
 }
 
 fn check(code: i32) -> Result<(), String> {
+    // alloc: error path
     if code == 0 { Ok(()) } else { Err(format!("kern_return {code}")) }
 }
 
@@ -327,8 +335,10 @@ fn region_at(address: u64) -> Result<(Range<u64>, i32), String> {
             &mut object,
         )
     })
+    // alloc: error path
     .map_err(|it| format!("reading the protection at {address:#x}: {it}"))?;
     if start > address || start.saturating_add(size) <= address {
+        // alloc: error path
         return Err(format!("nothing is mapped at {address:#x}"));
     }
     Ok((start..start + size, info[0]))
@@ -352,6 +362,7 @@ unsafe fn swap(
     let mut scratch = 0u64;
     // SAFETY: a new allocation anywhere, written to `scratch`.
     check(unsafe { mach_vm_allocate(task, &mut scratch, len, ANYWHERE) })
+        // alloc: error path
         .map_err(|it| format!("allocating a copy of {:#x}: {it}", pages.start))?;
     {
         // SAFETY: `len` bytes allocated above, zeroed, which only this function knows of.
@@ -385,6 +396,7 @@ unsafe fn swap(
     })();
     // SAFETY: the allocation above, which no slice borrows now; the remap shares its pages.
     unsafe { mach_vm_deallocate(task, scratch, len) };
+    // alloc: error path
     swapped.map_err(|it| format!("writing at {:#x}: {it}", pages.start))?;
     if protection & EXECUTE != 0 {
         // SAFETY: the pages were just mapped; invalidating changes no memory.
@@ -421,7 +433,9 @@ fn register(kq: c_int, path: &CString) -> Option<c_int> {
 /// place) is told to `events`.
 pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
     let path = CString::new(dir.as_os_str().as_bytes())
+        // alloc: error path
         .map_err(|_| format!("{}: a directory with a zero byte", dir.display()))?;
+    // alloc: error path
     let error = || format!("watching {}: {}", dir.display(), std::io::Error::last_os_error());
     // SAFETY: it takes no pointer.
     let kq = unsafe { kqueue() };
@@ -471,8 +485,10 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
         unsafe { close(kq) };
     };
     std::thread::Builder::new()
+        // alloc: setup, the thread's name, once
         .name("blaze-live-slots".to_owned())
         .spawn(watching)
         .map(drop)
+        // alloc: error path
         .map_err(|it| format!("starting the thread that watches for patches: {it}"))
 }

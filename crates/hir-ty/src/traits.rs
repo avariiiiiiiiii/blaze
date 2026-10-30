@@ -127,7 +127,7 @@ pub fn implements_trait_unique<'db>(
     env: ParamEnvAndCrate<'db>,
     trait_: TraitId,
 ) -> bool {
-    implements_trait_unique_with_infcx(db, env, trait_, &mut |infcx| {
+    implements_trait_unique_with_infcx(db, env, trait_, |infcx| {
         infcx.fill_rest_fresh_args(Span::Dummy, trait_.into(), [ty.into()])
     })
 }
@@ -139,14 +139,14 @@ pub fn implements_trait_unique_with_args<'db>(
     trait_: TraitId,
     args: GenericArgs<'db>,
 ) -> bool {
-    implements_trait_unique_with_infcx(db, env, trait_, &mut |_| args)
+    implements_trait_unique_with_infcx(db, env, trait_, |_| args)
 }
 
 pub fn implements_trait_unique_with_infcx<'db>(
     db: &'db Db,
     env: ParamEnvAndCrate<'db>,
     trait_: TraitId,
-    create_args: &mut dyn FnMut(&InferCtxt<'db>) -> GenericArgs<'db>,
+    create_args: impl FnOnce(&InferCtxt<'db>) -> GenericArgs<'db>,
 ) -> bool {
     let interner = DbInterner::new_with(db, env.krate);
     // FIXME(next-solver): I believe this should be `PostAnalysis`.
@@ -200,7 +200,7 @@ fn trait_ref_holds<'db>(
 pub fn could_unify_with_infcx<'db>(
     db: &'db Db,
     krate: Crate,
-    create_tys: &mut dyn FnMut(&InferCtxt<'db>) -> (Ty<'db>, Ty<'db>),
+    create_tys: impl FnOnce(&InferCtxt<'db>) -> (Ty<'db>, Ty<'db>),
 ) -> bool {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -215,7 +215,7 @@ pub fn impl_may_apply<'db>(
     db: &'db Db,
     krate: Crate,
     impl_: ImplId,
-    create_ty: &mut dyn FnMut(&InferCtxt<'db>) -> Ty<'db>,
+    create_ty: impl FnOnce(&InferCtxt<'db>) -> Ty<'db>,
 ) -> bool {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());

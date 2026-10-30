@@ -8,7 +8,8 @@ use hir_ty::db::HirDatabase;
 use std::cell::Cell;
 
 use hir_def::{
-    AdtId, ConstId, DefWithBodyId, VariantId,
+    AdtId, ConstId, DefWithBodyId, HasModule, VariantId,
+    builtin_derive::BuiltinDeriveImplTrait,
     expr_store::{Body, HygieneId, path::Path, scope::ExprScopes},
     hir::{Expr, ExprId, ExprOrPatId, Literal, Pat as HirPat, PatId, RangeOp, UnaryOp},
     resolver::{Resolver, ValueNs, resolver_for_scope},
@@ -23,6 +24,7 @@ use rustc_pattern_analysis::{
     pat::{DeconstructedPat, IndexedPat},
 };
 use rustc_type_ir::{FloatTy, inherent::IntoKind};
+use smallvec::{SmallVec, smallvec};
 
 use hir_ty::{
     BindingMode, ByRef, InferenceResult, MemoryMap, ParamEnvAndCrate,
@@ -30,22 +32,53 @@ use hir_ty::{
     infer::PatAdjust,
     method_resolution::CandidateId,
     next_solver::{Allocation, GenericArgs, Ty, TyKind},
+    traits::{implements_trait_unique, implements_trait_unique_with_args},
     utils::detect_variant_from_bytes,
 };
 
-use crate::cx::{Cx, VariantIdx};
+use crate::{
+    ConstPatternError,
+    cx::{Cx, VariantIdx},
+};
 
 pub(crate) type Pat<'a, 'db> = DeconstructedPat<Cx<'a, 'db>>;
 
 /// Why a pattern was not lowered. rustc reports each and the match is not checked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LowerError {
     /// An error type checking or const evaluation reports: a pattern of an erroneous type, a
     /// path that resolves to no pattern, a constant that does not evaluate.
     Failed,
     /// E0030 or E0579.
     EmptyRange { pat: PatId, inclusive: bool },
+    /// `const_to_pat` refused the constant `pat` names.
+    ConstPattern { pat: PatId, errors: SmallVec<[ConstPatternError; 1]> },
 }
+
+/// What `const_to_pat` refuses in one constant's value: the one error of making its valtree,
+/// which is reported alone, else each error of `valtree_to_pat`.
+#[derive(Default)]
+struct Refusals {
+    valtree: Option<ConstPatternError>,
+    pat: SmallVec<[ConstPatternError; 1]>,
+}
+
+impl Refusals {
+    fn valtree(&mut self, error: ConstPatternError) {
+        self.valtree.get_or_insert(error);
+    }
+
+    /// `refused`: a part of the value around this one was refused, and `valtree_to_pat` does
+    /// not look inside it.
+    fn pat(&mut self, refused: bool, error: ConstPatternError) {
+        if !refused {
+            self.pat.push(error);
+        }
+    }
+}
+
+/// The longest tuple core implements `PartialEq` for (`tuple_impls!`).
+const MAX_TUPLE_PARTIAL_EQ: usize = 12;
 
 /// How deep a constant's value is taken apart before it is called erroneous: a value has no
 /// cycles, so only a broken memory map gets this deep.
@@ -144,9 +177,12 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         let db = self.cx.db;
         let mut ty = self.pat_ty(pat)?;
         Ok(match self.body.pat(pat) {
-            HirPat::Wild | HirPat::Rest | HirPat::Missing | HirPat::Expr(_) | HirPat::NotNull => {
+            HirPat::Wild | HirPat::Rest | HirPat::Expr(_) | HirPat::NotNull => {
                 Self::leaf(Constructor::Wildcard, ty, pat)
             }
+            // Lowering leaves a pattern it could not read (an inline `const` block among them)
+            // missing.
+            HirPat::Missing => return Err(LowerError::Failed),
             HirPat::Bind { subpat, .. } => {
                 // A `ref x` is of type `&T`; the place it binds, which is what it matches, is `T`.
                 if let Some(BindingMode(ByRef::Yes(_), _)) = self.infer.binding_mode(pat)
@@ -234,8 +270,9 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
             }
             HirPat::Box { inner } | HirPat::Deref { inner } => {
                 self.cx.has_deref_pat.set(true);
-                let inner_ty = self.infer.type_of_pat_with_adjust(inner);
-                let field = self.lower(inner)?.at_index(0);
+                let field = self.lower(inner)?;
+                let inner_ty = *field.ty();
+                let field = field.at_index(0);
                 // alloc: the fields `DeconstructedPat::new` takes.
                 Self::new_pat(Constructor::DerefPattern(inner_ty), vec![field], 1, ty, pat)
             }
@@ -356,7 +393,8 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         self.cx.db.const_eval(konst, args, Some(env)).map_err(|_| LowerError::Failed)
     }
 
-    /// A path to a constant: its value, as `const_to_pat` makes a pattern of it.
+    /// A path to a constant: its value, as `const_to_pat` makes a pattern of it, refused as
+    /// `const_to_pat` refuses one.
     fn const_pat(
         &self,
         pat: PatId,
@@ -365,7 +403,73 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         args: GenericArgs<'db>,
     ) -> Result<Pat<'a, 'db>, LowerError> {
         let value = self.eval(konst, args)?;
-        self.value_pat(pat, ty, &value.memory, &value.memory_map, 0)
+        let mut refusals = Refusals::default();
+        let lowered =
+            self.value_pat(pat, ty, &value.memory, &value.memory_map, 0, &mut refusals, false)?;
+        let errors = match refusals {
+            // alloc: a `SmallVec` of one inline, for a constant that is refused.
+            Refusals { valtree: Some(error), .. } => smallvec![error],
+            Refusals { pat: errors, .. } if !errors.is_empty() => errors,
+            // alloc: as above.
+            _ if !self.has_partial_eq(ty, 0) => smallvec![ConstPatternError::NotPartialEq(ty.store())],
+            _ => return Ok(lowered),
+        };
+        Err(LowerError::ConstPattern { pat, errors })
+    }
+
+    /// `type_has_partial_eq_impl(ty).has_impl`. Core's impls for the built-in type
+    /// constructors are read off the type, as they hold exactly when their parts implement
+    /// `PartialEq`; an ADT's is asked of the trait solver.
+    fn has_partial_eq(&self, ty: Ty<'db>, depth: u32) -> bool {
+        if depth > MAX_VALUE_DEPTH {
+            return false;
+        }
+        match ty.kind() {
+            TyKind::Bool
+            | TyKind::Char
+            | TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::Str
+            | TyKind::Never
+            | TyKind::RawPtr(..) => true,
+            TyKind::Tuple(tys) => {
+                tys.len() <= MAX_TUPLE_PARTIAL_EQ
+                    && tys.iter().all(|ty| self.has_partial_eq(ty, depth + 1))
+            }
+            TyKind::Array(elem, _) | TyKind::Slice(elem) | TyKind::Ref(_, elem, _) => {
+                self.has_partial_eq(elem, depth + 1)
+            }
+            TyKind::Adt(..) => {
+                // A `no_core` crate without the lang item has no `PartialEq` to require.
+                let Some(partial_eq) = self.cx.infcx.interner.lang_items().PartialEq else {
+                    return true;
+                };
+                let env = ParamEnvAndCrate { param_env: self.cx.env, krate: self.cx.krate };
+                let args = GenericArgs::new_from_slice(&[ty.into(), ty.into()]);
+                implements_trait_unique_with_args(self.cx.db, env, partial_eq, args)
+            }
+            _ => false,
+        }
+    }
+
+    /// `type_marked_structural`: the ADT implements `StructuralPartialEq`, which
+    /// `#[derive(PartialEq)]` implements for every argument. The front end records a builtin
+    /// derive as the derive, not as the impls it expands to, so the derive is looked for too.
+    fn is_structural(&self, ty: Ty<'db>, adt: AdtId) -> bool {
+        let db = self.cx.db;
+        let module = adt.module(db);
+        let derived = module.def_map(db).module(db, module).scope(db).builtin_derive_impls().any(
+            |derive| {
+                let loc = derive.loc(db);
+                loc.adt == adt && loc.trait_ == BuiltinDeriveImplTrait::PartialEq
+            },
+        );
+        derived
+            || self.cx.infcx.interner.lang_items().StructuralPeq.is_some_and(|structural| {
+                let env = ParamEnvAndCrate { param_env: self.cx.env, krate: self.cx.krate };
+                implements_trait_unique(ty, db, env, structural)
+            })
     }
 
     fn layout_size(&self, ty: Ty<'db>) -> Result<usize, LowerError> {
@@ -374,7 +478,8 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         Ok(layout.size.bytes_usize())
     }
 
-    /// `const_to_pat`'s `valtree_to_pat` over a value's bytes.
+    /// `const_to_pat`'s valtree construction and `valtree_to_pat` over a value's bytes, in one
+    /// walk: what either refuses goes to `refusals`, and the part refused becomes opaque.
     fn value_pat(
         &self,
         pat: PatId,
@@ -382,6 +487,8 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
         bytes: &[u8],
         map: &MemoryMap<'db>,
         depth: u32,
+        refusals: &mut Refusals,
+        refused: bool,
     ) -> Result<Pat<'a, 'db>, LowerError> {
         if depth > MAX_VALUE_DEPTH {
             return Err(LowerError::Failed);
@@ -401,7 +508,18 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
             }
             TyKind::Float(fty) => {
                 let bits = read_uint(bytes).ok_or(LowerError::Failed)?;
+                if is_nan(fty, bits) {
+                    refusals.pat(refused, ConstPatternError::NaN);
+                }
                 Self::leaf(float_ctor(fty, bits, bits, RangeEnd::Included), ty, pat)
+            }
+            TyKind::Adt(def, _)
+                if !matches!(def.def_id(), AdtId::UnionId(_))
+                    && !refused
+                    && !self.is_structural(ty, def.def_id()) =>
+            {
+                refusals.pat(refused, ConstPatternError::NotStructural(ty.store()));
+                return self.value_pat(pat, ty, bytes, map, depth, refusals, true);
             }
             TyKind::Tuple(tys) => {
                 let layout = db.layout_of_ty(ty.store(), env).map_err(|_| LowerError::Failed)?;
@@ -409,7 +527,7 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                 for (i, field_ty) in tys.iter().enumerate() {
                     let offset = layout.fields.offset(i).bytes_usize();
                     let size = self.layout_size(field_ty)?;
-                    lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1)?);
+                    lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1, refusals, refused)?);
                 }
                 let arity = lowered.len();
                 Self::new_pat(Constructor::Struct, fields_of(lowered), arity, ty, pat)
@@ -425,7 +543,7 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         let i = u32::from(fid.into_raw()) as usize;
                         let offset = layout.fields.offset(i).bytes_usize();
                         let size = self.layout_size(field_ty)?;
-                        lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1)?);
+                        lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1, refusals, refused)?);
                     }
                     let arity = lowered.len();
                     Self::new_pat(Constructor::Struct, fields_of(lowered), arity, ty, pat)
@@ -444,21 +562,23 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         let i = u32::from(fid.into_raw()) as usize;
                         let offset = variant_layout.fields.offset(i).bytes_usize();
                         let size = self.layout_size(field_ty)?;
-                        lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1)?);
+                        lowered.push(self.value_pat(pat, field_ty, field(offset, size)?, map, depth + 1, refusals, refused)?);
                     }
                     let arity = lowered.len();
                     let ctor = Constructor::Variant(VariantIdx::of(db, variant));
                     Self::new_pat(ctor, fields_of(lowered), arity, ty, pat)
                 }
-                // A union's value is opaque to a pattern.
-                AdtId::UnionId(_) => Self::opaque(ty, pat),
+                AdtId::UnionId(_) => {
+                    refusals.valtree(ConstPatternError::Union);
+                    Self::opaque(ty, pat)
+                }
             },
             TyKind::Array(elem, len) => {
                 let len = try_const_usize(db, len).ok_or(LowerError::Failed)? as usize;
                 let size = self.layout_size(elem)?;
                 let mut lowered = Vec::with_capacity(len);
                 for i in 0..len {
-                    lowered.push(self.value_pat(pat, elem, field(i * size, size)?, map, depth + 1)?);
+                    lowered.push(self.value_pat(pat, elem, field(i * size, size)?, map, depth + 1, refusals, refused)?);
                 }
                 let kind = SliceKind::FixedLen(len);
                 Self::new_pat(Constructor::Slice(Slice::new(Some(len), kind)), fields_of(lowered), len, ty, pat)
@@ -481,13 +601,15 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         let mut lowered = Vec::with_capacity(count);
                         for i in 0..count {
                             let elem_bytes = data.get(i * size..(i + 1) * size).ok_or(LowerError::Failed)?;
-                            lowered.push(self.value_pat(pat, elem, elem_bytes, map, depth + 1)?);
+                            lowered.push(self.value_pat(pat, elem, elem_bytes, map, depth + 1, refusals, refused)?);
                         }
                         let kind = SliceKind::FixedLen(count);
                         Self::new_pat(Constructor::Slice(Slice::new(None, kind)), fields_of(lowered), count, pointee, pat)
                     }
-                    // A wide pointer to another unsized type is no structural value.
-                    TyKind::Dynamic(..) | TyKind::Foreign(_) => return Ok(Self::opaque(ty, pat)),
+                    TyKind::Dynamic(..) | TyKind::Foreign(_) => {
+                        refusals.valtree(ConstPatternError::Invalid(pointee.store()));
+                        return Ok(Self::opaque(ty, pat));
+                    }
                     _ if bytes.len() != (self.cx.pointer_bits / 8) as usize => {
                         return Ok(Self::opaque(ty, pat));
                     }
@@ -495,14 +617,34 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
                         let addr = read_uint(bytes).ok_or(LowerError::Failed)? as usize;
                         let size = self.layout_size(pointee)?;
                         let data = map.get(addr, size).ok_or(LowerError::Failed)?;
-                        self.value_pat(pat, pointee, data, map, depth + 1)?
+                        self.value_pat(pat, pointee, data, map, depth + 1, refusals, refused)?
                     }
                 };
                 // alloc: the fields `DeconstructedPat::new` takes.
                 Self::new_pat(Constructor::Ref, vec![inner.at_index(0)], 1, ty, pat)
             }
-            // Raw and function pointers, and what else no pattern takes apart, match by value.
-            _ => Self::opaque(ty, pat),
+            TyKind::FnPtr(..) => {
+                refusals.valtree(ConstPatternError::Pointer);
+                Self::opaque(ty, pat)
+            }
+            // Valtree construction takes a raw pointer only as an integer: one into an
+            // allocation is refused.
+            TyKind::RawPtr(..) => {
+                let addr = read_uint(bytes).ok_or(LowerError::Failed)? as usize;
+                if addr != 0 && (map.memory_at(addr).is_some() || map.static_at(addr).is_some()) {
+                    refusals.valtree(ConstPatternError::Pointer);
+                }
+                Self::opaque(ty, pat)
+            }
+            // A zero-sized valtree that `valtree_to_pat` makes no pattern of.
+            TyKind::FnDef(..) => {
+                refusals.pat(refused, ConstPatternError::Invalid(ty.store()));
+                Self::opaque(ty, pat)
+            }
+            _ => {
+                refusals.valtree(ConstPatternError::Invalid(ty.store()));
+                Self::opaque(ty, pat)
+            }
         })
     }
 
@@ -658,16 +800,20 @@ impl<'c, 'a, 'db> Lowerer<'c, 'a, 'db> {
     }
 }
 
+fn is_nan(fty: FloatTy, bits: u128) -> bool {
+    match fty {
+        FloatTy::F16 => Half::from_bits(bits).is_nan(),
+        FloatTy::F32 => Single::from_bits(bits).is_nan(),
+        FloatTy::F64 => Double::from_bits(bits).is_nan(),
+        FloatTy::F128 => Quad::from_bits(bits).is_nan(),
+    }
+}
+
 /// A float literal's bits, read as rustc reads one: by `rustc_apfloat` from its text.
 fn float_lit_bits(fty: FloatTy, lit: &Literal, negated: bool) -> Option<u128> {
-    // alloc: `rustc_apfloat` parses text; only for a float pattern.
-    let text = match lit {
-        Literal::Float(value, _) => value.to_string(), // alloc: as above.
-        Literal::Int(v, _) => v.to_string(), // alloc: as above.
-        Literal::Uint(v, _) => v.to_string(), // alloc: as above.
-        _ => return None,
-    };
-    let text = text.as_str();
+    // An integer literal at a float type is a type error, and the body is not checked.
+    let Literal::Float(value, _) = lit else { return None };
+    let text = value.as_str();
     fn parse<F: Float + std::str::FromStr>(text: &str, negated: bool) -> Option<u128> {
         let value: F = text.parse().ok()?;
         Some(if negated { (-value).to_bits() } else { value.to_bits() })
@@ -751,8 +897,9 @@ mod tests {
 
     #[test]
     fn float_literals_are_read_by_apfloat() {
-        let one = Literal::Int(1, None);
+        let one = Literal::Float(hir_def::hir::FloatTypeWrapper::new(Symbol::intern("1.0")), None);
         assert_eq!(float_lit_bits(FloatTy::F32, &one, false), Some(1.0f32.to_bits() as u128));
         assert_eq!(float_lit_bits(FloatTy::F64, &one, true), Some((-1.0f64).to_bits() as u128));
+        assert_eq!(float_lit_bits(FloatTy::F32, &Literal::Int(1, None), false), None);
     }
 }

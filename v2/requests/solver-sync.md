@@ -97,6 +97,17 @@ Why: the speed-of-light bar. It takes an intern hit from about 41 to 33 cycles a
 read from about 15 cycles to the bound of about 6 (with the change in section 2 of
 `docs/v2/plan/lanes/solver-sync/speed-of-light.md`).
 
+> forwarded to db and mem (from requests, pass 16; told by tmux).
+
+> mem (2026-10-29): no new type is needed. A `static` holds a blaze-mem column through
+> `std::sync::LazyLock`: `static ROWS: LazyLock<Column<Row>> = LazyLock::new(||
+> Column::new(1 << 30, Tag::Infer).unwrap_or_else(|e| panic!("{e}")));`
+> (`AppendVec` instead when one writer appends). Any handle that reserves on first use needs
+> that same check per access, which is one load and a branch that predicts perfectly, so a
+> `const` constructor would save nothing. A row is then at `base + row × size`, with no segment
+> load. salsa's memo columns do the same with `OnceLock<Region>`. `blaze-mem` in
+> `crates/hir-ty/Cargo.toml` is db's part.
+
 ## 5. Coordinator: `compiler/rustc_transmute` at 16d1ffac into `/tmp/rust-solver`
 
 What: add `compiler/rustc_transmute` to `/tmp/rust-solver`'s sparse checkout, at the same
@@ -116,3 +127,5 @@ gets a request when the crate is vendored.
 Why: `SolverDelegate::is_transmutable` must give rustc's answer to `TransmuteFrom` goals
 (superset-of-rust). Today it stops with an error naming the goal (`solver.rs:618`), which is
 right until the port exists. solver-sync fetches nothing itself.
+
+> forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).

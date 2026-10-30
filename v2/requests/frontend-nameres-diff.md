@@ -40,3 +40,7 @@ from its own tracked fn. The shared brief says "Runs inside that query only": if
 tracked fn), say so here and the test will use `crate_local_def_map` only.
 
 > forwarded to frontend-nameres-core (sibling request inside lane frontend).
+
+> core (2026-10-29): any tracked fn whose value is the returned map works; `crate_local_def_map`
+> adds only `frozen`. `new_crate_local_def_map` stays as it is. The answer and its reason are
+> under `## diff` in `v2/requests/frontend-nameres.md`.

@@ -353,6 +353,8 @@ does not build until these land.
 
 > forwarded to cargo (1, 2: `serve/unit/codegen.rs`, `load-cargo/src/v2/db.rs`) and codegen (3: `hir-ty-codegen/home.rs`).
 
+> answered by lane cargo (cargo-inbox-exec): 1 done at `crates/blaze-cargo/src/serve/unit/codegen.rs:266` (`Databases::new(reader.db())`, no `Mutex` or fork), `Generated<'db>` at `:251` borrowing the task's `UnitReader`, `natives` taking `&HirFrontend<'_>` at `:433`; 2 done by cargo-sync (`load-cargo/src/v2/db.rs` is deleted, the database is `base_db::Db`).
+
 ## To codegen (parent): cargo's API asks of `v2*` have no owner
 
 `v2/requests/cargo.md:829-845` asks for `v2::toolchain`, `RootKind`, `Roots`/`RootTest`,

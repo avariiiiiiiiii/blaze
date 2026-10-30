@@ -92,6 +92,46 @@ pub enum LitKind {
     Err(()),
 }
 
+impl LitKind {
+    /// This kind's number in tt's encodings (the column format, and hir-def's frozen trees), and
+    /// its count of `#`s.
+    #[inline]
+    pub const fn code(self) -> (u8, u8) {
+        match self {
+            LitKind::Byte => (0, 0),
+            LitKind::Char => (1, 0),
+            LitKind::Integer => (2, 0),
+            LitKind::Float => (3, 0),
+            LitKind::Str => (4, 0),
+            LitKind::StrRaw(hashes) => (5, hashes),
+            LitKind::ByteStr => (6, 0),
+            LitKind::ByteStrRaw(hashes) => (7, hashes),
+            LitKind::CStr => (8, 0),
+            LitKind::CStrRaw(hashes) => (9, hashes),
+            LitKind::Err(()) => (10, 0),
+        }
+    }
+
+    /// The kind [`LitKind::code`] numbers `code`, with `hashes` for a raw one; `None` past 10.
+    #[inline]
+    pub const fn from_code(code: u8, hashes: u8) -> Option<LitKind> {
+        Some(match code {
+            0 => LitKind::Byte,
+            1 => LitKind::Char,
+            2 => LitKind::Integer,
+            3 => LitKind::Float,
+            4 => LitKind::Str,
+            5 => LitKind::StrRaw(hashes),
+            6 => LitKind::ByteStr,
+            7 => LitKind::ByteStrRaw(hashes),
+            8 => LitKind::CStr,
+            9 => LitKind::CStrRaw(hashes),
+            10 => LitKind::Err(()),
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TokenTree {
     Leaf(Leaf),

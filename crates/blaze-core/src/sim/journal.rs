@@ -8,7 +8,7 @@
 use rustc_hash::FxHashMap;
 
 use super::SimFile;
-use crate::{Cursor, FileName, Journaled, Lost, S_IFDIR, S_IFREG, Stamp, Tag};
+use crate::{Cursor, FileName, Journaled, Lost, S_IFDIR, S_IFREG, Stamp};
 
 /// Which system's journal the simulation plays.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -47,8 +47,6 @@ pub(super) struct Disk {
     id: u64,
     first: u64,
     log: Vec<Entry>,
-    /// The watches that are journals, with their directories (also in the sim's `watches`).
-    pub(super) journals: FxHashMap<Tag, FileName>,
     /// The name a rename just made: its touch moves its change time only, as a rename does.
     renamed_to: Option<FileName>,
 }
@@ -97,6 +95,7 @@ impl Disk {
             (true, Some(inode)) => (inode.mtime, inode.ctime) = (now, now),
             (true, None) => {
                 let inode = self.new_inode();
+                // clone: the simulated disk's name of a new file.
                 self.inodes.insert(file.clone(), inode);
                 self.entered(file);
             }
@@ -106,6 +105,7 @@ impl Disk {
             }
             (false, None) => self.left(file, files),
         }
+        // clone: the simulated journal's entry, kept across crashes.
         self.log.push(Entry::Changed(file.clone()));
         self.cursor()
     }
@@ -113,6 +113,7 @@ impl Disk {
     /// A name was made under the directories above `name`: the first that was there already
     /// has a name more; those that were not are made.
     fn entered(&mut self, name: &FileName) {
+        // clone: a name of the simulated disk's, walked up.
         let mut at = name.clone();
         while let Some(up) = parent(&at) {
             let now = self.tick();
@@ -123,7 +124,9 @@ impl Disk {
                 }
                 None => {
                     let inode = self.new_inode();
+                    // clone: the simulated disk's name of a new directory.
                     self.inodes.insert(up.clone(), inode);
+                    // clone: the simulated journal's entry.
                     self.log.push(Entry::Changed(up.clone()));
                 }
             }
@@ -134,6 +137,7 @@ impl Disk {
     /// A name under the directories above `name` went: those left with nothing go too, and
     /// the first left with something has a name fewer.
     fn left(&mut self, name: &FileName, files: &FxHashMap<FileName, SimFile>) {
+        // clone: a name of the simulated disk's, walked up.
         let mut at = name.clone();
         while let Some(up) = parent(&at) {
             if !self.inodes.contains_key(&up) {
@@ -146,6 +150,7 @@ impl Disk {
                 return;
             }
             self.inodes.remove(&up);
+            // clone: the simulated journal's entry.
             self.log.push(Entry::Changed(up.clone()));
             at = up;
         }
@@ -155,8 +160,10 @@ impl Disk {
     /// changed, `from` first.
     pub(super) fn renamed(&mut self, from: &FileName, to: &FileName) {
         if let Some(inode) = self.inodes.remove(from) {
+            // clone: the simulated disk's new name of the file.
             self.inodes.insert(to.clone(), inode);
             self.entered(to);
+            // clone: as above, until its touch.
             self.renamed_to = Some(to.clone());
         }
     }
@@ -167,6 +174,7 @@ impl Disk {
         if let Some(inode) = self.inodes.get_mut(file) {
             inode.ctime = now;
         }
+        // clone: the simulated journal's entry.
         self.log.push(Entry::Changed(file.clone()));
         self.cursor()
     }
@@ -176,12 +184,13 @@ impl Disk {
         if let Some(file) = files.get(name) {
             if !self.inodes.contains_key(name) {
                 let inode = self.new_inode();
+                // clone: the simulated disk's name of a file first stamped.
                 self.inodes.insert(name.clone(), inode);
             }
             let inode = self.inodes[name];
             return Stamp {
                 ino: inode.ino,
-                size: file.contents().len() as u64,
+                size: file.len(),
                 mtime_ns: inode.mtime,
                 ctime_ns: inode.ctime,
                 mode: S_IFREG | (file.mode & 0o7777),
@@ -190,6 +199,7 @@ impl Disk {
         if files.keys().any(|it| it.is_under(name)) {
             if !self.inodes.contains_key(name) {
                 let inode = self.new_inode();
+                // clone: the simulated disk's name of a directory first stamped.
                 self.inodes.insert(name.clone(), inode);
             }
             let inode = self.inodes[name];
@@ -219,36 +229,50 @@ impl Disk {
             .filter_map(|it| {
                 let rest = &it.as_str()[dir.as_str().len() + 1..];
                 let first = rest.split('/').next().expect("a part");
+                // alloc: the listing's payload, a name of it.
                 FileName::new(&format!("{dir}/{first}"))
             })
+            // alloc: the listing's payload.
             .collect();
         if names.is_empty() {
             return None;
         }
         names.sort_unstable();
         names.dedup();
-        Some(names.into_iter().map(|name| (name.clone(), self.stamp(&name, files))).collect())
+        let stamped = names.into_iter().map(|name| {
+            let stamp = self.stamp(&name, files);
+            (name, stamp)
+        });
+        // alloc: the listing's payload.
+        Some(stamped.collect())
     }
 
     /// The batches an [`crate::Effect::Journal`] of `dir` from `since` is told first: the
     /// history since then, split in `parts` (FSEvents') or one, the last caught up.
     pub(super) fn history(&self, dir: &FileName, since: &Cursor, parts: u64) -> Vec<Journaled> {
         let whole = |lost: Option<Lost>| Journaled {
+            // alloc: none, an empty vector.
             files: Vec::new(),
+            // alloc: the batch's payload. clone: its name of the directory.
             lost: lost.map(|why| vec![(dir.clone(), why)]).unwrap_or_default(),
             cursor: self.cursor(),
             caught_up: true,
         };
         if self.kind == Journal::None {
+            // alloc: the batches' payload.
             return vec![whole((*since != Cursor::None).then_some(Lost::NoJournal))];
         }
         let next = match *since {
+            // alloc: the batches' payload.
             Cursor::None => return vec![whole(None)],
             Cursor::Sim { journal, next } if journal == self.id && next <= self.end() => next,
+            // alloc: the batches' payload.
             Cursor::Sim { journal, .. } if journal == self.id => return vec![whole(Some(Lost::Reset))],
+            // alloc: the batches' payload.
             _ => return vec![whole(Some(Lost::Reset))],
         };
         if next < self.first {
+            // alloc: the batches' payload.
             return vec![whole(Some(Lost::Truncated))];
         }
         let entries = &self.log[(next - self.first) as usize..];
@@ -257,12 +281,15 @@ impl Disk {
             _ => 1,
         };
         let each = entries.len().div_ceil(parts).max(1);
+        // alloc: the batches' payload.
         let mut out = Vec::new();
         let mut at = next;
         for chunk in entries.chunks(each) {
             at += chunk.len() as u64;
             let mut batch = Journaled {
+                // alloc: the batch's payload.
                 files: Vec::new(),
+                // alloc: as above.
                 lost: Vec::new(),
                 cursor: Cursor::Sim { journal: self.id, next: at },
                 caught_up: false,
@@ -283,8 +310,11 @@ impl Disk {
 
     fn add(&self, dir: &FileName, entry: &Entry, batch: &mut Journaled) {
         match entry {
+            // clone: the batch's payload, a name of it.
             Entry::Changed(file) if file.is_under(dir) => batch.files.push(file.clone()),
+            // clone: as above.
             Entry::Lost(under, why) if under.is_under(dir) => batch.lost.push((under.clone(), *why)),
+            // clone: as above.
             Entry::Lost(under, why) if dir.is_under(under) => batch.lost.push((dir.clone(), *why)),
             Entry::Changed(_) | Entry::Lost(..) => {}
         }
@@ -294,11 +324,13 @@ impl Disk {
     /// change is not under it.
     pub(super) fn live(&self, dir: &FileName, dropped: bool) -> Option<Journaled> {
         let entry = self.log.last()?;
-        let mut batch =
-            Journaled { files: Vec::new(), lost: Vec::new(), cursor: self.cursor(), caught_up: true };
+        let (cursor, caught_up) = (self.cursor(), true);
+        // alloc: none, empty vectors, the batch's payload once pushed to.
+        let mut batch = Journaled { files: Vec::new(), lost: Vec::new(), cursor, caught_up };
         self.add(dir, entry, &mut batch);
         if dropped {
             batch.files.clear();
+            // alloc: the batch's payload. clone: its name of the directory.
             batch.lost = vec![(dir.clone(), Lost::Dropped)];
         }
         (!batch.files.is_empty() || !batch.lost.is_empty()).then_some(batch)
@@ -320,6 +352,7 @@ impl Disk {
 
     /// The system loses the changes under `dir` (FSEvents' `MustScanSubDirs`).
     pub(super) fn lose(&mut self, dir: &FileName, why: Lost) {
+        // clone: the simulated journal's entry.
         self.log.push(Entry::Lost(dir.clone(), why));
     }
 }

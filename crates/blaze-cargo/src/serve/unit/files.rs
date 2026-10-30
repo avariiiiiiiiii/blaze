@@ -5,9 +5,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use std::borrow::Cow;
 
-use base_db::FileId;
 use blaze_ids::ContentId;
 use blaze_units::query::{Mount, Origin};
 use blaze_vfs::{Bytes, Corrupt};
@@ -89,20 +88,26 @@ impl Mounted {
     /// The name rustc gives absolute `path` in a diagnostic: from the workspace's root when it
     /// is below it, as cargo runs rustc there, else its whole path.
     pub(crate) fn name(&self, path: &str) -> String {
-        match under(path, &self.root) {
-            Some(rest) if !rest.is_empty() => rest.to_owned(),
-            _ => path.to_owned(),
-        }
+        blaze_diagnostics::Files::relative(path, &self.root).to_owned()
     }
 
-    /// The sources a diagnostic's snippets are read from, by the names [`Mounted::name`] gives;
-    /// a file whose bytes fail their check gives no snippet.
-    pub(crate) fn sources(&self) -> blaze_diagnostics::emit::Sources {
-        let mounted = self.clone();
-        blaze_diagnostics::emit::Sources::new(move |name| {
-            let (_, _, bytes) = mounted.read(&mounted.absolute(name)).ok()??;
-            String::from_utf8(bytes.to_vec()).ok()
-        })
+    /// The workspace's root, which names are relative to.
+    pub(crate) fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// The sources the snippets of `diags` are read from, by the names [`Mounted::name`] gives,
+    /// each file read once; a file whose bytes fail their check gives no snippet.
+    pub(crate) fn sources(&self, diags: &[blaze_diagnostics::Diag]) -> blaze_diagnostics::emit::Sources {
+        let mut sources = blaze_diagnostics::emit::Sources::default();
+        for name in sources.unread(diags) {
+            let text = match self.read(&self.absolute(name)) {
+                Ok(Some((_, _, bytes))) => String::from_utf8(bytes.to_vec()).ok(),
+                Ok(None) | Err(_) => None,
+            };
+            sources.add(name, text);
+        }
+        sources
     }
 }
 
@@ -121,28 +126,5 @@ fn join(a: &str, b: &str) -> String {
         (true, _) => b.to_owned(),
         (_, true) => a.to_owned(),
         _ => format!("{a}/{b}"),
-    }
-}
-
-/// The names of the front end's files, as rustc gives them: what the diagnostics and the code
-/// generator (`file!()`, a panic's location) print.
-pub(crate) struct Names<'a> {
-    pub(crate) paths: &'a HashMap<FileId, String>,
-    pub(crate) mounted: &'a Mounted,
-}
-
-impl<'a> Names<'a> {
-    /// The names of `paths`, the files of a task's reader.
-    pub(crate) fn new(paths: &'a Arc<HashMap<FileId, String>>, mounted: &'a Mounted) -> Names<'a> {
-        Names { paths, mounted }
-    }
-}
-
-impl blaze_diagnostics::Files for Names<'_> {
-    fn name(&self, file: FileId) -> String {
-        match self.paths.get(&file) {
-            Some(path) => self.mounted.name(path),
-            None => format!("<file {}>", file.index()),
-        }
     }
 }

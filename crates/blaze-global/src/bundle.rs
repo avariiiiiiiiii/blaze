@@ -15,6 +15,7 @@
 
 use blaze_cas::{Fetched, Key, Store, Ticket};
 use blaze_core::{Effect, Tag};
+use blaze_format::cursor::Reader;
 use blaze_ids::ContentId;
 
 use crate::{
@@ -23,7 +24,7 @@ use crate::{
     public::Public,
     sign::{PublisherKey, RECORD_LEN, Record, Trust, hex},
     tls::Channels,
-    wire::Reader,
+    wire::{Fields as _, truncated},
 };
 
 /// The most values one manifest lists.
@@ -196,13 +197,13 @@ impl Manifest {
     /// Reads one, every count checked against what the bytes hold before anything is
     /// allocated. Its signature is not checked: [`Manifest::verify`] does that.
     pub fn decode(reader: &mut Reader<'_>) -> Result<Manifest, String> {
-        let id = BundleId(ContentId(*reader.array("a bundle's ID")?));
-        let publisher = PublisherKey(*reader.array("a manifest's publisher")?);
-        let signature = *reader.array("a manifest's signature")?;
+        let id = BundleId(ContentId(*reader.array().map_err(truncated)?));
+        let publisher = PublisherKey(*reader.array().map_err(truncated)?);
+        let signature = *reader.array().map_err(truncated)?;
         let count = reader.count(RECORD_LEN, ENTRIES_MOST, "records")?;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
-            entries.push(Record::decode(reader.array("a record")?)?);
+            entries.push(Record::decode(reader.array().map_err(truncated)?)?);
         }
         Ok(Manifest { id, entries, publisher, signature })
     }

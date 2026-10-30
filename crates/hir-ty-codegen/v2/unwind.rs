@@ -4,7 +4,7 @@
 
 use std::sync::OnceLock;
 
-use blaze_codegen::{Data, Target, Unwind};
+use blaze_codegen::{Data, Relocs, Target, Unwind};
 use cranelift_codegen::{
     gimli::{
         self, RunTimeEndian,
@@ -21,6 +21,7 @@ use crate::unwind::{FunctionUnwind, UnwindParts};
 /// `unwind` as v2 keeps it, with the data of its landing pads, if it has any. `personality`
 /// is the target of the routine that reads them.
 pub(crate) fn convert(
+    // dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
     isa: &dyn TargetIsa,
     unwind: &FunctionUnwind,
     personality: impl FnOnce() -> Result<Target, String>,
@@ -29,7 +30,7 @@ pub(crate) fn convert(
         UnwindParts::Dwarf { fde, landing_pads } => {
             let common = common(isa)?;
             let fde = common.fde(fde)?;
-            let lsda = landing_pads.map(|pads| Data::new(4, pads.to_vec(), Vec::new()));
+            let lsda = landing_pads.map(|pads| Data::new(4, pads.to_vec(), Relocs::new()));
             let personality = match lsda {
                 Some(_) => Some(personality()?),
                 None => None,
@@ -71,6 +72,7 @@ impl Common {
 
 /// [`Common`] of `isa`, which is the process's: the only ISA a v2 unit compiles with
 /// (`backend::check_spec`).
+// dyn: cranelift's API takes `&dyn TargetIsa`; its backends are private, one made per process
 fn common(isa: &dyn TargetIsa) -> Result<&'static Common, String> {
     static COMMON: OnceLock<Result<Common, String>> = OnceLock::new();
     let process = crate::target().map_err(|e| e.to_string())?;

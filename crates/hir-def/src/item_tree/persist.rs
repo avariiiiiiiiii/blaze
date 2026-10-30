@@ -127,24 +127,28 @@ impl<'a> ItemTreeRef<'a> {
     pub fn decode(self) -> Result<ItemTree, FormatError> {
         let (root, buffer) = (self.root, self.buffer);
         let invalid = |what| FormatError::Invalid { at: self.position(root), what };
-        // alloc: the tree's column, once a store read, the edge
-        let kinds = (self.kinds.iter())
-            .map(|&kind| ItemKind::from_u8(kind).ok_or_else(|| invalid("an item kind out of range")))
-            .collect::<Result<Box<[ItemKind]>, FormatError>>()?;
+        if self.kinds.iter().any(|&kind| ItemKind::from_u8(kind).is_none()) {
+            return Err(invalid("an item kind out of range"));
+        }
+        let kinds: Box<[ItemKind]> = (self.kinds.iter())
+            .map(|&kind| ItemKind::ALL[kind as usize])
+            .collect(); // alloc: the tree's column, once a store read, the edge
         let ast_ids = (self.ast_ids.iter())
             .map(|&raw| FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw)))
             .collect(); // alloc: the tree's column, once a store read, the edge
-        let macro_calls = (root.macro_calls.follow(buffer)?.iter())
-            .map(|call| {
-                let expand_to = expand_to_of(call.expand_to)
-                    .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
-                let ctxt = syntax_context(call.ctxt)
-                    .ok_or_else(|| invalid("a syntax context of u32::MAX"))?;
-                Ok(MacroCall { path: call.path, ctxt, expand_to })
-            })
-            .collect::<Result<Box<[MacroCall]>, FormatError>>()?;
+        let calls = root.macro_calls.follow(buffer)?;
+        // alloc: the tree's column, once a store read, the edge
+        let mut macro_calls = Vec::with_capacity(calls.len());
+        for call in calls {
+            let expand_to = expand_to_of(call.expand_to)
+                .ok_or_else(|| invalid("a macro expansion kind out of range"))?;
+            let ctxt =
+                syntax_context(call.ctxt).ok_or_else(|| invalid("a syntax context of u32::MAX"))?;
+            macro_calls.push(MacroCall { path: call.path, ctxt, expand_to });
+        }
+        let macro_calls = macro_calls.into_boxed_slice();
         let words = Read::new(&root.words, buffer);
-        let tree = ItemTree {
+        let mut tree = ItemTree {
             top_level: self.top_level.into(),
             kinds,
             data: column(&root.data, buffer)?,
@@ -169,14 +173,16 @@ impl<'a> ItemTreeRef<'a> {
             use_trees: column(&root.use_trees, buffer)?,
             use_tree_lists: column(&root.use_tree_lists, buffer)?,
             ctor_vis: column(&root.ctor_vis, buffer)?,
-            names: words.from(root.names_at).seq()?,
-            paths: words.from(root.paths_at).seq()?,
-            vis: words.from(root.vis_at).seq()?,
+            names: words.from(root.names_at).get()?,
+            paths: words.from(root.paths_at).get()?,
+            vis: words.from(root.vis_at).get()?,
             attr_owners: column(&root.attr_owners, buffer)?,
-            attrs: words.from(root.attrs_at).seq()?,
-            cfgs: words.from(root.cfgs_at).seq()?,
+            attr_index: Box::default(),
+            attrs: words.from(root.attrs_at).get()?,
+            cfgs: words.from(root.cfgs_at).get()?,
         };
         check(&tree).map_err(invalid)?;
+        tree.attr_index = super::attr_index(&tree.attr_owners, tree.kinds.len());
         Ok(tree)
     }
 
@@ -300,8 +306,8 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
 }
 
 impl ItemTree {
-    /// The warm and cold forms of item tree buffers, codec by column: what the store's
-    /// `blaze_cas::Columns` for [`ItemTree`]'s schema is.
+    /// The warm and cold forms of item tree buffers, codec by column: what
+    /// `blaze_cas::Store::encode_columns` is given for [`ItemTree`]'s schema.
     pub fn columns() -> blaze_format::tiers::BufferColumns {
         blaze_format::tiers::BufferColumns::of::<Root>(<ItemTree as Persist>::SCHEMA)
     }

@@ -34,7 +34,10 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use blaze_ids::radix;
+use blaze_ids::{
+    bits::locate,
+    radix::{self, Csr},
+};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use smallvec::SmallVec;
@@ -106,28 +109,30 @@ fn tie_of(object: &Object, section: u32) -> Option<Tie> {
     object.ties.binary_search_by_key(&section, |it| it.section).ok().map(|it| object.ties[it])
 }
 
-/// A bitset, copied on write by chunk: a stage that marks a few more sections copies the
-/// words it writes.
+/// Flags by flat index, a bit each, copied on write by chunk: a stage that marks a few more
+/// sections copies the words it writes. Not a `blaze_ids::bits` set, whose words are one
+/// slice: these are a [`CowVec`]'s chunks, shared with the states the stage was cloned from.
 #[derive(Clone, Default)]
-pub(crate) struct Bits(CowVec<u64>);
+pub(crate) struct CowFlags(CowVec<u64>);
 
-impl Bits {
+impl CowFlags {
     #[inline]
     fn get(&self, at: usize) -> bool {
-        self.0.get(at / 64).is_some_and(|word| word >> (at % 64) & 1 == 1)
+        let (word, mask) = locate(at);
+        self.0.get(word).is_some_and(|it| it & mask != 0)
     }
 
-    /// Sets the bit; whether it was clear.
+    /// Sets the flag; whether it was clear.
     fn set(&mut self, at: usize) -> bool {
-        let (word, bit) = (at / 64, 1u64 << (at % 64));
+        let (word, mask) = locate(at);
         match self.0.get(word) {
-            Some(it) if it & bit != 0 => false,
+            Some(it) if it & mask != 0 => false,
             Some(_) => {
-                *self.0.get_mut(word).expect("in range") |= bit;
+                *self.0.get_mut(word).expect("in range") |= mask;
                 true
             }
             None => {
-                self.0.set(word, bit, || 0);
+                self.0.set(word, mask, || 0);
                 true
             }
         }
@@ -231,53 +236,6 @@ fn archive_index(archive: &Archive) -> Table {
 /// The member an archive's index says defines `name`.
 fn archive_find(table: &Table, archive: &Archive, name: &str) -> Option<u32> {
     table.find(hash(name), |it| archive.name(archive.index[it as usize].0) == name).map(|it| archive.index[it as usize].1)
-}
-
-/// Rows of `u32`s in one column.
-#[derive(Default, Debug)]
-struct Csr {
-    at: Vec<u32>,
-    items: Vec<u32>,
-}
-
-impl Csr {
-    /// From `(row, item)` pairs: each row's items in the pairs' order. Two allocations, its
-    /// two columns.
-    fn build(rows: usize, pairs: &[(u32, u32)]) -> Csr {
-        // alloc: the row starts, once per index built (an object read, a graph built)
-        let mut at = vec![0u32; rows + 1];
-        for (row, _) in pairs {
-            at[*row as usize + 1] += 1;
-        }
-        for row in 0..rows {
-            at[row + 1] += at[row];
-        }
-        // alloc: the items, once per index built
-        let mut items = vec![0; pairs.len()];
-        for (row, item) in pairs {
-            let slot = &mut at[*row as usize];
-            items[*slot as usize] = *item;
-            *slot += 1;
-        }
-        // Each row's start was advanced to the next row's: shift them back.
-        for row in (1..=rows).rev() {
-            at[row] = at[row - 1];
-        }
-        at[0] = 0;
-        Csr { at, items }
-    }
-
-    #[inline]
-    fn get(&self, row: usize) -> &[u32] {
-        &self.items[self.at[row] as usize..self.at[row + 1] as usize]
-    }
-
-    /// A row's items, none for a row past the index (one built with no rows when it would be
-    /// all empty).
-    #[inline]
-    fn row(&self, row: usize) -> &[u32] {
-        if row + 1 < self.at.len() { self.get(row) } else { &[] }
-    }
 }
 
 /// Checks every index and range a reader gave, once, so that the rest reads them in place.
@@ -488,14 +446,14 @@ pub(crate) struct Parsed {
     sections_at: usize,
     frames_at: usize,
     /// Of each section, the symbols its relocations refer to (and subtract), each once.
-    refs: Csr,
+    refs: Csr<u32>,
     /// Of each section, the symbols defined in it.
-    defs: Csr,
+    defs: Csr<u32>,
     /// Of each section, its COMDAT group; NONE for none.
     group_of: Vec<u32>,
     /// Of each section, the sections tied to it and the one it is tied to ([`Object::ties`]):
     /// each is kept when the other is. No rows when the object has no ties.
-    ties: Csr,
+    ties: Csr<u32>,
     /// Sections kept whatever refers to them.
     roots: Vec<u32>,
     /// Unwind sections and the symbol of their first relocation: what each describes.
@@ -504,7 +462,7 @@ pub(crate) struct Parsed {
     named: Vec<(NameId, u32)>,
     frames: Vec<Frame>,
     /// Of each frame record, its relocations (indexes into `Object::fixups`).
-    frame_fixups: Csr,
+    frame_fixups: Csr<u32>,
 }
 
 impl Parsed {
@@ -542,20 +500,20 @@ impl Parsed {
             }
             pairs.truncate(kept);
         }
-        let refs = Csr::build(sections, &pairs);
+        let refs = Csr::build(sections, pairs.iter().copied());
         pairs.clear();
         for (at, symbol) in object.symbols.iter().enumerate() {
             if let SymbolDef::Section { section, .. } = symbol.def {
                 pairs.push((section, at as u32));
             }
         }
-        let defs = Csr::build(sections, &pairs);
+        let defs = Csr::build(sections, pairs.iter().copied());
         let ties = if object.ties.is_empty() {
             Csr::default()
         } else {
             pairs.clear();
             pairs.extend(object.ties.iter().flat_map(|it| [(it.to, it.section), (it.section, it.to)]));
-            Csr::build(sections, &pairs)
+            Csr::build(sections, pairs.iter().copied())
         };
         // alloc: once per object read, kept with it
         let mut group_of = vec![NONE; sections];
@@ -647,7 +605,7 @@ impl Parsed {
                 });
             }
         }
-        let frame_fixups = Csr::build(frames.len(), &fixup_pairs);
+        let frame_fixups = Csr::build(frames.len(), fixup_pairs.iter().copied());
         let sections_at = object.symbols.len();
         let frames_at = sections_at + sections;
         debug_assert_eq!(syms.len(), frames_at + frames.len());
@@ -864,15 +822,15 @@ pub(crate) struct Graph {
     slot_of: FxHashMap<Sym, u32>,
     slots: Vec<Slot>,
     /// Sections (flat) of a group that lost.
-    discarded: Bits,
+    discarded: CowFlags,
     sections: u32,
     frames: u32,
     /// Of each flat section, the unwind sections (flat) and FDEs (flat) describing it.
-    unwinds: Csr,
-    fdes: Csr,
+    unwinds: Csr<u32>,
+    fdes: Csr<u32>,
     /// Of each flat section, the live support sections (flat) referring to it, which are kept
     /// once it is (ld64's `dontDeadStripIfReferencesLive`).
-    supports: Csr,
+    supports: Csr<u32>,
     /// `Class::Named` sections (flat) by name, sorted: a name's are a run.
     named: Vec<(NameId, u32)>,
     /// Sections (flat) kept whatever refers to them.
@@ -899,7 +857,7 @@ impl Graph {
             slot_of: FxHashMap::default(),
             // alloc: none (an empty `Vec`); the slots, once per graph built
             slots: Vec::new(),
-            discarded: Bits::default(),
+            discarded: CowFlags::default(),
             sections: 0,
             frames: 0,
             unwinds: Csr::default(),
@@ -1042,7 +1000,7 @@ impl Graph {
         for (load, it) in self.loads.iter().enumerate() {
             let load = load as u32;
             for section in &it.parsed.object().live_support {
-                for symbol in it.parsed.refs.get(*section as usize) {
+                for symbol in it.parsed.refs.row(*section as usize) {
                     match self.target(load, *symbol) {
                         Some((l, s)) if (l, s) != (load, *section) => {
                             supports.push((self.flat(l, s) as u32, it.sections + section));
@@ -1071,9 +1029,13 @@ impl Graph {
             roots.extend(it.parsed.roots.iter().map(|section| it.sections + section));
         }
         radix::sort_copy_by_key(&mut named, |&(name, flat)| radix::pack_32(name.0, flat));
-        self.unwinds = Csr::build(self.sections as usize, &unwinds);
-        self.fdes = Csr::build(self.sections as usize, &fdes);
-        self.supports = if supports.is_empty() { Csr::default() } else { Csr::build(self.sections as usize, &supports) };
+        self.unwinds = Csr::build(self.sections as usize, unwinds.iter().copied());
+        self.fdes = Csr::build(self.sections as usize, fdes.iter().copied());
+        self.supports = if supports.is_empty() {
+            Csr::default()
+        } else {
+            Csr::build(self.sections as usize, supports.iter().copied())
+        };
         self.named = named;
         self.roots = roots;
     }
@@ -1145,7 +1107,7 @@ struct Refs {
     lists: CowList<u64>,
     /// Every name ever referred to, once.
     names: CowVec<Sym>,
-    listed: Bits,
+    listed: CowFlags,
 }
 
 impl Refs {
@@ -1195,10 +1157,10 @@ fn counted(what: What) -> bool {
 /// What collection kept, over a [`Graph`]'s flat numbering.
 #[derive(Clone, Default)]
 pub(crate) struct Marks {
-    sections: Bits,
-    frames: Bits,
+    sections: CowFlags,
+    frames: CowFlags,
     /// Runs of `Graph::named` kept whole, by their first entry.
-    named: Bits,
+    named: CowFlags,
     /// Of each slot, what its name keeps as a writer's special, once asked: UNKNOWN,
     /// NOTHING, `NAMED | run`, or the slot `__imp_X`'s X is.
     special: CowVec<u32>,
@@ -1288,21 +1250,21 @@ impl<'g> Marker<'g> {
                     self.work.push(pack(load, *it));
                 }
             }
-            for it in parsed.ties.row(section as usize) {
+            for it in parsed.ties.get(section as usize).unwrap_or_default() {
                 self.work.push(pack(load, *it));
             }
-            for symbol in parsed.refs.get(section as usize) {
+            for symbol in parsed.refs.row(section as usize) {
                 self.symbol(load, *symbol);
             }
-            for it in graph.unwinds.get(flat) {
+            for it in graph.unwinds.row(flat) {
                 let at = graph.unflat(*it);
                 self.push(at);
             }
-            for it in graph.supports.row(flat) {
+            for it in graph.supports.get(flat).unwrap_or_default() {
                 let at = graph.unflat(*it);
                 self.push(at);
             }
-            for it in graph.fdes.get(flat) {
+            for it in graph.fdes.row(flat) {
                 let (l, f) = graph.unflat_frame(*it);
                 self.frame(l, f);
             }
@@ -1375,7 +1337,7 @@ impl<'g> Marker<'g> {
     fn frame_fixups(&mut self, load: u32, frame: u32) {
         let parsed = &self.graph.loads[load as usize].parsed;
         let object = parsed.object();
-        for fixup in parsed.frame_fixups.get(frame as usize) {
+        for fixup in parsed.frame_fixups.row(frame as usize) {
             self.symbol(load, object.fixups[*fixup as usize].symbol);
         }
     }
@@ -1401,14 +1363,14 @@ fn note_native(graph: &Graph, marks: &mut Marks, sections: &[u64], frames: &[u64
     };
     for (load, section) in sections.iter().map(|it| unpack(*it)) {
         let parsed = &graph.loads[load as usize].parsed;
-        for symbol in parsed.refs.get(section as usize) {
+        for symbol in parsed.refs.row(section as usize) {
             note(marks, load, *symbol);
         }
     }
     for (load, frame) in frames.iter().map(|it| unpack(*it)) {
         let parsed = &graph.loads[load as usize].parsed;
         let object = parsed.object();
-        for fixup in parsed.frame_fixups.get(frame as usize) {
+        for fixup in parsed.frame_fixups.row(frame as usize) {
             note(marks, load, object.fixups[*fixup as usize].symbol);
         }
     }
@@ -1421,7 +1383,7 @@ fn section_defines(graph: &Graph, load: u32, section: u32, out: &mut Vec<Sym>) {
     let parsed = &graph.loads[load as usize].parsed;
     let object = parsed.object();
     let own = parsed.section_sym(section);
-    for symbol in parsed.defs.get(section as usize) {
+    for symbol in parsed.defs.row(section as usize) {
         let sym = parsed.sym(*symbol);
         if sym != own && (is_local(&object.symbols[*symbol as usize]) || graph.wins(load, *symbol)) {
             out.push(sym);
@@ -1553,7 +1515,7 @@ impl Build {
         }
         let mut work: SmallVec<[u32; 8]> = SmallVec::from_slice(members);
         while let Some(section) = work.pop() {
-            for tied in it.parsed.ties.row(section as usize) {
+            for tied in it.parsed.ties.get(section as usize).unwrap_or_default() {
                 let dependent = tie_of(object, *tied).is_some_and(|tie| tie.to == section);
                 if dependent && discarded.set((it.sections + tied) as usize) {
                     work.push(*tied);
@@ -2286,7 +2248,7 @@ impl<'a> Stage<'a> {
         }
         let sym = parsed.frame_sym(frame);
         fixups.clear();
-        for at in parsed.frame_fixups.get(frame as usize) {
+        for at in parsed.frame_fixups.row(frame as usize) {
             let f = &object.fixups[*at as usize];
             fixups.push(Fixup {
                 at: f.at - start,
@@ -2332,7 +2294,7 @@ impl<'a> Stage<'a> {
         let parsed = &graph.loads[load as usize].parsed;
         let Some(piece) = self.piece_of(parsed.section_sym(section)) else { return };
         let object = parsed.object();
-        for symbol in parsed.defs.get(section as usize) {
+        for symbol in parsed.defs.row(section as usize) {
             let s = &object.symbols[*symbol as usize];
             let sym = parsed.sym(*symbol);
             if sym == parsed.section_sym(section) || !(is_local(s) || graph.wins(load, *symbol)) {
@@ -2765,7 +2727,7 @@ impl<'a> Stage<'a> {
         // What went: sections, frame records and commons the image has and the graph does not
         // keep. Loads whose sections came or went, or whose globals' winners changed, have
         // their symbols defined again; the rest are as they were.
-        let mut affected = Bits::default();
+        let mut affected = CowFlags::default();
         // alloc: none when nothing went; what went, once per graph built
         let mut gone: Vec<Sym> = Vec::new();
         if let Some(was) = &old.graph {
@@ -2963,7 +2925,7 @@ impl<'a> Stage<'a> {
                 Some(it) => it,
                 None => {
                     // Copied out of the table it is interned into.
-                    let arena: &'a bumpalo::Bump = self.arena;
+                    let arena: &'a blaze_mem::Frame = self.arena;
                     let target: &str = arena.alloc_str(target);
                     self.symbols.sym_name(target)
                 }
@@ -3076,7 +3038,7 @@ impl<'a> Stage<'a> {
         let (import_syms, imports): (Vec<Sym>, Vec<Import>) = order.into_iter().map(|(sym, import, _)| (sym, import)).unzip();
 
         // A name the image's resolution defined and this one does not is undefined now.
-        let mut now = Bits::default();
+        let mut now = CowFlags::default();
         for sym in &defined {
             now.set(Symbols::dense(*sym));
         }
@@ -3188,7 +3150,7 @@ mod tests {
 
     #[test]
     fn bits_set_once_across_words_and_copies() {
-        let mut bits = Bits::default();
+        let mut bits = CowFlags::default();
         assert!(bits.set(3));
         assert!(!bits.set(3));
         assert!(bits.set(64 * 2000 + 5));
@@ -3201,11 +3163,11 @@ mod tests {
 
     #[test]
     fn rows_keep_their_items_in_order() {
-        let csr = Csr::build(4, &[(2, 7), (0, 1), (2, 3), (3, 9)]);
-        assert_eq!(csr.get(0), &[1]);
-        assert_eq!(csr.get(1), &[] as &[u32]);
-        assert_eq!(csr.get(2), &[7, 3]);
-        assert_eq!(csr.get(3), &[9]);
+        let csr = Csr::build(4, [(2, 7), (0, 1), (2, 3), (3, 9)]);
+        assert_eq!(csr.row(0), &[1]);
+        assert_eq!(csr.row(1), &[] as &[u32]);
+        assert_eq!(csr.row(2), &[7, 3]);
+        assert_eq!(csr.row(3), &[9]);
     }
 
     #[test]
@@ -3295,9 +3257,9 @@ mod tests {
         let obj = Obj { native: IdNo(0), member: 0 };
         let parsed = Parsed::new(obj, Arc::new(NativeFile::Object(object)), 0, syms, &[NameId(9)], &records);
 
-        assert_eq!(parsed.refs.get(0), &[1], "the text refers to `g`");
-        assert_eq!(parsed.refs.get(1), &[0], "the frame records refer to `f`");
-        assert_eq!(parsed.defs.get(0), &[0]);
+        assert_eq!(parsed.refs.row(0), &[1], "the text refers to `g`");
+        assert_eq!(parsed.refs.row(1), &[0], "the frame records refer to `f`");
+        assert_eq!(parsed.defs.row(0), &[0]);
         assert_eq!(parsed.roots, vec![2], "the init array is kept whatever refers to it");
         assert_eq!(parsed.named, vec![(NameId(9), 3)]);
         assert_eq!(parsed.section_sym(1), Sym(3));
@@ -3305,8 +3267,8 @@ mod tests {
         let (cie, fde) = (parsed.frames[0], parsed.frames[1]);
         assert!(!cie.fde && cie.cie == NONE && cie.start == 0);
         assert!(fde.fde && fde.cie == 0 && fde.start == fde_at as u32 && fde.function == 0);
-        assert_eq!(parsed.frame_fixups.get(0), &[] as &[u32]);
-        assert_eq!(parsed.frame_fixups.get(1), &[1]);
+        assert_eq!(parsed.frame_fixups.row(0), &[] as &[u32]);
+        assert_eq!(parsed.frame_fixups.row(1), &[1]);
         assert_eq!(parsed.frame_sym(1), Sym(7));
     }
 
@@ -3344,8 +3306,8 @@ mod tests {
             // The pairs, two indexes of two lists each and the groups: none per section or symbol.
             let (parsed, used) = blaze_alloc_count::measure(|| Parsed::new(obj, file, 0, syms, &[], &[]));
             assert!(used.allocations <= 8, "{n} sections and symbols: {used:?}");
-            assert_eq!(parsed.refs.get(0), &[1]);
-            assert_eq!(parsed.defs.get(n as usize - 1), &[n - 1]);
+            assert_eq!(parsed.refs.row(0), &[1]);
+            assert_eq!(parsed.defs.row(n as usize - 1), &[n - 1]);
             counts.push(used.allocations);
         }
         assert_eq!(counts[0], counts[1], "the same count at 10 and 1000");

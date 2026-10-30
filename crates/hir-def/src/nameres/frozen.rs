@@ -20,11 +20,12 @@ use std::sync::{Arc, Mutex};
 
 use base_db::{Db, Crate};
 use base_db::{FileId, VfsPath};
+use blaze_format::cursor::{Put, Reader};
 use cfg::{CfgAtom, CfgExpr};
 use either::Either;
 use hir_expand::{
-    EagerCallInfo, ExpandErrorKind, ExpandTo, HirFileId, MacroCallId, MacroCallKind, MacroCallLoc,
-    MacroCallStyles, MacroDefId, MacroDefKind,
+    BuiltinChild, BuiltinError, EagerCallInfo, ExpandErrorKind, ExpandTo, HirFileId, MacroCallId,
+    MacroCallKind, MacroCallLoc, MacroCallStyles, MacroDefId, MacroDefKind,
     attrs::AttrId,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
     mod_path::{ModPath, PathKind},
@@ -76,7 +77,7 @@ type R<T = ()> = Result<T, String>;
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 9";
+pub const ENCODING: &str = "blaze frozen def map 10";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -532,7 +533,7 @@ impl<'a> Enc<'a> {
             self.bool(outside);
             if outside {
                 let text = self.db.file_text(file).text(self.db);
-                self.out.extend_from_slice(&hash128(text.as_bytes()).to_le_bytes());
+                self.out.put_u128(hash128(text.as_bytes()));
             }
             if !path.starts_with(OUT) {
                 let full = joined(&self.dirs[&owner], &path);
@@ -570,16 +571,8 @@ impl Enc<'_> {
         self.out.push(it);
     }
 
-    pub fn u32(&mut self, mut it: u32) {
-        loop {
-            let byte = (it & 0x7f) as u8;
-            it >>= 7;
-            if it == 0 {
-                self.out.push(byte);
-                return;
-            }
-            self.out.push(byte | 0x80);
-        }
+    pub fn u32(&mut self, it: u32) {
+        self.out.put_uleb(it.into());
     }
 
     pub fn usize(&mut self, it: usize) -> R {
@@ -717,7 +710,7 @@ impl Enc<'_> {
     fn call(&mut self, call: MacroCallId) -> R {
         if self.fingerprinting {
             let print = self.call_hash(call)?;
-            self.out.extend_from_slice(&print.to_le_bytes());
+            self.out.put_u128(print);
             return Ok(());
         }
         if let Some(&index) = self.calls.get(&call) {
@@ -881,7 +874,7 @@ impl Enc<'_> {
         if self.fingerprinting {
             self.u8(1);
             let print = self.context_hash(ctx)?;
-            self.out.extend_from_slice(&print.to_le_bytes());
+            self.out.put_u128(print);
             return Ok(());
         }
         if let Some(&index) = self.contexts.get(&ctx) {
@@ -1510,7 +1503,7 @@ impl Enc<'_> {
         for &(it, Item { def: (), vis, import }) in unnamed_trait_imports {
             self.def(ModuleDefId::TraitId(it))?;
             self.visibility(vis)?;
-            self.option(import, |enc, ImportId { use_, idx }| enc.import(use_, idx))?;
+            self.option(import, |enc, import| enc.import_or_extern_crate(import))?;
         }
         self.usize(underscore_imports.len())?;
         for &UnderscoreImport { import: ImportId { use_, idx }, def, vis } in underscore_imports {
@@ -1761,7 +1754,32 @@ impl Enc<'_> {
                         self.str(message)?;
                     }
                     ExpandErrorKind::DefaultNoVariant => self.u8(7),
-                    _ => return Err(format!("a macro error: {err:?}")),
+                    ExpandErrorKind::Builtin(it) => {
+                        let BuiltinError { message, code, also_at, children, derive } = &**it;
+                        self.u8(8);
+                        self.str(message)?;
+                        self.option(*code, |enc, code| {
+                            enc.u32(code.into());
+                            Ok(())
+                        })?;
+                        self.usize(also_at.len())?;
+                        for &span in also_at {
+                            self.span(span)?;
+                        }
+                        self.usize(children.len())?;
+                        for (kind, text) in children {
+                            self.bool(matches!(kind, BuiltinChild::Help));
+                            self.str(text)?;
+                        }
+                        self.bool(*derive);
+                    }
+                    ExpandErrorKind::ProcMacroPanic(message) => {
+                        self.u8(9);
+                        self.str(message)?;
+                    }
+                    ExpandErrorKind::Mbe(_) => {
+                        return Err(format!("a macro_rules! error: {err:?}"));
+                    }
                 }
             }
         }
@@ -2000,8 +2018,7 @@ impl Enc<'_> {
 /// Reads what [`Enc`] wrote.
 pub struct Dec<'a> {
     db: &'a Db,
-    bytes: &'a [u8],
-    at: usize,
+    r: Reader<'a>,
     krate: Crate,
     closure: Vec<Crate>,
     /// The files of each crate of the closure by their path from its root, read when first
@@ -2021,8 +2038,7 @@ impl<'a> Dec<'a> {
     fn new(db: &'a Db, krate: Crate, bytes: &'a [u8]) -> Self {
         Dec {
             db,
-            bytes,
-            at: 0,
+            r: Reader::new(bytes),
             krate,
             closure: closure(db, krate),
             paths: FxHashMap::default(),
@@ -2063,7 +2079,7 @@ impl<'a> Dec<'a> {
 
     /// Whether the bytes were read to their end.
     pub fn finish(&self) -> R {
-        match self.bytes.len() - self.at {
+        match self.r.left() {
             0 => Ok(()),
             left => Err(format!("{left} bytes left over")),
         }
@@ -2076,34 +2092,18 @@ fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> R<(DefMap, LocalDefMap)> {
     dec.in_def_map = true;
     let mut def_map = dec.def_map()?;
     let local = dec.local()?;
-    if dec.at != bytes.len() {
-        return Err(format!("{} bytes left over", bytes.len() - dec.at));
-    }
+    dec.finish()?;
     def_map.hand_over_scopes(db);
     Ok((def_map, local))
 }
 
 impl Dec<'_> {
     pub fn u8(&mut self) -> R<u8> {
-        let it = *self.bytes.get(self.at).ok_or("the bytes end early")?;
-        self.at += 1;
-        Ok(it)
+        Ok(self.r.u8()?)
     }
 
     pub fn u32(&mut self) -> R<u32> {
-        let mut it = 0u32;
-        let mut shift = 0;
-        loop {
-            let byte = self.u8()?;
-            it |= u32::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(it);
-            }
-            shift += 7;
-            if shift > 28 {
-                return Err("a number over u32".to_owned());
-            }
-        }
+        Ok(self.r.uleb32()?)
     }
 
     pub fn len(&mut self) -> R<usize> {
@@ -2116,8 +2116,7 @@ impl Dec<'_> {
 
     pub fn str(&mut self) -> R<&str> {
         let len = self.len()?;
-        let bytes = self.bytes.get(self.at..self.at + len).ok_or("a string past the end")?;
-        self.at += len;
+        let bytes = self.r.take(len)?;
         std::str::from_utf8(bytes).map_err(|_| "a string that is not UTF-8".to_owned())
     }
 
@@ -2155,12 +2154,7 @@ impl Dec<'_> {
             let owner = self.u32()?;
             let path = self.str()?.to_owned();
             let written = match self.bool()? {
-                true => {
-                    let bytes =
-                        self.bytes.get(self.at..self.at + 16).ok_or("a hash past the end")?;
-                    self.at += 16;
-                    Some(u128::from_le_bytes(bytes.try_into().expect("16 bytes")))
-                }
+                true => Some(self.r.u128()?),
                 false => None,
             };
             if !self.paths.contains_key(&owner) {
@@ -2746,7 +2740,7 @@ impl Dec<'_> {
     /// least a byte, so a length the bytes cannot hold reserves no more than they could.
     fn len_and_room(&mut self) -> R<(usize, usize)> {
         let n = self.len()?;
-        Ok((n, n.min(self.bytes.len() - self.at)))
+        Ok((n, n.min(self.r.left())))
     }
 
     pub fn many<T>(&mut self, mut f: impl FnMut(&mut Self) -> R<T>) -> R<Vec<T>> {
@@ -2837,10 +2831,7 @@ impl Dec<'_> {
                 return Err("a trait import of no trait".to_owned());
             };
             let vis = dec.visibility()?;
-            let import = dec.option(|dec| {
-                let (use_, idx) = dec.import()?;
-                Ok(ImportId { use_, idx })
-            })?;
+            let import = dec.option(|dec| dec.import_or_extern_crate())?;
             Ok((it, Item { def: (), vis, import }))
         })?;
         self.fill(&mut scope.underscore_imports, ThinVec::reserve_exact, |dec| {
@@ -3032,6 +3023,35 @@ impl Dec<'_> {
                     5 => ExpandErrorKind::Other(self.str()?.into()),
                     6 => ExpandErrorKind::BuiltinDerive(self.str()?.into()),
                     7 => ExpandErrorKind::DefaultNoVariant,
+                    8 => {
+                        let message = self.str()?.into();
+                        let code = self.option(|dec| {
+                            u16::try_from(dec.u32()?).map_err(|_| "an error code over u16".to_owned())
+                        })?;
+                        let also_at_len = self.len()?;
+                        let also_at = (0..also_at_len)
+                            .map(|_| self.span())
+                            .collect::<R<Box<[Span]>>>()?;
+                        let children_len = self.len()?;
+                        let children = (0..children_len)
+                            .map(|_| {
+                                let kind = match self.bool()? {
+                                    true => BuiltinChild::Help,
+                                    false => BuiltinChild::Note,
+                                };
+                                Ok((kind, Box::<str>::from(self.str()?)))
+                            })
+                            .collect::<R<Box<[_]>>>()?;
+                        let derive = self.bool()?;
+                        ExpandErrorKind::Builtin(Box::new(BuiltinError {
+                            message,
+                            code,
+                            also_at,
+                            children,
+                            derive,
+                        }))
+                    }
+                    9 => ExpandErrorKind::ProcMacroPanic(self.str()?.into()),
                     it => return Err(format!("macro error {it}")),
                 };
                 DefDiagnosticKind::MacroError { ast, path, err }
@@ -3254,6 +3274,8 @@ pub use lib::deep::deeper as d;
 pub use d::f;
 pub struct Shadowing;
 pub use lib::Shown as Shadowing;
+mod reex { pub(crate) use crate::inner::T as _; }
+use reex::*;
 
 //- /inner.rs
 pub(super) use super::Local as Again;
@@ -3348,6 +3370,47 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
                 enc.out
             })
             .collect()
+    }
+
+    /// A builtin macro's error and a proc macro's panic read back field for field.
+    #[test]
+    fn a_builtin_macro_error_reads_back_whole() {
+        let db = TestDB::with_files(FIXTURE);
+        let krate = crate_named(&db, "main");
+        let def_map = super::super::crate_def_map(&db, krate);
+        let root = def_map.root;
+        let local = Name::new_symbol_root(Symbol::intern("Local"));
+        let found = def_map.module(&db, root).scope(&db).get(&local).types.unwrap().def;
+        let ModuleDefId::AdtId(AdtId::StructId(local)) = found else { panic!("{found:?}") };
+        let ast: AstId<ast::Item> = local.lookup(&db).id.upcast();
+        let span = ast.file_id.span_map(&db).span_for_range(ast.to_range(&db));
+        let m = Name::new_symbol_root(Symbol::intern("m"));
+        let path = ModPath::from_segments(PathKind::Plain, [m]);
+        let builtin = ExpandErrorKind::Builtin(Box::new(BuiltinError {
+            message: "expected a literal".into(),
+            code: Some(802),
+            also_at: Box::new([span, span]),
+            children: Box::new([
+                (BuiltinChild::Note, Box::<str>::from("a note")),
+                (BuiltinChild::Help, Box::<str>::from("a help")),
+            ]),
+            derive: true,
+        }));
+        let panicked = ExpandErrorKind::ProcMacroPanic("it panicked".into());
+        let diagnostics = [
+            DefDiagnostic::macro_error(root, ast, path.clone(), builtin),
+            DefDiagnostic::macro_error(root, ast, path, panicked),
+        ];
+        let mut enc = Enc::new(&db, krate);
+        for it in &diagnostics {
+            enc.diagnostic(it).unwrap();
+        }
+        let bytes = enc.finish().unwrap();
+        let mut dec = Dec::new_checked(&db, krate, &bytes).unwrap();
+        for it in &diagnostics {
+            assert_eq!(&dec.diagnostic().unwrap(), it);
+        }
+        dec.finish().unwrap();
     }
 
     /// The fixture has what the records hold, so the bytes above cover them.

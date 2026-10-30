@@ -54,26 +54,19 @@ impl Value {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = b"blaze v2 run value 1".to_vec();
-        out.extend(postcard::to_allocvec(self).expect("a value is always encodable"));
-        out
+        // alloc: the bytes the store keeps, encoded after the magic in one buffer
+        postcard::to_extend(self, b"blaze v2 run value 1".to_vec()).expect("a value is always encodable")
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Value, String> {
         let rest = bytes
             .strip_prefix(b"blaze v2 run value 1".as_slice())
-            .ok_or_else(|| "not a run's value".to_owned())?;
-        postcard::from_bytes(rest).map_err(|error| format!("a run's value: {error}"))
+            .ok_or_else(|| "not a run's value".to_owned())?; // alloc: error path
+        postcard::from_bytes(rest).map_err(|error| format!("a run's value: {error}")) // alloc: error path
     }
 
-    fn of(exit: &Exit, files: Vec<OutFile>) -> Value {
-        Value {
-            code: exit.code,
-            signal: exit.signal,
-            stdout: exit.stdout.clone(),
-            stderr: exit.stderr.clone(),
-            files,
-        }
+    fn of(exit: Exit, files: Vec<OutFile>) -> Value {
+        Value { code: exit.code, signal: exit.signal, stdout: exit.stdout, stderr: exit.stderr, files }
     }
 }
 
@@ -174,11 +167,11 @@ impl Run {
                 if let Some(out_dir) = &spec.out_dir
                     && !write.contains(out_dir)
                 {
-                    write.push(out_dir.clone());
+                    write.push(out_dir.clone()); // clone: setup, the sandbox's command owns what it may write
                 }
             }
             Sandbox::Off => {
-                return Err(RunError::Spawn(format!(
+                return Err(RunError::Spawn(format!( // alloc: error path
                     "{}: user code runs in a sandbox that traces; this one is off, so what it \
                      reads can't be known and its result can't be kept",
                     spec.command.program.display()
@@ -188,6 +181,7 @@ impl Run {
         if let Some(out_dir) = &spec.out_dir {
             empty(out_dir).map_err(RunError::OutDir)?;
         }
+        // alloc: a spawn, at the edge: the effect owns its command, and the run keeps its spec
         effects.push(Effect::Spawn { command: Box::new(spec.command.clone()), tag });
         Ok(Begun::Running(Run { spec, tag, kept }))
     }
@@ -210,15 +204,16 @@ impl Run {
         keyed: impl FnOnce(&mut Traced),
     ) -> Result<(Value, Traced, Vec<Ticket>), RunError<I::Error>> {
         assert_eq!(completion.tag, self.tag, "a run takes its own completion");
-        let exit = match completion.done {
+        let mut exit = match completion.done {
             Done::Exited(exit) => exit,
             Done::Failed(error) => {
+                // alloc: error path
                 return Err(RunError::Spawn(format!("{}: {error}", self.spec.command.program.display())));
             }
-            other => return Err(RunError::Spawn(format!("a spawn completed as {other:?}"))),
+            other => return Err(RunError::Spawn(format!("a spawn completed as {other:?}"))), // alloc: error path
         };
-        let Some(mut traced) = exit.traced.clone() else {
-            return Err(RunError::Spawn(format!(
+        let Some(mut traced) = exit.traced.take() else {
+            return Err(RunError::Spawn(format!( // alloc: error path
                 "{}: its sandbox traces, and its exit has no record of what it read",
                 self.spec.command.program.display()
             )));
@@ -230,49 +225,61 @@ impl Run {
         }
         let files = match &self.spec.out_dir {
             Some(out_dir) => collect(out_dir).map_err(RunError::OutDir)?,
-            None => Vec::new(),
+            None => Vec::new(), // alloc: none, an empty list
         };
-        let value = Value::of(&exit, files);
+        let rule = (exit.code == Some(0)).then(|| rule(&exit));
+        let value = Value::of(exit, files);
         if let Some(kept) = &self.kept {
             if let Some(what) = differs(kept, &value) {
                 return Err(RunError::Differs { key: self.spec.key, what });
             }
         }
-        if !value.succeeded() {
-            return Ok((value, traced, Vec::new()));
-        }
-        rule::widen(&mut traced, &rule(&exit), inputs).map_err(RunError::Inputs)?;
+        let Some(rule) = rule else {
+            return Ok((value, traced, Vec::new())); // alloc: none, no tickets
+        };
+        rule::widen(&mut traced, &rule, inputs).map_err(RunError::Inputs)?;
         let tickets =
             index::keep(store, &self.spec.key, &traced, value.encode()).map_err(RunError::Keep)?;
         Ok((value, traced, tickets))
     }
 }
 
-/// The first way `ran` differs from `kept`, if it does.
+/// The first way `ran` differs from `kept`, if it does: what verify mode says, so only a
+/// difference is said, and an equal value allocates nothing.
 pub fn differs(kept: &Value, ran: &Value) -> Option<String> {
     if (kept.code, kept.signal) != (ran.code, ran.signal) {
+        // alloc: a difference said
         return Some(format!("it ended {:?} {:?}, not {:?} {:?}", ran.code, ran.signal, kept.code, kept.signal));
     }
     if kept.stdout != ran.stdout {
         let line = first_line_differing(&kept.stdout, &ran.stdout);
-        return Some(format!("what it printed differs at line {line}"));
+        return Some(format!("what it printed differs at line {line}")); // alloc: a difference said
     }
-    let kept_paths: Vec<&str> = kept.files.iter().map(|it| it.path.as_str()).collect();
-    let ran_paths: Vec<&str> = ran.files.iter().map(|it| it.path.as_str()).collect();
-    if kept_paths != ran_paths {
-        return Some(format!("its OUT_DIR holds {ran_paths:?}, not {kept_paths:?}"));
+    fn paths(value: &Value) -> impl Iterator<Item = &str> {
+        value.files.iter().map(|it| it.path.as_str())
+    }
+    if !paths(kept).eq(paths(ran)) {
+        let [kept, ran]: [Vec<&str>; 2] = [paths(kept).collect(), paths(ran).collect()]; // alloc: a difference said
+        return Some(format!("its OUT_DIR holds {ran:?}, not {kept:?}")); // alloc: a difference said
     }
     kept.files
         .iter()
         .zip(&ran.files)
         .find(|(a, b)| a != b)
-        .map(|(a, _)| format!("{} in its OUT_DIR differs", a.path))
+        .map(|(a, _)| format!("{} in its OUT_DIR differs", a.path)) // alloc: a difference said
 }
 
 fn first_line_differing(a: &[u8], b: &[u8]) -> usize {
-    let a: Vec<&[u8]> = a.split(|it| *it == b'\n').collect();
-    let b: Vec<&[u8]> = b.split(|it| *it == b'\n').collect();
-    (0..a.len().max(b.len())).find(|&at| a.get(at) != b.get(at)).unwrap_or(0) + 1
+    let mut a = a.split(|it| *it == b'\n');
+    let mut b = b.split(|it| *it == b'\n');
+    let mut line = 1;
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return 1,
+            (a, b) if a != b => return line,
+            _ => line += 1,
+        }
+    }
 }
 
 /// `dir` made, empty.
@@ -280,8 +287,9 @@ fn empty(dir: &Path) -> Result<(), String> {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("{}: emptying it: {error}", dir.display())),
+        Err(error) => return Err(format!("{}: emptying it: {error}", dir.display())), // alloc: error path
     }
+    // alloc: error path
     std::fs::create_dir_all(dir).map_err(|error| format!("{}: making it: {error}", dir.display()))
 }
 
@@ -289,25 +297,27 @@ fn empty(dir: &Path) -> Result<(), String> {
 /// leads to when that is inside `dir`, and an error otherwise: what a later step reads
 /// through it would be read outside every trace.
 pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
-    let top = std::fs::canonicalize(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    let mut out = Vec::new();
-    let mut stack = vec![PathBuf::new()];
+    let top = std::fs::canonicalize(dir).map_err(|error| format!("{}: {error}", dir.display()))?; // alloc: error path
+    let mut out = Vec::new(); // alloc: the files the value keeps, read once as a run ends
+    let mut stack = vec![PathBuf::new()]; // alloc: once per OUT_DIR collected
     while let Some(rel) = stack.pop() {
         let at = dir.join(&rel);
-        let entries = std::fs::read_dir(&at).map_err(|error| format!("{}: {error}", at.display()))?;
+        let entries = std::fs::read_dir(&at).map_err(|error| format!("{}: {error}", at.display()))?; // alloc: error path
         for entry in entries {
-            let entry = entry.map_err(|error| format!("{}: {error}", at.display()))?;
+            let entry = entry.map_err(|error| format!("{}: {error}", at.display()))?; // alloc: error path
             let name = entry.file_name();
             let Some(name) = name.to_str() else {
-                return Err(format!("{}: a name that is not UTF-8 ({name:?})", at.display()));
+                return Err(format!("{}: a name that is not UTF-8 ({name:?})", at.display())); // alloc: error path
             };
             let rel = rel.join(name);
             let path = dir.join(&rel);
+            // alloc: error path
             let link = std::fs::symlink_metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
             if link.file_type().is_symlink() {
-                let target = std::fs::canonicalize(&path).map_err(|error| format!("{}: a link to nothing: {error}", path.display()))?;
+                let target = std::fs::canonicalize(&path)
+                    .map_err(|error| format!("{}: a link to nothing: {error}", path.display()))?; // alloc: error path
                 if !target.starts_with(&top) {
-                    return Err(format!(
+                    return Err(format!( // alloc: error path
                         "{} is a link to {}, outside the OUT_DIR: what is read through it \
                          would be read outside every trace",
                         path.display(),
@@ -315,7 +325,7 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
                     ));
                 }
             }
-            let meta = std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+            let meta = std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
             let name = rel_name(&rel);
             match meta.is_dir() {
                 true => {
@@ -327,6 +337,7 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
                     }
                 }
                 false => {
+                    // alloc: error path
                     let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
                     out.push(OutFile { path: name, executable: executable(&meta), bytes: Some(bytes) });
                 }
@@ -337,9 +348,16 @@ pub fn collect(dir: &Path) -> Result<Vec<OutFile>, String> {
     Ok(out)
 }
 
+/// `rel`, `/`-separated: the path an [`OutFile`] keeps.
 fn rel_name(rel: &Path) -> String {
-    let parts: Vec<String> = rel.components().map(|it| it.as_os_str().to_string_lossy().into_owned()).collect();
-    parts.join("/")
+    let mut name = String::with_capacity(rel.as_os_str().len());
+    for (at, part) in rel.components().enumerate() {
+        if at > 0 {
+            name.push('/');
+        }
+        name.push_str(&part.as_os_str().to_string_lossy());
+    }
+    name
 }
 
 #[cfg(unix)]
@@ -362,21 +380,23 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
             && !file.path.starts_with('/')
             && file.path.split('/').all(|it| !it.is_empty() && it != "." && it != ".." && !it.contains('\\'));
         if !ok {
-            return Err(format!("a kept OUT_DIR names {:?}, which would leave it", file.path));
+            return Err(format!("a kept OUT_DIR names {:?}, which would leave it", file.path)); // alloc: error path
         }
         let path = dir.join(&file.path);
         match &file.bytes {
+            // alloc: error path
             None => std::fs::create_dir_all(&path).map_err(|error| format!("{}: {error}", path.display()))?,
             Some(bytes) => {
                 if let Some(parent) = path.parent() {
+                    // alloc: error path
                     std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
                 }
-                std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?;
+                std::fs::write(&path, bytes).map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
                 #[cfg(unix)]
                 if file.executable {
                     use std::os::unix::fs::PermissionsExt as _;
                     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                        .map_err(|error| format!("{}: {error}", path.display()))?;
+                        .map_err(|error| format!("{}: {error}", path.display()))?; // alloc: error path
                 }
             }
         }
@@ -525,6 +545,17 @@ mod tests {
             panic!("the store misses a kept run")
         };
         assert_eq!(read, held);
+        // Warm, either finds the kept run with no allocation: the hit is lent in place.
+        #[cfg(unix)]
+        {
+            let read = blaze_alloc_count::assert_at_most(0, "a warm find by a reader", || {
+                matches!(index::find(&reader, &guard, &key, &mut inputs), Ok(Found::Hit { .. }))
+            });
+            let held = blaze_alloc_count::assert_at_most(0, "a warm find on the store's thread", || {
+                matches!(index::find_held(&store, &key, &mut inputs), Ok(Found::Hit { .. }))
+            });
+            assert!(read && held);
+        }
         drop(guard);
         // A variable the run never read changes nothing.
         inputs.env.push(("PATH".into(), "/elsewhere".into()));

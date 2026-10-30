@@ -73,6 +73,7 @@ pub(crate) fn fixup_syntax(
 
         let node_range = node.text_range();
         if can_handle_error(&node) && has_error_to_handle(&node) {
+            // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
             remove.insert(node.clone().into());
             // the node contains an error node, we have to completely replace it by something valid
             let original_tree =
@@ -89,6 +90,7 @@ pub(crate) fn fixup_syntax(
                 },
                 is_raw: tt::IdentIsRaw::No,
             });
+            // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
             append.insert(node.clone().into(), vec![replacement]);
             preorder.skip_subtree();
             continue;
@@ -99,6 +101,7 @@ pub(crate) fn fixup_syntax(
                 ast::FieldExpr(it) => {
                     if it.name_ref().is_none() {
                         // incomplete field access: some_expr.|
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.clone().into(), vec![
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
@@ -111,6 +114,7 @@ pub(crate) fn fixup_syntax(
                 ast::ExprStmt(it) => {
                     let needs_semi = it.semicolon_token().is_none() && it.expr().is_some_and(|e| e.syntax().kind() != SyntaxKind::BLOCK_EXPR);
                     if needs_semi {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.clone().into(), vec![
                             Leaf::Punct(Punct {
                                 char: ';',
@@ -122,6 +126,7 @@ pub(crate) fn fixup_syntax(
                 },
                 ast::LetStmt(it) => {
                     if it.semicolon_token().is_none() {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.clone().into(), vec![
                             Leaf::Punct(Punct {
                                 char: ';',
@@ -138,6 +143,7 @@ pub(crate) fn fixup_syntax(
                             Some(t) => t,
                             None => continue,
                         };
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(if_token.into(), vec![
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
@@ -147,6 +153,7 @@ pub(crate) fn fixup_syntax(
                         ]);
                     }
                     if it.then_branch().is_none() {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.clone().into(), vec![
                             Leaf::Punct(Punct {
                                 char: '{',
@@ -168,6 +175,7 @@ pub(crate) fn fixup_syntax(
                             Some(t) => t,
                             None => continue,
                         };
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(while_token.into(), vec![
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
@@ -177,6 +185,7 @@ pub(crate) fn fixup_syntax(
                         ]);
                     }
                     if it.loop_body().is_none() {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.clone().into(), vec![
                             Leaf::Punct(Punct {
                                 char: '{',
@@ -193,6 +202,7 @@ pub(crate) fn fixup_syntax(
                 },
                 ast::LoopExpr(it) => {
                     if it.loop_body().is_none() {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.clone().into(), vec![
                             Leaf::Punct(Punct {
                                 char: '{',
@@ -213,6 +223,7 @@ pub(crate) fn fixup_syntax(
                             Some(t) => t,
                             None => continue
                         };
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(match_token.into(), vec![
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,
@@ -223,6 +234,7 @@ pub(crate) fn fixup_syntax(
                     }
                     if it.match_arm_list().is_none() {
                         // No match arms
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.clone().into(), vec![
                             Leaf::Punct(Punct {
                                 char: '{',
@@ -256,13 +268,16 @@ pub(crate) fn fixup_syntax(
                     );
 
                     if it.pat().is_none() && it.in_token().is_none() && it.iterable().is_none() {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(for_token.into(), vec![pat, in_token, iter]);
                     // does something funky -- see test case for_no_pat
                     } else if it.pat().is_none() {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(for_token.into(), vec![pat]);
                     }
 
                     if it.loop_body().is_none() {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.clone().into(), vec![
                             Leaf::Punct(Punct {
                                 char: '{',
@@ -280,6 +295,7 @@ pub(crate) fn fixup_syntax(
                 ast::RecordExprField(it) => {
                     if let Some(colon) = it.colon_token()
                         && it.name_ref().is_some() && it.expr().is_none() {
+                            // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                             append.insert(colon.into(), vec![
                                 Leaf::Ident(Ident {
                                     sym: sym::__ra_fixup,
@@ -292,6 +308,7 @@ pub(crate) fn fixup_syntax(
                 ast::Path(it) => {
                     if let Some(colon) = it.coloncolon_token()
                         && it.segment().is_none() {
+                            // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                             append.insert(colon.into(), vec![
                                 Leaf::Ident(Ident {
                                     sym: sym::__ra_fixup,
@@ -303,6 +320,7 @@ pub(crate) fn fixup_syntax(
                 },
                 ast::ClosureExpr(it) => {
                     if it.body().is_none() {
+                        // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
                         append.insert(node.into(), vec![
                             Leaf::Ident(Ident {
                                 sym: sym::__ra_fixup,

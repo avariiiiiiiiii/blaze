@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use blaze_alloc_count::assert_at_most;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, bits::Ranked, rng::SplitMix64};
 use test_fixture::WithFixture;
 
 use super::{items, single};
@@ -13,30 +13,21 @@ use crate::{
     CodeHash, DeepHash, Fact, FactSet, InterfaceHash, ItemHashes, ItemKey, ItemKind, LayoutHash,
     Unhashable, crate_hashes, item_key,
     key::{self, KeyIndex, Row},
-    table::{Bits, HashColumns},
+    table::HashColumns,
 };
 
 /// One crate's first 9 key bytes, and another's.
 const PREFIX: [u8; 9] = [7, 1, 2, 3, 4, 5, 6, 7, 0];
 const OTHER: [u8; 9] = [9, 9, 9, 9, 9, 9, 9, 9, 0x80];
 
-fn next(state: &mut u64) -> u64 {
-    *state ^= *state << 13;
-    *state ^= *state >> 7;
-    *state ^= *state << 17;
-    *state
-}
-
 /// `count` keys under `prefix`, the rest of each from `seed`.
 fn keys(count: usize, seed: u64, prefix: [u8; 9]) -> Vec<ItemKey> {
-    let mut state = seed | 1;
+    let mut rng = SplitMix64::new(seed);
     (0..count)
         .map(|_| {
             let mut bytes = [0; 32];
             bytes[..9].copy_from_slice(&prefix);
-            for chunk in bytes[9..].chunks_mut(8) {
-                chunk.copy_from_slice(&next(&mut state).to_le_bytes()[..chunk.len()]);
-            }
+            rng.fill(&mut bytes[9..]);
             ItemKey(ContentId(bytes))
         })
         .collect()
@@ -145,10 +136,10 @@ fn a_warm_lookup_allocates_nothing() {
         }
     });
 
-    let bits = Bits::new((0..1000).map(|it| it % 5 == 0));
-    assert_at_most(0, "a bitset's rank", || {
+    let bits = Ranked::from_bools((0..1000).map(|it| it % 5 == 0));
+    assert_at_most(0, "a ranked bitset's place", || {
         for row in 0..1000 {
-            std::hint::black_box((bits.get(row), bits.rank(row)));
+            std::hint::black_box(bits.place(row));
         }
     });
 }

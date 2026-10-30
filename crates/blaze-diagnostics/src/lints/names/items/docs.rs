@@ -15,10 +15,10 @@ use syntax::{
 };
 
 use super::{
-    def_span,
-    visibility::{self, Def, Effective},
+    def_span, visibility,
     walk::{self, Container, Item},
 };
+use crate::lints::names::effective::{Def, Effective};
 use crate::{
     cx::Cx,
     lower::{Found, Phase},

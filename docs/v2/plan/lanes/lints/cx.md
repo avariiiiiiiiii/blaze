@@ -91,7 +91,10 @@ impl<'q, 't> Cx<'q, 't> {
 node of the tree written in the file or handed to a macro, as now. Item-level lints
 (`crate_in_macro_def`, `empty_enums`, `new_without_default`, `nonstandard_macro_braces`,
 `redundant_static_lifetimes`, `upper_case_acronyms`) run in `item_lints`; the rest in
-`body_lints`. `blaze::check_body(cx)` and `blaze::check_items(cx)` run blaze's own.
+`body_lints`. `blaze::check_node(cx, node)` runs blaze's own, called from both walks for every
+node, the root included; its body pass runs once, at `node == cx.root()` with
+`cx.analysis()` `Some`. `cx.path` answers at item level too, in the scope of the item the path
+is written in.
 Each lint module keeps its `pub(super) fn check(cx: &mut Cx<'_, '_>, node: ast::X<'_>)` shape.
 
 ## Buffers

@@ -14,12 +14,15 @@
 //! Each file is read and indexed once, into an arena of [`Sources`] by `u32`; each diagnostic
 //! looks its files up once; what is rendered borrows the text of the files and of the
 //! diagnostic, and copies none of it. The bar is rustc's own: its `analyze_source_file` finds
-//! lines 16 bytes at a time with SSE2, where `memchr` picks AVX2, SSE2 or NEON at run time, and
+//! lines 16 bytes at a time with SSE2, where `span::LineIndex` makes its newline bitmap 64 bytes
+//! at a time with AVX-512BW, AVX2, SSE2 or NEON, picked at run time, and
 //! the layout is the same `annotate-snippets` rustc renders with, given borrowed text where
 //! rustc formats each line into a `String` first.
 
 pub mod codes;
 mod json;
+#[cfg(test)]
+mod reference;
 
 use std::borrow::Cow;
 
@@ -28,7 +31,7 @@ use blaze_ids::radix;
 use rustc_hash::FxBuildHasher;
 use smallvec::{SmallVec, smallvec};
 
-use crate::model::{Code, Diag, Expansion, Level, MacroKind, MultiSpan, Span, Sublevel, Suggestion, SuggestionStyle};
+use crate::model::{Code, Diag, Level, MacroKind, MultiSpan, Span, Sublevel, Suggestion, SuggestionStyle};
 
 /// rustc's `MAX_SUGGESTIONS`: the most ways to substitute that one suggestion shows.
 const MAX_SUGGESTIONS: usize = 4;
@@ -39,25 +42,28 @@ pub const WIDTH: usize = annotate_snippets::renderer::DEFAULT_TERM_WIDTH;
 /// The index of a file that can't be read: past the end of every arena of files.
 const UNREAD: u32 = u32::MAX;
 
-/// The text of the files diagnostics point into, by the name they give them.
+/// The text of the files diagnostics point into, by the name they give them. The caller reads
+/// them: [`Sources::unread`] names the files a batch of diagnostics needs, each given once to
+/// [`Sources::add`] before the batch is written.
+#[derive(Default)]
 pub struct Sources {
     /// Each file's index in `files` by its name, or [`UNREAD`]: one probe of an Fx table per
-    /// lookup, allocating only the first time a name is met.
+    /// lookup.
     names: hashbrown::HashMap<String, u32, FxBuildHasher>,
     files: Vec<File>,
-    read: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
 }
 
 /// A file as rustc's `SourceFile` holds it: its text without a byte order mark and with each
 /// `\r\n` as `\n` (`normalize_src`), where its lines start, and where what was taken out was.
 /// Spans are in bytes of the file as read; the text is shown and measured as rustc has it.
 ///
-/// The text is the `String` read, not a copy, unless a BOM or a `\r\n` is taken out. 4 bytes a
-/// line and 8 a `\r\n` besides; placing a byte is a binary search of the lines, then a count of
+/// The text is the `String` read, not a copy, unless a BOM or a `\r\n` is taken out. An eighth
+/// of a byte per byte of text for its lines ([`span::LineIndex`]) and 8 bytes a `\r\n`; placing
+/// a byte is a rank of the newline bitmap, then a count of
 /// the line's chars only in a file that is not ASCII (rustc keeps its multibyte chars for it).
 struct File {
     text: String,
-    lines: Vec<u32>,
+    lines: span::LineIndex,
     /// Each `\r` taken out: where it was in the file as read, and where its `\n` is in `text`.
     crs: Vec<(u32, u32)>,
     /// The length of the file as read.
@@ -86,14 +92,7 @@ impl File {
                 text
             }
         };
-        let bytes = text.as_bytes();
-        let mut lines = Vec::with_capacity(memchr::memchr_iter(b'\n', bytes).count() + 1);
-        lines.push(0);
-        lines.extend(
-            memchr::memchr_iter(b'\n', bytes)
-                .map(|at| at as u32 + 1)
-                .filter(|it| (*it as usize) < bytes.len()),
-        );
+        let lines = span::LineIndex::new(&text);
         let ascii = text.is_ascii();
         File { text, lines, crs, len, bom: bom as u32, ascii }
     }
@@ -119,14 +118,16 @@ impl File {
 
     /// The 0-based line byte `at` of `text` is on.
     fn line_of(&self, at: usize) -> usize {
-        self.lines.partition_point(|it| (*it as usize) <= at).saturating_sub(1)
+        let at = span::TextSize::new(at.min(self.text.len()) as u32);
+        self.lines.line(at).expect("an offset up to the text's end") as usize
     }
 
     /// The bytes of 0-based line `line`, from its start to the start of the next one.
     fn line_bounds(&self, line: usize) -> std::ops::Range<usize> {
-        let start = self.lines.get(line).map_or(self.text.len(), |it| *it as usize);
-        let end = self.lines.get(line + 1).map_or(self.text.len(), |it| *it as usize);
-        start..end
+        let start_of = |line: usize| {
+            u32::try_from(line).ok().and_then(|line| self.lines.line_start(line)).map_or(self.text.len(), usize::from)
+        };
+        start_of(line)..start_of(line + 1)
     }
 
     /// The text of 0-based line `line`, without its `\n`: rustc's `get_line`.
@@ -138,7 +139,7 @@ impl File {
     /// The 1-based line and the 0-based column in chars of byte `at` of `text`.
     fn position(&self, at: usize) -> (usize, usize) {
         let line = self.line_of(at);
-        let start = self.lines[line] as usize;
+        let start = self.line_bounds(line).start;
         let column = match self.ascii {
             true => at - start,
             false => self.text[start..at].chars().count(),
@@ -161,25 +162,46 @@ impl File {
 }
 
 impl Sources {
-    /// Files read with `read`, once each.
-    pub fn new(read: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> Sources {
-        Sources { names: hashbrown::HashMap::default(), files: Vec::new(), read: Box::new(read) }
-    }
-
     /// Files whose text is given.
     pub fn of(files: impl IntoIterator<Item = (String, String)>) -> Sources {
-        let mut sources = Sources::new(|_| None);
+        let mut sources = Sources::default();
         for (name, text) in files {
-            sources.names.insert(name, sources.files.len() as u32);
-            sources.files.push(File::new(text));
+            sources.add(&name, Some(text));
         }
         sources
     }
 
+    /// The files `diags` point into, through each macro call and definition their spans are
+    /// in, that were not given to [`Sources::add`]: each once, in the order first pointed into.
+    pub fn unread<'d>(&self, diags: impl IntoIterator<Item = &'d Diag>) -> Vec<&'d str> {
+        let mut seen: hashbrown::HashSet<&'d str, FxBuildHasher> = hashbrown::HashSet::default();
+        let mut unread = Vec::new();
+        for diag in diags {
+            each_file(diag, &mut |name| {
+                if !self.names.contains_key(name) && seen.insert(name) {
+                    unread.push(name);
+                }
+            });
+        }
+        unread
+    }
+
+    /// The text of the file `name`, as the caller read it; `None` for one it can't read, whose
+    /// spans are then a bug of whoever made them. A name given twice keeps its first text.
+    pub fn add(&mut self, name: &str, text: Option<String>) {
+        let Sources { names, files } = self;
+        names.entry_ref(name).or_insert_with(|| match text {
+            Some(text) => {
+                files.push(File::new(text));
+                (files.len() - 1) as u32
+            }
+            None => UNREAD,
+        });
+    }
+
     /// The 1-based line and 1-based column (in chars) of byte `at` of `file`.
-    pub fn position(&mut self, file: &str, at: u32) -> Option<(u32, u32)> {
-        let index = self.load(file);
-        let file = self.files.get(index as usize)?;
+    pub fn position(&self, file: &str, at: u32) -> Option<(u32, u32)> {
+        let file = self.files.get(self.index(file) as usize)?;
         if at > file.len {
             return None;
         }
@@ -187,16 +209,9 @@ impl Sources {
         Some((line as u32, column as u32 + 1))
     }
 
-    /// The index of the file `name`, read the first time it is asked for.
-    fn load(&mut self, name: &str) -> u32 {
-        let Sources { names, files, read } = self;
-        *names.entry_ref(name).or_insert_with(|| match read(name) {
-            Some(text) => {
-                files.push(File::new(text));
-                (files.len() - 1) as u32
-            }
-            None => UNREAD,
-        })
+    /// The index of the file `name` in `files`, or [`UNREAD`].
+    fn index(&self, name: &str) -> u32 {
+        self.names.get(name).copied().unwrap_or(UNREAD)
     }
 }
 
@@ -208,19 +223,13 @@ struct Placed<'a> {
 }
 
 impl<'a> Placed<'a> {
-    fn new(diag: &'a Diag, sources: &'a mut Sources) -> Placed<'a> {
-        let mut names = SmallVec::new();
-        let spans = spans_of(&diag.span)
-            .chain(diag.children.iter().flat_map(|it| spans_of(&it.span)))
-            .chain(
-                diag.suggestions
-                    .iter()
-                    .flat_map(|it| it.substitutions.iter().flatten().map(|(span, _)| span)),
-            );
-        for span in spans {
-            meet(&mut names, sources, span);
-        }
-        let sources: &'a Sources = sources;
+    fn new(diag: &'a Diag, sources: &'a Sources) -> Placed<'a> {
+        let mut names: SmallVec<[(&'a str, u32); 4]> = SmallVec::new();
+        each_file(diag, &mut |name| {
+            if !names.iter().any(|(it, _)| *it == name) {
+                names.push((name, sources.index(name)));
+            }
+        });
         Placed { names, files: &sources.files }
     }
 
@@ -247,15 +256,24 @@ fn spans_of(span: &MultiSpan) -> impl Iterator<Item = &Span> {
     span.primary.iter().chain(span.labels.iter().map(|(it, _)| it))
 }
 
-/// Looks up the file of `span` and of each macro call and definition it is in, once each.
-fn meet<'a>(names: &mut SmallVec<[(&'a str, u32); 4]>, sources: &mut Sources, mut span: &'a Span) {
+/// Each file `diag` points into: of its spans, its children's and its suggestions', and of
+/// each macro call and definition they are in. A file may be met more than once.
+fn each_file<'a>(diag: &'a Diag, f: &mut impl FnMut(&'a str)) {
+    let spans = spans_of(&diag.span)
+        .chain(diag.children.iter().flat_map(|it| spans_of(&it.span)))
+        .chain(diag.suggestions.iter().flat_map(|it| it.substitutions.iter().flatten().map(|(span, _)| span)));
+    for span in spans {
+        meet(span, f);
+    }
+}
+
+/// The file of `span` and of each macro call and definition it is in.
+fn meet<'a>(mut span: &'a Span, f: &mut impl FnMut(&'a str)) {
     loop {
-        if !names.iter().any(|(it, _)| *it == span.file) {
-            names.push((span.file.as_str(), sources.load(&span.file)));
-        }
+        f(&span.file);
         let Some(expansion) = span.expansion.as_deref() else { return };
         if let Some(def) = &expansion.def_site {
-            meet(names, sources, def);
+            meet(def, f);
         }
         span = &expansion.call_site;
     }
@@ -283,14 +301,14 @@ impl Default for Style {
 }
 
 /// `diag` as rustc writes it, without the empty line it writes after one.
-pub fn rendered(diag: &Diag, sources: &mut Sources, style: Style) -> String {
+pub fn rendered(diag: &Diag, sources: &Sources, style: Style) -> String {
     render(diag, &Placed::new(diag, sources), style)
 }
 
 /// `rendered` as rustc writes it to stderr: with the empty line after it (none after short, nor
 /// after a failure note). Under `short` rustc names no error codes to explain (its emitter
 /// can't show them), so one of [`summary`]'s notes naming them is the empty string.
-pub fn written(diag: &Diag, sources: &mut Sources, style: Style) -> String {
+pub fn written(diag: &Diag, sources: &Sources, style: Style) -> String {
     if style.short && explains(diag) {
         return String::new();
     }
@@ -301,12 +319,19 @@ pub fn written(diag: &Diag, sources: &mut Sources, style: Style) -> String {
 /// after it, its `rendered` as `style` says (`--json=diagnostic-short`,
 /// `--json=diagnostic-rendered-ansi`). Under `short`, one of [`summary`]'s notes naming error
 /// codes to explain is the empty string, as in [`written`].
-pub fn json(diag: &Diag, sources: &mut Sources, style: Style) -> String {
+pub fn json(diag: &Diag, sources: &Sources, style: Style) -> String {
     if style.short && explains(diag) {
         return String::new();
     }
     let placed = Placed::new(diag, sources);
     let rendered = write(diag, &placed, style);
+    json::line(diag, &placed, rendered)
+}
+
+/// [`json`] with `rendered` as its text: [`written`] of `diag` in the same style, made
+/// already.
+pub fn json_rendered(diag: &Diag, sources: &Sources, rendered: String) -> String {
+    let placed = Placed::new(diag, sources);
     json::line(diag, &placed, rendered)
 }
 
@@ -333,9 +358,15 @@ fn explains(diag: &Diag) -> bool {
 /// emitted", "N warnings emitted", "Some errors have detailed explanations: ...", "For more
 /// information about this error, try `rustc --explain E0308`." (failure-note), as rustc's
 /// `DiagCtxtInner::print_error_count` gives them.
-pub fn summary(diags: &[Diag]) -> Vec<Diag> {
-    let errors = diags.iter().filter(|it| it.level == Level::Error).count();
-    let warnings = diags.iter().filter(|it| it.level == Level::Warning).count();
+pub fn summary<'d>(diags: impl IntoIterator<Item = &'d Diag> + Clone) -> Vec<Diag> {
+    let (mut errors, mut warnings) = (0usize, 0usize);
+    for diag in diags.clone() {
+        errors += usize::from(diag.level == Level::Error);
+        warnings += usize::from(diag.level == Level::Warning);
+    }
+    if errors == 0 && warnings == 0 {
+        return Vec::new();
+    }
     let warned = match warnings {
         0 => String::new(),
         1 => "1 warning emitted".to_owned(),
@@ -348,13 +379,12 @@ pub fn summary(diags: &[Diag]) -> Vec<Diag> {
     };
     let mut closing = Vec::with_capacity(3);
     match (errors, warnings) {
-        (0, 0) => return closing,
         (0, _) => closing.push(Diag::new(Level::Warning, None, warned)),
         (_, 0) => closing.push(Diag::new(Level::Error, None, aborted)),
         (_, _) => closing.push(Diag::new(Level::Error, None, format!("{aborted}; {warned}"))),
     }
     let mut explained: Vec<&str> = diags
-        .iter()
+        .into_iter()
         .filter_map(|it| it.code.as_ref().and_then(Code::error))
         .filter(|code| codes::explanation(code).is_some())
         .collect();
@@ -440,7 +470,7 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
             group = snippets(group, &child.span, extra, placed);
         }
     }
-    if let Some(note) = originates_in(diag)
+    if let Some(note) = diag.origin_note()
         && !diag.children.iter().any(|it| it.message == note)
     {
         group = group.element(annotate_snippets::Level::NOTE.message(note));
@@ -568,11 +598,13 @@ fn snippets<'a>(
 /// they were labelled, then the primary spans with no label, by file in the order they are
 /// met, each file's by line, leaving out those not in their file.
 fn collect_annotations<'a>(span: &'a MultiSpan, extra: Labels<'a>, placed: &Placed<'a>) -> Annotated<'a> {
-    let unlabelled: SmallVec<[&'a Span; 2]> = span
-        .primary
-        .iter()
-        .filter(|it| !span.labels.iter().any(|(at, _)| at == *it) && !extra.iter().any(|(at, _)| at == it))
-        .collect();
+    let mut unlabelled: SmallVec<[&'a Span; 2]> = SmallVec::new();
+    for at in &span.primary {
+        let labelled = span.labels.iter().any(|(it, _)| it == at) || extra.iter().any(|(it, _)| *it == at);
+        if !labelled && !unlabelled.contains(&at) {
+            unlabelled.push(at);
+        }
+    }
     let labels = span
         .labels
         .iter()
@@ -698,35 +730,12 @@ fn attribute_suggestion(file: &File, parts: &mut [Part<'_>]) -> bool {
     true
 }
 
-/// rustc's `Span::macro_backtrace`: the expansions `span` is in, innermost first, leaving out
-/// a macro's recursive calls of itself.
-fn backtrace(span: &Span) -> impl Iterator<Item = &Expansion> {
-    let mut prev: Option<&Span> = None;
-    let mut at = span;
-    std::iter::from_fn(move || {
-        loop {
-            let expansion = at.expansion.as_deref()?;
-            let recursive = prev.is_some_and(|it| same_place(&expansion.call_site, it));
-            prev = Some(at);
-            at = &expansion.call_site;
-            if !recursive {
-                return Some(expansion);
-            }
-        }
-    })
-}
-
-/// rustc's `Span::source_equal`.
-fn same_place(a: &Span, b: &Span) -> bool {
-    a.file == b.file && a.lo == b.lo && a.hi == b.hi
-}
-
 /// rustc's `render_multispan_macro_backtrace` without `-Z macro-backtrace`: a primary span in a
 /// macro's expansion that is not in its call gets a label on the outermost call of a macro
 /// whose definition rustc knows.
 fn macro_labels<'a>(span: &'a MultiSpan, labels: &mut Labels<'a>) {
     for primary in &span.primary {
-        let Some(expansion) = backtrace(primary).filter(|it| it.def_site.is_some()).last() else {
+        let Some(expansion) = primary.macro_backtrace().filter(|it| it.def_site.is_some()).last() else {
             continue;
         };
         let call = &expansion.call_site;
@@ -742,28 +751,6 @@ fn macro_labels<'a>(span: &'a MultiSpan, labels: &mut Labels<'a>) {
             labels.push((call, Cow::Borrowed(label)));
         }
     }
-}
-
-/// rustc's note on a diagnostic in a macro's expansion, which its emitter adds: the macro it
-/// originates in, from the spans of it and of its children
-/// (`fix_multispans_in_extern_macros_and_render_macro_backtrace`).
-fn originates_in(diag: &Diag) -> Option<String> {
-    let spans = diag.span.primary.iter().chain(diag.children.iter().flat_map(|it| &it.span.primary));
-    let mut macros = spans.flat_map(backtrace);
-    let first = macros.next()?;
-    let last = macros.last().unwrap_or(first);
-    let and_then = match last.name != first.name {
-        true => {
-            format!(" which comes from the expansion of the {} `{}`", last.kind.descr(), last.name)
-        }
-        false => String::new(),
-    };
-    Some(format!(
-        "this {} originates in the {} `{}`{and_then} (in Nightly builds, run with -Z macro-backtrace for more info)",
-        diag.level.name(),
-        first.kind.descr(),
-        first.name
-    ))
 }
 
 /// rustc's `primary_span_formatted`: a lone suggestion that is short is shown as a label on
@@ -952,11 +939,15 @@ fn floor(text: &str, at: usize) -> usize {
 mod tests {
     use super::*;
 
+    fn starts(file: &File) -> Vec<u32> {
+        (0..file.lines.line_count()).map(|line| file.lines.line_start(line).unwrap().into()).collect()
+    }
+
     #[test]
     fn a_file_is_measured_as_rustc_has_it_without_its_bom_and_crs() {
         let file = File::new("\u{feff}a\r\nbc\r\n\r\nd".to_owned());
         assert_eq!(file.text, "a\nbc\n\nd");
-        assert_eq!(file.lines, [0, 2, 5, 6]);
+        assert_eq!(starts(&file), [0, 2, 5, 6]);
         // `b`, after the BOM (3), `a` and `\r\n`.
         assert_eq!(file.norm(6), 2);
         assert_eq!(file.original(2), 6);
@@ -981,13 +972,13 @@ mod tests {
     #[test]
     fn a_trailing_newline_starts_no_line() {
         let file = File::new("ab\ncd\n".to_owned());
-        assert_eq!(file.lines, [0, 3]);
+        assert_eq!(starts(&file), [0, 3]);
         assert_eq!(file.position(6), (2, 3));
     }
 
     #[test]
     fn positions_are_one_based_in_chars() {
-        let mut sources = Sources::of([("a.rs".to_owned(), "é = 1;\n  x".to_owned())]);
+        let sources = Sources::of([("a.rs".to_owned(), "é = 1;\n  x".to_owned())]);
         assert_eq!(sources.position("a.rs", 2), Some((1, 2)));
         assert_eq!(sources.position("a.rs", 10), Some((2, 3)));
         assert_eq!(sources.position("a.rs", 11), Some((2, 4)));
@@ -996,18 +987,41 @@ mod tests {
     }
 
     #[test]
-    fn files_are_read_once_each() {
-        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = reads.clone();
-        let mut sources = Sources::new(move |name| {
-            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (name == "a.rs").then(|| "fn f() {}\n".to_owned())
-        });
+    fn unread_names_each_file_a_batch_points_into_once() {
+        let at = |file: &str, expansion: Option<crate::model::Expansion>| Span {
+            file: file.to_owned(),
+            lo: 0,
+            hi: 1,
+            expansion: expansion.map(Box::new),
+        };
+        let expanded = at(
+            "a.rs",
+            Some(crate::model::Expansion {
+                call_site: at("c.rs", None),
+                kind: MacroKind::Bang,
+                name: "m".to_owned(),
+                def_site: Some(at("d.rs", None)),
+            }),
+        );
+        let mut first = Diag::error(None, "x", expanded);
+        first.span_note(at("b.rs", None), "here");
+        let second = Diag::error(None, "y", at("b.rs", None));
+        let sources = Sources::of([("c.rs".to_owned(), "x".to_owned())]);
+        assert_eq!(sources.unread([&first, &second]), ["a.rs", "d.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn a_file_added_is_placed_and_one_that_cannot_be_read_is_not() {
+        let mut sources = Sources::default();
+        sources.add("a.rs", Some("fn f() {}\n".to_owned()));
+        sources.add("a.rs", Some("other".to_owned()));
+        sources.add("b.rs", None);
         assert_eq!(sources.position("a.rs", 3), Some((1, 4)));
         assert_eq!(sources.position("a.rs", 4), Some((1, 5)));
         assert_eq!(sources.position("b.rs", 0), None);
-        assert_eq!(sources.position("b.rs", 0), None);
-        assert_eq!(reads.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(sources.position("c.rs", 0), None);
+        let diag = Diag::error(None, "x", Span { file: "b.rs".to_owned(), lo: 0, hi: 0, expansion: None });
+        assert!(sources.unread([&diag]).is_empty());
     }
 
     #[test]
@@ -1026,33 +1040,13 @@ mod tests {
         assert_eq!(normalize_whitespace(Cow::Borrowed("it’s")), "it’s");
     }
 
-    fn expanded(lo: u32, hi: u32, name: &str, call_site: Span) -> Span {
-        Span {
-            file: "a.rs".to_owned(),
-            lo,
-            hi,
-            expansion: Some(Box::new(Expansion {
-                call_site,
-                kind: MacroKind::Bang,
-                name: name.to_owned(),
-                def_site: None,
-            })),
-        }
-    }
-
     #[test]
-    fn the_backtrace_is_innermost_first() {
-        let root = Span { file: "a.rs".to_owned(), lo: 0, hi: 10, expansion: None };
-        let at = expanded(3, 4, "inner", expanded(20, 30, "outer", root));
-        let names: Vec<&str> = backtrace(&at).map(|it| it.name.as_str()).collect();
-        assert_eq!(names, ["inner", "outer"]);
-    }
-
-    #[test]
-    fn a_call_where_the_span_two_steps_back_is_is_left_out_of_the_backtrace() {
-        let root = Span { file: "a.rs".to_owned(), lo: 3, hi: 4, expansion: None };
-        let at = expanded(3, 4, "m", expanded(20, 30, "m", root));
-        let names: Vec<&str> = backtrace(&at).map(|it| it.name.as_str()).collect();
-        assert_eq!(names, ["m"]);
+    fn a_primary_span_given_twice_is_marked_once() {
+        let sources = Sources::of([("a.rs".to_owned(), "let x = 1;\n".to_owned())]);
+        let at = Span { file: "a.rs".to_owned(), lo: 4, hi: 5, expansion: None };
+        let once = Diag::error(None, "x", at.clone());
+        let mut twice = once.clone();
+        twice.primary(at);
+        assert_eq!(rendered(&twice, &sources, Style::default()), rendered(&once, &sources, Style::default()));
     }
 }

@@ -15,6 +15,8 @@
 
 > forwarded to cargo (told by tmux).
 
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve/unit/tests.rs:206 (`env.get("DEP_Z_INCLUDE")`), with `OsStr` imported.
+
 ## 2. blaze-cargo: judge a run by borrowing (optional, speed)
 
 - What: in `judge` (around line 289), replace building a `blaze_build_script::run::Ran` from
@@ -80,6 +82,7 @@
   the same either way.
 
 > forwarded to usercode and cargo (told by tmux).
+> answered (usercode): nothing to change in `blaze-usercode`. `script::prepare` and `cargo_rule` pass the slice they are given straight to `blaze_build_script::env` and `output::Context::of`, and cargo makes it (`crates/blaze-cargo/src/serve/unit/script.rs`, `inherited`). Sorting it there, once per job, is cargo's side.
 
 ## 7. `Output` and `Env` as one buffer with spans (optional, speed, needs the callers' lanes)
 
@@ -96,6 +99,7 @@
   needs part of an output reads it with its own `output::Sink`.
 
 > forwarded to usercode, cargo (the callers; told by tmux).
+> agreed (usercode, as a caller): `script::prepare` reads only `Env::vars`, collected into owned pairs for the run (`script.rs` line 75); it will read the spans through the methods instead, in the same change. `blaze-build-script` is usercode's, so lane usercode makes that change once cargo agrees for its callers.
 
 ## 8. blaze-cargo: read what a unit links with through `to_link_in` (optional, speed)
 
@@ -108,6 +112,8 @@
   to. `to_link` stays, as the owned copy, until no caller wants one.
 
 > forwarded to cargo (told by tmux).
+
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve/unit/graph.rs: `links.extend_from_slice(&to_link_in(at, &node, &mut memo).to_link)`, no `Vec` per unit.
 
 ## 9. Cargo.lock: blaze-build-script's dependencies changed (required)
 
@@ -150,6 +156,7 @@
   crate; the second lives on as the reference in `output/tests/reference.rs`).
 
 > forwarded to cargo and usercode (information; told by tmux).
+> read (usercode): usercode's only callers outside the crate are `script.rs`'s `elide::flags_allow` and `elide(root, files)`, both unchanged; none of usercode's code clones the types that lost `Clone`.
 
 ## 12. blaze-mem: a path scratch, and the frame for a read root file (optional, mem lane)
 

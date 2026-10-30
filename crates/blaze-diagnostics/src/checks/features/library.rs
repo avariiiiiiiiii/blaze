@@ -28,16 +28,16 @@ mod unstable;
 use hir::InFile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use span::FileId;
 use syntax::{AstNode, AstToken, NodeOrToken, SyntaxKind, T, TextRange, ast};
 
 use super::{Features, crate_fact};
 use crate::{
-    cx::{Cx, Files},
+    cx::Cx,
     lints::{
         edit_distance::find_best_match_for_name,
+        registry::LintId,
         syntax::{
-            Walk, source_fact,
+            source_fact,
             attrs::{Attr, Owner, Target, features::table, owners},
         },
     },
@@ -51,6 +51,8 @@ const CFG_RELEASE: &str = "1.101.0-nightly";
 
 /// The `since` a feature stabilized in the release being made is written with.
 const VERSION_PLACEHOLDER: &str = "CURRENT_RUSTC_VERSION";
+
+const STABLE_FEATURES: LintId = LintId::named("stable_features");
 
 /// `check_unused_or_stable_features` of the crate: its diagnostics in rustc's order, each at
 /// `Phase::Items`, the lints at the crate root.
@@ -85,21 +87,41 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> V
     let local = if features.enabled("staged_api") { collect(owners, Some((cx, &mut found))) } else { Library::default() };
     let mut implications = local.implications.clone();
     if !remaining.is_empty() || !implications.is_empty() {
-        let libraries: Vec<(hir::Crate, Library)> =
-            crates(cx).into_iter().map(|krate| (krate, library_of(cx, krate))).collect();
-        let mut all = implications.clone();
-        for (_, library) in &libraries {
-            all.extend(library.implications.iter().map(|(k, v)| (k.clone(), v.clone())));
-        }
-        let mut walk = Check { cx, remaining: &mut remaining, implications: &mut implications, all: &all, found: &mut found, lint_at };
-        walk.features(&local);
-        for (_, library) in &libraries {
-            if walk.remaining.is_empty() && walk.implications.is_empty() {
+        // A dependency's library features are read (a walk of all of it) only when one the
+        // crate enables is not found in those before it, and all of them only for what needs
+        // every crate's: a stable feature's implications, an unknown feature's error.
+        let mut libraries = Libraries::new(cx);
+        let stable_lint = cx.lint_may_fire(STABLE_FEATURES);
+        let mut all = None;
+        for at in 0..=libraries.crates.len() {
+            if remaining.is_empty() && implications.is_empty() {
                 break;
             }
+            let library = match at {
+                0 => &local,
+                at => libraries.get(at - 1),
+            };
+            if stable_lint && all.is_none() && needs_all(library, &remaining) {
+                all = Some(libraries.implications(&local));
+            }
+            let library = match at {
+                0 => &local,
+                at => libraries.loaded(at - 1),
+            };
+            let mut walk = Check {
+                cx,
+                remaining: &mut remaining,
+                implications: &mut implications,
+                stable_lint,
+                all: all.as_ref(),
+                found: &mut found,
+                lint_at,
+            };
             walk.features(library);
         }
         if !remaining.is_empty() {
+            libraries.load_all();
+            let libraries: Vec<(hir::Crate, &Library)> = libraries.all();
             let mut names: Vec<&str> = unstable::UNSTABLE.to_vec();
             for (_, library) in &libraries {
                 let start = names.len();
@@ -223,25 +245,93 @@ impl<T: Copy> Remaining<T> {
     }
 }
 
+/// The crates rustc loads besides the crate, in its order, with the library features of each
+/// read the first time they are asked for (once per crate per check).
+struct Libraries<'a, 'c, 'db> {
+    cx: &'a Cx<'c, 'db>,
+    crates: Vec<hir::Crate>,
+    loaded: Vec<Option<Library>>,
+}
+
+impl<'a, 'c, 'db> Libraries<'a, 'c, 'db> {
+    fn new(cx: &'a Cx<'c, 'db>) -> Libraries<'a, 'c, 'db> {
+        let crates = crates(cx);
+        // alloc: one slot per crate the crate loads, once per check that enables a library feature.
+        let loaded = crates.iter().map(|_| None).collect();
+        Libraries { cx, crates, loaded }
+    }
+
+    /// The library features of the `at`th crate, read now if they were not.
+    fn get(&mut self, at: usize) -> &Library {
+        let (cx, krate) = (self.cx, self.crates[at]);
+        self.loaded[at].get_or_insert_with(|| library_of(cx, krate))
+    }
+
+    /// Those of the `at`th crate, read by [`Libraries::get`].
+    fn loaded(&self, at: usize) -> &Library {
+        self.loaded[at].as_ref().expect("a crate's library features are read before they are looked at")
+    }
+
+    fn load_all(&mut self) {
+        for at in 0..self.crates.len() {
+            self.get(at);
+        }
+    }
+
+    /// rustc's `all_implications`: the crate's own, then each crate's in order.
+    fn implications(&mut self, local: &Library) -> FxHashMap<String, String> {
+        self.load_all();
+        let mut all = local.implications.clone();
+        for library in self.loaded.iter().flatten() {
+            // clone: once per implication of a staged crate, only when a stable feature is enabled.
+            all.extend(library.implications.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        all
+    }
+
+    /// Every crate with its library features, once [`Libraries::load_all`] has read them.
+    fn all(&self) -> Vec<(hir::Crate, &Library)> {
+        // alloc: on the error path, an unknown feature.
+        self.crates.iter().enumerate().map(|(at, krate)| (*krate, self.loaded(at))).collect()
+    }
+}
+
+/// Whether `library` has a stable feature the crate enables: what `check_features` says of one
+/// reads every crate's implications.
+fn needs_all(library: &Library, remaining: &Remaining) -> bool {
+    library
+        .features
+        .iter()
+        .any(|(name, (stability, _))| matches!(stability, Stability::Accepted(_)) && remaining.get(name).is_some())
+}
+
 /// rustc's `check_features`, over one crate's features after another.
 struct Check<'a, 'c, 'db> {
     cx: &'a Cx<'c, 'db>,
     remaining: &'a mut Remaining,
     implications: &'a mut FxHashMap<String, String>,
-    all: &'a FxHashMap<String, String>,
+    /// Whether `stable_features` may fire anywhere in the crate ([`Cx::lint_may_fire`]): when
+    /// it can't, a stable feature is passed over with nothing read or built for it.
+    stable_lint: bool,
+    /// rustc's `all_implications`, read once a library has a stable feature the crate enables
+    /// ([`needs_all`]) and `stable_lint` holds.
+    all: Option<&'a FxHashMap<String, String>>,
     found: &'a mut Vec<Found>,
     lint_at: InFile<syntax::SyntaxNodePtr>,
 }
 
 impl Check<'_, '_, '_> {
     fn features(&mut self, library: &Library) {
+        // alloc: once per staged crate read, only for a crate that enables a library feature.
         let mut sorted: Vec<(&String, &Stability)> = library.features.iter().map(|(k, (s, _))| (k, s)).collect();
         sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
         for (feature, stability) in sorted {
-            if let Stability::Accepted(since) = stability
+            if self.stable_lint
+                && let Stability::Accepted(since) = stability
                 && let Some(at) = self.remaining.get(feature)
             {
-                let mut diag = match self.all.get(feature) {
+                let all = self.all.expect("every crate's implications are read before a stable feature is looked at");
+                let mut diag = match all.get(feature) {
                     Some(implies) => partially_stable(self.cx, at, feature, implies, since),
                     None => stable(self.cx, at, feature, since),
                 };
@@ -332,24 +422,14 @@ fn crates(cx: &Cx<'_, '_>) -> Vec<hir::Crate> {
     order
 }
 
-/// The names a dependency's files have: none, as its library features are read without a span.
-struct NoSpans;
-
-impl Files for NoSpans {
-    fn name(&self, file: FileId) -> String {
-        unreachable!("the library features of a dependency are read without spans, yet {file:?} was named")
-    }
-}
-
 /// rustc's `lib_features(krate)` and `stability_implications(krate)` of a dependency: nothing
 /// unless it has `#![feature(staged_api)]`.
 fn library_of(cx: &Cx<'_, '_>, krate: hir::Crate) -> Library {
     if !krate.is_unstable_feature_enabled(cx.db, &intern::sym::staged_api) {
         return Library::default();
     }
-    let dependency = Cx::new(cx.sema, krate, &NoSpans, cx.frame());
-    let walk = Walk::of(&dependency);
-    collect(&owners(&dependency, &walk), None)
+    let dependency = Cx::new(cx.sema, krate, cx.files(), cx.frame());
+    collect(&owners(&dependency, dependency.walk()), None)
 }
 
 /// The groups of stability attributes rustc's attribute parsers have: `StabilityParser`,
@@ -476,7 +556,7 @@ fn declared(owner: &Owner) -> SmallVec<[Declared; 3]> {
     for (index, attr) in owner.attrs.iter().enumerate() {
         let Some(meta) = attr.meta() else { continue };
         let Some(name) = single_name(meta) else { continue };
-        let Some(group) = group(&name) else { continue };
+        let Some(group) = group(name.text()) else { continue };
         let slot = match groups.iter().position(|(_, it, _)| *it == group) {
             Some(it) => it,
             None => {
@@ -485,15 +565,15 @@ fn declared(owner: &Owner) -> SmallVec<[Declared; 3]> {
             }
         };
         if groups[slot].2.is_none() {
-            groups[slot].2 = parse(attr, meta, &name, group);
+            groups[slot].2 = parse(attr, meta, name.text(), group);
         }
     }
     groups.into_iter().filter_map(|(_, _, it)| it).collect()
 }
 
 /// The attribute's path, when it is one segment.
-fn single_name(meta: &ast::Meta) -> Option<String> {
-    Some(meta.path()?.as_single_name_ref()?.text().to_string())
+fn single_name(meta: &ast::Meta) -> Option<ast::NameRef> {
+    meta.path()?.as_single_name_ref()
 }
 
 /// `parse_stability` or `parse_unstability` of the stability attribute `attr`.
@@ -555,7 +635,7 @@ fn parse(attr: &Attr, meta: &ast::Meta, name: &str, group: Group) -> Option<Decl
 /// `UnstableRemovedParser` of one `#[unstable_removed(..)]`.
 fn removed(attr: &Attr) -> Option<Removed> {
     let meta = attr.meta()?;
-    if single_name(meta).as_deref() != Some("unstable_removed") {
+    if !single_name(meta).is_some_and(|it| it.text() == "unstable_removed") {
         return None;
     }
     let ast::Meta::TokenTreeMeta(list) = meta else { return None };

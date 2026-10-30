@@ -92,7 +92,7 @@ pub trait HasAttrs<'t>: AstNode<'t> {
                     // An outline's lazy body is parsed when a walk enters it: one that surely
                     // starts with no inner attribute stays unparsed.
                     let lazy = body.syntax().is_lazy();
-                    if lazy && !block_may_start_with_inner_attr(body.syntax().text()) {
+                    if lazy && !block_may_start_with_inner_attr(body.syntax().text(), false) {
                         return None;
                     }
                     body.stmt_list()?.syntax()
@@ -113,21 +113,27 @@ pub trait HasAttrs<'t>: AstNode<'t> {
     }
 }
 
-/// Whether the text of a block, its `{` included, may start with an inner attribute after
-/// whitespace and comments, as the parser's `inner_attrs` takes them: false only when it surely
-/// does not. A non-ASCII character, an unterminated comment or a text that is not a block is a
-/// maybe.
-fn block_may_start_with_inner_attr(block: &str) -> bool {
+/// Whether the text of a block, its `{` included, may start with an inner attribute (or, when
+/// `inner_docs`, an inner doc comment) after whitespace and comments, as the parser's
+/// `inner_attrs` takes them: false only when it surely does not. A non-ASCII character, an
+/// unterminated comment or a text that is not a block is a maybe.
+pub fn block_may_start_with_inner_attr(block: &str, inner_docs: bool) -> bool {
     let Some(mut rest) = block.strip_prefix('{') else { return true };
     loop {
         rest = rest
             .trim_start_matches(|c: char| matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' '));
         if let Some(comment) = rest.strip_prefix("//") {
+            if inner_docs && comment.starts_with('!') {
+                return true;
+            }
             match comment.find('\n') {
                 Some(end) => rest = &comment[end..],
                 None => return true,
             }
         } else if let Some(comment) = rest.strip_prefix("/*") {
+            if inner_docs && comment.starts_with('!') {
+                return true;
+            }
             match block_comment_len(comment) {
                 Some(end) => rest = &comment[end..],
                 None => return true,

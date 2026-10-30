@@ -23,6 +23,8 @@ and `FileId::from_raw` asserts the id is at most `FileId::MAX`, so check that to
 Why: the server is user code in a sandbox. `run_conversation`'s `catch_unwind` catches these
 panics today, but a panic is no answer: the error should name what the server sent.
 
+> forwarded to cargo (`crates/load-cargo`) (from requests, pass 16; told by tmux).
+
 ## 2. safety-fuzz (`fuzz/targets/proc_macro_flat_tree.rs` and the other `proc_macro_*` targets)
 
 What changed in `crates/proc-macro-api/`, which the targets read:
@@ -59,6 +61,9 @@ What changed in `crates/proc-macro-api/`, which the targets read:
    client's side of version 8 would read `Response::ExpandMacroWire` and call
    `proc_macro_api::wire::read_tree` (crate-private now; ask if you want it public).
 
+> taken by requests (safety is DONE): child `requests-fuzz-pm`; the outcome follows.
+> applied by requests (child requests-fuzz-pm): items 1-6 in `fuzz/targets/proc_macro_*.rs`. (1) `decode` takes `.ok()?` on both `Result`s. (3) `canonical` is gone: `proc_macro_frames` and `proc_macro_legacy` compare messages and answers with `==`, `shared::raw` compares its two reads with `==`, and `proc_macro_message` does where a message's two frames differ. (4) frames: a stream not ending in a 0 must end with the "no terminating zero" error; legacy: a last line with no newline (reached before an empty line), as in `api-version-check-with-no-newline.hex`, must be the "no newline" error. (5) `proc_macro_frames` reads its pieces through `warm::LinkReader` over a link that gives them. (6) `VERSIONS` is 4..=8, a `FlatTree` read at 8 as at 7; `bound(len)` stays, with a comment: its reason was the minus split doubling the builder, not a second build. Fixtures and dictionaries gain `ExpandMacroWire` in both protocols (`fuzz/Cargo.toml` takes `paths` for `Utf8PathBuf`). `wire::read_tree` is `pub(crate)` (and takes the crate-private `Sent`), so the client-side version 8 target is asked for in `v2/requests/requests.md` `## From requests-fuzz-pm`, with `Message::write(&self)` for `proc_macro_message`'s bound. Not built or run.
+
 ## 3. usercode (`crates/blaze-expand/src/lib.rs`): `read` takes the `Result`
 
 What: line 379, `Ok(flat.to_subtree_resolved(CURRENT_API_VERSION, &table))` becomes
@@ -69,6 +74,9 @@ at 7, but the run key's `"abi"` part (line 354) changes, so kept expansions are 
 Why: `to_subtree_resolved` returns `Result` (safety-fuzz-procmacro item 1). Without this
 change `blaze-expand` does not build.
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+> applied (usercode): `read` returns `to_subtree_resolved(..).map_err(|error| format!("a kept expansion: {error}"))`. Kept expansions are rebuilt once for the `abi` part at 8.
+
 ## 4. coordinator: the proc-macro server blaze runs speaks version 8 (`vendor/proc-macro-srv/`)
 
 What: the server blaze starts is `vendor/proc-macro-srv/crates/proc-macro-srv-cli`, on its own
@@ -76,13 +84,16 @@ vendored copy of `proc-macro-api` (version 6). The client negotiates, so it keep
 `FlatTree` JSON to it, which works but leaves the wire format unused. To use the wire format,
 either build the CLI on `crates/proc-macro-api` and `crates/proc-macro-srv`, or port the
 handling into the vendored copy. Handling `ExpandMacroWire` means: read `trees` with
-`proc_macro_srv::TokenStream::read_wire(bytes, &mut proc_macro_api::wire::raw_part, join)`
-(the attribute starts at the byte count the first read returns), take the three sites with
+`proc_macro_srv::TokenStream::read_wire(bytes, &mut scratch, &mut proc_macro_api::wire::raw_part, join)`
+(the attribute starts at the byte count the first read returns; `scratch` is a reused
+`Vec<u8>` that holds the bytes when a deserialized buffer doesn't start at a 4-byte boundary), take the three sites with
 `WireSpan::resolve(&mut raw_part)`, write the output with `TokenStream::write_wire(call_site,
 &mut out)`, answer `Response::ExpandMacroWire` (with tracked env vars and paths in the
 bidirectional protocol's `ExpandMacroWireResponse`), and report `CURRENT_API_VERSION` 8.
 
 Why: frontend-tokens item 2. Until then, expansions pay for the JSON `FlatTree` both ways.
+
+> forwarded to the coordinator (`vendor/proc-macro-srv/`) (from requests, pass 16; on requests' coordinator list).
 
 ## 5. frontend-tokens (`crates/tt/`): two small exports (optional)
 
@@ -96,3 +107,25 @@ request.
 
 Why: (a) keeps the two crates' bound in step with tt's. (b) removes the copy that remains per
 request.
+
+> forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+
+## 6. usercode (`crates/blaze-macro-wasm/src/lib.rs`): the two allocations left on a store hit
+
+Forwarded from `usercode-wire-macros`. That lane filed this under `usercode-wire`, but
+`src/lib.rs` is outside both lanes' paths: this lane holds only `src/wire.rs` and `guest/`.
+
+What: `expand` (line 1640) allocates on every call, before its store lookup:
+
+- `package_dir(call.env)` (line 1256) builds a `PathBuf`. It can return
+  `Option<&Path>` borrowed from the env (`env.get("CARGO_MANIFEST_DIR").map(Path::new)`),
+  with `placed` and the other users taking `&Path`. That costs nothing.
+- `guest_env(call.env)` (line 1263) collects and sorts a `Vec<(&str, &str)>`. Sorting is
+  needed because `Env` is an `FxHashMap`. But `Env` belongs to the crate, not the call, so the
+  sorted list, or just the `env_keyed` digest that the key needs, can be made once per crate
+  rather than once per expansion: a salsa query on `Crate`, or a memo beside `Listed`. The
+  sorted pairs are needed only on a miss, to give the module its environment.
+
+Why: the bar in principles.md ("By construction") is that a hit allocates nothing but its
+output. With these two changes, a hit allocates only the output tree.
+> forwarded to usercode-hot-macros (holds `crates/blaze-macro-wasm/` for the hot lint; told by tmux).

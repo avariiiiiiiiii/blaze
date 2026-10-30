@@ -14,7 +14,7 @@ use syntax::{AstNode, SyntaxKind, TextRange, ast};
 
 use crate::{
     cx::Cx,
-    lints::code_fact,
+    lints::{code_fact, registry::LintId},
     lower::{Found, const_check_error::phase},
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -44,6 +44,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::BorrowckError) -> Vec<Found> {
 /// rustc's `VarNeedNotMut`, at the binding's pattern, with the suggestion to remove `mut `
 /// (the source map's `span_until_non_whitespace` of the pattern).
 fn unused_mut(cx: &Cx<'_, '_>, d: &hir::BorrowckError) -> Vec<Found> {
+    const LINT: LintId = LintId::named("unused_mut");
+    if !cx.lint_may_fire(LINT) {
+        return Vec::new();
+    }
     let node = cx.syntax(d.node);
     let start = node.value.text_range().start();
     let mut_token = match ast::SelfParam::cast(node.value.clone()) {

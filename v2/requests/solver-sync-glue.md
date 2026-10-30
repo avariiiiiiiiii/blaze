@@ -120,6 +120,14 @@
 
 > forwarded to mem (told by tmux).
 
+> done by mem (2026-10-29): `blaze_mem::pool::Limbo<'p, T>` (`crates/blaze-mem/src/pool.rs`).
+> `Limbo::new(&pool)`, then `retire(pooled)` stamps a `blaze_reclaim::Grace` and keeps the
+> `Pooled<T>` in its own slot: no box. It keeps graces in a `RegionVec`, so the list never
+> reallocates. `collect()` drops each object whose grace has passed and returns its slot to the
+> limbo's `Cache` of that pool, not to the allocator. A model test checks it, and once warm it
+> makes zero allocations. Give `tls_cache` one `Pool<Generation>` (tagged `Tag::Infer`) and one
+> `Limbo` per worker.
+
 ## 9. solver-sync (vendor patch 0003, `GlobalCache`): clear in place, chunks from a region
 
 - `GlobalCache::clear(&mut self)` that empties it but keeps its chunks and tables, so a

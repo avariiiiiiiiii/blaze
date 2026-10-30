@@ -22,6 +22,7 @@ use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use hir::HasSource as _;
 use hir_def::{BuiltinDeriveImplId, attrs::AttrFlags, lang_item::lang_items};
+use rustc_hash::FxHashMap;
 use syntax::{
     AstNode as _,
     ast::{HasAttrs as _, HasName as _},
@@ -77,38 +78,63 @@ impl Origin {
     }
 }
 
-pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
+/// `scopes` is `defs::scopes`, made once per check.
+pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     let db = cx.db;
-    let impls = impls(cx);
+    let frame = cx.frame();
+    let impls = impls(cx, scopes);
+    // alloc: empty until a diagnostic fires.
     let mut found = Vec::new();
-    // rustc's `local_trait_impls`: the traits in the order their first impl is written.
-    let mut traits: Vec<(hir::Trait, Vec<usize>)> = Vec::new();
-    for (index, (impl_, _)) in impls.iter().enumerate() {
-        let Some(trait_) = impl_.trait_(db) else { continue };
-        match traits.iter_mut().find(|(it, _)| *it == trait_) {
-            Some((_, of)) => of.push(index),
-            None => traits.push((trait_, vec![index])),
-        }
+    // rustc's `local_trait_impls`: the traits in the order their first impl is written, each
+    // impl's trait by its place among them (one probe per impl), and the impls of each trait
+    // as a CSR list in impl order, all in the check's frame.
+    let mut slots: FxHashMap<hir::Trait, u32> = FxHashMap::default();
+    let mut traits: Vec<hir::Trait, _> = Vec::new_in(frame);
+    let mut of_impl: Vec<Option<u32>, _> = Vec::with_capacity_in(impls.len(), frame);
+    for (impl_, _) in &impls {
+        let slot = impl_.trait_(db).map(|trait_| {
+            *slots.entry(trait_).or_insert_with(|| {
+                traits.push(trait_);
+                u32::try_from(traits.len() - 1).expect("a crate implements fewer than 2^32 traits")
+            })
+        });
+        of_impl.push(slot);
+    }
+    let mut starts: Vec<u32, _> = Vec::with_capacity_in(traits.len() + 1, frame);
+    starts.resize(traits.len() + 1, 0);
+    for &slot in of_impl.iter().flatten() {
+        starts[slot as usize + 1] += 1;
+    }
+    for at in 1..starts.len() {
+        starts[at] += starts[at - 1];
+    }
+    let mut next: Vec<u32, _> = Vec::with_capacity_in(traits.len(), frame);
+    next.extend_from_slice(&starts[..traits.len()]);
+    let mut members: Vec<u32, _> = Vec::with_capacity_in(starts[traits.len()] as usize, frame);
+    members.resize(starts[traits.len()] as usize, 0);
+    for (index, slot) in of_impl.iter().enumerate() {
+        let Some(slot) = *slot else { continue };
+        members[next[slot as usize] as usize] = u32::try_from(index).expect("a crate has fewer than 2^32 impls");
+        next[slot as usize] += 1;
     }
     let mut builtin = builtin::Builtin::new(cx);
-    let mut incoherent: Vec<hir::Trait> = Vec::new();
-    for (trait_, of) in &traits {
+    let mut incoherent: Vec<bool, _> = Vec::with_capacity_in(traits.len(), frame);
+    incoherent.resize(traits.len(), false);
+    for (slot, trait_) in traits.iter().enumerate() {
         let denied = denies_explicit_impls(cx, *trait_);
         let mut coherent = true;
-        for &index in of {
-            let (impl_, origin) = &impls[index];
+        for &index in &members[starts[slot] as usize..starts[slot + 1] as usize] {
+            let (impl_, origin) = &impls[index as usize];
             let (errors, hir_error) = coherence(cx, &mut builtin, *impl_, origin, *trait_, denied);
             coherent &= !hir_error && !errors.iter().any(is_error);
             found.extend(errors);
         }
-        if !coherent {
-            incoherent.push(*trait_);
-        }
+        incoherent[slot] = !coherent;
     }
-    for (impl_, origin) in &impls {
+    for ((_, origin), slot) in impls.iter().zip(&of_impl) {
         // rustc compares an impl's items with its trait's only when the trait is coherent
         // (`check_item_type`).
-        if impl_.trait_(db).is_some_and(|it| incoherent.contains(&it)) {
+        if slot.is_some_and(|it| incoherent[it as usize]) {
             continue;
         }
         if let Origin::Written(at) = origin {
@@ -125,7 +151,7 @@ pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
 pub(crate) fn coherent(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
     let denied = denies_explicit_impls(cx, trait_);
     let mut builtin = builtin::Builtin::new(cx);
-    impls(cx).iter().filter(|(impl_, _)| impl_.trait_(cx.db) == Some(trait_)).all(|(impl_, origin)| {
+    impls(cx, &super::defs::scopes(cx)).iter().filter(|(impl_, _)| impl_.trait_(cx.db) == Some(trait_)).all(|(impl_, origin)| {
         let (errors, hir_error) = coherence(cx, &mut builtin, *impl_, origin, trait_, denied);
         !hir_error && !errors.iter().any(is_error)
     })
@@ -141,6 +167,7 @@ fn coherence(
     trait_: hir::Trait,
     denied: bool,
 ) -> (Vec<Found>, bool) {
+    // alloc: empty until a diagnostic fires.
     let mut found = Vec::new();
     let mut hir_error = false;
     if let Origin::Written(at) = origin {
@@ -183,13 +210,15 @@ fn is_error(found: &Found) -> bool {
 
 /// The impls of the crate, in rustc's order: each scope's (`defs::scopes`), as they are
 /// written, a derive's where its type is.
-fn impls(cx: &Cx<'_, '_>) -> Vec<(hir::Impl, Origin)> {
+fn impls(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<(hir::Impl, Origin)> {
     let db = cx.db;
+    // alloc: the crate's impls, and one buffer reused for each scope's, once per check.
     let mut all = Vec::new();
-    for module in super::defs::scopes(cx) {
+    // alloc: see above.
+    let mut here: Vec<(u32, hir::Impl, Origin)> = Vec::new();
+    for &module in scopes {
         let id = hir_def::ModuleId::from(module);
         let scope = id.def_map(db).module(db, id).scope(db);
-        let mut here: Vec<(u32, hir::Impl, Origin)> = Vec::new();
         for impl_id in scope.impls() {
             let impl_ = hir::Impl::from(impl_id);
             let Some(at) = ImplAt::of(cx, impl_) else { continue };
@@ -201,7 +230,7 @@ fn impls(cx: &Cx<'_, '_>) -> Vec<(hir::Impl, Origin)> {
             here.push((at, hir::Impl::from(derive), Origin::Derive { id: derive, adt }));
         }
         radix::sort_by_key(&mut here, |(at, _, _)| *at);
-        all.extend(here.into_iter().map(|(_, impl_, origin)| (impl_, origin)));
+        all.extend(here.drain(..).map(|(_, impl_, origin)| (impl_, origin)));
     }
     all
 }

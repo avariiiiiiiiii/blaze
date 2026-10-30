@@ -12,7 +12,7 @@
 use std::cmp::Ordering;
 
 use base_db::{Db, Crate};
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, bits::Ranked};
 use blaze_mem::{Frame, Tag, frame};
 use blaze_query::QueryKind;
 
@@ -30,76 +30,6 @@ const _: () = {
     assert!(size_of::<ItemKind>() == 1);
 };
 
-/// One bit per row, with the count of set bits before each word, so a row's rank (how many
-/// rows before it are set: where its value sits in a column of the set rows alone) is one
-/// popcount.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct Bits {
-    words: Box<[u64]>,
-    before: Box<[u32]>,
-    len: u32,
-}
-
-impl Bits {
-    pub fn new<I>(bits: I) -> Bits
-    where
-        I: IntoIterator<Item = bool>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let bits = bits.into_iter();
-        let mut words: Vec<u64> = Vec::with_capacity(bits.len().div_ceil(64));
-        let mut len = 0usize;
-        for bit in bits {
-            if len % 64 == 0 {
-                words.push(0);
-            }
-            if bit {
-                words[len / 64] |= 1 << (len % 64);
-            }
-            len += 1;
-        }
-        let mut before = Vec::with_capacity(words.len());
-        let mut count = 0u32;
-        for word in &words {
-            before.push(count);
-            count += word.count_ones();
-        }
-        let len = u32::try_from(len).expect("blaze-items: more than u32::MAX rows in a bitset");
-        Bits { words: words.into(), before: before.into(), len }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[track_caller]
-    pub fn get(&self, row: usize) -> bool {
-        assert!(row < self.len(), "blaze-items: row {row} of a bitset of {}", self.len);
-        self.words[row / 64] >> (row % 64) & 1 == 1
-    }
-
-    /// How many rows before `row` are set.
-    #[track_caller]
-    pub fn rank(&self, row: usize) -> usize {
-        assert!(row < self.len(), "blaze-items: row {row} of a bitset of {}", self.len);
-        let word = row / 64;
-        let below = self.words[word] & ((1u64 << (row % 64)) - 1);
-        self.before[word] as usize + below.count_ones() as usize
-    }
-
-    /// How many rows are set.
-    pub fn count(&self) -> usize {
-        match (self.before.last(), self.words.last()) {
-            (Some(&before), Some(word)) => before as usize + word.count_ones() as usize,
-            _ => 0,
-        }
-    }
-}
-
 /// The hashes of a set of items, sorted by key, one column per hash kind. The items that have
 /// no hash are in a side table, by key with why.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -108,9 +38,9 @@ pub struct HashColumns {
     kinds: Box<[ItemKind]>,
     interface: Box<[InterfaceHash]>,
     deep: Box<[DeepHash]>,
-    has_layout: Bits,
+    has_layout: Ranked,
     layout: Box<[LayoutHash]>,
-    has_code: Bits,
+    has_code: Ranked,
     code: Box<[CodeHash]>,
     unhashable: Box<[(ItemKey, Unhashable)]>,
 }
@@ -127,8 +57,8 @@ impl HashColumns {
         for pair in rows.windows(2) {
             assert_ne!(pair[0].0, pair[1].0, "blaze-items: two rows of one key");
         }
-        let has_layout = Bits::new(rows.iter().map(|(_, it)| it.layout.is_some()));
-        let has_code = Bits::new(rows.iter().map(|(_, it)| it.code.is_some()));
+        let has_layout = Ranked::from_bools(rows.iter().map(|(_, it)| it.layout.is_some()));
+        let has_code = Ranked::from_bools(rows.iter().map(|(_, it)| it.code.is_some()));
         HashColumns {
             keys: column(rows.iter().map(|&(key, _)| key)),
             kinds: column(rows.iter().map(|(_, it)| it.kind)),
@@ -168,8 +98,8 @@ impl HashColumns {
         ItemHashes {
             kind: self.kinds[row],
             interface: self.interface[row],
-            layout: self.has_layout.get(row).then(|| self.layout[self.has_layout.rank(row)]),
-            code: self.has_code.get(row).then(|| self.code[self.has_code.rank(row)]),
+            layout: self.has_layout.place(row).map(|at| self.layout[at]),
+            code: self.has_code.place(row).map(|at| self.code[at]),
             deep: self.deep[row],
         }
     }

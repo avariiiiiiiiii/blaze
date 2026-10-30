@@ -112,6 +112,12 @@ Status: open
    `mbe/src/benchmark.rs`, `mbe/src/differential.rs` and `tt/src/storage/varint.rs`, which are
    all test-only modules. It should follow a
    `#[cfg(test)] mod x;` to `x.rs` / `x/` and skip them.
+3. (frontend-tokens-next1, 20:55) `{"root": "crates/mbe"}` prints nothing and exits 0: it looks
+   for `<root>/crates/*/src`, finds none, and says nothing. A lane that lints that way (as I did
+   before) gets a clean result for code never read. It should refuse a root with no `crates/`
+   directory, or any run that lints zero files. Linting from `{"root": "."}` is right; with it my
+   crates' only findings outside test-only modules were `parser/src/frontmatter.rs` and
+   `shortcuts.rs:209`, now justified on their lines.
 
 > forwarded to the coordinator (`tools/`), listed in requests' report.
 

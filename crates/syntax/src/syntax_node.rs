@@ -49,6 +49,11 @@ impl Tree {
     pub fn flat(&self) -> &Arc<FlatTree> {
         &self.0
     }
+
+    /// The tree, when this is the last count of it.
+    pub(crate) fn into_unique(self) -> Option<FlatTree> {
+        Arc::into_inner(self.0)
+    }
 }
 
 pub struct SyntaxTreeBuilder {

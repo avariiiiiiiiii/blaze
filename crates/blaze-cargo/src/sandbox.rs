@@ -849,12 +849,16 @@ fn under(path: &str, dir: &str) -> bool {
 }
 
 /// `blaze sandbox SPEC -- PROGRAM ARGS...`, `blaze sandbox --v2 SPEC_FILE` ([`v2::command`]),
-/// or `blaze sandbox --probe [--overlays]`: runs the program and ends as it ended. Runs before
-/// anything else in the process, which is one thread: it forks.
+/// `blaze sandbox --v2-serve` ([`v2::serve`]), or `blaze sandbox --probe [--overlays]`: runs the
+/// program and ends as it ended. Runs before anything else in the process, which is one thread:
+/// it forks.
 pub fn command(mut args: impl Iterator<Item = OsString>) -> ! {
     let first = args.next();
     if first.as_deref() == Some("--v2".as_ref()) {
         v2::command(args)
+    }
+    if first.as_deref() == Some("--v2-serve".as_ref()) {
+        v2::serve(args)
     }
     if first.as_deref() == Some("--probe".as_ref()) {
         let kind = match args.next() {
@@ -947,7 +951,7 @@ fn windows_backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) ->
         report: PathBuf::new(),
         not_inputs: Vec::with_capacity(0),
     };
-    let code = windows::run(&confined)?;
+    let code = windows::run(&confined, windows::Given::own())?;
     if let Some(file) = &spec.record {
         let mut recorder = Recorder::new(spec, &[]);
         recorder.reached(Seen::Incomplete, "", v2::NOT_TRACED_ON_WINDOWS);

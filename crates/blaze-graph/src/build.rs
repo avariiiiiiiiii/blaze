@@ -196,9 +196,9 @@ mod tests {
             move |key: Key| db.lock().unwrap().get(&key).cloned()
         };
         let config = PlaneConfig { io: 1, work: 1, budget: None, starve_after: 4 };
-        let mut plane = Plane::with_memo(config, Box::new(memo)).unwrap();
+        let mut plane = Plane::with_memo(config, memo).unwrap();
         let mut at = 0;
-        let mut run = |plane: &mut Plane, request: RequestId, specs: Vec<Spec>| {
+        let mut run = |plane: &mut Plane<_>, request: RequestId, specs: Vec<Spec>| {
             let keys: HashMap<NodeId, Key> =
                 specs.iter().filter_map(|it| Some((it.id, it.key?))).collect();
             let mut ran = Vec::new();

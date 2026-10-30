@@ -5,11 +5,12 @@
 //! another crate, `macro_rules!`, the test harness), comparing the whole result.
 //!
 //! Then the cost of one lookup: one probe per segment, and no allocation for a resolved
-//! three-segment path.
+//! three-segment path or for any shape of path on a warm def map.
 
-use std::fmt::Write as _;
+use std::{fmt::Write as _, hint::black_box};
 
 use base_db::Db;
+use blaze_alloc_count::assert_at_most;
 use blaze_ids::rng::SplitMix64;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
@@ -698,7 +699,7 @@ fn resolved_path_allocates_nothing() {
     let db = TestDB::with_files(THREE_SEGMENTS);
     let (map, local, path) = three_segment_lookup(&db);
     let resolve = || {
-        map.resolve_path_fp_with_macro(
+        Res::from(map.resolve_path_fp_with_macro(
             local,
             &db,
             ResolveMode::Other,
@@ -706,73 +707,125 @@ fn resolved_path_allocates_nothing() {
             &path,
             BuiltinShadowMode::Module,
             None,
-        )
+        ))
     };
     let warm = resolve();
-    assert!(warm.resolved_def.take_types().is_some() && warm.segment_index.is_none());
-    let (res, allocations) = alloc_count::count(resolve);
-    assert_eq!(Res::from(res), Res::from(warm));
-    assert_eq!(allocations, 0);
+    assert!(warm.def.take_types().is_some() && warm.segment_index.is_none());
+    let res = assert_at_most(0, "a resolved three-segment path", resolve);
+    assert_eq!(res, warm);
 }
 
-#[global_allocator]
-static ALLOCATOR: alloc_count::Counting = alloc_count::Counting;
+const SHAPES: &str = r#"
+//- /main.rs crate:main deps:dep,pre
+#[prelude_import]
+use ::pre::prelude::*;
+pub mod m {
+    pub struct S;
+    impl S {
+        pub fn new() -> S {
+            S
+        }
+    }
+    pub enum E {
+        A,
+        B(u8),
+    }
+    pub mod inner {
+        pub fn f() {}
+    }
+}
+mod g {
+    pub use super::m::*;
+}
+use g::*;
+fn body() {
+    mod mb {
+        pub struct T;
+    }
+    $0
+}
+//- /dep.rs crate:dep
+pub mod a {
+    pub struct X;
+}
+//- /pre.rs crate:pre
+pub mod prelude {
+    pub struct Pre;
+}
+"#;
 
-mod alloc_count {
-    use std::{
-        alloc::{GlobalAlloc, Layout, System},
-        cell::Cell,
+/// Budget: one lookup of each shape of path on a warm def map (plain, `self::`, `super::`,
+/// `crate::`, through a glob, from the prelude, from the extern prelude with and without `::`, an
+/// enum variant, an associated item left unresolved, and from a block's def map, both inside it
+/// and out to its crate): 0 allocations.
+#[test]
+fn every_shape_of_resolved_path_allocates_nothing() {
+    let (db, position) = TestDB::with_position(SHAPES);
+    let db = &db;
+    let block_module = db.module_at_position(position);
+    let pair = crate_local_def_map(db, block_module.krate(db));
+    let (map, local) = (pair.def_map(db), pair.local(db));
+    let block_map = block_module.def_map(db);
+    assert!(block_map.block.is_some(), "`$0` is not in a block with items");
+    let inner = map
+        .modules(db)
+        .find(|(id, _)| id.name(db).is_some_and(|it| it.as_str() == "inner"))
+        .map(|(id, _)| id)
+        .expect("the fixture has `m::inner`");
+    let path = |kind: PathKind, segments: &[&str]| {
+        ModPath::from_segments(kind, segments.iter().map(|it| name(it)))
     };
-
-    thread_local! {
-        static COUNTING: Cell<bool> = const { Cell::new(false) };
-        static COUNT: Cell<usize> = const { Cell::new(0) };
+    let root = map.root;
+    let lookups: [(&DefMap, ModuleId, ModPath, &str); 12] = [
+        (map, root, path(PathKind::Plain, &["m", "S"]), "plain"),
+        (map, inner, path(PathKind::SELF, &["f"]), "`self::`"),
+        (map, inner, path(PathKind::Super(1), &["S"]), "`super::`"),
+        (map, root, path(PathKind::Crate, &["m", "inner", "f"]), "`crate::`"),
+        (map, root, path(PathKind::Plain, &["S"]), "through a glob"),
+        (map, root, path(PathKind::Plain, &["Pre"]), "the prelude"),
+        (map, root, path(PathKind::Plain, &["dep", "a", "X"]), "the extern prelude"),
+        (map, root, path(PathKind::Abs, &["dep", "a", "X"]), "the extern prelude, `::`"),
+        (map, root, path(PathKind::Plain, &["m", "E", "A"]), "an enum variant"),
+        (map, root, path(PathKind::Plain, &["m", "S", "new"]), "an associated item"),
+        (block_map, block_module, path(PathKind::Plain, &["mb", "T"]), "in a block"),
+        (block_map, block_module, path(PathKind::Plain, &["m", "S"]), "a block's crate"),
+    ];
+    let resolve = |(map, from, path, _): &(&DefMap, ModuleId, ModPath, &str)| {
+        Res::from(map.resolve_path_fp_with_macro(
+            local,
+            db,
+            ResolveMode::Other,
+            *from,
+            path,
+            BuiltinShadowMode::Module,
+            None,
+        ))
+    };
+    let warm: Vec<Res> = lookups.iter().map(resolve).collect();
+    for ((_, _, _, what), res) in lookups.iter().zip(&warm) {
+        assert!(res.fixed && !res.def.is_none(), "{what}: does not resolve: {res:?}");
     }
-
-    /// `System`, counting the allocations of the thread inside [`count`].
-    pub(super) struct Counting;
-
-    fn note() {
-        let _ = COUNTING.try_with(|on| {
-            if on.get() {
-                let _ = COUNT.try_with(|count| count.set(count.get() + 1));
-            }
-        });
-    }
-
-    // SAFETY: every call goes to `System` unchanged. The counters are thread-locals with const
-    // initializers and no destructor, so touching them allocates nothing and cannot recurse.
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            note();
-            // SAFETY: the caller upholds `alloc`'s contract, which `System` shares.
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            note();
-            // SAFETY: as in `alloc`.
-            unsafe { System.alloc_zeroed(layout) }
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            note();
-            // SAFETY: `ptr` came from this allocator, which is `System`, with `layout`.
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: `ptr` came from this allocator, which is `System`, with `layout`.
-            unsafe { System.dealloc(ptr, layout) }
+    let shape = |what: &str| &warm[lookups.iter().position(|it| it.3 == what).unwrap()];
+    assert!(
+        matches!(
+            shape("through a glob").def.types,
+            Some(it) if matches!(it.import, Some(ImportOrExternCrate::Glob(_)))
+        ),
+        "`S` at the root is not glob-imported: {:?}",
+        shape("through a glob")
+    );
+    assert!(shape("the extern prelude").differing_crate);
+    assert!(shape("the extern prelude, `::`").differing_crate);
+    assert!(shape("an enum variant").enum_variant);
+    assert_eq!(shape("an associated item").segment_index, Some(2));
+    for (it, res) in lookups.iter().zip(&warm) {
+        if it.3 != "an associated item" {
+            assert_eq!(res.segment_index, None, "{}: not resolved to its end", it.3);
         }
     }
-
-    /// Runs `f`, returning what it returned and how many allocations it made on this thread.
-    pub(super) fn count<T>(f: impl FnOnce() -> T) -> (T, usize) {
-        COUNT.with(|count| count.set(0));
-        COUNTING.with(|on| on.set(true));
-        let out = f();
-        COUNTING.with(|on| on.set(false));
-        (out, COUNT.with(Cell::get))
-    }
+    assert_at_most(0, "a lookup of each shape of path", || {
+        for it in &lookups {
+            black_box(resolve(it));
+        }
+    });
 }

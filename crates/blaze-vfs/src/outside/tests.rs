@@ -588,13 +588,13 @@ fn wants_past_the_high_water_mark_allocate_nothing() {
 fn the_columns_answer_as_a_plain_table_does() {
     use std::collections::HashMap;
 
+    use blaze_ids::rng::SplitMix64;
+
     let dirs = Dirs::new();
     let mut reference: Vec<String> = Vec::new();
-    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
     for _ in 0..3000 {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
+        let seed = rng.next_u64();
         let depth = 1 + seed % 3;
         let mut wanted = String::new();
         for part in 0..depth {

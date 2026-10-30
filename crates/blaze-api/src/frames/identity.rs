@@ -68,12 +68,12 @@ impl Gen {
             1 => 256 + self.below(4),
             n => n % 6,
         };
-        (0..len).map(|_| CHARS[self.below(CHARS.len() as u64) as usize]).collect()
+        (0..len).map(|_| CHARS[self.below(CHARS.len() as u64) as usize]).collect()  // alloc: test and fuzz reference only
     }
 
     fn bytes(&mut self) -> Vec<u8> {
         let len = self.count(1);
-        (0..len).map(|_| self.next() as u8).collect()
+        (0..len).map(|_| self.next() as u8).collect()  // alloc: test and fuzz reference only
     }
 
     /// How many items a list has: at the top sometimes past what a head of one byte says.
@@ -86,7 +86,7 @@ impl Gen {
 
     fn many<T>(&mut self, depth: u32, mut one: impl FnMut(&mut Gen) -> T) -> Vec<T> {
         let len = self.count(depth);
-        (0..len).map(|_| one(self)).collect()
+        (0..len).map(|_| one(self)).collect()  // alloc: test and fuzz reference only
     }
 
     fn maybe<T>(&mut self, one: impl FnOnce(&mut Gen) -> T) -> Option<T> {
@@ -155,14 +155,14 @@ impl Gen {
 
     fn ops(&mut self, depth: u32) -> Vec<Op> {
         match self.plain {
-            true => Vec::new(),
+            true => Vec::new(),  // alloc: test and fuzz reference only
             false => self.many(depth, Gen::op),
         }
     }
 
     fn changes(&mut self, depth: u32) -> Vec<Change> {
         if self.plain {
-            return Vec::new();
+            return Vec::new();  // alloc: test and fuzz reference only
         }
         self.many(depth, |g| Change {
             path: g.text(),
@@ -176,7 +176,7 @@ impl Gen {
 
     fn edges(&mut self, depth: u32) -> Vec<Edge> {
         if self.plain {
-            return Vec::new();
+            return Vec::new();  // alloc: test and fuzz reference only
         }
         self.many(depth, |g| Edge { read: g.key(), saw: g.fingerprint() })
     }
@@ -202,7 +202,7 @@ impl Gen {
         match self.below(kinds) {
             0 => ViewRef::Head(self.text()),
             1 => ViewRef::Root(View { root: self.id() }),
-            _ => ViewRef::WhatIf { ops: self.ops(depth + 1), base: Box::new(self.view(depth + 1)) },
+            _ => ViewRef::WhatIf { ops: self.ops(depth + 1), base: Box::new(self.view(depth + 1)) },  // alloc: test and fuzz reference only
         }
     }
 
@@ -381,7 +381,7 @@ impl Gen {
             message: self.text(),
             children: match depth < 2 {
                 true => self.many(1, |g| g.diagnostic(depth + 1)),
-                false => Vec::new(),
+                false => Vec::new(),  // alloc: test and fuzz reference only
             },
             rendered: self.text(),
         }
@@ -549,7 +549,7 @@ impl Gen {
                 committed_high_water: self.wide(),
             }),
             _ => {
-                Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }
+                Response::Of { response: Box::new(self.response(depth + 1)), candidate: self.u32() }  // alloc: test and fuzz reference only
             }
         }
     }
@@ -655,7 +655,7 @@ where
     assert_eq!(framed[..4], (old.len() as u32).to_be_bytes());
     assert_eq!(framed[4..], old[..], "{envelope:?}");
     let permuted = writer.permuted();
-    let mut kept = vec![7];
+    let mut kept = vec![7];  // alloc: test and fuzz reference only
     encode_into(writer, &mut kept, envelope).unwrap();
     assert_eq!(kept[0], 7);
     assert_eq!(kept[5..], old[..], "{envelope:?}");

@@ -1,5 +1,6 @@
 //! This module add real world mbe example for benchmark tests
 
+use base_db::Db;
 use intern::Symbol;
 use rustc_hash::FxHashMap;
 use stdx::itertools::Itertools;
@@ -43,7 +44,7 @@ fn benchmark_expand_macro_rules() {
     if skip_slow_tests() {
         return;
     }
-    let db = salsa::DatabaseImpl::default();
+    let db = base_db::Db::for_tests();
     let rules = macro_rules_fixtures();
     let invocations = invocation_fixtures(&db, &rules);
 
@@ -92,7 +93,7 @@ fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree> {
 
 /// Generate random invocation fixtures from rules
 pub(crate) fn invocation_fixtures(
-    db: &dyn salsa::Database,
+    db: &Db,
     rules: &FxHashMap<String, DeclarativeMacro>,
 ) -> Vec<(String, tt::TopSubtree)> {
     let mut seed = 123456789;

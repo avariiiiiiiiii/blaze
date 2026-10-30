@@ -739,6 +739,8 @@ lives.
 
 > forwarded to cargo (told by tmux).
 
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve.rs `run`: once a process, after `Daemon::start`, `blaze_expand::install(Expansions { store: daemon.store().reader(), toolchain: hir_ty_codegen::v2::toolchain(host, &[])?.id, environment: proc_macro_api::warm::Environment::new() })`; a failure stops `blaze serve`. Not in `Daemon::start`, which the simulation tests call many times a process. `hir_ty_codegen::v2::toolchain` is the entry serve/unit/codegen.rs:88 already calls, asked of codegen-adapter (cargo.md:833).
+
 ## frontend-tokens: send token trees over the proc-macro wire as their columns
 
 From frontend-tokens (docs/v2/plan/design/frontend.md item 4, notes in
@@ -781,9 +783,15 @@ given must start at a 4-byte boundary. A `Vec<u8>` read from the pipe does, and 
 tree after another in one buffer, since every tree is padded to a word. Bytes that don't are
 refused with `WireError::Malformed`.
 
+> applied (usercode-wire): every reader in usercode's paths now copies bytes that are not 4-byte aligned before calling `read_wire`. The client's `proc_macro_api::wire::read_tree` goes through `wire::aligned`, which copies such bytes to a 4-byte boundary in a scratch buffer. blaze-macro-wasm's `wire::read` and blaze-expand native copy them only when unaligned too. `proc_macro_srv::TokenStream::read_wire` used to pass a deserialized `Vec<u8>` straight through. A `Vec<u8>` promises only 1-byte alignment, so it could be refused for where it sits. It now takes `scratch: &mut Vec<u8>` and goes through its own `aligned`, a copy of the client's, since proc-macro-srv can't depend on proc-macro-api. The test `a_tree_at_an_odd_offset_reads_from_a_copy` reads a tree at an odd address and writes back the same bytes. The client's twin is `bytes_off_a_word_are_read_from_a_copy`. Not built or run.
+
+> addendum (usercode): the client (`proc_macro_api::wire::read_tree`), `blaze-macro-wasm`'s and `blaze-expand` native's readers copy into a scratch through `aligned` when the bytes don't start at a word. `proc_macro_srv::TokenStream::read_wire` does not yet; sent to usercode-wire-next1, since a `Vec<u8>` has no alignment promise.
+
 > in progress (usercode): items 1-2 by usercode-wire-next1 (proc-macro-api, proc-macro-srv: `wire.rs` both sides on `write_wire`/`read_wire`), items 3-4 by usercode-wire-macros (blaze-macro-wasm, blaze-expand native).
 
 > applied (usercode-wire): items 1-2. Protocol version `WIRE_TREES` = 8 (`CURRENT_API_VERSION`) adds `ExpandMacroWire` to both protocols. Its request carries the input and attribute trees as `write_wire` bytes plus the three sites as `WireSpan`, and the answer is one tree's bytes. The client (`proc_macro_api::wire`, `Sent`) accepts any anchor combined with any context that the request's trees or sites sent, plus the spans it gave back in `SpanSource`, `SpanParent` and `SpanJoin` sub-responses (`resolved_at` puts one span's context on another's anchor). Any other part is an error naming its file, AST id or context, and so are bytes after the tree. A server older than 8 keeps `FlatTree` by negotiation, and every span of the table it sends back is held to the same `Sent`. On the server side, `proc_macro_srv::TokenStream::read_wire` and `write_wire` (`crates/proc-macro-srv/src/wire.rs`) take parts through `proc_macro_api::wire::raw_part`. The vendored CLI blaze runs still speaks 6, so the client negotiates `FlatTree` with it; porting it is `v2/requests/usercode-wire.md` section 4. Not built or run (this lane may not).
+
+> applied (usercode-wire, by its child usercode-wire-macros): items 3-4. The wasm wire (`crates/blaze-macro-wasm/src/wire.rs`) sends `write_wire` columns, with each part rewritten to its index in the expansion's `Parts`, and reads the output with `read_wire` against those parts only. The per-span `Spans` map is gone; the guest's `Span` is a packed `u64`. The native path (`crates/blaze-expand/src/native/`) walks the `TopSubtree` itself and builds the output with `TopSubtreeBuilder`, with no bytes in between. The kept expansion's key also carries the three sites' words, because the relative bytes leave out the call site's range. Details are in `/tmp/blaze-lanes/v2-usercode-wire-macros.md`, and what it needs from other lanes is in `v2/requests/usercode-wire-macros.md`. Not built or run.
 
 ## From safety-fuzz-procmacro (2026-10-29): the client crashes on a proc-macro server's token trees
 
@@ -1029,6 +1037,17 @@ Design and reasons: `docs/v2/plan/lanes/dedup/macros.md`. `blaze-macro-wasm` alr
    that runs every kind through both.
 
 > forwarded to usercode (`blaze-expand`, `blaze-macro-wasm` are its, running; usercode-wire-macros told).
+> applied (usercode-wire-macros, 2026-10-29, unbuilt): `crates/blaze-expand/src/bridge.rs` with
+> `lex`, `spans` (`join`, `subspan`, the `// SAFETY:` kept) and `wire`, one copy each; the
+> blaze-macro-wasm and native copies are deleted and both hosts call the bridge. The guest's API
+> is `native/proc_macro/api.rs`, `include!`d after the native `sys` and appended to the guest's
+> imports and exports in `GUEST`. Two differences: the `GUEST.ends_with(api.rs)` test is in
+> blaze-macro-wasm's tests (blaze-expand can't name `GUEST`, blaze-macro-wasm depends on it); the
+> sys test leaves out `output`, `panicked`, `retained`, which only the guest's exports call, and
+> checks `api.rs` calls none of them. Item 3: the guest numbers kinds as `LitKind::code` and
+> `from_code` in `api.rs` (it can't name tt), the native bridge converts through those numbers
+> and tt's, and `every_literal_kind_is_numbered_as_tt_numbers_it` runs each kind through both;
+> `rg 'lit_kind_number|fn lit_kind'` finds nothing.
 
 ## dedup: `proc-macro-api`'s `Connections` is `blaze_mem::Column` (from dedup-mem)
 
@@ -1084,6 +1103,8 @@ Status: open
 
 > forwarded to usercode-wire-next1 (holds `crates/proc-macro-api/`; told by tmux).
 
+> applied (usercode-wire): as asked. In `crates/proc-macro-api/src/pool.rs`, `FIRST`, `CHUNKS`, the chunked `Connections`, `chunk_of` and the test `slots_cover_every_index_in_order` are gone. `Connections` is now `Column<ProcMacroServerProcess>` with `MAX_CONNECTIONS` 4096 and `Tag::Expand`. `Connections::new()` returns `Result`, and `ProcMacroServerPool::new` passes it on with `?`. The `std::sync` import is down to `Arc`, and `Cargo.toml` gains `blaze-mem.workspace = true`. The two `format!` calls carry `// alloc: error path` notes, which takes `pool.rs` from 11 hot-lint findings to 9; the 9 are in other functions. Not built or run.
+
 ## speed-link-edge-sol-usercode: one process creation per sandboxed run on Windows, by a warm launcher (from speed-link-edge-sol-usercode, 2026-10-29)
 
 Context: `v2/requests/usercode-sandbox.md` section 6 item 5, which you declined for running the
@@ -1127,6 +1148,7 @@ the run is 2 to 3 times its fixed bound.
 Status: open
 
 > accepted (usercode), after usercode-hot-sandbox (editing `sandbox/windows.rs`) finishes: the `--v2-serve` launcher and the driver handing it a spec need `Confine` to hand a spec to a running process (with cargo's request 14 above, the warm launcher on Linux and macOS).
+> forwarded to usercode (from requests, pass 16; told by tmux).
 
 ## dedup: the test queue onto `blaze_core::wheel::Wheel`
 
@@ -1448,11 +1470,17 @@ fn ranks_are_a_set_with_a_cursor() {
         let mut empty = Ranks::empty(len);
 ```
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
+> applied (usercode): `Ranks` over `BitSet<u32>` as written (import, the 4 uses, `stop`); `ranks_are_a_set_with_a_cursor` with `Ranks::full`/`empty`. Not built.
+
 ## dedup: one list of build-script keys, one table of signal names (from dedup-scan-cargo, 2026-10-29)
 
 Two copies between `blaze-build-script` and `blaze-cargo` (the other halves are lane cargo's,
 `v2/requests/cargo.md` "dedup: one copy of each piece the load ported from v1's cargo crates",
 items 7 and 8). Nothing a build prints changes.
+
+> forwarded to usercode (from requests, pass 16; told by tmux).
 
 ### 1. `has_reserved_prefix` public
 
@@ -1473,6 +1501,10 @@ pub fn has_reserved_prefix(flag: &str) -> bool {
 ```
 
 (`output` is already `pub mod`). Lane cargo then deletes `RESERVED` and calls it.
+
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
+> applied (usercode): `pub fn has_reserved_prefix`. Lane cargo can now delete `RESERVED`.
 
 ### 2. `status_to_string` on `blaze_core::signal::described`
 
@@ -1507,6 +1539,10 @@ which depend on blaze-build-script.
 
 Status: open
 
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
+> applied (usercode): `status_to_string` on `blaze_core::signal::described`; `blaze-core` in `[dependencies]`, the `cfg(unix)` `libc` table gone (no other use). Cargo.lock: `blaze-build-script` gains `blaze-core` and loses `libc`, for the next resolve. Not built.
+
 ## dedup: blaze_core::create_process (from dedup-scan)
 
 `crates/blaze-core/src/create_process.rs` now holds this file's `command_line`/`append_arg`/
@@ -1529,3 +1565,668 @@ Status: open
 - drop `use rustc_hash::FxHashMap;` (its one other use was `environment`).
 
 Output is byte-for-byte what this file makes today. Why: blaze-core's driver had a second copy.
+
+> forwarded to usercode (from requests, pass 16; told by tmux).
+
+> forwarded to usercode-hot-sandbox (holds `sandbox/windows.rs`; told by tmux).
+> applied (usercode): `windows.rs`'s `command_line`, `append_arg`, `environment` and `upper` and their two tests are gone. The spawn calls `blaze_core::create_process::{environment, command_line}` (`.map_err(|it| it.to_string())`, error paths). `FxHashMap`, `OsString` and the tests' `text` went with them. Not built (Windows).
+> checked (usercode-hot-sandbox): the shared functions make the same command line and environment block as the deleted ones (a later variable of the same name, by upper case, replaces an earlier one, spelling included; sorted by the upper-cased name). Only the error text differs. The hot lint over `sandbox/` stays at 0.
+
+## dedup: byte cursor onto blaze_format::cursor
+
+From `dedup-cursor-run` (report `/tmp/blaze-lanes/v2-dedup-cursor-run.md`; the cursor is
+`crates/blaze-format/src/cursor.rs`, docs/v2/plan/lanes/dedup/cursor.md). Not built; the diff
+applies to the tree as of 2026-10-29 (`git apply --check`).
+
+- `trace.rs`: `At` (a shrinking slice; `take`, `byte`, `len`, `part`, `hash`) is deleted. `decode`
+  reads with `blaze_format::cursor::Reader`: `len` becomes `count_u64(1)` (the same bound, a
+  count of entries of at least a byte each), `part` becomes `bytes_u64`, `hash` becomes
+  `*array()`. `encode`'s `part` closure becomes `Put::put_bytes_u64`. Same bytes.
+- `index.rs`: `Shape::encode`, `Shape::decode` and `keyed` move off `At` the same way. `keyed`
+  maps the cursor's error with one closure, `short`. Its `At(at.0)` copy becomes `at` (`Reader`
+  is `Copy`). The cursor's `Reader` is named `cursor::Reader` because `blaze_cas::Reader` is
+  already imported.
+- `test/select.rs`: `Entry::decode`'s fixed offsets (`rest[65..73]`, ...) and `decode_reached`'s
+  `split_at_checked` become `Reader` reads, `finish` refusing trailing bytes. Their writers move
+  onto `Put`. Same bytes, and the same inputs are accepted.
+- `test/wire.rs` and `test/fork_server/recorded.rs` keep their own (the file is the text of every
+  test binary's harness, which links nothing of blaze). The diff adds one comment saying so.
+- The words change: "it ends early" and "it counts more than it holds" become the cursor's
+  ("at byte N: 8 bytes wanted, 3 left"). No test checks them (they check `is_err`). The
+  harness's "a frame ends early", which `test/tests.rs` checks, stays.
+- `Cargo.toml` gains `blaze-format.workspace = true`. Graph: `blaze-format` depends on
+  `blaze-ids` (`blake3`, `blaze-radix`, `blaze-mem`), `serde` and `zstd`, none of them on
+  `blaze-usercode`.
+
+```diff
+--- a/crates/blaze-usercode/Cargo.toml
++++ b/crates/blaze-usercode/Cargo.toml
+@@ -18,6 +18,7 @@
+ blaze-build-script.workspace = true
+ blaze-cas.workspace = true
+ blaze-core.workspace = true
++blaze-format.workspace = true
+ blaze-ids.workspace = true
+ blaze-inproc = { workspace = true, features = ["host"] }
+ blaze-items.workspace = true
+--- a/crates/blaze-usercode/src/trace.rs
++++ b/crates/blaze-usercode/src/trace.rs
+@@ -16,6 +16,7 @@
+ };
+ 
+ use blaze_core::{Traced, Untraceable};
++use blaze_format::cursor::{Put, Reader};
+ use blaze_ids::{ContentId, Hasher};
+ use blaze_mem::{Frame, Tag, frame, scratch};
+ 
+@@ -791,125 +792,86 @@
+ /// are equal bytes.
+ pub fn encode(report: &Report) -> Vec<u8> {
+     let mut out = MAGIC.to_vec(); // alloc: the edge, the bytes the launcher leaves the driver
+-    let part = |out: &mut Vec<u8>, bytes: &[u8]| {
+-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+-        out.extend_from_slice(bytes);
+-    };
+     match report {
+         Report::NotMade(why) => {
+-            out.push(0);
+-            part(&mut out, why.as_bytes());
++            out.put_u8(0);
++            out.put_bytes_u64(why.as_bytes());
+         }
+-        Report::Ran(None) => out.push(1),
++        Report::Ran(None) => out.put_u8(1),
+         Report::Ran(Some(traced)) => {
+-            out.push(2);
+-            out.extend_from_slice(&(traced.files.len() as u64).to_le_bytes());
++            out.put_u8(2);
++            out.put_u64(traced.files.len() as u64);
+             for (path, hash) in &traced.files {
+-                part(&mut out, &os_bytes(path.as_os_str()));
++                out.put_bytes_u64(&os_bytes(path.as_os_str()));
+                 match hash {
+                     Some(hash) => {
+-                        out.push(1);
+-                        out.extend_from_slice(hash);
++                        out.put_u8(1);
++                        out.put_bytes(hash);
+                     }
+-                    None => out.push(0),
++                    None => out.put_u8(0),
+                 }
+             }
+-            out.extend_from_slice(&(traced.dirs.len() as u64).to_le_bytes());
++            out.put_u64(traced.dirs.len() as u64);
+             for (path, hash) in &traced.dirs {
+-                part(&mut out, &os_bytes(path.as_os_str()));
+-                out.extend_from_slice(hash);
++                out.put_bytes_u64(&os_bytes(path.as_os_str()));
++                out.put_bytes(hash);
+             }
+-            out.extend_from_slice(&(traced.env.len() as u64).to_le_bytes());
++            out.put_u64(traced.env.len() as u64);
+             for (name, value) in &traced.env {
+-                part(&mut out, &os_bytes(name));
++                out.put_bytes_u64(&os_bytes(name));
+                 match value {
+                     Some(value) => {
+-                        out.push(1);
+-                        part(&mut out, &os_bytes(value));
++                        out.put_u8(1);
++                        out.put_bytes_u64(&os_bytes(value));
+                     }
+-                    None => out.push(0),
++                    None => out.put_u8(0),
+                 }
+             }
+-            out.extend_from_slice(&(traced.untraceable.len() as u64).to_le_bytes());
++            out.put_u64(traced.untraceable.len() as u64);
+             for it in &traced.untraceable {
+-                part(&mut out, untraceable_name(*it).as_bytes());
++                out.put_bytes_u64(untraceable_name(*it).as_bytes());
+             }
+         }
+     }
+     out
+-}
+-
+-/// Reads what [`encode`] and [`crate::index::Shape::encode`] write.
+-pub(crate) struct At<'a>(pub(crate) &'a [u8]);
+-
+-impl<'a> At<'a> {
+-    pub(crate) fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
+-        if self.0.len() < len {
+-            return Err("it ends early".to_owned()); // alloc: error path
+-        }
+-        let (head, rest) = self.0.split_at(len);
+-        self.0 = rest;
+-        Ok(head)
+-    }
+-
+-    pub(crate) fn byte(&mut self) -> Result<u8, String> {
+-        Ok(self.take(1)?[0])
+-    }
+-
+-    pub(crate) fn len(&mut self) -> Result<usize, String> {
+-        let len = u64::from_le_bytes(self.take(8)?.try_into().unwrap());
+-        // Each entry takes at least a byte: a count past what is left is not one written.
+-        usize::try_from(len)
+-            .ok()
+-            .filter(|it| *it <= self.0.len())
+-            .ok_or_else(|| "it counts more than it holds".to_owned()) // alloc: error path
+-    }
+-
+-    pub(crate) fn part(&mut self) -> Result<&'a [u8], String> {
+-        let len = self.len()?;
+-        self.take(len)
+-    }
+-
+-    fn hash(&mut self) -> Result<[u8; 32], String> {
+-        Ok(self.take(32)?.try_into().unwrap())
+-    }
+ }
+ 
+-/// The report `bytes` are, or why they are not one.
++/// The report `bytes` are, or why they are not one. Each list's count is checked against the
++/// bytes left at one byte an entry, so no count makes a loop run past what was written.
+ pub fn decode(bytes: &[u8]) -> Result<Report, String> {
+-    let mut at = At(bytes);
++    let mut at = Reader::new(bytes);
+     if at.take(MAGIC.len())? != MAGIC {
+         return Err("not a sandbox's report".to_owned()); // alloc: error path
+     }
+-    let report = match at.byte()? {
+-        0 => Report::NotMade(String::from_utf8_lossy(at.part()?).into_owned()), // alloc: why a sandbox was not made
++    let report = match at.u8()? {
++        0 => Report::NotMade(String::from_utf8_lossy(at.bytes_u64()?).into_owned()), // alloc: why a sandbox was not made
+         1 => Report::Ran(None),
+         2 => {
+             let mut traced = Traced::default();
+-            for _ in 0..at.len()? {
+-                let path = PathBuf::from(os_from(at.part()?)?);
+-                let hash = match at.byte()? {
++            for _ in 0..at.count_u64(1)? {
++                let path = PathBuf::from(os_from(at.bytes_u64()?)?);
++                let hash = match at.u8()? {
+                     0 => None,
+-                    1 => Some(at.hash()?),
++                    1 => Some(*at.array()?),
+                     _ => return Err("a file's hash is neither there nor not".to_owned()), // alloc: error path
+                 };
+                 traced.files.push((path, hash));
+             }
+-            for _ in 0..at.len()? {
+-                let path = PathBuf::from(os_from(at.part()?)?);
+-                traced.dirs.push((path, at.hash()?));
+-            }
+-            for _ in 0..at.len()? {
+-                let name = os_from(at.part()?)?;
+-                let value = match at.byte()? {
++            for _ in 0..at.count_u64(1)? {
++                let path = PathBuf::from(os_from(at.bytes_u64()?)?);
++                traced.dirs.push((path, *at.array()?));
++            }
++            for _ in 0..at.count_u64(1)? {
++                let name = os_from(at.bytes_u64()?)?;
++                let value = match at.u8()? {
+                     0 => None,
+-                    1 => Some(os_from(at.part()?)?),
++                    1 => Some(os_from(at.bytes_u64()?)?),
+                     _ => return Err("a variable's value is neither there nor not".to_owned()), // alloc: error path
+                 };
+                 traced.env.push((name, value));
+             }
+-            for _ in 0..at.len()? {
+-                let name = at.part()?;
++            for _ in 0..at.count_u64(1)? {
++                let name = at.bytes_u64()?;
+                 let untraceable = std::str::from_utf8(name).ok().and_then(untraceable_of);
+                 // alloc: error path
+                 let why = || format!("no untraceable is {:?}", String::from_utf8_lossy(name));
+@@ -919,7 +881,7 @@
+         }
+         other => return Err(format!("no report is of kind {other}")), // alloc: error path
+     };
+-    match at.0.is_empty() {
++    match at.is_done() {
+         true => Ok(report),
+         false => Err("the report has bytes after its end".to_owned()), // alloc: error path
+     }
+--- a/crates/blaze-usercode/src/index.rs
++++ b/crates/blaze-usercode/src/index.rs
+@@ -19,12 +19,13 @@
+ 
+ use blaze_cas::{Corrupt, Guard, Key, Kind, Mismatch, Reader, Store, Ticket};
+ use blaze_core::{Traced, Untraceable};
++use blaze_format::cursor::{self, Put};
+ use blaze_ids::{ContentId, Hasher};
+ use blaze_mem::{Tag, frame};
+ 
+ use crate::{
+     RunKey,
+-    trace::{self, ALL_ENV_NAME, At, Inputs, os_from},
++    trace::{self, ALL_ENV_NAME, Inputs, os_from},
+ };
+ 
+ /// What a run read, without the values.
+@@ -105,51 +106,48 @@
+ 
+     pub fn encode(&self) -> Vec<u8> {
+         let mut out = SHAPE_MAGIC.to_vec(); // alloc: the bytes the caller keeps
+-        let part = |out: &mut Vec<u8>, bytes: &[u8]| {
+-            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+-            out.extend_from_slice(bytes);
+-        };
+         for list in [&self.files, &self.dirs] {
+-            out.extend_from_slice(&(list.len() as u64).to_le_bytes());
++            out.put_u64(list.len() as u64);
+             for path in list {
+-                part(&mut out, &trace::os_bytes(path.as_os_str()));
++                out.put_bytes_u64(&trace::os_bytes(path.as_os_str()));
+             }
+         }
+-        out.extend_from_slice(&(self.env.len() as u64).to_le_bytes());
++        out.put_u64(self.env.len() as u64);
+         for name in &self.env {
+-            part(&mut out, &trace::os_bytes(name));
++            out.put_bytes_u64(&trace::os_bytes(name));
+         }
+-        out.extend_from_slice(&(self.untraceable.len() as u64).to_le_bytes());
++        out.put_u64(self.untraceable.len() as u64);
+         for it in &self.untraceable {
+-            part(&mut out, trace::untraceable_name(*it).as_bytes());
++            out.put_bytes_u64(trace::untraceable_name(*it).as_bytes());
+         }
+         out
+     }
+ 
+     /// The shape [`Shape::encode`] wrote, which the caller keeps (an explanation of a rerun).
++    /// Each list's count is checked against the bytes left at one byte an entry.
+     pub fn decode(bytes: &[u8]) -> Result<Shape, String> {
+         let rest = bytes
+             .strip_prefix(SHAPE_MAGIC.as_slice())
+             .ok_or_else(|| "not a shape".to_owned())?; // alloc: error path
+-        let mut at = At(rest);
++        let mut at = cursor::Reader::new(rest);
+         let mut shape = Shape::default();
+-        for _ in 0..at.len()? {
+-            shape.files.push(PathBuf::from(os_from(at.part()?)?));
++        for _ in 0..at.count_u64(1)? {
++            shape.files.push(PathBuf::from(os_from(at.bytes_u64()?)?));
+         }
+-        for _ in 0..at.len()? {
+-            shape.dirs.push(PathBuf::from(os_from(at.part()?)?));
++        for _ in 0..at.count_u64(1)? {
++            shape.dirs.push(PathBuf::from(os_from(at.bytes_u64()?)?));
+         }
+-        for _ in 0..at.len()? {
+-            shape.env.push(os_from(at.part()?)?);
++        for _ in 0..at.count_u64(1)? {
++            shape.env.push(os_from(at.bytes_u64()?)?);
+         }
+-        for _ in 0..at.len()? {
+-            let name = at.part()?;
++        for _ in 0..at.count_u64(1)? {
++            let name = at.bytes_u64()?;
+             let untraceable = std::str::from_utf8(name).ok().and_then(trace::untraceable_of);
+             // alloc: error path
+             let why = || format!("no untraceable is {:?}", String::from_utf8_lossy(name));
+             shape.untraceable.push(untraceable.ok_or_else(why)?);
+         }
+-        match at.0.is_empty() {
++        match at.is_done() {
+             true => Ok(shape),
+             false => Err("the shape has bytes after its end".to_owned()), // alloc: error path
+         }
+@@ -253,13 +251,14 @@
+ /// not their bytes').
+ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option<ContentId>, Keyed<I::Error>> {
+     let bad = Keyed::NotAShape;
++    let short = |error: cursor::Error| Keyed::NotAShape(error.into());
+     let all_name = trace::os_bytes(OsStr::new(ALL_ENV_NAME));
+     // alloc: error path
+     let rest = bytes.strip_prefix(SHAPE_MAGIC.as_slice()).ok_or_else(|| bad("not a shape".to_owned()))?;
+-    let mut at = At(rest);
++    let mut at = cursor::Reader::new(rest);
+     let mut keyer = trace::Keyer::new(run);
+-    for _ in 0..at.len().map_err(bad)? {
+-        let bytes = at.part().map_err(bad)?;
++    for _ in 0..at.count_u64(1).map_err(short)? {
++        let bytes = at.bytes_u64().map_err(short)?;
+         let path = trace::path_in(bytes).map_err(bad)?;
+         let hash = match trace::walked(&path) {
+             // A walked directory that was not there: one there now is what the run did not
+@@ -272,8 +271,8 @@
+         };
+         keyer.file(bytes, hash.as_ref());
+     }
+-    for _ in 0..at.len().map_err(bad)? {
+-        let bytes = at.part().map_err(bad)?;
++    for _ in 0..at.count_u64(1).map_err(short)? {
++        let bytes = at.bytes_u64().map_err(short)?;
+         let path = trace::path_in(bytes).map_err(bad)?;
+         let hash = match trace::walked(&path) {
+             Some((dir, package)) => trace::walk(inputs, dir, package),
+@@ -284,11 +283,11 @@
+             None => return Ok(None),
+         }
+     }
+-    let names = at.len().map_err(bad)?;
+-    let mut asked = At(at.0);
++    let names = at.count_u64(1).map_err(short)?;
++    let mut asked = at;
+     let mut whole = false;
+     for _ in 0..names {
+-        whole |= asked.part().map_err(bad)? == &*all_name;
++        whole |= asked.bytes_u64().map_err(short)? == &*all_name;
+     }
+     if whole {
+         let all = inputs.env_all();
+@@ -296,7 +295,7 @@
+         let hex = trace::os_bytes(OsStr::new(std::str::from_utf8(&hex).expect("a hash in hex is ASCII")));
+         let mut all = all.iter().peekable();
+         for _ in 0..names {
+-            let name = at.part().map_err(bad)?;
++            let name = at.bytes_u64().map_err(short)?;
+             let named = trace::os_in(name).map_err(bad)?;
+             while let Some((set, value)) = all.next_if(|it| it.0.as_os_str() < &*named) {
+                 keyer.env(&trace::os_bytes(set), Some(&*trace::os_bytes(value)));
+@@ -315,20 +314,20 @@
+         }
+     } else {
+         for _ in 0..names {
+-            let name = at.part().map_err(bad)?;
++            let name = at.bytes_u64().map_err(short)?;
+             let value = inputs.env(&trace::os_in(name).map_err(bad)?).map(trace::os_bytes);
+             keyer.env(name, value.as_deref());
+         }
+     }
+-    for _ in 0..at.len().map_err(bad)? {
+-        let name = at.part().map_err(bad)?;
++    for _ in 0..at.count_u64(1).map_err(short)? {
++        let name = at.bytes_u64().map_err(short)?;
+         std::str::from_utf8(name)
+             .ok()
+             .and_then(trace::untraceable_of)
+             .ok_or_else(|| bad(format!("no untraceable is {:?}", String::from_utf8_lossy(name))))?; // alloc: error path
+         keyer.untraceable(name);
+     }
+-    match at.0.is_empty() {
++    match at.is_done() {
+         true => Ok(Some(keyer.finish())),
+         false => Err(bad("the shape has bytes after its end".to_owned())), // alloc: error path
+     }
+--- a/crates/blaze-usercode/src/test/select.rs
++++ b/crates/blaze-usercode/src/test/select.rs
+@@ -20,6 +20,7 @@
+ 
+ use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
+ use blaze_core::{Traced, Untraceable};
++use blaze_format::cursor::{Put, Reader};
+ use blaze_ids::{ContentId, Hasher, radix};
+ use blaze_items::CodeHash;
+ use rustc_hash::{FxHashMap, FxHashSet};
+@@ -685,13 +686,12 @@
+ impl<'s> Entry<'s> {
+     fn encode(&self) -> Vec<u8> {
+         let mut out = Vec::with_capacity(HISTORY.len() + 1 + 32 + 32 + 8 + 8 + self.traced.len());
+-        out.extend_from_slice(HISTORY);
+-        out.push(u8::from(self.passed) | (u8::from(self.kept) << 1));
+-        out.extend_from_slice(&self.attrs.0);
+-        out.extend_from_slice(&self.reached.0.0);
+-        out.extend_from_slice(&(self.took.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
+-        out.extend_from_slice(&(self.traced.len() as u64).to_le_bytes());
+-        out.extend_from_slice(self.traced);
++        out.put_bytes(HISTORY);
++        out.put_u8(u8::from(self.passed) | (u8::from(self.kept) << 1));
++        out.put_bytes(&self.attrs.0);
++        out.put_bytes(&self.reached.0.0);
++        out.put_u64(self.took.as_micros().min(u128::from(u64::MAX)) as u64);
++        out.put_bytes_u64(self.traced);
+         out
+     }
+ 
+@@ -708,22 +708,18 @@
+ 
+     fn decode(bytes: &'s [u8]) -> Result<Entry<'s>, String> {
+         let rest = bytes.strip_prefix(HISTORY).ok_or_else(|| "not a test's history".to_owned())?; // alloc: error path
+-        if rest.len() < 1 + 32 + 32 + 8 + 8 {
+-            return Err("a test's history ends early".to_owned()); // alloc: error path
+-        }
+-        let flags = rest[0];
+-        let id = |at: usize| ContentId(rest[at..at + 32].try_into().expect("32 bytes"));
+-        let took = u64::from_le_bytes(rest[65..73].try_into().expect("8 bytes"));
+-        let len = u64::from_le_bytes(rest[73..81].try_into().expect("8 bytes"));
+-        let traced = &rest[81..];
+-        if traced.len() as u64 != len {
+-            return Err("a test's history has a record of another length than it says".to_owned()); // alloc: error path
+-        }
++        let mut at = Reader::new(rest);
++        let flags = at.u8()?;
++        let attrs = ContentId(*at.array()?);
++        let reached = Key(ContentId(*at.array()?));
++        let took = at.u64()?;
++        let traced = at.bytes_u64()?;
++        at.finish()?;
+         Ok(Entry {
+             passed: flags & 1 != 0,
+             kept: flags & 2 != 0,
+-            attrs: id(1),
+-            reached: Key(id(33)),
++            attrs,
++            reached,
+             took: Duration::from_micros(took),
+             traced,
+         })
+@@ -733,10 +729,10 @@
+ /// The `count` hashes of `set`, in order, as the store keeps a reached set.
+ fn encode_reached<'h>(count: usize, set: impl Iterator<Item = &'h CodeHash>) -> Vec<u8> {
+     let mut out = Vec::with_capacity(REACHED.len() + 8 + 32 * count);
+-    out.extend_from_slice(REACHED);
+-    out.extend_from_slice(&(count as u64).to_le_bytes());
++    out.put_bytes(REACHED);
++    out.put_u64(count as u64);
+     for hash in set {
+-        out.extend_from_slice(&hash.0.0);
++        out.put_bytes(&hash.0.0);
+     }
+     out
+ }
+@@ -744,12 +740,11 @@
+ /// The sorted set [`encode_reached`] wrote.
+ fn decode_reached(bytes: &[u8]) -> Result<Vec<CodeHash>, String> {
+     let rest = bytes.strip_prefix(REACHED).ok_or_else(|| "not a reached set".to_owned())?; // alloc: the edge: an explanation for people, made only when asked
+-    let (count, rest) = rest.split_at_checked(8).ok_or_else(|| "a reached set ends early".to_owned())?; // alloc: the edge: an explanation for people, made only when asked
+-    let count = u64::from_le_bytes(count.try_into().expect("8 bytes"));
+-    if rest.len() as u64 != count.saturating_mul(32) {
+-        return Err("a reached set holds another number of hashes than it says".to_owned()); // alloc: the edge: an explanation for people, made only when asked
+-    }
+-    Ok(rest
++    let mut at = Reader::new(rest);
++    let count = at.count_u64(32)?;
++    let hashes = at.take(32 * count)?;
++    at.finish()?;
++    Ok(hashes
+         .chunks_exact(32)
+         .map(|it| CodeHash(ContentId(it.try_into().expect("32 bytes"))))
+         .collect()) // alloc: the edge: an explanation for people, made only when asked
+--- a/crates/blaze-usercode/src/test/wire.rs
++++ b/crates/blaze-usercode/src/test/wire.rs
+@@ -13,13 +13,8 @@
+ //! [`Frames::pop_view`]); [`Frame`] is the owned form.
+ //!
+ //! - The server, once connected and before any test runs: [`Frame::Hello`] (kind 1) with
+-//!   [`VERSION`], its process id, how long one fork of it took (nanoseconds, measured before the
+-//!   hello) and the name of every test of the binary in order; a test is named by its index in
+-//!   this list from then on.
+-//! - blaze, only as its first frame to the server: [`Frame::Replicate`] (kind 132), make `count`
+-//!   copies of yourself. Each copy is a server of its own: it connects anew on the same socket,
+-//!   says its own hello (the same tests) and runs what blaze sends it there, so a binary's forks
+-//!   run `count + 1` at a time. The server that was asked goes on as it was.
++//!   [`VERSION`], its process id and the name of every test of the binary in order; a test is
++//!   named by its index in this list from then on.
+ //! - blaze: [`Frame::Run`] (kind 129), the test at an index under an id of blaze's choosing.
+ //!   The server forks a child that marks its scope (`access(MARK + name)`), runs the one test
+ //!   as libtest would, with its output (standard output and error, together) going to the
+@@ -47,7 +42,7 @@
+ pub const MARK: &str = "/.blaze-test/";
+ 
+ /// The protocol's version, said by [`Frame::Hello`].
+-pub const VERSION: u32 = 3;
++pub const VERSION: u32 = 2;
+ 
+ /// The most bytes a frame's body may have.
+ pub const LONGEST: u32 = 64 << 20;
+@@ -71,7 +66,6 @@
+ const RUN: u8 = 129;
+ const KILL: u8 = 130;
+ const QUIT: u8 = 131;
+-const REPLICATE: u8 = 132;
+ 
+ const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+ const HIGH: u64 = 0x8080_8080_8080_8080;
+@@ -263,25 +257,22 @@
+ /// A frame. [`View`] is the same read in place.
+ #[derive(PartialEq, Eq, Debug)]
+ pub enum Frame {
+-    /// `fork` is how long one fork of the server took, in nanoseconds.
+-    Hello { version: u32, pid: u32, fork: u64, tests: Vec<String> },
++    Hello { version: u32, pid: u32, tests: Vec<String> },
+     Ended { id: u64, end: End, output: Vec<u8>, executed: Executed },
+     Run { id: u64, index: u32 },
+     Kill { id: u64 },
+     Quit,
+-    Replicate { count: u32 },
+ }
+ 
+ /// A frame read in place from the bytes it came in: every length checked against them, every
+ /// string checked UTF-8, nothing copied.
+ #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+ pub enum View<'a> {
+-    Hello { version: u32, pid: u32, fork: u64, tests: Names<'a> },
++    Hello { version: u32, pid: u32, tests: Names<'a> },
+     Ended { id: u64, end: EndView<'a>, output: &'a [u8], executed: ExecView<'a> },
+     Run { id: u64, index: u32 },
+     Kill { id: u64 },
+     Quit,
+-    Replicate { count: u32 },
+ }
+ 
+ /// The names of a hello, read in place: `count` strings, each checked when the frame was read.
+@@ -306,6 +297,8 @@
+     }
+ }
+ 
++// These writers and `Cursor` are not `blaze_format::cursor`'s: this file is also the text of
++// every test binary's harness, which links nothing of blaze.
+ fn put_u32(out: &mut Vec<u8>, value: u32) {
+     out.extend_from_slice(&value.to_le_bytes());
+ }
+@@ -317,32 +310,6 @@
+ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+     put_u32(out, bytes.len() as u32);
+     out.extend_from_slice(bytes);
+-}
+-
+-/// [`Frame::Hello`] of these parts, with its length, added to `out`: the bytes
+-/// [`Frame::encode`] adds for it, from borrowed names, so a server says hello straight from its
+-/// tests' names, with no list of its own.
+-pub fn encode_hello<'a>(out: &mut Vec<u8>, version: u32, pid: u32, fork: u64, tests: impl Iterator<Item = &'a str>) {
+-    let start = out.len();
+-    put_u32(out, 0);
+-    put_hello(out, version, pid, fork, tests);
+-    let len = (out.len() - start - 4) as u32;
+-    out[start..start + 4].copy_from_slice(&len.to_le_bytes());
+-}
+-
+-fn put_hello<'a>(out: &mut Vec<u8>, version: u32, pid: u32, fork: u64, tests: impl Iterator<Item = &'a str>) {
+-    out.push(HELLO);
+-    put_u32(out, version);
+-    put_u32(out, pid);
+-    put_u64(out, fork);
+-    let count = out.len();
+-    put_u32(out, 0);
+-    let mut names = 0u32;
+-    for name in tests {
+-        put_bytes(out, name.as_bytes());
+-        names += 1;
+-    }
+-    out[count..count + 4].copy_from_slice(&names.to_le_bytes());
+ }
+ 
+ /// [`Frame::Ended`] of these parts, with its length, added to `out`: the bytes
+@@ -422,7 +389,15 @@
+         let start = out.len();
+         put_u32(out, 0);
+         match self {
+-            Frame::Hello { version, pid, fork, tests } => put_hello(out, *version, *pid, *fork, tests.iter().map(String::as_str)),
++            Frame::Hello { version, pid, tests } => {
++                out.push(HELLO);
++                put_u32(out, *version);
++                put_u32(out, *pid);
++                put_u32(out, tests.len() as u32);
++                for name in tests {
++                    put_bytes(out, name.as_bytes());
++                }
++            }
+             Frame::Ended { id, end, output, executed } => {
+                 out.push(ENDED);
+                 put_u64(out, *id);
+@@ -453,10 +428,6 @@
+                 put_u64(out, *id);
+             }
+             Frame::Quit => out.push(QUIT),
+-            Frame::Replicate { count } => {
+-                out.push(REPLICATE);
+-                put_u32(out, *count);
+-            }
+         }
+         let len = (out.len() - start - 4) as u32;
+         out[start..start + 4].copy_from_slice(&len.to_le_bytes());
+@@ -482,13 +453,12 @@
+             HELLO => {
+                 let version = at.u32()?;
+                 let pid = at.u32()?;
+-                let fork = at.u64()?;
+                 let count = at.u32()?;
+                 let from = at.at;
+                 for _ in 0..count {
+                     at.string()?;
+                 }
+-                View::Hello { version, pid, fork, tests: Names { count, bytes: &body[from..at.at] } }
++                View::Hello { version, pid, tests: Names { count, bytes: &body[from..at.at] } }
+             }
+             ENDED => {
+                 let id = at.u64()?;
+@@ -528,7 +498,6 @@
+             }
+             KILL => View::Kill { id: at.u64()? },
+             QUIT => View::Quit,
+-            REPLICATE => View::Replicate { count: at.u32()? },
+             other => return Err(format!("no frame is of kind {}", other)), // alloc: error path
+         };
+         match at.at == body.len() {
+@@ -539,10 +508,10 @@
+ 
+     pub fn to_frame(self) -> Frame {
+         match self {
+-            View::Hello { version, pid, fork, tests } => {
++            View::Hello { version, pid, tests } => {
+                 let mut names = Vec::with_capacity(tests.len());
+                 names.extend(tests.iter().map(str::to_owned));
+-                Frame::Hello { version, pid, fork, tests: names }
++                Frame::Hello { version, pid, tests: names }
+             }
+             View::Ended { id, end, output, executed } => {
+                 Frame::Ended { id, end: end.to_end(), output: output.to_vec(), executed: executed.to_executed() } // alloc: the owned frame: what a result keeps
+@@ -550,7 +519,6 @@
+             View::Run { id, index } => Frame::Run { id, index },
+             View::Kill { id } => Frame::Kill { id },
+             View::Quit => Frame::Quit,
+-            View::Replicate { count } => Frame::Replicate { count },
+         }
+     }
+ }
+```
+
+> applied (usercode): the diff as written (`git apply`, clean against the tree after usercode-mem's edits). `At` is gone; `trace`, `index` and `test/select` read with `blaze_format::cursor::Reader` and write with `Put`. Lint 0 in those files; manifest lint passes. Not built.

@@ -100,7 +100,7 @@ pub(super) fn enabled() -> bool {
 /// The exports of what `recorder` calls that its compile imports, and of what those call in
 /// turn, the first first: what a call asks for is in the compile's names from then on.
 pub(super) fn chosen(recorder: &mut Recorder<'_>) -> Vec<Import> {
-    tallied(chosen_for(recorder, &|_| false, BUDGET))
+    tallied(chosen_for(recorder, &FxHashSet::default(), BUDGET))
 }
 
 /// `chosen`, counted as imported.
@@ -116,7 +116,7 @@ pub(super) fn tallied(chosen: Vec<Import>) -> Vec<Import> {
 /// room of all of them and imports none of them: `defined` says which instances it has.
 pub(super) fn chosen_for(
     recorder: &mut Recorder<'_>,
-    defined: &dyn Fn(&Instance) -> bool,
+    defined: &FxHashSet<Instance>,
     budget: usize,
 ) -> Vec<Import> {
     let db = recorder.db;
@@ -133,7 +133,7 @@ pub(super) fn chosen_for(
         }
         let request = &recorder.requests.funcs[id as usize];
         let FuncTarget::Instance(instance, env) = &request.target else { continue };
-        if !super::tier::shared(db, instance) || defined(instance) {
+        if !super::tier::shared(db, instance) || defined.contains(instance) {
             continue;
         }
         let Some(export) = export(db, instance, env) else { continue };

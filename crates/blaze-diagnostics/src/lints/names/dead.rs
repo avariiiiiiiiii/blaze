@@ -1,5 +1,6 @@
 //! `dead_code` and `dead_code_pub_in_binary`: rustc's dead-code pass. The definitions of the
-//! crate (`defs`), what is reachable from outside it (`reach`), where liveness starts (`seed`),
+//! crate (`defs`), what is reachable from outside it (`reach`, read from the crate's effective
+//! visibilities), where liveness starts (`seed`),
 //! what is live from there (`mark`, with `res` for what a name resolves to), and what is
 //! reported dead (`report`), each at the level of `dead_code` where it is (`level`).
 //!
@@ -21,15 +22,24 @@ mod report;
 mod res;
 mod seed;
 
-use crate::{cx::Cx, lower::Found};
+use super::effective::Effective;
+use crate::{
+    cx::Cx,
+    lints::registry::{LintId, LintSet},
+    lower::Found,
+};
 
-pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
+pub(super) fn lints(cx: &Cx<'_, '_>, effective: &Effective) -> Vec<Found> {
+    const GIVES: LintSet = LintSet::of(&[LintId::DEAD_CODE, LintId::named("dead_code_pub_in_binary")]);
+    if !cx.any_may_fire(&GIVES) {
+        return Vec::new();
+    }
     let defs = defs::Defs::of(cx);
     if defs.unported {
         return Vec::new(); // alloc: empty, allocates nothing
     }
     let levels = level::Levels::new();
-    let reach = reach::Reach::of(cx, &defs);
+    let reach = reach::Reach::of(cx, &defs, effective);
     let k = seed::Crate::new(cx, &defs, &levels, &reach);
     let seeds = seed::seeds(&k);
     let (liveness, mut found) = mark::live(&k, seeds);

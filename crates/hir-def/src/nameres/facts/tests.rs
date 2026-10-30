@@ -42,8 +42,8 @@ use crate::{
     builtin_derive::BuiltinDeriveImplTrait,
     expr_store::Body,
     item_scope::{
-        DeriveMacroInvocation, GlobId, ImportId, ImportOrDef, ImportOrExternCrate, ImportOrGlob,
-        ItemScope,
+        DeriveMacroInvocation, GlobAmbiguity, GlobId, ImportId, ImportOrDef, ImportOrExternCrate,
+        ImportOrGlob, ItemInNs, ItemScope, ShadowedImport, UnderscoreImport,
     },
     item_tree::TreeId,
     nameres::{
@@ -275,6 +275,12 @@ pub(super) struct CScope {
     pub(super) extern_blocks: Vec<CLoc>,
     pub(super) unnamed_consts: Vec<CAssoc>,
     pub(super) unnamed_trait_imports: Vec<(CLoc, CItem<()>)>,
+    /// Each `use path as _;` with what it named in the types namespace and its visibility.
+    pub(super) underscore_imports: Vec<(CImport, Option<CDef>, CVis)>,
+    /// Name, the other item, the glob, visibility.
+    pub(super) glob_ambiguities: Vec<(Name, CItemInNs, CImport, CVis)>,
+    /// Import, name, item, visibility.
+    pub(super) shadowed_imports: Vec<(CImport, Name, CItemInNs, CVis)>,
     pub(super) use_imports_types: Vec<(CImport, CImport)>,
     pub(super) use_imports_values: Vec<(CImport, CImport)>,
     pub(super) use_imports_macros: Vec<(CImport, CImport)>,
@@ -284,6 +290,13 @@ pub(super) struct CScope {
     pub(super) attr_macros: Vec<(ErasedAstId, MacroCallId)>,
     pub(super) macro_invocations: Vec<(ErasedAstId, MacroCallId)>,
     pub(super) derive_macros: Vec<(ErasedAstId, Vec<CDeriveInvocation>)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum CItemInNs {
+    Types(CDef),
+    Values(CDef),
+    Macros(CMacro),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -595,6 +608,9 @@ impl<'a> Projector<'a> {
             extern_blocks,
             unnamed_consts,
             unnamed_trait_imports,
+            underscore_imports,
+            glob_ambiguities,
+            shadowed_imports,
             use_imports_types,
             use_imports_values,
             use_imports_macros,
@@ -694,6 +710,32 @@ impl<'a> Projector<'a> {
                     })
                     .collect(),
             ),
+            underscore_imports: sorted(
+                underscore_imports
+                    .iter()
+                    .map(|&UnderscoreImport { import, def, vis }| {
+                        (self.import_id(import), def.map(|it| self.def(it)), self.vis(vis))
+                    })
+                    .collect(),
+            ),
+            glob_ambiguities: sorted(
+                glob_ambiguities
+                    .iter()
+                    .filter(|it| !exempt.name(&it.name))
+                    .map(|&GlobAmbiguity { name, other, glob, vis }| {
+                        (name, self.item_in_ns(other), self.glob_id(glob), self.vis(vis))
+                    })
+                    .collect(),
+            ),
+            shadowed_imports: sorted(
+                shadowed_imports
+                    .iter()
+                    .filter(|it| !exempt.name(&it.name))
+                    .map(|&ShadowedImport { import, name, item, vis }| {
+                        (self.import_or_extern_crate(import), name, self.item_in_ns(item), self.vis(vis))
+                    })
+                    .collect(),
+            ),
             use_imports_types: chain(
                 use_imports_types
                     .iter()
@@ -754,6 +796,14 @@ impl<'a> Projector<'a> {
                     })
                     .collect(),
             ),
+        }
+    }
+
+    fn item_in_ns(&self, item: ItemInNs) -> CItemInNs {
+        match item {
+            ItemInNs::Types(def) => CItemInNs::Types(self.def(def)),
+            ItemInNs::Values(def) => CItemInNs::Values(self.def(def)),
+            ItemInNs::Macros(mac) => CItemInNs::Macros(self.makro(mac)),
         }
     }
 
@@ -823,6 +873,8 @@ pub(super) fn project<'a>(
         macro_use_prelude,
         derive_helpers_in_scope,
         session_macros,
+        // Compared without ids by `driver.rs`'s `name_records_equal_the_old_ones`.
+        names: _,
         diagnostics,
         diagnostics_by_module,
         data,
@@ -957,6 +1009,9 @@ fn compare_scope(out: &mut String, at: &str, old: &CScope, new: &CScope) {
         extern_blocks,
         unnamed_consts,
         unnamed_trait_imports,
+        underscore_imports,
+        glob_ambiguities,
+        shadowed_imports,
         use_imports_types,
         use_imports_values,
         use_imports_macros,
@@ -977,6 +1032,9 @@ fn compare_scope(out: &mut String, at: &str, old: &CScope, new: &CScope) {
     list(out, at, "extern_blocks", extern_blocks, &new.extern_blocks);
     list(out, at, "unnamed_consts", unnamed_consts, &new.unnamed_consts);
     list(out, at, "unnamed_trait_imports", unnamed_trait_imports, &new.unnamed_trait_imports);
+    list(out, at, "underscore_imports", underscore_imports, &new.underscore_imports);
+    list(out, at, "glob_ambiguities", glob_ambiguities, &new.glob_ambiguities);
+    list(out, at, "shadowed_imports", shadowed_imports, &new.shadowed_imports);
     list(out, at, "use_imports_types", use_imports_types, &new.use_imports_types);
     list(out, at, "use_imports_values", use_imports_values, &new.use_imports_values);
     list(out, at, "use_imports_macros", use_imports_macros, &new.use_imports_macros);

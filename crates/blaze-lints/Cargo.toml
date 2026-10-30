@@ -21,6 +21,7 @@ base-db.workspace = true
 blaze-ids.workspace = true
 blaze-phf.workspace = true
 cfg.workspace = true
+either.workspace = true
 hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
@@ -28,6 +29,7 @@ hir-ty.workspace = true
 intern.workspace = true
 memchr.workspace = true
 rustc-hash.workspace = true
+rustc_type_ir.workspace = true
 salsa.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -36,6 +36,7 @@ use crate::{
     cx::{Cx, item_range},
     lints::{
         edit_distance::find_best_match_for_name_with_substrings,
+        registry::LintId,
         syntax::{Emitted, Walk, from_expansion, source_fact},
     },
     model::{Applicability, Diag, SuggestionStyle},
@@ -222,8 +223,13 @@ fn is_doc_str(attr: &Attr) -> bool {
 /// before the edition it must be, and `unsafe_code` of every unsafe attribute.
 fn safety(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, found: &mut Vec<Diag>) {
     let Safety::Unsafe { note, unsafe_since } = builtin.safety else { return };
+    let outside = cx.lint_may_fire(LintId::named("unsafe_attr_outside_unsafe"));
+    let code = cx.lint_may_fire(LintId::named("unsafe_code"));
+    if !outside && !code {
+        return;
+    }
     let inner = cx.span(attr.in_file(attr.inner_range()));
-    if !attr.is_unsafe() {
+    if outside && !attr.is_unsafe() {
         let edition = attr.file.edition(cx.db);
         let is_error = unsafe_since.is_none_or(|since| edition >= since);
         if !is_error {
@@ -239,6 +245,9 @@ fn safety(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, found: &mut Vec<Diag>
             }
             found.push(diag);
         }
+    }
+    if !code {
+        return;
     }
     let mut diag = Diag::lint("unsafe_code", format!("usage of the unsafe `{}` attribute", attr.name()), inner);
     diag.note(note);

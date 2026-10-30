@@ -147,7 +147,7 @@ fn a_files_parse_shares_its_text() {
     let parse = EditionedFileId::new(&db, files[1], Edition::Edition2021).parse(&db);
     let root = parse.syntax_node();
     let tree = root.flat_tree().expect("a parsed file is a flat tree");
-    assert!(std::sync::Arc::ptr_eq(tree.source(), db.file_text(files[1]).text(&db)));
+    assert!(tree.source().ptr_eq(db.file_text(files[1]).text(&db)));
 }
 
 /// #1294: a dependency's file is an outline, whose `fn` bodies stay unparsed until reached.
@@ -274,12 +274,13 @@ fn checkout(db: &mut Db) -> (AbsPathBuf, FileSetConfig) {
     (base, partition.build())
 }
 
-fn vfs_file(bytes: &[u8]) -> blaze_vfs::File<'_> {
-    blaze_vfs::File {
-        id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes),
-        mode: blaze_vfs::Mode::Regular,
-        bytes,
-    }
+/// `bytes` in an allocation of their own, as blaze-vfs holds a heap file.
+fn vfs_bytes(bytes: &[u8]) -> blaze_vfs::Bytes {
+    blaze_vfs::Bytes::from(std::sync::Arc::<[u8]>::from(bytes))
+}
+
+fn view_file<'a>(path: &'a str, bytes: &'a blaze_vfs::Bytes) -> ViewFile<'a> {
+    ViewFile { path, id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes), bytes }
 }
 
 fn set_view(
@@ -288,8 +289,9 @@ fn set_view(
     partition: &FileSetConfig,
     files: &[(&str, &[u8])],
 ) -> Result<ViewChange, ViewError> {
+    let bytes: Vec<blaze_vfs::Bytes> = files.iter().map(|&(_, bytes)| vfs_bytes(bytes)).collect();
     let files: Vec<ViewFile<'_>> =
-        files.iter().map(|&(path, bytes)| ViewFile { path, file: vfs_file(bytes) }).collect();
+        files.iter().zip(&bytes).map(|(&(path, _), bytes)| view_file(path, bytes)).collect();
     db.set_view_root(ViewRoot { base, built: &[], partition, other: SourceRootId(1), files: &files })
 }
 
@@ -318,6 +320,20 @@ fn setting_a_view_twice_writes_nothing() {
     assert_eq!(second, ViewChange::default());
     assert_eq!(revision(&db), revision);
     assert_eq!(db.source_root(SourceRootId(0)).content(&db), root);
+}
+
+#[test]
+fn a_views_text_is_its_bytes() {
+    let mut db = Db::for_tests();
+    let (base, partition) = checkout(&mut db);
+    let bytes = vfs_bytes(b"fn f() {}");
+    let files = [view_file("src/lib.rs", &bytes)];
+    let view =
+        ViewRoot { base: &base, built: &[], partition: &partition, other: SourceRootId(1), files: &files };
+    db.set_view_root(view).unwrap();
+    let file = file_at(&db, &base, "src/lib.rs").unwrap();
+    let text = db.file_text(file).text(&db);
+    assert!(std::ptr::eq(text.as_ptr(), bytes.as_ptr()), "a copy of the view's bytes");
 }
 
 #[test]
@@ -381,16 +397,13 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
     let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
     let revision = revision(&db);
-    let bytes: &[u8] = b"fn main() {}";
+    let (lib, main) = (vfs_bytes(b"mod a;"), vfs_bytes(b"fn main() {}"));
     let files = [
-        ViewFile { path: "src/lib.rs", file: vfs_file(b"mod a;") },
+        view_file("src/lib.rs", &lib),
         ViewFile {
             path: "src/main.rs",
-            file: blaze_vfs::File {
-                id: ContentId::of(blaze_vfs::FILE_DOMAIN, b"other"),
-                mode: blaze_vfs::Mode::Regular,
-                bytes,
-            },
+            id: ContentId::of(blaze_vfs::FILE_DOMAIN, b"other"),
+            bytes: &main,
         },
     ];
     let view =
@@ -609,8 +622,9 @@ fn a_view_set_over_others_is_the_view_set_alone() {
         let id_of = |db: &Db, path: &str| file_at(db, &base, path);
         let ids_before: Vec<(String, Option<FileId>)> =
             before.iter().map(|(path, _)| (path.clone(), id_of(&db, path))).collect();
+        let bytes: Vec<blaze_vfs::Bytes> = view.iter().map(|(_, bytes)| vfs_bytes(bytes)).collect();
         let files: Vec<ViewFile<'_>> =
-            view.iter().map(|(path, bytes)| ViewFile { path, file: vfs_file(bytes) }).collect();
+            view.iter().zip(&bytes).map(|((path, _), bytes)| view_file(path, bytes)).collect();
         let root = ViewRoot { base: &base, built: &built, partition: &partition, other: SourceRootId(1), files: &files };
         let change = db.set_view_root(root).unwrap();
 

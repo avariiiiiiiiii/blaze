@@ -63,7 +63,7 @@ that said its functions whole, and all of its last build's.
 module would be a table of their own, and anim has 5 000 modules.
 
 A function is in the path its name is in, as the page groups it (`moduleOf` in
-`assets/names.js`, `module_path` in `world.rs`): its path without its last segment, generic
+`assets/names.js`, `each_module` in `world.rs`): its path without its last segment, generic
 arguments or closures, and for a method of `<T as Trait>` or `<T>`, `T`'s path, so
 `<alloc::vec::Vec<u8>>::push` is in `alloc::vec::Vec`. A type's path is a module here. Each
 segment after its crate's is a module in the one before; a function with none is in its crate.

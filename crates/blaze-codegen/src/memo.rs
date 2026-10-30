@@ -180,6 +180,9 @@ impl Memo {
             for mut slot in level.into_vec() {
                 let it = std::mem::replace(slot.get_mut(), ptr::null_mut());
                 if !it.is_null() {
+                    // SAFETY: a non-null slot holds a `Box<Entry>` that `put` leaked and
+                    // published once; `&mut self` means no reader holds it, and the slot was
+                    // nulled just above, so this is its only owner (else a double free).
                     entries.push(unsafe { Box::from_raw(it) });
                 }
             }
@@ -190,7 +193,7 @@ impl Memo {
 
     /// Drops every template not of `kept`: what the daemon's collection keeps reachable. Runs
     /// between builds, when nothing borrows the memo.
-    pub fn retain(&mut self, kept: &dyn Fn(&ContentId) -> bool) {
+    pub fn retain(&mut self, kept: impl Fn(&ContentId) -> bool) {
         for entry in self.drain() {
             if kept(&entry.shape) {
                 let Entry { shape, template } = *entry;
@@ -216,7 +219,7 @@ mod tests {
             arch: Arch::Aarch64,
             align: 4,
             code: vec![byte; 4],
-            relocs: Vec::new(),
+            relocs: crate::Relocs::new(),
             data: Vec::new(),
             inlined: Vec::new(),
             side: None,

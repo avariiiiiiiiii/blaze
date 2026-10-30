@@ -94,10 +94,17 @@ pub enum Target {
     Blaze(u8),
 }
 
-/// The lints of the group `blaze::hot`, as a [`Target::Blaze`] has them.
-const BLAZE_HOT: u8 = blaze_bit(blaze::Lint::HotClone)
-    | blaze_bit(blaze::Lint::HotAlloc)
-    | blaze_bit(blaze::Lint::HotDyn);
+/// The lints of the group `blaze::hot` ([`blaze::HOT`], every lint of blaze's own), as a
+/// [`Target::Blaze`] has them.
+const BLAZE_HOT: u8 = {
+    let mut bits = 0;
+    let mut at = 0;
+    while at < blaze::HOT.len() {
+        bits |= blaze_bit(blaze::HOT[at]);
+        at += 1;
+    }
+    bits
+};
 
 pub(crate) const fn blaze_bit(lint: blaze::Lint) -> u8 {
     1 << lint as u8
@@ -159,10 +166,6 @@ pub enum Lint<'a> {
     /// A lint of rustc's, as `unfulfilled_lint_expectations`.
     Rustc(&'a str),
 }
-
-/// Where a diagnostic of a lint of blaze's own points for more.
-pub(crate) const BLAZE_DOCS: &str =
-    "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/lanes/lints/blaze.md";
 
 impl Lint<'_> {
     /// As rustc names it in its notes.
@@ -493,7 +496,7 @@ mod tests {
         assert_eq!(none.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Allow);
         let hot = Levels::new(&CommandLine::parse(&args("--deny=blaze::hot")).unwrap());
         assert_eq!(hot.of(hot_alloc, &[]).level, Level::Deny);
-        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Allow);
+        assert_eq!(hot.of(Lint::Blaze(blaze::Lint::StdHashmap), &[]).level, Level::Deny, "`blaze::hot` is all four");
         assert_eq!(hot.of(Lint::Clippy(info("needless_bool")), &[]).level, Level::Warn);
         let span = Span { file: "src/lib.rs".to_owned(), lo: 0, hi: 1, expansion: None };
         let cold = Set {

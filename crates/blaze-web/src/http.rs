@@ -105,10 +105,12 @@ impl Site {
     }
 
     pub(crate) fn route(&self, request: &Request) -> Result<Route, Refused> {
+        // alloc: the edge, once per request
         let hosts = [format!("127.0.0.1:{}", self.port), format!("localhost:{}", self.port)];
         if !request.host.as_ref().is_some_and(|it| hosts.contains(it)) {
             return Err(Refused::Forbidden);
         }
+        // alloc: the edge, once per request
         let origins = hosts.map(|it| format!("http://{it}"));
         if request.origin.as_ref().is_some_and(|it| !origins.contains(it)) {
             return Err(Refused::Forbidden);
@@ -124,6 +126,7 @@ impl Site {
             return Err(Refused::MethodNotAllowed);
         }
         if let Some(path) = file.strip_prefix("flecs/") {
+            // alloc: the edge, once per REST request
             return Ok(Route::Flecs { path: format!("/{path}") });
         }
         let file = file.split_once('?').map_or(file, |it| it.0);
@@ -176,6 +179,7 @@ impl Site {
     /// Sends the page what the world says, until it closes or goes away.
     fn follow(&self, stream: TcpStream, accept: &str) -> io::Result<()> {
         let mut writer = stream.try_clone()?;
+        // alloc: the edge, once per page
         let head = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
              Sec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -270,12 +274,14 @@ pub(crate) fn parse(head: &[u8]) -> Result<Request, Refused> {
     if version != "HTTP/1.1" {
         return Err(Refused::Malformed("a version other than HTTP/1.1"));
     }
-    let mut request =
-        Request { method: method.to_owned(), path: path.to_owned(), ..Request::default() };
+    // alloc: the edge, once per request
+    let (method, path) = (method.to_owned(), path.to_owned());
+    let mut request = Request { method, path, ..Request::default() };
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             return Err(Refused::Malformed("a header without a colon"));
         };
+        // alloc: the edge, once per header of a request
         let value = value.trim().to_owned();
         let field = match name.to_ascii_lowercase().as_str() {
             "host" => &mut request.host,
@@ -293,6 +299,7 @@ pub(crate) fn parse(head: &[u8]) -> Result<Request, Refused> {
 }
 
 fn respond(stream: &mut TcpStream, status: &str, kind: &str, body: &[u8]) -> io::Result<()> {
+    // alloc: the edge, once per request
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\n\
          Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
@@ -401,6 +408,7 @@ pub(crate) enum Frame {
 /// The next frame of the page, which a browser masks; an unmasked one or one longer than
 /// [`LONGEST_MESSAGE`] is no browser's page's.
 pub(crate) fn read_frame(from: &mut impl Read) -> io::Result<Frame> {
+    // alloc: an error path
     let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidData, what.to_owned());
     let mut head = [0u8; 2];
     from.read_exact(&mut head)?;

@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// What happened, for [`Standby::step`].
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Input {
     Started,
     /// A poll ended: `Ok` when the primary answered, else why not.
@@ -33,7 +33,7 @@ pub enum Input {
 }
 
 /// What to do next.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum Action {
     /// Ask the primary once the clock reads `at`.
     Poll { at: u64 },
@@ -44,7 +44,7 @@ pub enum Action {
     Exit { code: i32, why: String },
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Standby {
     every_secs: u64,
     misses_allowed: u32,
@@ -66,6 +66,7 @@ impl Standby {
     /// What `input`, at `now`, calls for.
     pub fn step(&mut self, now: u64, input: Input) -> Action {
         if self.over {
+            // alloc: error path
             return Action::Exit { code: 1, why: "the standby already stopped".to_owned() };
         }
         let next = Action::Poll { at: now.saturating_add(self.every_secs) };
@@ -82,20 +83,24 @@ impl Standby {
                 if self.misses >= self.misses_allowed { Action::Latest } else { next }
             }
             Input::Latest(Ok(id)) => Action::Restore { id },
+            // alloc: error path
             Input::Latest(Err(why)) => self.stop(1, format!("finding the newest snapshot failed: {why}")),
             Input::Restored(Ok(())) => Action::Promote,
+            // alloc: error path
             Input::Restored(Err(why)) => self.stop(1, format!("restoring the snapshot failed: {why}")),
             Input::Promoted(Ok(())) => {
+                // alloc: once, at the takeover
                 let last = self.last_miss.clone().unwrap_or_default();
                 self.stop(
                     0,
-                    format!(
+                    format!( // alloc: once, at the takeover
                         "the primary missed {} polls in a row (last: {last}); the newest snapshot \
                          is restored and promoted",
                         self.misses
                     ),
                 )
             }
+            // alloc: error path
             Input::Promoted(Err(why)) => self.stop(1, format!("promoting the restored VM failed: {why}")),
         }
     }
@@ -114,6 +119,7 @@ fn now() -> u64 {
 /// poll that hangs is a miss; its thread is left to end on its own.
 fn poll(primary: SocketAddr, token: &str, within: Duration) -> Result<(), String> {
     let (done, wait) = mpsc::channel();
+    // alloc: once per poll, every few seconds, the token its thread owns
     let token = token.to_owned();
     thread::spawn(move || {
         let result = Client::http(primary, token)
@@ -124,10 +130,12 @@ fn poll(primary: SocketAddr, token: &str, within: Duration) -> Result<(), String
                 })?;
                 Ok((ok, status))
             })
-            .map_err(|error| format!("{primary}: {error}"))
+            .map_err(|error| format!("{primary}: {error}")) // alloc: error path
             .and_then(|(ok, status)| match (ok, status) {
                 (true, true) => Ok(()),
+                // alloc: error path
                 (true, false) => Err(format!("{primary} ended its status without one")),
+                // alloc: error path
                 (false, _) => Err(format!("{primary} answered its status with an error")),
             });
         // The receiver is gone when the poll took too long; nothing waits for it.
@@ -135,6 +143,7 @@ fn poll(primary: SocketAddr, token: &str, within: Duration) -> Result<(), String
     });
     match wait.recv_timeout(within) {
         Ok(result) => result,
+        // alloc: error path
         Err(_) => Err(format!("{primary} did not answer within {} s", within.as_secs())),
     }
 }

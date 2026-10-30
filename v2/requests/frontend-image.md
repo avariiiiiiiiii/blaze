@@ -225,3 +225,18 @@ Why: one atomic bit set in the tree (`blaze_ids::bits`), its word arithmetic and
 thread test (`atomic_bits_set_from_many_threads_all_land`) shared with the store's flags.
 
 Status: open
+
+> taken by requests (frontend-image is DONE): child `requests-bits` is applying it (pass 17).
+
+> applied: by `requests-bits` (pass 17), hunk by hunk as written; the tree matched every before
+> text. `crates/blaze-image/src/image.rs`: imports to `ops::Range, sync::atomic::Ordering::Relaxed`
+> and `bits::AtomicBits`; `checked`/`bad` are `AtomicBits`; `Touched`'s test fields name
+> `std::sync::atomic::AtomicU64` in full; `words` and `bit` deleted for `bit_of`; `is_checked`,
+> `ensure`, `check`, `table_entry` and `is_bad` on `contains`/`insert`. One difference: the
+> `Image { .. }` literal in `open` is over 100 columns on one line, so it is broken one field a
+> line as rustfmt does. `rg` finds no `words(`, `bit(` or bare `AtomicU64` left in blaze-image.
+> `hot_lint` (its `lint_file`, since `main` rejects a `crates` list): 0 findings, as before.
+> Not part of this request, found in the same file and already in HEAD: `impl Image` has two
+> methods named `check` (`pub fn check(&self, &Section, Range<u32>)` and the cold
+> `fn check(&self, &Section, u32)` that `ensure` calls), which is E0592. The fix is to rename the
+> private one (to `check_group`, say) and its one caller in `ensure`.

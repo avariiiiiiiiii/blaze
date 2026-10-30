@@ -9,10 +9,10 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use blaze_codegen::{
-    InstanceKey, NativeLib, NativeLibKind, Target,
+    Backend, InstanceKey, NativeLib, NativeLibKind, Target,
     driver::{Build, Built},
     plan::{Mode as BuildMode, OptLevel, Origin, Override, Policy, Profile},
-    settings::{DebugInfo, Panic, Toolchain},
+    settings::{DebugInfo, Panic, Sanitize, Toolchain},
 };
 use blaze_build_script::{
     apply::{Compile, Linked as LinkedTo},
@@ -28,6 +28,9 @@ use hir_ty_codegen::v2::{
 
 use super::{Job, UnitReader, files::Mounted, graph::flag, script};
 use crate::serve::work::Image as KeptImage;
+
+#[cfg(test)]
+mod tests;
 
 /// What a unit makes, as the linker sees it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -156,12 +159,53 @@ pub(crate) fn origin(job: &Job, unit: &Unit) -> Result<Origin, String> {
     })
 }
 
+/// What blaze makes of cargo's `codegen-backend` for `package`'s code at `level`: `llvm`,
+/// rustc's default, leaves the machine code blaze's own choice, and so does `cranelift` where
+/// the level compiles with it already. Any other is an error naming it, never a key ignored:
+/// blaze's code generator has no setting that puts a backend over the level's.
+pub(crate) fn codegen_backend(profile: &schema::Profile, package: &str, level: OptLevel) -> Result<(), String> {
+    let asked = match profile.codegen_backend.as_deref() {
+        None | Some("llvm") => return Ok(()),
+        Some(asked) => asked,
+    };
+    let name = &profile.name;
+    match asked {
+        "cranelift" if level.backend(false) == Some(Backend::Cranelift) => Ok(()),
+        "cranelift" | "stencil" => Err(format!(
+            "the profile `{name}` of `{package}` asks for codegen-backend `{asked}`, and blaze's code \
+             generator takes no backend over the one opt-level {} compiles with",
+            profile.opt_level
+        )),
+        other => Err(format!(
+            "the profile `{name}` of `{package}` asks for codegen-backend `{other}`, which blaze has \
+             none of (`cranelift`, `stencil`, `llvm`)"
+        )),
+    }
+}
+
+/// The sanitizers of a build with `rustflags`, after refusing the `-Z` flags blaze does not do
+/// ([`crate::unstable`]). A sanitized build stops until blaze's linker links one.
+pub(crate) fn sanitize(rustflags: &[String]) -> Result<Sanitize, String> {
+    if let Some(why) = crate::unstable::refusal(rustflags) {
+        return Err(why);
+    }
+    let sanitize = crate::unstable::sanitize(rustflags)?;
+    match sanitize.is_empty() {
+        true => Ok(sanitize),
+        false => Err(crate::unstable::UNLINKED.to_owned()),
+    }
+}
+
 /// How `unit`'s build compiles every function: its own profile, and for each package of its
-/// closure whose unit cargo gives another profile (`[profile.*.package.*]`), that one.
+/// closure whose unit cargo gives another profile (`[profile.*.package.*]`), that one; the
+/// sanitizers of its rustflags, the same for every function, std's too, as cargo passes
+/// `RUSTFLAGS` to every crate.
 pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Policy, String> {
     let root = job.unit(unit).map_err(|it| it.what)?;
+    let sanitize = sanitize(&job.plan(unit).map_err(|it| it.what)?.rustflags)?;
     let base = &root.profile;
     let opt = opt_level(&base.opt_level)?;
+    codegen_backend(base, &job.package(root).map_err(|it| it.what)?.name, opt)?;
     let info = debuginfo(&base.debuginfo)?;
     // BTreeMap: it is `Profile::packages`, which is serialized and hashed.
     let mut packages = BTreeMap::new();
@@ -173,6 +217,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
         let name = job.package(dep).map_err(|it| it.what)?.name.clone();
         let profile = &dep.profile;
         let level = opt_level(&profile.opt_level)?;
+        codegen_backend(profile, &name, level)?;
         let dep_info = debuginfo(&profile.debuginfo)?;
         let differs = Override {
             opt_level: (level != opt).then_some(level),
@@ -198,6 +243,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
         },
         mode: BuildMode::Output,
         fold: true,
+        sanitize,
     })
 }
 

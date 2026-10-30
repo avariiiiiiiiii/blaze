@@ -39,7 +39,7 @@ use syntax::{
 };
 
 use super::{
-    defs::{Bits, DefIdx, Id, Kind, Parent, anon_key, cast, is_anon},
+    defs::{DefIdx, DefSet, Id, Kind, Parent, anon_key, cast, is_anon},
     res::Res,
     seed::{Crate, Seeds, Unsolved, WorkItem},
 };
@@ -51,7 +51,7 @@ use crate::{
 /// What is live at one point of the pass.
 #[derive(Debug, Default)]
 pub(super) struct Live {
-    live: Bits,
+    live: DefSet,
     /// The closures and anonymous constants walked, which items in them have as their parent.
     anon: FxHashSet<InFile<SyntaxNodePtr>>,
     /// rustc's `ignored_derived_traits`: of each ADT, the traits of the derives whose impls
@@ -63,20 +63,20 @@ impl Live {
     /// A copy, for rustc's `pre_deferred_seeding`: taken once per crate.
     fn snapshot(&self) -> Live {
         Live {
-            live: self.live.snapshot(),
+            live: self.live.clone(), // clone: once per crate, rustc's pre-deferred summary
             anon: self.anon.clone(), // clone: once per crate, rustc's pre-deferred summary
             ignored: self.ignored.clone(), // clone: once per crate, rustc's pre-deferred summary
         }
     }
 
     pub(super) fn contains(&self, def: DefIdx) -> bool {
-        self.live.get(def)
+        self.live.contains(def)
     }
 
     pub(super) fn parent_live(&self, parent: Parent) -> bool {
         match parent {
             Parent::Module => true,
-            Parent::Def(it) => self.live.get(it),
+            Parent::Def(it) => self.live.contains(it),
             Parent::Anon(it) => self.anon.contains(&it),
         }
     }
@@ -95,8 +95,8 @@ pub(super) fn live(k: &Crate<'_, '_, '_>, seeds: Seeds) -> (Liveness, Vec<Found>
     let mut m = Mark {
         k,
         worklist: seeds.worklist,
-        scanned: [Bits::new(len), Bits::new(len)],
-        live: Live { live: Bits::new(len), ..Live::default() },
+        scanned: [DefSet::new(len), DefSet::new(len)],
+        live: Live { live: DefSet::new(len), ..Live::default() },
         propagated: false,
         in_pat: false,
         ignore_variants: Vec::new(), // alloc: setup, one stack for the whole walk
@@ -117,7 +117,7 @@ struct Mark<'k, 'c, 'a, 'db> {
     k: &'k Crate<'c, 'a, 'db>,
     worklist: Vec<WorkItem>,
     /// rustc's `scanned` of `(id, comes_from_allow)`: one bitset for each `comes_from_allow`.
-    scanned: [Bits; 2],
+    scanned: [DefSet; 2],
     live: Live,
     propagated: bool,
     in_pat: bool,
@@ -192,7 +192,7 @@ impl Mark<'_, '_, '_, '_> {
     fn extract_live(&self, unsolved: &mut Vec<Unsolved>, out: &mut Vec<DefIdx>) {
         let live = &self.live.live;
         unsolved.retain(|it| {
-            let is_live = it.trait_def.is_none_or(|it| live.get(it)) && it.self_adt.is_none_or(|it| live.get(it));
+            let is_live = it.trait_def.is_none_or(|it| live.contains(it)) && it.self_adt.is_none_or(|it| live.contains(it));
             if is_live {
                 out.push(it.def);
             }

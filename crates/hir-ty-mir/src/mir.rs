@@ -15,8 +15,11 @@ pub(crate) use hir_ty::{
     next_solver::{GenericArgs, Ty},
 };
 
+#[doc(hidden)]
+pub mod budget;
 pub mod const_check;
 mod eval;
+mod framed;
 pub mod location;
 mod lower;
 mod monomorphization;
@@ -61,9 +64,10 @@ pub use lower::{
     inline_const_at, lower_body_to_mir, lower_to_mir_with_store, promoted_mir_body_query,
 };
 pub use monomorphization::monomorphized;
+pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};
 pub use monomorphization::monomorphized_promoted_mir_body_query;
 pub use monomorphization::opaque_of_impl;
 pub use optimize::{passes_not_ported, set_interpreter_mir_opt_level};
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
 pub use storage::{FrameStorage, StorageConflicts};
-pub use transform::runtime_promoted_mir_body_query;
+pub use transform::{noop_landing_pads, runtime_promoted_mir_body_query};

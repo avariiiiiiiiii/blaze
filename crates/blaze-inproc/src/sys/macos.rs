@@ -32,8 +32,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::time::Duration;
 
-pub(crate) use super::unix::{Listener, Stream, backtrace, connect, random, serialize};
+pub(crate) use super::unix::{
+    Bells, Errno, Listener, Stream, backtrace, connect, hung_up, random, ring, serialize, wait_answer,
+};
 pub(crate) use rendezvous::{Remote, recv_objects, send_objects};
 use crate::channel::Channel;
 use crate::handshake::Overlay;
@@ -99,6 +102,29 @@ unsafe extern "C" {
     fn csops(pid: c_int, ops: u32, out: *mut c_void, size: usize) -> c_int;
     /// dyld's: the Mach header of the main executable, where dyld mapped it.
     fn _NSGetMachExecuteHeader() -> *const c_void;
+    /// libSystem's compare-and-wait on a word (`<sys/ulock.h>`), what std's own futex uses;
+    /// `UL_COMPARE_AND_WAIT_SHARED` keys it by the memory, so every process mapping the word
+    /// shared meets on it.
+    fn __ulock_wait(operation: u32, address: *mut c_void, value: u64, timeout_us: u32) -> c_int;
+    fn __ulock_wake(operation: u32, address: *mut c_void, value: u64) -> c_int;
+}
+
+const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
+const ULF_WAKE_ALL: u32 = 0x100;
+/// Errors come back negated, and `errno` is left as it was.
+const ULF_NO_ERRNO: u32 = 0x0100_0000;
+
+pub(crate) fn wait(word: &AtomicU64, expected: u32, timeout: Duration) -> bool {
+    let micros = u32::try_from(timeout.as_micros()).unwrap_or(u32::MAX).max(1);
+    // SAFETY: `word` is live and 8-aligned; the kernel compares its first four bytes, the low
+    // half, with `expected` and sleeps on the memory they name.
+    let got = unsafe { __ulock_wait(UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, word.as_ptr().cast(), u64::from(expected), micros) };
+    got != -libc::ETIMEDOUT
+}
+
+pub(crate) fn wake(word: &AtomicU64) {
+    // SAFETY: as in `wait`; a wake reads nothing of the word.
+    unsafe { __ulock_wake(UL_COMPARE_AND_WAIT_SHARED | ULF_WAKE_ALL | ULF_NO_ERRNO, word.as_ptr().cast(), 0) };
 }
 
 fn task() -> Port {

@@ -98,6 +98,7 @@ fn module_of(address: *const c_void) -> Result<*mut c_void, String> {
     let found =
         unsafe { GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, address as _, &mut module) };
     if found == 0 || module.is_null() {
+        // alloc: error path
         return Err(format!("no module has {address:?}: {}", std::io::Error::last_os_error()));
     }
     Ok(module)
@@ -107,10 +108,12 @@ fn module_of(address: *const c_void) -> Result<*mut c_void, String> {
 pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
     let own = descriptor as fn() -> Result<(u64, &'static [u8]), String> as *const c_void;
     let module = module_of(own)?;
+    // alloc: setup, the descriptor's name, looked up once at start
     let name: Vec<u8> = DESCRIPTOR.bytes().chain([0]).collect();
     // SAFETY: the module is loaded and the name ends in a zero.
     let found = unsafe { GetProcAddress(module, name.as_ptr()) };
     if found.is_null() {
+        // alloc: error path
         return Err(format!(
             "the module of blaze-live's code exports no {DESCRIPTOR}: blaze-link links it for \
              live patches"
@@ -127,10 +130,12 @@ pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
 fn readable(range: &Range<u64>, base: u64) -> Result<&'static [u8], String> {
     regions(range, |piece, region| {
         if region.allocation != base {
+            // alloc: error path
             return Err(format!("{:#x}, outside the image at {base:#x}", piece.start));
         }
         let protect = region.protect & 0xff;
         if protect == PAGE_NOACCESS || region.protect & PAGE_GUARD != 0 {
+            // alloc: error path
             return Err(format!("{:#x}, in pages with no access", piece.start));
         }
         Ok(())
@@ -156,6 +161,7 @@ pub(super) fn backtrace(pcs: &mut Vec<u64>) {
 /// Watches `dir` on a thread of its own: each change of its file names (a message renamed
 /// into place) is told to `events`.
 pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
+    // alloc: setup, the directory's name, watched from start
     let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
     let first = |path: &[u16]| {
         let filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE;
@@ -164,6 +170,7 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
         (handle != INVALID_HANDLE_VALUE).then_some(handle as usize)
     };
     let Some(handle) = first(&path) else {
+        // alloc: error path
         return Err(format!("watching {}: {}", dir.display(), std::io::Error::last_os_error()));
     };
     // A handle is an address the thread is given to use alone.
@@ -197,9 +204,11 @@ pub(super) fn watch(dir: &Path, events: Arc<Events>) -> Result<(), String> {
         }
     };
     std::thread::Builder::new()
+        // alloc: setup, the thread's name, once
         .name("blaze-live-slots".to_owned())
         .spawn(watching)
         .map(drop)
+        // alloc: error path
         .map_err(|it| format!("starting the thread that watches for patches: {it}"))
 }
 
@@ -225,6 +234,7 @@ impl Os {
         for span in writes.spans {
             regions_from(&mut known, &span.range(), |piece, region| {
                 if region.allocation != base {
+                    // alloc: error path
                     return Err(format!(
                         "a write at {:#x}..{:#x}, outside the image at {base:#x}",
                         piece.start, piece.end
@@ -232,6 +242,7 @@ impl Os {
                 }
                 let protect = region.protect & 0xff;
                 if protect == PAGE_NOACCESS || region.protect & PAGE_GUARD != 0 {
+                    // alloc: error path
                     return Err(format!("a write at {:#x}, in pages with no access", piece.start));
                 }
                 if protect & WRITABLE != 0 {
@@ -325,6 +336,7 @@ impl Memory for Os {
     }
 
     fn frames(&mut self, starts: &[u64]) -> Result<(), String> {
+        // alloc: error path
         if starts.is_empty() { Ok(()) } else { Err("DWARF unwind entries on Windows".to_owned()) }
     }
 
@@ -334,6 +346,7 @@ impl Memory for Os {
         }
         let relative = |address: u64| {
             address.checked_sub(self.base).and_then(|it| u32::try_from(it).ok()).ok_or_else(|| {
+                // alloc: error path
                 format!("{address:#x}, out of reach of the image at {:#x}", self.base)
             })
         };
@@ -354,6 +367,7 @@ impl Memory for Os {
         let table: &'static [RuntimeFunction] = Box::leak(table.into_boxed_slice());
         // SAFETY: `count` entries, sorted, relative to `base`, alive forever.
         if unsafe { RtlAddFunctionTable(table.as_ptr(), count, self.base) } == 0 {
+            // alloc: error path
             return Err("the unwinder refused the patch's RUNTIME_FUNCTIONs".to_owned());
         }
         Ok(())
@@ -368,6 +382,7 @@ impl Memory for Os {
             Ok(())
         })?;
         if count != 1 {
+            // alloc: error path
             return Err(format!("the table cell at {cell:#x} spans two regions"));
         }
         let store = || {
@@ -430,10 +445,12 @@ fn regions_from(
         let len = size_of::<MemoryBasicInformation>();
         // SAFETY: `info` is a whole MEMORY_BASIC_INFORMATION.
         if unsafe { VirtualQuery(at as *const c_void, &mut info, len) } != len {
+            // alloc: error path
             return Err(format!("querying {at:#x}: {}", std::io::Error::last_os_error()));
         }
         let end = (info.base as u64).saturating_add(info.size as u64);
         if info.state != MEM_COMMIT || end <= at {
+            // alloc: error path
             return Err(format!("nothing is committed at {at:#x}"));
         }
         let region = Region { allocation: info.allocation_base as u64, protect: info.protect };
@@ -485,6 +502,7 @@ unsafe fn writable(range: &Range<u64>, protect: u32, f: impl FnOnce()) -> Result
     let mut old = 0;
     // SAFETY: the caller's.
     if unsafe { VirtualProtect(address, len, wanted, &mut old) } == 0 {
+        // alloc: error path
         return Err(format!(
             "making {:#x} writable: {}",
             range.start,
@@ -495,6 +513,7 @@ unsafe fn writable(range: &Range<u64>, protect: u32, f: impl FnOnce()) -> Result
     let mut was = 0;
     // SAFETY: as above; the regions had one protection, which they get back.
     if unsafe { VirtualProtect(address, len, old, &mut was) } == 0 {
+        // alloc: error path
         return Err(format!(
             "protecting {:#x} again: {}",
             range.start,

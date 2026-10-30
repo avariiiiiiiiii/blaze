@@ -12,9 +12,10 @@
 //! Apache-2.0). The stack is rebuilt from the syntax: from the body the `break` is in down to
 //! it, as rustc's visitor pushes it on the HIR that `rustc_ast_lowering` makes of it.
 
-use hir::InFile;
+use base_db::Db;
+use hir::{HirFileId, InFile};
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
+    AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, WalkEvent,
     ast::{self, HasLoopBody},
 };
 
@@ -26,7 +27,7 @@ use crate::{
 };
 
 /// A context of rustc's loop checker.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Context {
     Normal,
     Fn,
@@ -143,17 +144,7 @@ fn block_breaks(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, block: InFile<TextSi
         .ancestors()
         .filter_map(ast::BlockExpr::cast)
         .find(|it| block_start(it) == block.value)?;
-    let breaks: Vec<ast::BreakExpr> = block_node
-        .syntax()
-        .descendants()
-        .filter_map(ast::BreakExpr::cast)
-        .filter(|it| {
-            let other = node.with_value(it.syntax().clone());
-            let stack = contexts(cx, &other);
-            let in_labeled = it.lifetime().is_none() && stack.last() == Some(&Context::LabeledBlock);
-            !in_labeled && required(&stack, true) == Some(Context::UnlabeledBlock(block))
-        })
-        .collect();
+    let breaks = breaks_of_block(cx, node, &block_node, block)?;
     let first = breaks.first()?;
     if first.syntax() != &node.value {
         return None;

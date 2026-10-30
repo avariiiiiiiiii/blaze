@@ -48,6 +48,17 @@ impl EditionedFileId {
             [..] => Some(errors.into()),
         }
     }
+
+    /// The file's syntax errors with every lazy body's: a firewall, so a check of a
+    /// dependency parses its bodies for their errors once.
+    #[salsa::tracked(returns(as_deref))]
+    pub fn parse_errors_with_bodies(self, db: &Db) -> Option<Box<[SyntaxError]>> {
+        let errors = self.parse(db).errors_with_bodies();
+        match &*errors {
+            [] => None,
+            [..] => Some(errors.into()),
+        }
+    }
 }
 
 impl EditionedFileId {

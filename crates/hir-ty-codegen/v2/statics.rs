@@ -2,7 +2,7 @@
 //! its own read-only data by content.
 
 use base_db::Db;
-use blaze_codegen::{Arch, Init, Reloc, RelocKind, Static, backend::FrontRef, template::Refs};
+use blaze_codegen::{Arch, Init, RelocKind, Relocation, Static, backend::FrontRef, template::Refs};
 use blaze_ids::ContentId;
 use blaze_items::{ItemId, ItemKey};
 use hir_def::{HasModule, StaticId, attrs::AttrFlags};
@@ -103,10 +103,10 @@ pub(crate) fn compile(
         ));
     }
     let (data, mut relocs) = resolve(&value.places, refs, |resolve| {
-        super::convert::value(arch, &value.blob, &value.requests, resolve)
+        super::convert::value(resolve.frame(), arch, &value.blob, &value.requests, resolve)
     })?;
     if weak_symbol(db, id)?.is_some() {
-        relocs.push(Reloc { at: 0, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 });
+        relocs.push(Relocation { at: 0, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 });
     }
     let align = u32::try_from(value.blob.align).map_err(|e| e.to_string())?;
     let init = if relocs.is_empty() && value.blob.bytes.iter().all(|&it| it == 0) {

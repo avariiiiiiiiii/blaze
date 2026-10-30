@@ -8,6 +8,7 @@
 use std::sync::Arc as StdArc;
 
 use base_db::{Db, Crate};
+use blaze_format::cursor::{Put, Reader};
 use hir_def::{
     ModuleDefId,
     nameres::frozen::{Dec, Enc, Frozen, Mode, record_difference},
@@ -55,10 +56,9 @@ pub fn served(db: &Db, krate: Crate) -> bool {
 
 /// Part `which` of frozen bytes: the first is after its length.
 fn part(bytes: &[u8], which: usize) -> R<&[u8]> {
-    let len: [u8; 4] = bytes.get(..4).and_then(|it| it.try_into().ok()).ok_or("no length")?;
-    let first = 4 + u32::from_le_bytes(len) as usize;
-    let part = if which == 0 { bytes.get(4..first) } else { bytes.get(first..) };
-    part.ok_or_else(|| "a part past the end".to_owned())
+    let mut at = Reader::new(bytes);
+    let first = at.bytes_u32()?;
+    Ok(if which == 0 { first } else { at.take_rest() })
 }
 
 fn read<'db, T>(
@@ -167,9 +167,10 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
     let inherent = enc.finish()?;
 
     let len = u32::try_from(traits.len()).map_err(|_| "impls over 4 GiB")?;
-    let mut out = len.to_le_bytes().to_vec();
-    out.extend_from_slice(&traits);
-    out.extend_from_slice(&inherent);
+    let mut out = Vec::with_capacity(4 + traits.len() + inherent.len());
+    out.put_u32(len);
+    out.put_bytes(&traits);
+    out.put_bytes(&inherent);
     Ok(out)
 }
 

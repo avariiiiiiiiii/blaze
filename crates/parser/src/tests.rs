@@ -78,25 +78,44 @@ fn sources() -> Vec<String> {
     out
 }
 
-/// A warm lex allocates its two output columns once each (the tokens and the checkpoints) and
-/// nothing per token, when the text has no frontmatter, no lexer error and no more tokens than
-/// the columns are sized for (one per 3 bytes); nine in ten real files fit. The byte classes
-/// are in the worker's scratch, warm after the first lex of a text that size on the thread.
+/// A warm lex allocates nothing: its two columns (the tokens and the checkpoints) are the
+/// worker's `u32` scratch, back on the shelf since the lex before at the size it grew to, and
+/// the byte classes its `u64` scratch. A text with a lexer error is left out, whose message may
+/// be formatted; nine in ten real files have none.
 #[test]
-fn a_warm_lex_allocates_its_two_columns_once() {
+fn a_warm_lex_allocates_nothing() {
     let texts = sources();
-    let mut fit = 0;
+    let mut clean = 0;
     for text in &texts {
         let lexed = LexedStr::new(Edition::CURRENT, text);
-        if lexed.errors().next().is_some() || lexed.len() + 1 > text.len() / 3 {
+        if lexed.errors().next().is_some() {
             continue;
         }
-        fit += 1;
-        blaze_alloc_count::assert_at_most(2, "a warm lex of a source file", || {
+        drop(lexed);
+        clean += 1;
+        blaze_alloc_count::assert_at_most(0, "a warm lex of a source file", || {
             LexedStr::new(Edition::CURRENT, text)
         });
     }
-    assert!(fit * 10 >= texts.len() * 9, "{fit} of {} files fit the columns", texts.len());
+    assert!(clean * 10 >= texts.len() * 9, "{clean} of {} files lex cleanly", texts.len());
+}
+
+/// A lex dropped on another thread warms that thread: its columns go to the shelf of the
+/// thread that drops it, the token column on top.
+#[test]
+fn a_lex_dropped_on_another_thread_gives_it_the_columns() {
+    let text = "fn f(a: u32) -> u32 { a + 1 }\n".repeat(1000);
+    let lexed = LexedStr::new(Edition::CURRENT, &text);
+    let tokens = lexed.len() + 1;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            drop(lexed);
+            let first = blaze_mem::scratch::lend_u32s();
+            let second = blaze_mem::scratch::lend_u32s();
+            assert!(first.capacity() >= tokens, "the token column, on top");
+            assert!(second.capacity() >= tokens.div_ceil(16), "the checkpoint column under it");
+        });
+    });
 }
 
 /// A text denser than the columns are sized for grows them by doubling, not per token: a

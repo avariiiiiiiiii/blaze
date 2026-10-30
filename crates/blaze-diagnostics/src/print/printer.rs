@@ -73,7 +73,7 @@ pub(crate) struct Printer<'p, 'a, 'db, 't> {
     pub(crate) cx: &'p Cx<'a, 'db>,
     pub(crate) db: &'t Db,
     pub(crate) interner: DbInterner<'t>,
-    pub(crate) paths: &'p Paths,
+    pub(crate) paths: &'p Paths<'a>,
     pub(crate) mode: Mode,
     pub(crate) in_value: bool,
     out: String,
@@ -376,8 +376,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         if self.mode.untrimmed {
             return false;
         }
-        let Some(name) = self.paths.trimmed(def) else { return false };
-        let name = name.clone();
+        let Some(name) = self.paths.trimmed(self.cx, def) else { return false };
         self.write_name(&name);
         true
     }
@@ -387,9 +386,9 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     /// unique name.
     fn force_print_trimmed(&mut self, def: Def) -> bool {
         if let Def::Variant(_) = def
-            && let Some(name) = self.paths.trimmed(def)
+            && let Some(name) = self.paths.trimmed(self.cx, def)
         {
-            let name = self.local_name(name.clone(), def);
+            let name = self.local_name(name, def);
             self.write_name(&name);
             return true;
         }
@@ -430,7 +429,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
 
     /// The name `def` is re-exported by where its visible parent is not its parent.
     fn local_name(&self, name: Name, def: Def) -> Name {
-        if let Some(visible) = self.paths.visible_parent(def)
+        if let Some(visible) = self.paths.visible_parent(self.cx, def)
             && def.is_type_ns()
             && paths::parent(self.cx, def) != Some(Parent::Def(visible))
         {
@@ -447,7 +446,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         {
             let krate = module.krate(self.db);
             if hir::Crate::from(krate) != self.cx.krate
-                && let Some(extern_crate) = self.paths.extern_crate(krate)
+                && let Some(extern_crate) = self.paths.extern_crate(self.cx, krate)
             {
                 let was = std::mem::replace(&mut self.no_visible, true);
                 self.print_def_path(Def::ExternCrate(extern_crate), &[]);
@@ -460,7 +459,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         if def.is_local(self.cx) {
             return false;
         }
-        let Some(visible) = self.paths.visible_parent(def) else { return false };
+        let Some(visible) = self.paths.visible_parent(self.cx, def) else { return false };
         let Some(mut name) = def.name(self.cx) else { return false };
         if def.is_type_ns() && paths::parent(self.cx, def) != Some(Parent::Def(visible)) {
             match self.paths.reexport_name(self.cx, visible, def) {

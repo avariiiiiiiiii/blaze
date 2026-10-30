@@ -7,7 +7,8 @@ use base_db::Db;
 use hir_def::FunctionId;
 
 use super::{
-    Address, Evaluator, Heap, Interval, IntervalOrOwned, MirEvalError, Result, word_bytes,
+    Address, Evaluator, Heap, Interval, IntervalOrOwned, MirEvalError, OwnedBytes, Result,
+    word_bytes,
 };
 use crate::db::HirDatabase;
 
@@ -51,7 +52,7 @@ pub fn call_const_macro<'db>(
             MacroArg::Str(text) => write_str(&mut evaluator, text)?,
             MacroArg::Item(input) => write_item(&mut evaluator, input)?,
         };
-        values.push(IntervalOrOwned::Owned(value));
+        values.push(IntervalOrOwned::Owned(OwnedBytes::from_vec(value)));
     }
     let result = evaluator.interpret_mir(body, values.into_iter(), None)?;
     read_string(&evaluator, result)

@@ -113,6 +113,9 @@ pub(crate) struct Tree {
     /// Its nodes rustc's walk comes to, in pre-order: not those `cfg` removes, nor an item an
     /// attribute macro replaces (what that expands to is a tree of its own).
     pub(crate) nodes: Vec<SyntaxNode>,
+    /// The kind of each of `nodes`, by index: a pass that looks at a few kinds scans these 2
+    /// bytes a node, not the nodes ([`Tree::of_kind`]).
+    pub(crate) kinds: Vec<SyntaxKind>,
     /// The outermost nodes `cfg` removes: their `cfg`s are evaluated, nothing in them is.
     pub(crate) off: Vec<SyntaxNode>,
     /// The items an attribute macro replaces with its expansion.
@@ -135,6 +138,12 @@ impl Tree {
     pub(crate) fn skipped(&self, range: TextRange) -> bool {
         let after = self.skips.partition_point(|it| it.start() <= range.start());
         after > 0 && self.skips[after - 1].contains_range(range)
+    }
+
+    /// The nodes whose kind `wanted` holds, in pre-order: a scan of the kind column, each node
+    /// read only when it is wanted.
+    pub(crate) fn of_kind(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = &SyntaxNode> {
+        self.kinds.iter().zip(&self.nodes).filter(move |(kind, _)| wanted(**kind)).map(|(_, node)| node)
     }
 
     /// `node` of the tree, as the [`InFile`] the rest of the crate takes.
@@ -192,6 +201,7 @@ impl<'db> Walk<'db> {
         };
         // About one node per 16 bytes of Rust source.
         let mut nodes = Vec::with_capacity(usize::from(root.text_range().len()) / 16);
+        let mut kinds = Vec::with_capacity(nodes.capacity());
         let mut off = Vec::new();
         let mut replaced = Vec::new();
         let mut expansions: Vec<((u32, u32), InFile<SyntaxNode>)> = Vec::new();
@@ -243,10 +253,21 @@ impl<'db> Walk<'db> {
                 }
             }
             nodes.push(node);
+            kinds.push(kind);
         }
         let mut skips: Vec<TextRange> = off.iter().chain(&replaced).map(|it| it.text_range()).collect();
         radix::sort_copy_by_key(&mut skips, |it| radix::pack_32(it.start().into(), it.end().into()));
-        self.trees.push(Tree { file, root, call: file.macro_file(), nodes, off, replaced, skips, place: place.clone() });
+        self.trees.push(Tree {
+            file,
+            root,
+            call: file.macro_file(),
+            nodes,
+            kinds,
+            off,
+            replaced,
+            skips,
+            place: place.clone(),
+        });
         for (at, expanded) in expansions {
             let mut place = place.clone();
             place.push(at);
@@ -399,11 +420,11 @@ fn signature_item(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(ItemId,
 /// What rustc's early lint pass, its expansion and its attribute checks lint on the source as
 /// written, in the order it emits them.
 pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
-    let walk = Walk::of(cx);
-    let mut emitted = check_cfg::lints(cx, cmd, &walk);
-    emitted.extend(early::lints(cx, &walk));
-    emitted.extend(delims::lints(cx, &walk));
-    emitted.extend(attrs::lints(cx, &walk));
+    let walk = cx.walk();
+    let mut emitted = check_cfg::lints(cx, cmd, walk);
+    emitted.extend(early::lints(cx, walk));
+    emitted.extend(delims::lints(cx, walk));
+    emitted.extend(attrs::lints(cx, walk));
     // Per emitted diagnostic, not per node: each key is made once, and what it costs scales with
     // the output.
     let mut keyed: Vec<_> = emitted
@@ -496,8 +517,8 @@ mod tests {
             let sema = Semantics::new(db);
             let krate = hir::check::workspace_crates(db)[0];
             let frame = crate::tests::frame();
-            let cx = Cx::new(&sema, krate, &checked.names, &frame);
-            check(&cx, &Walk::of(&cx));
+            let cx = Cx::new(&sema, krate, checked.files(), &frame);
+            check(&cx, cx.walk());
         });
     }
 
@@ -590,6 +611,35 @@ fn after() {}
         assert!(entered(outer) < entered(inner));
         let left = (u32::from(outer.end()), 0);
         assert!(entered(inner) < left && left < entered(next));
+    }
+
+    /// Under `-A unused`, no lint of `delims` may fire: the pass reads no node and allocates
+    /// nothing, at any size of crate.
+    #[test]
+    fn delims_allowed_everywhere_cost_nothing() {
+        for fns in [4, 400] {
+            crate::lints::with_cx(&crate::lints::quiet_crate(fns), &["-A", "unused"], |cx| {
+                let walk = cx.walk();
+                cx.lint_may_fire(crate::lints::registry::LintId::WARNINGS);
+                let found = blaze_alloc_count::assert_at_most(0, "delims, all of its lints allowed", || {
+                    delims::lints(cx, walk)
+                });
+                assert!(found.is_empty());
+            });
+        }
+    }
+
+    /// Each node's kind is in the kind column, in the order of the nodes.
+    #[test]
+    fn the_kind_column_is_the_nodes_kinds() {
+        walked(&crate::lints::quiet_crate(3), |_, walk| {
+            for tree in &walk.trees {
+                assert_eq!(tree.kinds.len(), tree.nodes.len());
+                assert!(tree.nodes.iter().zip(&tree.kinds).all(|(node, &kind)| node.kind() == kind));
+                let fns: Vec<_> = tree.of_kind(|it| it == SyntaxKind::FN).collect();
+                assert_eq!(fns.len(), 3);
+            }
+        });
     }
 
     #[test]

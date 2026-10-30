@@ -8,6 +8,7 @@
 use std::fmt;
 
 use blaze_codegen::{Arch, RelocKind};
+use blaze_mem::align::align_up_u64;
 
 use crate::{
     Format,
@@ -220,15 +221,10 @@ pub(crate) fn tp_offset(arch: Arch, tls: Tls, s: u64) -> Result<i64, Bad> {
     let at = s.checked_sub(tls.addr).ok_or(Bad::OutsideTls)?;
     let align = tls.align.max(1);
     Ok(match arch {
-        Arch::X86_64 => at as i64 - align_up(tls.size, align) as i64,
-        Arch::Aarch64 => (align_up(16, align) + at) as i64,
+        Arch::X86_64 => at as i64 - align_up_u64(tls.size, align) as i64,
+        Arch::Aarch64 => (align_up_u64(16, align) + at) as i64,
         Arch::Wasm32 => return Err(Bad::WasmTls),
     })
-}
-
-pub(crate) fn align_up(value: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two());
-    (value + align - 1) & !(align - 1)
 }
 
 /// Writes `apply`'s value at the start of `field`.

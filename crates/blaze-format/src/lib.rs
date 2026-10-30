@@ -19,6 +19,7 @@
 //! Spans are never in a record that is hashed: they sit in a side table ([`Spans`]), and a
 //! record names one by [`SpanRef`].
 
+pub mod cursor;
 pub mod leb;
 mod raw;
 mod schema;
@@ -859,7 +860,7 @@ impl Spans {
     }
 
     /// The warm and cold forms of span table buffers, starts and lengths each a column: what
-    /// the store's `blaze_cas::Columns` for [`Spans`]' schema is.
+    /// `blaze_cas::Store::encode_columns` is given for [`Spans`]' schema.
     pub fn columns() -> tiers::BufferColumns {
         tiers::BufferColumns::of::<SpansRoot>(<Spans as Persist>::SCHEMA)
     }

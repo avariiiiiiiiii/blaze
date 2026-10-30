@@ -150,7 +150,6 @@ fn doc_item(doc: &mut Doc, cx: &mut Accept<'_, '_, '_>, meta: &MetaItem) {
         Some("rust_logo") => {
             if matches!(args, ArgParser::NoArgs)
                 && cx.target() == Target::Crate
-                && cx.emits()
                 && let Some(diag) = doc_rust_logo(cx.cx, &cx.session.features, cx.attr.in_file(path))
             {
                 cx.emit_err(diag);

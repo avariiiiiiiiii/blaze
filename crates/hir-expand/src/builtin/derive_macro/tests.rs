@@ -312,3 +312,31 @@ fn builtin_derives_found_as_by_compare() {
         assert_eq!(BuiltinDeriveExpander::find_by_name(&name), Some(BuiltinDeriveExpander::ALL[at]));
     }
 }
+
+/// A struct of `fields` fields with a field of each kind of type the derives read.
+fn wide_struct(fields: usize) -> String {
+    let fields: Vec<String> = (0..fields).map(|i| format!("f{i}: u{}", 8 << (i % 4))).collect();
+    format!("struct Wide {{ {} }}", fields.join(", "))
+}
+
+/// `#[derive(Clone)]` of a struct, from its syntax to its expansion (the reparse of the input
+/// tree before it is the bridge's): no allocation per field. What grows with the field count is
+/// the output builder's columns doubling, about 4 columns × log2 of the growth, so going from 16
+/// fields to 256 adds at most 48 allocations where one per field would add 240. Measured warm:
+/// the field bindings' symbols are interned by the first run.
+#[test]
+fn a_derive_allocates_nothing_per_field() {
+    let used = |fields: usize| {
+        let text = wide_struct(fields);
+        let (adt, map) = item(&text);
+        let span = call_site();
+        let run = || super::clone_derive(span, super::parse_adt_from_syntax(&adt, &map, span), false);
+        let warm = run();
+        let (again, used) = blaze_alloc_count::measure(run);
+        assert!(again.value == warm.value && again.err.is_none(), "{fields} fields");
+        used.allocations
+    };
+    let (small, big) = (used(16), used(256));
+    assert!(small <= 64, "`Clone` of 16 fields: {small} allocations, budget 64");
+    assert!(big <= small + 48, "`Clone` of 256 fields: {big} allocations, {small} for 16");
+}

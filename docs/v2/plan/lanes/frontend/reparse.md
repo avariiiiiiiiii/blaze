@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: frontend.md item 14 — a file is reparsed from its previous parse and its item tree is assembled from per-item lowerings, so an edit reparses and re-lowers only the items it touches, and the assembled tree is byte-equal to the whole-file lowering.
+summary: frontend.md item 14 — a file is reparsed from its previous parse and its item tree is made from its last one, kept beside salsa, re-lowering only the items an edit touches, the tree byte-equal to the whole-file lowering.
 date: 2026-10-29
 ---
 # Reparse and re-lower only what an edit touches (frontend-deps-reparse)
@@ -47,35 +47,54 @@ from its previous parse`) gives the exact edit to `EditionedFileId::parse`, one 
 
 ## The item tree per item
 
-`file_item_tree_query` assembles a source file's tree from parts (`item_tree/items.rs`):
+`file_item_tree_query` is one query per file, with no query per item: per-item salsa queries
+cost more than lowering the item (a tracked struct matched and a memo verified, about 250
+cycles an item an edit, against about 170 for lowering it), so they could at best tie a
+whole-file lowering. A source file's tree is made from its last one instead
+(`item_tree/items.rs`), as `syntax::parsing::kept` makes a parse from the last parse:
 
-- `item_sources(file, krate)` walks the file's top-level items once and makes one tracked
-  `ItemSource` per item. Its identity, `ItemSyntax`, is a key: the file's span id, the item's
-  ast id, and a BLAKE3 fingerprint of what lowering reads of the item: its syntax (the flat
-  tree's position-free subtree hash, with the bodies of `fn`s, `const`s and `static`s and the
-  items of `impl`s and `trait`s left out but for the inner attributes at their start), the ast
-  ids of the items it is made of (`[start, kind, id]` from its start) and the span anchors
-  lowering looks up in it (`[start, id]`, the anchors of an `impl`'s or `trait`'s items left
-  out, as no span past their start is looked up). The ids and anchors of all items are two
-  arrays the items share, with the tree, in one `Arc`: no allocation per item. The arrays and
-  the hash buffer are filled in a per-worker scratch that keeps its capacity, so a run
-  allocates the two arrays, the `Arc` and its list of items.
-- `item_fragment(item)` lowers one item (`Ctx::for_item`, `Ctx::lower_item`) from the item's
-  node in its tree, its ids by binary search and a `RealSpanMap` made of its anchors. It reads
-  nothing tracked but the crate's `cfg`s, so it runs again only when the item's key changes.
-- `top_attrs(file, krate)` lowers the file's inner attributes and, for a crate root, the crate
-  attributes from the command line: its own part, owner `TOP_OWNER`, first in `attrs` and
-  `cfgs` and last in `attr_owners`, as the whole-file lowering has it.
-- `assemble(top, fragments)` concatenates the columns in one pass, each allocated once at its
-  summed length, moving ids by where the part's columns start: items and attribute owners by
-  the item base, payloads by their kind's column, `children`, `use_trees`, `use_tree_lists`,
-  `ctor_vis`, names, paths, visibilities, attributes and `cfg`s by theirs, sentinels
-  (`NameId::NONE`, `AliasId::NONE`/`UNDERSCORE`, `PathId::NONE`, the builtin visibilities,
-  `IdRange::NONE` of `mod m;`, an empty constructor list, a non-prefixed `use` tree's list,
-  `AttrOwner::ENABLED`) left as they are.
+- `KEPT` is 128 direct-mapped slots, each one database's file in one crate (the database's
+  `Nonce`, the file, the crate): its last tree (`Arc<ItemTree>`, the same `Arc` salsa's memo
+  holds, so keeping it copies nothing), the crate's `cfg` set it was lowered under, and per
+  top-level item a key and its `Marks`. A slot is taken out under its lock while its tree is
+  worked from; one another file took, or another thread holds, is a whole lowering, never a
+  wrong one.
+- A key (`item_keys`) is a BLAKE3 fingerprint of what lowering reads of the item: its syntax
+  (the flat tree's position-free subtree hash, with the bodies of `fn`s, `const`s and `static`s
+  and the items of `impl`s and `trait`s left out but for the inner attributes at their start,
+  and a subtree of 4 KiB of text or more fed as its kept `subtree_hash`, so a big
+  `macro_rules!` is read once, not on every edit), the ast ids of the items it is made of
+  (`[start, kind, id]` from its start) and the span anchors lowering looks up in it
+  (`[start, id]`, the anchors of an `impl`'s or `trait`'s items left out). All from the item's
+  start, so an item keeps its key wherever an edit moves it.
+- `Marks` are where an item's rows begin in each of the tree's 28 columns (`kinds` standing
+  for `data` and `ast_ids` too), then where the last item's end. The whole-file lowering
+  records them at each top-level item (`Ctx::lower_module_items_marked`), and assembly at each
+  item it places.
+- A file's first lowering is `lower_whole` and makes no keys: a file never edited (every
+  dependency) never pays for them. Its next lowering (its first edit, or a new `cfg` set) is
+  `lower_whole` again, keying the items.
+- After that, an edit keys the new parse's items and compares them with the kept keys from
+  each end. The items of the common prefix and suffix keep their rows; those between are
+  lowered alone in the file's own context (`Ctx::lower_item`, the file's ast id map and span
+  map, which give the ids and spans the whole lowering gives). The top level's attributes
+  (`top_attrs`: the file's inner attributes and, for a crate root, the command line's) are
+  lowered again every time. If every key and the top level are the same, the kept `Arc` itself
+  is the result, which salsa compares by address and backdates.
+- `assemble(top, runs, marks)` builds the tree from the top level and runs of rows (a run of
+  kept items, or one item lowered alone) in one pass, each column allocated once at its summed
+  length, moving each id by where its run's rows go less where they were: items and attribute
+  owners by the item base, payloads by their kind's column, `children`, `use_trees`,
+  `use_tree_lists`, `ctor_vis`, names, paths, visibilities, attributes and `cfg`s by theirs,
+  sentinels (`NameId::NONE`, `AliasId::NONE`/`UNDERSCORE`, `PathId::NONE`, the builtin
+  visibilities, `IdRange::NONE` of `mod m;`, an empty constructor list, a non-prefixed `use`
+  tree's list, `AttrOwner::ENABLED`) left as they are.
 
-For the assembled tree to be the whole-file tree to the byte, names, paths and visibilities are
-deduplicated within each top-level item only, in every lowering (`Scoped` in `lower.rs`; the
+The query reads the crate's `cfg` set on every path, so salsa reruns it when the set changes even
+if nothing lowered reads it, and the kept tree is not reused under another set.
+
+For a tree made of kept rows to be the whole-file tree to the byte, names, paths and visibilities
+are deduplicated within each top-level item only, in every lowering (`Scoped` in `lower.rs`; the
 whole-file lowering seals the scope after each top-level item), so no name is rehashed on
 assembly. A tree's tables can hold a name once per item that uses it; the persist schema is
 bumped to 4 as the tables' contents changed.
@@ -86,10 +105,10 @@ expansion is made anew and a block's tree is small.
 Known costs, all bounded (the bounds and the arithmetic are in
 [speed-of-light.md](speed-of-light.md), section frontend-deps-reparse):
 
-- An item kept from an older parse keeps that parse's tree (text and words once per file) until
-  every item cut from it is edited or gone.
-- `item_sources` runs on every edit of the file: one walk and one BLAKE3 pass over the items'
-  lowered syntax. `top_attrs` runs too and comes out equal.
+- Every edit keys every item of the file again: one walk and one BLAKE3 pass over each item's
+  lowered syntax, ids and anchors.
+- A slot holds up to 116 bytes of marks and 16 of key per item of its file, and only for a file
+  edited at least once.
 - An edit inside a `fn` of an inline module re-lowers the module: it moves the module's later
   items, whose starts are in its key.
 - Attributes are cloned on assembly, which allocates for those holding paths or inputs.
@@ -113,21 +132,34 @@ crates/syntax:
 
 crates/hir-def/src/item_tree:
 
-- every fixture of `tests.rs` (`check`, `owned_tree`): the assembled tree equals the whole-file
-  lowering, bytes included, and is the tree `file_item_tree` gives.
+- every fixture of `tests.rs` (`check`, `owned_tree`): the tree `items::file_item_tree` makes,
+  three times so the first lowering, the keyed one and the one from the kept tree are each
+  made, equals the whole-file lowering, bytes included, and is the tree `file_item_tree` gives.
 - `real_files_assemble_to_their_whole_trees`: the same for every source of the item tree, name
-  resolution and the syntax tree, one database reusing items across them.
+  resolution and the syntax tree, one database across them.
 - `random_edits_assemble_to_a_fresh_whole_tree`: after each of six random edits per file
   (inserts of items, attributes, `cfg`s, visibilities, macros, braces, or text copied from the
-  file), the tree the edited database assembles from kept and re-lowered items equals, to the
+  file), the tree the edited database makes from kept rows and re-lowered items equals, to the
   byte, the tree a fresh database lowers the text to whole.
 - `an_edit_inside_bodies_lowers_no_item`: edits inside `fn`, `impl` method, `trait` method and
-  `const` bodies run `item_fragment` zero times (salsa's executed log), the tree still whole.
+  `const` bodies of a keyed file lower no item (a count of the items lowered, whole or alone),
+  the tree still whole; `an_edit_inside_a_body_gives_the_kept_tree`: the result is the kept
+  `Arc` itself.
 - `an_edit_of_one_item_lowers_it_alone`: renaming a `fn`, changing a field's visibility, making
   an `impl` a trait impl, adding `pub`, adding an item, changing an inline module's item, adding
-  an inner attribute to a `fn` body each run `item_fragment` exactly once.
-- `trees_asked_again_allocate_nothing`: a memo hit of `file_item_tree`, `top_attrs`,
-  `item_sources` and `item_fragment` allocates nothing.
+  an inner attribute to a `fn` body each lower exactly one item; `removing_an_item_lowers_none`.
+- `a_big_item_keeps_its_tree_across_an_edit_elsewhere`: a `macro_rules!` of more than 4 KiB is
+  not lowered again for an edit of another item, and is for an edit of its own.
+- `attributes_are_found_as_a_search_of_their_owners_finds_them`: the rank index `attrs` reads
+  gives what a binary search of the owners gives, for every item of a tree of more than two
+  blocks of 64.
+- `trees_asked_again_allocate_nothing`: a memo hit of `file_item_tree`, and a file whose items
+  all kept their keys, allocate nothing.
 - `assembly_allocates_once_a_column`: assembling a file of 4 items and one of 64 allocates as
-  many times, and gives the whole-file tree. These two count only once hir-def's test binary
-  installs `blaze_alloc_count::Counting` (requested from db).
+  many times, and gives the whole-file tree.
+- `reading_a_tree_allocates_nothing`, `expanding_use_trees_whose_paths_are_interned_allocates_nothing`,
+  `a_warm_builder_lowers_a_file_in_one_allocation_a_column`, `decoding_a_tree_allocates_once_a_column`
+  and `a_builder_after_an_item_of_many_names_lowers_as_a_fresh_one` (speed-hir-sol-items).
+
+The budgets count only once hir-def's test binary installs `blaze_alloc_count::Counting`
+(requested from db).

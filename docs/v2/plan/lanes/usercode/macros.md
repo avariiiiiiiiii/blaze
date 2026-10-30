@@ -54,10 +54,24 @@ A hit costs:
 - a stat of each traced input, with hashes cached by stat in a process-wide lock-free table;
 - a decode of the expansion from the store's bytes in place.
 
-It allocates nothing but the decoded expansion, apart from two things. The call's
-environment is made only if a shape read a variable. The token tree is flattened into
-`FlatTree`'s vectors before it is encoded (see Falls short). `check` compares by the hash of
-the kept bytes, also read in place. A miss runs the macro once and keeps what it made.
+It allocates nothing but the decoded expansion, apart from the call's environment, made
+only if a shape read a variable. The input crosses as the tree's own columns
+(`TopSubtree::write_wire` into the reused buffer, then its span parts rewritten to indices of
+the expansion's `Parts`), and the output is read back with `read_wire`, one pass over the
+columns into the tree. `check` compares by the hash of the kept bytes, also read in place. A
+miss runs the macro once and keeps what it made.
+
+The wire's speed of light is one pass over each tree's columns each way: a `u32` copy per node
+and span word, a three-word rewrite per span part, and a module that reads a span with
+arithmetic alone (`start | (len | part << 16) << 32`), calling the host only for a span too
+wide to pack (`span_pack`, `span_unpack`). The host side is there: `relative` is
+`write_wire` plus one pass over the parts table (and over the spans only when an expansion
+has more than 65535 parts), and `read_wire` checks the output canonical as it builds it, with
+no table of spans or map per span. The guest builds `Rc` streams of what it reads and its
+writer keeps its columns in fresh `Vec`s, which a macro's own API (an owned `TokenStream` per
+group) needs. The in-process bridge passes no bytes: it walks blaze's tree straight into the
+macro's stream and builds the output with `TopSubtreeBuilder`, so a warm expansion allocates
+only the macro's streams and the output tree (`native/tests.rs` holds it to that).
 
 | reference | what it does | blaze |
 |---|---|---|
@@ -71,8 +85,6 @@ the kept bytes, also read in place. A miss runs the macro once and keeps what it
 
 Falls short, and what it would take:
 - `Given::env` still copies each variable into an `OsString` (parent's `blaze-usercode`).
-- The key flattens the tree into `FlatTree`'s vectors. A walker that hashes tokens and span
-  shapes straight into the buffer would remove them.
 - The store's read guard (request: a lock-free view).
 - The warm record is read from a file after each expansion. The file stays open, the buffer
   is reused, and lines are parsed in place; only this scope's lines and new common lines are
@@ -84,18 +96,21 @@ Falls short, and what it would take:
 Change 20 runs a macro's own code on the MIR evaluator and copy-and-patch. Everything below
 already exists, and is exact against rustc's proc-macro server, so a port can reuse it.
 
-- **The `proc_macro` a macro is compiled against.** `crates/blaze-macro-wasm/guest/proc_macro.rs`
-  is blaze's own `proc_macro`: the full public API, with token streams, spans and literals as
-  host handles. `crates/blaze-expand/src/native/proc_macro/lib.rs` is the same file, held equal
-  to it by a test. Its host calls go to a thread-local `__native::Host` in process, instead of
-  to wasm imports. This is the crate to build macros against: its `sys` functions become the
+- **The `proc_macro` a macro is compiled against.** `crates/blaze-expand/src/native/proc_macro/api.rs`
+  is blaze's own `proc_macro`: the full public API, with token streams and literals in the
+  macro's memory and spans as the host's words. It is one text: the wasm guest is
+  `crates/blaze-macro-wasm/guest/proc_macro.rs` (its wasm imports, allocator and exports) with
+  `api.rs` appended (`blaze_macro_wasm::GUEST`), and the in-process bridge's
+  `proc_macro/lib.rs` `include!`s it after its own `sys`, whose calls go to a thread-local
+  `__native::Host` instead of to wasm imports. A test holds the two `sys` modules to the same
+  functions. This is the crate to build macros against: its `sys` functions become the
   evaluator's shims, and they are the only way out.
 - **The shims.** These are the host functions, one per `sys` import, in `add_host` in
   `crates/blaze-macro-wasm/src/lib.rs` and in `crates/blaze-expand/src/native/host.rs`:
   - sites: `def_site`, `call_site`, `mixed_site`;
   - span operations: `span_join`, `span_parent`, `span_source`, `span_start`, `span_end`,
     `span_byte_range`, `span_subspan`, `span_located_at`, `span_resolved_at`, `span_line`,
-    `span_column`, `span_debug`;
+    `span_column`, `span_debug`, and `span_pack`, `span_unpack` for a span too wide to pack;
   - questions of the database: `span_file`, `span_local_file`, `span_source_text`;
   - lexing: `ts_from_str`, `literal_from_str`;
   - handing data across: `take`, `output`;
@@ -106,15 +121,21 @@ already exists, and is exact against rustc's proc-macro server, so a port can re
   The wasm host also answers WASI preview 1 (`crates/blaze-macro-wasm/src/wasi.rs`). It gives
   the package read-only at `/blaze/package`, an empty `OUT_DIR`, cargo's `CARGO_*` variables
   only, and the real clock and randomness, marked untraceable.
-- **Span numbering.** The def, call and mixed sites are numbers 1, 2 and 3, the same spans or
-  not. The input's spans follow in the order they first appear in the encoded stream (`Spans`,
-  `wire.rs`). Keys carry spans relative to the call (`Shapes`: anchors and contexts as indices),
-  so one expansion is found again for the same tokens in another file or item.
-- **The wire format.** `crates/blaze-expand/src/native/wire.rs` and the wasm host's `wire.rs`
-  are byte-identical but for one `use`. They hold the token stream encoding and a one-pass
-  reader straight into rust-analyzer's flat tree, with no intermediate allocation.
-  `lex.rs` lexes literals and `ts_from_str` exactly as proc-macro-srv does, with
-  `rustc_lexer`.
+- **Span words.** A span is a `u64`: `start | len_part << 32`, `len_part` being
+  `len | part << 16` with `part` an index of the expansion's span parts (each distinct anchor
+  and context: the def, call and mixed sites', then the input's, the attribute's and what span
+  operations make, as `Parts` in `blaze_expand::bridge::wire` gives them out), or `u32::MAX` with `start` an
+  index of the spans too wide to pack. Equal spans have equal words; `u64::MAX` is none.
+  Keys carry the input as these columns relative to the call, and its parts as indices of the
+  input's anchors and contexts (`Shapes`), so one expansion is found again for the same
+  tokens in another file or item.
+- **The wire format.** A tree crosses as tt's own columns (`crates/tt/src/storage/wire.rs`),
+  each span part named by its index. Both hosts use one copy of the host's side,
+  `crates/blaze-expand/src/bridge/` (blaze-macro-wasm depends on blaze-expand): `wire.rs`
+  (`Parts`, the relative bytes, `read`), `spans.rs` (`join`, `subspan`) and `lex.rs`, which
+  lexes literals and `ts_from_str` exactly as proc-macro-srv does, with `rustc_lexer`. The
+  guest's reader and canonical writer are in `api.rs`, whose literal kinds are numbered as
+  `tt::LitKind::code` numbers them (a test runs every kind through both).
 - **Questions are inputs.** A question asked of a span (its source text, file, line and column,
   or byte range) is answered by `load_cargo::answer`. It is recorded with its answer as an
   input of the run (`Value::read` and `Value::said`, as NUL-named entries of `Traced::env`), so

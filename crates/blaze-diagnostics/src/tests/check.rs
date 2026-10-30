@@ -141,3 +141,33 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0539`.
 "#);
 }
+
+/// What deciding lint levels says of an attribute after the fatal error (`unknown_lints`, which
+/// rustc gives in its early lint pass, after expansion) is not written either.
+#[test]
+fn what_lint_attributes_say_after_a_fatal_error_is_not_written() {
+    let source = r#"#![recursion_limit = 123] //~ ERROR malformed `recursion_limit` attribute
+
+#[allow(this_lint_does_not_exist)]
+fn main() {}
+"#;
+    assert_eq!(ui("invalid_digit_type.rs", "2015", source), r#"error[E0539]: malformed `recursion_limit` attribute input
+  --> $DIR/invalid_digit_type.rs:1:4
+   |
+LL | #![recursion_limit = 123]
+   |    ^^^^^^^^^^^^^^^^^^---
+   |                      |
+   |                      expected a string literal here
+   |
+   = note: for more information, visit <https://doc.rust-lang.org/reference/attributes/limits.html#the-recursion_limit-attribute>
+help: must be of the form
+   |
+LL - #![recursion_limit = 123]
+LL + #![recursion_limit = "N"]
+   |
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0539`.
+"#);
+}

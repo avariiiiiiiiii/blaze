@@ -89,7 +89,7 @@ level, so readers never wait: this meets concurrency.md.
 | recording a read | FxHash and an `FxIndexSet` probe per read | a read of the same key as the last one is skipped before hashing (S4); the rest as before, in the task's own frame | a push, deduplicated by a scan |
 | edge record (query finishes) | one heap allocation per memo, 8 bytes an edge copied in | per edge, a probe of the task's 1024-entry node cache (L1 on a repeat key, the shared node table's lock-free probe otherwise) and one `Relaxed` store into the task's reserved chunk; one CAS per 256 edges; no allocation; published by the memo's own `Release` store | an `EdgesVec` moved into the graph |
 | deep verify | a claim per memo walked (a shard `Mutex` plus a `hashbrown` insert and remove), then a `dyn Ingredient` call per edge | no claim for a memo that ran no cycle, has no outputs and isn't provisional: an iterative walk, per edge one decode (the node's key: one page load and two column loads) then the hit check; a claim only for a memo that must run | one color load per edge, no lock |
-| memo at rest | header 40 + value, boxed; + 8 an edge in a second allocation (rounded to its size class); + 8 per sibling function; a 16-byte memo table in every slot | header 24 + value in its function's slab, no box; + 4 an edge in the shared array, no second allocation; + 8 for its row pointer in its own column only; a 4-byte row number in the slot. A memo with cycle, tracked-struct, accumulator or fingerprint data, or an assigned one, has them in one 72-byte box | 1 to 4 bytes an edge, a range per node |
+| memo at rest | header 40 + value, boxed; + 8 an edge in a second allocation (rounded to its size class); + 8 per sibling function; a 16-byte memo table in every slot | header 24 + value in its function's slab, no box; + 4 an edge in the shared array, no second allocation; + 8 for its row pointer in its own column only; nothing in the slot (its row comes from its page). A memo with cycle, tracked-struct, accumulator or fingerprint data, or an assigned one, has them in one 72-byte box | 1 to 4 bytes an edge, a range per node |
 
 `tests/memory-usage.rs` moves with it. The memos (header and value, the row pointer not
 counted): an interned argument's 144 to 96, each `String` memo 40 to 24, a tracked function's
@@ -123,12 +123,13 @@ by a `const` assertion:
   they exist only after an eviction), an assigned memo's 12-byte key, or a span longer than 2^29.
 
 **Memos as columns** (`table/memo.rs`; callers in `function.rs`, `function/memo.rs`, the three
-struct kinds, `zalsa.rs`, `ingredient.rs`). No box per memo, no pointer per sibling function, and
-a slot's memo table is one 4-byte row number:
+struct kinds, `zalsa.rs`, `ingredient.rs`, `table.rs`). No box per memo, no pointer per sibling
+function, and nothing in the slot: a slot's row is its page's first row plus its index in the
+page (rows by page, 20:40), so a hit computes the row from the page line and the `Id`:
 
 | piece | where | bytes | written by, when |
 |---|---|---|---|
-| row number (`MemoTable { row: u32 }`) | in the slot; handed out by the struct ingredient's `MemoTableTypes::next_row` when the slot is made, kept when the slot is reused | 4 per slot, folded into padding in all three struct kinds | once, at slot creation |
+| first row of a page (`Page::memo_rows`) | in the table page, beside its column slice; 128 rows handed out by the struct ingredient's `MemoTableTypes::next_page_rows` when the page is made (also a page made at deserialization); slot `s` has row `memo_rows + s`, kept when the slot is reused. `MemoTable` is zero-sized: `&mut MemoTable` only proves exclusive access | 4 per page of 128 slots | once, at page creation |
 | row pointer | the function's `Column`: a blaze-mem `Region` (`Tag::Query`) reserving 8 bytes for each of 2^28 rows, row `r` at `8r`, committed (kernel-zeroed) as far as the highest row with a memo, at least 64 KB at a time | 8 per row up to the highest with a memo; untouched committed pages are not resident | the publisher, one `AcqRel` swap per publish; clearing a slot swaps in null |
 | memo: `Memo<C>`, the 24-byte header and the value | the column's slab, a second `Region`: slot `i` at `size * i`, never moved, up to 2^24 memos (or 16 GB of address space) per column, a panic naming the type past it | 24 + the value | written once by the thread that took the slot, before the swap publishes it; after that only the header's atomics change, and the value only through `&mut` (eviction) |
 
@@ -136,9 +137,12 @@ a slot's memo table is one 4-byte row number:
   `fetch_add`, else the bump counter), write the memo there, swap the row pointer to it. The
   release half publishes the memo (and its edges, recorded before); the old memo, if any, goes on
   the column's retired list. A value is never written in place on a shared memo.
-- **Read** (`get`): the column (a type check against `TypeId` and the rows' committed length,
-  on one line), the row pointer at a computed address (acquire), the memo. Loads only, no write
-  to shared memory.
+- **Read** (`get`): the page (its column slice and first row), the column (a type check against
+  `TypeId` and the rows' committed length, on one line), the row pointer at
+  `8 * (memo_rows + slot)` (acquire), the memo. The slot is not on the chain: an input's hit
+  never loads it, and a tracked struct's or interned value's validation loads it beside the
+  column. Loads only, no write to shared memory. Cold paths (clearing a slot, memory reports)
+  get the row from `Table::memo_row(id)`.
 - **Reclaim** (`Zalsa::reclaim_memos`, in `new_revision` and at the end of `evict_values`, both
   `&mut Zalsa`): `&'db` references into memos last the whole revision, so the revision boundary
   is the quiescent point. Each column drops its retired memos in place and puts their slots on the
@@ -154,14 +158,19 @@ a slot's memo table is one 4-byte row number:
 - **Invariant, checked in debug builds at every reclaim and at drop** (`Column::check_accounting`):
   every slab slot ever handed out is exactly one of a row's current memo, retired, or free and not
   yet taken. Also debug-checked: a retired memo lies in its own column's slab, slab slots are
-  aligned and inside their page, a table is used only with rows its types handed out. Release
+  aligned and inside their page, a row is one its types handed out (`rows_handed_out`), a page's
+  first row is a multiple of 128. Release
   checks: the memo type of a column (`type_assert_failed`), more than 2^32 - 1 slots, a column
   outgrowing its last slab page.
-- **Tests** (`table/memo.rs`): `pages_tile_rows_and_slots`, `rows_keep_their_own_memos_per_column`,
+- **Tests** (`table/memo.rs`): `pages_take_disjoint_aligned_rows`,
+  `the_row_reservation_is_a_whole_number_of_pages` (the panic past 2^28 rows leaves the count at
+  the reservation), `rows_and_slots_sit_at_fixed_offsets`, `rows_keep_their_own_memos_per_column`,
   `replaced_memos_live_until_reclaim_and_their_slots_are_reused` (with drop counts),
   `taking_memos_retires_them`, `map_memo_changes_the_memo_in_place`, `the_wrong_memo_type_panics`,
   `racing_inserts_keep_every_row` (threads on disjoint rows, then reclaim and drop counts).
-- **`const` assertions:** `MemoHeader` 24, `MemoTable` 4, an interned value 24 plus its fields.
+- **`const` assertions:** `MemoHeader` 24 (3 words in `function/memo.rs`'s size module too,
+  which still said 5), `Memo` of an 8-byte value 32, `MemoTable` 0, rows a whole number of
+  pages, an interned value 24 plus its fields (unchanged: the row sat in padding).
 
 Memo at rest: 24 + value + 4n bytes in the slab, plus 8 for its row pointer in its own column
 only, against 40 + value + 8n, a box, 8 per sibling function, and the 16-byte memo table every

@@ -48,7 +48,7 @@ writes one buffer:
 
 1. **Scan** (`patch/scan.rs`). Use counts, which values are `iconst`s (folded as immediates
    where a shape takes one), and the last use of each value local to one block. Each is a
-   column indexed by `ir::Value`, in scratch reused across compiles. Selection
+   column indexed by `ir::Value`, on the compile's frame. Selection
    (`patch/select.rs`) then picks each instruction's shape, taking a fusion only when the
    library has the fused shape.
 2. **Slots** (`patch/slots.rs`). Which result stays in the accumulator is decided here, after
@@ -78,8 +78,14 @@ writes one buffer:
    (`vconst`, shuffle masks, 16-byte aligned, reached PC-relatively). Label fixups are
    resolved and the unwind rows closed, and the result is returned as `Code`.
 
-The compile allocates nothing per instruction. The scratch (`patch::Scratch`) holds every
-column and the buffer. It lives per thread and is cleared, not freed, between functions.
+The compile allocates nothing from the global allocator. It runs as one blaze-mem task
+(`blaze_mem::frame::task(Tag::Codegen, ..)`, [memory.md](../../design/memory.md)): every column,
+the buffer and the side tables are vectors on the task's frame, made empty at the start and
+gone when the frame is reset at the end, and the thread keeps the frame warm for the next
+compile. The result is handed out borrowed from the frame (`CodeRef`) to a sink:
+`blaze_stencil::compile_to(func, target, sink)`. `compile_into(func, target, &mut code)` copies
+it into a reused `Code` (`Code::copy_from`), so a warm compile allocates nothing at all, and
+`compile` copies it into a fresh `Code`.
 
 ## Shapes
 

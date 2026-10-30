@@ -93,7 +93,7 @@ use hir_ty_mir::mir::{
     TerminatorKind, UnOp, caller_location, interpret_mir,
     location::{
         ConcatPart, concat_parts, line_and_column, located_concats, location_macros,
-        location_of, reported_range, source_location_in_file, source_range, track_caller,
+        location_of, macro_location_of, reported_range, source_location_in_file, source_range, track_caller,
         written_call, written_range,
     },
     monomorphized, monomorphized_promoted_mir_body_query,
@@ -487,6 +487,7 @@ pub trait SymbolResolver {
         self.in_parallel_beside(count, work, &mut || ());
     }
     /// [`Self::in_parallel`], with `beside` run on this thread while the others work.
+    // dyn: a method of the object-safe `SymbolResolver`, run once per parallel phase of a build
     fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         _ = (count, work);
         beside();
@@ -496,6 +497,7 @@ pub trait SymbolResolver {
 /// What an instance is called in every run of the daemon, if anything.
 type StableName = std::sync::Arc<str>;
 
+// dyn: a method of the object-safe `SymbolResolver`, run once per parallel phase of a build
 pub type ParallelWork<'a> = dyn Fn(&Db, &dyn SymbolResolver, usize) + Sync + 'a;
 
 /// An x86 operation on two vectors that `FunctionCx::lanewise` does lane by lane.
@@ -789,6 +791,7 @@ impl CodegenUnit {
     /// rejected up front until a round finishes without a new rejection.
     pub fn compile(
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         roots: Roots<'_>,
         denied: &FxHashSet<FunctionId>,
@@ -823,10 +826,12 @@ impl CodegenUnit {
     /// had the rest of its bodies from before.
     pub fn compile_or_hold(
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         roots: Roots<'_>,
         denied: &FxHashSet<FunctionId>,
         known: &mut Rejections,
+        // dyn: called once per build
         hold: &dyn Fn() -> bool,
         undoable: bool,
         counted: &counted::Counted,
@@ -1355,6 +1360,7 @@ impl OwnStatics {
 
     fn new(
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         crates: FxHashSet<Crate>,
         theirs: FxHashSet<StaticId>,
@@ -1527,6 +1533,7 @@ impl Rejections {
     pub fn stale(
         &self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: Option<&dyn SymbolResolver>,
         part: usize,
         parts: usize,
@@ -1600,6 +1607,7 @@ impl Rejections {
     pub fn home(
         &mut self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         file: base_db::FileId,
         functions: &[FunctionId],
@@ -1907,6 +1915,7 @@ enum Callee<'db> {
 /// How rustc's demangled symbols spell the types and instances of the program.
 struct Spelling<'a, 'db> {
     db: &'db Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &'a dyn SymbolResolver,
 }
 
@@ -2115,9 +2124,6 @@ impl<'db> Spelling<'_, 'db> {
     fn symbol_type(&self, ty: Ty<'db>) -> Option<String> {
         use std::fmt::Write;
         let db = self.db;
-        let list = |tys: &mut dyn Iterator<Item = Ty<'db>>| {
-            tys.map(|it| self.symbol_type(it)).collect::<Option<Vec<_>>>().map(|it| it.join(", "))
-        };
         Some(match ty.kind() {
             TyKind::Bool => "bool".to_owned(),
             TyKind::Char => "char".to_owned(),
@@ -2140,8 +2146,8 @@ impl<'db> Spelling<'_, 'db> {
             TyKind::Array(element, len) => {
                 format!("[{}; {}]", self.symbol_type(element)?, try_const_usize(db, len)?)
             }
-            TyKind::Tuple(tys) if tys.len() == 1 => format!("({},)", list(&mut tys.iter())?),
-            TyKind::Tuple(tys) => format!("({})", list(&mut tys.iter())?),
+            TyKind::Tuple(tys) if tys.len() == 1 => format!("({},)", self.symbol_types(tys.iter())?),
+            TyKind::Tuple(tys) => format!("({})", self.symbol_types(tys.iter())?),
             TyKind::Adt(adt, args) => {
                 let mut path = self.symbols.item(adt.def_id().into())?;
                 let interner = DbInterner::new_no_crate(db);
@@ -2169,7 +2175,7 @@ impl<'db> Spelling<'_, 'db> {
                 {
                     return None;
                 }
-                let mut path = format!("fn({})", list(&mut sig.inputs().iter().copied())?);
+                let mut path = format!("fn({})", self.symbol_types(sig.inputs().iter().copied())?);
                 if !sig.output().is_unit() {
                     write!(path, " -> {}", self.symbol_type(sig.output())?).ok()?;
                 }
@@ -2199,6 +2205,11 @@ impl<'db> Spelling<'_, 'db> {
             }
             _ => return None,
         })
+    }
+
+    /// [`Self::symbol_type`] of each of `tys`, between commas.
+    fn symbol_types(&self, tys: impl Iterator<Item = Ty<'db>>) -> Option<String> {
+        tys.map(|it| self.symbol_type(it)).collect::<Option<Vec<_>>>().map(|it| it.join(", "))
     }
 }
 
@@ -2233,6 +2244,7 @@ fn split_top_on<'t>(text: &'t str, separator: &str) -> Vec<&'t str> {
 /// ask for an id in the module, and defines the ones that are ours.
 struct ObjectCodegen<'a, 'db> {
     db: &'db Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &'a dyn SymbolResolver,
     module: ObjectModule,
     unwind: UnwindContext,
@@ -2503,10 +2515,40 @@ impl Resolved {
 
 /// The code generator of the one [`Target`] the process compiles for.
 fn target() -> Result<&'static isa::OwnedTargetIsa> {
-    static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
-        std::sync::OnceLock::new();
-    TARGET
-        .get_or_init(|| Target::selected()?.isa(regalloc(), false))
+    target_of(Isa::Usual, false)
+}
+
+/// Which of the process's code generators a function is compiled with.
+#[derive(Clone, Copy)]
+enum Isa {
+    Usual,
+    /// For a function of more than [`SINGLE_PASS`] instructions. The usual register
+    /// allocator takes more than linear time: ten seconds for one of 150 000 instructions,
+    /// which a whole build then waits for.
+    Large,
+    /// For a function that asks for its frame pointer at its start, as one that takes `...`
+    /// does to find the arguments on the stack: Cranelift answers only where every function
+    /// keeps a frame pointer, which the others have no use for.
+    FramePointer,
+}
+
+/// The code generator of a kind, at Cranelift's `opt_level=speed` for code no edit reaches
+/// (`speed`) and at `none` for the rest. Each is made once, the first time it is asked for.
+fn target_of(kind: Isa, speed: bool) -> Result<&'static isa::OwnedTargetIsa> {
+    type Made = std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>>;
+    static TARGETS: [[Made; 3]; 2] = [const { [const { Made::new() }; 3] }; 2];
+    let (regalloc, frame_pointers) = match kind {
+        Isa::Usual => (regalloc(), false),
+        Isa::Large => ("single_pass", false),
+        Isa::FramePointer => (regalloc(), true),
+    };
+    let opt = if speed {
+        cranelift_codegen::settings::OptLevel::Speed
+    } else {
+        cranelift_codegen::settings::OptLevel::None
+    };
+    TARGETS[usize::from(speed)][kind as usize]
+        .get_or_init(|| Target::selected()?.isa(regalloc, frame_pointers, opt))
         .as_ref()
         .map_err(|e| CodegenError::Backend(e.clone()))
 }
@@ -2524,30 +2566,6 @@ fn regalloc() -> &'static str {
             _ => "backtracking",
         });
     *REGALLOC
-}
-
-/// The same target for a function of more than [`SINGLE_PASS`] instructions. The usual
-/// register allocator takes more than linear time: ten seconds for one of 150 000
-/// instructions, which a whole build then waits for.
-fn target_for_large() -> Result<&'static isa::OwnedTargetIsa> {
-    static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
-        std::sync::OnceLock::new();
-    TARGET
-        .get_or_init(|| Target::selected()?.isa("single_pass", false))
-        .as_ref()
-        .map_err(|e| CodegenError::Backend(e.clone()))
-}
-
-/// The same target for a function that asks for its frame pointer at its start, as one
-/// that takes `...` does to find the arguments on the stack: Cranelift answers only where
-/// every function keeps a frame pointer, which the others have no use for.
-fn target_with_frame_pointer() -> Result<&'static isa::OwnedTargetIsa> {
-    static TARGET: std::sync::OnceLock<std::result::Result<isa::OwnedTargetIsa, String>> =
-        std::sync::OnceLock::new();
-    TARGET
-        .get_or_init(|| Target::selected()?.isa(regalloc(), true))
-        .as_ref()
-        .map_err(|e| CodegenError::Backend(e.clone()))
 }
 
 /// The most instructions a function has that LLVM optimizes.
@@ -2756,6 +2774,7 @@ pub fn compile_written(db: &Db, func: FunctionId) {
 /// code of a function is the same whichever they are, and a build that knows them finds it
 /// compiled. A call of a function without generic arguments is not followed, since rustc
 /// may have built the one called.
+// dyn: blaze-engine's stop signal (itself a `&dyn Fn`), asked once per function compiled
 pub fn compile_unnamed(db: &Db, unnamed: &Unnamed, done: &dyn Fn() -> bool) {
     let mut homes = home::Homes::default();
     loop {
@@ -2923,6 +2942,7 @@ fn root_instance(db: &Db, func: FunctionId) -> Instance {
 /// function of another compiles a copy with its own.
 fn as_its_crate_compiles(
     db: &Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &dyn SymbolResolver,
     instance: &Instance,
 ) -> bool {
@@ -2947,6 +2967,7 @@ fn as_its_crate_compiles(
 /// callers blaze's.
 fn rustcs_callers_pass_scalable(
     db: &Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &dyn SymbolResolver,
     func: FunctionId,
 ) -> bool {
@@ -2977,6 +2998,7 @@ fn callee_name(db: &Db, def: InstanceDef) -> &str {
 /// Writes into `blob` the `TypeId`s it has the places of.
 fn hash_type_ids(
     db: &Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &dyn SymbolResolver,
     crates: &FxHashSet<Crate>,
     blob: &mut ConstBlob,
@@ -4046,6 +4068,7 @@ fn named_futures(db: &Db, func: FunctionId) -> FxHashSet<salsa::Id> {
 /// none: it is missing from the program, and no code of rustc's uses a static in its place.
 fn left_to_rustc<'a>(
     db: &'a Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &'a dyn SymbolResolver,
     skipped: &'a [(FunctionId, CodegenError)],
 ) -> impl Iterator<Item = FunctionId> + 'a {
@@ -5345,13 +5368,20 @@ impl cranelift_codegen::incremental_cache::CacheKvStore for IncrementalCache {
 /// serialization and hash of the whole function, and a lookup in v1's store) that the memo
 /// already missed on. It compiles with none.
 fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
-    emit_with(ctx, None)
+    emit_with(ctx, None, false)
+}
+
+/// [`emit`] at Cranelift's `opt_level=speed` when `speed`: for code no edit reaches, the
+/// standard library's and dependencies', whose unit's key says so
+/// (`blaze_codegen::Backend::Cranelift { speed }`).
+fn emit_at(ctx: &mut cranelift_codegen::Context, speed: bool) -> Result<Code> {
+    emit_with(ctx, None, speed)
 }
 
 /// [`emit`] for v1's build (`Backend::emit`), through Cranelift's incremental cache in v1's
 /// store when there is one.
 fn emit_cached(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
-    emit_with(ctx, store::Store::global())
+    emit_with(ctx, store::Store::global(), false)
 }
 
 /// Runs Cranelift on a finished function, with `store` as its incremental cache. Cranelift
@@ -5360,12 +5390,14 @@ fn emit_cached(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
 fn emit_with(
     ctx: &mut cranelift_codegen::Context,
     store: Option<&'static store::Store>,
+    speed: bool,
 ) -> Result<Code> {
     if Target::current().is_wasm() {
         return emit_wasm(&ctx.func, Target::current().calls());
     }
     let large = ctx.func.dfg.num_insts() > SINGLE_PASS;
-    let mut isa = &**if large { target_for_large()? } else { target()? };
+    let kind = if large { Isa::Large } else { Isa::Usual };
+    let mut isa = &**target_of(kind, speed)?;
     let func = &ctx.func;
     if !isa.flags().preserve_frame_pointers()
         && (backend::frame_pointers()
@@ -5375,7 +5407,7 @@ fn emit_with(
                     .any(|inst| func.dfg.insts[inst].opcode() == ir::Opcode::GetFramePointer)
             }))
     {
-        isa = &**target_with_frame_pointer()?;
+        isa = &**target_of(Isa::FramePointer, speed)?;
     }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match store {
@@ -5479,6 +5511,7 @@ fn root_body<'db>(
 impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn new(
         db: &'db Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &'a dyn SymbolResolver,
         rejected: &'a FxHashMap<Instance, Rejected>,
         own_statics: OwnStatics,
@@ -5893,7 +5926,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let name = self.stable_name(&root_instance(self.db, func))?;
         let symbols = self.symbols;
         let usable = |entries: &cached::Entries| {
-            entries.usable(&name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))
+            entries.usable(&name, symbols)
         };
         let stored =
             stable::StableNames::of_checkout(&name) && self.entries.as_deref().is_some_and(usable);
@@ -5942,9 +5975,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             while let Some((func, name)) =
                 named.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
             {
-                let usable = |symbol: &str| symbols.provides(symbol) && symbols.linked(symbol);
                 let stored =
-                    stable::StableNames::of_checkout(name) && entries.usable(name, &usable);
+                    stable::StableNames::of_checkout(name) && entries.usable(name, symbols);
                 here.push((*func, name.clone(), stored));
             }
             found.lock().unwrap_or_else(|e| e.into_inner()).extend(here);
@@ -6233,6 +6265,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     fn compile_ahead(
         &mut self,
         roots: Vec<FunctionId>,
+        // dyn: called once per build
         beside: &mut dyn FnMut(&mut Self, Option<&mut Ready<'_>>),
     ) {
         // A patch calls the base's copy of most of what it reaches. Units are compiled
@@ -6286,12 +6319,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // crate is listed to find again: listed here, beside the compiling, and not by every
         // thread at once after it.
         let (listings, keeps) = (self.names.listings(), self.defers() && entries.is_some());
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         let run = |db: &Db, symbols: &dyn SymbolResolver| {
             let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
                 .listing(listings.clone());
             let usable = |name: &str| {
                 let Some(entries) = entries else { return false };
-                entries.usable(name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))
+                entries.usable(name, symbols)
             };
             // What the store has is not compiled, nor looked into for what it calls.
             let in_store = |callee: &Instance| names.instance(callee).is_some_and(|it| usable(&it));
@@ -6432,6 +6466,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 progress.notify_all();
             }
         };
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         let work = |db: &Db, symbols: &dyn SymbolResolver, _: usize| {
             ahead.lock().unwrap_or_else(|e| e.into_inner()).alive += 1;
             /// Counts the thread out however it stops.
@@ -6615,6 +6650,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // of over and over: they are not made again for each part.
             let next = std::sync::atomic::AtomicUsize::new(0);
             let listings = self.names.listings();
+            // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
             let work = |db: &Db, symbols: &dyn SymbolResolver, _: usize| {
                 let names = stable::StableNames::new(db, symbols, owned.clone(), hydrate)
                     .listing(listings.clone());
@@ -6733,7 +6769,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         mixed: &settled::Mixed,
         func: FunctionId,
         instance: &Instance,
-        nameless: &dyn Fn() -> Result<bool>,
+        nameless: &impl Fn() -> Result<bool>,
     ) -> Result<bool> {
         let (db, asking) = (self.db, instance.checked);
         let args = instance.args.as_ref();
@@ -6801,11 +6837,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let Some(entries) = self.entries.clone() else { return Ok(None) };
         let symbols = self.symbols;
-        if !entries.usable(name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol)) {
+        if !entries.usable(name, symbols) {
             let why = match entries.get(name) {
                 None => "no entry",
                 Some(it)
-                    if !it.links(&|symbol| symbols.provides(symbol) && symbols.linked(symbol)) =>
+                    if !it.links(symbols) =>
                 {
                     "an entry linked against what the program lacks"
                 }
@@ -10484,8 +10520,11 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         // not exist.
         let mut reachable = rustc_hash::FxHashSet::default();
         let off = self.checks_off(body);
-        let resumes_only =
-            if frame.is_some() { FxHashSet::default() } else { Self::resumes_only(body) };
+        // rustc's RemoveNoopLandingPads: such a pad costs a call LLVM doesn't know resumes.
+        let resumes_only = match frame {
+            Some(_) => FxHashSet::default(),
+            None => hir_ty_mir::mir::noop_landing_pads(body),
+        };
         // Switches on a value known now, and the one way they go.
         let mut decided = FxHashMap::default();
         let mut worklist = vec![body.start_block];
@@ -10702,40 +10741,6 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         off.retain(|local| assigned.get(local) == Some(&1) && !borrowed.contains(local));
         off
-    }
-
-    /// The cleanup blocks of `body` that do nothing but go on unwinding, which a call that
-    /// unwinds to one needs no landing pad for, as rustc's `RemoveNoopLandingPads` has it: a
-    /// pad costs a call that LLVM does not know resumes, and that LLVM counts against
-    /// building the function into its callers.
-    fn resumes_only(body: &MirBody<'db>) -> FxHashSet<BasicBlockId> {
-        let mut found = FxHashSet::default();
-        loop {
-            let before = found.len();
-            for (id, block) in body.basic_blocks.iter() {
-                let idle = block.is_cleanup
-                    && block.statements.iter().all(|it| {
-                        matches!(
-                            it.kind,
-                            StatementKind::StorageLive(_)
-                                | StatementKind::StorageDead(_)
-                                | StatementKind::FakeRead(_)
-                                | StatementKind::Nop
-                        )
-                    });
-                let resumes = match block.terminator.as_ref().map(|it| &it.kind) {
-                    Some(TerminatorKind::UnwindResume) => true,
-                    Some(TerminatorKind::Goto { target }) => found.contains(target),
-                    _ => false,
-                };
-                if idle && resumes {
-                    found.insert(id);
-                }
-            }
-            if found.len() == before {
-                return found;
-            }
-        }
     }
 
     fn place(&mut self, place: &StoredPlace) -> Result<(Value, PlaceTy<'db>)> {
@@ -13237,7 +13242,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             text.push(match part {
                 ConcatPart::Text(text) => TextPart::Text(text),
                 ConcatPart::Location(expander, range) => {
-                    let Some((file, line, col)) = location_of(db, call.file_id, range) else {
+                    let Some((file, line, col)) = macro_location_of(db, call.file_id, range) else {
                         unsupported!("`concat!` of a place that is not in a file");
                     };
                     match expander {
@@ -13272,7 +13277,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let Some(site) = written_call(db, file_id) else { return Ok(None) };
         let range = InFile::new(site.file_id, written_range(&site.value));
         let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
-        let Some((file, line, col)) = location_of(db, file_id.into(), range) else {
+        let Some((file, line, col)) = macro_location_of(db, file_id.into(), range) else {
             return Ok(None);
         };
         let number = match expander {
@@ -13334,7 +13339,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             false => FxHashSet::default(),
         };
         let storage = body.frame_storage_conflicts(&locals, |local| named.contains(&local));
-        let mut conflicts = rustc_index::bit_set::BitMatrix::new(count, count);
+        let mut conflicts = blaze_ids::bits::BitMatrix::new(count, count);
         for (a, &(_, slot_a)) in members.iter().enumerate() {
             for (b, &(_, slot_b)) in members.iter().enumerate().skip(a + 1) {
                 if slot_a != slot_b && storage.conflict(a, b) {
@@ -19624,11 +19629,11 @@ fn register_locals(body: &MirBody<'_>, forwarded: &FxHashMap<LocalId, LocalId>) 
             mentions.entry(local).or_default().1 += 1;
         }
     };
-    let read = |operand: &Operand, plain: &mut dyn FnMut(&StoredPlace)| {
+    fn read(operand: &Operand, plain: &mut impl FnMut(&StoredPlace)) {
         if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
             plain(place);
         }
-    };
+    }
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(to, rvalue) = &statement.kind {

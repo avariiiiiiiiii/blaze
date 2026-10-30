@@ -965,6 +965,9 @@ mod tests {
                 id: [0; 16],
                 debug: &self.debug,
                 symbol: &|_| None,
+                synthesis: 0,
+                delta: None,
+                encoded: &[],
             })
         }
 

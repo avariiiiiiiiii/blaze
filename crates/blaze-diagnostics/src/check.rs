@@ -12,6 +12,8 @@
 //! and `compiler/rustc_errors/src/lib.rs` (`DiagCtxtInner::emit_diagnostic`: a diagnostic
 //! emitted again is not written again, nor a `note_once` already written).
 
+use std::hash::{Hash, Hasher};
+
 use base_db::Db;
 use blaze_ids::radix;
 use blaze_mem::{Frame, Tag, frame};
@@ -23,7 +25,7 @@ use crate::{
     cx::{Cx, Files},
     emit, lints,
     lower::{self, Found, Phase},
-    model::{Child, Diag},
+    model::Diag,
 };
 
 /// What a crate is checked with: the flags of rustc's that change what it says.
@@ -42,7 +44,7 @@ pub struct Options {
 pub fn check_crate(
     db: &Db,
     krate: hir::Crate,
-    files: &dyn Files,
+    files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
     let sema = Semantics::new(db);
@@ -53,14 +55,14 @@ pub fn check_crate(
 pub fn check_crate_with<'db>(
     sema: &Semantics<'db>,
     krate: hir::Crate,
-    files: &dyn Files,
+    files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
     frame::task(Tag::Diagnostics, |frame| run(sema, krate, files, options, frame))
 }
 
 /// The check of `krate`, its tables in `frame`.
-fn run(sema: &Semantics<'_>, krate: hir::Crate, files: &dyn Files, options: &Options, frame: &Frame) -> Vec<Diag> {
+fn run(sema: &Semantics<'_>, krate: hir::Crate, files: Files<'_>, options: &Options, frame: &Frame) -> Vec<Diag> {
     let cx = Cx::new(sema, krate, files, frame).with_lints(&options.lints);
     let parsed = lower::parse::parsed(&cx);
     if parsed.fatal {
@@ -75,7 +77,10 @@ fn run(sema: &Semantics<'_>, krate: hir::Crate, files: &dyn Files, options: &Opt
     radix::sort_by_key(&mut found, |it| it.phase as u8);
     if let Some(at) = found.iter().position(|it| it.diag.fatal) {
         found.truncate(at + 1);
-        return written(lints::decide(&cx, &options.lints, found, true), options);
+        let mut diags = lints::decide(&cx, &options.lints, found, true);
+        let stop = diags.iter().position(|it| it.fatal).expect("deciding levels keeps every error");
+        diags.truncate(stop + 1);
+        return written(diags, options);
     }
     let aborted = found.iter().any(stops_before_late);
     if !aborted {
@@ -120,45 +125,76 @@ const DUPLICATE: &str = "duplicate diagnostic emitted due to `-Z deduplicate-dia
 
 /// What rustc does as it emits each diagnostic: the note of the macro it came from, none
 /// written twice (unless `keep_duplicates`: then with a note that it is one), nor a
-/// `note_once` already written with another. Gives what is written and, of it, what rustc
-/// counts for its closing lines (each diagnostic once: `deduplicated_err_count`).
-fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> (Vec<Diag>, Vec<Diag>) {
-    let mut seen: FxHashSet<Diag> = FxHashSet::default();
-    let mut once: FxHashSet<Child> = FxHashSet::default();
+/// `note_once` already written with another. Gives what is written and the indices into it of
+/// what rustc counts for its closing lines (each diagnostic once: `deduplicated_err_count`).
+fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> (Vec<Diag>, Vec<u32>) {
+    let mut seen: FxHashSet<Key> = FxHashSet::default();
+    let mut once: FxHashSet<Key> = FxHashSet::default();
+    seen.reserve(diags.len());
     let mut written = Vec::with_capacity(diags.len());
     let mut counted = Vec::with_capacity(diags.len());
     for mut diag in diags {
-        let in_macro = diag.span.primary.iter().any(|it| it.expansion.is_some());
-        let noted = diag.children.iter().any(|it| it.message.contains("(in Nightly builds, run with -Z macro-backtrace for more info)"));
-        if in_macro && !noted {
+        if diag.span.primary.iter().any(|it| it.expansion.is_some())
+            && !diag.children.iter().any(|it| it.message.contains("(in Nightly builds, run with -Z macro-backtrace for more info)"))
+        {
             diag.originates_in();
         }
-        let already = !seen.insert(diag.clone());
+        let already = !seen.insert(key(&diag));
         if already && !keep_duplicates {
             continue;
         }
-        diag.children.retain(|child| !child.once || once.insert(child.clone()));
+        diag.children.retain(|child| !child.once || once.insert(key(child)));
         if already {
             diag.note(DUPLICATE);
         } else {
-            counted.push(diag.clone());
+            counted.push(u32::try_from(written.len()).expect("fewer than 2^32 diagnostics"));
         }
         written.push(diag);
     }
     (written, counted)
 }
 
+/// rustc's key for a diagnostic already emitted (`DiagCtxtInner::emitted_diagnostics`, a set of
+/// `Hash128`): a 128-bit content hash of it, so the set holds 16 bytes per diagnostic rather
+/// than a copy of it.
+type Key = [u8; 16];
+
+/// BLAKE3 over `it`'s `Hash` form, cut to 128 bits.
+fn key(it: &impl Hash) -> Key {
+    let mut hasher = Blake3(blake3::Hasher::new());
+    it.hash(&mut hasher);
+    let mut key = [0; 16];
+    key.copy_from_slice(&hasher.0.finalize().as_bytes()[..16]);
+    key
+}
+
+/// A [`Hasher`] that feeds BLAKE3.
+struct Blake3(blake3::Hasher);
+
+impl Hasher for Blake3 {
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        let mut word = [0; 8];
+        word.copy_from_slice(&self.0.finalize().as_bytes()[..8]);
+        u64::from_le_bytes(word)
+    }
+}
+
 /// `diags` as rustc writes them, then its closing lines.
 fn written(diags: Vec<Diag>, options: &Options) -> Vec<Diag> {
     let (mut written, counted) = finish(diags, options.keep_duplicates);
-    written.extend(emit::summary(&counted));
+    let closing = emit::summary(counted.iter().map(|&at| &written[at as usize]));
+    written.extend(closing);
     written
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Level, MultiSpan, Span, Sublevel};
+    use crate::model::{Child, Level, MultiSpan, Span, Sublevel};
 
     fn at(lo: u32) -> Span {
         Span { file: "src/lib.rs".to_owned(), lo, hi: lo + 1, expansion: None }
@@ -224,7 +260,23 @@ mod tests {
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0].children.len(), 1);
         assert!(diags[1].children.is_empty());
-        assert_eq!(counted, diags);
+        assert_eq!(counted, [0, 1]);
+    }
+
+    #[test]
+    fn a_crate_with_nothing_to_say_costs_the_driver_no_allocation() {
+        let options = Options::default();
+        let (written, used) = blaze_alloc_count::measure(|| written(Vec::new(), &options));
+        assert!(written.is_empty());
+        assert_eq!(used.allocations, 0, "dedup, once-notes and the closing lines of nothing");
+    }
+
+    #[test]
+    fn the_dedup_key_is_the_content_and_nothing_else() {
+        let a = Diag::error(Some("E0425"), "cannot find value `x` in this scope", at(0));
+        assert_eq!(key(&a), key(&a.clone()));
+        assert_ne!(key(&a), key(&Diag::error(Some("E0425"), "cannot find value `x` in this scope", at(1))));
+        assert_ne!(key(&a), key(&Diag::error(Some("E0425"), "cannot find value `y` in this scope", at(0))));
     }
 
     #[test]
@@ -234,6 +286,6 @@ mod tests {
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0], a);
         assert_eq!(diags[1].children.last().map(|it| it.message.as_str()), Some(DUPLICATE));
-        assert_eq!(counted, [a]);
+        assert_eq!(counted, [0]);
     }
 }

@@ -12,10 +12,16 @@
 //! Code dedupe never merges statics or anything whose address the program can compare as
 //! distinct: those are [`Target::Static`], keyed by which item they are, never by content.
 
+#![feature(allocator_api)]
+
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub mod backend;
 pub mod blob;
@@ -27,9 +33,13 @@ pub mod imports;
 pub mod memo;
 pub mod plan;
 pub mod query;
+pub mod relocs;
 pub mod settings;
 pub mod summary;
 pub mod template;
+pub mod unwind;
+
+pub use relocs::{Reloc, Relocation, Relocs, RelocsView};
 
 /// A function instance: what is compiled.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -65,8 +75,16 @@ pub struct Settings(pub ContentId);
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Backend {
-    Cranelift,
+    /// `speed`: Cranelift's `opt_level=speed`, for code no edit reaches (std's, dependencies',
+    /// build-time code), which is compiled once; else `opt_level=none`.
+    Cranelift { speed: bool },
     Llvm { opt: u8 },
+}
+
+impl Backend {
+    pub const fn is_cranelift(self) -> bool {
+        matches!(self, Backend::Cranelift { .. })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -96,7 +114,8 @@ pub struct CompiledFunction {
     /// A power of two.
     pub align: u32,
     pub code: Vec<u8>,
-    pub relocs: Vec<Reloc>,
+    /// Where `code` holds addresses: the places the linker fills, each target once.
+    pub relocs: Relocs,
     /// Read-only data only it refers to, deduplicated by content: [`Target::Data`].
     pub data: Vec<Data>,
     /// The callees whose bodies it inlined: a change to one's code reruns it (release).
@@ -180,7 +199,7 @@ pub struct Static {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Init {
-    Bytes { bytes: Vec<u8>, relocs: Vec<Reloc> },
+    Bytes { bytes: Vec<u8>, relocs: Relocs },
     Zeroed { size: u64 },
 }
 
@@ -190,21 +209,12 @@ pub struct Data {
     pub id: ContentId,
     pub align: u32,
     pub bytes: Vec<u8>,
-    pub relocs: Vec<Reloc>,
-}
-
-/// A place in code or data the linker fills with an address.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct Reloc {
-    /// From the start of the code or data it is in.
-    pub at: u32,
-    pub kind: RelocKind,
-    pub target: Target,
-    pub addend: i64,
+    pub relocs: Relocs,
 }
 
 /// How the address is written, as the object formats name them.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
 pub enum RelocKind {
     /// The absolute address, 64 bits.
     Abs64,
@@ -260,7 +270,7 @@ pub enum RelocKind {
 }
 
 /// What a relocation points at.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Target {
     /// Another compiled function, called through its jump-table slot so that a patch of it
     /// changes one slot.

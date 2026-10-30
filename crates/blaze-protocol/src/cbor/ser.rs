@@ -17,6 +17,7 @@ use super::{
 
 /// The deterministic encoding of `value`.
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
+    // alloc: the encoding is handed out; `Writer::append` writes into a buffer kept by the caller.
     let mut out = Vec::new();
     Writer::new().append(&mut out, value)?;
     Ok(out)
@@ -74,7 +75,7 @@ impl Writer {
         let written = value.serialize(Encoder { out: &mut *out, scratch: &mut self.scratch });
         self.scratch.spans.clear();
         if self.scratch.bytes.capacity() > KEPT_SCRATCH {
-            self.scratch.bytes = Vec::new();
+            drop(std::mem::take(&mut self.scratch.bytes));
         }
         if written.is_err() {
             out.truncate(start);

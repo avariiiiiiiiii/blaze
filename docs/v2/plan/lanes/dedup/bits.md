@@ -43,7 +43,10 @@ bytes inline by assertion, `ParamsInRepr` 16, `LintSet` 40). So the set is one g
   operations for sets made at compile time), `BitSlice`/`BitSliceMut` (views: a matrix row, a
   mapped column).
 - **`BitMatrix`**: rows of one width in one buffer, a row a multiply away; `union_rows`
-  splits the buffer once so a row is read and written in one loop.
+  splits the buffer once so a row is read and written in one loop. Its buffer is a storage
+  parameter after the index (`BitMatrix<I, S = Vec<u64>>`, index first because an owned
+  matrix of a caller's index is what nearly every caller names), so borrowck's matrices live
+  in a frame's words (`BitMatrix<I, &'f mut [u64]>`, `from_words`) with no global allocation.
 - **`Ranked`**: a fixed set with a `u32` count of members before each word, so a member's
   rank (its place in a column of the members' values) is one popcount: rank9's idea with a
   word-granular count, 1.5 bits a bit. `ranks_of`/`rank_in` do the same for columns held

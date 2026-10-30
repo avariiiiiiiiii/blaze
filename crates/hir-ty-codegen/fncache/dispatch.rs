@@ -124,7 +124,7 @@ pub(super) fn loaded_from(
     db: &Db,
     body: &MirBody<'_>,
     operand: &Operand,
-    is_cache: &dyn Fn(StaticId) -> bool,
+    is_cache: &impl Fn(StaticId) -> bool,
 ) -> bool {
     let Some(local) = whole_local(operand) else { return false };
     let mut seen = FxHashSet::default();
@@ -135,7 +135,7 @@ fn loaded(
     db: &Db,
     body: &MirBody<'_>,
     local: LocalId,
-    is_cache: &dyn Fn(StaticId) -> bool,
+    is_cache: &impl Fn(StaticId) -> bool,
     seen: &mut FxHashSet<LocalId>,
 ) -> bool {
     if !seen.insert(local) {

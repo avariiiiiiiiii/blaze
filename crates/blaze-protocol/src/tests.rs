@@ -450,6 +450,43 @@ fn frames_carry_one_item_each() {
     assert!(refused.to_string().contains("more bytes than it needs"), "{refused}");
 }
 
+/// `send` and `receive` keep their frame and encoder on the thread: warm, they allocate
+/// nothing for a value that owns nothing, and give the bytes a fresh buffer would. A frame past
+/// what is kept is sent and read whole.
+#[test]
+fn a_warm_send_and_receive_allocate_nothing() {
+    let message = Message::new(9, 1_250_000_000u64);
+    let mut stream = Vec::with_capacity(4096);
+    send(&mut stream, &message).unwrap();
+    let mut fresh = Vec::new();
+    crate::append_frame(&mut crate::cbor::Writer::new(), &mut fresh, &message).unwrap();
+    assert_eq!(stream, fresh);
+    blaze_alloc_count::assert_at_most(0, "a warm send", || {
+        for _ in 0..15 {
+            send(&mut stream, &message).unwrap();
+        }
+    });
+    assert_eq!(stream, fresh.repeat(16));
+    let mut from = stream.as_slice();
+    assert_eq!(receive::<Message<u64>>(&mut from).unwrap(), Some(message.clone()));
+    let read = blaze_alloc_count::assert_at_most(0, "a warm receive", || {
+        let mut read = 0;
+        while let Some(back) = receive::<Message<u64>>(&mut from).unwrap() {
+            assert_eq!(back, message);
+            read += 1;
+        }
+        read
+    });
+    assert_eq!(read, 15);
+    let big = vec![7u8; 2 << 20];
+    let mut sent = Vec::new();
+    send(&mut sent, &serde_bytes(&big)).unwrap();
+    send(&mut sent, &message).unwrap();
+    let mut from = sent.as_slice();
+    assert_eq!(receive::<crate::bytes::Buf>(&mut from).unwrap().map(|it| it.0), Some(big));
+    assert_eq!(receive::<Message<u64>>(&mut from).unwrap(), Some(message));
+}
+
 /// A record of the functions a build put in its program takes their names and some 100 bytes
 /// more for each (the names of the fields among them): a cold build of anim says some 80 000.
 #[test]
@@ -668,6 +705,39 @@ fn a_malformed_record_of_nodes_is_refused() {
         assert!(why.contains(what), "{why}, not {what}");
         assert!(why.starts_with("a record of nodes is malformed: "), "{why}");
         assert!(order.places().is_empty(), "{why}");
+    }
+}
+
+/// A cycle of more nodes than are shown names the first eight and counts the rest, as the
+/// message built from a list of the stuck ones did.
+#[test]
+fn a_long_cycle_names_eight_nodes() {
+    use crate::events::{NodeKind, Order};
+    let deps: Vec<[u32; 1]> = (0..11).map(|at| [(at + 1) % 11]).collect();
+    let nodes: Vec<(NodeKind, &str, &[u32])> =
+        deps.iter().map(|dep| (NodeKind::Codegen, "n", &dep[..])).collect();
+    let why = nodes_record(0, &nodes).nodes(&mut Order::default()).unwrap().unwrap_err().0;
+    assert_eq!(why, "nodes 0, 1, 2, 3, 4, 5, 6, 7 and 3 more wait for each other");
+}
+
+/// `Cause::shown` writes what `Cause::short` says, each the words they said before.
+#[test]
+fn a_cause_is_said_in_a_few_words() {
+    use crate::events::Cause;
+    let name = || "serde".to_owned();
+    let cases = [
+        (Cause::Cold, "not kept"),
+        (Cause::Edited { file: "src/lib.rs".into() }, "src/lib.rs edited"),
+        (Cause::Body, "body edited"),
+        (Cause::Signature, "signature changed"),
+        (Cause::Callee { name: name() }, "calls serde"),
+        (Cause::Uses, "uses what changed"),
+        (Cause::Dependency { name: name() }, "serde changed"),
+        (Cause::Flags { what: "RUSTFLAGS".to_owned() }, "RUSTFLAGS changed"),
+    ];
+    for (cause, said) in cases {
+        assert_eq!(cause.short(), said);
+        assert_eq!(format!("({})", cause.shown()), format!("({said})"));
     }
 }
 

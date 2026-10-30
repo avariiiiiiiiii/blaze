@@ -24,27 +24,19 @@ use syntax::{AstNode as _, SyntaxKind, SyntaxNodePtr, TextRange, ast};
 use crate::{
     cx::signature_range,
     lints::bodies::{
-        BodyCx, Hooks, LatePass,
+        BodyCx, Hooks, LatePass, LintSet, lint_set,
         types::util::{self, fn_item, from_expansion, method_fn},
     },
     lower::{Found, Phase, break_outside_of_loop::ancestors},
     model::{Applicability, Diag, Span},
 };
 
-pub(super) fn pass() -> Box<dyn LatePass> {
-    Box::new(MapUnitFn)
-}
-
-struct MapUnitFn;
+#[derive(Default)]
+pub(crate) struct MapUnitFn;
 
 impl LatePass for MapUnitFn {
-    fn name(&self) -> &'static str {
-        "MapUnitFn"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::STMT
-    }
+    const LINTS: LintSet = lint_set(["map_unit_fn"]);
+    const HOOKS: Hooks = Hooks::STMT;
 
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         if let Some(found) = map_unit_fn(b, block, index) {
@@ -57,7 +49,9 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
     let Expr::Block { statements, .. } = b.store().expr(block) else { return None };
     let Statement::Expr { expr, has_semi: true } = statements.get(index)? else { return None };
     let Expr::MethodCall { receiver, method_name, args: &[arg], .. } = b.store().expr(expr) else { return None };
-    if method_name.as_str() != "map" {
+    if method_name.as_str() != "map"
+        || !method_fn(b, expr).and_then(|it| fn_item(b.db(), it)).is_some_and(|it| it.as_str() == "IteratorMap")
+    {
         return None;
     }
     let node = util::syntax(b, expr)?;
@@ -66,7 +60,6 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
         || from_expansion(&b.expr_span(receiver)?)
         || from_expansion(&b.expr_span(arg)?)
         || !is_impl_slice(b, receiver)
-        || !method_fn(b, expr).and_then(|it| fn_item(b.db(), it)).is_some_and(|it| it.as_str() == "IteratorMap")
     {
         return None;
     }

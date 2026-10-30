@@ -211,7 +211,7 @@ pub(crate) fn owners(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Owner> {
     let mut owners: Vec<Owner> = Vec::new();
     let mut index: FxHashMap<InFile<SyntaxNodePtr>, usize> = FxHashMap::default();
     for tree in &walk.trees {
-        for node in &tree.nodes {
+        for node in tree.of_kind(ast::AnyHasAttrs::can_cast) {
             let Some(has_attrs) = ast::AnyHasAttrs::cast(node.clone()) else { continue };
             if node.kind() == SyntaxKind::SOURCE_FILE
                 && tree.in_file()

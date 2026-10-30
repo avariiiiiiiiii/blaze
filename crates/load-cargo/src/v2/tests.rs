@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use base_db::{Crate, SourceRoot, SourceRootId, TargetKind, VfsPath};
+use base_db::{Crate, CrateType, SourceRoot, SourceRootId, TargetKind, VfsPath};
 use blaze_ids::ContentId;
 use blaze_query::MemTree;
 use blaze_units::{
@@ -326,6 +326,13 @@ fn editions_kinds_and_origins_are_cargos() {
     assert_eq!(data(BIN).target_kind, TargetKind::Bin);
     assert_eq!(data(BUILD_SCRIPT).target_kind, TargetKind::BuildScript);
     assert!(data(MACRO).target_kind.is_proc_macro());
+    let types = |unit| data(unit).crate_types.iter().collect::<Vec<_>>();
+    assert_eq!(types(LIB), [CrateType::Lib]);
+    assert_eq!(types(MACRO), [CrateType::ProcMacro]);
+    assert_eq!(types(BIN), [CrateType::Bin]);
+    assert_eq!(types(BUILD_SCRIPT), [CrateType::Bin]);
+    // rustc builds a `--test` crate as an executable, whatever its target's types.
+    assert_eq!(types(LIB_TEST), [CrateType::Bin]);
     assert!(data(CORE).origin.is_lang());
     assert!(data(LIB).origin.is_local());
     // A member's proc macros run in the workspace's root.
@@ -334,6 +341,15 @@ fn editions_kinds_and_origins_are_cargos() {
     assert_eq!(extra.version.as_deref(), Some("0.1.0"));
     assert_eq!(extra.display_name.as_ref().map(|it| it.canonical_name().as_str().to_owned()).as_deref(), Some("b"));
     assert_eq!(krate(&built, LIB).workspace_data(&db).const_eval.steps, 5000);
+}
+
+#[test]
+fn a_crate_type_rustc_does_not_name_is_an_error_naming_the_unit() {
+    let mut units = units();
+    units.graph.units[LIB].target.crate_types = vec!["rlib".to_owned(), "shared".to_owned()];
+    let Err(error) = lowered(&units) else { panic!("a crate type no rustc names was lowered") };
+    assert!(error.what.contains("the crate type `shared`"), "{}", error.what);
+    assert!(error.what.contains("`a` (lib"), "{}", error.what);
 }
 
 #[test]

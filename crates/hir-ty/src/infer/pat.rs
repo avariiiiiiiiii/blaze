@@ -846,19 +846,19 @@ impl<'db> InferenceContext<'db> {
         if let (Some((true, ..)), _) | (_, Some((true, ..))) = (lhs, rhs) {
             // There exists a side that didn't meet our criteria that the end-point
             // be of a numeric or char type, as checked in `calc_side` above.
-            self.push_diagnostic(InferenceDiagnostic::InvalidRangePatType { pat });
+            self.push_invalid_range_pat_type(pat, lhs, rhs);
             return self.types.types.error;
         }
 
         // Unify each side with `expected`.
         // Subtyping doesn't matter here, as the value is some kind of scalar.
-        let mut demand_eqtype = |x: &mut _| {
-            if let Some((_, x_ty, x_expr)) = *x {
-                _ = self.demand_eqtype(ExprOrPatIdPacked::from(x_expr), expected, x_ty);
+        for side in [&mut lhs, &mut rhs] {
+            if let Some((fail, x_ty, x_expr)) = side
+                && self.demand_eqtype(ExprOrPatIdPacked::from(*x_expr), expected, *x_ty).is_err()
+            {
+                *fail = true;
             }
-        };
-        demand_eqtype(&mut lhs);
-        demand_eqtype(&mut rhs);
+        }
 
         if let (Some((true, ..)), _) | (_, Some((true, ..))) = (lhs, rhs) {
             return self.types.types.error;
@@ -873,10 +873,30 @@ impl<'db> InferenceContext<'db> {
             expected,
         );
         if !(ty.is_numeric() || ty.is_char() || ty.references_error()) {
-            // FIXME: Emit an error.
+            for (fail, ..) in [&mut lhs, &mut rhs].into_iter().flatten() {
+                *fail = true;
+            }
+            self.push_invalid_range_pat_type(pat, lhs, rhs);
             return self.types.types.error;
         }
         ty
+    }
+
+    /// rustc's `emit_err_pat_range`, E0029, which says nothing when an end's type has an error.
+    fn push_invalid_range_pat_type(
+        &mut self,
+        pat: PatId,
+        lhs: Option<(bool, Ty<'db>, ExprId)>,
+        rhs: Option<(bool, Ty<'db>, ExprId)>,
+    ) {
+        if [lhs, rhs].iter().flatten().any(|(_, ty, _)| ty.references_error()) {
+            return;
+        }
+        let end = |side: Option<(bool, Ty<'db>, ExprId)>| {
+            side.map(|(fail, ty, _)| (self.type_at_error(ty), fail))
+        };
+        let (lhs, rhs) = (end(lhs), end(rhs));
+        self.push_diagnostic(InferenceDiagnostic::InvalidRangePatType { pat, lhs, rhs });
     }
 
     fn infer_bind_pat(
@@ -1089,16 +1109,14 @@ impl<'db> InferenceContext<'db> {
                 pat,
                 expected: variant_fields.len(),
                 found: subpats.len(),
+                variant,
+                had_err: had_err.is_err(),
             });
 
-            for (i, &pat) in subpats.iter().enumerate() {
-                let field_id = LocalFieldId::from_raw(la_arena::RawIdx::from_u32(i as u32));
-                let expected = match variant_field_tys.get(field_id) {
-                    Some(field_ty) => field_ty.ty().instantiate(interner, args).skip_norm_wip(),
-                    None => self.types.types.error,
-                };
-                self.infer_pat(pat, expected, pat_info);
+            for &pat in subpats {
+                self.infer_pat(pat, self.types.types.error, pat_info);
             }
+            return self.types.types.error;
         }
         pat_ty
     }
@@ -1226,6 +1244,22 @@ impl<'db> InferenceContext<'db> {
             .filter(|(_, field)| !used_fields.contains_key(&field.name))
             .collect::<Vec<_>>();
 
+        // Require `..` if struct has non_exhaustive attribute.
+        let non_exhaustive = self.has_applicable_non_exhaustive(variant.into());
+        if non_exhaustive && !has_rest_pat {
+            self.push_diagnostic(InferenceDiagnostic::NonExhaustiveRecordPat { pat, variant });
+        }
+
+        // rustc emits a union's errors as it finds them and E0026 after them, then E0027.
+        if matches!(variant, VariantId::UnionId(_)) {
+            if fields.len() != 1 {
+                self.push_diagnostic(InferenceDiagnostic::UnionPatMustHaveExactlyOneField { pat });
+            }
+            if has_rest_pat {
+                self.push_diagnostic(InferenceDiagnostic::UnionPatHasRest { pat });
+            }
+        }
+
         for inexistent_field in inexistent_fields {
             self.push_diagnostic(InferenceDiagnostic::NoSuchField {
                 field: inexistent_field.pat.into(),
@@ -1234,21 +1268,11 @@ impl<'db> InferenceContext<'db> {
             });
         }
 
-        // Require `..` if struct has non_exhaustive attribute.
-        let non_exhaustive = self.has_applicable_non_exhaustive(variant.into());
-        if non_exhaustive && !has_rest_pat {
-            self.push_diagnostic(InferenceDiagnostic::NonExhaustiveRecordPat { pat, variant });
-        }
-
         // Report an error if an incorrect number of fields was specified.
-        if matches!(variant, VariantId::UnionId(_)) {
-            if fields.len() != 1 {
-                self.push_diagnostic(InferenceDiagnostic::UnionPatMustHaveExactlyOneField { pat });
-            }
-            if has_rest_pat {
-                self.push_diagnostic(InferenceDiagnostic::UnionPatHasRest { pat });
-            }
-        } else if !unmentioned_fields.is_empty() && !has_rest_pat {
+        if !matches!(variant, VariantId::UnionId(_))
+            && !unmentioned_fields.is_empty()
+            && !has_rest_pat
+        {
             self.push_diagnostic(InferenceDiagnostic::RecordMissingFields {
                 record: ExprOrPatId::PatId(pat),
                 variant,

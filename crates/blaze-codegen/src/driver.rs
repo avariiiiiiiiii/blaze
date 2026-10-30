@@ -24,6 +24,7 @@ use std::{
 use blaze_cas::{Key, Kind};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
+use blaze_mem::{Tag, frame};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -42,19 +43,21 @@ use crate::{
     query::keys,
     settings::Spec,
     summary::{Imports, Summary},
-    template::{StaticTemplate, Template},
+    template::{StaticTemplate, Template, TemplateError},
 };
 
 /// The store as a build reads it.
 pub trait Lookup {
-    /// The verified bytes under `key`; `Err` names why what is there can't be read.
-    fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, String>;
+    /// The verified bytes under `key`, borrowed from the store, read in place; `Err` names
+    /// why what is there can't be read.
+    fn read(&self, key: &Key) -> Result<Option<&[u8]>, String>;
 }
 
 impl Lookup for blaze_cas::Store {
-    fn get(&self, key: &Key) -> Result<Option<Vec<u8>>, String> {
+    fn read(&self, key: &Key) -> Result<Option<&[u8]>, String> {
         match blaze_cas::Store::get(self, key) {
-            Ok(entry) => Ok(entry.map(|it| it.bytes.to_vec())),
+            Ok(entry) => Ok(entry.map(|it| it.bytes)),
+            // alloc: an error
             Err(corrupt) => Err(corrupt.to_string()),
         }
     }
@@ -175,6 +178,7 @@ struct Sorted<K, V> {
 
 impl<K, V> Default for Sorted<K, V> {
     fn default() -> Self {
+        // alloc: none, the lists are empty
         Sorted { keys: Vec::new(), values: Vec::new(), at: FxHashMap::default() }
     }
 }
@@ -183,8 +187,10 @@ impl<K: Copy + Ord + Hash, V> Sorted<K, V> {
     /// The entries of `map` by key. Each value moves twice whatever its size: only the
     /// permutation is sorted.
     fn of(map: FxHashMap<K, V>) -> Self {
+        // alloc: per build, sized by its units
         let mut entries: Vec<Option<(K, V)>> = map.into_iter().map(Some).collect();
         assert!(entries.len() <= u32::MAX as usize, "more than 2^32 nodes");
+        // alloc: per build, sized by its units
         let mut order: Vec<u32> = (0..entries.len() as u32).collect();
         // Keys are unique: an unstable sort is the order.
         order.sort_unstable_by_key(|&at| entries[at as usize].as_ref().expect("not taken yet").0);
@@ -250,7 +256,11 @@ fn unkept_inline<B: Prepare>(
     function: &CompiledFunction,
     keys: impl IntoIterator<Item = InstanceKey>,
 ) -> Option<blaze_items::CodeHash> {
+    if function.inlined.is_empty() {
+        return None;
+    }
     let kept: HashSet<blaze_items::CodeHash> =
+        // alloc: per compile that builds code in, sized by what it builds in
         keys.into_iter().filter_map(|it| nodes.get(&it)).map(|it| it.unit.instance.code).collect();
     function.inlined.iter().find(|it| !kept.contains(*it)).copied()
 }
@@ -292,10 +302,10 @@ impl Out {
         self.put(key, Kind::Code, blob::encode(template));
     }
 
-    /// A compile's side table under its content ID.
-    fn side(&mut self, unit: &Unit, emitted: &Emitted) {
-        match (&emitted.side, emitted.function.side) {
-            (Some(bytes), Some(id)) => self.put(keys::side(&id), Kind::Debug, bytes.clone()),
+    /// A compile's side table under its content ID: its bytes move to the put.
+    fn side(&mut self, unit: &Unit, emitted: &mut Emitted) {
+        match (emitted.side.take(), emitted.function.side) {
+            (Some(bytes), Some(id)) => self.put(keys::side(&id), Kind::Debug, bytes),
             (None, None) => {}
             _ => self.errors.push(error(
                 unit.instance.key(),
@@ -305,24 +315,26 @@ impl Out {
         }
     }
 
-    /// Reads one value, or records why it can't.
+    /// Reads one value in place, or records why it can't.
     fn read<T>(
         &mut self,
-        store: &dyn Lookup,
+        store: &impl Lookup,
         key: &Key,
         unit: &Unit,
         decode: impl FnOnce(&[u8]) -> Result<T, String>,
     ) -> Read<T> {
-        match store.get(key) {
-            Ok(Some(bytes)) => match decode(&bytes) {
+        match store.read(key) {
+            Ok(Some(bytes)) => match decode(bytes) {
                 Ok(it) => Read::Hit(it),
                 Err(why) => {
+                    // alloc: an error
                     self.errors.push(error(unit.instance.key(), unit.item, format!("the store's {key:?}: {why}")));
                     Read::Failed
                 }
             },
             Ok(None) => Read::Miss,
             Err(why) => {
+                // alloc: an error
                 self.errors.push(error(unit.instance.key(), unit.item, format!("reading the store's {key:?}: {why}")));
                 Read::Failed
             }
@@ -331,18 +343,27 @@ impl Out {
 
     /// The function of `template` for `key` with `refs`, into the build's functions.
     fn instantiate(&mut self, unit: &Unit, key: InstanceKey, template: &Template, refs: &[Target]) {
-        match template.instantiate(key, refs) {
+        self.made(unit, key, template.instantiate(key, refs));
+    }
+
+    /// A function made for `key`, into the build's functions, or why it could not be made.
+    fn made(&mut self, unit: &Unit, key: InstanceKey, made: Result<CompiledFunction, TemplateError>) {
+        match made {
             Ok(function) => self.functions.push(function),
+            // alloc: an error
             Err(why) => self.errors.push(error(key, unit.item, why.to_string())),
         }
     }
 
-    /// A compile's template against `refs`, or the error naming why it has none.
-    fn template_of(&mut self, unit: &Unit, emitted: &Emitted, refs: &[Target]) -> Option<Template> {
-        match Template::of(&emitted.function, refs, &emitted.extra) {
+    /// A compile's template against `refs`, taking the compile's function over, or the error
+    /// naming why it has none.
+    fn template_of(&mut self, unit: &Unit, emitted: Emitted, refs: &[Target]) -> Option<Template> {
+        let key = emitted.function.key;
+        match Template::of_owned(emitted.function, refs, &emitted.extra) {
             Ok(it) => Some(it),
             Err(why) => {
-                self.errors.push(error(emitted.function.key, unit.item, why.to_string()));
+                // alloc: an error
+                self.errors.push(error(key, unit.item, why.to_string()));
                 None
             }
         }
@@ -355,6 +376,21 @@ impl Out {
         self.errors.dedup();
         (self.functions, self.statics, self.puts, self.stats, self.errors)
     }
+}
+
+/// The function of instance `key` with `refs` in a stored template blob, read in place: its
+/// lists are decoded into a frame and each part copied once, into the function. The outer
+/// `Err` is bytes that are no template; the inner is the template's own.
+fn stored_function(
+    bytes: &[u8],
+    key: InstanceKey,
+    refs: &[Target],
+) -> Result<Result<CompiledFunction, TemplateError>, String> {
+    frame::task(Tag::Codegen, |frame| {
+        // alloc: an error
+        let view = blob::decode_view(bytes, frame).map_err(|e| e.to_string())?;
+        Ok(view.instantiate(key, refs))
+    })
 }
 
 /// One build's codegen.
@@ -392,6 +428,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 args: described.args,
                 settings: crate::Settings(self.policy.id()),
             };
+            // alloc: an error
             error(unit.key(), described.item, why.to_string())
         })?;
         let instance_of = Instance { code: described.code, args: described.args, settings: choice.first.settings() };
@@ -406,9 +443,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             spec: choice.first,
             then: choice.then,
             patchable: choice.patchable,
+            // clone: per build, the walk's handle of the instance
             instance: instance.clone(),
             described,
+            // alloc: none, empty until the walk resolves them
             refs: Vec::new(),
+            // alloc: none, empty until the walk resolves them
             built_in: Vec::new(),
         })
     }
@@ -419,8 +459,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         described: DescribedStatic<FrontInstance<B>, FrontStatic<B>>,
     ) -> Result<StaticNode<B>, CodegenError> {
         let choice = self.policy.choose(&described.origin, None).map_err(|why| {
+            // alloc: an error
             error(InstanceKey(described.value), described.item, why.to_string())
         })?;
+        // clone: per build, the walk's handle of the static; its places are empty until resolved
         Ok(StaticNode { value: value.clone(), described, spec: choice.first, refs: Vec::new() })
     }
 
@@ -437,7 +479,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut queued: HashSet<(FrontInstance<B>, Origin)> = HashSet::new();
         let mut static_queued: HashSet<FrontStatic<B>> = HashSet::new();
         let mut level: Vec<(FrontInstance<B>, Origin)> =
+            // clone: per build, the walk's handles of its roots
             roots.iter().filter(|it| queued.insert((*it).clone())).cloned().collect();
+        // alloc: per build, sized by its units
         let mut static_level: Vec<FrontStatic<B>> = Vec::new();
         let enqueue = |refs: &[FrontRef<FrontInstance<B>, FrontStatic<B>>],
                        requester: &Origin,
@@ -448,13 +492,17 @@ impl<'a, B: Prepare> Build<'a, B> {
             for it in refs {
                 match it {
                     FrontRef::Function(callee) => {
+                        // clone: per build, the walk's handle of a callee and who asks for it
                         let asked = (callee.clone(), requester.clone());
+                        // clone: per build, the walk's handle of a callee and who asks for it
                         if queued.insert(asked.clone()) {
                             next.push(asked);
                         }
                     }
                     FrontRef::Static(value) => {
+                        // clone: per build, the walk's handle of a static
                         if static_queued.insert(value.clone()) {
+                            // clone: per build, the walk's handle of a static
                             next_statics.push(value.clone());
                         }
                     }
@@ -468,11 +516,14 @@ impl<'a, B: Prepare> Build<'a, B> {
                 .map(|(instance, requester)| {
                     self.frontend.describe(instance, requester).and_then(|it| self.node(instance, it))
                 })
+                // alloc: per build, sized by its units
                 .collect();
             let described_statics: Vec<_> = static_level
                 .par_iter()
                 .map(|value| self.frontend.describe_static(value).and_then(|it| self.static_node(value, it)))
+                // alloc: per build, sized by its units
                 .collect();
+            // alloc: per build, sized by its units
             let (mut next, mut next_statics) = (Vec::new(), Vec::new());
             for (asked_for, node) in std::mem::take(&mut level).into_iter().zip(described) {
                 let node = match node {
@@ -484,6 +535,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 };
                 let key = node.unit.instance.key();
                 asked.insert(asked_for, key);
+                // clone: per build, the requester of what it refers to
                 let origin = node.described.origin.clone();
                 enqueue(&node.described.refs, &origin, &mut queued, &mut static_queued, &mut next, &mut next_statics);
                 nodes.entry(key).or_insert(node);
@@ -498,6 +550,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 };
                 let id = (node.described.item, node.described.instance);
                 static_asked.insert(value, id);
+                // clone: per build, the requester of what it refers to
                 let origin = node.described.origin.clone();
                 enqueue(&node.described.refs, &origin, &mut queued, &mut static_queued, &mut next, &mut next_statics);
                 statics.entry(id).or_insert(node);
@@ -508,11 +561,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         let (mut nodes, mut statics) = (Sorted::of(nodes), Sorted::of(statics));
 
         let through_slot: HashMap<InstanceKey, bool> =
+            // alloc: per build, sized by its units
             nodes.iter().map(|(key, node)| (*key, node.patchable || node.then.is_some())).collect();
         let resolve = |refs: &[FrontRef<FrontInstance<B>, FrontStatic<B>>], requester: &Origin| {
             refs.iter()
                 .map(|it| match it {
                     FrontRef::Function(callee) => {
+                        // clone: per build, the walk's key of a callee and who asks for it
                         let key = asked.get(&(callee.clone(), requester.clone()))?;
                         Some(match through_slot.get(key) {
                             Some(true) => Target::Function(*key),
@@ -523,9 +578,12 @@ impl<'a, B: Prepare> Build<'a, B> {
                         let (item, instance) = *static_asked.get(value)?;
                         Some(Target::Static { item, instance })
                     }
+                    // clone: per build, the instance's own target, kept by its node
                     FrontRef::Extern(name) => Some(Target::Extern(name.clone())),
+                    // clone: per build, the instance's own target, kept by its node
                     FrontRef::Weak(name) => Some(Target::Weak(name.clone())),
                 })
+                // alloc: per build, an instance's places, kept by its node
                 .collect::<Option<Vec<_>>>()
         };
         // An instance one of whose references failed has no places; that failure is already
@@ -548,18 +606,21 @@ impl<'a, B: Prepare> Build<'a, B> {
                     Some(it) if nodes.get(&it).is_some_and(|it| it.patchable) => errors.push(error(
                         *key,
                         node.unit.item,
+                        // alloc: an error
                         format!("builds in {it:?}, which is patchable: an edit patches it alone"),
                     )),
                     Some(it) => callees.push(it),
                     None => errors.push(error(
                         *key,
                         node.unit.item,
+                        // alloc: an error
                         format!("builds in place {at}, which is not a function among its {} references", node.refs.len()),
                     )),
                 }
             }
             direct.insert(*key, callees);
         }
+        // alloc: per build, reused across its units
         let (mut seen, mut queue) = (FxHashSet::default(), Vec::new());
         for (key, node) in nodes.iter_mut() {
             seen.clear();
@@ -569,12 +630,14 @@ impl<'a, B: Prepare> Build<'a, B> {
                     queue.extend(direct.get(&it).into_iter().flatten().copied());
                 }
             }
+            // alloc: per build, what a unit builds in, kept by its node
             node.built_in = seen.iter().copied().collect();
             node.built_in.sort_unstable();
         }
         for node in statics.values_mut() {
             node.refs = resolve(&node.described.refs, &node.described.origin).unwrap_or_default();
         }
+        // alloc: per build, sized by its roots
         let roots = roots.iter().filter_map(|it| asked.get(it).copied()).collect();
         (nodes, statics, roots)
     }
@@ -591,6 +654,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 let made = self.backend.prepare(self.frontend, &node.unit, &node.spec, &node.instance, &node.refs);
                 (*key, made)
             })
+            // alloc: per build, sized by its units
             .collect()
     }
 
@@ -598,7 +662,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     pub fn run(
         &mut self,
         roots: &[(FrontInstance<B>, Origin)],
-        store: &dyn Lookup,
+        store: &impl Lookup,
     ) -> Result<Built, Vec<CodegenError>> {
         let mut out = Out::default();
         let (nodes, statics, root_keys) = self.walk(roots, &mut out.errors);
@@ -607,13 +671,16 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         out.stats.instances = nodes.len();
         out.stats.statics = statics.len();
+        // alloc: per build, sized by its statics' references
         self.static_callees = statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
 
         self.dev(&nodes, store, &mut out);
         let release: Vec<Job<'_, B>> = nodes
             .iter()
-            .filter(|(_, node)| node.spec.backend != crate::Backend::Cranelift)
+            .filter(|(_, node)| !node.spec.backend.is_cranelift())
+            // clone: per build, a release job's unit (plain IDs)
             .map(|(key, node)| Job { name: *key, unit: node.unit.clone(), spec: &node.spec, node })
+            // alloc: per build, sized by its units
             .collect();
         self.release(&nodes, &release, store, &mut out);
         self.statics(&statics, store, &mut out);
@@ -625,16 +692,22 @@ impl<'a, B: Prepare> Build<'a, B> {
         let deduped = dedupe(&mut out.functions, &mergeable);
         out.statics.sort_by_key(|it| (it.item, it.instance));
 
+        // clone: per build, the symbols the build gives the linker
         let built_symbols = |node: &FnNode<B>| node.described.symbol.clone();
         let symbols = nodes
             .iter()
             .filter_map(|(key, node)| Some((*key, built_symbols(node)?)))
+            // alloc: per build, what it gives the linker
             .collect();
         let static_symbols = statics
             .iter()
+            // clone: per build, the symbols the build gives the linker
             .filter_map(|((item, instance), node)| Some((*item, *instance, node.described.symbol.clone()?)))
+            // alloc: per build, what it gives the linker
             .collect();
+        // alloc: per build, what it gives the linker
         let patchable = nodes.iter().filter(|it| it.1.patchable).map(|it| *it.0).collect();
+        // alloc: per build, what it gives the linker
         let tiered = nodes.iter().filter(|it| it.1.then.is_some()).map(|it| *it.0).collect();
         let (functions, compiled_statics, puts, stats, errors) = out.finish();
         self.nodes = nodes;
@@ -658,7 +731,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// A live build's tiered functions at their last tier (#807): LLVM's code for the slots
     /// the build filled with Cranelift's. Nothing patchable is imported, as an edit replaces
     /// it alone.
-    pub fn tier_up(&self, store: &dyn Lookup) -> Result<TieredUp, Vec<CodegenError>> {
+    pub fn tier_up(&self, store: &impl Lookup) -> Result<TieredUp, Vec<CodegenError>> {
         let mut out = Out::default();
         let jobs: Vec<Job<'_, B>> = self
             .nodes
@@ -666,11 +739,14 @@ impl<'a, B: Prepare> Build<'a, B> {
             .filter_map(|(key, node)| {
                 let spec = node.then.as_ref()?;
                 let instance = Instance { settings: spec.settings(), ..node.unit.instance };
+                // clone: per tier-up, a job's unit (plain IDs)
                 let unit = Unit { instance, backend: spec.backend, ..node.unit.clone() };
                 Some(Job { name: *key, unit, spec, node })
             })
+            // alloc: per tier-up, sized by its units
             .collect();
         let names: Vec<(InstanceKey, InstanceKey)> =
+            // alloc: per tier-up, sized by its units
             jobs.iter().map(|job| (job.name, job.unit.instance.key())).collect();
         self.release(&self.nodes, &jobs, store, &mut out);
         let (functions, _, puts, stats, errors) = out.finish();
@@ -678,28 +754,34 @@ impl<'a, B: Prepare> Build<'a, B> {
             return Err(errors);
         }
         let mut by_key: HashMap<InstanceKey, CompiledFunction> =
+            // alloc: per tier-up, sized by its units
             functions.into_iter().map(|it| (it.key, it)).collect();
         let replaced = names
             .into_iter()
             .filter_map(|(name, key)| Some((name, by_key.remove(&key)?)))
+            // alloc: per tier-up, sized by its units
             .collect();
         Ok(TieredUp { replaced, puts, stats })
     }
 
-    fn dev(&self, nodes: &Sorted<InstanceKey, FnNode<B>>, store: &dyn Lookup, out: &mut Out) {
+    fn dev(&self, nodes: &Sorted<InstanceKey, FnNode<B>>, store: &impl Lookup, out: &mut Out) {
         let dev: Vec<InstanceKey> = nodes
             .iter()
-            .filter(|(_, node)| node.spec.backend == crate::Backend::Cranelift)
+            .filter(|(_, node)| node.spec.backend.is_cranelift())
             .map(|(key, _)| *key)
+            // alloc: per build, sized by its units
             .collect();
         let mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)> = HashMap::new();
 
         // Folding: every candidate's masked shape, from the store or from its IR.
         // Each dev key at most once, from the store or from its IR; sorted by key below.
+        // alloc: per build, sized by its units
         let mut masked: Vec<(InstanceKey, Option<Masked>)> = Vec::new();
+        // alloc: per build, sized by its units
         let mut unmasked = Vec::new();
         for key in dev.iter().filter(|key| nodes[*key].spec.fold) {
             let unit = &nodes[key].unit;
+            // alloc: an error
             let read = out.read(store, &keys::masked(&nodes[key].stored()), unit, |it| blob::decode_masked(it).map_err(|e| e.to_string()));
             match read {
                 Read::Hit(it) => {
@@ -721,6 +803,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         }
         masked.sort_unstable_by_key(|it| it.0);
+        // alloc: per build, sized by its units
         let mut candidates = Vec::new();
         for (key, it) in &masked {
             let (node, Some(it)) = (&nodes[key], it) else { continue };
@@ -733,24 +816,29 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Some(at) => out.errors.push(error(
                     *key,
                     node.unit.item,
+                    // alloc: an error
                     format!("its masked IR names place {at} of its {places} references"),
                 )),
                 None => candidates.push((*key, node.unit.instance.settings, it, node.refs.as_slice())),
             }
         }
         let groups = fold::groups(&candidates, &fold::Limits::default());
+        // alloc: per build, sized by its units
         let grouped: HashSet<InstanceKey> = groups.iter().flat_map(|it| it.members.iter().copied()).collect();
 
         // Every other dev unit: its template from the store, the memo, or a compile.
+        // alloc: per build, sized by its units
         let mut missing = Vec::new();
         for key in dev.iter().filter(|key| !grouped.contains(*key)) {
             let node = &nodes[key];
-            let read = out.read(store, &keys::template(&node.stored()), &node.unit, |it| blob::decode(it).map_err(|e| e.to_string()));
+            let read = out.read(store, &keys::template(&node.stored()), &node.unit, |it| {
+                stored_function(it, *key, &node.refs)
+            });
             match read {
-                Read::Hit(template) => {
+                Read::Hit(made) => {
                     out.stats.stored += 1;
                     prepared.remove(key);
-                    out.instantiate(&node.unit, *key, &template, &node.refs);
+                    out.made(&node.unit, *key, made);
                 }
                 Read::Miss => missing.push(*key),
                 Read::Failed => {
@@ -758,6 +846,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             }
         }
+        // alloc: per build, sized by its units
         let unprepared: Vec<InstanceKey> = missing.iter().filter(|it| !prepared.contains_key(*it)).copied().collect();
         for (key, made) in self.prepare_all(nodes, &unprepared) {
             match made {
@@ -768,13 +857,15 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         }
         // One compile per shape: the first of a shape compiles, the rest wait for its template.
+        // alloc: per build, sized by its units
         let mut to_emit = Vec::new();
         let mut first_of: HashMap<ContentId, InstanceKey> = HashMap::new();
+        // alloc: per build, sized by its units
         let mut waiting: Vec<(InstanceKey, ContentId)> = Vec::new();
         for key in missing {
             let Some((shape, made)) = prepared.remove(&key) else { continue };
             let node = &nodes[&key];
-            let shape = shape.key(&node.unit);
+            let shape = shape.key();
             match self.memo.get(&shape) {
                 Some(template) => {
                     out.stats.memo += 1;
@@ -794,12 +885,14 @@ impl<'a, B: Prepare> Build<'a, B> {
                 let node = &nodes[&key];
                 (key, shape, self.backend.emit(&node.unit, &node.spec, made, &node.refs, None))
             })
+            // alloc: per build, sized by its units
             .collect();
         for (key, shape, emitted) in emitted {
             let node = &nodes[&key];
-            let emitted = match emitted {
+            let mut emitted = match emitted {
                 Ok(it) if it.function.key == key => it,
                 Ok(it) => {
+                    // alloc: an error
                     out.errors.push(error(key, node.unit.item, format!("compiled as {:?}", it.function.key)));
                     continue;
                 }
@@ -809,12 +902,13 @@ impl<'a, B: Prepare> Build<'a, B> {
                 }
             };
             if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied()) {
+                // alloc: an error
                 out.errors.push(error(key, node.unit.item, format!("built in {it:?}, which its key does not hold")));
                 continue;
             }
             out.stats.compiled += 1;
-            out.side(&node.unit, &emitted);
-            let Some(template) = out.template_of(&node.unit, &emitted, &node.refs) else { continue };
+            out.side(&node.unit, &mut emitted);
+            let Some(template) = out.template_of(&node.unit, emitted, &node.refs) else { continue };
             let kept = self.memo.put(shape, template);
             out.template(keys::template(&node.stored()), kept);
             out.instantiate(&node.unit, key, kept, &node.refs);
@@ -830,6 +924,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 None => out.errors.push(error(
                     key,
                     node.unit.item,
+                    // alloc: an error
                     format!("not compiled: the compile of its shape, by {:?}, failed", first_of[&shape]),
                 )),
             }
@@ -844,14 +939,16 @@ impl<'a, B: Prepare> Build<'a, B> {
         nodes: &Sorted<InstanceKey, FnNode<B>>,
         groups: &[Group],
         mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)>,
-        store: &dyn Lookup,
+        store: &impl Lookup,
         out: &mut Out,
     ) {
         let thunk_refs = |group: &Group, member: &InstanceKey| group.thunk_refs(&nodes[member].refs);
+        // alloc: per build, sized by its groups
         let mut merging = Vec::new();
         for group in groups {
             let key = group.key();
             let first = &nodes[&group.members[0]];
+            // alloc: an error
             let decode = |it: &[u8]| blob::decode(it).map_err(|e| e.to_string());
             let body = out.read(store, &keys::folded(&key), &first.unit, decode);
             let mut thunks = Vec::with_capacity(group.members.len());
@@ -881,6 +978,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             .flat_map(|group| group.members.iter())
             .filter(|it| !prepared.contains_key(*it))
             .copied()
+            // alloc: per build, sized by its groups
             .collect();
         for (key, made) in self.prepare_all(nodes, &unprepared) {
             match made {
@@ -890,6 +988,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 Err(why) => out.errors.push(why),
             }
         }
+        // alloc: per build, sized by its groups
         let mut jobs = Vec::new();
         for group in merging {
             let members: Option<Vec<_>> = group
@@ -900,6 +999,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     let (_, made) = prepared.remove(member)?;
                     Some((&node.unit, &node.spec, made, node.refs.as_slice()))
                 })
+                // alloc: per merge, the members the backend takes
                 .collect();
             // A member that failed to prepare is already an error of the build.
             if let Some(members) = members {
@@ -907,11 +1007,12 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         }
         let merged: Vec<_> =
+            // alloc: per build, sized by its groups
             jobs.into_par_iter().map(|(group, members)| (group, self.backend.merge(group, members))).collect();
         for (group, merged) in merged {
             let key = group.key();
             let first = &nodes[&group.members[0]];
-            let merged = match merged {
+            let mut merged = match merged {
                 Ok(it) => it,
                 Err(why) => {
                     out.errors.push(why);
@@ -924,18 +1025,18 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
             out.stats.compiled += 1 + merged.thunks.len();
             out.stats.folded += group.members.len();
-            out.side(&first.unit, &merged.body);
-            if let Some(body) = out.template_of(&first.unit, &merged.body, &first.refs) {
+            out.side(&first.unit, &mut merged.body);
+            if let Some(body) = out.template_of(&first.unit, merged.body, &first.refs) {
                 out.template(keys::folded(&key), &body);
                 out.instantiate(&first.unit, key, &body, &first.refs);
             }
-            for (member, thunk) in group.members.iter().zip(&merged.thunks) {
+            for (member, mut thunk) in group.members.iter().zip(merged.thunks) {
                 let node = &nodes[member];
                 if thunk.function.key != *member {
                     out.errors.push(error(*member, node.unit.item, "a thunk of another member"));
                     continue;
                 }
-                out.side(&node.unit, thunk);
+                out.side(&node.unit, &mut thunk);
                 let refs = thunk_refs(group, member);
                 if let Some(template) = out.template_of(&node.unit, thunk, &refs) {
                     out.template(keys::thunk(&key, member), &template);
@@ -949,12 +1050,13 @@ impl<'a, B: Prepare> Build<'a, B> {
         &self,
         nodes: &Sorted<InstanceKey, FnNode<B>>,
         jobs: &[Job<'_, B>],
-        store: &dyn Lookup,
+        store: &impl Lookup,
         out: &mut Out,
     ) {
         if jobs.is_empty() {
             return;
         }
+        // alloc: per build, sized by its units
         let by_name: HashMap<InstanceKey, &Job<'_, B>> = jobs.iter().map(|job| (job.name, job)).collect();
         let prepare = |names: &[InstanceKey]| -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
             names
@@ -964,6 +1066,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     let made = self.backend.prepare(self.frontend, &job.unit, job.spec, &job.node.instance, &job.node.refs);
                     (*name, made)
                 })
+                // alloc: per build, sized by its units
                 .collect()
         };
 
@@ -973,9 +1076,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             FxHashMap::with_capacity_and_hasher(jobs.len(), Default::default());
         let mut prepared: HashMap<InstanceKey, B::Prepared> = HashMap::new();
         let mut exports: HashMap<InstanceKey, B::Export> = HashMap::new();
+        // alloc: per build, sized by its units
         let mut unsummarized = Vec::new();
         for job in jobs {
             let read = out.read(store, &keys::summary(&job.stored()), &job.unit, |it| {
+                // alloc: an error
                 serde_json::from_slice::<Summary>(it).map_err(|e| e.to_string())
             });
             match read {
@@ -997,6 +1102,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     });
                     (name, summarized)
                 })
+                // alloc: per build, sized by its units
                 .collect::<Vec<_>>()
         };
         for (name, summarized) in summarize(prepare(&unsummarized)) {
@@ -1028,12 +1134,14 @@ impl<'a, B: Prepare> Build<'a, B> {
                     .flat_map(|(_, node)| node.refs.iter().filter_map(callee)),
             )
             .chain(self.static_callees.iter().copied())
+            // alloc: per build, sized by its units
             .collect();
         imports::close(&mut summaries, &outside);
         let decided = match imports::decide(&summaries, &imports::Limits::default()) {
             Ok(it) => it,
             Err(why) => {
                 let job = &jobs[0];
+                // alloc: an error
                 out.errors.push(error(job.name, job.unit.item, format!("deciding the imports: {why}")));
                 return;
             }
@@ -1048,18 +1156,20 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
 
         // Each compile by its blob key: stored, else compiled with its imports' exports.
+        // alloc: per build, sized by its units
         let mut missing = Vec::new();
         for job in jobs {
             let imports = imports_of(&job.name);
             let imported: Vec<&[Target]> =
+                // alloc: per release unit, sized by its imports
                 imports.imported.iter().map(|it| by_name[it].node.refs.as_slice()).collect();
             let refs = release_refs(&job.node.refs, &imported);
             let key = job.unit.instance.key();
             let blob_key = keys::release(&imports.blob_key(job.stored()));
-            match out.read(store, &blob_key, &job.unit, |it| blob::decode(it).map_err(|e| e.to_string())) {
-                Read::Hit(template) => {
+            match out.read(store, &blob_key, &job.unit, |it| stored_function(it, key, &refs)) {
+                Read::Hit(made) => {
                     out.stats.stored += 1;
-                    out.instantiate(&job.unit, key, &template, &refs);
+                    out.made(&job.unit, key, made);
                 }
                 Read::Miss => missing.push((job.name, imports, refs, blob_key)),
                 Read::Failed => {}
@@ -1070,6 +1180,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             .flat_map(|(name, imports, _, _)| std::iter::once(name).chain(&imports.imported))
             .filter(|it| !prepared.contains_key(*it) && !exports.contains_key(*it))
             .copied()
+            // alloc: per build, sized by its units
             .collect();
         needed.sort();
         needed.dedup();
@@ -1083,6 +1194,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         }
         let exports = &exports;
+        // alloc: per build, sized by its units
         let mut compiles = Vec::new();
         for (name, imports, refs, blob_key) in missing {
             if let Some(made) = prepared.remove(&name) {
@@ -1097,6 +1209,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     .imported
                     .iter()
                     .map(|it| Some(Import { key: *it, export: exports.get(it)?, refs: &by_name[it].node.refs }))
+                    // alloc: per release compile, sized by its imports
                     .collect();
                 let emitted = match list {
                     Some(list) => {
@@ -1106,13 +1219,15 @@ impl<'a, B: Prepare> Build<'a, B> {
                 };
                 (name, imports, refs, blob_key, emitted)
             })
+            // alloc: per build, sized by its units
             .collect();
         for (name, imports, refs, blob_key, emitted) in emitted {
             let job = by_name[&name];
             let key = job.unit.instance.key();
-            let emitted = match emitted {
+            let mut emitted = match emitted {
                 Ok(it) if it.function.key == key => it,
                 Ok(it) => {
+                    // alloc: an error
                     out.errors.push(error(key, job.unit.item, format!("compiled as {:?}", it.function.key)));
                     continue;
                 }
@@ -1123,15 +1238,15 @@ impl<'a, B: Prepare> Build<'a, B> {
             };
             out.stats.compiled += 1;
             out.stats.imported += imports.imported.len();
-            out.side(&job.unit, &emitted);
-            if let Some(template) = out.template_of(&job.unit, &emitted, &refs) {
+            out.side(&job.unit, &mut emitted);
+            if let Some(template) = out.template_of(&job.unit, emitted, &refs) {
                 out.template(blob_key, &template);
                 out.instantiate(&job.unit, key, &template, &refs);
             }
         }
     }
 
-    fn statics(&self, statics: &Sorted<StaticId, StaticNode<B>>, store: &dyn Lookup, out: &mut Out) {
+    fn statics(&self, statics: &Sorted<StaticId, StaticNode<B>>, store: &impl Lookup, out: &mut Out) {
         let unit_of = |node: &StaticNode<B>| Unit {
             instance: Instance {
                 code: blaze_items::CodeHash(node.described.value),
@@ -1142,15 +1257,18 @@ impl<'a, B: Prepare> Build<'a, B> {
             arch: self.policy.toolchain.arch,
             item: node.described.item,
         };
+        // alloc: per build, sized by its statics
         let mut missing = Vec::new();
         for (id, node) in statics.iter() {
             let key = keys::static_value(&definition(&node.described), &node.spec.settings());
             let unit = unit_of(node);
+            // alloc: an error
             match out.read(store, &key, &unit, |it| blob::decode_static(it).map_err(|e| e.to_string())) {
                 Read::Hit(template) => {
                     out.stats.stored += 1;
                     match template.instantiate(id.0, id.1, &node.refs) {
                         Ok(value) => out.statics.push(value),
+                        // alloc: an error
                         Err(why) => out.errors.push(error(unit.instance.key(), id.0, why.to_string())),
                     }
                 }
@@ -1164,6 +1282,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 let made = self.backend.compile_static(self.frontend, &node.spec, &node.value, &node.refs);
                 (id, node, key, made)
             })
+            // alloc: per build, sized by its statics
             .collect();
         for (id, node, key, made) in compiled {
             let unit = unit_of(node);
@@ -1196,6 +1315,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                     out.put(key, Kind::Code, blob::encode_static(&template));
                     out.statics.push(value);
                 }
+                // alloc: an error
                 Err(why) => out.errors.push(error(unit.instance.key(), id.0, why.to_string())),
             }
         }
@@ -1218,6 +1338,7 @@ fn definition<I, S>(described: &DescribedStatic<I, S>) -> ContentId {
 
 /// The memo shared by every build of a daemon.
 pub fn shared_memo() -> Arc<Memo> {
+    // alloc: once a daemon
     Arc::new(Memo::new())
 }
 

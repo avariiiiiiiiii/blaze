@@ -9,13 +9,13 @@ use std::{
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{FormatError, Persist, Record, SchemaHash, Slice, Writer};
-use blaze_ids::{ContentId, Fingerprint};
+use blaze_ids::{ContentId, Fingerprint, bits::BitSet};
 use blaze_image::{Builder, Cause, Corrupt, Image, Refused, SectionId};
 use blaze_vfs::{Bytes, Mode, View, ViewId};
 use intern::Live;
 
 use crate::{
-    Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, Marks, MemTree, Query,
+    Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, MemTree, Query,
     QueryKey, QueryKind, Stored, Tree,
     table::{Aligned, EdgeRecord},
 };
@@ -958,13 +958,39 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
 /// they list what was marked in order.
 #[test]
 fn marks_are_a_bit_a_memo() {
-    let mut marks = Marks::new(70);
-    assert!(marks.insert(3));
-    assert!(!marks.insert(3), "marked once");
-    assert!(marks.insert(64));
-    assert!(marks.insert(200), "past the end it was made for");
+    let mut marks = BitSet::<u32>::new(70);
+    assert!(marks.insert_growing(3));
+    assert!(!marks.insert_growing(3), "marked once");
+    assert!(marks.insert_growing(64));
+    assert!(marks.insert_growing(200), "past the end it was made for");
     assert!(marks.contains(64) && marks.contains(200) && !marks.contains(65) && !marks.contains(1000));
     assert_eq!(marks.iter().collect::<Vec<_>>(), [3, 64, 200]);
+}
+
+mod some_kinds {
+    crate::query_kinds! {
+        range: 0x7000..0x7004, owner: "the test";
+        FIRST = 0x7000, "first";
+        /// A method of a tracked `impl`.
+        METHOD = 0x7002, "Type::method";
+    }
+}
+
+/// `query_kinds!` names each kind both ways, and a number it doesn't give, or one outside its
+/// range, has no name.
+#[test]
+fn query_kinds_name_each_kind_both_ways() {
+    use some_kinds::*;
+    assert_eq!(RANGE, 0x7000..0x7004);
+    assert_eq!(ALL, &[(FIRST, "first"), (METHOD, "Type::method")]);
+    for &(kind, query) in ALL {
+        assert_eq!(name(kind), Some(query));
+        assert_eq!(of(query), Some(kind));
+    }
+    assert_eq!(name(QueryKind(0x7001)), None);
+    assert_eq!(name(QueryKind(0x7004)), None);
+    assert_eq!(name(QueryKind(0x6fff)), None);
+    assert_eq!(of("second"), None);
 }
 
 const BROKEN: Corrupt = Corrupt { section: SectionId::VFS_BLOBS, group: 7, cause: Cause::Crc { found: 1, wanted: 2 } };

@@ -1,15 +1,17 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use base_db::EditionedFileId;
 use blaze_ids::rng::SplitMix64;
+use syntax::{AstNode, ast::HasModuleItem};
 use test_fixture::WithFixture;
 
 use crate::{
     item_tree::{ItemTree, lower_whole, tests::assert_assembled_is_whole},
-    test_db::{TestDB, TestDBExt},
+    test_db::TestDB,
 };
 
 /// Real files with nested and outline modules, `use` trees, macros, `extern` blocks, `impl`s
@@ -50,7 +52,7 @@ fn db_of(text: &str) -> (TestDB, EditionedFileId) {
     (db, file)
 }
 
-fn assembled(db: &TestDB, file: EditionedFileId) -> ItemTree {
+fn assembled(db: &TestDB, file: EditionedFileId) -> Arc<ItemTree> {
     super::file_item_tree(db, file, db.test_crate())
 }
 
@@ -113,9 +115,9 @@ fn random_edits_assemble_to_a_fresh_whole_tree() {
             let (fresh, fresh_file) = db_of(&text);
             let edited = assembled(&db, file);
             let whole = lower_whole(&fresh, fresh_file.into(), fresh.test_crate());
-            assert_eq!(edited, whole, "{path} after replacing {range:?} with {insert:?}");
+            assert_eq!(*edited, whole, "{path} after replacing {range:?} with {insert:?}");
             assert_eq!(
-                blaze_format::to_bytes(&edited),
+                blaze_format::to_bytes(&*edited),
                 blaze_format::to_bytes(&whole),
                 "{path} after replacing {range:?} with {insert:?}"
             );
@@ -136,19 +138,22 @@ const C: u8 = { 1 + 1 };
 mod m { pub fn inner() {} }
 "#;
 
-/// How many items lowering the file's tree lowers once it holds `text`, its tree lowered
-/// before.
+/// How many top-level items making the file's tree lowers once it holds `text`, whole or
+/// alone. Before it, an edit that changes no item (a newline at the end) has the file lowered
+/// whole and keyed, as a file's first edit is, so what is counted is an edit of a keyed file.
 fn items_lowered_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize {
     let krate = db.test_crate();
-    crate::file_item_tree(&*db, file.into(), krate);
     let file_id = file.file_id(&*db);
+    crate::file_item_tree(&*db, file.into(), krate);
+    let before = file.parse(&*db).tree().syntax().text().to_string();
+    db.set_file_text(file_id, &format!("{before}\n"));
+    crate::file_item_tree(&*db, file.into(), krate);
     db.set_file_text(file_id, text);
-    let db = &*db;
-    let events = db.executed_in_read_order(|| {
-        crate::file_item_tree(db, file.into(), krate);
-    });
+    super::LOWERED.set(0);
+    crate::file_item_tree(&*db, file.into(), krate);
+    let lowered = super::LOWERED.get();
     assert_assembled_is_whole(db, file, text);
-    events.iter().filter(|it| it.contains("item_fragment")).count()
+    lowered
 }
 
 #[test]
@@ -169,6 +174,17 @@ fn an_edit_inside_bodies_lowers_no_item() {
     }
 }
 
+/// An edit that changes no item gives back the kept tree itself: salsa sees the same value.
+#[test]
+fn an_edit_inside_a_body_gives_the_kept_tree() {
+    let (mut db, file) = db_of(ITEMS);
+    let krate = db.test_crate();
+    items_lowered_by(&mut db, file, &ITEMS.replace("{ s.0 }", "{ s.0 + 1 }"));
+    let kept = super::file_item_tree(&db, file, krate);
+    let again = super::file_item_tree(&db, file, krate);
+    assert!(Arc::ptr_eq(&kept, &again));
+}
+
 #[test]
 fn an_edit_of_one_item_lowers_it_alone() {
     for (from, to) in [
@@ -186,8 +202,28 @@ fn an_edit_of_one_item_lowers_it_alone() {
     }
 }
 
-/// A tree asked again is a memo hit of its query and of each of its parts', none of which
-/// allocates.
+/// Removing an item lowers none, and an item moved by another's removal keeps its rows.
+#[test]
+fn removing_an_item_lowers_none() {
+    let (mut db, file) = db_of(ITEMS);
+    let edited = ITEMS.replace("pub struct S(pub u8);\n", "");
+    assert_eq!(items_lowered_by(&mut db, file, &edited), 0);
+}
+
+#[test]
+fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
+    let rules: String = (0..300).map(|i| format!("    (a{i}) => {{ {i} }};\n")).collect();
+    let text = format!("macro_rules! big {{\n{rules}}}\nfn f() {{}}\nstruct S;\n");
+    assert!(text.len() > 4096 + 32);
+    let (mut db, file) = db_of(&text);
+    crate::file_item_tree(&db, file.into(), db.test_crate());
+    assert_eq!(items_lowered_by(&mut db, file, &text.replace("struct S;", "struct T;")), 1);
+    let renamed = text.replace("struct S;", "struct T;").replace("(a7)", "(b7)");
+    assert_eq!(items_lowered_by(&mut db, file, &renamed), 1);
+}
+
+/// A tree asked again is a memo hit of its query, and a file whose items all kept their keys
+/// is its kept tree: neither allocates once the worker's scratch is grown.
 #[test]
 fn trees_asked_again_allocate_nothing() {
     let (db, file) = db_of(ITEMS);
@@ -196,12 +232,14 @@ fn trees_asked_again_allocate_nothing() {
     blaze_alloc_count::assert_at_most(0, "a memo hit of `file_item_tree`", || {
         std::hint::black_box(crate::file_item_tree(&db, file.into(), krate));
     });
-    blaze_alloc_count::assert_at_most(0, "memo hits of a file's parts", || {
-        std::hint::black_box(super::top_attrs(&db, file, krate));
-        for &item in super::item_sources(&db, file, krate) {
-            std::hint::black_box(super::item_fragment(&db, item));
-        }
+    // A first lowering, a keyed one, then the kept tree twice, the scratch grown by the first.
+    for _ in 0..4 {
+        super::file_item_tree(&db, file, krate);
+    }
+    let kept = blaze_alloc_count::assert_at_most(0, "a file whose items kept their keys", || {
+        super::file_item_tree(&db, file, krate)
     });
+    assert_eq!(*kept, lower_whole(&db, file.into(), krate));
 }
 
 /// Assembling a file's tree allocates once a column, however many items the file has.
@@ -214,11 +252,19 @@ fn assembly_allocates_once_a_column() {
         let (db, file) = db_of(&text);
         let krate = db.test_crate();
         let top = super::top_attrs(&db, file, krate);
-        let fragments: Vec<&ItemTree> = (super::item_sources(&db, file, krate).iter())
-            .map(|&item| super::item_fragment(&db, item))
+        let alone: Vec<ItemTree> = (file.parse(&db).tree().items())
+            .map(|item| super::item_alone(&db, file, krate, &item))
             .collect();
-        let (tree, used) = blaze_alloc_count::measure(|| super::assemble(top, &fragments));
+        let marks: Vec<[super::Marks; 2]> =
+            alone.iter().map(|it| [super::Marks::default(), super::Marks::ends(it)]).collect();
+        let parts: Vec<super::Rows<'_>> = (alone.iter().zip(&marks))
+            .map(|(tree, marks)| super::Rows { tree, marks })
+            .collect();
+        let mut made = Vec::with_capacity(items * 3 + 1);
+        let (tree, used) =
+            blaze_alloc_count::measure(|| super::assemble(&top, &parts, &mut made));
         assert_eq!(tree, lower_whole(&db, file.into(), krate));
+        assert_eq!(made.len(), items * 3 + 1, "a mark per item, then the end");
         used.allocations
     };
     assert_eq!(allocations(4), allocations(64));

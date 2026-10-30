@@ -39,10 +39,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses, unused: &Unus
     let mut found = Vec::new();
     let mut scratch = Scratch::default();
     for tree in &walk.trees {
-        for node in &tree.nodes {
-            if node.kind() != SyntaxKind::PATH {
-                continue;
-            }
+        for node in tree.of_kind(|it| it == SyntaxKind::PATH) {
             let Some(path) = ast::Path::cast(node.clone()) else { continue };
             found.extend(qualification(cx, tree.file, &path, uses, unused, &mut scratch));
         }

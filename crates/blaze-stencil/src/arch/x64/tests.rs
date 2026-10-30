@@ -36,7 +36,7 @@ use crate::{
     buf::Buf,
     code::{self, Code, Handler, Name, Rule, Unwind},
     enc::Form,
-    patch::{Scratch, compile_in},
+    patch::compile_in,
     shape::{self, Dst, Isa, Op, Shape, Src},
     table::format::{Hole, HoleKind, Reader, Variant, Writer},
 };
@@ -199,7 +199,7 @@ fn mock() -> Reader<'static> {
 }
 
 fn compile(func: &ir::Function, target: &Target) -> Result<Code, Error> {
-    compile_in::<X64>(&mut Scratch::new(), func, target, &mock())
+    compile_in::<X64, _>(func, target, &mock(), |code, _| code.to_code())
 }
 
 fn ours(func: &ir::Function, target: &Target) -> Code {
@@ -271,10 +271,12 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|it| it == needle)
 }
 
-fn enc(f: impl FnOnce(&mut Buf)) -> Vec<u8> {
-    let mut buf = Buf::new();
-    f(&mut buf);
-    buf.bytes().to_vec()
+fn enc(f: impl FnOnce(&mut Buf<'_>)) -> Vec<u8> {
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, |temp| {
+        let mut buf = Buf::new_in(temp);
+        f(&mut buf);
+        buf.bytes().to_vec()
+    })
 }
 
 #[test]
@@ -424,7 +426,9 @@ fn windows_codes_as_cranelift() {
     let Some(UnwindInfo::WindowsX64(info)) = &clif.unwind else { panic!("{:?}", clif.unwind) };
     let mut want = vec![0; info.emit_size()];
     info.emit(&mut want);
-    assert_eq!(frame::win_raw(&rows, clobber).unwrap(), want);
+    let mut raw = Vec::new();
+    frame::win_raw(&rows, clobber, &mut raw).unwrap();
+    assert_eq!(raw, want);
 }
 
 /// The codes of an `UNWIND_INFO`: `(operation, register, the word after, if one)`.
@@ -789,10 +793,47 @@ fn win_raw_is_cranelifts_encoding() {
         (12, Rule::Offset(3, -16 - 32)),
         (20, Rule::Offset(17 + 6, 16 - 16 - 32)),
     ];
-    let raw = frame::win_raw(&rows, 32).unwrap();
+    let mut raw = Vec::new();
+    frame::win_raw(&rows, 32, &mut raw).unwrap();
     assert_eq!(raw, [1, 20, 6, 0x05, 20, 0x68, 1, 0, 12, 0x34, 0, 0, 4, 0x03, 1, 0x50]);
-    let fixed = frame::with_saves(&raw).unwrap();
+    let mut fixed = Vec::new();
+    frame::with_saves(&raw, &mut fixed).unwrap();
     // One 8-byte save padded to 16, then the vector's 16: 32 bytes below `rbp`.
     assert_eq!(codes(&fixed), [(8, 6, 1), (4, 3, 0), (3, 0, 0), (2, 3, 0), (0, 5, 0)]);
     assert_eq!(fixed[3], 0x25);
+}
+
+#[test]
+fn a_warm_compile_through_the_glue_allocates_only_into_recycled_vectors() {
+    let library = mock();
+    for target in [LINUX, WINDOWS] {
+        let conv = conv(&target);
+        let func = build(sig(conv, &[I64, F64], &[I64]), |b, p| {
+            let callee = import(b, 0, sig(conv, &[I64, I64, F64], &[I64]), true);
+            let k = b.ins().iconst(I64, 0x1234_5678_9abc);
+            let call = b.ins().call(callee, &[p[0], k, p[1]]);
+            let ret = b.inst_results(call)[0];
+            b.ins().return_(&[ret]);
+        });
+        // What `compile_into` does, with the mock library.
+        let into = |code: &mut Code| {
+            compile_in::<X64, _>(&func, &target, &library, |it, _| code.copy_from(it)).unwrap();
+        };
+        let mut code = Code::default();
+        into(&mut code);
+        let ((), used) = blaze_alloc_count::measure(|| into(&mut code));
+        assert_eq!(
+            used,
+            blaze_alloc_count::Used::default(),
+            "a warm compile with the x86-64 glue for {:?}",
+            target.os
+        );
+        assert!(!code.relocs.is_empty());
+        assert_eq!(code, ours(&func, &target), "the reused code is the fresh one");
+        match (&code.unwind, target.os) {
+            (Some(Unwind::Windows { info, .. }), Os::Windows) => assert!(!info.is_empty()),
+            (Some(Unwind::Dwarf { rows, .. }), Os::Linux) => assert!(!rows.is_empty()),
+            (unwind, os) => panic!("{os:?}: {unwind:?}"),
+        }
+    }
 }

@@ -415,7 +415,7 @@ fn lifetime(p: &mut Parser<'_>) {
     m.complete(p, LIFETIME);
 }
 
-fn error_block(p: &mut Parser<'_>, message: &str) {
+fn error_block(p: &mut Parser<'_>, message: &'static str) {
     assert!(p.at(T!['{']));
     let m = p.start();
     p.error(message);
@@ -427,7 +427,7 @@ fn error_block(p: &mut Parser<'_>, message: &str) {
 
 // test_err top_level_let
 // let ref foo: fn() = 1 + 3;
-fn error_let_stmt(p: &mut Parser<'_>, message: &str) {
+fn error_let_stmt(p: &mut Parser<'_>, message: &'static str) {
     assert!(p.at(T![let]));
     let m = p.start();
     p.error(message);

@@ -21,6 +21,7 @@
 use std::{ptr, sync::OnceLock};
 
 use base_db::Db;
+use blaze_mem::Tag;
 use hir_def::nameres::crate_def_map;
 
 use crate::{
@@ -114,7 +115,7 @@ fn check_modules<'db>(
     let slots: Vec<OnceLock<Vec<AnyDiagnostic<'db>>>> =
         modules.iter().map(|_| OnceLock::new()).collect();
     let home = ptr::from_ref(db).cast::<()>().addr();
-    db.run_all(starts.len(), |task_db, task| {
+    db.run_all(Tag::Infer, starts.len(), |task_db, task| {
         assert_eq!(
             ptr::from_ref(task_db).cast::<()>().addr(),
             home,

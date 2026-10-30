@@ -537,6 +537,7 @@ impl<'a> Reader<'a> {
     }
 
     fn check_index(&self) -> Result<(), FormatError> {
+        // alloc: once per library, at its first use
         let mut seen = vec![0u64; (self.counts.stencils as usize).div_ceil(64)];
         let mut found = 0u32;
         for slot in 0..self.counts.slots {
@@ -673,13 +674,13 @@ impl Writer {
     pub fn new(variant: Variant) -> Writer {
         Writer {
             variant,
-            keys: Vec::new(),
-            stencils: Vec::new(),
-            holes: Vec::new(),
-            code: Vec::new(),
-            rodata: Vec::new(),
+            keys: Vec::new(), // alloc: the generator, at blaze's build time
+            stencils: Vec::new(), // alloc: the generator, at blaze's build time
+            holes: Vec::new(), // alloc: the generator, at blaze's build time
+            code: Vec::new(), // alloc: the generator, at blaze's build time
+            rodata: Vec::new(), // alloc: the generator, at blaze's build time
             hole_count: 0,
-            faults: Vec::new(),
+            faults: Vec::new(), // alloc: the generator, at blaze's build time
         }
     }
 
@@ -831,7 +832,7 @@ impl Writer {
 fn index(keys: &[u32]) -> Result<(u32, u32, u32, Vec<u16>, Vec<(u32, u32)>), FormatError> {
     let n = keys.len() as u32;
     if n == 0 {
-        return Ok((0, 0, 0, Vec::new(), Vec::new()));
+        return Ok((0, 0, 0, Vec::new(), Vec::new())); // alloc: the generator, at blaze's build time
     }
     // Load factor about 0.95 and about 5 n / log2 n buckets: PTHash's usual point, where a
     // pilot is found in a few tries for most buckets.
@@ -850,16 +851,18 @@ fn index(keys: &[u32]) -> Result<(u32, u32, u32, Vec<u16>, Vec<(u32, u32)>), For
 
 #[allow(clippy::type_complexity)]
 fn place(keys: &[u32], seed: u32, buckets: u32, slots: u32) -> Option<(Vec<u16>, Vec<(u32, u32)>)> {
+    // alloc: the generator, at blaze's build time
     let mut members: Vec<Vec<(u64, u32)>> = vec![Vec::new(); buckets as usize];
     for (stencil, key) in keys.iter().enumerate() {
         let h = hash(*key, seed);
         members[bucket(h, buckets) as usize].push((h, stencil as u32));
     }
-    let mut order: Vec<u32> = (0..buckets).collect();
+    let mut order: Vec<u32> = (0..buckets).collect(); // alloc: the generator, at blaze's build time
     order.sort_by_key(|b| (std::cmp::Reverse(members[*b as usize].len()), *b));
-    let mut pilots = vec![0u16; buckets as usize];
+    let mut pilots = vec![0u16; buckets as usize]; // alloc: the generator, at blaze's build time
+    // alloc: the generator, at blaze's build time
     let mut table = vec![(EMPTY, EMPTY); slots as usize];
-    let mut taken = Vec::new();
+    let mut taken = Vec::new(); // alloc: the generator, at blaze's build time
     for b in order {
         let bucket = &members[b as usize];
         if bucket.is_empty() {

@@ -149,14 +149,22 @@ memory stays within the budget, the held task starts first, and every request en
   allocator it uses (per-thread counts added to one total each time they drift 256 KiB and at
   thread exit: no lock and no atomic per allocation; `held()` is one load, within 256 KiB per
   other thread); `measure(f)` is the peak of what `f` held, `held()` what the
-  process holds. The scheduler measures every task and feeds `observe` and `Held`.
+  process holds. Blaze's own memory is `own()`: `held()` plus every blaze-mem region's
+  committed bytes (`blaze_mem::tag::snapshot().committed`), what the scheduler's `Held` reports
+  after each run. The scheduler measures every task and feeds `observe` (a task's frames join
+  its peak once blaze-mem can measure them, docs/v2/plan/lanes/mem/core.md).
+- **Subsystems**: each task kind maps to a blaze-mem tag (`admission::tag_of`), and each tag's
+  budget is its share of the machine budget in 64ths (`admission::share`, `set_budgets`). A run
+  whose tag is over budget waits while another run of that tag is under way (`exec::Throttle`),
+  so a runaway subsystem is held back before the machine runs short, one task at a time, never
+  stopped.
 - **The daemon's own cap**: `Bump` arenas reserve their chunks from a `Cap`, which calls a
   spill (cold results to disk) once each time it crosses `spill_at`, makes a reserve over the
   limit wait, and when every holder waits and nothing fits cancels the newest waiter
   (`Cancelled`, reposted), so the cap never deadlocks.
 - **The budget**: `machine_budget(margin)` is the least of the cgroup's `memory.max` (and its
   ancestors'), `MemTotal` and `RLIMIT_AS` (`hw.memsize` on macOS), less what others use in
-  blaze's own cgroup (`memory.current` less `held()`), less the margin.
+  blaze's own cgroup (`memory.current` less `own()`), less the margin.
 
 ## The executor (`topology`, `pool`, `pump`, `exec`)
 
@@ -192,7 +200,8 @@ cancelled (step 7).
 
 - usercode: a `Confine` over the sandbox, given to the drivers.
 - the daemon: `arena::Counting<Jemalloc>` (or mimalloc) as its global allocator; its work on `exec::Scheduler` with the
-  database's `Memo`, the budget from `machine_budget`.
+  database as its `exec::Runner` (each task's work is data the runner reads, not a closure) and
+  its `Memo`, both type parameters, the budget from `machine_budget`.
 - db: `blaze_query::Cancelled` as `blaze_graph::Cancelled`, `Cx::get` on `Flights`.
 - ci: `NodeState::Cancelled`, and `Plane::stats` in the API's per-request work.
 

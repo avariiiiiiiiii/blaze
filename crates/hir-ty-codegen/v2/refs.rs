@@ -41,6 +41,7 @@ use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
+use blaze_ids::bits::BitSet;
 use salsa::plumbing::AsId;
 use smallvec::{SmallVec, smallvec};
 
@@ -416,30 +417,21 @@ impl Listed {
     }
 }
 
-/// A set of the blocks of a body, a bit a block.
-struct Blocks(Vec<u64>);
+/// A set of the blocks of a body, a bit a block, by the block's index in the body's arena.
+struct Blocks(BitSet);
 
 impl Blocks {
     fn new(count: usize) -> Self {
-        Blocks(vec![0; count.div_ceil(64)])
-    }
-
-    fn bit(id: BasicBlockId) -> (usize, u64) {
-        let index = id.into_raw().into_u32() as usize;
-        (index / 64, 1 << (index % 64))
+        Blocks(BitSet::new(count))
     }
 
     /// Adds `id`, saying whether it was not in the set.
     fn insert(&mut self, id: BasicBlockId) -> bool {
-        let (word, bit) = Self::bit(id);
-        let new = self.0[word] & bit == 0;
-        self.0[word] |= bit;
-        new
+        self.0.insert(id.into_raw().into_u32() as usize)
     }
 
     fn contains(&self, id: BasicBlockId) -> bool {
-        let (word, bit) = Self::bit(id);
-        self.0[word] & bit != 0
+        self.0.contains(id.into_raw().into_u32() as usize)
     }
 }
 
@@ -910,7 +902,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let off = self.fx.checks_off(body);
         let resumes_only = match body.coroutine {
             Some(_) => FxHashSet::default(),
-            None => FunctionCx::resumes_only(body),
+            None => hir_ty_mir::mir::noop_landing_pads(body),
         };
         let count = body.basic_blocks.len();
         let mut reachable = Blocks::new(count);

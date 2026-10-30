@@ -2,6 +2,8 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use blaze_ids::rng::SplitMix64;
+
 use crate::{
     api, view::{Element, Node, NodeId}, Direction, FlatTree, FlatTreeBuilder, Language,
     NodeOrToken, SyntaxKind, Text, TextRange, TextSize, TokenAtOffset, WalkEvent,
@@ -37,19 +39,8 @@ const CLOSE: SyntaxKind = SyntaxKind(13);
 /// A kind past the word's 10 bits, so its kind is in the side table.
 const FAR: SyntaxKind = SyntaxKind(1500);
 
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0 % n
-    }
-}
-
 /// A group's text: `[`, words, spaces and groups, `]`.
-fn group_text(rng: &mut Rng, depth: u32, out: &mut String) {
+fn group_text(rng: &mut SplitMix64, depth: u32, out: &mut String) {
     out.push('[');
     for _ in 0..rng.below(6) {
         match rng.below(4) {
@@ -134,7 +125,7 @@ fn expand(
 
 /// A random file: groups and words at the top, some groups lazy.
 fn tree(seed: u64) -> Arc<FlatTree> {
-    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut rng = SplitMix64::new(seed);
     let mut text = String::new();
     for _ in 0..1 + rng.below(8) {
         match rng.below(3) {

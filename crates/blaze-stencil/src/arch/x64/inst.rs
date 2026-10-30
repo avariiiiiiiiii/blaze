@@ -78,7 +78,7 @@ fn konst(bits: i64, ty: ir::Type, ext: Option<bool>) -> u64 {
 
 /// `value` into general register `dst`, extended to 64 bits as `ext` says.
 fn to_gpr(
-    cx: &mut Cx<'_, X64>,
+    cx: &mut Cx<'_, '_, X64>,
     inst: ir::Inst,
     dst: u8,
     value: ir::Value,
@@ -97,7 +97,7 @@ fn to_gpr(
 }
 
 /// `value` into XMM register `dst`.
-fn to_xmm(cx: &mut Cx<'_, X64>, inst: ir::Inst, dst: u8, value: ir::Value) -> Result<(), Error> {
+fn to_xmm(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst, dst: u8, value: ir::Value) -> Result<(), Error> {
     let ty = cx.func.dfg.value_type(value);
     match cx.loc(value) {
         Loc::Slot(off) => asm::xload(cx.buf, Sse::of(ty.bytes()), dst, slot(off)),
@@ -120,7 +120,7 @@ fn result_slot(inst: ir::Inst, loc: Loc) -> Result<Option<u32>, Error> {
 }
 
 /// The slot of a 16-byte operand, which is never folded.
-fn wide_slot(cx: &Cx<'_, X64>, inst: ir::Inst, value: ir::Value) -> Result<u32, Error> {
+fn wide_slot(cx: &Cx<'_, '_, X64>, inst: ir::Inst, value: ir::Value) -> Result<u32, Error> {
     match cx.loc(value) {
         Loc::Slot(off) => Ok(off),
         _ => Err(no_place(inst, value)),
@@ -131,7 +131,7 @@ fn wide_slot(cx: &Cx<'_, X64>, inst: ir::Inst, value: ir::Value) -> Result<u32, 
 /// is position-independent (then the offset added), `lea` of a near symbol, `movabs` of a far
 /// one.
 fn load_ext_name(
-    cx: &mut Cx<'_, X64>,
+    cx: &mut Cx<'_, '_, X64>,
     dst: u8,
     name: Name,
     offset: i64,
@@ -164,7 +164,7 @@ const EXT_NAME: u32 = 7 + 7;
 /// A call to `libcall` through `r11` (Cranelift calls libcalls as `RelocDistance::Far`),
 /// recorded as a call site of `inst` when `site`.
 fn call_libcall(
-    cx: &mut Cx<'_, X64>,
+    cx: &mut Cx<'_, '_, X64>,
     inst: ir::Inst,
     libcall: LibCall,
     site: bool,
@@ -182,7 +182,7 @@ fn call_libcall(
 const LIBCALL: u32 = EXT_NAME + 3;
 
 /// Writes `inst`.
-pub fn inst(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
+pub fn inst(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     let func = cx.func;
     let data = func.dfg.insts[inst];
     match data.opcode() {
@@ -269,7 +269,7 @@ pub fn inst(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
 
 /// `return`: the values to their registers as the function's signature says, the
 /// StructReturn pointer to `rax`, then the epilogue.
-fn ret(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
+fn ret(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     let func = cx.func;
     let args = func.dfg.inst_args(inst);
     if args.len() != func.signature.returns.len() {
@@ -327,7 +327,7 @@ fn call_of(func: &ir::Function, inst: ir::Inst) -> Result<(Callee, ir::SigRef, &
 /// `gen_call_args`, `CallKnown`/`CallUnknown` and `gen_call_rets` write it: each
 /// StructArgument copied by a `memcpy` first, then the stack arguments, then the register
 /// ones, the call, its return values to their places.
-fn call(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
+fn call(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     let func = cx.func;
     let (callee, sig_ref, args) = call_of(func, inst)?;
     let sig = &func.dfg.signatures[sig_ref];
@@ -444,7 +444,7 @@ fn call(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
 /// A StructArgument's copy as Cranelift's `gen_memcpy` makes it: `memcpy(rsp + to, value,
 /// size)` in the callee's convention, through `r11`.
 fn memcpy(
-    cx: &mut Cx<'_, X64>,
+    cx: &mut Cx<'_, '_, X64>,
     inst: ir::Inst,
     win: bool,
     value: ir::Value,
@@ -460,14 +460,14 @@ fn memcpy(
 }
 
 /// 8 bytes from `from` to `to` through `r10`.
-fn copy(buf: &mut crate::buf::Buf, from: Mem, to: Mem) {
+fn copy(buf: &mut crate::buf::Buf<'_>, from: Mem, to: Mem) {
     asm::load(buf, R10, from);
     asm::store(buf, to, R10);
 }
 
 /// `landing`: the exception payload registers of System V (`rax`, `rdx`, Cranelift's
 /// `exception_payload_regs`) to their places.
-pub fn landing(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
+pub fn landing(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     for (k, reg) in [RAX, RDX].into_iter().enumerate() {
         if let Some(off) = result_slot(inst, cx.payload(inst, k))? {
             asm::store(cx.buf, slot(off), reg);
@@ -482,7 +482,7 @@ pub const LANDING: u32 = 2 * 8;
 /// The value of global value `gv` into `rax`, as Cranelift's legalizer expands it: a symbol's
 /// address (or a thread-local's), plus an immediate, or loaded from.
 fn global_value(
-    cx: &mut Cx<'_, X64>,
+    cx: &mut Cx<'_, '_, X64>,
     inst: ir::Inst,
     gv: ir::GlobalValue,
     depth: u32,
@@ -559,7 +559,7 @@ fn gv_bound(func: &ir::Function, target: &Target, gv: ir::GlobalValue) -> u32 {
 
 /// A thread-local's address into `rax`, as Cranelift's `ElfTlsGetAddr`, `MachOTlsGetAddr`
 /// and `CoffTlsGetAddr` write it (the symbol's offset is not added, as Cranelift does not).
-fn thread_local(cx: &mut Cx<'_, X64>, name: Name) {
+fn thread_local(cx: &mut Cx<'_, '_, X64>, name: Name) {
     let buf = &mut *cx.buf;
     match cx.target.tls {
         TlsModel::ElfGd => {
@@ -595,7 +595,7 @@ fn thread_local(cx: &mut Cx<'_, X64>, name: Name) {
 /// `br_table` as Cranelift's `JmpTableSeq`: the index zero-extended and clamped to the
 /// table's length (where the default is), then a jump through a table of 32-bit offsets from
 /// its start, inline after the jump.
-fn br_table(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
+fn br_table(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     let InstructionData::BranchTable { arg, table, .. } = cx.func.dfg.insts[inst] else {
         return Err(Error::at(inst, "a `br_table` of another format"));
     };
@@ -627,7 +627,7 @@ fn br_table(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
 /// A float operation of a baseline CPU's Cranelift lowers to libcalls (`x64_round_*` without
 /// SSE4.1, `fma` without FMA): one per lane, each lane's operands to `xmm0`.. and its result
 /// from `xmm0`.
-fn libcall_op(cx: &mut Cx<'_, X64>, inst: ir::Inst) -> Result<(), Error> {
+fn libcall_op(cx: &mut Cx<'_, '_, X64>, inst: ir::Inst) -> Result<(), Error> {
     let func = cx.func;
     let opcode = func.dfg.insts[inst].opcode();
     let ty = func.dfg.ctrl_typevar(inst);

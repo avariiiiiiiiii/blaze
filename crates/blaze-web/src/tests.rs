@@ -8,8 +8,8 @@ use blaze_protocol::events::{Event, Fns, Function, How, Record, Summary};
 use crate::{
     Following, Graphs, Next, Roots, State,
     http::{self, Frame, Frames, Refused, Request, Route, Site},
-    kept::{self, KEPT, Kind},
-    world::{Applied, World, module_path},
+    kept::{self, KEPT, Kept, Kind},
+    world::{Applied, Calls, World, module_path},
 };
 
 fn site() -> Site {
@@ -955,4 +955,147 @@ fn frames_written_together_are_the_frames_written_alone() {
     frames.flush(&mut dribbled).unwrap();
     assert_eq!(together, alone);
     assert_eq!(dribbled.0, alone);
+}
+
+/// The calls of every node chained through one list are those of a list a node, as they were
+/// kept before: in the order made, each node's cleared alone or all at once.
+#[test]
+fn calls_chained_in_one_list_are_those_of_a_list_a_node() {
+    for seed in 0..64 {
+        let mut rng = SplitMix64::new(seed);
+        let (mut calls, mut model) = (Calls::new(), Vec::<Vec<u32>>::new());
+        for step in 0..3000 {
+            match rng.below(16) {
+                0 if !model.is_empty() => {
+                    let at = rng.index(model.len());
+                    assert_eq!(calls.clear_node(at as u32), model[at].len(), "seed {seed}");
+                    model[at].clear();
+                }
+                1 if rng.below(16) == 0 => {
+                    calls.clear();
+                    model.clear();
+                }
+                2 | 3 => {
+                    calls.push_node();
+                    model.push(Vec::new());
+                }
+                _ if !model.is_empty() => {
+                    let (at, to) = (rng.index(model.len()), rng.index(model.len()) as u32);
+                    assert_eq!(calls.contains(at as u32, to), model[at].contains(&to));
+                    if !model[at].contains(&to) {
+                        calls.push(at as u32, to);
+                        model[at].push(to);
+                    }
+                }
+                _ => {}
+            }
+            if step % 50 != 49 {
+                continue;
+            }
+            assert_eq!(calls.nodes(), model.len(), "seed {seed}, step {step}");
+            for (at, to) in model.iter().enumerate() {
+                let chained: Vec<u32> = calls.of(at as u32).collect();
+                assert_eq!(chained, *to, "seed {seed}, step {step}, node {at}");
+            }
+        }
+    }
+}
+
+/// A build kept like the one before, until a page is asked for, allocates nothing: the runs
+/// the next Began and whole object drop, the encoder's stream and the record's CBOR are reused.
+#[test]
+fn a_build_kept_like_the_last_allocates_nothing() {
+    // The same Began each build, so each build's stream is the same bytes.
+    let began = began(1, "/w");
+    let calls = vec![
+        function(0, 10, "anim::main", &[1], How::Stored),
+        function(1, 11, "anim::scene::render", &[], How::Stored),
+    ];
+    let whole = fns(0, true, calls);
+    let other = Record { at_ns: 2, event: Event::Unlisted { count: 3 } };
+    let keep = |kept: &mut Kept, build: u64| {
+        for record in [&began, &whole, &other, &other] {
+            kept.keep(0, build, record);
+        }
+    };
+    let mut kept = Kept::default();
+    for build in 1..5 {
+        keep(&mut kept, build);
+    }
+    blaze_alloc_count::assert_at_most(0, "a build kept like the last", || keep(&mut kept, 5));
+    let five = [Kind::Began, Kind::Functions { object: 0 }, Kind::Other, Kind::Other];
+    assert_eq!(kept.kinds(0), five.map(|kind| (5u64, kind)));
+    let mut drained = Vec::new();
+    kept.drain(|root, build, record| drained.push((root, build, record)));
+    let records = [&began, &whole, &other, &other].map(|it| (0u32, 5u64, it.clone()));
+    assert_eq!(drained, records);
+}
+
+/// A build told every page like the one before allocates nothing once warm: the world tells
+/// each record into its reused buffer, and the pages' frame is encoded into its own, once for
+/// every page. Flecs's own allocations are its C heap's, which this does not count; the frame
+/// sent at the flush is one allocation, and not measured.
+#[test]
+fn a_build_told_every_page_like_the_last_allocates_nothing() {
+    let roots = Roots::default();
+    let root = roots_of(&roots, 1)[0];
+    let mut state = State::new(World::new().unwrap());
+    let pages = [state.follow(), state.follow()];
+    for page in &pages {
+        told(page);
+    }
+    let began = began(1, "/w0");
+    let calls = vec![
+        function(0, 10, "anim::main", &[1], How::Stored),
+        function(1, 11, "anim::scene::render", &[0], How::Compiled { ns: 4 }),
+    ];
+    let said = fns(0, false, calls);
+    let mut round = vec![began, said];
+    round.extend((0..8).map(|count| Record { at_ns: 2, event: Event::Unlisted { count } }));
+    round.push(Record { at_ns: 3, event: Event::Finished { ok: true, summary: summary() } });
+    for build in 1..6 {
+        let tell = |state: &mut State| {
+            for record in &round {
+                state.record(&roots, root, build, record);
+            }
+        };
+        if build < 5 {
+            tell(&mut state);
+        } else {
+            blaze_alloc_count::assert_at_most(0, "a build told every page", || tell(&mut state));
+        }
+        state.flush();
+        for page in &pages {
+            let (sent, _) = told(page);
+            if build > 1 {
+                let records: Vec<Told> = round.iter().cloned().map(Told::Record).collect();
+                assert_eq!(sent, records, "build {build}");
+            }
+        }
+    }
+    assert_eq!((state.programs[0].functions(), state.programs[0].calls()), (2, 2));
+}
+
+/// The maps of the ids of each object, kept from build to build, name what a map a build made
+/// anew named: a call to an id an object's earlier build named waits, as before.
+#[test]
+fn ids_kept_from_build_to_build_are_each_builds_own() {
+    let mut world = World::new().unwrap();
+    let mut program = world.program(Path::new("/w"));
+    world.apply(&mut program, 1, &began(1, "/w"));
+    let first = vec![
+        function(0, 10, "main", &[], How::Stored),
+        function(1, 11, "render", &[], How::Stored),
+    ];
+    world.apply(&mut program, 1, &fns(0, true, first));
+    world.apply(&mut program, 2, &began(2, "/w"));
+    // Id 1 of object 0 was `render` in the build before, not in this one.
+    let main = vec![function(0, 10, "main", &[1], How::Stored)];
+    world.apply(&mut program, 2, &fns(0, false, main));
+    assert_eq!(program.calls(), 0);
+    let render = vec![function(1, 12, "draw", &[], How::Stored)];
+    world.apply(&mut program, 2, &fns(0, false, render));
+    let snapshot = read(&world.snapshot(&program));
+    let names: Vec<_> = snapshot.iter().map(|it| (it.0.as_str(), it.2.clone())).collect();
+    assert_eq!(names, [("main", vec!["draw".into()]), ("render", vec![]), ("draw", vec![])]);
 }

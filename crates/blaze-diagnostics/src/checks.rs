@@ -12,6 +12,8 @@ pub(crate) mod impls;
 mod krate;
 mod macros;
 mod names;
+#[cfg(test)]
+mod tests;
 
 use std::ops::ControlFlow;
 
@@ -19,10 +21,7 @@ use syntax::ast::{self, HasAttrs};
 
 use crate::{
     cx::Cx,
-    lints::syntax::{
-        Walk,
-        attrs::{Owner, owners},
-    },
+    lints::syntax::attrs::{Owner, owners},
     lower::{Found, Phase},
 };
 
@@ -36,34 +35,45 @@ pub(crate) const PASSES: Phase = Phase::Items;
 /// (with the early lints), what attribute parsing says as the AST is lowered,
 /// `misc_checking_1` (the entry point, `check_mod_attrs`, the unused and stable features), the
 /// checks of items.
+///
+/// What several checks read is made once here: the owners of attributes, the features and the
+/// attribute parsers' `Session`, and the lowering of every attribute, which attribute parsing
+/// and `check_mod_attrs` both read. The walk is the check's one (`Cx::walk`), which the early
+/// lints and the lint levels read too.
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let walk = Walk::of(cx);
-    let owners: Vec<Owner> = owners(cx, &walk);
+    let walk = cx.walk();
+    let owners: Vec<Owner> = owners(cx, walk);
     let flags = features::Flags::default();
     let (features, mut found) = features::configured(cx, &owners, &flags);
-    found.extend(macros::check(cx, &walk));
-    found.extend(features::expansion(cx, &walk, &owners, &features));
-    found.extend(ast_validation::check(cx, &walk));
-    found.extend(defs::check(cx));
-    found.extend(names::check(cx));
-    found.extend(features::early(cx, &walk, &owners, &features, &flags));
-    found.extend(attrs::parsed(cx, &walk, &owners));
+    let session = attrs::Session::of(cx, &owners, features);
+    let features = &session.features;
+    found.extend(macros::check(cx, walk));
+    found.extend(features::expansion(cx, walk, &owners, features));
+    found.extend(ast_validation::check(cx, walk));
+    let scopes = defs::scopes(cx);
+    found.extend(defs::check(cx, &scopes));
+    found.extend(names::check(cx, &scopes));
+    found.extend(features::early(cx, walk, &owners, features, &flags));
+    let lowered = attrs::parsed(cx, &session, &owners, &mut found);
     found.extend(krate::check(cx));
-    found.extend(attrs::checked(cx, &walk, &owners));
-    found.extend(features::unused_or_stable(cx, &owners, &features));
-    found.extend(impls::check(cx));
+    attrs::checked(cx, &session, &owners, &lowered, &mut found);
+    found.extend(features::unused_or_stable(cx, &owners, features));
+    found.extend(impls::check(cx, &scopes));
     found
 }
 
 /// The modules of `cx.krate` (not those of blocks), in the order rustc visits them: the crate
 /// root, then each module before the modules in it, in the order they are declared.
 pub(crate) fn modules(cx: &Cx<'_, '_>) -> Vec<hir::Module> {
+    let db = cx.db;
+    let def_map = hir_def::nameres::crate_def_map(db, cx.krate.base());
     let mut order = Vec::new();
-    let mut stack = vec![cx.krate.root_module(cx.db)];
-    while let Some(module) = stack.pop() {
-        order.push(module);
-        let children: Vec<hir::Module> = module.children(cx.db).collect();
-        stack.extend(children.into_iter().rev());
+    let mut stack = vec![def_map.root_module_id()];
+    while let Some(id) = stack.pop() {
+        order.push(hir::Module::from(id));
+        let start = stack.len();
+        stack.extend(def_map.module(db, id).children(db).values().copied());
+        stack[start..].reverse();
     }
     order
 }

@@ -29,7 +29,7 @@ use syntax::{
 use super::{expr_span, from_expansion};
 use crate::{
     lints::bodies::{
-        BodyCx, Hooks, LatePass,
+        BodyCx, ExprKinds, ExprTag, Hooks, LatePass, LintSet, lint_set,
         types::util::{Solver, method_fn, path_value},
     },
     lower::{Found, Phase},
@@ -41,16 +41,13 @@ const MUT_NOTE: &str = "mutable references to mutable statics are dangerous; it'
 const INTERIOR_MUTABILITY_HELP: &str = "use a type that relies on \"interior mutability\" instead; to read more on this, visit <https://doc.rust-lang.org/reference/interior-mutability.html>";
 const INTERIOR_MUTABILITY_SUGG: &str = "this type already provides \"interior mutability\", so its binding doesn't need to be declared as mutable when borrowed with a shared reference";
 
-pub(super) struct StaticMutRefs;
+#[derive(Default)]
+pub(crate) struct StaticMutRefs;
 
 impl LatePass for StaticMutRefs {
-    fn name(&self) -> &'static str {
-        "StaticMutRefs"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR | Hooks::STMT
-    }
+    const LINTS: LintSet = lint_set(["static_mut_refs"]);
+    const HOOKS: Hooks = Hooks::STMT;
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::Ref, ExprTag::MethodCall]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         match b.store().expr(expr) {

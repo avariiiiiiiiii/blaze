@@ -16,7 +16,7 @@ use cranelift_codegen::{
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 
-use super::{Kind, NONE, Scratch, compile_in, slots::GLOBAL};
+use super::{Kind, NONE, Plan, Sel, compile_in, slots::GLOBAL};
 use crate::{
     Cpu, Error, Os, Target, TlsModel,
     arch::{Area, Cx, Glue},
@@ -25,6 +25,52 @@ use crate::{
     shape::{self, Dst, IntCc, Isa, Op, Shape, Src, Ty},
     table::format::{Hole, HoleKind, Reader, Variant, Writer},
 };
+
+/// What the tests read of a compile's plan, copied out of its frame.
+#[derive(Default)]
+struct Seen {
+    slot: Vec<u32>,
+    last: Vec<u32>,
+    sels: Vec<Sel>,
+    stack: Vec<u32>,
+    base: u32,
+    relays: bool,
+    area: (u32, u32),
+}
+
+impl Seen {
+    fn of(plan: &Plan<'_>) -> Seen {
+        Seen {
+            slot: plan.slot.to_vec(),
+            last: plan.last.to_vec(),
+            sels: plan.sels.to_vec(),
+            stack: plan.stack.to_vec(),
+            base: plan.base,
+            relays: plan.relays,
+            area: plan.area,
+        }
+    }
+
+    fn stack_slot(&self, slot: ir::StackSlot) -> u32 {
+        self.stack[slot.as_u32() as usize]
+    }
+
+    fn area(&self) -> Area {
+        Area { size: self.area.0, align: self.area.1 }
+    }
+}
+
+/// The plan of the last compile, where the tests used to find the patcher's scratch.
+#[derive(Default)]
+struct Scratch {
+    plan: Seen,
+}
+
+impl Scratch {
+    fn new() -> Scratch {
+        Scratch::default()
+    }
+}
 
 const HEADER: u8 = 0x5c;
 const TAIL: u8 = 0xe9;
@@ -168,12 +214,12 @@ impl Glue for Mock {
         16
     }
 
-    fn prologue(cx: &mut Cx<'_, Mock>) -> Result<(), Error> {
+    fn prologue(cx: &mut Cx<'_, '_, Mock>) -> Result<(), Error> {
         cx.buf.put1(PROLOGUE);
         Ok(())
     }
 
-    fn inst(cx: &mut Cx<'_, Mock>, inst: ir::Inst) -> Result<(), Error> {
+    fn inst(cx: &mut Cx<'_, '_, Mock>, inst: ir::Inst) -> Result<(), Error> {
         match cx.func.dfg.insts[inst].opcode() {
             Opcode::Return => cx.buf.put1(RET),
             Opcode::Trap => {
@@ -189,27 +235,27 @@ impl Glue for Mock {
         Ok(())
     }
 
-    fn landing(cx: &mut Cx<'_, Mock>, _: ir::Inst) -> Result<(), Error> {
+    fn landing(cx: &mut Cx<'_, '_, Mock>, _: ir::Inst) -> Result<(), Error> {
         cx.buf.put1(LANDING);
         Ok(())
     }
 
-    fn trap(cx: &mut Cx<'_, Mock>, _: TrapCode) {
+    fn trap(cx: &mut Cx<'_, '_, Mock>, _: TrapCode) {
         cx.buf.put(&STUB);
     }
 
-    fn count_back_edge(cx: &mut Cx<'_, Mock>) {
+    fn count_back_edge(cx: &mut Cx<'_, '_, Mock>) {
         cx.buf.put1(COUNT);
     }
 
-    fn relay(cx: &mut Cx<'_, Mock>, from: u32, to: u32, bytes: u8) {
+    fn relay(cx: &mut Cx<'_, '_, Mock>, from: u32, to: u32, bytes: u8) {
         cx.buf.put1(RELAY);
         cx.buf.put1(bytes);
         cx.buf.put4(from);
         cx.buf.put4(to);
     }
 
-    fn unwind(_: &mut Cx<'_, Mock>) -> Result<Option<code::Unwind>, Error> {
+    fn unwind(_: &mut Cx<'_, '_, Mock>) -> Result<Option<code::UnwindKind>, Error> {
         Ok(None)
     }
 
@@ -364,7 +410,15 @@ fn function(
 }
 
 fn compile(scratch: &mut Scratch, func: &ir::Function) -> Code {
-    compile_in::<Mock>(scratch, func, &TARGET, &library()).unwrap_or_else(|e| panic!("{func}\n{e}"))
+    try_compile(scratch, func, &library()).unwrap_or_else(|e| panic!("{func}\n{e}"))
+}
+
+/// A compile against `library`, keeping what the tests read of its plan.
+fn try_compile(scratch: &mut Scratch, func: &ir::Function, library: &Reader<'_>) -> Result<Code, Error> {
+    compile_in::<Mock, _>(func, &TARGET, library, |code, plan| {
+        scratch.plan = Seen::of(plan);
+        code.to_code()
+    })
 }
 
 fn inst_of(func: &ir::Function, value: ir::Value) -> ir::Inst {
@@ -920,7 +974,7 @@ fn what_no_stencil_and_no_glue_takes_is_an_error_naming_it() {
         b.ins().return_(&[r]);
     });
     let mut scratch = Scratch::new();
-    let error = compile_in::<Mock>(&mut scratch, &func, &TARGET, &library()).unwrap_err();
+    let error = try_compile(&mut scratch, &func, &library()).unwrap_err();
     assert_eq!(error.inst, Some(s_inst(&func, 0)));
     assert!(error.what.contains("get_pinned_reg"), "{error}");
 
@@ -930,7 +984,7 @@ fn what_no_stencil_and_no_glue_takes_is_an_error_naming_it() {
         let q = b.ins().udiv(p[0], p[1]);
         b.ins().return_(&[q]);
     });
-    let error = compile_in::<Mock>(&mut scratch, &func, &TARGET, &Reader::new(bytes).unwrap()).unwrap_err();
+    let error = try_compile(&mut scratch, &func, &Reader::new(bytes).unwrap()).unwrap_err();
     assert_eq!(error.inst, Some(s_inst(&func, 0)));
     assert!(error.what.contains("udiv") && error.what.contains("i64"), "{error}");
 }
@@ -951,7 +1005,7 @@ fn without_accumulator_shapes_every_value_goes_through_its_slot() {
         b.ins().return_(&[w]);
     });
     let mut scratch = Scratch::new();
-    let code = compile_in::<Mock>(&mut scratch, &func, &TARGET, &Reader::new(bytes).unwrap()).unwrap();
+    let code = try_compile(&mut scratch, &func, &Reader::new(bytes).unwrap()).unwrap();
     let s = stencils(&decode(&code));
     assert_eq!(s[0].shape, shape(Op::Iadd, Ty::I64, [S, S, N], Dst::Slot));
     assert_eq!(s[1].shape, shape(Op::Imul, Ty::I64, [S, S, N], Dst::Slot));
@@ -959,7 +1013,7 @@ fn without_accumulator_shapes_every_value_goes_through_its_slot() {
 }
 
 #[test]
-fn a_warm_compile_allocates_only_what_the_code_does_not_give_back() {
+fn a_warm_compile_into_a_reused_code_allocates_nothing() {
     let func = function(&[types::I64, types::I64], &[types::I64], |b, p| {
         let (body, exit) = (b.create_block(), b.create_block());
         let x = b.append_block_param(body, types::I64);
@@ -974,15 +1028,63 @@ fn a_warm_compile_allocates_only_what_the_code_does_not_give_back() {
         b.ins().return_(&[z]);
     });
     let library = library();
-    let mut scratch = Scratch::new();
-    for _ in 0..2 {
-        let code = compile_in::<Mock>(&mut scratch, &func, &TARGET, &library).unwrap();
-        scratch.recycle(code);
+    let mut code = Code::default();
+    let into = |code: &mut Code| {
+        compile_in::<Mock, _>(&func, &TARGET, &library, |it, _| code.copy_from(it)).unwrap();
+    };
+    into(&mut code);
+    let ((), used) = blaze_alloc_count::measure(|| into(&mut code));
+    assert_eq!(
+        used,
+        blaze_alloc_count::Used::default(),
+        "a warm compile: its columns on the frame, its code into the vectors of the last"
+    );
+    assert!(!code.bytes.is_empty() && !code.lines.is_empty() && !code.traps.is_empty());
+    assert!(blaze_mem::frame::spare_frames() > 0, "the compile's frame went back to the thread's spares");
+}
+
+#[test]
+fn copying_into_a_reused_code_gives_the_fresh_code() {
+    let small = function(&[types::I64, types::I64], &[types::I64], |b, p| {
+        let q = b.ins().udiv(p[0], p[1]);
+        b.ins().return_(&[q]);
+    });
+    let big = function(&[types::I64, types::I64], &[types::I64], |b, p| {
+        let c = b.ins().icmp(IntCC::Equal, p[0], p[1]);
+        let m = b.ins().select(c, p[0], p[1]);
+        let q = b.ins().udiv(m, p[1]);
+        let r = b.ins().iadd(q, p[0]);
+        b.ins().return_(&[r]);
+    });
+    let library = library();
+    let mut reused = Code::default();
+    for func in [&big, &small, &big] {
+        compile_in::<Mock, _>(func, &TARGET, &library, |it, _| reused.copy_from(it)).unwrap();
+        assert_eq!(reused, compile(&mut Scratch::new(), func), "{func}");
     }
-    let (code, used) =
-        blaze_alloc_count::measure(|| compile_in::<Mock>(&mut scratch, &func, &TARGET, &library).unwrap());
-    assert_eq!(used, blaze_alloc_count::Used::default(), "a warm compile into recycled vectors");
-    assert!(!code.bytes.is_empty());
+}
+
+#[test]
+fn many_constants_are_each_placed_once_in_first_use_order() {
+    let values: Vec<[u8; 16]> = (0..20u8).map(|i| [i.wrapping_mul(13).wrapping_add(1); 16]).collect();
+    let func = function(&[], &[types::I8X16], |b, _| {
+        let handles: Vec<_> =
+            values.iter().map(|it| b.func.dfg.constants.insert(ConstantData::from(it.to_vec()))).collect();
+        let mut acc = b.ins().vconst(types::I8X16, handles[0]);
+        for i in 1..40 {
+            let k = b.ins().vconst(types::I8X16, handles[i % 20]);
+            acc = b.ins().band(acc, k);
+        }
+        b.ins().return_(&[acc]);
+    });
+    let first = compile(&mut Scratch::new(), &func);
+    let again = compile(&mut Scratch::new(), &func);
+    assert_eq!(first, again, "the constant area is laid out the same each compile");
+    let mut at = first.bytes.len() - 20 * 16;
+    for value in &values {
+        assert_eq!(first.bytes[at..at + 16], value[..], "each constant once, in the order first used");
+        at += 16;
+    }
 }
 
 #[test]

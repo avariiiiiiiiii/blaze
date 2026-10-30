@@ -76,7 +76,35 @@ fn convert(code: Code, requests: &Requests) -> Result<blaze_codegen::CompiledFun
     let symbol = |name: &str| Ok(Target::Extern(name.to_owned()));
     let body = || Ok(Target::Extern("body".to_owned()));
     let resolve = Resolve { func: &func, data: &data, symbol: &symbol, body: &body };
-    function(key(), Arch::X86_64, isa, code, requests, &resolve, &[span(0), span(1)], None)
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+        function(frame, key(), Arch::X86_64, isa, code, requests, &resolve, &[span(0), span(1)], None)
+    })
+}
+
+/// A warm conversion allocates what the function keeps and what building its relocation
+/// table takes: its code moves in, `used` and the data targets are the frame's, and the lists
+/// Cranelift's emit wrote go back to the thread. Of the 10, 3 are kept: the table's rows and
+/// targets, and the lines. The other 7 are `blaze_codegen::Relocs`'s own, which builds on the
+/// global heap: the table of names (its targets, their index, its pending rows, their order,
+/// its rows) and `try_map`'s (its targets, their index, the remap, the rows' copy).
+#[test]
+fn a_warm_conversion_allocates_only_what_it_keeps() {
+    let make = || {
+        code(
+            vec![reloc(1, binemit::Reloc::X86CallPLTRel4, 0, 0)],
+            vec![LineRow { offset: 0, span: 0 }, LineRow { offset: 4, span: 1 }],
+        )
+    };
+    let requests = requests();
+    convert(make(), &requests).expect("converted");
+    let code = make();
+    let compiled = blaze_alloc_count::assert_at_most(10, "a warm conversion: its relocations and its lines", || {
+        convert(code, &requests)
+    })
+    .expect("converted");
+    assert_eq!(compiled.relocs.len(), 1);
+    assert_eq!(compiled.lines.len(), 2);
+    assert!(compiled.data.is_empty());
 }
 
 #[test]
@@ -120,12 +148,12 @@ fn data_points_only_at_data_before_it() {
     }
     // The outer constant: the inner one at 0 with its addend, the callee at 8.
     let outer = &compiled.data[1];
-    assert_eq!(outer.relocs[0].target, Target::Data(compiled.data[0].id));
-    assert_eq!(outer.relocs[0].addend, 2);
-    assert_eq!(outer.relocs[1].target, callee());
+    assert_eq!(*outer.relocs.get(0).expect("the inner constant").target, Target::Data(compiled.data[0].id));
+    assert_eq!(outer.relocs.addend(0), 2);
+    assert_eq!(*outer.relocs.get(1).expect("the callee").target, callee());
     // The location of nowhere: its name, then the location pointing at it.
     assert_eq!(compiled.data[2].bytes, b"<blaze>\0");
-    assert_eq!(compiled.data[3].relocs[0].target, Target::Data(compiled.data[2].id));
+    assert_eq!(compiled.data[3].relocs.targets(), [Target::Data(compiled.data[2].id)]);
 }
 
 #[test]
@@ -156,7 +184,7 @@ fn a_thunk_calls_the_body() {
         addend: -4,
     };
     let compiled = convert(code(vec![call], Vec::new()), &requests()).expect("converted");
-    assert_eq!(compiled.relocs[0].target, Target::Extern("body".to_owned()));
+    assert_eq!(compiled.relocs.targets(), [Target::Extern("body".to_owned())]);
 }
 
 #[test]

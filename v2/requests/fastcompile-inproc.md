@@ -33,6 +33,8 @@ blaze-radix.workspace = true
 
 Why: one counting sort in the tree.
 
+> forwarded to fastcompile (from requests, pass 16; told by tmux).
+
 ## dedup: bits: blaze-inproc the fence table's used entries onto `blaze_ids::bits`
 
 From `dedup-bits-edge` (report `/tmp/blaze-lanes/v2-dedup-bits-edge.md`). `Fences::used`, a
@@ -102,3 +104,5 @@ In `Fences::clear` (lines 179-182):
         self.used.remove(index);
         self.high = self.used.last().map_or(0, |it| it + 1);
 ```
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).

@@ -98,6 +98,19 @@ hot_lint's findings in `crates/hir-def/src/deps/` other than `dyn SourceDatabase
 frontend-db-def's rewrite). `serve` and `store` run once per session start, so they are setup;
 error text is an error path. Old text is what to find; lines are as of 10-29 20:30.
 
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-tree (2026-10-29): applied, anchored on hot_lint's current findings, since the code has
+> moved since these line numbers. `hir-def/src/deps/` (non-test files) now has 0 findings.
+> - `image.rs`: `write_image`'s records are a `[PartRec; 3]` from `std::array::from_fn`. The
+>   `Range` and `Arc` clones in `ImageRef::at`, `PartBytes::of` and `deref` are justified.
+> - `serve.rs`:
+>   - `hits` is `Vec::with_capacity(order.len())`;
+>   - every `dyn ImageStore`, error `format!`, setup `collect`, `Arc::new` and refusal `format!`
+>     carries the comment given here;
+>   - findings added since the request get the same kinds: `for_each`'s `dyn`, the `found`
+>     and `made` slots, `store`'s `hits` and `order`, `make`'s `dyn` and `put` error.
+> - `key.rs`: no finding left.
+
 ### `crates/hir-def/src/deps/image.rs`
 
 Fix: `write_image`'s part records are a fixed three, so an array, not a `Vec` per image
@@ -131,11 +144,15 @@ becomes
     });
 ```
 
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+
 ### `crates/hir-def/src/deps/key.rs`
 
 - ~L75 `let deps: Vec<ContentId> =` (flagged at its `.collect();` on ~L76): on the line above
   `data.dependencies.iter()..collect();`:
   `// alloc: setup: once per crate per session`
+
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
 
 ### `crates/hir-def/src/deps/serve.rs`
 
@@ -163,6 +180,8 @@ interned locs, lang items (speed-hir-sol-defs)".
 
 Status: open
 
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+
 ## speed-hir-sol-items: hot_lint and budgets (2026-10-29)
 
 From `speed-hir-sol-items` (child of `speed-hir`). These are your files (`item_tree.rs`,
@@ -175,6 +194,12 @@ allocation, `dyn` and clone there is justified. The edits below are costs the re
 see. A, B, C and E are independent. D's tests assume A, C and E, and its decode test also
 assumes the two `hir/persist.rs` changes filed in `v2/requests/speed-hir-store.md`
 ("speed-hir-sol-items"). F is a design decision for you, plus one small edit.
+
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-tree (2026-10-29): not frontend-tree's. `item_tree.rs` and `item_tree/` belong to
+> frontend-deps-items (window `frontend-deps-items`, alive; brief
+> `~/restart-2026-10-28/briefs/v2/frontend-deps-items.md`). Forwarded to it by tmux. The last
+> subsection, about `serve`'s read path, is answered under it.
 
 ### A. `lower.rs`: no sort of the attribute owners at `finish`
 
@@ -242,6 +267,8 @@ invariant rather than an assumption.
        }
    ```
 
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+
 ### B. `lower.rs`: `Scoped::seal` without clearing a big table
 
 Why: `seal` runs once per top-level item for names, paths and visibilities. `drain(..)` of a
@@ -278,6 +305,8 @@ New:
         }
     }
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
 
 ### C. `item_tree.rs` (+ `lower.rs`, `items.rs`, `persist.rs`): `attrs(id)` in O(1)
 
@@ -458,6 +487,8 @@ unchanged) and `PartialEq` still compares what it did. Callers are unchanged. No
        crate::item_tree::persist::assert_round_trip(tree);
    }
    ```
+
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
 
 ### D. `item_tree/tests.rs`: allocation budgets
 
@@ -649,6 +680,8 @@ Without C, drop the `tree.attr_index.len(),` line. Without E, the decode test fa
 fails on `seq`'s doubling and on the `Vec` per path. A failure there is a budget missed, not a
 flaky test.
 
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+
 ### E. `persist.rs`: `kinds` and `macro_calls` at their exact length
 
 Why: `collect::<Result<Box<[_]>, _>>()` runs through a shunt whose size hint is 0, so the `Vec`
@@ -726,6 +759,8 @@ new:
             cfgs: words.from(root.cfgs_at).get()?,
 ```
 Same words read, so the same values and errors.
+
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
 
 ### F. `items.rs`: the per-item queries against the whole-file lowering (a decision for you)
 
@@ -821,6 +856,8 @@ fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
 
 Status: open
 
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+
 ### speed-hir-sol-defs: `serve`'s read path is serial and copies each part (design)
 
 Counted in `docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def: attributes, interned
@@ -837,3 +874,50 @@ locs, lang items (speed-hir-sol-defs)". For 300 crates and an assumed 50 MB of i
   with them.
 
 Status: open
+
+> forwarded to frontend-tree (frontend-deps is DONE; frontend-tree holds the syntax and item-tree side now) (from requests, pass 16; told by tmux).
+> frontend-tree (2026-10-29): both changes are already in the tree.
+> - `serve` reads every image in parallel: `ImageStore::for_each` runs `fetch`, which gets and
+>   opens the image, once per crate on the driver's cores, into one `OnceLock` slot each, and
+>   the results are taken in key order.
+> - Parts are not copied: `Frozen` gets `PartBytes::In { buffer: Arc<Aligned>, range }`
+>   (`deps/image.rs`), a count of the image buffer and the part's range.
+> No change needed.
+
+## dedyn: crates/hir-def/src/item_tree/lower.rs and attrs.rs: generic span callbacks and visibilities
+
+For `frontend-deps-items` (and `mem-format-tree-items`, who also holds `item_tree/`).
+
+`ModPath::from_src` (hir-expand) is already generic over
+`&mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized)` and calls the callback once per
+path segment; the three item-tree functions that forward it take `&mut dyn`, so every segment
+of every `use` and `pub(in ..)` path is a virtual call. Take it the way `from_src` does. Call
+sites are unchanged (`&mut |range| ..`). Instances: the `use`-tree lowering (recursive, one
+instance per caller: two), `visibility_from_ast` (20 lines; four callers: lower.rs,
+visibility.rs, signatures.rs twice).
+
+1. `UseTreeLowering::lower_use_tree` (method), `pub(crate) fn lower_use_tree` and
+   `pub(crate) fn visibility_from_ast`: in each, delete the line
+   `    // dyn: `ModPath::from_src`'s callback (hir-expand), once a path` (indented as it is)
+   and replace the parameter line below it,
+   `span_for_range: &mut dyn FnMut(::tt::TextRange) -> SyntaxContext,` (indentation kept), with
+   `span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),`.
+   Bodies are unchanged: passing `span_for_range` on reborrows it.
+
+2. `lower_visibility` and `lower_visibility_from_ast` (one virtual call each, 4-line bodies,
+   about 12 item kinds):
+   - before `    fn lower_visibility(&mut self, item: &dyn ast::HasVisibility) -> RawVisibilityId {`
+     after  `    fn lower_visibility(&mut self, item: &impl ast::HasVisibility) -> RawVisibilityId {`
+   - before `    fn lower_visibility_from_ast(&self, item: &dyn ast::HasVisibility) -> RawVisibility {`
+     after  `    fn lower_visibility_from_ast(&self, item: &impl ast::HasVisibility) -> RawVisibility {`
+
+3. Keep, justified (once per item, into hir-expand's `collect_item_tree_attrs` and syntax's
+   `attrs_including_inner`, both `&dyn ast::HasAttrs`; a generic would copy the whole attribute
+   lowering per node type, and `ast::AnyHasAttrs` costs a node refcount, no cheaper). Append to
+   each `node: &dyn ast::HasAttrs` / `owner: &dyn ast::HasAttrs` parameter line of
+   `lower_attrs_of`, `lower_attrs`, `cfg_disabled` (lower.rs) and `AttrsOrCfg::lower`,
+   `lower_attrs_into` (attrs.rs) the comment
+   `// dyn: once per item, into hir-expand's collect_item_tree_attrs; a generic would copy the attribute lowering per node type`
+   (for the three one-line `fn` signatures in lower.rs, put it on its own line above the `fn`).
+
+> forwarded to frontend-deps-items (window frontend-deps-items-next1, holds `item_tree*`) (requests, pass 19; told by tmux).

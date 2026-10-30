@@ -29,6 +29,7 @@ mod tests;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
+use base_db::Db;
 use span::{Edition, Span, SyntaxContext};
 use tt::DelimSpan;
 use tt::iter::TtIter;
@@ -83,6 +84,39 @@ pub enum ExpandErrorKind {
     LimitExceeded,
     NoMatchingRule,
     UnexpectedToken,
+    /// No rule matches the call: rustc's account of the rule that got furthest.
+    MatchFailure(Box<MatchFailure>),
+}
+
+/// What rustc's `failed_to_match_macro` says of a call no rule matches
+/// (`rustc_expand/src/mbe/diagnostics.rs`): the `BestFailure` its `CollectTrackerAndEmitter`
+/// keeps, the rule that got furthest into the input, and its missing-comma check. The error's
+/// span is the token the rule stopped at, or the closing delimiter of the input at its end
+/// (where rustc's span is the end of the last token, or the call when there is none).
+#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+pub struct MatchFailure {
+    /// The token the rule stopped at, as rustc's `token_descr` gives it (`` `x` ``, "keyword
+    /// `fn`"); `None` at the end of the input.
+    pub token: Option<Box<str>>,
+    /// What the rule was trying to match there, as rustc's `MatcherLoc` displays it: "`,`",
+    /// "meta-variable `$a:ident`", "end of macro".
+    pub remaining: Box<str>,
+    /// The span of that part of the rule, when it has one (rustc's `MatcherLoc::span`): the
+    /// span of rustc's "while trying to match" note, a bare note without it.
+    pub remaining_span: Option<Span>,
+    /// Where a `,` makes some rule match (rustc's `TokenStream::add_comma`, the help "missing
+    /// comma here"): empty, at the end of the token it goes after.
+    pub missing_comma: Option<Span>,
+}
+
+impl MatchFailure {
+    /// rustc's label at the error's span.
+    pub fn label(&self) -> &'static str {
+        match self.token {
+            Some(_) => "no rules expected this token in macro call",
+            None => "missing tokens in macro arguments",
+        }
+    }
 }
 
 impl ExpandError {
@@ -113,6 +147,10 @@ impl fmt::Display for ExpandErrorKind {
             }
             ExpandErrorKind::LimitExceeded => f.write_str("Expand exceed limit"),
             ExpandErrorKind::LeftoverTokens => f.write_str("leftover tokens"),
+            ExpandErrorKind::MatchFailure(failure) => match &failure.token {
+                Some(token) => write!(f, "no rules expected {token}"),
+                None => f.write_str("unexpected end of macro invocation"),
+            },
         }
     }
 }
@@ -296,7 +334,7 @@ impl DeclarativeMacro {
 
     pub fn expand(
         &self,
-        db: &dyn salsa::Database,
+        db: &Db,
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
         call_style: MacroCallStyle,
@@ -425,7 +463,7 @@ impl<T: Default, E> From<Result<T, E>> for ValueResult<T, E> {
 }
 
 pub fn expect_fragment<'t>(
-    db: &dyn salsa::Database,
+    db: &Db,
     tt_iter: &mut TtIter<'t>,
     entry_point: ::parser::PrefixEntryPoint,
     delim_span: DelimSpan,

@@ -5,20 +5,30 @@
 //! tables; the child joins its cgroup before its program runs, and the pidfd comes back with
 //! the pid. On macOS `posix_spawn`. Elsewhere std's spawn.
 
-use std::{io, os::fd::OwnedFd};
+use std::{
+    ffi::OsString,
+    io,
+    os::fd::OwnedFd,
+    path::Path,
+};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::{
-    collections::BTreeMap,
-    ffi::{CStr, CString, OsStr, OsString},
+    ffi::{CStr, OsStr},
     os::{
         fd::{AsRawFd as _, FromRawFd as _, RawFd},
         unix::{ffi::OsStrExt as _, fs::PermissionsExt as _},
     },
-    path::{Path, PathBuf},
     ptr,
 };
 
-use crate::Confined;
+/// What to start, borrowed: a command's own program, arguments, environment and directory, or
+/// those its sandbox made, so a spawn copies none of them.
+pub(super) struct Program<'a> {
+    pub(super) program: &'a Path,
+    pub(super) args: &'a [OsString],
+    pub(super) env: &'a [(OsString, OsString)],
+    pub(super) dir: &'a Path,
+}
 
 pub(super) struct Spawned {
     pub(super) pid: libc::pid_t,
@@ -29,11 +39,11 @@ pub(super) struct Spawned {
     pub(super) stderr: OwnedFd,
 }
 
-/// `confined` started with its output piped, its input piped where it has `input` (else
+/// `program` started with its output piped, its input piped where it has `input` (else
 /// `/dev/null`), joining the cgroup whose `cgroup.procs` is `procs` before its program runs.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn spawn(confined: &Confined, input: bool, procs: Option<&CStr>) -> io::Result<Spawned> {
-    let plan = Plan::new(confined)?;
+pub(super) fn spawn(program: &Program<'_>, input: bool, procs: Option<&CStr>) -> io::Result<Spawned> {
+    let plan = Plan::new(program)?;
     let (stdin_child, stdin) = match input {
         true => {
             let (read, write) = pipe()?;
@@ -61,17 +71,17 @@ pub(super) fn spawn(confined: &Confined, input: bool, procs: Option<&CStr>) -> i
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(super) fn spawn(
-    confined: &Confined,
+    program: &Program<'_>,
     input: bool,
     procs: Option<&std::ffi::CStr>,
 ) -> io::Result<Spawned> {
     use std::process::Stdio;
     debug_assert!(procs.is_none(), "no cgroups here");
-    let mut child = std::process::Command::new(&confined.program)
-        .args(&confined.args)
+    let mut child = std::process::Command::new(program.program)
+        .args(program.args)
         .env_clear()
-        .envs(confined.env.iter().map(|(name, value)| (name, value)))
-        .current_dir(&confined.dir)
+        .envs(program.env.iter().map(|(name, value)| (name, value)))
+        .current_dir(program.dir)
         .stdin(if input { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -88,82 +98,128 @@ pub(super) fn spawn(
 /// The program, its arguments, environment and directory as the system calls take them.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct Plan {
-    program: CString,
+    program: *const libc::c_char,
     argv: Vec<*const libc::c_char>,
     envp: Vec<*const libc::c_char>,
-    dir: CString,
-    /// What `argv` and `envp` point into: a `CString`'s bytes stay put when it moves.
-    _strings: Vec<CString>,
+    dir: *const libc::c_char,
+    /// What every pointer above points into: each string NUL-terminated, one after another,
+    /// in the thread's byte buffer. A `Vec`'s bytes stay put when it moves, and nothing writes
+    /// them once the plan is made.
+    _bytes: blaze_mem::scratch::Lent<Vec<u8>>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Plan {
     /// As std's spawn makes them: `argv[0]` the program as named, the environment with a later
-    /// value of a name replacing an earlier one, in order of name.
-    fn new(confined: &Confined) -> io::Result<Plan> {
-        let c = |bytes: &[u8], what: &str| {
-            CString::new(bytes).map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{}: {what} has a NUL byte", confined.program.display()),
-                )
-            })
+    /// value of a name replacing an earlier one, in order of name. Its strings go in the
+    /// thread's byte buffer, so only the two arrays of pointers are made per spawn.
+    fn new(program: &Program<'_>) -> io::Result<Plan> {
+        let nul = |what: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                // alloc: an error path.
+                format!("{}: {what} has a NUL byte", program.program.display()),
+            )
         };
-        let program = c(resolve(&confined.program, &confined.env)?.as_os_str().as_bytes(), "its path")?;
-        let env: BTreeMap<&OsStr, &OsStr> =
-            confined.env.iter().map(|(name, value)| (name.as_os_str(), value.as_os_str())).collect();
-        let mut strings = Vec::with_capacity(1 + confined.args.len() + env.len());
-        strings.push(c(confined.program.as_os_str().as_bytes(), "its name")?);
-        for arg in &confined.args {
-            strings.push(c(arg.as_bytes(), "an argument")?);
+        let mut bytes = blaze_mem::scratch::lend_bytes();
+        let push = |bytes: &mut Vec<u8>, parts: &[&[u8]], what: &str| -> io::Result<usize> {
+            if parts.iter().any(|it| it.contains(&0)) {
+                return Err(nul(what));
+            }
+            let at = bytes.len();
+            for part in parts {
+                bytes.extend_from_slice(part);
+            }
+            bytes.push(0);
+            Ok(at)
+        };
+        let resolved = bytes.len();
+        resolve(program.program, program.env, &mut bytes)?;
+        if bytes[resolved..].contains(&0) {
+            return Err(nul("its path"));
         }
-        let args = strings.len();
-        for (name, value) in env {
-            let mut pair = Vec::with_capacity(name.len() + 1 + value.len());
-            pair.extend_from_slice(name.as_bytes());
-            pair.push(b'=');
-            pair.extend_from_slice(value.as_bytes());
-            strings.push(c(&pair, "its environment")?);
+        bytes.push(0);
+        // Offsets into `bytes` until it is whole, then pointers.
+        let offset = ptr::without_provenance::<libc::c_char>;
+        // alloc: once per spawn, the arguments as the system takes them.
+        let mut argv = Vec::with_capacity(program.args.len() + 2);
+        argv.push(offset(push(&mut bytes, &[program.program.as_os_str().as_bytes()], "its name")?));
+        for arg in program.args {
+            argv.push(offset(push(&mut bytes, &[arg.as_bytes()], "an argument")?));
         }
-        let pointers = |it: &[CString]| it.iter().map(|it| it.as_ptr()).chain([ptr::null()]).collect();
+        // alloc: once per spawn, the environment as the system takes it.
+        let mut envp = Vec::with_capacity(program.env.len() + 1);
+        let env = program.env;
+        let name = |at: u32| env[at as usize].0.as_bytes();
+        blaze_mem::scratch::with_u32s(|order| {
+            order.extend(0..env.len() as u32);
+            order.sort_unstable_by(|&a, &b| name(a).cmp(name(b)).then(a.cmp(&b)));
+            let mut at = 0;
+            while at < order.len() {
+                let mut last = at;
+                while last + 1 < order.len() && name(order[last + 1]) == name(order[at]) {
+                    last += 1;
+                }
+                let (key, value) = &env[order[last] as usize];
+                let pair = [key.as_bytes(), b"=", value.as_bytes()];
+                envp.push(offset(push(&mut bytes, &pair, "its environment")?));
+                at = last + 1;
+            }
+            Ok::<(), io::Error>(())
+        })?;
+        let dir = push(&mut bytes, &[program.dir.as_os_str().as_bytes()], "its directory")?;
+        let base = bytes.as_ptr().cast::<libc::c_char>();
+        for pointer in argv.iter_mut().chain(envp.iter_mut()) {
+            *pointer = base.wrapping_add(pointer.addr());
+        }
+        argv.push(ptr::null());
+        envp.push(ptr::null());
         Ok(Plan {
-            program,
-            argv: pointers(&strings[..args]),
-            envp: pointers(&strings[args..]),
-            dir: c(confined.dir.as_os_str().as_bytes(), "its directory")?,
-            _strings: strings,
+            program: base.wrapping_add(resolved),
+            argv,
+            envp,
+            dir: base.wrapping_add(dir),
+            _bytes: bytes,
         })
     }
 }
 
-/// The file `program` names: itself where it has a `/`, else the first executable file of that
-/// name on the `PATH` of its environment, or of the daemon's where it sets none, as std's spawn
-/// looks it up.
+/// Writes to `into` the file `program` names: itself where it has a `/`, else the first
+/// executable file of that name on the `PATH` of its environment, or of the daemon's where it
+/// sets none, as std's spawn looks it up. Each candidate is joined in the thread's path buffer.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn resolve(program: &Path, env: &[(OsString, OsString)]) -> io::Result<PathBuf> {
-    if program.as_os_str().as_bytes().contains(&b'/') {
-        return Ok(program.to_owned());
+fn resolve(program: &Path, env: &[(OsString, OsString)], into: &mut Vec<u8>) -> io::Result<()> {
+    let named = program.as_os_str().as_bytes();
+    if named.contains(&b'/') {
+        into.extend_from_slice(named);
+        return Ok(());
     }
-    let path = env
-        .iter()
-        .rev()
-        .find(|(name, _)| name == "PATH")
-        .map(|(_, value)| value.clone())
-        .or_else(|| std::env::var_os("PATH"))
-        .unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
-        let dir = if dir.as_os_str().is_empty() { PathBuf::from(".") } else { dir };
-        let candidate = dir.join(program);
-        let runs = std::fs::metadata(&candidate)
-            .is_ok_and(|it| it.is_file() && it.permissions().mode() & 0o111 != 0);
-        if runs {
-            return Ok(candidate);
+    let own = env.iter().rev().find(|(name, _)| name == "PATH").map(|(_, value)| value.as_os_str());
+    // alloc: once per spawn whose environment sets no PATH, the daemon's.
+    let daemon = if own.is_none() { std::env::var_os("PATH") } else { None };
+    let path = own.or(daemon.as_deref()).unwrap_or_default();
+    let found = blaze_mem::scratch::with_path(|candidate| {
+        for dir in path.as_bytes().split(|&it| it == b':') {
+            candidate.as_mut_os_string().clear();
+            candidate.push(if dir.is_empty() { OsStr::new(".") } else { OsStr::from_bytes(dir) });
+            candidate.push(program);
+            let runs = std::fs::metadata(&*candidate)
+                .is_ok_and(|it| it.is_file() && it.permissions().mode() & 0o111 != 0);
+            if runs {
+                into.extend_from_slice(candidate.as_os_str().as_bytes());
+                return true;
+            }
         }
+        false
+    });
+    match found {
+        true => Ok(()),
+        false => Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            // alloc: an error path.
+            format!("{} is in no directory of its PATH", program.display()),
+        )),
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        format!("{} is in no directory of its PATH", program.display()),
-    ))
 }
 
 /// A pipe, its read end first, both closed on exec and numbered past 2.
@@ -192,6 +248,7 @@ fn open(path: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
     let fd = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
     if fd < 0 {
         let error = io::Error::last_os_error();
+        // alloc: an error path.
         return Err(io::Error::new(error.kind(), format!("{}: {error}", path.to_string_lossy())));
     }
     // SAFETY: the call returned a descriptor of its own.
@@ -234,9 +291,19 @@ struct Child<'a> {
 
 #[cfg(target_os = "linux")]
 fn clone(plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
-    let mut stack = vec![0u8; STACK];
+    blaze_mem::scratch::with_bytes(|stack| {
+        // alloc: once per thread that spawns, kept: the child's stack, its room unwritten.
+        stack.reserve(STACK);
+        clone_on(stack.as_mut_ptr(), plan, fds, procs)
+    })
+}
+
+/// As [`clone`], the child on the `STACK` bytes at `stack`, which nothing else uses until this
+/// returns.
+#[cfg(target_os = "linux")]
+fn clone_on(stack: *mut u8, plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t, OwnedFd)> {
     // It grows down from its end, which both ABIs (x86-64, AArch64) want on 16 bytes.
-    let top = stack.as_mut_ptr().wrapping_add(STACK).map_addr(|it| it & !15);
+    let top = stack.wrapping_add(STACK).map_addr(|it| it & !15);
     let mut child = Child { plan, fds, procs, step: 0, failed: 0 };
     let mut pidfd: libc::c_int = -1;
     // SAFETY: all zeros is a valid `sigset_t`; the calls below fill it.
@@ -275,7 +342,6 @@ fn clone(plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t,
     let step = unsafe { ptr::read_volatile(&raw const child.step) };
     // SAFETY: as above.
     let failed = unsafe { ptr::read_volatile(&raw const child.failed) };
-    drop(stack);
     if step == 0 {
         return Ok((pid, pidfd));
     }
@@ -287,6 +353,7 @@ fn clone(plan: &Plan, fds: [RawFd; 3], procs: RawFd) -> io::Result<(libc::pid_t,
         _ => "running its program",
     };
     let error = io::Error::from_raw_os_error(failed);
+    // alloc: an error path.
     Err(io::Error::new(error.kind(), format!("{what}: {error}")))
 }
 
@@ -343,13 +410,13 @@ extern "C" fn run(arg: *mut libc::c_void) -> libc::c_int {
         fail(child, 2);
     }
     // SAFETY: a NUL-terminated path the parent keeps.
-    if unsafe { libc::chdir(child.plan.dir.as_ptr()) } != 0 {
+    if unsafe { libc::chdir(child.plan.dir) } != 0 {
         fail(child, 3);
     }
     // SAFETY: a NUL-terminated path and two NULL-terminated arrays of NUL-terminated strings,
     // all kept by the parent until the program runs.
     unsafe {
-        libc::execve(child.plan.program.as_ptr(), child.plan.argv.as_ptr(), child.plan.envp.as_ptr())
+        libc::execve(child.plan.program, child.plan.argv.as_ptr(), child.plan.envp.as_ptr())
     };
     fail(child, 4)
 }
@@ -384,7 +451,7 @@ fn posix_spawn(plan: &Plan, fds: [RawFd; 3]) -> io::Result<libc::pid_t> {
             check(unsafe { libc::posix_spawn_file_actions_adddup2(&mut actions, fd, target) })?;
         }
         // SAFETY: made above; a NUL-terminated path kept until the spawn.
-        check(unsafe { posix_spawn_file_actions_addchdir_np(&mut actions, plan.dir.as_ptr()) })?;
+        check(unsafe { posix_spawn_file_actions_addchdir_np(&mut actions, plan.dir) })?;
         // SIGPIPE, which std ignores in the daemon, back to its default in the child, and the
         // child's mask empty, as std's spawn makes them. On macOS `sigset_t` is an integer.
         let mut defaults: libc::sigset_t = 0;
@@ -406,7 +473,7 @@ fn posix_spawn(plan: &Plan, fds: [RawFd; 3]) -> io::Result<libc::pid_t> {
         check(unsafe {
             libc::posix_spawn(
                 &mut pid,
-                plan.program.as_ptr(),
+                plan.program,
                 &actions,
                 &attr,
                 plan.argv.as_ptr().cast(),

@@ -22,6 +22,7 @@ reference = []
 serde = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 blaze-fuzz.workspace = true
 blaze-ids.workspace = true
 rustc-hash.workspace = true

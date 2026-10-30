@@ -3,66 +3,35 @@
 //! An integration test, so the test database's queries are of the one copy of this crate the
 //! tests call.
 
+mod alloc_budget;
 mod db;
 mod machine;
+mod source_maps;
 mod source_names;
 mod storage;
 mod threads;
 mod ub_checks;
 mod unwind;
 
-use hir_def::{
-    ConstId, FunctionId, ModuleDefId,
-    nameres::crate_def_map,
-    signatures::{ConstSignature, FunctionSignature},
-};
+use hir_def::{ConstId, FunctionId};
 use hir_ty::db::HirDatabase;
 use hir_ty_mir::mir::{MirOptions, print_mir_body};
 use test_fixture::WithFixture;
 
 use db::TestDB;
 
-fn declarations(db: &TestDB) -> Vec<ModuleDefId> {
-    crate_def_map(db, db.test_crate())
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
-        .collect()
-}
+/// Every allocation of the test binary, counted per thread, for `alloc_budget`'s budgets.
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    let found: Vec<FunctionId> = declarations(db)
-        .into_iter()
-        .filter_map(|def| match def {
-            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
-                Some(it)
-            }
-            _ => None,
-        })
-        .collect();
-    match found[..] {
-        [one] => one,
-        _ => panic!("{} functions named `{name}`", found.len()),
-    }
+    hir_def::test_items::function(db, db.test_crate(), name)
 }
 
 #[track_caller]
 fn constant(db: &TestDB, name: &str) -> ConstId {
-    let found: Vec<ConstId> = declarations(db)
-        .into_iter()
-        .filter_map(|def| match def {
-            ModuleDefId::ConstId(it)
-                if ConstSignature::of(db, it).name.as_ref().is_some_and(|it| it.as_str() == name) =>
-            {
-                Some(it)
-            }
-            _ => None,
-        })
-        .collect();
-    match found[..] {
-        [one] => one,
-        _ => panic!("{} constants named `{name}`", found.len()),
-    }
+    hir_def::test_items::constant(db, db.test_crate(), name)
 }
 
 /// The MIR of the function `name` in a one-file fixture, as asked with `options`, printed.

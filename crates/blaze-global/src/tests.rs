@@ -10,6 +10,7 @@ use blaze_core::{
     Address, Completion, Conn, Done, Driver as _, Effect, FileName, Tag,
     sim::{Faults, Rng, Sim},
 };
+use blaze_format::cursor::Reader;
 use blaze_ids::ContentId;
 
 use crate::{
@@ -18,7 +19,7 @@ use crate::{
     record_key,
     sign::tests::publisher,
     tls::clear::Clears,
-    wire::{self, BODY_MOST, CHUNKED_FROM, Reader, SendWindow},
+    wire::{self, BODY_MOST, CHUNKED_FROM, SendWindow},
 };
 
 const MINE: u64 = 1 << 40;

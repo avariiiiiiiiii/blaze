@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::PathBuf,
     time::Duration,
 };
@@ -231,11 +231,32 @@ impl Fake {
         self.say_bytes(conn, frame.to_bytes());
     }
 
+    /// A server that measured its fork as free, so it stays one.
     fn hello(&mut self, b: usize, tests: &[&str]) -> Conn {
+        self.hello_with(b, tests, 0, 1)
+    }
+
+    /// A connection of `b`'s server accepted and its hello said: a fork of `fork` nanoseconds,
+    /// process `pid`.
+    fn hello_with(&mut self, b: usize, tests: &[&str], fork: u64, pid: u32) -> Conn {
         let conn = self.accept(b);
-        let tests = tests.iter().map(|it| (*it).to_owned()).collect();
-        self.say(conn, Frame::Hello { version: wire::VERSION, pid: 1, tests });
+        self.say_hello(conn, tests, fork, pid);
         conn
+    }
+
+    fn say_hello(&mut self, conn: Conn, tests: &[&str], fork: u64, pid: u32) {
+        let tests = tests.iter().map(|it| (*it).to_owned()).collect();
+        self.say(conn, Frame::Hello { version: wire::VERSION, pid, fork, tests });
+    }
+
+    /// How many replicas `conn` was asked for since the last call; the rest of what it was
+    /// sent is kept.
+    fn replicate(&mut self, conn: Conn) -> Option<u32> {
+        let at = self.sent.iter().position(|it| it.0 == conn && matches!(it.1, Frame::Replicate { .. }))?;
+        match self.sent.remove(at).1 {
+            Frame::Replicate { count } => Some(count),
+            _ => None,
+        }
     }
 
     fn end(&mut self, conn: Conn, id: u64, end: End, output: &[u8]) {
@@ -729,7 +750,7 @@ fn the_queue_under_a_simulated_driver() {
                 let Some(conn) = server.conn.or_else(|| sim.dial(&socket).ok()) else { continue };
                 if server.conn.is_none() {
                     server.conn = Some(conn);
-                    let hello = Frame::Hello { version: wire::VERSION, pid: 7, tests: server.tests.clone() };
+                    let hello = Frame::Hello { version: wire::VERSION, pid: 7, fork: 0, tests: server.tests.clone() };
                     sim.peer_send(conn, &hello.to_bytes());
                 }
                 server.frames.push(&sim.peer_received(conn));
@@ -872,12 +893,13 @@ fn a_packed_line_reads_back_its_kind() {
     }
 }
 
-/// The bitsets against a sorted set, over seeded sets, clears and firsts.
+/// The rank sets against a sorted set, over seeded sets, clears and firsts: the cursor never
+/// skips a member set below it.
 #[test]
-fn bits_are_a_set() {
+fn ranks_are_a_set_with_a_cursor() {
     let mut rng = SplitMix64::new(0x2545_f491_4f6c_dd1d);
     for len in [0usize, 1, 63, 64, 65, 200] {
-        let mut bits = Bits::full(len);
+        let mut bits = Ranks::full(len);
         let mut set: BTreeSet<u32> = (0..len as u32).collect();
         assert_eq!(bits.ones().collect::<Vec<_>>(), set.iter().copied().collect::<Vec<_>>());
         if len == 0 {
@@ -909,7 +931,7 @@ fn bits_are_a_set() {
         assert_eq!(bits.ones().collect::<Vec<_>>(), set.iter().copied().collect::<Vec<_>>());
         bits.clear_all();
         assert_eq!((bits.first(), bits.ones().next()), (None, None));
-        let mut empty = Bits::empty(len);
+        let mut empty = Ranks::empty(len);
         assert_eq!(empty.first(), None);
     }
 }
@@ -918,17 +940,30 @@ fn bits_are_a_set() {
 /// lists stay at what the cores need, however many tests run.
 #[test]
 fn the_steady_state_reuses_its_slabs() {
+    // One server, and four replicas (a fork of 10 s against a median test of 300 ms).
+    for fork in [0, 10_000_000_000] {
+        steady_state(fork);
+    }
+}
+
+fn steady_state(fork: u64) {
     let jobs: Vec<Job> = (0..600).map(|n| job(&format!("t{n}"), 600 - n)).collect();
     let names: Vec<String> = jobs.iter().map(|it| it.name.clone()).collect();
     let mut fake = Fake::new(config(4), vec![binary("lib", jobs)]);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    let conn = fake.hello(0, &names);
+    let first = fake.hello_with(0, &names, fork, 1);
+    let mut conns = vec![first];
+    for pid in 0..fake.replicate(first).unwrap_or(0) {
+        conns.push(fake.hello_with(0, &names, fork, 2 + pid));
+    }
+    assert_eq!(conns.len(), if fork == 0 { 1 } else { 4 });
     let mut ended = 0;
     let mut high = None;
     while ended < 600 {
-        let runs = fake.runs(conn);
+        let runs: Vec<(Conn, u64, u32)> =
+            conns.clone().into_iter().flat_map(|conn| fake.runs(conn).into_iter().map(move |(id, index)| (conn, id, index))).collect();
         assert!(!runs.is_empty(), "nothing runs after {ended}");
-        for (id, index) in runs {
+        for (conn, id, index) in runs {
             fake.append(0, &[Line::new(Seen::Read, "", "/lib/libc.so"), Line::new(Seen::Read, names[index as usize], "/ws/x")]);
             let before = fake.allocations;
             fake.advance(Duration::from_millis(3));
@@ -959,4 +994,262 @@ fn the_steady_state_reuses_its_slabs() {
     // The line of every scope is kept once; every name once (blaze's four, then two).
     assert_eq!(server.common.len(), 1);
     assert_eq!(server.names.len(), 6);
+}
+
+/// `K = ceil(C × F / (F + T))`, at least one, at most the cores and the tests.
+#[test]
+fn replicas_follow_the_cores_the_fork_and_the_median_test() {
+    // Tests that take nothing: one replica per core.
+    assert_eq!(replicas(64, 50_000, 0, 10_000), 64);
+    // A median test as long as 63 forks: 64 cores need one replica.
+    assert_eq!(replicas(64, 50_000, 63 * 50_000, 10_000), 1);
+    // 16 × 50 / 150 = 5.3.
+    assert_eq!(replicas(16, 50_000, 100_000, 10_000), 6);
+    assert_eq!(replicas(16, 50_000, 1_000_000, 10_000), 1);
+    // A fork that costs nothing, fewer tests than cores, no cores said.
+    assert_eq!(replicas(16, 0, 0, 10_000), 1);
+    assert_eq!(replicas(16, 50_000, 0, 3), 3);
+    assert_eq!(replicas(0, 50_000, 0, 0), 1);
+    assert_eq!(replicas(usize::MAX, u64::MAX, 0, usize::MAX), u32::MAX);
+    assert_eq!((median(&mut [5, 1, 3]), median(&mut []), median(&mut [7])), (3, 0, 7));
+}
+
+fn names_of(count: usize) -> Vec<String> {
+    (0..count).map(|n| format!("t{n}")).collect()
+}
+
+/// The first hello asks for the replicas before any run; once every replica said hello the
+/// listen ends, and tests go to whichever replica has room (the cores over the replicas),
+/// each in the one order.
+#[test]
+fn tests_are_spread_across_replicas() {
+    let names = names_of(12);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut fake = Fake::new(config(4), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let first = fake.hello_with(0, &names, 1_000_000, 1);
+    let sent = fake.frames(first);
+    assert_eq!(sent[0], Frame::Replicate { count: 3 }, "asked first: {sent:?}");
+    // Alone, it has room for every core.
+    let mut flight: VecDeque<(Conn, u64, u32)> = VecDeque::new();
+    for frame in &sent[1..] {
+        let Frame::Run { id, index } = frame else { panic!("{sent:?}") };
+        flight.push_back((first, *id, *index));
+    }
+    assert_eq!(flight.iter().map(|it| it.2).collect::<Vec<_>>(), [0, 1, 2, 3]);
+    let mut conns = vec![first];
+    for pid in 2..5 {
+        conns.push(fake.hello_with(0, &names, 1_000_000, pid));
+    }
+    assert!(fake.listens.is_empty(), "every replica is in: the listen ended");
+    assert_eq!(fake.queue.bins[0].server.as_ref().unwrap().room, 1);
+    let mut ran: BTreeMap<u64, usize> = BTreeMap::new();
+    let (mut order, mut quit) = (Vec::new(), Vec::new());
+    while let Some((conn, id, index)) = flight.pop_front() {
+        fake.end(conn, id, End::Exited(0), b"");
+        for &conn in &conns {
+            for frame in fake.frames(conn) {
+                match frame {
+                    Frame::Run { id, index } => {
+                        *ran.entry(conn.0).or_default() += 1;
+                        order.push(index);
+                        flight.push_back((conn, id, index));
+                    }
+                    Frame::Quit => quit.push(conn),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+        // Past the first four, no replica runs more than its room.
+        if index >= 3 {
+            for &conn in &conns {
+                assert!(flight.iter().filter(|it| it.0 == conn).count() <= 1, "{flight:?}");
+            }
+        }
+    }
+    assert_eq!(order, (4..12).collect::<Vec<u32>>(), "the one order, whichever replica");
+    assert_eq!(ran.len(), 4, "every replica ran tests: {ran:?}");
+    assert_eq!(fake.results.len(), 12);
+    assert!(fake.results.iter().all(|it| it.outcome == Outcome::Passed));
+    quit.sort_unstable();
+    assert_eq!(quit, conns, "every replica is told to quit");
+    fake.exit("/bin/lib", exited(Some(0), None, None));
+    assert!(fake.queue.finished());
+}
+
+/// A replica that closes its socket loses only the test it ran, saying which replica and why;
+/// the server is not killed, and the others run the rest with the room it left.
+#[test]
+fn a_replica_that_dies_mid_test_fails_only_its_own_test() {
+    let names = names_of(6);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut fake = Fake::new(config(3), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let first = fake.hello_with(0, &names, 1_000_000, 1);
+    assert_eq!(fake.replicate(first), Some(2));
+    let runs = fake.runs(first);
+    assert_eq!(indices(&runs), [0, 1, 2]);
+    let (second, third) = (fake.hello_with(0, &names, 1_000_000, 2), fake.hello_with(0, &names, 1_000_000, 3));
+    // Each end frees a core for the next replica with room: the server runs two still.
+    fake.end(first, runs[0].0, End::Exited(0), b"");
+    let on_second = fake.run(second, 3);
+    fake.end(first, runs[1].0, End::Exited(0), b"");
+    let on_third = fake.run(third, 4);
+    fake.end(first, runs[2].0, End::Exited(0), b"");
+    let on_first = fake.run(first, 5);
+    // The second dies with t3 running.
+    fake.say_bytes(second, Vec::new());
+    let lost = fake.result("t3");
+    let Outcome::Failed(Failure::Lost(why)) = &lost.outcome else { panic!("{lost:?}") };
+    assert!(why.contains("lib: replica 1 of its fork server (pid 2) closed its socket"), "{why}");
+    assert_eq!((&lost.trace, &lost.executed, lost.attempts), (&Trace::Unknown(why.clone()), &Executed::Not(why.clone()), 1));
+    assert!(fake.kills.is_empty(), "the server and its other replicas carry on");
+    let server = fake.queue.bins[0].server.as_ref().unwrap();
+    assert_eq!((server.live, server.room), (2, 2));
+    assert!(fake.frames(second).is_empty(), "nothing more is sent to it");
+    assert!(!fake.recvs.iter().any(|it| it.1 == second), "nor read from it");
+    fake.end(third, on_third, End::Exited(0), b"");
+    fake.end(first, on_first, End::Exited(0), b"");
+    let _ = on_second;
+    for test in ["t0", "t1", "t2", "t4", "t5"] {
+        assert_eq!(fake.result(test).outcome, Outcome::Passed, "{test}");
+    }
+    assert_eq!(fake.results.len(), 6);
+    assert_eq!(fake.frames(first), vec![Frame::Quit]);
+    assert_eq!(fake.frames(third), vec![Frame::Quit]);
+    fake.exit("/bin/lib", exited(Some(0), None, None));
+    assert!(fake.queue.finished());
+}
+
+/// A replica's ends are its own: one sent on another replica's connection breaks the protocol
+/// there, losing only what that replica runs.
+#[test]
+fn an_end_on_another_replica_s_connection_loses_only_that_replica() {
+    let names = names_of(4);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut fake = Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let first = fake.hello_with(0, &names, 1_000_000, 1);
+    assert_eq!(fake.replicate(first), Some(1));
+    let runs = fake.runs(first);
+    let second = fake.hello_with(0, &names, 1_000_000, 2);
+    fake.end(first, runs[0].0, End::Exited(0), b"");
+    let on_second = fake.run(second, 2);
+    fake.end(second, runs[1].0, End::Exited(0), b"");
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("t2").outcome else { panic!("{:?}", fake.results) };
+    assert!(why.contains("replica 1") && why.contains("broke the protocol"), "{why}");
+    assert!(fake.hangups.contains(&second) && fake.kills.is_empty());
+    let _ = on_second;
+    // The server still runs t1, and t3 after it.
+    fake.end(first, runs[1].0, End::Exited(0), b"");
+    let t3 = fake.run(first, 3);
+    fake.end(first, t3, End::Exited(0), b"");
+    assert_eq!(fake.results.len(), 4);
+    assert_eq!(fake.frames(first), vec![Frame::Quit]);
+}
+
+/// Until a replica says hello it is sent nothing; once it has, it takes its share. One whose
+/// hello comes after the binary has nothing left is told to quit at once.
+#[test]
+fn a_replica_s_hello_may_come_late() {
+    let names = names_of(4);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut fake = Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let first = fake.hello_with(0, &names, 1_000_000, 1);
+    assert_eq!(fake.replicate(first), Some(1));
+    let runs = fake.runs(first);
+    assert_eq!(indices(&runs), [0, 1]);
+    let late = fake.accept(0);
+    fake.end(first, runs[0].0, End::Exited(0), b"");
+    // Connected but silent: the server runs the next.
+    let t2 = fake.run(first, 2);
+    assert!(fake.frames(late).is_empty());
+    fake.say_hello(late, &names, 1_000_000, 2);
+    assert!(fake.frames(late).is_empty(), "every core is busy");
+    fake.end(first, runs[1].0, End::Exited(0), b"");
+    let t3 = fake.run(late, 3);
+    fake.end(late, t3, End::Exited(0), b"");
+    fake.end(first, t2, End::Exited(0), b"");
+    assert_eq!(fake.results.len(), 4);
+    assert_eq!((fake.frames(first), fake.frames(late)), (vec![Frame::Quit], vec![Frame::Quit]));
+
+    let mut fake = Fake::new(config(2), vec![binary("lib", vec![job("a", 0), job("b", 0)])]);
+    let first = fake.hello_with(0, &["a", "b"], 1_000_000, 1);
+    assert_eq!(fake.replicate(first), Some(1));
+    for (id, _) in fake.runs(first) {
+        fake.end(first, id, End::Exited(0), b"");
+    }
+    assert_eq!(fake.frames(first), vec![Frame::Quit]);
+    let late = fake.hello_with(0, &["a", "b"], 1_000_000, 2);
+    assert_eq!(fake.frames(late), vec![Frame::Quit]);
+    fake.say_bytes(late, Vec::new());
+    fake.say_bytes(first, Vec::new());
+    fake.exit("/bin/lib", exited(Some(0), None, None));
+    assert!(fake.queue.finished());
+    assert!(fake.results.iter().all(|it| it.outcome == Outcome::Passed));
+}
+
+/// A replica's hello must name the first's tests, and a replica can't ask again.
+#[test]
+fn a_replica_with_other_tests_or_a_second_hello_is_lost() {
+    let mut fake = Fake::new(config(3), vec![binary("lib", vec![job("a", 0), job("b", 0), job("c", 0)])]);
+    let first = fake.hello_with(0, &["a", "b", "c"], 1_000_000, 1);
+    assert_eq!(fake.replicate(first), Some(2));
+    let other = fake.hello_with(0, &["a", "b"], 1_000_000, 2);
+    assert!(fake.hangups.contains(&other));
+    let again = fake.hello_with(0, &["a", "b", "c"], 1_000_000, 3);
+    fake.say_hello(again, &["a", "b", "c"], 1_000_000, 3);
+    assert!(fake.hangups.contains(&again));
+    assert!(fake.kills.is_empty() && fake.results.is_empty(), "the server runs a, b and c: {:?}", fake.results);
+    assert_eq!(fake.runs(first).len(), 3);
+}
+
+/// The same tests give the same results in the same order whether one server or four replicas
+/// run them: the order, the retries in their place, the reads and the outputs.
+#[test]
+fn replicas_give_the_results_of_one_server() {
+    let one = drive(0);
+    let four = drive(1_000_000_000);
+    assert_eq!((one.1, four.1), (1, 4), "replicas that ran tests");
+    assert_eq!(one.0.len(), 10);
+    assert_eq!(one.0, four.0);
+    let flaky = one.0.iter().find(|it| it.test.as_deref() == Some("flaky")).unwrap();
+    assert_eq!((&flaky.outcome, flaky.attempts), (&Outcome::Passed, 2));
+    assert!(one.0.iter().any(|it| it.test.as_deref() == Some("bad") && it.outcome == Outcome::Failed(Failure::Code(1))));
+}
+
+/// Ten tests through four cores, each ended in the order it was sent, with a fork of `fork`
+/// nanoseconds: the results, and how many connections ran tests.
+fn drive(fork: u64) -> (Vec<Finished>, usize) {
+    let mut jobs: Vec<Job> = (0..8).map(|n| job(&format!("t{n}"), 90 - 10 * n)).collect();
+    let mut flaky = job("flaky", 55);
+    flaky.retries = 1;
+    jobs.push(flaky);
+    jobs.push(job("bad", 45));
+    let names: Vec<String> = jobs.iter().map(|it| it.name.clone()).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut fake = Fake::new(config(4), vec![binary("lib", jobs)]);
+    let first = fake.hello_with(0, &names, fork, 1);
+    let mut conns = vec![first];
+    let count = fake.replicate(first).unwrap_or(0);
+    let mut flight: VecDeque<(Conn, u64, u32)> = fake.runs(first).into_iter().map(|(id, index)| (first, id, index)).collect();
+    for pid in 0..count {
+        conns.push(fake.hello_with(0, &names, fork, 2 + pid));
+    }
+    let mut used = BTreeSet::new();
+    let mut tries: BTreeMap<u32, u32> = BTreeMap::new();
+    while let Some((conn, id, index)) = flight.pop_front() {
+        used.insert(conn.0);
+        let name = names[index as usize];
+        fake.append(0, &[Line::new(Seen::Read, "", "/lib/libc.so"), Line::new(Seen::Read, name, &format!("/ws/{name}"))]);
+        fake.advance(Duration::from_millis(1));
+        let tried = tries.entry(index).or_default();
+        *tried += 1;
+        let end = match (name, *tried) {
+            ("bad", _) | ("flaky", 1) => End::Exited(1),
+            _ => End::Exited(0),
+        };
+        fake.end(conn, id, end, name.as_bytes());
+        for &conn in &conns {
+            flight.extend(fake.runs(conn).into_iter().map(|(id, index)| (conn, id, index)));
+        }
+    }
+    (fake.results, used.len())
 }

@@ -7,7 +7,6 @@ use std::{
 };
 
 use base_db::{Db, Crate, FxIndexSet};
-use blaze_ids::radix;
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
     HirFileId,
@@ -18,11 +17,10 @@ use hir_expand::{
 };
 use la_arena::Arena;
 use span::{
-    AstIdMap, AstIdNode, ErasedFileAstId, FileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER,
-    RealSpanMap, Span, SpanAnchor, SyntaxContext,
+    AstIdMap, FileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor, SyntaxContext,
 };
 use syntax::{
-    AstNode, SourceFile, TextRange, TextSize,
+    AstNode, SourceFile, TextRange,
     ast::{self, HasModuleItem, HasName, StructKind},
 };
 
@@ -30,7 +28,7 @@ use crate::item_tree::{
     AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, Function, IdRange, Impl,
     ImportAlias, ItemKind, ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId, ModPath,
     NameId, PathId, RawVisibility, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use,
-    UseTree, UseTreeId, VisibilityExplicitness, attrs::lower_attrs_into,
+    UseTree, UseTreeId, VisibilityExplicitness, attrs::lower_attrs_into, items::Marks,
 };
 
 /// The index of the next element of an array `len` long, as a tree's `u32` ids count. The top
@@ -107,6 +105,8 @@ struct TreeBuilder {
     vis: Scoped<RawVisibility>,
 
     attr_owners: Vec<AttrOwner>,
+    /// The top level's owner, pushed after every item's at `finish`.
+    top_attrs: Option<AttrOwner>,
     attrs: Vec<Attr>,
     cfgs: Vec<CfgExpr>,
 }
@@ -136,7 +136,19 @@ impl<T: Hash + Eq> Scoped<T> {
 
     /// Ends the item being lowered: no later value is deduplicated against its.
     fn seal(&mut self) {
-        self.done.extend(self.scope.drain(..));
+        match self.scope.len() {
+            0 => {}
+            // Draining clears the table, which writes every control byte of its capacity: after
+            // one item of many names, far more than taking a few entries out one by one.
+            len if len * 16 < self.scope.capacity() => {
+                let from = self.done.len();
+                while let Some(value) = self.scope.pop() {
+                    self.done.push(value);
+                }
+                self.done[from..].reverse();
+            }
+            _ => self.done.extend(self.scope.drain(..)),
+        }
     }
 
     fn finish(&mut self) -> Box<[T]> {
@@ -145,7 +157,48 @@ impl<T: Hash + Eq> Scoped<T> {
     }
 }
 
+impl<T> Scoped<T> {
+    fn len(&self) -> u32 {
+        id(self.done.len() + self.scope.len())
+    }
+}
+
 impl TreeBuilder {
+    /// Where the next rows of each column go: at a top-level item's start, where its rows
+    /// begin in the tree; after the last, where they end.
+    fn marks(&self) -> Marks {
+        Marks {
+            top_level: id(self.pending_items.len()),
+            kinds: id(self.kinds.len()),
+            children: id(self.children.len()),
+            consts: id(self.consts.len()),
+            enums: id(self.enums.len()),
+            extern_blocks: id(self.extern_blocks.len()),
+            extern_crates: id(self.extern_crates.len()),
+            functions: id(self.functions.len()),
+            impls: id(self.impls.len()),
+            macro2s: id(self.macro2s.len()),
+            macro_calls: id(self.macro_calls.len()),
+            macro_rules: id(self.macro_rules.len()),
+            mods: id(self.mods.len()),
+            statics: id(self.statics.len()),
+            structs: id(self.structs.len()),
+            traits: id(self.traits.len()),
+            type_aliases: id(self.type_aliases.len()),
+            unions: id(self.unions.len()),
+            uses: id(self.uses.len()),
+            use_trees: id(self.use_trees.len()),
+            use_tree_lists: id(self.use_tree_lists.len()),
+            ctor_vis: id(self.ctor_vis.len()),
+            names: self.names.len(),
+            paths: self.paths.len(),
+            vis: self.vis.len(),
+            attr_owners: id(self.attr_owners.len()),
+            attrs: id(self.attrs.len()),
+            cfgs: id(self.cfgs.len()),
+        }
+    }
+
     /// Ends the top-level item being lowered ([`Scoped`]).
     fn seal(&mut self) {
         self.names.seal();
@@ -157,7 +210,8 @@ impl TreeBuilder {
     /// kept.
     fn finish(&mut self) -> ItemTree {
         debug_assert!(self.pending_use_trees.is_empty() && self.ctor_scratch.is_empty());
-        radix::sort_copy_by_key(&mut self.attr_owners, |owner| owner.owner.index);
+        self.attr_owners.extend(self.top_attrs.take());
+        let attr_index = super::attr_index(&self.attr_owners, self.kinds.len());
         ItemTree {
             top_level: column(&mut self.pending_items),
             kinds: column(&mut self.kinds),
@@ -187,6 +241,7 @@ impl TreeBuilder {
             paths: self.paths.finish(),
             vis: self.vis.finish(),
             attr_owners: column(&mut self.attr_owners),
+            attr_index,
             attrs: column(&mut self.attrs),
             cfgs: column(&mut self.cfgs),
         }
@@ -272,72 +327,29 @@ impl TreeBuilder {
             None => AttrOwner::ENABLED,
         };
         let attrs = IdRange { start: id(start), len: id(len) };
-        self.attr_owners.push(AttrOwner { owner, attrs, cfg });
-    }
-}
-
-/// Where the ast ids of the nodes lowered come from.
-#[derive(Copy, Clone)]
-enum Ids<'a> {
-    /// The map of the whole file.
-    File(&'a AstIdMap),
-    /// One item's ids ([`super::items::ItemSyntax`]): `[start, kind, id]` per node, its start
-    /// from `start`, ordered by it. No two of an item's nodes that have ids start at the same
-    /// offset with the same kind.
-    Item { ids: &'a [[u32; 3]], start: TextSize },
-}
-
-impl Ids<'_> {
-    fn ast_id<N: AstIdNode>(self, node: &N) -> FileAstId<N> {
-        match self {
-            Ids::File(map) => map.ast_id(node),
-            Ids::Item { ids, start } => {
-                let node = node.syntax();
-                let at = u32::from(node.text_range().start() - start);
-                let kind = node.kind() as u32;
-                let from = ids.partition_point(|it| it[0] < at);
-                let Some(&[.., raw]) =
-                    ids[from..].iter().take_while(|it| it[0] == at).find(|it| it[1] == kind)
-                else {
-                    panic!("no ast id for the {:?} at {at} of the item", node.kind())
-                };
-                FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(raw))
-            }
+        let row = AttrOwner { owner, attrs, cfg };
+        if owner == ModItemId::TOP_OWNER {
+            debug_assert!(self.top_attrs.is_none(), "the top level's attributes lowered twice");
+            self.top_attrs = Some(row);
+            return;
         }
-    }
-}
-
-/// Where the spans of the nodes lowered come from.
-#[derive(Copy, Clone)]
-pub(super) enum Spans<'a> {
-    /// The map of the whole file.
-    File(SpanMap<'a>),
-    /// One item's map, as [`RealSpanMap::within`] the item, its offsets from `start`.
-    Item { map: &'a RealSpanMap, start: TextSize },
-}
-
-impl Spans<'_> {
-    pub(super) fn span_for_range(self, range: TextRange) -> Span {
-        match self {
-            Spans::File(map) => map.span_for_range(range),
-            Spans::Item { map, start } => map.span_for_range(range - start),
-        }
-    }
-}
-
-impl syntax_bridge::SpanMapper for Spans<'_> {
-    fn span_for(&self, range: TextRange) -> Span {
-        self.span_for_range(range)
+        // `ItemTree::attrs` relies on the order; each item's attributes are lowered right
+        // after its id is made, so this holds without a sort.
+        assert!(
+            self.attr_owners.last().is_none_or(|last| last.owner < owner),
+            "attribute owners out of the order of their items"
+        );
+        self.attr_owners.push(row);
     }
 }
 
 pub(super) struct Ctx<'db> {
     pub(super) db: &'db Db,
     tree: TreeBuilder,
-    ids: Ids<'db>,
-    span_map: OnceCell<Spans<'db>>,
-    /// The file lowered whole, whose span map is read when first wanted; none for an item.
-    file: Option<HirFileId>,
+    ids: &'db AstIdMap,
+    /// The file's span map, read when first wanted.
+    span_map: OnceCell<SpanMap<'db>>,
+    file: HirFileId,
     cfg_options: OnceCell<&'db CfgOptions>,
     krate: Crate,
 }
@@ -347,39 +359,16 @@ impl<'db> Ctx<'db> {
         Self {
             db,
             tree: SCRATCH.take(),
-            ids: Ids::File(file.ast_id_map(db)),
-            file: Some(file),
+            ids: file.ast_id_map(db),
+            file,
             cfg_options: OnceCell::new(),
             span_map: OnceCell::new(),
             krate,
         }
     }
 
-    /// A context lowering one item of a file, at `start` of it: `ids` and `spans` its own, as
-    /// [`super::items::ItemSyntax`] keeps them, so it reads nothing of the file's.
-    pub(super) fn for_item(
-        db: &'db Db,
-        krate: Crate,
-        ids: &'db [[u32; 3]],
-        spans: &'db RealSpanMap,
-        start: TextSize,
-    ) -> Self {
-        Self {
-            db,
-            tree: SCRATCH.take(),
-            ids: Ids::Item { ids, start },
-            file: None,
-            cfg_options: OnceCell::new(),
-            span_map: OnceCell::from(Spans::Item { map: spans, start }),
-            krate,
-        }
-    }
-
-    pub(super) fn span_map(&self) -> Spans<'db> {
-        *self.span_map.get_or_init(|| {
-            let file = self.file.expect("an item's context is made with its spans");
-            Spans::File(file.span_map(self.db))
-        })
+    pub(super) fn span_map(&self) -> SpanMap<'db> {
+        *self.span_map.get_or_init(|| self.file.span_map(self.db))
     }
 
     /// Lowers `node`'s attributes into the tree's, and returns where they start and the `cfg`
@@ -463,6 +452,21 @@ impl<'db> Ctx<'db> {
         for item in item_owner.items() {
             self.pend_top(&item);
         }
+        self.finish()
+    }
+
+    /// [`Self::lower_module_items`], pushing onto `marks` where each top-level item's rows
+    /// begin, then where the last one's end: what [`super::items`] reuses rows of.
+    pub(super) fn lower_module_items_marked(
+        mut self,
+        item_owner: &impl HasModuleItem,
+        marks: &mut Vec<Marks>,
+    ) -> ItemTree {
+        for item in item_owner.items() {
+            marks.push(self.tree.marks());
+            self.pend_top(&item);
+        }
+        marks.push(self.tree.marks());
         self.finish()
     }
 
@@ -781,8 +785,16 @@ impl<'db> Ctx<'db> {
         let range = path.syntax().text_range();
         let path =
             ModPath::from_src(self.db, path, &mut |range| span_map.span_for_range(range).ctx)?;
+        let expand_to = match hir_expand::ExpandTo::of_call_site(m) {
+            // A block's last call not in braces is an expression (rustc's `parse_stmt_mac`),
+            // which defines no items: the body's lowering expands it.
+            Ok(hir_expand::ExpandTo::Expr) => return None,
+            Ok(it) => it,
+            Err(parent) => {
+                unreachable!("an item tree lowers the calls of item lists and statements, not of a `{parent:?}`")
+            }
+        };
         let ast_id = self.ids.ast_id(m);
-        let expand_to = hir_expand::ExpandTo::from_call_site(m);
         let res = MacroCall {
             path: self.tree.path(path),
             expand_to,

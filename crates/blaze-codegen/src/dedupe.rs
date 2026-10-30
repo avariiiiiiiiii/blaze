@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
-use crate::{CompiledFunction, Data, InstanceKey, Reloc, Target, Unwind, content::code_id};
+use crate::{CompiledFunction, Data, InstanceKey, Relocs, Target, Unwind, content::code_id};
 
 /// What became of a build's functions.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
@@ -42,11 +42,11 @@ fn rename_target(
 }
 
 fn rename_relocs(
-    relocs: &[Reloc],
+    relocs: &Relocs,
     kept: &HashMap<InstanceKey, InstanceKey>,
     data: &HashMap<ContentId, ContentId>,
-) -> Vec<Reloc> {
-    relocs.iter().map(|reloc| Reloc { target: rename_target(&reloc.target, kept, data), ..reloc.clone() }).collect()
+) -> Relocs {
+    relocs.map(|target| rename_target(target, kept, data))
 }
 
 fn rename_unwind(
@@ -82,7 +82,7 @@ fn rename(
         Target::Function(key) | Target::Direct(key) => kept.contains_key(key),
         _ => false,
     };
-    let names_one = |relocs: &[Reloc]| relocs.iter().any(|it| names(&it.target));
+    let names_one = |relocs: &Relocs| relocs.targets().iter().any(names);
     let routine_named = match &function.unwind {
         Some(Unwind::Dwarf { personality: Some(it), .. } | Unwind::Windows { handler: Some(it), .. }) => names(it),
         _ => false,
@@ -110,7 +110,7 @@ fn rename(
 /// `mergeable` says which may be merged; any function's callers are renamed.
 pub fn dedupe(
     functions: &mut Vec<CompiledFunction>,
-    mergeable: &dyn Fn(&InstanceKey) -> bool,
+    mergeable: impl Fn(&InstanceKey) -> bool,
 ) -> Deduped {
     let mut kept: HashMap<InstanceKey, InstanceKey> = HashMap::new();
     loop {
@@ -147,7 +147,7 @@ pub fn dedupe(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Arch, RelocKind};
+    use crate::{Arch, RelocKind, Relocation};
 
     fn key(n: u8) -> InstanceKey {
         InstanceKey(ContentId([n; 32]))
@@ -157,7 +157,7 @@ mod tests {
         let relocs = calls
             .iter()
             .enumerate()
-            .map(|(at, callee)| Reloc {
+            .map(|(at, callee)| Relocation {
                 at: 1 + 5 * at as u32,
                 kind: RelocKind::PcRel32,
                 target: Target::Direct(key(*callee)),
@@ -183,7 +183,8 @@ mod tests {
     fn an_lsda_follows_its_data_and_a_personality_its_function() {
         // 2 and 3 are equal; 9's personality is 3 and its LSDA points at 3.
         let lsda = |to: u8| {
-            Data::new(4, vec![0; 4], vec![Reloc { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(to)), addend: 0 }])
+            let relocs = vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(to)), addend: 0 }];
+            Data::new(4, vec![0; 4], relocs.into())
         };
         let mut caller = function(9, 0x55, &[]);
         let area = lsda(3);
@@ -221,7 +222,7 @@ mod tests {
         assert_eq!(deduped.merged, BTreeMap::from([(key(3), key(2)), (key(5), key(4))]));
         let keys: Vec<_> = functions.iter().map(|it| it.key).collect();
         assert_eq!(keys, vec![key(2), key(4), key(6)]);
-        assert_eq!(functions[2].relocs[0].target, Target::Direct(key(4)));
+        assert_eq!(functions[2].relocs.targets(), [Target::Direct(key(4))]);
     }
 
     #[test]
@@ -245,7 +246,7 @@ mod tests {
         let mut functions =
             vec![function(2, 0x90, &[]), function(3, 0x90, &[]), function(7, 0xc3, &[3])];
         dedupe(&mut functions, &|it| *it != key(7));
-        assert_eq!(functions.iter().find(|it| it.key == key(7)).unwrap().relocs[0].target, Target::Direct(key(2)));
+        assert_eq!(functions.iter().find(|it| it.key == key(7)).unwrap().relocs.targets(), [Target::Direct(key(2))]);
     }
 
     #[test]
@@ -254,18 +255,18 @@ mod tests {
             Data::new(
                 8,
                 vec![0; 8],
-                vec![Reloc { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(to)), addend: 0 }],
+                vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Direct(key(to)), addend: 0 }].into(),
             )
         };
         let mut caller = function(9, 0x55, &[]);
         let table = vtable(3);
-        caller.relocs.push(Reloc { at: 0, kind: RelocKind::PcRel32, target: Target::Data(table.id), addend: -4 });
+        caller.relocs.push(Relocation { at: 0, kind: RelocKind::PcRel32, target: Target::Data(table.id), addend: -4 });
         caller.data.push(table);
         let mut functions = vec![function(2, 0x90, &[]), function(3, 0x90, &[]), caller];
         dedupe(&mut functions, &|_| true);
         let caller = functions.iter().find(|it| it.key == key(9)).unwrap();
         assert_eq!(caller.data[0], vtable(2));
-        assert_eq!(caller.relocs[0].target, Target::Data(vtable(2).id));
+        assert_eq!(caller.relocs.targets(), [Target::Data(vtable(2).id)]);
     }
 
     #[test]

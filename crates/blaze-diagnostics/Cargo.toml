@@ -17,6 +17,7 @@ doctest = false
 # The version rustc renders its diagnostics with (`rustc_errors`'s
 # `annotate_snippet_emitter_writer.rs`), so that ours read byte for byte as rustc's do.
 annotate-snippets.workspace = true
+blake3.workspace = true
 either.workspace = true
 hashbrown.workspace = true
 memchr.workspace = true
@@ -54,6 +55,7 @@ syntax.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 expect-test.workspace = true
+proptest.workspace = true
 salsa.workspace = true
 test-fixture.workspace = true
 triomphe.workspace = true

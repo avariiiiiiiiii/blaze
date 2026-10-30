@@ -31,6 +31,7 @@
 > told `lints` and `lints-driver` by tmux, 2026-10-29. lints-driver: yes to `fn_def`,
 > `impl_def`, `adt_source`, `item_range`, `expansion()` (plus `cx.def(ast::Node) ->
 > Option<hir::ModuleDef>`); `macro_def`, `macro_source`, `resolve_name` awaiting an answer.
+> forwarded to lints (from requests, pass 16; told by tmux).
 
 ## lints-driver: `lints/mod.rs` call shapes
 
@@ -45,3 +46,5 @@ check_closure(cx, ast::ClosureExpr)}`, `match_like_matches_macro::{check_match(c
 ast::MatchExpr), check_if_let(cx, ast::IfExpr)}`, `bool_assert_comparison::check`,
 `useless_format::check`, `useless_borrows_in_formatting::check` (each `ast::MacroCall`). All
 take `cx: &mut Cx<'_, 't>`.
+
+> forwarded to lints (from requests, pass 16; told by tmux).

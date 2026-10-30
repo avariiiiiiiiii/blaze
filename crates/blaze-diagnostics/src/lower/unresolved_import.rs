@@ -13,6 +13,8 @@
 //! `find_similarly_named_module_or_crate`, `into_struct_error` of `FailedToResolve`) and
 //! `lib.rs` (`names_to_string`, `module_to_string`) (MIT or Apache-2.0).
 
+use std::cell::OnceCell;
+
 use blaze_items::Fact;
 use hir::{HasVisibility as _, InFile, ItemInNs, ModPath, ModuleDef, Name, PathKind, StructKind};
 use span::Edition;
@@ -84,7 +86,7 @@ struct ImportError {
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedImport) -> Vec<Found> {
     let tree = cx.node(d.decl);
     let file = tree.file_id;
-    let r = Resolver { cx, file, node: tree.value.syntax().clone() };
+    let r = Resolver::new(cx, file, tree.value.syntax().clone());
     let mine = r.failure(&r.import(&tree.value));
     let error = match mine {
         Some(Failure::Path { at, error }) => return vec![Found::new(path_diag(&r, at, error), Phase::Resolve)],
@@ -103,7 +105,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedImport) -> Vec<Found> {
     let leaves = tree.value.syntax().ancestors().find_map(ast::Use::cast).map_or_else(Vec::new, |it| leaves(&it));
     let at = leaves.iter().position(|it| it.syntax() == tree.value.syntax()).unwrap_or(leaves.len());
     let import_error = |leaf: &ast::UseTree| {
-        let r = Resolver { cx, file, node: leaf.syntax().clone() };
+        let r = Resolver::new(cx, file, leaf.syntax().clone());
         match r.failure(&r.import(leaf)) {
             Some(Failure::Import(error)) => Some(error),
             _ => None,
@@ -171,7 +173,7 @@ pub(super) fn macro_path_error(
     expected: (&str, &str),
     bang: bool,
 ) -> Diag {
-    let r = Resolver { cx, file, node };
+    let r = Resolver::new(cx, file, node);
     let (last, module_path) = path.split_last().expect("a path of one segment at least");
     let mut module = None;
     for (at, segment) in module_path.iter().enumerate() {
@@ -270,9 +272,15 @@ struct Resolver<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     file: hir::HirFileId,
     node: SyntaxNode,
+    /// [`Resolver::current`], found once: each path the import resolves asks for it.
+    current: OnceCell<Option<hir::Module>>,
 }
 
-impl Resolver<'_, '_, '_> {
+impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
+    fn new(cx: &'c Cx<'a, 'db>, file: hir::HirFileId, node: SyntaxNode) -> Self {
+        Resolver { cx, file, node, current: OnceCell::new() }
+    }
+
     fn span(&self, range: TextRange) -> Span {
         self.cx.span(InFile::new(self.file, range))
     }
@@ -283,7 +291,9 @@ impl Resolver<'_, '_, '_> {
 
     /// The module the import is in: `self` of its paths.
     fn current(&self) -> Option<hir::Module> {
-        Some(self.cx.sema.scope(&self.node)?.module().nearest_non_block_module(self.cx.db))
+        *self.current.get_or_init(|| {
+            Some(self.cx.sema.scope(&self.node)?.module().nearest_non_block_module(self.cx.db))
+        })
     }
 
     /// rustc's import of the leaf use tree `tree`: the paths of the trees it is nested in and
@@ -654,10 +664,14 @@ impl Resolver<'_, '_, '_> {
         let current = self.current()?;
         let mut candidates: Vec<Vec<String>> = self
             .cx
-            .krate
-            .modules(db)
-            .into_iter()
-            .filter(|m| m.name(db).is_some_and(|it| it.as_str() == name))
+            .paths()
+            .decls(self.cx)
+            .named(name)
+            .iter()
+            .filter_map(|it| match it.def {
+                hir::ModuleDef::Module(module) if it.local => Some(module),
+                _ => None,
+            })
             .filter(|m| m.is_visible_from(db, current))
             .map(|m| {
                 let mut segments: Vec<String> = Vec::new();

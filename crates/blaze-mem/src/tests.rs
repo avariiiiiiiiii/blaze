@@ -450,6 +450,30 @@ fn frame_tasks_nest_with_frames_of_their_own() {
 }
 
 #[test]
+fn frame_current_is_the_innermost_task_and_comes_back_to_the_outer() {
+    assert!(!frame::in_task());
+    frame::task(Tag::Infer, |outer| {
+        let outer_at = outer as *const Frame;
+        frame::current(|frame| assert!(std::ptr::eq(frame, outer_at), "the running task's"));
+        frame::task(Tag::Mir, |inner| {
+            frame::current(|frame| {
+                assert!(std::ptr::eq(frame, inner), "a nested task's own");
+                frame.alloc_slice_copy(&[3u32; 16]);
+            });
+            assert!(inner.used() >= 64, "what current allocated is the inner task's");
+        });
+        frame::current(|frame| assert!(std::ptr::eq(frame, outer_at), "back to the outer"));
+    });
+    assert!(!frame::in_task());
+}
+
+#[test]
+#[should_panic(expected = "frame::current outside any frame::task")]
+fn frame_current_outside_a_task_stops() {
+    frame::current(|frame| frame.used());
+}
+
+#[test]
 fn frame_task_counts_its_peak_to_its_tag() {
     let before = tag::snapshot().get(Tag::Expand).allocated;
     frame::task(Tag::Expand, |frame| {
@@ -866,6 +890,136 @@ fn pool_allocates_nothing_once_warm() {
     assert_eq!(used.allocations, 0, "a warm pool recycles its slots");
 }
 
+// Shared pooled values
+
+#[test]
+fn shared_matches_arc_on_random_operations() {
+    let pool = Pool::<pool::Counted<[u64; 4]>>::new(1 << 16, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    let mut rng = Xorshift64Star::new(11);
+    let mut live: Vec<pool::Shared<'_, [u64; 4]>> = Vec::new();
+    let mut model: Vec<Arc<[u64; 4]>> = Vec::new();
+    for _ in 0..100_000 {
+        match rng.below(5) {
+            0 => {
+                let value = [rng.next(); 4];
+                live.push(cache.share(value));
+                model.push(Arc::new(value));
+            }
+            1 if !live.is_empty() => {
+                let i = rng.below(live.len() as u64) as usize;
+                live.push(live[i].clone());
+                model.push(Arc::clone(&model[i]));
+            }
+            2 if !live.is_empty() => {
+                let i = rng.below(live.len() as u64) as usize;
+                drop(live.swap_remove(i));
+                model.swap_remove(i);
+            }
+            3 if !live.is_empty() => {
+                let i = rng.below(live.len() as u64) as usize;
+                let value = rng.next();
+                pool::Shared::make_mut(&mut live[i], &mut cache)[1] = value;
+                Arc::make_mut(&mut model[i])[1] = value;
+            }
+            _ if !live.is_empty() => {
+                let i = rng.below(live.len() as u64) as usize;
+                assert_eq!(pool::Shared::owners(&live[i]) as usize, Arc::strong_count(&model[i]));
+            }
+            _ => {}
+        }
+    }
+    for (a, (shared, arc)) in live.iter().zip(&model).enumerate() {
+        assert_eq!(**shared, **arc);
+        for (other, other_arc) in live.iter().zip(&model).skip(a + 1).take(8) {
+            assert_eq!(pool::Shared::ptr_eq(shared, other), Arc::ptr_eq(arc, other_arc));
+        }
+    }
+}
+
+#[test]
+fn shared_drops_each_value_once_when_its_last_owner_goes() {
+    let drops = Rc::new(Cell::new(0));
+    let pool = Pool::<pool::Counted<Counted>>::new(64, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    let a = cache.share(Counted { value: 1, drops: Rc::clone(&drops) });
+    let b = a.clone();
+    let c = b.clone();
+    assert_eq!(pool::Shared::owners(&a), 3);
+    drop(a);
+    drop(c);
+    assert_eq!(drops.get(), 0, "an owner is left");
+    assert_eq!(b.value, 1);
+    drop(b);
+    assert_eq!(drops.get(), 1, "the last owner drops it");
+}
+
+#[test]
+fn shared_make_mut_copies_only_while_shared() {
+    let pool = Pool::<pool::Counted<Vec<u32>>>::new(64, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    let mut a = cache.share(vec![1, 2, 3]);
+    let at = pool::Shared::index(&a);
+    pool::Shared::make_mut(&mut a, &mut cache).push(4);
+    assert_eq!(pool::Shared::index(&a), at, "one owner changes in place");
+    let b = a.clone();
+    pool::Shared::make_mut(&mut a, &mut cache).push(5);
+    assert_ne!(pool::Shared::index(&a), at, "a shared value is copied first");
+    assert_eq!(*a, [1, 2, 3, 4, 5]);
+    assert_eq!(*b, [1, 2, 3, 4], "the other owner keeps the old value");
+    assert!(pool::Shared::get_mut(&mut a).is_some());
+}
+
+#[test]
+fn shared_owners_on_many_threads_drop_it_once() {
+    let pool = Pool::<pool::Counted<[u64; 2]>>::new(1 << 12, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    let values: Vec<_> = (0..256u64).map(|i| cache.share([i, !i])).collect();
+    thread::scope(|scope| {
+        for _ in 0..8 {
+            let owned: Vec<_> = values.iter().cloned().collect();
+            scope.spawn(move || {
+                for (i, shared) in owned.into_iter().enumerate() {
+                    assert_eq!(*shared, [i as u64, !(i as u64)]);
+                    let more = shared.clone();
+                    drop(shared);
+                    drop(more);
+                }
+            });
+        }
+    });
+    for shared in &values {
+        assert_eq!(pool::Shared::owners(shared), 1, "every other owner went");
+    }
+    drop(values);
+    drop(cache);
+    let mut cache = pool.cache();
+    let again: Vec<_> = (0..256u64).map(|i| cache.share([i, i])).collect();
+    assert!(pool.carved() <= 256 + 2 * 128, "the freed slots are reused");
+    drop(again);
+}
+
+#[test]
+fn shared_allocates_nothing_once_warm() {
+    let pool = Pool::<pool::Counted<[u64; 8]>>::new(1 << 14, Tag::Link).expect("reserve");
+    let mut cache = pool.cache();
+    let mut held = Vec::with_capacity(2_000);
+    let mut round = || {
+        for i in 0..1_000 {
+            let shared = cache.share([i; 8]);
+            held.push(shared.clone());
+            held.push(shared);
+        }
+        for shared in held.iter_mut().step_by(2) {
+            pool::Shared::make_mut(shared, &mut cache)[0] += 1;
+        }
+        held.clear();
+    };
+    round();
+    let (_, used) = measure(&mut round);
+    assert_eq!(used.allocations, 0, "warm shared values reuse their slots");
+}
+
 // Slab and handles
 
 #[test]
@@ -929,6 +1083,20 @@ fn slab_reuses_slots_with_new_generations() {
     assert!(slab.is_empty());
     assert_eq!(slab.get(b), None);
     assert_eq!(slab.get(c), None);
+}
+
+#[test]
+fn slab_handle_at_names_the_slot_s_current_value_only() {
+    let mut slab = Slab::<u64>::new(16, Tag::Io).expect("reserve");
+    let first = slab.insert(1);
+    assert_eq!(slab.handle_at(first.index()), Some(first));
+    assert_eq!(slab.remove(first), Some(1));
+    assert_eq!(slab.handle_at(first.index()), None, "a free slot has no handle");
+    let second = slab.insert(2);
+    assert_eq!(second.index(), first.index(), "the slot is reused");
+    assert_eq!(slab.handle_at(second.index()), Some(second), "with its new generation");
+    assert_eq!(slab.get(first), None, "the old handle stays stale");
+    assert_eq!(slab.handle_at(99), None, "a slot never made");
 }
 
 #[test]

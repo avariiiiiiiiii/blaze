@@ -23,8 +23,10 @@ tracing.workspace = true
 indexmap.workspace = true
 
 # local deps
+blaze-format.workspace = true
 blaze-graph.workspace = true
 blaze-ids.workspace = true
+blaze-mem.workspace = true
 blaze-vfs.workspace = true
 cfg.workspace = true
 syntax.workspace = true

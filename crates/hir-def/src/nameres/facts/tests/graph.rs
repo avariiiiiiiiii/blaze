@@ -889,11 +889,11 @@ fn chain(krate: Crate, len: u32) -> ImportShape {
 /// `partition`'s allocations: one per table, none per edge, pair or fact. The solver's 12
 /// (paths, the levels' paths and first modules, the pair map and rows, the per-module pair and
 /// glob heads, the links, the seen set, the worklist, the prelude levels, the edge list), the
-/// CSR's 4 (the counting sorts' cursors and buckets, offsets, targets) and the components' 5
-/// (`rindex`, frames, stack, component starts, members). The fixed point's tables are sized
-/// from the shape (a few facts per path level) and only grow, by doubling, on a shape past
-/// that estimate.
-const PARTITION_ALLOCATIONS: u64 = 21;
+/// CSR's 5 (the first pass's starts and sources by target, the cursors, offsets, targets) and
+/// the components' 5 (`rindex`, frames, stack, component starts, members). The fixed point's
+/// tables are sized from the shape (a few facts per path level) and only grow, by doubling, on
+/// a shape past that estimate.
+const PARTITION_ALLOCATIONS: u64 = 22;
 
 #[test]
 fn partition_allocations_do_not_grow_with_edges() {

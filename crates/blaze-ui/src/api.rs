@@ -24,6 +24,7 @@ const OUTPUT: usize = 64 << 10;
 /// The text of one response, each line ending in a newline; empty for one that says nothing
 /// to a person (a request's successful end).
 pub fn lines(response: &Response, color: bool) -> String {
+    // alloc: the one-call form; a printer of many writes `lines_into` one buffer
     let mut out = String::new();
     lines_into(&mut out, response, color);
     out
@@ -349,6 +350,7 @@ pub fn work_json(worked: &Worked) -> String {
         LinkKind::Patched => "patched",
         LinkKind::Placed => "placed",
     };
+    // alloc: the CLI's, once per request
     format!(
         "{{\"reason\": \"blaze-work\", \"reran\": {}, \"green\": {}, \"compiled\": {}, \
          \"found\": {}, \"link\": \"{link}\", \"critical_path_us\": {}}}\n",
@@ -383,6 +385,7 @@ pub fn trace_cbor(traced: &[Traced]) -> Result<Vec<u8>, blaze_protocol::cbor::Er
 /// Output of user code: lossily as text, its last [`OUTPUT`] bytes, each line ended.
 fn bytes(out: &mut String, bytes: &[u8]) {
     let start = bytes.len().saturating_sub(OUTPUT);
+    // alloc: a `Cow`, owned only for output that is not UTF-8
     let text = String::from_utf8_lossy(&bytes[start..]);
     if start > 0 {
         put!(out, "({start} bytes cut)\n");
@@ -526,7 +529,7 @@ mod tests {
         blaze_protocol::cbor::check(&bytes).unwrap();
         let trace: blaze_v2_proof::Trace = blaze_protocol::cbor::from_slice(&bytes).unwrap();
         assert_eq!(trace.keys, [key(1), key(2)]);
-        assert!(trace.ran.get(1) && !trace.ran.get(0));
+        assert!(trace.ran.contains(1) && !trace.ran.contains(0));
         assert_eq!(trace.reads, [0]);
         assert_eq!(trace.edges_from, [0, 0, 1]);
     }

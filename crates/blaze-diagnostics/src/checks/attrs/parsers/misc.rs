@@ -39,6 +39,7 @@ use crate::{
     checks::attrs::{
         accept::Accept,
         args::{self, ArgParser, MetaItemOrLit, NameValue},
+        is, with_path,
         parsed::{Parsed, ParsedAttr, ProcMacroKind},
     },
     cx::Cx,
@@ -530,7 +531,7 @@ fn debugger_visualizer(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
 fn path(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
     if matches!(cx.target(), Target::Mod)
         && args.as_name_value().and_then(NameValue::value_as_str).is_none()
-        && cx.owner.attrs.iter().position(|it| it.is("path")) == Some(cx.index)
+        && cx.owner.attrs.iter().position(|it| is(it, "path")) == Some(cx.index)
     {
         let mut diag = malformed(cx.cx, cx.attr, "path", &PATH, cx.attr.inner);
         diag.stop();
@@ -598,9 +599,13 @@ fn attribute_macro(name: &str) -> Option<Option<Template>> {
 /// value where rustc reads it before expansion makes a literal of a macro call there.
 pub(crate) fn validate(cx: &Cx<'_, '_>, attr: &Attr, errors: &mut Vec<Diag>) {
     let AttrKind::Meta { written, .. } = &attr.kind else { return };
-    let path = attr.path();
-    let name = match path.as_slice() {
-        [one] => Some(one.as_str()),
+    with_path(attr, |path| validate_path(cx, attr, written, path, errors));
+}
+
+/// [`validate`] of `attr`, written in `written`, whose path is `path`.
+fn validate_path(cx: &Cx<'_, '_>, attr: &Attr, written: &ast::Attr, path: &[&str], errors: &mut Vec<Diag>) {
+    let name = match path {
+        [one] => Some(*one),
         _ => None,
     };
     let args = attr.args();
@@ -610,8 +615,7 @@ pub(crate) fn validate(cx: &Cx<'_, '_>, attr: &Attr, errors: &mut Vec<Diag>) {
         errors.push(diag);
         return;
     }
-    let segments: Vec<&str> = path.iter().map(String::as_str).collect();
-    if table::builtin(&segments).is_some() {
+    if table::builtin(path).is_some() {
         return;
     }
     let edition = attr.file.edition(cx.db);

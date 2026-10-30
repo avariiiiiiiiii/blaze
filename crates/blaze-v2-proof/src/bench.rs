@@ -5,9 +5,9 @@
 
 use std::time::Instant;
 
-use blaze_ids::{ContentId, Fingerprint};
+use blaze_ids::{ContentId, Fingerprint, bits::BitSet};
 use blaze_query::{QueryKey, QueryKind};
-use blaze_v2_proof::{Bits, Rng, Trace, bytes, join, wire::View};
+use blaze_v2_proof::{Rng, Trace, bytes, join, wire::View};
 use serde::Deserialize;
 
 #[derive(Deserialize, Clone, Copy)]
@@ -31,7 +31,9 @@ pub(crate) fn run(workload: Workload) -> f64 {
     match workload {
         Workload::FirstDifference => {
             let mut rng = Rng::new(0x5eed);
+            // alloc: the bench's inputs, made once a run before the timer starts.
             let a: Vec<u8> = (0..OUTPUT_BYTES / 8).flat_map(|_| rng.next_u64().to_le_bytes()).collect();
+            // clone: as above.
             let mut b = a.clone();
             *b.last_mut().expect("the output is not empty") ^= 1;
             let began = Instant::now();
@@ -66,21 +68,26 @@ fn nushell_sized() -> Trace {
             }
             QueryKey { kind: QueryKind(0x2000 + rng.below(16) as u16), input: ContentId(input) }
         })
+        // alloc: the bench's inputs, made once a run before the timer starts.
         .collect();
     keys.sort_unstable();
     keys.dedup();
     let n = keys.len();
+    // alloc: as above.
     let fingerprints: Vec<Fingerprint> = (0..n).map(|_| Fingerprint(u128::from(rng.next_u64()))).collect();
-    let mut has = Bits::with_len(n);
-    let mut ran = Bits::with_len(n);
+    let mut has = BitSet::<u32>::new(n);
+    let mut ran = BitSet::<u32>::new(n);
     for i in 0..n as u32 {
-        has.set(i);
+        has.insert(i);
         if rng.below(100) == 0 {
-            ran.set(i);
+            ran.insert(i);
         }
     }
+    // alloc: as above.
     let reads: Vec<u32> = (0..n * EDGES_PER_KEY).map(|_| rng.below(n as u64) as u32).collect();
+    // alloc: as above.
     let saw = reads.iter().map(|&r| fingerprints[r as usize]).collect();
+    // alloc: as above.
     let edges_from = (0..=n).map(|i| (i * EDGES_PER_KEY) as u32).collect();
     Trace { keys, has, ran, fingerprints, edges_from, reads, saw }
 }

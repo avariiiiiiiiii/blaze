@@ -50,11 +50,48 @@ that keep names.
 
 - `Interned<ModPath>` removal across five children and `hir-expand`: `AstIdWithPath::path`
   (`hir-def/src/lib.rs`) and `hir_expand::attrs::Attr::path` are `ModPath`; the collector,
-  `assoc.rs` and `attr_resolution.rs` read them by copy. `crates/hir/src/semantics.rs:2843` is
-  requested in `v2/requests/db.md`; `intern::impl_internable!(ModPath)` in
-  `hir-expand/src/mod_path.rs` can go once that edit lands.
+  `assoc.rs` and `attr_resolution.rs` read them by copy. `crates/hir/src/semantics.rs` no
+  longer uses it either, so no `Interned<ModPath>` is left in the workspace;
+  `intern::impl_internable!(ModPath)` in `hir-expand/src/mod_path.rs` is requested deleted.
+
+## Round 2: speed of light, hot_lint, allocation budgets
+
+Five children (`speed-hir-sol-basedb`, `-expand`, `-defs`, `-nameres`, `-items`) each wrote a
+section of [speed-of-light.md](speed-of-light.md) (and the item tree's in
+[../format/speed-of-light.md](../format/speed-of-light.md)), fixed or justified the `hot_lint`
+findings in free files and filed exact edits for owned ones, and wrote `blaze-alloc-count` budget
+tests. Where each stands against its bound:
+
+| part | at the bound | furthest off, and what removes it |
+|---|---|---|
+| name resolution | `ItemScope::get`, scope push and lookup, `find_path` | an edit that changes no name, ≥ 40× (forward invalidation in the query engine); `resolve_path` 3.3× and `Resolver` 3.5× (`scope_name`, `SmallVec` scopes, db-expand-names) |
+| attributes, locs, lang items, upvars | loc intern hit, `crate_lang_items` without the feature | `AttrFlags` after a body edit ≈ 50× (read attributes off `file_outline`, db-expand item 12); `upvars` ≈ 11× to 14× (`has_closures`, then locals kept at lowering) |
+| signatures | lowering relative to the item | a body edit ≈ 30× until the attribute change above lands, then ≈ 7× |
+| expansion | `Name`/`ModPath`/span lookups, `macro_rules`, `parse_macro_expansion` | a builtin derive ≈ 4× and `macro_arg` ≈ 2.5× (a reused output builder, one-block `TopSubtree`, format) |
+| inputs | `parse` hit | `set_view_root` of a changed file in a large root up to 80× (a 16-way tree for the root's content id); the crate-graph set 50× (compare before hashing) |
+
+Every memo hit is 2× its 5.4 ns bound, all of it salsa's hit path (speed-salsa's section).
+
+Budgets: `crates/hir-def/src/alloc_budgets.rs` (flag reads, gated values, loc intern hits,
+lang-item lookups, upvar reads: 0 each), path resolution (`nameres/tests/paths.rs`), hir-expand
+(`budget_tests.rs`, `macro_expansion_tests/budgets.rs`), base-db (`tests.rs`); the item tree
+accessors' budgets are filed as edit D in `v2/requests/frontend-deps.md` ("speed-hir-sol-items"). hir-def's harness (the
+`#[global_allocator]`, `mod alloc_budgets`, and the port of `paths.rs` off its own allocator,
+which must land together) is filed in `v2/requests/db-expand.md`, "speed-hir-sol-defs" item 1
+and "speed-hir-sol-nameres".
+
+Requests left with owners (2026-10-29), all in `v2/requests/db-expand.md` "## speed-hir: four
+edits" unless said: `import_map.rs`'s counting sort onto `blaze_ids::radix::Csr`; base-db's
+`Table` onto `intern::swiss::Index`; `upvars` reading `ExpressionStore::has_closures`
+(the store side in `v2/requests/mem-format.md`); deleting `impl_internable!(ModPath)`, which
+nothing uses since `Interned<ModPath>` is gone everywhere.
 
 ## Left, and what it would take
+
+- `upvars` of a body with a closure builds a `Resolver` to find the locals its paths name (≈ 2.4
+  µs against ≈ 170 ns). Keeping, for each single-segment path expression, the local it resolves
+  to at lowering (rustc's `Res::Local`) lets upvars walk only the closure's own range with no
+  resolver; it changes lowering and the store's encoding (format's, now mem-format's files).
 
 - `parse_macro_expansion` and `EditionedFileId::parse` need `Hash` for `syntax::Parse<T>` and
   `mbe::ValueResult` under db-salsa's `lru` bound (requested from format by db-expand).

@@ -423,7 +423,7 @@ impl Own {
             // Its bytes ride in the segment; the store writes them as the file at the commit.
             self.claim(look, unit, record(Form::External, 0, bytes), bytes, ticket)
         } else if let Some(columns) = look.columns_of(bytes).filter(|_| kind.cold()) {
-            match cold_columns(columns.as_ref(), bytes) {
+            match cold_columns(columns, bytes) {
                 Ok(payload) => self.claim(look, unit, record(Form::ColdColumns, 0, &payload), &payload, ticket),
                 Err(why) => return Ok(self.fail(kind, why)),
             }

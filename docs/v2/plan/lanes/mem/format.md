@@ -164,3 +164,31 @@ What is left, and why:
 - Decode still copies once per column. Making it borrow the mapped bytes is speed-hir-store's
   queued "borrowed decode columns" (it needs frontend-deps-sigs' `Arc` owner of the image).
 - The source maps' encode is next, once srcmap's schema 4 is settled.
+
+## tree items (mem-format-tree-items)
+
+Filed as `v2/requests/mem-format-tree-items.md` (paths held by `frontend-deps-items`, which is
+applying F of speed-hir-sol-items, and `frontend-tree`); needs `mem-db-def.md` H1 to H3 for
+hir-def first.
+
+- An `ItemTree` is one pointer to one block: a header of `u32` column ends, then the 31
+  columns at their aligned offsets (`item_tree/block.rs`, written by a `columns!` macro). The
+  header costs 4 bytes a column against the 16 of a `Box<[T]>`, so the tree shrinks from about
+  500 bytes of fat pointers to 8. A tree with no values points at a static empty header and
+  allocates nothing.
+- The columns are private; same-named accessors keep every reader as it was (`attrs` is
+  `attr_list()`, since `attrs(id)` exists). A tree is made only through `build`/`try_build`
+  from its lengths, each column written through a sink branded to its build, and checked full
+  before it is a tree, so a half-written block is never seen; an error or panic drops what was
+  written.
+- Lowering, assembly and decode allocate once a tree, not once a non-empty column. Decode is
+  1 + one a `ModPath` with segments until `hir::persist`'s `Code for ModPath` stops collecting
+  into a `Vec` (not this lane's path).
+- Rejected: interning POD columns by content (a tree's columns would outlive it in the
+  interner, which never frees: a leak an edit), and keeping one box a column (31 allocations
+  a tree, which is what this replaces).
+- The per-item design of the 20:45 tree (`item_sources` keeping every item's syntax, ids and
+  anchors in one block, spans read in place from the anchors, a cached root cursor so a warm
+  item lowering allocates only its block) is on record in the request but withdrawn: F replaces
+  per-item queries with the file's last tree kept beside salsa. Of it, only `assemble` writing
+  one block carries over.

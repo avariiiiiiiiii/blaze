@@ -50,9 +50,20 @@ struct Workspace {
     /// The stream of the last run while it is written: `open` says it is.
     encoder: DeflateEncoder<Vec<u8>>,
     open: bool,
-    /// The record being kept, encoded: reused from one record to the next.
+    /// The record being kept, encoded, and its encoder: reused from one record to the next.
     item: Vec<u8>,
+    writer: blaze_protocol::cbor::Writer,
+    /// Buffers kept for the next build, so that a build kept like the one before allocates
+    /// nothing: runs dropped, cleared, for the next run; the encoder's other output, swapped
+    /// in when a stream ends; the builds that said functions, as a Began reads them.
+    spare: Vec<Run>,
+    out: Vec<u8>,
+    said: Vec<u64>,
 }
+
+/// The most bytes of output the encoder's spare keeps: a cold build's stream is not held twice
+/// for good.
+const SPARE_OUT: usize = 1 << 20;
 
 /// Records of one build, in a row as they came.
 struct Run {
@@ -95,6 +106,7 @@ impl Kept {
     /// Hands each record kept to `apply`, in the order the world takes them: each workspace's
     /// in order, the workspace whose build began last last.
     pub(crate) fn drain(self, mut apply: impl FnMut(u32, u64, Record)) {
+        // alloc: once, when the first page is asked for: every run inflates into it
         let mut inflated = Vec::new();
         for mut workspace in self.workspaces {
             workspace.close();
@@ -133,15 +145,40 @@ impl Kept {
     }
 }
 
+/// How many dropped runs a workspace keeps for its next builds: a build makes one.
+const SPARE_RUNS: usize = 2;
+
+impl Run {
+    fn new(build: u64) -> Run {
+        // alloc: none until they fill; a run is made only when no spare is kept
+        let (kinds, deflated, other, objects) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        Run { build, kinds, deflated, other, objects }
+    }
+
+    /// Empties it for another build, keeping its buffers but one too long to hold for good.
+    fn clear(&mut self) {
+        self.kinds.clear();
+        self.objects.clear();
+        for bytes in [&mut self.deflated, &mut self.other] {
+            match bytes.capacity() > SPARE_OUT {
+                // alloc: none, it frees the buffer
+                true => *bytes = Vec::new(),
+                false => bytes.clear(),
+            }
+        }
+    }
+}
+
 impl Workspace {
     fn new(root: u32) -> Workspace {
-        Workspace {
-            root,
-            runs: Vec::new(),
-            encoder: DeflateEncoder::new(Vec::new(), Compression::fast()),
-            open: false,
-            item: Vec::new(),
-        }
+        // alloc: once per workspace, the encoder's state; the buffers allocate as they fill
+        let encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        // alloc: none until they fill
+        let (runs, spare, said) = (Vec::new(), Vec::new(), Vec::new());
+        // alloc: none until they fill
+        let (item, out) = (Vec::new(), Vec::new());
+        let writer = blaze_protocol::cbor::Writer::new();
+        Workspace { root, runs, encoder, open: false, item, writer, spare, out, said }
     }
 
     fn build(&self) -> u64 {
@@ -154,7 +191,8 @@ impl Workspace {
         let kind = Kind::of(record);
         match &record.event {
             Event::Began { .. } => {
-                let mut said: Vec<u64> = Vec::new();
+                let mut said = std::mem::take(&mut self.said);
+                said.clear();
                 for run in &self.runs {
                     if !run.objects.is_empty() && said.last() != Some(&run.build) {
                         said.push(run.build);
@@ -166,6 +204,7 @@ impl Workspace {
                     run.kinds.retain(|it| *it != Kind::Other);
                     !run.kinds.is_empty() && said.contains(&run.build)
                 });
+                self.said = said;
             }
             Event::Functions { whole: true, object, .. } => {
                 let said =
@@ -178,7 +217,7 @@ impl Workspace {
         }
         let mut item = std::mem::take(&mut self.item);
         item.clear();
-        if let Err(error) = blaze_protocol::cbor::append(&mut item, record) {
+        if let Err(error) = self.writer.append(&mut item, record) {
             eprintln!("build page: a record of build {build} does not encode: {error}");
             self.item = item;
             return;
@@ -190,13 +229,14 @@ impl Workspace {
     fn keep_item(&mut self, build: u64, kind: Kind, item: &[u8]) {
         if !(self.open && self.runs.last().is_some_and(|it| it.build == build)) {
             self.close();
-            self.runs.push(Run {
-                build,
-                kinds: Vec::new(),
-                deflated: Vec::new(),
-                other: Vec::new(),
-                objects: Vec::new(),
-            });
+            let run = match self.spare.pop() {
+                Some(mut run) => {
+                    run.build = build;
+                    run
+                }
+                None => Run::new(build),
+            };
+            self.runs.push(run);
             self.open = true;
         }
         let Some(run) = self.runs.last_mut() else { return };
@@ -219,41 +259,65 @@ impl Workspace {
         run.kinds.push(kind);
     }
 
-    /// Keeps the runs `keep` says to; the stream of the last, if it goes, goes with it.
+    /// Keeps the runs `keep` says to, in order; the stream of the last, if it goes, goes with
+    /// it. Those dropped are kept spare, up to [`SPARE_RUNS`].
     fn retain(&mut self, mut keep: impl FnMut(&mut Run) -> bool) {
         let last = self.runs.len().wrapping_sub(1);
-        let mut at = 0;
-        let mut dropped_open = false;
         let open = self.open;
-        self.runs.retain_mut(|run| {
-            let kept = keep(run);
-            dropped_open |= !kept && open && at == last;
-            at += 1;
-            kept
-        });
+        let (mut kept, mut dropped_open) = (0, false);
+        for at in 0..self.runs.len() {
+            if keep(&mut self.runs[at]) {
+                // Every run before `kept` is kept, in order; the one at `kept` is dropped.
+                self.runs.swap(kept, at);
+                kept += 1;
+            } else {
+                dropped_open |= open && at == last;
+            }
+        }
+        for mut run in self.runs.drain(kept..) {
+            if self.spare.len() < SPARE_RUNS {
+                run.clear();
+                self.spare.push(run);
+            }
+        }
         if dropped_open {
             self.open = false;
             // What it held is dropped: the encoder only starts a stream of its own again.
-            let _ = self.encoder.reset(Vec::new());
+            let out = std::mem::take(&mut self.out);
+            if let Ok(stream) = self.encoder.reset(out) {
+                self.spare_out(stream);
+            }
         }
     }
 
-    /// Ends the stream of the last run.
+    /// Ends the stream of the last run: its bytes are copied out whole, and the encoder's
+    /// buffer kept for the next stream.
     fn close(&mut self) {
         if !std::mem::take(&mut self.open) {
             return;
         }
-        let finished = self.encoder.reset(Vec::new());
+        let finished = self.encoder.reset(std::mem::take(&mut self.out));
         let Some(run) = self.runs.last_mut() else { return };
         match finished {
-            Ok(mut deflated) => {
-                deflated.shrink_to_fit();
-                run.deflated = deflated;
+            Ok(stream) => {
+                run.deflated.clear();
+                run.deflated.reserve_exact(stream.len());
+                run.deflated.extend_from_slice(&stream);
+                self.spare_out(stream);
             }
             Err(error) => {
                 let build = run.build;
                 eprintln!("build page: the records kept of build {build} do not deflate: {error}")
             }
+        }
+    }
+
+    /// Keeps `stream`'s buffer, emptied, for the encoder's next stream, but one too long to
+    /// hold for good.
+    fn spare_out(&mut self, mut stream: Vec<u8>) {
+        if stream.capacity() <= SPARE_OUT {
+            stream.clear();
+            self.out = stream;
         }
     }
 }

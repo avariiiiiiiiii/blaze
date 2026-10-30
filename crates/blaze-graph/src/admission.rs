@@ -24,6 +24,7 @@
 
 use std::fmt;
 
+use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_mem::{Tag, tag};
 use blaze_radix as radix;
 use rustc_hash::FxHashMap;
@@ -229,14 +230,14 @@ impl Estimates {
     /// order: its number, `below`, `seen`, `most`, `predicted`, `below_most`.
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(MAGIC.len() + 16 + self.by_kind.len() * KIND_BYTES);
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&self.unseen.to_le_bytes());
-        bytes.extend_from_slice(&(self.by_kind.len() as u64).to_le_bytes());
+        bytes.put_bytes(MAGIC);
+        bytes.put_u64(self.unseen);
+        bytes.put_u64(self.by_kind.len() as u64);
         for (kind, estimate) in sorted(&self.by_kind) {
-            bytes.extend_from_slice(&kind.0.to_le_bytes());
-            bytes.extend_from_slice(&estimate.below.to_le_bytes());
+            bytes.put_u32(kind.0);
+            bytes.put_u32(estimate.below);
             for it in [estimate.seen, estimate.most, estimate.predicted, estimate.below_most] {
-                bytes.extend_from_slice(&it.to_le_bytes());
+                bytes.put_u64(it);
             }
         }
         bytes
@@ -246,43 +247,30 @@ impl Estimates {
     /// another version, cut short or with more after, kinds out of order, or an estimate no
     /// run of observations makes.
     pub fn decode(bytes: &[u8]) -> Result<Estimates, DecodeError> {
-        let mut at = 0;
-        let mut take = |len: usize| -> Result<&[u8], DecodeError> {
-            let end = at + len;
-            let it = bytes.get(at..end).ok_or(DecodeError::Short { at })?;
-            at = end;
-            Ok(it)
-        };
-        if take(MAGIC.len())? != MAGIC {
+        let mut read = Reader::new(bytes);
+        if read.array::<8>()? != MAGIC {
             return Err(DecodeError::Version);
         }
-        let mut word = || -> Result<u64, DecodeError> {
-            let it = take(8)?;
-            Ok(u64::from_le_bytes(it.try_into().expect("8 bytes")))
-        };
-        let unseen = word()?;
-        let count = word()?;
-        let rest = bytes.len() - MAGIC.len() - 16;
-        if count.checked_mul(KIND_BYTES as u64) != Some(rest as u64) {
+        let unseen = read.u64()?;
+        let count = read.u64()?;
+        if count.checked_mul(KIND_BYTES as u64) != Some(read.left() as u64) {
             return Err(DecodeError::Length { count, bytes: bytes.len() });
         }
         let mut by_kind = FxHashMap::default();
         by_kind.reserve(count as usize);
         let mut last: Option<u32> = None;
-        for chunk in bytes[MAGIC.len() + 16..].chunks_exact(KIND_BYTES) {
-            let u32_at = |at: usize| u32::from_le_bytes(chunk[at..at + 4].try_into().expect("4"));
-            let u64_at = |at: usize| u64::from_le_bytes(chunk[at..at + 8].try_into().expect("8"));
-            let kind = u32_at(0);
+        for _ in 0..count {
+            let kind = read.u32()?;
             if last.is_some_and(|it| it >= kind) {
                 return Err(DecodeError::Order { kind });
             }
             last = Some(kind);
             let estimate = Estimate {
-                below: u32_at(4),
-                seen: u64_at(8),
-                most: u64_at(16),
-                predicted: u64_at(24),
-                below_most: u64_at(32),
+                below: read.u32()?,
+                seen: read.u64()?,
+                most: read.u64()?,
+                predicted: read.u64()?,
+                below_most: read.u64()?,
             };
             if !estimate.is_sound() {
                 return Err(DecodeError::Unsound { kind });
@@ -326,6 +314,12 @@ impl fmt::Display for DecodeError {
 }
 
 impl std::error::Error for DecodeError {}
+
+impl From<cursor::Error> for DecodeError {
+    fn from(error: cursor::Error) -> DecodeError {
+        DecodeError::Short { at: error.at }
+    }
+}
 
 /// What a node is predicted to cost before it runs: its [`Spec::cost`](crate::Spec::cost) for
 /// the plane's critical-path order, when the predictor knows one, and its peak bytes for

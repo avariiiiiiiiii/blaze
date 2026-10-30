@@ -1,17 +1,19 @@
+use blaze_ids::rng::SplitMix64;
 use native_proc_macro::{
     Ident, Literal as MacroLiteral, Span as MacroSpan, TokenTree as MacroTree, __native::with_host,
 };
 use span::{EditionedFileId, ErasedFileAstId, SpanAnchor, SyntaxContext, TextRange};
 use tt::{IdentIsRaw, LitKind, Spacing};
 
-use super::{
+use super::*;
+use crate::bridge::{
+    lex,
     wire::{self, Parts},
-    *,
 };
 
+/// The wasm guest's own text: its imports (`sys`), allocator and exports, which
+/// `blaze_macro_wasm::GUEST` follows with `proc_macro/api.rs`.
 const GUEST: &str = include_str!("../../../blaze-macro-wasm/guest/proc_macro.rs");
-const WASM_WIRE: &str = include_str!("../../../blaze-macro-wasm/src/wire.rs");
-const WASM_LEX: &str = include_str!("../../../blaze-macro-wasm/src/lex.rs");
 
 fn span(start: u32, end: u32) -> Span {
     let file_id = EditionedFileId::new(span::FileId::from_raw(7), span::Edition::CURRENT);
@@ -86,22 +88,6 @@ fn both(expander: Expander, input: &TopSubtree, attr: Option<&TopSubtree>, sites
     native
 }
 
-/// A generator of the tests' own: the same numbers for a seed.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-
-    fn below(&mut self, n: usize) -> usize {
-        (self.next() % n as u64) as usize
-    }
-}
-
 /// More names than a symbol is looked for among the latest of, each used again.
 const NAMES: [&str; 24] = [
     "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r",
@@ -110,19 +96,22 @@ const NAMES: [&str; 24] = [
 
 /// A span of one of `parts` anchors (file 7, an ast id each) and one of two contexts, now and
 /// then longer than a packed span holds.
-fn random_span(rng: &mut Rng, parts: usize) -> Span {
+fn random_span(rng: &mut SplitMix64, parts: usize) -> Span {
     let file_id = EditionedFileId::new(span::FileId::from_raw(7), span::Edition::CURRENT);
-    let edition = if rng.below(4) == 0 { span::Edition::Edition2015 } else { span::Edition::CURRENT };
-    let start = rng.below(1 << 20) as u32;
-    let len = if rng.below(16) == 0 { 0x1_0000 + rng.below(1 << 16) } else { rng.below(64) } as u32;
+    let edition = if rng.index(4) == 0 { span::Edition::Edition2015 } else { span::Edition::CURRENT };
+    let start = rng.index(1 << 20) as u32;
+    let len: u32 = match rng.index(16) {
+        0 => 0x1_0000 + rng.index(1 << 16) as u32,
+        _ => rng.index(64) as u32,
+    };
     Span {
         range: TextRange::at(start.into(), len.into()),
-        anchor: SpanAnchor { file_id, ast_id: ErasedFileAstId::from_raw(rng.below(parts) as u32) },
+        anchor: SpanAnchor { file_id, ast_id: ErasedFileAstId::from_raw(rng.index(parts) as u32) },
         ctx: SyntaxContext::root(edition),
     }
 }
 
-fn random_leaf(rng: &mut Rng, span: Span) -> Leaf {
+fn random_leaf(rng: &mut SplitMix64, span: Span) -> Leaf {
     const LITERALS: [(LitKind, &str); 11] = [
         (LitKind::Integer, "17"),
         (LitKind::Float, "2.5"),
@@ -137,39 +126,39 @@ fn random_leaf(rng: &mut Rng, span: Span) -> Leaf {
         (LitKind::Err(()), "err"),
     ];
     const SUFFIXES: [&str; 4] = ["", "u8", "f32", "a_suffix"];
-    match rng.below(3) {
+    match rng.index(3) {
         0 => {
-            let char = ['+', '-', '#', ':', '<', '&'][rng.below(6)];
-            let spacing = if rng.below(2) == 0 { Spacing::Alone } else { Spacing::Joint };
+            let char = ['+', '-', '#', ':', '<', '&'][rng.index(6)];
+            let spacing = if rng.index(2) == 0 { Spacing::Alone } else { Spacing::Joint };
             Leaf::Punct(tt::Punct { char, spacing, span })
         }
         1 => {
-            let is_raw = if rng.below(8) == 0 { IdentIsRaw::Yes } else { IdentIsRaw::No };
-            Leaf::Ident(tt::Ident { sym: intern::Symbol::intern(NAMES[rng.below(NAMES.len())]), span, is_raw })
+            let is_raw = if rng.index(8) == 0 { IdentIsRaw::Yes } else { IdentIsRaw::No };
+            Leaf::Ident(tt::Ident { sym: intern::Symbol::intern(NAMES[rng.index(NAMES.len())]), span, is_raw })
         }
         _ => {
-            let (kind, text) = LITERALS[rng.below(LITERALS.len())];
-            Leaf::Literal(tt::Literal::new(text, span, kind, SUFFIXES[rng.below(SUFFIXES.len())]))
+            let (kind, text) = LITERALS[rng.index(LITERALS.len())];
+            Leaf::Literal(tt::Literal::new(text, span, kind, SUFFIXES[rng.index(SUFFIXES.len())]))
         }
     }
 }
 
 /// Token trees, at least two in every group so that none is a passed-on fragment and the top
 /// is never one group: a tree an identity macro gives back as it is.
-fn random_trees(rng: &mut Rng, builder: &mut tt::TopSubtreeBuilder, parts: usize, budget: &mut usize, depth: u32) {
-    let count = 2 + rng.below(6);
+fn random_trees(rng: &mut SplitMix64, builder: &mut tt::TopSubtreeBuilder, parts: usize, budget: &mut usize, depth: u32) {
+    let count = 2 + rng.index(6);
     for at in 0..count {
         if at >= 2 && *budget == 0 {
             break;
         }
         *budget = budget.saturating_sub(1);
-        if depth < 6 && rng.below(5) == 0 {
+        if depth < 6 && rng.index(5) == 0 {
             let kind = [
                 tt::DelimiterKind::Parenthesis,
                 tt::DelimiterKind::Brace,
                 tt::DelimiterKind::Bracket,
                 tt::DelimiterKind::Invisible,
-            ][rng.below(4)];
+            ][rng.index(4)];
             builder.open(kind, random_span(rng, parts));
             random_trees(rng, builder, parts, budget, depth + 1);
             builder.close(random_span(rng, parts));
@@ -181,7 +170,7 @@ fn random_trees(rng: &mut Rng, builder: &mut tt::TopSubtreeBuilder, parts: usize
 }
 
 fn random_tree(seed: u64, parts: usize, budget: usize, call_site: Span) -> TopSubtree {
-    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut rng = SplitMix64::new(seed);
     let mut builder = tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_spanned(call_site));
     random_trees(&mut rng, &mut builder, parts, &mut { budget }, 0);
     builder.build()
@@ -227,7 +216,7 @@ fn more_parts_than_a_packed_span_names_cross_as_wide_spans() {
     let file_id = EditionedFileId::new(span::FileId::from_raw(7), span::Edition::CURRENT);
     for ast in 0..70_000u32 {
         let anchor = SpanAnchor { file_id, ast_id: ErasedFileAstId::from_raw(ast) };
-        let len = if ast % 7 == 0 { 0x2_0000 } else { 3 };
+        let len: u32 = if ast % 7 == 0 { 0x2_0000 } else { 3 };
         let span = Span { range: TextRange::at(ast.into(), len.into()), anchor, ctx: at.ctx };
         let sym = intern::Symbol::intern(NAMES[ast as usize % NAMES.len()]);
         builder.push(Leaf::Ident(tt::Ident { sym, span, is_raw: IdentIsRaw::No }));
@@ -255,6 +244,60 @@ fn what_the_guest_writes_the_host_reads_as_blazes_builder_makes_it() {
         let out = both(Expander::One(negatives), &input, None, [span(5, 5), at, span(7, 7)]);
         assert_has(&out, "- 5i64 - 2.5 - 1");
     }
+}
+
+/// Each tree of the input as the text the macro shows of it, which shows each literal kind its
+/// own way, lexed again by the host; then a literal of each kind the macro can make.
+fn reshown(input: TokenStream) -> TokenStream {
+    let mut out: TokenStream = input
+        .into_iter()
+        .map(|tree| tree.to_string().parse::<TokenStream>().expect("what a tree shows lexes"))
+        .collect();
+    out.extend([
+        MacroTree::from(MacroLiteral::string("s")),
+        MacroTree::from(MacroLiteral::byte_string(b"b")),
+        MacroTree::from(MacroLiteral::character('c')),
+        MacroTree::from(MacroLiteral::byte_character(b'a')),
+        MacroTree::from(MacroLiteral::u8_suffixed(1)),
+        MacroTree::from(MacroLiteral::f64_unsuffixed(1.5)),
+        MacroTree::from(MacroLiteral::c_string(c"c")),
+    ]);
+    out
+}
+
+/// Every kind but `Err`, which nothing lexes or makes, crosses both ways: a numbering of the
+/// macro's (`api.rs`, `LitKind::code`) other than tt's would show a literal given as another
+/// kind, or give back one made as another.
+#[test]
+fn every_literal_kind_is_numbered_as_tt_numbers_it() {
+    let text = "b'a' 'c' 1 1.5 \"s\" r#\"r\"# b\"b\" br##\"b\"## c\"c\" cr#\"c\"#";
+    let at = span(0, text.len() as u32);
+    let input = tokens(text, at);
+    let out = both(Expander::One(reshown), &input, None, [span(5, 5), at, span(7, 7)]);
+    let literals = |tree: &TopSubtree| -> Vec<(LitKind, String)> {
+        let flat = tree.as_token_trees().iter_flat_tokens();
+        let text = |it: &tt::Literal| format!("{}{}", it.text(), it.suffix());
+        flat.filter_map(|token| match token {
+            TokenTree::Leaf(Leaf::Literal(it)) => Some((it.kind, text(&it))),
+            _ => None,
+        })
+        .collect()
+    };
+    let mut want = literals(&input);
+    assert_eq!(want.len(), 10, "the text has a literal of each kind that lexes");
+    want.extend(
+        [
+            (LitKind::Str, "s"),
+            (LitKind::ByteStr, "b"),
+            (LitKind::Char, "c"),
+            (LitKind::Byte, "a"),
+            (LitKind::Integer, "1u8"),
+            (LitKind::Float, "1.5"),
+            (LitKind::CStr, "c"),
+        ]
+        .map(|(kind, text)| (kind, text.to_owned())),
+    );
+    assert_eq!(literals(&out), want);
 }
 
 #[test]
@@ -306,25 +349,47 @@ fn between<'a>(text: &'a str, from: &str, to: &str) -> &'a str {
     &text[start..end]
 }
 
-#[test]
-fn the_proc_macro_is_the_guests_but_for_its_imports_and_exports() {
-    let shim = include_str!("proc_macro/lib.rs");
-    assert_eq!(
-        between(shim, "\nfn taken(", "\n/// How blaze runs a macro natively"),
-        between(GUEST, "\nfn taken(", "\n/// What blaze's list of a crate's macros calls"),
-    );
-    let uses = |text: &'static str| between(text, "\nuse std::{", "};");
-    assert_eq!(uses(shim), uses(GUEST));
+/// The imports the guest's exports alone call, which the bridge has no exports to call.
+const EXPORTS_ONLY: [&str; 3] = ["output", "panicked", "retained"];
+
+/// Each function `mod sys` of `text` declares, as `name(params) -> ret` without `unsafe` and
+/// without a leading `_` on a parameter name.
+fn declared(text: &str) -> Vec<String> {
+    let sys = between(text, "\nmod sys {", "\n}\n");
+    let mut all: Vec<String> = sys
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("pub fn ") || line.starts_with("pub unsafe fn "))
+        .map(|line| {
+            let line = line[..line.find(['{', ';']).unwrap_or(line.len())].trim();
+            let line = line.replacen("pub unsafe fn ", "pub fn ", 1);
+            let line = line.strip_prefix("pub fn ").expect("a function");
+            let (name, rest) = line.split_once('(').expect("a function's parameters");
+            let (params, ret) = rest.split_once(')').expect("a function's parameters end");
+            let params: Vec<&str> = params
+                .split(',')
+                .map(|param| param.trim().trim_start_matches('_'))
+                .filter(|param| !param.is_empty())
+                .collect();
+            format!("{name}({}){ret}", params.join(", "))
+        })
+        .collect();
+    all.sort();
+    all
 }
 
 #[test]
-fn the_wire_and_the_lexer_are_the_wasm_hosts() {
-    let from = |text: &'static str, start: &str| &text[text.find(start).unwrap()..];
-    assert_eq!(from(include_str!("wire.rs"), "\nuse "), from(WASM_WIRE, "\nuse "));
-    let lex = from(include_str!("lex.rs"), "\nuse intern::Symbol;");
-    let wasm_lex = from(WASM_LEX, "\nuse intern::Symbol;")
-        .replacen("use crate::wire::Tree;", "use super::wire::Tree;", 1);
-    assert_eq!(lex, wasm_lex);
+fn the_two_sys_modules_declare_the_same_functions() {
+    let native = declared(include_str!("proc_macro/lib.rs"));
+    let mut guest = declared(GUEST);
+    let only = |it: &String| EXPORTS_ONLY.iter().any(|name| it.starts_with(&format!("{name}(")));
+    assert_eq!(guest.iter().filter(|it| only(it)).count(), EXPORTS_ONLY.len());
+    guest.retain(|it| !only(it));
+    assert_eq!(native, guest);
+    let api = include_str!("proc_macro/api.rs");
+    for name in EXPORTS_ONLY {
+        assert!(!api.contains(&format!("sys::{name}(")), "the API calls `sys::{name}`");
+    }
 }
 
 #[test]

@@ -85,7 +85,8 @@ pub(crate) fn method_fn(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<FunctionId> 
 /// cost: an associated item as type checking resolved it (a table lookup); a function, tuple
 /// struct or variant by the `FnDef` type checking gave the path, when it can't name a local (a
 /// path of more than one segment, or one no binding in scope is named as); else the scope's
-/// resolver, which builds the scope chain.
+/// resolver, which builds the scope chain. The last two once per path of the body, however many
+/// passes ask.
 pub(crate) fn path_value(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ValueNs> {
     let Expr::Path(path) = b.store().expr(expr) else { return None };
     if let Some((assoc, _)) = b.infer.assoc_resolutions_for_expr(expr) {
@@ -94,26 +95,30 @@ pub(crate) fn path_value(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ValueNs> {
             CandidateId::ConstId(it) => ValueNs::ConstId(it),
         });
     }
-    let db = b.db();
-    let scopes = ExprScopes::of(db, b.owner);
-    let scope = scopes.scope_for(expr);
-    if let TyKind::FnDef(CallableIdWrapper(callable), _) = b.infer.expr_ty(expr).kind() {
-        let local = match (path.mod_path(), scope) {
-            (Some(mod_path), Some(scope)) => match mod_path.as_ident() {
-                Some(name) if mod_path.kind == PathKind::Plain => scopes.resolve_name_in_scope(scope, name).is_some(),
-                _ => false,
-            },
-            _ => true,
-        };
-        if !local {
-            return Some(match callable {
-                CallableDefId::FunctionId(it) => ValueNs::FunctionId(it),
-                CallableDefId::StructId(it) => ValueNs::StructId(it),
-                CallableDefId::EnumVariantId(it) => ValueNs::EnumVariantId(it),
-            });
+    b.path_value(expr, || {
+        let db = b.db();
+        let scopes = ExprScopes::of(db, b.owner);
+        let scope = scopes.scope_for(expr);
+        if let TyKind::FnDef(CallableIdWrapper(callable), _) = b.infer.expr_ty(expr).kind() {
+            let local = match (path.mod_path(), scope) {
+                (Some(mod_path), Some(scope)) => match mod_path.as_ident() {
+                    Some(name) if mod_path.kind == PathKind::Plain => {
+                        scopes.resolve_name_in_scope(scope, name).is_some()
+                    }
+                    _ => false,
+                },
+                _ => true,
+            };
+            if !local {
+                return Some(match callable {
+                    CallableDefId::FunctionId(it) => ValueNs::FunctionId(it),
+                    CallableDefId::StructId(it) => ValueNs::StructId(it),
+                    CallableDefId::EnumVariantId(it) => ValueNs::EnumVariantId(it),
+                });
+            }
         }
-    }
-    resolver_for_scope(db, b.owner, scope).resolve_path_in_value_ns_fully(db, path, b.store().expr_path_hygiene(expr))
+        resolver_for_scope(db, b.owner, scope).resolve_path_in_value_ns_fully(db, path, b.store().expr_path_hygiene(expr))
+    })
 }
 
 /// The diagnostic item the path `expr` names (`f32::NAN`, `std::ptr::null`).

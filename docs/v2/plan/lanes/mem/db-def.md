@@ -38,20 +38,48 @@ request:
    `nameres/tests/paths.rs` gives way to `blaze_alloc_count::Counting` in `lib.rs`, so every
    part's budget tests share one.
 
+## Ruling: the scopes a collection builds live in its frame
+
+`mem-db-def-collect` and `mem-db-def-resolve` both left one residual: while a def map is
+collected, each module's `ItemScope` columns (`ThinVec`s, `Keyed` maps, the index), the
+`ModulesMap`, the children maps and the `macro_use` prelude grow by doubling on the global
+heap, because path resolution reads the building `DefMap` and the scopes become the memo. An
+edit to any signature re-runs the crate's collection, so that growth is in the warm loop. The
+ruling: the building `DefMap` is a frame temporary like every other.
+
+- Path resolution reads a def map through one view, `DefMapRead` (with its provided methods in
+  `ResolvePath`), implemented by the collected `DefMap` and by the collector's
+  `BuildingDefMap<'f>`: one body, compiled for each, serves the building map and the settled
+  ones it walks into (dependencies, block maps).
+- `ItemScope<S: ScopeStore = Settled>`: a settled scope keeps its exact `ThinVec`s and tables,
+  a building one (`Building<'f>`) its lists as frame `Vec`s; the default keeps every reader
+  outside nameres as it is.
+- `settle` consumes the building scope and makes the settled one once at exact sizes, the copy
+  contract 4 asks of every memo.
+- Reserving each list from the item tree's declared-item count stays as a capacity hint in the
+  frame; it is not a substitute, as it would still take one global allocation per list per
+  module on every re-collection.
+
+`mem-db-def-resolve` wrote the view, the store and `BuildingDefMap` (its R10, with T5: a cold
+collection's allocations the same for any module width); `mem-db-def-collect` writes the
+collector's sites against R10.
+
 ## base-db
 
 The database's read side was already off the allocator: `Files`' columns and tables are read
 with acquire loads and no lock. What was left:
 
-- **The setters' temporaries.** A keystroke (`Files::set_text`) made about fifteen
-  allocations of temporaries: the `changed` list, `RootContent::refresh`'s three buffers and two
-  result vectors, `hash_ranges`' input list and `ContentId::of_many`'s three buffers, twice. A
-  view set that writes nothing still made its base's owned `VfsPath` key and the `built` list.
-  After: each setter is a `frame::task(Tag::Parse, ..)`, its temporaries frame vectors and
-  slices, the hasher's buffers the worker's (`of_many_into`, of mem-format), the view index found
-  by a scan of the few bases. A keystroke allocates its new text and its reparse slot (2), a
-  view set that changes nothing allocates nothing, a view edit allocates its text, its slot and
-  the returned change list (3).
+- **The setters' temporaries.** A keystroke (`Files::set_text`) made about a dozen
+  allocations of temporaries: `RootContent::refresh`'s four buffers, `hash_ranges`' input list
+  and `ContentId::of_many`'s result and working buffers, twice. A view set made its plan, its
+  write's lists and its sorts' scratch, and one that writes nothing still made its `built`
+  list. After: each setter is a `frame::task(Tag::Parse, ..)`, its temporaries frame vectors and
+  slices, the hasher's buffers the worker's (mem-format's `of_many_into`, its IDs copied into the
+  frame so two batches in flight never share a buffer), the sorts' scratch kept per thread, and
+  `ViewChange`'s lists copied out once at their size. A keystroke allocates its new text and its
+  reparse slot (2), a view set that changes nothing allocates nothing, a view edit allocates its
+  text, its slot and the returned change list (3). `Roots` (inline for four roots) and the
+  setters' own `ByFile` columns stay: they are the setters' state, grown only with the file set.
 - **Tables on regions.** `Column` (a salsa input per file ID) becomes an
   `AppendVec<AtomicU64>`: the word's address is the base plus the ID, so the length and the word
   are two independent loads instead of a directory load the word's load waits on. `Log`

@@ -148,6 +148,9 @@ struct Visitor<'c, 'a, 'db> {
     /// The blocks around the expression being visited, outermost first.
     blocks: Vec<ExprId>,
     lints: Vec<MatchLint>,
+    /// What rustc reports while building the body's THIR, before it checks a match: empty
+    /// ranges and refused constants.
+    pattern_errors: Vec<MatchError>,
     errors: Vec<MatchError>,
     failed: bool,
 }
@@ -170,15 +173,22 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
             // alloc: these allocate only once something is pushed, once per body.
             blocks: Vec::new(),
             lints: Vec::new(), // alloc: as above.
+            pattern_errors: Vec::new(), // alloc: as above.
             errors: Vec::new(), // alloc: as above.
             failed: false,
         }
     }
 
-    fn finish(self) -> MatchCheck {
+    fn finish(mut self) -> MatchCheck {
+        let errors = if self.pattern_errors.is_empty() {
+            self.errors
+        } else {
+            self.pattern_errors.append(&mut self.errors);
+            self.pattern_errors
+        };
         MatchCheck {
             lints: self.lints.into_boxed_slice(),
-            errors: self.errors.into_boxed_slice(),
+            errors: errors.into_boxed_slice(),
             failed: self.failed,
             not_checked: false,
         }
@@ -470,9 +480,17 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
 
         // alloc: the arms' lowered patterns, which the report borrows.
         let mut pats = Vec::with_capacity(arms.len());
+        // rustc lowers every arm's pattern, reporting what it refuses in each, before it
+        // checks the match.
+        let mut lowered_all = true;
         for arm in arms {
-            let Some(pat) = self.lower_pattern(arm.pat, true) else { return };
-            pats.push(pat);
+            match self.lower_pattern(arm.pat, true) {
+                Some(pat) => pats.push(pat),
+                None => lowered_all = false,
+            }
+        }
+        if !lowered_all {
+            return;
         }
         let tarms: Vec<Arm<'_, 'a, 'db>> = pats
             .iter()
@@ -558,7 +576,14 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
                 None
             }
             Err(LowerError::EmptyRange { pat, inclusive }) => {
-                self.errors.push(MatchError::EmptyRange { pat, inclusive });
+                self.pattern_errors.push(MatchError::EmptyRange { pat, inclusive });
+                self.failed = true;
+                None
+            }
+            Err(LowerError::ConstPattern { pat, errors }) => {
+                self.pattern_errors.extend(
+                    errors.into_iter().map(|error| MatchError::ConstPattern { pat, error }),
+                );
                 self.failed = true;
                 None
             }

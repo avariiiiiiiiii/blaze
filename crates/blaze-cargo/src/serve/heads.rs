@@ -10,6 +10,10 @@
 //!   committed everything it was told before it. Only then does the session see it.
 //! - A checkout whose directory can't be read, or whose watch ended, fails the requests waiting
 //!   on it, naming it; the next request watches it again.
+//! - A request that runs user code (a build, check, test or run) starts a round of the watches
+//!   of directories outside views ([`Outside`]) and is held until the round is in, so what its
+//!   checks of user code's inputs trust was heard before it ([`blaze_vfs::unchanged_since`]).
+//!   Until a round is in those checks stat everything: the hold is for speed, not soundness.
 //!
 //! A checkout is a slot, its watcher's tags `watchers + slot * 2^32`, so a completion finds its
 //! checkout by one shift; a head's name is looked up once, as a request arrives. A batch of
@@ -21,7 +25,7 @@
 use blaze_api::{ApiError, Arrived, Reply, Request, RequestRef, Response, ViewRef};
 use blaze_core::{Completion, Conn, Done, Effect, FileName, Tag};
 use blaze_ids::ContentId;
-use blaze_vfs::{Vfs, Watched, Watcher};
+use blaze_vfs::{Outside, Vfs, Watched, Watcher};
 use rustc_hash::FxHashMap;
 
 /// How many tags one watcher uses ([`Watcher::new`]).
@@ -36,12 +40,15 @@ pub enum Out {
     Answer(Reply),
 }
 
-/// A request whose checkouts' watchers have not caught up with it.
+/// A request whose checkouts' watchers, or the watches outside views, have not caught up with
+/// it.
 struct Held {
     from: RequestRef,
     request: Request,
     /// Each checkout it names, by slot, and the cookie it waits for there.
     waits: Vec<(u32, u64)>,
+    /// It runs user code: it waits for the round of the watches outside views.
+    outside: bool,
 }
 
 struct Checkout {
@@ -79,6 +86,8 @@ pub struct Heads {
     /// By cookie tag: the checkout's slot and the cookie.
     writing: FxHashMap<Tag, (u32, u64)>,
     held: Vec<Held>,
+    /// Kept for the daemon's life: dropping it leaves every directory unconfirmed.
+    outside: Outside<'static>,
 }
 
 /// Whether a head is a checkout's: one the CLI names by the checkout's absolute path.
@@ -122,6 +131,20 @@ pub fn named(request: &Request) -> Vec<&str> {
     heads
 }
 
+/// Whether `request` runs user code (build scripts, proc macros, tests, a binary), whose checks
+/// of their inputs outside views read the watches' round.
+pub fn runs_user_code(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Check { .. }
+            | Request::Build { .. }
+            | Request::Test { .. }
+            | Request::Run { .. }
+            | Request::BestOf { .. }
+            | Request::Verify { .. }
+    )
+}
+
 /// Whether the file at `rel` of a checkout is out of its view: the build's `target/` at the
 /// root and every `.git`.
 pub fn excluded(rel: &str) -> bool {
@@ -143,8 +166,8 @@ impl Checkout {
 
 impl Heads {
     /// Cookies take the tags `tags..tags + 2^32`; watchers take ranges of `2^32` from
-    /// `watchers` on, up to `watchers_end`.
-    pub fn new(tags: u64, watchers: u64, watchers_end: u64) -> Heads {
+    /// `watchers` on, up to `watchers_end`; `outside` its own ([`Outside::owns`]).
+    pub fn new(tags: u64, watchers: u64, watchers_end: u64, outside: Outside<'static>) -> Heads {
         Heads {
             tags,
             watchers,
@@ -154,11 +177,14 @@ impl Heads {
             slots: FxHashMap::default(),
             writing: FxHashMap::default(),
             held: Vec::new(),
+            outside,
         }
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
-        tag.0.wrapping_sub(self.tags) < 1 << 32 || (tag.0 >= self.watchers && tag.0 < self.watcher_end)
+        tag.0.wrapping_sub(self.tags) < 1 << 32
+            || (tag.0 >= self.watchers && tag.0 < self.watcher_end)
+            || self.outside.owns(tag)
     }
 
     /// The checkout's slot a watcher's tag is of.
@@ -183,7 +209,7 @@ impl Heads {
 
     /// Takes what arrived: passed on, or held until the watchers of the checkouts it names
     /// have caught up with it.
-    pub fn arrive(&mut self, arrived: Arrived, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {
+    pub fn arrive(&mut self, vfs: &Vfs, arrived: Arrived, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {
         let (from, request) = match arrived {
             Arrived::Gone { conn } => {
                 self.held.retain(|held| held.from.conn != conn);
@@ -209,13 +235,14 @@ impl Heads {
             return;
         }
         let heads = named(&request);
-        if heads.is_empty() {
+        let outside = runs_user_code(&request);
+        if heads.is_empty() && !outside {
             out.push(Out::Pass(Arrived::Request { from, request }));
             return;
         }
         let mut waits = Vec::with_capacity(heads.len());
         for head in heads {
-            match self.cookie(head, effects) {
+            match self.cookie(vfs, head, effects) {
                 Ok(wait) => waits.push(wait),
                 Err(error) => {
                     answer(out, from, Some(error), false);
@@ -223,15 +250,19 @@ impl Heads {
                 }
             }
         }
-        self.held.push(Held { from, request, waits });
+        if outside {
+            self.outside.flush(effects);
+        }
+        self.held.push(Held { from, request, waits, outside });
+        self.release(out);
     }
 
     /// A cookie written into `head`'s checkout, its watcher started first if it has none: the
     /// checkout's slot and the cookie's number.
-    fn cookie(&mut self, head: &str, effects: &mut Vec<Effect>) -> Result<(u32, u64), ApiError> {
+    fn cookie(&mut self, vfs: &Vfs, head: &str, effects: &mut Vec<Effect>) -> Result<(u32, u64), ApiError> {
         let slot = match self.slots.get(head) {
             Some(&slot) => slot,
-            None => self.watch(head, effects)?,
+            None => self.watch(vfs, head, effects)?,
         };
         let checkout = self.checkouts[slot as usize].as_deref_mut().expect("a slot named is watched");
         let number = self.next_cookie;
@@ -251,7 +282,7 @@ impl Heads {
     }
 
     /// Starts watching `head`'s checkout in a new slot.
-    fn watch(&mut self, head: &str, effects: &mut Vec<Effect>) -> Result<u32, ApiError> {
+    fn watch(&mut self, vfs: &Vfs, head: &str, effects: &mut Vec<Effect>) -> Result<u32, ApiError> {
         let path = head.trim_end_matches('/');
         let Some(dir) = FileName::new(path.trim_start_matches('/')) else {
             return Err(ApiError::new(
@@ -263,7 +294,7 @@ impl Heads {
         let tags = self.watchers + u64::from(slot) * WATCHER_TAGS;
         assert!(tags < self.watcher_end, "the daemon has watched every checkout its tags allow");
         let mut watcher = Watcher::new(head, dir.clone(), tags);
-        watcher.start(effects);
+        watcher.start(vfs, effects);
         let cookie_dir = format!("{dir}/target");
         let cookie_prefix = format!("{cookie_dir}/.blaze-cookie-{}-", std::process::id());
         let checkout = Checkout {
@@ -283,6 +314,8 @@ impl Heads {
     pub fn complete(&mut self, vfs: &mut Vfs, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Out>) {
         if completion.tag.0.wrapping_sub(self.tags) < 1 << 32 {
             self.cookie_done(completion, out);
+        } else if self.outside.owns(completion.tag) {
+            self.outside.complete(completion, effects);
         } else {
             self.watched(vfs, completion, effects, out);
         }
@@ -320,10 +353,11 @@ impl Heads {
         let Some(slot) = self.slot_of(completion.tag) else { return };
         let Some(checkout) = self.checkouts.get_mut(slot as usize).and_then(Option::as_deref_mut) else { return };
         let done = match completion.done {
-            Done::Changed { mut files, lost } => {
-                // A directory reported for what changed in it tells every cookie in it.
+            Done::Journaled(mut batch) => {
+                // A directory reported for what changed in it, or a subtree whose changes the
+                // journal lost, tells every cookie in it.
                 let mut told = false;
-                for file in &files {
+                for file in &batch.files {
                     let file = file.as_str();
                     match file.strip_prefix(checkout.cookie_prefix.as_str()).and_then(|it| it.parse::<u64>().ok()) {
                         Some(number) => {
@@ -334,17 +368,21 @@ impl Heads {
                         None => told |= within(&checkout.cookie_dir, file),
                     }
                 }
+                let lost = batch.lost.iter().any(|(under, _)| within(&checkout.cookie_dir, under.as_str()));
                 if told || lost {
                     for cookie in checkout.cookies.values_mut() {
                         cookie.seen |= told || cookie.written;
                     }
                 }
-                files.retain(|it| checkout.keeps(it));
-                Done::Changed { files, lost }
+                // A lost subtree under `target/` or `.git` is not rescanned, nor is an excluded
+                // directory listed into.
+                batch.files.retain(|it| checkout.keeps(it));
+                batch.lost.retain(|(it, _)| checkout.keeps(it));
+                Done::Journaled(batch)
             }
-            Done::Listed(mut listed) => {
-                listed.retain(|(it, _)| checkout.keeps(it));
-                Done::Listed(listed)
+            Done::Entries(mut entries) => {
+                entries.retain(|(it, _)| checkout.keeps(it));
+                Done::Entries(entries)
             }
             done => done,
         };
@@ -353,7 +391,7 @@ impl Heads {
         let mut ended = None;
         for it in watched {
             match it {
-                Watched::Committed(_) | Watched::Lost | Watched::Scanned => {}
+                Watched::Committed(_) | Watched::Lost { .. } | Watched::Scanned => {}
                 Watched::Conflict { path } => {
                     eprintln!("blaze serve: {head}/{path} changed on disk and by a commit since; the head keeps the commit's");
                 }
@@ -389,15 +427,16 @@ impl Heads {
     }
 
     /// Hands on every held request whose every checkout has seen its cookie and committed what
-    /// it was told before, oldest first.
+    /// it was told before, and, if it runs user code, whose round outside views is in, oldest
+    /// first. A request held for an older round waits for the newer one too.
     fn release(&mut self, out: &mut Vec<Out>) {
-        let checkouts = &self.checkouts;
+        let (checkouts, flushed) = (&self.checkouts, self.outside.flushed());
         let caught_up = |(slot, number): &(u32, u64)| {
             checkouts.get(*slot as usize).and_then(Option::as_deref).is_some_and(|it| {
                 it.watcher.idle() && it.cookies.get(number).is_some_and(|cookie| cookie.seen)
             })
         };
-        for held in self.held.extract_if(.., |it| it.waits.iter().all(&caught_up)) {
+        for held in self.held.extract_if(.., |it| (flushed || !it.outside) && it.waits.iter().all(&caught_up)) {
             out.push(Out::Pass(Arrived::Request { from: held.from, request: held.request }));
         }
     }
@@ -460,6 +499,8 @@ fn answer(out: &mut Vec<Out>, to: RequestRef, error: Option<ApiError>, ok: bool)
 
 #[cfg(test)]
 mod tests {
+    use blaze_vfs::outside::Dirs;
+
     use super::*;
 
     #[test]
@@ -515,11 +556,101 @@ mod tests {
         assert_eq!(named(&diff), vec!["/w"]);
     }
 
+    /// A table of its own, so tests that run at once each drive one.
+    fn outside(tags: u64) -> (&'static Dirs, Outside<'static>) {
+        let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
+        (dirs, Outside::new(dirs, "/", tags))
+    }
+
+    #[test]
+    fn a_request_that_runs_user_code_waits_for_the_round_outside_views() {
+        let (dirs, outside) = outside(1 << 40);
+        let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside);
+        let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 1 << 50, &[]);
+        let (mut effects, mut out) = (Vec::new(), Vec::new());
+        let targets = blaze_api::Targets {
+            packages: Vec::new(),
+            profile: String::new(),
+            target: None,
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+            cargo: None,
+        };
+        let from = |id| RequestRef { conn: Conn(1), id };
+        let build = |id| Arrived::Request {
+            from: from(id),
+            request: Request::Build { view: ViewRef::Head("ci/main".to_owned()), targets: targets.clone() },
+        };
+        let passed = |out: &mut Vec<Out>| -> Vec<u64> {
+            out.drain(..)
+                .map(|it| match it {
+                    Out::Pass(Arrived::Request { from, .. }) => from.id,
+                    it => panic!("{it:?}"),
+                })
+                .collect()
+        };
+
+        heads.arrive(&vfs, build(1), &mut effects, &mut out);
+        assert_eq!(passed(&mut out), [1], "nothing is watched: the round is in at once");
+
+        dirs.want(std::path::Path::new("/usr/include"));
+        heads.arrive(&vfs, build(2), &mut effects, &mut out);
+        assert_eq!(passed(&mut out), [2], "a watch not yet confirmed has nothing to flush");
+        let stat = effects
+            .iter()
+            .find_map(|it| match it {
+                Effect::Stat { tag, .. } => Some(*tag),
+                _ => None,
+            })
+            .expect("the new watch is confirmed by a stat");
+        let meta = blaze_core::Meta { len: 0, dir: true, modified_ns: 0 };
+        heads.complete(&mut vfs, Completion { tag: stat, done: Done::Stat(Some(meta)) }, &mut effects, &mut out);
+        effects.clear();
+
+        heads.arrive(&vfs, build(3), &mut effects, &mut out);
+        let flush = effects
+            .iter()
+            .find_map(|it| match it {
+                Effect::Flush { tag, .. } => Some(*tag),
+                _ => None,
+            })
+            .expect("the confirmed watch is flushed");
+        assert!(out.is_empty());
+        assert_eq!(heads.waiting(), 1);
+        heads.arrive(&vfs, Arrived::Request { from: from(4), request: Request::Status }, &mut effects, &mut out);
+        assert_eq!(passed(&mut out), [4], "what runs no user code waits for no round");
+
+        heads.complete(&mut vfs, Completion { tag: flush, done: Done::Flushed }, &mut effects, &mut out);
+        assert_eq!(passed(&mut out), [3]);
+        assert_eq!(heads.waiting(), 0);
+    }
+
+    #[test]
+    fn what_runs_user_code_is_what_builds() {
+        let view = || ViewRef::Head("ci/main".to_owned());
+        let targets = blaze_api::Targets {
+            packages: Vec::new(),
+            profile: String::new(),
+            target: None,
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+            cargo: None,
+        };
+        assert!(runs_user_code(&Request::Check { view: view(), targets: targets.clone() }));
+        assert!(runs_user_code(&Request::Verify { view: view(), targets: targets.clone() }));
+        assert!(!runs_user_code(&Request::Trace { view: view(), targets }));
+        assert!(!runs_user_code(&Request::Open { view: view() }));
+        assert!(!runs_user_code(&Request::Status));
+    }
+
     #[test]
     fn cookies_seen_are_removed_in_number_order() {
-        let mut heads = Heads::new(0, 1 << 32, 1 << 40);
+        let mut heads = Heads::new(0, 1 << 32, 1 << 40, outside(1 << 40).1);
         let mut effects = Vec::new();
-        let numbers: Vec<u64> = (0..40).map(|_| heads.cookie("/w", &mut effects).unwrap().1).collect();
+        let vfs = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]).0;
+        let numbers: Vec<u64> = (0..40).map(|_| heads.cookie(&vfs, "/w", &mut effects).unwrap().1).collect();
         let checkout = heads.checkouts[0].as_deref_mut().unwrap();
         for (number, cookie) in &mut checkout.cookies {
             cookie.seen = number % 3 != 1;

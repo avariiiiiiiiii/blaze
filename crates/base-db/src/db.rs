@@ -11,10 +11,12 @@
 //!
 //! There is one `Db` per lowered build and no handle on it: every task reads it through `&Db`,
 //! each with its own query stack, and nothing clones it. A write takes `&mut Db`, so it happens
-//! only once no reader holds `&Db`.
+//! only once no reader holds `&Db`. A task that outlives a borrow holds a [`Reader`] of a
+//! [`Shared`] database, whose write stops it and waits for it to let go.
 
 use std::{cell::Cell, fmt, panic, sync::Mutex};
 
+use blaze_mem::{Tag, frame, scratch};
 use salsa::Durability;
 use span::{FileId, TextSize};
 use triomphe::Arc;
@@ -77,8 +79,11 @@ pub fn set_run_order(order: RunOrder) -> RunOrder {
 
 type EventLog = Mutex<Option<Vec<salsa::Event>>>;
 
+mod shared;
 #[cfg(test)]
 mod tests;
+
+pub use shared::{Reader, Shared};
 
 impl Db {
     /// The database of a build: no crate, no source root, and its batches run as plane tasks
@@ -163,6 +168,12 @@ impl Db {
     #[inline]
     pub fn file_source_root(&self, id: FileId) -> FileSourceRootInput {
         self.files.file_source_root(self, id)
+    }
+
+    /// See [`Files::reload_included_file`].
+    pub fn reload_included_file(&mut self, path: &vfs::AbsPath) -> bool {
+        let files = Arc::clone(&self.files);
+        files.reload_included_file(self, path)
     }
 
     pub fn set_file_source_root_with_durability(
@@ -275,20 +286,25 @@ impl Db {
     /// database by reference, and the calling thread pump-waits for them
     /// (docs/v2/plan/lanes/db.md, "One database, shared by every thread"): no handle per
     /// thread, no thread of its own. A test database runs them here, in [`RunOrder`].
-    pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, count: usize, task: F) {
+    ///
+    /// Each task runs in a frame of its own, tagged `tag` (the caller's subsystem): its body
+    /// runs outside salsa's executor, and a task the pump runs on a waiting thread stays out of
+    /// the waiting caller's frame.
+    pub fn run_all<F: Fn(&Db, usize) + Sync>(&self, tag: Tag, count: usize, task: F) {
         if count == 0 {
             return;
         }
+        let run = |db: &Db, at: usize| frame::task(tag, |_| task(db, at));
         match self.run {
-            Run::Pool => run_on_pool(self, blaze_graph::exec::shared(), count, &task),
+            Run::Pool => run_on_pool(self, blaze_graph::exec::shared(), count, &run),
             Run::Here => match RUN_ORDER.get() {
-                RunOrder::InOrder => (0..count).for_each(|at| task(self, at)),
-                RunOrder::Reversed => (0..count).rev().for_each(|at| task(self, at)),
+                RunOrder::InOrder => (0..count).for_each(|at| run(self, at)),
+                RunOrder::Reversed => (0..count).rev().for_each(|at| run(self, at)),
                 RunOrder::Strided(stride) => {
                     let stride = stride.max(1);
                     (0..stride)
                         .flat_map(|first| (first..count).step_by(stride))
-                        .for_each(|at| task(self, at));
+                        .for_each(|at| run(self, at));
                 }
                 RunOrder::LeftToReaders => {}
             },
@@ -376,17 +392,19 @@ pub fn run_on_pool<F: Fn(&Db, usize) + Sync>(
     count: usize,
     task: &F,
 ) {
+    let count = u32::try_from(count).expect("a batch of more than `u32::MAX` tasks");
     let near = blaze_graph::pool::group();
     let panicked = Mutex::new(None);
-    let again = Mutex::new(Vec::new()); // alloc: setup of one batch, not per task
-    let mut round: Vec<usize> = (0..count).collect(); // alloc: setup of one batch, not per task
+    let again = Mutex::new(scratch::lend_u32s());
+    let mut round = scratch::lend_u32s();
+    round.extend(0..count);
     while !round.is_empty() {
         pool.scope(|scope| {
-            for &at in &round {
+            for &at in round.iter() {
                 let (panicked, again) = (&panicked, &again);
                 scope.submit(
                     near,
-                    move || task(db, at),
+                    move || task(db, at as usize),
                     move |ran| {
                         let Err(panic) = ran else { return };
                         let waited_on_itself = matches!(
@@ -403,7 +421,8 @@ pub fn run_on_pool<F: Fn(&Db, usize) + Sync>(
                 );
             }
         });
-        round = std::mem::take(&mut *again.lock().unwrap_or_else(|it| it.into_inner()));
+        round.clear();
+        std::mem::swap(&mut *round, &mut **again.lock().unwrap_or_else(|it| it.into_inner()));
         if panicked.lock().unwrap_or_else(|it| it.into_inner()).is_some() {
             break;
         }

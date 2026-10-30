@@ -18,6 +18,8 @@ here. The other 152 are below: 6 real fixes (blocks 1 to 6) and justify-comments
 The speed-of-light notes these come from: `docs/v2/plan/lanes/db/speed-of-light.md`, section
 "hir-expand: macro expansion (speed-hir-sol-expand)".
 
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+
 ### 1. `crates/hir-expand/src/lib.rs`: an eager call's argument read in place (fix)
 
 What: `macro_arg` of an eager call (`concat!`, `env!`, `option_env!`, `include*!`,
@@ -137,6 +139,8 @@ New:
 undo_info)`, which takes `&SyntaxFixupUndoInfo`) and `HirFileId::syntax_context` (`.2.ctx`)
 compile unchanged.
 
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+
 ### 2. `crates/hir-expand/src/mod_path.rs`: the path callback is generic, not `dyn` (fix)
 
 What: `ModPath::from_src`, `from_tokens` and `convert_path` call `span_for_range` through a
@@ -175,6 +179,8 @@ New:
         let segments: SegmentBuf = segments.into_iter().collect();
 ```
 
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+
 ### 3. `crates/hir-expand/src/builtin/fn_macro.rs`: `line!()`/`column!()` without a `String` (fix)
 
 What: every `line!()` and `column!()` (and so every `log`-style macro, `assert!` message helper,
@@ -198,6 +204,8 @@ New:
             std::str::from_utf8(&text[..len]).expect("digits and `u32` are ASCII"),
         ),
 ```
+
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
 
 ### 4. `crates/hir-expand/src/name.rs` and `proc_macro.rs`: `Symbol` is `Copy` (fix)
 
@@ -229,6 +237,8 @@ New:
 ```rust
                         let name = crate::name::Name::new_symbol(it.name, def_site_ctx);
 ```
+
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
 
 ### 5. `crates/hir-expand/src/cfg_process.rs`: the callback's empty answers named once (fix)
 
@@ -264,6 +274,8 @@ Justify-comments in the same file (append to the line):
 - `node_attrs.clone().for_each(|attr| {` → `// clone: an iterator of node handles`
 - `for event in preorder.clone() {` → `// clone: a cursor, for a cfg'd-out item only`
 - `let insert_tokens = vec![tt::Leaf::Punct(tt::Punct {` → `// alloc: the `]` after an expanded attribute: the bridge's callback takes a `Vec``
+
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
 
 ### 6. `crates/hir-expand/src/builtin/derive_macro.rs`: one allocation per field list (fix)
 
@@ -311,6 +323,8 @@ Justify-comments in the same file (append to the line):
   `ast::Struct::cast(edit.new_root().clone())`, `ast::Adt::Struct(strukt.clone())`,
   `ast::TypeBound::cast(edit.new_root().clone())`, `ast::WherePred::cast(edit.new_root().clone())`)
   → `// clone: `CoercePointee` only, rare: node handles and its edit's lists`
+
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
 
 ### 7. Justify-comments, the rest (append to the line, or put on the line above)
 
@@ -377,6 +391,8 @@ last `append.insert(node.into(), vec![`) → `// alloc: clone: error path: fixup
 `crates/hir-expand/src/builtin/quote.rs`:
 - `crate::tt::TtElement::Leaf(leaf) => builder.push(leaf.clone()),` → `// clone: a copy (symbol and span)`
 - `self.clone().to_tokens(span, builder);` → `// clone: a leaf, a number or a `Copy` handle, as the doc above says`
+
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
 
 ### 8. Budgets: allocation-budget tests (new code, yours to add)
 
@@ -603,3 +619,16 @@ struct S { a: u8, b: u16 }
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(true);
 }
 ```
+
+> applied by db-expand-macros: blocks 1 to 8.
+> - Blocks 1 to 6 as written. In `cfg_process.rs` the `AnyHasAttrs::cast(node.clone())` comment is at the end of its line.
+> - Block 7 as written, with two changes:
+>   - In `fn_macro.rs`, the `let mut tt = tt.clone();` comment is only on `gca_expand`'s; the other four of that text are in `mod tests`.
+>   - Three more lines `hot_lint` found are marked: `place_expand`'s error `format!`, now a `let message`; `ProcMacros::get`'s `format!(`; and `ProcMacros::list`'s `.collect()`.
+> - Block 8 as written, with one change: `macro_expansion_tests/budgets.rs` takes its calls from `builtin_errors::macro_calls`, which walks the root file's `MacroCall`s and adds the scopes' derives, instead of `all_macro_calls` over each scope. Its assert is now that it found a fn-like call and a derive.
+> - `hot_lint` over `crates/hir-expand` now finds only `builtin/derive_macro/reference.rs`.
+> - Not compiled or run (no builds allowed).
+> - Block 1 needs blaze-diagnostics' `macros.rs:148` change (`*span` becomes `span`) to land with it.
+> - `budgets.rs` needs hir-def's counting allocator (`v2/requests/db.md`, "speed-hir-store: one counting allocator for hir-def's tests", items 2 to 4, db-next2's).
+
+> forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).

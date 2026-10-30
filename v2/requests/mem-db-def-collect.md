@@ -72,7 +72,11 @@ pub(crate) fn frame_set<'f, T>(frame: &'f Frame) -> FrameSet<'f, T> {
 `.entry(k).or_default()` on a map whose values are frame vectors becomes
 `.entry(k).or_insert_with(|| Vec::new_in(frame))`.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ## Part A. `nameres.rs`
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### A1. `crate_local_def_map` (line 552)
 
@@ -122,12 +126,16 @@ pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
 When the facts driver serves crates (`facts::collect_crate`), its call takes `frame` the same way:
 `facts::collect_crate(db, frame, crate_id)`.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### A2. `block_def_map` (line 591)
 
 The body inside `blaze_mem::frame::current(|frame| { ... })`; the collect call becomes
 `collector::collect_defs(db, frame, def_map, TreeId::new(ast_id.file_id, Some(block_id)), Some(local_def_map.local(db)))`
 (and `facts::collect_block(db, frame, def_map, tree_id, local)` under the facts engine). The
 `unsafe { to_static() }` blocks and their SAFETY comments stay as they are, inside the closure.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### A3. `DefMap.diagnostics` (line 244) and `derive_helpers_in_scope` (line 234)
 
@@ -166,6 +174,8 @@ allocates).
 
 (`DeriveHelper` is `Copy`: `Name` and the ids are. `vec::IntoIter<T, &Frame>` is `TrustedLen`, so
 `collect::<Box<[T]>>()` allocates exactly once.)
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### A4. `DefMap::shrink_to_fit` (line 672) becomes `DefMap::settle`
 
@@ -217,6 +227,8 @@ long-term move (staging them in the frame behind the resolve-side view). Under t
 crate `DefMap` is assembled from final rows (`driver.rs` 445: `ModulesMap` reserved to
 `modules.order.len()`), so only blocks and the old collector still grow them.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### A5. `LocalDefMap::shrink_to_fit` and `DefMapCrateData::shrink_to_fit` (line 327)
 
 `LocalDefMap.extern_prelude: FxIndexMap` is filled by the collector one dependency at a time.
@@ -228,6 +240,8 @@ read: the collector gathers `#![register_tool]` names in a frame vector, then on
 `Vec::with_capacity(PREDEFINED_TOOLS.len() + extra)` is filled and boxed (exact, no realloc).
 `unstable_features.shrink_to_fit()` is `UnstableFeatures`' own (hir-def items slice); it stays
 until that type is built at size.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### A6. `DiagnosticsByModule::of` (line 262)
 
@@ -255,6 +269,8 @@ until that type is built at size.
 `order.sort_unstable_by_key(|&at| (diagnostics[at as usize].in_module, at))`: same order, since the
 index breaks ties, and no allocation.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### A7. `ModuleScope::traits` (line 514)
 
 Before: `self.scope(db).traits().collect()`. `traits()` is a `filter`, so the box grows and is
@@ -273,6 +289,8 @@ shrunk. After:
 `legacy_macro` (`Box::from(&[MacroId])`) and `name` (`PerNs`, no box) are exact already.
 `Modules::module` clones a `ModuleData` (no box: `ScopeSlot::Collected` is an id).
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### A8. `ModuleData::new` (line 1113) and `DefMap::empty` (line 639)
 
 `ScopeSlot::Building(Box::default())` is one global box per module, dropped at `hand_over_scopes`.
@@ -280,7 +298,11 @@ That stays: the `Box<BuildingScope>` is how a collected `ModuleData` keeps 16 by
 A4 covers it as part of the building `DefMap`. `DefMap::empty`'s `ModulesMap::new()` stays
 (no allocation until the root is inserted).
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ## Part B. `nameres/collector.rs`
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### B1. `collect_defs` (line 72) and `DefCollector` (line 745)
 
@@ -316,6 +338,8 @@ Signature: `pub(super) fn collect_defs<'f>(db: &Db, frame: &'f Frame, def_map: D
 | new | `extern_prelude` | (inserted into `self.local_def_map.extern_prelude`) | `FrameVec<'f, (Name, (CrateRootModuleId, Option<ExternCrateId>))>`, with the map's replace-in-place rule, published in `finish` (A5) |
 
 `LocalDefMap` and the `DefMap` themselves stay owned (they are the result).
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### B2. `Imports<'db>` (line 299) becomes `Imports<'db, 'f>`
 
@@ -355,11 +379,15 @@ vector. It becomes an index walk (`wake` never adds to `any_waiters`):
     }
 ```
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### B3. `ImporterLists<K, T>` (line 630) becomes `ImporterLists<'f, K, T>`
 
 `edges: FrameVec<'f, ImporterEdge<K, T>>`, `heads: FrameMap<'f, K, (u32, u32)>`,
 `by_pair: FrameMap<'f, (K, K), u32>`; `new()` (639) becomes `new_in(frame)`;
 `type GlobEdges<'f> = ImporterLists<'f, ModuleId, (Visibility, GlobId)>;` (682).
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### B4. `finish` (line 2745) and `name_records` (line 2850)
 
@@ -391,6 +419,8 @@ and `not_introducing: Box::from(&self.not_introducing[..])`, replacing the
 `path_uses_outside_imports` take `out: &mut Vec<Use>`. They become generic, `out: &mut Vec<Use, A>`
 with `A: Allocator`, in `uses.rs` (D2).
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### B5. Per-call temporaries
 
 | Line | Function | Before | After |
@@ -409,6 +439,8 @@ with `A: Allocator`, in `uses.rs` (D2).
 
 `expand_all` (line 144) captures `calls: &[MacroCallId]` already.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ## Part C. `nameres/facts/`
 
 The facts files are being written now (`driver.rs` and `macros.rs` changed while this was
@@ -416,6 +448,8 @@ read), so these are rules for each function. The line numbers are as read. The q
 no cycle (§G). Values carried between queries (`SccState.state: Arc<UnitState>`, `MacroStep`,
 `ModuleDecls`, `SideTables`) are memo values: they stay owned. Everything a query makes
 and drops in its run goes to the frame.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### C1. Frame plumbing
 
@@ -427,6 +461,8 @@ query's `current`. `CollectCx.deps: FxIndexMap<Name, BuiltDependency>` becomes
 `macro_step`, `round_env`, `scc_state`, `import_shape`, `partition`, `round_modules`,
 `module_round` and `legacy_exports`, plus `collect_crate`/`collect_block`, which get the frame from
 A1/A2.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### C2. Per query
 
@@ -453,6 +489,8 @@ with `blaze_mem::Frame`. The graph tests (`facts/tests/graph.rs`) call `componen
 `import_graph` and `partition` outside a query, so each test body is wrapped in
 `blaze_mem::frame::task(Tag::Nameres, |frame| ..)` and passes `frame`.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### C3. `OpLog` (`ops.rs`)
 
 Before: `OpLog { ops: Vec<DeclOp> }`, grown by `push`, then `shrink_to_fit`. After:
@@ -460,6 +498,8 @@ Before: `OpLog { ops: Vec<DeclOp> }`, grown by `push`, then `shrink_to_fit`. Aft
 That is one allocation, since `vec::IntoIter` is `TrustedLen`. Producers (`collect.rs`'s sink,
 `StepSink`, `module_round`) push into a `FrameVec` and call it once. `Update.resolutions:
 Box<[(Option<Name>, PerNs)]>` is made from the collector's `held` slice with `Box::from(&held[..])`.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### C4. What `UnitState` carries (`unit.rs`, not yet written; `nameres-core.md` §5)
 
@@ -490,13 +530,20 @@ The block path, whose state is never carried, uses the frame forms of B2 and B3 
 same split applies to `SideTables` (`env.rs`): `SideTablesIn<'f>` with frame maps for the block
 path, and the owned `SideTables` for what `MacroStep` carries.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### C5. `env.rs`
 
 `CrateEnv::after` (`into_vec` + `push` + `into_boxed_slice`, which reallocates when the vector has
 slack) becomes `let mut v = Vec::with_capacity(self.list.len() + 1); v.extend_from_slice(&self.list); v.push(new); v.into_boxed_slice()`.
 `install` (`macro_use_prelude.clear()` + `reserve(n)`) is exact already.
 
+> frontend-nameres-core (owner of `nameres/facts/` but `graph.rs`/`impls.rs`): C5 applied (`CrateEnv::after` builds the grown list at exact size, `env.rs` `set_or_push`). C1-C4 open, owner frontend-nameres-core: they need `blaze_mem::frame::current` (blaze-mem has `frame::task` only today) and hir-def's blaze-mem dependency (H1-H3); `facts/` adopts them in one pass once both land, with `collect_crate`/`collect_block` taking `frame` exactly as A1/A2 call them. Note: `ModuleDecls::side` and `MacroStep::side` are now `Arc<SideTables>`, and `SccState::unresolved` is `SccState::imports: Box<[(ImportOp, Option<PerNs>)]>`.
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ## Part D. The other files of the slice
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### D1. `assoc.rs`
 
@@ -512,6 +559,8 @@ slack) becomes `let mut v = Vec::with_capacity(self.list.len() + 1); v.extend_fr
 `collect` returns `(Box<[(Name, AssocItemId)]>, ThinVec<..>, DefDiagnostics)`. Line 59's
 `DefDiagnostics::new(vec![])` becomes `DefDiagnostics::default()` (no allocation either way).
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### D2. `uses.rs`
 
 `used_imports` (`db: &Db`): body in `current`. `Walk { uses, unresolved, glob_targets }` become
@@ -523,6 +572,8 @@ become frame collections (`indexmap::IndexMap` has no allocator parameter, so th
 Each owned result box is made with `Box::from(&v[..])` or a `TrustedLen` collect. `path_uses` and
 `path_uses_outside_imports` take `out: &mut Vec<Use, A>` with `A: Allocator` (callers in
 `collector.rs` pass frame vectors; IDE callers keep `Vec<Use>`).
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### D3. `demand.rs`
 
@@ -537,6 +588,8 @@ signatures, and `walk_bodies`' `seen`/`queue` and `walk_bodies_saying`'s `local`
 `thread_local!` `blaze_mem::scratch::Scratch<T>` buffers (`take()`, cleared on entry). A nested call
 gets its own buffer through `scratch::lend_u32s` (depth 4), and depth 5 is blaze-mem's panic
 naming the caller, not a heap fallback.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### D4. `diagnostics.rs`
 
@@ -556,6 +609,8 @@ impl DefDiagnostics {
 `vec::IntoIter<T, A>` is `ExactSizeIterator`, which is what `from_header_and_iter` needs: one
 allocation at exact size, as today.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ### D5. `frozen.rs`
 
 `served(db, krate)` becomes `served_in(db, krate, frame)`, called from A1 inside the frame.
@@ -572,6 +627,8 @@ allocation at exact size, as today.
 `Dec::def_map`'s `super::ModulesMap::new()` becomes `ModulesMap::with_capacity(n)`, and
 `Dec::scope` is exact already (`reserve_exact`). `check` (`Mode::Check`, testing) uses the same
 frame.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ### D6. `mod_resolution.rs`, `proc_macro.rs`, `attr_resolution.rs`
 
@@ -595,6 +652,8 @@ frame.
 - `attr_macro_as_call_id` clones the attribute's `tt` into the call's owned argument (result data
   of the interned call). No change.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ## Part E. Requests to the other slices
 
 E1, to **mem-db-def-resolve** (`item_scope.rs`):
@@ -615,6 +674,8 @@ new `Box<[(Name, CustomProcMacroExpander, bool)]>` on every collection of a proc
 should be `list_in(ctx, frame: &Frame) -> Option<&[(Name, CustomProcMacroExpander, bool)]>`
 (frame-allocated), or an iterator. The collector's `proc_macros` field then becomes
 `&'f [..]`.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
 ## Part F. Budget tests (new file `nameres/tests/budget.rs`, `mod budget;` in `nameres/tests.rs`)
 
@@ -835,6 +896,8 @@ baseline `salsa` measured here goes to 0, and both (b) tests then hold a miss to
 an exact count until the A4 tables leave the global heap (notes, "Residual"). It is held by (a)
 from the warm side.
 
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
 ## Part G. Salsa cycles
 
 No nameres query has `cycle_fn`, `cycle_initial` or `cycle_result` (`rg` over `nameres.rs` and
@@ -845,3 +908,5 @@ graph is acyclic by construction (`nameres-core.md` §3). What a round keeps for
 owned memo `SccState { members, handles, prelude, upstream, unresolved: Box<[ImportOp]>, state: Arc<UnitState> }`
 and `MacroStep { ops, pending, side, new_modules, .. }`. Both are owned and made at exact size per
 C2 to C4, and nothing in them points into a frame.
+
+> forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).

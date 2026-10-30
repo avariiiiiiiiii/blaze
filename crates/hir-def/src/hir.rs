@@ -712,14 +712,14 @@ pub enum Array<'a> {
     Repeat { initializer: ExprId, repeat: ExprId },
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct MatchArm {
     pub pat: PatId,
     pub guard: Option<ExprId>,
     pub expr: ExprId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RecordLitField {
     pub name: Name,
     pub expr: ExprId,
@@ -924,7 +924,7 @@ pub struct Binding {
     pub hygiene: HygieneId,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct RecordFieldPat {
     pub name: Name,
     pub pat: PatId,

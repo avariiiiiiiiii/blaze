@@ -158,7 +158,6 @@ pub(crate) struct Finalize<'a, 'c, 'db> {
     pub(crate) cx: &'a Cx<'c, 'db>,
     pub(crate) session: &'a Session,
     pub(crate) owner: &'a Owner,
-    emit: bool,
     errors: &'a mut Vec<Diag>,
 }
 
@@ -167,10 +166,9 @@ impl<'a, 'c, 'db> Finalize<'a, 'c, 'db> {
         cx: &'a Cx<'c, 'db>,
         session: &'a Session,
         owner: &'a Owner,
-        emit: bool,
         errors: &'a mut Vec<Diag>,
     ) -> Finalize<'a, 'c, 'db> {
-        Finalize { cx, session, owner, emit, errors }
+        Finalize { cx, session, owner, errors }
     }
 
     pub(crate) fn attr(&self, index: usize) -> &'a Attr {
@@ -198,12 +196,6 @@ impl<'a, 'c, 'db> Finalize<'a, 'c, 'db> {
         self.cx.span(InFile::new(node.file_id, crate::cx::item_range(&node.value)))
     }
 
-    /// rustc's `all_attrs`: the path of each of the node's attributes (doc comments left out),
-    /// with its index.
-    pub(crate) fn all_attrs(&self) -> impl Iterator<Item = (usize, Vec<String>)> + 'a {
-        self.owner.attrs.iter().enumerate().filter(|(_, it)| !it.is_doc_comment()).map(|(i, it)| (i, it.path()))
-    }
-
     pub(crate) fn feature(&self, name: &str) -> bool {
         self.session.feature(name)
     }
@@ -217,9 +209,7 @@ impl<'a, 'c, 'db> Finalize<'a, 'c, 'db> {
     }
 
     pub(crate) fn emit_err(&mut self, diag: Diag) {
-        if self.emit {
-            self.errors.push(diag);
-        }
+        self.errors.push(diag);
     }
 }
 

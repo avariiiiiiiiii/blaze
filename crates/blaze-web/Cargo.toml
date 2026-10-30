@@ -23,5 +23,8 @@ getrandom = "0.3"
 rustc-hash.workspace = true
 sha1 = "0.10"
 
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
 [lints]
 workspace = true

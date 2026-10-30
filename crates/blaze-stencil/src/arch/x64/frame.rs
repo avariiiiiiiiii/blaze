@@ -21,6 +21,8 @@
 //! (what it does not use lies above the StructReturn pointer), and `rsp` stays where the
 //! convention has it.
 
+use std::alloc::Allocator;
+
 use cranelift_codegen::{
     ir::{self, ArgumentPurpose, GlobalValueData, InstructionData, Opcode},
     isa::CallConv,
@@ -288,7 +290,8 @@ pub fn tls_chain(func: &ir::Function, inst: ir::Inst, gv: ir::GlobalValue) -> Re
             }
             GlobalValueData::Load { base, global_type, flags, .. } => {
                 pointer(inst, global_type)?;
-                if flags.endianness(ir::Endianness::Little) != ir::Endianness::Little {
+                let endianness = func.dfg.mem_flags[flags].endianness(ir::Endianness::Little);
+                if endianness != ir::Endianness::Little {
                     return Err(Error::at(inst, "a big-endian global value load on x86-64"));
                 }
                 gv = base;
@@ -443,7 +446,7 @@ fn incoming(off: u32) -> Mem {
 }
 
 /// Writes the prologue up to the entry block's parameters.
-pub fn enter(buf: &mut Buf, rows: &mut impl FnMut(u32, Rule), frame: &Frame) -> Result<(), Error> {
+pub fn enter(buf: &mut Buf<'_>, rows: &mut impl FnMut(u32, Rule), frame: &Frame) -> Result<(), Error> {
     asm::push(buf, RBP);
     rows(buf.len(), Rule::CfaOffset(16));
     rows(buf.len(), Rule::Offset(DWARF_RBP, -16));
@@ -470,7 +473,7 @@ pub fn enter(buf: &mut Buf, rows: &mut impl FnMut(u32, Rule), frame: &Frame) -> 
     Ok(())
 }
 
-pub fn probe(buf: &mut Buf, probe: Probe) -> Result<(), Error> {
+pub fn probe(buf: &mut Buf<'_>, probe: Probe) -> Result<(), Error> {
     match probe {
         Probe::None => {}
         Probe::Unroll { count, guard } => {
@@ -499,7 +502,7 @@ pub fn probe(buf: &mut Buf, probe: Probe) -> Result<(), Error> {
 
 /// Stores the entry block's parameter `value`, passed at `place`, to its slot.
 pub fn param(
-    buf: &mut Buf,
+    buf: &mut Buf<'_>,
     place: Place,
     ty: ir::Type,
     dst: crate::arch::Loc,
@@ -510,7 +513,7 @@ pub fn param(
             _ => Err(Error::new("an entry block parameter folded to a constant")),
         };
     };
-    let copy = |buf: &mut Buf, from: Mem, to: Mem| {
+    let copy = |buf: &mut Buf<'_>, from: Mem, to: Mem| {
         asm::load(buf, R10, from);
         asm::store(buf, to, R10);
     };
@@ -551,7 +554,7 @@ pub fn param(
     Ok(())
 }
 
-fn copy_via(buf: &mut Buf, tmp: u8, from: Mem, to: Mem) {
+fn copy_via(buf: &mut Buf<'_>, tmp: u8, from: Mem, to: Mem) {
     asm::load(buf, tmp, from);
     asm::store(buf, to, tmp);
 }
@@ -570,7 +573,7 @@ pub fn sret_place(func: &ir::Function) -> Result<Option<Place>, Error> {
 
 /// Writes the epilogue after the return values are in their registers: the restores, the
 /// frame popped, `ret`; with the rows that keep the CFA right through it and after it.
-pub fn leave(buf: &mut Buf, rows: &mut impl FnMut(u32, Rule), frame: &Frame) {
+pub fn leave(buf: &mut Buf<'_>, rows: &mut impl FnMut(u32, Rule), frame: &Frame) {
     let base = frame.fixed + frame.outgoing;
     for &(save, off) in frame.saves() {
         let m = at(RSP, (base + off) as i32);
@@ -650,7 +653,7 @@ pub fn win_codes(
 
 /// The `UNWIND_INFO` Cranelift's `winx64::UnwindInfo::emit` writes for the prologue's rows
 /// (`create_unwind_info_from_insts`): what `with_saves` then corrects.
-pub fn win_raw(rows: &[(u32, Rule)], clobber: u32) -> Result<Vec<u8>, Error> {
+pub fn win_raw(rows: &[(u32, Rule)], clobber: u32, out: &mut Vec<u8, impl Allocator>) -> Result<(), Error> {
     let mut nodes = 0usize;
     let mut last = 0u8;
     win_codes(rows, clobber, |code| {
@@ -671,8 +674,8 @@ pub fn win_raw(rows: &[(u32, Rule)], clobber: u32) -> Result<Vec<u8>, Error> {
         Error::new(format!("{clobber} bytes of saves, beyond what Windows' UNWIND_INFO describes"))
     })?;
     let size = 4 + nodes * 2 + if nodes & 1 == 1 { 2 } else { 0 };
-    // alloc: once per function, the unwind information it hands back.
-    let mut out = vec![0u8; size];
+    out.clear();
+    out.resize(size, 0);
     out[0] = 1;
     out[1] = last;
     out[2] = nodes as u8;
@@ -712,7 +715,7 @@ pub fn win_raw(rows: &[(u32, Rule)], clobber: u32) -> Result<Vec<u8>, Error> {
         end -= len;
         out[end..end + len].copy_from_slice(&node[..len]);
     })?;
-    Ok(out)
+    Ok(())
 }
 
 const UWOP_PUSH_NONVOL: u8 = 0;
@@ -729,7 +732,7 @@ const UWOP_SAVE_XMM128_FAR: u8 = 9;
 /// (it shifts it out of the byte) and halves where each 8-byte save is, so this writes the
 /// distance, each save's place, and an allocation of the distance at the frame pointer's code
 /// for the unwinder to find the frame pointer's own slot from.
-pub fn with_saves(info: &[u8]) -> Result<Vec<u8>, Error> {
+pub fn with_saves(info: &[u8], out: &mut Vec<u8, impl Allocator>) -> Result<(), Error> {
     let nodes = &info[4..4 + usize::from(info[2]) * 2];
     let code = |at: usize| -> Result<(u8, u8, u8, u16, usize), Error> {
         let (offset, op, register) = (nodes[at], nodes[at + 1] & 0xf, nodes[at + 1] >> 4);
@@ -757,15 +760,14 @@ pub fn with_saves(info: &[u8]) -> Result<Vec<u8>, Error> {
     }
     let saved = vectors_end.map_or(words.next_multiple_of(2) * 8, |end| end * 16);
     if saved == 0 {
-        // alloc: once per function, the unwind information it hands back.
-        return Ok(info.to_vec());
+        out.extend_from_slice(info);
+        return Ok(());
     }
     if saved > 240 {
         // alloc: the error's message.
         return Err(Error::new(format!("{saved} bytes of saved registers")));
     }
-    // alloc: once per function, the unwind information it hands back.
-    let mut out = Vec::with_capacity(info.len() + 4 + 4);
+    out.reserve(info.len() + 4 + 4);
     out.extend([info[0], info[1], 0, ((saved / 16) as u8 * 16) | (info[3] & 0xf)]);
     let mut word = words;
     let mut at = 0;
@@ -791,5 +793,5 @@ pub fn with_saves(info: &[u8]) -> Result<Vec<u8>, Error> {
     }
     out[2] = ((out.len() - 4) / 2) as u8;
     out.resize(out.len().next_multiple_of(4), 0);
-    Ok(out)
+    Ok(())
 }

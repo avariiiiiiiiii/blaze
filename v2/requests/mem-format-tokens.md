@@ -185,6 +185,8 @@ fn a_lex_dropped_on_another_thread_gives_it_the_columns() {
 `a_dense_text_grows_the_columns_by_doubling` (budget 7) stays as it is: each test runs on a
 thread of its own, so its shelf is cold, and a cold lex grows the columns as before.
 
+> forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+
 ## mem-format-tokens: the parser input's words on a per-thread shelf
 
 `crates/parser/src/input.rs`. `Input::with_capacity` allocates its words every call; every
@@ -301,6 +303,8 @@ Test, in `input.rs`' test module (beside "refilling a cleared input"):
 
 The syntax-bridge budgets "a parser's input into a used one" and "a matcher's input into a
 used one" (`tests.rs` 504, 509) stay 0.
+
+> forwarded to frontend-tokens (from requests, pass 16; told by tmux).
 
 ## mem-format-tokens: an expansion's matcher and transcriber in the task's frame
 
@@ -714,6 +718,8 @@ Concurrency: `frame::task` is per thread and per nesting level (blaze-mem's own 
 it); an expansion inside another task on the same thread (hir-expand under a query's task) takes
 the next level's frame. Nothing here is shared between threads.
 
+> forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+
 ## mem-format-tokens: tt's walk stack as a Scratch
 
 `crates/tt/`. `walk_tokens` keeps its open-subtree stack in a hand-rolled
@@ -789,6 +795,8 @@ empty `Vec` today.
 The builder's `SCRATCH: Cell<Option<Scratch>>` (line 683) stays: it is a struct of five
 columns kept together under one size cap, not one `Vec<T>`, so neither `Scratch<T>` nor a shelf
 kind fits it.
+
+> forwarded to frontend-tokens (from requests, pass 16; told by tmux).
 
 ## mem-format-tokens: the tree sink's buffers lent
 
@@ -910,3 +918,34 @@ fn a_sink_gives_its_text_buffer_back() {
 
 Each test runs on a thread of its own, so the shelf held no string before the conversion;
 today's `String::new()` leaves it empty and the assertion fails.
+
+> forwarded to frontend-tokens (from requests, pass 16; told by tmux).
+
+## mem-format: rename mbe's matcher `Arena` to `Buffers` (with the frame section above; 2026-10-29)
+
+From lane mem's dedup notes (`v2/requests/mem.md`, "copies of blaze-mem's allocators", the
+mem-format item on `crates/mbe/src/expander/matcher.rs`): the matcher's `Arena<'t>` is not a
+memory arena but the reused buffers of one match. With the section "an expansion's matcher and
+transcriber in the task's frame" its buffers live on a `blaze_mem::Frame`, so `Arena` would name
+a second thing beside `blaze_mem::Arena`. Rename it when applying that section; nothing else
+changes.
+
+- `crates/mbe/src/expander/matcher.rs`: `pub(super) struct Arena<'t>` becomes
+  `pub(super) struct Buffers<'t>`, and `impl<'t> Arena<'t>` becomes `impl<'t> Buffers<'t>`; the
+  parameters `arena: &mut Arena<'t>` (`match_`, ~L651) and `a: &mut Arena<'t>` (`match_loop`
+  ~L691, ~L932) become `buffers: &mut Buffers<'t>` and `a: &mut Buffers<'t>`; in comments,
+  `[`Arena`]`/`Arena::` become `[`Buffers`]`/`Buffers::` (~L65, L71, L337, L341, L343, L346,
+  L384, L387, L405, L409, L440), and "cons cells in the arena" / "one copy in the arena" become
+  "in the buffers".
+- `crates/mbe/src/expander/matcher/failure.rs`: the import `Arena` becomes `Buffers`; the
+  locals `let mut arena = Arena::default();` (~L193, ~L260; `Buffers::new_in(frame)` after the
+  frame section) become `let mut buffers = ...`, and their uses `&mut arena` become `&mut buffers`.
+- `crates/mbe/src/expander.rs`: ~L30 "One arena for every rule tried" becomes "One set of
+  buffers for every rule tried"; ~L32 `let mut arena = matcher::Arena::default();` becomes
+  `let mut buffers = matcher::Buffers::new_in(frame);` (per the frame section) and ~L41
+  `&mut arena` becomes `&mut buffers`; ~L114 `[`matcher::Arena`]` becomes `[`matcher::Buffers`]`.
+- `crates/mbe/src/expander/model.rs:2`: the model's doc names its own arena of `Rc` nodes; it
+  stays.
+
+Budget test: the frame section's (a warm `$($e:tt)*` expansion allocates the same for 10 and
+1000 trees); a rename changes no count.

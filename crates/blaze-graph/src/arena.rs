@@ -23,6 +23,7 @@ use std::{
     },
 };
 
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -612,8 +613,8 @@ impl Arena for Bump {
 
 /// The daemon's cap on its own arenas (docs/v2/plan/lanes/core.md, "Hard backstop"). Bytes are reserved
 /// before they are allocated and given back when the [`Grant`] is dropped. Past `spill_at`,
-/// `spill` is called with the bytes over it, once each time it is passed, so the query
-/// database moves cold values to the store; a reserve that would pass `limit` waits until
+/// its [`Spills`] hears the bytes over it, once each time it is passed, so the query
+/// database's spiller moves cold values to the store; a reserve that would pass `limit` waits until
 /// enough is given back. A holder is the thread that reserved; when every thread holding
 /// bytes is itself waiting in [`Cap::reserve`], nothing can be given back, and the newest of
 /// those waits ends in [`Cancelled`], so its task unwinds and gives its bytes back.
@@ -622,10 +623,29 @@ impl Arena for Bump {
 #[derive(Clone)]
 pub struct Cap(Arc<Shared>);
 
+/// What a [`Cap`] says each time what it holds passes `spill_at`: the bytes over it, for the
+/// database's spiller, which moves cold values to the store and drops their grants on its own
+/// thread. The reserve that passed it only sends: no database code runs inside a task's
+/// allocation, and the reserve does not wait for the spill.
+pub struct Spills(Receiver<u64>);
+
+impl Spills {
+    /// The next pass of `spill_at`, waiting for it; `None` once the cap and every grant of it
+    /// are gone.
+    pub fn next(&self) -> Option<u64> {
+        self.0.recv().ok()
+    }
+
+    /// The passes not yet taken, in order, without waiting.
+    pub fn ready(&self) -> impl Iterator<Item = u64> + '_ {
+        self.0.try_iter()
+    }
+}
+
 struct Shared {
     limit: u64,
     spill_at: u64,
-    spill: Box<dyn Fn(u64) + Send + Sync>,
+    spills: Sender<u64>,
     state: Lock<State>,
     changed: Condvar,
 }
@@ -685,14 +705,19 @@ impl Shared {
 }
 
 impl Cap {
-    pub fn new(limit: u64, spill_at: u64, spill: Box<dyn Fn(u64) + Send + Sync>) -> Cap {
-        Cap(Arc::new(Shared {
+    /// A cap of `limit` bytes, and what hears each time it passes `spill_at`.
+    pub fn new(limit: u64, spill_at: u64) -> (Cap, Spills) {
+        // Each send is a pass of `spill_at`, which needs a drop back under it first: a few a
+        // build, so the queue stays short.
+        let (spills, heard) = unbounded();
+        let shared = Shared {
             limit,
             spill_at,
-            spill,
+            spills,
             state: Lock::new(State::default()),
             changed: Condvar::new(),
-        }))
+        };
+        (Cap(Arc::new(shared)), Spills(heard))
     }
 
     pub fn limit(&self) -> u64 {
@@ -748,7 +773,9 @@ impl Cap {
                 });
                 drop(state);
                 if let Some(over) = over {
-                    (shared.spill)(over);
+                    // A cap whose `Spills` was dropped has no spiller: the send fails, and that
+                    // changes nothing.
+                    _ = shared.spills.send(over);
                 }
                 return Ok(Grant { cap: Arc::clone(&self.0), bytes, holder: me });
             }
@@ -1442,7 +1469,7 @@ mod tests {
 
     #[test]
     fn a_bump_under_a_cap_reserves_its_chunks() {
-        let cap = Cap::new(1 << 30, 1 << 30, Box::new(|_| {}));
+        let (cap, _spills) = Cap::new(1 << 30, 1 << 30);
         let bump = Bump::under(cap.clone());
         bump.alloc_slice(&vec![0u8; 3 * MB]).unwrap();
         bump.alloc(1u64).unwrap();
@@ -1459,7 +1486,7 @@ mod tests {
 
     #[test]
     fn a_reserve_past_the_limit_waits_until_grants_are_dropped() {
-        let cap = Cap::new(100, 100, Box::new(|_| {}));
+        let (cap, _spills) = Cap::new(100, 100);
         let first = cap.reserve(80).unwrap();
         let got = AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -1483,7 +1510,7 @@ mod tests {
     #[test]
     fn when_every_holder_waits_the_newest_is_cancelled_and_the_rest_go_on() {
         for _ in 0..20 {
-            let cap = Cap::new(100, 100, Box::new(|_| {}));
+            let (cap, _spills) = Cap::new(100, 100);
             let holding = Barrier::new(3);
             let order = AtomicUsize::new(0);
             let (cap, holding, order) = (&cap, &holding, &order);
@@ -1513,43 +1540,63 @@ mod tests {
     }
 
     #[test]
-    fn spill_is_called_once_each_time_spill_at_is_passed() {
-        let spilled = Arc::new(Mutex::new(Vec::new()));
-        let cap = {
-            let spilled = Arc::clone(&spilled);
-            Cap::new(1000, 500, Box::new(move |over| spilled.lock().unwrap().push(over)))
-        };
+    fn spills_hear_once_each_time_spill_at_is_passed() {
+        let (cap, spills) = Cap::new(1000, 500);
         let a = cap.reserve(300).unwrap();
-        assert!(spilled.lock().unwrap().is_empty());
+        assert_eq!(spills.ready().collect::<Vec<_>>(), []);
         let b = cap.reserve(300).unwrap();
-        assert_eq!(*spilled.lock().unwrap(), [100]);
+        assert_eq!(spills.ready().collect::<Vec<_>>(), [100]);
         let c = cap.reserve(100).unwrap();
-        assert_eq!(*spilled.lock().unwrap(), [100]);
+        assert_eq!(spills.ready().collect::<Vec<_>>(), []);
         drop((a, b, c));
         let d = cap.reserve(650).unwrap();
-        assert_eq!(*spilled.lock().unwrap(), [100, 150]);
-        drop(d);
+        assert_eq!(spills.ready().collect::<Vec<_>>(), [150]);
+        drop((d, cap));
+        assert_eq!(spills.next(), None, "the cap and its grants are gone");
     }
 
-    /// The spill runs with the cap unlocked, so it may give grants back.
+    /// A cap whose spiller is gone still grants, and passing `spill_at` changes nothing else.
     #[test]
-    fn a_spill_may_give_grants_back() {
+    fn a_cap_with_no_spiller_still_grants() {
+        let (cap, spills) = Cap::new(100, 10);
+        drop(spills);
+        let grant = cap.reserve(50).unwrap();
+        assert_eq!((grant.bytes(), cap.held()), (50, 50));
+    }
+
+    /// The spiller, on a thread of its own, gives back grants another thread took: a reserve
+    /// waiting at the limit goes on once the spill it caused has dropped the cold values.
+    #[test]
+    fn a_spiller_gives_grants_back_and_a_waiting_reserve_goes_on() {
+        let (cap, spills) = Cap::new(100, 50);
         let cold: Arc<Mutex<Vec<Grant>>> = Arc::new(Mutex::new(Vec::new()));
-        let cap = {
-            let cold = Arc::clone(&cold);
-            Cap::new(100, 50, Box::new(move |_| cold.lock().unwrap().clear()))
-        };
-        let grant = cap.reserve(40).unwrap();
-        cold.lock().unwrap().push(grant);
-        let warm = cap.reserve(20).unwrap();
-        assert_eq!(cap.held(), 20);
-        drop(warm);
+        std::thread::scope(|scope| {
+            let spiller = {
+                let cold = Arc::clone(&cold);
+                scope.spawn(move || {
+                    let over = spills.next().expect("a pass of `spill_at`");
+                    cold.lock().unwrap().clear();
+                    over
+                })
+            };
+            // Taken by a task that has ended, so the waiter below is never the one cancelled.
+            let task = scope.spawn(|| {
+                cold.lock().unwrap().push(cap.reserve(40).unwrap());
+                cold.lock().unwrap().push(cap.reserve(20).unwrap());
+            });
+            task.join().unwrap();
+            let warm = cap.reserve(70).expect("the spill gives the cold bytes back");
+            assert_eq!(spiller.join().unwrap(), 10);
+            assert_eq!(cap.held(), 70);
+            drop(warm);
+        });
+        assert_eq!(cap.held(), 0);
     }
 
     #[test]
     #[should_panic(expected = "more than the daemon's cap")]
     fn a_reserve_bigger_than_the_cap_is_refused() {
-        _ = Cap::new(10, 10, Box::new(|_| {})).reserve(11);
+        _ = Cap::new(10, 10).0.reserve(11);
     }
 
     struct Tree(std::path::PathBuf);
@@ -1813,7 +1860,7 @@ mod model {
     #[test]
     fn model_a_full_cap_cancels_one_of_two_stuck_holders() {
         model(|| {
-            let cap = Cap::new(LIMIT, LIMIT, Box::new(|_| {}));
+            let (cap, _spills) = Cap::new(LIMIT, LIMIT);
             let history = Arc::new(History::<Held>::new());
             let other = {
                 let (cap, history) = (cap.clone(), history.clone());

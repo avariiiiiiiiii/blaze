@@ -31,6 +31,7 @@ use base_db::{
     CrateOrigin, Db, InternedSourceRootId, LangCrateOrigin, LibraryRoots, LocalRoots, SourceRootId,
     salsa::SalsaValue, source_root_crates,
 };
+use blaze_mem::Tag;
 use fst::{Automaton, Streamer, raw::IndexedValue};
 use hir::{
     Crate, Module,
@@ -244,7 +245,9 @@ pub fn world_symbols(db: &RootDatabase, mut query: Query) -> Vec<FileSymbol<'_>>
         target_modules.iter().map(|&module| SymbolIndex::module_symbols(db, module)).collect()
     } else if query.libs {
         let roots: Vec<SourceRootId> = LibraryRoots::get(db).roots(db).iter().copied().collect();
-        db.run_all(roots.len(), |db, at| _ = SymbolIndex::library_symbols(db, roots[at]));
+        db.run_all(Tag::Query, roots.len(), |db, at| {
+            _ = SymbolIndex::library_symbols(db, roots[at]);
+        });
         roots.into_iter().map(|root| SymbolIndex::library_symbols(db, root)).collect()
     } else {
         let mut crates = Vec::new();
@@ -252,7 +255,7 @@ pub fn world_symbols(db: &RootDatabase, mut query: Query) -> Vec<FileSymbol<'_>>
         for &root in LocalRoots::get(db).roots(db).iter() {
             crates.extend(source_root_crates(db, root).iter().copied())
         }
-        db.run_all(crates.len(), |db, at| _ = crate_symbols(db, crates[at].into()));
+        db.run_all(Tag::Query, crates.len(), |db, at| _ = crate_symbols(db, crates[at].into()));
         crates
             .into_iter()
             .flat_map(|krate| Vec::from(crate_symbols(db, krate.into())))

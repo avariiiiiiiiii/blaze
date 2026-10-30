@@ -28,7 +28,7 @@ use hir_ty::{
     drop::{DropGlue, has_drop_glue, is_freeze},
     layout::Layout,
     next_solver::{
-        DbInterner, StoredTy, Ty, TyKind, TypingMode,
+        DbInterner, ParamEnv, StoredTy, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
     traits::{StoredParamEnvAndCrate, implements_trait_unique, structurally_normalize_ty},
@@ -56,8 +56,67 @@ mod tag {
     pub(super) const POINTEE_OPAQUE: u8 = 19;
 }
 
-/// How deep [`Cx::is_plain_data`] looks, as the code generator's `is_plain_data` does.
+/// How deep [`is_plain_data`] looks into a type.
 const PLAIN_DATA_DEPTH: u32 = 8;
+
+/// Whether `ty` is made of scalars, pointers and references only, through arrays, tuples and
+/// the fields of structs and enums: what the code generator reads to say a reference is the
+/// only way to its memory (its `reference_pointee`), and what a pointee's summary records.
+/// Only plain data is looked at: whether a type with a coroutine, a closure or a trait object
+/// in it is `Unpin` takes more than its fields to know, and a wrong yes is a miscompile.
+pub fn is_plain_data<'db>(
+    db: &'db Db,
+    interner: DbInterner<'db>,
+    infcx: &InferCtxt<'db>,
+    param_env: ParamEnv<'db>,
+    ty: Ty<'db>,
+) -> bool {
+    plain_data(db, interner, infcx, param_env, ty, 0)
+}
+
+fn plain_data<'db>(
+    db: &'db Db,
+    interner: DbInterner<'db>,
+    infcx: &InferCtxt<'db>,
+    param_env: ParamEnv<'db>,
+    ty: Ty<'db>,
+    depth: u32,
+) -> bool {
+    if depth > PLAIN_DATA_DEPTH {
+        return false;
+    }
+    match structurally_normalize_ty(infcx, ty, param_env).kind() {
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Never
+        | TyKind::RawPtr(..)
+        | TyKind::Ref(..)
+        | TyKind::FnPtr(..)
+        | TyKind::FnDef(..) => true,
+        TyKind::Array(element, _) | TyKind::Pat(element, _) => {
+            plain_data(db, interner, infcx, param_env, element, depth + 1)
+        }
+        TyKind::Tuple(fields) => {
+            fields.iter().all(|it| plain_data(db, interner, infcx, param_env, it, depth + 1))
+        }
+        TyKind::Adt(def, args) => {
+            let adt = def.def_id();
+            if let hir_def::AdtId::UnionId(_) = adt {
+                return false;
+            }
+            identity::variants(db, adt).all(|variant| {
+                db.field_types(variant).iter().all(|(_, field)| {
+                    let ty = field.ty().instantiate(interner, args).skip_norm_wip();
+                    plain_data(db, interner, infcx, param_env, ty, depth + 1)
+                })
+            })
+        }
+        _ => false,
+    }
+}
 
 /// What the queries of one environment share: the database, an inference context in it and
 /// the environment, borrowed and stored.
@@ -101,43 +160,6 @@ impl<'db> Cx<'db> {
         match fact(self.db, ty.store(), self.stored.clone()) { // clone: the query's key, a reference count
             Ok(id) => Ok(*id),
             Err(why) => Err(why.clone()), // clone: error path
-        }
-    }
-
-    /// The code generator's `is_plain_data`: made of scalars, pointers and references only,
-    /// through arrays, tuples and the fields of structs and enums.
-    fn is_plain_data(&self, ty: Ty<'db>, depth: u32) -> bool {
-        if depth > PLAIN_DATA_DEPTH {
-            return false;
-        }
-        match self.normalize(ty).kind() {
-            TyKind::Bool
-            | TyKind::Char
-            | TyKind::Int(_)
-            | TyKind::Uint(_)
-            | TyKind::Float(_)
-            | TyKind::Never
-            | TyKind::RawPtr(..)
-            | TyKind::Ref(..)
-            | TyKind::FnPtr(..)
-            | TyKind::FnDef(..) => true,
-            TyKind::Array(element, _) | TyKind::Pat(element, _) => {
-                self.is_plain_data(element, depth + 1)
-            }
-            TyKind::Tuple(fields) => fields.iter().all(|it| self.is_plain_data(it, depth + 1)),
-            TyKind::Adt(def, args) => {
-                let adt = def.def_id();
-                if let hir_def::AdtId::UnionId(_) = adt {
-                    return false;
-                }
-                identity::variants(self.db, adt).all(|variant| {
-                    self.db.field_types(variant).iter().all(|(_, field)| {
-                        let ty = field.ty().instantiate(self.interner, args).skip_norm_wip();
-                        self.is_plain_data(ty, depth + 1)
-                    })
-                })
-            }
-            _ => false,
         }
     }
 
@@ -187,7 +209,8 @@ impl<'db> Cx<'db> {
             TyKind::Slice(element) => Some(element),
             _ => Some(pointee),
         };
-        let plain = element.is_none_or(|it| self.is_plain_data(it, 0));
+        let plain = element
+            .is_none_or(|it| is_plain_data(self.db, self.interner, &self.infcx, self.env.param_env, it));
         let freeze = is_freeze(&self.infcx, pointee, self.env.param_env);
         let unpin = self.is_unpin(pointee);
         out.update(&[u8::from(plain) | u8::from(freeze) << 1 | u8::from(unpin) << 2]);

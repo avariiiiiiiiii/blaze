@@ -8,7 +8,8 @@
 //!   is placed), then publishes its slot: one release store of the slot's word after the code
 //!   is written and visible to the process's instruction fetch (blaze-link into
 //!   blaze-inproc's code memory, whose publish does the cache maintenance).
-//! - [`Answers`] sends a frame to a run process and stops one.
+//! - [`Answers`] sends a frame to a run process and stops one; [`Runs`] is blaze-inproc's, and
+//!   [`Runner::serve`] reads one run process's asks.
 //!
 //! Workers take compiles from the fetcher, compile with no lock held, place one at a time,
 //! and send the answers after the fetcher's lock is let go. A compile that panics or fails
@@ -21,8 +22,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
+use blaze_inproc::ask::{self, Reader, Sender};
 use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
+use rustc_hash::FxHashMap;
 
 use crate::{
     LazyId,
@@ -41,7 +44,7 @@ pub trait Placer: Send + 'static {
     fn place(&mut self, function: &CompiledFunction) -> Result<u64, String>;
 }
 
-/// The run processes' channels.
+/// The run processes' asks.
 pub trait Answers: Send + Sync + 'static {
     /// Sends `body` to `client` as a blaze-inproc frame of `kind`, answering the frame of
     /// sequence number `seq`.
@@ -134,6 +137,20 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             }
         }
         Ok(Runner { shared, threads })
+    }
+
+    /// Reads `client`'s asks from `reader` until it ends or sends what is not an ask: why, for
+    /// the daemon to stop the run with when it still runs. Blocking: on a thread of the run's.
+    pub fn serve(&self, client: u32, reader: &mut Reader) -> String {
+        loop {
+            let frame = match reader.recv() {
+                Ok(frame) => frame,
+                Err(error) => return error.to_string(),
+            };
+            if let Err(error) = self.frame(client, frame.kind, frame.seq, frame.body) {
+                return format!("process {client} asked what is not a lazy function's code: {error}");
+            }
+        }
     }
 
     /// A blaze-inproc frame of `kind` and sequence number `seq` from `client`'s run process,
@@ -295,7 +312,7 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
                     frame.clear();
                     let answer = match outcome {
                         Outcome::Ready(target) => Frame::Ready { request: to.request, lazy: *lazy, target: *target },
-                        Outcome::Failed(why) => Frame::Failed { request: to.request, lazy: *lazy, why: &**why },
+                        Outcome::Failed(why) => Frame::Failed { request: to.request, lazy: *lazy, why: fit(why) },
                     };
                     answer.encode(frame);
                     self.answers.send(to.client, to.seq, wire::channel_kind(&answer), frame);
@@ -305,6 +322,62 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
                     self.answers.stop(function, why);
                 }
             }
+        }
+    }
+}
+
+/// The most of `why` an answer carries: what fits in an ask's slot, cut at a character. The
+/// whole of it is the fetcher's ([`Runner::close`]).
+pub(crate) fn fit(why: &str) -> &str {
+    let most = ask::MOST_BODY - wire::FAILED_LEN;
+    if why.len() <= most {
+        return why;
+    }
+    let end = (0..=most).rev().find(|it| why.is_char_boundary(*it)).unwrap_or(0);
+    &why[..end]
+}
+
+/// The [`Answers`] of one runner's run processes, which blaze-inproc started: each one's
+/// [`Sender`], by process ID, its client. A run whose answer can't be sent, or that called a
+/// function that can't be compiled, is killed, that its error.
+#[derive(Default)]
+pub struct Runs {
+    senders: Mutex<FxHashMap<u32, Sender>>,
+}
+
+impl Runs {
+    /// Answers `sender`'s process from now on: its client.
+    pub fn add(&self, sender: Sender) -> u32 {
+        let client = sender.pid();
+        lock(&self.senders).insert(client, sender);
+        client
+    }
+
+    /// Once `client`'s process ended.
+    pub fn remove(&self, client: u32) {
+        lock(&self.senders).remove(&client);
+    }
+}
+
+fn kill(sender: &Sender, why: &str) {
+    if let Err(error) = sender.kill(why) {
+        eprintln!("blaze-lazy: {error}");
+    }
+}
+
+impl Answers for Runs {
+    fn send(&self, client: u32, seq: u32, kind: Kind, body: &[u8]) {
+        let Some(sender) = lock(&self.senders).get(&client).cloned() else { return };
+        if let Err(error) = sender.send(kind, seq, body) {
+            kill(&sender, &format!("answering its ask for a lazy function's code: {error}"));
+        }
+    }
+
+    /// Kills every run process it answers: they run one program, which called the function.
+    fn stop(&self, _: Option<(InstanceKey, ItemKey)>, why: &str) {
+        let senders: Vec<Sender> = lock(&self.senders).values().cloned().collect();
+        for sender in &senders {
+            kill(sender, why);
         }
     }
 }

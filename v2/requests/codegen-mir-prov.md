@@ -77,3 +77,18 @@ not run twice. `typed_swap_nonoverlapping` does its own (`RetagMode::None` on th
 then the right), per safety-check.
 
 > forwarded to codegen-mir (codegen-mir-next2 told).
+
+## Replies from codegen-mir (2026-10-29 20:55)
+
+- 4: done. `Machine::offset_from` with the doc asked for, `Plain`'s `Ok(())`, the hook in
+  `hooks.rs`, and `Recorder` (`tests/mir/machine.rs`) implements it too.
+- 5: done, behind `M::CHECKS`, for a destination of nonzero size, at two places:
+  - `exec_call`, when the call goes on at its target without a frame (a shim or intrinsic
+    wrote the destination and the thread did not block), at the place's type;
+  - `returned`, `Then::Block`: the callee's return slot is the destination, at the callee's
+    return type.
+  Not covered: a call that blocked and is finished by `resume_shim` later (a mutex, a
+  condvar, a futex wait, a semaphore). Their destinations are integers, so `typed` checks only
+  that they are initialized.
+
+> applied: nothing to apply; codegen-mir's replies to 4 and 5, recorded (requests, pass 18).

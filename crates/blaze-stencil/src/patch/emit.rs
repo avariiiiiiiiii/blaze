@@ -14,6 +14,7 @@
 //! or else the next block: a branch to it is dropped (a `jump`) or falls through (`brif`'s
 //! `Next`).
 
+use blaze_mem::frame::Frame;
 use cranelift_codegen::ir::{self, BlockArg};
 
 use super::{
@@ -107,7 +108,7 @@ enum Place {
 }
 
 /// Each branch's edges, and the orientation of its `BrIcmp`.
-pub(super) fn edges(plan: &mut Plan, func: &ir::Function, library: &Reader<'_>) -> Result<(), Error> {
+pub(super) fn edges(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>) -> Result<(), Error> {
     plan.edges.clear();
     reset(&mut plan.edges_of, func.dfg.num_insts(), (NONE, 0));
     for block in func.layout.blocks() {
@@ -147,7 +148,7 @@ pub(super) fn edges(plan: &mut Plan, func: &ir::Function, library: &Reader<'_>) 
 }
 
 fn edge(
-    plan: &mut Plan,
+    plan: &mut Plan<'_>,
     func: &ir::Function,
     from: ir::Block,
     term: ir::Inst,
@@ -178,7 +179,7 @@ fn edge(
 }
 
 /// The place of the code edge `at` starts at: its own, or its block's.
-fn start(plan: &Plan, at: u32) -> Place {
+fn start(plan: &Plan<'_>, at: u32) -> Place {
     let edge = &plan.edges[at as usize];
     if edge.own { Place::Edge(at) } else { Place::Block(edge.block) }
 }
@@ -189,7 +190,7 @@ fn inline(func: &ir::Function, term: ir::Inst) -> u32 {
 }
 
 /// What follows `term`, the terminator of `block`.
-fn follows(plan: &Plan, func: &ir::Function, block: ir::Block, term: ir::Inst) -> Place {
+fn follows(plan: &Plan<'_>, func: &ir::Function, block: ir::Block, term: ir::Inst) -> Place {
     let (first, count) = plan.edges_of[term.as_u32() as usize];
     if first != NONE {
         for at in first + inline(func, term)..first + count {
@@ -205,7 +206,7 @@ fn follows(plan: &Plan, func: &ir::Function, block: ir::Block, term: ir::Inst) -
 }
 
 /// Complements a `BrIcmp` whose taken edge follows and whose other edge does not.
-fn orient(plan: &mut Plan, func: &ir::Function, library: &Reader<'_>, block: ir::Block, term: ir::Inst) {
+fn orient(plan: &mut Plan<'_>, func: &ir::Function, library: &Reader<'_>, block: ir::Block, term: ir::Inst) {
     let sel = plan.sels[term.as_u32() as usize];
     if sel.kind != Kind::Stencil || sel.shape.op != Op::BrIcmp {
         return;
@@ -248,7 +249,7 @@ fn missing(inst: ir::Inst, shape: Shape, library: &Reader<'_>) -> Error {
 
 /// The bound of the code, and each stencil's index.
 pub(super) fn size<A: Glue>(
-    plan: &mut Plan,
+    plan: &mut Plan<'_>,
     func: &ir::Function,
     target: &Target,
     frame: &A::Frame,
@@ -336,7 +337,7 @@ pub(super) fn size<A: Glue>(
 }
 
 /// A label per block in the layout and per edge with code of its own.
-pub(super) fn labels(plan: &mut Plan, func: &ir::Function, buf: &mut Buf) {
+pub(super) fn labels(plan: &mut Plan<'_>, func: &ir::Function, buf: &mut Buf<'_>) {
     let Plan { blocks, edges, .. } = plan;
     blocks.clear();
     blocks.resize(func.dfg.num_blocks(), Label(NONE));
@@ -349,10 +350,10 @@ pub(super) fn labels(plan: &mut Plan, func: &ir::Function, buf: &mut Buf) {
 }
 
 /// Writes the function into `buf`.
-pub(super) fn function<A: Glue>(
-    buf: &mut Buf,
-    plan: &Plan,
-    side: &mut Side,
+pub(super) fn function<'f, A: Glue>(
+    buf: &mut Buf<'f>,
+    plan: &Plan<'f>,
+    side: &mut Side<'f>,
     func: &ir::Function,
     target: &Target,
     frame: &A::Frame,
@@ -361,18 +362,18 @@ pub(super) fn function<A: Glue>(
     Out::<A> { buf, plan, side, func, target, frame, library }.function()
 }
 
-struct Out<'a, A: Glue> {
-    buf: &'a mut Buf,
-    plan: &'a Plan,
-    side: &'a mut Side,
+struct Out<'a, 'f, A: Glue> {
+    buf: &'a mut Buf<'f>,
+    plan: &'a Plan<'f>,
+    side: &'a mut Side<'f>,
     func: &'a ir::Function,
     target: &'a Target,
     frame: &'a A::Frame,
     library: &'a Reader<'a>,
 }
 
-impl<A: Glue> Out<'_, A> {
-    fn cx(&mut self) -> Cx<'_, A> {
+impl<'f, A: Glue> Out<'_, 'f, A> {
+    fn cx(&mut self) -> Cx<'_, 'f, A> {
         Cx {
             buf: &mut *self.buf,
             func: self.func,
@@ -676,7 +677,7 @@ impl<A: Glue> Out<'_, A> {
         }
         let (func, plan) = (self.func, self.plan);
         let pool = &func.dfg.value_lists;
-        let mut moves = std::mem::take(&mut self.side.moves);
+        let mut moves = std::mem::replace(&mut self.side.moves, Vec::new_in(self.buf.temp()));
         moves.clear();
         for (arg, &param) in edge.call.args(pool).zip(func.dfg.block_params(edge.block)) {
             let to = match plan.slot[param.as_u32() as usize] {
@@ -722,7 +723,7 @@ impl<A: Glue> Out<'_, A> {
 
     /// Writes `moves` as if at once: each move whose slot no other move reads goes first, and
     /// a cycle is broken by saving one slot's value to the glue's scratch slot.
-    fn parallel(&mut self, term: ir::Inst, moves: &mut Vec<Move>) -> Result<(), Error> {
+    fn parallel(&mut self, term: ir::Inst, moves: &mut Vec<Move, &Frame>) -> Result<(), Error> {
         let scratch = self.plan.scratch()[0];
         while !moves.is_empty() {
             let ready = (0..moves.len()).find(|&at| {

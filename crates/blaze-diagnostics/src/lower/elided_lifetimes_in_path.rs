@@ -13,6 +13,7 @@ use syntax::{AstNode, SyntaxNodePtr};
 
 use crate::{
     cx::Cx,
+    lints::registry::LintId,
     lower::{
         Found, Phase,
         incorrect_generics_len::{Segment, generics_fact, s, site_fact},
@@ -20,7 +21,13 @@ use crate::{
     model::{Applicability, Diag},
 };
 
+/// The lint is allowed by default and hir reports every elided path: where it is allowed
+/// everywhere, the lowering is one bit test.
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ElidedLifetimesInPath) -> Vec<Found> {
+    const LINT: LintId = LintId::named("elided_lifetimes_in_paths");
+    if !d.hard_error && !cx.lint_may_fire(LINT) {
+        return Vec::new();
+    }
     let n = d.expected as usize;
     let node = cx.node(d.generics_or_segment);
     let node_span = cx.span(node.as_ref().map(|it| it.syntax().text_range()));

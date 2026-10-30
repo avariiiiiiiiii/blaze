@@ -2,9 +2,14 @@
 //! handler thread and checked in place ([`webhook::receive_ref`]), answered 202 or with the
 //! refusal's status, deduplicated by delivery id (GitHub redelivers), and its event handed to
 //! the service.
+//!
+//! A warm delivery allocates only the event it hands on: the request is read into the handler's
+//! parser, the delivery is lent from it, its id is remembered in a slot reused in place, and the
+//! answer is written into the handler's own buffer.
 
 use std::{
-    collections::{HashSet, VecDeque},
+    fmt::Write as _,
+    hash::BuildHasher,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
     sync::{
@@ -17,12 +22,14 @@ use std::{
 };
 
 use blaze_api::http::{self, RequestParser};
+use hashbrown::HashTable;
+use rustc_hash::FxBuildHasher;
 
 use super::log;
 use crate::{
     config::Secret,
     service::Input,
-    webhook::{self, Delivery},
+    webhook::{self, DeliveryRef, Verifier},
 };
 
 /// How many delivery ids are remembered.
@@ -34,32 +41,66 @@ pub(crate) const MOST_CONNECTIONS: usize = 64;
 /// How long a peer may take to send or read.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The last [`REMEMBERED`] delivery ids.
-#[derive(Default)]
+/// The room each remembered id's slot is made with: GitHub's ids are 36-byte UUIDs.
+const ID_ROOM: usize = 64;
+
+/// What every answer says besides its status and words.
+const HEADERS: [(&str, &str); 2] = [("Content-Type", "text/plain; charset=utf-8"), ("Connection", "close")];
+
+/// The last `most` delivery ids, in a ring of strings reused in place: once every slot has held
+/// an id, remembering another moves no memory unless it is longer than the slot's room. Each
+/// lookup is one FxHash of the id (ids come only from deliveries whose signature checked) and
+/// one compare per matching hash. About 100 bytes an id: its slot's 64 and the table's share.
 pub(crate) struct Seen {
-    order: VecDeque<String>,
-    ids: HashSet<String>,
+    ids: Vec<String>,
+    /// The slot the next id goes in once `ids` is full: the oldest's.
+    next: usize,
+    most: usize,
+    /// Slots by their id's hash. Sized for twice `most`, so the tombstones of forgotten ids are
+    /// cleared by rehashing in place, never by growing.
+    slots: HashTable<u32>,
 }
 
 impl Seen {
+    pub(crate) fn new(most: usize) -> Seen {
+        assert!(most > 0 && u32::try_from(most).is_ok(), "remember between 1 and 2^32 ids, not {most}");
+        // alloc: once, at start
+        Seen { ids: Vec::with_capacity(most), next: 0, most, slots: HashTable::with_capacity(2 * most) }
+    }
+
     /// Whether `id` is new; it is remembered either way.
     pub(crate) fn first(&mut self, id: &str) -> bool {
-        if self.ids.contains(id) {
+        let hash = FxBuildHasher.hash_one(id);
+        let ids = &self.ids;
+        if self.slots.find(hash, |&slot| ids[slot as usize] == id).is_some() {
             return false;
         }
-        if self.order.len() == REMEMBERED
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.ids.remove(&oldest);
-        }
-        self.order.push_back(id.to_owned());
-        self.ids.insert(id.to_owned());
+        let slot = if self.ids.len() < self.most {
+            // alloc: a slot's string, once for each of the first `most` ids
+            let mut kept = String::with_capacity(id.len().max(ID_ROOM));
+            kept.push_str(id);
+            self.ids.push(kept);
+            self.ids.len() - 1
+        } else {
+            let slot = self.next;
+            self.next = (slot + 1) % self.most;
+            let oldest = &mut self.ids[slot];
+            let old = FxBuildHasher.hash_one(oldest.as_str());
+            if let Ok(entry) = self.slots.find_entry(old, |&it| it as usize == slot) {
+                entry.remove();
+            }
+            oldest.clear();
+            oldest.push_str(id);
+            slot
+        };
+        let ids = &self.ids;
+        self.slots.insert_unique(hash, slot as u32, |&it| FxBuildHasher.hash_one(ids[it as usize].as_str()));
         true
     }
 }
 
 pub(crate) struct Listener {
-    pub(crate) secret: Arc<Secret>,
+    pub(crate) verifier: Verifier,
     pub(crate) repo: String,
     pub(crate) service: mpsc::Sender<Input>,
     pub(crate) seen: Mutex<Seen>,
@@ -68,11 +109,23 @@ pub(crate) struct Listener {
 
 impl Listener {
     pub(crate) fn new(secret: Arc<Secret>, repo: String, service: mpsc::Sender<Input>) -> Listener {
-        Listener { secret, repo, service, seen: Mutex::new(Seen::default()), open: AtomicUsize::new(0) }
+        Listener::remembering(secret, repo, service, REMEMBERED)
+    }
+
+    /// A listener remembering the last `most` delivery ids.
+    pub(crate) fn remembering(
+        secret: Arc<Secret>,
+        repo: String,
+        service: mpsc::Sender<Input>,
+        most: usize,
+    ) -> Listener {
+        let verifier = Verifier::new(secret.expose());
+        Listener { verifier, repo, service, seen: Mutex::new(Seen::new(most)), open: AtomicUsize::new(0) }
     }
 }
 
 pub(crate) fn run(listener: TcpListener, secret: Arc<Secret>, repo: String, service: mpsc::Sender<Input>) {
+    // alloc: once, at start
     serve(listener, Arc::new(Listener::new(secret, repo, service)));
 }
 
@@ -88,7 +141,7 @@ pub(crate) fn serve(listener: TcpListener, shared: Arc<Listener>) {
         let mut stream = match stream {
             Ok(stream) => stream,
             Err(error) => {
-                log(&format!("the webhook's accept failed: {error}"));
+                log(&format!("the webhook's accept failed: {error}")); // alloc: error path
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -99,7 +152,8 @@ pub(crate) fn serve(listener: TcpListener, shared: Arc<Listener>) {
             continue;
         }
         if open > handlers {
-            let (its_shared, its_streams) = (shared.clone(), streams.clone()); // clone: once per handler started
+            // clone: once per handler started
+            let (its_shared, its_streams) = (shared.clone(), streams.clone());
             let started = thread::Builder::new()
                 .name(format!("blaze-ci webhook {handlers}")) // alloc: once per handler started
                 .spawn(move || handler(&its_shared, &its_streams));
@@ -118,67 +172,96 @@ pub(crate) fn serve(listener: TcpListener, shared: Arc<Listener>) {
 fn refuse(shared: &Listener, stream: &mut TcpStream, said: &str) {
     shared.open.fetch_sub(1, Ordering::AcqRel);
     let _ = stream.set_write_timeout(Some(TIMEOUT));
-    let _ = stream.write_all(&answer(503, said));
+    let mut answer = Answer::default();
+    answer.said.push_str(said);
+    answer.write(503);
+    let _ = stream.write_all(&answer.out);
 }
 
-/// One handler: each connection in turn, with one read buffer for all of them.
+/// One handler: each connection in turn, with one parser and one answer for all of them.
 fn handler(shared: &Listener, streams: &crossbeam_channel::Receiver<TcpStream>) {
-    let mut buffer = vec![0; 64 << 10]; // alloc: once per handler thread
+    let mut parser = RequestParser::new(webhook::MOST_PAYLOAD);
+    let mut answer = Answer::default();
     for mut stream in streams {
-        handle(&mut stream, shared, &mut buffer);
+        parser.reset();
+        let _ = stream.set_read_timeout(Some(TIMEOUT));
+        let _ = stream.set_write_timeout(Some(TIMEOUT));
+        exchange(&mut stream, shared, &mut parser, &mut answer);
         drop(stream);
         shared.open.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-fn handle(stream: &mut TcpStream, shared: &Listener, buffer: &mut [u8]) {
-    let _ = stream.set_read_timeout(Some(TIMEOUT));
-    let _ = stream.set_write_timeout(Some(TIMEOUT));
-    let mut parser = RequestParser::new(webhook::MOST_PAYLOAD);
+/// A handler's answer, its words and its bytes, kept from one connection to the next.
+#[derive(Default)]
+pub(crate) struct Answer {
+    said: String,
+    out: Vec<u8>,
+}
+
+impl Answer {
+    /// `out` as the whole response: `status`, then `said` and a newline as its body.
+    fn write(&mut self, status: u16) {
+        self.said.push('\n');
+        self.out.clear();
+        http::response_into(&mut self.out, status, &HEADERS, self.said.as_bytes());
+    }
+}
+
+/// One connection's request read from `stream` into `parser`, checked in place and answered.
+pub(crate) fn exchange(
+    stream: &mut (impl Read + Write),
+    shared: &Listener,
+    parser: &mut RequestParser,
+    answer: &mut Answer,
+) {
     loop {
-        match parser.next_ref() {
-            Ok(Some(request)) => {
-                let (status, said) = match webhook::receive_ref(shared.secret.expose(), &request) {
-                    Ok(delivery) => accept(shared, delivery),
-                    Err(error) => (error.status, error.what),
-                };
-                let _ = stream.write_all(&answer(status, &said));
-                return;
-            }
-            Ok(None) => {}
+        answer.said.clear();
+        let status = match parser.next_ref() {
+            Ok(Some(request)) => Some(match webhook::receive_ref(&shared.verifier, &request) {
+                Ok(delivery) => accept(shared, delivery, &mut answer.said),
+                Err(error) => {
+                    answer.said.push_str(&error.what);
+                    error.status
+                }
+            }),
+            Ok(None) => None,
             Err(error) => {
-                let _ = stream.write_all(&answer(error.status, &error.what));
-                return;
+                answer.said.push_str(&error.what);
+                Some(error.status)
             }
+        };
+        if let Some(status) = status {
+            answer.write(status);
+            let _ = stream.write_all(&answer.out);
+            return;
         }
-        match stream.read(buffer) {
+        match parser.read_from(&mut *stream) {
             Ok(0) | Err(_) => return,
-            Ok(read) => parser.push(&buffer[..read]),
+            Ok(_) => {}
         }
     }
 }
 
-/// What a checked delivery is answered with; its event goes to the service once.
-pub(crate) fn accept(shared: &Listener, delivery: Delivery) -> (u16, String) {
+/// The status a checked delivery is answered with, its words written to `said`; its event goes
+/// to the service once, the one thing made of it that is its own.
+pub(crate) fn accept(shared: &Listener, delivery: DeliveryRef<'_>, said: &mut String) -> u16 {
     let Some(event) = delivery.event else {
-        return (202, "nothing for CI to run".to_owned());
+        said.push_str("nothing for CI to run");
+        return 202;
     };
-    if delivery.repo != shared.repo {
-        return (
-            403,
-            format!("a delivery for {}, and this service is for {}", delivery.repo, shared.repo),
-        );
+    if *delivery.repo != *shared.repo {
+        let _ = write!(said, "a delivery for {}, and this service is for {}", delivery.repo, shared.repo);
+        return 403;
     }
-    if !shared.seen.lock().unwrap_or_else(PoisonError::into_inner).first(&delivery.id) {
-        return (202, format!("delivery {} was already received", delivery.id));
+    if !shared.seen.lock().unwrap_or_else(PoisonError::into_inner).first(delivery.id) {
+        let _ = write!(said, "delivery {} was already received", delivery.id);
+        return 202;
     }
-    if shared.service.send(Input::Event(event)).is_err() {
-        return (503, "the service has stopped".to_owned());
+    if shared.service.send(Input::Event(event.into_owned())).is_err() {
+        said.push_str("the service has stopped");
+        return 503;
     }
-    (202, "accepted".to_owned())
-}
-
-fn answer(status: u16, said: &str) -> Vec<u8> {
-    let headers = [("Content-Type", "text/plain; charset=utf-8"), ("Connection", "close")];
-    http::response(status, &headers, format!("{said}\n").as_bytes())
+    said.push_str("accepted");
+    202
 }

@@ -21,3 +21,5 @@ What, three places in the parent's doc:
 Why: the doc is `current`-adjacent design the siblings read; the generator owns none of it.
 
 Status: done by fastcompile-stencil in stencil.md (all three places).
+
+> forwarded to fastcompile (from requests, pass 16; told by tmux).

@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 use crate::oracle;
 
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// `owner/name`: deliveries for any other repository are refused.
@@ -40,7 +40,7 @@ pub struct Config {
     pub state: PathBuf,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub id: u64,
@@ -51,7 +51,7 @@ pub struct AppConfig {
     pub api: String,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookConfig {
     /// Where the listener binds, behind the VM's proxy.
@@ -59,14 +59,14 @@ pub struct WebhookConfig {
     pub secret_file: PathBuf,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// The warm daemon's agent API socket.
     pub socket: PathBuf,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct GitConfig {
     /// The VM's clone of the repository.
@@ -83,6 +83,7 @@ pub enum CheckKind {
 }
 
 /// One check run per event.
+// clone: once, at start, into the service's settings
 #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct Check {
@@ -109,9 +110,9 @@ impl Check {
                 Request::Test {
                     view,
                     targets,
-                    filter: self.filter.clone(),
+                    filter: self.filter.clone(), // clone: once per test check run, its request
                     all: self.all,
-                    args: Vec::new(),
+                    args: Vec::new(), // alloc: none, an empty list
                     ub: None,
                 }
             }
@@ -120,6 +121,7 @@ impl Check {
 }
 
 /// [`blaze_api::Targets`] as the file spells it.
+// clone: once at start, and once per sampled view the oracle verifies
 #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct TargetsConfig {
@@ -141,10 +143,10 @@ pub struct TargetsConfig {
 impl TargetsConfig {
     pub fn to_targets(&self) -> Targets {
         Targets {
-            packages: self.packages.clone(),
-            profile: self.profile.clone(),
-            target: self.target.clone(),
-            features: self.features.clone(),
+            packages: self.packages.clone(), // clone: once per check run, its request
+            profile: self.profile.clone(), // clone: once per check run, its request
+            target: self.target.clone(), // clone: once per check run, its request
+            features: self.features.clone(), // clone: once per check run, its request
             all_features: self.all_features,
             no_default_features: self.no_default_features,
             cargo: None,
@@ -152,7 +154,7 @@ impl TargetsConfig {
     }
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct OracleConfig {
     /// One view in this many is built again from nothing ([`crate::oracle::sampled`]); 0 for
@@ -162,6 +164,7 @@ pub struct OracleConfig {
     pub targets: TargetsConfig,
 }
 
+// clone: once per snapshot, the argv a snapshot thread runs
 #[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SnapshotConfig {
@@ -176,7 +179,7 @@ pub struct SnapshotConfig {
     pub keep: usize,
 }
 
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Deserialize, PartialEq, Eq, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct StandbyConfig {
     /// The primary's agent API over HTTP.
@@ -195,7 +198,7 @@ pub struct StandbyConfig {
 }
 
 /// Why the file is refused.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct ConfigError {
     pub what: String,
 }
@@ -211,16 +214,16 @@ impl std::error::Error for ConfigError {}
 impl Config {
     pub fn read(path: &Path) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|error| ConfigError {
-            what: format!("could not read {}: {error}", path.display()),
+            what: format!("could not read {}: {error}", path.display()), // alloc: error path
         })?;
         Config::parse(&text).map_err(|error| ConfigError {
-            what: format!("{}: {}", path.display(), error.what),
+            what: format!("{}: {}", path.display(), error.what), // alloc: error path
         })
     }
 
     pub fn parse(text: &str) -> Result<Config, ConfigError> {
         let config: Config = serde_json::from_str(text)
-            .map_err(|error| ConfigError { what: error.to_string() })?;
+            .map_err(|error| ConfigError { what: error.to_string() })?; // alloc: error path
         config.validate()?;
         Ok(config)
     }
@@ -230,28 +233,32 @@ impl Config {
         if self.repo.split('/').filter(|part| !part.is_empty()).count() != 2
             || self.repo.matches('/').count() != 1
         {
+            // alloc: error path, the file is refused
             return refuse(format!("repo {:?} is not owner/name", self.repo));
         }
         if self.default_branch.is_empty() {
+            // alloc: error path, the file is refused
             return refuse("default_branch is empty".to_owned());
         }
         for (list, checks) in [("checks", &self.checks), ("release_checks", &self.release_checks)] {
             let mut names = BTreeSet::new();
             for check in checks {
                 if check.name.is_empty() {
+                    // alloc: error path, the file is refused
                     return refuse(format!("a check of {list} has no name"));
                 }
                 if check.name == oracle::CHECK {
-                    return refuse(format!(
+                    return refuse(format!( // alloc: error path, the file is refused
                         "check {} of {list} has the oracle's name, which the service posts",
                         check.name
                     ));
                 }
                 if !names.insert(check.name.as_str()) {
+                    // alloc: error path, the file is refused
                     return refuse(format!("check {} is named twice in {list}", check.name));
                 }
                 if check.kind != CheckKind::Test && (!check.filter.is_empty() || check.all) {
-                    return refuse(format!(
+                    return refuse(format!( // alloc: error path, the file is refused
                         "check {} of {list} has a test filter or `all`, and is not a test",
                         check.name
                     ));
@@ -259,19 +266,24 @@ impl Config {
             }
         }
         if self.checks.is_empty() {
+            // alloc: error path, the file is refused
             return refuse("checks is empty: a push would post nothing".to_owned());
         }
         if self.release_checks.is_empty() {
+            // alloc: error path, the file is refused
             return refuse("release_checks is empty: a tag would post nothing".to_owned());
         }
         let snapshot = &self.snapshot;
         if snapshot.command.is_empty() {
+            // alloc: error path, the file is refused
             return refuse("snapshot.command is empty".to_owned());
         }
         if snapshot.remove.is_empty() {
+            // alloc: error path, the file is refused
             return refuse("snapshot.remove is empty".to_owned());
         }
         if snapshot.keep == 0 {
+            // alloc: error path, the file is refused
             return refuse("snapshot.keep is 0: the snapshot just taken would be removed".to_owned());
         }
         let standby = &self.standby;
@@ -279,13 +291,16 @@ impl Config {
             [("latest", &standby.latest), ("restore", &standby.restore), ("promote", &standby.promote)]
         {
             if argv.is_empty() {
+                // alloc: error path, the file is refused
                 return refuse(format!("standby.{name} is empty"));
             }
         }
         if standby.every_secs == 0 {
+            // alloc: error path, the file is refused
             return refuse("standby.every_secs is 0".to_owned());
         }
         if standby.misses == 0 {
+            // alloc: error path, the file is refused
             return refuse("standby.misses is 0: the standby would take over at once".to_owned());
         }
         Ok(())
@@ -293,18 +308,20 @@ impl Config {
 }
 
 /// The bytes of a secret's file, without a trailing newline. Debug never shows them.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct Secret(Vec<u8>);
 
 impl Secret {
     pub fn read(path: &Path) -> Result<Secret, ConfigError> {
         let mut bytes = std::fs::read(path).map_err(|error| ConfigError {
+            // alloc: error path
             what: format!("could not read the secret file {}: {error}", path.display()),
         })?;
         while bytes.last().is_some_and(|byte| *byte == b'\n' || *byte == b'\r') {
             bytes.pop();
         }
         if bytes.is_empty() {
+            // alloc: error path
             return Err(ConfigError { what: format!("the secret file {} is empty", path.display()) });
         }
         Ok(Secret(bytes))
@@ -316,8 +333,9 @@ impl Secret {
 
     /// The secret as text (a PEM key, a token).
     pub fn text(&self, path: &Path) -> Result<String, ConfigError> {
+        // alloc: once at start, the key or token as text
         String::from_utf8(self.0.clone()).map_err(|_| ConfigError {
-            what: format!("the secret file {} is not UTF-8", path.display()),
+            what: format!("the secret file {} is not UTF-8", path.display()), // alloc: error path
         })
     }
 }
@@ -329,109 +347,4 @@ impl fmt::Debug for Secret {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const EXAMPLE: &str = r#"{
-        "repo": "indexable-inc/blaze",
-        "app": {
-            "id": 123,
-            "installation": 456,
-            "key_file": "/etc/blaze-ci/app.pem",
-            "api": "api.github.com"
-        },
-        "webhook": { "listen": "127.0.0.1:8080", "secret_file": "/etc/blaze-ci/webhook" },
-        "daemon": { "socket": "/run/blaze/api.sock" },
-        "git": { "dir": "/var/lib/blaze-ci/repo", "remote": "https://github.com/indexable-inc/blaze" },
-        "default_branch": "main",
-        "checks": [
-            { "name": "blaze/check", "kind": "check", "targets": { "profile": "dev" } },
-            {
-                "name": "blaze/test",
-                "kind": "test",
-                "targets": { "packages": ["blaze-ci"], "profile": "dev", "features": ["x"] },
-                "filter": ["service"]
-            }
-        ],
-        "release_checks": [
-            {
-                "name": "blaze/release",
-                "kind": "build",
-                "targets": { "profile": "release", "target": "x86_64-unknown-linux-gnu" }
-            }
-        ],
-        "oracle": { "one_in": 50, "targets": { "profile": "dev" } },
-        "snapshot": {
-            "every_secs": 3600,
-            "command": ["ix", "snapshot", "{name}"],
-            "remove": ["ix", "snapshot", "rm", "{id}"],
-            "keep": 3
-        },
-        "standby": {
-            "primary": "10.0.0.2:7070",
-            "token_file": "/etc/blaze-ci/token",
-            "every_secs": 10,
-            "misses": 6,
-            "latest": ["ix", "snapshot", "latest"],
-            "restore": ["ix", "restore", "{id}"],
-            "promote": ["ix", "promote"]
-        },
-        "state": "/var/lib/blaze-ci/state.json"
-    }"#;
-
-    #[test]
-    fn a_full_example_parses() {
-        let config = Config::parse(EXAMPLE).unwrap();
-        assert_eq!(config.repo, "indexable-inc/blaze");
-        assert_eq!(config.app.installation, 456);
-        assert_eq!(config.webhook.listen, "127.0.0.1:8080".parse().unwrap());
-        assert_eq!(config.checks.len(), 2);
-        assert_eq!(config.checks[1].kind, CheckKind::Test);
-        assert_eq!(config.checks[1].filter, ["service"]);
-        assert_eq!(config.release_checks[0].targets.target.as_deref(), Some("x86_64-unknown-linux-gnu"));
-        assert_eq!(config.oracle.one_in, 50);
-        assert_eq!(config.snapshot.keep, 3);
-        assert_eq!(config.standby.misses, 6);
-        let request = config.checks[1].request(ViewRef::Head("h".to_owned()));
-        let Request::Test { targets, filter, all, .. } = request else { panic!("{request:?}") };
-        assert_eq!(targets.packages, ["blaze-ci"]);
-        assert_eq!(filter, ["service"]);
-        assert!(!all);
-    }
-
-    #[test]
-    fn an_unknown_field_is_refused_naming_it() {
-        let text = EXAMPLE.replace("\"keep\": 3", "\"keep\": 3, \"kept\": 4");
-        let error = Config::parse(&text).unwrap_err();
-        assert!(error.what.contains("kept"), "{error}");
-        let text = EXAMPLE.replace("\"api\": \"api.github.com\"", "\"api\": \"x\", \"token\": \"t\"");
-        let error = Config::parse(&text).unwrap_err();
-        assert!(error.what.contains("token"), "{error}");
-    }
-
-    #[test]
-    fn a_filter_on_a_check_that_is_not_a_test_is_refused() {
-        let text = EXAMPLE.replace(
-            r#""kind": "check", "targets": { "profile": "dev" } }"#,
-            r#""kind": "check", "targets": { "profile": "dev" }, "all": true }"#,
-        );
-        let error = Config::parse(&text).unwrap_err();
-        assert!(error.what.contains("blaze/check"), "{error}");
-    }
-
-    #[test]
-    fn the_oracles_name_is_refused_for_a_check() {
-        let text = EXAMPLE.replace("blaze/release", oracle::CHECK);
-        assert!(Config::parse(&text).unwrap_err().what.contains(oracle::CHECK));
-    }
-
-    #[test]
-    fn a_secret_hides_in_debug_and_loses_its_newline() {
-        let path = std::env::temp_dir().join(format!("blaze-ci-secret-{}", std::process::id()));
-        std::fs::write(&path, "hunter2\n").unwrap();
-        let secret = Secret::read(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(secret.expose(), b"hunter2");
-        assert!(!format!("{secret:?}").contains("hunter2"));
-    }
-}
+mod tests;

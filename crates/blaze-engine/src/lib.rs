@@ -1442,20 +1442,20 @@ impl SymbolResolver for Resolver<'_> {
         let stopped = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
-                    let (db, next, parts) = (self.db.clone(), &next, self.parts());
+                    let (db, next, parts) = (self.db, &next, self.parts());
                     let counted = counted.clone();
                     scope.spawn(move || {
                         let _worker = trace::cold_span("worker", batch);
-                        let resolver = parts.over(&db);
+                        let resolver = parts.over(db);
                         hir_ty_codegen::counted::within(counted, || {
-                            hir::attach_db(&db, || {
+                            hir::attach_db(db, || {
                                 loop {
                                     let at =
                                         next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     if at >= count {
                                         break;
                                     }
-                                    work(&db, &resolver, at);
+                                    work(db, &resolver, at);
                                 }
                             })
                         })
@@ -3557,12 +3557,12 @@ fn resolve_names(db: &RootDatabase, crates: &[ide_db::base_db::Crate]) {
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     std::thread::scope(|scope| {
         for _ in 0..threads.min(crates.len()) {
-            let (db, next) = (db.clone(), &next);
+            let (db, next) = (db, &next);
             scope.spawn(move || {
                 while let Some(&krate) =
                     crates.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                 {
-                    hir::attach_db(&db, || _ = hir::crate_def_map(&db, krate));
+                    hir::attach_db(db, || _ = hir::crate_def_map(db, krate));
                 }
             });
         }
@@ -3629,16 +3629,13 @@ fn resolve_all(
     let counting = events::Counting::new(events::Step::Resolve, crates.len(), threads);
     // The slot a crate under way says what it works on in: at most `threads` are under way.
     let free: Mutex<Vec<usize>> = Mutex::new((0..threads).rev().collect());
-    // `RootDatabase` is `Send` but not `Sync`: each node clones its own from this one.
-    let shared = Mutex::new(db.clone());
     let work = |node: NodeId| {
         let krate = crates[(node.0 - first) as usize];
-        let db = lock(&shared).clone();
         let slot = lock(&free).pop().unwrap_or_default();
         busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        counting.on(slot, || crate_shown(&db, krate));
+        counting.on(slot, || crate_shown(db, krate));
         events::crate_is(krate, events::CrateState::Resolving);
-        hir::attach_db(&db, || resolve_one(&db, krate, &busy, threads));
+        hir::attach_db(db, || resolve_one(db, krate, &busy, threads));
         events::crate_is(krate, events::CrateState::Resolved);
         counting.done(slot);
         busy.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -3725,7 +3722,7 @@ fn warm_impls(
 /// verified again.
 fn verify_impls<'scope>(
     scope: &'scope std::thread::Scope<'scope, '_>,
-    db: &RootDatabase,
+    db: &'scope RootDatabase,
     crates: &FxHashSet<ide_db::base_db::Crate>,
 ) {
     use hir_ty::method_resolution::{InherentImpls, TraitImpls};
@@ -3733,15 +3730,15 @@ fn verify_impls<'scope>(
     let next = Arc::new(AtomicUsize::new(0));
     let threads = std::thread::available_parallelism().map_or(1, |it| it.get());
     for _ in 0..threads.min(crates.len()) {
-        let (db, crates, next) = (db.clone(), crates.clone(), next.clone());
+        let (crates, next) = (crates.clone(), next.clone());
         scope.spawn(move || {
             // A query that is cancelled unwinds, and those that wait for it see that.
             _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                hir::attach_db(&db, || {
+                hir::attach_db(db, || {
                     let at = || next.fetch_add(1, Ordering::Relaxed);
                     while let Some(&krate) = crates.get(at()) {
-                        _ = TraitImpls::for_crate(&db, krate);
-                        _ = InherentImpls::for_crate(&db, krate);
+                        _ = TraitImpls::for_crate(db, krate);
+                        _ = InherentImpls::for_crate(db, krate);
                     }
                 })
             }));
@@ -3798,9 +3795,8 @@ fn on_idle_threads<T: Sync>(
     };
     std::thread::scope(|scope| {
         for _ in 0..helpers {
-            let db = db.clone();
             let each = &each;
-            scope.spawn(move || hir::attach_db(&db, || each(&db)));
+            scope.spawn(move || hir::attach_db(db, || each(db)));
         }
         each(db);
     });
@@ -4207,10 +4203,7 @@ fn exported(db: &RootDatabase, functions: &[FunctionId]) -> Vec<bool> {
     std::thread::scope(|scope| {
         let parts: Vec<_> = functions
             .chunks(each)
-            .map(|part| {
-                let db = db.clone();
-                scope.spawn(move || hir::attach_db(&db, || exported(&db, part)))
-            })
+            .map(|part| scope.spawn(move || hir::attach_db(db, || exported(db, part))))
             .collect();
         // A query that is cancelled unwinds, and goes on unwinding here as what it is.
         let joined = |it: std::thread::ScopedJoinHandle<'_, Vec<bool>>| {
@@ -4263,12 +4256,12 @@ impl Listed {
         std::thread::scope(|scope| {
             let parts: Vec<_> = (0..threads.min(crates.len()))
                 .map(|_| {
-                    let (db, next) = (db.clone(), &next);
+                    let next = &next;
                     scope.spawn(move || {
-                        hir::attach_db(&db, || {
+                        hir::attach_db(db, || {
                             let at = || next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             while let Some(&krate) = crates.get(at()) {
-                                self.of(&db, krate);
+                                self.of(db, krate);
                             }
                         })
                     })
@@ -4462,11 +4455,11 @@ fn home_in_rustcs(
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..cores().min(written.len()) {
-                let (db, written, next) = (db.clone(), &written, &next);
+                let (written, next) = (&written, &next);
                 scope.spawn(move || {
-                    hir::attach_db(&db, || {
+                    hir::attach_db(db, || {
                         while let Some(&func) = written.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            hir_ty_codegen::compile_written(&db, func);
+                            hir_ty_codegen::compile_written(db, func);
                         }
                     })
                 });
@@ -4677,12 +4670,12 @@ fn lower(db: &RootDatabase, bodies: Vec<DefWithBodyId>) -> Vec<DefWithBodyId> {
         // ones: each thread takes every nth, so that they are spread over all of them.
         let probing = PROBING.get();
         for part in 0..threads.min(bodies.len()) {
-            let (db, bodies) = (db.clone(), &bodies);
+            let bodies = &bodies;
             scope.spawn(move || {
                 PROBING.set(probing);
-                hir::attach_db(&db, || {
+                hir::attach_db(db, || {
                     for &body in bodies.iter().skip(part).step_by(threads) {
-                        Body::of(&db, body);
+                        Body::of(db, body);
                     }
                 })
             });
@@ -5374,25 +5367,25 @@ fn build(
     let stale: Option<Vec<_>> = std::thread::scope(|scope| {
         let parts: Vec<_> = (0..threads)
             .map(|part| {
-                let (db, known, local, next) = (db.clone(), &*known, &local, &next);
+                let (known, local, next) = (&*known, &local, &next);
                 let parts = resolver.parts();
                 let counted = Some(counting.counted().clone());
                 scope.spawn(move || {
                     PROBING.set(true);
-                    let resolver = parts.over(&db);
+                    let resolver = parts.over(db);
                     // What an edit changed is compiled again to tell what changed.
                     hir_ty_codegen::counted::within(counted, || {
-                        hir::attach_db(&db, || {
+                        hir::attach_db(db, || {
                             while let Some(&krate) =
                                 local.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
                             {
-                                hir_ty::method_resolution::TraitImpls::for_crate(&db, krate.into());
+                                hir_ty::method_resolution::TraitImpls::for_crate(db, krate.into());
                                 hir_ty::method_resolution::InherentImpls::for_crate(
-                                    &db,
+                                    db,
                                     krate.into(),
                                 );
                             }
-                            known.stale(&db, Some(&resolver), part, threads)
+                            known.stale(db, Some(&resolver), part, threads)
                         })
                     })
                 })
@@ -6522,17 +6515,17 @@ fn broken_in(
     let mut found: Vec<_> = std::thread::scope(|scope| {
         let checks: Vec<_> = (0..threads.min(edited.len()))
             .map(|part| {
-                let (db, config, within, counting) = (db.clone(), &config, &within, &counting);
+                let (config, within, counting) = (&config, &within, &counting);
                 scope.spawn(move || {
                     let files = edited.iter().skip(part).step_by(threads);
-                    hir::attach_db(&db, || {
+                    hir::attach_db(db, || {
                         files
                             .flat_map(|&file| {
                                 counting.on(part, || shown(watched, file, root));
                                 // A library's files are its unit tests' too, with what is
                                 // under `cfg(test)`: each crate built of them says what it
                                 // finds, where rust-analyzer would ask the first.
-                                let crates: Vec<_> = ide_db::base_db::relevant_crates(&db, file)
+                                let crates: Vec<_> = ide_db::base_db::relevant_crates(db, file)
                                     .iter()
                                     .copied()
                                     .filter(|it| within.as_ref().is_none_or(|w| w.contains(it)))
@@ -6544,7 +6537,6 @@ fn broken_in(
                                         .map(|it| Some(Arc::new(FxHashSet::from_iter([it]))))
                                         .collect(),
                                 };
-                                let db = &db;
                                 let rules = (lints, refuse_borrowck);
                                 let each = each.into_iter().flat_map(move |within| {
                                     errors_of(db, config, file, within, rules)
@@ -7363,7 +7355,7 @@ impl Client {
 /// Compiles what the tier watcher asked for of the program at `at`, on a thread of its own,
 /// and sends what it compiled as an [`Event::Tiered`].
 fn compile_tiered(
-    db: &RootDatabase,
+    db: &ide_db::base_db::Shared,
     known: &Rejections,
     at: usize,
     ask: tier::Ask,
@@ -7390,7 +7382,7 @@ fn compile_tiered(
         tier::done(&binary, Vec::new(), counters);
         return;
     }
-    let (db, tiering) = (db.clone(), Tiering::start());
+    let (db, tiering) = (db.reader(), Tiering::start());
     let asked_of = binary.clone();
     // Each body built in or shown is built inside the one that calls it, up to ten deep, with
     // the frames of a whole function's build each; a thread's default 2 MiB does not hold that.
@@ -7481,14 +7473,14 @@ impl Drop for Tiering {
 /// Lets go now of what the queries with an `lru` keep past it, the trees parsed and the bodies
 /// lowered for the builds that are over, which would otherwise wait for the next edit. Only
 /// when nothing else holds the database: this cancels what does.
-fn let_go(db: &mut RootDatabase, builds: &Builds, programs: &[Program]) {
+fn let_go(db: &mut ide_db::base_db::Shared, builds: &Builds, programs: &[Program]) {
     use ide_db::base_db::salsa::Database;
     // An own base an edit interrupted is built again from what it had computed, which letting
     // it go would have it compute again (#261): only once it is built, or given up.
     let base_to_come = (programs.iter().enumerate())
         .any(|(at, it)| !builds.given_up.contains(&at) && it.known.wants_base());
     if builds.running.is_empty() && TIERING.load(Ordering::Relaxed) == 0 && !base_to_come {
-        db.trigger_lru_eviction();
+        db.write().trigger_lru_eviction();
         // An idle worker allocates nothing, and jemalloc returns freed pages only as it
         // allocates, so what the build and the eviction freed would stay resident.
         memory::give_back();
@@ -7808,14 +7800,18 @@ impl Builds {
 
     /// Leaves no build under way, for the database to be written to: a write stops every
     /// thread that reads it. The builds that are kept are waited for, the others interrupted.
-    fn settle(&mut self, db: &mut RootDatabase, programs: &mut [Program]) -> anyhow::Result<()> {
-        use ide_db::base_db::salsa::Database as _;
+    fn settle(
+        &mut self,
+        db: &mut ide_db::base_db::Shared,
+        programs: &mut [Program],
+    ) -> anyhow::Result<()> {
         while self.running.values().any(|it| it.kept) {
             let event = self.events.recv()?;
             self.take(event, programs)?;
         }
         loop {
             if self.running.is_empty() {
+                db.write();
                 return Ok(());
             }
             let linking = lock(&LINKING);
@@ -7827,11 +7823,12 @@ impl Builds {
             let event = self.events.recv()?;
             self.take(event, programs)?;
         }
-        db.trigger_cancellation();
+        db.stop_readers();
         while !self.running.is_empty() {
             let event = self.events.recv()?;
             self.take(event, programs)?;
         }
+        db.write();
         INTERRUPTING.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -7983,10 +7980,16 @@ fn end_with_input() {
     // What it started goes with it, as when the daemon kills it: the daemon started it in a
     // group of its own.
     #[cfg(unix)]
-    // SAFETY: neither takes a pointer.
-    unsafe {
-        if libc::getpgrp() == libc::getpid() {
-            libc::killpg(0, libc::SIGKILL);
+    {
+        // SAFETY: `getpgrp` takes no pointer and cannot fail.
+        let group = unsafe { libc::getpgrp() };
+        // SAFETY: `getpid` takes no pointer and cannot fail.
+        let me = unsafe { libc::getpid() };
+        if group == me {
+            // SAFETY: this process leads its group (checked just above), which the daemon made
+            // for this worker alone, so `killpg(0, ..)` kills only what the worker started, and
+            // itself.
+            unsafe { libc::killpg(0, libc::SIGKILL) };
         }
     }
     std::process::exit(0);
@@ -8264,10 +8267,10 @@ fn lower_until(
     std::thread::scope(|scope| {
         let compiling: Vec<_> = (0..threads)
             .map(|_| {
-                let (db, unnamed) = (db.clone(), &unnamed);
+                let (db, unnamed) = (&*db, &unnamed);
                 scope.spawn(move || {
-                    let compile = || hir_ty_codegen::compile_unnamed(&db, unnamed, done);
-                    let compile = std::panic::AssertUnwindSafe(|| hir::attach_db(&db, compile));
+                    let compile = || hir_ty_codegen::compile_unnamed(db, unnamed, done);
+                    let compile = std::panic::AssertUnwindSafe(|| hir::attach_db(db, compile));
                     let _ = std::panic::catch_unwind(compile);
                 })
             })
@@ -8278,25 +8281,28 @@ fn lower_until(
         // cycles, as inference and MIR building do, and so for most of what takes long.
         while compiling.iter().any(|thread| !thread.is_finished()) {
             if done() {
-                db.trigger_cancellation();
+                db.stop_readers();
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
     });
+    if db.readers_stopped() {
+        db.trigger_cancellation();
+    }
     let db = &*db;
     // What the build lists of the crates to name what it keeps, while there is still time.
     let lower = |bodies: &[hir_def::DefWithBodyId]| {
         let next = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                let (db, next) = (db.clone(), &next);
+                let next = &next;
                 scope.spawn(move || {
-                    hir::attach_db(&db, || {
+                    hir::attach_db(db, || {
                         while let Some(&body) = bodies.get(next.fetch_add(1, Ordering::Relaxed))
                             && !done()
                         {
-                            hir_def::expr_store::Body::of(&db, body);
+                            hir_def::expr_store::Body::of(db, body);
                         }
                     })
                 });
@@ -10652,13 +10658,13 @@ fn run_holding(
                         let mut theirs = clients.iter().filter(|it| it.0 == at).peekable();
                         let defer =
                             theirs.peek().is_some() && theirs.all(|it| it.1.0 == Request::Edit);
-                        let (db, listed, paths, edit) = (db.clone(), &*listed, &*paths, &edit);
+                        let (db, listed, paths, edit) = (&db, &*listed, &*paths, &edit);
                         let wanted = outputs.get(&at);
                         let build = scope.spawn(move || {
                             let answer =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     let answer =
-                                        program.sync(&db, listed, paths, edit, wanted, link, defer);
+                                        program.sync(db, listed, paths, edit, wanted, link, defer);
                                     program.refused_in_codegen(answer)
                                 }));
                             end_link();
@@ -11264,11 +11270,11 @@ impl Program {
                 verify_impls(scope, db, crates);
             }
             let check = {
-                let (db, edited, root) = (db.clone(), &edited, &args.checkout);
+                let (edited, root) = (&edited, &args.checkout);
                 let lints = !args.lints_capped;
                 scope.spawn(move || {
                     let start = Instant::now();
-                    let broken = broken_in(&db, edited, paths, root, within, lints);
+                    let broken = broken_in(db, edited, paths, root, within, lints);
                     if std::env::var_os("BLAZE_STATS").is_some() {
                         eprintln!("check-us: {}", start.elapsed().as_micros());
                     }

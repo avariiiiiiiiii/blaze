@@ -18,6 +18,7 @@ pub(crate) fn read<'a, R: BufRead + ?Sized>(
         return Ok(None);
     }
     if !ended {
+        // alloc: error path, naming the length.
         return Err(invalid(format!("a frame of {} bytes with no terminating zero", buf.len())));
     }
     Ok(Some(buf))
@@ -36,12 +37,14 @@ pub(crate) fn encode<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
 /// with bytes after its message is refused.
 pub(crate) fn decode<T: DeserializeOwned>(buf: &mut [u8]) -> io::Result<T> {
     let Some((0, frame)) = buf.split_last_mut() else {
+        // alloc: error path.
         return Err(invalid("a frame not ending in a zero".to_owned()));
     };
     let len = unstuff(frame)?;
     let (msg, rest) = postcard::take_from_bytes::<T>(&frame[..len])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if !rest.is_empty() {
+        // alloc: error path, naming the length.
         return Err(invalid(format!("{} bytes after the message in its frame", rest.len())));
     }
     Ok(msg)
@@ -55,10 +58,12 @@ fn unstuff(frame: &mut [u8]) -> io::Result<usize> {
     while read < frame.len() {
         let code = usize::from(frame[read]);
         if code == 0 {
+            // alloc: error path, naming the offset.
             return Err(invalid(format!("a zero inside a frame, at {read}")));
         }
         let end = read + code;
         if end > frame.len() {
+            // alloc: error path, naming the offset.
             return Err(invalid(format!(
                 "a block of {} bytes at {read} past the frame's end at {}",
                 code - 1,

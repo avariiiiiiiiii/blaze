@@ -132,6 +132,7 @@ impl Finder<'_> {
     fn find<'r>(
         &self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
@@ -141,7 +142,7 @@ impl Finder<'_> {
         let in_store = |callee: &Instance| {
             let Some(entries) = self.entries else { return false };
             names.instance(callee).is_some_and(|name| {
-                entries.usable(&name, &|symbol| symbols.provides(symbol) && symbols.linked(symbol))
+                entries.usable(&name, symbols)
             })
         };
         for request in requests {
@@ -192,7 +193,7 @@ fn calls_after_imports(db: &Db, pending: &Pending) -> Vec<FuncRequest> {
     };
     let mut recorder = Recorder::new(db, &**isa, target, false);
     let (funcs, datas) = recorder.moved_requests(&pending.wants.requests);
-    let chosen = imports::chosen_for(&mut recorder, &|_| false, imports::BUDGET);
+    let chosen = imports::chosen_for(&mut recorder, &FxHashSet::default(), imports::BUDGET);
     let imported: FxHashMap<u32, &imports::Import> = chosen.iter().map(|it| (it.id, it)).collect();
     // What the IR refers to of its requests: some it asked for may be gone from it.
     let func = &pending.func;
@@ -377,6 +378,7 @@ struct Tried {
 
 impl Tried {
     /// Adds to `wave` what of `found` was not compiled or tried yet.
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     fn add(&mut self, symbols: &dyn SymbolResolver, found: Found, wave: &mut Vec<Kind>) {
         for root in found.roots {
             if symbols.function(root).is_some() && self.roots.insert(root) {
@@ -439,6 +441,7 @@ impl Round {
 
     /// Cuts the wave just built into units, in the order it has, and makes what it calls
     /// the next wave.
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     fn found(&mut self, symbols: &dyn SymbolResolver) {
         let wave = std::mem::take(&mut self.wave);
         let built = std::mem::take(&mut self.built);
@@ -549,6 +552,7 @@ impl Context<'_> {
         round: &Mutex<Round>,
         idle: &Condvar,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
     ) {
         let names = stable::StableNames::new(db, symbols, self.owned.clone(), self.hydrate);
@@ -592,6 +596,7 @@ impl Context<'_> {
     fn built(
         &self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
@@ -611,9 +616,7 @@ impl Context<'_> {
                             && names.instance(&root_instance(db, *root)).is_some_and(|name| {
                                 stable::StableNames::of_checkout(&name)
                                     && self.entries.is_some_and(|entries| {
-                                        entries.usable(&name, &|symbol| {
-                                            symbols.provides(symbol) && symbols.linked(symbol)
-                                        })
+                                        entries.usable(&name, symbols)
                                     })
                             })
                     }
@@ -651,6 +654,7 @@ impl Context<'_> {
     fn compiled(
         &self,
         db: &Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &dyn SymbolResolver,
         names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
@@ -752,7 +756,7 @@ fn unit(db: &Db, members: Vec<Built>) -> Vec<(Kind, Outcome)> {
         funcs.push((func, request));
     }
     let budget = imports::BUDGET.saturating_mul(members.len());
-    let chosen = imports::chosen_for(&mut recorder, &|it| defined.contains(it), budget);
+    let chosen = imports::chosen_for(&mut recorder, &defined, budget);
     let chosen = imports::tallied(chosen);
     let compiled: Vec<llvm::Member<'_>> = std::iter::zip(&members, &funcs)
         .map(|(member, (func, request))| llvm::Member {

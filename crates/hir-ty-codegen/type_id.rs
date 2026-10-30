@@ -112,6 +112,7 @@ fn hash_str(hasher: &mut StableSipHasher128, text: &str) {
 
 pub(super) struct TypeIdHasher<'a, 'db> {
     db: &'db Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &'a dyn SymbolResolver,
     /// The binders around what is being hashed, outermost first: for each, its bound
     /// lifetimes in the order they were met. rustc renumbers them that way before it hashes,
@@ -138,6 +139,7 @@ pub(super) struct TypeIdHasher<'a, 'db> {
 impl<'a, 'db> TypeIdHasher<'a, 'db> {
     pub(super) fn new(
         db: &'db Db,
+        // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
         symbols: &'a dyn SymbolResolver,
         owned: &'a FxHashSet<Crate>,
     ) -> Self {

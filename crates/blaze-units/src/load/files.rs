@@ -144,7 +144,7 @@ pub(crate) struct MountTable {
 }
 
 impl Versioned for MountTable {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo mount table 2");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo mount table 3");
 }
 
 mod outside_bytes {
@@ -583,7 +583,7 @@ impl Query for FixedFile {
     type Value = Cbor<Found<Vec<u8>>>;
 
     fn input(key: &FixedPath) -> ContentId {
-        key_input("blaze v2 cargo fixed file key 1", key)
+        key_input("blaze v2 cargo fixed file key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &FixedPath) -> Result<Cbor<Found<Vec<u8>>>, Cancelled> {
@@ -601,7 +601,7 @@ impl Query for FixedDir {
     type Value = Cbor<Found<Names>>;
 
     fn input(key: &FixedPath) -> ContentId {
-        key_input("blaze v2 cargo fixed dir key 1", key)
+        key_input("blaze v2 cargo fixed dir key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, key: &FixedPath) -> Result<Cbor<Found<Names>>, Cancelled> {

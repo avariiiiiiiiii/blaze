@@ -22,7 +22,10 @@ use syntax::{NodeOrToken, SyntaxKind, SyntaxToken, T, TextRange, ast};
 use super::{Args, Attr, Owner, Target};
 use crate::{
     cx::Cx,
-    lints::syntax::{Emitted, Pass, Walk, source_fact},
+    lints::{
+        registry::LintId,
+        syntax::{Emitted, Pass, Walk, source_fact},
+    },
     lower::Phase,
     model::Diag,
 };
@@ -45,8 +48,10 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<
     }
     // A macro call's attributes are gone by the time HIR is built, so the late pass never sees
     // them.
-    for owner in owners.iter().filter(|it| it.target != Target::MacroCall) {
-        unstable(cx, owner, &mut emitted);
+    if cx.lint_may_fire(LintId::named("unstable_features")) {
+        for owner in owners.iter().filter(|it| it.target != Target::MacroCall) {
+            unstable(cx, owner, &mut emitted);
+        }
     }
     emitted
 }

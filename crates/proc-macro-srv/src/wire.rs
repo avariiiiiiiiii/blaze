@@ -20,16 +20,22 @@ impl TokenStream<Span> {
     /// the top subtree's token trees when it is invisible, else the one group it is. Returns the
     /// stream and how many bytes it took. `part` turns each span part's raw ids into an anchor
     /// and a context, or refuses them; `join` makes a group's whole span of its delimiters'.
+    /// `scratch` holds the bytes when they don't start at a word, which `read_wire` asks for and
+    /// a deserialized `Vec<u8>` doesn't promise.
     pub fn read_wire(
         bytes: &[u8],
+        scratch: &mut Vec<u8>,
         part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
         join: impl Fn(Span, Span) -> Span,
     ) -> Result<(TokenStream<Span>, usize), String> {
+        let bytes = aligned(bytes, scratch);
+        // alloc: error path.
         let (tree, used) = TopSubtree::read_wire(bytes, part).map_err(|error| error.to_string())?;
         let top = tree.top_subtree().delimiter;
         let stream = streams(tree.iter(), &join)?;
         let stream = match top.kind {
             tt::DelimiterKind::Invisible => stream,
+            // alloc: the one group a macro is given, as the stream it owns.
             _ => TokenStream::new(vec![TokenTree::Group(group(top, stream, &join))]),
         };
         Ok((stream, used))
@@ -45,6 +51,7 @@ impl TokenStream<Span> {
             None => (tt::Delimiter::invisible_spanned(call_site), self),
         };
         let mut builder = TopSubtreeBuilder::new(top);
+        // alloc: one stack per output, as deep as its nesting; the output goes to the client.
         let mut open: Vec<(TokenStreamIter<'_, Span>, Span)> = Vec::new();
         let mut trees = contents.iter();
         loop {
@@ -84,6 +91,7 @@ impl TokenStream<Span> {
 fn push_literal(builder: &mut TopSubtreeBuilder, literal: &Literal<Span>) -> Result<(), String> {
     let suffix = literal.suffix.as_ref().map_or("", |it| it.as_str());
     if suffix.len() > LONGEST_SUFFIX {
+        // alloc: error path, naming the suffix.
         return Err(format!(
             "a literal with a suffix of {} bytes, past the {LONGEST_SUFFIX} a token tree holds",
             suffix.len()
@@ -114,12 +122,28 @@ fn push_literal(builder: &mut TopSubtreeBuilder, literal: &Literal<Span>) -> Res
     Ok(())
 }
 
+/// `bytes`, or a copy of them in `scratch` starting at a 4-byte boundary when they don't. The
+/// same as `proc_macro_api::wire::aligned`, which this crate can't name (that one depends on it).
+fn aligned<'a>(bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    if bytes.as_ptr().addr().is_multiple_of(4) {
+        return bytes;
+    }
+    scratch.clear();
+    // alloc: only for bytes a deserializer left off a word, reused across requests.
+    scratch.resize(bytes.len() + 3, 0);
+    let at = scratch.as_ptr().align_offset(4);
+    scratch[at..at + bytes.len()].copy_from_slice(bytes);
+    &scratch[at..at + bytes.len()]
+}
+
 /// The streams of the token trees `top` walks, each subtree a group.
 fn streams(
     top: tt::TtIter<'_>,
     join: &impl Fn(Span, Span) -> Span,
 ) -> Result<TokenStream<Span>, String> {
+    // alloc: one stack per input, as deep as its nesting.
     let mut open: Vec<(Vec<TokenTree<Span>>, tt::TtIter<'_>, tt::Delimiter)> = Vec::new();
+    // alloc: a macro owns its streams, one `Vec` per group.
     let mut trees = Vec::new();
     let mut iter = top;
     loop {
@@ -200,6 +224,7 @@ fn leaf_tree(leaf: tt::Leaf) -> Result<TokenTree<Span>, String> {
         }
         tt::Leaf::Punct(punct) => {
             if !punct.char.is_ascii() {
+                // alloc: error path, naming the char.
                 return Err(format!("a punct {:?}, which is not ASCII", punct.char));
             }
             TokenTree::Punct(Punct {
@@ -278,8 +303,13 @@ mod tests {
             let tree = tree(kind);
             let mut bytes = Vec::new();
             tree.write_wire(&mut bytes);
-            let (stream, used) =
-                TokenStream::read_wire(&bytes, &mut parts(&tree), |open, _| open).unwrap();
+            let (stream, used) = TokenStream::read_wire(
+                &bytes,
+                &mut Vec::new(),
+                &mut parts(&tree),
+                |open, _| open,
+            )
+            .unwrap();
             assert_eq!(used, bytes.len());
             let mut again = Vec::new();
             stream.write_wire(span(0, 0), &mut again).unwrap();
@@ -292,6 +322,22 @@ mod tests {
             assert_eq!(tokens(&back), tokens(&tree), "{kind:?}");
             assert_eq!(tokens(&back).len(), 104);
         }
+    }
+
+    #[test]
+    fn a_tree_at_an_odd_offset_reads_from_a_copy() {
+        let tree = tree(tt::DelimiterKind::Brace);
+        let mut bytes = vec![0];
+        tree.write_wire(&mut bytes);
+        let odd = &bytes[1..];
+        assert!(!odd.as_ptr().addr().is_multiple_of(4));
+        let mut scratch = Vec::new();
+        let (stream, used) =
+            TokenStream::read_wire(odd, &mut scratch, &mut parts(&tree), |open, _| open).unwrap();
+        assert_eq!(used, odd.len());
+        let mut again = Vec::new();
+        stream.write_wire(span(0, 0), &mut again).unwrap();
+        assert_eq!(again, odd);
     }
 
     #[test]

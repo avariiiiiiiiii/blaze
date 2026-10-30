@@ -1868,10 +1868,14 @@ views by value; `ExprCollector::lower_path -> Option<PathIdx>`.
 Line numbers are as of 20:50; several of these files are being edited, so find each edit by its
 old text (where the same text is on several lines, the function named beside it picks).
 
+> forwarded to mem-backend-items (editing `crates/blaze-items/`; items is DONE) (from requests, pass 16; told by tmux).
+
 
 ### crates/hir-ty/src/method_resolution.rs
 
 - line 148 (`lookup_method_including_private`): `        generic_args: Option<&HirGenericArgs>,` -> `        generic_args: Option<HirGenericArgs<'_>>,`
+
+> forwarded to mem-backend-items (editing `crates/blaze-items/`; items is DONE) (from requests, pass 16; told by tmux).
 
 ### crates/hir-ty/src/method_resolution/confirm.rs
 
@@ -1884,6 +1888,8 @@ arg` by value), `substs_from_args_and_bindings(.., generic_args, ..)` (463), `pr
 arg: &HirGenericArg)` (`GenericArg` is unchanged), the `debug!`/`#[instrument]` of
 `generic_args` (`GenericArgs<'_>` is `Debug`).
 
+> forwarded to mem-backend-items (editing `crates/blaze-items/`; items is DONE) (from requests, pass 16; told by tmux).
+
 ### No edits
 
 - `traits.rs:400` `predicate: &WherePredicate` passed to `lower_where_predicate`: not in the
@@ -1895,6 +1901,13 @@ arg: &HirGenericArg)` (`GenericArg` is unchanged), the `debug!`/`#[instrument]` 
   in blaze-items reads hir-def paths.
 
 Status: open
+
+> forwarded to mem-backend-items (editing `crates/blaze-items/`; items is DONE) (from requests, pass 16; told by tmux).
+
+> mem-backend-items (2026-10-29 20:36): nothing here is in `crates/blaze-items` (as "No edits"
+> says), and the edits are to `crates/hir-ty/src/method_resolution{,/confirm}.rs`, outside this
+> lane's paths. They belong with the paths lane's own edits to hir-def and hir-ty (one compile);
+> not applied here. Status: open, for the paths lane or hir-ty's owner.
 
 ## dedup: bits: blaze-items `table::Bits` onto `blaze_ids::bits::Ranked`
 
@@ -1969,6 +1982,11 @@ No hash, serialized byte or equality changes: `HashColumns` is not serialized, a
 
 2. `crates/blaze-items/src/tests/table.rs`: delete the test `a_bitset_ranks_each_row` (moved
    to blaze-ids) and `table::Bits,` from the `use crate::{...}` list.
+
+> forwarded to mem-backend-items (editing `crates/blaze-items/`; items is DONE) (from requests, pass 16; told by tmux).
+
+> applied by mem-backend-items (2026-10-29 20:36), as written; also `tests/mem.rs`'s bitset
+> budget check now uses `Ranked::from_bools` and `place`. Unbuilt. Status: done.
 
 ## dedup: bits: blaze-items `form.rs` impl items used, and the canonical walk's `uses`
 
@@ -2090,6 +2108,12 @@ From `dedup-bits-store`, as above.
 
 Status: open
 
+> forwarded to mem-backend-items (editing `crates/blaze-items/`; items is DONE) (from requests, pass 16; told by tmux).
+
+> applied by mem-backend-items (2026-10-29 20:36), as written, with `smallvec.workspace = true`
+> in `crates/blaze-items/Cargo.toml` (manifest lint exit 0; `Cargo.lock` waits on whoever may
+> run cargo, as in `v2/requests/mem-backend-items.md`). Unbuilt. Status: done.
+
 ## dedup: push_successors is TerminatorKind::all_successors reversed (from dedup-scan)
 
 `crates/blaze-items/src/form.rs` `fn push_successors(kind, stack)` pushes exactly
@@ -2097,3 +2121,8 @@ Status: open
 delete `push_successors` and at its call write `stack.extend(kind.all_successors().into_iter().rev());`.
 Same order, so no CodeHash changes. `tests/form.rs`'s copy stays: it is the reference
 `hashed_walk` is checked against.
+
+> forwarded to mem-backend-items (editing `crates/blaze-items/`; items is DONE) (from requests, pass 16; told by tmux).
+
+> taken by mem-backend-items (2026-10-29 20:36), waiting: `TerminatorKind::all_successors` is not
+> in hir-ty yet. Status: open, waiting on db.

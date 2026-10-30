@@ -5,13 +5,10 @@
 
 use base_db::Db;
 use load_cargo::{SubRequest, SubResponse};
-use span::{
-    EditionedFileId, ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, Span, SpanAnchor,
-    SyntaxContext, TextRange, TextSize,
-};
+use span::{EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange, TextSize};
 
-use super::{
-    lex,
+use crate::bridge::{
+    lex, spans,
     wire::{self, NONE, Parts, Tree},
 };
 
@@ -37,48 +34,6 @@ impl Host<'_> {
         self.parts.pack(span)
     }
 
-    fn join(&mut self, first: Span, second: Span) -> Option<Span> {
-        if first.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
-            return Some(second);
-        }
-        if second.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
-            return Some(first);
-        }
-        if first.anchor != second.anchor {
-            if first.anchor.file_id != second.anchor.file_id {
-                return None;
-            }
-            let req = SubRequest::SpanJoin {
-                file_id: first.anchor.file_id.as_u32(),
-                ast_id_first: first.anchor.ast_id.into_raw(),
-                start_first: first.range.start().into(),
-                end_first: first.range.end().into(),
-                ctx_first: first.ctx.into_u32(),
-                ast_id_second: second.anchor.ast_id.into_raw(),
-                start_second: second.range.start().into(),
-                end_second: second.range.end().into(),
-                ctx_second: second.ctx.into_u32(),
-            };
-            let Some(SubResponse::SpanJoinResult { span: Some(it) }) = self.ask(req) else {
-                return None;
-            };
-            let anchor = SpanAnchor {
-                file_id: first.anchor.file_id,
-                ast_id: ErasedFileAstId::from_raw(it.ast_id),
-            };
-            // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts:
-            // `it.ctx` is what `load_cargo::answer` read from `self.db` for this join, in this
-            // process. Memory safety doesn't rest on it: a wrong value panics in `from_u32` or
-            // in salsa's checked lookup, or names another context's hygiene.
-            let ctx = unsafe { SyntaxContext::from_u32(it.ctx) };
-            return Some(Span { range: range(it.start, it.end), anchor, ctx });
-        }
-        if first.ctx != second.ctx {
-            return Some(first);
-        }
-        Some(Span { range: first.range.cover(second.range), anchor: second.anchor, ctx: second.ctx })
-    }
-
     fn line_column(&mut self, span: Span) -> Option<(u32, u32)> {
         let req = SubRequest::LineColumn {
             file_id: span.anchor.file_id.as_u32(),
@@ -96,41 +51,12 @@ impl Host<'_> {
     }
 
     /// `trees` as the columns the macro reads of text it asked to be tokens of.
-    fn written(&mut self, trees: &[Tree]) -> Vec<u8> {
+    fn written(&mut self, trees: impl IntoIterator<Item = Tree>) -> Vec<u8> {
+        // alloc: the bytes of text the macro asked to be tokens of, which it is given.
         let mut out = Vec::new();
         wire::relative(&wire::invisible(trees, self.call_site_span()), self.parts, &mut out);
         out
     }
-}
-
-fn subspan(span: Span, start: u64, end: u64) -> Option<Span> {
-    if span.anchor.ast_id == FIXUP_ERASED_FILE_AST_ID_MARKER {
-        return Some(span);
-    }
-    let length: u32 = span.range.len().into();
-    let bound = |it: u64, unbounded: u32, included_end: bool| -> Option<u32> {
-        let at = u32::try_from(it / 4).ok()?;
-        match (it, it % 4) {
-            (0, _) => Some(unbounded),
-            (_, 1) if included_end => at.checked_add(1),
-            (_, 1) => Some(at),
-            (_, 3) if included_end => Some(at),
-            (_, 3) => at.checked_add(1),
-            _ => None,
-        }
-    };
-    let start = bound(start, 0, false)?;
-    let end = bound(end, length, true)?;
-    let span_start: u32 = span.range.start().into();
-    if (u32::MAX - start) < span_start
-        || (u32::MAX - end) < span_start
-        || start >= end
-        || end > length
-    {
-        return None;
-    }
-    let range = TextRange::new(TextSize::from(start), TextSize::from(end)) + span.range.start();
-    Some(Span { range, ..span })
 }
 
 fn range(start: u32, end: u32) -> TextRange {
@@ -169,7 +95,7 @@ impl native_proc_macro::__native::Host for Host<'_> {
 
     fn span_join(&mut self, a: u64, b: u64) -> u64 {
         let (Some(first), Some(second)) = (self.span(a), self.span(b)) else { return NONE };
-        self.join(first, second).map_or(NONE, |it| self.number(it))
+        spans::join(first, second, |req| self.ask(req)).map_or(NONE, |it| self.number(it))
     }
 
     fn span_resolved_at(&mut self, a: u64, at: u64) -> u64 {
@@ -224,7 +150,7 @@ impl native_proc_macro::__native::Host for Host<'_> {
 
     fn span_subspan(&mut self, a: u64, start: u64, end: u64) -> u64 {
         let Some(span) = self.span(a) else { return NONE };
-        subspan(span, start, end).map_or(NONE, |it| self.number(it))
+        spans::subspan(span, start, end).map_or(NONE, |it| self.number(it))
     }
 
     fn span_pack(&mut self, start: u32, len: u32, part: u32) -> u64 {
@@ -256,6 +182,7 @@ impl native_proc_macro::__native::Host for Host<'_> {
     }
 
     fn span_debug(&mut self, a: u64) -> Option<String> {
+        // alloc: the text the macro asked for.
         self.span(a).map(|it| format!("{it:?}"))
     }
 
@@ -264,6 +191,7 @@ impl native_proc_macro::__native::Host for Host<'_> {
         let req = SubRequest::FilePath { file_id: span.anchor.file_id.file_id().index() };
         match self.ask(req) {
             Some(SubResponse::FilePathResult { name }) => Some(name),
+            // alloc: none, an empty name.
             _ => Some(String::new()),
         }
     }
@@ -288,14 +216,15 @@ impl native_proc_macro::__native::Host for Host<'_> {
 
     fn ts_from_str(&mut self, text: &str) -> Result<Vec<u8>, String> {
         match lex::stream(text, self.call_site_span()) {
-            Ok(trees) => Ok(self.written(&trees)),
+            Ok(trees) => Ok(self.written(trees)),
+            // alloc: the message of text refused.
             Err(e) => Err(format!("failed to parse str to token stream: {e}")),
         }
     }
 
     fn literal_from_str(&mut self, text: &str) -> Option<Vec<u8>> {
         let literal = lex::literal_from_str(text, self.call_site_span())?;
-        Some(self.written(&[Tree::Leaf(tt::Leaf::Literal(literal))]))
+        Some(self.written([Tree::Leaf(tt::Leaf::Literal(literal))]))
     }
 
     fn pack(&mut self, span: Span) -> u64 {

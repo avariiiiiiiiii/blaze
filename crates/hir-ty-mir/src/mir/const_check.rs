@@ -10,6 +10,7 @@
 //! and is left alone. An intrinsic not declared `const` is refused as rustc refuses it.
 
 use base_db::Db;
+use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
     CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
     expr_store::Body,
@@ -24,6 +25,7 @@ use hir_ty::{InferBodyId, InferenceResult, db::HirDatabase, next_solver::TyKind}
 use super::{
     BasicBlockId, BinOp, CastKind, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
     TerminatorKind,
+    framed::{Bits, bits_in},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
@@ -98,115 +100,122 @@ pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
         return result;
     }
     let Ok(body) = db.mir_body(InferBodyId::DefWithBodyId(def)) else { return result };
-    let (store, source_map) = Body::with_source_map(db, def);
+    let store = Body::of(db, def);
+    // Whether `span` is an expression written in the source, not one lowering made. Asked
+    // last, of what would be reported: a body with nothing to report is checked without
+    // building its source map.
     let written = |span: MirSpan| match span {
-        MirSpan::ExprId(expr) => source_map.expr_syntax(expr).is_ok().then_some(expr),
-        _ => None,
+        MirSpan::ExprId(expr) => Body::with_source_map(db, def).1.expr_syntax(expr).is_ok(),
+        _ => false,
     };
     let mut report = |code: &'static str, span: MirSpan, message: String| {
         result.diagnostics.push(ConstCheckDiagnostic { code, span, message });
     };
-    for block in reachable(body) {
-        let block = &body.basic_blocks[block];
-        if block.is_cleanup {
-            continue;
-        }
-        for statement in &block.statements {
-            match &statement.kind {
-                StatementKind::Assign(_, Rvalue::Cast(CastKind::PointerExposeAddress, _, _))
-                    if written(statement.span).is_some() =>
+    frame::task(Tag::Mir, |frame| {
+        for &block in reachable(body, frame).iter() {
+            let block = &body.basic_blocks[block];
+            if block.is_cleanup {
+                continue;
+            }
+            for statement in &block.statements {
+                match &statement.kind {
+                    StatementKind::Assign(_, Rvalue::Cast(CastKind::PointerExposeAddress, _, _))
+                        if written(statement.span) =>
+                    {
+                        report(
+                            "",
+                            statement.span,
+                            // alloc: the text of a diagnostic, made when it is reported
+                            "pointers cannot be cast to integers during const eval".to_owned(),
+                        );
+                    }
+                    StatementKind::Assign(
+                        _,
+                        Rvalue::BinaryOp(op, lhs, _) | Rvalue::CheckedBinaryOp(op, lhs, _),
+                    ) if matches!(
+                        op,
+                        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+                    ) && operand_ty(body, lhs)
+                        .is_some_and(|ty| matches!(ty, TyKind::RawPtr(..) | TyKind::FnPtr(..)))
+                        && written(statement.span) =>
+                    {
+                        report(
+                            "",
+                            statement.span,
+                            // alloc: the text of a diagnostic, made when it is reported
+                            "pointers cannot be reliably compared during const eval".to_owned(),
+                        );
+                    }
+                    StatementKind::InlineAsm(_) if written(statement.span) => {
+                        report(
+                            "E0015",
+                            statement.span,
+                            // alloc: the text of a diagnostic, made when it is reported
+                            format!("inline assembly is not allowed in {}", kind.plural()),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            let Some(terminator) = &block.terminator else { continue };
+            let TerminatorKind::Call { func, from_hir_call: true, intrinsic, .. } = &terminator.kind
+            else {
+                continue;
+            };
+            let MirSpan::ExprId(expr) = terminator.span else { continue };
+            match operand_ty(body, func) {
+                Some(TyKind::FnPtr(..))
+                    if matches!(store.expr(expr), Expr::Call { .. }) && written(terminator.span) =>
                 {
                     report(
                         "",
-                        statement.span,
+                        terminator.span,
                         // alloc: the text of a diagnostic, made when it is reported
-                        "pointers cannot be cast to integers during const eval".to_owned(),
+                        format!("function pointer calls are not allowed in {}", kind.plural()),
                     );
                 }
-                StatementKind::Assign(
-                    _,
-                    Rvalue::BinaryOp(op, lhs, _) | Rvalue::CheckedBinaryOp(op, lhs, _),
-                ) if matches!(
-                    op,
-                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-                ) && written(statement.span).is_some()
-                    && operand_ty(body, lhs)
-                        .is_some_and(|ty| matches!(ty, TyKind::RawPtr(..) | TyKind::FnPtr(..))) =>
-                {
-                    report(
-                        "",
-                        statement.span,
-                        // alloc: the text of a diagnostic, made when it is reported
-                        "pointers cannot be reliably compared during const eval".to_owned(),
-                    );
-                }
-                StatementKind::InlineAsm(_) if written(statement.span).is_some() => {
+                Some(TyKind::FnDef(callee, _)) => {
+                    let CallableDefId::FunctionId(callee) = callee.0 else { continue };
+                    // The function the source calls, and not one lowering calls for it.
+                    let called = match store.expr(expr) {
+                        Expr::Call { callee: path, .. } => match infer.expr_ty(path).kind() {
+                            TyKind::FnDef(it, _) => it.0 == CallableDefId::FunctionId(callee),
+                            _ => false,
+                        },
+                        Expr::MethodCall { .. } => {
+                            infer.method_resolution(expr).is_some_and(|(it, _)| it == callee)
+                        }
+                        _ => false,
+                    };
+                    if !called || is_const_callable(db, callee) || !written(terminator.span) {
+                        continue;
+                    }
+                    // rustc's `IntrinsicNonConst`, for an intrinsic that is not `const` (nor
+                    // `#[rustc_comptime]`, which `is_const_callable` accepts).
+                    if let Some(intrinsic) = intrinsic {
+                        report(
+                            "",
+                            terminator.span,
+                            // alloc: the text of a diagnostic, made when it is reported
+                            format!(
+                                "cannot call non-const intrinsic `{intrinsic}` in {}",
+                                kind.plural()
+                            ),
+                        );
+                        continue;
+                    }
+                    let (descr, path) = described(db, def, callee);
                     report(
                         "E0015",
-                        statement.span,
+                        terminator.span,
                         // alloc: the text of a diagnostic, made when it is reported
-                        format!("inline assembly is not allowed in {}", kind.plural()),
+                        format!("cannot call non-const {descr} `{path}` in {}", kind.plural()),
                     );
                 }
                 _ => {}
             }
         }
-        let Some(terminator) = &block.terminator else { continue };
-        let TerminatorKind::Call { func, from_hir_call: true, intrinsic, .. } = &terminator.kind
-        else {
-            continue;
-        };
-        let Some(expr) = written(terminator.span) else { continue };
-        match operand_ty(body, func) {
-            Some(TyKind::FnPtr(..)) if matches!(store.expr(expr), Expr::Call { .. }) => {
-                report(
-                    "",
-                    terminator.span,
-                    // alloc: the text of a diagnostic, made when it is reported
-                    format!("function pointer calls are not allowed in {}", kind.plural()),
-                );
-            }
-            Some(TyKind::FnDef(callee, _)) => {
-                let CallableDefId::FunctionId(callee) = callee.0 else { continue };
-                // The function the source calls, and not one lowering calls for it.
-                let called = match store.expr(expr) {
-                    Expr::Call { callee: path, .. } => match infer.expr_ty(path).kind() {
-                        TyKind::FnDef(it, _) => it.0 == CallableDefId::FunctionId(callee),
-                        _ => false,
-                    },
-                    Expr::MethodCall { .. } => {
-                        infer.method_resolution(expr).is_some_and(|(it, _)| it == callee)
-                    }
-                    _ => false,
-                };
-                if !called || is_const_callable(db, callee) {
-                    continue;
-                }
-                // rustc's `IntrinsicNonConst`, for an intrinsic that is not `const` (nor
-                // `#[rustc_comptime]`, which `is_const_callable` accepts).
-                if let Some(intrinsic) = intrinsic {
-                    report(
-                        "",
-                        terminator.span,
-                        // alloc: the text of a diagnostic, made when it is reported
-                        format!(
-                            "cannot call non-const intrinsic `{intrinsic}` in {}",
-                            kind.plural()
-                        ),
-                    );
-                    continue;
-                }
-                let (descr, path) = described(db, def, callee);
-                report(
-                    "E0015",
-                    terminator.span,
-                    // alloc: the text of a diagnostic, made when it is reported
-                    format!("cannot call non-const {descr} `{path}` in {}", kind.plural()),
-                );
-            }
-            _ => {}
-        }
-    }
+    });
     result
 }
 
@@ -307,17 +316,26 @@ fn operand_ty<'db>(body: &MirBody<'db>, operand: &Operand) -> Option<TyKind<'db>
 /// The blocks control reaches from the start when nothing unwinds, as rustc's
 /// `traversal::reachable` after `SimplifyCfg` removed the others, without the blocks lowering
 /// builds that rustc builds no way into.
-fn reachable(body: &MirBody<'_>) -> Vec<BasicBlockId> {
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut stack = vec![body.start_block];
-    let mut order = Vec::new();
+fn reachable<'f>(body: &MirBody<'_>, frame: &'f Frame) -> Vec<BasicBlockId, &'f Frame> {
+    let blocks = body.basic_blocks.len();
+    let block_index = |block: BasicBlockId| block.into_raw().into_u32() as usize;
+    let mut seen: Bits<'f> = bits_in(blocks, frame);
+    let mut stack = Vec::with_capacity_in(blocks, frame);
+    stack.push(body.start_block);
+    let mut order = Vec::with_capacity_in(blocks, frame);
     while let Some(block) = stack.pop() {
-        if !seen.insert(block) || body.unreached.contains(&block) {
+        if seen.contains(block_index(block)) || body.unreached.contains(&block) {
             continue;
         }
+        seen.insert(block_index(block));
         order.push(block);
-        if let Some(terminator) = &body.basic_blocks[block].terminator {
-            stack.extend(terminator.kind.successors());
+        match body.basic_blocks[block].terminator.as_ref().map(|it| &it.kind) {
+            // `successors` copies these into a `SmallVec` that spills past two.
+            Some(TerminatorKind::SwitchInt { targets, .. }) => {
+                stack.extend_from_slice(targets.all_targets())
+            }
+            Some(kind) => stack.extend(kind.successors()),
+            None => {}
         }
     }
     order

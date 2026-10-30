@@ -240,7 +240,7 @@ fn associated_call_syntax(
     candidate: &Static,
     call: &ast::MethodCallExpr,
     args: &[ast::Expr],
-    at: &dyn Fn(TextRange) -> Span,
+    at: &impl Fn(TextRange) -> Span,
 ) {
     let (ty_str, first_arg) = match *candidate {
         Static::Impl(imp, f) => {
@@ -364,7 +364,7 @@ fn call_field_as_fn(
     diag: &mut Diag,
     no_match: &NoMatch<'_>,
     call: &ast::MethodCallExpr,
-    at: &dyn Fn(TextRange) -> Span,
+    at: &impl Fn(TextRange) -> Span,
 ) -> bool {
     let found = no_match.receiver.autoderef(cx.db).find_map(|ty| {
         if !matches!(ty.as_adt()?, hir::Adt::Struct(_) | hir::Adt::Union(_)) {
@@ -708,7 +708,7 @@ fn restrict_param(
     diag: &mut Diag,
     param: hir::TypeParam,
     candidates: &[(bool, String, hir::Trait)],
-    message: &dyn Fn(&str) -> String,
+    message: &impl Fn(&str) -> String,
 ) {
     if param.is_implicit(cx.db) {
         return;

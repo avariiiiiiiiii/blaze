@@ -82,7 +82,6 @@ const REACH: u64 = 4 << 30;
 const LOOK_EVERY: Duration = Duration::from_millis(30);
 
 pub(crate) struct Live {
-    dir: PathBuf,
     uuid: [u8; 16],
     slide: u64,
     process: Process,
@@ -93,13 +92,31 @@ pub(crate) struct Live {
     threads: stop::Threads,
     sequence: u64,
     /// The statics new since the executable that a patch gave a first value, by address, and
-    /// the pages of the room they are in.
-    lasting: std::collections::HashSet<u64>,
-    lasting_pages: std::collections::HashSet<u64>,
+    /// the pages of the room they are in, each sorted.
+    lasting: Vec<u64>,
+    lasting_pages: Vec<u64>,
     /// Where the room ends, above those statics: the `end` published is below them.
     room_end: u64,
     /// The executable's image in memory, which every write over it is checked to be in.
     image: std::ops::Range<u64>,
+    scratch: Scratch,
+    /// The file the daemon reads `process` from, the one it is written to first, and its text.
+    process_file: PathBuf,
+    partial: PathBuf,
+    text: String,
+}
+
+/// Buffers a patch is planned and written with, kept from one to the next.
+#[derive(Default)]
+struct Scratch {
+    plan: Plan,
+    /// The protection of the region each step of the plan is in.
+    protections: Vec<i32>,
+    /// The CIEs and FDEs of the patch's unwind entries.
+    cies: Vec<usize>,
+    fdes: Vec<usize>,
+    /// A static's first value, slid.
+    value: Vec<u8>,
 }
 
 impl Live {
@@ -117,27 +134,39 @@ impl Live {
         // and `~/.cache/blaze` is its parent.
         std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
             .create(&dir)
+            // alloc: error path
             .map_err(|it| format!("{}: {it}", dir.display()))?;
         let (next, end) = reserve(&image, slide)?;
+        // clone: setup, the directory handed once to `DIR`
         _ = crate::DIR.set(dir.clone());
         let code = sample::Code { slide, image: image.start..image.end, patches: next..end };
+        // clone: setup, the directory handed once to the sampler's thread
         sample::start(dir.clone(), code);
         let started = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
         let started = started.map_or(0, |it| it.as_millis() as u64);
         let process = Process { pid: std::process::id(), uuid: image.uuid, started, next, end };
-        let live = Live {
+        let process_file = dir.join("process");
+        // alloc: setup, once at start
+        let partial = dir.join(format!("process.{}", process.pid));
+        let mut live = Live {
             patches: watch(&dir, image.uuid),
-            dir,
             uuid: image.uuid,
             slide,
             process,
             overwrites: Overwrites::default(),
             threads: stop::Threads::new(),
             sequence: 0,
-            lasting: std::collections::HashSet::new(),
-            lasting_pages: std::collections::HashSet::new(),
+            // alloc: none until a patch gives a static its first value, then once per doubling
+            lasting: Vec::new(),
+            // alloc: as `lasting`
+            lasting_pages: Vec::new(),
             room_end: end,
             image: image.start.wrapping_add(slide)..image.end.wrapping_add(slide),
+            scratch: Scratch::default(),
+            process_file,
+            partial,
+            // alloc: setup, the one buffer `publish` writes the process's text into
+            text: String::with_capacity(256),
         };
         live.publish()?;
         Ok(live)
@@ -168,6 +197,7 @@ impl Live {
             }
         };
         std::thread::Builder::new()
+            // alloc: setup, the thread's name, once
             .name("blaze-live-apply".to_owned())
             .spawn(applying)
             .expect("spawning the thread that applies edits");
@@ -179,6 +209,7 @@ impl Live {
         }
         self.sequence = patch.sequence;
         if patch.uuid != self.uuid {
+            // alloc: once, the program was linked again and has to start
             return Some(Outcome::Restart("the program was linked again".to_owned()));
         }
         Some(match patch.body {
@@ -203,19 +234,27 @@ impl Live {
     }
 
     fn apply(&mut self, code: &Code) -> Result<(), Failed> {
+        let mut scratch = std::mem::take(&mut self.scratch);
+        let applied = self.apply_with(code, &mut scratch);
+        self.scratch = scratch;
+        applied
+    }
+
+    fn apply_with(&mut self, code: &Code, s: &mut Scratch) -> Result<(), Failed> {
         // Every write over the executable is checked, and planned, before anything is mapped.
         apply::in_image(&code.writes, self.slide, &self.image)?;
-        let plan = self.overwrites.plan(code, self.slide)?;
-        let protections = protections(&plan)?;
+        self.overwrites.plan(code, self.slide, &mut s.plan)?;
+        protections(&s.plan, &mut s.protections)?;
         let at = code.base.checked_add(self.slide).ok_or("a patch past the end of memory")?;
         // From here the room up to `end` is used, whatever becomes of the patch: jumps or the
         // unwinder may reach what is mapped there.
         let end = apply::claim(&mut self.process, code, PAGE)?;
         let len = end - code.base;
-        let applied = (if len == 0 { Ok(()) } else { self.map(code, at, len) })
-            .and_then(|()| self.first_values(code, end))
+        let frames = (&mut s.cies, &mut s.fdes);
+        let applied = (if len == 0 { Ok(()) } else { self.map(code, at, len, frames) })
+            .and_then(|()| self.first_values(code, end, &mut s.value))
             .map_err(Failed::from)
-            .and_then(|()| self.redirect(&plan, &protections));
+            .and_then(|()| self.redirect(&s.plan, &s.protections));
         let published = self.publish().map_err(Failed::from);
         applied.and(published)
     }
@@ -233,13 +272,19 @@ impl Live {
                 std::ptr::copy_nonoverlapping(address as *const u8, into.as_mut_ptr(), into.len())
             }
         };
-        let write = |n: usize, step: &Step| put(step, protections[n]);
+        let write = |n: usize, step: &Step, bytes: &[u8]| put(step, bytes, protections[n]);
         apply::write_stopped(&mut self.threads, &mut self.overwrites, plan, true, read, write)
     }
 
     /// Allocates the patch's code and data, `len` bytes at `at` in the room `apply` claimed,
-    /// and writes them.
-    fn map(&self, code: &Code, at: u64, len: u64) -> Result<(), String> {
+    /// and writes them. `frames` holds the CIEs and FDEs of its unwind entries.
+    fn map(
+        &self,
+        code: &Code,
+        at: u64,
+        len: u64,
+        frames: (&mut Vec<usize>, &mut Vec<usize>),
+    ) -> Result<(), String> {
         // SAFETY: `mach_task_self` takes nothing and returns this task's port name, which
         // needs no release; it can't fail.
         let task = unsafe { mach_task_self() };
@@ -250,6 +295,7 @@ impl Live {
         // it): no code a thread may run and no static is replaced, and no jump reaches it
         // before `redirect`. The room is never deallocated, and no later patch is laid out here.
         let allocated = unsafe { mach_vm_allocate(task, &mut mapped, len, FIXED | OVERWRITE) };
+        // alloc: error path
         check(allocated).map_err(|it| format!("mapping the patch: {it}"))?;
         let len = code.text.len() + code.data.len();
         // SAFETY: `at..at + len` was just allocated read-write and zeroed, page-aligned so any
@@ -264,6 +310,7 @@ impl Live {
             // SAFETY: the text pages of the allocation above (whole pages, checked); no thread
             // runs them yet and `memory` writes nothing there after this.
             check(unsafe { mach_vm_protect(task, at, code.text.len() as u64, 0, READ | EXECUTE) })
+                // alloc: error path
                 .map_err(|it| format!("making the patch executable: {it}"))?;
             // SAFETY: invalidates the instruction cache over the text just written and made
             // runnable; it changes no memory.
@@ -272,12 +319,13 @@ impl Live {
         // SAFETY: `memory[..text.len()]` is this patch's text, read-and-run and never written
         // or deallocated for the rest of the process (`apply::claim` moved `next` past it
         // before it was allocated); `register_frames` checks each FDE is inside it.
-        unsafe { register_frames(&memory[..code.text.len()], code.frames) }
+        unsafe { register_frames(&memory[..code.text.len()], code.frames, frames.0, frames.1) }
     }
 
     /// Writes the first value of each static new since the executable that the patch refers
     /// to and no patch before gave one, in the room above the patch, which ends at `end`.
-    fn first_values(&mut self, code: &Code, end: u64) -> Result<(), String> {
+    /// `bytes` is the buffer a value is slid in.
+    fn first_values(&mut self, code: &Code, end: u64, bytes: &mut Vec<u8>) -> Result<(), String> {
         // SAFETY: `mach_task_self` takes nothing and returns this task's port name, which
         // needs no release; it can't fail.
         let task = unsafe { mach_task_self() };
@@ -285,15 +333,14 @@ impl Live {
             // Above every patch, in the room: nothing else of the program is mapped there.
             let len = value.bytes.len() as u64;
             if value.address < end || value.address.saturating_add(len) > self.room_end {
+                // alloc: error path
                 return Err(format!("a static at {:#x}, outside the room", value.address));
             }
             let address = value.address + self.slide;
-            if self.lasting.contains(&address) {
-                continue;
-            }
+            let Err(new) = self.lasting.binary_search(&address) else { continue };
             let mut page = address & !(PAGE - 1);
             while page < address + len {
-                if !self.lasting_pages.contains(&page) {
+                if let Err(unmapped) = self.lasting_pages.binary_search(&page) {
                     let mut at = page;
                     // SAFETY: `page` is page-aligned, at or above this patch's `end` and below
                     // `room_end` (checked above), and not in `lasting_pages`, so OVERWRITE
@@ -301,38 +348,43 @@ impl Live {
                     // never deallocated, so later patches may refer to the static there for
                     // the life of the process.
                     check(unsafe { mach_vm_allocate(task, &mut at, PAGE, FIXED | OVERWRITE) })
+                        // alloc: error path
                         .map_err(|it| format!("mapping a static's page at {page:#x}: {it}"))?;
-                    self.lasting_pages.insert(page);
+                    // alloc: a page newly allocated for statics, kept for good
+                    self.lasting_pages.insert(unmapped, page);
                 }
                 page += PAGE;
             }
-            let mut bytes = value.bytes.clone();
+            bytes.clear();
+            bytes.extend_from_slice(&value.bytes);
             for &pointer in &value.pointers {
-                apply::slide_at(&mut bytes, pointer, self.slide)?;
+                apply::slide_at(bytes, pointer, self.slide)?;
             }
             // SAFETY: `address..address + len` is in pages allocated read-write above or by an
             // earlier patch; no code refers to this static before this patch's jumps are
             // written (a patch has every static it refers to, and none before gave this one),
-            // so no other thread reads it; `bytes` is a local, and a byte copy needs no
-            // alignment.
+            // so no other thread reads it; `bytes` is the runtime's own buffer, and a byte copy
+            // needs no alignment.
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len())
             };
-            self.lasting.insert(address);
+            // alloc: a static given its first value, kept for good
+            self.lasting.insert(new, address);
         }
         // A daemon started again knows none of them, and places what it has below.
-        if let Some(&low) = self.lasting_pages.iter().min() {
+        if let Some(&low) = self.lasting_pages.first() {
             self.process.end = self.process.end.min(low - self.slide);
         }
         Ok(())
     }
 
-    fn publish(&self) -> Result<(), String> {
-        let path = self.dir.join("process");
-        let partial = self.dir.join(format!("process.{}", self.process.pid));
-        std::fs::write(&partial, self.process.encode())
-            .and_then(|()| std::fs::rename(&partial, &path))
-            .map_err(|it| format!("{}: {it}", path.display()))
+    fn publish(&mut self) -> Result<(), String> {
+        self.text.clear();
+        self.process.encode_into(&mut self.text);
+        std::fs::write(&self.partial, &self.text)
+            .and_then(|()| std::fs::rename(&self.partial, &self.process_file))
+            // alloc: error path
+            .map_err(|it| format!("{}: {it}", self.process_file.display()))
     }
 }
 
@@ -347,6 +399,7 @@ struct Image {
 impl Image {
     fn read(header: *const u8) -> Result<Image, String> {
         if header.is_null() {
+            // alloc: error path
             return Err("the program has no image".to_owned());
         }
         let u32_at = |at: usize| {
@@ -394,6 +447,7 @@ impl Image {
             at += size;
         }
         if image.uuid == [0; 16] || image.start == u64::MAX {
+            // alloc: error path
             return Err("the executable has no UUID or no header segment".to_owned());
         }
         Ok(image)
@@ -415,11 +469,13 @@ fn reserve(image: &Image, slide: u64) -> Result<(u64, u64), String> {
             // SAFETY: `address..address + ROOM` is the allocation just made; taking all access
             // away affects nothing else and keeps the room for patches, which map over it.
             check(unsafe { mach_vm_protect(task, address, ROOM, 0, 0) })
+                // alloc: error path
                 .map_err(|it| format!("setting aside room for edits: {it}"))?;
             return Ok((address - slide, address - slide + ROOM));
         }
         at += STEP;
     }
+    // alloc: error path
     Err("nothing near the program is free to put edits in".to_owned())
 }
 
@@ -461,6 +517,7 @@ fn watch(dir: &std::path::Path, uuid: [u8; 16]) -> Receiver<(Patch, Instant)> {
     let executable = std::env::current_exe().ok();
     let mut linked = executable.as_ref().and_then(stamp);
     std::thread::Builder::new()
+        // alloc: setup, the thread's name, once
         .name("blaze-live".to_owned())
         .spawn(move || {
             loop {
@@ -477,6 +534,7 @@ fn watch(dir: &std::path::Path, uuid: [u8; 16]) -> Receiver<(Patch, Instant)> {
                         linked = now;
                         let other = uuid_of(executable).filter(|it| *it != uuid);
                         if let Some(other) = other {
+                            // alloc: once, the program was linked again and has to start
                             let why = "the program was linked again".to_owned();
                             let sequence = SystemTime::now()
                                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -530,50 +588,47 @@ fn uuid_of(path: &PathBuf) -> Option<[u8; 16]> {
 }
 
 fn check(code: i32) -> Result<(), String> {
+    // alloc: error path
     if code == 0 { Ok(()) } else { Err(format!("kern_return {code}")) }
 }
 
-/// The protection of the region each step of `plan` is in, read before the threads are
-/// stopped: each step checked to be in one readable region.
-fn protections(plan: &Plan) -> Result<Vec<i32>, String> {
-    plan.steps
-        .iter()
-        .map(|step| {
-            let end = step.address + step.bytes.len() as u64;
-            let (region, protection) = region_at(step.address)?;
-            if end > region.end || protection & READ == 0 {
-                return Err(format!(
-                    "a write at {:#x}..{end:#x}, in no one readable region of the executable",
-                    step.address
-                ));
-            }
-            Ok(protection)
-        })
-        .collect()
+/// Puts in `protections` the protection of the region each step of `plan` is in, read before
+/// the threads are stopped: each step checked to be in one readable region.
+fn protections(plan: &Plan, protections: &mut Vec<i32>) -> Result<(), String> {
+    protections.clear();
+    for step in &plan.steps {
+        let end = step.address + step.len() as u64;
+        let (region, protection) = region_at(step.address)?;
+        if end > region.end || protection & READ == 0 {
+            // alloc: error path
+            return Err(format!(
+                "a write at {:#x}..{end:#x}, in no one readable region of the executable",
+                step.address
+            ));
+        }
+        protections.push(protection);
+    }
+    Ok(())
 }
 
 /// Writes `step` over the image, whose region has `protection`: in place if it is writable,
 /// else by mapping a written copy of its pages over them. Called with every other thread
 /// stopped; it allocates nothing in the process.
-fn put(step: &Step, protection: i32) -> Result<(), Broke> {
+fn put(step: &Step, bytes: &[u8], protection: i32) -> Result<(), Broke> {
     if protection & WRITE != 0 {
         // SAFETY: the bytes are in one writable region of the executable's image
         // (`protections`); every other thread is stopped and none inside them
         // (`apply::write_stopped`), so nothing reads or writes them meanwhile. `bytes` is the
         // plan's own buffer.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                step.bytes.as_ptr(),
-                step.address as *mut u8,
-                step.bytes.len(),
-            )
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), step.address as *mut u8, bytes.len())
         };
         return Ok(());
     }
     // SAFETY: the bytes are in one readable region of the executable's image with
     // `protection` (`protections`), which isn't writable; every other thread is stopped and
     // none inside them, so nothing writes or runs those pages while they are swapped.
-    unsafe { swap_pages(step.address, &step.bytes, protection) }
+    unsafe { swap_pages(step.address, bytes, protection) }
 }
 
 /// The mapped region at `address` and its protection.
@@ -596,8 +651,10 @@ fn region_at(address: u64) -> Result<(std::ops::Range<u64>, i32), String> {
             &mut object,
         )
     })
+    // alloc: error path
     .map_err(|it| format!("reading the protection at {address:#x}: {it}"))?;
     if start > address || start.saturating_add(size) <= address {
+        // alloc: error path
         return Err(format!("nothing is mapped at {address:#x}"));
     }
     Ok((start..start + size, info[0]))
@@ -686,19 +743,26 @@ unsafe fn swap_pages(address: u64, bytes: &[u8], protection: i32) -> Result<(), 
 }
 
 /// Tells the unwinder of each frame in `text` at `frames`, so that a panic unwinds through
-/// the new code. Apple's unwinder takes one frame description at a time.
+/// the new code. Apple's unwinder takes one frame description at a time. `cies` and `fdes`
+/// are the buffers the entries are found in, kept from one patch to the next.
 ///
 /// # Safety
 ///
 /// `text` is the patch's code, mapped and unchanged for the rest of the process (the unwinder
 /// keeps pointers into it).
-unsafe fn register_frames(text: &[u8], frames: (u64, u64)) -> Result<(), String> {
+unsafe fn register_frames(
+    text: &[u8],
+    frames: (u64, u64),
+    cies: &mut Vec<usize>,
+    fdes: &mut Vec<usize>,
+) -> Result<(), String> {
     if frames.1 == 0 {
         return Ok(());
     }
     // Every FDE is checked, each inside the section and naming a CIE before it, before any
     // is registered.
-    for at in apply::fdes(text, frames)? {
+    apply::fdes(text, frames, cies, fdes)?;
+    for &at in fdes.iter() {
         // SAFETY: `text[at..]` starts one FDE inside the patch's text whose CIE is too
         // (`apply::fdes`), which is mapped and unchanged for the rest of the process (the
         // caller's); Apple's libunwind takes one FDE and keeps a pointer to it.

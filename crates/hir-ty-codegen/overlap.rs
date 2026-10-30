@@ -16,8 +16,8 @@ use cranelift_codegen::{
     entity::{EntitySet, PackedOption, SecondaryMap},
     ir::{self, InstructionData},
 };
+use blaze_ids::bits::{BitMatrix, BitSet};
 use rustc_hash::FxHashMap;
-use rustc_index::bit_set::{BitMatrix, DenseBitSet};
 
 use super::fragment::Named;
 
@@ -26,7 +26,7 @@ pub(super) struct FrameLocals {
     /// `None` for a local kept in a register that never needed memory.
     pub(super) slots: Vec<Option<ir::StackSlot>>,
     /// By index in `slots`.
-    pub(super) conflicts: BitMatrix<usize, usize>,
+    pub(super) conflicts: BitMatrix<usize>,
     /// Where in `slots` a local kept in a register puts the slot it gets when it needs one.
     pub(super) lazy: FxHashMap<hir_ty_mir::mir::LocalId, usize>,
 }
@@ -167,20 +167,18 @@ fn share_slots(
     });
     // Each group: the slot it keeps, and every local any of its members conflicts with (the
     // rows of its members, or'ed), so that whether one more fits is one bit.
-    let mut groups: Vec<(ir::StackSlot, DenseBitSet<usize>)> = Vec::new();
+    let mut groups: Vec<(ir::StackSlot, BitSet<usize>)> = Vec::new();
     let mut moved: SecondaryMap<ir::StackSlot, PackedOption<ir::StackSlot>> = SecondaryMap::new();
     let mut any = false;
     for at in order {
         let found = groups.iter().position(|group| !group.1.contains(at));
         let first = found.is_none();
         let index = found.unwrap_or_else(|| {
-            groups.push((slot(at), DenseBitSet::new_empty(frame.slots.len())));
+            groups.push((slot(at), BitSet::new(frame.slots.len())));
             groups.len() - 1
         });
         let into = &mut groups[index];
-        for it in frame.conflicts.iter(at) {
-            into.1.insert(it);
-        }
+        into.1.union_with(&frame.conflicts.row(at));
         if first {
             continue;
         }

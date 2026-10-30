@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Job, UnitReader, artifact, checks_only, graph,
     codegen::{self, Makes},
-    files::{Mounted, Names},
+    files::Mounted,
     say, script,
 };
 use crate::serve::work::{Compiled, Failed, Goal, Image, Output, Put};
@@ -77,7 +77,7 @@ struct RecordRef<'a> {
     made: &'a Made,
 }
 
-const RECORD: &str = "blaze v2 cargo unit record 2";
+const RECORD: &str = "blaze v2 cargo unit record 3";
 const OUTPUT: &str = "blaze v2 cargo output 1";
 
 /// The record's fixed header, which `fresh` reads where the store has it, allocating nothing:
@@ -188,7 +188,7 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
         hash_cbor(&mut hasher, scratch, plan, "plan", unit)?;
         hash_cbor(&mut hasher, scratch, &runs.env, "run environment", unit)
     })?;
-    hasher.id(&toolchain.id).update(&[goal, u8::from(job.input.color)]);
+    hasher.id(&toolchain.id).update(&[goal, u8::from(job.input.color), u8::from(job.input.short)]);
     Ok(Key(hasher.finish()))
 }
 
@@ -426,18 +426,18 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
         ApiError::new(format!("unit {unit} (`{}`) has no crate in the front end", u.target.name), None)
     })?;
     let mounted = &job.mounted;
-    let names = Names::new(reader.paths(), mounted);
+    let files = blaze_diagnostics::Files::new(reader.paths(), mounted.root());
     let lints = CommandLine::parse(&lint_flags(u, plan, local(package.source.as_deref())))
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
     let options = Options { lints, ..Options::default() };
     let db = reader.db();
-    let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), &names, &options);
-    let mut sources = mounted.sources();
-    let style = blaze_diagnostics::emit::Style { ansi: color, ..Default::default() };
+    let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), files, &options);
+    let sources = mounted.sources(&diags);
+    let style = blaze_diagnostics::emit::Style { ansi: color, short: job.input.short, ..Default::default() };
     let diagnostics: Vec<Diagnostic> = diags
         .iter()
         .filter(|it| !cargo_hides(&it.message))
-        .map(|it| blaze_diagnostics::api::diagnostic(it, &mut sources, style, Some(unit_of.clone())))
+        .map(|it| blaze_diagnostics::api::diagnostic(it, &sources, style, Some(unit_of.clone())))
         .collect();
     let failed = diagnostics.iter().any(|it| it.level == Level::Error);
     let mut made = Made::default();
@@ -617,7 +617,7 @@ fn work_out_runs(job: &Job, unit: usize) -> artifact::Runs {
 /// What a test binary's behaviour depends on beside the code it reaches.
 fn context(policy: &blaze_codegen::plan::Policy) -> ContentId {
     let bytes = blaze_protocol::cbor::to_vec(policy).unwrap_or_default();
-    ContentId::of("blaze v2 test context 1", &bytes)
+    ContentId::of("blaze v2 test context 2", &bytes)
 }
 
 /// What blaze writes for a library (`.rlib`, `.rmeta`): no object code (its functions are in

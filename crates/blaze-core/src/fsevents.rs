@@ -327,15 +327,6 @@ fn realpath(path: &[u8], out: &mut PathBuf) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether [`FileName::new`] takes `name`, without making one: checked before a batch's names
-/// are made unique, so a name is made once. A difference from it is caught where the name is
-/// made, and told as lost.
-fn file_name_ok(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('/')
-        && name.split('/').all(|it| !it.is_empty() && it != "." && it != "..")
-}
-
 /// Whether `name` is `dir` or under it, as [`FileName::is_under`].
 fn is_under(name: &str, dir: &str) -> bool {
     name == dir || name.strip_prefix(dir).is_some_and(|rest| rest.starts_with('/'))
@@ -389,7 +380,7 @@ impl<S: Tell> Shared<S> {
             text.push_str(dir);
             text.push('/');
             text.push_str(rest);
-            if !file_name_ok(&text[start..]) {
+            if !FileName::is_valid(&text[start..]) {
                 text.truncate(start);
                 return Some(None);
             }
@@ -397,7 +388,7 @@ impl<S: Tell> Shared<S> {
         }
         let rest = path.strip_prefix(&self.root).ok()?;
         let Some(rest) = rest.to_str() else { return Some(None) };
-        if !file_name_ok(rest) || !is_under(rest, dir) {
+        if !FileName::is_valid(rest) || !is_under(rest, dir) {
             return None;
         }
         text.push_str(rest);
@@ -1138,13 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_name_is_checked_as_file_name_new_checks_it() {
-        for name in [
-            "", "a", "a/b", "/a", "a/", "a//b", ".", "..", "a/./b", "a/../b", "...", ".a", "a.",
-            "a/.b/c", "src/deep/lib.rs", "é/ü",
-        ] {
-            assert_eq!(file_name_ok(name), FileName::new(name).is_some(), "{name:?}");
-        }
+    fn a_name_is_under_a_dir_as_file_name_is_under_says() {
         let dir = FileName::new("src").unwrap();
         for name in ["src", "src/a", "srca", "sr", "src/a/b", "other/src"] {
             let it = FileName::new(name).unwrap();

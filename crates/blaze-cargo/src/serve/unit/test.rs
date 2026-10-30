@@ -11,6 +11,11 @@
 
 #![forbid(unsafe_code)]
 
+mod traced;
+
+#[cfg(test)]
+mod tests;
+
 use std::{
     ffi::OsString,
     path::PathBuf,
@@ -18,7 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use blaze_api::{ApiError, Artifact, Response, TestOutcome, TestResult, Ub};
+use blaze_api::{ApiError, Artifact, Basis, Cached, Response, TestOutcome, TestResult, Ub};
 use blaze_cas::Store;
 use blaze_core::{Completion, Effect, FileName, Tag};
 use blaze_usercode::{
@@ -206,7 +211,7 @@ pub(crate) fn ub_tests(job: &Job, reader: &UnitReader, selection: Selection<'_>)
     Ok(keys)
 }
 
-/// Test `key` of [`ub_tests`] run in blaze's MIR evaluator under `ub` on `db`, the task.s
+/// Test `key` of [`ub_tests`] run in blaze's MIR evaluator under `ub` on `db`, the task's
 /// shared front end, nothing compiled; a bench is refused, naming it (libtest runs one once with a
 /// `Bencher`, which the evaluator has no part of).
 pub(crate) fn evaluate(job: &Job, db: &Db, key: &str, ub: Ub) -> Result<TestResult, Failed> {
@@ -218,6 +223,7 @@ pub(crate) fn evaluate(job: &Job, db: &Db, key: &str, ub: Ub) -> Result<TestResu
     let result = |outcome, output: String, millis| TestResult {
         name: test.name.clone(),
         binary: binary.to_owned(),
+        cached: None,
         millis,
         output: output.into_bytes(),
         outcome,
@@ -302,6 +308,7 @@ fn result(report: test::Report) -> TestResult {
     TestResult {
         binary: report.binary,
         name: report.name,
+        cached: None,
         outcome: match report.outcome {
             Reported::Passed => TestOutcome::Passed,
             Reported::Failed => TestOutcome::Failed,
@@ -313,21 +320,50 @@ fn result(report: test::Report) -> TestResult {
     }
 }
 
+/// A test not run, as its pass is kept for its code and what it read: the pass stands, and
+/// took `took` when it ran. Passes are kept by what codegen's walk says the test reaches, as
+/// no test binary has an execution record blaze keeps a pass by yet.
+fn cached(binary: &str, name: &str, took: Option<Duration>) -> TestResult {
+    let millis = took.map_or(0, |it| u64::try_from(it.as_millis()).unwrap_or(u64::MAX));
+    TestResult {
+        binary: binary.to_owned(),
+        name: name.to_owned(),
+        cached: Some(Cached {
+            basis: Basis::Reached { why: REACHED.to_owned() },
+            millis,
+            outcome: TestOutcome::Passed,
+        }),
+        outcome: TestOutcome::Unreached,
+        output: Vec::new(),
+        millis: 0,
+    }
+}
+
+/// Why a kept pass is by what its test reaches: [`Basis::Reached`]'s reason.
+const REACHED: &str = "selected by the code it reaches: blaze keeps no execution record of a test binary yet";
+
 /// One binary's tests as the queue and selection see them.
 struct Suited {
     name: String,
     given: blaze_ids::ContentId,
-    tests: Vec<Test>,
-    /// `tests` by name, sorted: a finished test is found in `O(log n)` with nothing allocated.
-    by_name: Vec<u32>,
+    listed: Listed,
     /// Handed to the queue when it starts.
     binary: Option<Binary>,
     /// The machine's files and the binary's environment, as what a test read is checked
     /// against: made once per binary.
     disk: blaze_usercode::inputs::Disk,
+    /// What the tests of its server all read, hashed once per buffer of it.
+    common: traced::Common,
 }
 
-impl Suited {
+/// A binary's tests, and each by name.
+struct Listed {
+    tests: Vec<Test>,
+    /// `tests` by name, sorted: a finished test is found in `O(log n)` with nothing allocated.
+    by_name: Vec<u32>,
+}
+
+impl Listed {
     fn test(&self, name: &str) -> Option<&Test> {
         let at = self.by_name.binary_search_by(|it| self.tests[*it as usize].name.as_str().cmp(name)).ok()?;
         Some(&self.tests[self.by_name[at] as usize])
@@ -388,7 +424,7 @@ pub(crate) fn start(
             .iter()
             .map(|it| {
                 let reached = Reached { test: it.name.clone(), binary: artifact.content, reached: it.reached.clone() };
-                Test::of(&reached, attrs(it), it.outside)
+                Test::of(reached, attrs(it), it.outside)
             })
             .collect();
         let manifest_dir = PathBuf::from(&package.manifest_path).parent().map(PathBuf::from).unwrap_or_default();
@@ -415,11 +451,19 @@ pub(crate) fn start(
             memory: None,
             mode: TestMode::Process,
             jobs: Vec::new(),
+            loaded: None,
         };
         let mut by_name: Vec<u32> = (0..tests.len() as u32).collect();
         blaze_ids::names::sort_by_name_in(&mut by_name, |&it| tests[it as usize].name.as_bytes());
         let disk = blaze_usercode::inputs::Disk::new(binary.env.clone());
-        suites.push(Suited { name: program.clone(), given: suite.given(), tests, by_name, binary: Some(binary), disk });
+        suites.push(Suited {
+            name: program.clone(),
+            given: suite.given(),
+            listed: Listed { tests, by_name },
+            binary: Some(binary),
+            disk,
+            common: traced::Common::default(),
+        });
     }
     Ok(Box::new(TestRun { job: job.clone(), tags, filter, all, suites, queue: None, ok: true }))
 }
@@ -430,9 +474,15 @@ impl TestRun {
     }
 
     /// What finished: reported, and kept for selection.
-    fn finished(&mut self, finished: Vec<Finished>, store: &mut Store, out: &mut Vec<Response>) {
+    fn finished(&mut self, finished: impl Iterator<Item = Finished>, store: &mut Store, out: &mut Vec<Response>) {
+        let color = self.job.input.color;
+        let refused = |what: String| Response::Diagnostic(super::say::refused(what, None, color));
         for done in finished {
-            let Some(suite) = self.suites.get_mut(done.binary) else { continue };
+            let Some(suite) = self.suites.get_mut(done.binary) else {
+                self.ok = false;
+                out.push(refused(format!("the test queue gave a result of its binary {}, which this run did not give it", done.binary)));
+                continue;
+            };
             if let Outcome::Failed(_) = done.outcome {
                 self.ok = false;
             }
@@ -445,26 +495,28 @@ impl TestRun {
                 Outcome::NotRun => continue,
             };
             let Some(name) = &done.test else { continue };
-            let traced = match done.trace.traced(&mut suite.disk) {
+            let Some(test) = suite.listed.test(name) else {
+                self.ok = false;
+                out.push(refused(format!(
+                    "test `{name}` of `{}` ran, and is none of the tests its build listed: how it ran can't be kept",
+                    suite.name
+                )));
+                continue;
+            };
+            let (given, took) = (suite.given, done.took);
+            let kept = suite.common.traced(done.trace, &mut suite.disk, |traced| {
+                select::record(store, given, test, &select::Ran { passed, took, traced })
+            });
+            let kept = match kept {
                 Ok(it) => it,
                 Err(error) => {
-                    out.push(Response::Diagnostic(super::say::refused(
-                        format!("what test `{name}` read can't be told: {error}"),
-                        None,
-                        self.job.input.color,
-                    )));
-                    None
+                    out.push(refused(format!("what test `{name}` read can't be told: {error}")));
+                    select::record(store, given, test, &select::Ran { passed, took, traced: None })
                 }
             };
-            let Some(test) = suite.test(name) else { continue };
-            let ran = select::Ran { passed, took: done.took, traced: traced.as_ref() };
-            if let Err(error) = select::record(store, suite.given, test, &ran) {
+            if let Err(error) = kept {
                 self.ok = false;
-                out.push(Response::Diagnostic(super::say::refused(
-                    format!("keeping how test `{name}` ran: {error}"),
-                    None,
-                    self.job.input.color,
-                )));
+                out.push(refused(format!("keeping how test `{name}` ran: {error}")));
             }
         }
     }
@@ -485,7 +537,7 @@ impl Runs for TestRun {
         let mut binaries = Vec::with_capacity(self.suites.len());
         for suite in &mut self.suites {
             let Some(mut binary) = suite.binary.take() else { continue };
-            for test in &suite.tests {
+            for test in &suite.listed.tests {
                 match select::wanted(test, &self.filter) {
                     Wanted::Filtered => continue,
                     Wanted::Ignored => {
@@ -497,8 +549,7 @@ impl Runs for TestRun {
                 }
                 match select::select(store, suite.given, test, self.all, &mut suite.disk) {
                     Ok(Decision::Skip { took }) => {
-                        let report = test::report_unrun(&suite.name, &test.name, Reported::Unreached, took);
-                        out.push(Response::TestResult(result(report)));
+                        out.push(Response::TestResult(cached(&suite.name, &test.name, took)));
                     }
                     Ok(Decision::Run { expected, .. }) => binary.jobs.push(TestJob {
                         name: test.name.clone(),
@@ -553,10 +604,9 @@ impl Runs for TestRun {
         let now = self.now();
         let mut queue = self.queue.take()?;
         queue.complete(completion, now, effects);
-        let finished = queue.take();
+        self.finished(queue.drain(), store, out);
         let done = queue.finished();
         self.queue = Some(queue);
-        self.finished(finished, store, out);
         match done {
             true => self.end(),
             false => None,

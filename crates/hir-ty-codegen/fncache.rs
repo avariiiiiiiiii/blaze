@@ -199,6 +199,7 @@ pub(super) fn cache_code(
 /// a daemon with the store compiles none of it.
 pub fn tests_reach(
     db: &Db,
+    // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
     symbols: &dyn SymbolResolver,
     roots: &[FunctionId],
 ) -> Vec<Reach> {
@@ -364,6 +365,7 @@ pub fn tests_reach(
 
 /// Compiles the code [`Walk::hash_node`] hashes of each of `nodes` on every core, for the
 /// queries to have it when the walk asks.
+// dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
 fn compile_ahead(symbols: &dyn SymbolResolver, nodes: &[&Node]) {
     symbols.in_parallel(nodes.len(), &|db, _, at| match nodes[at] {
         Node::Root(func) => _ = compiled_root(db, *func),
@@ -1896,7 +1898,7 @@ fn shared<'db>(db: &Db, ty: Ty<'db>) -> bool {
 fn fn_from_data(
     db: &Db,
     body: &MirBody<'_>,
-    cache: &dyn Fn(StaticId) -> bool,
+    cache: &impl Fn(StaticId) -> bool,
 ) -> Option<MirSpan> {
     for (_, block) in body.basic_blocks.iter() {
         let Some(terminator) = &block.terminator else { continue };

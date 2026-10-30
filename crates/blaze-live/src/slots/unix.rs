@@ -72,6 +72,7 @@ pub(super) fn in_image(range: &Range<u64>, base: u64) -> Result<(), String> {
 }
 
 fn outside(range: &Range<u64>, base: u64) -> String {
+    // alloc: error path
     format!("data at {:#x}..{:#x}, outside the image at {base:#x}", range.start, range.end)
 }
 
@@ -90,6 +91,7 @@ impl Segments {
         ranges.retain(|it| !it.is_empty());
         ranges.sort_unstable_by_key(|it| it.start);
         if ranges.is_empty() {
+            // alloc: error path
             return Err(format!("the image at {base:#x} has no segments"));
         }
         Ok(Segments { base, ranges })
@@ -175,6 +177,7 @@ impl Segments {
                 let start = info.addr.wrapping_add(it.vaddr);
                 start..start.saturating_add(it.memsz)
             });
+            // clone: an iterator over the program headers, walked twice; it copies no element
             if !loads.clone().any(|it| it.contains(&found.address)) {
                 return 0;
             }
@@ -182,6 +185,7 @@ impl Segments {
             1
         }
         let base = image_base(address)
+            // alloc: error path
             .ok_or_else(|| format!("no image has the address {address:#x}"))?;
         let mut found = Found { address, ranges: Vec::with_capacity(16) };
         // SAFETY: `each` only reads the loader's headers and pushes to the `Found` it is given.
@@ -197,6 +201,7 @@ impl Segments {
         const HEADER: usize = 32;
         const SEGMENT: usize = 72;
         let base = image_base(address)
+            // alloc: error path
             .ok_or_else(|| format!("no image has the address {address:#x}"))?;
         let u32_at = |bytes: &[u8], at: usize| {
             u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
@@ -208,12 +213,14 @@ impl Segments {
         // the start of its `__TEXT`, read-only for as long as the image is loaded.
         let header = unsafe { image::view(base, HEADER) };
         if u32_at(header, 0) != MH_MAGIC_64 {
+            // alloc: error path
             return Err(format!("the image at {base:#x} is not a 64-bit Mach-O image"));
         }
         let (count, len) = (u32_at(header, 16), u32_at(header, 20) as usize);
         // SAFETY: the load commands follow the header in the same mapped `__TEXT`, `len`
         // bytes by the header, which dyld checked when it loaded the image.
         let commands = unsafe { image::view(base + HEADER as u64, len) };
+        // alloc: setup, the image's segments, read once at start
         let (mut at, mut segments, mut slide) = (0usize, Vec::new(), None);
         for _ in 0..count {
             if at + 8 > commands.len() {
@@ -221,6 +228,7 @@ impl Segments {
             }
             let (kind, size) = (u32_at(commands, at), u32_at(commands, at + 4) as usize);
             if size < 8 || at + size > commands.len() {
+                // alloc: error path
                 return Err(format!("the image at {base:#x} has a load command past its end"));
             }
             if kind == LC_SEGMENT_64 && size >= SEGMENT {
@@ -236,6 +244,7 @@ impl Segments {
             }
             at += size;
         }
+        // alloc: error path
         let slide = slide.ok_or_else(|| format!("the image at {base:#x} maps no header"))?;
         let ranges = segments
             .into_iter()
@@ -243,6 +252,7 @@ impl Segments {
                 let start = vmaddr.wrapping_add(slide);
                 start..start.saturating_add(vmsize)
             })
+            // alloc: setup, as `segments`
             .collect();
         Segments::new(base, ranges)
     }
@@ -273,6 +283,7 @@ pub(super) fn bytes(range: &Range<u64>, base: u64) -> Result<&'static [u8], Stri
 /// Where the descriptor of the image this code is in is, in memory, and its bytes.
 pub(super) fn descriptor() -> Result<(u64, &'static [u8]), String> {
     let at = find()?;
+    // alloc: error path
     let base = image_base(at).ok_or_else(|| format!("no image has {DESCRIPTOR} at {at:#x}"))?;
     let end =
         at.checked_add(Descriptor::SIZE as u64).ok_or("a descriptor past the end of memory")?;
@@ -309,7 +320,9 @@ fn find() -> Result<u64, String> {
         }
     }
     let path =
+        // alloc: error path
         path.map_or_else(|| "the program".to_owned(), |it| it.to_string_lossy().into_owned());
+    // alloc: error path
     Err(format!("{path} exports no {DESCRIPTOR}: blaze-link links it for live patches"))
 }
 

@@ -6,12 +6,7 @@ mod db;
 
 use blaze_ids::ContentId;
 use blaze_items::{CodeHash, ItemId};
-use hir_def::{
-    FunctionId, ModuleDefId, TypeAliasId,
-    expr_store::Body as BodyStore,
-    nameres::crate_def_map,
-    signatures::{FunctionSignature, TypeAliasSignature},
-};
+use hir_def::{FunctionId, TypeAliasId, expr_store::Body as BodyStore};
 use hir_ty::{TyDefId, consteval::usize_const, db::HirDatabase};
 use hir_ty_mir::mir::MirSpan;
 use test_fixture::WithFixture;
@@ -31,45 +26,14 @@ fn fixture(minicore: &str, text: &str) -> (TestDB, base_db::FileId) {
     (db, file)
 }
 
-fn declarations(db: &TestDB) -> Vec<ModuleDefId> {
-    crate_def_map(db, db.test_crate())
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
-        .collect()
-}
-
 #[track_caller]
 fn function(db: &TestDB, name: &str) -> FunctionId {
-    let found: Vec<FunctionId> = declarations(db)
-        .into_iter()
-        .filter_map(|def| match def {
-            ModuleDefId::FunctionId(it) if FunctionSignature::of(db, it).name.as_str() == name => {
-                Some(it)
-            }
-            _ => None,
-        })
-        .collect();
-    match found[..] {
-        [one] => one,
-        _ => panic!("{} functions named `{name}`", found.len()),
-    }
+    hir_def::test_items::function(db, db.test_crate(), name)
 }
 
 #[track_caller]
 fn alias(db: &TestDB, name: &str) -> TypeAliasId {
-    let found: Vec<TypeAliasId> = declarations(db)
-        .into_iter()
-        .filter_map(|def| match def {
-            ModuleDefId::TypeAliasId(it) if TypeAliasSignature::of(db, it).name.as_str() == name => {
-                Some(it)
-            }
-            _ => None,
-        })
-        .collect();
-    match found[..] {
-        [one] => one,
-        _ => panic!("{} type aliases named `{name}`", found.len()),
-    }
+    hir_def::test_items::type_alias(db, db.test_crate(), name)
 }
 
 #[track_caller]

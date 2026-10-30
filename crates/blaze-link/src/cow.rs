@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
-use blaze_ids::radix;
+use blaze_ids::{bits::locate, radix};
 
 use crate::model::Sym;
 use crate::symbols::Symbols;
@@ -240,33 +240,33 @@ impl<A: Allocator + Copy> IdSet<A> {
 
     #[inline]
     pub fn contains(&self, id: u32) -> bool {
-        let (word, bit) = (id as usize / 64, id % 64);
-        self.bits.get(word).is_some_and(|it| it & (1 << bit) != 0)
+        let (word, mask) = locate(id as usize);
+        self.bits.get(word).is_some_and(|it| it & mask != 0)
     }
 
     pub fn insert(&mut self, id: u32) -> bool {
-        let (word, bit) = (id as usize / 64, id % 64);
+        let (word, mask) = locate(id as usize);
         if self.bits.len() <= word {
             self.bits.resize(word + 1, 0);
             self.listed.resize(word + 1, 0);
         }
-        if self.bits[word] & (1 << bit) != 0 {
+        if self.bits[word] & mask != 0 {
             return false;
         }
-        self.bits[word] |= 1 << bit;
+        self.bits[word] |= mask;
         self.len += 1;
-        if self.listed[word] & (1 << bit) == 0 {
-            self.listed[word] |= 1 << bit;
+        if self.listed[word] & mask == 0 {
+            self.listed[word] |= mask;
             self.list.push(id);
         }
         true
     }
 
     pub fn remove(&mut self, id: u32) -> bool {
-        let (word, bit) = (id as usize / 64, id % 64);
+        let (word, mask) = locate(id as usize);
         match self.bits.get_mut(word) {
-            Some(it) if *it & (1 << bit) != 0 => {
-                *it &= !(1 << bit);
+            Some(it) if *it & mask != 0 => {
+                *it &= !mask;
                 self.len -= 1;
                 true
             }

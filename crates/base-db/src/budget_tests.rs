@@ -89,26 +89,26 @@ fn checkout() -> (Db, AbsPathBuf, FileSetConfig) {
     (db, base, partition.build())
 }
 
-/// `n` files under `src/`, the first `edited` of them with another body than the rest have.
-fn texts(n: usize, edited: usize) -> Vec<(String, Vec<u8>)> {
+/// `n` files under `src/`, the first `edited` of them with another body than the rest have,
+/// each in an allocation of its own as blaze-vfs holds a heap file.
+fn texts(n: usize, edited: usize) -> Vec<(String, blaze_vfs::Bytes)> {
     (0..n)
         .map(|at| {
             let body = if at < edited { 2 } else { 1 };
-            (format!("src/m{at}.rs"), format!("fn f{at}() {{ {body} }}\n").into_bytes())
+            let text = format!("fn f{at}() {{ {body} }}\n");
+            let bytes = std::sync::Arc::<[u8]>::from(text.as_bytes());
+            (format!("src/m{at}.rs"), blaze_vfs::Bytes::from(bytes))
         })
         .collect()
 }
 
-fn view_files(files: &[(String, Vec<u8>)]) -> Vec<ViewFile<'_>> {
+fn view_files(files: &[(String, blaze_vfs::Bytes)]) -> Vec<ViewFile<'_>> {
     files
         .iter()
         .map(|(path, bytes)| ViewFile {
             path: path.as_str(),
-            file: blaze_vfs::File {
-                id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes),
-                mode: blaze_vfs::Mode::Regular,
-                bytes: bytes.as_slice(),
-            },
+            id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes),
+            bytes,
         })
         .collect()
 }
@@ -117,11 +117,12 @@ fn view_files(files: &[(String, Vec<u8>)]) -> Vec<ViewFile<'_>> {
 fn set_view(
     db: &mut Db,
     base: &AbsPathBuf,
+    built: &[AbsPathBuf],
     partition: &FileSetConfig,
     files: &[ViewFile<'_>],
 ) -> (ViewChange, blaze_alloc_count::Used) {
     blaze_alloc_count::measure(|| {
-        db.set_view_root(ViewRoot { base, built: &[], partition, other: SourceRootId(1), files })
+        db.set_view_root(ViewRoot { base, built, partition, other: SourceRootId(1), files })
             .expect("a view of good paths and matching IDs")
     })
 }
@@ -130,29 +131,36 @@ fn set_view(
 fn an_unchanged_view_allocates_nothing() {
     for n in [8, 512] {
         let (mut db, base, partition) = checkout();
+        let built = [base.join("target")];
         let files = texts(n, 0);
         let view = view_files(&files);
-        let (first, _) = set_view(&mut db, &base, &partition, &view);
+        let (first, _) = set_view(&mut db, &base, &[], &partition, &view);
         assert_eq!(first.added.len(), n);
-        let (again, used) = set_view(&mut db, &base, &partition, &view);
-        assert_eq!(again, ViewChange::default());
-        assert_eq!(used.allocations, 0, "a view of {n} unchanged files: {used:?}");
+        for built in [&[][..], &built[..]] {
+            let (again, used) = set_view(&mut db, &base, built, &partition, &view);
+            assert_eq!(again, ViewChange::default());
+            assert_eq!(
+                used.allocations, 0,
+                "a view of {n} unchanged files, {} built: {used:?}",
+                built.len()
+            );
+        }
     }
 }
 
 #[test]
 fn a_changed_file_costs_a_constant() {
-    // The call's own batches (plan, byte and text IDs, dirty buckets), whatever it changes.
-    const PER_CALL: u64 = 64;
-    // The file's `Arc<str>` and its reparse slot, plus each batch's growth.
-    const PER_CHANGED_FILE: u64 = 6;
+    // The call's one allocation, `ViewChange::set` at its size; its batches are in its frame.
+    const PER_CALL: u64 = 1;
+    // Its reparse slot: the file's text is the view's bytes, not a copy.
+    const PER_CHANGED_FILE: u64 = 1;
     let cost = |edited: usize| {
         let (mut db, base, partition) = checkout();
         let files = texts(64, 0);
-        set_view(&mut db, &base, &partition, &view_files(&files));
+        set_view(&mut db, &base, &[], &partition, &view_files(&files));
         let edits = texts(64, edited);
         let view = view_files(&edits);
-        let (change, used) = set_view(&mut db, &base, &partition, &view);
+        let (change, used) = set_view(&mut db, &base, &[], &partition, &view);
         assert_eq!(change.set.len(), edited);
         used.allocations
     };

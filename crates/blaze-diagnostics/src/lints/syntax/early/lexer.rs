@@ -34,7 +34,10 @@ use syntax::{SyntaxKind, SyntaxNodePtr, TextRange};
 
 use crate::{
     cx::Cx,
-    lints::syntax::{Emitted, Pass, Walk, source_fact},
+    lints::{
+        registry::{LintId, LintSet},
+        syntax::{Emitted, Pass, Walk, source_fact},
+    },
     lower::Phase,
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
@@ -50,13 +53,29 @@ pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'_>) -> Vec<Emitted> {
         keywords::lints(cx, tree, &mut emitted);
     }
     let sources = sources(cx, walk);
+    let ascii: Vec<bool> = sources.iter().map(|it| cx.file_text(it.file).is_ascii()).collect();
+    let gathered = gathers_idents(cx, walk, &ascii);
+    let prefixes = cx.lint_may_fire(LintId::named("rust_2021_prefixes_incompatible_syntax"));
+    let guarded = cx.lint_may_fire(LintId::named("rust_2024_guarded_string_incompatible_syntax"));
     let mut gallery = Gallery::default();
     let mut lexed = LexedFile::default();
     for (index, source) in sources.iter().enumerate() {
+        // A codepoint that changes the direction of text is not ASCII, and the migration lints
+        // are of editions before theirs: an ASCII file gives nothing else.
+        let lexes = gathered
+            || !ascii[index]
+            || (prefixes && !source.edition.at_least_2021())
+            || (guarded && !source.edition.at_least_2024());
+        if !lexes {
+            continue;
+        }
         let text = cx.file_text(source.file);
         lex::lex_into(text, source.edition, &mut lexed);
         for found in lexed.lexed.drain(..) {
             emitted.push(lexer_lint(cx, source.file, text, found, krate));
+        }
+        if !gathered {
+            continue;
         }
         for &ident in &lexed.idents {
             let symbol = lex::nfc(&text[ident.symbol_range()]);
@@ -64,9 +83,38 @@ pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'_>) -> Vec<Emitted> {
             gallery.symbols.entry(symbol).or_insert(Entry { order, place: Place::File(source.file, ident.range) });
         }
     }
-    gallery.add_proc_macro_idents(cx, walk, &sources);
-    emitted.extend(idents::lints(cx, gallery.sorted(), krate));
+    if gathered {
+        gallery.add_proc_macro_idents(cx, walk, &sources);
+        emitted.extend(idents::lints(cx, gallery.sorted(), krate));
+    }
     emitted
+}
+
+/// The lints of the symbol gallery ([`idents`]).
+const IDENT_LINTS: LintSet = LintSet::of(&[
+    LintId::named("non_ascii_idents"),
+    LintId::named("uncommon_codepoints"),
+    LintId::named("confusable_idents"),
+    LintId::named("mixed_script_confusables"),
+]);
+
+/// Whether the symbol gallery is gathered: some of its lints may fire, and some identifier may
+/// not be ASCII. Every lint of it starts from an identifier that is not (rustc's
+/// `NonAsciiIdents::check_crate` returns when none is), so a crate whose files are ASCII
+/// throughout and whose proc macros make only ASCII text gives none of them: its identifiers
+/// are not hashed. The test is a SIMD-wide ASCII scan of each file (`ascii`, by source) and of
+/// each proc macro's expansion.
+fn gathers_idents(cx: &Cx<'_, '_>, walk: &Walk<'_>, ascii: &[bool]) -> bool {
+    if !cx.any_may_fire(&IDENT_LINTS) {
+        return false;
+    }
+    if ascii.iter().any(|&it| !it) {
+        return true;
+    }
+    walk.trees.iter().any(|tree| {
+        tree.call.is_some_and(|call| matches!(call.loc(cx.db).def.kind, MacroDefKind::ProcMacro(..)))
+            && tree.root.text().try_for_each_chunk(|chunk| if chunk.is_ascii() { Ok(()) } else { Err(()) }).is_err()
+    })
 }
 
 /// A file rustc's lexer reads, and the edition it is lexed in.
@@ -327,6 +375,27 @@ mod tests {
         assert_eq!(format!("{:?}", '\u{2066}'), "'\\u{2066}'");
         assert_eq!(invisible(1), "an invisible unicode text flow control codepoint");
         assert_eq!(invisible(4), "invisible unicode text flow control codepoints");
+    }
+
+    /// A crate of edition 2021 whose files are ASCII, under rustc's defaults, is not lexed and
+    /// its identifiers are not gathered: the pass makes the same few allocations (the list of
+    /// files) whatever the crate's size.
+    #[test]
+    fn an_ascii_crate_is_not_lexed() {
+        let used = |fns: usize| {
+            let mut used = None;
+            crate::lints::with_cx(&crate::lints::quiet_crate(fns), &[], |cx| {
+                let walk = cx.walk();
+                assert!(lints(cx, walk).is_empty());
+                let (found, it) = blaze_alloc_count::measure(|| lints(cx, walk));
+                assert!(found.is_empty());
+                used = Some(it.allocations);
+            });
+            used.unwrap()
+        };
+        let (small, large) = (used(4), used(400));
+        assert_eq!(small, large, "the lexer's allocations do not grow with the crate");
+        assert!(small <= 4, "{small} allocations");
     }
 
     #[test]

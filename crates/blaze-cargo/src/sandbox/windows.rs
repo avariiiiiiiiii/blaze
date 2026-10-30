@@ -15,11 +15,21 @@
 //! private-network capabilities, which only a spec with `network` is given. What is read is not
 //! traced on Windows: the caller says so in the record.
 //!
+//! A run is started by `blaze sandbox --v2`, one process a run, or by the warm launcher
+//! (`blaze sandbox --v2-serve`, [`serve`]), one process a daemon, which runs each on a thread of
+//! its own with the standard handles and the job its driver handed it ([`Given`]). What does not
+//! change from run to run is made once a process: the container's and the well-known SIDs
+//! ([`Kept`]) and the session lock's handle; in the warm launcher also the read checks
+//! ([`reads`]).
+//!
 //! [#1390]: https://github.com/indexable-inc/blaze/issues/1390
 
+mod reads;
+pub mod serve;
+
 use std::{
-    ffi::{OsStr, OsString, c_void},
-    fmt::Display,
+    ffi::{OsStr, c_void},
+    fmt::{Display, Write as _},
     io::ErrorKind,
     marker::PhantomData,
     os::windows::ffi::OsStrExt as _,
@@ -30,7 +40,6 @@ use std::{
 };
 
 use blaze_usercode::confine::Spec;
-use rustc_hash::FxHashMap;
 use windows_sys::{
     Win32::{
         Foundation::{
@@ -47,7 +56,7 @@ use windows_sys::{
                 NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW,
                 SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
             },
-            CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
+            CONTAINER_INHERIT_ACE, CopySid, CreateWellKnownSid, DACL_SECURITY_INFORMATION,
             DeriveCapabilitySidsFromName, EqualSid, FreeSid, GetAce, GetAclInformation, GetLengthSid,
             INHERIT_ONLY_ACE, InitializeAcl, InitializeSecurityDescriptor,
             Isolation::{CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName},
@@ -120,13 +129,61 @@ const ENDING: Duration = Duration::from_secs(5);
 /// A SID of the system's: as long as the longest, and aligned as a SID's fields are.
 type SidBuffer = [u32; (SECURITY_MAX_SID_SIZE / 4) as usize];
 
+/// What the read grants are asked about and made for.
+const GRANTING_READ: &str = "granting the sandbox read";
+
+/// The limits a job a driver hands a run must have already: what is left of the run ends with
+/// its job's last handle, and a crash ends a process rather than waiting on a dialog.
+const HANDED_LIMITS: u32 = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+
+/// Where a run's standard handles and job come from.
+pub struct Given {
+    /// Whether a driver handed them to the warm launcher; otherwise they are the launcher's own.
+    driver: bool,
+    standard: [Option<Handle>; 3],
+    job: Option<Handle>,
+}
+
+// SAFETY: a `Given`'s handles are its own ([`Given::adopt`]), named by no other value; it is
+// made on the thread that reads the frame and moved, whole, to the one thread that runs it, and
+// a kernel handle may be used and closed from any thread.
+unsafe impl Send for Given {}
+
+impl Given {
+    /// The launcher's own standard handles, copied for the program, and a job of the run's own:
+    /// `blaze sandbox --v2`, a process a run.
+    pub fn own() -> Given {
+        Given { driver: false, standard: [None, None, None], job: None }
+    }
+
+    /// The handles a driver duplicated into the warm launcher for one run
+    /// ([`blaze_core::Handed`]): the program's standard input, output and error (none for a 0),
+    /// inheritable, and the job it runs in, which the driver made, kills and reads the memory of.
+    ///
+    /// # Safety
+    ///
+    /// Each value of `handed` that is not 0 is a handle of this process the driver made for this
+    /// run alone, named in no other frame and not closed: from here on it is the `Given`'s, and
+    /// closed once, as it drops. A value named twice would be closed twice, and the second close
+    /// could close whatever reused its number.
+    pub unsafe fn adopt(handed: &blaze_core::Handed) -> Given {
+        let owned = |value: u64| (value != 0).then_some(Handle(value as usize as HANDLE));
+        Given {
+            driver: true,
+            standard: [owned(handed.stdin), owned(handed.stdout), owned(handed.stderr)],
+            job: owned(handed.job),
+        }
+    }
+}
+
 /// Runs `spec.program` with `spec.args`, exactly `spec.env` (plus TMP and TEMP pointing at the
-/// run's own temporary directory), in `spec.dir`, sandboxed: what it ends with, its exit code.
-/// `Err(why)` when no sandbox could be made, and then nothing ran.
-pub fn run(spec: &Spec) -> Result<i32, String> {
+/// run's own temporary directory), in `spec.dir`, sandboxed, with the standard handles and job
+/// `given` says: what it ends with, its exit code. `Err(why)` when no sandbox could be made, and
+/// then nothing ran.
+pub fn run(spec: &Spec, given: Given) -> Result<i32, String> {
     let _running = Running::start();
     on_interrupt()?;
-    let mut made = make(spec.network)?;
+    let mut made = make(spec.network, given)?;
     let temp = temporary(spec)?;
     let writable = Inheritable::new(made.run.sid(), WRITE)?;
     match writable.make_dir(&temp) {
@@ -134,54 +191,73 @@ pub fn run(spec: &Spec) -> Result<i32, String> {
         // Left by a launcher that was killed: the scheduler runs a spec once at a time.
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {
             std::fs::remove_dir_all(&temp).map_err(|error| {
+                // alloc: the error, once, and nothing runs.
                 format!("removing a killed run's temporary directory {}: {error}", temp.display())
             })?;
             writable.make_dir(&temp).map_err(|error| {
+                // alloc: the error, once, and nothing runs.
                 format!("making the run's temporary directory {}: {error}", temp.display())
             })?;
         }
+        // alloc: the error, once, and nothing runs.
         Err(error) => return Err(format!("making the run's temporary directory {}: {error}", temp.display())),
     }
-    let mut granted = Granted { sid: made.run.sid(), writes: Vec::new(), temp: temp.clone() };
-    let mut found = Vec::new();
+    let writes = Vec::with_capacity(spec.write.len());
+    // clone: once per sandbox, the directory it takes its grant back from.
+    let mut granted = Granted { sid: made.run.sid(), writes, temp: temp.clone() };
+    let mut found = Vec::with_capacity(spec.write.len());
     for dir in &spec.write {
         match writable.make_dir_all(dir) {
             // Made here with the grant in it; it stays, so the grant is taken back at the end.
+            // clone: once per sandbox and directory, as above.
             Ok(true) => granted.writes.push(dir.clone()),
             Ok(false) => found.push(dir.as_path()),
             Err(error) => {
+                // alloc: the error, once, and nothing runs.
                 return Err(format!("making the sandbox's writable directory {}: {error}", dir.display()));
             }
         }
     }
     let program_dir = spec.program.parent().filter(|it| !it.as_os_str().is_empty());
-    let readers = [made.container.0, sid(&made.any)];
-    let mut reads = Vec::new();
+    let readers = [sid(&made.kept.container), sid(&made.kept.any)];
+    let checks = reads::kept();
+    // Once per sandbox, the key each read path is looked up by in the kept checks.
+    let mut key = Vec::with_capacity(if checks.is_some() { 260 } else { 0 });
+    let mut missing = Vec::with_capacity(spec.read.len() + 2);
     for path in spec.read.iter().map(PathBuf::as_path).chain(program_dir).chain([spec.dir.as_path()]) {
-        let Some(seen) = covered(path, &readers, READ, "granting the sandbox read")? else { continue };
+        let seen = match checks {
+            Some(checks) => checks.covered(path, &readers, &mut key)?,
+            None => covered(path, &readers, READ, GRANTING_READ)?,
+        };
+        let Some(seen) = seen else { continue };
         // Read grants are only ever added, so one seen without the lock stays: only a missing
         // one is changed, under the lock, after looking again.
         if !seen.covered {
-            reads.push((path, seen.dir));
+            missing.push((path, seen.dir));
         }
     }
-    if !reads.is_empty() || !found.is_empty() {
+    if !missing.is_empty() || !found.is_empty() {
         let _lock = Lock::take()?;
-        for (path, dir) in reads {
-            grant(path, dir, made.container.0, &readers, READ, "granting the sandbox read")?;
+        for (path, dir) in missing {
+            grant(path, dir, readers[0], &readers, READ, GRANTING_READ)?;
         }
         for dir in found {
             if grant(dir, true, granted.sid, &[granted.sid], WRITE, "granting the sandbox write")? {
+                // alloc: once per sandbox and directory, the grant to take back.
                 granted.writes.push(dir.to_owned());
             }
         }
     }
 
-    let mut env = spec.env.clone();
+    // The program's environment, once per sandbox, for the kernel.
+    let mut env = Vec::with_capacity(spec.env.len() + 2);
+    env.extend(spec.env.iter().cloned());
+    // clone: as above.
     env.push(("TMP".into(), temp.clone().into_os_string()));
     env.push(("TEMP".into(), temp.into_os_string()));
-    let block = environment(&env)?;
-    let mut line = command_line(&spec.program, &spec.args)?;
+    let block = blaze_core::create_process::environment(&env).map_err(|it| it.to_string())?; // alloc: error path
+    let mut line =
+        blaze_core::create_process::command_line(&spec.program, &spec.args).map_err(|it| it.to_string())?; // alloc: error path
     let program = wide(spec.program.as_os_str(), "the program's path")?;
     let dir = wide(spec.dir.as_os_str(), "the program's directory")?;
     let mut startup = STARTUPINFOEXW::default();
@@ -219,6 +295,7 @@ pub fn run(spec: &Spec) -> Result<i32, String> {
         )
     };
     if created == 0 {
+        // alloc: the error, once, and nothing ran.
         return Err(failed(format!("starting {} in the sandbox", spec.program.display()), "CreateProcessW"));
     }
     let child = Handle(process.hProcess);
@@ -245,57 +322,101 @@ pub fn run(spec: &Spec) -> Result<i32, String> {
 /// Makes a sandbox around nothing (no program run): `Ok` when one can be made here, why not
 /// otherwise.
 pub fn probe() -> Result<(), String> {
-    let _made = make(true)?;
+    let _made = make(true, Given::own())?;
     let _lock = Lock::take()?;
     Ok(())
 }
 
-/// What a run is made of up to its process: the container, the run's capability, the job and
-/// the process's attribute list. The list points into the capabilities, the SIDs and the
-/// handles beside it, which are on the heap, where moving `Made` leaves them.
+/// What a run is made of up to its process: the run's capability, the job and the process's
+/// attribute list. The list points into the capabilities, the SIDs and the handles beside it,
+/// which are on the heap, where moving `Made` leaves them, or in [`Kept`], which lives as long
+/// as the process.
 struct Made {
     attributes: Attributes,
     _capabilities: Box<SECURITY_CAPABILITIES>,
     _granted: Vec<SID_AND_ATTRIBUTES>,
-    _network: Vec<SidBuffer>,
     _jobs: Box<[HANDLE; 1]>,
-    any: Box<SidBuffer>,
+    kept: &'static Kept,
     run: Capability,
-    container: Container,
     job: Handle,
     standard: [Option<Handle>; 3],
     inherited: Vec<HANDLE>,
 }
 
-fn make(network: bool) -> Result<Made, String> {
+/// The SIDs every run of the process shares, made by its first and kept: the container's, ALL
+/// APPLICATION PACKAGES' and the three network capabilities'. Copied into buffers of their own,
+/// so a static holds plain bytes.
+struct Kept {
+    container: SidBuffer,
+    any: SidBuffer,
+    network: [SidBuffer; 3],
+}
+
+static KEPT: OnceLock<Kept> = OnceLock::new();
+
+/// The process's [`Kept`], made the first time; an error is not kept, so a later run asks again.
+fn kept() -> Result<&'static Kept, String> {
+    if let Some(kept) = KEPT.get() {
+        return Ok(kept);
+    }
     let container = Container::open()?;
-    let run = Capability::new()?;
-    let any = Box::new(well_known(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?);
-    let network = match network {
-        true => vec![
+    let made = Kept {
+        container: copied(container.0, "the sandbox's AppContainer")?,
+        any: well_known(WinBuiltinAnyPackageSid, "ALL APPLICATION PACKAGES")?,
+        network: [
             well_known(WinCapabilityInternetClientSid, "the internetClient capability")?,
             well_known(WinCapabilityInternetClientServerSid, "the internetClientServer capability")?,
             well_known(WinCapabilityPrivateNetworkClientServerSid, "the privateNetworkClientServer capability")?,
         ],
-        false => Vec::new(),
     };
+    Ok(KEPT.get_or_init(|| made))
+}
+
+/// A copy of `sid` in a buffer of its own.
+fn copied(sid: PSID, what: &str) -> Result<SidBuffer, String> {
+    let mut buffer: SidBuffer = [0; (SECURITY_MAX_SID_SIZE / 4) as usize];
+    // SAFETY: `buffer` is SECURITY_MAX_SID_SIZE bytes, the length the call is told, live and
+    // exclusive for it and aligned for a SID's `u32` fields; `sid` is a valid SID its caller
+    // holds for the call ([`Container`]), which only reads it.
+    if unsafe { CopySid(SECURITY_MAX_SID_SIZE, buffer.as_mut_ptr().cast(), sid) } == 0 {
+        // alloc: the error, once, and the sandbox stops.
+        return Err(failed(format!("copying the SID of {what}"), "CopySid"));
+    }
+    Ok(buffer)
+}
+
+fn make(network: bool, given: Given) -> Result<Made, String> {
+    let kept = kept()?;
+    let run = Capability::new()?;
     let enabled = SE_GROUP_ENABLED as u32;
-    let mut granted = vec![SID_AND_ATTRIBUTES { Sid: run.sid(), Attributes: enabled }];
-    granted.extend(network.iter().map(|it| SID_AND_ATTRIBUTES { Sid: sid(it), Attributes: enabled }));
+    let mut granted = Vec::with_capacity(1 + kept.network.len());
+    granted.push(SID_AND_ATTRIBUTES { Sid: run.sid(), Attributes: enabled });
+    if network {
+        granted.extend(kept.network.iter().map(|it| SID_AND_ATTRIBUTES { Sid: sid(it), Attributes: enabled }));
+    }
+    // alloc: once per sandbox, where the attribute list's pointers into it stay put ([`Made`]).
     let capabilities = Box::new(SECURITY_CAPABILITIES {
-        AppContainerSid: container.0,
+        AppContainerSid: sid(&kept.container),
         Capabilities: granted.as_mut_ptr(),
         CapabilityCount: granted.len() as u32,
         Reserved: 0,
     });
-    let job = job()?;
+    let Given { driver, standard: handed, job: handed_job } = given;
+    let (job, standard) = match (driver, handed_job) {
+        (false, _) => (job()?, standard()?),
+        (true, Some(theirs)) => (driven(theirs)?, handed),
+        // alloc: the error, once, and nothing runs.
+        (true, None) => return Err("the driver handed the run no job to hold it in".to_owned()),
+    };
+    // alloc: as `capabilities` is.
     let jobs = Box::new([job.0]);
-    let standard = standard()?;
-    let inherited: Vec<HANDLE> = standard.iter().flatten().map(|it| it.0).collect();
+    let mut inherited: Vec<HANDLE> = Vec::with_capacity(3);
+    inherited.extend(standard.iter().flatten().map(|it| it.0));
     let mut attributes = Attributes::new(if inherited.is_empty() { 2 } else { 3 })?;
     // SAFETY: `capabilities` is one SECURITY_CAPABILITIES in a box, which `Made` keeps beside
-    // `attributes` (moving `Made` leaves it where it is), and what it points to, `granted`'s
-    // list and the SIDs of `container`, `run` and `network`, is kept there too.
+    // `attributes` (moving `Made` leaves it where it is), and what it points to is kept there
+    // too (`granted`'s list and `run`'s SID) or in `kept`, a static (the container's and the
+    // network's SIDs).
     unsafe {
         attributes.set(
             PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
@@ -328,26 +449,16 @@ fn make(network: bool) -> Result<Made, String> {
             )
         }?;
     }
-    Ok(Made {
-        attributes,
-        _capabilities: capabilities,
-        _granted: granted,
-        _network: network,
-        _jobs: jobs,
-        any,
-        run,
-        container,
-        job,
-        standard,
-        inherited,
-    })
+    Ok(Made { attributes, _capabilities: capabilities, _granted: granted, _jobs: jobs, kept, run, job, standard, inherited })
 }
 
 fn failed(what: impl Display, call: &str) -> String {
+    // alloc: the error, once, and the sandbox stops.
     format!("{what} ({call}): {}", std::io::Error::last_os_error())
 }
 
 fn failed_with(what: impl Display, call: &str, code: i32) -> String {
+    // alloc: the error, once, and the sandbox stops.
     format!("{what} ({call}): {}", std::io::Error::from_raw_os_error(code))
 }
 
@@ -355,20 +466,28 @@ fn failed_with(what: impl Display, call: &str, code: i32) -> String {
 /// is, so the same spec sees the same path.
 fn temporary(spec: &Spec) -> Result<PathBuf, String> {
     use sha2::Digest as _;
+    // alloc: the error, once, and nothing runs.
     let bytes = serde_json::to_vec(spec).map_err(|error| format!("the spec: {error}"))?;
     let digest = sha2::Sha256::digest(&bytes);
-    let name: String = digest[..8].iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut name = String::with_capacity(16);
+    for byte in &digest[..8] {
+        _ = write!(name, "{byte:02x}");
+    }
+    // alloc: once per sandbox, its temporary directory's path.
     Ok(std::env::temp_dir().join(format!("blaze-sandbox-{name}")))
 }
 
 fn random(what: &str) -> Result<u64, String> {
+    // alloc: the error, once, and the sandbox stops.
     getrandom::u64().map_err(|error| format!("random bytes for {what}: {error}"))
 }
 
 /// `text` as UTF-16 ending in NUL, or why not when it has a NUL of its own.
 fn wide(text: &OsStr, what: &str) -> Result<Vec<u16>, String> {
-    let mut out: Vec<u16> = text.encode_wide().collect();
+    let mut out = Vec::with_capacity(text.len() + 1);
+    out.extend(text.encode_wide());
     if out.contains(&0) {
+        // alloc: the error, once, and the sandbox stops.
         return Err(format!("{what} has a NUL in it: {}", text.to_string_lossy()));
     }
     out.push(0);
@@ -376,7 +495,9 @@ fn wide(text: &OsStr, what: &str) -> Result<Vec<u16>, String> {
 }
 
 fn literal(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain([0]).collect()
+    let mut out = Vec::with_capacity(text.len() + 1);
+    out.extend(text.encode_utf16().chain([0]));
+    out
 }
 
 fn sid(buffer: &SidBuffer) -> PSID {
@@ -426,6 +547,7 @@ impl Container {
             let found = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
             if found < 0 {
                 return Err(failed_with(
+                    // alloc: the error, once, and the sandbox stops.
                     format!("finding the sandbox's AppContainer profile {PROFILE}"),
                     "DeriveAppContainerSidFromAppContainerName",
                     found,
@@ -433,6 +555,7 @@ impl Container {
             }
         } else if made < 0 {
             return Err(failed_with(
+                // alloc: the error, once, and the sandbox stops.
                 format!("making the sandbox's AppContainer profile {PROFILE}"),
                 "CreateAppContainerProfile",
                 made,
@@ -464,6 +587,7 @@ struct Capability {
 impl Capability {
     fn new() -> Result<Capability, String> {
         let what = "the run's capability";
+        // alloc: once per sandbox, the name its capability is derived from.
         let name = literal(&format!("blaze.sandbox.run.{:016x}{:016x}", random(what)?, random(what)?));
         let mut it = Capability { groups: null_mut(), group_count: 0, sids: null_mut(), count: 0 };
         // SAFETY: `name` ends in NUL (`literal`) and lives in this frame; the four out-pointers
@@ -527,6 +651,7 @@ fn well_known(kind: WELL_KNOWN_SID_TYPE, what: &str) -> Result<SidBuffer, String
     // exclusive for it, and aligned for a SID's `u32` fields ([`SidBuffer`]); the call writes at
     // most `size` bytes and sets `size` to what it wrote. A null domain is the local one.
     if unsafe { CreateWellKnownSid(kind, null_mut(), buffer.as_mut_ptr().cast(), &mut size) } == 0 {
+        // alloc: the error, once, and the sandbox stops.
         return Err(failed(format!("making the SID of {what}"), "CreateWellKnownSid"));
     }
     Ok(buffer)
@@ -544,10 +669,47 @@ fn job() -> Result<Handle, String> {
         return Err(failed("making the sandbox's job", "CreateJobObjectW"));
     }
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags =
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    limits.BasicLimitInformation.LimitFlags = HANDED_LIMITS;
     // SAFETY: JobObjectExtendedLimitInformation names a JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
     unsafe { set_job(&job, JobObjectExtendedLimitInformation, &limits, "limiting the sandbox's job") }?;
+    off_the_desktop(&job)?;
+    Ok(job)
+}
+
+/// The job a driver handed the run, which made it with [`HANDED_LIMITS`] and its memory limit:
+/// checked, not set, so its limits stay the driver's, and kept off the desktop as [`job`] is.
+fn driven(job: Handle) -> Result<Handle, String> {
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: JobObjectExtendedLimitInformation names a JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    // and `limits` is a live, exclusive one of the size the call is told, which it writes and
+    // nothing more; a null length out-pointer is allowed. `job` owns the handle the driver
+    // duplicated in ([`Given::adopt`]).
+    let asked = unsafe {
+        QueryInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&raw mut limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            null_mut(),
+        )
+    };
+    if asked == 0 {
+        return Err(failed("reading the limits of the job the driver handed", "QueryInformationJobObject"));
+    }
+    if limits.BasicLimitInformation.LimitFlags & HANDED_LIMITS != HANDED_LIMITS {
+        // alloc: the error, once, and nothing runs.
+        return Err(format!(
+            "the job the driver handed has limits {:#x}, without killing what is left on its close and ending a \
+             process that crashes ({HANDED_LIMITS:#x})",
+            limits.BasicLimitInformation.LimitFlags
+        ));
+    }
+    off_the_desktop(&job)?;
+    Ok(job)
+}
+
+/// None of the desktop's shared state for `job`'s processes.
+fn off_the_desktop(job: &Handle) -> Result<(), String> {
     let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
         UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
             | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
@@ -559,8 +721,7 @@ fn job() -> Result<Handle, String> {
             | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
     };
     // SAFETY: JobObjectBasicUIRestrictions names a JOBOBJECT_BASIC_UI_RESTRICTIONS.
-    unsafe { set_job(&job, JobObjectBasicUIRestrictions, &ui, "keeping the sandbox's job off the desktop") }?;
-    Ok(job)
+    unsafe { set_job(job, JobObjectBasicUIRestrictions, &ui, "keeping the sandbox's job off the desktop") }
 }
 
 /// # Safety
@@ -645,6 +806,7 @@ fn standard() -> Result<[Option<Handle>; 3], String> {
         // closes it once.
         let copied = unsafe { DuplicateHandle(process, handle, process, &mut copy, 0, 1, DUPLICATE_SAME_ACCESS) };
         if copied == 0 {
+            // alloc: the error, once, and the sandbox stops.
             return Err(failed(format!("passing the program the launcher's standard {name}"), "DuplicateHandle"));
         }
         out[at] = Some(Handle(copy));
@@ -664,6 +826,7 @@ impl Attributes {
         if size == 0 {
             return Err(failed("sizing the program's attribute list", "InitializeProcThreadAttributeList"));
         }
+        // alloc: once per sandbox, the attribute list of the size Windows asked for.
         let mut buffer = vec![0usize; size.div_ceil(size_of::<usize>())];
         // SAFETY: `buffer` is at least `size` bytes, the size the call above asked for the same
         // `count`, live and exclusive for it, and aligned to a pointer's alignment, which the
@@ -728,6 +891,7 @@ impl Lock {
                 // which only reads it; null security is the default.
                 let opened = unsafe { CreateMutexW(null(), 0, name.as_ptr()) };
                 if opened.is_null() {
+                    // alloc: the error, once, and the sandbox stops.
                     return Err(failed(format!("opening the lock on the sandbox's grants {LOCK}"), "CreateMutexW"));
                 }
                 let kept = *MUTEX.get_or_init(|| opened as usize);
@@ -743,6 +907,7 @@ impl Lock {
         // names the session's mutex for as long as the process lives.
         match unsafe { WaitForSingleObject(mutex, INFINITE) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Lock { mutex, _thread: PhantomData }),
+            // alloc: the error, once, and the sandbox stops.
             _ => Err(failed(format!("taking the lock on the sandbox's grants {LOCK}"), "WaitForSingleObject")),
         }
     }
@@ -786,6 +951,7 @@ impl Dacl {
         };
         match code {
             ERROR_SUCCESS => Ok(it),
+            // alloc: the error, once, and the sandbox stops.
             _ => Err(failed_with(format!("{what} on {}", path.display()), "GetNamedSecurityInfoW", code as i32)),
         }
     }
@@ -793,7 +959,7 @@ impl Dacl {
     /// The DACL of what `file` has open, which it opened with READ_CONTROL.
     fn of_handle(file: &Handle, path: &Path, what: &str) -> Result<Dacl, String> {
         let mut it = Dacl { descriptor: null_mut(), dacl: null_mut() };
-        // SAFETY: `file` owns an open handle with READ_CONTROL (`covered`). The DACL and
+        // SAFETY: `file` owns an open handle with READ_CONTROL (`open`). The DACL and
         // descriptor out-pointers are live fields of `it`, the others null as allowed; the DACL
         // points into the descriptor, which `it`'s drop frees once.
         let code = unsafe {
@@ -810,6 +976,7 @@ impl Dacl {
         };
         match code {
             ERROR_SUCCESS => Ok(it),
+            // alloc: the error, once, and the sandbox stops.
             _ => Err(failed_with(format!("{what} on {}", path.display()), "GetSecurityInfo", code as i32)),
         }
     }
@@ -860,9 +1027,9 @@ impl Dacl {
             // of `SidStart`, where its SID begins, and reads nothing.
             let entry_sid = unsafe { (&raw mut (*allowed).SidStart).cast::<c_void>() };
             // SAFETY: `entry_sid` is the SID of an entry of the live DACL, and every one of
-            // `sids` is a SID of the run's `Made` (the container's, ALL APPLICATION PACKAGES or
-            // the run's capability: `run`, `covered`, `grant`), live while it is; the call only
-            // reads both.
+            // `sids` is the container's or ALL APPLICATION PACKAGES' in the static [`Kept`], or
+            // the run's capability, live while its `Made` is (`run`, `covered`, `grant`); the
+            // call only reads both.
             if !sids.iter().any(|it| unsafe { EqualSid(*it, entry_sid) } != 0) {
                 continue;
             }
@@ -934,6 +1101,14 @@ struct Seen {
 /// everyone in. One open, one attribute read and one DACL read, all on one handle, where a stat
 /// by name and then a DACL read by name would resolve the path twice.
 fn covered(path: &Path, already: &[PSID], mask: u32, what: &str) -> Result<Option<Seen>, String> {
+    match open(path, what)? {
+        Some(file) => inspect(&file, path, already, mask, what).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// `path` opened to read its attributes and DACL, following links; `None` when it is not there.
+fn open(path: &Path, what: &str) -> Result<Option<Handle>, String> {
     let name = wide(path.as_os_str(), "a path the sandbox grants")?;
     // SAFETY: `name` ends in NUL (`wide`) and lives in this frame, and the call only reads it;
     // null security attributes and template are allowed. The handle it gives, or
@@ -953,13 +1128,20 @@ fn covered(path: &Path, already: &[PSID], mask: u32, what: &str) -> Result<Optio
         let error = std::io::Error::last_os_error();
         return match error.raw_os_error().map(|code| code as u32) {
             Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND) => Ok(None),
+            // alloc: the error, once, and the sandbox stops.
             _ => Err(format!("{what} on {} (CreateFileW): {error}", path.display())),
         };
     }
+    Ok(Some(file))
+}
+
+/// Whether what `file` has open (by [`open`]) is a directory, and whether one of `already` has
+/// `mask` on it as [`covered`] says.
+fn inspect(file: &Handle, path: &Path, already: &[PSID], mask: u32, what: &str) -> Result<Seen, String> {
     let mut basic = FILE_BASIC_INFO::default();
-    // SAFETY: `file` owns the open handle just checked, opened with FILE_READ_ATTRIBUTES;
-    // FileBasicInfo names a FILE_BASIC_INFO, and `basic` is a live, exclusive one of the size
-    // the call is told, which it writes and nothing more.
+    // SAFETY: `file` owns an open handle (`open` returns only a valid one), opened with
+    // FILE_READ_ATTRIBUTES; FileBasicInfo names a FILE_BASIC_INFO, and `basic` is a live,
+    // exclusive one of the size the call is told, which it writes and nothing more.
     let asked = unsafe {
         GetFileInformationByHandleEx(
             file.0,
@@ -969,11 +1151,12 @@ fn covered(path: &Path, already: &[PSID], mask: u32, what: &str) -> Result<Optio
         )
     };
     if asked == 0 {
+        // alloc: the error, once, and the sandbox stops.
         return Err(failed(format!("{what} on {}", path.display()), "GetFileInformationByHandleEx"));
     }
     let dir = basic.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-    let current = Dacl::of_handle(&file, path, what)?;
-    Ok(Some(Seen { dir, covered: current.covers(already, mask, dir) }))
+    let current = Dacl::of_handle(file, path, what)?;
+    Ok(Seen { dir, covered: current.covers(already, mask, dir) })
 }
 
 /// Whether `path` is a directory, following a link as `Path::is_dir` does, with one attribute
@@ -1008,6 +1191,7 @@ impl Inheritable {
         // reads it.
         let sid_size = unsafe { GetLengthSid(sid) } as usize;
         let size = size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid_size;
+        // alloc: once per directory the sandbox makes, the ACL of its one grant.
         let mut acl = vec![0u32; size.div_ceil(size_of::<u32>())];
         let bytes = (acl.len() * size_of::<u32>()) as u32;
         // SAFETY: `acl` is `bytes` bytes, live, exclusive and 4-byte aligned, which the call is
@@ -1029,6 +1213,7 @@ impl Inheritable {
         if added == 0 {
             return Err(failed("making the sandbox's write grant", "AddAccessAllowedAceEx"));
         }
+        // alloc: as `acl` is, at an address that stays while the attributes point to it.
         let mut descriptor = Box::new(SECURITY_DESCRIPTOR::default());
         // SAFETY: `descriptor` is a live, exclusive SECURITY_DESCRIPTOR, the absolute form the
         // call makes at this revision.
@@ -1128,6 +1313,7 @@ fn set_dacl(name: &[u16], path: &Path, current: &Dacl, access: &EXPLICIT_ACCESS_
     // gave, live while `current` is, and only read. `new` is a live pointer for the call to set.
     let code = unsafe { SetEntriesInAclW(1, access, current.dacl, &mut new) };
     if code != ERROR_SUCCESS {
+        // alloc: the error, once, and the sandbox stops.
         return Err(failed_with(format!("{what} on {}", path.display()), "SetEntriesInAclW", code as i32));
     }
     // SAFETY: `name` ends in NUL (asserted above; `wide` made it) and is only read, and `new` is
@@ -1141,6 +1327,7 @@ fn set_dacl(name: &[u16], path: &Path, current: &Dacl, access: &EXPLICIT_ACCESS_
     unsafe { LocalFree(new.cast()) };
     match code {
         ERROR_SUCCESS => Ok(()),
+        // alloc: the error, once, and the sandbox stops.
         _ => Err(failed_with(format!("{what} on {}", path.display()), "SetNamedSecurityInfoW", code as i32)),
     }
 }
@@ -1174,6 +1361,7 @@ impl Drop for Granted {
 }
 
 /// The jobs of the runs in progress, for the console's interrupt to end.
+// alloc: none: an empty `Vec` in a static, which grows once per sandbox.
 static JOBS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// How many runs have not taken back their grants yet, for the console's close to wait on.
@@ -1228,19 +1416,30 @@ unsafe extern "system" fn interrupted(event: u32) -> BOOL {
     if !matches!(event, CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT) {
         return 0;
     }
+    let wait = match event {
+        CTRL_CLOSE_EVENT => Duration::from_secs(4),
+        _ => Duration::ZERO,
+    };
+    end_every_run(STATUS_CONTROL_C_EXIT as u32, wait);
+    1
+}
+
+/// Ends the job of every run in progress with `code`, then waits up to `wait` for the runs to
+/// take their grants back: what a console's close does, and a warm launcher whose driver is
+/// gone ([`serve`]).
+pub fn end_every_run(code: u32, wait: Duration) {
     let jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
     for &job in jobs.iter() {
         // SAFETY: a job is named in JOBS only while its `Registered` lives, which `run` declares
         // after `made` (so drops it first) and which takes the job out under the lock this holds:
         // the handle is open for the call, not one closed whose number another object took.
-        unsafe { TerminateJobObject(job as HANDLE, STATUS_CONTROL_C_EXIT as u32) };
+        unsafe { TerminateJobObject(job as HANDLE, code) };
     }
     drop(jobs);
-    if event == CTRL_CLOSE_EVENT {
+    if !wait.is_zero() {
         let runs = RUNS.0.lock().unwrap_or_else(PoisonError::into_inner);
-        _ = RUNS.1.wait_timeout_while(runs, Duration::from_secs(4), |runs| *runs > 0);
+        _ = RUNS.1.wait_timeout_while(runs, wait, |runs| *runs > 0);
     }
-    1
 }
 
 fn on_interrupt() -> Result<(), String> {
@@ -1249,158 +1448,22 @@ fn on_interrupt() -> Result<(), String> {
         .get_or_init(|| {
             // SAFETY: `interrupted` has the PHANDLER_ROUTINE signature, is a `fn` item that lives
             // as long as the process, and is sound on any thread for any event (its `# Safety`):
-            // it only locks JOBS and RUNS, ends jobs and waits. Windows calls it on a thread of its
-            // own, so it touches nothing that is not `Sync`.
+            // it only locks JOBS and RUNS, ends jobs and waits (`end_every_run`). Windows calls it
+            // on a thread of its own, so it touches nothing that is not `Sync`.
             match unsafe { SetConsoleCtrlHandler(Some(interrupted), 1) } {
                 0 => Err(failed("passing the console's interrupt to the sandbox", "SetConsoleCtrlHandler")),
                 _ => Ok(()),
             }
         })
+        // clone: `Ok(())` copies nothing; an error is copied once, and the sandbox stops.
         .clone()
-}
-
-/// The command line of `program` and `args`, ending in NUL: the program quoted, each argument
-/// as the MSVC runtime splits it back (`std::process::Command`'s rules).
-fn command_line(program: &Path, args: &[OsString]) -> Result<Vec<u16>, String> {
-    let quote = u16::from(b'"');
-    let name: Vec<u16> = program.as_os_str().encode_wide().collect();
-    if name.iter().any(|&it| it == 0 || it == quote) {
-        return Err(format!("the program's path has a quote or a NUL in it: {}", program.display()));
-    }
-    let mut line = vec![quote];
-    line.extend(name);
-    line.push(quote);
-    for arg in args {
-        line.push(u16::from(b' '));
-        append_arg(&mut line, arg)?;
-    }
-    line.push(0);
-    Ok(line)
-}
-
-/// `arg`, quoted when it is empty or has a space or a tab; the backslashes before a quote are
-/// doubled and the quote escaped, and so are those at the end of a quoted one.
-fn append_arg(line: &mut Vec<u16>, arg: &OsStr) -> Result<(), String> {
-    let (quote, slash) = (u16::from(b'"'), u16::from(b'\\'));
-    let units: Vec<u16> = arg.encode_wide().collect();
-    if units.contains(&0) {
-        return Err(format!("an argument has a NUL in it: {}", arg.to_string_lossy()));
-    }
-    let quoted = units.is_empty() || units.iter().any(|&it| it == u16::from(b' ') || it == u16::from(b'\t'));
-    if quoted {
-        line.push(quote);
-    }
-    let mut slashes = 0;
-    for unit in units {
-        if unit == slash {
-            slashes += 1;
-        } else {
-            if unit == quote {
-                line.extend(std::iter::repeat_n(slash, slashes + 1));
-            }
-            slashes = 0;
-        }
-        line.push(unit);
-    }
-    if quoted {
-        line.extend(std::iter::repeat_n(slash, slashes));
-        line.push(quote);
-    }
-    Ok(())
-}
-
-/// The environment block of `env`: `NAME=VALUE` and a NUL each, sorted by name without regard
-/// to case as Windows keeps it, a later one of a name in place of an earlier, and a NUL after.
-fn environment(env: &[(OsString, OsString)]) -> Result<Vec<u16>, String> {
-    let equals = u16::from(b'=');
-    let mut by_name: FxHashMap<Vec<u16>, (Vec<u16>, Vec<u16>)> = FxHashMap::default();
-    for (name, value) in env {
-        let units: Vec<u16> = name.encode_wide().collect();
-        // A name may start with `=` (cmd's `=C:`), and has none after.
-        if units.is_empty() || units.contains(&0) || units[1..].contains(&equals) {
-            return Err(format!("the environment has a variable that can't be named: {:?}", name));
-        }
-        let value: Vec<u16> = value.encode_wide().collect();
-        if value.contains(&0) {
-            return Err(format!("the variable {} has a NUL in it", name.to_string_lossy()));
-        }
-        by_name.insert(upper(&units), (units, value));
-    }
-    let mut sorted: Vec<(Vec<u16>, (Vec<u16>, Vec<u16>))> = by_name.into_iter().collect();
-    sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let mut block = Vec::new();
-    for (_, (name, value)) in sorted {
-        block.extend(name);
-        block.push(equals);
-        block.extend(value);
-        block.push(0);
-    }
-    if block.is_empty() {
-        block.push(0);
-    }
-    block.push(0);
-    Ok(block)
-}
-
-/// `units` with each in upper case where that is one unit, as Windows compares names.
-fn upper(units: &[u16]) -> Vec<u16> {
-    units
-        .iter()
-        .map(|&unit| {
-            let Some(c) = char::from_u32(u32::from(unit)) else { return unit };
-            let mut up = c.to_uppercase();
-            match (up.next(), up.next()) {
-                (Some(one), None) => u16::try_from(u32::from(one)).unwrap_or(unit),
-                _ => unit,
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_JOB_MEMORY;
+
     use super::*;
-
-    fn text(units: &[u16]) -> String {
-        String::from_utf16(units).unwrap()
-    }
-
-    #[test]
-    fn arguments_are_quoted_as_the_msvc_runtime_splits_them() {
-        let args = ["", "plain", "a b", "tab\there", r#"say "hi""#, r"tail\", r"tail dir\", r#"a\\"b"#, r"\\host\share"]
-            .map(OsString::from);
-        let line = command_line(Path::new(r"C:\p q\a.exe"), &args).unwrap();
-        assert_eq!(line.last(), Some(&0));
-        let expected = [
-            r#""C:\p q\a.exe""#,
-            r#""""#,
-            "plain",
-            r#""a b""#,
-            "\"tab\there\"",
-            r#""say \"hi\"""#,
-            r"tail\",
-            r#""tail dir\\""#,
-            r#"a\\\\\"b"#,
-            r"\\host\share",
-        ]
-        .join(" ");
-        assert_eq!(text(&line[..line.len() - 1]), expected);
-        assert!(command_line(Path::new("a.exe"), &[OsString::from("a\0b")]).is_err());
-        assert!(command_line(Path::new("a\".exe"), &[]).is_err());
-        assert_eq!(text(&command_line(Path::new("a.exe"), &[]).unwrap()), "\"a.exe\"\0");
-    }
-
-    #[test]
-    fn the_environment_block_is_sorted_without_regard_to_case_and_ends_in_two_nuls() {
-        let env = [("b", "2"), ("Path", "x"), ("A", "1"), ("_z", ""), ("a", "3"), ("=C:", r"C:\w")]
-            .map(|(name, value)| (OsString::from(name), OsString::from(value)));
-        let block = environment(&env).unwrap();
-        assert_eq!(text(&block), "=C:=C:\\w\0a=3\0b=2\0Path=x\0_z=\0\0");
-        assert_eq!(environment(&[]).unwrap(), vec![0, 0]);
-        assert!(environment(&[("A=B".into(), "c".into())]).is_err());
-        assert!(environment(&[("".into(), "c".into())]).is_err());
-        assert!(environment(&[("A".into(), "c\0d".into())]).is_err());
-    }
 
     #[test]
     fn generic_rights_are_mapped_to_a_files() {
@@ -1437,15 +1500,15 @@ mod tests {
         let (c, echo, hi) = (OsStr::new("/c"), OsStr::new("echo"), OsStr::new("hi>"));
 
         let inside = written.join("out.txt");
-        assert_eq!(run(&spec(&[c, echo, hi, inside.as_os_str()])), Ok(0));
+        assert_eq!(run(&spec(&[c, echo, hi, inside.as_os_str()]), Given::own()), Ok(0));
         assert_eq!(std::fs::read_to_string(&inside).unwrap().trim(), "hi");
 
         let outside = denied.join("out.txt");
-        assert_ne!(run(&spec(&[c, echo, hi, outside.as_os_str()])), Ok(0));
+        assert_ne!(run(&spec(&[c, echo, hi, outside.as_os_str()]), Given::own()), Ok(0));
         assert!(!outside.exists());
 
         let exit = spec(&[c, OsStr::new("exit"), OsStr::new("7")]);
-        assert_eq!(run(&exit), Ok(7));
+        assert_eq!(run(&exit, Given::own()), Ok(7));
         assert_eq!(temporary(&exit), temporary(&exit.clone()));
         assert_ne!(temporary(&exit), temporary(&spec(&[c, OsStr::new("exit"), OsStr::new("8")])));
         assert!(!temporary(&exit).unwrap().exists(), "the run's temporary directory was left behind");
@@ -1463,19 +1526,19 @@ mod tests {
         let (dir, file) = (base.join("d"), base.join("f.txt"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&file, "x").unwrap();
-        let made = make(false).unwrap();
-        let readers = [made.container.0, sid(&made.any)];
+        let made = make(false, Given::own()).unwrap();
+        let readers = [sid(&made.kept.container), sid(&made.kept.any)];
         for (path, is_dir) in [(&dir, true), (&file, false)] {
             let before = covered(path, &readers, READ, "test").unwrap().unwrap();
             assert_eq!(before.dir, is_dir, "{}", path.display());
             let added = {
                 let _lock = Lock::take().unwrap();
-                grant(path, is_dir, made.container.0, &readers, READ, "test").unwrap()
+                grant(path, is_dir, readers[0], &readers, READ, "test").unwrap()
             };
             assert_eq!(added, !before.covered, "{}", path.display());
             assert_eq!(covered(path, &readers, READ, "test").unwrap(), Some(Seen { dir: is_dir, covered: true }));
             let _lock = Lock::take().unwrap();
-            assert!(!grant(path, is_dir, made.container.0, &readers, READ, "test").unwrap(), "{}", path.display());
+            assert!(!grant(path, is_dir, readers[0], &readers, READ, "test").unwrap(), "{}", path.display());
         }
         _ = std::fs::remove_dir_all(&base);
     }
@@ -1500,8 +1563,8 @@ mod tests {
         let (dir, file, missing) = (base.join("d"), base.join("f.txt"), base.join("gone").join("x"));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&file, "x").unwrap();
-        let made = make(false).unwrap();
-        let readers = [made.container.0, sid(&made.any)];
+        let made = make(false, Given::own()).unwrap();
+        let readers = [sid(&made.kept.container), sid(&made.kept.any)];
         let windows = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
         for path in [&dir, &file, &missing, &base, &windows.join("System32"), &windows.join("win.ini")] {
             for (sids, mask) in [(&readers[..], READ), (&readers[..1], READ), (&readers[..], WRITE)] {
@@ -1521,7 +1584,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("blaze-windows-sandbox-made-{}", std::process::id()));
         _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let made = make(false).unwrap();
+        let made = make(false, Given::own()).unwrap();
         let run = made.run.sid();
         let writable = Inheritable::new(run, WRITE).unwrap();
 
@@ -1566,5 +1629,118 @@ mod tests {
         let started = Instant::now();
         end(&job, 1);
         assert!(started.elapsed() < ENDING);
+    }
+
+    /// A job as a driver makes one for a spawn: `flags`, and a memory limit.
+    fn drivers_job(flags: u32) -> Handle {
+        // SAFETY: as in `job`.
+        let job = Handle(unsafe { CreateJobObjectW(null(), null()) });
+        assert!(!job.0.is_null());
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = flags | JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limits.JobMemoryLimit = 1 << 30;
+        // SAFETY: JobObjectExtendedLimitInformation names a JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+        unsafe { set_job(&job, JobObjectExtendedLimitInformation, &limits, "test") }.unwrap();
+        job
+    }
+
+    fn limits_of(job: &Handle) -> JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // SAFETY: as in `driven`.
+        let asked = unsafe {
+            QueryInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&raw mut limits).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                null_mut(),
+            )
+        };
+        assert_ne!(asked, 0);
+        limits
+    }
+
+    /// A copy of `handle` in this process, as a driver duplicates one into the launcher.
+    fn duplicated(handle: HANDLE, inherit: bool) -> u64 {
+        let mut copy: HANDLE = null_mut();
+        // SAFETY: as in `standard`: `handle` is open, and `copy` is the test's from here on.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: as in `standard`.
+        let copied = unsafe {
+            DuplicateHandle(process, handle, process, &mut copy, 0, BOOL::from(inherit), DUPLICATE_SAME_ACCESS)
+        };
+        assert_ne!(copied, 0);
+        copy as usize as u64
+    }
+
+    #[test]
+    fn a_job_the_driver_hands_is_checked_and_keeps_its_memory_limit() {
+        let job = driven(drivers_job(HANDED_LIMITS)).unwrap();
+        let limits = limits_of(&job);
+        assert_eq!(limits.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_MEMORY);
+        assert_eq!(limits.JobMemoryLimit, 1 << 30);
+        let why = driven(drivers_job(JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION)).err().unwrap();
+        assert!(why.contains("killing what is left"), "{why}");
+        // SAFETY: a frame that names no handle adopts none.
+        let none = unsafe { Given::adopt(&blaze_core::Handed { run: 1, stdin: 0, stdout: 0, stderr: 0, job: 0 }) };
+        assert!(none.driver && none.job.is_none() && none.standard.iter().all(Option::is_none));
+        if probe().is_ok() {
+            assert!(make(false, none).err().unwrap().contains("no job"));
+        }
+    }
+
+    #[test]
+    fn a_run_handed_the_drivers_handles_writes_to_them_in_the_drivers_job() {
+        if let Err(why) = probe() {
+            eprintln!("no sandbox can be made here, so this is not run: {why}");
+            return;
+        }
+        let root = std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from);
+        let cmd = root.join("System32").join("cmd.exe");
+        let base = std::env::temp_dir().join(format!("blaze-windows-sandbox-handed-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let out = base.join("stdout.txt");
+        let file = std::fs::File::create(&out).unwrap();
+        let ours = drivers_job(HANDED_LIMITS);
+        let handed = blaze_core::Handed {
+            run: 1,
+            stdin: 0,
+            stdout: duplicated(std::os::windows::io::AsRawHandle::as_raw_handle(&file), true),
+            stderr: 0,
+            job: duplicated(ours.0, false),
+        };
+        let spec = Spec {
+            program: cmd.clone(),
+            args: vec!["/c".into(), "echo handed& exit 3".into()],
+            env: vec![("SystemRoot".into(), root.clone().into_os_string())],
+            dir: base.clone(),
+            read: vec![base.clone()],
+            write: Vec::new(),
+            network: false,
+            trace: false,
+            live: base.join("live"),
+            report: base.join("report"),
+            not_inputs: vec![cmd],
+        };
+        // SAFETY: both values were just duplicated for this run, and nothing else names them.
+        assert_eq!(run(&spec, unsafe { Given::adopt(&handed) }), Ok(3));
+        drop(file);
+        assert_eq!(std::fs::read_to_string(&out).unwrap().trim(), "handed");
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: as in `end`.
+        let asked = unsafe {
+            QueryInformationJobObject(
+                ours.0,
+                JobObjectBasicAccountingInformation,
+                (&raw mut info).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                null_mut(),
+            )
+        };
+        assert_ne!(asked, 0);
+        assert!(info.TotalProcesses >= 1, "the program ran in the driver's job");
+        assert_eq!(info.ActiveProcesses, 0);
+        _ = std::fs::remove_dir_all(&base);
     }
 }

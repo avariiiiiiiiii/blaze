@@ -30,7 +30,7 @@ use cranelift_codegen::{
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_object::{
-    ObjectProduct,
+    ObjectModule, ObjectProduct,
     object::{
         RelocationEncoding, RelocationFlags, RelocationKind, SectionKind,
         write::{Relocation, SectionId, SymbolId},
@@ -268,7 +268,7 @@ pub(super) struct Tables {
 impl Tables {
     pub(super) fn add_function(
         &mut self,
-        module: &mut dyn Module,
+        module: &mut ObjectModule,
         func: FuncId,
         frame: &Frame,
         pads: Option<&Vec<u8>>,
@@ -283,7 +283,7 @@ impl Tables {
     /// The function of this object that `symbol` names, if it is one of ours.
     pub(super) fn runtime(
         &mut self,
-        module: &mut dyn Module,
+        module: &mut ObjectModule,
         symbol: &str,
     ) -> Result<Option<FuncId>, String> {
         let (slot, build): (_, fn(&mut Shim<'_>)) = match symbol {
@@ -302,7 +302,7 @@ impl Tables {
         Ok(Some(id))
     }
 
-    fn personality(&mut self, module: &mut dyn Module) -> Result<FuncId, String> {
+    fn personality(&mut self, module: &mut ObjectModule) -> Result<FuncId, String> {
         if let Some(id) = self.personality {
             return Ok(id);
         }
@@ -313,7 +313,7 @@ impl Tables {
 
     fn define(
         &mut self,
-        module: &mut dyn Module,
+        module: &mut ObjectModule,
         name: &str,
         params: &[ir::Type],
         returns: &[ir::Type],
@@ -426,7 +426,7 @@ impl Tables {
     }
 }
 
-fn signature(module: &dyn Module, params: &[ir::Type], returns: &[ir::Type]) -> Signature {
+fn signature(module: &ObjectModule, params: &[ir::Type], returns: &[ir::Type]) -> Signature {
     let mut sig = module.make_signature();
     sig.params.extend(params.iter().copied().map(AbiParam::new));
     sig.returns.extend(returns.iter().copied().map(AbiParam::new));
@@ -436,7 +436,7 @@ fn signature(module: &dyn Module, params: &[ir::Type], returns: &[ir::Type]) -> 
 /// A function of ours being built.
 struct Shim<'a> {
     builder: FunctionBuilder<'a>,
-    module: &'a mut dyn Module,
+    module: &'a mut ObjectModule,
     entry: ir::Block,
     error: &'a mut Option<String>,
 }

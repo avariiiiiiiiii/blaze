@@ -27,21 +27,17 @@ use syntax::{
 };
 
 use crate::{
-    lints::bodies::{BodyCx, Hooks, LatePass, types::util},
+    lints::bodies::{BodyCx, ExprKinds, ExprTag, LatePass, LintSet, lint_set, types::util},
     lower::{Found, Phase},
     model::{Applicability, Diag},
 };
 
-pub(super) struct InteriorMutableConsts;
+#[derive(Default)]
+pub(crate) struct InteriorMutableConsts;
 
 impl LatePass for InteriorMutableConsts {
-    fn name(&self) -> &'static str {
-        "InteriorMutableConsts"
-    }
-
-    fn hooks(&self) -> Hooks {
-        Hooks::EXPR
-    }
+    const LINTS: LintSet = lint_set(["const_item_interior_mutations"]);
+    const EXPRS: ExprKinds = ExprKinds::of(&[ExprTag::MethodCall, ExprTag::Call]);
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let store = b.store();

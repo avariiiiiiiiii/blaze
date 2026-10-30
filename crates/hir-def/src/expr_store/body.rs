@@ -200,7 +200,7 @@ impl Body {
 impl Body {
     /// How to lower this body again for its source map: with its blocks.
     fn lowering_with_source_map(&self) -> BodyLowering<'_> {
-        let blocks = self.store.expr_only.as_ref().map_or(&[][..], |it| &it.block_scopes);
+        let blocks = self.store.expr_only.as_ref().map_or(&[][..], |it| &*it.block_scopes);
         BodyLowering::SourceMap { blocks }
     }
 

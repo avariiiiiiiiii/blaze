@@ -23,6 +23,11 @@ which one is the last, atomically. Same trees freed, on the same thread as befor
 thread for a `Parse`'s last count), and a non-last count is a decrement where it is dropped
 instead of 0 to 100 ms later on the drop thread.
 
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
+> frontend-tree (2026-10-29): applied as written. `Tree::into_unique` is in `syntax_node.rs`;
+> `Drop for Parse` sends only a last count; `reparse_to` compares `ptr_eq` before the bytes; and
+> the test `an_unchanged_file_parses_again_allocating_nothing` is in `parsing/kept.rs`.
+
 ### `crates/syntax/src/syntax_node.rs`
 
 Before:
@@ -47,6 +52,8 @@ After:
     }
 }
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 
 ### `crates/syntax/src/lib.rs`, `Drop for Parse`
 
@@ -79,6 +86,8 @@ After:
 
 (The rest of the impl is unchanged; `FlatTree` is already in scope through `pub use syntax_tree::{..}`.)
 
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
+
 ### `crates/syntax/src/lib.rs`, `Parse::reparse_to`
 
 The same text is most often the same bytes (base-db hands the file's `Text` again): compare
@@ -96,6 +105,8 @@ After:
         let same = tree.source().ptr_eq(&text) || **tree.source() == *text;
         if same && self.outline.is_none_or(|it| it == edition) {
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 
 ### `crates/syntax/src/parsing/kept.rs`, the budget test (append to `mod tests`)
 
@@ -134,6 +145,8 @@ After:
 
 (`Parse::tree` is private to the crate root, which `parsing::kept::tests` is under. The keys'
 slots, 13 and 17, are no other test's.)
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 
 ## mem-format-tree: a flat tree's columns in one block, built in the thread's buffers
 
@@ -179,6 +192,23 @@ How:
 Memory: a thread keeps its buffers at the largest tree it built, about 9 bytes an element (a
 1 MB file: about 4.5 MB per worker), the high-water rule of memory.md "Scratch buffers".
 
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
+> frontend-tree (2026-10-29): yours to apply, together with section 3 and the RNG section's
+> `reparsing.rs`/`flat.rs` edits. You wrote them against the code. For these edits, and only
+> them, you may edit:
+> - `crates/syntax-tree/{Cargo.toml, src/lib.rs, src/flat.rs, src/flat/block.rs}`;
+> - `crates/syntax/{Cargo.toml, src/parsing.rs, src/parsing/reparsing.rs}`.
+> frontend-tree will not touch those files until you tmux `frontend-tree` that you are done.
+> One constraint: `crates/syntax-tree/src/view.rs` reads `FlatTree` through `kind`,
+> `is_token`, `is_lazy`, `parent`, `end`, `range`, `text`, `text_len`, `token_text`, `part`,
+> `len`, `lazy_nodes` and the `pub(crate)` `first_child_or_token`, `next_sibling_or_token`,
+> `prev_sibling_or_token`, `last_child_or_token`, `index`, `first_child`, `next_sibling`,
+> `child_at_range`, `node_at_range`, `last_starting` and `subtree`. Keep those signatures.
+> The RNG request says frontend-deps-items also holds `flat.rs` (window alive, no report), so
+> agree with it first.
+> `crates/syntax/Cargo.toml` already has `blaze-alloc-count` under `[dev-dependencies]`, and
+> `syntax-tree`'s has none yet.
+
 ### `crates/syntax-tree/Cargo.toml`
 
 Add:
@@ -187,6 +217,8 @@ Add:
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 
 ### `crates/syntax-tree/src/lib.rs`
 
@@ -198,6 +230,8 @@ After `#![deny(unsafe_code)]`, add:
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 
 ### `crates/syntax-tree/src/flat/block.rs` (new file)
 
@@ -381,16 +415,9 @@ impl<T: fmt::Debug> fmt::Debug for Col<T> {
 
 #[cfg(test)]
 mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::{room, Block, Col};
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: u64) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) % n
-        }
-    }
 
     /// Columns of every type a tree has, of random lengths, placed in one block in a random
     /// order: each reads back what it was made of (the safe reference: the `Vec`s it was copied
@@ -398,8 +425,8 @@ mod tests {
     #[test]
     fn columns_read_back_what_they_were_made_of() {
         for seed in 0..500 {
-            let mut rng = Rng(seed);
-            let mut len = || rng.below(70) as usize;
+            let mut rng = SplitMix64::new(seed);
+            let mut len = || rng.index(70);
             let words: Vec<u32> = (0..len()).map(|it| it as u32 ^ 0x5a5a_0000).collect();
             let wide: Vec<u64> = (0..len()).map(|it| (it as u64) << 40 | 7).collect();
             let pairs: Vec<(u32, u32)> = (0..len()).map(|it| (it as u32, !(it as u32))).collect();
@@ -407,7 +434,7 @@ mod tests {
             let filled = len();
             let mut order = [0, 1, 2, 3, 4];
             for at in (1..order.len()).rev() {
-                order.swap(at, rng.below(at as u64 + 1) as usize);
+                order.swap(at, rng.index(at + 1));
             }
             let mut size = 0;
             for &it in &order {
@@ -449,6 +476,8 @@ mod tests {
     }
 }
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 
 ### `crates/syntax-tree/src/flat.rs`
 
@@ -1557,6 +1586,8 @@ Everything else in `flat.rs` (every read of a column, `slot`, `between`, `moved`
 hot_lint: the `// alloc:` lines above replace the ones they stand beside today; `Vec::new()` in
 `Buffers::new`, `Packer::new` and `Spare` are empty vectors (no allocation), in `const fn`s.
 
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
+
 ## mem-format-tree: an edit's reparse makes no buffer of its own
 
 Why: on a changed file, `reparsing.rs` makes per-call buffers on every keystroke: two
@@ -1574,6 +1605,9 @@ After this and section 2, a warm edit allocates its trees alone: the reparsed no
 spliced tree's block and its `Arc` (a token's edit: the last two), once the lexer's and parser
 input's columns are on their shelves (`v2/requests/mem-format-tokens.md`).
 
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
+> frontend-tree (2026-10-29): yours to apply, under the grant in section 2.
+
 ### `crates/syntax/Cargo.toml`
 
 Under `[dependencies]`, add (it is a root workspace dependency):
@@ -1581,6 +1615,8 @@ Under `[dependencies]`, add (it is a root workspace dependency):
 ```toml
 blaze-mem.workspace = true
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 
 ### `crates/syntax/src/parsing.rs`, `build_node`
 
@@ -1631,6 +1667,8 @@ after:
     Some((tree, errors))
 }
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 
 ### `crates/syntax/src/parsing/reparsing.rs`
 
@@ -1949,3 +1987,29 @@ slices of `range` of `source`, which the tree shares.`
         }
     }
 ```
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
+
+## dedup: seeded RNG onto blaze_ids::rng
+
+From `dedup-codec-rng-front` (report `/tmp/blaze-lanes/v2-dedup-codec-rng-front.md`). Every seeded test RNG in the front-end crates moves onto `blaze_ids::rng::SplitMix64` (`new`, `next_u64`, `next_u32`, `below(u64)` = `% n` and 0 for 0, `index(usize)`, `one_in`, `coin`, `pick`, `fill`); no test here pins a stream's values, only thresholds, so the local copy goes. The crate already depends on `blaze-ids`.
+
+Two files (also tell `frontend-deps-items`, which holds `flat.rs` too).
+
+`crates/syntax/src/parsing/reparsing.rs`, `mod tests`:
+
+1. Add `use blaze_ids::rng::SplitMix64;` before `use parser::Edition;`.
+2. Delete the doc line `/// A small deterministic generator, for the edits of [`reparse_random_edits`].`, `struct Rng(u64);` and `impl Rng { below }` (~853-863).
+3. `Rng(0x2545_f491_4f6c_dd1d)` (~922) and `Rng(0x9e37_79b9_7f4a_7c15)` (~963) become `SplitMix64::new(..)` with the same literal.
+4. `fn random_edit(rng: &mut Rng, ...)` becomes `rng: &mut SplitMix64`, and its six `rng.below(` become `rng.index(` (the old `below` took `usize` and mapped 0 to 1, as `index` does).
+
+`crates/syntax-tree/src/flat.rs`, `mod tests`:
+
+1. Add `use blaze_ids::rng::SplitMix64;` after the `use std::{...};` group.
+2. Delete `struct Rng(u64);` and `impl Rng { new, below }` (~1726-1737, the LCG; its `new` only stepped the LCG once, which SplitMix64 doesn't need).
+3. Every `Rng::new(` becomes `SplitMix64::new(` (same seeds, the `seed ^ 0x....` XORs kept), and every `&mut Rng` (`make_lazy`, `grow`, the `&mut Rng::new(..)` arguments) becomes `&mut SplitMix64`.
+4. `rng.below(n)` stays (same `u64 -> u64`). Optional: `x[rng.below(x.len() as u64) as usize]` reads better as `x[rng.index(x.len())]`.
+
+> forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
+> frontend-tree (2026-10-29): `reparsing.rs` and `flat.rs` are under the grant to mem-format-tree
+> (section 2), which applies this with its own edits there.

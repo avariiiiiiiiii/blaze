@@ -1,5 +1,7 @@
 //! See [`Output`]
 
+use std::borrow::Cow;
+
 use crate::SyntaxKind;
 
 /// Output of the parser -- a DFS traversal of a concrete syntax tree.
@@ -21,7 +23,8 @@ pub struct Output {
     ///
     /// A lazy node's word is followed by one more, its number of input tokens.
     event: blaze_mem::scratch::Lent<Words>,
-    error: Vec<String>,
+    /// The syntax errors: most are fixed text, borrowed, and only a formatted one is owned.
+    error: Vec<Cow<'static, str>>,
 }
 
 crate::event::per_thread_buffer! {
@@ -100,7 +103,7 @@ impl Output {
             at += 1;
             if event & Self::EVENT_MASK == 0 {
                 return Some(OutlineStep::Step(Step::Error {
-                    msg: self.error[(event as usize) >> Self::ERROR_SHIFT].as_str(),
+                    msg: &self.error[(event as usize) >> Self::ERROR_SHIFT],
                 }));
             }
             let tag = ((event & Self::TAG_MASK) >> Self::TAG_SHIFT) as u8;
@@ -218,7 +221,7 @@ impl Output {
         self.event.push(n_input_tokens);
     }
 
-    pub(crate) fn error(&mut self, error: String) {
+    pub(crate) fn error(&mut self, error: Cow<'static, str>) {
         let idx = self.error.len();
         self.error.push(error);
         let e = (idx as u32) << Self::ERROR_SHIFT;

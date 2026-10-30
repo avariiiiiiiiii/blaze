@@ -202,6 +202,7 @@ pub(super) const BUILTIN: &[Lint] = &[
     )
     .fcw(EditionSemanticsChange(Edition2024, "intoiterator-box-slice")),
     l("drop_bounds", Warn, "bounds of the form `T: Drop` are most likely incorrect"),
+    // dyn: rustc's text of the lint, no trait object
     l("dyn_drop", Warn, "trait objects of the form `dyn Drop` are useless"),
     l("dangling_pointers_from_temporaries", Warn, "detects getting a pointer from a temporary"),
     l(
@@ -380,6 +381,7 @@ pub(super) const BUILTIN: &[Lint] = &[
     l("arithmetic_overflow", Deny, "arithmetic operation overflows").eval_always(),
     l("asm_sub_register", Warn, "using only a subset of a register for inline asm inputs"),
     l("bad_asm_style", Warn, "incorrect use of inline assembly"),
+    // dyn: rustc's text of the lint, no trait object
     l("bare_trait_objects", Warn, "suggest using `dyn Trait` for trait objects")
         .fcw(EditionError(Edition2021, "warnings-promoted-to-error")),
     l(
@@ -861,6 +863,7 @@ pub(super) const BUILTIN: &[Lint] = &[
     l(
         "unused_associated_type_bounds",
         Warn,
+        // dyn: rustc's text of the lint, no trait object
         "detects unused `Foo = Bar` bounds in `dyn Trait<Foo = Bar>`",
     ),
     l("unused_attributes", Warn, "detects attributes that were not used by the compiler"),

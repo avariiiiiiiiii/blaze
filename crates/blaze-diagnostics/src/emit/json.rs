@@ -8,7 +8,7 @@
 use serde::Serialize;
 use smallvec::SmallVec;
 
-use super::{File, Placed, backtrace, codes, originates_in};
+use super::{File, Placed, codes};
 use crate::model::{Applicability, Child, Code, Diag, Expansion, MultiSpan, Span, Suggestion};
 
 #[derive(Serialize)]
@@ -69,7 +69,7 @@ type Backtrace<'a> = SmallVec<[&'a Expansion; 4]>;
 /// children are the ones it was given, without the note on the macro it originates in that
 /// rustc's text emitter adds, then a `help` for each suggestion.
 pub(super) fn line<'a>(diag: &'a Diag, placed: &Placed<'a>, rendered: String) -> String {
-    let added = originates_in(diag);
+    let added = diag.origin_note();
     let suggestions: &'a [Suggestion] = match diag.suggestions_disabled {
         true => &[],
         false => &diag.suggestions,
@@ -122,7 +122,7 @@ fn suggestion<'a>(suggestion: &'a Suggestion, placed: &Placed<'a>) -> Diagnostic
         .iter()
         .flatten()
         .map(|(span, replacement)| {
-            let backtrace: Backtrace<'a> = backtrace(span).collect();
+            let backtrace: Backtrace<'a> = span.macro_backtrace().collect();
             let suggested = Some((replacement.as_str(), suggestion.applicability));
             self::span(&span.file, span.lo, span.hi, true, None, suggested, &backtrace, placed)
         })
@@ -142,7 +142,7 @@ fn spans<'a>(span: &'a MultiSpan, placed: &Placed<'a>) -> Vec<DiagnosticSpan<'a>
     span.span_labels()
         .into_iter()
         .map(|it| {
-            let backtrace: Backtrace<'a> = backtrace(it.span).collect();
+            let backtrace: Backtrace<'a> = it.span.macro_backtrace().collect();
             let at = it.span;
             self::span(&at.file, at.lo, at.hi, it.is_primary, it.label, None, &backtrace, placed)
         })

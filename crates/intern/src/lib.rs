@@ -9,6 +9,7 @@ mod arena;
 mod intern;
 mod intern_slice;
 mod mapped;
+mod space;
 mod symbol;
 mod sync;
 mod table;

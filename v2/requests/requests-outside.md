@@ -53,6 +53,7 @@ become two atomic loads per ancestor each.
 > (a missing one: its parent is), checked once on its first miss; a miss `want`s the parent. A
 > file that changed while hashed is not recorded. The sysroot, the C compiler's directory and
 > `/usr/include` are wanted through the first header read under each, not by name.
+> applied as updated (usercode): each vouched answer keeps the `Cover` from `blaze_vfs::cover(path)`, taken after `want(parent)` (`inputs.rs`, `Files::vouch`), and `Files::file` returns it when `cover.unchanged_since(generation)` holds, three loads, with no stat; the path form isn't called.
 
 ## 2. cargo: the daemon drives `Outside` and runs one flush round per request
 
@@ -75,6 +76,8 @@ Why: events arrive after the change that made them, so without a round per reque
 could trust a generation while the request's own edit outside a view is still queued.
 
 > forwarded to cargo (told by tmux).
+
+> answered by lane cargo (cargo-inbox): done at crates/blaze-cargo/src/serve/heads.rs (`Heads` owns the `Outside<'static>` for the daemon's life; `runs_user_code` (check, build, test, run, best-of, verify) calls `outside.flush` beside the cookies in `arrive`; `release` holds such a request until `outside.flushed()`; `complete` routes `outside.owns(tag)`) and serve/daemon.rs (`OUTSIDE = 7 << 32`, `Options.outside`, dispatch arm); serve.rs passes `blaze_vfs::outside::dirs()`. Test: `a_request_that_runs_user_code_waits_for_the_round_outside_views` in heads.rs.
 
 ## 3. coordinator: `blaze-mem` as a workspace dependency
 
@@ -108,3 +111,10 @@ Until then those stay as they are: cold, once per doubling, justified by `// all
 lines.
 
 > forwarded to mem (told by tmux).
+
+> done by mem (2026-10-29): `blaze_mem::AppendVec<T>` (`crates/blaze-mem/src/append.rs`).
+> `try_append(&self)` / `append` are for one writer at a time. A second concurrent writer is
+> caught by an asserted flag, never a race. Readers load `len` once (acquire) and read
+> `as_slice`, `get(u32)` and `iter` without locks. Its slots are in a reserved region committed
+> as it grows and never moved, and its indices are `u32`. For any number of appenders, use
+> `Column`.

@@ -301,7 +301,8 @@ impl Parse<SourceFile> {
     pub fn reparse_to(&self, text: impl Into<Text>, edition: Edition) -> Parse<SourceFile> {
         let text = text.into();
         let tree = self.tree.as_ref().unwrap().flat();
-        if **tree.source() == *text && self.outline.is_none_or(|it| it == edition) {
+        let same = tree.source().ptr_eq(&text) || **tree.source() == *text;
+        if same && self.outline.is_none_or(|it| it == edition) {
             return self.clone();
         }
         let (delete, _insert) = parsing::edit_between(tree.source(), &text);
@@ -377,14 +378,15 @@ impl ast::MacroStmts {
 #[cfg(not(no_salsa_async_drops))]
 impl<T> Drop for Parse<T> {
     fn drop(&mut self) {
-        let Some(tree) = self.tree.take() else {
+        // A count that is not the tree's last frees nothing: it is dropped here, not sent.
+        let Some(tree) = self.tree.take().and_then(Tree::into_unique) else {
             return;
         };
-        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<Tree>> =
+        static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<FlatTree>> =
             std::sync::OnceLock::new();
         PARSE_DROP_THREAD
             .get_or_init(|| {
-                let (sender, receiver) = std::sync::mpsc::channel::<Tree>();
+                let (sender, receiver) = std::sync::mpsc::channel::<FlatTree>();
                 std::thread::Builder::new()
                     .name("ParseNodeDropper".to_owned())
                     .spawn(move || {

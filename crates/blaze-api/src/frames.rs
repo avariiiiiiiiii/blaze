@@ -123,14 +123,17 @@ impl Frames {
     /// The length the next frame declares, once its head is here.
     fn declared(&mut self) -> Result<Option<usize>, ApiError> {
         if let Some(error) = &self.broken {
+            // clone: error path, a stream hung up on refuses every later read.
             return Err(error.clone());
         }
         let Some(len) = self.length() else { return Ok(None) };
         if len > LONGEST_REQUEST {
-            let error =
-                ApiError::new(format!("a frame of {len} bytes, longer than {LONGEST_REQUEST}"), None);
+            // alloc: error path, a peer's frame too long; the stream is hung up on.
+            let said = format!("a frame of {len} bytes, longer than {LONGEST_REQUEST}");
+            let error = ApiError::new(said, None);
+            // clone: error path, once per stream hung up on.
             self.broken = Some(error.clone());
-            self.bytes = Vec::new();
+            drop(std::mem::take(&mut self.bytes));
             self.at = 0;
             self.end = 0;
             return Err(error);
@@ -149,7 +152,7 @@ impl Frames {
 }
 
 /// Why an item was refused, with the envelope's id when it could be read.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Refused {
     pub id: Option<u64>,
     pub error: ApiError,
@@ -179,16 +182,19 @@ pub(crate) fn head(item: &[u8]) -> Result<(u32, u64), Refused> {
 }
 
 fn wrong_schema(schema: u32, id: u64) -> Refused {
+    // alloc: error path, an envelope of another schema.
     let error = ApiError::new(format!("schema {schema}, this daemon speaks {SCHEMA}"), None);
     Refused { id: Some(id), error }
 }
 
 fn undecodable(error: &cbor::Error) -> ApiError {
+    // alloc: error path, an envelope that does not decode.
     ApiError::new(format!("an envelope that does not decode: {error}"), None)
 }
 
 /// `envelope` in deterministic CBOR, framed (4-byte big-endian length, then the item).
 pub fn encode<T: Serialize>(envelope: &Envelope<T>) -> Result<Vec<u8>, ApiError> {
+    // alloc: the frame is handed out; `encode_into` writes onto a buffer the caller keeps.
     let mut frame = Vec::new();
     encode_into(&mut cbor::Writer::new(), &mut frame, envelope)?;
     Ok(frame)
@@ -233,11 +239,13 @@ pub(crate) fn item_into<T: Serialize>(
     })();
     if let Err(error) = written {
         out.truncate(start);
+        // alloc: error path, a value with no encoding.
         return Err(ApiError::new(format!("an envelope with no encoding: {error}"), None));
     }
     let len = out.len() - start;
     if len > blaze_protocol::LONGEST_FRAME as usize {
         out.truncate(start);
+        // alloc: error path, a frame too long to send.
         let said = format!("a frame of {len} bytes, longer than {}", blaze_protocol::LONGEST_FRAME);
         return Err(ApiError::new(said, None));
     }

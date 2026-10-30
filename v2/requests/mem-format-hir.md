@@ -579,6 +579,8 @@ Edits, in order:
 
 The tests are the last section.
 
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+
 ## mem-format-hir: `finish`'s stable sorts without a heap buffer (`expr_store/source_map.rs`)
 
 Holder: speed-hir-store (window `speed-hir-store-next1`; `source_map.rs` is also in
@@ -765,6 +767,8 @@ warm call must allocate only the table:
 `SplitMix64`, `seeded_src`, `src`, `RawIdx`, `ExprId` and `SyntaxKind` are already in scope in
 that module. `SourceTable` and `IdTable` derive `PartialEq` and `Debug`.
 
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+
 ## mem-format-hir: the record columns and names in the store's slab (`hir.rs`, `hir/columns.rs`)
 
 Holder: `hir.rs` and `hir/columns.rs` are speed-hir-store's and its paths children's (windows
@@ -816,6 +820,8 @@ buffer, which is speed-hir-store's queued "borrowed decode columns".
 
 Test: `a_warm_store_is_its_blocks_and_nothing_else` (last section) checks
 `columns.arms.in_slab()`.
+
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 
 ## mem-format-hir: allocation-budget tests for lowering (`expr_store.rs` `scratch_tests`)
 
@@ -912,6 +918,8 @@ What they hold:
   if paths adds a block there, the count is that block more and the comment says which.
 - `expr_store/tests/alloc.rs` (speed-hir-store's) already holds reading a body, a memo hit and
   a scope lookup to 0.
+
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 
 ## mem-format-hir: `Words` on per-thread scratch, names without a `Box<str>` each (`hir/persist.rs`)
 
@@ -1115,6 +1123,8 @@ Test, in this file's `tests`:
         blaze_alloc_count::assert_at_most(0, "names on warm words", name_all);
     }
 ```
+
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 
 ## mem-format-hir: a store's and a body's encode on per-thread scratch (`expr_store/persist.rs`)
 
@@ -1384,3 +1394,5 @@ a path's or literal's `put`). That allocation is the finding, and goes in the ho
 The source maps' encode (`expr_store/persist/source_map.rs`) is not in this section. It
 collects its key and value columns the same way and gets the same treatment, with one kept
 buffer per record type, once srcmap's schema 4 is settled.
+
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).

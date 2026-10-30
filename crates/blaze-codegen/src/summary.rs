@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 
+use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, Hasher};
 use serde::{Deserialize, Serialize};
 
@@ -43,10 +44,10 @@ impl Arg {
     /// Its bytes in [`Imports::blob_key`]: a tag, the width and the value, 10 in all.
     fn encode(self, out: &mut Vec<u8>) {
         match self {
-            Arg::Unknown => out.extend_from_slice(&[0; 10]),
+            Arg::Unknown => out.put_bytes(&[0; 10]),
             Arg::Int { bits, value } => {
-                out.extend_from_slice(&[1, bits]);
-                out.extend_from_slice(&value.to_le_bytes());
+                out.put_bytes(&[1, bits]);
+                out.put_u64(value);
             }
         }
     }
@@ -151,7 +152,7 @@ impl Imports {
     /// every field laid out in a buffer the thread reuses.
     pub fn blob_key(&self, key: InstanceKey) -> ContentId {
         thread_local! {
-            static BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+            static BYTES: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) }; // alloc: empty, the buffer the thread reuses
         }
         BYTES.with_borrow_mut(|bytes| {
             bytes.clear();
@@ -165,29 +166,28 @@ impl Imports {
     /// Every field, each list as its length then its elements at fixed widths, little-endian:
     /// two different `Imports` never give the same bytes.
     fn encode(&self, out: &mut Vec<u8>) {
-        let len = |n: usize| (n as u32).to_le_bytes();
         let dead: usize = self.dead.iter().map(|it| 36 + 4 * it.1.len()).sum();
         out.reserve(16 + 32 * self.imported.len() + 14 * self.constants.len() + 33 * self.callees.len() + dead);
-        out.extend_from_slice(&len(self.imported.len()));
+        out.put_u32(self.imported.len() as u32);
         for key in &self.imported {
-            out.extend_from_slice(&key.0.0);
+            out.put_bytes(&key.0.0);
         }
-        out.extend_from_slice(&len(self.constants.len()));
+        out.put_u32(self.constants.len() as u32);
         for &(param, arg) in &self.constants {
-            out.extend_from_slice(&param.to_le_bytes());
+            out.put_u32(param);
             arg.encode(out);
         }
-        out.extend_from_slice(&len(self.callees.len()));
+        out.put_u32(self.callees.len() as u32);
         for (key, attrs) in &self.callees {
-            out.extend_from_slice(&key.0.0);
-            out.push(attrs.bits());
+            out.put_bytes(&key.0.0);
+            out.put_u8(attrs.bits());
         }
-        out.extend_from_slice(&len(self.dead.len()));
+        out.put_u32(self.dead.len() as u32);
         for (key, params) in &self.dead {
-            out.extend_from_slice(&key.0.0);
-            out.extend_from_slice(&len(params.len()));
+            out.put_bytes(&key.0.0);
+            out.put_u32(params.len() as u32);
             for param in params {
-                out.extend_from_slice(&param.to_le_bytes());
+                out.put_u32(*param);
             }
         }
     }

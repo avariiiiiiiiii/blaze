@@ -50,6 +50,37 @@ fn filled_holds_exactly_the_bits_below_its_size() {
     }
 }
 
+/// A set in a frame's `Vec` grows, resets and truncates like a [`BitSet`] given the same
+/// members.
+#[test]
+fn a_set_in_an_allocators_vec_matches_a_bitset() {
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Intern).expect("reserve");
+    let mut rng = SplitMix64::new(0x5851_f42d_4c95_7f2d);
+    let mut held: Bits<Vec<u64, &blaze_mem::Frame>, u32> = Bits::from_words(Vec::new_in(&frame));
+    let mut plain = BitSet::<u32>::default();
+    for round in 0..64 {
+        for _ in 0..200 {
+            let at = rng.index(5000) as u32;
+            assert_eq!(held.insert_growing(at), plain.insert_growing(at));
+        }
+        assert_eq!(held.words(), plain.words());
+        match round % 3 {
+            0 => {
+                let len = rng.index(5000);
+                held.truncate(len);
+                plain.truncate(len);
+            }
+            1 => {
+                held.reset(64 * (round + 1));
+                plain.reset(64 * (round + 1));
+            }
+            _ => {}
+        }
+        assert_eq!(held.words(), plain.words());
+        assert_eq!(held.iter().collect::<Vec<_>>(), plain.iter().collect::<Vec<_>>());
+    }
+}
+
 #[test]
 fn ranges_match_a_bit_at_a_time() {
     let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
@@ -142,6 +173,35 @@ fn matrix_rows_are_independent() {
     m.reset(2, 10);
     assert_eq!((m.rows(), m.row_words(), m.words().len()), (2, 1, 2));
     assert!(m.row(1).is_empty());
+}
+
+/// A matrix over words held elsewhere (borrowck's frame slices) works as an owned one, in the
+/// same words.
+#[test]
+fn borrowed_matrix_is_the_owned_one() {
+    let mut owned = BitMatrix::<u32>::new(3, 70);
+    let mut words = [0u64; 6];
+    let mut borrowed = BitMatrix::<u32, &mut [u64]>::from_words(3, 70, &mut words[..]);
+    for (row, at) in [(1, 69), (2, 0), (0, 64)] {
+        assert_eq!(owned.insert(row, at), borrowed.insert(row, at));
+    }
+    assert_eq!(owned.union_rows(0, 2), borrowed.union_rows(0, 2));
+    assert_eq!(owned.union_rows(2, 1), borrowed.union_rows(2, 1));
+    assert!(borrowed.remove(0, 64) && owned.remove(0, 64));
+    assert_eq!(owned.words(), borrowed.words());
+    assert_eq!(borrowed.iter_row(2).collect::<Vec<_>>(), vec![0, 69]);
+    assert_eq!(format!("{owned:?}"), format!("{borrowed:?}"));
+    borrowed.clear();
+    assert!(borrowed.row(2).is_empty());
+    assert_eq!(BitMatrix::<u32, &[u64]>::from_words(3, 70, &words[..]).words(), &[0; 6]);
+    assert_eq!(BitMatrix::<u32, &[u64]>::default().rows(), 0);
+}
+
+#[test]
+#[should_panic(expected = "2 rows of 70 bits in 3 words")]
+fn borrowed_matrix_needs_its_words_exactly() {
+    let words = [0u64; 3];
+    BitMatrix::<usize, &[u64]>::from_words(2, 70, &words[..]);
 }
 
 /// blaze-v2-proof's trace columns: bits on both sides of a word boundary.
@@ -350,7 +410,10 @@ fn reads_and_writes_allocate_nothing() {
     let mut b = BitSet::<u32>::new(1000);
     let mut m = BitMatrix::<u32>::new(4, 1000);
     let ranked = Ranked::from_bools((0..1000).map(|it| it % 7 == 0));
+    let mut frame = [0u64; 32];
     blaze_alloc_count::assert_at_most(0, "bit set reads and writes", || {
+        let mut held = BitMatrix::<u32, &mut [u64]>::from_words(2, 1000, &mut frame[..]);
+        assert!(held.insert(1, 999) && held.union_rows(0, 1) && held.contains(0, 999));
         for at in (0..1000).step_by(3) {
             a.insert(at);
             b.insert_growing(at + 1);

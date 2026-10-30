@@ -11,6 +11,7 @@ use std::{
 };
 
 use base_db::{Db, BuiltDependency, Crate, CrateOrigin, LangCrateOrigin};
+use blaze_mem::Tag;
 use cfg::{CfgAtom, CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
@@ -148,7 +149,7 @@ pub(super) fn collect_defs(
 /// reads them in the round's order.
 fn expand_all(db: &Db, krate: Crate, calls: &[MacroCallId]) {
     if calls.len() > 1 {
-        db.run_all(calls.len(), |db, at| {
+        db.run_all(Tag::Expand, calls.len(), |db, at| {
             file_item_tree(db, calls[at].into(), krate);
         });
     }
@@ -900,7 +901,7 @@ impl<'db> DefCollector<'db> {
         // the crates are not used. The def maps are collected as one batch of the database's
         // tasks, then put in the extern prelude in the order of the dependencies.
         if prelude.len() > 1 {
-            self.db.run_all(prelude.len(), |db, at| {
+            self.db.run_all(Tag::Nameres, prelude.len(), |db, at| {
                 crate_def_map(db, prelude[at].1);
             });
         }
@@ -1840,10 +1841,8 @@ impl<'db> DefCollector<'db> {
                         self.push_res_and_update_glob_vis(module_id, &name, res, vis, import);
                 }
                 None => {
-                    let (tr, import) = match res.take_types_full() {
-                        Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import }) => {
-                            (tr, import)
-                        }
+                    let tr = match res.take_types_full() {
+                        Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import: _ }) => tr,
                         Some(other) => {
                             tracing::debug!("non-trait `_` import of {:?}", other);
                             continue;
@@ -1871,11 +1870,9 @@ impl<'db> DefCollector<'db> {
 
                     if should_update {
                         changed = true;
-                        self.def_map.modules.building()[module_id].scope_mut().push_unnamed_trait(
-                            tr,
-                            vis,
-                            import.and_then(ImportOrExternCrate::import),
-                        );
+                        self.def_map.modules.building()[module_id]
+                            .scope_mut()
+                            .push_unnamed_trait_through(tr, vis, import);
                     }
                 }
             }
@@ -1949,8 +1946,7 @@ impl<'db> DefCollector<'db> {
         glob: GlobId,
         vis: Visibility,
     ) {
-        // clone: a `Name` is an interned symbol; the record keeps it.
-        let it = GlobAmbiguity { name: name.clone(), other, glob, vis };
+        let it = GlobAmbiguity { name: *name, other, glob, vis };
         self.def_map.modules.building()[module_id].scope_mut().push_glob_ambiguity(it);
     }
 

@@ -62,7 +62,7 @@ fn ui(style: Style) -> Style {
 }
 
 /// What rustc writes to stderr for `diags`: each, then its closing ones.
-fn stderr(diags: &[Diag], sources: &mut Sources, style: Style) -> String {
+fn stderr(diags: &[Diag], sources: &Sources, style: Style) -> String {
     let closing = emit::summary(diags);
     let out: String =
         diags.iter().chain(&closing).map(|it| emit::written(it, sources, ui(style))).collect();
@@ -70,7 +70,7 @@ fn stderr(diags: &[Diag], sources: &mut Sources, style: Style) -> String {
 }
 
 /// What rustc writes to stderr for `diags` with `--error-format=json`.
-fn json(diags: &[Diag], sources: &mut Sources, style: Style) -> String {
+fn json(diags: &[Diag], sources: &Sources, style: Style) -> String {
     let closing = emit::summary(diags);
     let out: String = diags
         .iter()
@@ -145,7 +145,7 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0425`.
 "#,
     );
-    assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&[diag], &File::sources(&[&file]), Style::default()), expected);
 }
 
 // tests/ui/error-codes/E0408.rs
@@ -182,7 +182,7 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0408`.
 "#,
     );
-    assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&[diag], &File::sources(&[&file]), Style::default()), expected);
 }
 
 // tests/ui/error-codes/E0428.rs
@@ -224,7 +224,7 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0428`.
 "#,
     );
-    assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&[diag], &File::sources(&[&file]), Style::default()), expected);
 }
 
 // tests/ui/mismatched_types/numeric-literal-cast.rs: labels under one line and under a callee
@@ -334,7 +334,7 @@ error: aborting due to 3 previous errors
 For more information about this error, try `rustc --explain E0308`.
 "#,
     );
-    assert_eq!(stderr(&diags, &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&diags, &File::sources(&[&file]), Style::default()), expected);
 }
 
 // tests/ui/return/tail-expr-if-as-return.rs
@@ -372,7 +372,7 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0308`.
 "#,
     );
-    assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&[diag], &File::sources(&[&file]), Style::default()), expected);
 }
 
 // tests/ui/annotate-snippet/multiple-files.rs, with its auxiliary/other_file.rs
@@ -422,7 +422,7 @@ error: aborting due to 1 previous error
 For more information about this error, try `rustc --explain E0624`.
 "#,
     );
-    assert_eq!(stderr(&[diag], &mut File::sources(&[&main, &other]), Style::default()), expected);
+    assert_eq!(stderr(&[diag], &File::sources(&[&main, &other]), Style::default()), expected);
 }
 
 // tests/ui/rust-2024/unsafe-extern-blocks/extern-items-unsafe.rs, edition 2024
@@ -493,7 +493,7 @@ error: aborting due to 2 previous errors
 For more information about this error, try `rustc --explain E0133`.
 "#,
     );
-    assert_eq!(stderr(&[first, second], &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&[first, second], &File::sources(&[&file]), Style::default()), expected);
 }
 
 // tests/ui/macros/macro-path-prelude-fail-4.rs: a help with a span, then one of two lines
@@ -529,7 +529,7 @@ error: aborting due to 1 previous error
 
 "#,
     );
-    assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&[diag], &File::sources(&[&file]), Style::default()), expected);
 }
 
 // tests/ui/generics/issue-59508.rs: two primary spans in a secondary one, and a suggestion
@@ -581,7 +581,7 @@ error: aborting due to 1 previous error
 
 "#,
     );
-    assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&[diag], &File::sources(&[&file]), Style::default()), expected);
 }
 
 // tests/ui/did_you_mean/issue-56028-there-is-an-enum-variant.rs, its first error: several
@@ -653,7 +653,7 @@ LL + fn setup() -> PutDown { Set }
 
 "#,
     );
-    let written = emit::written(&diag, &mut File::sources(&[&file]), ui(Style::default()));
+    let written = emit::written(&diag, &File::sources(&[&file]), ui(Style::default()));
     assert_eq!(compiletest(&written, false), expected);
 }
 
@@ -699,7 +699,7 @@ warning: 1 warning emitted
 
 "#,
     );
-    assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
+    assert_eq!(stderr(&[diag], &File::sources(&[&file]), Style::default()), expected);
 }
 
 const MACRO: &str = r#"macro_rules! g {
@@ -753,12 +753,12 @@ error: aborting due to 1 previous error
 
 "#,
     );
-    let mut sources = File::sources(&[&file]);
-    assert_eq!(stderr(&[in_a_macro(&file)], &mut sources, Style::default()), expected);
+    let sources = File::sources(&[&file]);
+    assert_eq!(stderr(&[in_a_macro(&file)], &sources, Style::default()), expected);
     // The note is written once when the diagnostic has it already, as `check` gives it.
     let mut noted = in_a_macro(&file);
     noted.originates_in();
-    assert_eq!(stderr(&[noted], &mut sources, Style::default()), expected);
+    assert_eq!(stderr(&[noted], &sources, Style::default()), expected);
 }
 
 #[test]
@@ -766,7 +766,7 @@ fn a_macro_expansion_in_json() {
     let file = File::new("issue-6596-2.rs", MACRO);
     let mut noted = in_a_macro(&file);
     noted.originates_in();
-    let line = emit::json(&noted, &mut File::sources(&[&file]), Style::default());
+    let line = emit::json(&noted, &File::sources(&[&file]), Style::default());
     let value: serde_json::Value = serde_json::from_str(&line).unwrap();
     // The note rustc's text emitter adds is not one of its children.
     assert_eq!(value["children"], serde_json::json!([]));
@@ -824,7 +824,7 @@ error: aborting due to 2 previous errors
 "#,
     );
     let short = Style { short: true, ..Style::default() };
-    assert_eq!(stderr(&[mismatch, method], &mut File::sources(&[&file]), short), expected);
+    assert_eq!(stderr(&[mismatch, method], &File::sources(&[&file]), short), expected);
 }
 
 // tests/ui/json/multibyte-rendered-ansi-issue-157148.rs: a lint's JSON with a note and a
@@ -883,7 +883,7 @@ fn main() {
 "##,
     );
     let ansi_json = Style { ansi: true, ..Style::default() };
-    let out = json(&[diag], &mut File::sources(&[&file]), ansi_json);
+    let out = json(&[diag], &File::sources(&[&file]), ansi_json);
     assert_eq!(ansi(&out), expected);
 }
 
@@ -898,7 +898,7 @@ fn colour_codes_are_rustcs() {
     diag.span_label(at.clone(), "not found in this scope");
     diag.span_note(at, "here");
     let style = ui(Style { ansi: true, ..Style::default() });
-    let rendered = emit::written(&diag, &mut File::sources(&[&file]), style);
+    let rendered = emit::written(&diag, &File::sources(&[&file]), style);
     let lines: Vec<&str> = rendered.lines().collect();
     assert_eq!(
         lines[0],
@@ -906,10 +906,10 @@ fn colour_codes_are_rustcs() {
     );
     assert_eq!(lines[1], "  \x1b[1m\x1b[94m--> \x1b[0m$DIR/E0412.rs:1:6");
     assert!(lines.iter().any(|it| *it == "\x1b[1m\x1b[92mnote\x1b[0m: here"), "{rendered:?}");
-    let warned = emit::written(&Diag::new(Level::Warning, None, "1 warning emitted"), &mut File::sources(&[]), style);
+    let warned = emit::written(&Diag::new(Level::Warning, None, "1 warning emitted"), &File::sources(&[]), style);
     assert_eq!(warned, "\x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: 1 warning emitted\x1b[0m\n\n");
     let failure = Diag::new(Level::FailureNote, None, "For more information about this error, try `rustc --explain E0425`.");
-    let written = emit::written(&failure, &mut File::sources(&[]), style);
+    let written = emit::written(&failure, &File::sources(&[]), style);
     assert_eq!(written, "\x1b[1mFor more information about this error, try `rustc --explain E0425`.\x1b[0m\n");
 }
 
@@ -950,7 +950,7 @@ LL |     let x = 1;
 
 "}"##,
     );
-    let line = emit::json(&diag, &mut File::sources(&[&file]), ui(Style::default()));
+    let line = emit::json(&diag, &File::sources(&[&file]), ui(Style::default()));
     assert_eq!(compiletest(&line, true), expected);
 }
 
@@ -975,7 +975,7 @@ fn json_short_at_the_end_of_a_file() {
     )
     .replace("EXPLANATION", &explained("E0601"));
     let short = Style { short: true, ..Style::default() };
-    assert_eq!(json(&[diag], &mut File::sources(&[&file]), short), expected);
+    assert_eq!(json(&[diag], &File::sources(&[&file]), short), expected);
 }
 
 // tests/ui/json/json-bom-plus-crlf.rs: byte offsets of the file as read, lines and columns of
@@ -1068,7 +1068,7 @@ fn json_of_a_file_with_a_bom_and_crlf() {
     )
     .replace("EXPLANATION", &explained("E0308"));
     let short = Style { short: true, ..Style::default() };
-    assert_eq!(json(&diags, &mut File::sources(&[&file]), short), expected);
+    assert_eq!(json(&diags, &File::sources(&[&file]), short), expected);
 }
 
 /// A child with no span has none in JSON, and a failure note's line, from rustc's `json.rs`.
@@ -1077,9 +1077,9 @@ fn json_of_children_without_spans_and_of_a_failure_note() {
     let file = File::new("lib.rs", "fn f() {}\n");
     let mut diag = Diag::error(Some("E0308"), "mismatched types", file.at(3, 4));
     diag.note("a note\nof two lines");
-    let mut sources = File::sources(&[&file]);
-    let line = emit::json(&diag, &mut sources, Style::default());
-    let written = emit::written(&diag, &mut sources, Style::default());
+    let sources = File::sources(&[&file]);
+    let line = emit::json(&diag, &sources, Style::default());
+    let written = emit::written(&diag, &sources, Style::default());
     let value: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(
         value["children"],
@@ -1101,16 +1101,16 @@ fn json_of_children_without_spans_and_of_a_failure_note() {
 
     let failure = &emit::summary(&[diag])[1];
     assert_eq!(
-        emit::json(failure, &mut File::sources(&[]), Style::default()),
+        emit::json(failure, &File::sources(&[]), Style::default()),
         r#"{"$message_type":"diagnostic","message":"For more information about this error, try `rustc --explain E0308`.","code":null,"level":"failure-note","spans":[],"children":[],"rendered":"For more information about this error, try `rustc --explain E0308`.\n"}"#
     );
     let short = Style { short: true, ..Style::default() };
-    assert_eq!(emit::json(failure, &mut File::sources(&[]), short), "");
-    assert_eq!(emit::written(failure, &mut File::sources(&[]), short), "");
+    assert_eq!(emit::json(failure, &File::sources(&[]), short), "");
+    assert_eq!(emit::written(failure, &File::sources(&[]), short), "");
     // Only the notes naming codes to explain are left out of short; another failure note is
     // written as one.
     let other = Diag::new(Level::FailureNote, None, "query stack during panic:");
-    assert_eq!(emit::written(&other, &mut File::sources(&[]), short), "query stack during panic:\n");
+    assert_eq!(emit::written(&other, &File::sources(&[]), short), "query stack during panic:\n");
 }
 
 /// A suggestion to remove a whole line removes its newline too, in JSON.
@@ -1125,7 +1125,7 @@ fn json_of_removing_a_line_takes_its_newline() {
         Applicability::MachineApplicable,
         SuggestionStyle::HideCodeInline,
     );
-    let out = emit::json(&diag, &mut File::sources(&[&file]), Style::default());
+    let out = emit::json(&diag, &File::sources(&[&file]), Style::default());
     let value: serde_json::Value = serde_json::from_str(&out).unwrap();
     let removed = &value["children"][0]["spans"][0];
     assert_eq!(removed["byte_start"], 0);
@@ -1216,9 +1216,9 @@ fn the_closing_lines_name_the_codes_with_explanations() {
 fn the_closing_lines_are_written_as_rustc_writes_them() {
     let diags = [error(Some("E0308"))];
     let closing = emit::summary(&diags);
-    let mut sources = File::sources(&[]);
+    let sources = File::sources(&[]);
     let written: Vec<String> =
-        closing.iter().map(|it| emit::written(it, &mut sources, Style::default())).collect();
+        closing.iter().map(|it| emit::written(it, &sources, Style::default())).collect();
     assert_eq!(
         written,
         [
@@ -1228,7 +1228,7 @@ fn the_closing_lines_are_written_as_rustc_writes_them() {
     );
     let short = Style { short: true, ..Style::default() };
     let written: Vec<String> =
-        closing.iter().map(|it| emit::written(it, &mut sources, short)).collect();
+        closing.iter().map(|it| emit::written(it, &sources, short)).collect();
     assert_eq!(written, ["error: aborting due to 1 previous error\n", ""]);
 }
 
@@ -1236,10 +1236,10 @@ fn the_closing_lines_are_written_as_rustc_writes_them() {
 fn rendered_is_written_without_its_empty_line() {
     let file = File::new("lib.rs", "fn f() {}\n");
     let diag = Diag::error(Some("E0308"), "mismatched types", file.span("f"));
-    let mut sources = File::sources(&[&file]);
-    let rendered = emit::rendered(&diag, &mut sources, Style::default());
+    let sources = File::sources(&[&file]);
+    let rendered = emit::rendered(&diag, &sources, Style::default());
     assert_eq!(rendered, "error[E0308]: mismatched types\n --> lib.rs:1:4\n  |\n1 | fn f() {}\n  |    ^");
-    assert_eq!(emit::written(&diag, &mut sources, Style::default()), format!("{rendered}\n\n"));
+    assert_eq!(emit::written(&diag, &sources, Style::default()), format!("{rendered}\n\n"));
 }
 
 #[test]

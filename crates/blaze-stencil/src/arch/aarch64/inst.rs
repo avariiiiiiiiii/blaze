@@ -295,7 +295,7 @@ pub(super) const fn imm12(imm: u64) -> Option<(u16, bool)> {
 
 /// `value` into `rd`: a `movz` (or a `movn` where more halfwords are all ones) and a `movk`
 /// for each other halfword that differs, at most four instructions.
-pub(super) fn mov_imm(buf: &mut Buf, rd: u8, value: u64) {
+pub(super) fn mov_imm(buf: &mut Buf<'_>, rd: u8, value: u64) {
     let half = |hw: u8| (value >> (u32::from(hw) * 16)) as u16;
     let zeros = (0..4).filter(|hw| half(*hw) == 0).count();
     let ones = (0..4).filter(|hw| half(*hw) == 0xffff).count();
@@ -327,7 +327,7 @@ pub(super) const LDST_MAX: u32 = 12;
 /// picks: the unscaled one below 256, the scaled one where the offset is a multiple of the
 /// access size below 4096 of them, and otherwise the offset put in `tmp` and the
 /// register form (`sxtx`). `tmp` must be neither `rn` nor (for a store) `rt`.
-pub(super) fn ldst(buf: &mut Buf, op: Mem, rt: u8, rn: u8, off: u32, tmp: u8) {
+pub(super) fn ldst(buf: &mut Buf<'_>, op: Mem, rt: u8, rn: u8, off: u32, tmp: u8) {
     if off < 256 {
         buf.put4(ldur(op, rt, rn, off as i32));
     } else if let Some(word) = ldst_scaled(op, rt, rn, off) {
@@ -352,7 +352,7 @@ pub(super) const ADD_ANY_MAX: u32 = 20;
 /// `rd = rn ± imm` for any `imm`, as Cranelift's `gen_add_imm` and `gen_sp_reg_adjust` write
 /// it: one immediate `add`/`sub`, or the constant put in `tmp` and an extended-register
 /// one. `rd` and `rn` may be `sp`; `tmp` may be neither.
-pub(super) fn add_any(buf: &mut Buf, rd: u8, rn: u8, imm: u64, sub: bool, tmp: u8) {
+pub(super) fn add_any(buf: &mut Buf<'_>, rd: u8, rn: u8, imm: u64, sub: bool, tmp: u8) {
     match imm12(imm) {
         Some((imm12, shift12)) => buf.put4(add_imm(rd, rn, imm12, shift12, sub)),
         None => {

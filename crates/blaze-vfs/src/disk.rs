@@ -9,6 +9,7 @@
 //! and the next image merges both into one sorted column again.
 
 use blaze_core::{Cursor, FileName, Names, Stamp};
+use blaze_format::cursor::{self, Put as _, Reader, Wanted};
 use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
@@ -245,11 +246,6 @@ pub(crate) struct Disks {
     pub(crate) by_head: FxHashMap<Box<str>, Disk>,
 }
 
-fn put(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&u32::try_from(bytes.len()).expect("under 4 GiB").to_le_bytes());
-    out.extend_from_slice(bytes);
-}
-
 impl Disks {
     /// The disk of `head` watching `dir`: kept if it watched `dir`, else a new one.
     pub(crate) fn of(&mut self, head: &str, dir: &FileName) -> &mut Disk {
@@ -271,78 +267,74 @@ impl Disks {
     /// of names, its names' length, each name's end (past its NUL), each stamp, the names, each
     /// with a NUL after it.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&MAGIC);
+        out.put_bytes(&MAGIC);
         // alloc: once per image written.
         let mut heads: Vec<&Box<str>> = self.by_head.keys().collect();
         heads.sort_unstable();
-        out.extend_from_slice(&(heads.len() as u32).to_le_bytes());
+        out.put_u32(heads.len() as u32);
         // alloc: once per image written, reused per disk.
         let (mut ends, mut stamps, mut names) = (Vec::new(), Vec::new(), Vec::new());
         for head in heads {
             let disk = &self.by_head[head];
-            put(out, head.as_bytes());
-            put(out, disk.dir.as_str().as_bytes());
+            out.put_bytes_u32(head.as_bytes());
+            out.put_bytes_u32(disk.dir.as_str().as_bytes());
             disk.cursor.encode(out);
-            out.push(u8::from(disk.root.is_some()));
-            out.extend_from_slice(&disk.root.unwrap_or_default().0);
+            out.put_u8(u8::from(disk.root.is_some()));
+            out.put_bytes(&disk.root.unwrap_or_default().0);
             (ends.clear(), stamps.clear(), names.clear());
             let mut count = 0u32;
             disk.under(disk.dir.as_str(), |name, stamp| {
-                names.extend_from_slice(name.as_bytes());
-                names.push(0);
-                ends.extend_from_slice(&(names.len() as u32).to_le_bytes());
+                names.put_cstr(name.as_bytes());
+                ends.put_u32(names.len() as u32);
                 stamp.encode(&mut stamps);
                 count += 1;
             });
-            out.extend_from_slice(&count.to_le_bytes());
-            out.extend_from_slice(&u32::try_from(names.len()).expect("under 4 GiB").to_le_bytes());
-            out.extend_from_slice(&ends);
-            out.extend_from_slice(&stamps);
-            out.extend_from_slice(&names);
+            out.put_u32(count);
+            out.put_u32(u32::try_from(names.len()).expect("under 4 GiB"));
+            out.put_bytes(&ends);
+            out.put_bytes(&stamps);
+            out.put_bytes(&names);
         }
     }
 
     /// The disks of an image's section, read in place: every length, end and name is checked
     /// once here (bounds, order, UTF-8), so reads after never fail.
     pub(crate) fn open(section: Section) -> Result<Disks, String> {
+        fn bad(what: &str) -> String {
+            // alloc: an error path.
+            format!("the VFS image's disks section: {what}")
+        }
+        fn cut(_: cursor::Error) -> String {
+            bad("cut short")
+        }
+        fn text<'a>(read: &mut Reader<'a>) -> Result<&'a str, String> {
+            read.str_u32().map_err(|error| match error.wanted {
+                Wanted::Utf8 { .. } => bad("a name that is not UTF-8"),
+                _ => bad("cut short"),
+            })
+        }
         let bytes = section.bytes();
-        // alloc: an error path.
-        let bad = |what: &str| format!("the VFS image's disks section: {what}");
-        if bytes.get(..4) != Some(&MAGIC[..]) {
+        let mut read = Reader::new(bytes);
+        if read.array::<4>().ok() != Some(&MAGIC) {
             return Err(bad("no magic"));
         }
-        let mut at = 4;
-        let word = |at: &mut usize| -> Result<usize, String> {
-            let word = bytes.get(*at..*at + 4).ok_or_else(|| bad("cut short"))?;
-            *at += 4;
-            Ok(u32::from_le_bytes(word.try_into().expect("4 bytes")) as usize)
-        };
-        let text = |at: &mut usize| -> Result<&str, String> {
-            let len = word(at)?;
-            let text = bytes.get(*at..*at + len).ok_or_else(|| bad("cut short"))?;
-            *at += len;
-            std::str::from_utf8(text).map_err(|_| bad("a name that is not UTF-8"))
-        };
         let mut disks = Disks::default();
-        for _ in 0..word(&mut at)? {
-            let head = text(&mut at)?;
-            let dir = FileName::new(text(&mut at)?).ok_or_else(|| bad("a directory that is no name"))?;
-            let cursor = bytes.get(at..).and_then(Cursor::decode).ok_or_else(|| bad("a bad cursor"))?;
-            at += Cursor::BYTES;
-            let root = match bytes.get(at..at + 33).ok_or_else(|| bad("cut short"))? {
+        for _ in 0..read.u32().map_err(cut)? {
+            let head = text(&mut read)?;
+            let dir = FileName::new(text(&mut read)?).ok_or_else(|| bad("a directory that is no name"))?;
+            let cursor = Cursor::decode(read.remaining()).ok_or_else(|| bad("a bad cursor"))?;
+            read.skip(Cursor::BYTES).map_err(cut)?;
+            let root = match read.array::<33>().map_err(cut)? {
                 [0, ..] => None,
-                [1, id @ ..] => Some(ContentId(id.try_into().expect("32 bytes"))),
+                [1, id @ ..] => Some(ContentId(*id)),
                 _ => return Err(bad("a bad root")),
             };
-            at += 33;
-            let count = word(&mut at)?;
-            let names_len = word(&mut at)?;
-            let (ends, stamps) = (at, at + count * 4);
+            let count = read.u32().map_err(cut)? as usize;
+            let names_len = read.u32().map_err(cut)? as usize;
+            let ends = read.at();
+            let stamps = ends + count * 4;
             let names = stamps + count * Stamp::BYTES;
-            let end = names + names_len;
-            if end > bytes.len() {
-                return Err(bad("cut short"));
-            }
+            read.skip(names + names_len - ends).map_err(cut)?;
             // clone: an `Arc` of the mapping, once per disk opened.
             let base = Base { section: section.clone(), count, ends, stamps, names };
             let mut last = 0;
@@ -361,7 +353,6 @@ impl Disks {
                 }
                 last = stop;
             }
-            at = end;
             let disk = Disk { dir, cursor, root, base: Some(base), over: FxHashMap::default() };
             disks.by_head.insert(head.into(), disk);
         }

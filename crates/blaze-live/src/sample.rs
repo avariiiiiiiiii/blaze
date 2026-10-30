@@ -19,6 +19,9 @@
 
 use std::{
     collections::HashMap,
+    fs::File,
+    hash::{BuildHasherDefault, Hasher},
+    io::Read as _,
     ops::Range,
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
@@ -57,6 +60,32 @@ const BUSY_NS: u64 = LIST_EVERY.as_nanos() as u64 / 20;
 const WRITE_EVERY: Duration = Duration::from_millis(250);
 /// The least time between two looks at the threads, whatever the daemon asks.
 const LEAST_INTERVAL_US: u64 = 250;
+/// How many distinct pcs the count of each has room for before it grows.
+const PCS: usize = 1 << 12;
+
+/// FxHash's multiply over a pc: pcs are the program's own addresses, not an attacker's keys,
+/// so one multiply and a rotate, never SipHash, per sample.
+#[derive(Default)]
+struct PcHasher(u64);
+
+impl Hasher for PcHasher {
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(26)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0xf135_7aea_2e62_a9c5);
+    }
+}
+
+/// How often a thread was found at each pc, before the slide.
+type Pcs = HashMap<u64, u64, BuildHasherDefault<PcHasher>>;
 
 #[repr(C)]
 #[derive(Default)]
@@ -116,12 +145,13 @@ pub(crate) fn start(dir: PathBuf, code: Code) {
         return;
     }
     std::thread::Builder::new()
+        // alloc: setup, the thread's name once at start
         .name("blaze-live-sample".to_owned())
         .spawn(move || {
-            let asked = dir.join(format::SAMPLE);
+            let mut files = Files::new(&dir);
             loop {
-                match read(&asked) {
-                    Some(sample) => run(&dir, &code, sample),
+                match files.sample() {
+                    Some(sample) => run(&mut files, &code, sample),
                     None => std::thread::sleep(IDLE),
                 }
             }
@@ -129,11 +159,47 @@ pub(crate) fn start(dir: PathBuf, code: Code) {
         .expect("spawning the thread that samples");
 }
 
-/// What `sample` asks, unless the process it names to read what is sampled is gone: a
-/// worker that exited, or was killed, does not remove the file.
-fn read(path: &Path) -> Option<Sample> {
-    let sample = Sample::decode(&std::fs::read_to_string(path).ok()?)?;
-    (sample.reader == 0 || alive(sample.reader)).then_some(sample)
+/// The sampler's files in the program's directory, and the text it reads and writes them
+/// through, kept from one look to the next: no path is joined and no text allocated per look.
+struct Files {
+    sample: PathBuf,
+    profile: PathBuf,
+    /// Where `profile` is written before it is renamed over the last.
+    partial: PathBuf,
+    text: String,
+}
+
+impl Files {
+    fn new(dir: &Path) -> Files {
+        Files {
+            sample: dir.join(format::SAMPLE),
+            profile: dir.join(format::PROFILE),
+            // alloc: setup, once when the sampler starts
+            partial: dir.join(format!("{}.{}", format::PROFILE, std::process::id())),
+            text: String::with_capacity(PCS * 24),
+        }
+    }
+
+    /// What `sample` asks, unless the process it names to read what is sampled is gone: a
+    /// worker that exited, or was killed, does not remove the file.
+    fn sample(&mut self) -> Option<Sample> {
+        self.text.clear();
+        File::open(&self.sample).ok()?.read_to_string(&mut self.text).ok()?;
+        let sample = Sample::decode(&self.text)?;
+        (sample.reader == 0 || alive(sample.reader)).then_some(sample)
+    }
+
+    /// Writes `profile` in one write, then renames it over the last.
+    #[allow(clippy::print_stderr, reason = "a profile the sampler can't write is said on stderr")]
+    fn write(&mut self, profile: &Profile) {
+        self.text.clear();
+        profile.encode_into(&mut self.text);
+        let written = std::fs::write(&self.partial, &self.text)
+            .and_then(|()| std::fs::rename(&self.partial, &self.profile));
+        if let Err(why) = written {
+            eprintln!("blaze: {}: {why}", self.profile.display());
+        }
+    }
 }
 
 /// Whether there is a process `pid`. One that is there and not this user's is.
@@ -144,8 +210,9 @@ fn alive(pid: u32) -> bool {
     unsafe { kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() != Some(ESRCH) }
 }
 
-/// Samples until `sample` is removed, counting from nothing.
-fn run(dir: &Path, code: &Code, mut sample: Sample) {
+/// Samples until `sample` is removed, counting from nothing. Once the pcs the threads are
+/// found at and the threads have been seen, a look and a write of `profile` allocate nothing.
+fn run(files: &mut Files, code: &Code, mut sample: Sample) {
     // SAFETY: the port of this thread, given back at the end.
     let me = unsafe { mach_thread_self() };
     let spent_before = cpu_ns(me);
@@ -154,7 +221,8 @@ fn run(dir: &Path, code: &Code, mut sample: Sample) {
     unsafe { mach_timebase_info(&mut timebase) };
     let ticks_of = |us: u64| us * 1000 * u64::from(timebase.denom) / u64::from(timebase.numer);
     let mut profile = Profile { pid: std::process::id(), started: now_ms(), ..Profile::default() };
-    let mut pcs: HashMap<u64, u64> = HashMap::new();
+    let mut pcs = Pcs::with_capacity_and_hasher(PCS, BuildHasherDefault::default());
+    profile.pcs.reserve(PCS);
     let mut threads = Threads::default();
     let mut listed = Instant::now() - LIST_EVERY;
     let mut written = Instant::now();
@@ -180,14 +248,15 @@ fn run(dir: &Path, code: &Code, mut sample: Sample) {
         profile.ticks += 1;
         if written.elapsed() >= WRITE_EVERY {
             written = Instant::now();
-            let Some(now) = read(&dir.join(format::SAMPLE)) else { break };
+            let Some(now) = files.sample() else { break };
             sample = now;
             profile.at = now_ms();
             profile.sampler_ns = cpu_ns(me).saturating_sub(spent_before);
-            profile.pcs = pcs.iter().map(|(pc, count)| (*pc, *count)).collect();
+            profile.pcs.clear();
+            profile.pcs.extend(pcs.iter().map(|(pc, count)| (*pc, *count)));
             profile.pcs.sort_unstable();
-            profile.counters = counters(sample.counters);
-            write(dir, &profile);
+            counters(sample.counters, &mut profile.counters);
+            files.write(&profile);
         }
         let interval = ticks_of(sample.interval_us.max(LEAST_INTERVAL_US));
         next += interval;
@@ -239,28 +308,19 @@ fn cpu_ns(thread: u32) -> u64 {
     basic_info(thread).map_or(0, |info| ns(&info.user_time) + ns(&info.system_time))
 }
 
-/// The counters in use that are not zero, by their place.
-fn counters(used: u64) -> Vec<(u32, u64)> {
+/// The counters in use that are not zero, by their place, into `into`.
+fn counters(used: u64, into: &mut Vec<(u32, u64)>) {
     // Called through its address, so that the linker keeps the function for the daemon's
     // code to call by name rather than only a copy inlined here.
     let find: extern "C" fn() -> *mut u64 = crate::blaze_live_counters;
     std::hint::black_box(find)();
     let used = (used as usize).min(format::COUNTERS);
-    (crate::COUNTERS[..used].iter().enumerate())
-        .map(|(at, counter)| (at as u32, counter.load(std::sync::atomic::Ordering::Relaxed)))
-        .filter(|(_, count)| *count != 0)
-        .collect()
-}
-
-#[allow(clippy::print_stderr, reason = "a profile the sampler can't write is said on stderr")]
-fn write(dir: &Path, profile: &Profile) {
-    let path = dir.join(format::PROFILE);
-    let partial = dir.join(format!("{}.{}", format::PROFILE, profile.pid));
-    if let Err(why) =
-        std::fs::write(&partial, profile.encode()).and_then(|()| std::fs::rename(&partial, &path))
-    {
-        eprintln!("blaze: {}: {why}", path.display());
-    }
+    into.clear();
+    into.extend(
+        (crate::COUNTERS[..used].iter().enumerate())
+            .map(|(at, counter)| (at as u32, counter.load(std::sync::atomic::Ordering::Relaxed)))
+            .filter(|(_, count)| *count != 0),
+    );
 }
 
 fn now_ms() -> u64 {
@@ -268,12 +328,16 @@ fn now_ms() -> u64 {
 }
 
 /// The threads of the task as the sampler last listed them, each a port it holds a right to
-/// with the CPU time the thread had taken then.
+/// with the CPU time the thread had taken then. The lists are reused from one listing to the
+/// next: a listing allocates nothing once they have room for the program's threads.
 #[derive(Default)]
 struct Threads {
+    /// Sorted by port, for a binary search per thread of the next listing.
     all: Vec<(u32, u64)>,
     /// Those but the sampler that took [`BUSY_NS`] since the list before, or were not on it.
     busy: Vec<u32>,
+    /// The listing being made, swapped with `all` once it is.
+    next: Vec<(u32, u64)>,
 }
 
 impl Threads {
@@ -288,24 +352,30 @@ impl Threads {
             return;
         }
         // SAFETY: the kernel gave `count` ports at `list`, page-aligned memory of this task;
-        // they are copied out before it is given back.
-        let ports = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
+        // they are copied out into `next` before it is given back.
+        let ports = unsafe { std::slice::from_raw_parts(list, count as usize) };
+        self.next.clear();
+        self.next.extend(ports.iter().map(|&port| (port, cpu_ns(port))));
         // SAFETY: `list` is the kernel's array of `count` ports, copied out above and not used
-        // after; the rights to the ports are given back by `give_back`.
+        // after; the rights to the ports are given back by `release`.
         unsafe { vm_deallocate(task, list as usize, count as usize * size_of::<u32>()) };
-        let all: Vec<(u32, u64)> = ports.into_iter().map(|port| (port, cpu_ns(port))).collect();
-        let before = |port| self.all.iter().find(|it| it.0 == port).map(|it| it.1);
-        let busy = all.iter().filter(|(port, ns)| {
+        self.next.sort_unstable_by_key(|it| it.0);
+        let all = &self.all;
+        let before =
+            |port: u32| all.binary_search_by_key(&port, |it| it.0).ok().map(|at| all[at].1);
+        let busy = self.next.iter().filter(|(port, ns)| {
             *port != me && before(*port).is_none_or(|was| ns.saturating_sub(was) >= BUSY_NS)
         });
-        let busy = busy.map(|it| it.0).collect();
+        self.busy.clear();
+        self.busy.extend(busy.map(|it| it.0));
         // The rights are given back after the new ones are taken, so that a thread keeps its
         // name from one list to the next.
-        self.give_back();
-        (self.all, self.busy) = (all, busy);
+        self.release();
+        std::mem::swap(&mut self.all, &mut self.next);
     }
 
-    fn give_back(&mut self) {
+    /// Gives back the right to each port of `all`, which it empties.
+    fn release(&mut self) {
         // SAFETY: `mach_task_self` takes nothing and returns this task's port name, which
         // needs no release.
         let task = unsafe { mach_task_self() };
@@ -314,6 +384,10 @@ impl Threads {
             // takes it out of `all`.
             unsafe { mach_port_deallocate(task, port) };
         }
+    }
+
+    fn give_back(&mut self) {
+        self.release();
         self.busy.clear();
     }
 }

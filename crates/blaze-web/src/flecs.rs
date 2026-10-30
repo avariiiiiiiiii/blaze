@@ -128,8 +128,10 @@ impl Flecs {
             krate: 0,
             module: 0,
             calls: 0,
+            // alloc: none until it fills
             text: Vec::new(),
         };
+        // alloc: once per world, the kinds' script; the error's is an error path
         let code = CString::new(KINDS).map_err(|e| e.to_string())?;
         // SAFETY: a live world; both strings are NUL-terminated and outlive the call.
         let ran = unsafe {
@@ -277,23 +279,27 @@ impl Flecs {
             )
         };
         let bytes = if body.is_null() || len <= 0 {
+            // alloc: none, an empty body
             Vec::new()
         } else {
             // SAFETY: the reply body Flecs wrote, `len` bytes, freed only below, after this
             // copy.
             unsafe { std::slice::from_raw_parts(body.cast::<u8>().cast_const(), len as usize) }
+                // alloc: the edge, once per REST request
                 .to_vec()
         };
         // SAFETY: the body `glue_rest_request` allocated, or null, which it takes. It is freed
         // once and not read after.
         unsafe { ecs::glue_free(body.cast::<c_void>()) };
         let kind = if kind.is_null() {
+            // alloc: the edge, once per REST request
             "application/json".to_owned()
         } else {
             // SAFETY: a static NUL-terminated content type (`glue_rest_request`'s contract in
             // csrc/glue.c).
             unsafe { CStr::from_ptr(kind) }.to_string_lossy().into_owned()
         };
+        // alloc: an error path
         let code = u16::try_from(code).map_err(|_| format!("Flecs answered {code}"))?;
         Ok(Answer { code, kind, body: bytes })
     }
@@ -328,6 +334,7 @@ impl Flecs {
         let entity = unsafe { ecs::ecs_lookup(self.world, name.as_ptr()) };
         if entity == 0 {
             let name = name.to_string_lossy();
+            // alloc: an error path
             return Err(format!("Flecs has no {name} of the build page's kinds"));
         }
         Ok(entity)
@@ -346,12 +353,14 @@ impl Flecs {
         // SAFETY: a live world; Flecs answers null for an id that is no component.
         let at = unsafe { ecs::ecs_get_id(self.world, id, of_component) }.cast::<Component>();
         if at.is_null() || !at.is_aligned() {
+            // alloc: an error path
             return Err(format!("Flecs has no component {name}"));
         }
         // SAFETY: non-null and aligned (checked above), Flecs's `EcsComponent`, which is laid
         // out as `Component`, read at once, before the world is written.
         let Component { size: has, alignment } = unsafe { at.read() };
         if has as usize != size || alignment as usize != align {
+            // alloc: an error path
             return Err(format!(
                 "Flecs lays out {name} in {has} bytes aligned to {alignment}, \
                  not {size} aligned to {align}"

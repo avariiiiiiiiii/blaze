@@ -5,7 +5,8 @@
 //!   (`"*"` for every package that is not a workspace member) and `build-override` for what
 //!   build scripts and proc macros run, picks the backend (docs/cargo.md, "Backends"): 0 and
 //!   1 Cranelift, 2, `s` and `z` LLVM at `-O2`, 3 LLVM at `-O3` (#635: tests are built at the
-//!   profile's level).
+//!   profile's level). Cranelift optimizes (`opt_level=speed`) all but a workspace member's
+//!   code, which no edit reaches and so is compiled once.
 //! - The standard library's own functions are compiled as rustc's shipped std is: `-O3`, no
 //!   overflow checks, no debug assertions, line tables. A generic of std is compiled as the
 //!   crate that instantiates it asks, as rustc compiles it in that crate's codegen unit.
@@ -39,11 +40,11 @@ pub enum OptLevel {
 }
 
 impl OptLevel {
-    /// The backend the level is compiled with; `None` when it asks for LLVM and blaze has
-    /// none.
+    /// The backend the level is compiled with, Cranelift at `opt_level=none`; `None` when it
+    /// asks for LLVM and blaze has none.
     pub fn backend(self, llvm: bool) -> Option<Backend> {
         match self {
-            OptLevel::O0 | OptLevel::O1 => Some(Backend::Cranelift),
+            OptLevel::O0 | OptLevel::O1 => Some(Backend::Cranelift { speed: false }),
             OptLevel::O2 | OptLevel::S | OptLevel::Z => llvm.then_some(Backend::Llvm { opt: 2 }),
             OptLevel::O3 => llvm.then_some(Backend::Llvm { opt: 3 }),
         }
@@ -201,6 +202,13 @@ impl Policy {
         let llvm = self.toolchain.llvm.is_some();
         let backend =
             level.backend(llvm).ok_or_else(|| PlanError::NoLlvm { origin: origin.clone(), level })?;
+        // Only a member's code is edited, so only it is recompiled: the rest is compiled once
+        // and can afford Cranelift's optimizer.
+        let member = matches!(origin, Origin::Member(_));
+        let backend = match backend {
+            Backend::Cranelift { .. } => Backend::Cranelift { speed: !member },
+            other => other,
+        };
         let live = self.mode == Mode::Live;
         let spec = Spec {
             toolchain: self.toolchain.clone(),
@@ -209,17 +217,18 @@ impl Policy {
             debug_assertions: assertions,
             panic: profile.panic,
             debuginfo,
-            fold: self.fold && backend == Backend::Cranelift,
+            fold: self.fold && backend.is_cranelift(),
             // A member's code built into another function's would outlive a patch of it.
             mir_inline: matches!(level, OptLevel::O2 | OptLevel::O3) && !live,
             sanitize: self.sanitize,
             policy: self.id(),
         };
-        let patchable = live && matches!(origin, Origin::Member(_));
-        let tiered = live && backend != Backend::Cranelift;
+        let patchable = live && member;
+        let tiered = live && !backend.is_cranelift();
         Ok(if tiered {
+            // The first tier runs only until LLVM's code is in the slot: compiled fast.
             Choice {
-                first: Spec { fold: self.fold, ..spec.at(Backend::Cranelift) },
+                first: Spec { fold: self.fold, ..spec.at(Backend::Cranelift { speed: false }) },
                 then: Some(spec),
                 patchable,
             }
@@ -270,10 +279,24 @@ mod tests {
     fn dev_is_cranelift_and_only_members_are_patched() {
         let policy = policy(OptLevel::O0, Mode::Live);
         let own = policy.choose(&member(), None).unwrap();
-        assert_eq!(own.first.backend, Backend::Cranelift);
+        assert_eq!(own.first.backend, Backend::Cranelift { speed: false });
         assert!(own.patchable && own.then.is_none());
         let dependency = policy.choose(&Origin::Dependency("regex".to_owned()), None).unwrap();
         assert!(!dependency.patchable);
+    }
+
+    #[test]
+    fn only_a_members_cranelift_code_is_unoptimized() {
+        for mode in [Mode::Output, Mode::Live] {
+            let policy = policy(OptLevel::O0, mode);
+            let speed = |origin: Origin| policy.choose(&origin, None).unwrap().first.backend;
+            assert_eq!(speed(member()), Backend::Cranelift { speed: false });
+            assert_eq!(speed(Origin::Dependency("regex".to_owned())), Backend::Cranelift { speed: true });
+            assert_eq!(speed(Origin::BuildTime("serde_derive".to_owned())), Backend::Cranelift { speed: true });
+        }
+        let dependency = policy(OptLevel::O0, Mode::Output).choose(&Origin::Dependency("regex".to_owned()), None);
+        let own = policy(OptLevel::O0, Mode::Output).choose(&member(), None);
+        assert_ne!(dependency.unwrap().first.settings(), own.unwrap().first.settings());
     }
 
     #[test]
@@ -297,14 +320,14 @@ mod tests {
             Override { opt_level: Some(OptLevel::O0), ..Override::default() },
         );
         let own = policy.choose(&member(), None).unwrap();
-        assert_eq!(own.first.backend, Backend::Cranelift);
+        assert_eq!(own.first.backend, Backend::Cranelift { speed: false });
         let dependency = policy.choose(&Origin::Dependency("nalgebra".to_owned()), None).unwrap();
         assert_eq!(dependency.first.backend, Backend::Llvm { opt: 3 });
         let named = policy.choose(&Origin::Dependency("slow".to_owned()), None).unwrap();
-        assert_eq!(named.first.backend, Backend::Cranelift);
+        assert_eq!(named.first.backend, Backend::Cranelift { speed: true });
         // `"*"` is not for members, even one named like a dependency.
         let member_star = policy.choose(&Origin::Member("nalgebra".to_owned()), None).unwrap();
-        assert_eq!(member_star.first.backend, Backend::Cranelift);
+        assert_eq!(member_star.first.backend, Backend::Cranelift { speed: false });
     }
 
     #[test]
@@ -312,7 +335,7 @@ mod tests {
         let mut policy = policy(OptLevel::O3, Mode::Output);
         policy.profile.build_override.opt_level = Some(OptLevel::O0);
         let build = policy.choose(&Origin::BuildTime("serde_derive".to_owned()), None).unwrap();
-        assert_eq!(build.first.backend, Backend::Cranelift);
+        assert_eq!(build.first.backend, Backend::Cranelift { speed: true });
     }
 
     #[test]
@@ -324,7 +347,7 @@ mod tests {
         );
         let dependency = Origin::Dependency("memchr".to_owned());
         let tiered = live.choose(&dependency, None).unwrap();
-        assert_eq!(tiered.first.backend, Backend::Cranelift);
+        assert_eq!(tiered.first.backend, Backend::Cranelift { speed: false });
         assert_eq!(tiered.then.as_ref().unwrap().backend, Backend::Llvm { opt: 3 });
         assert_ne!(tiered.first.settings(), tiered.then.unwrap().settings());
         let mut output = live.clone();

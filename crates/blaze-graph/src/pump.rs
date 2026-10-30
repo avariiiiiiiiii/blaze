@@ -17,15 +17,21 @@
 //! A wait's own edge, to the runner it waits for, sits beside the task in the same slot. Only
 //! a wait takes the one process-wide lock ([`WAITS`]), to check and add its edge as one step; a
 //! run nobody waits for takes its key's shard twice and nothing else.
+//!
+//! Nothing here allocates once warm (docs/v2/plan/lanes/mem/core/plane.md) but a value's
+//! clones: a waiter is a node on its own stack, linked into its run's entry, and the runner
+//! writes each waiter its clone; a thread's slot, once freed, is linked through its own stack.
 
 use std::{
-    cell::Cell,
+    cell::{Cell, UnsafeCell},
     collections::hash_map::Entry,
     hash::{BuildHasherDefault, Hasher},
     num::NonZero,
-    sync::{Arc, PoisonError},
+    ptr,
+    sync::PoisonError,
 };
 
+use blaze_mem::{Column, Tag as MemTag};
 use rustc_hash::{FxBuildHasher, FxHashSet};
 
 use crate::{
@@ -95,6 +101,10 @@ impl Published {
 #[repr(align(128))]
 struct Stack {
     len: AtomicU32,
+    /// The slot freed before this one, while this one is free (0 for none): written and read
+    /// under [`FREE`]. `std`'s even under `blaze_check`: [`FREE`]'s list outlives an execution,
+    /// as its head does, where a model atomic would start the next one from 0 and lose it.
+    next_free: std::sync::atomic::AtomicU32,
     /// The slot's task count, kept for the next thread given it.
     seq: AtomicU64,
     /// The thread itself, for a wait outside any job.
@@ -109,6 +119,7 @@ impl Stack {
     fn new() -> Stack {
         Stack {
             len: AtomicU32::new(0),
+            next_free: std::sync::atomic::AtomicU32::new(0),
             seq: AtomicU64::new(0),
             client: Published::new(),
             tasks: [const { Published::new() }; PUMP_DEPTH + 1],
@@ -116,40 +127,52 @@ impl Stack {
     }
 }
 
-/// Stacks come in chunks, published once and never freed or moved, so a check reads any
-/// thread's without a lock: slot `n` is chunk `n / CHUNK`, at `n % CHUNK`. A once cell, not a
-/// pointer: under `blaze_check` a set `static` cell stays set across executions, so a chunk is
-/// made once per process there too.
-const CHUNK: usize = 64;
-const CHUNKS: usize = 1 << 12;
-static DIR: [OnceLock<Box<[Stack]>>; CHUNKS] = [const { OnceLock::new() }; CHUNKS];
+/// The most threads with a task stack at once.
+const SLOTS: usize = 1 << 18;
 
-struct Free {
-    next: u32,
-    free: Vec<u32>,
+/// Every thread's stack by slot, in a blaze-mem column: published once and never freed or
+/// moved, so a check reads any thread's without a lock. Slot 0 is no thread's: it is "none" in
+/// [`FREE`]'s list. A once cell: under `blaze_check` a set `static` cell stays set across
+/// executions, so the column is made once per process there too.
+static STACKS: OnceLock<Column<Stack>> = OnceLock::new();
+
+fn stacks() -> &'static Column<Stack> {
+    STACKS.get_or_init(|| {
+        let stacks = Column::new(SLOTS, MemTag::Plane)
+            .unwrap_or_else(|why| panic!("the pump's task stacks: {why}"));
+        stacks.push(Stack::new()).unwrap_or_else(|why| panic!("the pump's slot 0: {why}"));
+        stacks
+    })
 }
 
-/// The slots of threads that ended, for the next; taken once by each thread.
-static FREE: Lock<Free> = Lock::new(Free { next: 1, free: Vec::new() });
+struct Free {
+    /// The slot freed last (0 for none), the others through [`Stack::next_free`].
+    head: u32,
+}
+
+/// The slots of threads that ended, for the next, last freed first; taken once by each
+/// thread.
+static FREE: Lock<Free> = Lock::new(Free { head: 0 });
 
 fn stack(index: u64) -> Option<&'static Stack> {
-    let index = usize::try_from(index).ok()?;
-    DIR.get(index / CHUNK)?.get()?.get(index % CHUNK)
+    stacks().get(u32::try_from(index).ok()?)
 }
 
 fn claim() -> (u32, &'static Stack) {
-    let index = {
-        let mut free = FREE.lock();
-        let index = free.free.pop().unwrap_or_else(|| {
-            free.next += 1;
-            free.next - 1
-        });
-        let at = index as usize / CHUNK;
-        assert!(at < CHUNKS, "more than {} threads have a task stack at once", CHUNKS * CHUNK);
-        DIR[at].get_or_init(|| (0..CHUNK).map(|_| Stack::new()).collect());
-        index
-    };
-    (index, stack(u64::from(index)).expect("the chunk was just published"))
+    let mut free = FREE.lock();
+    match free.head {
+        0 => {
+            let index = stacks().push(Stack::new()).unwrap_or_else(|why| {
+                panic!("more than {SLOTS} threads have a task stack at once: {why}")
+            });
+            (index, stack(u64::from(index)).expect("a stack just pushed is published"))
+        }
+        head => {
+            let freed = stack(u64::from(head)).expect("a freed slot's stack is published");
+            free.head = freed.next_free.load(Ordering::Relaxed);
+            (head, freed)
+        }
+    }
 }
 
 fn next_id(index: u32, depth: u64, seq: &Cell<u64>) -> u64 {
@@ -182,7 +205,9 @@ impl Drop for Me {
         self.stack.len.store(0, Ordering::Release);
         self.stack.client.task.store(0, Ordering::Release);
         self.stack.seq.store(self.seq.get(), Ordering::Relaxed);
-        FREE.lock().free.push(self.index);
+        let mut free = FREE.lock();
+        self.stack.next_free.store(free.head, Ordering::Relaxed);
+        free.head = self.index;
     }
 }
 
@@ -286,7 +311,7 @@ impl Walk {
 }
 
 /// Orders the waits: a check and the edge it adds are one step against every other wait's.
-static WAITS: Lock<Walk> =
+static WAITS: Lock<Walk> = // alloc: none, empty: the check's scratch, kept for the process
     Lock::new(Walk { next: Vec::new(), seen: FxHashSet::with_hasher(FxBuildHasher) });
 
 #[cfg(test)]
@@ -319,25 +344,51 @@ impl Hasher for KeyBits {
     }
 }
 
-#[allow(clippy::disallowed_types)]
+#[allow(clippy::disallowed_types)] // alloc: not SipHash: hashed by `KeyBits`, a key's first word
 type ByKey<V> = std::collections::HashMap<Key, V, BuildHasherDefault<KeyBits>>;
 
 const RUNNING: u8 = 0;
 const DONE: u8 = 1;
 const GAVE_WAY: u8 = 2;
 
-/// What the waiters of a run read: made by the first of them, so a run nobody waits for
-/// allocates nothing. Polled with plain loads.
-struct Flight<V> {
+/// A wait for a run, on the waiter's own stack while it waits, linked into the run's
+/// [`InFlight`] list. The runner reads it once it has taken the list out of its shard, writes
+/// it its value and its state, and touches it no more: `state` is the last write, and the
+/// waiter leaves only once it reads that ([`Linked`] holds it there, unwinding too).
+struct Waiter<V> {
+    task: u64,
+    thread: Thread,
+    /// The waiter linked before this one: written under the run's shard lock, read under it
+    /// or by the runner once the list is its own.
+    next: UnsafeCell<*const Waiter<V>>,
+    /// The run's value, written by the runner before `state` says `DONE`.
+    value: UnsafeCell<Option<V>>,
     state: AtomicU8,
-    value: OnceLock<V>,
 }
 
-/// A run under way, in its key's shard: 56 bytes beside its key.
+impl<V> Waiter<V> {
+    fn new(task: u64) -> Waiter<V> {
+        Waiter {
+            task,
+            thread: thread::current(),
+            next: UnsafeCell::new(ptr::null()),
+            value: UnsafeCell::new(None),
+            state: AtomicU8::new(RUNNING),
+        }
+    }
+}
+
+/// A run's waiters, the last linked first; null for none.
+struct Waiters<V>(*const Waiter<V>);
+
+// SAFETY: each waiter is reached through the list only under its shard's lock, or by the
+// runner once it took the list out, and the runner sends it a `V` (hence `V: Send`).
+unsafe impl<V: Send> Send for Waiters<V> {}
+
+/// A run under way, in its key's shard: 16 bytes beside its key.
 struct InFlight<V> {
     runner: u64,
-    waiters: Vec<(u64, Thread)>,
-    flight: Option<Arc<Flight<V>>>,
+    waiters: Waiters<V>,
 }
 
 /// One shard of the runs under way, by key. 128-byte aligned, so no two shards' locks share
@@ -383,6 +434,7 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
     pub fn new() -> Flights<V> {
         let count = shard_count();
         Flights {
+            // alloc: the shards, made once with the flights
             shards: (0..count).map(|_| Shard(Lock::new(ByKey::default()))).collect(),
             mask: count - 1,
         }
@@ -397,8 +449,15 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         run: impl FnOnce() -> Result<V, Cancelled>,
     ) -> Result<V, Cancelled> {
         let me = current();
-        while let Some(flight) = self.join(key, me)? {
-            if let Some(value) = wait(&flight) {
+        loop {
+            let waiter = Waiter::new(me);
+            if !self.join(key, me, &waiter)? {
+                break;
+            }
+            let linked = Linked { flights: self, key, waiter: &waiter };
+            let got = wait(&waiter);
+            drop(linked);
+            if let Some(value) = got {
                 return Ok(value);
             }
         }
@@ -418,13 +477,14 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         &self.shards[word(key, 8) as usize & self.mask].0
     }
 
-    /// `None` when this caller is to run `key`; else the run to wait for.
-    fn join(&self, key: Key, me: u64) -> Result<Option<Arc<Flight<V>>>, Cancelled> {
+    /// `false` when this caller is to run `key`; `true` when `waiter` is linked into the run
+    /// to wait for.
+    fn join(&self, key: Key, me: u64, waiter: &Waiter<V>) -> Result<bool, Cancelled> {
         let mut shard = self.shard(&key).lock();
         let entry = match shard.entry(key) {
             Entry::Vacant(slot) => {
-                slot.insert(InFlight { runner: me, waiters: Vec::new(), flight: None });
-                return Ok(None);
+                slot.insert(InFlight { runner: me, waiters: Waiters(ptr::null()) });
+                return Ok(false);
             }
             Entry::Occupied(slot) => slot.into_mut(),
         };
@@ -441,11 +501,55 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
                 mine.on.store(runner, Ordering::Relaxed);
             }
         }
-        entry.waiters.push((me, thread::current()));
-        let flight = entry.flight.get_or_insert_with(|| {
-            Arc::new(Flight { state: AtomicU8::new(RUNNING), value: OnceLock::new() })
-        });
-        Ok(Some(flight.clone()))
+        // SAFETY: `next` is the waiter's own until it is linked, here, under the shard's lock;
+        // the caller keeps the waiter where it is until its run ends ([`Linked`]).
+        unsafe { *waiter.next.get() = entry.waiters.0 };
+        entry.waiters.0 = ptr::from_ref(waiter);
+        Ok(true)
+    }
+}
+
+/// Keeps a linked [`Waiter`] in place until its run is done with it: dropped before the run
+/// ended (an unwind out of the wait), it unlinks the waiter if the run's entry still holds
+/// it, or else waits for the runner, which has taken the list, to write it its end.
+struct Linked<'a, V: Clone + Send + Sync + 'static> {
+    flights: &'a Flights<V>,
+    key: Key,
+    waiter: &'a Waiter<V>,
+}
+
+impl<V: Clone + Send + Sync + 'static> Drop for Linked<'_, V> {
+    fn drop(&mut self) {
+        if self.waiter.state.load(Ordering::Acquire) != RUNNING {
+            return;
+        }
+        let me = ptr::from_ref(self.waiter);
+        {
+            let mut shard = self.flights.shard(&self.key).lock();
+            if let Some(entry) = shard.get_mut(&self.key) {
+                let runner = entry.runner;
+                let mut link: *mut *const Waiter<V> = &raw mut entry.waiters.0;
+                // SAFETY: under the shard's lock every waiter of the list is linked and in
+                // place, and its `next` is read and written only under the lock.
+                unsafe {
+                    while !(*link).is_null() {
+                        if *link == me {
+                            *link = *(*me).next.get();
+                            if let Some(mine) = published(self.waiter.task) {
+                                _ = mine.on.compare_exchange(runner, 0, Ordering::Relaxed, Ordering::Relaxed);
+                            }
+                            return;
+                        }
+                        link = (**link).next.get();
+                    }
+                }
+            }
+        }
+        // The run ended and took the list: its runner writes this waiter its end and then
+        // touches it no more.
+        while self.waiter.state.load(Ordering::Acquire) == RUNNING {
+            hint::spin_loop();
+        }
     }
 }
 
@@ -461,33 +565,40 @@ struct Ending<'a, V: Clone + Send + Sync + 'static> {
 impl<V: Clone + Send + Sync + 'static> Ending<'_, V> {
     fn end(&mut self, value: Option<&V>) {
         self.ended = true;
-        let Some(InFlight { runner, waiters, flight }) =
-            self.flights.shard(&self.key).lock().remove(&self.key)
+        let Some(InFlight { runner, waiters }) = self.flights.shard(&self.key).lock().remove(&self.key)
         else {
             return;
         };
         debug_assert_eq!(runner, self.runner, "a run's entry is its own until it ends");
-        if waiters.is_empty() {
-            return;
-        }
         // Each waiter's edge goes before it can see the end and wait again, and while this
         // runner is in `end` it waits for nobody, so an edge read in between leads nowhere.
-        for &(waiter, _) in &waiters {
-            if let Some(entry) = published(waiter) {
+        let mut at = waiters.0;
+        // SAFETY: the list was taken out of its shard under the lock, so no waiter of it is
+        // unlinked or leaves before this writes its state, and no other thread writes a `next`.
+        while let Some(waiter) = unsafe { at.as_ref() } {
+            if let Some(entry) = published(waiter.task) {
                 _ = entry.on.compare_exchange(runner, 0, Ordering::Relaxed, Ordering::Relaxed);
             }
+            // SAFETY: as above.
+            at = unsafe { *waiter.next.get() };
         }
-        if let Some(flight) = flight {
-            let state = match value {
-                Some(value) => {
-                    _ = flight.value.set(value.clone());
-                    DONE
+        let state = if value.is_some() { DONE } else { GAVE_WAY };
+        let mut at = waiters.0;
+        while !at.is_null() {
+            // SAFETY: as above: the waiter is in place until its state is stored, and everything
+            // read of it is read before that. The store's `&self` outlives the store itself
+            // only as `std`'s own wake-ups' do (rust-lang/rust#55005): nothing is read after.
+            let thread = unsafe {
+                let next = *(*at).next.get();
+                // clone: a reference count, so the waiter is woken after it may have left
+                let thread = (*at).thread.clone();
+                if let Some(value) = value {
+                    *(*at).value.get() = Some(value.clone()); // clone: each waiter's own value
                 }
-                None => GAVE_WAY,
+                (*at).state.store(state, Ordering::Release);
+                at = next;
+                thread
             };
-            flight.state.store(state, Ordering::Release);
-        }
-        for (_, thread) in waiters {
             thread.unpark();
         }
     }
@@ -501,12 +612,14 @@ impl<V: Clone + Send + Sync + 'static> Drop for Ending<'_, V> {
     }
 }
 
-/// Waits for `flight` to end, pumping while this thread may: its value, or `None` when it was
-/// cancelled.
-fn wait<V: Clone>(flight: &Flight<V>) -> Option<V> {
-    wait_until(&|| flight.state.load(Ordering::Acquire) != RUNNING);
-    match flight.state.load(Ordering::Acquire) {
-        DONE => flight.value.get().cloned(),
+/// Waits for the run `waiter` is linked into to end, pumping while this thread may: its value,
+/// or `None` when it was cancelled.
+fn wait<V>(waiter: &Waiter<V>) -> Option<V> {
+    wait_until(&|| waiter.state.load(Ordering::Acquire) != RUNNING);
+    match waiter.state.load(Ordering::Acquire) {
+        // SAFETY: the runner wrote the value before it stored `DONE`, which this load read,
+        // and touches the waiter no more.
+        DONE => unsafe { (*waiter.value.get()).take() },
         _ => None,
     }
 }
@@ -515,7 +628,7 @@ fn wait<V: Clone>(flight: &Flight<V>) -> Option<V> {
 /// pool's jobs (below [`PUMP_DEPTH`]), spins a little, then parks; elsewhere it spins, then
 /// parks. Whoever makes `ended` true unparks this thread (`Thread::unpark`); `ended` is read
 /// again after each wake, so a spurious one only loops.
-pub fn wait_until(ended: &dyn Fn() -> bool) {
+pub fn wait_until(ended: &impl Fn() -> bool) {
     let mut idle = 0u32;
     loop {
         if ended() {
@@ -552,6 +665,7 @@ fn word(key: &Key, at: usize) -> u64 {
 }
 
 fn hex(key: &Key) -> String {
+    // alloc: for the panic of a key that asks for itself, once
     key.0.iter().take(8).map(|it| format!("{it:02x}")).collect()
 }
 
@@ -565,6 +679,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use blaze_alloc_count::{Used, measure};
+    use blaze_ids::rng::SplitMix64 as Rng;
     use crossbeam_channel::{bounded, unbounded};
 
     use super::{
@@ -590,23 +706,6 @@ mod tests {
         while !done() {
             assert!(Instant::now() < until, "timed out waiting for {what}");
             std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    /// SplitMix64, as `blaze-core`'s `sim::Rng`.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut z = self.0;
-            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            z ^ (z >> 31)
-        }
-
-        fn below(&mut self, n: u64) -> u64 {
-            if n == 0 { 0 } else { self.next() % n }
         }
     }
 
@@ -851,6 +950,97 @@ mod tests {
         assert_eq!(deepest.load(Ordering::SeqCst), PUMP_DEPTH);
     }
 
+    /// Key 1 run on one thread while another waits for it: what each allocates, and what the
+    /// waiter got. Each thread's slot is claimed before it is measured.
+    fn miss_then_hit<V: Clone + Send + Sync + 'static>(flights: &Flights<V>, value: V) -> (Used, Used, V) {
+        let at = key(1);
+        let linked = || flights.shard(&at).lock().get(&at).is_some_and(|it| !it.waiters.0.is_null());
+        std::thread::scope(|scope| {
+            let runner = scope.spawn(move || {
+                _ = depth();
+                measure(move || {
+                    flights.get_or_run(at, move || {
+                        until("the waiter to link itself", linked);
+                        Ok(value)
+                    })
+                })
+            });
+            let waiter = scope.spawn(move || {
+                _ = depth();
+                until("the run to begin", || flights.running() == 1);
+                measure(|| flights.get_or_run(at, || panic!("the waiter ran the key")))
+            });
+            let (ran, by_runner) = runner.join().unwrap();
+            let (got, by_waiter) = waiter.join().unwrap();
+            let got = got.unwrap_or_else(|_| panic!("the wait was cancelled"));
+            assert!(ran.is_ok());
+            (by_runner, by_waiter, got)
+        })
+    }
+
+    /// A run with a waiter, warm: neither thread allocates but for the value's clone the
+    /// runner makes its waiter (none for a `u64`, one for a `Vec`).
+    #[test]
+    fn a_miss_then_a_hit_allocate_only_the_values_clone() {
+        let numbers = Flights::<u64>::new();
+        for round in 0..4 {
+            miss_then_hit(&numbers, round);
+        }
+        let (runner, waiter, got) = miss_then_hit(&numbers, 99);
+        assert_eq!((runner.allocations, waiter.allocations, got), (0, 0, 99), "{runner:?} {waiter:?}");
+
+        let vectors = Flights::<Vec<u64>>::new();
+        for round in 0..4 {
+            miss_then_hit(&vectors, vec![round; 8]);
+        }
+        let (runner, waiter, got) = miss_then_hit(&vectors, vec![7; 8]);
+        assert_eq!((runner.allocations, waiter.allocations), (1, 0), "the runner clones for its one waiter");
+        assert_eq!(got, vec![7; 8]);
+        assert_eq!(vectors.running(), 0);
+    }
+
+    /// Many waiters of one run, linked and unlinked as they come: each gets the run's value.
+    #[test]
+    fn every_waiter_of_a_run_gets_its_value() {
+        let flights = Flights::<Vec<u32>>::new();
+        let at = key(3);
+        let waiting = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let runner = scope.spawn(|| {
+                flights.get_or_run(at, || {
+                    until("eight waiters", || {
+                        let mut count = 0;
+                        let shard = flights.shard(&at).lock();
+                        let mut link = shard.get(&at).map_or(std::ptr::null(), |it| it.waiters.0);
+                        // SAFETY: under the shard's lock each linked waiter is in place.
+                        while let Some(waiter) = unsafe { link.as_ref() } {
+                            count += 1;
+                            // SAFETY: as above.
+                            link = unsafe { *waiter.next.get() };
+                        }
+                        count == 8
+                    });
+                    Ok(vec![5, 6])
+                })
+            });
+            let waiters: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        until("the run to begin", || flights.running() == 1);
+                        waiting.fetch_add(1, Ordering::SeqCst);
+                        flights.get_or_run(at, || Ok(Vec::new()))
+                    })
+                })
+                .collect();
+            assert_eq!(runner.join().unwrap(), Ok(vec![5, 6]));
+            for waiter in waiters {
+                assert_eq!(waiter.join().unwrap(), Ok(vec![5, 6]));
+            }
+        });
+        assert_eq!(waiting.load(Ordering::SeqCst), 8);
+        assert_eq!(flights.running(), 0);
+    }
+
     #[test]
     #[should_panic(expected = "its value depends on itself")]
     fn a_key_that_asks_for_itself_panics() {
@@ -868,7 +1058,7 @@ mod tests {
             cpus: (0..4).map(|id| Cpu { id, group: id / 2, socket: 0, node: 0, fast: true }).collect(),
         };
         for seed in 0..12u64 {
-            let mut rng = Rng(seed);
+            let mut rng = Rng::new(seed);
             let deps: Vec<Vec<usize>> = (0..KEYS)
                 .map(|at| {
                     let after = (KEYS - at - 1) as u64;

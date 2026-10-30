@@ -41,7 +41,7 @@ use self::{
 };
 use crate::{
     cx::Cx,
-    lints::syntax::source_fact,
+    lints::{registry::LintId, syntax::source_fact},
     lower::{Found, Phase, mutable_ref_binding::BUILT_ON},
     model::{Applicability, Diag, Level, MultiSpan},
 };
@@ -68,6 +68,13 @@ fn deprecated(
     site: Site,
     suggestion: Option<InFile<TextRange>>,
 ) -> Option<Found> {
+    let lint = match depr.is_in_effect() {
+        true => LintId::named("deprecated"),
+        false => LintId::named("deprecated_in_future"),
+    };
+    if !cx.lint_may_fire(lint) {
+        return None;
+    }
     let kind = def.descr(cx.db);
     let path = def::path(cx, def)?;
     let mut diag = deprecation_diag(cx, depr, kind, &path, site.span, suggestion);

@@ -10,7 +10,7 @@ use std::{fmt, hash::Hash, sync::OnceLock};
 
 use span::{Edition, SyntaxContext};
 
-use super::{SUBTREE, TopSubtree};
+use super::{Node, SUBTREE, TopSubtree};
 use crate::{DelimiterKind, TokenTreesView};
 
 /// A tree's tokens as the parser's words, in the parser's order: an open and a close for each
@@ -101,18 +101,19 @@ impl<'a> TokenTreesView<'a> {
     pub fn words<'w>(&self, words: &'w TreeWords) -> ViewWords<'w> {
         let tree = self.tree;
         assert_eq!(words.at.len(), tree.token_slots(), "words of another tree");
+        let nodes = tree.nodes();
         let mut at = self.start;
         let mut last = None;
         while at < self.end {
             last = Some(at);
-            let node = tree.nodes[at as usize];
+            let node = Node::from_row(nodes[at as usize]);
             at += 1 + if node.tag() == SUBTREE { node.data } else { 0 };
         }
         let Some(last) = last else {
             return ViewWords { rest: &[], len: 0, first_fragment_counts: false };
         };
         let first = words.at[self.start as usize];
-        let node = tree.nodes[last as usize];
+        let node = tree.node(last);
         let end = match node.tag() {
             SUBTREE => {
                 let visible = node.delimiter_kind() != DelimiterKind::Invisible;

@@ -27,6 +27,8 @@ use crate::{Instance, Pending, fragment};
 pub(crate) mod allocator;
 pub(crate) mod backend;
 pub(crate) mod build;
+#[cfg(test)]
+pub(crate) mod by_id;
 pub(crate) mod convert;
 pub(crate) mod fold;
 pub(crate) mod frontend;
@@ -71,6 +73,71 @@ pub trait Hashes: Sync {
     /// The name a file is known by in the program (`file!()`, a panic location): the path
     /// relative to its package's root, as rustc prints it.
     fn file_name(&self, db: &Db, file: base_db::FileId) -> Result<String, String>;
+}
+
+/// The [`Hashes`] a build keys its code by: the items lane's, or a test's.
+pub enum HashSource {
+    Items(ItemHashes),
+    #[cfg(test)]
+    ById(by_id::ById),
+}
+
+impl Hashes for HashSource {
+    fn item(&self, db: &Db, item: ItemId) -> Result<ItemKey, String> {
+        match self {
+            HashSource::Items(it) => it.item(db, item),
+            #[cfg(test)]
+            HashSource::ById(it) => it.item(db, item),
+        }
+    }
+
+    fn code(&self, db: &Db, body: Body) -> Result<CodeHash, String> {
+        match self {
+            HashSource::Items(it) => it.code(db, body),
+            #[cfg(test)]
+            HashSource::ById(it) => it.code(db, body),
+        }
+    }
+
+    fn ty<'db>(&self, db: &'db Db, ty: Ty<'db>) -> Result<ContentId, String> {
+        match self {
+            HashSource::Items(it) => it.ty(db, ty),
+            #[cfg(test)]
+            HashSource::ById(it) => it.ty(db, ty),
+        }
+    }
+
+    fn konst<'db>(&self, db: &'db Db, konst: Const<'db>) -> Result<ContentId, String> {
+        match self {
+            HashSource::Items(it) => it.konst(db, konst),
+            #[cfg(test)]
+            HashSource::ById(it) => it.konst(db, konst),
+        }
+    }
+
+    fn span(&self, db: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String> {
+        match self {
+            HashSource::Items(it) => it.span(db, owner, span),
+            #[cfg(test)]
+            HashSource::ById(it) => it.span(db, owner, span),
+        }
+    }
+
+    fn declaration(&self, db: &Db, func: FunctionId) -> Result<SpanRef, String> {
+        match self {
+            HashSource::Items(it) => it.declaration(db, func),
+            #[cfg(test)]
+            HashSource::ById(it) => it.declaration(db, func),
+        }
+    }
+
+    fn file_name(&self, db: &Db, file: base_db::FileId) -> Result<String, String> {
+        match self {
+            HashSource::Items(it) => it.file_name(db, file),
+            #[cfg(test)]
+            HashSource::ById(it) => it.file_name(db, file),
+        }
+    }
 }
 
 /// A body whose code [`Hashes::code`] says. The ids are salsa's interned closures and

@@ -165,7 +165,7 @@ impl ExpnGlobals {
 pub trait Message: serde::Serialize + DeserializeOwned {
     type Buf;
     fn read(inp: &mut dyn BufRead, buf: &mut Self::Buf) -> io::Result<Option<Self>>;
-    fn write(self, out: &mut dyn Write) -> io::Result<()>;
+    fn write(&self, out: &mut dyn Write) -> io::Result<()>;
 }
 
 impl Message for Request {
@@ -177,8 +177,8 @@ impl Message for Request {
             Some(buf) => Some(json::decode(buf)?),
         })
     }
-    fn write(self, out: &mut dyn Write) -> io::Result<()> {
-        let value = json::encode(&self)?;
+    fn write(&self, out: &mut dyn Write) -> io::Result<()> {
+        let value = json::encode(self)?;
         json::write(out, &value)
     }
 }
@@ -192,8 +192,8 @@ impl Message for Response {
             Some(buf) => Some(json::decode(buf)?),
         })
     }
-    fn write(self, out: &mut dyn Write) -> io::Result<()> {
-        let value = json::encode(&self)?;
+    fn write(&self, out: &mut dyn Write) -> io::Result<()> {
+        let value = json::encode(self)?;
         json::write(out, &value)
     }
 }

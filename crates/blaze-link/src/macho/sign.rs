@@ -4,12 +4,14 @@
 //!
 //! The pages are hashed where they are, in the regions the core placed ([`View`]): nothing
 //! assembles the file first. They are hashed in parallel, and an incremental link hashes only
-//! the pages whose bytes differ from the last signature's ([`Cache`]).
+//! the pages the core wrote since the last signature, and the headers' and `__LINKEDIT`'s
+//! pages whose bytes differ from that signature's ([`Cache`]).
 
 #![forbid(unsafe_code)]
 
 use blaze_ids::radix;
 use rayon::prelude::*;
+use smallvec::SmallVec;
 
 use super::sha256;
 
@@ -44,6 +46,10 @@ pub(super) struct View<'a> {
     /// is a `usize`.
     parts: Vec<(u64, &'a [u8])>,
     len: usize,
+    /// The chained fixups' slots, (address, value) by address, laid over the parts: each 8
+    /// bytes at `address - base`, within `len`, so never across a page.
+    slots: &'a [(u64, u64)],
+    base: u64,
 }
 
 impl<'a> View<'a> {
@@ -66,30 +72,60 @@ impl<'a> View<'a> {
             // alloc: error path
             return Err(format!("the file's bytes run to {end:#x}, past its {len:#x} signed bytes"));
         };
-        Ok(View { parts, len })
+        Ok(View { parts, len, slots: &[], base: 0 })
+    }
+
+    /// The view with `slots` (address, the 8 bytes the file holds there) laid over its parts,
+    /// each at its address less `base`; an error naming the first not 8-aligned, out of
+    /// order or past the file.
+    pub(super) fn with_slots(self, slots: &'a [(u64, u64)], base: u64) -> Result<View<'a>, String> {
+        let mut end = 0;
+        for &(addr, _) in slots {
+            let at = addr.wrapping_sub(base);
+            if addr < base || at % 8 != 0 || at < end || at + 8 > self.len as u64 {
+                // alloc: error path
+                return Err(format!("a chained slot at {addr:#x} is not 8-aligned, in order and in the file"));
+            }
+            end = at + 8;
+        }
+        Ok(View { slots, base, ..self })
     }
 
     /// The file of `bytes`.
     #[cfg(test)]
     pub(super) fn whole(bytes: &'a [u8]) -> View<'a> {
-        View { parts: vec![(0, bytes)], len: bytes.len() }
+        View { parts: vec![(0, bytes)], len: bytes.len(), slots: &[], base: 0 }
     }
 
     pub(super) fn len(&self) -> usize {
         self.len
     }
 
-    /// Page `nth`: borrowed when one part holds all of it, else gathered into `buf`.
+    /// Page `nth`: borrowed when one part holds all of it and no slot is in it, else gathered
+    /// into `buf`.
     fn page<'b>(&'b self, nth: usize, buf: &'b mut [u8; PAGE]) -> &'b [u8] {
         let start = nth * PAGE;
         let end = (start + PAGE).min(self.len);
+        let base = self.base;
+        let slot = self.slots.partition_point(|it| ((it.0 - base) as usize) < start);
+        let slots = &self.slots[slot..];
+        let slots = &slots[..slots.partition_point(|it| ((it.0 - base) as usize) < end)];
         let first = self.parts.partition_point(|&(at, bytes)| at as usize + bytes.len() <= start);
         if let Some(&(at, bytes)) = self.parts.get(first)
             && at as usize <= start
             && at as usize + bytes.len() >= end
         {
             let at = at as usize;
-            return &bytes[start - at..end - at];
+            if slots.is_empty() {
+                return &bytes[start - at..end - at];
+            }
+            let buf = &mut buf[..end - start];
+            buf.copy_from_slice(&bytes[start - at..end - at]);
+            for &(addr, value) in slots {
+                let at = (addr - base) as usize - start;
+                buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+            }
+            return buf;
         }
         let buf = &mut buf[..end - start];
         buf.fill(0);
@@ -101,20 +137,99 @@ impl<'a> View<'a> {
             let (from, to) = (at.max(start), (at + bytes.len()).min(end));
             buf[from - start..to - start].copy_from_slice(&bytes[from - at..to - at]);
         }
+        for &(addr, value) in slots {
+            let at = (addr - base) as usize - start;
+            buf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
         buf
     }
 }
 
-/// The pages of the last signature and their hashes: a page whose bytes are the same is not
-/// hashed again. Exact (bytes compared, not fingerprints), so a signature never depends on
-/// what is cached. 4 KiB plus 32 bytes per page of the image.
+/// The last signature's hashes, and the pages of it the core doesn't track (the headers and
+/// `__LINKEDIT`, which the writer makes): a page is hashed again when the core wrote it since
+/// ([`Since`]) or, for a kept page, when its bytes differ. Exact (bytes compared, not
+/// fingerprints), so a signature never depends on what is cached. 32 bytes per page of the
+/// image, plus 4 KiB per kept page.
 #[derive(Default)]
 pub(super) struct Cache {
-    /// `pages * PAGE` bytes: each page as last signed, zero past `len`.
+    /// Each kept page as last signed, `PAGE` bytes, in the order of `kept`.
     pages: Vec<u8>,
+    /// The kept pages' hashes, in the same order.
+    kept_hashes: Vec<[u8; HASH]>,
+    /// The pages kept, as ranges of page indexes, ascending.
+    kept: SmallVec<[(u32, u32); 4]>,
     hashes: Vec<[u8; HASH]>,
     /// The length of the file last signed.
     len: usize,
+    /// The synthesis ([`crate::model::Placed::synthesis`]) last signed; 0 for none.
+    synthesis: u64,
+}
+
+/// What changed since the signature a [`Cache`] holds.
+pub(super) struct Since<'a> {
+    /// The synthesis these changes are from ([`crate::model::Delta::from`]): used only when
+    /// it is the cache's.
+    pub from: u64,
+    /// The file's byte ranges written since, (offset, length), by offset, not overlapping.
+    pub written: &'a [(u64, u64)],
+}
+
+/// A signature against a [`Cache`].
+pub(super) struct Cached<'a> {
+    pub cache: &'a mut Cache,
+    /// The synthesis this signature is of, which the cache records.
+    pub synthesis: u64,
+    /// `None` hashes every page.
+    pub since: Option<Since<'a>>,
+    /// The file's byte ranges whose pages are kept and compared, (offset, length): the
+    /// headers and `__LINKEDIT`.
+    pub kept: &'a [(u64, u64)],
+}
+
+/// Whether a page (from `start`, `PAGE` bytes) overlaps a range of `written`.
+fn touched(written: &[(u64, u64)], start: u64) -> bool {
+    let at = written.partition_point(|it| it.0 + it.1 <= start);
+    written.get(at).is_some_and(|it| it.0 < start + PAGE as u64)
+}
+
+/// The pages of `ranges` in a file of `len` bytes, as merged ranges of page indexes.
+fn page_ranges(ranges: &[(u64, u64)], len: usize) -> SmallVec<[(u32, u32); 4]> {
+    let mut out: SmallVec<[(u32, u32); 4]> = SmallVec::new();
+    for &(at, size) in ranges.iter().filter(|it| it.1 != 0) {
+        let first = (at / PAGE as u64) as u32;
+        let end = (at + size).min(len as u64).div_ceil(PAGE as u64) as u32;
+        if first >= end {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if first <= last.1 => last.1 = last.1.max(end),
+            _ => out.push((first, end)),
+        }
+    }
+    out
+}
+
+/// The `k`th page of `ranges`, and back: a page's place among them.
+fn nth_page(ranges: &[(u32, u32)], mut k: usize) -> usize {
+    for &(first, end) in ranges {
+        let len = (end - first) as usize;
+        if k < len {
+            return first as usize + k;
+        }
+        k -= len;
+    }
+    unreachable!("a kept page past the kept ranges")
+}
+
+fn place_of(ranges: &[(u32, u32)], page: usize) -> Option<usize> {
+    let mut before = 0;
+    for &(first, end) in ranges {
+        if (first as usize..end as usize).contains(&page) {
+            return Some(before + page - first as usize);
+        }
+        before += (end - first) as usize;
+    }
+    None
 }
 
 /// The signature of `file` (every byte before the signature), whose `__TEXT` is `text_len`
@@ -125,7 +240,7 @@ pub(super) fn signature(
     text_at: u64,
     text_len: u64,
     main: bool,
-    cache: Option<&mut Cache>,
+    cache: Option<Cached<'_>>,
     out: &mut Vec<u8>,
 ) {
     let pages = file.len().div_ceil(PAGE);
@@ -186,46 +301,69 @@ fn hash(file: &View<'_>, slots: &mut [u8]) {
     });
 }
 
-fn hash_cached(file: &View<'_>, slots: &mut [u8], cache: &mut Cache) {
+fn hash_cached(file: &View<'_>, slots: &mut [u8], cached: Cached<'_>) {
     let pages = slots.len() / HASH;
-    let was = cache.len;
-    cache.pages.resize(pages * PAGE, 0);
+    let Cached { cache, synthesis, since, kept } = cached;
+    let kept = page_ranges(kept, file.len());
+    let kept_len: usize = kept.iter().map(|it| (it.1 - it.0) as usize).sum();
+    // `None`: every page is hashed.
+    let written = since
+        .filter(|it| it.from != 0 && it.from == cache.synthesis)
+        .filter(|_| cache.len == file.len() && cache.hashes.len() == pages && cache.kept == kept)
+        .map(|it| it.written);
+    cache.synthesis = 0;
+    cache.pages.resize(kept_len * PAGE, 0);
+    cache.kept_hashes.resize(kept_len, [0; HASH]);
     cache.hashes.resize(pages, [0; HASH]);
-    (slots.par_chunks_mut(HASH * GROUP))
-        .zip(cache.pages.par_chunks_mut(PAGE * GROUP))
-        .zip(cache.hashes.par_chunks_mut(GROUP))
+
+    let ranges = &kept[..];
+    (cache.pages.par_chunks_mut(PAGE))
+        .zip(cache.kept_hashes.par_iter_mut())
         .enumerate()
-        .for_each(|(group, ((slots, old), hashes))| {
+        .with_min_len(GROUP)
+        .for_each(|(k, (old, hash))| {
+            let page = nth_page(ranges, k);
             let mut buf = [0u8; PAGE];
-            for (nth, slot) in slots.chunks_exact_mut(HASH).enumerate() {
-                let page = group * GROUP + nth;
-                let bytes = file.page(page, &mut buf);
-                let old = &mut old[nth * PAGE..nth * PAGE + bytes.len()];
-                let old_len = was.saturating_sub(page * PAGE).min(PAGE);
-                if old_len != bytes.len() || old != bytes {
-                    old.copy_from_slice(bytes);
-                    hashes[nth] = sha256::digest(bytes);
-                }
-                slot.copy_from_slice(&hashes[nth]);
+            let bytes = file.page(page, &mut buf);
+            let old = &mut old[..bytes.len()];
+            let again = match written {
+                None => true,
+                Some(written) => touched(written, (page * PAGE) as u64) || old != bytes,
+            };
+            if again {
+                old.copy_from_slice(bytes);
+                *hash = sha256::digest(bytes);
             }
         });
+
+    let kept_hashes = &cache.kept_hashes;
+    (slots.par_chunks_mut(HASH * GROUP)).zip(cache.hashes.par_chunks_mut(GROUP)).enumerate().for_each(
+        |(group, (slots, hashes))| {
+            let mut buf = [0u8; PAGE];
+            for (nth, (slot, hash)) in slots.chunks_exact_mut(HASH).zip(hashes.iter_mut()).enumerate() {
+                let page = group * GROUP + nth;
+                if let Some(k) = place_of(ranges, page) {
+                    *hash = kept_hashes[k];
+                } else if written.is_none_or(|written| touched(written, (page * PAGE) as u64)) {
+                    *hash = sha256::digest(file.page(page, &mut buf));
+                }
+                slot.copy_from_slice(hash);
+            }
+        },
+    );
     cache.len = file.len();
+    cache.kept = kept;
+    cache.synthesis = synthesis;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Cache, PAGE, View, signature};
+    use super::{Cache, Cached, PAGE, Since, View, signature};
 
     fn noise(seed: u64, len: usize) -> Vec<u8> {
-        let mut seed = seed | 1;
-        (0..len)
-            .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                seed as u8
-            })
-            .collect()
+        let mut out = vec![0; len];
+        blaze_ids::rng::SplitMix64::new(seed).fill(&mut out);
+        out
     }
 
     /// The file a view stands for, assembled.
@@ -267,19 +405,57 @@ mod tests {
     fn the_cache_changes_nothing() {
         let mut cache = Cache::default();
         let mut file = noise(7, 70 * PAGE + 123);
-        for round in 0..6u64 {
+        for round in 1..9u64 {
+            // What the core says it wrote, and whether it knows (a stale token says it doesn't).
+            let mut written: Vec<(u64, u64)> = Vec::new();
+            let mut from = round - 1;
             match round {
-                // A page changed, the file grown, shrunk, a page changed back, unchanged.
-                1 => file[5 * PAGE + 9] ^= 0xff,
-                2 => file.extend_from_slice(&noise(round, 3 * PAGE + 11)),
-                3 => file.truncate(40 * PAGE + 5),
-                4 => file[5 * PAGE + 9] ^= 0xff,
+                // A page written, the file grown, shrunk, a page written back, a kept page
+                // changed unsaid, a stale token, unchanged.
+                2 => {
+                    file[5 * PAGE + 9] ^= 0xff;
+                    written.push((5 * PAGE as u64 + 9, 1));
+                }
+                3 => file.extend_from_slice(&noise(round, 3 * PAGE + 11)),
+                4 => file.truncate(40 * PAGE + 5),
+                5 => {
+                    file[5 * PAGE + 9] ^= 0xff;
+                    written.push((5 * PAGE as u64, 16));
+                }
+                6 => file[file.len() - 3] ^= 0xff,
+                7 => {
+                    file[20 * PAGE] ^= 0xff;
+                    from = 1;
+                }
                 _ => {}
             }
+            let kept = [(0, PAGE as u64), (file.len() as u64 - 2 * PAGE as u64, 2 * PAGE as u64)];
+            let since = Some(Since { from, written: &written });
             let (mut want, mut seen) = (Vec::new(), Vec::new());
             signature(&View::whole(&file), "id", 0, 0x4000, false, None, &mut want);
-            signature(&View::whole(&file), "id", 0, 0x4000, false, Some(&mut cache), &mut seen);
+            let cached = Cached { cache: &mut cache, synthesis: round, since, kept: &kept };
+            signature(&View::whole(&file), "id", 0, 0x4000, false, Some(cached), &mut seen);
             assert_eq!(seen, want, "round {round}");
         }
+    }
+
+    #[test]
+    fn slots_are_signed_over_their_parts() {
+        let (a, b) = (noise(1, 3 * PAGE), noise(2, PAGE));
+        let len = 5 * PAGE;
+        let parts: Vec<(u64, &[u8])> = vec![(0, &a[..]), (4 * PAGE as u64, &b[..])];
+        let slots = [(0x1000_0008, 7u64), (0x1000_0000 + 2 * PAGE as u64, u64::MAX)];
+        let view = View::new(len as u64, parts.clone()).unwrap().with_slots(&slots, 0x1000_0000).unwrap();
+        let mut file = assembled(len, &parts);
+        for &(addr, value) in &slots {
+            let at = (addr - 0x1000_0000) as usize;
+            file[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        let (mut want, mut seen) = (Vec::new(), Vec::new());
+        signature(&View::whole(&file), "x", 0, 0x4000, true, None, &mut want);
+        signature(&view, "x", 0, 0x4000, true, None, &mut seen);
+        assert_eq!(seen, want);
+        let unaligned = [(0x1000_0004, 0u64)];
+        assert!(View::new(len as u64, parts).unwrap().with_slots(&unaligned, 0x1000_0000).is_err());
     }
 }

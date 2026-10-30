@@ -72,6 +72,8 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 (under its `#[cfg(test)]`), and `crates/hir-ty-borrowck/src/scan/tests.rs` line 5, before
 `mod db;` after `pub(crate) mod db;`, so the budget tests use the same test database.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## B1. `crates/hir-ty-borrowck/src/mem.rs` (new)
 
 ```rust
@@ -155,7 +157,11 @@ order reaches the output is named in its part and turned into a vector in insert
 a frame map of indices where it is looked up), which is rustc's own `FxIndexMap` order; a map
 only looked up changes nothing.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## B2. The core containers
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B2.1 `crates/hir-ty-borrowck/src/bitset.rs`
 
@@ -330,6 +336,8 @@ Tests (lines 207-281): each test body runs in `blaze_mem::frame::task(blaze_mem:
 ```
 
 (The first two allocations warm the frame's reservation, made once per thread and depth.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B2.2 `crates/hir-ty-borrowck/src/relation.rs`
 
@@ -586,6 +594,8 @@ Tests: in `frame::task(Tag::Mir, |frame| ..)`; `Facts::default()` -> `Facts::new
     }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B2.3 `crates/hir-ty-borrowck/src/dataflow.rs`
 
 Lines 17-29, before:
@@ -717,6 +727,8 @@ Tests (lines 166-429): each test in `frame::task(Tag::Mir, |frame| ..)`; `GenKil
 Rng) -> Case<'f>`, `fn composed<'f>(frame: &'f Frame, case: &Case<'_>, backward: bool) ->
 GenKill<'f>`. The naive reference versions keep their global `Vec`s: they are the test's
 oracle, not the code under test.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B2.4 `crates/hir-ty-borrowck/src/cfg.rs`
 
@@ -898,6 +910,8 @@ collect, filled, set, FSet};`. Tests: `Dominators::of_graph(frame, count, ..)` i
 
 `predecessor_locations` (lines 155-168) keeps its `SmallVec<[Location; 4]>`: four inline, it is
 asked only while an error is explained.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B2.5 `crates/hir-ty-borrowck/src/intervals.rs`
 
@@ -1106,6 +1120,8 @@ Add the budget test:
     }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## B3. Lifetimes
 
 Every per-run struct above takes `'f`, the frame's lifetime; the structs of B5-B7 that hold
@@ -1115,7 +1131,11 @@ them take it too (`Cfg<'f>`, `MoveData<'f>`, `Loans<'f>`, `Regions<'f, 'db>`, `R
 result and the scan it holds already bound. Existing lifetimes named `'f` (`liveness.rs`'s
 `Effects<'f>`, line 50) are renamed `'e`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## B4. The entry points: `crates/hir-ty-borrowck/src/lib.rs`
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B4.1 The queries take the run's frame
 
@@ -1168,6 +1188,8 @@ point a checker's entry may become `current`; it is not needed for the budget (T
 `borrowck_in_mode`, the same task either way).
 
 `use crate::mem::Frame;` with the other imports.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B4.2 `check_owner`: one task per body, what crosses bodies in the owner's frame
 
@@ -1382,6 +1404,8 @@ impl<I: Iterator> ExactSizeIterator for ExactLen<I> {}
 `result.skipped` (lines 348, 399) keeps its `format!`: it is part of the owned result and is
 made once, when MIR lowering refuses a body.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B4.3 `coroutines`, `inline_consts`, `nested_bodies_written`
 
 They return a fresh `Vec` per body checked. Lines 514-532, before / after:
@@ -1473,6 +1497,8 @@ fn nested_bodies_written<'db>(
 
 (`stack` is the only allocation per call; one per body, in the owner's frame.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B4.4 `Ctx` (lines 617-726)
 
 Fields, before:
@@ -1525,9 +1551,11 @@ after:
 `self.copy.borrow().get(&ty)`, `.insert(ty, known)` and the `bindings.get(&local)` reads are the
 same on a hashbrown map.
 
-`infcx` (line 675): `interner.infer_ctxt().build(..)` builds hir-ty's `InferCtxt`, whose tables
-are mem-db-solver's and mem-db-infer's to put in the frame; it is built in the body's task,
-so what they make it take from `frame::current` is the body's frame.
+`infcx` (line 675): `interner.infer_ctxt().build(..)` builds hir-ty's `InferCtxt`, unchanged
+here: its tables do not come from the body's frame but are recycled per worker
+(`v2/requests/mem-db-solver.md` request 5), so nothing is threaded into it.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B4.5 `normalized_env` (lines 889-912)
 
@@ -1546,6 +1574,8 @@ after (`env.clauses().iter()` is a copied slice iterator mapped, so it says its 
 ```
 
 It runs in the body's task (from `Ctx::new`), so `current` is the body's frame.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B4.6 `debugging` (lines 90-98)
 
@@ -1568,6 +1598,8 @@ pub(crate) fn debugging(db: &Db, owner: InferBodyId<'_>) -> bool {
 
 (the `match` after it compares `wanted` as a `&str` already: `wanted != "1"`, `== wanted`).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B4.7 `drops_in_const` (lines 475-512)
 
 Line 489 `let mut moved = rustc_hash::FxHashSet::default();` -> a bitset of locals:
@@ -1583,6 +1615,8 @@ Line 489 `let mut moved = rustc_hash::FxHashSet::default();` -> a bitset of loca
 
 and line 508 `!moved.contains(&place.local)` ->
 `!moved.contains(place.local.into_raw().into_u32() as usize)`; `use crate::bitset::BitSet;`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## B5. The analyses
 
@@ -1601,12 +1635,14 @@ Signatures B6 (regions.rs) and B7 (check.rs) call, after this part:
 | `Loans::gather` | `(ctx, body, &cfg, &regions, unique) -> Loans<'a>` |
 | `Loans::compute_scopes` | `(&mut self, ctx, body, &cfg, &values)` |
 | `Loans::compute_polonius_scopes` | `(&mut self, ctx, body, &cfg, &live_loans)` |
-| `Loans::entry_sets` | `(&self, ctx, body, &cfg) -> BitMatrix<'a>` (check.rs line 109 already passes `ctx`) |
+| `Loans::entry_sets` | `(&self, ctx, body, &cfg) -> BitMatrix<'a>` (check.rs line 112 passes `body, &cfg` today; B7.12 adds `ctx` to it and to lines 108 and 110) |
 | `loans::static_locals` | `(ctx.frame, body) -> FSet<'f, LocalId>` |
 | `scan::Scan::new` | `Scan::new(frame, store, infer, interner) -> Scan<'f, 'db>` (the owner's frame, B4.2) |
 | `Constraints` | `Constraints::new(frame)`, no `Default` |
 
 `'a` is `Ctx<'a, 'db>`'s: the body's task's frame.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B5.1 `liveness.rs`
 
@@ -1910,6 +1946,8 @@ analyses over all locals, a value per region, the order of points and the drop c
 - Imports: line 7 `use rustc_hash::{FxHashMap, FxHashSet};` ->
   `use crate::mem::{self, FMap, FVec, Frame, filled};`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B5.2 `loans.rs`
 
 Per body: the loans, their projections, three relations; per loan, `out_of_scope`'s walk; per
@@ -1950,20 +1988,18 @@ point of a body with a two-phase borrow, a list of used locals.
   after:
 
   ```rust
-      let all = |exprs: &mut dyn Iterator<Item = hir_def::hir::ExprId>| {
-          exprs.all(|it| const_promotable(ctx, body, it, depth + 1))
-      };
+      let promotable = |it: hir_def::hir::ExprId| const_promotable(ctx, body, it, depth + 1);
   ```
 
-  with the call sites, before -> after: `all(elements.to_vec())` ->
-  `all(&mut elements.iter().copied())` (line 422), `all(exprs.to_vec())` ->
-  `all(&mut exprs.iter().copied())` (426), `all(fields.iter().map(|it| it.expr).collect())` ->
-  `all(&mut fields.iter().map(|it| it.expr))` (428), `all(args.to_vec())` ->
-  `all(&mut args.iter().copied())` (448), `all(std::iter::once(receiver).chain(args.to_vec())
-  .collect())` -> `all(&mut std::iter::once(receiver).chain(args.iter().copied()))` (458).
-  The `&mut dyn Iterator` is one indirect call per child on a path that runs per constant
-  element, against a heap allocation and copy per aggregate: `// dyn: one closure over five
-  iterator types` on the `let all` line.
+  (it captures two shared references and a `usize`, so it is `Copy` and each site passes it by
+  value: no `dyn`, no collect). The call sites, before -> after: `all(elements.to_vec())` ->
+  `elements.iter().copied().all(promotable)` (line 422), `all(exprs.to_vec())` ->
+  `exprs.iter().copied().all(promotable)` (426), `all(fields.iter().map(|it|
+  it.expr).collect())` -> `fields.iter().map(|it| it.expr).all(promotable)` (428),
+  `all(args.to_vec())` -> `args.iter().copied().all(promotable)` (448),
+  `all(std::iter::once(receiver).chain(args.to_vec()).collect())` ->
+  `std::iter::once(receiver).chain(args.iter().copied()).all(promotable)` (458). The children
+  are tested in the same order and the first failing one stops the walk, as before.
 - `Loans::gather` (lines 471-640), before / after of the allocations:
 
   ```rust
@@ -2210,6 +2246,8 @@ point of a body with a two-phase borrow, a list of used locals.
 - Imports: line 10 `use rustc_hash::{FxHashMap, FxHashSet};` ->
   `use crate::mem::{self, FMap, FSet, FVec, Frame};`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B5.3 `moves.rs`
 
 Per body: the move-path tree's six columns, its map of steps, the moves and inits, the
@@ -2323,6 +2361,8 @@ preorder columns and the facts.
 - Imports: line 19 `use rustc_hash::FxHashMap;` -> `use crate::mem::{self, FMap, FVec, Frame,
   filled};`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B5.4 `polonius.rs`
 
 Per body in `Polonius` mode: a direction per region, two CSRs over the constraints, and per
@@ -2403,6 +2443,8 @@ loan a walk with a visited set per region it reaches.
 - `record_variances` and the functions under it (lines 205-350): `directions: &mut
   FVec<'_, Option<Direction>>` for `&mut Vec<Option<Direction>>`.
 - Imports: add `use crate::mem::{FVec, filled};`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B5.5 `inference.rs`
 
@@ -2486,6 +2528,8 @@ members CSR.
   `else if on_stack.contains(t)`, `on_stack[member as usize] = false;` ->
   `on_stack.remove(member as usize);` (a bit per node, 1/8 of the bytes, the same answers).
 - Imports: `use super::bitset::BitSet; use crate::mem::{FVec, Frame, filled};`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### B5.6 `constraints.rs`
 
@@ -2586,6 +2630,8 @@ Iter<'a, 'f>; .. }`, `iter(&self) -> Iter<'_, 'f>`. Line 6 `use std::cell::OnceC
 `use std::cell::{Cell, OnceCell};`, and `use crate::mem::{FVec, Frame};`. Test: in
 `frame::task(Tag::Mir, |frame| ..)`, `Constraints::default()` -> `Constraints::new(frame)`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B5.7 `scan.rs`
 
 Once per owner, in the owner's frame (B4.2).
@@ -2681,6 +2727,8 @@ Once per owner, in the owner's frame (B4.2).
   and, for `guard_bindings`, `|got, want: &Vec<BindingId>| got.as_slice() == want.as_slice()`.
   The vector comparisons (`scan.lets == want`) hold across allocators as they are.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B5.8 `qualifs.rs`
 
 - `ValueCx` (line 63): `pub(crate) consts: &'a RefCell<FMap<'a, ConstId, Qualifs>>`; line 17
@@ -2715,16 +2763,22 @@ Once per owner, in the owner's frame (B4.2).
   (`parts` is called once on each of the three paths that call it, each returning, so an
   `FnOnce` serves.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### B5.9 `timings.rs`
 
 Nothing per run: its thread-local `RefCell<Option<Timings>>` is a measurement's, set up by the
 caller that asks for timings.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## W. `crates/hir-ty-wfcheck/`
 
 Tag `Infer`. `wfcheck` and `inferred_outlives` are queries; each opens a `frame::task` of
 `Tag::Infer` for its run, as borrowck's do (B4.1 says why `task` and not `current`), and the
 code under them takes it through the `Check` and `Wfcx` that hold it.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### W0. Setup
 
@@ -2746,6 +2800,8 @@ code under them takes it through the `Check` and `Wfcx` that hold it.
   and its test, without `FDeque`, `filled` and `ExactLen` (unused here).
 - `src/outlives.rs` line 6 `mod tests;` -> `pub(crate) mod tests;`, and `outlives/tests.rs`
   line 5 `mod db;` -> `pub(crate) mod db;` (the budget tests use its `TestDB`).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### W1. `lib.rs`
 
@@ -2966,6 +3022,8 @@ predicate checked) is a `Symbol` clone, a reference count, not an allocation: un
 
 Imports: `use crate::mem::{self, FVec}; use blaze_mem::frame::Frame;`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### W2. `outlives.rs`
 
 The output buffers become generic over their allocator, as std's collections are: the checks
@@ -3158,6 +3216,8 @@ is one global allocation per `components` call on it, which T2's count shows (`M
 the calls on it). The long-term fix is a per-worker `Scratch<Component>` that `components`
 fills and its callers read before calling it again; it is listed in the notes as open.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### W3. `compare.rs`
 
 - `own` (lines 140-146) and the kinds test (152-153): `GenericArgs::iter(self)` is an exact
@@ -3201,11 +3261,15 @@ fills and its callers read before calling it again; it is listed in the notes as
   ```
 - Line 20 `use smallvec::SmallVec;` goes if nothing else in the file uses it (it does not).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### W4. `persist.rs`
 
 The edge (the memo written to the store and read back): `to_result` (line 73) is exact; `write`
 (lines 93-115) collects the message offsets and rows per memo written, `// alloc: the memo's
 persisted form, once per write` on each. Unchanged otherwise.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## S. Per-call buffers, reused
 
@@ -3233,7 +3297,11 @@ and cleared per use:
 | wfcheck `region_outlives` (854) | call: two `SmallVec`s, heap past eight | one frame vector at the top, freed in place (W2) |
 | wfcheck `variants`, compare `own`/`synthetic`/`hybrid` | call: a `SmallVec` | iterators (W2, W3) |
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## T. Budget tests
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### T1. `crates/hir-ty-borrowck/src/budget.rs` (new)
 
@@ -3410,15 +3478,18 @@ fn a_passing_gate_allocates_nothing() {
 }
 ```
 
-What each needs before it passes, besides this request: the first two, the frames of what a
-body's check builds through hir-ty (`InferCtxt` and the solver's caches: mem-db-infer,
-mem-db-solver) and B6/B7's parts (regions.rs, check.rs, explain.rs) with this rule for B7:
+What each needs before it passes, besides this request: the first two, that what a
+body's check builds through hir-ty allocates nothing once warm (`InferCtxt`'s tables, recycled
+per worker by mem-db-solver's request 5, and the solver's caches: mem-db-infer, mem-db-solver)
+and B6/B7's parts (regions.rs, check.rs, explain.rs) with this rule for B7:
 **each owned `String` of a diagnostic is made in one allocation** (formatted into a frame
 buffer, then copied out at its length: `format!` estimates and may grow, and a growth counts);
 the last three, salsa's hit and revalidation paths allocating nothing (mem-db-salsa).
 `gate::checked(db, def) -> Result<Checked<'_>, Refused>` (`gate.rs` line 108) on a passing
 body reads the memo and makes the `Checked` view; a refused body's `Refused` clones the
 errors, its error path.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### T2. `crates/hir-ty-wfcheck/src/budget.rs` (new)
 
@@ -3500,9 +3571,12 @@ fn asking_again_allocates_nothing() {
 `check_item` (W1) is `wfcheck`'s body as a plain function, as `borrowck_in_mode` is
 `borrowck`'s, so the test runs it again with what it reads already asked. `Twice` has two E0310s of different sites (`push_new`
 keeps both); the second pass also checks `push_new` adds nothing of its own (its comparison
-allocates nothing). What the first test needs besides this request: `InferCtxt` and the solver
-on frames (mem-db-infer, mem-db-solver) for `Wfcx`; the second, salsa's hit path
+allocates nothing). What the first test needs besides this request: `Wfcx`'s `InferCtxt`
+and solver allocating nothing once warm (tables recycled per worker, mem-db-solver's request
+5); the second, salsa's hit path
 (mem-db-salsa).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## Asks of others
 
@@ -3515,5 +3589,11 @@ on frames (mem-db-infer, mem-db-solver) for `Wfcx`; the second, salsa's hit path
 - **hir-ty `lower.rs` line 3945** (`ElidedLifetimes::regions`): `errors: &[impl
   AsRef<[Region<'db>]>]` for `&[Vec<Region<'db>>]` (`.map(Vec::as_slice)` ->
   `.map(AsRef::as_ref)`), so wfcheck's per-input lists can be frame vectors (W1).
-- **mem-db-infer / mem-db-solver**: `InferCtxt` and the solver's per-run state on the run's
-  frame; both crates' "owned result alone" tests (T1, T2) count what they allocate.
+- **mem-db-infer / mem-db-solver**: `InferCtxt`'s tables recycled per worker (mem-db-solver
+  request 5; nothing is threaded from the checks) and the solver's per-run state allocating
+  nothing once warm; both crates' "owned result alone" tests (T1, T2) count what they allocate.
+- **Settled with `dedup-bits-db`** (B7.13 in `v2/requests/mem-db-checks-check.md`):
+  `v2/requests/db.md` "## dedup: bits: hir-ty-borrowck on frame words" lands after B2 and
+  keeps B2.1's frame words, so T1's zero global allocations hold.
+
+> forwarded to db (from requests, pass 16; told by tmux).

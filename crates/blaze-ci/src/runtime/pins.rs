@@ -51,6 +51,7 @@ pub(crate) fn run(socket: PathBuf, commands: mpsc::Receiver<Command>, service: m
                     (None, Some(root), Err(why)) => {
                         let _ = pins.service.send(Input::Unpinned { root, why });
                     }
+                    // alloc: error path
                     (None, _, Err(why)) => log(&format!("holding a view open failed: {why}")),
                     (None, _, Ok(_)) => {}
                 }
@@ -64,7 +65,7 @@ impl Pins {
     fn open(&mut self, view: ViewRef) -> Result<ContentId, String> {
         for attempt in 0..2 {
             let client = self.connect()?;
-            match open(client, view.clone()) {
+            match open(client, view.clone()) { // clone: once per pin; a root's view owns nothing
                 Ok(Ok(root)) => {
                     *self.held.entry(root).or_default() += 1;
                     return Ok(root);
@@ -73,11 +74,13 @@ impl Pins {
                 Err(error) => {
                     self.client = None;
                     if attempt == 1 {
+                        // alloc: error path
                         return Err(format!("the daemon at {}: {error}", self.socket.display()));
                     }
                 }
             }
         }
+        // alloc: error path
         Err(format!("the daemon at {} could not be asked", self.socket.display()))
     }
 
@@ -87,21 +90,22 @@ impl Pins {
         if *count == 0 {
             self.held.remove(&root);
         }
+        // alloc: once per root let go, the daemon's name for an error
         let socket = self.socket.display().to_string();
         let result = self.connect().and_then(|client| {
-            let mut said = Vec::new();
+            let mut said = Vec::new(); // alloc: none until the daemon says an error
             let ok = client
                 .call(Request::Close { root }, |response| {
                     if let Response::Error(error) = response {
                         said.push(api_error(error));
                     }
                 })
-                .map_err(|error| format!("the daemon at {socket}: {error}"))?;
+                .map_err(|error| format!("the daemon at {socket}: {error}"))?; // alloc: error path
             if ok { Ok(()) } else { Err(said_or(&said, "the daemon refused and said nothing more")) }
         });
         if let Err(why) = result {
             // A lost connection closed every hold already.
-            log(&format!("letting go of root {root:x} failed: {why}"));
+            log(&format!("letting go of root {root:x} failed: {why}")); // alloc: error path
         }
     }
 
@@ -109,8 +113,10 @@ impl Pins {
     fn connect(&mut self) -> Result<&mut Client, String> {
         if self.client.is_none() {
             let mut client = Client::unix(&self.socket).map_err(|error| {
+                // alloc: error path
                 format!("could not reach the daemon at {}: {error}", self.socket.display())
             })?;
+            // alloc: once per connection lost, the roots held again
             let mut held: Vec<(ContentId, u32)> = self.held.iter().map(|(root, count)| (*root, *count)).collect();
             held.sort_unstable_by_key(|&(root, _)| root);
             for (root, count) in held {
@@ -124,7 +130,7 @@ impl Pins {
                         }
                         // The counts stand: the next connection holds them again.
                         Err(error) => {
-                            return Err(format!(
+                            return Err(format!( // alloc: error path
                                 "the daemon at {} hung up while its roots were held again: {error}",
                                 self.socket.display()
                             ));
@@ -142,7 +148,7 @@ impl Pins {
 /// connection's.
 pub(crate) fn open(client: &mut Client, view: ViewRef) -> Result<Result<ContentId, String>, ClientError> {
     let mut opened = None;
-    let mut said = Vec::new();
+    let mut said = Vec::new(); // alloc: none until the daemon says an error
     let ok = client.call(Request::Open { view }, |response| match response {
         Response::Opened { root } => opened = Some(*root),
         Response::Error(error) => said.push(api_error(error)),
@@ -150,6 +156,7 @@ pub(crate) fn open(client: &mut Client, view: ViewRef) -> Result<Result<ContentI
     })?;
     Ok(match (ok, opened) {
         (true, Some(root)) => Ok(root),
+        // alloc: error path
         (true, None) => Err("the daemon ended the open without a root".to_owned()),
         (false, _) => Err(said_or(&said, "the daemon refused the view and said nothing more")),
     })

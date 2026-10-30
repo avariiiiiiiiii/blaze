@@ -21,11 +21,12 @@
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
+use blaze_mem::{Frame, Tag, frame};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, Reloc, RelocKind, Static, Target,
-    Unwind, content,
+    Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, Relocs, RelocsView, Static, Target, Unwind,
+    content,
 };
 
 /// What an instance refers to, in the order its front end lists them: every function, static
@@ -46,21 +47,13 @@ pub enum Ref {
     Coverage(u32),
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct TemplateReloc {
-    pub at: u32,
-    pub kind: RelocKind,
-    pub target: Ref,
-    pub addend: i64,
-}
-
 /// A data object of a template: it points only at data before it, so each one's content ID
 /// can be made in order.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct TemplateData {
     pub align: u32,
     pub bytes: Vec<u8>,
-    pub relocs: Vec<TemplateReloc>,
+    pub relocs: Relocs<Ref>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
@@ -68,7 +61,7 @@ pub struct Template {
     pub arch: Arch,
     pub align: u32,
     pub code: Vec<u8>,
-    pub relocs: Vec<TemplateReloc>,
+    pub relocs: Relocs<Ref>,
     pub data: Vec<TemplateData>,
     pub inlined: Vec<CodeHash>,
     pub side: Option<ContentId>,
@@ -100,6 +93,154 @@ pub enum TemplateUnwind {
     Windows { info: Vec<u8>, handler: Option<u32>, lsda: Option<u32> },
 }
 
+/// A [`Template`] borrowed: from a template ([`Template::view`]) or straight from a stored blob
+/// ([`crate::blob::decode_view`]), its lists in a frame. An instance's function is made of one
+/// with each part copied once, into the function ([`TemplateView::instantiate`]).
+pub struct TemplateView<'a> {
+    pub arch: Arch,
+    pub align: u32,
+    pub code: &'a [u8],
+    pub relocs: RelocsView<'a, Ref>,
+    pub data: &'a [DataView<'a>],
+    pub inlined: &'a [CodeHash],
+    pub side: Option<ContentId>,
+    pub unwind: Option<UnwindView<'a>>,
+    pub lines: &'a [Line],
+    pub refs: u32,
+    pub externs: &'a [&'a str],
+    /// Owned: the function made of the view takes it as it is.
+    pub coverage: Option<Covered>,
+}
+
+/// A [`TemplateData`] borrowed.
+#[derive(Clone, Copy)]
+pub struct DataView<'a> {
+    pub align: u32,
+    pub bytes: &'a [u8],
+    pub relocs: RelocsView<'a, Ref>,
+}
+
+/// A [`TemplateUnwind`] borrowed.
+#[derive(Clone, Copy)]
+pub enum UnwindView<'a> {
+    Dwarf {
+        code_align: u32,
+        data_align: i32,
+        return_address: u16,
+        cie: &'a [u8],
+        fde: &'a [u8],
+        personality: Option<u32>,
+        lsda: Option<u32>,
+    },
+    Windows { info: &'a [u8], handler: Option<u32>, lsda: Option<u32> },
+}
+
+impl TemplateData {
+    pub fn view(&self) -> DataView<'_> {
+        DataView { align: self.align, bytes: &self.bytes, relocs: self.relocs.view() }
+    }
+}
+
+impl DataView<'_> {
+    fn owned(self) -> TemplateData {
+        // alloc: a template its caller keeps
+        TemplateData { align: self.align, bytes: self.bytes.to_vec(), relocs: self.relocs.to_relocs() }
+    }
+}
+
+impl TemplateUnwind {
+    pub fn view(&self) -> UnwindView<'_> {
+        match self {
+            TemplateUnwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda } => {
+                UnwindView::Dwarf {
+                    code_align: *code_align,
+                    data_align: *data_align,
+                    return_address: *return_address,
+                    cie,
+                    fde,
+                    personality: *personality,
+                    lsda: *lsda,
+                }
+            }
+            TemplateUnwind::Windows { info, handler, lsda } => {
+                UnwindView::Windows { info, handler: *handler, lsda: *lsda }
+            }
+        }
+    }
+}
+
+impl UnwindView<'_> {
+    fn owned(self) -> TemplateUnwind {
+        match self {
+            UnwindView::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda } => {
+                TemplateUnwind::Dwarf {
+                    code_align,
+                    data_align,
+                    return_address,
+                    // alloc: a template its caller keeps
+                    cie: cie.to_vec(),
+                    fde: fde.to_vec(), // alloc: as `cie`
+                    personality,
+                    lsda,
+                }
+            }
+            UnwindView::Windows { info, handler, lsda } => {
+                // alloc: a template its caller keeps
+                TemplateUnwind::Windows { info: info.to_vec(), handler, lsda }
+            }
+        }
+    }
+}
+
+impl TemplateView<'_> {
+    /// The function of instance `key` whose references are `refs`: [`Template::instantiate`]
+    /// of the template the view is of, each part copied once.
+    pub fn instantiate(self, key: InstanceKey, refs: &Refs) -> Result<CompiledFunction, TemplateError> {
+        check_refs(refs)?;
+        if refs_len(refs) != self.refs {
+            return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
+        }
+        frame::task(Tag::Codegen, |frame| {
+            let data = instantiate_data(self.data, refs, self.externs, frame)?;
+            Ok(CompiledFunction {
+                key,
+                arch: self.arch,
+                align: self.align,
+                // alloc: the instance's code, kept by the build
+                code: self.code.to_vec(),
+                relocs: instantiate_relocs(self.relocs, refs, self.externs, &data, None, frame)?,
+                unwind: self.unwind.map(|it| instantiate_unwind(it, refs, &data)).transpose()?,
+                data,
+                // alloc: kept by the build
+                inlined: self.inlined.to_vec(),
+                side: self.side,
+                // alloc: kept by the build
+                lines: self.lines.to_vec(),
+                coverage: self.coverage,
+            })
+        })
+    }
+
+    /// The template the view is of, every part copied.
+    pub fn owned(self) -> Template {
+        Template {
+            arch: self.arch,
+            align: self.align,
+            // alloc: a template its caller keeps, each list at its exact length
+            code: self.code.to_vec(),
+            relocs: self.relocs.to_relocs(),
+            data: self.data.iter().map(|it| it.owned()).collect(), // alloc: as `code`
+            inlined: self.inlined.to_vec(), // alloc: as `code`
+            side: self.side,
+            unwind: self.unwind.map(UnwindView::owned),
+            lines: self.lines.to_vec(), // alloc: as `code`
+            refs: self.refs,
+            externs: self.externs.iter().map(|it| (*it).to_owned()).collect(), // alloc: as `code`
+            coverage: self.coverage,
+        }
+    }
+}
+
 /// A static's value with what it refers to by place, as a function's [`Template`]. Never
 /// merged with another by content: it is the static [`Target::Static`] names.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
@@ -115,7 +256,7 @@ pub struct StaticTemplate {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TemplateInit {
-    Bytes { bytes: Vec<u8>, relocs: Vec<TemplateReloc> },
+    Bytes { bytes: Vec<u8>, relocs: Relocs<Ref> },
     Zeroed { size: u64 },
 }
 
@@ -174,10 +315,14 @@ impl std::fmt::Display for TemplateError {
     }
 }
 
-pub const TEMPLATE_DOMAIN: &str = "blaze v2 template 2";
+pub const TEMPLATE_DOMAIN: &str = "blaze v2 template 3";
+
+/// The outside symbols of a static's template: a static names none of its own accord.
+const NO_EXTERNS: &[&str] = &[];
 
 fn check_refs(refs: &Refs) -> Result<(), TemplateError> {
     match refs.iter().find(|it| matches!(it, Target::Data(_) | Target::Position(_) | Target::Coverage(_))) {
+        // clone: an error names the target
         Some(it) => Err(TemplateError::NotAReference(it.clone())),
         None => Ok(()),
     }
@@ -186,6 +331,7 @@ fn check_refs(refs: &Refs) -> Result<(), TemplateError> {
 /// The first place of `target` among `refs`.
 fn place(refs: &Refs, target: &Target) -> Result<u32, TemplateError> {
     let found = refs.iter().position(|it| it == target);
+    // clone: an error names the target
     found.map(|it| it as u32).ok_or_else(|| TemplateError::NotReferenced(target.clone()))
 }
 
@@ -207,101 +353,113 @@ fn own_externs(refs: &Refs, extra: &[String]) -> Result<Vec<String>, TemplateErr
     let mut externs: Vec<String> = Vec::with_capacity(extra.len());
     for name in extra {
         if name.is_empty() || externs.contains(name) {
+            // clone: an error names the target
             return Err(TemplateError::NotAnExtern(name.clone()));
         }
         if !refs.iter().any(|it| matches!(it, Target::Extern(listed) if listed == name)) {
+            // clone: the template keeps it, once per symbol a backend named of its own accord
             externs.push(name.clone());
         }
     }
     Ok(externs)
 }
 
+/// `relocs` with each target by its place, its index and remap in `frame`.
 fn template_relocs(
-    relocs: &[Reloc],
+    relocs: RelocsView<'_, Target>,
     refs: &Refs,
     externs: &[String],
     data: &[Data],
     before: Option<u32>,
-) -> Result<Vec<TemplateReloc>, TemplateError> {
-    relocs
-        .iter()
-        .map(|reloc| {
-            let target = match &reloc.target {
-                Target::Data(id) => {
-                    let Some(at) = data.iter().position(|it| it.id == *id) else {
-                        return Err(TemplateError::ForeignData(*id));
-                    };
-                    let at = at as u32;
-                    if let Some(data) = before
-                        && at >= data
-                    {
-                        return Err(TemplateError::DataOrder { data, points_at: at });
-                    }
-                    Ref::Data(at)
+    frame: &Frame,
+) -> Result<Relocs<Ref>, TemplateError> {
+    relocs.try_map_in(frame, |target| {
+        Ok(match target {
+            Target::Data(id) => {
+                let Some(at) = data.iter().position(|it| it.id == *id) else {
+                    return Err(TemplateError::ForeignData(*id));
+                };
+                let at = at as u32;
+                if let Some(data) = before
+                    && at >= data
+                {
+                    return Err(TemplateError::DataOrder { data, points_at: at });
                 }
-                Target::Position(span) => Ref::Position(*span),
-                Target::Coverage(array) if *array < Covered::ARRAYS => Ref::Coverage(*array),
-                Target::Coverage(array) => return Err(TemplateError::Coverage(*array)),
-                other => reference(refs, externs, other)?,
-            };
-            Ok(TemplateReloc { at: reloc.at, kind: reloc.kind, target, addend: reloc.addend })
+                Ref::Data(at)
+            }
+            Target::Position(span) => Ref::Position(*span),
+            Target::Coverage(array) if *array < Covered::ARRAYS => Ref::Coverage(*array),
+            Target::Coverage(array) => return Err(TemplateError::Coverage(*array)),
+            other => reference(refs, externs, other)?,
         })
-        .collect()
+    })
 }
 
-fn template_data(data: &[Data], refs: &Refs, externs: &[String]) -> Result<Vec<TemplateData>, TemplateError> {
-    data.iter()
-        .enumerate()
-        .map(|(at, it)| {
-            Ok(TemplateData {
-                align: it.align,
-                bytes: it.bytes.clone(),
-                relocs: template_relocs(&it.relocs, refs, externs, data, Some(at as u32))?,
-            })
-        })
-        .collect()
-}
-
-/// The data of a template with `refs` in its places, each with its content ID.
-fn instantiate_data(data: &[TemplateData], refs: &Refs, externs: &[String]) -> Result<Vec<Data>, TemplateError> {
-    let mut made: Vec<Data> = Vec::with_capacity(data.len());
+fn template_data(
+    data: &[Data],
+    refs: &Refs,
+    externs: &[String],
+    frame: &Frame,
+) -> Result<Vec<TemplateData>, TemplateError> {
+    let mut made = Vec::with_capacity(data.len());
     for (at, it) in data.iter().enumerate() {
-        let relocs = instantiate_relocs(&it.relocs, refs, externs, &made, Some(at as u32))?;
-        made.push(Data::new(it.align, it.bytes.clone(), relocs));
+        made.push(TemplateData {
+            align: it.align,
+            // clone: a static's value, once a static
+            bytes: it.bytes.clone(),
+            relocs: template_relocs(it.relocs.view(), refs, externs, data, Some(at as u32), frame)?,
+        });
     }
     Ok(made)
 }
 
-fn instantiate_relocs(
-    relocs: &[TemplateReloc],
+/// The data of a template with `refs` in its places, each with its content ID.
+fn instantiate_data<E: AsRef<str>>(
+    data: &[DataView<'_>],
     refs: &Refs,
-    externs: &[String],
+    externs: &[E],
+    frame: &Frame,
+) -> Result<Vec<Data>, TemplateError> {
+    let mut made: Vec<Data> = Vec::with_capacity(data.len());
+    for (at, it) in data.iter().enumerate() {
+        let relocs = instantiate_relocs(it.relocs, refs, externs, &made, Some(at as u32), frame)?;
+        // alloc: the instance's data, kept by the build
+        made.push(Data::new(it.align, it.bytes.to_vec(), relocs));
+    }
+    Ok(made)
+}
+
+/// `relocs` with `refs` in its places, its index and remap in `frame`.
+fn instantiate_relocs<E: AsRef<str>>(
+    relocs: RelocsView<'_, Ref>,
+    refs: &Refs,
+    externs: &[E],
     data: &[Data],
     before: Option<u32>,
-) -> Result<Vec<Reloc>, TemplateError> {
-    relocs
-        .iter()
-        .map(|reloc| {
-            let target = match reloc.target {
-                Ref::Place(at) => refs.get(at as usize).cloned().ok_or(TemplateError::Place(at))?,
-                Ref::Extern(at) => {
-                    Target::Extern(externs.get(at as usize).cloned().ok_or(TemplateError::Extern(at))?)
+    frame: &Frame,
+) -> Result<Relocs, TemplateError> {
+    relocs.try_map_in(frame, |target| {
+        Ok(match *target {
+            // clone: the instance's own target, kept by the build
+            Ref::Place(at) => refs.get(at as usize).cloned().ok_or(TemplateError::Place(at))?,
+            Ref::Extern(at) => {
+                let name = externs.get(at as usize).ok_or(TemplateError::Extern(at))?;
+                // alloc: the instance's own target, kept by the build
+                Target::Extern(name.as_ref().to_owned())
+            }
+            Ref::Data(at) => {
+                if let Some(data) = before
+                    && at >= data
+                {
+                    return Err(TemplateError::DataOrder { data, points_at: at });
                 }
-                Ref::Data(at) => {
-                    if let Some(data) = before
-                        && at >= data
-                    {
-                        return Err(TemplateError::DataOrder { data, points_at: at });
-                    }
-                    Target::Data(data.get(at as usize).ok_or(TemplateError::Place(at))?.id)
-                }
-                Ref::Position(span) => Target::Position(span),
-                Ref::Coverage(array) if array < Covered::ARRAYS => Target::Coverage(array),
-                Ref::Coverage(array) => return Err(TemplateError::Coverage(array)),
-            };
-            Ok(Reloc { at: reloc.at, kind: reloc.kind, target, addend: reloc.addend })
+                Target::Data(data.get(at as usize).ok_or(TemplateError::Place(at))?.id)
+            }
+            Ref::Position(span) => Target::Position(span),
+            Ref::Coverage(array) if array < Covered::ARRAYS => Target::Coverage(array),
+            Ref::Coverage(array) => return Err(TemplateError::Coverage(array)),
         })
-        .collect()
+    })
 }
 
 fn data_index(data: &[Data], id: ContentId) -> Result<u32, TemplateError> {
@@ -311,47 +469,50 @@ fn data_index(data: &[Data], id: ContentId) -> Result<u32, TemplateError> {
     }
 }
 
-fn template_unwind(unwind: &Unwind, refs: &Refs, data: &[Data]) -> Result<TemplateUnwind, TemplateError> {
+fn template_unwind(unwind: Unwind, refs: &Refs, data: &[Data]) -> Result<TemplateUnwind, TemplateError> {
     let routine = |it: &Option<Target>| it.as_ref().map(|it| place(refs, it)).transpose();
     let lsda = |it: &Option<ContentId>| it.map(|it| data_index(data, it)).transpose();
     Ok(match unwind {
         Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda: area } => {
             TemplateUnwind::Dwarf {
-                code_align: *code_align,
-                data_align: *data_align,
-                return_address: *return_address,
-                cie: cie.clone(),
-                fde: fde.clone(),
-                personality: routine(personality)?,
-                lsda: lsda(area)?,
+                code_align,
+                data_align,
+                return_address,
+                personality: routine(&personality)?,
+                lsda: lsda(&area)?,
+                cie,
+                fde,
             }
         }
         Unwind::Windows { info, handler, lsda: area } => {
-            TemplateUnwind::Windows { info: info.clone(), handler: routine(handler)?, lsda: lsda(area)? }
+            TemplateUnwind::Windows { handler: routine(&handler)?, lsda: lsda(&area)?, info }
         }
     })
 }
 
-fn instantiate_unwind(unwind: &TemplateUnwind, refs: &Refs, data: &[Data]) -> Result<Unwind, TemplateError> {
+fn instantiate_unwind(unwind: UnwindView<'_>, refs: &Refs, data: &[Data]) -> Result<Unwind, TemplateError> {
     let routine = |it: Option<u32>| {
+        // clone: the instance's own target, kept by the build
         it.map(|at| refs.get(at as usize).cloned().ok_or(TemplateError::Place(at))).transpose()
     };
     let lsda =
         |it: Option<u32>| it.map(|at| data.get(at as usize).map(|it| it.id).ok_or(TemplateError::Place(at))).transpose();
     Ok(match unwind {
-        TemplateUnwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda: area } => {
+        UnwindView::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda: area } => {
             Unwind::Dwarf {
-                code_align: *code_align,
-                data_align: *data_align,
-                return_address: *return_address,
-                cie: cie.clone(),
-                fde: fde.clone(),
-                personality: routine(*personality)?,
-                lsda: lsda(*area)?,
+                code_align,
+                data_align,
+                return_address,
+                // alloc: kept by the build
+                cie: cie.to_vec(),
+                fde: fde.to_vec(), // alloc: kept by the build
+                personality: routine(personality)?,
+                lsda: lsda(area)?,
             }
         }
-        TemplateUnwind::Windows { info, handler, lsda: area } => {
-            Unwind::Windows { info: info.clone(), handler: routine(*handler)?, lsda: lsda(*area)? }
+        UnwindView::Windows { info, handler, lsda: area } => {
+            // alloc: kept by the build
+            Unwind::Windows { info: info.to_vec(), handler: routine(handler)?, lsda: lsda(area)? }
         }
     })
 }
@@ -365,48 +526,67 @@ impl Template {
     /// symbols its backend named of its own accord ([`crate::backend::Emitted::extra`]): a
     /// relocation to one of them that `refs` lacks is kept by name in the template.
     pub fn of(function: &CompiledFunction, refs: &Refs, extra: &[String]) -> Result<Template, TemplateError> {
+        // clone: for a caller that keeps the function; a compile's goes to `of_owned`
+        Template::of_owned(function.clone(), refs, extra)
+    }
+
+    /// [`Template::of`] of a function the caller has no more use for (a compile's): its code,
+    /// data bytes, lines, unwind information and coverage move into the template.
+    pub fn of_owned(function: CompiledFunction, refs: &Refs, extra: &[String]) -> Result<Template, TemplateError> {
         check_refs(refs)?;
         let externs = own_externs(refs, extra)?;
+        let (relocs, mut data) = frame::task(Tag::Codegen, |frame| {
+            let relocs = template_relocs(function.relocs.view(), refs, &externs, &function.data, None, frame)?;
+            let mut data = Vec::with_capacity(function.data.len());
+            for (at, it) in function.data.iter().enumerate() {
+                let relocs = template_relocs(it.relocs.view(), refs, &externs, &function.data, Some(at as u32), frame)?;
+                // alloc: none: the function's bytes move in once every check has passed
+                data.push(TemplateData { align: it.align, bytes: Vec::new(), relocs });
+            }
+            Ok::<_, TemplateError>((relocs, data))
+        })?;
+        let unwind = function.unwind.map(|it| template_unwind(it, refs, &function.data)).transpose()?;
+        for (made, it) in data.iter_mut().zip(function.data) {
+            made.bytes = it.bytes;
+        }
         Ok(Template {
             arch: function.arch,
             align: function.align,
-            code: function.code.clone(),
-            relocs: template_relocs(&function.relocs, refs, &externs, &function.data, None)?,
-            data: template_data(&function.data, refs, &externs)?,
-            inlined: function.inlined.clone(),
+            code: function.code,
+            relocs,
+            data,
+            inlined: function.inlined,
             side: function.side,
-            unwind: function.unwind.as_ref().map(|it| template_unwind(it, refs, &function.data)).transpose()?,
-            lines: function.lines.clone(),
+            unwind,
+            lines: function.lines,
             refs: refs_len(refs),
             externs,
-            coverage: function.coverage.clone(),
+            coverage: function.coverage,
         })
     }
 
-    /// The function of instance `key` whose references are `refs`.
-    pub fn instantiate(
-        &self,
-        key: InstanceKey,
-        refs: &Refs,
-    ) -> Result<CompiledFunction, TemplateError> {
-        check_refs(refs)?;
-        if refs_len(refs) != self.refs {
-            return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
-        }
-        let data = instantiate_data(&self.data, refs, &self.externs)?;
-        Ok(CompiledFunction {
-            key,
+    /// The template borrowed, its data and outside symbols listed in `frame`.
+    pub fn view<'a>(&'a self, frame: &'a Frame) -> TemplateView<'a> {
+        TemplateView {
             arch: self.arch,
             align: self.align,
-            code: self.code.clone(),
-            relocs: instantiate_relocs(&self.relocs, refs, &self.externs, &data, None)?,
-            unwind: self.unwind.as_ref().map(|it| instantiate_unwind(it, refs, &data)).transpose()?,
-            data,
-            inlined: self.inlined.clone(),
+            code: &self.code,
+            relocs: self.relocs.view(),
+            data: frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view()),
+            inlined: &self.inlined,
             side: self.side,
-            lines: self.lines.clone(),
+            unwind: self.unwind.as_ref().map(TemplateUnwind::view),
+            lines: &self.lines,
+            refs: self.refs,
+            externs: frame.alloc_slice_fill_with(self.externs.len(), |at| self.externs[at].as_str()),
+            // clone: the function made of the view takes it
             coverage: self.coverage.clone(),
-        })
+        }
+    }
+
+    /// The function of instance `key` whose references are `refs`.
+    pub fn instantiate(&self, key: InstanceKey, refs: &Refs) -> Result<CompiledFunction, TemplateError> {
+        frame::task(Tag::Codegen, |frame| self.view(frame).instantiate(key, refs))
     }
 
     /// The template's content ID: two templates with one are the same function up to what
@@ -415,7 +595,7 @@ impl Template {
         let mut hasher = Hasher::new(TEMPLATE_DOMAIN);
         hasher.update(&[content::arch_tag(self.arch)]);
         hasher.update(&self.align.to_le_bytes()).part(&self.code);
-        template_relocs_into(&mut hasher, &self.relocs);
+        content::relocs_into(&mut hasher, &self.relocs, ref_into);
         template_data_into(&mut hasher, &self.data);
         hasher.update(&(self.inlined.len() as u64).to_le_bytes());
         for code in &self.inlined {
@@ -463,13 +643,18 @@ impl Template {
 impl StaticTemplate {
     pub fn of(value: &Static, refs: &Refs) -> Result<StaticTemplate, TemplateError> {
         check_refs(refs)?;
-        let init = match &value.init {
-            Init::Bytes { bytes, relocs } => {
-                TemplateInit::Bytes { bytes: bytes.clone(), relocs: template_relocs(relocs, refs, &[], &value.data, None)? }
-            }
-            Init::Zeroed { size } => TemplateInit::Zeroed { size: *size },
-        };
-        let data = template_data(&value.data, refs, &[])?;
+        let (init, data) = frame::task(Tag::Codegen, |frame| {
+            let init = match &value.init {
+                Init::Bytes { bytes, relocs } => TemplateInit::Bytes {
+                    // clone: a static's value, kept by the build
+                    bytes: bytes.clone(),
+                    relocs: template_relocs(relocs.view(), refs, &[], &value.data, None, frame)?,
+                },
+                Init::Zeroed { size } => TemplateInit::Zeroed { size: *size },
+            };
+            let data = template_data(&value.data, refs, &[], frame)?;
+            Ok::<_, TemplateError>((init, data))
+        })?;
         names_no_coverage(&init, &data)?;
         Ok(StaticTemplate {
             align: value.align,
@@ -477,6 +662,7 @@ impl StaticTemplate {
             data,
             mutable: value.mutable,
             thread_local: value.thread_local,
+            // clone: a static's value, kept by the build
             section: value.section.clone(),
             refs: refs_len(refs),
         })
@@ -488,13 +674,19 @@ impl StaticTemplate {
         if refs_len(refs) != self.refs {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
-        let data = instantiate_data(&self.data, refs, &[])?;
-        let init = match &self.init {
-            TemplateInit::Bytes { bytes, relocs } => {
-                Init::Bytes { bytes: bytes.clone(), relocs: instantiate_relocs(relocs, refs, &[], &data, None)? }
-            }
-            TemplateInit::Zeroed { size } => Init::Zeroed { size: *size },
-        };
+        let (data, init) = frame::task(Tag::Codegen, |frame| {
+            let views = frame.alloc_slice_fill_with(self.data.len(), |at| self.data[at].view());
+            let data = instantiate_data(views, refs, NO_EXTERNS, frame)?;
+            let init = match &self.init {
+                TemplateInit::Bytes { bytes, relocs } => Init::Bytes {
+                    // clone: a static's value, kept by the build
+                    bytes: bytes.clone(),
+                    relocs: instantiate_relocs(relocs.view(), refs, NO_EXTERNS, &data, None, frame)?,
+                },
+                TemplateInit::Zeroed { size } => Init::Zeroed { size: *size },
+            };
+            Ok::<_, TemplateError>((data, init))
+        })?;
         Ok(Static {
             item,
             instance,
@@ -503,6 +695,7 @@ impl StaticTemplate {
             data,
             mutable: self.mutable,
             thread_local: self.thread_local,
+            // clone: a static's value, kept by the build
             section: self.section.clone(),
         })
     }
@@ -510,11 +703,11 @@ impl StaticTemplate {
 
 /// A static's value and data name no SanitizerCoverage array: those are a function's own.
 fn names_no_coverage(init: &TemplateInit, data: &[TemplateData]) -> Result<(), TemplateError> {
-    let relocs = match init {
-        TemplateInit::Bytes { relocs, .. } => relocs.as_slice(),
+    let own: &[Ref] = match init {
+        TemplateInit::Bytes { relocs, .. } => relocs.targets(),
         TemplateInit::Zeroed { .. } => &[],
     };
-    let named = relocs.iter().chain(data.iter().flat_map(|it| &it.relocs)).find_map(|it| match it.target {
+    let named = own.iter().chain(data.iter().flat_map(|it| it.relocs.targets())).find_map(|it| match *it {
         Ref::Coverage(array) => Some(array),
         _ => None,
     });
@@ -524,42 +717,35 @@ fn names_no_coverage(init: &TemplateInit, data: &[TemplateData]) -> Result<(), T
     }
 }
 
-fn template_relocs_into(hasher: &mut Hasher, relocs: &[TemplateReloc]) {
-    hasher.update(&(relocs.len() as u64).to_le_bytes());
-    for reloc in relocs {
-        hasher.update(&reloc.at.to_le_bytes());
-        hasher.update(&[content::kind_tag(reloc.kind)]);
-        hasher.update(&reloc.addend.to_le_bytes());
-        match reloc.target {
-            Ref::Place(at) => hasher.update(&[0]).update(&at.to_le_bytes()),
-            Ref::Data(at) => hasher.update(&[1]).update(&at.to_le_bytes()),
-            Ref::Position(SpanRef { anchor, index }) => {
-                hasher.update(&[2]).id(&anchor).update(&index.to_le_bytes())
-            }
-            Ref::Extern(at) => hasher.update(&[3]).update(&at.to_le_bytes()),
-            Ref::Coverage(array) => hasher.update(&[4]).update(&array.to_le_bytes()),
-        };
-    }
+fn ref_into(hasher: &mut Hasher, target: &Ref) {
+    match *target {
+        Ref::Place(at) => hasher.update(&[0]).update(&at.to_le_bytes()),
+        Ref::Data(at) => hasher.update(&[1]).update(&at.to_le_bytes()),
+        Ref::Position(SpanRef { anchor, index }) => hasher.update(&[2]).id(&anchor).update(&index.to_le_bytes()),
+        Ref::Extern(at) => hasher.update(&[3]).update(&at.to_le_bytes()),
+        Ref::Coverage(array) => hasher.update(&[4]).update(&array.to_le_bytes()),
+    };
 }
 
 fn template_data_into(hasher: &mut Hasher, data: &[TemplateData]) {
     hasher.update(&(data.len() as u64).to_le_bytes());
     for it in data {
         hasher.update(&it.align.to_le_bytes()).part(&it.bytes);
-        template_relocs_into(hasher, &it.relocs);
+        content::relocs_into(hasher, &it.relocs, ref_into);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{RelocKind, Relocation};
 
     fn key(n: u8) -> InstanceKey {
         InstanceKey(ContentId([n; 32]))
     }
 
-    fn call(at: u32, to: Target) -> Reloc {
-        Reloc { at, kind: RelocKind::PcRel32, target: to, addend: -4 }
+    fn call(at: u32, to: Target) -> Relocation {
+        Relocation { at, kind: RelocKind::PcRel32, target: to, addend: -4 }
     }
 
     /// `Vec<A>::reserve` calling `Vec<A>::try_grow_to` and reading a constant that points at
@@ -570,14 +756,15 @@ mod tests {
             Target::Static { item, instance: ContentId([9; 32]) },
             Target::Extern("memcpy".to_owned()),
         ];
-        let inner = Data::new(8, vec![1, 2, 3, 4, 5, 6, 7, 8], vec![]);
+        let inner = Data::new(8, vec![1, 2, 3, 4, 5, 6, 7, 8], Relocs::new());
         let outer = Data::new(
             8,
             vec![0; 16],
             vec![
-                Reloc { at: 0, kind: RelocKind::Abs64, target: Target::Data(inner.id), addend: 0 },
-                Reloc { at: 8, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 },
-            ],
+                Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Data(inner.id), addend: 0 },
+                Relocation { at: 8, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 },
+            ]
+            .into(),
         );
         let function = CompiledFunction {
             key: own,
@@ -587,9 +774,10 @@ mod tests {
             relocs: vec![
                 call(1, refs[0].clone()),
                 call(6, refs[2].clone()),
-                Reloc { at: 6, kind: RelocKind::Abs64, target: Target::Data(outer.id), addend: 0 },
-                Reloc { at: 1, kind: RelocKind::Abs64, target: refs[1].clone(), addend: 8 },
-            ],
+                Relocation { at: 6, kind: RelocKind::Abs64, target: Target::Data(outer.id), addend: 0 },
+                Relocation { at: 1, kind: RelocKind::Abs64, target: refs[1].clone(), addend: 8 },
+            ]
+            .into(),
             data: vec![inner, outer],
             inlined: Vec::new(),
             side: None,
@@ -598,6 +786,96 @@ mod tests {
             coverage: None,
         };
         (function, refs)
+    }
+
+    /// The heap blocks of a relocation table: its rows, targets and wide addends, each one
+    /// when not empty.
+    fn table_blocks<T>(relocs: &Relocs<T>) -> u64 {
+        [relocs.rows().len(), relocs.targets().len(), relocs.wide().len()].into_iter().map(|it| u64::from(it != 0)).sum()
+    }
+
+    /// The heap blocks a function owns: what making it must allocate, and no more.
+    fn owned_blocks(function: &CompiledFunction) -> u64 {
+        let list = |len: usize| u64::from(len != 0);
+        let named = |it: &Target| u64::from(matches!(it, Target::Extern(name) | Target::Weak(name) if !name.is_empty()));
+        let table = |relocs: &Relocs| table_blocks(relocs) + relocs.targets().iter().map(named).sum::<u64>();
+        let routine = |it: &Option<Target>| it.as_ref().map_or(0, named);
+        let unwind = match &function.unwind {
+            None => 0,
+            Some(Unwind::Dwarf { cie, fde, personality, .. }) => list(cie.len()) + list(fde.len()) + routine(personality),
+            Some(Unwind::Windows { info, handler, .. }) => list(info.len()) + routine(handler),
+        };
+        let data: u64 = function.data.iter().map(|it| list(it.bytes.len()) + table(&it.relocs)).sum();
+        list(function.code.len())
+            + table(&function.relocs)
+            + list(function.data.len())
+            + data
+            + list(function.inlined.len())
+            + list(function.lines.len())
+            + unwind
+            + function.coverage.as_ref().map_or(0, |it| list(it.pcs.len()))
+    }
+
+    /// A warm instantiate allocates exactly the blocks the function owns: each part copied
+    /// once, the template's views and the tables' indexes in frames.
+    #[test]
+    fn a_warm_instantiate_allocates_only_what_the_function_keeps() {
+        let (function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        // The code, the relocations' rows, targets and `memcpy`'s name, the data list, `inner`'s
+        // bytes, `outer`'s bytes, rows and targets, and the lines.
+        assert_eq!(owned_blocks(&function), 10);
+        let template = Template::of(&function, &refs, &[]).unwrap();
+        assert_eq!(template.instantiate(function.key, &refs).unwrap(), function);
+        let made = blaze_alloc_count::assert_at_most(owned_blocks(&function), "a warm instantiate", || {
+            template.instantiate(function.key, &refs)
+        })
+        .unwrap();
+        assert_eq!(made, function);
+    }
+
+    /// The template of a compile takes the function's parts over: it allocates only its
+    /// relocation tables and its list of data.
+    #[test]
+    fn a_compiles_template_takes_its_parts_over() {
+        let (function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        let expected = Template::of(&function, &refs, &[]).unwrap();
+        assert_eq!(Template::of_owned(function.clone(), &refs, &[]).unwrap(), expected);
+        let lists = table_blocks(&function.relocs)
+            + u64::from(!function.data.is_empty())
+            + function.data.iter().map(|it| table_blocks(&it.relocs)).sum::<u64>();
+        // The function's rows and targets, the data list, and `outer`'s rows and targets.
+        assert_eq!(lists, 5);
+        let given = function.clone();
+        let made = blaze_alloc_count::assert_at_most(lists, "a compile's template: its tables", || {
+            Template::of_owned(given, &refs, &[])
+        })
+        .unwrap();
+        assert_eq!(made, expected);
+        assert_eq!(made.instantiate(function.key, &refs).unwrap(), function);
+    }
+
+    /// A view's owned template is the template, and a static's template, made and filled
+    /// through frames, gives back its static.
+    #[test]
+    fn a_view_owns_back_its_template() {
+        let (mut function, mut refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        refs.push(Target::Extern("rust_eh_personality".to_owned()));
+        function.unwind = Some(Unwind::Dwarf {
+            code_align: 1,
+            data_align: -8,
+            return_address: 16,
+            cie: vec![0x0c, 7, 8],
+            fde: vec![0x0e, 16],
+            personality: Some(refs[3].clone()),
+            lsda: Some(function.data[0].id),
+        });
+        function.relocs.push(call(1, Target::Extern("bcmp".to_owned())));
+        let template = Template::of(&function, &refs, &["bcmp".to_owned()]).unwrap();
+        let owned = frame::task(Tag::Codegen, |frame| template.view(frame).owned());
+        assert_eq!(owned, template);
+        assert_eq!(owned.id(), template.id());
+        let made = frame::task(Tag::Codegen, |frame| template.view(frame).instantiate(function.key, &refs)).unwrap();
+        assert_eq!(made, function);
     }
 
     #[test]
@@ -636,15 +914,18 @@ mod tests {
     #[test]
     fn coverage_is_the_functions_own() {
         let (mut function, refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
-        function.relocs.push(Reloc { at: 1, kind: RelocKind::PcRel32, target: Target::Coverage(0), addend: 1 });
+        function.relocs.push(Relocation { at: 1, kind: RelocKind::PcRel32, target: Target::Coverage(0), addend: 1 });
         function.coverage = Some(Covered { counters: 2, flags: 0, guards: 0, pcs: vec![(0, 1), (5, 0)] });
         let template = Template::of(&function, &refs, &[]).unwrap();
-        assert_eq!(template.relocs.last().unwrap().target, Ref::Coverage(0));
+        assert!(template.relocs.targets().contains(&Ref::Coverage(0)));
         assert_eq!(template.instantiate(function.key, &refs).unwrap(), function);
         assert_ne!(template.id(), Template { coverage: None, ..template.clone() }.id());
 
         let mut past = function.clone();
-        past.relocs.last_mut().unwrap().target = Target::Coverage(Covered::ARRAYS);
+        past.relocs = past.relocs.map(|it| match it {
+            Target::Coverage(_) => Target::Coverage(Covered::ARRAYS),
+            other => other.clone(),
+        });
         assert_eq!(Template::of(&past, &refs, &[]).unwrap_err(), TemplateError::Coverage(Covered::ARRAYS));
         let mut listed = refs.clone();
         listed.push(Target::Coverage(0));
@@ -658,7 +939,7 @@ mod tests {
             align: 8,
             init: Init::Bytes {
                 bytes: vec![0; 8],
-                relocs: vec![Reloc { at: 0, kind: RelocKind::Abs64, target: Target::Coverage(1), addend: 0 }],
+                relocs: vec![Relocation { at: 0, kind: RelocKind::Abs64, target: Target::Coverage(1), addend: 0 }].into(),
             },
             data: Vec::new(),
             mutable: false,
@@ -685,7 +966,7 @@ mod tests {
         let extra = ["memcpy".to_owned(), "bcmp".to_owned()];
         let template = Template::of(&function, &refs, &extra).unwrap();
         assert_eq!(template.externs, ["bcmp".to_owned()]);
-        assert_eq!(template.relocs.last().unwrap().target, Ref::Extern(0));
+        assert!(template.relocs.targets().contains(&Ref::Extern(0)));
         assert_eq!(template.instantiate(function.key, &refs).unwrap(), function);
         assert_ne!(template.id(), Template { externs: vec!["memcmp".to_owned()], ..template.clone() }.id());
         let twice = ["bcmp".to_owned(), "bcmp".to_owned()];
@@ -742,7 +1023,7 @@ mod tests {
     fn a_static_keeps_what_it_is() {
         let item = ItemKey(ContentId([3; 32]));
         let refs = vec![Target::Function(key(2))];
-        let text = Data::new(1, b"hi".to_vec(), Vec::new());
+        let text = Data::new(1, b"hi".to_vec(), Relocs::new());
         let value = Static {
             item,
             instance: ContentId([4; 32]),
@@ -750,9 +1031,10 @@ mod tests {
             init: Init::Bytes {
                 bytes: vec![0; 24],
                 relocs: vec![
-                    Reloc { at: 0, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 },
-                    Reloc { at: 8, kind: RelocKind::Abs64, target: Target::Data(text.id), addend: 0 },
-                ],
+                    Relocation { at: 0, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 },
+                    Relocation { at: 8, kind: RelocKind::Abs64, target: Target::Data(text.id), addend: 0 },
+                ]
+                .into(),
             },
             data: vec![text],
             mutable: true,

@@ -1,8 +1,9 @@
 //! The one buffer a function is written into: its bytes, labels for places not written yet
 //! (blocks, edges, trap stubs, constants), fixups resolved once every label is bound, and the
 //! relocations the linker resolves. Reserved once per function from the sizes of the
-//! stencils and the glue's bounds, and reused across functions: writing never allocates.
+//! stencils and the glue's bounds, on the compile's frame: writing never allocates.
 
+use blaze_mem::frame::Frame;
 use cranelift_codegen::binemit;
 
 use crate::{
@@ -26,26 +27,28 @@ pub struct Fixup {
 
 const UNBOUND: u32 = u32::MAX;
 
-#[derive(Default)]
-pub struct Buf {
-    bytes: Vec<u8>,
+pub struct Buf<'f> {
+    bytes: Vec<u8, &'f Frame>,
     /// By label: its offset, or `u32::MAX` while unbound.
-    labels: Vec<u32>,
-    fixups: Vec<Fixup>,
-    relocs: Vec<Reloc>,
+    labels: Vec<u32, &'f Frame>,
+    fixups: Vec<Fixup, &'f Frame>,
+    relocs: Vec<Reloc, &'f Frame>,
 }
 
-impl Buf {
-    pub fn new() -> Buf {
-        Buf::default()
+impl<'f> Buf<'f> {
+    /// An empty buffer on `frame`, the compile's.
+    pub fn new_in(frame: &'f Frame) -> Buf<'f> {
+        Buf {
+            bytes: Vec::new_in(frame),
+            labels: Vec::new_in(frame),
+            fixups: Vec::new_in(frame),
+            relocs: Vec::new_in(frame),
+        }
     }
 
-    /// Empties it for the next function, keeping every allocation.
-    pub fn clear(&mut self) {
-        self.bytes.clear();
-        self.labels.clear();
-        self.fixups.clear();
-        self.relocs.clear();
+    /// The frame the buffer is on, for the compile's other temporaries.
+    pub fn temp(&self) -> &'f Frame {
+        *self.bytes.allocator()
     }
 
     /// Room for `bytes` more bytes, `labels` labels and `fixups` fixups: one reservation per
@@ -184,28 +187,32 @@ impl Buf {
         Ok(())
     }
 
-    /// The bytes and relocations (sorted by offset), moved out; the buffer keeps its
-    /// labels' and fixups' allocations for the next function. The caller gives the next
-    /// function's buffer back its byte allocation by [`Buf::recycle`].
-    pub fn take(&mut self) -> (Vec<u8>, Vec<Reloc>) {
-        if !self.relocs.is_sorted_by_key(|it| it.at) {
-            self.relocs.sort_by_key(|it| it.at);
-        }
-        self.labels.clear();
-        self.fixups.clear();
-        (std::mem::take(&mut self.bytes), std::mem::take(&mut self.relocs))
+    /// The relocations, by offset once [`Buf::sort_relocs`] ran.
+    pub fn relocs(&self) -> &[Reloc] {
+        &self.relocs
     }
 
-    /// Gives the buffer an allocation to write the next function into (one a consumer of a
-    /// [`crate::Code`] is done with), so a steady stream of compiles allocates nothing.
-    pub fn recycle(&mut self, mut bytes: Vec<u8>, mut relocs: Vec<Reloc>) {
-        if self.bytes.is_empty() && bytes.capacity() > self.bytes.capacity() {
-            bytes.clear();
-            self.bytes = bytes;
+    /// Sorts the relocations by offset, keeping the order of those at one offset (what the
+    /// stable `sort_by_key` did), in place.
+    pub fn sort_relocs(&mut self) {
+        sort_by_key_in_place(&mut self.relocs, |it| it.at);
+    }
+}
+
+/// A stable sort that never allocates: an insertion sort, linear on what is already in order.
+/// Relocations and call sites are recorded as the code is written, so they come nearly sorted.
+pub(crate) fn sort_by_key_in_place<T: Copy, K: Ord>(items: &mut [T], key: impl Fn(&T) -> K) {
+    if items.is_sorted_by_key(&key) {
+        return;
+    }
+    for at in 1..items.len() {
+        let item = items[at];
+        let k = key(&item);
+        let mut to = at;
+        while to > 0 && key(&items[to - 1]) > k {
+            items[to] = items[to - 1];
+            to -= 1;
         }
-        if self.relocs.is_empty() && relocs.capacity() > self.relocs.capacity() {
-            relocs.clear();
-            self.relocs = relocs;
-        }
+        items[to] = item;
     }
 }

@@ -32,6 +32,7 @@ mod scalar;
 use std::fmt;
 
 use base_db::Db;
+use blaze_ids::bits::BitSet;
 use either::Either;
 use hir::InFile;
 use hir_def::{
@@ -67,18 +68,21 @@ use syntax::{
 };
 
 use self::scalar::{Kind, Output, Scalar};
-use super::{BodyCx, bits::Bits};
+use super::BodyCx;
 use crate::{
     cx::def_range,
     lower::{Found, Phase},
     model::{Diag, Span},
 };
 
+/// The lints this module gives: it runs only when one may fire.
+pub(super) const LINTS: super::LintSet = super::lint_set(["arithmetic_overflow", "unconditional_panic"]);
+
 /// The known-panics lint of the body and of the closures in it, each closure after the body
 /// it is in, in the order they are written. None of a body rustc builds no runtime MIR of
 /// before it aborts, or whose type checking or borrow checking failed.
 pub(super) fn lints<'db>(b: &BodyCx<'_, 'db>) -> Vec<Found> {
-    if b.mir_tainted || !b.elaborated || borrowck_failed(b) {
+    if b.mir_tainted() || !b.elaborated || borrowck_failed(b) {
         return Vec::new();
     }
     let db = b.db();
@@ -324,10 +328,10 @@ impl<'db> Owner<'db> {
 struct Scratch<'db> {
     locals: Vec<Value<'db>>,
     modes: Vec<Mode>,
-    assigned: Bits,
-    visited: Bits,
+    assigned: BitSet,
+    visited: BitSet,
     /// rustc's `written_only_inside_own_block_locals`: the set, and the order to clear it in.
-    written: Bits,
+    written: BitSet,
     written_list: Vec<u32>,
     worklist: Vec<BasicBlockId>,
     aggregates: Vec<Aggregate>,
@@ -422,8 +426,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
             }
             for at in 0..self.s.written_list.len() {
                 let local = self.s.written_list[at] as usize;
-                if self.s.written.contains(local) {
-                    self.s.written.remove(local);
+                if self.s.written.remove(local) {
                     self.s.locals[local] = Value::Uninit;
                 }
             }

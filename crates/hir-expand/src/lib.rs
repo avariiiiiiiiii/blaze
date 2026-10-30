@@ -4,6 +4,7 @@
 //! tree originates not from the text of some `FileId`, but from some macro
 //! expansion.
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 // It's useful to refer to code that is private in doc comments.
 #![allow(rustdoc::private_intra_doc_links)]
 #![forbid(unsafe_code)]
@@ -26,6 +27,13 @@ pub mod span_map;
 mod cfg_process;
 mod fixup;
 mod prettify_macro_expansion_;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+#[cfg(test)]
+mod budget_tests;
 
 use salsa::plumbing::{AsId, FromId};
 use thin_vec::ThinVec;
@@ -67,7 +75,10 @@ pub use crate::{
 };
 
 pub use base_db::EditionedFileId;
-pub use mbe::{DeclarativeMacro, MacroCallStyle, MacroCallStyles, ValueResult};
+pub use mbe::{
+    DeclarativeMacro, ExpandErrorKind as MbeErrorKind, MacroCallStyle, MacroCallStyles,
+    MatchFailure, ValueResult,
+};
 
 pub use syntax_bridge::parse_to_token_tree_static_span;
 pub use tt;
@@ -81,6 +92,12 @@ type MacroArgResult = (tt::TopSubtree, SyntaxFixupUndoInfo, Span);
 pub type MacroArg<'db> = (&'db tt::TopSubtree, &'db SyntaxFixupUndoInfo, Span);
 
 static NO_FIXUPS: SyntaxFixupUndoInfo = SyntaxFixupUndoInfo::NONE;
+
+thread_local! {
+    /// The scratch of the radix sorts of ranges, kept by the worker.
+    static RANGE_SORT: std::cell::RefCell<blaze_mem::scratch::Scratch<TextRange>> =
+        const { std::cell::RefCell::new(blaze_mem::scratch::Scratch::new()) };
+}
 
 #[macro_export]
 macro_rules! impl_intern_lookup {
@@ -606,6 +623,7 @@ impl MacroCallId {
 
         let (parse, mut rev_token_map, semicolon) = token_tree_to_syntax_node(db, &tt, expand_to);
         rev_token_map.matched_arm = matched_arm;
+        rev_token_map.dropped_semicolon = semicolon;
         let err = err.or_else(|| ignored_semicolon(db, loc, semicolon));
 
         ExpandResult { value: (parse, rev_token_map), err }
@@ -1671,12 +1689,6 @@ pub enum ExpandTo {
 }
 
 impl ExpandTo {
-    /// [`ExpandTo::of_call_site`], with a call in a place no macro call can be (a parse error's
-    /// recovery) taken as items.
-    pub fn from_call_site(call: &ast::MacroCall) -> ExpandTo {
-        Self::of_call_site(call).unwrap_or(ExpandTo::Items)
-    }
-
     /// What the macro call `call` expands to where it is; the kind of its parent if no macro
     /// call can be there.
     pub fn of_call_site(call: &ast::MacroCall) -> Result<ExpandTo, syntax::SyntaxKind> {
@@ -1692,11 +1704,17 @@ impl ExpandTo {
         // FIXME: macros in statement position are treated as expression statements, they should
         // probably be their own statement kind. The *grand*parent indicates what's valid.
         if parent.kind() == MACRO_EXPR
-            && parent
-                .parent()
-                .is_some_and(|p| matches!(p.kind(), EXPR_STMT | STMT_LIST | MACRO_STMTS))
+            && let Some(grandparent) = parent.parent()
+            && matches!(grandparent.kind(), EXPR_STMT | STMT_LIST | MACRO_STMTS)
         {
-            return Ok(ExpandTo::Statements);
+            // rustc's `parse_stmt_mac`: the last call of a block, not in braces and with no `;`
+            // after it, is followed by the block's `}`, so it is an expression. The last call
+            // of a statements expansion is followed by the end of its tokens: a statement.
+            let braced = call.token_tree().and_then(|it| it.l_curly_token()).is_some();
+            let is_tail = ast::StmtList::cast(grandparent)
+                .and_then(|list| list.tail_expr())
+                .is_some_and(|tail| tail.syntax() == &parent);
+            return Ok(if is_tail && !braced { ExpandTo::Expr } else { ExpandTo::Statements });
         }
 
         Ok(match parent.kind() {
@@ -1952,8 +1970,12 @@ impl HirFileId {
                 .map(SyntaxError::range)
                 .collect(), // alloc: the query's value, once per file
         };
-        radix::sort_copy_by_key(&mut ranges, |range| {
-            radix::pack_32(range.start().into(), range.end().into())
+        RANGE_SORT.with_borrow_mut(|scratch| {
+            radix::sort_copy_by_key_in(
+                &mut ranges,
+                |range| radix::pack_32(range.start().into(), range.end().into()),
+                scratch.take(),
+            )
         });
         ranges.into_boxed_slice()
     }

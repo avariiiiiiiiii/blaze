@@ -1,5 +1,6 @@
 //! Type inference for expressions.
 
+use salsa::Database as _;
 use std::{iter::repeat_with, mem};
 
 use either::Either;
@@ -23,9 +24,10 @@ use hir_expand::name::Name;
 use rustc_ast_ir::Mutability;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{
-    InferTy, Interner,
+    InferTy, Interner, TypeFoldable, TypeVisitableExt,
     inherent::{IntoKind, Ty as _},
 };
+use smallvec::SmallVec;
 use stdx::never;
 use tracing::debug;
 
@@ -40,6 +42,7 @@ use crate::{
         ClauseKind, FnSig, IsRigid, StoredTy, Ty, TyKind, TypeError,
         infer::{
             BoundRegionConversionTime, InferOk,
+            resolve::ReplaceInferWithError,
             traits::{Obligation, ObligationCause},
         },
         obligation_ctxt::ObligationCtxt,
@@ -47,8 +50,8 @@ use crate::{
 };
 
 use super::{
-    BreakableContext, Diverges, Expectation, InferenceContext, InferenceDiagnostic, ReturnKind,
-    Unreachable, UnreachableAt, cast::CastCheck, find_breakable,
+    BreakableContext, CallArguments, Diverges, Expectation, InferenceContext, InferenceDiagnostic,
+    ReturnKind, Unreachable, UnreachableAt, cast::CastCheck, find_breakable,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2168,22 +2171,12 @@ impl<'db> InferenceContext<'db> {
             provided_arg_count == minimum_input_count
         };
 
-        if !args_count_matches {
-            self.push_diagnostic(InferenceDiagnostic::MismatchedArgCount {
-                call_expr,
-                expected: expected_input_tys.len() + skip_indices.len(),
-                found: provided_args.len(),
-                is_fn_trait_call: tuple_arguments == TupleArgumentsFlag::TupleArguments,
-            });
-        }
-
         // We introduce a helper function to demand that a given argument satisfy a given input
         // This is more complicated than just checking type equality, as arguments could be coerced
         // This version writes those types back so further type checking uses the narrowed types
-        let demand_compatible = |this: &mut InferenceContext<'db>, idx| {
+        let demand_compatible = |this: &mut InferenceContext<'db>, idx: usize, provided_arg: ExprId| {
             let formal_input_ty: Ty<'db> = formal_input_tys[idx];
             let expected_input_ty: Ty<'db> = expected_input_tys[idx];
-            let provided_arg = provided_args[idx];
 
             debug!("checking argument {}: {:?} = {:?}", idx, provided_arg, formal_input_ty);
 
@@ -2229,6 +2222,11 @@ impl<'db> InferenceContext<'db> {
             }
         };
 
+        // rustc's `compatibility_diagonal`, by position among the arguments not taken as legacy
+        // const generics: those below `minimum_input_count` that did not fit their own input
+        // (the rest are `Incompatible(None)`, never checked against one).
+        let mut incompatible = SmallVec::<[u32; 2]>::new();
+
         // Check the arguments.
         // We do this in a pretty awful way: first we type-check any arguments
         // that are not closures, then we type-check the closures. This is so
@@ -2243,6 +2241,7 @@ impl<'db> InferenceContext<'db> {
             }
 
             let mut skip_indices = skip_indices.iter().copied();
+            let mut position = 0;
             // Check each argument, to satisfy the input it was provided for
             // Visually, we're traveling down the diagonal of the compatibility matrix
             for (idx, arg) in provided_args.iter().enumerate() {
@@ -2250,6 +2249,8 @@ impl<'db> InferenceContext<'db> {
                     skip_indices.next();
                     continue;
                 }
+                let idx = position;
+                position += 1;
                 // Only in the first pass: a closure can't diverge, but an argument before it
                 // can (`f(panic!(), || {})`).
                 if !check_closures {
@@ -2276,16 +2277,128 @@ impl<'db> InferenceContext<'db> {
                     continue;
                 }
 
-                if let Err((_error, expected, found)) = demand_compatible(self, idx)
-                    && args_count_matches
-                {
-                    // Don't report type mismatches if there is a mismatch in args count.
-                    self.emit_type_mismatch((*arg).into(), expected, found);
+                if let Err((_error, expected, found)) = demand_compatible(self, idx, *arg) {
+                    incompatible.push(idx as u32);
+                    if args_count_matches {
+                        // Don't report type mismatches if there is a mismatch in args count.
+                        self.emit_type_mismatch((*arg).into(), expected, found);
+                    }
                 }
             }
         }
 
-        if !args_count_matches {}
+        // rustc's `call_appears_satisfied`.
+        if !args_count_matches || !incompatible.is_empty() {
+            let args = self.call_arguments(
+                call_expr,
+                provided_args,
+                skip_indices,
+                &formal_input_tys,
+                &expected_input_tys,
+                &incompatible,
+                c_variadic,
+            );
+            self.push_diagnostic(if args_count_matches {
+                InferenceDiagnostic::IncorrectArguments { call_expr, args }
+            } else {
+                InferenceDiagnostic::MismatchedArgCount {
+                    call_expr,
+                    expected: expected_input_tys.len() + skip_indices.len(),
+                    found: provided_args.len(),
+                    is_fn_trait_call: tuple_arguments == TupleArgumentsFlag::TupleArguments,
+                    args,
+                }
+            });
+        }
+    }
+
+    /// rustc's `report_arg_errors` inputs of a call whose arguments do not fit: the callee, the
+    /// inputs and the provided types as found, and `ArgMatrix::new`'s compatibility, its
+    /// diagonal as `check_argument_types` found it (`incompatible` the positions that failed).
+    fn call_arguments(
+        &mut self,
+        call_expr: ExprId,
+        provided_args: &[ExprId],
+        skip_indices: &[u32],
+        formal_input_tys: &[Ty<'db>],
+        expected_input_tys: &[Ty<'db>],
+        incompatible: &[u32],
+        c_variadic: bool,
+    ) -> Box<CallArguments> {
+        let inputs = formal_input_tys.len();
+        // alloc: error path, one per call whose arguments do not fit
+        let provided: Vec<Ty<'db>> = provided_args
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| !skip_indices.contains(&(idx as u32)))
+            .take(if c_variadic { inputs } else { usize::MAX })
+            .map(|(_, &arg)| {
+                let ty = self.expr_ty_after_adjustments(arg);
+                self.table.resolve_vars_if_possible(ty)
+            })
+            .collect();
+        let inputs_tys: Vec<(Ty<'db>, Ty<'db>)> = formal_input_tys
+            .iter()
+            .zip(expected_input_tys)
+            .map(|(&formal, &expected)| {
+                (self.table.resolve_vars_if_possible(formal), self.table.resolve_vars_if_possible(expected))
+            })
+            .collect();
+
+        let mut compatible_ends = Vec::with_capacity(provided.len());
+        let mut compatible = Vec::new();
+        for (provided_idx, &arg_ty) in provided.iter().enumerate() {
+            for (expected_idx, &(formal, expected)) in inputs_tys.iter().enumerate() {
+                let fits = if provided_idx == expected_idx {
+                    !incompatible.contains(&(provided_idx as u32))
+                } else {
+                    self.check_compatible(arg_ty, formal, expected)
+                };
+                if fits {
+                    compatible.push(expected_idx as u32);
+                }
+            }
+            compatible_ends.push(compatible.len() as u32);
+        }
+
+        let (callee, method) = match self.store.expr(call_expr) {
+            Expr::Call { callee, .. } => (self.expr_ty_after_adjustments(callee), None),
+            Expr::MethodCall { receiver, .. } => (
+                self.expr_ty_after_adjustments(receiver),
+                self.result.method_resolution(call_expr).map(|(func, _)| func),
+            ),
+            _ => (self.types.types.error, None),
+        };
+        Box::new(CallArguments {
+            callee: self.ty_as_found(callee),
+            method,
+            is_method: matches!(self.store.expr(call_expr), Expr::MethodCall { .. }),
+            c_variadic,
+            formal_inputs: inputs_tys.iter().map(|&(formal, _)| self.ty_as_found(formal)).collect(),
+            expected_inputs: inputs_tys.iter().map(|&(_, expected)| self.ty_as_found(expected)).collect(),
+            provided: provided.iter().map(|&ty| self.ty_as_found(ty)).collect(),
+            compatible_ends: compatible_ends.into_boxed_slice(),
+            compatible: compatible.into_boxed_slice(),
+        })
+    }
+
+    /// rustc's `ArgMatchingCtxt::check_compatible` off the diagonal: whether an argument of
+    /// type `arg_ty` would fit the input `(formal, expected)`, inference left as it was.
+    fn check_compatible(&mut self, arg_ty: Ty<'db>, formal: Ty<'db>, expected: Ty<'db>) -> bool {
+        // An error type fits nothing, so the heuristics don't pass errors into every input.
+        if formal.references_error() || expected.references_error() {
+            return false;
+        }
+        let expectation = Expectation::rvalue_hint(self, expected);
+        let coerced_ty = expectation.only_has_type(&mut self.table).unwrap_or(formal);
+        if !self.may_coerce(arg_ty, coerced_ty) {
+            return false;
+        }
+        let infcx = &self.table.infer_ctxt;
+        let cause = ObligationCause::dummy();
+        let subtyping_error = infcx
+            .probe(|_| infcx.sup_raw(&cause, self.table.param_env, formal, coerced_ty).is_err());
+        !subtyping_error && !coerced_ty.references_error() && !arg_ty.references_error()
     }
 
     pub(super) fn with_breakable_ctx<T>(
@@ -2322,6 +2435,15 @@ impl<'db> InferenceContext<'db> {
     /// `ty` as inference has it at an error (`types_at_error`, for one type).
     pub(super) fn ty_at_error(&self, ty: Ty<'db>) -> Option<StoredTy> {
         self.types_at_error(ty, self.types.types.unit).map(|it| it.0)
+    }
+
+    /// `ty` as an error reports it: an undecided numeric literal's type fresh (`ty_at_error`),
+    /// any other variable an error.
+    fn ty_as_found(&self, ty: Ty<'db>) -> StoredTy {
+        self.ty_at_error(ty).unwrap_or_else(|| {
+            let ty = self.table.resolve_vars_if_possible(ty);
+            ty.fold_with(&mut ReplaceInferWithError::new(self.interner())).store()
+        })
     }
 
     /// rustc's `warn_if_unreachable`: `what` is unreachable when what came before it in its

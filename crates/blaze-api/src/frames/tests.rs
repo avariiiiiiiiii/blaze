@@ -150,6 +150,29 @@ fn a_warm_fill_allocates_nothing() {
     }
 }
 
+/// The whole way of a request that owns nothing, warm: encoded onto a kept buffer by a kept
+/// writer, pushed, cut out in place and decoded, it allocates nothing.
+#[test]
+fn a_warm_round_of_a_frame_allocates_nothing() {
+    let (mut writer, mut out, mut frames) = (cbor::Writer::new(), Vec::with_capacity(256), Frames::new());
+    let mut round = |id: u64| {
+        out.clear();
+        let sent = Envelope::new(id, Request::Cancel { id: id * 7 });
+        encode_into(&mut writer, &mut out, &sent).unwrap();
+        frames.push(&out);
+        let item = frames.next_ref().unwrap().expect("a whole frame");
+        let back: Envelope<Request> = decode(item).unwrap();
+        assert_eq!(back, sent);
+    };
+    // The longest frame of the ids below first, so the buffer has grown to it.
+    round(99);
+    blaze_alloc_count::assert_at_most(0, "a warm encode, push, cut and decode", || {
+        for id in 0..100 {
+            round(id);
+        }
+    });
+}
+
 #[test]
 fn nothing_comes_out_of_a_frame_cut_short() {
     let frame = encode(&Envelope::new(1, Request::Status)).unwrap();

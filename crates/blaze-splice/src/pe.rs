@@ -24,6 +24,7 @@ use std::{
 };
 
 use anyhow::{Context, bail, ensure};
+use blaze_format::cursor::{Put, Reader};
 use blaze_ids::radix;
 use object::{
     LittleEndian as LE, Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget,
@@ -635,7 +636,7 @@ impl<'a> Patch<'a> {
             let Some(old) = replaced.jump_from else { continue };
             let new = base + placed[&replaced.section] + replaced.offset;
             let mut jump = vec![0xe9];
-            jump.extend_from_slice(&relative(new, old + Self::JUMP as u64)?.to_le_bytes());
+            jump.put_i32(relative(new, old + Self::JUMP as u64)?);
             overwritten.push((image.offset_of(old)?, jump));
             redirected += 1;
         }
@@ -849,7 +850,7 @@ impl<'a> Patch<'a> {
             let Some(old) = replaced.jump_from else { continue };
             let new = start + placed[&replaced.section] + replaced.offset;
             let mut bytes = vec![0xe9];
-            bytes.extend_from_slice(&relative(new, old + Self::JUMP as u64)?.to_le_bytes());
+            bytes.put_i32(relative(new, old + Self::JUMP as u64)?);
             moved.push((image.base + new, image.base + old));
             let address = image.base + old;
             writes.push(blaze_live::format::Write { address, bytes, pointers: Vec::new() });
@@ -876,11 +877,10 @@ impl<'a> Patch<'a> {
         let mut blocks = Vec::new();
         for page in fixed.chunk_by(|a, b| a >> 12 == b >> 12) {
             let entries = page.len().next_multiple_of(2);
-            blocks.extend_from_slice(&((page[0] & !0xfff) as u32).to_le_bytes());
-            blocks.extend_from_slice(&((8 + entries * 2) as u32).to_le_bytes());
+            blocks.put_u32((page[0] & !0xfff) as u32);
+            blocks.put_u32((8 + entries * 2) as u32);
             for at in page {
-                let entry = pe::IMAGE_REL_BASED_DIR64 << 12 | (at & 0xfff) as u16;
-                blocks.extend_from_slice(&entry.to_le_bytes());
+                blocks.put_u16(pe::IMAGE_REL_BASED_DIR64 << 12 | (at & 0xfff) as u16);
             }
             // A block is a whole number of 4 bytes: an entry of no kind fills it.
             blocks.resize(blocks.len() + (entries - page.len()) * 2, 0);
@@ -931,10 +931,13 @@ fn rooms<'a>(file: &CoffFile<'a>) -> anyhow::Result<FxHashMap<&'a [u8], Option<u
 /// Where a table of `.reloc` says whole addresses are stored, sorted.
 fn fixed_up(table: &[u8]) -> anyhow::Result<Vec<u64>> {
     let mut fixed = Vec::new();
-    let mut rest = table;
-    while rest.len() >= 8 {
-        let (page, len) = (u64::from(read_u32(rest)), read_u32(&rest[4..]) as usize);
-        let block = rest.get(8..len).context("a block of .reloc past its table")?;
+    let mut blocks = Reader::new(table);
+    while blocks.left() >= 8 {
+        let page = u64::from(blocks.u32()?);
+        let len = (blocks.u32()? as usize).checked_sub(8);
+        let block = len
+            .and_then(|len| blocks.take(len).ok())
+            .context("a block of .reloc past its table")?;
         for entry in block.chunks_exact(2) {
             let entry = u16::from_le_bytes([entry[0], entry[1]]);
             match entry >> 12 {
@@ -943,7 +946,6 @@ fn fixed_up(table: &[u8]) -> anyhow::Result<Vec<u64>> {
                 other => bail!("an address the loader moves in the way {other}"),
             }
         }
-        rest = &rest[len..];
     }
     radix::sort(&mut fixed);
     Ok(fixed)

@@ -32,8 +32,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use blaze_mem::{RegionVec, Tag};
-
 use super::{Outcome, hook};
 use crate::patch::{
     ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor, MessageView,
@@ -64,8 +62,8 @@ pub(crate) const HOST_ARCH: u32 = if cfg!(target_arch = "x86_64") {
 };
 
 /// What an image's descriptor says, with its slide. Addresses are as linked unless a method
-/// slides them.
-#[derive(Clone, Debug)]
+/// slides them. 96 bytes, made once at start.
+#[derive(Debug)]
 pub(crate) struct Layout {
     pub(crate) id: [u8; 16],
     /// The generation the image was linked at.
@@ -83,12 +81,14 @@ impl Layout {
     /// The layout of the descriptor found in memory at `at`.
     pub(crate) fn new(descriptor: &Descriptor, at: u64) -> Result<Layout, String> {
         if descriptor.version != DESCRIPTOR_VERSION {
+            // alloc: error path
             return Err(format!(
                 "{DESCRIPTOR} is of version {}, where this blaze-live reads {DESCRIPTOR_VERSION}",
                 descriptor.version
             ));
         }
         if descriptor.arch != HOST_ARCH {
+            // alloc: error path
             return Err(format!(
                 "{DESCRIPTOR} is for architecture {}, where this program runs on {}",
                 descriptor.arch,
@@ -98,19 +98,23 @@ impl Layout {
         let [code_start, code_end] = descriptor.patch_code;
         let [data_start, data_end] = descriptor.patch_data;
         if code_start > code_end || data_start > data_end {
+            // alloc: error path
             return Err(format!(
                 "{DESCRIPTOR} has a patch region that ends before it starts: code {code_start:#x}..\
                  {code_end:#x}, data {data_start:#x}..{data_end:#x}"
             ));
         }
         if descriptor.slots > MOST_SLOTS {
+            // alloc: error path
             return Err(format!("{DESCRIPTOR} has {} slots", descriptor.slots));
         }
         if descriptor.dir[1] > MOST_DIR {
+            // alloc: error path
             return Err(format!("{DESCRIPTOR} names a directory {} bytes long", descriptor.dir[1]));
         }
         let slide = at.wrapping_sub(descriptor.this);
         if !descriptor.table.wrapping_add(slide).is_multiple_of(8) {
+            // alloc: error path
             return Err(format!(
                 "{DESCRIPTOR}'s table cell at {:#x} is not aligned",
                 descriptor.table
@@ -244,53 +248,53 @@ pub(crate) trait Memory {
 /// Every generation the program ran, by index (0 the one it started at), in columns: 29 bytes
 /// each, 20 per cell its patch set and 16 per write of code. Lookups by index are direct.
 struct Log {
-    number: RegionVec<u64>,
+    number: Vec<u64>,
     /// The generation it was applied on; its own index for the first.
-    parent: RegionVec<u32>,
-    depth: RegionVec<u32>,
+    parent: Vec<u32>,
+    depth: Vec<u32>,
     /// Whether it is kept to roll back to.
-    kept: RegionVec<bool>,
+    kept: Vec<bool>,
     /// Generation `g`'s cells are `cells[g]..cells[g + 1]` of `slot`, `new` and `old`.
-    cells: RegionVec<u32>,
-    slot: RegionVec<u32>,
+    cells: Vec<u32>,
+    slot: Vec<u32>,
     /// A slot's target in memory in the generation, and in its parent.
-    new: RegionVec<u64>,
-    old: RegionVec<u64>,
+    new: Vec<u64>,
+    old: Vec<u64>,
     /// Generation `g`'s code is `code_at[g]..code_at[g + 1]` of `code`, in memory.
-    code_at: RegionVec<u32>,
-    code: RegionVec<Range<u64>>,
+    code_at: Vec<u32>,
+    code: Vec<Range<u64>>,
 }
 
-/// The most rows of a column of the log: the `u32` counts [`Switch::apply`] checks, and the
-/// one past the last generation `cells` and `code_at` hold.
-const LOGGED: usize = u32::MAX as usize + 1;
-
-/// A column of the log, reserved for [`LOGGED`] rows and committed as it grows.
-fn column<T>() -> Result<RegionVec<T>, String> {
-    RegionVec::new(LOGGED, Tag::Link).map_err(|it| format!("reserving the log of generations: {it}"))
-}
+/// What the log and [`Lasting`] have room for from the start: a program's first
+/// `GENERATIONS` patches, `CELLS` cells, `CODE` writes of code and `LASTING` lasting ranges
+/// allocate nothing; past them a column doubles, one allocation per doubling. About 550 KB of
+/// address space, touched as it fills.
+const GENERATIONS: usize = 1 << 10;
+const CELLS: usize = 1 << 14;
+const CODE: usize = 1 << 12;
+const LASTING: usize = 1 << 12;
 
 impl Log {
-    fn new(number: u64) -> Result<Log, String> {
+    fn new(number: u64) -> Log {
         let mut log = Log {
-            number: column()?,
-            parent: column()?,
-            depth: column()?,
-            kept: column()?,
-            cells: column()?,
-            slot: column()?,
-            new: column()?,
-            old: column()?,
-            code_at: column()?,
-            code: column()?,
+            number: Vec::with_capacity(GENERATIONS),
+            parent: Vec::with_capacity(GENERATIONS),
+            depth: Vec::with_capacity(GENERATIONS),
+            kept: Vec::with_capacity(GENERATIONS),
+            cells: Vec::with_capacity(GENERATIONS + 1),
+            slot: Vec::with_capacity(CELLS),
+            new: Vec::with_capacity(CELLS),
+            old: Vec::with_capacity(CELLS),
+            code_at: Vec::with_capacity(GENERATIONS + 1),
+            code: Vec::with_capacity(CODE),
         };
         log.number.push(number);
         log.parent.push(0);
         log.depth.push(0);
         log.kept.push(true);
-        log.cells.extend_from_slice(&[0, 0]);
-        log.code_at.extend_from_slice(&[0, 0]);
-        Ok(log)
+        log.cells.extend([0, 0]);
+        log.code_at.extend([0, 0]);
+        log
     }
 
     fn cells(&self, generation: u32) -> Range<usize> {
@@ -318,7 +322,7 @@ impl Log {
 
 /// What a lasting range holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(super) enum Holds {
+enum Holds {
     Code,
     Unwind,
 }
@@ -328,19 +332,13 @@ pub(super) enum Holds {
 /// at (a thread can be in it however long ago the program left it), and every unwind entry
 /// registered (the unwinder reads it from then on, and not every platform can take one
 /// back). Each range is of one generation, by number.
-pub(super) struct Lasting {
-    pub(super) ranges: RegionVec<(Range<u64>, u64, Holds)>,
+struct Lasting {
+    ranges: Vec<(Range<u64>, u64, Holds)>,
 }
 
-/// The most lasting ranges a program keeps: [`Switch::apply`] refuses a patch that would
-/// have more before it writes anything.
-const LASTING: usize = 1 << 26;
-
 impl Lasting {
-    pub(super) fn new() -> Result<Lasting, String> {
-        let ranges = RegionVec::new(LASTING, Tag::Link)
-            .map_err(|it| format!("reserving the lasting ranges: {it}"))?;
-        Ok(Lasting { ranges })
+    fn new() -> Lasting {
+        Lasting { ranges: Vec::with_capacity(LASTING) }
     }
 
     /// The first lasting range `range` overlaps: a binary search.
@@ -351,7 +349,7 @@ impl Lasting {
 
     /// Adds `range` of generation `number`, merged with what it overlaps: only ranges of the
     /// same generation can, since a patch over a lasting range is refused.
-    pub(super) fn add(&mut self, range: Range<u64>, number: u64, holds: Holds) {
+    fn add(&mut self, range: Range<u64>, number: u64, holds: Holds) {
         if range.is_empty() {
             return;
         }
@@ -365,16 +363,7 @@ impl Lasting {
             }
             end += 1;
         }
-        let merged = (merged, number, holds);
-        if end == at {
-            self.ranges.push(merged);
-            self.ranges[at..].rotate_right(1);
-        } else {
-            self.ranges[at] = merged;
-            self.ranges[at + 1..].rotate_left(end - at - 1);
-            let len = self.ranges.len() - (end - at - 1);
-            self.ranges.truncate(len);
-        }
+        self.ranges.splice(at..end, [(merged, number, holds)]);
     }
 }
 
@@ -383,10 +372,12 @@ fn over(kind: &str, hit: &(Range<u64>, u64, Holds), slide: u64) -> String {
     let (range, number, holds) = hit;
     let (start, end) = (range.start.wrapping_sub(slide), range.end.wrapping_sub(slide));
     match holds {
+        // alloc: error path
         Holds::Code => format!(
             "{kind} over generation {number}'s code at {start:#x}..{end:#x}, which the program \
              can be running"
         ),
+        // alloc: error path
         Holds::Unwind => format!(
             "{kind} over generation {number}'s unwind entries at {start:#x}..{end:#x}, which \
              the unwinder reads"
@@ -450,25 +441,28 @@ impl<M: Memory> Switch<M> {
         memory.in_image(&(cell..cell + 8))?;
         let table = memory.cell(cell);
         if table == 0 || !table.is_multiple_of(8) {
+            // alloc: error path, at start
             return Err(format!("the jump table cell at {cell:#x} holds {table:#x}"));
         }
         let end = layout.slots.checked_mul(8).and_then(|len| table.checked_add(len));
-        let end =
-            end.ok_or_else(|| format!("a jump table at {table:#x} past the end of memory"))?;
+        // alloc: error path, at start
+        let end = end.ok_or_else(|| format!("a jump table at {table:#x} past the end of memory"))?;
         memory.in_image(&(table..end))?;
-        let log = Log::new(layout.generation)?;
+        let log = Log::new(layout.generation);
+        let mut kept = Vec::with_capacity(KEPT + 1);
+        kept.push(0);
         let mut switch = Switch {
             memory,
             layout,
             current: 0,
             log,
-            kept: vec![0],
+            kept,
             image: table,
             pool: Vec::with_capacity(POOL),
             on: None,
             next: None,
             published: 0,
-            lasting: Lasting::new()?,
+            lasting: Lasting::new(),
             scratch: Scratch::default(),
             #[cfg(test)]
             stored: 0,
@@ -508,8 +502,10 @@ impl<M: Memory> Switch<M> {
                 let from = self.current();
                 match self.roll_back(to) {
                     Ok(()) => {
+                        // alloc: once per rollback, the reason the program and linker get
                         let why = "the linker took it back".to_owned();
                         (
+                            // clone: the same, one copy each (see above)
                             Outcome::RolledBack { generation: from, to, why: why.clone() },
                             Some(Answer::RolledBack { generation: from, to, why }),
                         )
@@ -518,6 +514,7 @@ impl<M: Memory> Switch<M> {
                 }
             }
             MessageView::Restart { id, generation, why } => match self.ours(&id) {
+                // alloc: once per restart, the reason handed to the program
                 Ok(()) => (Outcome::Restart { generation, why: why.to_owned() }, None),
                 Err(other) => declined(generation, other),
             },
@@ -687,11 +684,9 @@ impl<M: Memory> Switch<M> {
             s.unwinds.push(slid_unwind..slid_unwind + len);
         }
         let cells = patch.cells();
-        let lasting = s.code.len() + s.fdes.len() + s.ends.len() + s.unwinds.len();
         if u32::try_from(self.log.slot.len() + cells.len()).is_err()
             || u32::try_from(self.log.code.len() + s.code.len()).is_err()
             || u32::try_from(self.log.number.len()).is_err()
-            || self.lasting.ranges.len() + lasting > LASTING
         {
             return Err("more generations, cells or code than this program counts".to_owned());
         }
@@ -911,6 +906,7 @@ impl<M: Memory> Switch<M> {
     pub(crate) fn guard<R>(
         &mut self,
         f: impl FnOnce() -> R,
+        // dyn: called only after a panic in patched code, once per rollback
         answer: &mut dyn FnMut(&Answer),
     ) -> Result<R, Outcome> {
         let (payload, panic) = match hook::catch(f) {
@@ -970,6 +966,7 @@ impl<M: Memory> Drop for Switch<M> {
 }
 
 fn declined(generation: u64, why: String) -> (Outcome, Option<Answer>) {
+    // clone: a declined patch's reason, one for the program and one for the linker
     (Outcome::Declined { generation, why: why.clone() }, Some(Answer::Declined { generation, why }))
 }
 
@@ -977,6 +974,7 @@ fn declined(generation: u64, why: String) -> (Outcome, Option<Answer>) {
 fn place(message: &[u8], at: u64, bytes: &[u8], slide: u64) -> Result<Span, String> {
     let slid = at.wrapping_add(slide);
     if slid.checked_add(bytes.len() as u64).is_none() {
+        // alloc: error path
         return Err(format!("a write at {at:#x} of {} bytes, past the end of memory", bytes.len()));
     }
     let from = bytes.as_ptr() as usize - message.as_ptr() as usize;
@@ -1004,6 +1002,7 @@ fn frames<M: Memory>(
         return Ok(());
     }
     if M::DWARF == Dwarf::Not {
+        // alloc: error path
         return Err("DWARF unwind entries, which this platform's unwinder doesn't take".to_owned());
     }
     let linked = |at: u64| at.wrapping_sub(slide);
@@ -1011,6 +1010,7 @@ fn frames<M: Memory>(
         |at: u64, len: u64| find(message, code, at, len).or_else(|| find(message, data, at, len));
     let length = |at: u64| -> Result<u32, String> {
         let field = bytes(at, 4).ok_or_else(|| {
+            // alloc: error path
             format!("unwind entries reach {:#x}, in none of the patch's writes", linked(at))
         })?;
         Ok(le32(field))
@@ -1018,11 +1018,13 @@ fn frames<M: Memory>(
     fdes.extend(patch.frames().map(|(at, len)| (at.wrapping_add(slide), len)));
     fdes.sort_unstable();
     if let Some(pair) = fdes.windows(2).find(|it| it[1].0 < it[0].0.saturating_add(it[0].1)) {
+        // alloc: error path
         return Err(format!("two unwind entries at {:#x}", linked(pair[1].0)));
     }
     for &(at, len) in fdes.iter() {
         let field = length(at)?;
         if field == 0 || field == u32::MAX || u64::from(field) + 4 != len {
+            // alloc: error path
             return Err(format!(
                 "the unwind entry at {:#x} is {len} bytes by the patch, and its length says {}",
                 linked(at),
@@ -1030,6 +1032,7 @@ fn frames<M: Memory>(
             ));
         }
         if bytes(at, len).is_none() {
+            // alloc: error path
             return Err(format!(
                 "the unwind entry at {:#x} runs past the patch's writes",
                 linked(at)
@@ -1050,17 +1053,20 @@ fn frames<M: Memory>(
                         break;
                     }
                     if field == u32::MAX {
+                        // alloc: error path
                         return Err(format!("a 64-bit unwind entry at {:#x}", linked(at)));
                     }
                     if next < fdes.len() && fdes[next].0 == at {
                         next += 1;
                     } else if next < fdes.len() && fdes[next].0 < at {
+                        // alloc: error path
                         return Err(format!(
                             "the unwind entry at {:#x} is not where the entries before it end",
                             linked(fdes[next].0)
                         ));
                     }
                     at = at.checked_add(4 + u64::from(field)).ok_or_else(|| {
+                        // alloc: error path
                         format!("unwind entries from {:#x} overflow", linked(start))
                     })?;
                 }
@@ -1103,6 +1109,7 @@ fn unwind_len(header: &[u8]) -> u64 {
 fn span(at: u64, len: usize) -> Result<Range<u64>, String> {
     at.checked_add(len as u64)
         .map(|end| at..end)
+        // alloc: error path
         .ok_or_else(|| format!("a write at {at:#x} of {len} bytes, past the end of memory"))
 }
 
@@ -1127,5 +1134,6 @@ pub(super) fn le64(bytes: &[u8]) -> u64 {
 }
 
 fn hex(bytes: &[u8]) -> String {
+    // alloc: error path
     bytes.iter().map(|it| format!("{it:02x}")).collect()
 }

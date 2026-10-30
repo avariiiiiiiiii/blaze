@@ -22,8 +22,8 @@ use syntax::{
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    let mut entries: Vec<_> = entries.filter_map(Result::ok).map(|it| it.path()).collect();
+    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {dir:?}: {e}"));
+    let mut entries: Vec<_> = entries.map(|it| it.expect("a directory entry").path()).collect();
     entries.sort();
     for path in entries {
         if path.is_dir() {

@@ -167,6 +167,7 @@ fn install() -> Result<i32, String> {
             return Ok(signal);
         }
     }
+    // alloc: error path
     Err(format!(
         "no real-time signal ({low}..={high}) is free to stop the program's threads with, which \
          live edits write over their code with"
@@ -201,6 +202,7 @@ impl Threads {
     pub(super) fn new() -> Result<Threads, String> {
         let signal = install()?;
         let task = File::open("/proc/self/task")
+            // alloc: error path
             .map_err(|it| format!("listing the program's threads in /proc/self/task: {it}"))?;
         let pid = std::process::id() as i32;
         Ok(Threads {
@@ -311,9 +313,13 @@ impl World for Threads {
         // SAFETY: wakes every thread waiting on `HOLD`, a static.
         unsafe { syscall(SYS_FUTEX, HOLD.as_ptr(), FUTEX_WAKE_PRIVATE, i32::MAX) };
         stopped.map_err(|stuck| match stuck {
+            // alloc: error path
             Stuck::Many => format!("the program runs more than {MOST_THREADS} threads to stop"),
+            // alloc: error path
             Stuck::Listing(code) => format!("listing the program's threads: error {code}"),
+            // alloc: error path
             Stuck::Signal(tid, code) => format!("stopping thread {tid}: error {code}"),
+            // alloc: error path
             Stuck::Slow(expected, done) => format!(
                 "{} of the program's {expected} other threads did not stop within {STOP_WITHIN:?} \
                  (one blocks signal {}, or waits where the kernel doesn't interrupt it)",

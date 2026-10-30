@@ -32,6 +32,7 @@ impl Plain {
     /// The lines `record` adds, each with its end. A step is said begun once it has gone on
     /// for [`NEWS_NS`]: one done sooner says nothing, as a log of every quick step is noise.
     pub fn record(&mut self, record: &Record) -> String {
+        // alloc: the one-call form for the CLI; a loop writes `record_into` one buffer
         let mut out = String::new();
         self.record_into(record, &mut out);
         out
@@ -74,6 +75,7 @@ impl Plain {
     /// A line saying the step under way still is, when nothing was said for
     /// [`HEARTBEAT_NS`]: a log that stops for a minute looks like a hung build.
     pub fn tick(&mut self, now_ns: u64) -> String {
+        // alloc: the one-call form for the CLI; a loop writes `tick_into` one buffer
         let mut out = String::new();
         self.tick_into(now_ns, &mut out);
         out

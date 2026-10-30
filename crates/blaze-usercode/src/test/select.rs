@@ -20,6 +20,7 @@ use std::{borrow::Cow, convert::Infallible, ffi::OsString, fmt, path::PathBuf, t
 
 use blaze_cas::{Corrupt, Key, Kind, Mismatch, Store, Ticket};
 use blaze_core::{Traced, Untraceable};
+use blaze_format::cursor::{Put, Reader};
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_items::CodeHash;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -83,18 +84,16 @@ impl Attrs {
     }
 }
 
-/// A test as selection sees it.
+/// A test as selection sees it. Made only by [`Test::of`] or [`Test::whole`], which work out
+/// its identity once, so its fields are read-only: [`select`] and [`record`] each key by
+/// the identity, and a test of 10,000 reached functions takes about 90 µs to hash.
 #[derive(PartialEq, Eq, Debug)]
 pub struct Test {
-    /// The name libtest shows, the path from the crate's root.
-    pub name: String,
-    /// The code hashes of what it reaches, in the order codegen's walk found them
-    /// ([`Reached::reached`]): an explanation names the first that changed.
-    pub reached: Vec<CodeHash>,
-    pub attrs: Attrs,
-    /// It reaches the outside world (files, the environment, processes, the network through
-    /// code the walk can't see into), as codegen marks it: it always runs.
-    pub outside: bool,
+    name: String,
+    reached: Vec<CodeHash>,
+    attrs: Attrs,
+    outside: bool,
+    identity: ContentId,
 }
 
 /// The name of the test that stands for a whole binary run as libtest's threads.
@@ -103,29 +102,39 @@ pub const WHOLE: &str = "\0the whole binary";
 impl Test {
     /// The test of what codegen found it reaches, its set moved, not copied.
     pub fn of(reached: Reached, attrs: Attrs, outside: bool) -> Test {
-        Test { name: reached.test, reached: reached.reached, attrs, outside }
+        Test::new(reached.test, reached.reached, attrs, outside)
+    }
+
+    fn new(name: String, reached: Vec<CodeHash>, attrs: Attrs, outside: bool) -> Test {
+        let identity = identity_of(&name, &reached, &attrs);
+        Test { name, reached, attrs, outside, identity }
+    }
+
+    /// The name libtest shows, the path from the crate's root.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The code hashes of what it reaches, in the order codegen's walk found them
+    /// ([`Reached::reached`]): an explanation names the first that changed.
+    pub fn reached(&self) -> &[CodeHash] {
+        &self.reached
+    }
+
+    pub fn attrs(&self) -> &Attrs {
+        &self.attrs
+    }
+
+    /// It reaches the outside world (files, the environment, processes, the network through
+    /// code the walk can't see into), as codegen marks it: it always runs.
+    pub fn outside(&self) -> bool {
+        self.outside
     }
 
     /// The test, binary-independent: its name, the set of code hashes it reaches and its
-    /// attributes.
+    /// attributes, as worked out when it was made.
     pub fn identity(&self) -> ContentId {
-        let mut hasher = Hasher::new("blaze v2 test identity 1");
-        hasher.part(self.name.as_bytes()).id(&self.attrs.id());
-        blaze_mem::scratch::with_u64s(|order| {
-            set_order(&self.reached, order);
-            hasher.update(&(order.len() as u64).to_le_bytes());
-            // 16 KiB an update, not 32 bytes: BLAKE3 hashes the whole 1 KiB chunks of one
-            // update side by side, as many as its widest SIMD (16 with AVX-512), and a 32-byte
-            // update at a time it cannot. On the stack, so no buffer of the set's size.
-            let mut block = [0u8; 32 * 512];
-            for group in order.chunks(512) {
-                for (at, &it) in group.iter().enumerate() {
-                    block[32 * at..32 * at + 32].copy_from_slice(&self.reached[it as u32 as usize].0.0);
-                }
-                hasher.update(&block[..32 * group.len()]);
-            }
-        });
-        hasher.finish()
+        self.identity
     }
 
     /// The test that stands for `tests` run together in one process: it reaches what any of
@@ -141,13 +150,31 @@ impl Test {
                 }
             }
         }
-        Test {
-            name: WHOLE.to_owned(), // alloc: once per binary run whole
-            reached,
-            attrs: Attrs::default(),
-            outside: tests.iter().any(|it| it.outside),
-        }
+        let outside = tests.iter().any(|it| it.outside);
+        Test::new(WHOLE.to_owned(), reached, Attrs::default(), outside) // alloc: once per binary run whole
     }
+}
+
+/// The identity of the test `name` that reaches `reached` with `attrs`: its name, its
+/// attributes and the set of what it reaches, sorted and each once.
+fn identity_of(name: &str, reached: &[CodeHash], attrs: &Attrs) -> ContentId {
+    let mut hasher = Hasher::new("blaze v2 test identity 1");
+    hasher.part(name.as_bytes()).id(&attrs.id());
+    blaze_mem::scratch::with_u64s(|order| {
+        set_order(reached, order);
+        hasher.update(&(order.len() as u64).to_le_bytes());
+        // 16 KiB an update, not 32 bytes: BLAKE3 hashes the whole 1 KiB chunks of one update
+        // side by side, as many as its widest SIMD (16 with AVX-512), and a 32-byte update at
+        // a time it cannot. On the stack, so no buffer of the set's size.
+        let mut block = [0u8; 32 * 512];
+        for group in order.chunks(512) {
+            for (at, &it) in group.iter().enumerate() {
+                block[32 * at..32 * at + 32].copy_from_slice(&reached[it as u32 as usize].0.0);
+            }
+            hasher.update(&block[..32 * group.len()]);
+        }
+    });
+    hasher.finish()
 }
 
 /// `hashes` sorted, each once: for an explanation ([`explain`]), the edge.
@@ -284,9 +311,14 @@ pub enum Wanted {
 }
 
 pub fn wanted(test: &Test, filter: &Filter) -> Wanted {
+    asked(&test.name, &test.attrs, filter)
+}
+
+/// [`wanted`] of the test `name` with `attrs`, before its reached set is known (a listing).
+pub fn asked(name: &str, attrs: &Attrs, filter: &Filter) -> Wanted {
     let matches = |pattern: &String| match filter.exact {
-        true => test.name == *pattern,
-        false => test.name.contains(pattern.as_str()),
+        true => name == pattern.as_str(),
+        false => name.contains(pattern.as_str()),
     };
     if !filter.names.is_empty() && !filter.names.iter().any(matches) {
         return Wanted::Filtered;
@@ -294,7 +326,7 @@ pub fn wanted(test: &Test, filter: &Filter) -> Wanted {
     if filter.skip.iter().any(matches) {
         return Wanted::Filtered;
     }
-    match (filter.ignored, test.attrs.ignore) {
+    match (filter.ignored, attrs.ignore) {
         (Ignored::Skip, true) => Wanted::Ignored,
         (Ignored::Only, false) => Wanted::Filtered,
         _ => Wanted::Yes,
@@ -654,13 +686,12 @@ struct Entry<'s> {
 impl<'s> Entry<'s> {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HISTORY.len() + 1 + 32 + 32 + 8 + 8 + self.traced.len());
-        out.extend_from_slice(HISTORY);
-        out.push(u8::from(self.passed) | (u8::from(self.kept) << 1));
-        out.extend_from_slice(&self.attrs.0);
-        out.extend_from_slice(&self.reached.0.0);
-        out.extend_from_slice(&(self.took.as_micros().min(u128::from(u64::MAX)) as u64).to_le_bytes());
-        out.extend_from_slice(&(self.traced.len() as u64).to_le_bytes());
-        out.extend_from_slice(self.traced);
+        out.put_bytes(HISTORY);
+        out.put_u8(u8::from(self.passed) | (u8::from(self.kept) << 1));
+        out.put_bytes(&self.attrs.0);
+        out.put_bytes(&self.reached.0.0);
+        out.put_u64(self.took.as_micros().min(u128::from(u64::MAX)) as u64);
+        out.put_bytes_u64(self.traced);
         out
     }
 
@@ -677,22 +708,18 @@ impl<'s> Entry<'s> {
 
     fn decode(bytes: &'s [u8]) -> Result<Entry<'s>, String> {
         let rest = bytes.strip_prefix(HISTORY).ok_or_else(|| "not a test's history".to_owned())?; // alloc: error path
-        if rest.len() < 1 + 32 + 32 + 8 + 8 {
-            return Err("a test's history ends early".to_owned()); // alloc: error path
-        }
-        let flags = rest[0];
-        let id = |at: usize| ContentId(rest[at..at + 32].try_into().expect("32 bytes"));
-        let took = u64::from_le_bytes(rest[65..73].try_into().expect("8 bytes"));
-        let len = u64::from_le_bytes(rest[73..81].try_into().expect("8 bytes"));
-        let traced = &rest[81..];
-        if traced.len() as u64 != len {
-            return Err("a test's history has a record of another length than it says".to_owned()); // alloc: error path
-        }
+        let mut at = Reader::new(rest);
+        let flags = at.u8()?;
+        let attrs = ContentId(*at.array()?);
+        let reached = Key(ContentId(*at.array()?));
+        let took = at.u64()?;
+        let traced = at.bytes_u64()?;
+        at.finish()?;
         Ok(Entry {
             passed: flags & 1 != 0,
             kept: flags & 2 != 0,
-            attrs: id(1),
-            reached: Key(id(33)),
+            attrs,
+            reached,
             took: Duration::from_micros(took),
             traced,
         })
@@ -702,10 +729,10 @@ impl<'s> Entry<'s> {
 /// The `count` hashes of `set`, in order, as the store keeps a reached set.
 fn encode_reached<'h>(count: usize, set: impl Iterator<Item = &'h CodeHash>) -> Vec<u8> {
     let mut out = Vec::with_capacity(REACHED.len() + 8 + 32 * count);
-    out.extend_from_slice(REACHED);
-    out.extend_from_slice(&(count as u64).to_le_bytes());
+    out.put_bytes(REACHED);
+    out.put_u64(count as u64);
     for hash in set {
-        out.extend_from_slice(&hash.0.0);
+        out.put_bytes(&hash.0.0);
     }
     out
 }
@@ -713,12 +740,11 @@ fn encode_reached<'h>(count: usize, set: impl Iterator<Item = &'h CodeHash>) -> 
 /// The sorted set [`encode_reached`] wrote.
 fn decode_reached(bytes: &[u8]) -> Result<Vec<CodeHash>, String> {
     let rest = bytes.strip_prefix(REACHED).ok_or_else(|| "not a reached set".to_owned())?; // alloc: the edge: an explanation for people, made only when asked
-    let (count, rest) = rest.split_at_checked(8).ok_or_else(|| "a reached set ends early".to_owned())?; // alloc: the edge: an explanation for people, made only when asked
-    let count = u64::from_le_bytes(count.try_into().expect("8 bytes"));
-    if rest.len() as u64 != count.saturating_mul(32) {
-        return Err("a reached set holds another number of hashes than it says".to_owned()); // alloc: the edge: an explanation for people, made only when asked
-    }
-    Ok(rest
+    let mut at = Reader::new(rest);
+    let count = at.count_u64(32)?;
+    let hashes = at.take(32 * count)?;
+    at.finish()?;
+    Ok(hashes
         .chunks_exact(32)
         .map(|it| CodeHash(ContentId(it.try_into().expect("32 bytes"))))
         .collect()) // alloc: the edge: an explanation for people, made only when asked

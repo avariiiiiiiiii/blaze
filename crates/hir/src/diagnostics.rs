@@ -43,7 +43,7 @@ use hir_ide::{
     display::{DisplayTarget, HirDisplay},
     method_resolution::TraitImpls,
     next_solver::{
-        AnyImplId, DbInterner, EarlyBinder, TyKind, TypingMode,
+        AnyImplId, DbInterner, EarlyBinder, StoredTy, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
     solver_errors::SolverDiagnosticKind,
@@ -63,7 +63,7 @@ use triomphe::Arc;
 use crate::{
     AnyFunctionId, AssocItem, Const, EnumVariant, Field, Function, GenericDef, GenericParam, Trait,
     Type, TypeAlias, TypeOwnerId, Variant,
-    match_lints::{BindingOrigin, SpecialTy},
+    match_lints::{BindingOrigin, ConstPatternError, SpecialTy},
     struct_tail_raw,
 };
 
@@ -167,7 +167,7 @@ diagnostics![AnyDiagnostic<'db> ->
     InvalidCast<'db>,
     InvalidDeriveTarget,
     InvalidLhsOfAssignment,
-    InvalidRangePatType,
+    InvalidRangePatType<'db>,
     LateBoundLifetimeArgs,
     MacroDefError,
     MacroError,
@@ -175,6 +175,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MalformedDerive,
     MethodCallIllegalSizedBound,
     MismatchedArgCount,
+    IncorrectArguments,
     MismatchedTupleStructPatArgCount,
     MissingFields,
     MissingMatchArms<'db>,
@@ -185,6 +186,7 @@ diagnostics![AnyDiagnostic<'db> ->
     EmptyRangePattern,
     PatternComplexityLimit,
     MixedDerefPatterns,
+    ConstPatternRefused<'db>,
     NonExhaustiveRecordExpr,
     NonExhaustiveRecordPat,
     NoSuchField,
@@ -364,6 +366,11 @@ pub struct MismatchedTupleStructPatArgCount {
     pub expr_or_pat: InFile<ExprOrPatPtr>,
     pub expected: usize,
     pub found: usize,
+    /// The struct or variant the pattern names.
+    pub variant: Variant,
+    /// Whether the pattern's type did not match the scrutinee's; rustc suggests parentheses
+    /// only when it did (`emit_err_pat_wrong_number_of_fields`).
+    pub had_err: bool,
 }
 
 #[derive(Debug)]
@@ -386,8 +393,12 @@ pub struct ExpectedArrayOrSlicePat<'db> {
 }
 
 #[derive(Debug)]
-pub struct InvalidRangePatType {
+pub struct InvalidRangePatType<'db> {
     pub pat: InFile<ExprOrPatPtr>,
+    /// Each end's type as inference had it when it checked that end (an undecided literal's
+    /// as `{integer}`), and whether that end is not `char` or numeric.
+    pub lhs: Option<(Type<'db>, bool)>,
+    pub rhs: Option<(Type<'db>, bool)>,
 }
 
 #[derive(Debug)]
@@ -757,6 +768,61 @@ pub struct MismatchedArgCount {
     /// True when the call is through a `Fn`/`FnMut`/`FnOnce` trait (E0057)
     /// rather than a regular function call (E0061).
     pub is_fn_trait_call: bool,
+    pub args: CallArgs,
+}
+
+/// rustc's `report_arg_errors` of a call whose argument count fits but some argument does not
+/// (E0308 "arguments to this function are incorrect"); each such argument also has its
+/// `TypeMismatch`.
+#[derive(Debug)]
+pub struct IncorrectArguments {
+    pub call_expr: InFile<ExprOrPatPtr>,
+    pub args: CallArgs,
+}
+
+/// What rustc's `report_arg_errors` starts from, every type as rustc prints it at the error
+/// (`{integer}` for an undecided literal, `{type error}` for any other variable).
+#[derive(Debug)]
+pub struct CallArgs {
+    /// rustc's `callee_ty`: the callee's type after adjustments, the receiver's of a method call.
+    pub callee: String,
+    /// The method a method call resolved to.
+    pub method: Option<Function>,
+    pub is_method: bool,
+    pub c_variadic: bool,
+    /// The callee's inputs, without a method's receiver.
+    pub formal_inputs: Vec<String>,
+    /// `formal_inputs` as the call's expectation has them.
+    pub expected_inputs: Vec<String>,
+    /// The provided arguments' types after adjustments (of a C-variadic call, those of its
+    /// fixed inputs only).
+    pub provided: Vec<String>,
+    compatible_ends: Box<[u32]>,
+    compatible: Box<[u32]>,
+}
+
+impl CallArgs {
+    /// `ArgMatrix::new`'s row of the `provided`th argument: the inputs it fits, in order.
+    pub fn compatible_with(&self, provided: usize) -> &[u32] {
+        let start = provided.checked_sub(1).map_or(0, |it| self.compatible_ends[it] as usize);
+        &self.compatible[start..self.compatible_ends[provided] as usize]
+    }
+
+    fn new(db: &Db, target: DisplayTarget, args: &hir_ide::CallArguments) -> Self {
+        let show = |ty: &StoredTy| ty.as_ref().display(db, target).to_string();
+        let shows = |tys: &[StoredTy]| tys.iter().map(show).collect();
+        CallArgs {
+            callee: show(&args.callee),
+            method: args.method.map(Into::into),
+            is_method: args.is_method,
+            c_variadic: args.c_variadic,
+            formal_inputs: shows(&args.formal_inputs),
+            expected_inputs: shows(&args.expected_inputs),
+            provided: shows(&args.provided),
+            compatible_ends: args.compatible_ends.clone(),
+            compatible: args.compatible.clone(),
+        }
+    }
 }
 
 /// E0004.
@@ -819,6 +885,13 @@ pub struct PatternComplexityLimit {
 pub struct MixedDerefPatterns {
     pub deref_pat: InFile<AstPtr<ast::Pat>>,
     pub normal_pat: InFile<AstPtr<ast::Pat>>,
+}
+
+/// A constant used as a pattern that rustc's `const_to_pat` refuses, at the path that names it.
+#[derive(Debug)]
+pub struct ConstPatternRefused<'db> {
+    pub pat: InFile<AstPtr<ast::Pat>>,
+    pub error: ConstPatternError<'db>,
 }
 
 #[derive(Debug)]
@@ -906,6 +979,29 @@ pub struct InvalidCast<'db> {
     pub error: CastError,
     pub expr_ty: Type<'db>,
     pub cast_ty: Type<'db>,
+    /// rustc's `PointerKind` of the expression's pointee, where the check of a pointer cast
+    /// found it: `DifferingKinds`, `SizedUnsizedCast`, `NeedViaThinPtr`, and
+    /// `UnknownCastPtrKind` of a cast to a wide pointer of unknown pointee.
+    pub expr_pointer: Option<CastPointerKind>,
+    /// Likewise of the pointee of the type cast to: also `IntToWideCast` and the
+    /// `IllegalCast` of a function pointer.
+    pub cast_pointer: Option<CastPointerKind>,
+    /// Of `PtrPtrAddingAutoTraits`: the auto traits the target `dyn` adds, in its order.
+    pub added_auto_traits: Vec<crate::Trait>,
+}
+
+/// The metadata of a pointer, as rustc's cast errors tell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastPointerKind {
+    Thin,
+    /// A trait object, with its principal trait if it has one.
+    VTable(Option<crate::Trait>),
+    /// A slice or `str`.
+    Length,
+    /// A projection or opaque type's.
+    OfAlias,
+    /// A type parameter's.
+    OfParam(crate::TypeParam),
 }
 
 #[derive(Debug)]
@@ -1162,6 +1258,14 @@ pub struct InvalidLhsOfAssignment {
 #[derive(Debug)]
 pub struct MethodCallIllegalSizedBound {
     pub call_expr: InFile<ExprOrPatPtr>,
+    pub method: crate::Function,
+    /// Whose own bounds or where clause (the method's, or its trait's or impl's) hold the
+    /// `Self: Sized` bound; `None` where it is only implied (rustc gives it no label).
+    pub bound: Option<crate::GenericDef>,
+    /// rustc's `needs_mut`: the receiver of the other mutability picks another method.
+    pub needs_mut: bool,
+    /// The traits, in scope or not, a probe of every crate's traits picks the method from.
+    pub candidates: Vec<crate::Trait>,
 }
 
 #[derive(Debug)]
@@ -2290,10 +2394,6 @@ impl<'db> AnyDiagnostic<'db> {
                     );
                 }
             }
-            // rustc's check_match, in `hir-ty-matchck`, gives these
-            // (`crate::match_lints::match_check_diagnostics`).
-            BodyValidationDiagnostic::MissingMatchArms { .. }
-            | BodyValidationDiagnostic::NonExhaustiveLet { .. } => {}
             BodyValidationDiagnostic::RemoveTrailingReturn { return_expr } => {
                 if let Ok(source_ptr) = source_map.expr_syntax(return_expr)
                     // Filters out desugared return expressions (e.g. desugared try operators).
@@ -2371,9 +2471,12 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
-            &InferenceDiagnostic::InvalidRangePatType { pat } => {
-                let pat = pat_syntax(pat)?.map(Into::into);
-                InvalidRangePatType { pat }.into()
+            InferenceDiagnostic::InvalidRangePatType { pat, lhs, rhs } => {
+                let pat = pat_syntax(*pat)?.map(Into::into);
+                let end = |side: &Option<(StoredTy, bool)>| {
+                    side.as_ref().map(|(ty, fail)| (new_ty(ty.as_ref()), *fail))
+                };
+                InvalidRangePatType { pat, lhs: end(lhs), rhs: end(rhs) }.into()
             }
             &InferenceDiagnostic::DuplicateField { field: expr, variant } => {
                 let expr_or_pat = match expr.unpack() {
@@ -2384,18 +2487,28 @@ impl<'db> AnyDiagnostic<'db> {
                 };
                 DuplicateField { field: expr_or_pat, variant: variant.into() }.into()
             }
-            &InferenceDiagnostic::MismatchedArgCount {
+            InferenceDiagnostic::MismatchedArgCount {
                 call_expr,
                 expected,
                 found,
                 is_fn_trait_call,
-            } => MismatchedArgCount {
-                call_expr: expr_syntax(call_expr)?,
-                expected,
-                found,
-                is_fn_trait_call,
+                args,
+            } => {
+                let target = DisplayTarget::from_crate_and_edition(db, krate, edition);
+                MismatchedArgCount {
+                    call_expr: expr_syntax(*call_expr)?,
+                    expected: *expected,
+                    found: *found,
+                    is_fn_trait_call: *is_fn_trait_call,
+                    args: CallArgs::new(db, target, args),
+                }
+                .into()
             }
-            .into(),
+            InferenceDiagnostic::IncorrectArguments { call_expr, args } => {
+                let target = DisplayTarget::from_crate_and_edition(db, krate, edition);
+                let args = CallArgs::new(db, target, args);
+                IncorrectArguments { call_expr: expr_syntax(*call_expr)?, args }.into()
+            }
             &InferenceDiagnostic::PrivateField { expr, field } => {
                 let expr = expr_syntax(expr)?;
                 let field = field.into();
@@ -2493,22 +2606,66 @@ impl<'db> AnyDiagnostic<'db> {
                 let expr = expr_syntax(*expr)?;
                 TypedHole { expr, expected: new_ty(expected.as_ref()) }.into()
             }
-            &InferenceDiagnostic::MismatchedTupleStructPatArgCount { pat, expected, found } => {
+            &InferenceDiagnostic::MismatchedTupleStructPatArgCount {
+                pat,
+                expected,
+                found,
+                variant,
+                had_err,
+            } => {
                 let InFile { file_id, value } = pat_syntax(pat)?;
                 // cast from Either<Pat, SelfParam> -> Either<_, Pat>
                 let ptr = AstPtr::try_from_raw(value.syntax_node_ptr())?;
                 let expr_or_pat = InFile { file_id, value: ptr };
-                MismatchedTupleStructPatArgCount { expr_or_pat, expected, found }.into()
+                MismatchedTupleStructPatArgCount {
+                    expr_or_pat,
+                    expected,
+                    found,
+                    variant: variant.into(),
+                    had_err,
+                }
+                .into()
             }
             InferenceDiagnostic::CastToUnsized { expr, cast_ty } => {
                 let expr = expr_syntax(*expr)?;
                 CastToUnsized { expr, cast_ty: new_ty(cast_ty.as_ref()) }.into()
             }
-            InferenceDiagnostic::InvalidCast { expr, error, expr_ty, cast_ty } => {
+            InferenceDiagnostic::InvalidCast { expr, error, expr_ty, cast_ty, pointers } => {
                 let expr = expr_syntax(*expr)?;
                 let expr_ty = new_ty(expr_ty.as_ref());
                 let cast_ty = new_ty(cast_ty.as_ref());
-                InvalidCast { expr, error: *error, expr_ty, cast_ty }.into()
+                let kind = |kind: Option<hir_ide::CastPointerKind>| {
+                    kind.map(|kind| match kind {
+                        hir_ide::CastPointerKind::Thin => CastPointerKind::Thin,
+                        hir_ide::CastPointerKind::VTable(principal) => {
+                            CastPointerKind::VTable(principal.map(|id| crate::Trait { id }))
+                        }
+                        hir_ide::CastPointerKind::Length => CastPointerKind::Length,
+                        hir_ide::CastPointerKind::OfAlias => CastPointerKind::OfAlias,
+                        hir_ide::CastPointerKind::OfParam(id) => {
+                            CastPointerKind::OfParam(crate::TypeParam { id })
+                        }
+                    })
+                };
+                let (expr_pointer, cast_pointer, added_auto_traits) = match pointers {
+                    Some(it) => (
+                        kind(it.expr),
+                        kind(it.cast),
+                        // alloc: once per refused pointer cast
+                        it.added_auto_traits.iter().map(|&id| crate::Trait { id }).collect(),
+                    ),
+                    None => (None, None, Vec::new()),
+                };
+                InvalidCast {
+                    expr,
+                    error: *error,
+                    expr_ty,
+                    cast_ty,
+                    expr_pointer,
+                    cast_pointer,
+                    added_auto_traits,
+                }
+                .into()
             }
             InferenceDiagnostic::CannotBeDereferenced { expr, found, at_error } => {
                 let expr = expr_syntax(*expr)?;
@@ -2641,9 +2798,21 @@ impl<'db> AnyDiagnostic<'db> {
                 let assign = expr_syntax(assign)?;
                 InvalidLhsOfAssignment { lhs, assign, op }.into()
             }
-            &InferenceDiagnostic::MethodCallIllegalSizedBound { call_expr } => {
-                MethodCallIllegalSizedBound { call_expr: expr_syntax(call_expr)? }.into()
+            &InferenceDiagnostic::MethodCallIllegalSizedBound {
+                call_expr,
+                method,
+                bound,
+                needs_mut,
+                ref candidates,
+            } => MethodCallIllegalSizedBound {
+                call_expr: expr_syntax(call_expr)?,
+                method: method.into(),
+                bound: bound.map(Into::into),
+                needs_mut,
+                // alloc: the error path's candidate traits.
+                candidates: candidates.iter().map(|&id| crate::Trait { id }).collect(),
             }
+            .into(),
             &InferenceDiagnostic::TypeMustBeKnown { at_point, ref top_term, kind, ref ambiguity } => {
                 let at_point = span_syntax(at_point)?;
                 let target = DisplayTarget::from_crate_and_edition(db, krate, edition);

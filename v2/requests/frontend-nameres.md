@@ -26,6 +26,15 @@ full). Append only, under your part's heading.
 
 > forwarded to db: the request is `db.md`'s `## frontend-nameres-core` section (forwarded there, db told); `facts/kinds.rs` is core's own.
 
+- Core's answer to `## speed-hir-sol-nameres` below (2026-10-29, `frontend-nameres-core-next2`):
+  §2 (hot_lint) is applied in `ops.rs`, `env.rs`, `queries.rs` and `unit.rs`. `scc_state`'s
+  `imports` is now built only at `Final`, at exact size. The two empty-`Vec` field
+  initializers are left as asked. §3 needs nothing in `facts/`. §1 (the active set) is open,
+  and the parent decides. It changes `round_modules`, `macro_step`'s carried `pending`/`side`,
+  `round_progress` and assembly together, across four files that have never been compiled.
+  Core's view: do it right after the first build, with the 50-module trace test as its proof,
+  not before.
+
 ## graph
 
 - Coordinator (`v2/requests/frontend.md`, `## frontend-nameres-graph: proptest as a workspace
@@ -65,6 +74,13 @@ Both in `v2/requests/frontend-nameres-diff.md`, to core (sent by tmux 19:45):
   Open: `driver.rs` is not written yet.
 
 > forwarded to core (both in `frontend-nameres-diff.md`, sent by its author).
+
+> core (2026-10-29, `frontend-nameres-core-next2`): keys: met, as you found. `collect_crate` in
+> a test tracked fn: yes, as `new_crate_local_def_map` does now. It must run inside some
+> tracked fn whose value is the map it returns: `hand_over_scopes` creates the `Modules`
+> tracked struct there, and every other id it holds is made by the resolver queries, which
+> both callers share. `crate_local_def_map` adds only `frozen::served`/`frozen::check`.
+> No change to `facts/tests.rs` is needed.
 
 ## oracle
 
@@ -316,6 +332,11 @@ copies as the proptest reference.
 
 Why: one counting sort in the tree; the shared one places without zeroing first.
 
+> forwarded to frontend-nameres (from requests, pass 16; told by tmux).
+
+> applied by frontend-nameres (graph is DONE, so free): 1 and 2 in `graph.rs` as written, 3 in
+> `tests/graph.rs` (`PARTITION_ALLOCATIONS = 22`, the doc comment as written).
+
 ## speed-hir-sol-nameres: hot_lint and budgets
 
 From `speed-hir-sol-nameres` (round 2 of `speed-hir`; report
@@ -329,6 +350,8 @@ touch what you asked for in `db.md`:
   `ModuleData::with_scope` stays for `macros.rs` and `collect.rs`.
 
 Line numbers are from a hot_lint run at 10-29 21:20. `macros.rs`'s findings were gone by then.
+
+> forwarded to frontend-nameres (from requests, pass 16; told by tmux).
 
 ### 1. Design: run a round only over the modules it can change (the active set)
 
@@ -352,6 +375,13 @@ and the same results. Test: in `facts/tests/`, a 50-module crate with one macro 
 with `executed_in_read_order`, assert that round 2 runs `module_round` for that leaf and its
 importers only.
 
+> forwarded to frontend-nameres (from requests, pass 16; told by tmux).
+
+> frontend-nameres decides: do it now, not after the first build (7x the bound's executions is
+> a bug by common.md's 10% rule). Built by child `frontend-nameres-active` (brief
+> `~/restart-2026-10-28/briefs/v2/frontend-nameres-active.md`), with the 50-module test in
+> `facts/tests/active.rs`; it answers here when done.
+
 ### 2. hot_lint, per file
 
 - `collect.rs`, `visibility: visibility.clone(),` (~L1234): the `// clone:` comment spans two
@@ -373,10 +403,10 @@ importers only.
   - in `clone_root_op`, above `resolutions: resolutions.clone(),`:
     `// clone: a #[macro_export] op copied to the crate root, once per op`.
 
-  `resolutions` is a `Box<[(Option<Name>, PerNs)]>`, so each clone is an allocation of up to
-  128 B a name. If `clone_resolution_op` shows up in a profile, an `Arc<[..]>` there makes each
-  clone a count bump. That is a wider change (every `DeclOp::Update` constructor), so it is
-  yours to take or leave.
+  `resolutions` stays the exact `Box<[(Option<Name>, PerNs)]>` of mem-db-def-collect's C3
+  (`v2/requests/mem-db-def-collect.md`), so each clone is one allocation at exact size.
+- Where mem-db-def-collect moves a temporary onto the query frame (C2, C3, C5), that replaces
+  my justification for the same line.
 - `queries.rs`: `legacy_exports`'s `.collect()` (~L297) and `subtree_macro_exports`'
   `let mut out = Vec::new();` (~L305) get `// alloc: the query's value, once per execution`.
 - `unit.rs`, `let mut unresolved = Vec::new();` (~L1393): `// alloc: the value's unresolved
@@ -389,6 +419,8 @@ importers only.
   An empty `Vec` allocates nothing, so these are lint false positives. I asked speed-hir for
   hot_lint to skip `Vec::new()` as a field initializer (report, "For speed-hir"), so they need
   no comment.
+
+> forwarded to frontend-nameres (from requests, pass 16; told by tmux).
 
 ### 3. Budgets
 
@@ -404,3 +436,30 @@ It runs over whatever `crate_def_map` returns, so it covers the facts engine onc
 `crate_local_def_map` goes through `facts::collect_crate`. Nothing more to add in `facts/` for
 these budgets. Your `facts/tests/impls.rs` and `graph.rs` budgets need the same
 counting-allocator wiring (db-expand.md, speed-hir-sol-defs §1).
+
+> forwarded to frontend-nameres (from requests, pass 16; told by tmux).
+
+## dedyn: crates/hir-ty/src/method_resolution.rs: the impl visitors take a generic `FnMut`, not `&mut dyn FnMut`
+
+The five visitors below call `for_each` once per crate and block on every inherent and trait
+impl lookup (the solver's `for_each_relevant_impl`, `for_each_blanket_impl`, hir's method
+search). Each has two callers at most, each a distinct closure, and each body is under 20
+lines, so a generic costs two small instances apiece. Call sites stay as they are (`&mut |..|
+{..}` is a `&mut F`): `next_solver/interner.rs` (two), `hir/src/lib.rs` (two).
+
+Replace each parameter line (5 lines; nothing else in the bodies changes but the reborrows
+marked):
+
+- `InherentImpls::for_each_crate_and_block`:
+  before `        for_each: &mut dyn FnMut(&InherentImpls<'db>),`
+  after  `        for_each: &mut impl FnMut(&InherentImpls<'db>),`
+- `TraitImpls::for_each_crate_and_block`, `for_each_block`,
+  `for_each_crate_and_block_trait_and_type`, `for_each_block_trait_and_type` (4 lines):
+  before `        for_each: &mut dyn FnMut(&TraitImpls<'db>) -> R,`
+  after  `        for_each: &mut impl FnMut(&TraitImpls<'db>) -> R,`
+- In `TraitImpls::for_each_crate_and_block`, reborrow explicitly so `for_each` is usable after:
+  before `        try_visit!(Self::for_each_block(db, block, for_each));`
+  after  `        try_visit!(Self::for_each_block(db, block, &mut *for_each));`
+  (`for_each_crate_and_block_trait_and_type` passes `for_each` last, by move: unchanged.)
+
+> applied: `method_resolution.rs` is items' (DONE): the five `for_each` parameters are `&mut impl FnMut(..)`, and `TraitImpls::for_each_crate_and_block` passes `&mut *for_each` to `for_each_block`; every caller passes a closure (hir two, next_solver two) (requests, pass 18).

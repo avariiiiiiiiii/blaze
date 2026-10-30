@@ -596,8 +596,7 @@ impl<'db> MirLowerCtx<'_, 'db> {
                 None => {
                     let unresolved_name = || MirLowerError::UnresolvedName {
                         owner: self.owner.expression_store_owner(self.db),
-                        // clone: error path
-                        path: p.clone(),
+                        path: p.mod_path().copied(),
                     };
                     // A path that starts at a type, `<T>::C`, is one only inference resolves.
                     let associated = match self.infer.assoc_resolutions_for_pat(pattern) {

@@ -20,6 +20,8 @@ mod reparse;
 mod table;
 pub mod target;
 #[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
 mod tests;
 mod view;
 
@@ -33,7 +35,7 @@ use std::{
 pub use crate::{
     change::FileChange,
     content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
-    db::{Db, RunOrder, run_on_pool, set_run_order},
+    db::{Db, Reader, RunOrder, Shared, run_on_pool, set_run_order},
     editioned_file_id::EditionedFileId,
     files::Files,
     input::{
@@ -153,7 +155,7 @@ pub struct FileText {
     #[returns(ref)]
     #[get(text_field)]
     #[set(set_text_field)]
-    text: std::sync::Arc<str>,
+    text: syntax::Text,
     pub file_id: vfs::FileId,
     /// The module a crate root's text ends with that the compiler wrote, not the file on disk:
     /// blaze's test harness or list of proc macros. rustc injects its own after it applies
@@ -212,11 +214,12 @@ impl FileText {
         files::no_text()
     }
 
-    /// The text, which the file's parse tree shares ([`EditionedFileId::parse`]).
+    /// The text, which the file's parse tree shares ([`EditionedFileId::parse`]): the VFS's
+    /// bytes as they are, a heap file's allocation or a range of the mapped image.
     pub fn text<'db, Db: ?Sized + salsa::Database>(
         self,
         db: &'db Db,
-    ) -> &'db std::sync::Arc<str> {
+    ) -> &'db syntax::Text {
         self.text_field(db)
     }
 

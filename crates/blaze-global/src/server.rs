@@ -17,6 +17,7 @@ use std::collections::VecDeque;
 
 use blaze_cas::{Key, Kind, Store, Ticket};
 use blaze_core::{Address, Completion, Conn, Done, Effect, Tag};
+use blaze_format::cursor::Reader;
 use blaze_ids::ContentId;
 
 use crate::{
@@ -26,7 +27,7 @@ use crate::{
     http, place,
     sign::{RECORD_LEN, SIGNED_LEN, Signed, Trust},
     tls::{Channel, Channels, TlsServer},
-    wire::{self, BATCH_MOST, BODY_MOST, Reader, RecvWindow, SendWindow},
+    wire::{self, BATCH_MOST, BODY_MOST, Fields as _, RecvWindow, SendWindow},
 };
 
 /// The most connections it serves at once; one more is hung up on.
@@ -483,7 +484,7 @@ fn bundle(body: &[u8], store: &Store) -> Result<Response, Response> {
     let bad = |why: String| Response::refused(400, &format!("a malformed bundle request: {why}"));
     let mut reader = Reader::new(body);
     reader.header(wire::BUNDLE_ASK, "a bundle request").map_err(bad)?;
-    let id = BundleId(ContentId(*reader.array("a bundle's ID").map_err(bad)?));
+    let id = BundleId(ContentId(*reader.array().map_err(wire::truncated).map_err(bad)?));
     reader.end("a bundle request").map_err(bad)?;
     let manifest = store.get(&id.manifest_key()).map_err(|corrupt| Response::refused(500, &corrupt.to_string()))?;
     let mut out = Vec::new();

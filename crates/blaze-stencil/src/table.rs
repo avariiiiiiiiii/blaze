@@ -31,6 +31,7 @@ impl Variant {
             (blaze_codegen::Arch::X86_64, Cpu::Baseline) => Ok(Variant::X86_64),
             (blaze_codegen::Arch::Aarch64, Cpu::Baseline) => Ok(Variant::Aarch64),
             (blaze_codegen::Arch::Aarch64, Cpu::AppleM1) => Ok(Variant::Aarch64Lse),
+            // alloc: the error, which stops the compile
             (arch, cpu) => Err(Error::new(format!("no stencil library for {arch:?} at {cpu:?}"))),
         }
     }
@@ -52,12 +53,15 @@ impl Library {
         static LIBRARIES: [OnceLock<Result<Library, String>>; 3] =
             [OnceLock::new(), OnceLock::new(), OnceLock::new()];
         let checked = LIBRARIES[variant as usize].get_or_init(|| {
+            // alloc: once per library, the check's error
             let reader = format::Reader::new(variant.bytes()).map_err(|e| e.to_string())?;
             if reader.variant() != variant {
+                // alloc: once per library, the check's error
                 return Err(format!("the {:?} library says it is {:?}", variant, reader.variant()));
             }
             Ok(Library { reader })
         });
+        // alloc: the error, which stops the compile
         checked.as_ref().map_err(|e| Error::new(format!("the {variant:?} stencil library: {e}")))
     }
 

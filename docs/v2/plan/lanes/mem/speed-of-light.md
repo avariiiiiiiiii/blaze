@@ -56,6 +56,11 @@ design it is held against.
 - **State of the art**: tcmalloc's per-CPU caches with transfer caches of batches, and
   mimalloc's free lists per page. A pool matches tcmalloc's batch transfer and has no size class
   lookup (one type per pool).
+- **Shared values** (`pool::Shared`): a clone is one relaxed atomic add, about 1 cycle
+  uncontended (an owner on another core's line costs the line's transfer, as for `Arc`). The
+  last drop is an acquire-release subtract and a slot push. `make_mut` with one owner is one
+  acquire load; while shared it is a cache allocation and the value's copy. Against `Arc`, the
+  same atomics, but no call into the global allocator for the copy or the free.
 
 ## Generational handles (`Slab::get`, `insert`, `remove`)
 
@@ -108,7 +113,7 @@ design it is held against.
 - **Bound**: counting cannot be free, but it need not be per allocation.
 - **Design**: counters move only at coarse grain: a commit, a chunk taken or given back, a
   batch of 64, a task's end. Each tag sits on its own 128-byte line, so subsystems never share a
-  counter line. A snapshot is 19 × 5 relaxed loads, read by admission per decision and by the
+  counter line. A snapshot is 20 × 5 relaxed loads, read by admission per decision and by the
   agent API, never on an allocation path.
 
 ## Scratch buffers (`scratch`)

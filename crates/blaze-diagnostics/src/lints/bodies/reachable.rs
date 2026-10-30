@@ -20,6 +20,9 @@ use crate::{
     model::{Diag, Span},
 };
 
+/// The lints this module gives: it runs only when one may fire.
+pub(super) const LINTS: super::LintSet = super::lint_set(["unreachable_code"]);
+
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
     b.infer.unreachable().iter().filter_map(|it| lint(b, it)).collect()
 }
@@ -28,7 +31,7 @@ pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
 /// uninhabited but not `!`, which type checking does not see (`MirBody::unreachable_after_calls`).
 /// None when the call is in a macro of another crate.
 pub(super) fn after_calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
-    if b.mir_tainted {
+    if b.mir_tainted() {
         return Vec::new();
     }
     let Some(mir) = b.mir() else { return Vec::new() };

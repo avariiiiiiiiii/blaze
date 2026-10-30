@@ -358,6 +358,9 @@ each, so 250 µs to read it), against 50 KiB and one `memcpy` (about 2 µs) as a
    per value). The tests are in `crates/blaze-protocol/src/bytes/tests.rs`; blaze-api's
    `frames/identity.rs` then covers `Op` against the reference codec as it is.
 
+> taken by requests (vfs and frontend-journal are DONE): child `requests-vfs`; the outcome follows.
+> applied by requests (child requests-vfs): `#[serde(with = "blaze_protocol::bytes")]` on `Op::Write`'s and `Op::Edit`'s `bytes` (`crates/blaze-vfs/src/lib.rs`), `blaze-protocol.workspace = true` in blaze-vfs's `[dependencies]` (manifest lint clean). `SCHEMA` was already 12 (`Request::Memory`), so this is `SCHEMA` 13 in `crates/blaze-api/src/lib.rs`, its doc saying so. Test `an_ops_bytes_are_one_byte_string` in `crates/blaze-vfs/src/tests.rs` (a byte string read back, the array refused); blaze-protocol's `bytes/tests.rs` and blaze-api's `frames/identity.rs` as the request says. Not built (no builds yet).
+
 ## dedup: bits: blaze-vfs `journal::Written` and `Tree::collect`'s `reached` onto `blaze_ids::bits::BitSet<NodeId>`
 
 From `dedup-bits-store` (report `/tmp/blaze-lanes/v2-dedup-bits-store.md`; parent `dedup-bits`).
@@ -551,3 +554,6 @@ function. Not persisted, no hash.
    `written.grow(tree.len());` stay as they are; `base.of.clone()` stays (with its comment).
 
 Status: open
+
+> taken by requests (vfs and frontend-journal are DONE): child `requests-vfs`; the outcome follows.
+> applied by requests (child requests-vfs): as written. `impl BitIndex for NodeId` and `Tree::collect`'s `reached` as a `BitSet<NodeId>` (`crates/blaze-vfs/src/tree.rs`); `type Written = BitSet<NodeId>` and the free `renumbered` with every call site (`crates/blaze-vfs/src/journal.rs`). `blaze_ids::bits` has each name used (`BitIndex`, `BitSet::{new, filled, contains, insert, grow, count, iter}`). Not built.

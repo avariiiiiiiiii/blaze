@@ -188,10 +188,10 @@ fn decode(form: &[u8], tier: u8) -> Result<Vec<u8>, FormatError> {
     }
 }
 
-/// The warm and cold forms of the buffers of one schema: what the store's
-/// `blaze_cas::Columns` for that schema is (an impl over this, in `blaze-cas`, which depends on
-/// this crate). Made by [`BufferColumns::of`] with the schema's root record type, so the
-/// columns are found from the schema, never guessed from the bytes.
+/// The warm and cold forms of the buffers of one schema: what `blaze_cas::Store::encode_columns`
+/// is given for that schema (`blaze-cas` depends on this crate). Made by [`BufferColumns::of`]
+/// with the schema's root record type, so the columns are found from the schema, never guessed
+/// from the bytes.
 ///
 /// The warm form is not read in place: a reader of a warm buffer decodes it with
 /// [`BufferColumns::hot_from_warm`], which unpacks 128 values a block.

@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
-use std::{ffi::OsString, path::PathBuf, sync::OnceLock};
+use std::{
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+    sync::OnceLock,
+};
 
 use blaze_api::{Artifact, Level, UnitProfile};
 use blaze_ids::ContentId;
@@ -199,7 +203,7 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
     let p = script::script_unit(&of(&units, &scripts, &tools), 3).unwrap();
     assert_eq!(p.dependencies.len(), 1);
     let env = blaze_build_script::env(&p, &[]).unwrap();
-    assert_eq!(env.vars.get(&OsString::from("DEP_Z_INCLUDE")), Some(&OsString::from(format!("{out_dir}/include"))));
+    assert_eq!(env.get("DEP_Z_INCLUDE"), Some(OsStr::new(&format!("{out_dir}/include"))));
     assert_eq!(p.tools.rustc, tools.join(format!("rustc{}", std::env::consts::EXE_SUFFIX)));
 }
 

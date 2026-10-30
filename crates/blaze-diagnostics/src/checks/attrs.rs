@@ -30,12 +30,16 @@ mod check;
 pub(in crate::checks) mod parsed;
 mod parsers;
 
+pub(in crate::checks) use self::accept::Session;
+
 use blaze_items::Fact;
+use blaze_mem::Frame;
 use hir::InFile;
-use syntax::{TextRange, TextSize};
+use smallvec::SmallVec;
+use syntax::{TextRange, TextSize, ast};
 
 use self::{
-    accept::{Accept, Session},
+    accept::Accept,
     args::ArgParser,
     parsed::ParsedAttr,
     parsers::{Accepted, Finalize, GroupId, Module},
@@ -44,7 +48,6 @@ use crate::{
     checks::features,
     cx::Cx,
     lints::syntax::{
-        Walk,
         attrs::{
             Attr, AttrKind, Owner, Target,
             table::{self, Kind, OnDuplicate, Safety, Targets},
@@ -56,55 +59,105 @@ use crate::{
 };
 
 /// The errors attribute parsing gives of `owners`' attributes: as the AST is lowered, and for
-/// a macro call's attributes, at expansion; with those of expansion's `check_attr`.
-pub(crate) fn parsed(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<Found> {
-    let session = Session::of(cx, owners);
-    let mut found = Vec::new();
+/// a macro call's attributes, at expansion; with those of expansion's `check_attr`. Each
+/// owner's attributes are lowered once, here: what they are parsed to is returned for
+/// [`checked`] (nothing for a macro call's, which `check_mod_attrs` does not see).
+pub(crate) fn parsed<'f>(
+    cx: &Cx<'f, '_>,
+    session: &Session,
+    owners: &[Owner],
+    found: &mut Vec<Found>,
+) -> Lowered<'f> {
+    let mut lowered = Lowered::with_capacity(cx.frame(), owners.len());
+    let mut errors = Vec::new();
     for owner in owners {
-        let mut errors = Vec::new();
         for attr in &owner.attrs {
             parsers::misc::validate(cx, attr, &mut errors);
         }
-        push(cx, owner, Phase::Expand, errors, &mut found);
-        let mut errors = Vec::new();
-        lower(cx, &session, owner, true, &mut errors);
+        push(cx, owner, Phase::Expand, &mut errors, found);
+        let start = lowered.attrs.len();
+        lower(cx, session, owner, &mut errors, &mut lowered.attrs);
         let phase = match owner.target {
-            Target::MacroCall => Phase::Expand,
+            Target::MacroCall => {
+                lowered.attrs.truncate(start);
+                Phase::Expand
+            }
             _ => Phase::Lower,
         };
-        push(cx, owner, phase, errors, &mut found);
+        lowered.close();
+        push(cx, owner, phase, &mut errors, found);
     }
-    found
+    lowered
 }
 
-/// The errors `check_mod_attrs` gives of `owners`' parsed attributes, then those of the
-/// stability pass, which reads what each definition inherits from its parents.
-pub(crate) fn checked(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<Found> {
-    let session = Session::of(cx, owners);
-    let mut found = Vec::new();
-    let mut all = Vec::with_capacity(owners.len());
-    for owner in owners {
-        if owner.target == Target::MacroCall {
-            all.push(Vec::new());
+/// The errors `check_mod_attrs` gives of `owners`' attributes, parsed by [`parsed`] to
+/// `lowered`, then those of the stability pass, which reads what each definition inherits
+/// from its parents.
+pub(crate) fn checked(
+    cx: &Cx<'_, '_>,
+    session: &Session,
+    owners: &[Owner],
+    lowered: &Lowered<'_>,
+    found: &mut Vec<Found>,
+) {
+    let mut errors = Vec::new();
+    for (at, owner) in owners.iter().enumerate() {
+        let parsed = lowered.of(at);
+        if parsed.is_empty() {
             continue;
         }
-        let parsed = lower(cx, &session, owner, false, &mut Vec::new());
-        let mut errors = Vec::new();
-        check::check(cx, &session, owner, &parsed, &mut errors);
-        push(cx, owner, Phase::Items, errors, &mut found);
-        all.push(parsed);
+        check::check(cx, session, owner, parsed, &mut errors);
+        push(cx, owner, Phase::Items, &mut errors, found);
     }
-    for (at, diag) in parsers::stability::crate_checks(cx, &session, owners, &all) {
-        push(cx, &owners[at], Phase::Items, vec![diag], &mut found);
+    for (at, diag) in parsers::stability::crate_checks(cx, session, owners, lowered) {
+        errors.push(diag);
+        push(cx, &owners[at], Phase::Items, &mut errors, found);
     }
-    found
 }
 
-/// Pushes `owner`'s errors. Besides its source, each reads the `#![feature]`s of the crate
-/// root, which the gates, the parsers and their targets look at.
-fn push(cx: &Cx<'_, '_>, owner: &Owner, phase: Phase, errors: Vec<Diag>, found: &mut Vec<Found>) {
+/// What every owner's attributes are parsed to, as one CSR list: owner `i`'s are
+/// `attrs[ends[i - 1]..ends[i]]`, in the check's frame. Two allocations per crate, not one
+/// per owner.
+pub(crate) struct Lowered<'f> {
+    attrs: Vec<ParsedAttr, &'f Frame>,
+    ends: Vec<u32, &'f Frame>,
+}
+
+impl<'f> Lowered<'f> {
+    /// `ends` is exact; `attrs` is allocated last, so it is the frame's top block and grows in
+    /// place past its estimate (most owners have only doc comments and lint attributes, which
+    /// lower to nothing).
+    fn with_capacity(frame: &'f Frame, owners: usize) -> Lowered<'f> {
+        let ends = Vec::with_capacity_in(owners, frame);
+        let attrs = Vec::with_capacity_in(owners / 4, frame);
+        Lowered { attrs, ends }
+    }
+
+    /// Ends the current owner's run.
+    fn close(&mut self) {
+        let end = u32::try_from(self.attrs.len()).expect("a crate has fewer than 2^32 parsed attributes");
+        self.ends.push(end);
+    }
+
+    /// What owner `at` (its index in the owners) is parsed to; nothing for one not lowered.
+    pub(crate) fn of(&self, at: usize) -> &[ParsedAttr] {
+        let Some(&end) = self.ends.get(at) else { return &[] };
+        let start = match at {
+            0 => 0,
+            _ => self.ends[at - 1],
+        };
+        &self.attrs[start as usize..end as usize]
+    }
+}
+
+/// Pushes `owner`'s errors, draining `errors`. Besides its source, each reads the
+/// `#![feature]`s of the crate root, which the gates, the parsers and their targets look at.
+fn push(cx: &Cx<'_, '_>, owner: &Owner, phase: Phase, errors: &mut Vec<Diag>, found: &mut Vec<Found>) {
+    if errors.is_empty() {
+        return;
+    }
     let root = cx.module_key(cx.krate.root_module(cx.db));
-    for mut diag in errors {
+    for mut diag in errors.drain(..) {
         source_fact(cx, &mut diag, owner.at());
         diag.fact(Fact::Signature(root), "the `#![feature]`s of the crate root");
         let phase = match (diag.fatal, owner.target) {
@@ -132,40 +185,40 @@ enum GroupKind {
     State,
 }
 
-/// rustc's `parse_attribute_list` of `owner`'s attributes: what they are, in the order rustc
-/// keeps them, with the errors (when `emit`) in `errors`.
-fn lower(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, emit: bool, errors: &mut Vec<Diag>) -> Vec<ParsedAttr> {
-    let mut quiet = Vec::new();
-    let out: &mut Vec<Diag> = if emit { errors } else { &mut quiet };
+/// rustc's `parse_attribute_list` of `owner`'s attributes: what they are, pushed to `parsed` in
+/// the order rustc keeps them, with the errors in `out`.
+fn lower(
+    cx: &Cx<'_, '_>,
+    session: &Session,
+    owner: &Owner,
+    out: &mut Vec<Diag>,
+    parsed: &mut Vec<ParsedAttr, &Frame>,
+) {
     let mut node = parsers::Node::default();
-    let mut groups: Vec<Group> = Vec::new();
+    let mut groups: SmallVec<[Group; 4]> = SmallVec::new();
     // The doc comments, `#[doc = ".."]` and the attributes no parser takes, which rustc keeps in
     // place: `where` predicates may have none of them.
-    let mut in_place: Vec<usize> = Vec::new();
+    let mut in_place: SmallVec<[usize; 8]> = SmallVec::new();
     for (index, attr) in owner.attrs.iter().enumerate() {
         let AttrKind::Meta { .. } = &attr.kind else {
             in_place.push(index);
             continue;
         };
-        let path = attr.path();
-        let segments: Vec<&str> = path.iter().map(String::as_str).collect();
-        let Some(builtin) = table::builtin(&segments) else {
-            if emit && attr.is_unsafe() {
+        let Some(builtin) = with_path(attr, table::builtin) else {
+            if attr.is_unsafe() {
                 out.push(not_unsafe(cx, attr));
             }
-            if emit && owner.target == Target::Crate {
+            if owner.target == Target::Crate {
                 out.extend(at_crate_level(cx, attr));
             }
             in_place.push(index);
             continue;
         };
-        if emit {
-            out.extend(safety(cx, attr, builtin.safety));
-            if owner.target != Target::MacroCall {
-                out.extend(features::attributes::gate(cx, &session.features, attr));
-            }
+        out.extend(safety(cx, attr, builtin.safety));
+        if owner.target != Target::MacroCall {
+            out.extend(features::attributes::gate(cx, &session.features, attr));
         }
-        let Some(args) = args::parse(cx, attr, &path, out) else { continue };
+        let Some(args) = args::parse(cx, attr, builtin.path, out) else { continue };
         if builtin.path == ["doc"]
             && let ArgParser::NameValue(nv) = &args
             && nv.value_as_str().is_some()
@@ -176,8 +229,7 @@ fn lower(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, emit: bool, errors: 
         let Some(module) = parsers::module(builtin.path) else {
             panic!("no parser module takes the builtin attribute `{}`", attr.name())
         };
-        let earlier = used_so_far(&groups);
-        let mut accept = Accept::new(cx, session, owner, index, builtin, &earlier, emit, out);
+        let mut accept = Accept::new(cx, session, owner, index, builtin, out);
         match parsers::accept(&mut node, module, &mut accept, &args) {
             Accepted::Single(converted) => {
                 let id = GroupId::Single(builtin.path);
@@ -192,8 +244,7 @@ fn lower(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, emit: bool, errors: 
                 if let Some(converted) = converted {
                     let GroupKind::Single(used) = &mut group.kind else { unreachable!("{id:?} is a single parser") };
                     if used.is_some() {
-                        if emit
-                            && let Kind::Single(on_duplicate) = builtin.kind
+                        if let Kind::Single(on_duplicate) = builtin.kind
                             && let Some(diag) = duplicate(cx, owner, builtin.path, on_duplicate, group.first, index)
                         {
                             out.push(diag);
@@ -211,16 +262,18 @@ fn lower(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, emit: bool, errors: 
                 }
             }
         }
-        if emit
-            && !matches!(builtin.targets, Targets::ManuallyChecked)
+        if !matches!(builtin.targets, Targets::ManuallyChecked)
             && let Some(diag) = accept::target_error(cx, &session.krate, owner, attr, builtin.targets, "")
         {
             out.push(diag);
         }
     }
-    let mut parsed = Vec::new();
-    let mut deferred = Vec::new();
-    let mut fx = Finalize::new(cx, session, owner, emit, out);
+    if groups.is_empty() && owner.target != Target::WherePredicate {
+        return;
+    }
+    let start = parsed.len();
+    let mut deferred: SmallVec<[(Module, GroupId, usize); 4]> = SmallVec::new();
+    let mut fx = Finalize::new(cx, session, owner, out);
     for group in &mut groups {
         match &mut group.kind {
             GroupKind::Single(used) => {
@@ -238,11 +291,12 @@ fn lower(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, emit: bool, errors: 
             }
         }
     }
+    let parsed = &parsed[start..];
     for (module, id, first) in deferred {
-        parsers::check(module, id, first, &mut fx, &parsed);
+        parsers::check(module, id, first, &mut fx, parsed);
     }
     drop(fx);
-    if emit && owner.target == Target::WherePredicate {
+    if owner.target == Target::WherePredicate {
         let mut spans = in_place;
         if let Some(doc) = parsed.iter().find(|it| matches!(it.parsed, parsed::Parsed::Doc(_))) {
             spans.push(doc.attr);
@@ -251,19 +305,28 @@ fn lower(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, emit: bool, errors: 
             out.push(in_where(cx, owner, &spans));
         }
     }
-    parsed
 }
 
-/// What the single parsers before an attribute made of theirs, for a parser that reads its
-/// node's other attributes as it parses.
-fn used_so_far(groups: &[Group]) -> Vec<ParsedAttr> {
-    groups
-        .iter()
-        .filter_map(|it| match &it.kind {
-            GroupKind::Single(Some(parsed)) => Some(ParsedAttr { parsed: parsed.clone(), attr: it.first }),
-            _ => None,
-        })
-        .collect()
+/// `attr`'s path as rustc's tables key it, given to `f` with nothing allocated: `["inline"]`,
+/// `["diagnostic", "on_unimplemented"]`, a doc comment's `["doc"]`. A segment that is not a
+/// name (`<T>`) is given as `"<>"`, which no table has.
+pub(in crate::checks) fn with_path<R>(attr: &Attr, f: impl FnOnce(&[&str]) -> R) -> R {
+    let AttrKind::Meta { meta, .. } = &attr.kind else { return f(&["doc"]) };
+    let Some(path) = meta.path() else { return f(&[]) };
+    let names: SmallVec<[Option<ast::NameRef>; 4]> = path.segments().map(|it| it.name_ref()).collect();
+    let segments: SmallVec<[&str; 4]> = names.iter().map(|it| it.as_ref().map_or("<>", ast::NameRef::text)).collect();
+    f(&segments)
+}
+
+/// Whether `attr`'s path is the one segment `name`, read with nothing allocated (what
+/// [`Attr::is`] answers by building the path).
+pub(in crate::checks) fn is(attr: &Attr, name: &str) -> bool {
+    match &attr.kind {
+        AttrKind::Doc(_) => name == "doc",
+        AttrKind::Meta { meta, .. } => {
+            meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == name)
+        }
+    }
 }
 
 /// What a second attribute of a single parser is, where the first is used: `UnusedMultiple`,
@@ -353,7 +416,7 @@ fn hides_wrapping(cx: &Cx<'_, '_>, attr: &Attr) -> bool {
 /// `#![global_allocator]` or `#![bench]`, which name attribute macros that apply to items.
 fn at_crate_level(cx: &Cx<'_, '_>, attr: &Attr) -> Option<Diag> {
     const NAMES: &[&str] = &["derive", "test", "test_case", "global_allocator", "bench"];
-    let name = NAMES.iter().find(|it| attr.is(it))?;
+    let name = NAMES.iter().find(|it| is(attr, it))?;
     let range = attr.range();
     let span = cx.span(attr.in_file(range));
     let mut diag = Diag::error(None, format!("`{name}` attribute cannot be used at crate level"), span.clone());

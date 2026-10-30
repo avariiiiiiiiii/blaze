@@ -47,6 +47,8 @@ mod utils;
 mod vec_box;
 
 #[cfg(test)]
+mod more_clone_tests;
+#[cfg(test)]
 mod more_types_tests;
 
 use syntax::{TextRange, TextSize, view as ast, view::AstNode as _};
@@ -159,6 +161,7 @@ const _: () = assert!(Implemented::ALL.len() <= BLAZE_BITS as usize);
 const _: () = assert!(BLAZE_BITS as usize + blaze::Lint::ALL.len() <= On::BITS as usize);
 
 /// Every bit of a [`blaze::Lint`].
+#[cfg(test)]
 const BLAZE: On = !0 << BLAZE_BITS;
 
 /// Each implemented lint's index in clippy's table, found when blaze compiles: a lint not of

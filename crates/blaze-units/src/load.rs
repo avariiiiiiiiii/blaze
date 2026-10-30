@@ -359,7 +359,7 @@ impl Query for Foreign {
     type Value = Cbor<StdPlanned>;
 
     fn input(key: &ForeignAsk) -> ContentId {
-        key_input("blaze v2 cargo foreign key 1", key)
+        key_input("blaze v2 cargo foreign key 2", key)
     }
 
     fn execute(cx: &mut Cx<'_>, ask: &ForeignAsk) -> Result<Cbor<StdPlanned>, Cancelled> {

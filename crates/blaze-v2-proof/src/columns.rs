@@ -17,19 +17,23 @@ use crate::Rng;
 /// zero, the extremes, and uniform over all of `u32`.
 pub fn shapes(seed: u64) -> Vec<(&'static str, Vec<u32>)> {
     let mut rng = Rng::new(seed);
+    // alloc: a test fixture, made once a codec's test; only tests call this module.
     let mut random = |n: usize, below: u64| -> Vec<u32> { (0..n).map(|_| rng.below(below) as u32).collect() };
     let lengths = [1, 7, 64, 127, 128, 129, 1000, 4096 + 3];
+    // alloc: as above.
     let mut out: Vec<(&'static str, Vec<u32>)> = vec![("empty", vec![]), ("single", vec![42])];
     for &n in &lengths {
-        out.push(("constant", vec![7; n]));
-        out.push(("zeros", vec![0; n]));
-        out.push(("max", vec![u32::MAX; n]));
+        for (name, value) in [("constant", 7), ("zeros", 0), ("max", u32::MAX)] {
+            // alloc: as above.
+            out.push((name, vec![value; n]));
+        }
         out.push(("u8 range", random(n, 1 << 8)));
         out.push(("u16 range", random(n, 1 << 16)));
         out.push(("below a power of two", random(n, (1 << 13) - 1)));
         out.push(("one bit", random(n, 2)));
         out.push(("u32 range", random(n, 1 << 32)));
         let base = random(1, 1 << 32)[0].saturating_sub(1 << 12);
+        // alloc: as above.
         out.push(("frame far from zero", random(n, 1 << 12).into_iter().map(|v| base + v).collect()));
         let mut runs = Vec::with_capacity(n);
         while runs.len() < n {
@@ -47,11 +51,14 @@ pub fn shapes(seed: u64) -> Vec<(&'static str, Vec<u32>)> {
             at += step;
         }
         out.push(("CSR offsets", offsets));
-        let increasing: Vec<u32> = random(n, 1000).iter().scan(0u32, |sum, &d| {
-            *sum += d + 1;
-            Some(*sum)
-        }).collect();
+        let mut increasing = random(n, 1000);
+        let mut sum = 0u32;
+        for d in &mut increasing {
+            sum += *d + 1;
+            *d = sum;
+        }
         out.push(("strictly increasing", increasing));
+        // alloc: as above.
         out.push(("alternating extremes", (0..n).map(|i| if i % 2 == 0 { 0 } else { u32::MAX }).collect()));
     }
     out
@@ -70,6 +77,7 @@ where
     for (name, column) in &all {
         let encoded = encode(column);
         if let Some(at) = (0..column.len()).find(|&i| get(&encoded, i) != column[i]) {
+            // alloc: error path, and the test fails.
             return Err(format!(
                 "{name} of {}: element {at} reads as {} in place, not {}",
                 column.len(),
@@ -91,9 +99,11 @@ where
 {
     let all = shapes(seed);
     for (name, column) in &all {
+        // alloc: error path, and the test fails.
         let back = decode(&encode(column)).map_err(|e| format!("{name} of {}: decoding failed: {e}", column.len()))?;
         if back != *column {
             let at = column.iter().zip(&back).position(|(a, b)| a != b).unwrap_or(column.len().min(back.len()));
+            // alloc: error path, and the test fails.
             return Err(format!(
                 "{name} of {}: came back with {} values, first apart at {at} ({:?} for {:?})",
                 column.len(),

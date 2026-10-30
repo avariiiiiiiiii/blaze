@@ -32,6 +32,15 @@ impl<'db> InferenceContext<'db> {
         // alloc: error path, one per type mismatch of a literal
         folder.numeric.then(|| Box::new((expected.store(), found.store())))
     }
+
+    /// `ty` as [`Self::types_at_error`] gives it, whether or not it holds a literal's type.
+    pub(super) fn type_at_error(&self, ty: Ty<'db>) -> StoredTy {
+        let ty = self.table.resolve_vars_if_possible(ty);
+        if !ty.has_infer() {
+            return ty.store();
+        }
+        ty.fold_with(&mut NumericVarsAtError { interner: self.interner(), numeric: false }).store()
+    }
 }
 
 struct NumericVarsAtError<'db> {

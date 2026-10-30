@@ -3,12 +3,14 @@
 //! Equal references are one place, so both go through here.
 
 use std::{
+    alloc::{Allocator, Global},
     borrow::Cow,
     cell::{OnceCell, RefCell},
     hash::BuildHasher as _,
 };
 
 use blaze_codegen::{Target, backend::FrontRef, template::Refs};
+use blaze_mem::Frame;
 use cranelift_codegen::ir;
 use hashbrown::HashTable;
 use rustc_hash::FxBuildHasher;
@@ -155,18 +157,34 @@ pub(crate) fn libcall_symbol(libcall: ir::LibCall) -> String {
     cranelift_module::default_libcall_names()(libcall)
 }
 
+/// The C library's name of each routine Cranelift calls itself, made once a process:
+/// `default_libcall_names` makes a boxed closure and a `String` a call.
+pub(crate) fn libcall_name(libcall: ir::LibCall) -> Result<&'static str, String> {
+    static NAMES: std::sync::LazyLock<Box<[(ir::LibCall, String)]>> = std::sync::LazyLock::new(|| {
+        let name = cranelift_module::default_libcall_names();
+        // alloc: once a process
+        ir::LibCall::all_libcalls().iter().map(|&it| (it, name(it))).collect()
+    });
+    match NAMES.iter().find(|it| it.0 == libcall) {
+        Some((_, name)) => Ok(name.as_str()),
+        // alloc: an error
+        None => Err(format!("{libcall:?}, which Cranelift's list of its libcalls lacks")),
+    }
+}
+
 /// The reference of the personality routine of a function with landing pads.
 pub(crate) fn personality_ref() -> Ref {
     FrontRef::Extern(PERSONALITY.to_owned())
 }
 /// The places of a list of references: a function's, which the walk made and nothing is
 /// added to, or a static's, made as its requests come.
-pub(crate) struct Placer<'a> {
+pub(crate) struct Placer<'a, A: Allocator = Global> {
     /// A function's: the walk's list as the database memoizes it, borrowed.
     refs: Cow<'a, [Ref]>,
     /// Each place, found by its reference's hash and checked against `refs`, so no reference is
-    /// cloned into a key: 4 bytes and a control byte a place, one probe a lookup.
-    index: HashTable<u32>,
+    /// cloned into a key: 4 bytes and a control byte a place, one probe a lookup. In `A`: a
+    /// unit's frame when it is a function's.
+    index: HashTable<u32, A>,
     open: bool,
 }
 
@@ -185,8 +203,19 @@ fn symbol_hash(name: &str) -> u64 {
 
 impl<'a> Placer<'a> {
     pub(crate) fn listed(refs: impl Into<Cow<'a, [Ref]>>) -> Placer<'a> {
+        Placer::listed_in(refs, Global)
+    }
+
+    pub(crate) fn open() -> Placer<'a> {
+        Placer { refs: Cow::Owned(Vec::new()), index: HashTable::new(), open: true }
+    }
+}
+
+impl<'a, A: Allocator> Placer<'a, A> {
+    /// [`Placer::listed`] with its index in `alloc`: a unit's frame.
+    pub(crate) fn listed_in(refs: impl Into<Cow<'a, [Ref]>>, alloc: A) -> Placer<'a, A> {
         let refs = refs.into();
-        let mut index = HashTable::with_capacity(refs.len());
+        let mut index = HashTable::with_capacity_in(refs.len(), alloc);
         for (place, it) in refs.iter().enumerate() {
             let hashed = hash(it);
             if index.find(hashed, |&at: &u32| refs[at as usize] == *it).is_none() {
@@ -194,10 +223,6 @@ impl<'a> Placer<'a> {
             }
         }
         Placer { refs, index, open: false }
-    }
-
-    pub(crate) fn open() -> Placer<'a> {
-        Placer { refs: Cow::Owned(Vec::new()), index: HashTable::new(), open: true }
     }
 
     pub(crate) fn place(&mut self, it: Ref) -> Result<u32, String> {
@@ -242,12 +267,12 @@ impl<'a> Placer<'a> {
 
 /// The place of each of `requests`, whose `TypeId`s it fills in. `krate` is the crate whose
 /// code makes them, `None` for assembly.
-pub(crate) fn place_requests(
+pub(crate) fn place_requests<A: Allocator>(
     db: &Db,
     homes: &mut Homes,
     hashes: &dyn Hashes,
     krate: Option<Crate>,
-    placer: &mut Placer<'_>,
+    placer: &mut Placer<'_, A>,
     requests: &mut Requests,
 ) -> Result<Places, String> {
     let mut funcs = Vec::with_capacity(requests.funcs.len());
@@ -345,9 +370,12 @@ pub(crate) fn fill_type_ids(
 /// references lack: [`resolve_owning`] keeps it by name, [`resolve`] refuses it.
 pub(crate) const OWN: u32 = u32::MAX;
 
-/// Resolves a function's requests against the targets of its places.
+/// Resolves a function's requests against the targets of its places, in a frame of the
+/// worker's that `work` gets through [`Placed::frame`] and that is reset when it returns.
 pub(crate) fn resolve<T>(places: &Places, refs: &Refs, work: impl FnOnce(&Placed<'_>) -> T) -> T {
-    work(&Placed { places, refs, symbols: OnceCell::new(), own: None })
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+        work(&Placed { places, refs, frame, symbols: OnceCell::new(), own: None })
+    })
 }
 
 /// [`resolve`] for code a backend optimized, which may call symbols of its own the walk did
@@ -358,9 +386,12 @@ pub(crate) fn resolve_owning<T>(
     refs: &Refs,
     work: impl FnOnce(&Placed<'_>) -> T,
 ) -> (T, Vec<String>) {
-    let placed = Placed { places, refs, symbols: OnceCell::new(), own: Some(RefCell::default()) };
-    let done = work(&placed);
-    (done, placed.own.map(RefCell::into_inner).unwrap_or_default())
+    blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+        let own = Some(RefCell::default());
+        let placed = Placed { places, refs, frame, symbols: OnceCell::new(), own };
+        let done = work(&placed);
+        (done, placed.own.map(RefCell::into_inner).unwrap_or_default())
+    })
 }
 
 /// A function's requests as the targets of its places. Its symbols are indexed on the first
@@ -369,9 +400,19 @@ pub(crate) fn resolve_owning<T>(
 pub(crate) struct Placed<'a> {
     places: &'a Places,
     refs: &'a Refs,
-    symbols: OnceCell<HashTable<(u64, u32)>>,
-    /// The symbols the backend named that `refs` does not list, when it may name its own.
+    /// The unit's frame: its emit's tables are kept there.
+    frame: &'a Frame,
+    symbols: OnceCell<HashTable<(u64, u32), &'a Frame>>,
+    /// The symbols the backend named that `refs` does not list, when it may name its own. Kept
+    /// past the emit ([`blaze_codegen::backend::Emitted::extra`]).
     own: Option<RefCell<Vec<String>>>,
+}
+
+impl<'a> Placed<'a> {
+    /// The frame the unit's emit runs in.
+    pub(crate) fn frame(&self) -> &'a Frame {
+        self.frame
+    }
 }
 
 impl Placed<'_> {
@@ -408,8 +449,9 @@ impl Resolver for Placed<'_> {
 
     fn symbol(&self, name: &str) -> Result<Target, String> {
         let refs = self.refs;
+        let frame = self.frame;
         let symbols = self.symbols.get_or_init(|| {
-            let mut index: HashTable<(u64, u32)> = HashTable::new();
+            let mut index: HashTable<(u64, u32), &Frame> = HashTable::new_in(frame);
             for (at, it) in refs.iter().enumerate() {
                 if let Target::Extern(it) = it {
                     let hashed = symbol_hash(it);
@@ -441,5 +483,34 @@ impl Resolver for Placed<'_> {
             Some(last) if last == self.places.refs as usize => Ok(refs[last].clone()),
             _ => Err("a call of a fold's body from what is no thunk of it".to_owned()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cranelift_codegen::ir::LibCall;
+
+    #[test]
+    fn every_libcall_is_named_as_cranelift_names_it() {
+        let name = cranelift_module::default_libcall_names();
+        for &libcall in LibCall::all_libcalls() {
+            assert_eq!(super::libcall_name(libcall), Ok(name(libcall).as_str()));
+            assert_eq!(super::libcall_name(libcall).map(str::to_owned), Ok(super::libcall_symbol(libcall)));
+        }
+    }
+
+    /// A unit's symbols are indexed in its frame, and found by name as before.
+    #[test]
+    fn a_symbol_is_found_through_the_frames_index() {
+        use blaze_codegen::Target;
+
+        use super::{super::convert::Resolver as _, resolve};
+        let places = super::Places { funcs: Vec::new(), datas: Vec::new(), refs: 2 };
+        let refs = [Target::Extern("memcpy".to_owned()), Target::Extern("memset".to_owned())];
+        let found = resolve(&places, &refs, |it| [it.symbol("memset"), it.symbol("memcpy"), it.symbol("bcmp")]);
+        let [memset, memcpy, bcmp] = found;
+        assert_eq!(memset, Ok(refs[1].clone()));
+        assert_eq!(memcpy, Ok(refs[0].clone()));
+        assert!(bcmp.is_err());
     }
 }

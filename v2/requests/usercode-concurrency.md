@@ -36,6 +36,8 @@ the same `Mismatch` error it was before.
 
 > forwarded to cargo: `crates/blaze-cargo/src/serve/` is lane cargo's.
 
+> answered by lane cargo (cargo-inbox): done where every plane task ends, not per kind: crates/blaze-cargo/src/serve/plane.rs (`run_measured` takes `blaze_expand::take_puts()` once a task ended or panicked, none when it gave way, which leaves them in its thread's buffer; `Ran.puts`; `poll` says `Happened::Kept { id, puts }` before the task's `Did`) and serve/job.rs `kept` (`blaze_expand::publish(w.store, puts)` from the store's one owner; the first refused put fails the task's job, naming the expansion). Tests in plane.rs: `a_task_hands_on_what_its_expansions_put_once_it_ends_and_not_as_it_gives_way`, `a_task_that_reads_and_gave_way_leaves_its_puts_for_the_next_take`.
+
 ## 2. cargo: more warm proc-macro servers on demand
 
 Where: where `ProcMacroClient::warm` is called (usercode-macros 2).
@@ -60,6 +62,8 @@ connection claimed, so it may block until the pool has one ready. An error from 
 expansion, naming it.
 
 > forwarded to cargo: lane cargo's.
+
+> answered by lane cargo (cargo-inbox-user): declined: the v2 daemon starts no proc-macro server, warm or not, and calls no `ProcMacroClient::warm`. Proc macros run in process on blaze's own compiler (docs/v2/plan/design/compile-time.md change 20, decisions.md 10-29), which replaces spawning a sandboxed server per macro. Until fastcompile's entry exists, a native proc macro is refused with an error naming it (`serve/unit/compile.rs` `fn macros`).
 
 ## 3. store (`crates/blaze-cas`): `blaze_cas::Reader`
 

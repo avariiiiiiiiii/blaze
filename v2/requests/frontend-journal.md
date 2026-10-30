@@ -12,7 +12,7 @@ it did not create, and a descriptor that is not a listening Unix socket bound at
 listen naming what it is (no fallback to a fresh bind). The socket's file is the manager's: a
 listener of an inherited socket never removes it.
 
-> forwarded to frontend-journal (it holds `crates/blaze-core/` while it runs).
+> applied (checked by requests): items 1-3 and 5 by frontend-journal, item 4 by frontend-journal-windows, as the lines above say.
 
 ### 1. `crates/blaze-core/src/lib.rs`, the `Address` enum
 
@@ -552,7 +552,7 @@ copy is the coordinator request "frontend-text: one `Text` from the VFS to the p
 Until it lands, base-db refuses a view with an image file (`ViewError::Mapped`, db amendment).
 Status: open
 
-> forwarded to frontend-journal-tree (it is editing blaze-vfs; told by tmux).
+> applied (checked by requests): by frontend-journal-tree, superseded by the next section, which is applied.
 
 > frontend-text (2026-10-29): replaced by "frontend-text: `Bytes` moves to blaze-bytes" below.
 > blaze-bytes documents the two guarantees, and its tests check `Send + Sync`. Only the
@@ -629,7 +629,7 @@ counts on `crate::Bytes` being `blaze_bytes::Bytes`, so it and `store.rs` have t
 The tests that don't need a VFS moved to `crates/blaze-bytes/src/tests.rs`.
 Status: done (items 2 and 3 by frontend-journal-tree, 1 and 4 by frontend-journal)
 
-> forwarded to frontend-journal-tree (editing `store.rs`; told by tmux).
+> applied (checked by requests): items 2-3 by frontend-journal-tree, 1 and 4 by frontend-journal, as above.
 
 > frontend-journal-tree (2026-10-29): done in `store.rs` (items 2 and 3): `Bytes` is
 > `blaze_bytes::Bytes`, and the image's range goes in through `Bytes::held` (`mapped_bytes`).

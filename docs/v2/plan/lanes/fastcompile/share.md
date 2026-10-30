@@ -20,9 +20,10 @@ The key is the body's identity (its item key and code hash, or its closure's or 
 code), the values of the instance's const arguments, and for each `MirOptions` the build may
 compile the body with (level, UB checks, lifetime markers), a walk of that body.
 
-The walk goes over the generic body and its monomorphized body in lockstep. They have one
-shape, because monomorphization only puts the arguments in. Where the generic body names a
-type or const parameter, it reads what the monomorphized body has there, and nothing else:
+The walk goes over the generic body once per body and options, listing its sites. Per
+instance, it substitutes those sites by the fold that monomorphization fills a body with
+(see "Speed of light"). Where the generic body names a type or const parameter, it reads what
+the monomorphized body has there, and nothing else:
 
 | where the generic body names a parameter | what is read |
 |---|---|
@@ -212,45 +213,47 @@ has \(|S| = 1\): a debug build gives `other: {Debug, UB checks}`. Options that g
 `share` compares body pointers. So the work is \(|S_{\text{distinct bodies}}| \cdot
 T_{\text{share}}\), and nothing is walked for an options that no unit compiles.
 
-**What the code does today, and the gap.**
+**What the code does.** The walk is split in two (`walk.rs`), which request
+`fastcompile-ident-share 4` made possible by exposing `hir-ty-mir`'s substitution of one value.
 
+- **Once per generic body and options**, the tracked query `sites(def, options)` walks the body
+  and lists, in walk order, every value a record is read from: each local's type, then each
+  type or constant at a place that names a parameter. With them go the ops that turn them into
+  records, with derefs deduplicated per place. It reads no argument, so every instance of the
+  body shares one list. It costs about \(10 B\) ns once, about 0.4 µs for the body above.
+- **Per instance**, `monomorphized_args` substitutes the whole list in one call. That is one
+  `Filler`, so one inference context, and one fold, the one `monomorphized` fills a body with.
+  The ops then replay over the result.
+  - No clone, no drop and no lockstep pass remain.
+  - Every local's type is in the list, because a cast, call or `sym` reads an operand's local
+    even where it names no parameter. A local without a parameter or alias takes the fold's
+    flags fast path, about 3 ns each.
 - **Matches the bound:**
   - records stream into one `Hasher`, with no buffer;
-  - facts, callee keys and the whole key are salsa memos, so a repeat costs one hit;
+  - facts, callee keys, sites and the whole key are salsa memos, so a repeat costs one hit;
   - recording depends only on the generic body, so no record is made for a place without a
     parameter.
-- **Over the bound:** each walk runs `monomorphized` on the whole generic body. For the body
-  above:
-  - cloning the body is about 60 allocations and 10 KB copied, plus a refcount increment per
-    stored type, about 3 µs;
-  - substitution visits all of about 150 types and constants, not just the \(P_t\), about
-    0.45 µs over;
-  - dropping the clone is about 2 µs;
-  - the lockstep walk visits every statement, about 0.4 µs.
 
-  That is about 6 µs over 1.6 µs, so the key runs at about 20% of its speed of light, not 90%.
-  Codegen also monomorphizes the same body again to compile it, so a shared group pays for
-  \(N + 1\) monomorphizations, where it needs one.
+The per-instance cost is \(T_{\text{share}}\) plus about 3 ns per local and per site, and one
+interned list for the result. That is about 95% of the bound for the body above. The site list
+costs below 10% of the bound for any body with two or more instances, and a body with one
+instance never needs a key.
 
-**What removes the gap** (request `fastcompile-ident-share 4`):
+**Why the records are the monomorphized body's, exactly:**
 
-- Split the walk.
-  - A tracked query `sites(body, options)` lists the generic body's parameter sites in walk
-    order, with derefs deduplicated. It depends on no argument, so it is built once per
-    generic body and options, \(O(B)\), and shared by every instance.
-  - Per instance, the key substitutes each site through `hir-ty-mir`'s substitution of one
-    value (the same `Filler` as `monomorphized`, so equal by construction). Then it reads the
-    fact or value and hashes it.
-  - No clone, no drop and no lockstep pass remain, and the shape checks become unnecessary:
-    the substituted site list is the monomorphized body's, by construction.
-  - A place's type at a deref is the generic place type substituted. Normalization is a
-    function of the type, so this equals projecting the substituted local.
-- After that, the per-instance cost is \(T_{\text{share}}\) plus a loop step of about 3 ns per
-  site, about 97% of the bound. The site list costs about \(10 B\) ns once per body, about
-  0.4 µs, which is below 10% of the bound for any body with two or more instances. A body with
-  one instance never needs a key.
-- Until `hir-ty-mir` gives that substitution, the walk keeps `monomorphized`. Writing a second
-  substitution here would be a parity risk with the one codegen compiles from.
+- A value in the list and the same value in the body are filled by one fold. `Filler::fill`
+  (the fold, then the error check) is what `monomorphized` applies to each of the body's
+  values, and what `monomorphized_args` applies to the list. Folding a list folds each element
+  in turn. The fold's binder stack is balanced, and inference variables are replaced by errors
+  in what it returns, so an element's result does not depend on what was folded before it.
+- The sites `fill_body` leaves alone are kept as the generic body has them, just as the
+  monomorphized body keeps them: a `Yield`'s value and a `DropAndReplace`'s value.
+- A place's type is the substituted local's type projected, as before.
+- What the key no longer does is fail on a value it never reads. If such a value fails to
+  substitute, the code generator's own `monomorphized` of that body fails too, so nothing
+  compiles from it and nothing can share it.
+- `sites_are_filled_as_the_body_is` checks each local's type against `monomorphized` on the
+  whole body, and `equal_keys_mean_one_monomorphized_body` still prints both bodies.
 
 ## The hook (requested of codegen)
 

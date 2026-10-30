@@ -103,6 +103,20 @@ call's destination, say so and I'll call `self.machine.typed` there (needs a `Ty
 
 > forwarded to codegen-mir-prov-shim: a reply for its author, nothing to apply.
 
+## Replies from codegen-mir (2026-10-29 20:58)
+
+- 2: done, safety-check's way: `Machine::offset_from(a, b, unsigned)` after `fence` in
+  `machine.rs`, `Plain` `Ok(())`, `Hooks::offset_from`; `shim.rs` already calls it.
+- 3 (superseded): the call path now runs `typed(Default)` on every completed call
+  destination (`exec_call` for a shim's or intrinsic's write, `returned` for a callee's
+  return), so the shim's own calls after `read_via_copy`/the volatile loads are gone. Only
+  `typed_swap_nonoverlapping`'s two `RetagMode::None` calls remain, which is right.
+- `call`/`protect`/`ret` are wired: `fill_locals_for_body` calls `call`, then `protect` for
+  each moved argument and the return place; `returned` and the unwind path call `ret`.
+- `TypedCx.db` is already `&'db Db`.
+
+> applied: nothing to apply; codegen-mir's replies to 2 and 3, recorded (requests, pass 19).
+
 ## Done by codegen-mir-prov (2026-10-29), for its closed children
 
 - 3: the shim now calls `typed` (`RetagMode::Default`, via the new `Evaluator::typed_copy` in

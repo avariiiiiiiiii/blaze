@@ -1,12 +1,13 @@
-//! From one function's Cranelift IR to its [`Code`], in one pass over the IR and one buffer
+//! From one function's Cranelift IR to its [`crate::Code`], in one pass over the IR and one buffer
 //! (docs/v2/plan/lanes/fastcompile/stencil.md, "What a compile is"): scan the values, give
 //! each a slot, lay out the frame, reserve the buffer, then per block in layout order copy
 //! each instruction's stencil and patch its holes (or have the glue write it), write the
 //! edges' moves, the trap stubs and the constants, resolve the labels and hand back the
 //! code.
 //!
-//! Every column is in [`Scratch`], indexed by the IR's entity numbers and cleared, not
-//! freed, between functions: a compile allocates nothing per instruction.
+//! Every column is on the compile's frame (`blaze_mem::frame::task`), indexed by the IR's
+//! entity numbers: a compile allocates nothing of the heap, and the frame is freed at once at
+//! its end.
 //!
 //! The passes, each a walk in layout order over columns of the one before:
 //!
@@ -30,13 +31,17 @@ mod slots;
 #[cfg(test)]
 mod tests;
 
+use blaze_mem::{
+    Tag,
+    frame::{self, Frame},
+};
 use cranelift_codegen::ir;
 
 use crate::{
     Error, Target,
     arch::{Area, Cx, Glue, Loc},
-    buf::{Buf, Label},
-    code::{CallSite, Code, Handler, Rule, Slots},
+    buf::{self, Buf, Label},
+    code::{CallSite, CodeRef, Handler, Rule, SlotsRef, UnwindKind, UnwindRef},
     shape::{Dst, Op, Shape, Src, Ty},
     table::{Library, format::Reader},
 };
@@ -45,28 +50,6 @@ pub use emit::ALIGN;
 
 /// A column entry for "none": no slot, no edge, no place in the layout.
 const NONE: u32 = u32::MAX;
-
-/// One thread's columns and buffer, reused across compiles.
-#[derive(Default)]
-pub struct Scratch {
-    pub(crate) buf: Buf,
-    pub(crate) plan: Plan,
-    pub(crate) side: Side,
-}
-
-impl Scratch {
-    pub fn new() -> Scratch {
-        Scratch::default()
-    }
-
-    /// Gives the scratch the allocations of a [`Code`] its consumer is done with, so the next
-    /// compile writes into them.
-    pub fn recycle(&mut self, code: Code) {
-        let Code { bytes, relocs, calls, handlers, lines, traps, slots, .. } = code;
-        self.buf.recycle(bytes, relocs);
-        self.side.recycle(calls, handlers, lines, traps, slots.offsets);
-    }
-}
 
 /// A value's constant, when an instruction of the function makes it one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -199,52 +182,51 @@ struct Places {
 /// What the patcher decided of a function before writing it: each value's place, the labels
 /// of blocks and edges, the stack slots' offsets. The glue reads it through
 /// [`crate::arch::Cx`].
-#[derive(Default)]
-pub(crate) struct Plan {
+pub(crate) struct Plan<'f> {
     // `scan`.
     /// By instruction: its place in layout order.
-    ord: Vec<u32>,
+    ord: Vec<u32, &'f Frame>,
     /// By block: its place in layout order, `NONE` when not in the layout.
-    bix: Vec<u32>,
+    bix: Vec<u32, &'f Frame>,
     /// By value: its uses (once per operand), less those of instructions dropped as dead.
-    uses: Vec<u32>,
+    uses: Vec<u32, &'f Frame>,
     /// By value: the place of its last use when every use is in its own block, else
     /// [`slots::GLOBAL`].
-    last: Vec<u32>,
+    last: Vec<u32, &'f Frame>,
     /// By value: the number of its defining block, `NONE` when none is in the layout.
-    def_block: Vec<u32>,
-    konst: Vec<Konst>,
+    def_block: Vec<u32, &'f Frame>,
+    konst: Vec<Konst, &'f Frame>,
     /// By instruction: a pure instruction nothing uses.
-    dead: Vec<bool>,
+    dead: Vec<bool, &'f Frame>,
     // `select`.
-    sels: Vec<Sel>,
+    sels: Vec<Sel, &'f Frame>,
     /// By value: a constant some stencil reads from a slot.
-    kslot: Vec<bool>,
+    kslot: Vec<bool, &'f Frame>,
     // `slots`.
     /// By value: its slot's offset from the start of the value slots, `NONE` for none.
-    slot: Vec<u32>,
+    slot: Vec<u32, &'f Frame>,
     /// By value: its local slot is free again.
-    released: Vec<bool>,
+    released: Vec<bool, &'f Frame>,
     /// By instruction: into `places`, for a glue instruction that gives values.
-    places_of: Vec<u32>,
-    places: Vec<Places>,
+    places_of: Vec<u32, &'f Frame>,
+    places: Vec<Places, &'f Frame>,
     /// The slots of glue instructions' results and of `try_call`s' returns and payloads,
     /// like `slot`.
-    pseudo: Vec<u32>,
+    pseudo: Vec<u32, &'f Frame>,
     /// By stack slot: its offset from the frame register.
-    stack: Vec<u32>,
+    stack: Vec<u32, &'f Frame>,
     /// The frame offset of the value slots: after the scratch slots.
     base: u32,
     /// Whether the relay slots of far operands are reserved (after the glue's two).
     relays: bool,
     area: (u32, u32),
     // Labels, made once the buffer is reserved.
-    blocks: Vec<Label>,
-    edges: Vec<Edge>,
+    blocks: Vec<Label, &'f Frame>,
+    edges: Vec<Edge, &'f Frame>,
     /// By instruction: its first edge in `edges` and how many, `(NONE, 0)` for none.
-    edges_of: Vec<(u32, u32)>,
-    /// `slots`' free lists, kept for their allocations.
-    free: [Vec<u32>; 2],
+    edges_of: Vec<(u32, u32), &'f Frame>,
+    /// `slots`' free lists.
+    free: [Vec<u32, &'f Frame>; 2],
 }
 
 /// The glue's two 16-byte scratch slots, at the bottom of the area.
@@ -252,7 +234,34 @@ const SCRATCH: u32 = 32;
 /// The patcher's relay slots of far operands: three operands and two results.
 const RELAYS: u32 = 5;
 
-impl Plan {
+impl<'f> Plan<'f> {
+    pub(crate) fn new_in(frame: &'f Frame) -> Plan<'f> {
+        Plan {
+            ord: Vec::new_in(frame),
+            bix: Vec::new_in(frame),
+            uses: Vec::new_in(frame),
+            last: Vec::new_in(frame),
+            def_block: Vec::new_in(frame),
+            konst: Vec::new_in(frame),
+            dead: Vec::new_in(frame),
+            sels: Vec::new_in(frame),
+            kslot: Vec::new_in(frame),
+            slot: Vec::new_in(frame),
+            released: Vec::new_in(frame),
+            places_of: Vec::new_in(frame),
+            places: Vec::new_in(frame),
+            pseudo: Vec::new_in(frame),
+            stack: Vec::new_in(frame),
+            base: 0,
+            relays: false,
+            area: (0, 0),
+            blocks: Vec::new_in(frame),
+            edges: Vec::new_in(frame),
+            edges_of: Vec::new_in(frame),
+            free: [Vec::new_in(frame), Vec::new_in(frame)],
+        }
+    }
+
     pub(crate) fn loc(&self, func: &ir::Function, value: ir::Value) -> Loc {
         let value = func.dfg.resolve_aliases(value);
         self.loc_of(value)
@@ -337,32 +346,33 @@ impl Plan {
 
 /// What is recorded while the function is written: unwind rows, call sites, trap stubs
 /// wanted, lines.
-#[derive(Default)]
-pub(crate) struct Side {
-    rows: Vec<(u32, Rule)>,
+pub(crate) struct Side<'f> {
+    rows: Vec<(u32, Rule), &'f Frame>,
     /// Each recorded call: where it returns to, and the instruction.
-    sites: Vec<(u32, ir::Inst)>,
+    sites: Vec<(u32, ir::Inst), &'f Frame>,
     /// The stubs wanted, in the order first used.
-    traps: Vec<(ir::TrapCode, Label)>,
+    traps: Vec<(ir::TrapCode, Label), &'f Frame>,
     /// By trap code: its stub's label, `NONE` while none is wanted.
     trap_of: TrapOf,
-    lines: Vec<(u32, ir::SourceLoc)>,
+    lines: Vec<(u32, ir::SourceLoc), &'f Frame>,
     /// Each place that traps, in the order written (by offset): memory accesses, then the
-    /// stubs ([`Code::traps`]).
-    trap_sites: Vec<(u32, ir::TrapCode)>,
+    /// stubs ([`crate::Code::traps`]).
+    trap_sites: Vec<(u32, ir::TrapCode), &'f Frame>,
     /// By constant-pool handle and by immediate handle: the constant's label, `NONE` while
     /// not placed.
-    pool_of: Vec<u32>,
-    imm_of: Vec<u32>,
+    pool_of: Vec<u32, &'f Frame>,
+    imm_of: Vec<u32, &'f Frame>,
     /// In the order first used, for a deterministic layout.
-    const_order: Vec<([u8; 16], Label)>,
+    const_order: Vec<([u8; 16], Label), &'f Frame>,
     /// The library rodata entries placed, with their labels, in the order first used.
-    rodata: Vec<(u32, Label)>,
+    rodata: Vec<(u32, Label), &'f Frame>,
     /// The parallel moves of the edge being written.
-    moves: Vec<emit::Move>,
-    calls: Vec<CallSite>,
-    handlers: Vec<Handler>,
-    offsets: Vec<i32>,
+    moves: Vec<emit::Move, &'f Frame>,
+    calls: Vec<CallSite, &'f Frame>,
+    handlers: Vec<Handler, &'f Frame>,
+    offsets: Vec<i32, &'f Frame>,
+    /// Windows' unwind information, when the glue writes it ([`Cx::windows_info`]).
+    info: Vec<u8, &'f Frame>,
 }
 
 /// By raw trap code: a label, `NONE` for none.
@@ -374,44 +384,33 @@ impl Default for TrapOf {
     }
 }
 
-impl Side {
-    fn clear(&mut self) {
-        self.rows.clear();
-        self.sites.clear();
-        for (code, _) in self.traps.drain(..) {
-            self.trap_of.0[usize::from(code.as_raw().get())] = NONE;
+impl<'f> Side<'f> {
+    fn new_in(frame: &'f Frame) -> Side<'f> {
+        Side {
+            rows: Vec::new_in(frame),
+            sites: Vec::new_in(frame),
+            traps: Vec::new_in(frame),
+            trap_of: TrapOf::default(),
+            lines: Vec::new_in(frame),
+            trap_sites: Vec::new_in(frame),
+            pool_of: Vec::new_in(frame),
+            imm_of: Vec::new_in(frame),
+            const_order: Vec::new_in(frame),
+            rodata: Vec::new_in(frame),
+            moves: Vec::new_in(frame),
+            calls: Vec::new_in(frame),
+            handlers: Vec::new_in(frame),
+            offsets: Vec::new_in(frame),
+            info: Vec::new_in(frame),
         }
-        self.lines.clear();
-        self.trap_sites.clear();
-        self.pool_of.clear();
-        self.imm_of.clear();
-        self.const_order.clear();
-        self.rodata.clear();
-        self.moves.clear();
-        self.calls.clear();
-        self.handlers.clear();
-        self.offsets.clear();
     }
 
-    fn recycle(
-        &mut self,
-        calls: Vec<CallSite>,
-        handlers: Vec<Handler>,
-        lines: Vec<(u32, ir::SourceLoc)>,
-        trap_sites: Vec<(u32, ir::TrapCode)>,
-        offsets: Vec<i32>,
-    ) {
-        fn keep<T>(mine: &mut Vec<T>, mut theirs: Vec<T>) {
-            if mine.is_empty() && theirs.capacity() > mine.capacity() {
-                theirs.clear();
-                *mine = theirs;
-            }
-        }
-        keep(&mut self.calls, calls);
-        keep(&mut self.handlers, handlers);
-        keep(&mut self.lines, lines);
-        keep(&mut self.trap_sites, trap_sites);
-        keep(&mut self.offsets, offsets);
+    pub(crate) fn retain_rows(&mut self, keep: impl FnMut(&(u32, Rule)) -> bool) {
+        self.rows.retain(keep);
+    }
+
+    pub(crate) fn windows_info(&mut self) -> &mut Vec<u8, &'f Frame> {
+        &mut self.info
     }
 
     pub(crate) fn rule(&mut self, at: u32, rule: Rule) {
@@ -427,7 +426,7 @@ impl Side {
     }
 
     #[inline]
-    pub(crate) fn trap(&mut self, buf: &mut Buf, code: ir::TrapCode) -> Label {
+    pub(crate) fn trap(&mut self, buf: &mut Buf<'_>, code: ir::TrapCode) -> Label {
         let at = usize::from(code.as_raw().get());
         if self.trap_of.0[at] != NONE {
             return Label(self.trap_of.0[at]);
@@ -456,7 +455,7 @@ impl Side {
     /// The label of the constant `bytes` in the constant area, placed once per handle: the
     /// pool's `index` when `pool` (the pool keeps one handle per distinct bytes), else the
     /// immediate's.
-    fn konst(&mut self, buf: &mut Buf, pool: bool, index: u32, bytes: [u8; 16]) -> Label {
+    fn konst(&mut self, buf: &mut Buf<'_>, pool: bool, index: u32, bytes: [u8; 16]) -> Label {
         let table = if pool { &mut self.pool_of } else { &mut self.imm_of };
         let at = index as usize;
         if table.len() <= at {
@@ -473,7 +472,7 @@ impl Side {
 
     /// The label of library rodata entry `entry`, placed once. A function uses a few entries
     /// (float masks and bounds), so a scan of the ones placed beats a map.
-    fn rodata(&mut self, buf: &mut Buf, entry: u32) -> Label {
+    fn rodata(&mut self, buf: &mut Buf<'_>, entry: u32) -> Label {
         if let Some(&(_, label)) = self.rodata.iter().find(|it| it.0 == entry) {
             return label;
         }
@@ -483,8 +482,8 @@ impl Side {
     }
 
     /// The call sites with their handlers, now that every edge's label is bound.
-    fn finish_calls(&mut self, func: &ir::Function, plan: &Plan, buf: &Buf) -> Result<(), Error> {
-        self.sites.sort_by_key(|it| it.0);
+    fn finish_calls(&mut self, func: &ir::Function, plan: &Plan<'_>, buf: &Buf<'_>) -> Result<(), Error> {
+        buf::sort_by_key_in_place(&mut self.sites, |it| it.0);
         for &(ret, inst) in &self.sites {
             let first = self.handlers.len() as u32;
             if let Some(table) = func.dfg.insts[inst].exception_table() {
@@ -525,56 +524,65 @@ impl Side {
     }
 }
 
-/// Compiles `func` for `target` with `A`'s glue and `library`'s stencils.
-pub fn compile<A: Glue>(
-    scratch: &mut Scratch,
+/// Compiles `func` for `target` with `A`'s glue and `library`'s stencils, handing the code to
+/// `sink` while it is in the compile's frame.
+pub fn compile<A: Glue, R>(
     func: &ir::Function,
     target: &Target,
     library: &Library,
-) -> Result<Code, Error> {
-    compile_in::<A>(scratch, func, target, library.reader())
+    sink: impl FnOnce(&CodeRef<'_>) -> R,
+) -> Result<R, Error> {
+    compile_in::<A, R>(func, target, library.reader(), |code, _| sink(code))
 }
 
-/// [`compile`] from a library's reader: the tests' own libraries come in here.
-pub(crate) fn compile_in<A: Glue>(
-    scratch: &mut Scratch,
+/// [`compile`] from a library's reader, also showing `sink` the plan: the tests' own libraries
+/// come in here, and the tests read where values went.
+pub(crate) fn compile_in<A: Glue, R>(
     func: &ir::Function,
     target: &Target,
     library: &Reader<'_>,
-) -> Result<Code, Error> {
-    let Scratch { buf, plan, side } = scratch;
-    buf.clear();
-    side.clear();
+    sink: impl FnOnce(&CodeRef<'_>, &Plan<'_>) -> R,
+) -> Result<R, Error> {
     if func.layout.entry_block().is_none() {
         return Err(Error::new("a function with no blocks"));
     }
-    scan::run(plan, func)?;
-    select::run::<A>(plan, func, target, library)?;
-    slots::run(plan, func, library, A::NEAR)?;
-    let frame = A::frame(func, target, plan.area())?;
-    emit::edges(plan, func, library)?;
-    let size = emit::size::<A>(plan, func, target, &frame, library)?;
-    buf.reserve(size.bytes, size.labels, size.fixups);
-    side.lines.reserve(size.lines);
-    emit::labels(plan, func, buf);
-    emit::function::<A>(buf, plan, side, func, target, &frame, library)?;
-    buf.resolve()?;
-    let unwind = A::unwind(&mut Cx { buf, func, target, frame: &frame, plan, side })?;
-    side.finish_calls(func, plan, buf)?;
-    let (base, delta) = A::slot_base(&frame);
-    side.offsets.extend(
-        func.sized_stack_slots.keys().map(|slot| delta + plan.stack_slot(slot) as i32),
-    );
-    let (bytes, relocs) = buf.take();
-    Ok(Code {
-        bytes,
-        align: emit::ALIGN,
-        relocs,
-        unwind,
-        calls: std::mem::take(&mut side.calls),
-        handlers: std::mem::take(&mut side.handlers),
-        lines: std::mem::take(&mut side.lines),
-        traps: std::mem::take(&mut side.trap_sites),
-        slots: Slots { base, offsets: std::mem::take(&mut side.offsets) },
+    frame::task(Tag::Codegen, |temp| -> Result<R, Error> {
+        let (mut buf, mut plan, mut side) = (Buf::new_in(temp), Plan::new_in(temp), Side::new_in(temp));
+        let (buf, plan, side) = (&mut buf, &mut plan, &mut side);
+        scan::run(plan, func)?;
+        select::run::<A>(plan, func, target, library)?;
+        slots::run(plan, func, library, A::NEAR)?;
+        let frame = A::frame(func, target, plan.area())?;
+        emit::edges(plan, func, library)?;
+        let size = emit::size::<A>(plan, func, target, &frame, library)?;
+        buf.reserve(size.bytes, size.labels, size.fixups);
+        side.lines.reserve(size.lines);
+        emit::labels(plan, func, buf);
+        emit::function::<A>(buf, plan, side, func, target, &frame, library)?;
+        buf.resolve()?;
+        let unwind = A::unwind(&mut Cx { buf, func, target, frame: &frame, plan, side })?;
+        side.finish_calls(func, plan, buf)?;
+        let (base, delta) = A::slot_base(&frame);
+        side.offsets.extend(
+            func.sized_stack_slots.keys().map(|slot| delta + plan.stack_slot(slot) as i32),
+        );
+        buf.sort_relocs();
+        let unwind = unwind.map(|kind| match kind {
+            UnwindKind::Dwarf { len } => UnwindRef::Dwarf { len, rows: &side.rows },
+            UnwindKind::Windows { len } => UnwindRef::Windows { len, info: &side.info },
+            UnwindKind::WindowsArm64 { len } => UnwindRef::WindowsArm64 { len, codes: &side.info },
+        });
+        let code = CodeRef {
+            bytes: buf.bytes(),
+            align: emit::ALIGN,
+            relocs: buf.relocs(),
+            unwind,
+            calls: &side.calls,
+            handlers: &side.handlers,
+            lines: &side.lines,
+            traps: &side.trap_sites,
+            slots: SlotsRef { base, offsets: &side.offsets },
+        };
+        Ok(sink(&code, plan))
     })
 }

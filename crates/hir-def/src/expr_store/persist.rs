@@ -1352,8 +1352,8 @@ impl<'a> ExpressionStoreRef<'a> {
 }
 
 impl ExpressionStore {
-    /// The warm and cold forms of expression store buffers, codec by column: what the store's
-    /// `blaze_cas::Columns` for [`ExpressionStore`]'s schema is.
+    /// The warm and cold forms of expression store buffers, codec by column: what
+    /// `blaze_cas::Store::encode_columns` is given for [`ExpressionStore`]'s schema.
     pub fn columns() -> blaze_format::tiers::BufferColumns {
         blaze_format::tiers::BufferColumns::of::<StoreRoot>(<ExpressionStore as Persist>::SCHEMA)
     }
@@ -2396,7 +2396,7 @@ mod tests {
             assert_eq!(read.binding_owner(id), store.binding_owner(id));
         }
         assert!(read.expr_roots().eq(store.expr_roots()));
-        let blocks = store.expr_only.as_ref().map_or(&[][..], |it| &it.block_scopes);
+        let blocks = store.expr_only.as_ref().map_or(&[][..], |it| &*it.block_scopes);
         assert!(read.block_scopes().eq(blocks.iter().copied()));
     }
 

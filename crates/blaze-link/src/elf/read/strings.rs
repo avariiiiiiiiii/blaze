@@ -13,6 +13,8 @@
 
 use std::fmt;
 
+use blaze_ids::bits::{BitSet, rank_in};
+
 use crate::model::{Name, Names};
 
 /// The string ending at this NUL is not pushed yet.
@@ -20,9 +22,10 @@ const UNSEEN: u32 = u32::MAX;
 
 pub(super) struct Table<'data> {
     bytes: &'data [u8],
-    /// Bit `i % 64` of word `i / 64`: whether byte `i` is a NUL. 1 bit per byte.
-    nuls: Vec<u64>,
-    /// The NULs before each word of `nuls`: 4 bytes per 64 bytes of table.
+    /// Whether byte `i` is a NUL. 1 bit per byte.
+    nuls: BitSet,
+    /// The NULs before each word of `nuls` (`blaze_ids::bits::ranks_of`'s counts, made in the
+    /// pass that finds the NULs): 4 bytes per 64 bytes of table.
     before: Vec<u32>,
     /// By the rank of a NUL, the index in `pushed` of the string ending there, or [`UNSEEN`]:
     /// 4 bytes per string of the table.
@@ -51,7 +54,7 @@ impl<'data> Table<'data> {
         }
         Ok(Table {
             bytes,
-            nuls,
+            nuls: BitSet::from_words(nuls),
             before,
             // alloc: once per string table, a slot per string
             strings: vec![UNSEEN; count as usize],
@@ -114,38 +117,17 @@ impl<'data> Table<'data> {
 
     /// The first NUL at or after `at`.
     fn next_nul(&self, at: usize) -> Option<usize> {
-        if at >= self.bytes.len() {
-            return None;
-        }
-        let mut word = at / 64;
-        let mut bits = self.nuls[word] & (!0u64 << (at % 64));
-        loop {
-            if bits != 0 {
-                return Some(word * 64 + bits.trailing_zeros() as usize);
-            }
-            word += 1;
-            bits = *self.nuls.get(word)?;
-        }
+        self.nuls.first_in(at..self.bytes.len())
     }
 
     /// The last NUL before `at`, which is inside the table.
     fn previous_nul(&self, at: usize) -> Option<usize> {
-        let mut word = at / 64;
-        let mut bits = self.nuls[word] & ((1u64 << (at % 64)) - 1);
-        loop {
-            if bits != 0 {
-                return Some(word * 64 + 63 - bits.leading_zeros() as usize);
-            }
-            word = word.checked_sub(1)?;
-            bits = self.nuls[word];
-        }
+        self.nuls.last_in(0..at)
     }
 
     /// How many NULs come before the one at `nul`.
     fn rank(&self, nul: usize) -> usize {
-        let word = nul / 64;
-        let below = self.nuls[word] & ((1u64 << (nul % 64)) - 1);
-        self.before[word] as usize + below.count_ones() as usize
+        rank_in(self.nuls.words(), &self.before, nul)
     }
 }
 
@@ -204,13 +186,8 @@ mod tests {
                 }
             }
         }
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        let mut next = || rng.next_u64();
         for _ in 0..20_000 {
             let len = (next() % 65) as usize;
             let density = next() % 4;

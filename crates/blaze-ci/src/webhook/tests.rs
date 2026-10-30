@@ -246,6 +246,91 @@ fn a_signature_of_the_right_length_with_a_non_hex_digit_is_401() {
     assert_eq!(hex(&good["sha256=".len()..]).map(|it| it[0]), Some(0x75));
 }
 
+/// The decoder before sonic-rs, kept to hold it to.
+struct SerdeJson;
+
+impl Json for SerdeJson {
+    type Error = serde_json::Error;
+    fn from_slice<'a, T: Deserialize<'a>>(body: &'a [u8]) -> Result<T, serde_json::Error> {
+        serde_json::from_slice(body)
+    }
+}
+
+/// What a decoder makes of a payload: the delivery, or the refusal's status and its words up to
+/// the decoder's own (which name the place each decoder stopped in its own terms).
+fn decoded<J: Json>(kind: &str, body: &[u8]) -> Result<Delivery, (u16, String)> {
+    parse_by::<J>(kind, "1", body).map(DeliveryRef::into_owned).map_err(|error| {
+        let words = match error.what.find(" is not one: ") {
+            Some(at) => error.what[..at + " is not one".len()].to_owned(),
+            None => error.what,
+        };
+        (error.status, words)
+    })
+}
+
+#[test]
+fn sonic_rs_takes_and_refuses_the_payloads_serde_json_did() {
+    let escaped = push("refs/heads/main", false)
+        .replace(r#""refs/heads/main""#, r#""refs\/heads\/l\u00e9ne""#)
+        .replace("indexable-inc/blaze", r"indexable-inc\/blaze");
+    let fork = pull_request("opened", r#"{"full_name":"someone/blaze"}"#);
+    let payloads = [
+        ("push", push("refs/heads/main", false)),
+        ("push", push("refs/tags/v1", false)),
+        ("push", push("refs/heads/main", true)),
+        ("push", escaped),
+        ("pull_request", pull_request("opened", SAME_REPO)),
+        ("pull_request", pull_request("synchronize", "null")),
+        ("pull_request", pull_request("closed", SAME_REPO)),
+        ("pull_request", fork),
+        ("ping", r#"{"zen":"Keep it logically awesome.","hook_id":1,"hook":{"type":"App","events":["*"]}}"#.to_owned()),
+        ("ping", r#"{"repository":{"full_name":"a/b","extra":[1,2.5e3,-0,true,null,{"x":"\ud83d\ude00"}]}}"#.to_owned()),
+        ("push", format!(r#"{}  {}"#, push("refs/heads/main", false), "\n\t")),
+    ];
+    let mut checked = 0;
+    for (kind, payload) in &payloads {
+        let body = payload.as_bytes();
+        let mut check = |kind: &str, body: &[u8]| {
+            assert_eq!(decoded::<Sonic>(kind, body), decoded::<SerdeJson>(kind, body), "{kind} {:?}", String::from_utf8_lossy(body));
+            checked += 1;
+        };
+        check(kind, body);
+        // Every prefix: a payload cut short anywhere.
+        for end in 0..body.len() {
+            check(kind, &body[..end]);
+        }
+        // Every byte replaced by each byte that changes JSON's meaning or its UTF-8.
+        let mut changed = body.to_vec();
+        for at in 0..body.len() {
+            for byte in *b"\"\\{}[],:0-e.nt \x00\x1f\x7f\x80\xc3\xff" {
+                let was = std::mem::replace(&mut changed[at], byte);
+                check(kind, &changed);
+                changed[at] = was;
+            }
+        }
+        // A field given twice, and bytes after the payload.
+        let twice = payload.replacen('{', r#"{"repository":{"full_name":"x/y"},"#, 1);
+        check(kind, twice.as_bytes());
+        check(kind, format!("{payload} {{}}").as_bytes());
+        check(kind, format!("{payload}x").as_bytes());
+    }
+    for (kind, body) in [
+        ("ping", "[]".to_owned()),
+        ("ping", "null".to_owned()),
+        ("ping", r#"{"repository":null}"#.to_owned()),
+        ("ping", r#"{"repository":{"full_name":"a\u0000b"}}"#.to_owned()),
+        ("ping", r#"{"repository":{"full_name":"\ud800"}}"#.to_owned()),
+        ("ping", r#"{"x":1e400,"repository":{"full_name":"a/b"}}"#.to_owned()),
+        ("ping", format!(r#"{{"x":{}{},"repository":{{"full_name":"a/b"}}}}"#, "[".repeat(100), "]".repeat(100))),
+        ("pull_request", pull_request("opened", SAME_REPO).replace("42", "042")),
+        ("pull_request", pull_request("opened", SAME_REPO).replace("42", "18446744073709551616")),
+        ("pull_request", pull_request("opened", SAME_REPO).replace("42", "4.2e1")),
+    ] {
+        assert_eq!(decoded::<Sonic>(kind, body.as_bytes()), decoded::<SerdeJson>(kind, body.as_bytes()), "{kind} {body}");
+    }
+    assert!(checked > 10_000, "{checked}");
+}
+
 /// `request` as it comes over the wire.
 fn wire(request: &HttpRequest) -> Vec<u8> {
     let mut bytes = format!("{} {} HTTP/1.1\r\n", request.method, request.path).into_bytes();
@@ -300,8 +385,67 @@ fn a_request_read_in_place_is_received_as_the_owned_one_is() {
         in_place.push(&bytes);
         let lent = in_place.next_ref().unwrap().expect("the request is whole");
         let want = receive(SECRET, &read);
-        assert_eq!(receive_ref(SECRET, &lent), want, "request {at}");
+        let verifier = Verifier::new(SECRET);
+        assert_eq!(receive_ref(&verifier, &lent).map(DeliveryRef::into_owned), want, "request {at}");
         assert_eq!(receive(SECRET, original), want, "request {at}");
+    }
+}
+
+#[test]
+fn a_key_made_once_verifies_as_one_made_per_delivery() {
+    let body = b"Hello, World!";
+    let good = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+    let bad = good.replace("e17", "e18");
+    for secret in [&b"It's a Secret to Everybody"[..], b"another secret", b""] {
+        let verifier = Verifier::new(secret);
+        for signature in [Some(good), Some(bad.as_str()), Some("sha256=zz"), None] {
+            assert_eq!(verifier.verify(body, signature), verify(secret, body, signature), "{signature:?}");
+        }
+    }
+}
+
+#[test]
+fn a_delivery_read_in_place_lends_its_strings_from_the_request() {
+    let body = push("refs/heads/main", false);
+    let id = "72d3162e-cc78-11e3-81ab-4c9367dc0958";
+    let lent = parse_ref("push", id, body.as_bytes()).unwrap();
+    assert!(std::ptr::eq(lent.id, id));
+    let Cow::Borrowed(repo) = &lent.repo else { panic!("the repository was copied") };
+    assert!(body.as_bytes().as_ptr_range().contains(&repo.as_ptr()));
+    let Some(EventRef::Push { branch: Cow::Borrowed(branch), commit: Cow::Borrowed(commit) }) = &lent.event else {
+        panic!("the event was copied: {:?}", lent.event);
+    };
+    assert_eq!((*branch, *commit), ("main", HEAD));
+}
+
+#[test]
+fn a_warm_delivery_allocates_only_its_events_strings() {
+    let verifier = Verifier::new(SECRET);
+    let bodies = [
+        ("push", push("refs/heads/main", false), 2),
+        ("push", push("refs/tags/v1", false), 2),
+        ("push", push("refs/heads/main", true), 0),
+        ("pull_request", pull_request("synchronize", SAME_REPO), 2),
+        ("pull_request", pull_request("closed", SAME_REPO), 0),
+        ("ping", r#"{"zen":"Keep it logically awesome.","hook_id":1}"#.to_owned(), 0),
+    ];
+    for (kind, body, strings) in &bodies {
+        let mut parser = RequestParser::new(MOST_PAYLOAD);
+        let bytes = wire(&request(kind, body));
+        for round in 0..3 {
+            parser.reset();
+            parser.push(&bytes);
+            let lent = parser.next_ref().unwrap().expect("the request is whole");
+            let delivery = blaze_alloc_count::assert_at_most(0, "a delivery checked and read in place", || {
+                receive_ref(&verifier, &lent).unwrap()
+            });
+            let event = blaze_alloc_count::assert_at_most(
+                *strings,
+                "an event handed to the service: its two strings, its own",
+                || delivery.event.map(EventRef::into_owned),
+            );
+            assert_eq!(event.is_some(), *strings > 0, "{kind} {round}");
+        }
     }
 }
 

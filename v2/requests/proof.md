@@ -103,7 +103,9 @@ folded in here: what they asked of `proof` (engine, fixture, proof.py) is done i
   coordinator adds it to `[workspace.dependencies]` as `{ path = "crates/blaze-v2-proof" }`),
   and a test per column encoding (hot narrow widths, warm frame-of-reference bit-packing, cold
   run-length, delta, dictionary and zstd) calling `columns::round_trips(encode, decode, seed)`
-  over several seeds.
+  over several seeds, and for each encoding read in place (hot narrow widths, warm
+  frame-of-reference) also `columns::reads_in_place(encode, get, seed)`. Store: the same for a
+  record moved hot to warm to cold and back by the tier mover.
 - Where: root `Cargo.toml` (coordinator); `crates/blaze-format`, `crates/blaze-cas` (format,
   store).
 - Why: docs/v2/README.md section 17: "Every encoding round-trips exactly, which the proof

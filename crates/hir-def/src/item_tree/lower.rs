@@ -18,7 +18,8 @@ use crate::item_tree::{
     BigModItem, Const, Enum, ExternBlock, ExternCrate, Function, Impl, ImportAlias, Interned,
     ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId, ModKind, ModPath, RawVisibility,
     RawVisibilityId, SmallModItem, Static, Struct, StructKind, StructValueNsCtor, Trait, TypeAlias,
-    Union, Use, UseTree, UseTreeKind, VisibilityExplicitness, attrs::AttrsOrCfg,
+    Union, Use, UseTree, UseTreeKind, VisibilityExplicitness,
+    attrs::{AttrsOrCfg, OutlineFn},
 };
 
 pub(super) struct Ctx<'db> {
@@ -156,7 +157,10 @@ impl<'db> Ctx<'db> {
             // FIXME: Handle `global_asm!()`.
             ast::Item::AsmExpr(_) => return None,
         };
-        let attrs = self.lower_attrs(item);
+        let attrs = match item {
+            ast::Item::Fn(func) => self.lower_attrs(&OutlineFn(func.clone())),
+            _ => self.lower_attrs(item),
+        };
         self.add_attrs(mod_item, attrs);
 
         Some(mod_item)
@@ -426,7 +430,10 @@ impl<'db> Ctx<'db> {
                         ast::ExternItem::TypeAlias(ty) => self.lower_type_alias(ty)?,
                         ast::ExternItem::MacroCall(call) => self.lower_macro_call(call)?,
                     };
-                    let attrs = self.lower_attrs(&item);
+                    let attrs = match &item {
+                        ast::ExternItem::Fn(func) => self.lower_attrs(&OutlineFn(func.clone())),
+                        _ => self.lower_attrs(&item),
+                    };
                     self.add_attrs(mod_item, attrs);
                     Some(mod_item)
                 })

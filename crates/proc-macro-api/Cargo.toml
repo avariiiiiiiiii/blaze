@@ -21,6 +21,9 @@ rustc-hash.workspace = true
 indexmap.workspace = true
 
 # local deps
+blaze-core.workspace = true
+blaze-ids.workspace = true
+blaze-usercode.workspace = true
 paths = { workspace = true, features = ["serde1"] }
 tt.workspace = true
 stdx.workspace = true

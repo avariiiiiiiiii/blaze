@@ -103,6 +103,63 @@ pub struct CompiledFunction {
     pub inlined: Vec<CodeHash>,
     /// Where its debug info and panic locations are, in the side table.
     pub side: Option<ContentId>,
+    /// How to unwind through it: none for a function that can't unwind (`nounwind`, wasm).
+    pub unwind: Option<Unwind>,
+    /// Its code offsets and the spans they are of, by `at`, for debug info. Spans are
+    /// position-independent (anchor and index), so a reformat changes no function.
+    pub lines: Vec<Line>,
+}
+
+/// A code offset of a function and the span its instructions from there are of.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Line {
+    pub at: u32,
+    pub span: SpanRef,
+}
+
+/// A function's unwind information, as its backend made it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum Unwind {
+    /// DWARF call frame information (ELF, Mach-O): the CIE's fields and initial instructions,
+    /// and the FDE's instructions, as `.eh_frame` encodes them (DW_CFA_*).
+    Dwarf {
+        code_align: u32,
+        data_align: i32,
+        return_address: u16,
+        cie: Vec<u8>,
+        fde: Vec<u8>,
+        /// The personality routine (`rust_eh_personality`) of a function with landing pads.
+        personality: Option<Target>,
+        /// Its language-specific data area: one of the function's `data`, by id.
+        lsda: Option<ContentId>,
+    },
+    /// Windows x64: the `UNWIND_INFO` bytes without the handler, and the handler and its data.
+    Windows { info: Vec<u8>, handler: Option<Target>, lsda: Option<ContentId> },
+}
+
+/// A static's definition. Its address is the linker's: by which static it is, never by
+/// content ([`Target::Static`]).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Static {
+    pub item: ItemKey,
+    pub instance: ContentId,
+    /// A power of two.
+    pub align: u32,
+    pub init: Init,
+    /// Read-only data only its value refers to ([`Target::Data`]): the bytes of a `&str`,
+    /// a promoted constant.
+    pub data: Vec<Data>,
+    /// Written while the program runs: `static mut`, or a type with interior mutability.
+    pub mutable: bool,
+    pub thread_local: bool,
+    /// `#[link_section]`, as written.
+    pub section: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum Init {
+    Bytes { bytes: Vec<u8>, relocs: Vec<Reloc> },
+    Zeroed { size: u64 },
 }
 
 /// Read-only bytes a function refers to: string literals, constants, vtables of known types.
@@ -164,6 +221,9 @@ pub enum Target {
     Data(ContentId),
     /// A symbol outside blaze's code: libc, a C dependency, the system.
     Extern(String),
+    /// As [`Target::Extern`], linked weakly: 0 when nothing defines it
+    /// (`#[linkage = "extern_weak"]`).
+    Weak(String),
     /// A position the program observes (`line!()`, `#[track_caller]`'s `Location`): the
     /// span side table's entry, filled at link time, so a reformat compiles nothing.
     Position(SpanRef),

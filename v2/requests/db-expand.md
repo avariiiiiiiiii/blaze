@@ -78,3 +78,71 @@ a full parse: from the outline, per body, either the body's token range (to scan
 tokens) or its sorted set of identifier symbols. Whichever the outline gives, `body_syntax` and
 `words` in `nameres/demand.rs` switch to it (db-expand-split's paths); until then the prefilter
 parses every dependency file it checks, which is what is parsed today.
+
+## Inputs keyed by content: callers outside base-db (from `db-expand-inputs`)
+
+What: every base-db input now carries the `ContentId` of what it is, and its fields are set
+only through base-db so the ID and the value can't disagree. The salsa setters of `Crate`,
+`FileText` (`text`, `appended_root_module`), `IncludedFile`, `SourceRootInput` and `ProcessEnv`
+are private now, and their builders take a `base_db::InputId` that only base-db can make. Each
+caller outside base-db that set a field directly must call the base-db function named here:
+
+- `crates/ide-db/src/lib.rs:169-172` (`RootDatabase::set_env`): `krate.set_env(self).to(env)`
+  becomes `krate.set_env(self, env)` (`base_db::Crate::set_env`). The `use salsa::Setter as _`
+  there becomes unused.
+- `crates/blaze-doc/src/lib.rs:203`: `krate.set_cfg_options(db).to(cfg)` becomes
+  `krate.set_cfg_options(db, cfg)` (`base_db::Crate::set_cfg_options`).
+- `crates/blaze-engine/src/doctest.rs:774` and `:1284`: the same change, `set_cfg_options(db, cfg)`.
+- `crates/blaze-engine/src/consteval.rs:91` and `crates/blaze-engine/src/borrowck.rs:112`:
+  `krate.set_cfg_options(&mut db).to(options)` becomes `krate.set_cfg_options(&mut db, options)`.
+- `crates/blaze-engine/src/doctest.rs:1093`: `base_db::Crate::builder(data, extra,
+  workspace.clone(), cfg.clone(), env.clone()).durability(Durability::MEDIUM).new(db)` becomes
+  `base_db::Crate::create(db, data, extra, workspace.clone(), cfg.clone(), env.clone(),
+  Durability::MEDIUM)`. Its root file must already be in a source root (it is: the root is set
+  just above).
+- `crates/blaze-engine/src/lib.rs:4074` (`write_harnesses`): `input.set_appended_root_module(db)
+  .with_durability(Durability::LOW).to(module)` becomes `db.set_appended_root_module(*file,
+  module, Durability::LOW)` (the new `SourceDatabase` method; it does nothing when the module is
+  that already, so the `if` around it can go).
+- `crates/hir-def/src/nameres/tests.rs:877` and `:886` (the parent's): `db.file_text(root)
+  .set_appended_root_module(&mut db).to(Some("__blaze_test_harness"))` becomes
+  `db.set_appended_root_module(root, Some("__blaze_test_harness"), Durability::LOW)`, and `.to(None)`
+  becomes `db.set_appended_root_module(root, None, Durability::LOW)`.
+- `crates/blaze-engine/src/lib.rs:6190` calls `RootDatabase::set_env`: no change once ide-db's is.
+
+Readers don't change: `krate.data(db)`, `env(db)`, `cfg_options(db)`, `extra_data(db)`,
+`workspace_data(db)`, `file_text.text(db)`, `appended_root_module(db)`, `included.bytes(db)`,
+`source_root_input.source_root(db)`, `process_env.vars(db)` keep their signatures.
+
+**Two new required `SourceDatabase` methods**, forwarded to `Files` as the others are. Where:
+`crates/ide-db/src/lib.rs` (`RootDatabase`), `crates/hir-ide/src/test_db.rs`,
+`crates/blaze-items/src/tests/db.rs` (coordinator), `crates/hir-def/src/test_db.rs` (the parent):
+
+```rust
+fn set_appended_root_module(
+    &mut self,
+    file_id: vfs::FileId,
+    module: Option<&'static str>,
+    durability: Durability,
+) {
+    let files = Arc::clone(&self.files);
+    files.set_appended_root_module(self, file_id, module, durability);
+}
+
+fn set_view_root(
+    &mut self,
+    view: base_db::ViewRoot<'_>,
+) -> Result<base_db::ViewChange, base_db::ViewError> {
+    let files = Arc::clone(&self.files);
+    files.set_view_root(self, view)
+}
+```
+
+Also: a crate's content ID names its root file by path, so `CrateGraphBuilder::set_in_db` and
+`Crate::create` now need the root file in a source root (`file_source_root` and the root's
+`FileSet`) and stop with a panic naming the file otherwise. Every caller found sets the roots
+first (`FileChange::apply`, load-cargo, test-fixture, blaze-wasm, the doctest crates).
+
+Why: docs/v2/README.md section 2 and docs/v2/crates.md "IDs": results keyed by input hashes,
+never by revision, so views with equal inputs share them; a setter that changes a value without
+its ID would let a stale result be reused.

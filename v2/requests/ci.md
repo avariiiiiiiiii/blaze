@@ -102,5 +102,10 @@ checkout refuses a tree with a symlink, naming the path (no-fallback), and write
 executable as a plain file. A build script that runs a checked-in script, or a crate with a
 symlinked file, needs `Op::Write` to carry a mode (lane vfs).
 
+Done by the coordinator (lane vfs): `blaze_vfs::Mode` is on `Op::Write` and `File`, and
+hashed into the tree as git's code. The checkout writes each file with its mode, a symlink as
+its target, and a mode-only change as a write; only submodules are refused. Item 4: the vfs
+arena is the one (`docs/v2/crates.md`); db drops its own, then `Opened` loses its field.
+
 ---
 Applied by the coordinator, 16:46.

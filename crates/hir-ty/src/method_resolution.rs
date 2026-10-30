@@ -1074,6 +1074,11 @@ impl<'db> InherentImpls<'db> {
         self.map.get(self_ty).map(|it| &**it).unwrap_or_default()
     }
 
+    /// Every simplified self type with its inherent impls, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (&SimplifiedType<'db>, &[ImplId])> + '_ {
+        self.map.iter().map(|(self_ty, impls)| (self_ty, &**impls))
+    }
+
     pub fn for_each_crate_and_block(
         db: &'db dyn HirDatabase,
         krate: Crate,

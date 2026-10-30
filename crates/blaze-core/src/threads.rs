@@ -371,8 +371,7 @@ mod world {
             }
             process::wait_exited(pid)?;
             self.processes.lock().unwrap_or_else(PoisonError::into_inner).remove(&tag);
-            let (status, rusage) = process::reap(pid)?;
-            finish.exited(status, &rusage, output, errors)
+            finish.exited(pid, output, errors)
         }
 
         pub(super) fn kill(&self, tag: Tag) {

@@ -131,6 +131,29 @@ mod tests {
         );
     }
 
+    fn warm_server(version: u32) -> io::Result<ProcMacroServerProcess> {
+        let mut bytes = Vec::new();
+        for response in [
+            Response::ApiVersionCheck(version),
+            Response::SetConfig(ServerConfig { span_mode: SpanMode::RustAnalyzer }),
+        ] {
+            BidirectionalMessage::Response(response).write(&mut bytes).unwrap();
+        }
+        let link = Arc::new(warm::Script {
+            sent: Mutex::default(),
+            answers: Mutex::new([bytes].into()),
+            ended: Mutex::default(),
+        });
+        ProcMacroServerProcess::warm(Warm { link, traced: None }, Environment::new())
+    }
+
+    #[test]
+    fn a_warm_server_must_mark_the_scope_of_each_expansion() {
+        let refused = warm_server(version::HASHED_AST_ID).unwrap_err().to_string();
+        assert!(refused.contains("scope"), "{refused}");
+        assert!(warm_server(version::SCOPED_EXPANSIONS).unwrap().rust_analyzer_spans());
+    }
+
     #[test]
     fn a_server_that_cannot_enable_source_spans_is_refused() {
         for config in [None, Some(ServerConfig { span_mode: SpanMode::Id })] {

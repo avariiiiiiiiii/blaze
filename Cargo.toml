@@ -76,6 +76,7 @@ cranelift-object = { path = "vendor/cranelift-object" }
 macros = { path = "crates/macros", version = "0.0.0" }
 base-db = { path = "crates/base-db", version = "0.0.0" }
 blaze-live = { path = "crates/blaze-live" }
+blaze-build-script = { path = "crates/blaze-build-script" }
 cfg = { path = "crates/cfg", version = "0.0.0", features = ["tt", "syntax"] }
 hir = { path = "crates/hir", version = "0.0.0" }
 hir-def = { path = "crates/hir-def", version = "0.0.0" }
@@ -170,6 +171,8 @@ base64 = "0.23"
 ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
+zstd = "0.13.3"
+annotate-snippets = "0.12.16"
 object = { version = "0.37", default-features = false, features = ["read_core", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 gimli = { version = "0.33", default-features = false, features = ["read", "write", "std"] }
 either = "1.15.0"

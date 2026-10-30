@@ -49,7 +49,10 @@ fn declarations(db: &TestDB) -> Vec<ModuleDefId> {
 
 fn impls(db: &TestDB) -> Vec<ImplId> {
     let def_map = crate_def_map(db, krate(db));
-    def_map.modules(db).flat_map(|(_, module)| module.scope(db).impls().collect::<Vec<_>>()).collect()
+    def_map
+        .modules(db)
+        .flat_map(|(_, module)| module.scope(db).impls().collect::<Vec<_>>())
+        .collect()
 }
 
 fn struct_named(db: &TestDB, name: &str) -> StructId {

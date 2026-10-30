@@ -270,3 +270,32 @@ fn a_lossy_encoding_is_named_with_where_it_lost() {
     assert!(shapes.iter().any(|(name, c)| *name == "CSR offsets" && c.windows(2).all(|w| w[0] <= w[1])));
     assert!(shapes.iter().any(|(name, c)| *name == "strictly increasing" && c.windows(2).all(|w| w[0] < w[1])));
 }
+
+#[test]
+fn a_frame_of_reference_packing_reads_in_place() {
+    // Each value as its offset from the column's minimum, in as many bits as the range needs.
+    let encode = |column: &[u32]| -> (u32, u32, Vec<u64>) {
+        let min = column.iter().copied().min().unwrap_or(0);
+        let range = column.iter().map(|&v| v - min).max().unwrap_or(0);
+        let width = 32 - range.leading_zeros();
+        let mut words = vec![0u64; (column.len() * width as usize).div_ceil(64) + 1];
+        for (i, &v) in column.iter().enumerate() {
+            let bit = i * width as usize;
+            let offset = u128::from(v - min) << (bit % 64);
+            words[bit / 64] |= offset as u64;
+            words[bit / 64 + 1] |= (offset >> 64) as u64;
+        }
+        (min, width, words)
+    };
+    let get = |(min, width, words): &(u32, u32, Vec<u64>), i: usize| -> u32 {
+        if *width == 0 {
+            return *min;
+        }
+        let bit = i * *width as usize;
+        let pair = u128::from(words[bit / 64]) | (u128::from(words[bit / 64 + 1]) << 64);
+        min + ((pair >> (bit % 64)) as u64 & ((1u64 << width) - 1)) as u32
+    };
+    assert_eq!(columns::reads_in_place(encode, get, 5).unwrap(), columns::shapes(5).len());
+    let off_by_one = |packed: &(u32, u32, Vec<u64>), i: usize| get(packed, i).wrapping_add(u32::from(i == 3));
+    assert!(columns::reads_in_place(encode, off_by_one, 5).unwrap_err().contains("element 3"));
+}

@@ -4,7 +4,7 @@
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
 
-use crate::{Arch, CompiledFunction, Data, Reloc, RelocKind, Target};
+use crate::{Arch, CompiledFunction, Data, Line, Reloc, RelocKind, Target, Unwind};
 
 pub const DATA_DOMAIN: &str = "blaze v2 data 1";
 pub const CODE_DOMAIN: &str = "blaze v2 code 1";
@@ -26,8 +26,9 @@ impl Data {
 }
 
 /// The content ID of what a compiled function does: its architecture, alignment, bytes,
-/// relocations and data. Not its key, what it inlined or its side table: two functions with
-/// one code ID run the same instructions against the same addresses.
+/// relocations, data, unwind information and lines. Not its key, what it inlined or its side
+/// table: two functions with one code ID run the same instructions against the same
+/// addresses, unwind alike and show the same lines in a backtrace.
 pub fn code_id(function: &CompiledFunction) -> ContentId {
     let mut hasher = Hasher::new(CODE_DOMAIN);
     hasher.update(&[arch_tag(function.arch)]);
@@ -37,7 +38,47 @@ pub fn code_id(function: &CompiledFunction) -> ContentId {
     for data in &function.data {
         hasher.id(&data.id);
     }
+    match &function.unwind {
+        None => hasher.update(&[0]),
+        Some(Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda }) => {
+            hasher.update(&[1]).update(&code_align.to_le_bytes()).update(&data_align.to_le_bytes());
+            hasher.update(&return_address.to_le_bytes()).part(cie).part(fde);
+            optional_target_into(&mut hasher, personality.as_ref());
+            optional_id_into(&mut hasher, lsda.as_ref())
+        }
+        Some(Unwind::Windows { info, handler, lsda }) => {
+            hasher.update(&[2]).part(info);
+            optional_target_into(&mut hasher, handler.as_ref());
+            optional_id_into(&mut hasher, lsda.as_ref())
+        }
+    };
+    lines_into(&mut hasher, &function.lines);
     hasher.finish()
+}
+
+fn optional_target_into<'h>(hasher: &'h mut Hasher, target: Option<&Target>) -> &'h mut Hasher {
+    match target {
+        Some(target) => {
+            hasher.update(&[1]);
+            target_into(hasher, target);
+            hasher
+        }
+        None => hasher.update(&[0]),
+    }
+}
+
+fn optional_id_into<'h>(hasher: &'h mut Hasher, id: Option<&ContentId>) -> &'h mut Hasher {
+    match id {
+        Some(id) => hasher.update(&[1]).id(id),
+        None => hasher.update(&[0]),
+    }
+}
+
+pub(crate) fn lines_into(hasher: &mut Hasher, lines: &[Line]) {
+    hasher.update(&(lines.len() as u64).to_le_bytes());
+    for Line { at, span: SpanRef { anchor, index } } in lines {
+        hasher.update(&at.to_le_bytes()).id(anchor).update(&index.to_le_bytes());
+    }
 }
 
 pub(crate) fn relocs_into(hasher: &mut Hasher, relocs: &[Reloc]) {
@@ -60,6 +101,7 @@ pub(crate) fn target_into(hasher: &mut Hasher, target: &Target) {
         Target::Position(SpanRef { anchor, index }) => {
             hasher.update(&[5]).id(anchor).update(&index.to_le_bytes())
         }
+        Target::Weak(name) => hasher.update(&[6]).part(name.as_bytes()),
     };
 }
 
@@ -140,7 +182,28 @@ mod tests {
             data: Vec::new(),
             inlined: Vec::new(),
             side: None,
+            unwind: None,
+            lines: Vec::new(),
         }
+    }
+
+    #[test]
+    fn unwinding_and_lines_are_the_code() {
+        let a = function(&[0xc3], Vec::new());
+        let mut b = a.clone();
+        b.unwind = Some(Unwind::Dwarf {
+            code_align: 1,
+            data_align: -8,
+            return_address: 16,
+            cie: vec![0x0c, 7, 8],
+            fde: Vec::new(),
+            personality: None,
+            lsda: None,
+        });
+        let mut c = a.clone();
+        c.lines = vec![Line { at: 0, span: SpanRef { anchor: ContentId([1; 32]), index: 0 } }];
+        assert_ne!(code_id(&a), code_id(&b));
+        assert_ne!(code_id(&a), code_id(&c));
     }
 
     #[test]

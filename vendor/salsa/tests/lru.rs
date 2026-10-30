@@ -12,7 +12,7 @@ use common::LogDatabase;
 use salsa::Database as _;
 use test_log::test;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct HotPotato(u32);
 
 thread_local! {

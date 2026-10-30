@@ -245,6 +245,90 @@ fn config_env() {
     assert_eq!(var(&env, "RUSTFLAGS"), None);
 }
 
+/// What cargo sets from the unit and what it passes through of its own environment (#805),
+/// which together are what the script sees.
+#[test]
+fn set_from_the_unit_or_passed_through() {
+    let mut unit = bar();
+    unit.package.links = Some("bar".into());
+    unit.dependencies = vec![Dependency {
+        name: "a".into(),
+        links: Some("foo".into()),
+        metadata: vec![("root".into(), "/x".into())],
+    }];
+    unit.config_env = vec![
+        ConfigEnv { name: "FROM_CONFIG".into(), value: "1".into(), force: false },
+        ConfigEnv { name: "HOME".into(), value: "/config-home".into(), force: false },
+        ConfigEnv { name: "USER".into(), value: "forced".into(), force: true },
+    ];
+    unit.tools.rustc_wrapper = Some("/wrap".into());
+    let inherited = os(&[
+        ("PATH", "/bin"),
+        ("HOME", "/home/me"),
+        ("USER", "me"),
+        ("CC", "clang"),
+        ("TARGET", "from-the-shell"),
+        ("RUSTFLAGS", "-Cfoo"),
+        ("LD_LIBRARY_PATH", "/opt/lib"),
+    ]);
+    let env = env(&unit, &inherited).unwrap();
+    let origin = |name: &str| env.origin(OsStr::new(name));
+    for name in [
+        "TARGET",
+        "HOST",
+        "OUT_DIR",
+        "NUM_JOBS",
+        "PROFILE",
+        "OPT_LEVEL",
+        "DEBUG",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTC_WRAPPER",
+        "CARGO",
+        "CARGO_MANIFEST_DIR",
+        "CARGO_MANIFEST_LINKS",
+        "CARGO_PKG_NAME",
+        "CARGO_FEATURE_FOO",
+        "CARGO_CFG_TARGET_OS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "DEP_FOO_ROOT",
+        "FROM_CONFIG",
+        "USER",
+        "LD_LIBRARY_PATH",
+    ] {
+        assert_eq!(origin(name), Some(Origin::Unit), "{name}");
+    }
+    for name in ["PATH", "HOME", "CC"] {
+        assert_eq!(origin(name), Some(Origin::PassedThrough), "{name}");
+    }
+    assert_eq!(origin("RUSTFLAGS"), None, "taken away");
+    assert_eq!(origin("NOT_SET"), None);
+    assert_eq!(var(&env, "TARGET"), Some("x86_64-unknown-linux-gnu"), "the unit's wins");
+
+    let passed: Vec<_> = env.passed_through().map(|(name, _)| name.to_str().unwrap()).collect();
+    assert_eq!(passed, ["CC", "HOME", "PATH"]);
+    let set: BTreeMap<_, _> = env.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
+    let mut whole = set.clone();
+    whole.extend(env.passed_through().map(|(n, v)| (n.to_owned(), v.to_owned())));
+    assert_eq!(whole, env.vars, "the two make the whole environment");
+    assert_eq!(set.len(), env.from_unit.len(), "every name set from the unit is in the environment");
+
+    // The same unit from another shell: what is set from the unit is the same.
+    let other = super::env(&unit, &os(&[("PATH", "/nix/bin:/bin"), ("HOME", "/home/me")])).unwrap();
+    let other_set: BTreeMap<_, _> =
+        other.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
+    // The dynamic library path keeps what cargo's environment had of it after the unit's.
+    let without_dylib = |it: &BTreeMap<&OsStr, &OsStr>| {
+        let mut it = it.clone();
+        it.remove(OsStr::new("LD_LIBRARY_PATH"));
+        it
+    };
+    let set: BTreeMap<&OsStr, &OsStr> = set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();
+    let other_set: BTreeMap<&OsStr, &OsStr> =
+        other_set.iter().map(|(n, v)| (n.as_os_str(), v.as_os_str())).collect();
+    assert_eq!(without_dylib(&set), without_dylib(&other_set));
+}
+
 /// `build_script_with_dynamic_native_dependency` and
 /// `build_script_dylib_search_path_excludes_target_dylibs`: the host's directories, then
 /// cargo's environment's, then what host-only dependencies' scripts added below the target

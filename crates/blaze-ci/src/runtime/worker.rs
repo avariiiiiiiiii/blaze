@@ -129,7 +129,8 @@ impl Worker {
                 .try_clone()
                 .map_err(|error| format!("the connection to the daemon at {socket}: {error}"))?;
             let me = self.me.clone();
-            thread::spawn(move || read(reader, &socket_owned(&socket), &me));
+            let named = socket.clone();
+            thread::spawn(move || read(reader, &named, &me));
             self.stream = Some(stream);
         }
         let id = self.next_id;
@@ -143,10 +144,6 @@ impl Worker {
         }
         Ok(id)
     }
-}
-
-fn socket_owned(socket: &str) -> String {
-    socket.to_owned()
 }
 
 /// Reads the connection's responses until it ends.
@@ -220,7 +217,6 @@ fn checkout(
             format!("diffing {from} to {commit} in {} failed: {error}", git.dir.display())
         })?
     };
-    drop(token);
     let base = match from {
         Some(from) => from.root,
         None => pin(shared, ViewRef::Head(EMPTY_HEAD.to_owned()))

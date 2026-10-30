@@ -28,3 +28,37 @@ as written above; it does not compile until this lands. No behavior change: read
 
 `crates/blaze-items/src/tests/facts.rs` unwraps `Result<_, Unhashable>`, which needs
 `Unhashable: Debug`.
+
+## items-hirty: whole impl and trait item lists read outside items' files (for `db`)
+
+What: four reads of an impl's or a trait's whole item list where one name, or only the
+associated types, is used. Each makes adding an item of another name to an impl or trait
+rerun every body that goes through it:
+
+- `crates/hir-ty/src/next_solver/solver.rs:235-254`: normalizing an associated item of an impl
+  reads `impl_id.impl_items(db)` whole and `find_map`s one name. Read a per-(impl, name) query
+  instead, as `method_resolution::impl_value_item` is for functions and constants (an
+  `impl_type_item(db, impl, name) -> Option<TypeAliasId>` beside it, same order: the first match).
+- `crates/hir-ty/src/next_solver/interner.rs:1663`: `trait_items(..).associated_types()` reads
+  the whole list for the associated types only. Use a per-trait query of the associated types,
+  as `opaques::trait_type_aliases` (private to `opaques.rs`; I can make it `pub(crate)` if you
+  want to call it).
+- `crates/hir-ty/src/lower/path.rs:589` and `crates/hir-ty/src/infer/path.rs:302`: the same
+  shape, one name looked up in a whole list.
+
+Why: docs/v2/items.md 6.2, `Fact::Method`. With these four left, the narrowing in items' files
+(`impl_value_item`, `trait_value_item`, `impl_type_aliases`) only takes effect for bodies whose
+inference does not go through them. No behavior change: return the first match by name, as
+now.
+
+## items-hirty: `hir-ide` incremental expectations (for the coordinator)
+
+`crates/hir-ide/src/tests/incremental.rs`, `add_struct_invalidates_trait_solve`, first
+`expect![..]`: the method probe of `s.method()` now reads `trait_value_item` (one execution).
+Expected: `"trait_value_item",` between `"InherentImpls < 'db >::for_crate_",` and
+`"TraitImpls < 'db >::in_crate_and_deps_for_trait_and_self_ty_",`. The second `expect![..]`
+should be unchanged if `TraitItems::query_with_diagnostics_` comes out equal after the edit,
+which it does when the trait's `FunctionId`s are stable; if not, `"trait_value_item",` appears
+once after `"TraitItems::query_with_diagnostics_",`. The positions are predicted, not run:
+`UPDATE_EXPECT=1` settles them. No other test in that file probes methods, finds destructors,
+lays out types or checks coherence.

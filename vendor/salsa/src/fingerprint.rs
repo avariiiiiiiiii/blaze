@@ -25,7 +25,12 @@ use std::hash::{Hash, Hasher};
 
 use crate::Revision;
 
-/// The fingerprint of a memoized value; see the [module docs](self).
+/// The 128-bit fingerprint of a memoized value: a stable hash of the value for tracked functions
+/// with the `lru` option, the revision the value last changed in otherwise.
+///
+/// Value fingerprints are SipHash-1-3 over what the value's [`Hash`] impl writes (see
+/// [`StableHasher`]). Salsa IDs hash their index and generation, which name one entity for as
+/// long as the database that assigned them exists, so fingerprints compare within one database.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
 #[repr(C)]
 pub struct Fingerprint([u32; 4]);
@@ -75,7 +80,8 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
-/// A [`Hasher`] whose output depends only on the bytes written, on every host.
+/// A [`Hasher`] whose output depends only on the bytes written, on every host: SipHash-1-3 with
+/// 128-bit output and a fixed key, integers written little-endian and `usize`/`isize` as 64 bits.
 pub type StableHasher = Sip<1, 3>;
 
 const KEY: (u64, u64) = (0x7361_6c73_615f_6670, 0x626c_617a_655f_7632);

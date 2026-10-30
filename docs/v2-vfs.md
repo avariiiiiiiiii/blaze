@@ -13,9 +13,17 @@ v2 interface; what changed from it is below.
 
 - A node is interned by its [`ContentId`](../crates/blaze-ids/src/lib.rs): a file's under
   `"blaze v2 vfs file 1"` (the hash of its bytes), a directory's under
-  `"blaze v2 vfs directory 1"` (each entry's kind, length-prefixed name and child ID, sorted
-  by name). A dense `NodeId` never leaves the crate: every public type names roots and files by
-  content ID, so collection can renumber freely.
+  `"blaze v2 vfs directory 2"` (each entry's git mode code, length-prefixed name and child ID,
+  sorted by name). A dense `NodeId` never leaves the crate: every public type names roots and
+  files by content ID, so collection can renumber freely.
+- **Modes** are git's: a directory entry carries `Mode` (regular 100644, executable 100755,
+  symlink 120000; a directory is 040000), and the code is hashed into the directory, as git
+  does. A file's own ID is its bytes alone, so a chmod is a new root and a `Modified` diff, and
+  equal bytes in two modes are one node. `Write` sets the mode; `Edit` and `Rename` keep it. A
+  symlink's bytes are its target: `read` gives the link itself, `follow` reads through every
+  link on the path, a relative target taken from the link's directory. A target that is
+  absolute, empty, climbs above the root, or makes more than 40 hops is `OpError::BadLink`;
+  the tree never reaches outside itself.
 - **Path order** is by component, as the tree is walked: `a/x` comes before `a.b`. A diff where
   a file and a directory swap gives the file's path first, then the paths under it.
 - `lookup` and `list` take `""` for the root.
@@ -35,7 +43,8 @@ v2 interface; what changed from it is below.
 ## The journal
 
 - Records: file, directory, head move, head removal, and sequence (below), each framed with
-  magic `BZJ2`, a length, a kind and an 8-byte checksum under `"blaze v2 vfs journal record 1"`.
+  magic `BZJ3`, a length, a kind and an 8-byte checksum under `"blaze v2 vfs journal record 1"`.
+  A directory record gives each entry's git mode code (4 bytes) before its child's ID.
 - One effect in flight at a time (append, then sync; a cut; a rewrite), with commits made in
   between grouped into the next append, as in blaze-next.
 - **Compaction**: `collect` drops unreached nodes from memory and, if anything was appended

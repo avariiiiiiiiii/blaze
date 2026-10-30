@@ -57,13 +57,17 @@ thread with its own database handle (a clone), and roll the patch back on `Err(R
 outputs get value fingerprints and keep early cutoff after eviction. `crates/hir-ty` does not
 compile until both are added.
 
-## 7. Items lane: findings, not mine to fix
+## 7. Codegen and coordinator: coroutine witness types; items: a finding
 
-- `coroutine_hidden_types` (`crates/hir-ty/src/next_solver/interner.rs:2183`) returns no
+- `coroutine_hidden_types` (`crates/hir-ty/src/next_solver/interner.rs:2183`, mine) returns no
   witness types, so the auto traits of a future (`Send`) are decided without what it holds
-  across an `.await`: programs rustc rejects are accepted and the reverse for negative impls.
-  It needs the coroutine's witness types from its MIR (rustc's `coroutine_hidden_types` over
-  `mir_coroutine_witnesses`); the query that computes them belongs beside `opaques.rs`.
+  across an `.await`: programs rustc rejects are accepted. rustc computes them from the
+  coroutine's MIR (`mir_coroutine_witnesses`), and MIR lowering is in `hir-ty-mir`, which
+  `hir-ty` cannot depend on. Request: a `HirDatabase` method
+  `coroutine_witnesses(InternedCoroutineId) -> &[StoredTy]` (the types live across a yield, as
+  rustc's `CoroutineLayout::field_tys`) declared in `crates/hir-ty/src/db.rs` and implemented by
+  `impl_hir_database!` (`crates/hir-ide/src/impl_db_macro.rs`) from `hir-ty-mir`; I then make
+  `coroutine_hidden_types` read it.
 - `impl_holders` lowers (does not infer) every body that may hold an impl; `Impl::all_in_crate`
   lowers `const _` bodies. Neither infers a dependency body, but both read bodies on a
   signature path.

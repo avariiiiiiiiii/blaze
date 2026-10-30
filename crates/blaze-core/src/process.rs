@@ -188,29 +188,41 @@ fn join(procs: &std::ffi::CStr) -> io::Result<()> {
 }
 
 impl Finish {
-    /// How the process ended, from what `wait4` said of it and what it wrote. Asks its
-    /// sandbox what it read, and removes what was made for it.
+    /// Reaps `pid`, which has exited (a zombie, so its pid is no one else's), and says how it
+    /// ended from what `wait4` said of it and what it wrote. Asks its sandbox what it read,
+    /// and removes what was made for it.
     pub(crate) fn exited(
         self,
-        status: libc::c_int,
-        rusage: &libc::rusage,
+        pid: libc::pid_t,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     ) -> io::Result<Exit> {
+        // Before the reap: the footprint watch signals the pid, which a reap frees for reuse.
+        let limited = match self.limit {
+            Limit::None => Ok(0),
+            #[cfg(target_os = "linux")]
+            Limit::Cgroup(cgroup) => cgroup.peak(),
+            #[cfg(target_os = "macos")]
+            Limit::Footprint(watch) => Ok(watch.stop()),
+        };
+        let reaped = reap(pid);
+        let ((status, rusage), limited) = match (reaped, limited) {
+            (Ok(reaped), Ok(limited)) => (reaped, limited),
+            (Err(error), _) | (_, Err(error)) => {
+                if let Some(scratch) = &self.scratch {
+                    _ = std::fs::remove_dir_all(scratch);
+                }
+                return Err(error);
+            }
+        };
         let (code, signal) = match libc::WIFSIGNALED(status) {
             true => (None, Some(libc::WTERMSIG(status))),
             false => (Some(libc::WEXITSTATUS(status)), None),
         };
         let max_rss = u64::try_from(rusage.ru_maxrss).unwrap_or(0);
         // Kibibytes on Linux, bytes on Apple's systems.
-        let mut peak_memory = if cfg!(target_os = "macos") { max_rss } else { max_rss * 1024 };
-        match self.limit {
-            Limit::None => {}
-            #[cfg(target_os = "linux")]
-            Limit::Cgroup(cgroup) => peak_memory = peak_memory.max(cgroup.peak()?),
-            #[cfg(target_os = "macos")]
-            Limit::Footprint(watch) => peak_memory = peak_memory.max(watch.stop()),
-        }
+        let peak_memory =
+            if cfg!(target_os = "macos") { max_rss } else { max_rss * 1024 }.max(limited);
         let traced = match (&self.command.sandbox, &self.confine, &self.scratch) {
             (Sandbox::On { trace: true, .. }, Some(confine), Some(scratch)) => {
                 Some(confine.traced(&self.command, scratch).map_err(|why| {

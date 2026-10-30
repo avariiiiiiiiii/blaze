@@ -3,10 +3,11 @@
 ## 1. Stop the footprint watch before the reap (`process.rs`)
 
 - What: `Finish::exited` stops `Limit::Footprint(watch)` (`watch.stop()`), but every driver
-  calls it after `process::reap(pid)`. Between the reap and that `stop`, the watch thread may
+  calls it after `process::reap(pid)`. Between the reap and that `stop`, the footprint thread may
   still read the footprint and `SIGKILL` the pid, which by then can belong to another process.
-  `footprint::Watch::stop` must come before the reap (its doc says so; the thread checks nothing
-  once `stop` returns).
+  `footprint::Watch::stop` must come before the reap (its doc says so). The thread kills only
+  with the pid still in its list, under the list's lock, and `stop` takes it out, so nothing
+  signals the pid once `stop` returns.
 - Where: `crates/blaze-core/src/process.rs`. Proposed: `Finish` does the reap itself, so no
   driver can get the order wrong:
 
@@ -36,3 +37,26 @@ spawn, it's one line in `limit_self`, but then every spawn with a memory limit w
 macOS. `footprint::tests::limits_set_before_exec_let_a_small_program_run` and
 `kqueue::tests::processes_end_with_their_output_code_and_signal` (tag 5) check that a limited
 spawn runs.
+
+## 3. Spawn with `posix_spawn` on macOS: drop the `pre_exec` (`process.rs`)
+
+- What: on macOS, don't install `pre_exec(move || crate::footprint::limit_self(bytes))` in
+  `process::start` (the `#[cfg(target_os = "macos")] if let Some(bytes) = command.memory`
+  block). Keep `Limit::Footprint(Watch::start(pid, bytes))` as it is: the footprint watch alone
+  holds the limit.
+- Where: `crates/blaze-core/src/process.rs`. Once that block is gone, `footprint::limit_self` and
+  its test `limits_set_before_exec_let_a_small_program_run` have no caller: tell me and I delete
+  them, or delete them with it (`footprint.rs` is mine, but the two go together).
+- Why (performance, per the new principle): std's `Command::spawn` on macOS uses `posix_spawn`
+  unless a `pre_exec` closure is set; with one it forks the daemon. Forking a daemon with a
+  multi-gigabyte mapped image and many threads copies its whole address-space map on every
+  spawn, so every limited build script and proc macro pays that. `posix_spawn` starts the program
+  with no copy (std handles the working directory with `posix_spawn_file_actions_addchdir_np`).
+  The rlimits buy nothing on macOS: `RLIMIT_AS` is refused (request 2), and `RLIMIT_DATA`
+  doesn't hold `malloc`'s `mach_vm_allocate` regions. The footprint watch, which reads the
+  number the kernel itself goes by, is the backstop either way.
+
+---
+Applied by core: request 1 (`Finish::exited(self, pid, stdout, stderr)` stops the limit, then
+reaps; `threads.rs` and `kqueue.rs` changed with it, io_uring told). Request 2 kept as written:
+the footprint watch is always on and holds the limit, the rlimit is extra.

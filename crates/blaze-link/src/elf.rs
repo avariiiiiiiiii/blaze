@@ -43,7 +43,6 @@ const DATA_REL_RO: &str = ".data.rel.ro";
 const PREINIT_ARRAY: &str = ".preinit_array";
 
 pub(crate) fn writer(output: &Output) -> Result<Box<dyn Writer>, LinkError> {
-    let error = |what: String| LinkError { function: None, what };
     if output.format != Format::Elf {
         return Err(error(format!("the ELF writer was asked for a {:?} image", output.format)));
     }
@@ -77,7 +76,7 @@ impl Segment {
             Class::Table | Class::Data | Class::PatchData | Class::Tdata | Class::Tbss | Class::Bss => {
                 Segment::Write
             }
-            Class::Named { name, write, exec } => match (name.as_str(), write, exec) {
+            Class::Named { name, write, exec } => match (name.as_str(), *write, *exec) {
                 (DATA_REL_RO | PREINIT_ARRAY, _, _) => Segment::Relro,
                 (_, _, true) => Segment::Code,
                 (_, true, false) => Segment::Write,
@@ -110,57 +109,55 @@ pub(crate) fn in_file(class: &Class) -> bool {
     !matches!(class, Class::Tbss | Class::Bss)
 }
 
-/// A class's place in its segment.
-fn rank(class: &Class) -> u32 {
-    match class {
-        Class::Synthetic(INTERP) => 0,
-        Class::Synthetic(BUILD_ID) => 1,
-        Class::Synthetic(DYNSYM) => 2,
-        Class::Synthetic(DYNSTR) => 3,
-        Class::Synthetic(GNU_HASH) => 4,
-        Class::Synthetic(VERSYM) => 5,
-        Class::Synthetic(VERNEED) => 6,
-        Class::Synthetic(RELA_DYN) => 7,
-        Class::Rodata => 8,
-        Class::Named { exec: false, write: false, .. } => 9,
-        Class::Synthetic(EH_FRAME_HDR) => 10,
-        Class::EhFrame => 11,
-        Class::Synthetic(_) => 12,
-
-        Class::Text => 0,
-        Class::Named { exec: true, .. } => 1,
-        Class::Patch => 2,
-        Class::Stubs => 3,
-        Class::Plt => 4,
-        Class::Veneers => 5,
-
-        Class::Named { name, .. } if name == DATA_REL_RO => 0,
-        Class::Named { name, .. } if name == PREINIT_ARRAY => 1,
-        Class::InitArray => 2,
-        Class::FiniArray => 3,
-        Class::Got => 5,
-
-        Class::Table => 0,
-        Class::Data => 1,
-        Class::Named { .. } => 2,
-        Class::PatchData => 3,
-        Class::Tdata => 4,
-        Class::Tbss => 5,
-        Class::Bss => 6,
-    }
-}
-
+/// A class's place in the address space: its segment, its rank in it, then its name.
 fn order_key(class: &Class) -> (Segment, u32, &str) {
+    let segment = Segment::of(class);
+    let rank = match (segment, class) {
+        (Segment::Read, Class::Synthetic(name)) => match *name {
+            INTERP => 0,
+            BUILD_ID => 1,
+            DYNSYM => 2,
+            DYNSTR => 3,
+            GNU_HASH => 4,
+            VERSYM => 5,
+            VERNEED => 6,
+            RELA_DYN => 7,
+            EH_FRAME_HDR => 10,
+            _ => 12,
+        },
+        (Segment::Read, Class::Rodata) => 8,
+        (Segment::Read, Class::EhFrame) => 11,
+        (Segment::Read, _) => 9,
+
+        (Segment::Code, Class::Text) => 0,
+        (Segment::Code, Class::Patch) => 2,
+        (Segment::Code, Class::Stubs) => 3,
+        (Segment::Code, Class::Plt) => 4,
+        (Segment::Code, Class::Veneers) => 5,
+        (Segment::Code, _) => 1,
+
+        (Segment::Relro, Class::Named { name, .. }) if name == DATA_REL_RO => 0,
+        (Segment::Relro, Class::Named { .. }) => 1,
+        (Segment::Relro, Class::InitArray) => 2,
+        (Segment::Relro, Class::FiniArray) => 3,
+        (Segment::Relro, Class::Synthetic(_)) => 4,
+        (Segment::Relro, Class::Got) => 5,
+        (Segment::Relro, _) => 6,
+
+        (Segment::Write, Class::Table) => 0,
+        (Segment::Write, Class::Data) => 1,
+        (Segment::Write, Class::PatchData) => 3,
+        (Segment::Write, Class::Tdata) => 4,
+        (Segment::Write, Class::Tbss) => 5,
+        (Segment::Write, Class::Bss) => 6,
+        (Segment::Write, _) => 2,
+    };
     let name = match class {
         Class::Named { name, .. } => name.as_str(),
         Class::Synthetic(name) => name,
         _ => "",
     };
-    let rank = match class {
-        Class::Synthetic(DYNAMIC) => 4,
-        _ => rank(class),
-    };
-    (Segment::of(class), rank, name)
+    (segment, rank, name)
 }
 
 /// The class and rank of an allocated section of this name and these flags, as lld places
@@ -198,7 +195,7 @@ pub(crate) fn section(name: &str, write: bool, exec: bool, tls: bool) -> Result<
         (Class::Named { name: PREINIT_ARRAY.into(), write: true, exec: false }, 0)
     } else if under(DATA_REL_RO) {
         (Class::Named { name: DATA_REL_RO.into(), write: true, exec: false }, 0)
-    } else if under(".rodata") && !write && !exec || under(".gcc_except_table") {
+    } else if (under(".rodata") || under(".gcc_except_table")) && !write && !exec {
         (Class::Rodata, 0)
     } else if under(".data") && !exec {
         (Class::Data, 0)

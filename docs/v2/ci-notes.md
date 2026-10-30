@@ -58,5 +58,6 @@ Notes on [ci.md](ci.md) as built, 2026-10-29. Requests of other lanes are in
 ## Open questions
 
 - Two arenas name an open view (`Vfs::open` and `Database::open`); `build::Opened` carries
-  both until vfs and db agree on one.
-- The VFS has no symlinks or file modes; a checkout with a symlink is refused naming it.
+  both until db drops its own (the vfs arena is the one, `docs/v2/crates.md`).
+- Files carry git's mode (`blaze_vfs::Mode`): a checkout writes executables and symlinks as
+  such; a submodule is refused naming it.

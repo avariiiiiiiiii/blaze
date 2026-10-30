@@ -273,9 +273,13 @@ impl Kqueue {
             | Effect::Sync { .. }
             | Effect::Truncate { .. }
             | Effect::Write { .. }
+            | Effect::WriteAt { .. }
+            | Effect::Rename { .. }
+            | Effect::Mode { .. }
             | Effect::Clone { .. }
             | Effect::Link { .. }
             | Effect::Stat { .. }
+            | Effect::List { .. }
             | Effect::Remove { .. }
             | Effect::Map { .. }) => {
                 let work = self.work.as_ref().expect("the driver is running");
@@ -455,9 +459,7 @@ impl Kqueue {
         }
         let Spawned { pid, out, err, failed, finish, .. } = spawned;
         let program = finish.command.program.display().to_string();
-        let ended = process::reap(pid)
-            .map_err(|error| io::Error::new(error.kind(), format!("reaping it: {error}")))
-            .and_then(|(status, rusage)| finish.exited(status, &rusage, out, err));
+        let ended = finish.exited(pid, out, err);
         let done = match (ended, failed) {
             (Ok(exit), None) => Done::Exited(Box::new(exit)),
             (Ok(_), Some(error)) | (Err(error), _) => Done::Failed(IoError(format!("{program}: {error}"))),
@@ -919,9 +921,7 @@ fn abandon(spawned: Spawned) {
     let Spawned { pid, finish, stdin, stdout, stderr, .. } = spawned;
     drop((stdin, stdout, stderr));
     process::kill(pid);
-    if let Ok((status, rusage)) = process::reap(pid) {
-        _ = finish.exited(status, &rusage, Vec::new(), Vec::new());
-    }
+    _ = finish.exited(pid, Vec::new(), Vec::new());
 }
 
 fn no_connection(conn: Conn) -> io::Error {

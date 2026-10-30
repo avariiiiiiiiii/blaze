@@ -20,6 +20,7 @@ pub mod legacy_protocol;
 pub mod pool;
 pub mod process;
 pub mod transport;
+pub mod warm;
 pub mod wrap;
 
 use paths::{AbsPath, AbsPathBuf};
@@ -41,9 +42,13 @@ pub mod version {
     /// Whether literals encode their kind as an additional u32 field and idents their rawness as a u32 field.
     pub const EXTENDED_LEAF_DATA: u32 = 5;
     pub const HASHED_AST_ID: u32 = 6;
+    /// Whether the server marks the thread of the `n`-th expansion of a connection, counted
+    /// from 0, with the scope `expand-<n>` for its sandbox (`crate::warm`). The messages are
+    /// as they were.
+    pub const SCOPED_EXPANSIONS: u32 = 7;
 
     /// Current API version of the proc-macro protocol.
-    pub const CURRENT_API_VERSION: u32 = HASHED_AST_ID;
+    pub const CURRENT_API_VERSION: u32 = SCOPED_EXPANSIONS;
 }
 
 /// Protocol format for communication between client and server.
@@ -191,6 +196,25 @@ impl ProcMacroClient {
 
         let pool = ProcMacroServerPool::new(workers);
         Ok(ProcMacroClient { pool: Arc::new(pool), path: process_path.to_owned() })
+    }
+
+    /// A client of the warm servers `servers` ([`warm`]), each started by the daemon's pool as
+    /// [`warm::Server::command`] says and connected: `program` is what [`Self::server_path`]
+    /// says. Each expansion is sent the variables `environment` passes through.
+    pub fn warm(
+        program: &AbsPath,
+        servers: Vec<warm::Warm>,
+        environment: Arc<warm::Environment>,
+    ) -> io::Result<ProcMacroClient> {
+        if servers.is_empty() {
+            return Err(io::Error::other("a proc-macro client of no warm server"));
+        }
+        let workers = servers
+            .into_iter()
+            .map(|server| ProcMacroServerProcess::warm(server, environment.clone()))
+            .collect::<io::Result<Vec<_>>>()?;
+        let pool = ProcMacroServerPool::new(workers);
+        Ok(ProcMacroClient { pool: Arc::new(pool), path: program.to_owned() })
     }
 
     /// Returns the absolute path to the proc-macro server.

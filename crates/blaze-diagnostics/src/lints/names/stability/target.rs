@@ -208,12 +208,22 @@ pub(super) fn extern_types(cx: &Cx<'_, '_>) -> bool {
     cx.krate.is_unstable_feature_enabled(cx.db, &Symbol::intern("extern_types"))
 }
 
+/// Whether the target check warns of a `#[deprecated]` on `target` with `useless_deprecated`.
+pub(super) fn is_useless(target: Target) -> bool {
+    let unused =
+        matches!(target, Target::Closure | Target::Expression | Target::Statement | Target::Arm | Target::MacroCall);
+    !(ALLOWED.contains(&target) || target == Target::WherePredicate || unused)
+}
+
+/// Whether `check_deprecated` can find a `#[deprecated]` on `target` to have no effect.
+pub(super) fn may_have_no_effect(target: Target, of_trait_impl: bool) -> bool {
+    of_trait_impl && matches!(target, Target::AssocConst | Target::AssocTy | Target::Method(_))
+}
+
 /// The target check's `useless_deprecated` of a `#[deprecated]`, where it is a warning.
 pub(super) fn useless(cx: &Cx<'_, '_>, attr: &Attribute, extern_types: bool) -> Option<Found> {
     let target = attr.target;
-    let unused =
-        matches!(target, Target::Closure | Target::Expression | Target::Statement | Target::Arm | Target::MacroCall);
-    if ALLOWED.contains(&target) || target == Target::WherePredicate || unused {
+    if !is_useless(target) {
         return None;
     }
     let message = format!("the `deprecated` attribute cannot be used on {}", target.plural_name());
@@ -237,7 +247,7 @@ pub(super) fn useless(cx: &Cx<'_, '_>, attr: &Attribute, extern_types: bool) -> 
 /// `check_attr`'s `check_deprecated`: `#[deprecated]` on an associated const or type of a
 /// trait impl, which the target check allows and nothing reads.
 pub(super) fn no_effect(cx: &Cx<'_, '_>, attr: &Attribute, of_trait_impl: bool) -> Option<Found> {
-    if !of_trait_impl || !matches!(attr.target, Target::AssocConst | Target::AssocTy | Target::Method(_)) {
+    if !may_have_no_effect(attr.target, of_trait_impl) {
         return None;
     }
     let span = cx.span(attr.whole);

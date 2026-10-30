@@ -279,6 +279,35 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
             || allows_unstable(cx, file, range, feature))
     }
 
+    /// `check_stability_and_deprecation`'s test of a macro's `stability`: denied unless its
+    /// feature, or the one implying it, is enabled or allowed where the macro is used.
+    pub(super) fn macro_denied(&mut self, stability: Id, file: HirFileId, range: TextRange) -> bool {
+        let Index { cx, stabilities, enabled, .. } = self;
+        let cx = *cx;
+        let Stability::Unstable { feature, implied_by, .. } = &stabilities[stability as usize] else { return false };
+        let mut allowed = |it: &Symbol| enabled_in(cx, enabled, it) || allows_unstable(cx, file, range, it);
+        !(allowed(feature) || implied_by.as_ref().is_some_and(|it| allowed(it)))
+    }
+
+    /// The stability of `def` when it is stable with `#[rustc_allowed_through_unstable_modules]`
+    /// (`lookup_stability`, of any definition of a staged dependency, public or not).
+    pub(super) fn through(&mut self, def: Def) -> Option<Id> {
+        let id = match self.foreign_stability(def) {
+            Some(id) => id,
+            None => {
+                let cx = self.cx;
+                let db = cx.db;
+                let krate = def.krate(db)?;
+                if krate == cx.krate || def.is_public(db) || !self.staged(krate) {
+                    return None;
+                }
+                self.stability_at(def.source(cx)?, krate)?
+            }
+        };
+        matches!(&self.stabilities[id as usize], Stability::Stable { allowed_through_unstable_modules: Some(_) })
+            .then_some(id)
+    }
+
     /// `lookup_stability` of a definition of this crate, staged, at `ptr`.
     pub(super) fn local_stability(&mut self, ptr: Key) -> Option<Id> {
         let known = self.nodes.get(Memo::hash(&ptr), &ptr).stab;
@@ -323,7 +352,6 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
         }
         decode(value)
     }
-
 }
 
 /// Whether this crate enables `feature`, kept in `enabled`. A hit clones no `Symbol` (no

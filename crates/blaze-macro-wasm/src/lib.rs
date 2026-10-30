@@ -1560,8 +1560,8 @@ fn find_answered<T>(
         let mut now =
             Now { root, machine, env, all: None, shapes, answers: &answers, unanswered: Vec::new() };
         let looked = {
-            let store = expansions.store.read().unwrap_or_else(|it| it.into_inner());
-            index::find(&store, run, &mut now).map(&look)
+            let guard = blaze_cas::enter();
+            index::find(&expansions.store, &guard, run, &mut now).map(&look)
         };
         if now.unanswered.is_empty() {
             return looked;

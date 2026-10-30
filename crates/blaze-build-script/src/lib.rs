@@ -11,8 +11,14 @@
 //!
 //! For blaze v2 (docs/v2/plan/lanes/usercode.md): scripts that only print constant directives are read
 //! rather than run ([`elide`](mod@elide), #1296); the environment says what cargo sets from the unit and
-//! what it passes through ([`Env::from_unit`], #805); and what cargo's rule watches of a run
+//! what it passes through ([`Env::origin`], #805); and what cargo's rule watches of a run
 //! is data ([`watch`]), for a run keyed as cargo keys it (#1450).
+//!
+//! Each reads its input in one pass over borrowed bytes: what a script prints is read line by
+//! line into a [`output::Sink`] ([`output::read`]), the root file elision reads is lexed a
+//! token at a time ([`elide::lex::Tokens`]), and a run is judged from its bytes alone
+//! ([`run::judge`]). docs/v2/plan/lanes/usercode/scripts.md says how each compares with the
+//! fastest known way.
 //!
 //! [#89]: https://github.com/indexable-inc/blaze/issues/89
 //! [#147]: https://github.com/indexable-inc/blaze/issues/147
@@ -29,9 +35,9 @@ pub mod watch;
 
 pub use elide::{elide, verify};
 pub use env::{Env, Origin, env, envify};
-pub use output::{Output, parse};
+pub use output::{Output, parse, read};
 pub use unit::Unit;
-pub use watch::{Watched, watched};
+pub use watch::{Watched, watched, watched_in};
 
 /// What cargo would fail with, in cargo's words.
 #[derive(Clone, Debug, PartialEq, Eq)]

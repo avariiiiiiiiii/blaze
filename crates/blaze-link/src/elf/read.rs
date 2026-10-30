@@ -3,6 +3,9 @@
 //!
 //! Sections and symbols of an object keep their ELF indexes, so a symbol's section, a group's
 //! members and a relocation's symbol are the ELF numbers unchanged.
+//!
+//! Nothing is copied but names: a section's bytes are its range of the input, and every name
+//! is pushed once, from the string table it is in, into the file's [`Names`].
 
 mod archive;
 mod script;
@@ -14,30 +17,35 @@ use std::collections::hash_map::Entry;
 
 use blaze_codegen::Arch;
 use object::Endianness;
-use rustc_hash::FxHashMap;
+use object::SectionIndex;
 use object::elf;
 use object::read::elf::{FileHeader as _, Rela as _, SectionHeader as _, SectionTable, Sym as _};
+use rustc_hash::FxHashMap;
 
 use crate::NativeKind;
 use crate::model::{
-    Apply, Binding, Data, Group, NativeFile, NativeFixup, Object, Section, SectionKind, Symbol,
-    SymbolDef, SymbolKind,
+    Apply, Binding, Data, Group, Name, Names, NativeFile, NativeFixup, Object, Section,
+    SectionKind, Symbol, SymbolDef, SymbolKind,
 };
 
 type Header = elf::FileHeader64<Endianness>;
+type Sym = elf::Sym64<Endianness>;
 
 /// Every ELF input blaze links is little-endian (x86-64, AArch64); [`header`] checks it.
 const ENDIAN: Endianness = Endianness::Little;
 
-/// Reads `bytes`, the input `name` the link line takes as `kind`.
+/// The symbol `R_X86_64_GOTPC*` and `GOTOFF64` are against.
+const GOT: &str = "_GLOBAL_OFFSET_TABLE_";
+
+/// Reads `bytes`, the input `name` the link line takes as `kind`. `object` is built with its
+/// `unaligned` feature, so the input is read in place at any alignment (an archive member is
+/// only 2-aligned).
 pub(super) fn read(
     arch: Arch,
     name: &str,
     bytes: &[u8],
     kind: &NativeKind,
 ) -> Result<NativeFile, String> {
-    let mut copy = Vec::new();
-    let bytes = aligned(bytes, &mut copy);
     if bytes.starts_with(&object::archive::THIN_MAGIC) {
         return Err(format!(
             "{name}: a thin archive, whose members are files outside it: blaze links only \
@@ -71,20 +79,8 @@ pub(super) fn read(
     }
 }
 
-/// `object`'s ELF reader takes its structures in place, so it needs them as aligned as its
-/// `U64`: 8 bytes, or 1 with its `unaligned` feature, when nothing is ever copied. An archive
-/// member is only 2-aligned. The copy is one allocation and one `memcpy`, nothing zeroed.
-fn aligned<'a>(bytes: &'a [u8], copy: &'a mut Vec<u8>) -> &'a [u8] {
-    let align = align_of::<Header>();
-    if bytes.as_ptr().align_offset(align) == 0 {
-        return bytes;
-    }
-    *copy = Vec::with_capacity(bytes.len() + align - 1);
-    let start = copy.as_ptr().align_offset(align);
-    copy.resize(start, 0);
-    copy.extend_from_slice(bytes);
-    &copy[start..]
-}
+// Reading in place at any alignment needs `object`'s `unaligned` feature.
+const _: () = assert!(align_of::<Header>() == 1 && align_of::<elf::Rela64<Endianness>>() == 1);
 
 fn taken(kind: &NativeKind) -> &'static str {
     match kind {
@@ -131,10 +127,20 @@ fn machine_name(machine: u16) -> &'static str {
     }
 }
 
-fn utf8(name: &str, what: &str, bytes: &[u8]) -> Result<String, String> {
-    std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| {
+fn utf8<'a>(name: &str, what: &str, bytes: &'a [u8]) -> Result<&'a str, String> {
+    std::str::from_utf8(bytes).map_err(|_| {
         format!("{name}: {what} {} is not UTF-8", String::from_utf8_lossy(bytes))
     })
+}
+
+/// An error of a file's [`Names`] (past 4 GiB), naming the input.
+fn full(name: &str) -> impl Fn(String) -> String + Copy + '_ {
+    move |why| format!("{name}: {why}")
+}
+
+/// The length of a column, as the end of a run of it.
+fn end(name: &str, len: usize, what: &str) -> Result<u32, String> {
+    u32::try_from(len).map_err(|_| format!("{name}: more than 2^32 {what} in one object"))
 }
 
 /// The last component of a path: what a shared library without a `DT_SONAME`, or a linker
@@ -156,9 +162,7 @@ fn kind(st_type: u8) -> SymbolKind {
 
 /// The names of the defined global and weak symbols of the relocatable object `bytes`, in
 /// symbol table order: what an archive without a symbol table is indexed by.
-fn defined(arch: Arch, name: &str, bytes: &[u8]) -> Result<Vec<String>, String> {
-    let mut copy = Vec::new();
-    let data = aligned(bytes, &mut copy);
+fn defined<'data>(arch: Arch, name: &str, data: &'data [u8]) -> Result<Vec<&'data str>, String> {
     if !data.starts_with(&elf::ELFMAG) {
         return Err(format!("{name}: an archive member that is not an ELF object"));
     }
@@ -186,21 +190,41 @@ fn defined(arch: Arch, name: &str, bytes: &[u8]) -> Result<Vec<String>, String> 
 fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
     let header = header(arch, name, data)?;
     let error = |error: object::read::Error| format!("{name}: {error}");
+    let full = full(name);
     let sections = header.sections(ENDIAN, data).map_err(error)?;
     let symtab = sections.symbols(ENDIAN, data, elf::SHT_SYMTAB).map_err(error)?;
 
-    let mut object = Object::default();
+    // The arena is sized by the string tables its names come from, the fixup column by the
+    // relocation sections; both are bounded by the input, whatever the headers claim.
+    let (mut name_bytes, mut relas) = (GOT.len() as u64, 0u64);
+    for section in sections.iter() {
+        match section.sh_type(ENDIAN) {
+            elf::SHT_STRTAB => name_bytes = name_bytes.saturating_add(section.sh_size(ENDIAN)),
+            elf::SHT_RELA => relas = relas.saturating_add(section.sh_size(ENDIAN)),
+            _ => {}
+        }
+    }
+    let input = data.len() as u64;
+    let rela_size = size_of::<elf::Rela64<Endianness>>() as u64;
+    let mut object = Object {
+        sections: Vec::with_capacity(sections.len()),
+        symbols: Vec::with_capacity(symtab.len()),
+        fixups: Vec::with_capacity((relas.min(input) / rela_size) as usize),
+        names: Names::with_capacity(name_bytes.min(input) as usize),
+        ..Object::default()
+    };
     for (index, section) in sections.enumerate() {
-        object.sections.push(self::section(arch, name, &sections, index.0, section, data)?);
+        let section =
+            self::section(arch, name, &sections, index.0, section, data, &mut object.names)?;
+        object.sections.push(section);
     }
 
-    // `st_size` of each ELF symbol, for `R_X86_64_SIZE*`.
-    let mut sizes = Vec::with_capacity(symtab.len());
+    // The null symbol, and the ones relocations add, are unnamed: one empty name for all.
+    let empty = object.names.push("").map_err(full)?;
     for (index, symbol) in symtab.enumerate() {
-        sizes.push(symbol.st_size(ENDIAN));
         if index.0 == 0 {
             object.symbols.push(Symbol {
-                name: String::new(),
+                name: empty,
                 def: SymbolDef::Absolute(0),
                 binding: Binding::Local,
                 kind: SymbolKind::Other,
@@ -261,7 +285,7 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
             ));
         }
         object.symbols.push(Symbol {
-            name: symbol_name,
+            name: object.names.push(symbol_name).map_err(full)?,
             def,
             binding,
             kind: kind(symbol.st_type()),
@@ -276,49 +300,66 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         if flag & elf::GRP_COMDAT == 0 {
             continue;
         }
-        let group = &object.sections[index.0].name;
+        let group = object.sections[index.0].name;
         if section.sh_link(ENDIAN) as usize != symtab.section().0 {
-            return Err(format!("{name}: group {group} names a symbol table other than .symtab"));
+            return Err(format!(
+                "{name}: group {} names a symbol table other than .symtab",
+                object.name(group)
+            ));
         }
         let signature = section.sh_info(ENDIAN) as usize;
         let Some(symbol) = object.symbols.get(signature).filter(|_| signature != 0) else {
             return Err(format!(
-                "{name}: group {group}'s signature is symbol {signature}, which the object does \
-                 not have"
+                "{name}: group {}'s signature is symbol {signature}, which the object does \
+                 not have",
+                object.name(group)
             ));
         };
+        // The signature's name is already in the arena: the group shares it.
         let group_name = match symbol.def {
             SymbolDef::Section { section, .. } if symbol.kind == SymbolKind::Section => {
-                object.sections[section as usize].name.clone()
+                object.sections[section as usize].name
             }
-            _ => symbol.name.clone(),
+            _ => symbol.name,
         };
-        let mut indexes = Vec::with_capacity(members.len());
+        let start = end(name, object.grouped.len(), "group members")?;
+        object.grouped.reserve(members.len());
         for member in members {
             let member = member.get(ENDIAN);
             if member as usize >= object.sections.len() || member == 0 {
                 return Err(format!(
-                    "{name}: group {group_name} names section {member}, which the object does \
-                     not have"
+                    "{name}: group {} names section {member}, which the object does not have",
+                    object.name(group_name)
                 ));
             }
-            indexes.push(member);
+            object.grouped.push(member);
         }
-        object.groups.push(Group { name: group_name, sections: indexes });
+        let sections = start..end(name, object.grouped.len(), "group members")?;
+        object.groups.push(Group { name: group_name, sections, largest: false });
     }
 
-    let mut added = Added::default();
-    for (index, section) in sections.enumerate() {
+    // Each section's fixups are one run of the column, so relocation sections are read in the
+    // order of the section they apply to: the order they nearly always come in, which the
+    // sort only checks.
+    let mut order: Vec<(u32, u32)> = sections
+        .enumerate()
+        .filter(|(_, it)| matches!(it.sh_type(ENDIAN), elf::SHT_RELA | elf::SHT_REL | elf::SHT_CREL))
+        .map(|(index, it)| (it.sh_info(ENDIAN), index.0 as u32))
+        .collect();
+    order.sort_unstable();
+    let mut added = Added::new(empty);
+    // The section the last relocation section applied to, and where its run starts.
+    let mut run: Option<(usize, u32)> = None;
+    for (target, index) in order {
+        let (target, index) = (target as usize, index as usize);
+        let section = sections.section(SectionIndex(index)).map_err(error)?;
         let sh_type = section.sh_type(ENDIAN);
-        if !matches!(sh_type, elf::SHT_RELA | elf::SHT_REL | elf::SHT_CREL) {
-            continue;
-        }
-        let relocations = &object.sections[index.0].name;
-        let target = section.sh_info(ENDIAN) as usize;
+        let relocations = object.sections[index].name;
         let Some(applied) = object.sections.get(target).filter(|_| target != 0) else {
             return Err(format!(
-                "{name}: relocation section {relocations} applies to section {target}, which \
-                 the object does not have"
+                "{name}: relocation section {} applies to section {target}, which the object \
+                 does not have",
+                object.name(relocations)
             ));
         };
         if applied.what == SectionKind::Dropped {
@@ -326,70 +367,79 @@ fn object(arch: Arch, name: &str, data: &[u8]) -> Result<Object, String> {
         }
         if sh_type != elf::SHT_RELA {
             return Err(format!(
-                "{name}: section {} has {} relocations ({relocations}): x86-64 and AArch64 \
-                 objects carry their addends (SHT_RELA)",
-                applied.name,
-                if sh_type == elf::SHT_REL { "SHT_REL" } else { "SHT_CREL" }
+                "{name}: section {} has {} relocations ({}): x86-64 and AArch64 objects carry \
+                 their addends (SHT_RELA)",
+                object.name(applied.name),
+                if sh_type == elf::SHT_REL { "SHT_REL" } else { "SHT_CREL" },
+                object.name(relocations),
             ));
         }
         if section.sh_link(ENDIAN) as usize != symtab.section().0 {
             return Err(format!(
-                "{name}: relocation section {relocations} names a symbol table other than .symtab"
+                "{name}: relocation section {} names a symbol table other than .symtab",
+                object.name(relocations)
             ));
         }
         let Some((relas, _)) = section.rela(ENDIAN, data).map_err(error)? else {
             continue;
         };
-        // Taken out while the relocations are read, so the added symbols can be pushed and
-        // an error can still name the section, without a copy of either.
-        let mut fixups = std::mem::take(&mut object.sections[target].fixups);
-        fixups.reserve_exact(relas.len());
+        let start = match run {
+            Some((last, start)) if last == target => start,
+            _ => end(name, object.fixups.len(), "relocations")?,
+        };
+        object.fixups.reserve(relas.len());
         for rela in relas {
             let at = rela.r_offset(ENDIAN);
             let r_type = rela.r_type(ENDIAN, false);
             let symbol = rela.r_sym(ENDIAN, false);
             let addend = rela.r_addend(ENDIAN);
-            let sections = &object.sections;
-            let place = || {
+            let place = |object: &Object| {
                 format!(
                     "{name}: section {}: relocation {} ({r_type}) at {at:#x}",
-                    sections[target].name,
+                    object.name(object.sections[target].name),
                     relocation_name(arch, r_type)
                 )
             };
-            if symbol as usize >= sizes.len() {
-                return Err(format!("{}: symbol {symbol}, which the object does not have", place()));
+            if symbol as usize >= symtab.len() {
+                return Err(format!(
+                    "{}: symbol {symbol}, which the object does not have",
+                    place(&object)
+                ));
             }
             let how = match arch {
                 Arch::X86_64 => x86_64(r_type),
                 Arch::Aarch64 => aarch64(r_type),
                 Arch::Wasm32 => Err("an ELF relocation in a wasm32 link"),
             }
-            .map_err(|why| format!("{}: {why}", place()))?;
-            let fixup = |apply, symbol, minus| NativeFixup { at, apply, symbol, addend, minus };
-            fixups.push(match how {
+            .map_err(|why| format!("{}: {why}", place(&object)))?;
+            let make = |apply, symbol, minus| NativeFixup { at, apply, symbol, addend, minus };
+            let fixup = match how {
                 How::Nothing => continue,
-                How::To(apply) => fixup(apply, symbol, None),
-                How::Module(apply) => fixup(apply, added.module(&mut object.symbols), None),
+                How::To(apply) => make(apply, symbol, None),
+                How::Module(apply) => make(apply, added.module(&mut object.symbols), None),
                 How::Size(apply) => {
                     let size = added
-                        .size(&mut object.symbols, &sizes, symbol)
-                        .map_err(|why| format!("{}: {why}", place()))?;
-                    fixup(apply, size, None)
+                        .size(&mut object.symbols, &object.names, symtab.symbols(), symbol)
+                        .map_err(|why| format!("{}: {why}", place(&object)))?;
+                    make(apply, size, None)
                 }
-                How::GotBase(apply) => fixup(apply, added.got(&mut object.symbols), None),
+                How::GotBase(apply) => {
+                    make(apply, added.got(&mut object.symbols, &mut object.names).map_err(full)?, None)
+                }
                 How::GotOff(apply) => {
-                    let got = added.got(&mut object.symbols);
-                    fixup(apply, symbol, Some(got))
+                    let got = added.got(&mut object.symbols, &mut object.names).map_err(full)?;
+                    make(apply, symbol, Some(got))
                 }
-            });
+            };
+            object.fixups.push(fixup);
         }
-        object.sections[target].fixups = fixups;
+        object.sections[target].fixups = start..end(name, object.fixups.len(), "relocations")?;
+        run = Some((target, start));
     }
     Ok(object)
 }
 
-/// The section at ELF index `index`, without its fixups.
+/// The section at ELF index `index`, without its fixups; its name goes in `names`.
 fn section(
     arch: Arch,
     name: &str,
@@ -397,6 +447,7 @@ fn section(
     index: usize,
     section: &elf::SectionHeader64<Endianness>,
     data: &[u8],
+    names: &mut Names,
 ) -> Result<Section, String> {
     let sh_type = section.sh_type(ENDIAN);
     let flags = section.sh_flags(ENDIAN);
@@ -406,6 +457,7 @@ fn section(
         "the section name",
         sections.section_name(ENDIAN, section).map_err(|error| format!("{name}: {error}"))?,
     )?;
+    let interned = names.push(section_name).map_err(full(name))?;
     let align = section.sh_addralign(ENDIAN).max(1);
     let dropped = index == 0
         || !flag(elf::SHF_ALLOC)
@@ -426,11 +478,11 @@ fn section(
         || section_name.starts_with(".debug_");
     if dropped {
         return Ok(Section {
-            name: section_name,
+            name: interned,
             what: SectionKind::Dropped,
             align,
             data: Data::Zero(0),
-            fixups: Vec::new(),
+            fixups: 0..0,
             retain: false,
         });
     }
@@ -457,19 +509,19 @@ fn section(
     let data = if sh_type == elf::SHT_NOBITS {
         Data::Zero(section.sh_size(ENDIAN))
     } else {
-        Data::Bytes(
-            section
-                .data(ENDIAN, data)
-                .map_err(|error| format!("{name}: section {section_name}: {error}"))?
-                .to_vec(),
-        )
+        // Bounds-checked against the input here, so the range below can't pass its end.
+        let bytes = section
+            .data(ENDIAN, data)
+            .map_err(|error| format!("{name}: section {section_name}: {error}"))?;
+        let start = section.sh_offset(ENDIAN);
+        Data::Input(start..start + bytes.len() as u64)
     };
     Ok(Section {
-        name: section_name,
+        name: interned,
         what,
         align,
         data,
-        fixups: Vec::new(),
+        fixups: 0..0,
         retain: flag(elf::SHF_GNU_RETAIN),
     })
 }

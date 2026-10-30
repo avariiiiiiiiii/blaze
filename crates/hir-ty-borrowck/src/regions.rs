@@ -17,7 +17,7 @@ use hir_def::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    ClauseKind, OutlivesClause, RegionKind, Variance,
+    AliasConstKind, ClauseKind, OutlivesClause, RegionKind, Variance,
     inherent::{
         GenericArgs as _, IntoKind, ParamEnv as _, Region as _, SliceLike as _, Term as _, Ty as _,
     },
@@ -25,14 +25,14 @@ use rustc_type_ir::{
 
 use hir_ty::{
     GenericPredicates, InferBodyId,
-    db::GeneralConstId,
     mir::{
         AggregateKind, BinOp, BorrowKind, CastKind, LocalId, MirBody, MirSpan, Operand,
         OperandKind, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind, TerminatorKind,
     },
     next_solver::{
-        Clause, ConstKind, GenericArgKind, GenericArgs, OpaqueTyIdWrapper, Region, RegionExt as _,
-        StoredRegion, StoredTy, Ty, TyKind,
+        Clause, ConstKind, FreeConstAliasId, GenericArgKind, GenericArgs, InherentAssocConstId,
+        OpaqueTyIdWrapper, Region, RegionExt as _, StoredRegion, StoredTy, TraitAssocConstId, Ty,
+        TyKind,
     },
 };
 use salsa::SalsaValue;
@@ -4289,6 +4289,7 @@ impl<'db> Builder<'_, '_, 'db> {
         };
         let ty = self.written(ty);
         if let TyKind::FnDef(def, args) = ty.kind() {
+            let args = args.no_bound_vars().unwrap();
             self.callee_predicates(def.0, args, span);
             for ty in args.types() {
                 self.well_formed(ty, At { category: Category::Boring, span }, 0);
@@ -4312,6 +4313,7 @@ impl<'db> Builder<'_, '_, 'db> {
             },
         };
         if let TyKind::FnDef(def, args) = ty.kind() {
+            let args = args.no_bound_vars().unwrap();
             let span = operand.span().unwrap_or(span);
             self.callee_predicates(def.0, args, span);
             for ty in args.types() {
@@ -4476,6 +4478,7 @@ impl<'db> Builder<'_, '_, 'db> {
         }
         let ty = self.ctx.infer.type_of_expr.get(expr)?.as_ref();
         let TyKind::FnDef(def, inferred) = ty.kind() else { return None };
+        let inferred = inferred.no_bound_vars().unwrap();
         let last = at + 1 == generic_args.len();
         let skip = match def.0 {
             CallableDefId::FunctionId(function) if last => {
@@ -4798,6 +4801,7 @@ impl<'db> Builder<'_, '_, 'db> {
                     }
                     CastKind::PointerCoercion(hir_ty::PointerCast::ReifyFnPointer) => {
                         if let TyKind::FnDef(def, args) = source.kind() {
+                            let args = args.no_bound_vars().unwrap();
                             let sig = self
                                 .ctx
                                 .db
@@ -5038,7 +5042,7 @@ impl<'db> Builder<'_, '_, 'db> {
                                         if let Some(location) = self.location {
                                             self.regions.callee_reads.push((local, location));
                                         }
-                                        Some(args)
+                                        Some(args.no_bound_vars().unwrap())
                                     }
                                     _ => None,
                                 }
@@ -5425,6 +5429,7 @@ impl<'db> Builder<'_, '_, 'db> {
                 };
                 let (inputs, output) = match func_ty.kind() {
                     TyKind::FnDef(def, fn_args) => {
+                        let fn_args = fn_args.no_bound_vars().unwrap();
                         let def: CallableDefId = def.0;
                         let sig = self
                             .ctx
@@ -5797,9 +5802,10 @@ impl<'db> Builder<'_, '_, 'db> {
             && args.regions().next().is_some()
         {
             for predicate in self.inferred.of(self.ctx.db, adt) {
-                let OutlivesClause(arg, region) = rustc_type_ir::EarlyBinder::bind(predicate)
-                    .instantiate(interner, args)
-                    .skip_norm_wip();
+                let OutlivesClause(arg, region) =
+                    rustc_type_ir::EarlyBinder::bind(interner, predicate)
+                        .instantiate(interner, args)
+                        .skip_norm_wip();
                 use rustc_type_ir::Upcast as _;
                 clauses.push(match arg.kind() {
                     GenericArgKind::Type(ty) => OutlivesClause(ty, region).upcast(interner),
@@ -5875,7 +5881,10 @@ impl<'db> Builder<'_, '_, 'db> {
                 {
                     let interner = self.interner();
                     if let Some(term) = projection.term.as_type()
-                        && let Some(alias) = projection.projection_term.to_term(interner).as_type()
+                        && let Some(alias) = projection
+                            .projection_term
+                            .to_term(interner, rustc_type_ir::IsRigid::No)
+                            .as_type()
                         && rustc_type_ir::TypeVisitableExt::has_free_regions(&alias)
                         && let Some(normalized) = self.normalize(alias)
                         && !matches!(normalized.kind(), TyKind::Alias(..) | TyKind::Infer(_))
@@ -6008,13 +6017,15 @@ impl<'db> Builder<'_, '_, 'db> {
             if rustc_type_ir::TypeVisitableExt::has_escaping_bound_vars(&term) {
                 continue;
             }
-            let assoc = hir_ty::next_solver::SolverDefId::TypeAliasId(assoc);
-            let bounds = rustc_type_ir::Interner::item_bounds(interner, assoc);
+            let kind = rustc_type_ir::AliasTyKind::Projection {
+                def_id: hir_ty::next_solver::TraitAssocTyId(assoc),
+            };
+            let bounds = rustc_type_ir::Interner::item_bounds(interner, alias_def_id(kind));
             for clause in bounds.iter_instantiated(interner, trait_ref.args.as_slice()) {
                 if let ClauseKind::TypeOutlives(OutlivesClause(bounded, region)) =
                     clause.kind().skip_binder()
                     && let TyKind::Alias(_, alias) = bounded.kind()
-                    && alias.kind.def_id() == assoc
+                    && alias.kind == kind
                     && !matches!(region.kind(), RegionKind::ReBound(..))
                 {
                     let region = match region.kind() {
@@ -6176,7 +6187,7 @@ impl<'db> Builder<'_, '_, 'db> {
     ) {
         let TyKind::Param(param) = trait_ref.self_ty().kind() else { return };
         let mut found = None;
-        for clause in self.ctx.env.caller_bounds().iter() {
+        for clause in self.ctx.env.caller_bounds() {
             let kind = clause.kind();
             let ClauseKind::Trait(bound) = kind.skip_binder() else { continue };
             if bound.trait_ref.def_id != trait_ref.def_id
@@ -6951,7 +6962,7 @@ pub(super) fn outlives_components<'db>(
         TyKind::Adt(_, args) => args_components(args, regions, params),
         // rustc leaves out the lifetimes among a function item's arguments (rust-lang/rust#70917).
         TyKind::FnDef(_, args) => {
-            for it in args.types() {
+            for it in args.no_bound_vars().unwrap().types() {
                 outlives_components(it, regions, params);
             }
         }
@@ -7018,7 +7029,8 @@ pub(super) fn alias_components<'db>(ty: Ty<'db>, out: &mut Vec<Ty<'db>>) {
                 alias_components(it, out);
             }
         }
-        TyKind::Adt(_, it) | TyKind::FnDef(_, it) => args(it, out),
+        TyKind::Adt(_, it) => args(it, out),
+        TyKind::FnDef(_, it) => args(it.no_bound_vars().unwrap(), out),
         TyKind::Closure(_, it) => alias_components(it.as_closure().tupled_upvars_ty(), out),
         TyKind::Coroutine(_, it) => alias_components(it.as_coroutine().tupled_upvars_ty(), out),
         TyKind::Tuple(tys) => {

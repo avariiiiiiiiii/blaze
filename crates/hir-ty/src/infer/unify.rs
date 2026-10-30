@@ -6,7 +6,6 @@ use base_db::Crate;
 use hir_def::{GenericParamId, TraitId};
 use rustc_type_ir::{
     TyVid, TypeFoldable, TypeVisitableExt,
-    PredicateProxy,
     inherent::{GenericArg as _, IntoKind, Ty as _},
     solve::Certainty,
 };
@@ -576,8 +575,8 @@ impl fmt::Debug for InferenceTable<'_> {
 pub(super) mod resolve_completely {
     use rustc_hash::FxHashSet;
     use rustc_type_ir::{
-        DebruijnIndex, Flags, InferConst, InferTy, TypeFlags, TypeFoldable, TypeFolder,
-        TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
+        DebruijnIndex, Flags, InferConst, InferTy, PredicateProxy, TypeFlags, TypeFoldable,
+        TypeFolder, TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
     };
     use stdx::never;
     use thin_vec::ThinVec;

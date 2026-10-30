@@ -2178,3 +2178,213 @@ struct Q(pub u8, u8);
         assert!(VariantBits::with_len(65).0.spilled());
     }
 }
+
+/// What an edit of a file lowers again of the signatures: each is lowered from its own
+/// [`SignatureSyntax`], so an edit of a body, or of another item, lowers none of them.
+#[cfg(test)]
+mod relative_tests {
+    use base_db::SourceDatabase;
+    use test_fixture::WithFixture;
+
+    use super::*;
+    use crate::{
+        AssocItemId, ModuleDefId,
+        nameres::{
+            assoc::{ImplItems, TraitItems},
+            crate_def_map,
+        },
+        test_db::TestDB,
+    };
+
+    const CODE: &str = r#"
+pub struct S<T> { a: T, b: u32 }
+pub union U { a: u32, b: f32 }
+pub enum E<T> { A = 1, B(T), C { c: u8 } }
+macro_rules! ty { () => { u32 } }
+pub trait Tr { const C: u32; fn d(&self) -> u32 { 41 } }
+impl Tr for S<u32> { const C: u32 = 2; fn d(&self) -> u32 { self.b + 5 } }
+pub type A = S<ty!()>;
+pub const K: u32 = 3;
+pub static L: u32 = K + 1;
+pub fn f(x: u32) -> ty!() { x + 11 }
+pub fn g<T: Tr>(t: &T) -> u32 where T: Copy { t.d() }
+#[cfg(all())]
+impl S<u8> { fn h(&self) -> u8 { 0 } }
+"#;
+
+    /// Each body of `CODE` edited, the text around it moved.
+    const BODY_EDITS: [(&str, &str); 7] = [
+        ("{ 41 }", "{ 41 + 1 }"),
+        ("= 2;", "= 2 * 2;"),
+        ("{ self.b + 5 }", "{ self.b * 5 + 1 }"),
+        ("= 3;", "= 3 + 4;"),
+        ("= K + 1;", "= K + 100;"),
+        ("{ x + 11 }", "{ (x + 11) * 3 }"),
+        ("{ t.d() }", "{ t.d() + t.d() }"),
+    ];
+
+    fn edited(code: &str, edits: &[(&str, &str)]) -> String {
+        edits.iter().fold(code.to_owned(), |code, (from, to)| {
+            assert_eq!(code.matches(from).count(), 1, "`{from}` is not written once");
+            code.replace(from, to)
+        })
+    }
+
+    fn assoc(item: AssocItemId) -> GenericDefId {
+        match item {
+            AssocItemId::FunctionId(it) => it.into(),
+            AssocItemId::ConstId(it) => it.into(),
+            AssocItemId::TypeAliasId(it) => it.into(),
+        }
+    }
+
+    /// Every signature of the test crate, items of traits and impls too, and every variant.
+    fn defs(db: &TestDB) -> (Vec<GenericDefId>, Vec<VariantId>) {
+        let (mut signatures, mut variants) = (Vec::new(), Vec::new());
+        for (_, module) in crate_def_map(db, db.fetch_test_crate()).modules(db) {
+            let scope = module.scope(db);
+            for decl in scope.declarations() {
+                match decl {
+                    ModuleDefId::FunctionId(it) => signatures.push(it.into()),
+                    ModuleDefId::ConstId(it) => signatures.push(it.into()),
+                    ModuleDefId::StaticId(it) => signatures.push(it.into()),
+                    ModuleDefId::TypeAliasId(it) => signatures.push(it.into()),
+                    ModuleDefId::TraitId(it) => {
+                        signatures.push(it.into());
+                        let items = TraitItems::query(db, it).items.iter();
+                        signatures.extend(items.map(|&(_, item)| assoc(item)));
+                    }
+                    ModuleDefId::AdtId(it) => {
+                        signatures.push(it.into());
+                        match it {
+                            AdtId::StructId(it) => variants.push(it.into()),
+                            AdtId::UnionId(it) => variants.push(it.into()),
+                            AdtId::EnumId(it) => variants.extend(
+                                EnumVariants::of(db, it).0.variants.values().map(|&(v, _)| v.into()),
+                            ),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for imp in scope.impls() {
+                signatures.push(imp.into());
+                let items = ImplItems::of(db, imp).0.items.iter();
+                signatures.extend(items.map(|&(_, item)| assoc(item)));
+            }
+        }
+        (signatures, variants)
+    }
+
+    /// Where each signature, each variant's fields and each enum's variants are kept: what
+    /// lowering them again makes anew.
+    fn lowered(db: &TestDB) -> Vec<usize> {
+        fn at<T>(it: &T) -> usize {
+            std::ptr::from_ref(it) as usize
+        }
+        let (signatures, variants) = defs(db);
+        let signatures = signatures.into_iter().map(|def| match def {
+            GenericDefId::AdtId(AdtId::StructId(it)) => at(StructSignature::of(db, it)),
+            GenericDefId::AdtId(AdtId::UnionId(it)) => at(UnionSignature::of(db, it)),
+            GenericDefId::AdtId(AdtId::EnumId(it)) => {
+                at(EnumSignature::of(db, it)) ^ at(EnumVariants::of(db, it))
+            }
+            GenericDefId::ConstId(it) => at(ConstSignature::of(db, it)),
+            GenericDefId::StaticId(it) => at(StaticSignature::of(db, it)),
+            GenericDefId::ImplId(it) => at(ImplSignature::of(db, it)),
+            GenericDefId::TraitId(it) => at(TraitSignature::of(db, it)),
+            GenericDefId::FunctionId(it) => at(FunctionSignature::of(db, it)),
+            GenericDefId::TypeAliasId(it) => at(TypeAliasSignature::of(db, it)),
+        });
+        let variants = variants.into_iter().map(|it| at(VariantFields::of(db, it)));
+        signatures.chain(variants).collect()
+    }
+
+    /// The signature lowerings in `log`.
+    fn lowerings(log: &[String]) -> Vec<&str> {
+        let lowering = |it: &&String| {
+            it.contains("Signature::relative")
+                || it.contains("VariantFields::relative")
+                || it.contains("EnumVariants::of")
+        };
+        log.iter().filter(lowering).map(String::as_str).collect()
+    }
+
+    /// `edits` of `CODE`, with every signature asked for before and after: what they lower.
+    fn lowered_by(edits: &[(&str, &str)]) -> (Vec<String>, Vec<usize>, Vec<usize>) {
+        let (mut db, file) = TestDB::with_single_file(CODE);
+        let before = lowered(&db);
+        assert!(lowerings(&db.log_executed(|| _ = lowered(&db))).is_empty());
+        db.set_file_text(file.file_id(&db), &edited(CODE, edits));
+        let mut after = Vec::new();
+        let log = db.log_executed(|| after = lowered(&db));
+        (log, before, after)
+    }
+
+    #[test]
+    fn a_body_edit_lowers_no_signature() {
+        let (log, before, after) = lowered_by(&BODY_EDITS);
+        assert_eq!(lowerings(&log), Vec::<&str>::new(), "{log:#?}");
+        assert_eq!(before, after, "a signature was lowered anew");
+    }
+
+    #[test]
+    fn an_edit_of_another_item_lowers_none_of_this_one() {
+        // `S` gets a field: its signature and fields are lowered again, and every item after
+        // it moves, but none of them is lowered again.
+        let (log, ..) = lowered_by(&[("b: u32 }", "b: u32, c: u64 }")]);
+        let mut lowerings = lowerings(&log);
+        lowerings.sort_unstable();
+        assert_eq!(lowerings.len(), 2, "{log:#?}");
+        assert!(lowerings[0].contains("StructSignature::relative"), "{lowerings:?}");
+        assert!(lowerings[1].contains("VariantFields::relative"), "{lowerings:?}");
+    }
+
+    #[test]
+    fn a_discriminant_edit_lowers_the_variants_not_the_enum() {
+        let (log, ..) = lowered_by(&[("A = 1", "A = 1 + 1")]);
+        let lowerings = lowerings(&log);
+        assert!(!lowerings.iter().any(|it| it.contains("EnumSignature")), "{log:#?}");
+        assert!(lowerings.iter().any(|it| it.contains("EnumVariants::of")), "{log:#?}");
+    }
+
+    /// What `with_source_map` gives, moved from the item's tree to the file, is what lowering
+    /// from the whole file gives: the same signature, each part at the same place.
+    #[test]
+    fn moved_source_maps_are_the_files() {
+        macro_rules! check {
+            ($db:ident, $Signature:ident, $id:expr) => {{
+                let id = $id;
+                let (signature, map) = $Signature::with_source_map(&$db, id);
+                let (whole, whole_map) = $Signature::lower(&$db, id, id.lookup(&$db).source(&$db), None);
+                assert_eq!(**signature, *whole, "{id:?}");
+                assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
+            }};
+        }
+        let (mut db, file) = TestDB::with_single_file(CODE);
+        for text in [CODE.to_owned(), edited(CODE, &BODY_EDITS)] {
+            db.set_file_text(file.file_id(&db), &text);
+            let (signatures, variants) = defs(&db);
+            for def in signatures {
+                assert!(signature_syntax(&db, def).is_some(), "{def:?} has no syntax of its own");
+                match def {
+                    GenericDefId::AdtId(AdtId::StructId(it)) => check!(db, StructSignature, it),
+                    GenericDefId::AdtId(AdtId::UnionId(it)) => check!(db, UnionSignature, it),
+                    GenericDefId::AdtId(AdtId::EnumId(it)) => check!(db, EnumSignature, it),
+                    GenericDefId::ConstId(it) => check!(db, ConstSignature, it),
+                    GenericDefId::StaticId(it) => check!(db, StaticSignature, it),
+                    GenericDefId::ImplId(it) => check!(db, ImplSignature, it),
+                    GenericDefId::TraitId(it) => check!(db, TraitSignature, it),
+                    GenericDefId::FunctionId(it) => check!(db, FunctionSignature, it),
+                    GenericDefId::TypeAliasId(it) => check!(db, TypeAliasSignature, it),
+                }
+            }
+            for id in variants {
+                let (fields, map) = VariantFields::with_source_map(&db, id);
+                let (whole, whole_map) = VariantFields::lower(&db, id, None);
+                assert_eq!(**fields, *whole, "{id:?}");
+                assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
+            }
+        }
+    }
+}

@@ -252,7 +252,8 @@ impl Cursor {
 }
 
 /// Why changes under a directory are not all named: whoever watches looks at that subtree
-/// again (its stamps, and the entries of each directory whose stamp moved), and nothing else.
+/// again (its stamps, and the entries of each directory whose stamp moved), and nothing else;
+/// for [`Lost::Unnamed`], only the directory's own entries.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Lost {
     /// The system keeps no journal across a restart (Linux): what changed since the cursor
@@ -268,6 +269,11 @@ pub enum Lost {
     Dropped,
     /// The system says to look at this directory again (FSEvents' `MustScanSubDirs`).
     Rescan,
+    /// Names directly in this directory were made, removed or renamed and the journal does not
+    /// say which (NTFS's unprivileged USN read gives no names): whoever watches lists its
+    /// entries again ([`crate::Effect::Entries`]), takes what is new in it whole, and drops what
+    /// is gone with what was under it; nothing else under it moved for this.
+    Unnamed,
     /// The watched directory was moved, replaced, or its volume mounted or unmounted.
     RootChanged,
 }
@@ -280,6 +286,7 @@ impl fmt::Display for Lost {
             Lost::Truncated => "the journal of changes no longer reaches the saved place in it",
             Lost::Dropped => "the system dropped changes",
             Lost::Rescan => "the system said to look at the directory again",
+            Lost::Unnamed => "the journal said names in the directory changed but not which",
             Lost::RootChanged => "the watched directory was moved, replaced or unmounted",
         })
     }

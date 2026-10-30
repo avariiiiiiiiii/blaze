@@ -1,11 +1,7 @@
 //! Module defining all known symbols required by the rest of rust-analyzer.
 #![allow(non_upper_case_globals)]
 
-use crate::{
-    Symbol,
-    arena::Store,
-    symbol::{Text, prefill_one},
-};
+use crate::{Symbol, symbol::Text};
 
 macro_rules! last {
     ( $($elems:literal,)+ ) => {
@@ -16,8 +12,8 @@ macro_rules! last {
 impl Integer {
     #[inline]
     pub fn as_uint(sym: &Symbol) -> Option<usize> {
-        // A declared integer's text is in `LIST`; one interned at runtime is parsed.
-        Self::LIST.element_offset(sym.as_static()).or_else(|| Self::as_uint_cold(sym))
+        // A declared integer is one of the list's IDs; one interned at runtime is parsed.
+        Self::index_of(sym).or_else(|| Self::as_uint_cold(sym))
     }
 
     #[cold]
@@ -26,20 +22,38 @@ impl Integer {
     }
 }
 
+/// The sum of the first `count` of `lens`.
+const fn sum_before(lens: &[usize], count: usize) -> usize {
+    let mut sum = 0;
+    let mut at = 0;
+    while at < count {
+        sum += lens[at];
+        at += 1;
+    }
+    sum
+}
+
 macro_rules! define_symbols {
     (
         @LISTS: $($list_type_name:ident = $list_prefix:literal + [ $($list_idx:literal,)+ ],)*
         @WITH_NAME: $($alias:ident = $value:literal,)*
         @PLAIN: $($name:ident,)*
     ) => {
+        /// The lists, in the order their texts follow the declared ones in [`TEXTS`].
+        #[allow(non_camel_case_types, dead_code)]
+        enum Lists {
+            $( $list_type_name, )*
+        }
+
+        /// How many texts each list has, in the order of [`Lists`].
+        const LIST_LENS: &[usize] = &[ $( last!($($list_idx,)+) + 1, )* ];
+
         $(
             pub enum $list_type_name {}
             impl $list_type_name {
-                // Ensure we covered all numbers.
-                const LIST: &[Text; last!($($list_idx,)+) + 1] = {
-                    static LIST: [Text; last!($($list_idx,)+) + 1] = [ $( Text::new(concat!($list_prefix, $list_idx)), )* ];
-                    &LIST
-                };
+                /// Where the list's first text is in [`TEXTS`].
+                const BASE: usize = DECLARED + sum_before(LIST_LENS, Lists::$list_type_name as usize);
+                const LEN: usize = last!($($list_idx,)+) + 1;
 
                 #[cold]
                 #[inline(never)]
@@ -49,18 +63,25 @@ macro_rules! define_symbols {
 
                 #[inline]
                 pub fn get(idx: usize) -> Symbol {
-                    match Self::LIST.get(idx) {
-                        Option::Some(s) => Symbol::from_static(s),
-                        Option::None => Self::create(idx),
+                    match idx < Self::LEN {
+                        true => Symbol::from_index(Self::BASE + idx),
+                        false => Self::create(idx),
                     }
+                }
+
+                /// `idx` when `sym` is the compiled-in `get(idx)`.
+                #[inline]
+                #[allow(dead_code)]
+                fn index_of(sym: &Symbol) -> Option<usize> {
+                    let at = sym.static_index()?.checked_sub(Self::BASE)?;
+                    (at < Self::LEN).then_some(at)
                 }
             }
         )*
 
-        /// Every plain and named symbol, in declaration order: its index in one `static`
-        /// array, so that a declared symbol's index is a pointer subtraction
-        /// ([`Symbol::declared_index`]) and a fixed set of them is a table indexed by it
-        /// ([`crate::KnownNames`]).
+        /// Every plain and named symbol, in declaration order: its index in [`TEXTS`], so a
+        /// declared symbol's index is its ID less one ([`Symbol::declared_index`]) and a fixed
+        /// set of them is a table indexed by it ([`crate::KnownNames`]).
         #[allow(non_camel_case_types)]
         #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
         #[repr(u16)]
@@ -72,42 +93,23 @@ macro_rules! define_symbols {
         /// How many symbols [`Declared`] has.
         pub const DECLARED: usize = [$( Declared::$name, )* $( Declared::$alias, )*].len();
 
-        // The strings are in one `static` so that symbol equality holds and a symbol's index
-        // is its offset in it.
-        pub(crate) static TEXTS: [Text; DECLARED] = [
+        /// How many symbols are compiled in: the declared ones, then each list's.
+        pub const STATIC: usize = DECLARED + sum_before(LIST_LENS, LIST_LENS.len());
+
+        /// Every compiled-in text: symbol ID `n`'s is at `n - 1`. The declared ones in
+        /// declaration order, then each list's, so every compiled-in symbol is a constant ID
+        /// and its text one load.
+        pub(crate) static TEXTS: [Text; STATIC] = [
             $( Text::new(stringify!($name)), )*
             $( Text::new($value), )*
+            $( $( Text::new(concat!($list_prefix, $list_idx)), )* )*
         ];
         $(
-            pub const $name: Symbol = Symbol::from_static(&TEXTS[Declared::$name as usize]);
+            pub const $name: Symbol = Symbol::from_index(Declared::$name as usize);
         )*
         $(
-            pub const $alias: Symbol = Symbol::from_static(&TEXTS[Declared::$alias as usize]);
+            pub const $alias: Symbol = Symbol::from_index(Declared::$alias as usize);
         )*
-
-        /// The index of `text` in [`TEXTS`], if it is one of them.
-        #[inline]
-        pub(crate) fn declared_index(text: &'static Text) -> Option<usize> {
-            TEXTS.element_offset(text)
-        }
-
-        /// The store of symbols, holding every declared one so that interning a declared
-        /// symbol's text gives it. A text declared twice gives the first.
-        pub(super) fn prefill() -> Store {
-            let store_ = Store::new();
-            $(
-                for s in $list_type_name::LIST {
-                    prefill_one(&store_, Symbol::from_static(s));
-                }
-            )*
-            $(
-                prefill_one(&store_, $name);
-            )*
-            $(
-                prefill_one(&store_, $alias);
-            )*
-            store_
-        }
     };
 }
 define_symbols! {

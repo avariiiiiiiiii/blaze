@@ -33,7 +33,8 @@ use crate::{
     model::{Applicability, Code, Diag, Level, MultiSpan, Span, SuggestionStyle},
 };
 
-/// What a name's lint read: the item's signature or code, by where the name is.
+/// What a name's lint read: the item's signature or code, by where the name is. Made only
+/// for a lint that fires.
 type Read = Vec<(Fact, String)>;
 
 /// rustc's `check_mod` of the crate root: the crate's name, unless every crate type it is
@@ -50,7 +51,7 @@ pub(super) fn krate(cx: &Cx<'_, '_>) -> Vec<Found> {
     let file = root.definition_source_file_id(cx.db);
     let Some(source_file) = ast::SourceFile::cast(cx.sema.parse_or_expand(file)) else { return Vec::new() };
     let at = InFile::new(file, SyntaxNodePtr::new(source_file.syntax()));
-    let read: Read = vec![(Fact::Name(cx.module_key(root)), "the name of the crate".to_owned())];
+    let read = || vec![(Fact::Name(cx.module_key(root)), "the name of the crate".to_owned())];
     // `#![crate_name = ".."]`: the span of the name between its quotes.
     if let Some((ast::Meta::KeyValueMeta(kv), _)) = walk::attr(cx, &source_file, "crate_name")
         && let Some(ast::Expr::Literal(literal)) = kv.expr()
@@ -63,23 +64,26 @@ pub(super) fn krate(cx: &Cx<'_, '_>) -> Vec<Found> {
         }
         let start = token.text_range().start();
         let range = TextRange::new(start + TextSize::from(left as u32 + 1), start + TextSize::from(right as u32));
-        let span = cx.span(InFile::new(file, range));
-        return snake(cx, "crate", &text[left + 1..right], Some(span), at, &read).into_iter().collect();
+        return snake(cx, "crate", &text[left + 1..right], Some(InFile::new(file, range)), at, read).into_iter().collect();
     }
     // As cargo runs rustc, `--crate-name` names it, with no span.
     let Some(name) = cx.krate.display_name(cx.db) else { return Vec::new() };
-    snake(cx, "crate", name.crate_name().symbol().as_str(), None, at, &read).into_iter().collect()
+    snake(cx, "crate", name.crate_name().symbol().as_str(), None, at, read).into_iter().collect()
 }
 
 /// What rustc's `NonSnakeCase` and `NonUpperCaseGlobals` lint of `item` that `IncorrectCase`
-/// does not, in the order rustc visits its nodes.
+/// does not, in the order rustc visits its nodes. Each node is told apart by its kind, and a
+/// name is tested for its case before anything resolves it.
 pub(super) fn item(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
     let mut found = Vec::new();
-    let def = super::item_id(cx, item);
-    let read = |fact: fn(blaze_items::ItemKey) -> Fact, what: &str| -> Read {
-        match &def {
-            Some((id, name)) => vec![(fact(cx.key(*id)), format!("the {what} of `{name}`"))],
-            None => Vec::new(),
+    let def = OnceCell::new();
+    let read = |fact: fn(blaze_items::ItemKey) -> Fact, what: &'static str| {
+        let def = &def;
+        move || -> Read {
+            match def.get_or_init(|| super::item_id(cx, item)) {
+                Some((id, name)) => vec![(fact(cx.key(*id)), format!("the {what} of `{name}`"))],
+                None => Vec::new(),
+            }
         }
     };
     if let ast::Item::Fn(it) = &item.node.value
@@ -88,66 +92,90 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
         && walk::attr(cx, it, "no_mangle").is_some()
         && let Some(name) = it.name()
     {
-        let span = cx.span(item.node.with_value(name.syntax().text_range()));
-        found.extend(snake(cx, "trait method", name.text(), Some(span), item.ptr(), &read(Fact::Name, "name")));
+        let range = item.node.with_value(name.syntax().text_range());
+        found.extend(snake(cx, "trait method", name.text(), Some(range), item.ptr(), read(Fact::Name, "name")));
     }
     let bindings = matches!(&item.node.value, ast::Item::Const(_) | ast::Item::Static(_) | ast::Item::Enum(_));
     for node in &item.nodes {
-        let at = node.as_ref().map(SyntaxNodePtr::new);
-        if let Some(param) = ast::LifetimeParam::cast(node.value.clone())
-            && let Some(lifetime) = param.lifetime()
-        {
-            let span = cx.span(node.with_value(lifetime.syntax().text_range()));
-            found.extend(snake(cx, "lifetime", lifetime.text(), Some(span), at, &read(Fact::Signature, "signature")));
-        } else if let Some(param) = ast::ConstParam::cast(node.value.clone())
-            && let Some(name) = param.name()
-        {
-            let span = cx.span(node.with_value(name.syntax().text_range()));
-            let usages = const_param_usages(cx, item, node.with_value(&param), name.text());
-            let read = read(Fact::Signature, "signature");
-            found.extend(upper(cx, "const parameter", name.text(), span, true, usages, at, &read));
-        } else if let Some(ty) = ast::FnPtrType::cast(node.value.clone()) {
-            for param in ty.param_list().into_iter().flat_map(|it| it.params()) {
-                if let Some(ast::Pat::IdentPat(pat)) = param.pat()
-                    && let Some(name) = pat.name()
-                {
-                    let span = cx.span(node.with_value(name.syntax().text_range()));
-                    let at = node.with_value(SyntaxNodePtr::new(pat.syntax()));
-                    found.extend(snake(cx, "variable", name.text(), Some(span), at, &read(Fact::Signature, "signature")));
+        let at = || node.as_ref().map(SyntaxNodePtr::new);
+        match node.value.kind() {
+            SyntaxKind::LIFETIME_PARAM => {
+                let Some(lifetime) = ast::LifetimeParam::cast(node.value.clone()).and_then(|it| it.lifetime()) else {
+                    continue;
+                };
+                let range = node.with_value(lifetime.syntax().text_range());
+                found.extend(snake(cx, "lifetime", lifetime.text(), Some(range), at(), read(Fact::Signature, "signature")));
+            }
+            SyntaxKind::CONST_PARAM => {
+                let Some(param) = ast::ConstParam::cast(node.value.clone()) else { continue };
+                let Some(name) = param.name() else { continue };
+                let range = node.with_value(name.syntax().text_range());
+                let usages = || const_param_usages(cx, item, node.with_value(&param), name.text());
+                let read = read(Fact::Signature, "signature");
+                found.extend(upper(cx, "const parameter", name.text(), range, Some(usages), at(), read));
+            }
+            SyntaxKind::FN_PTR_TYPE => {
+                let Some(ty) = ast::FnPtrType::cast(node.value.clone()) else { continue };
+                for param in ty.param_list().into_iter().flat_map(|it| it.params()) {
+                    if let Some(ast::Pat::IdentPat(pat)) = param.pat()
+                        && let Some(name) = pat.name()
+                    {
+                        let range = node.with_value(name.syntax().text_range());
+                        let at = node.with_value(SyntaxNodePtr::new(pat.syntax()));
+                        found.extend(snake(cx, "variable", name.text(), Some(range), at, read(Fact::Signature, "signature")));
+                    }
                 }
             }
-        } else if let Some(pat) = ast::IdentPat::cast(node.value.clone()) {
-            found.extend(ident_pat(cx, node.with_value(&pat), bindings, &read(Fact::Code, "code")));
-        } else if let Some(pat) = ast::PathPat::cast(node.value.clone())
-            && let Some(path) = pat.path()
-            && path.qualifier().is_none()
-            && let Some(segment) = path.segment()
-            && segment.generic_arg_list().is_none()
-            && let Some(name) = segment.name_ref()
-            && let Some(PathResolution::Def(ModuleDef::Const(_))) = cx.sema.resolve_path(&path)
-        {
-            let span = cx.span(node.with_value(name.syntax().text_range()));
-            let read = read(Fact::Code, "code");
-            found.extend(upper(cx, "constant in pattern", name.text(), span, false, Vec::new(), at, &read));
+            SyntaxKind::IDENT_PAT => {
+                let Some(pat) = ast::IdentPat::cast(node.value.clone()) else { continue };
+                found.extend(ident_pat(cx, node.with_value(&pat), bindings, read(Fact::Code, "code")));
+            }
+            SyntaxKind::PATH_PAT => {
+                if let Some(pat) = ast::PathPat::cast(node.value.clone())
+                    && let Some(path) = pat.path()
+                    && path.qualifier().is_none()
+                    && let Some(segment) = path.segment()
+                    && segment.generic_arg_list().is_none()
+                    && let Some(name) = segment.name_ref()
+                    && !is_upper_case(name.text())
+                    && let Some(PathResolution::Def(ModuleDef::Const(_))) = cx.sema.resolve_path(&path)
+                {
+                    let range = node.with_value(name.syntax().text_range());
+                    found.extend(upper(cx, "constant in pattern", name.text(), range, NO_USAGES, at(), read(Fact::Code, "code")));
+                }
+            }
+            _ => {}
         }
     }
     found
 }
 
+/// No usages to rename: the name is exported, or not a parameter's.
+const NO_USAGES: Option<fn() -> Vec<Span>> = None;
+
 /// An identifier pattern: a constant it names, or a binding of a body `IncorrectCase` does
 /// not look into (`bindings`: the item is a constant, a static or an enum's discriminants).
-fn ident_pat(cx: &Cx<'_, '_>, pat: InFile<&ast::IdentPat>, bindings: bool, read: &Read) -> Option<Found> {
+/// The name's case is tested first: most names neither lint could fire for are never
+/// resolved.
+fn ident_pat(cx: &Cx<'_, '_>, pat: InFile<&ast::IdentPat>, bindings: bool, read: impl FnOnce() -> Read) -> Option<Found> {
     let name = pat.value.name()?;
-    let span = cx.span(pat.with_value(name.syntax().text_range()));
-    let at = pat.map(|it| SyntaxNodePtr::new(it.syntax()));
+    let text = name.text();
+    let upper_case = is_upper_case(text);
+    // A constant lints only when its name is not upper case, a binding only when it is not
+    // snake case.
+    if upper_case && (!bindings || is_snake_case(text)) {
+        return None;
+    }
     // The parameters of a function pointer type are linted with it.
     if pat.value.syntax().ancestors().any(|it| ast::FnPtrType::can_cast(it.kind())) {
         return None;
     }
+    let range = pat.with_value(name.syntax().text_range());
+    let at = pat.map(|it| SyntaxNodePtr::new(it.syntax()));
     let plain = pat.value.pat().is_none() && pat.value.ref_token().is_none() && pat.value.mut_token().is_none();
     if plain && let Some(def) = cx.sema.resolve_bind_pat_to_const(pat.value) {
         return match def {
-            ModuleDef::Const(_) => upper(cx, "constant in pattern", name.text(), span, false, Vec::new(), at, read),
+            ModuleDef::Const(_) => upper(cx, "constant in pattern", text, range, NO_USAGES, at, read),
             _ => None,
         };
     }
@@ -160,7 +188,7 @@ fn ident_pat(cx: &Cx<'_, '_>, pat: InFile<&ast::IdentPat>, bindings: bool, read:
     if shorthand {
         return None;
     }
-    snake(cx, "variable", name.text(), Some(span), at, read)
+    snake(cx, "variable", text, Some(range), at, read)
 }
 
 /// The paths in `item` naming the const parameter `param`, which the suggestion renames too.
@@ -193,18 +221,19 @@ pub(super) fn is_rust_abi(abi: Option<ast::Abi>) -> bool {
 }
 
 /// rustc's `check_snake_case`: the lint of `name`, of the kind `sort`, when it is not snake
-/// case. `span` is `None` for the crate's name given on the command line.
+/// case. `range` is `None` for the crate's name given on the command line.
 fn snake(
     cx: &Cx<'_, '_>,
     sort: &str,
     name: &str,
-    span: Option<Span>,
+    range: Option<InFile<TextRange>>,
     at: InFile<SyntaxNodePtr>,
-    read: &Read,
+    read: impl FnOnce() -> Read,
 ) -> Option<Found> {
     if is_snake_case(name) {
         return None;
     }
+    let span = range.map(|it| cx.span(it));
     let message = format!("{sort} `{name}` should have a snake case name");
     let sc = to_snake_case(name);
     let mut diag = match &span {

@@ -227,3 +227,48 @@ fn what_is_logged_is_read_as_the_lossy_lines_have_it() {
         assert_eq!(ran.logged(), model(&stdout), "{stdout:?}");
     }
 }
+
+/// [`judge`] reads a run as [`Ran::finish`] does, from its bytes alone, and [`files`] and
+/// [`invoked`] name what `finish` and [`begin`] write: over runs that succeed, fail, log an
+/// error, print output cargo refuses, in both layouts.
+#[test]
+fn judged_from_the_bytes_as_finished() {
+    use std::os::unix::process::ExitStatusExt;
+    let (mut unit, _) = package("judged", "exit 0");
+    let first = unit.out_dir.clone();
+    let target = unit.script.ancestors().nth(4).unwrap().to_owned();
+    let second = target.join("debug/build/foo/0123456789abcdef/out");
+    let outputs: [&[u8]; 5] = [
+        b"cargo:rustc-cfg=foo\ncargo:warning=w\r\n",
+        b"noise\ncargo::error=bad\n",
+        b"cargo::rustc-what=1\n",
+        b"",
+        b"cargo:warning=a\ncargo:error=not one\n  cargo::error=indented",
+    ];
+    for out_dir in [first, second] {
+        unit.out_dir = out_dir;
+        for status in [0, 101 << 8, 9] {
+            for stdout in outputs {
+                let ran = Ran {
+                    began: begin(&unit).unwrap(),
+                    status: ExitStatus::from_raw(status),
+                    stdout: stdout.to_vec(),
+                    stderr: b"err\n".to_vec(),
+                };
+                let cx = Context::of(&unit, &[]);
+                let judged = judge(&unit, &cx, ran.status, &ran.stdout, &ran.stderr);
+                assert_eq!(judged, ran.finish(&unit, &cx), "{status} {stdout:?}");
+                let (timestamp, text) = invoked(&unit);
+                assert_eq!(fs::read(&timestamp).unwrap(), text);
+                let files = files(&unit, &ran.stdout, &ran.stderr).unwrap();
+                assert_eq!(files.printed.0, printed(&unit));
+                if ran.status.success() && !stdout.windows(13).any(|it| it == b"\ncargo::error") {
+                    for (path, bytes) in [&files.printed, &files.stderr, &files.root_output] {
+                        assert_eq!(fs::read(path).unwrap(), *bytes, "{}", path.display());
+                    }
+                }
+                let _ = fs::remove_dir_all(run_dir(&unit));
+            }
+        }
+    }
+}

@@ -7,7 +7,7 @@ use blaze_ids::radix;
 use hir_def::hir::{BindingAnnotation, BindingId, ExprId, Pat, Statement};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
-    ClauseKind, OutlivesPredicate, RegionKind,
+    ClauseKind, OutlivesClause, RegionKind,
     inherent::{GenericArgs as _, IntoKind, Region as _},
 };
 use smallvec::SmallVec;
@@ -1886,7 +1886,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 }
                 if reported.insert((test.ty, test.span)) {
                     let what = match test.ty.kind() {
-                        TyKind::Alias(_) => "associated type",
+                        TyKind::Alias(_, _) => "associated type",
                         _ => "parameter type",
                     };
                     let (code, message) = match kind {
@@ -2038,7 +2038,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// or the function body every parameter outlives, outlives `lower` as region inference
     /// left them.
     fn type_test_holds(&self, ty: Ty<'db>, lower: usize) -> bool {
-        if let TyKind::Alias(alias) = ty.kind() {
+        if let TyKind::Alias(_, alias) = ty.kind() {
             return self.alias_test_holds(ty, alias, lower, 0);
         }
         let fn_body = self.regions.universals[1].0;
@@ -2101,10 +2101,10 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }) {
             return true;
         }
-        for clause in rustc_type_ir::Interner::item_bounds(interner, alias.kind.def_id())
-            .iter_instantiated(interner, alias.args)
-        {
-            if let ClauseKind::TypeOutlives(OutlivesPredicate(bounded, region)) =
+        let bounds =
+            rustc_type_ir::Interner::item_bounds(interner, regions::alias_def_id(alias.kind));
+        for clause in bounds.iter_instantiated(interner, alias.args) {
+            if let ClauseKind::TypeOutlives(OutlivesClause(bounded, region)) =
                 clause.skip_norm_wip().kind().skip_binder()
                 && erase(bounded) == erased
             {
@@ -2121,8 +2121,8 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         let mut components = Vec::new();
         let mut params = Vec::new();
         let captured = match alias.kind {
-            rustc_type_ir::AliasTyKind::Opaque { .. } => {
-                regions::opaque_captures(self.ctx.db, alias.kind.def_id(), alias.args.len())
+            rustc_type_ir::AliasTyKind::Opaque { def_id } => {
+                regions::opaque_captures(self.ctx.db, def_id, alias.args.len())
             }
             _ => None,
         };
@@ -2141,7 +2141,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         }
         components.into_iter().all(outlives)
             && params.into_iter().all(|it| match it.kind() {
-                TyKind::Alias(inner) => self.alias_test_holds(it, inner, lower, depth + 1),
+                TyKind::Alias(_, inner) => self.alias_test_holds(it, inner, lower, depth + 1),
                 _ => self.type_test_holds(it, lower),
             })
     }

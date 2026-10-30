@@ -25,7 +25,7 @@ use crate::{
     infer::{BreakableKind, ClosureData, Diverges, coerce::CoerceMany, pat::PatOrigin},
     next_solver::{
         AliasTy, Binder, ClauseKind, DbInterner, ErrorGuaranteed, FnSig, GenericArg, PolyFnSig,
-        PolyProjectionPredicate, Predicate, PredicateKind, SolverDefId, StoredFnSig, TermId, Ty,
+        PolyProjectionClause, Predicate, PredicateKind, SolverDefId, StoredFnSig, TermId, Ty,
         TyKind, Unnormalized,
         abi::Safety,
         infer::{
@@ -373,7 +373,7 @@ impl<'db> InferenceContext<'db> {
         closure_kind: ClosureKind,
     ) -> (Option<PolyFnSig<'db>>, Option<rustc_type_ir::ClosureKind>) {
         match expected_ty.kind() {
-            TyKind::Alias(AliasTy { kind: rustc_type_ir::Opaque { def_id }, args, .. }) => self
+            TyKind::Alias(_, AliasTy { kind: rustc_type_ir::Opaque { def_id }, args, .. }) => self
                 .deduce_closure_signature_from_predicates(
                     closure_expr,
                     expected_ty,
@@ -565,7 +565,7 @@ impl<'db> InferenceContext<'db> {
         &mut self,
         closure_expr: ExprId,
         closure_kind: ClosureKind,
-        projection: PolyProjectionPredicate<'db>,
+        projection: PolyProjectionClause<'db>,
     ) -> Option<PolyFnSig<'db>> {
         let SolverDefId::TypeAliasId(def_id) = projection.item_def_id() else { unreachable!() };
 
@@ -596,7 +596,7 @@ impl<'db> InferenceContext<'db> {
     /// and return type to infer a `PolyFnSig` for the closure.
     fn extract_sig_from_projection(
         &self,
-        projection: PolyProjectionPredicate<'db>,
+        projection: PolyProjectionClause<'db>,
     ) -> Option<PolyFnSig<'db>> {
         let projection = self.resolve_vars_if_possible(projection);
 
@@ -642,7 +642,7 @@ impl<'db> InferenceContext<'db> {
     fn extract_sig_from_projection_and_future_bound(
         &mut self,
         closure_expr: ExprId,
-        projection: PolyProjectionPredicate<'db>,
+        projection: PolyProjectionClause<'db>,
     ) -> Option<PolyFnSig<'db>> {
         let projection = self.resolve_vars_if_possible(projection);
 
@@ -1071,10 +1071,10 @@ impl<'db> InferenceContext<'db> {
                 .obligations_for_self_ty(ret_vid, UseSubtyping::No)
                 .into_iter()
                 .find_map(|obligation| get_future_output(obligation.predicate))?,
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
                 return Some(self.types.types.error);
             }
-            TyKind::Alias(AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. }) => def_id
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id }, args, .. }) => def_id
                 .0
                 .predicates(self.db)
                 .iter_instantiated_copied(self.interner(), &args)
@@ -1098,7 +1098,7 @@ impl<'db> InferenceContext<'db> {
     /// `None`.
     fn deduce_future_output_from_projection(
         &self,
-        predicate: PolyProjectionPredicate<'db>,
+        predicate: PolyProjectionClause<'db>,
     ) -> Option<Ty<'db>> {
         debug!("deduce_future_output_from_projection(predicate={:?})", predicate);
 

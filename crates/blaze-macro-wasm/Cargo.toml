@@ -24,6 +24,7 @@ target-lexicon = "0.13"
 wasmtime = { version = "49", default-features = false, features = ["cranelift", "parallel-compilation", "runtime", "std"] }
 
 base-db.workspace = true
+blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-expand.workspace = true
 blaze-ids.workspace = true

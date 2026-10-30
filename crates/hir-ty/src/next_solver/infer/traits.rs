@@ -19,7 +19,7 @@ use tracing::debug;
 use crate::{
     Span,
     next_solver::{
-        Clause, DbInterner, Goal, ParamEnv, PolyTraitPredicate, Predicate, TraitPredicate,
+        Clause, DbInterner, Goal, ParamEnv, PolyTraitClause, Predicate, TraitClause,
         TraitRef, Ty,
     },
 };
@@ -74,6 +74,8 @@ pub struct Obligation<'db, T> {
     /// If this goes over a certain threshold, we abort compilation --
     /// in such cases, we can not say whether or not the predicate
     /// holds for certain. Stupid halting problem; such a drag.
+    #[type_foldable(identity)]
+    #[type_visitable(ignore)]
     pub recursion_depth: usize,
 }
 
@@ -106,7 +108,7 @@ impl<'db> Elaboratable<DbInterner<'db>> for PredicateObligation<'db> {
         &self,
         clause: Clause<'db>,
         span: Span,
-        _parent_trait_pred: PolyTraitPredicate<'db>,
+        _parent_trait_pred: PolyTraitClause<'db>,
         _index: usize,
     ) -> Self {
         let cause = ObligationCause::new(span);
@@ -153,7 +155,7 @@ impl<'db, P> From<Obligation<'db, P>> for Goal<'db, P> {
 }
 
 pub(crate) type PredicateObligation<'db> = Obligation<'db, Predicate<'db>>;
-pub(crate) type TraitObligation<'db> = Obligation<'db, TraitPredicate<'db>>;
+pub(crate) type TraitObligation<'db> = Obligation<'db, TraitClause<'db>>;
 
 pub(crate) type PredicateObligations<'db> = Vec<PredicateObligation<'db>>;
 

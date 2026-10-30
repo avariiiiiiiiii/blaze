@@ -21,14 +21,17 @@ use syntax::{
     ast::{self, HasGenericArgs, HasGenericParams, HasName, HasTypeBounds},
 };
 
-use super::walk::{Container, Item};
+use super::{
+    Krate,
+    walk::{Container, Item},
+};
 use crate::{
     cx::Cx,
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
 
-pub(super) fn type_alias(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
+pub(super) fn type_alias(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
     let ast::Item::TypeAlias(alias) = &item.node.value else { return Vec::new() };
     if !matches!(item.container, Container::Module) {
         return Vec::new();
@@ -41,7 +44,7 @@ pub(super) fn type_alias(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
         return Vec::new();
     }
     let ty = alias.ty();
-    let checked = super::feature(cx, "checked_type_aliases")
+    let checked = krate.checked_type_aliases
         || ty.as_ref().is_some_and(|it| it.syntax().descendants().any(|it| ast::ImplTraitType::can_cast(it.kind())));
     if checked {
         return Vec::new();
@@ -157,9 +160,8 @@ fn shorthand_qselves(cx: &Cx<'_, '_>, ty: &SyntaxNode) -> Vec<TextRange> {
 }
 
 /// `drop_bounds` of an item's bounds, then `dyn_drop` of its `dyn Drop` types.
-pub(super) fn drop(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
-    let Some(drop) = hir_def::lang_item::lang_items(cx.db, cx.krate.into()).Drop else { return Vec::new() };
-    let Some(needs_drop) = super::core_path(cx, "mem", "needs_drop") else { return Vec::new() };
+pub(super) fn drop(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
+    let Some(drop) = krate.drop else { return Vec::new() };
     let is_drop = |path: Option<ast::Path>| {
         path.and_then(|it| cx.sema.resolve_path(&it)).is_some_and(|it| {
             matches!(it, PathResolution::Def(ModuleDef::Trait(t)) if hir_def::TraitId::from(t) == drop)
@@ -175,7 +177,11 @@ pub(super) fn drop(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
             if !is_drop(bound_path(&bound.value)) {
                 continue;
             }
-            let clause = format!("{bounded}: Drop");
+            let Some(needs_drop) = krate.needs_drop(cx) else { continue };
+            let clause = match bounded {
+                Some(node) => format!("{}: Drop", node.text()),
+                None => "Self: Drop".to_owned(),
+            };
             let message = format!(
                 "bounds on `{clause}` are most likely incorrect, consider instead using `{needs_drop}` to detect whether a type can be trivially dropped"
             );
@@ -189,6 +195,7 @@ pub(super) fn drop(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
             if !is_drop(bound_path(&bound)) {
                 continue;
             }
+            let Some(needs_drop) = krate.needs_drop(cx) else { continue };
             let message = format!(
                 "types that do not implement `Drop` can still have drop glue, consider instead using `{needs_drop}` to detect whether a type is trivially dropped"
             );
@@ -201,10 +208,10 @@ pub(super) fn drop(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
     found
 }
 
-/// An item's explicit trait bounds, each with the type it bounds as rustc prints the clause:
-/// its parameters' bounds, its `where` clause's, a trait's supertraits (`Self`), and its
-/// `impl Trait` parameters; in that order.
-fn clauses(item: &InFile<ast::Item>) -> Vec<(String, InFile<ast::TypeBound>)> {
+/// An item's explicit trait bounds, each with the node whose text is the type it bounds as
+/// rustc prints the clause (`None`: `Self`), read only for a lint: its parameters' bounds, its
+/// `where` clause's, a trait's supertraits, and its `impl Trait` parameters; in that order.
+fn clauses(item: &InFile<ast::Item>) -> Vec<(Option<SyntaxNode>, InFile<ast::TypeBound>)> {
     let mut found = Vec::new();
     let node = item.value.syntax();
     let params = node.children().find_map(ast::GenericParamList::cast);
@@ -213,27 +220,28 @@ fn clauses(item: &InFile<ast::Item>) -> Vec<(String, InFile<ast::TypeBound>)> {
             && let Some(name) = param.name()
         {
             for bound in param.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-                found.push((name.text().to_string(), item.with_value(bound)));
+                found.push((Some(name.syntax().clone()), item.with_value(bound)));
             }
         }
     }
     if let ast::Item::Trait(it) = &item.value {
         for bound in it.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-            found.push(("Self".to_owned(), item.with_value(bound)));
+            found.push((None, item.with_value(bound)));
         }
     }
     let clause = node.children().find_map(ast::WhereClause::cast);
     for pred in clause.iter().flat_map(|it| it.predicates()) {
         let Some(ty) = pred.ty() else { continue };
         for bound in pred.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-            found.push((ty.syntax().text().to_string(), item.with_value(bound)));
+            found.push((Some(ty.syntax().clone()), item.with_value(bound)));
         }
     }
     if let ast::Item::Fn(f) = &item.value {
         for ty in f.param_list().into_iter().flat_map(|it| it.params()).filter_map(|it| it.ty()) {
-            for apit in ty.syntax().descendants().filter_map(ast::ImplTraitType::cast) {
+            let apits = ty.syntax().descendants().filter(|it| ast::ImplTraitType::can_cast(it.kind()));
+            for apit in apits.filter_map(ast::ImplTraitType::cast) {
                 for bound in apit.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-                    found.push((apit.syntax().text().to_string(), item.with_value(bound)));
+                    found.push((Some(apit.syntax().clone()), item.with_value(bound)));
                 }
             }
         }

@@ -179,7 +179,8 @@ fn a_string_borrows_its_value_until_an_escape() {
             (value.into_owned(), borrowed)
         })
         .collect();
-    let values: Vec<(&str, bool)> = values.iter().map(|(it, borrowed)| (it.as_str(), *borrowed)).collect();
+    let values: Vec<(&str, bool)> =
+        values.iter().map(|(it, borrowed)| (it.as_str(), *borrowed)).collect();
     assert_eq!(values, [("plain {} é", true), ("a\nb", false), ("x\\y", false), ("raw", true)]);
 }
 

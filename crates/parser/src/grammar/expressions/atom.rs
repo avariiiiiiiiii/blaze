@@ -112,30 +112,7 @@ pub(super) fn atom_expr(
         T![continue] => continue_expr(p),
         T![break] => break_expr(p, r),
 
-        LIFETIME_IDENT if la == T![:] => {
-            let m = p.start();
-            label(p);
-            match p.current() {
-                T![loop] => loop_expr(p, Some(m)),
-                T![for] => for_expr(p, Some(m)),
-                T![while] => while_expr(p, Some(m)),
-                // test labeled_block
-                // fn f() { 'label: {}; }
-                T!['{'] => {
-                    stmt_list(p);
-                    m.complete(p, BLOCK_EXPR)
-                }
-                _ => {
-                    // test_err misplaced_label_err
-                    // fn main() {
-                    //     'loop: impl
-                    // }
-                    p.error("expected a loop or block");
-                    m.complete(p, ERROR);
-                    return None;
-                }
-            }
-        }
+        LIFETIME_IDENT if la == T![:] => labeled_expr(p)?,
         // test effect_blocks
         // fn f() { unsafe { } }
         // fn f() { const { } }
@@ -691,6 +668,33 @@ fn label(p: &mut Parser<'_>) {
     m.complete(p, LABEL);
 }
 
+/// A loop or block after a label (rustc's `parse_expr_labeled`); `None` after the error when
+/// neither follows.
+fn labeled_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
+    let m = p.start();
+    label(p);
+    Some(match p.current() {
+        T![loop] => loop_expr(p, Some(m)),
+        T![for] => for_expr(p, Some(m)),
+        T![while] => while_expr(p, Some(m)),
+        // test labeled_block
+        // fn f() { 'label: {}; }
+        T!['{'] => {
+            stmt_list(p);
+            m.complete(p, BLOCK_EXPR)
+        }
+        _ => {
+            // test_err misplaced_label_err
+            // fn main() {
+            //     'loop: impl
+            // }
+            p.error("expected a loop or block");
+            m.complete(p, ERROR);
+            return None;
+        }
+    })
+}
+
 // test loop_expr
 // fn foo() {
 //     loop {};
@@ -1007,6 +1011,16 @@ fn break_expr(p: &mut Parser<'_>, r: Restrictions) -> CompletedMarker {
     assert!(p.at(T![break]));
     let m = p.start();
     p.bump(T![break]);
+    // rustc's `parse_expr_break`: `break 'a: loop {}` breaks with the labeled loop as its value,
+    // and the error ends where the value does.
+    if p.at(LIFETIME_IDENT) && p.nth(1) == T![:] && !p.nth_at(1, T![::]) {
+        if labeled_expr(p).is_some() {
+            p.error(
+                "parentheses are required around this expression to avoid confusion with a labeled break expression",
+            );
+        }
+        return m.complete(p, BREAK_EXPR);
+    }
     if p.at(LIFETIME_IDENT) {
         lifetime(p);
     }

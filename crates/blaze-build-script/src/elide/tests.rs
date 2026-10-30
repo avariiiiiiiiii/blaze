@@ -639,7 +639,8 @@ fn on_demand_elision_says_what_the_whole_list_said() {
         "#![allow(x)]\n",
         "\u{feff}",
     ];
-    let mains = ["fn main() {", "fn main(){\n", "pub fn main() {", "fn main() -> () {", "fn main ( ) {"];
+    let mains =
+        ["fn main() {", "fn main(){\n", "pub fn main() {", "fn main() -> () {", "fn main ( ) {"];
     let statements = [
         "\n    println!(\"cargo:rustc-cfg=a\");",
         "\n    print!(\"cargo:x={}\\n\", 1);",

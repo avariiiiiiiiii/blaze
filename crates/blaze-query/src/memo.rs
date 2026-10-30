@@ -564,6 +564,13 @@ impl Store {
             .sum()
     }
 
+    /// How many memos let go of are not freed yet.
+    #[cfg(test)]
+    pub(crate) fn dying(&self) -> usize {
+        let dying = self.dying.lock();
+        dying.unlinked.len() + dying.held.len() + dying.checked.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn segments(&self) -> (usize, usize, usize) {
         (self.edges.count(), self.bytes.count(), self.keys.count())

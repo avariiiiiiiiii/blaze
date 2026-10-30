@@ -37,12 +37,12 @@ pub mod tally;
 
 use std::{
     any::Any,
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 
 use base_db::{Env, SourceDatabase};
-use blaze_cas::Store;
+use blaze_cas::Reader;
 use blaze_core::Traced;
 use blaze_ids::ContentId;
 use blaze_usercode::{
@@ -92,9 +92,10 @@ impl Mode {
 
 /// Where expansions are kept, and what they are keyed by besides their call.
 pub struct Expansions {
-    /// Read to find an expansion, never written by one: what an expansion keeps goes to its
-    /// worker's buffer ([`take_puts`]), which the store's owner [`publish`]es.
-    pub store: Arc<RwLock<Store>>,
+    /// Read to find an expansion, with no lock, under a guard taken for that read alone;
+    /// never written by one: what an expansion keeps goes to its worker's buffer
+    /// ([`take_puts`]), which the store's owner [`publish`]es.
+    pub store: Reader,
     /// The toolchain whose proc-macro ABI and library the macros are built with.
     pub toolchain: ContentId,
     /// What warm servers pass through to the expansions, which they are checked against.
@@ -457,8 +458,8 @@ impl Kept {
             none: inputs::Env::default(),
         };
         let found = {
-            let store = installed.expansions.store.read().unwrap_or_else(|it| it.into_inner());
-            match index::find(&store, &run, &mut now) {
+            let guard = blaze_cas::enter();
+            match index::find(&installed.expansions.store, &guard, &run, &mut now) {
                 // Read in place, under the guard: a hit copies nothing out of the store.
                 Ok(Found::Hit { value, .. }) if installed.mode == Mode::Keep => {
                     read(value, &spans).map(Lookup::Read).map_err(|why| self.error(why))

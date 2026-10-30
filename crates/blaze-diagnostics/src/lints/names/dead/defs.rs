@@ -3,6 +3,10 @@
 //! free and foreign items of each module in the order `check_mod_deathness` visits them, each
 //! definition's parent (`local_parent`), and the owners in `hir_crate_items` order.
 //!
+//! One walk of the crate's syntax numbers every definition with a dense `u32`; the rest of the
+//! pass indexes columns and bitsets by it. A definition's children are one CSR list, its name the
+//! interned `Name` its signature has, and what each impl is of is resolved once here.
+//!
 //! Follows `compiler/rustc_middle/src/hir/map.rs` (`ItemCollector`),
 //! `compiler/rustc_middle/src/hir/mod.rs` (`hir_crate_items`, `hir_module_items`) and
 //! `compiler/rustc_builtin_macros/src/deriving/` (where a derive puts its impl)
@@ -12,20 +16,48 @@ use std::ops::ControlFlow;
 
 use blaze_ids::radix;
 use cfg::CfgExpr;
-use hir::{HirFileId, InFile, ModuleSource};
+use hir::{HirFileId, InFile, ModuleSource, Name};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, ConstId, EnumVariantId, FieldId, FunctionId, HasModule, ImplId,
     StaticId, TraitId, TypeAliasId, builtin_derive::BuiltinDeriveImplTrait,
 };
+use intern::sym;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr,
-    ast::{self, HasAttrs, HasModuleItem, HasName},
+    ast::{self, HasModuleItem},
 };
 
 use crate::cx::Cx;
 
-pub(super) type DefIdx = usize;
+/// A definition's dense number, its index in [`Defs`].
+pub(super) type DefIdx = u32;
+
+/// A set of definitions: one bit each, `len / 8` bytes, O(1) test and insert.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Bits(Vec<u64>);
+
+impl Bits {
+    pub(super) fn new(len: usize) -> Bits {
+        Bits(vec![0; len.div_ceil(64)])
+    }
+
+    #[inline]
+    pub(super) fn get(&self, at: DefIdx) -> bool {
+        (self.0[at as usize / 64] >> (at % 64)) & 1 != 0
+    }
+
+    /// Adds `at`, returning whether it was not in the set.
+    #[inline]
+    pub(super) fn insert(&mut self, at: DefIdx) -> bool {
+        let word = &mut self.0[at as usize / 64];
+        let bit = 1u64 << (at % 64);
+        let new = *word & bit == 0;
+        *word |= bit;
+        new
+    }
+}
 
 /// What a definition is, by the front end's ids. A `use` has none and is its node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -68,6 +100,8 @@ pub(super) enum Kind {
     Use,
 }
 
+const _: () = assert!(size_of::<Kind>() == 2);
+
 impl Kind {
     /// rustc's `def_descr`.
     pub(super) fn descr(self) -> &'static str {
@@ -92,6 +126,14 @@ impl Kind {
             Kind::Use => "import",
         }
     }
+
+    /// The same kind of associated item: functions, methods or not, are one.
+    fn same_assoc(self, other: Kind) -> bool {
+        match (self, other) {
+            (Kind::AssocFn { .. }, Kind::AssocFn { .. }) => true,
+            _ => self == other,
+        }
+    }
 }
 
 /// rustc's `local_parent` of a definition, as far as liveness asks: the module, a definition,
@@ -103,19 +145,41 @@ pub(super) enum Parent {
     Anon(InFile<SyntaxNodePtr>),
 }
 
+/// One definition: no heap data of its own (its children are a range of [`Defs`]'s list).
 #[derive(Debug)]
 pub(super) struct Def {
     pub(super) id: Id,
     pub(super) kind: Kind,
     /// Its node; none for what a builtin derive makes.
     pub(super) node: Option<InFile<SyntaxNodePtr>>,
-    /// rustc's `opt_item_name`: none for an impl or a `use`.
-    pub(super) name: Option<String>,
+    /// rustc's `opt_item_name`: none for an impl or a `use`; a positional field's is its index.
+    pub(super) name: Option<Name>,
     pub(super) parent: Parent,
-    /// A trait's or an impl's associated items, an enum's variants, a struct's, a union's or a
-    /// variant's fields, in order.
-    pub(super) children: Vec<DefIdx>,
     pub(super) foreign: bool,
+}
+
+impl Def {
+    /// A positional field: `0`, `1`.
+    pub(super) fn is_positional(&self) -> bool {
+        self.name.as_ref().is_some_and(|it| it.as_tuple_index().is_some())
+    }
+
+    /// Its name starts with `_`.
+    pub(super) fn is_underscore(&self) -> bool {
+        self.name.as_ref().is_some_and(|it| it.as_str().starts_with('_'))
+    }
+}
+
+/// What an impl is of, resolved once: each part the pass's definition when it is local.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ImplOf {
+    pub(super) def: DefIdx,
+    pub(super) trait_: Option<DefIdx>,
+    /// Its self type, when it is an ADT (rustc's `ty::Adt`), not behind a reference or in
+    /// another type.
+    pub(super) self_adt: Option<DefIdx>,
+    /// The principal trait of its self type, when it is a `dyn`.
+    pub(super) self_dyn: Option<DefIdx>,
 }
 
 /// A module's items, as `hir_module_items` has them.
@@ -129,11 +193,18 @@ pub(super) struct ModuleItems {
 pub(super) struct Defs {
     pub(super) defs: Vec<Def>,
     ids: FxHashMap<Id, DefIdx>,
+    /// CSR: the children of definition `d` (a trait's or an impl's associated items, an enum's
+    /// variants, a struct's, a union's or a variant's fields, in order) are
+    /// `child_list[child_at[d]..child_at[d + 1]]`.
+    child_at: Vec<u32>,
+    child_list: Vec<DefIdx>,
+    /// Every impl and builtin derive's impl, in definition order.
+    impls: Vec<ImplOf>,
     /// In `crate::checks::modules` order.
     pub(super) modules: Vec<ModuleItems>,
     pub(super) module_ids: Vec<hir::Module>,
     /// The index in `modules` of the module each definition is in.
-    pub(super) module_of: Vec<usize>,
+    pub(super) module_of: Vec<u32>,
     /// `hir_crate_items(()).owners()`: free items, trait items, impl items, foreign items.
     pub(super) owners: Vec<DefIdx>,
     /// What is live is not known: a `global_asm!` names an item in a `sym` or `const` operand
@@ -148,6 +219,7 @@ impl Defs {
             cx,
             defs: Vec::new(),
             ids: FxHashMap::default(),
+            edges: Vec::new(),
             modules: Vec::new(),
             module_of: Vec::new(),
             trait_items: Vec::new(),
@@ -159,42 +231,73 @@ impl Defs {
             unported: false,
         };
         let module_ids = crate::checks::modules(cx);
+        walk.modules.reserve_exact(module_ids.len());
         for &module in &module_ids {
             walk.modules.push(ModuleItems::default());
             let source = module.definition_source(cx.db);
             let file = source.file_id;
             let root = cx.sema.parse_or_expand(file);
-            let list: Vec<ast::Item> = match &source.value {
+            let items = match &source.value {
                 ModuleSource::SourceFile(it) => {
-                    let ptr = SyntaxNodePtr::new(it.syntax());
-                    ast::SourceFile::cast(ptr.to_node(&root)).map(|it| it.items().collect()).unwrap_or_default()
+                    ast::SourceFile::cast(SyntaxNodePtr::new(it.syntax()).to_node(&root)).map(|it| it.items())
                 }
-                ModuleSource::Module(it) => {
-                    let ptr = SyntaxNodePtr::new(it.syntax());
-                    ast::Module::cast(ptr.to_node(&root))
-                        .and_then(|it| it.item_list())
-                        .map(|it| it.items().collect())
-                        .unwrap_or_default()
-                }
+                ModuleSource::Module(it) => ast::Module::cast(SyntaxNodePtr::new(it.syntax()).to_node(&root))
+                    .and_then(|it| it.item_list())
+                    .map(|it| it.items()),
                 ModuleSource::BlockExpr(_) => continue,
             };
-            for item in list {
+            for item in items.into_iter().flatten() {
                 walk.item(InFile::new(file, item), Container::Module, Parent::Module);
             }
         }
+        let (child_at, child_list) = csr(walk.defs.len(), &walk.edges);
         let mut owners = walk.free_owners;
         owners.extend(walk.trait_items);
         owners.extend(walk.impl_items);
         owners.extend(walk.foreign_owners);
-        Defs {
+        let mut defs = Defs {
             defs: walk.defs,
             ids: walk.ids,
+            child_at,
+            child_list,
+            impls: Vec::new(),
             modules: walk.modules,
             module_ids,
             module_of: walk.module_of,
             owners,
             unported: walk.unported,
+        };
+        defs.impls = defs.resolve_impls(cx);
+        defs
+    }
+
+    /// What each impl's trait and self type are, one query each.
+    fn resolve_impls(&self, cx: &Cx<'_, '_>) -> Vec<ImplOf> {
+        let db = cx.db;
+        let mut impls = Vec::new();
+        for def in self.all() {
+            let of = match self[def].id {
+                Id::Impl(id) => {
+                    let impl_ = hir::Impl::from(id);
+                    let self_ty = impl_.self_ty(db);
+                    ImplOf {
+                        def,
+                        trait_: impl_.trait_(db).and_then(|it| self.get(Id::Trait(it.into()))),
+                        self_adt: self_ty.as_adt().and_then(|it| self.get(Id::Adt(AdtId::from(it)))),
+                        self_dyn: self_ty.as_dyn_trait().and_then(|it| self.get(Id::Trait(it.into()))),
+                    }
+                }
+                Id::Derive(id) => ImplOf {
+                    def,
+                    trait_: None,
+                    self_adt: self.get(Id::Adt(id.loc(db).adt)),
+                    self_dyn: None,
+                },
+                _ => continue,
+            };
+            impls.push(of);
         }
+        impls
     }
 
     pub(super) fn get(&self, id: Id) -> Option<DefIdx> {
@@ -204,13 +307,66 @@ impl Defs {
     pub(super) fn len(&self) -> usize {
         self.defs.len()
     }
+
+    /// Every definition, in order.
+    pub(super) fn all(&self) -> std::ops::Range<DefIdx> {
+        0..self.defs.len() as DefIdx
+    }
+
+    pub(super) fn children(&self, def: DefIdx) -> &[DefIdx] {
+        let at = def as usize;
+        &self.child_list[self.child_at[at] as usize..self.child_at[at + 1] as usize]
+    }
+
+    /// Every impl, in definition order.
+    pub(super) fn impls(&self) -> &[ImplOf] {
+        &self.impls
+    }
+
+    /// What the impl `def` is of, by a binary search of the impls.
+    pub(super) fn impl_of(&self, def: DefIdx) -> Option<&ImplOf> {
+        let at = self.impls.binary_search_by_key(&def, |it| it.def).ok()?;
+        Some(&self.impls[at])
+    }
+
+    /// The item of the local trait that `def`, an item of a trait impl, implements.
+    pub(super) fn trait_item_of(&self, def: DefIdx) -> Option<DefIdx> {
+        let Parent::Def(impl_) = self[def].parent else { return None };
+        let trait_ = self.impl_of(impl_)?.trait_?;
+        let (name, kind) = (self[def].name.as_ref()?, self[def].kind);
+        self.children(trait_)
+            .iter()
+            .copied()
+            .find(|&it| self[it].kind.same_assoc(kind) && self[it].name.as_ref() == Some(name))
+    }
 }
 
 impl std::ops::Index<DefIdx> for Defs {
     type Output = Def;
+    #[inline]
     fn index(&self, index: DefIdx) -> &Def {
-        &self.defs[index]
+        &self.defs[index as usize]
     }
+}
+
+/// The CSR of `edges` (owner, child), each owner's children in the order they were added: a
+/// counting sort by owner, two passes.
+fn csr(len: usize, edges: &[(DefIdx, DefIdx)]) -> (Vec<u32>, Vec<DefIdx>) {
+    let mut at = vec![0u32; len + 1];
+    for &(owner, _) in edges {
+        at[owner as usize + 1] += 1;
+    }
+    for i in 0..len {
+        at[i + 1] += at[i];
+    }
+    let mut next: Vec<u32> = at[..len].to_vec();
+    let mut list = vec![0; edges.len()];
+    for &(owner, child) in edges {
+        let slot = &mut next[owner as usize];
+        list[*slot as usize] = child;
+        *slot += 1;
+    }
+    (at, list)
 }
 
 /// What an item is an item of.
@@ -226,21 +382,23 @@ struct Walk<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     defs: Vec<Def>,
     ids: FxHashMap<Id, DefIdx>,
+    /// (owner, child), in the order the children are met.
+    edges: Vec<(DefIdx, DefIdx)>,
     modules: Vec<ModuleItems>,
-    module_of: Vec<usize>,
+    module_of: Vec<u32>,
     free_owners: Vec<DefIdx>,
     trait_items: Vec<DefIdx>,
     impl_items: Vec<DefIdx>,
     foreign_owners: Vec<DefIdx>,
     /// The builtin derives of each ADT, of the scopes read so far.
-    derives: FxHashMap<AdtId, Vec<BuiltinDeriveImplId>>,
+    derives: FxHashMap<AdtId, SmallVec<[BuiltinDeriveImplId; 4]>>,
     scopes: FxHashSet<hir_def::ModuleId>,
     unported: bool,
 }
 
 impl Walk<'_, '_, '_> {
     fn item(&mut self, item: InFile<ast::Item>, container: Container, parent: Parent) {
-        if !enabled(self.cx, &item.value) {
+        if !enabled(self.cx, item.value.syntax()) {
             return;
         }
         if let ast::Item::MacroCall(call) = &item.value {
@@ -256,7 +414,7 @@ impl Walk<'_, '_, '_> {
             return;
         }
         if let ast::Item::MacroDef(it) = &item.value
-            && it.visibility().is_some()
+            && ast::HasVisibility::visibility(it).is_some()
         {
             self.unported = true;
         }
@@ -282,7 +440,9 @@ impl Walk<'_, '_, '_> {
                         _ => inner,
                     };
                     for it in child.children() {
-                        self.list_node(file, &it, container, item_parent);
+                        if let Some(item) = ast::Item::cast(it) {
+                            self.item(InFile::new(file, item), container, item_parent);
+                        }
                     }
                 }
                 _ => self.node(file, &child, inner),
@@ -290,45 +450,34 @@ impl Walk<'_, '_, '_> {
         }
     }
 
-    /// An item of the associated item list of a trait or an impl, or of an `extern` block.
-    fn list_node(&mut self, file: HirFileId, node: &SyntaxNode, container: Container, parent: Parent) {
-        if let Some(it) = ast::AnyHasAttrs::cast(node.clone())
-            && !enabled(self.cx, &it)
-        {
-            return;
-        }
-        if let Some(item) = ast::Item::cast(node.clone()) {
-            self.item(InFile::new(file, item), container, parent);
-        }
-    }
-
     /// What a macro call or an attribute macro of an item expands to, in place of it.
     fn expansion(&mut self, root: InFile<SyntaxNode>, container: Container, parent: Parent) {
         for child in root.value.children() {
-            if let Some(item) = ast::Item::cast(child.clone())
-                && is_item(&child)
+            if is_item(&child)
+                && let Some(item) = ast::Item::cast(child)
             {
                 self.item(root.with_value(item), container, parent);
             }
         }
     }
 
-    /// `node`, inside the item whose nested items have `parent`.
+    /// `node`, inside the item whose nested items have `parent`: dispatched on its kind, so that
+    /// a node that is no item, macro call or anonymous definition costs its children's walk.
     fn node(&mut self, file: HirFileId, node: &SyntaxNode, parent: Parent) {
-        if let Some(it) = ast::AnyHasAttrs::cast(node.clone())
-            && !enabled(self.cx, &it)
-        {
+        let kind = node.kind();
+        if ast::AnyHasAttrs::can_cast(kind) && !enabled(self.cx, node) {
             return;
         }
         if is_item(node) {
-            if let Some(item) = ast::Item::cast(node.clone()) {
-                self.item(InFile::new(file, item), Container::Module, parent);
-            } else if node.kind() == SyntaxKind::ASM_EXPR {
+            if kind == SyntaxKind::ASM_EXPR {
                 self.global_asm(node);
+            } else if let Some(item) = ast::Item::cast(node.clone()) {
+                self.item(InFile::new(file, item), Container::Module, parent);
             }
             return;
         }
-        if let Some(call) = ast::MacroCall::cast(node.clone()) {
+        if kind == SyntaxKind::MACRO_CALL {
+            let Some(call) = ast::MacroCall::cast(node.clone()) else { return };
             let Some(expansion) = self.expand(InFile::new(file, &call)) else { return };
             match expansion.value.kind() {
                 SyntaxKind::MACRO_ITEMS | SyntaxKind::MACRO_STMTS => {
@@ -345,7 +494,7 @@ impl Walk<'_, '_, '_> {
             false => parent,
         };
         for child in node.children() {
-            self.node(file, &child, parent);
+            stdx::ensure_sufficient_stack(|| self.node(file, &child, parent));
         }
     }
 
@@ -361,10 +510,10 @@ impl Walk<'_, '_, '_> {
     }
 
     fn push(&mut self, def: Def) -> DefIdx {
-        let index = self.defs.len();
+        let index = DefIdx::try_from(self.defs.len()).expect("fewer than 2^32 definitions in a crate");
         self.ids.insert(def.id, index);
         self.defs.push(def);
-        self.module_of.push(self.modules.len() - 1);
+        self.module_of.push((self.modules.len() - 1) as u32);
         index
     }
 
@@ -379,8 +528,7 @@ impl Walk<'_, '_, '_> {
             Container::Trait(it) | Container::Impl(it) => Parent::Def(it),
             Container::Module | Container::Extern => parent,
         };
-        let name = |it: &dyn HasName| it.name().map(|it| it.text().trim_start_matches("r#").to_owned());
-        let def = |id, kind, name| Def { id, kind, node, name, parent, children: Vec::new(), foreign };
+        let def = |id, kind, name| Def { id, kind, node, name, parent, foreign };
         let (def, adt) = match &item.value {
             ast::Item::Fn(it) => {
                 let function = cx.sema.to_def2(item.with_value(it))?;
@@ -389,42 +537,46 @@ impl Walk<'_, '_, '_> {
                     true => Kind::AssocFn { method: function.has_self_param(db) },
                     false => Kind::Fn,
                 };
-                (def(Id::Fn(id), kind, name(it)), None)
+                (def(Id::Fn(id), kind, Some(function.name(db))), None)
             }
             ast::Item::Const(it) => {
-                let id = ConstId::from(cx.sema.to_def2(item.with_value(it))?);
+                let konst = cx.sema.to_def2(item.with_value(it))?;
                 let kind = if assoc { Kind::AssocConst } else { Kind::Const };
-                (def(Id::Const(id), kind, Some(name(it).unwrap_or_else(|| "_".to_owned()))), None)
+                let name = konst.name(db).unwrap_or_else(|| Name::new_symbol_root(sym::underscore));
+                (def(Id::Const(ConstId::from(konst)), kind, Some(name)), None)
             }
             ast::Item::Static(it) => {
-                let id = StaticId::from(cx.sema.to_def2(item.with_value(it))?);
-                (def(Id::Static(id), Kind::Static, name(it)), None)
+                let it = cx.sema.to_def2(item.with_value(it))?;
+                (def(Id::Static(StaticId::from(it)), Kind::Static, Some(it.name(db))), None)
             }
             ast::Item::Struct(it) => {
-                let id = AdtId::StructId(cx.sema.to_def2(item.with_value(it))?.into());
-                (def(Id::Adt(id), Kind::Struct, name(it)), Some(id))
+                let it = cx.sema.to_def2(item.with_value(it))?;
+                let id = AdtId::StructId(it.into());
+                (def(Id::Adt(id), Kind::Struct, Some(it.name(db))), Some(id))
             }
             ast::Item::Union(it) => {
-                let id = AdtId::UnionId(cx.sema.to_def2(item.with_value(it))?.into());
-                (def(Id::Adt(id), Kind::Union, name(it)), Some(id))
+                let it = cx.sema.to_def2(item.with_value(it))?;
+                let id = AdtId::UnionId(it.into());
+                (def(Id::Adt(id), Kind::Union, Some(it.name(db))), Some(id))
             }
             ast::Item::Enum(it) => {
-                let id = AdtId::EnumId(cx.sema.to_def2(item.with_value(it))?.into());
-                (def(Id::Adt(id), Kind::Enum, name(it)), Some(id))
+                let it = cx.sema.to_def2(item.with_value(it))?;
+                let id = AdtId::EnumId(it.into());
+                (def(Id::Adt(id), Kind::Enum, Some(it.name(db))), Some(id))
             }
             ast::Item::Trait(it) => {
-                let id = TraitId::from(cx.sema.to_def2(item.with_value(it))?);
                 let kind = if it.eq_token().is_some() { Kind::TraitAlias } else { Kind::Trait };
-                (def(Id::Trait(id), kind, name(it)), None)
+                let it = cx.sema.to_def2(item.with_value(it))?;
+                (def(Id::Trait(TraitId::from(it)), kind, Some(it.name(db))), None)
             }
             ast::Item::TypeAlias(it) => {
-                let id = TypeAliasId::from(cx.sema.to_def2(item.with_value(it))?);
+                let it = cx.sema.to_def2(item.with_value(it))?;
                 let kind = match (assoc, foreign) {
                     (true, _) => Kind::AssocTy,
                     (_, true) => Kind::ForeignTy,
                     _ => Kind::TyAlias,
                 };
-                (def(Id::Alias(id), kind, name(it)), None)
+                (def(Id::Alias(TypeAliasId::from(it)), kind, Some(it.name(db))), None)
             }
             ast::Item::Impl(it) => {
                 let id = ImplId::try_from(cx.sema.to_def2(item.with_value(it))?).ok()?;
@@ -438,12 +590,13 @@ impl Walk<'_, '_, '_> {
         };
         let index = self.push(def);
         match container {
-            Container::Trait(owner) | Container::Impl(owner) => {
-                self.defs[owner].children.push(index);
-                match container {
-                    Container::Trait(_) => self.trait_items.push(index),
-                    _ => self.impl_items.push(index),
-                }
+            Container::Trait(owner) => {
+                self.edges.push((owner, index));
+                self.trait_items.push(index);
+            }
+            Container::Impl(owner) => {
+                self.edges.push((owner, index));
+                self.impl_items.push(index);
             }
             Container::Extern => {
                 self.foreign_owners.push(index);
@@ -470,8 +623,9 @@ impl Walk<'_, '_, '_> {
             ast::Item::Struct(it) => it.field_list(),
             ast::Item::Union(it) => it.record_field_list().map(ast::FieldList::RecordFieldList),
             ast::Item::Enum(it) => {
+                let db = self.cx.db;
                 for variant in it.variant_list().into_iter().flat_map(|it| it.variants()) {
-                    if !enabled(self.cx, &variant) {
+                    if !enabled(self.cx, variant.syntax()) {
                         continue;
                     }
                     let Some(id) = self.cx.sema.to_def2(item.with_value(&variant)) else { continue };
@@ -479,12 +633,11 @@ impl Walk<'_, '_, '_> {
                         id: Id::Variant(id.into()),
                         kind: Kind::Variant,
                         node: Some(item.with_value(SyntaxNodePtr::new(variant.syntax()))),
-                        name: variant.name().map(|it| it.text().trim_start_matches("r#").to_owned()),
+                        name: Some(id.name(db)),
                         parent: Parent::Def(adt),
-                        children: Vec::new(),
                         foreign: false,
                     });
-                    self.defs[adt].children.push(index);
+                    self.edges.push((adt, index));
                     self.fields(item.file_id, variant.field_list(), index);
                 }
                 return;
@@ -495,40 +648,38 @@ impl Walk<'_, '_, '_> {
     }
 
     fn fields(&mut self, file: HirFileId, list: Option<ast::FieldList>, owner: DefIdx) {
-        let nodes: Vec<SyntaxNode> = match list {
-            Some(ast::FieldList::RecordFieldList(it)) => it.fields().map(|it| it.syntax().clone()).collect(),
-            Some(ast::FieldList::TupleFieldList(it)) => it.fields().map(|it| it.syntax().clone()).collect(),
-            None => return,
-        };
-        let db = self.cx.db;
-        for node in nodes {
-            let field = if let Some(it) = ast::RecordField::cast(node.clone()) {
-                if !enabled(self.cx, &it) {
-                    continue;
+        match list {
+            Some(ast::FieldList::RecordFieldList(it)) => {
+                for field in it.fields() {
+                    if enabled(self.cx, field.syntax()) {
+                        let def = self.cx.sema.to_def2(InFile::new(file, &field));
+                        self.field(file, field.syntax(), def, owner);
+                    }
                 }
-                self.cx.sema.to_def2(InFile::new(file, &it))
-            } else if let Some(it) = ast::TupleField::cast(node.clone()) {
-                if !enabled(self.cx, &it) {
-                    continue;
+            }
+            Some(ast::FieldList::TupleFieldList(it)) => {
+                for field in it.fields() {
+                    if enabled(self.cx, field.syntax()) {
+                        let def = self.cx.sema.to_def2(InFile::new(file, &field));
+                        self.field(file, field.syntax(), def, owner);
+                    }
                 }
-                self.cx.sema.to_def2(InFile::new(file, &it))
-            } else {
-                None
-            };
-            let Some(field) = field else { continue };
-            let id = FieldId::from(field);
-            let name = field.name(db).as_str().trim_start_matches("r#").to_owned();
-            let index = self.push(Def {
-                id: Id::Field(id),
-                kind: Kind::Field,
-                node: Some(InFile::new(file, SyntaxNodePtr::new(&node))),
-                name: Some(name),
-                parent: Parent::Def(owner),
-                children: Vec::new(),
-                foreign: false,
-            });
-            self.defs[owner].children.push(index);
+            }
+            None => {}
         }
+    }
+
+    fn field(&mut self, file: HirFileId, node: &SyntaxNode, field: Option<hir::Field>, owner: DefIdx) {
+        let Some(field) = field else { return };
+        let index = self.push(Def {
+            id: Id::Field(FieldId::from(field)),
+            kind: Kind::Field,
+            node: Some(InFile::new(file, SyntaxNodePtr::new(node))),
+            name: Some(field.name(self.cx.db)),
+            parent: Parent::Def(owner),
+            foreign: false,
+        });
+        self.edges.push((owner, index));
     }
 
     /// The impls the builtin derives of `adt` make, after it, and their methods.
@@ -541,8 +692,8 @@ impl Walk<'_, '_, '_> {
                 self.derives.entry(derive.loc(db).adt).or_default().push(derive);
             }
         }
-        let Some(mut derives) = self.derives.get(&adt).cloned() else { return };
-        radix::sort_by_key(&mut derives, |it| {
+        let Some(mut derives) = self.derives.remove(&adt) else { return };
+        radix::sort_by_key(&mut derives[..], |it| {
             let loc = it.loc(db);
             radix::pack_32(loc.derive_attr_id.item_tree_index(), loc.derive_index)
         });
@@ -554,7 +705,6 @@ impl Walk<'_, '_, '_> {
                 node: None,
                 name: None,
                 parent,
-                children: Vec::new(),
                 foreign: false,
             });
             self.free_owners.push(index);
@@ -564,12 +714,11 @@ impl Walk<'_, '_, '_> {
                     id: Id::DeriveMethod(derive),
                     kind: Kind::AssocFn { method: !matches!(trait_, BuiltinDeriveImplTrait::Default) },
                     node: None,
-                    name: Some(method.name().as_str().to_owned()),
+                    name: Some(method.name()),
                     parent: Parent::Def(index),
-                    children: Vec::new(),
                     foreign: false,
                 });
-                self.defs[index].children.push(method);
+                self.edges.push((index, method));
                 self.impl_items.push(method);
             }
         }
@@ -585,7 +734,7 @@ fn is_item(node: &SyntaxNode) -> bool {
             node.parent().map(|it| it.kind()),
             Some(SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST | SyntaxKind::MACRO_ITEMS)
         ),
-        _ => ast::Item::can_cast(node.kind()),
+        kind => ast::Item::can_cast(kind),
     }
 }
 
@@ -598,7 +747,7 @@ pub(super) fn is_anon(node: &SyntaxNode) -> bool {
         SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node.clone()).is_some_and(|it| {
             it.const_token().is_some() || it.async_token().is_some() || it.gen_token().is_some()
         }),
-        _ if !ast::Expr::can_cast(node.kind()) => false,
+        kind if !ast::Expr::can_cast(kind) => false,
         _ => match node.parent() {
             Some(parent) => match parent.kind() {
                 SyntaxKind::CONST_ARG | SyntaxKind::VARIANT => true,
@@ -619,14 +768,17 @@ pub(super) fn anon_of(node: &InFile<SyntaxNode>) -> Option<InFile<SyntaxNodePtr>
     Some(node.with_value(SyntaxNodePtr::new(&found)))
 }
 
-/// Whether the `cfg`s of `owner` keep it, its `cfg_attr`s expanded.
-fn enabled<N: HasAttrs>(cx: &Cx<'_, '_>, owner: &N) -> bool {
-    if owner.attrs().next().is_none() {
+/// Whether the `cfg`s of `node`, an attribute owner, keep it, its `cfg_attr`s expanded. A node's
+/// attributes are its first children, so one without an attribute first has none and costs one
+/// step.
+fn enabled(cx: &Cx<'_, '_>, node: &SyntaxNode) -> bool {
+    if node.first_child().is_none_or(|it| it.kind() != SyntaxKind::ATTR) {
         return true;
     }
+    let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { return true };
     let cfg = cx.krate.cfg(cx.db);
     let off = hir_expand::attrs::expand_cfg_attr(
-        owner.attrs(),
+        ast::HasAttrs::attrs(&owner),
         || cfg,
         |meta, _| {
             if let ast::Meta::CfgMeta(meta) = meta

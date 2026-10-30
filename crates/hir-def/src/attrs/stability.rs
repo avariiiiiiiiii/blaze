@@ -16,16 +16,17 @@
 use std::{num::NonZero, ops::ControlFlow, sync::LazyLock};
 
 use base_db::{Crate, CrateOrigin, SourceDatabase};
-use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr};
+use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr, name::Name};
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use smallvec::SmallVec;
-use span::ErasedFileAstId;
-use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, T, ast};
-
-use super::{
-    AttrFlags, attr_value, attrs_source, collect_attrs_in, for_each_field, is_one, name_text,
+use span::{AstIdNode, ErasedFileAstId};
+use syntax::{
+    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, T,
+    ast::{self, HasAttrs},
 };
+
+use super::{AttrFlags, attr_value, attrs_source, collect_attrs_in, for_each_field, is_one};
 use crate::{
     AdtId, AssocItemId, AttrDefId, BlockIdLt, FieldId, HasModule, ItemContainerId, ModuleDefId,
     ModuleId, ModuleIdLt, VariantId,
@@ -119,9 +120,9 @@ impl Deprecation {
         match self.since {
             DeprecatedSince::RustcVersion(since) => since <= current,
             DeprecatedSince::Future => false,
-            DeprecatedSince::NonStandard(_) | DeprecatedSince::Unspecified | DeprecatedSince::Err => {
-                true
-            }
+            DeprecatedSince::NonStandard(_)
+            | DeprecatedSince::Unspecified
+            | DeprecatedSince::Err => true,
         }
     }
 }
@@ -206,7 +207,10 @@ static FORCE_UNSTABLE: LazyLock<Stability> = LazyLock::new(|| Stability {
 /// `lookup_deprecation_entry(def)`: its own `#[deprecated]`, else the one of the definition
 /// it is in. rustc's `inherit_deprecation` holds for every definition here (only generic
 /// parameters don't inherit).
-pub fn deprecation_entry(db: &dyn SourceDatabase, def: StabilityDef) -> Option<DeprecationEntry<'_>> {
+pub fn deprecation_entry(
+    db: &dyn SourceDatabase,
+    def: StabilityDef,
+) -> Option<DeprecationEntry<'_>> {
     let origin = deprecation_from(db, def)?;
     Some(DeprecationEntry { deprecation: own(db, origin)?.deprecation.as_ref()?, origin })
 }
@@ -225,26 +229,24 @@ pub fn stability(db: &dyn SourceDatabase, def: StabilityDef) -> Option<&Stabilit
 fn deprecation_from(db: &dyn SourceDatabase, def: StabilityDef) -> Option<StabilityDef> {
     return match def {
         StabilityDef::Def(def) => deprecation_origin(db, def),
-        StabilityDef::Field(field) => deprecation_or_parent(db, def, field.parent.into()),
+        StabilityDef::Field(field) => {
+            deprecation_or_parent(db, def, || Some(AttrDefId::from(field.parent).into()))
+        }
     };
 
     #[salsa::tracked(returns(copy))]
     fn deprecation_origin(db: &dyn SourceDatabase, def: AttrDefId) -> Option<StabilityDef> {
-        let parent = parent(db, def);
-        match parent {
-            Some(parent) => deprecation_or_parent(db, def.into(), parent),
-            None => own(db, def.into())?.deprecation.as_ref().map(|_| def.into()),
-        }
+        deprecation_or_parent(db, def.into(), || parent(db, def))
     }
 
     fn deprecation_or_parent(
         db: &dyn SourceDatabase,
         def: StabilityDef,
-        parent: StabilityDef,
+        parent: impl FnOnce() -> Option<StabilityDef>,
     ) -> Option<StabilityDef> {
         match own(db, def).and_then(|it| it.deprecation.as_ref()) {
             Some(_) => Some(def),
-            None => deprecation_from(db, parent),
+            None => deprecation_from(db, parent()?),
         }
     }
 }
@@ -261,21 +263,22 @@ fn stability_from(db: &dyn SourceDatabase, def: StabilityDef) -> Option<Stabilit
     return match def {
         StabilityDef::Def(def) => stability_origin(db, def),
         StabilityDef::Field(field) => {
-            stability_or_parent(db, def, field.parent.krate(db), Some(field.parent.into()), true)
+            let parent = || -> Option<StabilityDef> { Some(AttrDefId::from(field.parent).into()) };
+            stability_or_parent(db, def, field.parent.krate(db), parent, true)
         }
     };
 
     #[salsa::tracked(returns(copy))]
     fn stability_origin(db: &dyn SourceDatabase, def: AttrDefId) -> Option<StabilityFrom> {
         let inherits = matches!(def, AttrDefId::EnumVariantId(_));
-        stability_or_parent(db, def.into(), def.krate(db), parent(db, def), inherits)
+        stability_or_parent(db, def.into(), def.krate(db), || parent(db, def), inherits)
     }
 
     fn stability_or_parent(
         db: &dyn SourceDatabase,
         def: StabilityDef,
         krate: Crate,
-        parent: Option<StabilityDef>,
+        parent: impl FnOnce() -> Option<StabilityDef>,
         inherits: bool,
     ) -> Option<StabilityFrom> {
         if !UnstableFeatures::query(db, krate).staged_api {
@@ -286,7 +289,7 @@ fn stability_from(db: &dyn SourceDatabase, def: StabilityDef) -> Option<Stabilit
         if own(db, def).is_some_and(|it| it.stability.is_some()) {
             return Some(StabilityFrom::Own(def));
         }
-        let from = stability_from(db, parent?)?;
+        let from = stability_from(db, parent()?)?;
         let unstable = match from {
             StabilityFrom::Own(origin) => {
                 own(db, origin)?.stability.as_ref().is_some_and(Stability::is_unstable)
@@ -329,7 +332,7 @@ fn own(db: &dyn SourceDatabase, def: StabilityDef) -> Option<&Own> {
             if !AttrFlags::query_field(db, field).intersects(READ) {
                 return None;
             }
-            own_of_fields(db, field.parent).get(field.local_id.into_raw().into_u32() as usize)?
+            own_of_fields(db, field.parent).get(u32::from(field.local_id.into_raw()) as usize)?
         }
     };
     (own != NONE).then_some(own)
@@ -344,7 +347,7 @@ fn own_of_def(db: &dyn SourceDatabase, def: AttrDefId) -> Own {
         reader.read(&context, meta, |value| attr_value(db, def, krate, source.with_value(value)));
         ControlFlow::<()>::Continue(())
     });
-    reader.finish(&context)
+    reader.finish()
 }
 
 /// The own attributes of each field of `variant` its cfg leaves in, by `LocalFieldId`.
@@ -365,7 +368,7 @@ fn own_of_fields(db: &dyn SourceDatabase, variant: VariantId) -> Box<[Own]> {
                 ControlFlow::<()>::Continue(())
             },
         );
-        fields.push(reader.finish(&context));
+        fields.push(reader.finish());
     });
     fields.into_boxed_slice()
 }
@@ -399,12 +402,12 @@ impl Reader {
         &mut self,
         context: &Context,
         meta: ast::Meta,
-        value: impl FnOnce(ast::Expr) -> Option<Symbol>,
+        expand: impl FnOnce(ast::Expr) -> Option<Symbol>,
     ) {
         let Some(path) = meta.path() else { return };
         if is_one(&path, "deprecated") {
             if self.deprecation.is_none() {
-                self.deprecation = parse_deprecation(context, &meta, value);
+                self.deprecation = parse_deprecation(context, &meta, expand);
             }
         } else if is_one(&path, "stable") || is_one(&path, "unstable") {
             // A stability attribute outside a staged crate is an error, and gives nothing.
@@ -426,7 +429,7 @@ impl Reader {
         }
     }
 
-    fn finish(self, context: &Context) -> Own {
+    fn finish(self) -> Own {
         let Reader { deprecation, mut stability, allowed_through_unstable_modules } = self;
         if let Some(Stability {
             level: StabilityLevel::Stable { allowed_through_unstable_modules: through, .. },
@@ -435,22 +438,22 @@ impl Reader {
         {
             *through = allowed_through_unstable_modules;
         }
-        Own { deprecation, stability: stability.filter(|_| context.staged) }
+        Own { deprecation, stability }
     }
 }
 
 /// `DeprecationParser`: `#[deprecated]`, `#[deprecated = ".."]` or `#[deprecated(since =
-/// "..", note = "..", suggestion = "..")]`. `value` reads a key-value attribute's value, with
+/// "..", note = "..", suggestion = "..")]`. `expand` reads a key-value attribute's value, with
 /// its macros expanded.
 fn parse_deprecation(
     context: &Context,
     meta: &ast::Meta,
-    value: impl FnOnce(ast::Expr) -> Option<Symbol>,
+    expand: impl FnOnce(ast::Expr) -> Option<Symbol>,
 ) -> Option<Deprecation> {
     let (mut since, mut note, mut suggestion) = (None, None, None);
     match meta {
         ast::Meta::PathMeta(_) => {}
-        ast::Meta::KeyValueMeta(meta) => note = Some(value(meta.expr()?)?),
+        ast::Meta::KeyValueMeta(meta) => note = Some(expand(meta.expr()?)?),
         ast::Meta::TokenTreeMeta(meta) => {
             for (key, value) in items(&meta.token_tree()?)? {
                 let slot = match key_text(&key) {
@@ -471,9 +474,8 @@ fn parse_deprecation(
         Some(since) if since.as_str() == "CURRENT_RUSTC_VERSION" => {
             context.current.map_or(DeprecatedSince::Err, DeprecatedSince::RustcVersion)
         }
-        Some(since) => {
-            RustcVersion::parse(since.as_str()).map_or(DeprecatedSince::Err, DeprecatedSince::RustcVersion)
-        }
+        Some(since) => RustcVersion::parse(since.as_str())
+            .map_or(DeprecatedSince::Err, DeprecatedSince::RustcVersion),
         None if staged => DeprecatedSince::Err,
         None => DeprecatedSince::Unspecified,
     };
@@ -497,7 +499,9 @@ fn parse_stable(items: &Items) -> Option<Stability> {
     let feature = feature.filter(|it| is_ident(it.as_str()))?;
     let since = match since {
         Some(since) if since.as_str() == "CURRENT_RUSTC_VERSION" => StableSince::Current,
-        Some(since) => RustcVersion::parse(since.as_str()).map_or(StableSince::Err, StableSince::Version),
+        Some(since) => {
+            RustcVersion::parse(since.as_str()).map_or(StableSince::Err, StableSince::Version)
+        }
         None => StableSince::Err,
     };
     Some(Stability {
@@ -742,7 +746,7 @@ fn definition_at(
         _ => {
             let id = file.ast_id_map(db).ast_id(&ast::Item::cast(node.value.clone())?).erase();
             let scope = module.def_map(db).module(db, module).scope(db);
-            let in_items = |items: &[(_, AssocItemId)]| {
+            let in_items = |items: &[(Name, AssocItemId)]| -> Option<StabilityDef> {
                 items.iter().find_map(|&(_, item)| {
                     let found = match item {
                         AssocItemId::FunctionId(it) => same(it.lookup(db).id, file, id),
@@ -762,7 +766,7 @@ fn definition_at(
                     ModuleDefId::AdtId(AdtId::UnionId(it)) => same(it.lookup(db).id, file, id),
                     ModuleDefId::AdtId(AdtId::EnumId(it)) => same(it.lookup(db).id, file, id),
                     ModuleDefId::TraitId(it) => {
-                        if let Some(found) = in_items(&TraitItems::query(db, it).items) {
+                        if let Some(found) = in_items(&TraitItems::query(db, it).items[..]) {
                             return Some(found);
                         }
                         same(it.lookup(db).id, file, id)
@@ -789,7 +793,7 @@ fn definition_at(
                 if same(it.lookup(db).id, file, id) {
                     return Some(AttrDefId::ImplId(it).into());
                 }
-                if let Some(found) = in_items(&ImplItems::of(db, it).0.items) {
+                if let Some(found) = in_items(&ImplItems::of(db, it).0.items[..]) {
                     return Some(found);
                 }
             }
@@ -798,9 +802,6 @@ fn definition_at(
     }
 }
 
-fn same<N: syntax::AstNode>(id: AstId<N>, file: HirFileId, erased: ErasedFileAstId) -> bool
-where
-    N: span::AstIdNode,
-{
+fn same<N: AstIdNode>(id: AstId<N>, file: HirFileId, erased: ErasedFileAstId) -> bool {
     id.file_id == file && id.value.erase() == erased
 }

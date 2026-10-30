@@ -212,7 +212,12 @@ struct Scratch {
 /// What `format_args!` (with `println!`'s newline) makes of `args`, added to `out`. The
 /// format string is copied in runs between its braces, each argument written where the
 /// source has it, with nothing allocated but what `out` and `scratch` grow by.
-fn format(args: &[Token<'_>], newline: bool, out: &mut String, scratch: &mut Scratch) -> Option<()> {
+fn format(
+    args: &[Token<'_>],
+    newline: bool,
+    out: &mut String,
+    scratch: &mut Scratch,
+) -> Option<()> {
     let (spec, rest) = args.split_first()?;
     let spec: &str = match spec.kind {
         Kind::Str { escaped: false, escaped_brace: false } => &spec.text[1..spec.text.len() - 1],

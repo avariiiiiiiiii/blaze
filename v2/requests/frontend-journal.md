@@ -348,3 +348,61 @@ relists only those folders: 69 folders in 41 ms against 15-30 s for a sweep.
 and in `Display`: `Lost::Unnamed => "the journal said names in the directory changed but not which",`.
 The consumer (blaze-vfs) handles it as one `Entries` of the directory diffed against the tree.
 Until it lands, iocp writes `Lost::Unnamed` (so it builds only with it). Answer here with `>`.
+
+> applied: `Lost::Unnamed` after `Rescan` in `crates/blaze-core/src/journal.rs` with its doc and `Display` text as asked (core is DONE); the enum's doc now says an `Unnamed` directory is relisted alone. blaze-vfs does not read journal batches yet, so its handling is the consumer's.
+
+## frontend-text: declare `blaze_vfs::text` (file text read in place, frontend.md item 6)
+
+`crates/blaze-vfs/src/text.rs` is new (lane `frontend-text`): `text_of(Arc<[u8]>) ->
+Result<Arc<str>, Utf8Error>` checks a blob is UTF-8 and casts the tree's own `Arc` to
+`Arc<str>` (no copy), plus `Reader::text(root, path)` and `Vfs::text(view, path)`. It is an
+unsafe module (one cast, with its `SAFETY:`), so it needs the same `allow` as `store`.
+
+- File: `crates/blaze-vfs/src/lib.rs`
+- Old:
+  ```rust
+  //! Unsafe code is only in `store` (docs/v2/plan/design/unsafe.md), whose API is safe.
+
+  #![deny(unsafe_code)]
+
+  mod journal;
+  mod reader;
+  mod rebase;
+  #[allow(unsafe_code)]
+  mod store;
+  mod sync;
+  mod tree;
+  pub mod watch;
+  ```
+- New:
+  ```rust
+  //! Unsafe code is only in `store` and `text` (docs/v2/plan/design/unsafe.md), whose APIs
+  //! are safe.
+
+  #![deny(unsafe_code)]
+
+  mod journal;
+  mod reader;
+  mod rebase;
+  #[allow(unsafe_code)]
+  mod store;
+  mod sync;
+  #[allow(unsafe_code)]
+  mod text;
+  mod tree;
+  pub mod watch;
+  ```
+- And in the `pub use crate::{ ... }` list, add `text::text_of,`:
+  ```rust
+  pub use crate::{
+      reader::{Pinned, Reader},
+      text::text_of,
+      watch::{Watched, Watcher},
+  };
+  ```
+- Why: without it the module is not compiled; base-db's view hook (request in
+  `v2/requests/db.md`, "frontend-text: file text shares the VFS's bytes") calls
+  `blaze_vfs::text_of`. `text.rs` reads only `Vfs`'s private `tree` and `open_root` (a child
+  module sees them) and `Reader::file`, so nothing else in blaze-vfs changes.
+
+> applied: `#[allow(unsafe_code)] mod text;` before `mod tree;`, `text::text_of` in the `pub use`, and the crate doc names `store` and `text` (vfs is DONE). The module list had gained `disk` and `section` since the request; they stay.

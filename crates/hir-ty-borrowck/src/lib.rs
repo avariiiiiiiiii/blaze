@@ -482,17 +482,16 @@ fn inline_consts<'db>(
     db: &'db dyn HirDatabase,
     body: &MirBody<'db>,
 ) -> Vec<hir_ty::db::AnonConstId<'db>> {
-    use hir_ty::db::GeneralConstId;
-    use hir_ty::next_solver::ConstKind;
+    use hir_ty::next_solver::{AnonConstIdWrapper, ConstKind};
     use hir_ty_mir::mir::{OperandKind, Rvalue, StatementKind};
-    use rustc_type_ir::inherent::IntoKind;
+    use rustc_type_ir::{AliasConstKind, inherent::IntoKind};
     let mut out = Vec::new();
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(_, Rvalue::Use(operand)) = &statement.kind
                 && let OperandKind::Constant { konst, .. } = &operand.kind
-                && let ConstKind::Unevaluated(unevaluated) = konst.as_ref().kind()
-                && let GeneralConstId::AnonConstId(id) = unevaluated.def.0
+                && let ConstKind::Alias(_, unevaluated) = konst.as_ref().kind()
+                && let AliasConstKind::Anon { def_id: AnonConstIdWrapper(id) } = unevaluated.kind
                 && id.is_inline_const(db)
                 && !out.contains(&id)
             {

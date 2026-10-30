@@ -19,7 +19,7 @@ use crate::{
     db::HirDatabase,
     infer::{AllowTwoPhase, InferenceContext, expr::ExprIsRead},
     next_solver::{
-        BoundExistentialPredicates, ExistentialPredicate, ParamTy, Region, Ty, TyKind,
+        BoundExistentialPredicates, ExistentialPredicate, ParamTy, Region, RegionExt, Ty, TyKind,
         infer::traits::ObligationCause,
     },
 };

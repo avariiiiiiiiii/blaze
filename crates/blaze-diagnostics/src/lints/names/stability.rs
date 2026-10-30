@@ -13,7 +13,8 @@
 //!
 //! Cost: one walk of the crate's syntax checks every use as it comes to it (`walk.rs`); a
 //! use is a probe of the per-check index (`lookup.rs`) and stores nothing. Text (paths,
-//! messages) is made here, only for what is reported.
+//! messages) is made here, only for what is reported, and only what is reported is sorted
+//! into rustc's order.
 //!
 //! Follows `compiler/rustc_middle/src/middle/stability.rs` (`deprecation_message`,
 //! `deprecation_suggestion`, `early_report_macro_deprecation`, `eval_stability_allow_unstable`,
@@ -42,7 +43,7 @@ use crate::{
     cx::Cx,
     lints::syntax::source_fact,
     lower::{Found, Phase, mutable_ref_binding::BUILT_ON},
-    model::{Applicability, Diag},
+    model::{Applicability, Diag, Level, MultiSpan},
 };
 
 pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
@@ -88,6 +89,17 @@ fn deprecated_macro(cx: &Cx<'_, '_>, mac: hir::Macro, depr: &Deprecation, path: 
     diag.fact_opt(definition_fact(cx, Def::Item(ModuleDef::Macro(mac))), format!("the attributes of `{path}`"));
     source_fact(cx, &mut diag, site.at);
     Found::lint(diag, site.phase, site.at)
+}
+
+/// `contains_macro_use`'s warning of a `#[macro_escape]` at `range`, on the `mod` at `at`.
+fn macro_escape(cx: &Cx<'_, '_>, range: InFile<TextRange>, inner: bool, at: InFile<SyntaxNodePtr>) -> Found {
+    let mut diag = Diag::new(Level::Warning, None, "`#[macro_escape]` is a deprecated synonym for `#[macro_use]`");
+    diag.span = MultiSpan::of(cx.span(range));
+    if inner {
+        diag.help("try an outer attribute: `#[macro_use]`");
+    }
+    source_fact(cx, &mut diag, at);
+    Found::new(diag, Phase::Resolve)
 }
 
 /// `report_unstable` of a use of `def` (whose path, for the fact, is `path`).

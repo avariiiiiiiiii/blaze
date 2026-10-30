@@ -1,7 +1,7 @@
 //! Helper routines for higher-ranked things. See the `doc` module at
 //! the end of the file for details.
 
-use rustc_type_ir::{TypeFoldable, UniverseIndex};
+use rustc_type_ir::{TypeFoldable, TypeVisitableExt, UniverseIndex};
 use tracing::{debug, instrument};
 
 use crate::next_solver::fold::FnMutDelegate;
@@ -28,10 +28,11 @@ impl<'db> InferCtxt<'db> {
     #[instrument(level = "debug", skip(self), ret)]
     pub fn enter_forall_and_leak_universe<T>(&self, binder: Binder<'db, T>) -> T
     where
-        T: TypeFoldable<DbInterner<'db>> + Clone,
+        T: TypeFoldable<DbInterner<'db>>,
     {
-        if let Some(inner) = binder.clone().no_bound_vars() {
-            return inner;
+        // Inlined `no_bound_vars`.
+        if !binder.as_ref().skip_binder().has_escaping_bound_vars() {
+            return binder.skip_binder();
         }
 
         let next_universe = self.create_next_universe();
@@ -66,7 +67,7 @@ impl<'db> InferCtxt<'db> {
     #[instrument(level = "debug", skip(self, f))]
     pub fn enter_forall<T, U>(&self, forall: Binder<'db, T>, f: impl FnOnce(T) -> U) -> U
     where
-        T: TypeFoldable<DbInterner<'db>> + Clone,
+        T: TypeFoldable<DbInterner<'db>>,
     {
         // FIXME: currently we do nothing to prevent placeholders with the new universe being
         // used after exiting `f`. For example region subtyping can result in outlives constraints

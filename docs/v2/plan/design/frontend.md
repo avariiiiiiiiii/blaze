@@ -59,7 +59,14 @@ sense for the IDE and costs blaze, followed by what v2 does instead.
     files (lane cargo).
 14. **Item trees are rebuilt per file on any edit to the file.** v2 reparses only the items an
     edit touches (lane format's item reparse) and re-lowers only those items.
+15. **Every query goes through `&dyn HirDatabase`.** A virtual call per query blocks inlining,
+    so even a memo hit can't compile down to a few loads. v2's database is one concrete type,
+    passed as `&Db` everywhere, so query calls are static and a hit inlines.
+16. **A rowan-style handle API over the flat tree.** `SyntaxNode` handles with an `Arc` to the
+    tree, cloned per node, keep the old callers working. Callers move to the flat tree's index
+    API (`u32` node IDs, kind and range columns, CSR children), and the handle layer is
+    deleted.
 
 Each item has an owner: 1 to 3 and 11 go to db with items, 4 to 6 and 14 go to format with
 db's expansion, 7 to format with diagnostics, 8 to everyone, 9 and 10 to db with core, 12 to
-db, 13 to cargo. Lane `frontend` makes sure each is done, building what no lane has started.
+db, 13 to cargo, 15 to db with every front-end lane, 16 to format with every caller. Lane `frontend` makes sure each is done, building what no lane has started.

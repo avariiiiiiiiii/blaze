@@ -18,10 +18,10 @@
 //! [lattices]: https://en.wikipedia.org/wiki/Lattice_(order)
 
 use rustc_type_ir::{
-    AliasRelationDirection, Interner, TypeVisitableExt, Upcast, Variance,
+    Interner, IsRigid, Opaque, TypeVisitableExt, Upcast, Variance,
     inherent::IntoKind,
     relate::{
-        Relate, StructurallyRelateAliases, TypeRelation, VarianceDiagInfo,
+        Relate, TypeRelation, VarianceDiagInfo,
         combine::{
             PredicateEmittingRelation, combine_ty_args, super_combine_consts, super_combine_tys,
         },
@@ -31,8 +31,8 @@ use rustc_type_ir::{
 use crate::{
     Span,
     next_solver::{
-        AliasTy, Binder, Const, DbInterner, GenericArgs, Goal, ParamEnv, Predicate, PredicateKind,
-        Region, SolverDefId, Ty, TyKind,
+        AliasTy, Binder, Const, DbInterner, GenericArgs, Goal, ParamEnv, Predicate, Region,
+        SolverDefId, Ty, TyKind,
         infer::{
             InferCtxt, TypeTrace,
             relate::RelateResult,
@@ -167,9 +167,18 @@ impl<'db> TypeRelation<DbInterner<'db>> for LatticeOp<'_, 'db> {
                 Ok(v)
             }
 
+            (TyKind::Alias(IsRigid::No, _), _) | (_, TyKind::Alias(IsRigid::No, _)) => {
+                // If this turns out to be possible, either the caller should normalize
+                // the alias, or we should normalize the alias here, as the other
+                // relations do.
+                panic!(
+                    "it should not be possible to encounter unnormalized aliases in lattice relation: {a:?}, {b:?}"
+                );
+            }
+
             (
-                TyKind::Alias(AliasTy { kind: rustc_type_ir::Opaque { def_id: a_def_id }, .. }),
-                TyKind::Alias(AliasTy { kind: rustc_type_ir::Opaque { def_id: b_def_id }, .. }),
+                TyKind::Alias(_, AliasTy { kind: Opaque { def_id: a_def_id }, .. }),
+                TyKind::Alias(_, AliasTy { kind: Opaque { def_id: b_def_id }, .. }),
             ) if a_def_id == b_def_id => super_combine_tys(infcx, self, a, b),
 
             _ => super_combine_tys(infcx, self, a, b),
@@ -225,15 +234,19 @@ impl<'infcx, 'db> LatticeOp<'infcx, 'db> {
     // relates `v` to `a` first, which may help us to avoid unnecessary
     // type variable obligations. See caller for details.
     fn relate_bound(&mut self, v: Ty<'db>, a: Ty<'db>, b: Ty<'db>) -> RelateResult<'db, ()> {
-        let at = self.infcx.at(&self.trace.cause, self.param_env);
+        let (cause, param_env) = (&self.trace.cause, self.param_env);
         match self.kind {
             LatticeOpKind::Glb => {
-                self.obligations.extend(at.sub(v, a)?.into_obligations());
-                self.obligations.extend(at.sub(v, b)?.into_obligations());
+                self.obligations
+                    .extend(self.infcx.sub_raw(cause, param_env, v, a)?.into_obligations());
+                self.obligations
+                    .extend(self.infcx.sub_raw(cause, param_env, v, b)?.into_obligations());
             }
             LatticeOpKind::Lub => {
-                self.obligations.extend(at.sub(a, v)?.into_obligations());
-                self.obligations.extend(at.sub(b, v)?.into_obligations());
+                self.obligations
+                    .extend(self.infcx.sub_raw(cause, param_env, a, v)?.into_obligations());
+                self.obligations
+                    .extend(self.infcx.sub_raw(cause, param_env, b, v)?.into_obligations());
             }
         }
         Ok(())
@@ -243,10 +256,6 @@ impl<'infcx, 'db> LatticeOp<'infcx, 'db> {
 impl<'db> PredicateEmittingRelation<InferCtxt<'db>> for LatticeOp<'_, 'db> {
     fn span(&self) -> Span {
         self.trace.cause.span()
-    }
-
-    fn structurally_relate_aliases(&self) -> StructurallyRelateAliases {
-        StructurallyRelateAliases::No
     }
 
     fn param_env(&self) -> ParamEnv<'db> {
@@ -266,14 +275,5 @@ impl<'db> PredicateEmittingRelation<InferCtxt<'db>> for LatticeOp<'_, 'db> {
         self.obligations.extend(goals.into_iter().map(|goal| {
             Obligation::new(self.infcx.interner, self.trace.cause, goal.param_env, goal.predicate)
         }))
-    }
-
-    fn register_alias_relate_predicate(&mut self, a: Ty<'db>, b: Ty<'db>) {
-        self.register_predicates([Binder::dummy(PredicateKind::AliasRelate(
-            a.into(),
-            b.into(),
-            // FIXME(deferred_projection_equality): This isn't right, I think?
-            AliasRelationDirection::Equate,
-        ))]);
     }
 }

@@ -81,3 +81,13 @@ without its body, body)` has `f` as its only entry and no body, and for an `impl
 Status: open
 
 > forwarded to frontend-text (the file's owner).
+
+> frontend-text (2026-10-29): done in `crates/span/src/ast_id.rs`: `relative_to` calls the new
+> private `relative(node, relative, None)`; `relative_without(node, relative, elided)` skips
+> the elided node (no id, no body). One change from the text above: each end of a range is
+> moved on its own (`shift`), so a node holding the elided one (the item itself) keeps its
+> start and loses the elided length from its end; with the `moved` above, the item's entry
+> would keep its old length and not be found at its range in the relative tree. Tests:
+> `relative_without_a_fn_body`, `relative_without_an_impls_items`,
+> `relative_without_a_const_body` (the `;` after the body moves back),
+> `relative_to_is_relative_without_nothing`, each on an outline and a full parse.

@@ -71,7 +71,9 @@ impl<'a> Token<'a> {
     /// `None` for any other token.
     pub fn str_value(&self) -> Option<Cow<'a, str>> {
         match self.kind {
-            Kind::Str { escaped: false, .. } => Some(Cow::Borrowed(&self.text[1..self.text.len() - 1])),
+            Kind::Str { escaped: false, .. } => {
+                Some(Cow::Borrowed(&self.text[1..self.text.len() - 1]))
+            }
             Kind::Str { escaped: true, .. } => {
                 let mut value = String::with_capacity(self.text.len());
                 unescape_into(self.text, &mut value)?;
@@ -307,7 +309,9 @@ impl<'a> Lexer<'a> {
                     Kind::Punct(char::from(byte))
                 }
                 _ => {
-                    return Err(self.fail("a character outside literals and comments elision reads"));
+                    return Err(
+                        self.fail("a character outside literals and comments elision reads")
+                    );
                 }
             };
             return Ok(Some(Token { kind, text: &self.source[start..self.at] }));
@@ -543,7 +547,8 @@ impl<'a> Lexer<'a> {
             self.ident_rest();
             return Kind::Number;
         }
-        self.at += bytes[start..].iter().take_while(|it| it.is_ascii_digit() || **it == b'_').count();
+        self.at +=
+            bytes[start..].iter().take_while(|it| it.is_ascii_digit() || **it == b'_').count();
         let digits = &bytes[start..self.at];
         if class(bytes.get(self.at)) & START != 0 {
             self.ident_rest();

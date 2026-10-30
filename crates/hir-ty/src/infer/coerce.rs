@@ -46,7 +46,7 @@ use rustc_type_ir::{
     BoundVar, DebruijnIndex, InferTy, TyVid, TypeAndMut, TypeFoldable, TypeFolder,
     TypeSuperFoldable, TypeVisitableExt,
     error::TypeError,
-    inherent::{Const as _, GenericArg as _, GenericArgs as _, IntoKind, Safety as _, Ty as _},
+    inherent::{GenericArg as _, GenericArgs as _, IntoKind, Safety as _, Ty as _},
     solve::{Certainty, NoSolution},
 };
 use smallvec::SmallVec;
@@ -60,8 +60,8 @@ use crate::{
     next_solver::{
         Binder, BoundConst, BoundRegion, BoundRegionKind, BoundTy, BoundTyKind, CallableIdWrapper,
         Canonical, CoercePredicate, Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArgs,
-        Goal, ParamEnv, PolyFnSig, PredicateKind, Region, RegionKind, TraitRef, Ty, TyKind,
-        TypingMode,
+        Goal, ParamEnv, PolyFnSig, PredicateKind, Region, RegionExt, RegionKind, TraitRef, Ty,
+        TyKind, TypingMode,
         abi::Safety,
         infer::{
             DbInternerInferExt, InferCtxt, InferOk, InferResult,

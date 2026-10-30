@@ -8,11 +8,11 @@
 //! `ExternCVoidReturn`) (MIT or Apache-2.0).
 
 use hir::{InFile, ModuleDef, PathResolution};
-use hir_def::lang_item::lang_items;
 use rustc_abi::ExternAbi;
-use syntax::{AstNode, SyntaxNodePtr, TextRange, TextSize, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
 
 use super::{
+    Krate,
     externs::abi_of,
     walk::{Container, Item},
 };
@@ -24,11 +24,13 @@ use crate::{
 
 /// The lints of `item`'s own nodes, in the order rustc's visitor meets them: its `check_fn`,
 /// then the closures and `fn` pointer types in it.
-pub(super) fn item(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
-    let Some(c_void) = lang_items(cx.db, cx.krate.into()).CVoid else { return Vec::new() };
-    let c_void = hir::Enum::from(c_void);
+pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
+    let Some(c_void) = krate.c_void else { return Vec::new() };
     let mut found = Vec::new();
     for node in &item.nodes {
+        if !matches!(node.value.kind(), SyntaxKind::FN | SyntaxKind::CLOSURE_EXPR | SyntaxKind::FN_PTR_TYPE) {
+            continue;
+        }
         let at = node.as_ref().map(SyntaxNodePtr::new);
         if let Some(f) = ast::Fn::cast(node.value.clone()) {
             let extern_ = match item.container {

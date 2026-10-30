@@ -614,7 +614,12 @@ struct Entry<'i> {
 }
 
 impl<'i> Entry<'i> {
-    fn new(name: Cow<'i, OsStr>, value: Option<Cow<'i, OsStr>>, from_unit: bool, seq: usize) -> Self {
+    fn new(
+        name: Cow<'i, OsStr>,
+        value: Option<Cow<'i, OsStr>>,
+        from_unit: bool,
+        seq: usize,
+    ) -> Self {
         let bytes = name.as_encoded_bytes();
         let mut first = [0u8; 8];
         let len = bytes.len().min(8);

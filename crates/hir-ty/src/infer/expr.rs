@@ -32,7 +32,7 @@ use crate::{
     lower::lower_mutability,
     method_resolution::{self, CandidateId, MethodCallee, MethodError},
     next_solver::{
-        ClauseKind, FnSig, Ty, TyKind, TypeError,
+        ClauseKind, FnSig, IsRigid, Ty, TyKind, TypeError,
         infer::{
             BoundRegionConversionTime, InferOk,
             traits::{Obligation, ObligationCause},
@@ -802,6 +802,7 @@ impl<'db> InferenceContext<'db> {
                         let ty = this.structurally_resolve_type(expr.into(), ty);
                         match ty.kind() {
                             TyKind::FnDef(def, parameters) => {
+                                let parameters = parameters.no_bound_vars().unwrap();
                                 let fnptr_ty = Ty::new_fn_ptr(
                                     this.interner(),
                                     this.interner()
@@ -955,7 +956,12 @@ impl<'db> InferenceContext<'db> {
         self.table.register_bound(awaitee_ty, into_future, ObligationCause::new(expr));
         self.table.try_structurally_resolve_type(
             expr.into(),
-            Ty::new_projection(self.interner(), into_future_output.into(), [awaitee_ty]),
+            Ty::new_projection(
+                self.interner(),
+                IsRigid::No,
+                into_future_output.into(),
+                [awaitee_ty],
+            ),
         )
     }
 
@@ -1780,6 +1786,7 @@ impl<'db> InferenceContext<'db> {
         expected: &Expectation<'db>,
     ) -> Ty<'db> {
         if let TyKind::FnDef(def_id, args) = callee_ty.kind() {
+            let args = args.no_bound_vars().unwrap();
             let def_id = match def_id.0 {
                 CallableDefId::FunctionId(it) => it.into(),
                 CallableDefId::StructId(it) => it.into(),

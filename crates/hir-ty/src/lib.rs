@@ -78,8 +78,9 @@ use crate::{
     lower::SupertraitsInfo,
     next_solver::{
         AliasTy, Binder, BoundConst, BoundRegion, BoundRegionKind, BoundTy, BoundTyKind, Canonical,
-        CanonicalVarKind, CanonicalVarKinds, ClauseKind, Const, ConstKind, DbInterner, GenericArgs,
-        PolyFnSig, Region, RegionKind, TraitRef, Ty, TyKind, TypingMode,
+        CanonicalVarKind, CanonicalVarKinds, ClauseKind, Const, ConstExt, ConstKind, DbInterner,
+        GenericArgs, IsRigid, PolyFnSig, Region, RegionExt, RegionKind, TraitRef, Ty, TyKind,
+        TypingMode,
         abi::Safety,
         infer::{
             DbInternerInferExt,
@@ -177,7 +178,9 @@ pub struct StaticMemory {
     pub id: hir_def::StaticId,
 }
 
-impl<V> rustc_type_ir::GenericTypeVisitable<V> for StaticMemory {
+// SAFETY: visits every field: it has three, a start, a size and a `StaticId`, none of which
+// holds a type.
+unsafe impl<V> rustc_type_ir::GenericTypeVisitable<V> for StaticMemory {
     fn generic_visit_with(&self, _visitor: &mut V) {}
 }
 
@@ -347,7 +350,9 @@ impl std::fmt::Debug for MemoryPieces {
     }
 }
 
-impl<V> rustc_type_ir::GenericTypeVisitable<V> for MemoryPieces {
+// SAFETY: visits every field: its columns hold bytes, addresses and extents, none of which is
+// a type.
+unsafe impl<V> rustc_type_ir::GenericTypeVisitable<V> for MemoryPieces {
     fn generic_visit_with(&self, _visitor: &mut V) {}
 }
 
@@ -813,6 +818,7 @@ pub fn callable_sig_from_fn_trait<'db>(
     let output_assoc_type = lang_items.FnOnceOutput?;
     let output_projection = Ty::new_alias(
         interner,
+        IsRigid::No,
         AliasTy::new(
             interner,
             rustc_type_ir::Projection { def_id: output_assoc_type.into() },

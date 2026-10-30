@@ -6,12 +6,11 @@ use hir_def::TraitId;
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
     Interner,
-    solve::{BuiltinImplSource, CandidateSource, Certainty, inspect::ProbeKind},
+    solve::{BuiltinImplSource, CandidateSource, Certainty, ParamEnvSource, inspect::ProbeKind},
 };
 
 use crate::{
     Span,
-    db::InternedOpaqueTyId,
     next_solver::{
         AnyImplId, Const, ErrorGuaranteed, GenericArgs, Goal, TraitRef, Ty, TypeError,
         infer::{
@@ -37,10 +36,6 @@ pub enum SelectionError<'db> {
     NotConstEvaluatable(NotConstEvaluatable),
     /// Exceeded the recursion depth during type projection.
     Overflow(OverflowError),
-    /// Computing an opaque type's hidden type caused an error (e.g. a cycle error).
-    /// We can thus not know whether the hidden type implements an auto trait, so
-    /// we should not presume anything about it.
-    OpaqueTypeAutoTraitLeakageUnknown(InternedOpaqueTyId<'db>),
     /// Error for a `ConstArgHasType` goal
     ConstArgHasWrongType { ct: Const<'db>, ct_ty: Ty<'db>, expected_ty: Ty<'db> },
 }
@@ -301,7 +296,7 @@ impl<'db> ProofTreeVisitor<'db> for Select {
 
         // Don't winnow until `Certainty::Yes` -- we don't need to winnow until
         // codegen, and only on the good path.
-        if matches!(goal.result().unwrap(), Certainty::Maybe { .. }) {
+        if matches!(goal.result().unwrap(), Certainty::Maybe(_)) {
             return ControlFlow::Break(Ok(None));
         }
 
@@ -332,9 +327,9 @@ fn candidate_should_be_dropped_in_favor_of<'db>(
     victim: &InspectCandidate<'_, 'db>,
     other: &InspectCandidate<'_, 'db>,
 ) -> bool {
-    // Don't winnow until `Certainty::Yes` -- we don't need to winnow until
-    // codegen, and only on the good path.
-    if matches!(other.result().unwrap(), Certainty::Maybe { .. }) {
+    // Don't winnow until `Certainty::Yes` -- we don't need to winnow until constant evaluation or
+    // codegen.
+    if matches!(other.result().unwrap(), Certainty::Maybe(_)) {
         return false;
     }
 
@@ -374,24 +369,33 @@ fn candidate_should_be_dropped_in_favor_of<'db>(
             victim.goal().infcx().interner.impl_specializes(other_def_id, victim_def_id)
         }
 
+        // Prefer impl candidates over global where clause candidates. Unless `generic_const_args`
+        // is enabled, we currently don't use an empty environment when resolving and evaluating
+        // constants to lower them to patterns. If we don't drop where clause candidates here, we
+        // can fail to select impl candidates (#162331).
+        (
+            CandidateSource::ParamEnv(ParamEnvSource::Global),
+            CandidateSource::Impl(_) | CandidateSource::BuiltinImpl(_),
+        ) => true,
+
         _ => false,
     }
 }
 
 fn to_selection<'db>(span: Span, cand: InspectCandidate<'_, 'db>) -> Option<Selection<'db>> {
-    if let Certainty::Maybe { .. } = cand.shallow_certainty() {
+    if let Certainty::Maybe(_) = cand.shallow_certainty() {
         return None;
     }
 
     let nested = match cand.result().expect("expected positive result") {
         Certainty::Yes => Vec::new(),
-        Certainty::Maybe { .. } => cand
+        Certainty::Maybe(_) => cand
             .instantiate_nested_goals(span)
             .into_iter()
             .map(|nested| {
                 Obligation::new(
                     nested.infcx().interner,
-                    ObligationCause::dummy(),
+                    ObligationCause::new(span),
                     nested.goal().param_env,
                     nested.goal().predicate,
                 )

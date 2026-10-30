@@ -1580,7 +1580,7 @@ to `hir_def::deps::ImageStore`. Asked:
    differences in `hir_def::nameres::frozen::differences()`; the differential harness should
    run one build per day in that mode and fail on any difference.
 
-> forwarded to cargo-daemon (window `cargo-daemon-next1`, told by tmux).
+> forwarded to cargo (its child cargo-daemon has no window; the lead told by tmux).
 
 ## From cargo-daemon-units (2026-10-29, cargo-daemon-units-next1): `serve/unit*` on the split front end
 
@@ -1613,7 +1613,7 @@ exists, `impl Lowered` is still the old one):**
 .. }`, and `Error { message, seed }` fails as "blaze's MIR evaluator stopped: ..." then
 `seed: N`, never a pass, whatever the test's `#[should_panic]`.
 
-> forwarded to cargo-daemon-lower (`load-cargo/src/v2.rs`) and cargo-daemon (`blaze-cargo/Cargo.toml`), both told by tmux.
+> forwarded to cargo (cargo-daemon-lower for `load-cargo/src/v2.rs`, cargo-daemon for `blaze-cargo/Cargo.toml`; neither has a window, the lead told by tmux).
 
 ## frontend-activate: socket activation of `blaze serve`, and `blaze daemon install|uninstall` (restore.md, "The daemon starts on demand"; to cargo-cli and cargo-daemon, 2026-10-29)
 

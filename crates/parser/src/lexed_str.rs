@@ -53,8 +53,8 @@ const LONG: u32 = (1 << (32 - KIND_BITS)) - 1;
 const CHECKPOINT: usize = 16;
 const _: () = assert!((SyntaxKind::__LAST as u32) <= KIND_MASK, "a kind fits in KIND_BITS");
 
-/// The messages are mostly fixed text: only an unterminated literal's and an unknown prefix's
-/// are formatted, so a valid token allocates nothing.
+/// The messages are mostly fixed text: only an unterminated literal's, an unknown prefix's and
+/// a bad raw name's are formatted, so a valid token allocates nothing.
 struct LexError {
     msg: Cow<'static, str>,
     token: u32,
@@ -86,8 +86,9 @@ impl<'a> LexedStr<'a> {
 
         let bytes = text.as_bytes();
         let classes = FAST.then(|| scan::Classes::new(bytes));
-        // Lex from scratch at every token because `GuardedStrPrefix` is one token in the lexer
-        // but we want to split it to two in edition <2024.
+        // Lex from scratch at every token because some of `rustc_lexer`'s tokens are split as
+        // rustc splits them in older editions: `GuardedStrPrefix` before 2024, a C string and a
+        // raw lifetime before 2021.
         while conv.offset < text.len() {
             let fast = match &classes {
                 Some(classes) => scan::token(bytes, conv.offset, classes),
@@ -121,7 +122,8 @@ impl<'a> LexedStr<'a> {
         let mut conv = Converter::new(edition, text);
         conv.extend_token(&token.kind, text);
         match conv.res.tokens.len() {
-            1 => Some((conv.res.raw_kind(0), conv.res.error.pop().map(|it| it.msg.into_owned()))),
+            // An edition's split (`c"x"`, `'r#a` before 2021, `#"x"` before 2024) leaves text.
+            1 if conv.offset == text.len() => Some((conv.res.raw_kind(0), conv.res.error.pop().map(|it| it.msg.into_owned()))),
             _ => None,
         }
     }
@@ -243,23 +245,6 @@ impl<'a> Converter<'a> {
         }
     }
 
-    /// Check for likely unterminated string by analyzing STRING token content
-    fn has_likely_unterminated_string(&self) -> bool {
-        let mut end = self.offset;
-        for i in (0..self.res.tokens.len()).rev().take(5) {
-            let start = end - self.res.raw_len(i);
-            if self.res.raw_kind(i) == STRING {
-                let content = &self.res.text[start..end];
-
-                if content.contains('(') && (content.contains("//") || content.contains(";\n")) {
-                    return true;
-                }
-            }
-            end = start;
-        }
-        false
-    }
-
     fn finalize_with_eof(mut self) -> LexedStr<'a> {
         self.res.push(EOF, self.offset, 0);
         self.res
@@ -324,7 +309,13 @@ impl<'a> Converter<'a> {
                     IDENT
                 }
 
-                rustc_lexer::TokenKind::RawIdent => IDENT,
+                rustc_lexer::TokenKind::RawIdent => {
+                    let name = &token_text[2..];
+                    if !can_be_raw(name) {
+                        self.error(format!("`{name}` cannot be a raw identifier"));
+                    }
+                    IDENT
+                }
                 #[cfg(feature = "in-rust-tree")]
                 rustc_lexer::TokenKind::ForcedKeywordIdent => ERROR,
 
@@ -339,6 +330,22 @@ impl<'a> Converter<'a> {
                     POUND
                 }
 
+                // Before 2021 `c"…"` is the identifier `c` and then the string, `cr#"…"#` the
+                // identifier `cr` and then `#"…"#`.
+                rustc_lexer::TokenKind::Literal {
+                    kind: rustc_lexer::LiteralKind::CStr { .. },
+                    ..
+                } if !self.edition.at_least_2021() => {
+                    token_text = &token_text[..1];
+                    IDENT
+                }
+                rustc_lexer::TokenKind::Literal {
+                    kind: rustc_lexer::LiteralKind::RawCStr { .. },
+                    ..
+                } if !self.edition.at_least_2021() => {
+                    token_text = &token_text[..2];
+                    IDENT
+                }
                 rustc_lexer::TokenKind::Literal { kind, .. } => {
                     self.extend_literal(token_text.len(), kind);
                     return;
@@ -351,10 +358,27 @@ impl<'a> Converter<'a> {
                     LIFETIME_IDENT
                 }
                 rustc_lexer::TokenKind::UnknownPrefixLifetime => {
-                    self.error("Unknown lifetime prefix");
+                    if self.edition.at_least_2021() {
+                        self.error(format!("prefix `{token_text}` is unknown"));
+                    }
                     LIFETIME_IDENT
                 }
-                rustc_lexer::TokenKind::RawLifetime => LIFETIME_IDENT,
+                // Before 2021 `'r#a` is `'r`, `#` and `a`.
+                rustc_lexer::TokenKind::RawLifetime if !self.edition.at_least_2021() => {
+                    token_text = &token_text[..2];
+                    LIFETIME_IDENT
+                }
+                rustc_lexer::TokenKind::RawLifetime => {
+                    let end = self.offset + token_text.len();
+                    if self.res.text.as_bytes().get(end) == Some(&b'\'') {
+                        self.error("character literal may only contain one codepoint");
+                    }
+                    let name = &token_text[3..];
+                    if !can_be_raw(name) {
+                        self.error(format!("`{name}` cannot be a raw lifetime"));
+                    }
+                    LIFETIME_IDENT
+                }
 
                 rustc_lexer::TokenKind::Semi => T![;],
                 rustc_lexer::TokenKind::Comma => T![,],
@@ -385,15 +409,16 @@ impl<'a> Converter<'a> {
                 rustc_lexer::TokenKind::Percent => T![%],
                 rustc_lexer::TokenKind::Unknown => ERROR,
                 rustc_lexer::TokenKind::UnknownPrefix if token_text == "builtin" => IDENT,
+                // The prefix is the identifier it spells, keyword or not, in every edition.
                 rustc_lexer::TokenKind::UnknownPrefix => {
-                    if self.has_likely_unterminated_string() {
-                        self.error(format!(
-                            "unknown literal prefix `{token_text}` (note: check for unterminated string literal)"
-                        ));
-                    } else {
-                        self.error("unknown literal prefix");
+                    if self.edition.at_least_2021() {
+                        self.error(format!("prefix `{token_text}` is unknown"));
                     }
-                    IDENT
+                    if token_text == "_" {
+                        UNDERSCORE
+                    } else {
+                        SyntaxKind::from_keyword(token_text, self.edition).unwrap_or(IDENT)
+                    }
                 }
                 rustc_lexer::TokenKind::Eof => EOF,
             }
@@ -510,6 +535,11 @@ impl<'a> Converter<'a> {
 
         self.push(syntax_kind, len);
     }
+}
+
+/// rustc's `Symbol::can_be_raw`: not `_` and not a path segment keyword.
+fn can_be_raw(name: &str) -> bool {
+    !matches!(name, "" | "_" | "crate" | "self" | "Self" | "super")
 }
 
 fn err_to_msg(error: EscapeError, mode: Mode) -> &'static str {

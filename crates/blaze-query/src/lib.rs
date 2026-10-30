@@ -562,6 +562,9 @@ struct ViewState {
     reruns: Map<Rerun>,
 }
 
+const _: () = assert!(size_of::<table::Entry<MemoId>>() == 40);
+const _: () = assert!(size_of::<table::Entry<u64>>() == 48);
+
 impl ViewState {
     fn new(id: ViewId, view: View, config: Arc<[u8]>) -> ViewState {
         ViewState { id, view, config, results: Map::new(), inputs: Map::new(), reruns: Map::new() }
@@ -676,7 +679,7 @@ pub struct Database {
     limbo: ShortLock<Limbo>,
     /// Bumped by each collection; a key given a memo since one started is kept by it whole.
     generation: AtomicU64,
-    /// The generation each key was last given a memo in.
+    /// The generation each key was last given a memo in: 48 bytes of row a key.
     born: Map<u64>,
     store: Store,
     image: Option<ImageMap>,
@@ -1327,11 +1330,11 @@ impl Database {
         run: Run,
         typed: Option<&(dyn Any + Send + Sync)>,
     ) -> Result<Option<MemoId>, Cancelled> {
+        if let Some(&memo) = state.results.get(task, &key) {
+            return Ok(Some(memo));
+        }
         let Some(info) = self.kinds.get(&key.kind) else { return Ok(None) };
         loop {
-            if let Some(&memo) = state.results.get(task, &key) {
-                return Ok(Some(memo));
-            }
             let mut ran = None;
             self.single(key, run, || {
                 ran = Some(self.resolve_held(task, state, info, key, run, typed)?);
@@ -1339,6 +1342,9 @@ impl Database {
             })?;
             if let Some(found) = ran {
                 return Ok(found);
+            }
+            if let Some(&memo) = state.results.get(task, &key) {
+                return Ok(Some(memo));
             }
         }
     }

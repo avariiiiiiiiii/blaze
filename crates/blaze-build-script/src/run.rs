@@ -194,7 +194,9 @@ fn log_lines(stdout: &[u8]) -> impl Iterator<Item = (Severity, &[u8])> {
         };
         match line {
             [b':', rest @ ..] => match rest {
-                [b'e', b'r', b'r', b'o', b'r', b'=', message @ ..] => Some((Severity::Error, message)),
+                [b'e', b'r', b'r', b'o', b'r', b'=', message @ ..] => {
+                    Some((Severity::Error, message))
+                }
                 [b'w', b'a', b'r', b'n', b'i', b'n', b'g', b'=', message @ ..] => {
                     Some((Severity::Warning, message))
                 }
@@ -285,7 +287,8 @@ impl Ran {
     /// what was printed is read.
     pub fn finish(&self, unit: &Unit, cx: &Context<'_>) -> Result<Output, Failed> {
         refused(unit, self.status, &self.stdout, &self.stderr)?;
-        self.write(unit).map_err(|err| Failed { error: Error(err.to_string()), log_messages: Vec::new() })?;
+        self.write(unit)
+            .map_err(|err| Failed { error: Error(err.to_string()), log_messages: Vec::new() })?;
         output::parse(&self.stdout, cx).map_err(|error| Failed { error, log_messages: Vec::new() })
     }
 

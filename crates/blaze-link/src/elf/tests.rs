@@ -23,6 +23,7 @@ fn output(arch: blaze_codegen::Arch, kind: OutputKind, interpreter: Option<&str>
         live: None,
         tags: 0,
         stack: None,
+        windows_subsystem: false,
     }
 }
 
@@ -131,6 +132,7 @@ impl Fixture {
             debug: &self.debug,
             init: None,
             fini: None,
+            symbol: &|_| None,
         })
     }
 
@@ -168,24 +170,6 @@ impl Fixture {
     }
 }
 
-/// `bytes` copied to an 8-aligned start: the workspace's `object` reads ELF only from those.
-struct Aligned {
-    buffer: Vec<u8>,
-    start: usize,
-}
-
-fn aligned(bytes: &[u8]) -> Aligned {
-    let mut buffer = Vec::with_capacity(bytes.len() + 7);
-    let start = buffer.as_ptr().align_offset(8);
-    buffer.resize(start, 0);
-    buffer.extend_from_slice(bytes);
-    Aligned { buffer, start }
-}
-
-fn view(aligned: &Aligned, len: usize) -> &[u8] {
-    &aligned.buffer[aligned.start..aligned.start + len]
-}
-
 fn c_string(data: &[u8], at: u64) -> &str {
     let rest = &data[at as usize..];
     std::str::from_utf8(&rest[..rest.iter().position(|&it| it == 0).unwrap()]).unwrap()
@@ -211,6 +195,7 @@ fn import(name: &str, library: Option<u32>, version: Option<&str>, weak: bool) -
         version: version.map(str::to_owned),
         kind: SymbolKind::Function,
         weak,
+        wasm: None,
     }
 }
 
@@ -290,8 +275,7 @@ fn an_executable_reads_back() {
     image.debug = vec![(".debug_line", vec![1, 2, 3])];
 
     let bytes = image.link();
-    let words = aligned(&bytes);
-    let data_bytes = view(&words, bytes.len());
+    let data_bytes = &bytes[..];
     let file = ElfFile64::<Endianness>::parse(data_bytes).unwrap();
     let endian = file.endian();
     let header = file.elf_header();
@@ -465,8 +449,7 @@ fn a_shared_library_exports_through_its_hash_table() {
         .collect();
 
     let bytes = image.link();
-    let words = aligned(&bytes);
-    let data = view(&words, bytes.len());
+    let data = &bytes[..];
     let file = ElfFile64::<Endianness>::parse(data).unwrap();
     let endian = file.endian();
     assert_eq!(file.elf_header().e_machine(endian), elf::EM_AARCH64);
@@ -528,8 +511,7 @@ fn a_shared_librarys_initial_exec_cell_is_relocated_against_the_module() {
         image.tls = Some(Tls { addr: image.at(&Class::Tdata), init: 24, size: 24, align: 16 });
 
         let bytes = image.link();
-        let words = aligned(&bytes);
-        let data = view(&words, bytes.len());
+        let data = &bytes[..];
         let file = ElfFile64::<Endianness>::parse(data).unwrap();
         let endian = file.endian();
         let sections = file.elf_section_table();
@@ -840,8 +822,7 @@ fn many_exports_hash_as_the_model_does() {
     assert_eq!(versym.len(), 2 * (3 + names.len()));
     assert!(versym[6..].chunks(2).all(|it| it == elf::VER_NDX_GLOBAL.to_le_bytes()));
 
-    let words = aligned(&bytes);
-    let data = view(&words, bytes.len());
+    let data = &bytes[..];
     let file = ElfFile64::<Endianness>::parse(data).unwrap();
     let endian = file.endian();
     let sections = file.elf_section_table();
@@ -931,8 +912,7 @@ fn many_functions_are_named_in_the_symbol_table() {
     image.imports = vec![import("malloc", Some(0), None, false)];
     let bytes = image.link();
 
-    let words = aligned(&bytes);
-    let data = view(&words, bytes.len());
+    let data = &bytes[..];
     let file = ElfFile64::<Endianness>::parse(data).unwrap();
     let endian = file.endian();
     let sections = file.elf_section_table();

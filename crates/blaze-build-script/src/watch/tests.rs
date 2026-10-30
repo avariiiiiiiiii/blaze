@@ -84,7 +84,8 @@ fn kept_once_by_hash_as_by_scan() {
     };
     for _ in 0..2_000 {
         let len = next(3 * SCAN as u64) as usize;
-        let names: Vec<String> = (0..len).map(|_| format!("V{}", next(len as u64 / 2 + 1))).collect();
+        let names: Vec<String> =
+            (0..len).map(|_| format!("V{}", next(len as u64 / 2 + 1))).collect();
         let paths: Vec<String> = (0..len)
             .map(|_| match next(4) {
                 0 => format!("src/{}.rs", next(8)),
@@ -161,7 +162,8 @@ fn watched_in_the_output_as_from_the_parsed_output() {
             stdout.push_str(lines[next(lines.len())]);
             stdout.push('\n');
         }
-        let made = output::parse(stdout.as_bytes(), &cx).map(|it| watched(&it, Path::new("/p/foo")));
+        let made =
+            output::parse(stdout.as_bytes(), &cx).map(|it| watched(&it, Path::new("/p/foo")));
         let read = watched_in(stdout.as_bytes(), &cx, Path::new("/p/foo"));
         match (read, made) {
             (Ok(read), Ok(made)) => {

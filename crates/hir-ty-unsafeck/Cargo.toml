@@ -1,0 +1,40 @@
+[package]
+name = "hir-ty-unsafeck"
+version = "0.0.0"
+repository.workspace = true
+description = "rustc's unsafety checking (E0133 and its lints) over a body's expression store and inference."
+
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+either.workspace = true
+salsa.workspace = true
+
+rustc_type_ir.workspace = true
+
+# local deps
+base-db.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+span.workspace = true
+
+[dev-dependencies]
+# The tests' database, as `crates/hir-ty-ub/tests/ub/db.rs` builds one.
+hir-ide.workspace = true
+hir-expand.workspace = true
+syntax.workspace = true
+test-fixture.workspace = true
+test-utils.workspace = true
+triomphe.workspace = true
+
+[features]
+in-rust-tree = ["hir-ty/in-rust-tree"]
+
+[lints]
+workspace = true

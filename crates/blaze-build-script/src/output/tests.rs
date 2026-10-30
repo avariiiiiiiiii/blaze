@@ -452,11 +452,18 @@ fn a_key_is_found_exactly_by_its_name() {
         state ^= state >> 7;
         state ^= state << 17;
         let len = (state % 25) as usize;
-        names.push((0..len).map(|at| b"rustc-linkargbe"[(state >> (at % 60)) as usize % 15]).collect());
+        names.push(
+            (0..len).map(|at| b"rustc-linkargbe"[(state >> (at % 60)) as usize % 15]).collect(),
+        );
     }
     for name in &names {
         let found = Key::of(name);
-        assert_eq!(found.map(|it| it as usize), searched(name), "{:?}", String::from_utf8_lossy(name));
+        assert_eq!(
+            found.map(|it| it as usize),
+            searched(name),
+            "{:?}",
+            String::from_utf8_lossy(name)
+        );
         if let Some(key) = found {
             assert_eq!(key.name().as_bytes(), name.as_slice());
         }

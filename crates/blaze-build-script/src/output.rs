@@ -148,7 +148,8 @@ impl<'a> Sink<'a> for Collect<'_> {
         let out = &mut self.out;
         match directive {
             Directive::LinkSearch(it) => {
-                out.library_paths.push(LibraryPath::new(PathBuf::from(it.into_owned()), self.out_dir))
+                let path = PathBuf::from(it.into_owned());
+                out.library_paths.push(LibraryPath::new(path, self.out_dir))
             }
             Directive::LinkLib(it) => out.library_links.push(it.into_owned()),
             Directive::LinkArg(to, it) => out.linker_args.push((to, it.into_owned())),
@@ -158,7 +159,9 @@ impl<'a> Sink<'a> for Collect<'_> {
             Directive::Metadata(key, value) => {
                 out.metadata.push((key.into_owned(), value.into_owned()))
             }
-            Directive::RerunIfChanged(it) => out.rerun_if_changed.push(PathBuf::from(it.into_owned())),
+            Directive::RerunIfChanged(it) => {
+                out.rerun_if_changed.push(PathBuf::from(it.into_owned()))
+            }
             Directive::RerunIfEnvChanged(it) => out.rerun_if_env_changed.push(it.into_owned()),
             Directive::Log(severity, it) => out.log_messages.push((severity, it.into_owned())),
         }

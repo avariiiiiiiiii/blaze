@@ -187,10 +187,12 @@ mod tests {
                 &[]
             }
         }
-        match index::find(&store, &put.run, &mut Same) {
+        let (reader, guard) = (store.reader(), blaze_cas::enter());
+        match index::find(&reader, &guard, &put.run, &mut Same) {
             Ok(Found::Hit { value, .. }) => assert_eq!(value, b"out"),
             other => panic!("{other:?}"),
         }
+        drop(guard);
         let published = publish(&mut store, vec![one(b"other", "the expansion of `M` of /lib.so")]);
         assert_eq!(published.refused.len(), 1);
         assert!(published.refused[0].starts_with("the expansion of `M` of /lib.so: the store has another"));

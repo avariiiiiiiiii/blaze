@@ -353,7 +353,7 @@ instruction. For example:
 - **The corpus.** Whole programs run in proof's harness: request 4 asks for a backend axis in
   `harness/v2/corpus.py`, so every corpus program runs with the dev tier forced to the stencil
   backend and to Cranelift, and must give the same output, exit status and panics. The
-  coordinator runs it. In the crate, `tests/clif/` holds a corpus of functions in Cranelift's
+  coordinator runs it. In the crate, `src/tests/clif/` holds a corpus of functions in Cranelift's
   text format, parsed with `cranelift-reader`, shaped like what the IR builder makes
   (drop glue, `try_call` with cleanup pads, overflow-checked arithmetic, `match` as
   `br_table`, iterator loops, `i128` math, SIMD intrinsics). `tests/corpus.rs` runs each one

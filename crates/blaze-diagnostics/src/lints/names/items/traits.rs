@@ -9,6 +9,7 @@
 use syntax::{AstNode, NodeOrToken, TextRange, TextSize, ast};
 
 use super::{
+    Krate,
     visibility::{self, Effective},
     walk::{Container, Item},
 };
@@ -18,10 +19,10 @@ use crate::{
     model::{Applicability, Diag},
 };
 
-pub(super) fn async_fn(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<Found> {
+pub(super) fn async_fn(cx: &Cx<'_, '_>, item: &Item, effective: &Effective, krate: &Krate) -> Vec<Found> {
     let (ast::Item::Fn(f), Container::Trait(_)) = (&item.node.value, &item.container) else { return Vec::new() };
     let Some(async_token) = f.async_token() else { return Vec::new() };
-    if super::feature(cx, "return_type_notation") {
+    if krate.return_type_notation {
         return Vec::new();
     }
     if !visibility::def(cx, item).is_some_and(|it| effective.is_reachable(it)) {

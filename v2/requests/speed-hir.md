@@ -373,10 +373,10 @@ hold them. Status: scheduled by speed-hir-store (2026-10-29 18:50).
   `~/restart-2026-10-28/briefs/v2/speed-hir-store-srcmap.md`. That is format-hir's brief minus the
   forward maps, which are already `SourceTable`s. It covers the back maps as columns,
   `patterns_for_binding` as CSR, and the encoding in `persist/source_map.rs`.
-- stmts, then paths: they start once the consumer edits I filed for the column views have been
-  applied (`v2/requests/*.md`, "speed-hir-store"). Both change types every consumer reads
-  (`&[Statement]`, `Path`), and stacking a second migration on an unapplied one would make the
-  first set of edits wrong. srcmap keeps its accessors' signatures, so it can run now.
+- srcmap: DONE.
+- stmts and paths: started 19:22 as `speed-hir-store-stmts` and `speed-hir-store-paths`, from
+  your briefs adapted to the tree as it is now. Every consumer but hir-ty-mir is on the views,
+  and stmts writes hir-ty-mir's edits on top of the pending codegen request.
 
 > forwarded to speed-hir-store: it scheduled them, as its status says.
 

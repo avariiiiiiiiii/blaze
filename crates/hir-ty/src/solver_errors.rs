@@ -7,7 +7,7 @@
 
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
-    ClosureKind, Interner, PredicatePolarity,
+    ClausePolarity, ClosureKind, Interner,
     inherent::{GenericArgs as _, IntoKind, SliceLike},
     lang_items::SolverTraitLangItem,
 };
@@ -15,7 +15,7 @@ use rustc_type_ir::{
 use crate::{
     Span,
     next_solver::{
-        ClauseKind, DbInterner, PolyTraitPredicate, PredicateKind, StoredTraitRef, TraitPredicate,
+        ClauseKind, DbInterner, PolyTraitClause, PredicateKind, StoredTraitRef, TraitClause,
         TyKind,
         infer::{
             InferCtxt,
@@ -52,13 +52,13 @@ pub enum SolverDiagnosticKind {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
 pub struct StoredTraitPredicate {
     pub trait_ref: StoredTraitRef,
-    pub polarity: PredicatePolarity,
+    pub polarity: ClausePolarity,
 }
 
 impl StoredTraitPredicate {
     #[inline]
-    pub fn get<'db>(&'db self, interner: DbInterner<'db>) -> TraitPredicate<'db> {
-        TraitPredicate { polarity: self.polarity, trait_ref: self.trait_ref.get(interner) }
+    pub fn get<'db>(&'db self, interner: DbInterner<'db>) -> TraitClause<'db> {
+        TraitClause { polarity: self.polarity, trait_ref: self.trait_ref.get(interner) }
     }
 }
 
@@ -97,7 +97,7 @@ impl SolverDiagnostic {
 fn closure_kind_mismatch<'db>(
     infcx: &InferCtxt<'db>,
     error: &FulfillmentError<'db>,
-    trait_pred: PolyTraitPredicate<'db>,
+    trait_pred: PolyTraitClause<'db>,
 ) -> Option<SolverDiagnosticKind> {
     let interner = infcx.interner;
     let mut trait_pred = infcx.resolve_vars_if_possible(trait_pred);
@@ -155,7 +155,7 @@ fn closure_kind_mismatch<'db>(
 
 fn handle_trait_unimplemented<'db>(
     error: &FulfillmentError<'db>,
-    trait_pred: TraitPredicate<'db>,
+    trait_pred: TraitClause<'db>,
 ) -> Option<SolverDiagnosticKind> {
     let trait_predicate = StoredTraitPredicate {
         trait_ref: StoredTraitRef::new(trait_pred.trait_ref),

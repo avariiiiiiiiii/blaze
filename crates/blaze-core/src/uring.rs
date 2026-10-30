@@ -298,6 +298,7 @@ const _: () = assert!(size_of::<ProvidedBuf>() == 16);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code, reason = "made by the kernel, read through a pointer")]
 struct StatxTime {
     sec: i64,
     nsec: u32,
@@ -308,6 +309,7 @@ struct StatxTime {
 /// what a [`Stamp`] reads named.
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[allow(dead_code, reason = "made by the kernel, read through a pointer")]
 struct Statx {
     mask: u32,
     /// `stx_blksize`, `stx_attributes`, `stx_nlink`, `stx_uid` and `stx_gid`.
@@ -3006,8 +3008,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Address, Confined, FileName, Sandbox, Traced, Untraceable, run_until_idle,
-        threads::Threads,
+        Address, Confined, Cursor, FileName, Journaled, Lost, Sandbox, Traced, Untraceable,
+        run_until_idle, threads::Threads,
     };
 
     fn dir(name: &str) -> PathBuf {
@@ -3688,5 +3690,177 @@ mod tests {
         assert!(!root.join("out/file").exists());
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `files` files of 8 bytes in directories of 100 under `src`, one of them executable, and
+    /// a symlink to one and one to nothing; the names to stamp of it: every file, directories,
+    /// the links, and names with nothing there (one under a file).
+    fn sweep_tree(root: &Path, files: usize) -> Names {
+        let mut names = Names::default();
+        for n in 0..files {
+            if n % 100 == 0 {
+                std::fs::create_dir_all(root.join(format!("src/d{}", n / 100))).unwrap();
+            }
+            let name = format!("src/d{}/f{n}.rs", n / 100);
+            std::fs::write(root.join(&name), (n as u64).to_le_bytes()).unwrap();
+            assert!(names.push_str(&name));
+        }
+        std::os::unix::fs::symlink("d0/f0.rs", root.join("src/link")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("src/dangling")).unwrap();
+        crate::fs::set_mode(&root.join("src/d0/f1.rs"), 0o755).unwrap();
+        for name in GONE.iter().chain(&["src", "src/d0", "src/link", "src/dangling"]) {
+            assert!(names.push_str(name));
+        }
+        names
+    }
+
+    const GONE: [&str; 3] = ["src/missing", "src/d0/f0.rs/under-a-file", "gone/deep/name"];
+
+    /// The ring's sweep of more names than the submission ring holds gives, name by name, the
+    /// stamps of the reference sweep's `fstatat`s: files, directories, links not followed, the
+    /// mode's bits, and names with nothing there gone.
+    #[test]
+    fn a_sweep_stamps_as_the_reference_does() {
+        let root = dir("uring-stamp");
+        let names = sweep_tree(&root, 10_000);
+        assert!(names.len() > ENTRIES as usize);
+        let reference = crate::fs::stamps(&root, &names).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let mut effects = vec![Effect::Stamp { files: names.clone(), tag: Tag(1) }];
+        let mut seen = Vec::new();
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done));
+        let [Completion { tag: Tag(1), done: Done::Stamped(stamps) }] = &seen[..] else { panic!("{seen:?}") };
+        assert_eq!(stamps.len(), names.len());
+        for (at, (ours, theirs)) in stamps.iter().zip(&reference).enumerate() {
+            assert_eq!(ours, theirs, "{}", names.get(at));
+        }
+        let of = |name: &str| stamps[names.iter().position(|it| it == name).expect("stamped")];
+        assert_eq!(stamps.iter().filter(|it| it.is_file()).count(), 10_000);
+        assert!(stamps.iter().all(|it| !it.is_unknown()));
+        assert!(of("src").is_dir() && of("src/d0").is_dir());
+        assert!(of("src/link").is_link() && of("src/dangling").is_link());
+        assert!(of("src/d0/f1.rs").executable() && !of("src/d0/f0.rs").executable());
+        assert_eq!(of("src/d0/f3.rs").size, 8);
+        for gone in GONE {
+            assert_eq!(of(gone), Stamp::GONE, "{gone}");
+        }
+        assert_eq!(driver.sweeps.in_flight(), 0);
+        assert!(driver.sweeps.slots.iter().all(Option::is_none));
+        assert_eq!(driver.in_flight(), 0);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Two sweeps in flight at once, with an empty one, an append, a timer and a listing of
+    /// entries among them: each ends as the reference has it. A sweep of a root not there
+    /// fails, naming it.
+    #[test]
+    fn sweeps_in_flight_together_and_with_other_effects() {
+        let root = dir("uring-stamps");
+        let names = sweep_tree(&root, 6_000);
+        let mut reversed = Names::default();
+        for at in (0..names.len()).rev() {
+            assert!(reversed.push_str(names.get(at)));
+        }
+        let reference = crate::fs::stamps(&root, &names).unwrap();
+        let src = FileName::new("src").unwrap();
+        let entries = crate::fs::entries(&root.join("src"), &src).unwrap();
+        let mut driver = Uring::new(&root).unwrap();
+        let mut effects = vec![
+            Effect::Stamp { files: names.clone(), tag: Tag(1) },
+            Effect::Append { file: FileName::new("log").unwrap(), bytes: b"x".to_vec(), tag: Tag(2) },
+            Effect::Stamp { files: reversed, tag: Tag(3) },
+            Effect::Stamp { files: Names::default(), tag: Tag(4) },
+            Effect::Timer { after: Duration::from_millis(1), tag: Tag(5) },
+            Effect::Entries { dir: src, tag: Tag(6) },
+            Effect::Entries { dir: FileName::new("src/missing").unwrap(), tag: Tag(7) },
+        ];
+        driver.submit(&mut effects);
+        assert_eq!(driver.sweeps.slots.iter().filter(|it| it.is_some()).count(), 2);
+        assert!(driver.sweeps.in_flight() > 0);
+        assert!(driver.sweeps.in_flight() <= driver.ring.sq_entries as usize);
+        let mut seen = BTreeMap::new();
+        run_until_idle(&mut driver, &mut Vec::new(), |done, _| _ = seen.insert(done.tag.0, done.done));
+        assert!(seen[&1] == Done::Stamped(reference.clone()), "the first sweep");
+        let mut backwards = reference;
+        backwards.reverse();
+        assert!(seen[&3] == Done::Stamped(backwards), "the reversed sweep");
+        assert_eq!(seen[&2], Done::Appended);
+        assert_eq!(seen[&4], Done::Stamped(Vec::new()));
+        assert_eq!(seen[&5], Done::Fired);
+        assert_eq!(seen[&6], Done::Entries(entries));
+        assert!(matches!(&seen[&7], Done::Failed(_)), "{:?}", seen[&7]);
+        assert_eq!(driver.sweeps.in_flight(), 0);
+        assert_eq!(driver.in_flight(), 0);
+        drop(driver);
+
+        let nowhere = dir("uring-stamp-no-root");
+        let mut driver = Uring::new(&nowhere).unwrap();
+        let mut effects = vec![Effect::Stamp { files: names, tag: Tag(1) }];
+        let mut seen = Vec::new();
+        run_until_idle(&mut driver, &mut effects, |done, _| seen.push(done.done));
+        let [Done::Failed(why)] = &seen[..] else { panic!("{seen:?}") };
+        assert!(why.0.contains(&*nowhere.to_string_lossy()), "{why}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A journal on Linux first says the changes since a saved cursor are lost (and nothing is
+    /// for no cursor), then tells a file written as a live batch, before a flush asked after
+    /// it; it ends at an unwatch, as a watch does.
+    #[test]
+    fn a_journal_tells_what_is_lost_then_what_is_written() {
+        for (since, lost) in [(Cursor::Sim { journal: 1, next: 9 }, true), (Cursor::None, false)] {
+            let root = dir("uring-journal");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            let src = FileName::new("src").unwrap();
+            let mut driver = Uring::new(&root).unwrap();
+            driver.submit(&mut vec![Effect::Journal { dir: src.clone(), since, tag: Tag(7) }]);
+            let mut done = Vec::new();
+            driver.poll(&mut done, Duration::from_secs(5));
+            let lost = if lost { vec![(src.clone(), Lost::NoJournal)] } else { Vec::new() };
+            match done.remove(0) {
+                Completion { tag: Tag(7), done: Done::Journaled(first) } => assert_eq!(
+                    *first,
+                    Journaled { files: Vec::new(), lost, cursor: Cursor::None, caught_up: true }
+                ),
+                other => panic!("{other:?}"),
+            }
+            assert!(done.is_empty(), "{done:?}");
+            assert_eq!(driver.in_flight(), 1);
+            let written = FileName::new("src/new.rs").unwrap();
+            std::fs::write(root.join(written.as_str()), b"fn f() {}").unwrap();
+            driver.submit(&mut vec![Effect::Flush { watch: Tag(7), tag: Tag(8) }]);
+            let (mut heard, mut flushed) = (Vec::new(), false);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !flushed && Instant::now() < deadline {
+                driver.poll(&mut done, Duration::from_millis(50));
+                for it in done.drain(..) {
+                    match (it.tag.0, it.done) {
+                        (7, Done::Journaled(batch)) => {
+                            assert!(batch.caught_up && batch.lost.is_empty(), "{batch:?}");
+                            heard.extend(batch.files);
+                        }
+                        (8, Done::Flushed) => {
+                            assert!(heard.contains(&written), "flushed first; {heard:?}");
+                            flushed = true;
+                        }
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+            assert!(flushed, "the flush never came; heard {heard:?}");
+            let mut ended = false;
+            run_until_idle(&mut driver, &mut vec![Effect::Unwatch { tag: Tag(7) }], |it, _| {
+                match (it.tag.0, it.done) {
+                    (7, Done::Journaled(_)) => {}
+                    (7, Done::Unwatched) => ended = true,
+                    other => panic!("{other:?}"),
+                }
+            });
+            assert!(ended);
+            assert_eq!(driver.in_flight(), 0);
+            drop(driver);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }

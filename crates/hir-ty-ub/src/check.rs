@@ -25,6 +25,7 @@ use std::ops::Range;
 
 use hir_def::{FunctionId, HasModule};
 use hir_ty::{
+    InferBodyId,
     db::HirDatabase,
     mir::{MirEvalError, MirSpan},
     next_solver::Ty,
@@ -72,28 +73,56 @@ impl eval::Shadow<Prov> for Shadow {
 }
 
 /// The evaluator's sites, interned into dense [`SiteId`]s (`SiteId(i + 1)` is `sites[i]`;
-/// [`SiteId::START`] is before the first step).
+/// [`SiteId::START`] is before the first step). `step` interns one per statement, so a site is
+/// found with no hashing: the body's table is looked up only when the body changes, and the
+/// span indexes that table's column for its kind.
 #[derive(Debug, Default)]
 pub struct Sites<'db> {
     sites: Vec<Site<'db>>,
-    by_site: FxHashMap<Site<'db>, SiteId>,
-    last: Option<(Site<'db>, SiteId)>,
+    bodies: FxHashMap<InferBodyId<'db>, u32>,
+    /// By the index in `bodies`: per span kind, the `SiteId` of each arena index
+    /// (`SiteId::START` where not yet interned).
+    spans: Vec<[Vec<SiteId>; 6]>,
+    current: Option<(InferBodyId<'db>, u32)>,
 }
 
 impl<'db> Sites<'db> {
+    #[inline]
     pub fn intern(&mut self, site: Site<'db>) -> SiteId {
-        if let Some((last, id)) = self.last
-            && last == site
-        {
-            return id;
+        let body = match self.current {
+            Some((owner, body)) if owner == site.owner => body,
+            _ => self.enter(site.owner),
+        };
+        let (kind, i) = match site.span {
+            MirSpan::ExprId(it) => (0, it.into_raw().into_u32()),
+            MirSpan::ExprEnd(it) => (1, it.into_raw().into_u32()),
+            MirSpan::PatId(it) => (2, it.into_raw().into_u32()),
+            MirSpan::BindingId(it) => (3, it.into_raw().into_u32()),
+            MirSpan::SelfParam => (4, 0),
+            MirSpan::Unknown => (5, 0),
+        };
+        let Sites { sites, spans, .. } = self;
+        let column = &mut spans[body as usize][kind];
+        let i = i as usize;
+        if column.len() <= i {
+            column.resize(i + 1, SiteId::START);
         }
-        let next = SiteId(self.sites.len() as u32 + 1);
-        let id = *self.by_site.entry(site).or_insert(next);
-        if id == next {
-            self.sites.push(site);
+        if column[i] == SiteId::START {
+            sites.push(site);
+            column[i] = SiteId(sites.len() as u32);
         }
-        self.last = Some((site, id));
-        id
+        column[i]
+    }
+
+    #[cold]
+    fn enter(&mut self, owner: InferBodyId<'db>) -> u32 {
+        let next = self.spans.len() as u32;
+        let body = *self.bodies.entry(owner).or_insert(next);
+        if body == next {
+            self.spans.push(Default::default());
+        }
+        self.current = Some((owner, body));
+        body
     }
 
     pub fn get(&self, id: SiteId) -> Option<Site<'db>> {

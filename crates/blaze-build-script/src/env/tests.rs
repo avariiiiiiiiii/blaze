@@ -314,7 +314,11 @@ fn set_from_the_unit_or_passed_through() {
     let set: BTreeMap<_, _> = env.set_from_unit().map(|(n, v)| (n.to_owned(), v.to_owned())).collect();
     let mut whole = set.clone();
     whole.extend(env.passed_through().map(|(n, v)| (n.to_owned(), v.to_owned())));
-    assert_eq!(whole.into_iter().collect::<Vec<_>>(), env.vars, "the two make the whole environment");
+    assert_eq!(
+        whole.into_iter().collect::<Vec<_>>(),
+        env.vars,
+        "the two make the whole environment"
+    );
     assert_eq!(
         set.len(),
         env.from_unit.iter().filter(|it| **it).count(),
@@ -579,7 +583,11 @@ fn the_sorted_environment_is_the_one_built_before() {
             .collect();
         match (env(&unit, &inherited), reference::env(&unit, &inherited)) {
             (Ok(new), Ok((vars, from_unit))) => {
-                assert_eq!(new.vars, vars.into_iter().collect::<Vec<_>>(), "{unit:?} {inherited:?}");
+                assert_eq!(
+                    new.vars,
+                    vars.into_iter().collect::<Vec<_>>(),
+                    "{unit:?} {inherited:?}"
+                );
                 let set: FxHashSet<OsString> =
                     new.set_from_unit().map(|(name, _)| name.to_owned()).collect();
                 assert_eq!(set, from_unit, "{unit:?} {inherited:?}");

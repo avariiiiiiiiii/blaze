@@ -1384,6 +1384,8 @@ Why: the third dev backend (idea 4) needs its own key (a changed stencil set cha
 stencil unit's key, or stale code is reused), and its tier-up counters (idea 13) need a
 relocation that names one function's cells without a symbol per function.
 
+> forwarded to codegen (window `codegen-next1`, told by tmux).
+
 ## fastcompile-stencil 2: codegen: the stencil backend in hir-ty-codegen (`crates/hir-ty-codegen/{Cargo.toml,v2.rs,v2/backend.rs,v2/convert.rs,unwind.rs,fragment.rs,target.rs}`)
 
 What:
@@ -1423,6 +1425,8 @@ What:
 Why: idea 4's backend plugs in where Cranelift's does and returns the same `CompiledFunction`,
 over the same IR, so both dev backends agree on what a program means.
 
+> forwarded to codegen (window `codegen-next1`, told by tmux).
+
 ## fastcompile-stencil 3: link: place `Target::Counter` cells (`crates/blaze-link/`)
 
 What: for each function with a `Target::Counter(key)` relocation, 16 zeroed bytes, 8-aligned,
@@ -1447,6 +1451,8 @@ one's comparison with cargo.
 Why: idea 4's rule that the stencil backend's output behaves as Cranelift's on the corpus,
 checked on whole programs.
 
+> taken by requests (proof is DONE): child `requests-backend-axis`; the outcome follows.
+
 ## fastcompile-stencil 5: coordinator: dev-dependencies and LLVM for every build
 
 What:
@@ -1463,3 +1469,5 @@ What:
    until the workspace has them, so the workspace keeps loading).
 
 Why: docs/v2/plan/lanes/fastcompile/stencil.md, "Why a build script" and "Tests".
+
+> applied (1): `cranelift-interpreter = "0.136"` and `cranelift-reader = "0.136"` in the root `[workspace.dependencies]` beside `cranelift-frontend`; both new to the lock (lock additions). (2), `LLVM_SYS_231_PREFIX` in the flake and CI, is the coordinator's: listed in requests' report.

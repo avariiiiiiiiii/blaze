@@ -72,29 +72,64 @@ pub(super) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
     let items = walk::items(cx);
     let effective = visibility::Effective::of(cx, &items);
     let canonical = runtime_symbols::Canonical::of(cx, &items);
-    let anonymous_in_impl_trait = feature(cx, "anonymous_lifetime_in_impl_trait");
-    let async_track_caller = feature(cx, "async_fn_track_caller");
+    let krate = Krate::of(cx);
     let mut found = docs::krate(cx);
     found.extend(naming::krate(cx));
     for (index, item) in items.iter().enumerate() {
-        found.extend(externs::ctypes_item(cx, item));
+        found.extend(externs::ctypes_item(cx, item, &krate));
         found.extend(naming::item(cx, item));
         found.extend(derives::copy(cx, item, &effective));
-        found.extend(bounds::type_alias(cx, item));
+        found.extend(bounds::type_alias(cx, item, &krate));
         found.extend(mangle::item(cx, item));
         found.extend(publicity::item(cx, item, &effective));
-        found.extend(track_caller::item(cx, item, async_track_caller));
-        found.extend(bounds::drop(cx, item));
+        found.extend(track_caller::item(cx, item, krate.async_fn_track_caller));
+        found.extend(bounds::drop(cx, item, &krate));
         found.extend(derives::debug(cx, item, &effective));
         found.extend(docs::item(cx, item, &effective));
-        found.extend(traits::async_fn(cx, item, &effective));
+        found.extend(traits::async_fn(cx, item, &effective, &krate));
         found.extend(non_local::item(cx, item));
-        found.extend(runtime_symbols::item(cx, item, &items[index + 1..], &canonical));
+        found.extend(runtime_symbols::item(cx, item, item.held(&items, index), &canonical));
         found.extend(externs::ctypes_nested(cx, item));
-        found.extend(lifetime_syntax::item(cx, item, anonymous_in_impl_trait));
-        found.extend(c_void::item(cx, item));
+        found.extend(lifetime_syntax::item(cx, item, krate.anonymous_lifetime_in_impl_trait));
+        found.extend(c_void::item(cx, item, &krate));
     }
     found
+}
+
+/// What the late passes read of the crate itself, read once for all of its items.
+pub(super) struct Krate {
+    pub(super) anonymous_lifetime_in_impl_trait: bool,
+    pub(super) async_fn_track_caller: bool,
+    pub(super) checked_type_aliases: bool,
+    pub(super) return_type_notation: bool,
+    /// The target is AIX, the one `uses_power_alignment` applies to.
+    pub(super) aix: bool,
+    pub(super) c_void: Option<hir::Enum>,
+    pub(super) drop: Option<hir_def::TraitId>,
+    /// `core::mem::needs_drop` as rustc prints it, found when a `Drop` bound first needs it.
+    needs_drop: OnceCell<Option<String>>,
+}
+
+impl Krate {
+    fn of(cx: &Cx<'_, '_>) -> Krate {
+        let features = UnstableFeatures::query(cx.db, cx.krate.base());
+        let enabled = |name: &str| features.is_enabled(&Symbol::intern(name));
+        let lang = lang_items(cx.db, cx.krate.into());
+        Krate {
+            anonymous_lifetime_in_impl_trait: enabled("anonymous_lifetime_in_impl_trait"),
+            async_fn_track_caller: enabled("async_fn_track_caller"),
+            checked_type_aliases: enabled("checked_type_aliases"),
+            return_type_notation: enabled("return_type_notation"),
+            aix: cx.krate.cfg(cx.db).get_cfg_values("target_os").any(|it| it.as_str() == "aix"),
+            c_void: lang.CVoid.map(hir::Enum::from),
+            drop: lang.Drop,
+            needs_drop: OnceCell::new(),
+        }
+    }
+
+    pub(super) fn needs_drop(&self, cx: &Cx<'_, '_>) -> Option<&str> {
+        self.needs_drop.get_or_init(|| core_path(cx, "mem", "needs_drop")).as_deref()
+    }
 }
 
 /// `clashing_extern_declarations`, its own query after the late lint passes.
@@ -159,26 +194,15 @@ pub(super) fn def_span(node: &SyntaxNode) -> TextRange {
     }
 }
 
-/// Whether the crate's root enables the feature `name` (`#![feature(name)]`, its `cfg_attr`s
-/// expanded).
+/// Whether the crate enables the feature `name`: its `#![feature(..)]`s, `cfg_attr`s expanded,
+/// as its def map collected them (one interned-symbol lookup).
 pub(super) fn feature(cx: &Cx<'_, '_>, name: &str) -> bool {
-    let root = cx.krate.root_module(cx.db);
-    let file = root.definition_source_file_id(cx.db);
-    let Some(source_file) = ast::SourceFile::cast(cx.sema.parse_or_expand(file)) else { return false };
-    walk::attrs_named(cx, &source_file, "feature").into_iter().any(|(meta, _)| match meta {
-        ast::Meta::TokenTreeMeta(it) => it.token_tree().is_some_and(|tt| {
-            tt.syntax()
-                .children_with_tokens()
-                .filter_map(syntax::NodeOrToken::into_token)
-                .any(|token| token.kind() == syntax::SyntaxKind::IDENT && token.text() == name)
-        }),
-        _ => false,
-    })
+    UnstableFeatures::query(cx.db, cx.krate.base()).is_enabled(&Symbol::intern(name))
 }
 
 /// The Rust path of `core`'s `name` in `module` as rustc prints it: through `std` when the
 /// crate has it.
-pub(super) fn core_path(cx: &Cx<'_, '_>, module: &str, name: &str) -> Option<String> {
+fn core_path(cx: &Cx<'_, '_>, module: &str, name: &str) -> Option<String> {
     let mut core = None;
     let mut std = false;
     for dep in cx.krate.dependencies(cx.db) {

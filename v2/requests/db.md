@@ -2337,3 +2337,147 @@ and as outlines), so which one runs changes the time only. The outline/full choi
 - Why: frontend.md item 14 ("v2 reparses only the items an edit touches"). The per-item item
   tree (`crates/hir-def/src/item_tree/`, same lane) then re-lowers only the items whose syntax
   changed. No new dependency: base-db already depends on `syntax`.
+
+## frontend-text: one lazy line index per file text (frontend.md item 6; 2026-10-29)
+
+`span::LineIndex` is new (lane `frontend-text`, `crates/span/src/lines.rs`): a bitmap of the
+text's `\n` bytes made with SIMD (AVX-512BW/AVX2/SSE2/NEON, chosen at run time, every path
+checked against the scalar one) and a rank table per 512 bytes; `place(offset)` gives a
+`span::Place` whose `line()`, `char_column(text)`, `display_column(text)` and
+`byte_column(text)` are rustc's (`lookup_char_pos`: byte order mark dropped, `\r\n` read as `\n`,
+a last `\n` starting no line; tested against a model of `rustc_span::SourceFile` at every
+offset). Today two salsa queries scan each text for line starts (`hir-expand`'s `line_starts`,
+`hir-ty-mir`'s), plus load-cargo's `line_index` crate. One query in base-db replaces them.
+
+### 1. `crates/base-db/src/lib.rs`: the query
+
+After `impl FileText { ... }` (the block ending with `pub fn content<Db ...>`), add:
+
+```rust
+/// Where the lines of a file's text are ([`span::LineIndex`]): made the first time a
+/// diagnostic, `line!`/`column!`, a caller location, a proc macro's `Span::line` or debug info
+/// asks for a line or a column of the text, once per text, and never on load.
+#[salsa::tracked(returns(ref))]
+pub fn line_index(db: &dyn SourceDatabase, text: FileText) -> span::LineIndex {
+    span::LineIndex::new(text.text(db))
+}
+```
+
+(`span` is already a base-db dependency; `LineIndex` is `Clone + Eq + Debug + 'static`.)
+
+### 2. `crates/hir-expand/src/builtin/fn_macro.rs`: `line_and_column` on it
+
+Old (from `pub fn line_and_column` to the end of `line_starts`):
+
+```rust
+pub fn line_and_column(db: &dyn SourceDatabase, range: FileRange) -> Option<(u32, u32)> {
+    let text = db.file_text(range.file_id.file_id(db));
+    let starts = line_starts(db, text);
+    let at = u32::from(range.range.start());
+    let line = starts.partition_point(|&start| start <= at);
+    let line_start = *starts.get(line.checked_sub(1)?)? as usize;
+    let mut written = text.text(db).get(line_start..at as usize)?;
+    if line == 1 {
+        written = written.strip_prefix('\u{feff}').unwrap_or(written);
+    }
+    Some((line as u32, written.chars().count() as u32 + 1))
+}
+
+/// Where each line of a file begins, the first at 0.
+#[salsa::tracked(returns(deref))]
+pub fn line_starts(db: &dyn SourceDatabase, text: FileText) -> Box<[u32]> {
+    let text = text.text(db).as_bytes();
+    let mut starts = Vec::with_capacity(text.len() / 32 + 1);
+    starts.push(0);
+    starts.extend(
+        text.iter().enumerate().filter(|&(_, &byte)| byte == b'\n').map(|(at, _)| at as u32 + 1),
+    );
+    starts.into_boxed_slice()
+}
+```
+
+New:
+
+```rust
+pub fn line_and_column(db: &dyn SourceDatabase, range: FileRange) -> Option<(u32, u32)> {
+    let text = db.file_text(range.file_id.file_id(db));
+    let place = base_db::line_index(db, text).place(range.range.start())?;
+    Some((place.line(), place.char_column(text.text(db))?))
+}
+```
+
+and in `crates/hir-expand/src/builtin.rs` drop `line_starts` from the `fn_macro::{...}`
+re-export (nothing else uses it: `rg line_starts crates` finds only these and hir-ty-mir's
+own). If `FileText` is then unused in `fn_macro.rs`, drop it from its imports. What changes:
+the doc comment above says "a line ends at each `'\n'`, a column is a code point, and a byte
+order mark that starts the file is no column"; add "and the `\r` of a `\r\n` is no column of
+its `\n`". `column!()` at the `\n` of a `\r\n` cannot happen (a macro call is not there), so
+`line!`/`column!` give what they gave on every program; the test
+`places_match_the_old_line_starts` in `crates/span/src/lines/tests.rs` is the differential
+against the code removed here.
+
+### 3. File text shares the VFS's bytes (zero copy)
+
+`blaze_vfs::text_of(Arc<[u8]>) -> Result<Arc<str>, Utf8Error>` is new
+(`crates/blaze-vfs/src/text.rs`; module declared by request to `frontend-journal`): it
+checks the bytes are UTF-8 and casts the tree's own `Arc` to `Arc<str>`, so a `FileText`
+holds the VFS's allocation instead of `Arc::from(&str)`'s copy of every file. load-cargo
+already holds that `Arc` (`files::Loaded::bytes`, from `Reader::file`); `ViewFile` has to carry
+it instead of a borrowed `&[u8]`.
+
+`crates/base-db/src/view.rs`:
+
+- `ViewFile`:
+  ```rust
+  /// One file of a view, as blaze-vfs reads it.
+  #[derive(Clone, Copy, Debug)]
+  pub struct ViewFile<'a> {
+      /// Relative to the view's root and `/`-separated, as blaze-vfs names it.
+      pub path: &'a str,
+      /// Its blaze-vfs content ID.
+      pub id: ContentId,
+      /// Its bytes, the tree's own allocation: a file with text keeps it as its text
+      /// ([`blaze_vfs::text_of`]), with no copy.
+      pub bytes: &'a std::sync::Arc<[u8]>,
+  }
+  ```
+  (was `pub file: blaze_vfs::File<'a>`; nothing read its `mode`).
+- `plan_view`: `file.file.id` -> `file.id` (three places: the `view_ids` check, `given:`, the
+  mismatch compare), and
+  `plan.writes.iter().map(|it| view.files[it.at].file.bytes).collect()` ->
+  `plan.writes.iter().map(|it| &view.files[it.at].bytes[..]).collect()`.
+- `write_view`:
+  ```rust
+  let texts: Vec<Option<std::sync::Arc<str>>> = plan
+      .writes
+      .iter()
+      .map(|it| blaze_vfs::text_of(std::sync::Arc::clone(view.files[it.at].bytes)).ok())
+      .collect();
+  ```
+  `FileText::content_bytes(&view.files[write.at].file.id, ...)` -> `(&view.files[write.at].id,
+  ...)`; `writer.view_ids.insert(write.id, view.files[write.at].file.id)` -> `.id`; and since
+  `text` is no longer `Copy`, `let unchanged = match (text, self.text_input(write.id))` ->
+  `match (&text, self.text_input(write.id))`. The `write_text` call stays
+  `text.map(|text| (text, content))`, now an `Option<(Arc<str>, ContentId)>`.
+
+`crates/base-db/src/files.rs`:
+
+- `write_text`'s parameter `text: Option<(&str, ContentId)>` -> `text:
+  Option<(std::sync::Arc<str>, ContentId)>`, and its two `std::sync::Arc::from(text)` (the
+  `set_text_field` of an existing input and `FileText::builder(...)`) -> `text`.
+- `set_text` (text set from outside a view, a `&str`): `Some((text, content))` ->
+  `Some((std::sync::Arc::from(text), content))`.
+
+`crates/base-db/src/tests.rs`: `vfs_file` and the three `ViewFile { path, file: vfs_file(bytes)
+}` sites (`set_view` ~L376, `a_content_id_that_is_not_its_bytes_is_refused` ~L470, the view
+property test ~L697) build the files' `Arc<[u8]>`s first (`let bytes: Vec<Arc<[u8]>> = ...`) and
+make `ViewFile { path, id: ContentId::of(blaze_vfs::FILE_DOMAIN, bytes), bytes }`; the refused
+test gives a wrong `id` as it gives a wrong `file.id` today. Worth one more assert where a view
+is set: `std::ptr::eq(db.file_text(id).text(&db).as_ptr(), bytes.as_ptr())`: the text is the
+view's allocation.
+
+The caller to change with it is load-cargo's `set_files` (request in `v2/requests/cargo.md`,
+same heading).
+
+Why: frontend.md item 6 ("v2 maps files from the VFS, read in place"): today every file's text
+is copied once on load and kept, as much memory again as the VFS holds.

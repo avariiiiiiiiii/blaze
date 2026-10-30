@@ -1,33 +1,38 @@
-//! The disk as one input: a [`Watcher`] watches a directory through [`Effect::Watch`] and
-//! turns each change the driver reports into a transaction on one head, by the disk.
+//! The disk as one input: a [`Watcher`] follows a directory through the system's journal of
+//! changes ([`Effect::Journal`]) and turns what changed into transactions on one head, by the
+//! disk (docs/v2/plan/design/restore.md, docs/v2/plan/lanes/frontend/journal.md).
 //!
-//! - Each report becomes a batch: every path in it is looked at ([`Effect::Stat`] and
-//!   [`Effect::ReadAll`], asked together so a batch costs one round trip, the read's bytes
-//!   kept only if the stat says a file), and once all are in the batch is committed, batches
-//!   in the order they were told, so a later read of a file wins.
-//! - The disk is the truth for the paths it reports, but not over a transaction made since:
-//!   a path whose head changed after the report (by anyone but this watcher) is not taken and
-//!   is named ([`Watched::Conflict`]).
-//! - A file whose bytes are those the head has already makes no op, so a file blaze wrote
-//!   itself is not taken back in as an edit.
-//! - A watch starts with a scan ([`Effect::List`], asked right after the [`Effect::Watch`] so
-//!   no change falls between them): every file on the disk is read, every file the head has
-//!   and the disk doesn't is deleted, as one batch, and [`Watched::Scanned`] says the head
-//!   holds what the directory did. Changes the system dropped (`lost`) are a rescan
-//!   ([`Watched::Lost`]), never a guess of what changed.
-//! - Modes: [`Effect::Stat`] says nothing of a file's executable bit or of a symlink, and
-//!   [`Effect::ReadAll`] reads through a symlink. So a file the head has keeps its mode, a new
-//!   one is [`Mode::Regular`], and a chmod alone is not seen, until the driver reports modes
-//!   (v2/requests/vfs.md item 6).
+//! - **Start**: the journal is asked for what changed since the cursor the head's [`Disk`] saved
+//!   (FSEvents' event ID, NTFS's USN). With no cursor (a first start, or Linux, whose journal
+//!   does not outlive a restart) the whole directory is looked at again ([`Watcher::rescan`]),
+//!   which with a saved column is a sweep of stamps, not a read of every file.
+//! - **Every look is stamps first**: the paths of a batch are stamped together in one
+//!   [`Effect::Stamp`] (io_uring's batched `statx` on Linux); a path whose stamp is the one the
+//!   column saved, and which the head has, is unchanged and never read or hashed. The rest are
+//!   read ([`Effect::ReadAll`]), after their stamp was taken, so a change during the read moves
+//!   the stamp and is seen again.
+//! - **A rescan of a subtree** (a cold start, a Linux start, or a [`blaze_core::Lost`] the journal
+//!   names) stamps every path the column and the head have under it, lists
+//!   ([`Effect::Entries`]) only the directories whose stamp moved, and every directory new to
+//!   it, and reads only files that are new or moved. Nothing outside the subtree is looked at.
+//! - A batch commits once every look in it is in, batches in the order they were told, so a
+//!   later read of a file wins; its stamps and the journal's cursor after it are saved in the
+//!   head's [`Disk`] then, so a cursor is never past a change not committed.
+//! - The disk is the truth for the paths it reports, but not over a transaction made since: a
+//!   path whose head changed after the report (by anyone but this watcher) is not taken and is
+//!   named ([`Watched::Conflict`]). A file whose bytes are those the head has already makes no op.
+//! - Modes: a file the head has keeps its mode, a new one is [`Mode::Regular`] (the stamp's
+//!   mode bits are saved for when the driver reports modes, v2/requests/vfs.md item 6).
 
 use std::collections::VecDeque;
 
-use blaze_core::{Completion, Done, Effect, FileName, IoError, Meta, Tag};
+use blaze_core::{Completion, Cursor, Done, Effect, FileName, IoError, Names, Stamp, Tag};
 use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
 use crate::{
     Commit, Mode, Op, Vfs,
+    disk::Disk,
     tree::{NodeId, Tree, ancestors},
 };
 
@@ -38,11 +43,9 @@ fn seen(tree: &Tree, root: NodeId, path: &str) -> Seen {
     tree.entry(root, path).map(|(node, mode)| (tree.id(node), mode))
 }
 
-/// How many tags a watcher uses: its watch, its listing, then two per path being looked at
-/// (its stat, then its read), reused in turn.
+/// How many tags a watcher uses: its journal, then one per stamp, listing or read in flight.
 const TAGS: u64 = 1 << 32;
-const LIST: u64 = 1;
-const FIRST_READ: u64 = 2;
+const FIRST: u64 = 1;
 
 /// What a watcher's completion did.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -51,78 +54,74 @@ pub enum Watched {
     Committed(Commit),
     /// The head's `path` changed since the disk's change was reported: the head keeps its own.
     Conflict { path: String },
-    /// `path` changed and could not be read: the head keeps what it had.
+    /// `path` changed and could not be read: the head keeps what it had. `""` is the watched
+    /// directory itself, which ends the watch.
     Unreadable { path: String, error: IoError },
-    /// The system dropped changes; a rescan is under way, and ends with [`Watched::Scanned`].
-    Lost,
-    /// A scan was committed: the head holds what the directory did when it was listed.
+    /// The journal could not name the changes under `path` (`""` for all of it), for `why`: that
+    /// subtree is looked at again, and only it; the look ends with [`Watched::Scanned`].
+    Lost { path: String, why: blaze_core::Lost },
+    /// The head holds what the directory did: a look at a subtree, or everything the journal
+    /// told up to where it caught up, is committed.
     Scanned,
     /// The watch ended: stopped, or failed with the error.
     Ended(Option<IoError>),
 }
 
 /// What the disk had at a path.
-enum Disk {
+enum Look {
     Gone,
     Dir,
     File(Vec<u8>),
+    /// Its stamp is the one saved and the head has it: not read.
+    Same,
     Unreadable,
 }
 
 struct Slot {
-    /// In the head, relative to the watched directory.
+    /// In the head, relative to the watched directory (`""` for the directory itself).
     path: String,
     /// Under the driver's root.
     file: FileName,
     /// What the head had at `path` when the change was reported.
     was: Seen,
-    disk: Option<Disk>,
-    /// The stat said a file: the read decides.
-    file_seen: bool,
-    /// The read, in before the stat.
-    early: Option<Result<Vec<u8>, IoError>>,
-}
-
-impl Slot {
-    fn new(path: String, file: FileName, was: Seen, disk: Option<Disk>, file_seen: bool) -> Slot {
-        Slot { path, file, was, disk, file_seen, early: None }
-    }
-
-    /// Takes the read of a path the stat said is a file.
-    fn read(&mut self, read: Result<Vec<u8>, IoError>, out: &mut Vec<Watched>) {
-        self.disk = Some(match read {
-            Ok(bytes) => Disk::File(bytes),
-            Err(error) => {
-                out.push(Watched::Unreadable { path: self.path.clone(), error });
-                Disk::Unreadable
-            }
-        });
-    }
+    /// What the column saved of it, and what it is now, taken before any read.
+    saved: Option<Stamp>,
+    stamp: Option<Stamp>,
+    look: Option<Look>,
 }
 
 struct Batch {
     slots: Vec<Slot>,
-    /// A scan's: every file of the directory.
-    scan: bool,
-    /// A scan's place, taken when the listing was asked: what is told after commits after it.
-    /// Its slots come with the listing.
-    waiting: bool,
+    /// Each slot by name, once a listing may add names to it.
+    index: FxHashMap<Box<str>, usize>,
+    /// Stamps and listings in flight: it commits once none is and every slot is looked at.
+    open: u32,
+    /// The subtree a rescan looks at, relative to the watched directory.
+    rescan: Option<String>,
+    /// The journal's place once this is committed, and whether it then has told everything
+    /// from before the watch.
+    cursor: Option<Cursor>,
+    caught_up: bool,
+}
+
+enum Pending {
+    Stamp(u64),
+    Entries(u64, FileName),
+    Read(u64, usize),
 }
 
 pub struct Watcher {
     head: Box<str>,
     dir: FileName,
+    /// `dir` and a `/`: what every name under it starts with.
+    below: String,
     tags: u64,
     watching: bool,
-    /// A listing is in flight; `again`: another is wanted once it is in.
-    listing: bool,
-    again: bool,
+    caught_up: bool,
     /// Batches in the order their changes were told; the first is number `first`.
     batches: VecDeque<Batch>,
     first: u64,
-    /// By a path's stat tag (its read's is the next): the batch's number, the slot in it, and
-    /// how many of its two effects are still in flight.
-    reading: FxHashMap<Tag, (u64, usize, u8)>,
+    pending: FxHashMap<Tag, Pending>,
     next_tag: u64,
     /// What this watcher's commits left at each path, while batches told before them wait.
     ours: FxHashMap<String, Seen>,
@@ -134,38 +133,35 @@ impl Watcher {
     pub fn new(head: &str, dir: FileName, tags: u64) -> Watcher {
         Watcher {
             head: head.into(),
+            below: format!("{dir}/"),
             dir,
             tags,
             watching: false,
-            listing: false,
-            again: false,
+            caught_up: false,
             batches: VecDeque::new(),
             first: 0,
-            reading: FxHashMap::default(),
+            pending: FxHashMap::default(),
             next_tag: 0,
             ours: FxHashMap::default(),
         }
     }
 
-    pub fn start(&mut self, effects: &mut Vec<Effect>) {
+    /// Starts following the directory from where `vfs` saved this head's disk, or from scratch.
+    pub fn start(&mut self, vfs: &Vfs, effects: &mut Vec<Effect>) {
         assert!(!self.watching, "{} is watched already", self.dir);
         self.watching = true;
-        effects.push(Effect::Watch { dir: self.dir.clone(), tag: Tag(self.tags) });
-        self.list(effects);
-    }
-
-    /// Asks for a listing of the directory, or for one more after the one in flight.
-    fn list(&mut self, effects: &mut Vec<Effect>) {
-        if self.listing {
-            self.again = true;
-        } else {
-            self.listing = true;
-            effects.push(Effect::List { dir: self.dir.clone(), tag: Tag(self.tags + LIST) });
-            self.batches.push_back(Batch { slots: Vec::new(), scan: true, waiting: true });
+        let since = vfs
+            .disks
+            .get(&self.head)
+            .filter(|disk| disk.dir == self.dir)
+            .map_or(Cursor::None, |disk| disk.cursor);
+        effects.push(Effect::Journal { dir: self.dir.clone(), since, tag: Tag(self.tags) });
+        if since == Cursor::None {
+            self.rescan(vfs, self.dir.clone(), effects);
         }
     }
 
-    /// Stops the watch: it ends with [`Watched::Ended`]. Reads in flight still commit.
+    /// Stops the watch: it ends with [`Watched::Ended`]. Looks in flight still commit.
     pub fn stop(&mut self, effects: &mut Vec<Effect>) {
         if self.watching {
             self.watching = false;
@@ -178,13 +174,35 @@ impl Watcher {
         tag.0.checked_sub(self.tags).is_some_and(|it| it < TAGS)
     }
 
-    /// Whether nothing it was told is waiting to be listed, read or committed.
+    /// Whether nothing it was told is waiting to be looked at or committed.
     pub fn idle(&self) -> bool {
         self.batches.is_empty()
     }
 
-    /// Takes a completion of its own; commits what is read in full to the head, and flushes
-    /// `vfs` after.
+    fn rel<'a>(&self, file: &'a FileName) -> Option<&'a str> {
+        match file.as_str().strip_prefix(&self.below) {
+            Some(rest) => Some(rest),
+            None => (*file == self.dir).then_some(""),
+        }
+    }
+
+    fn head_root(&self, vfs: &Vfs) -> NodeId {
+        vfs.heads.get(&*self.head).copied().unwrap_or(vfs.tree.empty())
+    }
+
+    fn tag(&mut self, pending: Pending) -> Tag {
+        let tag = Tag(self.tags + FIRST + self.next_tag);
+        self.next_tag = (self.next_tag + 1) % (TAGS - FIRST);
+        assert!(self.pending.insert(tag, pending).is_none(), "2^32 looks in flight at once");
+        tag
+    }
+
+    fn batch(&mut self, number: u64) -> Option<&mut Batch> {
+        number.checked_sub(self.first).and_then(|it| self.batches.get_mut(it as usize))
+    }
+
+    /// Takes a completion of its own; commits what is looked at in full to the head, and
+    /// flushes `vfs` after.
     pub fn complete(
         &mut self,
         vfs: &mut Vfs,
@@ -194,11 +212,7 @@ impl Watcher {
         let mut out = Vec::new();
         if completion.tag == Tag(self.tags) {
             match completion.done {
-                Done::Changed { lost: true, .. } => {
-                    out.push(Watched::Lost);
-                    self.list(effects);
-                }
-                Done::Changed { files, lost: false } => self.told(vfs, files, effects),
+                Done::Journaled(batch) => self.journaled(vfs, *batch, effects, &mut out),
                 Done::Unwatched => {
                     self.watching = false;
                     out.push(Watched::Ended(None));
@@ -207,81 +221,282 @@ impl Watcher {
                     self.watching = false;
                     out.push(Watched::Ended(Some(error)));
                 }
-                done => unreachable!("a watch completed with {done:?}"),
-            }
-            return out;
-        }
-        if completion.tag == Tag(self.tags + LIST) {
-            self.listing = false;
-            match completion.done {
-                Done::Listed(listed) => self.scanned(vfs, listed, effects),
-                Done::Failed(error) => {
-                    let place = self.scan_place();
-                    let batch = &mut self.batches[place];
-                    (batch.waiting, batch.scan) = (false, false);
-                    out.push(Watched::Unreadable { path: String::new(), error });
-                    self.again = false;
-                    self.stop(effects);
-                }
-                done => unreachable!("a listing completed with {done:?}"),
-            }
-            if std::mem::take(&mut self.again) {
-                self.list(effects);
+                done => unreachable!("a journal completed with {done:?}"),
             }
             self.drain(vfs, &mut out, effects);
             return out;
         }
-        let offset = completion.tag.0 - self.tags - FIRST_READ;
-        let (stat, read) = (Tag(completion.tag.0 - (offset & 1)), offset & 1 == 1);
-        let looking = self.reading.get_mut(&stat).expect("a path being looked at");
-        let (number, at) = (looking.0, looking.1);
-        looking.2 -= 1;
-        if looking.2 == 0 {
-            self.reading.remove(&stat);
-        }
-        // A read after its batch committed, or after the stat settled the path, is not needed.
-        let Some(batch) =
-            number.checked_sub(self.first).and_then(|it| self.batches.get_mut(it as usize))
-        else {
-            return out;
+        let Some(pending) = self.pending.remove(&completion.tag) else {
+            unreachable!("a completion {:?} of nothing asked", completion.tag)
         };
-        let slot = &mut batch.slots[at];
-        if slot.disk.is_some() {
-            return out;
-        }
-        match (read, completion.done) {
-            (false, Done::Stat(None)) => slot.disk = Some(Disk::Gone),
-            (false, Done::Stat(Some(meta))) if meta.dir => slot.disk = Some(Disk::Dir),
-            (false, Done::Stat(Some(_))) => match slot.early.take() {
-                Some(early) => slot.read(early, &mut out),
-                None => slot.file_seen = true,
-            },
-            (false, Done::Failed(error)) => {
-                out.push(Watched::Unreadable { path: slot.path.clone(), error });
-                slot.disk = Some(Disk::Unreadable);
+        match (pending, completion.done) {
+            (Pending::Stamp(number), Done::Stamped(stamps)) => {
+                self.stamped(number, stamps, effects, &mut out);
             }
-            (true, Done::Read(bytes)) if slot.file_seen => slot.read(Ok(bytes), &mut out),
-            (true, Done::Failed(error)) if slot.file_seen => slot.read(Err(error), &mut out),
-            (true, Done::Read(bytes)) => slot.early = Some(Ok(bytes)),
-            (true, Done::Failed(error)) => slot.early = Some(Err(error)),
-            (_, done) => unreachable!("a look at {} completed with {done:?}", slot.file),
+            (Pending::Entries(number, _), Done::Entries(entries)) => {
+                self.listed(vfs, number, entries, effects);
+            }
+            (Pending::Read(number, at), done) => {
+                if let Some(slot) = self.batch(number).and_then(|it| it.slots.get_mut(at)) {
+                    slot.look = Some(match done {
+                        Done::Read(bytes) => Look::File(bytes),
+                        Done::Failed(error) => {
+                            out.push(Watched::Unreadable { path: slot.path.clone(), error });
+                            Look::Unreadable
+                        }
+                        done => unreachable!("a read of {} completed with {done:?}", slot.file),
+                    });
+                }
+            }
+            (Pending::Stamp(number), Done::Failed(error)) => {
+                let Some(batch) = self.batch(number) else { unreachable!("stamps of no batch") };
+                batch.open -= 1;
+                let path = batch.rescan.clone().unwrap_or_default();
+                for slot in batch.slots.iter_mut().filter(|it| it.look.is_none()) {
+                    slot.look = Some(Look::Unreadable);
+                }
+                if batch.rescan.as_deref() == Some("") {
+                    self.stop(effects);
+                }
+                out.push(Watched::Unreadable { path, error });
+            }
+            (Pending::Entries(number, dir), Done::Failed(error)) => {
+                let Some(batch) = self.batch(number) else { unreachable!("a listing of no batch") };
+                batch.open -= 1;
+                let path = self.rel(&dir).unwrap_or_default().to_owned();
+                if path.is_empty() {
+                    self.stop(effects);
+                }
+                out.push(Watched::Unreadable { path, error });
+            }
+            (_, done) => unreachable!("a look completed with {done:?}"),
         }
         self.drain(vfs, &mut out, effects);
         out
     }
 
-    /// Commits every batch read in full that waits for none told before it.
+    /// A batch of the journal's: what it names is looked at, each subtree it lost is looked at
+    /// again, and its cursor is saved once they and everything told before are committed.
+    fn journaled(
+        &mut self,
+        vfs: &mut Vfs,
+        told: blaze_core::Journaled,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Watched>,
+    ) {
+        let blaze_core::Journaled { files, lost, cursor, caught_up } = told;
+        self.told(vfs, files, effects);
+        for (under, why) in lost {
+            let Some(path) = self.rel(&under).map(str::to_owned) else { continue };
+            out.push(Watched::Lost { path, why });
+            self.rescan(vfs, under, effects);
+        }
+        let caught_up = caught_up && !std::mem::replace(&mut self.caught_up, caught_up || self.caught_up);
+        match self.batches.back_mut() {
+            Some(last) => {
+                last.cursor = Some(cursor);
+                last.caught_up |= caught_up;
+            }
+            None => {
+                vfs.disks.of(&self.head, &self.dir).cursor = cursor;
+                if caught_up {
+                    out.push(Watched::Scanned);
+                }
+            }
+        }
+    }
+
+    /// The names the journal told: a batch of them, stamped together.
+    fn told(&mut self, vfs: &Vfs, files: Vec<FileName>, effects: &mut Vec<Effect>) {
+        let head = self.head_root(vfs);
+        let disk = vfs.disks.get(&self.head).filter(|it| it.dir == self.dir);
+        let mut slots = Vec::with_capacity(files.len());
+        for file in files {
+            let Some(path) = self.rel(&file).filter(|it| !it.is_empty()).map(str::to_owned) else {
+                continue;
+            };
+            let saved = disk.and_then(|it| it.get(file.as_str()));
+            let was = seen(&vfs.tree, head, &path);
+            slots.push(Slot { path, file, was, saved, stamp: None, look: None });
+        }
+        if !slots.is_empty() {
+            self.ask_stamps(slots, None, effects);
+        }
+    }
+
+    /// Looks at the subtree `under` again: every path the column and the head have under it is
+    /// stamped, and the directories whose stamp moved are listed.
+    pub fn rescan(&mut self, vfs: &Vfs, under: FileName, effects: &mut Vec<Effect>) {
+        let Some(root) = self.rel(&under).map(str::to_owned) else { return };
+        let head = self.head_root(vfs);
+        let mut names = Names::default();
+        let mut saved = Vec::new();
+        if let Some(disk) = vfs.disks.get(&self.head).filter(|it| it.dir == self.dir) {
+            disk.sweep(under.as_str(), &mut names, &mut saved);
+        }
+        let mut slots: Vec<Slot> = Vec::with_capacity(names.len() + 1);
+        let mut index = FxHashMap::default();
+        for (at, name) in names.iter().enumerate() {
+            let file = FileName::new(name).expect("a column's name is a name");
+            let path = self.rel(&file).expect("a column's name is under its directory").to_owned();
+            let was = seen(&vfs.tree, head, &path);
+            index.insert(Box::<str>::from(name), slots.len());
+            slots.push(Slot { path, file, was, saved: Some(saved[at]), stamp: None, look: None });
+        }
+        let mut add = |path: String, was: Seen, index: &mut FxHashMap<Box<str>, usize>| {
+            let name = if path.is_empty() { self.dir.to_string() } else { format!("{}{path}", self.below) };
+            if index.contains_key(name.as_str()) {
+                return;
+            }
+            let file = FileName::new(&name).expect("a head's path is a name");
+            index.insert(name.into(), slots.len());
+            slots.push(Slot { path, file, was, saved: None, stamp: None, look: None });
+        };
+        add(root.clone(), seen(&vfs.tree, head, &root), &mut index);
+        if let Some(node) = vfs.tree.lookup(head, &root) {
+            for (path, node, mode) in vfs.tree.files(node, Mode::Regular, &root) {
+                add(path, Some((vfs.tree.id(node), mode)), &mut index);
+            }
+        }
+        let number = self.ask_stamps(slots, Some(root), effects);
+        self.batch(number).expect("just made").index = index;
+    }
+
+    /// A batch of `slots`, and the stamp of each asked for in one effect. Returns its number.
+    fn ask_stamps(&mut self, slots: Vec<Slot>, rescan: Option<String>, effects: &mut Vec<Effect>) -> u64 {
+        let number = self.first + self.batches.len() as u64;
+        let mut names = Names::with_capacity(slots.len(), slots.len() * 32);
+        for slot in &slots {
+            names.push(&slot.file);
+        }
+        let tag = self.tag(Pending::Stamp(number));
+        effects.push(Effect::Stamp { files: names, tag });
+        self.batches.push_back(Batch {
+            slots,
+            index: FxHashMap::default(),
+            open: 1,
+            rescan,
+            cursor: None,
+            caught_up: false,
+        });
+        number
+    }
+
+    /// The stamps of a batch: what is unchanged is settled, what moved is read, and each
+    /// directory that is new, replaced, or (in a rescan) moved is listed.
+    fn stamped(&mut self, number: u64, stamps: Vec<Stamp>, effects: &mut Vec<Effect>, out: &mut Vec<Watched>) {
+        let mut reads = Vec::new();
+        let mut lists = Vec::new();
+        let mut stop = false;
+        {
+            let Some(batch) = self.batch(number) else { unreachable!("stamps of no batch") };
+            assert_eq!(stamps.len(), batch.slots.len(), "a stamp per name");
+            let rescan = batch.rescan.is_some();
+            batch.open -= 1;
+            for (at, (slot, stamp)) in batch.slots.iter_mut().zip(stamps).enumerate() {
+                slot.stamp = Some(stamp);
+                if stamp.is_gone() {
+                    if slot.path.is_empty() {
+                        out.push(Watched::Unreadable {
+                            path: String::new(),
+                            error: IoError(format!("{}: no such directory", slot.file)),
+                        });
+                        slot.look = Some(Look::Unreadable);
+                        stop = true;
+                    } else {
+                        slot.look = Some(Look::Gone);
+                    }
+                } else if stamp.is_dir() {
+                    slot.look = Some(Look::Dir);
+                    let list = match slot.saved {
+                        None => true,
+                        Some(saved) if rescan => saved.moved(&stamp),
+                        Some(saved) => saved.ino != stamp.ino,
+                    };
+                    if list {
+                        lists.push(slot.file.clone());
+                    }
+                } else if slot.saved == Some(stamp) && slot.was.is_some() {
+                    slot.look = Some(Look::Same);
+                } else {
+                    reads.push((at, slot.file.clone()));
+                }
+            }
+            if !lists.is_empty() && batch.index.is_empty() {
+                batch.index =
+                    batch.slots.iter().enumerate().map(|(at, it)| (it.file.as_str().into(), at)).collect();
+            }
+            batch.open += lists.len() as u32;
+        }
+        for (at, file) in reads {
+            let tag = self.tag(Pending::Read(number, at));
+            effects.push(Effect::ReadAll { file, tag });
+        }
+        for dir in lists {
+            let tag = self.tag(Pending::Entries(number, dir.clone()));
+            effects.push(Effect::Entries { dir, tag });
+        }
+        if stop {
+            self.stop(effects);
+        }
+    }
+
+    /// A listing of a directory of a batch: each name the batch has not looked at is new to it,
+    /// read if a file and listed if a directory.
+    fn listed(&mut self, vfs: &Vfs, number: u64, entries: Vec<(FileName, Stamp)>, effects: &mut Vec<Effect>) {
+        let head = self.head_root(vfs);
+        let below = self.below.len();
+        let mut asks = Vec::new();
+        {
+            let Some(batch) = self.batch(number) else { unreachable!("a listing of no batch") };
+            batch.open -= 1;
+            for (file, stamp) in entries {
+                if batch.index.contains_key(file.as_str()) || file.as_str().len() <= below {
+                    continue;
+                }
+                let path = file.as_str()[below..].to_owned();
+                let at = batch.slots.len();
+                batch.index.insert(file.as_str().into(), at);
+                let was = seen(&vfs.tree, head, &path);
+                let look = if stamp.is_gone() {
+                    Some(Look::Gone)
+                } else if stamp.is_dir() {
+                    asks.push((None, file.clone()));
+                    batch.open += 1;
+                    Some(Look::Dir)
+                } else {
+                    asks.push((Some(at), file.clone()));
+                    None
+                };
+                batch.slots.push(Slot { path, file, was, saved: None, stamp: Some(stamp), look });
+            }
+        }
+        for (at, file) in asks {
+            match at {
+                Some(at) => {
+                    let tag = self.tag(Pending::Read(number, at));
+                    effects.push(Effect::ReadAll { file, tag });
+                }
+                None => {
+                    let tag = self.tag(Pending::Entries(number, file.clone()));
+                    effects.push(Effect::Entries { dir: file, tag });
+                }
+            }
+        }
+    }
+
+    /// Commits every batch looked at in full that waits for none told before it.
     fn drain(&mut self, vfs: &mut Vfs, out: &mut Vec<Watched>, effects: &mut Vec<Effect>) {
         while self
             .batches
             .front()
-            .is_some_and(|it| !it.waiting && it.slots.iter().all(|it| it.disk.is_some()))
+            .is_some_and(|it| it.open == 0 && it.slots.iter().all(|it| it.look.is_some()))
         {
             let batch = self.batches.pop_front().expect("a batch");
             self.first += 1;
-            let scan = batch.scan;
+            let scanned = batch.rescan.is_some() || batch.caught_up;
             self.commit(vfs, batch, out);
-            if scan {
+            if scanned {
                 out.push(Watched::Scanned);
             }
         }
@@ -291,83 +506,18 @@ impl Watcher {
         vfs.flush(effects);
     }
 
-    /// The tags for one path's stat and read, `outstanding` of which are asked for.
-    fn look_tags(&mut self, number: u64, at: usize, outstanding: u8) -> (Tag, Tag) {
-        let stat = Tag(self.tags + FIRST_READ + self.next_tag);
-        self.next_tag = (self.next_tag + 2) % (TAGS - FIRST_READ);
-        assert!(!self.reading.contains_key(&stat), "2^31 paths are being looked at at once");
-        self.reading.insert(stat, (number, at, outstanding));
-        (stat, Tag(stat.0 + 1))
-    }
-
-    /// Where in `batches` the scan whose listing is in flight waits.
-    fn scan_place(&self) -> usize {
-        self.batches.iter().position(|it| it.waiting).expect("a scan waits for its listing")
-    }
-
-    /// A listing of the directory: its scan's batch, of every file in it, read, and of every
-    /// file the head has that it doesn't, gone.
-    fn scanned(&mut self, vfs: &Vfs, listed: Vec<(FileName, Meta)>, effects: &mut Vec<Effect>) {
-        let head = vfs.heads.get(&*self.head).copied().unwrap_or(vfs.tree.empty());
-        let below = format!("{}/", self.dir);
-        let place = self.scan_place();
-        let number = self.first + place as u64;
-        let mut slots = Vec::new();
-        let mut on_disk = rustc_hash::FxHashSet::default();
-        for (file, meta) in listed {
-            // A directory is what the files under it make.
-            if meta.dir {
-                continue;
-            }
-            let Some(path) = file.as_str().strip_prefix(&below) else { continue };
-            let path = path.to_owned();
-            on_disk.insert(path.clone());
-            // The listing said a file: only its read is asked.
-            let (_, tag) = self.look_tags(number, slots.len(), 1);
-            effects.push(Effect::ReadAll { file: file.clone(), tag });
-            let was = seen(&vfs.tree, head, &path);
-            slots.push(Slot::new(path, file, was, None, true));
-        }
-        for (path, node, mode) in vfs.tree.files(head, Mode::Regular, "") {
-            if on_disk.contains(&path) {
-                continue;
-            }
-            let file = FileName::new(&format!("{below}{path}")).expect("a head's path is a name");
-            let was = Some((vfs.tree.id(node), mode));
-            slots.push(Slot::new(path, file, was, Some(Disk::Gone), false));
-        }
-        let batch = &mut self.batches[place];
-        batch.slots = slots;
-        batch.waiting = false;
-    }
-
-    /// A report of changes: a batch of the paths under the watched directory, each looked at.
-    fn told(&mut self, vfs: &Vfs, files: Vec<FileName>, effects: &mut Vec<Effect>) {
-        let head = vfs.heads.get(&*self.head).copied().unwrap_or(vfs.tree.empty());
-        let below = format!("{}/", self.dir);
-        let number = self.first + self.batches.len() as u64;
-        let mut slots = Vec::new();
-        for file in files {
-            let Some(path) = file.as_str().strip_prefix(&below) else { continue };
-            let path = path.to_owned();
-            let was = seen(&vfs.tree, head, &path);
-            let (stat, read) = self.look_tags(number, slots.len(), 2);
-            effects.push(Effect::Stat { file: file.clone(), tag: stat });
-            effects.push(Effect::ReadAll { file: file.clone(), tag: read });
-            slots.push(Slot::new(path, file, was, None, false));
-        }
-        if !slots.is_empty() {
-            self.batches.push_back(Batch { slots, scan: false, waiting: false });
-        }
-    }
-
     fn commit(&mut self, vfs: &mut Vfs, batch: Batch, out: &mut Vec<Watched>) {
+        let disk = vfs.disks.of(&self.head, &self.dir);
+        save(disk, &batch);
         let base = vfs.heads.get(&*self.head).copied().unwrap_or(vfs.tree.empty());
         let tree = &vfs.tree;
         let mut deletes: Vec<String> = Vec::new();
         let mut writes: Vec<(String, Vec<u8>, Mode)> = Vec::new();
         let mut taken = Vec::new();
         for slot in batch.slots {
+            if slot.path.is_empty() || matches!(slot.look, Some(Look::Same | Look::Unreadable)) {
+                continue;
+            }
             let entry = tree.entry(base, &slot.path);
             let node = entry.map(|it| it.0);
             let now = entry.map(|(node, mode)| (tree.id(node), mode));
@@ -376,13 +526,13 @@ impl Watcher {
                 continue;
             }
             let is_file = node.is_some_and(|it| !tree.is_dir(it));
-            match slot.disk.expect("a read path") {
-                Disk::Unreadable => continue,
-                Disk::Gone if node.is_some() => deletes.push(slot.path.clone()),
-                Disk::Gone => {}
-                Disk::Dir if is_file => deletes.push(slot.path.clone()),
-                Disk::Dir => {}
-                Disk::File(bytes) => {
+            match slot.look.expect("a looked-at path") {
+                Look::Same | Look::Unreadable => unreachable!("skipped above"),
+                Look::Gone if node.is_some() => deletes.push(slot.path.clone()),
+                Look::Gone => {}
+                Look::Dir if is_file => deletes.push(slot.path.clone()),
+                Look::Dir => {}
+                Look::File(bytes) => {
                     // A file there means every directory above it is one.
                     let mut above: Vec<&str> = ancestors(&slot.path)
                         .filter(|up| tree.lookup(base, up).is_some_and(|it| !tree.is_dir(it)))
@@ -441,3 +591,24 @@ impl Watcher {
             || (now.is_none() && ancestors(path).any(|up| self.ours.contains_key(up)))
     }
 }
+
+/// What a committed batch saw goes into the column: each path's stamp (a conflict's too: the
+/// disk was seen and the head chose), gone paths with everything under them, and the journal's
+/// cursor after it. An unreadable path keeps what it had, so it is looked at again.
+fn save(disk: &mut Disk, batch: &Batch) {
+    for slot in &batch.slots {
+        let Some(stamp) = slot.stamp else { continue };
+        match slot.look {
+            Some(Look::Unreadable) | None => {}
+            Some(Look::Gone) => disk.remove_under(slot.file.as_str()),
+            Some(Look::Same) => {}
+            Some(Look::Dir | Look::File(_)) => disk.set(slot.file.as_str(), stamp),
+        }
+    }
+    if let Some(cursor) = batch.cursor {
+        disk.cursor = cursor;
+    }
+}
+
+#[cfg(test)]
+mod tests;

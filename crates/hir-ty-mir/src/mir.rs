@@ -29,13 +29,13 @@ mod transform;
 pub mod type_name;
 
 pub use eval::{
-    Evaluator, interpret_mir,
+    Evaluator, MirOutput, interpret_mir,
     machine::{
         Access, AtomicOrd, EvalThread, MResult, Machine, MemKind, Plain, Ptr, RetagMode, Shadow,
         Site, Stop, TypedCx,
     },
     macro_call::{FlatInput, MacroArg, call_const_macro},
-    render_const_using_debug_impl,
+    render_const_using_debug_impl, run_function,
 };
 pub use lower::is_builtin_index;
 pub use lower::{

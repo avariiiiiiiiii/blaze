@@ -15,7 +15,8 @@
 //! - Watching: changes a driver reports ([`blaze_core::Done::Changed`]) become ops on the
 //!   workspace's head ([`Watcher`]).
 //!
-//! Unsafe code is only in `store` (docs/v2/plan/design/unsafe.md), whose API is safe.
+//! Unsafe code is only in `store` and `text` (docs/v2/plan/design/unsafe.md), whose APIs
+//! are safe.
 
 #![deny(unsafe_code)]
 
@@ -27,6 +28,8 @@ mod section;
 #[allow(unsafe_code)]
 mod store;
 mod sync;
+#[allow(unsafe_code)]
+mod text;
 mod tree;
 pub mod watch;
 
@@ -44,6 +47,7 @@ use crate::{
 pub use crate::{
     reader::{Pinned, Reader},
     section::Section,
+    text::text_of,
     watch::{Watched, Watcher},
 };
 

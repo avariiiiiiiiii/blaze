@@ -51,7 +51,7 @@ pub enum SignatureMismatchAt {
 
 impl SignatureMismatchAt {
     /// Where `error`, of relating two signatures with `inputs` parameters, is.
-    fn of<'db>(error: &TypeError<'db>, inputs: usize) -> SignatureMismatchAt {
+    fn of<'db>(error: &TypeError<DbInterner<'db>>, inputs: usize) -> SignatureMismatchAt {
         match *error {
             TypeError::ArgumentSorts(_, i) if i == inputs => SignatureMismatchAt::Return,
             TypeError::ArgumentSorts(_, i) => SignatureMismatchAt::Param(i as u32),

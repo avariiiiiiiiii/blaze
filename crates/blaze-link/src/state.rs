@@ -197,7 +197,7 @@ const _: () = assert!(size_of::<Def>() == 16);
 const _: () = assert!(size_of::<Hot>() == 32);
 const _: () = assert!(size_of::<What>() == 16);
 const _: () = assert!(size_of::<Sort>() == 16);
-const _: () = assert!(size_of::<Lists>() == 36);
+const _: () = assert!(size_of::<Lists>() == 48);
 const _: () = assert!(size_of::<Loader>() == 24);
 const _: () = assert!(size_of::<SymCold>() == 24);
 const _: () = assert!(size_of::<FunctionInfo>() <= 88);

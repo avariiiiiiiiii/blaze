@@ -36,7 +36,7 @@ pub(crate) struct Variable {
 }
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<Variable>() == 64);
+const _: () = assert!(size_of::<Variable>() == 60);
 
 /// The scopes of a function's body its named locals are bound in, as the body says them:
 /// which code each is of is known once the code is, from its line rows.

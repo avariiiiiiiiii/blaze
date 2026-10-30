@@ -465,8 +465,8 @@ fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolK
 
 /// The symbol table's external definitions, for a library without an export trie, their
 /// names appended to `names`.
-fn symtab_exports(
-    table: &SymbolTable<'_, Header, &[u8]>,
+fn symtab_exports<'a>(
+    table: &SymbolTable<'a, Header, &'a [u8]>,
     endian: Endianness,
     sections: &[Section],
     names: &mut Names,

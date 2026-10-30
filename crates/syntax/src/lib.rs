@@ -55,15 +55,15 @@ pub use crate::{
     syntax_error::SyntaxError,
     syntax_node::{
         PreorderWithTokens, RustLanguage, SyntaxElement, SyntaxElementChildren, SyntaxNode,
-        SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder, Tree, set_green_trees,
+        SyntaxNodeChildren, SyntaxToken, SyntaxTreeBuilder, Tree,
     },
 };
 pub use parser::{Edition, LexedStr, SyntaxKind, T};
 pub use rustc_literal_escaper as unescape;
 pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
 pub use syntax_tree::{
-    Direction, FlatTree, GreenNode, NodeOrToken, SyntaxText, TextRange, TextSize, TokenAtOffset,
-    WalkEvent, api::Preorder,
+    Direction, Expand, FlatTree, FlatTreeBuilder, GreenNode, NodeOrToken, SyntaxText, TextRange,
+    TextSize, TokenAtOffset, WalkEvent, api::Preorder,
 };
 
 /// `Parse` is the result of the parsing: a syntax tree and a collection of
@@ -73,33 +73,83 @@ pub use syntax_tree::{
 /// files.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Parse<T> {
-    green: Option<Tree>,
+    tree: Option<Tree>,
     errors: Option<Arc<[SyntaxError]>>,
+    /// The edition of an outline ([`SourceFile::parse_outline`]), in which its lazy bodies'
+    /// errors are found when asked.
+    outline: Option<Edition>,
     _ty: PhantomData<fn() -> T>,
 }
 
 impl<T> Clone for Parse<T> {
     fn clone(&self) -> Parse<T> {
-        Parse { green: self.green.clone(), errors: self.errors.clone(), _ty: PhantomData }
+        Parse {
+            tree: self.tree.clone(),
+            errors: self.errors.clone(),
+            outline: self.outline,
+            _ty: PhantomData,
+        }
     }
 }
 
 impl<T> Parse<T> {
-    fn new(green: Tree, errors: Vec<SyntaxError>) -> Parse<T> {
+    fn new(tree: Tree, errors: Vec<SyntaxError>) -> Parse<T> {
+        Parse::with_outline(tree, errors, None)
+    }
+
+    fn with_outline(tree: Tree, errors: Vec<SyntaxError>, outline: Option<Edition>) -> Parse<T> {
         Parse {
-            green: Some(green),
+            tree: Some(tree),
             errors: if errors.is_empty() { None } else { Some(errors.into()) },
+            outline,
+            _ty: PhantomData,
+        }
+    }
+
+    fn take(&mut self) -> Parse<SyntaxNode> {
+        Parse {
+            tree: self.tree.take(),
+            errors: self.errors.take(),
+            outline: self.outline,
             _ty: PhantomData,
         }
     }
 
     pub fn syntax_node(&self) -> SyntaxNode {
-        self.green.as_ref().unwrap().root()
+        self.tree.as_ref().unwrap().root()
     }
 
+    /// The errors of what is parsed. For a full parse, every error of the text. For an outline,
+    /// those of the outline and of the lazy bodies parsed so far, whose parser errors are found
+    /// by parsing each again (none is ever parsed here): which bodies that covers depends on
+    /// what walked into them, so [`Parse::errors_with_bodies`] is the one to ask for all.
     pub fn errors(&self) -> Vec<SyntaxError> {
+        self.errors_of(false)
+    }
+
+    fn errors_of(&self, all_bodies: bool) -> Vec<SyntaxError> {
         let mut errors = if let Some(e) = self.errors.as_deref() { e.to_vec() } else { vec![] };
-        validation::validate(&self.syntax_node(), &mut errors);
+        let root = self.syntax_node();
+        let Some(edition) = self.outline else {
+            validation::validate(&root, &mut errors);
+            return errors;
+        };
+        let tree = self.tree.as_ref().unwrap().flat();
+        let source = tree.source();
+        let lazies: Vec<_> = tree.lazies().map(|at| (tree.range(at), at)).collect();
+        validation::validate_outline(
+            &root,
+            &lazies,
+            &mut |at, errors| {
+                if !all_bodies && !tree.is_parsed(at) {
+                    return false;
+                }
+                let kind = <RustLanguage as syntax_tree::Language>::kind_from_raw(tree.kind(at));
+                errors.extend(parsing::body_parser_errors(kind, source, tree.range(at), edition));
+                true
+            },
+            &mut errors,
+        );
         errors
     }
 }
@@ -107,9 +157,7 @@ impl<T> Parse<T> {
 impl<T: AstNode> Parse<T> {
     /// Converts this parse result into a parse result for an untyped syntax tree.
     pub fn to_syntax(mut self) -> Parse<SyntaxNode> {
-        let green = self.green.take();
-        let errors = self.errors.take();
-        Parse { green, errors, _ty: PhantomData }
+        self.take()
     }
 
     /// Gets the parsed syntax tree as a typed ast node.
@@ -134,7 +182,8 @@ impl<T: AstNode> Parse<T> {
 impl Parse<SyntaxNode> {
     pub fn cast<N: AstNode>(mut self) -> Option<Parse<N>> {
         if N::cast(self.syntax_node()).is_some() {
-            Some(Parse { green: self.green.take(), errors: self.errors.take(), _ty: PhantomData })
+            let Parse { tree, errors, outline, .. } = self.take();
+            Some(Parse { tree, errors, outline, _ty: PhantomData })
         } else {
             None
         }
@@ -150,6 +199,17 @@ impl Parse<SourceFile> {
         buf
     }
 
+    /// Every error of the file, bodies included: for an outline, its errors and those of every
+    /// lazy body, each parsed (once) if it was not yet. The errors are those of a full parse
+    /// of the text, the outline's first and then each body's.
+    pub fn errors_with_bodies(&self) -> Vec<SyntaxError> {
+        self.errors_of(true)
+    }
+
+    /// The parse of the text with `delete` replaced by `insert`: the smallest token, lazy
+    /// body, block or item holding the edit parsed again alone and spliced into the tree, or
+    /// the whole text when none can be (`parsing::reparsing` says when). An outline stays an
+    /// outline.
     pub fn reparse(&self, delete: TextRange, insert: &str, edition: Edition) -> Parse<SourceFile> {
         self.incremental_reparse(delete, insert, edition)
             .unwrap_or_else(|| self.full_reparse(delete, insert, edition))
@@ -162,24 +222,25 @@ impl Parse<SourceFile> {
         edition: Edition,
     ) -> Option<Parse<SourceFile>> {
         // FIXME: validation errors are not handled here
-        parsing::incremental_reparse(
-            self.tree().syntax(),
+        let parsing::Reparsed { tree, errors, .. } = parsing::incremental_reparse(
+            self.tree.as_ref().unwrap().flat(),
             delete,
             insert,
             self.errors.as_deref().unwrap_or_default().iter().cloned(),
             edition,
-        )
-        .map(|(green_node, errors, _reparsed_range)| Parse {
-            green: Some(Tree::Green(green_node)),
-            errors: if errors.is_empty() { None } else { Some(errors.into()) },
-            _ty: PhantomData,
-        })
+            self.outline.is_some(),
+        )?;
+        let outline = self.outline.map(|_| edition);
+        Some(Parse::with_outline(Tree::new(std::sync::Arc::new(tree)), errors, outline))
     }
 
     fn full_reparse(&self, delete: TextRange, insert: &str, edition: Edition) -> Parse<SourceFile> {
-        let mut text = self.tree().syntax().text().to_string();
+        let mut text = self.tree.as_ref().unwrap().flat().source().to_string();
         text.replace_range(Range::<usize>::from(delete), insert);
-        SourceFile::parse(&text, edition)
+        match self.outline {
+            Some(_) => SourceFile::parse_outline(text.into(), edition),
+            None => SourceFile::parse_shared(text.into(), edition),
+        }
     }
 }
 
@@ -194,22 +255,23 @@ impl ast::Expr {
     /// ```
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::Expr> {
         let _p = tracing::info_span!("Expr::parse").entered();
-        let (green, errors) = parsing::parse_text_at(text, parser::TopEntryPoint::Expr, edition);
-        let root = green.root();
+        let (tree, errors) =
+            parsing::parse_text_at(text.into(), parser::TopEntryPoint::Expr, edition);
+        let root = tree.root();
 
         assert!(
             ast::Expr::can_cast(root.kind()) || root.kind() == SyntaxKind::ERROR,
             "{:?} isn't an expression",
             root.kind()
         );
-        Parse::new(green, errors)
+        Parse::new(tree, errors)
     }
 }
 
 #[cfg(not(no_salsa_async_drops))]
 impl<T> Drop for Parse<T> {
     fn drop(&mut self) {
-        let Some(green) = self.green.take() else {
+        let Some(tree) = self.tree.take() else {
             return;
         };
         static PARSE_DROP_THREAD: std::sync::OnceLock<std::sync::mpsc::Sender<Tree>> =
@@ -234,7 +296,7 @@ impl<T> Drop for Parse<T> {
                     .unwrap();
                 sender
             })
-            .send(green)
+            .send(tree)
             .unwrap();
     }
 }
@@ -243,13 +305,33 @@ impl<T> Drop for Parse<T> {
 pub use crate::ast::SourceFile;
 
 impl SourceFile {
+    /// A full parse of `text`, over a shared copy of it.
     pub fn parse(text: &str, edition: Edition) -> Parse<SourceFile> {
+        SourceFile::parse_shared(text.into(), edition)
+    }
+
+    /// A full parse of `text`, whose tree shares it: the parse costs the tree's arrays only.
+    pub fn parse_shared(text: std::sync::Arc<str>, edition: Edition) -> Parse<SourceFile> {
         let _p = tracing::info_span!("SourceFile::parse").entered();
-        let (green, errors) = parsing::parse_text(text, edition);
-        let root = green.root();
+        let (tree, errors) = parsing::parse_text(text, edition, false);
+        let root = tree.root();
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
-        Parse::new(green, errors)
+        Parse::new(tree, errors)
+    }
+
+    /// An outline of `text`, for the files of dependency crates (#1294): every `fn` item's body
+    /// block (at any depth outside another body) a lazy `BLOCK_EXPR` node, parsed the first
+    /// time a cursor walks into it, to exactly the tree a full parse makes there. A body whose
+    /// tokens could parse otherwise alone (`parser::lazy_block_len`) is parsed in full here.
+    /// Its errors: [`Parse::errors`], [`Parse::errors_with_bodies`].
+    pub fn parse_outline(text: std::sync::Arc<str>, edition: Edition) -> Parse<SourceFile> {
+        let _p = tracing::info_span!("SourceFile::parse_outline").entered();
+        let (tree, errors) = parsing::parse_text(text, edition, true);
+        let root = tree.root();
+
+        assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
+        Parse::with_outline(tree, errors, Some(edition))
     }
 }
 

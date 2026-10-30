@@ -25,6 +25,7 @@ extern crate rustc_span;
 
 mod bridge;
 mod dylib;
+mod scope;
 mod server_impl;
 mod token_stream;
 
@@ -64,11 +65,13 @@ pub const RUSTC_VERSION_STRING: &str = env!("RUSTC_VERSION");
 pub struct ProcMacroSrv<'env> {
     expanders: Mutex<FxHashMap<Utf8PathBuf, Arc<dylib::Expander>>>,
     env: &'env EnvSnapshot,
+    /// How many expansions it was asked for: the next one's scope ([`scope`]).
+    expansions: std::sync::atomic::AtomicU64,
 }
 
 impl<'env> ProcMacroSrv<'env> {
     pub fn new(env: &'env EnvSnapshot) -> Self {
-        Self { expanders: Default::default(), env }
+        Self { expanders: Default::default(), env, expansions: Default::default() }
     }
 
     pub fn join_spans(&self, first: Span, second: Span) -> Option<Span> {
@@ -142,6 +145,8 @@ impl ProcMacroSrv<'_> {
         tracked_env: &'a mut TrackedEnv,
         callback: Option<ProcMacroClientHandle<'a>>,
     ) -> Result<token_stream::TokenStream<S>, ExpandError> {
+        // Counted before anything can fail: the client counts every expansion it asks for.
+        let number = self.expansions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snapped_env = self.env;
         let expander = self.expander(lib.as_ref()).map_err(|err| ExpandError::Internal {
             reason: Some(format!("failed to load macro: {err}")),
@@ -156,6 +161,7 @@ impl ProcMacroSrv<'_> {
                 .stack_size(EXPANDER_STACK_SIZE)
                 .name(macro_name.to_owned())
                 .spawn_scoped(s, move || {
+                    let _marked = scope::mark(number);
                     expander.expand(
                         macro_name,
                         macro_body,

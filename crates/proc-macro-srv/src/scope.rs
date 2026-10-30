@@ -8,6 +8,7 @@
 use std::ffi::{CString, c_char, c_int};
 
 /// What the sandbox takes as a marker: `access` of a path under it, which names no file.
+#[cfg(unix)]
 const MARK: &str = "/.blaze-test/";
 
 /// What a scope starts with: the expansion's number follows.

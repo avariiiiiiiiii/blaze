@@ -30,7 +30,7 @@ pub(crate) struct NameId(u32);
 pub(crate) type Entry = (NameId, NodeId, Mode);
 
 /// git's mode of a directory entry.
-const DIR_MODE: u32 = 0o040000;
+pub(crate) const DIR_MODE: u32 = 0o040000;
 
 /// How many symlinks one path may pass through, as Linux allows.
 const MAX_LINKS: usize = 40;
@@ -177,18 +177,20 @@ impl Tree {
         let mut hasher = Hasher::new(DIR_DOMAIN);
         for entry in &mut entries {
             let (name, child, mode) = *entry;
-            let code = if self.is_dir(child) {
+            if self.is_dir(child) {
                 entry.2 = Mode::Regular;
-                DIR_MODE
-            } else {
-                mode.git()
-            };
-            hasher.update(&code.to_le_bytes());
+            }
+            hasher.update(&self.code(child, mode).to_le_bytes());
             hasher.part(self.names[name.0 as usize].as_bytes());
             hasher.id(&self.id(child));
         }
         let id = hasher.finish();
         self.intern(id, || Node::Dir { id, entries: entries.into_boxed_slice() })
+    }
+
+    /// git's code for a directory entry: 040000 for a directory, else its file's mode.
+    pub(crate) fn code(&self, child: NodeId, mode: Mode) -> u32 {
+        if self.is_dir(child) { DIR_MODE } else { mode.git() }
     }
 
     fn child(&self, dir: NodeId, name: &str) -> Option<(NodeId, Mode)> {

@@ -104,7 +104,7 @@ caller outside base-db that set a field directly must call the base-db function 
   .with_durability(Durability::LOW).to(module)` becomes `db.set_appended_root_module(*file,
   module, Durability::LOW)` (the new `SourceDatabase` method; it does nothing when the module is
   that already, so the `if` around it can go).
-- `crates/hir-def/src/nameres/tests.rs:877` and `:886` (the parent's): `db.file_text(root)
+- `crates/hir-def/src/nameres/tests.rs:878` and `:887` (the parent's): `db.file_text(root)
   .set_appended_root_module(&mut db).to(Some("__blaze_test_harness"))` becomes
   `db.set_appended_root_module(root, Some("__blaze_test_harness"), Durability::LOW)`, and `.to(None)`
   becomes `db.set_appended_root_module(root, None, Durability::LOW)`.

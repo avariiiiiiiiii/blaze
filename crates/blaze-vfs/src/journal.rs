@@ -25,7 +25,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     Mode, Recovered, Ticket,
-    tree::{NodeId, Tree},
+    tree::{DIR_MODE, NodeId, Tree},
 };
 
 const MAGIC: [u8; 4] = *b"BZJ3";
@@ -338,7 +338,7 @@ fn write_node(tree: &Tree, written: &mut [bool], out: &mut Vec<u8>, node: NodeId
                 let name = tree.name_str(name);
                 payload.extend_from_slice(&(name.len() as u32).to_le_bytes());
                 payload.extend_from_slice(name.as_bytes());
-                payload.extend_from_slice(&mode.git().to_le_bytes());
+                payload.extend_from_slice(&tree.code(child, mode).to_le_bytes());
                 payload.extend_from_slice(&tree.id(child).0);
             }
             frame(out, DIR, &payload);
@@ -409,11 +409,16 @@ fn load(
             while !rest.is_empty() {
                 let len = u32::from_le_bytes(rest.get(..4)?.try_into().ok()?) as usize;
                 let name = std::str::from_utf8(rest.get(4..4 + len)?).ok()?;
-                let mode = u32::from_le_bytes(rest.get(4 + len..8 + len)?.try_into().ok()?);
-                let mode = Mode::from_git(mode)?;
+                let code = u32::from_le_bytes(rest.get(4 + len..8 + len)?.try_into().ok()?);
                 let id = ContentId(rest.get(8 + len..8 + len + 32)?.try_into().ok()?);
                 rest = &rest[8 + len + 32..];
                 let child = tree.node(&id)?;
+                // A directory is its node's kind; the code must say the same.
+                let mode = match code {
+                    DIR_MODE if tree.is_dir(child) => Mode::Regular,
+                    _ if tree.is_dir(child) => return None,
+                    _ => Mode::from_git(code)?,
+                };
                 let name = tree.name(name);
                 entries.push((name, child, mode));
             }

@@ -109,6 +109,12 @@ pub(crate) enum Special {
     /// The start or the end of the regions of a class; an error when there is none.
     Start(Class),
     Stop(Class),
+    /// The start or the end of the [`Class::Named`] regions of this name, whatever their
+    /// flags; an error naming the section when there is none (ELF `__start_X`, #1496).
+    Section { name: String, end: bool },
+    /// An address the writer computes from the placed regions (ELF's `_end`, `etext`,
+    /// `__bss_start`, `_DYNAMIC`).
+    Placed(fn(&[Region]) -> u64),
     /// An absolute value.
     Absolute(u64),
     /// The descriptor a live program finds its jump table by (`blaze_live::patch`).
@@ -188,6 +194,9 @@ pub(crate) enum Apply {
     /// The thread-local offset of `S + A` codegen asks for ([`blaze_codegen::RelocKind::TlsOffset`]):
     /// 32 bits on x86-64 (`TPOFF32`), a 64-bit literal on AArch64.
     TlsOffset,
+    /// `S`'s offset from the thread pointer, 64 bits: a GOT cell of an initial-exec access
+    /// to a thread-local of the image. The core's own; no reader emits it.
+    TpOff64,
     /// A relocation only the format's writer applies ([`Writer::apply`]), by its own type.
     Native(u32),
 }
@@ -470,6 +479,10 @@ pub(crate) struct Placed<'a> {
     pub exports: &'a [Export],
     pub functions: &'a [Function],
     pub entry: Option<u64>,
+    /// The addresses of `_init` and `_fini` when the image defines them (crti.o's `.init`
+    /// and `.fini`), for ELF's `DT_INIT` and `DT_FINI`.
+    pub init: Option<u64>,
+    pub fini: Option<u64>,
     pub tls: Option<Tls>,
     /// What the image is: the content ID's first 16 bytes, as its build ID or `LC_UUID`.
     pub id: [u8; 16],
@@ -515,6 +528,10 @@ pub(crate) struct Counts {
     pub function_names: u64,
     /// Bytes of code and data: a code signature hashes every page of them.
     pub image: u64,
+    /// The FDEs that will be in [`Class::EhFrame`]: Rust's and the native objects'.
+    pub fdes: u64,
+    /// The bytes of the kept native sections of [`SectionKind::Unwind`].
+    pub unwind: u64,
 }
 
 /// The file a writer makes of a placed image.

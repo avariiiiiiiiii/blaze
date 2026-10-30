@@ -6,7 +6,7 @@ pub(crate) struct Item {
     value: u64,
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Hash, Clone, Copy)]
 pub(crate) struct Value(pub(crate) u64);
 
 #[salsa::tracked(returns(copy))]

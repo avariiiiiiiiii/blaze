@@ -71,3 +71,16 @@ compile until both are added.
 - `impl_holders` lowers (does not infer) every body that may hold an impl; `Impl::all_in_crate`
   lowers `const _` bodies. Neither infers a dependency body, but both read bodies on a
   signature path.
+
+## 8. db-salsa (through lane db): hash a value when it is evicted, not when it is stored
+
+What: compute a memo's value fingerprint (`Fingerprint::of_value`) when the value is dropped
+(`evict_value(s)`, LRU), and compare a recomputation against it then; keep `Eq` backdating while
+the old value is still there.
+Where: `vendor/salsa/src/function/` (memo store, eviction, backdate), not yet wired to
+`fingerprint.rs`'s probe.
+Why: under "everything is ours, for the best performance" (docs/v2/plan/principles.md), hashing
+every `InferenceResult` and `MirBody` as it is stored walks the whole value with SipHash on every
+body's first computation, the hot path of a cold build, to serve only the values later evicted.
+Hashing at eviction costs one walk per evicted value, and only for values that are evicted. The
+`Hash` impls in `crates/hir-ty` (`infer.rs`, `mir.rs`) are the same either way.

@@ -91,6 +91,36 @@ echo "said on stderr" >&2"#,
     assert_eq!(modified, ran.began, "output is dated when the run began");
 }
 
+/// An elided script leaves what a run of it would: its directories and cargo's files, and
+/// what it printed read as cargo reads it. Here the script it stands for is never made.
+#[test]
+fn an_elided_run() {
+    let (mut unit, _) = package("elided", "exit 1");
+    unit.script = unit.script.with_file_name("never-made");
+    let files = std::collections::BTreeMap::from([(
+        PathBuf::from("build.rs"),
+        b"fn main() { println!(\"cargo:rustc-cfg=foo\"); }".to_vec(),
+    )]);
+    let stdout = crate::elide::elide(std::path::Path::new("build.rs"), &files).unwrap();
+    let ran = elided(&unit, stdout).unwrap();
+    assert!(ran.status.success() && ran.stderr.is_empty());
+    let output = ran.finish(&unit, &Context::of(&unit, &[])).unwrap();
+    assert_eq!(output.cfgs, ["foo"]);
+    assert!(unit.out_dir.is_dir());
+    let dir = run_dir(&unit);
+    assert_eq!(fs::read(dir.join("output")).unwrap(), b"cargo:rustc-cfg=foo\n");
+    assert_eq!(fs::read(dir.join("stderr")).unwrap(), b"");
+    assert_eq!(fs::metadata(dir.join("output")).unwrap().modified().unwrap(), ran.began);
+
+    let files = std::collections::BTreeMap::from([(
+        PathBuf::from("build.rs"),
+        b"fn main() { println!(\"cargo::error=no\"); }".to_vec(),
+    )]);
+    let stdout = crate::elide::elide(std::path::Path::new("build.rs"), &files).unwrap();
+    let failed = elided(&unit, stdout).unwrap().finish(&unit, &Context::of(&unit, &[]));
+    assert_eq!(failed.unwrap_err().error.0, "build script logged errors", "judged as a run is");
+}
+
 #[test]
 fn a_script_that_fails() {
     let (unit, env) = package(

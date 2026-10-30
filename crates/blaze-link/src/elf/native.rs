@@ -69,25 +69,29 @@ fn put(bytes: &mut [u8], value: &[u8]) -> Result<(), String> {
 
 fn insn(bytes: &mut [u8], keep: u32, set: u32) -> Result<(), String> {
     let place = bytes.get_mut(..4).ok_or("an instruction relocation at the end of its section")?;
-    let old = u32::from_le_bytes(place.try_into().expect("4 bytes"));
+    let old = u32::from_le_bytes([place[0], place[1], place[2], place[3]]);
     place.copy_from_slice(&((old & keep) | set).to_le_bytes());
     Ok(())
 }
 
-/// A signed `MOVZ`/`MOVN` of 16 bits of `value` at `group * 16`: `MOVN` of the inverted bits
-/// when the value is negative (lld's `writeSMovWImm`). `checked` groups must hold the whole
-/// value: 17, 33 or 49 signed bits.
+/// 16 bits of `value` at `group * 16` into a `MOVZ`, `MOVN` or `MOVK`; a `MOVZ` or `MOVN`
+/// becomes `MOVN` of the inverted bits when the value is negative (lld's `writeSMovWImm`).
+/// `checked` groups must hold the whole value: 17, 33 or 49 signed bits.
 fn smovw(bytes: &mut [u8], value: i64, group: u32, checked: bool, what: &str) -> Result<(), String> {
     if checked {
         int(value, 17 + 16 * group, what)?;
     }
-    let mut imm = (value >> (16 * group)) as u32;
-    let mut set_movz = true;
-    if imm & 0x1_0000 != 0 {
-        imm ^= 0xffff;
-        set_movz = false;
+    let place = bytes.get(..4).ok_or("an instruction relocation at the end of its section")?;
+    let old = u32::from_le_bytes([place[0], place[1], place[2], place[3]]);
+    let mut imm = ((value as u64) >> (16 * group)) as u32;
+    let mut opcode = old & (1 << 30);
+    if old & (1 << 29) == 0 {
+        if imm & 0x1_0000 != 0 {
+            imm ^= 0xffff;
+            opcode = 0;
+        } else {
+            opcode = 1 << 30;
+        }
     }
-    let keep = !((1 << 30) | (0xffff << 5));
-    let opcode = if set_movz { 1 << 30 } else { 0 };
-    insn(bytes, keep, opcode | ((imm & 0xffff) << 5))
+    insn(bytes, !((1 << 30) | (0xffff << 5)), opcode | ((imm & 0xffff) << 5))
 }

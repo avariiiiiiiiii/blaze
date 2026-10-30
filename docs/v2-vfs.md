@@ -37,8 +37,9 @@ v2 interface; what changed from it is below.
 - A view is an open root: `open` is constant time (a slot in an arena) and keeps what the root
   reaches alive until `close`. A closed view's number is never given out again, so a stale
   `ViewId` panics instead of reading another view. A what-if is `apply` and then `open`.
-- A CI job's checkout is `apply(empty, writes)` of the commit's files, opened as a view or set
-  as a head.
+- A CI job's checkout is `apply(empty, writes)` of the commit's files (each with git's mode),
+  opened as a view or set as a head. `empty` is the empty directory's root, always known.
+- The view arena is the one every crate uses: a `ViewId` is what `Vfs::open` gave.
 
 ## The journal
 
@@ -71,8 +72,11 @@ v2 interface; what changed from it is below.
 - A path whose head changed after the report, by anyone but this watcher, is not taken:
   `Watched::Conflict` names it and the head keeps its version.
 - `lost` (the system dropped changes) stops the watch with `Watched::Lost`. A rescan needs a
-  directory listing effect, which `blaze-core` does not have yet (requested). For the same
-  reason the head must already hold what the directory does when the watch starts.
+  directory listing; `blaze-core` now has `Effect::List`, which the watcher does not use yet.
+  Until it does, the head must already hold what the directory does when the watch starts.
+- Modes: `Stat` reports no executable bit or symlink and `ReadAll` reads through a link, so a
+  file the head has keeps its mode, a new one is regular, and a chmod alone is not seen
+  (requested from core: v2/requests/vfs.md item 6). A path's mode counts in the conflict check.
 - Projection (writing a head's changes back to its directory) is not in this lane yet. Until it
   is, an agent's transaction and an editor's save of the same file race, and the disk's read
   wins unless the agent's commit lands after the report.

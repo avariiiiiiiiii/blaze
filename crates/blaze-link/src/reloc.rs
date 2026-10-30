@@ -60,7 +60,7 @@ pub(crate) const WASM_MEMORY: u32 = 3;
 /// How many bytes from the place an [`Apply`] writes.
 pub(crate) fn width(apply: Apply) -> usize {
     match apply {
-        Apply::Abs64 | Apply::Rel64 | Apply::Delta64 | Apply::DtpOff64 => 8,
+        Apply::Abs64 | Apply::Rel64 | Apply::Delta64 | Apply::DtpOff64 | Apply::TpOff64 => 8,
         Apply::Section16 => 2,
         Apply::A64TlsDescCall | Apply::Native(_) => 0,
         Apply::TlsOffset => 4,
@@ -120,6 +120,7 @@ pub(crate) fn is_tls(apply: Apply) -> bool {
             | Apply::A64TpHi12
             | Apply::A64TpLo12
             | Apply::TlsOffset
+            | Apply::TpOff64
             | Apply::SecRel32
     )
 }
@@ -188,6 +189,7 @@ pub(crate) fn apply(apply: Apply, ctx: &Ctx, field: &mut [u8]) -> Result<(), Str
             let off = s.checked_sub(tls()?.addr).ok_or("a TLS offset outside TLS")? as i64 + a;
             put(field, off.to_le_bytes())
         }
+        Apply::TpOff64 => put(field, (tp_offset(ctx.arch, tls()?, s)? + a).to_le_bytes()),
         Apply::TlsOffset => match (ctx.format, ctx.arch) {
             (Format::Elf, Arch::X86_64) => {
                 let off = tp_offset(ctx.arch, tls()?, s)? + a;

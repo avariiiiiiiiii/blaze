@@ -744,7 +744,8 @@ impl SyntaxNode {
             Ref::Green(_) => SyntaxNode::new_root(self.green().to_owned()),
             Ref::Flat(root, at) => {
                 let tree = &flat(root).tree;
-                match *at == 0 && flat(root).file.is_none() && tree.range(0).start() == 0.into() {
+                let whole = flat(root).file.is_none() && tree.range(0).start() == TextSize::from(0);
+                match *at == 0 && whole {
                     true => SyntaxNode(flat_ref(*root, 0)),
                     false => SyntaxNode::new_flat_root(Arc::new(tree.subtree(*at))),
                 }

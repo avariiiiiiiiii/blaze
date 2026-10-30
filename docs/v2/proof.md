@@ -42,6 +42,14 @@ and `v2-proof` run everything together once the lanes' work is in:
   changing fingerprints, a worker keyed by `PATH`. Each becomes an oracle edit kind, and the
   environment becomes a traced input, not part of a worker's identity. (`v2-proof`, `v2-usercode`)
 
+## Where it lives
+
+The scripts are in `harness/v2/`, one entry for all of them (`proof.py`), and what each
+checks is in [the harnesses](../harness.md#the-v2-proof). `crates/blaze-v2-proof` holds the
+part that reads v2's own record: the query trace compared to name the stale query and the read
+it missed, reruns for nothing counted, SIMD byte comparison, and the round-trip and in-place
+checks of every column encoding.
+
 ## Done when
 
 - the oracle, corpus with rejections, determinism, tight memory and budgets run against v1 today through the same entry points v2 will use

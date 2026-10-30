@@ -6,19 +6,30 @@
 //! What a run is made from is a plain description ([`unit::Unit`]) that blaze's manifest
 //! reader and resolver fill; this crate reads no manifest and asks no cargo. cargo is the
 //! oracle of `harness/scripts.py`, which runs a corpus of scripts under both and compares.
+//! A script is any executable the caller places (`Unit::script`); nothing here assumes where
+//! or by what it was compiled.
+//!
+//! For blaze v2 (docs/v2/usercode.md): scripts that only print constant directives are read
+//! rather than run ([`elide`](mod@elide), #1296); the environment says what cargo sets from the unit and
+//! what it passes through ([`Env::from_unit`], #805); and what cargo's rule watches of a run
+//! is data ([`watch`]), for a run keyed as cargo keys it (#1450).
 //!
 //! [#89]: https://github.com/indexable-inc/blaze/issues/89
 //! [#147]: https://github.com/indexable-inc/blaze/issues/147
 
 pub mod apply;
+pub mod elide;
 pub mod env;
 pub mod output;
 pub mod run;
 pub mod unit;
+pub mod watch;
 
-pub use env::{Env, env, envify};
+pub use elide::{elide, verify};
+pub use env::{Env, Origin, env, envify};
 pub use output::{Output, parse};
 pub use unit::Unit;
+pub use watch::{Watched, watched};
 
 /// What cargo would fail with, in cargo's words.
 #[derive(Clone, Debug, PartialEq, Eq)]

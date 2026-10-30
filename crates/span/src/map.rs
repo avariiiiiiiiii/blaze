@@ -3,6 +3,8 @@
 
 use std::{fmt, hash::Hash};
 
+use blaze_format::Spans;
+use blaze_ids::ContentId;
 use stdx::{always, itertools::Itertools};
 
 use crate::{
@@ -245,20 +247,41 @@ impl Drop for SpanMap {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Debug)]
+/// The anchors of a real file's spans: the items whose ast ids the spans of the text from where
+/// each begins up to the next one are relative to.
+///
+/// What it is (what is compared and hashed) is each anchor with the length of its text, not
+/// where that text is: no position in the file. The positions lookups take are summed from
+/// the lengths when the map is made.
+#[derive(Debug)]
 pub struct RealSpanMap {
     file_id: EditionedFileId,
-    /// Invariant: Sorted vec over TextSize
-    // FIXME: SortedVec<(TextSize, ErasedFileAstId)>?
-    pairs: Box<[(TextSize, ErasedFileAstId)]>,
-    end: TextSize,
+    /// Each anchor and the length of its text, in the order of the text; the first begins at 0.
+    anchors: Box<[(ErasedFileAstId, TextSize)]>,
+    /// Where each anchor's text begins: the lengths before it, summed.
+    starts: Box<[TextSize]>,
+}
+
+impl PartialEq for RealSpanMap {
+    fn eq(&self, other: &RealSpanMap) -> bool {
+        self.file_id == other.file_id && self.anchors == other.anchors
+    }
+}
+
+impl Eq for RealSpanMap {}
+
+impl Hash for RealSpanMap {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.file_id.hash(state);
+        self.anchors.hash(state);
+    }
 }
 
 impl fmt::Display for RealSpanMap {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "RealSpanMap({:?}):", self.file_id)?;
-        for span in self.pairs.iter() {
-            writeln!(f, "{}: {:#?}", u32::from(span.0), span.1)?;
+        for (start, (ast_id, _)) in self.starts.iter().zip(&self.anchors) {
+            writeln!(f, "{}: {:#?}", u32::from(*start), ast_id)?;
         }
         Ok(())
     }
@@ -269,26 +292,52 @@ impl RealSpanMap {
     pub fn absolute(file_id: EditionedFileId) -> Self {
         RealSpanMap {
             file_id,
-            pairs: Box::from([(TextSize::new(0), ROOT_ERASED_FILE_AST_ID)]),
-            end: TextSize::new(!0),
+            anchors: Box::from([(ROOT_ERASED_FILE_AST_ID, TextSize::new(!0))]),
+            starts: Box::from([TextSize::new(0)]),
         }
     }
 
+    /// The map of a file of `end` bytes whose anchors begin at `pairs`' offsets, in order,
+    /// the first at 0.
     pub fn from_file(
         file_id: EditionedFileId,
         pairs: Box<[(TextSize, ErasedFileAstId)]>,
         end: TextSize,
     ) -> Self {
-        Self { file_id, pairs, end }
+        always!(
+            pairs.first().is_some_and(|it| it.0 == TextSize::new(0))
+                && pairs.windows(2).all(|it| it[0].0 <= it[1].0)
+                && pairs.last().is_some_and(|it| it.0 <= end),
+            "the anchors of a file begin at 0, in order, within it"
+        );
+        let anchors = pairs
+            .iter()
+            .enumerate()
+            .map(|(i, &(start, ast_id))| {
+                let next = pairs.get(i + 1).map_or(end, |it| it.0);
+                (ast_id, next.checked_sub(start).unwrap_or_default())
+            })
+            .collect();
+        let starts = pairs.iter().map(|&(start, _)| start).collect();
+        RealSpanMap { file_id, anchors, starts }
+    }
+
+    /// Where the file ends: past the last anchor's text.
+    fn end(&self) -> TextSize {
+        let last = self.anchors.len() - 1;
+        self.starts[last].checked_add(self.anchors[last].1).unwrap_or(TextSize::new(!0))
+    }
+
+    /// The number of the anchor of what begins at `offset`: the last to begin at or before it.
+    fn index_at(&self, offset: TextSize) -> usize {
+        let after = self.starts.partition_point(|&it| it <= offset);
+        after.checked_sub(1).unwrap_or_else(|| panic!("no anchor begins at or before {offset:?}"))
     }
 
     /// The anchor that the spans of what begins at `offset` are relative to, and where it begins.
     pub fn anchor_at(&self, offset: TextSize) -> (TextSize, ErasedFileAstId) {
-        let idx = self
-            .pairs
-            .binary_search_by(|&(it, _)| it.cmp(&offset).then(std::cmp::Ordering::Less))
-            .unwrap_err();
-        self.pairs[idx - 1]
+        let idx = self.index_at(offset);
+        (self.starts[idx], self.anchors[idx].0)
     }
 
     /// The map of `range` alone, as a file of its own: the spans it gives what is in `range`,
@@ -296,32 +345,65 @@ impl RealSpanMap {
     /// an anchor ([`RealSpanMap::anchor_at`]).
     pub fn within(&self, range: TextRange) -> RealSpanMap {
         let pairs = self
-            .pairs
+            .starts
             .iter()
-            .filter(|(offset, _)| range.contains(*offset))
-            .map(|&(offset, ast_id)| (offset - range.start(), ast_id))
+            .zip(&self.anchors)
+            .filter(|(offset, _)| range.contains(**offset))
+            .map(|(&offset, &(ast_id, _))| (offset - range.start(), ast_id))
             .collect::<Box<[_]>>();
         debug_assert_eq!(pairs.first().map(|it| it.0), Some(TextSize::new(0)));
-        RealSpanMap { file_id: self.file_id, pairs, end: range.len() }
+        RealSpanMap::from_file(self.file_id, pairs, range.len())
     }
 
     #[cfg(feature = "salsa")]
     pub fn span_for_range(&self, range: TextRange) -> Span {
-        assert!(
-            range.end() <= self.end,
-            "range {range:?} goes beyond the end of the file {:?}",
-            self.end
-        );
-        let start = range.start();
-        let idx = self
-            .pairs
-            .binary_search_by(|&(it, _)| it.cmp(&start).then(std::cmp::Ordering::Less))
-            .unwrap_err();
-        let (offset, ast_id) = self.pairs[idx - 1];
+        let end = self.end();
+        assert!(range.end() <= end, "range {range:?} goes beyond the end of the file {end:?}");
+        let (offset, ast_id) = self.anchor_at(range.start());
         Span {
             range: range - offset,
             anchor: crate::SpanAnchor { file_id: self.file_id, ast_id },
             ctx: SyntaxContext::root(self.file_id.edition()),
         }
+    }
+
+    /// `ranges`, of this map's text at or after where anchor `ast_id` begins, as the side table
+    /// of the anchor's spans (docs/v2/format.md section 5, "Spans"), each relative to where the
+    /// anchor begins. `anchor` is the content id of the anchor's item, which names the table;
+    /// the span of the `i`th range is the table's `i`th, `SpanRef { anchor, index: i }`.
+    ///
+    /// # Panics
+    ///
+    /// When `ast_id` is not an anchor that begins at or before the first range, or a range
+    /// begins before it or ends past the end of the text.
+    pub fn write_spans(
+        &self,
+        anchor: ContentId,
+        ast_id: ErasedFileAstId,
+        ranges: impl IntoIterator<Item = TextRange>,
+    ) -> Spans {
+        let mut spans = Spans::new(anchor);
+        let mut found = None;
+        let end = self.end();
+        for range in ranges {
+            let begins = *found.get_or_insert_with(|| self.start_of(ast_id, range.start()));
+            assert!(
+                begins <= range.start() && range.end() <= end,
+                "{range:?} is not in the text after {ast_id:?} begins at {begins:?} in {:?}",
+                self.file_id
+            );
+            spans.push(u32::from(range.start() - begins), u32::from(range.len()));
+        }
+        spans
+    }
+
+    /// Where anchor `ast_id` begins, at or before `offset`.
+    fn start_of(&self, ast_id: ErasedFileAstId, offset: TextSize) -> TextSize {
+        let last = self.index_at(offset);
+        let at = (0..=last).rev().find(|&it| self.anchors[it].0 == ast_id);
+        let at = at.unwrap_or_else(|| {
+            panic!("{ast_id:?} is no anchor at or before {offset:?} in {:?}", self.file_id)
+        });
+        self.starts[at]
     }
 }

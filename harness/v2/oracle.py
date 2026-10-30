@@ -235,6 +235,12 @@ def compare(a: Built, b: Built, names: tuple[str, str], whole: bool) -> list[str
     return out
 
 
+# cargo's build of a state is a function of the state (fixture.write, fixture.environment) and
+# of the profiles and tests built: random sequences, regressions, replays and reductions come
+# back to the same states, and build each with cargo once per run.
+REFERENCES: dict[tuple[tuple[str, ...], bool, tuple[tuple[str, int], ...]], Built] = {}
+
+
 class Round:
     """One sequence's workspace and its incremental daemon; a build from scratch and cargo's
     beside it at each step."""
@@ -403,8 +409,12 @@ class Round:
                     os.rename(aside, self.inc_target)
 
     def reference(self, state: fixture.State) -> Built:
+        key = (self.it.profiles, self.it.tests, tuple(sorted(state.items())))
+        if (known := REFERENCES.get(key)) is not None:
+            return known
         env = self.env_of(engine.reference_env(self.cargo_target), state)
-        return self.side("cargo", state, env, self.cargo_target, False)
+        REFERENCES[key] = built = self.side("cargo", state, env, self.cargo_target, False)
+        return built
 
     def step(self, state: fixture.State, name: str, edit: fixture.Edit | None) -> Step:
         self.files = fixture.write(self.ws, state, self.files)

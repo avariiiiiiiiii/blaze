@@ -23,7 +23,10 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::{CodeHash, ItemKey};
 use serde::{Deserialize, Serialize};
 
-use crate::{Arch, CompiledFunction, Data, InstanceKey, Reloc, RelocKind, Target, content};
+use crate::{
+    Arch, CompiledFunction, Data, Init, InstanceKey, Line, Reloc, RelocKind, Static, Target, Unwind,
+    content,
+};
 
 /// What an instance refers to, in the order its front end lists them: every function, static
 /// and outside symbol, each once. Never a [`Target::Data`] or [`Target::Position`].
@@ -65,8 +68,26 @@ pub struct Template {
     pub data: Vec<TemplateData>,
     pub inlined: Vec<CodeHash>,
     pub side: Option<ContentId>,
+    pub unwind: Option<TemplateUnwind>,
+    pub lines: Vec<Line>,
     /// How many references it was made against: what [`Template::instantiate`] is given.
     pub refs: u32,
+}
+
+/// A function's [`Unwind`], its personality routine or handler by place and its
+/// language-specific data area by its index among the template's data.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum TemplateUnwind {
+    Dwarf {
+        code_align: u32,
+        data_align: i32,
+        return_address: u16,
+        cie: Vec<u8>,
+        fde: Vec<u8>,
+        personality: Option<u32>,
+        lsda: Option<u32>,
+    },
+    Windows { info: Vec<u8>, handler: Option<u32>, lsda: Option<u32> },
 }
 
 /// A static's value with what it refers to by place, as a function's [`Template`]. Never
@@ -74,25 +95,18 @@ pub struct Template {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct StaticTemplate {
     pub align: u32,
-    pub bytes: Vec<u8>,
-    pub relocs: Vec<TemplateReloc>,
+    pub init: TemplateInit,
     pub data: Vec<TemplateData>,
-    pub writable: bool,
+    pub mutable: bool,
     pub thread_local: bool,
+    pub section: Option<String>,
     pub refs: u32,
 }
 
-/// A static's value as a build links it: its bytes, and what they point at.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct CompiledStatic {
-    pub item: ItemKey,
-    pub instance: ContentId,
-    pub align: u32,
-    pub bytes: Vec<u8>,
-    pub relocs: Vec<Reloc>,
-    pub data: Vec<Data>,
-    pub writable: bool,
-    pub thread_local: bool,
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum TemplateInit {
+    Bytes { bytes: Vec<u8>, relocs: Vec<TemplateReloc> },
+    Zeroed { size: u64 },
 }
 
 /// Why a function and its references don't make a template, or a template and references
@@ -230,6 +244,58 @@ fn instantiate_relocs(
         .collect()
 }
 
+fn data_index(data: &[Data], id: ContentId) -> Result<u32, TemplateError> {
+    match data.iter().position(|it| it.id == id) {
+        Some(at) => Ok(at as u32),
+        None => Err(TemplateError::ForeignData(id)),
+    }
+}
+
+fn template_unwind(unwind: &Unwind, refs: &Refs, data: &[Data]) -> Result<TemplateUnwind, TemplateError> {
+    let routine = |it: &Option<Target>| it.as_ref().map(|it| place(refs, it)).transpose();
+    let lsda = |it: &Option<ContentId>| it.map(|it| data_index(data, it)).transpose();
+    Ok(match unwind {
+        Unwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda: area } => {
+            TemplateUnwind::Dwarf {
+                code_align: *code_align,
+                data_align: *data_align,
+                return_address: *return_address,
+                cie: cie.clone(),
+                fde: fde.clone(),
+                personality: routine(personality)?,
+                lsda: lsda(area)?,
+            }
+        }
+        Unwind::Windows { info, handler, lsda: area } => {
+            TemplateUnwind::Windows { info: info.clone(), handler: routine(handler)?, lsda: lsda(area)? }
+        }
+    })
+}
+
+fn instantiate_unwind(unwind: &TemplateUnwind, refs: &Refs, data: &[Data]) -> Result<Unwind, TemplateError> {
+    let routine = |it: Option<u32>| {
+        it.map(|at| refs.get(at as usize).cloned().ok_or(TemplateError::Place(at))).transpose()
+    };
+    let lsda =
+        |it: Option<u32>| it.map(|at| data.get(at as usize).map(|it| it.id).ok_or(TemplateError::Place(at))).transpose();
+    Ok(match unwind {
+        TemplateUnwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda: area } => {
+            Unwind::Dwarf {
+                code_align: *code_align,
+                data_align: *data_align,
+                return_address: *return_address,
+                cie: cie.clone(),
+                fde: fde.clone(),
+                personality: routine(*personality)?,
+                lsda: lsda(*area)?,
+            }
+        }
+        TemplateUnwind::Windows { info, handler, lsda: area } => {
+            Unwind::Windows { info: info.clone(), handler: routine(*handler)?, lsda: lsda(*area)? }
+        }
+    })
+}
+
 fn refs_len(refs: &Refs) -> u32 {
     u32::try_from(refs.len()).expect("an instance refers to fewer than 2^32 things")
 }
@@ -246,6 +312,8 @@ impl Template {
             data: template_data(&function.data, refs)?,
             inlined: function.inlined.clone(),
             side: function.side,
+            unwind: function.unwind.as_ref().map(|it| template_unwind(it, refs, &function.data)).transpose()?,
+            lines: function.lines.clone(),
             refs: refs_len(refs),
         })
     }
@@ -267,9 +335,11 @@ impl Template {
             align: self.align,
             code: self.code.clone(),
             relocs: instantiate_relocs(&self.relocs, refs, &data, None)?,
+            unwind: self.unwind.as_ref().map(|it| instantiate_unwind(it, refs, &data)).transpose()?,
             data,
             inlined: self.inlined.clone(),
             side: self.side,
+            lines: self.lines.clone(),
         })
     }
 
@@ -289,45 +359,77 @@ impl Template {
             Some(side) => hasher.update(&[1]).id(side),
             None => hasher.update(&[0]),
         };
+        let index = |hasher: &mut Hasher, it: &Option<u32>| match it {
+            Some(at) => {
+                hasher.update(&[1]).update(&at.to_le_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        };
+        match &self.unwind {
+            None => {
+                hasher.update(&[0]);
+            }
+            Some(TemplateUnwind::Dwarf { code_align, data_align, return_address, cie, fde, personality, lsda }) => {
+                hasher.update(&[1]).update(&code_align.to_le_bytes()).update(&data_align.to_le_bytes());
+                hasher.update(&return_address.to_le_bytes()).part(cie).part(fde);
+                index(&mut hasher, personality);
+                index(&mut hasher, lsda);
+            }
+            Some(TemplateUnwind::Windows { info, handler, lsda }) => {
+                hasher.update(&[2]).part(info);
+                index(&mut hasher, handler);
+                index(&mut hasher, lsda);
+            }
+        }
+        content::lines_into(&mut hasher, &self.lines);
         hasher.update(&self.refs.to_le_bytes());
         hasher.finish()
     }
 }
 
 impl StaticTemplate {
-    pub fn of(value: &CompiledStatic, refs: &Refs) -> Result<StaticTemplate, TemplateError> {
+    pub fn of(value: &Static, refs: &Refs) -> Result<StaticTemplate, TemplateError> {
         check_refs(refs)?;
+        let init = match &value.init {
+            Init::Bytes { bytes, relocs } => {
+                TemplateInit::Bytes { bytes: bytes.clone(), relocs: template_relocs(relocs, refs, &value.data, None)? }
+            }
+            Init::Zeroed { size } => TemplateInit::Zeroed { size: *size },
+        };
         Ok(StaticTemplate {
             align: value.align,
-            bytes: value.bytes.clone(),
-            relocs: template_relocs(&value.relocs, refs, &value.data, None)?,
+            init,
             data: template_data(&value.data, refs)?,
-            writable: value.writable,
+            mutable: value.mutable,
             thread_local: value.thread_local,
+            section: value.section.clone(),
             refs: refs_len(refs),
         })
     }
 
-    pub fn instantiate(
-        &self,
-        item: ItemKey,
-        instance: ContentId,
-        refs: &Refs,
-    ) -> Result<CompiledStatic, TemplateError> {
+    pub fn instantiate(&self, item: ItemKey, instance: ContentId, refs: &Refs) -> Result<Static, TemplateError> {
         check_refs(refs)?;
         if refs_len(refs) != self.refs {
             return Err(TemplateError::Refs { made: self.refs, given: refs_len(refs) });
         }
         let data = instantiate_data(&self.data, refs)?;
-        Ok(CompiledStatic {
+        let init = match &self.init {
+            TemplateInit::Bytes { bytes, relocs } => {
+                Init::Bytes { bytes: bytes.clone(), relocs: instantiate_relocs(relocs, refs, &data, None)? }
+            }
+            TemplateInit::Zeroed { size } => Init::Zeroed { size: *size },
+        };
+        Ok(Static {
             item,
             instance,
             align: self.align,
-            bytes: self.bytes.clone(),
-            relocs: instantiate_relocs(&self.relocs, refs, &data, None)?,
+            init,
             data,
-            writable: self.writable,
+            mutable: self.mutable,
             thread_local: self.thread_local,
+            section: self.section.clone(),
         })
     }
 }
@@ -399,8 +501,43 @@ mod tests {
             data: vec![inner, outer],
             inlined: Vec::new(),
             side: None,
+            unwind: None,
+            lines: vec![Line { at: 0, span: SpanRef { anchor: ContentId([5; 32]), index: 2 } }],
         };
         (function, refs)
+    }
+
+    #[test]
+    fn unwinding_names_its_personality_by_place_and_its_lsda_by_index() {
+        let (mut function, mut refs) = reserve(key(1), key(2), ItemKey(ContentId([3; 32])));
+        refs.push(Target::Extern("rust_eh_personality".to_owned()));
+        let lsda = function.data[0].id;
+        function.unwind = Some(Unwind::Dwarf {
+            code_align: 1,
+            data_align: -8,
+            return_address: 16,
+            cie: vec![0x0c, 7, 8],
+            fde: vec![0x0e, 16],
+            personality: Some(refs[3].clone()),
+            lsda: Some(lsda),
+        });
+        let template = Template::of(&function, &refs).unwrap();
+        assert!(matches!(
+            template.unwind,
+            Some(TemplateUnwind::Dwarf { personality: Some(3), lsda: Some(0), .. })
+        ));
+        assert_eq!(template.instantiate(function.key, &refs).unwrap(), function);
+
+        let mut foreign = function.clone();
+        foreign.unwind = Some(Unwind::Windows { info: vec![1], handler: None, lsda: Some(ContentId([8; 32])) });
+        assert_eq!(Template::of(&foreign, &refs).unwrap_err(), TemplateError::ForeignData(ContentId([8; 32])));
+        let mut unlisted = function;
+        unlisted.unwind = Some(Unwind::Windows {
+            info: vec![1],
+            handler: Some(Target::Extern("__CxxFrameHandler3".to_owned())),
+            lsda: None,
+        });
+        assert!(matches!(Template::of(&unlisted, &refs), Err(TemplateError::NotReferenced(_))));
     }
 
     #[test]
@@ -457,17 +594,28 @@ mod tests {
     fn a_static_keeps_what_it_is() {
         let item = ItemKey(ContentId([3; 32]));
         let refs = vec![Target::Function(key(2))];
-        let value = CompiledStatic {
+        let text = Data::new(1, b"hi".to_vec(), Vec::new());
+        let value = Static {
             item,
             instance: ContentId([4; 32]),
             align: 8,
-            bytes: vec![0; 8],
-            relocs: vec![Reloc { at: 0, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 }],
-            data: Vec::new(),
-            writable: true,
+            init: Init::Bytes {
+                bytes: vec![0; 24],
+                relocs: vec![
+                    Reloc { at: 0, kind: RelocKind::Abs64, target: refs[0].clone(), addend: 0 },
+                    Reloc { at: 8, kind: RelocKind::Abs64, target: Target::Data(text.id), addend: 0 },
+                ],
+            },
+            data: vec![text],
+            mutable: true,
             thread_local: false,
+            section: Some(".init_array".to_owned()),
         };
         let template = StaticTemplate::of(&value, &refs).unwrap();
         assert_eq!(template.instantiate(item, value.instance, &refs).unwrap(), value);
+
+        let zeroed = Static { init: Init::Zeroed { size: 1 << 20 }, data: Vec::new(), ..value };
+        let template = StaticTemplate::of(&zeroed, &refs).unwrap();
+        assert_eq!(template.instantiate(item, zeroed.instance, &refs).unwrap(), zeroed);
     }
 }

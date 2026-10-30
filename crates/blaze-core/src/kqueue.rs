@@ -281,6 +281,10 @@ impl Kqueue {
             | Effect::Stat { .. }
             | Effect::List { .. }
             | Effect::Remove { .. }
+            | Effect::List { .. }
+            | Effect::WriteAt { .. }
+            | Effect::Rename { .. }
+            | Effect::Mode { .. }
             | Effect::Map { .. }) => {
                 let work = self.work.as_ref().expect("the driver is running");
                 work.send(effect).expect("the IO threads are running");
@@ -1254,6 +1258,11 @@ mod tests {
             run_until_idle(driver, &mut effects, |done, effects| {
                 seen.push(match done.done {
                     Done::Stat(Some(meta)) => format!("stat {} {}", meta.len, meta.dir),
+                    Done::Listed(entries) => {
+                        let entries: Vec<_> =
+                            entries.iter().map(|(name, meta)| (name.as_str(), meta.len, meta.dir)).collect();
+                        format!("listed {entries:?}")
+                    }
                     Done::Failed(_) => "failed".to_owned(),
                     other => format!("{other:?}"),
                 });
@@ -1272,6 +1281,13 @@ mod tests {
                     12 => Effect::Stat { file: name("out/l"), tag: Tag(13) },
                     13 => Effect::ReadAll { file: name("missing"), tag: Tag(14) },
                     14 => Effect::Read { file: name("missing"), at: 0, len: 1, tag: Tag(15) },
+                    15 => Effect::WriteAt { file: file.clone(), at: 6, bytes: b"!".to_vec(), tag: Tag(16) },
+                    16 => Effect::ReadAll { file: file.clone(), tag: Tag(17) },
+                    17 => Effect::Mode { file: file.clone(), mode: 0o600, tag: Tag(18) },
+                    18 => Effect::Rename { from: file.clone(), to: name("vfs/moved"), tag: Tag(19) },
+                    19 => Effect::List { dir: name("vfs"), tag: Tag(20) },
+                    20 => Effect::List { dir: name("missing"), tag: Tag(21) },
+                    21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], tag: Tag(22) },
                     _ => return,
                 };
                 effects.push(next);
@@ -1287,6 +1303,13 @@ mod tests {
         assert_eq!(kqueue[6], "stat 4 false");
         assert!(kqueue[7].starts_with("stat ") && kqueue[7].ends_with(" true"), "{}", kqueue[7]);
         assert_eq!(kqueue[14], "failed");
+        // Past the end, after the four bytes truncation left: a hole of zeros, then the byte.
+        assert_eq!(kqueue[16], format!("{:?}", Done::Read(b"onet\0\0!".to_vec())));
+        assert_eq!(kqueue[17], format!("{:?}", Done::Moded));
+        assert_eq!(kqueue[18], format!("{:?}", Done::Renamed));
+        assert!(kqueue[19].starts_with("listed ") && kqueue[19].contains("moved"), "{}", kqueue[19]);
+        assert!(!kqueue[19].contains("journal"), "{}", kqueue[19]);
+        assert_eq!((kqueue[20].as_str(), kqueue[21].as_str()), ("failed", "failed"));
         for it in [ours, theirs] {
             std::fs::remove_dir_all(it).unwrap();
         }

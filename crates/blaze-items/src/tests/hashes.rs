@@ -77,7 +77,7 @@ fn g(s: &T) -> u32 { h(s) }
 fn move_keeps_hashes_and_changes_the_key() {
     let (mut db, file) = single(
         r#"
-fn f(x: u32) -> u32 { x * 2 }
+pub(crate) fn f(x: u32) -> u32 { x * 2 }
 "#,
     );
     let f = of(&db, "f");
@@ -91,12 +91,30 @@ mod m {
 }
 "#,
     );
-    let moved = of(&db, "m::f");
-    assert_eq!(moved.code, f.code);
+    assert_eq!(of(&db, "m::f"), f);
     assert_ne!(item_key(&db, item(&db, "m::f")), key);
-    // A visibility is relative to the item's module: `pub(crate)` in `m` is not private at
-    // the root.
-    assert_ne!(moved.interface, f.interface);
+}
+
+#[test]
+fn a_visibility_is_relative_to_the_module() {
+    let (mut db, file) = single(
+        r#"
+fn f() {}
+mod m { pub(super) fn g() {} }
+"#,
+    );
+    let (f, g) = (of(&db, "f"), of(&db, "m::g"));
+    assert_ne!(f.interface, g.interface, "private at the root is not `pub(super)` in `m`");
+    edit(
+        &mut db,
+        file,
+        r#"
+mod m { fn f() {} }
+mod n { mod m { pub(super) fn g() {} } }
+"#,
+    );
+    assert_eq!(of(&db, "m::f").interface, f.interface, "private is private wherever it is");
+    assert_eq!(of(&db, "n::m::g").interface, g.interface);
 }
 
 #[test]
@@ -267,9 +285,13 @@ struct C { a: *const A }
 fn type_name_observes_the_name() {
     let (mut db, file) = single(
         r#"
-//- minicore: type_name
+#![feature(intrinsics)]
+mod intrinsics {
+    #[rustc_intrinsic]
+    pub const fn type_name<T: ?Sized>() -> &'static str;
+}
 struct S;
-fn f() -> &'static str { core::any::type_name::<S>() }
+fn f() -> &'static str { intrinsics::type_name::<S>() }
 "#,
     );
     let f = of(&db, "f");
@@ -277,8 +299,13 @@ fn f() -> &'static str { core::any::type_name::<S>() }
         &mut db,
         file,
         r#"
+#![feature(intrinsics)]
+mod intrinsics {
+    #[rustc_intrinsic]
+    pub const fn type_name<T: ?Sized>() -> &'static str;
+}
 struct T;
-fn f() -> &'static str { core::any::type_name::<T>() }
+fn f() -> &'static str { intrinsics::type_name::<T>() }
 "#,
     );
     assert_ne!(of(&db, "f").code, f.code, "`type_name` spells the name");

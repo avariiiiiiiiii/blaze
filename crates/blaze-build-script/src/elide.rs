@@ -166,8 +166,10 @@ fn printed(tokens: &[Token<'_>]) -> Option<String> {
         let start = at + 3;
         // Arguments are literals and commas, so the first delimiter after the opening one is
         // its close, or the script is of no form read.
-        let is_delimiter = |it: &Token<'_>| matches!(it.kind, Kind::Punct('(' | ')' | '[' | ']' | '{' | '}'));
-        let end = start + tokens[start..].iter().position(is_delimiter)?;
+        let end = start
+            + tokens[start..].iter().position(|it| {
+                matches!(it.kind, Kind::Punct('(' | ')' | '[' | ']' | '{' | '}'))
+            })?;
         if !tokens[end].is_punct(close) {
             return None;
         }

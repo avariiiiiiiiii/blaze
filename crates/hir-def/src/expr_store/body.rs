@@ -279,6 +279,9 @@ pub struct BodySyntax {
     range: TextRange,
     kind: SyntaxKind,
     edition: Edition,
+    /// Whether the anchor holds a lazy node of an outline (#1294), and so is parsed again as an
+    /// outline: a full parse of its text is a different tree.
+    outline: bool,
     /// The item in [`BodySyntax::root`].
     pub item: SyntaxNodePtr,
     pub ast_id_map: AstIdMap,
@@ -323,9 +326,14 @@ impl BodySyntax {
         &self.text[self.range]
     }
 
-    /// The anchor parsed alone, when that makes the tree it is in the file.
+    /// The anchor parsed alone, when that makes the tree it is in the file: as an outline when
+    /// it is one, its bodies left to be parsed when they are entered.
     fn reparse(&self) -> Option<SyntaxNode> {
-        let file = ast::SourceFile::parse(self.text(), self.edition).syntax_node();
+        let file = match self.outline {
+            true => ast::SourceFile::parse_outline(std::sync::Arc::from(self.text()), self.edition),
+            false => ast::SourceFile::parse(self.text(), self.edition),
+        };
+        let file = file.syntax_node();
         let root = match self.kind == SyntaxKind::SOURCE_FILE {
             true => file,
             false => {
@@ -348,14 +356,25 @@ impl BodySyntax {
             );
         }
         let file = self.file_id.file_id().expect("a body written in a file").parse(db);
-        file.syntax_node()
-            .descendants()
-            .filter(|it| it.text_range() == self.range && it.kind() == self.kind)
-            .map(|it| kept(&it))
-            .find(|it| it.0 == self.tree)
-            .expect("the anchor is not in its file")
-            .1
+        // Down the nodes around the anchor only: a walk of every node would parse every body
+        // of an outline.
+        std::iter::successors(Some(file.syntax_node()), |node| {
+            node.children().find(|it| it.text_range().contains_range(self.range))
+        })
+        .filter(|it| it.text_range() == self.range && it.kind() == self.kind)
+        .map(|it| kept(&it))
+        .find(|it| it.0 == self.tree)
+        .expect("the anchor is not in its file")
+        .1
     }
+}
+
+/// Whether the subtree of `node` holds a lazy node of an outline, parsed or not.
+fn holds_lazy(node: &SyntaxNode) -> bool {
+    node.flat().is_some_and(|(tree, at)| {
+        let end = tree.end(at);
+        tree.lazies().find(|&it| it >= at).is_some_and(|it| it < end)
+    })
 }
 
 /// What the subtree of `node` is made of, as the root of a tree of its own, so that two trees
@@ -474,6 +493,7 @@ pub fn body_syntax(db: &dyn SourceDatabase, def: DefWithBodyId) -> Option<BodySy
         range: anchor.text_range(),
         kind: anchor.kind(),
         edition,
+        outline: holds_lazy(&anchor),
         item: SyntaxNodePtr::new(&relative),
         ast_id_map: src.file_id.ast_id_map(db).relative_to(&anchor, &root),
         span_map: span_map.within(anchor.text_range()),

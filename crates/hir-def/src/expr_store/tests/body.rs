@@ -24,7 +24,17 @@ fn lower(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, DefWithBod
     let fn_def = fn_def.unwrap().into();
 
     Body::of(&db, fn_def);
+    round_trip(&db, fn_def);
     (db, fn_def)
+}
+
+/// The body of `def` and its source maps, written and read back.
+fn round_trip(db: &TestDB, def: DefWithBodyId) {
+    let (body, source_map) = Body::with_source_map(db, def);
+    crate::expr_store::persist::assert_round_trip(body, source_map);
+    if let Some((body, source_map)) = Body::relative(db, def) {
+        crate::expr_store::persist::assert_round_trip(body, source_map);
+    }
 }
 
 fn pretty_print(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {

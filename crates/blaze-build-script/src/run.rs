@@ -91,13 +91,10 @@ pub fn is_second_layout(out_dir: &Path) -> bool {
         && build.is_some_and(|it| it == "build")
 }
 
-/// Runs `command`, made from `unit`'s [`Invocation`] (directly or in a sandbox).
+/// Runs `command`, made from `unit`'s [`Invocation`] (directly or in a sandbox). The script is
+/// whatever executable `unit.script` names, wherever it was made.
 pub fn run(unit: &Unit, mut command: Command) -> Result<Ran, Error> {
-    fs::create_dir_all(&unit.out_dir).map_err(|err| {
-        Error(format!("failed to create script output directory for build command: {err}"))
-    })?;
-    let failed = |err: std::io::Error| Error(format!("{}: {err}", run_dir(unit).display()));
-    let began = invocation_time(&run_dir(unit)).map_err(failed)?;
+    let began = begin(unit)?;
     command.stdin(Stdio::null());
     // A script this process just wrote stays busy while a child another thread forked holds
     // it open, until that child execs.
@@ -120,6 +117,24 @@ pub fn run(unit: &Unit, mut command: Command) -> Result<Ran, Error> {
         ))
     })?;
     Ok(Ran { began, status: output.status, stdout: output.stdout, stderr: output.stderr })
+}
+
+/// The run of a script [`crate::elide::elide`] read rather than ran, as if it had run and
+/// printed `stdout` (what elision says it prints) and nothing on stderr, and succeeded: with
+/// `OUT_DIR` and the run's directory made as for a run, so that [`Ran::finish`] judges it and
+/// writes cargo's files of it as for any other.
+pub fn elided(unit: &Unit, stdout: Vec<u8>) -> Result<Ran, Error> {
+    let began = begin(unit)?;
+    Ok(Ran { began, status: ExitStatus::default(), stdout, stderr: Vec::new() })
+}
+
+/// What cargo does before it runs a script: `OUT_DIR` made, and the time the run begins.
+fn begin(unit: &Unit) -> Result<SystemTime, Error> {
+    fs::create_dir_all(&unit.out_dir).map_err(|err| {
+        Error(format!("failed to create script output directory for build command: {err}"))
+    })?;
+    invocation_time(&run_dir(unit))
+        .map_err(|err| Error(format!("{}: {err}", run_dir(unit).display())))
 }
 
 /// `paths::set_invocation_time`: the time a file written now is given.

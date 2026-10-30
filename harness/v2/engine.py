@@ -11,9 +11,11 @@ the codegen inputs of a build, the critical path of a cold build) is a method he
 
 - a method v1 has no answer to raises `Unmeasurable`, and the result says "unmeasured": a run
   against v1 still sets the bar;
-- a method whose v2 answer the agent API (`crates/blaze-api`, docs/v2/plan/lanes/ci.md) has no request or
-  response for raises `Missing`, naming it, which fails the script: the request for it is in
-  `v2/requests/proof.md`. Nothing is guessed.
+- v2 answers each from the agent API (`crates/blaze-api`) through the command line's forms of
+  it (`crates/blaze-ui/src/api.rs`): what a request did from the `blaze-work` line a build, test
+  or run prints under `--message-format=json`; `blaze codegen-inputs --format=json`,
+  `blaze trace --out PATH` and `blaze tables --format=json` for the rest. An answer it cannot
+  read is `Failed`, naming the command. Nothing is guessed.
 
 `Failed` is a step the harness could not do (a command that timed out, a daemon that did not
 come up): an error of the run, never a finding about the compiler.
@@ -24,6 +26,7 @@ against.
 """
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -68,8 +71,11 @@ V1_LINK = re.compile(r"^link: \S+ \((.*)\)$", re.M)
 V1_DONE = re.compile(r"^(edit-to-binary:|cold: compiled|stats: )", re.M)
 SETTLE_SECS = 3.0
 QUIET_SECS = 0.25
-# `blaze_api::SCHEMA`, the agent API `V2` reads.
-V2_SCHEMA = 3
+# The commands whose request ends in `Response::Work` (crates/blaze-api/src/build.rs), which the
+# command line prints under `--message-format=json` as a `blaze-work` line
+# (crates/blaze-ui/src/api.rs, `work_json`).
+WORKING = ("build", "test", "run")
+WORK_COUNTS = ("reran", "green", "compiled", "found", "critical_path_us")
 
 type Kind = Literal["v1", "v2"]
 type Backend = Literal["cranelift", "llvm"]
@@ -93,13 +99,6 @@ class Failed(Exception):
     """A step the harness could not do, said whole: the command, its status, what it said."""
 
 
-class Missing(Failed):
-    """What was asked needs an interface the engine does not have yet, named."""
-
-    def __init__(self, what: str):
-        super().__init__(f"{what}: blaze-api schema {V2_SCHEMA} has no request for it (v2/requests/proof.md)")
-
-
 @dataclass(frozen=True)
 class Ran:
     """A command that ran to its end. Shaped as `subprocess.CompletedProcess` where
@@ -114,6 +113,11 @@ class Ran:
     def said(self, tail: int = 3000) -> str:
         return (self.stdout + self.stderr)[-tail:]
 
+    def checked(self, step: str) -> "Ran":
+        if self.returncode != 0:
+            raise Failed(f"{step}: `{' '.join(self.argv)}` exited {self.returncode}:\n{self.said()}")
+        return self
+
 
 @dataclass(frozen=True)
 class Work:
@@ -126,6 +130,7 @@ class Work:
     found: int | None = None
     link: str | None = None
     said: str = ""
+    green: int | None = None
 
 
 @dataclass(frozen=True)
@@ -420,24 +425,119 @@ class V2(Engine):
             time.sleep(0.1)
         raise Failed(f"the daemon did not answer `blaze status` for {ws} in {timeout:.0f} s")
 
+    def __init__(self, spec: EngineSpec):
+        super().__init__(spec)
+        # Each build, test and run through `build`, by its daemon's home: its step and its
+        # `blaze-work` line, or None where it printed none.
+        self.worked: dict[str, list[tuple[str, dict[str, object] | None]]] = {}
+
+    def build(self, step: str, ws: Path, env: dict[str, str], args: Sequence[str] = (), command: str = "build",
+              timeout: float = 7200) -> Ran:
+        ran = self.command(step, command, list(args), ws, env, timeout)
+        if command in WORKING:
+            label = f"{step} (`{' '.join(['blaze', command, *args])}`)"
+            lines = worked_lines(ran.stdout) if "--message-format=json" in args else []
+            if len(lines) > 1:
+                raise Failed(f"{label}: {len(lines)} `blaze-work` lines; a request reports what it did once")
+            self.worked.setdefault(env["BLAZE_HOME"], []).append((label, lines[0] if lines else None))
+        return ran
+
     def mark(self, home: Path) -> Mark:
-        raise Missing("what a request did (queries rerun and found green, functions compiled, the link), "
-                      "for `mark` and `work_since`")
+        return Mark({"requests": len(self.worked.get(str(home), []))})
 
     def work_since(self, home: Path, mark: Mark) -> Work:
-        raise Missing("what a request did (queries rerun and found green, functions compiled, the link)")
+        since = self.worked.get(str(home), [])[mark.sizes["requests"]:]
+        if not since:
+            raise Failed(f"what the daemon of {home} did: no build, test or run since the mark")
+        lines = [(label, required(label, line)) for label, line in since]
+
+        def total(field: str) -> int:
+            return sum(work_count(label, line, field) for label, line in lines)
+
+        placed = [label for label, line in lines if line["link"] == "placed"]
+        link = "patched in place" if not placed else f"placed whole: {placed[0]}"
+        return Work(compiled=total("compiled"), reran=total("reran"), found=total("found"), link=link,
+                    said="\n".join(json.dumps(line, sort_keys=True) for _, line in lines), green=total("green"))
 
     def codegen_inputs(self, ws: Path, env: dict[str, str]) -> dict[str, str]:
-        raise Missing("the codegen inputs of a view's last build: each `InstanceKey` with its `CodeHash`")
+        # `blaze codegen-inputs --format=json` (`blaze_ui::api::codegen_inputs_json`): one object
+        # from each instance key's hex to its code hash's hex.
+        ran = self.command("the codegen inputs", "codegen-inputs", ["--format=json"], ws, env, 600)
+        inputs = json_answer("the codegen inputs", ran)
+        if not isinstance(inputs, dict) or not all(isinstance(v, str) for v in cast(dict[str, object], inputs).values()):
+            raise Failed(f"`blaze codegen-inputs --format=json` printed no object of hex strings:\n{ran.said()}")
+        return cast(dict[str, str], inputs)
 
     def critical_path_s(self, ws: Path, env: dict[str, str]) -> float:
-        raise Missing("the critical path of a request, as the plane measured it")
+        kept = self.worked.get(env["BLAZE_HOME"], [])
+        if not kept:
+            raise Failed(f"the critical path of the last build of {ws}: no build of it went through the harness")
+        label, line = kept[-1]
+        return work_count(label, required(label, line), "critical_path_us") / 1e6
 
     def tables(self, ws: Path, env: dict[str, str]) -> dict[str, Table]:
-        raise Missing("the size of each long-lived table: its elements and bytes")
+        # `blaze tables --format=json`: `{"<name>": {"elements": N, "bytes": N}}`.
+        ran = self.command("the tables", "tables", ["--format=json"], ws, env, 600)
+        answer = json_answer("the tables", ran)
+        if not isinstance(answer, dict):
+            raise Failed(f"`blaze tables --format=json` printed no object:\n{ran.said()}")
+        out: dict[str, Table] = {}
+        for name, sizes in cast(dict[str, object], answer).items():
+            label = f"`blaze tables` table {name}"
+            if not isinstance(sizes, dict):
+                raise Failed(f"{label}: {sizes!r} is not {{\"elements\": N, \"bytes\": N}}")
+            sizes = cast(dict[str, object], sizes)
+            out[name] = Table(work_count(label, sizes, "elements"), work_count(label, sizes, "bytes"))
+        return out
 
     def trace(self, ws: Path, env: dict[str, str], to: Path) -> None:
-        raise Missing("a view's trace: every result of its last build with its fingerprint, edges and whether it ran")
+        # `blaze trace --out PATH` (`blaze_ui::api::trace_cbor`): the CBOR of `blaze_v2_proof::Trace`.
+        to.unlink(missing_ok=True)
+        self.command("the trace", "trace", ["--out", str(to)], ws, env, 600).checked("the trace")
+        if not to.is_file():
+            raise Failed(f"`blaze trace --out {to}` exited 0 and wrote no file")
+
+
+def json_answer(step: str, ran: Ran) -> object:
+    ran.checked(step)
+    try:
+        return json.loads(ran.stdout)
+    except json.JSONDecodeError as e:
+        raise Failed(f"{step}: `{' '.join(ran.argv)}` printed no JSON ({e}):\n{ran.said()}") from None
+
+
+def worked_lines(stdout: str) -> list[dict[str, object]]:
+    """The `blaze-work` lines of a command's `--message-format=json` output."""
+    found: list[dict[str, object]] = []
+    for text in stdout.splitlines():
+        if not text.startswith("{") or '"blaze-work"' not in text:
+            continue
+        try:
+            line = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(line, dict) and cast(dict[str, object], line).get("reason") == "blaze-work":
+            found.append(cast(dict[str, object], line))
+    return found
+
+
+def required(label: str, line: dict[str, object] | None) -> dict[str, object]:
+    """`line`, checked whole; a request without one is a `Failed` naming it."""
+    if line is None:
+        raise Failed(f"{label}: no `blaze-work` line, so what it did is not known (it is printed only under "
+                     "`--message-format=json`, and every build, test and run that runs reports it)")
+    for field_name in WORK_COUNTS:
+        work_count(label, line, field_name)
+    if line.get("link") not in ("patched", "placed"):
+        raise Failed(f"{label}: `blaze-work` has link {line.get('link')!r}, not \"patched\" or \"placed\": {line}")
+    return line
+
+
+def work_count(label: str, line: dict[str, object], field_name: str) -> int:
+    value = line.get(field_name)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise Failed(f"{label}: `blaze-work` has {field_name} {value!r}, not a count: {line}")
+    return value
 
 
 def platform_name() -> str:

@@ -328,7 +328,11 @@ the `blaze` command line and `engine.py`. So it runs against v1 now and v2 later
 
 - Where v1 has no answer (codegen inputs, a query trace, table sizes, the critical path), the
   outcome is `unmeasured`.
-- Where v2's agent API does not have the request yet, it is an error naming it.
+- v2 answers them through the command line's forms of the agent API: the `blaze-work` line
+  each build, test and run prints under `--message-format=json` (what it reran, compiled and
+  found, how it linked, its critical path), `blaze codegen-inputs --format=json`, `blaze trace
+  --out PATH` and `blaze tables --format=json`. An answer missing or unreadable is an error
+  naming the command.
 - On v2, `unmeasured` fails too.
 
 Each script writes `report.py`'s result (pass, fail, unmeasured or error per outcome) and has a

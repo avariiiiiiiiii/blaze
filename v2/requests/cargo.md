@@ -399,6 +399,8 @@ registry that requires authentication (`auth-required`) answers 401 and fails wi
 error. If v2 is to fetch from such registries, `Fetch` needs the token (never logged), or the
 daemon an `Auth`; that is an interface change to `crates/blaze-units/src/query.rs`.
 
+> forwarded to cargo: between two of lane cargo's children, in its own `crates/blaze-cargo/Cargo.toml` (where `blaze-source.workspace = true` is now, line 72); the auth note concerns `crates/blaze-units/src/query.rs`, also cargo's.
+
 ## 8. From cargo-std (to lane cargo and cargo-load): request 6 is still unwritten, and is all cargo-std waits on
 
 `crates/blaze-units/src/stdlib.rs` and `stdlib/tests.rs` are finished against request 6. As of
@@ -420,3 +422,188 @@ daemon an `Auth`; that is an interface change to `crates/blaze-units/src/query.r
 If lane cargo would rather cargo-std write `Foreign` itself, grant `crates/blaze-units/src/load/foreign.rs`
 to cargo-std and say which load queries (manifest snapshot, lock, resolve, units, `plan`) it
 calls; until then cargo-std writes nothing in `load/`.
+
+> applied by lane cargo (requests 6 and 8): `StdKey::{host, rustflags, profile_root}` are in
+> `crates/blaze-units/src/query.rs` as request 6 gives them (key domain bumped to `std key 2`;
+> the test sets them). `crate::load::Foreign`, `ForeignAsk`, `ForeignProfile` with request 6's
+> fields, and `blaze-vfs` under `[dev-dependencies]`, go to cargo-load: `Foreign` is the same
+> manifest, config, lock, resolve and units pipeline as `Plan`, its inputs taken from the key
+> instead of `Cx::config`, so the child writing that pipeline writes it (in `load.rs` or
+> `load/foreign.rs`, its choice). The user's `build-override` stays out of `StdKey`: std's build
+> scripts take library/Cargo.toml's, as `-Zbuild-std` does.
+
+## 9. From cargo-std: two steps to the speed bar that are outside cargo-std's paths
+
+- **coordinator, `harness/answers.py --write`:** besides `crates/blaze-units/src/stdlib/rustc.json`,
+  also write `crates/blaze-units/src/stdlib/table.rs`: the per-target columns `stdlib/target.rs`
+  compiles at its first call, as `static` data. Then no JSON is parsed at run time (today about
+  1 ms once per process). cargo-std will switch `target.rs` to that file once its format is agreed.
+- **lane cargo, `crates/blaze-units/src/query.rs`:** a `Persist` for already-encoded CBOR, with
+  the same schema and layout as `Cbor<T>` (`CborBytes<'a, T>(&'a [u8])`), so `StdUnits` can
+  return `Foreign`'s bytes after checking them instead of decoding and encoding them again.
+
+> forwarded to coordinator: `harness/answers.py` writing `stdlib/table.rs` is the coordinator's, not among the paths `requests` applies.
+> forwarded to cargo: `CborBytes<'a, T>` in `crates/blaze-units/src/query.rs` is lane cargo's own path; lane cargo is still running.
+
+## From concurrency: lock audit (2026-10-29)
+
+Read-only audit of `crates/blaze-cargo/` (not `remote*`, not `sandbox*`), `crates/load-cargo/`,
+`crates/project-model/` against docs/v2/plan/design/concurrency.md, by concurrency-audit-build.
+v1's daemon and CLI (`cargo/daemon.rs`, `compile_time.rs`, `trace.rs`, `events.rs`, ...) are
+left as they are: `serve/` calls none of them. The findings are in v2's daemon, `serve/`, and in
+`load-cargo/src/v2.rs`, which it calls once per unit. `serve/unit/{compile,codegen,script,test,
+run,reach}.rs` are not written yet, so the locks below are judged by what their fields' docs and
+`work.rs`'s contract say runs where. Each can be dropped before those modules use it.
+
+1. **`crates/blaze-cargo/src/serve/work.rs:75`: `JobInput::store: Arc<RwLock<Store>>`.** Every
+   worker task (`lower`, `compile`, `reach`) reads the store through it, so each read takes the
+   `RwLock`'s read side, a write to one shared counter by every core. That breaks "a read writes
+   no shared memory". It also makes every reader wait whenever the loop takes the write side to
+   place `Compiled::puts`. **Instead:** `pub store: blaze_cas::Reader` (lane concurrency is
+   writing it: lock-free reads of the published index), with puts going to the store's owner as
+   they already do through `Compiled::puts`. `Runs::start(&Store)` and `Runs::complete(&mut
+   Store)` are on the loop, which owns the `Store` outright, so they need no lock.
+2. **`crates/blaze-cargo/src/serve/unit.rs:68`: `Shared::disk: Mutex<blaze_usercode::inputs::Disk>`.**
+   `Disk` is a stat-and-hash cache whose `Inputs::file(&mut self)` hashes whole files
+   (`blaze-usercode/src/inputs.rs:124`). So this one daemon-wide mutex is held across blocking
+   file reads and BLAKE3, and every job's freshness check and run-key check queues on it. It is
+   both a lock on a read path and held while computing. `Disk::set_env` on a `Disk` shared by
+   every job also means two jobs with different environments overwrite each other's environment
+   unless set and use stay under one guard. **Instead:** keep no shared `Disk` here. Give each
+   task its own `Disk` over a shared, append-only `path hash → (Stamp, [u8; 32])` table: lookups
+   are acquire loads, a changed stamp publishes a new entry with one release store, and hashing
+   happens outside any lock. Pass the job's environment as an argument, never as state on the
+   shared value. The `&self` table belongs in `blaze-usercode::inputs`, which usercode owns; the
+   same finding is in v2/requests/usercode.md.
+3. **`crates/blaze-cargo/src/serve/unit.rs:71`: `Shared::images: Mutex<HashMap<String, codegen::Linked>>`.**
+   It is taken per linked unit on a worker (`Front::compile`), and as written the obvious use
+   holds it across the incremental relink: a global lock on a hot write path, held while
+   computing. **Instead:** each image is touched by one unit's compile at a time, so let the
+   loop own the map. It hands the previous `Linked` into the compile task when it posts it, and
+   takes the new one back in `Compiled`, so workers share nothing. If workers must look it up,
+   use an append-only table keyed by the output path's hash, with each `Linked` published once
+   and replaced by swapping the entry, never mutated in place.
+4. **`crates/blaze-cargo/src/serve/unit.rs:152`: `Job::scripts: Mutex<BTreeMap<usize, script::Applied>>`.**
+   The loop writes it once per build-script run, and every dependent's `compile` on a worker
+   reads it (`rustc-link-lib`, `rustc-link-search`, `DEP_*`). That is a global mutex on a read
+   path, and a `BTreeMap` walk per read. **Instead:** `scripts: Box<[OnceLock<script::Applied>]>`,
+   indexed by unit (units are dense `0..graph.units.len()`). The loop `set`s an entry before it
+   posts any dependent, and readers `get` it with one acquire load. Each script runs once per
+   job, so a write-once slot fits.
+5. **`crates/blaze-cargo/src/serve/unit.rs:154`: `Job::made: Mutex<BTreeMap<usize, compile::Made>>`.**
+   Each unit's `compile` writes it and later units' compiles and the test start read it, so the
+   same mutex sits on a read path shared by every worker. **Instead:** `made:
+   Box<[OnceLock<compile::Made>]>` by unit, set once by the compile that made it (or by the loop
+   from `Compiled`), read lock-free.
+6. **`crates/load-cargo/src/v2.rs:107` (taken at `:358`, `:395`, `:438` via `Lowered::db`, `:446`): `Lowered::db: Mutex<Db>`.**
+   - `Lowered::snapshot` locks the database to clone a salsa snapshot, once per worker task
+     (per unit compiled or reached): a global mutex on a read path.
+   - `Lowered::ran` (`:395`) and `Lowered::macros` (`:438`) hold the same guard across salsa
+     writes (`set_files`, `set_cfg_options`, `set_env`, `ProcMacros::set_by_crate`) and reads
+     (`cfg_options`, `env`, `by_crate`). Salsa's write blocks until every live snapshot has
+     been cancelled and dropped. So a worker calling `snapshot()` meanwhile blocks on the
+     mutex behind a loop thread that is itself waiting on other workers. That is a guard held
+     across a query call (deadlock and priority-inversion risk), and a thread waiting on
+     another's work.
+
+   **Instead:** split `Lowered` into a loop-owned writer (`Db` by value, `ran(&mut self)`,
+   `macros(&mut self)`, no mutex) and the read-only part every task shares (`units`, `sets`).
+   The loop makes a task's snapshot when it posts the task and passes it in `JobInput` or the
+   task, so a worker never touches shared state to get one. After a write, the loop makes new
+   snapshots for the tasks it posts next.
+7. **`crates/load-cargo/src/v2.rs:113` (taken at `:397`): `Lowered::applied: Mutex<Vec<Vec<(usize, Applied)>>>`.**
+   Only the loop writes it, inside `ran`, but it is held across the same salsa reads and writes
+   as finding 6 (`:413`–`:418`). **Instead:** a plain field of the loop-owned writer from finding
+   6, with no lock.
+
+Note, not a lock-rule finding: `crates/blaze-cargo/src/serve/fetch/git.rs:35` takes cargo's
+`PackageCacheLock`, a file lock held across a git network fetch on an IO thread. It serializes
+every git fetch the daemon makes, and makes the daemon wait on a running cargo ("Blocking waiting
+for file lock on package cache"). docs/v2/plan/design/concurrency.md says "No build lock". It's
+off the hot path, but check whether a fetch into a `CARGO_HOME` of blaze's own could commit by
+atomic rename and drop the lock.
+
+> forwarded to cargo: every finding is in lane cargo's own paths (`crates/blaze-cargo/src/serve/`, `crates/load-cargo/`); lane cargo is still running.
+
+## 10. From cargo-load-source (to cargo-load and cargo-daemon-fetch)
+
+**What (to cargo-load, `crates/blaze-units/Cargo.toml`):** `sha2 = { version = "0.10", optional = true }`
+under `[dependencies]`, and `"dep:sha2"` in the `query` feature (blaze-registry and blaze-store
+already take `sha2 = "0.10"`; it is in `Cargo.lock`).
+**Why:** `src/load/source/tree.rs` checks a `directory` source's files against its
+`.cargo-checksum.json` as cargo's `DirectorySource::verify` does (`Sha256::digest`). Without it
+`load/source/tree.rs` does not compile.
+
+**What (to cargo-daemon-fetch, `crates/blaze-cargo/src/serve/fetch/`):** a `FetchKind::Crate`
+whose `url` is `file:///<path>` is a `local-registry`'s `.crate`: read it at that path (no network,
+so also offline), check its sha256 and unpack it at `at`
+(`$CARGO_HOME/registry/src/<dir>/<name>-<version>`), as cargo's `LocalRegistry` unpacks it.
+`Sources::locate` makes such a fetch only once the `.crate` reads through a mount.
+**Why:** `archive.rs` fetches over HTTP only; a local registry's packages otherwise never unpack.
+
+**Note (to cargo-daemon-fetch, re the note of request 7):** a sparse registry whose `config.json`
+has `auth-required = true` is already `Located::Failed` ("... requires authentication
+(`auth-required` in its config.json), and blaze sends no registry token yet"), so no fetch of
+one is made until `Fetch` carries a credential.
+
+> forwarded to cargo: between lane cargo's children, in its own `crates/blaze-units/Cargo.toml` (`sha2` 0.10 is a workspace-less dependency there; the lock has it) and `serve/fetch/`.
+
+## 11. From cargo-cli (to ci, `crates/blaze-api/src/lib.rs`; and to cargo-daemon, which fills them)
+
+`crates/blaze-cargo/src/cli/` is written against these. Without them it does not compile.
+
+```rust
+pub enum Request {
+    // ... every variant as it is, and:
+    /// `blaze stop`: the daemon's state made durable, then it exits; answered with
+    /// `Done { ok: true }` before it does.
+    Stop,
+}
+
+pub struct UnitOf {
+    // ... the fields as they are, and:
+    /// The unit is compiled with `--test` (cargo's `CompileMode::Test`): cargo names it
+    /// `` `foo` (lib test) `` in "generated N warnings" and "could not compile".
+    pub test: bool,
+}
+
+pub struct Artifact {
+    // ... the fields as they are, and:
+    /// What runs the executable before it, cargo's `target.<triple>.runner` (and
+    /// `CARGO_TARGET_<TRIPLE>_RUNNER`): program then arguments; empty for none.
+    pub runner: Vec<String>,
+    /// The variables cargo sets for running it (`Compilation::target_process`, `fill_env`):
+    /// `CARGO_MANIFEST_DIR`, `CARGO_MANIFEST_PATH`, `CARGO_PKG_*`, `CARGO_CRATE_NAME`... ,
+    /// `OUT_DIR` of a package with a build script, the library search path
+    /// (`DYLD_FALLBACK_LIBRARY_PATH`/`LD_LIBRARY_PATH`/`PATH`) with cargo's directories first.
+    /// None of the user's environment. Empty for an artifact that does not run.
+    pub env: Vec<(String, String)>,
+    /// The target's `harness` (`[[test]] harness = false` is false): cargo passes `--quiet`
+    /// to a harness under `-q`.
+    pub harness: bool,
+}
+```
+
+**Why:** the CLI runs `run`'s program and `test`'s executables itself, on the terminal
+(docs/v2/plan/lanes/cargo/notes.md section 7), and reads no manifest, so what cargo knows of
+how to run each (its runner, its variables, whether it has libtest's harness) has to come
+with the artifact; v1's client had it from v1's daemon (`Program::env`). `UnitOf::test`: cargo's
+per-unit summary lines name a test unit differently, and `UnitTarget` cannot tell a lib's
+test unit from the lib. `Stop`: cargo-daemon's `serve.rs` already documents
+`blaze_api::Request::Stop`.
+
+**To cargo-daemon:** for `Cargo::command == "run"` the daemon builds what cargo's
+`commands/run.rs` and `ops::run` build: one program, with `default-run` applied and their
+errors ("`cargo run` could not determine which binary to run...", "a bin target must be
+available for `cargo run`") as `Response::Error`; the CLI only checks the one it got
+(`cli/run.rs`'s `pick`). For `test`/`bench`, a doc test is an `Artifact` of kind `doctest`
+with `executable` set. The CLI starts `blaze serve` (no arguments) with stdout and stderr
+appended to `<serve::state()>/serve.log`, and waits up to 10 s for `serve::socket()`.
+
+**Asked, not written against (output that differs from cargo's until it is there):**
+- a `Response::UnitEnded(UnitOf)` when a unit's compile ends: cargo prints a unit's
+  "generated N warnings" / "could not compile" when it ends; the CLI prints them all at the
+  build's end.
+- the workspace's member count in `Response::Built` (cargo's `needs_spec_flag`): the CLI puts
+  `-p foo` in "to rerun pass" when `-p` was given or the built tests are of more than one
+  path package.

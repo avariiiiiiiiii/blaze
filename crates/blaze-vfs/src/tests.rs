@@ -8,8 +8,8 @@ use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Change, ChangeKind, CommitError, FILE_DOMAIN, Mode, Op, OpError, Ticket, View, Vfs, Watched,
-    Watcher,
+    Change, ChangeKind, CommitError, FILE_DOMAIN, Mode, Op, OpError, Reader, Ticket, View, Vfs,
+    Watched, Watcher,
     tree::{NodeId, Tree},
 };
 
@@ -341,7 +341,7 @@ fn views_read_share_and_outlive_collection_until_closed() {
     let again = vfs.open(View { root }).unwrap();
     assert!(again != view && again != main);
     assert_eq!(vfs.open(View { root: pr }), Err(CommitError::UnknownBase(pr)));
-    assert_eq!(vfs.apply(pr, &[]), Err(OpError::NotFound(format!("root {pr:x}"))));
+    assert_eq!(vfs.apply(pr, &[]), Err(OpError::UnknownRoot(pr)));
 }
 
 #[test]
@@ -472,11 +472,16 @@ fn model_apply(model: &mut BTreeMap<String, (Mode, Vec<u8>)>, op: &Op) -> bool {
 }
 
 #[test]
+fn listed(reader: &Reader, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
+    Some(reader.list(root, path)?.map(|(name, dir)| (name.to_owned(), dir)).collect())
+}
+
+#[test]
 fn the_reader_reads_every_root_as_the_vfs_does() {
     let mut vfs = new_vfs();
     let reader = vfs.reader();
     let empty = vfs.empty();
-    assert_eq!(reader.list(empty, ""), Some(Vec::new()), "the empty root is there from the start");
+    assert_eq!(listed(&reader, empty, ""), Some(Vec::new()), "the empty root is there from the start");
     let ops = [
         write("src/lib.rs", "fn a() {}"),
         write_as("run.sh", "echo", Mode::Executable),
@@ -490,39 +495,62 @@ fn the_reader_reads_every_root_as_the_vfs_does() {
         assert_eq!(read, file, "{path}");
     }
     for path in ["", "src", "run.sh", "nope"] {
-        assert_eq!(reader.list(root, path), vfs.list(view, path), "{path}");
+        assert_eq!(listed(&reader, root, path), vfs.list(view, path), "{path}");
     }
     let file_id = vfs.lookup(view, "run.sh").unwrap();
-    assert_eq!(reader.list(file_id, ""), None, "a file is no root");
+    assert_eq!(listed(&reader, file_id, ""), None, "a file is no root");
     assert_eq!(reader.file(file_id, ""), None);
 
-    // A what-if is readable as soon as `apply` gives its ID; another thread reads while the
-    // tree goes on.
+    // A what-if is readable as soon as `apply` gives its ID. Readers on other threads go on
+    // while the table grows and collections swap levels under them; what a collection keeps
+    // reads the same throughout.
     let what_if = vfs.apply(root, &[edit("src/lib.rs", 0, 2, "pub fn")]).unwrap();
     std::thread::scope(|scope| {
-        let reader = reader.clone();
-        let reading = scope.spawn(move || {
-            (0..1000).all(|_| {
-                reader.file(what_if, "src/lib.rs").map(|it| it.2.to_vec())
-                    == Some(b"pub fn a() {}".to_vec())
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let reader = reader.clone();
+                scope.spawn(move || {
+                    (0..2000).all(|_| {
+                        reader.file(what_if, "src/lib.rs").map(|it| &it.2[..])
+                            == Some(b"pub fn a() {}".as_slice())
+                    })
+                })
             })
-        });
-        for at in 0..100 {
-            vfs.commit("w", vfs.head("w").unwrap(), &[write(&format!("f{at}"), "x")]).unwrap();
+            .collect();
+        for at in 0..200 {
+            let head = vfs.head("w").unwrap();
+            vfs.commit("w", head, &[write(&format!("f{at}"), "x")]).unwrap();
+            if at % 50 == 49 {
+                vfs.collect(&[what_if]);
+            }
         }
-        assert!(reading.join().unwrap());
+        for reading in readers {
+            assert!(reading.join().unwrap());
+        }
     });
+    // SAFETY: every reading thread has joined.
+    unsafe { vfs.reclaim() };
 
     // Collection takes from the reader what it takes from the tree.
     vfs.close(view);
     vfs.remove_head("w");
     vfs.collect(&[what_if]);
+    // SAFETY: no read is going on.
+    unsafe { vfs.reclaim() };
     assert!(vfs.has(what_if) && !vfs.has(root));
     assert_eq!(reader.file(root, "run.sh"), None);
-    assert_eq!(reader.list(root, ""), None);
+    assert_eq!(listed(&reader, root, ""), None);
     assert_eq!(reader.file(what_if, "run.sh").map(|it| it.1), Some(Mode::Executable));
     let next = vfs.commit("w", empty, &[write("after", "1")]).unwrap().root;
     assert_eq!(reader.file(next, "after").map(|it| it.2.to_vec()), Some(b"1".to_vec()));
+
+    // A reader outlives its `Vfs`: what was retired and not reclaimed goes with the last
+    // handle, and what the table holds still reads.
+    vfs.collect(&[]);
+    drop(vfs);
+    assert_eq!(reader.file(what_if, "run.sh"), None);
+    assert_eq!(reader.file(next, "after").map(|it| it.2.to_vec()), Some(b"1".to_vec()));
+    assert_eq!(listed(&reader, empty, ""), Some(Vec::new()));
 }
 
 #[test]

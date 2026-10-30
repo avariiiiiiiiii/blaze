@@ -712,8 +712,12 @@ class Lane:
     def build(self, step: str, count: bool, args: Sequence[str] | None = None) -> tuple[float, engine.Work | None]:
         """`blaze build`, timed from before the command to its end; with `count`, what it did."""
         mark = self.eng.mark(self.home) if count else None
+        given = list(self.build_args if args is None else args)
+        # What a v2 build did is its `blaze-work` line, printed under JSON only (engine.V2.work_since).
+        if count and "--message-format=json" not in given:
+            given.append("--message-format=json")
         began = time.monotonic()
-        ran = self.eng.build(f"{self.name}: {step}", self.ws, self.env, self.build_args if args is None else args)
+        ran = self.eng.build(f"{self.name}: {step}", self.ws, self.env, given)
         took = time.monotonic() - began
         served(self.eng, f"{self.name}: {step}", ran)
         return took, None if mark is None else self.eng.work_since(self.home, mark)
@@ -1004,8 +1008,9 @@ def own(eng: engine.Engine, rep: report.Report, args: Input, work: Path, rows: d
         try:
             before = proc_stat()
             began = time.monotonic()
-            served(eng, "the cold build of blaze", eng.build("the cold build of blaze", ws, env, (),
-                                                             timeout=COLD_BLAZE_SECS))
+            # JSON: the critical path is the build's `blaze-work` line (engine.V2.critical_path_s).
+            served(eng, "the cold build of blaze", eng.build("the cold build of blaze", ws, env,
+                                                             ["--message-format=json"], timeout=COLD_BLAZE_SECS))
             eng.wait_ready(ws, env, COLD_BLAZE_SECS)
             wall = time.monotonic() - began
             after = proc_stat()

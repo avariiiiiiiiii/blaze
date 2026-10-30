@@ -56,11 +56,16 @@ fn text(expected: &str) -> String {
     expected.strip_prefix('\n').unwrap_or(expected).to_owned()
 }
 
+/// `style` with `-Z ui-testing`, as compiletest runs rustc.
+fn ui(style: Style) -> Style {
+    Style { ui_testing: true, ..style }
+}
+
 /// What rustc writes to stderr for `diags`: each, then its closing ones.
 fn stderr(diags: &[Diag], sources: &mut Sources, style: Style) -> String {
     let closing = emit::summary(diags);
     let out: String =
-        diags.iter().chain(&closing).map(|it| emit::ui_written(it, sources, style)).collect();
+        diags.iter().chain(&closing).map(|it| emit::written(it, sources, ui(style))).collect();
     compiletest(&out, false)
 }
 
@@ -70,7 +75,7 @@ fn json(diags: &[Diag], sources: &mut Sources, style: Style) -> String {
     let out: String = diags
         .iter()
         .chain(&closing)
-        .map(|it| emit::ui_json(it, sources, style))
+        .map(|it| emit::json(it, sources, ui(style)))
         .filter(|it| !it.is_empty())
         .map(|it| it + "\n")
         .collect();
@@ -193,6 +198,48 @@ LL |         Some(y) | None => {}
 error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0408`.
+"#,
+    );
+    assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
+}
+
+// tests/ui/error-codes/E0428.rs
+#[test]
+fn primary_and_secondary_labels_on_several_lines() {
+    let file = File::new(
+        "E0428.rs",
+        r#"//@ dont-require-annotations: NOTE
+
+struct Bar; //~ NOTE previous definition of the type `Bar` here
+struct Bar; //~ ERROR E0428
+
+fn main () {
+}
+"#,
+    );
+    let first = file.find("struct Bar;");
+    let second = first + 1 + file.text[first + 1..].find("struct Bar;").unwrap();
+    let redefined = file.at(second, second + "struct Bar;".len());
+    let mut diag =
+        Diag::error(Some("E0428"), "the name `Bar` is defined multiple times", redefined.clone());
+    diag.span_label(file.at(first, first + "struct Bar;".len()), "previous definition of the type `Bar` here");
+    diag.span_label(redefined, "`Bar` redefined here");
+    diag.note("`Bar` must be defined only once in the type namespace of this module");
+    let expected = text(
+        r#"
+error[E0428]: the name `Bar` is defined multiple times
+  --> $DIR/E0428.rs:4:1
+   |
+LL | struct Bar;
+   | ----------- previous definition of the type `Bar` here
+LL | struct Bar;
+   | ^^^^^^^^^^^ `Bar` redefined here
+   |
+   = note: `Bar` must be defined only once in the type namespace of this module
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0428`.
 "#,
     );
     assert_eq!(stderr(&[diag], &mut File::sources(&[&file]), Style::default()), expected);
@@ -624,7 +671,7 @@ LL + fn setup() -> PutDown { Set }
 
 "#,
     );
-    let written = emit::ui_written(&diag, &mut File::sources(&[&file]), Style::default());
+    let written = emit::written(&diag, &mut File::sources(&[&file]), ui(Style::default()));
     assert_eq!(compiletest(&written, false), expected);
 }
 
@@ -868,8 +915,8 @@ fn colour_codes_are_rustcs() {
     let mut diag = Diag::error(Some("E0425"), "cannot find type `Something` in this scope", at.clone());
     diag.span_label(at.clone(), "not found in this scope");
     diag.span_note(at, "here");
-    let style = Style { ansi: true, ..Style::default() };
-    let rendered = emit::ui_written(&diag, &mut File::sources(&[&file]), style);
+    let style = ui(Style { ansi: true, ..Style::default() });
+    let rendered = emit::written(&diag, &mut File::sources(&[&file]), style);
     let lines: Vec<&str> = rendered.lines().collect();
     assert_eq!(
         lines[0],
@@ -877,10 +924,10 @@ fn colour_codes_are_rustcs() {
     );
     assert_eq!(lines[1], "  \x1b[1m\x1b[94m--> \x1b[0m$DIR/E0412.rs:1:6");
     assert!(lines.iter().any(|it| *it == "\x1b[1m\x1b[92mnote\x1b[0m: here"), "{rendered:?}");
-    let warned = emit::ui_written(&Diag::new(Level::Warning, None, "1 warning emitted"), &mut File::sources(&[]), style);
+    let warned = emit::written(&Diag::new(Level::Warning, None, "1 warning emitted"), &mut File::sources(&[]), style);
     assert_eq!(warned, "\x1b[1m\x1b[33mwarning\x1b[0m\x1b[1m: 1 warning emitted\x1b[0m\n\n");
     let failure = Diag::new(Level::FailureNote, None, "For more information about this error, try `rustc --explain E0425`.");
-    let written = emit::ui_written(&failure, &mut File::sources(&[]), style);
+    let written = emit::written(&failure, &mut File::sources(&[]), style);
     assert_eq!(written, "\x1b[1mFor more information about this error, try `rustc --explain E0425`.\x1b[0m\n");
 }
 
@@ -921,7 +968,7 @@ LL |     let x = 1;
 
 "}"##,
     );
-    let line = emit::ui_json(&diag, &mut File::sources(&[&file]), Style::default());
+    let line = emit::json(&diag, &mut File::sources(&[&file]), ui(Style::default()));
     assert_eq!(compiletest(&line, true), expected);
 }
 
@@ -1078,6 +1125,10 @@ fn json_of_children_without_spans_and_of_a_failure_note() {
     let short = Style { short: true, ..Style::default() };
     assert_eq!(emit::json(failure, &mut File::sources(&[]), short), "");
     assert_eq!(emit::written(failure, &mut File::sources(&[]), short), "");
+    // Only the notes naming codes to explain are left out of short; another failure note is
+    // written as one.
+    let other = Diag::new(Level::FailureNote, None, "query stack during panic:");
+    assert_eq!(emit::written(&other, &mut File::sources(&[]), short), "query stack during panic:\n");
 }
 
 /// A suggestion to remove a whole line removes its newline too, in JSON.

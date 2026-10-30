@@ -11,6 +11,8 @@ extern crate rustc_type_ir;
 mod bitset;
 mod cfg;
 mod check;
+mod constraints;
+mod dataflow;
 mod gate;
 mod inference;
 mod intervals;
@@ -21,6 +23,7 @@ mod names;
 mod polonius;
 mod qualifs;
 mod regions;
+mod relation;
 pub mod timings;
 
 use std::sync::LazyLock;

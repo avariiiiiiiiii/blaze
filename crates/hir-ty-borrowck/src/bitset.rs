@@ -47,23 +47,12 @@ impl BitSet {
         union_words(&mut self.words, &other.words)
     }
 
-    /// Keeps only the bits `other` has too.
-    pub(super) fn intersect(&mut self, other: &BitSet) {
-        for (index, word) in self.words.iter_mut().enumerate() {
-            *word &= other.words.get(index).copied().unwrap_or(0);
-        }
-    }
-
     pub(super) fn clear(&mut self) {
         self.words.fill(0);
     }
 
     pub(super) fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         iter_words(&self.words)
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.words.iter().all(|it| *it == 0)
     }
 
     pub(super) fn words(&self) -> &[u64] {
@@ -118,10 +107,6 @@ impl BitMatrix {
         BitMatrix { words, data: vec![0; rows * words] }
     }
 
-    pub(super) fn words_per_row(&self) -> usize {
-        self.words
-    }
-
     pub(super) fn row(&self, row: usize) -> &[u64] {
         &self.data[row * self.words..(row + 1) * self.words]
     }
@@ -130,23 +115,14 @@ impl BitMatrix {
         &mut self.data[row * self.words..(row + 1) * self.words]
     }
 
-    pub(super) fn contains(&self, row: usize, bit: usize) -> bool {
-        self.row(row).get(bit / 64).is_some_and(|word| word & (1 << (bit % 64)) != 0)
-    }
-
     pub(super) fn insert(&mut self, row: usize, bit: usize) {
         self.row_mut(row)[bit / 64] |= 1 << (bit % 64);
-    }
-
-    /// The row as a set of its own.
-    pub(super) fn to_set(&self, row: usize) -> BitSet {
-        BitSet { words: self.row(row).to_vec() }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BitMatrix, BitSet};
+    use super::{BitMatrix, BitSet, iter_words};
 
     #[test]
     fn filled_holds_exactly_the_bits_below_its_size() {
@@ -177,8 +153,9 @@ mod tests {
         let mut m = BitMatrix::new(3, 70);
         m.insert(1, 69);
         m.insert(2, 0);
-        assert!(m.contains(1, 69) && !m.contains(0, 69) && !m.contains(2, 69));
-        assert_eq!(m.to_set(2).iter().collect::<Vec<_>>(), vec![0]);
-        assert_eq!(m.words_per_row(), 2);
+        assert_eq!(m.words, 2);
+        assert_eq!(iter_words(m.row(0)).collect::<Vec<_>>(), Vec::<usize>::new());
+        assert_eq!(iter_words(m.row(1)).collect::<Vec<_>>(), vec![69]);
+        assert_eq!(iter_words(m.row(2)).collect::<Vec<_>>(), vec![0]);
     }
 }

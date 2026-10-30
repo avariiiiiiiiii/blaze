@@ -28,7 +28,8 @@ use tracing::{debug, instrument, trace};
 use crate::{
     BindingMode, InferenceDiagnostic, Span,
     infer::{
-        AllowTwoPhase, ByRef, Expectation, InferenceContext, PatAdjust, PatAdjustment,
+        AllowTwoPhase, ByRef, Expectation, InferenceContext, InferenceTables, PatAdjust,
+        PatAdjustment,
         expr::ExprIsRead,
     },
     next_solver::{
@@ -411,10 +412,10 @@ impl<'db> InferenceContext<'db> {
 
                 debug!("current discriminant is Ref, inserting implicit deref");
                 // Preserve the reference type. We'll need it later during THIR lowering.
-                self.result.pat_adjustments.entry(pat).or_default().push(PatAdjustment {
-                    kind: PatAdjust::BuiltinDeref,
-                    source: expected.store(),
-                });
+                self.result.pat_adjustments.push(
+                    pat,
+                    PatAdjustment { kind: PatAdjust::BuiltinDeref, source: expected.store() },
+                );
 
                 // Use the old pat info to keep `current_depth` to its old value.
                 let new_pat_info = self.adjust_pat_info(inner_mutability, pat_info);
@@ -578,16 +579,19 @@ impl<'db> InferenceContext<'db> {
             "unexpected deref pattern for builtin reference type {expected:?}",
         );
 
-        let pat_adjustments = self.result.pat_adjustments.entry(pat).or_default();
+        let pat_adjustments = &mut self.result.pat_adjustments;
+        pat_adjustments.ensure(pat);
         // We may reach the recursion limit if a user matches on a type `T` satisfying
         // `T: Deref<Target = T>`; error gracefully in this case.
         // FIXME(deref_patterns): If `deref_patterns` stabilizes, it may make sense to move
         // this check out of this branch. Alternatively, this loop could be implemented with
         // autoderef and this check removed. For now though, don't break code compiling on
         // stable with lots of `&`s and a low recursion limit, if anyone's done that.
-        if pat_adjustments.len() < self.resolver.top_level_def_map().recursion_limit() as usize {
+        if pat_adjustments.len_of(&pat) < self.resolver.top_level_def_map().recursion_limit() as usize
+        {
             // Preserve the smart pointer type for THIR lowering and closure upvar analysis.
-            pat_adjustments.push(PatAdjustment { kind: pat_adjust_kind, source: expected.store() });
+            pat_adjustments
+                .push(pat, PatAdjustment { kind: pat_adjust_kind, source: expected.store() });
         } else {
             // FIXME: Emit an error.
             inner_ty = self.types.types.error;
@@ -1722,8 +1726,10 @@ impl<'db> InferenceContext<'db> {
                 expected
             }
         };
-        if let Some(coercion) = self.result.expr_adjustments.remove(&expr) {
-            self.result.assignment_coercions.insert(expr, coercion);
+        let InferenceTables { expr_adjustments, assignment_coercions, .. } = &mut self.result;
+        if let Some(coercion) = expr_adjustments.get(&expr) {
+            assignment_coercions.insert(expr, coercion.iter().cloned());
+            expr_adjustments.remove_in_place(&expr);
         }
         ty
     }

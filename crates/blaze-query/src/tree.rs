@@ -19,15 +19,20 @@ pub trait Tree: Send + Sync {
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>>;
 }
 
-/// The VFS's files: [`blaze_vfs::Vfs::reader`], a shared handle on its immutable nodes by
+/// The VFS's files: [`blaze_vfs::Vfs::reader`], a lock-free handle on its immutable nodes by
 /// content ID. Here rather than in blaze-vfs because blaze-query depends on blaze-vfs.
+///
+/// The reader lends a file's bytes; this trait gives an `Arc`, so `file` takes one count (once
+/// per file per view, as the database keeps the input) until the database holds a view's
+/// bytes as the VFS's view keeps them (v2/requests/vfs.md item 8).
 impl Tree for blaze_vfs::Reader {
     fn file(&self, root: ContentId, path: &str) -> Option<(ContentId, Mode, Arc<[u8]>)> {
-        blaze_vfs::Reader::file(self, root, path)
+        blaze_vfs::Reader::file(self, root, path).map(|(id, mode, bytes)| (id, mode, bytes.clone()))
     }
 
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
-        blaze_vfs::Reader::list(self, root, path)
+        let names = blaze_vfs::Reader::list(self, root, path)?;
+        Some(names.map(|(name, dir)| (name.to_owned(), dir)).collect())
     }
 }
 

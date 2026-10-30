@@ -40,6 +40,8 @@ pub enum Ref {
     /// The `n`th of the template's own data.
     Data(u32),
     Position(SpanRef),
+    /// The `n`th of the template's own [`Template::externs`].
+    Extern(u32),
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -72,6 +74,10 @@ pub struct Template {
     pub lines: Vec<Line>,
     /// How many references it was made against: what [`Template::instantiate`] is given.
     pub refs: u32,
+    /// Outside symbols its backend calls of its own accord, which no front end lists
+    /// ([`crate::backend::Emitted::extra`]): a function of its code and settings, so kept with
+    /// it and never a place.
+    pub externs: Vec<String>,
 }
 
 /// A function's [`Unwind`], its personality routine or handler by place and its
@@ -125,6 +131,10 @@ pub enum TemplateError {
     Refs { made: u32, given: u32 },
     /// A place or data index past the end.
     Place(u32),
+    /// An index past the end of the template's own outside symbols.
+    Extern(u32),
+    /// A symbol a backend says it named of its own accord is not an outside symbol's name.
+    NotAnExtern(String),
 }
 
 impl std::fmt::Display for TemplateError {
@@ -146,6 +156,10 @@ impl std::fmt::Display for TemplateError {
                 write!(f, "a template made against {made} references is given {given}")
             }
             TemplateError::Place(at) => write!(f, "place {at} is past the end"),
+            TemplateError::Extern(at) => write!(f, "outside symbol {at} is past the end of the template's own"),
+            TemplateError::NotAnExtern(name) => {
+                write!(f, "the backend named {name:?} of its own accord, which is empty or listed twice")
+            }
         }
     }
 }

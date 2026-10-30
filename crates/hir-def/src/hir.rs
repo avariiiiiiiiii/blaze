@@ -14,6 +14,7 @@
 //!
 //! [`body`]: crate::expr_store::body
 
+pub(crate) mod columns;
 pub mod format_args;
 pub mod generics;
 pub(crate) mod persist;
@@ -26,7 +27,6 @@ use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
 use syntax::ast;
-use thin_vec::ThinVec;
 use type_ref::TypeRefId;
 
 use crate::{
@@ -43,9 +43,9 @@ pub use syntax::ast::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, Unar
 
 pub type BindingId = Idx<Binding>;
 
-pub type ExprId = Idx<Expr>;
+pub type ExprId = Idx<Expr<'static>>;
 
-pub type PatId = Idx<Pat>;
+pub type PatId = Idx<Pat<'static>>;
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum ExprOrPatId {
@@ -291,11 +291,13 @@ pub enum Unsafe {
     No,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Expr {
+/// An expression of a store, decoded from the store's columns: ids and small enums by value,
+/// lists and cold values borrowed from the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expr<'a> {
     /// This is produced if the syntax tree does not have a required expression piece.
     Missing,
-    Path(Path),
+    Path(&'a Path),
     If {
         condition: ExprId,
         then_branch: ExprId,
@@ -307,7 +309,7 @@ pub enum Expr {
     },
     Block {
         id: Option<BlockId>,
-        statements: Box<[Statement]>,
+        statements: &'a [Statement],
         tail: Option<ExprId>,
         label: Option<LabelId>,
         unsafe_: Unsafe,
@@ -320,17 +322,17 @@ pub enum Expr {
     },
     Call {
         callee: ExprId,
-        args: Box<[ExprId]>,
+        args: &'a [ExprId],
     },
     MethodCall {
         receiver: ExprId,
-        method_name: Name,
-        args: Box<[ExprId]>,
-        generic_args: Option<Box<GenericArgs>>,
+        method_name: &'a Name,
+        args: &'a [ExprId],
+        generic_args: Option<&'a GenericArgs>,
     },
     Match {
         expr: ExprId,
-        arms: Box<[MatchArm]>,
+        arms: &'a [MatchArm],
     },
     Continue {
         label: Option<LabelId>,
@@ -352,13 +354,13 @@ pub enum Expr {
         expr: Option<ExprId>,
     },
     RecordLit {
-        path: Path,
-        fields: ThinVec<RecordLitField>,
+        path: &'a Path,
+        fields: &'a [RecordLitField],
         spread: RecordSpread,
     },
     Field {
         expr: ExprId,
-        name: Name,
+        name: &'a Name,
     },
     Await {
         expr: ExprId,
@@ -392,29 +394,26 @@ pub enum Expr {
         index: ExprId,
     },
     Closure {
-        args: Box<[PatId]>,
-        arg_types: Box<[Option<TypeRefId>]>,
+        args: &'a [PatId],
+        arg_types: &'a [Option<TypeRefId>],
         ret_type: Option<TypeRefId>,
         body: ExprId,
         closure_kind: ClosureKind,
         capture_by: CaptureBy,
     },
     Tuple {
-        exprs: Box<[ExprId]>,
+        exprs: &'a [ExprId],
     },
-    Array(Array),
-    Literal(Literal),
+    Array(Array<'a>),
+    Literal(&'a Literal),
     Underscore,
-    OffsetOf(OffsetOf),
-    InlineAsm(InlineAsm),
+    OffsetOf(&'a OffsetOf),
+    InlineAsm(&'a InlineAsm),
     IncludeBytes,
 }
 
-#[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Expr>() == 48);
-
-impl Expr {
-    pub fn precedence(&self) -> ast::prec::ExprPrecedence {
+impl Expr<'_> {
+    pub fn precedence(self) -> ast::prec::ExprPrecedence {
         use ast::prec::ExprPrecedence;
 
         match self {
@@ -684,9 +683,9 @@ pub enum Movability {
     Movable,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Array {
-    ElementList { elements: Box<[ExprId]> },
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Array<'a> {
+    ElementList { elements: &'a [ExprId] },
     Repeat { initializer: ExprId, repeat: ExprId },
 }
 
@@ -785,21 +784,22 @@ pub struct RecordFieldPat {
     pub pat: PatId,
 }
 
-/// Close relative to rustc's hir::PatKind
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum Pat {
+/// Close relative to rustc's hir::PatKind. A pattern of a store, decoded from the store's
+/// columns as [`Expr`] is.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Pat<'a> {
     Missing,
     /// A rest pattern. Not valid outside special context.
     Rest,
     Wild,
     Tuple {
-        args: Box<[PatId]>,
+        args: &'a [PatId],
         ellipsis: Option<u32>,
     },
-    Or(Box<[PatId]>),
+    Or(&'a [PatId]),
     Record {
-        path: Path,
-        args: Box<[RecordFieldPat]>,
+        path: &'a Path,
+        args: &'a [RecordFieldPat],
         ellipsis: bool,
     },
     Range {
@@ -808,19 +808,19 @@ pub enum Pat {
         range_type: RangeOp,
     },
     Slice {
-        prefix: Box<[PatId]>,
+        prefix: &'a [PatId],
         slice: Option<PatId>,
-        suffix: Box<[PatId]>,
+        suffix: &'a [PatId],
     },
-    Path(Path),
+    Path(&'a Path),
     Lit(ExprId),
     Bind {
         id: BindingId,
         subpat: Option<PatId>,
     },
     TupleStruct {
-        path: Path,
-        args: Box<[PatId]>,
+        path: &'a Path,
+        args: &'a [PatId],
         ellipsis: Option<u32>,
     },
     Ref {
@@ -840,8 +840,8 @@ pub enum Pat {
     Expr(ExprId),
 }
 
-impl Pat {
-    pub fn walk_child_pats(&self, mut f: impl FnMut(PatId)) {
+impl Pat<'_> {
+    pub fn walk_child_pats(self, mut f: impl FnMut(PatId)) {
         match self {
             Pat::Range { .. }
             | Pat::Lit(..)
@@ -852,20 +852,20 @@ impl Pat {
             | Pat::Expr(_)
             | Pat::NotNull => {}
             Pat::Bind { subpat, .. } => {
-                subpat.iter().copied().for_each(f);
+                subpat.into_iter().for_each(f);
             }
             Pat::Or(args) | Pat::Tuple { args, .. } | Pat::TupleStruct { args, .. } => {
                 args.iter().copied().for_each(f);
             }
-            Pat::Ref { pat, .. } => f(*pat),
+            Pat::Ref { pat, .. } => f(pat),
             Pat::Slice { prefix, slice, suffix } => {
-                let total_iter = prefix.iter().chain(slice.iter()).chain(suffix.iter());
-                total_iter.copied().for_each(f);
+                let total_iter = prefix.iter().copied().chain(slice).chain(suffix.iter().copied());
+                total_iter.for_each(f);
             }
             Pat::Record { args, .. } => {
                 args.iter().map(|f| f.pat).for_each(f);
             }
-            Pat::Box { inner } | Pat::Deref { inner } => f(*inner),
+            Pat::Box { inner } | Pat::Deref { inner } => f(inner),
         }
     }
 }

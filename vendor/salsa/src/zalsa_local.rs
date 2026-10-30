@@ -479,11 +479,6 @@ impl ZalsaLocal {
     }
 
     #[cold]
-    pub(crate) fn unwind_pending_write(&self) {
-        Cancelled::PendingWrite.throw();
-    }
-
-    #[cold]
     pub(crate) fn unwind_cancelled(&self) {
         Cancelled::Local.throw();
     }

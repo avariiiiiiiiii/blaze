@@ -73,7 +73,7 @@ impl<'db> ExprCollector<'db> {
                                 .template_map
                                 .get_or_insert_with(Default::default)
                                 .implicit_capture_to_source
-                                .insert(expr_id, self.expander.in_file((template_ptr, range)));
+                                .push((expr_id, self.expander.in_file((template_ptr, range))));
                         }
                         if !hygiene.is_root() {
                             self.store.ident_hygiene.insert(expr_id.into(), hygiene);
@@ -106,7 +106,7 @@ impl<'db> ExprCollector<'db> {
             .template_map
             .get_or_insert_with(Default::default)
             .format_args_to_captures
-            .insert(idx, (hygiene, mappings));
+            .push((idx, (hygiene, mappings)));
         idx
     }
 

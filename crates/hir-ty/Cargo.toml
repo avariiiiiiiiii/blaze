@@ -44,6 +44,7 @@ tracing-tree.workspace = true
 # local deps
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-query.workspace = true
 stdx.workspace = true
 macros.workspace = true
 intern.workspace = true

@@ -11,7 +11,7 @@ use std::{
     mem,
     sync::{
         LazyLock, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -85,26 +85,41 @@ pub fn clear_tls_solver_cache() {
 }
 
 /// An open-addressed table from a key to a value of type `T`, filled in a state `S`, shared
-/// by every thread. Each slot has a lock of its own; finding a key reads only atomics, and
-/// adding one takes the table's `claim` lock, so a key is in one slot at most. When the
-/// slots a key may go to are full, the one used least lately is emptied for it.
+/// by every thread, of a fixed size. A key is found by loads alone; a slot is claimed for a
+/// key by a compare-and-swap of its key, with no lock on the table. When the slots a key may
+/// go to are full, the first one not used since a claim last passed over it is given to it
+/// (second chance). A lookup is up to `PROBE` loads from `keys` (two cache lines) and the
+/// slot's lock.
 struct Table<S, T> {
-    /// The key in each slot, 0 for none. Written only under the slot's lock.
+    /// The key in each slot, 0 for none; written only to claim or clear the slot.
     keys: Box<[AtomicU64]>,
-    /// The `clock` when each slot was last used.
-    used: Box<[AtomicU64]>,
-    slots: Box<[Mutex<Slot<S, T>>]>,
-    /// Counts the keys added.
-    clock: AtomicU64,
-    claim: Mutex<()>,
+    slots: Box<[Slot<S, T>]>,
     bits: u32,
 }
 
+/// One key's value, on cache lines of its own. Only the task solving through that key takes
+/// its lock, but for a claim emptying it for another key, so it is not contended; and it is
+/// held only around `Table::with`'s `f`, the search graph's lookup or insert, which calls
+/// nothing in the database.
+#[repr(align(128))]
 struct Slot<S, T> {
+    filled: Mutex<Filled<S, T>>,
+    /// Set by a use, cleared by a claim passing over the slot.
+    referenced: AtomicBool,
+}
+
+struct Filled<S, T> {
+    /// The key `value` is of: a slot given to another key is emptied by its first use.
+    key: u64,
     /// `None` when the slot is empty or what is in it may be half written.
     state: Option<S>,
     value: T,
 }
+
+// A slot, the search graph's cache included, takes at most two 128-byte pairs of cache lines.
+const _: () = assert!(
+    align_of::<Slot<State, Kept>>() == 128 && size_of::<Slot<State, Kept>>() <= 256
+);
 
 const EMPTY: u64 = 0;
 
@@ -113,10 +128,12 @@ impl<S: Copy + Eq, T: Default> Table<S, T> {
         let len = 1usize << bits;
         Table {
             keys: (0..len).map(|_| AtomicU64::new(EMPTY)).collect(),
-            used: (0..len).map(|_| AtomicU64::new(0)).collect(),
-            slots: (0..len).map(|_| Mutex::new(Slot { state: None, value: T::default() })).collect(),
-            clock: AtomicU64::new(0),
-            claim: Mutex::new(()),
+            slots: (0..len)
+                .map(|_| Slot {
+                    filled: Mutex::new(Filled { key: EMPTY, state: None, value: T::default() }),
+                    referenced: AtomicBool::new(false),
+                })
+                .collect(),
             bits,
         }
     }
@@ -124,30 +141,32 @@ impl<S: Copy + Eq, T: Default> Table<S, T> {
     /// Runs `f` on the value of `key`, emptied first if it was filled in a state other than
     /// `state`, or a new one.
     fn with<R>(&self, key: u64, state: S, f: impl FnOnce(&mut T) -> R) -> R {
-        assert_ne!(key, EMPTY, "0 names no key");
-        let (at, mut slot) = match self.find(key) {
+        debug_assert_ne!(key, EMPTY, "0 names no key");
+        let (at, mut filled) = match self.find(key) {
             Some(found) => found,
-            None => self.add(key),
+            None => self.claim(key),
         };
-        if slot.state != Some(state) {
-            slot.value = T::default();
-            slot.state = Some(state);
+        if filled.key != key || filled.state != Some(state) {
+            filled.key = key;
+            filled.state = Some(state);
+            filled.value = T::default();
         }
-        let now = self.clock.load(Ordering::Relaxed);
-        if self.used[at].load(Ordering::Relaxed) != now {
-            self.used[at].store(now, Ordering::Relaxed);
+        let referenced = &self.slots[at].referenced;
+        if !referenced.load(Ordering::Relaxed) {
+            referenced.store(true, Ordering::Relaxed);
         }
-        f(&mut slot.value)
+        f(&mut filled.value)
     }
 
     /// Empties every slot.
     fn clear(&self) {
         for (at, slot) in self.slots.iter().enumerate() {
             let old = {
-                let mut slot = lock(slot);
+                let mut filled = lock(&slot.filled);
                 self.keys[at].store(EMPTY, Ordering::Release);
-                slot.state = None;
-                mem::take(&mut slot.value)
+                filled.key = EMPTY;
+                filled.state = None;
+                mem::take(&mut filled.value)
             };
             drop(old);
         }
@@ -160,56 +179,102 @@ impl<S: Copy + Eq, T: Default> Table<S, T> {
         (0..PROBE.min(mask + 1)).map(move |step| (start + step) & mask)
     }
 
-    fn find(&self, key: u64) -> Option<(usize, MutexGuard<'_, Slot<S, T>>)> {
-        for at in self.window(key) {
-            if self.keys[at].load(Ordering::Acquire) != key {
-                continue;
-            }
-            let slot = lock(&self.slots[at]);
-            // It may have been given to another key while the lock was awaited.
-            if self.keys[at].load(Ordering::Relaxed) == key {
-                return Some((at, slot));
-            }
-        }
-        None
+    /// The slot holding `key`, locked.
+    fn find(&self, key: u64) -> Option<(usize, MutexGuard<'_, Filled<S, T>>)> {
+        self.window(key).find_map(|at| self.locked(at, key))
     }
 
-    fn add(&self, key: u64) -> (usize, MutexGuard<'_, Slot<S, T>>) {
-        let claim = self.claim.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Another thread may have added it since `find`.
-        if let Some(found) = self.find(key) {
-            return found;
+    /// Slot `at`, locked, if it holds `key`.
+    fn locked(&self, at: usize, key: u64) -> Option<(usize, MutexGuard<'_, Filled<S, T>>)> {
+        if self.keys[at].load(Ordering::Acquire) != key {
+            return None;
         }
-        let at = self
-            .window(key)
-            .find(|&at| self.keys[at].load(Ordering::Acquire) == EMPTY)
-            .or_else(|| self.window(key).min_by_key(|&at| self.used[at].load(Ordering::Relaxed)))
-            .expect("a window has a slot");
-        let mut slot = lock(&self.slots[at]);
-        self.keys[at].store(key, Ordering::Release);
-        self.used[at].store(self.clock.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        slot.state = None;
-        let old = mem::take(&mut slot.value);
-        drop(claim);
-        drop(old);
-        (at, slot)
+        let filled = lock(&self.slots[at].filled);
+        // It may have been given to another key while the lock was awaited.
+        (self.keys[at].load(Ordering::Acquire) == key).then_some((at, filled))
+    }
+
+    /// Gives `key` a slot: an empty one, else the first not used since a claim last passed.
+    /// Two threads claiming one key at once take the same empty slot; a key that ends in two
+    /// slots after a race for a full window is only kept twice.
+    fn claim(&self, key: u64) -> (usize, MutexGuard<'_, Filled<S, T>>) {
+        loop {
+            let mut empty = None;
+            for at in self.window(key) {
+                match self.keys[at].load(Ordering::Acquire) {
+                    found if found == key => {
+                        if let Some(claimed) = self.locked(at, key) {
+                            return claimed;
+                        }
+                    }
+                    EMPTY => {
+                        empty = Some(at);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let at = empty.unwrap_or_else(|| self.second_chance(key));
+            let old = self.keys[at].load(Ordering::Acquire);
+            if (old == EMPTY || empty.is_none())
+                && old != key
+                && self.keys[at]
+                    .compare_exchange(old, key, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                let mut filled = lock(&self.slots[at].filled);
+                // Until its first use the slot still holds the value of the key it was taken
+                // from; that is dropped here, not while a lookup of `key` waits on it.
+                let old = (filled.key != key).then(|| {
+                    filled.key = key;
+                    filled.state = None;
+                    mem::take(&mut filled.value)
+                });
+                drop(old);
+                return (at, filled);
+            }
+            // Another claim took the slot first: look again.
+        }
+    }
+
+    /// The first slot of `key`'s window not used since a claim last passed over it, clearing
+    /// the mark of each one passed over.
+    fn second_chance(&self, key: u64) -> usize {
+        for _ in 0..2 {
+            for at in self.window(key) {
+                let referenced = &self.slots[at].referenced;
+                if !referenced.load(Ordering::Relaxed) {
+                    return at;
+                }
+                referenced.store(false, Ordering::Relaxed);
+            }
+        }
+        self.window(key).next().expect("a window has a slot")
     }
 }
 
 /// A slot whose user panicked holding it may be half written: it is emptied.
-fn lock<S, T: Default>(slot: &Mutex<Slot<S, T>>) -> MutexGuard<'_, Slot<S, T>> {
+fn lock<S, T: Default>(slot: &Mutex<Filled<S, T>>) -> MutexGuard<'_, Filled<S, T>> {
     slot.lock().unwrap_or_else(|poisoned| {
         slot.clear_poison();
-        let mut slot = poisoned.into_inner();
-        slot.state = None;
-        slot.value = T::default();
-        slot
+        let mut filled = poisoned.into_inner();
+        filled.key = EMPTY;
+        filled.state = None;
+        filled.value = T::default();
+        filled
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Barrier, thread};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+    };
 
     use super::{EMPTY, Solved, Table};
 
@@ -217,6 +282,10 @@ mod tests {
 
     fn key() -> u64 {
         Solved::new().0
+    }
+
+    fn holding(table: &Table<u32, Goals>, key: u64) -> usize {
+        table.keys.iter().filter(|it| it.load(Ordering::Relaxed) == key).count()
     }
 
     #[test]
@@ -256,14 +325,14 @@ mod tests {
             table.with(query, 0, |goals| goals.insert(7, 1));
         }
         table.clear();
-        assert!(table.keys.iter().all(|it| it.load(std::sync::atomic::Ordering::Relaxed) == EMPTY));
+        assert!(table.keys.iter().all(|it| it.load(Ordering::Relaxed) == EMPTY));
         for &query in &queries {
             assert_eq!(table.with(query, 0, |goals| goals.get(&7).copied()), None);
         }
     }
 
     #[test]
-    fn a_key_added_by_many_threads_at_once_is_in_one_slot() {
+    fn a_key_claimed_by_many_threads_at_once_is_in_one_slot() {
         let table = Table::<u32, Goals>::new(4);
         let query = key();
         let start = Barrier::new(8);
@@ -276,26 +345,33 @@ mod tests {
                 });
             }
         });
-        let holding = table
-            .keys
-            .iter()
-            .filter(|it| it.load(std::sync::atomic::Ordering::Relaxed) == query)
-            .count();
-        assert_eq!(holding, 1);
+        assert_eq!(holding(&table, query), 1);
         assert_eq!(table.with(query, 0, |goals| goals.len()), 8);
     }
 
     #[test]
-    fn a_full_window_keeps_the_slots_used_last() {
+    fn a_full_window_gives_away_a_slot_not_used_since_the_last_claim() {
+        // Every slot is in every window of a 16-slot table.
         let table = Table::<u32, Goals>::new(4);
-        let queries: Vec<u64> = (0..17).map(|_| key()).collect();
-        for &query in &queries[..16] {
+        let queries: Vec<u64> = (0..16).map(|_| key()).collect();
+        for &query in &queries {
             table.with(query, 0, |goals| goals.insert(7, 1));
         }
-        // Every slot is in every window of a 16-slot table; the first was used least lately.
-        table.with(queries[16], 0, |goals| goals.insert(7, 1));
-        assert_eq!(table.with(queries[0], 0, |goals| goals.get(&7).copied()), None);
-        assert_eq!(table.with(queries[15], 0, |goals| goals.get(&7).copied()), Some(1));
+        let (sixteenth, seventeenth) = (key(), key());
+        table.with(sixteenth, 0, |goals| goals.insert(7, 1));
+        let kept: Vec<u64> =
+            queries.iter().copied().filter(|&it| holding(&table, it) == 1).collect();
+        assert_eq!(kept.len(), 15);
+        // That claim cleared every mark; all but one of the queries left are used again.
+        let idle = kept[0];
+        for &query in &kept[1..] {
+            assert_eq!(table.with(query, 0, |goals| goals.get(&7).copied()), Some(1));
+        }
+        table.with(seventeenth, 0, |goals| goals.insert(7, 1));
+        assert_eq!(holding(&table, idle), 0);
+        for &query in kept[1..].iter().chain([&sixteenth, &seventeenth]) {
+            assert_eq!(holding(&table, query), 1);
+        }
     }
 
     /// The cache before this one: per thread, the last `KEPT` queries' goals, all dropped when
@@ -345,7 +421,7 @@ mod tests {
         // A small table, so slots are taken from queries under way.
         let table = Table::<u32, Goals>::new(5);
         let queries: Vec<u64> = (0..96).map(|_| key()).collect();
-        let shared_hits = std::sync::atomic::AtomicUsize::new(0);
+        let shared_hits = AtomicUsize::new(0);
         thread::scope(|scope| {
             for worker in 0..8u64 {
                 let (table, queries, shared_hits) = (&table, &queries, &shared_hits);
@@ -367,7 +443,7 @@ mod tests {
                         let truth = solve(query, state, goal);
                         let shared = table.with(query, state, |goals| {
                             if goals.contains_key(&goal) {
-                                shared_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                shared_hits.fetch_add(1, Ordering::Relaxed);
                             }
                             answer(goals, query, state, goal)
                         });

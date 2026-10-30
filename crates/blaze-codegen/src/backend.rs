@@ -57,6 +57,11 @@ pub struct Described<I, S> {
     pub symbol: Option<String>,
     /// Everything it refers to, each once, in the order of its MIR: its template's places.
     pub refs: Vec<FrontRef<I, S>>,
+    /// The places among `refs` of the functions whose bodies its code builds in, as LLVM's
+    /// always-inliner does at -O0: `#[inline(always)]` callees of crates no edit reaches.
+    /// Their keys, and those of what they build in, are in its store key; its
+    /// [`CompiledFunction::inlined`] may name only their code hashes.
+    pub built_in: Vec<u32>,
 }
 
 /// What the front end says of a static.
@@ -201,7 +206,7 @@ pub trait Prepare: Sync {
 
     /// #1292: the prepared IR with its constants masked, for [`crate::fold::groups`]; `None`
     /// for one that can't be folded (a backend or a function that has no thunk).
-    fn masked(&self, unit: &Unit, prepared: &Self::Prepared) -> Option<crate::fold::Masked>;
+    fn masked(&self, unit: &Unit, prepared: &Self::Prepared, refs: &Refs) -> Option<crate::fold::Masked>;
 
     /// Compiles a group's one body, taking the constants that differ as parameters, and a
     /// thunk for each member, which calls it with the member's constants. `members` are in

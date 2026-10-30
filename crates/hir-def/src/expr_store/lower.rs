@@ -543,7 +543,15 @@ pub struct ExprCollector<'db> {
     krate: base_db::Crate,
 
     name_generator_index: usize,
+
+    /// Emptied statement lists, one per block being lowered at once, reused so a block costs no
+    /// allocation once the deepest nesting has been seen.
+    stmt_buffers: Vec<Vec<Statement>>,
 }
+
+/// A node's child list while it is being built; nested lowering builds its own.
+type ExprList = SmallVec<[ExprId; 8]>;
+type PatList = SmallVec<[PatId; 8]>;
 
 #[derive(Clone, Debug)]
 struct LabelRib {
@@ -759,6 +767,7 @@ impl<'db> ExprCollector<'db> {
             name_generator_index: 0,
             named_lifetime_store: NamedLifetimeStore::default(),
             for_type_binder: None,
+            stmt_buffers: Vec::new(),
         };
         result.store.inference_roots = Some(SmallVec::new());
         result
@@ -768,6 +777,15 @@ impl<'db> ExprCollector<'db> {
         let index = self.name_generator_index;
         self.name_generator_index += 1;
         Name::generate_new_name(index)
+    }
+
+    fn take_stmt_buffer(&mut self) -> Vec<Statement> {
+        self.stmt_buffers.pop().unwrap_or_default()
+    }
+
+    fn return_stmt_buffer(&mut self, mut buffer: Vec<Statement>) {
+        buffer.clear();
+        self.stmt_buffers.push(buffer);
     }
 
     #[inline]
@@ -1764,7 +1782,7 @@ impl<'db> ExprCollector<'db> {
                                 None => self.missing_expr(),
                             };
                             let src = self.expander.in_file(AstPtr::new(&field));
-                            self.store.field_map_back.insert(expr, src);
+                            self.store.field_map_back.push((expr, src));
                             Some(RecordLitField { name, expr })
                         })
                         .collect();
@@ -2294,7 +2312,7 @@ impl<'db> ExprCollector<'db> {
                         let pat = self.collect_expr_as_pat(field_expr);
                         let name = f.field_name()?.as_name();
                         let src = self.expander.in_file(AstPtr::new(&f).wrap_left());
-                        self.store.pat_field_map_back.insert(pat, src);
+                        self.store.pat_field_map_back.push((pat, src));
                         Some(RecordFieldPat { name, pat })
                     })
                     .collect();
@@ -3267,7 +3285,7 @@ impl<'db> ExprCollector<'db> {
                         let pat = self.collect_pat(ast_pat, binding_list);
                         let name = f.field_name()?.as_name();
                         let src = self.expander.in_file(AstPtr::new(&f).wrap_right());
-                        self.store.pat_field_map_back.insert(pat, src);
+                        self.store.pat_field_map_back.push((pat, src));
                         Some(RecordFieldPat { name, pat })
                     })
                     .collect();

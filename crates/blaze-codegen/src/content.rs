@@ -131,7 +131,8 @@ pub(crate) fn arch_of(tag: u8) -> Option<Arch> {
     })
 }
 
-const KINDS: [RelocKind; 12] = [
+/// Every kind, by its tag ([`kind_tag`]); a new kind goes at the end.
+const KINDS: [RelocKind; 26] = [
     RelocKind::Abs64,
     RelocKind::PcRel32,
     RelocKind::GotPcRel32,
@@ -144,6 +145,20 @@ const KINDS: [RelocKind; 12] = [
     RelocKind::WasmFunction,
     RelocKind::WasmTable,
     RelocKind::WasmMemory,
+    RelocKind::TlsGd32,
+    RelocKind::TlsGotTpOff32,
+    RelocKind::TlvRel32,
+    RelocKind::TlvPage21,
+    RelocKind::TlvPageOffset12,
+    RelocKind::TlsDescPage21,
+    RelocKind::TlsDescLd64Lo12,
+    RelocKind::TlsDescAddLo12,
+    RelocKind::TlsDescCall,
+    RelocKind::TlsIePage21,
+    RelocKind::TlsIeLo12,
+    RelocKind::TpHi12,
+    RelocKind::TpLo12,
+    RelocKind::SectionRel32,
 ];
 
 pub(crate) fn kind_tag(kind: RelocKind) -> u8 {
@@ -160,6 +175,20 @@ pub(crate) fn kind_tag(kind: RelocKind) -> u8 {
         RelocKind::WasmFunction => 9,
         RelocKind::WasmTable => 10,
         RelocKind::WasmMemory => 11,
+        RelocKind::TlsGd32 => 12,
+        RelocKind::TlsGotTpOff32 => 13,
+        RelocKind::TlvRel32 => 14,
+        RelocKind::TlvPage21 => 15,
+        RelocKind::TlvPageOffset12 => 16,
+        RelocKind::TlsDescPage21 => 17,
+        RelocKind::TlsDescLd64Lo12 => 18,
+        RelocKind::TlsDescAddLo12 => 19,
+        RelocKind::TlsDescCall => 20,
+        RelocKind::TlsIePage21 => 21,
+        RelocKind::TlsIeLo12 => 22,
+        RelocKind::TpHi12 => 23,
+        RelocKind::TpLo12 => 24,
+        RelocKind::SectionRel32 => 25,
     }
 }
 
@@ -208,10 +237,13 @@ mod tests {
 
     #[test]
     fn every_kind_has_its_own_tag() {
-        for tag in 0..12 {
+        for tag in 0..KINDS.len() as u8 {
             assert_eq!(kind_tag(kind_of(tag).unwrap()), tag);
         }
-        assert_eq!(kind_of(12), None);
+        assert_eq!(kind_of(KINDS.len() as u8), None);
+        let mut tags: Vec<u8> = KINDS.iter().map(|it| kind_tag(*it)).collect();
+        tags.dedup();
+        assert_eq!(tags.len(), KINDS.len());
     }
 
     #[test]

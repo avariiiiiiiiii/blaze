@@ -3,22 +3,22 @@
 use std::ops::ControlFlow;
 
 use hir_def::{
-    AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, HasModule, LocalFieldId, TraitId,
+    AdtId, BuiltinDeriveImplId, BuiltinDeriveImplLoc, HasModule, TraitId,
     TypeOrConstParamId, TypeParamId,
     attrs::AttrFlags,
     builtin_derive::BuiltinDeriveImplTrait,
     hir::generics::{GenericParams, TypeOrConstParamData},
 };
 use itertools::Itertools;
-use la_arena::ArenaMap;
 use rustc_type_ir::{
     AliasTyKind, TypeFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitor, Upcast,
     inherent::{GenericArgs as _, IntoKind},
 };
 
 use crate::{
-    FieldType, GenericPredicates,
+    GenericPredicates,
     db::HirDatabase,
+    lower::FieldTypes,
     next_solver::{
         AliasTy, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv,
         StoredEarlyBinder, TraitRef, Ty, TyKind, Unnormalized, fold::fold_tys, generics::Generics,
@@ -350,7 +350,7 @@ fn simple_trait_predicates<'db>(
 fn extend_assoc_type_bounds<'db>(
     interner: DbInterner<'db>,
     assoc_type_bounds: &mut Vec<Clause<'db>>,
-    fields: &ArenaMap<LocalFieldId, FieldType>,
+    fields: &FieldTypes,
     trait_id: TraitId,
     trait_: BuiltinDeriveImplTrait,
 ) {

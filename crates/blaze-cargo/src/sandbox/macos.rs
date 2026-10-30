@@ -27,6 +27,22 @@
 //! A view ([`Spec::view`]) is not made on macOS (decided, 2026-10-27): a spec with one is run
 //! as though it had none, its binds unread, and the program sees the machine as Seatbelt
 //! leaves it. Linux is where a build sees its declared closure alone.
+//!
+//! For `blaze sandbox --v2` ([`super::v2`]) the library appends each line to the live record
+//! itself, before the call it notes returns (Seatbelt lets the run write that one file), and
+//! sees what the paths don't show: the variables read by name (`getenv`; `_NSGetEnviron` is
+//! the whole environment), the realtime clock, randomness (`getentropy`, `arc4random`,
+//! `CCRandomGenerateBytes`, the random devices), the directories listed (`getdirentries`,
+//! under `readdir`, and `getattrlistbulk`) and, with [`Also::network`], what the network
+//! answers (`T network`). A forked process keeps its thread's scope; a program run is told the
+//! scope of the thread that ran it.
+//!
+//! As the program ends, what it left running in its session's process group is killed, as a
+//! PID namespace's processes end with its first on Linux, before the record is read; one still
+//! there a moment later is an `X` line. A process that left the group (`setsid`, `setpgid`,
+//! a spawn into a group of its own) is not killed, there being no PID namespace to tell it by;
+//! Seatbelt still confines it, and the library says it left, so one still running as the run
+//! ends is an `X` line too.
 
 use std::{
     collections::HashSet,
@@ -35,11 +51,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{Reached, Recorder, Spec, tidy};
+use blaze_usercode::trace::Seen;
+
+use super::{Also, Recorder, Spec, tidy};
 
 /// The variables the sandbox gives the program's processes for the library, which takes them
 /// out of what the program sees as it loads.
-const OURS: [&str; 3] = ["DYLD_INSERT_LIBRARIES", "__BLAZE_SANDBOX", "__BLAZE_SANDBOX_EXEC"];
+const OURS: [&str; 4] =
+    ["DYLD_INSERT_LIBRARIES", "__BLAZE_SANDBOX", "__BLAZE_SANDBOX_EXEC", "__BLAZE_SANDBOX_SCOPE"];
 
 /// The library every process of a run loads, built from `macos_interpose.c` by `build.rs`.
 const LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/blaze_sandbox.dylib"));
@@ -83,25 +102,43 @@ const MACH_SERVICES: &[&str] = &[
     "(xpc-service-name \"com.apple.MTLCompilerService\")",
 ];
 
+/// The Mach service of the system's resolver, which a program given the network looks names
+/// up through.
+const RESOLVER_SERVICE: &str = "(global-name \"com.apple.dnssd.service\")";
+
 /// The profile: everything allowed but writing outside the run, the network beyond the
-/// loopback, a Unix socket outside the run's own and writable directories, and every Mach
-/// service but [`MACH_SERVICES`]. Paths come in as parameters (`WRITE0`, `WRITE1`, ...), which
+/// loopback (all of it with `network`, and the resolver's socket), a Unix socket outside the
+/// run's own and writable directories, and every Mach service but [`MACH_SERVICES`]. Paths
+/// come in as parameters (`WRITE0`, `WRITE1`, ... and the live record's `LIVE0`, ...), which
 /// need no quoting. No terminal is written by name: what the program prints goes to the
 /// descriptors it was given, which no rule checks again.
-fn profile(writes: usize) -> String {
+fn profile(writes: usize, lives: usize, network: bool) -> String {
     let dirs: String = (0..writes).map(|at| format!(" (subpath (param \"WRITE{at}\"))")).collect();
+    let files: String = (0..lives).map(|at| format!(" (literal (param \"LIVE{at}\"))")).collect();
     let mut text = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
-    text.push_str(&format!("(allow file-write*{dirs}\n"));
+    text.push_str(&format!("(allow file-write*{dirs}{files}\n"));
     text.push_str(
         "  (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/random\")
   (literal \"/dev/urandom\") (literal \"/dev/dtracehelper\") (literal \"/dev/stdout\")
   (literal \"/dev/stderr\") (regex #\"^/dev/fd/[0-9]+$\"))
 (deny network*)
-(allow network-bind (local ip \"localhost:*\"))
-(allow network-inbound (local ip \"localhost:*\"))
-(allow network-outbound (remote ip \"localhost:*\"))
 ",
     );
+    text.push_str(match network {
+        false => {
+            "(allow network-bind (local ip \"localhost:*\"))
+(allow network-inbound (local ip \"localhost:*\"))
+(allow network-outbound (remote ip \"localhost:*\"))
+"
+        }
+        true => {
+            "(allow network-bind (local ip \"*:*\"))
+(allow network-inbound (local ip \"*:*\"))
+(allow network-outbound (remote ip \"*:*\"))
+(allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))
+"
+        }
+    });
     // A socket's form takes one path: a rule each (two `subpath`s in one keep the first).
     for at in 0..writes {
         let dir = format!("(subpath (param \"WRITE{at}\"))");
@@ -109,12 +146,30 @@ fn profile(writes: usize) -> String {
         text.push_str(&format!("(allow network-outbound (remote unix-socket {dir}))\n"));
     }
     text.push_str("(deny mach-lookup)\n(allow mach-lookup");
-    for service in MACH_SERVICES {
+    for service in MACH_SERVICES.iter().chain(network.then_some(&RESOLVER_SERVICE)) {
         text.push_str("\n  ");
         text.push_str(service);
     }
     text.push_str(")\n");
     text
+}
+
+/// The program's environment from `given` as it is, without `TMPDIR` (the run's own is given)
+/// and the library's variables ([`OURS`]). A name or a value with a nul in it can't be in one.
+fn program_env(given: &[(OsString, OsString)]) -> Result<Vec<CString>, String> {
+    let mut env = Vec::with_capacity(given.len() + OURS.len() + 1);
+    for (name, value) in given {
+        if name == "TMPDIR" || OURS.iter().any(|it| name == it) {
+            continue;
+        }
+        let mut entry = name.as_bytes().to_vec();
+        entry.push(b'=');
+        entry.extend_from_slice(value.as_bytes());
+        env.push(CString::new(entry).map_err(|_| {
+            format!("the variable {:?} has a nul in it", name.to_string_lossy())
+        })?);
+    }
+    Ok(env)
 }
 
 fn os(what: &str) -> String {
@@ -238,13 +293,14 @@ impl Drop for Scratch {
     }
 }
 
-/// Runs `program` sandboxed as `spec` says, or with `None` makes the sandbox and runs nothing
-/// in it. What it ends with: its status, or 128 and the signal that ended it.
-pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
+/// Runs `program` sandboxed as `spec` and `also` say, or with `None` makes the sandbox and runs
+/// nothing in it. What it ends with: its status, or 128 and the signal that ended it.
+pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<i32, String> {
     let library = library()?;
     let scratch = Scratch::new(spec.overlays.len())?;
     let dir = scratch.dir.to_string_lossy().into_owned();
-    let recording = spec.record.is_some() && program.is_some();
+    let recording = program.is_some() && (spec.record.is_some() || also.live.is_some());
+    let live = also.live.filter(|_| recording);
 
     // What the library is told.
     let mut config = String::new();
@@ -313,22 +369,49 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
             config.push_str(&format!("W\t{it}\n"));
         }
     }
+    // What is seen as it is and is no input: the devices, the program (outside the overlays,
+    // whose paths the library answers itself).
+    let outside = |it: &&PathBuf| !spec.overlays.iter().any(|overlay| it.starts_with(overlay));
+    let programs = spec.not_inputs.iter().filter(outside).map(PathBuf::as_path);
+    for it in std::iter::once(Path::new("/dev")).chain(programs).flat_map(spellings) {
+        config.push_str(&format!("Q\t{it}\n"));
+    }
     if recording {
         config.push_str("L\n");
         if spec.record_reads {
             config.push_str("R\n");
         }
     }
+    let lives = match live {
+        Some(live) => {
+            let path = live.path.to_str().filter(|it| !it.contains(['\t', '\n']));
+            let path = path.ok_or_else(|| {
+                format!("the live record {} is not a path the library can be told", live.path.display())
+            })?;
+            config.push_str(&format!("V\t{path}\n"));
+            spellings(&live.path)
+        }
+        None => Vec::new(),
+    };
+    if also.network {
+        config.push_str("I\n");
+    }
     let config_path = scratch.dir.join("config");
     std::fs::write(&config_path, config)
         .map_err(|error| format!("{}: {error}", config_path.display()))?;
 
     // Everything the child uses is made before the fork.
-    let profile = c(profile(writes.len()).as_bytes());
+    let profile = c(profile(writes.len(), lives.len(), also.network).as_bytes());
     let params: Vec<CString> = writes
         .iter()
         .enumerate()
         .flat_map(|(at, it)| [c(format!("WRITE{at}").as_bytes()), c(it.as_bytes())])
+        .chain(
+            lives
+                .iter()
+                .enumerate()
+                .flat_map(|(at, it)| [c(format!("LIVE{at}").as_bytes()), c(it.as_bytes())]),
+        )
         .collect();
     let mut param_ptrs: Vec<*const libc::c_char> = params.iter().map(|it| it.as_ptr()).collect();
     param_ptrs.push(std::ptr::null());
@@ -337,17 +420,25 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|it| it.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
     let nonce = format!("{}.top", std::process::id());
-    // The program's environment is the spec's, its `TMPDIR` the run's empty one.
-    let mut env: Vec<CString> = spec
-        .env
-        .iter()
-        .filter(|(name, _)| name != "TMPDIR" && !OURS.contains(&name.as_str()))
-        .map(|(name, value)| c(format!("{name}={value}").as_bytes()))
-        .collect();
+    // The program's environment is the spec's (as it is with `also.env`), its `TMPDIR` the
+    // run's empty one.
+    let mut env: Vec<CString> = match also.env {
+        Some(given) => program_env(given)?,
+        None => spec
+            .env
+            .iter()
+            .filter(|(name, _)| name != "TMPDIR" && !OURS.contains(&name.as_str()))
+            .map(|(name, value)| c(format!("{name}={value}").as_bytes()))
+            .collect(),
+    };
     // The program's own `DYLD_INSERT_LIBRARIES` loads after the library, which takes it away
     // again before the program starts.
+    let theirs: Option<OsString> = match also.env {
+        Some(given) => given.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES").map(|it| it.1.clone()),
+        None => spec.env.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES").map(|it| it.1.clone().into()),
+    };
     let mut insert = library.as_os_str().to_owned();
-    if let Some((_, theirs)) = spec.env.iter().find(|(name, _)| name == "DYLD_INSERT_LIBRARIES") {
+    if let Some(theirs) = theirs.filter(|it| !it.is_empty()) {
         insert.push(":");
         insert.push(theirs);
     }
@@ -363,7 +454,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     let raw = scratch.dir.join("record");
     if recording {
         let program = program.unwrap_or_default().first().map(|it| it.to_string_lossy());
-        let line = format!("E\t{nonce}\t\t{}\n", program.unwrap_or_default());
+        let line = format!("P\t{nonce}\t\t{}\n", program.unwrap_or_default());
         std::fs::write(&raw, line).map_err(|error| format!("{}: {error}", raw.display()))?;
     }
 
@@ -408,6 +499,19 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
         unsafe { libc::_exit(127) };
     }
     super::pass_signals_to(child);
+    // Waited for, not reaped yet, so that its group's id is no other's when what it left
+    // running in its group is ended, as a PID namespace's processes end with its first on
+    // Linux: what they did later would be in no record.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    while unsafe {
+        libc::waitid(libc::P_PID, child as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+    } < 0
+    {
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(os("waitid"));
+        }
+    }
+    unsafe { libc::kill(-child, libc::SIGKILL) };
     let mut status = 0;
     while unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
@@ -416,6 +520,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     }
     // Its number may be another's now.
     super::pass_signals_to(0);
+    let left = recording && !group_ended(child);
     let code = if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status)
     } else if libc::WIFSIGNALED(status) {
@@ -423,7 +528,7 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
     } else {
         1
     };
-    if let Some(file) = spec.record.as_ref().filter(|_| recording) {
+    if recording {
         // The paths the library saw are as the program spelled them, so the overlays and what
         // is no input are known by each of their spellings.
         let spelled = |dirs: &[PathBuf]| -> Vec<PathBuf> {
@@ -439,30 +544,115 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>) -> Result<i32, String> {
             .collect();
         let own: Vec<&str> = own.iter().map(String::as_str).collect();
         let mut recorder = Recorder::new(&known, &own);
-        merge(&String::from_utf8_lossy(&std::fs::read(&raw).unwrap_or_default()), &mut recorder);
-        recorder.write(file);
+        if let Some(live) = live
+            && let Err(why) = recorder.live(&live.path)
+        {
+            live.failed(why);
+        }
+        let lost = match std::fs::read(&raw) {
+            Ok(bytes) => merge(&String::from_utf8_lossy(&bytes), &mut recorder),
+            Err(error) => {
+                let why = format!("the sandbox's record {}: {error}", raw.display());
+                recorder.reached(Seen::Incomplete, String::new(), &why);
+                None
+            }
+        };
+        if left {
+            let why = "processes of the run still ran after it ended, so what they read is not known";
+            recorder.reached(Seen::Incomplete, String::new(), why);
+        }
+        if let Some(file) = &spec.record {
+            recorder.write(file);
+        }
+        if let Some(live) = live {
+            if let Some(why) = lost {
+                live.failed(format!("the sandbox's library could not add a line to it: {why}"));
+            }
+            if let Some(why) = recorder.live_failed() {
+                live.failed(why);
+            }
+        }
     }
     drop(scratch);
     Ok(code)
 }
 
-/// Gives `recorder` what the processes of a run appended (`macos_interpose.c` says what each
-/// line is): its `R`, `W`, `N` and `X` lines, and an `X` line for each program that ran
-/// without the library.
-fn merge(raw: &str, recorder: &mut Recorder) {
+/// Whether the process group `group` has ended, given a moment for what was killed in it to
+/// go: a process that left it (`setsid`) is not waited for.
+fn group_ended(group: libc::pid_t) -> bool {
+    for _ in 0..2000 {
+        if unsafe { libc::kill(-group, 0) } < 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    false
+}
+
+/// Whether a process `pid` is there: one that is another user's is too. Its number may be
+/// another's now, which only makes the record say it is not whole when it is.
+fn still_runs(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) } == 0
+        || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Gives `recorder` what the processes of a run appended to `raw` (`macos_interpose.c` says
+/// what each line is), once the run has ended: the record's lines, there when there is no
+/// live record (the library appends them to it itself otherwise), an `X` line for each program
+/// that ran without the library, for each process that left the run's process group and still
+/// runs, and for a line that is not one. Why a line could not be added to the live record,
+/// when the library said one could not.
+fn merge(raw: &str, recorder: &mut Recorder) -> Option<String> {
     let mut ran = Vec::new();
     let mut loaded = HashSet::new();
-    for line in raw.lines() {
+    let mut lost = None;
+    for piece in raw.split_inclusive('\n') {
+        let Some(line) = piece.strip_suffix('\n') else {
+            // Every process has ended: a line with no line break was written short.
+            let why = "the sandbox's record ends in a line cut short";
+            recorder.reached(Seen::Incomplete, String::new(), why);
+            break;
+        };
         let mut fields = line.splitn(4, '\t');
-        match (fields.next(), fields.next(), fields.next(), fields.next()) {
-            (Some("E"), Some(nonce), Some(test), Some(path)) => ran.push((nonce, test, path)),
-            (Some("H" | "F"), Some(nonce), None, None) => _ = loaded.insert(nonce),
-            (Some(letter), Some(test), Some(what), None) => {
-                if let Some(reached) = Reached::of(letter) {
-                    recorder.reached(reached, test.to_owned(), what);
-                }
+        let seen = match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some("P"), Some(nonce), Some(test), Some(path)) => {
+                ran.push((nonce, test, path));
+                continue;
             }
-            _ => {}
+            (Some("H" | "F"), Some(nonce), None, None) => {
+                loaded.insert(nonce);
+                continue;
+            }
+            (Some("S"), Some(pid), None, None) if pid.parse::<libc::pid_t>().is_ok_and(|it| it > 0) => {
+                if still_runs(pid.parse().unwrap_or_default()) {
+                    let why = format!(
+                        "process {pid} of the run left its process group and still ran after the \
+                         run ended, so what it read is not known"
+                    );
+                    recorder.reached(Seen::Incomplete, String::new(), &why);
+                }
+                continue;
+            }
+            (Some("Z"), Some(errno), None, None) => {
+                let why = match errno.parse::<i32>() {
+                    Ok(errno) if errno > 0 => std::io::Error::from_raw_os_error(errno).to_string(),
+                    _ => "it was written short".to_owned(),
+                };
+                lost.get_or_insert(why);
+                continue;
+            }
+            (Some(letter), Some(test), Some(what), None) => Seen::of(letter).map(|it| (it, test, what)),
+            _ => None,
+        };
+        match seen {
+            Some((seen, test, what)) => recorder.reached(seen, test.to_owned(), what),
+            None => {
+                let shown: String = line.chars().take(200).collect();
+                let why = format!("the sandbox's record has a line that is not one: {shown:?}");
+                recorder.reached(Seen::Incomplete, String::new(), &why);
+            }
         }
     }
     for (nonce, test, path) in ran {
@@ -471,31 +661,40 @@ fn merge(raw: &str, recorder: &mut Recorder) {
                 "{path} ran without the recorder (macOS keeps DYLD_INSERT_LIBRARIES from a \
                  program it protects), so what it read is not known"
             );
-            recorder.reached(Reached::Incomplete, test.to_owned(), &why);
+            recorder.reached(Seen::Incomplete, test.to_owned(), &why);
         }
     }
+    lost
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
+    use blaze_usercode::trace::{self, Seen};
+
     use super::super::{Recorder, Spec};
 
     #[test]
     fn merge_keeps_each_line_once_and_names_the_programs_not_seen() {
-        let raw = "E\t1.top\t\t/w/target/debug/deps/t-1\n\
+        let raw = "P\t1.top\t\t/w/target/debug/deps/t-1\n\
                    H\t1.top\n\
                    R\ta::b\t/w/data.txt\n\
                    R\ta::b\t/w/data.txt\n\
                    R\t\t/dev/null\n\
                    R\t\t/w/target/debug/deps/t-1\n\
+                   D\ta::b\t/w/src\n\
+                   E\ta::b\tHOME\n\
+                   T\ta::b\tclock\n\
                    W\ta::b\t/Users/u/.config/x\n\
                    N\ta::c\t1.1.1.1:443\n\
-                   E\t5.ab.0\ta::c\t/bin/sh\n\
-                   E\t5.ab.1\ta::c\t/w/target/debug/helper\n\
+                   P\t5.ab.0\ta::c\t/bin/sh\n\
+                   P\t5.ab.1\ta::c\t/w/target/debug/helper\n\
                    H\t5.ab.1\n\
-                   E\t5.ab.2\ta::c\t/missing\n\
+                   P\t5.ab.2\ta::c\t/missing\n\
                    F\t5.ab.2\n\
-                   X\ta::d\ta path with a tab or a line break in it\n\
+                   X\ta::d\ta path or a name with a tab or a line break in it\n\
+                   Q\tnot\ta line\n\
                    R\ta::b\t/w/last";
         let spec = Spec {
             overlays: vec!["/w".into()],
@@ -504,7 +703,9 @@ mod tests {
             ..Spec::default()
         };
         let mut recorder = Recorder::new(&spec, &["/dev"]);
-        super::merge(raw, &mut recorder);
+        assert_eq!(super::merge(raw, &mut recorder), None);
+        let kept = |seen: Seen, what: &str| recorder.lines().any(|it| it.seen == seen && it.what == what);
+        assert!(kept(Seen::Env, "HOME") && kept(Seen::Untraceable, "clock"));
         let dir = std::env::temp_dir().join(format!("blaze-macos-merge-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("record");
@@ -512,12 +713,141 @@ mod tests {
         let text = std::fs::read_to_string(&file).unwrap();
         _ = std::fs::remove_dir_all(&dir);
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 6, "{text}");
+        assert_eq!(lines.len(), 8, "{text}");
         assert_eq!(lines[0], "R\ta::b\t/w/data.txt");
-        assert_eq!(lines[1], "R\ta::b\t/w/last");
+        assert_eq!(lines[1], "R\ta::b\t/w/src", "a listing is a read in this record");
         assert_eq!(lines[2], "W\ta::b\t/Users/u/.config/x");
         assert_eq!(lines[3], "N\ta::c\t1.1.1.1:443");
-        assert!(lines[4].starts_with("X\ta::c\t/bin/sh ran without the recorder"), "{text}");
-        assert_eq!(lines[5], "X\ta::d\ta path with a tab or a line break in it");
+        assert_eq!(lines[4], "X\t\tthe sandbox's record ends in a line cut short");
+        assert!(lines[5].starts_with("X\t\tthe sandbox's record has a line that is not one"), "{text}");
+        assert!(lines[6].starts_with("X\ta::c\t/bin/sh ran without the recorder"), "{text}");
+        assert_eq!(lines[7], "X\ta::d\ta path or a name with a tab or a line break in it");
+    }
+
+    #[test]
+    fn a_line_the_library_could_not_add_is_said() {
+        let mut recorder = Recorder::new(&Spec::default(), &[]);
+        let lost = super::merge("H\t1.top\nZ\t28\nZ\t5\n", &mut recorder).unwrap();
+        assert_eq!(lost, std::io::Error::from_raw_os_error(28).to_string(), "the first is kept");
+        assert_eq!(super::merge("Z\t0\n", &mut recorder).as_deref(), Some("it was written short"));
+        assert_eq!(recorder.lines().count(), 0);
+    }
+
+    #[test]
+    fn a_process_that_left_the_group_and_still_runs_makes_the_record_not_whole() {
+        let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let gone_pid = gone.id();
+        gone.wait().unwrap();
+        let mut recorder = Recorder::new(&Spec::default(), &[]);
+        let raw = format!("S\t{gone_pid}\nS\t{}\n", std::process::id());
+        assert_eq!(super::merge(&raw, &mut recorder), None);
+        let lines: Vec<_> = recorder.lines().cloned().collect();
+        let here = format!("process {} of the run left its process group", std::process::id());
+        assert!(lines.iter().any(|it| it.seen == Seen::Incomplete && it.what.starts_with(&here)), "{lines:?}");
+        let gone = format!("process {gone_pid} ");
+        assert!(!lines.iter().any(|it| it.what.starts_with(&gone)), "{lines:?}");
+    }
+
+    #[test]
+    fn the_profile_lets_the_live_record_be_written_and_the_network_through_when_given() {
+        let closed = super::profile(2, 1, false);
+        assert!(closed.contains("(subpath (param \"WRITE1\"))"), "{closed}");
+        assert!(closed.contains("(literal (param \"LIVE0\"))"), "{closed}");
+        assert!(closed.contains("(remote ip \"localhost:*\")"), "{closed}");
+        assert!(!closed.contains("\"*:*\"") && !closed.contains("mDNSResponder"), "{closed}");
+        assert!(!closed.contains("com.apple.dnssd.service"), "{closed}");
+        let open = super::profile(1, 0, true);
+        assert!(!open.contains("LIVE0"), "{open}");
+        assert!(open.contains("(allow network-outbound (remote ip \"*:*\"))"), "{open}");
+        assert!(open.contains("/private/var/run/mDNSResponder"), "{open}");
+        assert!(open.contains(super::RESOLVER_SERVICE), "{open}");
+        assert!(open.contains("(deny mach-lookup)"), "the other services stay refused");
+    }
+
+    #[test]
+    fn the_program_is_given_its_environment_as_it_is_without_the_sandboxs() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let given: Vec<(OsString, OsString)> = vec![
+            ("A".into(), OsString::from_vec(b"\xff".to_vec())),
+            ("TMPDIR".into(), "/x".into()),
+            ("DYLD_INSERT_LIBRARIES".into(), "/l.dylib".into()),
+            ("__BLAZE_SANDBOX_SCOPE".into(), "t".into()),
+            ("B".into(), "2".into()),
+        ];
+        let env = super::program_env(&given).unwrap();
+        let env: Vec<&[u8]> = env.iter().map(|it| it.as_bytes()).collect();
+        assert_eq!(env, [&b"A=\xff"[..], b"B=2"]);
+        let nul = vec![("A".into(), OsString::from_vec(b"x\0y".to_vec()))];
+        assert!(super::program_env(&nul).unwrap_err().contains("nul"));
+    }
+
+    /// What the end-to-end test runs in the sandbox: this executable, which macOS does not
+    /// protect, so the library is in it. Does nothing unless that test runs it.
+    #[test]
+    fn helper_reads_a_variable_lists_and_reads_the_clock() {
+        let Some(dir) = std::env::var_os("BLAZE_SANDBOX_TEST_HELPER") else { return };
+        let value = std::env::var("BLAZE_SANDBOX_TEST_VAR").unwrap();
+        let names = std::fs::read_dir(&dir).unwrap().count();
+        let now = std::time::SystemTime::now();
+        assert!(now > std::time::UNIX_EPOCH);
+        std::fs::write(std::path::Path::new(&dir).join("seen"), format!("{value} {names}")).unwrap();
+    }
+
+    /// A run of `blaze sandbox --v2` with the library in its program: its variables read by
+    /// name, its listing and its clock are in the live record, it is whole, and the report has
+    /// them. Skipped where no sandbox can be made, unless `BLAZE_VIEW_TESTS=require`.
+    #[test]
+    fn a_traced_run_sees_variables_listings_and_the_clock() {
+        if let Err(why) = crate::sandbox::probe(crate::sandbox::Probe::V2) {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let dir = std::env::temp_dir().join(format!("blaze-macos-v2-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("a"), "").unwrap();
+        let spec = blaze_usercode::confine::Spec {
+            program: exe.clone(),
+            args: ["sandbox::macos::tests::helper_reads_a_variable_lists_and_reads_the_clock", "--exact", "--test-threads=1"]
+                .map(OsString::from)
+                .to_vec(),
+            env: vec![
+                ("BLAZE_SANDBOX_TEST_HELPER".into(), out.clone().into()),
+                ("BLAZE_SANDBOX_TEST_VAR".into(), "v".into()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+            dir: out.clone(),
+            read: vec![dir.clone()],
+            write: vec![out.clone()],
+            network: false,
+            trace: true,
+            live: dir.join("live"),
+            report: dir.join("report"),
+            not_inputs: vec![exe],
+        };
+        assert_eq!(crate::sandbox::v2::launch(&spec), 0);
+        assert_eq!(std::fs::read_to_string(out.join("seen")).unwrap(), "v 1");
+        let text = std::fs::read_to_string(&spec.live).unwrap();
+        let (lines, used) = trace::parse(&text).unwrap();
+        assert_eq!(used, text.len(), "{text}");
+        assert_eq!(lines[0], trace::Line::new(Seen::Env, "", trace::ALL_ENV));
+        assert!(!lines.iter().any(|it| it.seen == Seen::Incomplete), "{text}");
+        let has = |seen: Seen, what: &str| lines.iter().any(|it| it.seen == seen && it.what == what);
+        assert!(has(Seen::Env, "BLAZE_SANDBOX_TEST_VAR"), "{text}");
+        assert!(has(Seen::Untraceable, "clock"), "{text}");
+        let listed = std::fs::canonicalize(&out).unwrap();
+        let listed = lines.iter().any(|it| {
+            it.seen == Seen::Listed && std::fs::canonicalize(&it.what).is_ok_and(|it| it == listed)
+        });
+        assert!(listed, "{text}");
+        let report = trace::decode(&std::fs::read(&spec.report).unwrap()).unwrap();
+        let trace::Report::Ran(Some(traced)) = report else { panic!("{report:?}") };
+        assert!(traced.env.iter().any(|it| it.0 == "BLAZE_SANDBOX_TEST_VAR" && it.1.as_deref() == Some("v".as_ref())));
+        assert!(traced.untraceable.contains(&blaze_core::Untraceable::Clock));
+        _ = std::fs::remove_dir_all(&dir);
     }
 }

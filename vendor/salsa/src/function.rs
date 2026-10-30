@@ -43,9 +43,9 @@ pub use eviction::{EvictionPolicy, HasCapacity, Lru, NoopEviction};
 pub type Memo<C> = memo::Memo<C>;
 
 /// Hashes a value of `C` into its value fingerprint.
-type ValueHasher<C> = for<'a, 'db> fn(&'a <C as Configuration>::Output<'db>) -> Fingerprint;
+type ValueHasher<C> = fn(&<C as Configuration>::Output<'static>) -> Fingerprint;
 
-fn hash_value<C: Configuration>(value: &C::Output<'_>) -> Fingerprint
+fn hash_value<C: Configuration>(value: &C::Output<'static>) -> Fingerprint
 where
     for<'db> C::Output<'db>: std::hash::Hash,
 {
@@ -320,9 +320,16 @@ where
         if C::NO_EQ {
             return Fingerprint::NONE;
         }
-        C::fingerprint(value)
-            .or_else(|| hasher.map(|hash| hash(value)))
-            .unwrap_or(Fingerprint::NONE)
+        if let Some(fingerprint) = C::fingerprint(value) {
+            return fingerprint;
+        }
+        let Some(hash) = hasher else {
+            return Fingerprint::NONE;
+        };
+        // SAFETY: `Configuration`'s contract lets salsa use an `Output<'db>` as an
+        // `Output<'static>`, as memos store it; the hasher only reads the value during this call.
+        let value = unsafe { std::mem::transmute::<&C::Output<'_>, &C::Output<'static>>(value) };
+        hash(value)
     }
 
     pub(super) fn value_fingerprint(&self, value: &C::Output<'_>) -> Fingerprint {

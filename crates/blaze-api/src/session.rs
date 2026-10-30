@@ -352,7 +352,7 @@ impl Session {
                     let root = cx.vfs.apply(base, ops).map_err(|error| {
                         ApiError::new(
                             format!("the candidate's ops don't apply to {base:x}: {error}"),
-                            Some(op_path(&error).to_owned()),
+                            Some(op_path(&error)),
                         )
                     });
                     match root.and_then(|root| open(cx, root)) {
@@ -586,7 +586,7 @@ fn resolve(vfs: &mut Vfs, view: &ViewRef) -> Result<ContentId, ApiError> {
             vfs.apply(base, ops).map_err(|error| {
                 ApiError::new(
                     format!("the what-if's ops don't apply to {base:x}: {error}"),
-                    Some(op_path(&error).to_owned()),
+                    Some(op_path(&error)),
                 )
             })
         }
@@ -654,12 +654,13 @@ fn commit_error(head: &str, base: ContentId, error: &CommitError) -> ApiError {
         ),
         CommitError::Op(error) => ApiError::new(
             format!("a commit to head `{head}` on {base:x}: {error}"),
-            Some(op_path(error).to_owned()),
+            Some(op_path(error)),
         ),
     }
 }
 
-fn op_path(error: &OpError) -> &str {
+/// Where an op failed: its path, or the root it was given.
+fn op_path(error: &OpError) -> String {
     match error {
         OpError::BadPath(path)
         | OpError::NotFound(path)
@@ -667,7 +668,8 @@ fn op_path(error: &OpError) -> &str {
         | OpError::NotADirectory(path)
         | OpError::Exists(path)
         | OpError::OutOfRange { path, .. }
-        | OpError::BadLink { path, .. } => path,
+        | OpError::BadLink { path, .. } => path.clone(),
+        OpError::UnknownRoot(root) => format!("root {root:x}"),
     }
 }
 

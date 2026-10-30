@@ -1303,7 +1303,7 @@ impl<'db, D: Delegate<'db>> ExprUseVisitor<'_, 'db, D> {
         let expr_ty = self.expr_ty(expr)?;
         match self.cx.store[expr] {
             Expr::UnaryOp { expr: e_base, op: UnaryOp::Deref } => {
-                if self.cx.result.method_resolutions.contains_key(&expr) {
+                if self.cx.result.method_resolutions.contains_idx(expr) {
                     self.cat_overloaded_place(expr, e_base)
                 } else {
                     let base = self.cat_expr(e_base)?;

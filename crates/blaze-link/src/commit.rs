@@ -87,9 +87,7 @@ impl Image {
             steps.push_back(step);
         }
         steps.push_back(vec![Effect::Sync { file: next.clone(), tag: self.tag() }]);
-        if writes.full {
-            steps.push_back(vec![Effect::Mode { file: next.clone(), mode: 0o755, tag: self.tag() }]);
-        }
+        steps.push_back(vec![Effect::Mode { file: next.clone(), mode: 0o755, tag: self.tag() }]);
         steps.push_back(vec![Effect::Rename { from: next, to, tag: self.tag() }]);
         let mut remove = Vec::new();
         for generation in writes.remove {

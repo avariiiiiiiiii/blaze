@@ -17,6 +17,7 @@
 //! space, but are no part of memory. The module is written whole by [`Writer::file`]: no
 //! region has a place of its own in the file.
 
+mod code;
 mod leb;
 mod module;
 mod object;

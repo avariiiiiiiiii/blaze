@@ -34,9 +34,13 @@ Why, by module:
 `Win32_System_Memory`, `Win32_System_Environment` and `Win32_UI_WindowsAndMessaging` are not
 needed (`LocalFree` is in `Win32_Foundation`; the environment block is built by hand).
 
+> forwarded to cargo: `crates/blaze-cargo/Cargo.toml` is lane cargo's; line 154 still has the five old features.
+
 ## 2. `blaze-usercode` as a dependency of `blaze-cargo`
 
 `windows.rs` takes `blaze_usercode::confine::Spec`, and `sandbox.rs` already uses
 `blaze_usercode::trace`, but `crates/blaze-cargo/Cargo.toml` has no `blaze-usercode` dependency
 yet (owner: `usercode-sandbox`, the parent). It also uses `getrandom` 0.3 (`getrandom::u64`),
 which is already there.
+
+> applied: `crates/blaze-cargo/Cargo.toml` names `blaze-usercode.workspace = true` (line 131) now.

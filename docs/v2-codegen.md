@@ -96,6 +96,9 @@ Off by default for LLVM's levels. See [`fold`](../crates/blaze-codegen/src/fold.
 
 ## Settings and the plan (#635, #807, #1404)
 
+- wasm32 is not yet a v2 target: a unit for `Arch::Wasm32` is refused with an error naming
+  it, never built another way.
+
 - The profile's `opt-level` with cargo's package overrides and `build-override` picks the
   backend per origin; tests are built at the profile's level.
 - The standard library's own functions are compiled as rustc ships std (`-O3`, no overflow

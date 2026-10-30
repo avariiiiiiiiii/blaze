@@ -28,7 +28,7 @@ pub fn serve(tests: &'static [&'static super::test::TestDescAndFn], socket: ::st
 #[cfg(unix)]
 mod unix {
     use super::super::test;
-    use super::{End, Frame, Frames, LONGEST_OUTPUT, MARK, SOCKET, VERSION};
+    use super::{End, Frame, Frames, LONGEST_OUTPUT, MARK, SOCKET, VERSION, encode_ended};
     use ::std::io::{Read, Write};
     use ::std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
     use ::std::os::unix::net::UnixStream;
@@ -237,12 +237,20 @@ mod unix {
         let mut children: Vec<Child> = Vec::new();
         let mut quitting = false;
         let mut buffer = vec![0u8; 1 << 16];
+        // Kept across turns of the loop, so a turn allocates nothing: what is polled, which
+        // children's outputs those are, the frames to send (one write a turn), and the output
+        // buffers of children that ended, for the next ones.
+        let mut watched: Vec<usize> = Vec::new();
+        let mut fds: Vec<PollFd> = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
+        let mut spare: Vec<Vec<u8>> = Vec::new();
         loop {
             if quitting && children.is_empty() {
                 return Ok(());
             }
-            let watched: Vec<usize> = (0..children.len()).filter(|&at| children[at].open).collect();
-            let mut fds = Vec::with_capacity(watched.len() + 1);
+            watched.clear();
+            watched.extend((0..children.len()).filter(|&at| children[at].open));
+            fds.clear();
             fds.push(PollFd { fd: stream.as_raw_fd(), events: POLLIN, revents: 0 });
             for &at in &watched {
                 fds.push(PollFd { fd: children[at].output.as_raw_fd(), events: POLLIN, revents: 0 });
@@ -291,7 +299,7 @@ mod unix {
                         }
                     };
                     match frame {
-                        Frame::Run { id, index } => match start(tests, id, index, &stream, &children) {
+                        Frame::Run { id, index } => match start(tests, id, index, &stream, &children, spare.pop().unwrap_or_default()) {
                             Ok(mut child) => {
                                 match exits::watch(&queue, child.pid) {
                                     Ok((exit, ended)) => {
@@ -306,13 +314,7 @@ mod unix {
                                 }
                                 children.push(child);
                             }
-                            Err(why) => {
-                                let ended = Frame::Ended { id: id, end: End::NotStarted(why), output: Vec::new() };
-                                if let Err(why) = send(&mut stream, &ended) {
-                                    kill_all(&mut children);
-                                    return Err(why);
-                                }
-                            }
+                            Err(why) => encode_ended(&mut out, id, &End::NotStarted(why), &[]),
                         },
                         Frame::Kill { id } => {
                             if let Some(child) = children.iter().find(|it| it.id == id && it.status.is_none()) {
@@ -353,14 +355,29 @@ mod unix {
                     let note = format!("\n[blaze: the output was cut at {} bytes]\n", LONGEST_OUTPUT);
                     child.bytes.extend_from_slice(note.as_bytes());
                 }
-                let ended = Frame::Ended { id: child.id, end: end_of(status), output: child.bytes };
-                if let Err(why) = send(&mut stream, &ended) {
+                encode_ended(&mut out, child.id, &end_of(status), &child.bytes);
+                // A buffer that held a long output is let go rather than kept at that size.
+                if child.bytes.capacity() <= KEPT {
+                    child.bytes.clear();
+                    spare.push(child.bytes);
+                }
+            }
+            // Every end of this turn in one write: blaze reads them as one batch.
+            if !out.is_empty() {
+                if let Err(error) = stream.write_all(&out) {
                     kill_all(&mut children);
-                    return Err(why);
+                    return Err(format!("writing to the socket: {}", error));
+                }
+                out.clear();
+                if out.capacity() > KEPT {
+                    out.shrink_to(KEPT);
                 }
             }
         }
     }
+
+    /// The most bytes a buffer of output or of frames keeps between uses.
+    const KEPT: usize = 1 << 20;
 
     fn connect(socket: &::std::ffi::OsStr) -> Result<UnixStream, String> {
         // blaze listens as it starts the binary; the listen may be made a moment after.
@@ -391,6 +408,7 @@ mod unix {
         index: u32,
         stream: &UnixStream,
         children: &[Child],
+        bytes: Vec<u8>,
     ) -> Result<Child, String> {
         let test: &'static test::TestDescAndFn = match tests.get(index as usize) {
             Some(test) => *test,
@@ -432,7 +450,7 @@ mod unix {
         unsafe { setpgid(pid, pid) };
         drop(theirs);
         ours.set_nonblocking(true).map_err(|error| format!("the test's output socket: {}", error))?;
-        Ok(Child { id: id, pid: pid, output: ours, bytes: Vec::new(), cut: false, open: true, status: None, exit: None })
+        Ok(Child { id: id, pid: pid, output: ours, bytes: bytes, cut: false, open: true, status: None, exit: None })
     }
 
     fn drain(child: &mut Child) {

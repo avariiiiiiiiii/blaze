@@ -40,6 +40,8 @@ macOS. `footprint::tests::limits_set_before_exec_let_a_small_program_run` and
 `kqueue::tests::processes_end_with_their_output_code_and_signal` (tag 5) check that a limited
 spawn runs.
 
+> forwarded to core: a review question from core-macos to its parent, no change asked.
+
 ## 3. Spawn with `posix_spawn` on macOS: drop the `pre_exec` (`process.rs`)
 
 - What: on macOS, don't install `pre_exec(move || crate::footprint::limit_self(bytes))` in

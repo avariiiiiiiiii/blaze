@@ -40,12 +40,18 @@ v2 interface; what changed from it is below.
 - A CI job's checkout is `apply(empty, writes)` of the commit's files (each with git's mode),
   opened as a view or set as a head. `empty` is the empty directory's root, always known.
 - The view arena is the one every crate uses: a `ViewId` is what `Vfs::open` gave.
-- **Readers on other threads**: `Vfs::reader` is a cloneable handle (`Send`, `Sync`) on every
-  node by content ID behind one read-write lock, which the query database reads as its
-  `blaze_query::Tree` (the impl is in blaze-query, which depends on blaze-vfs). After each
-  change the tree publishes the nodes it made, before the call that gives the new root's ID
-  returns; collection drops from it what it drops from the tree. A file's bytes are the tree's
-  own `Arc`; a directory's entries are copied once. A read takes the lock once per call.
+- **Readers on other threads**: `Vfs::reader` is a cloneable `Send` and `Sync` handle that
+  the query database reads as its `blaze_query::Tree` (the impl is in blaze-query, which
+  depends on blaze-vfs). It follows docs/v2/plan/design/concurrency.md:
+  - The nodes are in an append-only open-addressed table keyed by the content ID's bits.
+  - A place is published once by a release store of a pointer to an immutable node, and a
+    read is acquire loads: no lock and no count. `file` lends `&Arc<[u8]>`.
+  - The `Vfs` is the only writer. It publishes the nodes each change made, children first,
+    before the call that gives the new root's ID returns.
+  - Growth and collection fill a new level and swap it in with one release store. The old
+    level and the dropped nodes are retired, and freed by `unsafe fn Vfs::reclaim` once
+    every worker has passed a task boundary, or with the last handle.
+  - A node an open view, head or `keep` reaches is never retired.
 
 ## The journal
 

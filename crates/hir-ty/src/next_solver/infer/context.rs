@@ -270,20 +270,20 @@ impl<'db> rustc_type_ir::InferCtxtLike for InferCtxt<'db> {
         &self,
         sub: Region<'db>,
         sup: Region<'db>,
-        _vis: VisibleForLeakCheck,
+        vis: VisibleForLeakCheck,
         _span: Span,
     ) {
-        self.inner.borrow_mut().unwrap_region_constraints().make_subregion(sub, sup);
+        self.inner.borrow_mut().unwrap_region_constraints().make_subregion(sub, sup, vis);
     }
 
     fn equate_regions(
         &self,
         a: Region<'db>,
         b: Region<'db>,
-        _vis: VisibleForLeakCheck,
+        vis: VisibleForLeakCheck,
         _span: Span,
     ) {
-        self.inner.borrow_mut().unwrap_region_constraints().make_eqregion(a, b);
+        self.inner.borrow_mut().unwrap_region_constraints().make_eqregion(a, b, vis);
     }
 
     fn register_ty_outlives(&self, ty: Ty<'db>, r: Region<'db>, _span: Span) {
@@ -358,7 +358,7 @@ impl<'db> rustc_type_ir::InferCtxtLike for InferCtxt<'db> {
     ) -> Vec<rustc_type_ir::AliasTy<Self::Interner>> {
         let ty_sub_vid = self.sub_unification_table_root_var(ty_vid);
         let inner = &mut *self.inner.borrow_mut();
-        let mut type_variables = inner.type_variable_storage.with_log(&mut inner.undo_log);
+        let mut type_variables = inner.type_variable_storage.table();
         inner
             .opaque_type_storage
             .iter_opaque_types()

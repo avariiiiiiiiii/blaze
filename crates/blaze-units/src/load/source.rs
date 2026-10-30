@@ -15,7 +15,7 @@
 
 mod index;
 mod registry;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 mod tree;
 
@@ -144,7 +144,9 @@ impl Sources {
         if let Found::Here(_) = read_dir(cx, &at)? {
             return Ok(Ok(Located::Here { manifest: format!("{at}/Cargo.toml") }));
         }
-        if let Some(flag) = self.offline {
+        if let Some(flag) = self.offline
+            && from.kind() != &SourceKind::LocalRegistry
+        {
             return Ok(Err(anyhow!("attempting to make an HTTP request, but {flag} was specified")));
         }
         let sha256 = match checksum.filter(|it| !it.is_empty()) {
@@ -489,7 +491,7 @@ impl SourceMap {
             && name != CRATES_IO_REGISTRY
         {
             bail!(
-                "source `{name}` defines source {}, but that source is already defined by `{old}`\n\
+                "source `{old}` defines source {}, but that source is already defined by `{name}`\n\
                  note: Sources are not allowed to be defined multiple times.",
                 replacement.id
             );

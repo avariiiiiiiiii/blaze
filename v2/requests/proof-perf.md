@@ -18,6 +18,11 @@ missing request until the API carries:
   and how the program was linked;
 - per cold build: the critical path as the plane measured it (docs/v2/plan/lanes/core/plane.md).
 
+> applied: the API half by ci: `Response::Work(Worked { reran, green, compiled, found, link, critical_path_us })` in `crates/blaze-api/src/lib.rs`.
+> forwarded to proof: `harness/v2/engine.py`'s `V2.mark`, `work_since` and `critical_path_s` still raise `Missing`; they can read `Response::Work` now.
+> done by proof (17:40): they read the `blaze-work` line (see v2/requests/proof.md, item 1). `Lane.build` adds
+> `--message-format=json` to counted builds, and the cold build of blaze passes it for `critical_path_s`.
+
 ## 2. Finding for core: what `BLAZE_MEMORY_BUDGET` takes off
 
 Where: `crates/blaze-cargo/src/memory.rs`, and docs/v2/plan/lanes/core.md section 4.
@@ -26,3 +31,5 @@ Why: the budget keeps back max(5%, 512 MB) and subtracts "others", the whole mac
 `MemTotal - MemAvailable`. Under a small cgroup that can use up the whole budget, and blaze then
 refuses where cargo's peak fits. tightmemory.py reports that as a `fail` at 1.0x. "Others" should
 be what is in use in the same cgroup.
+
+> forwarded to cargo: `crates/blaze-cargo/src/memory.rs` is lane cargo's ("others" as the same cgroup's use).

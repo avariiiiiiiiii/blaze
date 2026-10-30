@@ -62,6 +62,8 @@ pub(crate) struct IndexDependency {
     /// The package's own name, which differs from `name_in_toml` for a renamed dependency.
     pub package: String,
     pub req: VersionReq,
+    /// `req` as the index wrote it, which the resolver's messages quote.
+    pub req_text: String,
     /// With the empty features older registries wrote taken out, as cargo takes them out.
     pub features: Vec<String>,
     pub optional: bool,
@@ -280,6 +282,7 @@ fn dependency(dep: RegistryDependency) -> anyhow::Result<IndexDependency> {
         name_in_toml: dep.name,
         package,
         req,
+        req_text: dep.req,
         features,
         optional: dep.optional,
         default_features: dep.default_features,
@@ -414,7 +417,7 @@ fn summary_dependency(dep: &IndexDependency, default: SourceId) -> anyhow::Resul
         bail!("`{}` is public but not a normal dependency", dep.package);
     }
     let id = dep.registry.unwrap_or(default);
-    let mut it = Dependency::parse(dep.package.as_str(), Some(&dep.req.to_string()), id)?;
+    let mut it = Dependency::parse(dep.package.as_str(), Some(dep.req_text.as_str()), id)?;
     if dep.name_in_toml != dep.package {
         it.set_explicit_name_in_toml(dep.name_in_toml.as_str());
     }

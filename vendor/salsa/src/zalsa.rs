@@ -40,13 +40,10 @@ pub unsafe trait ZalsaDatabase: Any {
     fn zalsa(&self) -> &Zalsa;
 
     /// Plumbing method: Access the internal salsa methods for mutating the database.
-    ///
-    /// **WARNING:** Triggers cancellation to other database handles.
-    /// This can lead to deadlock!
     #[doc(hidden)]
     fn zalsa_mut(&mut self) -> &mut Zalsa;
 
-    /// Access the thread-local state associated with this database
+    /// Access the state of the task the current thread runs for this database
     #[doc(hidden)]
     fn zalsa_local(&self) -> &ZalsaLocal;
 }
@@ -166,8 +163,7 @@ pub struct Zalsa {
     /// Indices of ingredients that require reset when a new revision starts.
     ingredients_requiring_reset: Vec<IngredientIndex>,
 
-    /// The runtime for this particular salsa database handle.
-    /// Each handle gets its own runtime, but the runtimes have shared state between them.
+    /// The runtime: revisions, the table of salsa structs and the graph of blocked tasks.
     runtime: Runtime,
 
     event_callback: Option<Box<dyn Fn(crate::Event) + Send + Sync>>,
@@ -290,11 +286,13 @@ impl Zalsa {
             .map(|ingredient| ingredient.as_ref())
     }
 
-    /// Starts unwinding the stack if the current revision is cancelled.
+    /// Starts unwinding the stack if the current task was cancelled through its
+    /// [`CancellationToken`](crate::CancellationToken).
     ///
     /// This method can be called by query implementations that perform
     /// potentially expensive computations, in order to speed up propagation of
-    /// cancellation.
+    /// cancellation. A write needs no cancellation: it takes the database by `&mut`, so no query
+    /// runs while it happens.
     ///
     /// Cancellation will automatically be triggered by salsa on any query
     /// invocation.
@@ -303,9 +301,6 @@ impl Zalsa {
         self.event(&|| crate::Event::new(crate::EventKind::WillCheckCancellation));
         if zalsa_local.should_trigger_local_cancellation() {
             zalsa_local.unwind_cancelled();
-        }
-        if self.runtime().load_cancellation_flag() {
-            zalsa_local.unwind_pending_write();
         }
     }
 

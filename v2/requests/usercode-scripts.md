@@ -25,6 +25,9 @@
 - Why: #804 (cold load spends its time reloading the sysroot per script) and #1296 (scripts
   that need no compile).
 
+> forwarded to cargo: `compile_time.rs` and `own_script.rs` are lane cargo's (`crates/blaze-cargo/`), not the coordinator's.
+> forwarded to codegen: the compile itself as a daemon codegen request.
+
 ## 2. Cargo's rule watches the package only when nothing was printed
 
 - What: `rule::of_directives` sets `package` whenever no `rerun-if-changed` was printed. Cargo
@@ -40,6 +43,8 @@
 - Where: `crates/blaze-usercode/src/rule.rs` (`of_directives`) and `script.rs` (`cargo_rule`),
   `trace::package`. Parent's paths.
 - Why: fewer reruns than now, never fewer than cargo's.
+
+> applied: by usercode (`rule::CargoRule::of` over `blaze_build_script::watched`, per usercode's report).
 
 ## 3. Keep a probe's verdict, keyed by what it depends on
 
@@ -61,3 +66,6 @@
   `crates/blaze-cargo/src/cargo/daemon.rs`. Coordinator's paths.
 - Why: the probe scripts are the largest group of scripts that can't be elided, and the
   docs/v2/plan/goals/principles.md rule (everything is ours, for the best performance possible).
+
+> forwarded to codegen: `crates/blaze-engine/src/as_rustc.rs`.
+> forwarded to cargo: the daemon's socket in `crates/blaze-cargo/src/cargo/daemon.rs`.

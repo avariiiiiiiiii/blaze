@@ -12,8 +12,13 @@
 //! runs them as plane tasks over the one database; each task's diagnostics go in its module's
 //! slot, and the result is read in the def maps' order, so it is the same whatever order the
 //! tasks ran in.
+//!
+//! The technique to match is rustc's parallel front end, `par_hir_for_each_module` on rayon's
+//! work stealing: one module per task. Here a run of small modules is one task, so no task
+//! costs less to schedule than it does to run, a slot is written once by a compare-and-swap
+//! (no lock), and unlike rustc's the diagnostics come out in one order whatever the threads.
 
-use std::{ptr, sync::Mutex};
+use std::{ptr, sync::OnceLock};
 
 use base_db::SourceDatabase;
 use hir_def::nameres::crate_def_map;
@@ -24,6 +29,10 @@ use crate::{
 
 /// Which bodies a check asks for: all of them when `None`.
 pub type Bodies<'a> = Option<&'a (dyn Fn(DefWithBody) -> bool + Sync)>;
+
+/// The items a task takes at least, but for the last: a run of smaller modules is one task.
+/// The tests' fixtures are a few items a module, which would otherwise be one task.
+const ITEMS_PER_TASK: usize = if cfg!(test) { 4 } else { 32 };
 
 /// The crates `blaze check` checks: the workspace's members.
 pub fn workspace_crates(db: &dyn HirDatabase) -> Vec<Crate> {
@@ -98,14 +107,15 @@ fn check_modules<'db>(
     style_lints: bool,
     bodies: Bodies<'_>,
 ) -> Vec<Vec<AnyDiagnostic<'db>>> {
-    if modules.len() < 2 {
+    let starts = tasks(db, modules);
+    if starts.len() < 2 {
         return modules.iter().map(|&it| check_module(db, it, style_lints, bodies)).collect();
     }
-    let slots: Vec<Mutex<Vec<AnyDiagnostic<'db>>>> =
-        modules.iter().map(|_| Mutex::new(Vec::new())).collect();
+    let slots: Vec<OnceLock<Vec<AnyDiagnostic<'db>>>> =
+        modules.iter().map(|_| OnceLock::new()).collect();
     HirDatabase::zalsa_register_downcaster(db);
     let home = ptr::from_ref(db).cast::<()>().addr();
-    db.run_all(modules.len(), &|task_db, at| {
+    db.run_all(starts.len(), &|task_db, task| {
         let task_db = hir_db(task_db);
         assert_eq!(
             ptr::from_ref(task_db).cast::<()>().addr(),
@@ -116,10 +126,32 @@ fn check_modules<'db>(
         // `'db` by this call, and `run_all` returns only once every task has run. `'db` brands
         // the diagnostics as that database's, which this one is.
         let task_db: &'db dyn HirDatabase = unsafe { &*ptr::from_ref(task_db) };
-        let found = check_module(task_db, modules[at], style_lints, bodies);
-        *slots[at].lock().unwrap_or_else(|it| it.into_inner()) = found;
+        let end = starts.get(task + 1).map_or(modules.len(), |&it| it as usize);
+        for at in starts[task] as usize..end {
+            let found = check_module(task_db, modules[at], style_lints, bodies);
+            assert!(slots[at].set(found).is_ok(), "a module of a check was checked twice");
+        }
     });
-    slots.into_iter().map(|it| it.into_inner().unwrap_or_else(|it| it.into_inner())).collect()
+    slots
+        .into_iter()
+        .map(|it| it.into_inner().expect("`run_all` returned before a task of the check ran"))
+        .collect()
+}
+
+/// Where each task of `modules` starts: a run of modules, together of [`ITEMS_PER_TASK`]
+/// items or more but for the last, in order.
+pub(crate) fn tasks(db: &dyn HirDatabase, modules: &[Module]) -> Vec<u32> {
+    let mut starts = Vec::with_capacity(modules.len());
+    let mut items = ITEMS_PER_TASK;
+    for (at, module) in modules.iter().enumerate() {
+        if items >= ITEMS_PER_TASK {
+            starts.push(at as u32);
+            items = 0;
+        }
+        let scope = module.id.def_map(db).module(db, module.id).scope(db);
+        items += 1 + scope.declarations().count() + scope.impls().len();
+    }
+    starts
 }
 
 /// `db` as the `HirDatabase` it is, once [`HirDatabase::zalsa_register_downcaster`] was called on

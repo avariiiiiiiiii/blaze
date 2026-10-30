@@ -21,9 +21,12 @@
 //! the syntax the bound was registered at), whether a span is of a format string's
 //! desugaring, and the ambiguous goals rustc reports as E0283.
 
-use hir::{HasSource as _, InFile, LangItem, PathResolution};
+use base_db::{CrateOrigin, LangCrateOrigin};
+use blaze_items::{Fact, ItemId};
+use hir::{AsAssocItem as _, InFile, LangItem, PathResolution};
+use hir_def::FunctionId;
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange,
+    AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, TextRange,
     ast::{self, HasAttrs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
 };
 
@@ -31,7 +34,7 @@ use crate::{
     cx::{Cx, def_range},
     lints::code_fact,
     lower::{Found, Phase},
-    model::{Applicability, Diag, Span},
+    model::{Applicability, Diag, MultiSpan, Span},
     print,
 };
 
@@ -58,11 +61,13 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
         _ => leaf,
     };
     let main_is_leaf = std::ptr::eq(main, leaf);
-    let main_ref = main.trait_ref();
     let direct = d.parent_trait_predicates.is_empty() || !main_is_leaf;
 
     let at = cx.syntax(d.span.map(|it| it.syntax_node_ptr()));
-    let cause = Cause::of(cx, &at, root_self.as_ref());
+    let want = root_self.as_ref().map(|it| cx.ty(it));
+    let cause = Cause::of(cx, &at, |ty| {
+        want.as_ref().is_some_and(|want| cx.ty(ty) == *want || cx.ty(&ty.strip_references()) == *want)
+    });
     let custom = on_unimplemented(cx, main, direct);
     let message = custom.message.clone().unwrap_or_else(|| {
         format!("the trait bound `{}` is not satisfied", print::predicate(cx, main))
@@ -144,7 +149,13 @@ fn explanation(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> String {
     }
     let self_ty = tr.get_type_argument(0);
     let desc = match &self_ty {
-        Some(ty) if ty.as_callable(cx.db).is_some_and(|it| matches!(it.kind(), hir::CallableKind::Function(_))) && !ty.is_fn_ptr_like() => " fn item",
+        Some(ty)
+            if ty
+                .as_callable(cx.db)
+                .is_some_and(|it| matches!(it.kind(), hir::CallableKind::Function(_))) =>
+        {
+            " fn item"
+        }
         Some(ty) if ty.is_closure() => " closure",
         _ => "",
     };
@@ -170,10 +181,12 @@ pub(super) struct Cause {
 }
 
 impl Cause {
+    /// The cause of a bound registered at `at`, blamed on the argument whose type `is_of`
+    /// holds of, when exactly one does.
     pub(super) fn of<'db>(
         cx: &Cx<'_, 'db>,
         at: &InFile<SyntaxNode>,
-        self_ty: Option<&hir::Type<'db>>,
+        is_of: impl Fn(&hir::Type<'db>) -> bool,
     ) -> Cause {
         let plain = || Cause {
             span: cx.span(at.as_ref().map(|it| it.text_range())),
@@ -202,20 +215,10 @@ impl Cause {
                 return plain();
             };
         let callee_span = cx.span(at.with_value(callee_range));
-        let blamed: Vec<&ast::Expr> = match self_ty {
-            Some(self_ty) => {
-                let want = cx.ty(self_ty);
-                args.iter()
-                    .filter(|arg| {
-                        cx.sema.type_of_expr(arg).is_some_and(|it| {
-                            let ty = it.original;
-                            cx.ty(&ty) == want || cx.ty(&ty.strip_references()) == want
-                        })
-                    })
-                    .collect()
-            }
-            None => Vec::new(),
-        };
+        let blamed: Vec<&ast::Expr> = args
+            .iter()
+            .filter(|arg| cx.sema.type_of_expr(arg).is_some_and(|it| is_of(&it.original)))
+            .collect();
         match blamed.as_slice() {
             [arg] => Cause {
                 span: cx.span(at.with_value(arg.syntax().text_range())),
@@ -252,7 +255,7 @@ fn note_derived(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>, diag: &mut Dia
         };
         format!("required for `{self_ty}` to implement `{modifier}{}`", print::trait_path(cx, &tr))
     };
-    let mut seen: Vec<hir::Trait> = vec![d.trait_predicate.trait_ref().trait_()];
+    let mut seen: Vec<hir::Trait> = Vec::new();
     let mut i = 0;
     while i < parents.len() {
         let trait_ = parents[i].trait_ref().trait_();
@@ -328,24 +331,25 @@ pub(super) fn where_clause_note<'db>(
         }
         _ => return,
     };
-    let mut span = crate::model::MultiSpan::of(at.clone());
+    let mut span = MultiSpan::of(at.clone());
     if let Some(ident) = ident
         && !overlaps(&ident, &at)
         && !same_line(cx, &ident, &at)
     {
-        span.labels.push((ident, "required by a bound in this function".to_owned()));
+        let descr = if callee.has_self_param(cx.db) {
+            "method"
+        } else if callee.as_assoc_item(cx.db).is_some() {
+            "associated function"
+        } else {
+            "function"
+        };
+        span.labels.push((ident, format!("required by a bound in this {descr}")));
     }
     span.labels.push((at, label));
     diag.span_note(span, descr);
-    diag.fact_opt(
-        Some(blaze_items::Fact::Signature(cx.key(blaze_items::ItemId::Function(
-            match hir::FunctionId::try_from(callee) {
-                Ok(id) => id,
-                Err(()) => return,
-            },
-        )))),
-        format!("the signature of `{name}`"),
-    );
+    if let Ok(id) = FunctionId::try_from(callee) {
+        diag.fact(Fact::Signature(cx.key(ItemId::Function(id))), format!("the signature of `{name}`"));
+    }
 }
 
 /// The bounds written on a function's type parameters and in its where clause, in order.
@@ -436,9 +440,9 @@ fn on_unimplemented(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, direct: boo
         }
         let Some(tt) = meta.token_tree() else { continue };
         let metas = parse_metas(tt.syntax());
-        // Of the directive and its `on(..)`s, each holding one, later ones override: rustc
-        // walks them from the last `on` back to the directive, so the first `on` that holds
-        // wins and the directive's own fields are the default.
+        // rustc walks the directive, then its `on(..)`s from the last to the first, each that
+        // holds overriding the message and label before it and adding its notes: the first
+        // `on` that holds wins, the directive's own fields are the default.
         let mut commands: Vec<(Option<&Meta>, Vec<&Meta>)> = vec![(None, Vec::new())];
         for meta in &metas {
             match meta {
@@ -452,47 +456,26 @@ fn on_unimplemented(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, direct: boo
             }
         }
         let mut found = Custom::default();
-        let mut notes = Vec::new();
-        for (cond, fields) in commands.iter().rev() {
+        for (cond, fields) in std::iter::once(&commands[0]).chain(commands[1..].iter().rev()) {
             if let Some(cond) = cond
                 && !args.holds(cond, direct)
             {
                 continue;
             }
-            let mut command_notes = Vec::new();
             for field in fields {
                 let Meta::Value(name, value) = field else { continue };
                 let text = args.format(value);
                 match name.as_str() {
                     "message" => found.message = Some(text),
                     "label" => found.label = Some(text),
-                    "note" => command_notes.push(text),
+                    "note" => found.notes.push(text),
                     _ => {}
                 }
             }
-            notes.extend(command_notes);
         }
-        // rustc collects the commands' notes from the directive to the last `on`, each
-        // command's in its order.
-        let mut ordered = Vec::new();
-        for (cond, fields) in &commands {
-            if let Some(cond) = cond
-                && !args.holds(cond, direct)
-            {
-                continue;
-            }
-            for field in fields {
-                if let Meta::Value(name, value) = field
-                    && name == "note"
-                {
-                    ordered.push(args.format(value));
-                }
-            }
-        }
-        debug_assert_eq!(ordered.len(), notes.len());
         custom.message = custom.message.or(found.message);
         custom.label = custom.label.or(found.label);
-        custom.notes.extend(ordered);
+        custom.notes.extend(found.notes);
     }
     custom
 }
@@ -705,18 +688,20 @@ fn full_path(cx: &Cx<'_, '_>, adt: hir::Adt) -> Option<String> {
 /// The name rustc's `get_diagnostic_name` gives a trait it can derive: core's lang and
 /// diagnostic items, or a trait marked `#[rustc_diagnostic_item = ".."]`.
 fn derivable_name(cx: &Cx<'_, '_>, trait_: hir::Trait) -> Option<&'static str> {
-    const DERIVABLE: [(LangItem, &str); 9] = [
+    const LANG: [(LangItem, &str); 4] = [
         (LangItem::Copy, "Copy"),
         (LangItem::Clone, "Clone"),
         (LangItem::PartialEq, "PartialEq"),
         (LangItem::PartialOrd, "PartialOrd"),
-        (LangItem::Eq, "Eq"),
-        (LangItem::Ord, "Ord"),
-        (LangItem::Hash, "Hash"),
-        (LangItem::Debug, "Debug"),
-        (LangItem::Default, "Default"),
     ];
-    if let Some((_, name)) = DERIVABLE.iter().find(|(item, _)| is_lang(cx, trait_, *item)) {
+    const DERIVABLE: [&str; 9] =
+        ["Copy", "Clone", "PartialEq", "PartialOrd", "Eq", "Ord", "Hash", "Debug", "Default"];
+    if let Some((_, name)) = LANG.iter().find(|(item, _)| is_lang(cx, trait_, *item)) {
+        return Some(name);
+    }
+    if trait_.module(cx.db).krate(cx.db).origin(cx.db) == CrateOrigin::Lang(LangCrateOrigin::Core)
+        && let Some(name) = DERIVABLE[4..].iter().find(|it| trait_.name(cx.db).as_str() == **it)
+    {
         return Some(name);
     }
     let src = cx.sema.source(trait_)?;
@@ -730,7 +715,7 @@ fn derivable_name(cx: &Cx<'_, '_>, trait_: hir::Trait) -> Option<&'static str> {
         }
         _ => None,
     })?;
-    DERIVABLE.iter().map(|(_, name)| *name).find(|name| *name == named)
+    DERIVABLE.into_iter().find(|name| *name == named)
 }
 
 /// rustc's `can_suggest_derive`: the self type is a local ADT, the trait one it can derive,

@@ -25,12 +25,15 @@ crate::sync::thread_local! {
 struct Attached {
     /// Pointer to the currently attached database.
     database: Cell<Option<NonNull<dyn Database>>>,
+    /// The depth of the task that attached it: a task pumped above it may attach another one.
+    depth: Cell<u32>,
 }
 
 impl Attached {
     const fn new() -> Self {
         Self {
             database: Cell::new(None),
+            depth: Cell::new(0),
         }
     }
 
@@ -62,6 +65,7 @@ impl Attached {
                     }
                     // No database is attached, attach the new one.
                     None => {
+                        attached.depth.set(crate::task::current_depth());
                         attached.database.set(Some(NonNull::from(db)));
                         Self {
                             state: Some(attached),
@@ -84,6 +88,9 @@ impl Attached {
             }
         }
 
+        if self.database.get().is_some() && self.depth.get() != crate::task::current_depth() {
+            return self.attach_allow_change(db, op);
+        }
         let _guard = DbGuard::new(self, db.as_dyn_database());
         op()
     }
@@ -102,26 +109,32 @@ impl Attached {
             ///
             /// We need to make sure to rollback and activate it again when we exit the scope.
             prev: Option<NonNull<dyn Database>>,
+            /// The depth of the task that attached `prev`.
+            prev_depth: u32,
         }
 
         impl<'s> DbGuard<'s> {
             #[inline]
             fn new(attached: &'s Attached, db: &dyn Database) -> Self {
                 let db = NonNull::from(db);
+                let prev_depth = attached.depth.replace(crate::task::current_depth());
                 match attached.database.replace(Some(db)) {
                     // A database was already attached by a parent scope.
                     Some(prev) => {
                         if std::ptr::eq(db.as_ptr(), prev.as_ptr()) {
                             // and it was the same as ours, so we did not change anything.
+                            attached.depth.set(prev_depth);
                             Self {
                                 state: None,
                                 prev: None,
+                                prev_depth,
                             }
                         } else {
                             // and it was the a different one from ours, record the state changes.
                             Self {
                                 state: Some(attached),
                                 prev: Some(prev),
+                                prev_depth,
                             }
                         }
                     }
@@ -131,6 +144,7 @@ impl Attached {
                         Self {
                             state: Some(attached),
                             prev: None,
+                            prev_depth,
                         }
                     }
                 }
@@ -144,6 +158,7 @@ impl Attached {
                 if let Some(attached) = self.state
                     && let Some(prev) = attached.database.replace(self.prev)
                 {
+                    attached.depth.set(self.prev_depth);
                     // SAFETY: `prev` is a valid pointer to a database.
                     unsafe { prev.as_ref().zalsa_local().uncancel() };
                 }

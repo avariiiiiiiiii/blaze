@@ -15,7 +15,7 @@ use hir_def::{
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
 
-use super::{InherentImpls, OneTraitImpls, TraitImpls};
+use super::{InherentImpls, OneTraitImplsBuilder, SelfTyGroups, TraitImpls};
 use crate::{
     db::HirDatabase,
     next_solver::{SimplifiedType, SolverDefId},
@@ -86,17 +86,22 @@ pub(super) fn trait_impls<'db>(db: &'db dyn HirDatabase, krate: Crate) -> Option
             let ModuleDefId::TraitId(trait_) = dec.def()? else {
                 return Err("impls of no trait".to_owned());
             };
-            let non_blanket_impls = dec.many(|dec| {
+            let entries = dec.many(|dec| {
                 let self_ty = read_simplified(dec)?;
-                let impls = dec.many(|dec| dec.impl_id())?.into_boxed_slice();
-                let derived = dec.many(|dec| dec.builtin_derive_impl())?.into_boxed_slice();
+                let impls = dec.many(|dec| dec.impl_id())?;
+                let derived = dec.many(|dec| dec.builtin_derive_impl())?;
                 Ok((self_ty, (impls, derived)))
             })?;
-            let blanket_impls = dec.many(|dec| dec.impl_id())?.into_boxed_slice();
-            let non_blanket_impls = non_blanket_impls.into_iter().collect();
-            map.insert(trait_, OneTraitImpls { non_blanket_impls, blanket_impls });
+            let mut one = OneTraitImplsBuilder::default();
+            for (self_ty, (impls, derived)) in entries {
+                let entry = one.non_blanket_impls.entry(self_ty);
+                entry.0.extend(impls);
+                entry.1.extend(derived);
+            }
+            one.blanket_impls = dec.many(|dec| dec.impl_id())?;
+            map.insert(trait_, one);
         }
-        Ok(TraitImpls { map })
+        Ok(TraitImpls::from_traits(map))
     })
 }
 
@@ -105,11 +110,15 @@ pub(super) fn inherent_impls<'db>(
     krate: Crate,
 ) -> Option<InherentImpls<'db>> {
     read(db, krate, 1, |dec| {
-        let map = dec.many(|dec| {
+        let entries = dec.many(|dec| {
             let self_ty = read_simplified(dec)?;
-            Ok((self_ty, dec.many(|dec| dec.impl_id())?.into_boxed_slice()))
+            Ok((self_ty, dec.many(|dec| dec.impl_id())?))
         })?;
-        Ok(InherentImpls { map: map.into_iter().collect() })
+        let mut groups = SelfTyGroups::default();
+        for (self_ty, impls) in entries {
+            groups.entry(self_ty).extend(impls);
+        }
+        Ok(InherentImpls::from_groups(groups))
     })
 }
 
@@ -117,13 +126,13 @@ pub(super) fn inherent_impls<'db>(
 /// [`Mode::Verify`].
 pub fn encode(db: &dyn HirDatabase, krate: Crate) -> R<Vec<u8>> {
     let mut enc = Enc::new(db, krate);
-    let TraitImpls { map } = &**TraitImpls::for_crate(db, krate);
-    let map = enc.sorted(map.iter(), |enc, it| enc.def(ModuleDefId::TraitId(**it)))?;
-    enc.usize(map.len())?;
-    for (&trait_, one) in map {
+    let trait_impls = &**TraitImpls::for_crate(db, krate);
+    let traits =
+        enc.sorted(trait_impls.trait_indices(), |enc, it| enc.def(ModuleDefId::TraitId(*it)))?;
+    enc.usize(traits.len())?;
+    for (trait_, t) in traits {
         enc.def(ModuleDefId::TraitId(trait_))?;
-        let OneTraitImpls { non_blanket_impls, blanket_impls } = one;
-        let entries = enc.sorted(non_blanket_impls.iter(), |enc, it| write_simplified(enc, it))?;
+        let entries = enc.sorted(trait_impls.rows_at(t), |enc, it| write_simplified(enc, it))?;
         enc.usize(entries.len())?;
         for (self_ty, (impls, derived)) in entries {
             write_simplified(&mut enc, self_ty)?;
@@ -136,16 +145,17 @@ pub fn encode(db: &dyn HirDatabase, krate: Crate) -> R<Vec<u8>> {
                 enc.builtin_derive_impl(it)?;
             }
         }
+        let blanket_impls = trait_impls.blanket_impls(trait_);
         enc.usize(blanket_impls.len())?;
-        for &it in blanket_impls.iter() {
+        for &it in blanket_impls {
             enc.impl_id(it)?;
         }
     }
     let traits = enc.finish()?;
 
     let mut enc = Enc::new(db, krate);
-    let InherentImpls { map } = InherentImpls::for_crate(db, krate);
-    let map = enc.sorted(map.iter(), |enc, it| write_simplified(enc, it))?;
+    let inherent_impls = InherentImpls::for_crate(db, krate);
+    let map = enc.sorted(inherent_impls.iter(), |enc, it| write_simplified(enc, it))?;
     enc.usize(map.len())?;
     for (self_ty, impls) in map {
         write_simplified(&mut enc, self_ty)?;

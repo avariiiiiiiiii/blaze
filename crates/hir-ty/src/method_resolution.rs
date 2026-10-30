@@ -10,6 +10,8 @@ mod confirm;
 pub mod frozen;
 mod probe;
 
+use std::{hash::BuildHasher, ops::Range};
+
 use crate::next_solver::StoredGenericArgs;
 use either::Either;
 use hir_expand::name::Name;
@@ -33,7 +35,7 @@ use hir_def::{
     signatures::{ConstSignature, FunctionSignature},
     unstable_features::UnstableFeatures,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::{
     TypeFoldable, TypeVisitableExt, VisitorResult,
     fast_reject::{TreatParams, simplify_type},
@@ -973,13 +975,116 @@ pub struct SelfTyKey<'db>(
     #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))] pub SimplifiedType<'db>,
 );
 
+const _: () = assert!(size_of::<ImplId>() <= 8);
+const _: () = assert!(size_of::<BuiltinDeriveImplId>() <= 8);
+const _: () = assert!(size_of::<TraitId>() <= 8);
+const _: () = assert!(size_of::<SimplifiedType<'static>>() <= 24);
+
+/// Runs of one flat array, as compressed sparse rows: run `i` is
+/// `values[starts[i]..starts[i + 1]]`.
+#[derive(Debug, PartialEq, Eq, SalsaValue)]
+struct Runs<V> {
+    starts: Box<[u32]>,
+    values: Box<[V]>,
+}
+
+impl<V: Copy> Runs<V> {
+    fn new<'a>(runs: impl IntoIterator<Item = &'a [V]>) -> Self
+    where
+        V: 'a,
+    {
+        let mut starts = vec![0];
+        let mut values = Vec::new();
+        for run in runs {
+            values.extend_from_slice(run);
+            starts.push(u32::try_from(values.len()).expect("more than 2^32 impls in a crate"));
+        }
+        Runs { starts: starts.into_boxed_slice(), values: values.into_boxed_slice() }
+    }
+
+    fn run(&self, i: usize) -> &[V] {
+        &self.values[self.starts[i] as usize..self.starts[i + 1] as usize]
+    }
+}
+
+fn hash_self_ty(self_ty: &SimplifiedType<'_>) -> u64 {
+    FxBuildHasher.hash_one(self_ty)
+}
+
+/// Simplified self types as two columns: the hashes, searched, and the types, compared only
+/// where a hash matches. They are sorted by hash within each range a table searches.
+#[derive(Debug, PartialEq, Eq)]
+struct SelfTys<'db> {
+    hashes: Box<[u64]>,
+    self_tys: Box<[SimplifiedType<'db>]>,
+}
+
+impl<'db> SelfTys<'db> {
+    fn new(self_tys: Vec<SimplifiedType<'db>>) -> Self {
+        let hashes = self_tys.iter().map(hash_self_ty).collect();
+        SelfTys { hashes, self_tys: self_tys.into_boxed_slice() }
+    }
+
+    fn len(&self) -> usize {
+        self.self_tys.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.self_tys.is_empty()
+    }
+
+    /// The index of `self_ty` in `range`, which is sorted by hash.
+    fn find(&self, range: Range<usize>, self_ty: &SimplifiedType<'db>) -> Option<usize> {
+        let hash = hash_self_ty(self_ty);
+        let first = range.start + self.hashes[range.clone()].partition_point(|&it| it < hash);
+        (first..range.end)
+            .take_while(|&i| self.hashes[i] == hash)
+            .find(|&i| self.self_tys[i] == *self_ty)
+    }
+}
+
+/// Values grouped by simplified self type while impls are found, each type where it was first
+/// seen.
+struct SelfTyGroups<'db, T> {
+    index: FxHashMap<SimplifiedType<'db>, usize>,
+    groups: Vec<(SimplifiedType<'db>, T)>,
+}
+
+impl<T> Default for SelfTyGroups<'_, T> {
+    fn default() -> Self {
+        SelfTyGroups { index: FxHashMap::default(), groups: Vec::new() }
+    }
+}
+
+impl<'db, T: Default> SelfTyGroups<'db, T> {
+    fn entry(&mut self, self_ty: SimplifiedType<'db>) -> &mut T {
+        let groups = &mut self.groups;
+        let i = *self.index.entry(self_ty).or_insert_with(|| {
+            groups.push((self_ty, T::default()));
+            groups.len() - 1
+        });
+        &mut self.groups[i].1
+    }
+
+    /// The groups sorted by the hash of their type; types of equal hash stay in the order they
+    /// were first seen.
+    fn into_sorted(self) -> Vec<(SimplifiedType<'db>, T)> {
+        let mut groups = self.groups;
+        groups.sort_by_cached_key(|(self_ty, _)| hash_self_ty(self_ty));
+        groups
+    }
+}
+
+/// The inherent impls of a crate or block, as columns: the self types sorted by hash, each
+/// with its run of impls in the order they were found.
 #[derive(Debug, PartialEq, Eq, SalsaValue)]
 pub struct InherentImpls<'db> {
     // SAFETY: necessary due to `SimplifiedType<'db>`.
     // It's safe to retain, as it only contains `SolverDefId<'db>` (which is `SalsaValue`),
     // and no `&'db` references.
     #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
-    map: FxHashMap<SimplifiedType<'db>, Box<[ImplId]>>,
+    self_tys: SelfTys<'db>,
+    impls: Runs<ImplId>,
 }
 
 #[salsa::tracked]
@@ -1016,7 +1121,7 @@ impl<'db> InherentImpls<'db> {
 
         let block_def_map = block_def_map(db, block);
         let result = Self::collect_def_map(db, block_def_map);
-        if result.map.is_empty() { None } else { Some(Box::new(result)) }
+        if result.self_tys.is_empty() { None } else { Some(Box::new(result)) }
     }
 
     /// The inherent impls of `block` for one type, as [`Self::in_crate_for_self_ty`].
@@ -1035,19 +1140,14 @@ impl<'db> InherentImpls<'db> {
 
 impl<'db> InherentImpls<'db> {
     fn collect_def_map(db: &'db dyn HirDatabase, def_map: &'db DefMap) -> Self {
-        let mut map = FxHashMap::default();
+        let mut map = SelfTyGroups::default();
         collect(db, def_map, &mut map);
-        let mut map = map
-            .into_iter()
-            .map(|(self_ty, impls)| (self_ty, impls.into_boxed_slice()))
-            .collect::<FxHashMap<_, _>>();
-        map.shrink_to_fit();
-        return Self { map };
+        return Self::from_groups(map);
 
         fn collect<'db>(
             db: &'db dyn HirDatabase,
             def_map: &DefMap,
-            map: &mut FxHashMap<SimplifiedType<'db>, Vec<ImplId>>,
+            map: &mut SelfTyGroups<'db, Vec<ImplId>>,
         ) {
             for (_module_id, module_data) in def_map.modules(db) {
                 for impl_id in module_data.scope(db).inherent_impls() {
@@ -1057,7 +1157,7 @@ impl<'db> InherentImpls<'db> {
                     if let Some(self_ty) =
                         simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer)
                     {
-                        map.entry(self_ty).or_default().push(impl_id);
+                        map.entry(self_ty).push(impl_id);
                     }
                 }
 
@@ -1070,13 +1170,23 @@ impl<'db> InherentImpls<'db> {
         }
     }
 
-    pub fn for_self_ty(&self, self_ty: &SimplifiedType<'db>) -> &[ImplId] {
-        self.map.get(self_ty).map(|it| &**it).unwrap_or_default()
+    fn from_groups(groups: SelfTyGroups<'db, Vec<ImplId>>) -> Self {
+        let groups = groups.into_sorted();
+        let impls = Runs::new(groups.iter().map(|(_, impls)| &**impls));
+        let self_tys = SelfTys::new(groups.into_iter().map(|(self_ty, _)| self_ty).collect());
+        Self { self_tys, impls }
     }
 
-    /// Every simplified self type with its inherent impls, in no particular order.
+    pub fn for_self_ty(&self, self_ty: &SimplifiedType<'db>) -> &[ImplId] {
+        match self.self_tys.find(0..self.self_tys.len(), self_ty) {
+            Some(i) => self.impls.run(i),
+            None => &[],
+        }
+    }
+
+    /// Every simplified self type with its inherent impls, in the order of their hashes.
     pub fn iter(&self) -> impl Iterator<Item = (&SimplifiedType<'db>, &[ImplId])> + '_ {
-        self.map.iter().map(|(self_ty, impls)| (self_ty, &**impls))
+        self.self_tys.self_tys.iter().enumerate().map(|(i, self_ty)| (self_ty, self.impls.run(i)))
     }
 
     pub fn for_each_crate_and_block(
@@ -1091,40 +1201,84 @@ impl<'db> InherentImpls<'db> {
     }
 }
 
+#[derive(Default)]
+struct OneTraitImplsBuilder<'db> {
+    non_blanket_impls: SelfTyGroups<'db, (Vec<ImplId>, Vec<BuiltinDeriveImplId>)>,
+    blanket_impls: Vec<ImplId>,
+}
+
+/// The trait impls of a crate or block, as columns. The traits are sorted; trait `t` has the
+/// run `blanket[t]` of blanket impls and the rows `trait_rows[t]..trait_rows[t + 1]`, one per
+/// self type, sorted by hash. Row `r` has the runs `impls[r]` and `derives[r]`. Every run is in
+/// the order its impls were found.
 #[derive(Debug, PartialEq, SalsaValue)]
-struct OneTraitImpls<'db> {
+pub struct TraitImpls<'db> {
+    traits: Box<[TraitId]>,
+    trait_rows: Box<[u32]>,
+    blanket: Runs<ImplId>,
     // SAFETY: necessary due to `SimplifiedType<'db>`.
     // It's safe to retain, as it only contains `SolverDefId<'db>` (which is `SalsaValue`),
     // and no `&'db` references.
     #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
-    non_blanket_impls: FxHashMap<SimplifiedType<'db>, (Box<[ImplId]>, Box<[BuiltinDeriveImplId]>)>,
-    blanket_impls: Box<[ImplId]>,
+    self_tys: SelfTys<'db>,
+    impls: Runs<ImplId>,
+    derives: Runs<BuiltinDeriveImplId>,
 }
 
-#[derive(Default)]
-struct OneTraitImplsBuilder<'db> {
-    non_blanket_impls: FxHashMap<SimplifiedType<'db>, (Vec<ImplId>, Vec<BuiltinDeriveImplId>)>,
-    blanket_impls: Vec<ImplId>,
-}
-
-impl<'db> OneTraitImplsBuilder<'db> {
-    fn finish(self) -> OneTraitImpls<'db> {
-        let mut non_blanket_impls = self
-            .non_blanket_impls
+impl<'db> TraitImpls<'db> {
+    fn from_traits(traits: FxHashMap<TraitId, OneTraitImplsBuilder<'db>>) -> Self {
+        let mut traits = traits.into_iter().collect::<Vec<_>>();
+        traits.sort_unstable_by_key(|&(trait_, _)| trait_);
+        let mut trait_rows = vec![0];
+        let mut blanket = Vec::with_capacity(traits.len());
+        let mut rows = Vec::new();
+        let traits = traits
             .into_iter()
-            .map(|(self_ty, (impls, builtin_derive_impls))| {
-                (self_ty, (impls.into_boxed_slice(), builtin_derive_impls.into_boxed_slice()))
+            .map(|(trait_, one)| {
+                rows.extend(one.non_blanket_impls.into_sorted());
+                let end = u32::try_from(rows.len()).expect("more than 2^32 impls in a crate");
+                trait_rows.push(end);
+                blanket.push(one.blanket_impls);
+                trait_
             })
-            .collect::<FxHashMap<_, _>>();
-        non_blanket_impls.shrink_to_fit();
-        let blanket_impls = self.blanket_impls.into_boxed_slice();
-        OneTraitImpls { non_blanket_impls, blanket_impls }
+            .collect::<Box<[_]>>();
+        TraitImpls {
+            traits,
+            trait_rows: trait_rows.into_boxed_slice(),
+            blanket: Runs::new(blanket.iter().map(|it| &**it)),
+            impls: Runs::new(rows.iter().map(|(_, (impls, _))| &**impls)),
+            derives: Runs::new(rows.iter().map(|(_, (_, derives))| &**derives)),
+            self_tys: SelfTys::new(rows.into_iter().map(|(self_ty, _)| self_ty).collect()),
+        }
     }
-}
 
-#[derive(Debug, PartialEq, SalsaValue)]
-pub struct TraitImpls<'db> {
-    map: FxHashMap<TraitId, OneTraitImpls<'db>>,
+    fn trait_index(&self, trait_: TraitId) -> Option<usize> {
+        self.traits.binary_search(&trait_).ok()
+    }
+
+    fn rows(&self, t: usize) -> Range<usize> {
+        self.trait_rows[t] as usize..self.trait_rows[t + 1] as usize
+    }
+
+    fn row(&self, trait_: TraitId, self_ty: &SimplifiedType<'db>) -> Option<usize> {
+        self.trait_index(trait_).and_then(|t| self.self_tys.find(self.rows(t), self_ty))
+    }
+
+    /// Each trait with its index, for [`frozen`].
+    fn trait_indices(&self) -> impl Iterator<Item = (TraitId, usize)> + '_ {
+        self.traits.iter().copied().zip(0..)
+    }
+
+    /// The impls of the trait at index `t` per self type, for [`frozen`].
+    fn rows_at(
+        &self,
+        t: usize,
+    ) -> impl Iterator<Item = (&SimplifiedType<'db>, (&[ImplId], &[BuiltinDeriveImplId]))> + '_
+    {
+        self.rows(t).map(|r| {
+            (&self.self_tys.self_tys[r], (self.impls.run(r), self.derives.run(r)))
+        })
+    }
 }
 
 #[salsa::tracked]
@@ -1150,7 +1304,7 @@ impl<'db> TraitImpls<'db> {
 
         let block_def_map = block_def_map(db, block);
         let result = Self::collect_def_map(db, block_def_map);
-        if result.map.is_empty() { None } else { Some(Box::new(result)) }
+        if result.traits.is_empty() { None } else { Some(Box::new(result)) }
     }
 
     #[salsa::tracked(returns(deref))]
@@ -1254,12 +1408,7 @@ impl<'db> TraitImpls<'db> {
         let lang_items = hir_def::lang_item::lang_items(db, def_map.krate());
         let mut map = FxHashMap::default();
         collect(db, def_map, lang_items, &mut map);
-        let mut map = map
-            .into_iter()
-            .map(|(trait_id, trait_map)| (trait_id, trait_map.finish()))
-            .collect::<FxHashMap<_, _>>();
-        map.shrink_to_fit();
-        return Self { map };
+        return Self::from_traits(map);
 
         fn collect<'db>(
             db: &'db dyn HirDatabase,
@@ -1294,9 +1443,7 @@ impl<'db> TraitImpls<'db> {
                     let interner = DbInterner::new_no_crate(db);
                     let entry = map.entry(trait_ref.def_id.0).or_default();
                     match simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer) {
-                        Some(self_ty) => {
-                            entry.non_blanket_impls.entry(self_ty).or_default().0.push(impl_id)
-                        }
+                        Some(self_ty) => entry.non_blanket_impls.entry(self_ty).0.push(impl_id),
                         None => entry.blanket_impls.push(impl_id),
                     }
                 }
@@ -1305,10 +1452,7 @@ impl<'db> TraitImpls<'db> {
                     let loc = impl_id.loc(db);
                     let Some(trait_id) = loc.trait_.get_id(lang_items) else { continue };
                     let entry = map.entry(trait_id).or_default();
-                    let entry = entry
-                        .non_blanket_impls
-                        .entry(SimplifiedType::Adt(loc.adt.into()))
-                        .or_default();
+                    let entry = entry.non_blanket_impls.entry(SimplifiedType::Adt(loc.adt.into()));
                     entry.1.push(impl_id);
                 }
 
@@ -1322,7 +1466,10 @@ impl<'db> TraitImpls<'db> {
     }
 
     pub fn blanket_impls(&self, for_trait: TraitId) -> &[ImplId] {
-        self.map.get(&for_trait).map(|it| &*it.blanket_impls).unwrap_or_default()
+        match self.trait_index(for_trait) {
+            Some(t) => self.blanket.run(t),
+            None => &[],
+        }
     }
 
     /// Queries whether `self_ty` has potentially applicable implementations of `trait_`.
@@ -1331,9 +1478,8 @@ impl<'db> TraitImpls<'db> {
         trait_: TraitId,
         self_ty: &SimplifiedType<'db>,
     ) -> bool {
-        self.map.get(&trait_).is_some_and(|trait_impls| {
-            trait_impls.non_blanket_impls.contains_key(self_ty)
-                || !trait_impls.blanket_impls.is_empty()
+        self.trait_index(trait_).is_some_and(|t| {
+            self.self_tys.find(self.rows(t), self_ty).is_some() || !self.blanket.run(t).is_empty()
         })
     }
 
@@ -1342,11 +1488,10 @@ impl<'db> TraitImpls<'db> {
         trait_: TraitId,
         self_ty: &SimplifiedType<'db>,
     ) -> (&'db [ImplId], &'db [BuiltinDeriveImplId]) {
-        self.map
-            .get(&trait_)
-            .and_then(|map| map.non_blanket_impls.get(self_ty))
-            .map(|it| (&*it.0, &*it.1))
-            .unwrap_or_default()
+        match self.row(trait_, self_ty) {
+            Some(r) => (self.impls.run(r), self.derives.run(r)),
+            None => (&[], &[]),
+        }
     }
 
     pub fn for_trait(
@@ -1354,11 +1499,11 @@ impl<'db> TraitImpls<'db> {
         trait_: TraitId,
         mut callback: impl FnMut(Either<&[ImplId], &[BuiltinDeriveImplId]>),
     ) {
-        if let Some(impls) = self.map.get(&trait_) {
-            callback(Either::Left(&impls.blanket_impls));
-            for impls in impls.non_blanket_impls.values() {
-                callback(Either::Left(&impls.0));
-                callback(Either::Right(&impls.1));
+        if let Some(t) = self.trait_index(trait_) {
+            callback(Either::Left(self.blanket.run(t)));
+            for r in self.rows(t) {
+                callback(Either::Left(self.impls.run(r)));
+                callback(Either::Right(self.derives.run(r)));
             }
         }
     }
@@ -1368,10 +1513,10 @@ impl<'db> TraitImpls<'db> {
         self_ty: &SimplifiedType<'db>,
         mut callback: impl FnMut(Either<&[ImplId], &[BuiltinDeriveImplId]>),
     ) {
-        for for_trait in self.map.values() {
-            if let Some(for_ty) = for_trait.non_blanket_impls.get(self_ty) {
-                callback(Either::Left(&for_ty.0));
-                callback(Either::Right(&for_ty.1));
+        for t in 0..self.traits.len() {
+            if let Some(r) = self.self_tys.find(self.rows(t), self_ty) {
+                callback(Either::Left(self.impls.run(r)));
+                callback(Either::Right(self.derives.run(r)));
             }
         }
     }

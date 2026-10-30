@@ -22,13 +22,35 @@ use crate::{
     model::Diag,
 };
 
-/// The tracking issue of `mut_ref`.
-const MUT_REF_ISSUE: u32 = 123076;
+/// The tracking issue of `mut_ref`, and the commit date of the pinned nightly
+/// (`harness/toolchain`, `nightly-2026-10-27`): rustc's `CFG_VER_DATE`, which its upgrade note
+/// names. Literals, so the notes are built at compile time.
+macro_rules! mut_ref_issue {
+    () => {
+        "123076"
+    };
+}
+macro_rules! built_on {
+    () => {
+        "2026-10-26"
+    };
+}
 
-/// The commit date of the pinned nightly (`harness/toolchain`, `nightly-2026-10-27`): rustc's
-/// `CFG_VER_DATE`, which its upgrade note names. rustc's UI tests write `YYYY-MM-DD` for it
-/// (`-Z ui-testing`).
-pub(crate) const BUILT_ON: &str = "2026-10-26";
+/// rustc's UI tests write `YYYY-MM-DD` for it (`-Z ui-testing`).
+pub(crate) const BUILT_ON: &str = built_on!();
+
+const ISSUE_NOTE: &str = concat!(
+    "see issue #",
+    mut_ref_issue!(),
+    " <https://github.com/rust-lang/rust/issues/",
+    mut_ref_issue!(),
+    "> for more information"
+);
+const UPGRADE_NOTE: &str = concat!(
+    "this compiler was built on ",
+    built_on!(),
+    "; consider upgrading it if it is out of date"
+);
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MutableRefBinding) -> Vec<Found> {
     let node = cx.node(d.pat);
@@ -43,13 +65,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MutableRefBinding) -> Vec<Found> {
     let span = cx.span(InFile::new(node.file_id, range));
     let mut diag =
         Diag::error(Some("E0658"), "binding cannot be both mutable and by-reference", span);
-    diag.note(format!(
-        "see issue #{MUT_REF_ISSUE} <https://github.com/rust-lang/rust/issues/{MUT_REF_ISSUE}> for more information"
-    ));
+    diag.note(ISSUE_NOTE);
     diag.help("add `#![feature(mut_ref)]` to the crate attributes to enable");
-    diag.note(format!(
-        "this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"
-    ));
+    diag.note(UPGRADE_NOTE);
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
     vec![Found::new(diag, Phase::Bodies)]
 }

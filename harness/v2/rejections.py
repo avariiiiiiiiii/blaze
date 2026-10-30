@@ -599,7 +599,7 @@ def run_batch(eng: engine.Engine, index: int, units: Sequence[Unit], work: Path,
                 ran = eng.build(f"blaze check of {unit.label}", ws, env, check_args(unit, name), command="check",
                                 timeout=CHECK_SECS)
                 said.append((unit, said_alone(ran.returncode, ran.stdout, ran.said(600), eng.not_blazes(ran))))
-    except (engine.Unmeasurable, engine.Missing, engine.Failed) as e:
+    except (engine.Unmeasurable, engine.Failed) as e:
         why = f"unmeasured: {e}" if isinstance(e, engine.Unmeasurable) else str(e)
         done = {unit.label for unit, _ in said}
         said += [(unit, Said(error=why)) for unit in members.values() if unit.label not in done]

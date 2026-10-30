@@ -63,6 +63,9 @@ pub struct Real {
 pub(crate) struct Shared {
     pub(crate) state: PathBuf,
     pub(crate) launcher: PathBuf,
+    /// The directory of blaze's stand-ins for the tools cargo names to a build script:
+    /// `rustc` and `rustdoc`, each blaze's own executable under that name.
+    pub(crate) tools: PathBuf,
     /// The machine's files and environment as build scripts and tests read them, hashed once
     /// per change ([`blaze_usercode::inputs::Disk`]).
     pub(crate) disk: Mutex<blaze_usercode::inputs::Disk>,
@@ -75,15 +78,39 @@ pub(crate) struct Shared {
 impl Real {
     pub fn new(paths: &Paths) -> Result<Real, String> {
         let fetcher = Fetcher::new()?;
+        let tools = paths.state.join("tools");
+        stand_ins(&tools, &paths.launcher)?;
         let shared = Shared {
             state: paths.state.clone(),
             launcher: paths.launcher.clone(),
+            tools,
             disk: Mutex::new(blaze_usercode::inputs::Disk::new(Vec::new())),
             images: Mutex::new(HashMap::new()),
             memo: blaze_codegen::driver::shared_memo(),
         };
         Ok(Real { fetcher, shared: Arc::new(shared) })
     }
+}
+
+/// blaze's executable linked as `rustc` and `rustdoc` in `dir`: what a build script is given as
+/// `RUSTC` and `RUSTDOC`, so a probe of them (`autocfg`, `version_check`) is answered by blaze
+/// and no rustc runs (docs/no-rustc.md).
+fn stand_ins(dir: &std::path::Path, launcher: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    for name in ["rustc", "rustdoc"] {
+        let at = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        match std::fs::read_link(&at) {
+            Ok(to) if to == launcher => continue,
+            Ok(_) => std::fs::remove_file(&at).map_err(|error| format!("{}: {error}", at.display()))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", at.display())),
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(launcher, &at).map_err(|error| format!("{}: {error}", at.display()))?;
+        #[cfg(windows)]
+        std::fs::hard_link(launcher, &at).map_err(|error| format!("{}: {error}", at.display()))?;
+    }
+    Ok(())
 }
 
 impl Steps for Real {
@@ -122,7 +149,7 @@ impl Steps for Real {
             })
         })?
         .map_err(|error| Failed::Error(ApiError::new(error.what, error.at)))?;
-        Ok(Arc::new(Job::new(job.clone(), lowered, self.shared.clone())))
+        Ok(Arc::new(JobFront(Arc::new(Job::new(job.clone(), lowered, self.shared.clone())))))
     }
 }
 
@@ -258,28 +285,31 @@ pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
     goal == Goal::Check || matches!(unit.mode, Mode::Check)
 }
 
-impl Front for Job {
+/// A job's front as the loop holds it.
+pub(crate) struct JobFront(pub(crate) Arc<Job>);
+
+impl Front for JobFront {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn fresh(&self, unit: usize) -> bool {
-        match self.unit(unit).map(|it| it.mode.clone()) {
-            Ok(Mode::RunCustomBuild) => script::fresh(self, unit),
-            Ok(_) => compile::fresh(self, unit),
+        match self.0.unit(unit).map(|it| it.mode) {
+            Ok(Mode::RunCustomBuild) => script::fresh(&self.0, unit),
+            Ok(_) => compile::fresh(&self.0, unit),
             Err(_) => false,
         }
     }
 
     fn compile(&self, unit: usize) -> Result<Compiled, Failed> {
-        if self.cancelled() {
+        if self.0.cancelled() {
             return Err(Failed::Again);
         }
-        cancellable(|| compile::compile(self, unit))?
+        cancellable(|| compile::compile(&self.0, unit))?
     }
 
     fn script(&self, unit: usize, tags: u64) -> Result<Box<dyn Runs>, ApiError> {
-        script::start(self, unit, tags)
+        script::start(&self.0, unit, tags)
     }
 
     fn tests(
@@ -289,7 +319,7 @@ impl Front for Job {
         all: bool,
         tags: u64,
     ) -> Result<Box<dyn Runs>, ApiError> {
-        test::start(self, built, filter, all, tags)
+        test::start(&self.0, built, filter, all, tags)
     }
 
     fn run(
@@ -299,19 +329,19 @@ impl Front for Job {
         args: &[String],
         tags: u64,
     ) -> Result<Box<dyn Runs>, ApiError> {
-        run::start(self, built, bin, args, tags)
+        run::start(&self.0, built, bin, args, tags)
     }
 
     fn reach(&self, from: &dyn Front, changes: &[blaze_vfs::Change]) -> Result<Reach, Failed> {
-        let Some(from) = from.as_any().downcast_ref::<Job>() else {
+        let Some(from) = from.as_any().downcast_ref::<JobFront>() else {
             return Err(Failed::Error(ApiError::new(
                 "the view to reach from was not lowered by this daemon's build",
                 None,
             )));
         };
-        if self.cancelled() {
+        if self.0.cancelled() {
             return Err(Failed::Again);
         }
-        cancellable(|| reach::reach(from, self, changes))?
+        cancellable(|| reach::reach(&from.0, &self.0, changes))?
     }
 }

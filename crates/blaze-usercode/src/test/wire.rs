@@ -81,12 +81,48 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
+/// [`Frame::Ended`] of these parts, with its length, added to `out`: the bytes
+/// [`Frame::encode`] adds for it, from a borrowed output, so a server encodes each test's
+/// output once, straight from the buffer it was read into.
+pub fn encode_ended(out: &mut Vec<u8>, id: u64, end: &End, output: &[u8]) {
+    let why = match end {
+        End::NotStarted(why) => why.len() + 4,
+        End::Exited(_) | End::Signaled(_) => 4,
+    };
+    out.reserve(4 + 1 + 8 + 1 + why + 4 + output.len());
+    let start = out.len();
+    put_u32(out, 0);
+    out.push(ENDED);
+    put_u64(out, id);
+    match end {
+        End::Exited(code) => {
+            out.push(0);
+            out.extend_from_slice(&code.to_le_bytes());
+        }
+        End::Signaled(signal) => {
+            out.push(1);
+            out.extend_from_slice(&signal.to_le_bytes());
+        }
+        End::NotStarted(why) => {
+            out.push(2);
+            put_bytes(out, why.as_bytes());
+        }
+    }
+    put_bytes(out, output);
+    let len = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&len.to_le_bytes());
+}
+
 impl Frame {
     /// The frame, with its length, added to `out`.
     pub fn encode(&self, out: &mut Vec<u8>) {
+        if let Frame::Ended { id, end, output } = self {
+            return encode_ended(out, *id, end, output);
+        }
         let start = out.len();
         put_u32(out, 0);
         match self {
+            Frame::Ended { .. } => {}
             Frame::Hello { version, pid, tests } => {
                 out.push(HELLO);
                 put_u32(out, *version);
@@ -95,25 +131,6 @@ impl Frame {
                 for name in tests {
                     put_bytes(out, name.as_bytes());
                 }
-            }
-            Frame::Ended { id, end, output } => {
-                out.push(ENDED);
-                put_u64(out, *id);
-                match end {
-                    End::Exited(code) => {
-                        out.push(0);
-                        out.extend_from_slice(&code.to_le_bytes());
-                    }
-                    End::Signaled(signal) => {
-                        out.push(1);
-                        out.extend_from_slice(&signal.to_le_bytes());
-                    }
-                    End::NotStarted(why) => {
-                        out.push(2);
-                        put_bytes(out, why.as_bytes());
-                    }
-                }
-                put_bytes(out, output);
             }
             Frame::Run { id, index } => {
                 out.push(RUN);
@@ -144,7 +161,9 @@ impl Frame {
                 let version = at.u32()?;
                 let pid = at.u32()?;
                 let count = at.u32()?;
-                let mut tests = Vec::new();
+                // Each name takes at least its 4-byte length, so a lying count allocates no
+                // more than the body could hold.
+                let mut tests = Vec::with_capacity((count as usize).min(at.left() / 4));
                 for _ in 0..count {
                     tests.push(at.string()?);
                 }
@@ -182,6 +201,10 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    fn left(&self) -> usize {
+        self.bytes.len() - self.at
+    }
+
     fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
         if self.bytes.len() - self.at < len {
             return Err("a frame ends early".to_owned());
@@ -219,42 +242,82 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// Frames out of a byte stream that comes in pieces.
+/// Frames out of a byte stream that comes in pieces. The frames read are skipped over, not
+/// moved out: what still waits moves to the front only where a push would otherwise grow
+/// the buffer, so many frames in one piece cost one pass, not one move of the rest per frame.
 #[derive(Default, Debug)]
 pub struct Frames {
     buffer: Vec<u8>,
+    /// Where the bytes not yet read as a frame start.
+    start: usize,
 }
 
 impl Frames {
     pub fn new() -> Frames {
-        Frames { buffer: Vec::new() }
+        Frames { buffer: Vec::new(), start: 0 }
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
+        if self.start == self.buffer.len() {
+            self.buffer.clear();
+            self.start = 0;
+        } else if self.start > 0 && self.buffer.len() + bytes.len() > self.buffer.capacity() {
+            self.buffer.drain(..self.start);
+            self.start = 0;
+        }
         self.buffer.extend_from_slice(bytes);
+    }
+
+    /// [`Frames::push`] of bytes the caller owns: taken as the buffer, with no copy, when
+    /// nothing is waiting.
+    pub fn push_owned(&mut self, bytes: Vec<u8>) {
+        match self.waiting() {
+            0 => {
+                self.buffer = bytes;
+                self.start = 0;
+            }
+            _ => self.push(&bytes),
+        }
     }
 
     /// The next whole frame, `None` until one has come. An error is for good: the stream is
     /// not this protocol's.
     pub fn pop(&mut self) -> Result<Option<Frame>, String> {
-        if self.buffer.len() < 4 {
+        let rest = &self.buffer[self.start..];
+        if rest.len() < 4 {
             return Ok(None);
         }
-        let len = u32::from_le_bytes([self.buffer[0], self.buffer[1], self.buffer[2], self.buffer[3]]);
+        let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
         if len > LONGEST {
             return Err(format!("a frame of {} bytes, past the most of {}", len, LONGEST));
         }
         let len = len as usize;
-        if self.buffer.len() < 4 + len {
+        if rest.len() < 4 + len {
             return Ok(None);
         }
-        let frame = Frame::decode(&self.buffer[4..4 + len]);
-        self.buffer.drain(..4 + len);
+        let frame = Frame::decode(&rest[4..4 + len]);
+        self.start += 4 + len;
+        if self.start == self.buffer.len() {
+            self.buffer.clear();
+            self.start = 0;
+        }
         frame.map(Some)
     }
 
     /// Bytes of a frame not yet whole.
     pub fn waiting(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() - self.start
+    }
+
+    /// How many more bytes the frame being received needs before it is whole (its length's
+    /// bytes first): what one read can ask for, so a long frame comes in one read rather than
+    /// many small ones. Never more than a frame can be.
+    pub fn needed(&self) -> usize {
+        let rest = &self.buffer[self.start..];
+        if rest.len() < 4 {
+            return 4 - rest.len();
+        }
+        let len = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]).min(LONGEST) as usize;
+        (4 + len).saturating_sub(rest.len())
     }
 }

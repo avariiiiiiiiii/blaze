@@ -4,7 +4,6 @@ use std::fmt;
 
 use base_db::Crate;
 use hir_def::{GenericParamId, TraitId};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     TyVid, TypeFoldable, TypeVisitableExt,
     inherent::{Const as _, GenericArg as _, IntoKind, Ty as _},
@@ -16,6 +15,7 @@ use thin_vec::ThinVec;
 use crate::{
     InferBodyId, InferenceDiagnostic, Span,
     db::HirDatabase,
+    infer::columns::VarSet,
     next_solver::{
         Canonical, ClauseKind, Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArg,
         GenericArgs, ParamEnv, Predicate, PredicateKind, Region, SolverDefId, Term, TraitRef, Ty,
@@ -149,7 +149,7 @@ pub(crate) struct InferenceTable<'db> {
     pub(crate) param_env: ParamEnv<'db>,
     pub(crate) infer_ctxt: InferCtxt<'db>,
     pub(super) fulfillment_cx: FulfillmentCtxt<'db>,
-    pub(super) diverging_type_vars: FxHashSet<Ty<'db>>,
+    pub(super) diverging_type_vars: VarSet,
     pub(super) trait_errors: Vec<NextSolverError<'db>>,
 }
 
@@ -170,7 +170,7 @@ impl<'db> InferenceTable<'db> {
             param_env: trait_env,
             fulfillment_cx: FulfillmentCtxt::new(&infer_ctxt),
             infer_ctxt,
-            diverging_type_vars: FxHashSet::default(),
+            diverging_type_vars: VarSet::default(),
             trait_errors: Vec::new(),
         }
     }
@@ -288,8 +288,13 @@ impl<'db> InferenceTable<'db> {
         }
     }
 
+    /// Marks `ty`, an inference variable, as the target of a coercion from `!`. Only type
+    /// variables are kept: fallback looks at what an integer or float variable resolves to
+    /// only for its type variable, and it has none.
     pub(super) fn set_diverging(&mut self, ty: Ty<'db>) {
-        self.diverging_type_vars.insert(ty);
+        if let Some(vid) = ty.ty_vid() {
+            self.diverging_type_vars.insert(vid.as_u32());
+        }
     }
 
     pub(crate) fn next_ty_var(&self, span: Span) -> Ty<'db> {

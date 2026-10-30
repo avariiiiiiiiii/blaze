@@ -5,11 +5,14 @@
 //! when the pin moves); the cfgs that follow from the arguments are added here as rustc adds
 //! them (`rustc_session::config::cfg::default_configuration`, `rustc_codegen_ssa`'s
 //! `target_features`). A triple the data does not have is an error naming it, never a guess.
+//!
+//! The JSON is read once per process and compiled per target into columns: feature names
+//! interned to bits of a [`Bits`] in their sorted order, what each turns on and off as a set,
+//! the target spec's facts and every `target_feature="..."` line made once. [`target_cfg`] is
+//! then a binary search for the triple, a few word operations per `-C target-feature`, and the
+//! copy of the output; it reads no lock (a `OnceLock` once set is one atomic load).
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::OnceLock,
-};
+use std::{borrow::Cow, collections::BTreeMap, sync::OnceLock};
 
 use blaze_resolve::Cfg;
 use serde::Deserialize;
@@ -17,16 +20,16 @@ use serde::Deserialize;
 const DATA: &str = include_str!("rustc.json");
 
 #[derive(Deserialize)]
-struct Release {
+struct RawRelease {
     /// As the first line of `rustc -V` has it, after `rustc `.
     version: String,
     /// What `rustc -vV` prints, with `{host}` for the host's triple.
     verbose: String,
-    targets: BTreeMap<String, Target>,
+    targets: BTreeMap<String, RawTarget>,
 }
 
 #[derive(Deserialize)]
-struct Target {
+struct RawTarget {
     /// The cfgs of the target, but those the arguments decide.
     cfg: Vec<String>,
     /// The cfgs printed besides those when unstable features are allowed, as on blaze's
@@ -60,148 +63,391 @@ struct Target {
     #[serde(default)]
     feature_cfgs: BTreeMap<String, Vec<String>>,
     /// The other features rustc or LLVM lists of the target (`--print target-features`): one
-    /// of none of these turns nothing on or off, and rustc warns of it.
+    /// of these turns no cfg on or off, and rustc warns of it.
     #[serde(default)]
     other_features: Vec<String>,
 }
 
 #[derive(Deserialize)]
-struct Spec {
+struct RawSpec {
     #[serde(default, rename = "crt-static-respected")]
     crt_static_respected: bool,
     #[serde(default)]
-    metadata: SpecMetadata,
+    metadata: RawSpecMetadata,
 }
 
 #[derive(Deserialize, Default)]
-struct SpecMetadata {
+struct RawSpecMetadata {
     #[serde(default)]
     std: Option<bool>,
 }
 
-fn release() -> &'static Release {
-    static READ: OnceLock<Release> = OnceLock::new();
-    READ.get_or_init(|| serde_json::from_str(DATA).expect("stdlib/rustc.json is what harness/answers.py writes"))
+/// The most feature names a target may have that can be a `target_feature` cfg (the largest
+/// recorded, aarch64's, has 92).
+const MAX_FEATURES: usize = 256;
+
+/// A set of a target's feature names, by their index in [`Compiled::names`]: 32 bytes, so a
+/// union, difference or subset test is four word operations.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(super) struct Bits([u64; MAX_FEATURES / 64]);
+
+const _: () = assert!(std::mem::size_of::<Bits>() == 32);
+
+impl Bits {
+    pub(super) fn has(&self, index: u16) -> bool {
+        (self.0[usize::from(index >> 6)] >> (index & 63)) & 1 == 1
+    }
+
+    pub(super) fn insert(&mut self, index: u16) {
+        self.0[usize::from(index >> 6)] |= 1u64 << (index & 63);
+    }
+
+    pub(super) fn remove(&mut self, index: u16) {
+        self.0[usize::from(index >> 6)] &= !(1u64 << (index & 63));
+    }
+
+    pub(super) fn union(&mut self, other: &Bits) {
+        for (word, it) in self.0.iter_mut().zip(other.0) {
+            *word |= it;
+        }
+    }
+
+    pub(super) fn subtract(&mut self, other: &Bits) {
+        for (word, it) in self.0.iter_mut().zip(other.0) {
+            *word &= !it;
+        }
+    }
+
+    pub(super) fn intersection(&self, other: &Bits) -> Bits {
+        let mut out = *self;
+        for (word, it) in out.0.iter_mut().zip(other.0) {
+            *word &= it;
+        }
+        out
+    }
+
+    pub(super) fn within(&self, other: &Bits) -> bool {
+        self.0.iter().zip(other.0).all(|(word, it)| word & !it == 0)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.iter().all(|it| *it == 0)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.0.iter().map(|it| it.count_ones() as usize).sum()
+    }
+
+    /// The indices in the set, ascending.
+    pub(super) fn iter(self) -> impl Iterator<Item = u16> {
+        self.0.into_iter().enumerate().flat_map(|(at, mut word)| {
+            std::iter::from_fn(move || {
+                if word == 0 {
+                    return None;
+                }
+                let bit = word.trailing_zeros() as u16;
+                word &= word - 1;
+                Some(((at as u16) << 6) | bit)
+            })
+        })
+    }
 }
 
-fn target(triple: &str) -> Result<&'static Target, String> {
-    release().targets.get(triple).ok_or_else(|| {
-        let known: Vec<&str> = release().targets.keys().map(String::as_str).collect();
-        format!(
-            "blaze has no data of target `{triple}` (it knows {}): harness/answers.py records each \
-             target blaze builds for, and blaze runs no rustc to ask (docs/no-rustc.md)",
-            known.join(", ")
-        )
+/// What a target's spec says that a build needs, read once.
+#[derive(Clone, Copy)]
+struct SpecFacts {
+    crt_static_respected: bool,
+    std: Option<bool>,
+}
+
+/// One target's data, compiled. Lookups are binary searches of sorted columns (a few dozen
+/// entries at most); sets are [`Bits`] over `names`.
+struct Compiled {
+    /// The recorded cfgs but `target_feature`s (`cfg`, then `nightly_cfg`).
+    base: Box<[Box<str>]>,
+    /// Every name a feature set can hold, sorted: a name's index is its bit.
+    names: Box<[Box<str>]>,
+    /// `target_feature="<name>"` of each name, in `names`' order.
+    feature_lines: Box<[Box<str>]>,
+    /// The target's own `target_feature`s.
+    own: Bits,
+    /// `crt-static`'s index, when a set can hold it.
+    crt_static: Option<u16>,
+    /// What turning a name on turns on (`features`, else `llvm_features`), per name; empty
+    /// for a name of neither, which `has_on` tells apart.
+    on: Box<[Bits]>,
+    has_on: Bits,
+    /// The names `features` (rustc's own list) has.
+    rustc_features: Bits,
+    /// What turning a name off turns off (`features_off`), per name.
+    off: Box<[Bits]>,
+    has_off: Bits,
+    /// Per name, the target's own features that need it (those whose `features_off` holds it),
+    /// turned back on with it.
+    pulls: Box<[Bits]>,
+    /// Each CPU's features, by name, sorted; `None` for an index past `cpu_features`.
+    cpus: Box<[(Box<str>, Option<Bits>)]>,
+    /// The other cfgs a name brings, by its index, ascending.
+    feature_cfgs: Box<[(u16, Box<[Box<str>]>)]>,
+    /// Whether the data lists the target's features at all (`other_features`): without, a
+    /// feature it does not name can't be told from one blaze has no data of.
+    lists_features: bool,
+    panic: Box<str>,
+    split_debuginfo: Box<[Box<str>]>,
+    /// By crate type, sorted.
+    file_names: Box<[(Box<str>, Option<Box<str>>)]>,
+    spec: Result<SpecFacts, String>,
+}
+
+struct Release {
+    version: String,
+    verbose: String,
+    /// By triple, sorted.
+    targets: Box<[(Box<str>, Result<Compiled, String>)]>,
+}
+
+fn boxed(items: impl IntoIterator<Item = String>) -> Box<[Box<str>]> {
+    items.into_iter().map(String::into_boxed_str).collect()
+}
+
+const FEATURE_PREFIX: &str = "target_feature=\"";
+
+fn feature_of(cfg: &str) -> Option<&str> {
+    cfg.strip_prefix(FEATURE_PREFIX)?.strip_suffix('"')
+}
+
+fn compile(triple: &str, raw: RawTarget) -> Result<Compiled, String> {
+    let RawTarget {
+        cfg,
+        nightly_cfg,
+        panic,
+        split_debuginfo,
+        file_names,
+        target_spec_json,
+        features,
+        llvm_features,
+        features_off,
+        cpus,
+        cpu_features,
+        feature_cfgs,
+        other_features,
+    } = raw;
+    let recorded: Vec<String> = cfg.into_iter().chain(nightly_cfg).collect();
+    let mut names: Vec<&str> = recorded.iter().filter_map(|it| feature_of(it)).collect();
+    for map in [&features, &llvm_features, &features_off] {
+        for (name, turned) in map {
+            names.push(name);
+            names.extend(turned.iter().map(String::as_str));
+        }
+    }
+    names.extend(cpu_features.iter().flatten().map(String::as_str));
+    names.extend(feature_cfgs.keys().map(String::as_str));
+    names.sort_unstable();
+    names.dedup();
+    if names.len() > MAX_FEATURES {
+        return Err(format!(
+            "blaze's data of target `{triple}` has {} features that can be cfgs, past the {MAX_FEATURES} \
+             a feature set holds",
+            names.len()
+        ));
+    }
+    let index = |name: &str| -> u16 {
+        names.binary_search(&name).expect("every name of a set was interned above") as u16
+    };
+    let set = |list: &[String]| {
+        let mut bits = Bits::default();
+        for name in list {
+            bits.insert(index(name));
+        }
+        bits
+    };
+    let count = names.len();
+    let mut own = Bits::default();
+    let mut base = Vec::with_capacity(recorded.len());
+    for line in &recorded {
+        match feature_of(line) {
+            Some(name) => own.insert(index(name)),
+            None => base.push(line.clone().into_boxed_str()),
+        }
+    }
+    let (mut on, mut has_on, mut rustc_features) = (vec![Bits::default(); count], Bits::default(), Bits::default());
+    // rustc's list wins over LLVM's for a name both have.
+    for (name, turned) in &llvm_features {
+        let at = index(name);
+        on[usize::from(at)] = set(turned.as_slice());
+        has_on.insert(at);
+    }
+    for (name, turned) in &features {
+        let at = index(name);
+        on[usize::from(at)] = set(turned.as_slice());
+        has_on.insert(at);
+        rustc_features.insert(at);
+    }
+    let (mut off, mut has_off, mut pulls) = (vec![Bits::default(); count], Bits::default(), vec![Bits::default(); count]);
+    for (name, turned) in &features_off {
+        let at = index(name);
+        off[usize::from(at)] = set(turned.as_slice());
+        has_off.insert(at);
+        for needed in turned {
+            pulls[usize::from(index(needed))].insert(at);
+        }
+    }
+    let cpus = cpus
+        .iter()
+        .map(|(name, at)| (name.clone().into_boxed_str(), cpu_features.get(*at).map(|it| set(it.as_slice()))))
+        .collect();
+    let feature_cfgs = feature_cfgs.iter().map(|(name, cfgs)| (index(name), boxed(cfgs.iter().cloned()))).collect();
+    let spec = match target_spec_json.values().next() {
+        None => Err(format!("blaze recorded no target spec of `{triple}`")),
+        Some(text) => serde_json::from_str::<RawSpec>(text)
+            .map(|it| SpecFacts { crt_static_respected: it.crt_static_respected, std: it.metadata.std })
+            .map_err(|error| format!("the recorded target spec of `{triple}`: {error}")),
+    };
+    let crt_static = names.binary_search(&"crt-static").ok().map(|it| it as u16);
+    let feature_lines = names.iter().map(|it| format!("{FEATURE_PREFIX}{it}\"").into_boxed_str()).collect();
+    let names = names.iter().map(|it| Box::<str>::from(*it)).collect();
+    Ok(Compiled {
+        base: base.into_boxed_slice(),
+        names,
+        feature_lines,
+        own,
+        crt_static,
+        on: on.into_boxed_slice(),
+        has_on,
+        rustc_features,
+        off: off.into_boxed_slice(),
+        has_off,
+        pulls: pulls.into_boxed_slice(),
+        cpus,
+        feature_cfgs,
+        lists_features: !other_features.is_empty(),
+        panic: panic.into_boxed_str(),
+        split_debuginfo: boxed(split_debuginfo),
+        file_names: file_names.into_iter().map(|(kind, name)| (kind.into_boxed_str(), name.map(String::into_boxed_str))).collect(),
+        spec,
     })
 }
 
-impl Target {
-    /// The spec every recorded host prints, for what the hosts agree on.
-    fn spec(&self, triple: &str) -> Result<Spec, String> {
-        let text = self
-            .target_spec_json
-            .values()
-            .next()
-            .ok_or_else(|| format!("blaze recorded no target spec of `{triple}`"))?;
-        serde_json::from_str(text).map_err(|error| format!("the recorded target spec of `{triple}`: {error}"))
+fn release() -> &'static Release {
+    static READ: OnceLock<Release> = OnceLock::new();
+    READ.get_or_init(|| {
+        let raw: RawRelease =
+            serde_json::from_str(DATA).expect("stdlib/rustc.json is what harness/answers.py writes");
+        Release {
+            version: raw.version,
+            verbose: raw.verbose,
+            targets: raw
+                .targets
+                .into_iter()
+                .map(|(triple, target)| {
+                    let compiled = compile(&triple, target);
+                    (triple.into_boxed_str(), compiled)
+                })
+                .collect(),
+        }
+    })
+}
+
+fn target(triple: &str) -> Result<&'static Compiled, String> {
+    let targets = &release().targets;
+    match targets.binary_search_by(|(it, _)| (**it).cmp(triple)) {
+        Ok(at) => targets[at].1.as_ref().map_err(Clone::clone),
+        Err(_) => {
+            let known: Vec<&str> = targets.iter().map(|(it, _)| &**it).collect();
+            Err(format!(
+                "blaze has no data of target `{triple}` (it knows {}): harness/answers.py records each \
+                 target blaze builds for, and blaze runs no rustc to ask (docs/no-rustc.md)",
+                known.join(", ")
+            ))
+        }
+    }
+}
+
+impl Compiled {
+    fn index(&self, name: &str) -> Option<u16> {
+        self.names.binary_search_by(|it| (**it).cmp(name)).ok().map(|it| it as u16)
     }
 
-    /// Whether rustc or LLVM lists `name` as a feature of the target.
-    fn lists(&self, name: &str) -> bool {
-        self.features.contains_key(name)
-            || self.llvm_features.contains_key(name)
-            || self.features_off.contains_key(name)
-            || self.other_features.iter().any(|it| it == name)
+    fn spec(&self) -> Result<SpecFacts, String> {
+        self.spec.clone()
+    }
+
+    /// One `-C target-feature` (or, `from_host`, one of the host's for `target-cpu=native`)
+    /// applied to `have`, as rustc's `cfg_target_feature` does.
+    fn apply(&self, triple: &str, have: &mut Bits, enable: bool, name: &str, from_host: bool) -> Result<(), String> {
+        let at = self.index(name);
+        let on = at.filter(|it| self.has_on.has(*it));
+        match (enable, on, at) {
+            (true, Some(it), _) => {
+                have.union(&self.on[usize::from(it)]);
+                // The target's own features it needs, should they be off.
+                have.union(&self.pulls[usize::from(it)]);
+            }
+            (false, _, Some(it)) if self.has_off.has(it) => have.subtract(&self.off[usize::from(it)]),
+            (false, Some(it), _) if !self.own.has(it) => {
+                // Off with it go the features that turn it on.
+                let turned = &self.on[usize::from(it)];
+                if !turned.is_empty() {
+                    for other in have.intersection(&self.rustc_features).iter() {
+                        if turned.within(&self.on[usize::from(other)]) {
+                            have.remove(other);
+                        }
+                    }
+                }
+            }
+            // A feature only LLVM has, of no `target_feature`, changes none of them.
+            _ if from_host => {}
+            _ => {
+                let sign = if enable { '+' } else { '-' };
+                return Err(format!(
+                    "blaze's data of target `{triple}` does not say what `-C target-feature={sign}{name}` \
+                     turns {}",
+                    if enable { "on" } else { "off" }
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The `target_feature`s with `cpu`'s and then `features` turned on (`true`) and off in
-    /// order, starting from `own`, the target's: rustc's `cfg_target_feature`.
-    fn tuned(
-        &self,
-        triple: &str,
-        own: Vec<String>,
-        cpu: Option<(&str, Option<&str>)>,
-        features: &[(bool, String)],
-    ) -> Result<Vec<String>, String> {
-        let mut have: BTreeSet<String> = match cpu {
+    /// order, starting from the target's own.
+    fn tuned(&self, triple: &str, cpu: Option<(&str, Option<&str>)>, features: &[(bool, String)]) -> Result<Bits, String> {
+        let mut have = match cpu {
             Some((name, _)) => {
-                let index = self
+                let at = self
                     .cpus
-                    .get(name)
-                    .ok_or_else(|| format!("`-C target-cpu={name}` is no CPU blaze knows of target `{triple}`"))?;
-                self.cpu_features
-                    .get(*index)
+                    .binary_search_by(|(it, _)| (**it).cmp(name))
+                    .map_err(|_| format!("`-C target-cpu={name}` is no CPU blaze knows of target `{triple}`"))?;
+                self.cpus[at]
+                    .1
                     .ok_or_else(|| format!("blaze's data of target `{triple}` lists no features of CPU `{name}`"))?
-                    .iter()
-                    .cloned()
-                    .collect()
             }
-            None => own.iter().cloned().collect(),
+            None => self.own,
         };
         // `target-cpu=native`: LLVM's features of the host, which name what rustc does not too.
-        let host: Vec<(bool, String)> = cpu
-            .and_then(|(_, host)| host)
-            .map(|it| {
-                it.split(',')
-                    .filter_map(|it| Some((it.starts_with('+'), it.get(1..)?.to_owned())))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let on = |name: &str| self.features.get(name).or_else(|| self.llvm_features.get(name));
-        let mut apply = |enable: bool, name: &str, from_host: bool| -> Result<(), String> {
-            match (enable, on(name)) {
-                (true, Some(turned)) => {
-                    have.extend(turned.iter().cloned());
-                    // The target's own features it needs, should they be off.
-                    have.extend(
-                        self.features_off
-                            .iter()
-                            .filter(|(_, off)| off.iter().any(|it| it == name))
-                            .map(|(it, _)| it.clone()),
-                    );
-                }
-                (false, _) if self.features_off.contains_key(name) => {
-                    for it in &self.features_off[name] {
-                        have.remove(it);
-                    }
-                }
-                (false, Some(turned)) if !own.iter().any(|it| it == name) => {
-                    // Off with it go the features that turn it on.
-                    let needs = |other: &Vec<String>| turned.iter().all(|it| other.contains(it));
-                    if !turned.is_empty() {
-                        have.retain(|it| !self.features.get(it).is_some_and(needs));
-                    }
-                }
-                // A feature only LLVM has, of no `target_feature`, changes none of them.
-                _ if from_host => {}
-                _ => {
-                    let sign = if enable { '+' } else { '-' };
-                    return Err(format!(
-                        "blaze's data of target `{triple}` does not say what `-C target-feature={sign}{name}` \
-                         turns {}",
-                        if enable { "on" } else { "off" }
-                    ));
+        if let Some(host) = cpu.and_then(|(_, host)| host) {
+            for it in host.split(',') {
+                if let Some(name) = it.get(1..) {
+                    self.apply(triple, &mut have, it.starts_with('+'), name, true)?;
                 }
             }
-            Ok(())
-        };
-        for (enable, name) in &host {
-            apply(*enable, name, true)?;
         }
         for (enable, name) in features {
-            if !self.lists(name) {
-                if self.other_features.is_empty() {
+            let listed = self.index(name).is_some_and(|it| self.has_on.has(it) || self.has_off.has(it));
+            if !listed {
+                if !self.lists_features {
                     return Err(format!(
                         "blaze's data of target `{triple}` does not list its features, so not whether \
                          `{name}` is one"
                     ));
                 }
-                // rustc warns of a feature it does not know and passes it to LLVM: no cfg.
+                // rustc warns of a feature it does not know, or knows of no cfg, and passes it to
+                // LLVM: no cfg.
                 continue;
             }
-            apply(*enable, name, false)?;
+            self.apply(triple, &mut have, *enable, name, false)?;
         }
-        Ok(have.into_iter().collect())
+        Ok(have)
     }
 }
 
@@ -326,18 +572,19 @@ impl CfgArgs {
                         Some((name, value)) => (name, Some(value)),
                         None => (option, None),
                     };
-                    let name = name.replace('_', "-");
+                    let name = if name.contains('_') { Cow::Owned(name.replace('_', "-")) } else { Cow::Borrowed(name) };
                     let needed = |value: Option<&str>| {
                         value.map(str::to_owned).ok_or_else(|| format!("rustc's `-C {name}` takes a value"))
                     };
-                    match name.as_str() {
+                    match &*name {
                         "opt-level" => args.opt_level = Some(needed(value)?),
                         "debug-assertions" => args.debug_assertions = Some(yes(&name, value)?),
                         "overflow-checks" => args.overflow_checks = Some(yes(&name, value)?),
                         "panic" => args.panic = Some(needed(value)?),
                         "target-cpu" => args.target_cpu = Some(needed(value)?),
                         "target-feature" => {
-                            for feature in needed(value)?.split(',').filter(|it| !it.is_empty()) {
+                            let list = value.ok_or_else(|| format!("rustc's `-C {name}` takes a value"))?;
+                            for feature in list.split(',').filter(|it| !it.is_empty()) {
                                 let enable = match feature.as_bytes()[0] {
                                     b'+' => true,
                                     b'-' => false,
@@ -417,16 +664,16 @@ fn arch(triple: &str) -> &str {
 }
 
 /// The cfgs `rustc --print cfg --target <triple> <args>` prints, one per line as rustc prints
-/// them, sorted.
+/// them, sorted. Call it once per platform and profile: it copies its answer out.
 pub fn target_cfg(triple: &str, args: &CfgArgs) -> Result<Vec<String>, String> {
     let target = target(triple)?;
-    let mut cfgs: Vec<String> = target.cfg.iter().chain(&target.nightly_cfg).cloned().collect();
-    let static_default = cfgs.iter().any(|it| it == "target_feature=\"crt-static\"");
+    let static_default = target.crt_static.is_some_and(|it| target.own.has(it));
     let as_it_is = args
         .target_features
         .iter()
         .all(|(enable, name)| name == "crt-static" && *enable == static_default);
-    if args.target_cpu.is_some() || !as_it_is {
+    let tuning = args.target_cpu.is_some() || !as_it_is;
+    let mut features = if tuning {
         let cpu = match args.target_cpu.as_deref() {
             Some("native") => match &args.host_cpu {
                 Some(host) if host.arch == arch(triple) => Some((host.name.as_str(), Some(host.features.as_str()))),
@@ -446,14 +693,18 @@ pub fn target_cfg(triple: &str, args: &CfgArgs) -> Result<Vec<String>, String> {
             Some(name) => Some((name, None)),
             None => None,
         };
-        let feature = |it: &String| Some(it.strip_prefix("target_feature=\"")?.strip_suffix('"')?.to_owned());
-        let own: Vec<String> = cfgs.iter().filter_map(feature).collect();
-        let tuned = target.tuned(triple, own, cpu, &args.target_features)?;
-        cfgs.retain(|it| feature(it).is_none());
-        for name in &tuned {
-            cfgs.extend(target.feature_cfgs.get(name).into_iter().flatten().cloned());
+        target.tuned(triple, cpu, &args.target_features)?
+    } else {
+        target.own
+    };
+    let mut cfgs = Vec::with_capacity(target.base.len() + features.len() + args.cfgs.len() + 6);
+    cfgs.extend(target.base.iter().map(|it| String::from(&**it)));
+    if tuning {
+        for (at, extra) in target.feature_cfgs.iter() {
+            if features.has(*at) {
+                cfgs.extend(extra.iter().map(|it| String::from(&**it)));
+            }
         }
-        cfgs.extend(tuned.iter().map(|it| format!("target_feature=\"{it}\"")));
     }
     let debug_assertions = args.debug_assertions();
     if debug_assertions {
@@ -464,7 +715,7 @@ pub fn target_cfg(triple: &str, args: &CfgArgs) -> Result<Vec<String>, String> {
         cfgs.push("overflow_checks".to_owned());
     }
     let panic = args.panic.as_deref().unwrap_or(&target.panic);
-    if panic != target.panic && panic != "abort" {
+    if panic != &*target.panic && panic != "abort" {
         return Err(format!(
             "`-C panic={panic}` for target `{triple}`, whose strategy is `{}`: blaze knows only `abort` \
              besides a target's own",
@@ -476,12 +727,13 @@ pub fn target_cfg(triple: &str, args: &CfgArgs) -> Result<Vec<String>, String> {
         cfgs.push("proc_macro".to_owned());
         // A proc macro is a dynamic library, which a target that respects `crt-static` builds
         // without it unless it is asked for (rustc's `Session::crt_static`).
-        if !args.target_features.iter().any(|(_, name)| name == "crt-static")
-            && target.spec(triple)?.crt_static_respected
-        {
-            cfgs.retain(|it| it != "target_feature=\"crt-static\"");
+        if !args.target_features.iter().any(|(_, name)| name == "crt-static") && target.spec()?.crt_static_respected {
+            if let Some(it) = target.crt_static {
+                features.remove(it);
+            }
         }
     }
+    cfgs.extend(features.iter().map(|it| String::from(&*target.feature_lines[usize::from(it)])));
     for cfg in &args.cfgs {
         if !is_plain_cfg(cfg) {
             return Err(format!(
@@ -490,7 +742,7 @@ pub fn target_cfg(triple: &str, args: &CfgArgs) -> Result<Vec<String>, String> {
         }
         cfgs.push(cfg.clone());
     }
-    cfgs.sort();
+    cfgs.sort_unstable();
     cfgs.dedup();
     Ok(cfgs)
 }
@@ -505,26 +757,41 @@ pub fn target_cfgs(triple: &str, args: &CfgArgs) -> Result<Vec<Cfg>, String> {
 
 /// The `CARGO_CFG_*` variables cargo sets for a build script's run from `cfgs`, its target's
 /// [`target_cfg`] (cargo's `custom_build.rs`, `build_work`): one per name, the values of a
-/// name joined by `,`, `debug_assertions` left out (cargo asks rustc with no profile, so it is
-/// always there and says nothing). Sorted by name.
+/// name joined by `,` in their order, `debug_assertions` left out (cargo asks rustc with no
+/// profile, so it is always there and says nothing). Sorted by variable.
 pub fn cargo_cfg_env(cfgs: &[String]) -> Vec<(String, String)> {
-    let mut by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for cfg in cfgs {
-        match cfg.split_once('=') {
-            Some((name, value)) => {
-                let value = value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value);
-                by_name.entry(name.to_owned()).or_default().push(value.to_owned());
-            }
-            None => {
-                by_name.entry(cfg.clone()).or_default();
-            }
+    let mut pairs: Vec<(&str, Option<&str>)> = cfgs
+        .iter()
+        .map(|cfg| match cfg.split_once('=') {
+            Some((name, value)) => (name, Some(value.strip_prefix('"').and_then(|it| it.strip_suffix('"')).unwrap_or(value))),
+            None => (cfg.as_str(), None),
+        })
+        .collect();
+    // Stable, so a name's values keep their order.
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let mut env = Vec::with_capacity(pairs.len());
+    let mut rest = pairs.as_slice();
+    while let Some(&(name, _)) = rest.first() {
+        let len = rest.iter().take_while(|it| it.0 == name).count();
+        let (group, after) = rest.split_at(len);
+        rest = after;
+        if name == "debug_assertions" {
+            continue;
         }
+        let mut var = String::with_capacity("CARGO_CFG_".len() + name.len());
+        var.push_str("CARGO_CFG_");
+        var.extend(name.chars().map(|c| if c == '-' { '_' } else { c.to_ascii_uppercase() }));
+        let mut value = String::new();
+        for (at, it) in group.iter().filter_map(|it| it.1).enumerate() {
+            if at > 0 {
+                value.push(',');
+            }
+            value.push_str(it);
+        }
+        env.push((var, value));
     }
-    by_name
-        .into_iter()
-        .filter(|(name, _)| name != "debug_assertions")
-        .map(|(name, values)| (format!("CARGO_CFG_{}", name.to_uppercase().replace('-', "_")), values.join(",")))
-        .collect()
+    env.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    env
 }
 
 /// What `-Zbuild-std` and a build need of a target beyond its cfgs.
@@ -546,16 +813,15 @@ pub struct TargetFacts {
 
 pub fn target_facts(triple: &str) -> Result<TargetFacts, String> {
     let target = target(triple)?;
-    let spec = target.spec(triple)?;
-    let has_std = spec
-        .metadata
+    let has_std = target
+        .spec()?
         .std
         .ok_or_else(|| format!("the recorded target spec of `{triple}` does not say whether it has std"))?;
     Ok(TargetFacts {
-        panic: target.panic.clone(),
+        panic: String::from(&*target.panic),
         has_std,
         needs_builtins_mem: !has_std,
-        split_debuginfo: target.split_debuginfo.clone(),
+        split_debuginfo: target.split_debuginfo.iter().map(|it| String::from(&**it)).collect(),
     })
 }
 
@@ -564,16 +830,16 @@ pub fn target_facts(triple: &str) -> Result<TargetFacts, String> {
 /// it; `None` for a crate type the target does not have.
 pub fn file_name(triple: &str, crate_type: &str, name: &str) -> Result<Option<String>, String> {
     let target = target(triple)?;
-    let file = target
+    let at = target
         .file_names
-        .get(crate_type)
-        .ok_or_else(|| format!("blaze does not know rustc's file of a `{crate_type}` crate for target `{triple}`"))?;
-    Ok(file.as_ref().map(|it| it.replace("___", name)))
+        .binary_search_by(|(it, _)| (**it).cmp(crate_type))
+        .map_err(|_| format!("blaze does not know rustc's file of a `{crate_type}` crate for target `{triple}`"))?;
+    Ok(target.file_names[at].1.as_deref().map(|it| it.replace("___", name)))
 }
 
 /// Every triple blaze has data of, sorted.
 pub fn triples() -> impl Iterator<Item = &'static str> {
-    release().targets.keys().map(String::as_str)
+    release().targets.iter().map(|(it, _)| &**it)
 }
 
 /// The version of blaze's rustc as `rustc -V` prints it after `rustc `

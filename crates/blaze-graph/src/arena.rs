@@ -17,7 +17,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicI64, AtomicU32, Ordering},
+        atomic::{AtomicI64, Ordering},
     },
     thread::ThreadId,
 };
@@ -26,54 +26,114 @@ use rustc_hash::FxHashMap;
 
 use crate::{Budget, Cancelled, admission::Arena};
 
-/// How many counters the process's bytes are spread over, so threads seldom share one.
-const SHARDS: usize = 64;
+/// How far a thread's count may move before it is added to [`HELD`] (Linux's
+/// `percpu_counter`): an allocation then costs a few thread-local adds and no atomic, and
+/// [`HELD`] is written once per this many bytes of a thread's drift.
+const BATCH: i64 = 256 << 10;
 
 #[repr(align(128))]
-struct Shard(AtomicI64);
+struct Total(AtomicI64);
 
-/// The bytes allocated less those freed through [`Counting`], spread over shards; their sum
-/// is what the process holds.
-static HELD: [Shard; SHARDS] = [const { Shard(AtomicI64::new(0)) }; SHARDS];
-static NEXT_SHARD: AtomicU32 = AtomicU32::new(0);
+/// What every thread added of its count: the bytes the process holds through [`Counting`],
+/// but for less than [`BATCH`] per thread not yet added.
+static HELD: Total = Total(AtomicI64::new(0));
 
-// `const` and without destructors: reading them allocates nothing and works while a thread
-// ends, as an allocator must.
-thread_local! {
-    static SHARD: Cell<u32> = const { Cell::new(u32::MAX) };
+/// A thread's counts, in one block so an allocation reaches its thread-local storage once.
+struct Local {
     /// The bytes this thread allocated less those it freed, through [`Counting`].
-    static NET: Cell<i64> = const { Cell::new(0) };
-    /// The most [`NET`] was since the innermost [`measure`] on this thread began.
-    static PEAK: Cell<i64> = const { Cell::new(0) };
+    net: Cell<i64>,
+    /// The most `net` was since the innermost [`measure`] on this thread began.
+    peak: Cell<i64>,
+    /// What `net` moved since it was last added to [`HELD`].
+    unflushed: Cell<i64>,
+    /// How far `unflushed` may go before it is added: 0 until the flush at the thread's exit is
+    /// armed, and again once it ran, so no count is lost with the thread.
+    batch: Cell<i64>,
+    armed: Cell<bool>,
+    #[cfg(test)]
+    flushed: Cell<i64>,
 }
 
+// `LOCAL` is `const` and without a destructor: reading it allocates nothing and works while a
+// thread ends, as an allocator must. `EXIT` has one, registered from the cold `flush` only.
+thread_local! {
+    static LOCAL: Local = const {
+        Local {
+            net: Cell::new(0),
+            peak: Cell::new(0),
+            unflushed: Cell::new(0),
+            batch: Cell::new(0),
+            armed: Cell::new(false),
+            #[cfg(test)]
+            flushed: Cell::new(0),
+        }
+    };
+    static EXIT: Exit = const { Exit };
+}
+
+struct Exit;
+
+impl Drop for Exit {
+    fn drop(&mut self) {
+        LOCAL.with(exit_flush);
+    }
+}
+
+/// Adds what is left of the thread's count to [`HELD`], and from then on every change at
+/// once: what the thread's other destructors free still counts. What it added.
+fn exit_flush(local: &Local) -> i64 {
+    local.batch.set(0);
+    let left = local.unflushed.replace(0);
+    add(local, left);
+    left
+}
+
+#[cfg_attr(not(test), allow(unused_variables))]
+fn add(local: &Local, bytes: i64) {
+    HELD.0.fetch_add(bytes, Ordering::Relaxed);
+    #[cfg(test)]
+    local.flushed.set(local.flushed.get().wrapping_add(bytes));
+}
+
+/// Per allocation: one thread-local block, three adds and two well-predicted branches; the
+/// atomic add is in [`flush`], once per [`BATCH`] bytes of drift.
+#[inline(always)]
 fn count(delta: i64) {
-    _ = NET.try_with(|net| {
-        let now = net.get().wrapping_add(delta);
-        net.set(now);
-        _ = PEAK.try_with(|peak| {
-            if now > peak.get() {
-                peak.set(now);
-            }
-        });
+    LOCAL.with(|local| {
+        let net = local.net.get().wrapping_add(delta);
+        local.net.set(net);
+        if net > local.peak.get() {
+            local.peak.set(net);
+        }
+        let unflushed = local.unflushed.get().wrapping_add(delta);
+        if unflushed.unsigned_abs() < local.batch.get().unsigned_abs() {
+            local.unflushed.set(unflushed);
+        } else {
+            flush(local, unflushed);
+        }
     });
-    let shard = SHARD
-        .try_with(|shard| {
-            if shard.get() == u32::MAX {
-                shard.set(NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % SHARDS as u32);
-            }
-            shard.get()
-        })
-        .unwrap_or(0);
-    HELD[shard as usize].0.fetch_add(delta, Ordering::Relaxed);
 }
 
-/// A global allocator that counts what goes through `A`: the daemon's binary installs it
-/// (`#[global_allocator] static ALLOC: Counting<System> = Counting(System);`). It takes no lock
-/// and allocates nothing of its own.
+#[cold]
+#[inline(never)]
+fn flush(local: &Local, unflushed: i64) {
+    local.unflushed.set(0);
+    add(local, unflushed);
+    // Registering `EXIT`'s destructor may allocate, which comes back here with `armed` set
+    // and `batch` still 0: it adds its own bytes and registers nothing.
+    if !local.armed.replace(true) && EXIT.try_with(|_| {}).is_ok() {
+        local.batch.set(BATCH);
+    }
+}
+
+/// A global allocator that counts what goes through `A`: the daemon's binary installs it over
+/// the allocator it uses (`#[global_allocator] static ALLOC: Counting<Jemalloc> =
+/// Counting(Jemalloc);`). It takes no lock, allocates nothing of its own and does no atomic
+/// write on an allocation but once per [`BATCH`] bytes a thread's count moves.
 ///
 /// A byte freed on another thread than the one that allocated it counts against the thread
-/// that frees it: [`measure`] sees what a task's thread allocated and freed, [`held`] is exact.
+/// that frees it: [`measure`] sees what a task's thread allocated and freed, exactly; [`held`]
+/// is within [`BATCH`] per other thread of what the process holds.
 pub struct Counting<A>(pub A);
 
 fn signed(bytes: usize) -> i64 {
@@ -82,7 +142,9 @@ fn signed(bytes: usize) -> i64 {
 }
 
 // SAFETY: every call goes to `A` with the caller's arguments, so `A`'s guarantees hold; the
-// counting beside it touches only atomics and `const` thread-locals with no destructor.
+// counting beside it touches an atomic and `LOCAL`, a `const` thread-local with no destructor,
+// and registers `EXIT`'s destructor once per thread, whose own allocations `flush` takes
+// without registering again.
 unsafe impl<A: GlobalAlloc> GlobalAlloc for Counting<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // SAFETY: the caller upholds `alloc`'s contract for `layout`.
@@ -128,29 +190,35 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, u64) {
     impl Drop for Restore {
         // On a panic too: the outer measure still sees what `f` held.
         fn drop(&mut self) {
-            let inner = PEAK.get();
-            PEAK.set(self.outer.max(inner));
+            LOCAL.with(|local| local.peak.set(self.outer.max(local.peak.get())));
         }
     }
-    let base = NET.get();
-    let restore = Restore { outer: PEAK.replace(base) };
+    let (base, outer) = LOCAL.with(|local| {
+        let base = local.net.get();
+        (base, local.peak.replace(base))
+    });
+    let restore = Restore { outer };
     let result = f();
-    let peak = PEAK.get();
+    let peak = LOCAL.with(|local| local.peak.get());
     drop(restore);
     (result, u64::try_from(peak.saturating_sub(base)).unwrap_or(0))
 }
 
 /// The bytes the process holds now through [`Counting`]; 0 when it is not the global
-/// allocator.
+/// allocator. One load: exact for what the calling thread did, within [`BATCH`] for each other
+/// thread.
 pub fn held() -> u64 {
-    let sum: i64 = HELD.iter().map(|it| it.0.load(Ordering::Relaxed)).sum();
-    u64::try_from(sum).unwrap_or(0)
+    let own = LOCAL.with(|local| local.unflushed.get());
+    u64::try_from(HELD.0.load(Ordering::Relaxed).wrapping_add(own)).unwrap_or(0)
 }
 
 /// The first chunk of a [`Bump`], and the most a chunk grows to but for one value bigger.
 const FIRST_CHUNK: usize = 64 << 10;
 const LAST_CHUNK: usize = 16 << 20;
 const CHUNK_ALIGN: usize = 16;
+/// Chunks this big or bigger are aligned to a huge page and asked to be backed by them
+/// (docs/v2/plan/design/hardware.md, "memory").
+const HUGE_PAGE: usize = 2 << 20;
 
 struct Chunk {
     ptr: NonNull<u8>,
@@ -159,18 +227,22 @@ struct Chunk {
     _grant: Option<Grant>,
 }
 
-/// A bump arena: values are put one after another in chunks from the global allocator, and
+/// A bump arena: values are put in chunks from the global allocator, from each chunk's end
+/// down (the fastest bump: a subtraction, a mask and one compare per value, as bumpalo), and
 /// all are freed together when it is dropped or [`Bump::reset`]. No value's destructor runs,
 /// so it takes only `Copy` values. Under a [`Cap`], each chunk is reserved from it first.
 pub struct Bump {
     chunks: RefCell<Vec<Chunk>>,
-    /// Where the next value may go in the last chunk, and that chunk's end, as addresses.
-    next: Cell<usize>,
-    end: Cell<usize>,
+    /// The lowest byte in use of the last chunk: the next value goes below it, down to `start`.
+    /// Both are the address 1 before the first chunk, so only a zero-sized value fits.
+    ptr: Cell<*mut u8>,
+    start: Cell<*mut u8>,
     held: Cell<u64>,
     peak: Cell<u64>,
     cap: Option<Cap>,
 }
+
+const NO_CHUNK: *mut u8 = std::ptr::without_provenance_mut(1);
 
 // SAFETY: a `Bump` owns its chunks, and every value in them is borrowed from it, so moving it
 // to another thread moves nothing another thread can reach.
@@ -196,8 +268,8 @@ impl Bump {
     fn with(cap: Option<Cap>) -> Bump {
         Bump {
             chunks: RefCell::new(Vec::new()),
-            next: Cell::new(0),
-            end: Cell::new(0),
+            ptr: Cell::new(NO_CHUNK),
+            start: Cell::new(NO_CHUNK),
             held: Cell::new(0),
             peak: Cell::new(0),
             cap,
@@ -205,14 +277,22 @@ impl Bump {
     }
 
     /// Room for a value of `layout`, valid until the arena is reset or dropped.
+    #[inline]
     pub fn alloc_layout(&self, layout: Layout) -> Result<NonNull<u8>, Cancelled> {
-        if let Some(at) = self.fit(layout) {
-            return Ok(at);
+        match self.fit(layout) {
+            Some(at) => Ok(at),
+            None => self.alloc_in_new_chunk(layout),
         }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn alloc_in_new_chunk(&self, layout: Layout) -> Result<NonNull<u8>, Cancelled> {
         self.grow(layout)?;
         Ok(self.fit(layout).expect("a new chunk has room for the value it was made for"))
     }
 
+    #[inline]
     #[allow(clippy::mut_from_ref)]
     pub fn alloc<T: Copy>(&self, value: T) -> Result<&mut T, Cancelled> {
         let ptr = self.alloc_layout(Layout::new::<T>())?.cast::<T>();
@@ -224,6 +304,7 @@ impl Bump {
         }
     }
 
+    #[inline]
     #[allow(clippy::mut_from_ref)]
     pub fn alloc_slice<T: Copy>(&self, values: &[T]) -> Result<&mut [T], Cancelled> {
         let layout = Layout::array::<T>(values.len()).expect("a slice's layout fits");
@@ -243,39 +324,52 @@ impl Bump {
         Ok(unsafe { std::str::from_utf8_unchecked_mut(bytes) })
     }
 
-    /// Frees every chunk, and every value with them; what it held at most is kept.
+    /// Frees every value, and every chunk but the last (the biggest), which the next values
+    /// reuse, so an arena reset between tasks calls the allocator only when a task needs more
+    /// than any before it; what it held at most is kept.
     pub fn reset(&mut self) {
-        self.free();
-        self.next.set(0);
-        self.end.set(0);
-        self.held.set(0);
+        let chunks = self.chunks.get_mut();
+        let last = chunks.pop();
+        for chunk in chunks.drain(..) {
+            free(chunk);
+        }
+        match last {
+            Some(last) => {
+                self.start.set(last.ptr.as_ptr());
+                // SAFETY: one past the end of the chunk's allocation.
+                self.ptr.set(unsafe { last.ptr.as_ptr().add(last.layout.size()) });
+                self.held.set(last.layout.size() as u64);
+                chunks.push(last);
+            }
+            None => {
+                self.start.set(NO_CHUNK);
+                self.ptr.set(NO_CHUNK);
+                self.held.set(0);
+            }
+        }
     }
 
+    #[inline(always)]
     fn fit(&self, layout: Layout) -> Option<NonNull<u8>> {
-        let (next, end) = (self.next.get(), self.end.get());
-        if end == 0 {
+        let top = self.ptr.get();
+        let low = top.addr().checked_sub(layout.size())? & !(layout.align() - 1);
+        if low < self.start.get().addr() {
             return None;
         }
-        let at = next.checked_next_multiple_of(layout.align())?;
-        let after = at.checked_add(layout.size())?;
-        if after > end {
-            return None;
-        }
-        self.next.set(after);
-        let chunks = self.chunks.borrow();
-        let chunk = chunks.last().expect("a chunk when `end` is set");
-        // SAFETY: `at` is within the last chunk (`next <= at <= after <= end`), so the offset
-        // stays in its allocation.
-        let ptr = unsafe { chunk.ptr.as_ptr().add(at - chunk.ptr.as_ptr() as usize) };
-        NonNull::new(ptr)
+        // `low` is in `start..=top`, within the last chunk, whose provenance `top` carries.
+        let at = top.with_addr(low);
+        self.ptr.set(at);
+        // SAFETY: `low >= start >= 1`.
+        Some(unsafe { NonNull::new_unchecked(at) })
     }
 
     fn grow(&self, layout: Layout) -> Result<(), Cancelled> {
         let last = self.chunks.borrow().last().map_or(0, |it| it.layout.size());
         let wanted = layout.size().checked_add(layout.align()).expect("a value's size fits");
         let size = (last * 2).clamp(FIRST_CHUNK, LAST_CHUNK).max(wanted);
-        let chunk_layout = Layout::from_size_align(size, CHUNK_ALIGN.max(layout.align()))
-            .expect("a chunk's layout fits");
+        let align = if size >= HUGE_PAGE { HUGE_PAGE } else { CHUNK_ALIGN };
+        let chunk_layout =
+            Layout::from_size_align(size, align.max(layout.align())).expect("a chunk's layout fits");
         let grant = match &self.cap {
             Some(cap) => Some(cap.reserve(size as u64)?),
             None => None,
@@ -283,27 +377,35 @@ impl Bump {
         // SAFETY: the layout's size is not zero.
         let ptr = unsafe { std::alloc::alloc(chunk_layout) };
         let Some(ptr) = NonNull::new(ptr) else { std::alloc::handle_alloc_error(chunk_layout) };
+        #[cfg(target_os = "linux")]
+        if size >= HUGE_PAGE {
+            // A hint, not a request that can fail the arena: the kernel's transparent huge
+            // page setting decides whether it is taken.
+            // SAFETY: the range is the chunk just allocated, aligned to a huge page.
+            _ = unsafe { libc::madvise(ptr.as_ptr().cast(), size, libc::MADV_HUGEPAGE) };
+        }
         self.chunks.borrow_mut().push(Chunk { ptr, layout: chunk_layout, _grant: grant });
-        self.next.set(ptr.as_ptr() as usize);
-        self.end.set(ptr.as_ptr() as usize + size);
+        self.start.set(ptr.as_ptr());
+        // SAFETY: one past the end of the chunk's allocation.
+        self.ptr.set(unsafe { ptr.as_ptr().add(size) });
         let held = self.held.get() + size as u64;
         self.held.set(held);
         self.peak.set(self.peak.get().max(held));
         Ok(())
     }
+}
 
-    fn free(&mut self) {
-        for chunk in self.chunks.get_mut().drain(..) {
-            // SAFETY: the chunk was allocated by the global allocator with this layout, and
-            // the values in it are borrowed from `self`, which is borrowed mutably here.
-            unsafe { std::alloc::dealloc(chunk.ptr.as_ptr(), chunk.layout) };
-        }
-    }
+fn free(chunk: Chunk) {
+    // SAFETY: the chunk was allocated by the global allocator with this layout, and the values
+    // in it are borrowed from the `Bump`, which its caller borrows mutably.
+    unsafe { std::alloc::dealloc(chunk.ptr.as_ptr(), chunk.layout) };
 }
 
 impl Drop for Bump {
     fn drop(&mut self) {
-        self.free();
+        for chunk in self.chunks.get_mut().drain(..) {
+            free(chunk);
+        }
     }
 }
 
@@ -519,9 +621,15 @@ impl Drop for Grant {
         if state.held <= shared.spill_at {
             state.above = false;
         }
-        state.unstick(shared.limit);
+        // A wake is a system call even with no one waiting.
+        let waiters = !state.waiters.is_empty();
+        if waiters {
+            state.unstick(shared.limit);
+        }
         drop(state);
-        shared.changed.notify_all();
+        if waiters {
+            shared.changed.notify_all();
+        }
     }
 }
 
@@ -858,10 +966,138 @@ mod tests {
         assert!(held >= 40 * MB as u64 + 10_000 * 9, "{held}");
         assert_eq!(bump.peak(), held);
         bump.reset();
-        assert_eq!((bump.held(), bump.peak()), (0, held));
+        // The last chunk, the one the 40 MB went in, is kept for what comes next.
+        let kept = bump.held();
+        assert!((40 * MB as u64..held).contains(&kept), "{kept} of {held}");
+        assert_eq!(bump.peak(), held);
         assert_eq!(*bump.alloc(5u32).unwrap(), 5);
         let empty: &mut [u64] = bump.alloc_slice(&[]).unwrap();
         assert!(empty.is_empty());
+        assert_eq!(bump.held(), kept);
+        let fresh = Bump::new();
+        let empty: &mut [u8] = fresh.alloc_slice(&[]).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(fresh.held(), 0);
+    }
+
+    /// Seeded layouts of every size and alignment: each value is aligned, inside the arena,
+    /// apart from every other, and keeps what was written, across resets.
+    #[test]
+    fn bumped_values_are_aligned_apart_and_kept() {
+        for seed in 0..40u64 {
+            let mut rng = SplitMix(seed);
+            let mut bump = Bump::new();
+            let mut values: Vec<(usize, usize, u8)> = Vec::new();
+            for step in 0..3000usize {
+                if rng.next() % 500 == 0 {
+                    check_values(&values);
+                    values.clear();
+                    bump.reset();
+                }
+                let size = match rng.next() % 8 {
+                    0 => 0,
+                    1 => (rng.next() % 200_000) as usize,
+                    _ => (rng.next() % 300) as usize,
+                };
+                let align = 1usize << (rng.next() % 7);
+                let layout = Layout::from_size_align(size, align).unwrap();
+                let at = bump.alloc_layout(layout).unwrap();
+                assert_eq!(at.as_ptr() as usize % align, 0, "seed {seed} step {step}");
+                let byte = (step % 251) as u8;
+                // SAFETY: the room is `size` bytes the arena gave and nothing else uses.
+                unsafe { at.as_ptr().write_bytes(byte, size) };
+                values.push((at.as_ptr() as usize, size, byte));
+            }
+            check_values(&values);
+        }
+    }
+
+    fn check_values(values: &[(usize, usize, u8)]) {
+        let mut sorted: Vec<_> = values.iter().filter(|it| it.1 > 0).copied().collect();
+        sorted.sort_unstable();
+        for pair in sorted.windows(2) {
+            assert!(pair[0].0 + pair[0].1 <= pair[1].0, "{:?} overlaps {:?}", pair[0], pair[1]);
+        }
+        for &(at, size, byte) in &sorted {
+            // SAFETY: the value's room is still the arena's, as no reset came since.
+            let bytes = unsafe { std::slice::from_raw_parts(at as *const u8, size) };
+            assert!(bytes.iter().all(|&it| it == byte));
+        }
+    }
+
+    #[test]
+    fn a_reset_arena_reuses_its_chunk_without_the_allocator() {
+        let mut bump = Bump::new();
+        for at in 0..1000u64 {
+            bump.alloc(at).unwrap();
+        }
+        let held = bump.held();
+        for _ in 0..100 {
+            bump.reset();
+            let ((), peak) = measure(|| {
+                for at in 0..1000u64 {
+                    bump.alloc(at).unwrap();
+                }
+            });
+            assert_eq!(peak, 0);
+            assert_eq!(bump.held(), held);
+        }
+    }
+
+    #[test]
+    fn big_chunks_are_aligned_to_a_huge_page() {
+        let bump = Bump::new();
+        bump.alloc_slice(&vec![1u8; 3 * MB]).unwrap();
+        let chunks = bump.chunks.borrow();
+        let chunk = chunks.last().unwrap();
+        assert!(chunk.layout.size() >= HUGE_PAGE);
+        assert_eq!(chunk.ptr.as_ptr() as usize % HUGE_PAGE, 0);
+    }
+
+    struct SplitMix(u64);
+
+    impl SplitMix {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// A thread's count reaches the total in batches: what it added plus what it has not yet
+    /// is exactly what it allocated less what it freed, what it has not stays under a batch,
+    /// and at its exit the rest is added, after which every change is added at once.
+    #[test]
+    fn a_thread_adds_its_count_in_batches_and_the_rest_at_exit() {
+        std::thread::spawn(|| {
+            std::hint::black_box(vec![0u8; 16]);
+            assert_eq!(LOCAL.with(|it| it.batch.get()), BATCH);
+            let mut rng = SplitMix(7);
+            let mut kept: Vec<Vec<u8>> = Vec::with_capacity(4000);
+            for _ in 0..4000 {
+                if !kept.is_empty() && rng.next() % 3 == 0 {
+                    let at = (rng.next() as usize) % kept.len();
+                    drop(kept.swap_remove(at));
+                } else {
+                    kept.push(std::hint::black_box(vec![0u8; 1 + (rng.next() % 9000) as usize]));
+                }
+                LOCAL.with(|it| {
+                    assert!(it.unflushed.get().unsigned_abs() < BATCH as u64);
+                    assert_eq!(it.net.get(), it.flushed.get().wrapping_add(it.unflushed.get()));
+                });
+            }
+            let left = LOCAL.with(|it| it.unflushed.get());
+            assert_eq!(LOCAL.with(exit_flush), left);
+            drop(kept);
+            LOCAL.with(|it| {
+                assert_eq!((it.unflushed.get(), it.batch.get()), (0, 0));
+                assert_eq!(it.net.get(), it.flushed.get());
+            });
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

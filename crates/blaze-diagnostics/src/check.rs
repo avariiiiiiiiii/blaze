@@ -2,6 +2,9 @@
 //! item and body, no list of codes to pass over (#1522, #1440, #780), in the order of rustc's
 //! passes, stopping where rustc stops, then its closing lines.
 //!
+//! A file that doesn't parse in a way rustc can't recover from (`FatalError`) ends it there:
+//! its errors and the closing lines, nothing of resolution, types or lints.
+//!
 //! Follows rustc's `compiler/rustc_interface/src/passes.rs` (`run_required_analyses`,
 //! `analysis`: no late lint, dead-code or privacy pass after an error that is not a lint's)
 //! and `compiler/rustc_errors/src/lib.rs` (`DiagCtxtInner::emit_diagnostic`: a diagnostic
@@ -46,12 +49,20 @@ pub fn check_crate_with<'db>(
     options: &Options,
 ) -> Vec<Diag> {
     let cx = Cx::new(sema, krate, files);
-    let mut found: Vec<Found> = lower::parse::lower(&cx);
-    for diagnostic in hir::check::check_crate(cx.db, krate, false) {
+    let parsed = lower::parse::parsed(&cx);
+    if parsed.fatal {
+        let mut diags: Vec<Diag> = parsed.found.into_iter().map(|it| it.diag).collect();
+        finish(&mut diags);
+        let closing = emit::summary(&diags);
+        diags.extend(closing);
+        return diags;
+    }
+    let mut found: Vec<Found> = parsed.found;
+    for diagnostic in hir::check::check_crate(cx.db, krate, false, None) {
         found.extend(lower::lower(&cx, diagnostic));
     }
     found.extend(checks::check(&cx));
-    found.extend(lints::early(&cx));
+    found.extend(lints::early(&cx, &options.lints));
     found.sort_by_key(|it| it.phase);
     let aborted = found.iter().any(stops_before_late);
     if !aborted {

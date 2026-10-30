@@ -152,18 +152,17 @@ fn borrow_terminator(terminator: &TerminatorKind, state: &mut Set) {
     }
 }
 
-/// The locals a statement or terminator moves out of as a whole: what `MaybeRequiresStorage`
-/// kills after it, unless the local was borrowed before.
-fn whole_moves(operands: &mut dyn FnMut(&mut dyn FnMut(&Operand))) -> SmallVec<[usize; 4]> {
-    let mut moved = SmallVec::new();
-    operands(&mut |operand| {
-        if let OperandKind::Move(place) = &operand.kind
-            && place.projection.as_slice().is_empty()
-        {
-            moved.push(local_index(place.local));
+/// A local an operand moves out of as a whole stops requiring storage after it, unless it was
+/// borrowed before (`MaybeRequiresStorage`'s primary effect).
+fn kill_whole_move(operand: &Operand, borrowed: &Set, requires: &mut Set) {
+    if let OperandKind::Move(place) = &operand.kind
+        && place.projection.as_slice().is_empty()
+    {
+        let local = local_index(place.local);
+        if !borrowed.contains(local) {
+            requires.remove(local);
         }
-    });
-    moved
+    }
 }
 
 fn asm_outputs(statement: &StatementKind) -> SmallVec<[&StoredPlace; 2]> {
@@ -180,10 +179,22 @@ fn asm_outputs(statement: &StatementKind) -> SmallVec<[&StoredPlace; 2]> {
 }
 
 /// The forward analyses: `MaybeBorrowedLocals` and `MaybeRequiresStorage` at the entry of
-/// each block.
+/// each block, `None` for a block not reached yet.
 struct Forward {
     borrowed: Vec<Option<Set>>,
     requires: Vec<Option<Set>>,
+}
+
+impl Forward {
+    /// Loads the entry states of block `at` into the buffers, which keep their memory.
+    fn load(&self, at: usize, borrowed: &mut Set, requires: &mut Set) {
+        for (known, into) in [(&self.borrowed[at], borrowed), (&self.requires[at], requires)] {
+            match known {
+                Some(known) => into.clone_from(known),
+                None => into.clear(),
+            }
+        }
+    }
 }
 
 impl MirBody<'_> {
@@ -199,6 +210,8 @@ impl MirBody<'_> {
 
         let mut any = Set::new_empty(count);
         let mut at_yields = Vec::new();
+        let mut borrowed = Set::new_empty(count);
+        let mut requires = Set::new_empty(count);
         for (id, block) in self.basic_blocks.iter() {
             let Some(Terminator { kind: TerminatorKind::Yield { resume, drop, .. }, .. }) =
                 &block.terminator
@@ -208,7 +221,7 @@ impl MirBody<'_> {
             if !reached[block_index(id)] {
                 continue;
             }
-            let (mut borrowed, mut requires) = self.entry_states(&forward, id);
+            forward.load(block_index(id), &mut borrowed, &mut requires);
             for statement in &block.statements {
                 self.storage_statement(statement, &mut borrowed, &mut requires, &mut |_| ());
             }
@@ -266,15 +279,6 @@ impl MirBody<'_> {
         always
     }
 
-    fn entry_states(&self, forward: &Forward, id: BasicBlockId) -> (Set, Set) {
-        let empty = || Set::new_empty(self.locals.len());
-        let at = block_index(id);
-        (
-            forward.borrowed[at].clone().unwrap_or_else(empty),
-            forward.requires[at].clone().unwrap_or_else(empty),
-        )
-    }
-
     /// Both forward analyses over one statement. `early` is told of the storage required
     /// after the statement's early effect, which is what storage conflicts are taken from.
     fn storage_statement(
@@ -282,7 +286,7 @@ impl MirBody<'_> {
         statement: &Statement,
         borrowed: &mut Set,
         requires: &mut Set,
-        early: &mut dyn FnMut(&Set),
+        early: &mut impl FnMut(&Set),
     ) {
         let kind = &statement.kind;
         // Early effect: a borrowed or assigned local needs its storage for the statement.
@@ -302,11 +306,7 @@ impl MirBody<'_> {
         early(requires);
         // Primary effect: a local moved out of as a whole, and never borrowed before, needs
         // no storage after.
-        for local in whole_moves(&mut |f| kind.for_each_operand(&mut |op| f(op))) {
-            if !borrowed.contains(local) {
-                requires.remove(local);
-            }
-        }
+        kind.for_each_operand(&mut |op| kill_whole_move(op, borrowed, requires));
         if let StatementKind::Assign(place, _) = kind {
             requires.insert(local_index(place.local));
         }
@@ -322,7 +322,7 @@ impl MirBody<'_> {
         terminator: &TerminatorKind,
         borrowed: &mut Set,
         requires: &mut Set,
-        early: &mut dyn FnMut(&Set),
+        early: &mut impl FnMut(&Set),
     ) {
         borrow_terminator(terminator, requires);
         if let TerminatorKind::Call { destination, .. } = terminator {
@@ -332,11 +332,7 @@ impl MirBody<'_> {
         if let TerminatorKind::Call { destination, .. } = terminator {
             requires.remove(local_index(destination.local));
         }
-        for local in whole_moves(&mut |f| terminator.for_each_operand(&mut |op| f(op))) {
-            if !borrowed.contains(local) {
-                requires.remove(local);
-            }
-        }
+        terminator.for_each_operand(&mut |op| kill_whole_move(op, borrowed, requires));
         borrow_terminator(terminator, borrowed);
     }
 
@@ -374,11 +370,15 @@ impl MirBody<'_> {
                 worklist.push(to);
             }
         };
+        // Scratch states, reused by every block and edge: no allocation per visit.
+        let mut borrowed = Set::new_empty(count);
+        let mut requires = Set::new_empty(count);
+        let mut edge_requires = Set::new_empty(count);
         while let Some(id) = worklist.pop() {
             if !reached[block_index(id)] {
                 continue;
             }
-            let (mut borrowed, mut requires) = self.entry_states(&forward, id);
+            forward.load(block_index(id), &mut borrowed, &mut requires);
             let block = &self.basic_blocks[id];
             for statement in &block.statements {
                 self.storage_statement(statement, &mut borrowed, &mut requires, &mut |_| ());
@@ -389,9 +389,9 @@ impl MirBody<'_> {
                 match edge {
                     Edge::Plain(to) => flow(&mut forward, &mut worklist, to, &borrowed, &requires),
                     Edge::Returns(to, place) | Edge::Resumes(to, place) => {
-                        let mut requires = requires.clone();
-                        requires.insert(local_index(place.local));
-                        flow(&mut forward, &mut worklist, to, &borrowed, &requires);
+                        edge_requires.clone_from(&requires);
+                        edge_requires.insert(local_index(place.local));
+                        flow(&mut forward, &mut worklist, to, &borrowed, &edge_requires);
                     }
                 }
             }
@@ -406,6 +406,10 @@ impl MirBody<'_> {
         let blocks = self.basic_blocks.len();
         let mut live_in = vec![Set::new_empty(count); blocks];
         let mut live_out = vec![Set::new_empty(count); blocks];
+        // Scratch states, reused by every block and edge; a changed block's state is swapped
+        // into `live_in` and its old one becomes the next scratch.
+        let mut state = Set::new_empty(count);
+        let mut entry = Set::new_empty(count);
         let mut changed = true;
         while changed {
             changed = false;
@@ -413,7 +417,7 @@ impl MirBody<'_> {
                 if !reached[block_index(id)] {
                     continue;
                 }
-                let mut state = Set::new_empty(count);
+                state.clear();
                 if let Some(terminator) = &block.terminator {
                     for edge in edges(self, terminator) {
                         match edge {
@@ -421,14 +425,14 @@ impl MirBody<'_> {
                                 state.union(&live_in[block_index(to)]);
                             }
                             Edge::Returns(to, place) => {
-                                let mut entry = live_in[block_index(to)].clone();
+                                entry.clone_from(&live_in[block_index(to)]);
                                 if place.projection.as_slice().is_empty() {
                                     entry.remove(local_index(place.local));
                                 }
                                 state.union(&entry);
                             }
                             Edge::Resumes(to, place) => {
-                                let mut entry = live_in[block_index(to)].clone();
+                                entry.clone_from(&live_in[block_index(to)]);
                                 def_use_write(place, &mut entry);
                                 insert_all(&mut entry, index_locals(place));
                                 state.union(&entry);
@@ -436,7 +440,7 @@ impl MirBody<'_> {
                         }
                     }
                 }
-                live_out[block_index(id)] = state.clone();
+                live_out[block_index(id)].clone_from(&state);
                 if let Some(terminator) = &block.terminator {
                     live_terminator(&terminator.kind, &mut state);
                 }
@@ -444,7 +448,7 @@ impl MirBody<'_> {
                     live_statement(&statement.kind, &mut state);
                 }
                 if live_in[block_index(id)] != state {
-                    live_in[block_index(id)] = state;
+                    std::mem::swap(&mut live_in[block_index(id)], &mut state);
                     changed = true;
                 }
             }
@@ -455,6 +459,7 @@ impl MirBody<'_> {
     /// `compute_storage_conflicts`: two held locals conflict if both need their storage at
     /// some statement or terminator of a block that does not end in `Unreachable`. One that
     /// is always storage live conflicts with every other.
+    ///
     fn storage_conflicts(
         &self,
         reached: &[bool],
@@ -464,16 +469,10 @@ impl MirBody<'_> {
         saved: &[usize],
     ) -> Vec<bool> {
         let count = self.locals.len();
-        let mut ineligible = always_live.clone();
-        ineligible.intersect(held);
-        let mut together: Vec<Set> = vec![ineligible.clone(); count];
-        let mut apply = |state: &Set| {
-            let mut eligible = state.clone();
-            eligible.intersect(held);
-            for local in eligible.iter() {
-                together[local].union(&eligible);
-            }
-        };
+        let mut matrix = Conflicts::new(count, always_live, held, saved);
+        let mut apply = |state: &Set| matrix.apply(state);
+        let mut borrowed = Set::new_empty(count);
+        let mut requires = Set::new_empty(count);
         for (id, block) in self.basic_blocks.iter() {
             if !reached[block_index(id)] {
                 continue;
@@ -482,18 +481,73 @@ impl MirBody<'_> {
             if let TerminatorKind::Unreachable = terminator.kind {
                 continue;
             }
-            let (mut borrowed, mut requires) = self.entry_states(forward, id);
+            forward.load(block_index(id), &mut borrowed, &mut requires);
             for statement in &block.statements {
                 self.storage_statement(statement, &mut borrowed, &mut requires, &mut apply);
             }
             self.storage_terminator(&terminator.kind, &mut borrowed, &mut requires, &mut apply);
         }
+        matrix.finish()
+    }
+}
+
+/// The storage conflicts of the held locals, over their positions in `saved` (every local of
+/// `held`, in order): `saved.len()²` bits, where rustc's `BitMatrix` has a row of every local
+/// per local. Each state costs a word-wise intersection and one row union per held local in it.
+struct Conflicts<'a> {
+    held: &'a Set,
+    /// A local's position in `saved`, `NOT_HELD` for one not held.
+    position: Vec<u32>,
+    /// The held locals that are always storage live, by position: they conflict with all.
+    ineligible: Set,
+    together: Vec<Set>,
+    live_held: Set,
+    eligible: Set,
+}
+
+const NOT_HELD: u32 = u32::MAX;
+
+impl<'a> Conflicts<'a> {
+    fn new(count: usize, always_live: &Set, held: &'a Set, saved: &[usize]) -> Conflicts<'a> {
         let n = saved.len();
+        let mut position = vec![NOT_HELD; count];
+        let mut ineligible = Set::new_empty(n);
+        for (at, &local) in saved.iter().enumerate() {
+            position[local] = at as u32;
+            if always_live.contains(local) {
+                ineligible.insert(at);
+            }
+        }
+        Conflicts {
+            held,
+            position,
+            together: vec![ineligible.clone(); n],
+            ineligible,
+            live_held: Set::new_empty(count),
+            eligible: Set::new_empty(n),
+        }
+    }
+
+    /// The locals that need their storage at one point all conflict with each other.
+    fn apply(&mut self, state: &Set) {
+        self.live_held.clone_from(state);
+        self.live_held.intersect(self.held);
+        self.eligible.clear();
+        for local in self.live_held.iter() {
+            debug_assert_ne!(self.position[local], NOT_HELD);
+            self.eligible.insert(self.position[local] as usize);
+        }
+        for at in self.eligible.iter() {
+            self.together[at].union(&self.eligible);
+        }
+    }
+
+    fn finish(self) -> Vec<bool> {
+        let n = self.together.len();
         let mut conflicts = vec![false; n * n];
-        for (a, &local_a) in saved.iter().enumerate() {
-            for (b, &local_b) in saved.iter().enumerate() {
-                conflicts[a * n + b] =
-                    ineligible.contains(local_a) || together[local_a].contains(local_b);
+        for a in 0..n {
+            for b in 0..n {
+                conflicts[a * n + b] = self.ineligible.contains(a) || self.together[a].contains(b);
             }
         }
         conflicts
@@ -578,4 +632,82 @@ fn live_terminator(terminator: &TerminatorKind, state: &mut Set) {
         _ => (),
     }
     terminator.for_each_operand(&mut |it| use_operand(it, state));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Conflicts, Set};
+
+    /// The matrix as it was computed before [`Conflicts`]: a row of every local per local.
+    fn model(always_live: &Set, held: &Set, saved: &[usize], states: &[Set]) -> Vec<bool> {
+        let count = held.domain_size();
+        let mut ineligible = always_live.clone();
+        ineligible.intersect(held);
+        let mut together: Vec<Set> = vec![ineligible.clone(); count];
+        for state in states {
+            let mut eligible = state.clone();
+            eligible.intersect(held);
+            for local in eligible.iter() {
+                together[local].union(&eligible);
+            }
+        }
+        let n = saved.len();
+        let mut conflicts = vec![false; n * n];
+        for (a, &local_a) in saved.iter().enumerate() {
+            for (b, &local_b) in saved.iter().enumerate() {
+                conflicts[a * n + b] =
+                    ineligible.contains(local_a) || together[local_a].contains(local_b);
+            }
+        }
+        conflicts
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn set(&mut self, count: usize, one_in: u64) -> Set {
+            let mut set = Set::new_empty(count);
+            for local in 0..count {
+                if self.next() % one_in == 0 {
+                    set.insert(local);
+                }
+            }
+            set
+        }
+    }
+
+    #[test]
+    fn conflicts_over_held_positions_are_the_full_matrix() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        for round in 0..200 {
+            let count = [0, 1, 2, 63, 64, 65, 130][round % 7] + (rng.next() % 40) as usize;
+            let density = 1 + rng.next() % 4;
+            let held = rng.set(count, density);
+            let density = 1 + rng.next() % 8;
+            let always_live = rng.set(count, density);
+            let saved: Vec<usize> = held.iter().collect();
+            let mut states = Vec::new();
+            for _ in 0..rng.next() % 12 {
+                let density = 1 + rng.next() % 5;
+                states.push(rng.set(count, density));
+            }
+            let mut matrix = Conflicts::new(count, &always_live, &held, &saved);
+            for state in &states {
+                matrix.apply(state);
+            }
+            assert_eq!(
+                matrix.finish(),
+                model(&always_live, &held, &saved, &states),
+                "round {round}: {count} locals, {} held",
+                saved.len()
+            );
+        }
+    }
 }

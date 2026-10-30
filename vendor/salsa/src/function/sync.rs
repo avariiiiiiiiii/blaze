@@ -10,6 +10,7 @@ use crate::runtime::{
     BlockOnTransferredOwner, BlockResult, BlockTransferredResult, Running, WaitResult,
 };
 use crate::sync::thread::{self};
+use crate::task::TaskId;
 use crate::sync::{Mutex, max_parallelism};
 use crate::tracing;
 use crate::zalsa::Zalsa;
@@ -99,7 +100,12 @@ impl SyncTable {
         &self.shards[self.shard_index(hash)]
     }
 
-    /// Claims the given key index, or blocks if it is running on another thread.
+    /// Claims the given key index, or blocks if it is running on another task.
+    ///
+    /// # Cancellation
+    ///
+    /// Throws [`Cancelled::WouldWaitOnItself`](crate::Cancelled::WouldWaitOnItself) if the task
+    /// that runs it is below this one on its thread.
     pub(crate) fn try_claim<'me>(
         &'me self,
         zalsa: &'me Zalsa,
@@ -117,7 +123,7 @@ impl SyncTable {
         ) {
             Entry::Occupied(occupied_entry) => {
                 let id = match occupied_entry.get().id {
-                    SyncOwner::Thread(id) => id,
+                    SyncOwner::Task(id) => id,
                     SyncOwner::Transferred => {
                         return match self.try_claim_transferred(
                             zalsa,
@@ -156,7 +162,7 @@ impl SyncTable {
             Entry::Vacant(vacant_entry) => {
                 vacant_entry.insert(SyncState {
                     key: key_index,
-                    id: SyncOwner::Thread(thread::current().id()),
+                    id: SyncOwner::Task(TaskId::current()),
                     anyone_waiting: false,
                     is_transfer_target: false,
                     claimed_twice: false,
@@ -184,7 +190,7 @@ impl SyncTable {
         match write.find_entry(hash, |state| state.key == key_index) {
             Ok(occupied_entry) => {
                 let id = match occupied_entry.get().id {
-                    SyncOwner::Thread(id) => id,
+                    SyncOwner::Task(id) => id,
                     SyncOwner::Transferred => {
                         return match self.peek_claim_transferred(zalsa, occupied_entry, reentrant) {
                             Ok(claimed) => claimed,
@@ -230,7 +236,7 @@ impl SyncTable {
     ) -> Result<ClaimResult<'me>, Box<BlockOnTransferredOwner<'me>>> {
         let key_index = entry.get().key;
         let database_key_index = DatabaseKeyIndex::new(self.ingredient, key_index);
-        let thread_id = thread::current().id();
+        let thread_id = TaskId::current();
 
         match zalsa
             .runtime()
@@ -242,7 +248,7 @@ impl SyncTable {
                 } = entry.into_mut();
                 debug_assert!(!*claimed_twice);
 
-                *id = SyncOwner::Thread(thread_id);
+                *id = SyncOwner::Task(thread_id);
                 *claimed_twice = true;
 
                 Ok(ClaimResult::Claimed(ClaimGuard {
@@ -261,7 +267,7 @@ impl SyncTable {
             BlockTransferredResult::Released => {
                 *entry.get_mut() = SyncState {
                     key: key_index,
-                    id: SyncOwner::Thread(thread_id),
+                    id: SyncOwner::Task(thread_id),
                     anyone_waiting: false,
                     is_transfer_target: false,
                     claimed_twice: false,
@@ -287,7 +293,7 @@ impl SyncTable {
     ) -> Result<ClaimResult<'me, ()>, Box<BlockOnTransferredOwner<'me>>> {
         let key_index = entry.get().key;
         let database_key_index = DatabaseKeyIndex::new(self.ingredient, key_index);
-        let thread_id = thread::current().id();
+        let thread_id = TaskId::current();
 
         match zalsa
             .runtime()
@@ -331,8 +337,8 @@ impl SyncTable {
 
 #[derive(Copy, Clone, Debug)]
 pub enum SyncOwner {
-    /// Query is owned by this thread
-    Thread(thread::ThreadId),
+    /// Query is owned by this task
+    Task(TaskId),
 
     /// The query's lock ownership has been transferred to another query.
     /// E.g. if `a` transfers its ownership to `b`, then only the thread in the critical path

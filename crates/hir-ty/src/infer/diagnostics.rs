@@ -13,8 +13,7 @@ use hir_def::{
     hir::{ExprId, ExprOrPatIdPacked},
     resolver::Resolver,
 };
-use la_arena::RawIdx;
-use rustc_hash::FxHashMap;
+use la_arena::{ArenaMap, RawIdx};
 use thin_vec::ThinVec;
 
 use crate::lower::LifetimeLoweringMode;
@@ -68,7 +67,7 @@ pub(crate) struct PathDiagnosticCallbackData<'a> {
 
 pub(super) struct InferenceTyLoweringVarsCtx<'a, 'db> {
     pub(super) table: &'a mut InferenceTable<'db>,
-    pub(super) type_of_type_placeholder: &'a mut FxHashMap<TypeRefId, StoredTy>,
+    pub(super) type_of_type_placeholder: &'a mut ArenaMap<TypeRefId, StoredTy>,
 }
 
 impl<'db> TyLoweringInferVarsCtx<'db> for InferenceTyLoweringVarsCtx<'_, 'db> {

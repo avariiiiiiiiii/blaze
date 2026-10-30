@@ -206,8 +206,8 @@ struct ExpressionOnlySourceMap {
 
     /// We don't create explicit nodes for record fields (`S { record_field: 92 }`).
     /// Instead, we use id of expression (`92`) to identify the field.
-    field_map_back: FxHashMap<ExprId, FieldSource>,
-    pat_field_map_back: FxHashMap<PatId, PatFieldSource>,
+    field_map_back: IdTable<ExprId, FieldSource>,
+    pat_field_map_back: IdTable<PatId, PatFieldSource>,
 
     template_map: Option<Box<FormatTemplate>>,
 
@@ -219,6 +219,48 @@ struct ExpressionOnlySourceMap {
     // We store diagnostics on the `ExpressionOnlySourceMap` because diagnostics are rare (except
     // maybe for cfgs, and they are also not common in type places).
     diagnostics: ThinVec<ExpressionStoreDiagnostics>,
+}
+
+/// A map from a store's own ids to values, as one column sorted by id and searched: what a
+/// finished store or source map keeps in place of a hash map keyed by its ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdTable<K, V>(Box<[(K, V)]>);
+
+impl<K, V> Default for IdTable<K, V> {
+    fn default() -> Self {
+        IdTable(Box::default())
+    }
+}
+
+impl<K: Ord + Copy, V> IdTable<K, V> {
+    /// The table of `pushed`, in the order they were pushed: a later value for an id replaces
+    /// an earlier one, as an insert into a map does.
+    pub(crate) fn from_pushed(mut pushed: Vec<(K, V)>) -> Self {
+        pushed.reverse();
+        // Stable, so the latest value of each id comes first among its equals.
+        pushed.sort_by_key(|&(id, _)| id);
+        pushed.dedup_by_key(|&mut (id, _)| id);
+        IdTable(pushed.into_boxed_slice())
+    }
+
+    /// The table of `entries`, which are sorted by id with no id twice.
+    pub(crate) fn from_sorted(entries: Box<[(K, V)]>) -> Option<Self> {
+        entries.windows(2).all(|pair| pair[0].0 < pair[1].0).then_some(IdTable(entries))
+    }
+
+    pub(crate) fn get(&self, id: K) -> Option<&V> {
+        let at = self.0.binary_search_by_key(&id, |&(it, _)| it).ok()?;
+        Some(&self.0[at].1)
+    }
+
+    pub(crate) fn entries(&self) -> &[(K, V)] {
+        &self.0
+    }
+
+    /// The same ids, each value as `f` makes it of the old.
+    pub(crate) fn map<W>(&self, mut f: impl FnMut(K, &V) -> W) -> IdTable<K, W> {
+        IdTable(self.0.iter().map(|(id, value)| (*id, f(*id, value))).collect())
+    }
 }
 
 impl PartialEq for ExpressionOnlySourceMap {
@@ -324,13 +366,11 @@ impl ExpressionStoreSourceMap {
             let template_map = it.template_map.as_deref().map(|it| FormatTemplate {
                 format_args_to_captures: it.format_args_to_captures.clone(),
                 asm_to_captures: it.asm_to_captures.clone(),
-                implicit_capture_to_source: (it.implicit_capture_to_source.iter())
-                    .map(|(&expr, src)| {
-                        let (ptr, range) = src.value;
-                        let ptr = mv.ptr(InFile::new(src.file_id, ptr)).value;
-                        (expr, InFile::new(src.file_id, (ptr, range)))
-                    })
-                    .collect(),
+                implicit_capture_to_source: it.implicit_capture_to_source.map(|_, src| {
+                    let (ptr, range) = src.value;
+                    let ptr = mv.ptr(InFile::new(src.file_id, ptr)).value;
+                    InFile::new(src.file_id, (ptr, range))
+                }),
             });
             Box::new(ExpressionOnlySourceMap {
                 expr_map: mv.forth(&it.expr_map),
@@ -340,12 +380,8 @@ impl ExpressionStoreSourceMap {
                 label_map: mv.forth(&it.label_map),
                 label_map_back: mv.back(&it.label_map_back),
                 binding_definitions: it.binding_definitions.clone(),
-                field_map_back: (it.field_map_back.iter())
-                    .map(|(&id, &src)| (id, mv.ptr(src)))
-                    .collect(),
-                pat_field_map_back: (it.pat_field_map_back.iter())
-                    .map(|(&id, &src)| (id, mv.ptr(src)))
-                    .collect(),
+                field_map_back: it.field_map_back.map(|_, &src| mv.ptr(src)),
+                pat_field_map_back: it.pat_field_map_back.map(|_, &src| mv.ptr(src)),
                 template_map: template_map.map(Box::new),
                 expansions: mv.forth(&it.expansions),
                 diagnostics: it.diagnostics.iter().map(|it| it.moved(mv)).collect(),
@@ -430,10 +466,10 @@ pub struct ExpressionStoreBuilder {
 
     /// We don't create explicit nodes for record fields (`S { record_field: 92 }`).
     /// Instead, we use id of expression (`92`) to identify the field.
-    field_map_back: FxHashMap<ExprId, FieldSource>,
-    pat_field_map_back: FxHashMap<PatId, PatFieldSource>,
+    field_map_back: Vec<(ExprId, FieldSource)>,
+    pat_field_map_back: Vec<(PatId, PatFieldSource)>,
 
-    template_map: Option<Box<FormatTemplate>>,
+    template_map: Option<Box<PendingTemplate>>,
 
     expansions: FxHashMap<InFile<MacroCallPtr>, MacroCallId>,
 
@@ -445,18 +481,37 @@ pub struct ExpressionStoreBuilder {
     pub(crate) diagnostics: Vec<ExpressionStoreDiagnostics>,
 }
 
+/// The captures of a `format_args!()`: its hygiene and each implicitly captured name.
+type FormatCaptures = (HygieneId, Vec<(syntax::TextRange, Name)>);
+/// The captures of each template piece of an `asm!()`.
+type AsmCaptures = Vec<Vec<(syntax::TextRange, usize)>>;
+/// Where an implicit capture is written: its template literal and the offset inside it.
+type CaptureSource = InFile<(ExprPtr, TextRange)>;
+/// A [`FormatTemplate`] while lowering: each map pushed to in the order it is made.
+type PendingTemplate = FormatTemplate<
+    Vec<(ExprId, FormatCaptures)>,
+    Vec<(ExprId, AsmCaptures)>,
+    Vec<(ExprId, CaptureSource)>,
+>;
+
+/// The maps of a store's templates: pushed to while lowering ([`ExpressionStoreBuilder`]),
+/// tables once finished.
 #[derive(Default, Debug, Eq, PartialEq)]
-struct FormatTemplate {
+struct FormatTemplate<
+    F = IdTable<ExprId, FormatCaptures>,
+    A = IdTable<ExprId, AsmCaptures>,
+    C = IdTable<ExprId, CaptureSource>,
+> {
     /// A map from `format_args!()` expressions to their captures.
-    format_args_to_captures: FxHashMap<ExprId, (HygieneId, Vec<(syntax::TextRange, Name)>)>,
+    format_args_to_captures: F,
     /// A map from `asm!()` expressions to their captures.
-    asm_to_captures: FxHashMap<ExprId, Vec<Vec<(syntax::TextRange, usize)>>>,
+    asm_to_captures: A,
     /// A map from desugared expressions of implicit captures to their source.
     ///
     /// The value stored for each capture is its template literal and offset inside it. The template literal
     /// is from the `format_args[_nl]!()` macro and so needs to be mapped up once to go to the user-written
     /// template.
-    implicit_capture_to_source: FxHashMap<ExprId, InFile<(ExprPtr, TextRange)>>,
+    implicit_capture_to_source: C,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
@@ -508,9 +563,9 @@ impl ExpressionStoreBuilder {
             mut lifetime_map_back,
             mut lifetime_map,
             mut binding_definitions,
-            mut field_map_back,
-            mut pat_field_map_back,
-            mut template_map,
+            field_map_back,
+            pat_field_map_back,
+            template_map,
             mut expansions,
             diagnostics,
         } = self;
@@ -532,18 +587,17 @@ impl ExpressionStoreBuilder {
         lifetime_map_back.shrink_to_fit();
         lifetime_map.shrink_to_fit();
         binding_definitions.shrink_to_fit();
-        field_map_back.shrink_to_fit();
-        pat_field_map_back.shrink_to_fit();
-        if let Some(template_map) = &mut template_map {
-            let FormatTemplate {
-                format_args_to_captures,
-                asm_to_captures,
-                implicit_capture_to_source,
-            } = &mut **template_map;
-            format_args_to_captures.shrink_to_fit();
-            asm_to_captures.shrink_to_fit();
-            implicit_capture_to_source.shrink_to_fit();
-        }
+        let field_map_back = IdTable::from_pushed(field_map_back);
+        let pat_field_map_back = IdTable::from_pushed(pat_field_map_back);
+        let template_map = template_map.map(|template| {
+            let FormatTemplate { format_args_to_captures, asm_to_captures, implicit_capture_to_source } =
+                *template;
+            Box::new(FormatTemplate {
+                format_args_to_captures: IdTable::from_pushed(format_args_to_captures),
+                asm_to_captures: IdTable::from_pushed(asm_to_captures),
+                implicit_capture_to_source: IdTable::from_pushed(implicit_capture_to_source),
+            })
+        });
         expansions.shrink_to_fit();
 
         let has_exprs =
@@ -1409,11 +1463,11 @@ impl ExpressionStoreSourceMap {
     }
 
     pub fn field_syntax(&self, expr: ExprId) -> FieldSource {
-        self.assert_expr_only().field_map_back[&expr]
+        *self.assert_expr_only().field_map_back.get(expr).expect("no field with this expression")
     }
 
     pub fn pat_field_syntax(&self, pat: PatId) -> PatFieldSource {
-        self.assert_expr_only().pat_field_map_back[&pat]
+        *self.assert_expr_only().pat_field_map_back.get(pat).expect("no field with this pattern")
     }
 
     pub fn macro_expansion_expr(&self, node: InFile<&ast::MacroExpr>) -> Option<ExprOrPatId> {
@@ -1439,7 +1493,7 @@ impl ExpressionStoreSourceMap {
             .template_map
             .as_ref()?
             .format_args_to_captures
-            .get(&expr_only.expr_map.get(&src)?.as_expr()?)?;
+            .get(expr_only.expr_map.get(&src)?.as_expr()?)?;
         Some((*hygiene, &**names))
     }
 
@@ -1451,7 +1505,7 @@ impl ExpressionStoreSourceMap {
             .template_map
             .as_ref()?
             .implicit_capture_to_source
-            .get(&capture_expr)
+            .get(capture_expr)
             .copied()
     }
 
@@ -1463,7 +1517,7 @@ impl ExpressionStoreSourceMap {
         let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
         let expr = expr_only.expr_map.get(&src)?.as_expr()?;
         Some(expr).zip(
-            expr_only.template_map.as_ref()?.asm_to_captures.get(&expr).map(std::ops::Deref::deref),
+            expr_only.template_map.as_ref()?.asm_to_captures.get(expr).map(std::ops::Deref::deref),
         )
     }
 

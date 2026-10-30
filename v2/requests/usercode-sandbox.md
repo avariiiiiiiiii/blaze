@@ -1,6 +1,6 @@
 # Requests from lane usercode-sandbox (child of usercode)
 
-## 1. `blaze-cargo` depends on `blaze-usercode`
+## 1. `blaze-cargo` depends on `blaze-usercode` (applied: it is in `crates/blaze-cargo/Cargo.toml`)
 
 - What: add `blaze-usercode.workspace = true` to `crates/blaze-cargo/Cargo.toml`'s
   `[dependencies]`.
@@ -12,6 +12,8 @@
   `blaze_usercode::confine::Spec`, appends `blaze_usercode::trace::Line`s to the live record,
   and writes `blaze_usercode::trace::encode(&Report)` with
   `blaze_usercode::trace::assemble` over `blaze_usercode::inputs::Disk`.
+
+> applied: `crates/blaze-cargo/Cargo.toml` has `blaze-usercode.workspace = true` (line 131).
 
 ## 2. The Linux interposer's `build.rs`
 
@@ -70,8 +72,23 @@
   preloaded library reports them, which keeps a run's traced inputs sound (no untraceable
   clock read missed, no environment variable read unseen).
 
+> forwarded to cargo: `crates/blaze-cargo/build.rs` is lane cargo's and has no `linux_interpose` yet.
+
 ## 3. `windows-sys` features (from child `usercode-sandbox-windows`)
 
 - The Windows launcher needs features beyond those already on the `windows-sys` line in
   `crates/blaze-cargo/Cargo.toml`. The child lane `usercode-sandbox-windows` appends the
   exact feature list to `v2/requests/usercode-sandbox-windows.md`; apply that too.
+
+> forwarded to cargo: as `v2/requests/usercode-sandbox-windows.md` item 1.
+
+## 4. Status (second agent of `usercode-sandbox`, 2026-10-29)
+
+Requests 2 and 3 are still open: `crates/blaze-cargo/build.rs` has no `linux_interpose()` yet,
+and the `windows-sys` line lacks the features in `v2/requests/usercode-sandbox-windows.md`.
+Until 2 lands, `src/sandbox/linux.rs` does not build on Linux (it includes
+`OUT_DIR/libblaze_sandbox_interpose.so` and reads `BLAZE_SANDBOX_INTERPOSE`); until 3 lands,
+`src/sandbox/windows.rs` does not build on Windows. The macOS library
+(`src/sandbox/macos_interpose.c`) needs no `build.rs` change: `sandbox_library()` builds the
+same file, which now also calls only libSystem (`CCRandomGenerateBytes` is libcommonCrypto,
+re-exported by libSystem).

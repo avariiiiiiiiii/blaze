@@ -154,7 +154,7 @@ pub fn rpit_hidden_types(
 }
 
 #[salsa::tracked(returns(ref))]
-pub(crate) fn tait_hidden_types(
+pub fn tait_hidden_types(
     db: &dyn HirDatabase,
     type_alias: TypeAliasId,
 ) -> ArenaMap<ImplTraitIdx, StoredEarlyBinder<StoredTy>> {

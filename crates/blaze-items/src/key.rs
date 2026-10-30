@@ -808,6 +808,23 @@ fn crate_keys_distinct(db: &dyn HirDatabase) {
     }
 }
 
+/// Every item of `krate` with an [`ItemId`], those of its bodies' blocks included.
+pub(crate) fn crate_item_ids(db: &dyn HirDatabase, krate: Crate) -> Vec<ItemId> {
+    let items = crate_items(db, krate);
+    let mut ids: Vec<ItemId> = Vec::new();
+    let mut take = |items: &Items| {
+        ids.extend(items.index.values().filter_map(|it| match *it {
+            Resolved::Item(id) => Some(id),
+            _ => None,
+        }))
+    };
+    take(items);
+    for &inner in &items.inner {
+        take(inner_items(db, inner, ()));
+    }
+    ids
+}
+
 /// Where else an item has things with keys: a store, with its closures and the items of its
 /// blocks, or the opaque types of an item's type, which are counted by lowering it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

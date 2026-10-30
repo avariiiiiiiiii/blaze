@@ -6,13 +6,13 @@ use hir_ty::db::{InternedClosure, InternedClosureId};
 use super::{TestDB, edit, item, single};
 use crate::{
     ItemId,
-    form::{Cx, Sub},
+    form::{Cx, Missed, Sub},
     key,
 };
 
 /// A form's digest, its slots by path and what it missed: slots of one fixture compared across
 /// edits, which may renumber their ids.
-type Named = (blaze_ids::ContentId, Vec<String>, Option<&'static str>);
+type Named = (blaze_ids::ContentId, Vec<String>, Option<Missed>);
 
 fn named(db: &TestDB, sub: Sub) -> Named {
     (sub.digest, sub.refs.iter().map(|&it| key::path(db, it)).collect(), sub.missed)
@@ -25,8 +25,8 @@ fn interface(db: &TestDB, path: &str) -> Named {
 #[track_caller]
 fn body(db: &TestDB, path: &str) -> Named {
     let id = item(db, path);
-    let sub = Cx::new(db).body(id).unwrap_or_else(|| panic!("`{path}` has no body"));
-    named(db, sub)
+    let code = Cx::new(db).body(id).unwrap_or_else(|| panic!("`{path}` has no body"));
+    named(db, code.sub)
 }
 
 fn closures(db: &TestDB, f: ItemId) -> Vec<InternedClosureId<'_>> {

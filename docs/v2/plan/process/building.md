@@ -66,6 +66,10 @@ Order:
   moves here; the IDE crates are then removed. Owns `crates/blaze-diagnostics/` (new) and
   `crates/ide-diagnostics/` until it is removed.
 
+- **`safety`**: proves the unsafe code sound without rustc (`plan/design/unsafe.md`): the
+  undefined-behavior checker on the MIR evaluator (`crates/hir-ty-ub/`, new), fuzz targets for
+  every parser of untrusted bytes (`fuzz/`, new), and the model checker for lock-free code
+  (`crates/blaze-graph/src/check/`, new). Sanitizer instrumentation goes to codegen by request.
 
 ## 19. How the coordinator integrates
 

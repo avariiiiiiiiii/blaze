@@ -35,13 +35,8 @@ impl<'db, Db: Database + ?Sized> From<&'db mut Db> for RawDatabase<'db> {
 
 /// The trait implemented by all Salsa databases.
 /// You can create your own subtraits of this trait using the `#[salsa::db]`(`crate::db`) procedural macro.
-pub trait Database: Send + ZalsaDatabase + AsDynDatabase {
+pub trait Database: Send + Sync + ZalsaDatabase + AsDynDatabase {
     /// Enforces current LRU limits, evicting entries if necessary.
-    ///
-    /// **WARNING:** Just like an ordinary write, this method triggers
-    /// cancellation. If you invoke it while a snapshot exists, it
-    /// will block until that snapshot is dropped -- if that snapshot
-    /// is owned by the current thread, this could trigger deadlock.
     fn trigger_lru_eviction(&mut self) {
         let zalsa_mut = self.zalsa_mut();
         zalsa_mut.evict_lru();
@@ -50,11 +45,6 @@ pub trait Database: Send + ZalsaDatabase + AsDynDatabase {
     /// A "synthetic write" causes the system to act *as though* some
     /// input of durability `durability` has changed, triggering a new revision.
     /// This is mostly useful for profiling scenarios.
-    ///
-    /// **WARNING:** Just like an ordinary write, this method triggers
-    /// cancellation. If you invoke it while a snapshot exists, it
-    /// will block until that snapshot is dropped -- if that snapshot
-    /// is owned by the current thread, this could trigger deadlock.
     ///
     /// # Panics
     ///
@@ -65,15 +55,14 @@ pub trait Database: Send + ZalsaDatabase + AsDynDatabase {
         zalsa_mut.runtime_mut().report_tracked_write(durability);
     }
 
-    /// This method cancels all outstanding computations.
-    /// If you invoke it while a snapshot exists, it
-    /// will block until that snapshot is dropped -- if that snapshot
-    /// is owned by the current thread, this could trigger deadlock.
+    /// Starts a new cancellation epoch, as a write does. No computation is outstanding: `&mut`
+    /// excludes every query, so there is nothing to wait for; provisional cycle results that
+    /// locally cancelled queries left behind are not reused after it.
     fn trigger_cancellation(&mut self) {
         let _ = self.zalsa_mut();
     }
 
-    /// Retrieves a [`CancellationToken`] for the current database handle.
+    /// Retrieves a [`CancellationToken`] for the task the current thread runs.
     fn cancellation_token(&self) -> CancellationToken {
         self.zalsa_local().cancellation_token()
     }
@@ -178,7 +167,7 @@ mod persistence {
         /// Returns a type implementing [`serde::Serialize`], that can be used to serialize the
         /// current state of the database.
         ///
-        /// Cancels other workers and waits for their database handles to be dropped.
+        /// Takes `&mut`, like a write, so no query runs while it serializes.
         pub fn as_serialize(&mut self) -> impl serde::Serialize + '_ {
             SerializeDatabase::new(self)
         }
@@ -423,15 +412,9 @@ mod memory_usage {
     impl dyn Database {
         /// Returns memory usage information about ingredients in the database.
         ///
-        /// **WARNING:** Just like an ordinary write, this method triggers
-        /// cancellation. It blocks until all other database handles are dropped,
-        /// which can deadlock if the current thread owns another handle.
+        /// Takes `&mut`, like a write, because measuring fields and memos needs exclusive access to
+        /// their storage.
         pub fn memory_usage(&mut self) -> DatabaseInfo {
-            // Measuring fields and memos requires exclusive access to their storage.
-            // `Database::trigger_cancellation` can be overridden by safe downstream code,
-            // so it cannot provide this safety guarantee. Call `zalsa_mut` directly, relying
-            // on the unsafe `ZalsaDatabase` contract to cancel and drain other handles.
-            let _ = self.zalsa_mut();
 
             let mut queries = HashMap::new();
             let mut structs = Vec::new();
@@ -439,8 +422,8 @@ mod memory_usage {
             let page_capacity = self.zalsa().table().page_capacity();
 
             for input_ingredient in self.zalsa().ingredients() {
-                // SAFETY: The ingredient belongs to this database. Calling `zalsa_mut`
-                // drained all other handles, and we retain exclusive access while measuring.
+                // SAFETY: The ingredient belongs to this database, and `&mut self` gives exclusive
+                // access while measuring.
                 let Some(input_info) = (unsafe { input_ingredient.memory_usage(self) }) else {
                     continue;
                 };

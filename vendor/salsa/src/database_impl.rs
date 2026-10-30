@@ -5,7 +5,6 @@ use crate::{Database, Storage};
 
 /// Default database implementation that you can use if you don't
 /// require any custom user data.
-#[derive(Clone)]
 pub struct DatabaseImpl {
     storage: Storage<Self>,
 }

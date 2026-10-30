@@ -2,19 +2,24 @@
 
 use std::ops::Deref;
 
-use ena::undo_log::UndoLogs;
 use tracing::instrument;
 
 use super::OpaqueHiddenType;
-use crate::next_solver::{
-    FxIndexMap, OpaqueTypeKey, Ty,
-    infer::snapshot::undo_log::{InferCtxtUndoLogs, UndoLog},
-};
+use crate::next_solver::{FxIndexMap, OpaqueTypeKey, Ty};
 
 #[derive(Default, Debug, Clone)]
 pub(crate) struct OpaqueTypeStorage<'db> {
     opaque_types: FxIndexMap<OpaqueTypeKey<'db>, OpaqueHiddenType<'db>>,
     duplicate_entries: Vec<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)>,
+    /// Each registration in the open snapshots, with the hidden type it replaced.
+    undo: Vec<(OpaqueTypeKey<'db>, Option<OpaqueHiddenType<'db>>)>,
+}
+
+/// Where the opaque types stood when a snapshot started.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OpaqueTypeMark {
+    undo: u32,
+    duplicate_entries: u32,
 }
 
 /// The number of entries in the opaque type storage at a given point.
@@ -49,20 +54,46 @@ impl<'db> OpaqueTypeStorage<'db> {
         }
     }
 
-    pub(crate) fn pop_duplicate_entry(&mut self) {
-        let entry = self.duplicate_entries.pop();
-        assert!(entry.is_some());
+    pub(crate) fn start_snapshot(&self) -> OpaqueTypeMark {
+        OpaqueTypeMark {
+            undo: self.undo.len() as u32,
+            duplicate_entries: self.duplicate_entries.len() as u32,
+        }
+    }
+
+    /// Undoes the registrations since `mark` in reverse, so each `swap_remove` removes the
+    /// last entry and the order of the others is kept.
+    pub(crate) fn rollback_to(&mut self, mark: OpaqueTypeMark) {
+        while self.undo.len() > mark.undo as usize {
+            let (key, prev) = self.undo.pop().unwrap();
+            self.remove(key, prev);
+        }
+        let duplicates = mark.duplicate_entries as usize;
+        assert!(self.duplicate_entries.len() >= duplicates, "duplicate opaque types were lost");
+        self.duplicate_entries.truncate(duplicates);
+    }
+
+    /// `outermost`: no snapshot is open after this one.
+    pub(crate) fn commit(&mut self, outermost: bool) {
+        if outermost {
+            self.undo.clear();
+        }
+    }
+
+    /// Whether an opaque type was registered since `mark`.
+    pub(crate) fn registered_since(&self, mark: &OpaqueTypeMark) -> bool {
+        self.undo.len() > mark.undo as usize
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        let OpaqueTypeStorage { opaque_types, duplicate_entries } = self;
+        let OpaqueTypeStorage { opaque_types, duplicate_entries, undo: _ } = self;
         opaque_types.is_empty() && duplicate_entries.is_empty()
     }
 
     pub(crate) fn take_opaque_types(
         &mut self,
     ) -> impl IntoIterator<Item = (OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)> + use<'db> {
-        let OpaqueTypeStorage { opaque_types, duplicate_entries } = self;
+        let OpaqueTypeStorage { opaque_types, duplicate_entries, undo: _ } = self;
         std::mem::take(opaque_types).into_iter().chain(std::mem::take(duplicate_entries))
     }
 
@@ -109,23 +140,20 @@ impl<'db> OpaqueTypeStorage<'db> {
     pub(crate) fn iter_opaque_types(
         &self,
     ) -> impl Iterator<Item = (OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)> {
-        let OpaqueTypeStorage { opaque_types, duplicate_entries } = self;
+        let OpaqueTypeStorage { opaque_types, duplicate_entries, undo: _ } = self;
         opaque_types.iter().map(|(k, v)| (*k, *v)).chain(duplicate_entries.iter().copied())
     }
 
     #[inline]
-    pub(crate) fn with_log<'a>(
-        &'a mut self,
-        undo_log: &'a mut InferCtxtUndoLogs<'db>,
-    ) -> OpaqueTypeTable<'a, 'db> {
-        OpaqueTypeTable { storage: self, undo_log }
+    pub(crate) fn table(&mut self, in_snapshot: bool) -> OpaqueTypeTable<'_, 'db> {
+        OpaqueTypeTable { storage: self, in_snapshot }
     }
 }
 
 pub(crate) struct OpaqueTypeTable<'a, 'db> {
     storage: &'a mut OpaqueTypeStorage<'db>,
 
-    undo_log: &'a mut InferCtxtUndoLogs<'db>,
+    in_snapshot: bool,
 }
 impl<'db> Deref for OpaqueTypeTable<'_, 'db> {
     type Target = OpaqueTypeStorage<'db>;
@@ -143,11 +171,15 @@ impl<'a, 'db> OpaqueTypeTable<'a, 'db> {
     ) -> Option<Ty<'db>> {
         if let Some(entry) = self.storage.opaque_types.get_mut(&key) {
             let prev = std::mem::replace(entry, hidden_type);
-            self.undo_log.push(UndoLog::OpaqueTypes(key, Some(prev)));
+            if self.in_snapshot {
+                self.storage.undo.push((key, Some(prev)));
+            }
             return Some(prev.ty);
         }
         self.storage.opaque_types.insert(key, hidden_type);
-        self.undo_log.push(UndoLog::OpaqueTypes(key, None));
+        if self.in_snapshot {
+            self.storage.undo.push((key, None));
+        }
         None
     }
 
@@ -157,6 +189,5 @@ impl<'a, 'db> OpaqueTypeTable<'a, 'db> {
         hidden_type: OpaqueHiddenType<'db>,
     ) {
         self.storage.duplicate_entries.push((key, hidden_type));
-        self.undo_log.push(UndoLog::DuplicateOpaqueType);
     }
 }

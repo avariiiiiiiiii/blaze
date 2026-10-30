@@ -308,7 +308,8 @@ class Round:
         return built
 
     def tests(self, step: str, env: dict[str, str], target: Path, release: list[str], blaze: bool, built: Built) -> object:
-        args = ["--no-fail-fast", *release]
+        # JSON for blaze-work (engine.V2.work_since); for cargo too, so both print alike.
+        args = ["--message-format=json", "--no-fail-fast", *release]
         kept_file = target / "blaze" / "tests.ndjson"
         if blaze:
             kept_file.unlink(missing_ok=True)
@@ -325,7 +326,7 @@ class Round:
             return None
         try:
             return self.eng.codegen_inputs(self.ws, env)
-        except (engine.Unmeasurable, engine.Missing) as e:
+        except engine.Unmeasurable as e:
             self.codegen_gap = self.gap("codegen inputs", e)
             return None
 
@@ -336,7 +337,7 @@ class Round:
         try:
             self.eng.trace(self.ws, env, to)
             return to
-        except (engine.Unmeasurable, engine.Missing) as e:
+        except engine.Unmeasurable as e:
             self.trace_gap = self.gap("the query database's trace", e)
             return None
 
@@ -364,14 +365,14 @@ class Round:
         if self.work_gap is None:
             try:
                 mark = self.eng.mark(self.inc_home)
-            except (engine.Unmeasurable, engine.Missing) as e:
+            except engine.Unmeasurable as e:
                 self.work_gap = self.gap("what a build did", e)
         built = self.side("incremental", state, env, self.inc_target, True)
         work = None
         if mark is not None:
             try:
                 work = self.eng.work_since(self.inc_home, mark)
-            except (engine.Unmeasurable, engine.Missing) as e:
+            except engine.Unmeasurable as e:
                 self.work_gap = self.gap("what a build did", e)
         if built.ok:
             built.codegen = self.codegen(env)

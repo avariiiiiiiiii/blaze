@@ -17,6 +17,16 @@
   `critical_path_s` raise `engine.Missing` until this exists, which fails every v2 run of
   oracle.py and budgets.py naming it.
 
+> applied: the API by ci (`Response::Work(Worked)`, `LinkKind`).
+> forwarded to cargo: the CLI's `{"reason": "blaze-work", ...}` line under `--message-format=json` (`crates/blaze-cargo/src/cli/`).
+> forwarded to proof: `harness/v2/engine.py`'s `V2.mark`/`work_since`/`critical_path_s` still raise `Missing`.
+> done by proof (17:40): `V2.build` keeps each build's, test's and run's `blaze-work` line by daemon home;
+> `mark`/`work_since` sum them, `critical_path_s` reads the last. A request in the span without the line
+> (not run under `--message-format=json`, or the CLI printed none) fails naming it. The oracle's tests and
+> budgets.py's counted builds pass `--message-format=json`. `V2.codegen_inputs`, `trace` and `tables` call
+> the CLI forms of requests 2, 3 and 8, which wait on cargo; until then they fail naming the command.
+> `engine.Missing` is gone.
+
 ## 2. blaze-api: codegen inputs of a view
 
 - What: `Request::CodegenInputs { view: ViewRef, targets: Targets }` answered with
@@ -26,6 +36,9 @@
 - Where: `crates/blaze-api` (ci), answered by the codegen queries (codegen).
 - Why: docs/v2/plan/lanes/proof.md: "the incremental result must equal a from-scratch build, bit for bit
   for the codegen inputs". `V2.codegen_inputs` raises `engine.Missing` until then.
+
+> applied: the API by ci (`Request::CodegenInputs`, `Response::CodegenInputs`).
+> forwarded to cargo: the CLI's `blaze codegen-inputs --format=json`.
 
 ## 3. blaze-api: a view's trace
 
@@ -41,6 +54,8 @@
   docs/v2/plan/lanes/items.md section 6.2), not only the wrong program. `V2.trace` raises
   `engine.Missing` until then.
 
+> applied: by ci (`Request::Trace`, `Response::Trace(Vec<Traced>)`; `blaze_ui::api::trace_cbor` writes `blaze_v2_proof::Trace`).
+
 ## 4. pyproject.toml: lint and type-check harness/v2
 
 - What: add `"harness/v2"` to both `include` lists (ruff and pyright),
@@ -50,6 +65,9 @@
 - Where: `pyproject.toml` (coordinator).
 - Why: the scripts are written pyright-strict; nothing checks them until they are included.
 
+> applied: by the coordinator: both `include` lists and the E402 ignore.
+> forwarded to coordinator: pyright's `extraPaths = ["harness", "harness/v2"]` is not in `pyproject.toml` (the coordinator's, not among the paths `requests` applies).
+
 ## 5. Cargo.lock: blaze-v2-proof
 
 - What: an entry for the path crate `blaze-v2-proof` (dependencies `blaze-ids`,
@@ -57,6 +75,8 @@
   It is a member through `crates/*`; no root `Cargo.toml` change.
 - Where: `Cargo.lock` (coordinator).
 - Why: its first build would add it anyway; written down so the lock is not a surprise.
+
+> applied: listed under the requests report's lock additions (a path crate, added at the first compile).
 
 ## 6. docs/harness.md: the v2 proof
 
@@ -66,6 +86,8 @@
   `docs/v2/plan/lanes/proof.md` can link it.
 - Where: `docs/harness.md`, `docs/v2/plan/lanes/proof.md` (coordinator).
 - Why: docs-say-what-they-are; the harnesses are otherwise undocumented.
+
+> applied: by the coordinator (`docs/harness.md` has the `harness/v2/` section).
 
 ---
 Routed or applied by the coordinator, 16:54.
@@ -80,6 +102,8 @@ Routed or applied by the coordinator, 16:54.
 - Why: `harness/v2/rejections.py` checks thousands of rustc compile-fail tests, about 100 to
   a workspace; its `whole: true` mode makes one request per workspace instead of one per
   test. Each member is still checked exactly as on its own.
+
+> applied: by ci (`Targets::cargo` documents `--keep-going` and one `Built` per checked unit).
 
 The children's own files (`v2/requests/proof-corpus.md`, `v2/requests/proof-perf.md`) are
 folded in here: what they asked of `proof` (engine, fixture, proof.py) is done in
@@ -97,6 +121,9 @@ folded in here: what they asked of `proof` (engine, fixture, proof.py) is done i
   relocation against its size budgets (`budgets.py`'s `layout` rows). `V2.tables` raises
   `engine.Missing` until then.
 
+> applied: by ci (`Request::Tables`, `Response::Tables(Vec<Table>)`).
+> forwarded to cargo: the CLI's `blaze tables --format=json`.
+
 ## 9. format and store: run every column codec through `blaze_v2_proof::columns::round_trips`
 
 - What: `blaze-v2-proof` as a dev-dependency (`blaze-v2-proof.workspace = true` once the
@@ -111,3 +138,6 @@ folded in here: what they asked of `proof` (engine, fixture, proof.py) is done i
 - Why: docs/v2/plan/design/data.md: "Every encoding round-trips exactly, which the proof
   checks." `shapes` holds the columns each tier is chosen for and their edges (empty, runs,
   sorted, CSR offsets, every narrow range, a frame far from zero, the extremes).
+
+> applied: `blaze-v2-proof = { path = "crates/blaze-v2-proof" }` in the root `[workspace.dependencies]`; `crates/blaze-format` already uses it.
+> forwarded to store: `crates/blaze-cas/Cargo.toml` has no `blaze-v2-proof` dev-dependency or tier round-trip test yet.

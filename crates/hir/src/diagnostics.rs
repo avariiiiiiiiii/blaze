@@ -1213,6 +1213,9 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             self.collect_macro_def(def);
         });
 
+        if scope.impls().len() == 0 {
+            return;
+        }
         let interner = DbInterner::new_with(self.db, self.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         let mut impl_assoc_items_scratch = Vec::new();

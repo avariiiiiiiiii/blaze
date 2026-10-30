@@ -11,17 +11,29 @@ mod impls;
 mod krate;
 mod names;
 
-use crate::{cx::Cx, lower::Found};
+use std::ops::ControlFlow;
 
-/// What rustc says of `cx.krate` that `hir` does not.
+use syntax::{AstNode, ast};
+
+use crate::{
+    cx::Cx,
+    lower::{Found, Phase},
+};
+
+/// rustc's `misc_checking_1` (the entry point, `check_mod_attrs`): after the resolver and the
+/// early lints, before the checks of items. Every check of that pass is given at this phase.
+pub(crate) const PASSES: Phase = Phase::Items;
+
+/// What rustc says of `cx.krate` that `hir` does not, in rustc's order: the resolver's, the
+/// feature gates (with the early lints), `misc_checking_1`, the checks of items.
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
     let mut found = Vec::new();
-    found.extend(features::check(cx));
-    found.extend(attrs::check(cx));
     found.extend(defs::check(cx));
     found.extend(names::check(cx));
-    found.extend(impls::check(cx));
+    found.extend(features::check(cx));
     found.extend(krate::check(cx));
+    found.extend(attrs::check(cx));
+    found.extend(impls::check(cx));
     found
 }
 
@@ -36,4 +48,33 @@ pub(crate) fn modules(cx: &Cx<'_, '_>) -> Vec<hir::Module> {
         stack.extend(children.into_iter().rev());
     }
     order
+}
+
+/// The crate's attributes as rustc reads them: the crate root's `#![..]`, then those of
+/// `-Z crate-attr`, with `cfg_attr` expanded as the crate's cfg says.
+pub(crate) fn crate_attrs(cx: &Cx<'_, '_>) -> Vec<ast::Meta> {
+    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
+    let tree = root.parse(cx.db).tree();
+    let extra = hir_def::attrs::parse_extra_crate_attrs(cx.db, cx.krate.into());
+    let attrs = tree.attrs().chain(extra.iter().flat_map(|it| it.attrs()));
+    let mut metas = Vec::new();
+    hir_expand::attrs::expand_cfg_attr::<()>(attrs, || cx.krate.cfg(cx.db), |meta, _| {
+        metas.push(meta);
+        ControlFlow::Continue(())
+    });
+    metas
+}
+
+/// Whether the crate has the attribute `#![name]` (or `#![name(..)]`, `#![name = ..]`).
+pub(crate) fn has_crate_attr(cx: &Cx<'_, '_>, name: &str) -> bool {
+    crate_attrs(cx).iter().any(|meta| {
+        meta.path().and_then(|path| path.as_single_name_ref()).is_some_and(|it| it.text() == name)
+            && !matches!(meta, ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_))
+    })
+}
+
+/// The text of `node` (for tests that read it).
+#[cfg(test)]
+pub(crate) fn text(node: &impl AstNode) -> String {
+    node.syntax().text().to_string()
 }

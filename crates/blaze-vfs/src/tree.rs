@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     Change, ChangeKind, DIR_DOMAIN, FILE_DOMAIN, Mode, Op, OpError,
-    reader::{Entry as SharedEntry, Reader, Shared},
+    reader::{self, Kind, Publisher},
 };
 
 /// A node of a [`Tree`]. Only meaningful for the tree that made it, and only until it collects.
@@ -171,17 +171,18 @@ impl Tree {
         at
     }
 
-    /// Gives `reader` the nodes made since the last publish.
-    pub(crate) fn publish(&mut self, reader: &Reader) {
+    /// Gives `publisher` the nodes made since the last publish, children before parents (the
+    /// order they were made in).
+    pub(crate) fn publish(&mut self, publisher: &mut Publisher) {
         let made = std::mem::take(&mut self.fresh)
             .into_iter()
             .map(|node| {
-                let shared = match &self.nodes[node.0 as usize] {
-                    Node::File { bytes, .. } => Shared::File(bytes.clone()),
-                    Node::Dir { entries, .. } => Shared::Dir(
+                let kind = match &self.nodes[node.0 as usize] {
+                    Node::File { bytes, .. } => Kind::File(bytes.clone()),
+                    Node::Dir { entries, .. } => Kind::Dir(
                         entries
                             .iter()
-                            .map(|&(name, child, mode)| SharedEntry {
+                            .map(|&(name, child, mode)| reader::Entry {
                                 name: self.names[name.0 as usize].clone(),
                                 id: self.id(child),
                                 mode,
@@ -190,10 +191,10 @@ impl Tree {
                             .collect(),
                     ),
                 };
-                (self.id(node), shared)
+                reader::Node { id: self.id(node), kind }
             })
             .collect();
-        reader.publish(made);
+        publisher.publish(made);
     }
 
     /// The node of a file with these bytes.

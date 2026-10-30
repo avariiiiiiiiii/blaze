@@ -29,3 +29,4 @@ work around it.
 | 10-29 | A new crate arrives with a `src/lib.rs`; every new workspace dependency goes through a request | one unloadable member stops the whole workspace from loading |
 | 10-29 | The first compile checks each lane's crates on their own, in one VM with committed memory and a job count bounded by it | one broken crate can't hide the rest; never OOM |
 | 10-29 | Reads never lock or write shared memory; values immutable once published; memory reclaimed at task boundaries; no build lock (plan/design/concurrency.md) | contention on one cache line costs more than the work on 100 cores |
+| 10-29 | `unsafe` only where it buys measured speed, behind safe APIs, each block with `// SAFETY:`; proved by our own Miri (the MIR evaluator), sanitizers in our code generator, model checking and fuzzing, never rustc (plan/design/unsafe.md) | fastest code that is still sound; no-rustc rules out Miri as it is |

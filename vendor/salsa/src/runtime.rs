@@ -3,9 +3,9 @@ use crate::durability::Durability;
 use crate::function::{SyncGuard, SyncOwner};
 use crate::key::DatabaseKeyIndex;
 use crate::sync::Mutex;
-use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use crate::sync::thread::{self, ThreadId};
+use crate::sync::atomic::{AtomicU8, Ordering};
 use crate::table::Table;
+use crate::task::TaskId;
 use crate::zalsa::Zalsa;
 use crate::{Cancelled, Event, EventKind, Revision};
 
@@ -13,14 +13,8 @@ mod dependency_graph;
 
 #[cfg_attr(feature = "persistence", derive(serde::Serialize, serde::Deserialize))]
 pub struct Runtime {
-    /// Set to true when the current revision has been cancelled.
-    /// This is done when we an input is being changed. The flag
-    /// is set back to false once the input has been changed.
-    #[cfg_attr(feature = "persistence", serde(skip))]
-    revision_cancelled: AtomicBool,
-
-    /// Distinguishes provisional cycle results created before and after cancelling other handles
-    /// within the same revision. Reset when the revision advances.
+    /// Distinguishes provisional cycle results created before and after a write within the same
+    /// revision. Reset when the revision advances.
     #[cfg_attr(feature = "persistence", serde(skip))]
     cancellation_count: AtomicU8,
 
@@ -35,7 +29,7 @@ pub struct Runtime {
     /// with durability less than D may have changed too.
     revisions: [Revision; Durability::LEN],
 
-    /// The dependency graph tracks which runtimes are blocked on one
+    /// The dependency graph tracks which tasks are blocked on one
     /// another, waiting for queries to terminate.
     #[cfg_attr(feature = "persistence", serde(skip))]
     dependency_graph: Mutex<DependencyGraph>,
@@ -59,17 +53,17 @@ pub(crate) enum BlockResult<'me> {
 
     /// Blocking resulted in a cycle.
     ///
-    /// The lock is hold by the current thread or there's another thread that is waiting on the current thread,
-    /// and blocking this thread on the other thread would result in a deadlock/cycle.
+    /// The lock is held by the current task, or another task waits for the current task through
+    /// query waits alone, and blocking would result in a deadlock/cycle.
     Cycle,
 }
 
 pub(crate) enum BlockTransferredResult<'me> {
-    /// The current thread is the owner of the transferred query
+    /// The current task is the owner of the transferred query
     /// and it can claim it if it wants to.
     ImTheOwner,
 
-    /// The query is owned/running on another thread.
+    /// The query is owned/running on another task.
     OwnedBy(Box<BlockOnTransferredOwner<'me>>),
 
     /// The query has transferred its ownership to another query previously but that query has
@@ -81,37 +75,72 @@ pub(super) struct BlockOnTransferredOwner<'me> {
     dg: crate::sync::MutexGuard<'me, DependencyGraph>,
     /// The query that we're trying to claim.
     database_key: DatabaseKeyIndex,
-    /// The thread that currently owns the lock for the transferred query.
-    other_id: ThreadId,
-    /// The current thread that is trying to claim the transferred query.
-    thread_id: ThreadId,
+    /// The task that currently owns the lock for the transferred query.
+    other_id: TaskId,
+    /// The current task that is trying to claim the transferred query.
+    thread_id: TaskId,
 }
 
 impl<'me> BlockOnTransferredOwner<'me> {
-    /// Block on the other thread to complete the computation.
+    /// Block on the other task to complete the computation.
     pub(super) fn block(self, query_mutex_guard: SyncGuard<'me>) -> BlockResult<'me> {
-        // Cycle in the same thread.
-        if self.thread_id == self.other_id {
-            return BlockResult::Cycle;
-        }
+        let Self {
+            dg,
+            database_key,
+            other_id,
+            thread_id,
+        } = self;
+        block_checked(dg, database_key, other_id, thread_id, query_mutex_guard)
+    }
+}
 
-        if self.dg.depends_on(self.other_id, self.thread_id) {
-            crate::tracing::debug!(
-                "block_on: cycle detected for {:?} in thread {thread_id:?} on {:?}",
-                self.database_key,
-                self.other_id,
-                thread_id = self.thread_id
-            );
-            return BlockResult::Cycle;
-        }
+/// Blocks `task_id` on `other_id`, which runs `database_key`, after checking that the wait
+/// can't deadlock.
+///
+/// # Cancellation
+///
+/// A wait on a task below this one on its thread, or one that would close a cycle through a
+/// task that pumped the current one, throws [`Cancelled::WouldWaitOnItself`]: no query cycle,
+/// so the work pool reposts the task.
+fn block_checked<'me>(
+    dg: crate::sync::MutexGuard<'me, DependencyGraph>,
+    database_key: DatabaseKeyIndex,
+    other_id: TaskId,
+    task_id: TaskId,
+    query_mutex_guard: SyncGuard<'me>,
+) -> BlockResult<'me> {
+    // Cycle in the same task.
+    if task_id == other_id {
+        return BlockResult::Cycle;
+    }
 
-        BlockResult::Running(Running(Box::new(BlockedOnInner {
-            dg: self.dg,
+    let closes = if other_id.is_below(task_id) {
+        dependency_graph::Closes::ThroughPumpedTask
+    } else {
+        dg.wait_closes(other_id, task_id)
+    };
+    match closes {
+        dependency_graph::Closes::No => BlockResult::Running(Running(Box::new(BlockedOnInner {
+            dg,
             query_mutex_guard,
-            database_key: self.database_key,
-            other_id: self.other_id,
-            thread_id: self.thread_id,
-        })))
+            database_key,
+            other_id,
+            thread_id: task_id,
+        }))),
+        dependency_graph::Closes::QueryCycle => {
+            crate::tracing::debug!(
+                "block_on: cycle detected for {database_key:?} in task {task_id:?} on {other_id:?}"
+            );
+            BlockResult::Cycle
+        }
+        dependency_graph::Closes::ThroughPumpedTask => {
+            crate::tracing::debug!(
+                "block_on: task {task_id:?} would wait on itself for {database_key:?} in {other_id:?}"
+            );
+            drop(dg);
+            drop(query_mutex_guard);
+            Cancelled::WouldWaitOnItself.throw()
+        }
     }
 }
 
@@ -121,8 +150,8 @@ struct BlockedOnInner<'me> {
     dg: crate::sync::MutexGuard<'me, DependencyGraph>,
     query_mutex_guard: SyncGuard<'me>,
     database_key: DatabaseKeyIndex,
-    other_id: ThreadId,
-    thread_id: ThreadId,
+    other_id: TaskId,
+    thread_id: TaskId,
 }
 
 impl Running<'_> {
@@ -145,13 +174,13 @@ impl Running<'_> {
 
         zalsa.event(&|| {
             Event::new(EventKind::WillBlockOn {
-                other_thread_id: other_id,
+                other_task: other_id,
                 database_key,
             })
         });
 
         crate::tracing::debug!(
-            "block_on: thread {thread_id:?} is blocking on {database_key:?} in thread {other_id:?}",
+            "block_on: task {thread_id:?} is blocking on {database_key:?} in task {other_id:?}",
         );
 
         let result =
@@ -197,7 +226,6 @@ impl Default for Runtime {
     fn default() -> Self {
         Runtime {
             revisions: [Revision::start(); Durability::LEN],
-            revision_cancelled: Default::default(),
             cancellation_count: Default::default(),
             dependency_graph: Default::default(),
             table: Default::default(),
@@ -209,7 +237,6 @@ impl std::fmt::Debug for Runtime {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fmt.debug_struct("Runtime")
             .field("revisions", &self.revisions)
-            .field("revision_cancelled", &self.revision_cancelled)
             .field("dependency_graph", &self.dependency_graph)
             .finish()
     }
@@ -253,21 +280,8 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn load_cancellation_flag(&self) -> bool {
-        self.revision_cancelled.load(Ordering::Acquire)
-    }
-
     pub(crate) fn cancellation_count(&self) -> u8 {
         self.cancellation_count.load(Ordering::Acquire)
-    }
-
-    pub(crate) fn set_cancellation_flag(&self) {
-        crate::tracing::trace!("set_cancellation_flag");
-        self.revision_cancelled.store(true, Ordering::Release);
-    }
-
-    pub(crate) fn reset_cancellation_flag(&self) {
-        self.revision_cancelled.store(false, Ordering::Release);
     }
 
     pub(crate) fn bump_cancellation_count(&mut self) -> bool {
@@ -289,8 +303,8 @@ impl Runtime {
         &mut self.table
     }
 
-    /// Increments the "current revision" counter and clears
-    /// the cancellation flag.
+    /// Increments the "current revision" counter and resets
+    /// the cancellation count.
     ///
     /// This should only be done by the storage when the state is "quiescent".
     pub(crate) fn new_revision(&mut self) -> Revision {
@@ -311,39 +325,27 @@ impl Runtime {
     ///
     /// # Propagating panics
     ///
-    /// If the thread `other_id` panics, then our thread is considered
-    /// cancelled, so this function will panic with a `Cancelled` value.
+    /// If the task `other_id` panics, then our task is considered
+    /// cancelled, so this function will panic with a `Cancelled` value. A wait that can't
+    /// end because `other_id` runs below this task on its thread (directly or through other
+    /// tasks' waits) panics with [`Cancelled::WouldWaitOnItself`].
     pub(crate) fn block<'a>(
         &'a self,
         database_key: DatabaseKeyIndex,
-        other_id: ThreadId,
+        other_id: TaskId,
         query_mutex_guard: SyncGuard<'a>,
     ) -> BlockResult<'a> {
-        let thread_id = thread::current().id();
-        // Cycle in the same thread.
-        if thread_id == other_id {
-            return BlockResult::Cycle;
-        }
-
-        let dg = self.dependency_graph.lock();
-
-        if dg.depends_on(other_id, thread_id) {
-            crate::tracing::debug!(
-                "block_on: cycle detected for {database_key:?} in thread {thread_id:?} on {other_id:?}"
-            );
-            return BlockResult::Cycle;
-        }
-
-        BlockResult::Running(Running(Box::new(BlockedOnInner {
-            dg,
-            query_mutex_guard,
+        let task_id = TaskId::current();
+        block_checked(
+            self.dependency_graph.lock(),
             database_key,
             other_id,
-            thread_id,
-        })))
+            task_id,
+            query_mutex_guard,
+        )
     }
 
-    /// Tries to claim ownership of a transferred query where `thread_id` is the current thread and `query`
+    /// Tries to claim ownership of a transferred query where `current_id` is the current task and `query`
     /// is the query (that had its ownership transferred) to claim.
     ///
     /// For this operation to be reasonable, the caller must ensure that the sync table lock on `query` is not released
@@ -351,7 +353,7 @@ impl Runtime {
     pub(super) fn block_transferred(
         &self,
         query: DatabaseKeyIndex,
-        current_id: ThreadId,
+        current_id: TaskId,
     ) -> BlockTransferredResult<'_> {
         let dg = self.dependency_graph.lock();
 
@@ -432,7 +434,7 @@ impl Runtime {
         DependencyGraph::transfer_lock(
             dg,
             query,
-            thread::current().id(),
+            TaskId::current(),
             new_owner_key,
             new_owner_id,
             guard,

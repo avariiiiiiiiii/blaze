@@ -10,11 +10,12 @@
 //!   profile, the rustflags and `UnitPlan::cfgs` decide; env is `UnitPlan::env`.
 //! - **Files**: every file under each package's directory (and the directory of a target root
 //!   outside it), by its absolute path as cargo names it, from the root of its longest mount.
-//!   One source root per package: library (`Durability::HIGH`) for the standard library,
-//!   registry and git packages; local (`Durability::LOW`) for path packages, as rust-analyzer
-//!   has them, so an edit of a member's file invalidates no query of std. A build script
-//!   run's `OUT_DIR` is in its package's source root, so what it writes there is read by that
-//!   package's crates and no other's.
+//!   One source root per package, but the standard library's packages share one, the whole of
+//!   `library/` (core reads `library/stdarch` and `library/portable-simd` by `#[path]`):
+//!   library (`Durability::HIGH`) for the standard library, registry and git packages; local
+//!   (`Durability::LOW`) for path packages, as rust-analyzer has them, so an edit of a member's
+//!   file invalidates no query of std. A build script run's `OUT_DIR` is in its package's
+//!   source root, so what it writes there is read by that package's crates and no other's.
 //! - **Build script runs** are applied by [`Lowered::ran`]; a proc macro's built expanders by
 //!   [`Lowered::macros`].
 
@@ -25,14 +26,14 @@ mod files;
 mod tests;
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
 use base_db::{
-    AbsPathBuf, ContentId, Crate, CrateWorkspaceData, Env, FileSet, LibraryRoots, LocalRoots,
-    SourceDatabase, SourceRoot, SourceRootId, VfsPath, ViewFile, ViewRoot,
+    AbsPathBuf, ContentId, Crate, CrateWorkspaceData, Env, FileId, FileSet, LibraryRoots,
+    LocalRoots, SourceDatabase, SourceRoot, SourceRootId, VfsPath, ViewChange, ViewFile, ViewRoot,
 };
 use blaze_units::{
     query::{BuildConfig, PackagePlan, Units},
@@ -106,11 +107,13 @@ pub struct Ran {
 pub struct Lowered {
     db: Mutex<Db>,
     units: Vec<Lowering>,
-    /// What every source root was made with: a set per package.
-    partition: FileSetConfig,
-    other: SourceRootId,
+    /// How many source roots of packages there are: `SourceRootId(0..sets)`, then the one of
+    /// files of no package.
+    sets: usize,
     /// By unit: the runs applied to it, by the run's unit.
     applied: Mutex<Vec<Vec<(usize, Applied)>>>,
+    /// Every file of the front end by its absolute path as cargo names it.
+    paths: Mutex<std::sync::Arc<HashMap<FileId, String>>>,
 }
 
 /// One unit as lowered.
@@ -118,6 +121,8 @@ struct Lowering {
     krate: Option<Crate>,
     /// `foo v0.1.0 (lib)`, for errors.
     what: String,
+    /// Its package's source root.
+    set: usize,
     /// A `RunCustomBuild` unit's `OUT_DIR`.
     out_dir: Option<String>,
     /// The units depending on it directly.
@@ -125,6 +130,7 @@ struct Lowering {
     /// Its cfg and env before any run applied.
     cfg: CfgOptions,
     env: Vec<(String, String)>,
+    /// Whether its crate is a proc macro's dylib (a `proc-macro` target built without `--test`).
     proc_macro: bool,
 }
 
@@ -159,94 +165,107 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
         whats.push(crates::describe(package_of(unit)?, unit));
     }
 
-    // One set of the partition per package with a unit, in the order of `units.packages`.
-    let used: FxHashSet<&str> = units.graph.units.iter().map(|it| it.pkg_id.as_str()).collect();
-    let mut sets: Vec<Set> = Vec::new();
+    // One source root per package with a unit, in the order of `units.packages`, but one for
+    // every package of the standard library; each directory read is one root's, the innermost
+    // when one is in another's.
+    let mut used: FxHashMap<&str, bool> = FxHashMap::default();
+    for unit in &units.graph.units {
+        *used.entry(unit.pkg_id.as_str()).or_default() |= unit.is_std;
+    }
+    let mut library: Vec<bool> = Vec::new();
     let mut set_of: FxHashMap<&str, usize> = FxHashMap::default();
-    for package in units.packages.iter().filter(|it| used.contains(it.id.as_str())) {
-        let dir = files::parent(&package.manifest_path).to_owned();
-        let is_std = units.graph.units.iter().any(|it| it.pkg_id == package.id && it.is_std);
-        set_of.insert(package.id.as_str(), sets.len());
-        sets.push(Set { prefixes: vec![dir.clone()], loads: vec![dir], library: is_std || !crates::is_path(package) });
+    let mut loads: BTreeMap<String, usize> = BTreeMap::new();
+    let mut std_set = None;
+    for package in &units.packages {
+        let Some(&is_std) = used.get(package.id.as_str()) else { continue };
+        let set = match (is_std, std_set) {
+            (true, Some(set)) => set,
+            (true, None) => {
+                let set = library.len();
+                library.push(true);
+                loads.insert(config.library.trim_end_matches('/').to_owned(), set);
+                std_set = Some(set);
+                set
+            }
+            (false, _) => {
+                let set = library.len();
+                library.push(!crates::is_path(package));
+                loads.entry(files::parent(&package.manifest_path).to_owned()).or_insert(set);
+                set
+            }
+        };
+        set_of.insert(package.id.as_str(), set);
     }
     let mut excluded: BTreeSet<String> = BTreeSet::new();
     excluded.insert(units.target_dir.clone());
     excluded.insert(units.build_dir.clone());
     for (index, unit) in units.graph.units.iter().enumerate() {
-        let set = set_of[unit.pkg_id.as_str()];
         if unit.mode == Mode::RunCustomBuild {
             let out_dir = units.plans[index].out_dir.clone().ok_or_else(|| {
                 LowerError::at("a build script's run has no `OUT_DIR`", whats[index].clone())
             })?;
-            excluded.insert(out_dir.clone());
-            sets[set].prefixes.push(out_dir);
+            excluded.insert(out_dir);
             continue;
         }
         let src = crates::src_path(unit, &whats[index])?;
         let dir = files::parent(&src);
-        let inside = sets[set].loads.iter().any(|load| files::rest(dir, load).is_some());
-        if !inside {
-            sets[set].prefixes.push(dir.to_owned());
-            sets[set].loads.push(dir.to_owned());
+        if !loads.keys().any(|load| files::rest(dir, load).is_some()) {
+            loads.insert(dir.to_owned(), set_of[unit.pkg_id.as_str()]);
         }
     }
 
     let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files };
-    let loads: BTreeSet<String> = sets.iter().flat_map(|it| it.loads.iter().cloned()).collect();
     let mut db = Db::new();
-    let mut partition = FileSetConfig::builder();
-    for (index, set) in sets.iter().enumerate() {
-        let source_root = match set.library {
+    for (index, &is_library) in library.iter().enumerate() {
+        let source_root = match is_library {
             true => SourceRoot::new_library(FileSet::default()),
             false => SourceRoot::new_local(FileSet::default()),
         };
-        let durability = if set.library { Durability::HIGH } else { Durability::LOW };
+        let durability = if is_library { Durability::HIGH } else { Durability::LOW };
         db.set_source_root_with_durability(SourceRootId(index as u32), Arc::new(source_root), durability);
-        let mut prefixes = Vec::with_capacity(set.prefixes.len());
-        for prefix in &set.prefixes {
-            prefixes.push(VfsPath::from(abs(prefix)?));
-        }
-        partition.add_file_set(prefixes);
     }
-    let other = SourceRootId(sets.len() as u32);
+    let other = SourceRootId(library.len() as u32);
     db.set_source_root_with_durability(other, Arc::new(SourceRoot::new_local(FileSet::default())), Durability::LOW);
-    let library: FxHashSet<SourceRootId> =
-        (0..sets.len()).filter(|&it| sets[it].library).map(|it| SourceRootId(it as u32)).collect();
-    let local: FxHashSet<SourceRootId> = (0..=sets.len())
-        .filter(|&it| it == sets.len() || !sets[it].library)
-        .map(|it| SourceRootId(it as u32))
-        .collect();
-    _ = LibraryRoots::builder(library).durability(Durability::MEDIUM).new(&db);
-    _ = LocalRoots::builder(local).durability(Durability::MEDIUM).new(&db);
-    let partition = partition.build();
+    let roots = |library_too: bool| -> FxHashSet<SourceRootId> {
+        (0..=library.len())
+            .filter(|&it| library.get(it).copied().unwrap_or(false) == library_too)
+            .map(|it| SourceRootId(it as u32))
+            .collect()
+    };
+    _ = LibraryRoots::builder(roots(true)).durability(Durability::MEDIUM).new(&db);
+    _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&db);
 
-    for load in &loads {
+    let mut loaded = Vec::new();
+    for (load, &set) in &loads {
         // What is under another load, or written by the build, is not this one's.
         let skipped: Vec<&String> = loads
-            .iter()
+            .keys()
             .chain(excluded.iter())
             .filter(|it| *it != load && files::rest(it, load).is_some())
             .collect();
         let skip = |path: &str| skipped.iter().any(|it| it.as_str() == path);
-        let mut loaded = Vec::new();
+        loaded.clear();
         tree.walk(load, &skip, &mut loaded)?;
         let built: Vec<AbsPathBuf> = skipped.iter().map(|it| abs(it)).collect::<Result<_, _>>()?;
-        set_files(&mut db, load, &built, &partition, other, &loaded)?;
+        set_files(&mut db, load, &built, set, library.len(), &loaded)?;
     }
 
-    let mut workspaces: HashMap<String, Arc<CrateWorkspaceData>> = HashMap::new();
+    let workspace_root = crates::root(units, &tree)?;
     let toolchain = crates::toolchain()?;
-    let const_eval = crates::const_eval(units);
+    let mut workspaces: HashMap<&str, Arc<CrateWorkspaceData>> = HashMap::new();
     let mut lowerings: Vec<Lowering> = Vec::with_capacity(unit_count);
     for (index, unit) in units.graph.units.iter().enumerate() {
+        let plan = &units.plans[index];
+        let compiles = unit.mode != Mode::RunCustomBuild;
         lowerings.push(Lowering {
             krate: None,
             what: whats[index].clone(),
-            out_dir: units.plans[index].out_dir.clone().filter(|_| unit.mode == Mode::RunCustomBuild),
+            set: set_of[unit.pkg_id.as_str()],
+            out_dir: plan.out_dir.clone().filter(|_| !compiles),
             dependents: Vec::new(),
             cfg: CfgOptions::default(),
             env: Vec::new(),
-            proc_macro: unit.target.is_proc_macro() && unit.mode != Mode::RunCustomBuild,
+            proc_macro: compiles && unit.target.is_proc_macro() && !crates::is_test(unit, plan),
         });
     }
     for (index, unit) in units.graph.units.iter().enumerate() {
@@ -268,24 +287,29 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
     for index in order {
         let unit = &units.graph.units[index];
         let plan = &units.plans[index];
+        let what = &whats[index];
         let package = package_of(unit)?;
-        let triple = unit.platform.clone().unwrap_or_else(|| config.host.clone());
-        let workspace = match workspaces.get(&triple) {
+        let triple = unit.platform.as_deref().unwrap_or(&config.host);
+        let workspace = match workspaces.get(triple) {
             Some(it) => it.clone(),
             None => {
-                let made = crates::workspace(&triple, &toolchain, const_eval)?;
-                workspaces.insert(triple.clone(), made.clone());
+                let made = crates::workspace_data(triple, &toolchain, workspace_root.const_eval)?;
+                workspaces.insert(triple, made.clone());
                 made
             }
         };
-        let cfg = crates::cfg(unit, plan, &triple, host_cpu, &whats[index])?;
-        let src = crates::src_path(unit, &whats[index])?;
+        let cfg = crates::cfg(unit, plan, triple, host_cpu, what)?;
+        let src = crates::src_path(unit, what)?;
         let src_path = VfsPath::from(abs(&src)?);
-        let set = partition.classify_path(&src_path).map_or(other, |it| SourceRootId(it as u32));
+        let set = loads
+            .iter()
+            .filter(|(load, _)| files::rest(&src, load).is_some())
+            .max_by_key(|(load, _)| load.len())
+            .map_or(other, |(_, &set)| SourceRootId(set as u32));
         let root_file = db.source_root(set).source_root(&db).file_for_path(&src_path).copied();
         let Some(root_file) = root_file else {
             return Err(LowerError::at(
-                format!("the root file `{src}` of {} is not among its package's files", whats[index]),
+                format!("the root file `{src}` of {what} is not among its package's files"),
                 src,
             ));
         };
@@ -297,28 +321,27 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
             }
             let Some(krate) = lowerings[dep.index].krate else {
                 return Err(LowerError::at(
-                    format!("{} depends on {}, which has no crate", whats[index], whats[dep.index]),
-                    whats[index].clone(),
+                    format!("{what} depends on {}, which has no crate", whats[dep.index]),
+                    what.clone(),
                 ));
             };
-            dependencies.push(crates::dependency(unit, on, dep, krate, &whats[index])?);
+            dependencies.push(crates::dependency(unit, on, dep, krate, what)?);
         }
         let data = base_db::BuiltCrateData {
             root_file_id: root_file,
-            edition: crates::edition(unit, &whats[index])?,
+            edition: crates::edition(unit, what)?,
             dependencies,
             origin: crates::origin(package, unit),
             crate_attrs: Box::new([]),
-            target_kind: crates::target_kind(unit, &whats[index])?,
-            proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(units, package))?),
+            target_kind: crates::target_kind(unit, plan, what)?,
+            proc_macro_cwd: Arc::new(abs(&crates::proc_macro_cwd(&workspace_root, package))?),
         };
         let extra = base_db::ExtraCrateData {
             version: Some(package.version.clone()),
             display_name: Some(base_db::CrateDisplayName::from_canonical_name(&unit.target.name)),
             potential_cfg_options: None,
         };
-        let library = sets[set_of[unit.pkg_id.as_str()]].library;
-        let durability = if library { Durability::HIGH } else { Durability::MEDIUM };
+        let durability = if library[set_of[unit.pkg_id.as_str()]] { Durability::HIGH } else { Durability::MEDIUM };
         let env: Env = plan.env.iter().cloned().collect();
         let krate = Crate::create(&mut db, data, extra, workspace, cfg.clone(), env, durability);
         let lowering = &mut lowerings[index];
@@ -341,23 +364,14 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
     ProcMacros::get(&db).set_by_crate(&mut db).with_durability(Durability::HIGH).to(not_built);
     base_db::set_process_env(&mut db, config.invocation.env.iter().cloned().collect());
 
+    let paths = paths_of(&db, library.len());
     Ok(Lowered {
         db: Mutex::new(db),
         applied: Mutex::new((0..unit_count).map(|_| Vec::new()).collect()),
         units: lowerings,
-        partition,
-        other,
+        sets: library.len(),
+        paths: Mutex::new(std::sync::Arc::new(paths)),
     })
-}
-
-/// A set of the partition: one package's.
-struct Set {
-    /// The directories whose files are its source root's: the package's, its runs' `OUT_DIR`s,
-    /// the directory of a target root outside the package's.
-    prefixes: Vec<String>,
-    /// Those read now: all but the `OUT_DIR`s.
-    loads: Vec<String>,
-    library: bool,
 }
 
 impl Lowered {
@@ -368,9 +382,15 @@ impl Lowered {
     }
 
     /// A database for a worker to read the front end with while other workers read theirs:
-    /// see [`Snapshot`] for what a write does to it.
+    /// see [`Snapshot`] for what a write does to it. Waits while a write is going on.
     pub fn snapshot(&self) -> Snapshot {
-        Snapshot::new(self.db().clone())
+        self.db().clone()
+    }
+
+    /// Every file of the front end by its absolute path as cargo names it, as of now: a run
+    /// applied after adds its `OUT_DIR`'s files to the map the next call gives.
+    pub fn paths(&self) -> std::sync::Arc<HashMap<FileId, String>> {
+        self.paths.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// The run of build script unit `run` applied to every unit that depends on it directly:
@@ -408,7 +428,21 @@ impl Lowered {
         }
 
         let mut db = self.db();
-        set_files(&mut db, out_dir, &[], &self.partition, self.other, &loaded)?;
+        let change = set_files(&mut db, out_dir, &[], lowering.set, self.sets, &loaded)?;
+        if !change.added.is_empty() || !change.removed.is_empty() {
+            let mut paths = self.paths.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut map = HashMap::clone(&paths);
+            for id in &change.removed {
+                map.remove(id);
+            }
+            let root = db.source_root(SourceRootId(lowering.set as u32)).source_root(&*db);
+            for id in &change.added {
+                if let Some(path) = root.path_for_file(id).and_then(VfsPath::as_path) {
+                    map.insert(*id, path.as_str().to_owned());
+                }
+            }
+            *paths = std::sync::Arc::new(map);
+        }
         let mut applied = self.applied.lock().unwrap_or_else(PoisonError::into_inner);
         for &dependent in &lowering.dependents {
             let Some(krate) = self.units[dependent].krate else { continue };
@@ -463,25 +497,39 @@ impl Lowered {
     }
 }
 
-impl Snapshot {
-    /// The absolute path of `file`, as cargo names it.
-    pub fn path(&self, file: base_db::FileId) -> Option<String> {
-        let root = self.file_source_root(file).source_root_id(&**self);
-        let root = self.source_root(root).source_root(&**self);
-        Some(root.path_for_file(&file)?.as_path()?.as_str().to_owned())
+/// Every file of the source roots `0..=sets` by its absolute path.
+fn paths_of(db: &Db, sets: usize) -> HashMap<FileId, String> {
+    let mut paths = HashMap::new();
+    for set in 0..=sets {
+        let root = db.source_root(SourceRootId(set as u32)).source_root(db);
+        for file in root.iter() {
+            if let Some(path) = root.path_for_file(&file).and_then(VfsPath::as_path) {
+                paths.insert(file, path.as_str().to_owned());
+            }
+        }
     }
+    paths
 }
 
-/// Puts `loaded`, the files under `base`, into the source roots `partition` gives them.
+/// Puts `loaded`, the files under `base`, into the source root `set` of the `sets` packages'.
+/// Files under `base` it lacks and none of `built` has are taken out.
 fn set_files(
     db: &mut Db,
     base: &str,
     built: &[AbsPathBuf],
-    partition: &FileSetConfig,
-    other: SourceRootId,
+    set: usize,
+    sets: usize,
     loaded: &[files::Loaded],
-) -> Result<(), LowerError> {
+) -> Result<ViewChange, LowerError> {
     let base_path = abs(base)?;
+    // Every file of `loaded` is under `base`, so the one prefix puts each in `set`: a partition
+    // of every package's prefixes would put `/w/ab/x.rs` in `/w/a`'s, its prefixes being bytes.
+    let mut partition = FileSetConfig::builder();
+    for index in 0..sets {
+        partition.add_file_set(if index == set { vec![VfsPath::from(base_path.clone())] } else { Vec::new() });
+    }
+    let partition = partition.build();
+    let other = SourceRootId(sets as u32);
     let mut view = Vec::with_capacity(loaded.len());
     for file in loaded {
         let Some(path) = files::rest(&file.path, base).filter(|it| !it.is_empty()) else {
@@ -490,7 +538,7 @@ fn set_files(
         let file = blaze_vfs::File { id: file.id, mode: blaze_vfs::Mode::Regular, bytes: &file.bytes };
         view.push(ViewFile { path, file });
     }
-    let root = ViewRoot { base: &base_path, built, partition, other, files: &view };
+    let root = ViewRoot { base: &base_path, built, partition: &partition, other, files: &view };
     db.set_view_root(root).map_err(|error| {
         let at = match &error {
             base_db::ViewError::BadPath(path)
@@ -500,8 +548,7 @@ fn set_files(
             | base_db::ViewError::NoFileId(path) => format!("{base}/{path}"),
         };
         LowerError::at(error.to_string(), at)
-    })?;
-    Ok(())
+    })
 }
 
 fn abs(path: &str) -> Result<AbsPathBuf, LowerError> {

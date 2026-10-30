@@ -8,7 +8,7 @@
 //! init functions [`Class::InitArray`] pieces of their priority holding the function's slot.
 //! The format: <https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md>.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::Range;
 
 use blaze_codegen::wasm::{Code, Import, Signature, ValType};
@@ -538,37 +538,44 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
     let imported = parsed.imported.len() as u32;
 
     // The relocations of each section, by the section's index in the module.
-    let mut by_section: BTreeMap<usize, Vec<Reloc>> = BTreeMap::new();
+    let mut by_section: Vec<Vec<Reloc>> = Vec::new();
+    by_section.resize_with(parsed.sections.len(), Vec::new);
     for &(name, contents) in &parsed.relocs {
         let (section, relocs) = relocs(contents).map_err(|e| format!("{name}: {e}"))?;
-        if section >= parsed.sections.len() {
+        let Some(list) = by_section.get_mut(section) else {
             return Err(format!("{name} is of section {section}, which there is not"));
-        }
-        by_section.entry(section).or_default().extend(relocs);
+        };
+        list.extend(relocs);
     }
     let start_of = |section: usize| parsed.sections[section].at;
     let named = |r: &Reloc| reloc::name(r.r_type).unwrap_or("an unknown relocation");
 
-    let mut sections = Vec::new();
-    let mut retain = BTreeSet::new();
+    let bodies = parsed.bodies.len();
+    let mut sections =
+        Vec::with_capacity(bodies + parsed.segments.len() + parsed.customs.len() + linking.inits.len());
+    let mut retain: Vec<usize> = Vec::new();
 
-    // Functions.
-    let mut function_names: BTreeMap<u32, &str> = BTreeMap::new();
-    let mut exported: BTreeMap<u32, &str> = BTreeMap::new();
+    // Functions: the first name and the first exported name of each, by body.
+    let mut function_names: Vec<Option<&str>> = vec![None; bodies];
+    let mut exported: Vec<Option<&str>> = vec![None; bodies];
     for symbol in &linking.symbols {
-        if symbol.kind == SYM_FUNCTION && symbol.flags & UNDEFINED == 0 {
-            if let Some(name) = symbol.name {
-                function_names.entry(symbol.index).or_insert(name);
-                if symbol.flags & EXPORTED != 0 {
-                    exported.entry(symbol.index).or_insert(name);
-                }
+        if symbol.kind != SYM_FUNCTION || symbol.flags & UNDEFINED != 0 {
+            continue;
+        }
+        let (Some(name), Some(body)) = (symbol.name, symbol.index.checked_sub(imported)) else {
+            continue;
+        };
+        if let Some(slot) = function_names.get_mut(body as usize) {
+            slot.get_or_insert(name);
+            if symbol.flags & EXPORTED != 0 {
+                exported[body as usize].get_or_insert(name);
             }
         }
     }
     // Each with its offset from the start of the body.
-    let mut code_relocs: Vec<Vec<(usize, &Reloc)>> = vec![Vec::new(); parsed.bodies.len()];
+    let mut code_relocs: Vec<Vec<(usize, &Reloc)>> = vec![Vec::new(); bodies];
     if let Some(code) = parsed.code {
-        for r in by_section.get(&code).into_iter().flatten() {
+        for r in &by_section[code] {
             let at = start_of(code) + r.offset;
             let (body, offset) = within(&parsed.bodies, at, width(r.r_type)).ok_or_else(|| {
                 format!("{} at {:#x} of the code section, in no function body", named(r), r.offset)
@@ -583,7 +590,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
         let ty = parsed.types.get(ty as usize).ok_or_else(|| format!("no type {ty}"))?.clone();
         let mut code = Code {
             ty,
-            export: parsed.exports.get(&index).or(exported.get(&index)).map(|it| (*it).to_owned()),
+            export: parsed.exports.get(&index).copied().or(exported[body]).map(str::to_owned),
             ..Code::default()
         };
         let mut fixups = Vec::new();
@@ -620,12 +627,17 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             fixup.at += u64::from(start);
         }
         if code.export.is_some() {
-            retain.insert(sections.len());
+            retain.push(sections.len());
         }
-        let name = match function_names.get(&index) {
-            Some(name) => format!(".text.{name}"),
-            None => format!(".text.{index}"),
-        };
+        let mut name = String::with_capacity(6 + function_names[body].map_or(10, str::len));
+        name.push_str(".text.");
+        match function_names[body] {
+            Some(it) => name.push_str(it),
+            None => {
+                use std::fmt::Write;
+                let _ = write!(name, "{index}");
+            }
+        }
         function_sections.push(sections.len() as u32);
         sections.push(Section {
             name,
@@ -640,7 +652,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
     // Data segments.
     let mut segment_fixups: Vec<Vec<NativeFixup>> = vec![Vec::new(); parsed.segments.len()];
     if let Some(data) = parsed.data {
-        for r in by_section.get(&data).into_iter().flatten() {
+        for r in &by_section[data] {
             let at = start_of(data) + r.offset;
             let (segment, offset) = within(&parsed.segments, at, width(r.r_type)).ok_or_else(|| {
                 format!("{} at {:#x} of the data section, in no segment", named(r), r.offset)
@@ -674,7 +686,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             return Err(format!("the segment `{}` aligned to 2^{}", info.name, info.align));
         }
         if info.flags & SEGMENT_RETAIN != 0 {
-            retain.insert(sections.len());
+            retain.push(sections.len());
         }
         segment_sections.push(sections.len() as u32);
         sections.push(Section {
@@ -700,7 +712,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             ));
         }
         let mut fixups = Vec::new();
-        for r in by_section.get(&custom.index).into_iter().flatten() {
+        for r in &by_section[custom.index] {
             let at = start_of(custom.index) + r.offset;
             let offset = at
                 .checked_sub(custom.payload.start)
@@ -721,7 +733,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
         }
         custom_sections.insert(custom.index, sections.len() as u32);
         if !dropped {
-            retain.insert(sections.len());
+            retain.push(sections.len());
         }
         sections.push(Section {
             name: custom.name.to_owned(),
@@ -781,7 +793,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
             SYM_FUNCTION => {
                 let section = function_section(s.index).map_err(|e| format!("symbol {at}: {e}"))?;
                 if s.flags & (EXPORTED | NO_STRIP) != 0 {
-                    retain.insert(section as usize);
+                    retain.push(section as usize);
                 }
                 Symbol {
                     name: s.name.ok_or_else(unnamed)?.to_owned(),
@@ -818,7 +830,7 @@ fn object(bytes: &[u8]) -> Result<Object, String> {
                             return Err(format!("`{name}` reaches past its segment"));
                         }
                         if s.flags & NO_STRIP != 0 {
-                            retain.insert(section as usize);
+                            retain.push(section as usize);
                         }
                         SymbolDef::Section { section, value, size }
                     }

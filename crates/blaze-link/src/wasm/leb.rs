@@ -4,15 +4,31 @@
 /// How many bytes an object leaves for an index or an address it relocates.
 pub(super) const PADDED: usize = 5;
 
-pub(super) fn uleb(out: &mut Vec<u8>, mut value: u64) {
+pub(super) fn uleb(out: &mut Vec<u8>, value: u64) {
+    let mut bytes = [0; 10];
+    let len = uleb_into(&mut bytes, value);
+    out.extend_from_slice(&bytes[..len]);
+}
+
+/// How many bytes [`uleb`] writes for `value`.
+pub(super) const fn uleb_len(value: u64) -> usize {
+    let bits = 64 - (value | 1).leading_zeros() as usize;
+    bits.div_ceil(7)
+}
+
+/// Writes `value` as a LEB128 at the start of `place`, which has room for it
+/// ([`uleb_len`]), and says how many bytes that took.
+pub(super) fn uleb_into(place: &mut [u8], mut value: u64) -> usize {
+    let mut at = 0;
     loop {
         let byte = (value & 0x7f) as u8;
         value >>= 7;
         if value == 0 {
-            out.push(byte);
-            return;
+            place[at] = byte;
+            return at + 1;
         }
-        out.push(byte | 0x80);
+        place[at] = byte | 0x80;
+        at += 1;
     }
 }
 
@@ -107,6 +123,16 @@ mod tests {
         assert_eq!(u(624_485), [0xe5, 0x8e, 0x26]);
         assert_eq!(u(u32::MAX.into()), [0xff, 0xff, 0xff, 0xff, 0x0f]);
         assert_eq!(u(u64::MAX).len(), 10);
+    }
+
+    #[test]
+    fn lengths() {
+        for value in [0, 1, 127, 128, 16_383, 16_384, u64::from(u32::MAX), u64::MAX] {
+            assert_eq!(uleb_len(value), u(value).len(), "{value}");
+            let mut place = [0xaa; 11];
+            assert_eq!(uleb_into(&mut place, value), u(value).len());
+            assert_eq!(&place[..u(value).len()], u(value));
+        }
     }
 
     #[test]

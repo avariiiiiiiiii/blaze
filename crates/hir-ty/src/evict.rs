@@ -3,12 +3,16 @@
 //! A dropped value keeps its memo: its fingerprint and the edges it read. Verifying it walks those
 //! edges without the value, so a dependent of an unchanged body stays valid, and a read of it
 //! computes it again and backdates by fingerprint, so a later edit cuts off early as if the value
-//! had been kept (salsa's `evict_values` and `evict_values_of`, which need the `lru` the two
-//! inference queries set; docs/v2/plan/lanes/db.md section 7).
+//! had been kept (salsa's `evict_values` and `evict_values_of`, which need the `lru` these queries
+//! set; docs/v2/plan/lanes/db.md section 7).
+//!
+//! A closure's captures and signature are its body's inference result, dropped with it. Enum
+//! discriminants are not dropped: an `i128` is smaller than the fingerprint kept in its place.
 
-use hir_def::DefWithBodyId;
+use hir_def::{DefWithBodyId, StaticId};
 
 use crate::{
+    consteval::{anon_const_eval_query, const_eval_query, const_eval_static_query},
     db::HirDatabase,
     infer::{infer_anon_const_body_query, infer_body_query},
 };
@@ -24,4 +28,26 @@ pub fn drop_inference(db: &mut dyn HirDatabase, bodies: &[DefWithBodyId]) {
 pub fn drop_all_inference(db: &mut dyn HirDatabase) {
     infer_body_query::evict_values(db);
     infer_anon_const_body_query::evict_values(db);
+}
+
+/// Drops the values of `statics`. What `statics` names that was never evaluated is left as it
+/// is.
+pub fn drop_statics(db: &mut dyn HirDatabase, statics: &[StaticId]) {
+    const_eval_static_query::evict_values_of(db, statics.iter().copied());
+}
+
+/// Drops the value of every constant and static evaluated: named constants with each set of
+/// generic arguments, anonymous constants (array lengths, repeat counts, const arguments,
+/// `const` blocks) and statics.
+pub fn drop_all_const_eval(db: &mut dyn HirDatabase) {
+    const_eval_query::evict_values(db);
+    anon_const_eval_query::evict_values(db);
+    const_eval_static_query::evict_values(db);
+}
+
+/// Drops every per-body result of hir-ty: what [`drop_all_inference`] and
+/// [`drop_all_const_eval`] drop.
+pub fn drop_all(db: &mut dyn HirDatabase) {
+    drop_all_inference(db);
+    drop_all_const_eval(db);
 }

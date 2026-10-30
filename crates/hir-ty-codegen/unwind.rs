@@ -55,6 +55,12 @@ pub(super) struct FunctionUnwind {
     landing_pads: Option<Vec<u8>>,
 }
 
+/// A function's unwind information apart from where the function is ([`FunctionUnwind::v2_parts`]).
+pub(super) enum UnwindParts<'a> {
+    Dwarf { fde: FrameDescriptionEntry, landing_pads: Option<&'a [u8]> },
+    Windows { len: u32, info: &'a [u8], landing_pads: Option<&'a [u8]> },
+}
+
 /// How to find the caller's frame at each place in a function, as the producer of its code
 /// tells it.
 #[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
@@ -189,10 +195,25 @@ impl FunctionUnwind {
         FunctionUnwind { frame, landing_pads: pads.finish() }
     }
 
+    /// What a v2 build keeps of the function's unwind information: the entry's instructions
+    /// at address 0, as the linker places them.
+    pub(super) fn v2_parts(&self) -> UnwindParts<'_> {
+        let landing_pads = self.landing_pads.as_deref();
+        match self.entry(Address::Constant(0)) {
+            Ok(fde) => UnwindParts::Dwarf { fde, landing_pads },
+            Err(frame) => UnwindParts::Windows { len: frame.len, info: &frame.info, landing_pads },
+        }
+    }
+
     /// The function's `.eh_frame` entry, which a frame of Windows has none of.
     fn fde(&self, address: Address) -> Option<FrameDescriptionEntry> {
-        Some(match &self.frame {
-            Frame::Windows(_) => return None,
+        self.entry(address).ok()
+    }
+
+    /// The function's `.eh_frame` entry, or its frame of Windows.
+    fn entry(&self, address: Address) -> Result<FrameDescriptionEntry, &seh::Frame> {
+        Ok(match &self.frame {
+            Frame::Windows(frame) => return Err(frame),
             Frame::Cranelift(info) => info.to_fde(address),
             Frame::Rows(FrameRows { len, rows }) => {
                 let mut fde = FrameDescriptionEntry::new(address, *len);

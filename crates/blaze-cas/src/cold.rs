@@ -4,7 +4,10 @@
 //! long-distance matching over a wide window, on several threads. Chunks of hot outputs: LZ4,
 //! which decompresses at memory speed.
 
-use zstd::stream::raw::{CParameter, DParameter};
+use zstd::{
+    dict::{DecoderDictionary, EncoderDictionary},
+    stream::raw::{CParameter, DParameter},
+};
 
 /// One level for every cold value: compression is deterministic for a level and a dictionary.
 const LEVEL: i32 = 6;
@@ -49,20 +52,46 @@ pub(crate) fn train(samples: &[&[u8]]) -> Result<Vec<u8>, String> {
         .map_err(|error| format!("training a dictionary on {} values failed: {error}", samples.len()))
 }
 
-pub(crate) fn compress(dictionary: &[u8], raw: &[u8]) -> Result<Vec<u8>, String> {
-    zstd::bulk::Compressor::with_dictionary(LEVEL, dictionary)
-        .and_then(|mut compressor| compressor.compress(raw))
-        .map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
+/// A kind's dictionary, digested once for both directions. Loading 64 KiB of dictionary into a
+/// context costs more than compressing or decompressing a small value, so each put and read
+/// references this instead of loading the bytes.
+pub(crate) struct Prepared {
+    bytes: Vec<u8>,
+    encoder: EncoderDictionary<'static>,
+    decoder: DecoderDictionary<'static>,
 }
 
-/// One compressor for a batch of values of one kind: the dictionary is loaded once, not once a
-/// value. Without a dictionary its frames are read by [`decompress_long`].
-pub(crate) struct Batch(zstd::bulk::Compressor<'static>);
+// SAFETY: a `ZSTD_CDict` and a `ZSTD_DDict` are read-only once created; zstd.h says each can be
+// shared by many threads at once (`ZSTD_createCDict`, `ZSTD_createDDict`). `Prepared` makes them
+// in `new` and never hands out a way to change them. zstd-safe 7.3 does not say so itself
+// (v2/requests/store.md).
+unsafe impl Send for Prepared {}
+unsafe impl Sync for Prepared {}
 
-impl Batch {
-    pub(crate) fn new(dictionary: Option<&[u8]>) -> Result<Batch, String> {
+impl Prepared {
+    pub(crate) fn new(bytes: Vec<u8>) -> Prepared {
+        let encoder = EncoderDictionary::copy(&bytes, LEVEL);
+        let decoder = DecoderDictionary::copy(&bytes);
+        Prepared { bytes, encoder, decoder }
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+pub(crate) fn compress(dictionary: &Prepared, raw: &[u8]) -> Result<Vec<u8>, String> {
+    Batch::new(Some(dictionary))?.compress(raw)
+}
+
+/// One compressor for a batch of values of one kind. Without a dictionary its frames are read
+/// by [`decompress_long`].
+pub(crate) struct Batch<'d>(zstd::bulk::Compressor<'d>);
+
+impl<'d> Batch<'d> {
+    pub(crate) fn new(dictionary: Option<&'d Prepared>) -> Result<Batch<'d>, String> {
         match dictionary {
-            Some(dictionary) => zstd::bulk::Compressor::with_dictionary(LEVEL, dictionary),
+            Some(dictionary) => zstd::bulk::Compressor::with_prepared_dictionary(&dictionary.encoder),
             None => zstd::bulk::Compressor::new(LEVEL),
         }
         .map(Batch)
@@ -90,9 +119,9 @@ pub(crate) fn compress_long(raw: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Exactly `raw` bytes, or why not.
-pub(crate) fn decompress(dictionary: &[u8], stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn decompress(dictionary: &Prepared, stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
     let raw = usize::try_from(raw).map_err(|_| "its length does not fit in memory".to_owned())?;
-    let bytes = zstd::bulk::Decompressor::with_dictionary(dictionary)
+    let bytes = zstd::bulk::Decompressor::with_prepared_dictionary(&dictionary.decoder)
         .and_then(|mut decompressor| decompressor.decompress(stored, raw))
         .map_err(|error| format!("it does not decompress: {error}"))?;
     whole(bytes, raw)
@@ -149,20 +178,23 @@ mod tests {
     fn a_dictionary_trained_on_a_kind_shrinks_its_values_and_round_trips() {
         let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
         let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-        let dictionary = train(&refs).unwrap();
-        assert!(dictionary.len() <= DICTIONARY_SIZE);
+        let dictionary = Prepared::new(train(&refs).unwrap());
+        assert!(dictionary.bytes().len() <= DICTIONARY_SIZE);
+        let loaded = zstd::bulk::Decompressor::with_dictionary(dictionary.bytes());
         let value = sample(12_345);
         let stored = compress(&dictionary, &value).unwrap();
         assert!(stored.len() * 4 < value.len(), "{} of {}", stored.len(), value.len());
         assert_eq!(decompress(&dictionary, &stored, value.len() as u64).unwrap(), value);
         assert_eq!(compress(&dictionary, &value).unwrap(), stored, "deterministic");
+        let read = loaded.and_then(|mut it| it.decompress(&stored, value.len())).unwrap();
+        assert_eq!(read, value, "a frame of the prepared dictionary reads with its bytes loaded");
     }
 
     #[test]
     fn a_wrong_length_or_garbage_is_refused() {
         let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
         let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-        let dictionary = train(&refs).unwrap();
+        let dictionary = Prepared::new(train(&refs).unwrap());
         let value = sample(3);
         let stored = compress(&dictionary, &value).unwrap();
         assert!(decompress(&dictionary, &stored, value.len() as u64 + 1).is_err());
@@ -194,7 +226,7 @@ mod tests {
     fn a_batch_compresses_as_one_call_does_and_without_a_dictionary_reads_as_long() {
         let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
         let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-        let dictionary = train(&refs).unwrap();
+        let dictionary = Prepared::new(train(&refs).unwrap());
         let mut batch = Batch::new(Some(&dictionary)).unwrap();
         for n in [5, 6, 7] {
             let value = sample(n);

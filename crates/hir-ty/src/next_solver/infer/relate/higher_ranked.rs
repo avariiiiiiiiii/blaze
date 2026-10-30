@@ -1,11 +1,13 @@
 //! Helper routines for higher-ranked things. See the `doc` module at
 //! the end of the file for details.
 
-use rustc_type_ir::TypeFoldable;
+use rustc_type_ir::{TypeFoldable, UniverseIndex};
 use tracing::{debug, instrument};
 
 use crate::next_solver::fold::FnMutDelegate;
 use crate::next_solver::infer::InferCtxt;
+use crate::next_solver::infer::relate::RelateResult;
+use crate::next_solver::infer::snapshot::CombinedSnapshot;
 use crate::next_solver::{
     Binder, BoundConst, BoundRegion, BoundTy, Const, DbInterner, PlaceholderConst,
     PlaceholderRegion, PlaceholderType, Region, Ty,
@@ -73,5 +75,23 @@ impl<'db> InferCtxt<'db> {
         let value = self.enter_forall_and_leak_universe(forall);
         debug!(?value);
         f(value)
+    }
+
+    /// See [`RegionConstraintCollector::leak_check`]. We only check placeholder leaking into
+    /// `outer_universe`, i.e. placeholders which cannot be named by that universe.
+    ///
+    /// [`RegionConstraintCollector::leak_check`]: crate::next_solver::infer::region_constraints::RegionConstraintCollector::leak_check
+    pub fn leak_check(
+        &self,
+        outer_universe: UniverseIndex,
+        only_consider_snapshot: Option<&CombinedSnapshot>,
+    ) -> RelateResult<'db, ()> {
+        let max_universe = self.universe();
+        self.inner.borrow_mut().unwrap_region_constraints().leak_check(
+            self.interner,
+            outer_universe,
+            max_universe,
+            only_consider_snapshot,
+        )
     }
 }

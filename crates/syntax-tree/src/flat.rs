@@ -66,8 +66,10 @@ const _: () = assert!(
 );
 
 /// What parses a lazy node: called with the node's kind, its text and the tree's `data`, it
-/// gives a tree whose root is a node of that kind over exactly that text.
-pub type Expand = fn(kind: SyntaxKind, text: &str, data: u32) -> FlatTree;
+/// gives a tree whose root is a node of that kind over exactly that text, and the errors
+/// parsing it found, their ranges in that text.
+pub type Expand =
+    fn(kind: SyntaxKind, text: &str, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>);
 
 #[derive(Clone)]
 pub struct FlatTree {
@@ -96,9 +98,36 @@ pub struct FlatTree {
 #[derive(Clone)]
 struct Lazy {
     nodes: Box<[u32]>,
-    parts: Box<[OnceLock<Arc<FlatTree>>]>,
+    parts: Box<[OnceLock<Part>]>,
     expand: Expand,
     data: u32,
+}
+
+/// A lazy node's part once parsed: its tree and the errors parsing it found, both in the
+/// file's source.
+#[derive(Clone)]
+struct Part {
+    tree: Arc<FlatTree>,
+    errors: Box<[(TextRange, Box<str>)]>,
+}
+
+impl Part {
+    /// This part with its text at `to` in `source` instead of at `from`.
+    fn moved(&self, source: &Arc<str>, from: u32, to: u32) -> Part {
+        let moved = |range: TextRange| {
+            TextRange::at((u32::from(range.start()) - from + to).into(), range.len())
+        };
+        Part {
+            tree: Arc::new(FlatTree::clone(&self.tree).moved(source.clone(), from, to)),
+            errors: self.errors.iter().map(|(range, it)| (moved(*range), it.clone())).collect(),
+        }
+    }
+
+    fn heap_size(&self) -> usize {
+        let errors = self.errors.len() * std::mem::size_of::<(TextRange, Box<str>)>()
+            + self.errors.iter().map(|it| it.1.len()).sum::<usize>();
+        std::mem::size_of::<FlatTree>() + self.tree.heap_size() + errors
+    }
 }
 
 impl fmt::Debug for FlatTree {
@@ -289,15 +318,10 @@ fn in_range<T>(table: &[(u32, T)], lo: u32, hi: u32) -> &[(u32, T)] {
 
 /// `part`, parsed or not, as the part of a lazy node whose text moved from `from` to `to`,
 /// in `source`.
-fn moved_part(
-    part: &OnceLock<Arc<FlatTree>>,
-    source: &Arc<str>,
-    from: u32,
-    to: u32,
-) -> OnceLock<Arc<FlatTree>> {
+fn moved_part(part: &OnceLock<Part>, source: &Arc<str>, from: u32, to: u32) -> OnceLock<Part> {
     let moved = OnceLock::new();
     if let Some(part) = part.get() {
-        let _ = moved.set(Arc::new(FlatTree::clone(part).moved(source.clone(), from, to)));
+        let _ = moved.set(part.moved(source, from, to));
     }
     moved
 }
@@ -327,13 +351,14 @@ impl FlatTree {
         &self.source
     }
 
-    /// The bytes the tree holds besides itself: its arrays and the parts parsed so far, not
-    /// the source it shares.
+    /// The bytes the tree holds besides itself: its arrays and the parts parsed so far with
+    /// their errors, not the source it shares.
     pub fn heap_size(&self) -> usize {
         let lazy = self.lazy.as_ref().map_or(0, |lazy| {
-            lazy.nodes.len() * 4
-                + lazy.parts.len() * std::mem::size_of::<OnceLock<Arc<FlatTree>>>()
-                + lazy.parts.iter().filter_map(|it| it.get()).map(|it| it.heap_size()).sum::<usize>()
+            std::mem::size_of::<Lazy>()
+                + lazy.nodes.len() * 4
+                + lazy.parts.len() * std::mem::size_of::<OnceLock<Part>>()
+                + lazy.parts.iter().filter_map(|it| it.get()).map(Part::heap_size).sum::<usize>()
         });
         let columns = self.words.len() + self.ranks.len() + self.node_parents.len() + self.marks.len();
         let tables = self.far.len() + self.kinds.len() + self.big.len();
@@ -858,12 +883,89 @@ impl FlatTree {
         packer.finish(source, base, lazy)
     }
 
+    /// The tree with token `at`'s text replaced by `text` (its kind stays), over `source`, the
+    /// new whole text: `text` is `source` at the token's start, and the rest of the root's text
+    /// is as it was around it. No element but the token changes, so only its length and the
+    /// starts kept after it are written: every lazy node stays lazy and every part already
+    /// parsed is kept, those after the token moved to `source`.
+    pub fn replace_token(&self, at: u32, text: &str, source: Arc<str>) -> FlatTree {
+        let kind = self.kind(at);
+        assert!(self.is_token(at), "element {at} ({kind:?}) is not a token");
+        let (old, root) = (self.range(at), self.range(0));
+        let (base, start) = (u32::from(root.start()), u32::from(old.start()));
+        let (old_end, old_root_end) = (u32::from(old.end()), u32::from(root.end()));
+        let new_end = start as u64 + text.len() as u64;
+        let root_end = new_end + (old_root_end - old_end) as u64;
+        fn bytes(text: &str, from: u64, to: u64) -> Option<&[u8]> {
+            text.as_bytes().get(from as usize..to as usize)
+        }
+        let same = |from: u64, to: u64, old_from: u32, old_to: u32| {
+            let it = bytes(&source, from, to);
+            it.is_some() && it == bytes(&self.source, old_from as u64, old_to as u64)
+        };
+        assert!(
+            root_end <= u32::MAX as u64
+                && (old_root_end as usize != self.source.len() || root_end == source.len() as u64)
+                && bytes(&source, start as u64, new_end) == Some(text.as_bytes())
+                && same(base as u64, start as u64, base, start)
+                && same(new_end, root_end, old_end, old_root_end),
+            "the new text is not the old one with the {kind:?} at {old:?} replaced by {text:?}",
+        );
+        let new_end = new_end as u32;
+        let len = text.len() as u32;
+
+        let mut words = self.words.clone();
+        let mut big = self.big.to_vec();
+        if let Ok(it) = big.binary_search_by_key(&at, |it| it.0) {
+            big.remove(it);
+        }
+        let stored = match len < LONG {
+            true => len,
+            false => {
+                big.insert(big.partition_point(|it| it.0 < at), (at, len));
+                LONG
+            }
+        };
+        let word = &mut words[at as usize];
+        *word = (*word & !(LONG << VALUE)) | stored << VALUE;
+        let mut marks = self.marks.clone();
+        for (mark, start) in marks.iter_mut().enumerate() {
+            if mark as u32 * MARK > at {
+                *start = *start - old_end + new_end;
+            }
+        }
+        let lazy = self.lazy.as_ref().map(|lazy| {
+            let parts = lazy.nodes.iter().zip(lazy.parts.iter()).map(|(&it, part)| match it < at {
+                true => moved_part(part, &source, 0, 0),
+                false => moved_part(part, &source, old_end, new_end),
+            });
+            Box::new(Lazy {
+                nodes: lazy.nodes.clone(),
+                parts: parts.collect(),
+                expand: lazy.expand,
+                data: lazy.data,
+            })
+        });
+        FlatTree {
+            source,
+            words,
+            nodes: self.nodes.clone(),
+            ranks: self.ranks.clone(),
+            node_parents: self.node_parents.clone(),
+            far: self.far.clone(),
+            kinds: self.kinds.clone(),
+            big: exact(big),
+            marks,
+            lazy,
+        }
+    }
+
     /// The lazy nodes, in preorder.
     pub fn lazies(&self) -> impl Iterator<Item = u32> + '_ {
         self.lazy.iter().flat_map(|it| it.nodes.iter().copied())
     }
 
-    fn slot(&self, at: u32) -> &OnceLock<Arc<FlatTree>> {
+    fn slot(&self, at: u32) -> &OnceLock<Part> {
         let lazy = match (self.is_lazy(at), &self.lazy) {
             (true, Some(lazy)) => lazy,
             _ => panic!("element {at} ({:?}) is not a lazy node", self.kind(at)),
@@ -873,10 +975,21 @@ impl FlatTree {
     }
 
     /// The parsed part of lazy node `at`, parsed on the first call (on one thread, the others
-    /// waiting for it): a tree whose root is `at`'s kind and range, its ranges in the same
-    /// source (so absolute in the file), without lazy nodes of its own.
+    /// waiting for it), with its errors ([`Self::part_errors`]): a tree whose root is `at`'s
+    /// kind and range, its ranges in the same source (so absolute in the file), without lazy
+    /// nodes of its own.
     pub fn part(&self, at: u32) -> &Arc<FlatTree> {
-        self.slot(at).get_or_init(|| Arc::new(self.expand(at)))
+        &self.parsed(at).tree
+    }
+
+    /// The errors parsing lazy node `at`'s part found, their ranges in the same source (so
+    /// absolute in the file): the part is parsed if it was not yet, as by [`Self::part`].
+    pub fn part_errors(&self, at: u32) -> &[(TextRange, Box<str>)] {
+        &self.parsed(at).errors
+    }
+
+    fn parsed(&self, at: u32) -> &Part {
+        self.slot(at).get_or_init(|| self.expand(at))
     }
 
     /// Whether `at` is a lazy node whose part was parsed already.
@@ -884,11 +997,11 @@ impl FlatTree {
         self.is_lazy(at) && self.slot(at).get().is_some()
     }
 
-    fn expand(&self, at: u32) -> FlatTree {
+    fn expand(&self, at: u32) -> Part {
         let lazy = self.lazy.as_deref().expect("a lazy node's tree has an expander");
         let (kind, range) = (self.kind(at), self.range(at));
         let text = &self.source[range];
-        let part = (lazy.expand)(kind, text, lazy.data);
+        let (part, errors) = (lazy.expand)(kind, text, lazy.data);
         let root = part.range(0);
         assert!(
             !part.is_token(0)
@@ -900,7 +1013,12 @@ impl FlatTree {
              without lazy nodes: its root is a {:?} at {root:?}",
             part.kind(0),
         );
-        part.moved(self.source.clone(), root.start().into(), range.start().into())
+        if let Some((error, _)) = errors.iter().find(|it| it.0.end() > range.len()) {
+            panic!("the part of the lazy {kind:?} at {range:?} has an error past its text, at {error:?}");
+        }
+        let tree = part.moved(self.source.clone(), root.start().into(), range.start().into());
+        let errors = errors.into_iter().map(|(it, message)| (it + range.start(), message));
+        Part { tree: Arc::new(tree), errors: errors.collect() }
     }
 }
 
@@ -1074,6 +1192,7 @@ mod tests {
     use std::{
         collections::{hash_map::DefaultHasher, BTreeMap},
         hash::{Hash, Hasher},
+        ops::Range,
         sync::{
             atomic::{AtomicU32, AtomicUsize, Ordering},
             Arc, Barrier, Mutex,
@@ -1189,13 +1308,24 @@ mod tests {
         }
     }
 
-    /// The expander of the tests' outlines.
-    fn expand(kind: SyntaxKind, text: &str, data: u32) -> FlatTree {
+    /// The expander of the tests' outlines. Its error is the part's number, at the number.
+    fn expand(kind: SyntaxKind, text: &str, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
         assert_eq!(data, DATA);
-        let n: usize = text[1..text.find('>').expect("a part's number")].parse().unwrap();
+        let end = text.find('>').expect("a part's number");
+        let n: usize = text[1..end].parse().unwrap();
         let part = PARTS.lock().unwrap()[&n].clone();
         assert_eq!(part.kind(0), kind);
-        part
+        let at = TextRange::new(1.into(), (end as u32).into());
+        (part, vec![(at, n.to_string().into())])
+    }
+
+    /// The errors [`expand`] gives lazy node `at` of `tree`, absolute.
+    fn expanded_errors(tree: &FlatTree, at: u32) -> Vec<(TextRange, Box<str>)> {
+        let range = tree.range(at);
+        let text = &tree.text()[range];
+        let end = text.find('>').unwrap();
+        let at = TextRange::new(1.into(), (end as u32).into()) + range.start();
+        vec![(at, text[1..end].into())]
     }
 
     fn text_of(shape: &Shape, text: &mut String) {
@@ -1470,11 +1600,12 @@ mod tests {
 
     /// The ranges a node's checks look at when not every range: its own, its children's,
     /// those one byte shorter at either end, and the empty ones at their starts.
-    fn around(node: &SyntaxNode) -> Vec<TextRange> {
+    fn around(model: &Model, at: usize) -> Vec<TextRange> {
         let one = TextSize::from(1);
-        let mut ranges = vec![node.text_range(), TextRange::empty(node.text_range().end())];
-        for child in node.children_with_tokens() {
-            let range = child.text_range();
+        let node = &model.elements[at];
+        let mut ranges = vec![node.range, TextRange::empty(node.range.end())];
+        for &child in &node.children {
+            let range = model.elements[child].range;
             ranges.extend([range, TextRange::empty(range.start())]);
             if range.len() > one {
                 ranges.extend([
@@ -1486,39 +1617,37 @@ mod tests {
         ranges
     }
 
-    /// Every function of the cursor on every element of `flat` against `green`, the same tree:
+    /// Every function of the cursor on every element of `flat` against `model`, the same tree:
     /// with every range in every node when `exhaustive`, else the ranges [`around`] it.
-    fn compare(green: &SyntaxNode, flat: &SyntaxNode, exhaustive: bool, seed: u64) {
-        assert_eq!(green.to_string(), flat.to_string());
-        let (greens, flats) = (elements(green), elements(flat));
-        assert_eq!(greens.len(), flats.len());
-        for (g, f) in greens.iter().zip(&flats) {
-            assert_eq!(describe(Some(g.clone())), describe(Some(f.clone())), "seed {seed}");
-            assert_eq!(g.index(), f.index());
-            assert_eq!(describe(g.parent().map(Into::into)), describe(f.parent().map(Into::into)));
-            assert_eq!(describe(g.next_sibling_or_token()), describe(f.next_sibling_or_token()));
-            assert_eq!(describe(g.prev_sibling_or_token()), describe(f.prev_sibling_or_token()));
-            assert_eq!(
-                describe(g.first_token().map(Into::into)),
-                describe(f.first_token().map(Into::into))
-            );
-            assert_eq!(
-                describe(g.last_token().map(Into::into)),
-                describe(f.last_token().map(Into::into))
-            );
-            match (g, f) {
-                (NodeOrToken::Node(g), NodeOrToken::Node(f)) => {
+    fn compare(model: &Model, flat: &SyntaxNode, exhaustive: bool, seed: u64) {
+        assert_eq!(model.text(0), flat.to_string());
+        let flats = elements(flat);
+        assert_eq!(model.elements.len(), flats.len());
+        for (m, f) in flats.iter().enumerate() {
+            let element = &model.elements[m];
+            assert_eq!(model.describe(Some(m)), describe(Some(f.clone())), "seed {seed}");
+            assert_eq!(element.index, f.index());
+            assert_eq!(model.describe(element.parent), describe(f.parent().map(Into::into)));
+            assert_eq!(model.describe(model.sibling(m, true)), describe(f.next_sibling_or_token()));
+            assert_eq!(model.describe(model.sibling(m, false)), describe(f.prev_sibling_or_token()));
+            assert_eq!(model.describe(model.first_token(m)), describe(f.first_token().map(Into::into)));
+            assert_eq!(model.describe(model.last_token(m)), describe(f.last_token().map(Into::into)));
+            match f {
+                NodeOrToken::Node(f) => {
                     let node = |it: Option<SyntaxNode>| describe(it.map(Into::into));
-                    assert_eq!(node(g.first_child()), node(f.first_child()));
-                    assert_eq!(node(g.last_child()), node(f.last_child()));
-                    assert_eq!(node(g.next_sibling()), node(f.next_sibling()));
-                    assert_eq!(node(g.prev_sibling()), node(f.prev_sibling()));
-                    assert_eq!(describe(g.first_child_or_token()), describe(f.first_child_or_token()));
-                    assert_eq!(describe(g.last_child_or_token()), describe(f.last_child_or_token()));
-                    assert_eq!(g.green(), f.green());
-                    assert_eq!(g.text().to_string(), f.text().to_string());
-                    assert_eq!(g.first_child_token_text(), f.first_child_token_text());
-                    let range = g.text_range();
+                    let children = &element.children;
+                    let first = children.iter().copied().find(|&it| !model.is_token(it));
+                    let last = children.iter().copied().rev().find(|&it| !model.is_token(it));
+                    assert_eq!(model.describe(first), node(f.first_child()));
+                    assert_eq!(model.describe(last), node(f.last_child()));
+                    assert_eq!(model.describe(model.node_sibling(m, true)), node(f.next_sibling()));
+                    assert_eq!(model.describe(model.node_sibling(m, false)), node(f.prev_sibling()));
+                    assert_eq!(model.describe(children.first().copied()), describe(f.first_child_or_token()));
+                    assert_eq!(model.describe(children.last().copied()), describe(f.last_child_or_token()));
+                    assert_eq!(model.text(m), f.text().to_string());
+                    let first_text = children.first().and_then(|&it| model.elements[it].text.as_deref());
+                    assert_eq!(first_text, f.first_child_token_text());
+                    let range = element.range;
                     let (start, end) = (u32::from(range.start()), u32::from(range.end()));
                     let ranges: Vec<TextRange> = match exhaustive {
                         true => (start..=end)
@@ -1526,16 +1655,16 @@ mod tests {
                                 (from..=end).map(move |to| TextRange::new(from.into(), to.into()))
                             })
                             .collect(),
-                        false => around(g),
+                        false => around(model, m),
                     };
                     for &at in &ranges {
                         assert_eq!(
-                            describe(g.child_or_token_at_range(at)),
+                            model.describe(model.child_at_range(m, at)),
                             describe(f.child_or_token_at_range(at)),
                             "seed {seed}, {at:?} in {range:?}"
                         );
                         assert_eq!(
-                            describe(Some(g.covering_element(at))),
+                            model.describe(Some(model.covering(m, at))),
                             describe(Some(f.covering_element(at)))
                         );
                         for kind in (0..5).chain(100..105).map(SyntaxKind) {
@@ -1548,8 +1677,8 @@ mod tests {
                             let found =
                                 f.flat_node_at_range(at, kind).unwrap_or_else(|| stepped(f));
                             assert_eq!(
-                                stepped(g).map(|it| describe(Some(it.into()))),
-                                found.map(|it| describe(Some(it.into()))),
+                                model.describe(model.stepped(m, at, kind)),
+                                found.and_then(|it| describe(Some(it.into()))),
                                 "seed {seed}, {kind:?} at {at:?}"
                             );
                         }
@@ -1560,20 +1689,25 @@ mod tests {
                     };
                     for offset in offsets {
                         let offset = TextSize::from(offset);
-                        let tokens = |it: TokenAtOffset<_>| {
-                            it.map(|it| describe(Some(NodeOrToken::Token(it)))).collect::<Vec<_>>()
-                        };
-                        assert_eq!(tokens(g.token_at_offset(offset)), tokens(f.token_at_offset(offset)));
+                        let expected: Vec<Described> =
+                            model.tokens_at(m, offset).into_iter().map(|it| model.describe(Some(it))).collect();
+                        let found = f.token_at_offset(offset);
+                        assert_eq!(found.clone().count(), expected.len(), "seed {seed}, {offset:?}");
+                        assert!(matches!(
+                            (&found, expected.len()),
+                            (TokenAtOffset::None, 0) | (TokenAtOffset::Single(_), 1) | (TokenAtOffset::Between(..), 2)
+                        ));
+                        let found: Vec<Described> =
+                            found.map(|it| describe(Some(NodeOrToken::Token(it)))).collect();
+                        assert_eq!(found, expected, "seed {seed}, {offset:?}");
                     }
                 }
-                (NodeOrToken::Token(g), NodeOrToken::Token(f)) => {
-                    assert_eq!(g.text(), f.text());
-                    assert_eq!(g.green(), f.green());
+                NodeOrToken::Token(f) => {
+                    assert_eq!(element.text.as_deref(), Some(f.text()));
                     let token = |it: Option<_>| describe(it.map(NodeOrToken::Token));
-                    assert_eq!(token(g.next_token()), token(f.next_token()));
-                    assert_eq!(token(g.prev_token()), token(f.prev_token()));
+                    assert_eq!(model.describe(model.token(m, true)), token(f.next_token()));
+                    assert_eq!(model.describe(model.token(m, false)), token(f.prev_token()));
                 }
-                _ => unreachable!(),
             }
         }
         let hash = |it: &SyntaxNode| {
@@ -1587,51 +1721,43 @@ mod tests {
             let (tree, at) = it.flat().unwrap();
             (at..tree.end(at)).all(|it| !tree.is_lazy(it))
         };
-        for (g, f) in greens.iter().zip(&flats).filter(|(g, _)| g.as_node().is_some()) {
-            let (g, f) = (g.as_node().unwrap(), f.as_node().unwrap());
-            let replacement = g.green().to_owned();
-            assert_eq!(g.replace_with(replacement.clone()), f.replace_with(replacement));
-            assert_eq!(g.clone_subtree().to_string(), f.clone_subtree().to_string());
+        for (m, f) in flats.iter().enumerate().filter(|(_, f)| f.as_node().is_some()) {
+            let (element, f) = (&model.elements[m], f.as_node().unwrap());
             let alone = f.clone_subtree();
-            assert_eq!(alone.green(), g.green());
+            assert_eq!(alone.to_string(), model.text(m));
+            let start = element.range.start();
+            let copied: Vec<Described> = elements(&alone).into_iter().map(|it| describe(Some(it))).collect();
+            let expected: Vec<Described> = (m..element.end)
+                .map(|it| model.describe(Some(it)).map(|(kind, range, token)| (kind, range - start, token)))
+                .collect();
+            assert_eq!(copied, expected, "seed {seed}");
+            assert!(alone.parent().is_none());
             assert_eq!(hash(f), hash(&alone), "seed {seed}");
             if full(f) {
                 let mut again = FlatTreeBuilder::new();
-                for event in g.preorder_with_tokens() {
-                    match event {
-                        WalkEvent::Enter(NodeOrToken::Node(it)) => again.start_node(it.kind()),
-                        WalkEvent::Enter(NodeOrToken::Token(it)) => again.token(it.kind(), it.text()),
-                        WalkEvent::Leave(NodeOrToken::Node(_)) => again.finish_node(),
-                        WalkEvent::Leave(NodeOrToken::Token(_)) => {}
-                    }
-                }
+                model.build(m, &mut again);
                 assert_eq!(alone.flat_tree().map(|it| &**it), Some(&again.finish()));
             }
-            if exhaustive {
-                let twin = g.to_flat();
-                assert_eq!(describe(Some(twin.clone().into())), describe(Some(f.clone().into())));
-                assert_eq!(twin.parent().is_none(), g.parent().is_none());
-                if full(f) {
-                    assert_eq!(hash(&twin), hash(f));
-                }
+            assert_eq!(f.to_flat(), *f);
+            let of_kind = |it: &usize, kind: SyntaxKind| model.elements[*it].kind == kind;
+            for kind in (0..5).chain(100..105).map(SyntaxKind) {
+                let ancestor = model.ancestors(Some(m)).find(|it| of_kind(it, kind));
+                let node = |it: Option<SyntaxNode>| describe(it.map(Into::into));
+                assert_eq!(model.describe(ancestor), node(f.ancestor_where(|it| it == kind)));
+                let child = element.children.iter().find(|&it| !model.is_token(*it) && of_kind(it, kind));
+                assert_eq!(model.describe(child.copied()), node(f.child_where(|it| it == kind)));
+                let token = element.children.iter().find(|&it| model.is_token(*it) && of_kind(it, kind));
+                let found = f.child_token(kind).map(NodeOrToken::Token);
+                assert_eq!(model.describe(token.copied()), describe(found));
             }
-            for node in [g, f] {
-                for kind in (0..5).chain(100..105).map(SyntaxKind) {
-                    let ancestor = node.ancestors().find(|it| it.kind() == kind);
-                    assert_eq!(node.ancestor_where(|it| it == kind), ancestor);
-                    let child = node.children().find(|it| it.kind() == kind);
-                    assert_eq!(node.child_where(|it| it == kind), child);
-                    let token = node
-                        .children_with_tokens()
-                        .filter_map(NodeOrToken::into_token)
-                        .find(|it| it.kind() == kind);
-                    assert_eq!(node.child_token(kind), token);
-                }
-                let mut odd = node.children_where();
-                let by_kind = std::iter::from_fn(|| odd.next_where(|it| it.0 % 2 == 1));
-                let children = node.children().filter(|it| it.kind().0 % 2 == 1);
-                assert!(by_kind.eq(children));
-            }
+            let mut odd = f.children_where();
+            let by_kind = std::iter::from_fn(|| odd.next_where(|it| it.0 % 2 == 1));
+            let by_kind: Vec<Described> = by_kind.map(|it| describe(Some(it.into()))).collect();
+            let children: Vec<Described> = (element.children.iter().copied())
+                .filter(|&it| !model.is_token(it) && model.elements[it].kind.0 % 2 == 1)
+                .map(|it| model.describe(Some(it)))
+                .collect();
+            assert_eq!(by_kind, children);
             let (tree, at) = f.flat().unwrap();
             if !tree.is_lazy(at) {
                 let children: Vec<_> = f.children().collect();
@@ -1648,11 +1774,11 @@ mod tests {
     }
 
     #[test]
-    fn a_flat_tree_answers_as_a_green_one() {
+    fn a_flat_tree_answers_as_its_model() {
         for seed in 0..2000 {
             let shape = random_shape(seed);
             let flat = SyntaxNode::new_flat_root(Arc::new(build_flat(&shape, seed % 2 == 1)));
-            compare(&build_green(&shape), &flat, true, seed);
+            compare(&Model::new(&shape), &flat, true, seed);
         }
         for seed in 0..4 {
             let shape = big_shape(seed);
@@ -1660,7 +1786,7 @@ mod tests {
             assert!(tree.big.iter().any(|&(it, _)| tree.is_token(it)), "a token past the word");
             assert!(tree.far.len() >= 50, "parents past the word: {}", tree.far.len());
             assert!(!tree.kinds.is_empty(), "kinds past the word");
-            compare(&build_green(&shape), &SyntaxNode::new_flat_root(Arc::new(tree)), false, seed);
+            compare(&Model::new(&shape), &SyntaxNode::new_flat_root(Arc::new(tree)), false, seed);
         }
     }
 
@@ -1736,11 +1862,12 @@ mod tests {
             assert_eq!(tree.descendants(0).filter(|&it| tree.is_lazy(it)).count(), lazies.len());
             let _ = tree.subtree(0);
             assert!(lazies.iter().all(|&at| !tree.is_parsed(at)));
-            compare(&build_green(&shape), &outline, !big, seed);
+            compare(&Model::new(&shape), &outline, !big, seed);
             for &at in &lazies {
                 let node = outline.flat_element(at).into_node().unwrap();
                 assert!(!node.is_lazy() && tree.is_parsed(at));
                 let part = tree.part(at);
+                assert_eq!(tree.part_errors(at), &expanded_errors(&tree, at)[..]);
                 assert!(Arc::ptr_eq(part.source(), tree.source()));
                 assert_eq!((part.kind(0), part.range(0)), (tree.kind(at), tree.range(at)));
                 assert_eq!(part.lazies().count(), 0);
@@ -1767,7 +1894,7 @@ mod tests {
     #[test]
     fn a_part_is_parsed_once_whichever_thread_asks() {
         static CALLS: AtomicU32 = AtomicU32::new(0);
-        fn counting(kind: SyntaxKind, text: &str, data: u32) -> FlatTree {
+        fn counting(kind: SyntaxKind, text: &str, data: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
             CALLS.fetch_add(1, Ordering::SeqCst);
             std::thread::sleep(std::time::Duration::from_millis(20));
             expand(kind, text, data)
@@ -1778,7 +1905,7 @@ mod tests {
             Shape::Token(SyntaxKind(2), "}".into()),
         ];
         let children = vec![Shape::Token(SyntaxKind(1), "fn".into()), lazy_node(SyntaxKind(101), body)];
-        let tree = build_outline(&Shape::Node(SyntaxKind(100), children, None), counting);
+        let tree = build_outline(&Shape::Node(SyntaxKind(100), children.clone(), None), counting);
         let at = tree.lazies().next().unwrap();
         let barrier = Barrier::new(4);
         let parts: Vec<Arc<FlatTree>> = std::thread::scope(|scope| {
@@ -1794,8 +1921,18 @@ mod tests {
         });
         assert!(parts.iter().all(|it| Arc::ptr_eq(it, &parts[0])));
         assert!(Arc::ptr_eq(&parts[0], tree.part(at)));
+        assert_eq!(tree.part_errors(at), &expanded_errors(&tree, at)[..]);
         assert_eq!(CALLS.load(Ordering::SeqCst), 1);
         assert!(tree.is_parsed(at));
+
+        // Asking for the errors first parses the part, once.
+        let tree = build_outline(&Shape::Node(SyntaxKind(100), children, None), counting);
+        let at = tree.lazies().next().unwrap();
+        let before = tree.heap_size();
+        assert_eq!(tree.part_errors(at), &expanded_errors(&tree, at)[..]);
+        assert!(tree.is_parsed(at) && tree.heap_size() > before);
+        let _ = tree.part(at);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1846,12 +1983,12 @@ mod tests {
     #[test]
     #[should_panic(expected = "the part of the lazy")]
     fn a_part_must_be_its_lazy_node_over_its_text() {
-        fn short(kind: SyntaxKind, text: &str, _: u32) -> FlatTree {
+        fn short(kind: SyntaxKind, text: &str, _: u32) -> (FlatTree, Vec<(TextRange, Box<str>)>) {
             let mut builder = FlatTreeBuilder::new();
             builder.start_node(kind);
             builder.token(SyntaxKind(1), &text[1..]);
             builder.finish_node();
-            builder.finish()
+            (builder.finish(), Vec::new())
         }
         let mut builder = FlatTreeBuilder::sourced("{x}".into());
         builder.start_node(SyntaxKind(100));
@@ -1926,10 +2063,95 @@ mod tests {
             assert!(spliced.lazies().eq(built.lazies()));
             assert_eq!(spliced.lazies().filter(|&it| spliced.is_parsed(it)).count(), carried);
             for it in spliced.lazies() {
+                let parsed = spliced.is_parsed(it);
                 assert_eq!(spliced.part(it), built.part(it), "seed {seed}, lazy {it}");
+                assert_eq!(spliced.part_errors(it), built.part_errors(it), "seed {seed}, {parsed}");
+                assert_eq!(spliced.part_errors(it), &expanded_errors(&spliced, it)[..]);
             }
-            compare(&build_green(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), true, seed);
+            // A copy of a subtree keeps the parts parsed, their errors moved with them.
+            let copy = spliced.subtree(at);
+            for it in copy.lazies() {
+                assert!(copy.is_parsed(it), "seed {seed}");
+                assert_eq!(copy.part_errors(it), &expanded_errors(&copy, it)[..], "seed {seed}");
+            }
+            compare(&Model::new(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), true, seed);
         }
+    }
+
+    #[test]
+    fn replacing_a_token_is_building_the_edited_tree() {
+        for seed in 0..1000 {
+            let mut rng = Rng::new(seed ^ 0x7f4a);
+            let mut shape = random_shape(seed);
+            let outline = seed % 2 == 1;
+            if outline {
+                make_lazy(&mut shape, &mut rng);
+            }
+            let mut tree = match outline {
+                true => build_outline(&shape, expand),
+                false => Arc::new(build_flat(&shape, seed % 4 == 2)),
+            };
+            for (i, at) in tree.lazies().enumerate() {
+                if i % 2 == 0 {
+                    let _ = tree.part(at);
+                }
+            }
+            // A few replacements in a row, so a long token is also made short again.
+            for step in 0..3 {
+                let tokens: Vec<u32> = (0..tree.len()).filter(|&it| tree.is_token(it)).collect();
+                if tokens.is_empty() {
+                    break;
+                }
+                let at = tokens[rng.below(tokens.len() as u64) as usize];
+                let text = match rng.below(5) {
+                    0 => String::new(),
+                    1 => "x".into(),
+                    2 => "abc".into(),
+                    3 => "y".repeat(LONG as usize + rng.below(3) as usize),
+                    _ => "é".into(),
+                };
+                let edited = replaced(&shape, at, &Shape::Token(tree.kind(at), text.clone()), &mut 0);
+                let mut source = String::new();
+                text_of(&edited, &mut source);
+                let parsed: Vec<u32> = tree.lazies().filter(|&it| tree.is_parsed(it)).collect();
+                let new = tree.replace_token(at, &text, source.into());
+                let built = match outline {
+                    true => build_outline(&edited, expand),
+                    false => Arc::new(build_flat(&edited, false)),
+                };
+                assert_eq!(new, *built, "seed {seed}, step {step}");
+                for it in 0..built.len() {
+                    assert_eq!(
+                        (new.parent(it), new.range(it), new.end(it), new.is_lazy(it)),
+                        (built.parent(it), built.range(it), built.end(it), built.is_lazy(it)),
+                        "seed {seed}, step {step}, element {it}"
+                    );
+                }
+                assert!(new.lazies().eq(built.lazies()));
+                assert!(new.lazies().filter(|&it| new.is_parsed(it)).eq(parsed.iter().copied()));
+                for &it in &parsed {
+                    assert_eq!(new.part(it), built.part(it), "seed {seed}, lazy {it}");
+                    assert_eq!(new.part_errors(it), &expanded_errors(&new, it)[..]);
+                    assert!(Arc::ptr_eq(new.part(it).source(), new.source()));
+                }
+                compare(&Model::new(&edited), &SyntaxNode::new_flat_root(Arc::new(new.clone())), false, seed);
+                assert!(new.lazies().filter(|&it| !parsed.contains(&it)).all(|it| !new.is_parsed(it)));
+                (shape, tree) = (edited, Arc::new(new));
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "is not the old one")]
+    fn a_token_is_replaced_only_by_its_text() {
+        let shape = Shape::Node(
+            SyntaxKind(100),
+            vec![Shape::Token(SyntaxKind(1), "ab".into()), Shape::Token(SyntaxKind(2), "c".into())],
+            None,
+        );
+        let tree = build_flat(&shape, false);
+        let _ = tree.replace_token(1, "zz", "zzc".into());
+        let _ = tree.replace_token(1, "zz", tree.source().clone());
     }
 
     #[test]
@@ -1946,7 +2168,7 @@ mod tests {
             let built = build_flat(&edited, true);
             assert_eq!(spliced, built);
             assert!((0..built.len()).all(|it| spliced.parent(it) == built.parent(it)));
-            compare(&build_green(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), false, seed);
+            compare(&Model::new(&edited), &SyntaxNode::new_flat_root(Arc::new(spliced)), false, seed);
         }
     }
 
@@ -1959,6 +2181,72 @@ mod tests {
             for (j, b) in again.iter().enumerate() {
                 assert_eq!(a == b, i == j);
             }
+        }
+    }
+
+    /// Every element of `shape` in preorder, as a tree of its own.
+    fn preorder(shape: &Shape, out: &mut Vec<Shape>) {
+        out.push(shape.clone());
+        if let Shape::Node(_, children, _) = shape {
+            children.iter().for_each(|it| preorder(it, out));
+        }
+    }
+
+    /// `shape` in full with the children `range` of its element `at` replaced by `with`,
+    /// `next` the number of `shape` in it.
+    fn spliced(shape: &Shape, at: usize, range: &Range<usize>, with: &[Shape], next: &mut usize) -> Shape {
+        let here = *next;
+        *next += 1;
+        match shape {
+            Shape::Node(kind, children, _) => {
+                let mut children: Vec<Shape> =
+                    children.iter().map(|it| spliced(it, at, range, with, next)).collect();
+                if here == at {
+                    children.splice(range.clone(), with.iter().cloned());
+                }
+                Shape::Node(*kind, children, None)
+            }
+            token => token.clone(),
+        }
+    }
+
+    #[test]
+    fn splicing_children_is_building_the_edited_tree() {
+        for seed in 0..1000 {
+            let mut rng = Rng::new(seed ^ 0x5bd1);
+            let mut shape = random_shape(seed);
+            let outline = seed % 2 == 1;
+            if outline {
+                make_lazy(&mut shape, &mut rng);
+            }
+            let root = match outline {
+                true => SyntaxNode::new_flat_root(build_outline(&shape, expand)),
+                false => SyntaxNode::new_flat_root(Arc::new(build_flat(&shape, seed % 4 == 2))),
+            };
+            let all = elements(&root);
+            let nodes: Vec<usize> = (0..all.len()).filter(|&it| all[it].as_node().is_some()).collect();
+            let at = nodes[rng.below(nodes.len() as u64) as usize];
+            let node = all[at].as_node().unwrap().clone();
+            let n = node.children_with_tokens().count();
+            let from = rng.below(n as u64 + 1) as usize;
+            let to = from + rng.below((n - from) as u64 + 1) as usize;
+            // What goes in: elements of this tree (even `node` or the root) and of another.
+            let other_shape = random_shape(seed + 20_000);
+            let other = SyntaxNode::new_flat_root(Arc::new(build_flat(&other_shape, false)));
+            let (mut pool, mut shapes) = (all.clone(), Vec::new());
+            pool.extend(elements(&other));
+            preorder(&shape, &mut shapes);
+            preorder(&other_shape, &mut shapes);
+            let picks: Vec<usize> = (0..rng.below(4)).map(|_| rng.below(pool.len() as u64) as usize).collect();
+            let with: Vec<SyntaxElement> = picks.iter().map(|&it| pool[it].clone()).collect();
+            let with_shapes: Vec<Shape> = picks.iter().map(|&it| shapes[it].clone()).collect();
+            let new = node.splice_children(from..to, &with);
+            let edited = spliced(&shape, at, &(from..to), &with_shapes, &mut 0);
+            assert!(new.parent().is_none() && new != root);
+            assert_eq!(**new.flat_tree().unwrap(), build_flat(&edited, false), "seed {seed}");
+            compare(&Model::new(&edited), &new, true, seed);
+            // The tree spliced is as it was.
+            compare(&Model::new(&shape), &root, false, seed);
         }
     }
 }

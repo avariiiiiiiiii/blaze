@@ -62,6 +62,11 @@ pub struct Slot(pub u32);
 pub struct Change<'a> {
     pub added: Vec<&'a CompiledFunction>,
     pub removed: Vec<InstanceKey>,
+    /// Slots that run another function than the one they are named for, as `(slot, function)`:
+    /// a tiered function's LLVM code in the slot its Cranelift code filled (codegen's
+    /// `TieredUp::replaced`), an edited function in the slot its callers call. The function
+    /// is in `added` or already linked; only an image with a jump table has slots.
+    pub slots: Vec<(InstanceKey, InstanceKey)>,
     pub statics: Vec<&'a Static>,
     pub removed_statics: Vec<(ItemKey, ContentId)>,
     /// Names Rust code defines (`#[no_mangle]`, `#[export_name]`, the entry point's callee),
@@ -187,6 +192,7 @@ impl Image {
             write: FxHashSet::default(),
             changed: FxHashSet::default(),
             removed: Vec::new(),
+            emptied: Vec::new(),
             touched: Vec::new(),
             counted: Vec::new(),
             full,

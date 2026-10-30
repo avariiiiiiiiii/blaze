@@ -54,6 +54,8 @@ runs as before.
 3. Any test of `text()` that compares the whole module needs the new `main` and the module
    at its end; the text after `MARKED` is exactly `FORK_SERVER`.
 
+> forwarded to codegen: `crates/blaze-engine/` is codegen's.
+
 ## To the sandbox lane
 
 - A forked test's sandbox must allow `connect()` to the Unix socket named in the command's
@@ -62,3 +64,5 @@ runs as before.
 - The fork server marks each forked child's scope with `access("/.blaze-test/<name>")` before
   the test runs, like `marked::Marked`. Tracing scoped per process after `fork` (every thread
   of the child is that test) would make the scope hold for threads the test spawns too.
+
+> forwarded to usercode: the sandbox is usercode's (`crates/blaze-cargo/src/sandbox*`, usercode-sandbox).

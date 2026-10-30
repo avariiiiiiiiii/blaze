@@ -200,6 +200,65 @@ def selftest() -> list[str]:
         {"name": "nushell body", "verdict": "fail", "detail": "took 80 ms", "numbers": {"ms": 80, "budget": 30}}]})])
     if "| nushell body | fail | ms=80  budget=30 | took 80 ms |" not in md:
         wrong.append(f"markdown has no row of the budget:\n{md}")
+    return wrong + v2_work_wrong()
+
+
+def v2_work_wrong() -> list[str]:
+    """`engine.V2` reading what requests did from the `blaze-work` lines of canned output, the
+    form `blaze_ui::api::work_json` prints."""
+    line = ('{"reason": "blaze-work", "reran": %d, "green": 300, "compiled": %d, "found": 40, '
+            '"link": "%s", "critical_path_us": %d}')
+
+    class Canned(engine.V2):
+        def __init__(self, said: list[str]):
+            super().__init__(engine.EngineSpec("v2", sys.executable))
+            self.said = said
+
+        def command(self, step: str, command: str, args: list[str], ws: Path, env: dict[str, str],
+                    timeout: float = 7200) -> engine.Ran:
+            return engine.Ran((command, *args), 0.1, 0, self.said.pop(0), "")
+
+    wrong: list[str] = []
+    home, ws = Path("/h"), Path("/w")
+    env = {"BLAZE_HOME": str(home)}
+    json_ = ["--message-format=json"]
+    eng = Canned(['{"reason": "compiler-artifact"}\n' + line % (12, 2, "patched", 1500) + "\n",
+                  line % (3, 1, "placed", 2_500_000) + "\n", "test a ... ok\n" + line % (1, 0, "patched", 9) + "\n"])
+    eng.build("cold", ws, env, json_)
+    mark = eng.mark(home)
+    eng.build("edit", ws, env, json_)
+    eng.build("tests", ws, env, json_, command="test")
+    work = eng.work_since(home, mark)
+    if (work.compiled, work.reran, work.found, work.green) != (1, 4, 80, 600):
+        wrong.append(f"V2.work_since sums {work}")
+    if work.link != "placed whole: edit (`blaze build --message-format=json`)":
+        wrong.append(f"V2.work_since: link {work.link!r}")
+    if eng.critical_path_s(ws, env) != 9e-6:
+        wrong.append(f"V2.critical_path_s: {eng.critical_path_s(ws, env)}")
+    for args, said in ((json_, "test a ... ok\n"), ([], line % (1, 1, "patched", 1))):
+        mark = eng.mark(home)
+        eng.said.append(said)
+        eng.build("unsaid", ws, env, args, command="test")
+        try:
+            eng.work_since(home, mark)
+            wrong.append(f"V2.work_since counted a request with args {args} that said {said!r}")
+        except engine.Failed as e:
+            if "unsaid (`blaze test" not in str(e) or "no `blaze-work` line" not in str(e):
+                wrong.append(f"V2.work_since: {e}")
+        try:
+            eng.critical_path_s(ws, env)
+            wrong.append("V2.critical_path_s read a request that printed no `blaze-work` line")
+        except engine.Failed:
+            pass
+    bad = [line % (1, 1, "spliced", 1), line.replace('"found": 40', '"found": -1') % (1, 1, "patched", 1)]
+    for said in bad:
+        try:
+            engine.required("bad", engine.worked_lines(said)[0])
+            wrong.append(f"engine.required took {said}")
+        except engine.Failed:
+            pass
+    if len(engine.worked_lines(line % (1, 1, "patched", 1) + "\n{not json\n")) != 1:
+        wrong.append("engine.worked_lines does not skip a line that is not JSON")
     return wrong
 
 

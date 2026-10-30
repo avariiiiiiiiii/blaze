@@ -6,7 +6,8 @@
 //! - `reachable`: `unreachable_code` (typeck).
 //! - `patterns`: what match checking lints (`unreachable_patterns`, `bindings_with_variant_name`,
 //!   `irrefutable_let_patterns`).
-//! - `recursion`: `unconditional_recursion` (MIR building).
+//! - `recursion`: `unconditional_recursion` (the MIR lints of calls, and of drops after drop
+//!   elaboration).
 //! - `unsafety`: `unused_unsafe` (`check_unsafety`).
 //! - `liveness`: `unused_variables`, `unused_assignments` (`check_liveness`).
 //! - `panics`: `arithmetic_overflow`, `unconditional_panic` (the known-panics lint).
@@ -14,8 +15,9 @@
 //!
 //! Follows rustc's `compiler/rustc_interface/src/passes.rs` (`run_required_analyses`: each body
 //! owner's `check_unsafety`, which builds its MIR and so checks its matches first, then
-//! `mir_borrowck`, `check_liveness` and `mir_drops_elaborated_and_const_checked`, in the order
-//! of `hir_crate_items(()).body_owners`), `compiler/rustc_lint/src/late.rs` (`LateContextAndPass`:
+//! `mir_borrowck`, which first runs the MIR lints of `mir_promoted`, `check_liveness` and, when
+//! rustc makes code, `mir_drops_elaborated_and_const_checked`, in the order of
+//! `hir_crate_items(()).body_owners`), `compiler/rustc_lint/src/late.rs` (`LateContextAndPass`:
 //! each node's `check_*` before its children's, every pass at each node) and
 //! `compiler/rustc_lint/src/lib.rs` (`BuiltinCombinedLateLintModPass`: the order of the passes)
 //! (MIT or Apache-2.0).
@@ -36,12 +38,16 @@ use hir_def::{
     expr_store::{Body, BodySourceMap, ExpressionStore},
     hir::{Array, BindingId, Expr, ExprId, Pat, PatId, Statement},
     nameres::demand::every_body,
+    signatures::FunctionSignature,
     src::HasSource as _,
 };
-use hir_ty::{InferBodyId, InferenceDiagnostic, InferenceResult, PathLoweringDiagnostic, TyLoweringDiagnostic, mir::MirBody};
+use hir_ty::{
+    InferBodyId, InferenceDiagnostic, InferenceResult, PathLoweringDiagnostic, TyLoweringDiagnostic,
+    mir::{MirBody, MirSpan},
+};
 use rustc_hash::FxHashMap;
 use span::FileId;
-use syntax::{SyntaxNodePtr, TextSize};
+use syntax::{SyntaxNodePtr, TextRange, TextSize};
 
 use crate::{
     cx::Cx,
@@ -51,16 +57,20 @@ use crate::{
 
 /// What type checking, match checking, unsafety checking, liveness and the MIR lints lint in
 /// the crate's bodies, given whatever else failed: each body in rustc's order, its typeck's
-/// lints at [`Phase::Bodies`], the rest at [`Phase::Mir`].
-pub(crate) fn before_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
+/// lints at [`Phase::Bodies`], the rest at [`Phase::Mir`]. `codegen` is whether rustc makes
+/// code of the crate (`--emit` asks for more than metadata: `cargo build`, not `cargo check`),
+/// which runs the lints after drop elaboration on every body, not only on those of consts.
+pub(crate) fn before_abort(cx: &Cx<'_, '_>, codegen: bool) -> Vec<Found> {
     let mut found = Vec::new();
     for owner in body_owners(cx) {
-        let Some(b) = BodyCx::new(cx, owner) else { continue };
+        let Some(mut b) = BodyCx::new(cx, owner) else { continue };
+        b.elaborated = codegen || b.is_const_context();
         found.extend(reachable::lints(&b));
         found.extend(patterns::lints(&b));
-        found.extend(recursion::lints(&b));
         found.extend(unsafety::lints(&b));
+        found.extend(recursion::calls(&b));
         found.extend(liveness::lints(&b));
+        found.extend(recursion::drops(&b));
         found.extend(panics::lints(&b));
     }
     found
@@ -90,6 +100,10 @@ pub(crate) struct BodyCx<'a, 'db> {
     /// THIR of it and runs none of its MIR lints (match checking, unsafety, liveness, known
     /// panics).
     pub(crate) tainted: bool,
+    /// rustc runs `mir_drops_elaborated_and_const_checked` on the body before it aborts, so
+    /// its lints (the known-panics lint, a `Drop` impl's `unconditional_recursion`): it makes
+    /// code, or the body is in a const context. Set by [`before_abort`].
+    pub(crate) elaborated: bool,
     /// The expressions of the body in the order rustc visits them, each before those in it;
     /// those of an anonymous const in it (an array length) are the const's.
     exprs: Vec<ExprId>,
@@ -107,7 +121,7 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         }
         let infer = InferenceResult::of(db, owner);
         let tainted = infer.diagnostics().iter().any(taints);
-        let mut b = BodyCx { cx, owner, body, source_map, infer, tainted, exprs: Vec::new() };
+        let mut b = BodyCx { cx, owner, body, source_map, infer, tainted, elaborated: false, exprs: Vec::new() };
         let mut exprs = Vec::new();
         b.preorder(body.root_expr(), &mut exprs);
         b.exprs = exprs;
@@ -165,6 +179,42 @@ impl<'a, 'db> BodyCx<'a, 'db> {
     /// The MIR the body is built to, before rustc's runtime passes, if it can be built.
     pub(crate) fn mir(&self) -> Option<&'db MirBody<'db>> {
         self.db().mir_body(InferBodyId::DefWithBodyId(self.owner)).ok()
+    }
+
+    /// The MIR of the body after drop elaboration (`MirPhase::Runtime`), if it can be built.
+    pub(crate) fn runtime_mir(&self) -> Option<&'db MirBody<'db>> {
+        self.db().runtime_mir_body(InferBodyId::DefWithBodyId(self.owner)).ok()
+    }
+
+    /// rustc's `hir_body_const_context` is some: a const, a static, a discriminant or a
+    /// `const fn`.
+    pub(crate) fn is_const_context(&self) -> bool {
+        match self.owner {
+            DefWithBodyId::FunctionId(it) => FunctionSignature::of(self.db(), it).is_const(),
+            DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_) | DefWithBodyId::VariantId(_) => true,
+        }
+    }
+
+    /// The span rustc's MIR has for what `span` is of: an expression, the end of one (the last
+    /// character, rustc's `end_point` of a scope), a pattern, a binding or `self`.
+    pub(crate) fn mir_span(&self, span: MirSpan) -> Option<Span> {
+        match span {
+            MirSpan::ExprId(expr) => self.expr_span(expr),
+            MirSpan::ExprEnd(expr) => {
+                let node = self.expr_node(expr)?;
+                let last = self.cx.syntax(node).value.last_token()?;
+                let end = last.text_range().end();
+                let len = TextSize::of(last.text().chars().next_back()?);
+                Some(self.cx.span(InFile::new(node.file_id, TextRange::new(end - len, end))))
+            }
+            MirSpan::PatId(pat) => self.pat_span(pat),
+            MirSpan::BindingId(binding) => Some(self.cx.span_of(self.binding_node(binding)?)),
+            MirSpan::SelfParam => {
+                let param = self.source_map.self_param_syntax()?;
+                Some(self.cx.span_of(param.map(|it| it.syntax_node_ptr())))
+            }
+            MirSpan::Unknown => None,
+        }
     }
 
     /// The item whose code the body is, with what to call it in a fact.

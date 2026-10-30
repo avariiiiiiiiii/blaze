@@ -313,10 +313,21 @@ pub struct StdKey {
     pub crates: Vec<String>,
     /// std's features (`panic-unwind`, `backtrace`, ...), as `-Zbuild-std-features` names them.
     pub features: Vec<String>,
+    /// The machine build scripts are compiled for and run on ([`BuildConfig::host`]): std's
+    /// build scripts' units are host units, and cargo hashes the host into their metadata.
+    pub host: String,
+    /// The target's rustflags as cargo passes them to every unit of the platform, std's too
+    /// (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `[build]`, `[target.<triple>]`): their `-C
+    /// target-feature`, `-C target-cpu` and `--cfg` decide the cfg std is resolved and built
+    /// with.
+    pub rustflags: Vec<String>,
+    /// `dev` or `release`: what the build's profile inherits from at the root, whose
+    /// `[profile.<root>.package.*]` tables of library/Cargo.toml apply to std.
+    pub profile_root: String,
 }
 
 impl StdKey {
-    pub const DOMAIN: &'static str = "blaze v2 cargo std key 1";
+    pub const DOMAIN: &'static str = "blaze v2 cargo std key 2";
 
     pub fn id(&self) -> ContentId {
         let bytes = cbor::to_vec(self).unwrap_or_else(|error| panic!("a std key has no CBOR: {error}"));
@@ -438,9 +449,14 @@ mod tests {
             debuginfo: "2".to_owned(),
             crates: vec!["std".to_owned()],
             features: vec![],
+            host: "x86_64-unknown-linux-gnu".to_owned(),
+            rustflags: vec![],
+            profile_root: "dev".to_owned(),
         };
         let abort = StdKey { panic: "abort".to_owned(), ..key.clone() };
         assert_ne!(key.id(), abort.id());
+        let avx = StdKey { rustflags: vec!["-Ctarget-feature=+avx2".to_owned()], ..key.clone() };
+        assert_ne!(key.id(), avx.id());
         assert_eq!(key.id(), key.clone().id());
     }
 }

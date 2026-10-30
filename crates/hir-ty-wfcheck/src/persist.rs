@@ -45,7 +45,15 @@ pub struct WfResultRef<'a> {
     rows: &'a [WfRow],
 }
 
-impl WfResultRef<'_> {
+/// One diagnostic read in place: its message borrows the buffer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WfDiagnosticRef<'a> {
+    pub code: &'static str,
+    pub message: &'a str,
+    pub site: Site,
+}
+
+impl<'a> WfResultRef<'a> {
     pub fn len(&self) -> usize {
         self.rows.len()
     }
@@ -54,10 +62,19 @@ impl WfResultRef<'_> {
         self.rows.is_empty()
     }
 
+    /// The diagnostics in place, in order.
+    pub fn iter(&self) -> impl Iterator<Item = Result<WfDiagnosticRef<'a>, FormatError>> + 'a {
+        let buffer = self.buffer;
+        self.rows.iter().map(move |row| decode(row, buffer))
+    }
+
     /// The result as the query returns it.
     pub fn to_result(&self) -> Result<WfResult, FormatError> {
-        let diagnostics =
-            self.rows.iter().map(|row| decode(row, self.buffer)).collect::<Result<_, _>>()?;
+        let mut diagnostics = Vec::with_capacity(self.rows.len());
+        for it in self.iter() {
+            let WfDiagnosticRef { code, message, site } = it?;
+            diagnostics.push(WfDiagnostic { code, message: message.to_owned(), site });
+        }
         Ok(WfResult { diagnostics })
     }
 }
@@ -71,6 +88,8 @@ impl Persist for WfResult {
     type Ref<'a> = WfResultRef<'a>;
 
     fn write(&self, out: &mut Writer) -> u64 {
+        let text: usize = self.diagnostics.iter().map(|it| it.message.len()).sum();
+        out.bytes.reserve(text + (self.diagnostics.len() + 1) * size_of::<WfRow>());
         let messages: Vec<u64> =
             self.diagnostics.iter().map(|it| out.push_str(&it.message)).collect();
         let rows_at = out.next::<WfRow>();
@@ -80,9 +99,8 @@ impl Persist for WfResult {
             .zip(messages)
             .enumerate()
             .map(|(at, (diagnostic, message))| {
-                let field = rows_at
-                    + (at * size_of::<WfRow>()) as u64
-                    + offset_of!(WfRow, message) as u64;
+                let field =
+                    rows_at + (at * size_of::<WfRow>()) as u64 + offset_of!(WfRow, message) as u64;
                 let (site, def, id, index) = encode_site(diagnostic.site);
                 let Some(code) = CODES.iter().position(|&it| it == diagnostic.code) else {
                     panic!("a well-formedness code not in `CODES`: {}", diagnostic.code)
@@ -154,7 +172,7 @@ fn encode_site(site: Site) -> (u8, u8, u64, u32) {
     }
 }
 
-fn decode(row: &WfRow, buffer: &[u8]) -> Result<WfDiagnostic, FormatError> {
+fn decode<'a>(row: &'a WfRow, buffer: &'a [u8]) -> Result<WfDiagnosticRef<'a>, FormatError> {
     let at = (row as *const WfRow as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
     let invalid = |what| FormatError::Invalid { at, what };
     if row.id as u32 == 0 {
@@ -198,9 +216,10 @@ fn decode(row: &WfRow, buffer: &[u8]) -> Result<WfDiagnostic, FormatError> {
         7 => Site::SelfTy(id::<ImplId>(row.id)),
         _ => return Err(invalid("a well-formedness site of an unknown variant")),
     };
-    let code = *CODES.get(code as usize).ok_or_else(|| invalid("an unknown well-formedness code"))?;
-    let message = row.message.as_str(buffer)?.to_owned();
-    Ok(WfDiagnostic { code, message, site })
+    let code =
+        *CODES.get(code as usize).ok_or_else(|| invalid("an unknown well-formedness code"))?;
+    let message = row.message.as_str(buffer)?;
+    Ok(WfDiagnosticRef { code, message, site })
 }
 
 #[cfg(test)]
@@ -241,6 +260,19 @@ mod tests {
             .collect();
         let result = WfResult { diagnostics };
         assert_eq!(round_trip(&result), result);
+    }
+
+    #[test]
+    fn a_message_is_read_in_place() {
+        let site = Site::Param(id::<FunctionId>(5), 2);
+        let result = WfResult {
+            diagnostics: vec![WfDiagnostic { code: "E0309", message: "in place".to_owned(), site }],
+        };
+        let bytes = Aligned::copy_from(&to_bytes(&result));
+        let read = WfResult::read(&bytes).unwrap();
+        let first = read.iter().next().unwrap().unwrap();
+        assert_eq!((first.code, first.message, first.site), ("E0309", "in place", site));
+        assert!(bytes.as_ptr_range().contains(&first.message.as_ptr()), "borrowed, not copied");
     }
 
     #[test]

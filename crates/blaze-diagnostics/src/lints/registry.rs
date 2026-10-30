@@ -8,12 +8,10 @@
 //! `FutureIncompatibleInfo`), every `declare_lint!` of `compiler/rustc_lint/src/`,
 //! `compiler/rustc_lint/src/lib.rs` (`register_builtins`, `register_internals`),
 //! `compiler/rustc_lint/src/context.rs` (`LintStore::register_lints`, `check_lint_name`,
-//! `no_lint_suggestion`, `check_tool_name_for_backwards_compat`) and
-//! `compiler/rustc_span/src/edit_distance.rs`, of rust-lang/rust
+//! `no_lint_suggestion`, `check_tool_name_for_backwards_compat`), of rust-lang/rust
 //! ad3d0bc141a02cf446e384136d250a1f6950fed5 (MIT or Apache-2.0); the pinned nightly is
 //! `nightly-2026-10-27`.
 
-pub mod edit_distance;
 mod lints;
 mod names;
 
@@ -22,6 +20,8 @@ use std::sync::OnceLock;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use span::Edition;
+
+use crate::lints::edit_distance;
 
 /// A lint level, in rustc's order: where one is capped, the lower wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -324,6 +324,19 @@ pub fn lint(name: &str) -> Option<&'static Lint> {
     index().lints.get(name).copied()
 }
 
+/// The lints rustc declares and does not register; their names are unknown to attributes.
+pub fn unregistered() -> &'static [Lint] {
+    lints::UNREGISTERED
+}
+
+/// The lint a diagnostic named `name` is of: a builtin one, an internal one, or one rustc
+/// emits without registering it (`private_macro_use`).
+pub fn declared(name: &str) -> Option<&'static Lint> {
+    lint(name).or_else(|| {
+        lints::INTERNAL.iter().chain(lints::UNREGISTERED).find(|it| it.name == name)
+    })
+}
+
 /// The builtin lint group named `name`, aliases included.
 pub fn group(name: &str) -> Option<&'static Group> {
     groups().iter().find(|it| it.name == name)
@@ -362,7 +375,7 @@ pub fn named(name: &str) -> Named {
     if let Some(group) = group(name) {
         return Named::Group(group);
     }
-    match index().names.get(name) {
+    match index().names.get(name).copied() {
         Some(Entry::Renamed(new)) => Named::Renamed(new),
         Some(Entry::Removed(reason)) => Named::Removed(reason),
         Some(Entry::Ignored) => Named::Ignored,
@@ -382,7 +395,7 @@ pub fn removed() -> &'static [(&'static str, &'static str)] {
 
 /// The lint `name` is renamed to, following each renaming.
 pub fn renamed_to(name: &str) -> Option<&'static str> {
-    match index().names.get(name) {
+    match index().names.get(name).copied() {
         Some(Entry::Renamed(new)) => Some(new),
         _ => None,
     }
@@ -405,7 +418,7 @@ fn build_groups(builtin: &'static [Lint]) -> Vec<Group> {
             add(&mut groups, name, lint);
         }
     }
-    for (name, members) in names::GROUPS {
+    for &(name, members) in names::GROUPS {
         let lints = members
             .iter()
             .map(|member| {
@@ -417,8 +430,8 @@ fn build_groups(builtin: &'static [Lint]) -> Vec<Group> {
             .collect();
         groups.push(Group { name, lints, alias_of: None });
     }
-    for (alias, of) in names::ALIASES {
-        let lints = groups.iter().find(|it| it.name == *of).map(|it| it.lints.clone());
+    for &(alias, of) in names::ALIASES {
+        let lints = groups.iter().find(|it| it.name == of).map(|it| it.lints.clone());
         let lints = lints.unwrap_or_else(|| panic!("alias `{alias}` of no group `{of}`"));
         groups.push(Group { name: alias, lints, alias_of: Some(of) });
     }
@@ -453,14 +466,14 @@ fn index() -> &'static Index {
     INDEX.get_or_init(|| {
         let lints = lints::BUILTIN.iter().map(|it| (it.name, it)).collect();
         let mut names = FxHashMap::default();
-        for name in names::IGNORED {
-            names.insert(*name, Entry::Ignored);
+        for &name in names::IGNORED {
+            names.insert(name, Entry::Ignored);
         }
-        for (old, new) in names::RENAMED {
-            names.insert(*old, Entry::Renamed(new));
+        for &(old, new) in names::RENAMED {
+            names.insert(old, Entry::Renamed(new));
         }
-        for (name, reason) in names::REMOVED {
-            names.insert(*name, Entry::Removed(reason));
+        for &(name, reason) in names::REMOVED {
+            names.insert(name, Entry::Removed(reason));
         }
         Index { lints, names }
     })
@@ -526,7 +539,7 @@ impl Store {
         if let Some(lint) = self.by_name(name) {
             return Some(vec![lint]);
         }
-        match index().names.get(name) {
+        match index().names.get(name).copied() {
             Some(Entry::Renamed(new)) => return Some(vec![self.by_name(new)?]),
             Some(Entry::Removed(_)) => return None,
             Some(Entry::Ignored) => return Some(Vec::new()),
@@ -572,7 +585,7 @@ impl Store {
         if let Some(lint) = self.by_name(&complete) {
             return Checked::Ok(vec![lint]);
         }
-        match index().names.get(complete.as_str()) {
+        match index().names.get(complete.as_str()).copied() {
             Some(Entry::Renamed(new)) => Checked::Renamed(new),
             Some(Entry::Removed(reason)) => Checked::Removed(reason),
             Some(Entry::Ignored) => Checked::Ok(Vec::new()),

@@ -89,6 +89,8 @@ and to `Target`:
 What the linker does with each relocation kind, so codegen emits the right one, is in
 `docs/v2/plan/lanes/link/notes.md` ("Relocations codegen emits").
 
+> applied: by codegen (`v2/requests/codegen.md` section 2: `unwind`, `lines`, `Line`, `Unwind`, `Static` with `data`, `Init`, `Target::Weak` in `crates/blaze-codegen/src/lib.rs`).
+
 ## 2. `blaze-link`: what a change carries, and the output's target
 
 Where: `crates/blaze-link/src/lib.rs` (the interface items `Change` and `Image::new`). The
@@ -131,6 +133,8 @@ format lane owns spans; when it has its own side-table type, the link reads that
 `SpanTable` goes. Until then whoever fills `Change::spans` (the coordinator's wiring) encodes
 with `SpanTable`.
 
+> applied: by link in its own `crates/blaze-link/src/lib.rs` (`Change`'s fields; `Image::new(to, output)`, which returns a `Result`).
+
 ## 3. `blaze-core`: write at an offset, rename, file mode
 
 Where: `crates/blaze-core/src/lib.rs` (`Effect`, `Done`) and the drivers.
@@ -156,6 +160,8 @@ half a link. An executable needs its mode set: `Effect::Write` makes files 0644.
 `Done` gains `Renamed` and `Moded`. `Effect::tag` gains the three arms. The simulation keeps a
 file's mode for `Stat`'s sake only.
 
+> applied: by core (`v2/requests/core.md` item 4).
+
 ## 4. Workspace dependencies
 
 Where: the root `Cargo.toml`, `[workspace.dependencies]`. `object` and `gimli` are in `Cargo.lock` already.
@@ -174,3 +180,42 @@ the format `blaze_live::patch` defines. `crates/blaze-link/Cargo.toml` uses all 
 
 ---
 Routed or applied by the coordinator, 16:54.
+
+> applied: by the coordinator; all three are in the root `[workspace.dependencies]`.
+
+## 5. From speed-link-edge-macho: zero-copy native reads (contract, `model.rs`, `native.rs`)
+
+Status: open. For lead `link` (window `link-next1`). Affects every reader (ELF, Mach-O, COFF,
+wasm); speed-link-edge-elf hits the same wall.
+
+What is slow today: every reader copies each section's bytes into `Data::Bytes(Vec<u8>)`
+(`macho/input.rs:157`, `elf/read.rs:452`, `pe/coff.rs:404`, `wasm/object.rs:671`), and the core
+copies them again (`native.rs:836`, `Cow::Owned(bytes.clone())`) though it already keeps the
+input's bytes (`state.rs:119`, `Input::bytes: Arc<[u8]>`). Every symbol name is its own `String`
+(`Symbol::name`, `SharedSymbol::name`): one allocation per symbol of every object, archive member
+and `.tbd`/dylib (libSystem's stub alone has ~3,500 names per document). mold and wild read
+sections and names in place from the mapped file.
+
+The change (exact):
+1. `model.rs`: `Data` gains `Input(Range<u64>)`: the section's bytes are `bytes[range]` of the
+   slice handed to `Writer::read` (for an archive member, the member's slice). Readers use it for
+   every section whose bytes are in the file unchanged; `Bytes` stays for bytes a reader makes.
+   `Data::len` gets the arm `Data::Input(range) => range.end - range.start`.
+2. `native.rs:836` borrows instead of cloning: `Data::Input(range) =>
+   Cow::Borrowed(&input_bytes[range.start as usize..range.end as usize])` where `input_bytes` is
+   `self.new.inputs[it.input].bytes` (or, for a member, its `entry.bytes` sub-slice), and
+   `native.rs:401` / `:859` read `.eh_frame` the same way. `Cow<'a, [u8]>` needs the input's
+   `Arc<[u8]>` to outlive the stage, which it does (`self.new.inputs`).
+3. `model.rs`: `Object` and `Shared` gain `pub names: String` (every name of the file, one
+   allocation), and `Symbol::name` / `SharedSymbol::name` become `pub name: Name` with
+   `#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)] pub(crate) struct Name { pub at: u32, pub len: u32 }`
+   and `impl Object { pub fn name(&self, name: Name) -> &str { &self.names[name.at as usize..][..name.len as usize] } }`
+   (same on `Shared`). `native.rs:103`, `:261`, `:274`, `:301`, `:675` call `object.name(symbol.name)`.
+   Mach-O strips the leading `_` and ELF names are already the core's, so most names are a
+   range of the file's string table copied once into `names`; with item 1 a later step can make
+   `names` a range of the input too.
+
+Why it is faster: no allocation per section or per symbol on read (two for a whole object);
+section bytes copied once, into the output, instead of three times. Until this is applied the
+readers keep the current types; the reader-side edits are mechanical and listed in
+`/tmp/blaze-lanes/v2-speed-link-edge-macho.md`.

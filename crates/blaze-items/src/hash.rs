@@ -76,7 +76,7 @@ pub(crate) fn interface_form(db: &dyn HirDatabase, id: ItemId) -> form::Sub {
 
 #[salsa::tracked(returns(ref))]
 pub(crate) fn body_form(db: &dyn HirDatabase, id: ItemId) -> Option<form::Sub> {
-    form::Cx::new(db).body(id)
+    form::Cx::new(db).body(id).map(|code| code.sub)
 }
 
 /// Which graph a hash is over, and so what its refs are filled with.
@@ -96,15 +96,14 @@ impl Graph {
         }
     }
 
-    /// The refs of `id` in this graph, in slot order.
-    fn refs(self, db: &dyn HirDatabase, id: ItemId) -> Vec<ItemId> {
-        let mut refs = interface_form(db, id).refs.clone();
+    /// Appends the refs of `id` in this graph to `out`, in slot order.
+    fn refs_into(self, db: &dyn HirDatabase, id: ItemId, out: &mut Vec<ItemId>) {
+        out.extend_from_slice(&interface_form(db, id).refs);
         if self == Graph::Deep
             && let Some(body) = body_form(db, id)
         {
-            refs.extend_from_slice(&body.refs);
+            out.extend_from_slice(&body.refs);
         }
-        refs
     }
 
     /// Whether an edge to `to` can be inside a component of an item of `krate`: a ref to
@@ -161,7 +160,7 @@ impl Graph {
 
 fn missed(sub: &form::Sub, item: ItemId) -> Result<(), Unhashable> {
     match sub.missed {
-        Some(what) => Err(Unhashable { item, what }),
+        Some(why) => Err(Unhashable { item, what: why.what() }),
         None => Ok(()),
     }
 }
@@ -209,70 +208,118 @@ fn filled_into(
 ) -> Result<ContentId, Unhashable> {
     missed(sub, owner)?;
     h.id(&sub.digest).update(&(sub.refs.len() as u64).to_le_bytes());
-    for &to in &sub.refs {
+    for &to in sub.refs.iter() {
         h.id(&interface_of(db, to)?);
     }
     Ok(h.finish())
 }
 
+/// Preimages written back to back, each hashed alone in one batched call: bit for bit what
+/// one [`Hasher`] per preimage gives, as `update` and `id` write the bytes a `Hasher` would.
+#[derive(Default)]
+struct Batch {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+}
+
+impl Batch {
+    fn update(&mut self, bytes: &[u8]) -> &mut Batch {
+        self.bytes.extend_from_slice(bytes);
+        self
+    }
+
+    fn id(&mut self, id: &ContentId) -> &mut Batch {
+        self.update(&id.0)
+    }
+
+    fn word(&mut self, n: usize) -> &mut Batch {
+        self.update(&(n as u64).to_le_bytes())
+    }
+
+    /// Ends the preimage being written.
+    fn end(&mut self) {
+        self.ends.push(self.bytes.len());
+    }
+
+    /// Each ended preimage's hash, in order; the batch is left empty.
+    fn hash(&mut self, domain: &'static str) -> Vec<ContentId> {
+        let mut start = 0;
+        let inputs: Vec<&[u8]> = self
+            .ends
+            .iter()
+            .map(|&end| {
+                let it = &self.bytes[start..end];
+                start = end;
+                it
+            })
+            .collect();
+        let hashes = ContentId::of_many(domain, &inputs);
+        self.bytes.clear();
+        self.ends.clear();
+        hashes
+    }
+
+    /// The hash of everything written, as one preimage.
+    fn hash_one(&self, domain: &'static str) -> ContentId {
+        ContentId::of(domain, &self.bytes)
+    }
+}
+
 /// The hash of `root` in `graph`: of its component, as the module doc says.
 fn component_hash(db: &dyn HirDatabase, graph: Graph, root: ItemId) -> Result<ContentId, Unhashable> {
     let members = component(db, graph, root);
+    let n = members.len();
     let domain = graph.domain();
     let position: FxHashMap<ItemId, usize> =
         members.iter().enumerate().map(|(at, &id)| (id, at)).collect();
-    let mut owns = Vec::with_capacity(members.len());
-    let mut refs = Vec::with_capacity(members.len());
+    let owns = members.iter().map(|&member| graph.own(db, member)).collect::<Result<Vec<_>, _>>()?;
+    // Every member's refs in one list, member `at`'s at `starts[at]..starts[at + 1]`, and what
+    // each ref outside the component is filled with, `None` for one inside it.
+    let mut starts = Vec::with_capacity(n + 1);
+    let mut refs: Vec<ItemId> = Vec::new();
+    starts.push(0);
     for &member in &members {
-        owns.push(graph.own(db, member)?);
-        refs.push(graph.refs(db, member));
+        graph.refs_into(db, member, &mut refs);
+        starts.push(refs.len());
     }
-    // What each ref outside the component is filled with, `None` for one inside it.
-    let mut fills: Vec<Vec<Option<ContentId>>> = Vec::with_capacity(members.len());
-    for member_refs in &refs {
-        let mut row = Vec::with_capacity(member_refs.len());
-        for to in member_refs {
-            row.push(match position.get(to) {
-                Some(_) => None,
-                None => Some(graph.fill(db, *to)?),
-            });
-        }
-        fills.push(row);
-    }
+    let fills = refs
+        .iter()
+        .map(|&to| match position.get(&to) {
+            Some(_) => Ok(None),
+            None => graph.fill(db, to).map(Some),
+        })
+        .collect::<Result<Vec<Option<ContentId>>, Unhashable>>()?;
+    let of = |at: usize| starts[at]..starts[at + 1];
 
-    let alone = members.len() == 1 && fills[0].iter().all(Option::is_some);
-    if alone {
-        let mut h = Hasher::new(domain);
-        h.update(b"item").id(&owns[0]);
-        spell_fills(&mut h, &refs[0], &fills[0], |_| 0);
-        return Ok(h.finish());
+    let mut b = Batch::default();
+    if n == 1 && fills.iter().all(Option::is_some) {
+        b.update(b"item").id(&owns[0]);
+        spell_fills(&mut b, &refs, &fills, |_| 0);
+        return Ok(b.hash_one(domain));
     }
 
     // Order the members by content: their own content and what is outside, refined by the
     // content of the members they refer to until the classes stop splitting; members still
-    // alike are ordered by key, which only matters where swapping them hashes alike.
-    let mut color: Vec<ContentId> = (0..members.len())
-        .map(|at| {
-            let mut h = Hasher::new(domain);
-            h.update(b"shape").id(&owns[at]);
-            spell_fills(&mut h, &refs[at], &fills[at], |_| 0);
-            h.finish()
-        })
-        .collect();
+    // alike are ordered by key, which only matters where swapping them hashes alike. Each
+    // round hashes every member in one batch.
+    for at in 0..n {
+        b.update(b"shape").id(&owns[at]);
+        spell_fills(&mut b, &refs[of(at)], &fills[of(at)], |_| 0);
+        b.end();
+    }
+    let mut color = b.hash(domain);
     let mut classes = distinct(&color);
-    for _ in 0..members.len() {
-        let next: Vec<ContentId> = (0..members.len())
-            .map(|at| {
-                let mut h = Hasher::new(domain);
-                h.update(b"refine").id(&color[at]);
-                for to in &refs[at] {
-                    if let Some(&inside) = position.get(to) {
-                        h.id(&color[inside]);
-                    }
+    for _ in 0..n {
+        for at in 0..n {
+            b.update(b"refine").id(&color[at]);
+            for to in &refs[of(at)] {
+                if let Some(&inside) = position.get(to) {
+                    b.id(&color[inside]);
                 }
-                h.finish()
-            })
-            .collect();
+            }
+            b.end();
+        }
+        let next = b.hash(domain);
         let next_classes = distinct(&next);
         color = next;
         if next_classes == classes {
@@ -281,36 +328,35 @@ fn component_hash(db: &dyn HirDatabase, graph: Graph, root: ItemId) -> Result<Co
         classes = next_classes;
     }
     let keys: Vec<crate::ItemKey> = members.iter().map(|&id| key::item_key(db, id)).collect();
-    let mut order: Vec<usize> = (0..members.len()).collect();
+    let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| color[a].0.cmp(&color[b].0).then(keys[a].cmp(&keys[b])));
-    let mut rank = vec![0; members.len()];
+    let mut rank = vec![0; n];
     for (at, &member) in order.iter().enumerate() {
         rank[member] = at;
     }
 
-    let mut h = Hasher::new(domain);
-    h.update(b"cycle").update(&(members.len() as u64).to_le_bytes());
+    b.update(b"cycle").word(n);
     for &at in &order {
-        h.id(&owns[at]);
-        spell_fills(&mut h, &refs[at], &fills[at], |to| rank[position[&to]]);
+        b.id(&owns[at]);
+        spell_fills(&mut b, &refs[of(at)], &fills[of(at)], |to| rank[position[&to]]);
     }
-    let whole = h.finish();
-    let mut h = Hasher::new(domain);
-    h.update(b"member").id(&whole).update(&(rank[position[&root]] as u64).to_le_bytes());
-    Ok(h.finish())
+    let whole = b.hash_one(domain);
+    let mut b = Batch::default();
+    b.update(b"member").id(&whole).word(rank[position[&root]]);
+    Ok(b.hash_one(domain))
 }
 
 fn spell_fills(
-    h: &mut Hasher,
+    b: &mut Batch,
     refs: &[ItemId],
     fills: &[Option<ContentId>],
     inside: impl Fn(ItemId) -> usize,
 ) {
-    h.update(&(refs.len() as u64).to_le_bytes());
+    b.word(refs.len());
     for (&to, fill) in refs.iter().zip(fills) {
         match fill {
-            Some(fill) => h.update(&[1]).id(fill),
-            None => h.update(&[0]).update(&(inside(to) as u64).to_le_bytes()),
+            Some(fill) => b.update(&[1]).id(fill),
+            None => b.update(&[0]).word(inside(to)),
         };
     }
 }
@@ -323,54 +369,73 @@ fn distinct(color: &[ContentId]) -> usize {
 }
 
 /// The strongly connected component of `root` in `graph` within its crate, by Tarjan's
-/// algorithm (iterative: a chain of refs may be long).
+/// algorithm (iterative: a chain of refs may be long). The edges of every frame on the work
+/// stack are one list: a frame's are its tail when it is popped.
 fn component(db: &dyn HirDatabase, graph: Graph, root: ItemId) -> Vec<ItemId> {
     struct Frame {
         node: ItemId,
-        edges: Vec<ItemId>,
+        at: usize,
+        start: usize,
         next: usize,
+        end: usize,
     }
     let krate = root.krate(db);
     let mut index: FxHashMap<ItemId, usize> = FxHashMap::default();
     let mut low: Vec<usize> = Vec::new();
     let mut on_stack: Vec<bool> = Vec::new();
     let mut stack: Vec<ItemId> = Vec::new();
+    let mut edges: Vec<ItemId> = Vec::new();
     let mut work: Vec<Frame> = Vec::new();
     let visit = |node: ItemId,
-                     index: &mut FxHashMap<ItemId, usize>,
-                     low: &mut Vec<usize>,
-                     on_stack: &mut Vec<bool>,
-                     stack: &mut Vec<ItemId>,
-                     work: &mut Vec<Frame>| {
+                 index: &mut FxHashMap<ItemId, usize>,
+                 low: &mut Vec<usize>,
+                 on_stack: &mut Vec<bool>,
+                 stack: &mut Vec<ItemId>,
+                 edges: &mut Vec<ItemId>,
+                 work: &mut Vec<Frame>| {
         let at = low.len();
         index.insert(node, at);
         low.push(at);
         on_stack.push(true);
         stack.push(node);
-        let edges = graph.refs(db, node).into_iter().filter(|&to| graph.inside(db, krate, to));
-        work.push(Frame { node, edges: edges.collect(), next: 0 });
+        let start = edges.len();
+        graph.refs_into(db, node, edges);
+        let mut kept = start;
+        for read in start..edges.len() {
+            if graph.inside(db, krate, edges[read]) {
+                edges[kept] = edges[read];
+                kept += 1;
+            }
+        }
+        edges.truncate(kept);
+        work.push(Frame { node, at, start, next: start, end: kept });
     };
-    visit(root, &mut index, &mut low, &mut on_stack, &mut stack, &mut work);
+    visit(root, &mut index, &mut low, &mut on_stack, &mut stack, &mut edges, &mut work);
     let mut found = Vec::new();
     while let Some(frame) = work.last_mut() {
-        if frame.next < frame.edges.len() {
-            let to = frame.edges[frame.next];
+        if frame.next < frame.end {
+            let to = edges[frame.next];
             frame.next += 1;
-            let from = index[&frame.node];
-            let seen = index.get(&to).copied();
-            match seen {
-                None => visit(to, &mut index, &mut low, &mut on_stack, &mut stack, &mut work),
-                Some(&at) if on_stack[at] => low[from] = low[from].min(at),
+            let from = frame.at;
+            match index.get(&to).copied() {
+                None => visit(
+                    to,
+                    &mut index,
+                    &mut low,
+                    &mut on_stack,
+                    &mut stack,
+                    &mut edges,
+                    &mut work,
+                ),
+                Some(at) if on_stack[at] => low[from] = low[from].min(at),
                 Some(_) => {}
             }
             continue;
         }
-        let node = frame.node;
-        work.pop();
-        let at = index[&node];
+        let Frame { node, at, start, .. } = work.pop().expect("the frame just looked at");
+        edges.truncate(start);
         if let Some(parent) = work.last() {
-            let parent = index[&parent.node];
-            low[parent] = low[parent].min(low[at]);
+            low[parent.at] = low[parent.at].min(low[at]);
         }
         if low[at] == at {
             let mut members = Vec::new();
@@ -443,7 +508,7 @@ fn closure_code_of<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
 ) -> Result<ContentId, Unhashable> {
-    let sub = form::Cx::new(db).closure_code(closure);
+    let sub = form::Cx::new(db).closure_code(closure).sub;
     filled(db, CLOSURE_CODE_DOMAIN, &sub, owner_of(db, closure.loc(db)))
 }
 
@@ -461,6 +526,6 @@ fn coroutine_code_of<'db>(
     db: &'db dyn HirDatabase,
     coroutine: InternedCoroutineId<'db>,
 ) -> Result<ContentId, Unhashable> {
-    let sub = form::Cx::new(db).coroutine_code(coroutine);
+    let sub = form::Cx::new(db).coroutine_code(coroutine).sub;
     filled(db, COROUTINE_CODE_DOMAIN, &sub, owner_of(db, coroutine.loc(db)))
 }

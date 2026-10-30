@@ -212,7 +212,7 @@ impl Prepare for Machine {
         Ok(Emitted { function, side: None })
     }
 
-    fn masked(&self, _: &Unit, _: &Prepared) -> Option<Masked> {
+    fn masked(&self, _: &Unit, _: &Prepared, _: &crate::template::Refs) -> Option<Masked> {
         None
     }
 

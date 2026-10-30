@@ -17,12 +17,16 @@ What release LLVM per function (`crates/hir-ty-codegen/v2/release.rs`, `llvm/rel
    `#[inline(always)]` and `#[inline(never)]`. That changes speed, never behavior. When the
    field lands, `inline_hint` reads `function.hint`.
 
+> forwarded to codegen: inside lane codegen (codegen-adapter's `v2.rs`).
+
 ## codegen-devspeed (`fragment.rs`)
 
 1. **A keep-mask from `Wants::referenced`.** Return which requests were kept, or the old-to-new
    index maps, beside the pruned `Requests`. Then release `emit` can drop the data of imported
    bodies that LLVM left unused, along with their `Places`. Today every such blob is converted
    and stored.
+
+> forwarded to codegen: inside lane codegen (`fragment.rs`).
 
 ## codegen (parent: the driver, `blaze-codegen`)
 
@@ -42,3 +46,5 @@ What release LLVM per function (`crates/hir-ty-codegen/v2/release.rs`, `llvm/rel
 3. **Speed: run `emit` on the thread that ran `summarize`.** Then the pre-linked LLVM module
    can stay a `Module` in that thread's context, which saves a bitcode write and parse per
    function. Today it is kept as bitcode in a map by instance key.
+
+> forwarded to codegen: every item is inside lane codegen (codegen-adapter, codegen-devspeed, the parent).

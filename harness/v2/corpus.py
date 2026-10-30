@@ -37,7 +37,7 @@ reference, into `target-ref` (engine.reference_env). Each (project, step) is one
     fail   they differ, one side's build fails and the other's does not, or the engine says the
            step was not blaze's (`not_blazes`)
     error  the harness could not say: a fetch or a checksum failed, a command timed out, the
-           engine lacks an interface it needs (`engine.Missing`), or the reference did not get
+           engine gave an answer it could not read, or the reference did not get
            far enough to compare with (cargo's build or test build fails)
     unmeasured
            the engine has no answer to a step (`engine.Unmeasurable`)

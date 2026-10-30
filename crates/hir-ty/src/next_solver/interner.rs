@@ -3,7 +3,6 @@
 use std::{fmt, ops::ControlFlow};
 
 use either::Either;
-use intern::{Interned, InternedRef, InternedSliceRef, impl_internable};
 use macros::GenericTypeVisitable;
 use rustc_abi::ReprOptions;
 use rustc_ast_ir::{FloatTy, IntTy, UintTy};
@@ -66,6 +65,8 @@ use super::{
     util::sizedness_constraint_for_ty,
 };
 
+/// A list of interned values, as an index into a [`table::Lists`] of its own: `$storage` holds the
+/// table, `$name<'db>` is the list, `$stored_name` the list as kept in a query result.
 macro_rules! interned_slice {
     ($storage:ident, $name:ident, $stored_name:ident, $default_types_field:ident, $ty_db:ty, $ty_static:ty $(,)?) => {
         const _: () = {
@@ -73,12 +74,26 @@ macro_rules! interned_slice {
             fn _ensure_correct_types<'db: 'static>(v: $ty_db) -> $ty_static { v }
         };
 
-        ::intern::impl_slice_internable!(gc; $storage, (), $ty_static);
+        /// Where every interned [`$name`] is.
+        pub struct $storage;
+
+        impl $storage {
+            #[inline]
+            fn table() -> &'static $crate::next_solver::interner::table::Lists<$ty_static> {
+                static TABLE: $crate::next_solver::interner::table::Lists<$ty_static> =
+                    $crate::next_solver::interner::table::Lists::new(::std::stringify!($name));
+                &TABLE
+            }
+        }
 
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        #[repr(transparent)]
         pub struct $name<'db> {
-            interned: ::intern::InternedSliceRef<'db, $storage>,
+            index: ::std::num::NonZeroU32,
+            _db: ::std::marker::PhantomData<&'db ()>,
         }
+
+        const _: () = ::std::assert!(::std::mem::size_of::<Option<$name<'static>>>() == 4);
 
         impl<'db> std::fmt::Debug for $name<'db> {
             fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -106,8 +121,10 @@ macro_rules! interned_slice {
             /// needs to intern the global slice as well.
             #[inline]
             pub(crate) fn new_from_slice_no_empty_check(slice: &[$ty_db]) -> Self {
+                // SAFETY: the two types differ only in their lifetime, which an interned value
+                // does not depend on (it is never freed).
                 let slice = unsafe { ::std::mem::transmute::<&[$ty_db], &[$ty_static]>(slice) };
-                Self { interned: ::intern::InternedSlice::from_header_and_slice((), slice) }
+                Self::at($storage::table().intern(slice))
             }
 
             #[inline]
@@ -123,8 +140,10 @@ macro_rules! interned_slice {
 
             #[inline]
             pub fn as_slice(self) -> &'db [$ty_db] {
-                let slice = &self.interned.get().slice;
-                unsafe { ::std::mem::transmute::<&[$ty_static], &[$ty_db]>(slice) }
+                // SAFETY: `index` was given by the table's `intern`.
+                let slice = unsafe { $storage::table().get(self.index) };
+                // SAFETY: as in `new_from_slice_no_empty_check`.
+                unsafe { ::std::mem::transmute::<&[$ty_static], &'db [$ty_db]>(slice) }
             }
 
             #[inline]
@@ -140,6 +159,30 @@ macro_rules! interned_slice {
             #[inline]
             pub fn is_empty(self) -> bool {
                 self.as_slice().is_empty()
+            }
+
+            /// The list's place in its table: dense from 1, the same for equal lists, for the
+            /// life of the process.
+            #[inline]
+            pub fn index(self) -> u32 {
+                self.index.get()
+            }
+
+            /// The list at `index`, which [`Self::index`] gave. Panics on any other number.
+            pub fn from_index(_interner: $crate::next_solver::DbInterner<'db>, index: u32) -> Self {
+                match ::std::num::NonZeroU32::new(index) {
+                    Some(index) if $storage::table().published(index) => Self::at(index),
+                    _ => ::std::panic!(
+                        "{index} is not the index of an interned {}",
+                        ::std::stringify!($name)
+                    ),
+                }
+            }
+
+            /// The list of a row of the table.
+            #[inline]
+            pub(crate) fn at(index: ::std::num::NonZeroU32) -> Self {
+                Self { index, _db: ::std::marker::PhantomData }
             }
         }
 
@@ -182,41 +225,35 @@ macro_rules! interned_slice {
             }
         }
 
-
         impl<'db, V: $crate::next_solver::interner::WorldExposer>
             rustc_type_ir::GenericTypeVisitable<V> for $name<'db>
         {
             #[inline]
             fn generic_visit_with(&self, visitor: &mut V) {
-                if visitor.on_interned_slice(self.interned).is_continue() {
+                if visitor.on_interned(::std::stringify!($name), self.index.get()).is_continue() {
                     self.as_slice().iter().for_each(|it| it.generic_visit_with(visitor));
                 }
             }
         }
 
-        $crate::next_solver::interner::impl_stored_interned_slice!($storage, $name, $stored_name);
+        $crate::next_solver::interner::impl_stored_interned_slice!($name, $stored_name);
     };
 }
 pub(crate) use interned_slice;
 
+/// `$stored_name`, the list `$name` as kept in a query result: its index, which stays valid in
+/// every revision, as an interned value is never freed.
 macro_rules! impl_stored_interned_slice {
-    ( $storage:ident, $name:ident, $stored_name:ident $(,)? ) => {
-        #[derive(Clone, PartialEq, Eq, Hash)]
+    ( $name:ident, $stored_name:ident $(,)? ) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $stored_name {
-            interned: ::intern::InternedSlice<$storage>,
+            index: ::std::num::NonZeroU32,
         }
 
         impl $stored_name {
             #[inline]
-            fn new(it: $name<'_>) -> Self {
-                Self { interned: it.interned.to_owned() }
-            }
-
-            // FIXME: This transmute is not safe as is!
-            #[inline]
-            pub fn as_ref<'a, 'db>(&'a self) -> $name<'db> {
-                let it = $name { interned: self.interned.as_ref() };
-                unsafe { std::mem::transmute::<$name<'a>, $name<'db>>(it) }
+            pub fn as_ref<'db>(&self) -> $name<'db> {
+                $name::at(self.index)
             }
         }
 
@@ -232,7 +269,7 @@ macro_rules! impl_stored_interned_slice {
         impl $name<'_> {
             #[inline]
             pub fn store(self) -> $stored_name {
-                $stored_name::new(self)
+                $stored_name { index: self.index }
             }
         }
     };
@@ -299,23 +336,22 @@ macro_rules! impl_foldable_for_stored_type {
 }
 pub(crate) use impl_foldable_for_stored_type;
 
+/// `$stored_name`, the interned `$name` as kept in a query result: its index, which stays valid
+/// in every revision, as an interned value is never freed. `$name` has an `index: NonZeroU32`
+/// field and an `at(NonZeroU32)` constructor.
 macro_rules! impl_stored_interned {
-    ( $storage:ident, $name:ident, $stored_name:ident $(,)? ) => {
-        #[derive(Clone, PartialEq, Eq, Hash, ::salsa::SalsaValue)]
+    ( $name:ident, $stored_name:ident $(,)? ) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, ::salsa::SalsaValue)]
         pub struct $stored_name {
-            interned: ::intern::Interned<$storage>,
+            index: ::std::num::NonZeroU32,
         }
+
+        const _: () = ::std::assert!(::std::mem::size_of::<Option<$stored_name>>() == 4);
 
         impl $stored_name {
             #[inline]
-            fn new(it: $name<'_>) -> Self {
-                Self { interned: it.interned.to_owned() }
-            }
-
-            #[inline]
-            pub fn as_ref<'a, 'db>(&'a self) -> $name<'db> {
-                let it = $name { interned: self.interned.as_ref() };
-                unsafe { std::mem::transmute::<$name<'a>, $name<'db>>(it) }
+            pub fn as_ref<'db>(&self) -> $name<'db> {
+                $name::at(self.index)
             }
         }
 
@@ -328,24 +364,19 @@ macro_rules! impl_stored_interned {
         impl $name<'_> {
             #[inline]
             pub fn store(self) -> $stored_name {
-                $stored_name::new(self)
+                $stored_name { index: self.index }
             }
         }
     };
 }
 pub(crate) use impl_stored_interned;
 
-/// This is a visitor trait that treats any interned thing specifically. Visitables are expected to call
-/// the trait's methods when encountering an interned. This is used to implement marking in GC.
+/// A visitor of the interned values a value holds. Visitables call [`Self::on_interned`] with
+/// the table and index of each interned value they reach, before its parts, and skip the parts
+/// on [`ControlFlow::Break`] (a value already seen): the walk a reachability pass over the
+/// tables makes.
 pub trait WorldExposer {
-    fn on_interned<T: intern::Internable>(
-        &mut self,
-        interned: InternedRef<'_, T>,
-    ) -> ControlFlow<()>;
-    fn on_interned_slice<T: intern::SliceInternable>(
-        &mut self,
-        interned: InternedSliceRef<'_, T>,
-    ) -> ControlFlow<()>;
+    fn on_interned(&mut self, table: &'static str, index: u32) -> ControlFlow<()>;
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -356,7 +387,7 @@ pub struct DbInterner<'db> {
     /// The crate's `#![recursion_limit]`, or rustc's default. The solver asks for it with every
     /// goal, so it is read once.
     recursion_limit: u32,
-    /// Which of the thread's solver caches is this interner's, see [`tls_cache`].
+    /// Which solver cache is this interner's, see [`tls_cache`].
     solved: tls_cache::Solved,
     /// The solver answers with the region constraints proving a goal takes, as borrowck needs;
     /// otherwise regions are not looked at.
@@ -371,7 +402,6 @@ impl<'db> DbInterner<'db> {
     // FIXME(next-solver): remove this method
     #[doc(hidden)]
     pub fn conjure() -> DbInterner<'db> {
-        // Here we can not reinit the cache since we do that when we attach the db.
         crate::with_attached_db(|db| DbInterner {
             db: unsafe { std::mem::transmute::<&dyn HirDatabase, &'db dyn HirDatabase>(db) },
             krate: None,
@@ -387,8 +417,6 @@ impl<'db> DbInterner<'db> {
     ///
     /// Elaboration is a special kind: it needs lang items (for `Sized`), therefore it needs `new_with()`.
     pub fn new_no_crate(db: &'db dyn HirDatabase) -> Self {
-        // We do not reinit the cache here, since anything accessing the cache needs an InferCtxt,
-        // and we panic when trying to construct an InferCtxt for an Interner without a crate.
         DbInterner {
             db,
             krate: None,
@@ -400,7 +428,6 @@ impl<'db> DbInterner<'db> {
     }
 
     pub fn new_with(db: &'db dyn HirDatabase, krate: Crate) -> DbInterner<'db> {
-        tls_cache::reinit_cache(db);
         DbInterner {
             db,
             krate: Some(krate),
@@ -1086,7 +1113,7 @@ impl<'db> Interner for DbInterner<'db> {
         self,
         f: impl FnOnce(&mut rustc_type_ir::search_graph::GlobalCache<Self>) -> R,
     ) -> R {
-        // We make sure to reinit the cache when constructing the Interner.
+        // The cache of this interner's `Solved`, in the database's present state.
         tls_cache::borrow_assume_valid(self.db, self.solved, f)
     }
 
@@ -2529,7 +2556,6 @@ mod tls_db {
             }
 
             let _guard = DbGuard::new(self, db);
-            super::tls_cache::reinit_cache(db);
             op()
         }
 
@@ -2552,14 +2578,10 @@ mod tls_db {
                 #[inline]
                 fn drop(&mut self) {
                     self.state.database.set(self.prev);
-                    if let Some(prev) = self.prev {
-                        super::tls_cache::reinit_cache(unsafe { prev.as_ref() });
-                    }
                 }
             }
 
             let _guard = DbGuard::new(self, db);
-            super::tls_cache::reinit_cache(db);
             op()
         }
 

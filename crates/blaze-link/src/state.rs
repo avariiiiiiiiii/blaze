@@ -157,6 +157,8 @@ pub(crate) struct State {
     pub resolved: Arc<Resolved>,
     /// The jump table: slots given out, and how many there are room for.
     pub slots: u32,
+    /// Each slot's symbol, by its index.
+    pub slot_syms: CowVec<Sym>,
     pub capacity: u32,
     pub tls: Option<Tls>,
     pub file_len: u64,
@@ -183,6 +185,7 @@ impl State {
             inputs: Arc::default(),
             resolved: Arc::default(),
             slots: 0,
+            slot_syms: CowVec::default(),
             capacity: 0,
             tls: None,
             file_len: 0,

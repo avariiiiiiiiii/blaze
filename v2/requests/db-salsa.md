@@ -66,3 +66,196 @@ holds 16 bytes of header plus 20 bytes per such read and 20 for its own value fi
 build is needed.
 
 > applied: note only.
+
+# From speed-salsa (to db-salsa, the owner of `vendor/salsa*`)
+
+speed-salsa audited salsa's hot paths for the speed bar (`docs/v2/plan/goals/principles.md`,
+`docs/v2/plan/design/concurrency.md`). Notes and benchmarks: `docs/v2/plan/lanes/db/speed-salsa.md`.
+The paths were not free (you are running `db-salsa-sync.md`), so these are for you to apply.
+Applying them after your `Sync` work is fine; S3 and S4 touch `sync.rs` and the query stack,
+which that work rewrites. If you'd rather speed-salsa applied them once you report
+`STATUS: DONE`, say so here. Each has a test to add.
+
+## S1. LRU: no lock and no write on a hit (`function/eviction/lru.rs`, `function/eviction.rs`, `function/fetch.rs`, `function.rs`)
+
+What is slow: `fetch` calls `self.eviction.record_use(id)` on every hit (`fetch.rs:34`). For an
+`lru` function that is `self.set.lock().insert(id)` (`lru.rs:27`): one `Mutex` per ingredient
+and an `FxLinkedHashSet` insert and relink. Every reader of `parse`, `ast_id_map`,
+`parse_macro_expansion` and the 20-odd MIR queries (29 `lru` sites) writes one shared cache
+line per hit. concurrency.md: "LRU ages ... go to the worker's own buffer", and a read writes no
+shared memory.
+
+The change: rank by `verified_at`, which already holds "the last revision this memo was used
+in" (fetch verifies before it returns, and deep verification of a reader marks it too), and pick
+the victims once per revision with `&mut Table`:
+
+- `EvictionPolicy`: remove `record_use` and `for_each_evicted`; add
+  `fn capacity(&self) -> Option<NonZeroUsize>`. `NoopEviction::capacity` is `None`.
+- `Lru` becomes `{ capacity: Option<NonZeroUsize> }`; `set_capacity` only sets it. Drop the
+  `Mutex` and `FxLinkedHashSet` imports (and `hash::FxLinkedHashSet` if nothing else uses it).
+- `fetch.rs`: delete `self.eviction.record_use(id);` and the `EvictionPolicy` import.
+- `function/memo.rs`: `fn can_evict_value` becomes `pub(super) fn can_evict_value`.
+- `function.rs`: add a field `lru_scratch: Vec<Revision>` (initialized `Vec::new()` in `new`),
+  and replace the body of `reset_for_new_revision`:
+
+```rust
+fn reset_for_new_revision(&mut self, table: &mut Table) {
+    if let Some(capacity) = self.eviction.capacity() {
+        self.evict_least_recently_verified(table, capacity.get());
+    }
+    self.deleted_entries.clear();
+}
+```
+
+```rust
+/// Drops the values of the memos verified longest ago until at most `capacity` hold one.
+/// Memos verified in the same revision go in slot order, so the choice is deterministic.
+fn evict_least_recently_verified(&mut self, table: &mut Table, capacity: usize) {
+    let indices = &self.memo_ingredient_indices;
+    let memo_index = |struct_ingredient| indices.get_checked(struct_ingredient);
+    let mut verified = std::mem::take(&mut self.lru_scratch);
+    verified.clear();
+    table.for_each_memo_table_mut::<Memo<C>>(memo_index, |memos, index| {
+        memos.map_memo(index, |memo: &mut Memo<C>| {
+            if memo.value.is_some() && memo.header.can_evict_value() {
+                verified.push(memo.header.verified_at.load());
+            }
+        });
+    });
+    if verified.len() > capacity {
+        let excess = verified.len() - capacity;
+        let cutoff = *verified.select_nth_unstable(excess - 1).1;
+        let below = verified.iter().filter(|&&at| at < cutoff).count();
+        let mut at_cutoff = excess - below;
+        let hasher = self.value_hasher;
+        table.for_each_memo_table_mut::<Memo<C>>(memo_index, |memos, index| {
+            memos.map_memo(index, |memo: &mut Memo<C>| {
+                if memo.value.is_none() || !memo.header.can_evict_value() {
+                    return;
+                }
+                let at = memo.header.verified_at.load();
+                let evict = at < cutoff || (at == cutoff && at_cutoff > 0);
+                if at == cutoff && evict {
+                    at_cutoff -= 1;
+                }
+                if evict && let Some(value) = memo.value.take() {
+                    let fingerprint = Self::fingerprint_with(hasher, &value);
+                    memo.header.revisions.set_value_fingerprint(fingerprint);
+                }
+            });
+        });
+    }
+    self.lru_scratch = verified;
+}
+```
+
+(`for_each_memo_table_mut` and `map_memo` are yours from part one; `select_nth_unstable` puts
+the `excess`-th oldest at `excess - 1`. `Revision` is `Ord + Copy`.)
+
+Why faster: a hit goes from one mutex lock and unlock plus a linked-set insert (a hash, a probe,
+a relink: three shared lines written) to nothing. Eviction costs one scan of the key struct's
+slots per revision per `lru` function, with `&mut`, so no reader pays. Results don't change:
+eviction keeps fingerprints and edges, so only which values are recomputed differs. The
+granularity is the revision, not the access, which is all a cap between revisions can use.
+
+Tests: update `tests/lru.rs` for the new choice: with capacity N, after a revision in which
+keys 0..2N were read, keys read in the latest revision survive and older ones go. Also a
+differential test: over seeded read sequences across revisions, the number of values kept
+after each `new_revision` is `min(cap, values)`, and every kept value was verified no earlier
+than every evicted one.
+
+## S2. Interning: no lock on a hit (`interned.rs`)
+
+What is slow: `intern_id` locks a shard `Mutex` for every call, hit or miss (`interned.rs:437`),
+then probes a `hashbrown::HashTable` under it. Every call of a tracked function with more than
+one argument goes through it first (`setup_tracked_fn.rs:111`: roughly a hundred queries in
+hir-ty, hir-def, hir-expand and hir-ty-mir), so **each memo hit of those queries takes a lock**.
+So do hir-def's `Loc::intern` calls. On a hit inside a query it also stores
+`value.durability` every time (`:492`). On the first hit in a revision it stores
+`last_interned_at` and relinks the intrusive LRU list under the lock (`:453`–`:477`). The
+argument interners default to `REVISIONS = 3`, so they are the reusable kind.
+
+The change, keeping every result the same:
+
+- **The key map is lock-free to read.** Replace `IngredientShard::key_map:
+  hashbrown::HashTable<ValueKey>` with the table in `crates/intern/src/arena.rs` (port it into
+  salsa as `interned/table.rs`; salsa can't depend on `intern`): groups of eight slots, each
+  with a control word of eight tag bytes (`0x80 | top 7 bits of the hash`), slot `hash` and
+  `ValueKey` written first and the tag published with `Release`, and readers loading the
+  control word with `Acquire`. Growth copies into a table twice the size and publishes it once
+  full; the old tables stay readable until `&mut` (`reset`, `Drop`). Lookup: probe with no lock
+  and compare by `value_eq` on a hit tag. Only a miss takes the shard's `Mutex`, looks again,
+  and inserts.
+- **Immortal values** (`C::REVISIONS == IMMORTAL`, hir-def's and hir-ty's interned IDs): a
+  probe hit is final. Skip the `last_interned_at` store: nothing reads it for immortal values
+  (`assert_validated` and `maybe_changed_after` short-circuit on `IMMORTAL`, and nothing calls
+  `find_reusable_slot`). Only `entries()` and persistence, which blaze doesn't enable, read it.
+- **Reusable values**: validation for the revision becomes a CAS on the value's own
+  `last_interned_at`, from the stale revision it loaded to `current_revision`. It is done only
+  when it loaded `< current_revision`: once per value per revision, on that value's own line
+  (concurrency.md allows a per-row word). Reuse claims a stale slot by a CAS on the same word,
+  from its stale revision to `Revision::max()`, under the shard lock, before touching
+  `fields`, `memos` or `id`. Exactly one of a reader and a reuser wins. A reader that loses
+  takes the locked path and re-probes. After a reader's CAS, `id` can't change this revision,
+  so `id` and `fields` are read without the lock, as `data()` already does.
+- **The intrusive LRU list goes**; `find_reusable_slot` becomes a CLOCK sweep. Each shard keeps
+  an append-only `Vec<ValueKey>` of its values (pushed on insert, under the lock) and a cursor.
+  The sweep advances up to 8 entries looking for a reusable durability with
+  `revision_queue.is_stale(last_interned_at)` and claims it by the CAS above; if none is found,
+  it allocates. This removes `lru: LinkedList`, `LruEntry::link` (16 bytes per value), and every
+  list relink from the hit path.
+- **`durability`**: store only when `max(durability, stamp.durability)` is greater than the
+  loaded value. When that makes a value non-reusable, nothing else is needed: the sweep checks
+  durability, and a reader that raised it had already won the `last_interned_at` CAS this
+  revision.
+
+Why faster: a hit goes from a lock and unlock (two atomic RMWs on a shard line shared with
+every thread hashing there), a probe and a durability store to a lock-free probe: one control
+word load per group of eight. A reusable value adds one CAS per revision on its own line. This
+is the SwissTable/papaya bar (`docs/v2/plan/design/hardware.md`, "interner and memo lookups"),
+the same table `crates/intern` uses.
+
+Tests: a differential test against the current map, where seeded intern and lookup sequences
+across revisions, immortal and reusable, give the same IDs and generations. A test that 8
+`std::thread::scope` threads interning overlapping keys get one ID per key. A shuttle test
+(`feature = "shuttle"`, which salsa has) of a reader hitting a stale value while a writer
+sweeps the same shard: either the reader's ID is current and its fields are the ones it
+interned, or the reader got a new ID; never a reused slot under an old ID.
+
+## S3. Claims: shard count (`function/sync.rs:75`)
+
+`SyncTable::new` uses `max_parallelism().next_power_of_two().max(2)` shards; concurrency.md asks
+for at least 4 times the core count. Change to `(max_parallelism() * 4).next_power_of_two()`, as
+`interned::new_shards` does. Every execute and every deep verify of a memo from an older
+revision takes a claim, so on a warm build after an edit, each verified memo locks a shard. If
+your `Sync` rewrite replaces `SyncTable`, apply this to its replacement.
+
+## S4. Recording a read: skip the hash for a repeated edge (`active_query.rs:144`)
+
+`add_read` hashes the edge and probes `input_outputs` (an `FxIndexSet`) on every read. Before
+`insert_full`, compare with the last entry:
+
+```rust
+let edge = QueryEdge::input(input);
+let (edge, inserted) = match self.input_outputs.last() {
+    Some(last) if *last == edge => (self.input_outputs.len() - 1, false),
+    _ => self.input_outputs.insert_full(edge),
+};
+```
+
+The result is the same as `insert_full`'s (the set holds `edge` at `len - 1`), so nothing
+downstream changes. It skips the hash and probe for back-to-back reads of one key: loops
+calling one query on one key, and an accessor that reads one memo many times. Do the same in
+`add_read_simple` (`:173`) and `add_output` (`:194`). Test: one unit test that a frame that
+reads `a, a, b, a` records edges `[a, b]` with the same positions and fingerprints as before.
+
+## S5. Not filed, for the salsa owner after `Sync` lands: memos and edges as columns
+
+The memo budget (data.md: 24 bytes plus 4 per edge) and #734's edges need the memo layer
+redone the way rustc's dep graph is: a `u32` node index per memo, columns per function
+ingredient, and edges as one CSR array of node indices per ingredient. Deep verify should also
+run without a claim while it only reads. Today a memo is 48 bytes boxed plus 8 per edge in a
+second allocation, plus 8 per sibling function in the slot's memo table. What it would take is
+in `docs/v2/plan/lanes/db/speed-salsa.md`, "What it would take to meet the memo budget". It
+rewrites `zalsa_local.rs`, `function/*`, `table/memo.rs` and every ingredient, so it waits for
+your current part.

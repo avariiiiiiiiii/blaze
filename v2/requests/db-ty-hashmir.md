@@ -13,6 +13,7 @@ compile.
    `Hash` agrees with it.
 
 > forwarded to items: `crates/hir-ty/src/layout.rs:79` still derives no `Hash`.
+> applied: lane items is DONE; `LayoutError` derives `Hash` (`crates/hir-ty/src/layout.rs`). It compiles once 2 (`rustc_abi`, the coordinator's) lands.
 
 2. **What:** add `Hash` to the derive of `LayoutCalculatorError<F>`.
    **Where:** `crates/rustc_abi/src/layout.rs` (`#[derive(Copy, Clone, Debug, PartialEq, Eq)] pub

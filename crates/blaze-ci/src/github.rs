@@ -4,6 +4,7 @@
 //! No token, JWT or key is ever in an error, a log or a `Debug`.
 
 use std::{
+    borrow::Cow,
     fmt,
     io::{self, Read, Write},
     net::{TcpStream, ToSocketAddrs},
@@ -22,7 +23,6 @@ use ring::{
 };
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, pki_types::ServerName};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::{CheckRun, CheckStatus};
 

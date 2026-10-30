@@ -5,10 +5,12 @@
 //!  - Building the type for an item: This happens through the `ty` query.
 //!
 //! This usually involves resolving names, collecting generic arguments etc.
+pub(crate) mod batch;
 pub(crate) mod diagnostics;
 pub(crate) mod path;
+pub mod persist;
 
-use std::{cell::OnceCell, iter, mem, ops::Deref, sync::OnceLock};
+use std::{cell::OnceCell, iter, mem, sync::OnceLock};
 
 use either::Either;
 use hir_def::{
@@ -38,7 +40,6 @@ use hir_def::{
     },
 };
 use hir_expand::name::Name;
-use la_arena::ArenaMap;
 use path::{PathDiagnosticCallback, PathLoweringContext};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
@@ -2493,15 +2494,45 @@ pub(crate) fn lower_field_types<'db>(
     TyLoweringResult::from_ctx(res, ctx)
 }
 
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Debug, PartialEq, Eq, Default, Hash)]
 pub(crate) struct SupertraitsInfo {
-    /// This includes the trait itself.
-    pub(crate) all_supertraits: Box<[TraitId]>,
-    pub(crate) direct_supertraits: Box<[TraitId]>,
+    /// Every supertrait, the trait itself included, in one column: the direct supertraits first,
+    /// then the others, each part in ascending order.
+    supertraits: Box<[TraitId]>,
+    direct_len: u32,
     pub(crate) defined_assoc_types: Box<[(Name, TypeAliasId)]>,
 }
 
 impl SupertraitsInfo {
+    /// Every supertrait, the trait itself included.
+    #[inline]
+    pub(crate) fn all_supertraits(&self) -> &[TraitId] {
+        &self.supertraits
+    }
+
+    #[inline]
+    pub(crate) fn direct_supertraits(&self) -> &[TraitId] {
+        &self.supertraits[..self.direct_len as usize]
+    }
+
+    fn new(
+        all: FxHashSet<TraitId>,
+        direct: FxHashSet<TraitId>,
+        defined_assoc_types: FxHashSet<(Name, TypeAliasId)>,
+    ) -> SupertraitsInfo {
+        let mut supertraits: Vec<TraitId> = direct.iter().copied().collect();
+        supertraits.sort_unstable();
+        let mut others: Vec<TraitId> = all.into_iter().filter(|it| !direct.contains(it)).collect();
+        others.sort_unstable();
+        let direct_len = supertraits.len() as u32;
+        supertraits.extend(others);
+        SupertraitsInfo {
+            supertraits: supertraits.into_boxed_slice(),
+            direct_len,
+            defined_assoc_types: Box::from_iter(defined_assoc_types),
+        }
+    }
+
     #[inline]
     pub(crate) fn query(db: &dyn HirDatabase, trait_: TraitId) -> &Self {
         return supertraits_info(db, trait_);
@@ -2548,21 +2579,13 @@ impl SupertraitsInfo {
                 else {
                     continue;
                 };
-                let SupertraitsInfo {
-                    all_supertraits: bounded_trait_all_supertraits,
-                    direct_supertraits: _,
-                    defined_assoc_types: bounded_traits_defined_assoc_types,
-                } = SupertraitsInfo::query(db, bounded_trait);
-                all_supertraits.extend(bounded_trait_all_supertraits);
+                let bounded = SupertraitsInfo::query(db, bounded_trait);
+                all_supertraits.extend(bounded.all_supertraits());
                 direct_supertraits.insert(bounded_trait);
-                defined_assoc_types.extend(bounded_traits_defined_assoc_types.iter().cloned());
+                defined_assoc_types.extend(bounded.defined_assoc_types.iter().cloned());
             }
 
-            SupertraitsInfo {
-                all_supertraits: Box::from_iter(all_supertraits),
-                direct_supertraits: Box::from_iter(direct_supertraits),
-                defined_assoc_types: Box::from_iter(defined_assoc_types),
-            }
+            SupertraitsInfo::new(all_supertraits, direct_supertraits, defined_assoc_types)
         }
 
         fn supertraits_info_cycle(

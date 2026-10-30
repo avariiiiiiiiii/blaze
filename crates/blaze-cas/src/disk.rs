@@ -45,31 +45,33 @@ pub(crate) fn id_at(bytes: &[u8], at: usize) -> ContentId {
 
 // Packs.
 
-pub(crate) const PACK_MAGIC: [u8; 8] = *b"BLZPACK\x03";
-/// A pack starts with its magic and its kind; records follow.
+pub(crate) const PACK_MAGIC: [u8; 8] = *b"BLZPACK\x04";
+/// A pack starts with its magic and its unit (the crate version whose records it holds, 0 for
+/// what crates share); records of any kind follow.
 pub(crate) const PACK_HEADER: u64 = 16;
 
-pub(crate) fn pack_header(kind: Kind) -> [u8; PACK_HEADER as usize] {
+pub(crate) fn pack_header(unit: u32) -> [u8; PACK_HEADER as usize] {
     let mut out = [0; PACK_HEADER as usize];
     out[..8].copy_from_slice(&PACK_MAGIC);
-    out[8] = kind.code();
+    out[8..12].copy_from_slice(&unit.to_le_bytes());
     out
 }
 
-pub(crate) fn check_pack_header(bytes: &[u8], kind: Kind) -> Result<(), &'static str> {
+pub(crate) fn check_pack_header(bytes: &[u8], unit: u32) -> Result<(), &'static str> {
     if bytes.len() < PACK_HEADER as usize || bytes[..8] != PACK_MAGIC {
         return Err("it does not start as a pack of this store's format does");
     }
-    if bytes[8] != kind.code() || bytes[9..16].iter().any(|&it| it != 0) {
-        return Err("its header names another kind than its head says");
+    if u32_at(bytes, 8) != unit || bytes[12..16].iter().any(|&it| it != 0) {
+        return Err("its header names another unit than its head says");
     }
     Ok(())
 }
 
-/// The file of a pack, in its store's directory. Packs sit next to the head, so the directory
-/// sync of the head's write makes a new pack's name durable with it.
-pub(crate) fn pack_file(kind: Kind, number: u32) -> String {
-    format!("pack-{}-{number:06}", kind.name())
+/// The file of the pack at `at` in its store's head: a place the pack keeps, removed or not.
+/// Packs sit next to the head, so the directory sync of the head's write makes a new pack's
+/// name durable with it.
+pub(crate) fn pack_file(at: usize) -> String {
+    format!("pack-{at:06}")
 }
 
 pub(crate) fn index_file(slot: u8) -> String {
@@ -265,11 +267,12 @@ pub(crate) struct Loc {
 
 // The head.
 
-const HEAD_MAGIC: [u8; 8] = *b"BLZHEAD\x03";
+const HEAD_MAGIC: [u8; 8] = *b"BLZHEAD\x04";
 const HEAD_FIXED: usize = 8 + 4 + 4 + 8 + 8 + 8 + 4 + 4 + 8 + 4 + 4 + 4 + 4;
 const PACK_REF: usize = 32;
 const DICTIONARY_REF: usize = 16;
 const EXTERNAL_REF: usize = 40;
+const UNIT_REF: usize = 32;
 const HEAD_CHECK: usize = 4;
 const _: () = assert!(HEAD_FIXED == 72 && PACK_REF == 32);
 
@@ -284,8 +287,9 @@ pub(crate) struct IndexRef {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct PackRef {
-    pub kind: Kind,
-    pub number: u32,
+    /// The crate version whose records it holds: 0 for what crates share, else one more than
+    /// its place in [`Head::units`].
+    pub unit: u32,
     /// Its bytes that are the store's: anything after is a torn append, cut before the next.
     pub committed: u64,
     /// How far the index table covers it; records from here to `committed` are found by
@@ -321,6 +325,9 @@ pub(crate) struct Head {
     pub packs: Vec<PackRef>,
     pub dictionaries: Vec<DictionaryRef>,
     pub externals: Vec<ExternalRef>,
+    /// The crate versions with packs of their own, each once and never zero; a pack's unit `n`
+    /// is `units[n - 1]`.
+    pub units: Vec<ContentId>,
 }
 
 impl Head {
@@ -330,6 +337,7 @@ impl Head {
                 + self.packs.len() * PACK_REF
                 + self.dictionaries.len() * DICTIONARY_REF
                 + self.externals.len() * EXTERNAL_REF
+                + self.units.len() * UNIT_REF
                 + HEAD_CHECK,
         );
         out.extend_from_slice(&HEAD_MAGIC);
@@ -350,13 +358,12 @@ impl Head {
         out.extend_from_slice(&(self.packs.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.dictionaries.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.externals.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(self.units.len() as u32).to_le_bytes());
         debug_assert_eq!(out.len(), HEAD_FIXED);
         for pack in &self.packs {
-            out.push(pack.kind.code());
             out.push(u8::from(pack.removed));
-            out.extend_from_slice(&[0; 2]);
-            out.extend_from_slice(&pack.number.to_le_bytes());
+            out.extend_from_slice(&[0; 3]);
+            out.extend_from_slice(&pack.unit.to_le_bytes());
             out.extend_from_slice(&pack.committed.to_le_bytes());
             out.extend_from_slice(&pack.indexed.to_le_bytes());
             out.extend_from_slice(&pack.dead.to_le_bytes());
@@ -370,6 +377,9 @@ impl Head {
         for external in &self.externals {
             out.extend_from_slice(&external.content.0);
             out.extend_from_slice(&external.len.to_le_bytes());
+        }
+        for unit in &self.units {
+            out.extend_from_slice(&unit.0);
         }
         let check = crc::crc32c(&out);
         out.extend_from_slice(&check.to_le_bytes());
@@ -407,26 +417,31 @@ impl Head {
         let packs = u32_at(body, 56) as usize;
         let dictionaries = u32_at(body, 60) as usize;
         let externals = u32_at(body, 64) as usize;
+        let units = u32_at(body, 68) as usize;
         let want = packs
             .checked_mul(PACK_REF)
             .zip(dictionaries.checked_mul(DICTIONARY_REF))
             .zip(externals.checked_mul(EXTERNAL_REF))
-            .and_then(|((a, b), c)| a.checked_add(b)?.checked_add(c)?.checked_add(HEAD_FIXED));
+            .zip(units.checked_mul(UNIT_REF))
+            .and_then(|(((a, b), c), d)| {
+                a.checked_add(b)?.checked_add(c)?.checked_add(d)?.checked_add(HEAD_FIXED)
+            });
         if want != Some(body.len()) {
             return Err("its length is not what its counts say".into());
         }
         let mut at = HEAD_FIXED;
         let mut head = Head { generation, index, ..Head::default() };
         for _ in 0..packs {
-            let kind = Kind::from_code(body[at]).ok_or("a pack of no kind")?;
-            let removed = match body[at + 1] {
+            let removed = match body[at] {
                 0 => false,
                 1 => true,
                 _ => return Err("a pack neither kept nor removed".into()),
             };
+            if body[at + 1..at + 4].iter().any(|&it| it != 0) {
+                return Err("a pack has bytes set that no head sets".into());
+            }
             head.packs.push(PackRef {
-                kind,
-                number: u32_at(body, at + 4),
+                unit: u32_at(body, at + 4),
                 committed: u64_at(body, at + 8),
                 indexed: u64_at(body, at + 16),
                 dead: u64_at(body, at + 24),
@@ -447,13 +462,25 @@ impl Head {
             head.externals.push(ExternalRef { content: id_at(body, at), len: u64_at(body, at + 32) });
             at += EXTERNAL_REF;
         }
-        for pack in &head.packs {
+        let mut seen = rustc_hash::FxHashSet::default();
+        for _ in 0..units {
+            let unit = id_at(body, at);
+            if unit == ContentId::default() || !seen.insert(unit) {
+                return Err("it lists a unit twice, or one of no crate".into());
+            }
+            head.units.push(unit);
+            at += UNIT_REF;
+        }
+        for (number, pack) in head.packs.iter().enumerate() {
             if pack.indexed > pack.committed
                 || pack.dead > pack.committed
                 || pack.committed < PACK_HEADER
                 || pack.committed % BLOCK != 0
             {
-                return Err(format!("pack {} has impossible lengths", pack_file(pack.kind, pack.number)));
+                return Err(format!("{} has impossible lengths", pack_file(number)));
+            }
+            if pack.unit as usize > head.units.len() {
+                return Err(format!("{} is of a unit it does not list", pack_file(number)));
             }
         }
         Ok(head)

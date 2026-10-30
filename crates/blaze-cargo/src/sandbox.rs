@@ -290,22 +290,94 @@ pub fn read_record(file: &Path) -> Option<Vec<Line>> {
         .collect()
 }
 
+/// The text of the record, each name once: the paths, variables and scopes its lines name,
+/// one after another in one buffer, each by a `u32`. A name is hashed once (FxHash) and
+/// compared only with the names of its hash, and one seen before allocates nothing.
+#[derive(Default)]
+struct Names {
+    text: String,
+    /// Where each name ends in `text`, by its id.
+    ends: Vec<u32>,
+    /// The last name of each hash; [`Names::next`] has the others of that hash before it.
+    first: FxHashMap<u64, u32>,
+    next: Vec<u32>,
+}
+
+/// No name: the end of a chain of [`Names::next`].
+const NO_NAME: u32 = u32::MAX;
+
+/// The name with id 0, made first: no scope.
+const NO_SCOPE: u32 = 0;
+
+impl Names {
+    fn get(&self, id: u32) -> &str {
+        name_at(&self.text, &self.ends, id)
+    }
+
+    fn intern(&mut self, name: &str) -> u32 {
+        let head = self.first.entry(FxBuildHasher.hash_one(name)).or_insert(NO_NAME);
+        let mut at = *head;
+        while at != NO_NAME {
+            if name_at(&self.text, &self.ends, at) == name {
+                return at;
+            }
+            at = self.next[at as usize];
+        }
+        let id = self.ends.len() as u32;
+        self.text.push_str(name);
+        self.ends.push(self.text.len() as u32);
+        self.next.push(*head);
+        *head = id;
+        id
+    }
+}
+
+fn name_at<'a>(text: &'a str, ends: &[u32], id: u32) -> &'a str {
+    let start = match id {
+        0 => 0,
+        _ => ends[id as usize - 1] as usize,
+    };
+    &text[start..ends[id as usize] as usize]
+}
+
+/// A [`trace::Line`] by the ids of its names.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Noted {
+    what: u32,
+    scope: u32,
+    seen: Seen,
+}
+
+const _: () = assert!(std::mem::size_of::<Noted>() == 12);
+
+/// Whether a scope or what a line names can't be written as it is: a tab or a line break.
+fn unwritable(text: &str) -> bool {
+    text.as_bytes().contains(&b'\t') || text.as_bytes().contains(&b'\n')
+}
+
 /// What a sandbox notes as its program runs: each [`trace::Line`] once, appended to the live
 /// record as it is first seen when there is one ([`Recorder::live`]), and written as the record
-/// of `blaze sandbox SPEC -- PROGRAM` when the run ends ([`Recorder::write`]).
+/// of `blaze sandbox SPEC -- PROGRAM` when the run ends ([`Recorder::write`]). A line seen
+/// before costs hashing its path and one lookup, and allocates nothing.
 pub struct Recorder {
-    lines: BTreeSet<trace::Line>,
+    names: Names,
+    /// Every line seen, kept or not: one seen before is not looked at again.
+    noted: FxHashSet<Noted>,
+    /// The lines kept, in the order they were first seen.
+    lines: Vec<Noted>,
     /// The live record, each new line appended before the call it notes goes on.
     live: Option<std::fs::File>,
     /// Why a line could not be appended to the live record: it is not whole after that.
     live_failed: Option<String>,
+    /// The line being appended to the live record.
+    appending: Vec<u8>,
     /// The scope each thread runs in, by the thread's id, as [`MARK`] said or as the thread
     /// that forked its process had it.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    threads: HashMap<u64, String>,
+    threads: FxHashMap<u64, u32>,
     /// Every thread seen, scoped or not: one not seen yet is new.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    known: std::collections::HashSet<u64>,
+    known: FxHashSet<u64>,
     /// Whether the processes load the interposer: one that ran a program and never said it
     /// loaded is an `X` line ([`Recorder::ended`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -349,12 +421,17 @@ impl Recorder {
         // What is read there is an input, as what is read in an overlay is.
         let mut overlays = overlays;
         overlays.extend(readable.iter().cloned());
+        let mut names = Names::default();
+        names.intern("");
         Recorder {
-            lines: BTreeSet::new(),
+            names,
+            noted: FxHashSet::default(),
+            lines: Vec::new(),
             live: None,
             live_failed: None,
-            threads: HashMap::new(),
-            known: std::collections::HashSet::new(),
+            appending: Vec::new(),
+            threads: FxHashMap::default(),
+            known: FxHashSet::default(),
             interposed: false,
             pending: std::collections::BTreeMap::new(),
             reads: spec.record_reads,
@@ -384,31 +461,68 @@ impl Recorder {
     /// knows the scope of a call itself, not by its thread. A read, a listing, a variable and
     /// what can't be traced are kept only when reads are recorded, a path only when it is an
     /// input, as [`Recorder::read`] keeps it.
-    pub fn reached(&mut self, seen: Seen, scope: String, what: &str) {
-        let kept = match seen {
-            Seen::Read | Seen::Looked | Seen::Listed => self.reads && self.input(what),
-            Seen::Env | Seen::Untraceable => self.reads,
+    pub fn reached(&mut self, seen: Seen, scope: &str, what: &str) {
+        let scope = self.names.intern(scope);
+        self.note(seen, scope, what);
+    }
+
+    /// [`Recorder::reached`], in the scope of id `scope`.
+    fn note(&mut self, seen: Seen, scope: u32, what: &str) {
+        let recorded = match seen {
+            Seen::Read | Seen::Looked | Seen::Listed | Seen::Env | Seen::Untraceable => self.reads,
             Seen::RefusedWrite | Seen::RefusedNet | Seen::Incomplete => true,
         };
-        if !kept {
+        if !recorded {
             return;
         }
-        let line = trace::Line::new(seen, &scope, what);
-        if self.lines.contains(&line) {
+        let noted = Noted { what: self.names.intern(what), scope, seen };
+        if !self.noted.insert(noted) {
+            return;
+        }
+        if matches!(seen, Seen::Read | Seen::Looked | Seen::Listed) && !self.input(what) {
+            return;
+        }
+        let written = match (unwritable(self.names.get(scope)), unwritable(what)) {
+            (false, false) => noted,
+            (true, _) => Noted {
+                what: self.names.intern("a scope with a tab or a line break in it"),
+                scope: NO_SCOPE,
+                seen: Seen::Incomplete,
+            },
+            (false, true) => Noted {
+                what: self.names.intern("a path or a name with a tab or a line break in it"),
+                scope,
+                seen: Seen::Incomplete,
+            },
+        };
+        if written != noted && !self.noted.insert(written) {
             return;
         }
         if let Some(file) = &mut self.live
             && self.live_failed.is_none()
-            && let Err(e) = file.write_all(line.text().as_bytes())
         {
-            self.live_failed = Some(e.to_string());
+            let line = &mut self.appending;
+            line.clear();
+            line.push(written.seen.letter() as u8);
+            line.push(b'\t');
+            line.extend_from_slice(self.names.get(written.scope).as_bytes());
+            line.push(b'\t');
+            line.extend_from_slice(self.names.get(written.what).as_bytes());
+            line.push(b'\n');
+            if let Err(e) = file.write_all(line) {
+                self.live_failed = Some(e.to_string());
+            }
         }
-        self.lines.insert(line);
+        self.lines.push(written);
     }
 
-    /// Every line seen, each once, in order.
-    pub fn lines(&self) -> impl Iterator<Item = &trace::Line> {
-        self.lines.iter()
+    /// Every line seen, each once, in the order first seen.
+    pub fn lines(&self) -> impl Iterator<Item = trace::Line> + '_ {
+        self.lines.iter().map(|it| trace::Line {
+            seen: it.seen,
+            scope: self.names.get(it.scope).to_owned(),
+            what: self.names.get(it.what).to_owned(),
+        })
     }
 
     /// Why the live record is not whole, when a line could not be appended to it.
@@ -424,7 +538,7 @@ impl Recorder {
     pub fn ended(&mut self) {
         for (program, scope) in std::mem::take(&mut self.pending).into_values() {
             let why = format!("{program} ran without the interposer, so what it read is not known");
-            self.reached(Seen::Incomplete, scope, &why);
+            self.reached(Seen::Incomplete, &scope, &why);
         }
     }
 
@@ -438,21 +552,22 @@ impl Recorder {
 
     /// Writes the record of `blaze sandbox SPEC -- PROGRAM` to `file`, whole or not at all.
     pub fn write(&self, file: &Path) {
-        let lines: BTreeSet<Line> = self
+        let mut lines: Vec<(Reached, &str, &str)> = self
             .lines
             .iter()
             .filter_map(|it| {
                 let reached = Reached::of_seen(it.seen)?;
-                Some(Line { reached, test: it.scope.clone(), what: it.what.clone() })
+                Some((reached, self.names.get(it.scope), self.names.get(it.what)))
             })
             .collect();
-        let mut text = String::new();
-        for line in &lines {
-            text.push(line.reached.letter());
+        lines.sort_unstable();
+        let mut text = String::with_capacity(lines.iter().map(|it| it.1.len() + it.2.len() + 4).sum());
+        for (reached, test, what) in lines {
+            text.push(reached.letter());
             text.push('\t');
-            text.push_str(&line.test);
+            text.push_str(test);
             text.push('\t');
-            text.push_str(&line.what);
+            text.push_str(what);
             text.push('\n');
         }
         let writing = file.with_extension("writing");
@@ -479,7 +594,10 @@ impl Recorder {
         if let Some(name) = path.strip_prefix(MARK.as_bytes()) {
             match name.is_empty() {
                 true => _ = self.threads.remove(&thread),
-                false => _ = self.threads.insert(thread, String::from_utf8_lossy(name).into_owned()),
+                false => {
+                    let scope = self.names.intern(&String::from_utf8_lossy(name));
+                    self.threads.insert(thread, scope);
+                }
             }
             return true;
         }
@@ -489,7 +607,7 @@ impl Recorder {
         if let Some(name) = path.strip_prefix(ENV_MARK.as_bytes()) {
             // A name that is not UTF-8 is read as one that is: the variable is an input
             // either way, and `Traced::env` names variables as text.
-            self.reached(Seen::Env, self.scope(thread), &String::from_utf8_lossy(name));
+            self.note(Seen::Env, self.scope_of(thread), &String::from_utf8_lossy(name));
             return true;
         }
         if path == CLOCK_MARK.as_bytes() {
@@ -505,7 +623,12 @@ impl Recorder {
 
     /// The scope `thread` runs in, empty when none.
     pub fn scope(&self, thread: u64) -> String {
-        self.threads.get(&thread).cloned().unwrap_or_default()
+        self.names.get(self.scope_of(thread)).to_owned()
+    }
+
+    /// The id of the scope `thread` runs in.
+    fn scope_of(&self, thread: u64) -> u32 {
+        self.threads.get(&thread).copied().unwrap_or(NO_SCOPE)
     }
 
     /// Whether `thread` was seen before.
@@ -517,33 +640,34 @@ impl Recorder {
     /// the scope the thread that forked it had then.
     pub fn starts(&mut self, thread: u64, scope: String) {
         if self.known.insert(thread) && !scope.is_empty() {
+            let scope = self.names.intern(&scope);
             self.threads.insert(thread, scope);
         }
     }
 
     /// `thread` read `path`, made whole: recorded when reads are and it is an input.
     pub fn read(&mut self, thread: u64, path: &str) {
-        self.reached(Seen::Read, self.scope(thread), path);
+        self.reached(Seen::Read, self.scope_of(thread), path);
     }
 
     /// `thread` looked at `path`, made whole, without opening it: recorded as [`Self::read`]
     /// records a read.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn looked(&mut self, thread: u64, path: &str) {
-        self.reached(Seen::Looked, self.scope(thread), path);
+        self.reached(Seen::Looked, self.scope_of(thread), path);
     }
 
     /// `thread` listed the directory `path`, made whole: recorded as [`Self::read`] records a
     /// read.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn listed(&mut self, thread: u64, path: &str) {
-        self.reached(Seen::Listed, self.scope(thread), path);
+        self.reached(Seen::Listed, self.scope_of(thread), path);
     }
 
     /// `thread` got what can't be traced.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn untraceable(&mut self, thread: u64, it: blaze_core::Untraceable) {
-        self.reached(Seen::Untraceable, self.scope(thread), trace::untraceable_name(it));
+        self.note(Seen::Untraceable, self.scope_of(thread), trace::untraceable_name(it));
     }
 
     /// Randomness was read. What a process read of it stays in it (`std` keeps the keys of its
@@ -551,7 +675,7 @@ impl Recorder {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn random(&mut self) {
         let name = trace::untraceable_name(blaze_core::Untraceable::Random);
-        self.reached(Seen::Untraceable, String::new(), name);
+        self.note(Seen::Untraceable, NO_SCOPE, name);
     }
 
     /// `process` runs the program `path`, in `scope`: when the processes load the interposer,
@@ -586,17 +710,17 @@ impl Recorder {
 
     /// The sandbox refused `thread` a write to `path`.
     pub fn refused_write(&mut self, thread: u64, path: &str) {
-        self.reached(Seen::RefusedWrite, self.scope(thread), path);
+        self.reached(Seen::RefusedWrite, self.scope_of(thread), path);
     }
 
     /// The sandbox refused `thread` the network at `address`.
     pub fn refused_net(&mut self, thread: u64, address: &str) {
-        self.reached(Seen::RefusedNet, self.scope(thread), address);
+        self.note(Seen::RefusedNet, self.scope_of(thread), address);
     }
 
     /// The record is not whole for what `thread` did, and why.
     pub fn incomplete(&mut self, thread: u64, why: &str) {
-        self.reached(Seen::Incomplete, self.scope(thread), why);
+        self.note(Seen::Incomplete, self.scope_of(thread), why);
     }
 }
 

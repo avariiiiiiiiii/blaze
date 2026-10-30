@@ -1,7 +1,8 @@
 //! Detecting whether a type is infinitely-sized.
 
-use hir_def::{AdtId, VariantId, hir::generics::GenericParams};
+use hir_def::{AdtId, VariantId};
 use rustc_type_ir::inherent::IntoKind;
+use thin_vec::ThinVec;
 
 use crate::{
     db::HirDatabase,
@@ -79,7 +80,7 @@ fn representability_adt_ty<'db>(
     let params_in_repr = params_in_repr(db, def_id);
     for (i, arg) in args.iter().enumerate() {
         if let GenericArgKind::Type(ty) = arg.kind()
-            && params_in_repr[i]
+            && params_in_repr.get(i)
         {
             rtry!(representability_ty(db, ty));
         }
@@ -87,22 +88,49 @@ fn representability_adt_ty<'db>(
     Representability::Representable
 }
 
-fn no_params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> Box<[bool]> {
-    let generics = GenericParams::of(db, def_id.into());
-    (0..generics.len_early_bound_lifetimes() + generics.len_type_or_consts())
-        .map(|_| false)
-        .collect()
+/// Which of an ADT's generic parameters, by index, appear in its representation: a bitset, the
+/// first 64 parameters in one word, which allocates nothing for nearly every ADT.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+struct ParamsInRepr {
+    first: u64,
+    rest: ThinVec<u64>,
 }
 
-fn params_in_repr_cycle(db: &dyn HirDatabase, _: salsa::Id, def_id: AdtId) -> Box<[bool]> {
-    no_params_in_repr(db, def_id)
+const _: () = assert!(size_of::<ParamsInRepr>() == 16);
+
+impl ParamsInRepr {
+    #[inline]
+    fn get(&self, index: usize) -> bool {
+        let word = match index / 64 {
+            0 => self.first,
+            at => self.rest.get(at - 1).copied().unwrap_or(0),
+        };
+        word & (1 << (index % 64)) != 0
+    }
+
+    fn insert(&mut self, index: usize) {
+        let bit = 1 << (index % 64);
+        match index / 64 {
+            0 => self.first |= bit,
+            at => {
+                if self.rest.len() < at {
+                    self.rest.resize(at, 0);
+                }
+                self.rest[at - 1] |= bit;
+            }
+        }
+    }
+}
+
+fn params_in_repr_cycle(_db: &dyn HirDatabase, _: salsa::Id, _def_id: AdtId) -> ParamsInRepr {
+    ParamsInRepr::default()
 }
 
 // This is a query because a chain of types that each hold the one before several times would
 // otherwise be walked once per path through it.
 #[salsa::tracked(cycle_result = params_in_repr_cycle, returns(ref))]
-fn params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> Box<[bool]> {
-    let mut params_in_repr = no_params_in_repr(db, def_id);
+fn params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> ParamsInRepr {
+    let mut params_in_repr = ParamsInRepr::default();
     let mut handle_variant = |variant| {
         for field in db.field_types(variant).values() {
             params_in_repr_ty(
@@ -121,16 +149,21 @@ fn params_in_repr(db: &dyn HirDatabase, def_id: AdtId) -> Box<[bool]> {
             }
         }
     }
+    params_in_repr.rest.shrink_to_fit();
     params_in_repr
 }
 
-fn params_in_repr_ty<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>, params_in_repr: &mut [bool]) {
+fn params_in_repr_ty<'db>(
+    db: &'db dyn HirDatabase,
+    ty: Ty<'db>,
+    params_in_repr: &mut ParamsInRepr,
+) {
     match ty.kind() {
         TyKind::Adt(adt, args) => {
             let inner_params_in_repr = self::params_in_repr(db, adt.def_id());
             for (i, arg) in args.iter().enumerate() {
                 if let GenericArgKind::Type(ty) = arg.kind()
-                    && inner_params_in_repr[i]
+                    && inner_params_in_repr.get(i)
                 {
                     params_in_repr_ty(db, ty, params_in_repr);
                 }
@@ -138,9 +171,32 @@ fn params_in_repr_ty<'db>(db: &'db dyn HirDatabase, ty: Ty<'db>, params_in_repr:
         }
         TyKind::Array(ty, _) => params_in_repr_ty(db, ty, params_in_repr),
         TyKind::Tuple(tys) => tys.iter().for_each(|ty| params_in_repr_ty(db, ty, params_in_repr)),
-        TyKind::Param(param) => {
-            params_in_repr[param.index as usize] = true;
-        }
+        TyKind::Param(param) => params_in_repr.insert(param.index as usize),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ParamsInRepr;
+
+    #[test]
+    fn params_in_repr_is_a_bitset_past_one_word() {
+        let mut set = ParamsInRepr::default();
+        for index in [0, 5, 63, 64, 130] {
+            set.insert(index);
+        }
+        let set_bits: Vec<usize> = (0..200).filter(|&it| set.get(it)).collect();
+        assert_eq!(set_bits, [0, 5, 63, 64, 130]);
+        assert_eq!(set.rest.len(), 2);
+    }
+
+    #[test]
+    fn params_in_repr_of_few_params_allocates_nothing() {
+        let mut set = ParamsInRepr::default();
+        set.insert(3);
+        set.insert(40);
+        assert!(set.rest.is_empty());
+        assert!(set.get(3) && set.get(40) && !set.get(4) && !set.get(64));
     }
 }

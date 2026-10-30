@@ -1404,7 +1404,7 @@ impl Hash for MirBody<'_> {
         start_block.hash(state);
         owner.hash(state);
         binding_locals.hash(state);
-        hash_unordered(upvar_locals.iter(), state);
+        hash_by_key(upvar_locals.iter(), state);
         param_locals.hash(state);
         promoted_locals.hash(state);
         closures.hash(state);
@@ -1419,21 +1419,20 @@ impl Hash for MirBody<'_> {
     }
 }
 
-/// Hashes the entries of a map so that maps that are `==` hash the same whatever order they
-/// iterate in: each entry on its own, summed.
-fn hash_unordered<'a, K: Hash + 'a, V: Hash + 'a, H: Hasher>(
-    entries: impl ExactSizeIterator<Item = (&'a K, &'a V)>,
+/// Hashes the entries of a map (distinct keys) in the order of their keys, so that maps that
+/// are `==` hash the same whatever order they iterate in. Straight into `state`, with no
+/// hasher per entry; up to 8 entries sort on the stack.
+fn hash_by_key<'a, K: Hash + Ord + 'a, V: Hash + 'a, H: Hasher>(
+    entries: impl Iterator<Item = (&'a K, &'a V)>,
     state: &mut H,
 ) {
-    let len = entries.len();
-    let sum = entries.fold(0u128, |sum, entry| {
-        let mut hasher = salsa::StableHasher::new();
-        entry.hash(&mut hasher);
-        let (low, high) = hasher.finish128();
-        sum.wrapping_add((u128::from(high) << 64) | u128::from(low))
-    });
-    state.write_usize(len);
-    state.write_u128(sum);
+    let mut entries: SmallVec<[(&K, &V); 8]> = entries.collect();
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    state.write_usize(entries.len());
+    for (key, value) in entries {
+        key.hash(state);
+        value.hash(state);
+    }
 }
 
 /// What a body means, which depends on the passes it has been through. The IDE only ever
@@ -1941,14 +1940,26 @@ pub struct VTableMap<'db> {
 impl<'db> VTableMap<'db> {
     const OFFSET: usize = 1000; // We should add some offset to ids to make 0 (null) an invalid id.
 
+    /// The id of the first type: the `n`th of [`VTableMap::tys`] has id `FIRST_ID + n`.
+    pub const FIRST_ID: usize = VTableMap::OFFSET;
+
+    /// One hash of `ty` per call, a hit or a new id alike.
     pub fn id(&mut self, ty: Ty<'db>) -> usize {
-        if let Some(it) = self.ty_to_id.get(&ty) {
-            return *it;
+        match self.ty_to_id.entry(ty) {
+            std::collections::hash_map::Entry::Occupied(it) => *it.get(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let id = self.id_to_ty.len() + VTableMap::OFFSET;
+                self.id_to_ty.push(ty);
+                slot.insert(id);
+                id
+            }
         }
-        let id = self.id_to_ty.len() + VTableMap::OFFSET;
-        self.id_to_ty.push(ty);
-        self.ty_to_id.insert(ty, id);
-        id
+    }
+
+    /// The types, in the order of their ids, which run on from [`VTableMap::FIRST_ID`]
+    /// without a gap.
+    pub fn tys(&self) -> impl ExactSizeIterator<Item = Ty<'db>> + '_ {
+        self.id_to_ty.iter().copied()
     }
 
     pub fn ty(&self, id: usize) -> Result<Ty<'db>, MirEvalError<'db>> {
@@ -2202,12 +2213,22 @@ impl MirOptLevel {
 mod tests {
     use rustc_hash::FxHashMap;
 
-    use super::hash_unordered;
+    use super::hash_by_key;
 
-    fn digest<'a>(entries: impl ExactSizeIterator<Item = (&'a u32, &'a Vec<u32>)>) -> (u64, u64) {
+    fn digest<'a>(entries: impl Iterator<Item = (&'a u32, &'a Vec<u32>)>) -> (u64, u64) {
         let mut hasher = salsa::StableHasher::new();
-        hash_unordered(entries, &mut hasher);
+        hash_by_key(entries, &mut hasher);
         hasher.finish128()
+    }
+
+    #[test]
+    fn a_small_map_hashes_by_key_on_the_stack_too() {
+        let forward = map((0..3).map(|key| (key, vec![key])), 0);
+        let backward = map((0..3).rev().map(|key| (key, vec![key])), 64);
+        assert_eq!(digest(forward.iter()), digest(backward.iter()));
+        assert_ne!(digest(forward.iter()), digest(map([(0, vec![0])], 0).iter()));
+        let empty = map(std::iter::empty::<(u32, Vec<u32>)>(), 0);
+        assert_ne!(digest(empty.iter()), digest(map([(0, vec![])], 0).iter()));
     }
 
     fn map(

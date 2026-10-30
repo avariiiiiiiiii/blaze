@@ -29,6 +29,7 @@ pub(crate) mod build;
 pub(crate) mod convert;
 pub(crate) mod fold;
 pub(crate) mod frontend;
+pub(crate) mod hashes;
 pub(crate) mod places;
 pub(crate) mod refs;
 pub(crate) mod release;
@@ -41,6 +42,7 @@ pub(crate) mod unwind;
 
 pub use backend::Backends;
 pub use frontend::{Databases, HirFrontend};
+pub use hashes::ItemHashes;
 
 /// What the items lane says of the front end's items by content (docs/v2/plan/lanes/items.md): the
 /// keys the code generator puts in place of the database's dense ids, which differ from one

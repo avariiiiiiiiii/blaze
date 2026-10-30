@@ -32,6 +32,19 @@ vfs-notify.workspace = true
 vfs.workspace = true
 intern.workspace = true
 
+# v2's lowering of a build's units (`v2`)
+base-db.workspace = true
+blaze-graph.workspace = true
+blaze-ids.workspace = true
+blaze-query.workspace = true
+blaze-units = { workspace = true, features = ["query"] }
+blaze-vfs.workspace = true
+hir.workspace = true
+line-index.workspace = true
+rustc-hash.workspace = true
+salsa.workspace = true
+toml.workspace = true
+
 [features]
 in-rust-tree = ["hir-expand/in-rust-tree", "proc-macro-api/in-rust-tree"]
 

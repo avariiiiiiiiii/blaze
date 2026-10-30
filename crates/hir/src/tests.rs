@@ -2,9 +2,17 @@ mod db;
 
 use base_db::{SourceDatabase, all_crates};
 use hir_def::{
-    DefWithBodyId, FunctionId, ModuleDefId, nameres::crate_def_map, signatures::FunctionSignature,
+    DefWithBodyId, FunctionId, ModuleDefId, TraitId, nameres::crate_def_map,
+    signatures::FunctionSignature,
 };
-use hir_ide::{InferBodyId, InferenceResult, db::HirDatabase};
+use hir_ide::{
+    InferBodyId, InferenceResult,
+    db::HirDatabase,
+    next_solver::{
+        DbInterner, GenericArgs, ParamEnv, Ty, TypingMode,
+        infer::{DbInternerInferExt, select::EvaluationResult},
+    },
+};
 use hir_ty_borrowck::{Checked, NotChecked, Refused};
 use test_fixture::WithFixture;
 
@@ -128,6 +136,17 @@ fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
         let batch = crate::check::check_crate(&db, krate, false, None);
         assert_eq!(kinds(&batch), kinds(&one_by_one));
         assert_eq!(format!("{batch:?}"), format!("{one_by_one:?}"));
+    });
+}
+
+#[test]
+fn small_modules_share_a_task() {
+    let db = TestDB::with_files(MODULES);
+    crate::attach_db(&db, || {
+        let krate = crate::check::workspace_crates(&db)[0];
+        let modules = crate::check::file_modules(&db, krate);
+        // `main` has five items with itself; `a` three and `b` two take one task together.
+        assert_eq!(crate::check::tasks(&db, &modules), [0, 1]);
     });
 }
 
@@ -300,5 +319,92 @@ pub fn g() {}
             assert_eq!((mir.basic_blocks.len(), mir.locals.len()), before);
         });
         assert_eq!(count(&executed, "mir_body_query"), 1, "{executed:#?}");
+    });
+}
+
+const SOLVER: &str = r#"
+//- minicore: sized
+trait Tr {}
+struct A;
+struct B<T>(T);
+struct C;
+impl Tr for A {}
+impl<T: Tr> Tr for B<T> {}
+"#;
+
+/// The item named `name` in the type namespace of a module of the fixture, and its crate.
+fn type_item(db: &TestDB, name: &str) -> (base_db::Crate, ModuleDefId) {
+    for &krate in all_crates(db).iter() {
+        let def_map = crate_def_map(db, krate);
+        for (_, module) in def_map.modules(db) {
+            for (it, per_ns) in module.scope(db).entries() {
+                if it.as_str() == name
+                    && let Some(def) = per_ns.take_types()
+                {
+                    return (krate, def);
+                }
+            }
+        }
+    }
+    panic!("no type `{name}` in the fixture")
+}
+
+/// Whether each of `goals` implements `tr`, all asked of one inference context of `interner`.
+fn implements<'db>(
+    interner: DbInterner<'db>,
+    tr: TraitId,
+    goals: &[(Ty<'db>, bool)],
+) -> Vec<EvaluationResult> {
+    let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+    goals.iter().map(|&(ty, _)| infcx.type_implements_trait(tr, [ty], ParamEnv::empty())).collect()
+}
+
+#[test]
+fn a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread() {
+    let db = TestDB::with_files(SOLVER);
+    crate::attach_db(&db, || {
+        let (krate, ModuleDefId::TraitId(tr)) = type_item(&db, "Tr") else {
+            panic!("`Tr` is a trait")
+        };
+        let adt = |name| match type_item(&db, name).1 {
+            ModuleDefId::AdtId(it) => it,
+            _ => panic!("`{name}` is a struct"),
+        };
+        let (a, b, c) = (adt("A"), adt("B"), adt("C"));
+        let interner = DbInterner::new_with(&db, krate);
+        let leaf = |adt| Ty::new_adt(interner, adt, GenericArgs::empty());
+        let wrap = |ty: Ty<'_>| Ty::new_adt(interner, b, GenericArgs::new_from_slice(&[ty.into()]));
+        let goals = [
+            (leaf(a), true),
+            (leaf(c), false),
+            (wrap(leaf(a)), true),
+            (wrap(leaf(c)), false),
+            (wrap(wrap(leaf(a))), true),
+            (wrap(wrap(leaf(c))), false),
+            (wrap(wrap(wrap(leaf(a)))), true),
+        ];
+
+        let cold: Vec<EvaluationResult> = goals
+            .iter()
+            .map(|goal| {
+                implements(DbInterner::new_with(&db, krate), tr, std::slice::from_ref(goal))[0]
+            })
+            .collect();
+        for (at, (&(_, holds), &answer)) in goals.iter().zip(&cold).enumerate() {
+            let expected = if holds {
+                EvaluationResult::EvaluatedToOk
+            } else {
+                EvaluationResult::EvaluatedToErr
+            };
+            assert_eq!(answer, expected, "goal {at}");
+        }
+
+        let warm = DbInterner::new_with(&db, krate);
+        assert_eq!(implements(warm, tr, &goals), cold, "first asked");
+        assert_eq!(implements(warm, tr, &goals), cold, "answered from the cache");
+        let elsewhere = std::thread::scope(|scope| {
+            scope.spawn(|| crate::attach_db(&db, || implements(warm, tr, &goals))).join().unwrap()
+        });
+        assert_eq!(elsewhere, cold, "answered on another thread");
     });
 }

@@ -951,7 +951,7 @@ where
         _ = zalsa_mut;
 
         for shard in self.shards.iter_mut() {
-            // We can clear the key maps now that we have cancelled all other handles.
+            // We can clear the key maps: `zalsa_mut` means no query runs.
             shard.get_mut().key_map.clear();
         }
     }

@@ -15,6 +15,7 @@ mod tests;
 
 use blaze_ids::ContentId;
 use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
+use rustc_hash::FxHashMap;
 
 use crate::load::{Foreign, ForeignAsk, ForeignProfile};
 use crate::query::{Cbor, LoadError, Mount, Origin, StdGraph, StdKey, StdPlanned, StdUnits, kinds, producer};
@@ -188,7 +189,9 @@ fn checked(ask: &ForeignAsk, graph: StdGraph) -> Result<StdGraph, String> {
     if graph.plans.len() != graph.units.len() {
         return Err(format!("the load planned {} of the standard library's {} units", graph.plans.len(), graph.units.len()));
     }
-    let name_of = |pkg_id: &str| graph.packages.iter().find(|it| it.id == pkg_id).map(|it| it.name.as_str());
+    let mut names: FxHashMap<&str, &str> = FxHashMap::with_capacity_and_hasher(graph.packages.len(), Default::default());
+    names.extend(graph.packages.iter().map(|it| (it.id.as_str(), it.name.as_str())));
+    let name_of = |pkg_id: &str| names.get(pkg_id).copied();
     for unit in &graph.units {
         let name = name_of(&unit.pkg_id).ok_or_else(|| format!("the load gave no package `{}`", unit.pkg_id))?;
         if !unit.is_std {
@@ -199,8 +202,8 @@ fn checked(ask: &ForeignAsk, graph: StdGraph) -> Result<StdGraph, String> {
             return Err(format!("`{name}` is built with `panic = \"{}\"`, not `\"abort\"`", unit.profile.panic));
         }
     }
-    let named: Vec<&str> = graph.roots.iter().map(|(name, _)| name.as_str()).collect();
-    if named != ask.roots.iter().map(String::as_str).collect::<Vec<_>>() {
+    if !graph.roots.iter().map(|(name, _)| name).eq(&ask.roots) {
+        let named: Vec<&str> = graph.roots.iter().map(|(name, _)| name.as_str()).collect();
         return Err(format!("the load's roots are {named:?}, not the crates asked, {:?}", ask.roots));
     }
     for (name, index) in &graph.roots {

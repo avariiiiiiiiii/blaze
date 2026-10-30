@@ -12,6 +12,11 @@ impl<'a> Reader<'a> {
         Reader { bytes, at: 0 }
     }
 
+    /// A reader of `bytes` from `at` on, `at` counted from the start of `bytes`.
+    pub(super) fn starting_at(bytes: &'a [u8], at: usize) -> Reader<'a> {
+        Reader { bytes, at: at.min(bytes.len()) }
+    }
+
     /// Where the next byte is, from the start of the bytes read.
     pub(super) fn at(&self) -> usize {
         self.at

@@ -24,7 +24,7 @@
 //! In this crate: [`key`] gives each item its [`ItemKey`] and resolves one back; `form` writes
 //! an item's normalized form; [`hash`] fills the forms' slots and gives the four hashes
 //! ([`hashes`]); [`facts`] gives each [`Fact`] its value; `index` holds the negative-fact
-//! indexes. Each is computed by `#[salsa::tracked]` queries over the front end's database, so
+//! indexes; [`table`] holds hashes and facts as columns ([`HashColumns`], [`FactSet`]). Each is computed by `#[salsa::tracked]` queries over the front end's database, so
 //! an edit recomputes only the forms it touched and stops where a hash comes out equal.
 
 mod facts;
@@ -32,6 +32,7 @@ mod form;
 pub mod hash;
 mod index;
 pub mod key;
+pub mod table;
 #[cfg(test)]
 mod tests;
 
@@ -51,6 +52,7 @@ pub use hash::{
 };
 pub use index::*;
 pub use key::{Resolved, item_key, resolve};
+pub use table::{FactSet, HashColumns, crate_hashes};
 
 /// Which item, in one database: its dense ids, never hashed, never kept past the database.
 /// [`ItemKey`] is what is kept.

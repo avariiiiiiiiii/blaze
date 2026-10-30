@@ -5,7 +5,7 @@ date: 2026-10-29
 ---
 # blaze v2: the store, as written
 
-The design is [v2/store.md](v2/plan/lanes/store.md) (section 8); this is how `crates/blaze-cas` does it.
+The design is the store lane file, [v2/plan/lanes/store.md](v2/plan/lanes/store.md); this is how `crates/blaze-cas` does it.
 `Store` is a sans-IO state machine: it maps, appends, syncs and writes through
 `blaze_core::Effect`s and is told how each went by `Store::complete`.
 
@@ -16,7 +16,7 @@ One flat directory per store (`Config::dir`):
 | file | what |
 |---|---|
 | `head` | what the store is: its generation, which index slot is live (with its length, count and CRC-32C), each pack with its committed and indexed length, the dictionaries, the files of their own. Ends with a CRC-32C. Written whole with `Effect::Write` (temporary file, sync, rename, directory sync). |
-| `pack-<kind>-<n>` | appended to only: a 16-byte header (magic, kind), then records. Every commit ends it on a 4 KiB block, the rest of the block zeros, so every append can be written with `O_DIRECT`. A pack takes no appends once it is 1 GiB. |
+| `pack-<n>` | the records of one crate version (#1298), of every kind, appended to only: a 16-byte header (magic, unit), then records. `n` is its place in the head's list, which it keeps when removed. Every commit ends it on a 4 KiB block, the rest of the block zeros, so every append can be written with `O_DIRECT`. A pack takes no appends once it is 1 GiB; its unit's next pack takes them. |
 | `index-0`, `index-1` | the two index slots: an open-addressed table on keys, written whole into the slot the head does not name. |
 | `head` packs | each pack's entry also holds its dead bytes (records since moved) and whether it is removed; a removed pack keeps its place in the list so the numbers records name stay put. |
 | `file-<content>` | a hot value of 4 MiB or more (not an output), a file of its own: mapped on its own, placed by cloning. |
@@ -27,7 +27,9 @@ durable with it.
 A **record** is a 96-byte header (magic, kind, form, a CRC-32C of the header, dictionary,
 stored and raw lengths, key, content hash), the payload, and zeros to the next 16 bytes. Its
 form is `Raw` (read in place), `Zstd`, `Lz4` (a chunk), `Chunked` (a list of chunk keys and
-lengths), `External` (the value is `file-<content>`) or `Dictionary`. The store's format is 2. `Entry::content` is BLAKE3 of the
+lengths), `External` (the value is `file-<content>`), `Dictionary`, `Warm` or `ColdColumns`
+(a value's columns, below: the payload is the schema's 32-byte hash, then the encoded bytes,
+so warm bytes keep the record's 16-byte alignment). The store's format is 2. `Entry::content` is BLAKE3 of the
 value's bytes under `"blaze v2 store value 1"`.
 
 An **index table** (`index.rs`) is laid out as a SwissTable: a 64-byte header, a control
@@ -88,7 +90,9 @@ values from then on are compressed with it. A training that fails is in `Store::
 tried again on twice the samples. A cold value of 8 MiB or more gets no dictionary but zstd's
 long-distance matching over a 128 MiB window, on 4 threads: a fixed count, so the bytes are the
 same on every machine. zstd refusing a value stops the store; it is never kept another way. A
-compressed value is decompressed on read and held until the store is next changed.
+compressed value is decompressed on read and held until the store is next changed. Each
+dictionary is digested once when it is read or trained (zstd's `CDict` and `DDict`, shared by
+every thread), so a put or a read of a cold value loads no dictionary.
 
 ## Chunks and placing
 
@@ -137,7 +141,19 @@ SSH); `remote::Client` is a laptop daemon's way to it. `Store::fetch` asks; the 
 against its content hash and put like any value. The channel is what is trusted for the key; the
 bytes are checked. It is never on the VM's hot path: the VM's builds read their own store.
 
-## Hardware (v2 plan section 16, plan/hardware.md)
+## One file per crate version (#1298)
+
+A **unit** is a crate version as the store numbers it: `Store::unit(crate_version)` gives the
+same `Unit` for the same content ID, and the head lists the units in order, so the numbering
+survives an open. `Store::put_in(unit, ...)` appends to that unit's pack, so one crate version's
+query results, code and debug info sit in one mapped file. A crate's build reads them together,
+and a crate version's records can be dropped as a whole. Chunks of outputs, dictionaries and
+values put with `Store::put` are in `Unit::SHARED` (0), since no one crate version owns them. A
+record moved between tiers, or copied out of a retired pack, stays in its unit. A commit
+appends to each pack written, syncs each and then writes the head once: the barrier is the
+head's write, whatever the number of crate versions.
+
+## Hardware (plan/design/hardware.md)
 
 Each hot loop picks its path at run time by CPU feature, and every path gives the same bits, so
 which one runs is dispatch, never a fallback:
@@ -153,43 +169,72 @@ The differential tests run every path the test machine has against the portable 
 store asks of the drivers (`O_DIRECT`, registered buffers, SQPOLL, linked submissions, huge pages
 and NUMA-local mappings) is in v2/requests/store.md; threads and pinning are core's.
 
-## Settling: hot and cold by reads
+## Settling: hot, warm and cold by reads
 
-`Store::settle` is called by the daemon when it is idle. Each call is a period: what was read in
-it and in the one before is known from two bit columns (`flags.rs`). It moves records between
-tiers by how recently they were read, copying each into a new record and leaving the old one
-dead:
+`Store::settle` is called by the daemon when it is idle. Each call is a period: what was read
+and what was made in it and in the one before is known from four bit columns (`flags.rs`). It
+moves records between tiers by how recently they were read, copying each into a new record and
+leaving the old one dead. A record of 4 KiB or more moves a tier colder once it was neither read
+nor made in the last two periods:
 
-- a raw or LZ4 record of 4 KiB or more that nothing read for two periods goes to zstd, batched
-  by kind with that kind's dictionary (trained first from the kind's records if it has none); a
-  record that zstd does not shrink by an eighth stays and is marked tried, never tried again;
-- a zstd record read in two periods running comes back raw (an output, LZ4);
+- a value of a schema the store was given `Columns` for (`Store::encode_columns`) goes from hot
+  to warm columns, or straight to cold where warm saves less than an eighth, and from warm to
+  cold columns;
+- any other raw or LZ4 record goes to zstd, batched by kind with that kind's dictionary (trained
+  first from the kind's records if it has none);
+- a record whose next tier does not save an eighth stays and is marked tried, never tried
+  again;
+- a zstd, warm or cold record read in two periods running comes back raw (an output, LZ4).
 - a sealed pack at least half dead is retired: its live records are copied on, the next head
   marks it removed, and once that head is durable its file is removed. A pack named removed
   when the store opens is removed again.
 
 A call does at most 256 MiB and says if there is more. Every move round-trips the same bytes,
 checked against the content hash before it is copied. What was read is not kept across an open
-or an index rewrite (rows are renumbered), so after either nothing goes cold until two periods
+or an index rewrite (rows are renumbered), so after either nothing goes colder until two periods
 have passed.
 
-## Data-oriented (v2 plan section 17, plan/design/data.md)
+## Columns: what each tier is (plan/design/data.md, "Compression follows the columns")
 
-- Per-record flags (checked, read this period, read last period, compression tried) are bit
-  columns indexed by the record's row (its index slot, or its number in the delta), not sets of
-  keys: a period's turn is a move of one column into the other.
+What a value's columns are is format's; when a value is in which tier is the store's. The store
+is given a `Columns` per schema: four functions from the value as put (a `blaze_format` buffer,
+whose header names the schema) to its warm form (bit-packed by frame of reference, random
+access, read in place) and its cold form (a codec per column, then zstd), and back. Every
+encoding the store makes is decoded and compared with the value before it is kept; one that
+does not give the value back is not kept, is in `Store::problems`, and the record is marked
+tried. A cold kind's value of such a schema is put in cold columns at once.
+
+`Store::get` always gives the value as it was put, decoding warm and cold records (held until
+the store next changes, as zstd's are). `Store::get_in_place` gives a warm record's bytes where
+they are, with `Heat::Warm`, for readers of the schema's warm form. Either is checked the same
+way: decoded and hashed against the content hash, once a record. A record in columns of a
+schema the store was not given is refused, naming the schema; nothing reads it another way.
+
+The proof's column shapes (`blaze_v2_proof::columns`: empty, runs, sorted, CSR offsets, each
+narrow range, a frame far from zero, the extremes) are run through the store itself. Each shape
+is put as a value of columns, moved by `settle` as cold as it goes, read back hot, and
+reopened, and must read the same at every step (`columns::round_trips`). What the first move
+leaves, warm or hot, must read element by element in place (`columns::reads_in_place`).
+
+## Data-oriented (plan/design/data.md)
+
+- Per-record flags (checked, read and made this period and the one before, compression tried)
+  are bit columns indexed by the record's row (its index slot, or its number in the delta), not
+  sets of keys: a period's turn is a move of one column into the other. The columns are atomic
+  words, sized when a row is made, so a read takes no lock, and a flag already set is only
+  loaded, so a record read again writes no shared cache line.
+- Maps on keys and content IDs (the delta, files of their own, fetches) index by the BLAKE3
+  hash's first eight bytes: a lookup hashes nothing.
 - The index's control column is the dense array probing runs over; the plan's row asks for keys
   and places in separate arrays, but a hit needs both, so they share one 64-byte row: one miss a
   hit, not two.
 - Settling batches by kind: one compressor and dictionary a kind, records in pack order.
 - Size budgets are const-asserted: `Key` 32 bytes, `Loc` 32, a delta entry 48, an index row 64,
   the head's fixed part 72 and a pack entry 32.
-- Column codecs (frame of reference, run lengths, deltas over a column) are the value encoding's
-  (format's): values are opaque bytes to the store, which applies zstd last.
+- Column codecs (frame of reference, run lengths, deltas over a column) are format's, reached
+  through `Columns`; the store keeps opaque values as before, raw or zstd.
 
 ## Not done here
 
-- Eviction: no live record is removed from a store; settling removes only dead space. The VM's disk is taken as unlimited (v2 README
-  section 2); a store is removed whole.
-- One file per crate version (#1298's makepad layout): `put` takes no crate, so packs are per
-  kind; the commit is #1298's (append, one barrier, index into the inactive slot, head flip).
+- Eviction: no live record is removed from a store; settling removes only dead space. The VM's
+  disk is taken as unlimited (plan/design/model.md); a store is removed whole.

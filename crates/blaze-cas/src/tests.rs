@@ -241,7 +241,7 @@ fn a_flipped_byte_of_a_value_is_never_served() {
     flush(&mut sim, &mut store);
     let loc = store.tiers[0].delta[&key(2)].loc;
     drop(store);
-    let pack = name("store/pack-query-000000");
+    let pack = name("store/pack-000000");
     let mut bytes = sim.contents(&pack);
     bytes[(loc.offset + RECORD_HEADER) as usize + 500] ^= 1;
     sim.change(&pack, &bytes);
@@ -263,7 +263,7 @@ fn a_record_header_that_is_not_whole_stops_the_store_naming_its_pack() {
     store.put(key(1), Kind::Code, vec![7; 100]).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
-    let pack = name("store/pack-code-000000");
+    let pack = name("store/pack-000000");
     let mut bytes = sim.contents(&pack);
     bytes[PACK_HEADER as usize + 40] ^= 0xff;
     sim.change(&pack, &bytes);
@@ -297,7 +297,7 @@ fn near_identical_outputs_share_their_chunks() {
     let mut sim = Sim::new(7, quiet());
     let mut store = open(&mut sim, "store");
     let output_bytes = |store: &Store| -> u64 {
-        store.tiers[0].packs.iter().filter(|it| it.kind == Kind::Output).map(|it| it.end).sum()
+        store.tiers[0].packs.iter().map(|it| it.end).sum()
     };
     let first = noise(2 << 20, 70);
     let mut second = first.clone();
@@ -480,10 +480,9 @@ fn a_head_round_trips_and_refuses_any_change() {
         generation: 7,
         index: Some(IndexRef { slot: 1, len: 64 + 1024 * 64, check: 0xdead_beef, count: 3 }),
         packs: vec![
-            PackRef { kind: Kind::Code, number: 0, committed: 4096, indexed: 16, dead: 0, removed: true },
+            PackRef { unit: 0, committed: 4096, indexed: 16, dead: 0, removed: true },
             PackRef {
-                kind: Kind::Run,
-                number: 2,
+                unit: 2,
                 committed: 3 * 4096,
                 indexed: 4096,
                 dead: 100,
@@ -492,6 +491,7 @@ fn a_head_round_trips_and_refuses_any_change() {
         ],
         dictionaries: vec![DictionaryRef { kind: Kind::Run, pack: 1, offset: 16 }],
         externals: vec![ExternalRef { content: content_of(b"y"), len: 9 }],
+        units: vec![content_of(b"crate a 1.0.0"), content_of(b"crate b 2.1.0")],
     };
     let bytes = head.encode();
     assert_eq!(Head::decode(&bytes).unwrap(), head);
@@ -646,7 +646,7 @@ fn a_changed_byte_in_the_zeros_ending_a_commit_stops_the_store_naming_its_pack()
     store.put(key(1), Kind::Code, vec![7; 100]).unwrap();
     flush(&mut sim, &mut store);
     drop(store);
-    let pack = name("store/pack-code-000000");
+    let pack = name("store/pack-000000");
     let mut bytes = sim.contents(&pack);
     let last = bytes.len() - 1;
     bytes[last] = 1;
@@ -798,7 +798,7 @@ fn a_value_that_does_not_compress_is_tried_once() {
     settle(&mut sim, &mut store);
     assert_eq!(settle(&mut sim, &mut store).demoted, 0);
     let (_, row) = store.tiers[0].find(&key(1)).unwrap().unwrap();
-    assert!(lock(&store.flags)[0].get(row, Flag::Tried));
+    assert!(store.flags[0].get(row, Flag::Tried));
     assert_eq!(form_of(&store, &key(1)), Form::Raw);
     assert_eq!(settle(&mut sim, &mut store), Settled::default());
 }
@@ -865,5 +865,382 @@ fn a_pack_left_behind_by_a_crash_is_removed_at_the_next_open() {
     assert!(gone.iter().all(|it| !sim.exists(it)));
     for n in 0..60 {
         assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 12 << 10), "{n}");
+    }
+}
+
+/// A schema of one `u32` column, encoded by blaze-format's tiers: what a query's result made
+/// of columns is to the store. `broken` encodings give back other values from warm.
+struct OneColumn {
+    schema: SchemaHash,
+    warm_schema: SchemaHash,
+    broken: bool,
+}
+
+const ONE_COLUMN_HEAD: usize = 8 + 32 + 8;
+const WARM_HEAD: usize = 8 + 32 + 4 + 4 + 8;
+
+fn one_column(broken: bool) -> OneColumn {
+    OneColumn {
+        schema: SchemaHash(ContentId::of("blaze v2 store test schema", b"one column")),
+        warm_schema: SchemaHash(ContentId::of("blaze v2 store test schema", b"one column, warm")),
+        broken,
+    }
+}
+
+fn word<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
+    bytes[at..at + N].try_into().unwrap()
+}
+
+impl OneColumn {
+    fn hot(&self, values: &[u32]) -> Vec<u8> {
+        let mut out = blaze_format::MAGIC.to_vec();
+        out.extend(self.schema.0.0);
+        out.extend((values.len() as u64).to_le_bytes());
+        out.extend(values.iter().flat_map(|it| it.to_le_bytes()));
+        out
+    }
+
+    fn values(&self, hot: &[u8]) -> Result<Vec<u32>, String> {
+        if hot.len() < ONE_COLUMN_HEAD || hot[8..40] != self.schema.0.0 {
+            return Err("not a value of the schema".into());
+        }
+        let len = u64::from_le_bytes(word(hot, 40)) as usize;
+        let rest = &hot[ONE_COLUMN_HEAD..];
+        if rest.len() != len * 4 {
+            return Err("not as long as it says".into());
+        }
+        Ok(rest.chunks_exact(4).map(|it| u32::from_le_bytes(it.try_into().unwrap())).collect())
+    }
+}
+
+impl Columns for OneColumn {
+    fn schema(&self) -> SchemaHash {
+        self.schema
+    }
+
+    fn warm(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
+        let packed = blaze_format::tiers::Packed::pack(&self.values(hot)?);
+        let mut out = blaze_format::MAGIC.to_vec();
+        out.extend(self.warm_schema.0.0);
+        out.extend(packed.min.to_le_bytes());
+        out.extend(packed.bits.to_le_bytes());
+        out.extend((packed.len as u64).to_le_bytes());
+        out.extend(packed.words.iter().flat_map(|it| it.to_le_bytes()));
+        Ok(out)
+    }
+
+    fn hot_from_warm(&self, warm: &[u8]) -> Result<Vec<u8>, String> {
+        if warm.len() < WARM_HEAD || warm[8..40] != self.warm_schema.0.0 {
+            return Err("not warm columns of the schema".into());
+        }
+        let words = warm[WARM_HEAD..].chunks_exact(8).map(|it| u64::from_le_bytes(it.try_into().unwrap()));
+        let packed = blaze_format::tiers::Packed {
+            min: u32::from_le_bytes(word(warm, 40)),
+            bits: u32::from_le_bytes(word(warm, 44)),
+            len: u64::from_le_bytes(word(warm, 48)) as usize,
+            words: words.collect(),
+        };
+        let mut values = packed.unpack();
+        if self.broken {
+            values[0] += 1;
+        }
+        Ok(self.hot(&values))
+    }
+
+    fn cold(&self, hot: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(blaze_format::tiers::encode_cold(&self.values(hot)?, None))
+    }
+
+    fn hot_from_cold(&self, cold: &[u8]) -> Result<Vec<u8>, String> {
+        let values = blaze_format::tiers::decode_cold(cold, None).map_err(|it| it.to_string())?;
+        Ok(self.hot(&values))
+    }
+}
+
+/// A column of 4096 values in a range of 50: 16 KiB hot, 6 bits a value warm.
+fn column_values(n: u32) -> Vec<u32> {
+    (0..4096).map(|at| 1000 + n + at * 7 % 50).collect()
+}
+
+fn with_columns(sim: &mut Sim, broken: bool) -> Store {
+    let mut store = open(sim, "store");
+    store.encode_columns(Arc::new(one_column(broken)));
+    store
+}
+
+#[test]
+fn a_value_of_columns_goes_warm_then_cold_then_comes_back_hot() {
+    let mut sim = Sim::new(40, quiet());
+    let mut store = with_columns(&mut sim, false);
+    let columns = one_column(false);
+    let hot = columns.hot(&column_values(0));
+    store.put(key(1), Kind::Query, hot.clone()).unwrap();
+    flush(&mut sim, &mut store);
+    for _ in 0..2 {
+        assert_eq!(settle(&mut sim, &mut store).demoted, 0);
+    }
+    assert_eq!(settle(&mut sim, &mut store).demoted, 1);
+    assert_eq!(form_of(&store, &key(1)), Form::Warm);
+    assert!(store.tiers[0].find(&key(1)).unwrap().unwrap().0.stored < hot.len() as u64 / 4);
+    assert_eq!(settle(&mut sim, &mut store).demoted, 0, "a warm record made last period stays");
+    assert_eq!(settle(&mut sim, &mut store).demoted, 1);
+    assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
+    for round in 0..2 {
+        assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+        let (heat, entry) = store.get_in_place(&key(1)).unwrap().unwrap();
+        assert_eq!((heat, entry.bytes, entry.content), (Heat::Hot, hot.as_slice(), content_of(&hot)));
+        assert_eq!(settle(&mut sim, &mut store).promoted, round);
+    }
+    assert_eq!(form_of(&store, &key(1)), Form::Raw);
+    drop(store);
+    let store = with_columns(&mut sim, false);
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn warm_columns_are_read_in_place_and_refused_without_their_encoding() {
+    let mut sim = Sim::new(41, quiet());
+    let mut store = with_columns(&mut sim, false);
+    let columns = one_column(false);
+    let hot = columns.hot(&column_values(3));
+    store.put(key(1), Kind::Query, hot.clone()).unwrap();
+    flush(&mut sim, &mut store);
+    for _ in 0..3 {
+        settle(&mut sim, &mut store);
+    }
+    assert_eq!(form_of(&store, &key(1)), Form::Warm);
+    let warm = columns.warm(&hot).unwrap();
+    let (heat, first) = store.get_in_place(&key(1)).unwrap().unwrap();
+    assert_eq!((heat, first.bytes, first.content), (Heat::Warm, warm.as_slice(), content_of(&hot)));
+    let (_, again) = store.get_in_place(&key(1)).unwrap().unwrap();
+    assert_eq!(first.bytes.as_ptr(), again.bytes.as_ptr(), "read where it is kept");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot, "a get gives the value as put");
+    drop(store);
+    let store = open(&mut sim, "store");
+    let refused = store.get(&key(1)).unwrap_err();
+    assert!(refused.what.contains("no encoding"), "{refused}");
+    assert!(store.get_in_place(&key(1)).is_err());
+    assert_eq!(store.verify(None).len(), 1);
+    drop(store);
+    let store = with_columns(&mut sim, false);
+    assert_eq!(store.get_in_place(&key(1)).unwrap().unwrap().1.bytes, warm.as_slice());
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn columns_that_do_not_decode_to_the_value_are_not_kept() {
+    let mut sim = Sim::new(42, quiet());
+    let mut store = with_columns(&mut sim, true);
+    let hot = one_column(true).hot(&column_values(5));
+    store.put(key(1), Kind::Query, hot.clone()).unwrap();
+    flush(&mut sim, &mut store);
+    for _ in 0..3 {
+        assert_eq!(settle(&mut sim, &mut store).demoted, 0);
+    }
+    assert_eq!(form_of(&store, &key(1)), Form::Raw);
+    assert!(store.problems().iter().any(|it| it.contains("do not decode")), "{:?}", store.problems());
+    let (_, row) = store.tiers[0].find(&key(1)).unwrap().unwrap();
+    assert!(store.flags[0].get(row, Flag::Tried));
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+}
+
+#[test]
+fn a_cold_kind_of_columns_is_put_in_cold_columns() {
+    let mut sim = Sim::new(43, quiet());
+    let mut store = with_columns(&mut sim, false);
+    let hot = one_column(false).hot(&column_values(9));
+    store.put(key(1), Kind::Run, hot.clone()).unwrap();
+    assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+    flush(&mut sim, &mut store);
+    drop(store);
+    let store = with_columns(&mut sim, false);
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn each_crate_version_has_packs_of_its_own_and_keeps_them_across_an_open() {
+    let mut sim = Sim::new(50, quiet());
+    let mut store = open(&mut sim, "store");
+    let (a, b) = (content_of(b"crate a 1.0.0"), content_of(b"crate b 2.1.0"));
+    let unit_a = store.unit(a);
+    let unit_b = store.unit(b);
+    assert_eq!(store.unit(a), unit_a, "a crate version is numbered once");
+    assert_ne!(unit_a, unit_b);
+    for n in 0..6 {
+        let unit = if n % 2 == 0 { unit_a } else { unit_b };
+        store.put_in(unit, key(n), [Kind::Query, Kind::Code, Kind::Debug][n as usize % 3], noise(5000, n)).unwrap();
+    }
+    store.put(key(10), Kind::Image, noise(3000, 10)).unwrap();
+    flush(&mut sim, &mut store);
+    let pack_of = |store: &Store, n: u64| store.tiers[0].find(&key(n)).unwrap().unwrap().0.pack as usize;
+    let units: Vec<u32> = (0..6).map(|n| store.tiers[0].packs[pack_of(&store, n)].unit).collect();
+    assert_eq!(units, [unit_a.0, unit_b.0, unit_a.0, unit_b.0, unit_a.0, unit_b.0]);
+    assert_eq!(pack_of(&store, 0), pack_of(&store, 2), "kinds of one crate version share its file");
+    assert_eq!(store.tiers[0].packs[pack_of(&store, 10)].unit, Unit::SHARED.0);
+    assert_eq!(store.tiers[0].packs.len(), 3);
+    drop(store);
+    let mut store = open(&mut sim, "store");
+    assert_eq!(store.unit(b), unit_b, "the head keeps the numbering");
+    assert_eq!(store.tiers[0].units, [a, b]);
+    for n in 0..6 {
+        assert_eq!(bytes_of(&store, &key(n)).unwrap(), noise(5000, n), "{n}");
+    }
+    store.put_in(unit_a, key(20), Kind::Query, noise(100, 20)).unwrap();
+    assert_eq!(pack_of(&store, 20), pack_of(&store, 0), "a unit appends to its own pack");
+    assert_eq!(store.verify(None), Vec::new());
+}
+
+#[test]
+fn a_pack_whose_header_names_another_unit_stops_the_store() {
+    let mut sim = Sim::new(51, quiet());
+    let mut store = open(&mut sim, "store");
+    let unit = store.unit(content_of(b"crate a 1.0.0"));
+    store.put_in(unit, key(1), Kind::Query, noise(100, 1)).unwrap();
+    flush(&mut sim, &mut store);
+    drop(store);
+    let pack = name("store/pack-000000");
+    let mut bytes = sim.contents(&pack);
+    bytes[8] = 0;
+    sim.change(&pack, &bytes);
+    let mut effects = Vec::new();
+    let mut store = Store::open(config("store"), &mut effects);
+    drive(&mut sim, &mut store, &mut effects);
+    let broken = store.broken().expect("the unit is checked");
+    assert_eq!(broken.file, pack);
+    assert!(broken.what.contains("unit"), "{broken}");
+}
+
+/// `column` repeated to at least 8 KiB, so the tier mover (which leaves records under
+/// `DEMOTE_FROM` where they are) moves every shape but the empty one.
+fn movable_column(column: &[u32]) -> Vec<u32> {
+    let times = match column.len() {
+        0 => 1,
+        len => (8 << 10usize).div_ceil(4 * len),
+    };
+    column.repeat(times)
+}
+
+/// The record's form and values, read without counting as a read, so looking does not change
+/// where the mover sends it.
+fn peek(store: &Store, key: &Key) -> (Form, Vec<u32>) {
+    let (loc, row) = store.tiers[0].find(key).unwrap().unwrap();
+    let (_, bytes) = store.value(0, key, loc, row, Use::Check).unwrap();
+    (loc.form, one_column(false).values(&bytes).unwrap())
+}
+
+/// What a column read as at each step of its record's life in the store.
+struct Trip {
+    len: usize,
+    stages: Vec<(&'static str, Form, Vec<u32>)>,
+}
+
+/// Puts `column` as a value of columns, lets the mover take it as cold as it goes (two
+/// unread periods a tier), reads it in two periods running so it comes back hot, and reopens.
+fn through_the_tiers(column: &[u32], forms: &std::cell::RefCell<Vec<Form>>) -> Trip {
+    let mut sim = Sim::new(60, quiet());
+    let mut store = with_columns(&mut sim, false);
+    let hot = one_column(false).hot(&movable_column(column));
+    store.put(key(1), Kind::Query, hot).unwrap();
+    flush(&mut sim, &mut store);
+    let mut trip = Trip { len: column.len(), stages: Vec::new() };
+    let (form, values) = peek(&store, &key(1));
+    trip.stages.push(("put", form, values));
+    for (stage, settles) in [("first move", 3), ("second move", 2)] {
+        for _ in 0..settles {
+            settle(&mut sim, &mut store);
+        }
+        let (form, values) = peek(&store, &key(1));
+        forms.borrow_mut().push(form);
+        trip.stages.push((stage, form, values));
+    }
+    for _ in 0..2 {
+        store.get(&key(1)).unwrap().unwrap();
+        settle(&mut sim, &mut store);
+    }
+    let (form, values) = peek(&store, &key(1));
+    trip.stages.push(("read back hot", form, values));
+    drop(store);
+    let store = with_columns(&mut sim, false);
+    let (form, values) = peek(&store, &key(1));
+    trip.stages.push(("reopened", form, values));
+    assert_eq!(store.verify(None), Vec::new());
+    trip
+}
+
+/// The column every stage of `trip` read, when they all read the same and it came back raw.
+fn column_of(trip: &Trip) -> Result<Vec<u32>, String> {
+    let (_, _, first) = &trip.stages[0];
+    for (stage, form, values) in &trip.stages {
+        if values != first {
+            return Err(format!("{stage} ({form:?}) read other values than were put"));
+        }
+    }
+    let (_, last, _) = trip.stages.last().unwrap();
+    if trip.len > 0 && *last != Form::Raw {
+        return Err(format!("read in two periods running, it stayed {last:?}"));
+    }
+    Ok(first[..trip.len].to_vec())
+}
+
+#[test]
+fn a_record_moved_hot_to_warm_to_cold_and_back_round_trips_every_column_shape() {
+    for seed in [1, 2, 3] {
+        let forms = std::cell::RefCell::new(Vec::new());
+        let checked =
+            blaze_v2_proof::columns::round_trips(|column| through_the_tiers(column, &forms), column_of, seed)
+                .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        assert!(checked > 100, "{checked} shapes");
+        let forms = forms.into_inner();
+        assert!(forms.contains(&Form::Warm), "no shape went warm: {forms:?}");
+        assert!(forms.contains(&Form::ColdColumns), "no shape went cold: {forms:?}");
+    }
+}
+
+/// A column as the store leaves it after the mover's first move: read in place where it is.
+enum InPlace {
+    Hot(Vec<u8>),
+    Warm(blaze_format::tiers::Packed),
+}
+
+fn moved_once(column: &[u32]) -> InPlace {
+    let mut sim = Sim::new(61, quiet());
+    let mut store = with_columns(&mut sim, false);
+    store.put(key(1), Kind::Query, one_column(false).hot(&movable_column(column))).unwrap();
+    flush(&mut sim, &mut store);
+    for _ in 0..3 {
+        settle(&mut sim, &mut store);
+    }
+    let (heat, entry) = store.get_in_place(&key(1)).unwrap().unwrap();
+    match heat {
+        Heat::Hot => InPlace::Hot(entry.bytes.to_vec()),
+        Heat::Warm => {
+            let warm = entry.bytes;
+            let words = warm[WARM_HEAD..].chunks_exact(8).map(|it| u64::from_le_bytes(it.try_into().unwrap()));
+            InPlace::Warm(blaze_format::tiers::Packed {
+                min: u32::from_le_bytes(word(warm, 40)),
+                bits: u32::from_le_bytes(word(warm, 44)),
+                len: u64::from_le_bytes(word(warm, 48)) as usize,
+                words: words.collect(),
+            })
+        }
+    }
+}
+
+fn element(column: &InPlace, at: usize) -> u32 {
+    match column {
+        InPlace::Hot(bytes) => u32::from_le_bytes(word(bytes, ONE_COLUMN_HEAD + 4 * at)),
+        InPlace::Warm(packed) => packed.as_ref().get(at),
+    }
+}
+
+#[test]
+fn what_the_mover_leaves_warm_or_hot_reads_in_place_for_every_column_shape() {
+    for seed in [1, 2, 3] {
+        let checked = blaze_v2_proof::columns::reads_in_place(moved_once, element, seed)
+            .unwrap_or_else(|why| panic!("seed {seed}: {why}"));
+        assert!(checked > 100, "{checked} shapes");
     }
 }

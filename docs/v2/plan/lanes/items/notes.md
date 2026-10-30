@@ -107,6 +107,19 @@ holds it. Form's sub-forms and index's name hashes batch the same way. Maps keye
 again; hashbrown does the SIMD probing. CRC32C, huge pages, NUMA, io_uring and threads are other
 lanes' rows.
 
+## Data
+
+docs/v2/plan/design/data.md's row for items: hashes as columns per kind, facts as sorted
+triples, negative-fact indexes as sorted arrays. `table::HashColumns` (built per crate by
+`crate_hashes`) holds a crate's item hashes sorted by key, one column per hash kind; a layout or
+code hash only some items have sits densely in its own column, found through a presence bitset
+(`table::Bits`) by rank, and the unhashable items are a side table. `changed_since` is one merge
+of two builds' key columns. `table::FactSet` holds facts as a `u8` kind and two `u32`s over a
+sorted dictionary of the ids they name (9 bytes a fact, `const`-asserted): one kind's facts
+about one subject are one range. The hash of a component writes every member's refs into one
+CSR list and hashes each refinement round in one batch. The indexes in `index.rs` keep the
+searched column apart from the rest.
+
 ## What other lanes must keep
 
 - Codegen and link name callees by identity (key and instance arguments, including the impls

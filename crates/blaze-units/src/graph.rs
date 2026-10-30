@@ -135,7 +135,7 @@ struct Dep {
 }
 
 /// A package as a profile override matches it.
-struct ProfilePkg<'a>(&'a blaze_manifest::manifest::PackageId);
+pub(crate) struct ProfilePkg<'a>(pub(crate) &'a blaze_manifest::manifest::PackageId);
 
 impl fmt::Display for ProfilePkg<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

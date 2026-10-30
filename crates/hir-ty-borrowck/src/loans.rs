@@ -22,10 +22,12 @@ use hir_ty::{
 
 use super::{
     Ctx,
-    bitset::BitSet,
+    bitset::{BitMatrix, BitSet},
     cfg::{Cfg, Location, index},
+    dataflow::{GenKill, forward},
     intervals::IntervalSet,
     regions::{RegionValues, Regions, Rv},
+    relation::{Facts, Relation},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,7 +39,8 @@ pub(super) enum Activation {
 
 pub(super) struct Loan {
     pub(super) local: LocalId,
-    pub(super) projection: Vec<PlaceElem>,
+    /// The range of [`Loans::projections`] the projection of the place borrowed is.
+    projection: (u32, u32),
     pub(super) kind: BorrowKind,
     pub(super) region: Rv,
     pub(super) location: Location,
@@ -47,13 +50,22 @@ pub(super) struct Loan {
     pub(super) activation: Activation,
 }
 
+/// The kinds of the facts of [`Loans::index`]: the loan made at a point, the loans of a
+/// local, the two-phase loans activated at a point.
+const MADE_AT: u8 = 0;
+const OF_LOCAL: u8 = 1;
+const ACTIVATED_AT: u8 = 2;
+/// The kind of the facts of [`Loans::scopes`]: the loans that go out of scope as a point
+/// starts.
+const ENDS_AT: u8 = 0;
+
 pub(super) struct Loans {
     pub(super) loans: Vec<Loan>,
-    pub(super) at: FxHashMap<Location, usize>,
-    pub(super) of_local: FxHashMap<LocalId, Vec<usize>>,
-    pub(super) activations: FxHashMap<Location, Vec<usize>>,
-    /// The loans that go out of scope at the start of each point.
-    out_of_scope: FxHashMap<usize, Vec<usize>>,
+    /// The projections of every loan's place, one after another.
+    projections: Vec<PlaceElem>,
+    /// Each list in the order the loans were made, or for activations, found.
+    index: Relation,
+    scopes: Relation,
     /// The borrows of a promoted copy, which make no loan and read nothing.
     pub(super) promoted: FxHashSet<Location>,
 }
@@ -504,12 +516,12 @@ impl Loans {
         }
         let mut loans = Loans {
             loans: Vec::new(),
-            at: FxHashMap::default(),
-            of_local: FxHashMap::default(),
-            activations: FxHashMap::default(),
-            out_of_scope: FxHashMap::default(),
+            projections: Vec::new(),
+            index: Relation::default(),
+            scopes: Relation::default(),
             promoted: promoted_borrows(ctx, body),
         };
+        let mut facts = Facts::default();
         let mut two_phase: FxHashMap<LocalId, usize> = FxHashMap::default();
         for &block in &cfg.order {
             for (statement, it) in body.basic_blocks[block].statements.iter().enumerate() {
@@ -538,9 +550,11 @@ impl Loans {
                 if two {
                     two_phase.insert(place.local, id);
                 }
+                let start = loans.projections.len() as u32;
+                loans.projections.extend_from_slice(projection);
                 loans.loans.push(Loan {
                     local: borrowed.local,
-                    projection: projection.to_vec(),
+                    projection: (start, loans.projections.len() as u32),
                     kind,
                     region,
                     location,
@@ -552,8 +566,8 @@ impl Loans {
                         Activation::NotTwoPhase
                     },
                 });
-                loans.at.insert(location, id);
-                loans.of_local.entry(borrowed.local).or_default().push(id);
+                facts.push(MADE_AT, cfg.point(location), id);
+                facts.push(OF_LOCAL, borrowed.local.into_raw().into_u32() as usize, id);
             }
         }
         if !two_phase.is_empty() {
@@ -597,27 +611,51 @@ impl Loans {
                             && loans.loans[id].location != location
                         {
                             loans.loans[id].activation = Activation::At(location);
-                            loans.activations.entry(location).or_default().push(id);
+                            facts.push(ACTIVATED_AT, cfg.point(location), id);
                         }
                     }
                 }
             }
         }
+        loans.index = facts.freeze(&[cfg.points, body.locals.len(), cfg.points]);
         loans
+    }
+
+    /// The projection of the place `id` borrows.
+    pub(super) fn projection(&self, id: usize) -> &[PlaceElem] {
+        let (start, end) = self.loans[id].projection;
+        &self.projections[start as usize..end as usize]
+    }
+
+    /// The loan made at `point`, if one is.
+    fn made_at(&self, point: usize) -> Option<usize> {
+        self.index.get(MADE_AT, point).first().map(|&it| it as usize)
+    }
+
+    /// The loans of a place of `local`, in the order they were made.
+    pub(super) fn of_local(&self, local: LocalId) -> &[u32] {
+        self.index.get(OF_LOCAL, local.into_raw().into_u32() as usize)
+    }
+
+    /// The two-phase loans first used at `point`.
+    pub(super) fn activated_at(&self, point: usize) -> &[u32] {
+        self.index.get(ACTIVATED_AT, point)
     }
 
     /// Where each loan goes out of scope: the first points past it its region does not hold
     /// at, as rustc's `OutOfScopePrecomputer`.
     pub(super) fn compute_scopes(&mut self, body: &MirBody<'_>, cfg: &Cfg, values: &RegionValues) {
+        let mut facts = Facts::default();
         for id in 0..self.loans.len() {
             let points = values.points_of(self.loans[id].region);
             let ends = out_of_scope(body, cfg, self.loans[id].location, |start, end| {
                 points.first_absent_in(start, end)
             });
             for point in ends {
-                self.out_of_scope.entry(point).or_default().push(id);
+                facts.push(ENDS_AT, point, id);
             }
         }
+        self.scopes = facts.freeze(&[cfg.points]);
     }
 
     /// Polonius alpha's scopes: a loan goes out of scope at the first point after it is made
@@ -628,6 +666,7 @@ impl Loans {
         cfg: &Cfg,
         live: &[IntervalSet],
     ) {
+        let mut facts = Facts::default();
         for id in 0..self.loans.len() {
             let issued = cfg.point(self.loans[id].location);
             // The loan is in scope where it is made, live there or not.
@@ -640,31 +679,28 @@ impl Loans {
                 }
             });
             for point in ends {
-                self.out_of_scope.entry(point).or_default().push(id);
+                facts.push(ENDS_AT, point, id);
             }
         }
+        self.scopes = facts.freeze(&[cfg.points]);
     }
 
-    /// The loans in scope at the start of each block.
+    /// The loans in scope at the start of each block, a row per block: rustc's `Borrows`.
     pub(super) fn entry_sets<'db>(
         &self,
         ctx: &Ctx<'_, 'db>,
         body: &MirBody<'db>,
         cfg: &Cfg,
-    ) -> Vec<BitSet> {
+    ) -> BitMatrix {
         let blocks = body.basic_blocks.len();
         let count = self.loans.len();
-        let mut entry = vec![BitSet::new(count); blocks];
         if count == 0 {
-            return entry;
+            return BitMatrix::new(blocks, 0);
         }
-        // A block only adds and removes loans, whatever is in scope, so what it does is
-        // `(in & kept) | made`: `made` is what it leaves of nothing in scope, `kept` of all.
-        let mut all = BitSet::new(count);
-        for id in 0..count {
-            all.insert(id);
-        }
-        let mut effect: Vec<Option<(BitSet, BitSet)>> = vec![None; blocks];
+        // A block only adds and removes loans, whatever is in scope: what it does is what it
+        // leaves of nothing in scope and of all of them.
+        let mut transfer = GenKill::new(blocks, count);
+        let all = BitSet::filled(count);
         for &block in &cfg.order {
             let data = &body.basic_blocks[block];
             let (mut made, mut kept) = (BitSet::new(count), all.clone());
@@ -672,33 +708,18 @@ impl Loans {
                 let location = Location { block, statement };
                 for state in [&mut made, &mut kept] {
                     self.before(cfg, location, state);
-                    self.after(ctx, body, location, state);
+                    self.after(ctx, body, cfg, location, state);
                 }
             }
-            effect[index(block)] = Some((made, kept));
+            transfer.set_from(index(block), &made, &kept);
         }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &block in &cfg.order {
-                let Some((made, kept)) = &effect[index(block)] else { continue };
-                let mut state = entry[index(block)].clone();
-                state.intersect(kept);
-                state.union(made);
-                for &successor in &cfg.successors[index(block)] {
-                    changed |= entry[index(successor)].union(&state);
-                }
-            }
-        }
-        entry
+        forward(cfg, &transfer, body.start_block, &BitSet::new(count), |_, _, _| ())
     }
 
     /// The loans that go out of scope as `location` starts.
     pub(super) fn before(&self, cfg: &Cfg, location: Location, state: &mut BitSet) {
-        if let Some(ids) = self.out_of_scope.get(&cfg.point(location)) {
-            for &id in ids {
-                state.remove(id);
-            }
+        for &id in self.scopes.get(ENDS_AT, cfg.point(location)) {
+            state.remove(id as usize);
         }
     }
 
@@ -707,6 +728,7 @@ impl Loans {
         &self,
         ctx: &Ctx<'_, 'db>,
         body: &MirBody<'db>,
+        cfg: &Cfg,
         location: Location,
         state: &mut BitSet,
     ) {
@@ -715,13 +737,13 @@ impl Loans {
             match &statement.kind {
                 StatementKind::Assign(place, _) => {
                     self.kill_on_place(ctx, body, place.local, place.projection.as_slice(), state);
-                    if let Some(&id) = self.at.get(&location) {
+                    if let Some(id) = self.made_at(cfg.point(location)) {
                         state.insert(id);
                     }
                 }
                 StatementKind::StorageDead(local) => {
-                    for &id in self.of_local.get(local).into_iter().flatten() {
-                        state.remove(id);
+                    for &id in self.of_local(*local) {
+                        state.remove(id as usize);
                     }
                 }
                 StatementKind::InlineAsm(asm) => {
@@ -761,11 +783,19 @@ impl Loans {
         projection: &[PlaceElem],
         state: &mut BitSet,
     ) {
-        let Some(ids) = self.of_local.get(&local) else { return };
-        for &id in ids {
-            let loan = &self.loans[id];
+        for &id in self.of_local(local) {
+            let id = id as usize;
             if projection.is_empty()
-                || places_conflict(ctx, body, loan, local, projection, Depth::Deep, Bias::NoOverlap)
+                || places_conflict(
+                    ctx,
+                    body,
+                    self,
+                    id,
+                    local,
+                    projection,
+                    Depth::Deep,
+                    Bias::NoOverlap,
+                )
             {
                 state.remove(id);
             }
@@ -823,21 +853,23 @@ enum Overlap {
     Disjoint,
 }
 
-/// Whether an access of `depth` to the place `local.projection` touches what `loan` borrows,
-/// as rustc's `borrow_conflicts_with_place`.
+/// Whether an access of `depth` to the place `local.projection` touches what loan `id`
+/// borrows, as rustc's `borrow_conflicts_with_place`.
 pub(super) fn places_conflict<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
-    loan: &Loan,
+    loans: &Loans,
+    id: usize,
     local: LocalId,
     projection: &[PlaceElem],
     depth: Depth,
     bias: Bias,
 ) -> bool {
+    let loan = &loans.loans[id];
     if loan.local != local {
         return false;
     }
-    let borrow = loan.projection.as_slice();
+    let borrow = loans.projection(id);
     for (index, &elem) in borrow.iter().enumerate() {
         let base = &borrow[..index];
         let base_ty = ctx.place_ty(body, local, base);

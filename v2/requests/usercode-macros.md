@@ -31,6 +31,8 @@ an error naming it).
 `blaze_macro_wasm::flush()` now flushes only machine code and verdicts; expansions are in the
 CAS store, which the engine flushes as it does any other.
 
+> forwarded to codegen: `crates/blaze-engine/src/lib.rs` is codegen's.
+
 ## 2. `crates/blaze-engine` (or the daemon's pool owner): warm proc-macro servers
 
 Where: wherever `ProcMacroClient::spawn` is called for a load.
@@ -47,6 +49,8 @@ socket (#805: a server is not keyed by `PATH`).
   completion whose tag `bridge.owns(tag)`, and `bridge.end(why)` when the server exits.
 - `ProcMacroClient::warm(program, vec![warm::Warm { link, traced: Some((live_record,
   socket)) }, …], environment)`.
+
+> forwarded to codegen: `ProcMacroClient::spawn`'s callers are in `crates/blaze-engine/` (codegen's); under v2 the daemon's pool owner is lane cargo's daemon, told with the same message.
 
 ## 3. `vendor/proc-macro-srv`: the warm protocol
 
@@ -65,6 +69,8 @@ which marks each expansion's scope so its reads can be told apart in the live re
 - Read the environment a macro is given by name only: `EnvSnapshot` walks `environ`, which the
   trace records as reading every variable, so no expansion would be keyed by fewer.
 
+> forwarded to coordinator: `vendor/proc-macro-srv/` has no owner in crates.md (usercode owns `crates/proc-macro-srv/`), so it is the coordinator's to apply or give to usercode.
+
 ## 4. `crates/blaze-cargo/src/cargo/own_macro.rs`: the wasm or native rule
 
 Where: `runs_as_wasm`, `wasm`.
@@ -74,8 +80,21 @@ Why: the rule is now `blaze_macro_wasm::rule::runs(name, &native, wasm)`, which 
 should fail with `blaze_macro_wasm::rule::refused(name, why)`. Use them in place of the copies
 there.
 
-## 5. Workspace
+> forwarded to cargo
+
+## 5. Native expanders (child `usercode-macros-native`)
+
+Apply `v2/requests/usercode-macros-native.md`: vendor the nine verified crates, add the six
+`native-*` workspace dependencies (`crates/blaze-expand/Cargo.toml` already names them, so the
+manifest lint reports them missing until then), and register `native::describe_with(…)` beside
+`blaze_expand::install`. Without the registration every load fails while
+`BLAZE_NATIVE_MACROS` is unset (its default, `on`), naming the macro; that is the intended
+no-fallback behavior, not something to paper over.
+
+## 6. Workspace
 
 The crates' own manifests now name `blaze-core`, `blaze-ids`, `blaze-usercode`, `blaze-cas`,
 `blaze-expand` and `blake3` with `workspace = true`; all are in the root `[workspace.dependencies]`
 already. `blaze-expand` no longer uses `sha2` or `blaze-store`.
+
+> applied: checked: `blaze-core`, `blaze-ids`, `blaze-usercode`, `blaze-cas`, `blaze-expand` and `blake3` are all in the root `[workspace.dependencies]`.

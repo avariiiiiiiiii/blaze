@@ -13,9 +13,11 @@
 - Where: root `Cargo.toml`. `crates/blaze-cas/Cargo.toml` already says `zstd.workspace = true`
   and `lz4_flex.workspace = true`.
 - Why:
-  - `zdict_builder`: cold values (debug info, build-script runs) are zstd with a dictionary per kind (docs/v2/plan/lanes/store.md section 8), and this feature trains the dictionaries.
+  - `zdict_builder`: cold values (debug info, build-script runs) are zstd with a dictionary per kind (docs/v2/plan/lanes/store.md), and this feature trains the dictionaries.
   - `zstdmt`: long cold values use long-distance matching on a fixed 4 workers (plan/hardware.md). Without it zstd refuses `NbWorkers`, which makes the store stop.
   - LZ4: chunks of hot outputs, where decompression speed matters.
+
+> applied: root `[workspace.dependencies]`: `zstd = { version = "0.13.3", default-features = false, features = ["zdict_builder", "zstdmt"] }` and `lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode"] }`, each with its reason. The workspace's other zstd users (blaze-format) use nothing of the dropped defaults; blaze-cargo, blaze-engine and blaze-store name zstd directly. `lz4_flex` is a lock addition.
 
 ## 2. At integration: delete v1's store and remote
 
@@ -36,6 +38,8 @@
   `blaze_cas::Key::of(schema, producer, inputs)` keys a value by its schema and the code that
   made it.
 
+> forwarded to coordinator: deletion at integration (in the requests report's integration list).
+
 ## 3. For core: one daemon a store directory
 
 - What: an exclusive lock on a file, as an effect (e.g. `Effect::Lock { file, tag }`
@@ -47,6 +51,8 @@
   directory would cut the first one's appends. `blaze-cas` cannot take a lock through the
   effects it has, so today nothing stops a second daemon; it must stop with an error instead.
 
+> forwarded to core: `crates/blaze-core` has no lock effect yet.
+
 ## 4. For core: what the store needs of `Effect::Map`
 
 - What: on the threads and io_uring drivers (still `unimplemented!` there): map the file's
@@ -55,6 +61,8 @@
   mapping only below the length it had). A zero-length file never comes up (packs are at least
   16 bytes, index tables at least 64 KiB).
 - Why: the store reads packs, index tables and large values in place through these mappings.
+
+> applied: by core (`Effect::Map` in `threads.rs` and `uring.rs` through `fs::map`).
 
 ## 5. For format: batched BLAKE3 (`ContentId::of_many`) and NEON
 
@@ -75,6 +83,9 @@
   - on the remote server, many small answers.
 
   Until it exists, the store hashes one input at a time, which is bit-identical.
+
+> applied: `blake3`'s `neon` feature in the root `Cargo.toml`.
+> forwarded to format: `ContentId::of_many` (`crates/blaze-ids`) is not there yet.
 
 ## 6. For core: what the store's pack writes need of the io_uring driver
 
@@ -97,7 +108,9 @@
   work there; under io_uring an unaligned `Append` to a pack is a store bug, and the driver
   should fail it with that name, not quietly write it buffered.
 
-## Column codecs belong to the value encoding (section 17)
+> forwarded to core
+
+## Column codecs belong to the value encoding (plan/design/data.md)
 
 - Who: format.
 - What: plan/design/data.md's compression paragraph puts frame-of-reference bit-packing, run
@@ -107,3 +120,53 @@
   hot, warm or cold form by read recency (`Store::settle`).
 - Why: a column codec chosen after the bytes are opaque would have to guess the layout. Applied
   in the encoding, it round-trips exactly by construction, and zstd still runs over the result.
+
+> forwarded to format
+
+## Whole-value tier encodings, as `blaze_cas::Columns` (plan/design/data.md, "Compression follows the columns")
+
+- Who: format, with the daemon wiring them in.
+- What: `crates/blaze-cas` has `pub trait Columns { schema; warm; hot_from_warm; cold;
+  hot_from_cold }` and `Store::encode_columns(Arc<dyn Columns>)`. The store moves records
+  hot to warm to cold by read recency, and back to hot when they are read in two periods
+  running. It decodes and compares every encoding before keeping it. A value takes part when it
+  is a `blaze_format` buffer whose header names a schema the store was given.
+  - Format: a whole-buffer re-encoding for each persisted schema, schema-driven. Every
+    `Slice<u32>`-like column of the buffer becomes a `WarmColumn` (warm) or an `encode_cold`
+    column (cold), and the buffer is rewritten around them. Its warm form is a buffer of its
+    own schema, so readers open it in place.
+  - Because blaze-cas depends on blaze-format, the `Columns` impls live in a crate above both
+    (the persist modules, or the daemon), which calls `encode_columns` right after
+    `Store::open`. Readers that can read the warm form call `Store::get_in_place` and branch on
+    `Heat`; every other reader keeps `Store::get`, which always gives the value as put.
+- Why: plan/design/data.md assigns the column encodings to format and the tiers to the store.
+  The store cannot find columns in opaque bytes, so this is where the two meet. Until a schema
+  is registered, its values stay raw or go to whole-value zstd as opaque bytes. A record already
+  in columns is refused, naming its schema, if its encoding is not given.
+
+> forwarded to format: the `blaze_cas::Columns` impls per persisted schema.
+> forwarded to cargo: the daemon calls `Store::encode_columns` right after `Store::open`.
+
+## Vendor zstd-safe and mark its dictionaries `Send` and `Sync` (everything is ours)
+
+- Who: whoever owns `vendor/` (coordinator).
+- What: vendor `zstd-safe` 7.3 (and `zstd` 0.13 with it) into the workspace, and add
+  `unsafe impl Send` and `unsafe impl Sync` for `CDict` and `DDict`, which zstd.h documents as
+  shareable read-only between threads. `crates/blaze-cas/src/cold.rs` (`Prepared`) asserts this
+  today with its own `unsafe impl`. Once the vendored crate says it, that impl goes.
+- Why: the store digests each kind's dictionary once, not once per put and per read. Loading
+  64 KiB of dictionary into a zstd context cost more than decompressing a small cold value.
+  The digested dictionaries are shared by every reader thread.
+
+## Put each crate version's values in its unit (#1298)
+
+- Who: every caller of `Store::put`: blaze-codegen, blaze-usercode, blaze-expand,
+  blaze-cargo's serve, and db's query results through the daemon.
+- What: call `Store::unit(crate_version)` once per crate version, with the content ID the
+  caller already names crate versions by: name, version and source. Then put that crate's
+  values with `Store::put_in(unit, key, kind, bytes)`.
+  - `Store::put` stays, for values no one crate version owns. Its values go in the shared unit.
+  - Output chunks always go in the shared unit, which the store does itself.
+- Why: the store is now one mapped file per crate version, which the lane's "Done when" asks
+  for, but a value only lands in its crate's file when its caller says which crate it is.
+  Until then every value is in the shared file, as before.

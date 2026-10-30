@@ -4,6 +4,7 @@
 
 use hir_def::{AdtId, ItemContainerId, Lookup as _, VariantId};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::{SmallVec, smallvec};
 use rustc_type_ir::{
     ClauseKind, EarlyBinder, ExistentialPredicate, OutlivesPredicate, RegionKind, TypeFoldable,
     TypeFolder, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
@@ -37,8 +38,13 @@ pub(crate) enum Component<'db> {
     Alias(Ty<'db>),
 }
 
-pub(crate) fn components<'db>(ty: Ty<'db>) -> Vec<Component<'db>> {
-    struct Find<'db>(Vec<Component<'db>>);
+/// At most four on the stack, which a type with more spills to the heap.
+pub(crate) type Components<'db> = SmallVec<[Component<'db>; 4]>;
+
+const _: () = assert!(size_of::<Component<'static>>() <= 16);
+
+pub(crate) fn components<'db>(ty: Ty<'db>) -> Components<'db> {
+    struct Find<'db>(Components<'db>);
     impl<'db> TypeVisitor<DbInterner<'db>> for Find<'db> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
@@ -57,7 +63,7 @@ pub(crate) fn components<'db>(ty: Ty<'db>) -> Vec<Component<'db>> {
             }
         }
     }
-    let mut find = Find(Vec::new());
+    let mut find = Find(SmallVec::new());
     ty.visit_with(&mut find);
     find.0
 }
@@ -177,11 +183,10 @@ fn adt_needs<'db>(
     out: &mut Vec<Needs<'db>>,
 ) {
     let interner = DbInterner::new_no_crate(db);
-    let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, adt.into())
+    let clauses = GenericPredicates::query_all(db, adt.into())
         .iter_instantiated(interner, args.as_slice())
-        .map(|it| it.skip_norm_wip())
-        .collect();
-    clause_needs(&clauses, out);
+        .map(|it| it.skip_norm_wip());
+    clause_needs(clauses, out);
     for predicate in inferred.of(db, adt) {
         let OutlivesPredicate(arg, region) =
             EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
@@ -194,7 +199,10 @@ fn adt_needs<'db>(
 }
 
 /// The outlives bounds among `clauses`.
-pub(crate) fn clause_needs<'db>(clauses: &[Clause<'db>], out: &mut Vec<Needs<'db>>) {
+pub(crate) fn clause_needs<'db>(
+    clauses: impl IntoIterator<Item = Clause<'db>>,
+    out: &mut Vec<Needs<'db>>,
+) {
     for clause in clauses {
         match clause.kind().skip_binder() {
             ClauseKind::TypeOutlives(OutlivesPredicate(ty, region)) => {
@@ -531,19 +539,26 @@ fn prove_needs<'db>(
 
 /// rustc's `inferred_outlives_of` the ADTs a check comes across: what each one's fields need
 /// of its own parameters, `T: 'a` and `'b: 'a` with `'a` a lifetime parameter, never
-/// `'static`.
+/// `'static`. Read in place from the query's memo: a lookup allocates nothing.
 #[derive(Default)]
 pub struct Inferred<'db> {
-    memo: FxHashMap<AdtId, Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>>>,
+    _db: std::marker::PhantomData<&'db ()>,
 }
 
 impl<'db> Inferred<'db> {
     pub fn of(
-        &mut self,
+        &self,
         db: &'db dyn HirDatabase,
         adt: AdtId,
-    ) -> Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> {
-        self.memo.entry(adt).or_insert_with(|| inferred_of(db, adt)).clone()
+    ) -> impl Iterator<Item = OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> + use<'db>
+    {
+        inferred_outlives(db, adt).0.iter().map(|it| {
+            let arg: GenericArg<'db> = match &it.arg {
+                InferredArg::Type(ty) => ty.as_ref().into(),
+                InferredArg::Region(region) => region.as_ref().into(),
+            };
+            OutlivesPredicate(arg, it.region.as_ref())
+        })
     }
 }
 
@@ -563,23 +578,6 @@ struct InferredPredicate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
 struct InferredOutlives(Vec<InferredPredicate>);
-
-fn inferred_of<'db>(
-    db: &'db dyn HirDatabase,
-    adt: AdtId,
-) -> Vec<OutlivesPredicate<DbInterner<'db>, GenericArg<'db>>> {
-    inferred_outlives(db, adt)
-        .0
-        .iter()
-        .map(|it| {
-            let arg: GenericArg<'db> = match &it.arg {
-                InferredArg::Type(ty) => ty.as_ref().into(),
-                InferredArg::Region(region) => region.as_ref().into(),
-            };
-            OutlivesPredicate(arg, it.region.as_ref())
-        })
-        .collect()
-}
 
 /// A query, so an edit checks again only the ADTs it changes. Worked out to a fixed point, as
 /// ADTs can contain each other.
@@ -646,12 +644,11 @@ fn required<'db>(
     match ty.kind() {
         TyKind::Ref(region, inner, _) => needs.push(Needs::Type(inner, region)),
         TyKind::Adt(def, args) => {
-            let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, def.def_id().into())
+            let clauses = GenericPredicates::query_all(db, def.def_id().into())
                 .iter_instantiated(interner, args.as_slice())
-                .map(|it| it.skip_norm_wip())
-                .collect();
-            clause_needs(&clauses, &mut needs);
-            for predicate in inferred_of(db, def.def_id()) {
+                .map(|it| it.skip_norm_wip());
+            clause_needs(clauses, &mut needs);
+            for predicate in Inferred::default().of(db, def.def_id()) {
                 let OutlivesPredicate(arg, region) =
                     EarlyBinder::bind(predicate).instantiate(interner, args).skip_norm_wip();
                 match arg.kind() {
@@ -666,11 +663,10 @@ fn required<'db>(
                 && let SolverDefId::TypeAliasId(item) = alias.kind.def_id()
                 && let ItemContainerId::TraitId(trait_) = item.lookup(db).container =>
         {
-            let clauses: Vec<Clause<'db>> = GenericPredicates::query_all(db, trait_.into())
+            let clauses = GenericPredicates::query_all(db, trait_.into())
                 .iter_instantiated(interner, alias.args.as_slice())
-                .map(|it| it.skip_norm_wip())
-                .collect();
-            clause_needs(&clauses, &mut needs);
+                .map(|it| it.skip_norm_wip());
+            clause_needs(clauses, &mut needs);
         }
         _ => (),
     }
@@ -728,7 +724,7 @@ impl<'db> Known<'db> {
     pub(crate) fn new(clauses: &[Clause<'db>]) -> Self {
         let mut known = Known { regions: Vec::new(), types: Vec::new() };
         let mut needs = Vec::new();
-        clause_needs(clauses, &mut needs);
+        clause_needs(clauses.iter().copied(), &mut needs);
         known.add(needs);
         known
     }
@@ -773,8 +769,8 @@ impl<'db> Known<'db> {
         {
             return true;
         }
-        let mut seen = vec![longer];
-        let mut stack = vec![longer];
+        let mut seen: SmallVec<[Region<'db>; 8]> = smallvec![longer];
+        let mut stack: SmallVec<[Region<'db>; 8]> = smallvec![longer];
         while let Some(region) = stack.pop() {
             for &(from, to) in &self.regions {
                 if from != region || seen.contains(&to) {

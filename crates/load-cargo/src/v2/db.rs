@@ -5,13 +5,22 @@
 use std::{fmt, panic};
 
 use base_db::{
-    AnchoredPath, CratesMap, FileSourceRootInput, FileText, Files, Nonce, SourceDatabase,
-    SourceRoot, SourceRootId, SourceRootInput, ViewChange, ViewError, ViewRoot,
+    CratesMap, FileSourceRootInput, FileText, Files, Nonce, SourceDatabase, SourceRoot,
+    SourceRootId, SourceRootInput, ViewChange, ViewError, ViewRoot,
 };
 use salsa::Durability;
 use span::{FileId, TextSize};
 use triomphe::Arc;
 
+/// The database of a [`crate::v2::Lowered`], and each worker's handle on it.
+///
+/// A handle ([`crate::v2::Lowered::snapshot`], or a clone of one) shares the storage and the
+/// inputs and has its own query stack. While one is alive, a write to the database
+/// ([`crate::v2::Lowered::ran`], [`crate::v2::Lowered::macros`]) sets salsa's cancellation
+/// flag, so the query its reader is in (or its next one) unwinds with [`salsa::Cancelled`],
+/// which the worker turns into `Failed::Again`; the write goes on once every handle is
+/// dropped. A worker holds one handle at a time, drops it before it waits on anything, and
+/// never asks for another while it holds one.
 #[salsa::db]
 pub struct Db {
     storage: salsa::Storage<Db>,
@@ -19,6 +28,11 @@ pub struct Db {
     crates_map: Arc<CratesMap>,
     nonce: Nonce,
 }
+
+/// What [`crate::v2::Lowered::snapshot`] gives a worker: a handle on the database, a
+/// `hir::db::HirDatabase` (`Box::new(snapshot) as Box<dyn HirDatabase + Send>` is what
+/// `hir_ty_codegen::v2::Databases::new` takes).
+pub type Snapshot = Db;
 
 impl Db {
     /// A database with no crate, no source root and proc-macro attributes expanded as rustc
@@ -122,30 +136,39 @@ impl SourceDatabase for Db {
         files.set_view_root(self, view)
     }
 
-    fn include_source(&self, path: AnchoredPath<'_>, krate: base_db::Crate) {
-        let root_id = self.file_source_root(path.anchor).source_root_id(self);
-        let root = self.source_root(root_id).source_root(self);
-        if let Some(anchor) = root.path_for_file(&path.anchor).and_then(|it| it.as_path())
-            && let Some(parent) = anchor.parent()
-        {
-            self.files.include_source(&parent.absolutize(path.path), root_id, krate);
-        }
-    }
-
-    fn env_is_read(&self, krate: base_db::Crate, key: &str) {
-        self.files.env_is_read(krate, key);
-    }
-
-    fn env_is_unset(&self, krate: base_db::Crate, key: &str) {
-        self.files.env_is_unset(krate, key);
-    }
-
     fn crates_map(&self) -> Arc<CratesMap> {
         self.crates_map.clone()
     }
 
-    fn fork(&self) -> Box<dyn SourceDatabase + Send> {
-        Box::new(self.clone())
+    /// Each task is a job of the process's worker pool (`blaze_graph::exec::shared`, the
+    /// daemon's one pool), near this thread's group, reading this database by reference; the
+    /// calling thread pump-waits for the batch (`Pool::scope`). The first panic of a task,
+    /// salsa's cancellation included, goes on from here once the batch is over.
+    fn run_all(&self, count: usize, task: &(dyn Fn(&dyn SourceDatabase, usize) + Sync)) {
+        if count == 0 {
+            return;
+        }
+        let pool = blaze_graph::exec::shared();
+        let near = blaze_graph::pool::group();
+        let panicked = std::sync::Mutex::new(None);
+        pool.scope(|scope| {
+            for at in 0..count {
+                let panicked = &panicked;
+                scope.submit(
+                    near,
+                    move || task(self, at),
+                    move |ran| {
+                        if let Err(panic) = ran {
+                            let mut first = panicked.lock().unwrap_or_else(|it| it.into_inner());
+                            first.get_or_insert(panic);
+                        }
+                    },
+                );
+            }
+        });
+        if let Some(panic) = panicked.into_inner().unwrap_or_else(|it| it.into_inner()) {
+            panic::resume_unwind(panic);
+        }
     }
 
     fn nonce_and_revision(&self) -> (Nonce, salsa::Revision) {
@@ -173,36 +196,4 @@ fn line_index(db: &dyn SourceDatabase, file: FileId) -> &Arc<line_index::LineInd
     }
 
     line_index(db, LinedFile::new(db, file))
-}
-
-/// A handle on a [`crate::v2::Lowered`]'s database for one worker: the same storage and
-/// inputs, its own query stack, read while other workers read theirs. It is `Send`, not
-/// `Sync`: one thread reads it at a time.
-///
-/// While it is alive, a write to the database ([`crate::v2::Lowered::ran`],
-/// [`crate::v2::Lowered::macros`]) waits for it: salsa cancels it, so the query it is in (or
-/// its next one) unwinds with [`salsa::Cancelled`], which the worker catches
-/// (`salsa::Cancelled::catch`), and the write goes on once the snapshot is dropped. A
-/// worker holds one snapshot at a time and never asks for another while it holds one.
-pub struct Snapshot {
-    db: Db,
-}
-
-impl Snapshot {
-    pub(crate) fn new(db: Db) -> Snapshot {
-        Snapshot { db }
-    }
-
-    /// As `hir_ty_codegen::v2::Databases::new` takes one.
-    pub fn into_boxed(self) -> Box<dyn hir::db::HirDatabase + Send> {
-        Box::new(self.db)
-    }
-}
-
-impl std::ops::Deref for Snapshot {
-    type Target = dyn hir::db::HirDatabase;
-
-    fn deref(&self) -> &Self::Target {
-        &self.db
-    }
 }

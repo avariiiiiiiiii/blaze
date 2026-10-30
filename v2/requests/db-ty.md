@@ -152,3 +152,19 @@ value for the whole process, and fingerprints are not persisted (salsa recompute
 `InferenceResult` and `MirBody` rely on this. Say so if there is a case I miss.
 
 > forwarded to db
+
+## speed-types: `VTableMap::tys` replaces probing for the first vtable id (`crates/hir-ty/src/lib.rs`, `consteval.rs`)
+
+`crates/hir-ty/src/mir.rs` (speed-types now) gives `VTableMap::tys(&self) -> impl
+ExactSizeIterator<Item = Ty<'db>>` (the types in id order) and `VTableMap::FIRST_ID` (the id
+of the first one; it is the private `OFFSET`, 1000).
+
+- `lib.rs` 162-186: delete `FIRST_VTABLE_ID` and `vtable_types`. Today the first non-empty map
+  of a process probes ids 1 to 1000, each building a `MirEvalError::InvalidVTableId`, and every
+  call does a relaxed load and one bounds-checked `ty(id)` per type.
+- `lib.rs` 154-155, in `Hash for ComplexMemoryMap`: `state.write_usize(vtable.tys().len());
+  vtable.tys().for_each(|ty| ty.hash(state));`. The bytes hashed are unchanged.
+- `consteval.rs` 812-816: `Placed::push_each(out, map.vtable.tys().len(),
+  map.vtable.tys().map(&mut *ty))`. The encoded bytes are unchanged.
+
+`VTableMap::id` now hashes a type once (entry API), not twice.

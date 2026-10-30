@@ -3097,7 +3097,6 @@ fn compiled_instance<'db>(
 enum Detach {
     No,
     Tier,
-    #[cfg_attr(not(feature = "llvm"), expect(dead_code))]
     Unit,
 }
 

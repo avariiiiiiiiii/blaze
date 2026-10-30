@@ -12,8 +12,8 @@ use test_fixture::WithFixture;
 
 use super::{TestDB, edit, item, single};
 use crate::{
-    Fact, ItemId, captures, code, const_value, drop_check, implements, item_key, key, method,
-    name, signature, value, vtable,
+    Fact, ItemId, ScopeEntry, ScopeIndexKey, captures, code, const_value, drop_check, implements,
+    item_key, key, method, name, scope, signature, value, vtable,
 };
 
 #[track_caller]
@@ -388,6 +388,21 @@ impl T for S { fn a(&self) {} fn b(&self) {} }
 "#,
     );
     assert_ne!(val(&db, fact), before, "the slots are in declaration order");
+}
+
+#[test]
+fn a_type_and_a_const_of_one_name_are_one_run() {
+    let (db, _) = single("trait T { type X; const X: u8; fn f(); }");
+    let t = item_key(&db, ItemId::Trait(trait_(&db, "T")));
+    let at = |name: &str| {
+        let key = ScopeIndexKey { scope: t, name: key::name_hash(name) };
+        hir_ty::attach_db(&db, || scope(&db, key)).unwrap()
+    };
+    let ScopeEntry::Assoc(items) = at("X") else { panic!("`X` is not an associated item") };
+    assert_eq!(items.len(), 2);
+    assert!(items.is_sorted_by_key(|&(key, _)| key));
+    assert!(matches!(at("f"), ScopeEntry::Assoc(items) if items.len() == 1));
+    assert_eq!(at("g"), ScopeEntry::Nothing);
 }
 
 #[test]

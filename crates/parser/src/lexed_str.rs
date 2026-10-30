@@ -8,7 +8,9 @@
 //! Note that these tokens, unlike the tokens we feed into the parser, do
 //! include info about comments and whitespace.
 
-use std::ops;
+mod scan;
+
+use std::{borrow::Cow, ops};
 
 use rustc_literal_escaper::{
     EscapeError, Mode, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char,
@@ -50,36 +52,56 @@ const LONG: u32 = (1 << (32 - KIND_BITS)) - 1;
 const CHECKPOINT: usize = 16;
 const _: () = assert!((SyntaxKind::__LAST as u32) <= KIND_MASK, "a kind fits in KIND_BITS");
 
+/// The messages are mostly fixed text: only an unterminated literal's and an unknown prefix's
+/// are formatted, so a valid token allocates nothing.
 struct LexError {
-    msg: String,
+    msg: Cow<'static, str>,
     token: u32,
 }
 
 impl<'a> LexedStr<'a> {
     pub fn new(edition: Edition, text: &'a str) -> LexedStr<'a> {
+        Self::lex::<true>(edition, text)
+    }
+
+    /// With `FAST`, the tokens [`scan::token`] decides from the byte classes are lexed there and
+    /// the rest by `rustc_lexer`; without, all by `rustc_lexer`. Both give the same tokens
+    /// (`fast_and_rustc_lexer_lex_alike`).
+    fn lex<const FAST: bool>(edition: Edition, text: &'a str) -> LexedStr<'a> {
         let _p = tracing::info_span!("LexedStr::new").entered();
         assert!(text.len() <= u32::MAX as usize, "a text of 4 GiB or more");
         let mut conv = Converter::new(edition, text);
         if let Ok(script) = crate::frontmatter::ScriptSource::parse(text) {
             if let Some(shebang) = script.shebang_span() {
-                conv.push(SHEBANG, shebang.end - shebang.start, Vec::new());
+                conv.push(SHEBANG, shebang.end - shebang.start);
             }
             if script.frontmatter().is_some() {
-                conv.push(FRONTMATTER, script.content_span().start - conv.offset, Vec::new());
+                conv.push(FRONTMATTER, script.content_span().start - conv.offset);
             }
         } else if let Some(shebang_len) = rustc_lexer::strip_shebang(text) {
             // Leave error reporting to `rustc_lexer`
-            conv.push(SHEBANG, shebang_len, Vec::new());
+            conv.push(SHEBANG, shebang_len);
         }
 
-        // Re-create the tokenizer from scratch every token because `GuardedStrPrefix` is one token in the lexer
+        let bytes = text.as_bytes();
+        let classes = FAST.then(|| scan::Classes::new(bytes));
+        // Lex from scratch at every token because `GuardedStrPrefix` is one token in the lexer
         // but we want to split it to two in edition <2024.
-        while let Some(token) =
-            rustc_lexer::tokenize(&text[conv.offset..], rustc_lexer::FrontmatterAllowed::No).next()
-        {
-            let token_text = &text[conv.offset..][..token.len as usize];
+        while conv.offset < text.len() {
+            let fast = match &classes {
+                Some(classes) => scan::token(bytes, conv.offset, classes),
+                None => None,
+            };
+            let (kind, len) = fast.unwrap_or_else(|| {
+                let token =
+                    rustc_lexer::tokenize(&text[conv.offset..], rustc_lexer::FrontmatterAllowed::No)
+                        .next()
+                        .expect("a token where text is left");
+                (token.kind, token.len as usize)
+            });
+            let token_text = &text[conv.offset..][..len];
 
-            conv.extend_token(&token.kind, token_text);
+            conv.extend_token(&kind, token_text);
         }
 
         conv.finalize_with_eof()
@@ -98,7 +120,7 @@ impl<'a> LexedStr<'a> {
         let mut conv = Converter::new(edition, text);
         conv.extend_token(&token.kind, text);
         match conv.res.tokens.len() {
-            1 => Some((conv.res.raw_kind(0), conv.res.error.pop().map(|it| it.msg))),
+            1 => Some((conv.res.raw_kind(0), conv.res.error.pop().map(|it| it.msg.into_owned()))),
             _ => None,
         }
     }
@@ -176,11 +198,11 @@ impl<'a> LexedStr<'a> {
     pub fn error(&self, i: usize) -> Option<&str> {
         assert!(i < self.len());
         let err = self.error.binary_search_by_key(&(i as u32), |i| i.token).ok()?;
-        Some(self.error[err].msg.as_str())
+        Some(&*self.error[err].msg)
     }
 
     pub fn errors(&self) -> impl Iterator<Item = (usize, &str)> + '_ {
-        self.error.iter().map(|it| (it.token as usize, it.msg.as_str()))
+        self.error.iter().map(|it| (it.token as usize, &*it.msg))
     }
 
     fn push(&mut self, kind: SyntaxKind, start: usize, len: usize) {
@@ -242,15 +264,16 @@ impl<'a> Converter<'a> {
         self.res
     }
 
-    fn push(&mut self, kind: SyntaxKind, len: usize, errors: Vec<String>) {
+    fn push(&mut self, kind: SyntaxKind, len: usize) {
         self.res.push(kind, self.offset, len);
         self.offset += len;
+    }
 
-        let token = (self.res.tokens.len() - 1) as u32;
-        for msg in errors {
-            if !msg.is_empty() {
-                self.res.error.push(LexError { msg, token });
-            }
+    /// An error of the token pushed next.
+    fn error(&mut self, msg: impl Into<Cow<'static, str>>) {
+        let msg = msg.into();
+        if !msg.is_empty() {
+            self.res.error.push(LexError { msg, token: self.res.tokens.len() as u32 });
         }
     }
 
@@ -267,16 +290,12 @@ impl<'a> Converter<'a> {
         // We drop some useful information here (see patterns with double dots `..`)
         // Storing that info in `SyntaxKind` is not possible due to its layout requirements of
         // being `u16` that come from `syntax_tree::SyntaxKind`.
-        let mut errors: Vec<String> = vec![];
-
         let syntax_kind = {
             match kind {
                 rustc_lexer::TokenKind::LineComment { doc_style } => Self::comment_kind(*doc_style),
                 rustc_lexer::TokenKind::BlockComment { doc_style, terminated } => {
                     if !terminated {
-                        errors.push(
-                            "Missing trailing `*/` symbols to terminate the block comment".into(),
-                        );
+                        self.error("Missing trailing `*/` symbols to terminate the block comment");
                     }
                     Self::comment_kind(*doc_style)
                 }
@@ -286,9 +305,9 @@ impl<'a> Converter<'a> {
                     invalid_infostring,
                 } => {
                     if *has_invalid_preceding_whitespace {
-                        errors.push("invalid preceding whitespace for frontmatter opening".into());
+                        self.error("invalid preceding whitespace for frontmatter opening");
                     } else if *invalid_infostring {
-                        errors.push("invalid infostring for frontmatter".into());
+                        self.error("invalid infostring for frontmatter");
                     }
                     FRONTMATTER
                 }
@@ -300,7 +319,7 @@ impl<'a> Converter<'a> {
                     SyntaxKind::from_keyword(token_text, self.edition).unwrap_or(IDENT)
                 }
                 rustc_lexer::TokenKind::InvalidIdent => {
-                    errors.push("Ident contains invalid characters".into());
+                    self.error("Ident contains invalid characters");
                     IDENT
                 }
 
@@ -310,7 +329,7 @@ impl<'a> Converter<'a> {
 
                 rustc_lexer::TokenKind::GuardedStrPrefix if self.edition.at_least_2024() => {
                     // FIXME: rustc does something better for recovery.
-                    errors.push("Invalid string literal (reserved syntax)".into());
+                    self.error("Invalid string literal (reserved syntax)");
                     ERROR
                 }
                 rustc_lexer::TokenKind::GuardedStrPrefix => {
@@ -326,12 +345,12 @@ impl<'a> Converter<'a> {
 
                 rustc_lexer::TokenKind::Lifetime { starts_with_number } => {
                     if *starts_with_number {
-                        errors.push("Lifetime name cannot start with a number".into());
+                        self.error("Lifetime name cannot start with a number");
                     }
                     LIFETIME_IDENT
                 }
                 rustc_lexer::TokenKind::UnknownPrefixLifetime => {
-                    errors.push("Unknown lifetime prefix".into());
+                    self.error("Unknown lifetime prefix");
                     LIFETIME_IDENT
                 }
                 rustc_lexer::TokenKind::RawLifetime => LIFETIME_IDENT,
@@ -366,79 +385,75 @@ impl<'a> Converter<'a> {
                 rustc_lexer::TokenKind::Unknown => ERROR,
                 rustc_lexer::TokenKind::UnknownPrefix if token_text == "builtin" => IDENT,
                 rustc_lexer::TokenKind::UnknownPrefix => {
-                    let has_unterminated = self.has_likely_unterminated_string();
-
-                    let error_msg = if has_unterminated {
-                        format!(
+                    if self.has_likely_unterminated_string() {
+                        self.error(format!(
                             "unknown literal prefix `{token_text}` (note: check for unterminated string literal)"
-                        )
+                        ));
                     } else {
-                        "unknown literal prefix".to_owned()
-                    };
-                    errors.push(error_msg);
+                        self.error("unknown literal prefix");
+                    }
                     IDENT
                 }
                 rustc_lexer::TokenKind::Eof => EOF,
             }
         };
 
-        self.push(syntax_kind, token_text.len(), errors);
+        self.push(syntax_kind, token_text.len());
     }
 
     fn extend_literal(&mut self, len: usize, kind: &rustc_lexer::LiteralKind) {
-        let invalid_raw_msg = String::from("Invalid raw string literal");
-
-        let mut errors = vec![];
-        let mut no_end_quote = |c: char, kind: &str| {
-            errors.push(format!("Missing trailing `{c}` symbol to terminate the {kind} literal"));
+        const INVALID_RAW: &str = "Invalid raw string literal";
+        let source: &'a str = self.res.text;
+        let no_end_quote = |this: &mut Self, c: char, kind: &str| {
+            this.error(format!("Missing trailing `{c}` symbol to terminate the {kind} literal"));
         };
 
         let syntax_kind = match *kind {
             rustc_lexer::LiteralKind::Int { empty_int, base: _ } => {
                 if empty_int {
-                    errors.push("Missing digits after the integer base prefix".into());
+                    self.error("Missing digits after the integer base prefix");
                 }
                 INT_NUMBER
             }
             rustc_lexer::LiteralKind::Float { empty_exponent, base: _ } => {
                 if empty_exponent {
-                    errors.push("Missing digits after the exponent symbol".into());
+                    self.error("Missing digits after the exponent symbol");
                 }
                 FLOAT_NUMBER
             }
             rustc_lexer::LiteralKind::Char { terminated } => {
                 if !terminated {
-                    no_end_quote('\'', "character");
+                    no_end_quote(self, '\'', "character");
                 } else {
-                    let text = &self.res.text[self.offset + 1..][..len - 1];
+                    let text = &source[self.offset + 1..][..len - 1];
                     let text = &text[..text.rfind('\'').unwrap()];
                     if let Err(e) = unescape_char(text) {
-                        errors.push(err_to_msg(e, Mode::Char));
+                        self.error(err_to_msg(e, Mode::Char));
                     }
                 }
                 CHAR
             }
             rustc_lexer::LiteralKind::Byte { terminated } => {
                 if !terminated {
-                    no_end_quote('\'', "byte");
+                    no_end_quote(self, '\'', "byte");
                 } else {
-                    let text = &self.res.text[self.offset + 2..][..len - 2];
+                    let text = &source[self.offset + 2..][..len - 2];
                     let text = &text[..text.rfind('\'').unwrap()];
                     if let Err(e) = unescape_byte(text) {
-                        errors.push(err_to_msg(e, Mode::Byte));
+                        self.error(err_to_msg(e, Mode::Byte));
                     }
                 }
                 BYTE
             }
             rustc_lexer::LiteralKind::Str { terminated } => {
                 if !terminated {
-                    no_end_quote('"', "string");
+                    no_end_quote(self, '"', "string");
                 } else {
-                    let text = &self.res.text[self.offset + 1..][..len - 1];
+                    let text = &source[self.offset + 1..][..len - 1];
                     let text = &text[..text.rfind('"').unwrap()];
                     unescape_str(text, |_, res| {
                         if let Err(e) = res {
-                            errors.push(err_to_msg(e, Mode::Str));
+                            self.error(err_to_msg(e, Mode::Str));
                         }
                     });
                 }
@@ -446,13 +461,13 @@ impl<'a> Converter<'a> {
             }
             rustc_lexer::LiteralKind::ByteStr { terminated } => {
                 if !terminated {
-                    no_end_quote('"', "byte string");
+                    no_end_quote(self, '"', "byte string");
                 } else {
-                    let text = &self.res.text[self.offset + 2..][..len - 2];
+                    let text = &source[self.offset + 2..][..len - 2];
                     let text = &text[..text.rfind('"').unwrap()];
                     unescape_byte_str(text, |_, res| {
                         if let Err(e) = res {
-                            errors.push(err_to_msg(e, Mode::ByteStr));
+                            self.error(err_to_msg(e, Mode::ByteStr));
                         }
                     });
                 }
@@ -460,13 +475,13 @@ impl<'a> Converter<'a> {
             }
             rustc_lexer::LiteralKind::CStr { terminated } => {
                 if !terminated {
-                    no_end_quote('"', "C string")
+                    no_end_quote(self, '"', "C string")
                 } else {
-                    let text = &self.res.text[self.offset + 2..][..len - 2];
+                    let text = &source[self.offset + 2..][..len - 2];
                     let text = &text[..text.rfind('"').unwrap()];
                     unescape_c_str(text, |_, res| {
                         if let Err(e) = res {
-                            errors.push(err_to_msg(e, Mode::CStr));
+                            self.error(err_to_msg(e, Mode::CStr));
                         }
                     });
                 }
@@ -474,29 +489,29 @@ impl<'a> Converter<'a> {
             }
             rustc_lexer::LiteralKind::RawStr { n_hashes } => {
                 if n_hashes.is_none() {
-                    errors.push(invalid_raw_msg);
+                    self.error(INVALID_RAW);
                 }
                 STRING
             }
             rustc_lexer::LiteralKind::RawByteStr { n_hashes } => {
                 if n_hashes.is_none() {
-                    errors.push(invalid_raw_msg);
+                    self.error(INVALID_RAW);
                 }
                 BYTE_STRING
             }
             rustc_lexer::LiteralKind::RawCStr { n_hashes } => {
                 if n_hashes.is_none() {
-                    errors.push(invalid_raw_msg);
+                    self.error(INVALID_RAW);
                 }
                 C_STRING
             }
         };
 
-        self.push(syntax_kind, len, errors);
+        self.push(syntax_kind, len);
     }
 }
 
-fn err_to_msg(error: EscapeError, mode: Mode) -> String {
+fn err_to_msg(error: EscapeError, mode: Mode) -> &'static str {
     match error {
         EscapeError::ZeroChars => "empty character literal",
         EscapeError::MoreThanOneChar => "character literal may only contain one codepoint",
@@ -532,7 +547,6 @@ fn err_to_msg(error: EscapeError, mode: Mode) -> String {
         EscapeError::UnskippedWhitespaceWarning => "",
         EscapeError::MultipleSkippedLinesWarning => "",
     }
-    .into()
 }
 
 #[cfg(test)]

@@ -13,6 +13,8 @@
   blaze's: cargo", and so would `harness/v2/corpus.py` test steps with a failing test. Both
   scripts call `not_blazes` on every run on purpose (no-fallback).
 
+> applied: by proof (`V2.not_blazes` in `harness/v2/engine.py` takes a failing run with no `by_rustc` line as blaze's).
+
 ## 2. A way for `rejections.py` to be gated by its floors alone (if wanted)
 
 - **Where:** `harness/v2/report.py`.
@@ -22,6 +24,8 @@
 - **Why:** against v1 many units will fail one by one. Without the change, the script behaves as
   the brief says: each unit is an outcome and gates the run.
 
+> forwarded to coordinator: a choice of how rejections gate, asked of the coordinator ("if wanted"); `harness/v2/report.py` is unchanged.
+
 ## 3. Lint and type-check `harness/v2/`
 
 - **Where:** `pyproject.toml`.
@@ -30,12 +34,16 @@
 - **Why:** the template imports after `sys.path[:0] = ...`, as `harness/fnincr.py` and
   `harness/keys.py` already do (and already have the ignore).
 
+> applied: `pyproject.toml` includes `harness/v2` for ruff and pyright and ignores E402 in `harness/v2/*.py`.
+
 ## 4. Optional: `engine.Ran.kept`
 
 - **Where:** `harness/v2/engine.py`.
 - **What:** `Ran` could carry blaze's kept test passes, as `blaze_cli.Side.cargo` does.
 - **Why:** today `corpus.py` reads `target/blaze/tests.ndjson` itself and wraps the result in its
   own `Tested`. That works as it is; the change would only move the reading into the engine.
+
+> refused: optional and only moves working code; proof is DONE, and `harness/v2/` is not an interface `requests` applies.
 
 ## 5. One check request for a whole workspace that keeps going and reports per package
 
@@ -49,3 +57,5 @@
   per test. With this request it can use `whole: true`, one request per workspace, and the daemon
   checks the members in parallel on all cores. Rust's semantics are unchanged: each member is
   checked exactly as on its own.
+
+> applied: by ci (`Targets::cargo` documents `--keep-going`: every member checked past one that fails, one `Built` per checked unit) and proof (`rejections.py`'s `whole`).

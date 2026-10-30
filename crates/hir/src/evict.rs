@@ -9,7 +9,9 @@
 //! - every MIR of every body, built, runtime, optimized and monomorphized, of closures and
 //!   coroutines too: once code is stored, codegen does not read it again, and the borrow check
 //!   and constant evaluation keep their own results;
-//! - the inference results of the bodies given.
+//! - the inference results of the bodies given;
+//! - the value of every constant and static evaluated: what codegen stored it as is read in
+//!   its place, and a constant evaluation that needs one again computes it.
 //!
 //! The borrow check's results stay: they are small, and the live-patch and build gates
 //! ([`hir_ty_borrowck::checked`]) read them on every build.
@@ -18,11 +20,12 @@ use hir_def::DefWithBodyId;
 
 use crate::{db::HirDatabase, mir};
 
-/// After a build stored the code of `compiled`: drops every MIR and the inference of
-/// `compiled`. A workspace body `blaze check` reads again is better left out of `compiled`
-/// when a check follows the build.
+/// After a build stored the code of `compiled`: drops every MIR, every constant's and
+/// static's value and the inference of `compiled`. A workspace body `blaze check` reads again
+/// is better left out of `compiled` when a check follows the build.
 pub fn drop_after_store(db: &mut dyn HirDatabase, compiled: &[DefWithBodyId]) {
     drop_mir(db);
+    hir_ide::evict::drop_all_const_eval(db);
     hir_ide::evict::drop_inference(db, compiled);
 }
 

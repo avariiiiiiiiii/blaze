@@ -581,7 +581,7 @@ fn str_addition<'db>(
 ) -> bool {
     const STR_CONCAT_NOTE: &str = "string concatenation requires an owned `String` on the left";
     let at = |range: TextRange| cx.span(InFile::new(file, range));
-    let string = hir_def::lang_item::lang_items(cx.db, cx.krate.into()).String;
+    let string = hir_def::lang_item::lang_items(cx.db, cx.krate.base()).String;
     let is_string = |ty: &hir::Type<'db>| {
         string.is_some_and(|it| ty.as_adt() == Some(hir::Adt::Struct(it.into())))
     };

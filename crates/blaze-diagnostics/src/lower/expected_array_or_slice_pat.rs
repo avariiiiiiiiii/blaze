@@ -10,11 +10,15 @@
 //! `match`, of a `let` with no type, of an `if let`, or the right of a destructuring
 //! assignment. A `for` loop's pattern has the call of `next` rustc desugars it to as its
 //! scrutinee, which is in no source: rustc's suggestion there is not given.
+//!
+//! The autoderef, the one step that asks the trait solver, runs last and only when a
+//! suggestion is still possible.
 
 use base_db::{CrateOrigin, LangCrateOrigin};
 use hir::InFile;
+use intern::sym;
 use syntax::{
-    AstNode, SyntaxNode,
+    AstNode, SyntaxKind, SyntaxNode,
     ast::{self, BinaryOp},
 };
 
@@ -50,119 +54,108 @@ fn suggest<'db>(cx: &Cx<'_, 'db>, d: &hir::ExpectedArrayOrSlicePat<'db>, diag: &
     {
         return;
     }
-    if !found.autoderef(cx.db).any(|it| it.is_slice() || it.is_array()) {
-        return;
-    }
     let Some(origin) = origin(cx, cx.syntax(d.pat.map(|it| it.syntax_node_ptr()))) else { return };
     let Some(root) = cx.sema.type_of_expr(&origin.expr.value).map(|it| it.original) else {
         return;
     };
     let (sequence, root) = slice_or_array_or_vector(cx, root);
+    let as_deref = matches!(root.as_adt(), Some(hir::Adt::Enum(it)) if is_option_or_result(cx, it));
+    let slicing = sequence && origin.top_level;
+    if !(as_deref || slicing) || !found.autoderef(cx.db).any(|it| it.is_slice() || it.is_array()) {
+        return;
+    }
     let at = cx.span(origin.expr.as_ref().map(|it| it.syntax().text_range())).shrink_to_hi();
-    if let Some(hir::Adt::Enum(it)) = root.as_adt()
-        && is_core_item(cx, it.module(cx.db), &it.name(cx.db), &["Option", "Result"])
-    {
-        diag.suggestion_verbose(
-            at.clone(),
-            "consider using `as_deref` here",
-            ".as_deref()",
-            Applicability::MaybeIncorrect,
-        );
-    }
-    if sequence && origin.top_level {
-        diag.suggestion_verbose(at, "consider slicing here", "[..]", Applicability::MaybeIncorrect);
-    }
+    // At most one holds: `as_deref` wants an enum at the root, slicing a sequence.
+    let (message, code) = match as_deref {
+        true => ("consider using `as_deref` here", ".as_deref()"),
+        false => ("consider slicing here", "[..]"),
+    };
+    diag.suggestion_verbose(at, message, code, Applicability::MaybeIncorrect);
 }
 
 /// rustc's `is_slice_or_array_or_vector`: whether `ty` behind its references is a `Vec`, an
 /// array or a slice, and `ty` without them.
-fn slice_or_array_or_vector<'db>(cx: &Cx<'_, 'db>, ty: hir::Type<'db>) -> (bool, hir::Type<'db>) {
-    if let Some((inner, _)) = ty.as_reference() {
-        return slice_or_array_or_vector(cx, inner);
+fn slice_or_array_or_vector<'db>(cx: &Cx<'_, 'db>, mut ty: hir::Type<'db>) -> (bool, hir::Type<'db>) {
+    while let Some((inner, _)) = ty.as_reference() {
+        ty = inner;
     }
     let vec = match ty.as_adt() {
         Some(hir::Adt::Struct(it)) => {
-            is_lang_crate_item(cx, it.module(cx.db), &it.name(cx.db), "Vec", LangCrateOrigin::Alloc)
+            it.name(cx.db).as_str() == "Vec" && in_lang_crate(cx, it.module(cx.db), LangCrateOrigin::Alloc)
         }
         _ => false,
     };
     (vec || ty.is_slice() || ty.is_array(), ty)
 }
 
-/// Whether the item named `name` in `module` is core's of one of `names`: rustc's diagnostic
-/// items `Option` and `Result`.
-fn is_core_item(cx: &Cx<'_, '_>, module: hir::Module, name: &hir::Name, names: &[&str]) -> bool {
-    names.iter().any(|it| is_lang_crate_item(cx, module, name, it, LangCrateOrigin::Core))
+/// core's `Option` or `Result`: rustc's diagnostic items of them.
+fn is_option_or_result(cx: &Cx<'_, '_>, it: hir::Enum) -> bool {
+    let name = it.name(cx.db);
+    (name == sym::Option || name == sym::Result)
+        && in_lang_crate(cx, it.module(cx.db), LangCrateOrigin::Core)
 }
 
-fn is_lang_crate_item(
-    cx: &Cx<'_, '_>,
-    module: hir::Module,
-    name: &hir::Name,
-    expected: &str,
-    krate: LangCrateOrigin,
-) -> bool {
-    name.as_str() == expected
-        && module.krate(cx.db).origin(cx.db) == CrateOrigin::Lang(krate)
+/// Asked only once the name matched: `Crate::origin` clones the crate's origin.
+fn in_lang_crate(cx: &Cx<'_, '_>, module: hir::Module, krate: LangCrateOrigin) -> bool {
+    module.krate(cx.db).origin(cx.db) == CrateOrigin::Lang(krate)
 }
 
 /// rustc's `TopInfo` of the pattern `node` is in: the expression it matches, and whether
 /// `node` is the whole pattern, found by going up through the patterns (or, of a
-/// destructuring assignment, the expressions) around it.
+/// destructuring assignment, the expressions) around it. Each step matches on the node's kind;
+/// only the node the walk ends at is cast.
 fn origin(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<Origin> {
     let is_pat = ast::Pat::can_cast(node.value.kind());
     let mut depth = 0u32;
-    let mut prev = node.value.clone();
+    let mut prev = node.value.text_range();
     for ancestor in cx.sema.ancestors_with_macros_file(node).skip(1) {
         let it = &ancestor.value;
-        let at = |expr: Option<ast::Expr>| expr.map(|e| ancestor.with_value(e));
+        let top_level = depth == 0;
+        let found =
+            |expr: Option<ast::Expr>| expr.map(|expr| Origin { expr: ancestor.with_value(expr), top_level });
+        let kind = it.kind();
         if is_pat {
-            if let Some(arm) = ast::MatchArm::cast(it.clone()) {
-                let expr = arm.syntax().parent()?.parent().and_then(ast::MatchExpr::cast)?.expr();
-                return at(expr).map(|expr| Origin { expr, top_level: depth == 0 });
-            }
-            if let Some(stmt) = ast::LetStmt::cast(it.clone()) {
-                if stmt.ty().is_some() {
-                    return None;
+            match kind {
+                SyntaxKind::MATCH_ARM => {
+                    return found(it.parent()?.parent().and_then(ast::MatchExpr::cast)?.expr());
                 }
-                return at(stmt.initializer()).map(|expr| Origin { expr, top_level: depth == 0 });
-            }
-            if let Some(expr) = ast::LetExpr::cast(it.clone()) {
-                return at(expr.expr()).map(|expr| Origin { expr, top_level: depth == 0 });
-            }
-            match ast::Pat::cast(it.clone()) {
-                Some(ast::Pat::ParenPat(_) | ast::Pat::MacroPat(_)) => {}
-                Some(_) => depth += 1,
-                None if ast::RecordPatField::can_cast(it.kind())
-                    || ast::RecordPatFieldList::can_cast(it.kind())
-                    || ast::MacroCall::can_cast(it.kind())
-                    || ast::TokenTree::can_cast(it.kind()) => {}
-                None => return None,
+                SyntaxKind::LET_STMT => {
+                    let stmt = ast::LetStmt::cast(it.clone())?;
+                    return if stmt.ty().is_some() { None } else { found(stmt.initializer()) };
+                }
+                SyntaxKind::LET_EXPR => return found(ast::LetExpr::cast(it.clone())?.expr()),
+                SyntaxKind::PAREN_PAT
+                | SyntaxKind::MACRO_PAT
+                | SyntaxKind::RECORD_PAT_FIELD
+                | SyntaxKind::RECORD_PAT_FIELD_LIST
+                | SyntaxKind::MACRO_CALL
+                | SyntaxKind::TOKEN_TREE => {}
+                _ if ast::Pat::can_cast(kind) => depth += 1,
+                _ => return None,
             }
         } else {
-            if let Some(bin) = ast::BinExpr::cast(it.clone())
-                && bin.op_kind() == Some(BinaryOp::Assignment { op: None })
-            {
-                if bin.lhs().is_none_or(|lhs| lhs.syntax() != &prev) {
-                    return None;
+            match kind {
+                SyntaxKind::BIN_EXPR => {
+                    let bin = ast::BinExpr::cast(it.clone())?;
+                    if bin.op_kind() != Some(BinaryOp::Assignment { op: None })
+                        || bin.lhs().is_none_or(|lhs| lhs.syntax().text_range() != prev)
+                    {
+                        return None;
+                    }
+                    return found(bin.rhs());
                 }
-                return at(bin.rhs()).map(|expr| Origin { expr, top_level: depth == 0 });
-            }
-            match ast::Expr::cast(it.clone()) {
-                Some(ast::Expr::ParenExpr(_)) => {}
-                Some(
-                    ast::Expr::TupleExpr(_)
-                    | ast::Expr::ArrayExpr(_)
-                    | ast::Expr::CallExpr(_)
-                    | ast::Expr::RecordExpr(_),
-                ) => depth += 1,
-                None if ast::ArgList::can_cast(it.kind())
-                    || ast::RecordExprField::can_cast(it.kind())
-                    || ast::RecordExprFieldList::can_cast(it.kind()) => {}
+                SyntaxKind::PAREN_EXPR
+                | SyntaxKind::ARG_LIST
+                | SyntaxKind::RECORD_EXPR_FIELD
+                | SyntaxKind::RECORD_EXPR_FIELD_LIST => {}
+                SyntaxKind::TUPLE_EXPR
+                | SyntaxKind::ARRAY_EXPR
+                | SyntaxKind::CALL_EXPR
+                | SyntaxKind::RECORD_EXPR => depth += 1,
                 _ => return None,
             }
         }
-        prev = it.clone();
+        prev = it.text_range();
     }
     None
 }

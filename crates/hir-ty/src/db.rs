@@ -772,3 +772,262 @@ impl<'db> GeneralConstId<'db> {
         }
     }
 }
+
+/// The kind numbers of hir-ty's queries and interned ids, for blaze-query and the
+/// why-did-this-rerun explainer: hir-ty's part of blaze-query's `FRONT` range. A number is
+/// never given to another query, nor reused once its query is gone.
+pub mod kinds {
+    pub use blaze_query::QueryKind;
+
+    /// The numbers hir-ty may give.
+    pub const RANGE: std::ops::Range<u16> = 0x2400..0x2600;
+
+    macro_rules! kinds {
+        ($($(#[$meta:meta])* $name:ident = $number:literal, $query:literal;)*) => {
+            $($(#[$meta])* pub const $name: QueryKind = QueryKind($number);)*
+
+            /// Every kind, with its query as hir-ty names it: a function's name, or
+            /// `Type::method` for a method of a tracked `impl`.
+            pub const ALL: &[(QueryKind, &str)] = &[$(($name, $query)),*];
+
+            /// The kind of the query or interned id hir-ty names `name`, as [`ALL`] names it.
+            pub fn of(name: &str) -> Option<QueryKind> {
+                match name {
+                    $($query => Some($name),)*
+                    _ => None,
+                }
+            }
+        };
+    }
+
+    /// Each number of [`RANGE`] with the query it is given to, built when compiled: a lookup
+    /// is one bounds check and one load, 8 KiB. Building it refuses a number outside the range
+    /// or given twice.
+    const NAMES: [Option<&str>; (RANGE.end - RANGE.start) as usize] = {
+        let mut names = [None; (RANGE.end - RANGE.start) as usize];
+        let mut at = 0;
+        while at < ALL.len() {
+            let (kind, name) = ALL[at];
+            assert!(RANGE.start <= kind.0 && kind.0 < RANGE.end, "a kind outside hir-ty's range");
+            let slot = (kind.0 - RANGE.start) as usize;
+            assert!(names[slot].is_none(), "a kind given to two queries");
+            names[slot] = Some(name);
+            at += 1;
+        }
+        names
+    };
+
+    /// The query or interned id of `kind`, if it is hir-ty's.
+    pub fn name(kind: QueryKind) -> Option<&'static str> {
+        NAMES.get(kind.0.wrapping_sub(RANGE.start) as usize).copied().flatten()
+    }
+
+    kinds! {
+        // Bodies.
+        INFER = 0x2400, "infer_body_query";
+        INFER_ANON_CONST = 0x2401, "infer_anon_const_body_query";
+        CLOSURE_EXPRS = 0x2402, "closure_exprs";
+
+        // Const eval.
+        CONST_EVAL = 0x2410, "const_eval_query";
+        ANON_CONST_EVAL = 0x2411, "anon_const_eval_query";
+        CONST_EVAL_STATIC = 0x2412, "const_eval_static_query";
+        CONST_EVAL_DISCRIMINANT = 0x2413, "const_eval_discriminant_variant";
+
+        // Signatures.
+        IMPL_TRAIT = 0x2420, "impl_trait_of_impl";
+        TYPE_FOR_CONST = 0x2421, "type_for_const_with_diagnostics";
+        TYPE_FOR_STATIC = 0x2422, "type_for_static_with_diagnostics";
+        TYPE_FOR_TYPE_ALIAS = 0x2423, "type_for_type_alias_with_diagnostics";
+        IMPL_SELF_TY = 0x2424, "impl_self_ty_of_impl";
+        CONST_PARAM_TYPES = 0x2425, "const_param_types_with_diagnostics";
+        FIELD_TYPES = 0x2426, "field_types_of_variant";
+        SUPERTRAITS_INFO = 0x2427, "supertraits_info";
+        ASSOC_TYPE_SHORTHAND = 0x2428, "resolve_type_param_assoc_type_shorthand";
+        TYPE_ALIAS_BOUNDS = 0x2429, "type_alias_bounds_with_diagnostics";
+        GENERIC_PREDICATES = 0x242a, "generic_predicates_of";
+        TRAIT_ENVIRONMENT = 0x242b, "trait_environment_query";
+        CONST_CONDITIONS = 0x242c, "const_conditions_query";
+        GENERIC_DEFAULTS = 0x242d, "generic_defaults_with_diagnostics";
+        FN_SIG_FOR_FN = 0x242e, "fn_sig_for_fn";
+        ELIDED_LIFETIMES = 0x242f, "elided_lifetimes";
+        FN_SIG_FOR_STRUCT_CONSTRUCTOR = 0x2430, "fn_sig_for_struct_constructor";
+        FN_SIG_FOR_ENUM_VARIANT_CONSTRUCTOR = 0x2431, "fn_sig_for_enum_variant_constructor";
+        BUILTIN_DERIVE_PREDICATES = 0x2432, "predicates";
+        CONST_PARAM_ENV = 0x2433, "const_param_env_query";
+        ITEM_BOUNDS = 0x2434, "ItemBounds::of";
+        IMPL_SUPER_OUTLIVES = 0x2435, "impl_super_outlives";
+        CRATE_FIELD_TYPES = 0x2436, "crate_field_types";
+        CRATE_IMPL_SELF_TYS = 0x2437, "crate_impl_self_tys";
+        CRATE_IMPL_TRAITS = 0x2438, "crate_impl_traits";
+        CRATE_IMPL_PREDICATES = 0x2439, "crate_impl_predicates";
+
+        // Variance, dyn compatibility, representability.
+        VARIANCES_OF = 0x2440, "variances_of_query";
+        CTOR_VARIANCES = 0x2441, "ctor_variances_query";
+        DYN_COMPATIBILITY_OF_TRAIT = 0x2442, "dyn_compatibility_of_trait_query";
+        GENERICS_REQUIRE_SIZED_SELF = 0x2443, "generics_require_sized_self";
+        REPRESENTABILITY = 0x2444, "representability";
+        PARAMS_IN_REPR = 0x2445, "params_in_repr";
+
+        // Layout and drop.
+        LAYOUT_OF_ADT = 0x2450, "layout_of_adt_query";
+        LAYOUT_OF_TY = 0x2451, "layout_of_ty_query";
+        TARGET_DATA_LAYOUT = 0x2452, "target_data_layout_query";
+        STRUCT_FLAGS = 0x2453, "struct_flags";
+        VARIANT_FIELD_IDS = 0x2454, "variant_field_ids";
+        ENUM_VARIANT_IDS = 0x2455, "enum_variant_ids";
+        DESTRUCTOR = 0x2456, "destructor";
+
+        // Method resolution, impls, coherence, specialization.
+        LOOKUP_IMPL_METHOD = 0x2460, "lookup_impl_method_stored";
+        IMPL_VALUE_ITEM = 0x2461, "impl_value_item";
+        TRAIT_VALUE_ITEM = 0x2462, "trait_value_item";
+        LOADED_CRATES = 0x2463, "loaded_crates";
+        IMPLS_IN_BODIES = 0x2464, "impls_in_bodies";
+        MACROS_WRITING_IMPLS = 0x2465, "macros_writing_impls";
+        MACRO_DEFINITIONS = 0x2466, "macro_definitions";
+        CRATES_WITH_INCOHERENT_IMPLS = 0x2467, "crates_containing_incoherent_inherent_impls";
+        INHERENT_IMPLS_FOR_CRATE = 0x2468, "InherentImpls::for_crate";
+        INHERENT_IMPLS_IN_CRATE_FOR_SELF_TY = 0x2469, "InherentImpls::in_crate_for_self_ty";
+        INHERENT_IMPLS_FOR_BLOCK = 0x246a, "InherentImpls::for_block";
+        INHERENT_IMPLS_IN_BLOCK_FOR_SELF_TY = 0x246b, "InherentImpls::in_block_for_self_ty";
+        TRAIT_IMPLS_FOR_CRATE = 0x246c, "TraitImpls::for_crate";
+        TRAIT_IMPLS_FOR_BLOCK = 0x246d, "TraitImpls::for_block";
+        TRAIT_IMPLS_FOR_CRATE_AND_DEPS = 0x246e, "TraitImpls::for_crate_and_deps";
+        TRAIT_IMPLS_IN_CRATE_AND_DEPS_FOR_TRAIT_AND_SELF_TY = 0x246f,
+            "TraitImpls::in_crate_and_deps_for_trait_and_self_ty";
+        TRAIT_IMPLS_BLANKET_IN_CRATE_AND_DEPS = 0x2470, "TraitImpls::blanket_in_crate_and_deps";
+        TRAIT_IMPLS_IN_CRATE_FOR_TRAIT_AND_SELF_TY = 0x2471,
+            "TraitImpls::in_crate_for_trait_and_self_ty";
+        TRAIT_IMPLS_IN_BLOCK_FOR_TRAIT_AND_SELF_TY = 0x2472,
+            "TraitImpls::in_block_for_trait_and_self_ty";
+        TRAIT_IMPLS_IN_CRATE_FOR_TRAIT = 0x2473, "TraitImpls::in_crate_for_trait";
+        TRAIT_IMPLS_IN_CRATE_AND_DEPS_FOR_TRAIT = 0x2474, "TraitImpls::in_crate_and_deps_for_trait";
+        INHERENT_IMPL_COHERENT = 0x2475, "inherent_impl_coherent";
+        ORPHAN_RULES_HOLD = 0x2476, "orphan_rules_hold";
+        SPECIALIZES = 0x2477, "specializes_query";
+        IMPL_HAS_UNCONSTRAINED_PARAMS = 0x2478, "impl_has_unconstrained_params";
+
+        // Opaque types.
+        IMPL_TYPE_ALIASES = 0x2480, "impl_type_aliases";
+        TRAIT_TYPE_ALIASES = 0x2481, "trait_type_aliases";
+        RPIT_HIDDEN_TYPES = 0x2482, "rpit_hidden_types";
+        TAIT_HIDDEN_TYPES = 0x2483, "tait_hidden_types";
+        DEFINING_FUNCTIONS = 0x2484, "defining_functions";
+        DEFINE_OPAQUE_FUNCTIONS = 0x2485, "define_opaque_functions";
+        DEFINE_OPAQUE_AT = 0x2486, "define_opaque_at";
+
+        // Inputs.
+        FROZEN_IMPLS = 0x25e0, "FrozenImpls";
+
+        // Interned ids.
+        INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";
+        INTERNED_CLOSURE = 0x25f1, "InternedClosureId";
+        INTERNED_COROUTINE = 0x25f2, "InternedCoroutineId";
+        INTERNED_COROUTINE_CLOSURE = 0x25f3, "InternedCoroutineClosureId";
+        ANON_CONST = 0x25f4, "AnonConstId";
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::path::Path;
+
+        use rustc_hash::FxHashSet;
+
+        use super::*;
+
+        #[test]
+        fn kinds_are_distinct_and_hir_tys() {
+            assert!(blaze_query::kinds::FRONT.start <= RANGE.start);
+            assert!(RANGE.end <= blaze_query::kinds::FRONT.end);
+            let mut numbers = FxHashSet::default();
+            let mut names = FxHashSet::default();
+            for &(kind, name) in ALL {
+                assert!(RANGE.contains(&kind.0), "{name}: {:#x} is not hir-ty's", kind.0);
+                assert!(numbers.insert(kind), "{name}: {:#x} is given twice", kind.0);
+                assert!(names.insert(name), "{name} has two kinds");
+                assert_eq!(of(name), Some(kind));
+                assert_eq!(super::name(kind), Some(name));
+            }
+            assert_eq!(of("no_such_query"), None);
+            assert_eq!(super::name(QueryKind(RANGE.end - 1)), None);
+        }
+
+        /// The queries and interned ids declared in the source of hir-ty, as [`ALL`] names them.
+        fn declared() -> Vec<String> {
+            let mut found = Vec::new();
+            let mut dirs = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+            while let Some(dir) = dirs.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        dirs.push(path);
+                    } else if path.extension().is_some_and(|it| it == "rs") {
+                        scan(&std::fs::read_to_string(&path).unwrap(), &mut found);
+                    }
+                }
+            }
+            found
+        }
+
+        /// What follows each salsa attribute of `text`: a function, a method of a tracked
+        /// `impl`, or an interned or input struct.
+        fn scan(text: &str, found: &mut Vec<String>) {
+            let attribute = concat!("#[", "salsa::");
+            let mut in_impl: Option<String> = None;
+            let mut lines = text.lines();
+            while let Some(line) = lines.next() {
+                if line.starts_with('}') {
+                    in_impl = None;
+                }
+                let Some(rest) = line.trim_start().strip_prefix(attribute) else { continue };
+                let keyword = match () {
+                    _ if rest.starts_with("tracked") => "fn",
+                    _ if rest.starts_with("interned") || rest.starts_with("input") => "struct",
+                    _ => continue,
+                };
+                for next in lines.by_ref() {
+                    let next = next.trim_start();
+                    if next.starts_with("//") || next.starts_with("#[") {
+                        continue;
+                    }
+                    if let Some(ty) = next.strip_prefix("impl") {
+                        in_impl = Some(ident(ty));
+                        break;
+                    }
+                    let mut words = next.split_whitespace();
+                    if words.any(|it| it == keyword) {
+                        let name = ident(words.next().unwrap_or_default());
+                        found.push(match (keyword, &in_impl) {
+                            ("fn", Some(ty)) => format!("{ty}::{name}"),
+                            _ => name,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        /// The name `text` starts with, after the generic parameters of an `impl`.
+        fn ident(text: &str) -> String {
+            let text = text.trim_start();
+            let text = match text.strip_prefix('<') {
+                Some(rest) => &rest[rest.find('>').map_or(0, |at| at + 1)..],
+                None => text,
+            };
+            text.trim_start().chars().take_while(|&c| c.is_alphanumeric() || c == '_').collect()
+        }
+
+        #[test]
+        fn every_query_has_a_kind() {
+            let declared = declared();
+            for name in &declared {
+                assert!(of(name).is_some(), "`{name}` has no kind in `hir_ty::db::kinds`");
+            }
+            for &(_, name) in ALL {
+                assert!(declared.iter().any(|it| it == name), "`{name}` is no query of hir-ty");
+            }
+        }
+    }
+}

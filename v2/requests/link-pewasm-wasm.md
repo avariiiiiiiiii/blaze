@@ -314,8 +314,13 @@ mod tests {
 }
 ```
 
+
+> forwarded to codegen: `crates/blaze-codegen/` is codegen's and codegen is running; `src/wasm.rs` and `pub mod wasm;` are not there yet.
+
 ## 2. `Static::imports` (with lane `link`'s `Static` request)
 
 `pub imports: Vec<(String, wasm::Import)>` on `blaze_codegen::Static`: what each
 `Target::Extern` its `Init` relocations name is imported as, on wasm (a function pointer to a
 `#[link(wasm_import_module)]` function stored in a static). Empty elsewhere.
+
+> forwarded to codegen: `Static::imports` (`crates/blaze-codegen/src/lib.rs`), with link's `Static` request.

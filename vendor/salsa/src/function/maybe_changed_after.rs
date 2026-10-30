@@ -247,7 +247,9 @@ where
 
                 // An evicted value with a value fingerprint is computed again and backdated
                 // when its fingerprint is the kept one. Without one it can't be compared.
-                if old_memo.value.is_none() && !old_memo.header.revisions.value_fingerprint().is_value() {
+                if old_memo.value.is_none()
+                    && !old_memo.header.revisions.value_fingerprint().is_value()
+                {
                     return Some(VerifyResult::changed());
                 }
 

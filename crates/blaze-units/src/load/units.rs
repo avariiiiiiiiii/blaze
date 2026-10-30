@@ -1,0 +1,675 @@
+//! The resolve made into units (blaze-metadata's `units`, then what `-Zbuild-std` adds): the
+//! profiles, the feature resolve, the unit graph ([`crate::unit_graph`]), the standard
+//! library's units merged in as cargo's `attach_std_deps` merges them, and each unit's plan
+//! ([`super::plan`]).
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
+use blaze_manifest::manifest::Manifest;
+use blaze_manifest::profiles::{Profiles, ProfilePackage, requested_profile};
+use blaze_manifest::targets::TargetKind;
+use blaze_manifest::{Context, Workspace};
+use blaze_query::{Cancelled, Cx};
+use blaze_resolve::resolver::{CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets};
+use blaze_resolve::{Cfg, InternedString, PackageId, Platform};
+use cargo_util_schemas::manifest::{TomlProfile, TomlProfiles};
+use cargo_util_schemas::restricted_names::ProfileName;
+use rustc_hash::FxHashMap;
+
+use super::manifest::WorkspaceRead;
+use super::resolve::Resolved;
+use super::summary::Read;
+use super::{ForeignAsk, Spec, Staged, load_error};
+use crate::query::{LoadError, LockWrite, PackagePlan, StdGraph, StdKey, StdPlanned, StdUnits, UnitPlan};
+use crate::schema::{self, Mode, Unit, UnitDep};
+use crate::stdlib::target::{self as platform, CfgArgs};
+use crate::stdlib::{STD_OUT, default_crates, default_features};
+use crate::{Filter, Intent, LibRule, Package, Platformed, Request, Rule};
+
+/// A build's units as the load made them: [`crate::query::Units`] less what only the view's
+/// build has, or a [`StdGraph`]'s.
+pub(crate) struct Built {
+    pub graph: schema::UnitGraph,
+    pub plans: Vec<UnitPlan>,
+    pub packages: Vec<PackagePlan>,
+    pub lock: Option<LockWrite>,
+    pub warnings: Vec<String>,
+    pub target_dir: String,
+    pub build_dir: String,
+    pub finished: String,
+    /// A foreign workspace's roots by name, with their units' indexes.
+    pub roots: Vec<(String, usize)>,
+}
+
+/// The units of `resolved`, as `spec` asks for them.
+pub(crate) fn units(
+    cx: &mut Cx<'_>,
+    ctx: &Context,
+    ws: &Workspace<'_>,
+    spec: &Spec,
+    read: &WorkspaceRead,
+    resolved: Resolved<'_>,
+) -> Result<Staged<Built>, Cancelled> {
+    let at = Some(ws.root_manifest().display().to_string());
+    let fail = |error: anyhow::Error| Staged::Failed(load_error(&error, at.clone()));
+    let config = &ctx.config;
+    let platforms = match platforms(config, spec) {
+        Ok(it) => it,
+        Err(error) => return Ok(Staged::Failed(error)),
+    };
+    let Platforms { host, host_flags, target, target_flags } = &platforms;
+    let requested = match &spec.foreign {
+        Some(ask) => ask.profile.root.clone(),
+        None => match requested_profile(spec.intent.default_profile(), spec.release, spec.profile.as_deref()) {
+            Ok(it) => it,
+            Err(error) => return Ok(fail(error)),
+        },
+    };
+    let manifest_profiles = match &spec.foreign {
+        Some(ask) => match foreign_profiles(ws.profiles(), ask) {
+            Ok(it) => Some(it),
+            Err(error) => return Ok(fail(error)),
+        },
+        None => ws.profiles().cloned(),
+    };
+    let profiles = match Profiles::new(manifest_profiles.as_ref(), ws.unstable_features(), config, &requested, &host.triple) {
+        Ok(it) => it,
+        Err(error) => return Ok(fail(error)),
+    };
+    let mut warnings: Vec<String> = read.config.warnings.clone();
+    warnings.extend(read.warnings.iter().cloned());
+    warnings.extend(resolved.warnings.iter().cloned());
+    {
+        let pkgs: Vec<crate::graph::ProfilePkg<'_>> =
+            resolved.resolve.iter().filter_map(|id| resolved.manifests.get(&id)).map(|(_, m)| crate::graph::ProfilePkg(&m.package_id)).collect();
+        let pkgs: Vec<&dyn ProfilePackage> = pkgs.iter().map(|it| it as &dyn ProfilePackage).collect();
+        if let Err(error) = profiles.validate_packages(manifest_profiles.as_ref(), &pkgs, &mut warnings) {
+            return Ok(fail(error));
+        }
+    }
+
+    let filter = match run_filter(spec, &resolved) {
+        Ok(it) => it,
+        Err(error) => return Ok(fail(error)),
+    };
+    let targets = Targets { reads: &resolved.reads, host, target: target.as_ref() };
+    let kinds = match target {
+        Some(target) => vec![CompileKind::Target(InternedString::new(&target.triple))],
+        None => vec![CompileKind::Host],
+    };
+    let opts = FeatureOpts::new(resolved.behavior, resolved.has_dev_units, ForceAllTargets::No);
+    let members: Vec<_> = resolved.feature_members.iter().map(|(summary, features)| (summary, features.clone())).collect();
+    let features = match FeatureResolver::resolve(&targets, &resolved.resolve, &members, &kinds, opts) {
+        Ok(it) => it,
+        Err(error) => return Ok(fail(error)),
+    };
+    let all_ids: Vec<PackageId> = resolved.resolve.iter().collect();
+    // A foreign workspace's roots are the packages it names (cargo's `generate_std_roots`),
+    // which need not be the packages it resolves for.
+    let root_specs: Vec<blaze_resolve::PackageIdSpec> = match &spec.foreign {
+        Some(ask) => match ask.roots.iter().map(|name| blaze_resolve::PackageIdSpec::parse(name)).collect() {
+            Ok(it) => it,
+            Err(error) => return Ok(fail(error)),
+        },
+        None => resolved.specs.clone(),
+    };
+    let roots = match root_specs.iter().map(|spec| spec.query(&all_ids)).collect::<anyhow::Result<Vec<_>>>() {
+        Ok(it) => it,
+        Err(error) => return Ok(fail(error)),
+    };
+    let by_id: FxHashMap<PackageId, Package<'_>> = resolved
+        .manifests
+        .iter()
+        .filter(|(id, _)| all_ids.contains(id))
+        .map(|(id, (_, manifest))| (*id, Package { manifest, is_member: resolved.member_ids.contains(id) }))
+        .collect();
+    let request = Request {
+        packages: &by_id,
+        resolve: &resolved.resolve,
+        features: &features,
+        profiles: &profiles,
+        roots: &roots,
+        intent: spec.intent,
+        filter: &filter,
+        host,
+        target: target.as_ref(),
+        has_dev_units: resolved.has_dev_units == HasDevUnits::Yes,
+    };
+    let mut graph = match crate::unit_graph(&request) {
+        Ok(it) => it,
+        Err(error) => return Ok(fail(error)),
+    };
+    if let Some(error) = artifact_refusal(&graph, &by_id, &resolved) {
+        return Ok(Staged::Failed(error));
+    }
+    if spec.run {
+        if let Err(error) = run_one(&graph, &filter) {
+            return Ok(fail(error));
+        }
+    }
+
+    let target_dir = match &spec.target_dir {
+        Some(dir) => PathBuf::from(dir),
+        None => ws.target_dir(),
+    };
+    let build_dir = match config.build_dir(ws.root_manifest()) {
+        Ok(Some(dir)) => dir,
+        Ok(None) => target_dir.clone(),
+        Err(error) => return Ok(fail(error)),
+    };
+    let dir_name = profiles.get_dir_name().to_owned();
+
+    // The standard library's units: of each platform a unit is built for, merged in.
+    let named_roots: Vec<(String, usize)> = match &spec.foreign {
+        Some(ask) => {
+            let mut named = Vec::new();
+            for (name, id) in ask.roots.iter().zip(&roots) {
+                let pkg_id = id.to_spec().to_string();
+                let found = graph.roots.iter().copied().find(|at| {
+                    let unit = &graph.units[*at];
+                    unit.pkg_id == pkg_id && unit.target.is_lib() && unit.mode == Mode::Build
+                });
+                match found {
+                    Some(at) => named.push((name.clone(), at)),
+                    None => return Ok(fail(anyhow::anyhow!("package `{name}` has no library unit among the roots"))),
+                }
+            }
+            named
+        }
+        None => Vec::new(),
+    };
+    let mut std_plans: Vec<Option<UnitPlan>> = vec![None; graph.units.len()];
+    let mut std_packages: Vec<PackagePlan> = Vec::new();
+    match &spec.foreign {
+        Some(ask) => foreign_units(&mut graph, &by_id, ask),
+        None => {
+            let base = match schema_profile(&profiles) {
+                Ok(it) => it,
+                Err(error) => return Ok(fail(error)),
+            };
+            let mut platforms_used: Vec<Option<String>> = graph.units.iter().map(|it| it.platform.clone()).collect();
+            platforms_used.sort();
+            platforms_used.dedup();
+            for platform in platforms_used {
+                let triple = platform.clone().unwrap_or_else(|| host.triple.clone());
+                let rustflags = match &platform {
+                    Some(_) => target_flags.clone(),
+                    None => host_flags.clone(),
+                };
+                let key = match std_key(spec, &graph, &by_id, &base, &profiles, &triple, rustflags) {
+                    Ok(it) => it,
+                    Err(error) => return Ok(Staged::Failed(error)),
+                };
+                let std = match cx.get::<StdUnits>(&key)?.get() {
+                    StdPlanned::Ready(std) => std,
+                    StdPlanned::Failed(error) => return Ok(Staged::Failed(error)),
+                };
+                let out = match &platform {
+                    Some(triple) => build_dir.join(triple).join(&dir_name),
+                    None => build_dir.join(&dir_name),
+                };
+                merge_std(&mut graph, &mut std_plans, &mut std_packages, std, &platform, &out.display().to_string());
+            }
+        }
+    }
+
+    let packages_by_spec: FxHashMap<String, (PackageId, Package<'_>)> = by_id
+        .iter()
+        .map(|(id, package)| (id.to_spec().to_string(), (*id, Package { manifest: package.manifest, is_member: package.is_member })))
+        .collect();
+    let (out_dir, out_build) = match &spec.foreign {
+        Some(_) => (PathBuf::from(FOREIGN_TARGET), PathBuf::from(FOREIGN_TARGET)),
+        None => (target_dir.clone(), build_dir.clone()),
+    };
+    let jobs = match jobs(config, spec.jobs) {
+        Ok(it) => it,
+        Err(error) => return Ok(fail(error)),
+    };
+    let input = super::plan::PlanInput {
+        units: &graph.units,
+        std_plans: &std_plans,
+        packages: &packages_by_spec,
+        config,
+        ws_root: ws.root(),
+        ws_manifest: ws.root_manifest(),
+        target_dir: &out_dir,
+        build_dir: &out_build,
+        host: &host.triple,
+        target: target.as_ref().map(|it| it.triple.as_str()),
+        requested_profile: &requested,
+        jobs,
+    };
+    let planned = match super::plan::plan(&input) {
+        Ok(it) => it,
+        Err(error) => return Ok(Staged::Failed(error)),
+    };
+    let mut plans = planned.plans;
+    if let Some(ask) = &spec.foreign {
+        let ours = |at: &Path| at.display().to_string();
+        let prefixes = [
+            ours(&Path::new(FOREIGN_TARGET).join(&ask.triple).join(&dir_name)),
+            ours(&Path::new(FOREIGN_TARGET).join(&dir_name)),
+        ];
+        for plan in &mut plans {
+            rebase(plan, &prefixes, &ask.out);
+        }
+    }
+
+    let mut packages: Vec<PackagePlan> = by_id
+        .iter()
+        .map(|(id, package)| package_plan(*id, package.manifest, resolved.manifests[id].0, package.is_member))
+        .collect();
+    packages.extend(std_packages);
+    packages.sort_by(|a, b| a.id.cmp(&b.id));
+    packages.dedup_by(|a, b| a.id == b.id);
+    Ok(Staged::Done(Built {
+        graph,
+        plans,
+        packages,
+        lock: resolved.lock,
+        warnings,
+        target_dir: target_dir.display().to_string(),
+        build_dir: build_dir.display().to_string(),
+        finished: planned.finished,
+        roots: named_roots,
+    }))
+}
+
+/// `-j` or `build.jobs` as cargo's `JobsConfig` reads it, when it names a number of jobs; none
+/// for cargo's default, the machine's parallelism (less `-N` of it), which the daemon has.
+fn jobs(config: &blaze_manifest::Config, asked: Option<u32>) -> anyhow::Result<Option<u32>> {
+    use blaze_manifest::config::schema::JobsConfig;
+    if asked == Some(0) {
+        anyhow::bail!("jobs may not be 0");
+    }
+    if asked.is_some() {
+        return Ok(asked);
+    }
+    Ok(match &config.build_config()?.jobs {
+        None => None,
+        Some(JobsConfig::Integer(0)) => anyhow::bail!("jobs may not be 0"),
+        Some(JobsConfig::Integer(n)) if *n > 0 => Some(*n as u32),
+        Some(JobsConfig::Integer(_)) => None,
+        Some(JobsConfig::String(it)) if it == "default" => None,
+        Some(JobsConfig::String(it)) => match it.parse::<i32>() {
+            Ok(0) => anyhow::bail!("jobs may not be 0"),
+            Ok(n) if n > 0 => Some(n as u32),
+            Ok(_) => None,
+            Err(_) => anyhow::bail!("could not parse `{it}`. Number of parallel jobs should be `default` or a number."),
+        },
+    })
+}
+
+/// Where a foreign workspace's plans are made before their directory is put as
+/// [`ForeignAsk::out`].
+const FOREIGN_TARGET: &str = "/@blaze-foreign-target";
+
+/// Each path of `plan` under one of `prefixes` put under `out` instead.
+fn rebase(plan: &mut UnitPlan, prefixes: &[String], out: &str) {
+    let moved = |path: &str| -> String {
+        for prefix in prefixes {
+            if let Some(rest) = path.strip_prefix(prefix.as_str())
+                && (rest.is_empty() || rest.starts_with('/'))
+            {
+                return format!("{out}{rest}");
+            }
+        }
+        path.to_owned()
+    };
+    for output in &mut plan.outputs {
+        *output = moved(output);
+    }
+    if let Some(dir) = &mut plan.out_dir {
+        *dir = moved(dir);
+    }
+    for (name, value) in &mut plan.env {
+        if name == "OUT_DIR" {
+            *value = moved(value);
+        }
+    }
+}
+
+/// The platforms a build is for: the host, and `--target`'s or `build.target`'s when there is
+/// one, each with its cfg and the rustflags cargo passes its units.
+pub(crate) struct Platforms {
+    pub host: Platformed,
+    pub host_flags: Vec<String>,
+    pub target: Option<Platformed>,
+    pub target_flags: Vec<String>,
+}
+
+fn platforms(config: &blaze_manifest::Config, spec: &Spec) -> Result<Platforms, LoadError> {
+    let error = |what: String| LoadError { what, at: None };
+    if let Some(ask) = &spec.foreign {
+        let parse = |cfg: &[String]| -> Result<Vec<Cfg>, LoadError> {
+            cfg.iter().map(|it| it.parse::<Cfg>().map_err(|e| error(format!("the cfg `{it}`: {e}")))).collect()
+        };
+        return Ok(Platforms {
+            host: Platformed { triple: ask.host.clone(), cfg: parse(&ask.host_cfg)? },
+            host_flags: Vec::new(),
+            target: Some(Platformed { triple: ask.triple.clone(), cfg: parse(&ask.cfg)? }),
+            target_flags: ask.rustflags.clone(),
+        });
+    }
+    let target = match &spec.target {
+        Some(it) => Some(it.clone()),
+        None => {
+            let build = config.build_config().map_err(|e| load_error(&e, None))?;
+            let named = build.target.as_ref().map(|it| it.values(config.cwd())).unwrap_or_default();
+            match named.as_slice() {
+                [] => None,
+                [one] => Some(one.clone()),
+                _ => {
+                    return Err(error(
+                        "blaze builds for one target at a time, and `build.target` names several".to_owned(),
+                    ));
+                }
+            }
+        }
+    };
+    let platform = |triple: &str| -> Result<(Platformed, Vec<String>), LoadError> {
+        let rustflags = super::plan::platform_rustflags(config, triple, &spec.host, target.as_deref())?;
+        let args = CfgArgs::from_flags(&rustflags).map_err(error)?;
+        let cfg = platform::target_cfgs(triple, &CfgArgs { proc_macro: true, ..args }).map_err(error)?;
+        Ok((Platformed { triple: triple.to_owned(), cfg }, rustflags))
+    };
+    let (host, host_flags) = platform(&spec.host)?;
+    let (target, target_flags) = match target.as_deref().map(platform).transpose()? {
+        Some((it, flags)) => (Some(it), flags),
+        None => (None, Vec::new()),
+    };
+    Ok(Platforms { host, host_flags, target, target_flags })
+}
+
+/// What the feature resolver reads of the packages.
+struct Targets<'a> {
+    reads: &'a FxHashMap<PackageId, Read>,
+    host: &'a Platformed,
+    target: Option<&'a Platformed>,
+}
+
+impl PackageTargets for Targets<'_> {
+    fn has_any_proc_macro(&self, package_id: PackageId) -> bool {
+        self.reads.get(&package_id).is_some_and(|it| it.any_proc_macro)
+    }
+
+    fn has_proc_macro_lib(&self, package_id: PackageId) -> bool {
+        self.reads.get(&package_id).is_some_and(|it| it.proc_macro_lib)
+    }
+
+    fn platform_activated(&self, platform: &Platform, kind: CompileKind) -> bool {
+        match kind {
+            CompileKind::Host => self.host.activates(platform),
+            CompileKind::Target(_) => self.target.unwrap_or(self.host).activates(platform),
+        }
+    }
+}
+
+/// `cargo run`'s targets: the one `default-run` names when no target flag does (cargo's
+/// `commands/run.rs`), else the command's filter.
+fn run_filter(spec: &Spec, resolved: &Resolved<'_>) -> anyhow::Result<Filter> {
+    if !spec.run || !matches!(spec.filter, Filter::Default { .. }) {
+        return Ok(spec.filter.clone());
+    }
+    let selected = resolved.member_ids.iter().filter(|id| resolved.specs.iter().any(|spec| spec.matches(**id)));
+    let default_runs: Vec<&str> = selected
+        .filter_map(|id| resolved.manifests.get(id))
+        .filter_map(|(_, manifest)| manifest.default_run.as_deref())
+        .collect();
+    Ok(match default_runs.as_slice() {
+        [bin] => Filter::Only {
+            all_targets: false,
+            lib: LibRule::False,
+            bins: Rule::Just(vec![(*bin).to_owned()]),
+            examples: Rule::none(),
+            tests: Rule::none(),
+            benches: Rule::none(),
+        },
+        _ => Filter::Default { required_features_filterable: false },
+    })
+}
+
+/// cargo's `ops::run`: exactly one executable among the graph's roots.
+fn run_one(graph: &schema::UnitGraph, filter: &Filter) -> anyhow::Result<()> {
+    let specific = matches!(filter, Filter::Only { .. });
+    let runnable: Vec<&Unit> = graph
+        .roots
+        .iter()
+        .map(|it| &graph.units[*it])
+        .filter(|unit| unit.target.kind.iter().any(|kind| kind == "bin" || kind == "example"))
+        .collect();
+    match runnable.as_slice() {
+        [] if !specific => anyhow::bail!("a bin target must be available for `cargo run`"),
+        [] => Ok(()),
+        [one] if one.target.kind.iter().any(|it| it == "example") && !one.target.crate_types.iter().any(|it| it == "bin") => {
+            anyhow::bail!("example target `{}` is a library and cannot be executed", one.target.name)
+        }
+        [_] => Ok(()),
+        _ if !specific => {
+            let mut names: Vec<&str> = runnable.iter().map(|it| it.target.name.as_str()).collect();
+            names.sort();
+            anyhow::bail!(
+                "`cargo run` could not determine which binary to run. Use the `--bin` option to specify a binary, or the `default-run` manifest key.\navailable binaries: {}",
+                names.join(", ")
+            )
+        }
+        _ => anyhow::bail!("`cargo run` can run at most one executable, but multiple were specified"),
+    }
+}
+
+/// The first unit that depends on an artifact dependency (`-Z bindeps`, #601), which blaze
+/// does not build: refused, naming both. Units that depend on none build.
+fn artifact_refusal(graph: &schema::UnitGraph, packages: &FxHashMap<PackageId, Package<'_>>, resolved: &Resolved<'_>) -> Option<LoadError> {
+    for unit in &graph.units {
+        let Some((id, package)) = packages.iter().find(|(id, _)| id.to_spec().to_string() == unit.pkg_id) else { continue };
+        let script = unit.target.is_custom_build() && unit.mode != Mode::RunCustomBuild;
+        let dev = matches!(unit.mode, Mode::Test) || unit.target.kind.iter().any(|it| matches!(it.as_str(), "test" | "bench" | "example"));
+        let used = |kind: blaze_resolve::DepKind| match kind {
+            blaze_resolve::DepKind::Build => script,
+            blaze_resolve::DepKind::Development => dev && !script,
+            blaze_resolve::DepKind::Normal => !script && unit.mode != Mode::RunCustomBuild,
+        };
+        let resolved_deps: Vec<String> = resolved.resolve.deps(*id).map(|(dep, _)| dep.name().to_string()).collect();
+        for dep in &package.manifest.dependencies {
+            let Some(artifact) = &dep.artifact else { continue };
+            if !used(dep.kind) || !resolved_deps.iter().any(|it| *it == dep.name) {
+                continue;
+            }
+            return Some(LoadError {
+                what: format!(
+                    "blaze does not build artifact dependencies yet (`-Z bindeps`, #601): {} of `{}` depends on `{}` with `artifact = {:?}`",
+                    unit_name(unit),
+                    package.manifest.package_id.name,
+                    dep.name,
+                    artifact.kinds
+                ),
+                at: Some(package.manifest.package_id.source_id.to_string()),
+            });
+        }
+    }
+    None
+}
+
+fn unit_name(unit: &Unit) -> String {
+    let kind = unit.target.kind.first().map(String::as_str).unwrap_or("lib");
+    match unit.mode {
+        Mode::RunCustomBuild => "the build script's run".to_owned(),
+        _ if unit.target.is_custom_build() => "the build script".to_owned(),
+        _ => format!("the {kind} target `{}`", unit.target.name),
+    }
+}
+
+/// The base profile (no package's overrides) in the unit graph's form: what [`StdKey`] takes
+/// of the user's profile.
+fn schema_profile(profiles: &Profiles) -> anyhow::Result<schema::Profile> {
+    serde_json::from_value(serde_json::to_value(profiles.base_profile())?).context("a profile in cargo's form")
+}
+
+fn debuginfo_text(debuginfo: &schema::DebugInfo) -> String {
+    match debuginfo {
+        schema::DebugInfo::Level(level) => level.to_string(),
+        schema::DebugInfo::Named(name) => name.clone(),
+    }
+}
+
+/// The standard library's key for the units built for `triple`.
+fn std_key(
+    spec: &Spec,
+    graph: &schema::UnitGraph,
+    packages: &FxHashMap<PackageId, Package<'_>>,
+    base: &schema::Profile,
+    profiles: &Profiles,
+    triple: &str,
+    rustflags: Vec<String>,
+) -> Result<StdKey, LoadError> {
+    let library = spec.library.clone().ok_or_else(|| LoadError {
+        what: format!("the standard library is mounted nowhere: no mount is at `{}`", spec.library_at),
+        at: None,
+    })?;
+    let mut crates = match &spec.build_std {
+        Some(crates) => crates.clone(),
+        None => default_crates(triple).map_err(|what| LoadError { what, at: None })?,
+    };
+    // cargo's `std_crates`: `test` when a unit is a test in libtest's harness.
+    let harnessed = graph.units.iter().any(|unit| {
+        unit.mode == Mode::Test && harness_of(unit, packages)
+    });
+    if crates.iter().any(|it| it == "std") && harnessed && !crates.iter().any(|it| it == "test") {
+        crates.push("test".to_owned());
+    }
+    crates.sort();
+    crates.dedup();
+    let root = match profiles.base_profile().root {
+        blaze_manifest::profiles::ProfileRoot::Release => "release",
+        blaze_manifest::profiles::ProfileRoot::Debug => "dev",
+    };
+    Ok(StdKey {
+        library,
+        triple: triple.to_owned(),
+        profile: base.name.clone(),
+        panic: base.panic.clone(),
+        opt_level: base.opt_level.clone(),
+        debug_assertions: base.debug_assertions,
+        overflow_checks: base.overflow_checks,
+        debuginfo: debuginfo_text(&base.debuginfo),
+        crates,
+        features: spec.build_std_features.clone().unwrap_or_else(default_features),
+        host: spec.host.clone(),
+        rustflags,
+        profile_root: root.to_owned(),
+    })
+}
+
+/// Whether the test `unit` runs in libtest's harness: its target's `harness`.
+fn harness_of(unit: &Unit, packages: &FxHashMap<PackageId, Package<'_>>) -> bool {
+    let Some((_, package)) = packages.iter().find(|(id, _)| id.to_spec().to_string() == unit.pkg_id) else { return false };
+    package.manifest.targets.iter().any(|target| {
+        target.name == unit.target.name && target.harness && kind_name(&target.kind) == unit.target.kind.first().map(String::as_str)
+    })
+}
+
+fn kind_name(kind: &TargetKind) -> Option<&'static str> {
+    Some(match kind {
+        TargetKind::Lib(_) => return None,
+        TargetKind::Bin => "bin",
+        TargetKind::Test => "test",
+        TargetKind::Bench => "bench",
+        TargetKind::ExampleLib(_) | TargetKind::ExampleBin => "example",
+        TargetKind::CustomBuild => "custom-build",
+    })
+}
+
+/// `std`'s units for `platform` merged into `graph` as cargo's `attach_std_deps` attaches
+/// them: every unit built for the platform but a build script's run depends on each root,
+/// `noprelude` (named by `--extern noprelude:std=...`), public and not reported unused. blaze
+/// has no sysroot, so a host unit (a build script, a proc macro) is given the host's std the
+/// same way.
+fn merge_std(
+    graph: &mut schema::UnitGraph,
+    plans: &mut Vec<Option<UnitPlan>>,
+    packages: &mut Vec<PackagePlan>,
+    std: StdGraph,
+    platform: &Option<String>,
+    out: &str,
+) {
+    let offset = graph.units.len();
+    let users: Vec<usize> = (0..offset)
+        .filter(|at| &graph.units[*at].platform == platform && graph.units[*at].mode != Mode::RunCustomBuild)
+        .collect();
+    for mut unit in std.units {
+        for dep in &mut unit.dependencies {
+            dep.index += offset;
+        }
+        graph.units.push(unit);
+    }
+    for mut plan in std.plans {
+        rebase(&mut plan, &[STD_OUT.to_owned()], out);
+        plans.push(Some(plan));
+    }
+    for at in users {
+        for (name, index) in &std.roots {
+            graph.units[at].dependencies.push(UnitDep {
+                index: index + offset,
+                extern_crate_name: name.clone(),
+                public: Some(true),
+                noprelude: Some(true),
+                nounused: Some(true),
+            });
+        }
+    }
+    packages.extend(std.packages);
+}
+
+/// The units of a foreign workspace as its ask says: every one `is_std` when asked, the
+/// packages that always abort built to abort, each unit's profile named as the build's.
+fn foreign_units(graph: &mut schema::UnitGraph, packages: &FxHashMap<PackageId, Package<'_>>, ask: &ForeignAsk) {
+    let names: FxHashMap<String, String> =
+        packages.keys().map(|id| (id.to_spec().to_string(), id.name().to_string())).collect();
+    for unit in &mut graph.units {
+        unit.is_std = ask.is_std;
+        unit.profile.name.clone_from(&ask.profile.name);
+        let script = unit.mode == Mode::RunCustomBuild || unit.target.is_custom_build();
+        let aborts = names.get(&unit.pkg_id).is_some_and(|name| ask.panic_abort.contains(name));
+        if aborts && !script {
+            unit.profile.panic = "abort".to_owned();
+        }
+    }
+}
+
+/// The workspace's own profiles, the root `ask.profile.root` given the build's settings.
+fn foreign_profiles(profiles: Option<&TomlProfiles>, ask: &ForeignAsk) -> anyhow::Result<TomlProfiles> {
+    let mut profiles = profiles.cloned().unwrap_or_else(|| TomlProfiles(BTreeMap::new()));
+    let quoted = |it: &str| match it.parse::<u32>() {
+        Ok(number) => number.to_string(),
+        Err(_) => format!("{it:?}"),
+    };
+    let text = format!(
+        "opt-level = {}\ndebug-assertions = {}\noverflow-checks = {}\ndebug = {}\npanic = {:?}\n",
+        quoted(&ask.profile.opt_level),
+        ask.profile.debug_assertions,
+        ask.profile.overflow_checks,
+        quoted(&ask.profile.debuginfo),
+        ask.profile.panic,
+    );
+    let settings: TomlProfile = toml::from_str(&text).with_context(|| format!("the standard library's profile: {text}"))?;
+    let name = ProfileName::new(ask.profile.root.clone())?;
+    profiles.0.entry(name).or_default().merge(&settings);
+    Ok(profiles)
+}
+
+/// A package as the build names it.
+fn package_plan(id: PackageId, manifest: &Manifest, manifest_path: &Path, is_member: bool) -> PackagePlan {
+    let named = format!("{} v{}", id.name(), id.version());
+    let full = id.to_string();
+    let source = full.strip_prefix(&named).map(str::trim).filter(|it| !it.is_empty()).map(str::to_owned);
+    PackagePlan {
+        id: id.to_spec().to_string(),
+        name: manifest.package_id.name.to_string(),
+        version: manifest.package_id.version.to_string(),
+        manifest_path: manifest_path.display().to_string(),
+        source,
+        is_member,
+    }
+}

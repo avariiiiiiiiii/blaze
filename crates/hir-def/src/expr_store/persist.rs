@@ -39,7 +39,7 @@ use crate::{
     expr_store::{
         Body, BodySourceMap, ExprOrPatSource, ExprRoot, ExpressionOnlySourceMap,
         ExpressionOnlyStore, ExpressionStore, ExpressionStoreDiagnostics, ExpressionStoreSourceMap,
-        FormatTemplate, HygieneId, LabelSource, LifetimeSource, MissingBodyItemKind, NO_OWNER,
+        FormatTemplate, HygieneId, IdTable, LabelSource, LifetimeSource, MissingBodyItemKind, NO_OWNER,
         TypeSource,
         body::Param,
         path::{
@@ -354,6 +354,23 @@ fn get_hash<K: Code + Eq + Hash, V: Code>(r: &mut Read<'_>) -> Result<FxHashMap<
         }
     }
     Ok(map)
+}
+
+/// Writes `table` in its order, which is by id.
+fn put_table<K: Code, V: Code>(w: &mut Words, table: &IdTable<K, V>) {
+    w.len(table.entries().len());
+    for (k, v) in table.entries() {
+        k.put(w);
+        v.put(w);
+    }
+}
+
+fn get_table<K: Code + Ord + Copy, V: Code>(r: &mut Read<'_>) -> Result<IdTable<K, V>, FormatError> {
+    let len = r.len()?;
+    let entries = (0..len)
+        .map(|_| Ok((K::get(r)?, V::get(r)?)))
+        .collect::<Result<Box<[(K, V)]>, FormatError>>()?;
+    IdTable::from_sorted(entries).ok_or_else(|| r.invalid("a table not sorted by id, or an id twice"))
 }
 
 /// Writes `map` densely: a slot for each id up to its last, each an `Option`.
@@ -1334,8 +1351,8 @@ impl SourceMapColumns {
             put_hash(&mut w, pat_map, src_key);
             put_hash(&mut w, label_map, src_key);
             put_arena_map(&mut w, binding_definitions);
-            put_hash(&mut w, field_map_back, |&expr| raw(expr));
-            put_hash(&mut w, pat_field_map_back, |&pat| raw(pat));
+            put_table(&mut w, field_map_back);
+            put_table(&mut w, pat_field_map_back);
             put_template(&mut w, template_map.as_deref());
             put_hash(&mut w, expansions, src_key);
             w.put(diagnostics);
@@ -1382,9 +1399,9 @@ fn put_template(w: &mut Words, template: Option<&FormatTemplate>) {
                 implicit_capture_to_source,
             } = template;
             w.u32(1);
-            put_hash(w, format_args_to_captures, |&expr| raw(expr));
-            put_hash(w, asm_to_captures, |&expr| raw(expr));
-            put_hash(w, implicit_capture_to_source, |&expr| raw(expr));
+            put_table(w, format_args_to_captures);
+            put_table(w, asm_to_captures);
+            put_table(w, implicit_capture_to_source);
         }
     }
 }
@@ -1393,9 +1410,9 @@ fn get_template(r: &mut Read<'_>) -> Result<Option<Box<FormatTemplate>>, FormatE
     Ok(match r.tag(2, "a template map that is neither 0 nor 1")? {
         0 => None,
         _ => Some(Box::new(FormatTemplate {
-            format_args_to_captures: get_hash(r)?,
-            asm_to_captures: get_hash(r)?,
-            implicit_capture_to_source: get_hash(r)?,
+            format_args_to_captures: get_table(r)?,
+            asm_to_captures: get_table(r)?,
+            implicit_capture_to_source: get_table(r)?,
         })),
     })
 }
@@ -1483,8 +1500,8 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
                 label_map: get_hash(&mut r)?,
                 label_map_back: back_map(self.label_map_back, buffer)?,
                 binding_definitions: get_arena_map(&mut r)?,
-                field_map_back: get_hash(&mut r)?,
-                pat_field_map_back: get_hash(&mut r)?,
+                field_map_back: get_table(&mut r)?,
+                pat_field_map_back: get_table(&mut r)?,
                 template_map: get_template(&mut r)?,
                 expansions: get_hash(&mut r)?,
                 diagnostics: r.get()?,

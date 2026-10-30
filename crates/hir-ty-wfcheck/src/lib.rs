@@ -42,7 +42,7 @@ use hir_ty::{
 };
 
 pub use outlives::Inferred;
-pub use persist::{WfResultRef, WfRow};
+pub use persist::{WfDiagnosticRef, WfResultRef, WfRow};
 use outlives::{Known, Needs, Wfcx};
 
 /// Where an error is: rustc's span of it.
@@ -117,15 +117,15 @@ impl<'db> Check<'_, 'db> {
         DbInterner::new_no_crate(self.db)
     }
 
-    fn clauses(&self, def: GenericDefId) -> Vec<Clause<'db>> {
-        self.db.trait_environment(def).clauses().iter().collect()
+    fn clauses(&self, def: GenericDefId) -> &'db [Clause<'db>] {
+        self.db.trait_environment(def).clauses().as_slice()
     }
 
     /// Every field must be well-formed. What it needs of a lifetime parameter rustc infers,
     /// so only what it needs of `'static` can fail. Its where clauses must be well-formed
     /// given its bounds, those rustc infers included.
     fn adt(&mut self, adt: AdtId) {
-        let mut known = Known::new(&self.clauses(adt.into()));
+        let mut known = Known::new(self.clauses(adt.into()));
         let inferred = self
             .inferred
             .of(self.db, adt)
@@ -141,32 +141,35 @@ impl<'db> Check<'_, 'db> {
             .collect();
         known.add(inferred);
         let mut needs = Vec::new();
+        // One inference context for the whole item, as rustc's `enter_wf_checking_ctxt`, and
+        // one buffer for what each field needs.
+        let mut wfcx = None;
+        let mut found = Vec::new();
         for variant in outlives::variants(self.db, adt) {
             for (field, ty) in self.db.field_types(variant).iter() {
                 let ty = ty.ty().instantiate_identity().skip_norm_wip();
                 if ty.references_error() {
                     continue;
                 }
-                let mut found = Vec::new();
+                let site = Site::Field(variant, field);
+                found.clear();
                 outlives::wf(self.db, &mut self.inferred, ty, &mut found);
                 needs.extend(
                     found
-                        .into_iter()
+                        .drain(..)
                         .filter(|it| match *it {
                             Needs::Type(_, region) | Needs::Region(_, region) => {
                                 matches!(region.kind(), RegionKind::ReStatic)
                             }
                         })
-                        .map(|it| (it, Site::Field(variant, field))),
+                        .map(|it| (it, site)),
                 );
-                let mut found = Vec::new();
-                outlives::projection_needs(
-                    self.db,
-                    &Wfcx::new(self.db, adt.into()),
-                    ty,
-                    &mut found,
-                );
-                needs.extend(found.into_iter().map(|it| (it, Site::Field(variant, field))));
+                if !ty.has_aliases() {
+                    continue;
+                }
+                let wfcx = wfcx.get_or_insert_with(|| Wfcx::new(self.db, adt.into()));
+                outlives::projection_needs(self.db, wfcx, ty, &mut found);
+                needs.extend(found.drain(..).map(|it| (it, site)));
             }
         }
         needs.extend(self.where_needs(adt.into()));
@@ -200,7 +203,7 @@ impl<'db> Check<'_, 'db> {
 
     /// What an item knows: its where clauses and what the types it assumes well-formed imply.
     fn known(&mut self, def: GenericDefId, assumed: &[Ty<'db>]) -> Known<'db> {
-        let mut known = Known::new(&self.clauses(def));
+        let mut known = Known::new(self.clauses(def));
         let mut implied = Vec::new();
         for &ty in assumed {
             outlives::wf(self.db, &mut self.inferred, ty, &mut implied);
@@ -215,26 +218,25 @@ impl<'db> Check<'_, 'db> {
         let known = self.known(impl_.into(), &header);
         let mut needs = self.where_needs(impl_.into());
         // The header is well-formed: the trait bounds that asks hold.
+        let wfcx = Wfcx::new(db, impl_.into());
+        let mut found = Vec::new();
         for (index, &ty) in header.iter().enumerate() {
             let site = match index {
                 0 => Site::SelfTy(impl_),
                 _ => Site::ImplTrait(impl_),
             };
-            let mut found = Vec::new();
-            outlives::trait_needs(db, &Wfcx::new(db, impl_.into()), ty, &mut found);
-            needs.extend(found.into_iter().map(|it| (it, site)));
+            outlives::trait_needs(db, &wfcx, ty, &mut found);
+            needs.extend(found.drain(..).map(|it| (it, site)));
         }
 
         // The trait's outlives bounds hold of the impl's arguments.
         if let Some(trait_ref) = db.impl_trait(impl_) {
             let trait_ref = trait_ref.instantiate_identity().skip_norm_wip();
-            let trait_clauses: Vec<Clause<'db>> =
-                GenericPredicates::query_all(db, trait_ref.def_id.0.into())
-                    .iter_instantiated(self.interner(), trait_ref.args.as_slice())
-                    .map(|it| it.skip_norm_wip())
-                    .collect();
             let mut found = Vec::new();
-            outlives::clause_needs(&trait_clauses, &mut found);
+            let clauses = GenericPredicates::query_all(db, trait_ref.def_id.0.into())
+                .iter_instantiated(self.interner(), trait_ref.args.as_slice())
+                .map(|it| it.skip_norm_wip());
+            outlives::clause_needs(clauses, &mut found);
             found.retain(|it| match *it {
                 Needs::Type(ty, region) => {
                     !ty.has_escaping_bound_vars() && !region.has_escaping_bound_vars()
@@ -497,12 +499,10 @@ impl<'db> Check<'_, 'db> {
                         GenericArgKind::Type(ty) => Some(ty),
                         _ => None,
                     }));
-                    let trait_clauses: Vec<Clause<'db>> =
-                        GenericPredicates::query_all(db, trait_ref.def_id.0.into())
-                            .iter_instantiated(interner, trait_ref.args.as_slice())
-                            .map(|it| it.skip_norm_wip())
-                            .collect();
-                    outlives::clause_needs(&trait_clauses, &mut found);
+                    let clauses = GenericPredicates::query_all(db, trait_ref.def_id.0.into())
+                        .iter_instantiated(interner, trait_ref.args.as_slice())
+                        .map(|it| it.skip_norm_wip());
+                    outlives::clause_needs(clauses, &mut found);
                 }
                 ClauseKind::Projection(predicate) => {
                     let TermId::TypeAliasId(item) = predicate.def_id().0 else { continue };
@@ -611,9 +611,12 @@ impl<'db> Check<'_, 'db> {
                 matches!(it, outlives::Component::Region(longer)
                     if !known.region_outlives(longer, region))
             });
+            if !fails {
+                continue;
+            }
             let message = "the type does not fulfill the required lifetime".to_owned();
             let diagnostic = WfDiagnostic { code: "E0477", message, site };
-            if fails && !concrete.contains(&diagnostic) {
+            if !concrete.contains(&diagnostic) {
                 concrete.push(diagnostic);
             }
         }

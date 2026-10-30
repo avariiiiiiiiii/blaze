@@ -1,10 +1,9 @@
-use ena::undo_log::UndoLogs;
 use rustc_type_ir::{OutlivesPredicate, TypeVisitableExt};
 use tracing::{debug, instrument};
 
 use crate::next_solver::{
     ArgOutlivesPredicate, GenericArgKind, Region, RegionOutlivesPredicate, Ty,
-    infer::{InferCtxt, TypeOutlivesConstraint, snapshot::undo_log::UndoLog},
+    infer::{InferCtxt, TypeOutlivesConstraint},
 };
 
 impl<'db> InferCtxt<'db> {
@@ -38,9 +37,7 @@ impl<'db> InferCtxt<'db> {
     /// information).
     #[instrument(level = "debug", skip(self))]
     pub fn register_type_outlives_constraint_inner(&self, obligation: TypeOutlivesConstraint<'db>) {
-        let mut inner = self.inner.borrow_mut();
-        inner.undo_log.push(UndoLog::PushTypeOutlivesConstraint);
-        inner.region_obligations.push(obligation);
+        self.inner.borrow_mut().region_obligations.push(obligation);
     }
 
     pub fn register_type_outlives_constraint(&self, sup_type: Ty<'db>, sub_region: Region<'db>) {
@@ -61,8 +58,6 @@ impl<'db> InferCtxt<'db> {
     }
 
     pub fn register_region_assumption(&self, assumption: ArgOutlivesPredicate<'db>) {
-        let mut inner = self.inner.borrow_mut();
-        inner.undo_log.push(UndoLog::PushRegionAssumption);
-        inner.region_assumptions.push(assumption);
+        self.inner.borrow_mut().region_assumptions.push(assumption);
     }
 }

@@ -1,9 +1,5 @@
 use std::ops::Range;
 
-use ena::{
-    snapshot_vec as sv,
-    unify::{self as ut, UnifyKey},
-};
 use rustc_type_ir::{
     ConstVid, FloatVid, IntVid, RegionVid, TyVid, TypeFoldable, TypeFolder, TypeSuperFoldable,
     TypeVisitableExt, inherent::IntoKind,
@@ -14,30 +10,26 @@ use crate::{
     next_solver::{
         Const, ConstKind, DbInterner, Region, RegionKind, Ty, TyKind,
         infer::{
-            InferCtxt, UnificationTable, iter_idx_range,
+            InferCtxt, iter_idx_range,
             snapshot::VariableLengths,
-            unify_key::{ConstVariableValue, ConstVidKey},
+            union_find::{UnifyKey, UnifyValue, UnionFind},
+            unify_key::ConstVariableValue,
         },
     },
 };
 
-fn vars_since_snapshot<'db, T>(
-    table: &UnificationTable<'_, 'db, T>,
+fn vars_since_snapshot<K: UnifyKey, V: UnifyValue>(
+    table: &UnionFind<K, V>,
     snapshot_var_len: usize,
-) -> Range<T>
-where
-    T: UnifyKey,
-    super::UndoLog<'db>: From<sv::UndoLog<ut::Delegate<T>>>,
-{
-    T::from_index(snapshot_var_len as u32)..T::from_index(table.len() as u32)
+) -> Range<K> {
+    K::from_index(snapshot_var_len as u32)..K::from_index(table.len() as u32)
 }
 
 fn const_vars_since_snapshot<'db>(
-    table: &mut UnificationTable<'_, 'db, ConstVidKey<'db>>,
+    table: &mut UnionFind<ConstVid, ConstVariableValue<'db>>,
     snapshot_var_len: usize,
 ) -> (Range<ConstVid>, Vec<Span>) {
     let range = vars_since_snapshot(table, snapshot_var_len);
-    let range = range.start.vid..range.end.vid;
 
     (
         range.clone(),
@@ -145,12 +137,12 @@ impl SnapshotVarData {
             .vars_since_snapshot(vars_pre_snapshot.region_constraints_len);
         let type_vars = inner.type_variables().vars_since_snapshot(vars_pre_snapshot.type_var_len);
         let int_vars =
-            vars_since_snapshot(&inner.int_unification_table(), vars_pre_snapshot.int_var_len);
+            vars_since_snapshot(inner.int_unification_table(), vars_pre_snapshot.int_var_len);
         let float_vars =
-            vars_since_snapshot(&inner.float_unification_table(), vars_pre_snapshot.float_var_len);
+            vars_since_snapshot(inner.float_unification_table(), vars_pre_snapshot.float_var_len);
 
         let const_vars = const_vars_since_snapshot(
-            &mut inner.const_unification_table(),
+            inner.const_unification_table(),
             vars_pre_snapshot.const_var_len,
         );
         SnapshotVarData { region_vars, type_vars, int_vars, float_vars, const_vars }

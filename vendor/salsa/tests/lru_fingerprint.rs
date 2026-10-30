@@ -105,16 +105,47 @@ fn report(db: &dyn LogDatabase, source: Source) -> u32 {
     digits(db, source) * 100
 }
 
-/// `report` read `digits` = 1. `digits` then changes to 2 and back to 1 while nobody reads
-/// `report`: the edge to `digits` recorded fingerprint of 1, which `digits` has again, so `report`
-/// is unchanged although `digits` changed after `report` was verified.
+/// Reads `digits` with its fingerprint: it is evicted (which fingerprints it) and computed again
+/// (the new memo keeps the fingerprint), then `report` reads it.
+fn read_with_fingerprint(db: &mut common::LoggerDatabase, source: Source) {
+    let tens = source.text(&*db) / 10;
+    assert_eq!(digits(&*db, source), tens);
+    assert_eq!(digits::evict_values(db), 1);
+    assert_eq!(report(&*db, source), tens * 100);
+    db.clear_logs();
+}
+
+/// `report` read `digits` = 1 with its fingerprint. `digits` then changes to 2 and back to 1
+/// while nobody reads `report`, each time computed again after an eviction, so each memo has a
+/// fingerprint: the edge to `digits` recorded the fingerprint of 1, which `digits` has again, so
+/// `report` is unchanged although `digits` changed after `report` was verified.
 #[test]
 fn reader_is_unchanged_when_its_input_has_the_fingerprint_it_read() {
     let mut db = common::LoggerDatabase::default();
     let a = Source::new(&db, 10);
+    read_with_fingerprint(&mut db, a);
 
+    a.set_text(&mut db).to(20);
+    assert_eq!(digits::evict_values(&mut db), 1);
+    assert_eq!(digits(&db, a), 2);
+
+    a.set_text(&mut db).to(11);
+    assert_eq!(digits::evict_values(&mut db), 1);
     assert_eq!(report(&db, a), 100);
-    db.clear_logs();
+    db.assert_logs(expect![[r#"
+        [
+            "digits(20)",
+            "digits(11)",
+        ]"#]]);
+}
+
+/// Without an eviction in between, `digits` is compared by `Eq` and its new memo has no
+/// fingerprint: `report` runs again, as it would without fingerprints.
+#[test]
+fn reader_compares_by_revision_when_its_input_has_no_fingerprint() {
+    let mut db = common::LoggerDatabase::default();
+    let a = Source::new(&db, 10);
+    read_with_fingerprint(&mut db, a);
 
     a.set_text(&mut db).to(20);
     assert_eq!(digits(&db, a), 2);
@@ -125,6 +156,7 @@ fn reader_is_unchanged_when_its_input_has_the_fingerprint_it_read() {
         [
             "digits(20)",
             "digits(11)",
+            "report",
         ]"#]]);
 }
 
@@ -134,15 +166,15 @@ fn fingerprint_edge_does_not_hide_a_durability_drop() {
     let a = Source::builder(10)
         .text_durability(Durability::HIGH)
         .new(&db);
-
-    assert_eq!(report(&db, a), 100);
-    db.clear_logs();
+    read_with_fingerprint(&mut db, a);
 
     a.set_text(&mut db).with_durability(Durability::LOW).to(20);
+    assert_eq!(digits::evict_values(&mut db), 1);
     assert_eq!(digits(&db, a), 2);
 
     // `digits` has the fingerprint `report` read, but it is now less durable than `report`.
     a.set_text(&mut db).to(11);
+    assert_eq!(digits::evict_values(&mut db), 1);
     assert_eq!(report(&db, a), 100);
     db.assert_logs(expect![[r#"
         [

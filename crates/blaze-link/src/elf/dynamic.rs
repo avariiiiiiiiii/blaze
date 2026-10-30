@@ -1,13 +1,13 @@
 //! The regions only the ELF writer fills, from the placed image: `.interp`, the build ID,
 //! the dynamic symbol table with its strings, GNU hash table and versions, `.rela.dyn`,
 //! `.dynamic` and `.eh_frame_hdr`. A pure function of [`Placed`]: an incremental link asks
-//! again and gets the same bytes for the same image.
-
-use std::collections::HashMap;
+//! again and gets the same bytes for the same image, on any number of cores.
 
 use blaze_codegen::Arch;
 use gimli::UnwindSection;
 use object::elf;
+use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, Elf, GNU_HASH, INTERP, RELA_DYN, Segment, VERNEED,
@@ -20,6 +20,28 @@ use crate::{LinkError, Output, OutputKind};
 const DYNAMIC_FIXED: u64 = 25;
 const SYM: u64 = 24;
 const RELA: u64 = 24;
+
+/// Items per rayon task: below this a split costs more than the work it shares.
+pub(crate) const CHUNK: usize = 4096;
+
+/// The first error in input order, so a failed link names the same place on any core count.
+pub(crate) fn first_error(results: Vec<Result<(), LinkError>>) -> Result<(), LinkError> {
+    results.into_iter().collect()
+}
+
+/// Sorts `items`, in parallel when there are many; free when they are sorted already (the
+/// core hands over addresses in order). Equal items are identical, so the order is the same
+/// whatever the sort.
+fn sort<T: Ord + Send>(items: &mut [T]) {
+    if items.is_sorted() {
+        return;
+    }
+    if items.len() >= CHUNK {
+        items.par_sort_unstable();
+    } else {
+        items.sort_unstable();
+    }
+}
 
 /// The synthetic regions of an output, in no particular order ([`super::Elf::order`] sorts).
 fn names(output: &Output) -> Vec<&'static str> {
@@ -99,28 +121,31 @@ impl Put for Vec<u8> {
     }
 }
 
-/// A string table: `\0` first, each string once.
-pub(crate) struct Strings {
+/// A string table: `\0` first, each string once. Keys borrow the image's names: one FxHash
+/// probe (entry API) per string and no allocation per string.
+pub(crate) struct Strings<'a> {
     pub(crate) bytes: Vec<u8>,
-    at: HashMap<String, u32>,
+    at: FxHashMap<&'a str, u32>,
 }
 
-impl Strings {
-    pub(crate) fn new() -> Strings {
-        Strings { bytes: vec![0], at: HashMap::new() }
+impl<'a> Strings<'a> {
+    /// Room for `strings` strings of `bytes` bytes with their terminators.
+    pub(crate) fn with_capacity(bytes: usize, strings: usize) -> Strings<'a> {
+        let mut table = Vec::with_capacity(1 + bytes);
+        table.push(0);
+        Strings { bytes: table, at: FxHashMap::with_capacity_and_hasher(strings, Default::default()) }
     }
 
-    pub(crate) fn add(&mut self, string: &str) -> u32 {
+    pub(crate) fn add(&mut self, string: &'a str) -> u32 {
         if string.is_empty() {
             return 0;
         }
-        if let Some(at) = self.at.get(string) {
-            return *at;
+        let next = self.bytes.len() as u32;
+        let at = *self.at.entry(string).or_insert(next);
+        if at == next {
+            self.bytes.extend_from_slice(string.as_bytes());
+            self.bytes.push(0);
         }
-        let at = self.bytes.len() as u32;
-        self.bytes.extend_from_slice(string.as_bytes());
-        self.bytes.push(0);
-        self.at.insert(string.to_owned(), at);
         at
     }
 }
@@ -136,13 +161,19 @@ pub(crate) struct Sym {
 }
 
 impl Sym {
+    pub(crate) fn bytes(&self) -> [u8; SYM as usize] {
+        let mut out = [0; SYM as usize];
+        out[0..4].copy_from_slice(&self.name.to_le_bytes());
+        out[4] = self.info;
+        out[5] = elf::STV_DEFAULT;
+        out[6..8].copy_from_slice(&self.shndx.to_le_bytes());
+        out[8..16].copy_from_slice(&self.value.to_le_bytes());
+        out[16..24].copy_from_slice(&self.size.to_le_bytes());
+        out
+    }
+
     pub(crate) fn put(&self, out: &mut Vec<u8>) {
-        out.u32(self.name);
-        out.u8(self.info);
-        out.u8(elf::STV_DEFAULT);
-        out.u16(self.shndx);
-        out.u64(self.value);
-        out.u64(self.size);
+        out.extend_from_slice(&self.bytes());
     }
 }
 
@@ -162,14 +193,25 @@ pub(crate) fn info(bind: u8, kind: SymbolKind) -> u8 {
 /// The section header index of the region holding `addr`: one more than its index in
 /// [`Placed::regions`], which [`super::image`] writes one section header each, in order.
 pub(crate) fn section_of(regions: &[Region], addr: u64) -> Result<u16, LinkError> {
+    numbered(regions)?;
+    Ok(shndx(regions, addr))
+}
+
+/// Whether every region's section header has an ordinary ELF number, as [`shndx`] needs.
+pub(crate) fn numbered(regions: &[Region]) -> Result<(), LinkError> {
+    if regions.len() + 1 >= usize::from(elf::SHN_LORESERVE) {
+        return Err(error(format!("{} regions: more sections than ELF numbers", regions.len())));
+    }
+    Ok(())
+}
+
+/// [`section_of`] once [`numbered`] held: a binary search over the regions.
+pub(crate) fn shndx(regions: &[Region], addr: u64) -> u16 {
     let at = regions.partition_point(|it| it.addr <= addr);
-    let Some(index) = at.checked_sub(1).filter(|&it| addr <= regions[it].addr + regions[it].capacity) else {
-        return Ok(elf::SHN_ABS);
-    };
-    u16::try_from(index + 1)
-        .ok()
-        .filter(|&it| it < elf::SHN_LORESERVE)
-        .ok_or_else(|| error(format!("{} regions: more sections than ELF numbers", regions.len())))
+    match at.checked_sub(1).filter(|&it| addr <= regions[it].addr + regions[it].capacity) {
+        Some(index) => (index + 1) as u16,
+        None => elf::SHN_ABS,
+    }
 }
 
 /// The value an exported or listed symbol has: thread-locals by their offset in the TLS

@@ -8,8 +8,8 @@ A script makes a `Report`, adds an `Outcome` for each thing it checked, and ends
                 a budget missed, a build that is not byte for byte the same)
     unmeasured  the engine has no answer to it (`engine.Unmeasurable`): allowed for v1, whose
                 run sets the bar; a failure for v2, which has to measure everything
-    error       the harness could not check it (`engine.Failed`; `engine.Missing` where the
-                v2 agent API has no request for what it needs)
+    error       the harness could not check it (`engine.Failed`: a command that timed out,
+                an answer of the engine it could not read)
 
 The exit status is 1 when anything failed or erred, or the engine is v2 and anything was
 unmeasured; else 0. `proof.py` reads the results of every script into one report.

@@ -98,6 +98,22 @@ The target's cfg, data layout and std's target facts come from blaze's own targe
 `rustc --print` (no-rustc). Its results are keyed by the library's root, the target and the
 profile's std settings, never the view: the shared base layer (#86).
 
+Speed. A cache hit is the database's memo, so it runs none of this code and allocates nothing.
+The measure for a miss is rustc's own `--print cfg`: about 20 ms, because it starts a process
+and loads LLVM's target machine to list features. The data is compiled once per process into
+per-target columns. Feature names are interned to bits of a 32-byte set; every recorded target
+has at most 92 such names, and the set's limit of 256 is checked. Each feature's implications
+and turn-offs are precomputed sets, as are the target spec's facts and every
+`target_feature="…"` line. `target_cfg` is then a binary search for the triple, four word
+operations per `-C target-feature`, and one sorted copy out, about a microsecond. Once set,
+reads take no lock. The checks `StdUnits` makes of a loaded graph are O(units) with one
+`FxHashMap` of package names. Not reached yet:
+- The JSON (423 KB) is still parsed at the first call, about a millisecond per process. Reaching
+  zero needs a build step that writes the table as `static` Rust data
+  (`harness/answers.py --write` could emit it beside `rustc.json`).
+- `StdUnits` decodes `Foreign`'s CBOR and writes it out again. Passing the bytes through needs a
+  `Persist` for already-encoded CBOR in `query.rs`.
+
 ## 6. The daemon
 
 `blaze serve` (`crates/blaze-cargo/src/serve*`): one process, one `blaze_core` driver, one loop:

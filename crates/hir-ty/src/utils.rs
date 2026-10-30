@@ -25,12 +25,12 @@ pub fn fn_traits(lang_items: &LangItems) -> impl Iterator<Item = TraitId> + '_ {
 
 /// Returns an iterator over the direct super traits (including the trait itself).
 pub fn direct_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
-    &SupertraitsInfo::query(db, trait_).direct_supertraits
+    SupertraitsInfo::query(db, trait_).direct_supertraits()
 }
 
 /// Returns the whole super trait hierarchy (including the trait itself).
 pub fn all_super_traits(db: &dyn HirDatabase, trait_: TraitId) -> &[TraitId] {
-    &SupertraitsInfo::query(db, trait_).all_supertraits
+    SupertraitsInfo::query(db, trait_).all_supertraits()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -479,6 +479,25 @@ pub(crate) fn find_best_match_for_name(
     lookup: &str,
     dist: Option<usize>,
 ) -> Option<String> {
+    find_best_match_for_name_impl(false, candidates, lookup, dist)
+}
+
+/// rustc's `find_best_match_for_name_with_substrings`: [`find_best_match_for_name`] scoring
+/// by [`edit_distance_with_substrings`], the closest ones then compared by edit distance.
+pub(crate) fn find_best_match_for_name_with_substrings(
+    candidates: &[String],
+    lookup: &str,
+    dist: Option<usize>,
+) -> Option<String> {
+    find_best_match_for_name_impl(true, candidates, lookup, dist)
+}
+
+fn find_best_match_for_name_impl(
+    use_substring_score: bool,
+    candidates: &[String],
+    lookup: &str,
+    dist: Option<usize>,
+) -> Option<String> {
     let lookup_uppercase = lookup.to_uppercase();
     if let Some(c) = candidates.iter().find(|c| c.to_uppercase() == lookup_uppercase) {
         return Some(c.clone());
@@ -486,15 +505,31 @@ pub(crate) fn find_best_match_for_name(
     let lookup_len = lookup.chars().count();
     let mut dist = dist.unwrap_or_else(|| cmp::max(lookup_len, 3) / 3);
     let mut best = None;
+    let mut next_candidates = vec![];
     for c in candidates {
-        match edit_distance(lookup, c, dist) {
+        let found = match use_substring_score {
+            true => edit_distance_with_substrings(lookup, c, dist),
+            false => edit_distance(lookup, c, dist),
+        };
+        match found {
             Some(0) => return Some(c.clone()),
             Some(d) => {
-                dist = d - 1;
+                if use_substring_score {
+                    if d < dist {
+                        dist = d;
+                        next_candidates.clear();
+                    }
+                    next_candidates.push(c.clone());
+                } else {
+                    dist = d - 1;
+                }
                 best = Some(c.clone());
             }
             None => {}
         }
+    }
+    if next_candidates.len() > 1 {
+        best = find_best_match_for_name_impl(false, &next_candidates, lookup, Some(lookup.len()));
     }
     if best.is_some() {
         return best;
@@ -560,4 +595,23 @@ pub(crate) fn edit_distance(a: &str, b: &str, limit: usize) -> Option<usize> {
     }
     let distance = prev[b.len()];
     (distance <= limit).then_some(distance)
+}
+
+/// rustc's `edit_distance_with_substrings`: [`edit_distance`] that scores a substring match
+/// low, so that `foo` is closer to `foobar` than to `bar`.
+pub(crate) fn edit_distance_with_substrings(a: &str, b: &str, limit: usize) -> Option<usize> {
+    let n = a.chars().count();
+    let m = b.chars().count();
+    let big_len_diff = (n * 2) < m || (m * 2) < n;
+    let len_diff = m.abs_diff(n);
+    let distance = edit_distance(a, b, limit + len_diff)?;
+    let score = distance - len_diff;
+    let score = if score == 0 && len_diff > 0 && !big_len_diff {
+        1
+    } else if !big_len_diff {
+        score + len_diff.div_ceil(2)
+    } else {
+        score + len_diff
+    };
+    (score <= limit).then_some(score)
 }

@@ -1,6 +1,6 @@
 //! Fallback of infer vars to `!` and `i32`/`f64`.
 
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use rustc_type_ir::{
     TyVid,
     inherent::{IntoKind, Ty as _},
@@ -8,7 +8,7 @@ use rustc_type_ir::{
 use tracing::debug;
 
 use crate::{
-    infer::InferenceContext,
+    infer::{InferenceContext, columns::VarSet},
     next_solver::{Ty, TyKind},
 };
 
@@ -145,20 +145,19 @@ impl<'db> InferenceContext<'db> {
 
         // The root vids of the type variables that (a) are the target of a coercion from a `!`
         // type and (b) have not yet been solved.
-        let diverging_roots: FxHashSet<TyVid> = self
-            .table
-            .diverging_type_vars
-            .iter()
-            .map(|&ty| self.shallow_resolve(ty))
-            .filter_map(|ty| ty.ty_vid())
-            .map(|vid| self.table.infer_ctxt.root_var(vid))
-            .collect();
+        let interner = self.interner();
+        let mut diverging_roots = VarSet::default();
+        for var in self.table.diverging_type_vars.iter() {
+            let ty = self.shallow_resolve(Ty::new_var(interner, TyVid::from_u32(var)));
+            if let Some(vid) = ty.ty_vid() {
+                diverging_roots.insert(self.table.infer_ctxt.root_var(vid).as_u32());
+            }
+        }
         debug!("calculate_diverging_fallback: diverging_roots={:?}", diverging_roots);
 
-        let mut diverging_fallback =
-            FxHashMap::with_capacity_and_hasher(diverging_roots.len(), FxBuildHasher);
+        let mut diverging_fallback = FxHashMap::default();
         for vid in unresolved_variables.iter().filter_map(|ty| ty.ty_vid()) {
-            if diverging_roots.contains(&self.table.infer_ctxt.root_var(vid)) {
+            if diverging_roots.contains(self.table.infer_ctxt.root_var(vid).as_u32()) {
                 debug!("fallback to !: {:?}", vid);
                 diverging_fallback
                     .insert(Ty::new_var(self.interner(), vid), self.types.types.never);

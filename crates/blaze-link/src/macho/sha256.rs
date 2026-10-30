@@ -43,7 +43,30 @@ fn compress(state: &mut [u32; 8], blocks: &[u8]) {
         unsafe { aarch64::compress(state, blocks) };
         return;
     }
+    #[cfg(target_arch = "x86_64")]
+    if x86::detected() {
+        // SAFETY: `detected` checked SHA-NI, SSSE3 and SSE4.1.
+        unsafe { x86::compress(state, blocks) };
+        return;
+    }
     portable(state, blocks);
+}
+
+/// Every compression this processor can run, by name, for the differential tests.
+#[cfg(test)]
+fn paths() -> Vec<(&'static str, fn(&mut [u32; 8], &[u8]))> {
+    let mut out: Vec<(&'static str, fn(&mut [u32; 8], &[u8]))> = vec![("portable", portable)];
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("sha2") {
+        // SAFETY: the processor has the SHA-256 instructions.
+        out.push(("aarch64 sha2", |state, blocks| unsafe { aarch64::compress(state, blocks) }));
+    }
+    #[cfg(target_arch = "x86_64")]
+    if x86::detected() {
+        // SAFETY: `detected` checked SHA-NI, SSSE3 and SSE4.1.
+        out.push(("x86-64 sha-ni", |state, blocks| unsafe { x86::compress(state, blocks) }));
+    }
+    out
 }
 
 fn portable(state: &mut [u32; 8], blocks: &[u8]) {
@@ -117,6 +140,70 @@ mod aarch64 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi32, _mm_alignr_epi8, _mm_blend_epi16, _mm_loadu_si128, _mm_set_epi64x,
+        _mm_sha256msg1_epu32, _mm_sha256msg2_epu32, _mm_sha256rnds2_epu32, _mm_shuffle_epi8,
+        _mm_shuffle_epi32, _mm_storeu_si128,
+    };
+
+    use super::K;
+
+    pub(super) fn detected() -> bool {
+        std::arch::is_x86_feature_detected!("sha")
+            && std::arch::is_x86_feature_detected!("ssse3")
+            && std::arch::is_x86_feature_detected!("sse4.1")
+    }
+
+    /// Intel's SHA extensions: the state as ABEF and CDGH, two rounds per `sha256rnds2`.
+    ///
+    /// # Safety
+    ///
+    /// The processor has SHA-NI, SSSE3 and SSE4.1 ([`detected`]).
+    #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
+    pub(super) unsafe fn compress(state: &mut [u32; 8], blocks: &[u8]) {
+        // SAFETY: every load and store is of 16 bytes within `state`, `blocks` and `K`, unaligned.
+        unsafe {
+            let swap = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0b, 0x0405_0607_0001_0203);
+            let dcba = _mm_shuffle_epi32(_mm_loadu_si128(state.as_ptr().cast()), 0xb1);
+            let efgh = _mm_shuffle_epi32(_mm_loadu_si128(state.as_ptr().add(4).cast()), 0x1b);
+            let mut abef = _mm_alignr_epi8(dcba, efgh, 8);
+            let mut cdgh = _mm_blend_epi16(efgh, dcba, 0xf0);
+            for block in blocks.chunks_exact(64) {
+                let (abef_was, cdgh_was) = (abef, cdgh);
+                let at = block.as_ptr().cast::<__m128i>();
+                let mut words: [__m128i; 4] = [
+                    _mm_shuffle_epi8(_mm_loadu_si128(at), swap),
+                    _mm_shuffle_epi8(_mm_loadu_si128(at.add(1)), swap),
+                    _mm_shuffle_epi8(_mm_loadu_si128(at.add(2)), swap),
+                    _mm_shuffle_epi8(_mm_loadu_si128(at.add(3)), swap),
+                ];
+                for group in 0..16 {
+                    let at = group % 4;
+                    if group >= 4 {
+                        let early = _mm_add_epi32(
+                            _mm_sha256msg1_epu32(words[at], words[(at + 1) % 4]),
+                            _mm_alignr_epi8(words[(at + 3) % 4], words[(at + 2) % 4], 4),
+                        );
+                        words[at] = _mm_sha256msg2_epu32(early, words[(at + 3) % 4]);
+                    }
+                    let mixed =
+                        _mm_add_epi32(words[at], _mm_loadu_si128(K[group * 4..].as_ptr().cast()));
+                    cdgh = _mm_sha256rnds2_epu32(cdgh, abef, mixed);
+                    abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(mixed, 0x0e));
+                }
+                abef = _mm_add_epi32(abef, abef_was);
+                cdgh = _mm_add_epi32(cdgh, cdgh_was);
+            }
+            let feba = _mm_shuffle_epi32(abef, 0x1b);
+            let dchg = _mm_shuffle_epi32(cdgh, 0xb1);
+            _mm_storeu_si128(state.as_mut_ptr().cast(), _mm_blend_epi16(feba, dchg, 0xf0));
+            _mm_storeu_si128(state.as_mut_ptr().add(4).cast(), _mm_alignr_epi8(dchg, feba, 8));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn hex(bytes: &[u8]) -> String {
@@ -163,6 +250,34 @@ mod tests {
             super::compress(&mut fast, &bytes[..len]);
             super::portable(&mut slow, &bytes[..len]);
             assert_eq!(fast, slow, "{len} bytes");
+            for (name, path) in super::paths() {
+                let mut state = super::INITIAL;
+                path(&mut state, &bytes[..len]);
+                assert_eq!(state, slow, "{name}, {len} bytes");
+            }
+        }
+    }
+
+    #[test]
+    fn every_path_on_random_states() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..64 {
+            let blocks = 1 + (next() % 8) as usize;
+            let bytes: Vec<u8> = (0..blocks * 64).map(|_| next() as u8).collect();
+            let start: [u32; 8] = std::array::from_fn(|_| next() as u32);
+            let mut want = start;
+            super::portable(&mut want, &bytes);
+            for (name, path) in super::paths() {
+                let mut state = start;
+                path(&mut state, &bytes);
+                assert_eq!(state, want, "{name}, round {round}");
+            }
         }
     }
 }

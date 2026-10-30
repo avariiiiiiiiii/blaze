@@ -256,7 +256,7 @@ impl<'db> InferenceContext<'db> {
         index_expr: Option<ExprId>,
     ) {
         debug!("convert_place_op_to_mutable({:?}, {:?}, {:?})", op, expr, base_expr);
-        if !self.result.method_resolutions.contains_key(&expr) {
+        if !self.result.method_resolutions.contains_idx(expr) {
             debug!("convert_place_op_to_mutable - builtin, nothing to do");
             return;
         }

@@ -22,12 +22,12 @@ pub mod registry;
 mod syntax;
 
 pub use levels::{CommandLine, Level};
-pub use syntax::CheckCfg;
+pub use self::syntax::CheckCfg;
 
 use blaze_items::{Fact, ItemId};
 use hir::InFile;
-use hir_def::AdtId;
-use syntax::{AstNode, SyntaxNode, SyntaxNodePtr, ast, ast::HasName};
+use hir_def::{AdtId, ModuleDefId};
+use ::syntax::{AstNode, SyntaxNode, SyntaxNodePtr, ast, ast::HasName};
 
 use crate::{
     cx::Cx,
@@ -101,6 +101,19 @@ pub(crate) fn body_item(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(I
         let call = node.file_id.macro_file()?;
         node = call.loc(cx.db).to_node(cx.db);
     }
+}
+
+/// The item whose body `at` is in, and its path as rustc prints it (`def_path_str`).
+pub(crate) fn body_path(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(ItemId, String)> {
+    let (item, _) = body_item(cx, at)?;
+    let id = match item {
+        ItemId::Function(id) => ModuleDefId::FunctionId(id),
+        ItemId::Const(id) => ModuleDefId::ConstId(id),
+        ItemId::Static(id) => ModuleDefId::StaticId(id),
+        ItemId::Adt(id) => ModuleDefId::AdtId(id),
+        _ => return None,
+    };
+    Some((item, cx.def_path(hir::ModuleDef::from(id))))
 }
 
 /// Records on `diag` the fact of the code of the body `at` is in: what to change to make it

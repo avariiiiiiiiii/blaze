@@ -45,7 +45,8 @@ impl<T: Copy> Csr<T> {
             items[*at as usize] = Some(item);
             *at += 1;
         }
-        Csr { start, items: items.into_iter().map(|it| it.expect("every slot is filled")).collect() }
+        let items = items.into_iter().map(|it| it.expect("every slot is filled")).collect();
+        Csr { start, items }
     }
 
     /// The items of `node`, none for a node past the last.
@@ -58,10 +59,6 @@ impl<T: Copy> Csr<T> {
 
     pub(super) fn nodes(&self) -> usize {
         self.start.len() - 1
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.items.len()
     }
 }
 
@@ -152,7 +149,7 @@ mod tests {
         assert_eq!(csr.of(2), &['a', 'c', 'e']);
         assert_eq!(csr.of(3), &['d']);
         assert_eq!(csr.of(4), &[] as &[char]);
-        assert_eq!((csr.nodes(), csr.len()), (4, 5));
+        assert_eq!((csr.nodes(), csr.items.len()), (4, 5));
         assert_eq!(Csr::<u32>::default().of(0), &[] as &[u32]);
     }
 }

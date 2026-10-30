@@ -46,6 +46,9 @@ pub(crate) struct Stage<'a> {
     pub changed: FxHashSet<Sym>,
     /// Pieces removed this stage, and what their fixups referred to.
     pub removed: Vec<(PieceId, Piece)>,
+    /// Cells (offsets in the table) whose function was removed: [`Stage::dangling`] fails
+    /// if one is still empty and its slot still called.
+    pub emptied: Vec<u64>,
     /// Shared pieces that lost a user outside [`Stage::removed`], and symbols that gained
     /// one outside [`Stage::fresh`]: [`Stage::sweep`] counts them.
     pub touched: Vec<PieceId>,
@@ -171,6 +174,7 @@ impl<'a> Stage<'a> {
             }
         }
         self.functions(&change.added)?;
+        self.slots(&change.slots)?;
         for it in &change.statics {
             self.add_static(it)?;
         }
@@ -267,6 +271,7 @@ impl<'a> Stage<'a> {
         let Some(What::Function(info)) = self.new.piece(piece).map(|it| it.what.clone()) else {
             return;
         };
+        let body = self.new.piece(piece).expect("a live piece").sym;
         self.unmake(piece);
         for sym in info.fde.into_iter().chain(info.windows.map(|it| it.0)) {
             if let Def::Piece { piece, .. } = self.new.def(sym) {
@@ -274,14 +279,12 @@ impl<'a> Stage<'a> {
             }
         }
         if self.table {
-            if let Some(slot) = self.symbols.find(&SymKey::Slot(info.key)) {
-                self.cell(slot, None);
-            }
+            self.unslot(body);
         }
     }
 
-    /// Points a slot's cell at a body, or leaves it as it is (`None`).
-    fn cell(&mut self, slot: Sym, body: Option<Sym>) {
+    /// Points a slot's cell at a body.
+    fn cell(&mut self, slot: Sym, body: Sym) {
         let Some((_, offset)) = self.new.home(slot) else { return };
         let index = offset / table::stub_size(self.arch());
         let cells = self.symbols.find(&SymKey::Cells).expect("the table was made");
@@ -289,12 +292,54 @@ impl<'a> Stage<'a> {
         let at = index * 8;
         let mut fixups: Vec<Fixup> =
             self.new.piece(piece).expect("the cells").fixups.iter().filter(|it| it.at != at).copied().collect();
-        if let Some(body) = body {
-            fixups.push(Fixup { at, apply: Apply::Abs64, target: body, addend: 0, minus: None });
-            fixups.sort_by_key(|it| it.at);
-        }
+        fixups.push(Fixup { at, apply: Apply::Abs64, target: body, addend: 0, minus: None });
+        fixups.sort_by_key(|it| it.at);
         self.new.set_fixups(piece, fixups.into());
         self.write.insert(piece);
+    }
+
+    /// Empties every cell holding `body`, which is gone: the cell keeps its bytes (a running
+    /// program may still be in the old code) until a function is put in its slot.
+    fn unslot(&mut self, body: Sym) {
+        let Some(cells) = self.symbols.find(&SymKey::Cells) else { return };
+        let Def::Piece { piece, .. } = self.new.def(cells) else { return };
+        let fixups = &self.new.piece(piece).expect("the cells").fixups;
+        if !fixups.iter().any(|it| it.target == body) {
+            return;
+        }
+        self.emptied.extend(fixups.iter().filter(|it| it.target == body).map(|it| it.at));
+        let kept: Vec<Fixup> = fixups.iter().filter(|it| it.target != body).copied().collect();
+        self.new.set_fixups(piece, kept.into());
+        self.write.insert(piece);
+    }
+
+    /// Puts each function in the slot `change` names for it.
+    fn slots(&mut self, slots: &[(InstanceKey, InstanceKey)]) -> Result<(), LinkError> {
+        if slots.is_empty() {
+            return Ok(());
+        }
+        if !self.table {
+            let (slot, _) = slots[0];
+            return Err(error(
+                Some(slot),
+                "a function put in another's slot, in an image linked without a jump table",
+            ));
+        }
+        for (name, function) in slots {
+            let body = self
+                .symbols
+                .find(&SymKey::Body(*function))
+                .filter(|it| self.new.home(*it).is_some())
+                .ok_or_else(|| {
+                    error(Some(*function), format!("put in the slot of {name:?}, and neither added nor linked"))
+                })?;
+            let slot = self.sym(SymKey::Slot(*name));
+            if self.new.home(slot).is_none() {
+                self.new_slot(slot, *name)?;
+            }
+            self.cell(slot, body);
+        }
+        Ok(())
     }
 
     /// The functions added, made into pieces: their symbols interned in parallel.
@@ -478,7 +523,7 @@ impl<'a> Stage<'a> {
             if self.new.home(slot).is_none() {
                 self.new_slot(slot, function.key)?;
             }
-            self.cell(slot, Some(body));
+            self.cell(slot, body);
         }
         Ok(())
     }
@@ -495,6 +540,7 @@ impl<'a> Stage<'a> {
         }
         let index = self.new.slots;
         self.new.slots += 1;
+        self.new.slot_syms.push(slot);
         let stubs = self.symbols.find(&SymKey::Stubs).expect("the table was made");
         let Def::Piece { piece, .. } = self.new.def(stubs) else {
             return Err(error(Some(function), "the jump table's stubs are gone"));
@@ -878,8 +924,29 @@ impl<'a> Stage<'a> {
         }
     }
 
-    /// Fails when a removed function or static is still referred to.
+    /// Fails when a removed function or static is still referred to, directly or through
+    /// its slot.
     pub fn dangling(&self) -> Result<(), LinkError> {
+        if let Some(Def::Piece { piece: cells, .. }) = self.symbols.find(&SymKey::Cells).map(|it| self.new.def(it)) {
+            let fixups = &self.new.piece(cells).expect("the cells").fixups;
+            for at in &self.emptied {
+                if fixups.iter().any(|it| it.at == *at) {
+                    continue;
+                }
+                let Some(slot) = self.new.slot_syms.get((*at / 8) as usize).copied() else { continue };
+                let caller = self.new.refs(slot).iter().find_map(|it| self.new.piece(*it));
+                if let Some(caller) = caller {
+                    return Err(error(
+                        function_of(caller),
+                        format!(
+                            "{} is removed with nothing put in its slot, and {} still calls it",
+                            describe(self.symbols.key(slot)),
+                            describe(self.symbols.key(caller.sym)),
+                        ),
+                    ));
+                }
+            }
+        }
         for (_, piece) in &self.removed {
             for sym in std::iter::once(piece.sym).chain(piece.defines.iter().copied()) {
                 if self.new.home(sym).is_some() || !matches!(self.new.def(sym), Def::None) {

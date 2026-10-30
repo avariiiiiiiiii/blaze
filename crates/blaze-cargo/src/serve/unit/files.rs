@@ -3,7 +3,7 @@
 //! through the VFS's reader, never from the disk; and the name rustc gives a file in a
 //! diagnostic, from the root of the workspace when it is below it.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use base_db::FileId;
 use blaze_ids::ContentId;
@@ -121,13 +121,19 @@ fn join(a: &str, b: &str) -> String {
 /// The names of the front end's files, as rustc gives them: what the diagnostics and the code
 /// generator (`file!()`, a panic's location) print.
 pub(crate) struct Names<'a> {
-    pub(crate) lowered: &'a Lowered,
+    pub(crate) paths: Arc<HashMap<FileId, String>>,
     pub(crate) mounted: &'a Mounted,
+}
+
+impl<'a> Names<'a> {
+    pub(crate) fn new(lowered: &Lowered, mounted: &'a Mounted) -> Names<'a> {
+        Names { paths: lowered.paths(), mounted }
+    }
 }
 
 impl blaze_diagnostics::Files for Names<'_> {
     fn name(&self, file: FileId) -> String {
-        match self.lowered.path(file) {
+        match self.paths.get(&file) {
             Some(path) => self.mounted.name(path),
             None => format!("<file {}>", file.index()),
         }

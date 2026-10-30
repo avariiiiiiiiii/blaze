@@ -235,7 +235,7 @@ impl<'db> InferCtxt<'db> {
             }
             TermVid::Const(ct_vid) => (
                 self.probe_const_var(ct_vid).unwrap_err(),
-                TermVid::Const(self.inner.borrow_mut().const_unification_table().find(ct_vid).vid),
+                TermVid::Const(self.inner.borrow_mut().const_unification_table().find(ct_vid)),
             ),
         };
 
@@ -598,14 +598,14 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
                 // `vid` are related and we'd be inferring an infinitely
                 // deep const.
                 if TermVid::Const(
-                    self.infcx.inner.borrow_mut().const_unification_table().find(vid).vid,
+                    self.infcx.inner.borrow_mut().const_unification_table().find(vid),
                 ) == self.root_vid
                 {
                     return Err(self.cyclic_term_error());
                 }
 
                 let mut inner = self.infcx.inner.borrow_mut();
-                let variable_table = &mut inner.const_unification_table();
+                let variable_table = inner.const_unification_table();
                 match variable_table.probe_value(vid) {
                     ConstVariableValue::Known { value: u } => {
                         drop(inner);
@@ -615,12 +615,10 @@ impl<'db> TypeRelation<DbInterner<'db>> for Generalizer<'_, 'db> {
                         if self.for_universe.can_name(universe) {
                             Ok(c)
                         } else {
-                            let new_var_id = variable_table
-                                .new_key(ConstVariableValue::Unknown {
-                                    span,
-                                    universe: self.for_universe,
-                                })
-                                .vid;
+                            let new_var_id = variable_table.new_key(ConstVariableValue::Unknown {
+                                span,
+                                universe: self.for_universe,
+                            });
 
                             // See the comment for type inference variables
                             // for more details.

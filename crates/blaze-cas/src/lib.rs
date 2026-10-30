@@ -1,4 +1,4 @@
-//! blaze v2's store (docs/v2/plan/lanes/store.md section 8). Replaces `blaze-store`.
+//! blaze v2's store (docs/v2/plan/lanes/store.md). Replaces `blaze-store`.
 //!
 //! - A value is kept under a [`Key`]: the BLAKE3 hash of exactly what it was made from (the
 //!   source, cfg, features, target, toolchain, the layout facts read, the schema and code of
@@ -53,7 +53,7 @@ use crate::index::{Shape, Table};
 
 /// The format of everything in a store's directory. A store of another refuses to open, naming
 /// both; nothing reads it as this one.
-pub(crate) const FORMAT: u32 = 2;
+pub(crate) const FORMAT: u32 = 3;
 
 /// A pack is closed for appends once it is this long; a record longer than that has a pack of
 /// its own.
@@ -218,6 +218,18 @@ pub enum Heat {
     Warm,
 }
 
+/// A crate version, as the store numbers it: the records of one unit go in packs of its own,
+/// one mapped file per crate version (#1298), so what a crate's build reads sits together and
+/// a crate version's records can go as a whole. [`Store::unit`] gives one.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Unit(u32);
+
+impl Unit {
+    /// What no one crate version owns: chunks of outputs (shared by every output that holds
+    /// them), dictionaries, and values put with [`Store::put`].
+    pub const SHARED: Unit = Unit(0);
+}
+
 /// A put's place in line for durability.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Ticket(pub u64);
@@ -304,11 +316,11 @@ pub struct Store {
     index_mapping: bool,
     training: [Training; Kind::ALL.len()],
     problems: Vec<String>,
-    fetching: FxHashMap<Key, Tag>,
+    fetching: ByHash<Key, Tag>,
     fetched: Vec<(Key, Fetched)>,
     placed: Vec<Placed>,
     /// Each tier's flag columns: verified, read, tried.
-    flags: Mutex<Vec<Flags>>,
+    flags: Vec<Flags>,
     /// How many times the own tier's read flags have rotated since its rows were last
     /// numbered afresh: a record is unread for two periods only once there have been two.
     periods: u32,
@@ -411,12 +423,15 @@ struct Tier {
     packs: Vec<Pack>,
     /// Records the index table does not hold: read from the packs' tails at opening, or put
     /// since.
-    delta: FxHashMap<Key, Delta>,
+    delta: ByHash<Key, Delta>,
     /// The row the next record of the delta gets.
     next_row: u64,
-    externals: FxHashMap<ContentId, External>,
+    externals: ByHash<ContentId, External>,
     /// By number, which a compressed record names.
     dictionaries: Vec<Dictionary>,
+    /// Each unit's crate version by its number less one, and the number of each.
+    units: Vec<ContentId>,
+    unit_of: ByHash<ContentId, Unit>,
 }
 
 impl Tier {
@@ -429,10 +444,12 @@ impl Tier {
             waiting: 0,
             index: None,
             packs: Vec::new(),
-            delta: FxHashMap::default(),
+            delta: ByHash::default(),
             next_row: 0,
-            externals: FxHashMap::default(),
+            externals: ByHash::default(),
             dictionaries: Vec::new(),
+            units: Vec::new(),
+            unit_of: ByHash::default(),
         }
     }
 
@@ -494,8 +511,8 @@ struct Delta {
 const _: () = assert!(size_of::<Delta>() == 48);
 
 struct Pack {
-    kind: Kind,
-    number: u32,
+    /// Its [`Unit`]'s number.
+    unit: u32,
     file: FileName,
     mapping: Option<Mapping>,
     /// How much of `mapping` is the store's.
@@ -539,7 +556,7 @@ struct Dictionary {
     kind: Kind,
     pack: u32,
     offset: u64,
-    bytes: Result<Vec<u8>, String>,
+    bytes: Result<Arc<cold::Prepared>, String>,
 }
 
 /// The raw values of a cold kind kept so far, to train its dictionary on.
@@ -614,6 +631,28 @@ fn colder_columns(columns: &dyn Columns, loc: Loc, hot: &[u8]) -> Result<Option<
     Ok(saves(&payload).then_some((Form::ColdColumns, payload)))
 }
 
+/// Keys and content IDs are BLAKE3 hashes already: their first eight bytes spread over a table
+/// as well as any hash of them would, so a lookup hashes nothing.
+#[derive(Default, Clone, Copy)]
+struct Prehashed(u64);
+
+impl std::hash::Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        if let Some(word) = bytes.first_chunk::<8>() {
+            self.0 ^= u64::from_le_bytes(*word);
+        }
+    }
+
+    fn write_usize(&mut self, _: usize) {}
+}
+
+/// A map on BLAKE3 hashes ([`Key`], [`ContentId`]), indexed by the hash itself.
+type ByHash<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Prehashed>>;
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -652,10 +691,10 @@ impl Store {
             index_mapping: false,
             training: Default::default(),
             problems: Vec::new(),
-            fetching: FxHashMap::default(),
+            fetching: ByHash::default(),
             fetched: Vec::new(),
             placed: Vec::new(),
-            flags: Mutex::new(flags),
+            flags,
             periods: 0,
             columns: FxHashMap::default(),
             owned: Mutex::default(),
@@ -705,7 +744,7 @@ impl Store {
             return self.read(tier, key, loc, row).map(|entry| Some((Heat::Hot, entry)));
         }
         let (header, payload) = self.record(tier, key, loc)?;
-        if lock(&self.flags)[tier].get(row, Flag::Verified) {
+        if self.flags[tier].get(row, Flag::Verified) {
             self.was_read(tier, row);
         } else {
             self.value(tier, key, loc, row, Use::Read)?;
@@ -753,10 +792,30 @@ impl Store {
         self.find(key).is_some()
     }
 
-    /// Keeps `bytes` under `key`; readable at once, durable once [`Store::complete`] says
-    /// its ticket is. A second put of a key keeps the first value, and a put whose bytes differ
-    /// from the value kept is an error the caller sees (a key that misses an input).
+    /// The unit of `crate_version` (the content ID of a crate's name, version and source, as
+    /// the caller names crate versions), numbered the first time it is asked for and kept in
+    /// the head from the next commit.
+    pub fn unit(&mut self, crate_version: ContentId) -> Unit {
+        assert!(crate_version != ContentId::default(), "a crate version of no crate");
+        let own = &mut self.tiers[0];
+        let next = Unit(own.units.len() as u32 + 1);
+        *own.unit_of.entry(crate_version).or_insert_with(|| {
+            own.units.push(crate_version);
+            next
+        })
+    }
+
+    /// [`Store::put_in`] of [`Unit::SHARED`]: for values of no one crate version.
     pub fn put(&mut self, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
+        self.put_in(Unit::SHARED, key, kind, bytes)
+    }
+
+    /// Keeps `bytes` under `key` in the packs of `unit`; readable at once, durable once
+    /// [`Store::complete`] says its ticket is. A second put of a key keeps the first value
+    /// wherever it is, and a put whose bytes differ from the value kept is an error the caller
+    /// sees (a key that misses an input).
+    pub fn put_in(&mut self, unit: Unit, key: Key, kind: Kind, bytes: Vec<u8>) -> Result<Ticket, Mismatch> {
+        assert!(unit.0 as usize <= self.tiers[0].units.len(), "{unit:?} is not one this store gave");
         assert!(self.tiers[0].opened, "a put into a store that is not open");
         self.forget_owned();
         let content = content_of(&bytes);
@@ -782,17 +841,17 @@ impl Store {
                     match cold::lz4(piece) {
                         Some(stored) => {
                             let (kind, content) = (Kind::Output, content_of(piece));
-                            self.append_value(chunk, kind, Form::Lz4, 0, content, len, &stored);
+                            self.append_value(Unit::SHARED, chunk, kind, Form::Lz4, 0, content, len, &stored);
                         }
                         None => {
-                            self.append(chunk, Kind::Output, Form::Raw, 0, content_of(piece), piece);
+                            self.append(Unit::SHARED, chunk, Kind::Output, Form::Raw, 0, content_of(piece), piece);
                         }
                     }
                 }
                 refs.push((chunk, piece.len() as u64));
             }
             let payload = disk::encode_chunks(&refs);
-            self.append_value(key, kind, Form::Chunked, 0, content, raw, &payload);
+            self.append_value(unit, key, kind, Form::Chunked, 0, content, raw, &payload);
         } else if !kind.cold() && kind != Kind::Output && bytes.len() >= EXTERNAL_FROM {
             let own = &mut self.tiers[0];
             let file = own.file(&disk::external_file(&content));
@@ -803,42 +862,44 @@ impl Store {
                 memory: Some(bytes),
                 committed: false,
             });
-            self.append_value(key, kind, Form::External, 0, content, raw, &[]);
+            self.append_value(unit, key, kind, Form::External, 0, content, raw, &[]);
         } else if let Some(columns) = self.columns_of(&bytes).filter(|_| kind.cold()) {
             match cold_columns(columns.as_ref(), &bytes) {
                 Ok(payload) => {
-                    self.append_value(key, kind, Form::ColdColumns, 0, content, raw, &payload);
+                    self.append_value(unit, key, kind, Form::ColdColumns, 0, content, raw, &payload);
                 }
                 Err(why) => self.cannot_compress(kind, why),
             }
         } else if kind.cold() && bytes.len() >= cold::LONG_FROM {
             match cold::compress_long(&bytes) {
                 Ok(stored) => {
-                    self.append_value(key, kind, Form::Zstd, NO_DICTIONARY, content, raw, &stored);
+                    self.append_value(unit, key, kind, Form::Zstd, NO_DICTIONARY, content, raw, &stored);
                 }
                 Err(why) => self.cannot_compress(kind, why),
             }
         } else if kind.cold() {
             match self.dictionary_of(kind) {
                 Some(number) => {
-                    let dictionary = self.tiers[0].dictionaries[number as usize]
-                        .bytes
-                        .as_ref()
-                        .expect("a dictionary of its own is held");
-                    match cold::compress(dictionary, &bytes) {
+                    let dictionary = Arc::clone(
+                        self.tiers[0].dictionaries[number as usize]
+                            .bytes
+                            .as_ref()
+                            .expect("a dictionary of its own is held"),
+                    );
+                    match cold::compress(&dictionary, &bytes) {
                         Ok(stored) => {
-                            self.append_value(key, kind, Form::Zstd, number, content, raw, &stored);
+                            self.append_value(unit, key, kind, Form::Zstd, number, content, raw, &stored);
                         }
                         Err(why) => self.cannot_compress(kind, why),
                     }
                 }
                 None => {
-                    let loc = self.append(key, kind, Form::Raw, 0, content, &bytes);
+                    let loc = self.append(unit, key, kind, Form::Raw, 0, content, &bytes);
                     self.sample(kind, loc);
                 }
             }
         } else {
-            self.append(key, kind, Form::Raw, 0, content, &bytes);
+            self.append(unit, key, kind, Form::Raw, 0, content, &bytes);
         }
         Ok(ticket)
     }
@@ -918,10 +979,10 @@ impl Store {
                             self.replace(key, loc, form, 0, content, &payload);
                             settled.demoted += 1;
                         }
-                        Ok(None) => lock(&self.flags)[0].set(row, Flag::Tried),
+                        Ok(None) => self.flags[0].set(row, Flag::Tried),
                         Err(why) => {
                             self.problems.push(format!("{:x} is not moved colder: {why}", key.0));
-                            lock(&self.flags)[0].set(row, Flag::Tried);
+                            self.flags[0].set(row, Flag::Tried);
                         }
                     }
                     continue;
@@ -936,7 +997,7 @@ impl Store {
                     }
                 };
                 if stored.len() as u64 + loc.raw / 8 > loc.raw {
-                    lock(&self.flags)[0].set(row, Flag::Tried);
+                    self.flags[0].set(row, Flag::Tried);
                     continue;
                 }
                 let dictionary = if long { NO_DICTIONARY } else { number.unwrap_or(NO_DICTIONARY) };
@@ -968,16 +1029,18 @@ impl Store {
                 break;
             }
             spent += bytes;
+            let unit = Unit(self.tiers[0].packs[at].unit);
             for (header, payload) in live {
-                let loc = self.append_record(header, &payload);
+                let loc = self.append_record(unit, header, &payload);
                 self.seq += 1;
                 let row = self.tiers[0].note(header.key, loc, self.seq);
-                lock(&self.flags)[0].set(row, Flag::New);
+                self.fit_flags(0);
+                self.flags[0].set(row, Flag::New);
             }
             self.tiers[0].packs[at].retiring = true;
             settled.retired += 1;
         }
-        lock(&self.flags)[0].rotate();
+        self.flags[0].rotate();
         self.periods = self.periods.saturating_add(1);
         self.start_commit(effects);
         settled
@@ -988,8 +1051,7 @@ impl Store {
         let own = &self.tiers[0];
         let mut bad = Vec::new();
         let rows = own.rows(&mut bad);
-        let flags = lock(&self.flags);
-        let flags = &flags[0];
+        let flags = &self.flags[0];
         let (mut demote, mut promote) = (Vec::new(), Vec::new());
         for (key, loc, row) in rows {
             let Some(pack) = own.packs.get(loc.pack as usize) else { continue };
@@ -1042,7 +1104,8 @@ impl Store {
         content: ContentId,
         payload: &[u8],
     ) {
-        self.append_value(key, old.kind, form, dictionary, content, old.raw, payload);
+        let unit = Unit(self.tiers[0].packs[old.pack as usize].unit);
+        self.append_value(unit, key, old.kind, form, dictionary, content, old.raw, payload);
         self.tiers[0].packs[old.pack as usize].dead += disk::aligned(RECORD_HEADER + old.stored);
     }
 
@@ -1059,7 +1122,7 @@ impl Store {
                     && pack.usable == pack.committed
                     && pack.committed > PACK_HEADER
                     && pack.dead * 2 >= pack.committed - PACK_HEADER
-                    && own.packs.iter().rposition(|it| it.kind == pack.kind && !it.removed) != Some(at)
+                    && own.packs.iter().rposition(|it| it.unit == pack.unit && !it.removed) != Some(at)
                     && !own.dictionaries.iter().any(|it| it.pack as usize == at)
             })
             .collect()
@@ -1382,7 +1445,7 @@ impl Store {
 
     fn was_read(&self, tier: usize, row: Row) {
         if tier == 0 {
-            lock(&self.flags)[0].set(row, Flag::Read);
+            self.flags[0].set(row, Flag::Read);
         }
     }
 
@@ -1447,7 +1510,7 @@ impl Store {
                     || corrupt(format!("it names dictionary {} the store does not have", header.dictionary)),
                 )?;
                 let dictionary =
-                    dictionary.bytes.as_ref().map_err(|why| corrupt(format!("its dictionary {why}")))?;
+                    dictionary.bytes.as_deref().map_err(|why| corrupt(format!("its dictionary {why}")))?;
                 Cow::Owned(cold::decompress(dictionary, payload, header.raw).map_err(corrupt)?)
             }
             Form::Chunked => {
@@ -1503,7 +1566,7 @@ impl Store {
             )));
         }
         let memo = !matches!(why, Use::Check);
-        if !(memo && lock(&self.flags)[tier_at].get(row, Flag::Verified)) {
+        if !(memo && self.flags[tier_at].get(row, Flag::Verified)) {
             let found = content_of(&bytes);
             if found != header.content {
                 return Err(corrupt(format!(
@@ -1512,7 +1575,7 @@ impl Store {
                 )));
             }
             if memo {
-                lock(&self.flags)[tier_at].set(row, Flag::Verified);
+                self.flags[tier_at].set(row, Flag::Verified);
             }
         }
         if matches!(why, Use::Read) {
@@ -1562,30 +1625,22 @@ impl Store {
     }
 
     /// The own pack of `kind` a record of `span` bytes goes into, made if none has room.
-    fn writable_pack(&mut self, kind: Kind, span: u64) -> usize {
+    fn writable_pack(&mut self, unit: Unit, span: u64) -> usize {
         let own = &mut self.tiers[0];
-        if let Some(at) = own.packs.iter().rposition(|it| it.kind == kind && !it.removed) {
+        if let Some(at) = own.packs.iter().rposition(|it| it.unit == unit.0 && !it.removed) {
             let pack = &own.packs[at];
             if pack.end == PACK_HEADER || pack.end + span <= PACK_MOST {
                 return at;
             }
         }
         assert!(own.packs.len() < PACKS_MOST, "the store has {PACKS_MOST} packs: it is full");
-        let number = own
-            .packs
-            .iter()
-            .filter(|it| it.kind == kind)
-            .map(|it| it.number + 1)
-            .max()
-            .unwrap_or(0);
-        let file = own.file(&disk::pack_file(kind, number));
+        let file = own.file(&disk::pack_file(own.packs.len()));
         own.packs.push(Pack {
-            kind,
-            number,
+            unit: unit.0,
             file,
             mapping: None,
             usable: 0,
-            memory: disk::pack_header(kind).to_vec(),
+            memory: disk::pack_header(unit.0).to_vec(),
             committed: 0,
             indexed: 0,
             end: PACK_HEADER,
@@ -1596,9 +1651,9 @@ impl Store {
         own.packs.len() - 1
     }
 
-    fn append_record(&mut self, header: RecordHeader, payload: &[u8]) -> Loc {
+    fn append_record(&mut self, unit: Unit, header: RecordHeader, payload: &[u8]) -> Loc {
         let span = header.span();
-        let at = self.writable_pack(header.kind, span);
+        let at = self.writable_pack(unit, span);
         let pack = &mut self.tiers[0].packs[at];
         let offset = pack.end;
         pack.memory.extend_from_slice(&header.encode());
@@ -1617,6 +1672,7 @@ impl Store {
 
     fn append_value(
         &mut self,
+        unit: Unit,
         key: Key,
         kind: Kind,
         form: Form,
@@ -1634,15 +1690,17 @@ impl Store {
             key,
             content,
         };
-        let loc = self.append_record(header, payload);
+        let loc = self.append_record(unit, header, payload);
         self.seq += 1;
         let row = self.tiers[0].note(key, loc, self.seq);
-        lock(&self.flags)[0].set(row, Flag::New);
+        self.fit_flags(0);
+        self.flags[0].set(row, Flag::New);
         loc
     }
 
     fn append(
         &mut self,
+        unit: Unit,
         key: Key,
         kind: Kind,
         form: Form,
@@ -1650,7 +1708,7 @@ impl Store {
         content: ContentId,
         bytes: &[u8],
     ) -> Loc {
-        self.append_value(key, kind, form, dictionary, content, bytes.len() as u64, bytes)
+        self.append_value(unit, key, kind, form, dictionary, content, bytes.len() as u64, bytes)
     }
 
     /// zstd refusing a value is a broken build of it (a missing feature), not something a
@@ -1706,12 +1764,12 @@ impl Store {
                     key: Key(ContentId::of(DICTIONARY_DOMAIN, &dictionary)),
                     content: content_of(&dictionary),
                 };
-                let loc = self.append_record(header, &dictionary);
+                let loc = self.append_record(Unit::SHARED, header, &dictionary);
                 self.tiers[0].dictionaries.push(Dictionary {
                     kind,
                     pack: loc.pack,
                     offset: loc.offset,
-                    bytes: Ok(dictionary),
+                    bytes: Ok(Arc::new(cold::Prepared::new(dictionary))),
                 });
             }
             Err(why) => {
@@ -1758,8 +1816,7 @@ impl Store {
                 .packs
                 .iter()
                 .map(|it| PackRef {
-                    kind: it.kind,
-                    number: it.number,
+                    unit: it.unit,
                     committed: it.end,
                     indexed: it.indexed,
                     dead: it.dead,
@@ -1772,6 +1829,7 @@ impl Store {
                 .map(|it| DictionaryRef { kind: it.kind, pack: it.pack, offset: it.offset })
                 .collect(),
             externals: all_externals,
+            units: own.units.clone(),
         };
         let mut index = None;
         if compact {
@@ -1981,10 +2039,10 @@ impl Store {
         let packs: Vec<Pack> = head
             .packs
             .iter()
-            .map(|it| Pack {
-                kind: it.kind,
-                number: it.number,
-                file: tier.file(&disk::pack_file(it.kind, it.number)),
+            .enumerate()
+            .map(|(number, it)| Pack {
+                unit: it.unit,
+                file: tier.file(&disk::pack_file(number)),
                 mapping: None,
                 usable: it.committed,
                 memory: Vec::new(),
@@ -1996,7 +2054,7 @@ impl Store {
                 retiring: false,
             })
             .collect();
-        let externals: FxHashMap<ContentId, External> = head
+        let externals: ByHash<ContentId, External> = head
             .externals
             .iter()
             .map(|it| {
@@ -2035,6 +2093,8 @@ impl Store {
             .collect();
         tier.packs = packs;
         tier.externals = externals;
+        tier.unit_of = head.units.iter().enumerate().map(|(at, it)| (*it, Unit(at as u32 + 1))).collect();
+        tier.units = head.units.clone();
         tier.head = head;
         tier.head_read = true;
         tier.waiting = maps.len();
@@ -2097,11 +2157,12 @@ impl Store {
                         for (key, it) in rest {
                             tier.note(key, it.loc, it.seq);
                         }
-                        lock(&self.flags)[at].forget();
+                        self.flags[at].forget();
                         self.periods = 0;
                         self.index_mapping = false;
                     }
                 }
+                self.fit_flags(at);
             }
         }
         self.failures = 0;
@@ -2116,9 +2177,19 @@ impl Store {
 
     fn finish_open(&mut self, at: usize) {
         match open_tier(&mut self.tiers[at]) {
-            Ok(()) => self.tiers[at].opened = true,
+            Ok(()) => {
+                self.fit_flags(at);
+                self.tiers[at].opened = true;
+            }
             Err((file, why)) => self.fail(file, why),
         }
+    }
+
+    /// Sizes tier `at`'s flag columns to its rows, so a read sets a flag without growing one.
+    fn fit_flags(&mut self, at: usize) {
+        let tier = &self.tiers[at];
+        let slots = tier.table().map_or(0, |it| it.slots());
+        self.flags[at].fit(slots, tier.next_row);
     }
 
     fn take_fetched(&mut self, key: Key, done: Done) -> Fetched {
@@ -2176,7 +2247,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
         let fail = |why: String| (pack.file.clone(), why);
         let all = pack.mapping.as_ref().ok_or_else(|| fail("it was not mapped".into()))?.bytes();
         let all = &all[..pack.committed as usize];
-        disk::check_pack_header(all, pack.kind).map_err(|why| fail(why.into()))?;
+        disk::check_pack_header(all, pack.unit).map_err(|why| fail(why.into()))?;
         let mut at = pack.indexed.max(PACK_HEADER);
         while at < pack.committed {
             if all[at as usize..at as usize + 4] == [0; 4] {
@@ -2192,9 +2263,6 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
             let end = at.checked_add(header.span()).filter(|&end| end <= pack.committed).ok_or_else(
                 || fail(format!("the record at {at} runs past the {} bytes its head names", pack.committed)),
             )?;
-            if header.kind != pack.kind {
-                return Err(fail(format!("the record at {at} is of another kind than its pack")));
-            }
             if header.form != Form::Dictionary {
                 let loc = Loc {
                     pack: number as u32,
@@ -2209,7 +2277,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
             at = end;
         }
     }
-    tier.delta = FxHashMap::default();
+    tier.delta = ByHash::default();
     tier.next_row = 0;
     for (key, loc) in found {
         tier.note(key, loc, 0);
@@ -2226,7 +2294,7 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
                 true => pack
                     .bytes(at + RECORD_HEADER, header.stored)
                     .filter(|bytes| content_of(bytes) == header.content)
-                    .map(<[u8]>::to_vec)
+                    .map(|bytes| Arc::new(cold::Prepared::new(bytes.to_vec())))
                     .ok_or_else(|| format!("at {at} of {} is not what was recorded", pack.file)),
                 false => Err(format!("at {at} of {} is not a dictionary of its kind", pack.file)),
             });

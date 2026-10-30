@@ -1,20 +1,23 @@
-//! E0268, E0267 and E0571: a `break` or `continue` with no loop or labeled block to leave, one
-//! inside a closure or a coroutine, and a `break` with a value out of a `while` or `for` loop.
+//! E0268, E0267, E0571, E0695 and E0696: a `break` or `continue` with no loop or labeled block
+//! to leave, one inside a closure or a coroutine, a `break` with a value out of a `while` or
+//! `for` loop, an unlabeled one inside a labeled block, and a `continue` to a labeled block.
 //!
 //! Follows rustc's `compiler/rustc_hir_typeck/src/loops.rs` (`CheckLoopVisitor`: the stack of
-//! contexts a body is visited with, `require_break_cx`, `report_outside_loop_error`) and
-//! `compiler/rustc_hir_typeck/src/diagnostics.rs` (`OutsideLoop`, `BreakInsideClosure`,
-//! `BreakInsideCoroutine`, `BreakNonLoop`) (MIT or Apache-2.0). The stack is rebuilt from the
-//! syntax: from the body the `break` is in down to it, as rustc's visitor pushes it.
+//! contexts a body is visited with, `require_label_in_labeled_block`, `require_break_cx`,
+//! `report_outside_loop_error`) and `compiler/rustc_hir_typeck/src/diagnostics.rs`
+//! (`OutsideLoop`, `BreakInsideClosure`, `BreakInsideCoroutine`, `BreakNonLoop`,
+//! `UnlabeledInLabeledBlock`, `ContinueLabeledBlock`) (MIT or Apache-2.0). The stack is rebuilt
+//! from the syntax: from the body the `break` is in down to it, as rustc's visitor pushes it
+//! on the HIR that `rustc_ast_lowering` makes of it.
 
 use hir::InFile;
 use syntax::{
-    AstNode, SyntaxNode, TextRange, TextSize,
+    AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
     ast::{self, HasLoopBody},
 };
 
 use crate::{
-    cx::{Cx, signature_range},
+    cx::{Cx, item_range, signature_range},
     lints::code_fact,
     lower::{Found, Phase},
     model::{Applicability, Diag},
@@ -39,45 +42,65 @@ enum Context {
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::BreakOutsideOfLoop) -> Vec<Found> {
     let at = d.expr.map(|it| it.syntax_node_ptr());
     let node = cx.syntax(at);
-    let span = cx.span_of(at);
-    let name = if d.is_break { "break" } else { "continue" };
-    let mut diag = if d.bad_value_break {
-        match break_non_loop(cx, &node) {
-            Some(it) => it,
-            None => return Vec::new(),
-        }
-    } else {
-        let stack = contexts(cx, &node);
-        match required(&stack, d.is_break) {
-            None => return Vec::new(),
-            Some(Context::Closure(closure)) => {
-                let mut diag =
-                    Diag::error(Some("E0267"), format!("`{name}` inside of a closure"), span.clone());
-                diag.span_label(span, format!("cannot `{name}` inside of a closure"));
-                diag.span_label(cx.span(closure), "enclosing closure");
-                diag
-            }
-            Some(Context::Coroutine { span: coroutine, kind, source }) => {
-                let mut diag = Diag::error(
-                    Some("E0267"),
-                    format!("`{name}` inside `{kind}` {source}"),
-                    span.clone(),
-                );
-                diag.span_label(span, format!("cannot `{name}` inside `{kind}` {source}"));
-                diag.span_label(cx.span(coroutine), format!("enclosing `{kind}` {source}"));
-                diag
-            }
-            Some(Context::UnlabeledBlock(block)) if same_file(&node, &block) => {
-                match block_breaks(cx, &node, block) {
-                    Some(it) => it,
-                    None => return Vec::new(),
-                }
-            }
-            Some(_) => outside_loop(vec![span], d.is_break),
-        }
-    };
+    let Some(mut diag) = diagnostic(cx, d, &node) else { return Vec::new() };
     code_fact(cx, &mut diag, at);
     vec![Found::new(diag, Phase::Bodies)]
+}
+
+/// What rustc's loop checker says of the `break` or `continue` at `node`, if anything.
+fn diagnostic(cx: &Cx<'_, '_>, d: &hir::BreakOutsideOfLoop, node: &InFile<SyntaxNode>) -> Option<Diag> {
+    let span = cx.span(node.with_value(node.value.text_range()));
+    let name = if d.is_break { "break" } else { "continue" };
+    let label = jump_label(&node.value);
+    let stack = contexts(cx, node);
+    if label.is_none() && stack.last() == Some(&Context::LabeledBlock) {
+        let mut diag =
+            Diag::error(Some("E0695"), format!("unlabeled `{name}` inside of a labeled block"), span.clone());
+        diag.span_label(
+            span,
+            format!("`{name}` statements that would diverge to or through a labeled block need to bear a label"),
+        );
+        return Some(diag);
+    }
+    if d.bad_value_break {
+        return break_non_loop(cx, node);
+    }
+    if !d.is_break
+        && let Some(label) = &label
+        && let Some(ast::Expr::BlockExpr(block)) = target_loop(&node.value, Some(label))
+    {
+        let mut diag = Diag::error(Some("E0696"), "`continue` pointing to a labeled block", span.clone());
+        diag.span_label(span, "labeled blocks cannot be `continue`'d");
+        diag.span_label(cx.span(node.with_value(item_range(block.syntax()))), "labeled block the `continue` points to");
+        return Some(diag);
+    }
+    match required(&stack, d.is_break)? {
+        Context::Closure(closure) => {
+            let mut diag = Diag::error(Some("E0267"), format!("`{name}` inside of a closure"), span.clone());
+            diag.span_label(span, format!("cannot `{name}` inside of a closure"));
+            diag.span_label(cx.span(closure), "enclosing closure");
+            Some(diag)
+        }
+        Context::Coroutine { span: coroutine, kind, source } => {
+            let mut diag =
+                Diag::error(Some("E0267"), format!("`{name}` inside `{kind}` {source}"), span.clone());
+            diag.span_label(span, format!("cannot `{name}` inside `{kind}` {source}"));
+            diag.span_label(cx.span(coroutine), format!("enclosing `{kind}` {source}"));
+            Some(diag)
+        }
+        Context::UnlabeledBlock(block) if same_file(node, &block) => block_breaks(cx, node, block),
+        _ => Some(outside_loop(vec![span], d.is_break)),
+    }
+}
+
+/// The label a `break` or `continue` names.
+fn jump_label(node: &SyntaxNode) -> Option<String> {
+    let lifetime = match ast::Expr::cast(node.clone())? {
+        ast::Expr::BreakExpr(it) => it.lifetime(),
+        ast::Expr::ContinueExpr(it) => it.lifetime(),
+        _ => None,
+    };
+    Some(lifetime?.text().to_string())
 }
 
 /// rustc's `OutsideLoop`, of the `break`s or the `continue` at `spans`.
@@ -107,14 +130,16 @@ fn block_breaks(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, block: InFile<TextSi
         .value
         .ancestors()
         .filter_map(ast::BlockExpr::cast)
-        .find(|it| it.syntax().text_range().start() == block.value)?;
+        .find(|it| block_start(it) == block.value)?;
     let breaks: Vec<ast::BreakExpr> = block_node
         .syntax()
         .descendants()
         .filter_map(ast::BreakExpr::cast)
         .filter(|it| {
             let other = node.with_value(it.syntax().clone());
-            required(&contexts(cx, &other), true) == Some(Context::UnlabeledBlock(block))
+            let stack = contexts(cx, &other);
+            let in_labeled = it.lifetime().is_none() && stack.last() == Some(&Context::LabeledBlock);
+            !in_labeled && required(&stack, true) == Some(Context::UnlabeledBlock(block))
         })
         .collect();
     let first = breaks.first()?;
@@ -156,7 +181,7 @@ fn break_non_loop(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<Diag> {
         _ => return None,
     };
     let span = cx.span(node.with_value(break_expr.syntax().text_range()));
-    let head = TextRange::new(target.syntax().text_range().start(), head_end);
+    let head = TextRange::new(item_range(target.syntax()).start(), head_end);
     let mut diag = Diag::error(
         Some("E0571"),
         format!("`break` with value from a `{kind}` loop"),
@@ -201,7 +226,8 @@ fn label_of(label: Option<ast::Label>) -> Option<String> {
 }
 
 /// The loop a `break` at `node` leaves: the innermost one when it has no label, else the loop
-/// or labeled block with its label, within the closure or body it is in.
+/// or labeled block with its label, within the closure, coroutine, constant or body it is in
+/// (rustc's loop scope, which `with_new_scopes` starts again, and its label ribs).
 fn target_loop(node: &SyntaxNode, label: Option<&str>) -> Option<ast::Expr> {
     let mut child = node.clone();
     for ancestor in node.ancestors().skip(1) {
@@ -222,9 +248,20 @@ fn target_loop(node: &SyntaxNode, label: Option<&str>) -> Option<ast::Expr> {
             Some(ast::Expr::ForExpr(it)) if in_body(it.loop_body()) => {
                 Some((label_of(it.label()), false, ast::Expr::ForExpr(it)))
             }
+            Some(ast::Expr::BlockExpr(it))
+                if it.async_token().is_some() || it.gen_token().is_some() || it.const_token().is_some() =>
+            {
+                return None;
+            }
             Some(ast::Expr::BlockExpr(it)) if it.label().is_some() => {
                 Some((label_of(it.label()), true, ast::Expr::BlockExpr(it)))
             }
+            Some(ast::Expr::ArrayExpr(it))
+                if it.semicolon_token().is_some() && it.exprs().nth(1).is_some_and(|len| len.syntax() == &child) =>
+            {
+                return None;
+            }
+            _ if ast::ConstArg::can_cast(ancestor.kind()) => return None,
             _ => None,
         };
         if let Some((own, is_block, expr)) = found {
@@ -283,7 +320,10 @@ fn contexts(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<Context> {
         let (node, child) = (&chain[i], &chain[i - 1]);
         let skip = std::mem::take(&mut contents_only);
         if let Some(pushed) = visit(&stack, node, &child.value, skip, &mut contents_only) {
+            // An inline const's body is a block of its own, visited with `ConstBlock` on top.
+            let body = (pushed == Context::ConstBlock).then_some(Context::Normal);
             stack.push(pushed);
+            stack.extend(body);
         }
     }
     stack
@@ -366,7 +406,7 @@ fn visit(
             if !it.body().is_some_and(|body| body.syntax() == child) {
                 return None;
             }
-            let start = it.syntax().text_range().start();
+            let start = item_range(it.syntax()).start();
             let end = match it.ret_type() {
                 Some(ret) => ret.syntax().text_range().end(),
                 None => it.param_list()?.syntax().text_range().end(),
@@ -380,12 +420,20 @@ fn visit(
             };
             Some(Context::Coroutine { span, kind, source: "closure" })
         }
+        // A `let`'s `else` block is visited as a block, not as an expression.
+        ast::Expr::BlockExpr(_) if node.value.parent().is_some_and(|it| it.kind() == SyntaxKind::LET_ELSE) => None,
         ast::Expr::BlockExpr(it) if !skip => block(top, node, &it),
         _ => None,
     }
 }
 
-fn block(top: &Context, node: &InFile<SyntaxNode>, it: &ast::BlockExpr) -> Option<Context> {
+/// Where rustc's span of a block starts: at its label or keyword, after its attributes.
+fn block_start(it: &ast::BlockExpr) -> TextSize {
+    item_range(it.syntax()).start()
+}
+
+/// The context of a block that is not a plain one: labeled, a coroutine, an inline const.
+fn block_modifier(node: &InFile<SyntaxNode>, it: &ast::BlockExpr) -> Option<Context> {
     if it.label().is_some() {
         return Some(Context::LabeledBlock);
     }
@@ -396,7 +444,7 @@ fn block(top: &Context, node: &InFile<SyntaxNode>, it: &ast::BlockExpr) -> Optio
         (false, false) => None,
     };
     if let Some(kind) = kind {
-        let start = it.syntax().text_range().start();
+        let start = block_start(it);
         let end = it
             .stmt_list()
             .and_then(|list| list.syntax().prev_sibling_or_token())
@@ -410,16 +458,21 @@ fn block(top: &Context, node: &InFile<SyntaxNode>, it: &ast::BlockExpr) -> Optio
     if it.const_token().is_some() {
         return Some(Context::ConstBlock);
     }
-    if it.try_block_modifier().is_some() {
-        return None;
+    None
+}
+
+/// What visiting the block `it` as an expression pushes. A `try` block is lowered to a plain
+/// block.
+fn block(top: &Context, node: &InFile<SyntaxNode>, it: &ast::BlockExpr) -> Option<Context> {
+    if let Some(context) = block_modifier(node, it) {
+        return Some(context);
     }
     if matches!(top, Context::Fn | Context::ConstBlock) {
         return Some(Context::Normal);
     }
     let default = it.unsafe_token().is_none();
     if default && matches!(top, Context::Normal | Context::AnonConst | Context::UnlabeledBlock(_)) {
-        let start = node.with_value(it.syntax().text_range().start());
-        return Some(Context::UnlabeledBlock(start));
+        return Some(Context::UnlabeledBlock(node.with_value(block_start(it))));
     }
     None
 }

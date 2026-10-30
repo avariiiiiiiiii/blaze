@@ -41,6 +41,8 @@ struct Pending<'db> {
     keep: Vec<bool>,
 }
 
+const _: () = assert!(size_of::<Pending<'static>>() == 6 * size_of::<Vec<u8>>());
+
 impl<'db> Pending<'db> {
     fn len(&self) -> usize {
         self.predicate.len()
@@ -235,6 +237,7 @@ impl<'db> FulfillmentCtxt<'db> {
         assert_eq!(self.usable_in_snapshot, infcx.num_open_snapshots());
         // What a round left when it unwound.
         self.round.clear();
+        let recursion_limit = infcx.interner.recursion_limit();
         let mut errors = Vec::new();
         loop {
             let mut any_changed = false;
@@ -243,7 +246,7 @@ impl<'db> FulfillmentCtxt<'db> {
             for at in 0..self.round.len() {
                 let mut obligation = self.round.obligation(at);
                 let stalled_on = self.round.stalled_on[at].take();
-                if obligation.recursion_depth >= infcx.interner.recursion_limit() {
+                if obligation.recursion_depth >= recursion_limit {
                     // The rest of the round is dropped, as rustc does.
                     self.round.clear();
                     self.obligations.on_fulfillment_overflow(infcx);
@@ -425,5 +428,35 @@ impl NextSolverError<'_> {
     #[inline]
     pub fn is_true_error(&self) -> bool {
         matches!(self, NextSolverError::TrueError(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retain_marked;
+
+    #[test]
+    fn columns_keep_one_order() {
+        let keep: Vec<bool> = (0..64).map(|at| at % 3 != 1 && at % 7 != 0).collect();
+        let mut numbers: Vec<u32> = (0..64).collect();
+        let mut names: Vec<String> = (0..64).map(|at| format!("o{at}")).collect();
+        retain_marked(&mut numbers, &keep);
+        retain_marked(&mut names, &keep);
+        let expected: Vec<u32> = (0..64).filter(|&at| keep[at as usize]).collect();
+        assert_eq!(numbers, expected);
+        assert_eq!(names, expected.iter().map(|at| format!("o{at}")).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn columns_keep_all_or_none() {
+        let mut all: Vec<u32> = (0..5).collect();
+        retain_marked(&mut all, &[true; 5]);
+        assert_eq!(all, [0, 1, 2, 3, 4]);
+        let mut none: Vec<u32> = (0..5).collect();
+        retain_marked(&mut none, &[false; 5]);
+        assert!(none.is_empty());
+        let mut empty: Vec<u32> = Vec::new();
+        retain_marked(&mut empty, &[]);
+        assert!(empty.is_empty());
     }
 }

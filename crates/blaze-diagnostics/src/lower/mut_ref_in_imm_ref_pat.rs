@@ -10,7 +10,7 @@
 
 use hir::InFile;
 use syntax::{
-    AstNode, SyntaxNode, TextRange,
+    AstNode, SyntaxKind, SyntaxNode, TextRange,
     ast::{self, HasName as _},
 };
 
@@ -44,19 +44,22 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MutRefInImmRefPat) -> Vec<Found> {
 fn and_pat_prefix(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<Span> {
     for ancestor in cx.sema.ancestors_with_macros_file(node).skip(1) {
         let it = &ancestor.value;
-        match ast::Pat::cast(it.clone()) {
-            Some(ast::Pat::RefPat(pat)) if pat.mut_token().is_none() => {
-                let inner = pat.pat()?;
-                let start = pat.syntax().text_range().start();
-                let end = inner.syntax().text_range().start();
+        match it.kind() {
+            SyntaxKind::REF_PAT => {
+                let pat = ast::RefPat::cast(it.clone())?;
+                if pat.mut_token().is_some() {
+                    continue;
+                }
+                let start = it.text_range().start();
+                let end = pat.pat()?.syntax().text_range().start();
                 return (end > start).then(|| cx.span(ancestor.with_value(TextRange::new(start, end))));
             }
-            Some(_) => {}
-            None if ast::RecordPatField::can_cast(it.kind())
-                || ast::RecordPatFieldList::can_cast(it.kind())
-                || ast::MacroCall::can_cast(it.kind())
-                || ast::TokenTree::can_cast(it.kind()) => {}
-            None => return None,
+            SyntaxKind::RECORD_PAT_FIELD
+            | SyntaxKind::RECORD_PAT_FIELD_LIST
+            | SyntaxKind::MACRO_CALL
+            | SyntaxKind::TOKEN_TREE => {}
+            kind if ast::Pat::can_cast(kind) => {}
+            _ => return None,
         }
     }
     None

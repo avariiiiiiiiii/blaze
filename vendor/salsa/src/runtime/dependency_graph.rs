@@ -8,10 +8,10 @@ use crate::key::DatabaseKeyIndex;
 use crate::runtime::WaitResult;
 use crate::runtime::dependency_graph::edge::EdgeCondvar;
 use crate::sync::MutexGuard;
-use crate::sync::thread::ThreadId;
+use crate::task::TaskId;
 use crate::tracing;
 
-type QueryDependents = FxHashMap<DatabaseKeyIndex, SmallVec<[ThreadId; 4]>>;
+type QueryDependents = FxHashMap<DatabaseKeyIndex, SmallVec<[TaskId; 4]>>;
 type TransferredDependents = FxHashMap<DatabaseKeyIndex, SmallSet<DatabaseKeyIndex, 4>>;
 
 #[derive(Debug, Default)]
@@ -22,19 +22,19 @@ pub(super) struct DependencyGraph {
     /// will result).
     edges: Edges,
 
-    /// Encodes the `ThreadId` that are blocked waiting for the result
+    /// Encodes the tasks that are blocked waiting for the result
     /// of a given query.
     query_dependents: QueryDependents,
 
     /// When a key K completes which had dependent queries Qs blocked on it,
     /// it stores its `WaitResult` here. As they wake up, each query Q in Qs will
     /// come here to fetch their results.
-    wait_results: FxHashMap<ThreadId, WaitResult>,
+    wait_results: FxHashMap<TaskId, WaitResult>,
 
     /// A `K -> Q` pair indicates that the query `K`'s lock is now owned by the query
     /// `Q`. It's important that `transferred` always forms a tree (must be acyclic),
     /// or else deadlock will result.
-    transferred: FxHashMap<DatabaseKeyIndex, (ThreadId, DatabaseKeyIndex)>,
+    transferred: FxHashMap<DatabaseKeyIndex, (TaskId, DatabaseKeyIndex)>,
 
     /// A `K -> [Q]` pair indicates that the query `K` owns the locks of
     /// `Q`. This is the reverse mapping of `transferred` to allow efficient unlocking
@@ -46,8 +46,45 @@ impl DependencyGraph {
     /// True if `from_id` depends on `to_id`.
     ///
     /// (i.e., there is a path from `from_id` to `to_id` in the graph.)
-    pub(super) fn depends_on(&self, from_id: ThreadId, to_id: ThreadId) -> bool {
+    pub(super) fn depends_on(&self, from_id: TaskId, to_id: TaskId) -> bool {
         self.edges.depends_on(from_id, to_id)
+    }
+
+    /// Whether blocking `from_id` on `to_id` would wait for `from_id` itself, following the edges
+    /// from `to_id` and, from a task without one, the blocked task above it on its thread: a task
+    /// can't go on before the tasks its thread runs above it (pumped while it waited) return.
+    pub(super) fn wait_closes(&self, to_id: TaskId, from_id: TaskId) -> Closes {
+        let mut task = to_id;
+        let mut through_pump = false;
+        // Each hop leaves a blocked task, so a walk longer than the edges is a cycle that does not
+        // pass `from_id`, which `block_on`'s precondition rules out.
+        for _ in 0..=self.edges.0.len() {
+            if task == from_id {
+                return if through_pump {
+                    Closes::ThroughPumpedTask
+                } else {
+                    Closes::QueryCycle
+                };
+            }
+            if task.is_below(from_id) {
+                return Closes::ThroughPumpedTask;
+            }
+            if let Some(edge) = self.edges.0.get(&task) {
+                task = edge.blocked_on_id;
+                continue;
+            }
+            let Some((_, edge)) = self
+                .edges
+                .0
+                .iter()
+                .find(|(blocked, _)| task.is_below(**blocked))
+            else {
+                return Closes::No;
+            };
+            through_pump = true;
+            task = edge.blocked_on_id;
+        }
+        panic!("the tasks blocked on {to_id:?} form a cycle without {from_id:?}: {self:#?}")
     }
 
     /// Modifies the graph so that `from_id` is blocked
@@ -65,9 +102,9 @@ impl DependencyGraph {
     /// * `held_mutex` is a read lock (or stronger) on `database_key`
     pub(super) fn block_on<QueryMutexGuard>(
         mut me: MutexGuard<'_, Self>,
-        from_id: ThreadId,
+        from_id: TaskId,
         database_key: DatabaseKeyIndex,
-        to_id: ThreadId,
+        to_id: TaskId,
         query_mutex_guard: QueryMutexGuard,
     ) -> WaitResult {
         let cvar = std::pin::pin!(EdgeCondvar::default());
@@ -100,9 +137,9 @@ impl DependencyGraph {
     /// [`Self::wait_results`] entry has been inserted.
     unsafe fn add_edge(
         &mut self,
-        from_id: ThreadId,
+        from_id: TaskId,
         database_key: DatabaseKeyIndex,
-        to_id: ThreadId,
+        to_id: TaskId,
         cvar: Pin<&EdgeCondvar>,
     ) {
         assert_ne!(from_id, to_id);
@@ -137,7 +174,7 @@ impl DependencyGraph {
     /// Unblock the runtime with the given id with the given wait-result.
     /// This will cause it resume execution (though it will have to grab
     /// the lock on this data structure first, to recover the wait result).
-    fn unblock_runtime(&mut self, id: ThreadId, wait_result: WaitResult) {
+    fn unblock_runtime(&mut self, id: TaskId, wait_result: WaitResult) {
         let edge = self.edges.remove(&id).expect("not blocked");
         self.wait_results.insert(id, wait_result);
 
@@ -200,7 +237,7 @@ impl DependencyGraph {
         &self,
         database_key: DatabaseKeyIndex,
         skip_over: Option<DatabaseKeyIndex>,
-    ) -> Option<ThreadId> {
+    ) -> Option<TaskId> {
         let &(mut resolved_thread, owner) = self.transferred.get(&database_key)?;
 
         let mut current_owner = owner;
@@ -231,14 +268,14 @@ impl DependencyGraph {
     pub(super) fn transfer_lock(
         mut me: MutexGuard<Self>,
         query: DatabaseKeyIndex,
-        current_thread: ThreadId,
+        current_thread: TaskId,
         new_owner: DatabaseKeyIndex,
         new_owner_id: SyncOwner,
         guard: SyncGuard,
     ) -> bool {
         let dg = &mut *me;
         let new_owner_thread = match new_owner_id {
-            SyncOwner::Thread(thread) => thread,
+            SyncOwner::Task(task) => task,
             SyncOwner::Transferred => {
                 // Skip over `query` to skip over any existing mapping from `new_owner` to `query` that may
                 // exist from previous transfers.
@@ -360,7 +397,7 @@ impl DependencyGraph {
 
     /// Finds the one query in the dependents of the `source_query` (the one that is transferred to a new owner)
     /// on which the `new_owner_id` thread blocks on and unblocks it, to ensure progress.
-    fn unblock_transfer_target(&mut self, source_query: DatabaseKeyIndex, new_owner_id: ThreadId) {
+    fn unblock_transfer_target(&mut self, source_query: DatabaseKeyIndex, new_owner_id: TaskId) {
         /// Finds the thread that's currently blocking the `new_owner_id` thread.
         ///
         /// Returns `Some` if there's such a thread where the first element is the query
@@ -369,7 +406,7 @@ impl DependencyGraph {
         fn find_blocked_thread(
             me: &DependencyGraph,
             query: DatabaseKeyIndex,
-            new_owner_id: ThreadId,
+            new_owner_id: TaskId,
         ) -> Option<(DatabaseKeyIndex, usize)> {
             if let Some(blocked_threads) = me.query_dependents.get(&query) {
                 for (i, id) in blocked_threads.iter().copied().enumerate() {
@@ -401,13 +438,13 @@ impl DependencyGraph {
         }
     }
 
-    fn update_transferred_edges(&mut self, query: DatabaseKeyIndex, new_owner_thread: ThreadId) {
+    fn update_transferred_edges(&mut self, query: DatabaseKeyIndex, new_owner_thread: TaskId) {
         fn update_transferred_edges(
             edges: &mut Edges,
             query_dependents: &QueryDependents,
             transferred_dependents: &TransferredDependents,
             query: DatabaseKeyIndex,
-            new_owner_thread: ThreadId,
+            new_owner_thread: TaskId,
         ) {
             tracing::trace!("update_transferred_edges({query:?}");
             if let Some(dependents) = query_dependents.get(&query) {
@@ -449,11 +486,23 @@ impl DependencyGraph {
     }
 }
 
+/// What blocking one task on another would close, from [`DependencyGraph::wait_closes`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum Closes {
+    /// Nothing: the wait ends when the other task finishes.
+    No,
+    /// A cycle of query waits, which salsa's cycle handling resolves.
+    QueryCycle,
+    /// A wait on a task that runs below the waiting one on its thread, which can't finish before
+    /// the waiting task returns.
+    ThroughPumpedTask,
+}
+
 #[derive(Debug, Default)]
-struct Edges(FxHashMap<ThreadId, edge::Edge>);
+struct Edges(FxHashMap<TaskId, edge::Edge>);
 
 impl Edges {
-    fn depends_on(&self, from_id: ThreadId, to_id: ThreadId) -> bool {
+    fn depends_on(&self, from_id: TaskId, to_id: TaskId) -> bool {
         let mut p = from_id;
         while let Some(q) = self.0.get(&p).map(|edge| edge.blocked_on_id) {
             if q == to_id {
@@ -465,19 +514,19 @@ impl Edges {
         p == to_id
     }
 
-    fn get_mut(&mut self, id: &ThreadId) -> Option<&mut edge::Edge> {
+    fn get_mut(&mut self, id: &TaskId) -> Option<&mut edge::Edge> {
         self.0.get_mut(id)
     }
 
-    fn contains_key(&self, id: &ThreadId) -> bool {
+    fn contains_key(&self, id: &TaskId) -> bool {
         self.0.contains_key(id)
     }
 
-    fn insert(&mut self, id: ThreadId, edge: edge::Edge) {
+    fn insert(&mut self, id: TaskId, edge: edge::Edge) {
         self.0.insert(id, edge);
     }
 
-    fn remove(&mut self, id: &ThreadId) -> Option<edge::Edge> {
+    fn remove(&mut self, id: &TaskId) -> Option<edge::Edge> {
         self.0.remove(id)
     }
 }
@@ -548,7 +597,7 @@ where
 }
 
 mod edge {
-    use crate::sync::thread::ThreadId;
+    use crate::task::TaskId;
     use crate::sync::{Condvar, MutexGuard};
 
     use std::pin::Pin;
@@ -568,7 +617,7 @@ mod edge {
 
     #[derive(Debug)]
     pub(super) struct Edge {
-        pub(super) blocked_on_id: ThreadId,
+        pub(super) blocked_on_id: TaskId,
 
         /// Signalled whenever a query with dependents completes.
         /// Allows those dependents to check if they are ready to unblock.
@@ -580,7 +629,7 @@ mod edge {
         /// # SAFETY
         ///
         /// The caller must ensure that the [`EdgeCondvar`] is kept alive until the [`Edge`] is dropped.
-        pub(super) unsafe fn new(blocked_on_id: ThreadId, condvar: Pin<&EdgeCondvar>) -> Self {
+        pub(super) unsafe fn new(blocked_on_id: TaskId, condvar: Pin<&EdgeCondvar>) -> Self {
             Self {
                 blocked_on_id,
                 // SAFETY: The caller is responsible for ensuring that the `EdgeCondvar` outlives the `Edge`.

@@ -108,7 +108,13 @@ impl<'a> Stage<'a> {
             if self.full {
                 (whole(self.old), self.old.file_len)
             } else {
-                (writes.iter().map(|(at, bytes)| (*at, file_bytes(self.old, *at, bytes.len() as u64))).collect(), self.old.file_len)
+                let len = self.old.file_len;
+                let undo = writes
+                    .iter()
+                    .filter(|(at, _)| *at < len)
+                    .map(|(at, bytes)| (*at, file_bytes(self.old, *at, (bytes.len() as u64).min(len - at))))
+                    .collect();
+                (undo, len)
             }
         } else {
             (Vec::new(), 0)

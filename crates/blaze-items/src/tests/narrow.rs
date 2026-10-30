@@ -1,8 +1,9 @@
-//! Facts recorded where they are read (docs/v2/plan/lanes/items.md section 6.2): each test runs a query,
-//! edits, runs it again and checks what reran. A query that reads a narrow fact reruns only
-//! when that fact changed; the narrow query itself reruns and comes out equal.
+//! Facts recorded where they are read (docs/v2/plan/lanes/items.md section 6.2): each test runs
+//! a query, edits, runs it again and checks what reran. A query that reads a narrow fact reruns
+//! only when that fact changed; the narrow query itself reruns and comes out equal.
 
 use base_db::{Crate, FileId, SourceDatabase, all_crates};
+use either::Either;
 use hir_def::{
     AdtId, AssocItemId, DefWithBodyId, FunctionId, GenericDefId, ImplId, ModuleDefId, StructId,
     TraitId,
@@ -14,8 +15,8 @@ use hir_ty::{
     db::HirDatabase,
     drop::destructor,
     layout::layout_of_adt_query,
-    method_resolution::TraitImpls,
-    next_solver::{DbInterner, GenericArgs},
+    method_resolution::{InherentImpls, TraitImpls},
+    next_solver::{DbInterner, GenericArgs, SimplifiedType},
     traits::is_inherent_impl_coherent,
 };
 use rustc_type_ir::inherent::GenericArgs as _;
@@ -346,4 +347,64 @@ fn an_associated_type_added_to_the_impl_reruns_its_bodies() {
     let m = impl_function_named(&db, "m");
     let warm = db.executed(|| infer(&db, m));
     assert!(ran(&warm, "::for_body"), "{warm:#?}");
+}
+
+const TABLES: &str = r#"
+pub trait T {}
+pub trait U {}
+pub struct A<X>(X);
+pub struct B;
+impl A<u8> { pub fn a1() {} }
+impl B { pub fn b() {} }
+impl A<u16> { pub fn a2() {} }
+impl T for A<u8> {}
+impl T for B {}
+impl T for A<u16> {}
+impl<X> T for [X] {}
+impl<X> U for X {}
+"#;
+
+/// The impl tables, as columns, give each self type its impls in the order they were found,
+/// a trait's blanket impls apart, and nothing for a type with none.
+#[test]
+fn impl_tables_keep_the_order_impls_are_found_in() {
+    let (db, _) = single_file(TABLES);
+    let k = krate(&db);
+    let a = SimplifiedType::Adt(AdtId::from(struct_named(&db, "A")).into());
+    let b = SimplifiedType::Adt(AdtId::from(struct_named(&db, "B")).into());
+    let (t, u) = (trait_named(&db, "T"), trait_named(&db, "U"));
+    hir_ty::attach_db(&db, || {
+        let trait_of = |it: ImplId| db.impl_trait(it).map(|it| it.skip_binder().def_id.0);
+        let all = impls(&db);
+        let of = |trait_: Option<TraitId>| {
+            all.iter().copied().filter(|&it| trait_of(it) == trait_).collect::<Vec<_>>()
+        };
+        let (inherent, of_t, of_u) = (of(None), of(Some(t)), of(Some(u)));
+
+        let inherent_impls = InherentImpls::for_crate(&db, k);
+        assert_eq!(inherent_impls.for_self_ty(&a), [inherent[0], inherent[2]]);
+        assert_eq!(inherent_impls.for_self_ty(&b), [inherent[1]]);
+        assert!(inherent_impls.for_self_ty(&SimplifiedType::Str).is_empty());
+
+        let trait_impls = &**TraitImpls::for_crate(&db, k);
+        assert_eq!(trait_impls.for_trait_and_self_ty(t, &a).0, [of_t[0], of_t[2]]);
+        assert_eq!(trait_impls.for_trait_and_self_ty(t, &b).0, [of_t[1]]);
+        assert_eq!(trait_impls.for_trait_and_self_ty(t, &SimplifiedType::Slice).0, [of_t[3]]);
+        assert!(trait_impls.for_trait_and_self_ty(u, &a).0.is_empty());
+        assert!(trait_impls.blanket_impls(t).is_empty());
+        assert_eq!(trait_impls.blanket_impls(u), of_u);
+        assert!(trait_impls.has_impls_for_trait_and_self_ty(u, &SimplifiedType::Str));
+        assert!(!trait_impls.has_impls_for_trait_and_self_ty(t, &SimplifiedType::Str));
+
+        let mut found = Vec::new();
+        trait_impls.for_trait(t, |it| {
+            if let Either::Left(it) = it {
+                found.extend_from_slice(it);
+            }
+        });
+        found.sort();
+        let mut expected = of_t.clone();
+        expected.sort();
+        assert_eq!(found, expected);
+    });
 }

@@ -22,5 +22,8 @@ rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 zstd.workspace = true
 
+[dev-dependencies]
+blaze-v2-proof.workspace = true
+
 [lints]
 workspace = true

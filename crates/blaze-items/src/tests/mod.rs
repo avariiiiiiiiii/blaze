@@ -5,6 +5,7 @@ mod facts;
 mod form;
 mod hashes;
 mod narrow;
+mod table;
 
 use base_db::SourceDatabase;
 use hir_def::{ModuleDefId, nameres::crate_def_map};

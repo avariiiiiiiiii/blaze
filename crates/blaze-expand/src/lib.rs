@@ -122,11 +122,24 @@ struct Installed {
     expansions: Expansions,
     mode: Mode,
     native: Native,
-    /// The machine's files, hashed once per change of what `stat` says of them.
-    disk: Mutex<Disk>,
 }
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
+
+thread_local! {
+    /// The machine's files, hashed once per change of what `stat` says of them: one per
+    /// expanding thread, so no check of an expansion's inputs waits on another's.
+    static DISK: std::cell::RefCell<Disk> = std::cell::RefCell::new(Disk::new(Vec::new()));
+}
+
+/// What the store has of a call.
+enum Lookup {
+    /// Its expansion, read back.
+    Read(tt::TopSubtree),
+    /// Its expansion's bytes, to compare a fresh one with ([`Mode::Check`]).
+    Bytes(Vec<u8>),
+    Nothing,
+}
 
 /// Keeps every proc-macro expansion of the workspaces loaded from here on in `expansions`.
 /// Says why not when [`CACHE`] or [`NATIVE`] has a value that is not one, or it was installed
@@ -139,7 +152,7 @@ pub fn install(expansions: Expansions) -> Result<(), String> {
     };
     let mode = Mode::of(var(CACHE)?.as_deref())?;
     let native = Native::of(var(NATIVE)?.as_deref())?;
-    let installed = Installed { expansions, mode, native, disk: Mutex::new(Disk::new(Vec::new())) };
+    let installed = Installed { expansions, mode, native };
     INSTALLED.set(installed).map_err(|_| "proc-macro expansions were installed twice".to_owned())?;
     load_cargo::wrap_expanders(wrap);
     Ok(())
@@ -400,28 +413,32 @@ impl Kept {
         let call_env: Vec<(String, String)> =
             env.iter().map(|(name, value)| (name.to_owned(), value.to_owned())).collect();
         let seen = Environment::seen(&installed.expansions.environment.passed(), &call_env);
-        let found = {
+        let found = DISK.with_borrow_mut(|disk| {
             let store = installed.expansions.store.read().unwrap_or_else(|it| it.into_inner());
-            let mut disk = installed.disk.lock().unwrap_or_else(|it| it.into_inner());
             disk.set_env(seen);
-            match index::find(&store, &run, &mut *disk) {
-                Ok(Found::Hit { value, .. }) => Some(value.to_vec()),
-                Ok(Found::Miss { .. }) => None,
-                Err(FindError::Corrupt(corrupt)) => return Err(self.error(corrupt)),
-                Err(FindError::NotAShape { key, why }) => {
-                    return Err(self.error(format!("the store's {key:?} is not a shape: {why}")));
+            match index::find(&store, &run, disk) {
+                // Read in place, under the lock: a hit copies nothing out of the store.
+                Ok(Found::Hit { value, .. }) if installed.mode == Mode::Keep => {
+                    read(value, &spans).map(Lookup::Read).map_err(|why| self.error(why))
                 }
-                Err(FindError::Inputs(unreadable)) => return Err(self.error(unreadable)),
+                Ok(Found::Hit { value, .. }) => Ok(Lookup::Bytes(value.to_vec())),
+                Ok(Found::Miss { .. }) => Ok(Lookup::Nothing),
+                Err(FindError::Corrupt(corrupt)) => Err(self.error(corrupt)),
+                Err(FindError::NotAShape { key, why }) => {
+                    Err(self.error(format!("the store's {key:?} is not a shape: {why}")))
+                }
+                Err(FindError::Inputs(unreadable)) => Err(self.error(unreadable)),
             }
-        };
+        })?;
         COUNTS.keyed.add(start.elapsed());
-        if let Some(bytes) = &found
-            && installed.mode == Mode::Keep
-        {
-            let output = read(bytes, &spans).map_err(|why| self.error(why))?;
-            COUNTS.found.add(start.elapsed());
-            return Ok(output);
-        }
+        let found = match found {
+            Lookup::Read(output) => {
+                COUNTS.found.add(start.elapsed());
+                return Ok(output);
+            }
+            Lookup::Bytes(bytes) => Some(bytes),
+            Lookup::Nothing => None,
+        };
         let asked = load_cargo::asked();
         let expand = Instant::now();
         let expanded =
@@ -745,6 +762,9 @@ pub fn report() -> Option<String> {
     }
     if let Some(compared) = compare::report() {
         said += &format!("; {compared}");
+    }
+    if let Some(native) = native::report() {
+        said += &format!("; {native}");
     }
     Some(said)
 }

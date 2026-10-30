@@ -25,6 +25,7 @@ use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, GenericArgKind, TypeFlags, TypeFoldable, TypeFolder,
     TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
     inherent::{GenericArg as _, IntoKind},
+    solve::VisibleForLeakCheck,
 };
 use tracing::{debug, instrument};
 
@@ -499,7 +500,11 @@ impl<'db> InferCtxt<'db> {
                     // no action needed
                 }
                 (GenericArgKind::Lifetime(v1), GenericArgKind::Lifetime(v2)) => {
-                    self.inner.borrow_mut().unwrap_region_constraints().make_eqregion(v1, v2);
+                    self.inner.borrow_mut().unwrap_region_constraints().make_eqregion(
+                        v1,
+                        v2,
+                        VisibleForLeakCheck::Yes,
+                    );
                 }
                 (GenericArgKind::Const(v1), GenericArgKind::Const(v2)) => {
                     let ok = self.at(cause, param_env).eq(v1, v2)?;

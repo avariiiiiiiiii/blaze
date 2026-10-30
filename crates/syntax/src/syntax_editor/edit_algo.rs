@@ -448,12 +448,8 @@ impl TreeState {
         }
 
         let parent = parent_path.resolve(&self.root).and_then(SyntaxElement::into_node).unwrap();
-        let green = syntax_tree::GreenNodeData::splice_children(
-            parent.green(),
-            deleted.clone(),
-            inserted.into_iter().map(PreparedElement::into_green),
-        );
-        self.root = SyntaxNode::new_root(parent.replace_with(green));
+        let inserted: Vec<SyntaxElement> = inserted.into_iter().map(|it| it.syntax).collect();
+        self.root = parent.splice_children(deleted.clone(), &inserted);
         self.edits.push(PathEdit::Splice {
             parent: parent_path,
             deleted,
@@ -466,7 +462,7 @@ impl TreeState {
         let NodeOrToken::Node(node) = replacement.syntax else {
             panic!("root node replacement should be a node")
         };
-        self.root = SyntaxNode::new_root(node.green().to_owned());
+        self.root = node.clone_subtree();
         self.changed.clear();
         if track_as_changed {
             self.changed.push(SyntaxPath { child_indices: Vec::new() });
@@ -538,17 +534,6 @@ impl TreeState {
 struct PreparedElement {
     syntax: SyntaxElement,
     annotations: Vec<TrackedAnnotation>,
-}
-
-impl PreparedElement {
-    fn into_green(
-        self,
-    ) -> syntax_tree::NodeOrToken<syntax_tree::GreenNode, syntax_tree::GreenToken> {
-        match self.syntax {
-            SyntaxElement::Node(node) => NodeOrToken::Node(node.green().to_owned()),
-            SyntaxElement::Token(token) => NodeOrToken::Token(token.green().to_owned()),
-        }
-    }
 }
 
 /// Owns all evolving trees involved in executing an edit plan.

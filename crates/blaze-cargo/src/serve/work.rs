@@ -18,12 +18,12 @@ use std::{
     sync::{Arc, RwLock, atomic::AtomicBool},
 };
 
-use blaze_api::{ApiError, Artifact, Diagnostic, Reach, Response};
+use blaze_api::{ApiError, Artifact, Diagnostic, Reach, Response, Table};
 use blaze_cas::Store;
 use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
-use blaze_query::Database;
-use blaze_units::query::{BuildConfig, Fetch, Units};
+use blaze_query::{Database, DbError, Query, QueryKey};
+use blaze_units::query::{BuildConfig, Fetch, Plan, Planned, Units};
 use blaze_vfs::{Change, Mode, ViewId};
 
 /// A source fetched and checked, as its files: the daemon puts it into the VFS as a root of its

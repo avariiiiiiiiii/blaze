@@ -1,0 +1,97 @@
+//! `unreachable_code`: what type checking finds after an expression that diverges.
+//!
+//! Follows `compiler/rustc_hir_typeck/src/fn_ctxt/_impl.rs` (`warn_if_unreachable`: "unreachable
+//! {kind}" at what is unreachable, "any code following this expression is unreachable" or the
+//! custom note at what diverged) and its callers in `expr.rs`, `_match.rs` and
+//! `fn_ctxt/checks.rs`, which give the kind, the span and the node of each (MIT or
+//! Apache-2.0). Which code is unreachable is type checking's (`InferenceResult::unreachable`,
+//! hir-ty's port of rustc's `Diverges`).
+
+use hir::InFile;
+use hir_def::hir::{Expr, ExprId, Statement};
+use hir_ty::{Unreachable, UnreachableAt};
+use syntax::{AstNode, SyntaxNodePtr, ast};
+
+use super::BodyCx;
+use crate::{
+    lower::{Found, Phase},
+    model::{Diag, Span},
+};
+
+pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
+    b.infer.unreachable().iter().filter_map(|it| lint(b, it)).collect()
+}
+
+fn lint(b: &BodyCx<'_, '_>, unreachable: &Unreachable) -> Option<Found> {
+    let (kind, span, at) = place(b, &unreachable.what)?;
+    let after = b.source_map.expr_or_pat_syntax(unreachable.after).ok()?;
+    let after = b.cx.span_of(after.map(|it| it.syntax_node_ptr()));
+    let message = format!("unreachable {kind}");
+    let mut diag = Diag::lint("unreachable_code", message.clone(), span.clone());
+    diag.span_label(span, message);
+    let note = unreachable.note.unwrap_or("any code following this expression is unreachable");
+    diag.span_label(after, note);
+    Some(b.lint(diag, Phase::Bodies, at))
+}
+
+/// What rustc calls what is unreachable, where it points and the node it lints at.
+fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span, InFile<SyntaxNodePtr>)> {
+    let store = b.store();
+    Some(match *what {
+        UnreachableAt::Expr(expr) => {
+            let node = b.expr_node(expr)?;
+            ("expression", b.cx.span_of(node), node)
+        }
+        UnreachableAt::Call(expr) => {
+            let node = b.expr_node(expr)?;
+            let span = match &store[expr] {
+                Expr::Call { callee, .. } => b.expr_span(*callee)?,
+                Expr::MethodCall { .. } => {
+                    let call = b.cx.syntax(node);
+                    let name = ast::MethodCallExpr::cast(call.value)?.name_ref()?;
+                    b.cx.span(InFile::new(call.file_id, name.syntax().text_range()))
+                }
+                _ => b.cx.span_of(node),
+            };
+            ("call", span, node)
+        }
+        UnreachableAt::Stmt { block, index } => {
+            let Expr::Block { statements, .. } = &store[block] else { return None };
+            let node = statement_node(b, statements.get(index as usize)?)?;
+            ("statement", b.cx.span_of(node), node)
+        }
+        UnreachableAt::Arm { match_expr, index } => {
+            let Expr::Match { arms, .. } = &store[match_expr] else { return None };
+            let body = arms.get(index as usize)?.expr;
+            let node = b.expr_node(body)?;
+            ("arm", b.cx.span_of(node), node)
+        }
+        UnreachableAt::IfBlock(if_expr) => {
+            let Expr::If { condition, then_branch, .. } = store[if_expr] else { return None };
+            ("block in `if` or `while` expression", b.expr_span(then_branch)?, b.expr_node(condition)?)
+        }
+        UnreachableAt::LetInit(let_expr) => {
+            let Expr::Let { expr, .. } = store[let_expr] else { return None };
+            let node = b.expr_node(expr)?;
+            ("block in `let` expression", b.cx.span_of(node), node)
+        }
+    })
+}
+
+/// A statement as rustc spans it: an expression statement with its `;`, a `let` with its `;`.
+fn statement_node(b: &BodyCx<'_, '_>, statement: &Statement) -> Option<InFile<SyntaxNodePtr>> {
+    let (node, is_let) = match statement {
+        Statement::Expr { expr, .. } => (b.expr_node(*expr)?, false),
+        Statement::Let { pat, .. } => (b.pat_node(*pat)?, true),
+        Statement::Item(_) => return None,
+    };
+    let syntax = b.cx.syntax(node);
+    let found = match is_let {
+        true => syntax.value.ancestors().find(|it| ast::LetStmt::can_cast(it.kind()))?,
+        false => match syntax.value.parent().filter(|it| ast::ExprStmt::can_cast(it.kind())) {
+            Some(stmt) => stmt,
+            None => syntax.value.clone(),
+        },
+    };
+    Some(InFile::new(syntax.file_id, SyntaxNodePtr::new(&found)))
+}

@@ -5,17 +5,19 @@
 
 mod format;
 mod graph;
+pub mod query;
 
 use std::fmt::Write as _;
 
 use anyhow::{Context as _, Result, bail};
 use blaze_manifest::Workspace;
 use blaze_metadata::{Asked, Read, Resolved};
+use blaze_manifest::config::schema::FeatureUnification;
 use blaze_resolve::resolver::{
-    CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets,
-    members_with_features,
+    CliFeatures, CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets,
+    ResolveBehavior, members_with_features,
 };
-use blaze_resolve::{Cfg, InternedString, PackageId, PackageIdSpec, Platform};
+use blaze_resolve::{Cfg, InternedString, PackageId, PackageIdSpec, Platform, Summary};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub use blaze_resolve::DepKind;
@@ -182,19 +184,11 @@ pub fn print_tree(
     out: &mut String,
     warn: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    let has_dev = match opts.edge_kinds.contains(&EdgeKind::Dep(DepKind::Development)) {
-        true => HasDevUnits::Yes,
-        false => HasDevUnits::No,
-    };
-    let force_all = match opts.target == Target::All {
-        true => ForceAllTargets::Yes,
-        false => ForceAllTargets::No,
-    };
     let build = blaze_metadata::Build {
         packages: &[],
         workspace: false,
         excludes: &[],
-        dev_units: has_dev == HasDevUnits::Yes,
+        dev_units: opts.edge_kinds.contains(&EdgeKind::Dep(DepKind::Development)),
     };
     let asked = Asked {
         build: Some(build),
@@ -210,85 +204,146 @@ pub fn print_tree(
         })
     };
     let printed = blaze_metadata::resolved(&asked, Some(&pick), |resolved| {
-        let Resolved { resolve, members, member_ids, cli_features, behavior, packages, .. } =
-            resolved;
-        let requested_kinds = kinds.requested();
-        // One tree per feature resolve: per package under `resolver.feature-unification =
-        // "package"`.
-        for roots in resolved.feature_resolves()? {
-            let feature_opts = FeatureOpts::new(behavior, has_dev, force_all);
-            let targets = Targets { packages, kinds };
-            let features = FeatureResolver::resolve(
-                &targets,
-                resolve,
-                &roots.members,
-                &requested_kinds,
-                feature_opts,
-            )?;
-            let mut graph = graph::build(
-                resolve,
-                &features,
-                members_with_features(&members, &roots.specs, cli_features)?,
-                kinds,
-                &requested_kinds,
-                packages,
-                opts,
-            );
-
-            let root_specs = match opts.invert.is_empty() {
-                true => roots.specs,
-                false => {
-                    opts.invert.iter().map(|p| PackageIdSpec::parse(p)).collect::<Result<_>>()?
-                }
-            };
-            let root_ids = graph::specs_to_ids(resolve, &root_specs)?;
-            let mut root_indexes = graph.indexes_from_ids(&root_ids);
-            if opts.duplicates {
-                // `-d -p foo` only shows duplicates within foo's subtree.
-                graph = graph.from_reachable(&root_indexes);
-                root_indexes = graph.find_duplicates();
-            }
-            if !opts.invert.is_empty() || opts.duplicates {
-                graph.invert();
-            }
-
-            let all_ids: Vec<PackageId> = resolve.iter().collect();
-            let pkgs_to_prune = opts
-                .pkgs_to_prune
-                .iter()
-                .map(|p| {
-                    // Said if the spec is not of the resolved graph.
-                    let spec = PackageIdSpec::parse(p)?;
-                    spec.query(&all_ids)?;
-                    Ok(spec)
-                })
-                .collect::<Result<Vec<PackageIdSpec>>>()?;
-
-            if root_indexes.is_empty() {
-                warn(
-                    "nothing to print.\n\n\
-                     To find dependencies that require specific target platforms, \
-                     try to use option `--target all` first, and then narrow your search scope accordingly.",
-                );
-                continue;
-            }
-            let printer = Printer {
-                graph: &graph,
-                format: format::Pattern::new(&opts.format)
-                    .with_context(|| format!("tree format `{}` not valid", opts.format))?,
-                symbols: if opts.unicode { &UTF8_SYMBOLS } else { &ASCII_SYMBOLS },
-                pkgs_to_prune: &pkgs_to_prune,
-                member_ids,
-                opts,
-            };
-            printer.print(root_indexes, out);
-        }
-        Ok(())
+        let input = Input {
+            resolve: resolved.resolve,
+            members: resolved.members,
+            member_ids: resolved.member_ids,
+            specs: resolved.specs,
+            cli_features: resolved.cli_features,
+            behavior: resolved.behavior,
+            unification: resolved.unification,
+            packages: resolved.packages,
+        };
+        print_resolved(&input, opts, kinds, out, warn)
     });
     for it in warned.into_inner() {
         warn(&it);
     }
     printed
+}
+
+/// A workspace resolved for `cargo tree`: blaze-metadata's (v1) or the database's ([`query`]).
+pub(crate) struct Input<'a> {
+    pub resolve: &'a blaze_resolve::Resolve,
+    pub members: blaze_resolve::resolver::Members<'a>,
+    pub member_ids: &'a [PackageId],
+    pub specs: &'a [PackageIdSpec],
+    pub cli_features: &'a CliFeatures,
+    pub behavior: ResolveBehavior,
+    pub unification: FeatureUnification,
+    pub packages: &'a FxHashMap<PackageId, Read>,
+}
+
+/// The feature resolves of `input`, as cargo's `resolve_ws_with_opts` makes them under
+/// `resolver.feature-unification`: one of the selected packages, which resolves the features
+/// of every member under `workspace`; one per selected package under `package`
+/// (blaze-metadata's `Resolved::feature_resolves`).
+fn feature_resolves<'a>(input: &Input<'a>) -> Result<Vec<(Vec<PackageIdSpec>, Vec<(&'a Summary, CliFeatures)>)>> {
+    let all: Vec<PackageIdSpec>;
+    let resolved_for = match input.unification {
+        FeatureUnification::Workspace => {
+            all = input.member_ids.iter().map(|id| id.to_spec()).collect();
+            &all[..]
+        }
+        FeatureUnification::Selected | FeatureUnification::Package => input.specs,
+    };
+    let members = members_with_features(&input.members, resolved_for, input.cli_features)?;
+    if !matches!(input.unification, FeatureUnification::Package) {
+        return Ok(vec![(input.specs.to_vec(), members)]);
+    }
+    let one = |spec: &PackageIdSpec| -> Result<(Vec<PackageIdSpec>, Vec<(&'a Summary, CliFeatures)>)> {
+        let mut narrowed = input.cli_features.clone();
+        let enabled = members.iter().filter(|(member, _)| spec.matches(member.package_id()));
+        narrowed.features = std::rc::Rc::new(enabled.flat_map(|(_, it)| it.features.iter().cloned()).collect());
+        let specs = vec![spec.clone()];
+        let members = members_with_features(&input.members, &specs, &narrowed)?;
+        Ok((specs, members))
+    };
+    input.specs.iter().map(one).collect()
+}
+
+/// The tree `opts` asks of `input`, printed into `out`; what cargo warns of goes to `warn`.
+pub(crate) fn print_resolved(
+    input: &Input<'_>,
+    opts: &Options,
+    kinds: &Kinds,
+    out: &mut String,
+    warn: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let has_dev = match opts.edge_kinds.contains(&EdgeKind::Dep(DepKind::Development)) {
+        true => HasDevUnits::Yes,
+        false => HasDevUnits::No,
+    };
+    let force_all = match opts.target == Target::All {
+        true => ForceAllTargets::Yes,
+        false => ForceAllTargets::No,
+    };
+    let Input { resolve, member_ids, cli_features, behavior, packages, .. } = *input;
+    let requested_kinds = kinds.requested();
+    // One tree per feature resolve: per package under `resolver.feature-unification =
+    // "package"`.
+    for (specs, feature_members) in feature_resolves(input)? {
+        let feature_opts = FeatureOpts::new(behavior, has_dev, force_all);
+        let targets = Targets { packages, kinds };
+        let features =
+            FeatureResolver::resolve(&targets, resolve, &feature_members, &requested_kinds, feature_opts)?;
+        let mut graph = graph::build(
+            resolve,
+            &features,
+            members_with_features(&input.members, &specs, cli_features)?,
+            kinds,
+            &requested_kinds,
+            packages,
+            opts,
+        );
+
+        let root_specs = match opts.invert.is_empty() {
+            true => specs,
+            false => opts.invert.iter().map(|p| PackageIdSpec::parse(p)).collect::<Result<_>>()?,
+        };
+        let root_ids = graph::specs_to_ids(resolve, &root_specs)?;
+        let mut root_indexes = graph.indexes_from_ids(&root_ids);
+        if opts.duplicates {
+            // `-d -p foo` only shows duplicates within foo's subtree.
+            graph = graph.from_reachable(&root_indexes);
+            root_indexes = graph.find_duplicates();
+        }
+        if !opts.invert.is_empty() || opts.duplicates {
+            graph.invert();
+        }
+
+        let all_ids: Vec<PackageId> = resolve.iter().collect();
+        let pkgs_to_prune = opts
+            .pkgs_to_prune
+            .iter()
+            .map(|p| {
+                // Said if the spec is not of the resolved graph.
+                let spec = PackageIdSpec::parse(p)?;
+                spec.query(&all_ids)?;
+                Ok(spec)
+            })
+            .collect::<Result<Vec<PackageIdSpec>>>()?;
+
+        if root_indexes.is_empty() {
+            warn(
+                "nothing to print.\n\n\
+                 To find dependencies that require specific target platforms, \
+                 try to use option `--target all` first, and then narrow your search scope accordingly.",
+            );
+            continue;
+        }
+        let printer = Printer {
+            graph: &graph,
+            format: format::Pattern::new(&opts.format)
+                .with_context(|| format!("tree format `{}` not valid", opts.format))?,
+            symbols: if opts.unicode { &UTF8_SYMBOLS } else { &ASCII_SYMBOLS },
+            pkgs_to_prune: &pkgs_to_prune,
+            member_ids,
+            opts,
+        };
+        printer.print(root_indexes, out);
+    }
+    Ok(())
 }
 
 /// The specs of the packages `packages` selects: cargo's `Packages::to_package_id_specs`.

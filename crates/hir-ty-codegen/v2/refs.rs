@@ -11,6 +11,7 @@
 //! that any of them compiles (it walks with unwinding, `ub_checks()` and debug assertions
 //! on), each check overflow checks may make, each landing pad's routines.
 
+use blaze_codegen::backend::FrontRef;
 use cranelift_codegen::ir::{self, ArgumentPurpose};
 use hir_def::{
     AdtId, CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, StaticId,
@@ -237,7 +238,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// A function of no crate of the build, by its symbol: `Recorder::import`.
     pub(super) fn symbol(&mut self, name: &str) -> Result<(), String> {
-        self.add(blaze_codegen::backend::FrontRef::Extern(name.to_owned()))
+        self.add(FrontRef::Extern(name.to_owned()))
     }
 
     /// A routine Cranelift calls itself, which no request names.
@@ -247,7 +248,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// The function of assembly `text`: `Recorder::assembly`.
     pub(super) fn assembly(&mut self, text: String) -> Result<(), String> {
-        self.add(blaze_codegen::backend::FrontRef::Function(HirInstance(Kind::Asm(text))))
+        self.add(FrontRef::Function(HirInstance(Kind::Asm(text))))
     }
 
     /// What any function may name without asking: the copies Cranelift makes calls of, and
@@ -536,6 +537,9 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             return Ok(());
         }
         let (reachable, decided) = self.reachable(body);
+        if body.coroutine.is_some() {
+            self.enter_coroutine(body)?;
+        }
         for (id, block) in body.basic_blocks.iter() {
             if !reachable.contains(&id) {
                 continue;
@@ -614,6 +618,21 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             worklist.extend(unwind.filter(|it| !resumes_only.contains(it)));
         }
         (reachable, decided.into_keys().collect())
+    }
+
+    /// `enter_coroutine`: an `async` body dropped before it ran drops what it captured.
+    fn enter_coroutine(&mut self, body: &'db MirBody<'db>) -> Result<(), String> {
+        let receiver = body.param_locals[0];
+        let Some(ty) = body.locals[receiver].ty.as_ref().builtin_deref(true) else {
+            return Err("async body without a reference to its future".to_owned());
+        };
+        let TyKind::Coroutine(_, args) = ty.kind() else {
+            return Err(format!("async body of {ty:?}"));
+        };
+        for field in args.as_coroutine().tupled_upvars_ty().tuple_fields().iter() {
+            self.drop_value(field)?;
+        }
+        Ok(())
     }
 
     /// The read-only data of each promoted local, as `promoted_constant` makes it. Its
@@ -949,9 +968,11 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let mut ty = self.operand(callee)?;
         let mut arg_tys = self.operands(rest)?;
         let tuple_ty = method_args.type_at(1);
-        if let (&[only], TyKind::Tuple(fields)) = (&arg_tys[..], tuple_ty.kind())
-            && only == tuple_ty
-        {
+        let spread = match (&arg_tys[..], tuple_ty.kind()) {
+            (&[only], TyKind::Tuple(fields)) if only == tuple_ty => Some(fields),
+            _ => None,
+        };
+        if let Some(fields) = spread {
             arg_tys = fields.iter().collect();
         }
         let mut by_ref = None;
@@ -1148,16 +1169,18 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let Some(start) = interner.lang_items().Start else {
             return Err("no `lang_start`".to_owned());
         };
-        let fn_ty =
-            |func: FunctionId, args| Ty::new_fn_def(interner, CallableDefId::FunctionId(func).into(), args);
-        let sig_of = |ty: Ty<'db>| interner.instantiate_bound_regions_with_erased(ty.fn_sig(interner));
+        let fn_ty = |func: FunctionId, args| {
+            Ty::new_fn_def(interner, CallableDefId::FunctionId(func).into(), args)
+        };
+        let sig_of =
+            |ty: Ty<'db>| interner.instantiate_bound_regions_with_erased(ty.fn_sig(interner));
         let main_ty = fn_ty(main, GenericArgs::new_from_slice(&[]));
         let returned = self.fx.normalize(sig_of(main_ty).output());
         let start_args = GenericArgs::new_from_slice(&[returned.into()]);
         let start_sig = sig_of(fn_ty(start, start_args));
         self.recorded(|fx| fx.fn_item(main_ty))?;
         let inputs: Vec<_> =
-            start_sig.inputs().iter().map(|&ty| self.fx.normalize(ty)).collect();
+            start_sig.inputs().as_slice().iter().map(|&ty| self.fx.normalize(ty)).collect();
         self.call_direct(start, start_args, &inputs, start_sig.output())
     }
 }

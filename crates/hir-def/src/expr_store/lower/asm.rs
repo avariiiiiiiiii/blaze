@@ -358,7 +358,7 @@ impl ExprCollector<'_> {
             .template_map
             .get_or_insert_with(Default::default)
             .asm_to_captures
-            .insert(idx, mappings);
+            .push((idx, mappings));
         idx
     }
 }

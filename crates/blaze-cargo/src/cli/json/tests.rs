@@ -44,6 +44,9 @@ fn compiler_artifact() {
         filenames: vec!["/w/foo/target/debug/foo".to_owned()],
         executable: Some("/w/foo/target/debug/foo".to_owned()),
         fresh: false,
+        runner: Vec::new(),
+        env: vec![("CARGO_PKG_NAME".to_owned(), "foo".to_owned())],
+        harness: true,
     };
     let expected = format!(
         r#"{{"reason":"compiler-artifact","package_id":"path+file:///w/foo#0.1.0","manifest_path":"/w/foo/Cargo.toml","target":{TARGET},"profile":{{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":false}},"features":["default"],"filenames":["/w/foo/target/debug/foo"],"executable":"/w/foo/target/debug/foo","fresh":false}}"#
@@ -135,6 +138,7 @@ fn a_compiler_message_as_cargo_writes_it_again() {
         package_id: format!("path+file://{root}#0.1.0"),
         manifest_path: format!("{root}/Cargo.toml"),
         target: bin_target(&root),
+        test: false,
     };
     let rendered = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
@@ -166,6 +170,7 @@ fn a_compiler_message_in_color_is_rustcs_as_it_wrote_it() {
         package_id: format!("path+file://{root}#0.1.0"),
         manifest_path: format!("{root}/Cargo.toml"),
         target: bin_target(&root),
+        test: false,
     };
     let rendered = "\u{1b}[33mwarning\u{1b}[0m\n";
     let mut sources = Sources::new(std::path::Path::new(&root));

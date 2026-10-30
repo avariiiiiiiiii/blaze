@@ -12,6 +12,8 @@
 ---
 Applied by the coordinator, 16:46.
 
+> applied: `crossbeam-deque = "0.8.6"` is in the root `[workspace.dependencies]` (by the coordinator, 16:46).
+
 ## 2. usercode: a `blaze_core::Confine` over the sandbox
 
 - What: implement `blaze_core::Confine` (`crates/blaze-core/src/lib.rs`) over the sandbox in
@@ -59,3 +61,110 @@ survived). A journal that cuts a torn tail and appends after it must not count t
 until a sync after it completes; tests that relied on the old rule may now fail on some seeds.
 
 > applied: note only, for vfs, store and db.
+
+## From concurrency: lock audit (2026-10-29)
+
+Audited against `docs/v2/plan/design/concurrency.md`. The plane (`plane.rs`, `machine.rs`,
+`admission.rs`) takes no lock. The pool takes none per task: `pool.rs:76` `stray` is locked
+only when a job's `done` panics. The per-query locks are all in `pump.rs`, and they are on
+every memo miss: `blaze-query`'s `single` (`crates/blaze-query/src/lib.rs:1139`) calls
+`Flights::get_or_run` for each key a view's `results` does not have yet, including each green
+check on a warm build.
+
+1. **`crates/blaze-graph/src/pump.rs:105` `WAITS`, one process-wide `Mutex<Waits>` (a
+   `BTreeMap` of wait edges).** It is taken at `:309` in `Ending::end` on *every* run's end,
+   even a run with no waiters: the loop over `waiters` is empty, but the lock comes first. That
+   contradicts the module doc (`:12-13`, "nothing of a run that waits for nobody takes it").
+   It is also taken at `:60` and `:71` around every pumped job, and at `:267` for every wait.
+   This breaks two rules: a shared write per query ("Writers shard by hash"), and a single
+   global lock on the hot path. Every core serializes on one cache line at each query end.
+   Fix, first step: in `end`, take `WAITS` only when `waiters` is non-empty.
+   Fix, the real one: store edges per task, not in a global map. Give each task's `on` and
+   `above` a home in an atomic word of a slot table indexed by task id (per-worker slots,
+   padded to 128 bytes). A waiter publishes its `on` edge with a SeqCst store, then walks the
+   chain with acquire loads. If the walk reaches itself, it retracts the edge. When two waits
+   close one cycle at once, only the task with the largest id in the cycle gives way, so
+   exactly one gives way. Neither a wait nor a pump then takes a lock.
+2. **`pump.rs:36`, `:202`, `:213`, `:250`: `Flights` has a fixed 64 shards, indexed by
+   `key.0[0] % 64`.** Every `get_or_run` takes a shard lock twice, in `join` (`:254`) and
+   `Ending::end` (`:300`). It also allocates an `Arc<Flight>` holding a `Mutex` (`:278-281`)
+   for every run, on the global allocator. This breaks "shard count a power of two, at least
+   4 times the core count, chosen at startup". The shard lock is held only to claim, never
+   while running, which follows the rule.
+   Fix: size the shards in `Flights::new` from the topology, as
+   `(4 * cpus).next_power_of_two()`, and index by masked key bits. Better still, drop the
+   shards: use an open-addressed claim table keyed by the key's hash. A claim is a CAS of the
+   slot's state word from empty to running(task id). Waiters push onto a lock-free list in the
+   slot. The value is published once (see item 3), and the slot is freed at the plane's task
+   boundary. Then no `Arc` or `Mutex` is allocated per run.
+3. **`pump.rs:160` `Flight::state: Mutex<State<V>>`, polled by waiters.** `outcome()` (`:166`)
+   and `ended()` (`:174`) lock it on every spin of `wait` (`:331-351`, up to `SPINS = 64`
+   spins, then on every park check). So readers write the lock word of the runner's flight,
+   which breaks "A read writes no shared memory". Fix: keep the state in an `AtomicU8`
+   (running, done or cancelled), store the value in a `OnceLock<V>` set before a release store
+   of `done`, and have waiters acquire-load it. The waiter list then needs the lock-free list
+   from item 2, or a short claim lock taken only to push a waiter and never by a poll.
+4. **`crates/blaze-graph/src/arena.rs:30`, `:37`, `:68`: `HELD` is 64 fixed shards of
+   `AtomicI64`, assigned round-robin.** `Counting` does a relaxed `fetch_add` on one of them
+   for *every* allocation in the daemon. With more than 64 threads, threads share a line, and
+   the count does not scale with the machine. This is an atomic, not a lock, but it breaks the
+   fixed-64 rule on the hottest write path there is. Fix: keep the count in the thread's own
+   slot, in a startup-sized array of 128-byte-padded counters, one per thread slot (the
+   thread-local `NET` already holds it). Have `held()` sum the slots; it runs at admission and
+   in `machine_budget`, not per allocation.
+5. **`arena.rs:338` `Cap::state: Mutex<State>` plus `Condvar`.** Every `Bump` chunk grow under
+   a cap (`:280`, `reserve` at `:427-475`) and every `Grant` drop (`:509-525`) takes one
+   process-wide lock. Each drop also calls `notify_all`, which wakes every waiter. A full cap
+   blocks the *worker thread* in `Condvar::wait` (`:474`), which breaks "No thread waits on
+   another's work". Nothing outside `arena.rs` builds a `Cap` or a `Bump::under` yet, but this
+   is the designed per-task arena path. Fix: keep `held` in an `AtomicU64` and reserve with a
+   CAS loop while `held + bytes <= limit`, with no lock. Keep `by_holder` per worker slot.
+   Only an over-limit reserve takes the slow path, and it should hand the task back to the
+   plane to park (return "would wait") instead of blocking the thread.
+6. **`crates/blaze-core/src/kqueue.rs:202`, `:907-909` (the macOS driver) and
+   `crates/blaze-core/src/threads.rs:50`, `:155-157`: the file-effect queue is an
+   `Arc<Mutex<mpsc::Receiver<Effect>>>`.** An idle IO thread holds the mutex *while blocked
+   in `recv`*. So every file effect (`ReadAll`, `Read`, `Stat`, `Map`, ...) is handed off
+   through one lock, and the other IO threads queue on the mutex rather than on the channel.
+   This is a single global lock on every file read the macOS driver does. Fix: use
+   `crossbeam_channel`'s MPMC `Receiver`, cloned into each thread, which is lock-free. Add
+   `crossbeam-channel.workspace = true` to `crates/blaze-core/Cargo.toml` (already a
+   workspace dependency, used by `blaze-graph`). Or give each thread its own queue and submit
+   round-robin.
+7. **For codegen's finding on `hir-ty-codegen/v2/frontend.rs` (in `codegen.md`): expose this
+   thread's worker index.** `pool.rs` keeps `Local::index` but exports only `group()`. Add
+   `pub fn worker() -> Option<u32>` beside `group()` (`pool.rs:98`) so per-worker tables can
+   be indexed without a lock.
+
+> forwarded to core: every finding is in lane core's own `crates/blaze-graph/`; lane core is still running.
+
+## From speed-link-edge-remote: two socket effects for the remote tier (2026-10-29)
+
+For `crates/blaze-cas/src/remote.rs` (the laptop/VM read-through tier). The before and after
+numbers are in `docs/v2/plan/lanes/store/speed-link-edge-remote.md`, and the rest of that work
+is in `v2/requests/concurrency.md`. These are the two copies left there that only
+`blaze-core`'s effect API can remove.
+
+K1. **`Effect::SendMapped { conn: Conn, mapping: Mapping, range: std::ops::Range<u64>, tag: Tag }`,
+    completing `Done::Sent`.**
+    - Sends `mapping.0.as_ref()[range]` on `conn` without copying it into a `Vec`:
+      - Linux: io_uring `IORING_OP_SEND_ZC` over the mapped range, or `splice`/`sendfile`
+        from the pack's file;
+      - macOS: `sendfile(2)` (kqueue driver);
+      - threads driver: `write` straight from the slice.
+    - The driver holds the `Mapping` clone until the send completes. That clone is the
+      lifetime guarantee.
+    - Today the server copies every served byte from the pack into a frame `Vec` for
+      `Effect::Send`. With this, a `Form::Raw` record is served with no user-space copy: the
+      server sends a small header `Vec`, then a `SendMapped` of the value's range, in order.
+    - Sim: deliver the bytes as `Send` does.
+K2. **`Effect::RecvInto { conn: Conn, buffer: Vec<u8>, most: usize, tag: Tag }`, completing
+    `Done::Read(buffer)` with up to `most` bytes appended after `buffer`'s existing contents.**
+    - Empty appended means hung up, as for `Recv`.
+    - Today each `Recv` returns a fresh `Vec`, and the client copies it into its frame buffer,
+      so a value spread over many receives is copied twice.
+    - With this, the client passes its buffer (reserved to the frame's length) and gets it
+      back: one copy, kernel to final buffer, and no allocation per receive.
+    - io_uring: a plain `recv` into `buffer.spare_capacity_mut()`. Multishot recv with provided
+      buffers (store's request 6) still suits small asks on the server side.
+    - Sim: append the delivered prefix.

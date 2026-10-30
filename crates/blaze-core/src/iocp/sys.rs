@@ -13,7 +13,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
+    Foundation::{ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
     System::IO::{
         CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY,
         PostQueuedCompletionStatus,
@@ -79,6 +79,16 @@ pub(super) fn check(ok: windows_sys::core::BOOL) -> io::Result<()> {
     match ok {
         0 => Err(io::Error::last_os_error()),
         _ => Ok(()),
+    }
+}
+
+/// Ok where an overlapped call is in flight: it returned true, or false with
+/// `ERROR_IO_PENDING`. Either way its completion comes to the port, as no handle of the
+/// driver's skips the port on success.
+pub(super) fn pending(ok: windows_sys::core::BOOL) -> io::Result<()> {
+    match ok != 0 || last() == ERROR_IO_PENDING {
+        true => Ok(()),
+        false => Err(io::Error::last_os_error()),
     }
 }
 

@@ -271,3 +271,145 @@ are still accepted and mean the same as without `gc;` (`hir-ty/src/next_solver/*
    switches `Edit::token` to it.
 
 > forwarded to format: format-tree's `crates/syntax-tree/`, inside lane format.
+
+## format-tree
+
+1. **Drop the green twin from an outline test** — `crates/syntax-bridge/src/tests.rs`
+   (`an_outline_has_the_token_trees_of_a_full_parse`). Green trees are gone from
+   `syntax-tree` (format-edit, decisions.md: rowan goes entirely), so `SyntaxNode::new_root`
+   and `SyntaxNode::green` no longer exist. Delete line 197,
+   `let green = SyntaxNode::new_root(full.green().to_owned());`, and line 222,
+   `assert_eq!(token_tree(&green), expected, "{path}");`. Nothing else changes: the test still
+   compares the outline with the full parse, which is what it is for (`SyntaxNode` stays
+   imported: the test's `in_full` closure uses it). Why: without this, `syntax-bridge`'s
+   tests don't build.
+2. **`expand_lazy` returns its errors** — `crates/syntax/src/parsing.rs` (format-parse).
+   format-parse's request 3 has landed in `syntax-tree`: `Expand` is now
+   `fn(SyntaxKind, &str, u32) -> (FlatTree, Vec<(TextRange, Box<str>)>)`, and
+   `FlatTree::part_errors(at)` gives a lazy node's errors, absolute. `syntax` doesn't build
+   until `expand_lazy` matches. The least edit: make it return
+   `(FlatTree, Vec<(TextRange, Box<str>)>)`, bind `errors` instead of `_errors` from
+   `build_tree`, and end with
+   `(tree, errors.into_iter().map(|it| (it.range(), it.to_string().into())).collect())`.
+   The ranges must be relative to `text` (the part's own text), which is what `build_tree`
+   gives over `Arc::from(text)`. The `ILLEGAL_FLOAT` error, whose position is a token count
+   in the file and not an offset, is format-parse's call, as in `body_parser_errors`. Then
+   `errors_of` can read `tree.part_errors(at)` (parsing the part if needed) in place of
+   `body_parser_errors`.
+
+## From concurrency: lock audit (2026-10-29)
+
+Audited against `docs/v2/plan/design/concurrency.md` by `concurrency-audit-front` (read-only).
+Lookups in both interners take no lock, which is right. The findings are on the write side.
+
+1. **`crates/intern/src/arena.rs:26` (`SHARDS = 1 << 6`) and `:47` (`Shard.state: Mutex<State>`).**
+   This is the store under every `Interned::new_gc` (hir-ty's `Ty`, `Const`, `Region`,
+   predicates; `next_solver/ty.rs:84` and the others) and `Symbol::intern`. That's a hot write path during
+   type checking. The shard count is fixed at 64, which breaks "a power of two ≥ 4× the core
+   count, chosen at startup". Also, a `Vacant` holder grows the shard's table while holding the
+   lock, copying every entry (`table_for_one_more`, :249-277), so the other inserters to that shard
+   wait out an O(n) copy. Instead, size `Store.shards` when the store is first made (the stores are
+   lazily initialized statics, so `available_parallelism() * 4`, next power of two, is known by
+   then) and derive `SHARD_BITS` from that. With more shards each table is smaller, which also
+   shortens the copy done under the lock.
+   Status: done by speed-span (`crates/intern/src/arena.rs`: shards from the core count, the
+   lock a named `InsertLock`; docs/v2/plan/lanes/format/speed-span.md).
+2. **`crates/blaze-ids/src/lib.rs:210` (`SHARDS = 64`) and `:224` (`Shard.lock: Mutex<u32>`).**
+   It has the same fixed count. On top of that, `Interner::intern` runs the caller's `value()` with
+   the shard locked (:340): that's computing under a shard lock, where the rule is "held only to
+   claim a slot". Every insert from every shard also writes two process-wide counters,
+   `next.fetch_add` (:335) and `published.fetch_add` (:347), so all writers contend on one line.
+   Instead: pick the count at startup as in 1. After the lock-free `find` misses, compute `value()`
+   *before* locking, then lock only to probe again and insert, dropping the loser's value. Hand out
+   indices from per-worker blocks (claim 64 at a time from `next`), and keep `published` per
+   shard, summed by `len()`. There are no users outside the crate yet, so now is the cheap time
+   to change it.
+
+Judged off the hot path: `syntax-tree/src/flat.rs:1167` (`PARTS`, tests only). The format files
+in `hir-def` (`expr_store*`, `hir*`, `item_tree*`) and `syntax`, `span`, `tt` and `mbe` hold no locks.
+
+## format-hir: expressions and patterns become columns (to lanes db, items, codegen)
+
+From format-hir, 2026-10-29. Per the lead's addendum and `docs/v2/plan/design/data.md`, the
+`ExpressionStore`'s expressions and patterns are now a `u8` kind and a `u32` data column each
+(at most 12 bytes per expression), with child lists as CSR ranges and cold values in side
+tables. There is no `Arena<Expr>` any more, so `impl Index<ExprId>` / `Index<PatId>` for
+`ExpressionStore` are gone. Readers get a borrowed view, `Expr<'a>` / `Pat<'a>`, with today's
+variant and field names. Full contract: `~/restart-2026-10-28/briefs/v2/format-hir-columns-api.md`.
+About 290 sites by a rough count: hir-ty 72, hir-ty-mir 89, hir-ty-borrowck 87, hir 35,
+hir-ty-codegen 6, and 3 in hir-def outside format's paths (`resolver.rs`, `upvars.rs`, ...).
+
+The rule, applied mechanically:
+1. For an expression, `store[e]`, `&store[e]`, `body[e]` and `self.body[e]` become
+   `store.expr(e)` (`body.expr(e)` through `Deref`). For a pattern, `store.pat(p)`.
+2. Fields bind by value for ids, `Option`s of ids and `Copy` enums: `*callee` becomes
+   `callee`, and `Some(*e)` becomes `Some(e)`. List fields are `&[T]` as before (`args.iter()`,
+   `args.len()` and `&args[..]` are unchanged). `Name`, `Path`, `Literal`, `OffsetOf` and
+   `InlineAsm` fields are `&T` as before. `generic_args.as_deref()` becomes `generic_args`,
+   which is now an `Option<&GenericArgs>`.
+3. A function taking `&Expr` / `&Pat` takes `Expr<'_>` / `Pat<'_>`. `store.exprs()` yields
+   `(ExprId, Expr<'_>)`. `Idx<Expr>` written out becomes `ExprId`.
+4. Nothing outside hir-def builds an `Expr` or a `Pat`.
+
+Examples from `crates/hir-ty/src/infer/expr.rs`:
+
+```rust
+// before (line 336)
+let expr = &self.store[tgt_expr];
+// after
+let expr = self.store.expr(tgt_expr);
+```
+
+```rust
+// before (line 446)
+Expr::Call { callee, args, .. } => self.infer_call(tgt_expr, *callee, args, expected),
+// after
+Expr::Call { callee, args, .. } => self.infer_call(tgt_expr, callee, args, expected),
+```
+
+```rust
+// before (line 447)
+Expr::MethodCall { receiver, args, method_name, generic_args } => self
+    .infer_method_call(tgt_expr, *receiver, args, method_name, generic_args.as_deref(), expected),
+// after
+Expr::MethodCall { receiver, args, method_name, generic_args } => self
+    .infer_method_call(tgt_expr, receiver, args, method_name, generic_args, expected),
+```
+
+Owners: lane db (`hir-ty`, `hir-ty-borrowck`, and hir-def's `resolver.rs`/`upvars.rs`), lane
+items (`hir`), lane codegen (`hir-ty-mir`, `hir-ty-codegen`). These land together with the
+format-hir change. The item tree's own migration follows under "## format-hir-tree".
+
+## speed-types: `ContentId::of_many` and a context key per domain (`crates/blaze-ids/src/lib.rs`)
+
+From `speed-types` (blaze-items' speed pass). `blaze-items` already calls
+`ContentId::of_many` (`key.rs` `hash_all`, `index.rs` `name_hashes`, `form.rs`
+`Form::finish_many`), so **it does not build until this lands**. The request was in
+`v2/requests/items.md` and `store.md` (5) with "forwarded to format", but never here.
+
+1. **`ContentId::of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId>`**, equal to
+   `inputs.iter().map(|it| ContentId::of(domain, it)).collect()` on every CPU path. The first
+   version can be exactly that map over one shared context key (2 below), which already
+   removes one compression per input. The SIMD version hashes up to 16 inputs per pass
+   (AVX-512; 8 AVX2, 4 NEON/SSE4.1). `blake3::platform::Platform::hash_many` needs every
+   input to be the same whole number of blocks, and items' inputs are 40 to 200 bytes of
+   different lengths, so it needs a per-lane block length: group by block count, run the
+   full blocks through `hash_many`, and finish each lane's last block with its own length. A
+   differential test against `ContentId::of` per input, over the empty input, 1, 63, 64, 65,
+   1024 and 1025 bytes, mixed in one call.
+2. **One context key per domain, not one `new_derive_key` per `Hasher::new`.** `blake3` 1.8.7
+   (our lock) has `blake3::hazmat::hash_derive_key_context(context) -> ContextKey` and
+   `blake3::hazmat::HasherExt::new_from_context_key(&ContextKey)`. Together they equal
+   `Hasher::new_derive_key(context)` bit for bit, with the context's compression done once.
+   - `Hasher::new(domain)` looks the key up in a table keyed by the `&'static str`'s address:
+     an append-only, open-addressed array of `(ptr, len, key)` slots published with one
+     release store (concurrency.md: no lock on a read). Then it calls `new_from_context_key`.
+   - Better still, a `pub struct Domain { name: &'static str, key: OnceLock<ContextKey> }`
+     made by `const fn Domain::new(name)`, with `Hasher::of(&'static Domain)` and
+     `ContentId::of_domain`. Callers' `pub const X_DOMAIN: &str` would become
+     `pub static X: Domain`, so the key is one acquire load. Items would move to it in the
+     same change.
+   - Why: items makes millions of hashes of 40 to 200 bytes (a key per item, two per form, one
+     per fact, component and name). Each costs two to four compressions today, and the
+     derive-key one is 25 to 50% of the total. A test: `Hasher::new(d)` equals
+     `blake3::Hasher::new_derive_key(d)` over several domains.

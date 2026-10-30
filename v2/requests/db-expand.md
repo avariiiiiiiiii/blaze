@@ -83,6 +83,7 @@ parses every dependency file it checks, which is what is parsed today.
 
 > forwarded to codegen: the three `crates/blaze-engine/src/lib.rs` changes (`declared_in`, `home_in_rustcs`, `Declared::in_scope`).
 > forwarded to items: `method_resolution.rs` `impl_holders` and `opaques.rs` are items' files in `crates/hir-ty/src/` (crates.md), not db-ty's.
+> forwarded to coordinator: lane items is DONE without it, and it is items' algorithm, not an interface type. `impl_holders` already lexes a dependency's file first (`holds_impl` over `impls_in_bodies`). Still open: `macros_writing_impls` counts no procedural macro (nor an attribute macro, which `impls_in_bodies` never sees), so an impl a proc macro writes in a dependency's function body is missed where rustc has it; and `opaques.rs:324` has no prefilter.
 > forwarded to format: the outline's per-body words or token range for `demand::may_declare_roots`.
 
 ## Inputs keyed by content: callers outside base-db (from `db-expand-inputs`)
@@ -156,6 +157,7 @@ its ID would let a stale result be reused.
 > applied: `crates/ide-db/src/lib.rs`: `RootDatabase::set_env` calls `krate.set_env(self, env)` (the `salsa::Setter` import is gone); `RootDatabase` and hir-ide's `TestDB` forward `set_appended_root_module` and `set_view_root` to `Files`. hir-def's tests (lines 878, 887) already call `db.set_appended_root_module`.
 > forwarded to codegen: `crates/blaze-engine/src/{doctest.rs,consteval.rs,borrowck.rs,lib.rs}`'s setter calls, and `crates/hir-ty-codegen/v2/tests/db.rs`, which lacks both new methods.
 > forwarded to items: `crates/blaze-items/src/tests/db.rs` is items' (`crates/blaze-items/`), not the coordinator's; it lacks both new methods.
+> applied: lane items is DONE; `crates/blaze-items/src/tests/db.rs` forwards `set_appended_root_module` and `set_view_root` to `Files`, as hir-ide's `TestDB` does.
 > forwarded to coordinator: `crates/blaze-doc/src/lib.rs:203` (blaze-doc is the coordinator's, not among the paths `requests` applies).
 
 ## `Hash` for the values of db-expand's `lru` queries (db-expand, for format)
@@ -238,4 +240,5 @@ section above.
 > forwarded to db: `RootDatabase::run_all` passes `&RootDatabase` to pool jobs, so it compiles only once `salsa::Storage` (its `ZalsaLocal`) is `Sync`: db's, as db-expand's report says.
 > forwarded to diagnostics: `crates/blaze-diagnostics/src/tests/db.rs` still has `fork` and no `run_all`.
 > forwarded to items: `crates/blaze-items/src/tests/db.rs` has no `run_all`.
+> applied: lane items is DONE; `crates/blaze-items/src/tests/db.rs` runs `run_all` in order on the calling thread, as asked.
 > forwarded to codegen: `crates/hir-ty-codegen/v2/tests/db.rs` has no `run_all`.

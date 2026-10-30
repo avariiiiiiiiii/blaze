@@ -416,7 +416,7 @@ fn write_method(
     name: NameHash,
 ) -> Result<(), Unhashable> {
     let mut inherent = Vec::new();
-    for &(_, imp) in inherent_impls_of(db, self_ty, ()) {
+    for (_, imp) in inherent_impls_of(db, self_ty, ()).iter() {
         let items = named(db, &imp.impl_items(db).items, name)?;
         if !items.is_empty() {
             inherent.push((hash::interface_hash(db, ItemId::Impl(imp))?.0, items));
@@ -424,7 +424,7 @@ fn write_method(
     }
     inherent.sort_unstable();
     let mut traits = Vec::new();
-    for &(_, trait_) in traits_with(db, name, ()) {
+    for (_, trait_) in traits_with(db, name, ()).iter() {
         let items = named(db, &trait_.trait_items(db).items, name)?;
         traits.push((items, implements_value(db, IMPLEMENTS, trait_, self_ty)?));
     }
@@ -478,7 +478,7 @@ fn write_const_value(
         MemoryMap::Complex(map) => {
             h.part(b"complex");
             let mut blocks: Vec<(usize, &[u8])> =
-                map.memory.iter().map(|(&at, bytes)| (at, &**bytes)).collect();
+                map.memory.iter().map(|(&at, bytes)| (at, bytes)).collect();
             blocks.sort_unstable_by_key(|&(at, _)| at);
             h.update(&(blocks.len() as u64).to_le_bytes());
             for (at, bytes) in blocks {
@@ -494,18 +494,11 @@ fn write_const_value(
                     .update(&(it.size as u64).to_le_bytes())
                     .id(&key::item_key(db, ItemId::Static(it.id)).0);
             }
-            // Vtable ids start past an offset `VTableMap` keeps to itself, and are dense
-            // from there.
-            let mut vtables = Vec::new();
+            let mut vtables = Vec::with_capacity(map.vtable.tys().len());
             if !map.vtable.is_empty() {
-                let mut id = 0;
-                while map.vtable.ty(id).is_err() {
-                    id += 1;
-                }
-                h.update(&(id as u64).to_le_bytes());
-                while let Ok(ty) = map.vtable.ty(id) {
+                h.update(&(hir_ty::mir::VTableMap::FIRST_ID as u64).to_le_bytes());
+                for ty in map.vtable.tys() {
                     vtables.push(ty_hash(db, owner, ty)?);
-                    id += 1;
                 }
             }
             h.update(&(vtables.len() as u64).to_le_bytes());
@@ -621,7 +614,7 @@ fn write_coherence(db: &dyn HirDatabase, h: &mut Hasher, imp: ImplId) -> Result<
             match self_ty {
                 Some(self_ty) => h.id(&implements_value(db, IMPLEMENTS, trait_, self_ty)?),
                 None => {
-                    let all = trait_impls(db, trait_).iter().map(|it| (it.key, it.imp));
+                    let all = trait_impls(db, trait_).all().iter();
                     h.part(b"blanket").id(&entry(db, all)?.value())
                 }
             };
@@ -633,7 +626,7 @@ fn write_coherence(db: &dyn HirDatabase, h: &mut Hasher, imp: ImplId) -> Result<
                 Some(self_ty) => {
                     let all = inherent_impls_of(db, self_ty, ())
                         .iter()
-                        .map(|&(key, it)| (key, AnyImpl::Impl(it)));
+                        .map(|(key, it)| (key, AnyImpl::Impl(it)));
                     h.update(&[1]).id(&entry(db, all)?.value())
                 }
                 None => h.update(&[0]),

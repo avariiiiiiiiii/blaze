@@ -14,11 +14,23 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blake3.workspace = true
 postcard.workspace = true
+ra-ap-rustc_lexer.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
+serde_json.workspace = true
+
+# The verified copies the native expanders are (`src/native/verified.rs`).
+native-proc-macro.workspace = true
+native-proc-macro2.workspace = true
+native-serde-derive.workspace = true
+native-thiserror-impl-1.workspace = true
+native-thiserror-impl-2.workspace = true
+native-tokio-macros.workspace = true
 
 base-db.workspace = true
+intern.workspace = true
 blaze-cas.workspace = true
 blaze-core.workspace = true
 blaze-ids.workspace = true

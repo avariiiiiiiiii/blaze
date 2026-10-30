@@ -5,7 +5,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 pub use BoundRegionConversionTime::*;
-use ena::unify as ut;
 use hir_def::{GenericParamId, TraitId};
 use opaque_types::{OpaqueHiddenType, OpaqueTypeStorage};
 use region_constraints::{RegionConstraintCollector, RegionConstraintStorage};
@@ -21,12 +20,13 @@ use rustc_type_ir::{
 };
 use rustc_type_ir::{
     Upcast,
-    solve::{NoSolution, inspect},
+    solve::{NoSolution, VisibleForLeakCheck, inspect},
 };
 use snapshot::undo_log::InferCtxtUndoLogs;
 use tracing::{debug, instrument};
 use traits::{ObligationCause, PredicateObligations};
-use unify_key::{ConstVariableValue, ConstVidKey};
+use union_find::UnionFind;
+use unify_key::ConstVariableValue;
 
 pub use crate::next_solver::infer::traits::ObligationInspector;
 use crate::{
@@ -62,6 +62,7 @@ pub(crate) mod snapshot;
 pub mod traits;
 mod type_variable;
 mod unify_key;
+mod union_find;
 
 /// `InferOk<'db, ()>` is used a lot. It may seem like a useless wrapper
 /// around `PredicateObligations`, but it has one important property:
@@ -78,10 +79,6 @@ pub struct InferOk<'db, T> {
 }
 pub type InferResult<'db, T> = Result<InferOk<'db, T>, TypeError<DbInterner<'db>>>;
 
-pub(crate) type UnificationTable<'a, 'db, T> = ut::UnificationTable<
-    ut::InPlace<T, &'a mut ut::UnificationStorage<T>, &'a mut InferCtxtUndoLogs<'db>>,
->;
-
 fn iter_idx_range<T: From<u32> + Into<u32>>(range: Range<T>) -> impl Iterator<Item = T> {
     (range.start.into()..range.end.into()).map(Into::into)
 }
@@ -92,21 +89,20 @@ fn iter_idx_range<T: From<u32> + Into<u32>>(range: Range<T>) -> impl Iterator<It
 /// call to `start_snapshot` and `rollback_to`.
 #[derive(Clone)]
 pub struct InferCtxtInner<'db> {
-    pub(crate) undo_log: InferCtxtUndoLogs<'db>,
+    pub(crate) undo_log: InferCtxtUndoLogs,
 
-    /// We instantiate `UnificationTable` with `bounds<Ty>` because the types
-    /// that might instantiate a general type variable have an order,
-    /// represented by its upper and lower bounds.
+    /// The type variables: which are equal, which are related by subtyping, and the known
+    /// type of each set.
     pub(crate) type_variable_storage: type_variable::TypeVariableStorage<'db>,
 
     /// Map from const parameter variable to the kind of const it represents.
-    pub(crate) const_unification_storage: ut::UnificationTableStorage<ConstVidKey<'db>>,
+    pub(crate) const_unification_storage: UnionFind<ConstVid, ConstVariableValue<'db>>,
 
     /// Map from integral variable to the kind of integer it represents.
-    pub(crate) int_unification_storage: ut::UnificationTableStorage<IntVid>,
+    pub(crate) int_unification_storage: UnionFind<IntVid, IntVarValue>,
 
     /// Map from floating variable to the kind of float it represents.
-    pub(crate) float_unification_storage: ut::UnificationTableStorage<FloatVid>,
+    pub(crate) float_unification_storage: UnionFind<FloatVid, FloatVarValue>,
 
     /// Tracks the set of region variables and the constraints between them.
     ///
@@ -187,43 +183,43 @@ impl<'db> InferCtxtInner<'db> {
         &self,
         vid: TyVid,
     ) -> Option<&type_variable::TypeVariableValue<'db>> {
-        // Uses a read-only view of the unification table, this way we don't
-        // need an undo log.
-        self.type_variable_storage.eq_relations_ref().try_probe_value(vid)
+        // Reads the table without path halving, so a shared borrow is enough.
+        self.type_variable_storage.try_probe_value(vid)
     }
 
     #[inline]
     fn type_variables(&mut self) -> type_variable::TypeVariableTable<'_, 'db> {
-        self.type_variable_storage.with_log(&mut self.undo_log)
+        self.type_variable_storage.table()
     }
 
     #[inline]
     pub(crate) fn opaque_types(&mut self) -> opaque_types::OpaqueTypeTable<'_, 'db> {
-        self.opaque_type_storage.with_log(&mut self.undo_log)
+        let in_snapshot = self.undo_log.in_snapshot();
+        self.opaque_type_storage.table(in_snapshot)
     }
 
     #[inline]
-    pub(crate) fn int_unification_table(&mut self) -> UnificationTable<'_, 'db, IntVid> {
-        tracing::debug!(?self.int_unification_storage);
-        self.int_unification_storage.with_log(&mut self.undo_log)
+    pub(crate) fn int_unification_table(&mut self) -> &mut UnionFind<IntVid, IntVarValue> {
+        &mut self.int_unification_storage
     }
 
     #[inline]
-    pub(crate) fn float_unification_table(&mut self) -> UnificationTable<'_, 'db, FloatVid> {
-        self.float_unification_storage.with_log(&mut self.undo_log)
+    pub(crate) fn float_unification_table(&mut self) -> &mut UnionFind<FloatVid, FloatVarValue> {
+        &mut self.float_unification_storage
     }
 
     #[inline]
-    fn const_unification_table(&mut self) -> UnificationTable<'_, 'db, ConstVidKey<'db>> {
-        self.const_unification_storage.with_log(&mut self.undo_log)
+    fn const_unification_table(&mut self) -> &mut UnionFind<ConstVid, ConstVariableValue<'db>> {
+        &mut self.const_unification_storage
     }
 
     #[inline]
     pub fn unwrap_region_constraints(&mut self) -> RegionConstraintCollector<'db, '_> {
+        let in_snapshot = self.undo_log.in_snapshot();
         self.region_constraint_storage
             .as_mut()
             .expect("region constraints already solved")
-            .with_log(&mut self.undo_log)
+            .collector(in_snapshot)
     }
 }
 
@@ -351,9 +347,7 @@ impl<'db> InferCtxtBuilder<'db> {
     }
 
     pub fn build(&mut self, typing_mode: TypingMode<'db>) -> InferCtxt<'db> {
-        // We do not allow creating an InferCtxt for an Interner without a crate, because this means
-        // an interner without a crate cannot access the cache, therefore constructing it doesn't need
-        // to reinit the cache, and we construct a lot of no-crate interners.
+        // Solving needs the crate's trait environment and solver cache.
         self.interner.expect_crate();
         let InferCtxtBuilder { interner } = *self;
         InferCtxt {
@@ -633,7 +627,11 @@ impl<'db> InferCtxt<'db> {
 
     #[instrument(skip(self), level = "debug")]
     pub fn sub_regions(&self, a: Region<'db>, b: Region<'db>) {
-        self.inner.borrow_mut().unwrap_region_constraints().make_subregion(a, b);
+        self.inner.borrow_mut().unwrap_region_constraints().make_subregion(
+            a,
+            b,
+            VisibleForLeakCheck::Yes,
+        );
     }
 
     /// Processes a `Coerce` predicate from the fulfillment context.
@@ -749,7 +747,6 @@ impl<'db> InferCtxt<'db> {
             .borrow_mut()
             .const_unification_table()
             .new_key(ConstVariableValue::Unknown { span, universe })
-            .vid
     }
 
     pub fn next_const_var_in_universe(&self, universe: UniverseIndex, span: Span) -> Const<'db> {
@@ -889,7 +886,7 @@ impl<'db> InferCtxt<'db> {
     pub fn has_opaques_with_sub_unified_hidden_type(&self, ty_vid: TyVid) -> bool {
         let ty_sub_vid = self.sub_unification_table_root_var(ty_vid);
         let inner = &mut *self.inner.borrow_mut();
-        let mut type_variables = inner.type_variable_storage.with_log(&mut inner.undo_log);
+        let mut type_variables = inner.type_variable_storage.table();
         inner.opaque_type_storage.iter_opaque_types().any(|(_, hidden_ty)| {
             if let TyKind::Infer(InferTy::TyVar(hidden_vid)) = hidden_ty.ty.kind() {
                 let opaque_sub_vid = type_variables.sub_unification_table_root_var(hidden_vid);
@@ -1002,7 +999,7 @@ impl<'db> InferCtxt<'db> {
     }
 
     pub fn root_const_var(&self, var: ConstVid) -> ConstVid {
-        self.inner.borrow_mut().const_unification_table().find(var).vid
+        self.inner.borrow_mut().const_unification_table().find(var)
     }
 
     /// Resolves an int var to a rigid int type, if it was constrained to one,

@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     journal::{Journal, Loaded},
+    reader::Publisher,
     tree::{NodeId, Tree},
 };
 pub use crate::{
@@ -119,6 +120,8 @@ pub enum OpError {
     /// The symlink at `path` points outside the tree (an absolute target, or `..` past the
     /// root) or into a loop of symlinks.
     BadLink { path: String, target: String },
+    /// The base root the ops were given is not one this tree has.
+    UnknownRoot(ContentId),
 }
 
 impl fmt::Display for OpError {
@@ -135,6 +138,7 @@ impl fmt::Display for OpError {
             OpError::BadLink { path, target } => {
                 write!(f, "{path} is a symlink to {target:?}, which leaves the tree or loops")
             }
+            OpError::UnknownRoot(root) => write!(f, "no root {root} is known"),
         }
     }
 }
@@ -201,7 +205,7 @@ pub struct Vfs {
     views: Vec<Option<NodeId>>,
     journal: Journal,
     /// Every node of `tree`, published after each change, for readers on other threads.
-    reader: Reader,
+    published: Publisher,
 }
 
 impl Vfs {
@@ -209,16 +213,29 @@ impl Vfs {
     /// Tags it asks with are `tags..tags + 2^32`.
     pub fn recover(journal: FileName, tags: u64, bytes: &[u8]) -> (Vfs, Recovered) {
         let Loaded { mut tree, heads, journal, found } = Journal::recover(journal, tags, bytes);
-        let reader = Reader::default();
-        tree.publish(&reader);
-        (Vfs { tree, heads, views: Vec::new(), journal, reader }, found)
+        let mut published = Publisher::new();
+        tree.publish(&mut published);
+        (Vfs { tree, heads, views: Vec::new(), journal, published }, found)
     }
 
     /// A handle that reads any root this tree has, from any thread, without the `Vfs`: what
     /// the query database's `blaze_query::Tree` is over. A root is in it before any call that
     /// gives its ID returns.
     pub fn reader(&self) -> Reader {
-        self.reader.clone()
+        self.published.reader()
+    }
+
+    /// Frees what collections and growth took out of the readers' table.
+    ///
+    /// # Safety
+    ///
+    /// Every call on a [`Reader`] of this `Vfs` begun before the last [`Vfs::collect`] (or
+    /// change) has returned, and nothing such a call lent of a root the tree no longer has is
+    /// still used: what the daemon knows once every worker has passed a task boundary. What
+    /// was read of a root a head, an open view or a collection's `keep` held is never freed.
+    pub unsafe fn reclaim(&mut self) {
+        // SAFETY: the caller's contract is the publisher's.
+        unsafe { self.published.reclaim() }
     }
 
     /// The root `head` is at, if it was ever written.
@@ -268,7 +285,7 @@ impl Vfs {
             (Cow::Owned(rebase::rebase(&self.tree, base, at, ops)?), true)
         };
         let root = self.tree.apply(at, &ops)?;
-        self.tree.publish(&self.reader);
+        self.tree.publish(&mut self.published);
         self.heads.insert(head.into(), root);
         let ticket = self.journal.record_head(&self.tree, head, root);
         Ok(Commit { root: self.tree.id(root), rebased, ticket })
@@ -289,9 +306,9 @@ impl Vfs {
 
     /// The root made of `base` and `ops`, kept as a view's root and moving no head: a what-if.
     pub fn apply(&mut self, base: ContentId, ops: &[Op]) -> Result<ContentId, OpError> {
-        let base = self.root(base).ok_or_else(|| OpError::NotFound(format!("root {base:x}")))?;
+        let base = self.root(base).ok_or(OpError::UnknownRoot(base))?;
         let root = self.tree.apply(base, ops)?;
-        self.tree.publish(&self.reader);
+        self.tree.publish(&mut self.published);
         Ok(self.tree.id(root))
     }
 
@@ -397,8 +414,9 @@ impl Vfs {
             self.views[at] = live.next();
         }
         self.journal.collected(&renumbered, self.tree.len());
-        self.reader.retain(|id| self.tree.node(id).is_some());
-        self.tree.publish(&self.reader);
+        let tree = &self.tree;
+        self.published.collect(|id| tree.node(id).is_some());
+        self.tree.publish(&mut self.published);
     }
 }
 

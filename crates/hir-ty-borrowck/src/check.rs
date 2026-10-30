@@ -131,12 +131,15 @@ pub(super) fn check<'db>(
         for constraint in &regions.outlives {
             eprintln!("{constraint:?}");
         }
-        for loan in &loans.loans {
+        for (id, loan) in loans.loans.iter().enumerate() {
             let points: Vec<usize> =
                 values.points_of(loan.region).iter().filter(|&it| it < cfg.points).collect();
             eprintln!(
                 "loan {:?} {:?} at {:?} region {} points {points:?}",
-                loan.local, loan.projection, loan.location, loan.region
+                loan.local,
+                loans.projection(id),
+                loan.location,
+                loan.region
             );
             for &(target, _) in &regions.universals {
                 let path = regions::constraint_path(&regions, count, loan.region, target);
@@ -190,9 +193,9 @@ pub(super) fn check<'db>(
         _ => span,
     };
     for &block in &cfg.order {
-        checker.uninit = flow.uninit_entry[index(block)].clone();
-        checker.ever = flow.ever_entry[index(block)].clone();
-        checker.in_scope = borrows_entry[index(block)].clone();
+        checker.uninit.load(flow.uninit_entry.row(index(block)));
+        checker.ever.load(flow.ever_entry.row(index(block)));
+        checker.in_scope.load(borrows_entry.row(index(block)));
         let data = &body.basic_blocks[block];
         for (statement, it) in data.statements.iter().enumerate() {
             let location = Location { block, statement };
@@ -228,8 +231,8 @@ pub(super) fn check<'db>(
                 }
             }
             checker.statement(location, &it.kind, span);
-            apply(body, &moves, location, &mut checker.uninit, &mut checker.ever);
-            loans.after(ctx, body, location, &mut checker.in_scope);
+            apply(body, &moves, &cfg, location, &mut checker.uninit, &mut checker.ever);
+            loans.after(ctx, body, &cfg, location, &mut checker.in_scope);
         }
         if let Some(terminator) = &data.terminator {
             let location = Location { block, statement: data.statements.len() };
@@ -1052,9 +1055,10 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     /// `resume`, so each of them is reported, not only the first a `StorageDead` meets.
     fn check_for_invalidation_at_unwind(&mut self) {
         let in_scope: Vec<usize> = self.in_scope.iter().collect();
+        let loans = self.loans;
         for id in in_scope {
-            let loan = &self.loans.loans[id];
-            if loan.projection.contains(&ProjectionElem::Deref) {
+            let loan = &loans.loans[id];
+            if loans.projection(id).contains(&ProjectionElem::Deref) {
                 continue;
             }
             let outlives_universal = self
@@ -1062,7 +1066,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 .universals_of(loan.region)
                 .any(|it| self.regions.universals[it].1 != UniversalKind::FnBody);
             // The unwind path drops the local the loan is of, a destructor that may see it.
-            let borrowed = PlaceRef { local: loan.local, projection: &loan.projection };
+            let borrowed = PlaceRef { local: loan.local, projection: loans.projection(id) };
             if outlives_universal && self.through_destructor(borrowed) {
                 self.report_conflicts_with_destructor(id);
             } else if outlives_universal {
@@ -1313,15 +1317,20 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     ) -> bool {
         // Only a loan of the place's local can conflict with it; `of_local` lists them in the
         // order they were made, the order of `in_scope`.
-        let Some(of_local) = self.loans.of_local.get(&place.local) else { return false };
-        let in_scope: SmallVec<[usize; 4]> =
-            of_local.iter().copied().filter(|&id| self.in_scope.contains(id)).collect();
+        let loans = self.loans;
+        let in_scope: SmallVec<[usize; 4]> = loans
+            .of_local(place.local)
+            .iter()
+            .map(|&id| id as usize)
+            .filter(|&id| self.in_scope.contains(id))
+            .collect();
         for id in in_scope {
-            let loan = &self.loans.loans[id];
+            let loan = &loans.loans[id];
             if !places_conflict(
                 self.ctx,
                 self.body,
-                loan,
+                loans,
+                id,
                 place.local,
                 place.projection,
                 depth,
@@ -1392,8 +1401,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                     );
                 }
                 (Access::StorageDeadOrDrop, _) => {
-                    let loan = &self.loans.loans[id];
-                    let borrowed = PlaceRef { local: loan.local, projection: &loan.projection };
+                    let borrowed = PlaceRef { local: loan.local, projection: loans.projection(id) };
                     if self.through_destructor(borrowed) && !borrowed.is_prefix_of(place) {
                         self.report_conflicts_with_destructor(id);
                     } else {
@@ -1423,11 +1431,10 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     }
 
     fn check_activations(&mut self, location: Location, span: MirSpan) {
-        let Some(ids) = self.loans.activations.get(&location) else { return };
-        for &id in ids {
-            let loan = &self.loans.loans[id];
-            let projection = loan.projection.clone();
-            let place = PlaceRef { local: loan.local, projection: &projection };
+        let loans = self.loans;
+        for &id in loans.activated_at(self.cfg.point(location)) {
+            let id = id as usize;
+            let place = PlaceRef { local: loans.loans[id].local, projection: loans.projection(id) };
             self.access_place(
                 location,
                 place,
@@ -1444,7 +1451,7 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
     fn check_for_invalidation_at_exit(&mut self, _location: Location, _span: MirSpan) {
         let in_scope: Vec<usize> = self.in_scope.iter().collect();
         for id in in_scope {
-            if !self.loans.loans[id].projection.contains(&ProjectionElem::Deref) {
+            if !self.loans.projection(id).contains(&ProjectionElem::Deref) {
                 self.report_does_not_live_long_enough(id);
             }
         }
@@ -1533,12 +1540,12 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
 
     /// rustc's `report_borrowed_value_does_not_live_long_enough`.
     fn report_does_not_live_long_enough(&mut self, id: usize) {
-        let loan = &self.loans.loans[id];
+        let loans = self.loans;
+        let loan = &loans.loans[id];
         if !self.dead_reported.insert((loan.local, loan.span)) {
             return;
         }
-        let projection = loan.projection.clone();
-        let place = PlaceRef { local: loan.local, projection: &projection };
+        let place = PlaceRef { local: loan.local, projection: loans.projection(id) };
         // rustc's `borrow_spans` knows a capture only by a closure's or a coroutine's aggregate:
         // what an `async` closure borrows is blamed as any other borrow of a local.
         let capture = self.capture_temps.get(&loan.assigned).copied().filter(|it| {
@@ -2682,9 +2689,11 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
         let ty = self.ctx.place_ty(self.body, base.local, base.projection).ty;
         if let TyKind::Adt(def, _) = ty.kind()
             && def.is_union()
-            && self.moves.moves_of[path]
+            && self
+                .moves
+                .moves_of(path)
                 .iter()
-                .any(|&it| self.is_predecessor_of(self.moves.moves[it].location, location))
+                .any(|&it| self.is_predecessor_of(self.moves.moves[it as usize].location, location))
         {
             return;
         }
@@ -2870,22 +2879,22 @@ impl<'a, 'db> Checker<'a, '_, 'db> {
                 self.body.basic_blocks[location.block].statements.get(location.statement),
                 Some(statement) if matches!(statement.kind, StatementKind::StorageDead(_))
             );
-            if !is_storage_dead && let Some(at) = self.moves.moves_at.get(&location) {
-                for &move_out in at {
+            let point = self.cfg.point(location);
+            if !is_storage_dead {
+                for &move_out in self.moves.moves_at(point) {
+                    let move_out = move_out as usize;
                     if paths.contains(&self.moves.moves[move_out].path) {
                         result.push(move_out);
                         return true;
                     }
                 }
             }
-            if let Some(at) = self.moves.inits_at.get(&location) {
-                for &init in at {
-                    let init = self.moves.inits[init];
-                    if matches!(init.kind, InitKind::Deep | InitKind::NonPanicPathOnly)
-                        && paths.contains(&init.path)
-                    {
-                        return true;
-                    }
+            for &init in self.moves.inits_at(point) {
+                let init = self.moves.inits[init as usize];
+                if matches!(init.kind, InitKind::Deep | InitKind::NonPanicPathOnly)
+                    && paths.contains(&init.path)
+                {
+                    return true;
                 }
             }
             false

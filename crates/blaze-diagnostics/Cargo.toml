@@ -18,10 +18,13 @@ doctest = false
 # `annotate_snippet_emitter_writer.rs`), so that ours read byte for byte as rustc's do.
 annotate-snippets.workspace = true
 either.workspace = true
+hashbrown.workspace = true
+memchr.workspace = true
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 smallvec.workspace = true
+unicode-ident.workspace = true
 
 base-db.workspace = true
 blaze-api.workspace = true
@@ -35,6 +38,7 @@ hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-borrowck.workspace = true
 intern.workspace = true
+rustc_type_ir.workspace = true
 span.workspace = true
 stdx.workspace = true
 syntax.workspace = true

@@ -47,10 +47,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NonExhaustiveRecordPat) -> Vec<Fou
         );
     }
     let adt = d.variant.adt(cx.db);
-    let name = d.variant.name(cx.db).display(cx.db, cx.edition).to_string();
+    let name = d.variant.name(cx.db);
     diag.fact(
         Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
-        format!("whether `{name}` is `#[non_exhaustive]`"),
+        format!("whether `{}` is `#[non_exhaustive]`", name.display(cx.db, cx.edition)),
     );
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
     vec![Found::new(diag, Phase::Bodies)]

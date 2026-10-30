@@ -10,21 +10,22 @@
 
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::IntoKind;
-use smallvec::SmallVec;
 
 use hir_ty::{
     consteval::try_const_usize,
     mir::{
-        AsmOperand, LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem, Rvalue, StatementKind,
-        StoredPlace, TerminatorKind,
+        AsmOperand, BasicBlockId, LocalId, MirBody, PlaceElem, PlaceTy, ProjectionElem, Rvalue,
+        StatementKind, StoredPlace, TerminatorKind,
     },
     next_solver::TyKind,
 };
 
 use super::{
     Ctx,
-    bitset::BitSet,
+    bitset::{BitMatrix, BitSet},
     cfg::{Cfg, Location, index},
+    dataflow::{GenKill, forward},
+    relation::{Facts, Relation},
 };
 
 pub(super) type Mpi = usize;
@@ -73,18 +74,20 @@ pub(super) struct Init {
     pub(super) kind: InitKind,
 }
 
+/// The kinds of [`MoveData`]'s facts: the moves and the inits at a point, the moves of a path.
+const MOVE_AT: u8 = 0;
+const INIT_AT: u8 = 1;
+const MOVE_OF: u8 = 2;
+
 pub(super) struct MoveData {
     pub(super) paths: Vec<MovePath>,
     locals: Vec<Mpi>,
-    lookup: FxHashMap<(LocalId, Vec<PlaceElem>), Mpi>,
+    /// The path below a path by one step.
+    steps: FxHashMap<(u32, PlaceElem), Mpi>,
     pub(super) moves: Vec<MoveOut>,
     pub(super) inits: Vec<Init>,
-    pub(super) moves_at: FxHashMap<Location, SmallVec<[usize; 2]>>,
-    pub(super) inits_at: FxHashMap<Location, SmallVec<[usize; 2]>>,
-    /// The moves out of each path, by the index of the path.
-    pub(super) moves_of: Vec<Vec<usize>>,
-    /// The inits of each path.
-    pub(super) inits_of: Vec<Vec<usize>>,
+    /// The moves and inits at each point and of each path, each in the order it was found.
+    facts: Relation,
 }
 
 impl MoveData {
@@ -92,13 +95,10 @@ impl MoveData {
         let mut data = MoveData {
             paths: Vec::new(),
             locals: Vec::new(),
-            lookup: FxHashMap::default(),
+            steps: FxHashMap::default(),
             moves: Vec::new(),
             inits: Vec::new(),
-            moves_at: FxHashMap::default(),
-            inits_at: FxHashMap::default(),
-            moves_of: Vec::new(),
-            inits_of: Vec::new(),
+            facts: Relation::default(),
         };
         for (local, _) in body.locals.iter() {
             let id = data.paths.len();
@@ -108,7 +108,6 @@ impl MoveData {
                 parent: None,
                 children: Vec::new(),
             });
-            data.lookup.insert((local, Vec::new()), id);
             data.locals.push(id);
         }
         for &local in &body.param_locals {
@@ -186,19 +185,36 @@ impl MoveData {
                 _ => (),
             }
         }
-        data.moves_of = vec![Vec::new(); data.paths.len()];
-        data.inits_of = vec![Vec::new(); data.paths.len()];
+        let mut facts = Facts::default();
         for (index, it) in data.moves.iter().enumerate() {
-            data.moves_of[it.path].push(index);
+            facts.push(MOVE_AT, cfg.point(it.location), index);
+            facts.push(MOVE_OF, it.path, index);
         }
         for (index, it) in data.inits.iter().enumerate() {
-            data.inits_of[it.path].push(index);
+            if let Some(location) = it.location {
+                facts.push(INIT_AT, cfg.point(location), index);
+            }
         }
+        data.facts = facts.freeze(&[cfg.points, cfg.points, data.paths.len()]);
         data
     }
 
+    /// The moves out at `point`, in the order they happen.
+    pub(super) fn moves_at(&self, point: usize) -> &[u32] {
+        self.facts.get(MOVE_AT, point)
+    }
+
+    /// The inits at `point`, in the order they happen.
+    pub(super) fn inits_at(&self, point: usize) -> &[u32] {
+        self.facts.get(INIT_AT, point)
+    }
+
+    /// The moves out of `path`.
+    pub(super) fn moves_of(&self, path: Mpi) -> &[u32] {
+        self.facts.get(MOVE_OF, path)
+    }
+
     fn record_move(&mut self, path: Mpi, location: Location) {
-        self.moves_at.entry(location).or_default().push(self.moves.len());
         self.moves.push(MoveOut { path, location });
     }
 
@@ -251,20 +267,15 @@ impl MoveData {
     }
 
     fn child(&mut self, parent: Mpi, local: LocalId, step: PlaceElem) -> Mpi {
-        let mut key = self.paths[parent].projection.clone();
-        key.push(step);
-        if let Some(&it) = self.lookup.get(&(local, key.clone())) {
+        if let Some(&it) = self.steps.get(&(parent as u32, step)) {
             return it;
         }
+        let mut projection = self.paths[parent].projection.clone();
+        projection.push(step);
         let id = self.paths.len();
-        self.paths.push(MovePath {
-            local,
-            projection: key.clone(),
-            parent: Some(parent),
-            children: Vec::new(),
-        });
+        self.paths.push(MovePath { local, projection, parent: Some(parent), children: Vec::new() });
         self.paths[parent].children.push(id);
-        self.lookup.insert((local, key), id);
+        self.steps.insert((parent as u32, step), id);
         id
     }
 
@@ -283,7 +294,6 @@ impl MoveData {
             Lookup::Parent(path) if self.is_union_field(ctx, body, place, path) => path,
             Lookup::Parent(_) => return,
         };
-        self.inits_at.entry(location).or_default().push(self.inits.len());
         self.inits.push(Init { path, location: Some(location), kind });
     }
 
@@ -342,9 +352,7 @@ impl MoveData {
         let mut ty = PlaceTy::from_ty(body.locals[local].ty.as_ref());
         for elem in projection {
             let Some(step) = ctx.trackable(ty, elem) else { return Lookup::Parent(path) };
-            let mut key = self.paths[path].projection.clone();
-            key.push(step);
-            match self.lookup.get(&(local, key)) {
+            match self.steps.get(&(path as u32, step)) {
                 Some(&it) => path = it,
                 None => return Lookup::Parent(path),
             }
@@ -429,8 +437,24 @@ impl<'db> Ctx<'_, 'db> {
 /// `MaybeUninitializedPlaces`. And per local, whether it may have been initialized since its
 /// storage last ended: `EverInitializedPlaces`, of whole locals.
 pub(super) struct InitFlow {
-    pub(super) uninit_entry: Vec<BitSet>,
-    pub(super) ever_entry: Vec<BitSet>,
+    /// A row of move paths per block.
+    pub(super) uninit_entry: BitMatrix,
+    /// A row of locals per block.
+    pub(super) ever_entry: BitMatrix,
+}
+
+/// What `run` does to the empty and to the full sets of paths and of locals: the gen and kill
+/// sets of both, as [`GenKill::set_from`] takes them.
+fn runs(
+    paths: usize,
+    locals: usize,
+    mut run: impl FnMut(&mut BitSet, &mut BitSet),
+) -> [(BitSet, BitSet); 2] {
+    let (mut uninit_made, mut ever_made) = (BitSet::new(paths), BitSet::new(locals));
+    let (mut uninit_kept, mut ever_kept) = (BitSet::filled(paths), BitSet::filled(locals));
+    run(&mut uninit_made, &mut ever_made);
+    run(&mut uninit_kept, &mut ever_kept);
+    [(uninit_made, uninit_kept), (ever_made, ever_kept)]
 }
 
 impl InitFlow {
@@ -438,64 +462,59 @@ impl InitFlow {
         let blocks = body.basic_blocks.len();
         let paths = moves.paths.len();
         let locals = body.locals.len();
-        let mut uninit_entry = vec![BitSet::new(paths); blocks];
-        let mut ever_entry = vec![BitSet::new(locals); blocks];
-        let mut seen = vec![false; blocks];
-        {
-            let start = index(body.start_block);
-            let entry = &mut uninit_entry[start];
-            for path in 0..paths {
-                entry.insert(path);
-            }
-            for init in moves.inits.iter().filter(|it| it.location.is_none()) {
-                moves.with_descendants(init.path, &mut |it| entry.remove(it));
-                ever_entry[start]
-                    .insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
-            }
-            seen[start] = true;
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for &block in &cfg.order {
-                if !seen[index(block)] {
-                    continue;
-                }
-                let mut uninit = uninit_entry[index(block)].clone();
-                let mut ever = ever_entry[index(block)].clone();
-                let data = &body.basic_blocks[block];
+        let mut uninit = GenKill::new(blocks, paths);
+        let mut ever = GenKill::new(blocks, locals);
+        // A call's return: what its destination being initialized does on that edge only.
+        let mut returned_uninit = GenKill::new(blocks, paths);
+        let mut returned_ever = GenKill::new(blocks, locals);
+        let mut returns_to: Vec<Option<BasicBlockId>> = vec![None; blocks];
+        for &block in &cfg.order {
+            let data = &body.basic_blocks[block];
+            let [(made, kept), (ever_made, ever_kept)] = runs(paths, locals, |uninit, ever| {
                 for statement in 0..=data.statements.len() {
-                    let location = Location { block, statement };
-                    apply(body, moves, location, &mut uninit, &mut ever);
+                    apply(body, moves, cfg, Location { block, statement }, uninit, ever);
                 }
-                let Some(terminator) = &data.terminator else { continue };
-                let returned = match &terminator.kind {
-                    TerminatorKind::Call { target: Some(target), .. } => Some(*target),
-                    _ => None,
-                };
-                for &target in &cfg.successors[index(block)] {
-                    let (mut uninit, mut ever) = (uninit.clone(), ever.clone());
-                    if Some(target) == returned {
-                        call_returned(
-                            moves,
-                            Location { block, statement: data.statements.len() },
-                            &mut uninit,
-                            &mut ever,
-                        );
-                    }
-                    let t = index(target);
-                    if !seen[t] {
-                        seen[t] = true;
-                        uninit_entry[t] = uninit;
-                        ever_entry[t] = ever;
-                        changed = true;
-                    } else {
-                        changed |= uninit_entry[t].union(&uninit);
-                        changed |= ever_entry[t].union(&ever);
-                    }
-                }
+            });
+            uninit.set_from(index(block), &made, &kept);
+            ever.set_from(index(block), &ever_made, &ever_kept);
+            if let Some(TerminatorKind::Call { target: Some(target), .. }) =
+                data.terminator.as_ref().map(|it| &it.kind)
+            {
+                returns_to[index(block)] = Some(*target);
+                let location = Location { block, statement: data.statements.len() };
+                let [(made, kept), (ever_made, ever_kept)] =
+                    runs(paths, locals, |uninit, ever| {
+                        call_returned(moves, cfg, location, uninit, ever)
+                    });
+                returned_uninit.set_from(index(block), &made, &kept);
+                returned_ever.set_from(index(block), &ever_made, &ever_kept);
             }
         }
+        let mut uninit_start = BitSet::filled(paths);
+        let mut ever_start = BitSet::new(locals);
+        for init in moves.inits.iter().filter(|it| it.location.is_none()) {
+            moves.with_descendants(init.path, &mut |it| uninit_start.remove(it));
+            ever_start.insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
+        }
+        // A block with no terminator yet leads nowhere.
+        let ends = |from: BasicBlockId, state: &mut [u64]| {
+            if body.basic_blocks[from].terminator.is_none() {
+                state.fill(0);
+            }
+        };
+        let uninit_entry =
+            forward(cfg, &uninit, body.start_block, &uninit_start, |from, to, state| {
+                if returns_to[index(from)] == Some(to) {
+                    returned_uninit.apply(index(from), state);
+                }
+                ends(from, state);
+            });
+        let ever_entry = forward(cfg, &ever, body.start_block, &ever_start, |from, to, state| {
+            if returns_to[index(from)] == Some(to) {
+                returned_ever.apply(index(from), state);
+            }
+            ends(from, state);
+        });
         InitFlow { uninit_entry, ever_entry }
     }
 }
@@ -505,25 +524,23 @@ impl InitFlow {
 pub(super) fn apply(
     body: &MirBody<'_>,
     moves: &MoveData,
+    cfg: &Cfg,
     location: Location,
     uninit: &mut BitSet,
     ever: &mut BitSet,
 ) {
-    if let Some(at) = moves.moves_at.get(&location) {
-        for &index in at {
-            moves.with_descendants(moves.moves[index].path, &mut |it| {
-                uninit.insert(it);
-            });
-        }
+    let point = cfg.point(location);
+    for &index in moves.moves_at(point) {
+        moves.with_descendants(moves.moves[index as usize].path, &mut |it| {
+            uninit.insert(it);
+        });
     }
-    if let Some(at) = moves.inits_at.get(&location) {
-        for &index in at {
-            let init = moves.inits[index];
-            if init.kind == InitKind::Deep {
-                moves.with_descendants(init.path, &mut |it| uninit.remove(it));
-                if moves.paths[init.path].projection.is_empty() {
-                    ever.insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
-                }
+    for &index in moves.inits_at(point) {
+        let init = moves.inits[index as usize];
+        if init.kind == InitKind::Deep {
+            moves.with_descendants(init.path, &mut |it| uninit.remove(it));
+            if moves.paths[init.path].projection.is_empty() {
+                ever.insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
             }
         }
     }
@@ -535,20 +552,20 @@ pub(super) fn apply(
     }
 }
 
-pub(super) fn call_returned(
+/// What the call at `location` returning does: its destination is initialized.
+fn call_returned(
     moves: &MoveData,
+    cfg: &Cfg,
     location: Location,
     uninit: &mut BitSet,
     ever: &mut BitSet,
 ) {
-    if let Some(at) = moves.inits_at.get(&location) {
-        for &index in at {
-            let init = moves.inits[index];
-            if init.kind == InitKind::NonPanicPathOnly {
-                moves.with_descendants(init.path, &mut |it| uninit.remove(it));
-                if moves.paths[init.path].projection.is_empty() {
-                    ever.insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
-                }
+    for &index in moves.inits_at(cfg.point(location)) {
+        let init = moves.inits[index as usize];
+        if init.kind == InitKind::NonPanicPathOnly {
+            moves.with_descendants(init.path, &mut |it| uninit.remove(it));
+            if moves.paths[init.path].projection.is_empty() {
+                ever.insert(moves.paths[init.path].local.into_raw().into_u32() as usize);
             }
         }
     }

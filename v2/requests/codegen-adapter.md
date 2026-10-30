@@ -5,17 +5,49 @@ Each says what, where and why.
 
 ## To codegen-devspeed (`crates/hir-ty-codegen/mod.rs`, `fragment.rs`, `tier.rs`)
 
-1. **`Recorder::new` reads `crate::v2::build::building()`** (`v2/build.rs`). When it is `Some(b)`:
+1. ~~`Recorder::new` reads `crate::v2::build::building()`~~ (done by codegen-devspeed:
+   `Wants::unit`, `debug_assertions`, `aborts`, no callee built in). Kept for the record: (`v2/build.rs`). When it is `Some(b)`:
    `debug_assertions = Some(b.debug_assertions)`; the panic strategy `build()` lowers with is
    abort iff `b.aborts`; `inlined_callee` and `always_inlined` return `None` (no body is built
    into another: a unit's code must be a function of its own MIR, and `INLINED` names are
    refused by `v2/shape.rs` and `v2/convert.rs`). `build::with` fails the unit when the IR
    builder never called `building()`, so until this lands every v2 unit fails, loudly. Why: the
    unit's `Spec` says these, not the environment.
-2. **`FunctionUnwind::v2_parts() -> UnwindParts<'_>`**: `Dwarf { fde: &FrameDescriptionEntry,
-   landing_pads: Option<&[u8]> }` or `Windows { len: u32, info: &[u8], landing_pads:
-   Option<&[u8]> }`, the FDE at `v2::unwind::ANYWHERE` (`Address::Constant(0)`). `v2/unwind.rs`
-   reads it. Why: v2 keeps unwind info by content, not at a module's symbol.
+2. **`FunctionUnwind::v2_parts()`** in `crates/hir-ty-codegen/unwind.rs`, which
+   `v2/unwind.rs` reads (the fields of `FunctionUnwind` are private to `unwind`). Not there yet,
+   so `v2/unwind.rs` does not build until it is:
+
+   ```rust
+   /// What a v2 build keeps of a function's unwind information, apart from where it is.
+   pub(super) enum UnwindParts<'a> {
+       Dwarf { fde: FrameDescriptionEntry, landing_pads: Option<&'a [u8]> },
+       Windows { len: u32, info: &'a [u8], landing_pads: Option<&'a [u8]> },
+   }
+
+   impl FunctionUnwind {
+       pub(super) fn v2_parts(&self) -> UnwindParts<'_> {
+           let landing_pads = self.landing_pads.as_deref();
+           match &self.frame {
+               Frame::Windows(frame) => {
+                   UnwindParts::Windows { len: frame.len, info: &frame.info, landing_pads }
+               }
+               Frame::Cranelift(info) => {
+                   UnwindParts::Dwarf { fde: info.to_fde(Address::Constant(0)), landing_pads }
+               }
+               Frame::Rows(rows) => {
+                   let mut fde = FrameDescriptionEntry::new(Address::Constant(0), rows.len);
+                   for &(offset, rule) in &rows.rows {
+                       fde.add_instruction(offset, rule.instruction());
+                   }
+                   UnwindParts::Dwarf { fde, landing_pads }
+               }
+           }
+       }
+   }
+   ```
+
+   (`fde()` already does the two DWARF arms; `v2_parts` can call it.) Why: v2 keeps an FDE's
+   instructions by content and the linker places it, so the address is a constant 0.
 3. **Drop `#[cfg_attr(not(feature = "llvm"), expect(dead_code))]` on `Detach::Unit`**
    (`mod.rs`): `v2/backend.rs` builds with it in every configuration, so the expectation is
    unfulfilled without `llvm`.
@@ -23,11 +55,16 @@ Each says what, where and why.
    data in a function (`v2/places.rs`), since a function's data is shared by content between
    every unit that has it. A promoted constant is never written.
 
+> forwarded to codegen: items 1 to 4 are inside lane codegen (codegen-devspeed's `crates/hir-ty-codegen/`).
+
 ## To the items lane (`crates/blaze-items`)
 
 5. **Implement `hir_ty_codegen::v2::Hashes`** (all seven functions; `v2.rs` documents each).
    `ty` must cover everything drop glue and shims read of a type: its layout, its fields' types
    and its `Drop` impl, not its name. The tests in `v2/tests.rs` use a stand-in by database id.
+
+> forwarded to items: the same as `v2/requests/codegen.md` 1.
+> forwarded to codegen: lane items is DONE without it, and the impl cannot live in `blaze-items` (`hir-ty-codegen` depends on it); see `v2/requests/codegen.md` 1.
 
 ## To the parent (`codegen`, `crates/blaze-codegen`)
 
@@ -46,6 +83,8 @@ Each says what, where and why.
 12. **`Prepare::masked` takes `refs`** (fold's request too): the adapter keeps a copy of the refs
     in each prepared Cranelift function (`Function::refs`) only because `masked` is given none.
 
+> forwarded to codegen: items 6 to 12 are the parent's (`crates/blaze-codegen/`).
+
 ## Done for siblings
 
 - codegen-release: `Function::{hint, release}`, `backend::emitted`, the LLVM arms of
@@ -53,3 +92,19 @@ Each says what, where and why.
 - codegen-fold: `Function::foldable` (no symbol of its own, not C-variadic), `masked` with the
   refs, `merge` through the same Cranelift emit, `fold::BODY` at the last ref, thunks without
   lines or named locals, and only the data the compiled IR names (`convert::OwnData::requests`).
+
+> applied: note only.
+
+## From speed-backend: `bumpalo` and `smallvec` in `crates/hir-ty-codegen/Cargo.toml`
+
+What: under `[dependencies]` of `crates/hir-ty-codegen/Cargo.toml`, add
+`bumpalo.workspace = true` and `smallvec.workspace = true` (both are already root workspace
+dependencies; `bumpalo` was requested for this in `v2/requests/speed.md` item 1).
+
+Why: speed-backend's children (speed-backend-lower, -code, -debug, -llvm, -fold, -intrinsics)
+replace per-function heap allocation in the IR builder (`mod.rs`), the fragment and pass files
+(`fragment.rs`, `promote.rs`, `overlap.rs`, `copies.rs`), debuginfo/unwind and the LLVM path
+with per-task bump arenas and inline small vectors (principles.md "Arenas, not the heap",
+"Preallocate"). The `Cargo.toml` is yours, so they can't add the lines themselves.
+
+> forwarded to codegen: `crates/hir-ty-codegen/Cargo.toml` is lane codegen's own; both are root workspace dependencies already (`bumpalo`, `smallvec`), so nothing is needed from the root.

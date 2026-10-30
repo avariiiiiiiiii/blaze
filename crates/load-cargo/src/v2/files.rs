@@ -63,6 +63,19 @@ impl Mounts<'_> {
         Ok((root, under))
     }
 
+    /// Whether `path` is under a mount.
+    pub(crate) fn covers(&self, path: &str) -> bool {
+        self.mounts.iter().any(|mount| rest(path, &mount.at).is_some())
+    }
+
+    /// The bytes of the file at `path`, symlinks followed; none for no file.
+    pub(crate) fn read(&self, path: &str) -> Result<Option<Arc<[u8]>>, LowerError> {
+        Ok(match self.node(path)? {
+            Node::File(_, bytes) => Some(bytes),
+            Node::Dir(_) | Node::None => None,
+        })
+    }
+
     /// What `path` is, symlinks followed.
     fn node(&self, path: &str) -> Result<Node, LowerError> {
         let mut path = path.to_owned();

@@ -82,6 +82,36 @@ fn a_target_feature_turns_on_what_rustc_says() {
 }
 
 #[test]
+fn a_feature_of_no_cfg_changes_none() {
+    // LLVM's, which rustc warns of and passes on.
+    let other = CfgArgs::from_flags(&["-Ctarget-feature=+64bit".to_owned()]).unwrap();
+    let triple = "x86_64-unknown-linux-gnu";
+    assert_eq!(target_cfg(triple, &other).unwrap(), target_cfg(triple, &CfgArgs::default()).unwrap());
+    // Turning off what it turned on is the target's own again.
+    let both = CfgArgs::from_flags(&["-Ctarget-feature=+avx2,-avx2".to_owned()]).unwrap();
+    let cfgs = target_cfg(triple, &both).unwrap();
+    assert!(!cfgs.iter().any(|it| it == "target_feature=\"avx2\""), "{cfgs:?}");
+    assert!(cfgs.iter().any(|it| it == "target_feature=\"sse2\""), "{cfgs:?}");
+}
+
+#[test]
+fn a_feature_set_is_its_bits() {
+    let mut bits = target::Bits::default();
+    for it in [0, 63, 64, 200, 255] {
+        bits.insert(it);
+    }
+    assert_eq!(bits.iter().collect::<Vec<_>>(), [0, 63, 64, 200, 255]);
+    assert_eq!(bits.len(), 5);
+    bits.remove(64);
+    assert!(!bits.has(64) && bits.has(63));
+    let mut low = target::Bits::default();
+    low.insert(0);
+    assert!(low.within(&bits) && !bits.within(&low));
+    bits.subtract(&low);
+    assert_eq!(bits.intersection(&low), target::Bits::default());
+}
+
+#[test]
 fn the_profile_decides_its_cfgs() {
     let triple = "x86_64-unknown-linux-gnu";
     let optimized = CfgArgs::from_flags(&["-Copt-level=3".to_owned()]).unwrap();

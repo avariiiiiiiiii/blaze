@@ -292,7 +292,7 @@ def child(args: Child) -> None:
             if who is None:
                 eng.wait_ready(ws, env, max(1.0, args.timeout_s - (time.monotonic() - began)))
     except engine.Failed as e:
-        hung = not isinstance(e, engine.Missing) and time.monotonic() - began >= args.timeout_s - 1
+        hung = time.monotonic() - began >= args.timeout_s - 1
         error = str(e)
     finally:
         sampler.stop()
@@ -550,7 +550,7 @@ def selftest() -> None:
         (Ending(0.5, -signal.SIGKILL, 0, None, None), "fail"),
         (Ending(0.5, None, 0, None, None), "fail"),
         (Ending(0.5, 0, 0, done(None, hung=True, error="took more than"), None), "fail"),
-        (Ending(0.5, 0, 0, done(None, error=str(engine.Missing("what a request did"))), None), "error"),
+        (Ending(0.5, 0, 0, done(None, error="the cold build: `blaze build` did not start"), None), "error"),
         (Ending(0.5, 1, 0, None, None, "Traceback"), "error"),
     ]
     for at, (ending, wanted) in enumerate(cases):

@@ -4,9 +4,10 @@ use std::panic::{self, UnwindSafe};
 /// A panic payload indicating that execution of a salsa query was cancelled.
 ///
 /// This can occur for a few reasons:
-/// *
-/// *
-/// *
+/// * the task's [`CancellationToken`](crate::CancellationToken) was cancelled ([`Cancelled::Local`]),
+/// * a query this one waited on panicked ([`Cancelled::PropagatedPanic`]),
+/// * the task asked for a query that a task below it on its thread runs, which can't finish
+///   before this task returns ([`Cancelled::WouldWaitOnItself`]).
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Cancelled {
@@ -14,10 +15,19 @@ pub enum Cancelled {
     Local,
 
     /// The query was operating on revision R, but there is a pending write to move to revision R+1.
+    ///
+    /// Salsa never throws it: a write takes the database by `&mut`, so no query runs during one.
+    /// Hosts throw it to abandon work for a write they are about to make.
     PendingWrite,
 
     /// The query was blocked on another thread, and that thread panicked.
     PropagatedPanic,
+
+    /// The task asked for a query that a task below it on the same thread holds (directly or
+    /// through other tasks' waits). That task resumes only after this one returns, so the wait
+    /// would never end. Not a query cycle: the work pool runs the task again once the task below
+    /// has finished.
+    WouldWaitOnItself,
 }
 
 impl Cancelled {
@@ -49,6 +59,7 @@ impl std::fmt::Display for Cancelled {
             Cancelled::Local => "local cancellation request",
             Cancelled::PendingWrite => "pending write",
             Cancelled::PropagatedPanic => "propagated panic",
+            Cancelled::WouldWaitOnItself => "a wait on a task below this one on its thread",
         };
         f.write_str("cancelled because of ")?;
         f.write_str(why)

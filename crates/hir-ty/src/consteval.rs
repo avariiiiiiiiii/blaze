@@ -1,6 +1,9 @@
 //! Constant evaluation details
 
+use std::mem::offset_of;
+
 use base_db::Crate;
+use blaze_format::{FormatError, Record, Slice, Writer};
 use hir_def::{
     ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, StaticId,
     attrs::AttrFlags,
@@ -16,15 +19,16 @@ use rustc_type_ir::inherent::{Const as _, GenericArgs as _, IntoKind, Ty as _};
 use salsa::SalsaValue;
 
 use crate::{
-    ParamEnvAndCrate, Span,
+    ComplexMemoryMap, MemoryMap, ParamEnvAndCrate, Span, StaticMemory,
     db::{AnonConstId, AnonConstLoc, GeneralConstId, HirDatabase},
     generics::Generics,
     lower::LoweringMode,
     mir::{IsSigned, MirEvalError, MirLowerError, pad16},
     next_solver::{
-        Allocation, Const, ConstKind, Consts, DbInterner, DefaultAny, GenericArgs, ParamConst,
-        ScalarInt, StoredAllocation, StoredEarlyBinder, StoredGenericArgs, Ty, TyKind,
+        Allocation, AllocationData, Const, ConstKind, Consts, DbInterner, DefaultAny, GenericArgs,
+        ParamConst, ScalarInt, StoredAllocation, StoredEarlyBinder, StoredGenericArgs, Ty, TyKind,
         UnevaluatedConst, ValTreeKind, default_types,
+        persist::{TyTableReader, TyTableWriter},
     },
     traits::StoredParamEnvAndCrate,
 };
@@ -204,28 +208,32 @@ pub fn allocation_as_usize(ec: Allocation<'_>) -> u128 {
     u128::from_le_bytes(pad16(&ec.memory, IsSigned::No))
 }
 
+/// The value of `unevaluated`, read from the cached result by reference: an array length asks
+/// this on every check, and one that fails to evaluate clones no error.
+fn evaluated<'db>(
+    db: &'db dyn HirDatabase,
+    unevaluated: UnevaluatedConst<'db>,
+) -> Option<Allocation<'db>> {
+    let result = match unevaluated.def.0 {
+        GeneralConstId::ConstId(id) => {
+            let _request = trace_const(db, id, false);
+            const_eval_query(db, id, unevaluated.args.store(), None)
+        }
+        GeneralConstId::StaticId(id) => const_eval_static_query(db, id),
+        GeneralConstId::AnonConstId(id) => {
+            anon_const_eval_query(db, id, unevaluated.args.store(), None)
+        }
+    };
+    result.as_ref().ok().map(|it| it.as_ref())
+}
+
 pub fn try_const_usize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<u128> {
     match c.kind() {
         ConstKind::Param(_) => None,
         ConstKind::Infer(_) => None,
         ConstKind::Bound(_, _) => None,
         ConstKind::Placeholder(_) => None,
-        ConstKind::Unevaluated(unevaluated_const) => match unevaluated_const.def.0 {
-            GeneralConstId::ConstId(id) => {
-                let subst = unevaluated_const.args;
-                let ec = db.const_eval(id, subst, None).ok()?;
-                Some(allocation_as_usize(ec))
-            }
-            GeneralConstId::StaticId(id) => {
-                let ec = db.const_eval_static(id).ok()?;
-                Some(allocation_as_usize(ec))
-            }
-            GeneralConstId::AnonConstId(id) => {
-                let subst = unevaluated_const.args;
-                let ec = db.anon_const_eval(id, subst, None).ok()?;
-                Some(allocation_as_usize(ec))
-            }
-        },
+        ConstKind::Unevaluated(unevaluated) => evaluated(db, unevaluated).map(allocation_as_usize),
         ConstKind::Value(val) => {
             if val.ty == default_types().types.usize {
                 Some(val.value.inner().to_leaf().to_uint_unchecked())
@@ -248,22 +256,7 @@ pub fn try_const_isize<'db>(db: &'db dyn HirDatabase, c: Const<'db>) -> Option<i
         ConstKind::Infer(_) => None,
         ConstKind::Bound(_, _) => None,
         ConstKind::Placeholder(_) => None,
-        ConstKind::Unevaluated(unevaluated_const) => match unevaluated_const.def.0 {
-            GeneralConstId::ConstId(id) => {
-                let subst = unevaluated_const.args;
-                let ec = db.const_eval(id, subst, None).ok()?;
-                Some(allocation_as_isize(ec))
-            }
-            GeneralConstId::StaticId(id) => {
-                let ec = db.const_eval_static(id).ok()?;
-                Some(allocation_as_isize(ec))
-            }
-            GeneralConstId::AnonConstId(id) => {
-                let subst = unevaluated_const.args;
-                let ec = db.anon_const_eval(id, subst, None).ok()?;
-                Some(allocation_as_isize(ec))
-            }
-        },
+        ConstKind::Unevaluated(unevaluated) => evaluated(db, unevaluated).map(allocation_as_isize),
         ConstKind::Value(val) => {
             if val.ty == default_types().types.isize {
                 Some(val.value.inner().to_leaf().to_int_unchecked())
@@ -476,43 +469,43 @@ pub(crate) fn const_eval<'db>(
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
     let _request = trace_const(db, def, false);
-    return match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
+    match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
-    };
-
-    #[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result)]
-    pub(crate) fn const_eval_query<'db>(
-        db: &'db dyn HirDatabase,
-        def: ConstId,
-        subst: StoredGenericArgs,
-        trait_env: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        let _execution = trace_const(db, def, true);
-        let body = db.monomorphized_runtime_mir_body(
-            def.into(),
-            subst,
-            // The crate the constant is evaluated for, not the one it is in: the impls its
-            // generic arguments select can be in crates its own doesn't depend on.
-            ParamEnvAndCrate {
-                param_env: db.trait_environment(def.into()),
-                krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
-            }
-            .store(),
-        )?;
-        let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
-        Ok(c.store())
     }
+}
 
-    pub(crate) fn const_eval_cycle_result<'db>(
-        _: &'db dyn HirDatabase,
-        _: salsa::Id,
-        _: ConstId,
-        _: StoredGenericArgs,
-        _: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
-    }
+#[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0)]
+pub(crate) fn const_eval_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: ConstId,
+    subst: StoredGenericArgs,
+    trait_env: Option<StoredParamEnvAndCrate>,
+) -> Result<StoredAllocation, ConstEvalError<'db>> {
+    let _execution = trace_const(db, def, true);
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        subst,
+        // The crate the constant is evaluated for, not the one it is in: the impls its
+        // generic arguments select can be in crates its own doesn't depend on.
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.into()),
+            krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
+        }
+        .store(),
+    )?;
+    let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
+    Ok(c.store())
+}
+
+fn const_eval_cycle_result<'db>(
+    _: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _: ConstId,
+    _: StoredGenericArgs,
+    _: Option<StoredParamEnvAndCrate>,
+) -> Result<StoredAllocation, ConstEvalError<'db>> {
+    Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
 
 pub(crate) fn anon_const_eval<'db>(
@@ -521,71 +514,494 @@ pub(crate) fn anon_const_eval<'db>(
     subst: GenericArgs<'db>,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
-    return match anon_const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
+    match anon_const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
-    };
-
-    #[salsa::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result)]
-    pub(crate) fn anon_const_eval_query<'db>(
-        db: &'db dyn HirDatabase,
-        def: AnonConstId<'db>,
-        subst: StoredGenericArgs,
-        trait_env: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        let body = db.monomorphized_runtime_mir_body(
-            def.into(),
-            subst,
-            ParamEnvAndCrate {
-                param_env: db.trait_environment(def.loc(db).owner.generic_def(db)),
-                krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
-            }
-            .store(),
-        )?;
-        let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
-        Ok(c.store())
     }
+}
 
-    pub(crate) fn anon_const_eval_cycle_result<'db>(
-        _: &'db dyn HirDatabase,
-        _: salsa::Id,
-        _: AnonConstId<'db>,
-        _: StoredGenericArgs,
-        _: Option<StoredParamEnvAndCrate>,
-    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
-    }
+#[salsa::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, lru = 0)]
+pub(crate) fn anon_const_eval_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: AnonConstId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: Option<StoredParamEnvAndCrate>,
+) -> Result<StoredAllocation, ConstEvalError<'db>> {
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        subst,
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.loc(db).owner.generic_def(db)),
+            krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
+        }
+        .store(),
+    )?;
+    let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
+    Ok(c.store())
+}
+
+fn anon_const_eval_cycle_result<'db>(
+    _: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _: AnonConstId<'db>,
+    _: StoredGenericArgs,
+    _: Option<StoredParamEnvAndCrate>,
+) -> Result<StoredAllocation, ConstEvalError<'db>> {
+    Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
 }
 
 pub(crate) fn const_eval_static<'db>(
     db: &'db dyn HirDatabase,
     def: StaticId,
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
-    return match const_eval_static_query(db, def) {
+    match const_eval_static_query(db, def) {
         Ok(konst) => Ok(konst.as_ref()),
         Err(err) => Err(err.clone()),
-    };
+    }
+}
 
-    #[salsa::tracked(returns(ref), cycle_result = const_eval_static_cycle_result)]
-    pub(crate) fn const_eval_static_query<'db>(
-        db: &'db dyn HirDatabase,
-        def: StaticId,
-    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        let body = db.monomorphized_runtime_mir_body(
-            def.into(),
-            GenericArgs::empty().store(),
-            ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
-                .store(),
-        )?;
-        let c = db.interpret_mir(body, false, None)?;
-        Ok(c.store())
+#[salsa::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, lru = 0)]
+pub(crate) fn const_eval_static_query<'db>(
+    db: &'db dyn HirDatabase,
+    def: StaticId,
+) -> Result<StoredAllocation, ConstEvalError<'db>> {
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        GenericArgs::empty().store(),
+        ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
+            .store(),
+    )?;
+    let c = db.interpret_mir(body, false, None)?;
+    Ok(c.store())
+}
+
+fn const_eval_static_cycle_result<'db>(
+    _: &'db dyn HirDatabase,
+    _: salsa::Id,
+    _: StaticId,
+) -> Result<StoredAllocation, ConstEvalError<'db>> {
+    Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
+}
+
+blaze_format::record! {
+    /// A piece of a constant's memory: its address, and where its bytes are in the bytes of
+    /// its [`MemoryMapRec`].
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct PieceRec: 1 {
+        pub address: u64,
+        pub start: u64,
+        pub len: u64,
+    }
+}
+
+blaze_format::record! {
+    /// What the piece of memory at `address` was aligned to.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct AlignRec: 1 {
+        pub address: u64,
+        pub align: u64,
+    }
+}
+
+blaze_format::record! {
+    /// The memory of a static a constant points into: where it was and the static, as its salsa
+    /// id (the database that wrote it is the one reading it).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct StaticRec: 1 {
+        pub start: u64,
+        pub size: u64,
+        pub id: u64,
+    }
+}
+
+blaze_format::record! {
+    /// A [`MemoryMap`]: `kind` 0 for [`MemoryMap::Empty`], 1 for [`MemoryMap::Simple`] (its
+    /// bytes in `bytes`, every other column empty), 2 for [`MemoryMap::Complex`] (its pieces'
+    /// bytes in `bytes` in the order of their addresses). Types are indices in the buffer's
+    /// type table (`next_solver::persist`): `vtable` in the order of their ids, `type_ids` one
+    /// more than the index, 0 for a `TypeId` of no type.
+    #[derive(Clone, Copy)]
+    pub struct MemoryMapRec: 1 {
+        pub kind: u32,
+        pub bytes: Slice<u8>,
+        pub pieces: Slice<PieceRec>,
+        pub aligns: Slice<AlignRec>,
+        pub statics: Slice<StaticRec>,
+        pub vtable: Slice<u32>,
+        pub type_ids: Slice<u32>,
+    }
+}
+
+blaze_format::record! {
+    /// An [`Allocation`], the value of a constant or a static: its type as an index in the
+    /// buffer's type table, its bytes and what they point to.
+    #[derive(Clone, Copy)]
+    pub struct AllocationRec: 1 {
+        pub ty: u32,
+        pub memory: Slice<u8>,
+        pub map: MemoryMapRec,
+    }
+}
+
+const _: () = assert!(size_of::<MemoryMapRec>() == 4 + 6 * 8);
+const _: () = assert!(size_of::<AllocationRec>() == 4 + 8 + size_of::<MemoryMapRec>());
+
+/// Writes `allocation` into `out`, its types into `tys`; returns where its record is, for the
+/// [`blaze_format::Rel`] of the record that holds it.
+pub fn write_allocation<'db>(
+    out: &mut Writer,
+    tys: &mut TyTableWriter<'db>,
+    allocation: Allocation<'db>,
+) -> u64 {
+    let memory = Placed::push(out, &allocation.memory);
+    let map = write_memory_map(out, &allocation.memory_map, &mut |ty| tys.ty(ty));
+    let ty = tys.ty(allocation.ty);
+    let at = out.next::<AllocationRec>();
+    let record = AllocationRec {
+        ty,
+        memory: memory.slice(at + offset_of!(AllocationRec, memory) as u64),
+        map: map.record(at + offset_of!(AllocationRec, map) as u64),
+    };
+    let written = out.push(&record);
+    debug_assert_eq!(written, at);
+    at
+}
+
+/// The allocation `record`, a record of `buffer`, is of, its types read from `tys`.
+pub fn read_allocation<'db>(
+    record: &AllocationRec,
+    buffer: &[u8],
+    tys: &TyTableReader<'_, 'db>,
+) -> Result<Allocation<'db>, FormatError> {
+    let ty = tys.ty(record.ty)?;
+    let memory = Box::from(record.memory.follow(buffer)?);
+    let memory_map = read_memory_map(&record.map, buffer, &|at| tys.ty(at))?;
+    Ok(Allocation::new(AllocationData { ty, memory, memory_map }))
+}
+
+/// Where a column was written: nowhere when it is empty.
+#[derive(Clone, Copy)]
+struct Placed {
+    at: u64,
+    len: usize,
+}
+
+impl Placed {
+    fn push<T: Record>(out: &mut Writer, values: &[T]) -> Placed {
+        match values.is_empty() {
+            true => Placed { at: 0, len: 0 },
+            false => Placed { at: out.push_slice(values), len: values.len() },
+        }
     }
 
-    pub(crate) fn const_eval_static_cycle_result<'db>(
-        _: &'db dyn HirDatabase,
-        _: salsa::Id,
-        _: StaticId,
-    ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-        Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
+    /// Pushes the `len` values of `values` straight into `out`, one after another: a record's
+    /// size is a multiple of its alignment, so none needs padding after the first.
+    fn push_each<T: Record>(out: &mut Writer, len: usize, values: impl Iterator<Item = T>) -> Placed {
+        if len == 0 {
+            return Placed { at: 0, len: 0 };
+        }
+        out.bytes.reserve(align_of::<T>() + len * size_of::<T>());
+        let at = out.next::<T>();
+        let mut pushed = 0;
+        for value in values {
+            out.push(&value);
+            pushed += 1;
+        }
+        debug_assert_eq!(pushed, len);
+        debug_assert_eq!(out.bytes.len() as u64, at + (len * size_of::<T>()) as u64);
+        Placed { at, len }
+    }
+
+    fn slice<T>(self, field_at: u64) -> Slice<T> {
+        match self.len {
+            0 => Slice::EMPTY,
+            len => Slice::between(field_at, self.at, len),
+        }
+    }
+}
+
+/// The columns of a [`MemoryMapRec`], written.
+struct MapColumns {
+    kind: u32,
+    bytes: Placed,
+    pieces: Placed,
+    aligns: Placed,
+    statics: Placed,
+    vtable: Placed,
+    type_ids: Placed,
+}
+
+impl MapColumns {
+    /// The record of the columns, to be written at `at`.
+    fn record(&self, at: u64) -> MemoryMapRec {
+        let field = |offset: usize| at + offset as u64;
+        MemoryMapRec {
+            kind: self.kind,
+            bytes: self.bytes.slice(field(offset_of!(MemoryMapRec, bytes))),
+            pieces: self.pieces.slice(field(offset_of!(MemoryMapRec, pieces))),
+            aligns: self.aligns.slice(field(offset_of!(MemoryMapRec, aligns))),
+            statics: self.statics.slice(field(offset_of!(MemoryMapRec, statics))),
+            vtable: self.vtable.slice(field(offset_of!(MemoryMapRec, vtable))),
+            type_ids: self.type_ids.slice(field(offset_of!(MemoryMapRec, type_ids))),
+        }
+    }
+}
+
+/// Writes the columns of `map`, each type as the index `ty` gives it.
+fn write_memory_map<'db>(
+    out: &mut Writer,
+    map: &MemoryMap<'db>,
+    ty: &mut dyn FnMut(Ty<'db>) -> u32,
+) -> MapColumns {
+    let none = Placed { at: 0, len: 0 };
+    let mut columns = MapColumns {
+        kind: 0,
+        bytes: none,
+        pieces: none,
+        aligns: none,
+        statics: none,
+        vtable: none,
+        type_ids: none,
+    };
+    match map {
+        MemoryMap::Empty => {}
+        MemoryMap::Simple(bytes) => {
+            columns.kind = 1;
+            columns.bytes = Placed::push(out, bytes);
+        }
+        MemoryMap::Complex(map) => {
+            columns.kind = 2;
+            let memory = &map.memory;
+            columns.bytes = match memory.compact_bytes() {
+                Some(bytes) => Placed::push(out, bytes),
+                None => {
+                    let len = memory.iter().map(|(_, it)| it.len()).sum();
+                    out.bytes.reserve(len);
+                    let at = out.next::<u8>();
+                    memory.iter().for_each(|(_, it)| _ = out.push_slice(it));
+                    Placed { at, len }
+                }
+            };
+            let mut start = 0;
+            columns.pieces = Placed::push_each(
+                out,
+                memory.len(),
+                memory.iter().map(|(&address, it)| {
+                    let piece = PieceRec { address: address as u64, start, len: it.len() as u64 };
+                    start += it.len() as u64;
+                    piece
+                }),
+            );
+            columns.aligns = Placed::push_each(
+                out,
+                map.aligns.len(),
+                map.aligns.iter().map(|&(address, align)| AlignRec {
+                    address: address as u64,
+                    align: align as u64,
+                }),
+            );
+            columns.statics = Placed::push_each(
+                out,
+                map.statics.len(),
+                map.statics.iter().map(|it| StaticRec {
+                    start: it.start as u64,
+                    size: it.size as u64,
+                    id: salsa::plumbing::AsId::as_id(&it.id).as_bits(),
+                }),
+            );
+            columns.vtable = Placed::push_each(
+                out,
+                crate::vtable_types(&map.vtable).count(),
+                crate::vtable_types(&map.vtable).map(&mut *ty),
+            );
+            columns.type_ids = Placed::push_each(
+                out,
+                map.type_ids.len(),
+                map.type_ids.iter().map(|it| it.map_or(0, |it| ty(it) + 1)),
+            );
+        }
+    }
+    columns
+}
+
+/// The memory map `record`, a record of `buffer`, is of, each type read as `ty` reads its index.
+fn read_memory_map<'db>(
+    record: &MemoryMapRec,
+    buffer: &[u8],
+    ty: &dyn Fn(u32) -> Result<Ty<'db>, FormatError>,
+) -> Result<MemoryMap<'db>, FormatError> {
+    let at = (record as *const MemoryMapRec as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
+    let invalid = |what| FormatError::Invalid { at, what };
+    let word = |value: u64| usize::try_from(value).map_err(|_| invalid("an address past usize"));
+    let bytes = record.bytes.follow(buffer)?;
+    let pieces = record.pieces.follow(buffer)?;
+    let aligns = record.aligns.follow(buffer)?;
+    let statics = record.statics.follow(buffer)?;
+    let vtable = record.vtable.follow(buffer)?;
+    let type_ids = record.type_ids.follow(buffer)?;
+    let only_bytes = pieces.is_empty()
+        && aligns.is_empty()
+        && statics.is_empty()
+        && vtable.is_empty()
+        && type_ids.is_empty();
+    match record.kind {
+        0 if only_bytes && bytes.is_empty() => return Ok(MemoryMap::Empty),
+        1 if only_bytes => return Ok(MemoryMap::Simple(Box::from(bytes))),
+        0 | 1 => return Err(invalid("columns a memory map of its kind does not have")),
+        2 => {}
+        _ => return Err(invalid("a memory map of no kind")),
+    }
+    let mut addresses = Vec::with_capacity(pieces.len());
+    let mut extents = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        let address = word(piece.address)?;
+        if addresses.last().is_some_and(|&last| last >= address) {
+            return Err(invalid("pieces of memory out of the order of their addresses"));
+        }
+        let (start, len) = (word(piece.start)?, word(piece.len)?);
+        if start.checked_add(len).is_none_or(|end| end > bytes.len()) {
+            return Err(invalid("a piece of memory past the bytes of its map"));
+        }
+        addresses.push(address);
+        extents.push(crate::Extent { start, len });
+    }
+    let mut map = ComplexMemoryMap {
+        memory: crate::MemoryPieces::from_columns(bytes.to_vec(), addresses, extents),
+        aligns: Vec::with_capacity(aligns.len()),
+        statics: Vec::with_capacity(statics.len()),
+        type_ids: Vec::with_capacity(type_ids.len()),
+        ..ComplexMemoryMap::default()
+    };
+    for align in aligns {
+        if map.aligns.last().is_some_and(|&(last, _)| last as u64 >= align.address) {
+            return Err(invalid("alignments out of the order of their addresses"));
+        }
+        map.aligns.push((word(align.address)?, word(align.align)?));
+    }
+    for it in statics {
+        if it.id as u32 == 0 {
+            return Err(invalid("a static of salsa id index 0"));
+        }
+        let id = salsa::plumbing::FromId::from_id(salsa::Id::from_bits(it.id));
+        map.statics.push(StaticMemory { start: word(it.start)?, size: word(it.size)?, id });
+    }
+    let mut last = None;
+    for &at in vtable {
+        let id = map.vtable.id(ty(at)?);
+        if last.is_some_and(|last: usize| id != last + 1) {
+            return Err(invalid("a type twice in a vtable map"));
+        }
+        last = Some(id);
+    }
+    for &at in type_ids {
+        map.type_ids.push(match at {
+            0 => None,
+            at => Some(ty(at - 1)?),
+        });
+    }
+    Ok(MemoryMap::Complex(Box::new(map)))
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_format::{Aligned, Record};
+
+    use super::*;
+
+    fn write(map: &MemoryMap<'static>) -> Aligned {
+        let mut out = Writer::new(<MemoryMapRec as Record>::SCHEMA);
+        let columns = write_memory_map(&mut out, map, &mut |_| unreachable!("a map without types"));
+        let at = out.next::<MemoryMapRec>();
+        let root = out.push(&columns.record(at));
+        Aligned::copy_from(&out.finish(root))
+    }
+
+    fn read(buffer: &[u8]) -> Result<MemoryMap<'static>, FormatError> {
+        let record = blaze_format::open::<MemoryMapRec>(buffer)?;
+        read_memory_map(record, buffer, &|_| unreachable!("a map without types"))
+    }
+
+    fn complex() -> ComplexMemoryMap<'static> {
+        let mut map = ComplexMemoryMap::default();
+        map.insert(0x2000, Box::new([1u8, 2, 3, 4, 5, 6, 7, 8]));
+        map.insert(0x1000, Box::new([9u8; 3]));
+        map.insert(0x1000, Box::new([10u8; 5]));
+        map.insert(0x2004, Box::new([5u8, 6]));
+        map.insert(0x3000, Box::new([0u8; 0]));
+        map.note_align(0x2000, 8);
+        map.note_align(0x1000, 1);
+        map.statics.push(StaticMemory {
+            start: 0x9000,
+            size: 16,
+            id: salsa::plumbing::FromId::from_id(salsa::Id::from_bits(7 | (2 << 32))),
+        });
+        map
+    }
+
+    #[test]
+    fn memory_maps_read_back_as_written() {
+        for map in [
+            MemoryMap::Empty,
+            MemoryMap::simple(Box::new([0u8; 0])),
+            MemoryMap::simple(Box::new([1u8, 2, 3])),
+            MemoryMap::Complex(Box::default()),
+            MemoryMap::Complex(Box::new(complex())),
+        ] {
+            assert_eq!(read(&write(&map)).unwrap(), map);
+        }
+    }
+
+    #[test]
+    fn equal_maps_are_equal_bytes() {
+        let mut other = ComplexMemoryMap::default();
+        other.note_align(0x1000, 1);
+        other.insert(0x3000, Box::new([0u8; 0]));
+        other.insert(0x2004, Box::new([5u8, 6]));
+        other.insert(0x1000, Box::new([10u8; 5]));
+        other.note_align(0x2000, 8);
+        other.insert(0x2000, Box::new([1u8, 2, 3, 4, 5, 6, 7, 8]));
+        other.statics = complex().statics;
+        let (a, b) = (MemoryMap::Complex(Box::new(complex())), MemoryMap::Complex(Box::new(other)));
+        assert_eq!(a, b);
+        assert_eq!(&*write(&a), &*write(&b));
+        // A piece that grew leaves nothing of its old bytes in the buffer.
+        let buffer = write(&a);
+        let record = blaze_format::open::<MemoryMapRec>(&buffer).unwrap();
+        assert_eq!(record.bytes.get(&buffer).len(), 5 + 8 + 2);
+    }
+
+    /// A buffer of a map of `kind` with `pieces` over `bytes`, as no writer of a map writes it.
+    fn forged(kind: u32, pieces: &[PieceRec], bytes: &[u8]) -> Aligned {
+        let mut out = Writer::new(<MemoryMapRec as Record>::SCHEMA);
+        let pieces_at = Placed::push(&mut out, pieces);
+        let bytes_at = Placed::push(&mut out, bytes);
+        let none = Placed { at: 0, len: 0 };
+        let columns = MapColumns {
+            kind,
+            bytes: bytes_at,
+            pieces: pieces_at,
+            aligns: none,
+            statics: none,
+            vtable: none,
+            type_ids: none,
+        };
+        let at = out.next::<MemoryMapRec>();
+        let root = out.push(&columns.record(at));
+        Aligned::copy_from(&out.finish(root))
+    }
+
+    #[test]
+    fn maps_no_writer_writes_are_refused() {
+        let piece = |address, start, len| PieceRec { address, start, len };
+        assert!(read(&forged(3, &[], &[])).is_err());
+        assert!(read(&forged(0, &[], &[1])).is_err());
+        assert!(read(&forged(1, &[piece(0, 0, 1)], &[1])).is_err());
+        assert!(read(&forged(2, &[piece(8, 0, 2)], &[1])).is_err());
+        assert!(read(&forged(2, &[piece(8, u64::MAX, 2)], &[1, 2])).is_err());
+        assert!(read(&forged(2, &[piece(8, 0, 1), piece(8, 1, 1)], &[1, 2])).is_err());
+        assert!(read(&forged(2, &[piece(9, 0, 1), piece(8, 1, 1)], &[1, 2])).is_err());
+        let read_back = read(&forged(2, &[piece(8, 0, 1), piece(9, 0, 2)], &[1, 2])).unwrap();
+        let MemoryMap::Complex(map) = read_back else { panic!("a complex map read as another") };
+        assert_eq!(map.memory.get(&9), Some(&[1, 2][..]));
     }
 }

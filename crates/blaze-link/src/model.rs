@@ -119,6 +119,10 @@ pub(crate) enum Special {
     Absolute(u64),
     /// The descriptor a live program finds its jump table by (`blaze_live::patch`).
     LiveDescriptor,
+    /// The address of the GOT cell of the symbol named so, resolved as any reference to it
+    /// is: an import's import address table entry, or a cell holding a local symbol's
+    /// address (PE's `__imp_X`; link.exe's LNK4217 case).
+    Got(String),
 }
 
 /// How a relocation is written. Every format's relocation types are read into these, and
@@ -234,6 +238,23 @@ pub(crate) struct Object {
     pub groups: Vec<Group>,
     /// Libraries the object asks for (`/DEFAULTLIB` of a COFF object, `LC_LINKER_OPTION`).
     pub libraries: Vec<String>,
+    /// What a COFF object's `.drectve` asks of the link beyond its libraries.
+    pub directives: Vec<Directive>,
+}
+
+/// What a COFF object's `.drectve` asks of the link beyond [`Object::libraries`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Directive {
+    /// `/INCLUDE:sym`: the link defines `sym` (pulling archive members for it) and keeps it.
+    Include(String),
+    /// `/EXPORT:name[=symbol][,DATA]`: the image exports `symbol` under `name`.
+    Export { name: String, symbol: String, data: bool },
+    /// `/FAILIFMISMATCH:key=value`: every object of the link naming `key` names `value`; an
+    /// error naming both objects otherwise (LNK2038: mixing CRTs or `_ITERATOR_DEBUG_LEVEL`).
+    Mismatch { key: String, value: String },
+    /// `/NODEFAULTLIB[:lib]`: the default library `lib` (every one when `None`) is not added
+    /// for any object's `libraries` ([`crate::default_libraries`]).
+    NoDefaultLib(Option<String>),
 }
 
 #[derive(Clone, Debug)]
@@ -293,6 +314,8 @@ pub(crate) struct Symbol {
     pub kind: SymbolKind,
     /// Not exported from a shared library (`STV_HIDDEN`, a private extern).
     pub hidden: bool,
+    /// wasm: what an undefined function is imported as when nothing defines it.
+    pub import: Option<blaze_codegen::wasm::Import>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -303,6 +326,12 @@ pub(crate) enum SymbolDef {
     /// A tentative definition, merged by name; the largest wins.
     Common { size: u64, align: u64 },
     Absolute(u64),
+    /// Undefined here; when the link leaves the name undefined, it is the object's symbol
+    /// `symbol` (COFF weak externals, `/ALTERNATENAME:from=to`). Archives are searched for it
+    /// on this object's account only when `search` (`IMAGE_WEAK_EXTERN_SEARCH_LIBRARY`,
+    /// `ALIAS`); another object's reference still may. `symbol` is resolved (and an error
+    /// when undefined) only when the fallback is taken.
+    Fallback { symbol: u32, search: bool },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -326,6 +355,9 @@ pub(crate) enum SymbolKind {
 pub(crate) struct Group {
     pub name: String,
     pub sections: Vec<u32>,
+    /// Of this name the group whose first section is largest is kept, not the first one
+    /// (`IMAGE_COMDAT_SELECT_LARGEST`: MSVC's vftables with or without their RTTI locator).
+    pub largest: bool,
 }
 
 /// An archive: its members are read only when one defines a symbol the link needs, as a
@@ -376,6 +408,8 @@ pub(crate) struct Import {
     pub version: Option<String>,
     pub kind: SymbolKind,
     pub weak: bool,
+    /// wasm: the module and field it is imported from, and its type.
+    pub wasm: Option<blaze_codegen::wasm::Import>,
 }
 
 /// A GOT cell and what it holds.
@@ -491,6 +525,9 @@ pub(crate) struct Placed<'a> {
     pub id: [u8; 16],
     /// The debug sections the core made ([`crate::dwarf`]), by DWARF name (`.debug_line`).
     pub debug: &'a [(&'static str, Vec<u8>)],
+    /// The address of a global name the image defines, an object's or a special (PE's data
+    /// directories point at the CRT's `_tls_used` and `_load_config_used`).
+    pub symbol: &'a dyn Fn(&str) -> Option<u64>,
 }
 
 impl Placed<'_> {
@@ -569,6 +606,18 @@ pub(crate) trait Writer: Send + Sync {
 
     /// The symbol the linker defines under `name`, if it defines one.
     fn special(&self, name: &str) -> Option<Special>;
+
+    /// The entry of a shared image, rooted and resolved as an executable's (PE's
+    /// `_DllMainCRTStartup`, which runs a DLL's CRT and C++ initializers).
+    fn shared_entry(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The class and rank of a piece the core places with no section name of its own
+    /// (codegen's code and statics), given the class the core would use.
+    fn own(&self, class: &Class) -> (Class, u32) {
+        (class.clone(), u32::MAX)
+    }
 
     /// Reads a native input of the format.
     fn read(&self, name: &str, bytes: &[u8], kind: &crate::NativeKind)

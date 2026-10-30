@@ -194,17 +194,47 @@ pub enum RelocKind {
     Call26,
     /// AArch64 `ADRP`: the page, 21 bits (`R_AARCH64_ADR_PREL_PG_HI21`).
     AdrpPage21,
-    /// AArch64 `ADD`/`LDR`: the low 12 bits (`R_AARCH64_ADD_ABS_LO12_NC`).
+    /// AArch64 `ADD`/`LDR`/`STR`: the low 12 bits, scaled as the instruction's access size
+    /// says (`R_AARCH64_ADD_ABS_LO12_NC`, `LDST{8,16,32,64,128}_ABS_LO12_NC`); the linker
+    /// reads the scale from the instruction.
     PageOffset12,
     /// AArch64 `LDR` from the GOT (`R_AARCH64_ADR_GOT_PAGE`, `LD64_GOT_LO12_NC`).
     GotPage21,
     GotPageOffset12,
-    /// Thread-local: the offset in the thread's block.
+    /// Thread-local, local exec: the offset in the thread's block (x86-64 ELF `TPOFF32`).
     TlsOffset,
     /// wasm: a function or table index, a memory address.
     WasmFunction,
     WasmTable,
     WasmMemory,
+    /// x86-64 ELF general dynamic: the GOT pair `__tls_get_addr` takes (`R_X86_64_TLSGD`).
+    TlsGd32,
+    /// x86-64 ELF initial exec: the GOT cell holding the offset (`R_X86_64_GOTTPOFF`).
+    TlsGotTpOff32,
+    /// x86-64 Mach-O: `rel32` to the cell holding the variable's descriptor
+    /// (`X86_64_RELOC_TLV`).
+    TlvRel32,
+    /// AArch64 Mach-O: that cell's page and low 12 bits for an `LDR`
+    /// (`ARM64_RELOC_TLVP_LOAD_PAGE21`, `TLVP_LOAD_PAGEOFF12`).
+    TlvPage21,
+    TlvPageOffset12,
+    /// AArch64 ELF TLS descriptor: the GOT pair's page, its `LDR`, its `ADD`, and the call
+    /// (`R_AARCH64_TLSDESC_ADR_PAGE21`, `LD64_LO12`, `ADD_LO12`, `CALL`).
+    TlsDescPage21,
+    TlsDescLd64Lo12,
+    TlsDescAddLo12,
+    TlsDescCall,
+    /// AArch64 ELF initial exec: the GOT cell's page and low 12 bits
+    /// (`R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21`, `LD64_GOTTPREL_LO12_NC`).
+    TlsIePage21,
+    TlsIeLo12,
+    /// AArch64 ELF local exec: the offset's high and low 12 bits
+    /// (`R_AARCH64_TLSLE_ADD_TPREL_HI12`, `ADD_TPREL_LO12_NC`).
+    TpHi12,
+    TpLo12,
+    /// COFF: the offset in its section (`IMAGE_REL_AMD64_SECREL`, `IMAGE_REL_ARM64_SECREL`):
+    /// a thread-local's place in the `.tls` block.
+    SectionRel32,
 }
 
 /// What a relocation points at.

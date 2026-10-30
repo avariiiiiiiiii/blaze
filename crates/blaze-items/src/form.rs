@@ -4,14 +4,14 @@
 //! code or the object file, visibility, and for a body the MIR the code generator is given. It
 //! leaves out what the program cannot observe: names (but where they are linked against or a
 //! type's name is asked for), the order where clauses or `dyn` bounds are written in, trivia,
-//! and the positions of code, which go to [`Sub::spans`] instead. Every other item it mentions
+//! and the positions of code, which go to [`Code::spans`] instead. Every other item it mentions
 //! is a slot, numbered in the order the form first meets it, for [`crate::hash`] to fill.
 //!
 //! Dense ids (salsa ids, arena indexes across items) are never hashed. Inside one body the
 //! blocks and locals are numbered by a walk from the start block, and expression ids, binding
 //! ids and closure positions are positions in that body's own store.
 
-use std::{cell::RefCell, fmt::Debug, rc::Rc};
+use std::{cell::RefCell, fmt::Debug};
 
 use base_db::Crate;
 use blaze_ids::ContentId;
@@ -73,33 +73,77 @@ use crate::{
 const DOMAIN: &str = "blaze v2 form 1";
 const SPANS_DOMAIN: &str = "blaze v2 form spans 1";
 
-const ERROR_TYPE: &str = "a type with an error";
-const ERROR_CONST: &str = "a constant with an error";
-const NO_MIR: &str = "MIR that failed to lower";
-const NO_RULES: &str = "a macro without rules";
+/// Why a form is not of a program rustc accepts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub(crate) enum Missed {
+    ErrorType,
+    ErrorConst,
+    NoMir,
+    NoRules,
+    ImplItemNotInTrait,
+    VisibilityOutside,
+    ProcMacroWithoutFn,
+}
 
-/// A form, hashed: its digest, what fills its slots in order, and why it is not of a program
-/// rustc accepts, if it is not.
+impl Missed {
+    /// What is hashed of it, and what the error says.
+    pub(crate) fn what(self) -> &'static str {
+        match self {
+            Missed::ErrorType => "a type with an error",
+            Missed::ErrorConst => "a constant with an error",
+            Missed::NoMir => "MIR that failed to lower",
+            Missed::NoRules => "a macro without rules",
+            Missed::ImplItemNotInTrait => "an impl item its trait does not have",
+            Missed::VisibilityOutside => "a visibility of a module the item is not in",
+            Missed::ProcMacroWithoutFn => "a procedural macro without its function",
+        }
+    }
+}
+
+/// A form, hashed: what every hash of an item reads of it. Its positions are apart, in
+/// [`Code::spans`].
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct Sub {
     pub(crate) digest: ContentId,
     /// Distinct, in slot order: slot 0 is `refs[0]`.
-    pub(crate) refs: Vec<ItemId>,
-    /// Set only when the program is not one rustc accepts (an error type or constant, MIR
-    /// that failed to lower, a macro without rules).
-    pub(crate) missed: Option<&'static str>,
-    /// The hash of the positions (MirSpans) of its code, in order: never in `digest`.
+    pub(crate) refs: Box<[ItemId]>,
+    /// Set only when the program is not one rustc accepts.
+    pub(crate) missed: Option<Missed>,
+}
+
+const _: () = assert!(size_of::<Sub>() == 56);
+
+/// A body's form and the hash of the positions (MirSpans) of its code, in order: read by what
+/// fills positions in, never by a hash of the item.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Code {
+    pub(crate) sub: Sub,
     pub(crate) spans: ContentId,
 }
 
+const _: () = assert!(size_of::<Code>() == 88);
+
+/// A finished sub-form inside one [`Cx`]: its refs are a range of [`Cx::refs`].
+#[derive(Clone, Copy)]
+struct Part {
+    digest: ContentId,
+    spans: ContentId,
+    refs_at: u32,
+    refs_len: u32,
+    missed: Option<Missed>,
+}
+
+const _: () = assert!(size_of::<Part>() == 76);
+
 /// The preimages of a form's digest and spans, hashed when it is finished: whole, or many
-/// small ones in one batched call ([`Form::finish_many`]).
+/// small ones in one batched call ([`Cx::parts`]).
 struct Form {
     digest: Vec<u8>,
     spans: Vec<u8>,
     refs: Vec<ItemId>,
     slots: FxHashMap<ItemId, u32>,
-    missed: Option<&'static str>,
+    missed: Option<Missed>,
 }
 
 impl Form {
@@ -179,10 +223,10 @@ impl Form {
         self.u32(slot);
     }
 
-    fn error(&mut self, why: &'static str) {
+    fn error(&mut self, why: Missed) {
         self.missed.get_or_insert(why);
         self.u8(0xff);
-        self.str(why);
+        self.str(why.what());
     }
 
     fn span(&mut self, span: MirSpan) {
@@ -198,43 +242,17 @@ impl Form {
         self.spans.extend_from_slice(&at.to_le_bytes());
     }
 
-    fn sub(&mut self, sub: &Sub) {
-        self.update(&sub.digest.0);
-        self.spans.extend_from_slice(&sub.spans.0);
-        for &id in &sub.refs {
-            self.item(id);
-        }
-        if let Some(why) = sub.missed {
-            self.missed.get_or_insert(why);
-        }
-    }
-
-    fn finish(self) -> Sub {
+    fn sub(self) -> Sub {
         Sub {
             digest: ContentId::of(DOMAIN, &self.digest),
-            refs: self.refs,
+            refs: self.refs.into_boxed_slice(),
             missed: self.missed,
-            spans: ContentId::of(SPANS_DOMAIN, &self.spans),
         }
     }
 
-    /// Each form finished as [`Form::finish`] would, the digests and spans hashed in one
-    /// batched call each.
-    fn finish_many(forms: Vec<Form>) -> Vec<Sub> {
-        let digests: Vec<&[u8]> = forms.iter().map(|it| it.digest.as_slice()).collect();
-        let digests = ContentId::of_many(DOMAIN, &digests);
-        let spans: Vec<&[u8]> = forms.iter().map(|it| it.spans.as_slice()).collect();
-        let spans = ContentId::of_many(SPANS_DOMAIN, &spans);
-        forms
-            .into_iter()
-            .zip(digests.into_iter().zip(spans))
-            .map(|(form, (digest, spans))| Sub {
-                digest,
-                refs: form.refs,
-                missed: form.missed,
-                spans,
-            })
-            .collect()
+    fn code(self) -> Code {
+        let spans = ContentId::of(SPANS_DOMAIN, &self.spans);
+        Code { sub: self.sub(), spans }
     }
 }
 
@@ -247,7 +265,11 @@ enum Nested<'db> {
 
 pub(crate) struct Cx<'db> {
     db: &'db dyn HirDatabase,
-    tys: RefCell<FxHashMap<Ty<'db>, Rc<Sub>>>,
+    tys: RefCell<FxHashMap<Ty<'db>, Part>>,
+    /// The refs of every finished [`Part`], each one's a range.
+    refs: RefCell<Vec<ItemId>>,
+    /// The spans hash of a form with no positions, which most are.
+    no_spans: ContentId,
     /// The types being spelled, outermost first: one met again contains itself.
     spelling: RefCell<Vec<Ty<'db>>>,
 }
@@ -292,7 +314,80 @@ fn crate_auto_traits(db: &dyn HirDatabase, krate: Crate) -> Box<[(ItemKey, Trait
 
 impl<'db> Cx<'db> {
     pub(crate) fn new(db: &'db dyn HirDatabase) -> Cx<'db> {
-        Cx { db, tys: RefCell::default(), spelling: RefCell::default() }
+        Cx {
+            db,
+            tys: RefCell::default(),
+            refs: RefCell::default(),
+            no_spans: ContentId::of(SPANS_DOMAIN, &[]),
+            spelling: RefCell::default(),
+        }
+    }
+
+    fn part(&self, form: Form) -> Part {
+        let digest = ContentId::of(DOMAIN, &form.digest);
+        let spans = if form.spans.is_empty() {
+            self.no_spans
+        } else {
+            ContentId::of(SPANS_DOMAIN, &form.spans)
+        };
+        self.finished(form, digest, spans)
+    }
+
+    /// Each form finished as [`Cx::part`] would, the digests and the positions hashed in one
+    /// batched call each.
+    fn parts(&self, forms: Vec<Form>) -> Vec<Part> {
+        let digests: Vec<&[u8]> = forms.iter().map(|it| it.digest.as_slice()).collect();
+        let digests = ContentId::of_many(DOMAIN, &digests);
+        let positioned: Vec<&[u8]> = forms
+            .iter()
+            .filter(|it| !it.spans.is_empty())
+            .map(|it| it.spans.as_slice())
+            .collect();
+        let mut positioned = ContentId::of_many(SPANS_DOMAIN, &positioned).into_iter();
+        forms
+            .into_iter()
+            .zip(digests)
+            .map(|(form, digest)| {
+                let spans = if form.spans.is_empty() {
+                    self.no_spans
+                } else {
+                    positioned.next().expect("a spans hash per form with positions")
+                };
+                self.finished(form, digest, spans)
+            })
+            .collect()
+    }
+
+    fn finished(&self, form: Form, digest: ContentId, spans: ContentId) -> Part {
+        let mut refs = self.refs.borrow_mut();
+        let refs_at = refs.len() as u32;
+        refs.extend_from_slice(&form.refs);
+        Part { digest, spans, refs_at, refs_len: form.refs.len() as u32, missed: form.missed }
+    }
+
+    /// `part` written into `f`: its digest and positions, and its refs as slots of `f`.
+    fn merge(&self, f: &mut Form, part: Part) {
+        f.update(&part.digest.0);
+        f.spans.extend_from_slice(&part.spans.0);
+        let refs = self.refs.borrow();
+        let at = part.refs_at as usize;
+        for &id in &refs[at..at + part.refs_len as usize] {
+            f.item(id);
+        }
+        if let Some(why) = part.missed {
+            f.missed.get_or_insert(why);
+        }
+    }
+
+    fn nest(&self, f: &mut Form, form: Form) {
+        let part = self.part(form);
+        self.merge(f, part);
+    }
+
+    fn sub_of(&self, part: Part) -> Sub {
+        let at = part.refs_at as usize;
+        let refs = self.refs.borrow()[at..at + part.refs_len as usize].into();
+        Sub { digest: part.digest, refs, missed: part.missed }
     }
 
     /// What the item's dependents see of it.
@@ -333,12 +428,12 @@ impl<'db> Cx<'db> {
                 self.macro_(f, it);
             }
         }
-        form.finish()
+        form.sub()
     }
 
     /// The MIR of a function, static or constant with the closures and coroutines written in
     /// it; `None` for an item with no body.
-    pub(crate) fn body(&self, id: ItemId) -> Option<Sub> {
+    pub(crate) fn body(&self, id: ItemId) -> Option<Code> {
         let db = self.db;
         let def = match id {
             ItemId::Function(it) if FunctionSignature::of(db, it).has_body() => {
@@ -359,38 +454,42 @@ impl<'db> Cx<'db> {
             | ItemId::Alias(_)
             | ItemId::Macro(_) => return None,
         };
-        Some(self.code(InferBodyId::DefWithBodyId(def)))
+        Some(self.code_form(InferBodyId::DefWithBodyId(def)).code())
     }
 
     /// One closure's code alone, for it to be built alone.
-    pub(crate) fn closure_code(&self, closure: InternedClosureId<'db>) -> Sub {
+    pub(crate) fn closure_code(&self, closure: InternedClosureId<'db>) -> Code {
         let mut f = Form::new("closure code");
         match self.db.mir_body_for_closure(closure) {
             Ok(body) => self.mir(&mut f, body, &mut Vec::new()),
-            Err(_) => f.error(NO_MIR),
+            Err(_) => f.error(Missed::NoMir),
         }
-        f.finish()
+        f.code()
     }
 
     /// One coroutine's code alone.
-    pub(crate) fn coroutine_code(&self, coroutine: InternedCoroutineId<'db>) -> Sub {
+    pub(crate) fn coroutine_code(&self, coroutine: InternedCoroutineId<'db>) -> Code {
         let mut f = Form::new("coroutine code");
         match self.db.mir_body_for_coroutine(coroutine) {
             Ok(body) => self.mir(&mut f, body, &mut Vec::new()),
-            Err(_) => f.error(NO_MIR),
+            Err(_) => f.error(Missed::NoMir),
         }
-        f.finish()
+        f.code()
     }
 
     /// What a closure captures and how, and the signature inference gave it.
     pub(crate) fn captures(&self, closure: InternedClosureId<'db>) -> Sub {
-        self.captures_of(closure.loc(self.db))
+        self.captures_of(closure.loc(self.db)).sub()
     }
 
     /// For each auto trait of the crates the owner's crate loads, in the order of their keys,
     /// whether the hidden type of the owner's `index`th opaque type implements it where the
     /// owner is written: what a caller learns of an `impl Trait` beyond its bounds.
     pub(crate) fn auto_traits(&self, owner: ItemId, index: u32) -> Sub {
+        self.auto_traits_form(owner, index).sub()
+    }
+
+    fn auto_traits_form(&self, owner: ItemId, index: u32) -> Form {
         let db = self.db;
         let def = match owner {
             ItemId::Function(it) => GenericDefId::from(it),
@@ -406,8 +505,8 @@ impl<'db> Cx<'db> {
         };
         let mut f = Form::new("auto traits");
         let Some(hidden) = self.hidden(owner, index) else {
-            f.error(ERROR_TYPE);
-            return f.finish();
+            f.error(Missed::ErrorType);
+            return f;
         };
         self.ty_in(&mut f, hidden);
         let krate = owner.krate(db);
@@ -423,11 +522,15 @@ impl<'db> Cx<'db> {
             let env = ParamEnvAndCrate { param_env: db.trait_environment(def), krate };
             f.bool(implements_trait_unique(hidden, db, env, it));
         }
-        f.finish()
+        f
     }
 
     /// A field: its type, default, visibility and attributes.
     pub(crate) fn field(&self, variant: VariantId, field: LocalFieldId) -> Sub {
+        self.field_form(variant, field).sub()
+    }
+
+    fn field_form(&self, variant: VariantId, field: LocalFieldId) -> Form {
         let db = self.db;
         let mut form = Form::new("field");
         let f = &mut form;
@@ -442,43 +545,45 @@ impl<'db> Cx<'db> {
                     None => f.u8(0),
                 }
             }
-            None => f.error(ERROR_TYPE),
+            None => f.error(Missed::ErrorType),
         }
         f.bool(variant.fields(db).fields()[field].is_unsafe);
         match VariantFields::field_visibilities(db, variant).get(field) {
             Some(&vis) => self.visibility(f, variant_module(db, variant), vis),
-            None => f.error(ERROR_TYPE),
+            None => f.error(Missed::ErrorType),
         }
         let flags = AttrFlags::query_field(db, FieldId { parent: variant, local_id: field });
         f.u64(flags.difference(unobserved()).bits());
-        form.finish()
+        form
     }
 
     /// A type: its digest and slots are the same wherever it is written.
     pub(crate) fn ty(&self, ty: Ty<'db>) -> Sub {
-        (*self.ty_sub(ty)).clone()
+        let part = self.ty_part(ty);
+        self.sub_of(part)
     }
 
-    fn ty_sub(&self, ty: Ty<'db>) -> Rc<Sub> {
-        if let Some(known) = self.tys.borrow().get(&ty) {
-            return known.clone();
+    fn ty_part(&self, ty: Ty<'db>) -> Part {
+        let known = self.tys.borrow().get(&ty).copied();
+        if let Some(known) = known {
+            return known;
         }
         let mut form = Form::new("ty");
         if self.spelling.borrow().contains(&ty) {
-            form.error(ERROR_TYPE);
-            return Rc::new(form.finish());
+            form.error(Missed::ErrorType);
+            return self.part(form);
         }
         self.spelling.borrow_mut().push(ty);
         self.spell(&mut form, ty);
         self.spelling.borrow_mut().pop();
-        let sub = Rc::new(form.finish());
-        self.tys.borrow_mut().insert(ty, sub.clone());
-        sub
+        let part = self.part(form);
+        self.tys.borrow_mut().insert(ty, part);
+        part
     }
 
     fn ty_in(&self, f: &mut Form, ty: Ty<'db>) {
-        let sub = self.ty_sub(ty);
-        f.sub(&sub);
+        let part = self.ty_part(ty);
+        self.merge(f, part);
     }
 
     fn function(&self, f: &mut Form, func: FunctionId) {
@@ -506,7 +611,7 @@ impl<'db> Cx<'db> {
         // A `const fn`'s body is what its callers' constants evaluate.
         if data.flags.contains(FnFlags::CONST) && data.has_body() {
             f.u8(1);
-            f.sub(&self.code(InferBodyId::DefWithBodyId(func.into())));
+            self.nest(f, self.code_form(InferBodyId::DefWithBodyId(func.into())));
         } else {
             f.u8(0);
         }
@@ -585,7 +690,7 @@ impl<'db> Cx<'db> {
         }
         f.len(fields.len());
         for (field, _) in fields.fields().iter() {
-            f.sub(&self.field(variant, field));
+            self.nest(f, self.field_form(variant, field));
         }
     }
 
@@ -634,7 +739,7 @@ impl<'db> Cx<'db> {
                     }
                 }
                 if used.len() != items.len() {
-                    f.error("an impl item its trait does not have");
+                    f.error(Missed::ImplItemNotInTrait);
                 }
             }
             None => {
@@ -659,7 +764,7 @@ impl<'db> Cx<'db> {
         // A constant's value is what its users see: it is in their code.
         if data.has_body() {
             f.u8(1);
-            f.sub(&self.code(InferBodyId::DefWithBodyId(it.into())));
+            self.nest(f, self.code_form(InferBodyId::DefWithBodyId(it.into())));
         } else {
             f.u8(0);
         }
@@ -682,7 +787,7 @@ impl<'db> Cx<'db> {
         if !data.flags.contains(StaticFlags::MUTABLE) && data.flags.contains(StaticFlags::HAS_BODY)
         {
             f.u8(1);
-            f.sub(&self.code(InferBodyId::DefWithBodyId(it.into())));
+            self.nest(f, self.code_form(InferBodyId::DefWithBodyId(it.into())));
         } else {
             f.u8(0);
         }
@@ -720,9 +825,9 @@ impl<'db> Cx<'db> {
         match self.hidden(owner, index) {
             Some(hidden) => {
                 self.ty_in(f, hidden);
-                f.sub(&self.auto_traits(owner, index));
+                self.nest(f, self.auto_traits_form(owner, index));
             }
-            None => f.error(ERROR_TYPE),
+            None => f.error(Missed::ErrorType),
         }
     }
 
@@ -787,14 +892,14 @@ impl<'db> Cx<'db> {
                 f.update(&key::crate_key(db, krate).0);
                 match crate_def_map(db, krate).proc_macro_as_fn(it) {
                     Some(func) => f.item(ItemId::Function(func)),
-                    None => f.error("a procedural macro without its function"),
+                    None => f.error(Missed::ProcMacroWithoutFn),
                 }
                 return;
             }
         };
         f.len(trees.len());
         for tree in trees {
-            let Some(tree) = tree else { return f.error(NO_RULES) };
+            let Some(tree) = tree else { return f.error(Missed::NoRules) };
             let tokens: Vec<_> =
                 tree.syntax().descendants_with_tokens().filter_map(|it| it.into_token()).collect();
             let solid = tokens.iter().filter(|it| !it.kind().is_trivia()).count();
@@ -861,7 +966,7 @@ impl<'db> Cx<'db> {
                             at = parent;
                             up += 1;
                         }
-                        None => return f.error("a visibility of a module the item is not in"),
+                        None => return f.error(Missed::VisibilityOutside),
                     }
                 }
                 f.u8(2);
@@ -899,7 +1004,7 @@ impl<'db> Cx<'db> {
                     match id {
                         GenericParamId::ConstParamId(it) => self.ty_in(f, db.const_param_ty(it)),
                         GenericParamId::TypeParamId(_) | GenericParamId::LifetimeParamId(_) => {
-                            f.error(ERROR_CONST)
+                            f.error(Missed::ErrorConst)
                         }
                     }
                 }
@@ -1038,28 +1143,28 @@ impl<'db> Cx<'db> {
                     }
                     forms.push(g);
                 }
-                self.sorted(f, Form::finish_many(forms));
+                self.sorted(f, self.parts(forms));
                 self.region(f, region);
             }
             TyKind::Closure(id, args) => {
                 f.u8(17);
                 let loc = id.0.loc(db);
                 self.closure_at(f, loc);
-                f.sub(&self.captures_of(loc));
+                self.nest(f, self.captures_of(loc));
                 self.args(f, args);
             }
             TyKind::CoroutineClosure(id, args) => {
                 f.u8(18);
                 let loc = id.0.loc(db);
                 self.closure_at(f, loc);
-                f.sub(&self.captures_of(loc));
+                self.nest(f, self.captures_of(loc));
                 self.args(f, args);
             }
             TyKind::Coroutine(id, args) => {
                 f.u8(19);
                 let loc = id.0.loc(db);
                 self.closure_at(f, loc);
-                f.sub(&self.captures_of(loc));
+                self.nest(f, self.captures_of(loc));
                 self.args(f, args);
                 self.held(f, id.0, args);
             }
@@ -1146,7 +1251,7 @@ impl<'db> Cx<'db> {
                     }
                 }
             }
-            TyKind::Error(_) => f.error(ERROR_TYPE),
+            TyKind::Error(_) => f.error(Missed::ErrorType),
         }
     }
 
@@ -1245,7 +1350,7 @@ impl<'db> Cx<'db> {
         }
     }
 
-    fn captures_of(&self, loc: InternedClosure<'db>) -> Sub {
+    fn captures_of(&self, loc: InternedClosure<'db>) -> Form {
         let mut form = Form::new("captures");
         let f = &mut form;
         let infer = InferenceResult::of(self.db, loc.owner);
@@ -1261,9 +1366,9 @@ impl<'db> Cx<'db> {
                     }
                 }
             }
-            None => f.error(NO_MIR),
+            None => f.error(Missed::NoMir),
         }
-        form.finish()
+        form
     }
 
     fn captured(&self, f: &mut Form, captured: &CapturedPlace) {
@@ -1320,7 +1425,7 @@ impl<'db> Cx<'db> {
         } else {
             db.runtime_mir_body_for_coroutine(coroutine)
         };
-        let Ok(body) = body else { return f.error(NO_MIR) };
+        let Ok(body) = body else { return f.error(Missed::NoMir) };
         let held = body.locals_held_across_yields();
         f.len(held.locals.len());
         for &local in &held.locals {
@@ -1378,7 +1483,7 @@ impl<'db> Cx<'db> {
                 bound_region(f, placeholder.bound);
             }
             RegionKind::ReErased => f.u8(6),
-            RegionKind::ReError(_) => f.error(ERROR_TYPE),
+            RegionKind::ReError(_) => f.error(Missed::ErrorType),
         }
     }
 
@@ -1416,7 +1521,7 @@ impl<'db> Cx<'db> {
                 self.ty_in(f, value.ty);
                 self.valtree(f, value.value);
             }
-            ConstKind::Error(_) => f.error(ERROR_CONST),
+            ConstKind::Error(_) => f.error(Missed::ErrorConst),
             ConstKind::Expr(_) => f.u8(7),
         }
     }
@@ -1542,7 +1647,7 @@ impl<'db> Cx<'db> {
                     let variants = &parent.enum_variants(db).variants;
                     match variants.get_index(it.index(db)) {
                         Some((name, _)) => f.str(name.as_str()),
-                        None => f.error(ERROR_TYPE),
+                        None => f.error(Missed::ErrorType),
                     }
                 }
             }
@@ -1628,15 +1733,20 @@ impl<'db> Cx<'db> {
 
     /// Forms in an order no order they are written in changes: by digest, then by the keys
     /// of what they refer to.
-    fn sorted(&self, f: &mut Form, mut subs: Vec<Sub>) {
+    fn sorted(&self, f: &mut Form, mut parts: Vec<Part>) {
         let db = self.db;
-        subs.sort_by_cached_key(|sub| {
-            let keys: Vec<ItemKey> = sub.refs.iter().map(|&it| item_key(db, it)).collect();
-            (sub.digest, keys)
-        });
-        f.len(subs.len());
-        for sub in &subs {
-            f.sub(sub);
+        {
+            let guard = self.refs.borrow();
+            let refs: &[ItemId] = &guard;
+            let keys = move |part: &Part| {
+                let at = part.refs_at as usize;
+                refs[at..at + part.refs_len as usize].iter().map(move |&it| item_key(db, it))
+            };
+            parts.sort_by(|a, b| a.digest.cmp(&b.digest).then_with(|| keys(a).cmp(keys(b))));
+        }
+        f.len(parts.len());
+        for part in parts {
+            self.merge(f, part);
         }
     }
 
@@ -1649,7 +1759,7 @@ impl<'db> Cx<'db> {
                 g
             })
             .collect();
-        self.sorted(f, Form::finish_many(forms));
+        self.sorted(f, self.parts(forms));
     }
 
     fn clause(&self, f: &mut Form, clause: Clause<'db>) {
@@ -1735,17 +1845,17 @@ impl<'db> Cx<'db> {
         }
     }
 
-    fn code(&self, owner: InferBodyId<'db>) -> Sub {
+    fn code_form(&self, owner: InferBodyId<'db>) -> Form {
         let mut f = Form::new("body");
         self.code_in(&mut f, owner);
-        f.finish()
+        f
     }
 
     /// A body, then each closure and coroutine written in it, transitively, in the order the
     /// walks meet them.
     fn code_in(&self, f: &mut Form, owner: InferBodyId<'db>) {
         let db = self.db;
-        let Ok(body) = db.mir_body(owner) else { return f.error(NO_MIR) };
+        let Ok(body) = db.mir_body(owner) else { return f.error(Missed::NoMir) };
         let mut nested = Vec::new();
         self.mir(f, body, &mut nested);
         let mut at = 0;
@@ -1764,7 +1874,7 @@ impl<'db> Cx<'db> {
             };
             match body {
                 Ok(body) => self.mir(f, body, &mut nested),
-                Err(_) => f.error(NO_MIR),
+                Err(_) => f.error(Missed::NoMir),
             }
         }
         f.len(nested.len());
@@ -1979,16 +2089,8 @@ impl<'db> Cx<'db> {
                         None => f.u8(0),
                     }
                 }
-                let mut vtables = Vec::new();
-                if !map.vtable.is_empty() {
-                    // The ids start past an offset of the map's own and run on without a gap.
-                    let first = (0usize..).find(|&id| map.vtable.ty(id).is_ok());
-                    if let Some(first) = first {
-                        vtables.extend((first..).map_while(|id| map.vtable.ty(id).ok()));
-                    }
-                }
-                f.len(vtables.len());
-                for ty in vtables {
+                f.len(map.vtable.tys().len());
+                for ty in map.vtable.tys() {
                     self.ty_in(f, ty);
                 }
                 f.len(map.statics.len());

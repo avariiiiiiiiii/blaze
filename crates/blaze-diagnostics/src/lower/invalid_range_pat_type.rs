@@ -46,34 +46,27 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidRangePatType) -> Vec<
         // rustc's `downgrade_to_delayed_bug`: an error of an end was given already.
         return Vec::new();
     }
-    let span = match (&lhs, &rhs) {
-        (Some(l), Some(r)) if l.fail && r.fail => cx.span_of_ptr(d.pat),
-        (Some(l), _) if l.fail => l.span.clone(),
-        (_, Some(r)) if r.fail => r.span.clone(),
+    // rustc's order: the failing end first, then the other.
+    let (first, second) = match (lhs, rhs) {
+        (Some(l), r) if l.fail => (l, r),
+        (l, Some(r)) if r.fail => (r, l),
         _ => return Vec::new(),
+    };
+    let span = match &second {
+        Some(it) if it.fail => cx.span_of_ptr(d.pat),
+        _ => first.span.clone(),
     };
     let mut diag = Diag::error(
         Some("E0029"),
         "only `char` and numeric types are allowed in range patterns",
         span,
     );
-    let wrong = |end: &End<'db>| {
-        format!("this is of type `{}` but it should be `char` or numeric", cx.ty(&end.ty))
-    };
-    let one_side = |diag: &mut Diag, first: &End<'db>, second: Option<&End<'db>>| {
-        diag.span_label(first.span.clone(), wrong(first));
-        if let Some(other) = second {
-            diag.span_label(other.span.clone(), format!("this is of type `{}`", cx.ty(&other.ty)));
-        }
-    };
-    match (&lhs, &rhs) {
-        (Some(l), Some(r)) if l.fail && r.fail => {
-            diag.span_label(l.span.clone(), wrong(l));
-            diag.span_label(r.span.clone(), wrong(r));
-        }
-        (Some(l), r) if l.fail => one_side(&mut diag, l, r.as_ref()),
-        (l, Some(r)) if r.fail => one_side(&mut diag, r, l.as_ref()),
-        _ => return Vec::new(),
+    for end in std::iter::once(first).chain(second) {
+        let label = match end.fail {
+            true => format!("this is of type `{}` but it should be `char` or numeric", cx.ty(&end.ty)),
+            false => format!("this is of type `{}`", cx.ty(&end.ty)),
+        };
+        diag.span_label(end.span, label);
     }
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
     vec![Found::new(diag, Phase::Bodies)]

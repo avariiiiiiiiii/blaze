@@ -101,7 +101,7 @@ pub use lower::{
     diagnostics::*, elided_lifetimes, with_elided_regions,
 };
 pub use next_solver::interner::{attach_db, attach_db_allow_change, with_attached_db};
-pub use opaques::rpit_hidden_types;
+pub use opaques::{rpit_hidden_types, tait_hidden_types};
 pub use target_feature::TargetFeatures;
 pub use traits::{ParamEnvAndCrate, check_orphan_rules};
 pub use utils::{
@@ -151,22 +151,20 @@ impl Hash for ComplexMemoryMap<'_> {
         let ComplexMemoryMap { memory, vtable, statics, aligns, type_ids } = self;
         memory.hash(state);
         // `VTableMap`'s ids of types follow from the order of its types.
-        vtable_types(vtable).collect::<Vec<_>>().hash(state);
+        state.write_usize(vtable_types(vtable).count());
+        vtable_types(vtable).for_each(|ty| ty.hash(state));
         statics.hash(state);
         aligns.hash(state);
         type_ids.hash(state);
     }
 }
 
-/// The types of `vtable` in the order of their ids, which run on without a gap from the first.
+/// The types of `vtable` in the order of their ids, which run on without a gap from
+/// [`VTableMap::FIRST_ID`].
 pub(crate) fn vtable_types<'a, 'db>(
     vtable: &'a VTableMap<'db>,
-) -> impl Iterator<Item = Ty<'db>> + 'a {
-    let first = match vtable.is_empty() {
-        true => None,
-        false => (0usize..).find(|&id| vtable.ty(id).is_ok()),
-    };
-    first.into_iter().flat_map(move |first| (first..).map_while(move |id| vtable.ty(id).ok()))
+) -> impl ExactSizeIterator<Item = Ty<'db>> + 'a {
+    vtable.tys()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -180,46 +178,74 @@ impl<V> rustc_type_ir::GenericTypeVisitable<V> for StaticMemory {
     fn generic_visit_with(&self, _visitor: &mut V) {}
 }
 
-/// The pieces of memory a constant points to: their bytes one after another in one buffer, and
-/// a column of where each piece is, sorted by address. Pieces may overlap: a reference into a
-/// value another piece holds is a piece of its own.
+/// The pieces of memory a constant points to, as columns: their bytes one after another in one
+/// buffer, their addresses sorted, and where each one's bytes are. Pieces may overlap: a
+/// reference into a value another piece holds is a piece of its own.
+///
+/// Cost: 24 bytes a piece beside its bytes (an address, 8, in the column searched; its extent,
+/// 16, in a column read only once found). A lookup by address is a binary search of the
+/// address column; one inside a piece also scans the pieces that start at most the longest
+/// piece's length below it. Inserting in address order appends; out of order it moves the
+/// columns' tails.
 #[derive(Default, Clone)]
 pub struct MemoryPieces {
     bytes: Vec<u8>,
-    pieces: Vec<Piece>,
+    addresses: Vec<usize>,
+    extents: Vec<Extent>,
+    /// The length of the longest piece: no piece starting further below an address holds it.
+    longest: usize,
 }
 
-/// One piece of [`MemoryPieces`]: the address it is at, and where its bytes are in the buffer.
+/// Where the bytes of one piece of [`MemoryPieces`] are in its buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Piece {
-    address: usize,
-    start: usize,
-    len: usize,
+pub(crate) struct Extent {
+    pub(crate) start: usize,
+    pub(crate) len: usize,
 }
 
-const _: () = assert!(size_of::<Piece>() == 3 * size_of::<usize>());
+const _: () = assert!(size_of::<Extent>() == 2 * size_of::<usize>());
 
 impl MemoryPieces {
+    /// Pieces from their columns: `addresses` strictly increasing, each extent in `bytes`.
+    pub(crate) fn from_columns(bytes: Vec<u8>, addresses: Vec<usize>, extents: Vec<Extent>) -> Self {
+        debug_assert!(addresses.is_sorted_by(|a, b| a < b) && addresses.len() == extents.len());
+        debug_assert!(extents.iter().all(|it| it.start + it.len <= bytes.len()));
+        let longest = extents.iter().map(|it| it.len).max().unwrap_or(0);
+        MemoryPieces { bytes, addresses, extents, longest }
+    }
+
     pub fn len(&self) -> usize {
-        self.pieces.len()
+        self.addresses.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.pieces.is_empty()
+        self.addresses.is_empty()
     }
 
-    fn bytes_of(&self, piece: &Piece) -> &[u8] {
-        &self.bytes[piece.start..piece.start + piece.len]
+    /// Whether `bytes` holds each piece once, in address order, and nothing else.
+    fn is_compact(&self) -> bool {
+        let mut at = 0;
+        self.extents.iter().all(|it| {
+            let next = it.start == at;
+            at += it.len;
+            next
+        }) && at == self.bytes.len()
+    }
+
+    /// The bytes of the piece `index` in the columns.
+    fn piece(&self, index: usize) -> &[u8] {
+        let Extent { start, len } = self.extents[index];
+        &self.bytes[start..start + len]
     }
 
     fn position(&self, address: usize) -> Result<usize, usize> {
-        self.pieces.binary_search_by_key(&address, |it| it.address)
+        self.addresses.binary_search(&address)
     }
 
     /// The piece at `address`.
     pub fn get(&self, address: &usize) -> Option<&[u8]> {
         let at = self.position(*address).ok()?;
-        Some(self.bytes_of(&self.pieces[at]))
+        Some(self.piece(at))
     }
 
     pub fn contains_key(&self, address: &usize) -> bool {
@@ -228,63 +254,78 @@ impl MemoryPieces {
 
     /// Each piece with its address, lowest address first.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&usize, &[u8])> + DoubleEndedIterator {
-        self.pieces.iter().map(|it| (&it.address, self.bytes_of(it)))
+        self.addresses.iter().enumerate().map(|(index, address)| (address, self.piece(index)))
     }
 
     /// The piece that holds `address`, with the address it starts at: the piece at `address`,
     /// or else the lowest one that holds it.
     fn holding(&self, address: usize) -> Option<(usize, &[u8])> {
         let end = match self.position(address) {
-            Ok(at) => return Some((address, self.bytes_of(&self.pieces[at]))),
+            Ok(at) => return Some((address, self.piece(at))),
             Err(end) => end,
         };
-        self.pieces[..end]
-            .iter()
-            .find(|it| address - it.address < it.len)
-            .map(|it| (it.address, self.bytes_of(it)))
+        let first = self.addresses[..end].partition_point(|&it| it.saturating_add(self.longest) <= address);
+        (first..end)
+            .find(|&index| address - self.addresses[index] < self.extents[index].len)
+            .map(|index| (self.addresses[index], self.piece(index)))
     }
 
     /// Keeps `bytes` at `address`, unless the piece already there is as long or longer.
     pub fn insert(&mut self, address: usize, bytes: &[u8]) {
         match self.position(address) {
             Ok(at) => {
-                let piece = &mut self.pieces[at];
-                if piece.len >= bytes.len() {
+                let extent = &mut self.extents[at];
+                if extent.len >= bytes.len() {
                     return;
                 }
-                if piece.start + piece.len == self.bytes.len() {
-                    self.bytes.truncate(piece.start);
+                if extent.start + extent.len == self.bytes.len() {
+                    self.bytes.truncate(extent.start);
                 } else {
-                    piece.start = self.bytes.len();
+                    extent.start = self.bytes.len();
                 }
-                piece.len = bytes.len();
-                self.bytes.extend_from_slice(bytes);
+                extent.len = bytes.len();
             }
             Err(at) => {
-                let piece = Piece { address, start: self.bytes.len(), len: bytes.len() };
-                self.pieces.insert(at, piece);
-                self.bytes.extend_from_slice(bytes);
+                self.addresses.insert(at, address);
+                self.extents.insert(at, Extent { start: self.bytes.len(), len: bytes.len() });
             }
         }
+        self.longest = self.longest.max(bytes.len());
+        self.bytes.extend_from_slice(bytes);
     }
 
     /// The bytes of every piece, lowest address first, and nothing else: what a piece that
     /// grew left behind is dropped.
     pub fn shrink_to_fit(&mut self) {
-        let mut bytes = Vec::with_capacity(self.pieces.iter().map(|it| it.len).sum());
-        for piece in &mut self.pieces {
-            let start = bytes.len();
-            bytes.extend_from_slice(&self.bytes[piece.start..piece.start + piece.len]);
-            piece.start = start;
+        if !self.is_compact() {
+            let mut bytes = Vec::with_capacity(self.extents.iter().map(|it| it.len).sum());
+            for extent in &mut self.extents {
+                let start = bytes.len();
+                bytes.extend_from_slice(&self.bytes[extent.start..extent.start + extent.len]);
+                extent.start = start;
+            }
+            self.bytes = bytes;
         }
-        self.bytes = bytes;
-        self.pieces.shrink_to_fit();
+        self.bytes.shrink_to_fit();
+        self.addresses.shrink_to_fit();
+        self.extents.shrink_to_fit();
+    }
+
+    /// The buffer when it holds each piece once in address order, as [`Self::shrink_to_fit`]
+    /// leaves it: what a writer copies in one go.
+    pub(crate) fn compact_bytes(&self) -> Option<&[u8]> {
+        self.is_compact().then_some(&*self.bytes)
+    }
+
+    pub(crate) fn addresses(&self) -> &[usize] {
+        &self.addresses
     }
 }
 
 impl PartialEq for MemoryPieces {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.iter().eq(other.iter())
+        self.addresses == other.addresses
+            && (0..self.len()).all(|index| self.piece(index) == other.piece(index))
     }
 }
 
@@ -292,11 +333,8 @@ impl Eq for MemoryPieces {}
 
 impl Hash for MemoryPieces {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        state.write_usize(self.len());
-        for (address, bytes) in self.iter() {
-            address.hash(state);
-            bytes.hash(state);
-        }
+        self.addresses.hash(state);
+        (0..self.len()).for_each(|index| self.piece(index).hash(state));
     }
 }
 
@@ -399,7 +437,9 @@ impl<'db> MemoryMap<'db> {
                 map.insert(addr, val);
                 map
             }),
-            MemoryMap::Complex(cm) => cm.memory.iter().map(&mut transform).collect(),
+            MemoryMap::Complex(cm) => {
+                cm.memory.iter().map(|(addr, val)| transform((addr, val))).collect()
+            }
         }
     }
 

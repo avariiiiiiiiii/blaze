@@ -1,7 +1,5 @@
 //! Inference of binary and unary operators.
 
-use std::collections::hash_map;
-
 use hir_def::{FunctionId, GenericParamId, TraitId, hir::ExprId};
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
@@ -234,17 +232,7 @@ impl<'db> InferenceContext<'db> {
                     // some cases applied on the RHS, on top of which we need
                     // to autoref, which is not allowed by write_expr_adj.
                     // self.write_expr_adj(rhs_expr, Box::new([autoref]));
-                    match self.result.expr_adjustments.entry(rhs_expr) {
-                        hash_map::Entry::Occupied(mut entry) => {
-                            let mut adjustments = Vec::from(std::mem::take(entry.get_mut()));
-                            adjustments.reserve_exact(1);
-                            adjustments.push(autoref);
-                            entry.insert(adjustments.into_boxed_slice());
-                        }
-                        hash_map::Entry::Vacant(entry) => {
-                            entry.insert(Box::new([autoref]));
-                        }
-                    };
+                    self.result.expr_adjustments.push(rhs_expr, autoref);
                 }
                 self.write_method_resolution(expr, method.def_id, method.args);
 

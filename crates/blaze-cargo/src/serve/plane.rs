@@ -68,12 +68,15 @@ pub struct Node<T> {
 pub enum Happened<T> {
     /// A thread task's value, before its node settles.
     Did { id: NodeId, value: T },
+    /// A thread task was posted: it starts.
+    Started { id: NodeId },
     /// A loop task to start now.
     Run { id: NodeId },
     /// A node settled: done (`why` none) or not (failed, skipped or cancelled, saying why).
     Settled { id: NodeId, ok: bool, why: Option<String> },
-    /// Every node of the request settled and it was closed.
-    Finished { request: RequestId, ok: bool },
+    /// Every node of the request settled and it was closed; what it did, taken before the
+    /// plane let it go.
+    Finished { request: RequestId, ok: bool, stats: RequestStats },
 }
 
 /// A thread task that ended: its value, or its panic's message.
@@ -426,16 +429,18 @@ impl<T: Send + 'static> Plane<T> {
                 PlaneOutput::Run { id, pool, near } => match self.held.get(&id) {
                     Some(Held::Thread { kind, work }) => {
                         let (kind, work) = (*kind, work.clone());
+                        self.happened.push(Happened::Started { id });
                         self.runner.post(id, pool, near, kind, work);
                     }
                     Some(Held::Loop) => self.happened.push(Happened::Run { id }),
                     None => panic!("the plane runs node {id}, which the daemon gave no task"),
                 },
                 PlaneOutput::Finished { request, ok } => {
+                    let stats = self.graph.stats(request).unwrap_or_default();
                     self.graph
                         .release(request)
                         .unwrap_or_else(|error| panic!("the plane refused to release {request}: {error}"));
-                    self.happened.push(Happened::Finished { request, ok });
+                    self.happened.push(Happened::Finished { request, ok, stats });
                 }
             }
         }

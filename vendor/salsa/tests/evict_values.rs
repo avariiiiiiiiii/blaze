@@ -1,7 +1,8 @@
 #![cfg(feature = "inventory")]
 
-//! `evict_values` and `evict_values_of` drop memoized values but keep their fingerprints and
-//! edges: a later read computes the value again and backdates it when it is equal.
+//! `evict_values` and `evict_values_of` drop memoized values, fingerprinting each and keeping its
+//! edges: a later read computes the value again and backdates it when it hashes the same. They
+//! exist for every tracked function whose output is `Hash`, with or without `lru`.
 
 mod common;
 use std::cell::Cell;
@@ -138,5 +139,73 @@ fn evict_values_covers_interned_keys() {
     db.assert_logs(expect![[r#"
         [
             "sum",
+        ]"#]]);
+}
+
+#[salsa::tracked(returns(copy))]
+fn halves(db: &dyn LogDatabase, source: Source) -> u32 {
+    db.push_log(format!("halves({})", source.text(db)));
+    source.text(db) / 2
+}
+
+#[salsa::tracked(returns(copy))]
+fn halves_reader(db: &dyn LogDatabase, source: Source) -> u32 {
+    db.push_log("halves_reader".to_string());
+    halves(db, source) + 1
+}
+
+#[test]
+fn function_without_lru_is_evicted_and_backdated() {
+    let mut db = common::LoggerDatabase::default();
+    let a = Source::new(&db, 4);
+
+    assert_eq!(halves_reader(&db, a), 3);
+    db.clear_logs();
+
+    assert_eq!(halves::evict_values(&mut db), 1);
+    a.set_text(&mut db).to(5);
+    assert_eq!(halves_reader(&db, a), 3);
+    db.assert_logs(expect![[r#"
+        [
+            "halves(5)",
+        ]"#]]);
+
+    // The recomputed value is kept, and a change to it still reaches the reader.
+    a.set_text(&mut db).to(6);
+    assert_eq!(halves_reader(&db, a), 4);
+    db.assert_logs(expect![[r#"
+        [
+            "halves(6)",
+            "halves_reader",
+        ]"#]]);
+}
+
+#[salsa::tracked(returns(copy), no_eq)]
+fn halves_no_eq(db: &dyn LogDatabase, source: Source) -> u32 {
+    db.push_log(format!("halves_no_eq({})", source.text(db)));
+    source.text(db) / 2
+}
+
+#[salsa::tracked(returns(copy))]
+fn halves_no_eq_reader(db: &dyn LogDatabase, source: Source) -> u32 {
+    db.push_log("halves_no_eq_reader".to_string());
+    halves_no_eq(db, source) + 1
+}
+
+#[test]
+fn no_eq_function_is_evicted_without_a_fingerprint() {
+    let mut db = common::LoggerDatabase::default();
+    let a = Source::new(&db, 4);
+
+    assert_eq!(halves_no_eq_reader(&db, a), 3);
+    db.clear_logs();
+
+    assert_eq!(halves_no_eq::evict_values(&mut db), 1);
+    a.set_text(&mut db).to(5);
+    assert_eq!(halves_no_eq_reader(&db, a), 3);
+    db.assert_logs(expect![[r#"
+        [
+            "halves_no_eq_reader",
+            "halves_no_eq(5)",
         ]"#]]);
 }

@@ -225,6 +225,7 @@ fn level(level: Level) -> &'static str {
         Level::Warning => "warning",
         Level::Note => "note",
         Level::Help => "help",
+        Level::FailureNote => "failure-note",
     }
 }
 

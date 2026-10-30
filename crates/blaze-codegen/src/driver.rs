@@ -122,9 +122,32 @@ struct FnNode<B: Prepare> {
     described: Described<FrontInstance<B>, FrontStatic<B>>,
     /// This build's targets of `described.refs`.
     refs: Vec<Target>,
+    /// The functions its code builds in, at any depth, sorted.
+    built_in: Vec<InstanceKey>,
+}
+
+pub const BUILT_IN_DOMAIN: &str = "blaze v2 built in 1";
+
+/// What a unit's compiled code is kept under: its key, and the keys of the bodies it builds
+/// in, as its own key takes callees by their interface.
+fn stored(key: InstanceKey, built_in: &[InstanceKey]) -> InstanceKey {
+    if built_in.is_empty() {
+        return key;
+    }
+    let mut hasher = Hasher::new(BUILT_IN_DOMAIN);
+    hasher.id(&key.0).update(&(built_in.len() as u64).to_le_bytes());
+    for it in built_in {
+        hasher.id(&it.0);
+    }
+    InstanceKey(hasher.finish())
 }
 
 impl<B: Prepare> FnNode<B> {
+    /// What its code is kept under.
+    fn stored(&self) -> InstanceKey {
+        stored(self.unit.instance.key(), &self.built_in)
+    }
+
     /// Whether code outside the build may call it, so nothing is assumed of its callers.
     fn external(&self) -> bool {
         self.patchable || self.then.is_some() || self.described.address == Address::Significant
@@ -147,6 +170,23 @@ struct Job<'n, B: Prepare> {
     unit: Unit,
     spec: &'n Spec,
     node: &'n FnNode<B>,
+}
+
+/// A body `function` built in that none of `keys` is: code its store key does not hold.
+fn unkept_inline<B: Prepare>(
+    nodes: &BTreeMap<InstanceKey, FnNode<B>>,
+    function: &CompiledFunction,
+    keys: impl IntoIterator<Item = InstanceKey>,
+) -> Option<blaze_items::CodeHash> {
+    let kept: HashSet<blaze_items::CodeHash> =
+        keys.into_iter().filter_map(|it| nodes.get(&it)).map(|it| it.unit.instance.code).collect();
+    function.inlined.iter().find(|it| !kept.contains(*it)).copied()
+}
+
+impl<B: Prepare> Job<'_, B> {
+    fn stored(&self) -> InstanceKey {
+        stored(self.unit.instance.key(), &self.node.built_in)
+    }
 }
 
 fn error(unit: InstanceKey, item: ItemKey, what: impl Into<String>) -> CodegenError {
@@ -297,6 +337,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             instance: instance.clone(),
             described,
             refs: Vec::new(),
+            built_in: Vec::new(),
         })
     }
 
@@ -418,6 +459,40 @@ impl<'a, B: Prepare> Build<'a, B> {
         // an error of the build.
         for node in nodes.values_mut() {
             node.refs = resolve(&node.described.refs, &node.described.origin).unwrap_or_default();
+        }
+        // What each builds in directly, then at any depth.
+        let mut direct: BTreeMap<InstanceKey, Vec<InstanceKey>> = BTreeMap::new();
+        for (key, node) in &nodes {
+            if node.refs.is_empty() && !node.described.refs.is_empty() {
+                continue;
+            }
+            let mut callees = Vec::with_capacity(node.described.built_in.len());
+            for &at in &node.described.built_in {
+                match node.refs.get(at as usize).and_then(callee) {
+                    Some(it) if through_slot.get(&it) == Some(&true) => errors.push(error(
+                        *key,
+                        node.unit.item,
+                        format!("builds in {it:?}, which is reached through its slot: an edit patches it alone"),
+                    )),
+                    Some(it) => callees.push(it),
+                    None => errors.push(error(
+                        *key,
+                        node.unit.item,
+                        format!("builds in place {at}, which is not a function among its {} references", node.refs.len()),
+                    )),
+                }
+            }
+            direct.insert(*key, callees);
+        }
+        for (key, node) in nodes.iter_mut() {
+            let mut seen = BTreeSet::new();
+            let mut queue: Vec<InstanceKey> = direct.get(key).cloned().unwrap_or_default();
+            while let Some(it) = queue.pop() {
+                if it != *key && seen.insert(it) {
+                    queue.extend(direct.get(&it).into_iter().flatten().copied());
+                }
+            }
+            node.built_in = seen.into_iter().collect();
         }
         for node in statics.values_mut() {
             node.refs = resolve(&node.described.refs, &node.described.origin).unwrap_or_default();
@@ -546,7 +621,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut unmasked = Vec::new();
         for key in dev.iter().filter(|key| nodes[*key].spec.fold) {
             let unit = &nodes[key].unit;
-            let read = out.read(store, &keys::masked(key), unit, |it| blob::decode_masked(it).map_err(|e| e.to_string()));
+            let read = out.read(store, &keys::masked(&nodes[key].stored()), unit, |it| blob::decode_masked(it).map_err(|e| e.to_string()));
             match read {
                 Read::Hit(it) => {
                     masked.insert(*key, it);
@@ -558,8 +633,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         for (key, made) in self.prepare_all(nodes, &unmasked) {
             match made {
                 Ok((shape, made)) => {
-                    let it = self.backend.masked(&nodes[&key].unit, &made);
-                    out.put(keys::masked(&key), Kind::Query, blob::encode_masked(it.as_ref()));
+                    let it = self.backend.masked(&nodes[&key].unit, &made, &nodes[&key].refs);
+                    out.put(keys::masked(&nodes[&key].stored()), Kind::Query, blob::encode_masked(it.as_ref()));
                     masked.insert(key, it);
                     prepared.insert(key, (shape, made));
                 }
@@ -590,7 +665,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut missing = Vec::new();
         for key in dev.iter().filter(|key| !grouped.contains(*key)) {
             let node = &nodes[key];
-            let read = out.read(store, &keys::template(key), &node.unit, |it| blob::decode(it).map_err(|e| e.to_string()));
+            let read = out.read(store, &keys::template(&node.stored()), &node.unit, |it| blob::decode(it).map_err(|e| e.to_string()));
             match read {
                 Read::Hit(template) => {
                     out.stats.stored += 1;
@@ -623,7 +698,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             match self.memo.get(&shape) {
                 Some(template) => {
                     out.stats.memo += 1;
-                    out.template(keys::template(&key), &template);
+                    out.template(keys::template(&node.stored()), &template);
                     out.instantiate(&node.unit, key, &template, &node.refs);
                 }
                 None if first_of.contains_key(&shape) => waiting.push((key, shape)),
@@ -653,11 +728,15 @@ impl<'a, B: Prepare> Build<'a, B> {
                     continue;
                 }
             };
+            if let Some(it) = unkept_inline(nodes, &emitted.function, node.built_in.iter().copied()) {
+                out.errors.push(error(key, node.unit.item, format!("built in {it:?}, which its key does not hold")));
+                continue;
+            }
             out.stats.compiled += 1;
             out.side(&node.unit, &emitted);
             let Some(template) = out.template_of(&node.unit, &emitted.function, &node.refs) else { continue };
             let kept = self.memo.put(shape, template);
-            out.template(keys::template(&key), &kept);
+            out.template(keys::template(&node.stored()), &kept);
             out.instantiate(&node.unit, key, &kept, &node.refs);
         }
         for (key, shape) in waiting {
@@ -665,7 +744,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             match self.memo.get(&shape) {
                 Some(template) => {
                     out.stats.memo += 1;
-                    out.template(keys::template(&key), &template);
+                    out.template(keys::template(&node.stored()), &template);
                     out.instantiate(&node.unit, key, &template, &node.refs);
                 }
                 None => out.errors.push(error(
@@ -814,7 +893,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut exports: HashMap<InstanceKey, B::Export> = HashMap::new();
         let mut unsummarized = Vec::new();
         for job in jobs {
-            let read = out.read(store, &keys::summary(&job.unit.instance.key()), &job.unit, |it| {
+            let read = out.read(store, &keys::summary(&job.stored()), &job.unit, |it| {
                 serde_json::from_slice::<Summary>(it).map_err(|e| e.to_string())
             });
             match read {
@@ -842,7 +921,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             match summarized {
                 Ok((summary, export, made)) => {
                     let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
-                    out.put(keys::summary(&job.unit.instance.key()), Kind::Query, bytes);
+                    out.put(keys::summary(&job.stored()), Kind::Query, bytes);
                     summaries.insert(name, summary);
                     exports.insert(name, export);
                     prepared.insert(name, made);
@@ -893,7 +972,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 imports.imported.iter().map(|it| by_name[it].node.refs.as_slice()).collect();
             let refs = release_refs(&job.node.refs, &imported);
             let key = job.unit.instance.key();
-            let blob_key = keys::release(&imports.blob_key(key));
+            let blob_key = keys::release(&imports.blob_key(job.stored()));
             match out.read(store, &blob_key, &job.unit, |it| blob::decode(it).map_err(|e| e.to_string())) {
                 Read::Hit(template) => {
                     out.stats.stored += 1;

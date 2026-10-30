@@ -11,7 +11,6 @@ use rustc_type_ir::{
     },
 };
 use salsa::SalsaValue;
-use smallvec::SmallVec;
 
 use hir_ty::{
     db::HirDatabase,
@@ -26,41 +25,66 @@ use hir_ty::{
 
 use super::{
     Ctx,
-    bitset::BitSet,
+    bitset::{BitMatrix, BitSet, union_words},
     cfg::{Cfg, Location, index},
+    dataflow::{GenKill, backward, forward},
     intervals::IntervalSet,
     moves::{InitKind, MoveData},
     regions::{Regions, Rv, regions_of, rv_of},
+    relation::{Facts, Relation},
 };
 
-#[derive(Default)]
-struct Effects {
-    uses: Vec<LocalId>,
-    defs: Vec<LocalId>,
-    drops: Vec<LocalId>,
+/// The kinds of the facts of what each point does to a local: uses it, defines it (assigns
+/// the whole of it, or ends its storage), drops it.
+const USE: u8 = 0;
+const DEF: u8 = 1;
+const DROP: u8 = 2;
+
+fn raw(local: LocalId) -> usize {
+    local.into_raw().into_u32() as usize
 }
 
-fn place_uses(local: LocalId, projection: &[PlaceElem], uses: &mut Vec<LocalId>) {
-    uses.push(local);
+/// The facts of one point, as they are found.
+struct Effects<'f> {
+    facts: &'f mut Facts,
+    point: usize,
+}
+
+impl Effects<'_> {
+    fn uses(&mut self, local: LocalId) {
+        self.facts.push(USE, self.point, raw(local));
+    }
+
+    fn defs(&mut self, local: LocalId) {
+        self.facts.push(DEF, self.point, raw(local));
+    }
+
+    fn drops(&mut self, local: LocalId) {
+        self.facts.push(DROP, self.point, raw(local));
+    }
+}
+
+fn place_uses(local: LocalId, projection: &[PlaceElem], effects: &mut Effects<'_>) {
+    effects.uses(local);
     for elem in projection {
         if let PlaceElem::Index(index) = elem {
-            uses.push(*index);
+            effects.uses(*index);
         }
     }
 }
 
-fn operand_uses(operand: &Operand, uses: &mut Vec<LocalId>) {
+fn operand_uses(operand: &Operand, effects: &mut Effects<'_>) {
     if let OperandKind::Copy(place) | OperandKind::Move(place) = &operand.kind {
-        place_uses(place.local, place.projection.as_slice(), uses);
+        place_uses(place.local, place.projection.as_slice(), effects);
     }
 }
 
 /// A write of a whole local defines it; a write of part of it uses it.
-fn assigned(local: LocalId, projection: &[PlaceElem], effects: &mut Effects) {
+fn assigned(local: LocalId, projection: &[PlaceElem], effects: &mut Effects<'_>) {
     if projection.is_empty() {
-        effects.defs.push(local);
+        effects.defs(local);
     } else {
-        place_uses(local, projection, &mut effects.uses);
+        place_uses(local, projection, effects);
     }
 }
 
@@ -95,13 +119,16 @@ fn statement_values<'db>(ctx: &Ctx<'_, 'db>) -> FxHashMap<hir_def::hir::ExprId, 
     found
 }
 
+/// What the point at `location` does to the locals; a drop only where what it drops may be
+/// initialized, which `drops_initialized` says by point.
 fn effects_at<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &MirBody<'db>,
     location: Location,
     statement_values: &FxHashMap<hir_def::hir::ExprId, Option<Ty<'db>>>,
-) -> Effects {
-    let mut effects = Effects::default();
+    drops_initialized: &BitSet,
+    effects: &mut Effects<'_>,
+) {
     let data = &body.basic_blocks[location.block];
     if let Some(statement) = data.statements.get(location.statement) {
         match &statement.kind {
@@ -110,14 +137,12 @@ fn effects_at<'db>(
                     Rvalue::Ref(_, borrowed)
                     | Rvalue::Len(borrowed)
                     | Rvalue::Discriminant(borrowed)
-                    | Rvalue::CopyForDeref(borrowed) => place_uses(
-                        borrowed.local,
-                        borrowed.projection.as_slice(),
-                        &mut effects.uses,
-                    ),
-                    _ => rvalue.for_each_operand(&mut |it| operand_uses(it, &mut effects.uses)),
+                    | Rvalue::CopyForDeref(borrowed) => {
+                        place_uses(borrowed.local, borrowed.projection.as_slice(), effects)
+                    }
+                    _ => rvalue.for_each_operand(&mut |it| operand_uses(it, effects)),
                 }
-                assigned(place.local, place.projection.as_slice(), &mut effects);
+                assigned(place.local, place.projection.as_slice(), effects);
             }
             StatementKind::FakeRead(place)
                 if let hir_ty_mir::mir::MirSpan::ExprId(expr) = statement.span
@@ -131,16 +156,16 @@ fn effects_at<'db>(
                             ) == value
                     }) => {}
             StatementKind::FakeRead(place) => {
-                place_uses(place.local, place.projection.as_slice(), &mut effects.uses)
+                place_uses(place.local, place.projection.as_slice(), effects)
             }
             StatementKind::Deinit(place) => {
-                assigned(place.local, place.projection.as_slice(), &mut effects)
+                assigned(place.local, place.projection.as_slice(), effects)
             }
             StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
-                effects.defs.push(*local)
+                effects.defs(*local)
             }
             StatementKind::InlineAsm(_) => {
-                statement.kind.for_each_operand(&mut |it| operand_uses(it, &mut effects.uses))
+                statement.kind.for_each_operand(&mut |it| operand_uses(it, effects))
             }
             StatementKind::Nop => (),
         }
@@ -148,78 +173,65 @@ fn effects_at<'db>(
         match &terminator.kind {
             TerminatorKind::Drop { place, .. } => {
                 if place.projection.is_empty() {
-                    effects.drops.push(place.local);
+                    if drops_initialized.contains(effects.point) {
+                        effects.drops(place.local);
+                    }
                 } else {
-                    place_uses(place.local, place.projection.as_slice(), &mut effects.uses);
+                    place_uses(place.local, place.projection.as_slice(), effects);
                 }
             }
             TerminatorKind::DropAndReplace { place, value, .. } => {
-                operand_uses(value, &mut effects.uses);
-                place_uses(place.local, place.projection.as_slice(), &mut effects.uses);
+                operand_uses(value, effects);
+                place_uses(place.local, place.projection.as_slice(), effects);
             }
             TerminatorKind::Call { func, args, destination, .. } => {
                 // The destination is written after the arguments are read.
-                assigned(destination.local, destination.projection.as_slice(), &mut effects);
-                operand_uses(func, &mut effects.uses);
+                assigned(destination.local, destination.projection.as_slice(), effects);
+                operand_uses(func, effects);
                 for arg in args.iter() {
-                    operand_uses(arg, &mut effects.uses);
+                    operand_uses(arg, effects);
                 }
             }
-            TerminatorKind::Return => effects.uses.push(super::return_slot()),
-            kind => kind.for_each_operand(&mut |it| operand_uses(it, &mut effects.uses)),
+            TerminatorKind::Return => effects.uses(super::return_slot()),
+            kind => kind.for_each_operand(&mut |it| operand_uses(it, effects)),
         }
     }
-    effects
 }
 
-/// The points each local is live at, by a backward analysis where `uses` says which locals a
-/// point uses, as ranges: what liveness gives a region is the points of the locals it is in.
+/// The points each local is live at, by a backward analysis where the facts of kind `uses`
+/// say which locals a point uses, as ranges: what liveness gives a region is the points of the
+/// locals it is in. `edge` restricts what is live coming back along an edge.
 fn live_ranges(
     body: &MirBody<'_>,
     cfg: &Cfg,
-    effects: &[Effects],
-    uses: impl Fn(&Effects) -> &[LocalId],
-    edge: impl Fn(BasicBlockId, BasicBlockId, &mut BitSet),
+    effects: &Relation,
+    uses: u8,
+    edge: impl Fn(BasicBlockId, BasicBlockId, &mut [u64]),
 ) -> Vec<IntervalSet> {
     let locals = body.locals.len();
-    let blocks = body.basic_blocks.len();
-    let mut entry = vec![BitSet::new(locals); blocks];
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &block in cfg.order.iter().rev() {
-            let mut live = BitSet::new(locals);
-            for &successor in &cfg.successors[index(block)] {
-                let mut from = entry[index(successor)].clone();
-                edge(block, successor, &mut from);
-                live.union(&from);
+    let mut transfer = GenKill::new(body.basic_blocks.len(), locals);
+    for &block in &cfg.order {
+        for point in (cfg.block_start(block)..=cfg.block_end(body, block)).rev() {
+            for &local in effects.get(DEF, point) {
+                transfer.kill_bit(index(block), local as usize);
             }
-            let start = cfg.block_start(block);
-            let end = cfg.block_end(body, block);
-            for point in (start..=end).rev() {
-                let it = &effects[point];
-                for local in &it.defs {
-                    live.remove(local.into_raw().into_u32() as usize);
-                }
-                for local in uses(it) {
-                    live.insert(local.into_raw().into_u32() as usize);
-                }
-            }
-            if entry[index(block)] != live {
-                entry[index(block)] = live;
-                changed = true;
+            for &local in effects.get(uses, point) {
+                transfer.gen_bit(index(block), local as usize);
             }
         }
     }
+    let entry = backward(cfg, &transfer, &edge);
     let mut ranges = vec![IntervalSet::default(); locals];
     // Where the run of points each live local is live at ends, walking backwards.
     let mut run_end = vec![0usize; locals];
+    let mut live = BitSet::new(locals);
+    let mut along = vec![0u64; live.words().len()];
     for &block in &cfg.order {
-        let mut live = BitSet::new(locals);
+        live.clear();
         for &successor in &cfg.successors[index(block)] {
-            let mut from = entry[index(successor)].clone();
-            edge(block, successor, &mut from);
-            live.union(&from);
+            along.copy_from_slice(entry.row(index(successor)));
+            edge(block, successor, &mut along);
+            union_words(live.words_mut(), &along);
         }
         let start = cfg.block_start(block);
         let end = cfg.block_end(body, block);
@@ -227,21 +239,21 @@ fn live_ranges(
             run_end[local] = end;
         }
         for point in (start..=end).rev() {
-            let it = &effects[point];
+            let used = effects.get(uses, point);
             // A local is live at a point that uses it, and where it is assigned if it is live
             // after, as rustc's `compute_use_live_points_for` has it; it is not live before
             // the assignment.
-            for local in uses(it) {
-                let local = local.into_raw().into_u32() as usize;
+            for &local in used {
+                let local = local as usize;
                 if live.insert(local) {
                     run_end[local] = point;
                 }
             }
-            for local in &it.defs {
-                let local = local.into_raw().into_u32() as usize;
-                if uses(it).iter().any(|it| it.into_raw().into_u32() as usize == local) {
+            for &local in effects.get(DEF, point) {
+                if used.contains(&local) {
                     continue;
                 }
+                let local = local as usize;
                 if live.contains(local) {
                     live.remove(local);
                     ranges[local].insert_range(point, run_end[local]);
@@ -265,21 +277,21 @@ pub(super) fn region_liveness<'db>(
     count: usize,
 ) -> Vec<IntervalSet> {
     let mut values = vec![IntervalSet::default(); count];
-    let mut effects: Vec<Effects> = (0..cfg.points).map(|_| Effects::default()).collect();
+    // A drop of what cannot be initialized there does nothing.
+    let (drops_initialized, init_at_exit) = maybe_initialized_at_drops(body, cfg, moves);
     let statement_values = statement_values(ctx);
+    let mut facts = Facts::default();
     for &block in &cfg.order {
         for point in cfg.block_start(block)..=cfg.block_end(body, block) {
-            effects[point] = effects_at(ctx, body, cfg.location(point), &statement_values);
+            let location = cfg.location(point);
+            let effects = &mut Effects { facts: &mut facts, point };
+            effects_at(ctx, body, location, &statement_values, &drops_initialized, effects);
         }
     }
     for &(local, location) in &regions.callee_reads {
-        effects[cfg.point(location)].uses.push(local);
+        facts.push(USE, cfg.point(location), raw(local));
     }
-    // A drop of what cannot be initialized there does nothing.
-    let (maybe_init, init_at_exit) = maybe_initialized_at_drops(body, cfg, moves);
-    for (point, it) in effects.iter_mut().enumerate() {
-        it.drops.retain(|&local| maybe_init.get(&point).is_some_and(|set| set.contains(&local)));
-    }
+    let effects = facts.freeze(&[cfg.points; 3]);
     let local_regions: Vec<Vec<Rv>> = regions
         .local_tys
         .iter()
@@ -289,7 +301,7 @@ pub(super) fn region_liveness<'db>(
             out
         })
         .collect();
-    let use_live = live_ranges(body, cfg, &effects, |it| &it.uses, |_, _, _| ());
+    let use_live = live_ranges(body, cfg, &effects, USE, |_, _, _| ());
     for (local, points) in use_live.iter().enumerate() {
         if points.is_empty() {
             continue;
@@ -304,7 +316,7 @@ pub(super) fn region_liveness<'db>(
         body,
         cfg,
         &effects,
-        |it| &it.drops,
+        DROP,
         // Dropping a local makes it live back to where it may be initialized only, as
         // rustc's `compute_drop_live_points_for` has it.
         |block, successor, live| init_at_exit.restrict(block, successor, live),
@@ -345,135 +357,135 @@ pub(super) fn region_liveness<'db>(
     values
 }
 
-/// For each drop, the locals it drops that may be initialized there; and for each edge
-/// between blocks, the locals that may be initialized, if partly, leaving the first for the
-/// second.
-fn maybe_initialized_at_drops<'m>(
+/// Which drops drop what may be initialized there, by point; and for each edge between
+/// blocks, the locals that may be initialized, if partly, leaving the first for the second.
+/// rustc's `MaybeInitializedPlaces`.
+fn maybe_initialized_at_drops(
     body: &MirBody<'_>,
     cfg: &Cfg,
-    moves: &'m MoveData,
-) -> (FxHashMap<usize, Vec<LocalId>>, InitAtExit<'m>) {
+    moves: &MoveData,
+) -> (BitSet, InitAtExit) {
     let paths = moves.paths.len();
     let blocks = body.basic_blocks.len();
-    let mut entry: Vec<Option<BitSet>> = vec![None; blocks];
+    let locals = body.locals.len();
+    let apply = |location: Location, state: &mut BitSet, returned: bool| {
+        let point = cfg.point(location);
+        if !returned {
+            for &it in moves.moves_at(point) {
+                moves.with_descendants(moves.moves[it as usize].path, &mut |path| {
+                    state.remove(path)
+                });
+            }
+        }
+        for &it in moves.inits_at(point) {
+            let init = moves.inits[it as usize];
+            if (init.kind == InitKind::Deep) != returned {
+                moves.with_descendants(init.path, &mut |path| {
+                    state.insert(path);
+                });
+            }
+        }
+    };
+    let runs = |run: &dyn Fn(&mut BitSet)| {
+        let (mut made, mut kept) = (BitSet::new(paths), BitSet::filled(paths));
+        run(&mut made);
+        run(&mut kept);
+        (made, kept)
+    };
+    let mut transfer = GenKill::new(blocks, paths);
+    let mut on_return = GenKill::new(blocks, paths);
+    let mut returns_to: Vec<Option<BasicBlockId>> = vec![None; blocks];
+    for &block in &cfg.order {
+        let data = &body.basic_blocks[block];
+        let (made, kept) = runs(&|state| {
+            for statement in 0..=data.statements.len() {
+                apply(Location { block, statement }, state, false);
+            }
+        });
+        transfer.set_from(index(block), &made, &kept);
+        if let Some(TerminatorKind::Call { target: Some(target), .. }) =
+            data.terminator.as_ref().map(|it| &it.kind)
+        {
+            returns_to[index(block)] = Some(*target);
+            let terminator = Location { block, statement: data.statements.len() };
+            let (made, kept) = runs(&|state| apply(terminator, state, true));
+            on_return.set_from(index(block), &made, &kept);
+        }
+    }
     let mut start = BitSet::new(paths);
     for init in moves.inits.iter().filter(|it| it.location.is_none()) {
         moves.with_descendants(init.path, &mut |it| {
             start.insert(it);
         });
     }
-    entry[index(body.start_block)] = Some(start);
-    let apply = |location: Location, state: &mut BitSet, returned: bool| {
-        if !returned {
-            if let Some(at) = moves.moves_at.get(&location) {
-                for &it in at {
-                    moves.with_descendants(moves.moves[it].path, &mut |path| state.remove(path));
-                }
-            }
+    let entry = forward(cfg, &transfer, body.start_block, &start, |from, to, state| {
+        if returns_to[index(from)] == Some(to) {
+            on_return.apply(index(from), state);
         }
-        if let Some(at) = moves.inits_at.get(&location) {
-            for &it in at {
-                let init = moves.inits[it];
-                if (init.kind == InitKind::Deep) != returned {
-                    moves.with_descendants(init.path, &mut |path| {
-                        state.insert(path);
-                    });
-                }
-            }
-        }
-    };
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for &block in &cfg.order {
-            let Some(mut state) = entry[index(block)].clone() else { continue };
-            let data = &body.basic_blocks[block];
-            for statement in 0..=data.statements.len() {
-                apply(Location { block, statement }, &mut state, false);
-            }
-            let returned = match data.terminator.as_ref().map(|it| &it.kind) {
-                Some(TerminatorKind::Call { target: Some(target), .. }) => Some(*target),
-                _ => None,
-            };
-            for &successor in &cfg.successors[index(block)] {
-                let mut state = state.clone();
-                if Some(successor) == returned {
-                    apply(Location { block, statement: data.statements.len() }, &mut state, true);
-                }
-                match &mut entry[index(successor)] {
-                    Some(it) => changed |= it.union(&state),
-                    slot @ None => {
-                        *slot = Some(state);
-                        changed = true;
-                    }
-                }
-            }
-        }
-    }
-    let mut exits: Vec<Option<(BitSet, Option<(BasicBlockId, BitSet)>)>> = vec![None; blocks];
-    let mut found: FxHashMap<usize, Vec<LocalId>> = FxHashMap::default();
+    });
+    let mut exit = BitMatrix::new(blocks, locals);
+    let mut returned = BitMatrix::new(blocks, locals);
+    let mut reached = BitSet::new(blocks);
+    let mut found = BitSet::new(cfg.points);
+    let mut state = BitSet::new(paths);
     for &block in &cfg.order {
-        let Some(mut state) = entry[index(block)].take() else { continue };
+        reached.insert(index(block));
+        state.load(entry.row(index(block)));
         let data = &body.basic_blocks[block];
         for statement in 0..data.statements.len() {
             apply(Location { block, statement }, &mut state, false);
         }
-        let mut exit = state.clone();
-        apply(Location { block, statement: data.statements.len() }, &mut exit, false);
-        let returned = match data.terminator.as_ref().map(|it| &it.kind) {
-            Some(TerminatorKind::Call { target: Some(target), .. }) => {
-                let mut returned = exit.clone();
-                apply(Location { block, statement: data.statements.len() }, &mut returned, true);
-                Some((*target, returned))
-            }
-            _ => None,
-        };
-        exits[index(block)] = Some((exit, returned));
+        let terminator = Location { block, statement: data.statements.len() };
         if let Some(TerminatorKind::Drop { place, .. }) =
             data.terminator.as_ref().map(|it| &it.kind)
             && place.projection.is_empty()
         {
             let path = moves.local_path(place.local);
             if moves.find_in_descendants(path, &|it| state.contains(it)).is_some() {
-                let point = cfg.point(Location { block, statement: data.statements.len() });
-                found.entry(point).or_default().push(place.local);
+                found.insert(cfg.point(terminator));
+            }
+        }
+        apply(terminator, &mut state, false);
+        // Every path of a local is below the local's own: the local may be initialized, if
+        // partly, where one of its paths may be.
+        for path in state.iter() {
+            exit.insert(index(block), raw(moves.paths[path].local));
+        }
+        if returns_to[index(block)].is_some() {
+            apply(terminator, &mut state, true);
+            for path in state.iter() {
+                returned.insert(index(block), raw(moves.paths[path].local));
             }
         }
     }
-    (found, InitAtExit { moves, exits })
+    (found, InitAtExit { exit, returned, returns_to, reached })
 }
 
-/// The paths that may be initialized leaving each block, and leaving a call's block for the
-/// call's return.
-struct InitAtExit<'m> {
-    moves: &'m MoveData,
-    exits: Vec<Option<(BitSet, Option<(BasicBlockId, BitSet)>)>>,
+/// The locals that may be initialized, if partly, leaving each block, and leaving a call's
+/// block for the call's return.
+struct InitAtExit {
+    exit: BitMatrix,
+    returned: BitMatrix,
+    returns_to: Vec<Option<BasicBlockId>>,
+    /// The blocks the analysis reached, which nothing leaves otherwise.
+    reached: BitSet,
 }
 
-impl InitAtExit<'_> {
+impl InitAtExit {
     /// Keeps of `live` the locals that may be initialized, if partly, leaving `block` for
-    /// `successor`: every path of a local is below the local's own, so where one of its paths
-    /// is. Asked of the few locals live there rather than of every path that is initialized.
-    fn restrict(&self, block: BasicBlockId, successor: BasicBlockId, live: &mut BitSet) {
-        let state = match &self.exits[index(block)] {
-            Some((_, Some((target, returned)))) if *target == successor => returned,
-            Some((exit, _)) => exit,
-            None => {
-                live.clear();
-                return;
-            }
+    /// `successor`.
+    fn restrict(&self, block: BasicBlockId, successor: BasicBlockId, live: &mut [u64]) {
+        let at = index(block);
+        if !self.reached.contains(at) {
+            live.fill(0);
+            return;
+        }
+        let mask = match self.returns_to[at] {
+            Some(target) if target == successor => self.returned.row(at),
+            _ => self.exit.row(at),
         };
-        let gone: SmallVec<[usize; 8]> = live
-            .iter()
-            .filter(|&local| {
-                let path = self
-                    .moves
-                    .local_path(LocalId::from_raw(la_arena::RawIdx::from_u32(local as u32)));
-                self.moves.find_in_descendants(path, &|it| state.contains(it)).is_none()
-            })
-            .collect();
-        for local in gone {
-            live.remove(local);
+        for (word, mask) in live.iter_mut().zip(mask) {
+            *word &= mask;
         }
     }
 }

@@ -167,7 +167,7 @@ pub(super) fn backward(
 mod tests {
     use super::{GenKill, backward, forward};
     use crate::{
-        bitset::BitSet,
+        bitset::{BitSet, iter_words},
         cfg::{Cfg, block, index},
     };
 
@@ -235,7 +235,8 @@ mod tests {
         }
         let lens: Vec<usize> = (0..blocks).map(|_| 1 + rng.next(5)).collect();
         let cfg = Cfg::from_edges(&lens, &edges);
-        let points = lens.iter().map(|&len| (0..len).map(|_| effect(rng, domain)).collect()).collect();
+        let points =
+            lens.iter().map(|&len| (0..len).map(|_| effect(rng, domain)).collect()).collect();
         let mut edge_effects = Vec::new();
         for (from, to) in edges {
             if rng.next(3) == 0 && !edge_effects.iter().any(|(it, _)| *it == (from, to)) {
@@ -251,7 +252,8 @@ mod tests {
     }
 
     fn apply_words(effect: &Effect, domain: usize, words: &mut [u64]) {
-        let mut state: Vec<bool> = (0..domain).map(|it| words[it / 64] & (1 << (it % 64)) != 0).collect();
+        let mut state: Vec<bool> =
+            (0..domain).map(|it| words[it / 64] & (1 << (it % 64)) != 0).collect();
         effect.apply(&mut state);
         words.fill(0);
         for (it, &set) in state.iter().enumerate() {
@@ -380,7 +382,7 @@ mod tests {
     }
 
     fn rows(entry: &crate::bitset::BitMatrix, blocks: usize) -> Vec<Vec<usize>> {
-        (0..blocks).map(|b| entry.to_set(b).iter().collect()).collect()
+        (0..blocks).map(|b| iter_words(entry.row(b)).collect()).collect()
     }
 
     #[test]

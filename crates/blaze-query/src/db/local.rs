@@ -29,7 +29,9 @@ pub(crate) enum Kind {
     Verify,
     /// A wait that may pump: frames below are another task's. `lifted` while the waiter
     /// itself runs the key (it holds the flight; its frames are its own again).
-    Barrier { lifted: bool },
+    Barrier {
+        lifted: bool,
+    },
 }
 
 pub(crate) struct Frame {
@@ -47,6 +49,8 @@ pub(crate) struct Frame {
     pub(crate) durability: u8,
     /// The highest `changed` read.
     pub(crate) changed: u32,
+    /// The summaries of the [`super::Reads`] it replayed, ORed into its edges' when it is written.
+    pub(crate) summary: [u64; 2],
     /// The lowest stack index of a cycle head it depends on, [`NONE`] for none.
     pub(crate) head: u32,
     /// A query on this stack asked for this one: it heads a cycle.
@@ -78,6 +82,7 @@ impl Frame {
             dedup_floor: 0,
             durability: u8::MAX,
             changed: 0,
+            summary: [0; 2],
             head: NONE,
             reentered: false,
             unconverged: false,
@@ -108,6 +113,7 @@ pub(crate) struct Capture {
     pub(crate) edges_start: u32,
     pub(crate) durability: u8,
     pub(crate) changed: u32,
+    pub(crate) summary: [u64; 2],
     pub(crate) unshareable: bool,
     pub(crate) dedup_floor: u32,
 }
@@ -131,6 +137,8 @@ pub(crate) struct Walk {
     pub(crate) word: u32,
     pub(crate) next: u64,
     pub(crate) end: u64,
+    /// The OR of the summaries of the edges proved so far.
+    pub(crate) summary: [u64; 2],
 }
 
 pub(crate) struct Local {
@@ -190,7 +198,13 @@ impl Local {
 
     /// Records a read of `node` into the running query of `storage`, if any.
     #[inline(always)]
-    pub(crate) fn read(&mut self, storage: *const Storage, node: u32, durability: u8, changed: u32) {
+    pub(crate) fn read(
+        &mut self,
+        storage: *const Storage,
+        node: u32,
+        durability: u8,
+        changed: u32,
+    ) {
         let edges_len = self.edges.len() as u32;
         let last = self.edges.last().copied();
         let Some(frame) = self.recording(storage) else { return };
@@ -213,7 +227,8 @@ impl Local {
         frame.serial = self.serial;
         if matches!(frame.kind, Kind::Run | Kind::Verify) {
             let slot = &mut self.bloom[bucket(frame.node)];
-            *slot = slot.checked_add(1).expect("more than 65535 frames of one node bucket on a stack");
+            *slot =
+                slot.checked_add(1).expect("more than 65535 frames of one node bucket on a stack");
         }
         // alloc: none once warm: the frame stack grows to its high-water mark once per thread
         self.frames.push(frame);
@@ -254,6 +269,7 @@ impl Local {
         frame.dedup_floor = edges;
         frame.durability = u8::MAX;
         frame.changed = 0;
+        frame.summary = [0; 2];
         frame.untracked = false;
         frame.head = NONE;
         let pending = frame.pending_start as usize;
@@ -321,6 +337,7 @@ impl Frame {
             dedup_floor: 0,
             durability: u8::MAX,
             changed: 0,
+            summary: [0; 2],
             head: NONE,
             reentered: false,
             unconverged: false,

@@ -73,7 +73,10 @@ impl<F: Send + Sync + 'static> Table for InternTable<F> {
             pages: Pages::new(Tag::Intern),
             ids: Ids::new(Tag::Intern),
             // alloc: once per interned ingredient per storage
-            shards: Box::new(std::array::from_fn(|_| Shard { index: swiss::Index::new(), len: Mutex::new(0) })),
+            shards: Box::new(std::array::from_fn(|_| Shard {
+                index: swiss::Index::new(),
+                len: Mutex::new(0),
+            })),
             _of: PhantomData,
         }
     }
@@ -86,7 +89,9 @@ impl<F: Send + Sync + 'static> Table for InternTable<F> {
 impl<F> InternTable<F> {
     #[inline]
     fn row(&self, id: Id) -> &InternRow<F> {
-        self.pages.row::<InternRow<F>>(id).expect("an interned ID's row page was made before the ID was given")
+        self.pages
+            .row::<InternRow<F>>(id)
+            .expect("an interned ID's row page was made before the ID was given")
     }
 }
 
@@ -123,7 +128,15 @@ fn shard(hash: u64) -> usize {
 #[inline]
 pub fn intern<I: Interned>(storage: &Storage, fields: I::Fields) -> Id {
     let hash = hash_of(&fields);
-    intern_keyed::<I::Fields, I::Fields>(storage, I::ingredient(), hash, fields, |it, fields| it == fields, |fields| fields).0
+    intern_keyed::<I::Fields, I::Fields>(
+        storage,
+        I::ingredient(),
+        hash,
+        fields,
+        |it, fields| it == fields,
+        |fields| fields,
+    )
+    .0
 }
 
 /// The ID of the value `eq` accepts for `key`, made from `key` by `make` when new: a lookup by
@@ -136,7 +149,15 @@ pub fn intern_by<I: Interned, Q: Hash>(
     make: impl FnOnce(Q) -> I::Fields,
 ) -> Id {
     let hash = hash_of(&key);
-    intern_keyed::<I::Fields, Q>(storage, I::ingredient(), hash, key, |fields, key| eq(key, fields), make).0
+    intern_keyed::<I::Fields, Q>(
+        storage,
+        I::ingredient(),
+        hash,
+        key,
+        |fields, key| eq(key, fields),
+        make,
+    )
+    .0
 }
 
 /// The ID of the row `eq` finds for `key`, else of a new row `make` builds from `key`; the
@@ -159,21 +180,30 @@ pub(crate) fn intern_keyed<F: Send + Sync + 'static, K>(
 }
 
 #[inline]
-fn find<F>(table: &InternTable<F>, shard: &Shard, hash: u64, eq: impl Fn(&F) -> bool) -> Option<Id> {
+fn find<F>(
+    table: &InternTable<F>,
+    shard: &Shard,
+    hash: u64,
+    eq: impl Fn(&F) -> bool,
+) -> Option<Id> {
     shard
         .index
         .find(hash, |at| {
             let row = table.row(Id::from_u32(at));
             // SAFETY: the index publishes an ID (release, `swiss::Index::insert`) only after
             // its row's hash and fields were written, never again; `find` acquires it.
-            row.hash.load(Ordering::Relaxed) == hash && eq(unsafe { (*row.fields.get()).assume_init_ref() })
+            row.hash.load(Ordering::Relaxed) == hash
+                && eq(unsafe { (*row.fields.get()).assume_init_ref() })
         })
         .map(Id::from_u32)
 }
 
 #[cold]
 #[inline(never)]
-#[expect(clippy::too_many_arguments, reason = "the cold half of `intern_keyed`, which passes its own")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the cold half of `intern_keyed`, which passes its own"
+)]
 fn insert<F, K>(
     storage: &Storage,
     table: &InternTable<F>,
@@ -189,14 +219,22 @@ fn insert<F, K>(
         return (id, Some(key));
     }
     let fields = make(key);
-    let id = table.ids.next(storage, index, &table.pages, &storage.intern_heap, layout::<InternRow<F>>());
+    let id = table.ids.next(
+        storage,
+        index,
+        &table.pages,
+        &storage.intern_heap,
+        layout::<InternRow<F>>(),
+    );
     let row = table.row(id);
     row.hash.store(hash, Ordering::Relaxed);
     // SAFETY: the ID is fresh, so this task is its row's one writer, and no reader sees the
     // row before the index publishes it below.
     unsafe { (*row.fields.get()).write(fields) };
     row.made.store(1, Ordering::Relaxed);
-    shard.index.insert(*len, hash, id.as_u32(), |at| table.row(Id::from_u32(at)).hash.load(Ordering::Relaxed));
+    shard.index.insert(*len, hash, id.as_u32(), |at| {
+        table.row(Id::from_u32(at)).hash.load(Ordering::Relaxed)
+    });
     *len += 1;
     drop(len);
     storage.event(|| EventKind::DidInternValue { key: DatabaseKeyIndex::new(index, id) });
@@ -207,10 +245,15 @@ fn insert<F, K>(
 pub fn interned_fields<'s, I: Interned>(storage: &'s Storage, id: Id) -> &'s I::Fields {
     let index = I::ingredient().index();
     check_owner(storage, id, index, I::NAME);
-    fields_of::<I::Fields>(storage, index, id).unwrap_or_else(|| panic!("{}({id:?}) was never interned", I::NAME))
+    fields_of::<I::Fields>(storage, index, id)
+        .unwrap_or_else(|| panic!("{}({id:?}) was never interned", I::NAME))
 }
 
-pub(crate) fn fields_of<F: Send + Sync + 'static>(storage: &Storage, index: u32, id: Id) -> Option<&F> {
+pub(crate) fn fields_of<F: Send + Sync + 'static>(
+    storage: &Storage,
+    index: u32,
+    id: Id,
+) -> Option<&F> {
     let row = storage.table::<InternTable<F>>(index)?.pages.row::<InternRow<F>>(id)?;
     // Acquire: an ID read from elsewhere (a field, a persisted `u32`) may come without the
     // index's ordering; `made` orders the fields before it.
@@ -236,7 +279,11 @@ fn memory<I: Interned>(storage: &Storage, index: u32) -> MemoryUsage {
     memory_of::<I::Fields>(storage, index, I::NAME)
 }
 
-pub(crate) fn memory_of<F: Send + Sync + 'static>(storage: &Storage, index: u32, name: &'static str) -> MemoryUsage {
+pub(crate) fn memory_of<F: Send + Sync + 'static>(
+    storage: &Storage,
+    index: u32,
+    name: &'static str,
+) -> MemoryUsage {
     let rows = storage.table::<InternTable<F>>(index).map_or(0, |table| u64::from(table.ids.len()));
     MemoryUsage {
         name,

@@ -304,12 +304,14 @@ impl Thread {
     fn state(&mut self) -> Result<&mut State, String> {
         let made = match self.world.take() {
             Some(made) => made,
-            None => World::new().map(|world| {
+            None => World::new().and_then(|world| {
                 let mut state = State::new(world);
                 let roots = &self.roots;
                 std::mem::take(&mut self.kept)
-                    .drain(|root, build, record| state.record(roots, root, build, &record));
-                state
+                    .drain(|root, build, record| state.record(roots, root, build, &record))
+                    // alloc: an error path, said to each page asked for after
+                    .map_err(|unkept| unkept.to_string())?;
+                Ok(state)
             }),
         };
         match self.world.insert(made) {

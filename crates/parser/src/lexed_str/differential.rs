@@ -78,7 +78,7 @@ pub(super) fn parser_files() -> Vec<String> {
 /// The parser's sources alone: real Rust with no intended lexer error.
 pub(super) fn parser_sources() -> Vec<String> {
     let out = read_all(&rust_files([manifest_dir().join("src")]));
-    assert!(out.len() > 50, "the parser's sources are found");
+    assert!(out.iter().any(|it| it == include_str!("differential.rs")), "the parser's sources are found");
     out
 }
 

@@ -894,6 +894,7 @@ fn command_line_flags_in_order() {
             ],
             cap: None,
         },
+        codegen: true,
         ..CommandLine::default()
     };
     assert_eq!(CommandLine::parse(&args), Ok(expected));

@@ -1235,10 +1235,10 @@ fn the_closing_lines_are_written_as_rustc_writes_them() {
 #[test]
 fn rendered_is_written_without_its_empty_line() {
     let file = File::new("lib.rs", "fn f() {}\n");
-    let diag = Diag::error(Some("E0308"), "mismatched types", file.span("f"));
+    let diag = Diag::error(Some("E0308"), "mismatched types", file.at(3, 4));
     let sources = File::sources(&[&file]);
     let rendered = emit::rendered(&diag, &sources, Style::default());
-    assert_eq!(rendered, "error[E0308]: mismatched types\n --> lib.rs:1:4\n  |\n1 | fn f() {}\n  |    ^");
+    assert_eq!(rendered, "error[E0308]: mismatched types\n --> $DIR/lib.rs:1:4\n  |\n1 | fn f() {}\n  |    ^");
     assert_eq!(emit::written(&diag, &sources, Style::default()), format!("{rendered}\n\n"));
 }
 

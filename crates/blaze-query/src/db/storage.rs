@@ -92,6 +92,35 @@ pub(crate) fn key_parts(key: u64) -> (u32, Id, u32) {
     ((key >> 32) as u32 & 0xfff, Id::from_u32(key as u32), (key >> 44) as u32 & 0xffff)
 }
 
+/// A node's input summary: a 128-bit Bloom filter of the input fields it read, transitively.
+/// An input field sets two bits ([`input_bits`]); a memo's is the OR of its edges' when it ran,
+/// grown by each walk that proves it; a cycle's or an untracked run's is [`ALL`]. A memo whose
+/// summary shares no bit with the fields written since it was verified is unchanged, with no
+/// walk: a field in its cone sets a bit of its summary, so a false positive costs a walk and a
+/// false negative can't happen.
+pub(crate) type Summary = [u64; 2];
+pub(crate) const ALL: Summary = [u64::MAX; 2];
+
+/// Views of written-field masks kept: a memo verified further back walks.
+const HISTORY: usize = 64;
+
+/// The two bits of input field node `node`: two multiplicative hashes by odd constants.
+#[inline]
+pub(crate) fn input_bits(node: u32) -> Summary {
+    let node = u64::from(node);
+    let mut bits = [0; 2];
+    for k in [0x9e37_79b9_7f4a_7c15_u64, 0xc2b2_ae3d_27d4_eb4f] {
+        let bit = (node.wrapping_mul(k) >> 57) as u32;
+        bits[(bit >> 6) as usize] |= 1 << (bit & 63);
+    }
+    bits
+}
+
+#[inline(always)]
+pub(crate) fn or(a: Summary, b: Summary) -> Summary {
+    [a[0] | b[0], a[1] | b[1]]
+}
+
 /// Bytes of address space each storage reserves for row pages (committed as they are made).
 const HEAP: usize = 1 << 36;
 const INTERN_HEAP: usize = 1 << 35;
@@ -108,6 +137,9 @@ pub struct Storage {
     view: u32,
     /// The last view an input of each kind or above changed in.
     last_changed: [u32; Durability::KINDS],
+    /// `written[i]`: the OR of the [`input_bits`] of every field written in the last `i + 1`
+    /// views.
+    written: [Summary; HISTORY],
     /// Each ingredient's row-page directory, null until first use.
     dirs: Box<[AtomicPtr<AtomicPtr<u8>>; MAX_INGREDIENTS]>,
     /// Each ingredient's table, null until first use.
@@ -118,6 +150,7 @@ pub struct Storage {
     owners: Owners,
     next_page: AtomicU32,
     pub(crate) colors: Dense<AtomicU64>,
+    pub(crate) summaries: Dense<[AtomicU64; 2]>,
     pub(crate) keys: Dense<AtomicU64>,
     next_node: AtomicU32,
     edges: Dense<AtomicU32>,
@@ -160,6 +193,7 @@ impl Storage {
             clock: AtomicU64::new(u64::from(view | VALUE)),
             view,
             last_changed: [view; Durability::KINDS],
+            written: [[0; 2]; HISTORY],
             dirs,
             tables,
             making: Mutex::new(()),
@@ -168,6 +202,7 @@ impl Storage {
             owners: Owners::committed(MAX_PAGES, Tag::Query),
             next_page: AtomicU32::new(1),
             colors: Dense::growing(NODES, Tag::Query),
+            summaries: Dense::growing(NODES, Tag::Query),
             keys: Dense::growing(NODES, Tag::Query),
             next_node: AtomicU32::new(1),
             edges: Dense::growing(EDGES, Tag::Query),
@@ -203,6 +238,49 @@ impl Storage {
     #[inline]
     pub(crate) fn unchanged_since(&self, durability: u8, verified: u32) -> bool {
         self.last_changed[durability.min(2) as usize] <= verified
+    }
+
+    /// Whether node `node`, verified in `verified`, read no input field written since: its
+    /// summary shares no bit with the fields written in the views after `verified`.
+    #[inline]
+    pub(crate) fn inputs_unchanged(&self, node: u32, verified: u32) -> bool {
+        let Some(back) = self.view.checked_sub(verified) else { return false };
+        let Some(&written) = back.checked_sub(1).and_then(|at| self.written.get(at as usize))
+        else {
+            return back == 0;
+        };
+        let summary = self.summary_of(node);
+        (summary[0] & written[0]) | (summary[1] & written[1]) == 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn summary_of(&self, node: u32) -> Summary {
+        let [a, b] = self.summaries.get(node as usize);
+        // Relaxed: a summary is stored before its row's word or its node's color is published
+        // (release), which the reader acquired.
+        [a.load(Ordering::Relaxed), b.load(Ordering::Relaxed)]
+    }
+
+    /// Sets `node`'s summary, for its one writer (the run that holds its flight, an input's
+    /// maker, a tracked struct's creator).
+    #[inline]
+    pub(crate) fn set_summary(&self, node: u32, summary: Summary) {
+        let [a, b] = self.summaries.get(node as usize);
+        a.store(summary[0], Ordering::Relaxed);
+        b.store(summary[1], Ordering::Relaxed);
+    }
+
+    /// Adds `summary`'s bits to `node`'s: a walk's, which racing walkers of a view agree on.
+    #[inline]
+    pub(crate) fn grow_summary(&self, node: u32, summary: Summary) {
+        let [a, b] = self.summaries.get(node as usize);
+        a.fetch_or(summary[0], Ordering::Relaxed);
+        b.fetch_or(summary[1], Ordering::Relaxed);
+    }
+
+    /// The OR of the summaries of `edges`' nodes.
+    pub(crate) fn summary_of_edges(&self, edges: &[u32]) -> Summary {
+        edges.iter().fold([0; 2], |acc, &node| or(acc, self.summary_of(node)))
     }
 
     /// Has every reader unwind with [`super::Cancelled::PendingWrite`] at its next query call,
@@ -250,22 +328,33 @@ impl Storage {
     }
 
     /// A write of kind `durability` that changed nothing the storage holds: what an input a
-    /// host keeps elsewhere does when it changes.
+    /// host keeps elsewhere does when it changes. Its mask is all ones: no row of that kind or
+    /// below is green by its summary.
     pub fn synthetic_write(&mut self, durability: Durability) {
-        self.new_view(durability);
+        self.new_view(durability, ALL);
     }
 
-    /// Opens the next view for a write of kind `durability`: rows of that kind or below
-    /// verify again; `lru` caps are applied.
-    pub(crate) fn new_view(&mut self, durability: Durability) -> u32 {
-        assert!(self.view < VIEW_MASK, "the query database ran out of views ({VIEW_MASK})");
-        self.view += 1;
+    /// Opens the next view for a write of kind `durability` to the input fields whose
+    /// [`input_bits`] OR to `written`: rows of that kind or below verify again; `lru` caps are
+    /// applied.
+    pub(crate) fn new_view(&mut self, durability: Durability, written: Summary) -> u32 {
+        self.next_view(written);
         for kind in &mut self.last_changed[..=durability.0 as usize] {
             *kind = self.view;
         }
-        *self.clock.get_mut() = u64::from(self.view | VALUE);
         self.sweep();
         self.view
+    }
+
+    /// Bumps the view, the clock (clearing the stop flag) and the written-field history.
+    fn next_view(&mut self, written: Summary) {
+        assert!(self.view < VIEW_MASK, "the query database ran out of views ({VIEW_MASK})");
+        self.view += 1;
+        *self.clock.get_mut() = u64::from(self.view | VALUE);
+        for at in (1..HISTORY).rev() {
+            self.written[at] = or(self.written[at - 1], written);
+        }
+        self.written[0] = written;
     }
 
     /// Applies every `lru` cap: with `&mut`, no reader holds a value.
@@ -319,6 +408,7 @@ impl Storage {
         let end = first as usize + count as usize;
         assert!(end <= NODES, "the query database ran out of nodes ({NODES})");
         self.colors.ensure(end);
+        self.summaries.ensure(end);
         self.keys.ensure(end);
         first
     }
@@ -403,9 +493,7 @@ impl Storage {
         }
         *self.edges_top.get_mut() = moved.top;
         *self.edges_dead.get_mut() = 0;
-        assert!(self.view < VIEW_MASK, "the query database ran out of views ({VIEW_MASK})");
-        self.view += 1;
-        *self.clock.get_mut() = u64::from(self.view | VALUE);
+        self.next_view([0; 2]);
     }
 
     /// Moves `span` from the old edge array into the new one (compaction only).
@@ -513,7 +601,8 @@ impl Storage {
 
     /// The live ingredients' indices.
     pub(crate) fn live(&self) -> impl Iterator<Item = u32> + '_ {
-        (1..=ingredient::registered()).filter(|&index| !self.tables[index as usize].load(Ordering::Relaxed).is_null())
+        (1..=ingredient::registered())
+            .filter(|&index| !self.tables[index as usize].load(Ordering::Relaxed).is_null())
     }
 }
 
@@ -561,11 +650,22 @@ pub(crate) struct Ids {
 
 impl Ids {
     pub(crate) fn new(tag: Tag) -> Ids {
-        Ids { next: AtomicU32::new(0), pages: Dense::growing(MAX_PAGES, tag), making: Mutex::new(()) }
+        Ids {
+            next: AtomicU32::new(0),
+            pages: Dense::growing(MAX_PAGES, tag),
+            making: Mutex::new(()),
+        }
     }
 
     /// A fresh ID of ingredient `index`, its row page made in `pages`.
-    pub(crate) fn next(&self, storage: &Storage, index: u32, pages: &Pages, heap: &Heap, layout: (usize, usize)) -> Id {
+    pub(crate) fn next(
+        &self,
+        storage: &Storage,
+        index: u32,
+        pages: &Pages,
+        heap: &Heap,
+        layout: (usize, usize),
+    ) -> Id {
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let (k, slot) = ((n >> PAGE_BITS) as usize, n as usize & (PAGE_LEN - 1));
         let page = match self.pages.get_checked(k).map(|it| it.load(Ordering::Acquire)) {
@@ -576,7 +676,15 @@ impl Ids {
     }
 
     #[cold]
-    fn page(&self, storage: &Storage, index: u32, k: usize, pages: &Pages, heap: &Heap, layout: (usize, usize)) -> usize {
+    fn page(
+        &self,
+        storage: &Storage,
+        index: u32,
+        k: usize,
+        pages: &Pages,
+        heap: &Heap,
+        layout: (usize, usize),
+    ) -> usize {
         let _one = self.making.lock().unwrap_or_else(PoisonError::into_inner);
         self.pages.ensure(k + 1);
         if let page @ 1.. = self.pages.get(k).load(Ordering::Acquire) {

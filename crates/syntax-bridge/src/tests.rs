@@ -319,10 +319,10 @@ fn a_views_call_input_is_the_cursors_token_tree() {
                 if range.is_empty() {
                     continue;
                 }
-                let node = match full_node.covering_element(range) {
-                    NodeOrToken::Node(node) if node.text_range() == range => node,
-                    other => panic!("{path}: no node of {range:?} in the full parse: {other:?}"),
-                };
+                let node = full_node
+                    .descendants()
+                    .find(|it| it.kind() == view.kind() && it.text_range() == range)
+                    .unwrap_or_else(|| panic!("{path}: no {:?} of {range:?} in the full parse", view.kind()));
                 for mode in [DocCommentDesugarMode::Mbe, DocCommentDesugarMode::ProcMacro] {
                     let new = crate::call_input(view, DummyTestSpanMap, DUMMY, mode);
                     let cursor = syntax_node_to_token_tree_modified(
@@ -379,10 +379,10 @@ fn a_views_modified_input_is_the_cursors() {
                 if range.is_empty() {
                     continue;
                 }
-                let node = match full_node.covering_element(range) {
-                    NodeOrToken::Node(node) if node.text_range() == range => node,
-                    other => panic!("{path}: no node of {range:?} in the full parse: {other:?}"),
-                };
+                let node = full_node
+                    .descendants()
+                    .find(|it| it.kind() == view.kind() && it.text_range() == range)
+                    .unwrap_or_else(|| panic!("{path}: no {:?} of {range:?} in the full parse", view.kind()));
                 let mut rng = SplitMix64::new(seed);
                 let (mut remove, mut view_remove) =
                     (Removed::<_, Global>::default(), Removed::<_, Global>::default());

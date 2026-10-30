@@ -129,7 +129,11 @@ fn main() {
     }
 }
 "#,
+        // rustc's `.stderr` has no `unreachable_patterns`: compiletest runs ui tests with
+        // `-A unused`, and the lint is in that group.
         &[
+            ("30..=30", "unreachable_patterns"),
+            ("20..=21", "unreachable_patterns"),
             ("19..=20", "overlapping_range_endpoints: 20_u8"),
             ("10..=20", "overlapping_range_endpoints: 10_u8"),
             ("10..=20", "overlapping_range_endpoints: 20_u8"),

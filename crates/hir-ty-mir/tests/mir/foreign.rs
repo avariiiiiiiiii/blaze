@@ -105,7 +105,7 @@ fn with_evaluator(owner: &str, test: impl FnOnce(&TestDB, Evaluator<'_>)) {
     let db = fx.into_db();
     hir_ty::attach_db(&db, || {
         let owner = function(&db, owner);
-        let eval = Evaluator::new(&db, owner.into(), false, None).expect("an evaluator");
+        let eval = Evaluator::new(&db, owner.into(), None).expect("an evaluator");
         test(&db, eval);
     })
 }

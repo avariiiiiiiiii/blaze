@@ -89,11 +89,13 @@ class Left(unittest.TestCase):
             "    db.unwind_if_revision_cancelled();\n"
             "    salsa::Database::ingredient_debug_name(db, i);\n"
             "    impl salsa::plumbing::interned::NamesIds for A {}\n"
-            "    match k { ReadKind::Query => {} ReadKind::Interned => {} }\n"
+            "    match k { ReadKind::Query => {} ReadKind::TrackedField(_) => {} }\n"
+            "    salsa::plumbing::ZalsaDatabase::zalsa(db);\n"
             "}\n"
         )
         lines = sorted(line for line, _ in hand(text))
-        self.assertEqual(lines, [3, 4, 5, 6])
+        self.assertEqual(lines, [3, 4, 6, 7])
+        self.assertIn("impl blaze_query::db::NamesIds for A {}", s.migrate(text).text)
 
     def test_unsized_generic_database(self) -> None:
         text = "pub fn text<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) {}\n"

@@ -377,8 +377,10 @@ pub(crate) fn crate_root(db: &Db, krate: Crate) -> ModuleId {
 /// The id of the module `name` in `parent`, in `krate`'s def map or `block`'s. Created here, keyed
 /// by what names the module, so every collection that finds it shares it: a def-map query's,
 /// and the name-resolution maintainer's, which runs in no query and so can make no tracked
-/// struct itself.
-#[salsa::tracked(returns(copy))]
+/// struct itself. Its interned arguments are never collected: collecting them drops the memo and
+/// deletes the module it made, whose id published scopes of other crates still hold, and salsa
+/// gives that id to the next module made.
+#[salsa::tracked(returns(copy), revisions = usize::MAX)]
 pub(crate) fn child_module(
     db: &Db,
     krate: Crate,

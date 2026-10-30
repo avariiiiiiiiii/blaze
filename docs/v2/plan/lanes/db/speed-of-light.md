@@ -1964,6 +1964,58 @@ The benchmarks:
   trie is that tree, keyed by path hash rather than by directory, so its shape does not follow
   how deep the directories are.
 
+## blaze_query::db: the dense engine (query-unify-engine)
+
+Counted from `crates/blaze-query/src/db/` as of 10-30 16:50, written blind (no lane runs cargo
+since 15:21); measured by `query_hit`'s `db/<case>` cases, below, once the coordinator runs them.
+A "line" is as in the salsa section: a dependent load, 4.5 cycles from L1, 110 ns from DRAM.
+
+### Warm hit (`fetch`, verified this view, value present)
+
+- **Work:** find the row of (function, key), compare its word with the view, return the value
+  in place, and record the read.
+- **Bound:** as the salsa section's: 2 lines (the row's page, the row), about 20 instructions,
+  **≈ 5.4 ns** hot.
+- **Today:** the clock (one word, read-mostly, L1), the function's page directory
+  (`storage.dir(index)`: an array indexed by the ingredient's static number, L1 across a task's
+  hits), the page pointer at `dir[id.page()]`, then the row at `page + size × slot`: its 32-byte
+  header and the value beside it share a line for values up to 32 bytes. The test is one compare
+  of the 32-bit word with the clock (`view | VALUE`; a stopped storage or a running row fails
+  it). 2 lines that can miss, 2 that stay in L1, about 15 instructions: **at the bound**. No
+  hash, no lock, no `Arc`, no allocation (`warm_paths_allocate_nothing`).
+- **Inside a query:** plus the read's record: the thread-local's frame count, a compare with
+  the last edge, and a 4-byte push onto the edge stack, which grows once per thread to its
+  high-water mark. About 8 instructions and L1 lines only, ≈ 2 ns: **≈ 7.5 ns**, at the bound
+  of the salsa section's "Recording a read".
+
+### Verifying a memo (the first fetch in a new view)
+
+- **Work:** prove the memo's inputs unchanged since it was verified, or find the first edge
+  that changed.
+- **Bound, by durability:** one compare of the memo's durability kind's `last_changed` with its
+  verified view: the header's line, already loaded by the failed hit, **≈ 1 ns**.
+- **Bound, by summary:** the memo's 16-byte summary (a column by node: 1 line) ANDed with
+  `written[now − verified − 1]` (64 words of 16 bytes, L1): **1 line, ≈ 3 ns** hot, one miss
+  cold. This is what `db/verify/deep_unrelated` measures: independent of the cone's 1M edges.
+- **Bound, by edges:** per edge a 4-byte load from the edge array (sequential, streamed) and the
+  dependency's 8-byte color (`(verified << 32) | changed`, a column by node: random). The colors
+  are prefetched four edges ahead, so their misses overlap: **≈ 5.5 ns an edge** cold in
+  throughput, about 1.5 ns hot (two loads and a compare).
+- **Today:** that order (durability, summary, edges), claim-free: no flight, no lock. A walk
+  that proves a row ORs its dependencies' summaries into its own (one `fetch_or` of 16 bytes)
+  and compare-and-swaps its word; a dependency not verified in this view is pushed on the
+  thread's walk stack, so the walk has no recursion and allocates nothing once warm. **At the
+  bound** on each of the three paths.
+
+### Interning a hit (`intern`, `intern_by`)
+
+- **Work:** hash the value, find its row, compare.
+- **Bound:** FxHash of the key (a few cycles a word), one probe group of the shard's index
+  (1 line), the row's fields for the compare (1 line): **≈ 2 lines, ≈ 6 ns** hot for a small key.
+- **Today:** 64 shards of `blaze_mem::swiss::Index`, chosen by the hash's top bits. A find takes
+  no lock (an insert takes the shard's mutex), and a hit records no edge and allocates nothing.
+  **At the bound.**
+
 ## Measured: salsa fork vs blaze_query::db (query-unify-bench)
 
 `crates/blaze-bench/benches/query_hit.rs` runs the same query shapes on both engines
@@ -2010,5 +2062,14 @@ Against the bounds above ("Memo hit", ≈ 5.4 ns hot), the fork's warm hit is 2.
 and 2.7× scattered; a hit from inside a query costs about 10 ns more for its edge and the
 revision's first check.
 
-**blaze_query::db**: measured once `query-unify-engine` reports the engine done; the same
-cases, the same machine, both engines in one run.
+A ninth case, **deep unrelated** (Andrew, 15:56), added after this run: the memo on top of
+64 layers of 1024 queries of 16 edges (1M edges) over 4 leaf inputs, all of medium durability;
+an iteration writes a medium input outside its closure and asks the memo again. The engine's
+transitive-input summary ([query-unify.md](query-unify.md), "Transitive-input summaries") makes
+it green with no walk; the fork has its 62-bit closure filter (`graph::bloom`) or walks the 1M
+edges. Its closure holds few inputs so that 128 bits stay sparse: with 1024 leaves every bit
+would be set and every check a walk.
+
+**blaze_query::db**: the same nine cases are written on the engine with its macros
+(`db/<case>`, beside `salsa/<case>` in one binary), not yet run: from 15:21 no lane runs cargo,
+and the coordinator runs the bench. Both engines' numbers go here from that run.

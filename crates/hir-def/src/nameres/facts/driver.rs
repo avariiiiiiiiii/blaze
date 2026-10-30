@@ -27,7 +27,7 @@ use crate::{
     nameres::{
         BuiltinShadowMode, DefMap, DefMapCrateData, DeriveHelpers, DiagnosticsByModule,
         LocalDefMap, MacroSubNs, ModuleData, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot,
-        diagnostics::{DefDiagnostic, DefDiagnosticKind},
+        diagnostics::{DefDiagnostic, DefDiagnosticKind, is_glob_of_non_module},
         uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use},
     },
     per_ns::{Item, Namespace, PerNs},
@@ -770,8 +770,9 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (D
 }
 
 /// What rustc's `finalize_imports` reports of `import`, resolved to `status` (`None` when it did
-/// not resolve): a trait's items imported without `import_trait_associated_functions`, or a glob
-/// of a trait whose items blaze cannot list (`DefMap::trait_item_import_reports`).
+/// not resolve): a glob of what is not a module, enum or trait (`is_glob_of_non_module`), a
+/// trait's items imported without `import_trait_associated_functions`, or a glob of a trait
+/// whose items blaze cannot list (`DefMap::trait_item_import_reports`).
 pub(crate) fn trait_item_import_diagnostics(
     db: &Db,
     def_map: &DefMap,
@@ -780,7 +781,11 @@ pub(crate) fn trait_item_import_diagnostics(
     mut push: impl FnMut(DefDiagnostic),
 ) {
     let ImportSource { use_tree, id, kind, .. } = import.source;
-    def_map.trait_item_import_reports(db, kind, status.unwrap_or_else(PerNs::none), |why| {
+    let res = status.unwrap_or_else(PerNs::none);
+    if is_glob_of_non_module(kind, res) {
+        push(DefDiagnostic::unresolved_import(import.module, id.lookup(db).id, use_tree));
+    }
+    def_map.trait_item_import_reports(db, kind, res, |why| {
         push(DefDiagnostic::trait_item_import(import.module, id.lookup(db).id, use_tree, why));
     });
 }

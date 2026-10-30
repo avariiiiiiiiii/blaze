@@ -276,7 +276,6 @@ pub trait HirDatabase: sealed::Sealed {
     fn interpret_mir<'db>(
         &'db self,
         body: &'db MirBody<'db>,
-        assert_placeholder_ty_is_unused: bool,
         trait_env: Option<ParamEnvAndCrate<'db>>,
     ) -> Result<Allocation<'db>, MirEvalError<'db>>;
 
@@ -734,10 +733,9 @@ impl HirDatabase for Db {
     fn interpret_mir<'db>(
         &'db self,
         body: &'db MirBody<'db>,
-        assert_placeholder_ty_is_unused: bool,
         trait_env: Option<ParamEnvAndCrate<'db>>,
     ) -> Result<Allocation<'db>, MirEvalError<'db>> {
-        (providers::mir().interpret_mir)(self, body, assert_placeholder_ty_is_unused, trait_env)
+        (providers::mir().interpret_mir)(self, body, trait_env)
     }
 
     #[inline]

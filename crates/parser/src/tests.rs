@@ -74,7 +74,7 @@ fn sources() -> Vec<String> {
             }
         }
     }
-    assert!(out.len() > 50, "the parser's sources are found");
+    assert!(out.iter().any(|it| it == include_str!("tests.rs")), "the parser's sources are found");
     out
 }
 

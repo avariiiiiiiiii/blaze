@@ -311,7 +311,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0133`.
 "##;
-    assert_eq!(ui("safety-fn-body.rs", "2015", source), stderr);
+    assert_eq!(crate::tests::items::ui_core("safety-fn-body.rs", "2015", "sized", source), stderr);
 }
 
 #[test]

@@ -623,7 +623,7 @@ error: aborting due to 9 previous errors
 Some errors have detailed explanations: E0380, E0567, E0568.
 For more information about an error, try `rustc --explain E0380`.
 "###;
-    assert_eq!(ui("auto-trait-validation.rs", "2015", source), stderr);
+    assert_eq!(ui_core("auto-trait-validation.rs", "2015", "copy", source), stderr);
 }
 
 #[test]

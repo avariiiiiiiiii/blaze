@@ -1,0 +1,23 @@
+{
+  "id": "01175",
+  "from_lane": "no-fallback-front-def",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src"
+  ],
+  "what": "blaze-diagnostics: report rustc E0703 (invalid ABI: found `x`) for an `extern \"x\"` (fn, fn pointer type, extern block) whose string does not parse as rustc_abi::ExternAbi (FromStr). hir-def recovers with ExternAbi::FALLBACK (signatures.rs:1316,1972, expr_store/lower.rs:1104) exactly as rustc_ast_lowering lower_abi does after error_on_invalid_abi, so the build must stop on this diagnostic; today nothing reports it and the program builds as extern \"C\". A syntax-level check over ast::Abi is enough.",
+  "state": "open",
+  "created": "2026-10-30T23:27:07Z",
+  "updated": "2026-10-30T23:27:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:27:07Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

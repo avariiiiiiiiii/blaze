@@ -2,7 +2,9 @@
 //! depth first, with no flight and no lock, marking each row it proves unchanged with a
 //! compare-and-swap of its `verified` word. It gives up (and the caller takes the row's flight)
 //! at the first edge that changed, or that needs a run, or a row that is running, provisional,
-//! made in a cycle or untracked: those are the claimed path's.
+//! made in a cycle or untracked: those are the claimed path's. A row whose kind did not change,
+//! or whose input summary shares no bit with the fields written since it was verified, is
+//! proved without its edges; a walked row's summary grows by its dependencies' current ones.
 //!
 //! The walk reads headers untyped: every function row starts with its [`Header`], and the
 //! ingredient's vtable gives the row size. With a hook set it gives up too, so that every
@@ -13,8 +15,11 @@ use std::{ptr::NonNull, sync::atomic::Ordering};
 use super::{
     ingredient::{self, Kind},
     local::{self, Walk},
-    row::{CYCLE, DURABILITY, Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, header_at, span},
-    storage::{FIELD, Storage, color, key_parts},
+    row::{
+        CYCLE, DURABILITY, Header, PROVISIONAL, RUNNING, UNTRACKED, VALUE, VIEW_MASK, header_at,
+        span,
+    },
+    storage::{FIELD, Storage, color, key_parts, or},
 };
 
 /// Edges ahead of the one checked whose colors are prefetched.
@@ -28,10 +33,15 @@ pub(crate) fn unclaimed(storage: &Storage, header: &Header, word: u32, node: u32
         return false;
     }
     let meta = header.meta.load(Ordering::Relaxed);
-    if word & (RUNNING | PROVISIONAL) != 0 || meta & (CYCLE | UNTRACKED) != 0 || word & VIEW_MASK == 0 {
+    if word & (RUNNING | PROVISIONAL) != 0
+        || meta & (CYCLE | UNTRACKED) != 0
+        || word & VIEW_MASK == 0
+    {
         return false;
     }
-    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
+    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
+        || storage.inputs_unchanged(node, word & VIEW_MASK)
+    {
         return mark(storage, header, word, node);
     }
     local::with(|local| {
@@ -52,10 +62,18 @@ fn entry(header: &Header, word: u32, node: u32) -> Walk {
         word,
         next: start,
         end: start + span::len(edges),
+        summary: [0; 2],
     }
 }
 
-fn walk(storage: &Storage, stack: &mut Vec<Walk>, base: usize, header: &Header, word: u32, node: u32) -> bool {
+fn walk(
+    storage: &Storage,
+    stack: &mut Vec<Walk>,
+    base: usize,
+    header: &Header,
+    word: u32,
+    node: u32,
+) -> bool {
     let view = storage.view_bits();
     let depth = storage.nodes_made() as usize;
     // alloc: none once warm: the walk stack grows to its high-water depth once per thread
@@ -67,6 +85,8 @@ fn walk(storage: &Storage, stack: &mut Vec<Walk>, base: usize, header: &Header, 
             // SAFETY: the header is in a row page of `storage` (pushed from one), which lives
             // as long as the storage, borrowed for this walk.
             let header = unsafe { &*done.header };
+            // The summary goes in before the mark publishes the row in this view.
+            storage.grow_summary(done.node, done.summary);
             if !mark(storage, header, done.word, done.node) {
                 return false;
             }
@@ -74,50 +94,57 @@ fn walk(storage: &Storage, stack: &mut Vec<Walk>, base: usize, header: &Header, 
             if stack.len() == base {
                 return true;
             }
-            let parent = stack.last().expect("a walked row's reader");
+            let parent = stack.last_mut().expect("a walked row's reader");
             if header.changed.load(Ordering::Relaxed) > parent.verified {
                 return false;
             }
+            parent.summary = or(parent.summary, storage.summary_of(done.node));
             continue;
         }
         let at = top.next;
         top.next += 1;
         let verified = top.verified;
         if at + AHEAD < top.end {
-            prefetch::read(storage.colors.get(storage.edge(at + AHEAD) as usize));
+            let ahead = storage.edge(at + AHEAD) as usize;
+            prefetch::read(storage.colors.get(ahead));
+            prefetch::read(storage.summaries.get(ahead));
         }
         let dep = storage.edge(at);
         let seen = storage.color_of(dep);
         let painted = (seen >> 32) as u32;
-        if painted >= FIELD || painted == view {
-            if seen as u32 > verified {
+        let proved = if painted >= FIELD || painted == view {
+            seen as u32 <= verified
+        } else {
+            let Some(header) = function_header(storage, dep) else { return false };
+            let word = header.verified.load(Ordering::Acquire);
+            let meta = header.meta.load(Ordering::Relaxed);
+            if word & (RUNNING | PROVISIONAL) != 0
+                || meta & (CYCLE | UNTRACKED) != 0
+                || word & VIEW_MASK == 0
+            {
                 return false;
             }
-            continue;
-        }
-        let Some(header) = function_header(storage, dep) else { return false };
-        let word = header.verified.load(Ordering::Acquire);
-        let meta = header.meta.load(Ordering::Relaxed);
-        if word & (RUNNING | PROVISIONAL) != 0 || meta & (CYCLE | UNTRACKED) != 0 || word & VIEW_MASK == 0 {
+            if word & VIEW_MASK == view {
+                header.changed.load(Ordering::Relaxed) <= verified
+            } else if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
+                || storage.inputs_unchanged(dep, word & VIEW_MASK)
+            {
+                mark(storage, header, word, dep)
+                    && header.changed.load(Ordering::Relaxed) <= verified
+            } else {
+                if stack.len() - base > depth {
+                    return false;
+                }
+                // alloc: none once warm: the walk stack grows to its high-water depth once per thread
+                stack.push(entry(header, word, dep));
+                continue;
+            }
+        };
+        if !proved {
             return false;
         }
-        if word & VIEW_MASK == view {
-            if header.changed.load(Ordering::Relaxed) > verified {
-                return false;
-            }
-            continue;
-        }
-        if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
-            if !mark(storage, header, word, dep) || header.changed.load(Ordering::Relaxed) > verified {
-                return false;
-            }
-            continue;
-        }
-        if stack.len() - base > depth {
-            return false;
-        }
-        // alloc: as above
-        stack.push(entry(header, word, dep));
+        let top = stack.last_mut().expect("the walked row");
+        top.summary = or(top.summary, storage.summary_of(dep));
     }
 }
 

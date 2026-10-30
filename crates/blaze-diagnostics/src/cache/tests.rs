@@ -275,7 +275,8 @@ fn stderr(db: &Db, names: &HashMap<FileId, String>, root: &str, diags: &[Diag]) 
 
 #[test]
 fn a_served_outcome_renders_byte_identical() {
-    let fixture = FIXTURE.replace("pub fn f()", "fn unused() {}\npub fn f()");
+    // An early lint's warning: the error leaves out the late lints, `dead_code` among them.
+    let fixture = FIXTURE.replace("pub fn f()", "pub fn g() -> u32 { (1) }\npub fn f()");
     let (db, names, diags) = checked(&fixture, "/reg/lib-1.0.0", "/home/a/work");
     assert!(diags.iter().any(|it| it.code == Some(Code::Error("E0308".to_owned()))), "{diags:?}");
     let lib = crate_named(&db, "lib");
@@ -293,7 +294,7 @@ fn a_served_outcome_renders_byte_identical() {
     assert_eq!(read.diags, there_diags);
     assert_eq!(stderr(&there, &there_names, "/home/b", &read.diags), stderr(&there, &there_names, "/home/b", &there_diags));
     assert!(read.failed);
-    assert!(read.diags.iter().any(|it| it.level == Level::Warning), "the unused function's lint: {:?}", read.diags);
+    assert!(read.diags.iter().any(|it| it.level == Level::Warning), "the parentheses' lint: {:?}", read.diags);
 }
 
 /// A store in memory, which refuses a second put of a key with other bytes as the store does.

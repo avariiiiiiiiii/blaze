@@ -55,7 +55,7 @@ use crate::{
         BuiltinShadowMode, DefMap, LocalDefMap, MacroSubNs, ModuleData, ModuleOrigin, ResolveMode,
         attr_resolution::{attr_macro_as_call_id, derive_macro_as_call_id},
         crate_def_map,
-        diagnostics::{DefDiagnostic, TraitItemImport},
+        diagnostics::{DefDiagnostic, TraitItemImport, is_glob_of_non_module},
         mod_resolution::ModDir,
         path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
         proc_macro::{ProcMacroDef, ProcMacroKind, parse_macro_name_and_helper_attrs},
@@ -2844,6 +2844,14 @@ impl<'db> DefCollector<'db> {
             // alloc: none, at most one report per namespace (two), inline
             let mut reports = SmallVec::<[TraitItemImport; 2]>::new();
             def_map.trait_item_import_reports(db, kind, status.namespaces(), |it| reports.push(it));
+            if is_glob_of_non_module(kind, status.namespaces()) {
+                let item_tree_id = id.lookup(db).id;
+                def_map.diagnostics.push(DefDiagnostic::unresolved_import(
+                    *module_id,
+                    item_tree_id,
+                    use_tree,
+                ));
+            }
             for why in reports {
                 let item_tree_id = id.lookup(db).id;
                 def_map.diagnostics.push(DefDiagnostic::trait_item_import(

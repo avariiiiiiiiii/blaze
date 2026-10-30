@@ -184,7 +184,13 @@ impl Pages {
     }
 
     /// The row page of ID page `page`, made of zeroes from `heap` when it has none.
-    pub(crate) fn page_or_make(&self, page: usize, heap: &Heap, size: usize, align: usize) -> NonNull<u8> {
+    pub(crate) fn page_or_make(
+        &self,
+        page: usize,
+        heap: &Heap,
+        size: usize,
+        align: usize,
+    ) -> NonNull<u8> {
         if let Some(at) = NonNull::new(self.page(page)) {
             return at;
         }
@@ -215,8 +221,9 @@ impl Pages {
     /// Every made page's index and base, in ID-page order: for sweeps, compaction and drop,
     /// under `&mut` of the storage.
     pub(crate) fn made(&self, pages: usize) -> impl Iterator<Item = (usize, NonNull<u8>)> + '_ {
-        (0..pages.min(self.dir.len()))
-            .filter_map(|page| NonNull::new(self.dir.get(page).load(Ordering::Relaxed)).map(|at| (page, at)))
+        (0..pages.min(self.dir.len())).filter_map(|page| {
+            NonNull::new(self.dir.get(page).load(Ordering::Relaxed)).map(|at| (page, at))
+        })
     }
 }
 

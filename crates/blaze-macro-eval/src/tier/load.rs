@@ -77,7 +77,10 @@ impl Call {
         code.calls
             .iter()
             .map(|call| {
-                let handlers = code.handlers.get(call.handlers.start as usize..call.handlers.end as usize).unwrap_or(&[]);
+                let handlers = code
+                    .handlers
+                    .get(call.handlers.start as usize..call.handlers.end as usize)
+                    .expect("a call's handlers are its code's");
                 let landing = handlers.iter().find_map(|it| match *it {
                     blaze_stencil::code::Handler::Default { landing } => Some(landing),
                     blaze_stencil::code::Handler::Tag { .. } => None,

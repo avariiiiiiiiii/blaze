@@ -353,7 +353,7 @@ fn no_such_field<'db>(
                 // alloc: the error's text, for an error hir found
                 paths.iter().map(|path| format!("{unwrap}{path}")),
                 Applicability::MaybeIncorrect,
-                SuggestionStyle::ShowCode,
+                SuggestionStyle::ShowAlways,
             );
         } else if let Some(similar) = similar
             && !(field.parse::<usize>().is_ok() && similar.parse::<usize>().is_ok())

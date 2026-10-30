@@ -10,7 +10,7 @@ use std::{
     },
 };
 
-use blaze_ids::{Hasher, Idx, Sharded};
+use blaze_ids::{Hasher, Idx, Interner as _, Sharded};
 
 /// The variables blaze sets for every expansion, whatever it expands.
 pub const SET: [(&str, &str); 1] = [("RUST_ANALYZER_INTERNALS_DO_NOT_USE", "this is unstable")];

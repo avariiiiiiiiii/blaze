@@ -10,17 +10,21 @@ use crate::{
     tests::{Mode, checked_with, compiletest, normalized, ui},
 };
 
-/// The stderr of `source` with only the diagnostics `keep` takes, without the closing ones.
+/// The stderr of `source` with only the diagnostics `keep` takes, without the closing ones, ending
+/// at the last one's text: the empty line rustc writes after it comes before the ones left out.
 fn ui_only(name: &str, source: &str, keep: impl Fn(&Diag) -> bool) -> String {
     let fixture = format!("//- /{name} crate:other:main edition:2015\n{source}");
     let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     let sources = checked.sources();
-    let stderr: String = checked
+    let mut stderr: String = checked
         .diags
         .iter()
         .filter(|it| keep(it))
         .map(|it| written(it, &sources, Style { ui_testing: true, ..Style::default() }))
         .collect();
+    if stderr.ends_with("\n\n") {
+        stderr.pop();
+    }
     normalized(&stderr)
 }
 

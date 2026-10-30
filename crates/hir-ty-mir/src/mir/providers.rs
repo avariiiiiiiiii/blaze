@@ -29,9 +29,8 @@ inventory::submit! {
 fn interpret_mir<'db>(
     db: &'db Db,
     body: &'db MirBody<'db>,
-    assert_placeholder_ty_is_unused: bool,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, MirEvalError<'db>> {
-    eval::interpret_mir(db, body, assert_placeholder_ty_is_unused, trait_env)
+    eval::interpret_mir(db, body, trait_env)
         .and_then(|(value, _)| value)
 }

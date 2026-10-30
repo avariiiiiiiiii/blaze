@@ -11,7 +11,7 @@
 //! rustc's typeck error leaves it no MIR to check.
 //!
 //! Each finding is a [`ConstCheckKind`], what rustc's error is with what it names; `code` and
-//! `message` are rustc's, the message spelling types as `type_name` does.
+//! `message` are rustc's.
 
 mod calls;
 mod qualifs;
@@ -37,6 +37,7 @@ use salsa::SalsaValue;
 use hir_ty::{
     InferBodyId, InferenceResult,
     db::HirDatabase,
+    display::{DisplayTarget, HirDisplay},
     next_solver::{GenericArgs, StoredGenericArgs, StoredTy, Ty, TyKind},
 };
 
@@ -191,6 +192,7 @@ impl ConstCheckKind {
     pub fn write_message(
         &self,
         db: &Db,
+        krate: Crate,
         context: ConstContext,
         out: &mut impl fmt::Write,
     ) -> fmt::Result {
@@ -200,7 +202,9 @@ impl ConstCheckKind {
             true => "conditionally",
             false => "non",
         };
-        let ty = |ty: &StoredTy| TypeName(super::type_name::rustc_type_name(db, ty.as_ref()));
+        // rustc's diagnostics name a type by its trimmed path (`Option<()>`), as hir-ty shows it.
+        let target = DisplayTarget::from_crate(db, krate);
+        let ty = |ty: &StoredTy| ty.as_ref().display(db, target).to_string();
         match self {
             PointerToInt => out.write_str("pointers cannot be cast to integers during const eval"),
             PointerComparison => {
@@ -480,6 +484,7 @@ impl<'a, 'db> Checker<'a, 'db> {
     }
 
     fn finish(self) -> ConstCheck {
+        eprintln!("DBGCC finish tainted={} primary={:?} secondary={:?}", self.tainted, self.primary, self.secondary);
         if self.tainted {
             return ConstCheck::default();
         }
@@ -540,13 +545,14 @@ impl<'a, 'db> Checker<'a, 'db> {
     }
 
     fn report(&mut self, kind: ConstCheckKind, span: MirSpan) {
+        eprintln!("DBGCC report {kind:?} {span:?} written={}", self.written(span));
         if !self.written(span) {
             return;
         }
         let code = kind.code();
         // alloc: the text of a diagnostic, made when it is reported
         let mut message = String::new();
-        kind.write_message(self.db, self.context, &mut message)
+        kind.write_message(self.db, self.krate, self.context, &mut message)
             .expect("writing to a `String` does not fail");
         let secondary =
             matches!(kind, ConstCheckKind::EscapingMutBorrow | ConstCheckKind::EscapingCellBorrow);

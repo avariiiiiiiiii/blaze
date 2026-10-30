@@ -2119,7 +2119,7 @@ impl Function {
             }
             .store(),
         )?;
-        let (result, output) = interpret_mir(db, body, false, None)?;
+        let (result, output) = interpret_mir(db, body, None)?;
         let mut text = match result {
             Ok(_) => "pass".to_owned(), // alloc: editor edge, the owned report `eval` returns
             Err(e) => {

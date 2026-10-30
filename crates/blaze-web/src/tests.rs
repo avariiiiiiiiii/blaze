@@ -1026,9 +1026,23 @@ fn a_build_kept_like_the_last_allocates_nothing() {
     let five = [Kind::Began, Kind::Functions { object: 0 }, Kind::Other, Kind::Other];
     assert_eq!(kept.kinds(0), five.map(|kind| (5u64, kind)));
     let mut drained = Vec::new();
-    kept.drain(|root, build, record| drained.push((root, build, record)));
+    kept.drain(|root, build, record| drained.push((root, build, record))).expect("kept whole");
     let records = [&began, &whole, &other, &other].map(|it| (0u32, 5u64, it.clone()));
     assert_eq!(drained, records);
+}
+
+/// A record kept that does not come back whole is the drain's error, naming its build, never
+/// a world made from the records around it.
+#[test]
+fn a_torn_record_kept_is_an_error() {
+    let other = Record { at_ns: 2, event: Event::Unlisted { count: 3 } };
+    let mut kept = Kept::default();
+    kept.keep(4, 7, &began(1, "/w"));
+    kept.keep(4, 7, &other);
+    kept.tear();
+    let Err(unkept) = kept.drain(|_, _, _| {}) else { panic!("a torn record drained") };
+    assert_eq!((unkept.root, unkept.build), (4, 7));
+    assert!(matches!(unkept.why, kept::Why::EndsEarly), "{unkept}");
 }
 
 /// A build told every page like the one before allocates nothing once warm: the world tells

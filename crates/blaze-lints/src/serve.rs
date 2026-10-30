@@ -206,7 +206,14 @@ pub fn answer_with<P: AsRef<Path>>(
         let hir_crate = hir::Crate::from(krate);
         let Some(root_path) = path_of(hir_crate.root_file(db)) else { continue };
         let root_path = root_path.as_ref().to_path_buf();
-        let found = crate::check(db, hir_crate, setup, &name_of);
+        let found = match crate::check(db, hir_crate, setup, &name_of) {
+            Ok(found) => found,
+            Err(unnamed) => {
+                // clone: a package's error, once per request it fails in
+                answer.failed.push((ask.packages[at].name.clone(), unnamed.to_string()));
+                continue;
+            }
+        };
         let plain: Vec<&Found> = found.iter().filter(|it| !it.test_only).collect();
         let test = has_tests.then(|| written(found.iter(), &mut sources, &read, style));
         answer.crates.push(Linted {

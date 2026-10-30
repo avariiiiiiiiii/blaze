@@ -158,6 +158,8 @@ mod tests {
                 suggestions: Vec::new(),
             };
             let impure = hir::ConstImpure { node, message: String::new() };
+            // The first lowering decides the crate's lints that may fire, once per crate.
+            assert!(super::lower(cx, &unused_mut).is_empty());
             let found = assert_at_most(0, "an allowed lint's lowering", || {
                 (super::lower(cx, &unused_mut).len(), crate::lower::const_impure::lower(cx, &impure).len())
             });

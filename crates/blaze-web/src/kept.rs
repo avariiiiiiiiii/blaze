@@ -42,7 +42,44 @@ impl Kind {
 pub(crate) struct Kept {
     /// The workspace whose build began last at the end.
     workspaces: Vec<Workspace>,
+    /// The first record that could not be kept: nothing is kept after it, and the world is
+    /// refused rather than made from fewer records than came.
+    broken: Option<Unkept>,
 }
+
+/// Why the records kept of a build cannot be given back whole.
+#[derive(Debug)]
+pub(crate) struct Unkept {
+    pub(crate) root: u32,
+    pub(crate) build: u64,
+    pub(crate) why: Why,
+}
+
+#[derive(Debug)]
+pub(crate) enum Why {
+    Encode(blaze_protocol::cbor::Error),
+    Deflate(std::io::Error),
+    Inflate(std::io::Error),
+    Decode(blaze_protocol::cbor::Error),
+    /// The run's items end before its kinds do.
+    EndsEarly,
+}
+
+impl std::fmt::Display for Unkept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Unkept { root, build, why } = self;
+        write!(f, "build page: the records kept of build {build} of workspace {root} ")?;
+        match why {
+            Why::Encode(error) => write!(f, "do not encode: {error}"),
+            Why::Deflate(error) => write!(f, "do not deflate: {error}"),
+            Why::Inflate(error) => write!(f, "do not inflate: {error}"),
+            Why::Decode(error) => write!(f, "do not decode: {error}"),
+            Why::EndsEarly => f.write_str("end early"),
+        }
+    }
+}
+
+impl std::error::Error for Unkept {}
 
 struct Workspace {
     root: u32,
@@ -81,6 +118,9 @@ struct Run {
 impl Kept {
     /// Keeps `record`, of build `build` of the workspace numbered `root`.
     pub(crate) fn keep(&mut self, root: u32, build: u64, record: &Record) {
+        if self.broken.is_some() {
+            return;
+        }
         let mut at = match self.workspaces.iter().position(|it| it.root == root) {
             Some(at) => at,
             None => {
@@ -100,40 +140,47 @@ impl Kept {
             self.workspaces.push(began);
             at = self.workspaces.len() - 1;
         }
-        self.workspaces[at].keep(build, record);
+        if let Err(unkept) = self.workspaces[at].keep(build, record) {
+            self.broken = Some(unkept);
+        }
     }
 
     /// Hands each record kept to `apply`, in the order the world takes them: each workspace's
-    /// in order, the workspace whose build began last last.
-    pub(crate) fn drain(self, mut apply: impl FnMut(u32, u64, Record)) {
+    /// in order, the workspace whose build began last last. Any record not given back whole
+    /// is the error, before or after the ones it gave.
+    pub(crate) fn drain(self, mut apply: impl FnMut(u32, u64, Record)) -> Result<(), Unkept> {
+        if let Some(unkept) = self.broken {
+            return Err(unkept);
+        }
         // alloc: once, when the first page is asked for: every run inflates into it
         let mut inflated = Vec::new();
         for mut workspace in self.workspaces {
-            workspace.close();
+            workspace.close()?;
+            let root = workspace.root;
             for run in &workspace.runs {
                 inflated.clear();
                 let build = run.build;
-                let read = DeflateDecoder::new(&run.deflated[..]).read_to_end(&mut inflated);
-                if let Err(error) = read {
-                    eprintln!("build page: the records kept of build {build} do not inflate: {error}");
-                    continue;
-                }
+                DeflateDecoder::new(&run.deflated[..])
+                    .read_to_end(&mut inflated)
+                    .map_err(|error| Unkept { root, build, why: Why::Inflate(error) })?;
                 let (mut kept, mut other) = (Items(&inflated), Items(&run.other));
                 for kind in &run.kinds {
                     let item = if *kind == Kind::Other { other.next() } else { kept.next() };
-                    match item.map(blaze_protocol::cbor::from_slice::<Record>) {
-                        Some(Ok(record)) => apply(workspace.root, build, record),
-                        Some(Err(error)) => {
-                            eprintln!("build page: a record kept of build {build} does not decode: {error}")
-                        }
-                        None => {
-                            eprintln!("build page: the records kept of build {build} end early");
-                            break;
-                        }
-                    }
+                    let item = item.ok_or(Unkept { root, build, why: Why::EndsEarly })?;
+                    let record = blaze_protocol::cbor::from_slice::<Record>(item)
+                        .map_err(|error| Unkept { root, build, why: Why::Decode(error) })?;
+                    apply(root, build, record);
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Cuts the last byte off the last run's records of other kinds, for the tests.
+    #[cfg(test)]
+    pub(crate) fn tear(&mut self) {
+        let run = self.workspaces.last_mut().and_then(|it| it.runs.last_mut());
+        run.expect("a run kept").other.pop().expect("a record of another kind kept");
     }
 
     /// The build and kind of each record kept of the workspace `at` in order.
@@ -187,7 +234,7 @@ impl Workspace {
 
     /// As [`crate::world::World::apply`] does: a Began ends the last build's records but for its
     /// functions, and the first object of a build said whole makes the program anew.
-    fn keep(&mut self, build: u64, record: &Record) {
+    fn keep(&mut self, build: u64, record: &Record) -> Result<(), Unkept> {
         let kind = Kind::of(record);
         match &record.event {
             Event::Began { .. } => {
@@ -217,18 +264,17 @@ impl Workspace {
         }
         let mut item = std::mem::take(&mut self.item);
         item.clear();
-        if let Err(error) = self.writer.append(&mut item, record) {
-            eprintln!("build page: a record of build {build} does not encode: {error}");
-            self.item = item;
-            return;
-        }
-        self.keep_item(build, kind, &item);
+        let kept = match self.writer.append(&mut item, record) {
+            Ok(()) => self.keep_item(build, kind, &item),
+            Err(error) => Err(Unkept { root: self.root, build, why: Why::Encode(error) }),
+        };
         self.item = item;
+        kept
     }
 
-    fn keep_item(&mut self, build: u64, kind: Kind, item: &[u8]) {
+    fn keep_item(&mut self, build: u64, kind: Kind, item: &[u8]) -> Result<(), Unkept> {
         if !(self.open && self.runs.last().is_some_and(|it| it.build == build)) {
-            self.close();
+            self.close()?;
             let run = match self.spare.pop() {
                 Some(mut run) => {
                     run.build = build;
@@ -239,17 +285,16 @@ impl Workspace {
             self.runs.push(run);
             self.open = true;
         }
-        let Some(run) = self.runs.last_mut() else { return };
+        let run = self.runs.last_mut().expect("a run was pushed if none was open");
         let len = (item.len() as u32).to_le_bytes();
         if kind == Kind::Other {
             run.other.extend_from_slice(&len);
             run.other.extend_from_slice(item);
         } else {
-            let written = self.encoder.write_all(&len).and_then(|()| self.encoder.write_all(item));
-            if let Err(error) = written {
-                eprintln!("build page: a record of build {build} is not kept: {error}");
-                return;
-            }
+            self.encoder
+                .write_all(&len)
+                .and_then(|()| self.encoder.write_all(item))
+                .map_err(|error| Unkept { root: self.root, build, why: Why::Deflate(error) })?;
         }
         if let Kind::Functions { object } = kind
             && !run.objects.contains(&object)
@@ -257,6 +302,7 @@ impl Workspace {
             run.objects.push(object);
         }
         run.kinds.push(kind);
+        Ok(())
     }
 
     /// Keeps the runs `keep` says to, in order; the stream of the last, if it goes, goes with
@@ -292,24 +338,19 @@ impl Workspace {
 
     /// Ends the stream of the last run: its bytes are copied out whole, and the encoder's
     /// buffer kept for the next stream.
-    fn close(&mut self) {
+    fn close(&mut self) -> Result<(), Unkept> {
         if !std::mem::take(&mut self.open) {
-            return;
+            return Ok(());
         }
         let finished = self.encoder.reset(std::mem::take(&mut self.out));
-        let Some(run) = self.runs.last_mut() else { return };
-        match finished {
-            Ok(stream) => {
-                run.deflated.clear();
-                run.deflated.reserve_exact(stream.len());
-                run.deflated.extend_from_slice(&stream);
-                self.spare_out(stream);
-            }
-            Err(error) => {
-                let build = run.build;
-                eprintln!("build page: the records kept of build {build} do not deflate: {error}")
-            }
-        }
+        let run = self.runs.last_mut().expect("an open stream is the last run's");
+        let (root, build) = (self.root, run.build);
+        let stream = finished.map_err(|error| Unkept { root, build, why: Why::Deflate(error) })?;
+        run.deflated.clear();
+        run.deflated.reserve_exact(stream.len());
+        run.deflated.extend_from_slice(&stream);
+        self.spare_out(stream);
+        Ok(())
     }
 
     /// Keeps `stream`'s buffer, emptied, for the encoder's next stream, but one too long to
@@ -351,6 +392,6 @@ pub(crate) fn round_trip(
     }
     let kinds = kept.kinds(kept.workspaces.len().wrapping_sub(1));
     let mut out = Vec::new();
-    kept.drain(|root, build, record| out.push((root, build, record)));
+    kept.drain(|root, build, record| out.push((root, build, record))).expect("kept whole");
     (kinds, out)
 }

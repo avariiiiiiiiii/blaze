@@ -356,7 +356,7 @@ fn on_evaluator<'db>(
     let krate = first.module(db).krate(db);
     let env = ParamEnvAndCrate { param_env: db.trait_environment(first.into()), krate };
     let owner: InferBodyId<'db> = first.into();
-    let mut eval = Evaluator::new(db, owner, false, Some(env))?;
+    let mut eval = Evaluator::new(db, owner, Some(env))?;
     eval.set_budget(ConstEvalBudget { steps: u64::MAX, memory: MEMORY });
     eval.track_statics();
     for (id, bytes) in preset {

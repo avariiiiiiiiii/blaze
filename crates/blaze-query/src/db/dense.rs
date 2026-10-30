@@ -32,6 +32,8 @@ unsafe impl Zeroed for AtomicU64 {}
 unsafe impl Zeroed for AtomicUsize {}
 // SAFETY: zero bytes are the null pointer; `AtomicPtr` is `Sync`.
 unsafe impl<T> Zeroed for AtomicPtr<T> {}
+// SAFETY: an array's bytes are its elements', each valid zero and `Sync`.
+unsafe impl<T: Zeroed, const N: usize> Zeroed for [T; N] {}
 
 /// A column of `T` over reserved address space, zero where never written.
 pub(crate) struct Dense<T: Zeroed> {

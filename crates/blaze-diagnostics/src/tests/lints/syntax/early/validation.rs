@@ -877,7 +877,7 @@ LL |     type Assoc3 where = () where;
 warning: 5 warnings emitted
 
 "#;
-    assert_eq!(ui("where-clause-placement-assoc-type-in-impl.rs", "2015", source), stderr);
+    assert_eq!(crate::tests::items::ui_core("where-clause-placement-assoc-type-in-impl.rs", "2015", "copy", source), stderr);
 }
 
 #[test]
@@ -930,7 +930,7 @@ LL +     type Assoc2 = () where i32: Copy, u32: Copy;
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(ui("where-clause-placement-assoc-type-in-trait.rs", "2015", source), stderr);
+    assert_eq!(crate::tests::items::ui_core("where-clause-placement-assoc-type-in-trait.rs", "2015", "copy", source), stderr);
 }
 
 #[test]

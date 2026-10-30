@@ -149,6 +149,11 @@ mod tests {
         unit.package.name = "p".into();
         unit.package.version = "0.1.0".into();
         unit.package.manifest_dir = "/ws/p".into();
+        unit.package.manifest_path = "/ws/p/Cargo.toml".into();
+        unit.tools.cargo = "/bin/cargo".into();
+        unit.tools.rustc = "/bin/rustc".into();
+        unit.tools.rustdoc = "/bin/rustdoc".into();
+        unit.profile.opt_level = "0".into();
         unit.script = "/t/build/p/script".into();
         unit.out_dir = "/t/build/p/0123456789abcdef/out".into();
         unit.target = "x86_64-unknown-linux-gnu".into();

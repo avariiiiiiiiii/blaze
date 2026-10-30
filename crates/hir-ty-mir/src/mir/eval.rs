@@ -45,7 +45,7 @@ use crate::{
     drop::{DropGlue, has_drop_glue, is_freeze},
     infer::PointerCast,
     intrinsic::Intrinsic,
-    layout::{InternedLayout, Layout, LayoutError, RustcEnumVariantIdx, RustcFieldIdx},
+    layout::{InternedLayout, Layout, RustcEnumVariantIdx, RustcFieldIdx},
     method_resolution::{is_dyn_method, lookup_impl_const},
     next_solver::{
         AliasConstKind, AliasTy, Allocation, AllocationData, AnonConstIdWrapper, Const, ConstKind,
@@ -447,8 +447,6 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     /// What the `TypeId`s made so far stand for. An id here is its place in this list, which
     /// says whether two are of one type and is not the hash compiled code has.
     type_ids: Vec<TypeIdOf<'db>>,
-    // FIXME: This is a workaround, see the comment on `interpret_mir`
-    assert_placeholder_ty_is_unused: bool,
     /// What the evaluation may spend, of the workspace of the crate it is for.
     budget: ConstEvalBudget,
     /// The steps of [`Self::budget`] not spent yet.
@@ -726,12 +724,6 @@ impl MirOutput {
 pub fn interpret_mir<'db>(
     db: &'db Db,
     body: &'db MirBody<'db>,
-    // FIXME: This is workaround. Ideally, const generics should have a separate body (issue #7434), but now
-    // they share their body with their parent, so in MIR lowering we have locals of the parent body, which
-    // might have placeholders. With this argument, we (wrongly) assume that every placeholder type has
-    // a zero size, hoping that they are all outside of our current body. Even without a fix for #7434, we can
-    // (and probably should) do better here, for example by excluding bindings outside of the target expression.
-    assert_placeholder_ty_is_unused: bool,
     trait_env: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<'db, (Result<'db, Allocation<'db>>, MirOutput)> {
     let ty = body.locals[return_slot()].ty.as_ref();
@@ -740,7 +732,6 @@ pub fn interpret_mir<'db>(
         let mut evaluator = Evaluator::with_machine(
             db,
             body.owner,
-            assert_placeholder_ty_is_unused,
             trait_env,
             Provenance::default(),
         )
@@ -782,7 +773,7 @@ pub fn run_function<'db, M: Machine<'db>>(
         }
     };
     let mut evaluator =
-        match Evaluator::with_machine(db, body.owner, false, Some(env), machine) {
+        match Evaluator::with_machine(db, body.owner, Some(env), machine) {
             Ok(it) => it,
             Err((e, machine)) => {
                 // alloc: error path
@@ -877,10 +868,9 @@ impl<'db> Evaluator<'db> {
     pub fn new(
         db: &'db Db,
         owner: InferBodyId<'db>,
-        assert_placeholder_ty_is_unused: bool,
         trait_env: Option<ParamEnvAndCrate<'db>>,
     ) -> Result<'db, Evaluator<'db>> {
-        Evaluator::with_machine(db, owner, assert_placeholder_ty_is_unused, trait_env, Plain)
+        Evaluator::with_machine(db, owner, trait_env, Plain)
             .map_err(|(e, Plain)| e)
     }
 }
@@ -890,7 +880,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     pub fn with_machine(
         db: &'db Db,
         owner: InferBodyId<'db>,
-        assert_placeholder_ty_is_unused: bool,
         trait_env: Option<ParamEnvAndCrate<'db>>,
         machine: M,
     ) -> std::result::Result<Evaluator<'db, M>, (MirEvalError<'db>, M)> {
@@ -968,7 +957,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             stdout: vec![], // alloc: empty, allocates nothing; one per evaluation
             stderr: vec![], // alloc: empty, allocates nothing; one per evaluation
             type_ids: Vec::new(), // alloc: empty, allocates nothing; one per evaluation
-            assert_placeholder_ty_is_unused,
             stack_depth_limit,
             limits_frames,
             budget,
@@ -3882,13 +3870,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 .is_sized()
                 .then(|| (layout.size.bytes_usize(), layout.align.bytes() as usize)));
         }
-        let layout = self.layout(ty);
-        if self.assert_placeholder_ty_is_unused
-            && matches!(layout, Err(MirEvalError::LayoutError(LayoutError::HasPlaceholder, _)))
-        {
-            return Ok(Some((0, 1)));
-        }
-        let layout = layout?;
+        let layout = self.layout(ty)?;
         Ok(layout.is_sized().then(|| (layout.size.bytes_usize(), layout.align.bytes() as usize)))
     }
 
@@ -5632,7 +5614,7 @@ pub fn render_const_using_debug_impl<'db>(
     c: Allocation<'db>,
     ty: Ty<'db>,
 ) -> Result<'db, String> {
-    let mut evaluator = Evaluator::new(db, owner, false, None)?;
+    let mut evaluator = Evaluator::new(db, owner, None)?;
     let locals = &Locals {
         ptr: ArenaMap::new(),
         body: db

@@ -437,7 +437,8 @@ impl ImageMap {
         }
         let bytes = self.read(&self.edges, (first_edge * EDGE_RECORD) as u64, (edge_len * EDGE_RECORD) as u64)?;
         // SAFETY: the edge section starts at a group boundary of a mapping `open` found at a
-        // 16-byte boundary, and records are 56 bytes, so each is at an 8-byte boundary.
+        // 16-byte boundary, and records are 56 bytes, so each is at an 8-byte boundary; a memo
+        // of no edges reads an empty range, which `from_bytes` takes at any address.
         let edges = unsafe { EdgeRecord::from_bytes(bytes) };
         let (value_at, value_len) = (u64_at(record, 160), u64_at(record, 168));
         let value = if value_len == EVICTED {

@@ -60,7 +60,6 @@ pub struct Mir {
     pub interpret_mir: for<'db> fn(
         &'db Db,
         &'db MirBody<'db>,
-        bool,
         Option<ParamEnvAndCrate<'db>>,
     ) -> Result<Allocation<'db>, MirEvalError<'db>>,
     pub opaque_of_impl: for<'db> fn(

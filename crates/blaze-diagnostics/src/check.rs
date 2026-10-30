@@ -138,14 +138,13 @@ const DUPLICATE: &str = "duplicate diagnostic emitted due to `-Z deduplicate-dia
 
 /// What rustc does as it emits each diagnostic: the note of the macro it came from, none
 /// written twice (unless `keep_duplicates`: then with a note that it is one), nor a
-/// `note_once` already written with another. Gives what is written and the indices into it of
-/// what rustc counts for its closing lines (each diagnostic once: `deduplicated_err_count`).
-fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> (Vec<Diag>, Vec<u32>) {
+/// `note_once` already written with another. rustc counts each one it writes for its closing
+/// lines, a duplicate kept included (`deduplicated_err_count`).
+fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> Vec<Diag> {
     let mut seen: FxHashSet<Key> = FxHashSet::default();
     let mut once: FxHashSet<Key> = FxHashSet::default();
     seen.reserve(diags.len());
     let mut written = Vec::with_capacity(diags.len());
-    let mut counted = Vec::with_capacity(diags.len());
     for mut diag in diags {
         if diag.span.primary.iter().any(|it| it.expansion.is_some())
             && !diag.children.iter().any(|it| it.message.contains("(in Nightly builds, run with -Z macro-backtrace for more info)"))
@@ -159,12 +158,10 @@ fn finish(diags: Vec<Diag>, keep_duplicates: bool) -> (Vec<Diag>, Vec<u32>) {
         diag.children.retain(|child| !child.once || once.insert(key(child)));
         if already {
             diag.note(DUPLICATE);
-        } else {
-            counted.push(u32::try_from(written.len()).expect("fewer than 2^32 diagnostics"));
         }
         written.push(diag);
     }
-    (written, counted)
+    written
 }
 
 /// rustc's key for a diagnostic already emitted (`DiagCtxtInner::emitted_diagnostics`, a set of
@@ -198,8 +195,8 @@ impl Hasher for Blake3 {
 
 /// `diags` as rustc writes them, then its closing lines.
 fn written(diags: Vec<Diag>, options: &Options) -> Vec<Diag> {
-    let (mut written, counted) = finish(diags, options.keep_duplicates);
-    let closing = emit::summary(counted.iter().map(|&at| &written[at as usize]));
+    let mut written = finish(diags, options.keep_duplicates);
+    let closing = emit::summary(written.iter());
     written.extend(closing);
     written
 }
@@ -269,11 +266,10 @@ mod tests {
         a.children.push(note.clone());
         let mut b = Diag::lint("unused_variables", "unused variable: `b`", at(9));
         b.children.push(note);
-        let (diags, counted) = finish(vec![a.clone(), a, b], false);
+        let diags = finish(vec![a.clone(), a, b], false);
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0].children.len(), 1);
         assert!(diags[1].children.is_empty());
-        assert_eq!(counted, [0, 1]);
     }
 
     #[test]
@@ -293,12 +289,13 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_kept_is_noted_and_not_counted() {
+    fn a_duplicate_kept_is_noted_and_counted() {
         let a = Diag::error(Some("E0425"), "cannot find value `x` in this scope", at(0));
-        let (diags, counted) = finish(vec![a.clone(), a.clone()], true);
+        let diags = finish(vec![a.clone(), a.clone()], true);
         assert_eq!(diags.len(), 2);
         assert_eq!(diags[0], a);
         assert_eq!(diags[1].children.last().map(|it| it.message.as_str()), Some(DUPLICATE));
-        assert_eq!(counted, [0]);
+        let closing = emit::summary(diags.iter());
+        assert_eq!(closing[0].message, "aborting due to 2 previous errors");
     }
 }

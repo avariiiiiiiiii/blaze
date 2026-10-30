@@ -967,6 +967,16 @@ fn edges_round_trip_through_their_record() {
     assert_eq!(read.iter().map(EdgeRecord::edge).collect::<Vec<_>>(), vec![edge]);
 }
 
+/// A memo of no edges reads an empty range of the image, which is `&[]` at address 1: no
+/// records, never a cast of an unaligned pointer (the daemon's settle of a 14:13 home).
+#[test]
+fn no_edges_read_from_an_empty_range() {
+    let empty: &[u8] = &[];
+    assert_ne!(empty.as_ptr().addr() % align_of::<EdgeRecord>(), 0, "the case this covers");
+    // SAFETY: empty, which `from_bytes` takes at any address.
+    assert!(unsafe { EdgeRecord::from_bytes(empty) }.is_empty());
+}
+
 /// Counts each thread's allocations for the budgets below and in `memo` and `table`'s tests.
 #[global_allocator]
 static ALLOCATOR: blaze_alloc_count::Counting = blaze_alloc_count::Counting;

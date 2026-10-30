@@ -1277,8 +1277,13 @@ impl EdgeRecord {
     ///
     /// # Safety
     ///
-    /// `bytes` starts at an 8-byte boundary. (Any bytes are a valid record.)
+    /// `bytes` is empty or starts at an 8-byte boundary. (Any bytes are a valid record.) An
+    /// empty `bytes` may be dangling at any address (`&[]` of `u8` is at 1).
     pub(crate) unsafe fn from_bytes(bytes: &[u8]) -> &[EdgeRecord] {
+        if bytes.len() < EDGE_RECORD {
+            debug_assert!(bytes.is_empty(), "{} bytes: less than one edge record", bytes.len());
+            return &[];
+        }
         debug_assert!(bytes.as_ptr().addr() % align_of::<EdgeRecord>() == 0);
         // SAFETY: aligned by the caller's contract, in bounds (`len / 56` whole records), and
         // every bit pattern of a record's byte arrays is valid.

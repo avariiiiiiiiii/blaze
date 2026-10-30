@@ -584,7 +584,7 @@ LL |         let b = 16;
 warning: 2 warnings emitted
 
 "#;
-    assert_eq!(ui("liveness-derive.rs", "2018", source), stderr);
+    assert_eq!(ui_core("liveness-derive.rs", "2018", "sized", source), stderr);
 }
 
 #[test]

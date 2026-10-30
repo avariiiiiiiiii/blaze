@@ -240,6 +240,7 @@ dependencies = [
  "blaze-cas",
  "blaze-format",
  "blaze-ids",
+ "blaze-query",
  "salsa",
  "tango-bench",
 ]

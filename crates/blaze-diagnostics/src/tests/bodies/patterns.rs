@@ -8,7 +8,6 @@
 use crate::{
     Options,
     emit::{Style, written},
-    lower::mutable_ref_binding::BUILT_ON,
     model::Diag,
     tests::{Mode, checked_with, compiletest, normalized, ui},
 };
@@ -19,29 +18,28 @@ use crate::{
 fn ui_fixture(fixture: &str) -> String {
     let stderr = checked_with(fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()))
         .stderr_with(ui_testing());
-    built_on(&normalized(&stderr))
+    normalized(&stderr)
 }
 
-/// [`ui_fixture`] with only the diagnostics `keep` takes, without the closing ones.
+/// [`ui_fixture`] with only the diagnostics `keep` takes, without the closing ones, ending at the
+/// last one's text: the empty line rustc writes after it comes before the ones left out.
 fn ui_only(fixture: &str, keep: impl Fn(&Diag) -> bool) -> String {
     let checked = checked_with(fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
     let sources = checked.sources();
-    let stderr: String = checked
+    let mut stderr: String = checked
         .diags
         .iter()
         .filter(|it| keep(it))
         .map(|it| written(it, &sources, ui_testing()))
         .collect();
-    built_on(&normalized(&stderr))
+    if stderr.ends_with("\n\n") {
+        stderr.pop();
+    }
+    normalized(&stderr)
 }
 
 fn ui_testing() -> Style {
     Style { ui_testing: true, ..Style::default() }
-}
-
-/// rustc writes the date it was built on as `YYYY-MM-DD` under `-Z ui-testing`.
-fn built_on(stderr: &str) -> String {
-    stderr.replace(&format!("was built on {BUILT_ON};"), "was built on YYYY-MM-DD;")
 }
 
 fn code(code: &str) -> impl Fn(&Diag) -> bool + '_ {

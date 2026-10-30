@@ -1,0 +1,24 @@
+{
+  "id": "01185",
+  "from_lane": "tests-misc-lints",
+  "owner": "cargo",
+  "paths": [
+    "crates/blaze-cargo/src/serve/unit.rs",
+    "crates/blaze-lower/src/"
+  ],
+  "what": "Edit seeds are never taken in production: crates/blaze-cargo/src/serve/unit.rs `seed` calls EditionedFileId::seed_parse after `lowered.refresh(lower())` has written the new texts, but every write ends with hir-def nameres maintainer (order 100, crates/hir-def/src/nameres/delta.rs), which parses the written files; salsa keeps that parse, so Reparse::keep refuses every seed and `retain` silently drops them (a fallback to a whole parse; no-fallback). Seed inside the write: hand the seeds to the refresh so it calls seed_parse within the same Db::batch, after set_file_text and before the batch ends (as crates/blaze-intent/src/tests/rename.rs `check` now does), and make a refused seed an error naming the file rather than a silent drop.",
+  "state": "open",
+  "created": "2026-10-30T23:46:42Z",
+  "updated": "2026-10-30T23:46:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:46:42Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

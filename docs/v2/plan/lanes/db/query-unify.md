@@ -103,14 +103,66 @@ thread-local, no downcasters, no revision-keyed claim table.
   was verified is verified by one compare and one store of `verified` (the first read in a
   view), never by walking its edges: an edit to a workspace file never walks a library query.
 
+### Transitive-input summaries (Andrew, 15:56)
+
+Every node has a fixed 128-bit **summary**: a Bloom word of the inputs its value can depend on,
+transitively. A memo whose summary shares no bit with the inputs changed since it was verified
+is green with no edge walk; otherwise it walks its edges as below. A false positive costs a
+walk, never a wrong answer. (The fork had a 62-bit form of it, `graph` closure filters with a
+change log; this replaces it at 128 bits and with the refresh rule below.)
+
+- **Where.** A column of `[u64; 2]` by node (a `blaze_mem` region beside the colors), not in
+  the row header: the hit reads 32 bytes of header and never the summary.
+- **An input field's** summary is two bits: two hashes of its node number (`(n × K1) >> 57`
+  and `(n × K2) >> 57`, two odd 64-bit constants), set when the field's node is made.
+- **A memo's** is the OR of the summaries of every edge it recorded, ORed into the running
+  frame as each read is recorded (one load from the column per edge, on the run path only),
+  and stored when the memo is written. A **tracked field's** is its creator's at the write: a
+  field changes only when its creator runs, so its readers must see its creator's inputs.
+- **Refresh.** A memo verified by a walk (its edges in read order, each dependency verified or
+  run) stores, with its new `verified`, the OR of its edges' current summaries: a dependency
+  that ran again may read inputs it didn't before, and a summary of the old reads would then
+  miss them. A memo made green by its summary keeps it; none of its dependencies can have run.
+  Invariant: a memo verified in view `v` has a summary that covers every dependency's summary
+  as of `v`.
+- **Masks.** Each `&mut` that bumps the view ORs the bits of every input field it set into the
+  new view's mask. The storage keeps the masks of the last 64 views as suffix ORs (`since[i]` =
+  the OR of the masks of the newest `i + 1` views, 64 ORs of 16 bytes per bump), so the mask
+  of everything changed after view `v` is one load, `since[now − v − 1]`. A memo verified more
+  than 64 views ago takes the all-ones mask and walks.
+- **All ones.** A memo that made an untracked read (`report_untracked_read`), a provisional row
+  (in a cycle) and a `Reads` captured while either was open have the all-ones summary. A
+  `synthetic_write(d)` puts all ones in its view's mask.
+- **Order of the checks** on a memo verified in an earlier view: (1) durability (no input of
+  its kind changed since: green, one compare); (2) `summary & since[..] == 0`: green, two
+  loads and a 128-bit AND; (3) the walk, which refreshes the summary.
+- `Reads` (capture/replay) carries the summary of what it read, so a replay ORs it in: `Reads`
+  is 32 bytes, not 16.
+
+Bench (`query_hit`, query-unify-bench): a memo at depth 64 of a graph of 1M edges, one input
+outside its closure changed: verified by its summary in tens of ns, against the fork's walk.
+
 ### Verifying
 
-- A row verified in an earlier view walks its edges in read order. For each edge, the node's
+- A row verified in an earlier view, and not made green by its durability or its summary
+  (above), walks its edges in read order. For each edge, the node's
   color (a `u64` per node in one column: the view it was verified in and its `changed`) says in
   one load whether it is verified now and its stamp; only a node not yet verified in this view
   is verified first (recursively, through its own ingredient, by its node's `(ingredient, id)`).
   The walk stops at the first edge with `changed > verified`: the row runs again. Nothing is
   hashed on this path. Colors are prefetched four edges ahead.
+- **Input summaries** (Andrew, 15:56). Each node has a fixed 128-bit word, a Bloom filter
+  of the input fields under it: an input field sets two bits (two hashes of its node, so per
+  field, finer than per input), a run's is the OR of its edges' words when it is written, a
+  tracked field's is its creator's so far, a cycle's or untracked run's is all ones. The
+  storage keeps the OR of the written fields' bits of each of the last 64 views. A row whose
+  durability check fails is green, with no walk, when its word ANDs to zero with the fields
+  written since it was verified; else it walks as below, and a walk that proves it ORs its
+  dependencies' current words into its own (a dependency that reran with new reads grew its
+  cone, and the next check must see that). A false positive costs a walk, never a wrong answer:
+  every field in a row's cone at its last verify sets a bit of its word, and a dependency's
+  cone grows only by a run that a change in the old cone caused. The word is a column by node
+  beside the colors, so the header stays 32 bytes and the hit doesn't load it.
 - Verifying takes no claim (two tasks verifying the same row reach the same answer and store
   the same view); running does (single flight, below). A row made inside a cycle is never
   verified by its edges: it runs again (its cycle runs again with it).
@@ -173,7 +225,7 @@ The two forms the front end uses keep salsa's semantics, so every result is the 
 - `capture_reads(db, f) -> (T, Option<Reads>)`, `replay_reads(db, reads)`,
   `unshareable_reads(db)` (the trait solver's `DepNodeIndex`, the goal, pick and body stores):
   a capture is a frame whose edges are copied out as a span of the edge array, with their
-  lowest durability and highest stamp (`Reads`, 16 bytes, valid in its view only; replaying
+  lowest durability, highest stamp and summary (`Reads`, 32 bytes, valid in its view only; replaying
   one of another view panics). `None` when the capture read a provisional row.
 - `Reads::for_each_read` and `Storage::ingredient_of(node)`, `ingredient_name`, `owner(id)`:
   what `blaze-item-hash`, `blaze-items` and `hir-firewall` classify reads with, in place of
@@ -257,6 +309,11 @@ Fixed here so the engine (`crates/blaze-query/src/db/`) and the macros
 (`crates/blaze-query-macros`) are written at once. Both sides hold to these names and
 signatures; a change goes through this section first.
 
+Behaviour the front end may rely on beyond the signatures: a memo is verified in a new view
+by, in order, its durability kind (one compare), its 128-bit input summary ANDed with the
+fields written since (green when zero; "Input summaries" above), and only then its edges in
+read order. None of it changes a result, only how much is walked.
+
 ### Public, in `blaze_query::db` (the front end names these as `blaze_query::db::X`)
 
 The root `blaze_query::` has the content-keyed side's own `Database`, so the dense names are
@@ -307,7 +364,7 @@ pub trait Setter: Sized {
 pub struct Cycle<'a>;                            // head_ids() -> impl Iterator<Item = Id>, id() -> Id, iteration() -> u32
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Reads;                                // 16 bytes: edge span, durability, view, changed
+pub struct Reads;                                // 32 bytes: edge span, durability, view, changed, 128-bit summary
 impl Reads {
     pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool;
     pub fn for_each_read<B>(&self, storage: &Storage, f: impl FnMut(Read) -> ControlFlow<B>) -> Option<B>;

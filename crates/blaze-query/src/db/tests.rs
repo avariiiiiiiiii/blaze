@@ -1,0 +1,1283 @@
+//! The dense engine's tests, on hand-written ingredients (the macros are another crate's): hits
+//! and edges, backdating, durability and summaries, every cycle form, inputs, interning,
+//! tracked structs, captured reads, LRU, cancellation, allocation budgets, and a property over
+//! random query graphs checked against a from-scratch evaluation.
+
+use std::{
+    collections::HashMap,
+    hash::Hash,
+    ops::ControlFlow,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Barrier, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+};
+
+use hegel::{TestCase, generators as gs};
+
+use super::{
+    AsId, Cancelled, Cycle, Database, Durability, Event, FromIdIn, Hook, Id, ReadKind, Reads,
+    Setter, Storage, attach, capture_reads,
+    input::field_node,
+    owner_is,
+    plumbing::{
+        CycleKind, Function, Ingredient, Input, Interned, Tag, Tracked, Vtable, evict_values,
+        evict_values_of, fetch, input_fields, input_new, input_read, input_set, input_singleton,
+        intern, intern_by, interned_arguments, interned_fields, tracked_fields, tracked_new,
+        value_hash,
+    },
+    replay_reads, report_untracked_read,
+    storage::{Summary, input_bits},
+    unshareable_reads, unwind_if_cancelled, with_attached,
+};
+
+/// The database of every test: the storage, a log of runs, and what particular tests share
+/// with their queries.
+struct TestDb {
+    storage: Storage,
+    /// `(query, key, view)` of every run.
+    log: Mutex<Vec<(&'static str, u32, u32)>>,
+    shared: Mutex<HashMap<u32, (u64, Reads)>>,
+    gate: Barrier,
+    armed: [AtomicBool; 2],
+    drops: Arc<AtomicUsize>,
+    probe: AtomicU64,
+    cells: Mutex<Vec<Id>>,
+    graph: Vec<GNode>,
+    /// The dependency values of each graph node's last run.
+    snapshots: Mutex<HashMap<usize, Vec<u64>>>,
+}
+
+impl TestDb {
+    fn new() -> TestDb {
+        TestDb::made(None, Vec::new())
+    }
+
+    fn made(hook: Option<Hook>, graph: Vec<GNode>) -> TestDb {
+        TestDb {
+            storage: Storage::new(hook),
+            log: Mutex::new(Vec::new()),
+            shared: Mutex::new(HashMap::new()),
+            gate: Barrier::new(2),
+            armed: [AtomicBool::new(false), AtomicBool::new(false)],
+            drops: Arc::new(AtomicUsize::new(0)),
+            probe: AtomicU64::new(u64::MAX),
+            cells: Mutex::new(Vec::new()),
+            graph,
+            snapshots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn ran(&self, query: &'static str, key: Id) {
+        let view = self.storage.view().as_u32();
+        self.log.lock().unwrap().push((query, key.as_u32(), view));
+    }
+
+    fn runs(&self, query: &str) -> usize {
+        self.log.lock().unwrap().iter().filter(|it| it.0 == query).count()
+    }
+}
+
+impl Database for TestDb {
+    fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
+    fn storage_mut(&mut self) -> &mut Storage {
+        &mut self.storage
+    }
+}
+
+/// An ingredient's static vtable and number.
+macro_rules! ingredient {
+    ($kind:ident :: <$ty:ty>) => {{
+        static VTABLE: Vtable = Vtable::$kind::<$ty>();
+        static INGREDIENT: Ingredient = Ingredient::new(&VTABLE);
+        &INGREDIENT
+    }};
+}
+
+/// A test query, without the plumbing [`Function`] asks of every function.
+trait Spec: 'static {
+    type Key: AsId + FromIdIn + Copy + Send + Sync + 'static;
+    type Value: PartialEq + Hash + Send + Sync + 'static;
+    const QUERY: &'static str;
+    const CAP: usize = 0;
+    const EVICT: bool = false;
+    const CYCLES: CycleKind = CycleKind::Panic;
+    fn cache() -> &'static Ingredient;
+    fn compute(db: &TestDb, key: Self::Key) -> Self::Value;
+    fn fallback(_: &TestDb, _: Self::Key) -> Self::Value {
+        panic!("{} has no cycle_result", Self::QUERY)
+    }
+    fn initial(_: &TestDb, _: Self::Key) -> Self::Value {
+        panic!("{} has no cycle_initial", Self::QUERY)
+    }
+    fn recover(
+        _: &TestDb,
+        _: &Cycle<'_>,
+        _: &Self::Value,
+        new: Self::Value,
+        _: Self::Key,
+    ) -> Self::Value {
+        new
+    }
+}
+
+impl<S: Spec> Function for S {
+    type Db = TestDb;
+    type Key = S::Key;
+    type Value = S::Value;
+    const NAME: &'static str = S::QUERY;
+    const FILE: &'static str = file!();
+    const LRU: usize = S::CAP;
+    const EVICTABLE: bool = S::EVICT;
+    const NO_EQ: bool = false;
+    const CYCLE: CycleKind = S::CYCLES;
+    const TAG: Tag = Tag::Query;
+
+    fn ingredient() -> &'static Ingredient {
+        S::cache()
+    }
+
+    fn execute(db: &TestDb, key: S::Key) -> S::Value {
+        db.ran(S::QUERY, key.as_id());
+        S::compute(db, key)
+    }
+
+    fn cycle_result(db: &TestDb, _: Id, key: S::Key) -> S::Value {
+        S::fallback(db, key)
+    }
+
+    fn cycle_initial(db: &TestDb, _: Id, key: S::Key) -> S::Value {
+        S::initial(db, key)
+    }
+
+    fn cycle_recover(
+        db: &TestDb,
+        cycle: &Cycle<'_>,
+        last: &S::Value,
+        new: S::Value,
+        key: S::Key,
+    ) -> S::Value {
+        S::recover(db, cycle, last, new, key)
+    }
+
+    fn equal(old: &S::Value, new: &S::Value) -> bool {
+        old == new
+    }
+
+    fn hash(value: &S::Value) -> u64 {
+        value_hash(value)
+    }
+}
+
+/// An input of two `u64` fields.
+struct Cells;
+
+impl Input for Cells {
+    type Fields = (u64, u64);
+    const NAME: &'static str = "Cell";
+    const FILE: &'static str = file!();
+    const FIELDS: u32 = 2;
+    const SINGLETON: bool = false;
+
+    fn ingredient() -> &'static Ingredient {
+        ingredient!(input::<Cells>)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Cell(Id);
+
+impl AsId for Cell {
+    fn as_id(&self) -> Id {
+        self.0
+    }
+}
+
+impl FromIdIn for Cell {
+    fn from_id_in(storage: &Storage, id: Id) -> Option<Cell> {
+        owner_is(storage, id, Cells::ingredient()).then_some(Cell(id))
+    }
+}
+
+fn field_a(fields: &mut (u64, u64)) -> &mut u64 {
+    &mut fields.0
+}
+
+fn field_b(fields: &mut (u64, u64)) -> &mut u64 {
+    &mut fields.1
+}
+
+impl Cell {
+    fn new(db: &TestDb, a: u64, b: u64) -> Cell {
+        Cell::of(db, a, b, Durability::LOW)
+    }
+
+    fn of(db: &TestDb, a: u64, b: u64, durability: Durability) -> Cell {
+        Cell(input_new::<Cells, 2>(db.storage(), (a, b), [durability; 2]))
+    }
+
+    fn a(self, db: &TestDb) -> u64 {
+        input_read::<Cells>(db.storage(), self.0, 0);
+        input_fields::<Cells>(db.storage(), self.0).0
+    }
+
+    fn b(self, db: &TestDb) -> u64 {
+        input_read::<Cells>(db.storage(), self.0, 1);
+        input_fields::<Cells>(db.storage(), self.0).1
+    }
+
+    fn set_a(self, db: &mut TestDb, value: u64) -> u64 {
+        input_set::<Cells, u64>(db.storage_mut(), self.0, 0, field_a).to(value)
+    }
+
+    fn set_b(self, db: &mut TestDb, value: u64) -> u64 {
+        input_set::<Cells, u64>(db.storage_mut(), self.0, 1, field_b).to(value)
+    }
+}
+
+/// A function of one input; after a `;`, the [`Spec`] items it overrides.
+macro_rules! query {
+    ($name:ident, $value:ty, |$db:ident, $key:ident| $body:expr $(; $($extra:tt)*)?) => {
+        struct $name;
+
+        impl Spec for $name {
+            type Key = Cell;
+            type Value = $value;
+            const QUERY: &'static str = stringify!($name);
+            $($($extra)*)?
+
+            fn cache() -> &'static Ingredient {
+                ingredient!(function::<$name>)
+            }
+
+            fn compute($db: &TestDb, $key: Cell) -> $value {
+                $body
+            }
+        }
+    };
+}
+
+fn get<F: Function<Db = TestDb, Key = Cell>>(db: &TestDb, cell: Cell) -> &F::Value {
+    fetch::<F>(db, cell)
+}
+
+query!(Double, u64, |db, key| key.a(db) * 2);
+query!(Parity, u64, |db, key| key.a(db) % 2);
+query!(Label, u64, |db, key| get::<Parity>(db, key) * 10 + 1);
+query!(ReadB, u64, |db, key| key.b(db));
+query!(Untracked, u64, |db, key| {
+    report_untracked_read(db);
+    key.b(db)
+});
+
+#[test]
+fn a_hit_returns_the_memo_without_running() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<Double>(&db, cell), 6);
+    assert_eq!(*get::<Double>(&db, cell), 6);
+    assert_eq!(db.runs("Double"), 1);
+}
+
+#[test]
+fn a_change_reruns_its_readers_and_an_equal_value_backdates() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<Label>(&db, cell), 11);
+    cell.set_a(&mut db, 5);
+    assert_eq!(*get::<Label>(&db, cell), 11);
+    assert_eq!(
+        (db.runs("Parity"), db.runs("Label")),
+        (2, 1),
+        "parity reran equal: label is backdated"
+    );
+    cell.set_a(&mut db, 4);
+    assert_eq!(*get::<Label>(&db, cell), 1);
+    assert_eq!((db.runs("Parity"), db.runs("Label")), (3, 2));
+}
+
+#[test]
+fn each_field_has_its_own_edge() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 1, 2);
+    assert_eq!(*get::<ReadB>(&db, cell), 2);
+    cell.set_a(&mut db, 9);
+    assert_eq!(*get::<ReadB>(&db, cell), 2);
+    assert_eq!(db.runs("ReadB"), 1);
+    assert_eq!(cell.set_b(&mut db, 7), 2, "a setter gives back the old value");
+    assert_eq!(*get::<ReadB>(&db, cell), 7);
+    assert_eq!(db.runs("ReadB"), 2);
+}
+
+#[test]
+fn a_write_of_a_lower_durability_skips_higher_rows() {
+    let mut db = TestDb::new();
+    let library = Cell::of(&db, 4, 0, Durability::HIGH);
+    let file = Cell::new(&db, 1, 0);
+    assert_eq!(*get::<Double>(&db, library), 8);
+    file.set_a(&mut db, 2);
+    assert_eq!(*get::<Double>(&db, library), 8);
+    assert_eq!(db.runs("Double"), 1);
+    let old = input_set::<Cells, u64>(db.storage_mut(), library.0, 0, field_a)
+        .with_durability(Durability::LOW)
+        .to(5);
+    assert_eq!(old, 4);
+    assert_eq!(*get::<Double>(&db, library), 10);
+    file.set_a(&mut db, 3);
+    assert_eq!(*get::<Double>(&db, library), 10, "now LOW, verified by its edges: unchanged");
+    assert_eq!(db.runs("Double"), 2);
+}
+
+#[test]
+fn an_unrelated_write_of_the_same_durability_passes_the_summary() {
+    let mut db = TestDb::new();
+    let cells: Vec<Cell> = (0..8).map(|i| Cell::new(&db, i, 0)).collect();
+    let other = Cell::new(&db, 0, 0);
+    for &cell in &cells {
+        get::<Label>(&db, cell);
+    }
+    for round in 0..70 {
+        other.set_a(&mut db, round + 1);
+        for &cell in &cells {
+            assert_eq!(*get::<Label>(&db, cell), (cell.a(&db) % 2) * 10 + 1);
+        }
+    }
+    assert_eq!(db.runs("Label"), 8, "70 views, more than the history, and nothing reran");
+    assert_eq!(db.runs("Parity"), 8);
+    cells[3].set_a(&mut db, 4);
+    assert_eq!(*get::<Label>(&db, cells[3]), 1);
+}
+
+fn bits(db: &TestDb, cell: Cell, field: u32) -> Summary {
+    input_bits(field_node::<Cells>(db.storage(), cell.0, field))
+}
+
+/// A new cell neither of whose fields shares a summary bit with `cell`'s field `a`.
+fn apart(db: &TestDb, cell: Cell) -> Cell {
+    let mine = bits(db, cell, 0);
+    loop {
+        let other = Cell::new(db, 0, 0);
+        let shared = |field| {
+            let theirs = bits(db, other, field);
+            (theirs[0] & mine[0]) | (theirs[1] & mine[1]) != 0
+        };
+        if !shared(0) && !shared(1) {
+            return other;
+        }
+    }
+}
+
+fn recorded() -> (Arc<Mutex<Vec<String>>>, Hook) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&events);
+    let hook: Hook = Box::new(move |_: &Storage, event: Event| {
+        seen.lock().unwrap().push(format!("{:?}", event.kind));
+    });
+    (events, hook)
+}
+
+#[test]
+fn a_memo_green_by_its_summary_walks_nothing() {
+    let (events, hook) = recorded();
+    let mut db = TestDb::made(Some(hook), Vec::new());
+    let cell = Cell::new(&db, 3, 0);
+    let other = apart(&db, cell);
+    assert_eq!(*get::<Label>(&db, cell), 11);
+    events.lock().unwrap().clear();
+    other.set_a(&mut db, 1);
+    assert_eq!(*get::<Label>(&db, cell), 11);
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(|it| it.starts_with("DidValidateMemoizedValue") && it.contains("Label("))
+    );
+    assert!(
+        !events.iter().any(|it| it.contains("Parity(")),
+        "its dependency was not visited: {events:?}"
+    );
+    assert_eq!((db.runs("Label"), db.runs("Parity")), (1, 1));
+}
+
+query!(Grows, u64, |db, key| {
+    if key.a(db) == 0 { 0 } else { Cell(db.cells.lock().unwrap()[0]).b(db) }
+});
+query!(GrowsReader, u64, |db, key| get::<Grows>(db, key) + 1);
+
+#[test]
+fn a_walk_refreshes_the_summary_with_a_dependencys_new_reads() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    let late = apart(&db, cell);
+    db.cells.lock().unwrap().push(late.0);
+    assert_eq!(*get::<GrowsReader>(&db, cell), 1);
+    cell.set_a(&mut db, 1);
+    assert_eq!(*get::<GrowsReader>(&db, cell), 1, "Grows reran, read `late.b` (0): backdated");
+    assert_eq!((db.runs("Grows"), db.runs("GrowsReader")), (2, 1));
+    late.set_b(&mut db, 5);
+    assert_eq!(*get::<GrowsReader>(&db, cell), 6, "the reader's summary has `late.b` now");
+    assert_eq!((db.runs("Grows"), db.runs("GrowsReader")), (3, 2));
+}
+
+#[test]
+fn an_untracked_read_reruns_in_every_view() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 0, 5);
+    let other = Cell::new(&db, 0, 0);
+    assert_eq!(*get::<Untracked>(&db, cell), 5);
+    other.set_a(&mut db, 1);
+    assert_eq!(*get::<Untracked>(&db, cell), 5);
+    assert_eq!(db.runs("Untracked"), 2);
+}
+
+query!(
+    OneOOne,
+    u64,
+    |db, key| get::<OneOOne>(db, key) + 1;
+    const CYCLES: CycleKind = CycleKind::Result;
+    fn fallback(_: &TestDb, _: Cell) -> u64 {
+        100
+    }
+);
+
+#[test]
+fn cycle_fallback_immediate() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    assert_eq!(*get::<OneOOne>(&db, cell), 100);
+}
+
+query!(
+    CycA,
+    u64,
+    |db, key| get::<CycB>(db, key) + 1;
+    const CYCLES: CycleKind = CycleKind::Result;
+    fn fallback(_: &TestDb, _: Cell) -> u64 {
+        10
+    }
+);
+query!(
+    CycB,
+    u64,
+    |db, key| get::<CycA>(db, key) + 1;
+    const CYCLES: CycleKind = CycleKind::Result;
+    fn fallback(_: &TestDb, _: Cell) -> u64 {
+        20
+    }
+);
+
+#[test]
+fn every_query_of_a_fallback_cycle_gets_its_fallback_whichever_is_asked() {
+    for a_first in [true, false] {
+        let db = TestDb::new();
+        let cell = Cell::new(&db, 0, 0);
+        let (a, b) = if a_first {
+            (*get::<CycA>(&db, cell), *get::<CycB>(&db, cell))
+        } else {
+            let b = *get::<CycB>(&db, cell);
+            (*get::<CycA>(&db, cell), b)
+        };
+        assert_eq!((a, b), (10, 20));
+    }
+}
+
+query!(
+    Count,
+    u64,
+    |db, key| (get::<Count>(db, key) + 1).min(key.a(db));
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+
+#[test]
+fn a_fixpoint_converges_and_reconverges_after_a_write() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 5, 0);
+    assert_eq!(*get::<Count>(&db, cell), 5);
+    assert_eq!(db.runs("Count"), 6, "rounds 0, 1, .., 5, then 5 again");
+    cell.set_a(&mut db, 3);
+    assert_eq!(*get::<Count>(&db, cell), 3);
+    cell.set_b(&mut db, 1);
+    let before = db.runs("Count");
+    assert_eq!(*get::<Count>(&db, cell), 3);
+    assert_eq!(db.runs("Count"), before, "an unread field leaves the cycle's rows verified");
+}
+
+query!(
+    FixA,
+    u64,
+    |db, key| *get::<FixB>(db, key);
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(FixB, u64, |db, key| (get::<FixA>(db, key) + 1).min(key.a(db)));
+
+#[test]
+fn a_fixpoint_of_two_queries_converges_from_its_head() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<FixA>(&db, cell), 3);
+    assert_eq!(*get::<FixB>(&db, cell), 3);
+}
+
+query!(
+    Diverge,
+    u64,
+    |db, key| get::<Diverge>(db, key) + 1;
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+
+fn message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|it| (*it).to_owned()))
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_fixpoint_that_never_converges_panics_naming_its_head_and_leaves_no_value() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    for _ in 0..2 {
+        let payload =
+            catch_unwind(AssertUnwindSafe(|| *get::<Diverge>(&db, cell))).expect_err("no fixpoint");
+        let message = message(&*payload);
+        assert!(message.contains("Diverge") && message.contains("did not converge"), "{message}");
+    }
+}
+
+query!(
+    PanicA,
+    u64,
+    |db, key| *get::<PanicB>(db, key);
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(PanicB, u64, |db, key| {
+    let a = *get::<PanicA>(db, key);
+    assert!(key.b(db) == 0, "PanicB was told to panic");
+    (a + 1).min(key.a(db))
+});
+
+#[test]
+fn a_panic_in_a_cycle_leaves_its_rows_empty() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 4, 1);
+    for _ in 0..2 {
+        let payload = catch_unwind(AssertUnwindSafe(|| *get::<PanicA>(&db, cell)))
+            .expect_err("PanicB panics");
+        assert!(message(&*payload).contains("told to panic"));
+    }
+    cell.set_b(&mut db, 0);
+    assert_eq!(*get::<PanicA>(&db, cell), 4);
+    assert_eq!(*get::<PanicB>(&db, cell), 4);
+}
+
+query!(
+    NestA,
+    u64,
+    |db, key| (get::<NestB>(db, key) + 1).min(6);
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(
+    NestB,
+    u64,
+    |db, key| (*get::<NestA>(db, key)).max(*get::<NestC>(db, key));
+    const CYCLES: CycleKind = CycleKind::Fixpoint;
+    fn initial(_: &TestDb, _: Cell) -> u64 {
+        0
+    }
+);
+query!(NestC, u64, |db, key| *get::<NestB>(db, key));
+
+#[test]
+fn a_nested_cycle_merges_into_the_outermost_head() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    assert_eq!(*get::<NestA>(&db, cell), 6);
+    assert_eq!(*get::<NestB>(&db, cell), 6);
+    assert_eq!(*get::<NestC>(&db, cell), 6);
+}
+
+query!(
+    TaskA,
+    u64,
+    |db, key| {
+        if db.armed[0].swap(false, Ordering::SeqCst) {
+            db.gate.wait();
+        }
+        get::<TaskB>(db, key) + 1
+    };
+    const CYCLES: CycleKind = CycleKind::Result;
+    fn fallback(_: &TestDb, _: Cell) -> u64 {
+        1
+    }
+);
+query!(
+    TaskB,
+    u64,
+    |db, key| {
+        if db.armed[1].swap(false, Ordering::SeqCst) {
+            db.gate.wait();
+        }
+        get::<TaskA>(db, key) + 1
+    };
+    const CYCLES: CycleKind = CycleKind::Result;
+    fn fallback(_: &TestDb, _: Cell) -> u64 {
+        2
+    }
+);
+
+/// `F`'s value, asked again each time the task gave way (as `base_db::run_on_pool` posts it).
+fn until_it_holds<F: Function<Db = TestDb, Key = Cell, Value = u64>>(
+    db: &TestDb,
+    cell: Cell,
+) -> u64 {
+    loop {
+        match Cancelled::catch(AssertUnwindSafe(|| *get::<F>(db, cell))) {
+            Ok(value) => return value,
+            Err(Cancelled::WouldWaitOnItself) => {}
+            Err(other) => panic!("cancelled: {other}"),
+        }
+    }
+}
+
+#[test]
+fn a_cycle_across_two_tasks_is_resolved_by_one_of_them() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    db.armed[0].store(true, Ordering::SeqCst);
+    db.armed[1].store(true, Ordering::SeqCst);
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| until_it_holds::<TaskA>(&db, cell));
+        let b = scope.spawn(|| until_it_holds::<TaskB>(&db, cell));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!((a, b), (1, 2));
+}
+
+query!(Slow, u64, |db, key| {
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    key.a(db)
+});
+
+#[test]
+fn one_run_of_a_key_however_many_tasks_ask() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 7, 0);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| assert_eq!(*get::<Slow>(&db, cell), 7));
+        }
+    });
+    assert_eq!(db.runs("Slow"), 1);
+}
+
+#[test]
+fn stopped_readers_unwind_until_the_next_write() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 1, 0);
+    assert_eq!(*get::<Double>(&db, cell), 2);
+    db.storage().stop_readers();
+    assert!(db.storage().readers_stopped());
+    assert_eq!(
+        Cancelled::catch(AssertUnwindSafe(|| *get::<Double>(&db, cell))),
+        Err(Cancelled::PendingWrite)
+    );
+    assert_eq!(
+        Cancelled::catch(AssertUnwindSafe(|| unwind_if_cancelled(&db))),
+        Err(Cancelled::PendingWrite)
+    );
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert!(!db.storage().readers_stopped());
+    assert_eq!(*get::<Double>(&db, cell), 2);
+    let other = catch_unwind(|| Cancelled::catch(|| -> u32 { panic!("not a cancel") }))
+        .expect_err("passes through");
+    assert!(message(&*other).contains("not a cancel"));
+}
+
+/// A singleton input of one field.
+struct Config;
+
+impl Input for Config {
+    type Fields = (u32,);
+    const NAME: &'static str = "Config";
+    const FILE: &'static str = file!();
+    const FIELDS: u32 = 1;
+    const SINGLETON: bool = true;
+
+    fn ingredient() -> &'static Ingredient {
+        ingredient!(input::<Config>)
+    }
+}
+
+#[test]
+fn a_singleton_is_made_once() {
+    let db = TestDb::new();
+    assert_eq!(input_singleton::<Config>(db.storage()), None);
+    let id = input_new::<Config, 1>(db.storage(), (3,), [Durability::HIGH]);
+    assert_eq!(input_singleton::<Config>(db.storage()), Some(id));
+    assert_eq!(input_fields::<Config>(db.storage(), id).0, 3);
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        input_new::<Config, 1>(db.storage(), (4,), [Durability::HIGH])
+    }))
+    .expect_err("a second singleton");
+    assert!(message(&*payload).contains("singleton"));
+}
+
+/// Interned strings.
+struct Names;
+
+impl Interned for Names {
+    type Fields = String;
+    const NAME: &'static str = "Name";
+    const FILE: &'static str = file!();
+
+    fn ingredient() -> &'static Ingredient {
+        ingredient!(interned::<Names>)
+    }
+
+    fn ids_of(_: &String, _: &mut Vec<Id>) {}
+}
+
+fn name(db: &TestDb, text: &str) -> Id {
+    intern_by::<Names, &str>(db.storage(), text, |text, it| *text == it.as_str(), str::to_owned)
+}
+
+#[test]
+fn many_threads_interning_the_same_values_get_one_id_each() {
+    let db = TestDb::new();
+    let texts: Vec<String> = (0..500).map(|i| format!("name{i}")).collect();
+    let all: Vec<Vec<Id>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|t| {
+                let (db, texts) = (&db, &texts);
+                scope.spawn(move || {
+                    let mut ids = vec![None; texts.len()];
+                    for at in (0..texts.len()).map(|i| (i * 7 + t * 31) % texts.len()) {
+                        ids[at] = Some(name(db, &texts[at]));
+                    }
+                    ids.into_iter().map(Option::unwrap).collect::<Vec<Id>>()
+                })
+            })
+            .collect();
+        workers.into_iter().map(|it| it.join().unwrap()).collect()
+    });
+    assert!(all.iter().all(|ids| *ids == all[0]));
+    let mut distinct = all[0].clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(distinct.len(), texts.len());
+    for (text, &id) in texts.iter().zip(&all[0]) {
+        assert_eq!(interned_fields::<Names>(db.storage(), id), text);
+        assert_eq!(intern::<Names>(db.storage(), text.clone()), id, "by value as by borrow");
+    }
+}
+
+/// Interned pairs of an ID and a number, whose `ids_of` is the ID; a function's hidden key.
+struct Pairs;
+
+impl Interned for Pairs {
+    type Fields = (Id, u32);
+    const NAME: &'static str = "probe::interned_arguments";
+    const FILE: &'static str = file!();
+
+    fn ingredient() -> &'static Ingredient {
+        ingredient!(interned::<Pairs>)
+    }
+
+    fn ids_of(fields: &(Id, u32), out: &mut Vec<Id>) {
+        out.push(fields.0);
+    }
+}
+
+#[test]
+fn owners_ids_and_argument_names_are_read_from_the_pages() {
+    let db = TestDb::new();
+    let cell = Cell::new(&db, 0, 0);
+    let pair = intern::<Pairs>(db.storage(), (cell.0, 9));
+    let mut ids = Vec::new();
+    db.storage().ids_of(pair, &mut ids);
+    assert_eq!(ids, [cell.0]);
+    assert_eq!(interned_arguments(db.storage(), pair), Some("probe"));
+    assert_eq!(interned_arguments(db.storage(), cell.0), None);
+    assert_eq!(db.storage().owner(cell.0), Some(Cells::ingredient().index()));
+    assert_eq!(
+        db.storage().ingredient_name(Pairs::ingredient().index()),
+        "probe::interned_arguments"
+    );
+    assert!(db.storage().ingredient_file(Cells::ingredient().index()).ends_with("tests.rs"));
+    let payload = catch_unwind(AssertUnwindSafe(|| input_fields::<Cells>(db.storage(), pair).0))
+        .expect_err("a pair read as a cell");
+    assert!(message(&*payload).contains("read as Cell"));
+    assert!(Cell::from_id_in(db.storage(), pair).is_none());
+}
+
+/// Tracked structs of one `#[tracked]` field, identified by a number.
+struct Items;
+
+impl Tracked for Items {
+    type Identity = u64;
+    type Fields = (u64,);
+    const NAME: &'static str = "Item";
+    const FILE: &'static str = file!();
+    const TRACKED_FIELDS: u32 = 1;
+
+    fn ingredient() -> &'static Ingredient {
+        ingredient!(tracked::<Items>)
+    }
+
+    fn equal_field(_: u32, old: &(u64,), new: &(u64,)) -> bool {
+        old == new
+    }
+}
+
+query!(MakeItem, Id, |db, key| tracked_new::<Items>(db.storage(), 0, (key.a(db),)));
+query!(ReadItem, u64, |db, key| {
+    let item = *get::<MakeItem>(db, key);
+    tracked_fields::<Items>(db.storage(), item, 0).0 * 2
+});
+
+#[test]
+fn a_tracked_struct_keeps_its_id_and_its_field_has_an_edge() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<ReadItem>(&db, cell), 6);
+    let item = *get::<MakeItem>(&db, cell);
+    cell.set_a(&mut db, 4);
+    assert_eq!(*get::<ReadItem>(&db, cell), 8);
+    assert_eq!(*get::<MakeItem>(&db, cell), item, "the same identity is the same struct");
+    assert_eq!((db.runs("MakeItem"), db.runs("ReadItem")), (2, 2));
+    cell.set_b(&mut db, 1);
+    assert_eq!(*get::<ReadItem>(&db, cell), 8);
+    assert_eq!((db.runs("MakeItem"), db.runs("ReadItem")), (2, 2));
+}
+
+query!(Capture, u64, |db, key| {
+    let (value, reads) = capture_reads(db, || key.a(db));
+    db.shared
+        .lock()
+        .unwrap()
+        .insert(key.0.as_u32(), (value, reads.expect("a plain read is shareable")));
+    value
+});
+query!(Replay, u64, |db, key| {
+    let (value, reads) = db.shared.lock().unwrap()[&key.0.as_u32()];
+    replay_reads(db, reads);
+    value + 1
+});
+query!(Unshare, bool, |db, key| {
+    let ((), reads) = capture_reads(db, || {
+        key.a(db);
+        unshareable_reads(db);
+    });
+    reads.is_none()
+});
+
+#[test]
+fn captured_reads_replay_into_another_query() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    assert_eq!(*get::<Capture>(&db, cell), 3);
+    assert_eq!(*get::<Replay>(&db, cell), 4);
+    let (_, reads) = db.shared.lock().unwrap()[&cell.0.as_u32()];
+    assert_eq!(reads.len(), 1);
+    let first =
+        reads.for_each_read(db.storage(), |read| ControlFlow::Break(read)).expect("one read");
+    assert_eq!(first.kind, ReadKind::InputField(0));
+    assert_eq!(
+        (first.key.ingredient_index(), first.key.key_index()),
+        (Cells::ingredient().index(), cell.0)
+    );
+    cell.set_a(&mut db, 5);
+    assert_eq!(*get::<Capture>(&db, cell), 5);
+    assert_eq!(*get::<Replay>(&db, cell), 6, "the replayed read is the replaying query's edge");
+    cell.set_b(&mut db, 1);
+    assert_eq!(*get::<Replay>(&db, cell), 6);
+    assert_eq!(db.runs("Replay"), 2);
+    assert!(capture_reads(&db, || 0).1.is_none(), "no query runs");
+    assert!(*get::<Unshare>(&db, cell));
+}
+
+query!(
+    Tens,
+    u64,
+    |db, key| key.a(db) / 10;
+    const EVICT: bool = true;
+);
+query!(TensReader, u64, |db, key| get::<Tens>(db, key) + 1);
+
+#[test]
+fn an_evicted_value_recomputed_equal_does_not_rerun_its_readers() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 11, 0);
+    assert_eq!(*get::<TensReader>(&db, cell), 2);
+    assert_eq!(evict_values::<Tens>(&mut db), 1);
+    cell.set_a(&mut db, 12);
+    assert_eq!(*get::<TensReader>(&db, cell), 2);
+    assert_eq!((db.runs("Tens"), db.runs("TensReader")), (2, 1));
+    assert_eq!(evict_values_of::<Tens>(&mut db, &[cell]), 1);
+    assert_eq!(*get::<Tens>(&db, cell), 1, "evicted in this view: run again, stamp kept");
+    cell.set_a(&mut db, 25);
+    assert_eq!(*get::<TensReader>(&db, cell), 3);
+}
+
+query!(
+    Capped,
+    u64,
+    |db, key| key.a(db);
+    const CAP: usize = 2;
+    const EVICT: bool = true;
+);
+
+fn values_held(db: &TestDb, name: &str) -> u64 {
+    let mut usage = Vec::new();
+    db.storage().memory_usage(&mut usage);
+    usage.iter().find(|it| it.name == name).map_or(0, |it| it.value_bytes / 8)
+}
+
+#[test]
+fn a_new_view_evicts_past_the_cap_and_keep_every_value_stops_it() {
+    let mut db = TestDb::new();
+    let cells: Vec<Cell> = (0..4).map(|i| Cell::new(&db, i, 0)).collect();
+    for &cell in &cells {
+        get::<Capped>(&db, cell);
+    }
+    assert_eq!(values_held(&db, "Capped"), 4);
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(values_held(&db, "Capped"), 2);
+    db.storage_mut().keep_every_value(true);
+    for (i, &cell) in cells.iter().enumerate() {
+        assert_eq!(*get::<Capped>(&db, cell), i as u64);
+    }
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(values_held(&db, "Capped"), 4);
+    assert_eq!(db.runs("Capped"), 6, "two evicted values ran again");
+}
+
+/// A value that counts its drops.
+struct Counted(u64, Arc<AtomicUsize>);
+
+impl PartialEq for Counted {
+    fn eq(&self, other: &Counted) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Hash for Counted {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.1.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+query!(MakeCounted, Counted, |db, key| Counted(key.a(db), Arc::clone(&db.drops)));
+
+#[test]
+fn dropping_the_storage_frees_every_value() {
+    let mut db = TestDb::new();
+    let cells: Vec<Cell> = (0..3).map(|i| Cell::new(&db, i, 0)).collect();
+    for &cell in &cells {
+        get::<MakeCounted>(&db, cell);
+    }
+    cells[0].set_a(&mut db, 9);
+    assert_eq!(get::<MakeCounted>(&db, cells[0]).0, 9);
+    let drops = Arc::clone(&db.drops);
+    assert_eq!(drops.load(Ordering::SeqCst), 1, "the replaced value");
+    drop(db);
+    assert_eq!(drops.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn events_reach_the_hook() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&events);
+    let hook: Hook = Box::new(move |_: &Storage, event: Event| {
+        seen.lock().unwrap().push(format!("{:?}", event.kind))
+    });
+    let mut db = TestDb::made(Some(hook), Vec::new());
+    let cell = Cell::new(&db, 1, 0);
+    let other = Cell::new(&db, 0, 0);
+    get::<Double>(&db, cell);
+    other.set_a(&mut db, 1);
+    get::<Double>(&db, cell);
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events.iter().filter(|it| it.starts_with("WillExecute") && it.contains("Double(")).count(),
+        1
+    );
+    assert!(
+        events
+            .iter()
+            .any(|it| it.starts_with("DidValidateMemoizedValue") && it.contains("Double("))
+    );
+}
+
+#[test]
+fn attach_lends_the_storage_to_its_closure() {
+    let db = TestDb::new();
+    assert!(!with_attached(|it| it.is_some()));
+    let view = attach(&db, || with_attached(|it| it.map(Storage::view)));
+    assert_eq!(view, Some(db.storage().view()));
+    assert!(!with_attached(|it| it.is_some()));
+}
+
+query!(Wide, u64, |db, _key| {
+    let cells = db.cells.lock().unwrap().clone();
+    cells.iter().map(|&it| Cell(it).a(db)).sum()
+});
+
+#[test]
+fn compaction_keeps_every_live_span() {
+    let mut db = TestDb::new();
+    let cells: Vec<Cell> = (0..128).map(|i| Cell::new(&db, i, 0)).collect();
+    db.cells.lock().unwrap().extend(cells.iter().map(|it| it.0));
+    let key = cells[0];
+    let mut expected: u64 = (0..128).sum();
+    assert_eq!(*get::<Wide>(&db, key), expected);
+    for round in 0..1200 {
+        cells[1].set_a(&mut db, round + 2);
+        expected = (0..128).sum::<u64>() - 1 + round + 2;
+        assert_eq!(*get::<Wide>(&db, key), expected);
+    }
+    get::<Double>(&db, cells[5]);
+    db.storage_mut().compact();
+    assert_eq!(*get::<Wide>(&db, key), expected);
+    assert_eq!(*get::<Double>(&db, cells[5]), 10);
+    cells[2].set_a(&mut db, 100);
+    assert_eq!(*get::<Wide>(&db, key), expected + 98);
+    assert_eq!(*get::<Double>(&db, cells[5]), 10);
+    assert_eq!(db.runs("Double"), 1);
+}
+
+/// Interned numbers, for an intern hit that builds nothing.
+struct Numbers;
+
+impl Interned for Numbers {
+    type Fields = u64;
+    const NAME: &'static str = "Number";
+    const FILE: &'static str = file!();
+
+    fn ingredient() -> &'static Ingredient {
+        ingredient!(interned::<Numbers>)
+    }
+
+    fn ids_of(_: &u64, _: &mut Vec<Id>) {}
+}
+
+query!(Probe, u64, |db, key| {
+    let target = Cell(db.cells.lock().unwrap()[0]);
+    let (value, used) = blaze_alloc_count::measure(|| *get::<Double>(db, target));
+    db.probe.store(used.allocations, Ordering::SeqCst);
+    value + key.a(db)
+});
+
+#[test]
+fn warm_paths_allocate_nothing() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 3, 0);
+    let other = Cell::new(&db, 0, 0);
+    db.cells.lock().unwrap().push(cell.0);
+    get::<Double>(&db, cell);
+    let (_, used) = blaze_alloc_count::measure(|| *get::<Double>(&db, cell));
+    assert_eq!(used.allocations, 0, "a warm hit");
+
+    for round in 0..3 {
+        other.set_a(&mut db, round + 1);
+        get::<Probe>(&db, other);
+    }
+    assert_eq!(db.probe.load(Ordering::SeqCst), 0, "a hit inside a query once its stacks grew");
+
+    intern::<Numbers>(db.storage(), 7);
+    let (_, used) = blaze_alloc_count::measure(|| intern::<Numbers>(db.storage(), 7));
+    assert_eq!(used.allocations, 0, "an interned hit");
+
+    get::<Label>(&db, cell);
+    for round in 0..3 {
+        other.set_b(&mut db, round + 1);
+        let (_, used) = blaze_alloc_count::measure(|| *get::<Label>(&db, cell));
+        if round > 0 {
+            assert_eq!(used.allocations, 0, "a verify of an unchanged graph");
+        }
+    }
+}
+
+/// A node of a random query graph: how it combines what it reads.
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    Sum,
+    Mod3,
+    Max,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Dep {
+    Input(usize),
+    Query(usize),
+}
+
+#[derive(Clone, Debug)]
+struct GNode {
+    op: Op,
+    deps: Vec<Dep>,
+}
+
+/// Interned node numbers: the graph's keys.
+struct Indices;
+
+impl Interned for Indices {
+    type Fields = u32;
+    const NAME: &'static str = "Index";
+    const FILE: &'static str = file!();
+
+    fn ingredient() -> &'static Ingredient {
+        ingredient!(interned::<Indices>)
+    }
+
+    fn ids_of(_: &u32, _: &mut Vec<Id>) {}
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct Node(Id);
+
+impl AsId for Node {
+    fn as_id(&self) -> Id {
+        self.0
+    }
+}
+
+impl FromIdIn for Node {
+    fn from_id_in(storage: &Storage, id: Id) -> Option<Node> {
+        owner_is(storage, id, Indices::ingredient()).then_some(Node(id))
+    }
+}
+
+fn node(db: &TestDb, at: usize) -> Node {
+    Node(intern::<Indices>(db.storage(), at as u32))
+}
+
+fn combine(op: Op, values: &[u64]) -> u64 {
+    match op {
+        Op::Sum => values.iter().fold(0, |acc, it| acc.wrapping_add(*it)),
+        Op::Mod3 => values.iter().fold(0, |acc, it| acc.wrapping_add(*it)) % 3,
+        Op::Max => values.iter().copied().max().unwrap_or(0),
+    }
+}
+
+struct Graph;
+
+impl Spec for Graph {
+    type Key = Node;
+    type Value = u64;
+    const QUERY: &'static str = "Graph";
+
+    fn cache() -> &'static Ingredient {
+        ingredient!(function::<Graph>)
+    }
+
+    fn compute(db: &TestDb, key: Node) -> u64 {
+        let at = *interned_fields::<Indices>(db.storage(), key.0) as usize;
+        let spec = &db.graph[at];
+        let values: Vec<u64> = spec
+            .deps
+            .iter()
+            .map(|&dep| match dep {
+                Dep::Input(input) => {
+                    let cell = Cell(db.cells.lock().unwrap()[input]);
+                    cell.a(db)
+                }
+                Dep::Query(query) => *fetch::<Graph>(db, node(db, query)),
+            })
+            .collect();
+        if let Some(last) = db.snapshots.lock().unwrap().insert(at, values.clone()) {
+            assert_ne!(last, values, "node {at} ran again though nothing it read changed");
+        }
+        combine(spec.op, &values)
+    }
+}
+
+/// Every node's value from scratch.
+fn evaluate(graph: &[GNode], inputs: &[u64]) -> Vec<u64> {
+    let mut values: Vec<u64> = Vec::with_capacity(graph.len());
+    for spec in graph {
+        let read: Vec<u64> = spec
+            .deps
+            .iter()
+            .map(|&dep| match dep {
+                Dep::Input(input) => inputs[input],
+                Dep::Query(query) => values[query],
+            })
+            .collect();
+        values.push(combine(spec.op, &read));
+    }
+    values
+}
+
+#[hegel::test]
+fn random_graphs_agree_with_a_run_from_scratch(tc: TestCase) {
+    let inputs: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(6));
+    let queries: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(12));
+    let mut graph = Vec::with_capacity(queries);
+    for at in 0..queries {
+        let op = [Op::Sum, Op::Mod3, Op::Max][tc.draw(gs::integers::<usize>().max_value(2))];
+        let count: usize = tc.draw(gs::integers::<usize>().min_value(1).max_value(4));
+        let deps = (0..count)
+            .map(|_| {
+                if at > 0 && tc.draw(gs::booleans()) {
+                    Dep::Query(tc.draw(gs::integers::<usize>().max_value(at - 1)))
+                } else {
+                    Dep::Input(tc.draw(gs::integers::<usize>().max_value(inputs - 1)))
+                }
+            })
+            .collect();
+        graph.push(GNode { op, deps });
+    }
+    let mut values: Vec<u64> = (0..inputs).map(|i| i as u64).collect();
+    let mut db = TestDb::made(None, graph);
+    let cells: Vec<Cell> = values.iter().map(|&value| Cell::new(&db, value, 0)).collect();
+    db.cells.lock().unwrap().extend(cells.iter().map(|it| it.0));
+    let writes: usize = tc.draw(gs::integers::<usize>().max_value(12));
+    for step in 0..=writes {
+        if step > 0 {
+            let input: usize = tc.draw(gs::integers::<usize>().max_value(inputs - 1));
+            values[input] += 1 + tc.draw(gs::integers::<u64>().max_value(3));
+            cells[input].set_a(&mut db, values[input]);
+        }
+        let expected = evaluate(&db.graph, &values);
+        let reverse = tc.draw(gs::booleans());
+        for at in 0..queries {
+            let at = if reverse { queries - 1 - at } else { at };
+            assert_eq!(
+                *fetch::<Graph>(&db, node(&db, at)),
+                expected[at],
+                "node {at} at step {step}"
+            );
+        }
+    }
+    let log = db.log.lock().unwrap();
+    let mut seen = HashMap::new();
+    for &(query, key, view) in log.iter() {
+        *seen.entry((query, key, view)).or_insert(0) += 1;
+    }
+    assert!(seen.values().all(|&count| count == 1), "a query ran twice in one view");
+}

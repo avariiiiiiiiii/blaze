@@ -1297,7 +1297,8 @@ pub fn f(x: t!()) -> u8 {
                     expanded += 1;
                 }
             }
-            assert!(expanded >= 8, "{expanded} calls expanded");
+            // `t!`, both `p!`, `s!`, `nest!` and the `e!` it expands to, `e!({ y })`.
+            assert_eq!(expanded, 7, "{expanded} calls expanded");
             assert!(not >= 1, "the call `cfg` removes is expanded by neither");
         });
     }

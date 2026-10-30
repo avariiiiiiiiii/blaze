@@ -301,6 +301,7 @@ fn main() {
 #[test]
 fn self_tuple_struct_pattern() {
     let fixture = r#"
+//- minicore: copy
 //- /main.rs crate:other:main
 struct S(i32, i32);
 impl S {

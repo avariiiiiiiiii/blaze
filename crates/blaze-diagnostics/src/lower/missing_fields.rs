@@ -468,7 +468,7 @@ fn private_fields<'db>(cx: &Cx<'_, 'db>, record: &Record<'db>, variant: hir::Var
                 "you might have meant to use an associated function to build this type",
                 many.iter().map(|(_, name, args)| call(name, *args)),
                 Applicability::MaybeIncorrect,
-                SuggestionStyle::ShowCode,
+                SuggestionStyle::ShowAlways,
             );
         }
     }

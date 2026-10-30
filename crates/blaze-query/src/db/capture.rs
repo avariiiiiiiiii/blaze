@@ -15,20 +15,21 @@ use super::{
     ingredient::{self, Kind},
     local::{self, Capture},
     row::span,
-    storage::key_parts,
+    storage::{Summary, key_parts, or},
 };
 
 /// What a [`capture_reads`] frame read: its edges, the lowest durability and highest
-/// `changed` of them, and the view it was captured in.
+/// `changed` of them, the OR of their input summaries, and the view it was captured in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Reads {
     span: u64,
     view: u32,
     /// `changed`, with the durability in its top two bits.
     changed: u32,
+    summary: Summary,
 }
 
-const _: () = assert!(size_of::<Reads>() == 16);
+const _: () = assert!(size_of::<Reads>() == 32);
 
 const DURABILITY_SHIFT: u32 = 30;
 
@@ -82,7 +83,11 @@ impl Reads {
     /// # Panics
     ///
     /// If `self` was captured in another view than `storage`'s.
-    pub fn for_each_read<B>(&self, storage: &Storage, mut f: impl FnMut(Read) -> ControlFlow<B>) -> Option<B> {
+    pub fn for_each_read<B>(
+        &self,
+        storage: &Storage,
+        mut f: impl FnMut(Read) -> ControlFlow<B>,
+    ) -> Option<B> {
         self.check_view(storage);
         let start = span::start(self.span);
         for at in start..start + span::len(self.span) {
@@ -93,7 +98,8 @@ impl Reads {
                 Some(Kind::Interned) => ReadKind::Interned,
                 Some(Kind::Function) | None => ReadKind::Function,
             };
-            if let ControlFlow::Break(it) = f(Read { key: DatabaseKeyIndex::new(index, id), kind }) {
+            if let ControlFlow::Break(it) = f(Read { key: DatabaseKeyIndex::new(index, id), kind })
+            {
                 return Some(it);
             }
         }
@@ -121,6 +127,7 @@ impl Drop for Open {
             {
                 frame.durability = frame.durability.min(capture.durability);
                 frame.changed = frame.changed.max(capture.changed);
+                frame.summary = or(frame.summary, capture.summary);
                 frame.unshareable = true;
                 frame.dedup_floor = capture.dedup_floor;
             }
@@ -143,11 +150,13 @@ pub fn capture_reads<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> (T, Optio
             edges_start: edges,
             durability: frame.durability,
             changed: frame.changed,
+            summary: frame.summary,
             unshareable: frame.unshareable,
             dedup_floor: frame.dedup_floor,
         };
         frame.durability = u8::MAX;
         frame.changed = 0;
+        frame.summary = [0; 2];
         frame.unshareable = false;
         frame.dedup_floor = edges;
         // alloc: none once warm: the capture stack grows to its high-water depth once per thread
@@ -162,17 +171,25 @@ pub fn capture_reads<D: Database, T>(db: &D, f: impl FnOnce() -> T) -> (T, Optio
         let capture = local.captures.pop().expect("the capture `capture_reads` opened");
         debug_assert_eq!(local.captures.len(), at);
         let frame = &mut local.frames[capture.frame as usize];
-        let (durability, changed, unshareable) = (frame.durability, frame.changed, frame.unshareable);
+        let (durability, changed, replayed, unshareable) =
+            (frame.durability, frame.changed, frame.summary, frame.unshareable);
         frame.durability = durability.min(capture.durability);
         frame.changed = changed.max(capture.changed);
+        frame.summary = or(replayed, capture.summary);
         frame.unshareable = unshareable || capture.unshareable;
         frame.dedup_floor = capture.dedup_floor;
         if unshareable {
             return None;
         }
-        let span = storage.push_edges(&local.edges[capture.edges_start as usize..]);
+        let edges = &local.edges[capture.edges_start as usize..];
+        let span = storage.push_edges(edges);
         let durability = u32::from(durability.min(2));
-        Some(Reads { span, view: storage.view_bits(), changed: changed | (durability << DURABILITY_SHIFT) })
+        Some(Reads {
+            span,
+            view: storage.view_bits(),
+            changed: changed | (durability << DURABILITY_SHIFT),
+            summary: or(replayed, storage.summary_of_edges(edges)),
+        })
     });
     (value, reads)
 }
@@ -190,6 +207,7 @@ pub fn replay_reads<D: Database>(db: &D, reads: Reads) {
         let Some(frame) = local.recording(storage) else { return };
         frame.durability = frame.durability.min(reads.durability());
         frame.changed = frame.changed.max(reads.changed());
+        frame.summary = or(frame.summary, reads.summary);
         let start = span::start(reads.span);
         for at in start..start + span::len(reads.span) {
             // alloc: none once warm: the edge stack grows to its high-water mark once per thread

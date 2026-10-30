@@ -5,7 +5,8 @@
 //!   `verified` (equal to the storage's clock): four dependent loads, no lock, no shared write.
 //!   Inside a query, one push of the row's node onto the thread's edge stack.
 //! - **Verify**: a row of an earlier view is verified first by its durability (one compare),
-//!   then by a claim-free walk of its edges in read order ([`super::verify`]), which stops at
+//!   then by its input summary (one 128-bit AND with the fields written since), then by a
+//!   claim-free walk of its edges in read order ([`super::verify`]), which stops at
 //!   the first changed one; only a row that must run takes its flight, and verifies its edges
 //!   again there, running each changed dependency (whose new value may be backdated).
 //! - **Run**: under the key's flight, with `RUNNING` set; the new value is backdated (its old
@@ -17,7 +18,11 @@
 //!   on its own stack when it runs again). Heads are stack positions; a frame's `head` is the
 //!   lowest it depends on, so nested cycles merge into the outermost head, which iterates.
 
-use std::{marker::PhantomData, ptr::NonNull, sync::atomic::{AtomicUsize, Ordering}};
+use std::{
+    marker::PhantomData,
+    ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use blaze_mem::Tag;
 
@@ -30,7 +35,7 @@ use super::{
         self, CYCLE, DURABILITY, HASHED, HEAD, Header, PROVISIONAL, Pages, RUNNING, Row, STALE,
         UNTRACKED, VALUE, VIEW_MASK, row_at, span,
     },
-    storage::{Durability, FIELD, Relocate, Storage, Table, color, key_parts, node_key},
+    storage::{ALL, Durability, FIELD, Relocate, Storage, Table, color, key_parts, node_key, or},
     verify,
 };
 
@@ -67,7 +72,13 @@ pub trait Function: 'static {
     fn execute(db: &Self::Db, key: Self::Key) -> Self::Value;
     fn cycle_result(db: &Self::Db, id: Id, key: Self::Key) -> Self::Value;
     fn cycle_initial(db: &Self::Db, id: Id, key: Self::Key) -> Self::Value;
-    fn cycle_recover(db: &Self::Db, cycle: &Cycle<'_>, last: &Self::Value, new: Self::Value, key: Self::Key) -> Self::Value;
+    fn cycle_recover(
+        db: &Self::Db,
+        cycle: &Cycle<'_>,
+        last: &Self::Value,
+        new: Self::Value,
+        key: Self::Key,
+    ) -> Self::Value;
     fn equal(old: &Self::Value, new: &Self::Value) -> bool;
     fn hash(value: &Self::Value) -> u64;
 }
@@ -219,7 +230,14 @@ fn row_or_make<F: Function>(storage: &Storage, id: Id) -> (&RowOf<F>, u32) {
 
 /// Brings `row` up to this view: with its value when `value`. Returns how the caller may read
 /// it; without `value`, `Provisional` and `OnStack` mean its edge counts as changed.
-fn refresh<F: Function>(db: &F::Db, storage: &Storage, index: u32, row: &RowOf<F>, key: F::Key, value: bool) -> State {
+fn refresh<F: Function>(
+    db: &F::Db,
+    storage: &Storage,
+    index: u32,
+    row: &RowOf<F>,
+    key: F::Key,
+    value: bool,
+) -> State {
     let id = key.as_id();
     let header = &row.header;
     loop {
@@ -228,7 +246,10 @@ fn refresh<F: Function>(db: &F::Db, storage: &Storage, index: u32, row: &RowOf<F
         }
         let view = storage.view_bits();
         let word = header.verified.load(Ordering::Acquire);
-        if word & (RUNNING | PROVISIONAL) == 0 && word & VIEW_MASK == view && (word & VALUE != 0 || !value) {
+        if word & (RUNNING | PROVISIONAL) == 0
+            && word & VIEW_MASK == view
+            && (word & VALUE != 0 || !value)
+        {
             return State::Current;
         }
         let node = header.node.load(Ordering::Relaxed);
@@ -241,19 +262,27 @@ fn refresh<F: Function>(db: &F::Db, storage: &Storage, index: u32, row: &RowOf<F
         if word & PROVISIONAL != 0 {
             let head = header.extra.load(Ordering::Relaxed) as u32;
             match local::with(|local| local.find(storage, head)) {
-                Some(at) if header.meta.load(Ordering::Relaxed) & STALE == 0 => return State::Provisional(at),
+                Some(at) if header.meta.load(Ordering::Relaxed) & STALE == 0 => {
+                    return State::Provisional(at);
+                }
                 Some(_) => {}
                 None => {
                     wait_for(storage, head);
                     continue;
                 }
             }
-        } else if word & RUNNING == 0 && node != 0 && word & VIEW_MASK != view && verify::unclaimed(storage, header, word, node) {
+        } else if word & RUNNING == 0
+            && node != 0
+            && word & VIEW_MASK != view
+            && verify::unclaimed(storage, header, word, node)
+        {
             continue;
         }
         let db_ptr = std::ptr::from_ref(db).cast::<()>();
         let mut assumed = None;
-        in_flight(storage, index, id, || assumed = claimed::<F>(db_ptr, storage, index, row, key, value));
+        in_flight(storage, index, id, || {
+            assumed = claimed::<F>(db_ptr, storage, index, row, key, value)
+        });
         if let Some(head) = assumed {
             local::with(|local| depend_on(local, head));
             return State::Assumed;
@@ -300,7 +329,14 @@ fn wait_for(storage: &Storage, head: u32) {
 /// The flight holder's part of [`refresh`]: verify the row's edges with its dependencies run
 /// as needed, or run it. The stack index of the verify it assumed unchanged when it proved the
 /// row on that assumption (only without `value`), else `None`.
-fn claimed<F: Function>(db: *const (), storage: &Storage, index: u32, row: &RowOf<F>, key: F::Key, value: bool) -> Option<u32> {
+fn claimed<F: Function>(
+    db: *const (),
+    storage: &Storage,
+    index: u32,
+    row: &RowOf<F>,
+    key: F::Key,
+    value: bool,
+) -> Option<u32> {
     let header = &row.header;
     let view = storage.view_bits();
     let word = header.verified.load(Ordering::Acquire);
@@ -324,15 +360,18 @@ fn claimed<F: Function>(db: *const (), storage: &Storage, index: u32, row: &RowO
         run::<F>(db, storage, index, row, key, None, false);
         return None;
     }
-    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK) {
+    if storage.unchanged_since(meta as u8 & DURABILITY as u8, word & VIEW_MASK)
+        || storage.inputs_unchanged(node, word & VIEW_MASK)
+    {
         if mark(storage, header, word, node, index, id) && value && word & VALUE == 0 {
             run::<F>(db, storage, index, row, key, None, true);
         }
         return None;
     }
-    let at = local::with(|local| local.push(Frame::new(storage, FrameKind::Verify, node, index, id)));
+    let at =
+        local::with(|local| local.push(Frame::new(storage, FrameKind::Verify, node, index, id)));
     let mut guard = Running { storage, header, word, at, index, id, armed: true };
-    let unchanged = verify_claimed(db, storage, header, word & VIEW_MASK);
+    let unchanged = verify_claimed(db, storage, header, node, word & VIEW_MASK);
     let (reentered, head) = local::with(|local| {
         let frame = &local.frames[at as usize];
         (frame.reentered, frame.head)
@@ -344,7 +383,13 @@ fn claimed<F: Function>(db: *const (), storage: &Storage, index: u32, row: &RowO
             debug_assert!(!value, "a fetch's verify never depends on one below it");
             local::with(|local| {
                 // alloc: none once warm: the pending list grows to its high-water mark once per thread
-                local.pending.push(Pending { header: std::ptr::from_ref(header), word, node, ingredient: index, id: id.as_u32() });
+                local.pending.push(Pending {
+                    header: std::ptr::from_ref(header),
+                    word,
+                    node,
+                    ingredient: index,
+                    id: id.as_u32(),
+                });
                 local.pop(at);
             });
             return Some(head);
@@ -367,10 +412,19 @@ fn claimed<F: Function>(db: *const (), storage: &Storage, index: u32, row: &RowO
 
 /// Marks the rows from `from` on the pending list verified: the verify they assumed was proved.
 fn mark_pending(storage: &Storage, from: u32) {
-    while let Some(pending) = local::with(|local| (local.pending.len() as u32 > from).then(|| local.pending.pop()).flatten()) {
+    while let Some(pending) = local::with(|local| {
+        (local.pending.len() as u32 > from).then(|| local.pending.pop()).flatten()
+    }) {
         // SAFETY: a pending row's header is in a page of `storage`, which outlives this call.
         let header = unsafe { &*pending.header };
-        mark(storage, header, pending.word, pending.node, pending.ingredient, Id::from_u32(pending.id));
+        mark(
+            storage,
+            header,
+            pending.word,
+            pending.node,
+            pending.ingredient,
+            Id::from_u32(pending.id),
+        );
     }
 }
 
@@ -390,7 +444,14 @@ fn node_of(storage: &Storage, index: u32, id: Id, header: &Header) -> u32 {
 
 /// Marks a row verified in this view, keeping whether it has its value. `false` when another
 /// task changed its word meanwhile (the caller looks again).
-pub(crate) fn mark(storage: &Storage, header: &Header, word: u32, node: u32, index: u32, id: Id) -> bool {
+pub(crate) fn mark(
+    storage: &Storage,
+    header: &Header,
+    word: u32,
+    node: u32,
+    index: u32,
+    id: Id,
+) -> bool {
     let view = storage.view_bits();
     let to = view | (word & VALUE);
     if header.verified.compare_exchange(word, to, Ordering::AcqRel, Ordering::Acquire).is_err() {
@@ -398,16 +459,26 @@ pub(crate) fn mark(storage: &Storage, header: &Header, word: u32, node: u32, ind
     }
     storage.paint(node, color(view, header.changed.load(Ordering::Relaxed)));
     if storage.has_hook() {
-        storage.event(|| EventKind::DidValidateMemoizedValue { database_key: DatabaseKeyIndex::new(index, id) });
+        storage.event(|| EventKind::DidValidateMemoizedValue {
+            database_key: DatabaseKeyIndex::new(index, id),
+        });
     }
     true
 }
 
 /// Checks a row's edges in read order holding its flight, bringing each dependency up to this
-/// view (running it if it changed): `true` when none changed since `verified`.
-fn verify_claimed(db: *const (), storage: &Storage, header: &Header, verified: u32) -> bool {
+/// view (running it if it changed): `true` when none changed since `verified`, and then the
+/// row's summary has its dependencies' current ones.
+fn verify_claimed(
+    db: *const (),
+    storage: &Storage,
+    header: &Header,
+    row_node: u32,
+    verified: u32,
+) -> bool {
     let edges = header.edges.load(Ordering::Acquire);
     let (start, len) = (span::start(edges), span::len(edges));
+    let mut summary = [0; 2];
     for at in start..start + len {
         let node = storage.edge(at);
         let mut seen = storage.color_of(node);
@@ -415,12 +486,17 @@ fn verify_claimed(db: *const (), storage: &Storage, header: &Header, verified: u
         let painted = (seen >> 32) as u32;
         if painted < FIELD && painted != view {
             let (index, id, _) = key_parts(storage.key_of(node));
-            let Some(verify) = ingredient::vtable(index).and_then(|it| it.verify) else { return false };
+            let Some(verify) = ingredient::vtable(index).and_then(|it| it.verify) else {
+                return false;
+            };
             // SAFETY: `db` is this storage's database as every function of it names it
             // (`Storage::check_db`), and `id` is a key of ingredient `index` (its node's key).
             match unsafe { verify(db, storage, id) } {
                 Verified::Changed => return false,
-                Verified::Assumed => continue,
+                Verified::Assumed => {
+                    summary = or(summary, storage.summary_of(node));
+                    continue;
+                }
                 Verified::Current => {}
             }
             seen = storage.color_of(node);
@@ -431,7 +507,9 @@ fn verify_claimed(db: *const (), storage: &Storage, header: &Header, verified: u
         if seen as u32 > verified {
             return false;
         }
+        summary = or(summary, storage.summary_of(node));
     }
+    storage.grow_summary(row_node, summary);
     true
 }
 
@@ -518,8 +596,9 @@ impl Drop for Running<'_> {
 /// Empties the cycle members from `from` on the member list: a cycle's unwinding.
 fn empty_members(storage: &Storage, from: u32) {
     loop {
-        let Some(member) = local::with(|local| (local.members.len() as u32 > from).then(|| local.members.pop()).flatten())
-        else {
+        let Some(member) = local::with(|local| {
+            (local.members.len() as u32 > from).then(|| local.members.pop()).flatten()
+        }) else {
             return;
         };
         reset_member(storage, member);
@@ -550,7 +629,15 @@ fn member_header(storage: &Storage, member: Member) -> Option<&Header> {
 
 /// Runs `key` holding its flight, its frame pushed (or the verify frame `frame` turned into
 /// it). `keep`: the row was verified in this view without its value, so its stamp stands.
-fn run<F: Function>(db: *const (), storage: &Storage, index: u32, row: &RowOf<F>, key: F::Key, frame: Option<u32>, keep: bool) {
+fn run<F: Function>(
+    db: *const (),
+    storage: &Storage,
+    index: u32,
+    row: &RowOf<F>,
+    key: F::Key,
+    frame: Option<u32>,
+    keep: bool,
+) {
     // SAFETY: as in `verify_edge`: `db` is this storage's `&F::Db`.
     let db = unsafe { &*db.cast::<F::Db>() };
     let header = &row.header;
@@ -562,7 +649,11 @@ fn run<F: Function>(db: *const (), storage: &Storage, index: u32, row: &RowOf<F>
         if meta & STALE != 0 {
             header.meta.store(meta & !STALE, Ordering::Relaxed);
         }
-        if header.verified.compare_exchange(word, word | RUNNING, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        if header
+            .verified
+            .compare_exchange(word, word | RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             if let Some(at) = frame {
                 local::with(|local| local.pop(at));
             }
@@ -571,7 +662,9 @@ fn run<F: Function>(db: *const (), storage: &Storage, index: u32, row: &RowOf<F>
     } else {
         word &= !RUNNING;
     }
-    let at = frame.unwrap_or_else(|| local::with(|local| local.push(Frame::new(storage, FrameKind::Run, node, index, id))));
+    let at = frame.unwrap_or_else(|| {
+        local::with(|local| local.push(Frame::new(storage, FrameKind::Run, node, index, id)))
+    });
     let mut running = Running { storage, header, word, at, index, id, armed: true };
     storage.event(|| EventKind::WillExecute { database_key: DatabaseKeyIndex::new(index, id) });
     loop {
@@ -609,8 +702,31 @@ fn store_edges(storage: &Storage, header: &Header, at: u32) {
     storage.forget_edges(old);
 }
 
+/// Sets the summary of the run at `at` (node `node`): the OR of its edges' and its replayed
+/// reads', all bits when it made an untracked read.
+fn summarize(storage: &Storage, node: u32, at: u32, untracked: bool) {
+    let summary = if untracked {
+        ALL
+    } else {
+        local::with(|local| {
+            let frame = &local.frames[at as usize];
+            let start = frame.edges_start as usize;
+            or(frame.summary, storage.summary_of_edges(&local.edges[start..]))
+        })
+    };
+    storage.set_summary(node, summary);
+}
+
 /// A run outside any cycle: backdate, write, publish.
-fn finish<F: Function>(storage: &Storage, row: &RowOf<F>, done: &Ran, at: u32, word: u32, new: F::Value, keep: bool) {
+fn finish<F: Function>(
+    storage: &Storage,
+    row: &RowOf<F>,
+    done: &Ran,
+    at: u32,
+    word: u32,
+    new: F::Value,
+    keep: bool,
+) {
     let header = &row.header;
     let view = storage.view_bits();
     let old_meta = header.meta.load(Ordering::Relaxed);
@@ -644,6 +760,7 @@ fn finish<F: Function>(storage: &Storage, row: &RowOf<F>, done: &Ran, at: u32, w
     // SAFETY: the flight holder, `RUNNING` set; the value was dropped above (rule 1).
     unsafe { row.put(new) };
     store_edges(storage, header, at);
+    summarize(storage, done.node, at, done.untracked);
     header.changed.store(changed, Ordering::Relaxed);
     header.meta.store(meta, Ordering::Relaxed);
     storage.paint(done.node, color(view, changed));
@@ -653,7 +770,16 @@ fn finish<F: Function>(storage: &Storage, row: &RowOf<F>, done: &Ran, at: u32, w
 
 /// A run that read a provisional row of a cycle headed below it: it becomes a member of that
 /// cycle, provisional, owned by the head.
-fn participate<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done: &Ran, at: u32, word: u32, new: F::Value, key: F::Key) {
+fn participate<F: Function>(
+    db: &F::Db,
+    storage: &Storage,
+    row: &RowOf<F>,
+    done: &Ran,
+    at: u32,
+    word: u32,
+    new: F::Value,
+    key: F::Key,
+) {
     let header = &row.header;
     let id = key.as_id();
     let head = local::with(|local| local.frames[done.head as usize].node);
@@ -665,7 +791,8 @@ fn participate<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done:
             let cycle = Cycle { heads: &heads, id, iteration: round };
             // SAFETY: the row's provisional value, this task's own (rule 4).
             let last = unsafe { row.value() };
-            let value = blaze_mem::frame::task(F::TAG, |_| F::cycle_recover(db, &cycle, last, new, key));
+            let value =
+                blaze_mem::frame::task(F::TAG, |_| F::cycle_recover(db, &cycle, last, new, key));
             if !F::equal(last, &value) {
                 local::with(|local| local.frames[done.head as usize].unconverged = true);
             }
@@ -684,6 +811,7 @@ fn participate<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done:
     // SAFETY: as above, the row holds no value now.
     unsafe { row.put(value) };
     store_edges(storage, header, at);
+    storage.set_summary(done.node, ALL);
     header.changed.store(done.changed, Ordering::Relaxed);
     let meta = durability_of(done) | if done.reentered { HEAD } else { 0 };
     header.meta.store(meta, Ordering::Relaxed);
@@ -699,7 +827,9 @@ fn participate<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done:
             }
         }
     }
-    local::with(|local| local.members.push(Member { ingredient: F::ingredient().index(), id: id.as_u32() }));
+    local::with(|local| {
+        local.members.push(Member { ingredient: F::ingredient().index(), id: id.as_u32() })
+    });
     // Release: other tasks see `PROVISIONAL` and the head to wait for, never the value.
     header.verified.store((word & VIEW_MASK) | VALUE | PROVISIONAL, Ordering::Release);
 }
@@ -709,7 +839,9 @@ fn heads_of(storage: &Storage, from: u32, id: Id) -> Vec<Id> {
     let members = local::with(|local| local.members[from as usize..].to_vec()); // alloc: a fixpoint round's heads
     let mut heads = vec![id]; // alloc: as above
     for member in members {
-        if member_header(storage, member).is_some_and(|it| it.meta.load(Ordering::Relaxed) & HEAD != 0) {
+        if member_header(storage, member)
+            .is_some_and(|it| it.meta.load(Ordering::Relaxed) & HEAD != 0)
+        {
             heads.push(Id::from_u32(member.id));
         }
     }
@@ -718,7 +850,15 @@ fn heads_of(storage: &Storage, from: u32, id: Id) -> Vec<Id> {
 
 /// One round of the outermost head of a cycle ended: `true` when it converged and every row of
 /// the cycle is final, `false` when it runs again.
-fn head_round<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done: &Ran, at: u32, new: F::Value, key: F::Key) -> bool {
+fn head_round<F: Function>(
+    db: &F::Db,
+    storage: &Storage,
+    row: &RowOf<F>,
+    done: &Ran,
+    at: u32,
+    new: F::Value,
+    key: F::Key,
+) -> bool {
     let header = &row.header;
     let id = key.as_id();
     // SAFETY: the head's provisional value, this task's own, read by no frame now (rule 4).
@@ -731,7 +871,8 @@ fn head_round<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done: 
         CycleKind::Fixpoint => {
             let heads = heads_of(storage, done.members, id);
             let cycle = Cycle { heads: &heads, id, iteration: done.round };
-            let value = blaze_mem::frame::task(F::TAG, |_| F::cycle_recover(db, &cycle, last, new, key));
+            let value =
+                blaze_mem::frame::task(F::TAG, |_| F::cycle_recover(db, &cycle, last, new, key));
             let converged = F::equal(last, &value) && !done.unconverged;
             (value, converged)
         }
@@ -745,6 +886,7 @@ fn head_round<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done: 
     if converged {
         let durability = finalize(storage, done.members, durability_of(done));
         store_edges(storage, header, at);
+        storage.set_summary(done.node, ALL);
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(durability | CYCLE, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
@@ -759,7 +901,10 @@ fn head_round<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done: 
         F::NAME
     );
     let round = done.round + 1;
-    storage.event(|| EventKind::WillIterateCycle { database_key: DatabaseKeyIndex::new(F::ingredient().index(), id), iteration: round });
+    storage.event(|| EventKind::WillIterateCycle {
+        database_key: DatabaseKeyIndex::new(F::ingredient().index(), id),
+        iteration: round,
+    });
     next_round(storage, done.members);
     local::with(|local| {
         let edges = local.edges.len();
@@ -771,6 +916,7 @@ fn head_round<F: Function>(db: &F::Db, storage: &Storage, row: &RowOf<F>, done: 
         frame.untracked = false;
         frame.durability = u8::MAX;
         frame.changed = 0;
+        frame.summary = [0; 2];
         frame.dedup_floor = frame.edges_start;
         debug_assert!(edges >= start);
         local.edges.truncate(start);
@@ -822,10 +968,12 @@ fn finalize(storage: &Storage, from: u32, durability: u32) -> u32 {
             reset_member(storage, member);
             continue;
         }
+        let node = header.node.load(Ordering::Relaxed);
+        storage.set_summary(node, ALL);
         header.changed.store(view, Ordering::Relaxed);
         header.meta.store(lowest | CYCLE, Ordering::Relaxed);
         header.extra.store(0, Ordering::Relaxed);
-        storage.paint(header.node.load(Ordering::Relaxed), color(view, view));
+        storage.paint(node, color(view, view));
         // Release: the member's value is final in this view (rule 2).
         header.verified.store(view | VALUE, Ordering::Release);
     }
@@ -834,7 +982,13 @@ fn finalize(storage: &Storage, from: u32, durability: u32) -> u32 {
 
 /// A query on this task's stack (at `at`) asked for again: a cycle through `key`. The asker
 /// gets the row's provisional value (its fallback or initial value on the first re-entry).
-fn reenter<'db, F: Function>(db: &'db F::Db, storage: &Storage, row: &'db RowOf<F>, at: u32, key: F::Key) -> &'db F::Value {
+fn reenter<'db, F: Function>(
+    db: &'db F::Db,
+    storage: &Storage,
+    row: &'db RowOf<F>,
+    at: u32,
+    key: F::Key,
+) -> &'db F::Value {
     let header = &row.header;
     let id = key.as_id();
     if F::CYCLE == CycleKind::Panic {
@@ -857,10 +1011,14 @@ fn reenter<'db, F: Function>(db: &'db F::Db, storage: &Storage, row: &'db RowOf<
     }
     let word = header.verified.load(Ordering::Acquire);
     if word & PROVISIONAL == 0 {
-        let again = local::with(|local| std::mem::replace(&mut local.frames[at as usize].reentered, true));
+        let again =
+            local::with(|local| std::mem::replace(&mut local.frames[at as usize].reentered, true));
         assert!(!again, "the cycle recovery of {}({id:?}) asked for {} itself", F::NAME, F::NAME);
         if word & RUNNING == 0
-            && header.verified.compare_exchange(word, word | RUNNING, Ordering::AcqRel, Ordering::Acquire).is_err()
+            && header
+                .verified
+                .compare_exchange(word, word | RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
         {
             panic!("{}({id:?}) changed while this task held its flight", F::NAME);
         }
@@ -880,7 +1038,9 @@ fn reenter<'db, F: Function>(db: &'db F::Db, storage: &Storage, row: &'db RowOf<
         unsafe { row.put(initial) };
         header.meta.store(header.meta.load(Ordering::Relaxed) | HEAD, Ordering::Relaxed);
         header.extra.store(u64::from(header.node.load(Ordering::Relaxed)), Ordering::Relaxed);
-        header.verified.store((word & VIEW_MASK) | VALUE | RUNNING | PROVISIONAL, Ordering::Release);
+        header
+            .verified
+            .store((word & VIEW_MASK) | VALUE | RUNNING | PROVISIONAL, Ordering::Release);
     } else {
         local::with(|local| local.frames[at as usize].reentered = true);
     }
@@ -890,7 +1050,9 @@ fn reenter<'db, F: Function>(db: &'db F::Db, storage: &Storage, row: &'db RowOf<
 }
 
 fn table_of<F: Function>(storage: &Storage) -> &FnTable<F> {
-    storage.table::<FnTable<F>>(F::ingredient().index()).expect("a function's table, made before its rows")
+    storage
+        .table::<FnTable<F>>(F::ingredient().index())
+        .expect("a function's table, made before its rows")
 }
 
 /// [`Vtable::reset`] of `F`: empties row `id`, never verified by its edges again.
@@ -912,7 +1074,10 @@ unsafe fn reset_row<F: Function>(storage: &Storage, index: u32, id: Id) {
 }
 
 /// Every made row of `F` (ID page 0 is never given), for a caller with `&mut` of the storage.
-fn rows<'t, F: Function>(storage: &Storage, table: &'t FnTable<F>) -> impl Iterator<Item = (Id, &'t RowOf<F>)> {
+fn rows<'t, F: Function>(
+    storage: &Storage,
+    table: &'t FnTable<F>,
+) -> impl Iterator<Item = (Id, &'t RowOf<F>)> {
     let pages: Vec<(usize, NonNull<u8>)> = table.pages.made(storage.pages_made()).collect(); // alloc: a sweep's or drop's page list
     pages.into_iter().flat_map(|(page, at)| {
         (0..PAGE_LEN).map(move |slot| {
@@ -988,8 +1153,11 @@ fn sweep<F: Function>(storage: &mut Storage, index: u32) {
 
 /// [`Vtable::memory`] of `F`: rows made, and the bytes of rows and of the values in place.
 fn memory<F: Function>(storage: &Storage, index: u32) -> MemoryUsage {
-    let made = storage.table::<FnTable<F>>(index).map_or(0, |table| table.pages.made(storage.pages_made()).count());
-    let values = storage.table::<FnTable<F>>(index).map_or(0, |table| table.values.load(Ordering::Relaxed));
+    let made = storage
+        .table::<FnTable<F>>(index)
+        .map_or(0, |table| table.pages.made(storage.pages_made()).count());
+    let values =
+        storage.table::<FnTable<F>>(index).map_or(0, |table| table.values.load(Ordering::Relaxed));
     MemoryUsage {
         name: F::NAME,
         rows: (made * PAGE_LEN) as u64,
@@ -1023,6 +1191,8 @@ fn drop_table<F: Function>(storage: &mut Storage, index: u32) {
 /// The ID of the storage's running query, if any: what a tracked struct's identity names.
 pub(crate) fn running(storage: &Storage) -> Option<DatabaseKeyIndex> {
     local::with(|local| {
-        local.recording(storage).map(|frame| DatabaseKeyIndex::new(frame.ingredient, Id::from_u32(frame.id)))
+        local
+            .recording(storage)
+            .map(|frame| DatabaseKeyIndex::new(frame.ingredient, Id::from_u32(frame.id)))
     })
 }

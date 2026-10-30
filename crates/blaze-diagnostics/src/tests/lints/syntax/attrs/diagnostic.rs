@@ -1009,7 +1009,7 @@ LL |     message = "Foo {Baz}",
    = note: `#[warn(malformed_diagnostic_format_literals)]` (part of `#[warn(unknown_or_malformed_diagnostic_attributes)]`) on by default
 
 "#;
-    let stderr = ui("report_warning_on_invalid_formats.rs", "2015", source);
+    let stderr = ui_core("report_warning_on_invalid_formats.rs", "2015", "fmt", source);
     assert_starts_with(&stderr, expected);
 }
 
@@ -1099,7 +1099,7 @@ LL | #[diagnostic::on_move(message = "Foo", label = "Bar", note = "{Expected} {F
    = help: expect either a generic argument name or `{Self}` as format argument
 
 "#;
-    let stderr = ui("on-type-error-invalid-placeholders.rs", "2015", source);
+    let stderr = ui_core("on-type-error-invalid-placeholders.rs", "2015", "fmt", source);
     assert_starts_with(&stderr, expected);
 }
 

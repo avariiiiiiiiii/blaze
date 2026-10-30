@@ -4495,7 +4495,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.env.store(),
         )
         .ok()?;
-        let allocation = interpret_mir(db, constant, false, Some(self.env)).ok()?.0.ok()?;
+        let allocation = interpret_mir(db, constant, Some(self.env)).ok()?.0.ok()?;
         let ty = allocation.ty;
         let blob = self.allocation_blob(allocation, false).ok()?;
         if blob.bytes.len() != layout.size.bytes_usize()

@@ -660,7 +660,7 @@ fn collect_blocks<'db>(expr: ast::Expr<'db>, blocks: &mut Vec<ast::BlockExpr<'db
 }
 
 /// E0317: an `if` with no `else` where a value of another type than `()` is expected. The
-/// front end reports `()` as what was expected, as rustc's `label_unit_as_expected` does.
+/// front end has already undone rustc's `label_unit_as_expected` swap: `()` is what it found.
 fn no_else<'db>(
     cx: &Cx<'_, 'db>,
     d: &hir::TypeMismatch<'db>,
@@ -669,11 +669,10 @@ fn no_else<'db>(
 ) -> Diag {
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     let span = in_file(if_expr.syntax().text_range());
-    let (expected, found) = (&d.actual, &d.expected);
+    let (expected, found) = (&d.expected, &d.actual);
     // clone: on the error path, for an error hir found
     let mut diag = Diag::error(Some("E0317"), "`if` may be missing an `else` clause", span.clone());
-    let swapped = at_error(d).map(|(expected, found)| (found, expected));
-    diag.span_label(span, print::sorts_at_error(cx, expected, found, swapped));
+    diag.span_label(span, print::sorts_at_error(cx, expected, found, at_error(d)));
     match coercion_reason(cx, node, if_expr.syntax(), expected) {
         Some((at, label)) => {
             diag.span_label(at, label);
@@ -725,7 +724,7 @@ fn return_no_value<'db>(
 ) -> Diag {
     let in_file = |range: TextRange| cx.span(node.with_value(range));
     let span = in_file(ret.syntax().text_range());
-    let expected = &d.actual;
+    let expected = &d.expected;
     let mut diag =
         // clone: on the error path, for an error hir found
         Diag::error(Some("E0069"), "`return;` in a function whose return type is not `()`", span.clone());

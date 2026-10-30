@@ -83,7 +83,7 @@ pub fn by_mir<'db>(
         }
         .store(),
     )?;
-    Ok(db.interpret_mir(body, false, trait_env)?)
+    Ok(db.interpret_mir(body, trait_env)?)
 }
 
 /// Both paths' values of `owner` when it is of the shape, the HIR one first: for the

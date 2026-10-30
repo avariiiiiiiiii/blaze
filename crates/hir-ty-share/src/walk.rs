@@ -768,7 +768,7 @@ impl<'a, 'db> Walk<'a, 'db> {
             self.cx.stored.clone(),     // clone: the query's key, a reference count
         )
         .ok()
-        .and_then(|body| db.interpret_mir(body, false, Some(self.cx.env)).ok());
+        .and_then(|body| db.interpret_mir(body, Some(self.cx.env)).ok());
         match evaluated {
             Some(allocation) => {
                 let value = allocation_value(&allocation)?;

@@ -139,7 +139,7 @@ warning: 7 warnings emitted
 
 "##;
     let options = flags(DIAGNOTICS_FLAGS, &[], false);
-    assert_eq!(ui_cfg("", "diagnotics.rs", "edition:2015 cfg:rustc", DIAGNOTICS, &options), super::platform(expected));
+    assert_eq!(ui_cfg("", "diagnotics.rs", "edition:2015 cfg:rustc", DIAGNOTICS, &options), expected);
 }
 
 #[test]
@@ -247,7 +247,7 @@ warning: 7 warnings emitted
 
 "##;
     let options = flags(DIAGNOTICS_FLAGS, &[], true);
-    assert_eq!(ui_cfg("", "diagnotics.rs", "edition:2015 cfg:cargo", DIAGNOTICS, &options), super::platform(expected));
+    assert_eq!(ui_cfg("", "diagnotics.rs", "edition:2015 cfg:cargo", DIAGNOTICS, &options), expected);
 }
 
 #[test]
@@ -660,7 +660,7 @@ warning: 4 warnings emitted
 
 "#;
     let options = flags(&["cfg(docsrs,test)", "cfg(feature,values())"], &[], true);
-    assert_eq!(ui_cfg("", "cargo-feature.rs", "edition:2015 cfg:none", source, &options), super::platform(expected));
+    assert_eq!(ui_cfg("", "cargo-feature.rs", "edition:2015 cfg:none", source, &options), expected);
 }
 
 /// `auxiliary/cfg_macro.rs`, another crate's macros that read cfgs.

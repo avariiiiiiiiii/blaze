@@ -1414,11 +1414,11 @@ fn test() {
     d.foo();
 }"#,
         expect![[r#"
-            184..195 '{ loop {} }': (impl Iterator<Item = impl Trait<u32>>, impl Trait<u64>)
+            184..195 '{ loop {} }': ({unknown}, {unknown})
             186..193 'loop {}': !
             191..193 '{}': ()
             206..207 't': T
-            268..279 '{ loop {} }': (impl Iterator<Item = impl Trait<T>>, impl Trait<T>)
+            268..279 '{ loop {} }': ({unknown}, {unknown})
             270..277 'loop {}': !
             275..277 '{}': ()
             291..413 '{     ...o(); }': ()

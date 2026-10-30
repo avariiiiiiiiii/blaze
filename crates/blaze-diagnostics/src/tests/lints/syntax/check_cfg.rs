@@ -28,8 +28,8 @@ const AUTO: &str = "cfg(test,FALSE)";
 
 /// [`crate::tests::ui_with`] of a fixture whose crate `main` is the UI test, with the files
 /// `before` it, and the cfgs `cfg` set (`cfg:` of a fixture): what the test's `--cfg`s make
-/// true. Both outputs are as compiletest compares them: `\\` as `\`
-/// (`normalize_platform_differences`).
+/// true. The output is as compiletest compares it: `\\` as `\`
+/// (`normalize_platform_differences`), which a blessed `.stderr` already is.
 fn ui_cfg(before: &str, name: &str, header: &str, source: &str, options: &Options) -> String {
     let fixture = format!("{before}//- /{name} crate:other:main {header}\n{source}");
     let stderr = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, options))

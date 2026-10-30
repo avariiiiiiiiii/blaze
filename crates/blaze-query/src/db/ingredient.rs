@@ -35,7 +35,8 @@ pub struct Vtable {
     /// Brings `id`'s row up to the storage's view (verifying it, running it if it changed),
     /// for a reader that verifies an edge on it. `db` is the database that owns `storage`, as
     /// the ingredient's own database type.
-    pub(crate) verify: Option<unsafe fn(db: *const (), storage: &Storage, id: Id) -> super::function::Verified>,
+    pub(crate) verify:
+        Option<unsafe fn(db: *const (), storage: &Storage, id: Id) -> super::function::Verified>,
     /// Empties a function's provisional row (a cycle's round or its unwinding): only the
     /// thread of the row's cycle calls it.
     pub(crate) reset: Option<unsafe fn(storage: &Storage, ingredient: u32, id: Id)>,
@@ -86,7 +87,8 @@ impl Ingredient {
             "more than {MAX_INGREDIENTS} ingredients (at {})",
             self.vtable.name
         );
-        VTABLES[index as usize].store(std::ptr::from_ref(self.vtable).cast_mut(), Ordering::Release);
+        VTABLES[index as usize]
+            .store(std::ptr::from_ref(self.vtable).cast_mut(), Ordering::Release);
         // Relaxed: a reader that sees the number reads the vtable through `vtable`, which
         // the release above published.
         self.index.store(index, Ordering::Relaxed);

@@ -12,6 +12,27 @@ fn ui_test(name: &str, source: &str, expected: &str) {
     assert_eq!(ui(name, "2015", source), expected);
 }
 
+/// A `core` whose prelude has only rustc's built-in attribute `define_opaque`.
+const DEFINE_OPAQUE_CORE: &str = r#"//- /core.rs crate:core edition:2021 library
+#![feature(no_core, rustc_attrs, decl_macro)]
+#![no_core]
+pub mod prelude {
+    pub mod rust_2015 {
+        pub use crate::define_opaque;
+    }
+}
+#[rustc_builtin_macro]
+pub macro define_opaque($($tt:tt)*) {
+    /* compiler built-in */
+}
+"#;
+
+/// [`ui_test`] of a test that defines an opaque type with `#[define_opaque]`, from std's prelude.
+fn ui_test_opaque(name: &str, source: &str, expected: &str) {
+    let fixture = format!("{DEFINE_OPAQUE_CORE}//- /{name} crate:other:main edition:2015 deps:core\n{source}");
+    assert_eq!(ui_fixture(&fixture), expected);
+}
+
 /// What rustc writes compiling `fixture` (its files named `$DIR/<path>`) as compiletest runs a
 /// UI test that is not `run-pass`.
 fn ui_fixture(fixture: &str) -> String {
@@ -188,12 +209,12 @@ fn generic_no_mangle() {
 
 #[test]
 fn improper_ctypes_73251_1() {
-    ui_test("lint-73251-1.rs", include_str!("items/lint-73251-1.rs"), include_str!("items/lint-73251-1.stderr"));
+    ui_test_opaque("lint-73251-1.rs", include_str!("items/lint-73251-1.rs"), include_str!("items/lint-73251-1.stderr"));
 }
 
 #[test]
 fn improper_ctypes_73249_2() {
-    ui_test("lint-73249-2.rs", include_str!("items/lint-73249-2.rs"), include_str!("items/lint-73249-2.stderr"));
+    ui_test_opaque("lint-73249-2.rs", include_str!("items/lint-73249-2.rs"), include_str!("items/lint-73249-2.stderr"));
 }
 
 /// A struct of another crate without `repr(C)` is not FFI-safe in an `extern` block or an
@@ -206,7 +227,7 @@ fn improper_ctypes_of_a_foreign_struct() {
 #[repr(C)]
 pub struct Good { pub x: u8 }
 pub struct Bad { pub x: u8 }
-//- /main.rs crate:other:main deps:dep
+//- /main.rs crate:other:main edition:2021 deps:dep
 #![allow(dead_code)]
 use dep::{Bad, Good};
 extern "C" {
@@ -238,11 +259,11 @@ fn main() {}
 #[test]
 fn clashing_extern_declarations_are_per_crate() {
     let fixture = r#"
-//- /dep.rs crate:dep library
+//- /dep.rs crate:dep library edition:2021
 extern "C" {
     pub fn clash(x: u8);
 }
-//- /main.rs crate:other:main deps:dep
+//- /main.rs crate:other:main edition:2021 deps:dep
 #![allow(dead_code)]
 extern "C" {
     fn clash(x: u16);

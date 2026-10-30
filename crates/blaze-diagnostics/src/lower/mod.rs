@@ -108,6 +108,7 @@ pub(crate) mod pattern_complexity_limit;
 pub(crate) mod return_outside_function;
 pub(crate) mod undeclared_label;
 pub(crate) mod unlabeled_jump_in_labeled_block;
+pub(crate) mod unplaced_diagnostic;
 pub(crate) mod unreachable_label;
 pub(crate) mod unused_must_use;
 pub(crate) mod val_tree_error;
@@ -292,6 +293,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::UnsafeBinderCastOfNonBinder(d) => unsafe_binder_cast_of_non_binder::lower(cx, &d),
         AnyDiagnostic::UndeclaredLabel(d) => undeclared_label::lower(cx, &d),
         AnyDiagnostic::UnlabeledJumpInLabeledBlock(d) => unlabeled_jump_in_labeled_block::lower(cx, &d),
+        AnyDiagnostic::UnplacedDiagnostic(d) => unplaced_diagnostic::lower(cx, &d),
         AnyDiagnostic::UnreachableLabel(d) => unreachable_label::lower(cx, &d),
         AnyDiagnostic::UnusedMustUse(d) => unused_must_use::lower(cx, &d),
         AnyDiagnostic::ValTreeError(d) => val_tree_error::lower(cx, &d),

@@ -488,7 +488,8 @@ impl Diag {
         )
     }
 
-    /// rustc's `span_suggestions`: one message, a way to substitute for each of `codes`.
+    /// rustc's `span_suggestions_with_style`: one message, a way to substitute for each of
+    /// `codes`. rustc's `span_suggestions` is this with [`SuggestionStyle::ShowAlways`].
     pub fn suggestions(
         &mut self,
         span: Span,

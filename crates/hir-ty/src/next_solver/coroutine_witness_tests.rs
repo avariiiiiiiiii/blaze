@@ -83,7 +83,6 @@ fn no_monomorphize<'db>(
 fn no_interpret<'db>(
     _: &'db Db,
     _: &'db MirBody<'db>,
-    _: bool,
     _: Option<ParamEnvAndCrate<'db>>,
 ) -> Result<Allocation<'db>, MirEvalError<'db>> {
     unreachable!("the coroutine witness tests run no MIR")

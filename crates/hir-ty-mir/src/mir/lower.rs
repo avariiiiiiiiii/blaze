@@ -334,6 +334,10 @@ struct MirLowerCtx<'a, 'f, 'db> {
 }
 
 /// A token to ensuring that each drop scope is popped at most once, thanks to the compiler that checks moves.
+/// The scope of a temporary or `super let` binding extended to `'static`, in place of the index
+/// of a drop scope.
+const STATIC_SCOPE: usize = usize::MAX;
+
 struct DropScopeToken;
 impl DropScopeToken {
     fn pop_and_drop<'db>(
@@ -3552,6 +3556,10 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             }
             _ => None,
         };
+        // rustc's `as_temp`: a `'static` temporary has no storage statements and is not dropped.
+        if scope == Some(STATIC_SCOPE) {
+            return Ok(());
+        }
         let scope = match scope.and_then(|it| self.drop_scopes.get_mut(it)) {
             Some(scope) => scope,
             None => self.drop_scopes.last_mut().unwrap(),
@@ -5380,6 +5388,11 @@ fn lower_root<'db>(
     let binding_picker = |b: BindingId| store.binding_owner(b) == expected_binding_owner;
     let current = ctx.lower_params_and_bindings(params, self_param, binding_picker)?;
     ctx.ends_temporaries.insert(root_expr);
+    // rustc's `region::resolve_body`: the initializer of a body that is not a function's is a
+    // `let` initializer whose extended temporaries live for `'static`.
+    if !matches!(owner, InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(_))) {
+        ctx.extend_in(root_expr, STATIC_SCOPE);
+    }
     let current = if inline {
         ctx.lower_expr_to_place_without_adjust(root_expr, return_slot().into(), current)?
     } else {

@@ -6,6 +6,13 @@ fn ui(name: &str, source: &str) -> String {
     crate::tests::ui(name, "2015", source)
 }
 
+/// [`ui`] with core's indexing, unsizing and negation, which rustc's type check reaches only
+/// through their lang items, as the UI test has them from std.
+fn ui_core(name: &str, source: &str) -> String {
+    const FLAGS: &str = "sized, unsize, coerce_unsized, index, slice, unary_ops, builtin_impls";
+    crate::tests::items::ui_core(name, "2015", FLAGS, source)
+}
+
 #[test]
 fn an_index_of_an_array_literal_by_a_cast() {
     // tests/ui/consts/issue-54348.rs
@@ -34,7 +41,7 @@ LL |     [1][1u64 as usize];
 error: aborting due to 2 previous errors
 
 "##;
-    assert_eq!(ui("issue-54348.rs", source), stderr);
+    assert_eq!(ui_core("issue-54348.rs", source), stderr);
 }
 
 #[test]
@@ -59,7 +66,7 @@ LL |     let _ = xs[7];
 error: aborting due to 1 previous error
 
 "##;
-    assert_eq!(ui("unconditional_panic_98444.rs", source), stderr);
+    assert_eq!(ui_core("unconditional_panic_98444.rs", source), stderr);
 }
 
 #[test]
@@ -85,7 +92,7 @@ LL |     let _ = slice[2];
 error: aborting due to 1 previous error
 
 "##;
-    assert_eq!(ui("unconditional_panic_promoted.rs", source), stderr);
+    assert_eq!(ui_core("unconditional_panic_promoted.rs", source), stderr);
 }
 
 #[test]
@@ -116,7 +123,7 @@ LL | #![warn(unconditional_panic)]
 warning: 1 warning emitted
 
 "##;
-    assert_eq!(ui("array-literal-index-oob.rs", source), stderr);
+    assert_eq!(ui_core("array-literal-index-oob.rs", source), stderr);
 }
 
 #[test]
@@ -139,7 +146,7 @@ LL |     [0; 3][3u64 as usize];
 error: aborting due to 1 previous error
 
 "##;
-    assert_eq!(ui("const-prop-ice.rs", source), stderr);
+    assert_eq!(ui_core("const-prop-ice.rs", source), stderr);
 }
 
 #[test]
@@ -187,7 +194,7 @@ LL |     let _z = 1 % y;
 error: aborting due to 2 previous errors
 
 "##;
-    assert_eq!(ui("mir_detects_invalid_ops.rs", source), stderr);
+    assert_eq!(ui_core("mir_detects_invalid_ops.rs", source), stderr);
 }
 
 #[test]
@@ -222,7 +229,7 @@ LL |     let _n = [64][u32::MAX as usize - 1];
 error: aborting due to 2 previous errors
 
 "##;
-    assert_eq!(ui("index-bounds.rs", source), stderr);
+    assert_eq!(ui_core("index-bounds.rs", source), stderr);
 }
 
 #[test]
@@ -334,7 +341,7 @@ LL |     const OOB_REV: i32 = T::OOB + [1][1];
 error: aborting due to 8 previous errors
 
 "##;
-    assert_eq!(ui("issue-69020-assoc-const-arith-overflow.rs", source), stderr);
+    assert_eq!(ui_core("issue-69020-assoc-const-arith-overflow.rs", source), stderr);
 }
 
 #[test]
@@ -388,7 +395,7 @@ fn main() {
     cols[0];
 }
 "##;
-    assert_eq!(ui("issue-69312.rs", source), "");
+    assert_eq!(ui_core("issue-69312.rs", source), "");
 }
 
 #[test]
@@ -407,7 +414,7 @@ pub fn ice() {
 }
 fn main() {}
 "##;
-    assert_eq!(ui("empty-array-index-in-struct-init.rs", source), "");
+    assert_eq!(ui_core("empty-array-index-in-struct-init.rs", source), "");
 }
 
 #[test]
@@ -443,7 +450,7 @@ fn main() {
     }
 }
 "##;
-    assert_eq!(ui("dst-raw-slice.rs", source), "");
+    assert_eq!(ui_core("dst-raw-slice.rs", source), "");
 }
 
 #[test]

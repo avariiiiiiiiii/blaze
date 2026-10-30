@@ -936,7 +936,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0283`.
 ";
-    assert_eq!(ui("type-annotation-needed.rs", "2015", source), stderr);
+    assert_eq!(ui_core("type-annotation-needed.rs", "from", source), stderr);
 }
 
 #[test]

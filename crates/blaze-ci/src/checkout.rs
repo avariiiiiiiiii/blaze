@@ -98,8 +98,10 @@ impl Git {
             .map_err(|error| CheckoutError::new(format!("git did not start: {error}"), Some(shown(&args))))?;
         match output.status.code() {
             Some(0) => Ok(true),
-            // `--quiet`: no such commit, said by the status alone.
-            Some(1) if output.stderr.trim_ascii().is_empty() => Ok(false),
+            // `--verify` ends 1 for a name that is no commit: none there, or an object of
+            // another type (which git 2.55 says on stderr despite `--quiet`); git's own
+            // failures (no repository, a bad argument) end 128.
+            Some(1) => Ok(false),
             _ => Err(CheckoutError::new(
                 // alloc: error path
                 format!("git failed ({}): {}", output.status, last_line(&output.stderr)),

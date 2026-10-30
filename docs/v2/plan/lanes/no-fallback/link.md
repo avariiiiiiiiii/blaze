@@ -13,7 +13,7 @@ link path in blaze-cargo (`serve/unit/codegen.rs`, `serve/unit/compile.rs`, `ser
 |---|---|
 | blaze-link | [link/native.md](link/native.md) |
 | blaze-live, blaze-stencil | [link/live.md](link/live.md) |
-| blaze-cargo, but the files below and the sandbox | [link/cargo.md](link/cargo.md) |
+| blaze-cargo, but the files below and the sandbox | [link/cargo.md](link/cargo.md), [link/cargo-cli.md](link/cargo-cli.md), [link/cargo-units.md](link/cargo-units.md) |
 | blaze-build-script, blaze-engine | [link/scripts.md](link/scripts.md) |
 
 ## The link path, ranked
@@ -32,7 +32,7 @@ link path in blaze-cargo (`serve/unit/codegen.rs`, `serve/unit/compile.rs`, `ser
 | `harness/bench.py` `link_kind` (was :551) | error | printed why a step linked in full and timed it as a result | done: `link_kind(text, linked)` gives `spliced`, `first link` or `full link: <why>` (a first link of an image the daemon linked before is a full link); `edit_link` raises the harness's `Failed` for an edit or its taking back that was not spliced, before the step is timed, so the project's result says `failed` with the reason. Doctest in `link_kind`'s docstring |
 | `harness/v2/engine.py:576`, `harness/v2/oracle.py:441` | error | the oracle records a non-spliced link as a number and judges the step by the rest | queued 01164 (coordinator): a step after `start` whose link is a full link fails |
 | `codegen.rs` `relink`, test table `beside: ContentId::default()` | rule | zero is the exec table's "no premapped dependency image" (`blaze_codegen::exec::ExecTable::beside`) | stays |
-| blaze-link `place.rs` "has room for N: link the image from scratch" | error | refused as it should be, but nothing can link the image from scratch: every later link fails the same way | link/native.md: a typed form, and the design (grow the region as a planned, reported step, or relink on an explicit user action), never a silent relayout |
+| blaze-link `place.rs` "has room for N: link the image from scratch" | error | refused as it should be, but nothing can link the image from scratch: every later link fails the same way | typed (link/native.md: `LinkError::refusal`, `Refusal::NoRoom` and the rest), and it reaches the job typed inside `LinkCause::Linker`. The image is left as it was, so the refusal repeats until the edit that needed the room is taken back. Plan: the room is blaze-link's to provide, by sizing each region from the code it holds at layout and growing it in a stage as a planned step that `Staged` reports (so `Linking` says it and the bench can tell it from a splice). Never a relayout taken because a stage was refused |
 
 ## Later
 

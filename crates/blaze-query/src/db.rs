@@ -22,6 +22,8 @@ mod interned;
 mod local;
 mod row;
 mod storage;
+#[cfg(test)]
+mod tests;
 mod tracked;
 mod value;
 mod verify;
@@ -41,12 +43,15 @@ pub mod plumbing {
     pub use super::{
         function::{CycleKind, Function, MAX_ROUNDS, evict_values, evict_values_of, fetch},
         ingredient::{Ingredient, Kind, Vtable},
-        input::{Input, InputSetter, input_fields, input_new, input_read, input_set, input_singleton},
+        input::{
+            Input, InputSetter, input_fields, input_new, input_read, input_set, input_singleton,
+        },
         interned::{Interned, intern, intern_by, interned_arguments, interned_fields},
         owner_is,
         tracked::{Tracked, tracked_fields, tracked_identity, tracked_new},
         value::{
-            HashEqLike, IdOfAsId, IdOfNamed, IdOfOther, IdsOf, Lookup, ReturnsAsDeref, ReturnsAsRef, value_hash,
+            HashEqLike, IdOfAsId, IdOfNamed, IdOfOther, IdsOf, Lookup, ReturnsAsDeref,
+            ReturnsAsRef, value_hash,
         },
     };
 }

@@ -13,13 +13,12 @@
 use std::{cell::UnsafeCell, hash::Hash};
 
 use super::{
-    DatabaseKeyIndex, Id, MemoryUsage,
-    function,
+    DatabaseKeyIndex, Id, MemoryUsage, function,
     ingredient::{Ingredient, Kind, Vtable},
     input::check_owner,
     interned::{self, hash_of, intern_keyed},
     local,
-    storage::{Durability, FIELD, Storage, color, node_key},
+    storage::{ALL, Durability, FIELD, Storage, color, node_key, or},
 };
 
 /// One tracked struct: its untracked fields are its identity, its `#[tracked]` ones are
@@ -77,11 +76,18 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
     let creator = function::running(storage)
         .unwrap_or_else(|| panic!("{} made outside a tracked function", T::NAME));
     let identity_hash = local::Local::identity_hash(&identity);
-    let (occurrence, durability) = local::with(|local| {
+    let (occurrence, durability, summary) = local::with(|local| {
         let occurrence = local.occurrence(index, identity_hash).expect("a running query");
         let frame = local.recording(storage).expect("a running query");
         frame.unshareable = true;
-        (occurrence, Durability::from_bits(frame.durability))
+        let (durability, untracked, start, replayed) =
+            (frame.durability, frame.untracked, frame.edges_start as usize, frame.summary);
+        let summary = if untracked {
+            ALL
+        } else {
+            or(replayed, storage.summary_of_edges(&local.edges[start..]))
+        };
+        (occurrence, Durability::from_bits(durability), summary)
     });
     let hash = hash_of(&(creator, occurrence, identity_hash));
     let view = storage.view_bits();
@@ -90,7 +96,9 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
         T::ingredient(),
         hash,
         (identity, fields),
-        |row, (identity, _)| row.creator == creator && row.occurrence == occurrence && row.identity == *identity,
+        |row, (identity, _)| {
+            row.creator == creator && row.occurrence == occurrence && row.identity == *identity
+        },
         |(identity, fields)| TrackedRow {
             creator,
             occurrence,
@@ -105,6 +113,7 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
             for field in 0..T::TRACKED_FIELDS {
                 let node = row.first + field;
                 storage.set_key(node, node_key(index, id, field));
+                storage.set_summary(node, summary);
                 storage.repaint(node, color(FIELD | u32::from(durability.0), view));
             }
         }
@@ -114,6 +123,7 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
             let old = unsafe { &mut *row.fields.get() };
             for field in 0..T::TRACKED_FIELDS {
                 let node = row.first + field;
+                storage.set_summary(node, summary);
                 let was = Durability((((storage.color_of(node) >> 32) as u32) & !FIELD) as u8);
                 if was != durability || !T::equal_field(field, old, &new) {
                     storage.repaint(node, color(FIELD | u32::from(durability.0), view));
@@ -128,7 +138,8 @@ pub fn tracked_new<T: Tracked>(storage: &Storage, identity: T::Identity, fields:
 fn row<'s, T: Tracked>(storage: &'s Storage, id: Id) -> &'s TrackedRow<T> {
     let index = T::ingredient().index();
     check_owner(storage, id, index, T::NAME);
-    interned::fields_of::<TrackedRow<T>>(storage, index, id).unwrap_or_else(|| panic!("{}({id:?}) was never made", T::NAME))
+    interned::fields_of::<TrackedRow<T>>(storage, index, id)
+        .unwrap_or_else(|| panic!("{}({id:?}) was never made", T::NAME))
 }
 
 /// The identity (untracked fields) of tracked struct `id`: no edge.

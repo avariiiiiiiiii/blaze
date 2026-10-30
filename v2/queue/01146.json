@@ -7,10 +7,10 @@
     "crates/blaze-query/src"
   ],
   "what": "blaze-query: 2 allocation-budget tests fail in /Volumes/Projects/.coord-1030/v2-build/cargo-test3.log (HEAD of 15:00): tests::verifying_in_a_new_view_of_the_same_tree_allocates_nothing (src/tests.rs:1092: 4 allocations, 256 bytes, budget 0) and tests::a_warm_miss_allocates_at_most_a_segment (src/tests.rs:1130: 3 allocations, 8225 bytes, budget 1). The hit/verify path allocates where the budget says it must not; fix the path, not the budget. Run: /tmp/blaze-lanes/tests-misc-cargo.sh test -p blaze-query --lib allocates",
-  "state": "open",
+  "state": "taken",
   "created": "2026-10-30T22:35:02Z",
-  "updated": "2026-10-30T22:35:02Z",
-  "taken_by": null,
+  "updated": "2026-10-30T23:32:34Z",
+  "taken_by": "query-unify",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,12 @@
       "at": "2026-10-30T22:35:02Z",
       "by": "tests-misc",
       "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-30T23:32:34Z",
+      "by": "query-unify",
+      "action": "take",
       "note": ""
     }
   ]

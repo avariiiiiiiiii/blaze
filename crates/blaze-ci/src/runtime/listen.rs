@@ -193,10 +193,21 @@ fn handler(shared: &Listener, streams: &crossbeam_channel::Receiver<TcpStream>) 
 }
 
 /// A handler's answer, its words and its bytes, kept from one connection to the next.
-#[derive(Default)]
 pub(crate) struct Answer {
     said: String,
     out: Vec<u8>,
+}
+
+/// Room for the words of any answer to a delivery whose id fits a [`Seen`] slot, and for the
+/// response around them (status line, headers, length): a warm exchange grows neither buffer.
+const SAID_ROOM: usize = 256;
+const OUT_ROOM: usize = 512;
+
+impl Default for Answer {
+    fn default() -> Answer {
+        // alloc: once per handler, at setup.
+        Answer { said: String::with_capacity(SAID_ROOM), out: Vec::with_capacity(OUT_ROOM) }
+    }
 }
 
 impl Answer {

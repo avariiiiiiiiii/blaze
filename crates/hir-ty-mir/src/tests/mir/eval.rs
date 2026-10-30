@@ -66,7 +66,7 @@ fn eval_main_at(
         }
         .map_err(|e| MirEvalError::MirLowerError(func_id, e))?;
         set_interpreter_mir_opt_level(level);
-        let ran = interpret_mir(db, body, false, None);
+        let ran = interpret_mir(db, body, None);
         set_interpreter_mir_opt_level(MirOptLevel::Off);
         let (result, output) = ran?;
         result?;

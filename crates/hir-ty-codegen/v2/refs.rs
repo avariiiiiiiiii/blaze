@@ -1004,7 +1004,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
                     env.store(),
                 )
                 .ok()?;
-                interpret_mir(db, constant, false, Some(env)).ok()?.0.ok()
+                interpret_mir(db, constant, Some(env)).ok()?.0.ok()
             })();
             if let Some(allocation) = allocation {
                 // A constant whose data can't be made is not promoted, and leaves what it

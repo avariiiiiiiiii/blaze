@@ -503,10 +503,15 @@ mod tests {
                 assert_eq!(KEYWORDS.of(symbol, edition), expected, "{text} in {edition:?}");
             }
         }
-        for text in ["fn", "union", "dyn", "async"] {
+        for text in ["fn", "union", "dyn"] {
             for edition in Edition::iter() {
                 assert_ne!(KEYWORDS.of(Symbol::intern(text), edition), (IDENT, IDENT), "{text}");
             }
+        }
+        // `async` is a keyword from 2018; in 2015 it is an identifier, as in rustc.
+        for edition in Edition::iter() {
+            let plain = KEYWORDS.of(Symbol::intern("async"), edition) == (IDENT, IDENT);
+            assert_eq!(plain, edition == Edition::Edition2015, "async in {edition:?}");
         }
     }
 

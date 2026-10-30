@@ -596,7 +596,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0184`.
 "#;
-    assert_eq!(ui_core("E0184.rs", "copy, drop", source), stderr);
+    assert_eq!(ui_core("E0184.rs", "copy, drop, derive", source), stderr);
 }
 
 #[test]
@@ -621,7 +621,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0206`.
 "#;
-    assert_eq!(ui_core("E0206.rs", "copy", source), stderr);
+    assert_eq!(ui_core("E0206.rs", "copy, derive", source), stderr);
 }
 
 #[test]
@@ -682,7 +682,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0204`.
 "#;
-    assert_eq!(ui_core("missing-bound-in-manual-copy-impl.rs", "copy", source), stderr);
+    assert_eq!(ui_core("missing-bound-in-manual-copy-impl.rs", "copy, derive", source), stderr);
 }
 
 #[test]

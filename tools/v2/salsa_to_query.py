@@ -9,7 +9,8 @@ What it rewrites, in code only (never in comments or string literals):
   without their `revisions = ..` (nothing is collected, and the macros refuse it);
 - `salsa::{Id, Durability, Setter, Cycle, Reads, ReadKind, Event, EventKind, DatabaseKeyIndex,
   Cancelled, Database, capture_reads, replay_reads, unshareable_reads, report_untracked_read,
-  attach}` and `salsa::plumbing::{AsId, FromId, Id, attach}` -> `blaze_query::db::..`;
+  attach}`, `salsa::plumbing::{AsId, FromId, Id, attach}` and
+  `salsa::plumbing::interned::NamesIds` -> `blaze_query::db::..`;
 - `salsa::Revision` -> `blaze_query::db::View`; `SalsaValue` -> `blaze_query::db::Value`, and
   `blaze_query::Value` inside a `#[derive(..)]`;
 - `base_db::salsa::..` as `salsa::..`, and `use salsa::..` trees leaf by leaf;
@@ -61,14 +62,14 @@ DB_METHODS = {
     "synthetic_write": "`db.storage_mut().synthetic_write(durability)`",
     "report_untracked_read": "`blaze_query::db::report_untracked_read(db)`",
     "ingredient_debug_name": "`db.storage().ingredient_name(key.ingredient_index())`",
-    "zalsa": "no zalsa: `Storage` (`view`, `owner`, `ingredient_name`) or `Reads::for_each_read`",
-    "zalsa_mut": "no zalsa: `Database::storage_mut`",
+    "zalsa": "no zalsa: `Storage` (`view`, `owner`, `ingredient_name`, `ingredient_file`, `ids_of`), `FromIdIn::from_id_in`",
+    "zalsa_mut": "no zalsa: `db.storage_mut()` (`keep_every_value`, `synthetic_write`)",
     "trigger_lru_eviction": "eviction runs at the view boundary; `evict_values` for on-demand",
     "trigger_cancellation": "a write clears the stop: `let _ = db.storage_mut();`",
     "stop_readers": "`db.storage().stop_readers()` (base-db's `Shared::stop_readers` stays)",
-    "readers_stopped": "`db.storage().readers_stopped()` (queued to the contract)",
+    "readers_stopped": "`db.storage().readers_stopped()`",
     "task_depth": "goes: the engine's frames push a barrier at each pumping wait",
-    "memory_usage": "`db.storage().memory_usage()` (queued to the contract)",
+    "memory_usage": "`db.storage().memory_usage(&mut out)` (`Vec<MemoryUsage>`)",
 }
 # What the salsa paths this script leaves become (by longest prefix), for its report.
 HINTS = {
@@ -78,13 +79,12 @@ HINTS = {
     "StableHasher": "blaze_ids' stable hasher",
     "Update": "no `Update`: values stay in place; `blaze_query::db::Value` for `'db` types",
     "IngredientIndex": "an ingredient is a `u32` (`DatabaseKeyIndex::ingredient_index`)",
-    "IngredientInfo": "no memory-usage report in the contract",
-    "Zalsa": "no zalsa: `Storage` (`view`, `owner`, `ingredient_name`) or `Reads::for_each_read`",
-    "plumbing::Zalsa": "no zalsa: `Storage` (`view`, `owner`, `ingredient_name`) or `Reads::for_each_read`",
+    "IngredientInfo": "`blaze_query::db::MemoryUsage` (name, rows, row_bytes, value_bytes)",
+    "Zalsa": "no zalsa: `Storage` (`view`, `owner`, `ingredient_name`, `ingredient_file`, `ids_of`), `FromIdIn::from_id_in`",
+    "plumbing::Zalsa": "no zalsa: `Storage` (`view`, `owner`, `ingredient_name`, `ingredient_file`, `ids_of`), `FromIdIn::from_id_in`",
     "plumbing::ZalsaDatabase": "no zalsa: `Database::storage()` (`view()` for the revision)",
-    "plumbing::SalsaStructInDb": "`Storage::owner(id)` names the ingredient of an ID's page",
-    "plumbing::interned::NamesIds": "no `NamesIds` in the contract: see the cases file",
-    "plumbing::interned_arguments": "`blaze_query::db::plumbing::interned_arguments(storage, id)`",
+    "plumbing::SalsaStructInDb": "`T: blaze_query::db::FromIdIn`, `T::from_id_in(db.storage(), id)`",
+    "plumbing::interned_arguments": "the generated `f::arguments(db, id) -> Option<(A, ..)>` of the rule's function",
     "plumbing": "salsa plumbing: see the cases file",
     "image": "the interned image section (`SectionId::QUERY_INTERNED`)",
     "graph": "no graph image in the contract: see the cases file",
@@ -102,9 +102,9 @@ EVENT = re.compile(r"\bEventKind::(\w+)")
 UNSIZED_DB = re.compile(r"\?Sized\s*\+\s*blaze_query::db::Database|blaze_query::db::Database\s*\+\s*\?Sized")
 INDEX = re.compile(r"\bas_id\(\)\.index\(\)")
 READ_KIND = re.compile(r"\bReadKind::(\w+)")
-READ_KINDS = {"Function", "InputField", "Interned"}
+READ_KINDS = {"Function", "InputField", "TrackedField", "Interned"}
 CANCELLED = re.compile(r"\bCancelled::(\w+)")
-CANCELS = {"PendingWrite", "WouldWaitOnItself", "PropagatedPanic"}
+CANCELS = {"PendingWrite", "WouldWaitOnItself", "PropagatedPanic", "catch", "throw"}
 FOR_EACH_READ = re.compile(r"\.for_each_read\(")
 ATTR = re.compile(r"#\[blaze_query::(?:tracked|input|interned)\(")
 REVISIONS = re.compile(r"\s*revisions\s*=")
@@ -148,6 +148,8 @@ def map_path(segs: list[str], in_derive: bool) -> str | None:
         return "::".join(["blaze_query::db", *segs])
     if head == "plumbing" and rest and rest[0] in PLUMBING:
         return "::".join(["blaze_query::db", *rest])
+    if segs[:3] == ["plumbing", "interned", "NamesIds"]:
+        return "::".join(["blaze_query::db", *segs[2:]])
     return None
 
 

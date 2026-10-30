@@ -270,6 +270,7 @@ fn unreachable_3() {
 fn top_level_alternation() {
     check(
         r#"
+//- minicore: option, index, slice, range
 fn main() {
     while let 0..=2 | 1 = 0 {}
     if let 0..=2 | 1 = 0 {}
@@ -412,11 +413,12 @@ fn through_a_reference(x: &Void, r: &Result<u32, Void>) {
     let Ok(_y) = *r;
 }
 "#,
-        &[
-            ("Err(_)", "unreachable_patterns: matches no values"),
-            ("*x", "E0004: _"),
-            ("Ok(_y)", "E0005 local binding: Err(_)"),
-        ],
+        // rustc_pattern_analysis `compute_exhaustiveness_and_usefulness`: without
+        // `exhaustive_patterns` an empty arm is unreachable only at the top level of a `!` or
+        // empty-enum scrutinee (rust-lang/rust#129103), so `Err(_)` is not linted; and that
+        // top-level exception omits empty arms whatever the place, so `match *x {}` is
+        // exhaustive.
+        &[("Ok(_y)", "E0005 local binding: Err(_)")],
     );
 }
 

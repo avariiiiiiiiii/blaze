@@ -290,8 +290,14 @@ fn sonic_rs_takes_and_refuses_the_payloads_serde_json_did() {
     let mut checked = 0;
     for (kind, payload) in &payloads {
         let body = payload.as_bytes();
+        // A body that is not UTF-8 is no JSON (RFC 8259) and is refused whole; serde_json read
+        // only the strings it kept, so took one whose bad bytes were in a field it skipped.
         let mut check = |kind: &str, body: &[u8]| {
-            assert_eq!(decoded::<Sonic>(kind, body), decoded::<SerdeJson>(kind, body), "{kind} {:?}", String::from_utf8_lossy(body));
+            let said = || format!("{kind} {:?}", String::from_utf8_lossy(body));
+            match std::str::from_utf8(body) {
+                Ok(_) => assert_eq!(decoded::<Sonic>(kind, body), decoded::<SerdeJson>(kind, body), "{}", said()),
+                Err(_) => assert!(matches!(decoded::<Sonic>(kind, body), Err((400, _))), "{}", said()),
+            }
             checked += 1;
         };
         check(kind, body);

@@ -668,7 +668,7 @@ fn variant_enums(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, name: &s
         // clone: the error's suggestions
         enums.clone(),
         Applicability::MachineApplicable,
-        SuggestionStyle::ShowCode,
+        SuggestionStyle::ShowAlways,
     );
     enums
 }

@@ -1,0 +1,23 @@
+{
+  "id": "01176",
+  "from_lane": "no-fallback-front-def",
+  "owner": "format",
+  "paths": [
+    "crates/syntax/src/validation.rs"
+  ],
+  "what": "crates/syntax/src/validation.rs: report rustc \"integer literal is too large\" (rustc_session report_lit_error, LitError::IntTooLarge) for an IntNumber literal whose value does not fit u128 (view IntNumber::value() Err). hir-def hir.rs:275/278 Literal::from lowers it as 0 (error recovery), so the build must stop on the syntax error; today nothing reports it outside attributes.",
+  "state": "open",
+  "created": "2026-10-30T23:27:07Z",
+  "updated": "2026-10-30T23:27:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-30T23:27:07Z",
+      "by": "no-fallback-front-def",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

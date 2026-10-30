@@ -106,6 +106,7 @@ const THREAD_LOCAL: &str = "thread-local statics cannot be accessed at compile-t
 
 /// std's `Drop` and `Destruct`, both `const` traits.
 const DROP: &str = "\
+#![feature(lang_items)]
 #[lang = \"drop\"]
 pub const trait Drop {
     fn drop(&mut self);

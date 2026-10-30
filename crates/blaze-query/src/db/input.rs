@@ -16,7 +16,7 @@ use super::{
     ingredient::{Ingredient, Kind, Vtable},
     local,
     row::{Pages, layout},
-    storage::{Durability, FIELD, Ids, Storage, Table, color, node_key},
+    storage::{Durability, FIELD, Ids, Storage, Table, color, input_bits, node_key},
 };
 
 /// One input struct. Its fields are numbered 0..FIELDS; each has its own stamp and node.
@@ -115,8 +115,18 @@ fn row<'s, I: Input>(storage: &'s Storage, id: Id) -> &'s RowOf<I> {
 }
 
 /// A new input with `fields`, field `f` of durability `durability[f]`.
-pub fn input_new<I: Input, const N: usize>(storage: &Storage, fields: I::Fields, durability: [Durability; N]) -> Id {
-    assert_eq!(N, I::FIELDS as usize, "{} has {} fields, given {N} durabilities", I::NAME, I::FIELDS);
+pub fn input_new<I: Input, const N: usize>(
+    storage: &Storage,
+    fields: I::Fields,
+    durability: [Durability; N],
+) -> Id {
+    assert_eq!(
+        N,
+        I::FIELDS as usize,
+        "{} has {} fields, given {N} durabilities",
+        I::NAME,
+        I::FIELDS
+    );
     let (table, index) = storage.table_or_make::<InputTable<I>>(I::ingredient());
     let id = table.ids.next(storage, index, &table.pages, &storage.heap, layout::<RowOf<I>>());
     if I::SINGLETON {
@@ -128,6 +138,7 @@ pub fn input_new<I: Input, const N: usize>(storage: &Storage, fields: I::Fields,
     for (field, durability) in durability.into_iter().enumerate() {
         let node = first + field as u32;
         storage.set_key(node, node_key(index, id, field as u32));
+        storage.set_summary(node, input_bits(node));
         storage.repaint(node, color(FIELD | u32::from(durability.0), view));
     }
     // SAFETY: the ID is fresh (`Ids::next` gives each once), so this task is the row's one
@@ -157,6 +168,11 @@ pub fn input_read<I: Input>(storage: &Storage, id: Id, field: u32) {
     local::with(|local| local.read(storage, node, durability, seen as u32));
 }
 
+#[cfg(test)]
+pub(crate) fn field_node<I: Input>(storage: &Storage, id: Id, field: u32) -> u32 {
+    row::<I>(storage, id).first.load(Ordering::Relaxed) + field
+}
+
 /// The singleton's ID, if made.
 pub fn input_singleton<I: Input>(storage: &Storage) -> Option<Id> {
     let index = I::ingredient().index();
@@ -174,7 +190,12 @@ pub struct InputSetter<'s, I: Input, T> {
 }
 
 /// The setter of `field` of input `id`, which `at` finds in its fields.
-pub fn input_set<'s, I: Input, T>(storage: &'s mut Storage, id: Id, field: u32, at: fn(&mut I::Fields) -> &mut T) -> InputSetter<'s, I, T> {
+pub fn input_set<'s, I: Input, T>(
+    storage: &'s mut Storage,
+    id: Id,
+    field: u32,
+    at: fn(&mut I::Fields) -> &mut T,
+) -> InputSetter<'s, I, T> {
     assert!(field < I::FIELDS, "{} has no field {field}", I::NAME);
     InputSetter { storage, id, field, durability: None, at }
 }
@@ -191,7 +212,7 @@ impl<I: Input, T> Setter for InputSetter<'_, I, T> {
         let node = row::<I>(self.storage, self.id).first.load(Ordering::Relaxed) + self.field;
         let old = Durability(((self.storage.color_of(node) >> 32) as u32 & !FIELD) as u8);
         let durability = self.durability.unwrap_or(old);
-        let view = self.storage.new_view(old.max(durability));
+        let view = self.storage.new_view(old.max(durability), input_bits(node));
         let row = row::<I>(self.storage, self.id);
         // SAFETY: `&mut` of the storage: no reference to the fields lives, and nobody else
         // writes them.

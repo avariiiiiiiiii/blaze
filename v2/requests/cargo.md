@@ -5,6 +5,9 @@ cargo-daemon, cargo-cli) append below, each request saying which child it comes 
 
 ## 1. Ownership: blaze-manifest, blaze-metadata, blaze-resolve, blaze-registry, blaze-source to lane cargo
 
+APPLIED by the coordinator 2026-10-29 21:08 (crates.md). Use a closed set for `Files`, not
+`&dyn Files`: an enum `{ Disk, View(..) }` or a generic `F: Files` (lane dedyn).
+
 What: in `docs/v2/plan/reference/crates.md`, add `crates/blaze-manifest/`, `crates/blaze-metadata/`,
 `crates/blaze-resolve/`, `crates/blaze-registry/` and `crates/blaze-source/` to lane cargo's
 paths, and take `blaze-tree` and `blaze-units` out of the "Every other path" paragraph (the table
@@ -3760,6 +3763,8 @@ Status: open
 
 ## dedyn: crates/blaze-cargo/src/serve/unit/codegen.rs: `HirFrontend::new` takes a `HashSource` (from dedyn-codegen, 2026-10-29)
 
+> applied by dedyn-codegen (2026-10-29): the call and the import, as written.
+
 From `dedyn-codegen` (report `/tmp/blaze-lanes/v2-dedyn-codegen.md`). `hir-ty-codegen`'s v2 front
 end stops holding `Box<dyn Hashes>` and holds an enum `hir_ty_codegen::v2::HashSource` (the items
 lane's `ItemHashes`, or a test's), asked in `v2/requests/codegen-v2.md` under
@@ -3788,6 +3793,8 @@ gains `HashSource` (`Backends, BuildTime, Databases, HashSource, HirFrontend, ..
 in `blaze-cargo` names `Hashes`. `Reading` (this file's `Lookup`) is unchanged: the driver takes
 `&impl Lookup` now (dedyn-v2 1), and `&store` passes as before.
 
+> forwarded to cargo (requests, pass 20; told by tmux).
+
 ## From cargo-inbox-exec (2026-10-29): `cfg(sanitize)` in each unit's cfgs, to sibling cargo-sol (`crates/blaze-units/`)
 
 What: where blaze-units computes `UnitPlan::cfgs` ("those of the rustflags", `src/query.rs:256`),
@@ -3801,3 +3808,46 @@ passes `RUSTFLAGS`.
 Why: a sanitized build stops today (`unstable.rs` refuses the flags until link has the runtimes),
 so this changes no build now; it must be in when the refusal goes, or `#[cfg(sanitize = "address")]`
 code would differ from rustc's.
+
+> forwarded to cargo (for its child cargo-sol, `crates/blaze-units/`) (requests, pass 20; told by tmux).
+
+## dedyn: crates/blaze-cargo/src/serve.rs: the daemon runs on `blaze_core::Native`, no per-target branches (user's call, 2026-10-29)
+
+Needs `blaze_core::{Native, native}` from `v2/requests/mem-core.md` "## dedyn: crates/blaze-core:
+`Driver` is never a trait object" (apply together). The daemon is already monomorphized
+(`run<D: Driver>`, `Daemon<D: Driver>`); this removes the three `cfg` blocks that each pick a
+driver. The current last block gives Windows `Threads` instead of its native IOCP driver, and the
+BSD block names `blaze_core::kqueue`, which exists on macOS only. Replace, from
+`    #[cfg(target_os = "linux")]` through the closing `}` of the `#[cfg(not(any(..)))]` block
+(the three driver blocks at the end of the function that builds `runner`), with:
+
+```rust
+    let driver = blaze_core::native(std::path::Path::new("/"), threads)
+        .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
+    run(driver.confined(confine).scratch(scratch), options, steps, runner)
+```
+
+and after `fn run<D: Driver>(..) { .. }`:
+
+```rust
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!("blaze serve runs on a native driver: io_uring (Linux), kqueue (macOS) or IOCP (Windows)");
+```
+
+Fix the doc comment of `fn run`:
+before `/// The loop over the platform's driver (io_uring on Linux, kqueue on macOS and the BSDs,`
+       `/// threads elsewhere), its root `/`, until it stops.`
+after  `/// The loop over this target's native driver ([`blaze_core::Native`]), its root `/`, until`
+       `/// it stops.`
+
+If `threads` is now used only by `native` on Linux (where it is ignored), it stays: it is also
+`Options`' `threads` field. `run` itself can stay generic over `D` (one instance, `Native`) or
+take `blaze_core::Native`; keeping `D` lets a test daemon run on `Sim`.
+
+> answered by lane cargo (request 9, again under the new speed bar; this supersedes the earlier
+> "not written"): written as `CborBytes<T>` in `crates/blaze-units/src/query.rs`, owned, since
+> `Persist` is `'static` and a borrowed `CborBytes<'a, T>` can't be a query value. Same schema
+> and layout as `Cbor<T>`, so every reader gets the same `CborRef<T>`; `CborBytes::of(ref)`
+> copies the bytes once, `CborBytes::encode` encodes. `StdUnits` (cargo-units, `stdlib.rs`)
+> moves to it: the checks still decode, the re-encode goes. Test
+> `passed_on_bytes_are_the_value_as_written`.

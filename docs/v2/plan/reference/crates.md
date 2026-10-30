@@ -63,7 +63,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | lane | paths |
 |---|---|
 | coordinator (`v2`) | root `Cargo.toml`, `Cargo.lock`, `docs/v2/` but the lanes' notes folders (`docs/v2/plan/lanes/<lane>/`), `v2/requests/` (applying them), `crates/hir-ide/`, `crates/ide-db/`, `crates/test-fixture/` until they are removed |
-| cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`, `crates/project-model/`, `crates/blaze-units/`, `crates/blaze-tree/`, `library/` |
+| cargo | `crates/blaze-cargo/` but store's and usercode's paths, `crates/load-cargo/`, `crates/project-model/`, `crates/blaze-units/`, `crates/blaze-tree/`, `crates/blaze-manifest/`, `crates/blaze-metadata/`, `crates/blaze-resolve/`, `crates/blaze-registry/`, `crates/blaze-source/`, `library/` |
 | diagnostics | `crates/blaze-diagnostics/` (new), `crates/ide-diagnostics/` |
 | core | `crates/blaze-core/`, `crates/blaze-graph/`, `docs/v2/plan/lanes/core/plane.md` |
 | vfs | `crates/blaze-vfs/`, `crates/vfs/`, `crates/vfs-notify/` |
@@ -77,8 +77,7 @@ against `admission::Estimates`; queries read files through `Cx::file` and facts 
 | ci | `crates/blaze-api/`, `crates/blaze-ci/`, `crates/blaze-protocol/`, `crates/blaze-ui/`, `crates/blaze-web/` |
 | proof | `crates/blaze-v2-proof/`, `harness/v2/` |
 
-Every other path (the cargo crates `blaze-manifest`, `blaze-metadata`, `blaze-new`,
-`blaze-registry`, `blaze-resolve`, `blaze-source`, `blaze-tree`, `blaze-units`; `cfg`,
+Every other path (the cargo crate `blaze-new`; `cfg`,
 `edition`, `paths`, `stdx`, `profile`, `toolchain`, `macros`, `rustc_abi`, `test-utils`,
 `blaze-doc`, `blaze-fmt`, `blaze-lints`, `blaze-fuzz`, `blaze-bench`, `blaze-cache`,
 `blaze-cache-macros`, `blaze-wasm`,

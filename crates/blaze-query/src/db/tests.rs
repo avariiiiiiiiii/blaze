@@ -1055,6 +1055,16 @@ fn views_renumber_at_the_limit_and_every_answer_holds() {
     assert_eq!(db.runs("Parity"), 6, "once, then once per write of `a`");
 }
 
+fn is_value<T: super::Value + ?Sized>() {}
+
+#[test]
+fn foreign_containers_of_values_are_values() {
+    is_value::<either::Either<Id, Vec<u32>>>();
+    is_value::<Option<either::Either<String, Option<Id>>>>();
+    is_value::<Result<thin_vec::ThinVec<Id>, Box<str>>>();
+    is_value::<smallvec::SmallVec<[Id; 2]>>();
+}
+
 /// A value that counts its drops.
 struct Counted(u64, Arc<AtomicUsize>);
 

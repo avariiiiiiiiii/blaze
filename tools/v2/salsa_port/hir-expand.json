@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-expand",
- "base": "b8c752e457596472d86888086afc758ecfcb8f38",
+ "base": "50e11331df9ea34eb60fe68fe783db82d49f1d44",
  "files": [
   {
    "path": "crates/hir-expand/src/files.rs",
@@ -66,8 +66,8 @@
    "path": "crates/hir-expand/src/view_tests.rs",
    "edits": [
     {
-     "old": "use base_db::{AbsPathBuf, Crate, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, EditionedFileId, Env, FileId, FileSet, SourceRoot, SourceRootId, TargetKind, VfsPath};\nuse blaze_query::db::Durability;\n",
-     "new": "use base_db::{\n    AbsPathBuf, Crate, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, EditionedFileId,\n    Env, FileId, FileSet, SourceRoot, SourceRootId, TargetKind, VfsPath, blaze_query::db::Durability,\n};\n"
+     "old": "use base_db::{AbsPathBuf, Crate, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, EditionedFileId, Env, FileId, FileSet, SourceRoot, SourceRootId, TargetKind, VfsPath};\n",
+     "new": "use base_db::{\n    AbsPathBuf, Crate, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, EditionedFileId,\n    Env, FileId, FileSet, SourceRoot, SourceRootId, TargetKind, VfsPath,\n};\n"
     }
    ]
   }

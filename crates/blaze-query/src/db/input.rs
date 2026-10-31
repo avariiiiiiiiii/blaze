@@ -139,7 +139,11 @@ pub fn input_new<I: Input, const N: usize>(
         I::NAME,
         I::FIELDS
     );
-    assert!(!I::SINGLETON, "{} is a singleton: it is made by `&mut` (input_new_singleton)", I::NAME);
+    assert!(
+        !I::SINGLETON,
+        "{} is a singleton: it is made by `&mut` (input_new_singleton)",
+        I::NAME
+    );
     let (table, index) = storage.table_or_make::<InputTable<I>>(I::ingredient());
     let id = table.ids.next(storage, index, &table.pages, &storage.heap, layout::<RowOf<I>>());
     let row = table.pages.row::<RowOf<I>>(id).expect("`Ids::next` made the row's page");

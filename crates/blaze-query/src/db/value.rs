@@ -71,6 +71,7 @@ macro_rules! container_values {
 container_values!(Vec<T>);
 container_values!(Option<T>);
 container_values!(Result<T, E>);
+container_values!(either::Either<L, R>);
 container_values!(thin_vec::ThinVec<T>);
 container_values!(std::ops::Range<T>);
 container_values!(std::ops::RangeInclusive<T>);

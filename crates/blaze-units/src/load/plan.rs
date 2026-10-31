@@ -502,9 +502,8 @@ fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadErro
             is_root: roots[at],
         })?;
 
-        let mut rustflags = Vec::with_capacity(unit.profile.rustflags.len() + info.rustflags.len());
-        rustflags.extend(unit.profile.rustflags.iter().cloned());
-        rustflags.extend(info.rustflags.iter().cloned());
+        let name = it.pkg.id.name();
+        let rustflags = flags::unit_rustflags(&unit.profile.rustflags, &unit.profile.panic, name.as_str(), &info.rustflags)?;
         plans.push(Some(UnitPlan {
             checked_as_test: unit.checked_as_test,
             metadata: meta.metadata(),

@@ -94,6 +94,40 @@ pub(super) fn cfgs(profile_rustflags: &[String], features: &[String], rustflags:
     out
 }
 
+/// A unit's rustflags in cargo's order: its profile's `rustflags` (`-Z profile-rustflags`),
+/// then the kind's `rest`. A profile `-C panic` that says the profile's `panic`
+/// (library/Cargo.toml's `panic_abort`, built to abort) is the profile's own flag and goes; one
+/// that says another strategy is refused, naming `package`, since blaze compiles with the
+/// profile's `panic` and rustc's last `-C panic` would win.
+pub(super) fn unit_rustflags(flags: &[String], panic: &str, package: &str, rest: &[String]) -> Result<Vec<String>, LoadError> {
+    // alloc: per unit, its flags (`UnitPlan` owns them)
+    let mut out = Vec::with_capacity(flags.len() + rest.len());
+    let mut at = 0;
+    while at < flags.len() {
+        let flag = flags[at].as_str();
+        let (option, words) = match flag {
+            "-C" | "--codegen" => (flags.get(at + 1).map(String::as_str), 2),
+            _ => (flag.strip_prefix("--codegen=").or_else(|| flag.strip_prefix("-C")), 1),
+        };
+        match option.and_then(|it| it.strip_prefix("panic=")) {
+            Some(strategy) if strategy == panic => {}
+            Some(strategy) => {
+                return Err(error(format!(
+                    "`{package}`'s profile rustflags say `-C panic={strategy}` and its profile \
+                     `panic = \"{panic}\"`: blaze compiles with the profile's `panic`; set it in \
+                     `[profile.*]` instead"
+                )));
+            }
+            // clone: each plan owns its flags
+            None => out.extend(flags[at..flags.len().min(at + words)].iter().cloned()),
+        }
+        at += words;
+    }
+    // clone: each plan owns its flags
+    out.extend(rest.iter().cloned());
+    Ok(out)
+}
+
 /// cargo's `check_cfg_args`: what follows each `--check-cfg`, the package's features (its
 /// summary's, the implicit ones of optional dependencies too) sorted by name.
 pub(super) fn check_cfg(manifest: &Manifest) -> Vec<String> {

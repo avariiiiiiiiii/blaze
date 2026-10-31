@@ -281,6 +281,28 @@ fn one_package_plans_its_library_and_binary_with_the_standard_library() {
     }
 }
 
+// library/Cargo.toml's `[profile.*.package.panic_abort] rustflags = ["-Cpanic=abort"]` is
+// the profile's `panic` of `panic_abort`, not a flag blaze compiles by.
+#[test]
+fn std_panic_abort_aborts_by_its_profile_not_its_rustflags() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "")];
+    let units = ready(fixture.plan(fixture.open(&ask(&files))));
+    let id = &units.packages.iter().find(|it| it.name == "panic_abort").expect("panic_abort").id;
+    let (at, unit) = units
+        .graph
+        .units
+        .iter()
+        .enumerate()
+        .find(|(_, it)| &it.pkg_id == id && it.target.is_lib() && it.mode == Mode::Build)
+        .expect("panic_abort's library unit");
+    assert!(unit.is_std);
+    assert_eq!(unit.profile.panic, "abort");
+    assert_eq!(unit.profile.rustflags, ["-Cpanic=abort"]);
+    let plan = &units.plans[at];
+    assert!(!plan.rustflags.iter().any(|it| it.contains("panic")), "{plan:?}");
+}
+
 #[test]
 fn a_virtual_workspace_builds_its_glob_members() {
     let fixture = Fixture::new();

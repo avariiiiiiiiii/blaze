@@ -21,7 +21,7 @@ pub(super) const SP: u8 = 31;
 pub(super) const ZR: u8 = 31;
 
 /// Condition codes.
-pub(super) const HS: u32 = 0b0010;
+pub(super) const LO: u32 = 0b0011;
 pub(super) const GT: u32 = 0b1100;
 
 pub(super) const RET: u32 = 0xd65f_03c0;
@@ -181,11 +181,6 @@ pub(super) const fn cmn(rn: u8, rm: u8) -> u32 {
 /// `csel xd, xn, xm, cond`.
 pub(super) const fn csel(rd: u8, rn: u8, rm: u8, cond: u32) -> u32 {
     0x9a80_0000 | r(rm) << 16 | cond << 12 | r(rn) << 5 | r(rd)
-}
-
-/// `b.cond` to be fixed up (`A64CondBr19`).
-pub(super) const fn b_cond(cond: u32) -> u32 {
-    0x5400_0000 | cond
 }
 
 /// `b` with a resolved word offset.

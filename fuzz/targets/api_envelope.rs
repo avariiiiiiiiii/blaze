@@ -23,10 +23,10 @@ use std::{fmt, time::Duration};
 
 use blaze_api::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, BuildScriptRan, Cached, Cargo,
-    CrateType, Diagnostic, Envelope, FactRead, FetchVerb, Level, LinkKind, Mismatch, Ranked,
-    Reach, ReachedItem, Request, Response, SCHEMA, ServedCrate, ServedPart, Span, Status, Table,
-    TargetKind, Targets, TestOutcome, TestResult, Traced, Ub, UnitOf, UnitProfile, UnitStarted,
-    UnitTarget, Verb, ViewRef, Worked,
+    CrateType, Diagnostic, Envelope, FactRead, FetchVerb, Level, LinkHow, LinkKind, Linked,
+    Mismatch, Ranked, Reach, ReachedItem, Request, Response, SCHEMA, ServedCrate, ServedPart,
+    Span, Status, Table, TargetKind, Targets, TestOutcome, TestResult, Traced, Ub, UnitOf,
+    UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
     frames::{self, Refused},
 };
 use blaze_fuzzer::Target;
@@ -346,6 +346,7 @@ fn seeds() -> Vec<Vec<u8>> {
             link: LinkKind::Patched,
             found: 1,
             green: 2,
+            links: vec![Linked { how: LinkHow::Spliced, path: "target/debug/a".to_owned() }],
             reran: 3,
             served: vec![ServedCrate {
                 why: Some("a body changed".to_owned()),

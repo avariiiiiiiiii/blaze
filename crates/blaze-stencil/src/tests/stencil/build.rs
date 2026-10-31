@@ -207,6 +207,15 @@ fn flags() -> MemFlagsData {
 /// `Offset` hole is patched with something.
 const AT: i32 = 16;
 
+/// A confined access's address ([`Cx::confined`]): `vmctx`, the offset `p` is made with, and
+/// the address once made.
+#[derive(Clone, Copy)]
+struct Confined {
+    vmctx: ir::Value,
+    off: i64,
+    addr: Option<ir::Value>,
+}
+
 struct Cx<'a> {
     b: FunctionBuilder<'a>,
     entry: ir::Block,
@@ -353,7 +362,7 @@ impl Cx<'_> {
 
     /// A load `op` from memory holding one input of `mem`: at `base + AT`, or at `confined`
     /// (that place, reached through a confined address) with no offset.
-    fn load(&mut self, op: Op, mem: Ty, confined: Option<ir::Value>) {
+    fn load(&mut self, op: Op, mem: Ty, confined: Option<Confined>) {
         let t = ir_ty(self.shape.ty);
         let atomic = op == Op::AtomicLoad;
         let base = self.stack_addr(0);
@@ -361,7 +370,7 @@ impl Cx<'_> {
         let input = self.param(mem, Xform::Plain, None);
         self.b.ins().store(flags(), input, base, AT);
         let (addr, at) = match (confined, self.shape.srcs[0], at16) {
-            (Some(addr), _, _) => (addr, 0),
+            (Some(confined), _, _) => (self.address(confined), 0),
             (None, Src::Acc, _) => (self.stack_addr(0), AT),
             (None, _, Some(at16)) => (at16, AT),
             (None, _, None) => (base, AT),
@@ -397,36 +406,52 @@ impl Cx<'_> {
         let (access, disp) = self.shape.confined().ok_or("a confined shape naming no access")?;
         let off = if disp == Disp::Zero { 0 } else { self.baked.imms[OFFSET] };
         let vmctx = self.stack_addr(0);
-        let p = self.b.ins().iconst(types::I64, (i64::from(AT) - off) & 0xffff_ffff);
-        // An `iadd` of an `iconst`: `confine` fuses no `iadd_imm`.
-        let sum = if off == 0 {
-            p
+        let load = self.shape.op == Op::LoadConfined;
+        // An accumulator `p` is made right before the access, after the memory is filled, so
+        // its stencil hands it on; any other is made first, so the filling keeps them apart.
+        let mut confined = Confined { vmctx, off, addr: None };
+        if self.shape.srcs[usize::from(!load)] != Src::Acc {
+            confined.addr = Some(self.address(confined));
+        }
+        if load {
+            self.load(access, loaded(access, self.shape.ty), Some(confined));
         } else {
-            let k = self.b.ins().iconst(types::I64, off);
-            self.b.ins().iadd(p, k)
-        };
-        let low = self.b.ins().ireduce(types::I32, sum);
-        let index = self.b.ins().uextend(types::I64, low);
-        let addr = self.b.ins().iadd(vmctx, index);
-        if self.shape.op == Op::LoadConfined {
-            self.load(access, loaded(access, self.shape.ty), Some(addr));
-        } else {
-            self.store(access, Some(addr));
+            self.store(access, Some(confined));
         }
         Ok(())
     }
 
+    /// The confined address `vmctx + uextend.i64(ireduce.i32(p + off))`, unless made already.
+    fn address(&mut self, confined: Confined) -> ir::Value {
+        if let Some(addr) = confined.addr {
+            return addr;
+        }
+        let Confined { vmctx, off, .. } = confined;
+        // An `iadd` of an `iconst`, which `confine` fuses (it fuses no `iadd_imm`), its
+        // `iconst` before `p`'s: `p`'s stencil is the last before the access.
+        let k = (off != 0).then(|| self.b.ins().iconst(types::I64, off));
+        let p = self.b.ins().iconst(types::I64, (i64::from(AT) - off) & 0xffff_ffff);
+        let sum = match k {
+            Some(k) => self.b.ins().iadd(p, k),
+            None => p,
+        };
+        let low = self.b.ins().ireduce(types::I32, sum);
+        let index = self.b.ins().uextend(types::I64, low);
+        self.b.ins().iadd(vmctx, index)
+    }
+
     /// A store `op` into prefilled memory, read back as two `i64`s: at `base + AT`, or at
     /// `confined` (that place, reached through a confined address) with no offset.
-    fn store(&mut self, op: Op, confined: Option<ir::Value>) {
+    fn store(&mut self, op: Op, confined: Option<Confined>) {
         let atomic = op == Op::AtomicStore;
         let base = self.stack_addr(0);
         let at16 = if atomic && confined.is_none() { Some(self.stack_addr(AT)) } else { None };
         let fill = self.iconst(Ty::I64, 0x5a5a_5a5a);
         self.b.ins().store(flags(), fill, base, AT);
         self.b.ins().store(flags(), fill, base, AT + 8);
-        let (value, addr, at) = if let Some(addr) = confined {
-            (self.operand(0), addr, 0)
+        let (value, addr, at) = if let Some(confined) = confined {
+            let value = self.operand(0);
+            (value, self.address(confined), 0)
         } else if self.shape.srcs[1] == Src::Acc {
             let value = self.operand(0);
             (value, self.stack_addr(0), AT)

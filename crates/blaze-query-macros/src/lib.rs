@@ -1,7 +1,6 @@
-//! The front end's query attributes over `blaze_query::db`, in salsa's grammar so that a port is
-//! `salsa::` -> `blaze_query::`: `#[tracked]` on free functions, on the functions of a tracked
-//! `impl` and on structs, `#[input]`, `#[interned]`, `#[derive(Supertype)]` and
-//! `#[derive(Value)]`. Generated code names `::blaze_query::db::plumbing` and the public
+//! The front end's query attributes over `blaze_query::db`: `#[tracked]` on free functions, on
+//! the functions of a tracked `impl` and on structs, `#[input]`, `#[interned]`,
+//! `#[derive(Supertype)]` and `#[derive(Value)]`. Generated code names `::blaze_query::db::plumbing` and the public
 //! `::blaze_query::db` items only, as docs/v2/plan/lanes/db/query-unify.md ("The contract")
 //! fixes them. Every option the front end doesn't use is refused with an error naming it.
 
@@ -41,7 +40,7 @@ pub fn input(args: TokenStream, item: TokenStream) -> TokenStream {
     input_tokens(args.into(), item.into()).into()
 }
 
-/// `#[blaze_query::interned(debug, constructor = name, unsafe(no_lifetime), revisions = ..)]` on
+/// `#[blaze_query::interned(debug, constructor = name, unsafe(no_lifetime))]` on
 /// a struct with named fields.
 #[proc_macro_attribute]
 pub fn interned(args: TokenStream, item: TokenStream) -> TokenStream {

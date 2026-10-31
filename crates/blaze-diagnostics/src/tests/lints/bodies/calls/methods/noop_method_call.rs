@@ -97,11 +97,12 @@ fn suspicious_double_ref_op() {
     let core_prelude =
         format!("{CORE_OPS_PRELUDE}{CORE_OPTION_RESULT_PRELUDE}{CORE_CMP_PRELUDE}{CORE_ITER_PRELUDE}{CORE_FMT_PRELUDE}");
     let std = format!("{DOUBLE_REF_STD}{STD_VEC}");
+    let std_prelude = format!("{STD_VEC_PRELUDE}        pub use crate::println;\n");
     let library = Library {
         core: &core,
         core_prelude: &core_prelude,
         std: &std,
-        std_prelude: STD_VEC_PRELUDE,
+        std_prelude: &std_prelude,
         ..Library::default()
     };
     let ui = Ui {

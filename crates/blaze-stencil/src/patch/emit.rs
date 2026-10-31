@@ -459,7 +459,9 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
             }
         }
         match shape.op {
-            Op::Iconst | Op::Fconst => fill.imms[0] = (sel.imm, 64),
+            // Sign-extended from the type's width, which `imm` zero-extends for a field that
+            // takes no negative value.
+            Op::Iconst | Op::Fconst => fill.imms[0] = (sel.imm, u32::from(shape.ty.bytes()) * 8),
             _ => {
                 for (n, &arg) in sel.args().iter().enumerate() {
                     match shape.srcs[n] {
@@ -476,7 +478,9 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                                 // alloc: the error's message, once per failed compile.
                                 return Err(Error::at(inst, format!("operand {arg} of `{shape}` is no constant")));
                             };
-                            fill.imms[n] = (value, func.dfg.value_type(arg).bits());
+                            // The stencil's operand type, narrower than the value's for a shift
+                            // amount (an `i8` it masks).
+                            fill.imms[n] = (value, u32::from(shape.arg(n).bytes()) * 8);
                         }
                         Src::Acc | Src::None => {}
                     }
@@ -766,7 +770,7 @@ impl<'f, A: Glue> Out<'_, 'f, A> {
                     // alloc: the error's message, once per failed compile.
                     return Err(Error::at(term, format!("a constant block argument of {}", one.ty.name())));
                 };
-                fill.imms[0] = (imm, 64);
+                fill.imms[0] = (imm, u32::from(shape.ty.bytes()) * 8);
                 shape
             }
         };

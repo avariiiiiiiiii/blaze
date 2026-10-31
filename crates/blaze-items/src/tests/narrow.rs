@@ -318,8 +318,10 @@ const LAYOUT_IN_ENVS: &str = "pub struct S {
     a: u32,
     b: u8,
 }
-pub fn g<T: Copy>(_: T) {}
-pub fn h<U: Clone>(_: U) {}
+pub trait A {}
+pub trait B {}
+pub fn g<T: A>(_: T) {}
+pub fn h<U: B>(_: U) {}
 ";
 
 /// The size of the struct `name` asked under the environment of `function`.

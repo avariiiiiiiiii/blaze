@@ -433,7 +433,12 @@ fn equal_keys_mean_one_monomorphized_body() {
                     continue;
                 }
                 shared += 1;
-                assert_eq!(printed(&db, body, a), printed(&db, body, b), "`{body}` of `{a}` and `{b}`");
+                let ((raw_a, named_a), (raw_b, named_b)) = (printed(&db, body, a), printed(&db, body, b));
+                // Renaming `u32` also renames a `u32` the body names itself (`counter`'s), so
+                // bodies that print the same as written are one body too.
+                if raw_a != raw_b {
+                    assert_eq!(named_a, named_b, "`{body}` of `{a}` and `{b}`");
+                }
             }
         }
         assert!(shared > 0, "some instances of `{body}` share");
@@ -484,9 +489,9 @@ fn sites_are_filled_as_the_body_is() {
     });
 }
 
-/// The monomorphized runtime body of `func` with the alias `arg`, printed, with the name of the
-/// type `arg` points to or is replaced by `_`.
-fn printed(db: &TestDB, func: &str, arg: &'static str) -> String {
+/// The monomorphized runtime body of `func` with the alias `arg`, printed as it is and with the
+/// name of the type `arg` points to or is replaced by `_`.
+fn printed(db: &TestDB, func: &str, arg: &'static str) -> (String, String) {
     hir_ty::attach_db(db, || {
         let instance = instance(db, func, &[Ty(arg)]);
         let owner = hir_ty::InferBodyId::DefWithBodyId(function(db, func).into());
@@ -497,7 +502,9 @@ fn printed(db: &TestDB, func: &str, arg: &'static str) -> String {
             "I32" => "i32",
             other => other.trim_start_matches("Ref").trim_start_matches("Own"),
         };
-        replace_word(&print_mir_body(db, &body, func), named, "_")
+        let raw = print_mir_body(db, &body, func);
+        let renamed = replace_word(&raw, named, "_");
+        (raw, renamed)
     })
 }
 

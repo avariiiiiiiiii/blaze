@@ -1,6 +1,6 @@
 //! Tracked functions expanded and run on the engine: no, one and several arguments, every return
-//! mode, `lru`, the three ways a cycle goes, `no_eq`, `self_ty`, `mem_tag`, `revisions`, the
-//! database lifetime, and `Debug` through the attached database.
+//! mode, `lru`, the three ways a cycle goes, `no_eq`, `self_ty`, `mem_tag`, the database
+//! lifetime, and `Debug` through the attached database.
 
 mod common;
 
@@ -182,7 +182,7 @@ fn an_lru_cap_set_at_runtime_applies_at_the_next_view() {
     assert!(runs().is_empty(), "no cap: nothing evicted");
 }
 
-#[blaze_query_macros::tracked(returns(copy), mem_tag = Infer, revisions = usize::MAX)]
+#[blaze_query_macros::tracked(returns(copy), mem_tag = Infer)]
 fn tagged(db: &TestDb, source: Source) -> u32 {
     source.weight(db) + 1
 }
@@ -193,7 +193,7 @@ fn weighed(db: &TestDb, source: Source) -> u32 {
 }
 
 #[test]
-fn mem_tag_revisions_and_self_ty_expand_and_self_ty_names_the_query() {
+fn mem_tag_and_self_ty_expand_and_self_ty_names_the_query() {
     let db = TestDb::new();
     let source = Source::new(&db, String::new(), 5);
     assert_eq!(tagged(&db, source), 6);

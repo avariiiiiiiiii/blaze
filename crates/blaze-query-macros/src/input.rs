@@ -177,6 +177,22 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
         }
     });
 
+    // A singleton's absence is a read (`try_get`), so making it is a write: `&mut`.
+    let (db_ref, make) = if singleton {
+        let make = quote!(#plumbing::input_new_singleton::<#config, #count>(
+            #db::Database::storage_mut(db),
+            self.fields,
+            self.durabilities,
+        ));
+        (quote!(&mut), make)
+    } else {
+        let make = quote!(#plumbing::input_new::<#config, #count>(
+            #db::Database::storage(db),
+            self.fields,
+            self.durabilities,
+        ));
+        (quote!(&), make)
+    };
     let declaration = structs::declaration(item, None);
     let id_impls = structs::id_impls(ident, None, &ingredient);
     Ok(quote! {
@@ -206,7 +222,7 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
             impl #ident {
                 /// Makes the input, every field of durability `LOW`.
                 #[inline]
-                pub fn new<#database>(db: &#database, #(#required_idents: #required_tys),*) -> Self
+                pub fn new<#database>(db: #db_ref #database, #(#required_idents: #required_tys),*) -> Self
                 where
                     #database: ?::core::marker::Sized + #db::Database,
                 {
@@ -242,15 +258,11 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
 
                 /// Makes the input.
                 #[must_use]
-                pub fn new<#database>(self, db: &#database) -> #ident
+                pub fn new<#database>(self, db: #db_ref #database) -> #ident
                 where
                     #database: ?::core::marker::Sized + #db::Database,
                 {
-                    #ident(#plumbing::input_new::<#config, #count>(
-                        #db::Database::storage(db),
-                        self.fields,
-                        self.durabilities,
-                    ))
+                    #ident(#make)
                 }
             }
 

@@ -181,10 +181,9 @@ fn no() {}
         expect![[r#"
             [
                 "EditionedFileId::parse_",
-                "HirFileId::ast_id_map_",
                 "file_item_tree_query",
+                "HirFileId::ast_id_map_",
                 "real_span_map",
-                "EnumVariants::of_",
             ]
         "#]],
     );
@@ -226,8 +225,8 @@ pub struct S {}
         expect![[r#"
             [
                 "EditionedFileId::parse_",
-                "HirFileId::ast_id_map_",
                 "file_item_tree_query",
+                "HirFileId::ast_id_map_",
                 "real_span_map",
                 "MacroCallId::macro_arg_",
                 "MacroCallId::parse_macro_expansion_",
@@ -365,12 +364,11 @@ pub struct S {}
         expect![[r#"
             [
                 "EditionedFileId::parse_",
-                "HirFileId::ast_id_map_",
                 "file_item_tree_query",
+                "HirFileId::ast_id_map_",
                 "real_span_map",
                 "MacroCallId::macro_arg_",
                 "AstId < ast :: Macro >::decl_macro_expander_",
-                "MacroCallId::macro_arg_",
                 "MacroCallId::macro_arg_",
             ]
         "#]],
@@ -445,7 +443,6 @@ m!(Z);
         expect![[r#"
             [
                 "crate_local_def_map",
-                "Modules < 'db >::module_",
             ]
         "#]],
     );
@@ -527,8 +524,8 @@ pub type Ty = ();
         expect![[r#"
             [
                 "EditionedFileId::parse_",
-                "HirFileId::ast_id_map_",
                 "file_item_tree_query",
+                "HirFileId::ast_id_map_",
                 "real_span_map",
             ]
         "#]],

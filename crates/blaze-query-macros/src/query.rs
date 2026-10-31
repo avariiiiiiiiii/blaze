@@ -242,10 +242,10 @@ impl Query<'_> {
         } else {
             quote!(old == new)
         };
-        let hash = if evictable {
+        let hash = if evictable && !no_eq {
             quote!(#plumbing::value_hash(value))
         } else {
-            let message = "{} has no `lru`: its values are never hashed";
+            let message = "{} has no `lru`, or is `no_eq`: its values are never hashed";
             quote!({
                 let _ = value;
                 ::core::unreachable!(#message, <Self as #plumbing::Function>::NAME)

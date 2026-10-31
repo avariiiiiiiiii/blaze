@@ -137,7 +137,7 @@ fn autocfg_probes() {
     let outcome = said(&i256, "#![no_std]\npub type Probe = i256;\n");
     assert_eq!(outcome.code, 1);
     let stderr = String::from_utf8(outcome.stderr).unwrap();
-    assert!(stderr.contains("error[E0412]: cannot find type `i256` in this scope"), "{stderr}");
+    assert!(stderr.contains("error[E0425]: cannot find type `i256` in this scope"), "{stderr}");
     assert!(!scratch.0.join("autocfg_0123_3.ll").exists());
 }
 

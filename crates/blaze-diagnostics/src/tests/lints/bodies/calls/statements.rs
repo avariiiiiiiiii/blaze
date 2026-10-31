@@ -396,7 +396,7 @@ warning: 1 warning emitted
     let ui = ui(Ui {
         name: "let_underscore_drop.rs",
         core: "drop",
-        std: Some(("", PRINTLN)),
+        std: Some(("pub use crate::println;", PRINTLN)),
         source,
         ..Ui::default()
     });
@@ -715,7 +715,7 @@ error: aborting due to 7 previous errors
     let ui = ui(Ui {
         name: "unused-result.rs",
         core: "result, try",
-        std: Some(("", PANIC_OPS)),
+        std: Some(("pub use crate::panic;", PANIC_OPS)),
         source,
         ..Ui::default()
     });

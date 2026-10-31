@@ -67,7 +67,8 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
 }
 
 /// [`ui`] of a UI test without compile flags that uses std: core is minicore with `flags`, and
-/// `std` a crate of core's prelude and `std_items`, the items of std the test uses.
-pub(crate) fn ui_std(name: &str, edition: &str, flags: &str, std_items: &str, source: &str) -> String {
-    ui(Ui { name, edition, core: flags, std: Some(("", std_items)), source, ..Ui::default() })
+/// `std` a crate of `std`'s two parts, what its prelude has beyond core's and the items of std
+/// the test uses.
+pub(crate) fn ui_std(name: &str, edition: &str, flags: &str, std: (&str, &str), source: &str) -> String {
+    ui(Ui { name, edition, core: flags, std: Some(std), source, ..Ui::default() })
 }

@@ -170,7 +170,7 @@ LL |     let _ = S { field: () };
 help: all remaining fields have default values, if you added `#![feature(default_field_values)]` to your crate you could use those values with `..`
    |
 LL |     let _ = S { field: (), .. };
-   |                          ++
+   |                          ++++
 "#;
     assert_eq!(ui_only("non-exhaustive-ctor.rs", source, code(&["E0797", "E0063"])), stderr);
 }

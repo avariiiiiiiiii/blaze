@@ -13,6 +13,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use syntax::{
@@ -168,11 +169,23 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
 
 #[test]
 fn views_answer_as_handles_on_every_fixture_and_file() {
-    for (path, text) in corpus() {
-        for parse in parses(&text) {
-            check(&path, &parse);
+    // Each file is parsed and checked on its own, so the corpus is shared out to every core:
+    // asking every token's position of the root is quadratic in a file's top-level items, and
+    // one core takes a quarter of an hour of a debug build.
+    let corpus = corpus();
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, usize::from);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                while let Some((path, text)) = corpus.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    for parse in parses(text) {
+                        check(path, &parse);
+                    }
+                }
+            });
         }
-    }
+    });
 }
 
 #[test]

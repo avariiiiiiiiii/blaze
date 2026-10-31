@@ -543,8 +543,9 @@ pub(crate) struct Job {
     /// The view and the mounts, as paths.
     pub(crate) mounted: Arc<files::Mounted>,
     /// What each build script prints, by its compile unit, when it provably prints only
-    /// constants; worked out once.
-    pub(crate) inert: Box<[OnceLock<Option<blaze_usercode::run::Value>>]>,
+    /// constants or is one of std's own (`script::ported`), or why std's can't be said; worked
+    /// out once.
+    pub(crate) inert: Box<[OnceLock<Result<Option<blaze_usercode::run::Value>, String>>]>,
     /// What the pure path found of each build script, by its compile unit (script::pure), worked out once.
     pub(crate) pure: Box<[OnceLock<script::pure::Purity>]>,
     /// How each unit's program is run, worked out once (the key and the artifact read it).

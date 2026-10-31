@@ -445,7 +445,7 @@ fn main() {
         text: "pub enum Option<T> {\n    /// No value.\n    None,\n    /// Some value of type `T`.\n    Some(T),\n}\n"
             .to_owned(),
     };
-    let at = main.span("Some(1).match");
+    let at = main.span("Some(1)");
     let mut diag = Diag::error(Some("E0004"), "non-exhaustive patterns: `Some(_)` not covered", at.clone());
     diag.span_label(at, "pattern `Some(_)` not covered");
     let mut defined = MultiSpan::of(option.span("pub enum Option<T>"));
@@ -453,10 +453,10 @@ fn main() {
     diag.span_note(defined, "`Option<i32>` defined here");
     diag.note("the matched value is of type `Option<i32>`");
     diag.suggestion_verbose(
-        main.span("None => {}").shrink_to_hi(),
+        main.span("None => {},").shrink_to_hi(),
         "ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an \
          explicit pattern as shown",
-        "\n        Some(_) => todo!()",
+        "\n        Some(_) => todo!(),",
         Applicability::HasPlaceholders,
     );
     let mut sources = File::sources(&[&main]);

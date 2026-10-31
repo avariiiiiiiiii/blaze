@@ -1,6 +1,6 @@
 #![feature(allocator_api, allocator_ext)]
-//! blaze v2's query database (docs/v2/plan/lanes/db.md section 7, docs/v2/plan/lanes/items.md section 6.2), remade
-//! from `vendor/salsa`.
+//! blaze v2's query database (docs/v2/plan/lanes/db.md section 7, docs/v2/plan/lanes/items.md
+//! section 6.2).
 //!
 //! - A query is asked of a [`QueryKey`]: its kind and the content ID of its arguments. Results
 //!   are keyed by input hashes, never by view or revision, so every view shares every equal
@@ -1284,6 +1284,9 @@ struct ColdEntry {
 enum Pending {
     ColdWrite { file: FileName, entries: Vec<ColdEntry> },
     ColdMap { file: FileName, entries: Vec<ColdEntry> },
+    /// A cold pack written or mapped for a store a settle has dropped: its entries name that
+    /// store's memos, whose values the image holds, so once the I/O is done it is removed.
+    Stale { file: FileName, doing: &'static str },
     Remove { file: FileName },
 }
 
@@ -1293,7 +1296,17 @@ impl Pending {
         match self {
             Pending::ColdWrite { file, .. } => ("write its cold pack", file),
             Pending::ColdMap { file, .. } => ("map its cold pack", file),
+            Pending::Stale { file, doing } => (doing, file),
             Pending::Remove { file } => ("remove", file),
+        }
+    }
+
+    /// The same I/O once a settle has dropped the store its cold entries name.
+    fn settled(self) -> Pending {
+        match self {
+            Pending::ColdWrite { file, .. } => Pending::Stale { file, doing: "write its cold pack" },
+            Pending::ColdMap { file, .. } => Pending::Stale { file, doing: "map its cold pack" },
+            pending @ (Pending::Stale { .. } | Pending::Remove { .. }) => pending,
         }
     }
 }
@@ -2019,6 +2032,11 @@ impl Database {
                 }
                 self.io.lock().packs.push((file, mapping));
             }
+            (Pending::Stale { file, .. }, Done::Written | Done::Mapped(_)) => {
+                let tag = io.tag(self.config.tags);
+                effects.push(Effect::Remove { file: file.clone(), tag }); // clone: a name, once an I/O
+                io.pending.insert(tag, Pending::Remove { file });
+            }
             (Pending::Remove { .. }, Done::Removed) => {}
             (pending, Done::Failed(error)) => {
                 let (doing, file) = pending.what();
@@ -2041,7 +2059,8 @@ impl Database {
     /// The settle swap (#1299): once the image [`Database::write_image`] wrote is on disk and
     /// mapped, the database becomes the image's, used in place, and every arena of the cold
     /// build is dropped. Open views stay open with what they resolved; queries stay
-    /// registered. On an error the database is left as it was.
+    /// registered. A cold pack still being written or mapped is removed once that is done:
+    /// it names the dropped store's memos. On an error the database is left as it was.
     pub fn settle(&mut self, image: Arc<Image<Mapping>>, effects: &mut Vec<Effect>) -> Result<(), DbError> {
         // Settle runs once per cold build, and copies each view's inputs (`Arc`s) and reruns
         // into the new database.
@@ -2081,7 +2100,8 @@ impl Database {
         let new_io = new.io.get_mut();
         new_io.next = old_io.next;
         new_io.cold_files = old_io.cold_files;
-        new_io.pending = old_io.pending;
+        // alloc: see above
+        new_io.pending.extend(old_io.pending.into_iter().map(|(tag, pending)| (tag, pending.settled())));
         for (file, _) in &old_io.packs {
             let tag = new_io.tag(new.config.tags);
             effects.push(Effect::Remove { file: file.clone(), tag }); // clone: see above

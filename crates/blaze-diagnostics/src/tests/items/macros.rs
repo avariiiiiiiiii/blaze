@@ -1,7 +1,7 @@
 //! rustc's UI tests of macros: calls of macros that do not exist, `compile_error!`,
 //! `macro_rules!` definitions rustc refuses, and expansions that do not parse.
 
-use crate::tests::ui;
+use crate::tests::{ui, ui_builtins};
 
 #[test]
 fn an_undefined_macro_suggests_the_similar_one() {
@@ -78,7 +78,7 @@ LL |     compile_error!("a very descriptive error message");
 error: aborting due to 1 previous error
 
 "#;
-    assert_eq!(ui("compile_error_macro.rs", "2015", source), stderr);
+    assert_eq!(ui_builtins("compile_error_macro.rs", "2015", source), stderr);
 }
 
 #[test]

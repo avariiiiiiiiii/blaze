@@ -1,6 +1,6 @@
 [package]
 name = "blaze-query-macros"
-description = "blaze-query's front-end attributes: #[tracked], #[input], #[interned], derive(Supertype) and derive(Value), in salsa's grammar over blaze_query::db"
+description = "blaze-query's front-end attributes: #[tracked], #[input], #[interned], derive(Supertype) and derive(Value), over blaze_query::db"
 publish = false
 
 version.workspace = true

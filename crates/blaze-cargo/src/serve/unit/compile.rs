@@ -185,7 +185,10 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
     };
     let runs = runs(job, unit);
     // An inert script's compile makes nothing, unless `BLAZE_ELIDE=verify` builds it to run it.
-    let verified = u.target.is_custom_build() && script::verifies(job)? && script::inert(job, unit).is_some();
+    let verified = u.target.is_custom_build()
+        && !script::ported(job, unit)
+        && script::verifies(job)?
+        && script::inert(job, unit)?.is_some();
     let reached = reached_only(job, u)?;
     let mut hasher = Hasher::new(RECORD);
     hasher.id(&identity);
@@ -212,11 +215,13 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
     Ok(Key(hasher.finish()))
 }
 
-/// Whether `unit` is a build script elision found inert, so neither built nor run: under
-/// `BLAZE_ELIDE=verify` it is built and run as well.
+/// Whether `unit` is a build script elision found inert, or one of std's own that blaze has a
+/// port of, so neither built nor run: under `BLAZE_ELIDE=verify` an inert one is built and run
+/// as well; std's never is ([`script::ported`]).
 fn elided_unbuilt(job: &Job, unit: usize) -> Result<bool, ApiError> {
     let custom_build = job.unit(unit)?.target.is_custom_build();
-    Ok(custom_build && !script::verifies(job)? && script::inert(job, unit).is_some())
+    let unverified = script::ported(job, unit) || !script::verifies(job)?;
+    Ok(custom_build && unverified && script::inert(job, unit)?.is_some())
 }
 
 /// The variable that builds every dependency whole: `full`, for the differential run against a

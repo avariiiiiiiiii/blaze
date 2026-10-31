@@ -360,6 +360,8 @@ fn decode_to(code: &Code, end: usize) -> Vec<Piece> {
                 out.push(Piece::Glue { at: at as u32, byte });
                 at += 1;
             }
+            // `finish`'s padding of the code to its constants' alignment.
+            byte if byte == Mock::NOP[0] => at += 1,
             byte => panic!("byte {byte:#x} at {at:#x} is no piece"),
         }
     }

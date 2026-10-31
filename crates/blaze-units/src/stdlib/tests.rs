@@ -478,6 +478,26 @@ fn the_standard_library_is_one_more_graph() {
     assert!(lib_of(&graph, "core").profile.debug_assertions);
 }
 
+/// std's own build scripts are of the library (`is_std`, which the daemon gives their output by)
+/// and depend on nothing of it but other scripts: they are never compiled
+/// ([`super::scripts`] says what they print), so no host std has to be built for them first.
+#[test]
+fn std_scripts_are_std_and_need_no_std() {
+    let (db, tree, root) = setup();
+    let view = project(&db, &tree, "a");
+    let graph = ready(planned(&db, view, &key(root)));
+    let scripts: Vec<&Unit> = graph.units.iter().filter(|it| it.target.is_custom_build()).collect();
+    assert!(scripts.iter().any(|it| it.mode == Mode::RunCustomBuild));
+    assert!(scripts.iter().any(|it| it.mode != Mode::RunCustomBuild));
+    for unit in scripts {
+        assert!(unit.is_std, "{}", unit.target.name);
+        for dep in &unit.dependencies {
+            let it = &graph.units[dep.index];
+            assert!(it.target.is_custom_build(), "{} ({:?}) depends on {}", unit.target.name, unit.mode, it.target.name);
+        }
+    }
+}
+
 #[test]
 fn another_panic_strategy_is_another_graph() {
     let (db, tree, root) = setup();

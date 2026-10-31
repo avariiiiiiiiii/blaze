@@ -43,12 +43,12 @@ fn query() -> TokenStream {
 }
 
 #[test]
-fn salsa_options_the_front_end_never_uses_are_refused_by_name() {
+fn options_blaze_query_does_not_have_are_unknown() {
     for option in ["specify", "persist", "heap_size = h", "db = D", "accumulator"] {
         let option: TokenStream = option.parse().unwrap();
         let name = option.to_string();
         let name = name.split_whitespace().next().unwrap().to_owned();
-        refused(tracked_tokens(option, query()), &format!("`{name}` is a salsa option"));
+        refused(tracked_tokens(option, query()), &format!("unknown option `{name}`"));
     }
 }
 
@@ -101,7 +101,7 @@ fn options_of_another_site_are_refused() {
 }
 
 #[test]
-fn cycle_options_combine_as_salsa_has_them() {
+fn cycle_options_combine_one_way_out() {
     refused(tracked_tokens(quote!(cycle_fn = g), query()), "`cycle_fn` needs `cycle_initial`");
     refused(
         tracked_tokens(quote!(cycle_result = r, cycle_initial = i), query()),
@@ -126,7 +126,7 @@ fn a_return_mode_is_one_of_six() {
 #[test]
 fn every_option_a_tracked_function_takes_expands() {
     accepted(tracked_tokens(
-        quote!(returns(ref), lru = 0, mem_tag = Nameres, no_eq, self_ty = Ty, revisions = 3),
+        quote!(returns(ref), lru = 0, mem_tag = Nameres, no_eq, self_ty = Ty),
         query(),
     ));
     accepted(tracked_tokens(quote!(cycle_result = crate::r), query()));
@@ -300,7 +300,7 @@ fn every_struct_form_expands() {
         ),
     ));
     accepted(interned_tokens(
-        quote!(debug, constructor = make, revisions = usize::MAX),
+        quote!(debug, constructor = make),
         quote!(
             pub struct S<'db> {
                 #[returns(copy)]

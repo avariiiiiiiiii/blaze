@@ -65,7 +65,7 @@ pub trait Function: 'static {
     const FILE: &'static str;
     /// The value cap: past it, the oldest-verified values are evicted at a new view. 0: none.
     const LRU: usize;
-    /// `lru = N` given (0 too): `hash` is real and the values may be evicted.
+    /// `lru = N` given (0 too): the values may be evicted, and without `NO_EQ` `hash` is real.
     const EVICTABLE: bool;
     const NO_EQ: bool;
     const CYCLE: CycleKind;
@@ -746,13 +746,16 @@ fn finish<F: Function>(
     let had = now & VALUE != 0;
     let final_old = had && now & PROVISIONAL == 0;
     let made_before = word & VIEW_MASK != 0 && word & PROVISIONAL == 0 && old_meta & CYCLE == 0;
-    let hash = if F::EVICTABLE { F::hash(&new) } else { 0 };
     let backdate = made_before
         && durability >= old_durability
         && (keep
             // SAFETY: the old value is this view's flight holder's to read (rule 1).
             || (!F::NO_EQ && final_old && F::equal(unsafe { row.value() }, &new))
-            || (F::EVICTABLE && !had && old_meta & HASHED != 0 && hash == header.extra.load(Ordering::Relaxed)));
+            || (F::EVICTABLE
+                && !F::NO_EQ
+                && !had
+                && old_meta & HASHED != 0
+                && F::hash(&new) == header.extra.load(Ordering::Relaxed)));
     let changed = if backdate { header.changed.load(Ordering::Relaxed) } else { view };
     let table = table_of::<F>(storage);
     if had {
@@ -762,11 +765,7 @@ fn finish<F: Function>(
     } else {
         table.values.fetch_add(1, Ordering::Relaxed);
     }
-    let mut meta = durability | if done.untracked { UNTRACKED } else { 0 };
-    if F::EVICTABLE {
-        header.extra.store(hash, Ordering::Relaxed);
-        meta |= HASHED;
-    }
+    let meta = durability | if done.untracked { UNTRACKED } else { 0 };
     // SAFETY: the flight holder, `RUNNING` set; the value was dropped above (rule 1).
     unsafe { row.put(new) };
     store_edges(storage, header, at);
@@ -1098,13 +1097,22 @@ fn rows<'t, F: Function>(
     })
 }
 
-/// Drops the value of `row` (with `&mut`): its stamp, hash and edges stay.
+/// Drops the value of `row` (with `&mut`), keeping its stamp and edges and, for a run that
+/// computes it again, its hash: hashed here, once per eviction, never on a run that keeps it,
+/// and never for `NO_EQ`, whose every run is a change.
 fn evict<F: Function>(row: &RowOf<F>) -> bool {
-    let word = row.header.verified.load(Ordering::Relaxed);
+    let header = &row.header;
+    let word = header.verified.load(Ordering::Relaxed);
     if word & VALUE == 0 || word & PROVISIONAL != 0 {
         return false;
     }
-    // SAFETY: with `&mut` of the storage no reference to the value lives (rule 3).
+    if !F::NO_EQ {
+        // SAFETY: with `&mut` of the storage no reference to the value lives (rule 3), and it
+        // is whole (`VALUE`, not provisional).
+        header.extra.store(F::hash(unsafe { row.value() }), Ordering::Relaxed);
+        header.meta.store(header.meta.load(Ordering::Relaxed) | HASHED, Ordering::Relaxed);
+    }
+    // SAFETY: as above.
     unsafe { row.drop_value() };
     row.header.verified.store(word & !VALUE, Ordering::Relaxed);
     true

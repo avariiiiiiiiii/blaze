@@ -176,6 +176,49 @@ pub(crate) fn ui_core_as(
     ui_fixture_as(mode, &fixture, options)
 }
 
+/// [`ui`] beside a core of the builtin macros of core's prelude the UI tests call, as
+/// `library/core/src/macros/mod.rs` writes them: `compile_error!` and `#[cfg_accessible]`.
+pub(crate) fn ui_builtins(name: &str, edition: &str, source: &str) -> String {
+    let fixture = format!("{BUILTINS_CORE}//- /{name} crate:other:main edition:{edition} deps:core\n{source}");
+    ui_fixture_as(Mode::Other, &fixture, &Options::default())
+}
+
+const BUILTINS_CORE: &str = r#"//- /core.rs crate:core edition:2024
+#![feature(decl_macro, rustc_attrs)]
+pub mod prelude {
+    pub mod v1 {
+        pub use crate::compile_error;
+        pub use crate::macros::builtin::cfg_accessible;
+    }
+    pub mod rust_2015 {
+        pub use super::v1::*;
+    }
+    pub mod rust_2018 {
+        pub use super::v1::*;
+    }
+    pub mod rust_2021 {
+        pub use super::v1::*;
+    }
+    pub mod rust_2024 {
+        pub use super::v1::*;
+    }
+}
+pub mod macros {
+    #[rustc_builtin_macro]
+    #[macro_export]
+    macro_rules! compile_error {
+        ($msg:expr $(,)?) => {{ /* compiler built-in */ }};
+    }
+
+    pub mod builtin {
+        #[rustc_builtin_macro]
+        pub macro cfg_accessible($item:item) {
+            /* compiler built-in */
+        }
+    }
+}
+"#;
+
 fn ui_fixture_as(mode: Mode, fixture: &str, options: &Options) -> String {
     let stderr = checked_with(fixture, "$DIR/", &compiletest(mode, options))
         .stderr_with(Style { ui_testing: true, ..Style::default() });

@@ -36,7 +36,7 @@ fn a_singleton_input_is_made_once_found_and_set() {
         .durability(Durability::MEDIUM)
         .depth_durability(Durability::HIGH)
         .label("x".to_owned())
-        .new(&db);
+        .new(&mut db);
     assert_eq!(Settings::try_get(&db), Some(settings));
     assert_eq!(Settings::get(&db).label(&db), "x");
     assert_eq!(deeper(&db), 4);
@@ -52,7 +52,7 @@ fn a_singleton_input_is_made_once_found_and_set() {
 #[test]
 fn a_default_field_starts_at_its_default() {
     let mut db = TestDb::new();
-    let settings = Settings::new(&db, 1);
+    let settings = Settings::new(&mut db, 1);
     assert_eq!(settings.label(&db), "");
     assert_eq!(settings.note(&db), None);
     assert_eq!(settings.set_note(&mut db).to(Some("n")), None);
@@ -62,9 +62,24 @@ fn a_default_field_starts_at_its_default() {
 #[test]
 #[should_panic(expected = "Settings is a singleton")]
 fn a_second_singleton_panics() {
-    let db = TestDb::new();
-    Settings::new(&db, 1);
-    Settings::new(&db, 2);
+    let mut db = TestDb::new();
+    Settings::new(&mut db, 1);
+    Settings::new(&mut db, 2);
+}
+
+#[blaze_query_macros::tracked(returns(copy))]
+fn level_or_zero(db: &TestDb) -> u32 {
+    Settings::try_get(db).map_or(0, |it| it.level(db))
+}
+
+/// A query that saw the singleton absent runs again once it is made.
+#[test]
+fn making_a_singleton_reruns_what_saw_it_absent() {
+    let mut db = TestDb::new();
+    assert_eq!(level_or_zero(&db), 0);
+    Settings::new(&mut db, 7);
+    assert_eq!(level_or_zero(&db), 7);
+    assert_eq!(runs(), ["level_or_zero", "level_or_zero"]);
 }
 
 #[blaze_query_macros::input(debug)]
@@ -73,7 +88,7 @@ struct File {
     text: String,
 }
 
-#[blaze_query_macros::interned(debug, constructor = make, revisions = usize::MAX)]
+#[blaze_query_macros::interned(debug, constructor = make)]
 struct Path<'db> {
     #[returns(ref)]
     text: String,
@@ -82,7 +97,7 @@ struct Path<'db> {
     depth: u32,
 }
 
-#[blaze_query_macros::interned(unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query_macros::interned(unsafe(no_lifetime))]
 struct Symbol {
     #[returns(deref)]
     text: Box<str>,

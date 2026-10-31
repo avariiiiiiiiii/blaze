@@ -348,7 +348,7 @@ fn library_of(target: &Target) -> &'static Library {
 fn compiles_where_cranelift_does(target: Target) {
     let isa = host::isa(&target);
     let library = library_of(&target);
-    let isa_set = library.variant().isa();
+    let variant = library.variant();
     let mut shapes = Vec::new();
     shape::each(|shape| shapes.push(shape));
     let mut failures = Vec::new();
@@ -384,7 +384,7 @@ fn compiles_where_cranelift_does(target: Target) {
                         )),
                     }
                 }
-                if shape.exists_on(isa_set) {
+                if variant.has(shape) {
                     if let Err(e) = selected(&code, library, shape) {
                         failures.push(format!("{shape}: {e}\n{}", clif()));
                     }
@@ -548,7 +548,11 @@ fn every_library_has_exactly_the_set() {
         let a64 = isa == Isa::Aarch64;
         let reader = library.reader();
         let mut shapes = Vec::new();
-        shape::each_on(isa, |shape| shapes.push(shape));
+        shape::each_on(isa, |shape| {
+            if variant.has(shape) {
+                shapes.push(shape);
+            }
+        });
         if reader.len() as usize != shapes.len() {
             failures.push(format!("{variant:?}: {} stencils for {} shapes", reader.len(), shapes.len()));
         }
@@ -569,7 +573,7 @@ fn every_library_has_exactly_the_set() {
             let key = shape.key();
             let bits = (0..32).map(|bit| key ^ (1 << bit));
             for near in bits.chain([key.wrapping_add(1), key.wrapping_sub(1)]) {
-                let exists = Shape::from_key(near).is_some_and(|it| it.exists_on(isa));
+                let exists = Shape::from_key(near).is_some_and(|it| variant.has(it));
                 if reader.find(near).is_some() != exists {
                     failures.push(format!(
                         "{variant:?}: key {near:#x} (next to `{shape}`) {} a stencil, and is {}a shape of the set",
@@ -806,7 +810,12 @@ mod run {
         let library = library_of(&target);
         let budget = Budget::get();
         let mut shapes = Vec::new();
-        shape::each_on(library.variant().isa(), |shape| shapes.push(shape));
+        let variant = library.variant();
+        shape::each_on(variant.isa(), |shape| {
+            if variant.has(shape) {
+                shapes.push(shape);
+            }
+        });
         let mut failures = Vec::new();
         for (i, shape) in shapes.into_iter().enumerate() {
             if i % SHARDS != k {

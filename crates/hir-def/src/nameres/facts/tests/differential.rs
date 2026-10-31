@@ -160,7 +160,9 @@ pub(in crate::nameres) const NAMERES: &[(&str, &str)] = sources![
 
 pub(in crate::nameres) const MACRO_EXPANSION: &[(&str, &str)] = sources![
     "../macro_expansion_tests/mod.rs",
+    "../macro_expansion_tests/budgets.rs",
     "../macro_expansion_tests/builtin_derive_macro.rs",
+    "../macro_expansion_tests/builtin_errors.rs",
     "../macro_expansion_tests/builtin_fn_macro.rs",
     "../macro_expansion_tests/mbe.rs",
     "../macro_expansion_tests/proc_macros.rs",
@@ -218,12 +220,12 @@ fn nameres_tests_traits_uses_views_worklist_prelude_stale_ids() {
 
 #[test]
 fn macro_expansion_tests() {
-    check_files(&MACRO_EXPANSION[..5]);
+    check_files(&MACRO_EXPANSION[..7]);
 }
 
 #[test]
 fn macro_expansion_tests_mbe() {
-    check_files(&MACRO_EXPANSION[5..]);
+    check_files(&MACRO_EXPANSION[7..]);
 }
 
 #[test]

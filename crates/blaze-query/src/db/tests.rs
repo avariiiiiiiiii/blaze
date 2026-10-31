@@ -23,9 +23,9 @@ use super::{
     owner_is,
     plumbing::{
         CycleKind, Function, Ingredient, Input, Interned, Tag, Tracked, Vtable, evict_values,
-        evict_values_of, fetch, input_fields, input_new, input_read, input_set, input_singleton,
-        intern, intern_by, interned_arguments, interned_fields, set_lru_capacity, tracked_fields,
-        tracked_new, value_hash,
+        evict_values_of, fetch, input_fields, input_new, input_new_singleton, input_read,
+        input_set, input_singleton, intern, intern_by, interned_arguments, interned_fields,
+        set_lru_capacity, tracked_fields, tracked_new, value_hash,
     },
     replay_reads, report_untracked_read,
     row::VIEW_MASK,
@@ -106,6 +106,7 @@ pub trait Spec: 'static {
     const QUERY: &'static str;
     const CAP: usize = 0;
     const EVICT: bool = false;
+    const UNEQUAL: bool = false;
     const CYCLES: CycleKind = CycleKind::Panic;
     fn cache() -> &'static Ingredient;
     fn compute(db: &TestDb, key: Self::Key) -> Self::Value;
@@ -124,6 +125,9 @@ pub trait Spec: 'static {
     ) -> Self::Value {
         new
     }
+    fn hash_value(value: &Self::Value) -> u64 {
+        value_hash(value)
+    }
 }
 
 impl<S: Spec> Function for S {
@@ -134,7 +138,7 @@ impl<S: Spec> Function for S {
     const FILE: &'static str = file!();
     const LRU: usize = S::CAP;
     const EVICTABLE: bool = S::EVICT;
-    const NO_EQ: bool = false;
+    const NO_EQ: bool = S::UNEQUAL;
     const CYCLE: CycleKind = S::CYCLES;
     const TAG: Tag = Tag::Query;
 
@@ -166,11 +170,11 @@ impl<S: Spec> Function for S {
     }
 
     fn equal(old: &S::Value, new: &S::Value) -> bool {
-        old == new
+        !S::UNEQUAL && old == new
     }
 
     fn hash(value: &S::Value) -> u64 {
-        value_hash(value)
+        S::hash_value(value)
     }
 }
 
@@ -743,16 +747,44 @@ impl Input for Config {
 
 #[test]
 fn a_singleton_is_made_once() {
-    let db = TestDb::new();
+    let mut db = TestDb::new();
     assert_eq!(input_singleton::<Config>(db.storage()), None);
-    let id = input_new::<Config, 1>(db.storage(), (3,), [Durability::HIGH]);
+    let id = input_new_singleton::<Config, 1>(db.storage_mut(), (3,), [Durability::HIGH]);
     assert_eq!(input_singleton::<Config>(db.storage()), Some(id));
     assert_eq!(input_fields::<Config>(db.storage(), id).0, 3);
     let payload = catch_unwind(AssertUnwindSafe(|| {
-        input_new::<Config, 1>(db.storage(), (4,), [Durability::HIGH])
+        input_new_singleton::<Config, 1>(db.storage_mut(), (4,), [Durability::HIGH])
     }))
     .expect_err("a second singleton");
     assert!(message(&*payload).contains("singleton"));
+    let payload = catch_unwind(AssertUnwindSafe(|| {
+        input_new::<Config, 1>(db.storage(), (4,), [Durability::HIGH])
+    }))
+    .expect_err("a singleton made by `&`");
+    assert!(message(&*payload).contains("singleton"));
+}
+
+query!(ConfigOrZero, u64, |db, _key| match input_singleton::<Config>(db.storage()) {
+    Some(id) => {
+        input_read::<Config>(db.storage(), id, 0);
+        u64::from(input_fields::<Config>(db.storage(), id).0)
+    }
+    None => 0,
+});
+
+/// Reading a singleton's absence is a dependency: making it reruns exactly those readers,
+/// though it is made after they ran in the same view (queue 01228).
+#[test]
+fn making_a_singleton_reruns_what_read_its_absence() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 1, 2);
+    let other = Cell::new(&db, 3, 4);
+    assert_eq!(*get::<ConfigOrZero>(&db, cell), 0);
+    assert_eq!(*get::<Double>(&db, other), 6);
+    input_new_singleton::<Config, 1>(db.storage_mut(), (5,), [Durability::HIGH]);
+    assert_eq!(*get::<ConfigOrZero>(&db, cell), 5, "its absence was read");
+    assert_eq!(*get::<Double>(&db, other), 6);
+    assert_eq!((db.runs("ConfigOrZero"), db.runs("Double")), (2, 1));
 }
 
 /// Interned strings.
@@ -952,6 +984,73 @@ fn an_evicted_value_recomputed_equal_does_not_rerun_its_readers() {
     assert_eq!(*get::<TensReader>(&db, cell), 3);
 }
 
+static HASHES: AtomicUsize = AtomicUsize::new(0);
+
+query!(
+    Hashed,
+    u64,
+    |db, key| key.a(db) / 10;
+    const EVICT: bool = true;
+    fn hash_value(value: &u64) -> u64 {
+        HASHES.fetch_add(1, Ordering::SeqCst);
+        value_hash(value)
+    }
+);
+query!(HashedReader, u64, |db, key| get::<Hashed>(db, key) + 1);
+
+#[test]
+fn an_evictable_function_hashes_its_value_only_when_evicted() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 11, 0);
+    assert_eq!(*get::<HashedReader>(&db, cell), 2);
+    cell.set_a(&mut db, 15);
+    assert_eq!(*get::<HashedReader>(&db, cell), 2, "rerun equal, backdated by `==`");
+    assert_eq!(HASHES.load(Ordering::SeqCst), 0, "a run that keeps its value hashes nothing");
+    assert_eq!(evict_values::<Hashed>(&mut db), 1);
+    assert_eq!(HASHES.load(Ordering::SeqCst), 1, "hashed once, as it was evicted");
+    cell.set_a(&mut db, 12);
+    assert_eq!(*get::<HashedReader>(&db, cell), 2, "rerun equal, backdated by the hash");
+    assert_eq!(
+        HASHES.load(Ordering::SeqCst),
+        2,
+        "the rerun of an evicted row hashes its new value"
+    );
+    assert_eq!((db.runs("Hashed"), db.runs("HashedReader")), (3, 1));
+}
+
+static UNEQUAL_HASHES: AtomicUsize = AtomicUsize::new(0);
+
+query!(
+    UnequalHashed,
+    u64,
+    |db, key| key.a(db) / 10;
+    const EVICT: bool = true;
+    const UNEQUAL: bool = true;
+    fn hash_value(value: &u64) -> u64 {
+        UNEQUAL_HASHES.fetch_add(1, Ordering::SeqCst);
+        value_hash(value)
+    }
+);
+query!(UnequalReader, u64, |db, key| get::<UnequalHashed>(db, key) + 1);
+
+#[test]
+fn an_evictable_no_eq_function_never_hashes_and_every_rerun_changes() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 11, 0);
+    assert_eq!(*get::<UnequalReader>(&db, cell), 2);
+    cell.set_a(&mut db, 15);
+    assert_eq!(*get::<UnequalReader>(&db, cell), 2);
+    assert_eq!(evict_values::<UnequalHashed>(&mut db), 1);
+    cell.set_a(&mut db, 12);
+    assert_eq!(*get::<UnequalReader>(&db, cell), 2);
+    assert_eq!(UNEQUAL_HASHES.load(Ordering::SeqCst), 0, "`no_eq`: nothing is hashed");
+    assert_eq!(
+        (db.runs("UnequalHashed"), db.runs("UnequalReader")),
+        (3, 3),
+        "an equal rerun is still a change, evicted or not"
+    );
+}
+
 query!(
     Capped,
     u64,
@@ -1053,6 +1152,16 @@ fn views_renumber_at_the_limit_and_every_answer_holds() {
     assert!(db.storage().view() > before, "the view hosts see is never reused");
     assert_eq!((db.runs("Double"), db.runs("ReadB")), (1, 1), "unchanged across it: never ran");
     assert_eq!(db.runs("Parity"), 6, "once, then once per write of `a`");
+}
+
+fn is_value<T: super::Value + ?Sized>() {}
+
+#[test]
+fn foreign_containers_of_values_are_values() {
+    is_value::<either::Either<Id, Vec<u32>>>();
+    is_value::<Option<either::Either<String, Option<Id>>>>();
+    is_value::<Result<thin_vec::ThinVec<Id>, Box<str>>>();
+    is_value::<smallvec::SmallVec<[Id; 2]>>();
 }
 
 /// A value that counts its drops.

@@ -21,7 +21,7 @@ nightly = []
 
 [dependencies]
 derive-where = "1.2.7"
-rustc_index = { version = "0.166.0", package = "ra-ap-rustc_index", default-features = false }
+rustc_index = { version = "0.179.0", package = "ra-ap-rustc_index", default-features = false }
 rustc_type_ir = { path = "../rustc_type_ir", version = "0.0.0", default-features = false }
 rustc_type_ir_macros = { path = "../rustc_type_ir_macros", version = "0.0.0" }
 thin-vec = "0.2.21"

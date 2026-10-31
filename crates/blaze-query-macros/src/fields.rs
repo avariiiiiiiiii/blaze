@@ -94,13 +94,6 @@ fn parse_field(kind: Kind, field: &syn::Field) -> syn::Result<Field> {
             "set" | "default" => &[Kind::Input],
             "tracked" | "no_eq" => &[Kind::Tracked],
             "value" => &[Kind::Interned],
-            "id" | "maybe_update" | "salsa_value" => {
-                return Err(syn::Error::new_spanned(
-                    attr,
-                    // alloc: expansion time, the error's message
-                    format!("`#[{word}]` is a salsa field attribute blaze_query does not have"),
-                ));
-            }
             _ => {
                 out.attrs.push(attr.clone()); // clone: expansion time, an attribute
                 continue;

@@ -389,7 +389,7 @@ mod engine {
         }
     }
 
-    #[blaze_query::interned(unsafe(no_lifetime), revisions = usize::MAX)]
+    #[blaze_query::interned(unsafe(no_lifetime))]
     pub(crate) struct Key {
         #[returns(copy)]
         value: u32,
@@ -523,7 +523,7 @@ mod engine {
         }
     }
 
-    #[blaze_query::interned(unsafe(no_lifetime), revisions = usize::MAX)]
+    #[blaze_query::interned(unsafe(no_lifetime))]
     pub(crate) struct Node {
         #[returns(copy)]
         layer: u32,
@@ -568,7 +568,7 @@ mod engine {
 
     impl Deep {
         pub(crate) fn new() -> Deep {
-            let db = Db::new();
+            let mut db = Db::new();
             let leaves: Vec<Leaf> = (0..LEAVES)
                 .map(|i| Leaf::builder(i as u32).durability(Durability::MEDIUM).new(&db))
                 .collect();
@@ -577,7 +577,7 @@ mod engine {
                 .map(|(layer, index)| Node::new(&db, layer, index))
                 .collect();
             let top = nodes[LAYERS * WIDTH];
-            let _ = Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&db);
+            let _ = Graph::builder(leaves, nodes).durability(Durability::MEDIUM).new(&mut db);
             let other = Other::builder(0).durability(Durability::MEDIUM).new(&db);
             let expected = node(&db, top);
             Deep { db, top, other, tick: 0, runs: 0, expected }

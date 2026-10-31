@@ -28,8 +28,8 @@ ena = "0.14.4"
 indexmap = "2.0.0"
 rustc-hash = "2.0.0"
 rustc_abi = { path = "../../crates/rustc_abi", version = "0.0.0", default-features = false }
-rustc_ast_ir = { version = "0.166.0", package = "ra-ap-rustc_ast_ir", default-features = false }
-rustc_index = { version = "0.166.0", package = "ra-ap-rustc_index", default-features = false }
+rustc_ast_ir = { version = "0.179.0", package = "ra-ap-rustc_ast_ir", default-features = false }
+rustc_index = { version = "0.179.0", package = "ra-ap-rustc_index", default-features = false }
 rustc_type_ir_macros = { path = "../rustc_type_ir_macros", version = "0.0.0" }
 smallvec = { version = "1.8.1", default-features = false, features = ["const_generics"] }
 thin-vec = "0.2.21"

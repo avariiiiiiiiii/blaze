@@ -164,7 +164,7 @@ second version left in `Cargo.lock` is forced by an upstream's newest release, a
 | `getrandom` 0.3 beside 0.4, `r-efi` 5 beside 6 | `ahash` 0.8.12 under `sonic-rs` (blaze-api, blaze-ci); goes if `sonic-rs` gives way to `serde_json` (below) |
 | `bitflags` 1 beside 2 | `defmt` 1.2 under `jiff`, under `cargo-util-schemas` =0.14.3 (cargo 1.99's pin) |
 | `miniz_oxide` 0.8 beside 0.9 | none once the lock re-resolves: `vendor/hegeltest-c` asks for 0.9.1 like `flate2` (vendor/hegeltest/SOURCE.md, change 5; 2026-10-30) |
-| `rustc-literal-escaper` 0.0.7 beside 0.0.8 | `ra-ap-rustc_parse_format` 0.166 (blaze-diagnostics, hir-def); 0.179 is waiting for its source (01151) |
+| `rustc-literal-escaper` 0.0.7 beside 0.0.8 | none once `ra-ap-*` 0.179 lands (queued after round 6): `ra-ap-rustc_parse_format` 0.179 asks for 0.0.8 |
 | `wasmparser`, `wasm-metadata`, `wit-component`, `wit-parser` 0.244, `hashbrown` 0.15, `foldhash` 0.1 | none: left in the lock by the deleted Wasmtime hosts; the workspace's `wasm-encoder` 0.263 without default features names no `wasmparser`, so the next re-resolve drops them |
 | `windows-sys` 0.52 | `ring` 0.17.14 |
 | `embedded-io` 0.4 beside 0.6 | `postcard` 1.1.3, which names both |

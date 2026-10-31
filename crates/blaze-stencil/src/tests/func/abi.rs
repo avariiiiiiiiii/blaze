@@ -195,7 +195,7 @@ pub fn i128_even(mk: &Mk) -> Family {
 /// Floats past the eight vector registers (Windows: four, by position).
 pub fn floats(mk: &Mk) -> Family {
     let params = ps(&[F32, F64, F32, F64, F64, F32, F64, F32, F64, F32, F64]);
-    shape(mk, "abi/floats", &params, &ps(&[F64, F32]), mk.windows())
+    shape(mk, "abi/floats", &params, &ps(&[F64, F32]), false)
 }
 
 /// Integers and floats interleaved, each class running out on its own.
@@ -227,14 +227,14 @@ pub fn mixed(mk: &Mk) -> Family {
 pub fn vectors(mk: &Mk) -> Family {
     use types::{F32X4, F64X2, I8X16, I16X8, I32X4, I64X2};
     let params = ps(&[I32X4, F64X2, I8X16, F32X4, I64X2, I16X8, I32X4, F64X2, I8X16, F32X4]);
-    shape(mk, "abi/vectors", &params, &ps(&[I32X4, F64X2]), mk.windows())
+    shape(mk, "abi/vectors", &params, &ps(&[I32X4, F64X2]), false)
 }
 
 /// `f16` and `f128`, which both architectures pass in vector registers (and on the stack
 /// at their own size on Apple's AArch64).
 pub fn f16_f128(mk: &Mk) -> Family {
     let params = ps(&[F16, F128, F16, F128, F16, F16, F128, F16, F16, F128, F16]);
-    shape(mk, "abi/f16_f128", &params, &ps(&[F16, F128]), mk.windows())
+    shape(mk, "abi/f16_f128", &params, &ps(&[F16, F128]), false)
 }
 
 pub fn rets_3(mk: &Mk) -> Family {
@@ -260,10 +260,10 @@ pub fn rets_floats_8(mk: &Mk) -> Family {
     shape(mk, "abi/rets_floats_8", &ps(&[F64; 8]), &ps(&[F64; 8]), mk.x64())
 }
 
-/// Two of each class: System V's `rax`, `rdx`, `xmm0`, `xmm1`; Windows has one float.
+/// Two of each class: `rax`, `rdx`, `xmm0`, `xmm1` (on Windows too since Cranelift 0.137).
 pub fn rets_mixed(mk: &Mk) -> Family {
     let tys = [I64, F64, I32, F32];
-    shape(mk, "abi/rets_mixed", &ps(&tys), &ps(&tys), mk.windows())
+    shape(mk, "abi/rets_mixed", &ps(&tys), &ps(&tys), false)
 }
 
 /// Sixteen: AArch64's eight of each class, its limit of all registers together.

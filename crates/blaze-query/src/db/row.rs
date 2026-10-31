@@ -62,7 +62,7 @@ pub(crate) const UNTRACKED: u32 = 1 << 3;
 pub(crate) const HEAD: u32 = 1 << 4;
 /// `meta`: a carried head value of an earlier round: run again before it is read.
 pub(crate) const STALE: u32 = 1 << 5;
-/// `meta`: `extra` is the value's 64-bit hash.
+/// `meta`: `extra` is the 64-bit hash of the value an eviction dropped.
 pub(crate) const HASHED: u32 = 1 << 6;
 
 /// A row's header: the same for every function, so the verify walk reads any row untyped.

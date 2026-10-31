@@ -17,6 +17,7 @@ use cranelift_codegen::{
 use cranelift_interpreter::{
     environment::FunctionStore,
     interpreter::{Interpreter, InterpreterState},
+    state::State,
     step::{ControlFlow, CraneliftTrap},
 };
 
@@ -36,11 +37,16 @@ pub enum Run {
 /// is what the interpreter can't do (an operation it lacks, its fuel run out).
 pub fn run(funcs: &[&ir::Function], entry: usize, args: &[DataValue]) -> Result<Run, String> {
     let funcs: Vec<ir::Function> = funcs.iter().map(|func| interpretable(func)).collect();
+    // The interpreter's address of the first frame's first stack slot is 0, which code
+    // testing a pointer for null takes for one: a frame of 16 bytes below the entry's.
+    let mut base = ir::Function::new();
+    base.create_sized_stack_slot(ir::StackSlotData::new(ir::StackSlotKind::ExplicitSlot, 16, 4));
     let mut store = FunctionStore::default();
     for func in &funcs {
         store.add(func.name.to_string(), func);
     }
-    let state = InterpreterState::default().with_function_store(store);
+    let mut state = InterpreterState::default().with_function_store(store);
+    state.push_frame(&base);
     let mut interpreter = Interpreter::new(state).with_fuel(Some(FUEL));
     match interpreter.call_by_name(&funcs[entry].name.to_string(), args) {
         Ok(ControlFlow::Return(values)) => Ok(Run::Returned(values.to_vec())),
@@ -54,26 +60,54 @@ pub fn run(funcs: &[&ir::Function], entry: usize, args: &[DataValue]) -> Result<
     }
 }
 
-/// `func` with each `avg_round` as `(x | y) - ((x ^ y) >> 1)`, the same lane by lane: the
-/// interpreter's `avg_round` adds its operands as one scalar, which panics on a vector and
-/// wraps before it halves on a scalar.
+/// `func` with what the interpreter gets wrong written as what it gets right:
+///
+/// - each `avg_round` as `(x | y) - ((x ^ y) >> 1)`, the same lane by lane: the interpreter's
+///   adds its operands as one scalar, which panics on a vector and wraps before it halves on
+///   a scalar;
+/// - each `srem` by -1 as one by 1, both 0: the interpreter's traps on the minimum by -1,
+///   which only a zero divisor does.
 fn interpretable(func: &ir::Function) -> ir::Function {
     let mut func = func.clone();
     let mut cursor = FuncCursor::new(&mut func);
     while cursor.next_block().is_some() {
         while let Some(inst) = cursor.next_inst() {
-            if cursor.func.dfg.insts[inst].opcode() != ir::Opcode::AvgRound {
-                continue;
+            match cursor.func.dfg.insts[inst].opcode() {
+                ir::Opcode::AvgRound => {
+                    let &[x, y] = cursor.func.dfg.inst_args(inst) else {
+                        unreachable!("avg_round takes two operands")
+                    };
+                    let or = cursor.ins().bor(x, y);
+                    let xor = cursor.ins().bxor(x, y);
+                    let one = cursor.ins().iconst(types::I32, 1);
+                    let half = cursor.ins().ushr(xor, one);
+                    cursor.func.replace(inst).isub(or, half);
+                }
+                ir::Opcode::Srem => {
+                    let &[x, y] = cursor.func.dfg.inst_args(inst) else { unreachable!("srem takes two operands") };
+                    let ty = cursor.func.dfg.value_type(y);
+                    let all_ones = int(&mut cursor, ty, -1);
+                    let minus_one = cursor.ins().icmp(ir::condcodes::IntCC::Equal, y, all_ones);
+                    let one = int(&mut cursor, ty, 1);
+                    let divisor = cursor.ins().select(minus_one, one, y);
+                    cursor.func.replace(inst).srem(x, divisor);
+                }
+                _ => {}
             }
-            let &[x, y] = cursor.func.dfg.inst_args(inst) else { unreachable!("avg_round takes two operands") };
-            let or = cursor.ins().bor(x, y);
-            let xor = cursor.ins().bxor(x, y);
-            let one = cursor.ins().iconst(types::I32, 1);
-            let half = cursor.ins().ushr(xor, one);
-            cursor.func.replace(inst).isub(or, half);
         }
     }
     func
+}
+
+/// `value` as a constant of the integer type `ty`, which `iconst` makes only up to 64 bits.
+fn int(cursor: &mut FuncCursor<'_>, ty: ir::Type, value: i64) -> ir::Value {
+    if ty == types::I128 {
+        let wide = cursor.ins().iconst(types::I64, value);
+        return cursor.ins().sextend(types::I128, wide);
+    }
+    let bits = ty.bits();
+    let value = if bits >= 64 { value } else { value & ((1i64 << bits) - 1) };
+    cursor.ins().iconst(ty, value)
 }
 
 /// How a call of machine code ended (`exec`'s calls in a forked child).

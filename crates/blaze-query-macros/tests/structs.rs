@@ -17,6 +17,10 @@ struct Settings {
     #[default]
     #[returns(ref)]
     label: String,
+    /// A field whose type names a lifetime of its own.
+    #[default]
+    #[returns(copy)]
+    note: Option<&'static str>,
 }
 
 #[blaze_query_macros::tracked(returns(copy))]
@@ -47,9 +51,12 @@ fn a_singleton_input_is_made_once_found_and_set() {
 
 #[test]
 fn a_default_field_starts_at_its_default() {
-    let db = TestDb::new();
+    let mut db = TestDb::new();
     let settings = Settings::new(&db, 1);
     assert_eq!(settings.label(&db), "");
+    assert_eq!(settings.note(&db), None);
+    assert_eq!(settings.set_note(&mut db).to(Some("n")), None);
+    assert_eq!(settings.note(&db), Some("n"));
 }
 
 #[test]

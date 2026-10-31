@@ -97,7 +97,7 @@ fn expand_in(args: TokenStream, item: &ItemStruct) -> syn::Result<TokenStream> {
             }
         });
         at_fns.extend(quote! {
-            fn #at(fields: &mut (#(#tys,)*)) -> &mut #ty {
+            fn #at<'fields>(fields: &'fields mut (#(#tys,)*)) -> &'fields mut #ty {
                 &mut fields.#tuple_index
             }
         });

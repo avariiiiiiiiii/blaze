@@ -1,12 +1,6 @@
-use base_db::{
-    CrateDisplayName, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData,
-    DependencyBuilder, Env, TargetKind, all_crates,
-};
+use base_db::{CrateGraphBuilder, CrateName, DependencyBuilder, all_crates};
 use expect_test::{Expect, expect};
-use intern::Symbol;
-use span::Edition;
 use hir_expand::fixture;
-use triomphe::Arc;
 
 use crate::{
     file_item_tree,
@@ -67,40 +61,48 @@ pub const BAZ: u32 = 0;
     }
 
     let all_crates_before = all_crates(&db);
+    let a = *all_crates_before
+        .iter()
+        .find(|it| it.extra_data(&db).display_name.as_ref().is_some_and(|name| name.to_string() == "a"))
+        .expect("crate a");
+    let a_before = crate::nameres::delta::Slices::of(&db, a);
 
     let new_crate_graph = {
         // Add dependencies: c -> b, b -> a.
         let mut new_crate_graph = CrateGraphBuilder::default();
 
-        let mut add_crate = |crate_name, root_file_idx: usize| {
+        // Each crate as the fixture made it (its cfg, crate attributes and the rest), only its
+        // dependencies new: what changes is the graph, not the crates.
+        let mut add_crate = |root_file_idx: usize| {
+            let root = files[root_file_idx].file_id(&db);
+            let old = *all_crates_before
+                .iter()
+                .find(|it| it.data(&db).root_file_id == root)
+                .expect("a crate of the fixture's root file");
+            let (data, extra) = (old.data(&db), old.extra_data(&db));
+            let attrs = data
+                .crate_attrs
+                .iter()
+                .map(|it| it.strip_prefix("#![").and_then(|it| it.strip_suffix(']')).unwrap_or(it).to_owned())
+                .collect();
             new_crate_graph.add_crate_root(
-                files[root_file_idx].file_id(&db),
-                Edition::CURRENT,
-                Some(CrateDisplayName::from_canonical_name(crate_name)),
-                None,
-                Default::default(),
-                None,
-                Env::default(),
-                CrateOrigin::Local { repo: None, name: Some(Symbol::intern(crate_name)) },
-                Vec::new(),
-                TargetKind::Lib { is_proc_macro: false },
-                Arc::new(
-                    // FIXME: This is less than ideal
-                    TryFrom::try_from(
-                        &*std::env::current_dir().unwrap().as_path().to_string_lossy(),
-                    )
-                    .unwrap(),
-                ),
-                Arc::new(CrateWorkspaceData {
-                    target: Err("".into()),
-                    toolchain: None,
-                    const_eval: Default::default(),
-                }),
+                root,
+                data.edition,
+                extra.display_name.clone(),
+                extra.version.clone(),
+                old.cfg_options(&db).clone(),
+                extra.potential_cfg_options.clone(),
+                old.env(&db).clone(),
+                data.origin.clone(),
+                attrs,
+                data.target_kind,
+                data.proc_macro_cwd.clone(),
+                old.workspace_data(&db).clone(),
             )
         };
-        let a = add_crate("a", 0);
-        let b = add_crate("b", 1);
-        let c = add_crate("c", 2);
+        let a = add_crate(0);
+        let b = add_crate(1);
+        let c = add_crate(2);
         new_crate_graph
             .add_dep(c, DependencyBuilder::new(CrateName::new("b").unwrap(), b))
             .unwrap();
@@ -116,8 +118,10 @@ pub const BAZ: u32 = 0;
             crate_def_map(db, krate);
         }
     });
-    // `c` gets invalidated as its dependency `b` changed
-    // `b` gets invalidated due to its new dependency edge to `a`
+    let a_after = crate::nameres::delta::Slices::of(&db, a);
+    assert_eq!(a_before.differing(&a_after), Vec::<String>::new(), "fields of crate a's resolution set");
+    // `b` gets invalidated due to its new dependency edge to `a`. `c` already depended on `b`,
+    // and `b` declares what it did, so `c`'s def map stays as it was.
     let names: Vec<(blaze_query::db::Id, String)> = all_crates(&db)
         .iter()
         .map(|&krate| {
@@ -140,7 +144,7 @@ pub const BAZ: u32 = 0;
         })
         .collect();
     rerun.sort_unstable();
-    assert_eq!(rerun, ["b", "c"], "the crates whose def map was collected again");
+    assert_eq!(rerun, ["b"], "the crates whose def map was collected again");
     let all_crates_after = all_crates(&db);
     assert!(
         std::sync::Arc::ptr_eq(&all_crates_before, &all_crates_after),
@@ -279,11 +283,13 @@ fn f() { foo }
         "#]],
         expect![[r#"
             [
+                "resolution_of",
                 "EditionedFileId::parse_",
-                "HirFileId::ast_id_map",
                 "file_item_tree_query",
+                "HirFileId::ast_id_map",
                 "real_span_map",
                 "MacroCallId::macro_arg",
+                "EditionedFileId::parse_errors",
                 "MacroCallId::proc_macro_expansion",
                 "MacroCallId::parse_macro_expansion",
                 "HirFileId::ast_id_map",
@@ -379,6 +385,7 @@ pub struct S {}
         "#]],
         expect![[r#"
             [
+                "resolution_of",
                 "EditionedFileId::parse_",
                 "file_item_tree_query",
                 "HirFileId::ast_id_map",
@@ -386,6 +393,8 @@ pub struct S {}
                 "MacroCallId::macro_arg",
                 "AstId::decl_macro_expander",
                 "MacroCallId::macro_arg",
+                "MacroCallId::macro_arg",
+                "EditionedFileId::parse_errors",
             ]
         "#]],
     );

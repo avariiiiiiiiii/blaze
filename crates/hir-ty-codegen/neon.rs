@@ -37,7 +37,6 @@ macro_rules! text {
 const LITTLE: MemFlagsData = MemFlagsData::new().with_endianness(Endianness::Little);
 
 /// An intrinsic as instructions on the registers [`asm::neon_function`](super::asm) loads.
-#[derive(Clone)]
 pub(super) struct Lowered {
     /// The target features, as Rust names them, the instructions need of the assembler.
     pub(super) features: Vec<&'static str>,

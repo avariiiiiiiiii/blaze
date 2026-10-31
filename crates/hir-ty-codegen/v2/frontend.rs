@@ -725,6 +725,8 @@ const SHIM_DOMAIN: &str = "blaze v2 shim 1";
 const ASM_ITEM_DOMAIN: &str = "blaze v2 asm item 1";
 const ASM_DOMAIN: &str = "blaze v2 asm 1";
 const START_DOMAIN: &str = "blaze v2 start 1";
+/// A cached function's code with the code of its body it writes ([`fncache::written_code`]).
+const CACHED_DOMAIN: &str = "blaze v2 cached function 1";
 const ARGS_DOMAIN: &str = "blaze v2 args 1";
 /// A share key in place of the arguments: never equal to an [`ARGS_DOMAIN`] hash.
 const SHARED_ARGS_DOMAIN: &str = "blaze v2 shared args 1";
@@ -765,8 +767,8 @@ fn share_def(def: InstanceDef) -> ShareDef {
 /// What an instance's code is. A shim's is what kind of shim it is, with the code of the
 /// function whose signature it adapts: what else it reads is its type argument's.
 fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String> {
-    let instance = match kind {
-        Kind::Code(instance, _) => instance,
+    let (instance, env) = match kind {
+        Kind::Code(instance, env) => (instance, env),
         Kind::Asm(text) => return Ok(CodeHash(ContentId::of(ASM_DOMAIN, text.as_bytes()))),
         Kind::Allocator(forward) => return Ok(super::allocator::code(forward)),
         Kind::Start(main) => {
@@ -784,7 +786,20 @@ fn code_of(db: &Db, hashes: &HashSource, kind: &Kind) -> Result<CodeHash, String
         Ok(CodeHash(hasher.finish()))
     };
     match instance.def {
-        InstanceDef::Fn(func) => hashes.code(db, Body::Item(func.into())),
+        InstanceDef::Fn(func) => {
+            let code = hashes.code(db, Body::Item(func.into()))?;
+            let written = hir_ty::attach_db(db, || fncache::written_code(db, func, instance, env));
+            let Some(written) = written else {
+                return Ok(code);
+            };
+            let mut hasher = Hasher::new(CACHED_DOMAIN);
+            hasher.id(&code.0);
+            match written {
+                Ok(hash) => hasher.update(&[0]).update(&hash.to_le_bytes()),
+                Err(why) => hasher.update(&[1]).update(why.as_bytes()),
+            };
+            Ok(CodeHash(hasher.finish()))
+        }
         InstanceDef::Closure(id) => hashes.code(db, Body::Closure(id)),
         InstanceDef::Coroutine(id) => hashes.code(db, Body::Coroutine(id)),
         InstanceDef::CoroutineByMove(id) => hashes.code(db, Body::CoroutineByMove(id)),

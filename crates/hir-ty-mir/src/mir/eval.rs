@@ -21,6 +21,7 @@ use hir_def::{
     signatures::{StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
 use hir_expand::mod_path::path;
+use hir_lint_levels::LintId;
 use la_arena::ArenaMap;
 use rustc_abi::{Size, TargetDataLayout};
 use rustc_apfloat::{
@@ -457,6 +458,9 @@ pub struct Evaluator<'db, M: Machine<'db> = Plain> {
     budget: ConstEvalBudget,
     /// The steps of [`Self::budget`] not spent yet.
     steps_left: u64,
+    /// [`Self::steps_left`] once [`LINT_TERMINATOR_LIMIT`] steps are spent, when the evaluation
+    /// is of a constant's or static's initializer; `u64::MAX`, which it never is, otherwise.
+    lint_mark: u64,
     /// An additional limit on stack depth, to prevent stack overflow
     stack_depth_limit: usize,
     /// Every call takes a frame of [`Self::stack_depth_limit`], which is the crate's recursion
@@ -704,6 +708,19 @@ impl Address {
 }
 
 type Result<'db, T> = std::result::Result<T, MirEvalError<'db>>;
+
+/// The steps at which rustc's const evaluation asks for `long_running_const_eval`
+/// (`rustc_const_eval`'s `LINT_TERMINATOR_LIMIT`).
+pub const LINT_TERMINATOR_LIMIT: u64 = 2_000_000;
+
+/// [`Evaluator::lint_mark`] of an evaluation with `steps` of budget: only a constant's or
+/// static's initializer (`limits_frames`) is const evaluation, which the lint is of.
+fn lint_mark(limits_frames: bool, steps: u64) -> u64 {
+    match steps.checked_sub(LINT_TERMINATOR_LIMIT) {
+        Some(mark) if limits_frames => mark,
+        _ => u64::MAX,
+    }
+}
 
 #[derive(Debug)]
 struct Locals<'db> {
@@ -967,6 +984,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             limits_frames,
             budget,
             steps_left: budget.steps,
+            lint_mark: lint_mark(limits_frames, budget.steps),
             layout_cache: RefCell::new(Default::default()),
             projected_ty_cache: RefCell::new(Default::default()),
             not_special_fn_cache: RefCell::new(Default::default()),
@@ -1318,7 +1336,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     self.unwind_out(frame, &mut block)?;
                 }
                 Err(Raised { mut error, statement }) => {
-                    if let MirEvalError::OverBudget { at: at @ None, .. } = &mut error {
+                    if let MirEvalError::OverBudget { at: at @ None, .. }
+                    | MirEvalError::LongRunning { at: at @ None } = &mut error
+                    {
                         let body = frame.locals.body;
                         let terminator = body.basic_blocks[block].terminator.as_ref();
                         *at = Some((body.owner, terminator.map_or(MirSpan::Unknown, |it| it.span)));
@@ -1328,6 +1348,33 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
             }
         }
+    }
+
+    /// rustc's `long_running_const_eval` once [`LINT_TERMINATOR_LIMIT`] steps are spent (its
+    /// `increment_const_eval_counter`), at the level in force where the outermost frame of a
+    /// body of the evaluation's crate is (`best_lint_scope`), or at the crate's root when no
+    /// frame is of it. An error level stops the evaluation; any other goes on.
+    #[cold]
+    fn long_running(&self, current: &StackFrame<'db>) -> Result<'db, ()> {
+        let db = self.db;
+        let lint = LintId::LONG_RUNNING_CONST_EVAL;
+        let local = self
+            .code_stack
+            .iter()
+            .chain(std::iter::once(current))
+            .map(|frame| frame.locals.body.owner)
+            .find(|owner| owner.module(db).krate(db) == self.crate_id);
+        let level = match local {
+            Some(InferBodyId::DefWithBodyId(owner)) => hir_lint_levels::lint_level(db, owner, lint),
+            Some(InferBodyId::AnonConstId(konst)) => {
+                let loc = konst.loc(db);
+                hir_lint_levels::lint_level_at(db, loc.owner, Some(loc.expr), lint)
+                    // alloc: the error's message
+                    .map_err(|error| MirEvalError::InternalError(error.to_string().into()))?
+            }
+            None => hir_lint_levels::crate_lint_level(db, self.crate_id, lint),
+        };
+        if level.is_error() { Err(MirEvalError::LongRunning { at: None }) } else { Ok(()) }
     }
 
     /// Runs `frame` from `block` until it calls, returns, unwinds or its thread gives way;
@@ -1342,6 +1389,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             let current_block = &body.basic_blocks[*block];
             if let Some(it) = self.steps_left.checked_sub(1) {
                 self.steps_left = it;
+                if it == self.lint_mark {
+                    self.long_running(frame).map_err(|error| Raised { error, statement: None })?;
+                }
             } else {
                 let error =
                     MirEvalError::OverBudget { spent: Budget::Steps(self.budget.steps), at: None };

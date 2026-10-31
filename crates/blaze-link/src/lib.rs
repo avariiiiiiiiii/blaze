@@ -446,14 +446,25 @@ impl Image {
         stage.sweep();
         stage.asan_globals(&change)?;
         stage.dangling()?;
-        for _ in 0..2 {
+        // Each round places what the last made; GOT cells and PLT stubs need nothing past the
+        // next, so a stage that still makes pieces after `ROUNDS` would write them unplaced.
+        const ROUNDS: usize = 8;
+        let mut settled = false;
+        for _ in 0..ROUNDS {
             stage.place()?;
             stage.referrers();
             let before = stage.fresh.len();
             stage.needs()?;
             if stage.fresh.len() == before {
+                settled = true;
                 break;
             }
+        }
+        if !settled {
+            return Err(stage::error(
+                None,
+                format!("the GOT cells and PLT stubs the image needs were still growing after {ROUNDS} placements"),
+            ));
         }
         stage.coverage_moved();
         if let Some(place) = self.place {

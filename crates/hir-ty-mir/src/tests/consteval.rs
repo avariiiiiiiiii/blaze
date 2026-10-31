@@ -3438,8 +3438,17 @@ fn exec_limits() {
         return;
     }
 
+    // `long_running_const_eval` is deny by default: rustc stops at 2,000,000 steps.
     check_fail(
         r#"
+    const GOAL: usize = loop {};
+    "#,
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::LongRunning { at: Some(_) })),
+    );
+    // Allowed or warned, the evaluation goes on to the budget.
+    check_fail(
+        r#"
+    #[allow(long_running_const_eval)]
     const GOAL: usize = loop {};
     "#,
         |e| {
@@ -3451,6 +3460,30 @@ fn exec_limits() {
                 })
             )
         },
+    );
+    check_fail(
+        r#"
+    #![warn(long_running_const_eval)]
+    const GOAL: usize = loop {};
+    "#,
+        |e| {
+            matches!(
+                e,
+                ConstEvalError::MirEvalError(MirEvalError::OverBudget {
+                    spent: Budget::Steps(10_000_000),
+                    at: Some(_),
+                })
+            )
+        },
+    );
+    // The level is the item's whose body the outermost frame is, not the callee's.
+    check_fail(
+        r#"
+    #[allow(long_running_const_eval)]
+    const fn spin() -> usize { loop {} }
+    const GOAL: usize = spin();
+    "#,
+        |e| matches!(e, ConstEvalError::MirEvalError(MirEvalError::LongRunning { at: Some(_) })),
     );
     check_fail(
         r#"

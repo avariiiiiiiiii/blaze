@@ -432,7 +432,7 @@ pub trait Steps: Sized + Send + Sync + 'static {
     type Reader: Send + 'static;
     /// A job's front end kept by the loop once the job is done with it ([`Writer::keep`]), for
     /// the next job of the same head to lower into ([`Steps::lower`]).
-    type KeptFront: Send + 'static;
+    type KeptFront: KeptDb;
     /// What the front keeps of a linked image ([`Image`]).
     type Linked: Kept;
     /// User code of a job run through the loop's driver ([`Runs`]).
@@ -506,6 +506,13 @@ pub struct Image<S: Steps> {
 }
 
 /// What a front keeps of a linked image.
+/// A job's front end as the loop keeps it ([`Steps::KeptFront`]).
+pub trait KeptDb: Send + 'static {
+    /// Its database, whose library parses the daemon's image stores
+    /// ([`base_db::trees::write_section`]); `None` for a front end with none.
+    fn db(&self) -> Option<&base_db::Db>;
+}
+
 pub trait Kept: Send + 'static {
     /// Its tables as the linker counts them: name, elements, bytes ([`Response::Tables`]).
     fn tables(&self) -> Vec<(&'static str, u64, u64)>;

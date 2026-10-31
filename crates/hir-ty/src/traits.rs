@@ -79,12 +79,7 @@ pub fn structurally_normalize_ty<'db>(
 ) -> Ty<'db> {
     let TyKind::Alias(..) = ty.kind() else { return ty };
     let mut ocx = ObligationCtxt::new(infcx);
-    let ty = ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty).unwrap_or_else(
-        |errors| {
-            tracing::debug!(?ty, ?errors, "structural normalization failed");
-            ty
-        },
-    );
+    let ty = ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty).unwrap_or(ty);
     ty.replace_infer_with_error(infcx.interner)
 }
 

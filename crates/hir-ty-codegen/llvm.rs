@@ -488,6 +488,9 @@ fn wrap<'ctx>(
         lower::entry_count(context, outer, weights.entered);
     }
     inner.set_linkage(Linkage::Internal);
+    // The outer function keeps `#[inline(never)]`'s `noinline`; the inner one is only ever
+    // built into it, and LLVM refuses a function marked both.
+    inner.remove_enum_attribute(AttributeLoc::Function, attribute_kind("noinline"));
     let always = attribute_kind("alwaysinline");
     inner.add_attribute(AttributeLoc::Function, context.create_enum_attribute(always, 0));
     let builder = context.create_builder();

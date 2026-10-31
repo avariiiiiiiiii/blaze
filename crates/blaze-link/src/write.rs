@@ -301,7 +301,7 @@ impl Column {
         for ((kind, sym), at) in wants.got.iter().zip(got) {
             column.cells_mut(*sym).got[*kind as usize] = at;
         }
-        wants.plt.retain(|it| column.slot(*it)[1] == IMPORT);
+        wants.plt.retain(|it| column.is_import(*it));
         for sym in wants.plt {
             column.cells_mut(sym).plt = resolver.plt(sym).unwrap_or(NONE);
         }
@@ -347,6 +347,12 @@ impl Column {
             WHY => Err(value as u32),
             _ => Err(u32::MAX),
         }
+    }
+
+    /// Whether the symbol is an import, its cells or none.
+    #[inline]
+    fn is_import(&self, sym: Sym) -> bool {
+        matches!(self.value(sym), Ok(Value::Import(_)))
     }
 
     #[inline]
@@ -611,7 +617,8 @@ impl Reloc<'_> {
                 Value::Import(at) if through_plt(fixup.apply, self.got_by_library, self.imports, at) => {
                     slid = true;
                     match self.column.cells(fixup.target).plt {
-                        NONE => return Err(fail(fixup, "no PLT stub".into())),
+                        // alloc: error path
+                        NONE => return Err(fail(fixup, format!("no PLT stub of {}", symbols.describe(fixup.target)))),
                         at => at,
                     }
                 }
@@ -1800,6 +1807,24 @@ mod tests {
 
     fn fixup(at: u64, apply: Apply) -> Fixup {
         Fixup { at, apply, target: Sym(0), addend: 0, minus: None }
+    }
+
+    /// An import called and also reached through a GOT cell (as every PLT stub's target is)
+    /// keeps its PLT stub: its cells index sits in the slot's high half, not its kind.
+    #[test]
+    fn an_import_with_cells_is_still_an_import() {
+        let (import, local) = (Sym(0), Sym(1));
+        let mut column = Column::sized(&[import, local], 2);
+        *column.slot_mut(import) = [4, IMPORT];
+        *column.slot_mut(local) = [0x1000, IMAGE];
+        assert!(column.is_import(import));
+        column.cells_mut(import).got[GotKind::Address as usize] = 0x2000;
+        column.cells_mut(local).got[GotKind::Address as usize] = 0x2008;
+        assert!(column.is_import(import), "a GOT cell keeps it an import");
+        assert!(!column.is_import(local));
+        column.cells_mut(import).plt = 0x3000;
+        let cells = column.cells(import);
+        assert_eq!((cells.plt, cells.got[GotKind::Address as usize]), (0x3000, 0x2000));
     }
 
     #[test]

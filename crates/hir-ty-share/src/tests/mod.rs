@@ -112,6 +112,13 @@ impl Pick for &'static Q { const F: fn(u32) -> u32 = plus_one; }
 impl Pick for &'static S { const F: fn(u32) -> u32 = plus_zero; }
 pub fn pick<T: Pick>(x: u32) -> u32 { (T::F)(x) }
 
+pub trait Out { type O; }
+impl Out for &'static P { type O = u32; }
+impl Out for &'static Q { type O = u64; }
+impl Out for &'static S { type O = u32; }
+pub struct Holds<T: Out> { pub f: fn(T::O) }
+pub fn holds<T: Out>(h: Holds<T>) -> Holds<T> { h }
+
 pub fn n<const N: usize>() -> usize { N }
 
 pub trait Show { fn show(&self) -> u32; }
@@ -359,6 +366,15 @@ fn a_function_pointer_constant_is_its_function() {
     let db = fixture();
     apart(&db, "pick", Ty("RefP"), Ty("RefQ"));
     same(&db, "pick", Ty("RefP"), Ty("RefS"));
+}
+
+/// A field's type is normalized all through once the ADT's arguments are in it: the
+/// projection in `fn(T::O)` is the type it names, as rustc has it before layout and codegen.
+#[test]
+fn a_projection_inside_a_field_is_the_type_it_names() {
+    let db = fixture();
+    apart(&db, "holds", Ty("RefP"), Ty("RefQ"));
+    same(&db, "holds", Ty("RefP"), Ty("RefS"));
 }
 
 #[test]

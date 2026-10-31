@@ -105,7 +105,7 @@ fn full() -> Template {
             relocation(Ref::Place(2), 0),
         ]
         .into(),
-        data: vec![TemplateData { align: 8, bytes: vec![9; 8], relocs: vec![relocation(Ref::Place(0), -8)].into() }],
+        data: vec![TemplateData { align: 8, bytes: vec![9; 8], relocs: vec![relocation(Ref::Place(0), -8)].into(), writable: false }],
         inlined: Vec::new(),
         side: Some(ContentId([6; 32])),
         unwind: Some(TemplateUnwind::Dwarf {
@@ -136,7 +136,7 @@ fn statics() -> [StaticTemplate; 2] {
     let bytes = StaticTemplate {
         align: 16,
         init: TemplateInit::Bytes { bytes: vec![0; 24], relocs: vec![reloc].into() },
-        data: vec![TemplateData { align: 1, bytes: b"hi".to_vec(), relocs: Relocs::new() }],
+        data: vec![TemplateData { align: 1, bytes: b"hi".to_vec(), relocs: Relocs::new(), writable: false }],
         mutable: true,
         thread_local: true,
         section: Some("__DATA,__mod_init_func".to_owned()),

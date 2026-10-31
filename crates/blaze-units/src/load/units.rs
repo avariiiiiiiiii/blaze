@@ -14,7 +14,8 @@ use blaze_manifest::{Context, Workspace};
 use blaze_query::Cancelled;
 use blaze_resolve::resolver::{CompileKind, FeatureOpts, FeatureResolver, ForceAllTargets, HasDevUnits, PackageTargets};
 use blaze_resolve::{Cfg, InternedString, PackageId, Platform};
-use cargo_util_schemas::manifest::{ProfileName, TomlProfile, TomlProfiles};
+use cargo_util_schemas::core::PartialVersion;
+use cargo_util_schemas::manifest::{ProfileName, RustVersion, TomlProfile, TomlProfiles};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::files::Snap;
@@ -172,6 +173,11 @@ pub(crate) fn units(
     };
     if let Some(error) = artifact_refusal(&graph, &packages_by_spec, &resolved) {
         return Ok(Staged::Failed(error));
+    }
+    if spec.honor_rust_version
+        && let Err(error) = rust_version_refusal(&graph, &packages_by_spec, &spec.rustc_version)
+    {
+        return Ok(fail(error));
     }
     if spec.run {
         if let Err(error) = run_one(&graph, &filter) {
@@ -564,6 +570,47 @@ fn artifact_refusal(graph: &schema::UnitGraph, packages: &BySpec<'_>, resolved: 
         }
     }
     None
+}
+
+/// cargo's check in `create_bcx` that rustc meets the `rust-version` of each unit's package,
+/// a nightly counting as its release: a line for each unit that it doesn't, by package.
+fn rust_version_refusal(graph: &schema::UnitGraph, packages: &BySpec<'_>, rustc: &str) -> anyhow::Result<()> {
+    let release = rustc.split(' ').next().unwrap_or(rustc);
+    let rustc_version: PartialVersion = semver::Version::parse(release)
+        .with_context(|| format!("blaze's rustc version `{rustc}` is not a version"))?
+        .into();
+    let mut incompatible: Vec<(PackageId, &RustVersion)> = Vec::new();
+    let mut local_incompatible = false;
+    for unit in &graph.units {
+        let Some((id, package)) = packages.get(&unit.pkg_id) else {
+            anyhow::bail!("a unit of `{}` has no package in the resolve", unit.pkg_id);
+        };
+        let Some(msrv) = &package.manifest.metadata.rust_version else { continue };
+        if msrv.is_compatible_with(&rustc_version) {
+            continue;
+        }
+        local_incompatible |= id.source_id().is_path();
+        incompatible.push((*id, msrv));
+    }
+    if incompatible.is_empty() {
+        return Ok(());
+    }
+    use std::fmt::Write as _;
+    let plural = if incompatible.len() == 1 { "" } else { "s" };
+    let mut message = format!("rustc {rustc_version} is not supported by the following package{plural}:\n");
+    incompatible.sort_by(|a, b| (a.0.name().as_str(), a.0.version()).cmp(&(b.0.name().as_str(), b.0.version())));
+    for (id, msrv) in incompatible {
+        _ = writeln!(message, "  {}@{} requires rustc {msrv}", id.name(), id.version());
+    }
+    if !local_incompatible {
+        _ = writeln!(
+            message,
+            "Either upgrade rustc or select compatible dependency versions with
+`cargo update <name>@<current-ver> --precise <compatible-ver>`
+where `<compatible-ver>` is the latest version supporting rustc {rustc_version}",
+        );
+    }
+    Err(anyhow::Error::msg(message))
 }
 
 fn unit_name(unit: &Unit) -> String {

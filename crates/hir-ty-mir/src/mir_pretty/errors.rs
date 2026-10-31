@@ -198,6 +198,20 @@ impl MirEvalError<'_> {
                 }
                 writeln!(f, " (raise {} under `[workspace.metadata.blaze]`)", spent.setting())?;
             }
+            MirEvalError::LongRunning { at } => {
+                f.write_str("constant evaluation is taking a long time")?;
+                if let Some((owner, span)) = at
+                    && let Some((file_id, range)) = source_range(db, *owner, *span)
+                {
+                    write!(f, " at {}", span_formatter(file_id, range))?;
+                }
+                writeln!(
+                    f,
+                    "\nnote: this lint makes sure the compiler doesn't get stuck due to infinite loops in \
+                     const eval.\n    If your compilation actually takes a long time, you can safely \
+                     allow the lint"
+                )?;
+            }
             MirEvalError::UndefinedBehavior(_)
             | MirEvalError::TargetDataLayoutNotAvailable(_)
             | MirEvalError::Panic(_)

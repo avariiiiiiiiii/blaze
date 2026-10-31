@@ -394,6 +394,8 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
 
     let order = crates::topological(units, &whats, &const_plan.after)?;
     let mut all = Vec::with_capacity(order.len());
+    // alloc: once a lowering, the crates made by their root file, for the units after to share.
+    let mut made: FxHashMap<FileId, Vec<Made>> = FxHashMap::default();
     let mut const_listed = Vec::new();
     let mut const_made = Vec::new();
     for index in order {
@@ -500,12 +502,38 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
             potential_cfg_options: None,
         };
         let env: Env = plan.env.iter().cloned().collect();
-        let krate = Crate::create(&mut db, data, extra, workspace, cfg.clone(), env, durability);
+        let runs: Vec<usize> = unit
+            .dependencies
+            .iter()
+            .filter(|dep| units.graph.units[dep.index].mode == Mode::RunCustomBuild)
+            .map(|dep| dep.index)
+            .collect();
+        // Units cargo keeps apart for what the front end does not read (a profile's opt-level
+        // or debuginfo) are one crate: two crates of one key would name each other's items.
+        let made_of_root = made.entry(root_file).or_default();
+        let same = made_of_root.iter().find(|it| {
+            it.data == data
+                && it.extra == extra
+                && Arc::ptr_eq(&it.workspace, &workspace)
+                && it.cfg == cfg
+                && it.env == env
+                && it.durability == durability
+                && it.runs == runs
+        });
+        let krate = match same {
+            Some(it) => it.krate,
+            None => {
+                // clone: once per crate made, kept to compare the units after with
+                let krate = Crate::create(&mut db, data.clone(), extra.clone(), workspace.clone(), cfg.clone(), env.clone(), durability);
+                made_of_root.push(Made { data, extra, workspace, cfg: cfg.clone(), env, durability, runs, krate });
+                all.push(krate);
+                krate
+            }
+        };
         let lowering = &mut lowerings[index];
         lowering.krate = Some(krate);
         lowering.cfg = cfg;
         lowering.env = plan.env.clone();
-        all.push(krate);
     }
     base_db::set_all_crates_with_durability(&mut db, all, Durability::MEDIUM);
 
@@ -535,6 +563,19 @@ pub fn lower_into<T: blaze_query::Tree>(db: Db, lower: Lower<'_, T>) -> Result<L
         workspace_root,
         const_macros: const_made,
     })
+}
+
+/// What a crate of [`lower_into`] was made of, and the build scripts' runs its unit is given:
+/// a later unit of all the same is lowered to it.
+struct Made {
+    data: base_db::BuiltCrateData,
+    extra: base_db::ExtraCrateData,
+    workspace: Arc<CrateWorkspaceData>,
+    cfg: CfgOptions,
+    env: Env,
+    durability: Durability,
+    runs: Vec<usize>,
+    krate: Crate,
 }
 
 impl Lowered {
@@ -660,6 +701,7 @@ impl Lowered {
         let mut loaded = Vec::new();
         let mut removed = false;
         let (loads, paths) = (&mut self.loads, &mut self.paths);
+        self.db.admit_parses();
         self.db.batch(|db| {
             for load in loads.iter_mut() {
                 if !load.view {

@@ -33,7 +33,7 @@ use super::{
 };
 
 /// Why a function is not const-pure.
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
 pub struct Impure {
     /// What the function that does it does, said of it: "reads or writes mutable state:
     /// `CALLS` is `AtomicU64`, which is not `Freeze`".

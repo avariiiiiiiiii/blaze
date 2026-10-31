@@ -16,16 +16,12 @@ fn serde() -> Origin {
 }
 
 fn rule() -> Rule {
-    Rule {
-        toolchain: TOOLCHAIN,
-        systems: Vec::new(),
-        roots: vec![
-            Root { path: "/reg/serde-1.0.219".into(), origin: serde() },
-            Root { path: "/work".into(), origin: Origin::Workspace },
-            Root { path: "/work/target/debug/build".into(), origin: Origin::Outputs },
-        ],
-        public_env: Vec::new(),
-    }
+    let roots = vec![
+        Root { path: "/reg/serde-1.0.219".into(), origin: serde() },
+        Root { path: "/work".into(), origin: Origin::Workspace },
+        Root { path: "/work/target/debug/build".into(), origin: Origin::Outputs },
+    ];
+    Rule::new(TOOLCHAIN, ContentId([11; 32]), Vec::new(), roots, Vec::new())
 }
 
 fn given(manifest_dir: &str) -> Given {

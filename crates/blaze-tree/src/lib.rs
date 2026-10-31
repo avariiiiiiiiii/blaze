@@ -1,7 +1,6 @@
 //! `cargo tree`, made by blaze with no cargo: `src/ops/cargo_tree/` of cargo 1.101.0
 //! (cad07cf8e5), on the workspace blaze-metadata resolves and blaze-resolve's feature
-//! resolver. It prints what cargo prints, line for line; `harness/own_tree.py` holds it to
-//! that. [`query::Tree`] is the same over the database's load (blaze-units' `load`).
+//! resolver. It prints what cargo prints, line for line. [`query::Tree`] is the same over the database's load (blaze-units' `load`).
 //!
 //! The work after the feature resolve is O(packages + edges + output bytes): packages are
 //! interned once to dense indexes ([`packages::Table`]), the graph is columns of `u32`s with

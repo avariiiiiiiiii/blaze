@@ -404,6 +404,34 @@ fn a_member_inherits_the_workspaces_package_table() {
     assert_eq!(units.packages.iter().find(|it| it.name == "a").map(|it| it.version.as_str()), Some("1.2.3"));
 }
 
+/// cargo's `rust-version` check: a package newer than blaze's Rust is refused naming it, a
+/// nightly meets its own release, and `--ignore-rust-version` builds it anyway.
+#[test]
+fn a_package_needing_a_newer_rust_is_refused_unless_ignored() {
+    let fixture = Fixture::new();
+    let rustc = crate::stdlib::target::rustc_version();
+    let release = semver::Version::parse(rustc.split(' ').next().unwrap()).unwrap();
+    let needs = |version: &str| format!("{A}rust-version = \"{version}\"\n");
+    let newer = needs(&format!("{}.{}", release.major, release.minor + 1));
+    let files = [("ws/Cargo.toml", newer.as_str()), ("ws/src/lib.rs", "")];
+    let error = failed(fixture.plan(fixture.open(&ask(&files))));
+    let rustc_release = rustc.split(' ').next().unwrap();
+    let want = format!(
+        "rustc {rustc_release} is not supported by the following package:\n  a@0.1.0 requires rustc {}.{}\n",
+        release.major,
+        release.minor + 1
+    );
+    assert!(error.starts_with(&want), "{error}");
+    assert!(!error.contains("cargo update"), "a member's own rust-version gets no hint to update: {error}");
+
+    let ignored = Ask { args: &["--ignore-rust-version"], ..ask(&files) };
+    ready(fixture.plan(fixture.open(&ignored)));
+
+    let ours = needs(&format!("{}.{}.{}", release.major, release.minor, release.patch));
+    let files = [("ws/Cargo.toml", ours.as_str()), ("ws/src/lib.rs", "")];
+    ready(fixture.plan(fixture.open(&ask(&files))));
+}
+
 fn with_serde() -> String {
     format!("{A}\n[dependencies]\nserde = \"1\"\n")
 }

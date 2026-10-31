@@ -595,7 +595,7 @@ LL | async gen fn async_gen_foo() {}
 error: aborting due to 3 previous errors
 
 "#;
-    assert_eq!(ui("invalid.rs", "2024", source), stderr);
+    assert_eq!(ui_core("invalid.rs", "2024", "future", source), stderr);
 }
 
 #[test]

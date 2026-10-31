@@ -6,6 +6,7 @@
 #![deny(unsafe_code)]
 
 mod as_rustc;
+mod huge;
 mod pin;
 mod program;
 mod versions;

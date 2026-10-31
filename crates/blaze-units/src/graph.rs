@@ -1705,7 +1705,7 @@ impl<'r, 'a> State<'r, 'a> {
 /// depend on are ordered by cargo's `dep_hash`, which hashes where its interned
 /// dependencies happen to be in memory, so cargo prints them in either order from one run
 /// to the next. blaze orders them by their dependencies, compared the same way, which is
-/// one of cargo's orders; `harness/resolve.py units` accepts either.
+/// one of cargo's orders.
 fn cmp_shared(sh: &Shared, key: &[u128], names: &Names, a: u32, b: u32) -> Ordering {
     if a == b {
         return Ordering::Equal;

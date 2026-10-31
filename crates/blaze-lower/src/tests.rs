@@ -291,6 +291,25 @@ fn every_unit_that_compiles_is_a_crate() {
 }
 
 #[test]
+fn units_apart_only_in_what_the_front_end_does_not_read_are_one_crate() {
+    let mut units = units();
+    // The build script again at another opt-level, as cargo keeps a host unit whose debuginfo
+    // it weakened apart from one it did not: one crate.
+    let mut optimized = units.graph.units[BUILD_SCRIPT].clone();
+    optimized.profile.opt_level = "3".to_owned();
+    units.graph.units.push(optimized);
+    units.plans.push(units.plans[BUILD_SCRIPT].clone());
+    // Again with a feature: a cfg the front end reads, so another crate.
+    units.graph.units.push(units.graph.units[BUILD_SCRIPT].clone());
+    units.plans.push(plan(&["feature=\"extra\""], &[], None));
+    let (optimized, featured) = (units.graph.units.len() - 2, units.graph.units.len() - 1);
+    let built = lowered(&units).unwrap();
+    assert_eq!(krate(&built, optimized), krate(&built, BUILD_SCRIPT));
+    assert_ne!(krate(&built, featured), krate(&built, BUILD_SCRIPT));
+    assert_eq!(base_db::all_crates(built.lowered.db()).len(), 7);
+}
+
+#[test]
 fn deps_are_by_extern_name_in_the_units_order() {
     let built = lowered(&units()).unwrap();
     let db = built.lowered.db();
@@ -846,6 +865,45 @@ fn two_spans_of_one_file_join_to_the_span_covering_both() {
     );
 }
 
+/// A server's numbers that name nothing of the build are a refusal naming the field, never a
+/// panic: the server is user code.
+#[test]
+fn a_question_naming_nothing_of_the_build_is_refused() {
+    use super::{SubRequest, SubResponse, answer};
+
+    let built = lowered(&units()).unwrap();
+    let db = built.lowered.db();
+    let (raw, file_id, ast_id, ctx) = bin_span(&built);
+    let refused = |req: SubRequest, field: &str| match answer(db, req) {
+        SubResponse::Cancel { reason } => assert!(reason.contains(field), "{field}: {reason}"),
+        other => panic!("{field}: answered {other:?}"),
+    };
+    refused(SubRequest::FilePath { file_id: u32::MAX }, "file_id");
+    refused(SubRequest::LocalFilePath { file_id: raw + 1000 }, "file_id");
+    refused(SubRequest::SourceText { file_id: file_id | 0x8000_0000, ast_id, start: 0, end: 1 }, "reserved");
+    refused(SubRequest::SourceText { file_id: file_id | 0x7F80_0000, ast_id, start: 0, end: 1 }, "edition");
+    refused(SubRequest::ByteRange { file_id, ast_id, start: 7, end: 3 }, "range");
+    refused(SubRequest::ByteRange { file_id, ast_id: 1_000_000, start: 0, end: 1 }, "ast_id");
+    refused(SubRequest::LineColumn { file_id, ast_id, offset: 1_000_000 }, "offset");
+    refused(SubRequest::SpanSource { file_id, ast_id, start: 0, end: 1, ctx: u32::MAX }, "ctx");
+    let unowned = blaze_query::db::Id::MAX_U32 - 2;
+    refused(SubRequest::SpanParent { file_id, ast_id, start: 0, end: 1, ctx: unowned }, "ctx");
+    refused(
+        SubRequest::SpanJoin {
+            file_id,
+            ast_id_first: ast_id,
+            start_first: 0,
+            end_first: 2,
+            ctx_first: ctx,
+            ast_id_second: ast_id,
+            start_second: 17,
+            end_second: 12,
+            ctx_second: ctx,
+        },
+        "range",
+    );
+}
+
 #[test]
 fn a_cycle_of_units_is_refused() {
     let mut units = units();
@@ -1010,7 +1068,7 @@ fn a_derived_method_has_a_body() {
     let db = lowered.db();
     let core = lowered.krate(CORE).expect("core is a crate");
     let def_map = hir_def::nameres::crate_def_map(db, core);
-    let scope = def_map.crate_root(db).scope(db);
+    let scope = def_map.module(db, def_map.crate_root(db)).scope(db);
     assert_eq!(scope.builtin_derive_impls().len(), 0, "a derive only recorded");
     let bodies: Vec<&str> = scope
         .impls()

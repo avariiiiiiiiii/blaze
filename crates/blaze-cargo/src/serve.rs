@@ -226,7 +226,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
     plane::record_panics();
     let steps = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
-    let runner = plane::Runner::Threads(plane::Threads::new(options.io));
+    let runner = plane::Runner::Threads(plane::Threads::new(options.io, options.threads));
     let driver = blaze_core::native(std::path::Path::new("/"), threads)
         .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
     let driver = driver

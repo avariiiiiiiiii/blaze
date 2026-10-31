@@ -33,7 +33,7 @@ pub enum Relocation {
 
 /// How the program is built, for a function's settings: the toolchain and target, the same
 /// for every function of a build.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: setup, once per plan and per unit's settings
 pub struct Toolchain {
     /// The pinned nightly's and blaze's own code identity (`harness/toolchain` and the
     /// codegen producer): another blaze is other code.

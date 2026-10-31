@@ -1678,6 +1678,18 @@ fn refused_const_eval(
                     spent.setting()
                 )));
             }
+            MirEvalError::LongRunning { at } => {
+                let at = at
+                    .and_then(|(owner, span)| fncache::location(db, owner, span))
+                    // alloc: the error's message
+                    .map(|it| format!(" at {it}"))
+                    .unwrap_or_default();
+                // alloc: the error's message
+                return Some(CodegenError::Refused(format!(
+                    "the evaluation of {what}{at}: constant evaluation is taking a long time \
+                     (`long_running_const_eval` is denied there; `#[allow]` it to go on)"
+                )));
+            }
             MirEvalError::HeapInValue { .. } => {
                 // alloc: the error's message
                 return Some(CodegenError::Refused(format!("the value of {what}: {e:?}")));
@@ -2230,7 +2242,7 @@ fn build<'db>(
             body,
             env,
             dl,
-            infcx: interner.infer_ctxt().build(TypingMode::PostAnalysis),
+            infcx: interner.infer_ctxt().build(TypingMode::Codegen),
             interner,
             builder: FunctionBuilder::new(&mut ctx.func, &mut builder_ctx),
             locals: FrameMap::with_capacity_in(body.map_or(0, |it| it.locals.len()), frame),

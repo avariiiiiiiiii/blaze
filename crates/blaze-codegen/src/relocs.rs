@@ -77,7 +77,7 @@ pub struct Relocation<T = Target> {
 }
 
 /// The relocations of one function, data object or static value.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: inside `CompiledFunction` and `Static`; a build makes tables in place, tests copy them
 #[serde(
     try_from = "Parts<T>",
     bound(serialize = "T: Serialize", deserialize = "T: Deserialize<'de> + Eq + Hash")
@@ -661,5 +661,32 @@ mod tests {
                 Err("a relocation target listed twice")
             );
         });
+    }
+
+    /// Reading a table, relocation by relocation, and checking stored parts as a view of it
+    /// allocate nothing once the thread's frames are warm.
+    #[test]
+    fn reading_relocations_allocates_nothing() {
+        let table: Relocs = (0..64u32)
+            .map(|at| reloc(at * 4, call((at % 5) as u8), if at % 7 == 0 { 1 << 40 } else { -4 }))
+            .collect();
+        let (rows, targets, wide) = table.clone().into_parts();
+        let read = || {
+            let mut sum = 0i64;
+            for it in &table {
+                sum = sum.wrapping_add(it.addend).wrapping_add(i64::from(it.at));
+            }
+            for row in 0..table.len() {
+                let it = table.get(row).expect("a row");
+                sum = sum.wrapping_add(it.addend ^ table.addend(row));
+            }
+            let view = frame::task(Tag::Codegen, |frame| {
+                RelocsView::from_parts(&rows, &targets, &wide, frame).map(|it| it.iter().count())
+            });
+            (sum, view)
+        };
+        let cold = read();
+        assert_eq!(blaze_alloc_count::assert_at_most(0, "reading relocations", read), cold);
+        assert_eq!(cold.1, Ok(table.len()));
     }
 }

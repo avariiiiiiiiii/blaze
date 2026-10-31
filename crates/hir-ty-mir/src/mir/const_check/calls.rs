@@ -41,6 +41,8 @@ enum Source {
     Overloaded,
     /// A desugaring's call, `from_hir_call` as the call it is.
     Desugared(Desugaring),
+    /// A constant pattern's comparison, `from_hir_call` false.
+    MatchCmp,
 }
 
 impl<'db> Checker<'_, 'db> {
@@ -70,23 +72,7 @@ impl<'db> Checker<'_, 'db> {
         let db = self.db;
 
         if let ItemContainerId::TraitId(trait_) = callee.lookup(db).container {
-            // A method of a trait: what the impl is is not known here. rustc calls it
-            // conditionally const only when the trait is const and its conditions hold.
-            let holds = trait_is_const(db, trait_).then(|| self.conditions_hold(callee, fn_args));
-            match holds {
-                Some(true) => {
-                    let kind = self.call_error(callee, fn_args, destination, source, true);
-                    self.check_op(kind, Status::conditionally_const(), span);
-                    self.check_callee_stability(Item::Trait(trait_), expr, span);
-                }
-                // typeck's `E0277` of a `[const]` bound that does not hold; a closure's call is
-                // left to this check (`DeferredCallResolution` doesn't enforce constness).
-                Some(false) if !is_closure(fn_args.type_at(0)) => self.tainted = true,
-                _ => {
-                    let kind = self.call_error(callee, fn_args, destination, source, false);
-                    self.check_op(kind, Status::Forbidden, span);
-                }
-            }
+            self.check_trait_call(trait_, callee, fn_args, destination, source, span);
             return;
         }
 
@@ -139,7 +125,7 @@ impl<'db> Checker<'_, 'db> {
                 self.check_op(kind, Status::Forbidden, span);
                 return;
             }
-            self.check_intrinsic_stability(callee, name, expr, span);
+            self.check_intrinsic_stability(callee, name, span);
             return;
         }
 
@@ -148,7 +134,51 @@ impl<'db> Checker<'_, 'db> {
             self.check_op(kind, Status::Forbidden, span);
             return;
         }
-        self.check_callee_stability(Item::Fn(callee), expr, span);
+        self.check_callee_stability(Item::Fn(callee), span);
+    }
+
+    /// The call of `callee`, a method of `trait_`: what the impl is is not known here. rustc
+    /// calls it conditionally const only when the trait is const and its conditions hold.
+    fn check_trait_call(
+        &mut self,
+        trait_: TraitId,
+        callee: FunctionId,
+        fn_args: GenericArgs<'db>,
+        destination: Option<&StoredPlace>,
+        source: Source,
+        span: MirSpan,
+    ) {
+        let holds = trait_is_const(self.db, trait_).then(|| self.conditions_hold(callee, fn_args));
+        match holds {
+            Some(true) => {
+                let kind = self.call_error(callee, fn_args, destination, source, true);
+                self.check_op(kind, Status::conditionally_const(), span);
+                self.check_callee_stability(Item::Trait(trait_), span);
+            }
+            // typeck's `E0277` of a `[const]` bound that does not hold; a closure's call is
+            // left to this check (`DeferredCallResolution` doesn't enforce constness).
+            Some(false) if !is_closure(fn_args.type_at(0)) => self.tainted = true,
+            _ => {
+                let kind = self.call_error(callee, fn_args, destination, source, false);
+                self.check_op(kind, Status::Forbidden, span);
+            }
+        }
+    }
+
+    /// The comparison of a constant pattern of `pattern`, lowered as a `BinOp::Eq` of an operand
+    /// of type `ty`. rustc's MIR building compares a scalar with `BinOp::Eq` too, and a `&str`
+    /// (the one other type a constant pattern compares) with a call of `<str as
+    /// PartialEq>::eq`, `CallSource::MatchCmp` (`string_compare`), which is checked here.
+    pub(super) fn check_match_cmp(&mut self, ty: TyKind<'db>, pattern: MirSpan) {
+        let TyKind::Ref(_, pointee, _) = ty else { return };
+        if !matches!(pointee.kind(), TyKind::Str) {
+            return;
+        }
+        let (Some(trait_), Some(callee)) = (self.lang.PartialEq, self.lang.PartialEq_eq) else {
+            return;
+        };
+        let fn_args = GenericArgs::new_from_slice(&[pointee.into(), pointee.into()]);
+        self.check_trait_call(trait_, callee, fn_args, None, Source::MatchCmp, pattern);
     }
 
     /// How the source makes the call of `callee` lowered from `expr`, or `None` for a call
@@ -171,6 +201,9 @@ impl<'db> Checker<'_, 'db> {
                 }
             }
             Expr::MethodCall { .. } if resolved() => return Some(Source::Call),
+            // rustc's `call_kind`: a call whose span is the `.await` desugaring's, whatever it
+            // calls.
+            Expr::Await { .. } => return Some(Source::Desugared(Desugaring::Await)),
             Expr::BinaryOp { .. }
             | Expr::UnaryOp { op: UnaryOp::Not | UnaryOp::Neg, .. }
             | Expr::Index { .. }
@@ -230,7 +263,7 @@ impl<'db> Checker<'_, 'db> {
             }
             _ => None,
         };
-        let from_hir_call = source != Source::Overloaded;
+        let from_hir_call = !matches!(source, Source::Overloaded | Source::MatchCmp);
         let self_ty = || fn_args.type_at(0);
         if let Some(trait_) = trait_
             && [lang.Fn, lang.FnMut, lang.FnOnce].contains(&Some(trait_))
@@ -247,6 +280,9 @@ impl<'db> Checker<'_, 'db> {
             && let Some(trait_) = trait_
             && self.is_operator(trait_)
         {
+            if source == Source::MatchCmp {
+                return ConstCheckKind::NonConstMatchEq { ty: self_ty().store(), conditionally };
+            }
             let derefs = match lang.PartialEq == Some(trait_) {
                 true => consider_dereferencing(fn_args),
                 false => None,
@@ -312,7 +348,6 @@ impl<'db> Checker<'_, 'db> {
         &mut self,
         callee: FunctionId,
         name: impl Fn() -> String,
-        expr: ExprId,
         span: MirSpan,
     ) {
         let db = self.db;
@@ -332,7 +367,7 @@ impl<'db> Checker<'_, 'db> {
             Some(stability::ConstStability {
                 level: stability::Level::Unstable { feature, .. }, ..
             }) => {
-                if const_stable_indirect && stability::allows_unstable(db, self.def, expr, feature) {
+                if const_stable_indirect && stability::allows_unstable(db, self.def, span, feature) {
                     return;
                 }
                 // clone: a `Symbol`, a count bumped
@@ -351,7 +386,7 @@ impl<'db> Checker<'_, 'db> {
     }
 
     /// rustc's `check_callee_stability` of a function or a trait.
-    pub(super) fn check_callee_stability(&mut self, item: Item, expr: ExprId, span: MirSpan) {
+    pub(super) fn check_callee_stability(&mut self, item: Item, span: MirSpan) {
         let (db, krate) = (self.db, self.krate);
         let path = || match item {
             Item::Fn(func) => described(db, krate, func, GenericArgs::new_from_slice(&[])).1,
@@ -382,7 +417,7 @@ impl<'db> Checker<'_, 'db> {
             }) => {
                 let safe_to_expose = stability::safe_to_expose(db, item, self.krate);
                 let allows = |feature: &intern::Symbol| {
-                    stability::allows_unstable(db, self.def, expr, feature)
+                    stability::allows_unstable(db, self.def, span, feature)
                 };
                 if (allows(feature) || implied_by.as_ref().is_some_and(allows)) && safe_to_expose {
                     return;

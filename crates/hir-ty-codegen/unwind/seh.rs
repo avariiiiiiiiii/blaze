@@ -103,7 +103,7 @@ const INLINE_OBJECT: u32 = 256;
 const MEM: MemFlagsData = MemFlagsData::new().with_notrap();
 
 /// A function's `UNWIND_INFO` without a handler, and how long its code is.
-#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(super) struct Frame {
     pub(super) len: u32,
     pub(super) info: Vec<u8>,

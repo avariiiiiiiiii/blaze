@@ -6,7 +6,7 @@ use hir_expand::fixture;
 use super::*;
 use crate::{
     AdtId, ModuleDefId,
-    test_db::TestDBExt,
+    test_db::{TestDB, TestDBExt},
     test_items::{declarations, impls},
 };
 
@@ -67,19 +67,26 @@ pub type A<T> = (T, T);
 
 /// A miss of `EnumVariants::of`, its syntax warm, allocates its map's two tables and nothing
 /// else: the variants gathered in the frame, no diagnostics, the bits inline. `Some` and `None`
-/// are predefined symbols, so naming them interns nothing.
+/// are predefined symbols, so naming them interns nothing. The miss measured is the second:
+/// the first makes the storage's tables, and interns the variants, which a whitespace edit of
+/// the enum leaves as they were.
 #[test]
 fn enum_variants_miss_is_its_map() {
     let fx = fixture::db("pub enum E { Some, None }");
-    let _ = fx.only_file();
-    let db = fx.into_db();
-    let e = declarations(&db, db.fetch_test_crate())
-        .into_iter()
-        .find_map(|it| match it {
-            ModuleDefId::AdtId(AdtId::EnumId(it)) => Some(it),
-            _ => None,
-        })
-        .expect("the fixture has an enum");
+    let file = fx.only_file();
+    let mut db = fx.into_db();
+    let enum_of = |db: &TestDB| {
+        declarations(db, db.fetch_test_crate())
+            .into_iter()
+            .find_map(|it| match it {
+                ModuleDefId::AdtId(AdtId::EnumId(it)) => Some(it),
+                _ => None,
+            })
+            .expect("the fixture has an enum")
+    };
+    let _ = EnumVariants::of(&db, enum_of(&db));
+    db.set_file_text(file.file_id(&db), "pub enum E { Some,  None }");
+    let e = enum_of(&db);
     let _ = variants_syntax(&db, e);
     let _ = AttrFlags::query(&db, e.into());
     let len = blaze_alloc_count::assert_at_most(2, "an enum-variants miss", || {

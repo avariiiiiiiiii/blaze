@@ -523,6 +523,10 @@ fn generate(job: &Job, reader: &UnitReader, unit: usize, slot: &Mutex<Phases>) -
         let generated = codegen::generate(job, reader, unit, &makes, &job.mounted, checks);
         (makes, generated)
     });
+    // Its build may have stopped for the cancel, with an error that is not the unit's.
+    if job.cancelled() {
+        return Err(Failed::Again);
+    }
     lock(slot).generated = Some(generated);
     Ok(())
 }
@@ -676,7 +680,7 @@ fn macros(job: &Job, reader: &UnitReader, unit: usize, ok: bool) -> Option<ProcM
 pub(crate) fn unit_lint_flags(job: &Job, unit: usize) -> Result<Vec<String>, ApiError> {
     let u = job.unit(unit)?;
     let package = job.package(u)?;
-    Ok(lint_flags(u, job.plan(unit)?, local(package.source.as_deref())))
+    Ok(lint_flags(u, job.plan(unit)?, local(package.source.as_deref()), job.input.verbose > 1))
 }
 
 pub(crate) use blaze_lower::{lint_flags, local};
@@ -703,7 +707,7 @@ fn crate_of(job: &Job, unit: usize, u: &Unit) -> Result<base_db::Crate, ApiError
 /// name no lint blaze has, whether or not a check runs.
 fn options(job: &Job, unit: usize, u: &Unit) -> Result<(Vec<String>, Options), ApiError> {
     let package = job.package(u)?;
-    let flags = lint_flags(u, job.plan(unit)?, local(package.source.as_deref()));
+    let flags = lint_flags(u, job.plan(unit)?, local(package.source.as_deref()), job.input.verbose > 1);
     let mut lints = CommandLine::parse(&flags)
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
     // Every crate blaze builds is built as cargo builds it, with `CARGO_CRATE_NAME` set.

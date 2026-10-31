@@ -267,6 +267,43 @@ fn instances_with_one_share_key_are_one() {
     });
 }
 
+/// A function `#[blaze::cache]` made, with `deep` its closure reaches: `{deep}` is its body.
+fn cached_fixture(deep: &str) -> String {
+    format!(
+        r#"
+//- minicore: sized, fn
+pub struct Code {{ hash: [u64; 2], name: &'static str }}
+pub fn __blaze_cache_code<F>(_: &F) -> Code {{ loop {{}} }}
+pub fn deep(x: u32) -> u32 {{ {deep} }}
+pub fn cached(x: u32) -> u32 {{
+    let body = move || deep(x);
+    let _code = __blaze_cache_code(&body);
+    body()
+}}
+"#
+    )
+}
+
+/// A cached function writes the hash of all its closure reaches into its own code, so an
+/// edit of a function the closure reaches, which leaves the cached function's body, its
+/// closure's and every interface as they were, still changes the cached function's code.
+#[test]
+fn a_cached_function_is_new_code_when_what_its_closure_reaches_is() {
+    use blaze_codegen::backend::Frontend as _;
+    let code = |deep: &str| {
+        let (db, frontend) = frontend(&cached_fixture(deep));
+        hir_ty::attach_db(db, || {
+            let root = frontend.root(function(db, "cached"));
+            let origin = frontend.with(|hir, _| frontend.origin(hir, fixture::test_crate(&db)));
+            let described = (frontend.describe(&root, &origin))
+                .unwrap_or_else(|e| panic!("{root:?}: {}", e.what));
+            described.code
+        })
+    };
+    assert_eq!(code("x ^ 1"), code("x ^ 1"));
+    assert_ne!(code("x ^ 1"), code("x ^ 2"));
+}
+
 /// A generic is shared under every options a unit of its origin builds a body with: the
 /// first spec's, the LLVM spec a live build tiers it up to, the LLVM tier of a tiered run,
 /// and UB checks where its crate has debug assertions. The library's bodies are at level 2,

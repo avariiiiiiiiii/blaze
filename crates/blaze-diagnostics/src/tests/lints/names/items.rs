@@ -4,7 +4,7 @@
 use crate::{
     Options,
     emit::Style,
-    tests::{Mode, checked, checked_with, compiletest, normalized, ui},
+    tests::{Mode, checked, checked_with, compiletest, items::ui_core, normalized, ui},
 };
 
 /// The UI test `items/<name>` against its `.stderr`, as compiletest runs it.
@@ -434,7 +434,7 @@ LL | async fn bar_track_caller() {}
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui("track-caller.rs", "2021", source), expected);
+    assert_eq!(ui_core("track-caller.rs", "2021", "future", source), expected);
 }
 
 /// Methods are linted too; a function that is not `async`, a required trait method and a
@@ -456,10 +456,10 @@ trait Tr {
 fn not_async() {}
 fn main() {}
 "#;
-    let fixture = format!("//- /main.rs crate:other:main edition:2021\n{source}");
+    let fixture = format!("//- minicore: future\n//- /main.rs crate:other:main edition:2021\n{source}");
     let messages = checked(&fixture).messages();
     assert_eq!(messages, ["`#[track_caller]` on async functions is a no-op"], "{messages:?}");
-    let gated = format!("//- /main.rs crate:other:main edition:2021\n#![feature(async_fn_track_caller)]\n{source}");
+    let gated = format!("//- minicore: future\n//- /main.rs crate:other:main edition:2021\n#![feature(async_fn_track_caller)]\n{source}");
     let messages = checked(&gated).messages();
     assert!(!messages.iter().any(|it| it.contains("no-op")), "{messages:?}");
 }

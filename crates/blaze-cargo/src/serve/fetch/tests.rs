@@ -161,6 +161,27 @@ fn a_crate_of_another_sha256_is_refused_naming_both() {
 }
 
 #[test]
+fn a_local_registrys_crate_is_read_in_place_and_checked() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = tarball(&[Entry::File("serde-1.0.219/Cargo.toml", b"[package]\n", 0o644)]);
+    let at = dir.path().join("serde-1.0.219.crate");
+    std::fs::write(&at, &bytes).unwrap();
+    let local = |sha256: &str| Fetch { url: format!("file://{}", at.display()), ..crate_fetch(sha256) };
+    let fake = Fake::new(Vec::new());
+    let source = fetcher(&fake).fetch(&local(&blaze_registry::download::checksum(&bytes))).unwrap();
+    assert_eq!(
+        source.files,
+        vec![file(".cargo-ok", br#"{"v":1}"#, Mode::Regular), file("Cargo.toml", b"[package]\n", Mode::Regular)]
+    );
+    let error = fetcher(&fake).fetch(&local(&"ab".repeat(32))).unwrap_err();
+    assert!(error.what.starts_with("failed to verify the checksum of `serde v1.0.219`"), "{}", error.what);
+    std::fs::remove_file(&at).unwrap();
+    let error = fetcher(&fake).fetch(&local(&"ab".repeat(32))).unwrap_err();
+    assert!(error.what.starts_with(&format!("failed to read `{}`", at.display())), "{}", error.what);
+    assert!(fake.asked().is_empty());
+}
+
+#[test]
 fn entries_that_leave_the_package_are_refused_by_name() {
     let refused = |entry: Entry<'_>, named: &str| {
         let error = fetch_crate(&[Entry::File("serde-1.0.219/Cargo.toml", b"", 0o644), entry])

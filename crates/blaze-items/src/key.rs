@@ -13,7 +13,8 @@
 //! an opaque type). [`resolve`] reads both and looks in one index of one crate.
 //!
 //! A crate is named by its content, never by its `Crate` id: its name, version, origin, kind
-//! of target and the cfg it is built with. Features are in the cfg: one package is built
+//! of target, edition, crate attributes, dependencies (by name and key) and the cfg it is
+//! built with. Features are in the cfg: one package is built
 //! twice in one build, for the host and for the target, with different features and, when not
 //! cross compiling, the same target cfg. Turning on a feature names its crate's items anew;
 //! their hashes stay what they were, so it costs queries, not code. Two crates of one build
@@ -63,7 +64,7 @@ use syntax::view::HasName;
 use crate::{ItemId, ItemKey, NAME_DOMAIN, NameHash, SimplifiedType};
 
 pub const KEY_DOMAIN: &str = "blaze v2 item key 2";
-pub const CRATE_DOMAIN: &str = "blaze v2 crate key 1";
+pub const CRATE_DOMAIN: &str = "blaze v2 crate key 2";
 pub const SIMPLIFIED_DOMAIN: &str = "blaze v2 simplified type 1";
 
 /// What a key names, in the current database.
@@ -104,6 +105,21 @@ pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
         TargetKind::BuildScript => h.update(&[5]),
         TargetKind::Other => h.update(&[6]),
     };
+    // What a path in it resolves to: its edition, its `-Z crate-attr`s and each dependency by
+    // its name, its flags and its own key. One package of one cfg built twice in one graph (a
+    // build dependency reached from the host side and the target side) has two `Crate`s only
+    // when these differ, and its items then name different things.
+    h.update(&[data.edition as u8]);
+    h.update(&(data.crate_attrs.len() as u64).to_le_bytes());
+    for attr in data.crate_attrs.iter() {
+        h.part(attr.as_bytes());
+    }
+    h.update(&(data.dependencies.len() as u64).to_le_bytes());
+    for dep in &data.dependencies {
+        h.part(dep.name.symbol().as_str().as_bytes())
+            .update(&[u8::from(dep.is_prelude()), u8::from(dep.is_sysroot()), u8::from(dep.is_private())])
+            .id(&crate_key(db, dep.crate_id));
+    }
     // Every atom's bytes in one buffer, sorted as byte strings; an atom is its start and end
     // in the buffer, packed into a `u64`.
     let range = |atom: u64| (atom >> 32) as usize..(atom as u32) as usize;
@@ -1098,9 +1114,18 @@ fn crates_by_prefix(db: &Db) -> Vec<(u64, Crate)> {
         let ((prefix, krate), (other_prefix, other)) = (pair[0], pair[1]);
         if prefix == other_prefix {
             let same = crate_key(db, krate) == crate_key(db, other);
+            let name = |it: Crate| {
+                let extra = it.extra_data(db);
+                let name = extra.display_name.as_ref().map(|it| it.canonical_name().as_str());
+                // alloc: the stop's message, once
+                format!("{}@{} ({it:?})", name.unwrap_or("<unnamed>"), extra.version.as_deref().unwrap_or("?"))
+            };
             panic!(
-                "blaze-items: crates {krate:?} and {other:?} have {}: the same name, version, \
-                 origin, kind of target and cfg, or a 64-bit collision",
+                "blaze-items: crates {} and {} have {}: the same name, version, origin, kind of \
+                 target, edition, crate attributes, dependencies and cfg, so the crate graph holds \
+                 one crate twice; or a 64-bit collision",
+                name(krate),
+                name(other),
                 if same { "one key" } else { "keys with equal first 8 bytes" }
             );
         }

@@ -100,6 +100,32 @@ fn a_function_pointer_call_is_refused() {
     assert_eq!(found[0].0.kind, ConstCheckKind::FnPointerCall);
 }
 
+/// `tests/ui/consts/async-block.rs`, both revisions: an `async` block in a `const fn` is a
+/// feature error without `const_async_blocks`, and allowed with it.
+#[test]
+fn an_async_block_needs_const_async_blocks() {
+    let src = "const fn foo() -> impl core::future::Future<Output = ()> {\n    async {}\n}\n";
+    let found = check("future", src, func("foo"));
+    assert_eq!(
+        reported(&found),
+        [("E0658", "async blocks are not allowed in constant functions", "async {}")]
+    );
+    assert_eq!(found[0].0.kind, ConstCheckKind::Coroutine { what: "async blocks", gated: true });
+    let gated = format!("#![feature(const_async_blocks)]\n{src}");
+    assert_eq!(reported(&check("future", &gated, func("foo"))), []);
+}
+
+/// `tests/ui/traits/const-traits/match-non-const-eq.rs`, stock: a string pattern compares with
+/// `<str as PartialEq>::eq`, which rustc names as the match it is. minicore's `PartialEq` is not
+/// const, so the kind is the non-const one, with no code of its own.
+#[test]
+fn a_string_pattern_is_a_match_comparison() {
+    let src = "const fn foo(input: &'static str) {\n    match input {\n        \"a\" => (),\n        _ => (),\n    }\n}\n";
+    let found = check("eq, str", src, func("foo"));
+    assert_eq!(reported(&found), [("", "cannot match on `str` in constant functions", "\"a\"")]);
+    assert!(matches!(found[0].0.kind, ConstCheckKind::NonConstMatchEq { conditionally: false, .. }));
+}
+
 /// `tests/ui/consts/issue-28113.rs`, the constant named.
 #[test]
 fn a_closure_call_in_a_constant_names_constants() {
@@ -227,6 +253,55 @@ static foo: &Y::X = &*Y::foo(Y::x as *const Y::X);
             "cannot call non-const function `Y::foo` in statics",
             "Y::foo(Y::x as *const Y::X)",
         )]
+    );
+}
+
+/// `tests/ui/consts/const-unstable-intrinsic.rs`'s `copy::copy`: a function in a body is a
+/// path through the function whose body it is in.
+#[test]
+fn a_function_in_a_body_is_named_through_its_owner() {
+    let src = "\
+const fn outer() {
+    fn inner() {}
+    inner()
+}
+";
+    let found = check("sized", src, func("outer"));
+    assert_eq!(
+        reported(&found),
+        [("E0015", "cannot call non-const function `outer::inner` in constant functions", "inner()")]
+    );
+}
+
+/// rustc's `def_path_str_with_args`: the impl's type with its arguments, and a function's own.
+#[test]
+fn a_call_is_named_with_its_generic_arguments() {
+    let src = "\
+struct V<T>(T);
+impl<T> V<T> {
+    fn new() {}
+}
+fn g<T>() {}
+const fn by_impl() {
+    V::<u8>::new()
+}
+const fn by_own() {
+    g::<u16>()
+}
+";
+    let by_impl = check("sized", src, func("by_impl"));
+    assert_eq!(
+        reported(&by_impl),
+        [(
+            "E0015",
+            "cannot call non-const associated function `V::<u8>::new` in constant functions",
+            "V::<u8>::new()",
+        )]
+    );
+    let by_own = check("sized", src, func("by_own"));
+    assert_eq!(
+        reported(&by_own),
+        [("E0015", "cannot call non-const function `g::<u16>` in constant functions", "g::<u16>()")]
     );
 }
 

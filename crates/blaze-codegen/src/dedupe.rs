@@ -17,7 +17,7 @@ use rustc_hash::FxHashMap;
 use crate::{CompiledFunction, Data, InstanceKey, Relocs, Target, Unwind, content::code_id};
 
 /// What became of a build's functions.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)] // clone: inside `driver::Built`, once per build
 pub struct Deduped {
     /// Each function merged away, with the one kept for it.
     // BTreeMap: a build's output, sorted once when it is made.

@@ -189,3 +189,42 @@ fn release_builds_at_once_compile_each_shared_function_once() {
         assert_eq!(built.functions, alone(&program, &policy, root).functions, "root {root}");
     }
 }
+
+/// A release build after another of the same units takes its summaries and its compiles from
+/// the memo: it prepares, summarizes and compiles nothing, and makes and keeps what the first
+/// did.
+#[test]
+fn a_release_build_after_another_takes_its_summaries_and_prepares_nothing() {
+    let (program, policy) = (compile_time(Origin::Dependency), policy(OptLevel::O3, Mode::Output));
+    let memo = Memo::new();
+    let first =
+        Build::new(&Machine::default(), &program, &policy, &memo).run(&[(1, root_origin(1))], &Store::default()).unwrap();
+    let again = Slow::default();
+    let built = Build::new(&again, &program, &policy, &memo).run(&[(1, root_origin(1))], &Store::default()).unwrap();
+    assert_eq!((sorted(&again.prepared).len(), sorted(&again.emitted).len()), (0, 0));
+    assert_eq!(again.machine.summarized.load(std::sync::atomic::Ordering::Relaxed), 0);
+    assert_eq!(built.functions, first.functions);
+    assert_eq!(built.puts, first.puts, "the summaries and templates it took, kept in its own store too");
+}
+
+/// What a build used of the memo is what a collection keeps for it: kept, the same build
+/// again compiles nothing; another build's, dropped, is compiled again.
+#[test]
+fn a_collection_keeps_what_a_build_used_and_drops_the_rest() {
+    let (program, policy) = (compile_time(Origin::BuildTime), policy(OptLevel::O0, Mode::Output));
+    let mut memo = Memo::new();
+    let first =
+        Build::new(&Machine::default(), &program, &policy, &memo).run(&[(1, root_origin(1))], &Store::default()).unwrap();
+    let other =
+        Build::new(&Machine::default(), &program, &policy, &memo).run(&[(4, root_origin(4))], &Store::default()).unwrap();
+    assert!(!first.memo_used.is_empty() && first.memo_used.windows(2).all(|it| it[0] < it[1]));
+    memo.retain(|it| first.memo_used.binary_search(it).is_ok());
+
+    let again = Slow::default();
+    let built = Build::new(&again, &program, &policy, &memo).run(&[(1, root_origin(1))], &Store::default()).unwrap();
+    assert_eq!((built.stats.compiled, built.stats.flown), (0, first.stats.compiled));
+    assert!(sorted(&again.prepared).is_empty());
+    let dropped = Slow::default();
+    let built = Build::new(&dropped, &program, &policy, &memo).run(&[(4, root_origin(4))], &Store::default()).unwrap();
+    assert_eq!((built.stats.compiled, built.stats.flown), (other.stats.compiled, 0));
+}

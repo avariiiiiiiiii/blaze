@@ -127,14 +127,14 @@ impl Node {
 
 /// What level 2 counted of a function: how often it was entered, and for each two-way branch
 /// of its IR in order, how often it went each way.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)] // clone: `prepare` copies the profile of a level-3 request, once per request
 pub struct Branches {
     pub entered: u64,
     pub taken: Vec<[u64; 2]>,
 }
 
 /// What the daemon asks of one function.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Asked {
     pub node: Node,
     pub level: Level,
@@ -177,7 +177,7 @@ impl Tiered {
 }
 
 /// The functions of a program at a level above 1.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct Tiers {
     nodes: FxHashMap<Node, Arc<Tiered>>,
     /// What was installed since a patch last held the code, with the code each replaced.

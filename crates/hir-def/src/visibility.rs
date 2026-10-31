@@ -387,7 +387,8 @@ pub fn written_visibility<N: AstIdNode>(
     has_resolver: impl HasResolver + HasModule,
     id: AstId<N>,
 ) -> Visibility {
-    resolve_raw(db, has_resolver, &crate::signatures::written_visibility(db, id))
+    let module = has_resolver.module(db);
+    resolve_raw(db, has_resolver, &crate::signatures::written_visibility(db, id, module))
 }
 
 fn resolve_raw(db: &Db, has_resolver: impl HasResolver + HasModule, raw_vis: &RawVisibility) -> Visibility {

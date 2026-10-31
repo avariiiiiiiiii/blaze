@@ -65,7 +65,7 @@ impl Lookup for blaze_cas::Store {
 }
 
 /// A value for the store.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Put {
     pub key: Key,
     pub kind: Kind,
@@ -94,7 +94,7 @@ pub struct Stats {
 }
 
 /// What a build gives the linker.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct Built {
     /// By key, after dedupe.
     pub functions: Vec<CompiledFunction>,
@@ -140,6 +140,11 @@ pub struct Built {
     pub versions: Vec<(ContentId, Result<ContentId, String>)>,
     /// A digest of each function, static and debug name, made with it ([`Digests`]).
     pub digests: Digests,
+    /// Every memo entry the build took or put, sorted, each once: the shapes of its templates,
+    /// the store keys its release, folded and thunk templates and its summaries are kept under,
+    /// and a lazy build's recorded shapes. What a collection of the memo keeps for it
+    /// ([`Memo::retain`]).
+    pub memo_used: Vec<ContentId>,
 }
 
 impl Built {
@@ -159,11 +164,13 @@ impl Built {
 }
 
 /// What [`Build::tier_up`] gives: each tiered function's key, with the code for its slot.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct TieredUp {
     pub replaced: Vec<(InstanceKey, CompiledFunction)>,
     pub puts: Vec<Put>,
     pub stats: Stats,
+    /// As [`Built::memo_used`].
+    pub memo_used: Vec<ContentId>,
 }
 
 /// What [`Build::reach`] gives: everything the roots reach, as a build's walk reaches it
@@ -183,14 +190,19 @@ pub struct Reached<I, S> {
 
 type FrontInstance<B> = <<B as Prepare>::Frontend as Frontend>::Instance;
 type FrontStatic<B> = <<B as Prepare>::Frontend as Frontend>::Static;
+type Node<B> = FnNode<FrontInstance<B>, FrontStatic<B>>;
 
-struct FnNode<B: Prepare> {
+/// A function of a walk, over the front end's instance `I` and static `S`: what a lazy run
+/// keeps of it past its build ([`Later`]) is this, so it names no backend or database.
+struct FnNode<I, S> {
     unit: Unit,
     spec: Spec,
     then: Option<Spec>,
     patchable: bool,
-    instance: FrontInstance<B>,
-    described: Described<FrontInstance<B>, FrontStatic<B>>,
+    instance: I,
+    /// Whose code the walk first asked for it as: what describing it again takes.
+    requester: Origin,
+    described: Described<I, S>,
     /// [`digests::debug_name_digest`] of `described.name`, made where it is described.
     name_digest: ContentId,
     /// This build's targets of `described.refs`.
@@ -216,7 +228,20 @@ pub fn stored(key: InstanceKey, built_in: &[InstanceKey]) -> InstanceKey {
     InstanceKey(hasher.finish())
 }
 
-impl<B: Prepare> FnNode<B> {
+pub const GROUP_FLIGHT_DOMAIN: &str = "blaze v2 group flight 1";
+
+/// What a folded group's merge flies under ([`crate::flight`]): its key and its members, as
+/// a group of other members has other thunks.
+fn group_flight(group: &Group) -> InstanceKey {
+    let mut hasher = Hasher::new(GROUP_FLIGHT_DOMAIN);
+    hasher.id(&group.key().0).update(&(group.members.len() as u64).to_le_bytes());
+    for member in &group.members {
+        hasher.id(&member.0);
+    }
+    InstanceKey(hasher.finish())
+}
+
+impl<I, S> FnNode<I, S> {
     /// What its code is kept under.
     fn stored(&self) -> InstanceKey {
         stored(self.unit.instance.key(), &self.built_in)
@@ -316,12 +341,12 @@ struct Job<'n, B: Prepare> {
     name: InstanceKey,
     unit: Unit,
     spec: &'n Spec,
-    node: &'n FnNode<B>,
+    node: &'n Node<B>,
 }
 
 /// A body `function` built in that none of `keys` is: code its store key does not hold.
-fn unkept_inline<B: Prepare>(
-    nodes: &Sorted<InstanceKey, FnNode<B>>,
+fn unkept_inline<I, S>(
+    nodes: &Sorted<InstanceKey, FnNode<I, S>>,
     function: &CompiledFunction,
     keys: impl IntoIterator<Item = InstanceKey>,
 ) -> Option<blaze_items::CodeHash> {
@@ -364,9 +389,16 @@ struct Out {
     function_digests: Vec<(InstanceKey, ContentId)>,
     /// Of each static pushed, by item and instance ([`digests::static_definition`]).
     static_digests: Vec<(StaticId, ContentId)>,
+    /// What it took and put in the memo ([`Built::memo_used`]).
+    used: Vec<ContentId>,
 }
 
 impl Out {
+    /// A memo entry taken or put.
+    fn used(&mut self, id: ContentId) {
+        self.used.push(id);
+    }
+
     /// A function into the build's functions, made from `code`, counted by what its profile
     /// says, with its digest.
     fn push(&mut self, code: CodeHash, function: CompiledFunction) {
@@ -456,13 +488,32 @@ impl Out {
         }
     }
 
-    fn finish(mut self) -> (Vec<CompiledFunction>, Vec<Static>, Vec<Put>, Stats, Vec<CodegenError>) {
+    fn finish(mut self) -> Finished {
         self.puts.sort_by(|a, b| a.key.cmp(&b.key));
         self.puts.dedup_by(|a, b| a.key == b.key);
         self.errors.sort_by_key(|it| (it.unit, it.item));
         self.errors.dedup();
-        (self.functions, self.statics, self.puts, self.stats, self.errors)
+        self.used.sort_unstable();
+        self.used.dedup();
+        Finished {
+            functions: self.functions,
+            statics: self.statics,
+            puts: self.puts,
+            stats: self.stats,
+            errors: self.errors,
+            used: self.used,
+        }
     }
+}
+
+/// What a build collected, sorted and each once.
+struct Finished {
+    functions: Vec<CompiledFunction>,
+    statics: Vec<Static>,
+    puts: Vec<Put>,
+    stats: Stats,
+    errors: Vec<CodegenError>,
+    used: Vec<ContentId>,
 }
 
 /// The function of instance `key` with `refs` in a stored template blob, read in place: its
@@ -488,11 +539,10 @@ pub struct Build<'a, B: Prepare> {
     memo: &'a Memo,
     /// The masked IR of every function folded so far, kept across builds.
     masks: &'a Masks,
-    nodes: Sorted<InstanceKey, FnNode<B>>,
+    /// The last run's functions, with the shapes its lazy checks recorded.
+    last: Later<FrontInstance<B>, FrontStatic<B>>,
     /// Functions the last run's statics refer to.
     static_callees: FxHashSet<InstanceKey>,
-    /// The shapes of the last lazy run's functions whose IR its checks built.
-    shapes: FxHashMap<InstanceKey, ContentId>,
 }
 
 /// The function a target names, if it names one.
@@ -511,9 +561,8 @@ impl<'a, B: Prepare> Build<'a, B> {
             policy,
             memo,
             masks: Masks::shared(),
-            nodes: Sorted::default(),
+            last: Later::default(),
             static_callees: FxHashSet::default(),
-            shapes: FxHashMap::default(),
         }
     }
 
@@ -526,8 +575,9 @@ impl<'a, B: Prepare> Build<'a, B> {
     fn node(
         &self,
         instance: &FrontInstance<B>,
+        requester: Origin,
         described: Described<FrontInstance<B>, FrontStatic<B>>,
-    ) -> Result<FnNode<B>, CodegenError> {
+    ) -> Result<Node<B>, CodegenError> {
         let choice = self.policy.choose(&described.origin, described.overflow_checks).map_err(|why| {
             let unit = Instance {
                 code: described.code,
@@ -551,6 +601,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             patchable: choice.patchable,
             // clone: per build, the walk's handle of the instance
             instance: instance.clone(),
+            requester,
             name_digest: digests::debug_name_digest(&described.name),
             described,
             // alloc: none, empty until the walk resolves them
@@ -581,8 +632,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         static_roots: &[FrontStatic<B>],
         mut order: Option<&mut Vec<InstanceKey>>,
         errors: &mut Vec<CodegenError>,
-    ) -> (Sorted<InstanceKey, FnNode<B>>, Sorted<StaticId, StaticNode<B>>, Vec<InstanceKey>) {
-        let mut nodes: FxHashMap<InstanceKey, FnNode<B>> = FxHashMap::default();
+    ) -> (Sorted<InstanceKey, Node<B>>, Sorted<StaticId, StaticNode<B>>, Vec<InstanceKey>) {
+        let mut nodes: FxHashMap<InstanceKey, Node<B>> = FxHashMap::default();
         let mut statics: FxHashMap<StaticId, StaticNode<B>> = FxHashMap::default();
         let mut asked: HashMap<(FrontInstance<B>, Origin), InstanceKey> = HashMap::new();
         let mut static_asked: HashMap<FrontStatic<B>, StaticId> = HashMap::new();
@@ -630,7 +681,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             let described: Vec<_> = level
                 .par_iter()
                 .map(|(instance, requester)| {
-                    self.frontend.describe(instance, requester).and_then(|it| self.node(instance, it))
+                    self.frontend.describe(instance, requester).and_then(|it| self.node(instance, *requester, it))
                 })
                 // alloc: per build, sized by its units
                 .collect();
@@ -797,7 +848,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// Builds the IR of each of `keys`, on all cores, until the build is stopped.
     fn prepare_all(
         &self,
-        nodes: &Sorted<InstanceKey, FnNode<B>>,
+        nodes: &Sorted<InstanceKey, Node<B>>,
         keys: &[InstanceKey],
         errors: &mut Vec<CodegenError>,
     ) -> Vec<(InstanceKey, Result<(Shape, B::Prepared), CodegenError>)> {
@@ -891,7 +942,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             &mut out.errors,
         );
         if !out.errors.is_empty() {
-            return Err(out.finish().4);
+            return Err(out.finish().errors);
         }
         out.stats.instances = nodes.len();
         out.stats.statics = statics.len();
@@ -939,7 +990,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         };
 
         // clone: per build, the symbols the build gives the linker
-        let built_symbols = |node: &FnNode<B>| node.described.symbol.clone();
+        let built_symbols = |node: &Node<B>| node.described.symbol.clone();
         let symbols = nodes
             .iter()
             .filter_map(|(key, node)| Some((*key, built_symbols(node)?)))
@@ -993,9 +1044,9 @@ impl<'a, B: Prepare> Build<'a, B> {
             })
             // alloc: per build, what it gives the test binary's table
             .collect();
-        let (functions, compiled_statics, puts, stats, errors) = out.finish();
-        self.nodes = nodes;
-        self.shapes = lazily.shapes;
+        out.used.extend(lazily.shapes.values().copied());
+        let Finished { functions, statics: compiled_statics, puts, stats, errors, used } = out.finish();
+        self.last = Later { nodes, shapes: lazily.shapes };
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -1020,6 +1071,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             static_owners: owned.statics,
             versions,
             digests: pieces,
+            memo_used: used,
         })
     }
 
@@ -1029,6 +1081,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     pub fn tier_up(&self, store: &impl Lookup) -> Result<TieredUp, Vec<CodegenError>> {
         let mut out = Out::default();
         let jobs: Vec<Job<'_, B>> = self
+            .last
             .nodes
             .iter()
             .filter_map(|(key, node)| {
@@ -1043,8 +1096,8 @@ impl<'a, B: Prepare> Build<'a, B> {
         let names: Vec<(InstanceKey, InstanceKey)> =
             // alloc: per tier-up, sized by its units
             jobs.iter().map(|job| (job.name, job.unit.instance.key())).collect();
-        self.release(&self.nodes, &jobs, store, &mut out);
-        let (functions, _, puts, stats, errors) = out.finish();
+        self.release(&self.last.nodes, &jobs, store, &mut out);
+        let Finished { functions, puts, stats, errors, used, .. } = out.finish();
         if !errors.is_empty() {
             return Err(errors);
         }
@@ -1056,10 +1109,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             .filter_map(|(name, key)| Some((name, by_key.remove(&key)?)))
             // alloc: per tier-up, sized by its units
             .collect();
-        Ok(TieredUp { replaced, puts, stats })
+        Ok(TieredUp { replaced, puts, stats, memo_used: used })
     }
 
-    fn dev(&self, nodes: &Sorted<InstanceKey, FnNode<B>>, store: &impl Lookup, out: &mut Out) {
+    fn dev(&self, nodes: &Sorted<InstanceKey, Node<B>>, store: &impl Lookup, out: &mut Out) {
         let dev: Vec<InstanceKey> = nodes
             .iter()
             .filter(|(_, node)| node.spec.backend.is_cranelift())
@@ -1196,7 +1249,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// made with this build's places: neither prepared nor compiled here.
     fn landed(
         &self,
-        nodes: &Sorted<InstanceKey, FnNode<B>>,
+        nodes: &Sorted<InstanceKey, Node<B>>,
         key: InstanceKey,
         shape: ContentId,
         prepared: &mut HashMap<InstanceKey, (Shape, B::Prepared)>,
@@ -1204,6 +1257,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     ) {
         prepared.remove(&key);
         let node = &nodes[&key];
+        out.used(shape);
         match self.memo.get(&shape) {
             Some(template) => {
                 out.stats.flown += 1;
@@ -1226,7 +1280,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// stopped lands what it has so far.
     fn compile_missing(
         &self,
-        nodes: &Sorted<InstanceKey, FnNode<B>>,
+        nodes: &Sorted<InstanceKey, Node<B>>,
         missing: Vec<InstanceKey>,
         prepared: &mut HashMap<InstanceKey, (Shape, B::Prepared)>,
         out: &mut Out,
@@ -1256,6 +1310,7 @@ impl<'a, B: Prepare> Build<'a, B> {
             let Some((shape, made)) = prepared.remove(&key) else { continue };
             let node = &nodes[&key];
             let shape = shape.key();
+            out.used(shape);
             match self.memo.get(&shape) {
                 Some(template) => {
                     out.stats.memo += 1;
@@ -1327,7 +1382,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// Each group's body and thunks, from the store or merged from the members' IR.
     fn folded(
         &self,
-        nodes: &Sorted<InstanceKey, FnNode<B>>,
+        nodes: &Sorted<InstanceKey, Node<B>>,
         groups: &[Group],
         mut prepared: HashMap<InstanceKey, (Shape, B::Prepared)>,
         store: &impl Lookup,
@@ -1364,9 +1419,61 @@ impl<'a, B: Prepare> Build<'a, B> {
                 _ => merging.push(group),
             }
         }
-        let unprepared: Vec<InstanceKey> = merging
+        // Each group the store missed is merged by one build of the memo ([`crate::flight`]),
+        // by its key and members; its body and thunks are kept in the memo under their store
+        // keys, so a build that waited for it or asks after takes them there.
+        let flights = self.memo.flights();
+        let mut claims = flights.claims();
+        while !merging.is_empty() {
+            // alloc: per batch of store misses, sized by it
+            let flight_keys: Vec<InstanceKey> = merging.iter().map(|it| group_flight(it)).collect();
+            let asked = claims.claim(&flight_keys);
+            // alloc: per batch of store misses, sized by it
+            let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+            for ((group, flight), asked) in merging.drain(..).zip(flight_keys).zip(asked) {
+                match asked {
+                    Asked::Ours => ours.push((group, flight)),
+                    Asked::Theirs => theirs.push((group, flight)),
+                    Asked::Landed(_) => self.landed_group(nodes, group, out),
+                }
+            }
+            let landed = self.merge_groups(nodes, ours, &mut prepared, out);
+            claims.land(&landed);
+            claims.release();
+            if self.frontend.stopped() {
+                out.errors.push(stopped());
+                return;
+            }
+            // alloc: per batch of store misses, sized by it
+            let waited_for: Vec<InstanceKey> = theirs.iter().map(|it| it.1).collect();
+            let Some(waited) = flights.wait(&waited_for, || self.frontend.stopped()) else {
+                out.errors.push(stopped());
+                return;
+            };
+            for ((group, _), shape) in theirs.into_iter().zip(waited) {
+                match shape {
+                    Some(_) => self.landed_group(nodes, group, out),
+                    // Let go of by the build that claimed it, which did not merge it.
+                    None => merging.push(group),
+                }
+            }
+        }
+    }
+
+    /// Merges `ours`, groups the store missed that this build claimed, each with its flight
+    /// key, from the members' IR. What landed: the flight key of each group whose body and
+    /// every thunk are in the memo, with its body's id there.
+    fn merge_groups<'g>(
+        &self,
+        nodes: &Sorted<InstanceKey, Node<B>>,
+        ours: Vec<(&'g Group, InstanceKey)>,
+        prepared: &mut HashMap<InstanceKey, (Shape, B::Prepared)>,
+        out: &mut Out,
+    ) -> Vec<(InstanceKey, ContentId)> {
+        let thunk_refs = |group: &Group, member: &InstanceKey| group.thunk_refs(&nodes[member].refs);
+        let unprepared: Vec<InstanceKey> = ours
             .iter()
-            .flat_map(|group| group.members.iter())
+            .flat_map(|(group, _)| group.members.iter())
             .filter(|it| !prepared.contains_key(*it))
             .copied()
             // alloc: per build, sized by its groups
@@ -1381,7 +1488,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         }
         // alloc: per build, sized by its groups
         let mut jobs = Vec::new();
-        for group in merging {
+        for (group, flight) in ours {
             let members: Option<Vec<_>> = group
                 .members
                 .iter()
@@ -1394,13 +1501,15 @@ impl<'a, B: Prepare> Build<'a, B> {
                 .collect();
             // A member that failed to prepare is already an error of the build.
             if let Some(members) = members {
-                jobs.push((group, members));
+                jobs.push((group, flight, members));
             }
         }
-        let merged = self.until_stopped(jobs.into_par_iter(), &mut out.errors, |(group, members)| {
-            (group, self.backend.merge(group, members))
+        let merged = self.until_stopped(jobs.into_par_iter(), &mut out.errors, |(group, flight, members)| {
+            (group, flight, self.backend.merge(group, members))
         });
-        for (group, merged) in merged {
+        // alloc: per batch of store misses, sized by it
+        let mut landed = Vec::with_capacity(merged.len());
+        for (group, flight, merged) in merged {
             let key = group.key();
             let first = &nodes[&group.members[0]];
             let mut merged = match merged {
@@ -1417,29 +1526,85 @@ impl<'a, B: Prepare> Build<'a, B> {
             out.stats.compiled += 1 + merged.thunks.len();
             out.stats.folded += group.members.len();
             out.side(&first.unit, &mut merged.body);
-            if let Some(body) = out.template_of(&first.unit, merged.body, &first.refs) {
-                out.template(keys::folded(&key), &body);
-                out.instantiate(&first.unit, key, &body, &first.refs);
+            let body_at = keys::folded(&key);
+            let mut whole = true;
+            match out.template_of(&first.unit, merged.body, &first.refs) {
+                Some(body) => {
+                    let kept = self.memo.put(body_at.0, body);
+                    out.used(body_at.0);
+                    out.template(body_at, kept);
+                    out.instantiate(&first.unit, key, kept, &first.refs);
+                }
+                None => whole = false,
             }
             for (member, mut thunk) in group.members.iter().zip(merged.thunks) {
                 let node = &nodes[member];
                 if thunk.function.key != *member {
                     out.errors.push(error(*member, node.unit.item, "a thunk of another member"));
+                    whole = false;
                     continue;
                 }
                 out.side(&node.unit, &mut thunk);
                 let refs = thunk_refs(group, member);
-                if let Some(template) = out.template_of(&node.unit, thunk, &refs) {
-                    out.template(keys::thunk(&key, member), &template);
-                    out.instantiate(&node.unit, *member, &template, &refs);
+                let at = keys::thunk(&key, member);
+                match out.template_of(&node.unit, thunk, &refs) {
+                    Some(template) => {
+                        let kept = self.memo.put(at.0, template);
+                        out.used(at.0);
+                        out.template(at, kept);
+                        out.instantiate(&node.unit, *member, kept, &refs);
+                    }
+                    None => whole = false,
                 }
             }
+            if whole {
+                landed.push((flight, body_at.0));
+            }
+        }
+        landed
+    }
+
+    /// Group `group`, which another build merged into the memo, made with this build's places:
+    /// its body and each member's thunk by their store keys, nothing prepared or merged here.
+    fn landed_group(&self, nodes: &Sorted<InstanceKey, Node<B>>, group: &Group, out: &mut Out) {
+        let key = group.key();
+        let first = &nodes[&group.members[0]];
+        let body_at = keys::folded(&key);
+        let thunks: Option<Vec<(&InstanceKey, Key, &Template)>> = group
+            .members
+            .iter()
+            .map(|member| {
+                let at = keys::thunk(&key, member);
+                Some((member, at, self.memo.get(&at.0)?))
+            })
+            // alloc: per group another build merged, sized by its members
+            .collect();
+        let (Some(body), Some(thunks)) = (self.memo.get(&body_at.0), thunks) else {
+            // A landing is dropped with its templates ([`Memo::retain`]), between builds.
+            out.errors.push(error(
+                key,
+                first.unit.item,
+                // alloc: an error
+                format!("its merge landed under {body_at:?}, and the memo lacks its body or one of its thunks"),
+            ));
+            return;
+        };
+        out.stats.flown += 1 + thunks.len();
+        out.stats.folded += group.members.len();
+        out.used(body_at.0);
+        out.template(body_at, body);
+        out.instantiate(&first.unit, key, body, &first.refs);
+        for (member, at, thunk) in thunks {
+            let node = &nodes[member];
+            out.used(at.0);
+            out.template(at, thunk);
+            out.instantiate(&node.unit, *member, thunk, &group.thunk_refs(&node.refs));
         }
     }
 
     fn release(
         &self,
-        nodes: &Sorted<InstanceKey, FnNode<B>>,
+        nodes: &Sorted<InstanceKey, Node<B>>,
         jobs: &[Job<'_, B>],
         store: &impl Lookup,
         out: &mut Out,
@@ -1459,8 +1624,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             })
         };
 
-        // Every summary: stored, else from the IR, which is kept for the compile.
-        // Sorted by key once, in `imports::decide`.
+        // Every summary: stored, else from the IR, which is kept for the compile, else the one
+        // another build of the memo made ([`crate::flight`]), by its store key: this build then
+        // prepares the function only if it compiles or imports it. Sorted by key once, in
+        // `imports::decide`.
         let mut summaries: FxHashMap<InstanceKey, Summary> =
             FxHashMap::with_capacity_and_hasher(jobs.len(), Default::default());
         let mut prepared: HashMap<InstanceKey, B::Prepared> = HashMap::new();
@@ -1491,23 +1658,67 @@ impl<'a, B: Prepare> Build<'a, B> {
                 (name, summarized)
             })
         };
-        let made = prepare(&unsummarized, &mut out.errors);
-        for (name, summarized) in summarize(made, &mut out.errors) {
-            let job = by_name[&name];
-            match summarized {
-                Ok((summary, export, made)) => {
-                    let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
-                    out.put(keys::summary(&job.stored()), Kind::Query, bytes);
-                    summaries.insert(name, summary);
-                    exports.insert(name, export);
-                    prepared.insert(name, made);
+        let summary_flight = |name: &InstanceKey| InstanceKey(keys::summary(&by_name[name].stored()).0);
+        let flights = self.memo.flights();
+        let mut claims = flights.claims();
+        while !unsummarized.is_empty() {
+            // alloc: per batch of store misses, sized by it
+            let flight_keys: Vec<InstanceKey> = unsummarized.iter().map(summary_flight).collect();
+            let asked = claims.claim(&flight_keys);
+            // alloc: per batch of store misses, sized by it
+            let (mut ours, mut theirs, mut flown) = (Vec::new(), Vec::new(), Vec::new());
+            for ((name, flight), asked) in unsummarized.drain(..).zip(flight_keys).zip(asked) {
+                match asked {
+                    Asked::Ours => ours.push(name),
+                    Asked::Theirs => theirs.push((name, flight)),
+                    Asked::Landed(_) => flown.push((name, flight)),
                 }
-                Err(why) => out.errors.push(why),
             }
-        }
-        if self.frontend.stopped() {
-            out.errors.push(stopped());
-            return;
+            self.flown_summaries(&by_name, flown, &mut summaries, out);
+            let made = prepare(&ours, &mut out.errors);
+            // alloc: per batch of store misses, sized by it
+            let (mut kept, mut landed) = (Vec::new(), Vec::new());
+            for (name, summarized) in summarize(made, &mut out.errors) {
+                let job = by_name[&name];
+                match summarized {
+                    Ok((summary, export, made)) => {
+                        let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
+                        out.put(keys::summary(&job.stored()), Kind::Query, bytes);
+                        let flight = summary_flight(&name);
+                        out.used(flight.0);
+                        // clone: per summary made, the one the memo's other builds take
+                        kept.push((flight, summary.clone()));
+                        landed.push((flight, flight.0));
+                        summaries.insert(name, summary);
+                        exports.insert(name, export);
+                        prepared.insert(name, made);
+                    }
+                    Err(why) => out.errors.push(why),
+                }
+            }
+            flights.keep_summaries(kept);
+            claims.land(&landed);
+            claims.release();
+            if self.frontend.stopped() {
+                out.errors.push(stopped());
+                return;
+            }
+            // alloc: per batch of store misses, sized by it
+            let waited_for: Vec<InstanceKey> = theirs.iter().map(|it| it.1).collect();
+            let Some(waited) = flights.wait(&waited_for, || self.frontend.stopped()) else {
+                out.errors.push(stopped());
+                return;
+            };
+            // alloc: per batch of store misses, sized by it
+            let mut flown = Vec::new();
+            for (it, landing) in theirs.into_iter().zip(waited) {
+                match landing {
+                    Some(_) => flown.push(it),
+                    // Let go of by the build that claimed it, which did not summarize it.
+                    None => unsummarized.push(it.0),
+                }
+            }
+            self.flown_summaries(&by_name, flown, &mut summaries, out);
         }
         // What only this build knows of a function: whether code outside it calls it, or
         // anything without a summary (another phase's unit, a static's value) refers to it.
@@ -1569,8 +1780,6 @@ impl<'a, B: Prepare> Build<'a, B> {
         // Each compile the store missed is one build's of the memo ([`crate::flight`]), by its
         // blob key; its template is kept in the memo under that key, a domain of its own, so a
         // build that waited for it or asks after takes it there.
-        let flights = self.memo.flights();
-        let mut claims = flights.claims();
         while !missing.is_empty() {
             // alloc: per batch of store misses, sized by it
             let flight_keys: Vec<InstanceKey> = missing.iter().map(|it| InstanceKey(it.3.0)).collect();
@@ -1651,6 +1860,7 @@ impl<'a, B: Prepare> Build<'a, B> {
                 out.side(&job.unit, &mut emitted);
                 if let Some(template) = out.template_of(&job.unit, emitted, &refs) {
                     let kept = self.memo.put(blob_key.0, template);
+                    out.used(blob_key.0);
                     out.template(blob_key, kept);
                     out.instantiate(&job.unit, key, kept, &refs);
                     landed.push((InstanceKey(blob_key.0), blob_key.0));
@@ -1692,6 +1902,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         let key = job.unit.instance.key();
         match self.memo.get(&blob_key.0) {
             Some(template) => {
+                out.used(blob_key.0);
                 out.stats.flown += 1;
                 out.template(blob_key, template);
                 out.instantiate(&job.unit, key, template, refs);
@@ -1703,6 +1914,41 @@ impl<'a, B: Prepare> Build<'a, B> {
                 // alloc: an error
                 format!("its compile landed under {blob_key:?}, which the memo has no template of"),
             )),
+        }
+    }
+
+    /// The summaries of `flown`, release units each with the flight key another build landed
+    /// its summary under, into `summaries`: nothing prepared or summarized here.
+    fn flown_summaries(
+        &self,
+        by_name: &HashMap<InstanceKey, &Job<'_, B>>,
+        flown: Vec<(InstanceKey, InstanceKey)>,
+        summaries: &mut FxHashMap<InstanceKey, Summary>,
+        out: &mut Out,
+    ) {
+        if flown.is_empty() {
+            return;
+        }
+        // alloc: per batch of summaries another build made, sized by it
+        let keys: Vec<InstanceKey> = flown.iter().map(|it| it.1).collect();
+        for ((name, flight), summary) in flown.into_iter().zip(self.memo.flights().summaries(&keys)) {
+            match summary {
+                Some(summary) => {
+                    let bytes = serde_json::to_vec(&summary).expect("a summary is plain data");
+                    out.put(keys::summary(&by_name[&name].stored()), Kind::Query, bytes);
+                    out.used(flight.0);
+                    summaries.insert(name, summary);
+                }
+                // A landing is dropped with its summary ([`Memo::retain`]), between builds.
+                None => {
+                    let job = by_name[&name];
+                    out.errors.push(error(
+                        job.unit.instance.key(),
+                        job.unit.item,
+                        "its summary landed, and the memo has none of it",
+                    ));
+                }
+            }
         }
     }
 
@@ -1830,7 +2076,7 @@ pub use reach::Reach;
 mod owners;
 pub use owners::Owner;
 mod later;
-pub use later::{Walked, runs_at_start};
+pub use later::{Later, Walked, runs_at_start};
 pub mod digests;
 pub use digests::{Digests, static_definition};
 

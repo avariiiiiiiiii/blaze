@@ -86,13 +86,15 @@ fn attrs_from_ast_id_loc<'db, N: AstIdNode + Typed + Into<syntax::ast::AnyHasAtt
     let loc = lookup.lookup(db);
     let krate = loc.krate(db);
     let id = loc.ast_id();
-    (InFile::new(id.file_id, any_has_attrs(item_node(db, id, tree).syntax())), krate)
+    (InFile::new(id.file_id, any_has_attrs(item_node(db, id, loc.module(db), tree).syntax())), krate)
 }
 
-/// The node at `id`, off the tree `tree` says.
-fn item_node<'db, N: AstIdNode + Typed>(db: &'db Db, id: AstId<N>, tree: Tree) -> N::Of<'db> {
+/// The node at `id`, an item of `module`, off the tree `tree` says: for [`Tree::Outline`], an
+/// item of a block of a body is read off that body's syntax.
+fn item_node<'db, N: AstIdNode + Typed>(db: &'db Db, id: AstId<N>, module: ModuleId, tree: Tree) -> N::Of<'db> {
     if tree == Tree::Outline
-        && let Some(node) = crate::signatures::outline_item(db, id)
+        && let Some(node) =
+            crate::signatures::outline_item(db, id).or_else(|| crate::signatures::body_item(db, id, module))
     {
         return node;
     }
@@ -1071,13 +1073,13 @@ fn attrs_source(
                     let definition_source = file_root(db, definition, tree);
                     let definition = InFile::new(definition.into(), definition_source.into());
                     let declaration = InFile::new(declaration_tree_id.file_id(), declaration);
-                    let declaration = declaration.with_value(item_node(db, declaration, tree));
+                    let declaration = declaration.with_value(item_node(db, declaration, id, tree));
                     (definition, Some(declaration), &[][..])
                 }
                 ModuleOrigin::Inline { definition_tree_id, definition } => {
                     let definition = InFile::new(definition_tree_id.file_id(), definition);
                     let definition =
-                        definition.with_value(item_node(db, definition, tree).into());
+                        definition.with_value(item_node(db, definition, id, tree).into());
                     (definition, None, &[][..])
                 }
                 ModuleOrigin::BlockExpr { block, .. } => {
@@ -2499,16 +2501,38 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
     let krate = outer.krate(db);
     // The block the module holding `block` is, if it is a block's: the walk stops there, as it
     // does at a `mod` or a file, which bound every other module.
-    let stop = match (outer.block(db), outer.containing_module_inside_def_map(db)) {
-        (Some(it), None) => {
-            let ast_id = it.ast_id(db);
-            Some((ast_id.file_id, ast_id.to_range(db)))
-        }
+    let outer_block = match (outer.block(db), outer.containing_module_inside_def_map(db)) {
+        (Some(it), None) => Some(it.ast_id(db)),
         _ => None,
     };
     let ast_id = block.ast_id(db);
     let mut file_id = ast_id.file_id;
-    let mut node = ast_id.to_view(db).syntax().parent();
+    // A block of a body written in a file is walked in that body's syntax alone, as
+    // `block_item_tree_query` lowers it: every ancestor of its anchor up to the module holding
+    // it has no attributes (`real_span_map`), so the walk finds the same `#[sanitize]` there.
+    let syntax = block
+        .owner(db)
+        .and_then(|owner| crate::expr_store::body::body_syntax(db, owner).as_ref())
+        .filter(|syntax| syntax.file_id == ast_id.file_id);
+    let tree = syntax.map(|it| it.tree(db));
+    let (mut node, stop) = match (syntax, &tree) {
+        (Some(syntax), Some(tree)) => {
+            let ptr = syntax.ast_id_map.try_get_erased(ast_id.value.erase()).unwrap_or_else(|| {
+                panic!("{block:?}: block {:?} is not in its body's syntax, which made it", ast_id.value)
+            });
+            let stop = outer_block.filter(|it| it.file_id == file_id).map(|it| {
+                let ptr = syntax.ast_id_map.try_get_erased(it.value.erase()).unwrap_or_else(|| {
+                    panic!("{block:?}: the block {:?} holding it is not in its body's syntax", it.value)
+                });
+                (file_id, ptr.text_range())
+            });
+            (ast::to_node(ptr, ast::Node::root(tree)).parent(), stop)
+        }
+        _ => (
+            ast_id.to_view(db).syntax().parent(),
+            outer_block.map(|it| (it.file_id, it.to_range(db))),
+        ),
+    };
     let mut cfg_options = None;
     let mut sets = SmallVec::<[SanitizeSets; 4]>::new();
     'walk: loop {

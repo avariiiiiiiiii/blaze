@@ -199,7 +199,7 @@ pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, Lo
 /// What [`published`] reads of a crate's resolution, by field, to compare across a write: a
 /// write that changes none of them runs no `crate_local_def_map` of the crate again.
 #[cfg(test)]
-pub(super) struct Slices {
+pub(in crate::nameres) struct Slices {
     resolutions: FxHashMap<Crate, CrateResolution>,
     resolution: CrateResolution,
     root: ModuleId,
@@ -212,7 +212,7 @@ pub(super) struct Slices {
 
 #[cfg(test)]
 impl Slices {
-    pub(super) fn of(db: &Db, krate: Crate) -> Slices {
+    pub(in crate::nameres) fn of(db: &Db, krate: Crate) -> Slices {
         let resolutions = Resolutions::get(db).crates(db);
         let resolution = *resolutions.get(&krate).expect("the crate is maintained");
         Slices {
@@ -227,8 +227,8 @@ impl Slices {
         }
     }
 
-    /// The fields that differ between `self` and `other`, by name.
-    pub(super) fn differing(&self, other: &Slices) -> Vec<&'static str> {
+    /// The fields that differ between `self` and `other`, by name, `data` with both values.
+    pub(in crate::nameres) fn differing(&self, other: &Slices) -> Vec<String> {
         let fields = [
             ("resolutions", self.resolutions == other.resolutions),
             ("resolution", self.resolution == other.resolution),
@@ -239,7 +239,11 @@ impl Slices {
             ("macro_use_prelude", self.macro_use_prelude == other.macro_use_prelude),
             ("session_macros", self.session_macros == other.session_macros),
         ];
-        fields.into_iter().filter(|&(_, same)| !same).map(|(name, _)| name).collect()
+        let describe = |name: &str| match name {
+            "data" => format!("data: {:?} then {:?}", self.data, other.data),
+            _ => name.to_owned(),
+        };
+        fields.into_iter().filter(|&(_, same)| !same).map(|(name, _)| describe(name)).collect()
     }
 }
 

@@ -43,7 +43,7 @@ pub(super) const CATCH: u32 = 1;
 
 /// The frame layout and the landing pads of one compiled function, which do not depend on
 /// where the function ends up.
-#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(super) struct FunctionUnwind {
     frame: Frame,
     /// The function's `.gcc_except_table` entry. A function without one has no call that
@@ -59,7 +59,7 @@ pub(super) enum UnwindParts<'a> {
 
 /// How to find the caller's frame at each place in a function, as the producer of its code
 /// tells it.
-#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 enum Frame {
     Cranelift(cranelift_codegen::isa::unwind::systemv::UnwindInfo),
     Rows(FrameRows),
@@ -68,7 +68,7 @@ enum Frame {
 
 /// The rules of a function's `.eh_frame` entry, each with the offset in the function it
 /// holds from.
-#[derive(Debug, Clone, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(super) struct FrameRows {
     /// How many bytes of code the rules cover.
     pub(super) len: u32,

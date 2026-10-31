@@ -642,12 +642,45 @@ fn file_body_syntax(db: &Db, file: EditionedFileId) -> FxHashMap<ErasedFileAstId
 }
 
 /// The [`BodySyntax`] of `def` found by where it is in its file: what [`body_syntax`] reads for
-/// a body in a fn body or one a macro writes.
+/// a body in a fn body or one a macro writes. An item of a block lowered from the syntax of the
+/// body it is in is in that body's anchor, and takes its tree and maps from it, so an edit
+/// elsewhere in the file leaves it the same.
 #[blaze_query::tracked(returns(ref))]
 fn placed_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
+    if let Some(syntax) = in_owner_body_syntax(db, def) {
+        return Some(syntax);
+    }
     let src = def_syntax(db, def);
     let SpanMap::RealSpanMap(span_map) = src.file_id.span_map(db) else { return None };
     anchored_body_syntax(db, src.file_id, span_map, src.file_id.ast_id_map(db), src.value)
+}
+
+/// The [`BodySyntax`] of `def`, an item in a body, off the [`BodySyntax`] of the body whose own
+/// syntax made its block (`BlockIdLt::owner`). `None` for an item outside fn bodies, of a block
+/// lowered from its file, or written by a macro.
+fn in_owner_body_syntax(db: &Db, def: DefWithBodyId) -> Option<BodySyntax> {
+    let InFile { file_id, value: ast_id } = def.erased_ast_id(db);
+    if !ast_id.in_body() {
+        return None;
+    }
+    let owner = def.module(db).block(db)?.owner(db)?;
+    let owner = body_syntax(db, owner).as_ref().filter(|it| it.file_id == file_id)?;
+    let item = owner.ast_id_map.try_get_erased(ast_id)?;
+    Some(BodySyntax {
+        file_id,
+        tree: owner.tree,
+        // clone: a count of the file's text
+        text: owner.text.clone(),
+        range: owner.range,
+        kind: owner.kind,
+        edition: owner.edition,
+        outline: owner.outline,
+        item,
+        // clone: a count of the anchor's maps
+        ast_id_map: owner.ast_id_map.clone(),
+        // clone: a count of the anchor's maps
+        span_map: owner.span_map.clone(),
+    })
 }
 
 /// The [`BodySyntax`] of `item`, a node of the real file `file_id`.

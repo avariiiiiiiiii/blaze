@@ -95,7 +95,7 @@ type SourcePaths = dyn Fn(&Db, base_db::FileId) -> Option<String> + Send + Sync;
 
 /// How a build names files, told by [`name_sources`]. Two rules with the same `key` name every
 /// file the same: the key is all the rule depends on besides what it reads of the database.
-#[derive(Clone)]
+#[derive(Clone)] // clone: a field of the `SourceNames` input, which the database copies once per image it writes
 pub struct NamingRule {
     key: Box<str>,
     paths: std::sync::Arc<SourcePaths>,

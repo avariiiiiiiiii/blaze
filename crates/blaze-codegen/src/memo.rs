@@ -318,19 +318,33 @@ mod tests {
         assert_eq!(memo.len(), crowded.len());
     }
 
+    /// A lookup, hit or miss, allocates nothing, even when it probes past level 0.
+    #[test]
+    fn a_lookup_allocates_nothing() {
+        let memo = Memo::new();
+        let crowded = |n: u8| {
+            let mut id = ContentId([9; 32]);
+            id.0[31] = n;
+            id
+        };
+        for n in 0..(PROBES * 2) as u8 {
+            memo.put(crowded(n), template(n));
+        }
+        let missing = crowded(u8::MAX);
+        let found = blaze_alloc_count::assert_at_most(0, "a memo lookup", || {
+            (0..(PROBES * 2) as u8).all(|n| memo.get(&crowded(n)).is_some()) && memo.get(&missing).is_none()
+        });
+        assert!(found);
+    }
+
     /// The memo against a map that keeps the first template of a shape: the same answers for
     /// a run of puts, gets and collections, crowded into few windows so most spill.
     #[test]
     fn the_memo_answers_as_a_map_of_first_templates() {
         let mut memo = Memo::new();
         let mut reference: std::collections::HashMap<ContentId, Template> = Default::default();
-        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
-        let mut next = move || {
-            rng ^= rng << 13;
-            rng ^= rng >> 7;
-            rng ^= rng << 17;
-            rng
-        };
+        let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_f491_4f6c_dd1d);
+        let mut next = move || rng.next_u64();
         let pick = |n: u64| {
             let mut id = ContentId([0; 32]);
             id.0[..8].copy_from_slice(&(n % 8).to_le_bytes());

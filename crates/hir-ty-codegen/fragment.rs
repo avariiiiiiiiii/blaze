@@ -42,7 +42,7 @@ use super::{
 };
 
 /// A function that compiled code calls or takes the address of.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)] // clone: inside `FuncRequest`, which `referenced` copies as `DataRequest`
 pub(super) enum FuncTarget {
     /// A symbol by its link name.
     Symbol(String),
@@ -98,7 +98,7 @@ pub(super) struct FuncRequest {
 
 /// A data object that compiled code or other data points to. The ids inside a blob index the
 /// requests of the same [`Requests`].
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)] // clone: `referenced` copies a function's own requests out of its unit's, once per function LLVM compiles
 pub(super) enum DataRequest {
     Blob {
         blob: ConstBlob,
@@ -124,7 +124,7 @@ pub(super) enum DataRequest {
 }
 
 /// A part of a [`DataRequest::Text`].
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)] // clone: inside `DataRequest`
 pub(super) enum TextPart {
     Text(String),
     /// The path of a file as rustc reports it.
@@ -304,7 +304,7 @@ const WIDE: i32 = i32::MIN;
 /// addends wider than that, and the namespaces of [`RelocName::User`] names, in side tables.
 /// One `Vec` of rows a function, no name owned by a row, and a lookup is an index (a wide
 /// addend or a namespace a binary search of the few there are).
-#[derive(Clone, Default, PartialEq, Eq, Debug)]
+#[derive(Default, PartialEq, Eq, Debug)]
 pub(super) struct Relocs {
     rows: Vec<Row>,
     /// The addends rows hold [`WIDE`] for, by the row's place, in the order of the rows.
@@ -879,7 +879,6 @@ impl Requests {
 /// The body of a function the function being built calls, which LLVM is shown in a compile
 /// at a level above 1 (see `tier::seen_body`): it builds the body in where it finds that
 /// worth it, and knows what a call it keeps does.
-#[derive(Clone)]
 pub(super) struct Seen {
     /// The function the calls are of, among the requests.
     pub(super) id: FuncId,

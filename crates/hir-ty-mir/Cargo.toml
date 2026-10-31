@@ -43,6 +43,8 @@ cfg.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
+# `long_running_const_eval`'s level where an evaluation reaches rustc's limit (`mir/eval.rs`).
+hir-lint-levels.workspace = true
 base-db.workspace = true
 syntax.workspace = true
 span.workspace = true

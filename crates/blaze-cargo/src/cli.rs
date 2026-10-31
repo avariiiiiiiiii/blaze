@@ -64,6 +64,7 @@ Commands:
     serve       Run the daemon the other commands are clients of
     stop        Make the daemon's state durable and stop it
     status      What the daemon is doing
+    toolchain   Download the Rust blaze builds with, once, unless rustup has it
     daemon      install: the system starts the daemon on demand; uninstall
     codegen-inputs --format=json   Each instance the last build made, with its code hash
     trace --out PATH               Every result of the last build, with its edges, as CBOR
@@ -140,13 +141,23 @@ pub fn command(words: Vec<OsString>) -> i32 {
         Asked::Unknown(name) => {
             let what = format!(
                 "no such command: `{name}`\n\nhelp: blaze's commands are build, check, run, test, bench, \
-                 doc, serve, stop, status, daemon, codegen-inputs, trace, tables and pack"
+                 doc, serve, stop, status, toolchain, daemon, codegen-inputs, trace, tables and pack"
             );
             eprint!("{}", say::error(&what, auto_color()));
             FAILED
         }
         Asked::Stop => said(daemon::stop(&mut io::stderr().lock(), auto_color())),
         Asked::Status => said(daemon::status(&mut io::stdout().lock(), &mut io::stderr().lock(), auto_color())),
+        Asked::Toolchain => match crate::toolchain::ensure() {
+            Ok(chosen) => {
+                println!("{chosen}");
+                0
+            }
+            Err(what) => {
+                eprint!("{}", say::error(&what, auto_color()));
+                FAILED
+            }
+        },
         Asked::Daemon(verb) => said(daemon::units(verb, &mut io::stderr().lock(), auto_color())),
         Asked::Inspect(what, words) => inspect::main(what, words, auto_color()),
         Asked::Cargo(asked) => cargo(&asked),
@@ -242,6 +253,10 @@ fn cargo(asked: &Invocation) -> i32 {
         Ok(prepared) => prepared,
         Err(what) => return refused(&what, color),
     };
+    crate::toolchain::say_toolchain_file(&place.cwd, asked.flags.verbose > 0);
+    if let Err(what) = crate::toolchain::ensure() {
+        return refused(&what, color);
+    }
     let mut client = match daemon::connect(Start::IfMissing) {
         Ok(Some(client)) => client,
         Ok(None) => return refused("no daemon answers, and none could be started", color),

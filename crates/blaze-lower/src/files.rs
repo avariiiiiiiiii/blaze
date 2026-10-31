@@ -101,9 +101,9 @@ impl<T: Tree> Mounts<'_, T> {
                 }
                 Some((id, _, bytes)) => return Ok(Node::File(id, bytes)),
                 None => {
-                    return Ok(match self.tree.list(root, &under) {
-                        Some(_) => Node::Dir(path),
-                        None => Node::None,
+                    return Ok(match self.tree.read_dir(root, &under, &mut |_| {}) {
+                        true => Node::Dir(path),
+                        false => Node::None,
                     });
                 }
             }

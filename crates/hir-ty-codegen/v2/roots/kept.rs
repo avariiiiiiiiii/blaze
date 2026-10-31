@@ -2,12 +2,13 @@
 //! that links the crate keeps though no code of it names them. A function with a C-level
 //! symbol (`#[no_mangle]`, `#[export_name]`) or one of the standard library's linked by name
 //! (`#[rustc_std_internal_symbol]`, `#[panic_handler]`, the personality); a static that is
-//! `#[used]` or exported. Items declared in bodies count, as rustc's collector finds them
+//! `#[used]` or exported; either with a `#[linkage]` other than `internal`. Items declared in bodies count, as rustc's collector finds them
 //! there: `const _: () = { #[used] static .. };` is how a constructor is registered.
 
 use base_db::{Crate, Db};
 use hir_def::{
-    AssocItemId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId, StaticId,
+    AssocItemId, AttrDefId, DefWithBodyId, ExpressionStoreOwnerId, FunctionId, ModuleDefId,
+    StaticId,
     attrs::AttrFlags,
     expr_store::ExpressionStore,
     nameres::{DefMap, crate_def_map},
@@ -97,10 +98,19 @@ fn assoc_body(db: &Db, item: AssocItemId, bodies: &mut Vec<DefWithBodyId>) {
 
 /// A generic one is left out, as rustc leaves it (`no_mangle_generic_items`).
 fn keeps_function(db: &Db, func: FunctionId) -> bool {
-    super::compiled(db, func) && exported_symbol(db, func).or_else(|| linked_symbol(db, func)).is_some()
+    super::compiled(db, func)
+        && (exported_symbol(db, func).or_else(|| linked_symbol(db, func)).is_some()
+            || custom_linkage(db, func.into()))
 }
 
 fn keeps_static(db: &Db, value: StaticId) -> bool {
     exported_static(db, value).is_some()
         || AttrFlags::query(db, value.into()).contains(AttrFlags::USED)
+        || custom_linkage(db, value.into())
+}
+
+/// rustc's `contains_extern_indicator` of `#[linkage = ..]` (feature `linkage`): any linkage but
+/// `internal`.
+fn custom_linkage(db: &Db, owner: AttrDefId) -> bool {
+    AttrFlags::linkage(db, owner).is_some_and(|it| it.as_str() != "internal")
 }

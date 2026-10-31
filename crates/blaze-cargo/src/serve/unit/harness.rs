@@ -11,24 +11,10 @@ use std::sync::Arc;
 use blaze_api::ApiError;
 use blaze_ids::radix;
 use blaze_units::schema::Mode;
-use hir_ty_codegen::v2::HirFrontend;
+use hir_ty_codegen::v2::{HARNESS_MODULE, HirFrontend};
 use blaze_lower::{Appended, LowerError, Lowered};
 
 use super::{Job, codegen, graph::Waits, lower_error};
-
-macro_rules! module {
-    () => {
-        "__blaze_test_harness"
-    };
-}
-
-/// The module [`HirFrontend::harness`] writes, by its name in the crate's root: what the
-/// front end keeps of a root that `#![cfg]` takes away.
-const MODULE: &str = module!();
-
-/// How the harness opens [`MODULE`]: a harness that doesn't is refused, so the appended
-/// module is never named for one it lacks.
-const OPENS: &str = concat!("pub mod ", module!(), " {");
 
 /// The harness of each of `units` built with `cfg(test)` (a test, a check of tests) written
 /// into its crate's root: the root's text on disk, then the harness. A test with
@@ -64,16 +50,14 @@ pub(super) fn write(lowered: &mut Lowered, job: &Job, units: impl IntoIterator<I
         let frontend = codegen::frontend_over(job, db, &paths, &job.mounted);
         let harness = frontend.harness(krate, policy.profile.panic, policy.mode, blaze_usercode::test::fork_server);
         let Some(harness) = harness.map_err(|it| refused(it.what))? else { return Ok(None) };
-        if !harness.contains(OPENS) {
-            // alloc: the error's message
-            return Err(refused(format!("the test harness blaze wrote has no module `{MODULE}`")));
-        }
         let on_disk = HirFrontend::on_disk(db.file_text(krate.data(db).root_file_id).text(db));
         // alloc: once a test crate a lowering, the root's text the front end is given
         let mut text = String::with_capacity(on_disk.len() + harness.len());
         text.push_str(on_disk);
         text.push_str(&harness);
-        Ok(Some(Appended { text, module: MODULE }))
+        // The module the harness is written in, by its name in the crate's root: what the
+        // front end keeps of a root that `#![cfg]` takes away.
+        Ok(Some(Appended { text, module: HARNESS_MODULE }))
     });
     made.map(drop).map_err(lower_error)
 }

@@ -605,6 +605,30 @@ pub struct S;
     }
 }
 
+/// One package built twice in a graph with the same cfg but other dependencies (a build
+/// dependency reached from the host and the target side) is two crates: its paths name other
+/// things.
+#[test]
+fn a_crate_with_other_dependencies_has_another_key() {
+    let key_of_a = |fixture: &str| {
+        let db = fixture::db(fixture).into_db();
+        let a = base_db::all_crates(&db)
+            .iter()
+            .copied()
+            .find(|&it| {
+                it.extra_data(&db).display_name.as_ref().is_some_and(|it| it.canonical_name().as_str() == "a")
+            })
+            .expect("crate `a`");
+        key::crate_key(&db, a)
+    };
+    let alone = key_of_a("//- /a.rs crate:a\npub struct S;\n//- /d.rs crate:d\npub struct D;\n");
+    let with_d = key_of_a("//- /a.rs crate:a deps:d\npub struct S;\n//- /d.rs crate:d\npub struct D;\n");
+    let with_other_d =
+        key_of_a("//- /a.rs crate:a deps:d\npub struct S;\n//- /d.rs crate:d cfg:x\npub struct D;\n");
+    assert_ne!(alone, with_d, "a dependency more");
+    assert_ne!(with_d, with_other_d, "the dependency's own key");
+}
+
 #[test]
 fn a_batch_of_keys_is_each_key_alone() {
     let (db, _) = single(

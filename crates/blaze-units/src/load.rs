@@ -124,6 +124,9 @@ pub(crate) struct Spec {
     pub jobs: Option<u32>,
     /// rustc's release, as `rustc -vV` says it.
     pub rustc_version: String,
+    /// Each unit's package's `rust-version` is checked against [`Spec::rustc_version`]: not
+    /// under `--ignore-rust-version`.
+    pub honor_rust_version: bool,
     /// The standard library's mount, where the view has one at [`Spec::library_at`].
     pub library: Option<Mount>,
     pub library_at: String,
@@ -208,6 +211,7 @@ fn view_spec(asked: &Asked, library: Option<Mount>) -> Result<Spec, LoadError> {
         target_dir: asked.target_dir.as_deref().map(absolute),
         jobs: asked.jobs,
         rustc_version: crate::stdlib::target::rustc_version().to_owned(),
+        honor_rust_version: !asked.ignore_rust_version,
         library,
         library_at: asked.library.clone(),
         build_std,
@@ -252,6 +256,8 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
         target_dir: None,
         jobs: None,
         rustc_version: crate::stdlib::target::rustc_version().to_owned(),
+        // The standard library is the toolchain's own, of its release.
+        honor_rust_version: false,
         library: None,
         library_at: String::new(),
         build_std: None,

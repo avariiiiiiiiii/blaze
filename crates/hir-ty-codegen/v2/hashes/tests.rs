@@ -151,6 +151,56 @@ fn a_drop_impl_of_a_fields_type_is_in_the_type() {
     assert_ne!(ty(&db, "Held"), held, "drop glue of `Outer` drops an `Inner`");
 }
 
+const NAMED: &str = r#"
+pub mod m {
+    pub struct A(pub u32);
+}
+pub type Held = m::A;
+"#;
+
+/// An instance's arguments are spelled by [`Hashes::ty`], so an instance of `type_name` or
+/// `type_id`, and every generic calling one with its parameters (whose share key takes their
+/// identity), is another instance once a type it is called with is renamed or moved: the
+/// identity holds the type's key, of which the path `type_name` prints is a function.
+#[test]
+fn renaming_or_moving_a_type_changes_its_identity() {
+    let (mut db, file) = fixture("sized", NAMED);
+    let held = ty(&db, "Held");
+
+    db.set_file_text(file, &format!("\n\n// moved down\n{NAMED}"));
+    assert_eq!(ty(&db, "Held"), held, "a move within the file keeps what the program sees");
+
+    db.set_file_text(file, &NAMED.replace("struct A", "struct B").replace("m::A", "m::B"));
+    assert_ne!(ty(&db, "Held"), held, "`type_name` prints the new name");
+
+    db.set_file_text(file, &NAMED.replace("mod m", "mod n").replace("m::A", "n::A"));
+    assert_ne!(ty(&db, "Held"), held, "`type_name` prints the new module");
+}
+
+const VALUED: &str = r#"
+pub const C: u32 = 1;
+pub fn reads() -> u32 { C }
+"#;
+
+/// A constant's code is its value where it has one for every use, so the data a body makes
+/// of it is keyed by the value, never by how the constant is written.
+#[test]
+fn a_constant_s_code_is_its_value() {
+    let (mut db, file) = fixture("sized", VALUED);
+    let konst = |db: &TestDB| {
+        let konst = hir_def::test_items::constant(db, fixture::test_crate(db), "C");
+        hashes().code(db, Body::Item(konst.into())).unwrap_or_else(|e| panic!("the code of `C`: {e}"))
+    };
+    let (before, reads) = (konst(&db), code(&db, "reads"));
+
+    db.set_file_text(file, &VALUED.replace("= 1", "= 2 - 1"));
+    assert_eq!(konst(&db), before, "one value, however written");
+
+    db.set_file_text(file, &VALUED.replace("= 1", "= 2"));
+    assert_ne!(konst(&db), before);
+    assert_ne!(code(&db, "reads"), reads, "a body reading it reads its value");
+}
+
 #[test]
 fn a_constant_is_its_value() {
     let (db, _) = fixture("sized", CALLS);

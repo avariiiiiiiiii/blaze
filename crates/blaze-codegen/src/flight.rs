@@ -14,6 +14,10 @@
 //! each a compile of 50 to 200 µs, against which the lock is noise. Kept in the [`Memo`]
 //! whose templates the shapes name: a landing outlives no template.
 //!
+//! A release build's summaries fly the same way, by their store key: the summary a build made
+//! is kept here before it lands, so a build that waited for it or asks after takes it and
+//! prepares the function only if it compiles or imports it.
+//!
 //! [`Memo`]: crate::memo::Memo
 
 #![forbid(unsafe_code)]
@@ -30,7 +34,7 @@ use std::{
 use blaze_ids::ContentId;
 use rustc_hash::FxHashMap;
 
-use crate::InstanceKey;
+use crate::{InstanceKey, summary::Summary};
 
 /// A function by the key its compiled code is stored under.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -47,6 +51,8 @@ pub struct Flights {
     /// Told on every landing and release.
     settled: Condvar,
     builds: AtomicU64,
+    /// Each summary landed, by its flight key.
+    summaries: Mutex<FxHashMap<InstanceKey, Summary>>,
 }
 
 /// What a build is told of a function it asks for.
@@ -113,14 +119,37 @@ impl Flights {
         self.table().values().filter(|it| matches!(it, Flight::Landed(_))).count()
     }
 
-    /// Keeps only the landings whose shape `kept` keeps: the memo's collection, between
-    /// builds.
+    fn summary_table(&self) -> MutexGuard<'_, FxHashMap<InstanceKey, Summary>> {
+        self.summaries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keeps each of `made`, a summary under the flight key a build claimed it by, for the
+    /// builds that take it once the build lands it.
+    pub fn keep_summaries(&self, made: Vec<(InstanceKey, Summary)>) {
+        if made.is_empty() {
+            return;
+        }
+        self.summary_table().extend(made);
+    }
+
+    /// The summary kept under each of `keys`, landed: `None` for one no build kept.
+    pub fn summaries(&self, keys: &[InstanceKey]) -> Vec<Option<Summary>> {
+        let table = self.summary_table();
+        // clone: each taken in place of the store's, which a build decodes into one of its own
+        // alloc: per batch of summaries another build made, sized by it
+        keys.iter().map(|key| table.get(key).cloned()).collect()
+    }
+
+    /// Keeps only the landings whose shape `kept` keeps, and the summaries of those kept: the
+    /// memo's collection, between builds.
     pub(crate) fn retain(&mut self, kept: impl Fn(&ContentId) -> bool) {
         let table = self.table.get_mut().unwrap_or_else(PoisonError::into_inner);
         table.retain(|_, it| match it {
             Flight::Landed(shape) => kept(shape),
             Flight::Flying(_) => true,
         });
+        let summaries = self.summaries.get_mut().unwrap_or_else(PoisonError::into_inner);
+        summaries.retain(|key, _| matches!(table.get(key), Some(Flight::Landed(_))));
     }
 }
 
@@ -236,6 +265,38 @@ mod tests {
         flights.retain(|it| *it == shape(2));
         let mut again = flights.claims();
         assert_eq!(again.claim(&[key(1), key(2)]), [Asked::Ours, Asked::Landed(shape(2))]);
+    }
+
+    fn summary(n: u8) -> Summary {
+        Summary {
+            key: key(n),
+            size: u32::from(n),
+            hint: crate::summary::Hint::None,
+            calls: Vec::new(),
+            addressed: Vec::new(),
+            params: 0,
+            unused: Vec::new(),
+            attrs: crate::summary::Attrs::default(),
+            body: crate::summary::Attrs::default(),
+            external: true,
+        }
+    }
+
+    /// A summary kept and landed is every later asker's, and goes with its landing.
+    #[test]
+    fn a_landed_summary_is_taken_and_collected_with_its_landing() {
+        let mut flights = Flights::new();
+        let mut claims = flights.claims();
+        assert_eq!(claims.claim(&[key(1), key(2)]), [Asked::Ours, Asked::Ours]);
+        flights.keep_summaries(vec![(key(1), summary(1)), (key(2), summary(2))]);
+        claims.land(&[(key(1), key(1).0), (key(2), key(2).0)]);
+        drop(claims);
+        let mut later = flights.claims();
+        assert_eq!(later.claim(&[key(1)]), [Asked::Landed(key(1).0)]);
+        assert_eq!(flights.summaries(&[key(1), key(3)]), [Some(summary(1)), None]);
+        drop(later);
+        flights.retain(|it| *it == key(2).0);
+        assert_eq!(flights.summaries(&[key(1), key(2)]), [None, Some(summary(2))]);
     }
 
     #[test]

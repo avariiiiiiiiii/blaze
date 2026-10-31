@@ -165,6 +165,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     pub fn set_budget(&mut self, budget: ConstEvalBudget) {
         self.budget = budget;
         self.steps_left = budget.steps;
+        self.lint_mark = super::lint_mark(self.limits_frames, budget.steps);
     }
 
     /// From now on, each static's bytes as first written (its initializer, or what

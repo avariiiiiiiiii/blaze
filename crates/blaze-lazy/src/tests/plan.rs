@@ -23,6 +23,7 @@ fn starts(section: &str, names: &[u32], in_data: &[u32]) -> Static {
             align: 8,
             bytes: vec![0; 8 * 64],
             relocs: in_data.iter().map(reloc).collect(),
+            writable: false,
         }],
         mutable: false,
         thread_local: false,

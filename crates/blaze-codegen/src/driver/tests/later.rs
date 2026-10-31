@@ -46,10 +46,11 @@ fn compile_one_gives_what_a_whole_build_compiles() {
         let want = whole.functions.iter().find(|it| it.key == walked.key).unwrap();
         assert_eq!(&function, want);
     }
-    // The entry's IR again, for its shape, then the memo's; 2's IR again and its compile; 3
-    // takes 2's template by the shape its check kept, building nothing; 4 and 5 compile.
+    // The entry is the memo's, by the stored key its compile ahead landed under; 2's IR again
+    // and its compile; 3 takes 2's template by the shape its check kept, building nothing; 4
+    // and 5 compile.
     let after = counts(&machine);
-    assert_eq!((after.0 - before.0, after.1 - before.1), (4, 3));
+    assert_eq!((after.0 - before.0, after.1 - before.1), (3, 3));
 }
 
 #[test]
@@ -201,4 +202,144 @@ fn memo_hit_is_none_for_a_function_of_no_dev_backend() {
     let mut build = Build::new(&machine, &program, &release, &memo);
     let built = build.run(&[(1, member())], &Store::default()).unwrap();
     assert!(build.memo_hit(built.roots[0]).is_none(), "an LLVM function is never compiled lazily");
+}
+
+/// What a lazy run keeps for its first calls, owned past its build: the program it borrowed is
+/// free again, and each first call compiles what a whole build compiles, against the front end
+/// and backend it is handed.
+#[test]
+fn an_owned_walk_compiles_what_a_whole_build_compiles() {
+    let (program, policy) = (program(), live());
+    let whole = Build::new(&Machine::default(), &program, &policy, &Memo::new())
+        .run(&[(1, member())], &Store::default())
+        .unwrap();
+    let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
+    let mut build = Build::new(&machine, &program, &policy, &memo);
+    let built = build.run_later(&[(1, member())], &[], &[0], &store).unwrap();
+    let later = build.into_later();
+    for walked in &built.walked {
+        let (function, _) = later.compile_kept(&machine, &program, &memo, walked.key, &store).unwrap();
+        let want = whole.functions.iter().find(|it| it.key == walked.key).unwrap();
+        assert_eq!(&function, want);
+    }
+}
+
+/// `memo_hit` and `memo_put` together are `compile_kept`'s memo branch, and a probe that
+/// misses allocates nothing.
+#[test]
+fn memo_hit_and_memo_put_are_compile_kept_from_the_memo() {
+    let (program, policy) = (program(), live());
+    let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
+    let mut build = Build::new(&machine, &program, &policy, &memo);
+    let built = build.run_later(&[(1, member())], &[], &[0], &store).unwrap();
+    let key = |id: u32| built.walked.iter().find(|it| it.item == item(id)).unwrap().key;
+    let later = build.into_later();
+    let unknown = InstanceKey(ContentId([0xab; 32]));
+    let missed = blaze_alloc_count::assert_at_most(0, "a memo probe that misses", || {
+        (later.memo_hit(&memo, key(4)).is_none(), later.memo_hit(&memo, unknown).is_none())
+    });
+    assert_eq!(missed, (true, true));
+    assert!(later.memo_put(&memo, key(4)).is_none());
+
+    let kept = later.compile_kept(&machine, &program, &memo, key(4), &store).unwrap();
+    let before = counts(&machine);
+    let hit = later.memo_hit(&memo, key(4)).expect("its shape is in the memo now").unwrap();
+    let put = later.memo_put(&memo, key(4)).expect("the hit's template");
+    assert_eq!((hit, vec![put]), kept);
+    assert_eq!(counts(&machine), before, "a probe builds no IR and compiles nothing");
+}
+
+/// The key decides: a function whose body changed before its first call is refused, naming
+/// it and both code hashes, while one the edit left alone compiles at the later revision, and
+/// one whose template the memo has by its recorded shape is that template whatever changed.
+#[test]
+fn a_first_call_after_an_edit_compiles_only_what_still_has_its_key() {
+    let (mut program, policy) = (program(), live());
+    let whole = Build::new(&Machine::default(), &program, &policy, &Memo::new())
+        .run(&[(1, member())], &Store::default())
+        .unwrap();
+    let want = |key: InstanceKey| whole.functions.iter().find(|it| it.key == key).unwrap().clone();
+    let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
+    let mut build = Build::new(&machine, &program, &policy, &memo);
+    let built = build.run_later(&[(1, member())], &[], &[0], &store).unwrap();
+    let key = |id: u32| built.walked.iter().find(|it| it.item == item(id)).unwrap().key;
+    let code = |id: u32| built.walked.iter().find(|it| it.item == item(id)).unwrap().code;
+    let later = build.into_later();
+    later.compile_kept(&machine, &program, &memo, key(2), &store).unwrap();
+
+    for id in [3, 4] {
+        program.functions.get_mut(&id).unwrap().body ^= 0x01;
+    }
+    let before = counts(&machine);
+    let error = later.compile_kept(&machine, &program, &memo, key(4), &store).unwrap_err();
+    assert_eq!((error.unit, error.item), (key(4), item(4)));
+    assert!(error.what.starts_with("changed before its first call"), "{}", error.what);
+    assert!(error.what.contains(&format!("{:?}", code(4))), "{}", error.what);
+    assert_eq!(counts(&machine), before, "refused before its IR is built");
+
+    let (five, _) = later.compile_kept(&machine, &program, &memo, key(5), &store).unwrap();
+    assert_eq!(five, want(key(5)));
+    let (three, _) = later.compile_kept(&machine, &program, &memo, key(3), &store).unwrap();
+    assert_eq!(three, want(key(3)), "2's template, by the shape 3's check recorded");
+}
+
+/// A tier-up compiles the function alone at each tier, under the tier's own key, and refuses
+/// a tier the toolchain has no backend for and a function edited since the image.
+#[test]
+fn tier_up_compiles_a_function_alone_at_each_tier() {
+    let (mut program, mut policy) = (program(), live());
+    policy.toolchain.stencils = Some("ab".repeat(32));
+    let (machine, memo, mut store) = (Machine::default(), Memo::new(), Store::default());
+    let mut build = Build::new(&machine, &program, &policy, &memo);
+    let built = build.run_later(&[(1, member())], &[], &[0], &store).unwrap();
+    let key = |built: &Built, id: u32| built.walked.iter().find(|it| it.item == item(id)).unwrap().key;
+    let (four, five) = (key(&built, 4), key(&built, 5));
+    let later = build.into_later();
+    let tiers = [(Backend::Stencil, true), (Backend::Cranelift { speed: false }, true), (Backend::Llvm { opt: 3 }, false)];
+    let mut keys = vec![four];
+    for (to, counted) in tiers {
+        let (function, puts) = later.tier_up(&machine, &program, &memo, four, to, counted, &store).unwrap();
+        assert!(!keys.contains(&function.key), "{to:?}: a tier is its own instance");
+        assert_eq!(function.code[0], 0x44);
+        keys.push(function.key);
+        store.keep(&puts);
+        let before = counts(&machine);
+        let again = later.tier_up(&machine, &program, &memo, four, to, counted, &store).unwrap();
+        assert_eq!(again, (function, Vec::new()), "{to:?}: the store's, kept by the first");
+        assert_eq!(counts(&machine), before);
+    }
+
+    let mut without = policy.clone();
+    without.toolchain.llvm = None;
+    let mut build = Build::new(&machine, &program, &without, &memo);
+    let no_llvm = build.run_later(&[(1, member())], &[], &[0], &Store::default()).unwrap();
+    let to_llvm = |later: &Later<u32, u32>| {
+        later.tier_up(&machine, &program, &memo, key(&no_llvm, 4), Backend::Llvm { opt: 3 }, false, &Store::default())
+    };
+    assert!(to_llvm(&build.into_later()).unwrap_err().what.contains("without it"));
+
+    // No build tiered 5 up, so its stencil tier would be built from its new body: refused.
+    program.functions.get_mut(&5).unwrap().body = 0x56;
+    let error = later.tier_up(&machine, &program, &memo, five, Backend::Stencil, true, &Store::default()).unwrap_err();
+    assert!(error.what.starts_with("changed before its first call"), "{}", error.what);
+}
+
+/// Two lazy builds of one memo, as two runs of a job: what the first compiled ahead, the
+/// second takes from the memo by its stored key, preparing nothing for it.
+#[test]
+fn a_second_lazy_build_of_the_memo_takes_what_the_first_compiled_ahead() {
+    let (program, policy) = (program(), live());
+    let memo = Memo::new();
+    let first = Build::new(&Machine::default(), &program, &policy, &memo)
+        .run_later(&[(1, member())], &[], &[0], &Store::default())
+        .unwrap();
+    assert_eq!(first.stats.compiled, 1);
+    let machine = Machine::default();
+    let second = Build::new(&machine, &program, &policy, &memo)
+        .run_later(&[(1, member())], &[], &[0], &Store::default())
+        .unwrap();
+    assert_eq!((second.stats.flown, second.stats.compiled), (1, 0));
+    assert_eq!(second.functions, first.functions);
+    // Only the checks of the four functions compiled later.
+    assert_eq!(counts(&machine), (4, 0));
 }

@@ -85,6 +85,32 @@ static KEPT: u8 = 0;
     assert!(roots.tests.is_empty());
 }
 
+/// A `#[linkage]` other than `internal` keeps a function or static, as rustc's
+/// `contains_extern_indicator` does.
+#[test]
+fn an_executable_keeps_what_has_a_linkage_of_its_own() {
+    let (db, frontend, roots) = roots(
+        r#"
+//- /main.rs crate:main
+#![feature(linkage)]
+fn main() {}
+#[linkage = "weak"]
+pub extern "C" fn weak() {}
+#[linkage = "internal"]
+fn internal() {}
+#[linkage = "external"]
+static LINKED: u8 = 0;
+#[linkage = "internal"]
+static HIDDEN: u8 = 0;
+"#,
+        RootKind::Executable,
+    );
+    assert!(roots.roots.contains(&function(db, &frontend, "weak")));
+    assert!(!roots.roots.contains(&function(db, &frontend, "internal")));
+    let linked = test_items::static_item(db, fixture::test_crate(&db), "LINKED");
+    assert_eq!(roots.statics, [HirStatic(linked)]);
+}
+
 /// A dependency's `#[used]` static is in the program only when the program's code names the
 /// dependency, as rustc loads only those, though cargo hands it every one.
 #[test]

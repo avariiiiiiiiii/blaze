@@ -104,6 +104,29 @@ pub fn found() -> Option<Chosen> {
     Some(chosen)
 }
 
+/// [`found`], else blaze's own copy of the release, downloaded once: what a command needs
+/// before the daemon builds with it. `Err` says why there is none and what to do.
+pub fn ensure() -> Result<Chosen, String> {
+    if let Some(chosen) = found() {
+        return Ok(chosen);
+    }
+    let ours = OURS.trim();
+    let Some(release) = own::Release::ours() else {
+        return Err(format!(
+            "blaze builds with Rust {ours}, and the Rust project publishes no copy of it for this machine that blaze knows"
+        ));
+    };
+    let Some(dir) = release.dir() else {
+        return Err(format!(
+            "blaze builds with Rust {ours} and keeps it in .blaze in your home directory, and there is no home \
+             directory: `BLAZE_HOME` names where to keep it"
+        ));
+    };
+    own::fetch(&release, &dir)?;
+    let _ = FOUND.set(dir.clone());
+    Ok(Chosen::Own(dir))
+}
+
 /// Where [`found`] found blaze's release, or was told it is ([`known_at`]).
 static FOUND: OnceLock<PathBuf> = OnceLock::new();
 
@@ -222,9 +245,37 @@ fn installed(home: &Path, release: &str) -> Option<PathBuf> {
     found.into_iter().find(host)
 }
 
+/// The `rust-toolchain` or `rust-toolchain.toml` nearest `dir`, which rustup would follow and
+/// blaze does not.
+pub fn toolchain_file(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .flat_map(|it| ["rust-toolchain", "rust-toolchain.toml"].map(|name| it.join(name)))
+        .find(|it| it.is_file())
+}
+
+/// Says, under `-v`, that the toolchain file nearest `dir` is not followed: one line, since
+/// nothing about the build depends on it.
+pub fn say_toolchain_file(dir: &Path, verbose: bool) {
+    if let Some(file) = toolchain_file(dir).filter(|_| verbose) {
+        eprintln!("blaze: {} is ignored: blaze builds with its own Rust, {} ({})", file.display(), ours_release(), name());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_nearest_toolchain_file_is_found() {
+        let root = tempfile::tempdir().unwrap();
+        let inner = root.path().join("a/b");
+        std::fs::create_dir_all(&inner).unwrap();
+        assert_eq!(toolchain_file(&inner).filter(|it| it.starts_with(root.path())), None);
+        std::fs::write(root.path().join("a/rust-toolchain.toml"), "[toolchain]\nchannel = \"1.70\"\n").unwrap();
+        assert_eq!(toolchain_file(&inner), Some(root.path().join("a/rust-toolchain.toml")));
+        std::fs::write(root.path().join("a/b/rust-toolchain"), "1.70\n").unwrap();
+        assert_eq!(toolchain_file(&inner), Some(inner.join("rust-toolchain")), "the nearest");
+    }
 
     #[test]
     fn blazes_toolchain_is_named_after_its_nightly_and_its_rustc_says_its_release() {

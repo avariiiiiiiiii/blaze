@@ -67,17 +67,27 @@ impl<H: Http + 'static> Fetcher<H> {
         Ok(source)
     }
 
-    /// A `.crate`: downloaded, checked by the lock file's sha256, unpacked (cargo's
-    /// `RegistrySource::download`, `finish_download` and `unpack_package`).
+    /// A `.crate`: downloaded, or read where a `local-registry` keeps it (a `file://` URL, as
+    /// the load names one), checked by the lock file's sha256, unpacked (cargo's
+    /// `RegistrySource::download`, `finish_download` and `unpack_package`, and
+    /// `LocalRegistry::download`).
     fn package(&self, fetch: &Fetch, sha256: &str) -> Result<Source, ApiError> {
-        let answer = self.get(&fetch.url, &[], &[]).map_err(|e| {
-            let texts = [
-                format!("failed to download `{}`", fetch.what),
-                format!("failed to download from `{}`", fetch.url),
-            ];
-            failed(fetch, &texts, Some(&e))
-        })?;
-        let actual = blaze_registry::download::checksum(&answer.body);
+        let body = match fetch.url.strip_prefix("file://") {
+            Some(path) => std::fs::read(path).map_err(|e| {
+                failed(fetch, &[format!("failed to read `{path}`")], Some(&anyhow::Error::new(e)))
+            })?,
+            None => {
+                let answer = self.get(&fetch.url, &[], &[]).map_err(|e| {
+                    let texts = [
+                        format!("failed to download `{}`", fetch.what),
+                        format!("failed to download from `{}`", fetch.url),
+                    ];
+                    failed(fetch, &texts, Some(&e))
+                })?;
+                answer.body
+            }
+        };
+        let actual = blaze_registry::download::checksum(&body);
         if !actual.eq_ignore_ascii_case(sha256) {
             return Err(failed(
                 fetch,
@@ -91,7 +101,7 @@ impl<H: Http + 'static> Fetcher<H> {
         let prefix = last_part(&fetch.at).ok_or_else(|| {
             failed(fetch, &[format!("`{}` names no package directory", fetch.at)], None)
         })?;
-        let mut files = archive::unpack(&answer.body, prefix).map_err(|cause| {
+        let mut files = archive::unpack(&body, prefix).map_err(|cause| {
             failed(fetch, &[format!("failed to unpack package `{}`", fetch.what), cause], None)
         })?;
         let under_lock = format!("{PACKAGE_SOURCE_LOCK}/");

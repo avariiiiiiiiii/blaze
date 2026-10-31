@@ -47,6 +47,8 @@ pub(in crate::nameres) use self::publish::{
     published_modules, published_records,
 };
 pub(in crate::nameres) use self::state::State;
+#[cfg(test)]
+pub(in crate::nameres) use self::publish::Slices;
 use self::{
     diff::{Changed, Items},
     input::Delta,

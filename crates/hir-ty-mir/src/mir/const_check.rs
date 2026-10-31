@@ -22,12 +22,15 @@ use std::fmt;
 use base_db::{Crate, Db};
 use blaze_mem::{Frame, Tag, frame};
 use hir_def::{
-    CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
+    CallableDefId, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup,
     ModuleIdLt, TraitId,
     expr_store::Body,
-    hir::generics::GenericParams,
+    hir::{ClosureKind, CoroutineKind, CoroutineSource, generics::GenericParams},
     lang_item::LangItems,
-    signatures::{FunctionSignature, ImplSignature, TraitSignature},
+    signatures::{
+        ConstSignature, EnumSignature, FunctionSignature, ImplSignature, StaticSignature,
+        TraitSignature,
+    },
     unstable_features::UnstableFeatures,
 };
 use intern::Symbol;
@@ -37,11 +40,11 @@ use hir_ty::{
     InferBodyId, InferenceResult,
     db::HirDatabase,
     display::{DisplayTarget, HirDisplay},
-    next_solver::{GenericArgs, StoredGenericArgs, StoredTy, Ty, TyKind},
+    next_solver::{DbInterner, GenericArg, GenericArgs, StoredGenericArgs, StoredTy, Ty, TyKind},
 };
 
 use super::{
-    BasicBlockId, BinOp, CastKind, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
+    AggregateKind, BasicBlockId, BinOp, CastKind, MirBody, MirSpan, Operand, OperandKind, Rvalue, StatementKind,
     TerminatorKind,
     framed::{Bits, bits_in},
 };
@@ -91,6 +94,8 @@ pub enum ConstCheckKind {
     /// An overloaded operator: `NonConstOperator`. `derefs` is rustc's `ConsiderDereferencing`:
     /// the `*`s that make an `==` of references to a primitive compare the primitives.
     NonConstOperator { callee: FunctionId, trait_: TraitId, derefs: Option<u32>, conditionally: bool },
+    /// A constant pattern's comparison of `ty`s: `NonConstMatchEq`.
+    NonConstMatchEq { ty: StoredTy, conditionally: bool },
     /// A deref the source does not write: `NonConstDerefCoercion` of `ty` into `target`.
     NonConstDerefCoercion { callee: FunctionId, ty: StoredTy, target: StoredTy, conditionally: bool },
     /// A desugaring's call on `ty`, the callee's `Self`.
@@ -132,6 +137,10 @@ pub enum ConstCheckKind {
     EscapingCellBorrow,
     /// `ThreadLocalAccess`.
     ThreadLocalAccess,
+    /// `Coroutine`: a coroutine made in a const context. `what` is rustc's
+    /// `CoroutineKind::to_plural_string`; `gated` is whether `#![feature(const_async_blocks)]`
+    /// allows it (an `async` block or a coroutine), when rustc's error is a feature error.
+    Coroutine { what: &'static str, gated: bool },
 }
 
 /// rustc's `NonConstClosureNote`: what the closure called is.
@@ -151,6 +160,8 @@ pub enum Desugaring {
     QuestionBranch,
     QuestionFromResidual,
     TryBlockFromOutput,
+    /// Every call `.await` makes, `into_future` and `poll`.
+    Await,
 }
 
 impl ConstCheckKind {
@@ -173,6 +184,8 @@ impl ConstCheckKind {
             EscapingMutBorrow => "E0764",
             EscapingCellBorrow => "E0492",
             ThreadLocalAccess => "E0625",
+            Coroutine { gated: true, .. } | NonConstMatchEq { conditionally: true, .. } => "E0658",
+            Coroutine { gated: false, .. } | NonConstMatchEq { conditionally: false, .. } => "",
             PointerToInt
             | PointerComparison
             | FnPointerCall
@@ -241,6 +254,9 @@ impl ConstCheckKind {
                     "`try` block cannot convert `{}` to the result in {kind}",
                     ty(self_ty)
                 ),
+                Desugaring::Await => {
+                    write!(out, "cannot convert `{}` into a future in {kind}", ty(self_ty))
+                }
             },
             NonConstFmtMacroCall { conditionally, .. } => {
                 write!(out, "cannot call {}-const formatting macro in {kind}", non(conditionally))
@@ -282,6 +298,10 @@ impl ConstCheckKind {
             ),
             ThreadLocalAccess => {
                 out.write_str("thread-local statics cannot be accessed at compile-time")
+            }
+            Coroutine { what, .. } => write!(out, "{what} are not allowed in {kind}"),
+            NonConstMatchEq { ty: compared, .. } => {
+                write!(out, "cannot match on `{}` in {kind}", ty(compared))
             }
         }
     }
@@ -427,6 +447,40 @@ impl Status {
     }
 }
 
+/// rustc's `Coroutine` op of a coroutine of `kind`: an `async` block or a coroutine needs
+/// `const_async_blocks`, every other coroutine is refused. `None` for a closure's kind.
+fn coroutine_op(kind: ClosureKind) -> Option<(ConstCheckKind, Status)> {
+    use CoroutineKind::{Async, AsyncGen, Gen};
+    use CoroutineSource::{Block, Closure, Fn};
+    let what = match kind {
+        ClosureKind::OldCoroutine(_) => "coroutines",
+        ClosureKind::Coroutine { kind: Async, source: Block } => "async blocks",
+        ClosureKind::Coroutine { kind: Async, source: Closure } => "async closure bodies",
+        ClosureKind::Coroutine { kind: Async, source: Fn } => "async fn bodies",
+        ClosureKind::Coroutine { kind: Gen, source: Block } => "gen blocks",
+        ClosureKind::Coroutine { kind: Gen, source: Closure } => "gen closure bodies",
+        ClosureKind::Coroutine { kind: Gen, source: Fn } => "gen fn bodies",
+        ClosureKind::Coroutine { kind: AsyncGen, source: Block } => "async gen blocks",
+        ClosureKind::Coroutine { kind: AsyncGen, source: Closure } => "async gen closure bodies",
+        ClosureKind::Coroutine { kind: AsyncGen, source: Fn } => "async gen fn bodies",
+        ClosureKind::Closure | ClosureKind::CoroutineClosure(_) => return None,
+    };
+    let gated = matches!(
+        kind,
+        ClosureKind::OldCoroutine(_) | ClosureKind::Coroutine { kind: Async, source: Block }
+    );
+    let status = match gated {
+        true => Status::Unstable {
+            gate: Symbol::intern("const_async_blocks"),
+            already_checked: false,
+            safe_to_expose: false,
+            is_function_call: false,
+        },
+        false => Status::Forbidden,
+    };
+    Some((ConstCheckKind::Coroutine { what, gated }, status))
+}
+
 /// rustc's `Checker` of one body.
 struct Checker<'a, 'db> {
     db: &'db Db,
@@ -509,8 +563,22 @@ impl<'a, 'db> Checker<'a, 'db> {
             {
                 self.check_op(ConstCheckKind::PointerComparison, Status::Forbidden, span)
             }
+            StatementKind::Assign(_, Rvalue::CheckedBinaryOp(BinOp::Eq, constant, _))
+                if matches!(span, MirSpan::PatId(_)) =>
+            {
+                if let Some(ty) = operand_ty(self.body, constant) {
+                    self.check_match_cmp(ty, span);
+                }
+            }
             StatementKind::InlineAsm(_) => {
                 self.check_op(ConstCheckKind::InlineAsm, Status::Forbidden, span)
+            }
+            StatementKind::Assign(_, Rvalue::Aggregate(AggregateKind::Closure(ty), _)) => {
+                if let TyKind::Coroutine(id, _) = ty.as_ref().kind()
+                    && let Some((kind, status)) = coroutine_op(id.0.loc(self.db).kind)
+                {
+                    self.check_op(kind, status, span);
+                }
             }
             _ => {}
         }
@@ -605,11 +673,11 @@ fn is_const_callable(db: &Db, func: FunctionId) -> bool {
 /// How rustc's message names the function called: `function`, `method` or `associated
 /// function`, and its path, which leaves out the crate when it is the caller's. A trait's
 /// method is `<Self as Trait>::name`, `Self` as `args` have it.
-fn described(
-    db: &Db,
+fn described<'db>(
+    db: &'db Db,
     caller: Crate,
     func: FunctionId,
-    args: GenericArgs<'_>,
+    args: GenericArgs<'db>,
 ) -> (&'static str, String) {
     let signature = FunctionSignature::of(db, func);
     let name = signature.name.as_str();
@@ -617,27 +685,73 @@ fn described(
         true => "method",
         false => "associated function",
     };
+    let parent = hir_ty::generics::generics(db, func.into()).len_parent();
+    let all = args.as_slice();
+    let (parent_args, own_args) = all.split_at(parent.min(all.len()));
     match func.lookup(db).container {
         ItemContainerId::ImplId(impl_) => {
-            let self_ty = db.impl_self_ty(impl_).skip_binder();
-            let ty = super::type_name::rustc_type_name(db, self_ty)
-                .map(|it| {
-                    let bare = it.split('<').next().unwrap_or(&it);
-                    // alloc: the text of a diagnostic, made when it is reported
-                    bare.rsplit("::").next().unwrap_or(bare).to_owned()
-                })
-                // alloc: the text of a diagnostic, made when it is reported
-                .unwrap_or_else(|| "_".to_owned());
+            let ty = impl_type_name(db, caller, impl_, (parent_args.len() == parent).then_some(parent_args));
             // alloc: the text of a diagnostic, made when it is reported
-            (assoc_descr, format!("{ty}::{name}"))
+            (assoc_descr, format!("{ty}::{name}{}", turbofish(db, caller, own_args)))
         }
         ItemContainerId::TraitId(trait_) => {
             let self_ty = self_ty_name(db, args.type_at(0));
             let trait_name = TraitSignature::of(db, trait_).name.as_str();
             // alloc: the text of a diagnostic, made when it is reported
-            (assoc_descr, format!("<{self_ty} as {trait_name}>::{name}"))
+            (assoc_descr, format!("<{self_ty} as {trait_name}>::{name}{}", turbofish(db, caller, own_args)))
         }
-        _ => ("function", def_path(db, caller, func.module(db), name)),
+        _ => {
+            let path = def_path(db, caller, func.module(db), name);
+            // alloc: the text of a diagnostic, made when it is reported
+            ("function", format!("{path}{}", turbofish(db, caller, own_args)))
+        }
+    }
+}
+
+/// An `impl`'s self type as rustc's `def_path_str_with_args` writes it before a method's name:
+/// a type and its arguments, `Vec::<u8>` (`args`, the impl's, when known), or its name alone.
+fn impl_type_name<'db>(
+    db: &'db Db,
+    caller: Crate,
+    impl_: ImplId,
+    args: Option<&[GenericArg<'db>]>,
+) -> String {
+    let self_ty = db.impl_self_ty(impl_);
+    let bare = || {
+        super::type_name::rustc_type_name(db, self_ty.skip_binder())
+            .map(|it| {
+                let bare = it.split('<').next().unwrap_or(&it);
+                // alloc: the text of a diagnostic, made when it is reported
+                bare.rsplit("::").next().unwrap_or(bare).to_owned()
+            })
+            // alloc: the text of a diagnostic, made when it is reported
+            .unwrap_or_else(|| "_".to_owned())
+    };
+    let Some(args) = args.filter(|it| !it.is_empty()) else { return bare() };
+    let ty = self_ty.instantiate(DbInterner::new_no_crate(db), args).skip_norm_wip();
+    if !matches!(ty.kind(), TyKind::Adt(..)) {
+        return bare();
+    }
+    let shown = ty.display(db, DisplayTarget::from_crate(db, caller)).to_string();
+    match shown.split_once('<') {
+        // alloc: the text of a diagnostic, made when it is reported
+        Some((name, rest)) => format!("{name}::<{rest}"),
+        None => shown,
+    }
+}
+
+/// `::<..>` of the generic arguments of a function of its own, as rustc's
+/// `def_path_str_with_args` writes them: no lifetimes, and nothing when none is left.
+fn turbofish<'db>(db: &'db Db, caller: Crate, own: &[GenericArg<'db>]) -> String {
+    let target = DisplayTarget::from_crate(db, caller);
+    // alloc: the text of a diagnostic, made when it is reported
+    let shown: Vec<String> =
+        own.iter().filter(|it| it.as_region().is_none()).map(|it| it.display(db, target).to_string()).collect();
+    match shown.is_empty() {
+        // alloc: none, empty
+        true => String::new(),
+        // alloc: the text of a diagnostic, made when it is reported
+        false => format!("::<{}>", shown.join(", ")),
     }
 }
 
@@ -653,11 +767,21 @@ fn self_ty_name(db: &Db, ty: Ty<'_>) -> TypeName {
 }
 
 /// rustc's `def_path_str` of the item `name` in `module`: its modules' names and its own,
-/// with the crate's name first when it is not `caller`.
+/// with the crate's name first when it is not `caller`. An item in a body is a path through
+/// the body's owner, `copy::copy` for a `fn copy` in `fn copy`'s body: rustc's `DefPath` goes
+/// through it, not through the block.
 fn def_path<'db>(db: &'db Db, caller: Crate, mut module: ModuleIdLt<'db>, name: &str) -> String {
     // alloc: the text of a diagnostic, made when it is reported
     let mut segments = vec![name.to_owned()];
     loop {
+        if module.is_block_module(db)
+            && let Some(block) = module.block(db)
+            && let Some((owner, around)) = super::type_name::block_owner(db, block)
+        {
+            owner_segments(db, caller, owner, &mut segments);
+            module = around;
+            continue;
+        }
         let Some(parent) = module.containing_module(db) else {
             let krate = module.krate(db);
             if krate != caller
@@ -676,6 +800,38 @@ fn def_path<'db>(db: &'db Db, caller: Crate, mut module: ModuleIdLt<'db>, name: 
     }
     segments.reverse();
     segments.join("::")
+}
+
+/// The segments of the path to `owner`'s body, last first, as [`def_path`] gathers them: its
+/// name, then its `impl`'s type or its trait for an associated item.
+fn owner_segments(db: &Db, caller: Crate, owner: DefWithBodyId, segments: &mut Vec<String>) {
+    // alloc: the text of a diagnostic, made when it is reported
+    let named = |name: Option<&hir_expand::name::Name>| name.map_or("_", |it| it.as_str()).to_owned();
+    let container = match owner {
+        DefWithBodyId::FunctionId(it) => {
+            segments.push(named(Some(&FunctionSignature::of(db, it).name)));
+            it.lookup(db).container
+        }
+        DefWithBodyId::ConstId(it) => {
+            segments.push(named(ConstSignature::of(db, it).name.as_ref()));
+            it.lookup(db).container
+        }
+        DefWithBodyId::StaticId(it) => {
+            segments.push(named(Some(&StaticSignature::of(db, it).name)));
+            return;
+        }
+        DefWithBodyId::VariantId(it) => {
+            let variant = it.lookup(db);
+            segments.push(named(Some(&variant.name)));
+            segments.push(named(Some(&EnumSignature::of(db, variant.parent).name)));
+            return;
+        }
+    };
+    match container {
+        ItemContainerId::ImplId(impl_) => segments.push(impl_type_name(db, caller, impl_, None)),
+        ItemContainerId::TraitId(trait_) => segments.push(named(Some(&TraitSignature::of(db, trait_).name))),
+        ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => {}
+    }
 }
 
 /// The type of an operand, when it is a constant or a local.

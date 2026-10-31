@@ -58,7 +58,8 @@ pub enum Ref {
 
 /// A data object of a template: it points only at data before it, so each one's content ID
 /// can be made in order.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: inside `Template`, which only tests copy
 pub struct TemplateData {
     pub align: u32,
     pub bytes: Vec<u8>,
@@ -67,7 +68,8 @@ pub struct TemplateData {
     pub writable: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: tests vary a copy; the memo and the store share one by reference
 pub struct Template {
     pub arch: Arch,
     pub align: u32,
@@ -92,7 +94,8 @@ pub struct Template {
 
 /// A function's [`Unwind`], its personality routine or handler by place and its
 /// language-specific data area by its index among the template's data.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: inside `Template`, which only tests copy
 pub enum TemplateUnwind {
     Dwarf {
         code_align: u32,
@@ -266,7 +269,8 @@ impl TemplateView<'_> {
 
 /// A static's value with what it refers to by place, as a function's [`Template`]. Never
 /// merged with another by content: it is the static [`Target::Static`] names.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: tests vary a copy
 pub struct StaticTemplate {
     pub align: u32,
     pub init: TemplateInit,
@@ -278,7 +282,8 @@ pub struct StaticTemplate {
     pub refs: u32,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: inside `StaticTemplate`, which only tests copy
 pub enum TemplateInit {
     Bytes { bytes: Vec<u8>, relocs: Relocs<Ref> },
     Zeroed { size: u64 },
@@ -286,7 +291,7 @@ pub enum TemplateInit {
 
 /// Why a function and its references don't make a template, or a template and references
 /// don't make a function.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub enum TemplateError {
     /// A relocation points at a function, static or symbol that is not among the references.
     NotReferenced(Target),
@@ -616,16 +621,17 @@ fn refs_len(refs: &Refs) -> u32 {
 }
 
 impl Template {
-    /// `function` with each of its references by its place in `refs`. `extra` are the outside
-    /// symbols its backend named of its own accord ([`crate::backend::Emitted::extra`]): a
-    /// relocation to one of them that `refs` lacks is kept by name in the template.
+    /// [`Template::of_owned`] of a function the test keeps.
+    #[cfg(test)]
     pub fn of(function: &CompiledFunction, refs: &Refs, extra: &[String]) -> Result<Template, TemplateError> {
-        // clone: for a caller that keeps the function; a compile's goes to `of_owned`
+        // clone: tests keep the function they make a template of; a compile's goes to `of_owned`
         Template::of_owned(function.clone(), refs, extra)
     }
 
-    /// [`Template::of`] of a function the caller has no more use for (a compile's): its code,
-    /// data bytes, lines, unwind information and coverage move into the template.
+    /// `function` with each of its references by its place in `refs`. `extra` are the outside
+    /// symbols its backend named of its own accord ([`crate::backend::Emitted::extra`]): a
+    /// relocation to one of them that `refs` lacks is kept by name in the template. The
+    /// function's code, data bytes, lines, unwind information and coverage move into it.
     pub fn of_owned(function: CompiledFunction, refs: &Refs, extra: &[String]) -> Result<Template, TemplateError> {
         check_refs(refs)?;
         let externs = own_externs(refs, extra)?;

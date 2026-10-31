@@ -37,7 +37,7 @@ impl ValType {
 }
 
 /// A function type.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Default)] // clone: the link keeps each signature new to the module once
 pub struct Signature {
     pub params: Vec<ValType>,
     pub results: Vec<ValType>,
@@ -78,7 +78,7 @@ impl Signature {
 }
 
 /// What a function the module doesn't define is imported as.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: once per import a function or static names, kept by the link
 pub struct Import {
     pub module: String,
     pub field: String,
@@ -86,7 +86,7 @@ pub struct Import {
 }
 
 /// What the linker needs of a wasm function beside its body.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default)]
 pub struct Code {
     pub ty: Signature,
     /// The types its `call_indirect`s name.

@@ -18,7 +18,7 @@ use super::{
 };
 
 /// The locals an `async` block keeps in its future: rustc's `CoroutineSavedLocal`s.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HeldLocals {
     /// The locals live across some yield, in the order the body declares them.
     pub locals: Box<[LocalId]>,
@@ -31,7 +31,7 @@ pub struct HeldLocals {
 }
 
 /// One place the body yields at, which is one variant of the future.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct YieldPoint {
     pub resume: BasicBlockId,
     /// Where a future suspended here is dropped.

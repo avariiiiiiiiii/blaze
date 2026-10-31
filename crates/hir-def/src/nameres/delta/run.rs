@@ -399,4 +399,13 @@ impl<'db> Sink<'db> for RegionSink<'db, '_> {
     fn expanded_now(&mut self, module: ModuleId, call: hir_expand::MacroCallId) {
         self.unit.expanded_now(module, call);
     }
+
+    fn collecting_expansion(&mut self, call: hir_expand::MacroCallId) {
+        let db = self.unit.db();
+        let file = hir_expand::HirFileId::from(call).original_file(db).file_id(db);
+        let files = &mut self.out().expansion_files;
+        if !files.contains(&file) {
+            files.push(file);
+        }
+    }
 }

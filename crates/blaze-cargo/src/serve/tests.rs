@@ -35,8 +35,8 @@ use super::{
     Daemon, Options,
     plane::{Inline, Runner},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Output, Phase, Put, Runs, Selection,
-        Source, SourceFile, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Output, Phase, Put, Runs,
+        Selection, Source, SourceFile, Steps, Writer,
     },
 };
 
@@ -365,6 +365,13 @@ struct FakeFront {
 #[derive(Default)]
 struct FakeInputs {
     runs: Vec<usize>,
+}
+
+/// The fakes' front end has no database: their images store no library trees.
+impl KeptDb for FakeInputs {
+    fn db(&self) -> Option<&base_db::Db> {
+        None
+    }
 }
 
 /// The front end written as the real one is: each write asked for waits until no reader of

@@ -1655,11 +1655,9 @@ pub mod fmt {
         }
     }
 
+    // The rest of the primitives get Debug from impl_fmt_traits! above; a second impl is ambiguous.
     impl_debug! {
-        usize u8 u16 u32 u64 u128
-        isize i8 i16 i32 i64 i128
-        f16 f32 f64 f128
-        bool char
+        f16 f128
     }
 
     impl<T: Debug> Debug for [T] {
@@ -1671,12 +1669,6 @@ pub mod fmt {
     impl<T: Debug, const N: usize> Debug for [T; N] {
         fn fmt(&self, _f: &mut Formatter<'_>) -> Result {
             Ok(())
-        }
-    }
-
-    impl<T: Debug + PointeeSized> Debug for &T {
-        fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-            (&**self).fmt(f)
         }
     }
     // endregion:builtin_impls

@@ -40,7 +40,7 @@ const _: () = assert!(size_of::<Variable>() == 60);
 
 /// The scopes of a function's body its named locals are bound in, as the body says them:
 /// which code each is of is known once the code is, from its line rows.
-#[derive(Clone, Default, PartialEq, Eq, Hash, Debug)]
+#[derive(Default, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Scopes {
     /// The scope each is inside of, which comes before it.
     pub(crate) parents: Vec<Option<u32>>,
@@ -77,7 +77,7 @@ const _: () = assert!(size_of::<SpanScope>() == 8);
 
 /// The table as written, borrowing what it tells of, and as read, borrowing the names from
 /// the stored bytes.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub(crate) struct Side<'a> {
     pub(crate) version: u32,
     /// The DWARF expression of what [`Place::Frame`] and `DW_OP_fbreg` count from.
@@ -91,7 +91,7 @@ pub(crate) struct Side<'a> {
 
 /// Code of a body inlined into the function: the `DW_TAG_inlined_subroutine` it is told as,
 /// whose `DW_AT_call_*` is `call_site`.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub(crate) struct Inlined {
     pub(crate) parent: Option<u32>,
     pub(crate) call_site: SpanRef,
@@ -100,7 +100,7 @@ pub(crate) struct Inlined {
 }
 
 /// A part of the function its names are looked up in: a block, what follows a `let`.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub(crate) struct Scope {
     pub(crate) parent: Option<u32>,
     /// The code of the scope and of the scopes inside it, from the first offset up to the
@@ -108,7 +108,7 @@ pub(crate) struct Scope {
     pub(crate) ranges: Vec<(u32, u32)>,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub(crate) struct Told<'a> {
     pub(crate) name: &'a str,
     pub(crate) param: bool,
@@ -117,7 +117,7 @@ pub(crate) struct Told<'a> {
     pub(crate) scope: Option<u32>,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 pub(crate) enum Place {
     /// This far from the frame base, all through the function.
     Frame(i64),

@@ -33,7 +33,7 @@ use super::{
 use crate::home::Homes;
 
 /// The module's name in the crate's root.
-pub(super) const MODULE: &str = "__blaze_test_harness";
+pub const MODULE: &str = "__blaze_test_harness";
 
 /// What the module starts with, after the text of the root file: v1's mark, so a root file
 /// is cut the same by either.

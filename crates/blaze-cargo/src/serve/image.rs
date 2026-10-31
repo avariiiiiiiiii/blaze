@@ -11,10 +11,10 @@
 //! - Once the write is renamed into place the VFS is told ([`Vfs::image_durable`]) and
 //!   flushed, which rewrites its journal onto the image; the file is then mapped and opened,
 //!   for [`Database::settle`].
-//! - The plane's history is the predictor's bytes, a [`History`], in
-//!   [`SectionId::PLANE_HISTORY`] under [`HISTORY`]. One of another blaze starts an empty
-//!   history ([`Unlearned`]), which changes how work is ordered and admitted, never what is
-//!   built; one that is corrupt or does not decode is an error ([`HistoryError`]).
+//! - The plane's history is a [`History`], in the section [`blaze_history::section`] lays out.
+//!   One of another blaze starts an empty history ([`Unlearned`]), which changes how work is
+//!   ordered and admitted, never what is built; one that is corrupt or does not decode is an
+//!   error ([`HistoryError`]).
 //! - An image that is not made is an [`ImageFailed`]: the one before it stays on disk, and
 //!   whoever asked (the cold build's settle, a snapshot, a stop) fails with it.
 
@@ -27,15 +27,10 @@ use std::{
 };
 
 use blaze_core::{Completion, Done, Effect, FileName, IoError, Mapping, Tag};
-use blaze_format::SchemaHash;
-use blaze_history::{DecodeError, History};
+use blaze_history::{DecodeError, History, section::HistoryError};
 use blaze_image::{Builder, Corrupt, Image, OpenError, Refused, SectionId, Stable, TooLarge};
 use blaze_query::{Database, DbError};
 use blaze_vfs::{ImageError, ImageMark, Vfs};
-
-/// The schema of the plane's history section: [`History::encode`]'s bytes, by their version.
-pub const HISTORY: SchemaHash =
-    blaze_format::schema("blaze plane history 2: blaze_history::History::encode bytes, version blzhis01");
 
 /// Why the plane's history starts empty from an image: the image was written by another blaze.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -55,38 +50,32 @@ impl fmt::Display for Unlearned {
     }
 }
 
-/// Why the plane's history in an image can't be read: the daemon does not start.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub enum HistoryError {
-    Corrupt(Corrupt),
-    Decode(DecodeError),
-}
-
-impl fmt::Display for HistoryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HistoryError::Corrupt(corrupt) => write!(f, "{corrupt}"),
-            HistoryError::Decode(error) => write!(f, "{}: {error}", SectionId::PLANE_HISTORY),
-        }
-    }
-}
-
 /// The plane's history in `image`, as `config` sizes it, and why it starts empty when the image
-/// was written without one or with one of another blaze.
+/// was written without one or with one of another blaze. The daemon does not start on an
+/// error: a section that is corrupt or does not decode.
 pub fn history<S: Stable>(
     image: &Image<S>,
     config: blaze_history::Config,
 ) -> Result<(History, Option<Unlearned>), HistoryError> {
-    let section = match image.section(SectionId::PLANE_HISTORY, HISTORY) {
-        Ok(section) => section,
-        Err(refused) => return Ok((History::new(config), Some(Unlearned::Refused(refused)))),
-    };
-    let bytes = image.whole(&section).map_err(HistoryError::Corrupt)?;
-    match History::decode(bytes, config) {
+    match blaze_history::section::restore(image, config) {
         Ok(history) => Ok((history, None)),
-        Err(DecodeError::Version) => Ok((History::new(config), Some(Unlearned::Version))),
-        Err(error) => Err(HistoryError::Decode(error)),
+        Err(HistoryError::Refused(refused)) => Ok((History::new(config), Some(Unlearned::Refused(refused)))),
+        Err(HistoryError::Decode(DecodeError::Version)) => Ok((History::new(config), Some(Unlearned::Version))),
+        Err(error) => Err(error),
     }
+}
+
+/// The library syntax trees `image` stores, read in place; `None` when it was written without
+/// them. A section of another schema or layout, or one that does not read, is the error saying
+/// why, for the start to report: its library files are then parsed.
+pub fn trees(image: &Arc<Image<Mapping>>) -> Result<Option<base_db::trees::Trees>, String> {
+    let section = match image.section(SectionId::SYNTAX_TREES, base_db::trees::SCHEMA) {
+        Ok(section) => section,
+        Err(Refused::Missing { .. }) => return Ok(None),
+        Err(refused) => return Err(refused.to_string()),
+    };
+    let bytes = image.whole_bytes(&section).map_err(|corrupt| format!("the image's {}: {corrupt}", SectionId::SYNTAX_TREES))?;
+    base_db::trees::Trees::open(bytes).map(Some).map_err(|error| error.to_string())
 }
 
 /// Why an image asked was not made.
@@ -136,6 +125,9 @@ impl From<&ImageFailed> for String {
 /// What an image is made of: the parts of the daemon that write its sections.
 pub struct Parts<'a> {
     pub db: &'a Database,
+    /// A kept front end's database: its library files' parses are the image's library syntax
+    /// trees. With none kept the image has no such section, and the next start parses them.
+    pub front: Option<&'a base_db::Db>,
     pub vfs: &'a mut Vfs,
     pub predict: &'a History,
     pub effects: &'a mut Vec<Effect>,
@@ -221,7 +213,16 @@ impl Images {
         if let Err(error) = parts.db.write_image(&mut builder, &mut live) {
             return self.fail(Unmade::Db(error));
         }
-        builder.add(SectionId::PLANE_HISTORY, HISTORY, &parts.predict.encode());
+        blaze_history::section::write(parts.predict, &mut builder);
+        if let Some(front) = parts.front {
+            if let Some(failed) = front.trees().and_then(|it| it.failed()) {
+                tracing::warn!(failed, "a stored library tree failed to read: the image carries none of the old ones on");
+            }
+            // alloc: the section, once an image.
+            let mut trees = Vec::new();
+            base_db::trees::write_section(front, &mut trees);
+            builder.add(SectionId::SYNTAX_TREES, base_db::trees::SCHEMA, &trees);
+        }
         intern::write_symbols(&live, &mut builder);
         match builder.finish_on(&on_pool) {
             Ok(bytes) => {
@@ -298,6 +299,9 @@ pub fn on_pool(n: usize, job: &(dyn Fn(usize) + Sync)) {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use blaze_format::SchemaHash;
+    use blaze_history::section::SCHEMA as HISTORY;
 
     use super::*;
 

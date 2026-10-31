@@ -1262,7 +1262,7 @@ LL |     const async fn a() {}
 error: aborting due to 1 previous error
 
 "###;
-    assert_eq!(ui("const-async-fn-in-main.rs", "2021", source), stderr);
+    assert_eq!(ui_core("const-async-fn-in-main.rs", "2021", "future", source), stderr);
 }
 
 #[test]

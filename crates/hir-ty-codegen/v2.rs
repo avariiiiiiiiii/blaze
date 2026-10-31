@@ -23,7 +23,7 @@ use hir_ty::{
 use hir_ty_mir::mir::MirSpan;
 use hir_ty_share::code::TABLES;
 
-use crate::{Instance, Pending, fragment};
+use crate::{Instance, InstanceDef, Pending, fragment};
 
 pub(crate) mod allocator;
 pub(crate) mod backend;
@@ -52,9 +52,9 @@ pub(crate) mod wasm;
 pub use backend::Backends;
 pub use frontend::{BodyChecks, Databases, HirFrontend};
 pub use hashes::ItemHashes;
-pub use linked::LinkInputs;
+pub use linked::{LinkInputs, span_tables_of};
 pub use lowered::{Lowering, lowered};
-pub use roots::{RootKind, RootTest, Roots, proc_macros as proc_macro_list};
+pub use roots::{RootKind, RootTest, Roots, harness::MODULE as HARNESS_MODULE, proc_macros as proc_macro_list};
 pub use toolchain::{Runs, select, toolchain};
 #[cfg(feature = "llvm")]
 pub use crate::llvm::pgo::Profile;
@@ -181,7 +181,18 @@ pub enum Body {
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct HirInstance(pub(crate) Kind);
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+impl HirInstance {
+    /// The function item this is an instance of, with any generic arguments. `None` for a
+    /// closure, a coroutine, a shim, an `asm!` function, the allocator shim's and the C `main`.
+    pub fn function(&self) -> Option<FunctionId> {
+        match &self.0 {
+            Kind::Code(Instance { def: InstanceDef::Fn(func), .. }, _) => Some(*func),
+            Kind::Code(..) | Kind::Asm(_) | Kind::Start(_) | Kind::Allocator(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Debug)] // clone: inside `Instance`, which the walk of what a function reaches queues once per callee
 pub(crate) enum Kind {
     /// What the IR builder compiles: a function, closure, coroutine or shim with its generic
     /// arguments, regions erased, in the environment of the crate it is compiled as
@@ -285,7 +296,7 @@ impl Function {
 
 /// What each request of a function's IR is in the build: its references by their place in
 /// [`blaze_codegen::backend::Described::refs`], its data by content.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)] // clone: a release build's export keeps the places of each function it builds
 pub(crate) struct Places {
     /// By the function request's number (`FuncId`): its place.
     pub(crate) funcs: Vec<u32>,
@@ -295,7 +306,7 @@ pub(crate) struct Places {
     pub(crate) refs: u32,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: inside `Places`
 pub(crate) enum DataPlace {
     /// A static, or one of an `extern` block, by its place.
     Place(u32),
@@ -310,7 +321,7 @@ pub(crate) enum DataPlace {
 }
 
 /// A crate the build compiles for its build scripts and proc macros, not for the program.
-#[derive(Clone, Default, Debug)]
+#[derive(Default, Debug)]
 pub struct BuildTime(pub rustc_hash::FxHashSet<Crate>);
 
 /// The error of `unit`, saying `what`.

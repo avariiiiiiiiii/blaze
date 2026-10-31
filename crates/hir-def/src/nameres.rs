@@ -134,10 +134,13 @@ pub struct BuiltinDerives {
     pub expand: bool,
 }
 
-/// Has the def maps of `db` expand builtin derives (`true`) or only record them.
+/// Has the def maps of `db` expand builtin derives (`true`) or only record them. Every crate's
+/// collection reads it, so a change is a crate-wide write: the name resolution maintainer
+/// resolves every crate it has already published again.
 pub fn set_expand_builtin_derives(db: &mut Db, expand: bool) {
     use blaze_query::db::{Durability, Setter};
     match BuiltinDerives::try_get(db) {
+        Some(it) if it.expand(db) == expand => return,
         Some(it) => {
             it.set_expand(db).with_durability(Durability::HIGH).to(expand);
         }
@@ -145,6 +148,7 @@ pub fn set_expand_builtin_derives(db: &mut Db, expand: bool) {
             _ = BuiltinDerives::builder(expand).durability(Durability::HIGH).new(db);
         }
     }
+    db.note_crates_changed();
 }
 
 /// Whether the collection of a def map of `db` records builtin derives instead of expanding
@@ -674,18 +678,16 @@ pub(crate) struct DefMapPair<'db> {
     pub(crate) local: LocalDefMap,
 }
 
+/// `krate`'s display name, empty without one: what a span names the crate by, backdated when the
+/// rest of its extra data (version, potential cfg options) changes.
+#[blaze_query::tracked(returns(ref))]
+fn crate_display_name(db: &Db, krate: Crate) -> SmolStr {
+    krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().to_smolstr()).unwrap_or_default()
+}
+
 #[blaze_query::tracked(returns(ref))]
 pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
-    let _p = tracing::info_span!(
-        "crate_def_map_query",
-        name=?crate_id
-            .extra_data(db)
-            .display_name
-            .as_ref()
-            .map(|it| it.crate_name().to_smolstr())
-            .unwrap_or_default()
-    )
-    .entered();
+    let _p = tracing::info_span!("crate_def_map_query", name = ?crate_display_name(db, crate_id)).entered();
 
     if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
         return DefMapPair::new(db, def_map, local_def_map);

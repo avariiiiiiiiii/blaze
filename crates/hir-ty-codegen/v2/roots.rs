@@ -17,7 +17,7 @@
 //! `-Zon-broken-pipe`), whose front end refuses them; `lang_start` is passed `sigpipe::DEFAULT`
 //! as rustc passes it without the flag.
 
-mod harness;
+pub(super) mod harness;
 mod kept;
 mod outside;
 pub mod proc_macros;
@@ -57,7 +57,7 @@ pub enum RootKind {
 }
 
 /// One test of a harness, as libtest lists it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct RootTest {
     /// The name libtest shows and `--exact` picks: its path from the crate's root.
     pub name: String,
@@ -77,7 +77,7 @@ pub struct RootTest {
 
 /// The roots of a unit: each instance once, then each static a linker or a runtime finds by
 /// its name though no code names it.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct Roots {
     pub roots: Vec<HirInstance>,
     /// `#[used]` statics, and those exported (`#[no_mangle]`, `#[export_name]`).

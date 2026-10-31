@@ -92,9 +92,24 @@ pub(crate) fn workspace(metadata: Option<&toml::Value>, manifest: &Path) -> Resu
                     out.link_dirs.push(absolute);
                 }
             }
-            // The daemon's or another experiment's: checked here, read where they are used.
-            "unsandboxed-proc-macros" | "build-script-env" | "wasi-build-scripts" => {
+            // Every build script is given the command's whole environment, these variables too.
+            "build-script-env" => {
                 names()?;
+            }
+            "unsandboxed-proc-macros" => {
+                return Err(wrong(&format!(
+                    "`unsandboxed-proc-macros` lists {:?}, but no proc macro can run outside: blaze runs \
+                     every proc macro on its own evaluator, which has no way out (docs/cargo.md, \"Proc \
+                     macros run on blaze's evaluator\"); remove the key",
+                    names()?
+                )));
+            }
+            "wasi-build-scripts" => {
+                return Err(wrong(&format!(
+                    "`wasi-build-scripts` lists {:?}, but blaze runs every build script natively in its \
+                     sandbox, none under WASI; remove the key",
+                    names()?
+                )));
             }
             other => {
                 return Err(wrong(&format!(
@@ -250,6 +265,11 @@ mod tests {
         assert!(unknown.what.starts_with("[workspace.metadata.blaze.sandbox] in /w/Cargo.toml: `build-scripts`"), "{}", unknown.what);
         let not_list = workspace(Some(&metadata("[blaze.sandbox]\nunsandboxed-build-scripts = \"a\"\n")), manifest).unwrap_err();
         assert!(not_list.what.ends_with("`unsandboxed-build-scripts` is a list"), "{}", not_list.what);
+        for key in ["unsandboxed-proc-macros", "wasi-build-scripts"] {
+            let asked = workspace(Some(&metadata(&format!("[blaze.sandbox]\n{key} = [\"m\"]\n"))), manifest).unwrap_err();
+            assert!(asked.what.contains(&format!("`{key}` lists [\"m\"]")), "{}", asked.what);
+            assert!(asked.what.ends_with("remove the key"), "{}", asked.what);
+        }
         let member = Path::new("/w/a/Cargo.toml");
         let not_bool = package(Some(&metadata("[blaze.sandbox]\nbuild-script = \"no\"\n")), member).unwrap_err();
         assert!(not_bool.what.ends_with("`build-script` is true or false"), "{}", not_bool.what);

@@ -31,7 +31,7 @@ pub enum Address {
 }
 
 /// What an instance refers to, as its front end names it.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)] // clone: `Described::refs` is copied out of the front end's memo, once per function described
 pub enum FrontRef<I, S> {
     Function(I),
     Static(S),
@@ -42,7 +42,7 @@ pub enum FrontRef<I, S> {
 }
 
 /// What the front end says of a function instance, without compiling it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Described<I, S> {
     pub item: ItemKey,
     pub code: CodeHash,
@@ -81,7 +81,7 @@ pub struct Described<I, S> {
 }
 
 /// What the front end says of a static.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DescribedStatic<I, S> {
     pub item: ItemKey,
     /// Which instance of the item: a generic's thread-local or a promoted constant's owner;
@@ -153,7 +153,7 @@ impl Shape {
 }
 
 /// What a compile gives.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Emitted {
     pub function: CompiledFunction,
     /// Its debug info and panic locations, kept in the store under

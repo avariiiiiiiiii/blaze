@@ -158,6 +158,26 @@ pub(super) fn cache_code(
     Ok(u128::from(low) | u128::from(high) << 64)
 }
 
+/// What `instance` of the cached function `func` writes as the code of its body
+/// ([`FunctionCx::cache_code`]): the hash of all its closure reaches, or why it is not cached.
+/// `None` for a function that asks for no closure's code. The function's own code hash takes
+/// its closure by interface, so a key of its code must take this beside it.
+pub(super) fn written_code<'db>(
+    db: &'db Db,
+    func: FunctionId,
+    instance: &Instance,
+    env: &StoredParamEnvAndCrate,
+) -> Option<&'db std::result::Result<u128, String>> {
+    let id = cached_closure_of(db, func)?;
+    let closure = Instance {
+        def: InstanceDef::Closure(id.as_id()),
+        args: instance.args,
+        checked: instance.checked,
+    };
+    let env = Homes::default().home(db, &closure, env);
+    Some(cache_code(db, closure, env))
+}
+
 /// A way a test's end depends on more than its code.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Found {

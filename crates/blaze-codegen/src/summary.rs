@@ -97,7 +97,8 @@ impl Attrs {
 }
 
 /// A call site of a function. 64 bytes, its `args` on the heap.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: inside `Summary`, which only tests copy
 pub struct Call {
     pub callee: InstanceKey,
     /// How many call sites of it the function has.
@@ -108,7 +109,8 @@ pub struct Call {
 
 const _: () = assert!(size_of::<Call>() == 64);
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(test, derive(Clone))] // clone: tests decide from copies of one set of summaries
 pub struct Summary {
     pub key: InstanceKey,
     /// Its instructions, as LLVM counts them after its pre-link pipeline.
@@ -134,7 +136,7 @@ pub struct Summary {
 }
 
 /// What one release compile is given, decided from the summaries of the whole build.
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Hash, Debug)] // clone: the build takes each release function's copy to drop what it may not build in
 pub struct Imports {
     /// The functions whose exports it may build in, at any depth, sorted.
     pub imported: Vec<InstanceKey>,

@@ -24,7 +24,7 @@ use super::{
 };
 
 /// Whether two of a list of locals may hold storage at once, by their index in the list.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StorageConflicts {
     /// The ones that have storage all through the body, as words.
     always: Box<[u64]>,

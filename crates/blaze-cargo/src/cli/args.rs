@@ -286,6 +286,8 @@ pub enum Asked {
     Stop,
     /// `blaze status`: what the daemon is doing.
     Status,
+    /// `blaze toolchain`: blaze's Rust, downloaded once unless rustup has it.
+    Toolchain,
     /// `blaze daemon install` or `blaze daemon uninstall`: the units that socket-activate it.
     Daemon(DaemonVerb),
     /// `blaze codegen-inputs`, `blaze trace` or `blaze tables`: what the daemon's last build of
@@ -533,6 +535,7 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
             Some("--version" | "-V") => return Ok(Asked::Version),
             Some("stop") => return Ok(Asked::Stop),
             Some("status") => return Ok(Asked::Status),
+            Some("toolchain") => return Ok(Asked::Toolchain),
             Some("daemon") => {
                 return Ok(match words.next().as_deref().and_then(std::ffi::OsStr::to_str) {
                     Some("install") => Asked::Daemon(DaemonVerb::Install),

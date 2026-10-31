@@ -523,7 +523,7 @@ impl blaze_codegen::driver::Lookup for Reading<'_> {
 /// told the bodies the build reaches, it stops the build once it failed. `None` for a crate
 /// whose check outcome is already known.
 pub(crate) fn generate<'db>(
-    job: &Job,
+    job: &'db Job,
     reader: &'db UnitReader,
     unit: usize,
     makes: &Makes,
@@ -541,7 +541,8 @@ pub(crate) fn generate<'db>(
     // a unit of another is refused here, naming both.
     hir_ty_codegen::v2::select(&toolchain)?;
     let policy = policy(job, unit, toolchain)?;
-    let frontend = frontend(job, reader, mounted).with_policy(&policy);
+    // A cancelled job's build stops within a function: its caller posts it again.
+    let frontend = frontend(job, reader, mounted).with_policy(&policy).with_stop(&job.input.cancelled);
     let frontend = match checks {
         Some(checks) => frontend.with_checks(checks),
         None => frontend,
@@ -1043,6 +1044,7 @@ fn relink(
         true => Some(super::test::image::table(
             path,
             built,
+            &side.spans,
             linked.image.slots(),
             |key| linked.image.slot(key).map(|it| it.0),
             ContentId::default(),

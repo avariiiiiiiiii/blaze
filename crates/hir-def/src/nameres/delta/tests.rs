@@ -601,7 +601,7 @@ fn an_edit_in_a_body_of_a_macro_heavy_file_sets_nothing_the_def_map_reads() {
     let work = work_of(&mut db, krate, |db| db.set_file_text(file, &macro_heavy_text("0")));
     assert_eq!(work.slices, 0, "inputs the maintainer set, though each ends as it was: {work:?}");
     let after = super::publish::Slices::of(&db, krate);
-    assert_eq!(before.differing(&after), Vec::<&str>::new(), "fields of the crate's resolution set");
+    assert_eq!(before.differing(&after), Vec::<String>::new(), "fields of the crate's resolution set");
     assert_eq!(*krate.extra_data(&db), extra, "the crate's extra data");
     let log = crate::test_db::TestDBExt::executed_in_read_order(&db, || _ = crate_local_def_map(&db, krate));
     assert!(log.iter().all(|it| it != "resolution_of" && it != "crate_local_def_map"), "{log:#?}");
@@ -618,6 +618,7 @@ fn an_edit_in_a_body_of_a_macro_heavy_file_runs_no_resolution_of_again() {
     let (mut db, file, krate) = macro_heavy();
     let write = db.executed_in_write(|db| db.set_file_text(file, &macro_heavy_text("0")));
     let read = db.executed_in_read_order(|| _ = crate_local_def_map(&db, krate));
+    let second = db.executed_in_write(|db| db.set_file_text(file, &macro_heavy_text("1")));
 
     let (mut db, file, krate) = macro_heavy();
     let within = db.executed_in_write(|db| {
@@ -625,10 +626,86 @@ fn an_edit_in_a_body_of_a_macro_heavy_file_runs_no_resolution_of_again() {
         _ = crate_local_def_map(db, krate);
     });
 
+    let (mut db, file, _) = macro_heavy();
+    let events = db.log_write_in_read_order(|db| db.set_file_text(file, &macro_heavy_text("0")));
+    let storage = blaze_query::db::Database::storage(&db);
+    let of: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            blaze_query::db::EventKind::WillExecute { database_key }
+                if storage.ingredient_name(database_key.ingredient_index()) == "resolution_of" =>
+            {
+                let key = database_key.key_index();
+                let krate = all_crates(&db).iter().copied().find(|it| blaze_query::db::AsId::as_id(it) == key);
+                Some(krate.map_or_else(
+                    || format!("{key:?}, no crate"),
+                    |it| format!("{:?}", it.extra_data(&db).display_name),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(
         (ran(&write), ran(&read), ran(&within)),
         (0, 0, 0),
-        "`resolution_of` ran (in the write, in a read after it, in a read in the write)\n\
-         write: {write:#?}\nread: {read:#?}\nwithin: {within:#?}"
+        "the crates whose `resolution_of` ran in the write: {of:?}; in a second write: {}\n\
+         `resolution_of` ran (in the write, in a read after it, in a read in the write)\n\
+         write: {write:#?}\nread: {read:#?}\nwithin: {within:#?}",
+        ran(&second)
     );
+}
+
+/// An attribute macro's input is its whole item: an edit inside an attributed inline module,
+/// which leaves the call where it was, expands the attribute again, and the module gains what
+/// the edit wrote. The incremental tests' `typing_inside_an_attribute_should_not_invalidate_def_map`
+/// shows no expansion after such an edit (queue 01309).
+#[test]
+fn an_edit_inside_an_attributed_module_expands_the_attribute_again() {
+    let mut loaded = Loaded::new(
+        r#"
+//- proc_macros: identity
+//- /lib.rs
+#[proc_macros::identity]
+pub mod m {
+    pub struct A;
+}
+"#,
+    );
+    let krate = loaded.krate();
+    let root = loaded.file("/lib.rs");
+    let has = |db: &Db, it: &str| {
+        let module = module_at(db, krate, &["m"]);
+        module.def_map(db).module(db, module).scope(db).type_(&name(it)).is_some()
+    };
+    assert!(has(&loaded.db, "A") && !has(&loaded.db, "B"), "`m` holds `A` alone");
+    let text = loaded.text(root).replace("pub struct A;", "pub struct A;\n    pub struct B;");
+    loaded.db.set_file_text(root, &text);
+    assert!(has(&loaded.db, "B"), "`m` holds the `B` the edit wrote inside the attributed module");
+    let mut failures = String::new();
+    check_db(&loaded.db, "an edit inside an attributed module", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+}
+
+/// An attribute macro's input is its whole item, the fn body too, and its output may depend on
+/// that body: an edit that makes the body of a `#[identity_when_valid]` fn invalid turns its
+/// expansion into an error, which a fresh map shows. The item tree leaves bodies out, so this
+/// write changes none of the module's round-0 ops (queue 01309,
+/// `typing_inside_an_attribute_should_not_invalidate_def_map`).
+#[test]
+fn an_edit_in_the_body_of_an_attributed_fn_expands_the_attribute_again() {
+    let mut loaded = Loaded::new(
+        r#"
+//- proc_macros: identity_when_valid
+//- /lib.rs
+#[proc_macros::identity_when_valid]
+pub fn f() {}
+"#,
+    );
+    let root = loaded.file("/lib.rs");
+    let mut failures = String::new();
+    check_db(&loaded.db, "before the edit", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
+    loaded.db.set_file_text(root, "#[proc_macros::identity_when_valid]\npub fn f() { let = ; }\n");
+    check_db(&loaded.db, "a body the attribute rejects", &Exempt::NONE, false, &mut failures);
+    assert!(failures.is_empty(), "{failures}");
 }

@@ -61,6 +61,7 @@ const CHANGES_CODE: &[&str] = &[
     "BLAZE_LEAN",
     "BLAZE_BACKEND",
     "BLAZE_OPT",
+    "BLAZE_EMIT",
     "BLAZE_NO_HOME",
     "BLAZE_BUILT_IN",
 ];
@@ -543,7 +544,11 @@ pub(super) fn built(db: &Db, instance: &HirInstance, checked: bool) -> Result<Bu
             let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
             compile_as(db, env, None, false, checked, true, |fx| fx.start_shim(*main))
         }
-        Kind::Asm(text) => return assembled(text),
+        Kind::Asm(text) => {
+            // An `asm!` block's code is its text, the same under every unit's settings.
+            _ = super::build::building();
+            return assembled(text);
+        }
         Kind::Allocator(forward) => super::allocator::built(db, forward, checked),
     }
     .map_err(|e| e.to_string())?; // alloc: the error's message

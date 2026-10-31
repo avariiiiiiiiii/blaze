@@ -32,6 +32,9 @@ mod namespace {
     pub(super) const STATIC: u32 = 2;
     pub(super) const POSITION: u32 = 3;
     pub(super) const OWN: u32 = 4;
+    /// A body built in: Cranelift's inliner puts the body where it is called and leaves its
+    /// name declared, which no instruction names any more (and the emit refuses one that is).
+    pub(super) const BUILT_IN: u32 = 5;
 }
 
 /// The parts of a shape, each once, in this order.
@@ -75,10 +78,7 @@ pub(crate) fn of(unit: &Unit, function: &Function, frame: &Frame) -> Result<Shap
                     let canonical = match name.namespace {
                         0 => UserExternalName::new(namespace::PLACE, place(places, name.index)?),
                         1 => data.name(name.index)?,
-                        fragment::INLINED => {
-                            // alloc: the error's message
-                            return Err("a reference of a body built in".to_owned());
-                        }
+                        fragment::INLINED => UserExternalName::new(namespace::BUILT_IN, 0),
                         // alloc: the error's message
                         other => return Err(format!("a name in the unknown namespace {other}")),
                     };

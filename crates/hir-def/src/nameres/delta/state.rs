@@ -192,6 +192,9 @@ pub(super) struct GroupOut {
     pub(super) writes_root: bool,
     /// Whether it expanded an `include!`, which reads a file no module is defined in.
     pub(super) uses_include: bool,
+    /// The files of the calls it expanded: an expansion's input is its call's syntax, fn bodies
+    /// and token trees included, which a write may change with the group's log as it was.
+    pub(super) expansion_files: Vec<FileId>,
 }
 
 /// A copy of `op`: logs are query values, and the state keeps the last one it read of each

@@ -41,7 +41,12 @@ pub fn main() -> ExitCode {
             println!("{}", versions::why_this_one());
             Ok(0)
         }
-        _ => return blaze_cargo::cli::main(std::env::args_os()),
+        _ => {
+            if let Err(error) = crate::huge::huge_pages_for_mimalloc() {
+                return failed(&format!("{error:#}"));
+            }
+            return blaze_cargo::cli::main(std::env::args_os());
+        }
     };
     match done {
         Ok(code) => ExitCode::from(u8::try_from(code).unwrap_or(1)),

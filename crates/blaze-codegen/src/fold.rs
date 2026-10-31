@@ -21,7 +21,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_hashcons::{Consed, HashCons, Interned};
-use blaze_ids::{ContentId, Domain, Hasher};
+use blaze_ids::{ContentId, Domain, Hasher, radix};
 use serde::{Deserialize, Serialize};
 
 use crate::{InstanceKey, Settings, Target, backend::Emitted, content::target_id, template::Refs};
@@ -44,7 +44,7 @@ pub enum Constant {
 }
 
 /// A prepared function's IR with its constants masked: what [`groups`] compares.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub struct Masked {
     /// The IR's canonical form with its constants left out, or a content hash of it (the
     /// Cranelift backend's): equal for two functions exactly when their masked IR is.
@@ -76,7 +76,7 @@ impl Masked {
 ///
 /// Hash-consed under [`MASKED_DOMAIN`], fed what `groups` hashed before it was: its content
 /// ID is the bucket every group's shape and key are made from.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(PartialEq, Eq, Hash, Debug)]
 pub struct Form {
     shape: Vec<u8>,
     size: u32,
@@ -123,7 +123,7 @@ impl<'a> Masking<'a> {
 }
 
 /// Functions that fold into one body.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Group {
     /// The merged body's shape: the masked IR, every constant equal for all members with its
     /// value (a place by its target), and which parameter each varying one reads.
@@ -208,7 +208,7 @@ impl Default for Limits {
 /// `i`'s: its own, then [`Target::Direct`] of the body. The driver makes their templates
 /// against exactly those. A thunk's data are the member's objects of the varying
 /// [`Constant::Data`]; the body's, the objects equal for every member.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug)]
 pub struct Merged {
     pub body: Emitted,
     pub thunks: Vec<Emitted>,
@@ -293,9 +293,8 @@ struct Split<'a> {
     /// The constants that start a new parameter in [`Split::params_with`].
     reps: Vec<u32>,
     positions: Vec<u32>,
-    /// Per part, its members in bucket order: `flat[starts[p]..starts[p + 1]]`.
-    starts: Vec<u32>,
-    flat: Vec<u32>,
+    /// Per part, its members in bucket order.
+    parts: radix::Csr<u32>,
     param_of: Vec<u32>,
     /// Per varying constant of the part at hand, the parameter it reads.
     reads: Vec<u32>,
@@ -333,26 +332,14 @@ impl<'a> Split<'a> {
         }
 
         let parts = self.firsts.len();
-        self.starts.clear();
-        self.starts.resize(parts + 1, 0);
-        for &part in &self.part_of {
-            self.starts[part as usize + 1] += 1;
-        }
-        for part in 0..parts {
-            self.starts[part + 1] += self.starts[part];
-        }
-        self.flat.clear();
-        self.flat.resize(self.members.len(), 0);
-        self.positions.clear();
-        self.positions.extend_from_slice(&self.starts[..parts]);
-        for (member, &part) in self.part_of.iter().enumerate() {
-            let at = &mut self.positions[part as usize];
-            self.flat[*at as usize] = member as u32;
-            *at += 1;
-        }
+        self.parts.rebuild(
+            parts,
+            self.part_of.iter().enumerate().map(|(member, &part)| (part, member as u32)),
+            &mut self.positions,
+        );
 
         for part in 0..parts {
-            let members = &self.flat[self.starts[part] as usize..self.starts[part + 1] as usize];
+            let members = self.parts.row(part);
             if members.len() < limits.min_members as usize {
                 continue;
             }
@@ -989,7 +976,8 @@ mod tests {
                     hasher.update(&kind(constant));
                 }
                 assert_eq!(blaze_hashcons::content_of(&masked.form()), hasher.finish());
-                assert_eq!(masked.clone().into_parts(), (masked.form(), masked.constants.clone()));
+                let (form, constants) = (masked.form(), masked.constants.clone());
+                assert_eq!(masked.into_parts(), (form, constants));
                 seen += 1;
             }
         }

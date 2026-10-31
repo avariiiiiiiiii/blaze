@@ -78,16 +78,14 @@ impl Mounts {
     /// `source` put into the VFS as a root of its own and mounted at `at`, durably once the
     /// ticket is. A source mounted there before is replaced: a root is a function of its bytes,
     /// so a fetch of the same source gives the same root.
-    pub fn mount(&mut self, vfs: &mut Vfs, at: &str, source: &Source) -> Result<(Mount, Ticket), String> {
-        let ops: Vec<Op> = source
-            .files
-            .iter()
-            .map(|file| Op::Write { path: file.path.clone(), bytes: file.bytes.clone(), mode: file.mode })
-            .collect();
+    pub fn mount(&mut self, vfs: &mut Vfs, at: &str, source: Source) -> Result<(Mount, Ticket), String> {
+        let Source { files, under } = source;
+        let ops: Vec<Op> =
+            files.into_iter().map(|file| Op::Write { path: file.path, bytes: file.bytes, mode: file.mode }).collect();
         let root = vfs
-            .apply(vfs.empty(), &ops)
+            .apply_owned(vfs.empty(), ops)
             .map_err(|error| format!("the files of the source for {at} don't make a tree: {}", op_error(&error)))?;
-        let mount = Mount { at: at.to_owned(), origin: Origin::Root(root), under: source.under.clone() };
+        let mount = Mount { at: at.to_owned(), origin: Origin::Root(root), under };
         let ticket = vfs.set_head(&head_of(&mount), root).map_err(|error| commit_error(at, &error))?;
         if let Some(old) = self.by_at.insert(at.to_owned(), mount.clone())
             && old.under != mount.under
@@ -104,7 +102,7 @@ impl Mounts {
         vfs: &mut Vfs,
         at: &str,
         fingerprint: &str,
-        source: &Source,
+        source: Source,
     ) -> Result<(Mount, Ticket), String> {
         let (mount, _) = self.mount(vfs, at, source)?;
         let Origin::Root(root) = mount.origin else { unreachable!("a source is mounted as a root of its own") };
@@ -161,9 +159,9 @@ mod tests {
         let (mut vfs, _) = Vfs::recover(journal, 0, &[]);
         let mut mounts = Mounts::default();
         let at = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.219";
-        let (mount, _) = mounts.mount(&mut vfs, at, &source(&[("Cargo.toml", b"[package]\n")], "")).unwrap();
+        let (mount, _) = mounts.mount(&mut vfs, at, source(&[("Cargo.toml", b"[package]\n")], "")).unwrap();
         let index = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/se/rd/serde";
-        mounts.mount(&mut vfs, index, &source(&[("serde", b"{}\n")], "serde")).unwrap();
+        mounts.mount(&mut vfs, index, source(&[("serde", b"{}\n")], "serde")).unwrap();
         let again = Mounts::recover(&vfs);
         assert_eq!(again, mounts);
         assert_eq!(again.get(at), Some(&mount));
@@ -176,10 +174,10 @@ mod tests {
         let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]);
         let mut mounts = Mounts::default();
         let at = "/rustc/0123abcd/library";
-        mounts.mount_library(&mut vfs, at, "f1", &source(&[("core/src/lib.rs", b"#![no_core]\n")], "")).unwrap();
+        mounts.mount_library(&mut vfs, at, "f1", source(&[("core/src/lib.rs", b"#![no_core]\n")], "")).unwrap();
         assert_eq!(mounts.libraries(&vfs), vec![("f1".to_owned(), at.to_owned())]);
         assert_eq!(Mounts::recover(&vfs).libraries(&vfs), mounts.libraries(&vfs), "kept across a restart");
-        mounts.mount(&mut vfs, at, &source(&[("core/src/lib.rs", b"#![no_core] // edited\n")], "")).unwrap();
+        mounts.mount(&mut vfs, at, source(&[("core/src/lib.rs", b"#![no_core] // edited\n")], "")).unwrap();
         assert!(mounts.libraries(&vfs).is_empty(), "the mount is no longer what that library read");
     }
 
@@ -187,9 +185,9 @@ mod tests {
     fn the_same_bytes_are_the_same_root() {
         let (mut vfs, _) = Vfs::recover(FileName::new("journal").unwrap(), 0, &[]);
         let mut mounts = Mounts::default();
-        let files = source(&[("src/lib.rs", b"pub fn f() {}\n")], "");
-        let (one, _) = mounts.mount(&mut vfs, "/a", &files).unwrap();
-        let (two, _) = mounts.mount(&mut vfs, "/b", &files).unwrap();
+        let files = || source(&[("src/lib.rs", b"pub fn f() {}\n")], "");
+        let (one, _) = mounts.mount(&mut vfs, "/a", files()).unwrap();
+        let (two, _) = mounts.mount(&mut vfs, "/b", files()).unwrap();
         assert_eq!(one.origin, two.origin);
     }
 
@@ -201,7 +199,7 @@ mod tests {
         let mut want = Vec::new();
         for (n, at) in ats.iter().enumerate() {
             let body = format!("pub fn f{n}() {{}}\n");
-            let (mount, _) = mounts.mount(&mut vfs, at, &source(&[("src/lib.rs", body.as_bytes())], "")).unwrap();
+            let (mount, _) = mounts.mount(&mut vfs, at, source(&[("src/lib.rs", body.as_bytes())], "")).unwrap();
             let Origin::Root(root) = mount.origin else { panic!("a mount of a source is a root") };
             want.push((*at, root));
         }

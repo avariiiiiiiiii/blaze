@@ -1066,6 +1066,37 @@ fn bar() -> extern "Rust" fn() -> Ret {}
 }
 
 #[test]
+fn ty_repetition_with_a_trailing_comma() {
+    // minicore's `impl_fmt_traits!`: the comma after the last type is the `$(,)?`'s.
+    check(
+        r#"
+macro_rules! m {
+    ( $($ty:ty),* $(,)? ) => { $( impl Tr for $ty {} )* };
+}
+m! {
+    i8, u8,
+}
+m! { i16, u16 }
+m!(
+    i32, usize, char,
+);
+"#,
+        expect![[r#"
+macro_rules! m {
+    ( $($ty:ty),* $(,)? ) => { $( impl Tr for $ty {} )* };
+}
+impl Tr for i8 {}
+impl Tr for u8 {}
+impl Tr for i16 {}
+impl Tr for u16 {}
+impl Tr for i32 {}
+impl Tr for usize {}
+impl Tr for char {}
+"#]],
+    );
+}
+
+#[test]
 fn test_pat_() {
     check(
         r#"

@@ -58,6 +58,7 @@ pub(super) fn read(db: &Db, krate: Crate, state: &mut CrateState, written: &Writ
         walk(db, state, root_key, written, cold, &mut delta);
     }
     include_readers(state, written, &mut delta);
+    expansion_readers(state, written, &mut delta);
     delta
 }
 
@@ -176,6 +177,19 @@ fn is_root_op(root: ModuleId, op: &DeclOp) -> bool {
 
 fn writes_root(root: ModuleId, log: &[DeclOp]) -> bool {
     log.iter().any(|op| is_root_op(root, op))
+}
+
+/// An expansion's input is its call's syntax, which the round-0 log leaves out of an attributed
+/// fn's body or a macro call's token tree: every group that expanded a call in a written file
+/// is a seed, with a possible removal, so an expansion whose output changed is collected again.
+/// A run that makes what was published sets nothing, so the crate's readers stay as they were.
+fn expansion_readers(state: &CrateState, written: &Written<'_>, delta: &mut Delta) {
+    for (&group, g) in &state.groups {
+        if g.out.expansion_files.iter().any(|it| written.set.contains(it)) && !delta.seeds.contains(&group) {
+            delta.seeds.push(group);
+            delta.removing.push(group);
+        }
+    }
 }
 
 /// A written file that defines no module of the crate may be one an `include!` read, and an

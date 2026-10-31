@@ -97,11 +97,18 @@ struct Pipelines {
   StringMap<std::unique_ptr<ModulePassManager>> Parsed;
 };
 
-/* The CGSCC inliner run on its own, not inside the module inliner the default pipelines wrap
- * it in, makes an inline advisor of the first module it runs on and keeps it
- * (InlinerPass::OwnedAdvisor): a pipeline that names it is parsed again for each module, so
- * that no module is optimized by what another left. */
-bool reusable(StringRef Text) { return !Text.contains("inline"); }
+/* Whether a pipeline parsed once can run over every module. Two inliners can't:
+ * - The CGSCC inliner run on its own makes an inline advisor of the first module it runs on
+ *   and keeps it (InlinerPass::OwnedAdvisor), so a second module is optimized by what the
+ *   first left.
+ * - The module inliner the default, LTO and ThinLTO pipelines wrap it in runs once: its run
+ *   moves its CGSCC pipeline and the module passes after it into its own manager
+ *   (ModuleInlinerWrapperPass::run), so a second run is handed null passes and crashes in
+ *   PassInstrumentation::runBeforePass.
+ * A pipeline naming either is parsed again for each module. */
+bool reusable(StringRef Text) {
+  return !Text.contains("inline") && !Text.contains("default<") && !Text.contains("lto");
+}
 
 } // namespace
 

@@ -341,14 +341,12 @@ pub trait Tr { fn m(&self); }
     let assoc = items(&db);
     assert_eq!(assoc.len(), 3, "`get`, `C` and `m`");
     let before: Vec<_> = assoc.iter().map(|it| it.assoc_visibility(&db)).collect();
-    let outline = |db: &TestDB| {
-        let root = crate::signatures::outline_root(db, file);
-        let (tree, at) = root.syntax().flat();
-        tree.source()[tree.range(at)].to_owned()
-    };
+    let outline = |db: &TestDB| crate::signatures::file_outline(db, file).text();
     let outline_before = outline(&db);
 
-    db.set_file_text(file.file_id(&db), &VISIBILITIES.replace("x + 1", "x + 1 + 2 + 3"));
+    let file_id = file.file_id(&db);
+    let edited = db.file_text(file_id).text(&db).as_str().replace("x + 1", "x + 1 + 2 + 3");
+    db.set_file_text(file_id, &edited);
     assert_eq!(outline_before, outline(&db), "the outline's text, every body left out");
     let mut after = Vec::new();
     let log = db.executed_in_read_order(|| after = assoc.iter().map(|it| it.assoc_visibility(&db)).collect());

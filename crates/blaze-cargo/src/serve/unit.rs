@@ -69,8 +69,8 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Phase, Put, Runs, Selection,
-        Source, SourceFile, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Phase, Put, Runs,
+        Selection, Source, SourceFile, Steps, Writer,
     },
 };
 
@@ -277,6 +277,12 @@ fn seed(db: &base_db::Db, seeds: &[blaze_intent::Seed]) -> Result<(), blaze_lowe
 
 fn lower_error(error: blaze_lower::LowerError) -> ApiError {
     ApiError::new(error.what, error.at)
+}
+
+impl KeptDb for KeptLowered {
+    fn db(&self) -> Option<&Db> {
+        Some(self.lowered.db())
+    }
 }
 
 /// A job's front end as the loop keeps it ([`Writer::keep`]), with what it was lowered from:

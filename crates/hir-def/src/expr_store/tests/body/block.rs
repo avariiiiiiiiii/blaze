@@ -192,7 +192,7 @@ fn f() {
             ModuleIdLt {
                 [id]: Id(12291),
                 krate: Crate(
-                    Id(10240),
+                    Id(9216),
                 ),
                 block: Some(
                     BlockId(

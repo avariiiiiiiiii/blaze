@@ -27,13 +27,16 @@ use hir_ty::{
     db::HirDatabase,
     drop::{DropGlue, has_drop_glue, is_freeze},
     layout::Layout,
-    next_solver::{
+        next_solver::{
         DbInterner, ParamEnv, StoredTy, Ty, TyKind, TypingMode,
-        infer::{DbInternerInferExt, InferCtxt},
+        infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
     },
     traits::{StoredParamEnvAndCrate, implements_trait_unique, structurally_normalize_ty},
 };
-use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind};
+use rustc_type_ir::{
+    TypeVisitableExt as _,
+    inherent::{AdtDef as _, GenericArgs as _, IntoKind},
+};
 use crate::{FACT_DOMAIN, Unshared, identity, layout};
 
 /// What a fact or a pointee summary is of: its first byte.
@@ -153,9 +156,22 @@ impl<'db> Cx<'db> {
         has_drop_glue(&self.infcx, ty, self.env.param_env) != DropGlue::None
     }
 
+    /// `ty` with every alias in it normalized, as rustc's `normalize_erasing_regions` has a type
+    /// before layout and codegen: a field instantiated with the ADT's arguments, or a closure's
+    /// signature, can hold a projection deep inside that only resolves with them.
+    fn deeply_normalize(&self, ty: Ty<'db>) -> Result<Ty<'db>, Unshared> {
+        if !ty.has_aliases() {
+            return Ok(ty);
+        }
+        self.infcx
+            .at(&ObligationCause::dummy(), self.env.param_env)
+            .deeply_normalize(ty)
+            .map_err(|errors| Unshared::NoContent(format!("`{ty:?}` does not normalize: {errors:?}"))) // alloc: error path
+    }
+
     /// The fact of `ty`: one query per (type, environment), so a hit is one lookup.
     pub(crate) fn fact(&self, ty: Ty<'db>) -> Result<ContentId, Unshared> {
-        let ty = self.normalize(ty);
+        let ty = self.deeply_normalize(ty)?;
         match fact(self.db, ty.store(), self.stored.clone()) { // clone: the query's key, a reference count
             Ok(id) => Ok(*id),
             Err(why) => Err(why.clone()), // clone: error path
@@ -171,7 +187,7 @@ impl<'db> Cx<'db> {
 
     /// What a pointer to `pointee` says of its memory.
     fn pointee(&self, pointee: Ty<'db>, out: &mut Hasher) -> Result<(), Unshared> {
-        let pointee = self.normalize(pointee);
+        let pointee = self.deeply_normalize(pointee)?;
         let (size, align) = match pointee.kind() {
             TyKind::Str => {
                 out.update(&[tag::POINTEE_STR]);

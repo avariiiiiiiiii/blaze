@@ -710,11 +710,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         })
     }
 
-    /// `type_id_vtable` of `ty` and the `dyn` type `trait_ty`. rustc proves each of the
-    /// `dyn`'s predicates of `ty` in `TypingMode::Reflection` (only impls generic over every
-    /// lifetime, no builtin impl, and the regions checked), a mode the solver here does not
-    /// have; that mode only takes impls away, so a predicate this solver says cannot hold does
-    /// not hold there either, and that answer (`None`) is given. Any other is refused.
+    /// `type_id_vtable` of `ty` and the `dyn` type `trait_ty`, as rustc's
+    /// `type_implements_dyn_trait`: every one of the `dyn`'s predicates of `ty`, its erased
+    /// regions `'static`, holds in `TypingMode::Reflection` with no ambiguity, and then the
+    /// answer is `ty`'s vtable, else `None`. rustc also resolves the regions the proof
+    /// constrains; with every region `'static` and the mode's impls constraining no lifetime
+    /// of their own, none is left free to fail.
     fn reflected_vtable(
         &mut self,
         ty: Ty<'db>,
@@ -728,22 +729,21 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             not_supported!("type_id_vtable for {trait_ty:?}, which is not a `dyn Trait`")
         };
         let interner = self.interner();
-        let fails = predicates.iter().any(|predicate| {
+        let infcx = interner.infer_ctxt().build(TypingMode::Reflection);
+        let mut ocx = ObligationCtxt::new(&infcx);
+        let param_env = self.param_env.param_env;
+        ocx.register_obligations(predicates.iter().map(|predicate| {
             let clause = predicate.with_self_ty(interner, ty);
-            let obligation = Obligation::new(
-                interner,
-                ObligationCause::dummy(),
-                self.param_env.param_env,
-                clause,
-            );
-            !self.infcx.predicate_may_hold(&obligation)
-        });
-        if !fails {
-            not_supported!(
-                "whether {ty:?} implements {trait_ty:?} as reflection asks it: rustc's solver in \
-                 `TypingMode::Reflection`, which the solver here does not have"
-            )
-        }
+            let clause = rustc_type_ir::fold_regions(interner, clause, |region, _| {
+                match region.kind() {
+                    rustc_type_ir::RegionKind::ReErased => Region::new_static(interner),
+                    _ => region,
+                }
+            });
+            Obligation::new(interner, ObligationCause::dummy(), param_env, clause)
+        }));
+        let holds = ocx.evaluate_obligations_error_on_ambiguity().is_empty();
+        let vtable = holds.then(|| word_bytes(self.vtable_map.id(ty)));
         let Some(dyn_metadata) = self.lang_items().DynMetadata else {
             not_supported!("no `DynMetadata` in core")
         };
@@ -753,6 +753,6 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             dyn_metadata.into(),
             GenericArgs::new_from_slice(&[unit_ptr.into()]),
         );
-        self.write_option(destination, dyn_metadata, None::<Vec<u8>>, locals)
+        self.write_option(destination, dyn_metadata, vtable, locals)
     }
 }

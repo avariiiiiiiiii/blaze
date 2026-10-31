@@ -81,7 +81,7 @@ impl From<WasmType> for ValType {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)] // clone: the object keeps each distinct signature once, for its type section
 pub struct WasmSignature {
     pub params: Vec<WasmType>,
     pub results: Vec<WasmType>,
@@ -152,7 +152,7 @@ impl WasmSignature {
 }
 
 /// How a function hands back what it returns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum Returned {
     Nothing,
     Value(Class),

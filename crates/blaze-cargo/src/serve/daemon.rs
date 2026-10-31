@@ -8,8 +8,8 @@
 //!   session call, so what a call committed is on its way to durability when it returns.
 //! - The plane is stepped after every completion; what it did goes to the jobs, and what the
 //!   jobs say to the session.
-//! - Between requests the database and the VFS are collected, keeping each view's plan and
-//!   every mount; after a cold build the daemon image ([`Images`]: the database, the VFS, the
+//! - Between requests the database is collected, and the VFS once it made as many nodes as
+//!   its last collection kept, keeping each view's plan and every mount; after a cold build the daemon image ([`Images`]: the database, the VFS, the
 //!   plane's history and their symbols) is written and the database settles onto it.
 //! - A start maps that image once: the symbols are restored from it first, then the VFS, the
 //!   database and the plane's history each open their sections of it.
@@ -32,7 +32,7 @@ use blaze_api::{
 use blaze_cas::Store;
 use blaze_core::{Address, Completion, Done, Driver, Effect, FileName, Mapping, Tag};
 use blaze_graph::{Budget, PlaneConfig, arena};
-use blaze_history::{Config as HistoryConfig, History};
+use blaze_history::{Config as HistoryConfig, History, section::HistoryError};
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_image::{Corrupt, Image, OpenError, Refused};
@@ -42,7 +42,7 @@ use intern::RestoreError;
 
 use super::{
     heads::{Heads, Out},
-    image::{HistoryError, ImageFailed, Images, Parts, Unlearned, on_pool},
+    image::{ImageFailed, Images, Parts, Unlearned, on_pool},
     job::{Jobs, Said, Setup, Step, Value, World},
     mounts::Mounts,
     plane::{Happened, Plane, Runner, ns},
@@ -200,6 +200,8 @@ pub struct Started {
     pub heads_dropped: usize,
     /// Why the plane's history started empty.
     pub unlearned: Option<Unlearned>,
+    /// Why the image's library syntax trees were not read: every library file is parsed.
+    pub trees: Option<String>,
 }
 
 impl Started {
@@ -212,6 +214,7 @@ impl Started {
             && self.journal_cut == 0
             && self.heads_dropped == 0
             && self.unlearned.is_none()
+            && self.trees.is_none()
     }
 }
 
@@ -244,6 +247,10 @@ impl fmt::Display for Started {
         }
         if let Some(unlearned) = &self.unlearned {
             write!(f, "{sep}the plane's history starts empty: {unlearned}")?;
+            sep = "; ";
+        }
+        if let Some(why) = &self.trees {
+            write!(f, "{sep}the stored library trees were not read ({why}): library files are parsed")?;
         }
         Ok(())
     }
@@ -553,7 +560,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         };
         // First: every other section names symbols by their IDs in this table.
         let restored = opened.as_ref().map(|it| (it.clone(), intern::restore_symbols(it.clone(), &on_pool)));
-        let (vfs, recovered) = Vfs::restore(journal.clone(), VFS, &read.journal.unwrap_or_default(), mapping);
+        let (mut vfs, recovered) = Vfs::restore(journal.clone(), VFS, &read.journal.unwrap_or_default(), mapping);
+        vfs.hash_on(on_pool);
         started.journal_cut = recovered.skipped;
         started.heads_dropped = recovered.heads_dropped;
         vfs_used(recovered.image, &mut started).map_err(|fault| StartError::image(&image, ImageFault::Vfs(fault)))?;
@@ -582,6 +590,14 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
                 history
             }
         };
+        // Before any front end's database is made: each reads the trees installed when made.
+        if let Some(opened) = &opened {
+            match super::image::trees(opened) {
+                Ok(Some(trees)) => _ = base_db::trees::install(Arc::new(trees)),
+                Ok(None) => {}
+                Err(why) => started.trees = Some(why),
+            }
+        }
         let plane_config = PlaneConfig { io: options.io, work: options.threads.max(1), budget: options.budget, starve_after: 8 };
         let plane = Plane::new(plane_config, history, runner).map_err(|error| format!("the plane: {error}"))?;
         let mounts = Mounts::recover(&vfs);
@@ -724,7 +740,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
     }
 
     fn ask_image(&mut self) {
-        let parts = Parts { db: &self.db, vfs: &mut self.vfs, predict: self.plane.predict(), effects: &mut self.effects };
+        let front = self.jobs.front_db();
+        let parts = Parts { db: &self.db, front, vfs: &mut self.vfs, predict: self.plane.predict(), effects: &mut self.effects };
         self.images.ask(parts);
     }
 
@@ -753,7 +770,8 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
         self.done = done;
         self.step_plane();
         let idle = self.effects.is_empty() && self.driver.in_flight() == 0;
-        let parts = Parts { db: &self.db, vfs: &mut self.vfs, predict: self.plane.predict(), effects: &mut self.effects };
+        let front = self.jobs.front_db();
+        let parts = Parts { db: &self.db, front, vfs: &mut self.vfs, predict: self.plane.predict(), effects: &mut self.effects };
         self.images.step(parts, idle);
         self.between();
         self.stepping_stop();
@@ -928,7 +946,7 @@ impl<D: Driver, S: Steps> Daemon<D, S> {
             if let Some(db) = Arc::get_mut(&mut self.db) {
                 db.reclaim();
             }
-            self.vfs.collect(&self.mounts.roots());
+            self.vfs.collect_if_due(&self.mounts.roots());
             self.heads.sweep(&mut self.effects);
             // The requests that read a corrupt group failed with it; the image is not used
             // past it.

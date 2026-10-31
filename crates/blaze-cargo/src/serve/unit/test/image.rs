@@ -12,7 +12,8 @@ use blaze_usercode::test::Executed;
 use hir_ty_codegen::v2::RootTest;
 use rustc_hash::FxHashMap;
 
-/// The execution table of the test binary `binary`, linked from `built`: `slots` is how many
+/// The execution table of the test binary `binary`, linked from `built` with the span tables
+/// `spans` (`LinkInputs::spans`): `slots` is how many
 /// slots its jump table has, `slot_of` the slot its link named for a function, `beside` the
 /// content of the code it runs that is in no table (zero for none), and `tests` its harness's
 /// tests in order. An error names the binary: its tests can't be selected, and are never all
@@ -20,6 +21,7 @@ use rustc_hash::FxHashMap;
 pub(crate) fn table(
     binary: &str,
     built: &Built,
+    spans: &[(ContentId, Vec<u8>)],
     slots: u32,
     slot_of: impl Fn(&InstanceKey) -> Option<u32>,
     beside: ContentId,
@@ -28,7 +30,7 @@ pub(crate) fn table(
     // clone: once per test binary linked, the names the table keeps
     let tests = tests.iter().map(|it| (it.name.clone(), it.root));
     // alloc: error path
-    ExecTable::new(built, slots, slot_of, beside, tests).map_err(|why| format!("the execution table of `{binary}`: {why}"))
+    ExecTable::new(built, spans, slots, slot_of, beside, tests).map_err(|why| format!("the execution table of `{binary}`: {why}"))
 }
 
 /// `table` as a selector reads it. A slot an incremental link emptied ([`ExecTable::EMPTY`]) is

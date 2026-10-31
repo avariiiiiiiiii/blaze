@@ -35,7 +35,7 @@ enum Step {
 }
 
 /// What a pattern asks of the place it is at.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq)] // clone: inside `Pair`
 enum Ask<'t> {
     Variant(EnumVariantId),
     /// An integer or a `char`, as a number that orders the way the type does.
@@ -53,7 +53,7 @@ enum Ask<'t> {
 }
 
 /// A place, what a pattern asks of it, and what the pattern asks inside once that holds.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq)] // clone: what is left after an or-pattern, in the frame, copied to each candidate that goes on to it
 struct Pair<'t> {
     place: Vec<Step, &'t Frame>,
     ask: Ask<'t>,
@@ -61,7 +61,6 @@ struct Pair<'t> {
 }
 
 /// One way an arm can match: what is still to be tested for it.
-#[derive(Clone)]
 struct Candidate<'t> {
     arm: usize,
     pairs: Vec<Pair<'t>, &'t Frame>,

@@ -33,7 +33,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0728`.
 "#;
-    assert_eq!(ui("issue-51719.rs", "2018", source), stderr);
+    assert_eq!(ui_core("issue-51719.rs", "2018", "future", source), stderr);
 }
 
 #[test]
@@ -64,7 +64,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0728`.
 "#;
-    assert_eq!(ui("non-async-enclosing-span.rs", "2018", source), stderr);
+    assert_eq!(ui_core("non-async-enclosing-span.rs", "2018", "future", source), stderr);
 }
 
 #[test]
@@ -95,7 +95,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0728`.
 "#;
-    assert_eq!(ui("issue-51751.rs", "2018", source), stderr);
+    assert_eq!(ui_core("issue-51751.rs", "2018", "future", source), stderr);
 }
 
 #[test]
@@ -150,7 +150,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0728`.
 "#;
-    assert_eq!(ui("issue-70594.rs", "2018", source), stderr);
+    assert_eq!(ui_core("issue-70594.rs", "2018", "future", source), stderr);
 }
 
 #[test]

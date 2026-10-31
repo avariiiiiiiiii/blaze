@@ -164,13 +164,34 @@ fn linked(db: &Db, krate: Crate) -> Result<Vec<NativeLib>, String> {
 /// Every span table `built` names, encoded: of each body and function declaration of its
 /// items whose anchor its code names. An anchor of no table found is an error naming it.
 fn span_tables(db: &Db, hashes: &HashSource, built: &Built) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
-    let mut named = named_anchors(built);
+    tables(db, hashes, &built.items, named_anchors(built))
+}
+
+/// The span tables of `items` that `named` lists, encoded as the linker's `SpanTable::decode`
+/// reads them: for code loaded in process with no [`Built`] to read the anchors from. An
+/// anchor of no table found is an error naming it.
+pub fn span_tables_of(
+    db: &Db,
+    hashes: &HashSource,
+    items: &[ItemKey],
+    named: impl IntoIterator<Item = ContentId>,
+) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
+    // alloc: per call, the anchors asked for
+    tables(db, hashes, items, named.into_iter().map(|it| (it, NamedBy::Caller)).collect())
+}
+
+fn tables(
+    db: &Db,
+    hashes: &HashSource,
+    items: &[ItemKey],
+    mut named: FxHashMap<ContentId, NamedBy>,
+) -> Result<Vec<(ContentId, Vec<u8>)>, String> {
     let mut names: FxHashMap<base_db::FileId, String> = FxHashMap::default();
     // alloc: per link, a table the code names each
     let mut spans = Vec::with_capacity(named.len());
     let mut owners: FxHashSet<DefWithBodyId> = FxHashSet::default();
     let mut declared: FxHashSet<FunctionId> = FxHashSet::default();
-    for &item in &built.items {
+    for &item in items {
         let owner = match blaze_items::resolve(db, item) {
             Some(Resolved::Item(ItemId::Function(func))) => {
                 declared.insert(func);
@@ -254,6 +275,8 @@ fn named_anchors(built: &Built) -> FxHashMap<ContentId, NamedBy> {
 enum NamedBy {
     Function(InstanceKey),
     Static(ItemKey),
+    /// The caller of [`span_tables_of`], which named it.
+    Caller,
 }
 
 impl std::fmt::Display for NamedBy {
@@ -261,6 +284,7 @@ impl std::fmt::Display for NamedBy {
         match self {
             NamedBy::Function(key) => write!(f, "the function {key:?}"),
             NamedBy::Static(item) => write!(f, "the static {item:?}"),
+            NamedBy::Caller => f.write_str("the caller"),
         }
     }
 }

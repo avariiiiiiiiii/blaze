@@ -328,7 +328,7 @@ pub enum AggregateKind {
     //Coroutine(LocalDefId, SubstsRef, Movability),
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)] // clone: inside `MirBody`
 pub struct SwitchTargets {
     /// Possible values. The locations to branch to in each case
     /// are found in the corresponding indices from the `targets` vector.
@@ -521,7 +521,7 @@ impl Iterator for Successors<'_> {
 
 impl ExactSizeIterator for Successors<'_> {}
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: inside `MirBody`
 pub enum TerminatorKind {
     /// Block has one successor; we continue execution there.
     Goto { target: BasicBlockId },
@@ -999,7 +999,7 @@ pub enum CastKind {
     Transmute,
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: inside `MirBody`
 pub enum Rvalue {
     /// Yields the operand unchanged
     Use(Operand),
@@ -1134,7 +1134,7 @@ pub enum Rvalue {
     CopyForDeref(StoredPlace),
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: inside `MirBody`
 pub enum StatementKind {
     Assign(StoredPlace, Rvalue),
     FakeRead(StoredPlace),
@@ -1153,7 +1153,7 @@ pub enum StatementKind {
 }
 
 /// An `asm!` block. One that does not return is followed by `Unreachable`.
-#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)] // clone: inside `MirBody`
 pub struct InlineAsm {
     /// The pieces name `operands` by index.
     pub template: Box<[hir_def::hir::AsmPiece]>,
@@ -1197,7 +1197,7 @@ pub struct Statement {
     pub span: MirSpan,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)] // clone: inside `MirBody`
 pub struct BasicBlock {
     /// List of statements in this block.
     pub statements: Vec<Statement>,
@@ -1525,7 +1525,7 @@ pub struct InlinedPromoted {
 }
 
 /// What an optimized body inlined. Empty in every body as it is built.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, blaze_query::Value)] // clone: inside `MirBody`
 pub struct Inlined<'db> {
     pub callees: Vec<InlinedCallee<'db>>,
     pub scopes: Vec<InlinedScope>,
@@ -1549,7 +1549,7 @@ impl Inlined<'_> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)] // clone: monomorphizing and optimizing copy the body they start from, once per query answer
 pub struct MirBody<'db> {
     pub basic_blocks: Arena<BasicBlock>,
     pub locals: Arena<Local>,
@@ -2208,7 +2208,7 @@ impl<'db> PlaceTy<'db> {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, GenericTypeVisitable)] // clone: inside a constant's `ComplexMemoryMap`
 pub struct VTableMap<'db> {
     /// Fx hashed as `FxHashMap`, with the hasher `rustc_type_ir` can visit.
     ty_to_id: HashMap<Ty<'db>, usize, BuildHasherDefault<FxHasher>>,
@@ -2256,7 +2256,7 @@ impl<'db> VTableMap<'db> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)] // clone: an error a query answers with, copied out of its memo
 pub enum MirEvalError<'db> {
     ConstEvalError(String, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError, StoredTy),
@@ -2283,6 +2283,11 @@ pub enum MirEvalError<'db> {
     /// body it was in and the place in it, when known.
     OverBudget {
         spent: Budget,
+        at: Option<(InferBodyId<'db>, MirSpan)>,
+    },
+    /// rustc's `long_running_const_eval` at an error level: a constant's or static's evaluation
+    /// ran 2,000,000 blocks (rustc's `LINT_TERMINATOR_LIMIT`), at `at`.
+    LongRunning {
         at: Option<(InferBodyId<'db>, MirSpan)>,
     },
     /// The value of the constant points to memory allocated while evaluating it: by the
@@ -2322,6 +2327,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
             }
             Self::TypeIsUnsized(ty, it) => write!(f, "{ty:?} is unsized. {it} should be sized."),
             Self::OverBudget { spent, at: _ } => write!(f, "{spent}"),
+            Self::LongRunning { at: _ } => f.write_str("constant evaluation is taking a long time"),
             Self::HeapInValue { of_const_allocate: true } => f.write_str(
                 "encountered `const_allocate` pointer in final value that was not made global",
             ),
@@ -2398,7 +2404,7 @@ pub fn pad16(it: &[u8], is_signed: IsSigned) -> [u8; 16] {
 }
 
 // FIXME: Make this smaller, its stored in database queries
-#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)] // clone: an error a query answers with, copied out of its memo
 pub enum MirLowerError<'db> {
     ConstEvalError(Box<str>, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError),

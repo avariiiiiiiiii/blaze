@@ -62,17 +62,18 @@ impl Mounted {
     /// Every file below the directory at absolute `dir`, by `/`-separated path under it.
     pub(crate) fn walk(&self, dir: &str) -> Result<Option<Vec<(String, Bytes)>>, Corrupt> {
         let Some((root, inner)) = self.locate(dir) else { return Ok(None) };
+        let pinned = self.reader.pin();
         let mut out = Vec::new();
         let mut pending = vec![String::new()];
         while let Some(at) = pending.pop() {
             let full = join(&inner, &at);
-            let Some(names) = self.reader.list(root, &full) else { return Ok(None) };
+            let Some(names) = pinned.list(root, &full) else { return Ok(None) };
             for (name, is_dir) in names {
-                let rel = join(&at, &name);
+                let rel = join(&at, name);
                 match is_dir {
                     true => pending.push(rel),
                     false => {
-                        let Some((_, _, bytes)) = self.reader.file(root, &join(&inner, &rel))? else { return Ok(None) };
+                        let Some((_, _, bytes)) = pinned.held(root, &join(&inner, &rel))? else { return Ok(None) };
                         out.push((rel, bytes));
                     }
                 }

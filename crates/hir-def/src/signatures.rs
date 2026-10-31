@@ -25,11 +25,12 @@ use thin_vec::ThinVec;
 use triomphe::Arc;
 
 use crate::{
-    AdtId, ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, FxIndexMap,
+    AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId, FunctionId, FxIndexMap,
     GenericDefId, HasModule, ImplId, ItemContainerId, LoweringMode, ModuleId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId, VariantId,
     attrs::AttrFlags,
     expr_store::{
+        body::{BodySyntax, body_syntax},
         ExpressionStore, ExpressionStoreSourceMap, Move, MoveTo,
         lower::{
             BodyLowering, ExprCollector, ImplTraitLowering, lower_function,
@@ -463,6 +464,14 @@ impl FileOutline {
     }
 }
 
+#[cfg(test)]
+impl FileOutline {
+    /// The outline's text, every body cut out.
+    pub(crate) fn text(&self) -> String {
+        self.root().text().to_string()
+    }
+}
+
 /// The [`FileOutline`] of `file_id`: one pass over the file's items, and one over what is left
 /// of the file for the copy and each map.
 #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
@@ -517,6 +526,7 @@ pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
 fn item_syntax<N: AstIdNode>(
     db: &Db,
     id: AstId<N>,
+    module: ModuleId,
     elide: Elide,
     frame: &Frame,
 ) -> Option<SignatureSyntax> {
@@ -531,11 +541,51 @@ fn item_syntax<N: AstIdNode>(
         };
         return SignatureSyntax::new(source, ast::to_node(ptr, outline.root()), elide, frame);
     }
+    if let Some((body, tree, ptr)) = owning_body(db, id.file_id, id.value.erase(), module) {
+        let source = Source { file_id: id.file_id, span_map: &body.span_map, ast_id_map: &body.ast_id_map, cuts: &[] };
+        return SignatureSyntax::new(source, ast::to_node(ptr, ast::Node::root(tree)), elide, frame);
+    }
     let SpanMap::RealSpanMap(span_map) = id.file_id.span_map(db) else { return None };
     let ast_id_map = id.file_id.ast_id_map(db);
     let item = ast::to_node(ast_id_map.get_erased(id.value.erase()), id.file_id.root(db));
     let source = Source { file_id: id.file_id, span_map, ast_id_map, cuts: &[] };
     SignatureSyntax::new(source, item, elide, frame)
+}
+
+/// The tree of `owner`'s [`BodySyntax`], kept as a query's value so that what is read off it
+/// lives as long as the database: the same while the body is.
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+fn body_tree(db: &Db, owner: DefWithBodyId) -> Option<std::sync::Arc<FlatTree>> {
+    body_syntax(db, owner).as_ref().map(|it| it.tree(db))
+}
+
+/// The body an item of `module` at `id` is written in, its tree and the item's node there: the
+/// body whose own syntax made `module`'s block (`BlockIdLt::owner`). `None` for an item outside
+/// fn bodies, of a block lowered from its file, or written by a macro.
+fn owning_body<'db>(
+    db: &'db Db,
+    file_id: HirFileId,
+    id: span::ErasedFileAstId,
+    module: ModuleId,
+) -> Option<(&'db BodySyntax, &'db std::sync::Arc<FlatTree>, SyntaxNodePtr)> {
+    if !id.in_body() {
+        return None;
+    }
+    let owner = module.block(db)?.owner(db)?;
+    let syntax = body_syntax(db, owner).as_ref().filter(|it| it.file_id == file_id)?;
+    let tree = body_tree(db, owner).as_ref()?;
+    Some((syntax, tree, syntax.ast_id_map.try_get_erased(id)?))
+}
+
+/// The node at `id`, an item of a block of `module`, in the body that holds it
+/// ([`owning_body`]): an edit elsewhere in the file leaves it the same.
+pub(crate) fn body_item<'db, N: AstIdNode + syntax::view::Typed>(
+    db: &'db Db,
+    id: AstId<N>,
+    module: ModuleId,
+) -> Option<N::Of<'db>> {
+    let (_, tree, ptr) = owning_body(db, id.file_id, id.value.erase(), module)?;
+    <N::Of<'db> as syntax::view::AstNode<'db>>::cast(syntax::view::to_node(ptr, ast::Node::root(tree)))
 }
 
 /// The node at `id` in its file's [`FileOutline`], when the outline has it: the item's
@@ -556,13 +606,17 @@ pub(crate) fn outline_item<'db, N: AstIdNode + syntax::view::Typed>(
 /// [`FileOutline`] with the outline's spans, and so the same after any edit of a body the
 /// outline leaves out. An item the outline doesn't have (in such a body, or written by a
 /// macro) is lowered off its file, as that body is.
-pub(crate) fn written_visibility<N: AstIdNode>(db: &Db, id: AstId<N>) -> RawVisibility {
+pub(crate) fn written_visibility<N: AstIdNode>(db: &Db, id: AstId<N>, module: ModuleId) -> RawVisibility {
     if let HirFileId::FileId(file) = id.file_id {
         let outline = file_outline(db, file);
         if let Some(ptr) = outline.ast_id_map.try_get_erased(id.value.erase()) {
             let node = ast::to_node(ptr, ast::Node::root(&outline.tree));
             return visibility_of(db, node, &mut |range| outline.span_map.span_for_range(range).ctx);
         }
+    }
+    if let Some((body, tree, ptr)) = owning_body(db, id.file_id, id.value.erase(), module) {
+        let node = ast::to_node(ptr, ast::Node::root(tree));
+        return visibility_of(db, node, &mut |range| body.span_map.span_for_range(range).ctx);
     }
     let node = ast::to_node(id.file_id.ast_id_map(db).get_erased(id.value.erase()), id.file_id.root(db));
     let span_map = id.file_id.span_map(db);
@@ -572,7 +626,7 @@ pub(crate) fn written_visibility<N: AstIdNode>(db: &Db, id: AstId<N>) -> RawVisi
 fn visibility_of(
     db: &Db,
     node: ast::Node<'_>,
-    span_for_range: &mut dyn FnMut(TextRange) -> span::SyntaxContext,
+    span_for_range: &mut impl FnMut(TextRange) -> span::SyntaxContext,
 ) -> RawVisibility {
     let item = ast::AnyHasVisibility::cast(node)
         .unwrap_or_else(|| panic!("a {:?} at {:?} has no visibility", node.kind(), node.text_range()));
@@ -601,20 +655,20 @@ pub fn signature_syntax(db: &Db, def: GenericDefId) -> Option<SignatureSyntax> {
     let variants: Elide = |it| it.child_where(|kind| kind == SyntaxKind::VARIANT_LIST);
     blaze_mem::frame::current(|frame| match def {
         GenericDefId::AdtId(AdtId::StructId(it)) => {
-            item_syntax(db, it.lookup(db).id, nothing, frame)
+            item_syntax(db, it.lookup(db).id, it.module(db), nothing, frame)
         }
         GenericDefId::AdtId(AdtId::UnionId(it)) => {
-            item_syntax(db, it.lookup(db).id, nothing, frame)
+            item_syntax(db, it.lookup(db).id, it.module(db), nothing, frame)
         }
         GenericDefId::AdtId(AdtId::EnumId(it)) => {
-            item_syntax(db, it.lookup(db).id, variants, frame)
+            item_syntax(db, it.lookup(db).id, it.module(db), variants, frame)
         }
-        GenericDefId::FunctionId(it) => item_syntax(db, it.lookup(db).id, left_out, frame),
-        GenericDefId::ConstId(it) => item_syntax(db, it.lookup(db).id, left_out, frame),
-        GenericDefId::StaticId(it) => item_syntax(db, it.lookup(db).id, left_out, frame),
-        GenericDefId::ImplId(it) => item_syntax(db, it.lookup(db).id, items, frame),
-        GenericDefId::TraitId(it) => item_syntax(db, it.lookup(db).id, items, frame),
-        GenericDefId::TypeAliasId(it) => item_syntax(db, it.lookup(db).id, nothing, frame),
+        GenericDefId::FunctionId(it) => item_syntax(db, it.lookup(db).id, it.module(db), left_out, frame),
+        GenericDefId::ConstId(it) => item_syntax(db, it.lookup(db).id, it.module(db), left_out, frame),
+        GenericDefId::StaticId(it) => item_syntax(db, it.lookup(db).id, it.module(db), left_out, frame),
+        GenericDefId::ImplId(it) => item_syntax(db, it.lookup(db).id, it.module(db), items, frame),
+        GenericDefId::TraitId(it) => item_syntax(db, it.lookup(db).id, it.module(db), items, frame),
+        GenericDefId::TypeAliasId(it) => item_syntax(db, it.lookup(db).id, it.module(db), nothing, frame),
     })
 }
 
@@ -623,7 +677,7 @@ pub fn signature_syntax(db: &Db, def: GenericDefId) -> Option<SignatureSyntax> {
 /// enum a macro writes.
 #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn variants_syntax(db: &Db, def: EnumId) -> Option<SignatureSyntax> {
-    blaze_mem::frame::current(|frame| item_syntax(db, def.lookup(db).id, |_| None, frame))
+    blaze_mem::frame::current(|frame| item_syntax(db, def.lookup(db).id, def.module(db), |_| None, frame))
 }
 
 /// `source_map`, of `def`'s signature lowered from its [`signature_syntax`], moved to `item`,
@@ -2382,7 +2436,9 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         ("{ t.d() }", "{ t.d() + t.d() }"),
     ];
 
+    /// `code` as the fixture writes it, without its first newline, with `edits` made.
     fn edited(code: &str, edits: &[(&str, &str)]) -> String {
+        let code = code.strip_prefix('\n').unwrap_or(code);
         edits.iter().fold(code.to_owned(), |code, (from, to)| {
             assert_eq!(code.matches(from).count(), 1, "`{from}` is not written once");
             code.replace(from, to)
@@ -2617,8 +2673,30 @@ pub const K: u8 = ;
         let fx = fixture::db(INNER);
         let file = fx.only_file();
         let db = fx.into_db();
-        assert_eq!(file_outline(&db, file).root().to_string(), LEFT);
-        assert_eq!(syntax::view::AstNode::syntax(&outline_root(&db, file)).to_string(), LEFT);
+        let left = edited(LEFT, &[]);
+        assert_eq!(file_outline(&db, file).root().to_string(), left);
+        assert_eq!(syntax::view::AstNode::syntax(&outline_root(&db, file)).to_string(), left);
+    }
+
+    /// What a body edit leaves the outline the same in, one part at a time.
+    #[test]
+    fn a_body_edit_keeps_each_part_of_the_outline() {
+        let fx = fixture::db(CODE);
+        let file = fx.only_file();
+        let mut db = fx.into_db();
+        let before = file_outline(&db, file);
+        // clone: the outline before, kept past the edit
+        let (text, cuts) = (before.text(), before.cuts.clone());
+        let (span_map, ast_id_map) = (format!("{:?}", before.span_map), format!("{:?}", before.ast_id_map));
+        // clone: a count of the tree before
+        let tree = before.tree.clone();
+        db.set_file_text(file.file_id(&db), &edited(CODE, &BODY_EDITS));
+        let after = file_outline(&db, file);
+        assert_eq!(after.text(), text, "text");
+        assert_eq!(after.cuts, cuts, "cuts");
+        assert_eq!(format!("{:?}", after.span_map), span_map, "span map");
+        assert_eq!(format!("{:?}", after.ast_id_map), ast_id_map, "ast id map");
+        assert!(*after.tree == *tree, "tree");
     }
 
     #[test]
@@ -2656,6 +2734,8 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
                 .unwrap_or_else(|| panic!("no struct {name}"))
         };
         let nothing: Elide = |_| None;
+        let krate = crate::test_db::TestDBExt::fetch_test_crate(&db);
+        let root_module = crate::nameres::crate_def_map(&db, krate).root;
         for (name, text) in [
             ("Inner", "pub fn outer() -> u32 { struct Inner<T>(T); 1 }"),
             ("InType", "pub fn p(x: [u8; { struct InType; 1 }]) -> u8 "),
@@ -2666,7 +2746,7 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
                 file_id.ast_id_map(&db).ast_id_of_view::<syntax::ast::Struct>(item),
             );
             let syntax = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
-                item_syntax(&db, id, nothing, frame)
+                item_syntax(&db, id, root_module, nothing, frame)
             })
             .unwrap_or_else(|| panic!("{name}"));
             assert_eq!(syntax.root().text(), text, "{name}");

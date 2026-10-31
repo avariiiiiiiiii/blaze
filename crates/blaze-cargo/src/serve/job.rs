@@ -79,8 +79,8 @@ use super::{
     mounts::Mounts,
     plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Linking, Phase, Readers, Runs,
-        Selection, Source, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptDb, Library, Linking, Phase, Readers,
+        Runs, Selection, Source, Steps, Writer,
     },
 };
 use crate::cli::print::Format;
@@ -995,6 +995,12 @@ impl<S: Steps> Jobs<S> {
         self.jobs.is_empty() && self.asked.is_empty()
     }
 
+    /// The database of the first root's front end kept now, whose library parses the next
+    /// image stores ([`Parts::front`]); `None` while no front end is kept.
+    pub fn front_db(&self) -> Option<&base_db::Db> {
+        self.roots.fronts.iter().flatten().find_map(KeptDb::db)
+    }
+
     /// The roots the jobs' views read, kept by a collection, in the order the jobs started.
     pub fn roots(&self) -> Vec<ContentId> {
         let jobs = self.order.iter().filter_map(|id| self.jobs.get(key_of(*id)));
@@ -1345,7 +1351,7 @@ impl<S: Steps> Jobs<S> {
     fn did(&mut self, w: &mut World<'_, S>, node: NodeId, value: Value<S>) {
         match value {
             Value::Library(Ok(Library { at, fingerprint, source })) => {
-                let mounted = match &source {
+                let mounted = match source {
                     Some(source) => w.mounts.mount_library(w.vfs, &at, &fingerprint, source).map(drop),
                     None if w.mounts.has(&at) => Ok(()),
                     // alloc: an error, once
@@ -1363,7 +1369,7 @@ impl<S: Steps> Jobs<S> {
             Value::Library(Err(error)) => self.library_failed = Some(error),
             Value::Fetched(fetches, at, Ok(source)) => {
                 let fetch = &fetches[at as usize];
-                if let Err(why) = w.mounts.mount(w.vfs, &fetch.at, &source) {
+                if let Err(why) = w.mounts.mount(w.vfs, &fetch.at, source) {
                     // clone: a failed fetch's names, once per source
                     self.fetch_failed.insert(fetch.at.clone(), ApiError::new(why, Some(fetch.what.clone())));
                 }
@@ -2621,7 +2627,8 @@ impl<S: Steps> Jobs<S> {
     /// A snapshot: the image written, the journal and the store flushed, and every head as it
     /// stands, reported once all of it is durable.
     fn snapshot(&mut self, w: &mut World<'_, S>) -> Stage<S> {
-        w.images.ask(Parts { db: w.db, vfs: &mut *w.vfs, predict: w.plane.predict(), effects: &mut *w.effects });
+        let front = self.front_db();
+        w.images.ask(Parts { db: w.db, front, vfs: &mut *w.vfs, predict: w.plane.predict(), effects: &mut *w.effects });
         w.store.flush(w.effects);
         // alloc: once per snapshot
         let heads: Vec<(String, ContentId)> = w.vfs.heads().into_iter().map(|(head, root)| (head.to_owned(), root)).collect();

@@ -277,6 +277,12 @@ pub(crate) trait Sink<'db> {
     fn expanded_now(&mut self, module: ModuleId, call: MacroCallId) {
         let _ = (module, call);
     }
+
+    /// The call whose expansion the sink's collection collects next: its input is the call's
+    /// syntax, which a sink that runs again on a write keeps the file of.
+    fn collecting_expansion(&mut self, call: MacroCallId) {
+        let _ = call;
+    }
 }
 
 /// A child module a collection declares, for [`Sink::child`].

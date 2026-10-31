@@ -195,7 +195,7 @@ struct Types<'db> {
 impl<'db> Types<'db> {
     fn new(db: &'db Db, env: ParamEnvAndCrate<'db>) -> Self {
         let interner = DbInterner::new_with(db, env.krate);
-        let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        let infcx = interner.infer_ctxt().build(TypingMode::Codegen);
         Types {
             db,
             env,

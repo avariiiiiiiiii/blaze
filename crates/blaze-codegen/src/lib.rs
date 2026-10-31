@@ -118,7 +118,7 @@ pub struct Unit {
 
 /// A function's machine code, relocatable: placed anywhere by the linker, which applies
 /// `relocs`.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)] // clone: in `driver::Built` and `TieredUp`; a build moves its functions, tests copy one to vary it
 pub struct CompiledFunction {
     pub key: InstanceKey,
     pub arch: Arch,
@@ -210,7 +210,7 @@ pub const PROFILE_NAME_PREFIX: &str = "blaze.pgo.";
 /// What LLVM's SanitizerCoverage made for one function: its arrays, which start zeroed and
 /// which the link gathers with every other function's into one section each, in one order,
 /// and its PC table.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: a template's view hands it to the function it makes, once per instantiate with coverage
 pub struct Covered {
     /// Bytes of its 8-bit counters (`__sancov_cntrs`), flags (`__sancov_bools`) and
     /// guards (`__sancov_guards`, 4 bytes each); 0 for an array it has not.
@@ -235,7 +235,7 @@ pub struct Line {
 }
 
 /// A function's unwind information, as its backend made it.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)] // clone: inside `CompiledFunction`
 pub enum Unwind {
     /// DWARF call frame information (ELF, Mach-O): the CIE's fields and initial instructions,
     /// and the FDE's instructions, as `.eh_frame` encodes them (DW_CFA_*).
@@ -257,7 +257,7 @@ pub enum Unwind {
 
 /// A static's definition. Its address is the linker's: by which static it is, never by
 /// content ([`Target::Static`]).
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)] // clone: in `driver::Built`; a build moves its statics, tests copy one to vary it
 pub struct Static {
     pub item: ItemKey,
     pub instance: ContentId,
@@ -278,7 +278,7 @@ pub struct Static {
     pub imports: Vec<(String, wasm::Import)>,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)] // clone: inside `Static`
 pub enum Init {
     Bytes { bytes: Vec<u8>, relocs: Relocs },
     Zeroed { size: u64 },
@@ -286,7 +286,7 @@ pub enum Init {
 
 /// Read-only bytes a function refers to: string literals, constants, vtables of known types.
 /// Or, `writable`, a static's nested mutable allocation ([`Data::owned`]).
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)] // clone: inside `CompiledFunction` and `Static`
 pub struct Data {
     pub id: ContentId,
     pub align: u32,
@@ -357,7 +357,7 @@ pub enum RelocKind {
 }
 
 /// What a relocation points at.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: a function owns its targets, so an instantiate copies each place's; only an outside symbol's name allocates
 pub enum Target {
     /// Another compiled function, called through its jump-table slot so that a patch of it
     /// changes one slot.
@@ -394,7 +394,7 @@ pub enum Target {
 
 /// A native library a crate links against: a `#[link(..)]` of one of its `extern` blocks, a
 /// build script's `cargo:rustc-link-lib` or a `-l`, as rustc's `NativeLib` has it.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)] // clone: setup, once per crate's link list
 pub struct NativeLib {
     /// As written: `foo` for `libfoo.a`, `foo.dll` or `foo.framework`, unless `verbatim`.
     pub name: String,
@@ -415,7 +415,7 @@ pub enum NativeLibKind {
 }
 
 /// Why a unit did not compile: names the instance and the item.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct CodegenError {
     pub unit: InstanceKey,
     pub item: ItemKey,

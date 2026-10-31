@@ -1148,6 +1148,15 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             .ok_or_else(|| Unhandled::Llvm(format!("`{name}` returns nothing")))
     }
 
+    /// `value` in every lane of `ty`: in lane 0, then shuffled into the rest, as LLVM writes a
+    /// splat.
+    fn splat(&self, ty: VectorType<'ctx>, value: BasicValueEnum<'ctx>) -> Lowered<VectorValue<'ctx>> {
+        let index = self.context.i32_type();
+        let first = self.builder.build_insert_element(ty.get_poison(), value, index.const_zero(), "")?;
+        let every = index.vec_type(ty.get_size()).const_zero();
+        Ok(self.builder.build_shuffle_vector(first, ty.get_poison(), every, "")?)
+    }
+
     fn int_intrinsic(&self, name: &str, args: &[IntValue<'ctx>]) -> Lowered<IntValue<'ctx>> {
         let ty = args[0].get_type();
         let args =
@@ -1252,6 +1261,51 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 }
                 _ => return Err(Unhandled::Opcode(opcode)),
             },
+            // Each lane of the result is the lane of `l` then `r` its mask byte says; a byte
+            // past both is a zero lane, which LLVM's `shufflevector` has no index for.
+            InstructionData::Shuffle { args: [l, r], imm, .. } => {
+                let (Operand::Vector(l), Operand::Vector(r)) = (self.operand(l), self.operand(r)) else {
+                    return Err(Unhandled::Type(dfg.value_type(l)));
+                };
+                let mask = dfg.immediates.get(imm).ok_or(Unhandled::Opcode(opcode))?.as_slice();
+                let lanes = 2 * l.get_type().get_size();
+                let (index, flag) = (self.context.i32_type(), self.context.bool_type());
+                let within = |at: &u8| u32::from(*at) < lanes;
+                let picked = mask
+                    .iter()
+                    .map(|at| index.const_int(if within(at) { u64::from(*at) } else { 0 }, false))
+                    .collect::<SmallVec<[IntValue<'ctx>; 16]>>();
+                let kept = mask
+                    .iter()
+                    .map(|at| flag.const_int(u64::from(within(at)), false))
+                    .collect::<SmallVec<[IntValue<'ctx>; 16]>>();
+                let zeroed = !mask.iter().all(within);
+                let shuffled = self.builder.build_shuffle_vector(l, r, VectorType::const_vector(picked.as_slice()), "")?;
+                let value = if zeroed {
+                    let kept = VectorType::const_vector(kept.as_slice());
+                    let zero = shuffled.get_type().const_zero();
+                    self.builder.build_select(kept, shuffled, zero, "")?.into_vector_value()
+                } else {
+                    shuffled
+                };
+                self.set(inst, Operand::Vector(value));
+            }
+            InstructionData::BinaryImm8 { opcode: Opcode::Extractlane, arg, imm } => {
+                let Operand::Vector(vector) = self.operand(arg) else {
+                    return Err(Unhandled::Type(dfg.value_type(arg)));
+                };
+                let lane = self.context.i32_type().const_int(u64::from(imm), false);
+                let value = self.builder.build_extract_element(vector, lane, "")?;
+                self.set(inst, value);
+            }
+            InstructionData::TernaryImm8 { opcode: Opcode::Insertlane, args: [vector, value], imm } => {
+                let Operand::Vector(vector) = self.operand(vector) else {
+                    return Err(Unhandled::Type(dfg.value_type(vector)));
+                };
+                let lane = self.context.i32_type().const_int(u64::from(imm), false);
+                let inserted = self.builder.build_insert_element(vector, self.plain(value)?, lane, "")?;
+                self.set(inst, Operand::Vector(inserted));
+            }
             InstructionData::Load { arg, offset, flags, .. } => {
                 self.load(inst, opcode, arg, offset.into(), dfg.mem_flags[flags].aligned())?;
             }
@@ -1572,8 +1626,12 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         let result_ty = || self.func.dfg.value_type(self.func.dfg.first_result(inst));
         let b = &self.builder;
         let value: Operand<'ctx> = match opcode {
-            Opcode::Ineg => Operand::Int(b.build_int_neg(self.int(arg)?, "")?),
-            Opcode::Bnot => Operand::Int(b.build_not(self.int(arg)?, "")?),
+            Opcode::Ineg | Opcode::Bnot => match (opcode, self.operand(arg)) {
+                (Opcode::Ineg, Operand::Vector(it)) => Operand::Vector(b.build_int_neg(it, "")?),
+                (_, Operand::Vector(it)) => Operand::Vector(b.build_not(it, "")?),
+                (Opcode::Ineg, _) => Operand::Int(b.build_int_neg(self.int(arg)?, "")?),
+                _ => Operand::Int(b.build_not(self.int(arg)?, "")?),
+            },
             Opcode::Uextend => {
                 Operand::Int(b.build_int_z_extend(self.int(arg)?, self.int_ty(result_ty())?, "")?)
             }
@@ -1618,6 +1676,28 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
                 self.values.insert(results[0], Operand::Int(low));
                 self.values.insert(results[1], Operand::Int(high));
                 return Ok(());
+            }
+            Opcode::Splat => {
+                let BasicTypeEnum::VectorType(ty) = self.ty(result_ty())? else {
+                    return Err(Unhandled::Type(result_ty()));
+                };
+                Operand::Vector(self.splat(ty, self.plain(arg)?)?)
+            }
+            Opcode::VallTrue | Opcode::VanyTrue => {
+                let Operand::Vector(vector) = self.operand(arg) else {
+                    return Err(Unhandled::Type(self.func.dfg.value_type(arg)));
+                };
+                if !vector.get_type().get_element_type().is_int_type() {
+                    return Err(Unhandled::Type(self.func.dfg.value_type(arg)));
+                }
+                let zero = vector.get_type().const_zero();
+                let set = b.build_int_compare(IntPredicate::NE, vector, zero, "")?;
+                let name = match opcode {
+                    Opcode::VallTrue => "llvm.vector.reduce.and",
+                    _ => "llvm.vector.reduce.or",
+                };
+                let held = self.intrinsic(name, &[set.get_type().into()], &[set.into()])?.into_int_value();
+                Operand::Int(b.build_int_z_extend(held, self.int_ty(result_ty())?, "")?)
             }
             Opcode::Fneg => Operand::Float(b.build_float_neg(self.float(arg)?, "")?),
             Opcode::Fabs => Operand::Float(self.float_intrinsic("llvm.fabs", &[self.float(arg)?])?),
@@ -1692,21 +1772,45 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
             self.set(inst, Operand::Float(value));
             return Ok(());
         }
+        // Every lane shifted by the one amount, modulo the lane's width, as in Cranelift.
+        let shifted = self.func.dfg.value_type(l);
+        if let (Operand::Vector(l), Operand::Int(by)) = (self.operand(l), self.operand(r))
+            && matches!(opcode, Opcode::Ishl | Opcode::Ushr | Opcode::Sshr)
+        {
+            let BasicTypeEnum::IntType(lane) = l.get_type().get_element_type() else {
+                return Err(Unhandled::Type(shifted));
+            };
+            let by = b.build_int_cast_sign_flag(by, lane, false, "")?;
+            let by = b.build_and(by, lane.const_int(u64::from(lane.get_bit_width()) - 1, false), "")?;
+            let by = self.splat(l.get_type(), by.into())?;
+            let value = match opcode {
+                Opcode::Ishl => b.build_left_shift(l, by, "")?,
+                Opcode::Ushr => b.build_right_shift(l, by, false, "")?,
+                _ => b.build_right_shift(l, by, true, "")?,
+            };
+            self.set(inst, Operand::Vector(value));
+            return Ok(());
+        }
         if let (Operand::Vector(l), Operand::Vector(r)) = (self.operand(l), self.operand(r)) {
-            let saturating = |name: &str| -> Lowered<VectorValue<'ctx>> {
+            let each = |name: &str| -> Lowered<VectorValue<'ctx>> {
                 let args = [l.into(), r.into()];
                 Ok(self.intrinsic(name, &[l.get_type().into()], &args)?.into_vector_value())
             };
             let value = match opcode {
                 Opcode::Iadd => b.build_int_add(l, r, "")?,
                 Opcode::Isub => b.build_int_sub(l, r, "")?,
+                Opcode::Imul => b.build_int_mul(l, r, "")?,
                 Opcode::Band => b.build_and(l, r, "")?,
                 Opcode::Bor => b.build_or(l, r, "")?,
                 Opcode::Bxor => b.build_xor(l, r, "")?,
-                Opcode::UaddSat => saturating("llvm.uadd.sat")?,
-                Opcode::SaddSat => saturating("llvm.sadd.sat")?,
-                Opcode::UsubSat => saturating("llvm.usub.sat")?,
-                Opcode::SsubSat => saturating("llvm.ssub.sat")?,
+                Opcode::UaddSat => each("llvm.uadd.sat")?,
+                Opcode::SaddSat => each("llvm.sadd.sat")?,
+                Opcode::UsubSat => each("llvm.usub.sat")?,
+                Opcode::SsubSat => each("llvm.ssub.sat")?,
+                Opcode::Umin => each("llvm.umin")?,
+                Opcode::Umax => each("llvm.umax")?,
+                Opcode::Smin => each("llvm.smin")?,
+                Opcode::Smax => each("llvm.smax")?,
                 // The pairs of `l` and then of `r`, which AArch64 selects as one `addp`.
                 Opcode::IaddPairwise => {
                     let index = self.context.i32_type();

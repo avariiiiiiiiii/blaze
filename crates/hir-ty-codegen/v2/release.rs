@@ -126,10 +126,16 @@ pub(crate) fn summarize(
     function.release = Kept { own: Some(own), mismatched };
     let requests = &pending.wants.requests;
     let mut calls: Vec<Call> = Vec::with_capacity(facts.calls.len());
-    for called in facts.calls {
+    for mut called in facts.calls {
         let Some(callee) = key(unit, places, refs, called.request)? else {
             return Err(failed(unit, "LLVM calls a request that is not a function of the build"));
         };
+        // An `asm!` function reads the registers its text names, so its summary counts no
+        // parameters (`assembled`) and no argument of a call of it is one to specialize on.
+        let request = requests.funcs.get(called.request as usize);
+        if request.is_some_and(|it| matches!(it.target, FuncTarget::Asm(_))) {
+            called.args.clear();
+        }
         match calls.iter_mut().find(|it| it.callee == callee) {
             Some(call) => {
                 call.count += called.count;
@@ -243,8 +249,11 @@ pub(crate) fn emit(
     let Function { code: Built::Ir(pending), places, .. } = &mut function else {
         return Err(failed(unit, "an assembly function has no IR for LLVM"));
     };
-    let mut linked = Vec::with_capacity(imported.len());
-    let mut inlined = Vec::with_capacity(imported.len());
+    // An import at depth is called by another import's body, whose calls are the compile's
+    // only once it is merged, and the imports are in the order of their keys: every one is
+    // merged before any is looked for.
+    // alloc: once per compile with imports, an entry an import
+    let mut merged = Vec::with_capacity(imported.len());
     for import in imported {
         let Some(module) = &import.export.module else {
             // alloc: an error
@@ -252,6 +261,11 @@ pub(crate) fn emit(
         };
         let (funcs, datas) =
             merge(unit, &mut pending.wants, places, refs, &module.requests, &import.export.places, import.refs)?;
+        merged.push((import, module, funcs, datas));
+    }
+    let mut linked = Vec::with_capacity(imported.len());
+    let mut inlined = Vec::with_capacity(imported.len());
+    for (import, module, funcs, datas) in merged {
         let id = requests_of(places, refs, import.key).next().ok_or_else(|| {
             // alloc: an error
             failed(unit, format!("imports {}, which nothing it builds calls", import.key.0))
@@ -566,14 +580,33 @@ fn merge(
     for (at, request) in requests.funcs.iter().enumerate() {
         let theirs = *theirs.funcs.get(at).ok_or_else(|| failed(unit, "an import's request without its place"))?;
         let place = place_in(theirs_of(theirs)?)?;
+        let named = |id: usize| places.funcs.get(id).and_then(|&it| refs.get(it as usize));
         let before = wants.requests.funcs.len();
         // clone: `Wants::func` takes the target owned; the import's export is shared, borrowed
         let id = wants.func(request.target.clone(), &request.sig).as_u32();
-        if id as usize == before {
+        let id = if id as usize == before {
             places.funcs.push(place);
-        } else if places.funcs[id as usize] != place {
-            return Err(failed(unit, "an import asks for a function the compile has as another"));
-        }
+            id
+        } else if named(id as usize) == refs.get(place as usize) {
+            id
+        } else {
+            // The build keys a callee by who asks for it: the instance the compile asks for is
+            // another function of the build than the one the import's body calls, and each
+            // request is a declaration of its own (`Symbol::Func` of its ID).
+            let found = (0..wants.requests.funcs.len())
+                .find(|&it| wants.requests.funcs[it] == *request && named(it) == refs.get(place as usize));
+            match found {
+                Some(it) => it as u32,
+                None => {
+                    let id = u32::try_from(wants.requests.funcs.len())
+                        .map_err(|_| failed(unit, "more than 2^32 function requests"))?;
+                    // clone: as above, a request of the import's that the compile has apart
+                    wants.requests.funcs.push(request.clone());
+                    places.funcs.push(place);
+                    id
+                }
+            }
+        };
         funcs.push(id);
     }
     let mut datas: Vec<u32> = Vec::with_capacity(requests.datas.len());
@@ -721,6 +754,28 @@ mod tests {
                 .unwrap();
         assert_eq!(again, (funcs, datas));
         assert_eq!(wants.requests.datas.len(), 3);
+    }
+
+    /// The importer's request of `a` is the compile's function 5; the import's same request
+    /// is its function 6, as the build keys a callee by who asks for it: two requests, the
+    /// second made once however many bodies ask for it.
+    #[test]
+    fn one_request_that_is_two_functions_is_two_requests() {
+        let isa = crate::target().unwrap();
+        let mut wants = Wants::new(&**isa);
+        symbol(&mut wants, "a");
+        let mut places = Places { funcs: vec![0], datas: Vec::new(), refs: 2 };
+        let mut theirs = Wants::new(&**isa);
+        symbol(&mut theirs, "a");
+        let their_places = Places { funcs: vec![0], datas: Vec::new(), refs: 1 };
+        let their_refs = [Target::Direct(instance(6))];
+        let refs = [Target::Direct(instance(5)), Target::Direct(instance(6))];
+        let mut merged =
+            || merge(&unit(), &mut wants, &mut places, &refs, &theirs.requests, &their_places, &their_refs).unwrap();
+        assert_eq!(merged().0, [1]);
+        assert_eq!(merged().0, [1]);
+        assert_eq!(places.funcs, [0, 1]);
+        assert_eq!(wants.requests.funcs.len(), 2);
     }
 
     #[test]

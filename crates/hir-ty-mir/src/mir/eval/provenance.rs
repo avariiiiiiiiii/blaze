@@ -18,7 +18,7 @@ use crate::next_solver::Ty;
 /// sorted by start and disjoint. Provenance is that of a whole pointer, as the test machine's
 /// per-byte record has it: bytes put over a pointer's start take its provenance away, and
 /// bytes put over its rest end it there.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)] // clone: a machine's `Shadow`, which a value's copy copies
 pub(super) struct Pointers {
     len: usize,
     pieces: SmallVec<[(usize, usize); 2]>,

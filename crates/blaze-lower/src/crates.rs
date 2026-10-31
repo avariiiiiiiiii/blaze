@@ -446,10 +446,10 @@ fn const_eval(workspace: &toml::Value, manifest: &str) -> Result<ConstEvalBudget
 }
 
 /// The lint flags of `unit`'s rustc: cargo's `[lints]`, those of its rustflags, its
-/// `--check-cfg`s, and `--cap-lints allow` for a package cargo shows no warnings of (one not
-/// from a path, and the standard library). The check and the front end's crate read this one
-/// list.
-pub fn lint_flags(unit: &Unit, plan: &UnitPlan, local: bool) -> Vec<String> {
+/// `--check-cfg`s, and cargo's `--cap-lints` for a package not from a path or the standard
+/// library: `allow`, or `warn` under `-vv` (`extra_verbose`), which shows their warnings
+/// (cargo's `compute_cap_lints`). The check and the front end's crate read this one list.
+pub fn lint_flags(unit: &Unit, plan: &UnitPlan, local: bool, extra_verbose: bool) -> Vec<String> {
     const SHORT: [&str; 4] = ["-A", "-W", "-D", "-F"];
     const LONG: [&str; 6] = ["--allow", "--warn", "--deny", "--forbid", "--force-warn", "--cap-lints"];
     let mut out = plan.lints.clone(); // clone: the unit's own list, once per unit per build
@@ -473,7 +473,7 @@ pub fn lint_flags(unit: &Unit, plan: &UnitPlan, local: bool) -> Vec<String> {
     }
     if unit.is_std || !local {
         out.push("--cap-lints".to_owned()); // alloc: as above
-        out.push("allow".to_owned()); // alloc: as above
+        out.push(if extra_verbose { "warn" } else { "allow" }.to_owned()); // alloc: as above
     }
     out
 }

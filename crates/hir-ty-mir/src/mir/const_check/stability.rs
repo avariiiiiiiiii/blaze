@@ -15,7 +15,6 @@ use hir_def::{
     AttrDefId, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId, Lookup, TraitId,
     attrs::stability::{Stability, StabilityLevel, stability},
     expr_store::Body,
-    hir::ExprId,
     signatures::FunctionSignature,
     src::HasSource,
     unstable_features::UnstableFeatures,
@@ -27,6 +26,8 @@ use syntax::{
     NodeOrToken, SyntaxKind,
     view::{self, AstToken, HasAttrs, TokenTreeChildren},
 };
+
+use super::MirSpan;
 
 /// What rustc checks the const stability of: a function called, or the trait of a trait's
 /// method called.
@@ -134,21 +135,27 @@ pub(super) fn forces_unstable(db: &Db, krate: Crate) -> bool {
     matches!(krate.data(db).origin, CrateOrigin::Lang(_))
 }
 
-/// `Span::allows_unstable(feature)` of the call `expr` of `def`'s body: the macro whose
-/// expansion made it is written `#[allow_internal_unstable(.., feature, ..)]`. rustc reads the
-/// expansion off the hygiene of the call's span; here it is that of the call's first token, or
-/// the macro whose expansion the call is in. A call in a macro's argument is allowed when either
-/// macro allows it, where rustc asks only the one whose tokens it is.
-pub(super) fn allows_unstable(
-    db: &Db,
-    def: DefWithBodyId,
-    expr: ExprId,
-    feature: &Symbol,
-) -> bool {
+/// `Span::allows_unstable(feature)` of the call at `at` in `def`'s body (an expression, or the
+/// pattern whose comparison it is): the macro whose expansion made it is written
+/// `#[allow_internal_unstable(.., feature, ..)]`. rustc reads the expansion off the hygiene of
+/// the call's span; here it is that of the call's first token, or the macro whose expansion the
+/// call is in. A call in a macro's argument is allowed when either macro allows it, where rustc
+/// asks only the one whose tokens it is.
+pub(super) fn allows_unstable(db: &Db, def: DefWithBodyId, at: MirSpan, feature: &Symbol) -> bool {
     let source_map = &Body::with_source_map(db, def).1;
-    let Ok(source) = source_map.expr_syntax(expr) else { return false };
-    let Some(file) = source.file_id.macro_file() else { return false };
-    let ctxt = source.file_id.span_map(db).span_for_range(source.value.text_range()).ctx;
+    let (file_id, range) = match at {
+        MirSpan::ExprId(expr) => match source_map.expr_syntax(expr) {
+            Ok(it) => (it.file_id, it.value.text_range()),
+            Err(_) => return false,
+        },
+        MirSpan::PatId(pat) => match source_map.pat_syntax(pat) {
+            Ok(it) => (it.file_id, it.value.text_range()),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    let Some(file) = file_id.macro_file() else { return false };
+    let ctxt = file_id.span_map(db).span_for_range(range).ctx;
     ctxt.outer_expn(db).is_some_and(|call| macro_allows(db, call.into(), feature))
         || macro_allows(db, file, feature)
 }

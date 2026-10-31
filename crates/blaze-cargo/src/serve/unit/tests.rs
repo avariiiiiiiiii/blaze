@@ -445,10 +445,12 @@ fn a_dependencys_lints_are_capped_and_rustc_closing_lines_hidden() {
     plan.rustflags = vec!["-D".to_owned(), "warnings".to_owned(), "-Ctarget-cpu=native".to_owned(), "-Aunused".to_owned()];
     plan.check_cfg = vec!["cfg(foo)".to_owned()];
     assert_eq!(
-        compile::lint_flags(&lib, &plan, true),
+        compile::lint_flags(&lib, &plan, true, false),
         ["--warn=unused_qualifications", "-D", "warnings", "-Aunused", "--check-cfg", "cfg(foo)"]
     );
-    assert_eq!(compile::lint_flags(&lib, &plan, false).last().map(String::as_str), Some("allow"));
+    assert_eq!(compile::lint_flags(&lib, &plan, false, false).last().map(String::as_str), Some("allow"));
+    assert_eq!(compile::lint_flags(&lib, &plan, false, true).last().map(String::as_str), Some("warn"));
+    assert_eq!(compile::lint_flags(&lib, &plan, true, true), compile::lint_flags(&lib, &plan, true, false));
     assert!(compile::local(Some("(/w/p)")));
     assert!(!compile::local(Some("(https://github.com/a/b#0123)")));
     assert!(!compile::local(None));

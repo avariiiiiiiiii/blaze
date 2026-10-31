@@ -17,7 +17,7 @@ pub const STATIC_DIGEST_DOMAIN: &str = "blaze v2 static digest 2";
 pub const DEBUG_NAME_DOMAIN: &str = "blaze v2 debug name 1";
 
 /// Of each piece of a build, by what it is, each list sorted and each key once.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct Digests {
     /// Of each of `Built::functions`, by key: [`function_digest`].
     pub functions: Vec<(InstanceKey, ContentId)>,

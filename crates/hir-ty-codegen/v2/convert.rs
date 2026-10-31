@@ -15,7 +15,7 @@ use crate::{
 };
 
 /// What a data request is in the build.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an ID but for an `Extern`'s name; each relocation to the data owns one
 pub(crate) enum DataTarget {
     /// A static, a symbol, a position.
     Target(Target),

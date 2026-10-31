@@ -1030,6 +1030,7 @@ pub(crate) fn collect_expansion<'db, S: Sink<'db>, A: Allocator + Clone>(
         sink.apply(DeclOp::Diagnostic(DefDiagnostic::recursion_overflow(db, module, call)));
         return;
     }
+    sink.collecting_expansion(call);
     let def = call.loc(db).def;
     if let MacroDefKind::ProcMacro(_, exp, _) = def.kind
         && exp.requires_session(db, def.krate)

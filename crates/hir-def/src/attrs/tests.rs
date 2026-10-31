@@ -210,6 +210,7 @@ fn old_match_attr_flags(
                         attr_flags.insert(AttrFlags::IS_DERIVE_OR_BUILTIN_MACRO)
                     }
                     "unstable" => attr_flags.insert(AttrFlags::IS_UNSTABLE),
+                    "stable" => attr_flags.insert(AttrFlags::IS_STABLE),
                     "rustc_layout_scalar_valid_range_start"
                     | "rustc_layout_scalar_valid_range_end" => {
                         attr_flags.insert(AttrFlags::RUSTC_LAYOUT_SCALAR_VALID_RANGE)
@@ -1391,7 +1392,8 @@ fn a_body_edit_runs_no_attribute_query() {
     let file = fx.only_file();
     let mut db = fx.into_db();
     let before = read(&db);
-    db.set_file_text(file.file_id(&db), &CODE.replace("{ 1 }", "{ 1 + 2 }"));
+    let text = db.file_text(file.file_id(&db)).text(&db).as_str().replace("{ 1 }", "{ 1 + 2 }");
+    db.set_file_text(file.file_id(&db), &text);
     let mut after = Vec::new();
     let log = db.executed_in_read_order(|| after = read(&db));
     let attrs = |it: &&String| it.contains("AttrFlags::query") || it.contains("field_attr_flags");

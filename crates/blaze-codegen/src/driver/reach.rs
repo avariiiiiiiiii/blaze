@@ -13,7 +13,7 @@ use blaze_items::{CodeHash, ItemKey};
 
 use crate::{InstanceKey, Target};
 
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(PartialEq, Eq, Debug, Default)]
 pub struct Reach {
     /// The functions, sorted: node `i` for `i < functions.len()`.
     functions: Vec<InstanceKey>,

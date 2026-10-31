@@ -26,7 +26,7 @@ pub enum MacroArg<'a> {
 /// Element `i` has the kind `kinds[i]` (with `const_ast::TOKEN` set for a token), ends at
 /// `ends[i]`, has the span index `spans[i]`, and, if a token, the text
 /// `text[text_ends[i - 1]..text_ends[i]]` (from 0 for element 0).
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct FlatInput {
     pub kinds: Vec<u16>,
     pub ends: Vec<u32>,

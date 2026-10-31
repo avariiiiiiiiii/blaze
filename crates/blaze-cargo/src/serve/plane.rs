@@ -31,7 +31,7 @@ use blaze_graph::{
 };
 use blaze_ids::rng::SplitMix64 as Rng;
 use blaze_protocol::events::{Event, NodeState};
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 /// The kinds of the daemon's own tasks, for their estimates and their subsystems' budgets.
 pub use blaze_graph::admission::kinds;
@@ -199,7 +199,8 @@ pub struct Posting {
 
 /// The daemon's: work tasks on the process's worker pool, IO tasks on threads of their own.
 pub struct Threads<W: Work> {
-    done_tx: Sender<Ran<W::Value>>,
+    /// Every task's way back, shared by reference: a task posted counts no sender.
+    done_tx: &'static Sender<Ran<W::Value>>,
     done: Receiver<Ran<W::Value>>,
     io: Sender<IoJob<W>>,
     running: usize,
@@ -209,17 +210,20 @@ struct IoJob<W: Work> {
     task: Posting,
     work: Arc<W>,
     readers: W::Readers,
-    done: Sender<Ran<W::Value>>,
 }
 
 impl<W: Work> Threads<W> {
-    /// `io` threads for IO tasks.
+    /// `io` threads for IO tasks, for a plane that runs at most `io` IO tasks and `work` work
+    /// tasks at once (its `PlaneConfig`): what `done` holds, so a task's send never waits and
+    /// the channel allocates nothing after it is made.
     ///
     /// # Panics
     ///
     /// When a thread cannot be started, as [`std::thread::spawn`].
-    pub fn new(io: usize) -> Threads<W> {
-        let (done_tx, done) = unbounded();
+    pub fn new(io: usize, work: usize) -> Threads<W> {
+        let (done_tx, done) = bounded(io.max(1) + work.max(1) + 1);
+        // alloc: one sender per runner, kept for the process's life so no task clones it.
+        let done_tx: &'static Sender<Ran<W::Value>> = Box::leak(Box::new(done_tx));
         let (io_tx, io_rx) = unbounded::<IoJob<W>>();
         for at in 0..io.max(1) {
             let io_rx = io_rx.clone();
@@ -240,7 +244,7 @@ impl<W: Work> Threads<W> {
                                 (None, ..) => {}
                             }
                         };
-                        _ = job.done.send(Ran { task: job.task, ended, peak, ran_ns, puts });
+                        _ = done_tx.send(Ran { task: job.task, ended, peak, ran_ns, puts });
                     }
                 })
                 .unwrap_or_else(|why| panic!("an IO thread of the daemon's plane: {why}"));
@@ -334,19 +338,20 @@ fn panicked(payload: &(dyn std::any::Any + Send)) -> Panic {
     Panic { message, at }
 }
 
-fn post_work<W: Work>(task: Posting, work: Arc<W>, readers: W::Readers, done: Sender<Ran<W::Value>>) {
+fn post_work<W: Work>(task: Posting, work: Arc<W>, readers: W::Readers, done: &'static Sender<Ran<W::Value>>) {
     let pool = blaze_graph::exec::shared();
-    let again = work.clone();
-    let run = move || run_measured(&*work, task.arg, readers);
+    // The batch's work comes back with the result, for a task that gave way to be posted again
+    // without counting another reference.
+    let run = move || (run_measured(&*work, task.arg, readers), work);
     let then = move |result: std::thread::Result<_>| match result {
-        Ok((Some(ended), peak, ran_ns, puts)) => _ = done.send(Ran { task, ended, peak, ran_ns, puts }),
-        Ok((None, peak, ran_ns, puts)) if task.reads => {
+        Ok(((Some(ended), peak, ran_ns, puts), _)) => _ = done.send(Ran { task, ended, peak, ran_ns, puts }),
+        Ok(((None, peak, ran_ns, puts), _)) if task.reads => {
             let ended = Ended::GaveWay { group: blaze_graph::pool::group() };
             _ = done.send(Ran { task, ended, peak, ran_ns, puts });
         }
         // Gave way: posted again behind what is ready on the group it ran on.
-        Ok((None, ..)) => {
-            post_work(Posting { near: blaze_graph::pool::group(), ..task }, again, W::Readers::default(), done);
+        Ok(((None, ..), work)) => {
+            post_work(Posting { near: blaze_graph::pool::group(), ..task }, work, W::Readers::default(), done);
         }
         // A panic outside the measure: its puts stay in the thread's buffer.
         Err(panic) => {
@@ -363,9 +368,9 @@ impl<W: Work> Threads<W> {
     fn post(&mut self, task: Posting, work: Arc<W>, readers: W::Readers) {
         self.running += 1;
         match task.pool {
-            Pool::Work => post_work(task, work, readers, self.done_tx.clone()),
+            Pool::Work => post_work(task, work, readers, self.done_tx),
             Pool::Io => {
-                let job = IoJob { task, work, readers, done: self.done_tx.clone() };
+                let job = IoJob { task, work, readers };
                 // The IO threads hold the receiver for as long as the process lives.
                 _ = self.io.send(job);
             }
@@ -912,8 +917,8 @@ mod tests {
     fn each_runner_runs_a_task_and_hands_back_its_value() {
         let task = |pool| Posting { id: NodeId(4), pool, near: None, critical: false, kind: kinds::COMPILE, arg: 20, reads: false };
         let runners: [(Runner<Next>, Pool); 3] = [
-            (Runner::Threads(Threads::new(1)), Pool::Io),
-            (Runner::Threads(Threads::new(1)), Pool::Work),
+            (Runner::Threads(Threads::new(1, 1)), Pool::Io),
+            (Runner::Threads(Threads::new(1, 1)), Pool::Work),
             (Runner::Inline(Inline::new(1)), Pool::Work),
         ];
         for (mut runner, pool) in runners {

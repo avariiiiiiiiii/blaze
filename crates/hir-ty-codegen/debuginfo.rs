@@ -134,7 +134,7 @@ pub(super) type TypeIndex = u32;
 /// What a debugger is told of a type: its name, its size, and what it is made of as far as
 /// that is told. A type names the types it is made of by their place in the same list, so
 /// one that points to itself can be told of.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum DebugType {
     /// A number, a `bool` or a `char`, whose bytes are read as the `DW_ATE_*` of `encoding`.
     Base {
@@ -175,7 +175,7 @@ impl DebugType {
 }
 
 /// A name, a size, the fields and the types the generic parameters stand for.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Aggregate {
     pub(super) name: String,
     pub(super) size: u64,
@@ -183,7 +183,7 @@ pub(super) struct Aggregate {
     pub(super) parameters: Vec<(String, TypeIndex)>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)] // clone: each state of a coroutine keeps what it captured as its fields
 pub(super) struct Field {
     pub(super) name: String,
     pub(super) offset: u64,
@@ -202,7 +202,7 @@ pub(super) struct Tag {
 
 /// A variant of an enum. `tag` is the value of the tag that says a value is of this variant;
 /// the variant without one is what every other value of the tag means.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Variant {
     pub(super) name: String,
     pub(super) tag: Option<u64>,
@@ -210,7 +210,8 @@ pub(super) struct Variant {
 }
 
 /// Where the value of a variable is while the function runs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(test, derive(Clone))] // clone: tests keep the places they hand `SlotPlaces::new`
 pub(super) enum VariablePlace {
     /// In the frame, this far from what the frame is found by, from the first instruction
     /// to the last.
@@ -223,7 +224,7 @@ pub(super) enum VariablePlace {
 /// Where the stack slots of a function are while it runs, for the ones that hold a local
 /// written with a name. Made by [`SlotPlaces::new`], and sorted again when read back, so that
 /// [`SlotPlaces::of`] finds a slot by binary search: one is asked for each variable told of.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(from = "UnsortedSlotPlaces")]
 pub(super) struct SlotPlaces {
     /// The DWARF expression of what [`VariablePlace::Frame`] and `DW_OP_fbreg` count from.
@@ -363,7 +364,7 @@ impl SlotPlaces {
 }
 
 /// A part of a function its names are looked up in: the body, a block, what follows a `let`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Scope {
     /// The scope this one is inside of, by its place among the scopes. It comes before.
     pub(super) parent: Option<u32>,
@@ -372,7 +373,7 @@ pub(super) struct Scope {
 }
 
 /// A parameter or a `let` of a function.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct VariableDebug {
     pub(super) name: String,
     pub(super) param: bool,
@@ -386,7 +387,7 @@ pub(super) struct VariableDebug {
 
 /// What a debugger is told about one function, with nothing in it that depends on where the
 /// function ends up.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct FunctionDebug {
     /// The path a debugger knows the function by, as in `a::B<c::D>::e<F>`.
     pub(super) name: String,
@@ -1472,7 +1473,7 @@ struct Reloc {
 
 /// A [`Writer`] of one debug section that collects the relocations its output needs: the
 /// addresses of functions, and the offsets into other debug sections, which a linker moves.
-#[derive(Clone)]
+#[derive(Clone)] // clone: gimli's `Sections::new` copies the empty writer once per section
 struct SectionWriter {
     relocs: Vec<Reloc>,
     bytes: EndianVec<RunTimeEndian>,

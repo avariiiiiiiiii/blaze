@@ -5,8 +5,7 @@
 //!
 //! Nothing here reads a file or runs a process (issue #458): the workspace's manifests, the
 //! resolve and its features and the profiles come in ([`Request`]), already read by
-//! blaze-manifest and resolved by blaze-resolve, and the graph goes out. `harness/resolve.py
-//! units` holds the result equal to cargo's.
+//! blaze-manifest and resolved by blaze-resolve, and the graph goes out, equal to cargo's.
 //!
 //! The code follows the pinned nightly's cargo (`cad07cf8e`): `ops/cargo_compile/mod.rs`
 //! (`create_bcx`, `rebuild_unit_graph_shared`), `ops/cargo_compile/unit_generator.rs` (the

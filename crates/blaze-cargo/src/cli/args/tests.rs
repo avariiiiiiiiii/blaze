@@ -63,6 +63,7 @@ fn commands_and_their_aliases() {
     assert_eq!(parse(os(&["-V"])), Ok(Asked::Version));
     assert_eq!(parse(os(&["stop"])), Ok(Asked::Stop));
     assert_eq!(parse(os(&["status"])), Ok(Asked::Status));
+    assert_eq!(parse(os(&["toolchain"])), Ok(Asked::Toolchain));
     assert_eq!(parse(os(&["daemon", "install"])), Ok(Asked::Daemon(DaemonVerb::Install)));
     assert_eq!(parse(os(&["daemon", "uninstall"])), Ok(Asked::Daemon(DaemonVerb::Uninstall)));
     assert_eq!(parse(os(&["daemon", "start"])), Ok(Asked::Unknown("daemon start".to_owned())));

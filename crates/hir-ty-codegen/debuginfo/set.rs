@@ -55,14 +55,14 @@ pub(super) enum Of<'a> {
 
 /// What one type is told as, with the types it is made of by their keys: what the database
 /// keeps of each type.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: holds counts; the cache of types hands out each part's key, once per type on a miss
 pub(crate) struct Own<K> {
     pub(super) told: Interned<Told>,
     pub(super) of: Box<[Made<K>]>,
 }
 
 /// A type that one of an [`Own`] is made of.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)] // clone: as `Own`
 pub(crate) enum Made<K> {
     Key(K),
     /// See [`Part::Named`].

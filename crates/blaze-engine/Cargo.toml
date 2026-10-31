@@ -47,6 +47,9 @@ anyhow.workspace = true
 hir-ty-codegen.workspace = true
 blaze-graph.workspace = true
 mimalloc.workspace = true
+# mimalloc on the huge pages `blaze-mem` chose (`huge.rs`).
+libmimalloc-sys = { workspace = true, features = ["extended"] }
+blaze-mem.workspace = true
 # A pin: the root manifest read (`pin.rs`) and written with its layout and comments kept
 # (`versions.rs`).
 toml.workspace = true

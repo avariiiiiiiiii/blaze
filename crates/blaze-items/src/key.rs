@@ -18,7 +18,8 @@
 //! twice in one build, for the host and for the target, with different features and, when not
 //! cross compiling, the same target cfg. Turning on a feature names its crate's items anew;
 //! their hashes stay what they were, so it costs queries, not code. Two crates of one build
-//! with equal keys, or keys with equal first 8 bytes, are an error [`resolve`] stops at.
+//! with equal keys, or keys with equal first 8 bytes, stop the build with a
+//! [`CrateKeyClash`] ([`check_crate_keys`]), before any key is resolved.
 //!
 //! [`resolve`] goes back from a key to the item of the current database, by indexes over every
 //! crate's items: one of the items of its modules, impls and traits (with their constructors),
@@ -929,7 +930,7 @@ impl ItemId {
 
 /// The item of the current database a key names, if one still has it (see the module doc).
 pub fn resolve(db: &Db, key: ItemKey) -> Option<Resolved> {
-    let krates = crates_by_prefix(db);
+    let krates = checked_crates(db);
     let prefix = u64::from_le_bytes(key.crate_prefix());
     let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
     let krate = krates[at].1;
@@ -940,7 +941,7 @@ pub fn resolve(db: &Db, key: ItemKey) -> Option<Resolved> {
 
 /// The crate of the current database whose [`crate_key`] is `key`, if one has it.
 pub fn resolve_crate(db: &Db, key: &ContentId) -> Option<Crate> {
-    let krates = crates_by_prefix(db);
+    let krates = checked_crates(db);
     let prefix = u64::from_le_bytes(crate_prefix(key));
     let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
     let krate = krates[at].1;
@@ -1100,10 +1101,75 @@ impl std::hash::Hasher for KeyHasher {
     }
 }
 
-/// Every crate of the build by the first 8 bytes of its key, sorted. Stops if two crates have
-/// one: an item of one would be taken for the other's.
+/// Two crates of one build that [`crate_key`] does not tell apart: an item of one would be
+/// taken for the other's, so the build stops ([`check_crate_keys`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CrateKeyClash {
+    pub crates: [ClashingCrate; 2],
+    /// Whether the two keys are one; else only their first 8 bytes, the prefix an item key
+    /// holds, are (a 64-bit collision).
+    pub same_key: bool,
+}
+
+/// A crate of a [`CrateKeyClash`], as the error names it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ClashingCrate {
+    pub name: String,
+    pub version: Option<String>,
+    pub origin: String,
+    pub kind: String,
+}
+
+impl ClashingCrate {
+    fn of(db: &Db, krate: Crate) -> ClashingCrate {
+        let extra = krate.extra_data(db);
+        let data = krate.data(db);
+        let name = extra.display_name.as_ref().map_or("<unnamed>", |it| it.canonical_name().as_str());
+        ClashingCrate {
+            name: name.to_owned(), // alloc: an error's, once
+            version: extra.version.clone(), // clone: an error's, once
+            origin: format!("{:?}", data.origin), // alloc: an error's, once
+            kind: format!("{:?}", data.target_kind), // alloc: an error's, once
+        }
+    }
+}
+
+impl fmt::Display for ClashingCrate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{} ({}, {})", self.name, self.version.as_deref().unwrap_or("?"), self.origin, self.kind)
+    }
+}
+
+impl fmt::Display for CrateKeyClash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [a, b] = &self.crates;
+        match self.same_key {
+            true => write!(
+                f,
+                "crates {a} and {b} have one key: the same name, version, origin, kind of target, \
+                 edition, crate attributes, dependencies and cfg, so the crate graph holds one crate twice"
+            ),
+            false => write!(f, "crates {a} and {b} have keys with equal first 8 bytes (a 64-bit collision)"),
+        }
+    }
+}
+
+impl std::error::Error for CrateKeyClash {}
+
+/// Stops the build when two of its crates have one key or one key prefix. A build checks it
+/// once its crate graph is set and before any key is resolved: [`resolve`] and
+/// [`resolve_crate`] hold it.
+pub fn check_crate_keys(db: &Db) -> Result<(), CrateKeyClash> {
+    match crates_by_prefix(db) {
+        Ok(_) => Ok(()),
+        Err(clash) => Err(clash.clone()), // clone: an error, once
+    }
+}
+
+/// Every crate of the build by the first 8 bytes of its key, sorted; the first two crates found
+/// with one prefix as an error.
 #[blaze_query::tracked(returns(ref))]
-fn crates_by_prefix(db: &Db) -> Vec<(u64, Crate)> {
+fn crates_by_prefix(db: &Db) -> Result<Vec<(u64, Crate)>, CrateKeyClash> {
     let mut krates: Vec<(u64, Crate)> = base_db::all_crates(db)
         .iter()
         .map(|&krate| (u64::from_le_bytes(crate_prefix(&crate_key(db, krate))), krate))
@@ -1113,24 +1179,21 @@ fn crates_by_prefix(db: &Db) -> Vec<(u64, Crate)> {
     for pair in krates.windows(2) {
         let ((prefix, krate), (other_prefix, other)) = (pair[0], pair[1]);
         if prefix == other_prefix {
-            let same = crate_key(db, krate) == crate_key(db, other);
-            let name = |it: Crate| {
-                let extra = it.extra_data(db);
-                let name = extra.display_name.as_ref().map(|it| it.canonical_name().as_str());
-                // alloc: the stop's message, once
-                format!("{}@{} ({it:?})", name.unwrap_or("<unnamed>"), extra.version.as_deref().unwrap_or("?"))
-            };
-            panic!(
-                "blaze-items: crates {} and {} have {}: the same name, version, origin, kind of \
-                 target, edition, crate attributes, dependencies and cfg, so the crate graph holds \
-                 one crate twice; or a 64-bit collision",
-                name(krate),
-                name(other),
-                if same { "one key" } else { "keys with equal first 8 bytes" }
-            );
+            return Err(CrateKeyClash {
+                crates: [ClashingCrate::of(db, krate), ClashingCrate::of(db, other)],
+                same_key: crate_key(db, krate) == crate_key(db, other),
+            });
         }
     }
-    krates
+    Ok(krates)
+}
+
+/// [`crates_by_prefix`] of a build [`check_crate_keys`] let through.
+fn checked_crates(db: &Db) -> &[(u64, Crate)] {
+    match crates_by_prefix(db) {
+        Ok(it) => it,
+        Err(clash) => panic!("blaze-items: a key resolved in a build check_crate_keys stops: {clash}"),
+    }
 }
 
 /// Every item of `krate` with an [`ItemId`], those of its bodies' blocks included.

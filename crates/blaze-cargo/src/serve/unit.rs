@@ -209,6 +209,9 @@ impl Steps for Real {
                 },
                 None => (blaze_lower::lower(lower()).map_err(failed)?, None, Vec::new()),
             };
+            // Before any key is resolved: two crates of one key would take each other's items.
+            blaze_items::key::check_crate_keys(lowered.db())
+                .map_err(|clash| Failed::Error(ApiError::new(format!("blaze-items: {clash}"), None)))?; // alloc: an error, once
             let fresh = session.is_none();
             if fresh {
                 blaze_item_hash::impls::install(lowered.served_db());

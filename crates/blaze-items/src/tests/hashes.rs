@@ -629,6 +629,40 @@ fn a_crate_with_other_dependencies_has_another_key() {
     assert_ne!(with_d, with_other_d, "the dependency's own key");
 }
 
+/// A graph holding one package twice, alike in all a key hashes (two roots of one name,
+/// version, origin, kind, edition, cfg and no dependencies), stops with an error naming both.
+#[test]
+fn two_crates_of_one_key_stop_the_build_naming_both() {
+    let mut db = fixture::db("//- /a.rs crate:a\npub struct S;\n//- /b.rs crate:b\npub struct S;\n").into_db();
+    let krates: Vec<_> = base_db::all_crates(&db).iter().copied().collect();
+    let a = krates[0];
+    let (data, workspace) = (a.data(&db).clone(), a.workspace_data(&db).clone());
+    let roots: Vec<_> = krates.iter().map(|it| it.data(&db).root_file_id).collect();
+    let mut graph = base_db::CrateGraphBuilder::default();
+    for root in roots {
+        graph.add_crate_root(
+            root,
+            data.edition,
+            Some(base_db::CrateDisplayName::from_canonical_name("twice")),
+            Some("1.0.0".to_owned()),
+            cfg::CfgOptions::default(),
+            None,
+            base_db::Env::default(),
+            base_db::CrateOrigin::Library { repo: None, name: intern::Symbol::intern("twice") },
+            Vec::new(),
+            base_db::TargetKind::Lib { is_proc_macro: false },
+            data.proc_macro_cwd.clone(),
+            workspace.clone(),
+        );
+    }
+    graph.set_in_db(&mut db);
+    let clash = key::check_crate_keys(&db).expect_err("two crates of one key");
+    assert!(clash.same_key, "{clash}");
+    let message = clash.to_string();
+    assert_eq!(message.matches("twice@1.0.0").count(), 2, "{message}");
+    assert!(message.contains("one key"), "{message}");
+}
+
 #[test]
 fn a_batch_of_keys_is_each_key_alone() {
     let (db, _) = single(

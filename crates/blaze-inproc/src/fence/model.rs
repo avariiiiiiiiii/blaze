@@ -18,6 +18,7 @@
 //!   mutation of the protocol below is caught.
 
 use std::collections::HashMap;
+use std::hash::BuildHasherDefault;
 
 const NONE: u8 = u8::MAX;
 const MOST_THREADS: usize = 3;
@@ -69,7 +70,7 @@ struct Slot {
     seen: u8,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 enum Pc {
     Unborn,
     /// Between calls: may call, quiesce, start a thread or end.
@@ -98,7 +99,7 @@ enum Pc {
     Dead,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 struct Thread {
     pc: Pc,
     tid: u8,
@@ -546,16 +547,99 @@ fn daemon_steps(state: &State, config: &Config, out: &mut Vec<State>) -> Result<
     Ok(())
 }
 
+/// The representative of `state` under renaming the threads, when every thread plays the same
+/// part (no spawn: thread `i` is ID `i + 1` throughout). A thread ID only meets another in
+/// equality tests and as a bit of a set, so renaming the records and every ID with them
+/// (the slots' IDs, the OS's list, the daemon's list) gives a state that steps the same way,
+/// freeing exposes a thread in one exactly when it does in the other, and the range is freed
+/// from one exactly when from the other: exploring one state per class checks both
+/// properties. Sorted by everything of a thread but its ID; ties only cost reduction.
+fn canonical(state: State, config: &Config) -> State {
+    if config.spawn {
+        return state;
+    }
+    let live = config.threads;
+    let mut order = [0usize, 1, 2];
+    order[..live].sort_by_key(|&it| Thread { tid: 0, ..state.threads[it] });
+    if order[..live].iter().enumerate().all(|(at, &it)| at == it) {
+        return state;
+    }
+    let mut rename = [0u8; MOST_THREADS + 1];
+    for (to, &from) in order[..live].iter().enumerate() {
+        rename[from + 1] = to as u8 + 1;
+    }
+    let set = |bits: u8| (1..=live).filter(|&tid| bits & bit(tid as u8) != 0).fold(0, |out, tid| out | bit(rename[tid]));
+    let mut out = state;
+    for (to, &from) in order[..live].iter().enumerate() {
+        out.threads[to] = Thread { tid: to as u8 + 1, ..state.threads[from] };
+    }
+    for slot in &mut out.slots {
+        slot.tid = rename[slot.tid as usize];
+    }
+    out.alive = set(state.alive);
+    out.during = set(state.during);
+    out.throughout = set(state.throughout);
+    out.daemon.list = set(state.daemon.list);
+    out
+}
+
+/// rustc's FxHash, for the explorer's table: a state is about a hundred one-byte writes,
+/// which SipHash makes the explorer's whole cost.
+#[derive(Default)]
+struct Fx(u64);
+
+impl Fx {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for Fx {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.add(u64::from(byte));
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.add(u64::from(value));
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.add(value);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    fn write_isize(&mut self, value: isize) {
+        self.add(value as u64);
+    }
+}
+
 struct Explored {
     states: usize,
     /// Done states with a thread still alive.
     freed_while_running: usize,
 }
 
+/// The most states one exploration holds (a few GiB with its edges): past it the config is too
+/// big for a test, an error rather than a run of hours.
+const MOST_STATES: usize = 1 << 24;
+
 /// Explores every reachable state; `Err` is the trace to a violation.
 fn explore(config: Config) -> Result<Explored, String> {
-    let initial = State::initial(&config);
-    let mut index: HashMap<State, u32> = HashMap::new();
+    let initial = canonical(State::initial(&config), &config);
+    let mut index: HashMap<State, u32, BuildHasherDefault<Fx>> = HashMap::default();
     let mut states: Vec<State> = vec![initial];
     let mut parent: Vec<u32> = vec![u32::MAX];
     let mut edges: Vec<(u32, u32)> = Vec::new();
@@ -584,6 +668,7 @@ fn explore(config: Config) -> Result<Explored, String> {
             ));
         }
         for successor in next.drain(..) {
+            let successor = canonical(successor, &config);
             let to = *index.entry(successor).or_insert_with(|| {
                 states.push(successor);
                 parent.push(at);
@@ -591,6 +676,9 @@ fn explore(config: Config) -> Result<Explored, String> {
                 (states.len() - 1) as u32
             });
             edges.push((at, to));
+        }
+        if states.len() > MOST_STATES {
+            return Err(format!("{config:?}: past {MOST_STATES} states, too many to explore in a test"));
         }
     }
 
@@ -650,7 +738,7 @@ fn two_threads() {
 
 #[test]
 fn a_thread_starts_while_the_daemon_looks() {
-    check(Config { spawn: true, slots: 3, calls: 1, quiesces: 1, ..BASE });
+    check(Config { threads: 1, spawn: true, slots: 3, calls: 1, quiesces: 1, ..BASE });
 }
 
 #[test]
@@ -670,7 +758,10 @@ fn three_threads_two_slots() {
 
 fn caught(mutation: Mutation) {
     let config = Config { mutation, ..BASE };
-    assert!(explore(config).is_err(), "{mutation:?} was not caught");
+    match explore(config) {
+        Ok(_) => panic!("{mutation:?} was not caught"),
+        Err(error) => assert!(!error.contains("too many to explore"), "{error}"),
+    }
 }
 
 #[test]

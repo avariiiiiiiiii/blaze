@@ -882,6 +882,16 @@ fn struct_path_def(ns: TypeNs) -> Option<StructPathDef> {
     })
 }
 
+/// The kind of the function or constant `name` of `trait_`, if it has one.
+fn trait_item_struct_path_def(db: &Db, trait_: TraitId, name: &Name) -> Option<StructPathDef> {
+    trait_.trait_items(db).items.iter().find_map(|(item_name, item)| match item {
+        _ if item_name != name => None,
+        AssocItemId::FunctionId(_) => Some(StructPathDef::AssocFn),
+        AssocItemId::ConstId(_) => Some(StructPathDef::AssocConst),
+        AssocItemId::TypeAliasId(_) => None,
+    })
+}
+
 impl InferenceDiagnostic {
     /// Whether this is an error that leaves the body tainted by errors, like rustc's
     /// `InferCtxt::tainted_by_errors`: once it is, "type annotations needed" is not reported.
@@ -3418,6 +3428,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         segments = segments.skip(1);
                         variant.into()
                     } else {
+                        if value_ns && segments.len() == 1 {
+                            return self.struct_path_type_relative(node, path);
+                        }
                         let (found, ty) = match segments.is_empty() {
                             true => (StructPathFound::Ty, Some(ty)),
                             false => {
@@ -3425,25 +3438,25 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                                 (StructPathFound::NoVariant { segment }, None)
                             }
                         };
-                        // FIXME: in a tuple struct pattern a segment after the type is an
-                        // associated function or constant (rustc's E0164) or nothing (E0599).
-                        if !value_ns || segments.is_empty() {
-                            self.diagnostics.push(not_a_struct_path(node, found, ty));
-                        }
+                        self.diagnostics.push(not_a_struct_path(node, found, ty));
                         return (self.types.types.error, None);
                     }
                 }
                 None => {
-                    if !ty.references_error() && (!value_ns || segments.is_empty()) {
-                        let (found, ty) = match segments.is_empty() {
-                            true => (StructPathFound::Ty, Some(ty)),
-                            false => {
-                                let segment = (written - segments.len()) as u32;
-                                (StructPathFound::AssocType { segment }, None)
-                            }
-                        };
-                        self.diagnostics.push(not_a_struct_path(node, found, ty));
+                    if ty.references_error() {
+                        return (self.types.types.error, None);
                     }
+                    if value_ns && segments.len() == 1 {
+                        return self.struct_path_type_relative(node, path);
+                    }
+                    let (found, ty) = match segments.is_empty() {
+                        true => (StructPathFound::Ty, Some(ty)),
+                        false => {
+                            let segment = (written - segments.len()) as u32;
+                            (StructPathFound::AssocType { segment }, None)
+                        }
+                    };
+                    self.diagnostics.push(not_a_struct_path(node, found, ty));
                     return (self.types.types.error, None);
                 }
             };
@@ -3451,13 +3464,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             if !segments.is_empty() {
                 let segment = (written - segments.len()) as u32;
                 let found = match variant {
-                    VariantId::EnumVariantId(_) => Some(StructPathFound::AfterVariant { segment }),
-                    _ if value_ns => None,
-                    _ => Some(StructPathFound::AssocType { segment }),
+                    VariantId::EnumVariantId(_) => StructPathFound::AfterVariant { segment },
+                    _ if value_ns && segments.len() == 1 => {
+                        return self.struct_path_type_relative(node, path);
+                    }
+                    _ => StructPathFound::AssocType { segment },
                 };
-                if let Some(found) = found {
-                    self.diagnostics.push(not_a_struct_path(node, found, None));
-                }
+                self.diagnostics.push(not_a_struct_path(node, found, None));
                 return (self.types.types.error, None);
             } else {
                 return (ty, Some(variant));
@@ -3534,14 +3547,28 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 drop(ctx);
                 let ty = self.db.ty(strukt.into()).instantiate(interner, args).skip_norm_wip();
                 let ty = self.insert_type_vars(ty);
-                forbid_unresolved_segments(self, node, value_ns, (ty, Some(strukt.into())), unresolved)
+                forbid_unresolved_segments(
+                    self,
+                    node,
+                    path,
+                    value_ns,
+                    (ty, Some(strukt.into())),
+                    unresolved,
+                )
             }
             TypeNs::AdtId(AdtId::UnionId(u)) => {
                 let args = path_ctx.substs_from_path(u.into(), true, false, node.into());
                 drop(ctx);
                 let ty = self.db.ty(u.into()).instantiate(interner, args).skip_norm_wip();
                 let ty = self.insert_type_vars(ty);
-                forbid_unresolved_segments(self, node, value_ns, (ty, Some(u.into())), unresolved)
+                forbid_unresolved_segments(
+                    self,
+                    node,
+                    path,
+                    value_ns,
+                    (ty, Some(u.into())),
+                    unresolved,
+                )
             }
             TypeNs::EnumVariantId(var) => {
                 let args = path_ctx.substs_from_path(var.into(), true, false, node.into());
@@ -3552,7 +3579,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     .instantiate(interner, args)
                     .skip_norm_wip();
                 let ty = self.insert_type_vars(ty);
-                forbid_unresolved_segments(self, node, value_ns, (ty, Some(var.into())), unresolved)
+                forbid_unresolved_segments(
+                    self,
+                    node,
+                    path,
+                    value_ns,
+                    (ty, Some(var.into())),
+                    unresolved,
+                )
             }
             TypeNs::SelfType(impl_id) => {
                 let mut ty = self.db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
@@ -3562,7 +3596,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     let Some(mod_path) = path.mod_path() else {
                         unreachable!("resolver should always resolve lang item paths");
                     };
-                    return self.resolve_variant_on_alias(node, value_ns, ty, None, mod_path);
+                    return self.resolve_variant_on_alias(node, path, value_ns, ty, None, mod_path);
                 };
 
                 let mut remaining_segments = path.segments().skip(remaining_idx);
@@ -3598,6 +3632,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         }
                     }
 
+                    if value_ns && remaining_segments.len() == 1 {
+                        drop(ctx);
+                        return self.struct_path_type_relative(node, path);
+                    }
+
                     if tried_resolving_once {
                         // FIXME: with `inherent_associated_types` this is allowed, but our `lower_partly_resolved_path()`
                         // will need to be updated to err at the correct segment.
@@ -3621,11 +3660,11 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 let ty = self.table.try_structurally_resolve_type(node.into(), ty);
                 if !remaining_segments.is_empty() {
                     let segment = (path.segments().len() - remaining_segments.len()) as u32;
-                    return self.struct_path_segment_after(node, value_ns, ty, segment);
+                    return self.struct_path_segment_after(node, path, value_ns, ty, segment);
                 }
                 self.struct_path_variant(node, ty)
             }
-            TypeNs::TraitId(_) => {
+            TypeNs::TraitId(trait_) => {
                 let Some(remaining_idx) = unresolved else {
                     let found = StructPathFound::Def(StructPathDef::Trait);
                     self.diagnostics.push(not_a_struct_path(node, found, None));
@@ -3633,6 +3672,18 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 };
 
                 let remaining_segments = path.segments().skip(remaining_idx);
+
+                // rustc's resolver takes `Trait::item` whole, so a function or constant in a
+                // tuple struct pattern is its E0532.
+                if value_ns
+                    && remaining_segments.len() == 1
+                    && let Some(segment) = remaining_segments.first()
+                    && let Some(def) = trait_item_struct_path_def(self.db, trait_, segment.name)
+                {
+                    drop(ctx);
+                    self.push_diagnostic(not_a_struct_path(node, StructPathFound::Def(def), None));
+                    return (self.types.types.error, None);
+                }
 
                 if remaining_segments.len() >= 2 {
                     path_ctx.ignore_last_segment();
@@ -3663,7 +3714,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 drop(ctx);
                 if remaining_segments.len() >= 2 {
                     let segment = (remaining_idx + 1) as u32;
-                    return self.struct_path_segment_after(node, value_ns, ty, segment);
+                    return self.struct_path_segment_after(node, path, value_ns, ty, segment);
                 }
                 self.struct_path_variant(node, ty)
             }
@@ -3678,7 +3729,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 let ty = self.db.ty(it.into()).instantiate(interner, args).skip_norm_wip();
                 let ty = self.insert_type_vars(ty);
 
-                self.resolve_variant_on_alias(node, value_ns, ty, unresolved, mod_path)
+                self.resolve_variant_on_alias(node, path, value_ns, ty, unresolved, mod_path)
             }
             TypeNs::AdtSelfType(_) => {
                 // FIXME this could happen in array size expressions, once we're checking them
@@ -3686,11 +3737,17 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             }
             TypeNs::GenericParam(_) => {
                 drop(ctx);
-                if unresolved.is_none() {
-                    let found = StructPathFound::Def(StructPathDef::TypeParam);
-                    self.push_diagnostic(not_a_struct_path(node, found, None));
+                match unresolved {
+                    None => {
+                        let found = StructPathFound::Def(StructPathDef::TypeParam);
+                        self.push_diagnostic(not_a_struct_path(node, found, None));
+                    }
+                    Some(segment) if value_ns && segment + 1 == path.segments().len() => {
+                        return self.struct_path_type_relative(node, path);
+                    }
+                    // FIXME potentially resolve assoc type
+                    Some(_) => {}
                 }
-                // FIXME potentially resolve assoc type
                 (self.types.types.error, None)
             }
             TypeNs::AdtId(AdtId::EnumId(_)) | TypeNs::BuiltinType(_) | TypeNs::ModuleId(_) => {
@@ -3699,9 +3756,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                     (None, _) => struct_path_def(resolution).map(StructPathFound::Def),
                     // A module's unresolved segment is `UnresolvedPath`'s.
                     (Some(_), TypeNs::ModuleId(_)) => None,
-                    // FIXME: in a tuple struct pattern the segment is an associated function or
-                    // constant (rustc's E0164) or nothing (E0599).
-                    (Some(_), _) if value_ns => None,
+                    (Some(segment), _) if value_ns && segment + 1 == path.segments().len() => {
+                        return self.struct_path_type_relative(node, path);
+                    }
                     (Some(segment), TypeNs::AdtId(_)) => {
                         Some(StructPathFound::NoVariant { segment: segment as u32 })
                     }
@@ -3717,23 +3774,24 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         };
 
         fn forbid_unresolved_segments<'db>(
-            ctx: &InferenceContext<'db, '_>,
+            ctx: &mut InferenceContext<'db, '_>,
             node: ExprOrPatIdPacked,
+            path: Path<'_>,
             value_ns: bool,
             result: (Ty<'db>, Option<VariantId>),
             unresolved: Option<usize>,
         ) -> (Ty<'db>, Option<VariantId>) {
             let Some(segment) = unresolved else { return result };
-            // FIXME: in a tuple struct pattern the segment is an associated function or constant
-            // (rustc's E0164) or nothing (E0599).
-            if !value_ns {
-                let segment = segment as u32;
-                let found = match result.1 {
-                    Some(VariantId::EnumVariantId(_)) => StructPathFound::AfterVariant { segment },
-                    _ => StructPathFound::AssocType { segment },
-                };
-                ctx.push_diagnostic(not_a_struct_path(node, found, None));
-            }
+            let found = match result.1 {
+                Some(VariantId::EnumVariantId(_)) => {
+                    StructPathFound::AfterVariant { segment: segment as u32 }
+                }
+                _ if value_ns && segment + 1 == path.segments().len() => {
+                    return ctx.struct_path_type_relative(node, path);
+                }
+                _ => StructPathFound::AssocType { segment: segment as u32 },
+            };
+            ctx.push_diagnostic(not_a_struct_path(node, found, None));
             (ctx.types.types.error, None)
         }
     }
@@ -3758,16 +3816,19 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
     /// Reports a struct path's `segment` after the type `ty`, which names no variant of it (an
     /// enum) or an associated type a struct path can't use, unless `ty` is an error already.
+    /// The last segment of a tuple struct pattern's `path` is a value instead.
     fn struct_path_segment_after(
-        &self,
+        &mut self,
         node: ExprOrPatIdPacked,
+        path: Path<'_>,
         value_ns: bool,
         ty: Ty<'db>,
         segment: u32,
     ) -> (Ty<'db>, Option<VariantId>) {
-        // FIXME: in a tuple struct pattern the segment is an associated function or constant
-        // (rustc's E0164) or nothing (E0599).
-        if !value_ns && !ty.references_error() {
+        if value_ns && segment as usize + 1 == path.segments().len() {
+            return self.struct_path_type_relative(node, path);
+        }
+        if !ty.references_error() {
             let found = match ty.as_adt() {
                 Some((AdtId::EnumId(_), _)) => StructPathFound::NoVariant { segment },
                 _ => StructPathFound::AssocType { segment },
@@ -3777,20 +3838,41 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         (self.types.types.error, None)
     }
 
+    /// A tuple struct pattern whose last segment follows a type and names no variant of it:
+    /// rustc's `resolve_fully_qualified_call` finds an associated function or constant there
+    /// (E0164) or nothing (the probe's E0599, which `resolve_value_path_inner` reports).
+    fn struct_path_type_relative(
+        &mut self,
+        node: ExprOrPatIdPacked,
+        path: Path<'_>,
+    ) -> (Ty<'db>, Option<VariantId>) {
+        let def = match self.resolve_value_path_inner(path, node, true) {
+            Some((ValueNs::FunctionId(_), _)) => Some(StructPathDef::AssocFn),
+            Some((ValueNs::ConstId(_), _)) => Some(StructPathDef::AssocConst),
+            _ => None,
+        };
+        if let Some(def) = def {
+            let found = StructPathFound::TypeRelative(def);
+            self.push_diagnostic(not_a_struct_path(node, found, None));
+        }
+        (self.types.types.error, None)
+    }
+
     fn resolve_variant_on_alias(
         &mut self,
         node: ExprOrPatIdPacked,
+        path: Path<'_>,
         value_ns: bool,
         ty: Ty<'db>,
         unresolved: Option<usize>,
-        path: &ModPath,
+        mod_path: &ModPath,
     ) -> (Ty<'db>, Option<VariantId>) {
-        let remaining = unresolved.map(|it| path.segments()[it..].len()).filter(|it| it > &0);
+        let remaining = unresolved.map(|it| mod_path.segments()[it..].len()).filter(|it| it > &0);
         let ty = self.table.try_structurally_resolve_type(node.into(), ty);
         let Some((remaining, first)) = remaining.zip(unresolved) else {
             return self.struct_path_variant(node, ty);
         };
-        let segments = path.segments();
+        let segments = mod_path.segments();
         // this could be an enum variant or associated type
         if let Some((AdtId::EnumId(enum_id), _)) = ty.as_adt()
             && let Some(variant) = enum_id.enum_variants(self.db).variant(&segments[first])
@@ -3803,7 +3885,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             return (self.err_ty(), None);
         }
         // FIXME potentially resolve assoc type
-        self.struct_path_segment_after(node, value_ns, ty, first as u32)
+        self.struct_path_segment_after(node, path, value_ns, ty, first as u32)
     }
 
     fn resolve_va_list(&self) -> Option<AdtId> {

@@ -5,14 +5,17 @@
 use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use blaze_alloc_count::assert_at_most;
 use hir_def::{
-    FunctionId, ModuleDefId,
+    AdtId, FunctionId, ModuleDefId,
     expr_store::Body,
     nameres::crate_def_map,
-    signatures::{FunctionSignature, StructSignature, TraitSignature},
+    signatures::{EnumSignature, FunctionSignature, StructSignature, TraitSignature, UnionSignature},
     test_items,
 };
 use hir_expand::name::Name;
-use hir_ty::{db::HirDatabase, next_solver::TyKind};
+use hir_ty::{
+    db::HirDatabase,
+    next_solver::{Ty, TyKind},
+};
 use rustc_type_ir::inherent::IntoKind;
 use hir_expand::fixture;
 
@@ -48,28 +51,48 @@ fn free(db: &Db, krate: Crate, path: &[&str]) -> FunctionId {
     }
 }
 
-/// The method `name` of the impl in `krate` for the type named `self_ty` (`str` for `str`, any
-/// references taken off), of the trait named `trait_` or inherent.
+/// The name of `ty` (`str` for `str`, any references taken off), `None` for one with none.
+fn type_name(db: &Db, mut ty: Ty<'_>) -> Option<String> {
+    while let TyKind::Ref(_, inner, _) = ty.kind() {
+        ty = inner;
+    }
+    let name = match ty.kind() {
+        TyKind::Str => return Some("str".to_owned()),
+        TyKind::Adt(def, _) => match def.def_id() {
+            AdtId::StructId(id) => StructSignature::of(db, id).name.clone(),
+            AdtId::EnumId(id) => EnumSignature::of(db, id).name.clone(),
+            AdtId::UnionId(id) => UnionSignature::of(db, id).name.clone(),
+        },
+        _ => return None,
+    };
+    Some(name.as_str().to_owned())
+}
+
+/// The method `name` of the impl in `krate` for the type named `self_ty` (as [`type_name`]),
+/// of the trait named `trait_` or inherent; `Tr<T>` names the impl of `Tr` whose first argument
+/// is the type named `T`.
 #[track_caller]
 fn method(db: &Db, krate: Crate, self_ty: &str, trait_: Option<&str>, name: &str) -> FunctionId {
     let mut found = Vec::new();
     for imp in test_items::impls(db, krate) {
-        let mut ty = db.impl_self_ty(imp).skip_binder();
-        while let TyKind::Ref(_, inner, _) = ty.kind() {
-            ty = inner;
+        if type_name(db, db.impl_self_ty(imp).skip_binder()).as_deref() != Some(self_ty) {
+            continue;
         }
-        let ty_name = match ty.kind() {
-            TyKind::Str => "str".to_owned(),
-            TyKind::Adt(def, _) => match def.def_id() {
-                hir_def::AdtId::StructId(id) => StructSignature::of(db, id).name.as_str().to_owned(),
-                _ => continue,
-            },
-            _ => continue,
+        let trait_ref = db.impl_trait(imp).map(|it| it.skip_binder());
+        let matches = match (trait_ref, trait_) {
+            (None, None) => true,
+            (Some(trait_ref), Some(wanted)) => {
+                let (wanted, arg) = match wanted.split_once('<') {
+                    Some((it, arg)) => (it, arg.strip_suffix('>')),
+                    None => (wanted, None),
+                };
+                let of = TraitSignature::of(db, trait_ref.def_id.0).name.as_str() == wanted;
+                let first = || trait_ref.args.iter().nth(1).and_then(|it| it.ty());
+                of && arg.is_none_or(|arg| first().and_then(|it| type_name(db, it)).as_deref() == Some(arg))
+            }
+            _ => false,
         };
-        let trait_name = db
-            .impl_trait(imp)
-            .map(|it| TraitSignature::of(db, it.skip_binder().def_id.0).name.as_str().to_owned());
-        if ty_name != self_ty || trait_name.as_deref() != trait_ {
+        if !matches {
             continue;
         }
         for (item_name, item) in imp.impl_items(db).items.iter() {
@@ -127,7 +150,7 @@ fn std_functions_have_their_models() {
         assert_eq!(method("PathBuf", Some("Deref"), "deref"), SAME);
         assert_eq!(method("PathBuf", Some("From"), "from"), SAME);
         assert_eq!(method("PathBuf", Some("AsRef"), "as_ref"), SAME);
-        assert_eq!(method("String", Some("AsRef"), "as_ref"), SAME);
+        assert_eq!(method("String", Some("AsRef<Path>"), "as_ref"), SAME);
         assert_eq!(method("OsStr", None, "to_str"), SAME);
         // Walked as any code: what they do is what their bodies reach.
         assert_eq!(method("Command", None, "output"), None);

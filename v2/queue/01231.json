@@ -1,0 +1,24 @@
+{
+  "id": "01231",
+  "from_lane": "tests-misc-front1",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-ty-mir/src/mir/lower.rs",
+    "crates/hir-ty/src/opaques.rs"
+  ],
+  "what": "For the hir-ty/hir-ty-mir subagent, from round3d (my crates' tests, causes in hir-ty*): (1) hir-ty-share tests::a_vtable_and_a_method_tell_types_apart: `pub fn erase<T: Show>(x: &T) -> &dyn Show { x }` (minicore has unsize, coerce_unsized) has MIR that failed to lower; rustc accepts it (WF of &'a T gives T: 'a). (2) hir-ty-share tests::equal_keys_mean_one_monomorphized_body: `counter<T>() -> &'static u32 { static C: u32 = 7; &C }` monomorphized at RefP prints `&u32` locals, at U32 prints `&_` (an unresolved/error type) with the same share key. (3) blaze-items tests::coherence::an_alias_with_impl_trait_takes_its_hidden_type_from_its_defining_body: tait_hidden_types of `pub type Opaque = impl Tr;` defined by `#[define_opaque(Opaque)] fn opaque() -> Opaque { 0u32 }` is [{type error}], not u32.",
+  "state": "open",
+  "created": "2026-10-31T02:20:29Z",
+  "updated": "2026-10-31T02:20:29Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:20:29Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -1,7 +1,8 @@
-//! Compile errors and warnings as rustc gives them (docs/v2/plan/process/building.md section 18; #1522,
-//! #1440, #780): computed from the front end's queries that found them, each with the facts
-//! it read, and written as rustc and cargo write them. Every error rustc gives is given: a
-//! program rustc rejects that blaze accepts is a bug of this crate or of the front end.
+//! Compile errors and warnings (docs/v2/plan/process/building.md section 18; #1522, #1440, #780):
+//! computed from the front end's queries that found them, each with the facts it read. They
+//! are judged by usefulness, not by matching rustc (AGENTS.md `useful-not-rustc-parity`): an
+//! error catches the mistake, points at the code that causes it, and says what is wrong and how
+//! to fix it. The modules below started as ports of rustc's; their wording is free to change.
 //!
 //! - [`model`]: a diagnostic as data, rustc's `DiagInner`, with its facts.
 //! - [`cx`]: what one is lowered with: spans as rustc gives them, files, facts.

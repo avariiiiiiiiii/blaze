@@ -23,52 +23,59 @@ then `bun tools/agents/rules.ts --write`). Skills: .agents/skills/.
    attributes, semantics) only has to work under blaze, never under rustc, as long as it is opt-in
    and every program that doesn't use it behaves exactly as under rustc. See
    [docs/no-rustc.md](docs/no-rustc.md).
-5. **own-nightly**: blaze is its own toolchain: it builds every project with its pinned nightly
+5. **useful-not-rustc-parity**: blaze's errors, warnings, lints and printed output are judged by how
+   useful they are, never by how closely they match rustc or cargo. Don't copy rustc's wording,
+   layout, error codes, ordering, closing lines or set of lints; don't add a check only because
+   rustc has one. A diagnostic is right when it catches the mistake, points at the code that causes
+   it, and says what is wrong and how to fix it. Tests assert those facts (reported or not, where,
+   the names and types involved), never rustc's text. This does not loosen `superset-of-rust`: a
+   program blaze builds still runs as it does under rustc.
+6. **own-nightly**: blaze is its own toolchain: it builds every project with its pinned nightly
    (`harness/toolchain`, bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN`
    and `RUSTC`. Projects pin the blaze version, not Rust's. See
    [docs/toolchain.md](docs/toolchain.md).
-6. **sandbox-everything**: Build scripts and proc macros always run sandboxed, on every platform; where
+7. **sandbox-everything**: Build scripts and proc macros always run sandboxed, on every platform; where
    no sandbox can be made, blaze stops. Sandboxed tests are an opt-in experiment. The only ways out
    are the documented manifest opt-outs and `BLAZE_SANDBOX=off`; nothing new that runs user code
    runs outside by default. See
    [docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox](docs/cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox).
-7. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
+8. **best-long-term-design**: Pick the best long-term design, not the least work: own the layer or port
    rustc's rule properly, and spend the effort on proving it right: real crates' own test suites
    passing under blaze, and fuzzing of blaze's own invariants. See
    [docs/contributing.md#rules-for-code](docs/contributing.md#rules-for-code).
-8. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
+9. **semantics-in-front-end**: Language semantics (MIR building and passes, borrow checking, const
    eval, layout, code-identity hashes) go in the front end's salsa crates in `crates/` (`hir-ty`,
    `hir-def` and the rest, derived from rust-analyzer but no longer synced with it), in a crate of
    their own where possible. Codegen, the store, the daemon, cargo integration and the runtime stay
    outside the front end. See
    [docs/contributing.md#where-new-code-goes](docs/contributing.md#where-new-code-goes).
-9. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
-   deterministic CBOR; the CLI is a client of the same API. See
-   [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
-10. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
+10. **no-mcp**: No MCP. Agent-facing interfaces are a Unix socket or HTTP with one versioned schema in
+    deterministic CBOR; the CLI is a client of the same API. See
+    [docs/roadmap.md#8-the-agent-api](docs/roadmap.md#8-the-agent-api).
+11. **work-in-ix-vms**: Builds, tests, benchmarks and experiments run in an ix VM, one per lane (`ix
     new`, `ix shell`, `ix rm`), never on the Mac or AWS. Where an ix VM can't do it, stop and say
     what is missing. See
     [docs/contributing.md#working-in-parallel](docs/contributing.md#working-in-parallel).
-11. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
+12. **worktree-per-lane**: One uniquely named worktree per lane with its own `CARGO_TARGET_DIR`; never
     `git stash`.
-12. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
+13. **land-through-pr**: Land small and often through a pull request: `python3 .github/scripts/land.py
     "what the branch does"` opens it, turns on auto-merge and waits for the merge gate (`--wait`
     resumes). Harnesses run after merge in the release train. Never push to main. See
     [docs/contributing.md#landing-a-change](docs/contributing.md#landing-a-change).
-13. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
+14. **own-prs-to-merge**: Any agent may take any open pull request or issue to done (merge main, resolve
     conflicts, fix its gate, finish a draft) rather than hand it back; tell the owning lane what
     changed. Close one only when it is wrong, saying why.
-14. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
+15. **clean-up-lane**: When a lane is done, delete its worktree, target directory, ix VM and merged
     branch.
-15. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
+16. **credit-people**: A commit or pull request built on someone's suggestion, diagnosis or patch gets a
     `Co-authored-by: Name <id+login@users.noreply.github.com>` trailer for each of them and says
     where it came from. See [docs/contributing.md#credit](docs/contributing.md#credit).
-16. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
+17. **docs-say-what-they-are**: Every doc under `docs/` has front matter: `current` (kept true), `plan`,
     `record` (dated history) or `superseded` (naming its replacement). Trust current docs; read
     plans and records as of their date. A change that makes a current doc untrue fixes it or marks
     it superseded in the same change; `python3 tools/docs.py check` holds them to the tree. See
     [docs/contributing.md#documents](docs/contributing.md#documents).
-17. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
+18. **scripts-take-typed-input**: A script takes one JSON value (a file path, `-` or inline), parsed
     into a frozen dataclass that refuses unknown fields, not a set of flags or hidden environment
     variables. An existing script moves to this when next changed.
 

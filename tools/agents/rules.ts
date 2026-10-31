@@ -50,6 +50,11 @@ export const rules = [
 		link: "docs/no-rustc.md",
 	},
 	{
+		id: "useful-not-rustc-parity",
+		info: "blaze's errors, warnings, lints and printed output are judged by how useful they are, never by how closely they match rustc or cargo. Don't copy rustc's wording, layout, error codes, ordering, closing lines or set of lints; don't add a check only because rustc has one. A diagnostic is right when it catches the mistake, points at the code that causes it, and says what is wrong and how to fix it. Tests assert those facts (reported or not, where, the names and types involved), never rustc's text. This does not loosen `superset-of-rust`: a program blaze builds still runs as it does under rustc.",
+		reason: "\"we dont need word for word ... be clear functional parity also not needed we care about usefulness just in general wrt rustc\" (Andrew, 2026-10-31). On 2026-10-31 166 of blaze-diagnostics' 1223 tests failed, most on text that differed from rustc's (`{integer}` against `i32`, a span one column off, a lint count) and not on whether the error was useful.",
+	},
+	{
 		id: "own-nightly",
 		info: "blaze is its own toolchain: it builds every project with its pinned nightly (`harness/toolchain`, bumped daily), ignoring rust-toolchain files, rustup, `RUSTUP_TOOLCHAIN` and `RUSTC`. Projects pin the blaze version, not Rust's.",
 		reason: "\"You should use your own nightly that you control since you are trying to replace rustc\" (Andrew, 2026-10-26). \"blaze should be the latest-nightly equivalent\" (Andrew, 2026-10-27, #404). \"ZERO Rust toolchain pinning\" (Andrew, 2026-10-28).",

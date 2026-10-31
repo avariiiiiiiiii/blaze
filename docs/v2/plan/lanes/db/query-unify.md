@@ -223,6 +223,16 @@ The two forms the front end uses keep salsa's semantics, so every result is the 
   for a `#[tracked]` field, an input-like field written by the query that makes it, read with an
   edge. Their creation's identity is the creating query's key plus the struct's own fields.
 
+### Singletons (R18, 01228)
+
+A singleton's absence is observable (`try_get` gives `None`), so it is a read and its creation
+a write. Its table reserves the one ID and its field nodes when made, stamped 0 ("never
+changed") and unmade; `try_get` of the unmade row records a read of field 0's node and gives
+`None`. `new`/`builder(..).new` of a singleton take `&mut D` and open a view (kind `LOW`, the
+field nodes' bits written) that repaints every field node: exactly the queries that saw it
+absent run again, in the view right after it is made. `&` can't make a singleton (the fork's
+`&` creation left readers of the absence valid forever).
+
 ### What the front end reads of the graph
 
 - `capture_reads(db, f) -> (T, Option<Reads>)`, `replay_reads(db, reads)`,

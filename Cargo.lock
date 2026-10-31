@@ -1039,6 +1039,7 @@ dependencies = [
  "blaze-query-macros",
  "blaze-reclaim",
  "blaze-vfs",
+ "either",
  "hashbrown 0.17.1",
  "hegeltest",
  "indexmap",

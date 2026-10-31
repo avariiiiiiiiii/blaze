@@ -1,6 +1,7 @@
 //! Input structs: a row of fields per ID, each field with its own node, whose color is its
-//! stamp (the view it last changed in) and durability, always verified. Made by `&`, set only
-//! by `&mut` (a setter opens a view of the field's kind).
+//! stamp (the view it last changed in) and durability, always verified. Made by `&` (a
+//! singleton, whose absence a query can read, by `&mut`), set only by `&mut` (a setter opens a
+//! view of the field's kind).
 
 use std::{
     cell::UnsafeCell,
@@ -19,7 +20,7 @@ use super::{
     ingredient::{Ingredient, Kind, Vtable},
     local,
     row::{Pages, layout},
-    storage::{Durability, FIELD, Ids, Storage, Table, color, input_bits, node_key},
+    storage::{Durability, FIELD, Ids, Storage, Table, color, input_bits, node_key, or},
 };
 
 /// One input struct. Its fields are numbered 0..FIELDS; each has its own stamp and node.
@@ -28,7 +29,7 @@ pub trait Input: 'static {
     const NAME: &'static str;
     const FILE: &'static str;
     const FIELDS: u32;
-    /// A second [`input_new`] panics naming `NAME`.
+    /// Made once, by `&mut` ([`input_new_singleton`]); a second panics naming `NAME`.
     const SINGLETON: bool;
     fn ingredient() -> &'static Ingredient;
 }
@@ -187,11 +188,80 @@ pub(crate) fn field_node<I: Input>(storage: &Storage, id: Id, field: u32) -> u32
     row::<I>(storage, id).first.load(Ordering::Relaxed) + field
 }
 
-/// The singleton's ID, if made.
+/// Singleton `I`'s table and ID, reserving the ID and its field nodes on first use: unmade,
+/// each field node stamped 0 (never changed) with durability `LOW`.
+fn reserved<I: Input>(storage: &Storage) -> (&InputTable<I>, Id) {
+    let (table, index) = storage.table_or_make::<InputTable<I>>(I::ingredient());
+    let id = *table.singleton.get_or_init(|| {
+        let id = table.ids.next(storage, index, &table.pages, &storage.heap, layout::<RowOf<I>>());
+        let row = table.pages.row::<RowOf<I>>(id).expect("`Ids::next` made the row's page");
+        let first = storage.new_nodes(I::FIELDS.max(1));
+        for field in 0..I::FIELDS.max(1) {
+            let node = first + field;
+            storage.set_key(node, node_key(index, id, field));
+            storage.set_summary(node, input_bits(node));
+            storage.repaint(node, color(FIELD | u32::from(Durability::LOW.0), 0));
+        }
+        row.first.store(first, Ordering::Relaxed);
+        id
+    });
+    (table, id)
+}
+
+/// The singleton's ID, if made. Its absence is a read of its field 0's node, which making it
+/// changes ([`input_new_singleton`]).
 pub fn input_singleton<I: Input>(storage: &Storage) -> Option<Id> {
-    let index = I::ingredient().index();
-    let table = storage.table::<InputTable<I>>(index)?;
-    (table.ids.len() > 0).then(|| table.ids.all().next()).flatten()
+    let (table, id) = reserved::<I>(storage);
+    let row = table.pages.row::<RowOf<I>>(id).expect("the reserved row's page");
+    // Acquire: the fields `input_new_singleton` wrote before `made`.
+    if row.made.load(Ordering::Acquire) != 0 {
+        return Some(id);
+    }
+    let node = row.first.load(Ordering::Relaxed);
+    let seen = storage.color_of(node);
+    let durability = ((seen >> 32) as u32 & !FIELD) as u8;
+    local::with(|local| local.read(storage, node, durability, seen as u32));
+    None
+}
+
+/// Makes singleton `I` with `fields`, field `f` of durability `durability[f]`: a write, whose
+/// view repaints its field nodes, so every query that read its absence runs again.
+pub fn input_new_singleton<I: Input, const N: usize>(
+    storage: &mut Storage,
+    fields: I::Fields,
+    durability: [Durability; N],
+) -> Id {
+    assert!(I::SINGLETON, "{} is not a singleton", I::NAME);
+    assert_eq!(
+        N,
+        I::FIELDS as usize,
+        "{} has {} fields, given {N} durabilities",
+        I::NAME,
+        I::FIELDS
+    );
+    let (table, id) = reserved::<I>(storage);
+    let row = table.pages.row::<RowOf<I>>(id).expect("the reserved row's page");
+    assert!(
+        row.made.load(Ordering::Relaxed) == 0,
+        "{} is a singleton, made a second time",
+        I::NAME
+    );
+    let first = row.first.load(Ordering::Relaxed);
+    let end = first + I::FIELDS.max(1);
+    let written = (first..end).fold([0; 2], |acc, node| or(acc, input_bits(node)));
+    let view = storage.new_view(Durability::LOW, written);
+    for (at, node) in (first..end).enumerate() {
+        let kind = durability.get(at).copied().unwrap_or(Durability::LOW);
+        storage.repaint(node, color(FIELD | u32::from(kind.0), view));
+    }
+    let (table, _) = reserved::<I>(storage);
+    let row = table.pages.row::<RowOf<I>>(id).expect("the reserved row's page");
+    // SAFETY: `&mut` of the storage, so no reader; the row is unmade, so its fields were
+    // never written.
+    unsafe { (*row.fields.get()).write(fields) };
+    // Release: the fields and nodes are written before a reader sees the row made.
+    row.made.store(1, Ordering::Release);
+    id
 }
 
 /// Sets one field of an input: `with_durability`, then `to`.

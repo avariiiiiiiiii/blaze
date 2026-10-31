@@ -288,7 +288,7 @@ pub(crate) enum AnyImpl {
     BuiltinDerive(BuiltinDeriveImplId),
 }
 
-const _: () = assert!(size_of::<AnyImpl>() == 12);
+const _: () = assert!(size_of::<AnyImpl>() == 8);
 
 /// An impl's signature hash: an impl fact's value is computed inside a body's inference, which
 /// an interface hash, holding what bodies leak, may reach. A built-in derive impl has no item

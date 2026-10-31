@@ -279,7 +279,7 @@ pub fn mir_body_for_coroutine_by_move_query<'db>(
 
 // Built MIR, monomorphized.
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_mir_body_query<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,
@@ -289,7 +289,7 @@ pub fn monomorphized_mir_body_query<'db>(
     compute_monomorphized(db, MirOwner::Body(owner), MirStage::Built, subst, trait_env)
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -299,7 +299,7 @@ pub fn monomorphized_mir_body_for_closure_query<'db>(
     compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Built, subst, trait_env)
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -309,7 +309,7 @@ pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     compute_monomorphized(db, MirOwner::Coroutine(coroutine), MirStage::Built, subst, trait_env)
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -395,7 +395,7 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
 
 // Optimized MIR.
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, lru = 0, mem_tag = Mir)]
 pub fn optimized_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -404,7 +404,7 @@ pub fn optimized_mir_body_query<'db>(
     compute(db, MirOwner::Body(def), MirStage::Optimized(options))
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, lru = 0, mem_tag = Mir)]
 pub fn optimized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -415,7 +415,7 @@ pub fn optimized_mir_body_for_closure_query<'db>(
 
 /// The body of an `async` block's `poll` with `options`: of the passes, only the UB checks run
 /// on a coroutine body.
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, lru = 0, mem_tag = Mir)]
 pub fn optimized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -424,7 +424,7 @@ pub fn optimized_mir_body_for_coroutine_query<'db>(
     compute(db, MirOwner::Coroutine(coroutine), MirStage::Optimized(options))
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop2, lru = 0, mem_tag = Mir)]
 pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -433,7 +433,7 @@ pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
     compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Optimized(options))
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,
@@ -445,7 +445,7 @@ pub fn monomorphized_optimized_mir_body_query<'db>(
     compute_monomorphized(db, MirOwner::Body(def), stage, subst, trait_env)
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
@@ -457,7 +457,7 @@ pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
     compute_monomorphized(db, MirOwner::Closure(closure), stage, subst, trait_env)
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
@@ -469,7 +469,7 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
     compute_monomorphized(db, MirOwner::Coroutine(coroutine), stage, subst, trait_env)
 }
 
-#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, mem_tag = Mir)]
+#[blaze_query::tracked(returns(as_ref), cycle_result = mir_loop4, lru = 0, mem_tag = Mir)]
 pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,

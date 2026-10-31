@@ -584,7 +584,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for EraseAndAnonymize<'db> {
 }
 
 /// The constant behind a promoted `&expr` of `owner`, as the instance with `subst` sees it.
-#[blaze_query::tracked(returns(as_ref))]
+#[blaze_query::tracked(returns(as_ref), lru = 0)]
 pub fn monomorphized_promoted_mir_body_query<'db>(
     db: &'db Db,
     owner: InferBodyId<'db>,

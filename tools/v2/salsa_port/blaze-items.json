@@ -54,6 +54,10 @@
     {
      "old": "//! Each is built from salsa queries in layers, so an edit reruns only the groupings it touches\n",
      "new": "//! Each is built from tracked queries in layers, so an edit reruns only the groupings it touches\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<AnyImpl>() == 12);\n",
+     "new": "const _: () = assert!(size_of::<AnyImpl>() == 8);\n"
     }
    ]
   },

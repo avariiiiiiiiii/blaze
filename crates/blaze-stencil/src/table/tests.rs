@@ -19,6 +19,11 @@ fn shapes(isa: Isa) -> Vec<Shape> {
     shapes
 }
 
+/// The shapes a library of `variant` holds: its set, less what [`Variant::has`] leaves out.
+fn shapes_of(variant: Variant) -> Vec<Shape> {
+    shapes(variant.isa()).into_iter().filter(|it| variant.has(*it)).collect()
+}
+
 /// Stencil `i`'s made-up code: its length varies, and its last 5 bytes are a `jmp rel32`.
 fn code(i: usize) -> Vec<u8> {
     let mut code = vec![i as u8; 4 + i % 7];
@@ -99,7 +104,7 @@ fn writing_is_deterministic() {
 fn the_index_finds_every_key_of_a_full_set_and_no_other() {
     for isa in Isa::ALL {
         let variant = if isa == Isa::X86_64 { Variant::X86_64 } else { Variant::Aarch64 };
-        let set = shapes(isa);
+        let set = shapes_of(variant);
         let mut writer = Writer::new(variant);
         let code = [0u8; 4];
         for shape in &set {
@@ -330,7 +335,7 @@ fn the_built_libraries_hold_every_shape_of_their_set() {
         let library = Library::get(variant).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(library.variant(), variant);
         assert_ne!(library.id(), [0; 32]);
-        let set = shapes(variant.isa());
+        let set = shapes_of(variant);
         assert_eq!(library.reader().len() as usize, set.len(), "{variant:?}");
         let a64 = variant.isa() == Isa::Aarch64;
         for shape in set {

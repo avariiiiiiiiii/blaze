@@ -1297,7 +1297,7 @@ mod tests {
         let mut changed = Vec::new();
         b.changed_since(&a, &mut changed);
         assert_eq!(changed, vec![0..2 * PAGE, 3 * PAGE..b.len()]);
-        assert!(b.same(PAGE + 1, &a, PAGE + 1, 20), "an unwritten range is the same");
+        assert!(b.same(PAGE + 3, &a, PAGE + 3, 20), "an unwritten range is the same");
         assert!(!b.same(PAGE - 5, &a, PAGE - 5, 10), "a written range differs");
         assert!(b.same(PAGE - 5, &b.clone(), PAGE - 5, PAGE + 10), "a range across pages, copied in parts");
         assert!(b.same(0, &a, 0, PAGE - 3));

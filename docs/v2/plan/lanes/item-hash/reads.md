@@ -103,7 +103,9 @@ walks every module's inherent impls inline in inference). It is refused.
 | `predicates` (`builtin_derive.rs`) | I B | `Derive(adt)` | the value hashes each built-in derive impl's interface |
 | the tables above of impls and traits by several arguments (salsa's `interned_arguments`, 00827), of another crate | I | `Crate` of the crate they name (of a module's crate for `module_items_named`) | the `Crate` fact hashes the crate and every crate it depends on |
 | `impl_value_item`, `trait_value_item` | I | `Fields(impl or trait)` | as `ImplItems::of` and `TraitItems` |
+| `impl_type_aliases`, `trait_type_aliases` | I | `Fields(impl or trait)` | the associated types in order, a function of the members' kinds and names `Fields` hashes |
 | `closure_exprs` of the body's own store | I | covered (with the identity's own-body reads) | its closures are of its HIR |
+| `failed_expansion` of the body's own | M | covered (with the identity's own-body reads) | whether each macro call expanded as rustc parses it is of the calls the entries hash; a body refused for one builds no MIR to store |
 | `const_eval_query` of a const without generics, with no arguments and no environment | I M | `ConstValue(const)` | the evaluation lane items hashes |
 | `infer_body_query` of the body itself, from M or B | M B | `StepInfer(body)` (0x1803), valued by `hir_ty::body_store::step_value` | the earlier step's answer, as the store encodes it |
 | `mir_body_query` of the body itself, and `mir_body_for_closure_query` and `mir_body_for_coroutine_query` of a closure, async closure or async block written in it, from B | B | `StepMir(body)` (0x1804) | the step value hashes the body's built MIR and every such closure's and coroutine's, in expression order |
@@ -129,6 +131,7 @@ Each is in `REFUSALS` in `tests/classify.rs`, which fails on a refused read not 
 | `is_copy_query`, `drop_glue_query`, `prove_query`, `normalize_query`, `auto_trait_depth`, `copy_clone_impl` | I B | a type or goal in an environment, or an ADT's auto trait for a crate: no fact names one | goal facts by environment |
 | `TraitImpls::for_block`, `InherentImpls::for_block` | I | a block's impls, keyed by a block of another body or the body's own (whose impls are content, but the read cannot tell which) | a rule for the own body's blocks |
 | `Modules.table` | I | a walk of every module of a crate (above) | `inherent_associated_type` reading `InherentImpls::for_crate` instead |
+| `CrateResolution.modules` (`modules`, hir-def `nameres/delta/publish.rs`) | I | a published crate's whole module table, which `DefMap::module` reads for one module and `DefMap::table` for a walk alike | a query of one module of the published map, as `Modules::module` is of a collected one |
 | `Body::with_source_map`, `Body::relative`, the signatures' `with_source_map` and `relative` | B | positions: the borrow check reads which expressions are synthesized and the lowering diagnostics, through the source map, and the identity has no spans | the identity hashing the synthesized-expression set and the diagnostics' kinds |
 | `coroutine_witnesses_query`, `opaque_variances_query` | I | a coroutine's witnesses and a TAIT's hidden type come from other bodies' borrow checks (firewall E3, E7) | facts of them |
 | the other `AttrFlags::*` queries | I | read rarely; no rule yet | an `Attrs` value holding them |

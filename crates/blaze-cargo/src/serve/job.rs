@@ -791,8 +791,9 @@ enum Own {
     Mode { job: JobId, path: u32, key: blaze_cas::Key },
     /// A placed output's file looked at: placed again unless it is as it was placed.
     Look { job: JobId, path: u32, key: blaze_cas::Key, executable: bool },
-    /// A file placed, looked at for its [`Placement`].
-    Record { path: u32, key: blaze_cas::Key },
+    /// A file placed, looked at for its [`Placement`] before its job is done: a file changed
+    /// after the job's `Done` must not be recorded as the one placed.
+    Record { job: JobId, path: u32, key: blaze_cas::Key },
 }
 
 /// A placement the store was asked for.
@@ -2021,8 +2022,11 @@ impl<S: Steps> Jobs<S> {
     fn record(&mut self, w: &mut World<'_, S>, id: JobId, path: u32, key: blaze_cas::Key, executable: bool) {
         // clone: the driver's effect owns the file's name, once per placement
         let Some(file) = self.paths.files[path as usize].clone() else { return };
-        match self.own_tag(Own::Record { path, key }) {
+        match self.own_tag(Own::Record { job: id, path, key }) {
             Ok(tag) => {
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.placing += 1;
+                }
                 self.paths.placed[path as usize] = Some(Placement { key, executable, meta: None });
                 w.effects.push(Effect::Stat { file, tag });
             }
@@ -2109,10 +2113,15 @@ impl<S: Steps> Jobs<S> {
     /// An effect of the loop's own done.
     fn completed(&mut self, w: &mut World<'_, S>, own: Own, done: Done) {
         match own {
-            Own::Record { path, key } => match (done, &mut self.paths.placed[path as usize]) {
-                (Done::Stat(Some(meta)), Some(placement)) if placement.key == key => placement.meta = Some(meta),
-                (_, placement) => *placement = None,
-            },
+            Own::Record { job: id, path, key } => {
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.placing -= 1;
+                }
+                match (done, &mut self.paths.placed[path as usize]) {
+                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key => placement.meta = Some(meta),
+                    (_, placement) => *placement = None,
+                }
+            }
             Own::Look { job: id, path, key, executable } => {
                 let unchanged = matches!(
                     (&done, &self.paths.placed[path as usize]),

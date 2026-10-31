@@ -1,0 +1,24 @@
+{
+  "id": "01268",
+  "from_lane": "builder-2",
+  "owner": "codegen",
+  "paths": [
+    "crates/hir-ty-codegen/v2.rs",
+    "crates/hir-ty-codegen/v2/frontend.rs"
+  ],
+  "what": "hello6 (blaze from /Volumes/Projects/blaze-v2 at 06:36, b2-target; std crates and hello compile) ends EXIT=101 with NO error printed. The daemon panicked (b2-home-6/v2/serve.log): hir-ty next_solver/interner.rs:3139 \"Tried to use attached db, but no db is attached\", reached from hir-ty-codegen v2/frontend.rs describe -> described -> map_err -> v2.rs:323 undescribed, which formats the HirInstance with Debug; Debug of AdtDef/GenericArg needs an attached db that is not attached on that rayon thread. Three fixes: (1) undescribed must not need an attached db (attach it, or describe the instance without Debug through the interner); (2) the describe failure it reports is the real next blocker, still unseen; (3) the client must print the daemon panic, not exit 101 silently (blaze-cargo serve owner). Logs .coord-1030/b2-build/hello6-run.log, .coord-1030/b2-home-6/v2/serve.log.",
+  "state": "open",
+  "created": "2026-10-31T13:36:59Z",
+  "updated": "2026-10-31T13:36:59Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:36:59Z",
+      "by": "builder-2",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

@@ -62,6 +62,9 @@ impl<'a> Files<'a> {
     /// The name rustc gives `path`: from `root` when it is below it, as cargo runs rustc there,
     /// else the whole path, as `root` itself keeps it.
     pub fn relative<'p>(path: &'p str, root: &str) -> &'p str {
+        if root.is_empty() {
+            return path;
+        }
         let root = root.trim_end_matches('/');
         match path.strip_prefix(root).and_then(|rest| rest.strip_prefix('/')) {
             Some(rest) if !rest.is_empty() => rest,
@@ -669,6 +672,8 @@ mod tests {
         assert_eq!(Files::relative("/wsx/lib.rs", "/ws"), "/wsx/lib.rs");
         assert_eq!(Files::relative("/std/lib.rs", "/ws"), "/std/lib.rs");
         assert_eq!(Files::relative("src/lib.rs", ""), "src/lib.rs");
+        assert_eq!(Files::relative("/tmp/probe.rs", ""), "/tmp/probe.rs");
+        assert_eq!(Files::relative("/ws/src/lib.rs", "/"), "ws/src/lib.rs");
         assert_eq!(Files::relative("$DIR/a.rs", ""), "$DIR/a.rs");
 
         let paths = HashMap::from([(FileId::from_raw(0), "/ws/src/main.rs".to_owned())]);

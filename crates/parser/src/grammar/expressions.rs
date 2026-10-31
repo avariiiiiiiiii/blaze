@@ -274,6 +274,15 @@ fn expr_bp(
     r: Restrictions,
     bp: u8,
 ) -> Option<(CompletedMarker, BlockLike)> {
+    stdx::ensure_sufficient_stack(|| expr_bp_here(p, m, r, bp))
+}
+
+fn expr_bp_here(
+    p: &mut Parser<'_>,
+    m: Option<Marker>,
+    r: Restrictions,
+    bp: u8,
+) -> Option<(CompletedMarker, BlockLike)> {
     let m = m.unwrap_or_else(|| {
         let m = p.start();
         attributes::outer_attrs(p);

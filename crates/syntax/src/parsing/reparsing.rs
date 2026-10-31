@@ -94,9 +94,9 @@ fn reparse_onto(
 ) -> Option<(FlatTree, Vec<SyntaxError>, TextRange)> {
     let edit = Edit::new(tree, delete, insert, new_source, 0, edition, outline.is_some());
     let mut unit = edit.unit()?;
+    let merged = merge_errors(errors, std::slice::from_mut(&mut unit))?;
     let tree = tree.splice_all(&[unit.splice(new_source)], new_source.clone());
-    let range = unit.range;
-    Some((tree, merge_errors(errors, std::slice::from_mut(&mut unit)), range))
+    Some((tree, merged, unit.range))
 }
 
 /// The tree of `tree`'s text with each of `edits` made, which is `new_source` (whose tree
@@ -144,10 +144,11 @@ pub(crate) fn reparse_all(
         units.push(unit);
         groups.push(group);
     }
+    let merged = merge_errors(errors, &mut units)?;
     // alloc: one an edit, as `units`
     let splices: Vec<(u32, Splice<'_>)> = units.iter().map(|it| it.splice(new_source)).collect();
     let tree = tree.splice_all(&splices, new_source.clone());
-    Some((tree, merge_errors(errors, &mut units)))
+    Some((tree, merged))
 }
 
 /// Edits of [`reparse_all`] parsed again as one: the old text `delete` from the first's start
@@ -634,15 +635,27 @@ fn covering(tree: &FlatTree, range: TextRange) -> u32 {
 
 /// The errors of the tree `units` make: `old_errors`, those of the old tree, that are outside
 /// every unit, moved by what the units before them grew, then each unit's own, from its new
-/// start.
+/// start. `None` when an old error is empty at a unit's start or end: it may be the unit's
+/// own (an unclosed block's "expected `}`" at the end of the text a unit runs to), which its
+/// new errors have again, or its neighbour's, and its place can't tell which.
 fn merge_errors(
     old_errors: impl IntoIterator<Item = SyntaxError>,
     units: &mut [Unit],
-) -> Vec<SyntaxError> {
+) -> Option<Vec<SyntaxError>> {
     let mut res = Vec::new();
     for old_err in old_errors {
         let range = old_err.range();
         let before = units.partition_point(|it| it.range.end() <= range.start());
+        let at_edge = |unit: Option<&Unit>| {
+            unit.is_some_and(|it| {
+                it.range.start() == range.start() || it.range.end() == range.start()
+            })
+        };
+        if range.is_empty()
+            && (at_edge(units.get(before)) || at_edge(before.checked_sub(1).map(|it| &units[it])))
+        {
+            return None;
+        }
         if units.get(before).is_some_and(|it| it.range.start() < range.end()) {
             continue;
         }
@@ -659,7 +672,7 @@ fn merge_errors(
             it.with_range(range)
         }));
     }
-    res
+    Some(res)
 }
 
 #[cfg(test)]

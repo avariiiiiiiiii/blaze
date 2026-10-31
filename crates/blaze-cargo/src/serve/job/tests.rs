@@ -273,7 +273,7 @@ fn a_tag_of_the_loops_own_names_its_effect_once() {
     let mut jobs = Jobs::<Real>::new(setup(0, 0)).unwrap();
     let job = JobId { slot: 3, generation: 7 };
     let key = blaze_cas::Key(ContentId([1; 32]));
-    let tag = jobs.own_tag(Own::Record { path: 0, key }).unwrap();
+    let tag = jobs.own_tag(Own::Record { job, path: 0, key }).unwrap();
     let other = jobs.own_tag(Own::Write { job, path: 1 }).unwrap();
     assert_ne!(tag, other);
     assert!(jobs.owns(tag) && jobs.owns(other));

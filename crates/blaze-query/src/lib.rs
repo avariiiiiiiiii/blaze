@@ -361,15 +361,12 @@ pub(crate) fn value_id(bytes: &[u8]) -> ContentId {
     ContentId::of(VALUE_DOMAIN, bytes)
 }
 
-/// A key handed to a query's runner: the caller's own, or the bytes the database kept.
-#[derive(Clone, Copy)]
-enum KeySource<'a> {
-    // Kinds register at run time into a table of `Runner` fn pointers, so the caller's key is
-    // erased and read back by one `TypeId` compare when the query runs.
-    // dyn: only when a query runs, never on a lookup that finds its memo.
-    Typed(&'a (dyn Any + Send + Sync)),
-    Bytes(&'a [u8]),
-}
+/// A key handed to a query's runner: the caller's own, or one read back once from the bytes
+/// the database kept ([`Database::keys`]).
+// Kinds register at run time into a table of `Runner` fn pointers, so the key is erased and
+// read back by one `TypeId` compare when the query runs.
+// dyn: only when a query runs, never on a lookup that finds its memo.
+type AnyKey = dyn Any + Send + Sync;
 
 /// A run's value, written once into a buffer of this thread's (see [`BUFFERS`]); copied once
 /// into the thread's value segment by the store.
@@ -398,31 +395,30 @@ impl Drop for Computed {
     }
 }
 
-/// Runs one kind's query: `None` when its key's bytes don't decode (a key of another schema,
-/// from an image), which makes the memo that named it unverifiable, never wrong.
-type Runner = fn(&mut Cx<'_>, KeySource<'_>) -> Result<Option<Computed>, Cancelled>;
+/// Runs one kind's query.
+type Runner = fn(&mut Cx<'_>, &AnyKey) -> Result<Computed, Cancelled>;
 
-fn run_query<Q: Query>(cx: &mut Cx<'_>, source: KeySource<'_>) -> Result<Option<Computed>, Cancelled> {
-    let decoded: Q::Key;
-    let key = match source {
-        KeySource::Typed(key) => key
-            .downcast_ref::<Q::Key>()
-            .unwrap_or_else(|| panic!("query {} was handed a key of another type", Q::NAME)),
-        KeySource::Bytes(bytes) => match cbor::from_slice::<Q::Key>(bytes) {
-            Ok(key) => {
-                decoded = key;
-                &decoded
-            }
-            Err(_) => return Ok(None),
-        },
-    };
+fn run_query<Q: Query>(cx: &mut Cx<'_>, key: &AnyKey) -> Result<Computed, Cancelled> {
+    let key = key
+        .downcast_ref::<Q::Key>()
+        .unwrap_or_else(|| panic!("query {} was handed a key of another type", Q::NAME));
     let value = Q::execute(cx, key)?;
     let buffer = BUFFERS.with(|buffers| buffers.borrow_mut().pop()).unwrap_or_default();
     let mut out = Writer::with_buffer(<Q::Value as Persist>::SCHEMA, buffer);
     let root = value.write(&mut out);
     let bytes = out.finish(root);
     let fingerprint = Q::fingerprint(&value, &bytes);
-    Ok(Some(Computed { bytes, fingerprint }))
+    Ok(Computed { bytes, fingerprint })
+}
+
+/// Reads one kind's key back from the bytes the database kept: `None` when they don't decode
+/// (a key of another schema, from an image), which makes the memo that named it unverifiable,
+/// never wrong.
+type KeyDecoder = fn(&[u8]) -> Option<Box<AnyKey>>;
+
+fn decode_key<Q: Query>(bytes: &[u8]) -> Option<Box<AnyKey>> {
+    // alloc: once a key, kept in `Database::keys` while its slot lives.
+    cbor::from_slice::<Q::Key>(bytes).ok().map(|key| Box::new(key) as Box<AnyKey>)
 }
 
 struct KindInfo {
@@ -433,6 +429,7 @@ struct KindInfo {
     code: u32,
     query: TypeId,
     run: Runner,
+    decode: KeyDecoder,
     /// The tag of the frame task each run is ([`Query::TAG`]).
     tag: blaze_mem::Tag,
     /// Set for a [`Query::SHARE`] kind.
@@ -1337,6 +1334,10 @@ pub struct Database {
     kinds: Kinds,
     /// Every key's memos made or touched since start; the rest are in the image.
     slots: Map<Slot>,
+    /// Keys read back from their slot's bytes, for runs no asker handed the key to (a
+    /// dependency run again while a dependent is verified): each decoded once, while its slot
+    /// lives, so a warm miss allocates no key.
+    keys: Map<Box<AnyKey>>, // dyn: see `AnyKey`
     /// What each input key a memo read names, to read it again in another view.
     inputs: Map<Input>,
     /// By [`ViewId`]; a closed one is taken out.
@@ -1402,6 +1403,7 @@ impl Database {
             config,
             kinds: Kinds::new(),
             slots: Map::hot(),
+            keys: Map::new(),
             inputs: Map::new(),
             views: Column::new(),
             newest: AtomicU32::new(0),
@@ -1486,6 +1488,7 @@ impl Database {
                 code: self.store.code(Q::Value::SCHEMA, Q::PRODUCER),
                 query: TypeId::of::<Q>(),
                 run: run_query::<Q>,
+                decode: decode_key::<Q>,
                 tag: Q::TAG,
                 share: Q::SHARE.then_some(Shared { name: Q::NAME, schema: Q::Value::SCHEMA }),
                 symbols: <Q::Value as Persist>::symbols,
@@ -1677,6 +1680,7 @@ impl Database {
                 self.image_slotted.store(true, std::sync::atomic::Ordering::Release);
             }
             self.inputs.retain(&task, |key, _| inputs_kept.contains(key));
+            self.keys.retain(&task, |key, _| self.slots.get(&task, key).is_some());
 
             if self.config.dir.is_some() {
                 let mut cold: Vec<(QueryKey, Fingerprint, MemoId), _> = Vec::new_in(frame);
@@ -1961,6 +1965,7 @@ impl Database {
     fn collect_retired(&self, task: &Guard) {
         self.spare_views.lock().sweep();
         self.slots.sweep();
+        self.keys.sweep();
         self.inputs.sweep();
         self.views.for_each(task, ViewState::sweep);
         self.store.sweep();
@@ -2117,6 +2122,7 @@ impl Database {
     pub fn reclaim(&mut self) {
         self.spare_views.get_mut().reclaim();
         self.slots.reclaim();
+        self.keys.reclaim();
         self.inputs.reclaim();
         // alloc: one bitset a reclaim, 1 bit a memo.
         let mut held = BitSet::<MemoId>::new(self.store.end() as usize);
@@ -2405,7 +2411,7 @@ impl Database {
         state: &ViewState,
         key: QueryKey,
         run: Run,
-        typed: Option<&(dyn Any + Send + Sync)>, // dyn: see `KeySource::Typed`
+        typed: Option<&AnyKey>,
     ) -> Result<Option<MemoId>, Cancelled> {
         if let Some(resolved) = state.results.get(task, &key) {
             return Ok(Some(resolved.memo));
@@ -2462,7 +2468,7 @@ impl Database {
         info: &KindInfo,
         key: QueryKey,
         run: Run,
-        typed: Option<&(dyn Any + Send + Sync)>, // dyn: see `KeySource::Typed`
+        typed: Option<&AnyKey>,
     ) -> Result<Option<MemoId>, Cancelled> {
         if let Some(resolved) = state.results.get(task, &key) {
             return Ok(Some(resolved.memo));
@@ -2481,14 +2487,18 @@ impl Database {
             };
             previous.get_or_insert((self.store.fingerprint(task, memo), change));
         }
-        let source = match (typed, slot.and_then(Slot::key)) {
-            (Some(typed), _) => KeySource::Typed(typed),
-            (None, Some(bytes)) => KeySource::Bytes(bytes),
-            (None, None) => return Ok(None),
+        let typed = match typed {
+            Some(typed) => typed,
+            None => match self.keys.get(task, &key) {
+                Some(decoded) => &**decoded,
+                None => {
+                    let Some(bytes) = slot.and_then(Slot::key) else { return Ok(None) };
+                    let Some(decoded) = (info.decode)(bytes) else { return Ok(None) };
+                    &**self.keys.get_or_insert_with(task, key, || decoded)
+                }
+            },
         };
-        let Some((computed, recording)) = self.execute(task, state, info, run, source)? else {
-            return Ok(None);
-        };
+        let (computed, recording) = self.execute(task, state, info, run, typed)?;
         let made = recording.with(|edges| match info.share {
             Some(shared) => self.store.make_shared(key, computed.fingerprint, info.code, edges, &computed.bytes, shared),
             None => self.store.make(key, computed.fingerprint, info.code, edges, &computed.bytes),
@@ -2548,13 +2558,13 @@ impl Database {
         state: &ViewState,
         info: &KindInfo,
         run: Run,
-        source: KeySource<'_>,
-    ) -> Result<Option<(Computed, Recording)>, Cancelled> {
+        key: &AnyKey,
+    ) -> Result<(Computed, Recording), Cancelled> {
         let recording = Recording::start();
         let mut cx = Cx { db: self, task, state, run };
         let _inside = Inside::enter();
-        let computed = blaze_mem::frame::task(info.tag, |_| (info.run)(&mut cx, source))?;
-        Ok(computed.map(|computed| (computed, recording)))
+        let computed = blaze_mem::frame::task(info.tag, |_| (info.run)(&mut cx, key))?;
+        Ok((computed, recording))
     }
 
     /// The bytes of a memo's value, made again if it was evicted.
@@ -2565,7 +2575,7 @@ impl Database {
         key: QueryKey,
         memo: MemoId,
         run: Run,
-        typed: &(dyn Any + Send + Sync), // dyn: see `KeySource::Typed`
+        typed: &AnyKey,
     ) -> Result<&'g [u8], Cancelled> {
         loop {
             if let Some(bytes) = self.store.bytes(task, memo) {
@@ -2579,9 +2589,7 @@ impl Database {
                     return Ok(());
                 }
                 let _frame = Frame::push(key);
-                let (computed, _edges) = self
-                    .execute(task, state, info, run, KeySource::Typed(typed))?
-                    .expect("a query run with its typed key always answers");
+                let (computed, _edges) = self.execute(task, state, info, run, typed)?;
                 let fingerprint = self.store.fingerprint(task, memo);
                 if computed.fingerprint != fingerprint {
                     panic!(

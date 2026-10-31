@@ -1,7 +1,7 @@
 //! The traits nodes share, on views; implemented in `generated/nodes.rs`.
 
 use crate::{
-    T, match_ast,
+    SyntaxKind, T, match_ast,
     view::{self as ast, AstChildren, AstNode, Node, Token, support},
 };
 
@@ -101,11 +101,14 @@ pub trait HasAttrs<'t>: AstNode<'t> {
                 ast::Impl(it) => it.assoc_item_list()?.syntax(),
                 ast::Trait(it) => it.assoc_item_list()?.syntax(),
                 ast::Module(it) => it.item_list()?.syntax(),
+                // Any block expression's, as rustc reads them (`may_carry_attributes` is where
+                // outer ones may go), but a body's, which are its function's. The parser puts
+                // them in the block's statement list.
                 ast::BlockExpr(it) => {
-                    if !it.may_carry_attributes() {
+                    if syntax.parent().is_some_and(|it| it.kind() == SyntaxKind::FN) {
                         return None;
                     }
-                    syntax
+                    it.stmt_list()?.syntax()
                 },
                 _ => return None,
             }

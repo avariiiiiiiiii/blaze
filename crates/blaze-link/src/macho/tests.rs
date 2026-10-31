@@ -1477,7 +1477,7 @@ fn an_archive_index_read_is_bounded_by_its_index() {
     }
     let names = "a.o".len() + symbols.iter().map(|it| core_name(it.as_bytes()).unwrap().len()).sum::<usize>();
     // The members, their header offsets, their ranges, the index, its entries by string
-    // offset and the names, and the radix sort's three: the entries are out of offset order.
+    // offset and the names, and the radix sort's scratch: the entries are out of offset order.
     let used = [128, 8192].map(|entries| {
         let entries: Vec<(u32, usize)> = (0..entries).map(|it| (offsets[3 - it % 4], 0)).collect();
         let bytes = super::archive::tests::bsd_raw(&[("a.o", &b"aaaa"[..])], strings.clone(), &entries);
@@ -1487,7 +1487,7 @@ fn an_archive_index_read_is_bounded_by_its_index() {
         assert_eq!(archive.names.bytes(), names, "one name a string, however many entries name it");
         used.allocations
     });
-    assert_eq!(used, [9, 9]);
+    assert_eq!(used, [7, 7]);
 }
 
 #[test]

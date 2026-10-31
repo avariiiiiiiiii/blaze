@@ -92,6 +92,8 @@ pub(crate) fn toolchain(job: &Job, unit: usize) -> Result<Toolchain, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let plan = job.plan(unit).map_err(|it| it.what)?;
     hir_ty_codegen::v2::toolchain(triple(job, u), &plan.rustflags, runs(u))
+        // alloc: an error
+        .map_err(|it| format!("unit {unit} (`{}` of {}): {it}", u.target.name, u.pkg_id))
 }
 
 /// Where `unit`'s code runs. A dev build of the host's target (no `--target`) runs where it

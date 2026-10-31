@@ -4,7 +4,7 @@
 use either::Either;
 
 use crate::{
-    SyntaxNode, SyntaxToken, T,
+    SyntaxKind, SyntaxNode, SyntaxToken, T,
     ast::{self, AstChildren, AstNode, support},
     match_ast,
 };
@@ -103,11 +103,14 @@ pub trait HasAttrs: AstNode {
                 ast::Impl(it) => it.assoc_item_list()?.syntax().clone(),
                 ast::Trait(it) => it.assoc_item_list()?.syntax().clone(),
                 ast::Module(it) => it.item_list()?.syntax().clone(),
+                // Any block expression's, as rustc reads them (`may_carry_attributes` is where
+                // outer ones may go), but a body's, which are its function's. The parser puts
+                // them in the block's statement list.
                 ast::BlockExpr(it) => {
-                    if !it.may_carry_attributes() {
+                    if syntax.parent().is_some_and(|it| it.kind() == SyntaxKind::FN) {
                         return None;
                     }
-                    syntax.clone()
+                    it.stmt_list()?.syntax().clone()
                 },
                 _ => return None,
             }

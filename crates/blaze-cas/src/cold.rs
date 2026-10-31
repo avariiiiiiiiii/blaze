@@ -70,10 +70,16 @@ pub(crate) struct Prepared {
 }
 
 impl Prepared {
-    pub(crate) fn new(bytes: Vec<u8>) -> Prepared {
-        let encoder = EncoderDictionary::copy(&bytes, LEVEL);
-        let decoder = DecoderDictionary::copy(&bytes);
-        Prepared { bytes, encoder, decoder }
+    /// `bytes` come from a pack, which nothing but their content hash has checked: zstd may
+    /// refuse them (a dictionary's magic number before a corrupt header).
+    pub(crate) fn new(bytes: Vec<u8>) -> Result<Prepared, String> {
+        let encoder = EncoderDictionary::try_copy(&bytes, LEVEL)
+            // alloc: the error's message
+            .map_err(|error| format!("does not load for compressing: {error}"))?;
+        let decoder = DecoderDictionary::try_copy(&bytes)
+            // alloc: the error's message
+            .map_err(|error| format!("does not load for decompressing: {error}"))?;
+        Ok(Prepared { bytes, encoder, decoder })
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
@@ -278,7 +284,7 @@ mod tests {
     fn a_dictionary_trained_on_a_kind_shrinks_its_values_and_round_trips() {
         let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
         let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-        let dictionary = Prepared::new(train(&refs).unwrap());
+        let dictionary = Prepared::new(train(&refs).unwrap()).unwrap();
         assert!(dictionary.bytes().len() <= DICTIONARY_SIZE);
         let loaded = zstd::bulk::Decompressor::with_dictionary(dictionary.bytes());
         let value = sample(12_345);
@@ -294,12 +300,22 @@ mod tests {
     fn a_wrong_length_or_garbage_is_refused() {
         let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
         let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-        let dictionary = Prepared::new(train(&refs).unwrap());
+        let dictionary = Prepared::new(train(&refs).unwrap()).unwrap();
         let value = sample(3);
         let stored = compress(&dictionary, &value).unwrap();
         assert!(decompress(&dictionary, &stored, value.len() as u64 + 1).is_err());
         assert!(decompress(&dictionary, &stored, value.len() as u64 - 1).is_err());
         assert!(decompress(&dictionary, b"not zstd at all", 10).is_err());
+    }
+
+    /// Bytes zstd will not load as a dictionary, its magic number then a corrupt header, are
+    /// refused, not a panic.
+    #[test]
+    fn a_dictionary_zstd_refuses_is_an_error() {
+        let mut bytes = vec![0x37, 0xa4, 0x30, 0xec, 1, 0, 0, 0];
+        bytes.extend([0xff; 120]);
+        let why = Prepared::new(bytes).err().expect("a corrupt dictionary header is refused");
+        assert!(why.contains("does not load"), "{why}");
     }
 
     /// A record header's `raw` is not trusted before its bytes are decoded: a length its bytes
@@ -308,7 +324,7 @@ mod tests {
     fn a_length_the_bytes_cannot_reach_is_refused_before_it_is_allocated() {
         let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
         let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-        let dictionary = Prepared::new(train(&refs).unwrap());
+        let dictionary = Prepared::new(train(&refs).unwrap()).unwrap();
         let huge = 1 << 40;
         let tiny = [0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         for stored in [compress(&dictionary, &sample(4)).unwrap(), tiny.to_vec()] {
@@ -345,7 +361,7 @@ mod tests {
     fn a_batch_compresses_as_one_call_does_and_without_a_dictionary_reads_as_long() {
         let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
         let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-        let dictionary = Prepared::new(train(&refs).unwrap());
+        let dictionary = Prepared::new(train(&refs).unwrap()).unwrap();
         let mut batch = Batch::new(Some(&dictionary)).unwrap();
         for n in [5, 6, 7] {
             let value = sample(n);
@@ -373,7 +389,7 @@ mod tests {
         let second: Vec<Vec<u8>> = (0..200).map(|n| sample(n * 31 + 7).repeat(2)).collect();
         let train_on = |samples: &[Vec<u8>]| {
             let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
-            Prepared::new(train(&refs).unwrap())
+            Prepared::new(train(&refs).unwrap()).unwrap()
         };
         (train_on(&first), train_on(&second))
     }

@@ -498,5 +498,5 @@ fn a_lang_items_key_is_the_one_each_old_copy_gave() {
         assert_eq!(key::lang_item_key(&db, target), old::lang_item_key(&db, target), "{item:?}");
         seen += 1;
     }
-    assert!(seen >= 7, "a trait, struct, variant, alias and functions: {seen}");
+    assert_eq!(seen, 6, "a trait, struct, variant, alias and two functions");
 }

@@ -706,7 +706,8 @@ fn merge_std(
 }
 
 /// The units of a foreign workspace as its ask says: every one `is_std` when asked, the
-/// packages that always abort built to abort, each unit's profile named as the build's.
+/// packages that always abort built to abort, a standard library `dylib` built as an `rlib`,
+/// each unit's profile named as the build's.
 fn foreign_units(graph: &mut schema::UnitGraph, packages: &BySpec<'_>, ask: &ForeignAsk) {
     for unit in &mut graph.units {
         unit.is_std = ask.is_std;
@@ -717,6 +718,15 @@ fn foreign_units(graph: &mut schema::UnitGraph, packages: &BySpec<'_>, ask: &For
             .is_some_and(|(id, _)| ask.panic_abort.iter().any(|it| it.as_str() == id.name().as_str()));
         if aborts && !script {
             unit.profile.panic = "abort".to_owned();
+        }
+        // cargo's `UnitInterner::intern`: a standard library unit whose library is also a
+        // `dylib` (library/std's `crate-type = ["dylib", "rlib"]`) is built as an `rlib` only.
+        let dylib = unit.target.is_lib() && unit.target.kind.iter().any(|it| it == "dylib");
+        if ask.is_std && dylib {
+            // alloc: once per standard library load, the one target that names a `dylib`
+            unit.target.kind = vec!["rlib".to_owned()];
+            // alloc: as above
+            unit.target.crate_types = vec!["rlib".to_owned()];
         }
     }
 }

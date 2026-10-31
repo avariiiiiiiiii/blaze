@@ -452,6 +452,7 @@ const REFUSALS: &[(&str, &str)] = &[
     ("TraitImpls::for_block", "a block's impls: no fact yet"),
     ("InherentImpls::for_block", "a block's impls: no fact yet"),
     ("table", "a walk of every module of a crate (hir-ty lower/path.rs inherent_associated_type)"),
+    ("modules", "a published crate's whole module table, read for one module and a walk alike"),
     // Positions: the identity has no spans.
     ("Body::with_source_map", "a source map: positions"),
     ("Body::relative", "a source map: positions"),
@@ -494,7 +495,6 @@ impl BodyFacts for Probe {
         name: &'static str,
     ) -> Classified {
         let class = reads::classify(db, def, step, read, kind, name);
-        let name = reads::listed_name(name);
         self.seen.lock().unwrap().push(Seen { def, step, read, kind, name, class });
         class
     }
@@ -564,7 +564,7 @@ fn every_read_of_the_steps_is_covered_a_fact_or_a_listed_refusal() {
     let mut unlisted: Vec<(Step, &str)> = seen
         .iter()
         .filter(|it| it.class == Classified::Refused)
-        .filter(|it| !REFUSALS.iter().any(|&(name, _)| name == it.name))
+        .filter(|it| !REFUSALS.iter().any(|&(name, _)| reads::cmp_listed(name, it.name).is_eq()))
         .map(|it| (it.step, it.name))
         .collect();
     unlisted.sort_unstable();
@@ -579,7 +579,7 @@ fn every_read_of_the_steps_is_covered_a_fact_or_a_listed_refusal() {
 fn a_read_the_table_names_by_name_is_found_by_its_file() {
     let (db, seen) = steps_seen();
     let named: Vec<&Seen> =
-        seen.iter().filter(|it| RULES.iter().any(|&(name, _, _)| name == it.name)).collect();
+        seen.iter().filter(|it| RULES.iter().any(|&(name, _, _)| reads::cmp_listed(name, it.name).is_eq())).collect();
     assert!(!named.is_empty(), "no read of the steps is of an ingredient the table names");
     for it in named {
         assert!(

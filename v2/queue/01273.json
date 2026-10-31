@@ -1,0 +1,24 @@
+{
+  "id": "01273",
+  "from_lane": "tests-misc-front1",
+  "owner": "coordinator",
+  "paths": [
+    "crates/hir-def/src/nameres.rs",
+    "crates/hir-def/src/nameres/delta/publish.rs"
+  ],
+  "what": "DefMap::module on a published map (ModulesSlot::Published) reads the input field CrateResolution.modules, the whole module table, as DefMap::table does for a walk. A body step cannot tell the two apart, so blaze-item-hash refuses the read (classify.rs REFUSALS modules), and every inference that resolves through a published def map is not stored. A collected map has Modules::module (one module, covered as name resolution) and Modules::table (refused). Please give the published map a tracked query of one module, as Modules::module is.",
+  "state": "open",
+  "created": "2026-10-31T13:41:24Z",
+  "updated": "2026-10-31T13:41:24Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:41:24Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

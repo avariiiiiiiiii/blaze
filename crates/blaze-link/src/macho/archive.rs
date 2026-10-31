@@ -13,7 +13,7 @@ use crate::model::{Archive, Member, Name, Names};
 ///
 /// Allocates six buffers, each sized exactly before it is filled (the members, their header
 /// offsets and their ranges, the index, its entries by string offset, and the names), and the
-/// radix sort's three when more than 64 entries' strings are out of offset order: none per
+/// radix sort's scratch when more than 64 entries' strings are out of offset order: none per
 /// member, entry or name.
 pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
     // alloc: error path

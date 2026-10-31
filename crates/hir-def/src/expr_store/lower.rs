@@ -1808,6 +1808,15 @@ impl<'db> ExprCollector<'db> {
                 if self.store.record {
                     let src = self.expander.in_file(syntax_ptr);
                     self.store.expr_map.push((src, inner.into()));
+                    // rustc's `lower_expr_mut` of `ExprKind::Paren`: the inner expression's span
+                    // is the parens' when theirs contains it (not one a macro expanded to).
+                    let widen = self.store.expr_map_back.get(inner).is_some_and(|it| {
+                        it.file_id == src.file_id
+                            && src.value.text_range().contains_range(it.value.text_range())
+                    });
+                    if widen {
+                        self.store.expr_map_back.insert(inner, src.map(AstPtr::wrap_left));
+                    }
                 }
                 inner
             }

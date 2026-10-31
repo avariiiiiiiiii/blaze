@@ -51,6 +51,10 @@ pub(super) fn item_or_macro(
     is_in_extern: bool,
     is_in_trait: bool,
 ) {
+    stdx::ensure_sufficient_stack(|| item_or_macro_here(p, stop_on_r_curly, is_in_extern, is_in_trait))
+}
+
+fn item_or_macro_here(p: &mut Parser<'_>, stop_on_r_curly: bool, is_in_extern: bool, is_in_trait: bool) {
     let m = p.start();
     attributes::outer_attrs(p);
 
@@ -529,6 +533,10 @@ pub(super) fn macro_call_after_excl(p: &mut Parser<'_>) -> BlockLike {
 }
 
 pub(crate) fn token_tree(p: &mut Parser<'_>) {
+    stdx::ensure_sufficient_stack(|| token_tree_here(p))
+}
+
+fn token_tree_here(p: &mut Parser<'_>) {
     let closing_paren_kind = match p.current() {
         T!['{'] => T!['}'],
         T!['('] => T![')'],

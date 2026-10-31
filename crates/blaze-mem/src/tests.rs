@@ -120,6 +120,30 @@ fn regions_grow_from_many_threads_at_once() {
     assert!(region.committed() >= 8 * 64 * (256 << 10));
 }
 
+/// A length another thread committed is counted by the time `ensure` sees it: else a taker that
+/// moves those bytes to another tag (`chunks::take`) takes the region's tag below zero, and
+/// the grower's count then overflows.
+#[test]
+fn a_region_counts_what_it_commits_before_another_thread_sees_it() {
+    let region = Arc::new(Region::reserve(256 << 20, Tag::Fuzz).expect("reserve"));
+    let threads: Vec<_> = (0..8)
+        .map(|t| {
+            let region = Arc::clone(&region);
+            thread::spawn(move || {
+                for step in 0..64 {
+                    let len = (step * 8 + t + 1) * (64 << 10);
+                    region.ensure(len).expect("commit");
+                    let live = tag::snapshot().get(Tag::Fuzz).live;
+                    assert!(live >= len as u64, "{len} bytes committed, {live} counted");
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().expect("grower");
+    }
+}
+
 // Huge pages
 
 /// Writes byte `i % 251` at each offset `i` of `[from, to)` of `region`.

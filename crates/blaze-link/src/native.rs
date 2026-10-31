@@ -770,7 +770,8 @@ impl Parsed {
                 });
             }
         }
-        let frame_fixups = Csr::build(frames.len(), fixup_pairs.iter().copied());
+        let frame_fixups =
+            if frames.is_empty() { Csr::default() } else { Csr::build(frames.len(), fixup_pairs.iter().copied()) };
         let sections_at = object.symbols.len();
         let frames_at = sections_at + sections;
         debug_assert_eq!(syms.len(), frames_at + frames.len());

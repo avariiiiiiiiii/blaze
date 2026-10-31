@@ -270,14 +270,32 @@ impl Region {
         Ok(())
     }
 
-    /// Publishes `[base, base + target)` as committed and counts what it adds.
+    /// Publishes `[base, base + target)` as committed and counts what it adds: counted before
+    /// it is published, so a thread whose `ensure` sees the new length (and hands the bytes on
+    /// to another tag, as `chunks::take` does) comes after the count, and a tag's live bytes
+    /// never fall below zero. A grower that loses the race takes its count back; meanwhile the
+    /// high-water mark may read high.
     fn publish(&self, target: usize) {
-        // Release: what the commit made accessible is ordered before a reader that sees the
-        // new length.
-        let before = self.committed.fetch_max(target, Ordering::AcqRel);
-        if target > before {
+        let mut before = self.committed.load(Ordering::Acquire);
+        while target > before {
             tag::add(self.tag, target - before);
-            tag::committed(target - before);
+            // Release: the commit, and the count, are ordered before a reader that sees the
+            // new length.
+            match self.committed.compare_exchange_weak(
+                before,
+                target,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    tag::committed(target - before);
+                    return;
+                }
+                Err(now) => {
+                    tag::sub(self.tag, target - before);
+                    before = now;
+                }
+            }
         }
     }
 

@@ -8,6 +8,8 @@
 //! of a salsa struct is named by the field alone (`data`, `scope`), so the name says little.
 //! A read no rule names is refused.
 
+use std::cmp::Ordering;
+
 use base_db::{Crate, Db};
 use blaze_ids::ContentId;
 use blaze_items::{
@@ -49,8 +51,11 @@ pub(crate) enum Rule {
     /// scopes and their names, the traits in scope), which the identity hashes as what each of
     /// the body's paths resolves to, its traits in scope and its module chain.
     Names,
-    /// Keyed by a body: covered when it is the body's own (its HIR, scopes and upvars are of
-    /// its codec bytes and resolutions), refused for another's.
+    /// Keyed by a body, as a `DefWithBodyId` or its `InferBodyId`: covered when it is the
+    /// body's own (its HIR, scopes and upvars are of its codec bytes and resolutions, and
+    /// whether its macro calls expanded as rustc parses them is of the calls the identity
+    /// hashes; a body whose expansion is refused builds no MIR to store), refused for
+    /// another's.
     OwnBody,
     /// A field of the `Crate` input: covered for the body's crate (the identity hashes its
     /// inputs), another crate's `Crate` fact.
@@ -221,6 +226,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("elided_lifetimes", "hir-ty/src/lower.rs", Rule::Signature(Of::Function)),
     ("extra_data", "base-db/src/input.rs", Rule::CrateInput),
     ("fact_value", "blaze-items/src/goals.rs", Rule::FactValue),
+    ("failed_expansion", "hir-ty-mir/src/mir/lower.rs", Rule::OwnBody),
     ("field_types_of_variant", "hir-ty/src/lower.rs", Rule::Items),
     ("fn_sig_for_enum_variant_constructor", "hir-ty/src/lower.rs", Rule::Items),
     ("fn_sig_for_fn", "hir-ty/src/lower.rs", Rule::Items),
@@ -232,6 +238,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("impl_has_unconstrained_params", "hir-ty/src/specialization.rs", Rule::Items),
     ("impl_self_ty_of_impl", "hir-ty/src/lower.rs", Rule::Items),
     ("impl_trait_of_impl", "hir-ty/src/lower.rs", Rule::Items),
+    ("impl_type_aliases", "hir-ty/src/opaques.rs", Rule::Fields(Of::Impl)),
     ("impl_value_item", "hir-ty/src/method_resolution.rs", Rule::FieldNamed(Of::Impl)),
     ("in_crate_trait_value_items", "hir-ty/src/method_resolution.rs", Rule::DepCrate(Args::Name)),
     ("infer_body_query", "hir-ty/src/infer.rs", Rule::OwnStep(Step::Infer)),
@@ -258,6 +265,7 @@ pub(crate) const RULES: &[(&str, &str, Rule)] = &[
     ("target_data_layout_query", "hir-ty/src/layout/target.rs", Rule::OwnCrate(Else::Items)),
     ("target_features", "hir-def/src/attrs.rs", Rule::Attrs(Of::Function)),
     ("trait_environment_query", "hir-ty/src/lower.rs", Rule::Signature(Of::GenericDef)),
+    ("trait_type_aliases", "hir-ty/src/opaques.rs", Rule::Fields(Of::Trait)),
     ("trait_value_item", "hir-ty/src/method_resolution.rs", Rule::FieldNamed(Of::Trait)),
     ("transitive_deps", "base-db/src/input.rs", Rule::CrateRoot),
     ("type_alias_bounds_with_diagnostics", "hir-ty/src/lower.rs", Rule::Signature(Of::AliasBounds)),
@@ -284,28 +292,59 @@ pub fn classify(
         ReadKind::Accumulator => return Classified::Refused,
         ReadKind::Input | ReadKind::TrackedStruct | ReadKind::Query => {}
     }
-    let name = listed_name(name);
+    // Lane items' table lists names of types without generics, as they are written.
+    let name = match listed_parts(name) {
+        [head, ""] => head,
+        _ => name,
+    };
     match rule_of(db, read, name) {
         Some(rule) => apply(db, def, step, read, name, rule),
         None => Classified::Refused,
     }
 }
 
-/// `name` as [`RULES`] lists it. Salsa names a method of a `#[salsa::tracked] impl` after its
-/// hygienic inner function, the method's name with `_` added (`Body::of_`); a free tracked
-/// function or a field keeps its name.
-pub(crate) fn listed_name(name: &str) -> &str {
-    match name.contains("::") {
+/// `name` as [`RULES`] lists it, as the two parts it is the concatenation of. Salsa names a
+/// method of a `#[salsa::tracked] impl` after its self type as written, generics and all
+/// (`TraitImpls < 'db >::for_crate`), and its hygienic inner function, the method's name with
+/// `_` added (`Body::of_`); the listed name is the type's without its generics and the
+/// method's (`TraitImpls::for_crate`). A free tracked function or a field keeps its name.
+pub(crate) fn listed_parts(name: &str) -> [&str; 2] {
+    let name = match name.contains("::") {
         true => name.trim_end_matches('_'),
         false => name,
+    };
+    let Some(open) = name.find('<') else { return [name, ""] };
+    let mut depth = 0usize;
+    let close = name[open..].char_indices().find_map(|(at, c)| {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + at);
+                }
+            }
+            _ => {}
+        }
+        None
+    });
+    match close {
+        Some(close) => [name[..open].trim_end(), name[close + 1..].trim_start()],
+        None => [name, ""],
     }
+}
+
+/// How `listed`, a name as [`RULES`] lists it, orders against `name`, an ingredient's debug
+/// name as [`listed_parts`] reads it.
+pub(crate) fn cmp_listed(listed: &str, name: &str) -> Ordering {
+    let [head, tail] = listed_parts(name);
+    listed.bytes().cmp(head.bytes().chain(tail.bytes()))
 }
 
 /// The rule for `name`, if one is had for the ingredient `read` is of.
 pub(crate) fn rule_of(db: &Db, read: salsa::DatabaseKeyIndex, name: &str) -> Option<Rule> {
-    let name = listed_name(name);
-    let first = RULES.partition_point(|&(it, _, _)| it < name);
-    let same = RULES[first..].iter().take_while(|&&(it, _, _)| it == name);
+    let first = RULES.partition_point(|&(it, _, _)| cmp_listed(it, name) == Ordering::Less);
+    let same = RULES[first..].iter().take_while(|&&(it, _, _)| cmp_listed(it, name) == Ordering::Equal);
     let mut file = None;
     for &(_, at, rule) in same {
         let file = *file.get_or_insert_with(|| {
@@ -338,9 +377,13 @@ fn apply(
     let found = match rule {
         Rule::Names => return Classified::Covered,
         Rule::OwnBody => {
-            return match arg::<DefWithBodyId>(db, key) {
-                Some(body) if body == def => Classified::Covered,
-                _ => Classified::Refused,
+            let own = match arg::<DefWithBodyId>(db, key) {
+                Some(body) => body == def,
+                None => arg::<InferBodyId<'_>>(db, key) == Some(InferBodyId::DefWithBodyId(def)),
+            };
+            return match own {
+                true => Classified::Covered,
+                false => Classified::Refused,
             };
         }
         Rule::CrateInput => match arg::<Crate>(db, key) {

@@ -1727,9 +1727,11 @@ fn archive_read_allocates_its_three_columns() {
 #[test]
 fn import_library_read_allocates_per_member() {
     let pe = pe(exe());
+    // One worker, measured on it: the members are parsed and grouped on the pool's threads.
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
     let read = |members: usize| {
         let bytes = import_archive(members, 3);
-        let used = allocations(&pe, "x.lib", &bytes, NativeKind::Shared { as_needed: true });
+        let used = pool.install(|| allocations(&pe, "x.lib", &bytes, NativeKind::Shared { as_needed: true }));
         assert!(used <= 2 * members as u64 + 16, "{members} members: {used} allocations");
         used
     };

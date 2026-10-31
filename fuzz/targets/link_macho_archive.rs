@@ -253,8 +253,9 @@ fn one_name_many_times() -> Vec<u8> {
 }
 
 /// A `__.SYMDEF` of 640 entries, each naming one 4096-byte string from a different offset:
-/// distinct names of 2.4 MB in all from about 10 KB, past `allowed(len)` (1.7 MB) unless a
-/// suffix shares its string's bytes.
+/// distinct names of 2.4 MB in all from about 10 KB, past `allowed(len)` (1.7 MB). All but the
+/// first start with no `_`, so none is a suffix of another's name: the reader refuses the
+/// archive before it allocates its names.
 fn suffixes_of_one_string() -> Vec<u8> {
     let mut strings = vec![b'_'];
     strings.resize(4096, b'a');
@@ -290,8 +291,10 @@ mod tests {
         for (what, arch, bytes) in named() {
             assert!(blaze_link::fuzz_read(Format::MachO, arch, ARCHIVE, &bytes), "seed `{what}` is refused");
         }
-        for bytes in [one_name_many_times(), suffixes_of_one_string()] {
-            assert!(blaze_link::fuzz_read(Format::MachO, blaze_codegen::Arch::X86_64, ARCHIVE, &bytes));
-        }
+        let read = |bytes: &[u8]| {
+            blaze_link::fuzz_read(Format::MachO, blaze_codegen::Arch::X86_64, ARCHIVE, bytes)
+        };
+        assert!(read(&one_name_many_times()));
+        assert!(!read(&suffixes_of_one_string()));
     }
 }

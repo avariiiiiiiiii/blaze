@@ -93,6 +93,13 @@ fn pattern_single_r(
     p: &mut Parser<'_>,
     recovery_set: TokenSet,
 ) -> (Option<CompletedMarker>, Option<SyntaxKind>) {
+    stdx::ensure_sufficient_stack(|| pattern_single_r_here(p, recovery_set))
+}
+
+fn pattern_single_r_here(
+    p: &mut Parser<'_>,
+    recovery_set: TokenSet,
+) -> (Option<CompletedMarker>, Option<SyntaxKind>) {
     // test range_pat
     // fn main() {
     //     match () {

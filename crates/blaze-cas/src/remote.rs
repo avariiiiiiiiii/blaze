@@ -45,7 +45,7 @@
 
 use std::collections::{VecDeque, hash_map};
 
-use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, Tag, Tags};
+use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, RECV_MOST, Tag, Tags};
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_ids::{ContentId, fuse::Fuse8, radix};
 use rustc_hash::FxHashMap;
@@ -645,7 +645,7 @@ impl Client {
         up.buffer.drain(..start);
         // What the next receive can bring, not the whole frame: a length prefix is only what the
         // peer says, and the buffer grows with the bytes that do come.
-        up.buffer.reserve(owed(&up.buffer).min(CLIENT_RECV_MOST));
+        up.buffer.reserve(owed(&up.buffer).min(RECV_MOST));
         result
     }
 
@@ -1651,13 +1651,25 @@ mod tests {
         let frame = framed(|out| write_value(out, &key("a"), Kind::Code, &content, &bytes));
         let first = Completion { tag: recv, done: Done::Read(frame[..100].to_vec()) };
         assert!(completed(&mut client, first, &mut effects).is_empty());
-        let [Effect::Recv { most, tag: rest, .. }] = effects[..] else { panic!("{effects:?}") };
+        let [Effect::Recv { most, tag: mut rest, .. }] = effects[..] else { panic!("{effects:?}") };
         assert_eq!(most, frame.len() - 100);
+        let pieces: Vec<&[u8]> = frame[100..].chunks(RECV_MOST).collect();
+        let (last, before) = pieces.split_last().expect("the frame is longer than its first read");
+        for piece in before {
+            effects.clear();
+            let read = Completion { tag: rest, done: Done::Read(piece.to_vec()) };
+            assert!(completed(&mut client, read, &mut effects).is_empty());
+            let [Effect::Recv { tag, .. }] = effects[..] else { panic!("{effects:?}") };
+            rest = tag;
+            let Link::Up(up) = &client.link else { panic!("the connection is up") };
+            assert!(up.buffer.capacity() >= up.buffer.len() + RECV_MOST.min(frame.len() - up.buffer.len()));
+            assert!(up.buffer.capacity() <= 2 * (up.buffer.len() + RECV_MOST), "{}", up.buffer.capacity());
+        }
         let Link::Up(up) = &client.link else { panic!("the connection is up") };
         let buffer = up.buffer.as_ptr();
 
         effects.clear();
-        let last = Completion { tag: rest, done: Done::Read(frame[100..].to_vec()) };
+        let last = Completion { tag: rest, done: Done::Read(last.to_vec()) };
         let answers = completed(&mut client, last, &mut effects);
         assert_eq!(answers, vec![Completion { tag: Tag(0), done: Done::Read(frame.clone()) }]);
         let Done::Read(handed) = &answers[0].done else { panic!("{answers:?}") };
@@ -1672,7 +1684,7 @@ mod tests {
         let prefix = Completion { tag: recv, done: Done::Read((1u64 << 30).to_le_bytes().to_vec()) };
         assert!(completed(&mut client, prefix, &mut effects).is_empty());
         let Link::Up(up) = &client.link else { panic!("the connection is up") };
-        assert!(up.buffer.capacity() <= 8 + CLIENT_RECV_MOST, "{}", up.buffer.capacity());
+        assert!(up.buffer.capacity() <= 8 + RECV_MOST, "{}", up.buffer.capacity());
         let [Effect::Recv { most, .. }] = effects[..] else { panic!("{effects:?}") };
         assert_eq!(most, CLIENT_RECV_MOST);
         assert_eq!(owed(&[1, 0, 0]), 0);

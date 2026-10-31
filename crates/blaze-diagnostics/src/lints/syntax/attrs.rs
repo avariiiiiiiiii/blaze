@@ -250,7 +250,15 @@ pub(crate) fn owners<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Owner<'db>>
             if attrs.is_empty() && !is_module {
                 continue;
             }
-            let Some(target) = Target::of(cx, InFile::new(tree.file, node), crate_root) else { continue };
+            // The parser puts a macro call expression's attributes on the `MACRO_EXPR`; rustc's
+            // expansion checks them as the call's (`check_attributes` of `collect_bang`).
+            let (node, target) = match ast::MacroExpr::cast(node).and_then(|it| it.macro_call()) {
+                Some(call) => (call.syntax(), Target::MacroCall),
+                None => match Target::of(cx, InFile::new(tree.file, node), crate_root) {
+                    Some(target) => (node, target),
+                    None => continue,
+                },
+            };
             if is_module {
                 module_items.insert(tree.ptr(node), owners.len());
             }

@@ -1,14 +1,14 @@
 {
   "id": "01141",
   "from_lane": "tests-diag",
-  "owner": "db",
+  "owner": "coord-1030",
   "paths": [
     "crates/hir-def/src/attrs/stability.rs"
   ],
   "what": "crates/hir-def/src/attrs/stability.rs forces_unstable: every CrateOrigin::Lang crate without staged_api gets FORCE_UNSTABLE (rustc_private), which includes the fixtures minicore `core` (Lang(Core), no staged_api), so every use of Sized/Iterator/... from minicore is E0658 `use of unstable library feature rustc_private` in 28 blaze-diagnostics UI tests. rustc: -Zforce-unstable-if-unmarked only matters for sysroot crates without staged_api; core/alloc/std/proc_macro/test always have staged_api in the real sysroot. Fix: `matches!(origin, CrateOrigin::Lang(LangCrateOrigin::Dependency | LangCrateOrigin::Other))`. Also, separately: block_owner (stability.rs:698) panics `no definition of its module holds the block` for a block expanded from a macro_rules called inside core::panic! (test tests::items::impls::drop_of_an_instantiation_of_its_type); parent_ancestors_with_macros_view seems not to climb out of the nested macro file.",
   "state": "open",
   "created": "2026-10-30T22:23:59Z",
-  "updated": "2026-10-30T22:23:59Z",
+  "updated": "2026-10-31T13:42:42Z",
   "taken_by": null,
   "why": null,
   "source": null,
@@ -18,6 +18,12 @@
       "by": "tests-diag",
       "action": "add",
       "note": ""
+    },
+    {
+      "at": "2026-10-31T13:42:42Z",
+      "by": "db-next5",
+      "action": "reassign",
+      "note": "db -> coord-1030: hir-def is listed for coord-1030's test-fix subagent in crate-holds.md, so db does not edit it. db checked the fix and it is rustc's rule: -Zforce-unstable-if-unmarked only changes crates without staged_api, and the real core/alloc/std/proc_macro/test always have staged_api, so this changes nothing for a real sysroot and frees minicore's core. Exact edit, crates/hir-def/src/attrs/stability.rs:320: `matches!(krate.data(db).origin, CrateOrigin::Lang(LangCrateOrigin::Dependency | LangCrateOrigin::Other))` (import LangCrateOrigin from base_db). The block_owner panic (stability.rs:698, a block from a macro_rules inside core::panic!) is a separate bug: give it back to db as its own item once hir-def is free. If hir-def's line in the ledger is stale, say so and db applies both"
     }
   ]
 }

@@ -596,7 +596,7 @@ fn a_refresh_reads_the_view_again_and_no_fixed_mount() {
     let (more, new): (&'static [u8], &'static [u8]) = (b"pub fn more() -> u8 { 1 }\n", b"pub fn new() {}\n");
     let root = changed(&tree, &[("a/src/more.rs", Some(more)), ("a/src/new.rs", Some(new))]);
     let config = config(root, library(&MemTree::default()));
-    let refreshed = built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None });
+    let refreshed = built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }, |_| Ok(()));
     assert_eq!(refreshed, Ok(true));
     let db = built.lowered.db();
     let a = root_of(db, krate(&built, LIB));
@@ -618,7 +618,7 @@ fn a_refresh_refuses_a_root_file_gone_and_leaves_a_new_workspace_root_to_lower()
         let mut built = lowered(&units).unwrap();
         let root = changed(&tree, changes);
         let config = config(root, library);
-        built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None })
+        built.lowered.refresh(Lower { units: &units, config: &config, files: &tree, root, host_cpu: None }, |_| Ok(()))
     };
     let Err(error) = refresh(&[("b/src/main.rs", None)]) else { panic!("a crate's root file went and nothing said so") };
     assert!(error.what.contains("root file"), "{error}");
@@ -705,7 +705,7 @@ fn an_appended_root_is_its_crates_text_until_the_next_job() {
     let view = view(&tree);
     let config = config(view, library(&tree));
     let next = Lower { units: &units, config: &config, files: &tree, root: view, host_cpu: None };
-    assert_eq!(built.lowered.refresh(next), Ok(true));
+    assert_eq!(built.lowered.refresh(next, |_| Ok(())), Ok(true));
     let unrecorded = harness("pub fn main() { let _ = 1; }");
     assert_eq!(append(&mut built.lowered, LIB_TEST, Some(unrecorded.clone())), Ok(1));
     assert_eq!(**built.lowered.db().file_text(root).text(built.lowered.db()), *unrecorded);
@@ -943,13 +943,15 @@ fn a_refresh_lists_the_const_macros_again_once_their_file_changes() {
         #[proc_macro_attribute]\npub fn twice(attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
     let root = changed(&tree, &[("a/src/macros.rs", Some(more))]);
     let with_more = config(root, library_with_proc_macro(&tree));
-    let refreshed = built.lowered.refresh(Lower { units: &units, config: &with_more, files: &tree, root, host_cpu: None });
+    let refreshed =
+        built.lowered.refresh(Lower { units: &units, config: &with_more, files: &tree, root, host_cpu: None }, |_| Ok(()));
     assert_eq!(refreshed, Ok(true));
     assert_eq!(const_macros_of(built.lowered.db(), macros), ["double", "twice"]);
 
     let root = changed(&tree, &[]);
     let without = config(root, library_with_proc_macro(&tree));
-    let Err(error) = built.lowered.refresh(Lower { units: &units, config: &without, files: &tree, root, host_cpu: None })
+    let Err(error) =
+        built.lowered.refresh(Lower { units: &units, config: &without, files: &tree, root, host_cpu: None }, |_| Ok(()))
     else {
         panic!("the const macros' file went and nothing said so")
     };

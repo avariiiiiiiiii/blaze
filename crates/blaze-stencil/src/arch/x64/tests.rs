@@ -843,7 +843,8 @@ fn places_as_cranelifts_abi() {
     assert_eq!(returns(&sig(sysv, &[], &[I128])).unwrap(), [Pair(Part::Gpr(RAX), Part::Gpr(RDX))]);
     assert_eq!(returns(&sig(win, &[], &[I64, I64])).unwrap(), [RAX, RDX].map(Gpr));
     assert!(returns(&sig(win, &[], &[I64; 3])).is_err());
-    assert!(returns(&sig(win, &[], &[F64, F64])).is_err());
+    assert_eq!(returns(&sig(win, &[], &[F64, F64])).unwrap(), [Xmm(0), Xmm(1)]);
+    assert!(returns(&sig(win, &[], &[F64, F64, F64])).is_err());
     assert_eq!(returns(&sig(win, &[], &[F32X4])).unwrap(), [Xmm(0)]);
 }
 

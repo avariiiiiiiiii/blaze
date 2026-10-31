@@ -184,33 +184,50 @@ pub(crate) fn ui_builtins(name: &str, edition: &str, source: &str) -> String {
 }
 
 const BUILTINS_CORE: &str = r#"//- /core.rs crate:core edition:2024
-#![feature(decl_macro, rustc_attrs)]
+#![feature(decl_macro, rustc_attrs, staged_api)]
+#![stable(feature = "core", since = "1.6.0")]
+#[stable(feature = "core_prelude", since = "1.4.0")]
 pub mod prelude {
+    #[stable(feature = "core_prelude", since = "1.4.0")]
     pub mod v1 {
+        #[stable(feature = "core_prelude", since = "1.4.0")]
         pub use crate::compile_error;
+        #[unstable(feature = "cfg_accessible", issue = "64797")]
         pub use crate::macros::builtin::cfg_accessible;
     }
+    #[stable(feature = "prelude_2015", since = "1.55.0")]
     pub mod rust_2015 {
+        #[stable(feature = "prelude_2015", since = "1.55.0")]
         pub use super::v1::*;
     }
+    #[stable(feature = "prelude_2018", since = "1.55.0")]
     pub mod rust_2018 {
+        #[stable(feature = "prelude_2018", since = "1.55.0")]
         pub use super::v1::*;
     }
+    #[stable(feature = "prelude_2021", since = "1.55.0")]
     pub mod rust_2021 {
+        #[stable(feature = "prelude_2021", since = "1.55.0")]
         pub use super::v1::*;
     }
+    #[stable(feature = "prelude_2024", since = "1.85.0")]
     pub mod rust_2024 {
+        #[stable(feature = "prelude_2024", since = "1.85.0")]
         pub use super::v1::*;
     }
 }
+#[stable(feature = "core", since = "1.6.0")]
 pub mod macros {
+    #[stable(feature = "compile_error_macro", since = "1.20.0")]
     #[rustc_builtin_macro]
     #[macro_export]
     macro_rules! compile_error {
         ($msg:expr $(,)?) => {{ /* compiler built-in */ }};
     }
 
+    #[stable(feature = "core", since = "1.6.0")]
     pub mod builtin {
+        #[unstable(feature = "cfg_accessible", issue = "64797")]
         #[rustc_builtin_macro]
         pub macro cfg_accessible($item:item) {
             /* compiler built-in */

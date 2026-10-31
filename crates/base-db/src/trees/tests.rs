@@ -13,7 +13,8 @@ use crate::{Db, EditionedFileId, SourceRoot, SourceRootId, reparse::WHOLE};
 const EDITION: Edition = Edition::Edition2021;
 
 /// Texts with bodies of every kind: the parser's test data that parses, and one with errors in
-/// its bodies.
+/// its bodies. Each text once: the store keeps a tree per text, so two files of one text (the
+/// fixtures have two empty ones) are one entry.
 fn texts() -> Vec<(String, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../parser/test_data/parser/ok");
     let mut paths: Vec<_> = std::fs::read_dir(&dir)
@@ -22,13 +23,15 @@ fn texts() -> Vec<(String, String)> {
         .filter(|it| it.extension().is_some_and(|it| it == "rs"))
         .collect();
     paths.sort();
+    let mut seen = std::collections::HashSet::new();
     let mut texts: Vec<(String, String)> = paths
         .iter()
-        .take(40)
         .map(|it| {
             let name = it.file_name().unwrap().to_string_lossy().into_owned();
             (name, std::fs::read_to_string(it).unwrap())
         })
+        .filter(|(_, text)| seen.insert(text.clone()))
+        .take(40)
         .collect();
     let broken = "fn f() { let x = ; }\nfn g() -> u8 { 1 + }\nstruct S { a: u8 }\n";
     texts.push(("broken.rs".to_owned(), broken.to_owned()));

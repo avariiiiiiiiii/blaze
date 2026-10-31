@@ -1,0 +1,23 @@
+{
+  "id": "01267",
+  "from_lane": "tests-misc-lints",
+  "owner": "db",
+  "paths": [
+    "crates/hir/src/lib.rs"
+  ],
+  "what": "crates/hir/src/lib.rs:5172 Type::impls_trait returns false when args.references_error(); in vendor/rustc_type_ir HAS_ERROR now includes HAS_RE_ERROR, and every region an inference result holds is ReError, so any type with a reference (&str, &i32, &dyn T) never implements anything: blaze-lints useless_borrows_in_formatting (&str: Display, &i32: Debug through impl for &T) and unnecessary_to_owned (&str: AsRef<str>) miss findings. Check only type/const errors: args.has_type_flags(TypeFlags::HAS_NON_REGION_ERROR) (rustc solves modulo regions, a region error holds). Grep crates/hir and hir-ty for other references_error() guards meant for types.",
+  "state": "open",
+  "created": "2026-10-31T13:36:07Z",
+  "updated": "2026-10-31T13:36:07Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:36:07Z",
+      "by": "tests-misc-lints",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

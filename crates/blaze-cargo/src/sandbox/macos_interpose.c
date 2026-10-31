@@ -1195,25 +1195,26 @@ INTERPOSE(my_getattrlistbulk, getattrlistbulk)
 
 // A variable read by name. What reads the C library makes itself (`getenv("TZ")` in
 // `localtime`) are not seen: the launcher keys every traced run by the whole environment.
+//
+// The hooks test `alive` alone and leave the rest out of line: libSystem's initializer reads
+// the environment (malloc's settings) before thread-locals can be read, and with `busy` in
+// the hook the compiler may compute its address ahead of the test, which aborts there in
+// `_tlv_bootstrap_error`.
+__attribute__((noinline)) static void env_read(const char *name) {
+    if (busy || !record_reads) return;
+    busy = 1;
+    int saved = errno;
+    note('E', name);
+    errno = saved;
+    busy = 0;
+}
 static char *my_getenv(const char *name) {
-    if (configured() && record_reads && name) {
-        busy = 1;
-        int saved = errno;
-        note('E', name);
-        errno = saved;
-        busy = 0;
-    }
+    if (alive && name) env_read(name);
     return getenv(name);
 }
 // The whole environment, which Rust's `env::vars` and a `Command` that keeps it walk.
 static char ***my__NSGetEnviron(void) {
-    if (configured() && record_reads) {
-        busy = 1;
-        int saved = errno;
-        note('E', "*");
-        errno = saved;
-        busy = 0;
-    }
+    if (alive) env_read("*");
     return _NSGetEnviron();
 }
 INTERPOSE(my_getenv, getenv)

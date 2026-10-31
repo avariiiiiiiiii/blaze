@@ -71,6 +71,11 @@ fn check(data: &[u8]) {
         let table = shared::index(&shared::slots_of_packs(&mut sim));
         let head = shared::file(HEAD);
         let mut whole = sim.contents(&head);
+        if whole.is_empty() {
+            assert!(values.is_empty(), "a flush of {} values put commits a head", values.len());
+            shared::assert_whole(shared::read_back(&mut sim, &[]), 0);
+            return;
+        }
         shared::index_whole(&mut whole, &table);
         sim.change(&head, &whole);
         let index = shared::file(INDEX);

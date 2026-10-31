@@ -2030,28 +2030,33 @@ impl Store {
             let samples: Vec<&[u8]> =
                 // alloc: once per dictionary trained, the samples as slices for zstd
                 self.training[kind.code() as usize].samples.iter().map(Vec::as_slice).collect();
-            cold::train(&samples)
+            cold::train(&samples).and_then(|dictionary| {
+                cold::Prepared::new(dictionary)
+                    // alloc: the error's message
+                    .map_err(|why| format!("the dictionary trained on {} values {why}", samples.len()))
+            })
         };
         let training = &mut self.training[kind.code() as usize];
         match trained {
-            Ok(dictionary) => {
+            Ok(prepared) => {
                 *training = Training::default();
+                let dictionary = prepared.bytes();
                 let header = RecordHeader {
                     kind,
                     form: Form::Dictionary,
                     dictionary: 0,
                     stored: dictionary.len() as u64,
                     raw: dictionary.len() as u64,
-                    key: Key(ContentId::of(DICTIONARY_DOMAIN, &dictionary)),
-                    content: content_of(&dictionary),
+                    key: Key(ContentId::of(DICTIONARY_DOMAIN, dictionary)),
+                    content: content_of(dictionary),
                 };
-                let loc = self.append_record(Unit::SHARED, header, &dictionary);
+                let loc = self.append_record(Unit::SHARED, header, dictionary);
                 self.tiers[0].dictionaries.push(Dictionary {
                     kind,
                     pack: loc.pack,
                     offset: loc.offset,
                     // alloc: once per dictionary trained
-                    bytes: Ok(Arc::new(cold::Prepared::new(dictionary))),
+                    bytes: Ok(Arc::new(prepared)),
                 });
                 self.publish();
             }
@@ -2706,9 +2711,15 @@ fn open_tier(tier: &mut Tier) -> Result<(), (FileName, String)> {
                     .bytes(at + RECORD_HEADER, header.stored)
                     .filter(|bytes| content_of(bytes) == header.content)
                     // alloc: opening, once per dictionary, whose bytes the prepared dictionary keeps
-                    .map(|bytes| Arc::new(cold::Prepared::new(bytes.to_vec())))
+                    .map(|bytes| bytes.to_vec())
                     // alloc: the error of a dictionary that cannot be read
-                    .ok_or_else(|| format!("at {at} of {} is not what was recorded", pack.file)),
+                    .ok_or_else(|| format!("at {at} of {} is not what was recorded", pack.file))
+                    .and_then(|bytes| {
+                        cold::Prepared::new(bytes)
+                            .map(Arc::new)
+                            // alloc: the error of a dictionary that cannot be read
+                            .map_err(|why| format!("at {at} of {} {why}", pack.file))
+                    }),
                 // alloc: the error of a dictionary that cannot be read
                 false => Err(format!("at {at} of {} is not a dictionary of its kind", pack.file)),
             });

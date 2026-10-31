@@ -629,8 +629,18 @@ impl Lowered {
     /// `Ok(false)`, nothing changed, when the view moves the workspace's root or what its
     /// manifest sets, which every crate is made with: it is to be [`lower`]ed anew.
     ///
+    /// `seed` runs in the same write once the new texts are set, before the write's
+    /// maintainers parse them: where an edit's trees are handed over
+    /// ([`base_db::EditionedFileId::seed_parse`]), as after it each file has its parse. It does
+    /// not run when the view did not move (nothing is written, so nothing is parsed again) or
+    /// on `Ok(false)`.
+    ///
     /// A write, as [`Lowered::ran`] is.
-    pub fn refresh<T: blaze_query::Tree>(&mut self, lower: Lower<'_, T>) -> Result<bool, LowerError> {
+    pub fn refresh<T: blaze_query::Tree>(
+        &mut self,
+        lower: Lower<'_, T>,
+        seed: impl FnOnce(&Db) -> Result<(), LowerError>,
+    ) -> Result<bool, LowerError> {
         let Lower { units, config, files, root, .. } = lower;
         // A new job: its units' roots are appended to again, and may be made other than before.
         self.appended.clear();
@@ -645,18 +655,22 @@ impl Lowered {
         let sets = self.crates.sets;
         let mut loaded = Vec::new();
         let mut removed = false;
-        for load in &mut self.loads {
-            if !load.view {
-                continue;
+        let (loads, paths) = (&mut self.loads, &mut self.paths);
+        self.db.batch(|db| {
+            for load in loads.iter_mut() {
+                if !load.view {
+                    continue;
+                }
+                loaded.clear();
+                tree.read_view.set(false);
+                tree.walk(&load.dir, &load.skipped, &mut loaded)?;
+                load.view = tree.read_view.get();
+                let change = set_files(db, &load.dir, &load.built, load.set, sets, &loaded)?;
+                removed |= !change.removed.is_empty();
+                note(paths, db, load.set, &change);
             }
-            loaded.clear();
-            tree.read_view.set(false);
-            tree.walk(&load.dir, &load.skipped, &mut loaded)?;
-            load.view = tree.read_view.get();
-            let change = set_files(&mut self.db, &load.dir, &load.built, load.set, sets, &loaded)?;
-            removed |= !change.removed.is_empty();
-            note(&mut self.paths, &self.db, load.set, &change);
-        }
+            seed(db)
+        })?;
         self.view = root;
         if removed {
             for lowering in &self.crates.units {

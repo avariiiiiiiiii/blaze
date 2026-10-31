@@ -170,9 +170,11 @@ fn read_dylib(bytes: &[u8], arch: Arch) -> Result<Shared, String> {
         None => {
             let symtab = symtab.ok_or("neither an export trie nor a symbol table")?;
             let table: SymbolTable<'_, Header, &[u8]> = symtab.symbols(endian, bytes).map_err(err)?;
-            // The string table is in the file (`symbols` checked it) and holds every name, each of
-            // which loses its `_` (or, rarely, gains a `\x01`).
-            names = Names::with_capacity(symtab.strsize.get(endian) as usize);
+            // The string table holds every name, each of which loses its `_` (or, rarely, gains a
+            // `\x01`). `symbols` checks only the nlists: a name read past the file's end is an
+            // error, so only the table's bytes inside the file can be names.
+            let (stroff, strsize) = (symtab.stroff.get(endian) as usize, symtab.strsize.get(endian) as usize);
+            names = Names::with_capacity(strsize.min(bytes.len().saturating_sub(stroff)));
             symtab_exports(&table, endian, &sections, &mut names)?
         }
     };
@@ -1002,6 +1004,36 @@ mod tests {
         })
         .unwrap();
         assert_eq!(shared.symbols.len(), 7);
+    }
+
+    /// A string table whose size runs past the file sizes the name arena by the part inside it:
+    /// read with no external symbol it is accepted, and with one whose name is past the end it
+    /// is refused, neither asking for what the size says.
+    #[test]
+    fn string_table_past_the_end() {
+        let (mut table, strings) = (Vec::new(), b"\0_f\0");
+        table.put_u32(1);
+        table.extend_from_slice(&[macho::N_SECT.0 | macho::N_EXT.0, 1]);
+        table.extend_from_slice(&0u16.to_le_bytes());
+        table.put_u64(0x1000);
+        for (nsyms, strsize, accepted) in [(0, u32::MAX, true), (0, 0x0100_0000, true), (1, u32::MAX, false)] {
+            let table_len = table.len() as u32;
+            let mut tail = table.clone();
+            tail.extend_from_slice(strings);
+            let bytes = file(
+                macho::CPU_TYPE_ARM64.0,
+                |at| {
+                    let mut commands = segments(0x1000);
+                    commands.push(dylib_command(macho::LC_ID_DYLIB.0, "/usr/lib/libsym.dylib"));
+                    commands.push(symtab_command(at, nsyms, at + table_len, strsize));
+                    commands
+                },
+                &tail,
+            );
+            let (read, used) = blaze_alloc_count::measure(|| read("libsym.dylib", &bytes, Arch::Aarch64));
+            assert_eq!(read.is_ok(), accepted, "{nsyms} symbols, a string table of {strsize:#x} bytes: {read:?}");
+            assert!(used.largest <= bytes.len() as u64, "{} bytes at once reading {} bytes", used.largest, bytes.len());
+        }
     }
 
     /// The walk allocates its symbols and its bitset, once each, whatever the trie's size: a

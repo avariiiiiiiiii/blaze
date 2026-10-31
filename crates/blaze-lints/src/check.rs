@@ -1073,9 +1073,12 @@ impl<'q: 't, 't> Cx<'q, 't> {
     }
 
     /// rustc's `hir_span_if_local`: where `adt` is written, from after its attributes, when it
-    /// is written in a file.
+    /// is of the crate being linted and written in a file.
     pub(crate) fn def_span(&self, adt: hir::Adt) -> Option<Span> {
         let db = self.db;
+        if adt.module(db).krate(db) != self.krate() {
+            return None;
+        }
         let file = match AdtId::from(adt) {
             AdtId::StructId(it) => it.lookup(db).id.file_id,
             AdtId::UnionId(it) => it.lookup(db).id.file_id,

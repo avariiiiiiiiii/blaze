@@ -61,7 +61,8 @@ pub(crate) fn library(tree: &MemTree) -> ContentId {
         "[dependencies]\nalloc = { path = \"../alloc\" }\ncore = { path = \"../core\" }\n\
          panic_abort = { path = \"../panic_abort\" }\npanic_unwind = { path = \"../panic_unwind\", optional = true }\n\n\
          [features]\npanic-unwind = [\"dep:panic_unwind\"]\nbacktrace = []\n",
-    );
+    )
+    .replace("[lib]\n", "[lib]\ncrate-type = [\"dylib\", \"rlib\"]\n");
     let proc_macro = package("proc_macro", "[dependencies]\nstd = { path = \"../std\" }\ncore = { path = \"../core\" }\n");
     let sysroot = package(
         "sysroot",
@@ -301,6 +302,28 @@ fn std_panic_abort_aborts_by_its_profile_not_its_rustflags() {
     assert_eq!(unit.profile.rustflags, ["-Cpanic=abort"]);
     let plan = &units.plans[at];
     assert!(!plan.rustflags.iter().any(|it| it.contains("panic")), "{plan:?}");
+}
+
+// cargo's `UnitInterner::intern`: library/std's `crate-type = ["dylib", "rlib"]` is built as
+// an `rlib` only, under `-Z build-std`.
+#[test]
+fn std_is_built_as_an_rlib_not_a_dylib() {
+    let fixture = Fixture::new();
+    let files = [("ws/Cargo.toml", A), ("ws/src/lib.rs", "")];
+    let units = ready(fixture.plan(fixture.open(&ask(&files))));
+    let id = &units.packages.iter().find(|it| it.name == "std").expect("std").id;
+    let (at, unit) = units
+        .graph
+        .units
+        .iter()
+        .enumerate()
+        .find(|(_, it)| &it.pkg_id == id && it.target.is_lib() && it.mode == Mode::Build)
+        .expect("std's library unit");
+    assert!(unit.is_std);
+    assert_eq!((&unit.target.kind[..], &unit.target.crate_types[..]), (&["rlib".to_owned()][..], &["rlib".to_owned()][..]));
+    let outputs = &units.plans[at].outputs;
+    assert!(outputs.iter().any(|it| it.ends_with(".rlib")), "{outputs:?}");
+    assert!(!outputs.iter().any(|it| it.contains(".dylib") || it.ends_with(".so")), "{outputs:?}");
 }
 
 #[test]

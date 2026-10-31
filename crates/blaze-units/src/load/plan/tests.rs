@@ -144,6 +144,23 @@ fn cfgs_in_cargos_order() {
     assert_eq!(cfgs, ["p", "feature=\"a\"", "k"]);
 }
 
+// A profile's `-C panic` that says its `panic` goes, in each spelling rustc takes; the
+// kind's rustflags follow, kept as they are.
+#[test]
+fn a_profiles_own_panic_flag_goes() {
+    let profile = strings(&["-Cpanic=abort", "-C", "panic=abort", "--codegen", "panic=abort", "--codegen=panic=abort", "-C", "embed-bitcode=yes", "-Zunstable-options"]);
+    let rest = strings(&["-Cpanic=abort", "--cfg", "k"]);
+    let flags = flags::unit_rustflags(&profile, "abort", "panic_abort", &rest).unwrap();
+    assert_eq!(flags, ["-C", "embed-bitcode=yes", "-Zunstable-options", "-Cpanic=abort", "--cfg", "k"]);
+}
+
+#[test]
+fn a_profiles_other_panic_flag_is_refused_naming_its_package() {
+    let error = flags::unit_rustflags(&strings(&["-Cpanic=abort"]), "unwind", "p", &[]).unwrap_err();
+    assert!(error.what.contains("`p`'s profile rustflags say `-C panic=abort`"), "{}", error.what);
+    assert!(error.what.contains("`panic = \"unwind\"`"), "{}", error.what);
+}
+
 // `lints_to_rustflags`: by priority, then by name backwards; `[lints.cargo]` is cargo's own.
 #[test]
 fn lints_order() {

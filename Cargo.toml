@@ -12,6 +12,8 @@ exclude = [
     "vendor/hegeltest",
     "vendor/hegeltest-c",
     "vendor/hegeltest-macros",
+    # Patched below; its own tests need dev-dependencies blaze has no use for.
+    "vendor/sonic-rs",
 ]
 resolver = "2"
 
@@ -75,6 +77,8 @@ llvm-sys = { path = "vendor/llvm-sys" }
 cranelift-object = { path = "vendor/cranelift-object" }
 # The unwind instructions hir-ty-codegen makes `.eh_frame` rows from (vendor/cranelift-codegen/SOURCE.md).
 cranelift-codegen = { path = "vendor/cranelift-codegen" }
+# A skipped string's `\u` takes four hex digits, as serde_json's (vendor/sonic-rs/SOURCE.md).
+sonic-rs = { path = "vendor/sonic-rs" }
 
 [workspace.dependencies]
 # local crates

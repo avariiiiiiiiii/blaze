@@ -332,7 +332,8 @@ http-body-util = "0.1.5"
 hyper = { version = "1.12.0", default-features = false }
 hyper-rustls = { version = "0.27.10", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
-im-rc = "15.1.0"
+# The persistent maps of blaze-resolve: im-rc's maintained fork (im-rc has had no release since 2021).
+imbl = "7.0.2"
 inkwell = { version = "0.11.0", default-features = false }
 lzma-rust2 = { version = "0.24.0", default-features = false }
 pathdiff = "0.2.3"
@@ -350,7 +351,6 @@ shell-escape = "=0.1.5"
 stacker = "0.1.25"
 syn = "2.0.117"
 synstructure = "0.13.2"
-tango-bench = "0.9.0"
 tar = { version = "0.4.46", default-features = false }
 target-lexicon = "0.13.5"
 tempfile = "3.27.0"

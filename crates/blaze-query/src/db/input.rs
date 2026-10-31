@@ -6,7 +6,10 @@ use std::{
     cell::UnsafeCell,
     marker::PhantomData,
     mem::MaybeUninit,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        OnceLock,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 use blaze_mem::Tag;
@@ -50,12 +53,20 @@ struct InputRow<F> {
 pub(crate) struct InputTable<I: Input> {
     pages: Pages,
     ids: Ids,
+    /// A singleton's ID and field nodes, reserved at the first `try_get` or `new`: before it
+    /// is made, its field 0's node is what a read of its absence depends on.
+    singleton: OnceLock<Id>,
     _of: PhantomData<fn() -> I>,
 }
 
 impl<I: Input> Table for InputTable<I> {
     fn new(_: &Storage, _: u32) -> InputTable<I> {
-        InputTable { pages: Pages::new(Tag::Query), ids: Ids::new(Tag::Query), _of: PhantomData }
+        InputTable {
+            pages: Pages::new(Tag::Query),
+            ids: Ids::new(Tag::Query),
+            singleton: OnceLock::new(),
+            _of: PhantomData,
+        }
     }
 
     fn pages(&self) -> &Pages {
@@ -128,11 +139,9 @@ pub fn input_new<I: Input, const N: usize>(
         I::NAME,
         I::FIELDS
     );
+    assert!(!I::SINGLETON, "{} is a singleton: it is made by `&mut` (input_new_singleton)", I::NAME);
     let (table, index) = storage.table_or_make::<InputTable<I>>(I::ingredient());
     let id = table.ids.next(storage, index, &table.pages, &storage.heap, layout::<RowOf<I>>());
-    if I::SINGLETON {
-        assert!(table.ids.len() == 1, "{} is a singleton, made a second time", I::NAME);
-    }
     let row = table.pages.row::<RowOf<I>>(id).expect("`Ids::next` made the row's page");
     let first = storage.new_nodes(I::FIELDS.max(1));
     let view = storage.view_bits();

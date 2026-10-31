@@ -142,7 +142,7 @@ fn only_a_crate_that_can_name_the_trait_and_the_type_is_asked() {
     }
     let names = crates_that_name(&db, main);
     let holders = |trait_crate, self_crate| {
-        blaze_mem::frame::current(|frame| {
+        blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
             let mut holders: Vec<Crate> =
                 names.holders(frame, trait_crate, self_crate).map(|at| loaded[at]).collect();
             holders.sort_unstable();

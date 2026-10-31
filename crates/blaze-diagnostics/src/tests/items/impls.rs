@@ -561,7 +561,7 @@ error: aborting due to 3 previous errors
 Some errors have detailed explanations: E0201, E0592.
 For more information about an error, try `rustc --explain E0201`.
 "#;
-    assert_eq!(ui("E0201.rs", "2015", source), stderr);
+    assert_eq!(ui_core("E0201.rs", "copy", source), stderr);
 }
 
 #[test]

@@ -589,6 +589,7 @@ fn main() {
 fn call_drop_explicitly() {
     check(
         r#"
+#![feature(lang_items)]
 #[lang = "drop"]
 trait Drop {
     fn drop(&mut self) {

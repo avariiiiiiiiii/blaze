@@ -63,8 +63,8 @@ use crate::{
 /// The crate's def map as the old collector made it: `crate_local_def_map` before the per-module
 /// resolver (`nameres.rs`, without `frozen`, which serves and checks images and is the same for
 /// both). A query of its own, so the tracked structs it makes live in one.
-#[blaze_query::tracked(returns(ref))]
-pub(super) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
+#[salsa::tracked(returns(ref))]
+pub(in crate::nameres) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     let root_file_id = krate.root_file_id(db);
     let module_data = ModuleData::new(
         ModuleOrigin::CrateRoot { definition: root_file_id },
@@ -85,7 +85,7 @@ pub(super) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
 }
 
 /// The crate's def map as the per-module resolver makes it, without `frozen`.
-#[blaze_query::tracked(returns(ref))]
+#[salsa::tracked(returns(ref))]
 pub(in crate::nameres) fn new_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     blaze_mem::frame::task(Tag::Nameres, |frame| {
         let (def_map, local_def_map) = super::collect_crate(db, frame, krate);
@@ -113,7 +113,7 @@ fn empty_block_def_map(db: &Db, block_id: BlockIdLt<'_>) -> (DefMap, TreeId) {
 }
 
 /// `block`'s def map as the old collector made it (`block_def_map` before the resolver).
-#[blaze_query::tracked(returns(ref))]
+#[salsa::tracked(returns(ref))]
 pub(super) fn old_block_def_map<'db>(
     db: &'db Db,
     block_id: BlockIdLt<'db>,
@@ -127,7 +127,7 @@ pub(super) fn old_block_def_map<'db>(
 }
 
 /// `block`'s def map as the per-module resolver makes it.
-#[blaze_query::tracked(returns(ref))]
+#[salsa::tracked(returns(ref))]
 pub(super) fn new_block_def_map<'db>(
     db: &'db Db,
     block_id: BlockIdLt<'db>,

@@ -74,6 +74,65 @@ pub(super) fn known_abi_of(string: ast::String<'_>) -> Option<&'static str> {
     with_abi_text(string, known_abi)
 }
 
+/// The ABIs of [`ABIS`] no feature gates (`extern_abi_stability`): those `enabled_names`
+/// suggests from when no ABI feature is on.
+fn stable_abi(name: &str) -> bool {
+    !matches!(
+        name,
+        "custom"
+            | "gpu-kernel"
+            | "ptx-kernel"
+            | "msp430-interrupt"
+            | "x86-interrupt"
+            | "avr-interrupt"
+            | "avr-non-blocking-interrupt"
+            | "riscv-interrupt-m"
+            | "riscv-interrupt-s"
+            | "cmse-nonsecure-call"
+            | "cmse-nonsecure-entry"
+            | "rust-call"
+            | "rust-cold"
+            | "rust-invalid"
+            | "rust-preserve-none"
+            | "tail"
+            | "unadjusted"
+            | "vectorcall"
+            | "vectorcall-unwind"
+            | "Swift"
+    )
+}
+
+/// E0703 of an `extern "x"` (a function, a function pointer type, an `extern` block) whose
+/// string is no ABI rustc knows: rustc's `error_on_invalid_abi`, as it lowers the ABI, which
+/// then lowers to the default one. The build stops on it, never on that default.
+pub(super) fn invalid_abi(v: &V<'_, '_, '_>, node: ast::Node<'_>, out: &mut Out) {
+    let Some(string) = ast::Abi::cast(node).and_then(abi_string) else { return };
+    if known_abi_of(string).is_some() {
+        return;
+    }
+    let at = v.span(string.syntax().text_range());
+    // alloc: the error's message
+    let found = with_abi_text(string, str::to_owned);
+    // clone: a handle, on the error path
+    let mut diag = Diag::error(Some("E0703"), format!("invalid ABI: found `{found}`"), at.clone());
+    // clone: a handle, on the error path
+    diag.span_label(at.clone(), "invalid ABI");
+    diag.note("invoke `rustc --print=calling-conventions` for a full list of supported calling conventions");
+    // alloc: the candidates, on the error path
+    let stable: Vec<&str> = ABIS.iter().copied().filter(|it| stable_abi(it)).collect();
+    if let Some(suggestion) = stdx::edit_distance::find_best_match_for_name(&stable, &found, None) {
+        diag.suggestion_verbose(
+            at,
+            // alloc: the error's message
+            format!("there's a similarly named valid ABI `{suggestion}`"),
+            // alloc: the error's message
+            format!("\"{suggestion}\""),
+            Applicability::MaybeIncorrect,
+        );
+    }
+    v.push(out, node, diag, super::Phase::Lower, super::Pass::Early);
+}
+
 /// The ABI a function's or a function pointer's `extern` gives (`FALLBACK`, `"C"`, for one
 /// without a string), when rustc knows it.
 pub(super) fn abi_of(abi: ast::Abi<'_>) -> Option<&'static str> {

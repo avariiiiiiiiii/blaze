@@ -70,9 +70,11 @@ mod tests {
     };
 
     const ITEMS: &str = r#"
-trait Tr {}
+use core::marker::PointeeSized;
+trait Tr: PointeeSized {}
 fn sized_param<T: Tr>() {}
 fn unsized_param<T: ?Sized + Tr>() {}
+fn pointee_param<T: PointeeSized + Tr>() {}
 "#;
 
     const FEATURES: [&str; 4] =
@@ -222,9 +224,12 @@ fn unsized_param<T: ?Sized + Tr>() {}
         assert!(meta_sized_fast_path("", "unsized_param"));
     }
 
+    /// rustc's `add_sizedness_bounds`: `?Sized` is a `MetaSized` bound, and only
+    /// `PointeeSized` leaves a parameter none.
     #[test]
     fn meta_sized_on_a_param_with_sized_hierarchy_needs_a_bound() {
         assert!(meta_sized_fast_path("sized_hierarchy", "sized_param"));
-        assert!(!meta_sized_fast_path("sized_hierarchy", "unsized_param"));
+        assert!(meta_sized_fast_path("sized_hierarchy", "unsized_param"));
+        assert!(!meta_sized_fast_path("sized_hierarchy", "pointee_param"));
     }
 }

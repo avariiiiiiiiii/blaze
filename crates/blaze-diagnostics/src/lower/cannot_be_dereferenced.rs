@@ -15,7 +15,8 @@ use crate::{
 
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::CannotBeDereferenced<'db>) -> Vec<Found> {
     let span = cx.span_of_ptr(d.expr);
-    let ty = cx.ty(&d.found);
+    // clone: the type as rustc prints it, for an error hir found
+    let ty = d.at_error.clone().unwrap_or_else(|| cx.ty(&d.found));
     let message = format!("type `{ty}` cannot be dereferenced"); // alloc: the error's message
     let mut diag = Diag::error(Some("E0614"), message, span.clone()); // clone: the error's span
     diag.span_label(span, "can't be dereferenced");

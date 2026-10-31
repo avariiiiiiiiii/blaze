@@ -1380,12 +1380,17 @@ fn a_crate_graph_set_keeps_every_content_id_what_hashing_gives() {
         let texts: Vec<(&str, &str)> = texts.iter().map(|(path, text)| (path.as_str(), *text)).collect();
         let files = load(&mut db, 0, &texts);
         let mut moved = [false; FILES];
+        let mut graph: Vec<DrawnCrate> = Vec::new();
         for step in 0..60 {
             match rng.below(6) {
+                // A crate's ID follows its root file's path only once the graph is set again,
+                // as a loader does after a move.
                 0 => {
                     let at = rng.index(FILES);
                     moved[at] = !moved[at];
                     root_at(&mut db, &files, &moved);
+                    build_graph(&graph, &files).set_in_db(&mut db);
+                    assert_crates_fresh(&db, &format!("a move, seed {seed} step {step}"));
                 }
                 1 => {
                     let all = crate::all_crates(&db);
@@ -1395,9 +1400,9 @@ fn a_crate_graph_set_keeps_every_content_id_what_hashing_gives() {
                     }
                 }
                 _ => {
-                    let drawn = draw_graph(&mut rng, FILES);
-                    build_graph(&drawn, &files).set_in_db(&mut db);
-                    assert_crates_fresh(&db, &format!("{drawn:?}, seed {seed} step {step}"));
+                    graph = draw_graph(&mut rng, FILES);
+                    build_graph(&graph, &files).set_in_db(&mut db);
+                    assert_crates_fresh(&db, &format!("{graph:?}, seed {seed} step {step}"));
                 }
             }
         }

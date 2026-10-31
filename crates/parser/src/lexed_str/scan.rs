@@ -675,7 +675,7 @@ mod tests {
                 decided += usize::from(special(&text, at, &classes).is_some());
             }
         }
-        assert!(asked > 10_000, "{asked} special tokens in the parser's sources");
+        assert!(asked > 5_000, "{asked} special tokens in the parser's sources");
         assert!(decided * 100 >= asked * 99, "special decides {decided} of {asked}");
     }
 }

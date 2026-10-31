@@ -27,9 +27,11 @@ use blaze_ids::{ContentId, Hasher};
 use blaze_items::{ItemId, key};
 use blaze_mem::scratch;
 use hir_def::{
-    AttrDefId, DefWithBodyId, HasModule as _, ItemContainerId, Lookup as _, expr_store::Body,
-    item_hash::portable_body,
+    AttrDefId, DefWithBodyId, GenericDefId, HasModule as _, ItemContainerId, Lookup as _,
+    expr_store::Body, hir::generics::GenericParams, item_hash::portable_body,
 };
+use hir_expand::name::Name;
+use smallvec::SmallVec;
 
 pub use inputs::{FrontEnd, crate_inputs, set_build};
 
@@ -59,7 +61,8 @@ fn identity_of(db: &Db, def: DefWithBodyId) -> Result<ContentId, &'static str> {
     h.id(&inputs::lang_item_signatures(db, home)?);
     owner(db, def, &mut h)?;
     let names = names::names_of(db, def).as_ref().map_err(|it| *it)?;
-    let portable = portable_body(Body::of(db, def), &names.blank, &slots::of(db, def));
+    let portable =
+        portable_body(Body::of(db, def), &names.blank, &slots::of(db, def), &lifetimes(db, def));
     h.part(portable.bytes());
     scratch::with_bytes(|buffer| -> Result<(), &'static str> {
         entries::write(db, home, item::own_item(def), &portable, buffer)?;
@@ -76,6 +79,27 @@ fn identity_of(db: &Db, def: DefWithBodyId) -> Result<ContentId, &'static str> {
     }
     h.update(&depth.to_le_bytes());
     Ok(h.finish())
+}
+
+/// The names of the lifetime parameters `def`'s body sees, its impl's or trait's first: a
+/// lifetime of the body is hashed by its place among them, not its name.
+fn lifetimes(db: &Db, def: DefWithBodyId) -> SmallVec<[Name; 4]> {
+    let container = match def {
+        DefWithBodyId::FunctionId(it) => Some(it.lookup(db).container),
+        DefWithBodyId::ConstId(it) => Some(it.lookup(db).container),
+        DefWithBodyId::StaticId(_) | DefWithBodyId::VariantId(_) => None,
+    };
+    let parent = match container {
+        Some(ItemContainerId::ImplId(it)) => Some(GenericDefId::from(it)),
+        Some(ItemContainerId::TraitId(it)) => Some(GenericDefId::from(it)),
+        Some(ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_)) | None => None,
+    };
+    // alloc: inline for a few, once per identity computed
+    let mut names = SmallVec::new();
+    for generic in parent.into_iter().chain([def.generic_def(db)]) {
+        names.extend(GenericParams::of(db, generic).iter_lt().map(|(_, it)| it.name));
+    }
+    names
 }
 
 /// Section 3.2: the item `def` is the body of, as "self" by its signature and attributes (a

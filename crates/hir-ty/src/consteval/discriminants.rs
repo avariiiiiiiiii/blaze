@@ -361,7 +361,7 @@ impl<'db> Builder<'db> {
         for &run in &by_value {
             let low = int.key(firsts[run as usize]);
             duplicates |= covered.is_some_and(|covered| low <= covered);
-            let high = low + len(run as usize) - 1;
+            let high = low + (len(run as usize) - 1);
             covered = Some(covered.map_or(high, |covered| covered.max(high)));
         }
         if !failed.is_empty() {

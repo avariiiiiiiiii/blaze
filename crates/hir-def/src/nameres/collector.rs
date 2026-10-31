@@ -54,7 +54,7 @@ use crate::{
         BuiltinShadowMode, DefMap, LocalDefMap, MacroSubNs, ModuleData, ModuleOrigin, ResolveMode,
         attr_resolution::{attr_macro_as_call_id, derive_macro_as_call_id},
         crate_def_map,
-        diagnostics::{DefDiagnostic, TraitItemImport, is_glob_of_non_module},
+        diagnostics::{DefDiagnostic, PreludeError, TraitItemImport, is_glob_of_non_module},
         mod_resolution::ModDir,
         path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
         proc_macro::{ProcMacroDef, ProcMacroKind, parse_macro_name_and_helper_attrs},
@@ -911,8 +911,8 @@ impl<'db> DefCollector<'db> {
                 .insert(name, (crate_def_map(self.db, krate).root_module_id(), None));
         }
 
-        self.inject_prelude();
         self.inject_std_extern_crate();
+        self.inject_prelude();
 
         let items = item_tree.top_level_items();
         let items = if let Some(AttrsOrCfgRef::CfgDisabled(cfg_expr, _)) = item_tree.top_level_attrs() {
@@ -1120,15 +1120,16 @@ impl<'db> DefCollector<'db> {
             return;
         }
 
-        let krate = if self.def_map.data.no_std {
-            Name::new_symbol_root(sym::core)
-        } else if self.local_def_map().extern_prelude().any(|(name, _)| *name == sym::std) {
-            Name::new_symbol_root(sym::std)
-        } else {
-            // If `std` does not exist for some reason, fall back to core. This mostly helps
-            // keep r-a's own tests minimal.
-            Name::new_symbol_root(sym::core)
+        let krate = match self.def_map.data.no_std {
+            true => Name::new_symbol_root(sym::core),
+            false => Name::new_symbol_root(sym::std),
         };
+        if !self.local_def_map().extern_prelude().any(|(name, _)| *name == krate) {
+            let root = self.def_map.root;
+            let diagnostic = DefDiagnostic::prelude(root, krate, PreludeError::CrateNotFound);
+            self.def_map.diagnostics.push(diagnostic);
+            return;
+        }
 
         let edition = match self.def_map.data.edition {
             Edition::Edition2015 => Name::new_symbol_root(sym::rust_2015),
@@ -1160,12 +1161,10 @@ impl<'db> DefCollector<'db> {
                 self.def_map.prelude = Some((m, import.and_then(ImportOrExternCrate::use_)));
                 self.imports.wake_all();
             }
-            types => {
-                tracing::debug!(
-                    "could not resolve prelude path `{}` to module (resolved to {:?})",
-                    path.display(self.db, Edition::LATEST),
-                    types
-                );
+            _ => {
+                let root = self.def_map.root;
+                let diagnostic = DefDiagnostic::prelude(root, krate, PreludeError::NoPreludeModule);
+                self.def_map.diagnostics.push(diagnostic);
             }
         }
     }
@@ -1178,20 +1177,31 @@ impl<'db> DefCollector<'db> {
     /// look the name up in the root module itself, such as `crate::std::...`, `super::std::...`
     /// or a macro's `$crate::std::...` (lewton 0.10's own `try!`), find it, and in later editions
     /// they do not (rustc: "could not find `std` in the crate root"). Plain paths reach the crate
-    /// through the extern prelude in every edition, which `seed_with_top_level` fills.
+    /// through the extern prelude in every edition, which `seed_with_top_level` fills; a
+    /// dependency cargo passes `noprelude` (build-std's `--extern noprelude:std`) is put there by
+    /// this item, as by any `extern crate` of the root, and the std prelude is injected after it.
     fn inject_std_extern_crate(&mut self) {
-        if self.def_map.data.no_core || self.def_map.data.edition != Edition::Edition2015 {
+        if self.def_map.data.no_core {
             return;
         }
         let name = match self.def_map.data.no_std {
             true => Name::new_symbol_root(sym::core),
             false => Name::new_symbol_root(sym::std),
         };
-        // Without the crate rustc stops with "can't find crate"; rust-analyzer has no item to
-        // point at then, and plain paths to it fail the same way.
-        let Some(&(krate_root, _)) = self.local_def_map().extern_prelude.get(&name) else {
-            return;
+        let krate_root = match self.local_def_map().extern_prelude.get(&name) {
+            Some(&(krate_root, _)) => krate_root,
+            // Without the crate rustc stops with "can't find crate"; there is no item to point
+            // at then, and `inject_prelude` reports it.
+            None => {
+                let Some(dep) = self.deps.get(&name) else { return };
+                let krate_root = crate_def_map(self.db, dep.crate_id).root_module_id();
+                self.local_def_map.extern_prelude.insert(name, (krate_root, None));
+                krate_root
+            }
         };
+        if self.def_map.data.edition != Edition::Edition2015 {
+            return;
+        }
         let root = self.def_map.root;
         let vis = Visibility::Module(root, VisibilityExplicitness::Implicit);
         self.update(root, &[(Some(name), PerNs::types(krate_root.into(), vis, None))], vis, None);

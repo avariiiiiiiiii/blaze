@@ -50,13 +50,11 @@ fn named(db: &Db, module: ModuleId, name: &str) -> Option<ModuleDefId> {
     module.def_map(db).module(db, module).scope(db).get(&Name::new_root(name)).take_types()
 }
 
-/// The ADT `name` at `root`, or `dep::name` through its `dep`.
+/// The ADT `name` at `root`, or `dep::name` at the root of the crate `dep`, which is in the
+/// extern prelude, not in `root`'s scope.
 fn adt(db: &Db, root: ModuleId, name: &str) -> AdtId {
     let (module, name) = match name.strip_prefix("dep::") {
-        Some(rest) => match named(db, root, "dep") {
-            Some(ModuleDefId::ModuleId(dep)) => (dep, rest),
-            other => panic!("`dep` is {other:?}"),
-        },
+        Some(rest) => (crate_def_map(db, crate_named(db, "dep")).root_module_id(), rest),
         None => (root, name),
     };
     match named(db, module, name) {

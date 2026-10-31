@@ -166,8 +166,7 @@ pub fn cranelift(func: &ir::Function, isa: &dyn isa::TargetIsa) -> Result<Compil
         for handler in site.exception_handlers {
             match *handler {
                 cranelift_codegen::MachExceptionHandler::Tag(tag, landing) => {
-                    let landing = landing.as_offset();
-                    handlers.push(code::Handler::Tag { tag: tag.as_u32(), landing });
+                    handlers.push(code::Handler::Tag { tag: tag.as_u32(), landing: landing.as_offset() });
                 }
                 cranelift_codegen::MachExceptionHandler::Default(landing) => {
                     handlers.push(code::Handler::Default { landing: landing.as_offset() });

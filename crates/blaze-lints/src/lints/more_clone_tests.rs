@@ -304,7 +304,6 @@ fn copy(n: u32) -> u32 {
         10 |     let t = s.clone();
            |             ^
            = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#redundant_clone
-           = note: requested on the command line with `-W clippy::redundant-clone`
 
         warning: redundant clone
           --> src/lib.rs:26:6
@@ -318,7 +317,6 @@ fn copy(n: u32) -> u32 {
         26 |     s.to_string()
            |     ^
            = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#redundant_clone
-           = note: requested on the command line with `-W clippy::redundant-clone`
 
     "#]]
     .assert_eq(&lint(&fixture(main), &only("redundant_clone")));
@@ -353,7 +351,6 @@ fn f(rc: Rc<i32>, arc: Arc<u8>, weak: Weak<i32>) {
           |             ^^^^^^^^^^^ help: try: `Arc::<u8>::clone(&arc)`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#clone_on_ref_ptr
-          = note: requested on the command line with `-W clippy::clone-on-ref-ptr`
 
         warning: using `.clone()` on a ref-counted pointer
          --> src/lib.rs:6:13
@@ -362,7 +359,6 @@ fn f(rc: Rc<i32>, arc: Arc<u8>, weak: Weak<i32>) {
           |             ^^^^^^^^^^^^ help: try: `Weak::<i32>::clone(&weak)`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#clone_on_ref_ptr
-          = note: requested on the command line with `-W clippy::clone-on-ref-ptr`
 
     "#]]
     .assert_eq(&lint(&fixture(main), &only("clone_on_ref_ptr")));
@@ -395,7 +391,6 @@ fn f(s: String, v: Vec<u8>, r: &String) {
           |             ^^^^^^^^^^ help: consider using: `v.clone()`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#implicit_clone
-          = note: requested on the command line with `-W clippy::implicit-clone`
 
     "#]]
     .assert_eq(&lint(&fixture(main), &only("implicit_clone")));
@@ -437,7 +432,6 @@ fn g(s: &str) {
           |                 ^^^^^^^^^^^ help: use: `v`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#unnecessary_to_owned
-          = note: requested on the command line with `-W clippy::unnecessary-to-owned`
 
         warning: unnecessary use of `to_string`
          --> src/lib.rs:8:15
@@ -446,7 +440,6 @@ fn g(s: &str) {
           |               ^^^^^^^^^^^^^ help: use: `s`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#unnecessary_to_owned
-          = note: requested on the command line with `-W clippy::unnecessary-to-owned`
 
         warning: unnecessary use of `to_vec`
          --> src/lib.rs:9:13
@@ -455,7 +448,6 @@ fn g(s: &str) {
           |             ^^^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `bytes.iter().copied()`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#unnecessary_to_owned
-          = note: requested on the command line with `-W clippy::unnecessary-to-owned`
 
         warning: allocating a new `String` only to create a temporary `&str` from it
           --> src/lib.rs:11:20
@@ -464,7 +456,6 @@ fn g(s: &str) {
            |                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
            |
            = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#unnecessary_to_owned
-           = note: requested on the command line with `-W clippy::unnecessary-to-owned`
         help: convert from `&[u8]` to `&str` directly
            |
         11 -     let _: &str = &String::from_utf8(v.to_vec()).unwrap();
@@ -478,7 +469,6 @@ fn g(s: &str) {
            |             ^^^^^^^^^^^^^^^^^^^^^^^^ help: use: `s.split(',')`
            |
            = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#unnecessary_to_owned
-           = note: requested on the command line with `-W clippy::unnecessary-to-owned`
 
     "#]]
     .assert_eq(&lint(&fixture(main), &only("unnecessary_to_owned")));
@@ -573,7 +563,6 @@ fn f(s: &str, t: String) {
           |             ^^^^^^^^^^^^^^^ help: try: `"x".to_owned()`
           |
           = help: for further information visit https://rust-lang.github.io/rust-clippy/main/index.html#str_to_string
-          = note: requested on the command line with `-W clippy::str-to-string`
 
     "#]]
     .assert_eq(&lint(&fixture(main), &only("str_to_string")));

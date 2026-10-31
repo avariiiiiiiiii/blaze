@@ -51,7 +51,7 @@ LL +     consume(a.b);
 warning: 1 warning emitted
 
 "#;
-    assert_eq!(ui("unused_braces_borrow.rs", "2015", source), expected);
+    assert_eq!(crate::tests::items::ui_core("unused_braces_borrow.rs", "2015", "copy", source), expected);
 }
 
 /// A const argument needs its braces unless it is a literal written where it is.

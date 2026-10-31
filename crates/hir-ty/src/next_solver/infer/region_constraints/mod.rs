@@ -1076,7 +1076,8 @@ mod tests {
         let rows = [
             (var(0), var(1), VisibleForLeakCheck::Yes),
             (var(7), var(3), VisibleForLeakCheck::No),
-            (var(u32::MAX - 1), var(0), VisibleForLeakCheck::Unreachable),
+            // `RegionVid`'s largest index.
+            (var(0xFFFF_FF00), var(0), VisibleForLeakCheck::Unreachable),
         ];
         for (sub, sup, visible) in rows {
             constraints.push(Constraint::VarSubVar(sub, sup), visible);

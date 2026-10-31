@@ -15,7 +15,7 @@ use super::{decode, encode, encode_into};
 use crate::{
     ApiError, Applicability, Artifact, ArtifactKind, Basis, BuildScriptRan, Cached, Cargo,
     CrateType, Diagnostic, Edit, Edited, EditedItem, Envelope, FactRead, FetchVerb, How, Level,
-    LinkKind, Memory, Mismatch, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
+    LinkHow, LinkKind, Linked, Memory, Mismatch, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
     ServedCrate, ServedPart, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
     TestResult, Traced, Ub,
     UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
@@ -500,6 +500,14 @@ impl Gen {
                 },
                 found: self.wide(),
                 green: self.wide(),
+                links: self.many(depth, |g| Linked {
+                    how: match g.below(3) {
+                        0 => LinkHow::First,
+                        1 => LinkHow::Spliced,
+                        _ => LinkHow::Full { why: g.texts(depth) },
+                    },
+                    path: g.text(),
+                }),
                 reran: self.wide(),
                 served: self.many(depth, |g| ServedCrate {
                     why: g.maybe(Gen::text),

@@ -1,8 +1,8 @@
 //! The model and pages of a fixture workspace with every item kind, re-exports, intra-doc links
 //! (one unresolved), a dependency and a proc macro.
 
-use hir::Crate;
 use base_db::Db;
+use hir::Crate;
 use hir_expand::fixture;
 
 use crate::{
@@ -279,7 +279,12 @@ fn load() -> (Db, Model) {
 
 /// The fixture documented; `dep_for_tests` makes `dep` a dependency of its tests alone.
 fn load_with(no_deps: bool, dep_for_tests: bool) -> (Db, Model) {
-    let mut db = fixture::db(FIXTURE).into_db();
+    load_text(FIXTURE, no_deps, dep_for_tests)
+}
+
+/// `text` documented: a fixture with crates `fixture` and `dep`.
+fn load_text(text: &str, no_deps: bool, dep_for_tests: bool) -> (Db, Model) {
+    let mut db = fixture::db(text).into_db();
     let named = |name: &str| {
         Crate::all(&db).into_iter().find(|it| crate::crate_name(&db, *it) == name).expect(name)
     };
@@ -403,6 +408,30 @@ fn aliases_show_the_type_they_stand_for() {
 }
 
 #[test]
+fn unsafe_binders_show_their_lifetimes_as_rustdoc_does() {
+    let (_db, model) = load_text(
+        r#"
+//- /lib.rs crate:fixture deps:dep
+pub type Bound = unsafe<'a, 'b> &'a &'b u8;
+pub type Unbound = unsafe<> u8;
+//- /dep.rs crate:dep
+"#,
+        false,
+        false,
+    );
+    let fixture = krate(&model, "fixture");
+    assert_eq!(
+        item(fixture, "fixture::Bound").decl.plain(),
+        "pub type Bound = unsafe<'a, 'b> &'a &'b u8;"
+    );
+    assert_eq!(
+        item(fixture, "fixture::Unbound").decl.plain(),
+        "pub type Unbound = u8;",
+        "no lifetimes, no `unsafe<>`"
+    );
+}
+
+#[test]
 fn signatures_come_from_the_hir() {
     let (_db, model) = load();
     let fixture = krate(&model, "fixture");
@@ -428,7 +457,12 @@ fn signatures_come_from_the_hir() {
     assert!(shape.starts_with("pub trait Shape: Clone {"), "{shape}");
     assert!(shape.contains("fn area(&self) -> u32;"), "{shape}");
     assert!(shape.contains("fn name(&self) -> &'static str { ... }"), "{shape}");
-    for group in ["// Required associated type", "// Associated constant", "// Required method", "// Provided method"] {
+    for group in [
+        "// Required associated type",
+        "// Associated constant",
+        "// Required method",
+        "// Provided method",
+    ] {
         assert!(shape.contains(&format!("{group}\n")), "{group}: {shape}");
     }
     assert!(!shape.contains("// Provided associated type"), "{shape}");
@@ -622,8 +656,16 @@ fn writes_pages_sources_and_search() {
     );
     assert!(thing.contains("https://doc.rust-lang.org/nightly/core/option/enum.Option.html"));
     let shape = std::fs::read_to_string(out.join("fixture/trait.Shape.html")).unwrap();
-    for id in ["required-associated-types", "associated-constants", "required-methods", "provided-methods"] {
-        assert!(shape.contains(&format!("<h2 id=\"{id}\" class=\"section-header\">")), "{id} section");
+    for id in [
+        "required-associated-types",
+        "associated-constants",
+        "required-methods",
+        "provided-methods",
+    ] {
+        assert!(
+            shape.contains(&format!("<h2 id=\"{id}\" class=\"section-header\">")),
+            "{id} section"
+        );
     }
     assert!(!shape.contains("id=\"provided-associated-types\""), "no provided associated type");
     let index = text(&std::fs::read_to_string(out.join("fixture/index.html")).unwrap());
@@ -710,7 +752,10 @@ fn deref_methods_follow_the_chain() {
         .iter()
         .map(|it| (it.target.plain(), it.members.iter().map(|m| m.name.as_str()).collect()))
         .collect();
-    assert_eq!(sections, [("Chain".to_owned(), vec!["read"]), ("[u8]".to_owned(), vec!["len"])]);
+    assert_eq!(
+        sections,
+        [("Chain".to_owned(), vec!["read"]), ("[u8]".to_owned(), vec!["len", "iter"])]
+    );
     assert_eq!(bytes.impls.deref[1].anchor, "deref-methods-%5Bu8%5D");
 }
 

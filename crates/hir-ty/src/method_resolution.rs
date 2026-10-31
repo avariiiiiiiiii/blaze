@@ -100,6 +100,20 @@ pub struct MethodResolutionContext<'a, 'db> {
     /// The frame the probe's temporaries live in: the inference run's, or the task a caller
     /// outside inference opened.
     pub frame: &'a Frame,
+    /// Where the probe puts the errors rustc reports as it probes, for inference to report;
+    /// `None` silences them, as rustc's `is_suggestion` probes are.
+    pub errors: Option<&'a ProbeErrors<'db>>,
+}
+
+/// The errors a method probe finds that rustc reports from the probe itself.
+#[derive(Default)]
+pub struct ProbeErrors<'db> {
+    /// E0055: the receiver's autoderef went past the crate's recursion limit at this type
+    /// (resolved, its variables made errors).
+    pub(crate) recursion_limit: std::cell::Cell<Option<Ty<'db>>>,
+    /// E0282: the receiver's autoderef ended at this type variable, with whether it went
+    /// through a raw pointer to reach it.
+    pub(crate) unknown_receiver: std::cell::Cell<Option<(Ty<'db>, bool)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
@@ -256,6 +270,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         receiver_span: Span,
         f: impl FnOnce(&MethodResolutionContext<'_, 'db>) -> R,
     ) -> R {
+        let errors = ProbeErrors::default();
         let ctx = MethodResolutionContext {
             infcx: &self.table.infer_ctxt,
             resolver: &self.resolver,
@@ -266,8 +281,16 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             call_span,
             receiver_span,
             frame: self.frame,
+            errors: Some(&errors),
         };
-        f(&ctx)
+        let result = f(&ctx);
+        if let Some(ty) = errors.recursion_limit.take() {
+            self.table.recursion_limit_errors.report(&self.table.infer_ctxt, call_span, ty);
+        }
+        if let Some((ty, raw_pointer)) = errors.unknown_receiver.take() {
+            self.report_unknown_receiver(call_span, ty, raw_pointer);
+        }
+        result
     }
 }
 

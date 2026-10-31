@@ -1,0 +1,23 @@
+{
+  "id": "01198",
+  "from_lane": "tests-misc-front1",
+  "owner": "format",
+  "paths": [
+    "crates/hir-def/src/expr_store/persist.rs"
+  ],
+  "what": "hir-def expr_store/persist.rs put_lifetime writes LifetimeRef::Named's name even under names_blank(), so renaming a lifetime parameter changes a body's identity (blaze-item-hash anon::renaming_a_generic_or_a_lifetime_keeps_the_identity, 'a vs 'b). Write w.str(\"\") for Named when names_blank(), as put_binding/put_label do. blaze-item-hash names.rs now hashes each named lifetime by its resolution (param by owner+index, 'static, else its text), so blanking is safe once that lands.",
+  "state": "open",
+  "created": "2026-10-31T00:51:36Z",
+  "updated": "2026-10-31T00:51:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:51:36Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

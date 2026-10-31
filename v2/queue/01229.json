@@ -1,0 +1,23 @@
+{
+  "id": "01229",
+  "from_lane": "item-hash-facts",
+  "owner": "items",
+  "paths": [
+    "crates/blaze-items/src/form.rs"
+  ],
+  "what": "AutoTraits fact value (form.rs auto_traits_form) hashes the hidden type itself (self.ty_in(&mut f, hidden)) besides each auto trait`s answer, so `fn f() -> impl Sized { 1u8 }` to `{ 1u16 }` changes it although Send/Sync hold the same. blaze-item-hash test tests::classify::items_facts_change_through_value (round3d) expects it unchanged: the fact is what a reader of the opaque`s auto traits depends on, the answers. Please drop the hidden type from the form (keep the trait list and the bools), or tell me if it is needed and I change the test.",
+  "state": "open",
+  "created": "2026-10-31T02:13:42Z",
+  "updated": "2026-10-31T02:13:42Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:13:42Z",
+      "by": "item-hash-facts",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

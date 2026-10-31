@@ -54,7 +54,7 @@ use tracing::debug;
 
 use crate::{
     Adjust, Adjustment, AutoBorrow, ParamEnvAndCrate, PointerCast, Span, TargetFeatures,
-    autoderef::Autoderef,
+    autoderef::{Autoderef, RecursionLimitErrors},
     db::{HirDatabase, InternedClosure, InternedClosureId},
     infer::{AllowTwoPhase, AutoBorrowMutability, InferenceContext, expr::ExprIsRead},
     next_solver::{
@@ -89,6 +89,9 @@ trait CoerceDelegate<'db> {
 
     /// The body's record of failed unsizing coercions; none outside a body.
     fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>>;
+
+    /// Where an autoderef walk past the recursion limit is reported; none outside a body.
+    fn recursion_limit_errors(&self) -> Option<&RecursionLimitErrors<'db>>;
 }
 
 struct Coerce<'f, D> {
@@ -305,6 +308,9 @@ where
         let mut r_borrow_var = None;
         let mut autoderef =
             Autoderef::new_with_tracking(self.infcx(), self.param_env(), a, self.cause.span());
+        if let Some(errors) = self.delegate.recursion_limit_errors() {
+            autoderef = autoderef.reporting_to(errors);
+        }
         let mut found = None;
 
         for (referent_ty, autoderefs) in autoderef.by_ref() {
@@ -759,6 +765,11 @@ impl<'db> CoerceDelegate<'db> for InferenceCoercionDelegate<'_, 'db, '_> {
     #[inline]
     fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>> {
         Some(&mut self.0.unsize_memo)
+    }
+
+    #[inline]
+    fn recursion_limit_errors(&self) -> Option<&RecursionLimitErrors<'db>> {
+        Some(&self.0.table.recursion_limit_errors)
     }
 }
 
@@ -1394,6 +1405,9 @@ impl<'db> CoerceDelegate<'db> for HirCoercionDelegate<'_, 'db> {
     fn set_diverging(&mut self, _diverging_ty: Ty<'db>) {}
     fn type_var_is_sized(&self, _var: TyVid) -> bool {
         false
+    }
+    fn recursion_limit_errors(&self) -> Option<&RecursionLimitErrors<'db>> {
+        None
     }
     fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>> {
         None

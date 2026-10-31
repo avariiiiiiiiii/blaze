@@ -10,8 +10,16 @@ use crate::{cx::Cx, model::Diag};
 
 pub(crate) mod parse;
 
+pub(crate) mod additional_non_auto_traits;
+pub(crate) mod ambiguous_assoc_type;
 pub(crate) mod ambiguous_associated_item;
+pub(crate) mod assoc_type_not_resolved;
 pub(crate) mod bad_rtn;
+pub(crate) mod conflicting_assoc_type_bindings;
+pub(crate) mod impl_trait_not_allowed;
+pub(crate) mod missing_self_default_params;
+pub(crate) mod not_a_struct_path;
+pub(crate) mod object_without_trait;
 pub(crate) mod const_param_ty_not_allowed;
 pub(crate) mod elided_lifetimes_in_path;
 pub(crate) mod generic_args_prohibited;
@@ -19,15 +27,18 @@ pub(crate) mod generic_default_refers_to_self;
 pub(crate) mod incoherent_impl;
 pub(crate) mod incorrect_case;
 pub(crate) mod incorrect_generics_len;
+pub(crate) mod invalid_const_arg;
 pub(crate) mod incorrect_generics_order;
 pub(crate) mod infer_vars_not_allowed;
 pub(crate) mod invalid_derive_target;
+pub(crate) mod invalid_visibility;
 pub(crate) mod late_bound_lifetime_args;
 pub(crate) mod macro_def_error;
 pub(crate) mod macro_error;
 pub(crate) mod macro_expansion_parse_error;
 pub(crate) mod malformed_derive;
 pub(crate) mod missing_body;
+pub(crate) mod missing_prelude;
 pub(crate) mod missing_lifetime;
 pub(crate) mod missing_lifetimes;
 pub(crate) mod parenthesized_generic_args_without_fn_trait;
@@ -184,6 +195,17 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::IncorrectGenericsOrder(d) => incorrect_generics_order::lower(cx, &d),
         AnyDiagnostic::InferVarsNotAllowed(d) => infer_vars_not_allowed::lower(cx, &d),
         AnyDiagnostic::InvalidDeriveTarget(d) => invalid_derive_target::lower(cx, &d),
+        AnyDiagnostic::InvalidVisibility(d) => invalid_visibility::lower(cx, &d),
+        AnyDiagnostic::InvalidConstArg(d) => invalid_const_arg::lower(cx, &d),
+        AnyDiagnostic::MissingPrelude(d) => missing_prelude::lower(cx, &d),
+        AnyDiagnostic::AdditionalNonAutoTraits(d) => additional_non_auto_traits::lower(cx, &d),
+        AnyDiagnostic::AmbiguousAssocType(d) => ambiguous_assoc_type::lower(cx, &d),
+        AnyDiagnostic::AssocTypeNotResolved(d) => assoc_type_not_resolved::lower(cx, &d),
+        AnyDiagnostic::ConflictingAssocTypeBindings(d) => conflicting_assoc_type_bindings::lower(cx, &d),
+        AnyDiagnostic::ImplTraitNotAllowed(d) => impl_trait_not_allowed::lower(cx, &d),
+        AnyDiagnostic::MissingSelfDefaultParams(d) => missing_self_default_params::lower(cx, &d),
+        AnyDiagnostic::ObjectWithoutTrait(d) => object_without_trait::lower(cx, &d),
+        AnyDiagnostic::NotAStructPath(d) => not_a_struct_path::lower(cx, &d),
         AnyDiagnostic::LateBoundLifetimeArgs(d) => late_bound_lifetime_args::lower(cx, &d),
         AnyDiagnostic::MacroDefError(d) => macro_def_error::lower(cx, &d),
         AnyDiagnostic::MacroError(d) => macro_error::lower(cx, &d),

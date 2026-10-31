@@ -111,29 +111,60 @@ pub(crate) struct Segment {
     holds: AtomicI64,
     /// Its lane opened another: no more is copied in.
     sealed: AtomicBool,
+    /// The segment its [`Segments`] made before it: their list, read and written only under
+    /// [`Segments::all`]'s lock.
+    next: UnsafeCell<*mut Segment>,
 }
+
+/// A segment is one allocation: this header, then its bytes at [`SEGMENT_ALIGN`].
+const HEADER: usize = size_of::<Segment>().next_multiple_of(SEGMENT_ALIGN);
+const _: () = assert!(align_of::<Segment>() <= SEGMENT_ALIGN);
 
 /// Added to an open segment's hold count, so it reads as held whatever its lane has copied
 /// in; far above any count of real holds.
 const OPEN: i64 = 1 << 48;
 
 impl Segment {
-    fn new(cap: usize, holds: i64, sealed: bool) -> Box<Segment> {
-        assert!(cap > 0);
-        let layout = Layout::from_size_align(cap, SEGMENT_ALIGN).expect("a segment's layout");
-        // SAFETY: `layout` has a nonzero size.
-        let base = unsafe { alloc::alloc(layout) };
-        let base = NonNull::new(base).unwrap_or_else(|| alloc::handle_alloc_error(layout));
-        // alloc: one header a segment (16 KiB to 4 MiB of copies), freed with it.
-        Box::new(Segment { base, cap, holds: AtomicI64::new(holds), sealed: AtomicBool::new(sealed) })
+    fn layout(cap: usize) -> Layout {
+        Layout::from_size_align(HEADER + cap, SEGMENT_ALIGN).expect("a segment's layout")
     }
-}
 
-impl Drop for Segment {
-    fn drop(&mut self) {
-        freed_bytes(self.base.as_ptr(), self.cap);
-        // SAFETY: allocated in `Segment::new` with this size and alignment, freed once here.
-        unsafe { alloc::dealloc(self.base.as_ptr(), Layout::from_size_align_unchecked(self.cap, SEGMENT_ALIGN)) };
+    /// A segment of `cap` bytes, its header in the same allocation.
+    fn new(cap: usize, holds: i64, sealed: bool) -> NonNull<Segment> {
+        assert!(cap > 0);
+        let layout = Segment::layout(cap);
+        // SAFETY: `layout` has a nonzero size.
+        let raw = unsafe { alloc::alloc(layout) };
+        let raw = NonNull::new(raw).unwrap_or_else(|| alloc::handle_alloc_error(layout));
+        // SAFETY: `HEADER + cap` bytes were allocated, so `HEADER` is inside them.
+        let base = unsafe { raw.add(HEADER) };
+        let segment = raw.cast::<Segment>();
+        let header = Segment {
+            base,
+            cap,
+            holds: AtomicI64::new(holds),
+            sealed: AtomicBool::new(sealed),
+            next: UnsafeCell::new(ptr::null_mut()),
+        };
+        // SAFETY: `raw` is aligned to `SEGMENT_ALIGN`, at least `Segment`'s alignment, and its
+        // first `HEADER` bytes (at least a `Segment`) are this header's alone.
+        unsafe { segment.write(header) };
+        segment
+    }
+
+    /// # Safety
+    ///
+    /// `segment` was made by [`Segment::new`] and is freed once: no span, row or list names it.
+    unsafe fn free(segment: NonNull<Segment>) {
+        // SAFETY: the caller's: made by `Segment::new` and not freed yet.
+        let (base, cap) = unsafe { (segment.as_ref().base, segment.as_ref().cap) };
+        freed_bytes(base.as_ptr(), cap);
+        // SAFETY: as above; the header is dropped once, then its allocation, of the layout it
+        // was made with, is freed.
+        unsafe {
+            ptr::drop_in_place(segment.as_ptr());
+            alloc::dealloc(segment.as_ptr().cast(), Segment::layout(cap));
+        }
     }
 }
 
@@ -253,11 +284,23 @@ impl Default for OpenCell {
 /// `memcpy` and an add to a lane-local count; no atomic read-modify-write.
 pub(crate) struct Segments {
     lanes: Lanes<OpenCell>,
-    /// Every segment made, from `Box::into_raw`, for [`Segments::sweep`] and drop.
-    all: ShortLock<Vec<NonNull<Segment>>>,
+    /// Every segment made and not freed, for [`Segments::sweep`] and drop.
+    all: ShortLock<All>,
     first: usize,
     max: usize,
     align: usize,
+}
+
+/// A [`Segments`]' segments, the newest first, linked through their headers' `next`: making
+/// one allocates nothing past the segment.
+struct All {
+    head: *mut Segment,
+}
+
+impl Default for All {
+    fn default() -> All {
+        All { head: ptr::null_mut() }
+    }
 }
 
 // SAFETY: a lane's `Open` is read and written only by the thread holding that lane (`lane()`),
@@ -273,8 +316,11 @@ impl Segments {
     }
 
     fn make(&self, cap: usize, holds: i64, sealed: bool) -> *mut Segment {
-        let segment = Box::into_raw(Segment::new(cap, holds, sealed));
-        self.all.lock().push(NonNull::new(segment).expect("a box"));
+        let segment = Segment::new(cap, holds, sealed).as_ptr();
+        let mut all = self.all.lock();
+        // SAFETY: just made, so no other thread reaches it; `next` is written under the lock.
+        unsafe { *(*segment).next.get() = all.head };
+        all.head = segment;
         segment
     }
 
@@ -334,32 +380,55 @@ impl Segments {
 
     /// Frees each segment that is sealed and holds nothing.
     pub(crate) fn sweep(&self) {
-        self.all.lock().retain(|segment| {
-            // SAFETY: in `all`, so not freed yet.
+        let mut guard = self.all.lock();
+        let all: &mut All = &mut guard;
+        let mut link: *mut *mut Segment = &raw mut all.head;
+        // SAFETY: `link` is the list's head or the `next` of a segment in it, both owned by
+        // `all`'s lock, which this holds; a segment in the list is not freed yet.
+        while let Some(segment) = NonNull::new(unsafe { *link }) {
+            // SAFETY: in the list, so not freed yet.
             let it = unsafe { segment.as_ref() };
+            let next = it.next.get();
             // Acquire: the sealing lane's copies and every releaser's reads happen before.
             let empty = it.sealed.load(Ordering::Acquire) && it.holds.load(Ordering::Acquire) == 0;
             if empty {
-                // SAFETY: sealed, so no lane copies in; no hold, so no span or row names it,
-                // and none can be made (a hold is shared only from a hold).
-                drop(unsafe { Box::from_raw(segment.as_ptr()) });
+                // SAFETY: unlinked under the lock before it is freed. Sealed, so no lane
+                // copies in; no hold, so no span or row names it, and none can be made (a hold
+                // is shared only from a hold).
+                unsafe {
+                    *link = *next;
+                    Segment::free(segment);
+                }
+            } else {
+                link = next;
             }
-            !empty
-        });
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn count(&self) -> usize {
-        self.all.lock().len()
+        let all = self.all.lock();
+        let mut count = 0;
+        let mut at = all.head;
+        while let Some(segment) = NonNull::new(at) {
+            count += 1;
+            // SAFETY: in the list, which the lock held here keeps from changing.
+            at = unsafe { *segment.as_ref().next.get() };
+        }
+        count
     }
 }
 
 impl Drop for Segments {
     fn drop(&mut self) {
-        for segment in self.all.get_mut().drain(..) {
-            // SAFETY: from `Box::into_raw`, freed once; `&mut` excludes every reader, and the
-            // database drops what holds spans before its segments.
-            drop(unsafe { Box::from_raw(segment.as_ptr()) });
+        let mut at = self.all.get_mut().head;
+        while let Some(segment) = NonNull::new(at) {
+            // SAFETY: in the list, each freed once, after its `next` is read; `&mut` excludes
+            // every reader, and the database drops what holds spans before its segments.
+            unsafe {
+                at = *segment.as_ref().next.get();
+                Segment::free(segment);
+            }
         }
     }
 }

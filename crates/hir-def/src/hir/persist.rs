@@ -251,11 +251,13 @@ thread_local! {
 /// for each path of the store (by its index in the store's paths) its first `blank[i]`
 /// segments, whose meaning the caller hashes as what they resolve to. A path past `blank` is
 /// written whole. Each literal expression of `slots` (raw expression ids, sorted) is written as
-/// a slot: its kind and type, not its value.
+/// a slot: its kind and type, not its value. A named lifetime that is one of `lifetimes` (the
+/// owner's lifetime parameters, its impl's or trait's first) is written as its index there.
 #[derive(Default)]
 pub(crate) struct Anonymous {
     pub(crate) blank: Vec<u16>,
     pub(crate) slots: Vec<u32>,
+    pub(crate) lifetimes: Vec<Name>,
 }
 
 /// Runs `f` with what [`Words`] writes anonymous as `it` says. Scopes do not nest. Only a
@@ -273,6 +275,16 @@ pub(crate) fn names_blank() -> bool {
 pub(crate) fn blank_segments(at: usize) -> usize {
     ANONYMOUS.with(|slot| {
         slot.borrow().as_ref().map_or(0, |it| it.blank.get(at).map_or(0, |&n| usize::from(n)))
+    })
+}
+
+/// The index of the lifetime `name` among the [`Anonymous::lifetimes`] of the scope this thread
+/// is in: `None` outside one, or for a name none of them has.
+pub(crate) fn lifetime_index(name: &Name) -> Option<u32> {
+    ANONYMOUS.with(|slot| {
+        let slot = slot.borrow();
+        let at = slot.as_ref()?.lifetimes.iter().rposition(|it| it == name)?;
+        Some(u32::try_from(at).expect("more than 2^32 lifetime parameters"))
     })
 }
 

@@ -134,7 +134,8 @@ fn inference_records_the_type_it_gives_a_placeholder() {
 #[test]
 fn an_inference_context_gives_a_variable_of_each_kind() {
     let fixture = Fixture::new();
-    let interner = DbInterner::new_no_crate(&fixture.db);
+    let krate = hir_def::HasModule::module(&fixture.function, &fixture.db).krate(&fixture.db);
+    let interner = DbInterner::new_with(&fixture.db, krate);
     let infcx: InferCtxt<'_> = interner.infer_ctxt().build(TypingMode::non_body_analysis());
     let (resolver, generics) = (fixture.resolver(), OnceCell::new());
     let (ty, diagnostics) = frame::task(Tag::Infer, |frame| {

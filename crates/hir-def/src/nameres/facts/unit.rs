@@ -47,7 +47,7 @@ use crate::{
         uses,
     },
     per_ns::{Item, PerNs},
-    visibility::{RawVisibility, Visibility, VisibilityError},
+    visibility::{RawVisibility, Visibility, VisibilityError, visibility_path},
 };
 
 use self::imports::{
@@ -768,6 +768,7 @@ impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
         let vis = match visibility {
             RawVisibility::Module(path, explicitness) => {
                 let Unit { def_map, local, state, check, .. } = self;
+                let path = &visibility_path(path, def_map.data.edition)?;
                 let upstream = &mut state.upstream;
                 let (krate, block) = (def_map.krate, def_map.block_id());
                 let mut reads = |read: PathRead| {

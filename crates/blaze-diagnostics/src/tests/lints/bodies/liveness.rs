@@ -411,7 +411,7 @@ LL |         Foo { foo, .. } => {
 warning: 3 warnings emitted
 
 "#;
-    assert_eq!(ui_run_pass("try-removing-the-field.rs", "2015", source, &Options::default()), stderr);
+    assert_eq!(crate::tests::ui_core_as(Mode::RunPass, "try-removing-the-field.rs", "2015", "copy", source, &Options::default()), stderr);
 }
 
 #[test]

@@ -23,7 +23,7 @@ use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
 use intern::sym;
 use la_arena::{Idx, RawIdx};
 use rustc_hash::FxBuildHasher;
-use blaze_query::db::{AsId, FromId};
+use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 use span::Edition;
 use stdx::{format_to, impl_from};
@@ -314,17 +314,17 @@ impl Iterator for Probe<'_> {
     }
 }
 
-/// One name of one namespace and its [`Item`], packed as tags and ids. Every field the
+/// One name of one namespace and its [`Item`], packed as tags and salsa ids. Every field the
 /// item does not use is `None` or 0, so two entries are equal exactly when their items are.
-/// 24 bytes (an `IndexMap` bucket of a `TypesItem` is 48: its hash, the name and 32 bytes of
+/// 40 bytes (an `IndexMap` bucket of a `TypesItem` is 60: its hash, the name and 44 bytes of
 /// item); reading the item back is a `match` on each tag.
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 struct Entry {
     name: Name,
-    def: Option<blaze_query::db::Id>,
-    vis: Option<blaze_query::db::Id>,
-    import: Option<blaze_query::db::Id>,
+    def: Option<salsa::Id>,
+    vis: Option<salsa::Id>,
+    import: Option<salsa::Id>,
     /// The use tree of a glob or an import.
     tree: u32,
     def_tag: u8,
@@ -332,8 +332,8 @@ struct Entry {
     import_tag: u8,
 }
 
-const _: () = assert!(size_of::<Option<blaze_query::db::Id>>() == 4);
-const _: () = assert!(size_of::<Entry>() == 24);
+const _: () = assert!(size_of::<Option<salsa::Id>>() == 8);
+const _: () = assert!(size_of::<Entry>() == 36);
 
 const DEF_MODULE: u8 = 0;
 const DEF_FUNCTION: u8 = 1;
@@ -386,24 +386,24 @@ fn builtin_index(ty: BuiltinType) -> u8 {
 }
 
 #[inline]
-fn raw(it: impl AsId) -> Option<blaze_query::db::Id> {
+fn raw(it: impl AsId) -> Option<salsa::Id> {
     Some(it.as_id())
 }
 
 #[inline]
-fn typed<T: FromId>(id: blaze_query::db::Id) -> T {
+fn typed<T: FromId>(id: salsa::Id) -> T {
     T::from_id(id)
 }
 
-/// What an entry's definition is: a tag and, but for a builtin type, an id.
+/// What an entry's definition is: a tag and, but for a builtin type, a salsa id.
 pub(crate) trait PackedDef: Copy + PartialEq {
-    fn pack(self) -> (u8, Option<blaze_query::db::Id>);
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>) -> Self;
+    fn pack(self) -> (u8, Option<salsa::Id>);
+    fn unpack(tag: u8, id: Option<salsa::Id>) -> Self;
 }
 
 impl PackedDef for MacroId {
     #[inline]
-    fn pack(self) -> (u8, Option<blaze_query::db::Id>) {
+    fn pack(self) -> (u8, Option<salsa::Id>) {
         match self {
             MacroId::Macro2Id(it) => (DEF_MACRO2, raw(it)),
             MacroId::MacroRulesId(it) => (DEF_MACRO_RULES, raw(it)),
@@ -412,7 +412,7 @@ impl PackedDef for MacroId {
     }
 
     #[inline]
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>) -> Self {
+    fn unpack(tag: u8, id: Option<salsa::Id>) -> Self {
         match (tag, id) {
             (DEF_MACRO2, Some(id)) => MacroId::Macro2Id(typed(id)),
             (DEF_MACRO_RULES, Some(id)) => MacroId::MacroRulesId(typed(id)),
@@ -424,7 +424,7 @@ impl PackedDef for MacroId {
 
 impl PackedDef for ModuleDefId {
     #[inline]
-    fn pack(self) -> (u8, Option<blaze_query::db::Id>) {
+    fn pack(self) -> (u8, Option<salsa::Id>) {
         match self {
             ModuleDefId::ModuleId(it) => (DEF_MODULE, raw(it)),
             ModuleDefId::FunctionId(it) => (DEF_FUNCTION, raw(it)),
@@ -442,7 +442,7 @@ impl PackedDef for ModuleDefId {
     }
 
     #[inline]
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>) -> Self {
+    fn unpack(tag: u8, id: Option<salsa::Id>) -> Self {
         let Some(id) = id else {
             return ModuleDefId::BuiltinType(BUILTIN_TYPES[usize::from(tag - DEF_BUILTIN)]);
         };
@@ -471,7 +471,7 @@ const VIS_CRATE: u8 = 2;
 const VIS_PUBLIC: u8 = 3;
 
 #[inline]
-fn pack_vis(vis: Visibility) -> (u8, Option<blaze_query::db::Id>) {
+fn pack_vis(vis: Visibility) -> (u8, Option<salsa::Id>) {
     match vis {
         Visibility::Module(it, VisibilityExplicitness::Explicit) => (VIS_EXPLICIT, raw(it)),
         Visibility::Module(it, VisibilityExplicitness::Implicit) => (VIS_IMPLICIT, raw(it)),
@@ -481,7 +481,7 @@ fn pack_vis(vis: Visibility) -> (u8, Option<blaze_query::db::Id>) {
 }
 
 #[inline]
-fn unpack_vis(tag: u8, id: Option<blaze_query::db::Id>) -> Visibility {
+fn unpack_vis(tag: u8, id: Option<salsa::Id>) -> Visibility {
     match (tag, id) {
         (VIS_EXPLICIT, Some(id)) => Visibility::Module(typed(id), VisibilityExplicitness::Explicit),
         (VIS_IMPLICIT, Some(id)) => Visibility::Module(typed(id), VisibilityExplicitness::Implicit),
@@ -506,15 +506,15 @@ fn tree_at(raw: u32) -> Idx<ast::UseTree> {
     Idx::from_raw(RawIdx::from_u32(raw))
 }
 
-/// What an entry was imported by: a tag, an id and a use tree.
+/// What an entry was imported by: a tag, a salsa id and a use tree.
 pub(crate) trait PackedImport: Copy + PartialEq {
-    fn pack(import: Option<Self>) -> (u8, Option<blaze_query::db::Id>, u32);
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>, tree: u32) -> Option<Self>;
+    fn pack(import: Option<Self>) -> (u8, Option<salsa::Id>, u32);
+    fn unpack(tag: u8, id: Option<salsa::Id>, tree: u32) -> Option<Self>;
 }
 
 impl PackedImport for ImportOrExternCrate {
     #[inline]
-    fn pack(import: Option<Self>) -> (u8, Option<blaze_query::db::Id>, u32) {
+    fn pack(import: Option<Self>) -> (u8, Option<salsa::Id>, u32) {
         match import {
             None => (IMPORT_NONE, None, 0),
             Some(ImportOrExternCrate::Glob(GlobId { use_, idx })) => {
@@ -528,7 +528,7 @@ impl PackedImport for ImportOrExternCrate {
     }
 
     #[inline]
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>, tree: u32) -> Option<Self> {
+    fn unpack(tag: u8, id: Option<salsa::Id>, tree: u32) -> Option<Self> {
         let id = id?;
         Some(match tag {
             IMPORT_GLOB => ImportOrExternCrate::Glob(GlobId { use_: typed(id), idx: tree_at(tree) }),
@@ -543,7 +543,7 @@ impl PackedImport for ImportOrExternCrate {
 
 impl PackedImport for ImportOrGlob {
     #[inline]
-    fn pack(import: Option<Self>) -> (u8, Option<blaze_query::db::Id>, u32) {
+    fn pack(import: Option<Self>) -> (u8, Option<salsa::Id>, u32) {
         match import {
             None => (IMPORT_NONE, None, 0),
             Some(ImportOrGlob::Glob(GlobId { use_, idx })) => {
@@ -556,7 +556,7 @@ impl PackedImport for ImportOrGlob {
     }
 
     #[inline]
-    fn unpack(tag: u8, id: Option<blaze_query::db::Id>, tree: u32) -> Option<Self> {
+    fn unpack(tag: u8, id: Option<salsa::Id>, tree: u32) -> Option<Self> {
         let id = id?;
         Some(match tag {
             IMPORT_GLOB => ImportOrGlob::Glob(GlobId { use_: typed(id), idx: tree_at(tree) }),
@@ -598,7 +598,7 @@ impl Entry {
     }
 
     #[inline]
-    fn is_def(&self, (tag, id): (u8, Option<blaze_query::db::Id>)) -> bool {
+    fn is_def(&self, (tag, id): (u8, Option<salsa::Id>)) -> bool {
         self.def_tag == tag && self.def == id
     }
 
@@ -838,7 +838,7 @@ pub(crate) type ListBits = Bits<ThinVec<u64>>;
 ///
 /// Two scopes are equal when their namespaces hold the same entries in the same order (the
 /// order [`ItemScope::types`] and the others show, so a scope that kept another's order when
-/// the query database backdated it would list differently) and the rest the same, `unresolved` and the maps
+/// salsa backdated it would list differently) and the rest the same, `unresolved` and the maps
 /// in any order. The index and `sorted` are derived and not compared.
 #[derive(Debug, Default, Clone)]
 pub struct ItemScope {
@@ -2346,10 +2346,9 @@ mod tests {
         per_ns::{MacrosItem, Namespace, ValuesItem},
     };
 
-    /// An id of no database: the scope only packs and compares it.
+    /// A salsa id of no database: the scope only packs and compares it.
     fn id<T: FromId>(n: u64) -> T {
-        let n = u32::try_from(n).expect("a test id below 2^32");
-        T::from_id(blaze_query::db::Id::from_u32((n % 7 + 1) + ((n / 7) << 20)))
+        T::from_id(salsa::Id::from_bits((n % 7 + 1) | (n / 7) << 32))
     }
 
     fn names() -> Vec<Name> {
@@ -2854,17 +2853,17 @@ mod tests {
         }
     }
 
-    /// The sizes the notes give (`docs/v2/plan/lanes/db/speed-hir-nameres-scope.md`), with
-    /// ids of 4 bytes (`blaze_query::db::Id`).
+    /// The sizes the notes give (`docs/v2/plan/lanes/db/speed-hir-nameres-scope.md`). Ids are
+    /// 8 bytes (salsa's index and generation).
     #[test]
     fn sizes() {
-        assert_eq!(size_of::<Entry>(), 24);
+        assert_eq!(size_of::<Entry>(), 36);
         assert_eq!(size_of::<Index>(), 8);
-        assert_eq!(size_of::<Visibility>(), 8);
-        assert_eq!(size_of::<ModuleDefId>(), 12);
-        assert_eq!(size_of::<TypesItem>(), 32);
-        assert_eq!(size_of::<ValuesItem>(), 32);
-        assert_eq!(size_of::<MacrosItem>(), 28);
-        assert_eq!(size_of::<PerNs>(), 92);
+        assert_eq!(size_of::<Visibility>(), 12);
+        assert_eq!(size_of::<ModuleDefId>(), 16);
+        assert_eq!(size_of::<TypesItem>(), 44);
+        assert_eq!(size_of::<ValuesItem>(), 44);
+        assert_eq!(size_of::<MacrosItem>(), 40);
+        assert_eq!(size_of::<PerNs>(), 128);
     }
 }

@@ -9,7 +9,7 @@ use hir_expand::{
     ErasedAstId, ExpandErrorKind, MacroCallId, MacroCallKind,
     attrs::AttrId,
     mod_path::{ModPath, PathKind},
-    name::AsName as _,
+    name::{AsName as _, Name},
 };
 use la_arena::Idx;
 use syntax::{ast, view::HasName as _};
@@ -49,6 +49,20 @@ pub enum DefDiagnosticKind {
     /// A `use` of a trait's associated items (`use Trait::item`, `use Trait::*`) that rustc's
     /// `finalize_imports` reports, or that blaze cannot list.
     TraitItemImport { id: AstId<ast::Use>, index: Idx<ast::UseTree>, why: TraitItemImport },
+    /// What the crate's injected `extern crate std;` (`core` under `#![no_std]`) and `use
+    /// std::prelude::rust_20xx::*;` need and the crate graph does not give: the crate has no
+    /// prelude then.
+    Prelude { krate: Name, error: PreludeError },
+}
+
+/// Why a [`DefDiagnosticKind::Prelude`] is reported, as rustc reports the items
+/// `rustc_builtin_macros::standard_library_imports` injects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PreludeError {
+    /// No dependency has the name (rustc's E0463, "can't find crate for `std`").
+    CrateNotFound,
+    /// The crate has no `prelude::rust_20xx` module (rustc's E0433 on the injected `use`).
+    NoPreludeModule,
 }
 
 /// Why a [`DefDiagnosticKind::TraitItemImport`] is reported.
@@ -124,6 +138,10 @@ impl DefDiagnostic {
         why: TraitItemImport,
     ) -> Self {
         Self { in_module: container, kind: DefDiagnosticKind::TraitItemImport { id, index, why } }
+    }
+
+    pub(super) fn prelude(root: ModuleId, krate: Name, error: PreludeError) -> Self {
+        Self { in_module: root, kind: DefDiagnosticKind::Prelude { krate, error } }
     }
 
     pub fn macro_error(

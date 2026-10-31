@@ -1,0 +1,23 @@
+{
+  "id": "01200",
+  "from_lane": "tests-misc-front1",
+  "owner": "db",
+  "paths": [
+    "crates/hir-ty/src/db.rs"
+  ],
+  "what": "hir-ty db.rs:1022 panics 'expected a closure, found Closure {.. Coroutine Async ..}' in blaze-items tests::form::shared_type_forms_are_the_forms_each_cx_spelled: an async closure's id reaches a lookup that only takes plain closures.",
+  "state": "open",
+  "created": "2026-10-31T00:51:36Z",
+  "updated": "2026-10-31T00:51:36Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T00:51:36Z",
+      "by": "tests-misc-front1",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

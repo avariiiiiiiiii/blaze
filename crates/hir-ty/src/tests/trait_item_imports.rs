@@ -13,7 +13,7 @@ use hir_expand::fixture;
 use crate::{InferBodyId, InferenceResult, next_solver::TyKind};
 
 const FIXTURE: &str = r#"
-//- minicore: default
+//- minicore: default, builtin_impls
 #![feature(import_trait_associated_functions)]
 use core::default::Default::default;
 use crate::Make::make;

@@ -329,6 +329,7 @@ fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
                 && let Some(helpers) = side.derive_helpers.get(&ast_id)
                 && let Some(&(_, derive, _)) = helpers.iter().find(|(it, ..)| it == ident)
             {
+                cov_mark::hit!(resolved_derive_helper);
                 sink.apply(DeclOp::DeriveHelperUse(DeriveHelperUse {
                     item: ast_id,
                     attr: *attr_id,
@@ -682,6 +683,7 @@ pub(crate) fn reseed_at<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
     pending: &mut FrameVec<'f, MacroOp>,
     index: u32,
 ) {
+    cov_mark::hit!(unresolved_attribute_fallback);
     sink.take_macros(pending);
     let at = index as usize;
     let directive = &pending[at];

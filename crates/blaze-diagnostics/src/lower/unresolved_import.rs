@@ -232,6 +232,39 @@ pub(super) fn macro_path_error<'db>(
     diag
 }
 
+/// The segments rustc resolves for the path of a `pub(in path)` or `pub(super)`
+/// (`try_resolve_visibility`): `{{root}}` first in Rust 2015 when it starts with a name.
+pub(super) fn visibility_segments(cx: &Cx<'_, '_>, path: ast::Path<'_>) -> Vec<Segment> {
+    let mut segments = path_segments(path);
+    if cx.edition == Edition::Edition2015
+        && let Some(first) = segments.first()
+        && !is_path_segment_keyword(&first.name)
+    {
+        let range = TextRange::empty(first.range.start());
+        // alloc: the error's text, for an error hir found
+        segments.insert(0, Segment { name: ROOT.to_owned(), range });
+    }
+    segments
+}
+
+/// rustc's E0433 of a `pub(in path)` or `pub(super)` that names nothing
+/// (`try_resolve_visibility`'s `FailedToResolve`): at the first segment that names no module.
+pub(super) fn visibility_path_error<'db>(cx: &Cx<'_, 'db>, file: hir::HirFileId, path: ast::Path<'db>) -> Diag {
+    let r = Resolver::new(cx, file, path.syntax());
+    let segments = visibility_segments(cx, path);
+    let mut module = None;
+    for (at, segment) in segments.iter().enumerate() {
+        match r.module(&segments[..=at]) {
+            Some(found) => module = Some(found),
+            None => return path_diag(&r, segment.range, r.path_error(&segments, at, module, false)),
+        }
+    }
+    // hir finds no module where this walk finds one: still the error, with what it can say.
+    let names = names_to_string(segments.iter().map(|it| it.name.as_str()));
+    // alloc: the error's text, for an error hir found
+    Diag::error(Some("E0433"), format!("failed to resolve: `{names}`"), r.span(path.syntax().text_range()))
+}
+
 fn suggest(diag: &mut Diag, suggestion: Suggestion) {
     match suggestion.parts.is_empty() {
         true => diag.help(suggestion.message),
@@ -276,7 +309,7 @@ fn import_path(import: &Import, failed: Option<usize>) -> String {
 }
 
 /// rustc's `names_to_string`: the names joined by `::`, `{{root}}` written as nothing.
-fn names_to_string<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+pub(super) fn names_to_string<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
     // alloc: the error's text, for an error hir found
     let mut out = String::new();
     for (i, name) in names.into_iter().enumerate().filter(|(_, it)| *it != ROOT) {

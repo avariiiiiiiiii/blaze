@@ -9,7 +9,11 @@
 //!
 //! The interpreter runs everywhere; it needs no code mapped.
 
-use cranelift_codegen::{data_value::DataValue, ir};
+use cranelift_codegen::{
+    cursor::{Cursor, FuncCursor},
+    data_value::DataValue,
+    ir::{self, InstBuilder, types},
+};
 use cranelift_interpreter::{
     environment::FunctionStore,
     interpreter::{Interpreter, InterpreterState},
@@ -31,8 +35,9 @@ pub enum Run {
 /// (`func.name`, which is how a `call` in another one names it: `u0:3` or `%name`). An error
 /// is what the interpreter can't do (an operation it lacks, its fuel run out).
 pub fn run(funcs: &[&ir::Function], entry: usize, args: &[DataValue]) -> Result<Run, String> {
+    let funcs: Vec<ir::Function> = funcs.iter().map(|func| interpretable(func)).collect();
     let mut store = FunctionStore::default();
-    for func in funcs {
+    for func in &funcs {
         store.add(func.name.to_string(), func);
     }
     let state = InterpreterState::default().with_function_store(store);
@@ -47,6 +52,28 @@ pub fn run(funcs: &[&ir::Function], entry: usize, args: &[DataValue]) -> Result<
         Ok(_) => Err("the interpreter ended the call with no return".to_owned()),
         Err(e) => Err(format!("the interpreter: {e}")),
     }
+}
+
+/// `func` with each `avg_round` as `(x | y) - ((x ^ y) >> 1)`, the same lane by lane: the
+/// interpreter's `avg_round` adds its operands as one scalar, which panics on a vector and
+/// wraps before it halves on a scalar.
+fn interpretable(func: &ir::Function) -> ir::Function {
+    let mut func = func.clone();
+    let mut cursor = FuncCursor::new(&mut func);
+    while cursor.next_block().is_some() {
+        while let Some(inst) = cursor.next_inst() {
+            if cursor.func.dfg.insts[inst].opcode() != ir::Opcode::AvgRound {
+                continue;
+            }
+            let &[x, y] = cursor.func.dfg.inst_args(inst) else { unreachable!("avg_round takes two operands") };
+            let or = cursor.ins().bor(x, y);
+            let xor = cursor.ins().bxor(x, y);
+            let one = cursor.ins().iconst(types::I32, 1);
+            let half = cursor.ins().ushr(xor, one);
+            cursor.func.replace(inst).isub(or, half);
+        }
+    }
+    func
 }
 
 /// How a call of machine code ended (`exec`'s calls in a forked child).
@@ -145,7 +172,7 @@ fn is_nan(lane: ir::Type, bytes: &[u8]) -> bool {
 
 #[test]
 fn nans_compare_by_rule() {
-    use cranelift_codegen::ir::{immediates::Ieee32, types};
+    use cranelift_codegen::ir::immediates::Ieee32;
     let quiet = DataValue::F32(Ieee32::with_bits(0x7fc0_0000));
     let payload = DataValue::F32(Ieee32::with_bits(0x7fc1_2345));
     let one = DataValue::F32(Ieee32::with_bits(0x3f80_0000));
@@ -162,7 +189,6 @@ fn nans_compare_by_rule() {
 
 #[test]
 fn the_interpreter_runs_an_add() {
-    use cranelift_codegen::ir::{InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     let mut sig = ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
     sig.params.push(ir::AbiParam::new(types::I32));
@@ -182,5 +208,33 @@ fn the_interpreter_runs_an_add() {
     assert_eq!(
         run(&[&func], 0, &[DataValue::I32(i32::MAX)]),
         Ok(Run::Returned(vec![DataValue::I32(i32::MIN)]))
+    );
+}
+
+/// `avg_round` is `(x + y + 1) >> 1` of each lane, computed wide.
+#[test]
+fn the_interpreter_runs_a_vector_avg_round() {
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    let mut sig = ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
+    sig.params.extend([ir::AbiParam::new(types::I8X16), ir::AbiParam::new(types::I8X16)]);
+    sig.returns.push(ir::AbiParam::new(types::I8X16));
+    let mut func = ir::Function::with_name_signature(ir::UserFuncName::user(0, 0), sig);
+    let mut cx = FunctionBuilderContext::new();
+    let mut b = FunctionBuilder::new(&mut func, &mut cx);
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    let (x, y) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+    let avg = b.ins().avg_round(x, y);
+    b.ins().return_(&[avg]);
+    b.seal_all_blocks();
+    let config = super::host::isa(&super::host::TARGETS[0]).frontend_config();
+    b.finalize(config);
+    let x: [u8; 16] = std::array::from_fn(|i| [0, 0, 1, 254, 255, 255, 7, 128][i % 8]);
+    let y: [u8; 16] = std::array::from_fn(|i| [0, 1, 1, 255, 254, 255, 100, 127][i % 8]);
+    let want: [u8; 16] = std::array::from_fn(|i| ((u16::from(x[i]) + u16::from(y[i]) + 1) >> 1) as u8);
+    assert_eq!(
+        run(&[&func], 0, &[DataValue::V128(x), DataValue::V128(y)]),
+        Ok(Run::Returned(vec![DataValue::V128(want)]))
     );
 }

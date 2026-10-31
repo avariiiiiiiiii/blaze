@@ -3835,12 +3835,11 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
                     // A place used as a statement (`*x;`, `S[0];`) is moved out of into a
                     // temporary, as rustc's `stmt_expr` does with `as_temp`, sized or not, and
                     // the value dropped at the end of the statement.
-                    let Some((p, c)) = self.lower_expr_to_fresh_place(expr, current)? else {
+                    let Some((_, c)) = self.lower_expr_to_fresh_place(expr, current)? else {
                         scope2.pop_assume_dropped(self);
                         scope.pop_assume_dropped(self);
                         return Ok(None);
                     };
-                    self.push_fake_read(c, p, expr.into());
                     current = scope2.pop_and_drop(self, c, expr.into());
                 }
                 hir_def::hir::Statement::Item(_) => (),

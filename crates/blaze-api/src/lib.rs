@@ -64,8 +64,8 @@ use serde::{Deserialize, Serialize};
 /// ([`UnitOf::id`], [`UnitStarted::package`], [`TestResult::executable`]); the fixed name sets
 /// as enums ([`TargetKind`], [`CrateType`], [`ArtifactKind`], [`Applicability`]), written by
 /// name as before. [`ResponseRef`] reads the same bytes. 15: [`Request::Pack`] and
-/// [`Response::Packed`].
-pub const SCHEMA: u32 = 15;
+/// [`Response::Packed`]. 16: [`Worked::links`].
+pub const SCHEMA: u32 = 16;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -270,7 +270,7 @@ pub enum Request {
     /// `targets` asks (its build scripts run and its proc macros loaded in the sandbox, every
     /// expansion of the program recorded) as one file for blaze's in-browser compiler
     /// (`blaze_wasm_pack::Pack`); answered with [`Response::Packed`].
-    Pack { view: ViewRef, targets: Targets, program: String },
+    Pack { view: ViewRef, program: String, targets: Targets },
 }
 
 /// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
@@ -543,11 +543,14 @@ pub struct UnitProfile {
 /// What a build did: the counts the oracle's over-invalidation and the budgets read.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Worked {
+    /// [`LinkKind::Placed`] when any of [`Worked::links`] is not [`LinkHow::Spliced`].
     pub link: LinkKind,
     /// Functions found in the store.
     pub found: u64,
     /// Queries verified green.
     pub green: u64,
+    /// Each image the build linked, in the order it linked them.
+    pub links: Vec<Linked>,
     /// Queries executed.
     pub reran: u64,
     /// Each crate of the build that is not a workspace member, sorted by cargo package name:
@@ -598,6 +601,46 @@ impl ServedPart {
             ServedPart::Served => "served",
             ServedPart::Checked => "checked",
             ServedPart::Refused => "refused",
+        }
+    }
+}
+
+/// One image of [`Worked::links`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Linked {
+    pub how: LinkHow,
+    pub path: String,
+}
+
+/// How an image was linked.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum LinkHow {
+    /// No image of it was kept: laid out whole.
+    First,
+    /// What changed was placed into the room the kept image keeps.
+    Spliced,
+    /// Laid out whole although an image was kept: the names of the output's fields that differ
+    /// from the kept image's (`exports`, `debug`), or `not incremental` for an output that keeps
+    /// no room.
+    Full { why: Vec<String> },
+}
+
+/// The `link:` line's words: `first link`, `spliced`, `not spliced: <why>, <why>`.
+impl std::fmt::Display for LinkHow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkHow::First => f.write_str("first link"),
+            LinkHow::Spliced => f.write_str("spliced"),
+            LinkHow::Full { why } => {
+                f.write_str("not spliced: ")?;
+                for (at, it) in why.iter().enumerate() {
+                    if at > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(it)?;
+                }
+                Ok(())
+            }
         }
     }
 }

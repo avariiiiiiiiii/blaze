@@ -70,8 +70,6 @@ pub(super) fn check_qualifs<'db>(
     );
     let live = blocks_in(body, reachable, frame);
     let mut checker = Checker::new(db, body, context, frame);
-    for (b, d) in body.basic_blocks.iter() { eprintln!("DBGCC {b:?} {:?} {:?}", d.statements.iter().map(|s| &s.kind).collect::<Vec<_>>(), d.terminator.as_ref().map(|t| &t.kind)); }
-    for (l, local) in body.locals.iter() { eprintln!("DBGCC {l:?}: {:?} mutint={}", local.ty.as_ref(), checker.cx.in_any_value_of_ty(Qualif::HasMutInterior, local.ty.as_ref())); }
     let mut drops = false;
     for (block, data) in body.basic_blocks.iter() {
         if !live.contains(block_index(block)) || data.is_cleanup {
@@ -881,7 +879,6 @@ impl<'a, 'f, 'db> Checker<'a, 'f, 'db> {
                     place.local,
                     elems,
                 );
-                eprintln!("DBGCC shared {place:?} interior={interior} escape={} span={:?}", self.place_may_escape(place.local, elems), statement.span);
                 if interior && self.place_may_escape(place.local, elems) {
                     report(ConstCheckKind::EscapingCellBorrow, statement.span);
                 }

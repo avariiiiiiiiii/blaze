@@ -97,7 +97,7 @@ error: aborting due to 1 previous error
 
 For more information about this error, try `rustc --explain E0015`.
 "#;
-    assert_eq!(ui("const-fn-not-safe-for-const.rs", "2015", source), stderr);
+    assert_eq!(ui_core("const-fn-not-safe-for-const.rs", "2015", "copy", source), stderr);
 }
 
 /// In a `static`, rustc's const checking runs as it evaluates the static, in its type checking
@@ -157,7 +157,7 @@ error: aborting due to 3 previous errors
 Some errors have detailed explanations: E0015, E0133.
 For more information about an error, try `rustc --explain E0015`.
 "#;
-    assert_eq!(ui("issue-16538.rs", "2015", source), stderr);
+    assert_eq!(ui_core("issue-16538.rs", "2015", "copy", source), stderr);
 }
 
 #[test]

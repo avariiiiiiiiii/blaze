@@ -147,7 +147,7 @@ fn an_async_fn_and_a_const_fn_have_identities() {
 fn the_parent_impls_generics_change_it() {
     differ(
         &with_dep("pub struct W<T>(T);\nimpl<T> W<T> { pub fn f() {} }"),
-        &with_dep("pub struct W<T>(T);\nimpl<T: Copy> W<T> { pub fn f() {} }"),
+        &with_dep("pub struct W<T>(T);\nimpl<T: dep::Tr> W<T> { pub fn f() {} }"),
     );
 }
 

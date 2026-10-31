@@ -34,7 +34,7 @@ use super::{
 
 /// The database of every test: the storage, a log of runs, and what particular tests share
 /// with their queries.
-struct TestDb {
+pub struct TestDb {
     storage: Storage,
     /// `(query, key, view)` of every run.
     log: Mutex<Vec<(&'static str, u32, u32)>>,
@@ -99,7 +99,7 @@ macro_rules! ingredient {
 }
 
 /// A test query, without the plumbing [`Function`] asks of every function.
-trait Spec: 'static {
+pub trait Spec: 'static {
     type Key: AsId + FromIdIn + Copy + Send + Sync + 'static;
     type Value: PartialEq + Hash + Send + Sync + 'static;
     const QUERY: &'static str;
@@ -1178,8 +1178,8 @@ fn node(db: &TestDb, at: usize) -> Node {
 
 fn combine(op: Op, values: &[u64]) -> u64 {
     match op {
-        Op::Sum => values.iter().fold(0, |acc, it| acc.wrapping_add(*it)),
-        Op::Mod3 => values.iter().fold(0, |acc, it| acc.wrapping_add(*it)) % 3,
+        Op::Sum => values.iter().fold(0u64, |acc, it| acc.wrapping_add(*it)),
+        Op::Mod3 => values.iter().fold(0u64, |acc, it| acc.wrapping_add(*it)) % 3,
         Op::Max => values.iter().copied().max().unwrap_or(0),
     }
 }

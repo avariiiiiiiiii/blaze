@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn matches_a_sorted_free_list() {
         for seed in 1..40u64 {
-            let mut rng = blaze_ids::rng::SplitMix64::new(seed * 0x2545_f491_4f6c_dd1d);
+            let mut rng = blaze_ids::rng::SplitMix64::new(seed.wrapping_mul(0x2545_f491_4f6c_dd1d));
             let start = 0x10000;
             let len = 1 << 20;
             let mut arena = CodeHeap::new(start, len);

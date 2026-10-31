@@ -220,6 +220,20 @@ impl Linking {
     pub(crate) fn placed(self) -> bool {
         !matches!(self, Linking::Spliced)
     }
+
+    /// As [`blaze_api::Worked::links`] says it.
+    pub(crate) fn how(self) -> blaze_api::LinkHow {
+        match self {
+            Linking::First => blaze_api::LinkHow::First,
+            Linking::Spliced => blaze_api::LinkHow::Spliced,
+            // alloc: a name a field that differs, for a link that was not spliced
+            Linking::Full(Full::Output(fields)) => {
+                blaze_api::LinkHow::Full { why: fields.names().map(str::to_owned).collect() }
+            }
+            // alloc: one name, for a link that was not spliced
+            Linking::Full(Full::NotIncremental) => blaze_api::LinkHow::Full { why: vec!["not incremental".to_owned()] },
+        }
+    }
 }
 
 impl std::fmt::Display for Linking {
@@ -476,9 +490,10 @@ pub trait Writer<S: Steps>: Send + 'static {
     /// the goals its build offered to the persistent goal cache. None when nothing was kept.
     fn goals_noted(&self) -> Option<blaze_api::Diagnostic>;
     /// On the loop, once every task of the job's build has ended: the front end with every
-    /// write applied, for the head's next build to lower into. None while a reader of it is
-    /// alive or a write fails to apply: the next build lowers anew.
-    fn keep(self) -> Option<S::KeptFront>;
+    /// write applied, for the head's next build to lower into. An error while a reader of it
+    /// is alive or a write fails to apply: the build ends with it, never a silent full lower
+    /// next time.
+    fn keep(self) -> Result<S::KeptFront, ApiError>;
 }
 
 /// One job's front end, its units lowered: shared by the job's tasks, read only.

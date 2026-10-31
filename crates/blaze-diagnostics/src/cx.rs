@@ -366,8 +366,14 @@ impl<'a, 'db> Cx<'a, 'db> {
         let (kind, name, range) = match &loc.kind {
             MacroCallKind::FnLike { .. } => {
                 let call = view::MacroCall::cast(node.value)?;
-                let text = call.path()?.segment()?.name_ref()?.text();
-                (MacroKind::Bang, owned(text), node.value.text_range())
+                let path = call.path()?;
+                let name = if named { fast_print_path(path)? } else { String::new() };
+                // rustc's `MacCall::span`: the path to the closing delimiter, without the
+                // call's attributes or the `;` of one in item or statement position.
+                let whole = node.value.text_range();
+                let end = call.token_tree().map_or(whole, |it| it.syntax().text_range()).end();
+                let range = TextRange::new(path.syntax().text_range().start(), end);
+                (MacroKind::Bang, name, range)
             }
             MacroCallKind::Derive { derive_index, .. } => {
                 let attr = view::Attr::cast(node.value)?;
@@ -390,8 +396,9 @@ impl<'a, 'db> Cx<'a, 'db> {
             MacroCallKind::Attr { .. } => {
                 let item = view::Item::cast(node.value)?;
                 let attr = item.attrs().next()?;
-                let text = attr.path()?.segment()?.name_ref()?.text();
-                (MacroKind::Attr, owned(text), attr.syntax().text_range())
+                let path = attr.path()?;
+                let name = if named { fast_print_path(path)? } else { String::new() };
+                (MacroKind::Attr, name, attr.syntax().text_range())
             }
         };
         Some((kind, name, node.with_value(range)))
@@ -444,6 +451,26 @@ impl<'a, 'db> Cx<'a, 'db> {
     pub fn resolves_fact(&self, module: hir::Module, name: &str) -> Fact {
         Fact::Resolves { scope: self.module_key(module), name: self.name_hash(name) }
     }
+}
+
+/// rustc's `fast_print_path`: a macro's path as its call writes it, the segments joined by
+/// `::` (a global path's starting with it), the name rustc gives the expansion.
+fn fast_print_path(path: view::Path<'_>) -> Option<String> {
+    let mut segments: SmallVec<[view::PathSegment<'_>; 2]> = SmallVec::new();
+    let mut at = Some(path);
+    while let Some(path) = at {
+        segments.push(path.segment()?);
+        at = path.qualifier();
+    }
+    // alloc: the macro's name, kept in the diagnostic
+    let mut out = String::new();
+    for (i, segment) in segments.iter().rev().enumerate() {
+        if i != 0 || segment.coloncolon_token().is_some() {
+            out.push_str("::");
+        }
+        out.push_str(segment.name_ref()?.text());
+    }
+    Some(out)
 }
 
 /// The paths of a `#[derive(...)]`, in order, with where each is, as text: for a diagnostic

@@ -1,5 +1,5 @@
-use base_db::Db;
-use hir_expand::change::ChangeWithProcMacros;
+use base_db::{Db, salsa::Durability};
+use hir_expand::{change::ChangeWithProcMacros, proc_macro::ProcMacros};
 
 use super::*;
 
@@ -68,6 +68,9 @@ fn load(pack: Pack) -> (Db, FileId) {
     change.set_crate_graph(project.graph);
     change.set_proc_macros(project.macros);
     let mut db = Db::for_tests();
+    // Setting the crate graph maintains every crate's def map, which reads the proc macros: the
+    // input is there first, as `load-cargo` makes it, and `build_in` gives it the pack's.
+    ProcMacros::init_default(&db, Durability::HIGH);
     change.apply(&mut db);
     (db, project.main)
 }

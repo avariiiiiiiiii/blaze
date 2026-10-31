@@ -18,7 +18,7 @@ use blaze_format::{
     schema_of,
 };
 use hir_def::{
-    AdtId, ConstParamId, EnumVariantId, GenericDefId, GenericParamId, ImplId, LifetimeParamId,
+    AdtId, AssocItemId, ConstParamId, EnumVariantId, GenericDefId, GenericParamId, ImplId, LifetimeParamId,
     StructId, TraitId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
 };
 use la_arena::{Idx, RawIdx};
@@ -26,6 +26,7 @@ use blaze_query::db::{AsId, FromId};
 
 use crate::{
     Span, TyLoweringDiagnostic,
+    consteval::CreateConstError,
     db::AnonConstId,
     lower::{
         FieldType, GenericPredicates,
@@ -34,8 +35,9 @@ use crate::{
             SideTable,
         },
         diagnostics::{
-            ElidedLifetimeSite, GenericArgsProhibitedReason, IncorrectGenericsLenKind,
-            MissingLifetimeKind, PathGenericsSource, PathLoweringDiagnostic,
+            AssocTypeFailure, AssocTypeQself, ElidedLifetimeSite, GenericArgsProhibitedReason,
+            IncorrectGenericsLenKind, MissingLifetimeKind, PathGenericsSource,
+            PathLoweringDiagnostic,
         },
     },
     next_solver::{
@@ -368,7 +370,7 @@ impl ColdBatch {
 impl Persist for ColdBatch {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ColdBatch"),
-        Part::U64(2),
+        Part::U64(4),
         Part::Schema(<BatchRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ColdBatchRef<'a>;
@@ -776,6 +778,41 @@ fn put_span(w: &mut Vec<u32>, span: Span) {
     }
 }
 
+/// The word of `reason`, `TypeMismatch`'s type left to the caller to write after it.
+pub(crate) fn const_error_word(reason: &CreateConstError) -> u32 {
+    match reason {
+        CreateConstError::UsedForbiddenParam => 0,
+        CreateConstError::LocalBinding => 1,
+        CreateConstError::Static => 2,
+        CreateConstError::ImplSelf => 3,
+        CreateConstError::NeedsAnonConst => 4,
+        CreateConstError::DoesNotResolve => 5,
+        CreateConstError::ConstHasGenerics => 6,
+        CreateConstError::UnderscoreExpr => 7,
+        CreateConstError::AnonConstInterningDisabled => 8,
+        CreateConstError::TypeMismatch { .. } => 9,
+        CreateConstError::TargetLayoutNotAvailable => 10,
+    }
+}
+
+/// The reason of `word` but `TypeMismatch`'s (9), whose type the caller reads; `None` for 9 and
+/// a word of no reason.
+pub(crate) fn const_error_of(word: u32) -> Option<CreateConstError> {
+    Some(match word {
+        0 => CreateConstError::UsedForbiddenParam,
+        1 => CreateConstError::LocalBinding,
+        2 => CreateConstError::Static,
+        3 => CreateConstError::ImplSelf,
+        4 => CreateConstError::NeedsAnonConst,
+        5 => CreateConstError::DoesNotResolve,
+        6 => CreateConstError::ConstHasGenerics,
+        7 => CreateConstError::UnderscoreExpr,
+        8 => CreateConstError::AnonConstInterningDisabled,
+        10 => CreateConstError::TargetLayoutNotAvailable,
+        _ => return None,
+    })
+}
+
 pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic) {
     match diagnostic {
         TyLoweringDiagnostic::PathDiagnostic { source, diag } => {
@@ -813,6 +850,54 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
                     }
                 }
             }
+        }
+        TyLoweringDiagnostic::InvalidConstArg { site, reason } => {
+            assert!(
+                !matches!(reason, CreateConstError::TypeMismatch { .. }),
+                "type lowering makes a literal of another type an anon const, never this error",
+            );
+            w.push(3);
+            put_span(w, *site);
+            w.push(const_error_word(reason));
+        }
+        TyLoweringDiagnostic::ImplTraitNotAllowed { source } => {
+            w.push(4);
+            put_local(w, *source);
+        }
+        TyLoweringDiagnostic::AdditionalNonAutoTraits { first, additional } => {
+            w.push(5);
+            put_local(w, *first);
+            w.push(additional.len() as u32);
+            additional.iter().for_each(|&it| put_local(w, it));
+        }
+        TyLoweringDiagnostic::ConflictingAssocTypeBindings { source, assoc } => {
+            w.push(6);
+            put_local(w, *source);
+            match *assoc {
+                AssocItemId::TypeAliasId(it) => {
+                    w.push(0);
+                    put_u64(w, def_bits(it));
+                }
+                AssocItemId::ConstId(it) => {
+                    w.push(1);
+                    put_u64(w, def_bits(it));
+                }
+                AssocItemId::FunctionId(it) => {
+                    w.push(2);
+                    put_u64(w, def_bits(it));
+                }
+            }
+        }
+        TyLoweringDiagnostic::MissingSelfDefaultParams { source, trait_, params } => {
+            w.push(7);
+            put_local(w, *source);
+            put_u64(w, def_bits(*trait_));
+            w.push(params.len() as u32);
+            params.iter().for_each(|&it| put_generic_param(w, it.into()));
+        }
+        TyLoweringDiagnostic::ObjectWithoutTrait { source } => {
+            w.push(8);
+            put_local(w, *source);
         }
     }
 }
@@ -899,6 +984,25 @@ pub(crate) fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDia
             put_u64(w, def_bits(item));
             put_u64(w, def_bits(impl_));
         }
+        PathLoweringDiagnostic::AssocTypeNotResolved { segment, qself, failure } => {
+            let failure = match failure {
+                AssocTypeFailure::NotFound => 0,
+                AssocTypeFailure::Ambiguous => 1,
+                AssocTypeFailure::Cycle => 2,
+            };
+            w.extend([10, segment, failure]);
+            match qself {
+                AssocTypeQself::Param(it) => {
+                    w.push(0);
+                    put_generic_param(w, it.into());
+                }
+                AssocTypeQself::Trait(it) => {
+                    w.push(1);
+                    put_u64(w, def_bits(it));
+                }
+            }
+        }
+        PathLoweringDiagnostic::AmbiguousAssocType { segment } => w.extend([11, segment]),
     }
 }
 
@@ -984,6 +1088,13 @@ impl Words<'_> {
         })
     }
 
+    fn type_param(&mut self) -> Result<TypeParamId, FormatError> {
+        match self.generic_param()? {
+            GenericParamId::TypeParamId(it) => Ok(it),
+            _ => Err(self.invalid("a type parameter that is not one")),
+        }
+    }
+
     fn generics_source(&mut self) -> Result<PathGenericsSource, FormatError> {
         Ok(match self.u32()? {
             0 => PathGenericsSource::Segment(self.u32()?),
@@ -1046,6 +1157,45 @@ impl Words<'_> {
                 }
                 TyLoweringDiagnostic::MissingLifetimes { sites: sites.into_boxed_slice(), kind }
             }
+            3 => TyLoweringDiagnostic::InvalidConstArg {
+                site: self.span()?,
+                reason: match const_error_of(self.u32()?) {
+                    Some(reason) => reason,
+                    None => return Err(self.invalid("an invalid const argument of no reason")),
+                },
+            },
+            4 => TyLoweringDiagnostic::ImplTraitNotAllowed { source: self.local()? },
+            5 => {
+                let first = self.local()?;
+                let len = self.u32()? as usize;
+                if len > self.words.len() - self.next {
+                    return Err(self.invalid("more additional traits than words"));
+                }
+                // alloc: an error's sites.
+                let additional = exact(len, (0..len).map(|_| self.local()))?;
+                TyLoweringDiagnostic::AdditionalNonAutoTraits { first, additional }
+            }
+            6 => TyLoweringDiagnostic::ConflictingAssocTypeBindings {
+                source: self.local()?,
+                assoc: match self.u32()? {
+                    0 => AssocItemId::TypeAliasId(self.id()?),
+                    1 => AssocItemId::ConstId(self.id()?),
+                    2 => AssocItemId::FunctionId(self.id()?),
+                    _ => return Err(self.invalid("an associated item of no kind")),
+                },
+            },
+            7 => {
+                let source = self.local()?;
+                let trait_ = self.id()?;
+                let len = self.u32()? as usize;
+                if len > self.words.len() - self.next {
+                    return Err(self.invalid("more missing parameters than words"));
+                }
+                // alloc: an error's parameters.
+                let params = exact(len, (0..len).map(|_| self.type_param()))?;
+                TyLoweringDiagnostic::MissingSelfDefaultParams { source, trait_, params }
+            }
+            8 => TyLoweringDiagnostic::ObjectWithoutTrait { source: self.local()? },
             _ => return Err(self.invalid("a lowering diagnostic of no kind")),
         })
     }
@@ -1125,6 +1275,22 @@ impl Words<'_> {
                 item: self.id()?,
                 impl_: self.id()?,
             },
+            10 => {
+                let segment = self.u32()?;
+                let failure = match self.u32()? {
+                    0 => AssocTypeFailure::NotFound,
+                    1 => AssocTypeFailure::Ambiguous,
+                    2 => AssocTypeFailure::Cycle,
+                    _ => return Err(self.invalid("an associated type failure of no kind")),
+                };
+                let qself = match self.u32()? {
+                    0 => AssocTypeQself::Param(self.type_param()?),
+                    1 => AssocTypeQself::Trait(self.id()?),
+                    _ => return Err(self.invalid("an associated type qself of no kind")),
+                };
+                PathLoweringDiagnostic::AssocTypeNotResolved { segment, qself, failure }
+            }
+            11 => PathLoweringDiagnostic::AmbiguousAssocType { segment: self.u32()? },
             _ => return Err(self.invalid("a path diagnostic of no kind")),
         })
     }
@@ -1222,11 +1388,50 @@ mod tests {
                 item: TypeAliasId::from_id(id(14)),
                 impl_: ImplId::from_id(id(9)),
             }),
+            path(PathLoweringDiagnostic::AssocTypeNotResolved {
+                segment: 1,
+                qself: AssocTypeQself::Param(TypeParamId::from_unchecked(param)),
+                failure: AssocTypeFailure::NotFound,
+            }),
+            path(PathLoweringDiagnostic::AssocTypeNotResolved {
+                segment: 0,
+                qself: AssocTypeQself::Param(TypeParamId::from_unchecked(param)),
+                failure: AssocTypeFailure::Ambiguous,
+            }),
+            path(PathLoweringDiagnostic::AssocTypeNotResolved {
+                segment: 2,
+                qself: AssocTypeQself::Trait(TraitId::from_id(id(10))),
+                failure: AssocTypeFailure::Cycle,
+            }),
+            path(PathLoweringDiagnostic::AmbiguousAssocType { segment: 3 }),
+            TyLoweringDiagnostic::ImplTraitNotAllowed { source },
+            TyLoweringDiagnostic::AdditionalNonAutoTraits {
+                first: source,
+                additional: Box::new([Idx::from_raw(RawIdx::from_u32(8)), Idx::from_raw(RawIdx::from_u32(9))]),
+            },
+            TyLoweringDiagnostic::ConflictingAssocTypeBindings {
+                source,
+                assoc: AssocItemId::TypeAliasId(TypeAliasId::from_id(id(14))),
+            },
+            TyLoweringDiagnostic::MissingSelfDefaultParams {
+                source,
+                trait_: TraitId::from_id(id(10)),
+                params: Box::new([TypeParamId::from_unchecked(param)]),
+            },
+            TyLoweringDiagnostic::ObjectWithoutTrait { source },
             TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::TypeRefId(source)]) },
             TyLoweringDiagnostic::InferVarsNotAllowed {
                 sources: Box::new([Span::ExprId(Idx::from_raw(RawIdx::from_u32(1))), Span::TypeRefId(source)]),
             },
             TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::Dummy]) },
+            TyLoweringDiagnostic::InvalidConstArg {
+                site: Span::TypeRefId(source),
+                reason: CreateConstError::LocalBinding,
+            },
+            TyLoweringDiagnostic::InvalidConstArg {
+                site: Span::ExprId(Idx::from_raw(RawIdx::from_u32(4))),
+                reason: CreateConstError::TargetLayoutNotAvailable,
+            },
             TyLoweringDiagnostic::MissingLifetimes {
                 sites: Box::new([ElidedLifetimeSite::Reference(source)]),
                 kind: MissingLifetimeKind::Missing,

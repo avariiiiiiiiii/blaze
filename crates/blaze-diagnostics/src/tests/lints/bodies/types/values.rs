@@ -1169,7 +1169,7 @@ fn ptr_to_int_transmute_in_consts_issue_87525() {
 fn int_to_ptr() {
     check(
         "int_to_ptr.rs",
-        "sized, add, fn",
+        "sized, copy, add, fn",
         TRANSMUTE,
         include_str!("values/ui/int_to_ptr.rs"),
         include_str!("values/ui/int_to_ptr.stderr"),
@@ -1180,7 +1180,7 @@ fn int_to_ptr() {
 fn unnecessary_transmutation() {
     check(
         "unnecessary-transmutation.rs",
-        "sized",
+        "sized, copy",
         TRANSMUTE,
         include_str!("values/ui/unnecessary-transmutation.rs"),
         include_str!("values/ui/unnecessary-transmutation.stderr"),

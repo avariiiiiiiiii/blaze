@@ -118,7 +118,7 @@ impl<'a> Elf<'a> {
                 panic!("stencil `{what}`: a relocation that is not ELF's")
             };
             let form = form(self.isa, r_type).unwrap_or_else(|| {
-                panic!("stencil `{what}`: relocation type {r_type} at {at:#x} is no hole form")
+                panic!("stencil `{what}`: relocation type {} at {at:#x} is no hole form", r_type.0)
             });
             let at = usize::try_from(at).expect("an offset in memory");
             if at + usize::from(form.bytes()) > code.len() {
@@ -314,7 +314,7 @@ impl<'a> Elf<'a> {
 }
 
 /// The form of an ELF relocation type of `isa`, if it is one.
-fn form(isa: Isa, r_type: u32) -> Option<Form> {
+fn form(isa: Isa, r_type: elf::RelocationType) -> Option<Form> {
     Some(match isa {
         Isa::X86_64 => match r_type {
             elf::R_X86_64_8 => Form::Abs8,

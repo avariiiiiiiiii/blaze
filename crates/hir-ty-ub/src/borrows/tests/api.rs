@@ -148,7 +148,10 @@ fn protector_forbids_foreign_write() {
     s.call();
     let a = s.arg_mut(x, 1).unwrap();
     let e = expect_ub(s.write(x, 1), AliasErrorKind::ProtectedDisabled, "write access through");
-    assert_eq!(e.title(), "write access through <1> at alloc1[0x0] is forbidden");
+    assert_eq!(
+        e.title(),
+        "write access through <1> (root of the allocation) at alloc1[0x0] is forbidden"
+    );
     assert_eq!(
         e.details(),
         &[
@@ -162,7 +165,8 @@ fn protector_forbids_foreign_write() {
     expect_history(
         &e,
         &[
-            "the accessed tag <TAG> (root of the allocation) was created here",
+            // A history note names a tag by its `BorTag` alone (Miri `HistoryData::extend`).
+            "the accessed tag <TAG> was created here",
             "the protected tag <TAG> was created here, in the initial state Reserved",
         ],
     );

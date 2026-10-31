@@ -154,9 +154,18 @@ second version left in `Cargo.lock` is forced by an upstream's newest release, a
 
 | duplicate | forced by |
 |---|---|
-| `object` 0.39 beside 0.40 | `thorin-dwp` 0.11 and `ar_archive_writer` 0.5.3 (0.40 is cranelift 0.137's) |
-| `gimli` 0.33 beside 0.34 | cranelift 0.137 (0.34 is `thorin-dwp` 0.11's) |
-| `sha2`, `sha1`, `digest` 0.10 beside 0.11 | cranelift-codegen's incremental cache and `aws-config` 1.13 |
+| `object` 0.39 beside 0.40 | `ar_archive_writer` 0.5.3, the build-dependency of `psm` 0.1.32 (under `stacker`, in `stdx`) that writes its assembly archive; 0.40 is the workspace's and cranelift 0.137's |
+| `hashbrown` 0.16 beside 0.17 | `gimli` 0.33, the one cranelift 0.137 pins (`gimli` itself is a single version) |
+| `sha2`, `digest`, `block-buffer`, `crypto-common` 0.10 beside 0.11 | cranelift-codegen 0.137's incremental cache (`sha2` 0.10); 0.11 is `lzma-rust2` 0.24's and `sha1` 0.11's |
+| `getrandom` 0.2, `rand_core` 0.6 | `ring` 0.17.14 and `im-rc` 15.1.0 (`rand_xoshiro`), both their newest |
+| `windows-sys` 0.52 | `ring` 0.17.14 |
+| `embedded-io` 0.4 beside 0.6 | `postcard` 1.1.3, which names both |
 | `syn` 2 beside 3 | both majors are in use upstream (syn 2: `serde_derive`, `thiserror-impl`, `tracing-attributes`, `zerocopy-derive`; syn 3: `clap_derive`, `async-trait`, `rkyv_derive`); the workspace's own `syn` is 2, which `synstructure` needs |
 | `rand` 0.8, `thiserror` 1, `nix` 0.23, `bitflags` 1, `memoffset` 0.6, `windows` 0.34 and 0.62 | `tango-bench` 0.9.0 (its newest), blaze-bench's paired benchmark harness, a dev-dependency only |
 | `unicode-width` 0.1 | `blaze-fmt` keeps the pinned nightly rustfmt's versions (`rustfmt-unicode-width`) |
+| `wasmparser`, `wasm-encoder`, `wit-*` | open until the proc-macro and Wasm engines are deleted (lane dedup-engines) |
+
+Where two libraries do one job, one stays: seeded randomness is `blaze-rng` (hir-ty-mir's
+`oorandom` went). Still to decide, each with its owner: `im-rc` (blaze-resolve; no release since
+2021) against its maintained fork `imbl` 7; `sonic-rs` (blaze-api, blaze-ci; SIMD) against
+`serde_json` everywhere else; `crossbeam-channel` against the nightly `std::sync::mpmc`.

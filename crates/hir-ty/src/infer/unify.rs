@@ -7,7 +7,7 @@ use blaze_ids::bits::{BitSlice, BitSliceMut, words_for};
 use blaze_mem::scratch;
 use hir_def::{GenericParamId, TraitId};
 use rustc_type_ir::{
-    TyVid, TypeFoldable, TypeVisitableExt,
+    Interner as _, TyVid, TypeFoldable, TypeVisitableExt,
     inherent::{GenericArg as _, IntoKind, Ty as _},
     solve::Certainty,
 };
@@ -15,6 +15,7 @@ use smallvec::SmallVec;
 
 use crate::{
     InferBodyId, InferenceDiagnostic, Span,
+    autoderef::RecursionLimitErrors,
     db::HirDatabase,
     next_solver::{
         Canonical, ClauseKind, Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArg,
@@ -155,6 +156,8 @@ pub(crate) struct InferenceTable<'db> {
     diverging_type_vars: scratch::Lent<Vec<u64>>,
     /// Each converted once, when the solver returns it, as rustc's `FromSolverError` does.
     trait_errors: Vec<FulfillmentError<'db>>,
+    /// The body's autoderef walks past the crate's recursion limit (E0055).
+    pub(crate) recursion_limit_errors: RecursionLimitErrors<'db>,
 }
 
 impl<'db> InferenceTable<'db> {
@@ -177,6 +180,7 @@ impl<'db> InferenceTable<'db> {
             diverging_type_vars: scratch::lend_u64s(),
             // alloc: an error path, unallocated until the body's first trait error
             trait_errors: Vec::new(),
+            recursion_limit_errors: RecursionLimitErrors::default(),
         }
     }
 
@@ -621,6 +625,22 @@ impl<'db> InferenceTable<'db> {
                 .map(InferenceDiagnostic::SolverDiagnostic)
         }));
     }
+
+    fn emit_recursion_limit_errors(&self, diagnostics: &mut impl Extend<InferenceDiagnostic>) {
+        let suggested_limit = suggested_recursion_limit(self.interner());
+        diagnostics.extend(self.recursion_limit_errors.take().into_iter().map(|(span, ty)| {
+            InferenceDiagnostic::AutoderefRecursionLimit { span, ty: ty.store(), suggested_limit }
+        }));
+    }
+}
+
+/// rustc's `report_autoderef_recursion_limit_error` suggestion: twice the crate's limit, 2 for
+/// a limit of 0.
+pub(crate) fn suggested_recursion_limit(interner: DbInterner<'_>) -> u32 {
+    match interner.recursion_limit() {
+        0 => 2,
+        limit => u32::try_from(limit * 2).unwrap_or(u32::MAX),
+    }
 }
 
 impl fmt::Debug for InferenceTable<'_> {
@@ -754,6 +774,7 @@ pub(super) mod resolve_completely {
             let mut diagnostics = Vec::new_in(self.frame);
             diagnostics.extend(std::mem::take(&mut self.diagnostics));
             self.table.emit_trait_errors(&mut diagnostics);
+            self.table.emit_recursion_limit_errors(&mut diagnostics);
 
             // Ignore diagnostics made from resolving diagnostics.
             let unresolved_vars =

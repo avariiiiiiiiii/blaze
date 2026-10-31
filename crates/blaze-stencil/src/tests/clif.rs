@@ -279,9 +279,9 @@ fn rename(file: &str, funcs: &mut [ir::Function], names: &[String]) {
     }
 }
 
-/// Whether the interpreter can run each function: none with a `try_call`, a vector
-/// `avg_round` (it adds the whole vector as one scalar and panics) or a call of anything but
-/// the file's own functions, nor any calling one of those.
+/// Whether the interpreter can run each function: none with a `try_call`, an extending
+/// vector load or a call of anything but the file's own functions, nor any calling one of
+/// those. `avg_round` it runs as [`interp::run`] rewrites it.
 fn interpretable(funcs: &[ir::Function]) -> Vec<bool> {
     let ok: Vec<bool> = funcs
         .iter()
@@ -302,7 +302,6 @@ fn interpretable(funcs: &[ir::Function]) -> Vec<bool> {
                     | Opcode::Sload16x4
                     | Opcode::Uload32x2
                     | Opcode::Sload32x2 => true,
-                    Opcode::AvgRound => func.dfg.ctrl_typevar(inst).is_vector(),
                     _ => false,
                 })
             });

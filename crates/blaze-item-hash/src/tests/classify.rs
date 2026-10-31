@@ -494,6 +494,7 @@ impl BodyFacts for Probe {
         name: &'static str,
     ) -> Classified {
         let class = reads::classify(db, def, step, read, kind, name);
+        let name = reads::listed_name(name);
         self.seen.lock().unwrap().push(Seen { def, step, read, kind, name, class });
         class
     }

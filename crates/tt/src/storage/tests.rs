@@ -778,11 +778,9 @@ fn old_token_to_literal(text: &str, span: Span) -> Literal {
     };
     let (lit, suffix) = text.split_at(suffix_start as usize);
     let lit = &lit[start_offset..lit.len() - end_offset];
+    // Quoted literals keep their suffix as rustc's lexer does, not `Err` as they once did.
     let suffix = match suffix {
         "" | "_" => "",
-        _ if !matches!(kind, LitKind::Integer | LitKind::Float | LitKind::Err(_)) => {
-            return Literal::new_no_suffix(text, span, LitKind::Err(()));
-        }
         suffix => suffix,
     };
     Literal::new(lit, span, kind, suffix)

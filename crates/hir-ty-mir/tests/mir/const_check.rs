@@ -387,7 +387,7 @@ fn an_exposed_const_fn_may_not_use_a_local_feature() {
             &it.kind,
             ConstCheckKind::UnstableInStableExposed {
                 gate,
-                is_function_call: true,
+                is_function_call: false,
                 already_unstable: false,
             } if gate.as_str() == "local"
         ));

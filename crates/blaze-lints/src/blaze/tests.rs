@@ -15,6 +15,7 @@ const MINICORE: &str = "//- minicore: sized, clone, copy, derive, fn, default, f
 
 const ALLOC_STD: &str = r#"
 //- /std/lib.rs crate:std
+#![feature(lang_items)]
 pub mod prelude {
     pub mod v1 {
         pub use crate::{format, vec};

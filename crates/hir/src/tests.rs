@@ -6,6 +6,7 @@ mod infer;
 mod lower;
 mod trait_imports;
 mod types;
+mod visibilities;
 
 use base_db::{RunOrder, all_crates, set_run_order};
 use blaze_format::{Aligned, Persist, Record, Rel, Writer};

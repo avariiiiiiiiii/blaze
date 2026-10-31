@@ -111,8 +111,8 @@ use crate::{
 pub use autoderef::autoderef;
 pub use infer::{
     Adjust, Adjustment, AutoBorrow, BindingMode, ByRef, CallArguments, ExplicitDropMethodUseKind,
-    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast, ReturnKind, Unreachable,
-    UnreachableAt, cast::{CastError, CastPointerKind, CastPointers},
+    InferenceDiagnostic, InferenceResult, OverloadedDeref, PointerCast, ReturnKind, StructPathDef,
+    StructPathFound, Unreachable, UnreachableAt, cast::{CastError, CastPointerKind, CastPointers},
     prelude_lints::{EditionLint, ReceiverAdjustment}, could_coerce, could_unify, could_unify_deeply, infer_query_with_inspect,
 };
 pub use lower::{

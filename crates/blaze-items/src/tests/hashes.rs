@@ -766,7 +766,11 @@ fn a_leak_changes_the_interface_hash_and_keeps_the_signature_hash() {
 #[test]
 fn a_signature_change_changes_the_signature_hash() {
     for (before, after, path) in [
-        ("fn g() -> impl Copy { 1u8 }", "fn g() -> impl Clone { 1u8 }", "g"),
+        (
+            "trait A {} trait B {} impl A for u8 {} impl B for u8 {} fn g() -> impl A { 1u8 }",
+            "trait A {} trait B {} impl A for u8 {} impl B for u8 {} fn g() -> impl B { 1u8 }",
+            "g",
+        ),
         ("const fn g() -> u8 { 1 }", "fn g() -> u8 { 1 }", "g"),
         ("const C: u8 = 1;", "const C: u16 = 1;", "C"),
         ("static S: u8 = 1;", "static mut S: u8 = 1;", "S"),

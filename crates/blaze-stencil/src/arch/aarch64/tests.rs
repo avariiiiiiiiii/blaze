@@ -1,4 +1,4 @@
-//! The AArch64 glue against Cranelift 0.136.2's own code of the same functions, with the flags
+//! The AArch64 glue against Cranelift 0.137's own code of the same functions, with the flags
 //! `hir-ty-codegen/target.rs` gives the dev ISA: the frame record, the probe, the unwind rows
 //! and Windows codes, the relocations of calls, addresses and thread-locals, where stack
 //! arguments go, the jump table sequence, and the places of arguments in AAPCS64 and Apple's

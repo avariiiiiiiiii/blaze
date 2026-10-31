@@ -45,15 +45,26 @@ fn the_roots_features_are_the_def_maps() {
     assert!(of_root.is_enabled(&Symbol::intern("never_patterns")));
 }
 
+/// Read inside a batch, after an edit of the root and before any maintainer ran: what the read
+/// executes is what the features need, as when the maintainer's run of a proc macro reads them.
 #[test]
 fn reading_the_roots_features_builds_no_def_map() {
-    let db = db();
+    let fx = fixture::db(FIXTURE);
+    let root = fx.file(0).file_id(fx.db());
+    let mut db = fx.into_db();
     let krate = db.fetch_test_crate();
-    let mut forced = false;
-    let executed = db.executed_in_read_order(|| {
-        forced = UnstableFeatures::of_root(&db, krate).forced_keywords;
+    let text = format!("#![feature(deref_patterns)]\n{}", db.file_text(root).text(&db));
+    let (forced, deref, executed) = db.batch(|db| {
+        db.set_file_text(root, &text);
+        let view: &Db = db;
+        let mut read = (false, false);
+        let executed = view.executed_in_read_order(|| {
+            let features = UnstableFeatures::of_root(view, krate);
+            read = (features.forced_keywords, features.deref_patterns);
+        });
+        (read.0, read.1, executed)
     });
-    assert!(forced);
+    assert!(forced && deref, "the edit's feature is read");
     assert!(executed.iter().any(|it| it.contains("crate_data")), "{executed:#?}");
     let resolver = |it: &&String| it.contains("def_map") || it.contains("module_decls");
     assert_eq!(executed.iter().filter(resolver).count(), 0, "{executed:#?}");

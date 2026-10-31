@@ -392,6 +392,9 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
     }
 
     let mut db = Db::for_tests();
+    // Setting the crate graph maintains every crate's def map, which reads the proc macros: the
+    // input is there first, as `load-cargo` makes it, and `build_in` gives it the fixture's.
+    ProcMacros::init_default(&db, Durability::HIGH);
     let ids = set_files(&mut db, &base, &planned, &roots);
     let sysroot_files = ids[own_files..].to_vec();
     let core_file = has_core.then(|| ids[own_files]);
@@ -401,7 +404,10 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
     let fixture_env = || Env::from_iter([(FIXTURE_ENV.to_owned(), FIXTURE_ENV.to_owned())]);
     let mut by_name = FxIndexMap::default();
     let mut deps = Vec::new();
-    for PlannedCrate { file, name, meta, krate } in crates {
+    for PlannedCrate { file, name, mut meta, krate } in crates {
+        if let Some(attr) = sysroot_attr(&meta, &planned[file].text, has_core) {
+            meta.crate_attrs.push(attr.to_owned());
+        }
         let id = graph.add_crate_root(
             ids[file],
             meta.edition,
@@ -434,7 +440,8 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
             Default::default(),
             fixture_env(),
             CrateOrigin::Lang(LangCrateOrigin::Core),
-            Vec::new(),
+            // alloc: one crate attribute, once per fixture
+            vec!["no_core".to_owned()],
             TargetKind::Lib { is_proc_macro: false },
             proc_macro_cwd.clone(),
             workspace.clone(),
@@ -449,6 +456,7 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
             default_root.expect("missing default crate root, specify a main.rs or lib.rs");
         let mut env = fixture_env();
         env.extend_from_other(&meta.env);
+        let attrs = sysroot_attr(&meta, &planned[file].text, has_core).map(str::to_owned);
         let root = graph.add_crate_root(
             ids[file],
             meta.edition,
@@ -458,7 +466,7 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
             Some(meta.cfg),
             env,
             CrateOrigin::Local { repo: None, name: None },
-            Vec::new(),
+            attrs.into_iter().collect(),
             TargetKind::Lib { is_proc_macro: false },
             proc_macro_cwd.clone(),
             workspace.clone(),
@@ -502,7 +510,8 @@ fn build(fixture: &str, mut extra: Vec<(String, ProcMacro)>) -> Fixture {
             Default::default(),
             fixture_env(),
             CrateOrigin::Local { repo: None, name: None },
-            Vec::new(),
+            // alloc: one crate attribute, once per fixture
+            vec!["no_core".to_owned()],
             TargetKind::Lib { is_proc_macro: true },
             proc_macro_cwd,
             workspace,
@@ -610,6 +619,26 @@ fn set_files(
             }
         })
         .collect()
+}
+
+/// The crate attribute a fixture crate with no `std` dependency takes, so that rustc's injected
+/// `extern crate std;` is not asked for: `no_std` beside a `core` (minicore's or a `core` it
+/// depends on), whose prelude it gets, and `no_core` with none. None when it depends on `std`
+/// or its crate attributes or root already say either.
+fn sysroot_attr(meta: &FileMeta, root_text: &str, has_core: bool) -> Option<&'static str> {
+    let says = |attr: &str| {
+        meta.crate_attrs.iter().any(|it| it == attr)
+            || root_text.lines().any(|line| {
+                line.trim().strip_prefix("#![").and_then(|it| it.strip_suffix(']')) == Some(attr)
+            })
+    };
+    if meta.deps.iter().any(|it| it == "std") || says("no_std") || says("no_core") {
+        return None;
+    }
+    match has_core || meta.deps.iter().any(|it| it == "core") {
+        true => Some("no_std"),
+        false => Some("no_core"),
+    }
 }
 
 fn parse_target_arch(arch: &str) -> Arch {

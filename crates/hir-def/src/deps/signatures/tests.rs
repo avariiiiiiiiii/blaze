@@ -220,13 +220,18 @@ fn assert_served(db: &TestDB, krate: Crate, item: Item, values: bool) {
         Item::TypeAlias(id) => same!(TypeAlias, TypeAliasSignature, served_type_alias, id),
         Item::Fields(id) => same!(Fields, VariantFields, served_variant_fields, id),
         Item::Variants(id) => {
-            let direct =
-                values.then(|| served_enum_variants(db, id).expect("an enum with an image"));
+            // Outside the query, which runs in a frame of its `mem_tag`, the lowering needs one.
+            let in_frame = |f: &dyn Fn() -> (EnumVariants, ThinVec<InactiveEnumVariantCode>)| {
+                blaze_mem::frame::task(blaze_mem::Tag::Nameres, |_| f())
+            };
+            let direct = values.then(|| {
+                in_frame(&|| served_enum_variants(db, id).expect("an enum with an image"))
+            });
             let served = match &direct {
                 Some(it) => it,
                 None => EnumVariants::of(db, id),
             };
-            let lowered = EnumVariants::lower(db, id);
+            let lowered = in_frame(&|| EnumVariants::lower(db, id));
             let records = (
                 record::<codes::Variants>(db, krate, what, served),
                 record::<codes::Variants>(db, krate, what, &lowered),

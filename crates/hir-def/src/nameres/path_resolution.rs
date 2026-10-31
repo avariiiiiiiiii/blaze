@@ -34,7 +34,7 @@ use crate::{
         sub_namespace_match, trait_items::trait_item_per_ns,
     },
     per_ns::{PerNs, TypesItem},
-    visibility::{RawVisibility, Visibility, VisibilityError},
+    visibility::{RawVisibility, Visibility, VisibilityError, visibility_path},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,11 +159,12 @@ impl DefMap {
     ) -> Result<Visibility, VisibilityError> {
         let vis = match visibility {
             RawVisibility::Module(path, explicitness) => {
+                let path = visibility_path(path, self.data.edition)?;
                 let (result, remaining) = self.resolve_path(
                     local_def_map,
                     db,
                     original_module,
-                    path,
+                    &path,
                     BuiltinShadowMode::Module,
                     None,
                 );

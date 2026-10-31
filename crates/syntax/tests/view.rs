@@ -123,7 +123,7 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
                 assert_eq!(h.first_child_token_text(), v.first_child_token_text(), "{}", at());
                 let range = h.text_range();
                 let found = v.descendant_at_range(range, h.kind()).map(NodeOrToken::Node);
-                assert!(same(found, node(handle.descendant_at_range(range, h.kind()))), "{}", at());
+                assert!(same(found, node(h.descendant_at_range(range, h.kind()))), "{}", at());
                 let found = root.descendant_at_range(range, h.kind()).map(NodeOrToken::Node);
                 assert!(same(found, node(handle.descendant_at_range(range, h.kind()))), "{}", at());
                 accessors::check(h, v);

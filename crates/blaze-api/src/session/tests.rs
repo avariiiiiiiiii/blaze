@@ -653,6 +653,7 @@ fn worked() -> Response {
         compiled: 1,
         found: 4,
         link: crate::LinkKind::Placed,
+        links: vec![crate::Linked { how: crate::LinkHow::First, path: "target/debug/app".to_owned() }],
         critical_path_us: 70,
     })
 }

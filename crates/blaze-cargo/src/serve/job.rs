@@ -2201,10 +2201,14 @@ impl<S: Steps> Jobs<S> {
         let packing = match pack {
             true => Some(writer),
             false => {
-                if let Some(root) = root
-                    && let Some(kept) = writer.keep()
-                {
-                    self.roots.fronts[root as usize] = Some(kept);
+                if let Some(root) = root {
+                    match writer.keep() {
+                        Ok(kept) => self.roots.fronts[root as usize] = Some(kept),
+                        Err(error) => {
+                            self.end(w, id, false, Some(error));
+                            return;
+                        }
+                    }
                 }
                 None
             }
@@ -2315,6 +2319,8 @@ impl<S: Steps> Jobs<S> {
             compiled,
             found: fresh,
             link: link_kind(&links),
+            // alloc: one a link, at the request's end
+            links: links.into_iter().map(|(path, how)| blaze_api::Linked { how: how.how(), path }).collect(),
             critical_path_us: stats.critical_path_ns / 1000,
         };
         w.said.push(Said::Report(id, Response::Work(worked)));

@@ -268,7 +268,9 @@ impl<'c, 'f, const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>
                 tt::DelimiterKind::Brace => res.push(T!['{'], editions.of(ctx)),
                 tt::DelimiterKind::Bracket => res.push(T!['['], editions.of(ctx)),
                 tt::DelimiterKind::Invisible => {
-                    if FRAGMENTS && self.fragment_at.is_none() {
+                    if FRAGMENTS {
+                        // A waiting start is at `res.len()` too. Its origin is the innermost
+                        // group: a view from any group opened before it holds that one too.
                         self.fragment_at = Some(res.len());
                         if let Some(slots) = &mut self.slots {
                             slots.origin = slots.slot;

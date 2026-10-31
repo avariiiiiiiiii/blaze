@@ -181,8 +181,11 @@ outside its closure changed: verified by its summary in tens of ns, against the 
   `Db::run_all`'s) pushes a barrier first, so a job pumped above it starts a stack of its own:
   a hit never asks the pump for its depth.
 - `Storage::stop_readers()` sets a flag every query call checks (one relaxed load from the line
-  the view is on): set, it unwinds with `Cancelled::PendingWrite`. The next `&mut` clears it.
-  `unwind_if_cancelled(db)` is the same check for long loops.
+  the view is on): set, it unwinds with `Cancelled::PendingWrite`. The next view clears it, and
+  so does `Storage::resume_readers(&mut self)` (R14, 01211) for a host that took `&mut` and
+  wrote nothing (base-db's `Shared::write` and `idle`, which set only fields that differ): with
+  `&mut` no reader is left, so the stop has done its work, and clearing it opens no view and
+  re-verifies nothing. `unwind_if_cancelled(db)` is the same check for long loops.
 
 ### Cycles
 
@@ -243,6 +246,12 @@ The two forms the front end uses keep salsa's semantics, so every result is the 
   rows past `N`, oldest `verified` first, drop their value and keep stamp, hash and edges;
   nothing is written on a hit (no recency list). `lru = 0`: no cap, evictable on demand
   (`Query::evict_values(db)`, `hir/src/evict.rs`).
+- The cap is a runtime value (R15, 01212): `N` is its start, held in the function's table, and
+  `f::set_lru_capacity(db: &mut D, capacity: usize)` replaces it (0: no cap), applied at the
+  next view's sweep. Every `lru` function is on the sweep list whatever its cap, so a cap set
+  later on a function declared `lru = 0` is swept too. Users: base-db's `Db::admit_parses` (the
+  parse budget per revision) and hir-ty `providers.rs`'s MIR-body caps. The cap is read only by
+  the sweep, never on a hit.
 
 ### Memory, tags, frames
 
@@ -336,7 +345,8 @@ impl Storage {
     pub fn view(&self) -> View;
     pub fn synthetic_write(&mut self, durability: Durability);
     pub fn stop_readers(&self);                  // readers unwind Cancelled::PendingWrite
-    pub fn readers_stopped(&self) -> bool;       // stop_readers since the last `&mut` (01120)
+    pub fn readers_stopped(&self) -> bool;       // stop_readers since the last view or resume (01120)
+    pub fn resume_readers(&mut self);            // clears the stop flag (clock bit 32); no view (R14)
     pub fn owner(&self, id: Id) -> Option<u32>;  // the ingredient that owns id's page
     pub fn ingredient_name(&self, ingredient: u32) -> &'static str;
     pub fn ingredient_file(&self, ingredient: u32) -> &'static str;   // `file!()` of its definition (01125)
@@ -449,7 +459,7 @@ pub trait Function: 'static {
     type Value: Send + Sync + 'static;            // `'db` erased to `'static` by the macro
     const NAME: &'static str;                     // `f`, or `SelfTy::f` in a tracked impl / with `self_ty`
     const FILE: &'static str;                     // `file!()` at the definition (every trait here has it)
-    const LRU: usize;                             // 0: no cap
+    const LRU: usize;                             // the starting cap; 0: no cap (R15: the live cap is the table's)
     const EVICTABLE: bool;                        // `lru = N` given (0 too): `hash` is real, `evict_values*` exist
     const NO_EQ: bool;
     const CYCLE: CycleKind;
@@ -467,6 +477,7 @@ pub fn value_hash<V: Hash + ?Sized>(value: &V) -> u64;   // what `hash` calls: t
 pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value;
 pub fn evict_values<F: Function>(db: &mut F::Db) -> usize;
 pub fn evict_values_of<F: Function>(db: &mut F::Db, keys: &[F::Key]) -> usize;
+pub fn set_lru_capacity<F: Function>(db: &mut F::Db, capacity: usize);   // EVICTABLE only; next sweep (R15)
 
 // Inputs, interned and tracked structs name no database (their attributes don't): their
 // functions take the `Storage` (`Database::storage(db)`), so their methods are generic over
@@ -552,8 +563,8 @@ The macros generate, for a tracked function `fn f(db: &Db, a: A, b: B) -> V`: a 
 fork's does), a private `struct Configuration` implementing `Function` with `execute` calling
 the user's body (private, so a private value type in a `pub fn` is no E0446), its `static
 VTABLE` and `static INGREDIENT`, and `fn f(db, a, b) -> <returns>` doing
-`plumbing::fetch::<Configuration>(db, key)` then the return mode. `evict_values`/`evict_values_of`
-(functions with `lru = N`) and `arguments` (several arguments) are inherent associated functions
+`plumbing::fetch::<Configuration>(db, key)` then the return mode. `evict_values`/`evict_values_of`/
+`set_lru_capacity` (functions with `lru = N`) and `arguments` (several arguments) are inherent associated functions
 of `struct f`, so `mir_body_query::evict_values(db)` (hir/src/evict.rs) reads as it does now. In a
 tracked `impl`, the user's body stays in the impl as a private method (so `Self` and the impl's
 `'db` mean what they did), the struct is `TypeName_method` beside the impl, and the method calls

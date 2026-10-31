@@ -377,10 +377,6 @@ fn diverging_expression_3_break() {
             140..141 'x': u32
             149..175 '{ for ...; }; }': u32
             151..172 'for a ...eak; }': !
-            151..172 'for a ...eak; }': {unknown}
-            151..172 'for a ...eak; }': &'? mut {unknown}
-            151..172 'for a ...eak; }': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
-            151..172 'for a ...eak; }': Option<<{unknown} as Iterator>::Item>
             151..172 'for a ...eak; }': ()
             151..172 'for a ...eak; }': ()
             151..172 'for a ...eak; }': ()
@@ -389,15 +385,15 @@ fn diverging_expression_3_break() {
             160..161 'b': {unknown}
             160..161 'b': fn into_iter<{unknown}>({unknown}) -> <{unknown} as IntoIterator>::IntoIter
             160..161 'b': <{unknown} as IntoIterator>::IntoIter
+            160..161 'b': {unknown}
+            160..161 'b': &'? mut {unknown}
+            160..161 'b': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            160..161 'b': Option<<{unknown} as Iterator>::Item>
             162..172 '{ break; }': !
             164..169 'break': !
             226..227 'x': u32
             235..253 '{ for ... {}; }': u32
             237..250 'for a in b {}': !
-            237..250 'for a in b {}': {unknown}
-            237..250 'for a in b {}': &'? mut {unknown}
-            237..250 'for a in b {}': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
-            237..250 'for a in b {}': Option<<{unknown} as Iterator>::Item>
             237..250 'for a in b {}': ()
             237..250 'for a in b {}': ()
             237..250 'for a in b {}': ()
@@ -406,14 +402,14 @@ fn diverging_expression_3_break() {
             246..247 'b': {unknown}
             246..247 'b': fn into_iter<{unknown}>({unknown}) -> <{unknown} as IntoIterator>::IntoIter
             246..247 'b': <{unknown} as IntoIterator>::IntoIter
+            246..247 'b': {unknown}
+            246..247 'b': &'? mut {unknown}
+            246..247 'b': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            246..247 'b': Option<<{unknown} as Iterator>::Item>
             248..250 '{}': ()
             304..305 'x': u32
             313..340 '{ for ...; }; }': u32
             315..337 'for a ...urn; }': !
-            315..337 'for a ...urn; }': {unknown}
-            315..337 'for a ...urn; }': &'? mut {unknown}
-            315..337 'for a ...urn; }': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
-            315..337 'for a ...urn; }': Option<<{unknown} as Iterator>::Item>
             315..337 'for a ...urn; }': ()
             315..337 'for a ...urn; }': ()
             315..337 'for a ...urn; }': ()
@@ -422,6 +418,10 @@ fn diverging_expression_3_break() {
             324..325 'b': {unknown}
             324..325 'b': fn into_iter<{unknown}>({unknown}) -> <{unknown} as IntoIterator>::IntoIter
             324..325 'b': <{unknown} as IntoIterator>::IntoIter
+            324..325 'b': {unknown}
+            324..325 'b': &'? mut {unknown}
+            324..325 'b': fn next<{unknown}>(&'? mut {unknown}) -> Option<<{unknown} as Iterator>::Item>
+            324..325 'b': Option<<{unknown} as Iterator>::Item>
             326..337 '{ return; }': !
             328..334 'return': !
             149..175: expected u32, got ()

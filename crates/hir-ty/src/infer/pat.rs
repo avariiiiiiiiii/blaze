@@ -28,7 +28,7 @@ use crate::{
     BindingMode, InferenceDiagnostic, Span,
     infer::{
         AllowTwoPhase, ByRef, Expectation, InferenceContext, InferenceTables, PatAdjust,
-        PatAdjustment,
+        PatAdjustment, StructPathDef, StructPathFound,
         expr::ExprIsRead,
     },
     next_solver::{
@@ -591,7 +591,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             pat_adjustments
                 .push(pat, PatAdjustment { kind: pat_adjust_kind, source: expected.store() });
         } else {
-            // FIXME: Emit an error.
+            self.table.recursion_limit_errors.report(&self.table.infer_ctxt, pat.into(), expected);
             inner_ty = self.types.types.error;
         }
 
@@ -1047,9 +1047,23 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         match res {
             ValueNs::FunctionId(_)
             | ValueNs::GenericParam(_)
-            | ValueNs::ImplSelf(_)
             | ValueNs::LocalBinding(_)
             | ValueNs::StaticId(_) => {
+                let def = match res {
+                    ValueNs::FunctionId(_) => StructPathDef::Function,
+                    ValueNs::GenericParam(_) => StructPathDef::ConstParam,
+                    ValueNs::LocalBinding(_) => StructPathDef::Local,
+                    _ => StructPathDef::Static,
+                };
+                self.push_diagnostic(InferenceDiagnostic::NotAStructPath {
+                    node: pat.into(),
+                    found: StructPathFound::Def(def),
+                    ty: None,
+                });
+                return Err(());
+            }
+            // `infer_path` makes a `Self` of a struct the struct.
+            ValueNs::ImplSelf(_) => {
                 // FIXME: Emit an error.
                 return Err(());
             }
@@ -1423,7 +1437,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         // (RFC 3627, Rule 5). If we implement a pattern typing ruleset with Rule 4E
                         // but not Rule 5, we'll need to check that here.
                         debug_assert!(ref_pat_matches_mut_ref);
-                        // FIXME: Emit an error.
+                        self.push_diagnostic(InferenceDiagnostic::InheritedRefMutabilityMismatch {
+                            pat,
+                        });
                     }
 
                     pat_info.binding_mode = ByRef::No;
@@ -1461,7 +1477,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                             // falling back to the inherited reference didn't work. This should be
                             // the same error as the old-Edition version below.
                             debug_assert!(ref_pat_matches_mut_ref);
-                            // FIXME: Emit an error.
+                            self.push_diagnostic(
+                                InferenceDiagnostic::InheritedRefMutabilityMismatch { pat },
+                            );
                         }
 
                         pat_info.binding_mode = ByRef::No;
@@ -1498,7 +1516,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                         // inherited reference.
                         if pat_mutbl > inh_mut {
                             // We can't match a lone inherited shared reference with `&mut`.
-                            // FIXME: Emit an error.
+                            self.push_diagnostic(
+                                InferenceDiagnostic::InheritedRefMutabilityMismatch { pat },
+                            );
                         }
 
                         self.result.skipped_ref_pats.insert(pat);

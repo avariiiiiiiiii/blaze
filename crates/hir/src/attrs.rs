@@ -568,6 +568,7 @@ fn resolve_impl_trait_item<'db>(
             call_span: hir_ty::Span::Dummy,
             receiver_span: hir_ty::Span::Dummy,
             frame,
+            errors: None,
         };
         ctx.probe_for_name(method_resolution::Mode::Path, *name, ty.ty.skip_binder())
     });

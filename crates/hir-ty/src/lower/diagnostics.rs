@@ -1,11 +1,12 @@
 //! This files contains the declaration of diagnostics kinds for ty and path lowering.
 
 use hir_def::{
-    EnumVariantId, GenericDefId, GenericParamId, ImplId, TypeAliasId,
+    AssocItemId, EnumVariantId, GenericDefId, GenericParamId, ImplId, TraitId, TypeAliasId,
+    TypeParamId,
     type_ref::{LifetimeRefId, TypeRefId},
 };
 
-use crate::Span;
+use crate::{Span, consteval::CreateConstError};
 
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub enum TyLoweringDiagnostic {
@@ -17,6 +18,25 @@ pub enum TyLoweringDiagnostic {
     /// none to elide to. One site but for [`MissingLifetimeKind::ElisionFailure`], which has
     /// every site of one return type, as rustc reports them in one error.
     MissingLifetimes { sites: Box<[ElidedLifetimeSite]>, kind: MissingLifetimeKind },
+    /// A const argument that is not a constant, at `site`: its expression, or the type ref of
+    /// a path written where a type could stand.
+    InvalidConstArg { site: Span, reason: CreateConstError },
+    /// `impl Trait` where it is not allowed: E0562 (rustc's `ImplTraitPosition`, which the
+    /// emitter reads from where `source` is written).
+    ImplTraitNotAllowed { source: TypeRefId },
+    /// A trait object with more than one non-auto trait: E0225, at the bound of the `first`
+    /// and those of the `additional` ones (rustc's `lower_trait_object_ty`).
+    AdditionalNonAutoTraits { first: TypeRefId, additional: Box<[TypeRefId]> },
+    /// Two bounds of a trait object that give the associated type or const `assoc` different
+    /// values, the second at `source`: E0719 (rustc's `lower_trait_object_ty`).
+    ConflictingAssocTypeBindings { source: TypeRefId, assoc: AssocItemId },
+    /// A trait object whose principal trait `trait_` leaves out the type parameters `params`
+    /// whose defaults name `Self`, at the bound `source`: E0393 (rustc's
+    /// `report_missing_type_params`).
+    MissingSelfDefaultParams { source: TypeRefId, trait_: TraitId, params: Box<[TypeParamId]> },
+    /// A trait object whose bounds are only relaxed ones (`dyn ?Sized`), at the first:
+    /// E0224. A `dyn` with no trait written at all is the parser's.
+    ObjectWithoutTrait { source: TypeRefId },
 }
 
 /// Where a lifetime is left out.
@@ -140,6 +160,31 @@ pub enum PathLoweringDiagnostic {
         item: TypeAliasId,
         impl_: ImplId,
     },
+    /// The associated type `segment` names, looked up in `qself`'s bounds (`T::Name`,
+    /// `Self::Name`) or in the trait (`Trait::Name`), that `failure` gives: E0220 not found,
+    /// E0221 ambiguous, E0391 a cycle (rustc's `probe_single_bound_for_assoc_item`).
+    AssocTypeNotResolved { segment: u32, qself: AssocTypeQself, failure: AssocTypeFailure },
+    /// An associated type `segment` of a type no bound can give it of (`T::A::B`,
+    /// `<u8>::Name`, an inherent one not found): E0223 (rustc's
+    /// `report_ambiguous_assoc_item`).
+    AmbiguousAssocType { segment: u32 },
+}
+
+/// Where an associated type shorthand is looked up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssocTypeQself {
+    /// The bounds of a type parameter, `Self` included.
+    Param(TypeParamId),
+    /// The trait itself.
+    Trait(TraitId),
+}
+
+/// Why an associated type shorthand did not resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AssocTypeFailure {
+    NotFound,
+    Ambiguous,
+    Cycle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

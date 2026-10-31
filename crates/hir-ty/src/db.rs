@@ -1431,6 +1431,10 @@ pub mod kinds {
         USED_IMPORTS_WITH_TRAITS = 0x24c0, "used_imports_with_traits";
         USES_FN_CACHE = 0x24c1, "uses_fn_cache";
 
+        // Bodies served from the check cache.
+        SERVED_PART = 0x24f0, "served_part";
+        SERVED_ITEMS = 0x24f1, "served_items";
+
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";
         TRAIT_IMPLS_SLICE_INPUT = 0x25e1, "TraitImplsSlice";
@@ -1439,6 +1443,7 @@ pub mod kinds {
         SLICE_DIRECTORY = 0x25e4, "SliceDirectory";
         IMPL_SLICES = 0x25e5, "ImplSlices";
         IMPL_IDENTITIES = 0x25e6, "ImplIdentities";
+        SERVED_BODIES = 0x25e7, "ServedBodies";
 
         // Interned ids.
         INTERNED_OPAQUE_TY = 0x25f0, "InternedOpaqueTyId";
@@ -1446,6 +1451,7 @@ pub mod kinds {
         INTERNED_COROUTINE = 0x25f2, "InternedCoroutineId";
         INTERNED_COROUTINE_CLOSURE = 0x25f3, "InternedCoroutineClosureId";
         ANON_CONST = 0x25f4, "AnonConstId";
+        IMPL_PAIR = 0x25f5, "ImplPair";
     }
 
     #[cfg(test)]

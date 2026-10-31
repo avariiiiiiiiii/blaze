@@ -252,6 +252,7 @@ fn orphan_rules_normalize_only_a_header_with_an_alias() {
 }
 
 const FREEZE: &str = r#"
+#![feature(lang_items)]
 #[lang = "unsafe_cell"]
 pub struct UnsafeCell<T>(T);
 pub struct Cell<T>(UnsafeCell<T>);

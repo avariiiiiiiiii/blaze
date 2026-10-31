@@ -18,6 +18,9 @@
 //! lowering takes. Once a path's prefix is a type the rest is type-relative: inference
 //! resolves it through impls and traits, which are facts (section 5).
 //!
+//! A lifetime written by name is hashed as the generic parameter it resolves to, or by its
+//! text where it resolves to none, so its name in the HIR's bytes can be left out.
+//!
 //! The traits in scope are hashed once per module a scope is in (the owner's, each block's
 //! with items): the impl's trait, the blocks', the prelude's and the module's, as a sorted set
 //! of (key, signature), which is what method calls and type-relative paths search.
@@ -38,12 +41,15 @@ use hir_def::{
     expr_store::{
         Body, ExpressionStore, HygieneId, StoreVisitor, StoreVisitorExt as _, path::Path,
     },
-    hir::{AsmOperand, Expr, ExprId, InlineAsm, Pat, PatId, type_ref::TypeRef, type_ref::TypeRefId},
+    hir::{
+        AsmOperand, Expr, ExprId, InlineAsm, Pat, PatId,
+        type_ref::{LifetimeRef, LifetimeRefId, TypeRef, TypeRefId},
+    },
     item_hash::{mod_path_index, path_count},
     item_tree::VisibilityExplicitness,
     nameres::ResolvePathResultPrefixInfo,
     per_ns::PerNs,
-    resolver::{HasResolver, ResolveValueResult, Resolver, TypeNs, ValueNs},
+    resolver::{HasResolver, LifetimeNs, ResolveValueResult, Resolver, TypeNs, ValueNs},
     visibility::Visibility,
 };
 use hir_expand::{mod_path::ModPath, name::AsName};
@@ -135,6 +141,7 @@ fn write(
         traits: Traits { db, out: traits, seen: scratch::lend_u32s() },
         pats: scratch::lend_u32s(),
         types: scratch::lend_u32s(),
+        lifetimes: scratch::lend_u32s(),
         blank,
     };
     walk.traits.scope(&base)?;
@@ -156,9 +163,10 @@ fn write(
 struct Walk<'a, 'db> {
     out: Out<'a, 'db>,
     traits: Traits<'a, 'db>,
-    /// The patterns and types of the expression being walked, still to walk.
+    /// The patterns, types and lifetimes of the expression being walked, still to walk.
     pats: scratch::Lent<Vec<u32>>,
     types: scratch::Lent<Vec<u32>>,
+    lifetimes: scratch::Lent<Vec<u32>>,
     blank: &'a mut [u16],
 }
 
@@ -183,13 +191,13 @@ impl Walk<'_, '_> {
                     if let AsmOperand::Sym(path) = *operand {
                         let path = store.path_at(path);
                         self.path(store, at, also, path, store.expr_path_hygiene(id))?;
-                        Collect { pats: &mut self.pats, types: &mut self.types }.on_path(path);
+                        self.gather().on_path(path);
                     }
                 }
             }
             _ => {}
         }
-        store.visit_expr_children(id, Collect { pats: &mut self.pats, types: &mut self.types });
+        store.visit_expr_children(id, self.gather());
         self.drain(store, at, also)
     }
 
@@ -211,17 +219,42 @@ impl Walk<'_, '_> {
                     }
                     _ => {}
                 }
-                let collect = Collect { pats: &mut self.pats, types: &mut self.types };
+                let collect = self.gather();
                 store.visit_pat_children(pat, collect);
             } else if let Some(ty) = self.types.pop() {
                 let ty = TypeRefId::from_raw(RawIdx::from_u32(ty));
                 if let TypeRef::Path(path) = store.type_ref(ty) {
                     self.path(store, at, also, path, store.type_path_hygiene(ty))?;
                 }
-                let collect = Collect { pats: &mut self.pats, types: &mut self.types };
+                let collect = self.gather();
                 store.visit_type_ref_children(ty, collect);
+            } else if let Some(lifetime) = self.lifetimes.pop() {
+                self.lifetime(at, &store[LifetimeRefId::from_raw(RawIdx::from_u32(lifetime))]);
             } else {
                 return Ok(());
+            }
+        }
+    }
+
+    fn gather(&mut self) -> Collect<'_> {
+        Collect { pats: &mut self.pats, types: &mut self.types, lifetimes: &mut self.lifetimes }
+    }
+
+    /// A lifetime written by name, as what it resolves to at `at`: a generic parameter as
+    /// [`Out::param`], so that a rename keeps the identity; one that resolves to nothing (a
+    /// `for<..>` binder's) by its text. The others are the HIR's bytes alone.
+    fn lifetime(&mut self, at: &Resolver<'_>, lifetime: &LifetimeRef) {
+        let LifetimeRef::Named(name) = lifetime else { return };
+        self.out.tag(0xfe);
+        match at.resolve_lifetime(lifetime) {
+            Some(LifetimeNs::LifetimeParam(it)) => {
+                self.out.tag(1);
+                self.out.param(it.parent, it.local_id.into_raw().into_u32());
+            }
+            Some(LifetimeNs::Static) => self.out.tag(2),
+            None => {
+                self.out.tag(0);
+                self.out.bytes(name.as_str().as_bytes());
             }
         }
     }
@@ -252,10 +285,11 @@ impl Walk<'_, '_> {
     }
 }
 
-/// Gathers the patterns and types an expression, pattern or type holds.
+/// Gathers the patterns, types and lifetimes an expression, pattern or type holds.
 struct Collect<'a> {
     pats: &'a mut Vec<u32>,
     types: &'a mut Vec<u32>,
+    lifetimes: &'a mut Vec<u32>,
 }
 
 impl StoreVisitor for Collect<'_> {
@@ -269,6 +303,10 @@ impl StoreVisitor for Collect<'_> {
 
     fn on_type(&mut self, ty: TypeRefId) {
         self.types.push(ty.into_raw().into_u32());
+    }
+
+    fn on_lifetime(&mut self, lifetime: LifetimeRefId) {
+        self.lifetimes.push(lifetime.into_raw().into_u32());
     }
 }
 

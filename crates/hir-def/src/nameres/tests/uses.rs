@@ -321,13 +321,14 @@ macro_rules! made { () => {} }
         "main",
         fixture,
         expect![[r#"
-            macro_use extern crate dep; Scope
+            macro_use #[macro_use]
+            extern crate dep; Scope
         "#]],
     );
     let db = fixture::db(fixture).into_db();
     let def_map = crate_def_map(&db, crate_named(&db, "main"));
     let [call] = def_map.name_records(&db).macro_calls() else { panic!() };
-    assert_eq!(via_text(&db, call.via), "macro_use extern crate dep;");
+    assert_eq!(via_text(&db, call.via), "macro_use #[macro_use]\nextern crate dep;");
 }
 
 #[test]
@@ -412,10 +413,12 @@ macro_rules! made { () => {} }
         expect![[r#"
             use S Types Other super::a::*
             use S Values Other super::a::*
-            use made Macros Scope extern crate dep;
+            use made Macros Scope #[macro_use]
+            extern crate dep;
             unresolved missing::thing
             glob super::a::* reads a
-            call macro_use extern crate dep;
+            call macro_use #[macro_use]
+            extern crate dep;
         "#]],
     );
 }

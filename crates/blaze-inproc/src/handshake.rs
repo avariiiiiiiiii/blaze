@@ -38,6 +38,9 @@ pub(crate) const MOST_BINDS: usize = 1 << 22;
 /// The longest name a lookup may have.
 pub(crate) const MOST_NAME: usize = 1 << 16;
 
+/// The bytes of one encoded overlay: object, offset, length, address, access, place, image.
+pub(crate) const OVERLAY_BYTES: usize = 31;
+
 /// The bytes of one encoded write: place, value, whether it is an address.
 const WRITE_BYTES: usize = 17;
 
@@ -156,7 +159,7 @@ impl Grant {
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.reserve(
             41 + 9 * self.objects.len()
-                + 35 * self.overlays.len()
+                + OVERLAY_BYTES * self.overlays.len()
                 + WRITE_BYTES * self.writes.len()
                 + (LOOKUP_BYTES - 1) * self.lookups.len()
                 + self.names.len(),
@@ -269,7 +272,7 @@ impl Grant {
         if objects[0].1 != Rights::Code || objects[1].1 != Rights::Words || objects[2].1 != Rights::Words {
             return Err(Error::new("a grant whose first objects are not the code memory, the control words and the asks"));
         }
-        let count = read.count(35).map_err(&bad)?;
+        let count = read.count(OVERLAY_BYTES).map_err(&bad)?;
         if count > MOST {
             return Err(Error::new(format!("a grant of {count} overlays")));
         }

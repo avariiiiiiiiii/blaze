@@ -572,7 +572,7 @@ mod through_stubs {
             )
             .unwrap();
             let isa = Isa::host().unwrap();
-            let stubs = stub::generate(&isa, FUNCTIONS, hook as usize as u64).unwrap();
+            let stubs = stub::generate(&isa, FUNCTIONS, hook as *const () as u64).unwrap();
             World { runner, mail, compiler, seq: AtomicU32::new(1), code: Code::new(&stubs.bytes), layout: stubs.layout }
         })
     }

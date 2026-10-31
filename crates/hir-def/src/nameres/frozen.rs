@@ -65,7 +65,7 @@ use crate::{
     lang_item::{LangItemEnum, LangItemTarget, LangItems},
     nameres::{
         DefDiagnostic, DefMap, DefMapCrateData, LocalDefMap, ModuleData, ModuleOrigin, ModulesSlot,
-        diagnostics::{DefDiagnosticKind, TraitItemImport},
+        diagnostics::{DefDiagnosticKind, PreludeError, TraitItemImport},
         uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use, Used},
     },
     per_ns::{Item, Namespace},
@@ -78,7 +78,7 @@ type R<T = ()> = Result<T, String>;
 /// The version of what this module writes, for the key frozen bytes are stored under: it
 /// changes with every change to the bytes [`Enc`] writes, the list of lang items included, so
 /// bytes of another version are never read.
-pub const ENCODING: &str = "blaze frozen def map 12";
+pub const ENCODING: &str = "blaze frozen def map 13";
 
 /// What name resolution does with the frozen bytes of a crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1772,6 +1772,14 @@ impl Enc<'_> {
                     TraitItemImport::ItemsFromMacros => 1,
                 });
             }
+            DefDiagnosticKind::Prelude { krate, error } => {
+                self.u8(11);
+                self.name(krate)?;
+                self.u8(match error {
+                    PreludeError::CrateNotFound => 0,
+                    PreludeError::NoPreludeModule => 1,
+                });
+            }
             DefDiagnosticKind::UnconfiguredCode { ast_id, cfg } => {
                 self.u8(3);
                 self.hir_file(ast_id.file_id)?;
@@ -3224,6 +3232,16 @@ impl Dec<'_> {
                     it => return Err(format!("trait item import {it}")),
                 };
                 DefDiagnosticKind::TraitItemImport { id, index, why }
+            }
+            11 => {
+                let krate = self.name()?;
+                let error = match self.u8()? {
+                    0 => PreludeError::CrateNotFound,
+                    1 => PreludeError::NoPreludeModule,
+                    // alloc: error path
+                    it => return Err(format!("prelude error {it}")),
+                };
+                DefDiagnosticKind::Prelude { krate, error }
             }
             // alloc: error path
             it => return Err(format!("diagnostic {it}")),

@@ -483,7 +483,6 @@ impl<'a, 'db> Checker<'a, 'db> {
     }
 
     fn finish(self) -> ConstCheck {
-        eprintln!("DBGCC finish tainted={} primary={:?} secondary={:?}", self.tainted, self.primary, self.secondary);
         if self.tainted {
             return ConstCheck::default();
         }
@@ -544,7 +543,6 @@ impl<'a, 'db> Checker<'a, 'db> {
     }
 
     fn report(&mut self, kind: ConstCheckKind, span: MirSpan) {
-        eprintln!("DBGCC report {kind:?} {span:?} written={}", self.written(span));
         if !self.written(span) {
             return;
         }

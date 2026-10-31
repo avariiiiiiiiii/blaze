@@ -72,6 +72,13 @@ impl Names {
                         names.macros.insert(name, it.def);
                     }
                 }
+                // A `macro_rules!` is in the module's textual scope, not its entries.
+                for (name, defs) in data.scope(db).legacy_macros() {
+                    let Some(&def) = defs.last() else { continue };
+                    let name = name.as_str().to_owned();
+                    names.of.entry(ModuleDefId::MacroId(def)).or_insert_with(|| name.clone());
+                    names.macros.entry(name).or_insert(def);
+                }
             }
         }
         names

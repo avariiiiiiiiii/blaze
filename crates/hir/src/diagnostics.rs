@@ -65,7 +65,7 @@ use triomphe::Arc;
 
 use crate::{
     AnyFunctionId, AssocItem, Const, EnumVariant, Field, Function, GenericDef, GenericParam, Trait,
-    Type, TypeAlias, TypeOwnerId, Variant,
+    Type, TypeAlias, TypeOwnerId, TypeParam, Variant,
     match_lints::{BindingOrigin, ConstPatternError, SpecialTy},
     struct_tail_raw,
 };
@@ -73,8 +73,10 @@ use crate::{
 pub use hir_def::{VariantId, expr_store::MissingBodyItemKind, hir::UnsafeBinderCastKind};
 pub use hir_expand::BuiltinChild;
 pub use hir_ty::{
-    GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind, ReturnKind,
+    AssocTypeFailure, GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind,
+    ReturnKind, StructPathDef, StructPathFound,
     const_param_ty::ConstParamTyReason,
+    consteval::CreateConstError,
     diagnostics::{CaseType, IdentType, IncorrectCase},
 };
 pub use hir_ty::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
@@ -170,6 +172,13 @@ diagnostics![AnyDiagnostic<'db> ->
     MissingBody,
     FunctionalRecordUpdateOnNonStruct,
     GenericDefaultRefersToSelf,
+    AssocTypeNotResolved,
+    AmbiguousAssocType,
+    ImplTraitNotAllowed,
+    AdditionalNonAutoTraits,
+    ConflictingAssocTypeBindings,
+    MissingSelfDefaultParams,
+    ObjectWithoutTrait,
     InactiveCode,
     IncoherentImpl,
     IncorrectCase,
@@ -178,6 +187,7 @@ diagnostics![AnyDiagnostic<'db> ->
     InferVarsNotAllowed,
     InvalidCast<'db>,
     InvalidDeriveTarget,
+    InvalidVisibility,
     InvalidLhsOfAssignment,
     InvalidRangePatType<'db>,
     LateBoundLifetimeArgs,
@@ -205,6 +215,7 @@ diagnostics![AnyDiagnostic<'db> ->
     MismatchedArrayPatLen,
     DuplicateField,
     PatternArgInExternFn,
+    MissingPrelude,
     PrivateAssocItem,
     PrivateField,
     RemoveTrailingReturn,
@@ -246,6 +257,12 @@ diagnostics![AnyDiagnostic<'db> ->
     YieldOutsideCoroutine,
     ReturnOutsideFunction,
     UnsafeBinderCastOfNonBinder<'db>,
+    InvalidConstArg,
+    NotAStructPath<'db>,
+    AutoderefRecursionLimit<'db>,
+    MethodOnUnknownRawPointee,
+    InheritedRefMutabilityMismatch,
+    FnTraitArgsNotTuple,
     ConstParamTyNotAllowed<'db>,
     ValTreeError<'db>,
     UnplacedDiagnostic<'db>,
@@ -299,6 +316,22 @@ pub struct UnresolvedImport {
 pub struct TraitItemImport {
     pub decl: InFile<AstPtr<ast::UseTree>>,
     pub why: hir_def::nameres::diagnostics::TraitItemImport,
+}
+
+/// The crate's injected `extern crate std;` (`core` under `#![no_std]`) names no dependency, or
+/// that crate has no `prelude::rust_20xx`: rustc's E0463 or E0433, with no span.
+#[derive(Debug)]
+pub struct MissingPrelude {
+    pub krate: Name,
+    pub error: hir_def::nameres::diagnostics::PreludeError,
+}
+
+/// A `pub(in path)` or `pub(super)` whose path names no module above the item, as rustc's
+/// `try_resolve_visibility` reports it; the item is `pub` after it.
+#[derive(Debug)]
+pub struct InvalidVisibility {
+    pub node: InFile<AstPtr<ast::Visibility>>,
+    pub error: hir_def::visibility::VisibilityError,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -1389,6 +1422,58 @@ pub struct GenericDefaultRefersToSelf {
     pub segment: InFile<AstPtr<ast::PathSegment>>,
 }
 
+/// The associated type `segment` names that `qself` does not give for `failure`: E0220 not
+/// found, E0221 ambiguous, E0391 a cycle. `qself` is the type parameter (`Self` of a trait
+/// included) whose bounds were looked in, or the trait of `Trait::Name`.
+#[derive(Debug)]
+pub struct AssocTypeNotResolved {
+    pub segment: InFile<AstPtr<ast::PathSegment>>,
+    pub qself: Either<TypeParam, Trait>,
+    pub failure: AssocTypeFailure,
+}
+
+/// An associated type `segment` of a type no bound gives it of: E0223.
+#[derive(Debug)]
+pub struct AmbiguousAssocType {
+    pub segment: InFile<AstPtr<ast::PathSegment>>,
+}
+
+/// `impl Trait` where it is not allowed: E0562.
+#[derive(Debug)]
+pub struct ImplTraitNotAllowed {
+    pub ty: InFile<AstPtr<ast::Type>>,
+}
+
+/// A trait object with more than one non-auto trait: E0225, at the `first` bound and the
+/// `additional` ones.
+#[derive(Debug)]
+pub struct AdditionalNonAutoTraits {
+    pub first: InFile<AstPtr<ast::Type>>,
+    pub additional: Box<[InFile<AstPtr<ast::Type>>]>,
+}
+
+/// A second value of the associated item `assoc` in a trait object, at `bound`: E0719.
+#[derive(Debug)]
+pub struct ConflictingAssocTypeBindings {
+    pub bound: InFile<AstPtr<ast::Type>>,
+    pub assoc: AssocItem,
+}
+
+/// A trait object of `trait_` at `bound` that leaves out `params`, whose defaults name
+/// `Self`: E0393.
+#[derive(Debug)]
+pub struct MissingSelfDefaultParams {
+    pub bound: InFile<AstPtr<ast::Type>>,
+    pub trait_: Trait,
+    pub params: Box<[TypeParam]>,
+}
+
+/// A trait object whose bounds are only relaxed (`dyn ?Sized`), at the first: E0224.
+#[derive(Debug)]
+pub struct ObjectWithoutTrait {
+    pub bound: InFile<AstPtr<ast::Type>>,
+}
+
 #[derive(Debug)]
 pub struct UnionExprMustHaveExactlyOneField {
     pub expr: InFile<ExprOrPatPtr>,
@@ -1696,6 +1781,55 @@ pub struct ReturnOutsideFunction {
     pub kind: ReturnKind,
 }
 
+/// A const argument in a body that is not a constant, for `reason`: at its expression, or at
+/// the type ref of a path written where a type could stand.
+#[derive(Debug)]
+pub struct InvalidConstArg {
+    pub site: SpanSyntax,
+    pub reason: CreateConstError,
+}
+
+/// A struct literal's or pattern's path that resolves to something it can't be (see
+/// `StructPathFound` for rustc's error of each case). `ty` is the type found, exactly for
+/// `StructPathFound::Ty`.
+#[derive(Debug)]
+pub struct NotAStructPath<'db> {
+    pub node: InFile<ExprOrPatPtr>,
+    pub found: StructPathFound,
+    pub ty: Option<Type<'db>>,
+}
+
+/// E0055 "reached the recursion limit while auto-dereferencing `{ty}`", with rustc's help to
+/// add `#![recursion_limit = "{suggested_limit}"]`.
+#[derive(Debug)]
+pub struct AutoderefRecursionLimit<'db> {
+    pub site: SpanSyntax,
+    pub ty: Type<'db>,
+    pub suggested_limit: u32,
+}
+
+/// E0282 "type annotations needed" of a method call on a raw pointer to an unknown pointee,
+/// labelled "cannot call a method on a raw pointer with an unknown pointee type".
+#[derive(Debug)]
+pub struct MethodOnUnknownRawPointee {
+    pub site: SpanSyntax,
+}
+
+/// E0308 "mismatched types" at a `&mut` pattern's prefix matching an inherited shared
+/// reference: noted "cannot match inherited `&` with `&mut` pattern", suggested "replace this
+/// `&mut` pattern with `&`".
+#[derive(Debug)]
+pub struct InheritedRefMutabilityMismatch {
+    pub pat: InFile<ExprOrPatPtr>,
+}
+
+/// E0059 "cannot use call notation; the first type parameter for the function trait is
+/// neither a tuple nor unit", at the call.
+#[derive(Debug)]
+pub struct FnTraitArgsNotTuple {
+    pub call: InFile<ExprOrPatPtr>,
+}
+
 /// rustc's two errors of `check_expr_unsafe_binder_cast`: for `Wrap`, "`wrap_binder!()` can
 /// only wrap into unsafe binder, not {found}" (note "unsafe binders are the only valid output
 /// of wrap"), at the written type or else the cast; for `Unwrap`, "expected unsafe binder,
@@ -1880,15 +2014,14 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                     .push(UnresolvedExternCrate { decl: InFile::new(ast.file_id, item) }.into());
             }
 
-            DefDiagnosticKind::MacroError { ast, path, err } => {
+            DefDiagnosticKind::MacroError { ast, path: _, err } => {
                 let item = ast.to_ptr(self.db);
                 let RenderedExpandError { message, error, kind } = err.render_to_string(self.db);
                 let (code, also_at, children) = builtin_parts(self.db, err);
                 self.acc.push(
                     MacroError {
                         range: InFile::new(ast.file_id, item.text_range()),
-                        // alloc: error path, a reported diagnostic's message
-                        message: format!("{}: {message}", path.display(self.db, self.edition)),
+                        message,
                         error,
                         kind,
                         code,
@@ -1910,6 +2043,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
                 let use_tree = hir_def::src::use_tree_to_view(self.db, *id, *index);
                 let decl = InFile::new(id.file_id, AstPtr::of(use_tree));
                 self.acc.push(TraitItemImport { decl, why: *why }.into());
+            }
+            DefDiagnosticKind::Prelude { krate, error } => {
+                self.acc.push(MissingPrelude { krate: *krate, error: *error }.into());
             }
 
             DefDiagnosticKind::UnconfiguredCode { ast_id, cfg } => {
@@ -2049,6 +2185,22 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         self.emit_def_diagnostics(&impl_items.1);
         impl_items.0.macro_calls().for_each(|(_, call)| self.collect_macro_call(call));
         self.collect_assoc_items(&impl_items.0.items, def_map);
+        for &(_, item) in &impl_items.0.items {
+            use hir_def::src::HasSource as _;
+            use syntax::view::HasVisibility as _;
+            let db = self.db;
+            match item {
+                AssocItemId::FunctionId(it) => {
+                    self.collect_visibility(it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+                }
+                AssocItemId::ConstId(it) => {
+                    self.collect_visibility(it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+                }
+                AssocItemId::TypeAliasId(it) => {
+                    self.collect_visibility(it, it.lookup(db).source_view(db).map(|it| it.visibility()))
+                }
+            }
+        }
 
         let loc = def.lookup(self.db);
 
@@ -2258,6 +2410,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             .declarations()
             .chain(scope.unnamed_consts().map(ModuleDefId::ConstId))
             .for_each(|def| self.collect_module_def(def, def_map));
+        self.collect_visibilities(def, def_map, scope);
 
         scope.legacy_macros().flat_map(|(_, it)| it).for_each(|&def| {
             self.emit_case_diagnostics(def.into());
@@ -2275,6 +2428,72 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             impl_assoc_items_scratch.clear();
             self.collect_impl(def, &infcx, def_map, &mut impl_assoc_items_scratch)
         });
+    }
+
+    /// rustc's errors for the visibilities written on the items `module` declares, its imports
+    /// and extern crates, resolved in `module` as the def collectors resolve them.
+    fn collect_visibilities(
+        &mut self,
+        module: ModuleId,
+        def_map: &DefMap,
+        scope: &hir_def::item_scope::ItemScope,
+    ) {
+        use hir_def::src::HasSource as _;
+        use syntax::view::HasVisibility as _;
+        let db = self.db;
+        for def in scope.declarations().chain(scope.unnamed_consts().map(ModuleDefId::ConstId)) {
+            let vis = match def {
+                ModuleDefId::FunctionId(it) => it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ModuleDefId::ConstId(it) => it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ModuleDefId::StaticId(it) => it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ModuleDefId::TypeAliasId(it) => {
+                    it.lookup(db).source_view(db).map(|it| it.visibility())
+                }
+                ModuleDefId::TraitId(it) => it.lookup(db).source_view(db).map(|it| it.visibility()),
+                ModuleDefId::AdtId(AdtId::StructId(it)) => {
+                    it.lookup(db).source_view(db).map(|it| it.visibility())
+                }
+                ModuleDefId::AdtId(AdtId::UnionId(it)) => {
+                    it.lookup(db).source_view(db).map(|it| it.visibility())
+                }
+                ModuleDefId::AdtId(AdtId::EnumId(it)) => {
+                    it.lookup(db).source_view(db).map(|it| it.visibility())
+                }
+                ModuleDefId::MacroId(MacroId::Macro2Id(it)) => {
+                    it.lookup(db).source_view(db).map(|it| it.visibility())
+                }
+                ModuleDefId::ModuleId(it) => {
+                    match def_map.module(db, it).declaration_source_view(db) {
+                        Some(source) => source.map(|it| it.visibility()),
+                        None => continue,
+                    }
+                }
+                ModuleDefId::MacroId(MacroId::MacroRulesId(_) | MacroId::ProcMacroId(_))
+                | ModuleDefId::EnumVariantId(_)
+                | ModuleDefId::BuiltinType(_) => continue,
+            };
+            self.collect_visibility(module, vis);
+        }
+        for it in scope.use_decls() {
+            self.collect_visibility(module, it.lookup(db).source_view(db).map(|it| it.visibility()));
+        }
+        for it in scope.extern_crate_decls() {
+            self.collect_visibility(module, it.lookup(db).source_view(db).map(|it| it.visibility()));
+        }
+    }
+
+    /// rustc's error for `vis`, written on an item whose visibility `scope` resolves.
+    fn collect_visibility(
+        &mut self,
+        scope: impl hir_def::resolver::HasResolver,
+        vis: InFile<Option<view::Visibility<'_>>>,
+    ) {
+        let (file_id, Some(node)) = (vis.file_id, vis.value) else { return };
+        let Some(error) = hir_def::visibility::visibility_error_from_ast_view(self.db, scope, vis)
+        else {
+            return;
+        };
+        self.acc.push(InvalidVisibility { node: InFile::new(file_id, AstPtr::of(node)), error }.into());
     }
 
     fn collect_macro_def(&mut self, def: MacroId) {
@@ -2770,6 +2989,15 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         self.collect_generic_def(store, source_map, generic_def);
         self.collect_variant(def.into());
         self.collect_wfcheck(generic_def);
+
+        use syntax::view::HasVisibility as _;
+        let variant: VariantId = def.into();
+        let module = hir_def::HasModule::module(&variant, self.db);
+        let fields = hir_def::src::enabled_fields_view(self.db, variant);
+        for field in fields.value {
+            let vis = field.either(|it| it.visibility(), |it| it.visibility());
+            self.collect_visibility(module, InFile::new(fields.file_id, vis));
+        }
     }
 
     /// rustc's well-formedness errors of an ADT or an impl, reported as the borrow checker's.
@@ -3588,6 +3816,32 @@ impl<'db> AnyDiagnostic<'db> {
             &InferenceDiagnostic::ReturnOutsideFunction { expr, kind } => {
                 ReturnOutsideFunction { expr: expr_syntax(expr)?, kind }.into()
             }
+            InferenceDiagnostic::InvalidConstArg { site, reason } => {
+                InvalidConstArg { site: span_syntax(*site)?, reason: reason.clone() }.into()
+            }
+            InferenceDiagnostic::NotAStructPath { node, found, ty } => NotAStructPath {
+                node: expr_or_pat_syntax(node.unpack())?,
+                found: *found,
+                ty: ty.as_ref().map(|it| new_ty(it.as_ref())),
+            }
+            .into(),
+            InferenceDiagnostic::AutoderefRecursionLimit { span, ty, suggested_limit } => {
+                AutoderefRecursionLimit {
+                    site: span_syntax(*span)?,
+                    ty: new_ty(ty.as_ref()),
+                    suggested_limit: *suggested_limit,
+                }
+                .into()
+            }
+            InferenceDiagnostic::MethodOnUnknownRawPointee { span } => {
+                MethodOnUnknownRawPointee { site: span_syntax(*span)? }.into()
+            }
+            &InferenceDiagnostic::InheritedRefMutabilityMismatch { pat } => {
+                InheritedRefMutabilityMismatch { pat: pat_syntax(pat)? }.into()
+            }
+            &InferenceDiagnostic::FnTraitArgsNotTuple { call_expr } => {
+                FnTraitArgsNotTuple { call: expr_syntax(call_expr)? }.into()
+            }
             InferenceDiagnostic::UnsafeBinderCastOfNonBinder { expr, kind, found } => {
                 UnsafeBinderCastOfNonBinder {
                     expr: expr_syntax(*expr)?,
@@ -3999,6 +4253,19 @@ impl<'db> AnyDiagnostic<'db> {
                 let segment = path.with_value(AstPtr::of(segment));
                 GenericDefaultRefersToSelf { segment }.into()
             }
+            PathLoweringDiagnostic::AssocTypeNotResolved { segment, qself, failure } => {
+                let segment = hir_segment_to_ast_segment_view(path.value, segment)?;
+                let segment = path.with_value(AstPtr::of(segment));
+                let qself = match qself {
+                    hir_ty::AssocTypeQself::Param(id) => Either::Left(TypeParam { id }),
+                    hir_ty::AssocTypeQself::Trait(id) => Either::Right(id.into()),
+                };
+                AssocTypeNotResolved { segment, qself, failure }.into()
+            }
+            PathLoweringDiagnostic::AmbiguousAssocType { segment } => {
+                let segment = hir_segment_to_ast_segment_view(path.value, segment)?;
+                AmbiguousAssocType { segment: path.with_value(AstPtr::of(segment)) }.into()
+            }
         })
     }
 
@@ -4066,6 +4333,43 @@ impl<'db> AnyDiagnostic<'db> {
                     .map(|&site| Self::missing_lifetime_site(site, source_map, db))
                     .collect::<Option<Box<[_]>>>()?;
                 MissingLifetimes { sites, kind: *kind }.into()
+            }
+            TyLoweringDiagnostic::InvalidConstArg { site, reason } => InvalidConstArg {
+                site: Self::span_syntax(*site, source_map)?,
+                reason: reason.clone(),
+            }
+            .into(),
+            TyLoweringDiagnostic::ImplTraitNotAllowed { source } => {
+                ImplTraitNotAllowed { ty: Self::type_syntax(*source, source_map)? }.into()
+            }
+            TyLoweringDiagnostic::AdditionalNonAutoTraits { first, additional } => {
+                AdditionalNonAutoTraits {
+                    first: Self::type_syntax(*first, source_map)?,
+                    additional: additional
+                        .iter()
+                        .map(|&it| Self::type_syntax(it, source_map))
+                        .collect::<Option<_>>()?,
+                }
+                .into()
+            }
+            TyLoweringDiagnostic::ConflictingAssocTypeBindings { source, assoc } => {
+                ConflictingAssocTypeBindings {
+                    bound: Self::type_syntax(*source, source_map)?,
+                    assoc: (*assoc).into(),
+                }
+                .into()
+            }
+            TyLoweringDiagnostic::MissingSelfDefaultParams { source, trait_, params } => {
+                MissingSelfDefaultParams {
+                    bound: Self::type_syntax(*source, source_map)?,
+                    trait_: (*trait_).into(),
+                    // alloc: error path, a reported diagnostic
+                    params: params.iter().map(|&id| TypeParam { id }).collect(),
+                }
+                .into()
+            }
+            TyLoweringDiagnostic::ObjectWithoutTrait { source } => {
+                ObjectWithoutTrait { bound: Self::type_syntax(*source, source_map)? }.into()
             }
         })
     }

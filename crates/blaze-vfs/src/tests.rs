@@ -1047,6 +1047,9 @@ fn journal_run(seed: u64) {
     let mut tickets: FxHashMap<Ticket, (String, u64, bool)> = FxHashMap::default();
     // By head: the latest record acknowledged durable, and whether it was a removal.
     let mut acknowledged: FxHashMap<String, (u64, bool)> = FxHashMap::default();
+    // By head: the sequence of its latest removal, acknowledged or not. A crash keeps a random
+    // prefix of what was appended and not synced, so an unacknowledged removal can survive one.
+    let mut removed: FxHashMap<String, u64> = FxHashMap::default();
     let mut old_bases: Vec<ContentId> = Vec::new();
 
     for step in 0..300 {
@@ -1095,7 +1098,9 @@ fn journal_run(seed: u64) {
                 let (from, to) = if rng.one_in(2) { ("a", "b") } else { ("b", "a") };
                 if rng.one_in(2) {
                     if let Some(ticket) = vfs.remove_head(to) {
-                        tickets.insert(ticket, (to.into(), vfs.journal.last_sequence(), true));
+                        let sequence = vfs.journal.last_sequence();
+                        tickets.insert(ticket, (to.into(), sequence, true));
+                        removed.insert(to.into(), sequence);
                     }
                 } else if let Some(root) = vfs.head(from) {
                     let ticket = vfs.set_head(to, root).unwrap();
@@ -1146,14 +1151,15 @@ fn journal_run(seed: u64) {
                             "seed {seed}: {head} acknowledged {sequence}, recovered {recovered}"
                         ),
                         None => assert!(
-                            removal,
+                            removal || removed.get(head).is_some_and(|&at| at > sequence),
                             "seed {seed}: {head} acknowledged {sequence}, recovered nothing"
                         ),
                     }
                 }
-                // Sequences after the cut may reuse numbers of moves it lost.
+                // Sequences after the cut may reuse numbers of moves and removals it lost.
                 let last = vfs.journal.last_sequence();
                 moves.retain(|&sequence, _| sequence <= last);
+                removed.retain(|_, &mut sequence| sequence <= last);
             }
         }
     }

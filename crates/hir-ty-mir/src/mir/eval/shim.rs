@@ -455,9 +455,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     fn fill_random(&mut self, addr: Address, size: usize) -> Result<'db, ()> {
-        for i in 0..size {
-            let rand_byte = self.random_state.rand_u64() as u8;
-            self.write_memory(addr.offset(i), &[rand_byte])?;
+        let mut chunk = [0u8; 64];
+        let mut done = 0;
+        while done < size {
+            let len = (size - done).min(chunk.len());
+            self.random_state.fill(&mut chunk[..len]);
+            self.write_memory(addr.offset(done), &chunk[..len])?;
+            done += len;
         }
         Ok(())
     }

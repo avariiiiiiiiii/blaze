@@ -407,7 +407,7 @@ impl<'db> Machine<'db> for Recorder {
 }
 
 fn fixture(program: &str) -> String {
-    format!("//- minicore: sized, copy\n{program}")
+    format!("//- minicore: sized, copy, index, slice\n{program}")
 }
 
 struct Run {
@@ -590,9 +590,11 @@ fn main() {
         ),
         "{events:#?}"
     );
+    // The value read is used as a number: its `require_init` comes between.
+    let mut after = events[read + 1..].iter().filter(|it| !matches!(it, Event::RequireInit { .. }));
     assert!(
         matches!(
-            events.get(read + 1),
+            after.next(),
             Some(&Event::Write { addr: a, prov: Some(p), size: 4, access, .. })
                 if a == addr && p == x && access == rmw
         ),
@@ -600,7 +602,7 @@ fn main() {
     );
     assert!(
         matches!(
-            events.get(read + 2),
+            after.next(),
             Some(&Event::AtomicStore { addr: a, prov: Some(p), ord: AtomicOrd::SeqCst })
                 if a == addr && p == x
         ),

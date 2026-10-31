@@ -308,7 +308,9 @@ mod tests {
                 .collect();
             workers.into_iter().map(|it| it.join().unwrap()).collect()
         });
-        assert_eq!(<Racing as SliceInternable>::storage().get().len(), VALUES as usize);
+        // Every `n` a multiple of 17 makes the one empty slice.
+        let distinct: std::collections::HashSet<Vec<u64>> = (0..VALUES).map(slice).collect();
+        assert_eq!(<Racing as SliceInternable>::storage().get().len(), distinct.len());
         for (worker, handles) in seen.iter().enumerate() {
             for (i, handle) in handles.iter().enumerate() {
                 let n = (i as u64 + worker as u64 * 331) % VALUES;

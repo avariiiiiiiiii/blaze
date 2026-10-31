@@ -405,15 +405,19 @@ impl Writer<Real> for UnitWriter {
         deps::noted(self.flushed.as_ref(), self.session.item_steps().as_ref())
     }
 
-    fn keep(mut self) -> Option<KeptLowered> {
-        if !matches!(self.apply(), Ok(true)) {
-            return None;
+    fn keep(mut self) -> Result<KeptLowered, ApiError> {
+        if !self.apply()? {
+            let what = "the front end is kept for the head's next build with no task reading it, and one still does";
+            return Err(ApiError::new(what, None));
         }
         let UnitWriter { session, front, job, deps, .. } = self;
-        let lowered = Arc::into_inner(front)?;
+        let Some(lowered) = Arc::into_inner(front) else {
+            let what = "the front end is kept for the head's next build, and another holder of it is still alive";
+            return Err(ApiError::new(what, None));
+        };
         let later = std::mem::take(&mut *job.later.lock().unwrap_or_else(|it| it.into_inner()));
         let seeds = std::mem::take(&mut *job.seeds.lock().unwrap_or_else(|it| it.into_inner()));
-        Some(KeptLowered {
+        Ok(KeptLowered {
             session,
             lowered,
             units: job.input.units.clone(),

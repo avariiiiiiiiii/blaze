@@ -784,7 +784,7 @@ pub enum InferenceDiagnostic {
 
 /// What a struct literal's or pattern's path names instead (`InferenceDiagnostic::NotAStructPath`).
 /// A `segment` indexes the path's written segments, as `UnresolvedPath`'s does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StructPathFound {
     /// A type of another kind, reached through `Self`, an alias or a type anchor: rustc's
     /// E0071.

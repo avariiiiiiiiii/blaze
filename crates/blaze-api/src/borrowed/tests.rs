@@ -176,6 +176,18 @@ fn a_streamed_response_read_in_place_allocates_nothing() {
 /// Nesting past the decoder's depth is refused in place as it is owned, at the same depth.
 #[test]
 fn nesting_is_refused_in_place_where_it_is_owned() {
+    // A 300-deep value is built, encoded, compared and dropped by recursion: in a debug build
+    // that needs more than a test thread's 2 MiB, so it runs on a worker's stack (64 MiB,
+    // `blaze-graph`'s pool).
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(nesting_at_each_depth)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn nesting_at_each_depth() {
     for depth in [100usize, 250, 255, 256, 300] {
         let mut response = Response::Done { ok: true };
         for candidate in 0..depth as u32 {

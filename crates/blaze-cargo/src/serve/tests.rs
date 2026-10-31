@@ -428,11 +428,11 @@ impl Writer<Fake> for FakeWriter {
         }
     }
 
-    fn keep(mut self) -> Option<FakeInputs> {
-        if !matches!(self.apply(), Ok(true)) {
-            return None;
+    fn keep(mut self) -> Result<FakeInputs, ApiError> {
+        if !self.apply()? {
+            return Err(ApiError::new("the fakes' runs are kept while a task still reads them", None));
         }
-        Arc::into_inner(self.inputs)
+        Arc::into_inner(self.inputs).ok_or_else(|| ApiError::new("the fakes' inputs are kept while a task still holds them", None))
     }
 }
 

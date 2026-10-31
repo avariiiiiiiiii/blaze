@@ -156,14 +156,18 @@ impl<'a> Sig<'a> {
                 }
             }
             TypeRef::UnsafeBinder { lifetimes, ty } => {
-                out.kw("unsafe").text("<");
-                for (at, name) in self.store.names(lifetimes).iter().enumerate() {
-                    if at > 0 {
-                        out.text(", ");
+                // rustdoc's `print_higher_ranked_params_with_space`: nothing when no lifetime is bound.
+                let names = self.store.names(lifetimes);
+                if !names.is_empty() {
+                    out.kw("unsafe").text("<");
+                    for (at, name) in names.iter().enumerate() {
+                        if at > 0 {
+                            out.text(", ");
+                        }
+                        out.push(Piece::Lifetime(lifetime_text(name.as_str())));
                     }
-                    out.push(Piece::Lifetime(lifetime_text(name.as_str())));
+                    out.text("> ");
                 }
-                out.text("> ");
                 self.ty(out, ty);
             }
             TypeRef::ImplTrait(bounds) => {

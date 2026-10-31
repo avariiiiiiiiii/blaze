@@ -588,6 +588,8 @@ fn a_removed_function_still_called_through_its_slot_is_an_error() {
     let g2 = function(3, &returns(2), Vec::new());
     let wrong = Change { added: vec![&g2], slots: vec![(key(2), key(4))], ..Change::default() };
     assert!(image.stage(wrong).is_err(), "a slot given a function that is not linked");
+    let next = image.stage(edit(&g2)).unwrap();
+    assert!(!next.full(), "a refused stage never makes the next one a whole layout");
     assert_eq!(disk.link(&mut image, edit(&g2)), Ok(2));
 }
 

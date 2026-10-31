@@ -35,14 +35,14 @@ fn targets() -> &'static [u64; COUNT] {
     static TARGETS: OnceLock<[u64; COUNT]> = OnceLock::new();
     TARGETS.get_or_init(|| {
         let mut out = [0; COUNT];
-        out[INTS as usize] = ints as usize as u64;
-        out[FLOATS as usize] = floats as usize as u64;
-        out[MIXED as usize] = mixed as usize as u64;
-        out[BIG as usize] = big as usize as u64;
-        out[PAIR as usize] = pair as usize as u64;
-        out[HFA as usize] = hfa as usize as u64;
-        out[VECTOR as usize] = vector as usize as u64;
-        out[SNPRINTF as usize] = libc::snprintf as usize as u64;
+        out[INTS as usize] = ints as *const () as u64;
+        out[FLOATS as usize] = floats as *const () as u64;
+        out[MIXED as usize] = mixed as *const () as u64;
+        out[BIG as usize] = big as *const () as u64;
+        out[PAIR as usize] = pair as *const () as u64;
+        out[HFA as usize] = hfa as *const () as u64;
+        out[VECTOR as usize] = vector as *const () as u64;
+        out[SNPRINTF as usize] = libc::snprintf as *const () as u64;
         out
     })
 }
@@ -59,7 +59,7 @@ fn region() -> &'static (Code, Layout) {
     REGION.get_or_init(|| {
         let _ = targets();
         let isa = Isa::host().expect("a host with lazy stubs");
-        let stubs = stub::generate(&isa, COUNT as u32, hook as usize as u64).expect("the region");
+        let stubs = stub::generate(&isa, COUNT as u32, hook as *const () as u64).expect("the region");
         (Code::new(&stubs.bytes), stubs.layout)
     })
 }

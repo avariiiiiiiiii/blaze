@@ -47,7 +47,7 @@ corrupt while the daemon runs stops it (`daemon::Failed`).
 | `serve/plane.rs:260,412` | rule | `as_nanos` past `u64` saturates | 584 years. Stays |
 | `serve/plane.rs:270` | rule | a panic with no message | an optional text. Stays |
 | `serve/mounts.rs:95` | rule | `remove_head`'s ticket dropped | a removal's durability is not waited on; `None` means no such head. Stays |
-| `serve/work.rs:481` `Writer::keep` (+ `serve/unit.rs:408`, `serve/tests.rs:431`, parent's `serve/job.rs:2205`) | error | `None` when a write fails to apply or a reader is alive: the kept front end is dropped and the head's next build lowers in full, no reason given | `Result<S::KeptFront, ApiError>`, the build ends with it. Queue 01166, taken; all four files must land in one round, waiting on the parent for `job.rs` |
+| `serve/work.rs:481` `Writer::keep` (+ `serve/unit.rs:408`, `serve/tests.rs:431`, parent's `serve/job.rs:2205`) | error | `None` when a write fails to apply or a reader is alive: the kept front end is dropped and the head's next build lowers in full, no reason given | `Result<S::KeptFront, ApiError>` naming why (a reader still alive, another holder, the apply's error); the build ends with it. Queue 01166. Done |
 | `serve/unit/codegen.rs`, `serve/unit/compile.rs`, `serve/job.rs` | parent's | | in the parent's table, `no-fallback/link.md` |
 
 Tests: `serve/daemon.rs` `mod tests` (each classification: layout vs damaged open, symbols,

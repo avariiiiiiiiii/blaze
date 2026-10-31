@@ -31,8 +31,6 @@ authors = ["blaze contributors"]
 repository = "https://github.com/indexable-inc/blaze"
 homepage = "https://ix.dev/blaze"
 keywords = ["compiler", "jit", "hot-reload", "rust-analyzer", "cargo"]
-categories = ["development-tools", "development-tools::build-utils"]
-
 [profile.dev]
 debug = 1
 
@@ -100,7 +98,6 @@ hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
 hir-ty-codegen = { path = "crates/hir-ty-codegen" }
 blaze-macro-eval = { path = "crates/blaze-macro-eval" }
-blaze-doc = { path = "crates/blaze-doc" }
 blaze-manifest = { path = "crates/blaze-manifest" }
 blaze-metadata = { path = "crates/blaze-metadata" }
 blaze-resolve = { path = "crates/blaze-resolve" }
@@ -110,7 +107,6 @@ blaze-lower = { path = "crates/blaze-lower" }
 blaze-wasm-pack = { path = "crates/blaze-wasm-pack" }
 blaze-fuzz = { path = "crates/blaze-fuzz" }
 blaze-core = { path = "crates/blaze-core" }
-blaze-profile = { path = "crates/blaze-profile" }
 blaze-graph = { path = "crates/blaze-graph" }
 blaze-image = { path = "crates/blaze-image" }
 blaze-protocol = { path = "crates/blaze-protocol" }
@@ -141,7 +137,6 @@ blaze-history = { path = "crates/blaze-history" }
 blaze-inproc = { path = "crates/blaze-inproc" }
 blaze-intent = { path = "crates/blaze-intent" }
 blaze-lazy = { path = "crates/blaze-lazy" }
-blaze-premap = { path = "crates/blaze-premap" }
 blaze-stencil = { path = "crates/blaze-stencil" }
 blaze-testsel = { path = "crates/blaze-testsel" }
 blaze-query = { path = "crates/blaze-query" }
@@ -173,8 +168,6 @@ ra-ap-rustc_parse_format = { version = "0.166", default-features = false }
 ra-ap-rustc_index = { version = "0.166", default-features = false }
 # rustc's layout code, from the tag of the stable in `harness/toolchain`.
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
-# rustc's lexer at the commit of `harness/toolchain`.
-rustc_lexer = { path = "crates/rustc_lexer", version = "0.0.0" }
 unicode-properties = { version = "0.1.4", default-features = false }
 ra-ap-rustc_pattern_analysis = { version = "0.166", default-features = false }
 ra-ap-rustc_ast_ir = { version = "0.166", default-features = false }
@@ -182,8 +175,6 @@ rustc_apfloat = "0.2.3"
 # The trait solver, with fixes of rustc's backported.
 rustc_type_ir = { path = "vendor/rustc_type_ir", version = "0.0.0", default-features = false }
 rustc_next_trait_solver = { path = "vendor/rustc_next_trait_solver", version = "0.0.0", default-features = false }
-# rustc's transmutability analysis, generic over the caller's layouts (vendor/rustc_transmute/PATCHES.md).
-rustc_transmute = { path = "vendor/rustc_transmute", version = "0.0.0" }
 
 # rust-analyzer's libraries, from crates.io
 la-arena = { version = "0.3.1" }
@@ -344,7 +335,6 @@ hyper-rustls = { version = "0.27.10", default-features = false }
 hyper-util = { version = "0.1.21", default-features = false }
 im-rc = "15.1.0"
 inkwell = { version = "0.11.0", default-features = false }
-jobserver = "0.1.35"
 lzma-rust2 = { version = "0.24.0", default-features = false }
 pathdiff = "0.2.3"
 percent-encoding = "2.3.2"

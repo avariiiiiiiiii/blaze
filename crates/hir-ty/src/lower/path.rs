@@ -559,7 +559,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             Some(TypeNs::GenericParam(param)) => {
                 let resolution =
                     super::resolve_type_param_assoc_type_shorthand(db, def, param, *assoc_name);
-                let assoc_type = match self.resolved_shorthand(AssocTypeQself::Param(param), resolution) {
+                let assoc_type = match self.resolved_shorthand(AssocTypeQself::Param(param), resolution.clone()) {
                     Ok(it) => it,
                     Err(error) => return error,
                 };
@@ -581,7 +581,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     *assoc_name,
                 );
                 let assoc_type =
-                    match self.resolved_shorthand(AssocTypeQself::Param(self_param), resolution) {
+                    match self.resolved_shorthand(AssocTypeQself::Param(self_param), resolution.clone()) {
                         Ok(it) => it,
                         Err(error) => return error,
                     };

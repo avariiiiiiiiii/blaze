@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use base_db::{Crate, CrateOrigin, Db, salsa::Setter as _};
 use cfg::CfgAtom;
+use intern::sym;
 use hir_expand::proc_macro::{
     CrateProcMacros, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros,
 };
@@ -199,6 +200,8 @@ pub fn record(db: &mut Db, program: Crate, expand: impl FnOnce(&Db, &[Crate])) -
             cfg: krate
                 .cfg_options(db)
                 .into_iter()
+                // Every `CfgOptions` holds `true`; it is not a cfg the crate was given.
+                .filter(|atom| !matches!(atom, CfgAtom::Flag(it) if *it == sym::true_))
                 .map(|atom| match atom {
                     CfgAtom::Flag(name) => name.as_str().to_owned(),
                     CfgAtom::KeyValue { key, value } => format!("{key}={value}"),

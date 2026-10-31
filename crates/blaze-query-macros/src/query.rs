@@ -295,6 +295,11 @@ impl Query<'_> {
                     #plumbing::evict_values::<#config>(db)
                 }
                 #evict_of
+
+                /// Replaces the query's value cap (0: none) from the next view.
+                #vis fn set_lru_capacity(db: &mut #db_ty, capacity: usize) {
+                    #plumbing::set_lru_capacity::<#config>(db, capacity)
+                }
             }
         } else {
             TokenStream::new()

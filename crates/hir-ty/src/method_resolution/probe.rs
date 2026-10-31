@@ -440,15 +440,9 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                 // this case used to be allowed by the compiler,
                 // so we do a future-compat lint here for the 2015 edition
                 // (see https://github.com/rust-lang/rust/issues/46906)
-                // FIXME: Emit the lint (`tyvar_behind_raw_pointer`, warn by default).
-                // self.tcx.node_span_lint(
-                //     lint::builtin::TYVAR_BEHIND_RAW_POINTER,
-                //     scope_expr_id,
-                //     span,
-                //     |lint| {
-                //         lint.primary_message("type annotations needed");
-                //     },
-                // );
+                if let Some(errors) = self.errors {
+                    errors.tyvar_behind_raw_pointer.set(true);
+                }
             } else {
                 // Ended up encountering a type variable when doing autoderef,
                 // but it may not be a type variable after processing obligations

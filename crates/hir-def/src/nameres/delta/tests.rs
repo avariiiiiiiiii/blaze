@@ -25,7 +25,7 @@ use span::FileId;
 use crate::{
     ModuleId,
     nameres::{
-        DefMap, DefMapPair, ModulesSlot, ScopeSlot, crate_local_def_map,
+        DefMap, DefMapPair, ModulesSlot, ScopeSlot, Unmaintained, crate_local_def_map,
         diagnostics::DefDiagnosticKind,
         facts::tests::{
             Exempt, compare, differential::ORDER_DEPENDENT, extra_proc_macros,
@@ -435,6 +435,36 @@ fn a_dependencys_module_ids_outlive_the_crates_maintained_after_it() {
     let mut failures = String::new();
     check_db(db, "a dependency's module ids", &Exempt::NONE, false, &mut failures);
     assert!(failures.is_empty(), "{failures}");
+}
+
+/// A crate the maintainer does not go over (here, one taken out of the crate graph) has no
+/// resolution: asking for its def map stops with an [`Unmaintained`] naming it, and resolves
+/// nothing in its place.
+#[test]
+fn a_crate_with_no_maintained_resolution_is_an_error_naming_it() {
+    let mut loaded = Loaded::new(
+        r#"
+//- /main.rs crate:main
+pub struct M;
+//- /lib.rs crate:lib
+pub struct L;
+"#,
+    );
+    let main = loaded.krate();
+    let lib = *all_crates(&loaded.db).iter().find(|it| **it != main).expect("the crate `lib`");
+    let map = crate_local_def_map(&loaded.db, lib).def_map(&loaded.db);
+    assert!(map.module(&loaded.db, map.root).scope(&loaded.db).type_(&name("L")).is_some(), "`lib` is maintained");
+    base_db::set_all_crates_with_durability(&mut loaded.db, [main], salsa::Durability::LOW);
+    let db = &loaded.db;
+    let map = crate_local_def_map(db, main).def_map(db);
+    assert!(map.module(db, map.root).scope(db).type_(&name("M")).is_some(), "`main` is still maintained");
+    let caught = Unmaintained::catch(std::panic::AssertUnwindSafe(|| {
+        _ = crate_local_def_map(db, lib);
+    }));
+    let Err(error) = caught else { panic!("`lib`'s def map was given with no maintained resolution") };
+    assert_eq!(error, Unmaintained { krate: lib, name: Some("lib".to_owned()), asking: None });
+    let text = error.to_string();
+    assert!(text.contains("`lib`") && text.contains("no maintainer ran"), "{text}");
 }
 
 /// A `std` cargo passes `noprelude` (build-std's `--extern noprelude:std`) is in no extern

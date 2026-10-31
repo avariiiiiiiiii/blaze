@@ -1,0 +1,26 @@
+{
+  "id": "01233",
+  "from_lane": "no-fallback-front-ty",
+  "owner": "no-fallback-tools",
+  "paths": [
+    "crates/blaze-diagnostics/src/lower/not_a_struct_path.rs",
+    "crates/blaze-diagnostics/src/lower/generic_args_prohibited.rs",
+    "crates/blaze-diagnostics/src/lower/self_ctor_not_tuple_or_unit.rs",
+    "crates/blaze-diagnostics/src/lower/mod.rs"
+  ],
+  "what": "01168 batch 6 emitters, exact code in /tmp/blaze-lanes/no-fallback-front-ty-01168-type-relative-emitters.rs. hir now has StructPathFound::TypeRelative(def) (E0164 in a tuple struct pattern, E0533 in a path pattern), StructPathDef::{AssocFn, AssocConst, SelfCtor}, GenericArgsProhibitedReason::TypeRelativeVariant (E0109 on <E>::V::<T> / Alias::V::<T> / Self::V::<T> struct paths, with rustc EnumVariant note and suggestion), and AnyDiagnostic::SelfCtorNotTupleOrUnit (the `Self` constructor can only be used with tuple or unit structs). The matches in not_a_struct_path.rs (found, descr) are exhaustive, so this must land in the same round as the hir-ty change.",
+  "state": "open",
+  "created": "2026-10-31T02:30:41Z",
+  "updated": "2026-10-31T02:30:41Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T02:30:41Z",
+      "by": "no-fallback-front-ty",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

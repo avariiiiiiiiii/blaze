@@ -3,16 +3,18 @@
 use hir_def::{
     AdtId, AssocItemId, GenericDefId, ItemContainerId, Lookup,
     expr_store::path::{Path, PathSegment},
-    hir::ExprOrPatIdPacked,
+    hir::{ExprOrPatId, ExprOrPatIdPacked},
+    item_tree::FieldsShape,
     resolver::{ResolveValueResult, TypeNs, ValueNs},
-    signatures::{ConstSignature, FunctionSignature},
+    signatures::{ConstSignature, FunctionSignature, StructSignature},
 };
 use hir_expand::name::Name;
 use rustc_type_ir::inherent::{SliceLike, Ty as _};
 
 use crate::{
     db::HirDatabase,
-    ExplicitDropMethodUseKind, InferenceDiagnostic, Span, ValueTyDefId,
+    ExplicitDropMethodUseKind, InferenceDiagnostic, Span, StructPathDef, StructPathFound,
+    ValueTyDefId,
     infer::{
         InferenceTyLoweringVarsCtx, diagnostics::InferenceTyLoweringContext as TyLoweringContext,
     },
@@ -87,16 +89,43 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 };
             }
             ValueNs::ImplSelf(impl_id) => {
+                // rustc's `check_pat_path` (a pattern takes a unit struct only, E0533) and
+                // `instantiate_value_path` (a constructor).
                 let ty = self.db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
-                return if let Some((AdtId::StructId(struct_id), substs)) = ty.as_adt() {
-                    Some(ValuePathResolution::GenericDef(
-                        struct_id.into(),
-                        struct_id.into(),
-                        substs,
-                    ))
-                } else {
-                    // FIXME: report error, invalid Self reference
-                    None
+                let ctor = match ty.as_adt() {
+                    Some((AdtId::StructId(struct_id), substs)) => {
+                        Some((struct_id, substs, StructSignature::of(self.db, struct_id).shape))
+                    }
+                    _ => None,
+                };
+                return match (ctor, id.unpack()) {
+                    (Some((struct_id, substs, FieldsShape::Unit)), _)
+                    | (Some((struct_id, substs, FieldsShape::Tuple)), ExprOrPatId::ExprId(_)) => {
+                        self.write_variant_resolution(id, struct_id.into());
+                        Some(ValuePathResolution::GenericDef(
+                            struct_id.into(),
+                            struct_id.into(),
+                            substs,
+                        ))
+                    }
+                    (_, ExprOrPatId::PatId(_)) => {
+                        let found = StructPathFound::TypeRelative(StructPathDef::SelfCtor);
+                        self.push_diagnostic(InferenceDiagnostic::NotAStructPath {
+                            node: id,
+                            found,
+                            ty: None,
+                        });
+                        None
+                    }
+                    (_, ExprOrPatId::ExprId(expr)) => {
+                        if !ty.references_non_lt_error() {
+                            self.push_diagnostic(InferenceDiagnostic::SelfCtorNotTupleOrUnit {
+                                expr,
+                                self_ty: ty.store(),
+                            });
+                        }
+                        None
+                    }
                 };
             }
             ValueNs::GenericParam(it) => {
@@ -112,12 +141,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             return Some(ValuePathResolution::NonGeneric(ty));
         };
 
-        let substs = if self_subst.is_some_and(|it| !it.is_empty())
+        let substs = if self_subst.is_some()
             && matches!(value_def, ValueTyDefId::EnumVariantId(_))
         {
             // This is something like `TypeAlias::<Args>::EnumVariant`. Do not call `substs_from_path()`,
             // as it'll try to re-lower the previous segment assuming it refers to the enum, but it refers
-            // to the type alias and they may have different generics.
+            // to the type alias and they may have different generics. The variant's own arguments
+            // are E0109 (`resolve_value_path_inner`).
             self.types.empty.generic_args
         } else {
             self.with_ty_lowering(|ctx| {
@@ -266,6 +296,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 }
             }
         };
+        // Only a variant found on a type has its enum's arguments as `self_subst`.
+        if !no_diagnostics
+            && self_subst.is_some()
+            && let ValueNs::EnumVariantId(_) = value
+        {
+            let last = path.segments().len() - 1;
+            Self::forbid_type_relative_variant_args(&self.diagnostics, id, path, last);
+        }
         return Some((value, self_subst));
 
         #[inline]

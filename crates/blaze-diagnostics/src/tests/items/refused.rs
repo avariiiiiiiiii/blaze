@@ -92,3 +92,37 @@ fn a_struct_path_to_something_else() {
         "E0599: no variant named `C` found for enum `E`",
     );
 }
+
+#[test]
+fn a_type_relative_path_in_a_pattern() {
+    let s = "struct S;\nimpl S { fn new() -> S { S } }\n";
+    refused(
+        "2021",
+        &format!("{s}fn main() {{ match S {{ S::new(..) => {{}} }} }}\n"),
+        "E0164: expected tuple struct or tuple variant, found associated function `S::new`",
+    );
+    refused(
+        "2021",
+        &format!("{s}fn main() {{ match S {{ S::new => {{}} }} }}\n"),
+        "E0533: expected unit struct, unit variant or constant, found associated function `S::new`",
+    );
+}
+
+#[test]
+fn self_of_a_struct_with_fields_is_no_constructor() {
+    let source = "struct S { a: u8 }\nimpl S { fn f() { let _ = Self; } }\nfn main() {}\n";
+    refused("2021", source, "the `Self` constructor can only be used with tuple or unit structs");
+}
+
+#[test]
+fn generic_arguments_on_a_variant_through_an_alias_are_e0109() {
+    let source = "enum E<T> { V(T) }\ntype A = E<u8>;\nfn main() { let _ = A::V::<u8>(0); }\n";
+    refused("2021", source, "E0109: type arguments are not allowed on this type");
+}
+
+#[test]
+fn a_method_on_a_raw_pointer_to_an_unknown_pointee() {
+    let source = "fn main() { let p = 0usize as *const _; let _ = p.is_null(); }\n";
+    refused("2018", source, "E0282: type annotations needed");
+    refused("2015", source, "tyvar_behind_raw_pointer: type annotations needed");
+}

@@ -163,7 +163,7 @@ second version left in `Cargo.lock` is forced by an upstream's newest release, a
 | `syn` 2 beside 3 | both majors are in use upstream (syn 2: `serde_derive`, `thiserror-impl`, `tracing-attributes`, `zerocopy-derive`; syn 3: `clap_derive`, `async-trait`, `rkyv_derive`); the workspace's own `syn` is 2, which `synstructure` needs |
 | `rand` 0.8, `thiserror` 1, `nix` 0.23, `bitflags` 1, `memoffset` 0.6, `windows` 0.34 and 0.62 | `tango-bench` 0.9.0 (its newest), blaze-bench's paired benchmark harness, a dev-dependency only |
 | `unicode-width` 0.1 | `blaze-fmt` keeps the pinned nightly rustfmt's versions (`rustfmt-unicode-width`) |
-| `wasmparser`, `wasm-encoder`, `wit-*` | open until the proc-macro and Wasm engines are deleted (lane dedup-engines) |
+| `wit-bindgen` 0.57 (no dependencies of its own) | `wasip2` 1.0.3, under `getrandom` 0.3.4 (`ahash`, in `sonic-rs`); `wasm-encoder` is the workspace's 0.263 alone once `getrandom` 0.4 is at 0.4.3, which dropped `wasip2`/`wasip3` and with them the `wit-*` 0.244 crates (queue 01236) |
 
 Where two libraries do one job, one stays: seeded randomness is `blaze-rng` (hir-ty-mir's
 `oorandom` went). Still to decide, each with its owner: `im-rc` (blaze-resolve; no release since

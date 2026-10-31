@@ -7,10 +7,10 @@
     "crates/blaze-query-macros/tests"
   ],
   "what": "R15 (01212, contract in docs/v2/plan/lanes/db/query-unify.md): beside the generated `evict_values` (query.rs ~294, functions with `lru = N`) emit `#vis fn set_lru_capacity(db: &mut #db_ty, capacity: usize) { #plumbing::set_lru_capacity::<#config>(db, capacity) }` with doc `/// Replaces the query's value cap (0: none) from the next view.`; engine adds plumbing::set_lru_capacity (queued to query-unify-engine). Users: base-db `parse_::set_lru_capacity(self, next)`, hir-ty providers.rs MIR-body caps. Add a tests/ case calling it on an `lru = 3` fn.",
-  "state": "open",
+  "state": "taken",
   "created": "2026-10-31T01:51:44Z",
-  "updated": "2026-10-31T01:51:44Z",
-  "taken_by": null,
+  "updated": "2026-10-31T02:39:17Z",
+  "taken_by": "query-unify-macros",
   "why": null,
   "source": null,
   "history": [
@@ -18,6 +18,12 @@
       "at": "2026-10-31T01:51:44Z",
       "by": "query-unify",
       "action": "add",
+      "note": ""
+    },
+    {
+      "at": "2026-10-31T02:39:17Z",
+      "by": "query-unify-macros",
+      "action": "take",
       "note": ""
     }
   ]

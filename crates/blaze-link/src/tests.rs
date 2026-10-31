@@ -588,9 +588,15 @@ fn a_removed_function_still_called_through_its_slot_is_an_error() {
     let g2 = function(3, &returns(2), Vec::new());
     let wrong = Change { added: vec![&g2], slots: vec![(key(2), key(4))], ..Change::default() };
     assert!(image.stage(wrong).is_err(), "a slot given a function that is not linked");
+    assert_eq!(image.generation(), 1, "a refused stage leaves the image as it was");
     let next = image.stage(edit(&g2)).unwrap();
     assert!(!next.full(), "a refused stage never makes the next one a whole layout");
-    assert_eq!(disk.link(&mut image, edit(&g2)), Ok(2));
+    let mut effects = Vec::new();
+    image.commit(next, &mut effects).unwrap();
+    assert_eq!(disk.run(&mut image, effects), Ok(2), "the next good stage moves the generation by one");
+    assert_eq!(image.generation(), 2);
+    let linked = Linked::of(disk.file(TO));
+    assert_eq!(linked.through_stub(linked.rel32(linked.symbol("start") + 1)), linked.symbol("g2"));
 }
 
 #[test]
@@ -621,7 +627,11 @@ fn a_stage_out_of_room_is_a_refusal_the_caller_can_match() {
     assert!(matches!(error.no_room(), Some(crate::Refusal::NoRoom { need, room }) if need > room), "{error}");
     assert_eq!(image.generation(), 1);
     let g2 = function(3, &returns(2), Vec::new());
-    assert_eq!(disk.link(&mut image, edit(&g2)), Ok(2), "the refused stage left the image as it was");
+    let next = image.stage(edit(&g2)).unwrap();
+    assert!(!next.full(), "a refusal for want of room never makes the next stage a whole layout");
+    let mut effects = Vec::new();
+    image.commit(next, &mut effects).unwrap();
+    assert_eq!(disk.run(&mut image, effects), Ok(2), "the refused stage left the image as it was");
 }
 
 #[test]

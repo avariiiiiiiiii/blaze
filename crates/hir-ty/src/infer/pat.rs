@@ -10,7 +10,7 @@ use hir_def::{
         BindingAnnotation, BindingId, Expr, ExprId, ExprOrPatId, ExprOrPatIdPacked, Literal, Pat,
         PatId, RecordFieldPat,
     },
-    resolver::ValueNs,
+    resolver::{TypeNs, ValueNs},
     signatures::VariantFields,
 };
 use rustc_abi::HasDataLayout as _;
@@ -29,7 +29,7 @@ use crate::{
     infer::{
         AllowTwoPhase, ByRef, Expectation, InferenceContext, InferenceTables, PatAdjust,
         PatAdjustment, StructPathDef, StructPathFound,
-        expr::ExprIsRead,
+        expr::ExprIsRead, function_struct_path_def,
     },
     next_solver::{
         Const, ConstExt, IsRigid, TraitRef, Ty, TyKind, Tys,
@@ -1050,24 +1050,35 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             | ValueNs::LocalBinding(_)
             | ValueNs::StaticId(_) => {
                 let def = match res {
-                    ValueNs::FunctionId(_) => StructPathDef::Function,
+                    ValueNs::FunctionId(func) => function_struct_path_def(self.db, func),
                     ValueNs::GenericParam(_) => StructPathDef::ConstParam,
                     ValueNs::LocalBinding(_) => StructPathDef::Local,
                     _ => StructPathDef::Static,
                 };
+                // rustc's resolver takes a path to an item whole (E0532) and leaves one through
+                // a type to type checking (`check_pat_path`'s E0533).
+                let type_relative = path.type_anchor().is_some()
+                    || self
+                        .result
+                        .qualifier_resolutions
+                        .get(pat.into())
+                        .is_some_and(|(qualifier, _)| !matches!(qualifier, TypeNs::TraitId(_)));
+                let found = match type_relative {
+                    true => StructPathFound::TypeRelative(def),
+                    false => StructPathFound::Def(def),
+                };
                 self.push_diagnostic(InferenceDiagnostic::NotAStructPath {
                     node: pat.into(),
-                    found: StructPathFound::Def(def),
+                    found,
                     ty: None,
                 });
                 return Err(());
             }
-            // `infer_path` makes a `Self` of a struct the struct.
-            ValueNs::ImplSelf(_) => {
-                // FIXME: Emit an error.
-                return Err(());
-            }
-            ValueNs::ConstId(_) | ValueNs::EnumVariantId(_) | ValueNs::StructId(_) => {} // OK
+            // `infer_path` takes a `Self` in a pattern for a unit struct only.
+            ValueNs::ImplSelf(_)
+            | ValueNs::ConstId(_)
+            | ValueNs::EnumVariantId(_)
+            | ValueNs::StructId(_) => {} // OK
         }
 
         Ok(ResolvedPat { ty: pat_ty, kind: ResolvedPatKind::Path { res } })

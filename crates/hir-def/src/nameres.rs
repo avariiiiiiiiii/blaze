@@ -690,23 +690,80 @@ pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
         return DefMapPair::new(db, def_map, local_def_map);
     }
     let Some((def_map, local_def_map)) = delta::published(db, crate_id) else {
-        let name = |krate: Crate| match &krate.extra_data(db).display_name {
-            Some(name) => format!("`{}` ({krate:?})", name.crate_name()),
-            None => format!("{krate:?}"),
-        };
-        match delta::maintaining() {
-            Some(asking) => panic!(
-                "nameres: no maintained resolution for crate {} read while maintaining crate {}: \
-                 it is not maintained before it",
-                name(crate_id),
-                name(asking)
-            ),
-            None => panic!("nameres: no maintained resolution for crate {}: no maintainer ran", name(crate_id)),
-        }
+        Unmaintained::of(db, crate_id, delta::maintaining()).throw()
     };
     frozen::check(db, crate_id, &def_map, &local_def_map);
     DefMapPair::new(db, def_map, local_def_map)
 }
+
+/// A crate's `DefMap` asked for when no frozen image serves it and the name resolution
+/// maintainer published none: a bug in whoever asked or in the maintainer, never resolved
+/// another way. It unwinds out of the query with this as its payload, and the driver that
+/// catches it ([`Unmaintained::catch`]) stops the build with it as the error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unmaintained {
+    pub krate: Crate,
+    /// Its display name, if it has one.
+    pub name: Option<String>,
+    /// The crate the maintainer was resolving when it asked, with its display name: the
+    /// crate asked for is not maintained before it. `None` when no maintainer ran.
+    pub asking: Option<(Crate, Option<String>)>,
+}
+
+impl Unmaintained {
+    fn of(db: &Db, krate: Crate, asking: Option<Crate>) -> Unmaintained {
+        let name = |krate: Crate| {
+            // alloc: an error's crate name, once
+            krate.extra_data(db).display_name.as_ref().map(|it| it.crate_name().to_string())
+        };
+        Unmaintained { krate, name: name(krate), asking: asking.map(|it| (it, name(it))) }
+    }
+
+    /// Unwinds with `self` as the payload. It is logged first: a catcher that reads only a
+    /// panic's text finds none in it, and the panic hook prints only where it was thrown.
+    pub fn throw(self) -> ! {
+        tracing::error!("{self}");
+        std::panic::panic_any(self)
+    }
+
+    /// Runs `f`; an [`Unmaintained`] it unwinds with is returned, any other panic goes on.
+    pub fn catch<T>(f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Result<T, Unmaintained> {
+        std::panic::catch_unwind(f).map_err(|payload| match payload.downcast::<Unmaintained>() {
+            Ok(it) => *it,
+            Err(payload) => std::panic::resume_unwind(payload),
+        })
+    }
+
+    /// The `Unmaintained` a caught panic's payload is, if it is one.
+    // dyn: a caught panic's payload, read once
+    pub fn of_payload(payload: &(dyn std::any::Any + Send)) -> Option<&Unmaintained> {
+        payload.downcast_ref::<Unmaintained>()
+    }
+}
+
+fn write_crate(f: &mut std::fmt::Formatter<'_>, krate: Crate, name: Option<&str>) -> std::fmt::Result {
+    match name {
+        Some(name) => write!(f, "`{name}` ({krate:?})"),
+        None => write!(f, "{krate:?}"),
+    }
+}
+
+impl std::fmt::Display for Unmaintained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("name resolution: no maintained resolution for crate ")?;
+        write_crate(f, self.krate, self.name.as_deref())?;
+        match &self.asking {
+            Some((asking, name)) => {
+                f.write_str(", read while maintaining crate ")?;
+                write_crate(f, *asking, name.as_deref())?;
+                f.write_str(", which it is not maintained before")
+            }
+            None => f.write_str(": no maintainer ran for it and no frozen image serves it"),
+        }
+    }
+}
+
+impl std::error::Error for Unmaintained {}
 
 #[salsa::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {

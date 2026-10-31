@@ -369,7 +369,7 @@ fn builtin_of(word: u32) -> Option<BuiltinType> {
 }
 
 /// Every `StructPathDef`, its word being its index here.
-const STRUCT_PATH_DEFS: [StructPathDef; 14] = [
+const STRUCT_PATH_DEFS: [StructPathDef; 17] = [
     StructPathDef::Enum,
     StructPathDef::Struct,
     StructPathDef::Union,
@@ -384,6 +384,9 @@ const STRUCT_PATH_DEFS: [StructPathDef; 14] = [
     StructPathDef::Static,
     StructPathDef::ConstParam,
     StructPathDef::Local,
+    StructPathDef::AssocFn,
+    StructPathDef::AssocConst,
+    StructPathDef::SelfCtor,
 ];
 
 fn struct_path_def_word(def: StructPathDef) -> u32 {
@@ -982,7 +985,7 @@ impl InferenceRecord {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(22),
+        Part::U64(23),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -2315,6 +2318,9 @@ impl Sink {
                     StructPathFound::NoVariant { segment } => self.words.extend([2, segment]),
                     StructPathFound::AssocType { segment } => self.words.extend([3, segment]),
                     StructPathFound::AfterVariant { segment } => self.words.extend([4, segment]),
+                    StructPathFound::TypeRelative(def) => {
+                        self.words.extend([5, struct_path_def_word(def)])
+                    }
                 }
                 self.opt_ty(tys, ty.as_ref());
             }
@@ -2328,8 +2334,16 @@ impl Sink {
                 self.word(49);
                 self.span(*span);
             }
+            D::TyvarBehindRawPointer { span } => {
+                self.word(56);
+                self.span(*span);
+            }
             D::InheritedRefMutabilityMismatch { pat } => self.words.extend([53, local(*pat)]),
             D::FnTraitArgsNotTuple { call_expr } => self.words.extend([54, local(*call_expr)]),
+            D::SelfCtorNotTupleOrUnit { expr, self_ty } => {
+                self.words.extend([55, local(*expr)]);
+                self.ty(tys, self_ty);
+            }
         }
     }
 
@@ -3280,6 +3294,10 @@ impl Source<'_> {
                     2 => StructPathFound::NoVariant { segment: self.word()? },
                     3 => StructPathFound::AssocType { segment: self.word()? },
                     4 => StructPathFound::AfterVariant { segment: self.word()? },
+                    5 => match struct_path_def_of(self.word()?) {
+                        Some(def) => StructPathFound::TypeRelative(def),
+                        None => return Err(self.invalid("a struct path naming no kind of item")),
+                    },
                     _ => return Err(self.invalid("a struct path that found nothing")),
                 };
                 let ty = self.opt_ty(tys)?;
@@ -3296,6 +3314,8 @@ impl Source<'_> {
             49 => D::MethodOnUnknownRawPointee { span: self.span()? },
             53 => D::InheritedRefMutabilityMismatch { pat: self.local()? },
             54 => D::FnTraitArgsNotTuple { call_expr: self.local()? },
+            55 => D::SelfCtorNotTupleOrUnit { expr: self.local()?, self_ty: self.ty(tys)? },
+            56 => D::TyvarBehindRawPointer { span: self.span()? },
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
         })
     }
@@ -3670,8 +3690,15 @@ mod tests {
                 suggested_limit: 256,
             },
             D::MethodOnUnknownRawPointee { span: Span::PatId(pat(4)) },
+            D::TyvarBehindRawPointer { span: Span::ExprId(expr(5)) },
             D::InheritedRefMutabilityMismatch { pat: pat(3) },
             D::FnTraitArgsNotTuple { call_expr: expr(9) },
+            D::SelfCtorNotTupleOrUnit { expr: expr(2), self_ty: ty(types.never) },
+            D::NotAStructPath {
+                node: pat(2).into(),
+                found: StructPathFound::TypeRelative(StructPathDef::SelfCtor),
+                ty: None,
+            },
             D::BreakOutsideOfLoop { expr: expr(8), is_break: false, bad_value_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(8), is_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(9), is_break: false },

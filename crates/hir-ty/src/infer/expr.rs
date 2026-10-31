@@ -1429,6 +1429,14 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let g = self.resolver.update_to_inner_scope(self.db, self.store_owner, scope_id);
         let ty = match self.infer_path(path, id) {
             Some((_, ty)) => ty,
+            // A `Self` that resolves but has no constructor is reported already.
+            None if self.diagnostics.any(|it| {
+                matches!(it, InferenceDiagnostic::SelfCtorNotTupleOrUnit { expr, .. }
+                    if ExprOrPatIdPacked::from(*expr) == id)
+            }) =>
+            {
+                self.err_ty()
+            }
             None => {
                 if path.mod_path().is_some_and(|mod_path| mod_path.is_ident() || mod_path.is_self())
                 {

@@ -14,7 +14,7 @@ on), **rule** (the platform's linker or loader does the same; it stays, with why
 
 | file:line | kind | what it does | what it becomes |
 |---|---|---|---|
-| `place.rs:597`, `:602`, `:645`, `:668`, `:752`; `file.rs:328`; `stage.rs:1016`; `premap.rs:842` | error | an incremental image without room for a stage refused it with a string only ("link the image from scratch"), so the caller could not tell it from any other failure | done: `LinkError` has `refusal: Option<Refusal>`; `Refusal::NoRoom { need, room }` (a region or synthetic section past its capacity, the end of the call frames), `NoRegion` (the stage needs a region the image was laid out without), `TableFull { slots }` (jump table), `TlsMoved` (thread-locals would move in the run's area). `LinkError::no_room()` gives it; every other error has `None`. Made by `stage::refused`. Test: `tests.rs` `a_stage_out_of_room_is_a_refusal_the_caller_can_match`, `slots_need_a_jump_table`. What the caller does with it (grow the region as a planned, reported step, or relink on an explicit action) is the parent's (`../link.md`) |
+| `place.rs:597`, `:602`, `:645`, `:668`, `:752`; `file.rs:328`; `stage.rs:1016`; `premap.rs:842` | error | an incremental image without room for a stage refused it with a string only ("link the image from scratch"), so the caller could not tell it from any other failure | done: `LinkError` has `refusal: Option<Refusal>`; `Refusal::NoRoom { need, room }` (a region or synthetic section past its capacity, the end of the call frames), `NoRegion` (the stage needs a region the image was laid out without), `TableFull { slots }` (jump table), `TlsMoved` (thread-locals would move in the run's area). `LinkError::no_room()` gives it; every other error has `None`. Made by `stage::refused`. Test: `tests.rs` `a_stage_out_of_room_is_a_refusal_the_caller_can_match`, `slots_need_a_jump_table`. What comes next (grow as a planned, reported step; else relink on an explicit user action; never a silent relayout): [below](#a-refused-stage-and-what-comes-after-it) |
 | `write.rs:516` (fixup loop) | error | a native unwind record's field was zero-filled whenever its target did not resolve: undefined, an alias loop or a special symbol's error too, not only a piece the stage removed | done: zero-filled only when `Column::removed(at)` (the target's piece was removed, as ld drops an FDE of a collected function); anything else is the fixup's error. Test: `write.rs` `a_column_reads_back_values_cells_and_errors` |
 | `counter.rs:66` "pairs, all given out" | error (later) | refuses as it should, with a string | a `Refusal` variant when the parent matches it; the counter area is sized at layout like the regions |
 | `live.rs:73` `Message::Restart { why: String }` | rule (reported) | a live patch that can't apply tells the running program to restart, with a reason | stays an explicit, reported outcome; a typed reason is for blaze-live (`live.md`) |
@@ -52,6 +52,37 @@ on), **rule** (the platform's linker or loader does the same; it stays, with why
 | AS_NEEDED | rule (noted) | a library given as needed is always needed | later: ld drops one nothing references; the output then has one more `DT_NEEDED` than ld's |
 | wasm archive sizing, wasm function names | rule | the sizing pass ignores errors the reading pass raises; a missing name section gives no names | stays: the error comes from the read, names are optional in wasm |
 | `elf/read/archive.rs:64`, `wasm/object.rs:125` member names | rule | lossy, for display in errors only | stays |
+
+## A refused stage, and what comes after it
+
+A failed stage never makes the next one a whole layout: `Image::stage` works on a clone of the
+state, so after any refusal the next good change stages into the room the image kept
+(`Staged::full()` false) and its commit moves the generation by one. Tests: `tests.rs`
+`a_removed_function_still_called_through_its_slot_is_an_error` (a refused stage) and
+`a_stage_out_of_room_is_a_refusal_the_caller_can_match` (a refusal for want of room).
+
+A refusal for want of room (`err.no_room()` is `Some`) is different: the change itself can't fit,
+so it is refused again on every try, and the caller is stuck until something changes the layout.
+blaze-link never relays the image out by itself to get past it: a relayout moves every function,
+so a running program can't be patched into it, and that is the fallback this lane removes. The
+right design has two parts.
+
+- **Grow as a planned step (first choice).** blaze-link gets `Image::grow(&self, refusal) ->
+  Result<Growth, LinkError>`. It lays out a new image whose regions keep the old addresses
+  and add room past the end of each region that ran out (a patch region, a synthetic section,
+  the jump table: each is the last of its kind in its segment, or can be moved to be). Where a
+  region can't grow in place (the next region is right after it, or a `TlsMoved` refusal), it
+  says so with its own error and does not grow. `Growth` is staged and committed like any
+  change, and is reported as its own kind of link (`Linking::Grown { refusal }` in the parent's
+  `LinkMade`), so the bench and the user see it, and the bench times it as a grow, never as a
+  splice. A live program is told to restart only when a grow moves something it uses.
+- **Relink on an explicit user action (where a grow can't apply).** The parent turns the
+  refusal into a diagnostic that names the region, `need` and `room`, and says how to link from
+  scratch (`blaze build --relink`, or deleting the image). The next build is a first link only
+  because the user asked for it, and says so.
+
+Until `grow` exists, the refusal stops the link with the typed error and the parent reports it as
+that diagnostic.
 
 ## For the parent
 

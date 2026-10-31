@@ -54,7 +54,7 @@ use rustc_type_ir::{
 };
 use salsa::SalsaValue;
 use smallvec::SmallVec;
-use stdx::{impl_from, never};
+use stdx::impl_from;
 use thin_vec::ThinVec;
 use tracing::debug;
 
@@ -63,7 +63,7 @@ pub(crate) use hir_def::TrackedStructToken;
 
 use crate::{
     ElidedLifetimeSite, ImplTraitId, InferenceResult, MissingLifetimeKind,
-    PathLoweringDiagnostic, Span, TyLoweringDiagnostic,
+    PathLoweringDiagnostic, PatternTypeUnsupported, Span, TyLoweringDiagnostic,
     consteval::{CreateConstError, create_anon_const, path_to_const},
     db::{AnonConstId, HirDatabase, InternedOpaqueTyId},
     generics::{Generics, SingleGenerics, generics},
@@ -1202,7 +1202,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             }
             TypeRef::PatternType(ty, pat) => {
                 let ty = self.lower_ty(ty);
-                let Some(pat) = self.lower_pattern_type(pat, ty) else {
+                let Some(pat) = self.lower_pattern_type(type_ref_id, pat, ty) else {
                     return (self.types.types.error, res);
                 };
                 Ty::new_pat(self.interner, ty, pat)
@@ -1224,9 +1224,28 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
         (ty, res)
     }
 
-    fn lower_pattern_type(&mut self, pat: PatId, ty: Ty<'db>) -> Option<Pattern<'db>> {
+    /// `None` when the pattern is missing (a parse error) or is not lowered, which is reported.
+    fn lower_pattern_type(
+        &mut self,
+        source: TypeRefId,
+        pat: PatId,
+        ty: Ty<'db>,
+    ) -> Option<Pattern<'db>> {
+        let unsupported = |reason| TyLoweringDiagnostic::PatternTypeNotLowered { source, reason };
         let pat_kind = match self.store.pat(pat) {
-            hir_def::hir::Pat::Range { start: Some(start), end: Some(end), range_type: _ } => {
+            hir_def::hir::Pat::Range { start: None, .. } | hir_def::hir::Pat::Range { end: None, .. } => {
+                self.push_diagnostic(unsupported(PatternTypeUnsupported::OpenEnd));
+                return None;
+            }
+            hir_def::hir::Pat::Range { range_type: hir_def::hir::RangeOp::Exclusive, .. } => {
+                self.push_diagnostic(unsupported(PatternTypeUnsupported::ExclusiveEnd));
+                return None;
+            }
+            hir_def::hir::Pat::Range {
+                start: Some(start),
+                end: Some(end),
+                range_type: hir_def::hir::RangeOp::Inclusive,
+            } => {
                 // rustc allows using generic params in pattern types.
                 // In practice this does not matter since this feature is internal and I didn't find a way to actually use generic params,
                 // but it doesn't matter so...
@@ -1238,13 +1257,13 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
             hir_def::hir::Pat::NotNull => rustc_type_ir::PatternKind::NotNull,
             hir_def::hir::Pat::Or(pats) => rustc_type_ir::PatternKind::Or(
                 PatList::new_from_iter(
-                    pats.iter().map(|&pat| self.lower_pattern_type(pat, ty).ok_or(())),
+                    pats.iter().map(|&pat| self.lower_pattern_type(source, pat, ty).ok_or(())),
                 )
                 .ok()?,
             ),
             hir_def::hir::Pat::Missing => return None,
             _ => {
-                never!("pattern type can only be Range, NotNull or Or");
+                self.push_diagnostic(unsupported(PatternTypeUnsupported::Pattern));
                 return None;
             }
         };

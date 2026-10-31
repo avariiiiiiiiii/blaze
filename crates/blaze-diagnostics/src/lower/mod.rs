@@ -14,12 +14,19 @@ pub(crate) mod additional_non_auto_traits;
 pub(crate) mod ambiguous_assoc_type;
 pub(crate) mod ambiguous_associated_item;
 pub(crate) mod assoc_type_not_resolved;
+pub(crate) mod autoderef_recursion_limit;
 pub(crate) mod bad_rtn;
 pub(crate) mod conflicting_assoc_type_bindings;
+pub(crate) mod fn_trait_args_not_tuple;
 pub(crate) mod impl_trait_not_allowed;
+pub(crate) mod inherited_ref_mutability_mismatch;
+pub(crate) mod method_on_unknown_raw_pointee;
 pub(crate) mod missing_self_default_params;
 pub(crate) mod not_a_struct_path;
 pub(crate) mod object_without_trait;
+pub(crate) mod pattern_type_not_lowered;
+pub(crate) mod self_ctor_not_tuple_or_unit;
+pub(crate) mod tyvar_behind_raw_pointer;
 pub(crate) mod const_param_ty_not_allowed;
 pub(crate) mod elided_lifetimes_in_path;
 pub(crate) mod generic_args_prohibited;
@@ -205,7 +212,14 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::ImplTraitNotAllowed(d) => impl_trait_not_allowed::lower(cx, &d),
         AnyDiagnostic::MissingSelfDefaultParams(d) => missing_self_default_params::lower(cx, &d),
         AnyDiagnostic::ObjectWithoutTrait(d) => object_without_trait::lower(cx, &d),
+        AnyDiagnostic::PatternTypeNotLowered(d) => pattern_type_not_lowered::lower(cx, &d),
         AnyDiagnostic::NotAStructPath(d) => not_a_struct_path::lower(cx, &d),
+        AnyDiagnostic::AutoderefRecursionLimit(d) => autoderef_recursion_limit::lower(cx, &d),
+        AnyDiagnostic::FnTraitArgsNotTuple(d) => fn_trait_args_not_tuple::lower(cx, &d),
+        AnyDiagnostic::InheritedRefMutabilityMismatch(d) => inherited_ref_mutability_mismatch::lower(cx, &d),
+        AnyDiagnostic::MethodOnUnknownRawPointee(d) => method_on_unknown_raw_pointee::lower(cx, &d),
+        AnyDiagnostic::SelfCtorNotTupleOrUnit(d) => self_ctor_not_tuple_or_unit::lower(cx, &d),
+        AnyDiagnostic::TyvarBehindRawPointer(d) => tyvar_behind_raw_pointer::lower(cx, &d),
         AnyDiagnostic::LateBoundLifetimeArgs(d) => late_bound_lifetime_args::lower(cx, &d),
         AnyDiagnostic::MacroDefError(d) => macro_def_error::lower(cx, &d),
         AnyDiagnostic::MacroError(d) => macro_error::lower(cx, &d),

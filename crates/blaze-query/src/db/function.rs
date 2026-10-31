@@ -35,7 +35,9 @@ use super::{
         self, CYCLE, DURABILITY, HASHED, HEAD, Header, PROVISIONAL, Pages, RUNNING, Row, STALE,
         UNTRACKED, VALUE, VIEW_MASK, row_at, span,
     },
-    storage::{ALL, Durability, FIELD, Relocate, Storage, Table, color, key_parts, node_key, or},
+    storage::{
+        ALL, Durability, FIELD, Relocate, Restamp, Storage, Table, color, key_parts, node_key, or,
+    },
     verify,
 };
 
@@ -83,20 +85,27 @@ pub trait Function: 'static {
     fn hash(value: &Self::Value) -> u64;
 }
 
-/// A function's table: its rows, and how many hold a value (for its `lru` cap).
+/// A function's table: its rows, how many hold a value, and its `lru` cap (0: none), read
+/// only by the sweep.
 pub(crate) struct FnTable<F: Function> {
     pages: Pages,
     values: AtomicUsize,
+    cap: AtomicUsize,
     _of: PhantomData<fn() -> F>,
 }
 
 impl<F: Function> Table for FnTable<F> {
     fn new(storage: &Storage, index: u32) -> FnTable<F> {
         storage.check_db::<F::Db>(F::NAME);
-        if F::LRU > 0 {
+        if F::EVICTABLE {
             storage.add_lru(index);
         }
-        FnTable { pages: Pages::new(Tag::Query), values: AtomicUsize::new(0), _of: PhantomData }
+        FnTable {
+            pages: Pages::new(Tag::Query),
+            values: AtomicUsize::new(0),
+            cap: AtomicUsize::new(F::LRU),
+            _of: PhantomData,
+        }
     }
 
     fn pages(&self) -> &Pages {
@@ -117,8 +126,9 @@ impl Vtable {
             memory: memory::<F>,
             verify: Some(verify_edge::<F> as unsafe fn(*const (), &Storage, Id) -> Verified),
             reset: Some(reset_row::<F> as unsafe fn(&Storage, u32, Id)),
-            sweep: if F::LRU > 0 { Some(sweep::<F> as fn(&mut Storage, u32)) } else { None },
+            sweep: if F::EVICTABLE { Some(sweep::<F> as fn(&mut Storage, u32)) } else { None },
             relocate: Some(relocate::<F> as fn(&mut Storage, u32, &mut Relocate)),
+            restamp: Some(restamp::<F> as fn(&Storage, u32, &mut Restamp<'_>)),
             drop: drop_table::<F>,
         }
     }
@@ -1126,7 +1136,8 @@ pub fn evict_values_of<F: Function>(db: &mut F::Db, keys: &[F::Key]) -> usize {
 fn sweep<F: Function>(storage: &mut Storage, index: u32) {
     let Some(table) = storage.table::<FnTable<F>>(index) else { return };
     let held = table.values.load(Ordering::Relaxed);
-    if held <= F::LRU {
+    let cap = table.cap.load(Ordering::Relaxed);
+    if cap == 0 || held <= cap {
         return;
     }
     let mut ages: Vec<(u32, Id)> = rows::<F>(storage, table) // alloc: a sweep past the cap, at a view boundary
@@ -1135,7 +1146,7 @@ fn sweep<F: Function>(storage: &mut Storage, index: u32) {
             (word & VALUE != 0 && word & PROVISIONAL == 0).then_some((word & VIEW_MASK, id))
         })
         .collect(); // alloc: as above
-    let over = ages.len().saturating_sub(F::LRU);
+    let over = ages.len().saturating_sub(cap);
     if over == 0 {
         return;
     }
@@ -1149,6 +1160,31 @@ fn sweep<F: Function>(storage: &mut Storage, index: u32) {
         }
     }
     table.values.fetch_sub(evicted, Ordering::Relaxed);
+}
+
+/// Replaces `F`'s `lru` cap (0: none), applied at the next view's sweep.
+///
+/// # Panics
+///
+/// If `F` has no `lru`.
+pub fn set_lru_capacity<F: Function>(db: &mut F::Db, capacity: usize) {
+    assert!(F::EVICTABLE, "{} has no `lru`: its cap can't be set", F::NAME);
+    let (table, _) = db.storage_mut().table_or_make::<FnTable<F>>(F::ingredient());
+    table.cap.store(capacity, Ordering::Relaxed);
+}
+
+/// [`Vtable::restamp`] of `F`: each row's verified view and `changed`.
+fn restamp<F: Function>(storage: &Storage, index: u32, restamp: &mut Restamp<'_>) {
+    let Some(table) = storage.table::<FnTable<F>>(index) else { return };
+    for (_, row) in rows::<F>(storage, table) {
+        let header = &row.header;
+        let word = header.verified.load(Ordering::Relaxed);
+        debug_assert!(word & (RUNNING | PROVISIONAL) == 0, "a row running across a `&mut`");
+        let verified = restamp.apply(word & VIEW_MASK);
+        header.verified.store((word & !VIEW_MASK) | verified, Ordering::Relaxed);
+        let changed = restamp.apply(header.changed.load(Ordering::Relaxed));
+        header.changed.store(changed, Ordering::Relaxed);
+    }
 }
 
 /// [`Vtable::memory`] of `F`: rows made, and the bytes of rows and of the values in place.

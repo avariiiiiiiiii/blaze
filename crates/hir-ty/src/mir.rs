@@ -2136,10 +2136,12 @@ impl<'db> PlaceTy<'db> {
             elem,
             |ty| {
                 if matches!(ty.kind(), TyKind::Alias(..)) {
+                    // rustc's `normalize_erasing_regions` panics on a type that does not
+                    // normalize: the body type-checked, so its place types do.
                     let mut ocx = ObligationCtxt::new(infcx);
                     match ocx.structurally_normalize_ty(&ObligationCause::dummy(), env, ty) {
                         Ok(it) => it,
-                        Err(_) => Ty::new_error(infcx.interner, ErrorGuaranteed),
+                        Err(e) => panic!("the place type {ty:?} does not normalize: {e:?}"),
                     }
                 } else {
                     ty
@@ -2170,18 +2172,22 @@ impl<'db> PlaceTy<'db> {
             panic!("cannot use non field projection on downcasted place")
         }
         match *elem {
+            // rustc's `PlaceTy::projection_ty` has `bug!` for both: MIR building derefs only
+            // builtin pointers (a deref pattern on a smart pointer calls `Deref::deref` first,
+            // `lower/deref_pattern.rs`) and indexes only arrays and slices.
             ProjectionElem::Deref => {
-                // Lowering a deref pattern on a smart pointer gets here, for one.
-                let ty = structurally_normalize(self.ty)
-                    .builtin_deref(true)
-                    .unwrap_or_else(|| Ty::new_error(tcx, ErrorGuaranteed));
-                PlaceTy::from_ty(ty)
+                let ty = structurally_normalize(self.ty);
+                PlaceTy::from_ty(
+                    ty.builtin_deref(true)
+                        .unwrap_or_else(|| panic!("deref projection of non-dereferenceable {ty:?}")),
+                )
             }
-            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => PlaceTy::from_ty(
-                structurally_normalize(self.ty)
-                    .builtin_index()
-                    .unwrap_or_else(|| Ty::new_error(tcx, ErrorGuaranteed)),
-            ),
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                let ty = structurally_normalize(self.ty);
+                PlaceTy::from_ty(
+                    ty.builtin_index().unwrap_or_else(|| panic!("index projection of non-indexable {ty:?}")),
+                )
+            }
             ProjectionElem::Subslice { from, to /*, from_end*/ } => {
                 PlaceTy::from_ty(match structurally_normalize(self.ty).kind() {
                     TyKind::Slice(..) => self.ty,

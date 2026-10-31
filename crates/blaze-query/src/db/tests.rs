@@ -24,10 +24,11 @@ use super::{
     plumbing::{
         CycleKind, Function, Ingredient, Input, Interned, Tag, Tracked, Vtable, evict_values,
         evict_values_of, fetch, input_fields, input_new, input_read, input_set, input_singleton,
-        intern, intern_by, interned_arguments, interned_fields, tracked_fields, tracked_new,
-        value_hash,
+        intern, intern_by, interned_arguments, interned_fields, set_lru_capacity, tracked_fields,
+        tracked_new, value_hash,
     },
     replay_reads, report_untracked_read,
+    row::VIEW_MASK,
     storage::{Summary, input_bits},
     unshareable_reads, unwind_if_cancelled, with_attached,
 };
@@ -689,6 +690,20 @@ fn one_run_of_a_key_however_many_tasks_ask() {
 }
 
 #[test]
+fn resume_readers_clears_the_stop_without_a_view() {
+    let mut db = TestDb::new();
+    let cell = Cell::new(&db, 1, 0);
+    assert_eq!(*get::<Double>(&db, cell), 2);
+    let view = db.storage().view();
+    db.storage().stop_readers();
+    db.storage_mut().resume_readers();
+    assert!(!db.storage().readers_stopped());
+    assert_eq!(db.storage().view(), view);
+    assert_eq!(Cancelled::catch(AssertUnwindSafe(|| *get::<Double>(&db, cell))), Ok(2));
+    assert_eq!(db.runs("Double"), 1);
+}
+
+#[test]
 fn stopped_readers_unwind_until_the_next_write() {
     let mut db = TestDb::new();
     let cell = Cell::new(&db, 1, 0);
@@ -968,6 +983,74 @@ fn a_new_view_evicts_past_the_cap_and_keep_every_value_stops_it() {
     db.storage_mut().synthetic_write(Durability::LOW);
     assert_eq!(values_held(&db, "Capped"), 4);
     assert_eq!(db.runs("Capped"), 6, "two evicted values ran again");
+}
+
+query!(
+    CapLater,
+    u64,
+    |db, key| key.a(db);
+    const CAP: usize = 2;
+    const EVICT: bool = true;
+);
+
+#[test]
+fn a_cap_set_at_runtime_applies_at_the_next_view_and_zero_is_none() {
+    let mut db = TestDb::new();
+    let cells: Vec<Cell> = (0..6).map(|i| Cell::new(&db, i, 0)).collect();
+    set_lru_capacity::<CapLater>(&mut db, 4);
+    for &cell in &cells {
+        get::<CapLater>(&db, cell);
+    }
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(values_held(&db, "CapLater"), 4);
+    set_lru_capacity::<CapLater>(&mut db, 0);
+    for (i, &cell) in cells.iter().enumerate() {
+        assert_eq!(*get::<CapLater>(&db, cell), i as u64);
+    }
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(values_held(&db, "CapLater"), 6, "no cap: nothing evicted");
+    set_lru_capacity::<Tens>(&mut db, 1);
+    for &cell in &cells[..3] {
+        get::<Tens>(&db, cell);
+    }
+    db.storage_mut().synthetic_write(Durability::LOW);
+    assert_eq!(values_held(&db, "Tens"), 1, "a function declared `lru = 0` is swept once capped");
+}
+
+#[test]
+fn a_cap_on_a_function_without_lru_panics() {
+    let mut db = TestDb::new();
+    let payload = catch_unwind(AssertUnwindSafe(|| set_lru_capacity::<Double>(&mut db, 3)))
+        .expect_err("Double has no lru");
+    assert!(message(&*payload).contains("has no `lru`"));
+}
+
+#[test]
+fn views_renumber_at_the_limit_and_every_answer_holds() {
+    let mut db = TestDb::new();
+    let start = VIEW_MASK - 6;
+    db.storage_mut().start_at_view(start);
+    let cell = Cell::new(&db, 3, 7);
+    let still = Cell::new(&db, 21, 0);
+    let other = Cell::new(&db, 0, 0);
+    assert_eq!(*get::<Label>(&db, cell), 11);
+    assert_eq!(*get::<ReadB>(&db, cell), 7);
+    assert_eq!(*get::<Double>(&db, still), 42);
+    let mut a = 3;
+    for round in 0..14 {
+        if round % 3 == 0 {
+            a = round + 4;
+            cell.set_a(&mut db, a);
+        } else {
+            other.set_a(&mut db, round);
+        }
+        assert_eq!(*get::<Label>(&db, cell), (a % 2) * 10 + 1, "round {round}");
+        assert_eq!(*get::<ReadB>(&db, cell), 7, "round {round}");
+        assert_eq!(*get::<Double>(&db, still), 42, "round {round}");
+    }
+    assert!(db.storage().view().as_u32() < start, "renumbered past the limit");
+    assert_eq!((db.runs("Double"), db.runs("ReadB")), (1, 1), "unchanged across it: never ran");
+    assert_eq!(db.runs("Parity"), 6, "once, then once per write of `a`");
 }
 
 /// A value that counts its drops.

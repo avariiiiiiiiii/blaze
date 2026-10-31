@@ -2532,14 +2532,14 @@ fn emit_with(
         let mut lines = lines;
         LineRow::extend_ranges(
             &mut lines,
-            compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
+            compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc.as_abs())),
         );
         Ok(Code {
             // clone: the kept code's signature, a few parameters
             signature: ctx.func.signature.clone(),
             // alloc: the kept code, written once at its exact length
             bytes: compiled.buffer.data().to_vec(),
-            align: compiled.buffer.alignment.into(),
+            align: compiled.buffer.min_alignment.into(),
             relocs,
             unwind: FunctionUnwind::of(isa, ctx)?,
             lines,

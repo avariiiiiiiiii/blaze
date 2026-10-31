@@ -13,14 +13,22 @@
 //!   labelled "variant not found in `E`";
 //! - a segment that would be an associated type: E0223 "ambiguous associated type", as
 //!   `ambiguous_assoc_type` reports it, at the path up to that segment;
-//! - a segment after a variant: E0433 "failed to resolve: `A` is a variant, not a module".
+//! - a segment after a variant: E0433 "failed to resolve: `A` is a variant, not a module";
+//! - a pattern's path that type checking resolves to an item of another kind (an associated
+//!   function or constant after a type, a `Self` that is no unit struct): E0164 "expected
+//!   tuple struct or tuple variant, found {descr} `{path}`" in a tuple struct pattern, E0533
+//!   "expected unit struct, unit variant or constant, found ..." in a path pattern ("expected
+//!   unit struct" for `Self`), at the pattern, labelled "not a {expected}", or for a function
+//!   in a tuple struct pattern "`fn` calls are not allowed in patterns" with rustc's help.
 //!
 //! Follows rustc's `compiler/rustc_resolve/src/late/diagnostics.rs`
 //! (`smart_resolve_report_errors`), `compiler/rustc_resolve/src/late.rs` (`error_code`),
 //! `compiler/rustc_resolve/src/diagnostics.rs` (`BindingShadowsSomethingUnacceptable`),
 //! `compiler/rustc_mir_build/src/errors.rs` (`ConstParamInPattern`),
 //! `compiler/rustc_hir_typeck/src/lib.rs`/`fn_ctxt/mod.rs` (`check_struct_path`) and
-//! `compiler/rustc_hir_analysis/src/hir_ty_lowering/mod.rs` (`lower_assoc_path`) (MIT or
+//! `compiler/rustc_hir_analysis/src/hir_ty_lowering/mod.rs` (`lower_assoc_path`),
+//! `compiler/rustc_hir_typeck/src/pat.rs` (`check_pat_path`, `check_pat_tuple_struct`) and
+//! `compiler/rustc_hir_typeck/src/lib.rs` (`report_unexpected_variant_res`) (MIT or
 //! Apache-2.0).
 
 use either::Either;
@@ -154,6 +162,32 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NotAStructPath<'_>) -> Vec<Found> 
             }
             failure::diag(cx, &At { file, node: path.syntax() }, &segments, at, None)
         }
+        StructPathFound::TypeRelative(def) => {
+            let (code, expected) = match (source, def) {
+                (PathSource::TupleStruct, _) => ("E0164", "tuple struct or tuple variant"),
+                (_, StructPathDef::SelfCtor) => ("E0533", "unit struct"),
+                _ => ("E0533", "unit struct, unit variant or constant"),
+            };
+            // rustc prints the qualified path (`qpath_to_string`): `S::new`, `<S>::new`, `Self`.
+            // alloc: the error's text, for an error hir found
+            let qpath: String = path.syntax().text().split_whitespace().collect();
+            let at = cx.span_of(ptr);
+            // alloc: the error's text, for an error hir found
+            let message = format!("expected {expected}, found {} `{qpath}`", descr(cx, def, path));
+            // clone: a handle, on the error path
+            let mut diag = Diag::error(Some(code), message, at.clone());
+            match def {
+                StructPathDef::AssocFn if code == "E0164" => {
+                    diag.span_label(at, "`fn` calls are not allowed in patterns");
+                    diag.help("for more information, visit https://doc.rust-lang.org/book/ch19-00-patterns.html");
+                }
+                _ => {
+                    // alloc: the error's text, for an error hir found
+                    diag.span_label(at, format!("not a {expected}"));
+                }
+            }
+            diag
+        }
     };
     let mut diag = diag;
     code_fact(cx, &mut diag, ptr);
@@ -193,6 +227,9 @@ fn descr<'db>(cx: &Cx<'_, 'db>, def: StructPathDef, path: ast::Path<'db>) -> &'s
         StructPathDef::Static => "static",
         StructPathDef::ConstParam => "const parameter",
         StructPathDef::Local => "local variable",
+        StructPathDef::AssocFn => "associated function",
+        StructPathDef::AssocConst => "associated constant",
+        StructPathDef::SelfCtor => "self constructor",
     }
 }
 

@@ -13,7 +13,7 @@
 //! Apache-2.0).
 
 use either::Either;
-use hir::{Adt, AsAssocItem as _, GenericDef, InFile, ModuleDef, PathResolution, StructKind};
+use hir::{Adt, AsAssocItem as _, GenericArgsProhibitedReason, GenericDef, InFile, ModuleDef, PathResolution, StructKind};
 use syntax::{
     TextRange,
     view::{self as ast, AstNode as _, HasGenericArgs as _, HasName as _},
@@ -252,6 +252,136 @@ fn args_after_name(segment: ast::PathSegment<'_>) -> Option<TextRange> {
     Some(TextRange::new(start, end.max(start)))
 }
 
+/// A segment's generic arguments blaze can't report as rustc does: an error naming why, never
+/// nothing.
+fn refused(cx: &Cx<'_, '_>, file: hir::HirFileId, segment: ast::PathSegment<'_>, why: &str) -> Vec<Found> {
+    // alloc: the error's text, for an error hir found
+    let message = format!("blaze can't report these generic arguments as rustc does: {why}");
+    let mut diag = Diag::error(None, message, cx.span(InFile::new(file, segment.syntax().text_range())));
+    site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
+    vec![Found::new(diag, phase_at(segment.syntax()))] // alloc: the error found
+}
+
+/// rustc's `lower_assoc_path` of a variant a struct path reaches through a type: one error for
+/// the variant segment's arguments, the segment "this type" (the resolver left it unresolved),
+/// with `GenericsArgsErrExtend::EnumVariant`'s note and suggestion.
+fn type_relative_variant<'db>(
+    cx: &Cx<'_, 'db>,
+    segs: &[Seg<'db>],
+    h: usize,
+    file: hir::HirFileId,
+    segment: ast::PathSegment<'db>,
+) -> Vec<Found> {
+    let db = cx.db;
+    let span = |range: TextRange| cx.span(InFile::new(file, range));
+    let seg = &segs[h];
+    let seg_args = args(seg.segment);
+    let Some(&(_, last_range)) = seg_args.last() else {
+        return refused(cx, file, segment, "hir found arguments on a segment that has none");
+    };
+    let mut kinds: Vec<ArgKind> = Vec::new(); // alloc: for the error's message
+    for (kind, _) in &seg_args {
+        if !kinds.contains(kind) {
+            kinds.push(*kind);
+        }
+    }
+    let kind_names: Vec<&str> = kinds
+        .iter()
+        .map(|it| match it {
+            ArgKind::Lifetime => "lifetime",
+            ArgKind::Type => "type",
+            ArgKind::Const => "const",
+            ArgKind::Infer => "generic",
+        })
+        .collect(); // alloc: for the error's message
+    let kind = stdx::list::list(kind_names.iter(), Join::AndNoSerialComma, false);
+    let mut diag = Diag::error(
+        Some("E0109"),
+        format!("{kind} arguments are not allowed on this type"), // alloc: the error's message
+        span(seg_args[0].1),
+    );
+    for (_, range) in &seg_args[1..] {
+        diag.primary(span(*range));
+    }
+    // alloc: the error's label
+    diag.span_label(span(last_range), format!("{kind} argument{} not allowed", s(kinds.len())));
+    if let Some(name) = seg.segment.name_ref() {
+        diag.span_label(span(name.syntax().text_range()), "not allowed on this type");
+    }
+
+    diag.note("enum variants can't have type parameters");
+    let Some(PathResolution::Def(ModuleDef::EnumVariant(variant))) = &seg.res else {
+        return refused(cx, file, segment, "its path does not resolve to the variant hir found");
+    };
+    let adt = variant.parent_enum(db);
+    let type_name = adt.name(db).display(db, cx.edition).to_string(); // alloc: for the suggestion
+    let msg = format!("you might have meant to specify type parameters on enum `{type_name}`"); // alloc
+    let Some(args_span) = args_after_name(seg.segment) else {
+        return refused(cx, file, segment, "the variant's segment has no name before its arguments");
+    };
+    if GenericDef::Adt(Adt::Enum(adt)).params(db).is_empty() {
+        diag.suggestion_verbose(
+            span(args_span),
+            format!("{type_name} doesn't have generic parameters"), // alloc: the suggestion's message
+            "",
+            Applicability::MachineApplicable,
+        );
+    } else {
+        // rustc's `qself`: the type before the variant (`Alias` of `Alias::V`, `E` of `<E>::V`);
+        // a plain path of one segment, or one whose second to last segment is the enum, gets
+        // the arguments moved onto it.
+        let qself_path = seg.segment.parent_path().qualifier().and_then(|q| {
+            match q.segment().and_then(|it| it.type_anchor()) {
+                Some(anchor) => match anchor.ty() {
+                    Some(ast::Type::PathType(it)) => it.path(),
+                    _ => None,
+                },
+                None => Some(q),
+            }
+        });
+        let qself = qself_path.map(|path| segments(cx, path)).unwrap_or_default();
+        let target = match &qself[..] {
+            [only] => Some((only, only.segment.self_type_token().is_some())),
+            [.., enum_seg, _] if is_enum(&enum_seg.res) => Some((enum_seg, false)),
+            _ => None,
+        };
+        match target {
+            Some((target, is_self)) => {
+                // rustc's `span_to_snippet` of `args_span`, which lies in the segment.
+                let seg_start = seg.segment.syntax().text_range().start();
+                let seg_text = seg.segment.syntax().text();
+                let snippet = &seg_text
+                    [usize::from(args_span.start() - seg_start)..usize::from(args_span.end() - seg_start)];
+                let Some(name) = target.segment.name_ref().map(|it| it.syntax().text_range()) else {
+                    diag.note(msg);
+                    return finish(cx, diag, file, segment);
+                };
+                let target_args = args_after_name(target.segment).unwrap_or_else(|| TextRange::empty(name.end()));
+                let first = if is_self {
+                    let qself_range = target.segment.syntax().text_range();
+                    (span(qself_range), format!("{type_name}{snippet}")) // alloc: a part
+                } else {
+                    (span(target_args), snippet.to_owned()) // alloc: a part
+                };
+                diag.multipart_suggestion(
+                    msg,
+                    vec![first, (span(args_span), String::new())], // alloc: the parts
+                    Applicability::MaybeIncorrect,
+                );
+            }
+            None => {
+                diag.note(msg);
+            }
+        }
+    }
+    finish(cx, diag, file, segment)
+}
+
+fn finish(cx: &Cx<'_, '_>, mut diag: Diag, file: hir::HirFileId, segment: ast::PathSegment<'_>) -> Vec<Found> {
+    site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
+    vec![Found::new(diag, phase_at(segment.syntax()))] // alloc: the error found
+}
+
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Found> {
     let db = cx.db;
     let node = cx.node_view(d.args);
@@ -269,9 +399,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
     let value = in_value(top);
     let segs = segments(cx, top);
     let Some(h) = segs.iter().position(|it| it.segment.syntax() == segment.syntax()) else {
-        return Vec::new(); // alloc: empty, allocates nothing
+        return refused(cx, file, segment, "its segment is not in its own path");
     };
     let last = segs.len() - 1;
+    if d.reason == GenericArgsProhibitedReason::TypeRelativeVariant {
+        return type_relative_variant(cx, &segs, h, file, segment);
+    }
 
     // A static's or a const parameter's arguments are counted as a value's, E0107.
     if value && h == last {

@@ -26,7 +26,7 @@ pub(crate) trait TestDBExt {
     /// The events of `f`, in the order they happened: a batch's tasks are left to the queries
     /// that read their results ([`RunOrder::LeftToReaders`]), so the order is the one a test
     /// expects of the collection alone.
-    fn log_in_read_order(&self, f: impl FnOnce()) -> Vec<salsa::Event>;
+    fn log_in_read_order(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event>;
 
     /// The names of the queries `f` executed, in [`TestDBExt::log_in_read_order`]'s order.
     fn executed_in_read_order(&self, f: impl FnOnce()) -> Vec<String>;
@@ -80,7 +80,7 @@ impl TestDBExt for Db {
         }
     }
 
-    fn log_in_read_order(&self, f: impl FnOnce()) -> Vec<salsa::Event> {
+    fn log_in_read_order(&self, f: impl FnOnce()) -> Vec<blaze_query::db::Event> {
         let order = set_run_order(RunOrder::LeftToReaders);
         let events = self.log(f);
         set_run_order(order);

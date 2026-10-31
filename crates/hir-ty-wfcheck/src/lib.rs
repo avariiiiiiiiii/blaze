@@ -47,7 +47,6 @@ use rustc_type_ir::{
     AliasTyKind, BoundRegionKind, BoundVar, ClauseKind, RegionKind, TypeVisitableExt as _,
     inherent::{IntoKind, Term as _},
 };
-use salsa::SalsaValue;
 
 use hir_ty::{
     GenericPredicates, ImplTraitId, InferBodyId, InferenceResult,
@@ -67,7 +66,7 @@ pub use persist::{WfDiagnosticRef, WfResultRef, WfRow};
 use outlives::{Known, Needs, Wfcx};
 
 /// Where an error is: rustc's span of it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum Site {
     /// The type of a field.
     Field(VariantId, LocalFieldId),
@@ -88,7 +87,7 @@ pub enum Site {
     SelfTy(ImplId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct WfDiagnostic {
     /// rustc's error code, as `E0310`.
     pub code: &'static str,
@@ -96,13 +95,13 @@ pub struct WfDiagnostic {
     pub site: Site,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, blaze_query::Value)]
 pub struct WfResult {
     pub diagnostics: Vec<WfDiagnostic>,
 }
 
 /// The well-formedness errors of the item `def`: an ADT, an impl, a trait or a function.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn wfcheck(db: &Db, def: GenericDefId) -> WfResult {
     check_item(db, def)
 }

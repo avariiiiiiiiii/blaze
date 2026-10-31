@@ -1597,7 +1597,7 @@ fn type_looks_like_const(
 /// [`PathLoweringContext::inherent_associated_type`]: in the order of its crate's modules and
 /// their impls, and only each impl's first alias of a name. One read per ADT, so a lowering that
 /// looks a name up depends on this list, not on every module scope of the crate.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(crate) fn inherent_assoc_types(db: &Db, adt: AdtId) -> Box<[(Name, TypeAliasId, ImplId)]> {
     let def_map = hir_def::nameres::crate_def_map(db, adt.module(db).krate(db));
     let mut found = Vec::new(); // alloc: the memo's value, once per ADT

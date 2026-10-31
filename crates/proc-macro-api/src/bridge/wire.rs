@@ -100,8 +100,8 @@ impl Parts {
             ast_id: ErasedFileAstId::from_raw(ast_id),
         };
         // `ctx` is what `write_wire` wrote of a part of a tree of this process the moment
-        // before (`relative`); a wrong value panics in `from_u32` or in salsa's checked
-        // lookup, or names another context's hygiene.
+        // before (`relative`); a wrong value panics in `from_u32` or in the query engine's
+        // checked lookup, or names another context's hygiene.
         let ctx = SyntaxContext::from_u32(ctx);
         self.part(anchor, ctx)
     }

@@ -472,8 +472,8 @@ struct Probe {
 struct Seen {
     def: DefWithBodyId,
     step: Step,
-    read: salsa::DatabaseKeyIndex,
-    kind: salsa::ReadKind,
+    read: blaze_query::db::DatabaseKeyIndex,
+    kind: blaze_query::db::ReadKind,
     name: &'static str,
     class: Classified,
 }
@@ -489,8 +489,8 @@ impl BodyFacts for Probe {
         db: &Db,
         def: DefWithBodyId,
         step: Step,
-        read: salsa::DatabaseKeyIndex,
-        kind: salsa::ReadKind,
+        read: blaze_query::db::DatabaseKeyIndex,
+        kind: blaze_query::db::ReadKind,
         name: &'static str,
     ) -> Classified {
         let class = reads::classify(db, def, step, read, kind, name);
@@ -573,7 +573,8 @@ fn every_read_of_the_steps_is_covered_a_fact_or_a_listed_refusal() {
 
 /// A rule that names an ingredient no read of the steps is of is checked by the fact pairs
 /// above, not here; this asserts what the closure test relies on: a read the table names is
-/// never refused for its file, so the file suffixes match where salsa says each ingredient is.
+/// never refused for its file, so the file suffixes match where the engine says each ingredient
+/// is.
 #[test]
 fn a_read_the_table_names_by_name_is_found_by_its_file() {
     let (db, seen) = steps_seen();

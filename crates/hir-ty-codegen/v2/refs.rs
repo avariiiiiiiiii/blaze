@@ -42,7 +42,7 @@ use rustc_ast_ir::Mutability;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
 use blaze_ids::bits::BitSet;
-use salsa::plumbing::AsId;
+use blaze_query::db::AsId;
 use smallvec::{SmallVec, smallvec};
 
 use super::{
@@ -159,9 +159,9 @@ fn memo<'db>(
     }
 }
 
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(ref), revisions = usize::MAX)]
+// Nothing in its arguments is ever collected (the query database frees no interned value),
+// so they stay interned and are never verified.
+#[blaze_query::tracked(returns(ref))]
 fn code_walk<'db>(
     db: &'db Db,
     instance: Instance,
@@ -171,7 +171,7 @@ fn code_walk<'db>(
     code_refs(db, &instance, &env, inlined)
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn start_walk<'db>(db: &'db Db, main: FunctionId) -> Result<Walked, String> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
     scratch(db, env, None, false, |walk| walk.start_shim(main))

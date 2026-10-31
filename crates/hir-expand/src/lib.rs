@@ -38,7 +38,7 @@ mod budget_tests;
 #[cfg(test)]
 mod view_tests;
 
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use thin_vec::ThinVec;
 use triomphe::Arc;
 
@@ -465,7 +465,7 @@ pub enum MacroCallKind {
         /// for the eager input macro file.
         // FIXME: This is being interned, subtrees can vary quickly differing just slightly causing
         // leakage problems here
-        // Shared, as `attr_args` is: salsa clones an interned key, and a token tree is never cloned.
+        // Shared, as `attr_args` is: the query engine clones an interned key, and a token tree is never cloned.
         eager: Option<Arc<EagerCallInfo>>,
     },
     Derive {
@@ -633,12 +633,12 @@ impl MacroCallId {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl MacroCallId {
     /// Implementation of [`HirFileId::parse_or_expand`] for the macro case.
     // FIXME: We should verify that the parsed node is one of the many macro node variants we expect
     // instead of having it be untyped
-    #[salsa::tracked(returns(ref), lru = 512, mem_tag = Expand)]
+    #[blaze_query::tracked(returns(ref), lru = 512, mem_tag = Expand)]
     pub fn parse_macro_expansion(
         self,
         db: &Db,
@@ -700,7 +700,7 @@ impl MacroCallId {
     /// Lowers syntactic macro call to a token tree representation. That's a firewall
     /// query, only typing in the macro call itself changes the returned
     /// subtree.
-    #[salsa::tracked(returns(ref), mem_tag = Expand)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
     #[deprecated = "calling this is incorrect, call `macro_arg_considering_derives` instead"]
     fn macro_arg(self, db: &Db) -> MacroArgResult {
         use syntax::view::AstNode as _;
@@ -916,9 +916,9 @@ impl MacroCallId {
 
     /// Special case of [`Self::macro_expand`] for procedural macros. We can't LRU
     /// proc macros, since they are not deterministic in general, and
-    /// non-determinism breaks salsa in a very, very, very bad way.
+    /// non-determinism breaks the query engine in a very, very, very bad way.
     /// @edwin0cheng heroically debugged this once! See #4315 for details
-    #[salsa::tracked(returns(ref), mem_tag = Expand)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
     fn proc_macro_expansion(
         self,
         db: &Db,
@@ -996,7 +996,7 @@ fn expand_unimplemented_builtin_macro(
 /// parse queries being LRU cached. If they weren't the invalidations would only happen if the
 /// user wrote in the file that defines the proc-macro.
 fn proc_macro_span(db: &Db, ast: AstId<ast::Fn>) -> Span {
-    #[salsa::tracked(returns(copy), mem_tag = Expand)]
+    #[blaze_query::tracked(returns(copy), mem_tag = Expand)]
     fn proc_macro_span(db: &Db, ast: AstId<ast::Fn>, _: ()) -> Span {
         let span_map = ast.file_id.span_map(db);
         let node = ast.to_view(db);
@@ -1686,11 +1686,11 @@ impl ExpandTo {
 }
 
 /// Macro ids. That's probably the tricksiest bit in rust-analyzer, and the
-/// reason why we use salsa at all.
+/// reason why we use a query engine at all.
 ///
 /// We encode macro definitions into ids of macro calls, this what allows us
 /// to be incremental.
-#[salsa::interned(unsafe(no_lifetime), debug, revisions = usize::MAX)]
+#[blaze_query::interned(unsafe(no_lifetime), debug)]
 #[doc(alias = "MacroFileId")]
 pub struct MacroCallId {
     #[returns(ref)]
@@ -1711,7 +1711,7 @@ impl From<MacroCallId> for span::MacroCallId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum HirFileId {
     FileId(EditionedFileId),
     MacroFile(MacroCallId),
@@ -1857,7 +1857,7 @@ impl HirFileId {
     /// start at zero for every body and every block, so a macro expanding to an item that invokes
     /// the macro again advances neither counter past one and never reaches the recursion limit.
     ///
-    /// Written recursively rather than as a loop so that salsa memoizes each file's depth. Callers
+    /// Written recursively rather than as a loop so that the query engine memoizes each file's depth. Callers
     /// ask for this once per body, and the bodies of one expansion chain sit at depths 1..n, so a
     /// loop would walk 1 + 2 + ... + n steps for that chain. Reusing the parent's memoized depth
     /// makes each file O(1) once computed, and the chain linear.
@@ -1870,16 +1870,16 @@ impl HirFileId {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl HirFileId {
-    #[salsa::tracked(lru = 1024, returns(ref), mem_tag = Expand)]
+    #[blaze_query::tracked(lru = 1024, returns(ref), mem_tag = Expand)]
     pub fn ast_id_map(self, db: &Db) -> AstIdMap {
         AstIdMap::from_view(self.root(db))
     }
 
     /// The ranges of the file's syntax errors, sorted by where they start: what
     /// [`HirFileId::has_syntax_error_in`] searches, so the errors are found once per file.
-    #[salsa::tracked(returns(ref), mem_tag = Expand)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Expand)]
     fn syntax_error_ranges(self, db: &Db) -> Box<[TextRange]> {
         let mut ranges: Vec<TextRange> = match self {
             HirFileId::FileId(file_id) => {

@@ -22,7 +22,7 @@ use blaze_format::cursor::Put;
 use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame, scratch};
 use rustc_hash::FxHashMap;
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use smallvec::SmallVec;
 use triomphe::Arc;
 use crate::{AbsPath, AbsPathBuf, FileId, FileSet, VfsPath};
@@ -51,7 +51,7 @@ pub struct Files {
     pub(crate) file_source_roots: Column<FileSourceRootInput>,
     source_roots: Column<SourceRootInput>,
     /// What only the setters read and write. Every setter runs on `&mut` of the database and
-    /// no query takes this lock, so no query waits on it. A setter holds it across the salsa
+    /// no query takes this lock, so no query waits on it. A setter holds it across the input
     /// writes it makes; those call no query.
     writer: Mutex<Writer>,
     /// The files outside the VFS that `include_bytes!` or `include_str!` named.

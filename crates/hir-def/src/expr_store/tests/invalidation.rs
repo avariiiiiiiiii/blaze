@@ -44,7 +44,7 @@ pub static L: u32 = K + 1;
 "#;
 
 /// What reads a signature's store: whether it ran again is whether the store changed.
-#[salsa::tracked(returns(clone))]
+#[blaze_query::tracked(returns(clone))]
 fn signature_store_bytes(db: &Db, def: GenericDefId) -> Vec<u8> {
     let (_, store) = GenericParams::with_store(db, def);
     blaze_format::to_bytes(store)

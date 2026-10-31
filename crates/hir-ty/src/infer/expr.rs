@@ -1,6 +1,5 @@
 //! Type inference for expressions.
 
-use salsa::Database as _;
 use std::{iter::repeat_with, mem};
 
 use blaze_mem::Frame;
@@ -365,7 +364,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // Every expression is inferred and ids are dense, so one in 64 bounds how long a
         // cancelled revision runs on, without two dependent loads per expression.
         if tgt_expr.into_raw().into_u32() % 64 == 0 {
-            self.db.unwind_if_revision_cancelled();
+            blaze_query::db::unwind_if_cancelled(self.db);
         }
         // An expression is inferred within the one it is in: rustc's 5,204-arm `else if`.
         crate::next_solver::ensure_sufficient_stack(|| {

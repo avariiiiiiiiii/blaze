@@ -86,10 +86,10 @@ fn arg_columns(db: &TestDB, call: MacroCallId) -> u64 {
     blaze_alloc_count::measure(|| tree.copy()).1.allocations
 }
 
-/// A miss of `parse_macro_expansion` (with its argument's `macro_arg`) allocates salsa's run
-/// cost, the argument tree and the expansion's parse and span map, nothing else: the expansion
-/// tree and the semicolon split are the run's frame's. The parse's cost is measured by parsing
-/// the same tokens outside the database, warm; salsa's run cost by the miss of a call that
+/// A miss of `parse_macro_expansion` (with its argument's `macro_arg`) allocates the query
+/// engine's run cost, the argument tree and the expansion's parse and span map, nothing else: the
+/// expansion tree and the semicolon split are the run's frame's. The parse's cost is measured by
+/// parsing the same tokens outside the database, warm; the engine's run cost by the miss of a call that
 /// expands to nothing, less what that one owns.
 #[test]
 fn an_expansion_miss_allocates_its_result_alone() {
@@ -125,17 +125,17 @@ nothing!();
         blaze_alloc_count::measure(|| make.parse_macro_expansion(&db).value.1.iter().count());
     let (_, run) =
         blaze_alloc_count::measure(|| nothing.parse_macro_expansion(&db).value.1.iter().count());
-    let salsa = run.allocations.saturating_sub(parse_cost(&empty) + arg_columns(&db, nothing));
+    let engine = run.allocations.saturating_sub(parse_cost(&empty) + arg_columns(&db, nothing));
     let owned = parse_cost(&tokens) + arg_columns(&db, make);
     assert!(
-        base.allocations <= salsa + owned,
-        "a miss: {} allocations; salsa's run {salsa}, its argument, parse and map {owned}",
+        base.allocations <= engine + owned,
+        "a miss: {} allocations; the engine's run {engine}, its argument, parse and map {owned}",
         base.allocations,
     );
 }
 
-/// A miss of `macro_arg` for a derive's attribute call is the argument tree's columns and salsa's
-/// run cost (the same query for a derive of a unit struct, less its tree): the cfg walk's
+/// A miss of `macro_arg` for a derive's attribute call is the argument tree's columns and the
+/// query engine's run cost (the same query for a derive of a unit struct, less its tree): the cfg walk's
 /// attribute list and inserted leaves are the frame's.
 #[test]
 fn a_derive_argument_miss_allocates_its_tree_alone() {
@@ -166,15 +166,15 @@ struct Unit;
     let (_, run) = blaze_alloc_count::measure(|| {
         let _ = unit.macro_arg_considering_derives(&db, &unit.loc(&db).kind);
     });
-    let salsa = run.allocations.saturating_sub(arg_columns(&db, unit));
+    let engine = run.allocations.saturating_sub(arg_columns(&db, unit));
     let (_, miss) = blaze_alloc_count::measure(|| {
         let _ = wide.macro_arg_considering_derives(&db, &wide.loc(&db).kind);
     });
     let owned = arg_columns(&db, wide);
     crate::nameres::ENABLE_BUILTIN_DERIVE_FAST_PATH.set(true);
     assert!(
-        miss.allocations <= salsa + owned,
-        "`macro_arg` of a derive: {} allocations; salsa's run {salsa}, its tree {owned}",
+        miss.allocations <= engine + owned,
+        "`macro_arg` of a derive: {} allocations; the engine's run {engine}, its tree {owned}",
         miss.allocations,
     );
 }

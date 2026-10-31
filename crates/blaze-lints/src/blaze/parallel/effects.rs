@@ -1,5 +1,5 @@
 //! What a call may do that iterations running at once could see: a per-instance effect
-//! summary, bottom-up, as salsa queries.
+//! summary, bottom-up, as tracked queries.
 //!
 //! [`effects`] answers for one instance of a function (its generic arguments given), over its
 //! monomorphized MIR, and [`closure_effects`] for one of a closure. A summary says which
@@ -266,7 +266,7 @@ impl Effects {
 }
 
 /// What the instance `f` with `args`, in `env`, does.
-#[salsa::tracked(returns(copy), cycle_initial = |_, _, _, _, _| Effects::NONE)]
+#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _, _, _| Effects::NONE)]
 pub(crate) fn effects(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -282,7 +282,7 @@ pub(crate) fn effects(
 
 /// What a closure does when called, its parent's arguments `parent` given. Its parameter 0 is
 /// the closure itself, by reference or by value, through which it reaches what it captures.
-#[salsa::tracked(returns(copy), cycle_initial = |_, _, _, _, _| Effects::NONE)]
+#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _, _, _| Effects::NONE)]
 pub(crate) fn closure_effects<'db>(
     db: &'db Db,
     env: StoredParamEnvAndCrate,
@@ -305,7 +305,7 @@ pub(crate) const LOOP_WEIGHT: u64 = 16;
 /// The work a call of the instance runs, in MIR statements and terminators, its callees'
 /// included; a block in a loop counts [`LOOP_WEIGHT`] times. A call that recurses counts
 /// [`RECURSIVE_COST`], with no fixpoint to find.
-#[salsa::tracked(returns(copy), cycle_result = recursive_cost)]
+#[blaze_query::tracked(returns(copy), cycle_result = recursive_cost)]
 pub(crate) fn cost(
     db: &Db,
     env: StoredParamEnvAndCrate,
@@ -321,7 +321,7 @@ pub(crate) fn cost(
 
 fn recursive_cost(
     _db: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _env: StoredParamEnvAndCrate,
     _f: FunctionId,
     _args: StoredGenericArgs,
@@ -331,7 +331,7 @@ fn recursive_cost(
 
 fn recursive_closure_cost<'db>(
     _db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _env: StoredParamEnvAndCrate,
     _closure: InternedClosureId<'db>,
     _parent: StoredGenericArgs,
@@ -340,7 +340,7 @@ fn recursive_closure_cost<'db>(
 }
 
 /// [`cost`] of a closure.
-#[salsa::tracked(returns(copy), cycle_result = recursive_closure_cost)]
+#[blaze_query::tracked(returns(copy), cycle_result = recursive_closure_cost)]
 pub(crate) fn closure_cost<'db>(
     db: &'db Db,
     env: StoredParamEnvAndCrate,

@@ -1,0 +1,90 @@
+{
+ "crate": "crates/hir-ty-codegen",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/hir-ty-codegen/counted.rs",
+   "edits": [
+    {
+     "old": "    /// Compile queries salsa ran rather than handed back, in all and by the crate each was\n",
+     "new": "    /// Compile queries the query engine ran rather than handed back, in all and by the crate each was\n"
+    },
+    {
+     "old": "/// Salsa ran a compile query for `krate`.\n",
+     "new": "/// The query engine ran a compile query for `krate`.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-codegen/mod.rs",
+   "edits": [
+    {
+     "old": "\n// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with\n// fewer revisions), so they stay interned and are never verified.\n#[blaze_query::tracked(returns(copy))]\n",
+     "new": "\n// Nothing in its arguments is ever collected (the query database frees no interned value),\n// so they stay interned and are never verified.\n#[blaze_query::tracked(returns(copy))]\n"
+    },
+    {
+     "old": "// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with\n// fewer revisions), so they stay interned and are never verified.\n",
+     "new": "// Nothing in its arguments is ever collected (the query database frees no interned value),\n// so they stay interned and are never verified.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-codegen/places.rs",
+   "edits": [
+    {
+     "old": "/// The [`Place`] of [`source_location_in_file`].\n// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with\n// fewer revisions), so they stay interned and are never verified.\n#[blaze_query::tracked]\n",
+     "new": "/// The [`Place`] of [`source_location_in_file`].\n// Nothing in its arguments is ever collected (the query database frees no interned value),\n// so they stay interned and are never verified.\n#[blaze_query::tracked]\n"
+    },
+    {
+     "old": "// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with\n// fewer revisions), so they stay interned and are never verified.\n",
+     "new": "// Nothing in its arguments is ever collected (the query database frees no interned value),\n// so they stay interned and are never verified.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-codegen/v2.rs",
+   "edits": [
+    {
+     "old": "/// A body whose code [`Hashes::code`] says. The ids are salsa's interned closures and\n",
+     "new": "/// A body whose code [`Hashes::code`] says. The ids are the query database's interned closures and\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-codegen/v2/frontend.rs",
+   "edits": [
+    {
+     "old": "/// what it is: one of a cycle (salsa's answer for all of it), a shim built without MIR, or a\n",
+     "new": "/// what it is: one of a cycle (the query engine's answer for all of it), a shim built without MIR, or a\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-codegen/v2/hashes.rs",
+   "edits": [
+    {
+     "old": "//! Nothing here is shared between threads but salsa's memos: no lock on any path.\n",
+     "new": "//! Nothing here is shared between threads but the query database's memos: no lock on any path.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-codegen/v2/refs.rs",
+   "edits": [
+    {
+     "old": "// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with\n// fewer revisions), so they stay interned and are never verified.\n",
+     "new": "// Nothing in its arguments is ever collected (the query database frees no interned value),\n// so they stay interned and are never verified.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty-codegen/v2/tests.rs",
+   "edits": [
+    {
+     "old": "/// time, and its frame is used. The rest is Cranelift's IR, salsa's results and the prepared\n",
+     "new": "/// time, and its frame is used. The rest is Cranelift's IR, the queries' results and the prepared\n"
+    }
+   ]
+  }
+ ]
+}

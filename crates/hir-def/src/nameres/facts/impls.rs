@@ -26,7 +26,7 @@ pub struct ModuleImpls {
 /// inherent impls are told apart as hir-ty's `TraitImpls` and `InherentImpls` tell them, by the
 /// scope's own split (`ItemScope::trait_impls`, `ItemScope::inherent_impls`); a
 /// `#[rustc_reservation_impl]` is a trait impl here, left to the trait tables to skip as they do.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn module_impls(db: &Db, module: ModuleId) -> ModuleImpls {
     let scope = module.def_map(db).module(db, module).scope(db);
     let all = scope.impls().len();

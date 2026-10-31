@@ -504,7 +504,7 @@ pub(crate) fn cancellable<T>(work: impl FnOnce() -> T) -> Result<T, Failed> {
     match caught {
         Ok(it) => Ok(it),
         Err(payload) => {
-            if payload.is::<salsa::Cancelled>() || payload.is::<blaze_graph::Cancelled>() {
+            if payload.is::<blaze_query::db::Cancelled>() || payload.is::<blaze_graph::Cancelled>() {
                 Err(Failed::Again)
             } else {
                 std::panic::resume_unwind(payload)

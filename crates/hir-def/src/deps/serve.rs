@@ -312,7 +312,7 @@ fn open(db: &Db, krate: Crate, filed: ContentId, bytes: ImageBuf) -> Fetched {
 }
 
 fn set_images(db: &mut Db, images: FxHashMap<Crate, Image>) {
-    use salsa::{Durability, Setter};
+    use blaze_query::db::{Durability, Setter};
     // alloc: setup: the one input value, once per session
     let images = Arc::new(images);
     match DepImages::try_get(&*db) {

@@ -19,7 +19,7 @@
 
 use blaze_ids::ContentId;
 use blaze_mem::{Frame, Tag, frame};
-use salsa::Durability;
+use blaze_query::db::Durability;
 use smallvec::SmallVec;
 use syntax::{LexedStr, SourceFile, SyntaxKind, T, TextRange, TextSize};
 use crate::FileId;
@@ -68,7 +68,7 @@ impl Crate {
 }
 
 /// The files of `krate`'s crate attributes at its edition, in the order given, refused or not.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 pub fn crate_attr_files(db: &Db, krate: Crate) -> Box<[EditionedFileId]> {
     let files = krate.crate_attr_files(db);
     if files.is_empty() {
@@ -81,7 +81,7 @@ pub fn crate_attr_files(db: &Db, krate: Crate) -> Box<[EditionedFileId]> {
 
 /// The files of `krate`'s crate attributes rustc applies, in the order given: those without a
 /// [`crate_attr_error`]. They come after the crate root's own inner attributes.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 pub fn applied_crate_attr_files(db: &Db, krate: Crate) -> Box<[EditionedFileId]> {
     let files = crate_attr_files(db, krate);
     if files.is_empty() {
@@ -102,7 +102,7 @@ pub fn crate_attr_owner(db: &Db, file: FileId) -> Option<Crate> {
 /// wrapped text `#![<attr>]` into token trees (a lexer error or an unbalanced delimiter stops
 /// it), parses one inner attribute off them (`parse_attribute`) and refuses any token after it
 /// (`unexpected`).
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub fn crate_attr_error(db: &Db, file: EditionedFileId) -> Option<CrateAttrError> {
     let (file_id, edition) = file.unpack(db);
     let text: &str = db.file_text(file_id).text(db);

@@ -52,7 +52,6 @@ use rustc_type_ir::{
     inherent::{Clause as _, GenericArg as _, GenericArgs as _, IntoKind as _, Ty as _},
     shift_vars,
 };
-use salsa::SalsaValue;
 use smallvec::SmallVec;
 use stdx::{impl_from, never};
 use thin_vec::ThinVec;
@@ -95,7 +94,7 @@ pub(crate) fn exact_thin<T>(
 
 pub(crate) struct PathDiagnosticCallbackData(pub(crate) TypeRefId);
 
-#[derive(PartialEq, Eq, Debug, Hash, SalsaValue)]
+#[derive(PartialEq, Eq, Debug, Hash, blaze_query::Value)]
 pub struct WithDefinedOpaques<T> {
     value: T,
     impl_traits: ThinVec<SelfAndAssocBounds>,
@@ -105,7 +104,7 @@ pub enum ImplTrait {}
 
 pub type ImplTraitIdx = la_arena::Idx<ImplTrait>;
 
-#[derive(PartialEq, Eq, Debug, Hash, SalsaValue)]
+#[derive(PartialEq, Eq, Debug, Hash, blaze_query::Value)]
 pub struct SelfAndAssocBounds {
     /// The self bounds, then the associated type bounds from `assoc_ty_bounds_start`, then from
     /// `const_bounds_start` each written `[const] Trait` bound again as `HostEffect(Maybe)`.
@@ -2001,7 +2000,7 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
 
 /// A lowered signature and what lowering it found: its diagnostics and the anonymous constants it
 /// defined. Both lists are empty for most items, and an empty `ThinVec` allocates nothing.
-#[derive(Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct TyLoweringResult<'db, T> {
     pub value: T,
     diagnostics: ThinVec<TyLoweringDiagnostic>,
@@ -2225,7 +2224,7 @@ pub(crate) fn impl_trait_with_diagnostics<'db>(
     impl_trait_of_impl(db, impl_id).as_ref().map(TyLoweringResult::as_lowered)
 }
 
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_result = impl_trait_with_diagnostics_cycle_result,
     mem_tag = Infer
@@ -2270,7 +2269,7 @@ pub(crate) fn lower_impl_trait<'db, 'f>(
 
 pub(crate) fn impl_trait_with_diagnostics_cycle_result<'db>(
     _db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _impl_id: ImplId,
 ) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
     None
@@ -2342,7 +2341,7 @@ pub enum TyDefId {
 }
 impl_from!(BuiltinType, AdtId(StructId, EnumId, UnionId), TypeAliasId for TyDefId);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::Supertype)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Supertype)]
 pub enum ValueTyDefId {
     FunctionId(FunctionId),
     StructId(StructId),
@@ -2402,7 +2401,7 @@ pub(crate) fn type_for_const<'db>(
 }
 
 /// Build the declared type of a const.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(crate) fn type_for_const_with_diagnostics<'db>(
     db: &'db Db,
     def: ConstId,
@@ -2438,7 +2437,7 @@ pub(crate) fn type_for_static<'db>(
 }
 
 /// Build the declared type of a static.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(crate) fn type_for_static_with_diagnostics<'db>(
     db: &'db Db,
     def: StaticId,
@@ -2521,7 +2520,7 @@ pub(crate) fn value_ty<'db>(
     }
 }
 
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_result = type_for_type_alias_with_diagnostics_cycle_result,
     mem_tag = Infer
@@ -2578,7 +2577,7 @@ pub(crate) fn type_for_type_alias_with_diagnostics<'db>(
 
 pub(crate) fn type_for_type_alias_with_diagnostics_cycle_result<'db>(
     db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _adt: TypeAliasId,
 ) -> TyLoweringResult<'db, WithDefinedOpaques<StoredEarlyBinder<StoredTy>>> {
     TyLoweringResult::empty(WithDefinedOpaques {
@@ -2610,7 +2609,7 @@ pub(crate) fn impl_self_ty_with_diagnostics<'db>(
     impl_self_ty_of_impl(db, impl_id).as_lowered()
 }
 
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_result = impl_self_ty_with_diagnostics_cycle_result,
     mem_tag = Infer
@@ -2649,7 +2648,7 @@ pub(crate) fn lower_impl_self_ty<'db, 'f>(
 
 pub(crate) fn impl_self_ty_with_diagnostics_cycle_result<'db>(
     db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _impl_id: ImplId,
 ) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
     TyLoweringResult::empty(StoredEarlyBinder::bind_no_rigid_aliases(
@@ -2663,7 +2662,7 @@ pub(crate) fn const_param_ty<'db>(db: &'db Db, def: ConstParamId) -> Ty<'db> {
 
 /// The types of an item's const parameters, by the parameter's `LocalTypeOrConstParamId`: one
 /// column, `None` at the type parameters' places.
-#[derive(Debug, Default, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Default, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct ConstParamTypes {
     tys: ThinVec<Option<StoredTy>>,
 }
@@ -2682,7 +2681,7 @@ pub(crate) fn const_param_types(db: &Db, def: GenericDefId) -> &ConstParamTypes 
     &const_param_types_with_diagnostics(db, def).value
 }
 
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_result = const_param_types_with_diagnostics_cycle_result,
     mem_tag = Infer
@@ -2730,7 +2729,7 @@ pub(crate) fn const_param_types_with_diagnostics<'db>(
 
 fn const_param_types_with_diagnostics_cycle_result<'db>(
     _db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _def: GenericDefId,
 ) -> TyLoweringResult<'db, ConstParamTypes> {
     TyLoweringResult::empty(ConstParamTypes::default())
@@ -2813,7 +2812,7 @@ pub(crate) fn field_types_query(db: &Db, variant_id: VariantId) -> &FieldTypes {
     field_types_with_diagnostics(db, variant_id).value
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct FieldType {
     pub(crate) ty: StoredEarlyBinder<StoredTy>,
     pub(crate) default: Option<StoredEarlyBinder<StoredConst>>,
@@ -2853,7 +2852,7 @@ pub(crate) fn field_types_with_diagnostics<'db>(
     )
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn field_types_of_variant<'db>(
     db: &'db Db,
     variant_id: VariantId,
@@ -2957,7 +2956,7 @@ impl SupertraitsInfo {
     pub(crate) fn query(db: &Db, trait_: TraitId) -> &Self {
         return supertraits_info(db, trait_);
 
-        #[salsa::tracked(returns(ref), cycle_result = supertraits_info_cycle, mem_tag = Infer)]
+        #[blaze_query::tracked(returns(ref), cycle_result = supertraits_info_cycle, mem_tag = Infer)]
         fn supertraits_info(db: &Db, trait_: TraitId) -> SupertraitsInfo {
             blaze_mem::frame::current(|frame| {
                 let mut all_supertraits = Vec::new_in(frame);
@@ -3016,7 +3015,7 @@ impl SupertraitsInfo {
 
         fn supertraits_info_cycle(
             _db: &Db,
-            _: salsa::Id,
+            _: blaze_query::db::Id,
             _trait_: TraitId,
         ) -> SupertraitsInfo {
             SupertraitsInfo::default()
@@ -3051,7 +3050,7 @@ enum AssocTypeShorthandResolution {
 /// following bounds are disallowed: `T: Foo<U::Item>, U: Foo<T::Item>`, but
 /// these are fine: `T: Foo<U::Item>, U: Foo<()>`.
 #[tracing::instrument(skip(db), ret)]
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_result = resolve_type_param_assoc_type_shorthand_cycle_result,
     mem_tag = Infer
@@ -3215,7 +3214,7 @@ fn resolve_type_param_assoc_type_shorthand_in(
 
 fn resolve_type_param_assoc_type_shorthand_cycle_result(
     _db: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _def: GenericDefId,
     _param: TypeParamId,
     _assoc_name: Name,
@@ -3278,7 +3277,7 @@ fn maybe_const_bound<'db>(
     )
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(crate) fn type_alias_bounds_with_diagnostics<'db>(
     db: &'db Db,
     type_alias: TypeAliasId,
@@ -3609,7 +3608,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for MapAndCompressBoundVars<'db, '_> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct GenericPredicates {
     // The order is the following:
     //
@@ -3651,7 +3650,7 @@ impl GenericPredicates {
     }
 }
 
-#[salsa::tracked(returns(ref), cycle_result = generic_predicates_cycle_result, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = generic_predicates_cycle_result, mem_tag = Infer)]
 fn generic_predicates_of<'db>(
     db: &'db Db,
     def: GenericDefId,
@@ -3662,7 +3661,7 @@ fn generic_predicates_of<'db>(
 /// A cycle can occur from malformed code.
 fn generic_predicates_cycle_result<'db>(
     _db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericPredicates> {
     TyLoweringResult::empty(GenericPredicates::from_explicit_own_predicates(
@@ -3796,7 +3795,7 @@ pub(crate) fn param_env_from_predicates<'db>(
 pub(crate) fn trait_environment<'db>(db: &'db Db, def: GenericDefId) -> ParamEnv<'db> {
     return ParamEnv { clauses: trait_environment_query(db, def).as_ref() };
 
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     pub(crate) fn trait_environment_query(
         db: &Db,
         def: GenericDefId,
@@ -3817,7 +3816,7 @@ pub(crate) fn const_conditions<'db>(
 ) -> EarlyBinder<'db, &'db [Clause<'db>]> {
     return const_conditions_query(db, def).get().map_bound(|it| it.as_slice());
 
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     fn const_conditions_query(
         db: &Db,
         def: GenericDefId,
@@ -4121,7 +4120,7 @@ fn push_const_arg_has_type_predicates<'db>(
     });
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct GenericDefaults(ThinVec<Option<StoredEarlyBinder<StoredGenericArg>>>);
 
 impl GenericDefaults {
@@ -4148,7 +4147,7 @@ pub(crate) fn generic_defaults(db: &Db, def: GenericDefId) -> GenericDefaultsRef
 /// Resolve the default type params from generics.
 ///
 /// Diagnostics are only returned for this `GenericDefId` (returned defaults include parents).
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_result = generic_defaults_with_diagnostics_cycle_result,
     mem_tag = Infer
@@ -4226,7 +4225,7 @@ pub(crate) fn generic_defaults_with_diagnostics<'db>(
 
 fn generic_defaults_with_diagnostics_cycle_result<'db>(
     _db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _def: GenericDefId,
 ) -> TyLoweringResult<'db, GenericDefaults> {
     TyLoweringResult::empty(GenericDefaults(ThinVec::new()))
@@ -4244,7 +4243,7 @@ pub(crate) fn callable_item_signature<'db>(
     }
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(crate) fn fn_sig_for_fn<'db>(
     db: &'db Db,
     def: FunctionId,
@@ -4322,7 +4321,7 @@ fn fn_sig_for_fn_in<'db>(
 /// where rustc makes each a late-bound lifetime of its own. An `impl Trait` the function returns
 /// has a lifetime parameter for each after the function's own, as rustc's has one for each
 /// lifetime it captures, and an error for its argument as the parameters have.
-#[derive(PartialEq, Eq, Debug, Hash, SalsaValue)]
+#[derive(PartialEq, Eq, Debug, Hash, blaze_query::Value)]
 pub struct ElidedLifetimes {
     /// How many each parameter leaves out, `None` where this does not work it out: then none of
     /// them is the `impl Trait`'s.
@@ -4332,7 +4331,7 @@ pub struct ElidedLifetimes {
     pub output: Option<ElidedOutput>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, SalsaValue)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, blaze_query::Value)]
 pub enum ElidedOutput {
     /// The one the parameters leave out at this index.
     Elided(u32),
@@ -4477,7 +4476,7 @@ pub fn with_elided_regions<'db>(
     ty.fold_with(&mut folder)
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn elided_lifetimes(db: &Db, function: FunctionId) -> ElidedLifetimes {
     blaze_mem::frame::current(|frame| elided_lifetimes_in(db, function, frame))
 }
@@ -4684,7 +4683,7 @@ fn ctor_signature(
     })))
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn fn_sig_for_struct_constructor(
     db: &Db,
     def: StructId,
@@ -4692,7 +4691,7 @@ fn fn_sig_for_struct_constructor(
     ctor_signature(db, def.into(), def.into())
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn fn_sig_for_enum_variant_constructor(
     db: &Db,
     def: EnumVariantId,
@@ -4729,13 +4728,13 @@ pub(crate) fn associated_type_by_name_including_super_traits_allow_ambiguity<'db
 #[cfg(test)]
 mod tests {
     use hir_def::type_ref::TypeRefId;
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
 
     use super::*;
     use crate::lower::diagnostics::{GenericArgsProhibitedReason, PathLoweringDiagnostic};
 
     fn trait_id(index: u32) -> TraitId {
-        TraitId::from_id(salsa::Id::from_bits(u64::from(index)))
+        TraitId::from_id(blaze_query::db::Id::from_u32(index))
     }
 
     #[test]

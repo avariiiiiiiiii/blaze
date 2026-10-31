@@ -8,10 +8,8 @@
 //! need to be resolved. rust-analyzer does not want a crate-wide analysis though as that would hurt
 //! incrementality too much and as such our query is based on a per item basis.
 //!
-//! This does unfortunately run into the issue that we can run into query cycles which salsa
-//! currently does not allow to be resolved via a fixpoint computation. This will likely be resolved
-//! by the next salsa version. If not, we will likely have to adapt and go with the rustc approach
-//! while installing firewall per item queries to prevent invalidation issues.
+//! Per item, the queries can form cycles; the query engine resolves them by fixpoint iteration
+//! (`variances_of`'s `cycle_initial` and `cycle_fn`).
 
 mod unused;
 
@@ -39,7 +37,7 @@ pub(crate) fn variances_of(db: &Db, def: GenericDefId) -> VariancesOf<'_> {
     variances_of_query(db, def).as_ref()
 }
 
-#[salsa::tracked(
+#[blaze_query::tracked(
     returns(ref),
     cycle_fn = crate::variance::variances_of_cycle_fn,
     cycle_initial = crate::variance::variances_of_cycle_initial,
@@ -85,7 +83,7 @@ pub fn ctor_variances(db: &Db, ctor: VariantId) -> VariancesOf<'_> {
     ctor_variances_query(db, ctor).as_ref()
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
     let adt: GenericDefId = match ctor {
         VariantId::StructId(s) => AdtId::StructId(s).into(),
@@ -119,7 +117,7 @@ fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
 
 pub(crate) fn variances_of_cycle_fn(
     _db: &Db,
-    _: &salsa::Cycle<'_>,
+    _: &blaze_query::db::Cycle<'_>,
     _last_provisional_value: &StoredVariancesOf,
     value: StoredVariancesOf,
     _def: GenericDefId,
@@ -149,7 +147,7 @@ fn glb(v1: Variance, v2: Variance) -> Variance {
 
 pub(crate) fn variances_of_cycle_initial(
     db: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     def: GenericDefId,
 ) -> StoredVariancesOf {
     let generics = generics(db, def);

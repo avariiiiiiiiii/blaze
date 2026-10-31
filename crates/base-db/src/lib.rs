@@ -1,4 +1,4 @@
-//! The front end's one database, [`Db`], and the [`salsa`] inputs it holds: files, source
+//! The front end's one database, [`Db`], and the query inputs it holds: files, source
 //! roots and the crate graph.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
@@ -7,8 +7,6 @@
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
-
-pub use salsa;
 
 mod change;
 mod content;
@@ -58,7 +56,7 @@ pub use crate::{
 pub use blaze_ids::ContentId;
 use blaze_ids::Hasher;
 use rustc_hash::FxHashSet;
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 use triomphe::Arc;
 pub use crate::{
@@ -75,18 +73,18 @@ pub type FxIndexMap<K, V> =
 #[macro_export]
 macro_rules! impl_intern_key {
     ($id:ident, $loc:ident) => {
-        #[salsa::interned(unsafe(no_lifetime), revisions = usize::MAX)]
+        #[blaze_query::interned(unsafe(no_lifetime))]
         #[derive(PartialOrd, Ord)]
         pub struct $id {
             #[returns(ref)]
             pub loc: $loc,
         }
 
-        // If we derive this salsa prints the values recursively, and this causes us to blow.
+        // If we derive this the query engine prints the values recursively, and this causes us to blow.
         impl ::std::fmt::Debug for $id {
             fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 f.debug_tuple(stringify!($id))
-                    .field(&format_args!("{:04x}", self.0.index()))
+                    .field(&format_args!("{:04x}", self.0.as_u32()))
                     .finish()
             }
         }
@@ -98,7 +96,7 @@ pub const DEFAULT_BORROWCK_LRU_CAP: u16 = 2024;
 
 /// The set of roots for crates.io libraries.
 /// Files in libraries are assumed to never change.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct LibraryRoots {
     #[returns(ref)]
     pub roots: FxHashSet<SourceRootId>,
@@ -106,7 +104,7 @@ pub struct LibraryRoots {
 
 /// The set of "local" (that is, from the current workspace) roots.
 /// Files in local roots are assumed to change frequently.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct LocalRoots {
     #[returns(ref)]
     pub roots: FxHashSet<SourceRootId>,
@@ -115,7 +113,7 @@ pub struct LocalRoots {
 /// The variables of the process a build is for, which `env!` and `option_env!` read where
 /// the crate's own have nothing: those of whoever asked for the build.
 /// Its content ID is [`Env::content`] of its variables.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct ProcessEnv {
     #[returns(ref)]
     #[get(vars_field)]
@@ -128,11 +126,11 @@ pub struct ProcessEnv {
 }
 
 impl ProcessEnv {
-    pub fn vars<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db Env {
+    pub fn vars<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db Env {
         self.vars_field(db)
     }
 
-    pub fn content<Db: ?Sized + salsa::Database>(self, db: &Db) -> ContentId {
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
         self.content_field(db).id()
     }
 }
@@ -164,7 +162,7 @@ pub fn set_process_env(db: &mut Db, vars: Env) {
 
 /// A file's text. Set only through [`Files`] (and the [`Db`] methods that call it),
 /// which keeps [`FileText::content`] the content ID of the text and its appended module.
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub struct FileText {
     #[returns(ref)]
     #[get(text_field)]
@@ -229,7 +227,7 @@ impl FileText {
 
     /// The text, which the file's parse tree shares ([`EditionedFileId::parse`]): the VFS's
     /// bytes as they are, a heap file's allocation or a range of the mapped image.
-    pub fn text<'db, Db: ?Sized + salsa::Database>(
+    pub fn text<'db, Db: ?Sized + blaze_query::db::Database>(
         self,
         db: &'db Db,
     ) -> &'db syntax::Text {
@@ -237,14 +235,14 @@ impl FileText {
     }
 
     /// See the field: the module the compiler appends to a crate root.
-    pub fn appended_root_module<Db: ?Sized + salsa::Database>(
+    pub fn appended_root_module<Db: ?Sized + blaze_query::db::Database>(
         self,
         db: &Db,
     ) -> Option<&'static str> {
         self.appended_root_module_field(db)
     }
 
-    pub fn content<Db: ?Sized + salsa::Database>(self, db: &Db) -> ContentId {
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
         self.content_field(db).id()
     }
 }
@@ -252,7 +250,7 @@ impl FileText {
 /// Where the lines of a file's text are ([`span::LineIndex`]): made the first time a
 /// diagnostic, `line!`/`column!`, a caller location, a proc macro's `Span::line` or debug info
 /// asks for a line or a column of the text, once per text, and never on load.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn line_index(db: &Db, text: FileText) -> span::LineIndex {
     span::LineIndex::new(text.text(db))
 }
@@ -282,7 +280,7 @@ impl std::fmt::Display for ReadError {
 }
 
 /// The contents of a file named by `include_bytes!` or `include_str!`, or why it can't be read.
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub struct IncludedFile {
     #[returns(ref)]
     #[get(read_field)]
@@ -309,26 +307,26 @@ impl IncludedFile {
         hasher.finish()
     }
 
-    pub fn read<'db, Db: ?Sized + salsa::Database>(
+    pub fn read<'db, Db: ?Sized + blaze_query::db::Database>(
         self,
         db: &'db Db,
     ) -> &'db Result<std::sync::Arc<[u8]>, ReadError> {
         self.read_field(db)
     }
 
-    pub fn bytes<'db, Db: ?Sized + salsa::Database>(
+    pub fn bytes<'db, Db: ?Sized + blaze_query::db::Database>(
         self,
         db: &'db Db,
     ) -> Option<&'db std::sync::Arc<[u8]>> {
         self.read_field(db).as_ref().ok()
     }
 
-    pub fn content<Db: ?Sized + salsa::Database>(self, db: &Db) -> ContentId {
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
         self.content_field(db).id()
     }
 }
 
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub struct FileSourceRootInput {
     #[returns(copy)]
     pub source_root_id: SourceRootId,
@@ -336,7 +334,7 @@ pub struct FileSourceRootInput {
 
 /// A source root. Its content ID is of its files' paths and content IDs and `is_library`
 /// ([`SourceRoot::DOMAIN`]), kept by [`Files`] as either changes.
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub struct SourceRootInput {
     #[returns(ref)]
     #[get(source_root_field)]
@@ -349,18 +347,18 @@ pub struct SourceRootInput {
 }
 
 impl SourceRootInput {
-    pub fn source_root<Db: ?Sized + salsa::Database>(self, db: &Db) -> Arc<SourceRoot> {
+    pub fn source_root<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> Arc<SourceRoot> {
         // clone: the owned copy this API hands out; a reader that only looks uses `source_root_ref`.
         self.source_root_field(db).clone()
     }
 
     /// [`SourceRootInput::source_root`] without a clone of the `Arc` (a write to the count
     /// every reader of the root shares).
-    pub fn source_root_ref<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) -> &'db SourceRoot {
+    pub fn source_root_ref<'db, Db: ?Sized + blaze_query::db::Database>(self, db: &'db Db) -> &'db SourceRoot {
         self.source_root_field(db)
     }
 
-    pub fn content<Db: ?Sized + salsa::Database>(self, db: &Db) -> ContentId {
+    pub fn content<Db: ?Sized + blaze_query::db::Database>(self, db: &Db) -> ContentId {
         self.content_field(db).id()
     }
 }
@@ -464,7 +462,7 @@ pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
     krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
 }
 
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 struct AllCrates {
     #[returns(clone)]
     crates: std::sync::Arc<[Crate]>,
@@ -531,7 +529,7 @@ pub fn all_crates(db: &Db) -> std::sync::Arc<[Crate]> {
 
 // FIXME: VFS rewrite should allow us to get rid of this wrapper
 #[doc(hidden)]
-#[salsa::interned]
+#[blaze_query::interned]
 pub struct InternedSourceRootId {
     #[returns(copy)]
     pub id: SourceRootId,
@@ -539,7 +537,7 @@ pub struct InternedSourceRootId {
 
 /// Crates whose root file is in `id`.
 pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
-    #[salsa::tracked(returns(deref))]
+    #[blaze_query::tracked(returns(deref))]
     pub fn source_root_crates(db: &Db, root: SourceRootInput) -> Box<[Crate]> {
         let crates = AllCrates::get(db).crates(db);
         blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {

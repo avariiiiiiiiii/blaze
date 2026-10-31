@@ -21,7 +21,6 @@ blaze-query.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
 rustc-hash.workspace = true
-salsa.workspace = true
 smallvec.workspace = true
 either.workspace = true
 rustc_type_ir.workspace = true

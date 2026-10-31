@@ -156,7 +156,7 @@ pub fn store_buffer(schema: SchemaHash) -> Valid {
     build.finish(root)
 }
 
-/// A `Src` record, as its three words of eight bytes: the file's salsa id, then the file kind
+/// A `Src` record, as its three words of eight bytes: the file's query ID, then the file kind
 /// and the syntax kind, then the range.
 fn src(file_kind: u32, file: u64, kind: SyntaxKind, start: u32, end: u32) -> [u64; 3] {
     let kind = u64::from(u16::from(kind));
@@ -171,7 +171,7 @@ fn in_file(kind: SyntaxKind, start: u32, end: u32) -> [u64; 3] {
 /// `NO_SOURCE`: the kind of an id of a back map without syntax.
 const NO_SOURCE: u16 = u16::MAX;
 
-/// A `FileRun`, as its two words of eight bytes: the file's salsa id, then the file kind and
+/// A `FileRun`, as its two words of eight bytes: the file's query ID, then the file kind and
 /// the run's first id.
 fn run(file_kind: u32, file: u64, start: u32) -> [u64; 2] {
     [file, u64::from(file_kind) | u64::from(start) << 32]

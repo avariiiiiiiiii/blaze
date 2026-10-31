@@ -12,7 +12,7 @@
 //! - a valid source map edited only in its columns (the store's maps, and `self`) decodes to
 //!   `Err`, or to a map written as exactly the edited bytes.
 //!
-//! The decoded map's files and macro calls are salsa ids from the bytes; they are compared and
+//! The decoded map's files and macro calls are query IDs from the bytes; they are compared and
 //! dropped, never looked up.
 
 #![forbid(unsafe_code)]

@@ -4,7 +4,6 @@ use std::{ops, sync::LazyLock};
 use base_db::Db;
 use hir_expand::name::Name;
 use la_arena::{Arena, Idx, RawIdx};
-use salsa::SalsaValue;
 use stdx::impl_from;
 
 use crate::{
@@ -69,7 +68,7 @@ pub enum TypeParamProvenance {
     ArgumentImplTrait,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash, SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash, blaze_query::Value)]
 pub enum TypeOrConstParamData {
     TypeParamData(TypeParamData),
     ConstParamData(ConstParamData),

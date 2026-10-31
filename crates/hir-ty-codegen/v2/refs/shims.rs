@@ -22,7 +22,7 @@ use hir_ty_mir::mir::location::track_caller;
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind, SliceLike as _, Ty as _};
-use salsa::plumbing::AsId;
+use blaze_query::db::AsId;
 
 use super::{Tys, told};
 use crate::{CodegenError, FunctionCx, InstanceDef, coroutine_instance, implemented_fn_method};

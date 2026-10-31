@@ -274,7 +274,7 @@ macro_rules! impl_stored_interned_slice {
 
         // SAFETY: `$stored_name` is a row number and borrows nothing, and the row it names is
         // never freed, so it is valid in every revision (unlike `$name`, which carries `'db`).
-        unsafe impl salsa::SalsaValue for $stored_name {}
+        unsafe impl blaze_query::db::Value for $stored_name {}
 
         impl std::fmt::Debug for $stored_name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -357,7 +357,7 @@ pub(crate) use impl_foldable_for_stored_type;
 /// field and an `at(NonZeroU32)` constructor.
 macro_rules! impl_stored_interned {
     ( $name:ident, $stored_name:ident $(,)? ) => {
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, ::salsa::SalsaValue)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
         pub struct $stored_name {
             index: ::std::num::NonZeroU32,
         }
@@ -412,7 +412,7 @@ pub struct DbInterner<'db> {
     features: Option<Features<'db>>,
 }
 
-// The database is `Send + Sync` (`salsa::Database`), so an interner is, by the auto traits.
+// The database is `Send + Sync` (`blaze_query::db::Database`), so an interner is, by the auto traits.
 const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<DbInterner<'static>>();
@@ -622,7 +622,7 @@ interned_slice!(
 #[derive(Debug)]
 pub struct Tracked<T: fmt::Debug + Clone> {
     value: T,
-    reads: Option<salsa::Reads>,
+    reads: Option<blaze_query::db::Reads>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -1247,7 +1247,7 @@ impl<'db> Interner for DbInterner<'db> {
         ExternalConstraints::new(self, data)
     }
 
-    type DepNodeIndex = Option<salsa::Reads>;
+    type DepNodeIndex = Option<blaze_query::db::Reads>;
 
     type Tracked<T: fmt::Debug + Clone> = Tracked<T>;
 
@@ -1319,10 +1319,10 @@ impl<'db> Interner for DbInterner<'db> {
         match tracked.reads {
             // From the shared cache: the query taking it reruns when the reads change, and so
             // does any goal it is solving in a capture of its own, which takes them too.
-            Some(reads) => salsa::replay_reads(self.db, reads),
+            Some(reads) => blaze_query::db::replay_reads(self.db, reads),
             // From this query's own cache: the query made the reads itself, but a goal being
             // captured now did not, and so must not be shared either.
-            None => salsa::unshareable_reads(self.db),
+            None => blaze_query::db::unshareable_reads(self.db),
         }
         tracked.value.clone() // clone: `get_tracked` hands out an owned value; the solver's are handles
     }
@@ -1331,8 +1331,8 @@ impl<'db> Interner for DbInterner<'db> {
         // Every goal the solver computes runs in here, a nested goal inside its parent's. A
         // goal can take minutes of solving that asks the database nothing, so a cancelled one
         // is noticed here rather than at the next query.
-        salsa::Database::unwind_if_revision_cancelled(self.db);
-        salsa::capture_reads(self.db, || super::ensure_sufficient_stack(task))
+        blaze_query::db::unwind_if_cancelled(self.db);
+        blaze_query::db::capture_reads(self.db, || super::ensure_sufficient_stack(task))
     }
 
     fn cache_scope(self, reads: &Self::DepNodeIndex) -> rustc_type_ir::search_graph::CacheScope {
@@ -4433,7 +4433,7 @@ mod tests {
     use crate::next_solver::{CanonicalVarKinds, Goal, PredicateKind, default_types};
 
     fn function() -> GenericDefId {
-        GenericDefId::FunctionId(salsa::plumbing::FromId::from_id(salsa::Id::from_bits(1)))
+        GenericDefId::FunctionId(blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(1)))
     }
 
     fn early(index: u32) -> Region<'static> {

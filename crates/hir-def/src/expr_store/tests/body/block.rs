@@ -190,7 +190,7 @@ fn f() {
     "#,
         expect![[r#"
             ModuleIdLt {
-                [salsa id]: Id(583),
+                [id]: Id(583),
                 krate: Crate(
                     Id(380),
                 ),

@@ -1,0 +1,24 @@
+{
+ "crate": "crates/blaze-diagnostics",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/blaze-diagnostics/Cargo.toml",
+   "edits": [
+    {
+     "old": "hegeltest.workspace = true\nblaze-query.workspace = true\nhir-expand = { workspace = true, features = [\"fixture\"] }\n",
+     "new": "hegeltest.workspace = true\nhir-expand = { workspace = true, features = [\"fixture\"] }\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/blaze-diagnostics/src/lower/unimplemented_trait.rs",
+   "edits": [
+    {
+     "old": "/// salsa-cached, and allocates nothing.\n",
+     "new": "/// memoized queries, and allocates nothing.\n"
+    }
+   ]
+  }
+ ]
+}

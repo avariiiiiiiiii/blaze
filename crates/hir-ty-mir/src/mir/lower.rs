@@ -4714,7 +4714,7 @@ fn check_expansions<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Result<'db, ()
 /// What is wrong with the first macro call of the body, in the order lowering met them, that
 /// failed to expand or whose expansion is not what rustc parses it as. It reads the store's
 /// macro calls and their sites, not the source map, so lowering a body never builds its map.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn failed_expansion<'db>(db: &'db Db, owner: InferBodyId<'db>) -> Option<String> {
     use syntax::view::AstNode;
     let calls = ExpressionStore::of(db, owner.expression_store_owner(db)).macro_calls();
@@ -5237,7 +5237,7 @@ pub(crate) fn lower_body<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<'db,
 }
 
 /// The body of the constant behind a promoted `&expr` of `def`, which evaluates `expr` alone.
-#[salsa::tracked(returns(as_ref))]
+#[blaze_query::tracked(returns(as_ref))]
 pub fn promoted_mir_body_query<'db>(
     db: &'db Db,
     def: InferBodyId<'db>,

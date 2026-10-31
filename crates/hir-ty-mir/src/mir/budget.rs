@@ -1,5 +1,5 @@
 //! What `tests/mir/alloc_budget.rs` measures: the pipelines' steps one at a time, outside
-//! salsa, so a test can count what one step allocates.
+//! the query database, so a test can count what one step allocates.
 
 use base_db::Db;
 use blaze_mem::{Frame, Tag, frame};
@@ -86,7 +86,7 @@ pub fn new_infer_ctxt<'db>(db: &'db Db, owner: InferBodyId<'db>) -> InferCtxt<'d
     DbInterner::new_with(db, owner.krate(db)).infer_ctxt().build(TypingMode::non_body_analysis())
 }
 
-/// What `mir_body_query` builds for `def`, without salsa.
+/// What `mir_body_query` builds for `def`, without the query database.
 pub fn lower<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<MirBody<'db>, MirLowerError<'db>> {
     super::lower::lower_body(db, def)
 }

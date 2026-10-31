@@ -1,7 +1,7 @@
 //! Moving results off the heap once a build has stored what it made of them (#806: the MIR of
 //! every compiled body was 15% of a cold build's live heap; #734).
 //!
-//! Each value dropped keeps its memo, its fingerprint and the edges it read (salsa's
+//! Each value dropped keeps its memo, its fingerprint and the edges it read (the query database's
 //! `evict_values`, which every query with a `Hash` output has): a dependent verifies against it without the value, and a
 //! read computes it again and backdates by fingerprint, so a later edit cuts off early as if it
 //! had been kept. What is dropped:

@@ -11,7 +11,7 @@ authors.workspace = true
 
 
 [dependencies]
-salsa = { workspace = true, optional = true }
+blaze-query = { workspace = true, optional = true }
 rustc-hash.workspace = true
 text-size.workspace = true
 unicode-width.workspace = true
@@ -28,7 +28,8 @@ blaze-alloc-count.workspace = true
 syntax.workspace = true
 
 [features]
-default = ["salsa"]
+default = ["query"]
+query = ["dep:blaze-query"]
 in-rust-tree = []
 
 [lints]

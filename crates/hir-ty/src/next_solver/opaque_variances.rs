@@ -75,7 +75,7 @@ pub(crate) fn opt_alias_variances<'db>(
     }
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn opaque_variances_query<'db>(db: &'db Db, opaque: InternedOpaqueTyId<'db>) -> StoredVariancesOf {
     let interner = DbInterner::new_no_crate(db);
     let params = generics(interner, opaque.into());

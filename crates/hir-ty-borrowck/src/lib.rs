@@ -60,7 +60,6 @@ use hir_def::{
     expr_store::ExpressionStore,
     hir::{BindingAnnotation, BindingId, ExprId},
 };
-use salsa::SalsaValue;
 
 use hir_ty::{
     InferBodyId, InferenceResult,
@@ -119,7 +118,7 @@ pub(crate) fn debugging(db: &Db, owner: InferBodyId<'_>) -> bool {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub struct BorrowckDiagnostic {
     /// rustc's error code, as `E0382`, or `unused_mut` for the lint the borrow checker gives.
     pub code: &'static str,
@@ -254,7 +253,7 @@ impl BorrowckDiagnostic {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, blaze_query::Value)]
 pub struct BorrowckResult {
     pub diagnostics: Vec<BorrowckDiagnostic>,
     /// Why the body, or a closure in it, was not checked: MIR lowering does not support
@@ -266,7 +265,7 @@ pub struct BorrowckResult {
 }
 
 /// Why a body was not borrow checked, by the error rustc reports before borrow checking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum NotChecked {
     /// `BLAZE_BORROWCK=off`.
     Off,
@@ -295,7 +294,7 @@ impl NotChecked {
 }
 
 /// The errors rustc's borrow checker reports in `def` and the closures in it.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
     let mode = mode();
     let Some(checker) = checker(mode) else { return borrowck_in_mode(db, def, mode) };
@@ -369,7 +368,7 @@ fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> Borrowck
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
 /// or a const generic argument or default, which rustc checks as a body of its own.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn borrowck_anon_const<'db>(
     db: &'db Db,
     konst: hir_ty::db::AnonConstId<'db>,
@@ -996,7 +995,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
 /// Whether `ty`, its regions `'static`, is `Copy` in `env`: a query, as what it asks of the
 /// solver can be long (a future through every type it holds) and is the same in every body of
 /// the environment, and after an edit.
-#[salsa::tracked]
+#[blaze_query::tracked]
 fn is_copy_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,
@@ -1010,7 +1009,7 @@ fn is_copy_query(
 
 /// [`hir_ty::drop::has_drop_glue`] of `ty`, its regions `'static`, in `env`, as the order of
 /// its variants: a query as [`is_copy_query`] is.
-#[salsa::tracked]
+#[blaze_query::tracked]
 fn drop_glue_query(
     db: &Db,
     env: hir_ty::traits::StoredParamEnvAndCrate,

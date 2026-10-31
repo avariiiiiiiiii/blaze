@@ -14,7 +14,7 @@ use blaze_ids::radix;
 use blaze_mem::Frame;
 use hir_def::{AdtId, ImplId, ModuleDefId, ModuleId, VariantId, nameres::crate_def_map};
 use rustc_type_ir::inherent::Ty as _;
-use salsa::{SalsaValue, plumbing::AsId};
+use blaze_query::db::AsId;
 
 use crate::{
     TyLoweringDiagnostic,
@@ -49,7 +49,7 @@ pub(crate) fn batched_crate(db: &Db, module: ModuleId) -> Option<Crate> {
 }
 
 /// The diagnostics and anonymous constants of the rows that have any, ascending by row.
-#[derive(Debug, Default, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Default, PartialEq, Eq, blaze_query::Value)]
 pub struct SideTable<'db> {
     pub(super) rows: Box<[u32]>,
     /// Where each of `rows` starts in `diagnostics`; it ends where the next starts.
@@ -141,7 +141,7 @@ fn exact<T>(items: &mut Vec<T, &Frame>) -> Box<[T]> {
 }
 
 /// One kind of signature of a crate's items: the items ascending, a value for each.
-#[derive(Debug, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
 pub struct Batch<'db, K, V> {
     pub(super) keys: Box<[K]>,
     pub(super) values: Box<[V]>,
@@ -243,7 +243,7 @@ impl<'db> CrateImplPredicates<'db> {
 
 /// The field types of every variant of a crate's modules: the structs, the unions and each
 /// variant of the enums, ascending, their fields one CSR list.
-#[derive(Debug, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
 pub struct CrateFieldTypes<'db> {
     pub(super) variants: Box<[VariantId]>,
     /// The fields of `variants[i]` are `fields[starts[i]..starts[i + 1]]`: one more than
@@ -348,7 +348,7 @@ fn module_impls<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Vec<ImplId, A>
     impls
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn crate_field_types<'db>(db: &'db Db, krate: Crate) -> CrateFieldTypes<'db> {
     blaze_mem::frame::current(|frame| {
         let variants = module_variants(db, krate, frame);
@@ -358,7 +358,7 @@ fn crate_field_types<'db>(db: &'db Db, krate: Crate) -> CrateFieldTypes<'db> {
     })
 }
 
-#[salsa::tracked(returns(ref), cycle_result = crate_impl_self_tys_cycle, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = crate_impl_self_tys_cycle, mem_tag = Infer)]
 fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> {
     blaze_mem::frame::current(|frame| {
         let impls = module_impls(db, krate, frame);
@@ -368,7 +368,7 @@ fn crate_impl_self_tys<'db>(db: &'db Db, krate: Crate) -> CrateImplSelfTys<'db> 
 
 fn crate_impl_self_tys_cycle<'db>(
     db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     krate: Crate,
 ) -> CrateImplSelfTys<'db> {
     let error = StoredEarlyBinder::bind_no_rigid_aliases(
@@ -379,7 +379,7 @@ fn crate_impl_self_tys_cycle<'db>(
 }
 
 /// Reads the crate's self types: a trait's arguments may name `Self`.
-#[salsa::tracked(returns(ref), cycle_result = crate_impl_traits_cycle, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = crate_impl_traits_cycle, mem_tag = Infer)]
 fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
     let self_tys = CrateImplSelfTys::of(db, krate);
     blaze_mem::frame::current(|frame| {
@@ -399,14 +399,14 @@ fn crate_impl_traits<'db>(db: &'db Db, krate: Crate) -> CrateImplTraits<'db> {
 
 fn crate_impl_traits_cycle<'db>(
     db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     krate: Crate,
 ) -> CrateImplTraits<'db> {
     Batch::filled(&module_impls(db, krate, std::alloc::Global), || None)
 }
 
 /// Reads the crate's self types and traits: a where clause may name `Self` and `Self::Assoc`.
-#[salsa::tracked(returns(ref), cycle_result = crate_impl_predicates_cycle, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = crate_impl_predicates_cycle, mem_tag = Infer)]
 fn crate_impl_predicates<'db>(db: &'db Db, krate: Crate) -> CrateImplPredicates<'db> {
     let self_tys = CrateImplSelfTys::of(db, krate);
     blaze_mem::frame::current(|frame| {
@@ -418,7 +418,7 @@ fn crate_impl_predicates<'db>(db: &'db Db, krate: Crate) -> CrateImplPredicates<
 
 fn crate_impl_predicates_cycle<'db>(
     db: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     krate: Crate,
 ) -> CrateImplPredicates<'db> {
     let empty = StoredEarlyBinder::bind_no_rigid_aliases(Clauses::empty().store());

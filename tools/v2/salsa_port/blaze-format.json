@@ -1,0 +1,15 @@
+{
+ "crate": "crates/blaze-format",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/blaze-format/src/lib.rs",
+   "edits": [
+    {
+     "old": "/// record holds beyond its bounds (a salsa index, an interned handle) is only given bytes\n",
+     "new": "/// record holds beyond its bounds (a query ID, an interned handle) is only given bytes\n"
+    }
+   ]
+  }
+ ]
+}

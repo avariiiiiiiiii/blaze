@@ -1,0 +1,15 @@
+{
+ "crate": "crates/blaze-live",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/blaze-live/Cargo.toml",
+   "edits": [
+    {
+     "old": "    \"cfg(no_salsa_async_drops)\",\n",
+     "new": ""
+    }
+   ]
+  }
+ ]
+}

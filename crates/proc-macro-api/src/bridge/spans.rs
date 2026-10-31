@@ -20,8 +20,8 @@ pub fn spanned(file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Spa
         ast_id: ErasedFileAstId::from_raw(ast_id),
     };
     // Every caller passes a `ctx` that `blaze_lower::answer` read from the running expansion's
-    // database in this process; a wrong value panics in `from_u32` or in salsa's checked
-    // lookup, or names another context's hygiene.
+    // database in this process; a wrong value panics in `from_u32` or in the query engine's
+    // checked lookup, or names another context's hygiene.
     Span { range: range(start, end), anchor, ctx: SyntaxContext::from_u32(ctx) }
 }
 
@@ -95,7 +95,7 @@ pub fn join(
         };
         // `it.ctx` is what `ask` answered for this join, which the server gets from
         // `blaze_lower::answer` of the running expansion's database, in this process; a wrong
-        // value panics in `from_u32` or in salsa's checked lookup, or names another context's
+        // value panics in `from_u32` or in the query engine's checked lookup, or names another context's
         // hygiene.
         let ctx = SyntaxContext::from_u32(it.ctx);
         return Some(Span { range: range(it.start, it.end), anchor, ctx });

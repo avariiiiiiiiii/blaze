@@ -1,0 +1,15 @@
+{
+ "crate": "crates/intern",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/intern/src/intern.rs",
+   "edits": [
+    {
+     "old": "//! (Salsa refuses to store one, as it has no `salsa::Update`); [`InternedRef::to_owned`] and\n",
+     "new": "//! (the query engine refuses to store one, as it is no `blaze_query::db::Value`); [`InternedRef::to_owned`] and\n"
+    }
+   ]
+  }
+ ]
+}

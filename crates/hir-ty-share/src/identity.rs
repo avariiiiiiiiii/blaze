@@ -76,7 +76,7 @@ fn no_content(what: String) -> Unshared {
 /// An ADT as its identity says it: its key, its interface (fields, variants, `repr`), its
 /// layout, and the `Drop` impls of it and of every ADT its fields' types name, transitively,
 /// which drop glue reads.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn adt(db: &Db, adt: AdtId) -> Result<ContentId, Unshared> {
     let item = ItemId::Adt(adt);
     let mut h = Hasher::new(ADT_DOMAIN);

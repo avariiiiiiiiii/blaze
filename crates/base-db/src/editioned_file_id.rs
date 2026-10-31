@@ -11,16 +11,16 @@ use crate::FileId;
 
 use crate::{Db, trees::Trees};
 
-#[salsa::interned(debug, constructor = from_span_file_id, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, constructor = from_span_file_id, unsafe(no_lifetime))]
 #[derive(PartialOrd, Ord)]
 pub struct EditionedFileId {
     #[returns(copy)]
     field: span::EditionedFileId,
 }
 
-/// [`EditionedFileId::parse`]. salsa keeps every file's parse ([`Db::admit_parses`] lowers that
+/// [`EditionedFileId::parse`]. The query engine keeps every file's parse ([`Db::admit_parses`] lowers that
 /// when the trees outgrow [`Tag::Parse`]'s budget), and the trees count against that tag.
-#[salsa::tracked(self_ty = EditionedFileId, lru = 0, mem_tag = Parse, returns(ref))]
+#[blaze_query::tracked(self_ty = EditionedFileId, lru = 0, mem_tag = Parse, returns(ref))]
 fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     let _p = tracing::info_span!("parse", ?file).entered();
     let (file_id, edition) = file.unpack(db);
@@ -34,10 +34,10 @@ fn parse_(db: &Db, file: EditionedFileId) -> syntax::Parse<ast::SourceFile> {
     })
 }
 
-/// What a database keeps its files' parses by: salsa's capacity for them, which
+/// What a database keeps its files' parses by: the query engine's capacity for them, which
 /// [`Db::admit_parses`] sets, and the stored trees read in place of parsing ([`Trees`]).
 pub(crate) struct Parses {
-    /// How many parses salsa keeps the values of past a revision; 0 keeps every one.
+    /// How many parses the query engine keeps the values of past a view; 0 keeps every one.
     capacity: usize,
     pub(crate) trees: Option<Arc<Trees>>,
 }
@@ -49,7 +49,7 @@ impl Parses {
 }
 
 impl Db {
-    /// Sets how many files' parses salsa keeps past this revision by the bytes their trees
+    /// Sets how many files' parses the query engine keeps past this view by the bytes their trees
     /// hold against [`Tag::Parse`]'s budget: every one while they fit; over it, as many as
     /// fit at the bytes a parse holds now (with an eighth to spare), the ones read longest
     /// ago let go at the next revision; under half of it again, twice as many, back to every
@@ -84,31 +84,31 @@ impl Db {
         }
     }
 
-    /// How many files' parses salsa keeps now ([`Db::admit_parses`]); 0 is every one.
+    /// How many files' parses the query engine keeps now ([`Db::admit_parses`]); 0 is every one.
     pub fn parse_capacity(&self) -> usize {
         self.parses.capacity
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl EditionedFileId {
     /// Whether the file is in a library source root: a firewall, so an edit to the root's set
     /// of files that keeps the answer re-parses none of them.
-    #[salsa::tracked(returns(copy))]
+    #[blaze_query::tracked(returns(copy))]
     pub fn is_library(self, db: &Db) -> bool {
         let root = db.file_source_root(self.file_id(db)).source_root_id(db);
         db.source_root(root).source_root_ref(db).is_library
     }
 
     // firewall query
-    #[salsa::tracked(returns(as_deref))]
+    #[blaze_query::tracked(returns(as_deref))]
     pub fn parse_errors(self, db: &Db) -> Option<Box<[SyntaxError]>> {
         self.parse(db).errors_exact()
     }
 
     /// The file's syntax errors with every lazy body's: a firewall, so a check of a
     /// dependency parses its bodies for their errors once.
-    #[salsa::tracked(returns(as_deref))]
+    #[blaze_query::tracked(returns(as_deref))]
     pub fn parse_errors_with_bodies(self, db: &Db) -> Option<Box<[SyntaxError]>> {
         self.parse(db).errors_with_bodies_exact()
     }

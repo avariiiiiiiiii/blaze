@@ -138,7 +138,7 @@ impl UnsafetyCheck {
 }
 
 /// rustc's `check_unsafety` of `def`, with the closures, inline consts and repeat counts in it.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn unsafety_check(db: &Db, def: DefWithBodyId) -> UnsafetyCheck {
     let body = Body::of(db, def);
     let infer = InferenceResult::of(db, def);

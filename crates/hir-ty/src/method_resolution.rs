@@ -28,7 +28,7 @@ use blaze_mem::Frame;
 use either::Either;
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
-use salsa::{SalsaValue, plumbing::AsId};
+use blaze_query::db::AsId;
 use span::Edition;
 use tracing::{debug, instrument};
 
@@ -102,7 +102,7 @@ pub struct MethodResolutionContext<'a, 'db> {
     pub frame: &'a Frame,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum CandidateId {
     FunctionId(FunctionId),
     ConstId(ConstId),
@@ -486,7 +486,7 @@ pub(crate) type StoredImplMethod =
 /// [`lookup_impl_method_query`], memoized: codegen asks the same trait method with the same
 /// arguments many times per build and again on every edit, and each ask re-runs trait
 /// selection in a fresh inference context.
-#[salsa::tracked(cycle_result = lookup_impl_method_cycle_result, returns(clone), mem_tag = Infer)]
+#[blaze_query::tracked(cycle_result = lookup_impl_method_cycle_result, returns(clone), mem_tag = Infer)]
 pub(crate) fn lookup_impl_method_stored(
     db: &Db,
     env: crate::traits::StoredParamEnvAndCrate,
@@ -499,7 +499,7 @@ pub(crate) fn lookup_impl_method_stored(
 
 fn lookup_impl_method_cycle_result(
     _: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _env: crate::traits::StoredParamEnvAndCrate,
     func: FunctionId,
     fn_subst: StoredGenericArgs,
@@ -600,13 +600,13 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
 /// The function or constant of `impl_` named `name`, the first if there are more: all that a
 /// lookup of `name` reads of the impl, so an item of another name added to it leaves the
 /// lookup as it was.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn impl_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
     value_item_named(&impl_.impl_items(db).items, &name)
 }
 
 /// As [`impl_value_item`], of a trait.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn trait_value_item(
     db: &Db,
     trait_: TraitId,
@@ -618,7 +618,7 @@ pub fn trait_value_item(
 /// For every trait declared in a module of a frozen `krate` (not in a block), what
 /// [`trait_value_item`] answers for each name its items have, sorted by name and then trait.
 /// A maintained crate's are its candidate slices ([`delta::candidate_traits`]).
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)]> {
     blaze_mem::frame::current(|frame| {
         // Each with where it was found: of a trait's items of one name the first stays first,
@@ -649,8 +649,8 @@ fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)
 /// (not in a block), sorted by trait: the traits of the name's candidate slice, so an item of
 /// another name added to a trait of `krate` leaves it as it was. A frozen crate's are the run
 /// of [`trait_value_items`] named `name`.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
-pub(crate) fn in_crate_trait_value_items(
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
+pub fn in_crate_trait_value_items(
     db: &Db,
     krate: Crate,
     name: Name,
@@ -763,7 +763,7 @@ pub(crate) fn find_matching_impl<'db>(
 /// Named is by the identifiers of `krate`'s files and of what the macros of other crates
 /// expand to among its items, which is more than rustc resolves (a local of the same name
 /// does) and less where such a macro in a body alone names the dependency.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("loaded_crates").entered();
     blaze_mem::frame::current(|frame| {
@@ -852,7 +852,7 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
 /// is for, so only a crate that can name the crates of both holds one: the walks over the
 /// loaded crates for one trait ask those alone, one AND of two rows, where each crate asked is
 /// a memo read and, cold, a table built.
-#[derive(Debug, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
 pub struct CratesThatName {
     /// The loaded crates and what they depend on, sorted: row `r` is `crates[r]`'s.
     crates: Box<[Crate]>,
@@ -884,7 +884,7 @@ impl CratesThatName {
     }
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn crates_that_name(db: &Db, krate: Crate) -> CratesThatName {
     let _p = tracing::info_span!("crates_that_name").entered();
     blaze_mem::frame::current(|frame| {
@@ -1024,7 +1024,7 @@ fn attribute_is_inert(name: &str) -> bool {
 }
 
 /// What lexing a body found that may write an impl there.
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 enum BodyMark {
     /// An `impl` token.
     Impl,
@@ -1036,7 +1036,7 @@ enum BodyMark {
 
 /// The `macro_rules!` of a file ([`macro_definitions`]): each one's name, whether it may write
 /// an impl, and the end of its run in `calls`, the names of the other macros it calls.
-#[derive(Debug, Default, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Default, PartialEq, Eq, blaze_query::Value)]
 struct MacroDefinitions {
     defs: Box<[(Symbol, bool, u32)]>,
     calls: Box<[Symbol]>,
@@ -1097,7 +1097,7 @@ fn macro_is_inert(db: &Db, krate: Crate, name: &Symbol) -> bool {
 /// attribute inside the braces that follow `fn name`, or between the `=` and the `;` of a
 /// `const` or `static`. An `impl Trait` type is found as well, which costs a lowering and
 /// nothing else.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn impls_in_bodies(
     db: &Db,
     file: base_db::EditionedFileId,
@@ -1206,7 +1206,7 @@ fn impls_in_bodies(
 /// turn (dtoa's `dtoa!`, called in the body of `<f64 as Sealed>::write`, calls `diyfp!`, which
 /// writes `impl DiyFp` there). Known by name, so a name that may costs a lowering and nothing
 /// else.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn macros_writing_impls(db: &Db, krate: Crate) -> Box<[(Symbol, bool)]> {
     fn add<'a>(known: &mut FrameMap<'_, &'a Symbol, bool>, name: &'a Symbol, writes: bool) {
         *known.entry(name).or_default() |= writes;
@@ -1276,7 +1276,7 @@ fn macros_writing_impls(db: &Db, krate: Crate) -> Box<[(Symbol, bool)]> {
 /// transcribers write an impl (an `impl` after `{`, `}`, `;`, `(`, `*`, an attribute or
 /// `unsafe`), an attribute that is not inert or one from a fragment, or call a macro passed in
 /// as `$name!`, and the names of the other macros they call.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn macro_definitions(db: &Db, file: base_db::EditionedFileId) -> MacroDefinitions {
     let text = db.file_text(file.file_id(db)).text(db);
     if !text.contains("macro_rules") {
@@ -1390,7 +1390,7 @@ impl ImplWork {
     }
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn crates_containing_incoherent_inherent_impls(db: &Db, krate: Crate) -> Box<[Crate]> {
     blaze_mem::frame::current(|frame| {
         let _p = tracing::info_span!("crates_containing_incoherent_inherent_impls").entered();
@@ -1439,13 +1439,13 @@ pub fn simplified_type_module(db: &Db, ty: &SimplifiedType<'_>) -> Option<Module
 }
 
 /// A `SimplifiedType` as the argument of a query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct SelfTyKey<'db>(
-    // SAFETY: salsa may keep this value past `'db` only if nothing in it borrows from the
-    // database. `SimplifiedType<'db>` is `fast_reject::SimplifiedType<SolverDefId<'db>>`
+    // SAFETY: the query database may keep this value past `'db` only if nothing in it borrows
+    // from the database. `SimplifiedType<'db>` is `fast_reject::SimplifiedType<SolverDefId<'db>>`
     // (`next_solver/ty.rs`), whose variants (`vendor/rustc_type_ir/src/fast_reject.rs`) hold
-    // only plain data and `SolverDefId<'db>`, which is `SalsaValue`; no `&'db`.
-    #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))] pub SimplifiedType<'db>,
+    // only plain data and `SolverDefId<'db>`, which is `blaze_query::db::Value`; no `&'db`.
+    #[value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))] pub SimplifiedType<'db>,
 );
 
 const _: () = assert!(size_of::<ImplId>() <= 8);
@@ -1455,7 +1455,7 @@ const _: () = assert!(size_of::<SimplifiedType<'static>>() <= 24);
 
 /// Runs of one flat array, as compressed sparse rows: run `i` is
 /// `values[starts[i]..starts[i + 1]]`.
-#[derive(Debug, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
 struct Runs<V> {
     starts: Box<[u32]>,
     values: Box<[V]>,
@@ -1635,21 +1635,21 @@ impl<'db> InherentImplsBuilder<'db, '_> {
 
 /// The inherent impls of a crate or block, as columns: the self types sorted by hash, each
 /// with its run of impls in the order they were found.
-#[derive(Debug, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, blaze_query::Value)]
 pub struct InherentImpls<'db> {
-    // SAFETY: salsa may keep this column past `'db` only if nothing in it borrows from the
-    // database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are
+    // SAFETY: the query database may keep this column past `'db` only if nothing in it borrows
+    // from the database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are
     // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants
     // (`vendor/rustc_type_ir/src/fast_reject.rs`) hold only plain data and `SolverDefId<'db>`,
-    // which is `SalsaValue`; no `&'db`.
-    #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
+    // which is `blaze_query::db::Value`; no `&'db`.
+    #[value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))]
     self_tys: SelfTys<'db>,
     impls: Runs<ImplId>,
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl<'db> InherentImpls<'db> {
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_crate(db: &'db Db, krate: Crate) -> InherentImpls<'db> {
         blaze_mem::frame::current(|frame| {
             let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
@@ -1664,7 +1664,7 @@ impl<'db> InherentImpls<'db> {
     /// ([`module_impls`]) and those of the blocks in the bodies it holds, in the order
     /// [`Self::for_crate`] holds them. Reruns when the module's scope changes, and is equal
     /// unless one of those impls is added, removed or changes its self type.
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_module(db: &'db Db, module: ModuleId) -> InherentImpls<'db> {
         blaze_mem::frame::current(|frame| {
             let mut builder = InherentImplsBuilder::new(frame);
@@ -1677,7 +1677,7 @@ impl<'db> InherentImpls<'db> {
     /// them: the type's inherent slice and the bodies of the modules whose bodies hold impls
     /// for it, so an impl added for another type, or anything else added anywhere, leaves this
     /// as it was. A frozen crate's are read from its frozen table.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_for_self_ty(
         db: &'db Db,
         krate: Crate,
@@ -1689,7 +1689,7 @@ impl<'db> InherentImpls<'db> {
         delta::read::inherent_impls_for(db, krate, self_ty)
     }
 
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_block(
         db: &'db Db,
         block: BlockIdLt<'db>,
@@ -1705,7 +1705,7 @@ impl<'db> InherentImpls<'db> {
     }
 
     /// The inherent impls of `block` for one type, as [`Self::in_crate_for_self_ty`].
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_block_for_self_ty(
         db: &'db Db,
         block: BlockIdLt<'db>,
@@ -1889,17 +1889,17 @@ impl<'db, 'f> TraitImplsBuilder<'db, 'f> {
 /// run `blanket[t]` of blanket impls and the rows `trait_rows[t]..trait_rows[t + 1]`, one per
 /// self type, sorted by hash. Row `r` has the runs `impls[r]` and `derives[r]`. Every run is in
 /// the order its impls were found.
-#[derive(Debug, PartialEq, SalsaValue)]
+#[derive(Debug, PartialEq, blaze_query::Value)]
 pub struct TraitImpls<'db> {
     traits: Box<[TraitId]>,
     trait_rows: Box<[u32]>,
     blanket: Runs<ImplId>,
-    // SAFETY: salsa may keep this column past `'db` only if nothing in it borrows from the
-    // database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are
+    // SAFETY: the query database may keep this column past `'db` only if nothing in it borrows
+    // from the database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are
     // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants
     // (`vendor/rustc_type_ir/src/fast_reject.rs`) hold only plain data and `SolverDefId<'db>`,
-    // which is `SalsaValue`; no `&'db`.
-    #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
+    // which is `blaze_query::db::Value`; no `&'db`.
+    #[value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))]
     self_tys: SelfTys<'db>,
     impls: Runs<ImplId>,
     derives: Runs<BuiltinDeriveImplId>,
@@ -1935,9 +1935,9 @@ impl<'db> TraitImpls<'db> {
     }
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl<'db> TraitImpls<'db> {
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_crate(db: &'db Db, krate: Crate) -> Arc<TraitImpls<'db>> {
         blaze_mem::frame::current(|frame| {
             let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
@@ -1954,7 +1954,7 @@ impl<'db> TraitImpls<'db> {
     /// ([`module_impls`]) and those of the blocks in the bodies it holds, in the order
     /// [`Self::for_crate`] holds them. Reruns when the module's scope changes, and is equal
     /// unless one of those impls is added, removed or changes its trait or self type.
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_module(db: &'db Db, module: ModuleId) -> TraitImpls<'db> {
         blaze_mem::frame::current(|frame| {
             let lang_items = hir_def::lang_item::lang_items(db, module.krate(db));
@@ -1969,7 +1969,7 @@ impl<'db> TraitImpls<'db> {
     /// the trait's slice and the bodies of the modules whose bodies hold impls of it, so an
     /// impl of another trait, or anything else added anywhere, leaves this as it was. A frozen
     /// crate's is read from its frozen table.
-    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_crate_and_trait(
         db: &'db Db,
         krate: Crate,
@@ -1986,7 +1986,7 @@ impl<'db> TraitImpls<'db> {
         })
     }
 
-    #[salsa::tracked(returns(as_deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(as_deref), mem_tag = Infer)]
     pub fn for_block(
         db: &'db Db,
         block: BlockIdLt<'db>,
@@ -2001,7 +2001,7 @@ impl<'db> TraitImpls<'db> {
         })
     }
 
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn for_crate_and_deps(db: &'db Db, krate: Crate) -> Box<[Arc<Self>]> {
         // clone: an `Arc` count per crate into the memo's value, made once at its length.
         loaded_crates(db, krate).iter().map(|&dep| Self::for_crate(db, dep).clone()).collect()
@@ -2011,7 +2011,7 @@ impl<'db> TraitImpls<'db> {
     /// [`loaded_crates`]. Reads [`Self::for_crate_and_trait`] of each crate that can name both
     /// ([`crates_that_name`]), so an impl of another trait anywhere leaves this
     /// unvalidated-equal, and one of `trait_` for another type reruns it equal.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_and_deps_for_trait_and_self_ty(
         db: &'db Db,
         krate: Crate,
@@ -2035,7 +2035,7 @@ impl<'db> TraitImpls<'db> {
     }
 
     /// The blanket impls of one trait in `krate` and its dependencies.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn blanket_in_crate_and_deps(
         db: &'db Db,
         krate: Crate,
@@ -2055,7 +2055,7 @@ impl<'db> TraitImpls<'db> {
     }
 
     /// The impls of one trait for one type in `krate` alone, without the built-in derives.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_for_trait_and_self_ty(
         db: &'db Db,
         krate: Crate,
@@ -2069,7 +2069,7 @@ impl<'db> TraitImpls<'db> {
     }
 
     /// The impls of one trait for one type in `block` alone, without the built-in derives.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_block_for_trait_and_self_ty(
         db: &'db Db,
         block: BlockIdLt<'db>,
@@ -2084,7 +2084,7 @@ impl<'db> TraitImpls<'db> {
 
     /// The impls of one trait in `krate` alone, without the built-in derives, in the order
     /// [`Self::for_trait`] gives them: the blanket impls first.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_for_trait(
         db: &'db Db,
         krate: Crate,
@@ -2105,7 +2105,7 @@ impl<'db> TraitImpls<'db> {
     /// The impls of one trait in `krate` and its dependencies, each crate's as
     /// [`Self::in_crate_for_trait`]. An impl of another trait leaves every crate's
     /// [`Self::for_crate_and_trait`] for this one as it was, so this does not rerun.
-    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    #[blaze_query::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_and_deps_for_trait(
         db: &'db Db,
         krate: Crate,
@@ -2397,7 +2397,7 @@ impl<'db> TraitImpls<'db> {
 
 /// The key of [`relevant_impls`]: a goal of `trait_` solved in `krate` whose self type
 /// simplifies to `self_ty`, or to nothing (a parameter, an alias, a placeholder) when `None`.
-#[salsa::interned(debug, revisions = usize::MAX)]
+#[blaze_query::interned(debug)]
 pub struct RelevantImplsKey<'db> {
     #[returns(copy)]
     pub krate: Crate,
@@ -2436,7 +2436,7 @@ impl RelevantImpls {
 /// the crates not among them. With no self type, the blanket impls alone. One read names one
 /// trait and one simplified self type, as a goal's `Implements` fact does; the whole tables
 /// name neither.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub fn relevant_impls<'db>(db: &'db Db, key: RelevantImplsKey<'db>) -> RelevantImpls {
     blaze_mem::frame::current(|frame| {
         let (krate, trait_) = (key.krate(db), key.trait_(db));

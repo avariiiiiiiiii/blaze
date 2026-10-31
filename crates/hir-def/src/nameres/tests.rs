@@ -910,7 +910,7 @@ pub fn f() {}
 /// `#![cfg(target_arch = "wasm32")]` still has the harness's `main` (astral-experiments/blaze#35).
 #[test]
 fn cfg_the_entire_crate_keeps_the_appended_module() {
-    use base_db::salsa::Durability;
+    use blaze_query::db::Durability;
     let mut db = fixture::db(
         r#"
 //- /main.rs

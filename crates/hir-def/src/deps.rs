@@ -112,7 +112,7 @@ impl std::fmt::Debug for Image {
 }
 
 /// The images of the crates a database reads from them, set by [`serve`].
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct DepImages {
     #[returns(ref)]
     pub images: Arc<FxHashMap<Crate, Image>>,
@@ -120,7 +120,7 @@ pub struct DepImages {
 
 /// The image `krate` is read from, if it is: what every reader of one crate's image goes
 /// through, so a [`serve`] that leaves the crate's image as it was re-runs none of its queries.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn image_of(db: &Db, krate: Crate) -> Option<Image> {
     // clone: two buffer handles and a few words, once per crate per serve that changes the set
     DepImages::try_get(db)?.images(db).get(&krate).cloned()

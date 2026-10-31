@@ -1,0 +1,24 @@
+{
+ "crate": "crates/blaze-lints",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/blaze-lints/src/blaze/parallel/effects.rs",
+   "edits": [
+    {
+     "old": "//! summary, bottom-up, as salsa queries.\n",
+     "new": "//! summary, bottom-up, as tracked queries.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/blaze-lints/src/query/tests.rs",
+   "edits": [
+    {
+     "old": "/// How many times `query` is among the salsa debug names in `executed`.\n",
+     "new": "/// How many times `query` is among the ingredient names in `executed`.\n"
+    }
+   ]
+  }
+ ]
+}

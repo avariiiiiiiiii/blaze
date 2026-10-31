@@ -35,7 +35,7 @@ use crate::{
 
 /// The trait impls of the blocks in the bodies `module` holds, as [`TraitImpls::for_module`]
 /// adds them after the module's own.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(in crate::method_resolution) fn trait_bodies<'db>(
     db: &'db Db,
     module: ModuleId,
@@ -50,7 +50,7 @@ pub(in crate::method_resolution) fn trait_bodies<'db>(
 
 /// The inherent impls of the blocks in the bodies `module` holds, as
 /// [`InherentImpls::for_module`] adds them after the module's own.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(in crate::method_resolution) fn inherent_bodies<'db>(
     db: &'db Db,
     module: ModuleId,
@@ -76,7 +76,7 @@ pub(in crate::method_resolution) struct BodyPart {
 
 /// [`BodyPart`] of `module`, a module of its crate's `DefMap`: equal unless a trait or head
 /// of its bodies' impls comes or goes, or its bodies gain or lose their impl holders.
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 pub(in crate::method_resolution) fn body_part(db: &Db, module: ModuleId) -> BodyPart {
     blaze_mem::frame::current(|frame| {
         let scope = module.def_map(db).module(db, module).scope(db);
@@ -266,7 +266,7 @@ pub(in crate::method_resolution) fn inherent_impls_of_crate<'db>(
 /// The hash of `krate`'s body-block impls of `trait_` (for [`super::impl_set_hash`]): the
 /// tables of the body modules its slice lists, in module order, with each impl's identity and
 /// head.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(in crate::method_resolution) fn body_impl_set_hash(
     db: &Db,
     krate: Crate,
@@ -296,7 +296,7 @@ pub(in crate::method_resolution) fn body_impl_set_hash(
 
 /// The hash of the impls of `trait_` for one self type in `krate`, derives and blanket impls
 /// left out: what a result that read one row keys on.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn impl_row_hash<'db>(
     db: &'db Db,
     krate: Crate,
@@ -311,7 +311,7 @@ pub fn impl_row_hash<'db>(
 }
 
 /// The hash of the blanket impls of `trait_` in `krate`.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn blanket_hash(db: &Db, krate: Crate, trait_: TraitId) -> ContentId {
     let mut hasher = Hasher::new(IMPL_SET_DOMAIN);
     hasher.part(b"blanket");

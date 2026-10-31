@@ -42,7 +42,6 @@ cfg.workspace = true
 intern.workspace = true
 object = { workspace = true, features = ["read", "write", "std", "archive", "elf", "macho", "coff", "pe", "wasm"] }
 rustc-hash.workspace = true
-salsa.workspace = true
 blaze-sha256.workspace = true
 toml.workspace = true
 

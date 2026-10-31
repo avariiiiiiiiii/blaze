@@ -1,0 +1,33 @@
+{
+ "crate": "crates/hir-lint-levels",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/hir-lint-levels/Cargo.toml",
+   "edits": [
+    {
+     "old": "description = \"The level of each lint where it is, rustc's rule, as salsa queries.\"\n",
+     "new": "description = \"The level of each lint where it is, rustc's rule, as queries.\"\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-lint-levels/src/lib.rs",
+   "edits": [
+    {
+     "old": "//! - [`query`]: the level at an item or an expression of its store, as salsa queries: rustc's\n",
+     "new": "//! - [`query`]: the level at an item or an expression of its store, as queries: rustc's\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-lint-levels/src/query.rs",
+   "edits": [
+    {
+     "old": "/// The `()` is there because salsa needs it: a tracked function of one argument takes only a\n/// salsa struct or a `salsa::Supertype`, and `ExpressionStoreOwnerId` can be neither (its\n/// variants overlap: `Body(FunctionId)` and `Signature(FunctionId)` are one id). With two\n/// arguments salsa interns the pair (as hir-ty's `closure_exprs`).\n",
+     "new": "/// The `()` is there because the query engine needs it: a tracked function of one argument is\n/// keyed by that argument, an interned or input struct or a `blaze_query::Supertype` enum, and\n/// `ExpressionStoreOwnerId` can be neither (its variants overlap: `Body(FunctionId)` and\n/// `Signature(FunctionId)` are one id). With two arguments the engine interns the pair into the\n/// function's hidden key (as hir-ty's `closure_exprs`).\n"
+    }
+   ]
+  }
+ ]
+}

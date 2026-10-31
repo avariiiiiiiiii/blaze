@@ -28,7 +28,7 @@ use crate::{
 
 /// The lints a query runs, which may be above `allow` where it looks, and the configuration
 /// they read.
-#[salsa::interned(debug, unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query::interned(debug, unsafe(no_lifetime))]
 pub(crate) struct LintSet {
     #[returns(copy)]
     pub(crate) on: lints::On,
@@ -89,14 +89,14 @@ pub(crate) struct Expect {
 
 /// The lints of `set` over the body of `def`, from the tree of its anchor, or of the macro
 /// expansion that writes it. Typed lints infer the body the first time they ask.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn body_lints(db: &Db, def: DefWithBodyId, set: LintSet) -> BodyLints {
     check::lint_body(db, def, set.on(db), set.conf(db))
 }
 
 /// The lints of `set` over what of `file` is in no body, as `krate` reads it: its items and
 /// what attribute macros and macro calls make of them. A body is never walked into.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn item_lints(
     db: &Db,
     file: EditionedFileId,
@@ -124,7 +124,7 @@ pub(crate) struct FileNames {
 }
 
 /// The lint names `file` writes: one scan of its text, again only when the text changes.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn lint_names(db: &Db, file: EditionedFileId) -> FileNames {
     check::names_of(db, file)
 }
@@ -158,14 +158,14 @@ pub(crate) struct Plan {
 
 /// The [`Plan`] of `krate`: from its def map, the bodies' blocks and their anchors, so a run
 /// with nothing changed is one hit here, not several per body.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn lint_plan(db: &Db, krate: base_db::Crate) -> Plan {
     check::plan_of(db, krate)
 }
 
 /// What `krate` resolves each path of [`famous::KNOWN`] to, by index: once per crate, so a
 /// lint's lookup is a hash of its path and one load, not a walk of `std`'s scopes.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn famous_defs(db: &Db, krate: base_db::Crate) -> Box<[Option<hir::ModuleDef>]> {
     let famous = Famous::new(db, hir::Crate::from(krate));
     // alloc: the query's value, once per crate
@@ -224,7 +224,7 @@ fn is_of(db: &Db, def: ModuleDefId, krate: base_db::Crate) -> bool {
 /// What of `krate` another crate can name: resolve's pass of rustc's effective visibilities at
 /// the `Reexported` level, from the crate's root over each name public in a scope another crate
 /// can name. It reads the crate's def map and no body, so an edit inside a body keeps it.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn exported(db: &Db, krate: base_db::Crate) -> Exported {
     let mut exported = Exported::default();
     let root = crate_def_map(db, krate).root_module_id();

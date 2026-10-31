@@ -8,7 +8,7 @@ use hir_def::{
     nameres::crate_def_map,
 };
 use hir_ty::next_solver::goal_store::{GoalFacts, solver_version};
-use salsa::{Database as _, Setter as _};
+use blaze_query::db::{Database as _, Setter as _};
 
 use super::item::{Part, item_part, variant_part};
 
@@ -17,7 +17,7 @@ const LANG_ITEMS_DOMAIN: &str = "blaze v2 item identity lang items 1";
 
 /// The build of the front end that computes identities: the toolchain and blaze's own code.
 /// The driver tells it ([`set_build`]); with none told, every identity is `Err`.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct FrontEnd {
     #[returns(copy)]
     pub build: ContentId,
@@ -30,13 +30,13 @@ pub fn set_build(db: &mut Db, build: ContentId) {
     match FrontEnd::try_get(db) {
         Some(front_end) if front_end.build(db) == build => {}
         Some(front_end) => {
-            front_end.set_build(db).with_durability(salsa::Durability::HIGH).to(build);
+            front_end.set_build(db).with_durability(blaze_query::db::Durability::HIGH).to(build);
         }
         None => {
-            _ = FrontEnd::builder(build).durability(salsa::Durability::HIGH).new(db);
+            _ = FrontEnd::builder(build).durability(blaze_query::db::Durability::HIGH).new(db);
             // Reading a singleton that does not exist yet is not tracked: what read it before
             // reported an untracked read ([`build`]), which a new revision makes stale.
-            db.synthetic_write(salsa::Durability::LOW);
+            db.storage_mut().synthetic_write(blaze_query::db::Durability::LOW);
         }
     }
 }
@@ -46,7 +46,7 @@ pub(crate) fn build(db: &Db) -> Option<ContentId> {
     match FrontEnd::try_get(db) {
         Some(front_end) => Some(front_end.build(db)),
         None => {
-            db.report_untracked_read();
+            blaze_query::db::report_untracked_read(db);
             None
         }
     }
@@ -70,7 +70,7 @@ pub(crate) fn build(db: &Db) -> Option<ContentId> {
 ///
 /// MIR building reads no option of its own: overflow checks, debug assertions and the panic
 /// strategy reach the front end as cfg, in the crate's key.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub fn crate_inputs(db: &Db, krate: Crate) -> ContentId {
     let mut h = Hasher::new(CRATE_INPUTS_DOMAIN);
     h.id(&blaze_items::goals::Goals.crate_key(db, Some(krate)));
@@ -111,7 +111,7 @@ pub fn crate_inputs(db: &Db, krate: Crate) -> ContentId {
 
 /// Each lang item of `krate` by key and signature (section 3.1): what operators, `?`, `for`,
 /// closures and `Box` are checked against. [`crate_inputs`] names them by key only.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub(crate) fn lang_item_signatures(db: &Db, krate: Crate) -> Result<ContentId, &'static str> {
     let items = lang_items(db, krate);
     let mut h = Hasher::new(LANG_ITEMS_DOMAIN);

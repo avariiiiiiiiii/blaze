@@ -6,7 +6,7 @@
 //! body's result ([`served_inference`]) and `hir_ty_borrowck::gate::checked` takes a served
 //! verdict ([`served_passed`]). MIR is not kept: a consumer lowers it from the served result.
 //!
-//! Every id the record writes goes through a table ([`ids`]), so the bytes name no salsa id.
+//! Every id the record writes goes through a table ([`ids`]), so the bytes name no database's own id.
 //! Inference reads no lint level, and the verdict is whether the borrow check found an error,
 //! which lint levels do not change: the part's [`key`] is the image's and the borrow checker's
 //! mode.
@@ -78,7 +78,7 @@ pub fn open(bytes: &[u8]) -> Result<(), String> {
 /// one that does not open here is a panic naming its crate. The same parts as now (the same
 /// buffers) change nothing.
 pub fn set_served(db: &mut Db, parts: FxHashMap<Crate, ImageBuf>) {
-    use salsa::{Durability, Setter};
+    use blaze_query::db::{Durability, Setter};
     for (&krate, buf) in &parts {
         if let Err(why) = part::open(buf.bytes()) {
             panic!(
@@ -130,7 +130,7 @@ pub(crate) fn served_inference(db: &Db, def: DefWithBodyId) -> Option<InferenceR
 }
 
 /// The parts of the crates whose bodies are served, set by [`set_served`].
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub(crate) struct ServedBodies {
     #[returns(ref)]
     parts: Served,
@@ -180,13 +180,13 @@ impl std::fmt::Debug for PartBuf {
     }
 }
 
-#[salsa::tracked(returns(ref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), mem_tag = Infer)]
 fn served_part(db: &Db, krate: Crate) -> Option<PartBuf> {
     ServedBodies::try_get(db)?.parts(db).0.get(&krate).cloned().map(PartBuf)
 }
 
 /// The crate's items, made in this database once per crate: what each body's ids name.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 fn served_items(db: &Db, krate: Crate) -> Box<[(IdKind, u64)]> {
     let part = view(db, krate).expect("the items of a crate with a part");
     part.items(db, krate).unwrap_or_else(|why| corrupt(db, krate, None, &why))

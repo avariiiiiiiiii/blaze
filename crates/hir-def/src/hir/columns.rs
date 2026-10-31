@@ -79,7 +79,7 @@
 use std::ops::Deref;
 
 use la_arena::{Idx, RawIdx};
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 
 use crate::{
     BlockId,
@@ -510,19 +510,15 @@ pub(crate) fn take_exact<T>(column: &mut Vec<T>) -> Box<[T]> {
 }
 
 fn block_words(id: Option<BlockId>) -> (u32, u32) {
-    id.map_or((0, 0), |id| {
-        let bits = id.as_id().as_bits();
-        (bits as u32, (bits >> 32) as u32)
-    })
+    id.map_or((0, 0), |id| (id.as_id().as_u32(), 0))
 }
 
 fn block(low: u32, high: u32) -> Checked<Option<BlockId>> {
     match (low, high) {
         (0, 0) => Ok(None),
         (0, _) => Err("a block id of index 0"),
-        _ => Ok(Some(BlockId::from_id(salsa::Id::from_bits(
-            u64::from(low) | (u64::from(high) << 32),
-        )))),
+        (_, 0) => Ok(Some(BlockId::from_id(blaze_query::db::Id::from_u32(low)))),
+        _ => Err("a block id past 32 bits"),
     }
 }
 
@@ -1802,7 +1798,7 @@ impl HirColumns<Frozen> {
     /// path and slot word (an `asm!` `sym` operand's too) naming a row of `paths`, the store's,
     /// whose own rows [`crate::hir::type_ref::TypeColumns::check`] checks first. The encoding
     /// calls it after reading a buffer and maps `Err(what)` to `FormatError::Invalid`.
-    /// `BlockId`s are salsa ids the encoding layer already refuses at 0; they are not checked here.
+    /// `BlockId`s are ids the encoding layer already refuses at 0; they are not checked here.
     pub(crate) fn check(
         &self,
         bindings: usize,
@@ -1918,14 +1914,14 @@ mod tests {
         ModPath::from_segments(PathKind::Plain, [name(text)])
     }
 
-    fn macro_def(bits: u64) -> MacroDefId {
+    fn macro_def(bits: u32) -> MacroDefId {
         use hir_expand::{AstId, HirFileId, MacroCallId, MacroCallStyles, MacroDefKind};
         use span::{Edition, ErasedFileAstId, FileAstId};
 
-        let file = HirFileId::MacroFile(MacroCallId::from_id(salsa::Id::from_bits(bits)));
-        let ast_id = FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(bits as u32));
+        let file = HirFileId::MacroFile(MacroCallId::from_id(blaze_query::db::Id::from_u32(bits)));
+        let ast_id = FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(bits));
         MacroDefId {
-            krate: base_db::Crate::from_id(salsa::Id::from_bits(bits)),
+            krate: base_db::Crate::from_id(blaze_query::db::Id::from_u32(bits)),
             edition: Edition::Edition2021,
             kind: MacroDefKind::Declarative(AstId::new(file, ast_id), MacroCallStyles::FN_LIKE),
             local_inner: false,
@@ -2037,8 +2033,8 @@ mod tests {
         }
     }
 
-    fn block_id(bits: u64) -> BlockId {
-        BlockId::from_id(salsa::Id::from_bits(bits))
+    fn block_id(bits: u32) -> BlockId {
+        BlockId::from_id(blaze_query::db::Id::from_u32(bits))
     }
 
     /// Every variant of [`Expr`], with every optional field both set and not, every packed enum
@@ -2079,7 +2075,7 @@ mod tests {
             Expr::If { condition: E0, then_branch: E0, else_branch: None },
             Expr::Let { pat: P0, expr: E0 },
             Expr::Block {
-                id: Some(block_id(3 | (7 << 32))),
+                id: Some(block_id(3 + (7 << 20))),
                 statements: v.statements.statements_since(0),
                 tail: Some(E0),
                 label: some_label,

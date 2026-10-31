@@ -1,0 +1,682 @@
+{
+ "crate": "crates/hir-ty",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/hir-ty/benches/impls.rs",
+   "edits": [
+    {
+     "old": "    db.synthetic_write(Durability::LOW);\n",
+     "new": "    db.storage_mut().synthetic_write(Durability::LOW);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/body_store.rs",
+   "edits": [
+    {
+     "old": "        let _ = reads.for_each_read(db, |read, kind, name| {\n",
+     "new": "        let storage = blaze_query::db::Database::storage(db);\n        let _ = reads.for_each_read(storage, |blaze_query::db::Read { key: read, kind }| {\n"
+    },
+    {
+     "old": "            }\n            match self.facts.classify(db, def, step, read, kind, name) {\n",
+     "new": "            }\n            let name = storage.ingredient_name(read.ingredient_index());\n            match self.facts.classify(db, def, step, read, kind, name) {\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/body_store/infer.rs",
+   "edits": [
+    {
+     "old": "    let id = blaze_query::db::Id::from_u32(bits);\n",
+     "new": "    let id = blaze_query::db::Id::from_u32(u32::try_from(bits).ok().filter(|&bits| bits != 0)?);\n"
+    },
+    {
+     "old": "    Some(id.as_bits())\n",
+     "new": "    Some(u64::from(id.as_u32()))\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/check_cache.rs",
+   "edits": [
+    {
+     "old": "//! Every id the record writes goes through a table ([`ids`]), so the bytes name no salsa id.\n",
+     "new": "//! Every id the record writes goes through a table ([`ids`]), so the bytes name no database's own id.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/check_cache/ids.rs",
+   "edits": [
+    {
+     "old": "//! through [`id_of`]; outside one, both are what they were: an id's salsa bits. [`write`] then\n",
+     "new": "//! through [`id_of`]; outside one, both are what they were: an id's bits. [`write`] then\n"
+    },
+    {
+     "old": "/// Which salsa type an entry of a [`Table`] is: an entry is read back only as the kind it was\n",
+     "new": "/// Which id type an entry of a [`Table`] is: an entry is read back only as the kind it was\n"
+    },
+    {
+     "old": "/// A salsa id type the inference record and its type tables write, by the kind its table\n",
+     "new": "/// An id type the inference record and its type tables write, by the kind its table\n"
+    },
+    {
+     "old": "    /// The index of the id of `kind` whose bits are `bits`, added when it is new.\n    fn index(&mut self, kind: IdKind, bits: u64) -> u32 {\n",
+     "new": "    /// The index of the id `id` of `kind`, added when it is new.\n    fn index(&mut self, kind: IdKind, id: blaze_query::db::Id) -> u32 {\n        let bits = u64::from(id.as_u32());\n"
+    },
+    {
+     "old": "/// The bits written for `id`: its index in the scope's table plus one, or its salsa bits\n",
+     "new": "/// The bits written for `id`: its index in the scope's table plus one, or its own bits\n"
+    },
+    {
+     "old": "    let bits = id.as_id().as_u32();\n",
+     "new": "    let id = id.as_id();\n"
+    },
+    {
+     "old": "        None => bits,\n",
+     "new": "        None => u64::from(id.as_u32()),\n"
+    },
+    {
+     "old": "            u64::from(table.index(T::KIND, bits)) + 1\n",
+     "new": "            u64::from(table.index(T::KIND, id)) + 1\n"
+    },
+    {
+     "old": "        None => Some(T::from_id(blaze_query::db::Id::from_u32(bits))),\n",
+     "new": "        None => id_at(bits).map(T::from_id),\n"
+    },
+    {
+     "old": "            table.get(T::KIND, index).map(|bits| T::from_id(blaze_query::db::Id::from_u32(bits)))\n",
+     "new": "            table.get(T::KIND, index).and_then(id_at).map(T::from_id)\n"
+    },
+    {
+     "old": "            table.get(T::KIND, index).and_then(id_at).map(T::from_id)\n        }\n    })\n}\n\n/// The crate's items every body of its part names: frontend-deps' portable table, and the kind\n",
+     "new": "            table.get(T::KIND, index).and_then(id_at).map(T::from_id)\n        }\n    })\n}\n\n/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`.\nfn id_at(bits: u64) -> Option<blaze_query::db::Id> {\n    u32::try_from(bits).ok().filter(|&bits| bits != 0).map(blaze_query::db::Id::from_u32)\n}\n\n/// The id a [`Table`] entry holds: [`Table::index`] adds only an id's bits.\nfn entry_id(bits: u64) -> blaze_query::db::Id {\n    id_at(bits).expect(\"a table entry is an id's bits\")\n}\n\n/// The crate's items every body of its part names: frontend-deps' portable table, and the kind\n"
+    },
+    {
+     "old": "                    *BuiltinDeriveImplId::from_id(blaze_query::db::Id::from_u32(bits)).loc(db);\n",
+     "new": "                    *BuiltinDeriveImplId::from_id(entry_id(bits)).loc(db);\n"
+    },
+    {
+     "old": "                match InternedOpaqueTyId::from_id(blaze_query::db::Id::from_u32(bits)).loc(db) {\n",
+     "new": "                match InternedOpaqueTyId::from_id(entry_id(bits)).loc(db) {\n"
+    },
+    {
+     "old": "                        def: table.index(IdKind::Function, def.as_id().as_u32()),\n",
+     "new": "                        def: table.index(IdKind::Function, def.as_id()),\n"
+    },
+    {
+     "old": "                        def: table.index(IdKind::TypeAlias, def.as_id().as_u32()),\n",
+     "new": "                        def: table.index(IdKind::TypeAlias, def.as_id()),\n"
+    },
+    {
+     "old": "                let id = blaze_query::db::Id::from_u32(bits);\n",
+     "new": "                let id = entry_id(bits);\n"
+    },
+    {
+     "old": "                let loc = AnonConstId::from_id(blaze_query::db::Id::from_u32(bits)).loc(db);\n",
+     "new": "                let loc = AnonConstId::from_id(entry_id(bits)).loc(db);\n"
+    },
+    {
+     "old": "    let id = blaze_query::db::Id::from_u32(bits);\n",
+     "new": "    let id = entry_id(bits);\n"
+    },
+    {
+     "old": "        id.as_id().as_u32()\n",
+     "new": "        u64::from(id.as_id().as_u32())\n"
+    },
+    {
+     "old": "        AdtId::StructId(it) => table.index(IdKind::Struct, it.as_id().as_u32()),\n        AdtId::UnionId(it) => table.index(IdKind::Union, it.as_id().as_u32()),\n        AdtId::EnumId(it) => table.index(IdKind::Enum, it.as_id().as_u32()),\n",
+     "new": "        AdtId::StructId(it) => table.index(IdKind::Struct, it.as_id()),\n        AdtId::UnionId(it) => table.index(IdKind::Union, it.as_id()),\n        AdtId::EnumId(it) => table.index(IdKind::Enum, it.as_id()),\n"
+    },
+    {
+     "old": "        DefWithBodyId::FunctionId(it) => (0, table.index(IdKind::Function, it.as_id().as_u32())),\n        DefWithBodyId::StaticId(it) => (1, table.index(IdKind::Static, it.as_id().as_u32())),\n        DefWithBodyId::ConstId(it) => (2, table.index(IdKind::Const, it.as_id().as_u32())),\n",
+     "new": "        DefWithBodyId::FunctionId(it) => (0, table.index(IdKind::Function, it.as_id())),\n        DefWithBodyId::StaticId(it) => (1, table.index(IdKind::Static, it.as_id())),\n        DefWithBodyId::ConstId(it) => (2, table.index(IdKind::Const, it.as_id())),\n"
+    },
+    {
+     "old": "            (3, table.index(IdKind::EnumVariant, it.as_id().as_u32()))\n",
+     "new": "            (3, table.index(IdKind::EnumVariant, it.as_id()))\n"
+    },
+    {
+     "old": "        InferBodyId::AnonConstId(it) => (4, table.index(IdKind::AnonConst, it.as_id().as_u32())),\n",
+     "new": "        InferBodyId::AnonConstId(it) => (4, table.index(IdKind::AnonConst, it.as_id())),\n"
+    },
+    {
+     "old": "    let mut item = |kind, id: blaze_query::db::Id| table.index(kind, id.as_bits());\n",
+     "new": "    let mut item = |kind, id: blaze_query::db::Id| table.index(kind, id);\n"
+    },
+    {
+     "old": "            table.entries[at].1 = BuiltinDeriveImplId::new(db, loc).as_id().as_u32();\n",
+     "new": "            table.entries[at].1 = u64::from(BuiltinDeriveImplId::new(db, loc).as_id().as_u32());\n"
+    },
+    {
+     "old": "        table.entries[at].1 = bits;\n",
+     "new": "        table.entries[at].1 = u64::from(bits);\n"
+    },
+    {
+     "old": "            table.entries[at].1 = match id_kind {\n",
+     "new": "            table.entries[at].1 = u64::from(match id_kind {\n"
+    },
+    {
+     "old": "            .as_bits();\n",
+     "new": "            .as_u32());\n"
+    },
+    {
+     "old": "        .map(|bits| T::from_id(blaze_query::db::Id::from_u32(bits)))\n",
+     "new": "        .and_then(id_at)\n        .map(T::from_id)\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/check_cache/tests.rs",
+   "edits": [
+    {
+     "old": "//! A part written in one database and read in another, whose salsa ids differ; the bytes of a\n",
+     "new": "//! A part written in one database and read in another, whose ids differ; the bytes of a\n"
+    },
+    {
+     "old": "    let sum_bits = sum.as_id().as_u32().to_le_bytes();\n",
+     "new": "    let sum_bits = u64::from(sum.as_id().as_u32()).to_le_bytes();\n"
+    },
+    {
+     "old": "    assert!(names(&outside), \"a method's salsa id, as today's records write it\");\n",
+     "new": "    assert!(names(&outside), \"a method's id, as today's records write it\");\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/consteval.rs",
+   "edits": [
+    {
+     "old": "pub(crate) fn const_eval_query<'db>(\n",
+     "new": "pub fn const_eval_query<'db>(\n"
+    },
+    {
+     "old": "    /// The memory of a static a constant points into: where it was and the static, as its salsa\n    /// id (the database that wrote it is the one reading it).\n",
+     "new": "    /// The memory of a static a constant points into: where it was and the static, as its id\n    /// (the database that wrote it is the one reading it).\n"
+    },
+    {
+     "old": "            .ok_or_else(|| invalid(\"a static of salsa id index 0 or not in the table\"))?;\n",
+     "new": "            .ok_or_else(|| invalid(\"a static of id index 0 or not in the table\"))?;\n"
+    },
+    {
+     "old": "            id: blaze_query::db::FromId::from_id(blaze_query::db::Id::from_bits(7 | (2 << 32))),\n",
+     "new": "            id: blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(7 + (2 << 20))),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/consteval/deps.rs",
+   "edits": [
+    {
+     "old": "//! salsa id ([`codec`]). [`cached`] gives `const_eval_query` the kept value before it reads\n",
+     "new": "//! database id ([`codec`]). [`cached`] gives `const_eval_query` the kept value before it reads\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/consteval/deps/codec.rs",
+   "edits": [
+    {
+     "old": "//! The bytes of a kept constant value: its type with no salsa id, its memory and its memory\n",
+     "new": "//! The bytes of a kept constant value: its type with no database id, its memory and its memory\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/db.rs",
+   "edits": [
+    {
+     "old": "// The unit makes the arguments something salsa interns: the owner alone is no salsa struct.\n",
+     "new": "// The unit makes this a function of several arguments, whose key `closure_exprs::arguments`\n// gives back (blaze-item-hash reads it).\n"
+    },
+    {
+     "old": "fn closure_exprs(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {\n",
+     "new": "pub fn closure_exprs(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {\n"
+    },
+    {
+     "old": "        /// What follows each salsa attribute of `text`: a function, a method of a tracked\n",
+     "new": "        /// What follows each query attribute of `text`: a function, a method of a tracked\n"
+    },
+    {
+     "old": "            let attribute = concat!(\"#[\", \"salsa::\");\n",
+     "new": "            let attribute = concat!(\"#[\", \"blaze_query::\");\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/evict.rs",
+   "edits": [
+    {
+     "old": "//! had been kept (salsa's `evict_values` and `evict_values_of`, which every query with a `Hash`\n//! output has; docs/v2/plan/lanes/db.md section 7).\n",
+     "new": "//! had been kept (`evict_values` and `evict_values_of`, which every query with `lru = N` has;\n//! docs/v2/plan/lanes/db/query-unify.md, \"LRU and eviction\").\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/infer/columns.rs",
+   "edits": [
+    {
+     "old": "        let id = |index: u32| blaze_query::db::Id::from_bits(u64::from(index) | (2 << 32));\n",
+     "new": "        let id = |index: u32| blaze_query::db::Id::from_u32(index + (2 << 20));\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/infer/expr.rs",
+   "edits": [
+    {
+     "old": "use blaze_query::db::Database as _;\n",
+     "new": ""
+    },
+    {
+     "old": "            self.db.unwind_if_revision_cancelled();\n",
+     "new": "            blaze_query::db::unwind_if_cancelled(self.db);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/infer/persist.rs",
+   "edits": [
+    {
+     "old": "//! definition its salsa id (the database that wrote a buffer is the one reading it, as\n",
+     "new": "//! definition its id (the database that wrote a buffer is the one reading it, as\n"
+    },
+    {
+     "old": "    /// The columns of `u64` words: salsa ids, bitset words, and which keys a sparse column has\n",
+     "new": "    /// The columns of `u64` words: ids, bitset words, and which keys a sparse column has\n"
+    },
+    {
+     "old": "/// An id's word: its salsa bits, or inside `check_cache::relocating` its place in the table.\n",
+     "new": "/// An id's word: its bits, or inside `check_cache::relocating` its place in the table.\n"
+    },
+    {
+     "old": "    /// The trait as two words of its salsa id and its arguments.\n",
+     "new": "    /// The trait as two words of its id and its arguments.\n"
+    },
+    {
+     "old": "    fn id<T: crate::check_cache::Relocate>(&self, bits: u64) -> Result<T, FormatError> {\n        id_of(bits).ok_or(self.invalid(\"a salsa id of index 0 or not in the table\"))\n    }\n",
+     "new": "    fn id<T: crate::check_cache::Relocate>(&self, bits: u64) -> Result<T, FormatError> {\n        id_of(bits).ok_or(self.invalid(\"an id of index 0 or not in the table\"))\n    }\n"
+    },
+    {
+     "old": "        id_of(bits).ok_or(self.invalid(\"a salsa id of index 0 or not in the table\"))\n",
+     "new": "        id_of(bits).ok_or(self.invalid(\"an id of index 0 or not in the table\"))\n"
+    },
+    {
+     "old": "        blaze_query::db::Id::from_bits(u64::from(index) | (3 << 32))\n",
+     "new": "        blaze_query::db::Id::from_u32(index + (3 << 20))\n"
+    },
+    {
+     "old": "        assert_eq!(salsa_hash(&back), salsa_hash(&result));\n",
+     "new": "        assert_eq!(content_hash(&back), content_hash(&result));\n"
+    },
+    {
+     "old": "    fn salsa_hash(result: &InferenceResult<'_>) -> u128 {\n        use std::hash::Hash;\n        let mut hasher = salsa::StableHasher::new();\n        result.hash(&mut hasher);\n        let (low, high) = hasher.finish128();\n        u128::from(high) << 64 | u128::from(low)\n",
+     "new": "    fn content_hash(result: &InferenceResult<'_>) -> blaze_ids::ContentId {\n        blaze_ids::Hasher::new(\"hir-ty test\").std(result).finish()\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/layout.rs",
+   "edits": [
+    {
+     "old": "/// `Layout<'tcx>`, so equal layouts are kept once, a read is a pointer copy, equality is a\n/// pointer compare and the fingerprint salsa backdates by is computed once. A newtype because\n/// [`Layout`] is `rustc_abi`'s.\n",
+     "new": "/// `Layout<'tcx>`, so equal layouts are kept once, a read is a pointer copy, and equality (what\n/// the query engine backdates by) is a pointer compare. A newtype because [`Layout`] is\n/// `rustc_abi`'s.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/lower/persist.rs",
+   "edits": [
+    {
+     "old": "//! The cold form is columns, as the batch is: the keys as their salsa ids (the database that\n",
+     "new": "//! The cold form is columns, as the batch is: the keys as their ids (the database that\n"
+    },
+    {
+     "old": "    /// constants start, the diagnostics as words one after another, the constants as salsa ids.\n",
+     "new": "    /// constants start, the diagnostics as words one after another, the constants as ids.\n"
+    },
+    {
+     "old": "fn salsa_id(bits: u64) -> Option<blaze_query::db::Id> {\n    (bits as u32 != 0).then(|| blaze_query::db::Id::from_u32(bits))\n",
+     "new": "/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`.\nfn query_id(bits: u64) -> Option<blaze_query::db::Id> {\n    u32::try_from(bits).ok().filter(|&bits| bits != 0).map(blaze_query::db::Id::from_u32)\n"
+    },
+    {
+     "old": "    id.as_id().as_u32()\n",
+     "new": "    u64::from(id.as_id().as_u32())\n"
+    },
+    {
+     "old": "    let id = salsa_id(bits)?;\n",
+     "new": "    let id = query_id(bits)?;\n"
+    },
+    {
+     "old": "                salsa_id(bits).map(ImplId::from_id).ok_or(self.invalid(\"an impl of id 0\"))\n",
+     "new": "                query_id(bits).map(ImplId::from_id).ok_or(self.invalid(\"an impl of id 0\"))\n"
+    },
+    {
+     "old": "                let trait_id = salsa_id(trait_id)\n",
+     "new": "                let trait_id = query_id(trait_id)\n"
+    },
+    {
+     "old": "                salsa_id(bits).map(AnonConstId::from_id).ok_or(self.invalid(\"a constant of id 0\"))\n",
+     "new": "                query_id(bits).map(AnonConstId::from_id).ok_or(self.invalid(\"a constant of id 0\"))\n"
+    },
+    {
+     "old": "        crate::check_cache::id_of(bits).ok_or(self.invalid(\"a salsa id of index 0 or not in the table\"))\n",
+     "new": "        crate::check_cache::id_of(bits).ok_or(self.invalid(\"an id of index 0 or not in the table\"))\n"
+    },
+    {
+     "old": "        blaze_query::db::Id::from_bits(u64::from(index) | (3 << 32))\n",
+     "new": "        blaze_query::db::Id::from_u32(index + (3 << 20))\n"
+    },
+    {
+     "old": "                anon_consts: vec![id(12).as_bits()],\n",
+     "new": "                anon_consts: vec![id_bits(id(12))],\n"
+    },
+    {
+     "old": "        assert_eq!(variant_of(3, id(1).as_bits()), None);\n",
+     "new": "        assert_eq!(variant_of(3, id_bits(id(1))), None);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/method_resolution.rs",
+   "edits": [
+    {
+     "old": "pub(crate) fn in_crate_trait_value_items(\n",
+     "new": "pub fn in_crate_trait_value_items(\n"
+    },
+    {
+     "old": "    // SAFETY: salsa may keep this value past `'db` only if nothing in it borrows from the\n    // database. `SimplifiedType<'db>` is `fast_reject::SimplifiedType<SolverDefId<'db>>`\n",
+     "new": "    // SAFETY: the query database may keep this value past `'db` only if nothing in it borrows\n    // from the database. `SimplifiedType<'db>` is `fast_reject::SimplifiedType<SolverDefId<'db>>`\n"
+    },
+    {
+     "old": "    // only plain data and `SolverDefId<'db>`, which is `SalsaValue`; no `&'db`.\n    #[salsa_value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))] pub SimplifiedType<'db>,\n",
+     "new": "    // only plain data and `SolverDefId<'db>`, which is `blaze_query::db::Value`; no `&'db`.\n    #[value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))] pub SimplifiedType<'db>,\n"
+    },
+    {
+     "old": "pub struct InherentImpls<'db> {\n    // SAFETY: salsa may keep this column past `'db` only if nothing in it borrows from the\n    // database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are\n    // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants\n",
+     "new": "pub struct InherentImpls<'db> {\n    // SAFETY: the query database may keep this column past `'db` only if nothing in it borrows\n    // from the database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are\n    // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants\n"
+    },
+    {
+     "old": "    // from the database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are\n    // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants\n    // (`vendor/rustc_type_ir/src/fast_reject.rs`) hold only plain data and `SolverDefId<'db>`,\n    // which is `SalsaValue`; no `&'db`.\n    #[salsa_value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))]\n    self_tys: SelfTys<'db>,\n    impls: Runs<ImplId>,\n}\n",
+     "new": "    // from the database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are\n    // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants\n    // (`vendor/rustc_type_ir/src/fast_reject.rs`) hold only plain data and `SolverDefId<'db>`,\n    // which is `blaze_query::db::Value`; no `&'db`.\n    #[value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))]\n    self_tys: SelfTys<'db>,\n    impls: Runs<ImplId>,\n}\n"
+    },
+    {
+     "old": "    // SAFETY: salsa may keep this column past `'db` only if nothing in it borrows from the\n    // database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are\n",
+     "new": "    // SAFETY: the query database may keep this column past `'db` only if nothing in it borrows\n    // from the database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are\n"
+    },
+    {
+     "old": "    // which is `SalsaValue`; no `&'db`.\n    #[salsa_value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))]\n",
+     "new": "    // which is `blaze_query::db::Value`; no `&'db`.\n    #[value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))]\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/method_resolution/delta.rs",
+   "edits": [
+    {
+     "old": "//! arrangements, and sets the salsa inputs ([`publish`]) of each `(crate, trait)`,\n",
+     "new": "//! arrangements, and sets the query inputs ([`publish`]) of each `(crate, trait)`,\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/method_resolution/delta/publish.rs",
+   "edits": [
+    {
+     "old": "//! The published slices (design \u00a77, \u00a78): one salsa input per (crate, trait), per (crate, head)\n",
+     "new": "//! The published slices (design \u00a77, \u00a78): one query input per (crate, trait), per (crate, head)\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/method_resolution/delta/tests/cost.rs",
+   "edits": [
+    {
+     "old": "/// Whether `query` is among the salsa debug names in `executed`, which end in `_` for a\n",
+     "new": "/// Whether `query` is among the ingredient names in `executed`, which end in `_` for a\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/method_resolution/pick_cache.rs",
+   "edits": [
+    {
+     "old": "//! replays the reads the probe made (`salsa::replay_reads`), so it is checked again when any of\n",
+     "new": "//! replays the reads the probe made (`blaze_query::db::replay_reads`), so it is checked again when any of\n"
+    },
+    {
+     "old": "    solver_crate: u64,\n    resolver_crate: u64,\n",
+     "new": "    solver_crate: u32,\n    resolver_crate: u32,\n"
+    },
+    {
+     "old": "    module: u64,\n",
+     "new": "    module: u32,\n"
+    },
+    {
+     "old": "        hasher.write_u64(self.solver_crate);\n        hasher.write_u64(self.resolver_crate);\n        hasher.write_u64(self.module);\n        hasher.write_u64(pair(self.self_ty, self.name));\n        hasher.write_u64(pair(self.scope, self.param_env));\n        hasher.write_u64(pair(self.typing_defs, self.bits));\n",
+     "new": "        hasher.write_u64(pair(self.solver_crate, self.resolver_crate));\n        hasher.write_u64(pair(self.module, self.self_ty));\n        hasher.write_u64(pair(self.name, self.scope));\n        hasher.write_u64(pair(self.param_env, self.typing_defs));\n        hasher.write_u32(self.bits);\n"
+    },
+    {
+     "old": "    solver_crate: u64,\n",
+     "new": "    solver_crate: u32,\n"
+    },
+    {
+     "old": "        hasher.write_u64(self.solver_crate);\n",
+     "new": "        hasher.write_u32(self.solver_crate);\n"
+    },
+    {
+     "old": "/// `PhantomData<&'db ()>`) and salsa ids; none is a reference into the database. A table entry\n",
+     "new": "/// `PhantomData<&'db ()>`) and `blaze_query::db::Id`s; none is a reference into the database. A table entry\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/mir.rs",
+   "edits": [
+    {
+     "old": "        let hash = |inlined: &Inlined<'_>| {\n            let mut hasher = salsa::StableHasher::new();\n            std::hash::Hash::hash(inlined, &mut hasher);\n            hasher.finish128()\n        };\n",
+     "new": "        let hash = |inlined: &Inlined<'_>| blaze_ids::Hasher::new(\"hir-ty test\").std(inlined).finish();\n"
+    },
+    {
+     "old": "    fn digest(map: &FxHashMap<u32, Vec<u32>>) -> (u64, u64) {\n        let mut hasher = salsa::StableHasher::new();\n        hash_by_key(map, |key| key, |raw| raw, &mut hasher);\n        hasher.finish128()\n",
+     "new": "    fn digest(map: &FxHashMap<u32, Vec<u32>>) -> blaze_ids::ContentId {\n        let mut hasher = blaze_ids::Hasher::new(\"hir-ty test\");\n        hash_by_key(map, |key| key, |raw| raw, &mut blaze_ids::StdHash(&mut hasher));\n        hasher.finish()\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/mir/persist.rs",
+   "edits": [
+    {
+     "old": "//! Every salsa id (the owner, a static, a variant, a closure, each definition a type names) is\n",
+     "new": "//! Every id (the owner, a static, a variant, a closure, each definition a type names) is\n"
+    },
+    {
+     "old": "//! built the same body write the same bytes. Outside a scope it is the id's salsa bits, read\n",
+     "new": "//! built the same body write the same bytes. Outside a scope it is the id's own bits, read\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/mir/persist/tests.rs",
+   "edits": [
+    {
+     "old": "    assert_ne!(relocated, written(&db, &body), \"the static is by its table index, not its salsa bits\");\n",
+     "new": "    assert_ne!(relocated, written(&db, &body), \"the static is by its table index, not its own bits\");\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/budget_tests.rs",
+   "edits": [
+    {
+     "old": "//! These run outside any salsa query, so a goal's cache is the interner's own\n",
+     "new": "//! These run outside any query, so a goal's cache is the interner's own\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/global_goals.rs",
+   "edits": [
+    {
+     "old": "//! the evaluation had. The salsa reads of the evaluation are kept with it and replayed on a\n",
+     "new": "//! the evaluation had. The query reads of the evaluation are kept with it and replayed on a\n"
+    },
+    {
+     "old": "//! read; an evaluation salsa could not capture (a cycle head, an untracked read) is not kept.\n",
+     "new": "//! read; an evaluation whose reads `blaze_query::db::capture_reads` could not capture (a cycle\n//! head, an untracked read) is not kept.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/goal_store.rs",
+   "edits": [
+    {
+     "old": "        let _ = reads.for_each_read(db, |read, kind, name| {\n",
+     "new": "        let storage = blaze_query::db::Database::storage(db);\n        let _ = reads.for_each_read(storage, |blaze_query::db::Read { key: read, kind }| {\n"
+    },
+    {
+     "old": "            }\n            match self.facts.fact_of(db, read, name) {\n",
+     "new": "            }\n            let name = storage.ingredient_name(read.ingredient_index());\n            match self.facts.fact_of(db, read, name) {\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/goal_store/stable.rs",
+   "edits": [
+    {
+     "old": "//! as its own variant and its item key ([`GoalFacts::def_key`]) where `persist` writes a salsa\n",
+     "new": "//! as its own variant and its item key ([`GoalFacts::def_key`]) where `persist` writes an\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/interner.rs",
+   "edits": [
+    {
+     "old": "// The database is `Send + Sync` (`salsa::Database`), so an interner is, by the auto traits.\n",
+     "new": "// The database is `Send + Sync` (`blaze_query::db::Database`), so an interner is, by the auto traits.\n"
+    },
+    {
+     "old": "        salsa::Database::unwind_if_revision_cancelled(self.db);\n",
+     "new": "        blaze_query::db::unwind_if_cancelled(self.db);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/interner/tls_cache.rs",
+   "edits": [
+    {
+     "old": "//! - [`shared`]: a goal whose reads `salsa::capture_reads` recorded, for every query and\n",
+     "new": "//! - [`shared`]: a goal whose reads `blaze_query::db::capture_reads` recorded, for every query and\n"
+    },
+    {
+     "old": "/// (salsa's `new_revision` takes `&mut Zalsa`). So a lookup reads neither; debug builds check.\n",
+     "new": "/// (a new view takes `&mut Storage`). So a lookup reads neither; debug builds check.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/persist.rs",
+   "edits": [
+    {
+     "old": "//!   as its words, each child as its place in the table, definitions as salsa ids, an ADT as its\n",
+     "new": "//!   as its words, each child as its place in the table, definitions as ids, an ADT as its\n"
+    },
+    {
+     "old": "    /// A salsa id as [`put_id`] writes it, unless the sink names ids otherwise.\n",
+     "new": "    /// An id as [`put_id`] writes it, unless the sink names ids otherwise.\n"
+    },
+    {
+     "old": "    /// A definition: its variant and salsa id, unless the sink names definitions otherwise.\n",
+     "new": "    /// A definition: its variant and id, unless the sink names definitions otherwise.\n"
+    },
+    {
+     "old": "    /// A salsa id, as [`Sink::id`] wrote it.\n",
+     "new": "    /// An id, as [`Sink::id`] wrote it.\n"
+    },
+    {
+     "old": "/// A salsa id: its index (never 0) and its generation.\n",
+     "new": "/// An id: its bits (never 0) and a generation word, always 0, which the format keeps.\n"
+    },
+    {
+     "old": "    let bits = id.as_bits();\n    sink.word(bits as u32);\n    sink.word((bits >> 32) as u32);\n",
+     "new": "    sink.word(id.as_u32());\n    sink.word(0);\n"
+    },
+    {
+     "old": "        return Err(source.invalid(\"a salsa id of index 0\"));\n",
+     "new": "        return Err(source.invalid(\"an id of index 0\"));\n"
+    },
+    {
+     "old": "    Ok(blaze_query::db::Id::from_bits(u64::from(index) | (u64::from(generation) << 32)))\n",
+     "new": "    if generation != 0 {\n        return Err(source.invalid(\"an id of a generation\"));\n    }\n    Ok(blaze_query::db::Id::from_u32(index))\n"
+    },
+    {
+     "old": "/// A definition as its variant and salsa id: [`Sink::def`]'s default.\n",
+     "new": "/// A definition as its variant and id: [`Sink::def`]'s default.\n"
+    },
+    {
+     "old": "            .ok_or_else(|| self.invalid(\"a salsa id of index 0 or not in the table\"))\n",
+     "new": "            .ok_or_else(|| self.invalid(\"an id of index 0 or not in the table\"))\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/ty.rs",
+   "edits": [
+    {
+     "old": "/// The salsa ids of the closures, coroutines and opaque types `ty` names at any depth: whose\n/// a query keyed by it is (`salsa::Zalsa::ids_of`, read by `crates/hir-firewall`).\n",
+     "new": "/// The ids of the closures, coroutines and opaque types `ty` names at any depth: whose\n/// a query keyed by it is (`blaze_query::db::Storage::ids_of`, read by `crates/hir-firewall`).\n"
+    },
+    {
+     "old": "    fn id<T: blaze_query::db::FromId>(bits: u64) -> T {\n",
+     "new": "    fn id<T: blaze_query::db::FromId>(bits: u32) -> T {\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/next_solver/util.rs",
+   "edits": [
+    {
+     "old": "        reason = \"this happens in a Salsa macro, not sure why only here\"\n",
+     "new": "        reason = \"this happens in the tracked macro's expansion, not sure why only here\"\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/providers.rs",
+   "edits": [
+    {
+     "old": "/// How many of the lowered bodies salsa keeps the value of once a revision is over; 0 keeps\n",
+     "new": "/// How many of the lowered bodies the query engine keeps the value of once a view is over; 0 keeps\n"
+    },
+    {
+     "old": "/// How many of the runtime bodies (and their monomorphized copies) salsa keeps the value of once\n/// a revision is over; 0 keeps every one. A body let go is lowered again when it is next asked\n",
+     "new": "/// How many of the runtime bodies (and their monomorphized copies) the query engine keeps the\n/// value of once a view is over; 0 keeps every one. A body let go is lowered again when it is next asked\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/tests/budget.rs",
+   "edits": [
+    {
+     "old": "    // the steady state.\n    db.synthetic_write(Durability::LOW);\n    infer_all(&db, &bodies);\n",
+     "new": "    // the steady state.\n    db.storage_mut().synthetic_write(Durability::LOW);\n    infer_all(&db, &bodies);\n"
+    },
+    {
+     "old": "    db.synthetic_write(Durability::LOW);\n",
+     "new": "    db.storage_mut().synthetic_write(Durability::LOW);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-ty/src/variance.rs",
+   "edits": [
+    {
+     "old": "//! This does unfortunately run into the issue that we can run into query cycles which salsa\n//! currently does not allow to be resolved via a fixpoint computation. This will likely be resolved\n//! by the next salsa version. If not, we will likely have to adapt and go with the rustc approach\n//! while installing firewall per item queries to prevent invalidation issues.\n",
+     "new": "//! Per item, the queries can form cycles; the query engine resolves them by fixpoint iteration\n//! (`variances_of`'s `cycle_initial` and `cycle_fn`).\n"
+    }
+   ]
+  }
+ ]
+}

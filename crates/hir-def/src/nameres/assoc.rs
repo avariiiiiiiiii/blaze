@@ -37,14 +37,14 @@ pub struct TraitItems {
     pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl TraitItems {
     #[inline]
     pub(crate) fn query(db: &Db, tr: TraitId) -> &TraitItems {
         &Self::query_with_diagnostics(db, tr).0
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     pub fn query_with_diagnostics(
         db: &Db,
         tr: TraitId,
@@ -109,9 +109,9 @@ pub struct ImplItems {
     pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl ImplItems {
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
         let _p = tracing::info_span!("impl_items_with_diagnostics_query").entered();
         let ItemLoc { container: module_id, id: ast_id } = *id.lookup(db);

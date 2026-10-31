@@ -39,7 +39,7 @@ use crate::{
 /// The crate's def map as a fresh maintainer makes it: maintained from an empty state, without
 /// the database's state or published inputs. A query of its own, so the tracked structs it
 /// makes live in one.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn cold_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
     blaze_mem::frame::task(Tag::Nameres, |frame| {
         let (mut def_map, local) = super::cold(db, frame, krate);

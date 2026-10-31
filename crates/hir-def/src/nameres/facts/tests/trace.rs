@@ -1,4 +1,4 @@
-//! What an edit reruns: the resolver's queries a revision executes, read off salsa's
+//! What an edit reruns: the resolver's queries a revision executes, read off the query database's
 //! `WillExecute` events. Every resolver query takes one interned key (`queries.rs`), so an
 //! event's key id is that key and names its module.
 //!
@@ -9,7 +9,7 @@
 
 use base_db::Db;
 use rustc_hash::FxHashSet;
-use salsa::plumbing::FromId;
+use blaze_query::db::FromId;
 use hir_expand::fixture;
 
 use super::{Exempt, compare_db, new_crate_local_def_map};
@@ -61,13 +61,14 @@ const RESOLVER: &[&str] = &[
 ];
 
 /// The queries `f` executed: each ingredient's name and its key's id.
-fn executed(db: &TestDB, f: impl FnOnce()) -> Vec<(String, salsa::Id)> {
+fn executed(db: &TestDB, f: impl FnOnce()) -> Vec<(String, blaze_query::db::Id)> {
     db.log_in_read_order(f)
         .into_iter()
         .filter_map(|event| match event.kind {
-            salsa::EventKind::WillExecute { database_key } => Some((
-                salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())
-                    .to_string(),
+            blaze_query::db::EventKind::WillExecute { database_key } => Some((
+                blaze_query::db::Database::storage(db)
+                    .ingredient_name(database_key.ingredient_index())
+                    .to_owned(),
                 database_key.key_index(),
             )),
             _ => None,
@@ -90,7 +91,7 @@ fn path(db: &Db, module: ModuleId) -> String {
 
 /// The modules whose `query` ran, as paths: its key's module (the anchor of a component for
 /// `scc_state` and `latest`), any round.
-fn ran(db: &TestDB, events: &[(String, salsa::Id)], query: &str) -> FxHashSet<String> {
+fn ran(db: &TestDB, events: &[(String, blaze_query::db::Id)], query: &str) -> FxHashSet<String> {
     events
         .iter()
         .filter(|(name, _)| name == query)
@@ -112,7 +113,7 @@ fn set(paths: &[&str]) -> FxHashSet<String> {
 
 /// A database of [`FIXTURE`] with the new map collected, then `file` set to `text`: the
 /// resolver queries the next collection executes.
-fn edit(file: usize, text: &str) -> (TestDB, Vec<(String, salsa::Id)>) {
+fn edit(file: usize, text: &str) -> (TestDB, Vec<(String, blaze_query::db::Id)>) {
     let fx = fixture::db(FIXTURE);
     let files = fx.files().to_vec();
     let mut db = fx.into_db();
@@ -200,7 +201,7 @@ fn a_negative_fact_holds_before_the_name_appears() {
 #[test]
 fn an_edit_inside_a_body_reruns_no_resolver_query() {
     let (_, events) = edit(A, "pub struct A;\npub fn helper() { let _ = 1; }\n");
-    let resolver: Vec<&(String, salsa::Id)> =
+    let resolver: Vec<&(String, blaze_query::db::Id)> =
         events.iter().filter(|(name, _)| RESOLVER.contains(&name.as_str())).collect();
     assert!(resolver.is_empty(), "resolver queries ran: {resolver:?}");
 }

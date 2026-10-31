@@ -96,7 +96,7 @@ pub fn shared() -> &'static Workers {
 ///
 /// A node whose work panics fails, and once the build is over the panic goes on on the calling
 /// thread, as from a thread of [`std::thread::scope`]: a panic that unwinds on purpose, as
-/// salsa's cancellation does, reaches whoever catches it. Work the frames' cap cancels
+/// the query engine's cancellation does, reaches whoever catches it. Work the frames' cap cancels
 /// ([`blaze_mem::frame::Cancelled`]) runs again on the same thread.
 pub fn drive<W, S>(
     machine: &mut Machine,

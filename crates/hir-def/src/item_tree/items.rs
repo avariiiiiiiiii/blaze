@@ -1,6 +1,6 @@
 //! A source file's [`ItemTree`], made from the file's last tree where the file was edited.
 //!
-//! One query per file ([`super::file_item_tree_query`]) and no query per item. Beside salsa,
+//! One query per file ([`super::file_item_tree_query`]) and no query per item. Beside the query database,
 //! a few files' last trees are kept ([`KEPT`]), with the text they were made of and a key per
 //! top-level item: all that lowering the item reads ([`item_keys`]: a fingerprint of its
 //! syntax but for its bodies, its ast ids and its span anchors) and where its rows are in the

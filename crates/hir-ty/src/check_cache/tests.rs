@@ -1,4 +1,4 @@
-//! A part written in one database and read in another, whose salsa ids differ; the bytes of a
+//! A part written in one database and read in another, whose ids differ; the bytes of a
 //! record outside a scope; the key; damaged parts; what finding a record allocates.
 
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use hir_def::{
 };
 use hir_expand::name::Name;
 use rustc_hash::FxHashMap;
-use salsa::plumbing::AsId;
+use blaze_query::db::AsId;
 use hir_expand::fixture;
 
 use super::{ids::Table, part, *};
@@ -113,7 +113,7 @@ fn a_part_reads_back_in_another_database() {
     let first = db_of(FIXTURE);
     let first_dep = crate_named(&first, "dep");
     let (mut db, dep) = second();
-    let bits = |db: &Db, krate| function(db, krate, "area").as_id().as_bits();
+    let bits = |db: &Db, krate| function(db, krate, "area").as_id().as_u32();
     assert_ne!(bits(&first, first_dep), bits(&db, dep), "the two databases' ids differ");
 
     open(&bytes).unwrap();
@@ -145,9 +145,9 @@ fn outside_a_scope_a_record_is_todays_bytes() {
     assert_eq!(outside, blaze_format::to_bytes(&result.to_record(interner)), "deterministic");
     let read = InferenceRecord::read(&Aligned::copy_from(&outside)).unwrap().to_result(interner);
     assert!(read.unwrap() == *result, "a record outside a scope reads back in its own database");
-    let sum_bits = sum.as_id().as_bits().to_le_bytes();
+    let sum_bits = u64::from(sum.as_id().as_u32()).to_le_bytes();
     let names = |bytes: &[u8]| bytes.windows(8).any(|it| it == sum_bits);
-    assert!(names(&outside), "a method's salsa id, as today's records write it");
+    assert!(names(&outside), "a method's id, as today's records write it");
 
     let mut table = Table::default();
     let inside = ids::relocating(&mut table, || blaze_format::to_bytes(&result.to_record(interner)));

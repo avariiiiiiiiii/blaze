@@ -8,7 +8,7 @@
 //! that is interesting us; for the rest of them, we define another query that extracts
 //! their data. A key part is that every one of those queries will have a wrapper method
 //! that queries (or is given) the `AttrFlags` and checks for the presence of the attribute;
-//! if it is not present, we do not call the query, to prevent Salsa from needing to record
+//! if it is not present, we do not call the query, to keep the query database from needing to record
 //! its value. This way, queries are only called on items that have the attribute, which is
 //! usually only a few.
 //!
@@ -39,7 +39,7 @@ use itertools::Itertools;
 use la_arena::ArenaMap;
 use rustc_abi::ReprOptions;
 use rustc_hash::FxHashSet;
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 use span::AstIdNode;
 use syntax::{
@@ -140,7 +140,7 @@ impl FileAttrFlags {
 }
 
 /// The [`FileAttrFlags`] of `file` for `krate`'s cfg.
-#[salsa::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 fn file_attr_flags(db: &Db, file: EditionedFileId, krate: Crate) -> FileAttrFlags {
     blaze_mem::frame::current(|frame| {
         let (root, ast_id_map) = crate::signatures::outline_with_ids(db, file);
@@ -1028,7 +1028,7 @@ pub fn cli_crate_attrs(db: &Db, krate: Crate) -> impl Iterator<Item = InFile<ast
 }
 
 /// Whether the crate root declares `#![no_std]`, looking through `cfg_attr` gating.
-#[salsa::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn crate_supports_no_std(db: &Db, krate: Crate) -> bool {
     fn contains_no_std(meta: ast::Meta<'_>) -> bool {
         match meta {
@@ -1484,9 +1484,9 @@ fn extract_cfgs(
 }
 
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl AttrFlags {
-    #[salsa::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
     pub fn query(db: &Db, owner: AttrDefId) -> AttrFlags {
         let mut column = |file: EditionedFileId, krate: Crate| file_attr_flags(db, file, krate);
         column_flags(db, owner, &mut column).unwrap_or_else(|| walked_flags(db, owner))
@@ -1501,7 +1501,7 @@ impl AttrFlags {
 
         /// The flags of each field the cfg leaves in, indexed by `LocalFieldId`: 16 bytes a
         /// field, read by index.
-        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn field_attr_flags(db: &Db, variant: VariantId) -> Box<[AttrFlags]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
@@ -1534,7 +1534,7 @@ impl AttrFlags {
         }
         return generic_params_attr_flags(db, def);
 
-        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn generic_params_attr_flags(
             db: &Db,
             def: GenericDefId,
@@ -1658,7 +1658,7 @@ impl AttrFlags {
         }
         return link_name(db, owner);
 
-        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn link_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "link_name")
         }
@@ -1673,7 +1673,7 @@ impl AttrFlags {
         }
         return diagnostic_item(db, owner);
 
-        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn diagnostic_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "rustc_diagnostic_item")
         }
@@ -1681,7 +1681,7 @@ impl AttrFlags {
 
     /// The native libraries the `#[link(...)]`s of an `extern` block link its crate against,
     /// those whose `cfg(...)` the crate does not have left out, in the order written.
-    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub fn native_libs(db: &Db, owner: ExternBlockId) -> Box<[NativeLib]> {
         let krate = owner.lookup(db).container.krate(db);
         blaze_mem::frame::current(|frame| {
@@ -1704,7 +1704,7 @@ impl AttrFlags {
 
     /// The module a wasm module imports the functions of an `extern` block from,
     /// `#[link(wasm_import_module = "...")]`: they are its imports, not a library's.
-    #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
     pub fn wasm_import_module(db: &Db, owner: ExternBlockId) -> Option<Symbol> {
         collect_attrs(db, AttrDefId::ExternBlockId(owner), |attr| {
             if let ast::Meta::TokenTreeMeta(attr) = &attr
@@ -1726,7 +1726,7 @@ impl AttrFlags {
         }
         return link_section(db, owner);
 
-        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn link_section(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "link_section")
         }
@@ -1740,7 +1740,7 @@ impl AttrFlags {
         }
         return linkage(db, owner);
 
-        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn linkage(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "linkage")
         }
@@ -1754,7 +1754,7 @@ impl AttrFlags {
         }
         return export_name(db, owner);
 
-        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn export_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "export_name")
         }
@@ -1799,7 +1799,7 @@ impl AttrFlags {
 
         return lang_item(db, owner);
 
-        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn lang_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::KeyValueMeta(attr) = attr
@@ -1828,7 +1828,7 @@ impl AttrFlags {
     ///
     /// Prefer [`AttrFlags::repr()`] in non-perf-sensitive places as it also has a check that
     /// that the ADT has repr.
-    #[salsa::tracked(returns(copy), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
     pub fn repr_assume_has(db: &Db, owner: AdtId) -> Option<ReprOptions> {
         let mut result = None;
         collect_attrs::<Infallible>(db, owner.into(), |attr| {
@@ -1874,7 +1874,7 @@ impl AttrFlags {
     }
 
     /// Call this only if there are legacy const generics, to save memory.
-    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub(crate) fn legacy_const_generic_indices(
         db: &Db,
         owner: FunctionId,
@@ -1896,7 +1896,7 @@ impl AttrFlags {
     }
 
     // There aren't typically many crates, so it's okay to always make this a query without a flag.
-    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
     pub fn doc_html_root_url(db: &Db, krate: Crate) -> Option<SmolStr> {
         let root_file_id = krate.root_file_id(db);
         let syntax = root_file_id.parse(db).view();
@@ -1936,7 +1936,7 @@ impl AttrFlags {
 
         return target_features(db, owner);
 
-        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn target_features(db: &Db, owner: FunctionId) -> FxHashSet<Symbol> {
             blaze_mem::frame::current(|frame| {
                 let mut found = Vec::new_in(frame);
@@ -2034,7 +2034,7 @@ impl AttrFlags {
 
         return rustc_layout_scalar_valid_range(db, owner);
 
-        #[salsa::tracked(returns(copy), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
         fn rustc_layout_scalar_valid_range(
             db: &Db,
             owner: AdtId,
@@ -2080,7 +2080,7 @@ impl AttrFlags {
                 .unwrap_or_default(),
         };
 
-        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn doc_aliases(db: &Db, owner: AttrDefId) -> Box<[Symbol]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
@@ -2092,7 +2092,7 @@ impl AttrFlags {
             })
         }
 
-        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn fields_doc_aliases(
             db: &Db,
             variant: VariantId,
@@ -2129,7 +2129,7 @@ impl AttrFlags {
         };
 
         // We LRU this query because it is only used by IDE.
-        #[salsa::tracked(returns(ref), lru = 250, mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), lru = 250, mem_tag = Nameres)]
         fn cfgs(db: &Db, owner: AttrDefId) -> Option<CfgExpr> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
@@ -2144,7 +2144,7 @@ impl AttrFlags {
         }
 
         // We LRU this query because it is only used by IDE.
-        #[salsa::tracked(returns(ref), lru = 50, mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), lru = 50, mem_tag = Nameres)]
         fn fields_cfgs(
             db: &Db,
             variant: VariantId,
@@ -2175,7 +2175,7 @@ impl AttrFlags {
         }
         return doc_keyword(db, owner);
 
-        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn doc_keyword(db: &Db, owner: ModuleId) -> Option<Symbol> {
             collect_attrs(db, AttrDefId::ModuleId(owner), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -2196,7 +2196,7 @@ impl AttrFlags {
     }
 
     // We LRU this query because it is only used by IDE.
-    #[salsa::tracked(returns(as_deref), lru = 250, mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(as_deref), lru = 250, mem_tag = Nameres)]
     pub fn docs(db: &Db, owner: AttrDefId) -> Option<Box<Docs>> {
         let (source, outer_mod_decl, _crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
         let inner_attrs_node = docs::inner_docs_node(source.value);
@@ -2220,7 +2220,7 @@ impl AttrFlags {
     }
 
     // We LRU this query because it is only used by IDE.
-    #[salsa::tracked(returns(ref), lru = 50, mem_tag = Nameres)]
+    #[blaze_query::tracked(returns(ref), lru = 50, mem_tag = Nameres)]
     pub fn fields_docs(
         db: &Db,
         variant: VariantId,
@@ -2249,7 +2249,7 @@ impl AttrFlags {
 
         return derive_info(db, owner).as_ref();
 
-        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
         fn derive_info(db: &Db, owner: MacroId) -> Option<DeriveInfo> {
             blaze_mem::frame::current(|frame| {
                 collect_attrs(db, owner.into(), |attr| {
@@ -2300,7 +2300,7 @@ impl AttrFlags {
 
         return unstable_feature(db, owner);
 
-        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(clone), mem_tag = Nameres)]
         fn unstable_feature(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -2335,7 +2335,7 @@ impl AttrFlags {
         }
         return Some(must_use_message(db, owner));
 
-        #[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
         fn must_use_message(db: &Db, owner: AttrDefId) -> Option<Box<str>> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::KeyValueMeta(attr) = attr
@@ -2357,7 +2357,7 @@ impl AttrFlags {
         }
         return define_opaque(db, owner);
 
-        #[salsa::tracked(returns(deref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(deref), mem_tag = Nameres)]
         fn define_opaque(db: &Db, owner: FunctionId) -> Box<[ModPath]> {
             blaze_mem::frame::current(|frame| {
                 let mut result = Vec::new_in(frame);
@@ -2412,7 +2412,7 @@ impl AttrFlags {
         }
         return must_implement_one_of(db, owner);
 
-        #[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
+        #[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
         pub fn must_implement_one_of(
             db: &Db,
             owner: TraitId,
@@ -2477,7 +2477,7 @@ pub fn disabled_sanitizers(db: &Db, def: FunctionId) -> u8 {
 }
 
 /// [`disabled_sanitizers`] of the items of `module`.
-#[salsa::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
 fn module_disabled_sanitizers(db: &Db, module: ModuleId) -> u8 {
     let inherited = match module.containing_module_inside_def_map(db) {
         Some(parent) => module_disabled_sanitizers(db, ModuleId::from_id(parent.as_id())),
@@ -2493,7 +2493,7 @@ fn module_disabled_sanitizers(db: &Db, module: ModuleId) -> u8 {
 /// [`disabled_sanitizers`] of the items of `block`: the set of the module holding it, then the
 /// `#[sanitize]` of each item and closure between the two, outermost first, through the macro
 /// calls the block was expanded from.
-#[salsa::tracked(returns(copy), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(copy), mem_tag = Nameres)]
 fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
     let outer = block.module(db);
     let krate = outer.krate(db);

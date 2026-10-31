@@ -1,5 +1,5 @@
-//! [`WfResult`] in blaze's format: one row per diagnostic, its site as a tag word and the salsa
-//! id of the definition it is in (the database that wrote a buffer is the one reading it, as
+//! [`WfResult`] in blaze's format: one row per diagnostic, its site as a tag word and the query
+//! database id of the definition it is in (the database that wrote a buffer is the one reading it, as
 //! `crates/hir-def/src/hir/persist.rs` writes ids), its message in the buffer.
 
 use std::mem::offset_of;
@@ -10,7 +10,7 @@ use hir_def::{
     TraitId, TypeAliasId, UnionId, VariantId,
 };
 use la_arena::{Idx, RawIdx};
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 
 use crate::{Site, WfDiagnostic, WfResult};
 
@@ -138,7 +138,7 @@ impl Persist for WfResult {
 /// The site's variant, the kind of its definition, the definition's id and the site's index.
 fn encode_site(site: Site) -> (u8, u8, u64, u32) {
     fn bits(id: impl AsId) -> u64 {
-        id.as_id().as_bits()
+        u64::from(id.as_id().as_u32())
     }
     match site {
         Site::Field(variant, field) => {
@@ -175,11 +175,11 @@ fn encode_site(site: Site) -> (u8, u8, u64, u32) {
 fn decode<'a>(row: &'a WfRow, buffer: &'a [u8]) -> Result<WfDiagnosticRef<'a>, FormatError> {
     let at = (row as *const WfRow as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
     let invalid = |what| FormatError::Invalid { at, what };
-    if row.id as u32 == 0 {
-        return Err(invalid("a salsa id of index 0"));
+    if row.id == 0 || row.id > u64::from(u32::MAX) {
+        return Err(invalid("an id of 0 or wider than 32 bits"));
     }
     fn id<T: FromId>(bits: u64) -> T {
-        T::from_id(salsa::Id::from_bits(bits))
+        T::from_id(blaze_query::db::Id::from_u32(bits as u32))
     }
     let (site, def, code) = (row.kind & 0xff, (row.kind >> 8) & 0xff, row.kind >> 16);
     let bad_def = || invalid("a well-formedness site of an unknown definition kind");
@@ -227,12 +227,12 @@ mod tests {
     use blaze_format::{Aligned, Persist, to_bytes};
     use hir_def::{FunctionId, GenericDefId, ImplId, StructId, VariantId};
     use la_arena::{Idx, RawIdx};
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
 
     use crate::{Site, WfDiagnostic, WfResult};
 
     fn id<T: FromId>(index: u32) -> T {
-        T::from_id(salsa::Id::from_bits(u64::from(index) | (3 << 32)))
+        T::from_id(blaze_query::db::Id::from_u32(index + (3 << 20)))
     }
 
     fn round_trip(result: &WfResult) -> WfResult {

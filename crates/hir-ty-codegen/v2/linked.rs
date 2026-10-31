@@ -279,7 +279,7 @@ struct Positions {
 /// Each span's position, as the program observes it; a span with no syntax of its own (a
 /// binding, [`MirSpan::Unknown`]) is where its owner is. Memoized, so a link after an edit
 /// finds again only the bodies it changed.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn positions(db: &Db, owner: DefWithBodyId) -> Result<Positions, String> {
     let store = BodyStore::of(db, owner);
     let at_owner = owner_location(db, owner);

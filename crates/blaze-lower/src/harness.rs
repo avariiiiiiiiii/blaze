@@ -6,7 +6,7 @@
 use base_db::{Crate, FileText};
 use hir_expand::proc_macro::ProcMacros;
 use rustc_hash::FxHashSet;
-use salsa::Durability;
+use blaze_query::db::Durability;
 
 use super::{ContentId, Db, LowerError, Lowered};
 

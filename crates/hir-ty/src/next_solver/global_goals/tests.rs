@@ -303,7 +303,7 @@ fn goals<'db>(db: &'db Db, krate: Crate, interner: DbInterner<'db>) -> Vec<(Trai
 
 /// Each goal's evaluation, twice in a row (the second a table hit when the tables are on), in
 /// the two typing modes the table keys most.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn answers(db: &Db, krate: Crate) -> Box<[u8]> {
     let interner = DbInterner::new_with(db, krate);
     let goals = goals(db, krate, interner);
@@ -320,7 +320,7 @@ fn answers(db: &Db, krate: Crate) -> Box<[u8]> {
 }
 
 /// The shape table's verdict on each goal, in the first typing mode of [`answers`].
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn shape_verdicts(db: &Db, krate: Crate) -> Box<[bool]> {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
@@ -455,7 +455,7 @@ fn limit_goals<'db>(
 }
 
 /// Each goal's evaluation and the overflow warnings it gave, twice in a row.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn limit_answers(db: &Db, krate: Crate) -> Box<[u8]> {
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());

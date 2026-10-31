@@ -1,0 +1,31 @@
+{
+ "crate": "crates/hir-ty-borrowck",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/hir-ty-borrowck/src/regions.rs",
+   "edits": [
+    {
+     "old": "            // `&dyn Any` or salsa's `&dyn Database`, only what a parameter writes or elides.\n",
+     "new": "            // `&dyn Any` or the query database's `&dyn Database`, only what a parameter writes or\n            // elides.\n"
+    },
+    {
+     "old": "    /// salsa's `Database` is) defaults its objects to `'static` instead, as rustc's\n",
+     "new": "    /// `blaze_query::db::Database` is) defaults its objects to `'static` instead, as rustc's\n"
+    },
+    {
+     "old": "                    // Its supertraits' too, as rustc elaborates them: salsa's `dyn Database`\n                    // through `ZalsaDatabase: Any`.\n",
+     "new": "                    // Its supertraits' too, as rustc elaborates them: a `dyn Db` through a\n                    // supertrait bounded by `'static`.\n"
+    },
+    {
+     "old": "/// What proving a trait reference gives a body, as salsa keeps it: its region variables are\n",
+     "new": "/// What proving a trait reference gives a body, as the query database keeps it: its region variables are\n"
+    },
+    {
+     "old": "/// What normalizing a type gives, as salsa keeps it, its region variables numbered as\n",
+     "new": "/// What normalizing a type gives, as the query database keeps it, its region variables numbered as\n"
+    }
+   ]
+  }
+ ]
+}

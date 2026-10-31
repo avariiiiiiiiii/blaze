@@ -3,7 +3,7 @@
 //! `#[track_caller]` and panics report. The evaluator of constants and the code generator
 //! both read them.
 
-use salsa::{Database as _, Setter as _};
+use blaze_query::db::{Database as _, Setter as _};
 use base_db::Db;
 use hir_def::{
     DefWithBodyId, FunctionId, ItemContainerId, Lookup,
@@ -46,7 +46,7 @@ fn calls_location_macros(db: &Db, body: &Body) -> bool {
 /// The literals of a body that `file!()` expanded to, each with its expansion: the path is the
 /// build's rule's ([`name_sources`]), not the expander's. The source map changes with every
 /// edit above the body, and this keeps code without such literals from changing with it.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> FxHashMap<ExprId, HirFileId> {
     let body = Body::of(db, owner);
     if !calls_location_macros(db, body) {
@@ -67,7 +67,7 @@ pub fn location_macros<'db>(db: &'db Db, owner: DefWithBodyId) -> FxHashMap<Expr
 
 /// The literals of a body that `concat!` made of arguments with `file!()` among them, each with
 /// the expansion it is in.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn located_concats<'db>(
     db: &'db Db,
     owner: DefWithBodyId,
@@ -109,7 +109,7 @@ impl std::fmt::Debug for NamingRule {
 
 /// What the build calls each file, for a constant with `file!()` in its value: the evaluator
 /// has no build to ask, and a constant's value depends on it, so it is an input.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct SourceNames {
     #[returns(ref)]
     pub rule: NamingRule,
@@ -128,13 +128,13 @@ pub fn name_sources(
     match SourceNames::try_get(db) {
         Some(names) if names.rule(db).key == rule.key => {}
         Some(names) => {
-            names.set_rule(db).with_durability(salsa::Durability::HIGH).to(rule);
+            names.set_rule(db).with_durability(blaze_query::db::Durability::HIGH).to(rule);
         }
         None => {
-            _ = SourceNames::builder(rule).durability(salsa::Durability::HIGH).new(db);
+            _ = SourceNames::builder(rule).durability(blaze_query::db::Durability::HIGH).new(db);
             // Reading a singleton that does not exist yet is not tracked: what read it before
             // reported an untracked read (`file_source_path`), which a new revision makes stale.
-            db.synthetic_write(salsa::Durability::LOW);
+            db.storage_mut().synthetic_write(blaze_query::db::Durability::LOW);
         }
     }
 }
@@ -145,10 +145,10 @@ pub fn source_path<'db>(db: &'db Db, file: base_db::FileId) -> Option<&'db str> 
     file_source_path(db, db.file_text(file))
 }
 
-#[salsa::tracked(returns(as_deref))]
+#[blaze_query::tracked(returns(as_deref))]
 fn file_source_path<'db>(db: &'db Db, file: base_db::FileText) -> Option<String> {
     let Some(names) = SourceNames::try_get(db) else {
-        db.report_untracked_read();
+        blaze_query::db::report_untracked_read(db);
         return None;
     };
     (names.rule(db).paths)(db, *file.file_id(db))
@@ -357,7 +357,7 @@ pub fn line_and_column(
 
 /// File, line and column of a place in a body, as rustc reports them, found from where the
 /// body is in its file: the code generator also finds them from the body alone.
-#[salsa::tracked]
+#[blaze_query::tracked]
 pub fn source_location_in_file<'db>(
     db: &'db Db,
     owner: DefWithBodyId,

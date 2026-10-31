@@ -40,7 +40,7 @@ const LONGEST: usize = 256;
 
 /// Whether the instance `f` with `args`, in the environment `env`, reaches the global
 /// allocator.
-#[salsa::tracked(returns(copy), cycle_initial = |_, _, _, _, _| false)]
+#[blaze_query::tracked(returns(copy), cycle_initial = |_, _, _, _, _| false)]
 pub(crate) fn reaches_alloc(
     db: &Db,
     env: StoredParamEnvAndCrate,

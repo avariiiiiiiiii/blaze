@@ -54,8 +54,8 @@ impl BodyFacts for Bodies {
         db: &Db,
         def: DefWithBodyId,
         step: Step,
-        read: salsa::DatabaseKeyIndex,
-        kind: salsa::ReadKind,
+        read: blaze_query::db::DatabaseKeyIndex,
+        kind: blaze_query::db::ReadKind,
         name: &'static str,
     ) -> Classified {
         reads::classify(db, def, step, read, kind, name)

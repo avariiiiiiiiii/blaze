@@ -76,10 +76,10 @@ const _: () = assert!(size_of::<TyKind<'static>>() <= 48);
 impl_stored_interned!(Ty, StoredTy);
 impl_foldable_for_stored_type!(StoredTy);
 
-/// The salsa ids of the closures, coroutines and opaque types `ty` names at any depth: whose
-/// a query keyed by it is (`salsa::Zalsa::ids_of`, read by `crates/hir-firewall`).
-fn push_named_ids(ty: Ty<'_>, out: &mut Vec<salsa::Id>) {
-    use salsa::plumbing::AsId;
+/// The ids of the closures, coroutines and opaque types `ty` names at any depth: whose
+/// a query keyed by it is (`blaze_query::db::Storage::ids_of`, read by `crates/hir-firewall`).
+fn push_named_ids(ty: Ty<'_>, out: &mut Vec<blaze_query::db::Id>) {
+    use blaze_query::db::AsId;
     for arg in ty.walk() {
         let Some(ty) = arg.ty() else { continue };
         match ty.kind() {
@@ -94,28 +94,28 @@ fn push_named_ids(ty: Ty<'_>, out: &mut Vec<salsa::Id>) {
     }
 }
 
-impl salsa::plumbing::interned::NamesIds for Ty<'_> {
-    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+impl blaze_query::db::NamesIds for Ty<'_> {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
         push_named_ids(*self, out);
     }
 }
 
-impl salsa::plumbing::interned::NamesIds for StoredTy {
-    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+impl blaze_query::db::NamesIds for StoredTy {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
         push_named_ids(self.as_ref(), out);
     }
 }
 
-impl salsa::plumbing::interned::NamesIds for GenericArgs<'_> {
-    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+impl blaze_query::db::NamesIds for GenericArgs<'_> {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
         for ty in self.iter().filter_map(|arg| arg.ty()) {
             push_named_ids(ty, out);
         }
     }
 }
 
-impl salsa::plumbing::interned::NamesIds for super::StoredGenericArgs {
-    fn names_ids(&self, out: &mut Vec<salsa::Id>) {
+impl blaze_query::db::NamesIds for super::StoredGenericArgs {
+    fn names_ids(&self, out: &mut Vec<blaze_query::db::Id>) {
         self.as_ref().names_ids(out);
     }
 }
@@ -1620,8 +1620,8 @@ mod tests {
     use super::*;
     use crate::next_solver::{GenericArg, TraitAssocTyId};
 
-    fn id<T: salsa::plumbing::FromId>(bits: u64) -> T {
-        T::from_id(salsa::Id::from_bits(bits))
+    fn id<T: blaze_query::db::FromId>(bits: u32) -> T {
+        T::from_id(blaze_query::db::Id::from_u32(bits))
     }
 
     fn u8_ty<'db>() -> Ty<'db> {

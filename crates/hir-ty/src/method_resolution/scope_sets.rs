@@ -191,7 +191,7 @@ impl TraitsInScope {
 
 /// The traits in scope in `module`: its blocks', its module's and the prelude's, as
 /// `Resolver::for_each_trait_in_scope` walks them.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn module_trait_set(db: &Db, module: ModuleId) -> TraitSet {
     // alloc: once per module and revision.
     let mut traits = Vec::new();
@@ -201,7 +201,7 @@ pub fn module_trait_set(db: &Db, module: ModuleId) -> TraitSet {
 
 /// The traits in scope in `module` with a value item named `name`, and those items. What a body
 /// reads of its scope's traits, so it is checked again only when this changes.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub fn module_items_named(db: &Db, module: ModuleId, name: Name) -> ScopeItems {
     blaze_mem::frame::current(|frame| {
         ScopeItems::of_traits(db, module_trait_set(db, module).traits(), name, frame)

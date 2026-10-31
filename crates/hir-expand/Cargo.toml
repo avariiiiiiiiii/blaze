@@ -20,7 +20,7 @@ rustc-hash.workspace = true
 itertools.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 thin-vec.workspace = true
 
 # local deps

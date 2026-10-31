@@ -1,5 +1,5 @@
 //! What a write reruns (design §12, "a reader sees only its slice"): the resolver queries the
-//! maintainer executes during the write, read off salsa's `WillExecute` events
+//! maintainer executes during the write, read off the query database's `WillExecute` events
 //! (`Db::log_mut`, which wraps the write), what a read of the def map after it executes, and
 //! the bindings `LastWrite` says the write changed.
 //!
@@ -8,7 +8,7 @@
 
 use base_db::Db;
 use rustc_hash::FxHashSet;
-use salsa::plumbing::FromId;
+use blaze_query::db::FromId;
 
 use super::{Loaded, check_db, module_path};
 use crate::nameres::{
@@ -65,12 +65,12 @@ const ROUND_QUERIES: &[&str] = &[
 const DECL_QUERIES: &[&str] = &["module_decls", "legacy_exports", "subtree_macro_exports", "decl_handle"];
 
 /// The queries `f` executed: each ingredient's name and its key's id.
-fn executed(db: &mut Db, f: impl FnOnce(&mut Db)) -> Vec<(String, salsa::Id)> {
+fn executed(db: &mut Db, f: impl FnOnce(&mut Db)) -> Vec<(String, blaze_query::db::Id)> {
     db.log_mut(f)
         .into_iter()
         .filter_map(|event| match event.kind {
-            salsa::EventKind::WillExecute { database_key } => Some((
-                salsa::Database::ingredient_debug_name(&*db, database_key.ingredient_index()).to_string(),
+            blaze_query::db::EventKind::WillExecute { database_key } => Some((
+                blaze_query::db::Database::storage(&*db).ingredient_name(database_key.ingredient_index()).to_owned(),
                 database_key.key_index(),
             )),
             _ => None,
@@ -79,7 +79,7 @@ fn executed(db: &mut Db, f: impl FnOnce(&mut Db)) -> Vec<(String, salsa::Id)> {
 }
 
 /// What a write of `text` to `file` of [`FIXTURE`] executed, with the database after it.
-fn write(file: &str, text: &str) -> (Loaded, Vec<(String, salsa::Id)>) {
+fn write(file: &str, text: &str) -> (Loaded, Vec<(String, blaze_query::db::Id)>) {
     let mut loaded = Loaded::new(FIXTURE);
     let file = loaded.file(file);
     let events = executed(&mut loaded.db, |db| db.set_file_text(file, text));
@@ -87,7 +87,7 @@ fn write(file: &str, text: &str) -> (Loaded, Vec<(String, salsa::Id)>) {
 }
 
 /// The modules, as paths, whose `DeclKey` queries ran.
-fn decl_modules(db: &Db, events: &[(String, salsa::Id)]) -> FxHashSet<String> {
+fn decl_modules(db: &Db, events: &[(String, blaze_query::db::Id)]) -> FxHashSet<String> {
     events
         .iter()
         .filter(|(name, _)| DECL_QUERIES.contains(&name.as_str()))
@@ -95,7 +95,7 @@ fn decl_modules(db: &Db, events: &[(String, salsa::Id)]) -> FxHashSet<String> {
         .collect()
 }
 
-fn round_queries(events: &[(String, salsa::Id)]) -> Vec<&(String, salsa::Id)> {
+fn round_queries(events: &[(String, blaze_query::db::Id)]) -> Vec<&(String, blaze_query::db::Id)> {
     events.iter().filter(|(name, _)| ROUND_QUERIES.contains(&name.as_str())).collect()
 }
 
@@ -165,7 +165,7 @@ fn an_item_removed_changes_its_readers() {
 #[test]
 fn an_edit_inside_a_body_reruns_no_resolver_query() {
     let (mut loaded, events) = write("/a.rs", "pub struct A;\npub fn helper() { let _ = 1; }\n");
-    let resolver: Vec<&(String, salsa::Id)> = events
+    let resolver: Vec<&(String, blaze_query::db::Id)> = events
         .iter()
         .filter(|(name, _)| DECL_QUERIES.contains(&name.as_str()) || ROUND_QUERIES.contains(&name.as_str()))
         .collect();

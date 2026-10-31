@@ -1,4 +1,4 @@
-//! The bytes of a kept constant value: its type with no salsa id, its memory and its memory
+//! The bytes of a kept constant value: its type with no database id, its memory and its memory
 //! map, little-endian, read where the store keeps them.
 //!
 //! ```text

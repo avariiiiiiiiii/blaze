@@ -70,7 +70,7 @@ pub trait GoalFacts: Send + Sync + 'static {
     /// The fact a read of the query or input `read` (named `name`, its ingredient's debug name)
     /// stands for, if one does: one whose value changes whenever what that read returned does.
     /// `None` keeps the goal out of the store.
-    fn fact_of(&self, db: &Db, read: salsa::DatabaseKeyIndex, name: &'static str)
+    fn fact_of(&self, db: &Db, read: blaze_query::db::DatabaseKeyIndex, name: &'static str)
     -> Option<FactRef>;
 
     /// The value of `fact` in `db` now (`blaze_items::facts::value`), read by the active query;
@@ -100,7 +100,7 @@ pub enum FactObject {
 /// captured shareably: the answer is then good for the asking query alone).
 pub(crate) struct Found {
     pub(crate) answer: Answer,
-    pub(crate) reads: Option<salsa::Reads>,
+    pub(crate) reads: Option<blaze_query::db::Reads>,
 }
 
 /// On a global-table miss, before solving: the stored answer of `key` for `interner`'s crate
@@ -116,7 +116,7 @@ pub(crate) fn lookup<'db>(interner: DbInterner<'db>, key: GoalKey) -> Option<Fou
 
 /// After solving: `key`'s answer, shareable, with what its evaluation read.
 #[inline]
-pub(crate) fn offer<'db>(interner: DbInterner<'db>, key: GoalKey, answer: Answer, reads: salsa::Reads) {
+pub(crate) fn offer<'db>(interner: DbInterner<'db>, key: GoalKey, answer: Answer, reads: blaze_query::db::Reads) {
     if INSTALLED.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -133,7 +133,7 @@ fn offer_goal<'db>(
     interner: DbInterner<'db>,
     goal: Goal<'db>,
     answer: Answer,
-    reads: salsa::Reads,
+    reads: blaze_query::db::Reads,
 ) {
     with_store(interner.db, |store| store.offer(interner, goal, answer, reads));
 }
@@ -249,7 +249,7 @@ enum Refusal {
 
 impl Store {
     fn lookup<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>) -> Option<Found> {
-        let (answer, reads) = salsa::capture_reads(interner.db, || self.find(interner, goal));
+        let (answer, reads) = blaze_query::db::capture_reads(interner.db, || self.find(interner, goal));
         Some(Found { answer: answer?, reads })
     }
 
@@ -307,7 +307,7 @@ impl Store {
         Some(key.finish())
     }
 
-    fn offer<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>, answer: Answer, reads: salsa::Reads) {
+    fn offer<'db>(&self, interner: DbInterner<'db>, goal: Goal<'db>, answer: Answer, reads: blaze_query::db::Reads) {
         let mut scratch = SCRATCH.take();
         scratch.facts.clear();
         scratch.values.clear();
@@ -324,16 +324,18 @@ impl Store {
         interner: DbInterner<'db>,
         goal: Goal<'db>,
         answer: Answer,
-        reads: salsa::Reads,
+        reads: blaze_query::db::Reads,
         scratch: &mut Scratch,
     ) -> Result<(), Refusal> {
         let db = interner.db;
         let mut refused = None;
         let facts = &mut scratch.facts;
-        let _ = reads.for_each_read(db, |read, kind, name| {
-            if kind == salsa::ReadKind::Interned {
+        let storage = blaze_query::db::Database::storage(db);
+        let _ = reads.for_each_read(storage, |blaze_query::db::Read { key: read, kind }| {
+            if kind == blaze_query::db::ReadKind::Interned {
                 return ControlFlow::Continue(());
             }
+            let name = storage.ingredient_name(read.ingredient_index());
             match self.facts.fact_of(db, read, name) {
                 Some(fact) => {
                     facts.push(fact);

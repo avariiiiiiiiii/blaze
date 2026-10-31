@@ -54,7 +54,7 @@ pub struct ConstParamTyError {
 
 /// The refused const parameters of `def`, its own parameters only, in their order. A type
 /// with an error in it is passed over, as rustc passes over a type whose error is reported.
-#[salsa::tracked(returns(deref), mem_tag = Infer)]
+#[blaze_query::tracked(returns(deref), mem_tag = Infer)]
 pub fn const_param_ty_errors(db: &Db, def: GenericDefId) -> Box<[ConstParamTyError]> {
     let params = GenericParams::of(db, def);
     let mut consts = params.iter_type_or_consts().filter_map(|(local_id, data)| match data {

@@ -23,14 +23,11 @@
 pub use self::imp::*;
 
 /// A syntax context describes a hierarchy tracking order of macro definitions.
-#[cfg(feature = "salsa")]
+#[cfg(feature = "query")]
 mod imp {
     use std::{fmt, num::NonZeroU32};
 
-    use salsa::{
-        Database,
-        plumbing::{AsId, FromId},
-    };
+    use blaze_query::db::{AsId, Database, FromId};
     use syntax::Edition;
 
     use crate::{MacroCallId, Transparency};
@@ -57,9 +54,9 @@ mod imp {
         }
     }
 
-    // `unsafe(no_lifetime)`: the values are never collected (`revisions = usize::MAX`), so a
+    // `unsafe(no_lifetime)`: the engine never frees an interned value, so a
     // `SyntaxContextImpl` held without the database's lifetime never outlives its slot.
-    #[salsa::interned(unsafe(no_lifetime), revisions = usize::MAX)]
+    #[blaze_query::interned(unsafe(no_lifetime))]
     struct SyntaxContextImpl {
         data: SyntaxContextData,
     }
@@ -68,7 +65,7 @@ mod imp {
     pub struct SyntaxContext(NonZeroU32);
 
     impl SyntaxContext {
-        const MAX_ROOT_ID: u32 = salsa::Id::MAX_U32 + 1 + Edition::LATEST as u32;
+        const MAX_ROOT_ID: u32 = blaze_query::db::Id::MAX_U32 + 1 + Edition::LATEST as u32;
 
         #[inline]
         pub fn into_u32(self) -> u32 {
@@ -78,8 +75,8 @@ mod imp {
         /// # Contract
         ///
         /// `u32` is what [`SyntaxContext::into_u32`] gave for a context of this database.
-        /// Memory safety doesn't rest on it ([`SyntaxContext::id`] checks the bound salsa needs,
-        /// and salsa's table checks the page, slot and type of every lookup): another value
+        /// Memory safety doesn't rest on it ([`SyntaxContext::id`] checks the bound an `Id` has,
+        /// and the engine checks the owner of every row it reads): another value
         /// gives a panic, or another context's hygiene data. Panics on `u32::MAX`, which no
         /// context has.
         #[inline]
@@ -96,11 +93,10 @@ mod imp {
                 return None;
             }
             let index = self.0.get() - 1;
-            assert!(index < salsa::Id::MAX_U32, "SyntaxContext({index}) is no root and no salsa id");
-            // The id `Id::from_index(index)` would make (stored index `index + 1`, generation
-            // 0), with the bound checked instead of trusted. Whether it is a `SyntaxContextImpl`
-            // salsa's table checks on lookup (page, slot and the page's type), panicking if not.
-            let id = salsa::Id::from_bits(u64::from(index) + 1);
+            assert!(index < blaze_query::db::Id::MAX_U32, "SyntaxContext({index}) is no root and no query id");
+            // Whether it is a `SyntaxContextImpl` the engine checks on lookup (the owner of the
+            // ID's page), panicking if not.
+            let id = blaze_query::db::Id::from_u32(index + 1);
             Some(SyntaxContextImpl::from_id(id))
         }
 
@@ -145,7 +141,7 @@ mod imp {
                     opaque_and_semiopaque_if_not_self,
                 },
             );
-            SyntaxContext(NonZeroU32::new(result.as_id().index() + 1).unwrap())
+            SyntaxContext(NonZeroU32::new(result.as_id().as_u32()).unwrap())
         }
 
         /// Invariant: Only the root [`SyntaxContext`] has a [`None`] outer expansion.
@@ -304,7 +300,7 @@ mod imp {
     }
 }
 
-#[cfg(not(feature = "salsa"))]
+#[cfg(not(feature = "query"))]
 mod imp {
     use std::{fmt, num::NonZeroU32};
 
@@ -378,6 +374,25 @@ mod tests {
 
     use super::*;
 
+    /// A database of span's one ingredient: span is below base-db's `Db`.
+    struct TestDb(blaze_query::db::Storage);
+
+    impl TestDb {
+        fn new() -> TestDb {
+            TestDb(blaze_query::db::Storage::new(None))
+        }
+    }
+
+    impl blaze_query::db::Database for TestDb {
+        fn storage(&self) -> &blaze_query::db::Storage {
+            &self.0
+        }
+
+        fn storage_mut(&mut self) -> &mut blaze_query::db::Storage {
+            &mut self.0
+        }
+    }
+
     #[test]
     fn test_root_edition_is_root() {
         for edition in Edition::iter() {
@@ -388,7 +403,7 @@ mod tests {
 
     #[test]
     fn test_root_edition_editions() {
-        let db = salsa::DatabaseImpl::new();
+        let db = TestDb::new();
         for edition in Edition::iter() {
             let ctx = SyntaxContext::root(edition);
             assert_eq!(edition, ctx.edition(&db), "{edition} root should have edition {edition}");
@@ -396,16 +411,16 @@ mod tests {
     }
 
     #[test]
-    fn test_roots_do_not_overlap_with_salsa_ids() {
+    fn test_roots_do_not_overlap_with_query_ids() {
         for edition in Edition::iter() {
             let root = SyntaxContext::root(edition);
             let root_u32 = root.into_u32();
             assert!(
-                root_u32 >= salsa::Id::MAX_U32,
-                "Root context for {:?} (value {}) must be >= salsa::Id::MAX_U32 ({}) to avoid collision",
+                root_u32 >= blaze_query::db::Id::MAX_U32,
+                "Root context for {:?} (value {}) must be >= Id::MAX_U32 ({}) to avoid collision",
                 edition,
                 root_u32,
-                salsa::Id::MAX_U32
+                blaze_query::db::Id::MAX_U32
             );
         }
     }
@@ -420,12 +435,12 @@ mod tests {
 
     #[test]
     fn test_interned_context_round_trips_through_u32() {
-        let db = salsa::DatabaseImpl::new();
+        let db = TestDb::new();
         let root = SyntaxContext::root(Edition::Edition2015);
         let ctx = SyntaxContext::new(
             &db,
             // Stored as the expansion of the context and never looked up.
-            crate::MacroCallId(salsa::Id::from_bits(2)),
+            crate::MacroCallId(blaze_query::db::Id::from_u32(2)),
             Transparency::Opaque,
             Edition::Edition2021,
             root,
@@ -438,12 +453,12 @@ mod tests {
         assert_eq!(round_tripped.parent(&db), root);
     }
 
-    /// A value past the roots, which no salsa id has, panics when looked up instead of making
-    /// an `Id` out of `from_index`'s range.
+    /// A value past the roots, which no query id has, panics when looked up instead of making
+    /// an `Id` out of its range.
     #[test]
-    #[should_panic(expected = "no root and no salsa id")]
+    #[should_panic(expected = "no root and no query id")]
     fn a_context_past_the_roots_panics() {
-        let db = salsa::DatabaseImpl::new();
+        let db = TestDb::new();
         let ctx = SyntaxContext::from_u32(u32::MAX - 1);
         assert!(!ctx.is_root());
         ctx.parent(&db);
@@ -460,7 +475,7 @@ mod tests {
     #[test]
     fn warm_context_reads_allocate_nothing() {
         assert!(blaze_alloc_count::installed());
-        let db = salsa::DatabaseImpl::new();
+        let db = TestDb::new();
         let root = SyntaxContext::root(Edition::Edition2021);
         let transparencies =
             [Transparency::Opaque, Transparency::SemiOpaque, Transparency::Transparent];
@@ -468,7 +483,7 @@ mod tests {
             SyntaxContext::new(
                 &db,
                 // Stored as the expansion of the context and never looked up.
-                crate::MacroCallId(salsa::Id::from_bits(n + 2)),
+                crate::MacroCallId(blaze_query::db::Id::from_u32(n as u32 + 2)),
                 transparencies[n as usize % 3],
                 Edition::Edition2021,
                 parent,

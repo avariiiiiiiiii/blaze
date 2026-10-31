@@ -9,7 +9,7 @@
 //! - [`attrs`]: the lint attributes of a node as rustc reads them, and the node around it.
 //! - [`builder`]: rustc's `LintLevelsBuilder`, as the early lint pass has it and as the HIR has
 //!   it, with what it finds wrong handed to a [`builder::Sink`] (blaze-diagnostics words it).
-//! - [`query`]: the level at an item or an expression of its store, as salsa queries: rustc's
+//! - [`query`]: the level at an item or an expression of its store, as queries: rustc's
 //!   `shallow_lint_levels_on` and `lint_level_at_node`.
 //!
 //! The lints themselves, their groups and names, and the command line's type are

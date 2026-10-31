@@ -595,7 +595,7 @@ fn an_allocation_into_a_static_is_relocated_in_a_relocating_scope() {
     let mut table = crate::check_cache::ids::Table::default();
     let relocated = crate::check_cache::ids::relocating(&mut table, || write(&db, &body, None))
         .expect("a static an allocation points into is written by its place in the table");
-    assert_ne!(relocated, written(&db, &body), "the static is by its table index, not its salsa bits");
+    assert_ne!(relocated, written(&db, &body), "the static is by its table index, not its own bits");
 }
 
 /// Where the words column starts in `bytes`, and how many bytes it has.

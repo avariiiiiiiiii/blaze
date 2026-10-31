@@ -11,7 +11,6 @@ use hir_def::{
     },
 };
 use rustc_type_ir::inherent;
-use salsa::SalsaValue;
 use stdx::impl_from;
 
 use crate::{
@@ -30,7 +29,7 @@ pub enum Ctor {
     Enum(EnumVariantId),
 }
 
-#[derive(PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(PartialOrd, Ord, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum SolverDefId<'db> {
     AdtId(AdtId),
     ConstId(ConstId),

@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// The key of [`specializes_query`]: whether `specializing` specializes `parent`.
-#[salsa::interned(debug, revisions = usize::MAX)]
+#[blaze_query::interned(debug)]
 pub struct ImplPair {
     #[returns(copy)]
     pub specializing: ImplId,
@@ -42,13 +42,13 @@ pub struct ImplPair {
 // and indeed I was unable to cause cycles even with erroneous code. However, in r-a we can
 // create a cycle if there is an error in the impl's where clauses. I believe well formed code
 // cannot create a cycle, but a cycle handler is required nevertheless.
-fn specializes_query_cycle(_db: &Db, _: salsa::Id, _pair: ImplPair) -> bool {
+fn specializes_query_cycle(_db: &Db, _: blaze_query::db::Id, _pair: ImplPair) -> bool {
     false
 }
 
 /// Whether the crate of `impl_id` enables `specialization` or `min_specialization`: only
 /// then may it specialize another impl.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
     let features = UnstableFeatures::query(db, impl_id.krate(db));
     features.specialization || features.min_specialization
@@ -65,7 +65,7 @@ pub(crate) fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
 /// `parent_impl_def_id` is a const impl (conditionally based off of some `[const]`
 /// bounds), then `specializing_impl_def_id` must also be const for the same
 /// set of types.
-#[salsa::tracked(cycle_result = specializes_query_cycle, returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(cycle_result = specializes_query_cycle, returns(copy), mem_tag = Infer)]
 fn specializes_query<'db>(db: &'db Db, pair: ImplPair<'db>) -> bool {
     let (specializing_impl_def_id, parent_impl_def_id) = (pair.specializing(db), pair.parent(db));
     let trait_env = db.trait_environment(specializing_impl_def_id.into());
@@ -287,7 +287,7 @@ fn parameters_for<'db>(
 /// `enforce_impl_non_lifetime_params_are_constrained`). rustc's `assoc_def` refuses to
 /// project an item such an impl defines, which would leave the parameter an inference
 /// variable nothing constrains, and gives an error instead.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn impl_has_unconstrained_params(db: &Db, impl_id: ImplId) -> bool {
     blaze_mem::frame::current(|frame| {
         let Some(constrained) = constrained_params(db, frame, impl_id) else { return false };

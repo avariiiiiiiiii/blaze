@@ -2,16 +2,15 @@
 //!
 //! Scoped work borrows `&Db` and the borrow checker keeps writes out until it ends. A task on a
 //! `'static` thread can't borrow, so it holds a [`Reader`], and the owner's write first stops
-//! every reader ([`salsa::Database::stop_readers`]), then waits for each to let go. This is
-//! what a write to the owner of a salsa database fork did: no task forks the database here,
-//! they share the one `Db`.
+//! every reader ([`blaze_query::db::Storage::stop_readers`]), then waits for each to let go:
+//! no task forks the database here, they share the one `Db`.
 
 use std::{
     ops::Deref,
     sync::{Arc, Condvar, Mutex},
 };
 
-use salsa::Database as _;
+use blaze_query::db::Database as _;
 
 use super::Db;
 
@@ -65,7 +64,7 @@ impl Shared {
     /// Has every reader, held or borrowed, unwind with `Cancelled::PendingWrite` at its next
     /// query call, until the next [`Shared::write`].
     pub fn stop_readers(&self) {
-        self.db.stop_readers();
+        self.db.storage().stop_readers();
     }
 
     /// The database to write to: stops every [`Reader`] still held, waits for each to let go,
@@ -73,17 +72,16 @@ impl Shared {
     /// isn't stopped too.
     pub fn write(&mut self) -> &mut Db {
         if Arc::strong_count(&self.db) > 1 {
-            self.db.stop_readers();
+            self.db.storage().stop_readers();
             let mut held = self.gone.lock.lock().unwrap_or_else(|it| it.into_inner());
             while Arc::strong_count(&self.db) > 1 {
                 held = self.gone.left.wait(held).unwrap_or_else(|it| it.into_inner());
             }
         }
-        let stopped = self.db.readers_stopped();
         let db = Arc::get_mut(&mut self.db)
             .expect("a reader of the database is held past its last `Reader`: only `Reader`s clone it");
-        if stopped {
-            db.trigger_cancellation();
+        if db.storage().readers_stopped() {
+            db.storage_mut().resume_readers();
         }
         db
     }
@@ -92,8 +90,8 @@ impl Shared {
     /// may as well wait for the next time nothing reads it.
     pub fn idle(&mut self) -> Option<&mut Db> {
         let db = Arc::get_mut(&mut self.db)?;
-        if db.readers_stopped() {
-            db.trigger_cancellation();
+        if db.storage().readers_stopped() {
+            db.storage_mut().resume_readers();
         }
         Some(db)
     }

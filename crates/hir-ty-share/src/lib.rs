@@ -19,7 +19,7 @@
 //! - Nothing here reads a dense id into a hash: items by their [`blaze_items`] keys, types by
 //!   content.
 //!
-//! Every query is salsa's, memoized by (instance, environment, options): a hit is one lookup.
+//! Every query is the query database's, memoized by (instance, environment, options): a hit is one lookup.
 //! A cycle of instances (polymorphic recursion, a recursive type's drop glue) gives every
 //! instance in it [`Unshared::Recursive`], the same whichever is asked first.
 
@@ -71,11 +71,11 @@ pub const VALUE_DOMAIN: &str = "blaze v2 share value 1";
 pub enum ShareDef {
     Fn(FunctionId),
     /// An `InternedClosureId`, without its database lifetime.
-    Closure(salsa::Id),
+    Closure(blaze_query::db::Id),
     /// An `InternedCoroutineId`: the `Future::poll` of an `async` block.
-    Coroutine(salsa::Id),
+    Coroutine(blaze_query::db::Id),
     /// The same of the future an `async` closure gives when called by value.
-    CoroutineByMove(salsa::Id),
+    CoroutineByMove(blaze_query::db::Id),
     /// `drop_in_place` of the instance's only argument.
     DropGlue,
     CallOnceShim,
@@ -178,7 +178,7 @@ impl ShareKey {
 /// Why an instance has no share key and is compiled for its arguments alone.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Unshared {
-    /// The instance is in a cycle of instances or types, which salsa gives this to all of.
+    /// The instance is in a cycle of instances or types, which the query engine gives this to all of.
     Recursive,
     /// A shim the code generator builds without MIR: kept per instance.
     Shim(&'static str),

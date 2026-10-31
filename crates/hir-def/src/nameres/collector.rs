@@ -27,7 +27,6 @@ use intern::{Symbol, sym};
 use itertools::izip;
 use la_arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
-use salsa::Database as _;
 use smallvec::SmallVec;
 use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID, SyntaxContext};
 use stdx::always;
@@ -986,7 +985,7 @@ impl<'db> DefCollector<'db> {
         'resolve_attr: loop {
             let _p = tracing::info_span!("resolve_macros loop").entered();
             'resolve_macros: loop {
-                self.db.unwind_if_revision_cancelled();
+                blaze_query::db::unwind_if_cancelled(self.db);
 
                 {
                     let _p = tracing::info_span!("resolve_imports loop").entered();
@@ -2689,7 +2688,7 @@ impl<'db> DefCollector<'db> {
             && exp.requires_session(self.db, def.krate)
         {
             // Equal expansion output still has state changes to replay next revision.
-            self.db.report_untracked_read();
+            blaze_query::db::report_untracked_read(self.db);
             self.def_map.session_macros = true;
         }
         let file_id = macro_call_id.into();

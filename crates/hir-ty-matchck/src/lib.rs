@@ -284,7 +284,7 @@ pub enum ManualPartialEq {
 
 /// Match checking of `def`, once per body: the closures and inline constants written in it are
 /// checked with it, as they are lowered with it.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn match_check(db: &Db, def: DefWithBodyId) -> MatchCheck {
     let infer = InferenceResult::of(db, def);
     // rustc's `thir_body` is `Err` for a body type checking found an error in.

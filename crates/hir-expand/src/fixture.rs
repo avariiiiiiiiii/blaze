@@ -61,7 +61,7 @@ use cfg::CfgOptions;
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use rustc_hash::FxHashSet;
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use span::Edition;
 use test_utils::{
     CURSOR_MARKER, ESCAPED_CURSOR_MARKER, Fixture as FixtureFile, FixtureWithProjectMeta,

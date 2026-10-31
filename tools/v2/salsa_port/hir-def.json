@@ -1,0 +1,848 @@
+{
+ "crate": "crates/hir-def",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/hir-def/src/attrs.rs",
+   "edits": [
+    {
+     "old": "//! if it is not present, we do not call the query, to prevent Salsa from needing to record\n",
+     "new": "//! if it is not present, we do not call the query, to keep the query database from needing to record\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/deps/signatures/ids.rs",
+   "edits": [
+    {
+     "old": "    hir::persist::{Kind, Relocation},\n",
+     "new": "    hir::persist::{Kind, Relocation, entry_id},\n"
+    },
+    {
+     "old": "        self.0.index(T::KIND.0, id.as_id().as_u32())\n",
+     "new": "        self.0.index(T::KIND.0, u64::from(id.as_id().as_u32()))\n"
+    },
+    {
+     "old": "        self.0.get(T::KIND.0, index).map(|bits| T::from_id(blaze_query::db::Id::from_u32(bits)))\n",
+     "new": "        self.0.get(T::KIND.0, index).map(|bits| T::from_id(entry_id(bits)))\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/deps/signatures/key.rs",
+   "edits": [
+    {
+     "old": "//! the same in every process (no salsa id), hashed into a [`ContentId`].\n",
+     "new": "//! the same in every process (no query database id), hashed into a [`ContentId`].\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/deps/signatures/table.rs",
+   "edits": [
+    {
+     "old": "        persist::{Kind, Relocation, syntax_context},\n",
+     "new": "        persist::{Kind, Relocation, entry_id, syntax_context},\n"
+    },
+    {
+     "old": "    T::from_id(blaze_query::db::Id::from_u32(bits))\n",
+     "new": "    T::from_id(entry_id(bits))\n"
+    },
+    {
+     "old": "    let outer = (Kind::Block, outer.as_id().as_u32());\n",
+     "new": "    let outer = (Kind::Block, u64::from(outer.as_id().as_u32()));\n"
+    },
+    {
+     "old": "    it.as_id().as_u32()\n",
+     "new": "    u64::from(it.as_id().as_u32())\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/expr_store/path.rs",
+   "edits": [
+    {
+     "old": "    assert!(size_of::<ModPath>() == 24);\n",
+     "new": "    assert!(size_of::<ModPath>() == 16);\n"
+    },
+    {
+     "old": "        LangItemTarget::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_bits(5 | (1 << 32))))\n",
+     "new": "        LangItemTarget::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_u32(5 + (1 << 20))))\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/expr_store/persist.rs",
+   "edits": [
+    {
+     "old": "            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, names_blank,\n            syntax_context, with_slots,\n",
+     "new": "            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, id_of_bits,\n            names_blank, syntax_context, with_slots,\n"
+    },
+    {
+     "old": "        /// Each block's salsa id, as its bits.\n",
+     "new": "        /// Each block's id, as its bits.\n"
+    },
+    {
+     "old": "        /// Each macro call's salsa id, as its bits, in lowering order.\n",
+     "new": "        /// Each macro call's id, as its bits, in lowering order.\n"
+    },
+    {
+     "old": "    id.as_id().as_u32()\n}\n\n/// The salsa id of `bits`, refused when salsa could not have made it.\nfn salsa_id(bits: u64) -> Option<blaze_query::db::Id> {\n    (bits as u32 != 0).then(|| blaze_query::db::Id::from_u32(bits))\n",
+     "new": "    u64::from(id.as_id().as_u32())\n"
+    },
+    {
+     "old": "            ensure(salsa_id(*block).is_some(), block, buffer, \"a block id of index 0\")?;\n",
+     "new": "            ensure(id_of_bits(*block).is_some(), block, buffer, \"a block id of 0 or past 32 bits\")?;\n"
+    },
+    {
+     "old": "            ensure(salsa_id(*call).is_some(), call, buffer, \"a macro call id of index 0\")?;\n",
+     "new": "            ensure(id_of_bits(*call).is_some(), call, buffer, \"a macro call id of 0 or past 32 bits\")?;\n"
+    },
+    {
+     "old": "            .filter_map(|&block| salsa_id(block))\n",
+     "new": "            .filter_map(|&block| id_of_bits(block))\n"
+    },
+    {
+     "old": "                <MacroCallId as FromId>::from_id(salsa_id(call).expect(\"checked when read\"))\n",
+     "new": "                <MacroCallId as FromId>::from_id(id_of_bits(call).expect(\"checked when read\"))\n"
+    },
+    {
+     "old": "crate::hir::persist::salsa_ids!(\n",
+     "new": "crate::hir::persist::query_ids!(\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/expr_store/persist/source_map.rs",
+   "edits": [
+    {
+     "old": "use super::{HAS_EXPRS, at_of, bits, ensure, idx, packed_bits, packed_of, raw, salsa_id};\n",
+     "new": "use super::{HAS_EXPRS, at_of, bits, ensure, idx, packed_bits, packed_of, raw};\n"
+    },
+    {
+     "old": "        persist::{Code, Column, Placed, Read, Words, WordsRec},\n",
+     "new": "        persist::{Code, Column, Placed, Read, Words, WordsRec, id_of_bits},\n"
+    },
+    {
+     "old": "    pub(crate) struct Src: 1 {\n        /// The salsa id of the file or of the macro call, as its bits.\n        pub(crate) file: u64,\n",
+     "new": "    pub(crate) struct Src: 1 {\n        /// The id of the file or of the macro call, as its bits.\n        pub(crate) file: u64,\n"
+    },
+    {
+     "old": "        /// The salsa id of the file or of the macro call, as its bits.\n",
+     "new": "        /// The id of the file or of the macro call, as its bits.\n"
+    },
+    {
+     "old": "    /// call's salsa id as its bits.\n",
+     "new": "    /// call's id as its bits.\n"
+    },
+    {
+     "old": "    let id = salsa_id(file)?;\n",
+     "new": "    let id = id_of_bits(file)?;\n"
+    },
+    {
+     "old": "    /// salsa id), the range, the syntax kind.\n",
+     "new": "    /// id), the range, the syntax kind.\n"
+    },
+    {
+     "old": "            FILE | MACRO_FILE => file_of(self.file_kind, self.file).ok_or(\"a salsa id of index 0\")?,\n",
+     "new": "            FILE | MACRO_FILE => file_of(self.file_kind, self.file).ok_or(\"an id of 0 or past 32 bits\")?,\n"
+    },
+    {
+     "old": "            ensure(file, run, buffer, \"a file run of a file kind out of range or salsa id 0\")?;\n",
+     "new": "            ensure(file, run, buffer, \"a file run of a file kind out of range or an id of 0 or past 32 bits\")?;\n"
+    },
+    {
+     "old": "        let call = |&call: &u64| salsa_id(call).is_some();\n",
+     "new": "        let call = |&call: &u64| id_of_bits(call).is_some();\n"
+    },
+    {
+     "old": "        salsa_id(call).map(<MacroCallId as FromId>::from_id)\n",
+     "new": "        id_of_bits(call).map(<MacroCallId as FromId>::from_id)\n"
+    },
+    {
+     "old": "                        salsa_id(call).expect(\"checked when the buffer was read\"),\n",
+     "new": "                        id_of_bits(call).expect(\"checked when the buffer was read\"),\n"
+    },
+    {
+     "old": "        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), 0)), \"a salsa id of 0\");\n",
+     "new": "        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), 0)), \"an id of 0\");\n        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)) + 4, 1)), \"an id past 32 bits\");\n"
+    },
+    {
+     "old": "        assert!(refused(&with_word(&bytes, keys + offset_of!(Src, file), 0)), \"a key's salsa id\");\n",
+     "new": "        assert!(refused(&with_word(&bytes, keys + offset_of!(Src, file), 0)), \"a key's id\");\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/expr_store/scope.rs",
+   "edits": [
+    {
+     "old": "// 16 bytes a block scope: a salsa id (index and generation) and an `Option` of an arena id,\n// which has no niche.\nconst _: () = assert!(size_of::<(BlockId, Option<LabelId>)>() == 16);\n",
+     "new": "// 12 bytes a block scope: an id (4) and an `Option` of an arena id, which has no niche.\nconst _: () = assert!(size_of::<(BlockId, Option<LabelId>)>() == 12);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/expr_store/source_map.rs",
+   "edits": [
+    {
+     "old": "/// neither): the file (files before macro files, each by its salsa id's bits), the range's start\n",
+     "new": "/// neither): the file (files before macro files, each by its id's bits), the range's start\n"
+    },
+    {
+     "old": "            HirFileId::FileId(file) => (1, file.as_id().as_u32()),\n            HirFileId::MacroFile(call) => (2, call.as_id().as_u32()),\n",
+     "new": "            HirFileId::FileId(file) => (1, u64::from(file.as_id().as_u32())),\n            HirFileId::MacroFile(call) => (2, u64::from(call.as_id().as_u32())),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/expr_store/tests/body/block.rs",
+   "edits": [
+    {
+     "old": "                [salsa id]: Id(583),\n",
+     "new": "                [id]: Id(583),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/find_path.rs",
+   "edits": [
+    {
+     "old": "    /// as its `salsa::Id`. Empty between top-level searches: each local search removes what it\n",
+     "new": "    /// as its `blaze_query::db::Id`. Empty between top-level searches: each local search removes what it\n"
+    },
+    {
+     "old": "/// what the tie-breaks compare. 28 bytes (the `PathKind` is 12: `DollarCrate` holds a salsa id),\n",
+     "new": "/// what the tie-breaks compare. 24 bytes (the `PathKind` is 8: `DollarCrate` holds an id),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/hir/columns.rs",
+   "edits": [
+    {
+     "old": "    id.map_or((0, 0), |id| {\n        let bits = id.as_id().as_u32();\n        (bits as u32, (bits >> 32) as u32)\n    })\n",
+     "new": "    id.map_or((0, 0), |id| (id.as_id().as_u32(), 0))\n"
+    },
+    {
+     "old": "        _ => Ok(Some(BlockId::from_id(blaze_query::db::Id::from_bits(\n            u64::from(low) | (u64::from(high) << 32),\n        )))),\n",
+     "new": "        (_, 0) => Ok(Some(BlockId::from_id(blaze_query::db::Id::from_u32(low)))),\n        _ => Err(\"a block id past 32 bits\"),\n"
+    },
+    {
+     "old": "    /// `BlockId`s are salsa ids the encoding layer already refuses at 0; they are not checked here.\n",
+     "new": "    /// `BlockId`s are ids the encoding layer already refuses at 0; they are not checked here.\n"
+    },
+    {
+     "old": "    fn macro_def(bits: u64) -> MacroDefId {\n",
+     "new": "    fn macro_def(bits: u32) -> MacroDefId {\n"
+    },
+    {
+     "old": "        let ast_id = FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(bits as u32));\n",
+     "new": "        let ast_id = FileAstId::from_erased_unchecked(ErasedFileAstId::from_raw(bits));\n"
+    },
+    {
+     "old": "    fn block_id(bits: u64) -> BlockId {\n",
+     "new": "    fn block_id(bits: u32) -> BlockId {\n"
+    },
+    {
+     "old": "                id: Some(block_id(3 | (7 << 32))),\n",
+     "new": "                id: Some(block_id(3 + (7 << 20))),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/hir/persist.rs",
+   "edits": [
+    {
+     "old": "//! What salsa interns or tracks (a crate, a file, a macro call, a block, a syntax context) is\n",
+     "new": "//! What the query database interns or tracks (a crate, a file, a macro call, a block, a syntax context) is\n"
+    },
+    {
+     "old": "/// `Code` for salsa's ids, as their bits: the database that wrote them is the one reading.\n",
+     "new": "/// `Code` for the query database's ids, as their bits: the database that wrote them is the one reading.\n"
+    },
+    {
+     "old": "macro_rules! salsa_ids {\n",
+     "new": "macro_rules! query_ids {\n"
+    },
+    {
+     "old": "                w.salsa_id(\n",
+     "new": "                w.query_id(\n"
+    },
+    {
+     "old": "                Ok(<$ty as blaze_query::db::FromId>::from_id(r.salsa_id_of(kind)?))\n",
+     "new": "                Ok(<$ty as blaze_query::db::FromId>::from_id(r.query_id_of(kind)?))\n"
+    },
+    {
+     "old": "pub(crate) use salsa_ids;\n",
+     "new": "pub(crate) use query_ids;\n"
+    },
+    {
+     "old": "/// What an id in a [`Relocation`] table is: which salsa type, or a syntax context, or a span's\n",
+     "new": "/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`, which no id is.\npub(crate) fn id_of_bits(bits: u64) -> Option<blaze_query::db::Id> {\n    u32::try_from(bits).ok().filter(|&it| it != 0).map(blaze_query::db::Id::from_u32)\n}\n\n/// The id of a [`Relocation`] entry's bits, which this database made.\npub(crate) fn entry_id(bits: u64) -> blaze_query::db::Id {\n    id_of_bits(bits).expect(\"a relocation entry of an id that is no id of this database\")\n}\n\n/// What an id in a [`Relocation`] table is: which query database type, or a syntax context, or a span's\n"
+    },
+    {
+     "old": "/// A salsa id type [`salsa_ids`] writes, by the kind its table entries are.\n",
+     "new": "/// An id type [`query_ids`] writes, by the kind its table entries are.\n"
+    },
+    {
+     "old": "    /// An id salsa made: its bits, or inside [`relocating`] its index in the table.\n    pub(crate) fn salsa_id(&mut self, kind: Kind, id: blaze_query::db::Id) {\n        let bits = id.as_bits();\n",
+     "new": "    /// An id the query database made: its bits as a `u64` word, or inside [`relocating`] its\n    /// index in the table.\n    pub(crate) fn query_id(&mut self, kind: Kind, id: blaze_query::db::Id) {\n        let bits = u64::from(id.as_u32());\n"
+    },
+    {
+     "old": "    /// The id of something salsa made, as [`salsa_ids`] wrote it outside [`relocating`].\n    pub(crate) fn salsa_id(&mut self) -> Result<blaze_query::db::Id, FormatError> {\n",
+     "new": "    /// The id of something the query database made, as [`query_ids`] wrote it outside\n    /// [`relocating`].\n    pub(crate) fn query_id(&mut self) -> Result<blaze_query::db::Id, FormatError> {\n"
+    },
+    {
+     "old": "        match bits as u32 {\n            0 => Err(self.invalid(\"a salsa id of index 0\")),\n            _ => Ok(blaze_query::db::Id::from_u32(bits)),\n        }\n",
+     "new": "        id_of_bits(bits).ok_or_else(|| self.invalid(\"an id of 0 or of more than 32 bits\"))\n"
+    },
+    {
+     "old": "    /// The id of something salsa made of `kind`, as [`Words::salsa_id`] wrote it: inside\n    /// [`relocating`], looked up in the table.\n    pub(crate) fn salsa_id_of(&mut self, kind: Kind) -> Result<blaze_query::db::Id, FormatError> {\n",
+     "new": "    /// The id of something the query database made of `kind`, as [`Words::query_id`] wrote it:\n    /// inside [`relocating`], looked up in the table.\n    pub(crate) fn query_id_of(&mut self, kind: Kind) -> Result<blaze_query::db::Id, FormatError> {\n"
+    },
+    {
+     "old": "            return self.salsa_id();\n",
+     "new": "            return self.query_id();\n"
+    },
+    {
+     "old": "        match bits as u32 {\n            0 => Err(self.invalid(\"a relocated salsa id of index 0\")),\n            _ => Ok(blaze_query::db::Id::from_u32(bits)),\n        }\n",
+     "new": "        id_of_bits(bits).ok_or_else(|| self.invalid(\"a relocated id of 0 or of more than 32 bits\"))\n"
+    },
+    {
+     "old": "salsa_ids!(base_db::Crate, base_db::EditionedFileId, MacroCallId, crate::BlockId);\n",
+     "new": "query_ids!(base_db::Crate, base_db::EditionedFileId, MacroCallId, crate::BlockId);\n"
+    },
+    {
+     "old": "    fn crate_of(bits: u64) -> base_db::Crate {\n",
+     "new": "    fn crate_of(bits: u32) -> base_db::Crate {\n"
+    },
+    {
+     "old": "    fn call_of(bits: u64) -> MacroCallId {\n",
+     "new": "    fn call_of(bits: u32) -> MacroCallId {\n"
+    },
+    {
+     "old": "        let bits = 5 | (3 << 32);\n        assert_eq!(words_of(&crate_of(bits), None), [5, 3]);\n",
+     "new": "        assert_eq!(words_of(&crate_of(5), None), [5, 0]);\n        let high = blaze_query::db::Id::MAX_U32;\n        assert_eq!(words_of(&crate_of(high), None), [high, 0]);\n"
+    },
+    {
+     "old": "        let bits = |it: base_db::Crate| blaze_query::db::AsId::as_id(&it).as_u32();\n",
+     "new": "        let bits = |it: base_db::Crate| u64::from(blaze_query::db::AsId::as_id(&it).as_u32());\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/hir/type_ref.rs",
+   "edits": [
+    {
+     "old": "            parent: GenericDefId::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_bits(\n                5 | (1 << 32),\n",
+     "new": "            parent: GenericDefId::FunctionId(FunctionId::from_id(blaze_query::db::Id::from_u32(\n                5 + (1 << 20),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/import_map.rs",
+   "edits": [
+    {
+     "old": "/// 16 bytes: the name's symbol (4), the module's salsa id (8) and three bytes of flags.\nconst _: () = assert!(size_of::<ImportInfo>() == 16);\n",
+     "new": "/// 12 bytes: the name's symbol (4), the module's id (4) and three bytes of flags.\nconst _: () = assert!(size_of::<ImportInfo>() == 12);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/item_hash.rs",
+   "edits": [
+    {
+     "old": "        persist::{Anonymous, Kind, Relocation, anonymous, relocating, syntax_context},\n",
+     "new": "        persist::{Anonymous, Kind, Relocation, anonymous, entry_id, relocating, syntax_context},\n"
+    },
+    {
+     "old": "    T::from_id(blaze_query::db::Id::from_u32(bits))\n",
+     "new": "    T::from_id(entry_id(bits))\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/item_scope.rs",
+   "edits": [
+    {
+     "old": "/// One name of one namespace and its [`Item`], packed as tags and salsa ids. Every field the\n",
+     "new": "/// One name of one namespace and its [`Item`], packed as tags and ids. Every field the\n"
+    },
+    {
+     "old": "/// 40 bytes (an `IndexMap` bucket of a `TypesItem` is 60: its hash, the name and 44 bytes of\n",
+     "new": "/// 24 bytes (an `IndexMap` bucket of a `TypesItem` is 48: its hash, the name and 32 bytes of\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<Option<blaze_query::db::Id>>() == 8);\nconst _: () = assert!(size_of::<Entry>() == 36);\n",
+     "new": "const _: () = assert!(size_of::<Option<blaze_query::db::Id>>() == 4);\nconst _: () = assert!(size_of::<Entry>() == 24);\n"
+    },
+    {
+     "old": "/// What an entry's definition is: a tag and, but for a builtin type, a salsa id.\n",
+     "new": "/// What an entry's definition is: a tag and, but for a builtin type, an id.\n"
+    },
+    {
+     "old": "/// What an entry was imported by: a tag, a salsa id and a use tree.\n",
+     "new": "/// What an entry was imported by: a tag, an id and a use tree.\n"
+    },
+    {
+     "old": "/// salsa backdated it would list differently) and the rest the same, `unresolved` and the maps\n",
+     "new": "/// the query database backdated it would list differently) and the rest the same, `unresolved` and the maps\n"
+    },
+    {
+     "old": "    /// A salsa id of no database: the scope only packs and compares it.\n",
+     "new": "    /// An id of no database: the scope only packs and compares it.\n"
+    },
+    {
+     "old": "        T::from_id(blaze_query::db::Id::from_bits((n % 7 + 1) | (n / 7) << 32))\n",
+     "new": "        let n = u32::try_from(n).expect(\"a test id below 2^32\");\n        T::from_id(blaze_query::db::Id::from_u32((n % 7 + 1) + ((n / 7) << 20)))\n"
+    },
+    {
+     "old": "    /// The sizes the notes give (`docs/v2/plan/lanes/db/speed-hir-nameres-scope.md`). Ids are\n    /// 8 bytes (salsa's index and generation).\n",
+     "new": "    /// The sizes the notes give (`docs/v2/plan/lanes/db/speed-hir-nameres-scope.md`), with\n    /// ids of 4 bytes (`blaze_query::db::Id`).\n"
+    },
+    {
+     "old": "        assert_eq!(size_of::<Entry>(), 40);\n",
+     "new": "        assert_eq!(size_of::<Entry>(), 24);\n"
+    },
+    {
+     "old": "        assert_eq!(size_of::<Visibility>(), 12);\n        assert_eq!(size_of::<ModuleDefId>(), 16);\n        assert_eq!(size_of::<TypesItem>(), 44);\n        assert_eq!(size_of::<ValuesItem>(), 44);\n        assert_eq!(size_of::<MacrosItem>(), 40);\n        assert_eq!(size_of::<PerNs>(), 128);\n",
+     "new": "        assert_eq!(size_of::<Visibility>(), 8);\n        assert_eq!(size_of::<ModuleDefId>(), 12);\n        assert_eq!(size_of::<TypesItem>(), 32);\n        assert_eq!(size_of::<ValuesItem>(), 32);\n        assert_eq!(size_of::<MacrosItem>(), 28);\n        assert_eq!(size_of::<PerNs>(), 92);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/item_tree.rs",
+   "edits": [
+    {
+     "old": "/// `Arc` so the last one is kept beside salsa without a copy.\n",
+     "new": "/// `Arc` so the last one is kept beside the query database without a copy.\n"
+    },
+    {
+     "old": "    /// The item tree of a source file, as columns (the module's docs), all in one block: a salsa\n",
+     "new": "    /// The item tree of a source file, as columns (the module's docs), all in one block: a query\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/item_tree/items.rs",
+   "edits": [
+    {
+     "old": "//! One query per file ([`super::file_item_tree_query`]) and no query per item. Beside salsa,\n",
+     "new": "//! One query per file ([`super::file_item_tree_query`]) and no query per item. Beside the query database,\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/item_tree/items/tests.rs",
+   "edits": [
+    {
+     "old": "/// An edit that changes no item gives back the kept tree itself: salsa sees the same value.\n",
+     "new": "/// An edit that changes no item gives back the kept tree itself: the query database sees the same value.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/lang_item.rs",
+   "edits": [
+    {
+     "old": "/// Salsa query. This will look for lang items in a specific crate.\n",
+     "new": "/// A query. This will look for lang items in a specific crate.\n"
+    },
+    {
+     "old": "/// Salsa query. Look for a lang items, starting from the specified crate and recursively\n",
+     "new": "/// A query. Look for a lang items, starting from the specified crate and recursively\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/lib.rs",
+   "edits": [
+    {
+     "old": "// An `AstId` is 16 bytes: the file 12 (a tag word and an id), the file-local id 4.\nconst _: () = assert!(size_of::<AstId<ast::Struct>>() == 16);\n",
+     "new": "// An `AstId` is 12 bytes: the file 8 (a tag word and an id), the file-local id 4.\nconst _: () = assert!(size_of::<AstId<ast::Struct>>() == 12);\n"
+    },
+    {
+     "old": "// 24 bytes per item (module 8, `AstId` 16), no padding; hashed in 3 Fx rounds (module, file,\n",
+     "new": "// 16 bytes per item (module 4, `AstId` 12), no padding; hashed in 3 Fx rounds (module, file,\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 24);\n",
+     "new": "const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 16);\n"
+    },
+    {
+     "old": "pub struct AssocItemLoc<N: AstIdNode> {\n    // FIXME: Store this as an erased `salsa::Id` to save space\n    pub container: ItemContainerId,\n",
+     "new": "pub struct AssocItemLoc<N: AstIdNode> {\n    // FIXME: Store this as an erased `blaze_query::db::Id` to save space\n    pub container: ItemContainerId,\n"
+    },
+    {
+     "old": "// 28 bytes per item (container 12: a tag word and an id, `AstId` 16); hashed in 3 Fx rounds\n",
+     "new": "// 20 bytes per item (container 8: a tag word and an id, `AstId` 12); hashed in 3 Fx rounds\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 28);\n",
+     "new": "const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 20);\n"
+    },
+    {
+     "old": "// 24 bytes per impl (adt 12, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 Fx rounds.\nconst _: () = assert!(size_of::<BuiltinDeriveImplLoc>() == 24);\n",
+     "new": "// 20 bytes per impl (adt 8, attr id 4, index 4, trait 1, 3 of padding); hashed in 3 Fx rounds.\nconst _: () = assert!(size_of::<BuiltinDeriveImplLoc>() == 20);\n"
+    },
+    {
+     "old": "// 28 bytes per variant (`AstId` 16, enum 8, name 4), no padding; hashed in 4 Fx rounds (file,\n",
+     "new": "// 20 bytes per variant (`AstId` 12, enum 4, name 4), no padding; hashed in 4 Fx rounds (file,\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<EnumVariantLoc>() == 28);\n",
+     "new": "const _: () = assert!(size_of::<EnumVariantLoc>() == 20);\n"
+    },
+    {
+     "old": "// 28 bytes per macro (module 8, `AstId` 16, expander 2, flag 1, edition 1), no padding; hashed\n",
+     "new": "// 20 bytes per macro (module 4, `AstId` 12, expander 2, flag 1, edition 1), no padding; hashed\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<Macro2Loc>() == 28);\n",
+     "new": "const _: () = assert!(size_of::<Macro2Loc>() == 20);\n"
+    },
+    {
+     "old": "// 28 bytes per macro (module 8, `AstId` 16, expander 2, flags 1, edition 1), no padding; hashed\n",
+     "new": "// 20 bytes per macro (module 4, `AstId` 12, expander 2, flags 1, edition 1), no padding; hashed\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<MacroRulesLoc>() == 28);\n",
+     "new": "const _: () = assert!(size_of::<MacroRulesLoc>() == 20);\n"
+    },
+    {
+     "old": "    /// deleted it, salsa panics or gives the fields of another `BlockId`; it is never UB\n    /// (salsa's `FromId` is safe for every lifetime).\n",
+     "new": "    /// deleted it, it gives the fields the `BlockId` last had (the query database frees no id);\n    /// it is never UB (`blaze_query::db::FromId` is safe for every lifetime).\n"
+    },
+    {
+     "old": "    /// deleted it, salsa panics or gives the fields of another `ModuleId`; it is never UB\n    /// (salsa's `FromId` is safe for every lifetime).\n",
+     "new": "    /// deleted it, it gives the fields the `ModuleId` last had (the query database frees no id);\n    /// it is never UB (`blaze_query::db::FromId` is safe for every lifetime).\n"
+    },
+    {
+     "old": "pub struct FieldId {\n    // FIXME: Store this as an erased `salsa::Id` to save space\n    pub parent: VariantId,\n",
+     "new": "pub struct FieldId {\n    // FIXME: Store this as an erased `blaze_query::db::Id` to save space\n    pub parent: VariantId,\n"
+    },
+    {
+     "old": "pub struct TypeOrConstParamId {\n    // FIXME: Store this as an erased `salsa::Id` to save space\n    pub parent: GenericDefId,\n",
+     "new": "pub struct TypeOrConstParamId {\n    // FIXME: Store this as an erased `blaze_query::db::Id` to save space\n    pub parent: GenericDefId,\n"
+    },
+    {
+     "old": "    // FIXME: Store this as an erased `salsa::Id` to save space\n",
+     "new": "    // FIXME: Store this as an erased `blaze_query::db::Id` to save space\n"
+    },
+    {
+     "old": "// NOTE: This type cannot be `salsa::Supertype` as its variants are overlapping.\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord /* !salsa::Supertype */)]\n",
+     "new": "// NOTE: This type cannot be `blaze_query::Supertype` as its variants are overlapping.\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord /* !blaze_query::Supertype */)]\n"
+    },
+    {
+     "old": "/// The item whose store it is, for a query keyed by it (`salsa::Zalsa::ids_of`, read by\n",
+     "new": "/// The item whose store it is, for a query keyed by it (`blaze_query::db::Storage::ids_of`, read by\n"
+    },
+    {
+     "old": "    /// An id of a salsa struct whose data no test reads.\n    fn salsa_id<T: FromId>(index: u32) -> T {\n",
+     "new": "    /// An id of an interned struct whose data no test reads.\n    fn query_id<T: FromId>(index: u32) -> T {\n"
+    },
+    {
+     "old": "            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(3)), raw(7)),\n            InFile::new(HirFileId::MacroFile(salsa_id::<MacroCallId>(3)), raw(7)),\n            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(4)), raw(7)),\n            InFile::new(HirFileId::FileId(salsa_id::<EditionedFileId>(3)), raw(8)),\n",
+     "new": "            InFile::new(HirFileId::FileId(query_id::<EditionedFileId>(3)), raw(7)),\n            InFile::new(HirFileId::MacroFile(query_id::<MacroCallId>(3)), raw(7)),\n            InFile::new(HirFileId::FileId(query_id::<EditionedFileId>(4)), raw(7)),\n            InFile::new(HirFileId::FileId(query_id::<EditionedFileId>(3)), raw(8)),\n"
+    },
+    {
+     "old": "            ItemContainerId::ModuleId(salsa_id(5)),\n            ItemContainerId::ImplId(salsa_id(5)),\n            ItemContainerId::TraitId(salsa_id(5)),\n            ItemContainerId::ExternBlockId(salsa_id(5)),\n            ItemContainerId::ModuleId(salsa_id(6)),\n",
+     "new": "            ItemContainerId::ModuleId(query_id(5)),\n            ItemContainerId::ImplId(query_id(5)),\n            ItemContainerId::TraitId(query_id(5)),\n            ItemContainerId::ExternBlockId(query_id(5)),\n            ItemContainerId::ModuleId(query_id(6)),\n"
+    },
+    {
+     "old": "            AdtId::StructId(salsa_id(5)),\n            AdtId::UnionId(salsa_id(5)),\n            AdtId::EnumId(salsa_id(5)),\n            AdtId::StructId(salsa_id(6)),\n",
+     "new": "            AdtId::StructId(query_id(5)),\n            AdtId::UnionId(query_id(5)),\n            AdtId::EnumId(query_id(5)),\n            AdtId::StructId(query_id(6)),\n"
+    },
+    {
+     "old": "            locs.push(ItemLoc { container: salsa_id(5), id });\n",
+     "new": "            locs.push(ItemLoc { container: query_id(5), id });\n"
+    },
+    {
+     "old": "        locs.push(ItemLoc { container: salsa_id(6), id: ast_ids()[0] });\n",
+     "new": "        locs.push(ItemLoc { container: query_id(6), id: ast_ids()[0] });\n"
+    },
+    {
+     "old": "            for parent in [salsa_id::<EnumId>(5), salsa_id(6)] {\n",
+     "new": "            for parent in [query_id::<EnumId>(5), query_id(6)] {\n"
+    },
+    {
+     "old": "        let base = Macro2Loc {\n            container: salsa_id(5),\n            id: ast_ids()[0],\n",
+     "new": "        let base = Macro2Loc {\n            container: query_id(5),\n            id: ast_ids()[0],\n"
+    },
+    {
+     "old": "        locs.push(Macro2Loc { container: salsa_id(6), ..base });\n",
+     "new": "        locs.push(Macro2Loc { container: query_id(6), ..base });\n"
+    },
+    {
+     "old": "        let base = MacroRulesLoc {\n            container: salsa_id(5),\n            id: ast_ids()[0],\n",
+     "new": "        let base = MacroRulesLoc {\n            container: query_id(5),\n            id: ast_ids()[0],\n"
+    },
+    {
+     "old": "        locs.push(MacroRulesLoc { container: salsa_id(6), ..base });\n",
+     "new": "        locs.push(MacroRulesLoc { container: query_id(6), ..base });\n"
+    },
+    {
+     "old": "            container: salsa_id(5),\n",
+     "new": "            container: query_id(5),\n"
+    },
+    {
+     "old": "        locs.push(ProcMacroLoc { container: salsa_id(6), ..base });\n",
+     "new": "        locs.push(ProcMacroLoc { container: query_id(6), ..base });\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/macro_expansion_tests/budgets.rs",
+   "edits": [
+    {
+     "old": "/// A miss of `parse_macro_expansion` (with its argument's `macro_arg`) allocates salsa's run\n/// cost, the argument tree and the expansion's parse and span map, nothing else: the expansion\n/// tree and the semicolon split are the run's frame's. The parse's cost is measured by parsing\n/// the same tokens outside the database, warm; salsa's run cost by the miss of a call that\n",
+     "new": "/// A miss of `parse_macro_expansion` (with its argument's `macro_arg`) allocates the query\n/// engine's run cost, the argument tree and the expansion's parse and span map, nothing else: the\n/// expansion tree and the semicolon split are the run's frame's. The parse's cost is measured by\n/// parsing the same tokens outside the database, warm; the engine's run cost by the miss of a call that\n"
+    },
+    {
+     "old": "    let salsa = run.allocations.saturating_sub(parse_cost(&empty) + arg_columns(&db, nothing));\n",
+     "new": "    let engine = run.allocations.saturating_sub(parse_cost(&empty) + arg_columns(&db, nothing));\n"
+    },
+    {
+     "old": "        base.allocations <= salsa + owned,\n        \"a miss: {} allocations; salsa's run {salsa}, its argument, parse and map {owned}\",\n",
+     "new": "        base.allocations <= engine + owned,\n        \"a miss: {} allocations; the engine's run {engine}, its argument, parse and map {owned}\",\n"
+    },
+    {
+     "old": "/// A miss of `macro_arg` for a derive's attribute call is the argument tree's columns and salsa's\n/// run cost (the same query for a derive of a unit struct, less its tree): the cfg walk's\n",
+     "new": "/// A miss of `macro_arg` for a derive's attribute call is the argument tree's columns and the\n/// query engine's run cost (the same query for a derive of a unit struct, less its tree): the cfg walk's\n"
+    },
+    {
+     "old": "    let salsa = run.allocations.saturating_sub(arg_columns(&db, unit));\n",
+     "new": "    let engine = run.allocations.saturating_sub(arg_columns(&db, unit));\n"
+    },
+    {
+     "old": "        miss.allocations <= salsa + owned,\n        \"`macro_arg` of a derive: {} allocations; salsa's run {salsa}, its tree {owned}\",\n",
+     "new": "        miss.allocations <= engine + owned,\n        \"`macro_arg` of a derive: {} allocations; the engine's run {engine}, its tree {owned}\",\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres.rs",
+   "edits": [
+    {
+     "old": "        // `Modules::module` query); salsa ids carry a generation, so a freed one matches no later id.\n",
+     "new": "        // `Modules::module` query); the query database never frees an id, so none is reused.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/collector.rs",
+   "edits": [
+    {
+     "old": "use blaze_query::db::Database as _;\n",
+     "new": ""
+    },
+    {
+     "old": "                self.db.unwind_if_revision_cancelled();\n",
+     "new": "                blaze_query::db::unwind_if_cancelled(self.db);\n"
+    },
+    {
+     "old": "            self.db.report_untracked_read();\n",
+     "new": "            blaze_query::db::report_untracked_read(self.db);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/delta/run.rs",
+   "edits": [
+    {
+     "old": "            salsa::Database::unwind_if_revision_cancelled(db);\n",
+     "new": "            blaze_query::db::unwind_if_cancelled(db);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/delta/state.rs",
+   "edits": [
+    {
+     "old": "//! The maintainer's state per crate (design \u00a76), outside salsa: what the last run of each group\n",
+     "new": "//! The maintainer's state per crate (design \u00a76), outside the query database: what the last run of each group\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/delta/tests/cost.rs",
+   "edits": [
+    {
+     "old": "//! binding woke; `slices`, the salsa inputs set; `keys`, the `(module, name)` bindings that\n",
+     "new": "//! binding woke; `slices`, the query inputs set; `keys`, the `(module, name)` bindings that\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/delta/tests/trace.rs",
+   "edits": [
+    {
+     "old": "//! maintainer executes during the write, read off salsa's `WillExecute` events\n",
+     "new": "//! maintainer executes during the write, read off the query database's `WillExecute` events\n"
+    },
+    {
+     "old": "                salsa::Database::ingredient_debug_name(&*db, database_key.ingredient_index()).to_string(),\n",
+     "new": "                blaze_query::db::Database::storage(&*db).ingredient_name(database_key.ingredient_index()).to_owned(),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/facts.rs",
+   "edits": [
+    {
+     "old": "/// The `ModuleScope` (as `salsa::Id`) of a `ScopeSlot::Fact(scope)`.\n",
+     "new": "/// The `ModuleScope` (as `blaze_query::db::Id`) of a `ScopeSlot::Fact(scope)`.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/facts/collect.rs",
+   "edits": [
+    {
+     "old": "use blaze_query::db::Database as _;\n",
+     "new": ""
+    },
+    {
+     "old": "        db.report_untracked_read();\n",
+     "new": "        blaze_query::db::report_untracked_read(db);\n"
+    },
+    {
+     "old": "        // which a value naming this id is live re-creates it and salsa keeps it\n",
+     "new": "        // which a value naming this id is live re-creates it and the query database keeps it\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/facts/driver.rs",
+   "edits": [
+    {
+     "old": "    while queries::round_kind(db, RoundKey::new(db, krate, r)) != RoundKind::Final {\n        salsa::Database::unwind_if_revision_cancelled(db);\n        r += 1;\n",
+     "new": "    while queries::round_kind(db, RoundKey::new(db, krate, r)) != RoundKind::Final {\n        blaze_query::db::unwind_if_cancelled(db);\n        r += 1;\n"
+    },
+    {
+     "old": "            salsa::Database::unwind_if_revision_cancelled(db);\n",
+     "new": "            blaze_query::db::unwind_if_cancelled(db);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/facts/queries.rs",
+   "edits": [
+    {
+     "old": "//! The salsa queries of the per-module resolver (`docs/v2/plan/lanes/frontend/nameres.md` \u00a73,\n",
+     "new": "//! The queries of the per-module resolver (`docs/v2/plan/lanes/frontend/nameres.md` \u00a73,\n"
+    },
+    {
+     "old": "    /// Each member's `ModuleScope` (as `salsa::Id`), in `members` order.\n",
+     "new": "    /// Each member's `ModuleScope` (as `blaze_query::db::Id`), in `members` order.\n"
+    },
+    {
+     "old": "/// struct itself. Its interned arguments are never collected: collecting them drops the memo and\n/// deletes the module it made, whose id published scopes of other crates still hold, and salsa\n/// gives that id to the next module made.\n",
+     "new": "/// struct itself. Its interned arguments are never collected: the query database frees no id,\n/// so the module it made keeps its id for the published scopes of other crates that hold it.\n"
+    },
+    {
+     "old": "/// The `ModuleScope` (as `salsa::Id`) a `ScopeSlot::Fact` names.\n",
+     "new": "/// The `ModuleScope` (as `blaze_query::db::Id`) a `ScopeSlot::Fact` names.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/facts/tests/active.rs",
+   "edits": [
+    {
+     "old": "//! crate cold, reads which resolver queries ran at round 2 off salsa's `WillExecute` events,\n",
+     "new": "//! crate cold, reads which resolver queries ran at round 2 off the query database's `WillExecute` events,\n"
+    },
+    {
+     "old": "                salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())\n                    .to_string(),\n",
+     "new": "                blaze_query::db::Database::storage(db)\n                    .ingredient_name(database_key.ingredient_index())\n                    .to_owned(),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/facts/tests/impls.rs",
+   "edits": [
+    {
+     "old": "                let name = salsa::Database::ingredient_debug_name(\n                    base,\n                    database_key.ingredient_index(),\n                );\n",
+     "new": "                let name = blaze_query::db::Database::storage(base)\n                    .ingredient_name(database_key.ingredient_index());\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/facts/tests/trace.rs",
+   "edits": [
+    {
+     "old": "//! What an edit reruns: the resolver's queries a revision executes, read off salsa's\n",
+     "new": "//! What an edit reruns: the resolver's queries a revision executes, read off the query database's\n"
+    },
+    {
+     "old": "                salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())\n                    .to_string(),\n",
+     "new": "                blaze_query::db::Database::storage(db)\n                    .ingredient_name(database_key.ingredient_index())\n                    .to_owned(),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/frozen.rs",
+   "edits": [
+    {
+     "old": "//! The bytes name nothing by a salsa id: a file is the crate it belongs to and its path from\n",
+     "new": "//! The bytes name nothing by a query database id: a file is the crate it belongs to and its path from\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/tests/imports.rs",
+   "edits": [
+    {
+     "old": "use super::*;\r\n\r\n#[test]\r\nfn kw_path_renames() {\r\n    check(\r\n        r#\"\r\nmacro_rules! m {\r\n    () => {\r\n        pub use $crate as dollar_crate;\r\n        pub use $crate::{self as self_dollar_crate};\r\n    };\r\n}\r\n\r\npub use self as this;\r\npub use crate as krate;\r\n\r\npub use crate::{self as self_krate};\r\nm!();\r\n\r\nmod foo {\r\n    pub use super as zuper;\r\n    pub use super::{self as self_zuper};\r\n}\r\n\"#,\r\n        expect![[r#\"\r\n            crate\r\n            - dollar_crate : type (import)\r\n            - foo : type\r\n            - krate : type (import)\r\n            - self_dollar_crate : type (import)\r\n            - self_krate : type (import)\r\n            - this : type (import)\r\n            - (legacy) m : macro!\r\n\r\n            crate::foo\r\n            - self_zuper : type (import)\r\n            - zuper : type (import)\r\n            - (legacy) m : macro!\r\n        \"#]],\r\n    );\r\n}\r\n\r\n#[test]\r\nfn trailing_self_import() {\r\n    check(\r\n        r#\"\r\nmod fmt {\r\n    pub struct Thing;\r\n}\r\npub use fmt::self as alias;\r\n\"#,\r\n        expect![[r#\"\r\n            crate\r\n            - alias : type (import)\r\n            - fmt : type\r\n\r\n            crate::fmt\r\n            - Thing : type value\r\n        \"#]],\r\n    );\r\n}\r\n\r\n#[test]\r\nfn primitive_reexport() {\r\n    check(\r\n        r#\"\r\n//- /lib.rs\r\nmod foo;\r\nuse foo::int;\r\n\r\n//- /foo.rs\r\npub use i32 as int;\r\n\"#,\r\n        expect![[r#\"\r\n            crate\r\n            - foo : type\r\n            - int : type (import)\r\n\r\n            crate::foo\r\n            - int : type (import)\r\n        \"#]],\r\n    );\r\n}\r\n",
+     "new": "use super::*;\n\n#[test]\nfn kw_path_renames() {\n    check(\n        r#\"\nmacro_rules! m {\n    () => {\n        pub use $crate as dollar_crate;\n        pub use $crate::{self as self_dollar_crate};\n    };\n}\n\npub use self as this;\npub use crate as krate;\n\npub use crate::{self as self_krate};\nm!();\n\nmod foo {\n    pub use super as zuper;\n    pub use super::{self as self_zuper};\n}\n\"#,\n        expect![[r#\"\n            crate\n            - dollar_crate : type (import)\n            - foo : type\n            - krate : type (import)\n            - self_dollar_crate : type (import)\n            - self_krate : type (import)\n            - this : type (import)\n            - (legacy) m : macro!\n\n            crate::foo\n            - self_zuper : type (import)\n            - zuper : type (import)\n            - (legacy) m : macro!\n        \"#]],\n    );\n}\n\n#[test]\nfn trailing_self_import() {\n    check(\n        r#\"\nmod fmt {\n    pub struct Thing;\n}\npub use fmt::self as alias;\n\"#,\n        expect![[r#\"\n            crate\n            - alias : type (import)\n            - fmt : type\n\n            crate::fmt\n            - Thing : type value\n        \"#]],\n    );\n}\n\n#[test]\nfn primitive_reexport() {\n    check(\n        r#\"\n//- /lib.rs\nmod foo;\nuse foo::int;\n\n//- /foo.rs\npub use i32 as int;\n\"#,\n        expect![[r#\"\n            crate\n            - foo : type\n            - int : type (import)\n\n            crate::foo\n            - int : type (import)\n        \"#]],\n    );\n}\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/tests/stale_ids.rs",
+   "edits": [
+    {
+     "old": "//! A `ModuleId` kept across revisions that delete its module and make others: salsa panics, or\n//! reads the fields of a module of the same type, never UB (the contract of\n//! `ModuleIdLt::to_static`, a safe `fn` over salsa's `FromId`). `blaze test --ub` runs this under\n",
+     "new": "//! A `ModuleId` kept across revisions that delete its module and make others: the query\n//! database reads the fields the module last had, never UB (the contract of\n//! `ModuleIdLt::to_static`, a safe `fn` over `blaze_query::db::FromId`). `blaze test --ub` runs this under\n"
+    },
+    {
+     "old": "    // New modules, so salsa may hand `foo`'s freed slot to one of them.\n",
+     "new": "    // New modules, which must not be handed `foo`'s id.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/nameres/uses.rs",
+   "edits": [
+    {
+     "old": "//! A lookup records nothing as it goes, so salsa sees no side effect. Once a def map's fixed\n",
+     "new": "//! A lookup records nothing as it goes, so the query database sees no side effect. Once a def map's fixed\n"
+    },
+    {
+     "old": "//! them, never sorted by salsa id, so they are the same bytes in every run.\n",
+     "new": "//! them, never sorted by id, so they are the same bytes in every run.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/signatures.rs",
+   "edits": [
+    {
+     "old": "    /// Compared by its content, not a hash of it: salsa compares a new value with the old one\n",
+     "new": "    /// Compared by its content, not a hash of it: the query database compares a new value with the old one\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-def/src/visibility.rs",
+   "edits": [
+    {
+     "old": "// A module id (8 bytes) and the explicitness, whose spare values tag the other two.\nconst _: () = assert!(size_of::<Visibility>() <= 12);\n",
+     "new": "// A module id (4 bytes) and the explicitness, whose spare values tag the other two.\nconst _: () = assert!(size_of::<Visibility>() <= 8);\n"
+    }
+   ]
+  }
+ ]
+}

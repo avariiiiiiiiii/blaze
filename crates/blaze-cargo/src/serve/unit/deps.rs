@@ -572,7 +572,7 @@ fn on_pool(count: usize, task: &(dyn Fn(usize) + Sync)) {
                 let (panicked, again) = (&panicked, &again);
                 scope.submit(near, move || task(at), move |ran| {
                     let Err(panic) = ran else { return };
-                    if matches!(panic.downcast_ref::<salsa::Cancelled>(), Some(salsa::Cancelled::WouldWaitOnItself)) {
+                    if matches!(panic.downcast_ref::<blaze_query::db::Cancelled>(), Some(blaze_query::db::Cancelled::WouldWaitOnItself)) {
                         again.lock().unwrap_or_else(|it| it.into_inner()).push(at);
                     } else {
                         panicked.lock().unwrap_or_else(|it| it.into_inner()).get_or_insert(panic);

@@ -40,7 +40,7 @@ use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use rustc_hash::FxHashMap;
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use smallvec::SmallVec;
 use span::Edition;
 
@@ -64,8 +64,8 @@ use crate::{
         col::{Col, SlabLayout, SlabWriter},
         columns::{self, Frozen, HirColumns},
         persist::{
-            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, names_blank,
-            syntax_context, with_slots,
+            Code, Column, Node, Placed, Read, Words, WordsRec, blank_segments, id_of_bits,
+            names_blank, syntax_context, with_slots,
         },
     },
     lang_item::LangItemTarget,
@@ -152,9 +152,9 @@ blaze_format::record! {
         pub(crate) lifetimes: Slice<Node>,
         /// The owner of each binding, or [`NO_OWNER`]; empty when the top level owns them all.
         pub(crate) binding_owners: Slice<u32>,
-        /// Each block's salsa id, as its bits.
+        /// Each block's id, as its bits.
         pub(crate) block_scopes: Slice<u64>,
-        /// Each macro call's salsa id, as its bits, in lowering order.
+        /// Each macro call's id, as its bits, in lowering order.
         pub(crate) macro_calls: Slice<u64>,
         /// The packed id and the syntax context, by packed id in increasing order.
         pub(crate) ident_hygiene: Slice<IdPair>,
@@ -269,12 +269,7 @@ fn idx<T>(raw: u32) -> Idx<T> {
 }
 
 fn bits(id: impl AsId) -> u64 {
-    id.as_id().as_bits()
-}
-
-/// The salsa id of `bits`, refused when salsa could not have made it.
-fn salsa_id(bits: u64) -> Option<salsa::Id> {
-    (bits as u32 != 0).then(|| salsa::Id::from_bits(bits))
+    u64::from(id.as_id().as_u32())
 }
 
 /// Where `value`, which is in `buffer`, is from the buffer's start.
@@ -1193,10 +1188,10 @@ impl<'a> ExpressionStoreRef<'a> {
             ensure(*owner == NO_OWNER || *owner < exprs, owner, buffer, "a binding owner past the expressions")?;
         }
         for block in self.block_scopes {
-            ensure(salsa_id(*block).is_some(), block, buffer, "a block id of index 0")?;
+            ensure(id_of_bits(*block).is_some(), block, buffer, "a block id of 0 or past 32 bits")?;
         }
         for call in self.macro_calls {
-            ensure(salsa_id(*call).is_some(), call, buffer, "a macro call id of index 0")?;
+            ensure(id_of_bits(*call).is_some(), call, buffer, "a macro call id of 0 or past 32 bits")?;
         }
         ascending(self.ident_hygiene, |it| it.a, buffer, "ident hygiene out of order")?;
         for pair in self.ident_hygiene {
@@ -1310,7 +1305,7 @@ impl<'a> ExpressionStoreRef<'a> {
     /// The blocks of the store that may hold items, as [`ExpressionStore::blocks`] walks them.
     pub fn block_scopes(self) -> impl Iterator<Item = BlockId> + 'a {
         (self.block_scopes.iter())
-            .filter_map(|&block| salsa_id(block))
+            .filter_map(|&block| id_of_bits(block))
             .map(<BlockId as FromId>::from_id)
     }
 
@@ -1509,7 +1504,7 @@ impl<'a> ExpressionStoreRef<'a> {
         });
         let macro_calls = (self.macro_calls.iter())
             .map(|&call| {
-                <MacroCallId as FromId>::from_id(salsa_id(call).expect("checked when read"))
+                <MacroCallId as FromId>::from_id(id_of_bits(call).expect("checked when read"))
             })
             // alloc: the decode's one copy of the column.
             .collect();
@@ -1827,7 +1822,7 @@ macro_rules! sum_codes {
     )*};
 }
 
-crate::hir::persist::salsa_ids!(
+crate::hir::persist::query_ids!(
     FunctionId,
     StructId,
     UnionId,

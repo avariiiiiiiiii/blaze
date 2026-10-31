@@ -1,0 +1,28 @@
+{
+ "crate": "crates/blaze-cargo",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/blaze-cargo/src/serve/unit/codegen.rs",
+   "edits": [
+    {
+     "old": "/// thread of the build reads the one database of the task's reader by reference: salsa's reads\n/// take `&self`, so none waits on another and none is cloned.\n",
+     "new": "/// thread of the build reads the one database of the task's reader by reference: the query\n/// engine's reads take `&self`, so none waits on another and none is cloned.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/blaze-cargo/src/serve/work.rs",
+   "edits": [
+    {
+     "old": "//! with no lock, no clone of the database and no cancellation. The tables are measured, which\n//! salsa does only with the database exclusive: their task, the front end's last use, is\n",
+     "new": "//! with no lock, no clone of the database and no cancellation. The tables are measured with\n//! the database exclusive, so no reader adds to them: their task, the front end's last use, is\n"
+    },
+    {
+     "old": "    /// tables (name, elements, bytes), measured with it exclusive, as salsa measures; an\n",
+     "new": "    /// tables (name, elements, bytes), measured with it exclusive; an\n"
+    }
+   ]
+  }
+ ]
+}

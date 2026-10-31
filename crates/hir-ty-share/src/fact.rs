@@ -297,7 +297,7 @@ impl<'db> Cx<'db> {
     }
 }
 
-#[salsa::tracked(returns(ref), cycle_result = fact_cycle)]
+#[blaze_query::tracked(returns(ref), cycle_result = fact_cycle)]
 fn fact(
     db: &Db,
     ty: StoredTy,
@@ -311,7 +311,7 @@ fn fact(
 
 fn fact_cycle(
     _: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: StoredTy,
     _: StoredParamEnvAndCrate,
 ) -> Result<ContentId, Unshared> {

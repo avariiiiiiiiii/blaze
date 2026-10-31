@@ -1,0 +1,66 @@
+{
+ "crate": "crates/hir-expand",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/hir-expand/src/files.rs",
+   "edits": [
+    {
+     "old": "/// It is stable across reparses, and can be used as salsa key/value.\n",
+     "new": "/// It is stable across reparses, and can be used as a query key or value.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-expand/src/lib.rs",
+   "edits": [
+    {
+     "old": "        // Shared, as `attr_args` is: salsa clones an interned key, and a token tree is never cloned.\n",
+     "new": "        // Shared, as `attr_args` is: the query engine clones an interned key, and a token tree is never cloned.\n"
+    },
+    {
+     "old": "    /// non-determinism breaks salsa in a very, very, very bad way.\n",
+     "new": "    /// non-determinism breaks the query engine in a very, very, very bad way.\n"
+    },
+    {
+     "old": "/// reason why we use salsa at all.\n",
+     "new": "/// reason why we use a query engine at all.\n"
+    },
+    {
+     "old": "    /// Written recursively rather than as a loop so that salsa memoizes each file's depth. Callers\n",
+     "new": "    /// Written recursively rather than as a loop so that the query engine memoizes each file's depth. Callers\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-expand/src/mod_path.rs",
+   "edits": [
+    {
+     "old": "/// A path's kind and its segments. 24 bytes, `Copy`: the segments are interned once per\n",
+     "new": "/// A path's kind and its segments. 16 bytes, `Copy`: the segments are interned once per\n"
+    },
+    {
+     "old": "/// exists), so equality and hashing are three words and a clone is a copy. `None` is no segments.\n",
+     "new": "/// exists), so equality and hashing are two words and a clone is a copy. `None` is no segments.\n"
+    },
+    {
+     "old": "const _: () = assert!(size_of::<ModPath>() == 24);\n",
+     "new": "const _: () = assert!(size_of::<ModPath>() == 16);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/hir-expand/src/name.rs",
+   "edits": [
+    {
+     "old": "        // Can't do that for all `SyntaxContextId`s because it breaks Salsa.\n",
+     "new": "        // Can't do that for all `SyntaxContextId`s because it breaks the query engine.\n"
+    },
+    {
+     "old": "    /// salsa though, so we punt on that bit for a moment.\n",
+     "new": "    /// the query engine though, so we punt on that bit for a moment.\n"
+    }
+   ]
+  }
+ ]
+}

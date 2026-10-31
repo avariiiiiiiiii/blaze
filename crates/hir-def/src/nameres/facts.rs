@@ -85,14 +85,14 @@ pub(super) fn collect_block(
     driver::collect_block(db, frame, def_map, tree_id, crate_local_def_map)
 }
 
-/// The `ModuleScope` (as `salsa::Id`) of a `ScopeSlot::Fact(scope)`.
-pub(super) fn fact_scope(db: &Db, scope: salsa::Id) -> salsa::Id {
-    let scope = <queries::ScopeRef as salsa::plumbing::FromId>::from_id(scope);
+/// The `ModuleScope` (as `blaze_query::db::Id`) of a `ScopeSlot::Fact(scope)`.
+pub(super) fn fact_scope(db: &Db, scope: blaze_query::db::Id) -> blaze_query::db::Id {
+    let scope = <queries::ScopeRef as blaze_query::db::FromId>::from_id(scope);
     queries::scope_of(db, scope)
 }
 
 /// The row of `module` in a resolver view (`ModulesSlot::Unit`) that does not hold it.
-pub(super) fn row(db: &Db, rows: salsa::Id, module: ModuleId) -> Option<&ModuleData> {
-    let rows = <queries::RowsKey as salsa::plumbing::FromId>::from_id(rows);
+pub(super) fn row(db: &Db, rows: blaze_query::db::Id, module: ModuleId) -> Option<&ModuleData> {
+    let rows = <queries::RowsKey as blaze_query::db::FromId>::from_id(rows);
     queries::row(db, rows, module).as_ref()
 }

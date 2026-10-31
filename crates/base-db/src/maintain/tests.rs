@@ -7,7 +7,7 @@
 use std::{cell::RefCell, panic};
 
 use blaze_dbsp::Work;
-use salsa::Durability;
+use blaze_query::db::Durability;
 use span::Edition;
 use triomphe::Arc;
 use crate::{AbsPathBuf, FileId, FileSet, VfsPath};

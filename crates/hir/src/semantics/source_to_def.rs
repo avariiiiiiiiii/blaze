@@ -279,7 +279,7 @@ impl ChildContainer {
 /// empty and rebuild every `DynMap` it reads.
 #[derive(Default)]
 struct Carry {
-    at: Option<(base_db::Nonce, salsa::Revision)>,
+    at: Option<(base_db::Nonce, blaze_query::db::View)>,
     dynmap_cache: FxHashMap<(ChildContainer, HirFileId), DynMap>,
     expansion_at: FxHashMap<MacroCallId, u32>,
     /// Always empty: its storage, for the next `Semantics`' expansions.

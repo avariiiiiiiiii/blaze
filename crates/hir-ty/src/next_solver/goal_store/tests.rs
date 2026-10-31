@@ -23,7 +23,7 @@ use hir_def::{
 };
 use rustc_hash::FxHashMap;
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
-use salsa::Setter;
+use blaze_query::db::Setter;
 use hir_expand::fixture;
 
 use super::{
@@ -109,7 +109,7 @@ const KNOB: FactRef = FactRef { kind: QueryKind(0x1000), subject: ContentId([3; 
 
 /// A stand-in for what a goal's evaluation reads: `value` is its fact; `holds`, the answer, is
 /// read outside the capture, as a read the facts would miss.
-#[salsa::input]
+#[blaze_query::input]
 struct Knob {
     #[returns(copy)]
     value: u32,
@@ -204,7 +204,7 @@ impl GoalFacts for TestFacts {
         CRATE
     }
 
-    fn fact_of(&self, _: &Db, _: salsa::DatabaseKeyIndex, name: &'static str) -> Option<FactRef> {
+    fn fact_of(&self, _: &Db, _: blaze_query::db::DatabaseKeyIndex, name: &'static str) -> Option<FactRef> {
         self.names.lock().unwrap().push(name);
         self.expressible.then_some(KNOB)
     }
@@ -479,11 +479,11 @@ fn a_goal_reads_back_from_its_stable_form_and_its_record() {
 }
 
 /// Offers [`the_goal`] with the reads of reading the knob's value, answered by `holds`.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn offered(db: &Db, knob: Knob) -> u32 {
     let interner = DbInterner::new_with(db, knob.krate(db));
     let answer = if knob.holds(db) { Answer::Holds } else { Answer::Fails };
-    let (value, reads) = salsa::capture_reads(db, || knob.value(db));
+    let (value, reads) = blaze_query::db::capture_reads(db, || knob.value(db));
     offer_goal(interner, the_goal(interner), answer, reads.expect("an input's read is shareable"));
     value
 }
@@ -575,12 +575,12 @@ fn a_database_finds_only_its_own_store() {
 }
 
 /// Offers [`the_goal`] under [`assert_at_most`]: with no store, nothing is allocated.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn offered_with_no_store(db: &Db, knob: Knob) -> u32 {
     let interner = DbInterner::new_with(db, knob.krate(db));
     let goal = the_goal(interner);
     let key = GoalKey::of(goal.predicate, ParamEnv::empty(), TypingMode::PostAnalysis).expect("a global goal");
-    let (value, reads) = salsa::capture_reads(db, || knob.value(db));
+    let (value, reads) = blaze_query::db::capture_reads(db, || knob.value(db));
     let reads = reads.expect("an input's read is shareable");
     offer(interner, key, Answer::Holds, reads);
     assert_at_most(0, "a goal-store offer with no store installed", || offer(interner, key, Answer::Holds, reads));

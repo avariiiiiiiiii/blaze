@@ -13,7 +13,7 @@
 //!   edit elsewhere in the file moves no index, and a formatting edit changes the table only
 //!   ([`ItemHashes::span_tables`]).
 //!
-//! Nothing here is shared between threads but salsa's memos: no lock on any path.
+//! Nothing here is shared between threads but the query database's memos: no lock on any path.
 
 #[cfg(test)]
 mod tests;
@@ -32,7 +32,7 @@ use hir_ty_share::{
     code::{self, TABLES},
     identity,
 };
-use salsa::plumbing::FromId;
+use blaze_query::db::FromId;
 
 use super::{Body, Hashes};
 
@@ -157,7 +157,7 @@ struct Anchors([ContentId; TABLES]);
 
 /// The anchors of a body's span tables: of the key of its store, which an edit of what the
 /// body is keeps.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn anchors(db: &Db, owner: DefWithBodyId) -> Anchors {
     let store = key::store_key(db, ExpressionStoreOwnerId::Body(owner));
     Anchors(std::array::from_fn(|table| {

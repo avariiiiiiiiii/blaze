@@ -21,7 +21,7 @@ smallvec.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 triomphe.workspace = true
 la-arena.workspace = true
-salsa.workspace = true
+blaze-query.workspace = true
 
 rustc_type_ir.workspace = true
 

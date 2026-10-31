@@ -961,7 +961,7 @@ impl<'db, 'f> StepSink<'db, 'f> {
         let module = queries::round_modules(db, round).order[at as usize];
         let handle = queries::fact_handle(db, queries::fact_key(db, round, at));
         let ran = FactKey::new(db, module, krate, queries::ran_by(db, round, at));
-        let scope = <ModuleScope<'_> as salsa::plumbing::FromId>::from_id(handle);
+        let scope = <ModuleScope<'_> as blaze_query::db::FromId>::from_id(handle);
         let data = ModuleData::with_scope(
             row.origin,
             row.visibility,
@@ -980,7 +980,7 @@ impl<'db, 'f> StepSink<'db, 'f> {
             krate,
             block: None,
             root: queries::crate_root(db, krate),
-            modules: ModulesSlot::Unit { own, rows: salsa::plumbing::AsId::as_id(&rows) },
+            modules: ModulesSlot::Unit { own, rows: blaze_query::db::AsId::as_id(&rows) },
             prelude: None,
             macro_use_prelude: FxHashMap::default(),
             derive_helpers_in_scope: FxHashMap::default(),

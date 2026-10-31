@@ -74,11 +74,11 @@ class Rewrites(unittest.TestCase):
         self.assertTrue(any("generation" in why for _, why in hand(text)))
 
     def test_comments_and_strings_are_not_rewritten(self) -> None:
-        text = '// salsa::Id here\nconst A: &str = "salsa::tracked";\n#[cfg(feature = "salsa")]\nfn f() {}\n'
+        text = '// salsa::Id here\nconst A: &str = "salsa::tracked";\nfn f() {}\n'
         result = s.migrate(text)
         self.assertEqual(result.text, text)
         kinds = sorted((it.line, it.kind) for it in result.left)
-        self.assertEqual(kinds, [(1, "comment"), (2, "string"), (3, "hand")])
+        self.assertEqual(kinds, [(1, "comment"), (2, "string")])
 
 
 class Left(unittest.TestCase):
@@ -97,15 +97,51 @@ class Left(unittest.TestCase):
         self.assertEqual(lines, [3, 4, 6, 7])
         self.assertIn("impl blaze_query::db::NamesIds for A {}", s.migrate(text).text)
 
-    def test_unsized_generic_database(self) -> None:
+    def test_unsized_generic_database_is_no_case(self) -> None:
         text = "pub fn text<'db, Db: ?Sized + salsa::Database>(self, db: &'db Db) {}\n"
-        self.assertTrue(any("?Sized" in why for _, why in hand(text)))
+        self.assertEqual(hand(text), [])
 
     def test_lines_are_the_new_files(self) -> None:
         text = "use salsa::SalsaValue;\nuse salsa::Durability;\nfn f() { salsa::DatabaseImpl::new(); }\n"
         result = s.migrate(text)
         self.assertEqual(result.text.split("\n")[1], "fn f() { salsa::DatabaseImpl::new(); }")
         self.assertEqual([line for line, _ in hand(text)], [2])
+
+
+class StorageCalls(unittest.TestCase):
+    def test_a_call_on_the_storage_is_no_case(self) -> None:
+        text = ("use blaze_query::db::Durability;\n"
+                "fn f(db: &mut Db) { db.storage_mut().synthetic_write(Durability::LOW); db.storage().stop_readers(); }\n")
+        self.assertEqual(s.migrate(text).left, [])
+        self.assertTrue(hand("fn f(db: &mut Db) { salsa::Database::synthetic_write(db, d); db.synthetic_write(d); }\n"))
+
+
+class Feature(unittest.TestCase):
+    def test_spans_feature_is_query(self) -> None:
+        out = s.migrate('#[cfg(not(feature = "salsa"))]\nfn f() {}\n')
+        self.assertEqual(out.text, '#[cfg(not(feature = "query"))]\nfn f() {}\n')
+        self.assertEqual(out.left, [])
+
+
+class Replay(unittest.TestCase):
+    def check(self, before: str, after: str) -> None:
+        edits = s.hand_edits(before, after)
+        self.assertEqual(s.replay("x.rs", before, edits), after)
+        for edit in edits:
+            self.assertTrue(edit["old"])
+
+    def test_round_trips(self) -> None:
+        base = "".join(f"line {i}\n" for i in range(20)) + "same\nsame\nsame\n"
+        self.check(base, base.replace("line 3\n", "line three\n"))
+        self.check(base, base.replace("line 5\n", "line 5\nnew\n").replace("line 17\n", ""))
+        self.check(base, base.replace("same\nsame\nsame\n", "same\nother\nsame\n"))
+        self.check(base, "head\n" + base + "tail\n")
+        self.check("a\n", "")
+
+    def test_a_stale_edit_stops(self) -> None:
+        edits = s.hand_edits("a\nb\nc\n", "a\nB\nc\n")
+        with self.assertRaises(SystemExit):
+            s.replay("x.rs", "a\nchanged\nc\n", edits)
 
 
 class Manifest(unittest.TestCase):

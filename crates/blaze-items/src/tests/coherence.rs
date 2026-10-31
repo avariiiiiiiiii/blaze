@@ -26,7 +26,7 @@ use hir_expand::fixture;
 
 use super::db::TestDB;
 
-/// How many times `query` is among the salsa debug names in `executed`.
+/// How many times `query` is among the ingredient names in `executed`.
 fn runs(executed: &[String], query: &str) -> usize {
     executed.iter().filter(|it| it.trim_end_matches('_').ends_with(query)).count()
 }

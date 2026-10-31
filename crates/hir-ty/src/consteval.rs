@@ -16,7 +16,6 @@ use rustc_abi::Size;
 use rustc_apfloat::Float;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, Ty as _};
-use salsa::SalsaValue;
 
 use crate::{
     ComplexMemoryMap, MemoryMap, ParamEnvAndCrate, Span, StaticMemory,
@@ -38,7 +37,7 @@ pub mod deps;
 pub mod discriminants;
 pub mod hir_eval;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum ConstEvalError<'db> {
     MirLowerError(MirLowerError<'db>),
     MirEvalError(MirEvalError<'db>),
@@ -433,7 +432,7 @@ pub(crate) fn create_anon_const<'a, 'db: 'a>(
 
 /// One variant's discriminant, kept per variant so that what reads it is invalidated only when
 /// its own value changes. Every variant's at once is [`discriminants::enum_discriminants`].
-#[salsa::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), mem_tag = Infer)]
+#[blaze_query::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), mem_tag = Infer)]
 pub(crate) fn const_eval_discriminant_variant<'db>(
     db: &'db Db,
     variant_id: EnumVariantId,
@@ -443,7 +442,7 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
 
 fn const_eval_discriminant_cycle_result<'db>(
     _: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: EnumVariantId,
 ) -> Result<i128, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
@@ -477,8 +476,8 @@ pub(crate) fn const_eval<'db>(
     }
 }
 
-#[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0, mem_tag = Infer)]
-pub(crate) fn const_eval_query<'db>(
+#[blaze_query::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0, mem_tag = Infer)]
+pub fn const_eval_query<'db>(
     db: &'db Db,
     def: ConstId,
     subst: StoredGenericArgs,
@@ -497,7 +496,7 @@ pub(crate) fn const_eval_query<'db>(
 
 fn const_eval_cycle_result<'db>(
     _: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: ConstId,
     _: StoredGenericArgs,
     _: Option<StoredParamEnvAndCrate>,
@@ -517,7 +516,7 @@ pub(crate) fn anon_const_eval<'db>(
     }
 }
 
-#[salsa::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, lru = 0, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, lru = 0, mem_tag = Infer)]
 pub(crate) fn anon_const_eval_query<'db>(
     db: &'db Db,
     def: AnonConstId<'db>,
@@ -530,7 +529,7 @@ pub(crate) fn anon_const_eval_query<'db>(
 
 fn anon_const_eval_cycle_result<'db>(
     _: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: AnonConstId<'db>,
     _: StoredGenericArgs,
     _: Option<StoredParamEnvAndCrate>,
@@ -548,7 +547,7 @@ pub(crate) fn const_eval_static<'db>(
     }
 }
 
-#[salsa::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, lru = 0, mem_tag = Infer)]
+#[blaze_query::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, lru = 0, mem_tag = Infer)]
 pub(crate) fn const_eval_static_query<'db>(
     db: &'db Db,
     def: StaticId,
@@ -558,7 +557,7 @@ pub(crate) fn const_eval_static_query<'db>(
 
 fn const_eval_static_cycle_result<'db>(
     _: &'db Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
     Err(ConstEvalError::MirLowerError(MirLowerError::Loop))
@@ -585,8 +584,8 @@ blaze_format::record! {
 }
 
 blaze_format::record! {
-    /// The memory of a static a constant points into: where it was and the static, as its salsa
-    /// id (the database that wrote it is the one reading it).
+    /// The memory of a static a constant points into: where it was and the static, as its id
+    /// (the database that wrote it is the one reading it).
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct StaticRec: 1 {
         pub start: u64,
@@ -848,7 +847,7 @@ fn read_memory_map<'db>(
     }
     for it in statics {
         let id = crate::check_cache::id_of::<StaticId>(it.id)
-            .ok_or_else(|| invalid("a static of salsa id index 0 or not in the table"))?;
+            .ok_or_else(|| invalid("a static of id index 0 or not in the table"))?;
         map.statics.push(StaticMemory { start: word(it.start)?, size: word(it.size)?, id });
     }
     let mut last = None;
@@ -911,7 +910,7 @@ mod tests {
         map.statics.push(StaticMemory {
             start: 0x9000,
             size: 16,
-            id: salsa::plumbing::FromId::from_id(salsa::Id::from_bits(7 | (2 << 32))),
+            id: blaze_query::db::FromId::from_id(blaze_query::db::Id::from_u32(7 + (2 << 20))),
         });
         map.note_pointer(crate::PointerAt::Memory(0x2000));
         map.note_pointer(crate::PointerAt::Value(8));

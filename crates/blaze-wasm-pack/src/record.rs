@@ -4,7 +4,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use base_db::{Crate, CrateOrigin, Db, salsa::Setter as _};
+use base_db::{Crate, CrateOrigin, Db};
+use blaze_query::db::Setter as _;
 use cfg::CfgAtom;
 use hir_expand::proc_macro::{
     CrateProcMacros, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacros,

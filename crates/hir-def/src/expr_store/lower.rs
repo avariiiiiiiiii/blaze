@@ -4243,7 +4243,7 @@ impl<'db> ExprCollector<'db> {
             .filter_map(|&idx| lifetime_args.get(idx as usize).copied());
         return Some(res);
 
-        #[salsa::tracked(returns(deref), cycle_result = get_constrained_lifetimes_cycle_result)]
+        #[blaze_query::tracked(returns(deref), cycle_result = get_constrained_lifetimes_cycle_result)]
         fn get_constrained_lifetimes(
             db: &Db,
             type_alias_id: TypeAliasId,
@@ -4291,7 +4291,7 @@ impl<'db> ExprCollector<'db> {
 
         fn get_constrained_lifetimes_cycle_result(
             _db: &Db,
-            _: salsa::Id,
+            _: blaze_query::db::Id,
             _id: TypeAliasId,
         ) -> Box<[u32]> {
             Default::default()

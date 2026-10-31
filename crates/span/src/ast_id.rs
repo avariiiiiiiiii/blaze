@@ -654,7 +654,7 @@ pub struct AstIdMap {
 
 /// A node with an id, as words: where it begins, where it ends, its kind and its id. Plain
 /// words, so that a map's entries are compared as one `[u32]` and hashed with one `write`:
-/// salsa compares and fingerprints maps to backdate them.
+/// the query engine compares maps to backdate them.
 type Entry = [u32; 4];
 const START: usize = 0;
 const END: usize = 1;

@@ -1,6 +1,6 @@
 use expect_test::Expect;
 use hir_def::{DefWithBodyId, ModuleDefId};
-use salsa::EventKind;
+use blaze_query::db::{Database as _, EventKind};
 use hir_expand::fixture;
 
 use crate::{InferenceResult, method_resolution::TraitImpls, test_db::{TestDB, TestDBExt as _}};
@@ -762,10 +762,9 @@ fn execute_assert_events(
         let executed: Vec<String> = events
             .iter()
             .filter_map(|event| match event.kind {
-                EventKind::WillExecute { database_key } => Some(
-                    salsa::Database::ingredient_debug_name(db, database_key.ingredient_index())
-                        .into_owned(),
-                ),
+                EventKind::WillExecute { database_key } => {
+                    Some(db.storage().ingredient_name(database_key.ingredient_index()).to_owned())
+                }
                 _ => None,
             })
             .collect();

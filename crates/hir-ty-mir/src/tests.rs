@@ -314,7 +314,7 @@ fn check_impl(
                 };
                 let range = node.original_file_range_rooted_view(&db);
                 if let Some(expected) = types.remove(&range) {
-                    let actual = salsa::attach(&db, || {
+                    let actual = blaze_query::db::attach(&db, || {
                         if display_source {
                             ty.display_source_code(&db, def.module(&db), true).unwrap()
                         } else {
@@ -616,7 +616,7 @@ fn check_infer_with_mismatches(#[rust_analyzer::rust_fixture] ra_fixture: &str, 
 }
 
 #[test]
-fn salsa_bug() {
+fn query_cycle_bug() {
     let fx = fixture::db(
         "
         //- /lib.rs

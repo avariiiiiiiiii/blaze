@@ -296,7 +296,7 @@ fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
 /// const-eval budget, and its dependencies' content), the content of the source root of its
 /// root file (every file's path and text), and its proc macros with their libraries, as a
 /// dependency image's key (`hir_def::deps::key`) has them.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn crate_inputs(db: &Db, krate: base_db::Crate) -> ContentId {
     let mut h = Hasher::new(CRATE);
     let all = krate.transitive_deps(db);

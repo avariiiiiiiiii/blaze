@@ -1,7 +1,7 @@
 //! The trait solver's caches of solved goals, in the two scopes of
 //! [`CacheScope`](rustc_type_ir::search_graph::CacheScope):
 //!
-//! - [`shared`]: a goal whose reads `salsa::capture_reads` recorded, for every query and
+//! - [`shared`]: a goal whose reads `blaze_query::db::capture_reads` recorded, for every query and
 //!   thread of one database, crate and revision. A query that takes an answer from it replays
 //!   the reads (`Tracked`), so it reruns when they change, as rustc's `with_cached_task` /
 //!   `get_tracked` do.
@@ -20,7 +20,7 @@ use base_db::{Db, Crate, Nonce};
 use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
 use rustc_hash::FxBuildHasher;
 use rustc_type_ir::search_graph::GlobalCache;
-use salsa::Revision;
+use blaze_query::db::View;
 use std::{
     cell::Cell,
     hash::BuildHasher,
@@ -434,7 +434,7 @@ const SLOT_BITS: u32 = 9;
 /// The cache of one interner. Its database and revision are those the interner was made in,
 /// for as long as it is used: a `Solved` is made with its interner and used only through it,
 /// and the interner's `&'db` borrow of the database keeps the revision from advancing
-/// (salsa's `new_revision` takes `&mut Zalsa`). So a lookup reads neither; debug builds check.
+/// (a new view takes `&mut Storage`). So a lookup reads neither; debug builds check.
 #[derive(Default)]
 struct OfQuery {
     #[cfg(debug_assertions)]

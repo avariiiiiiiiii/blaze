@@ -19,10 +19,10 @@ use std::mem::{offset_of, size_of};
 use blaze_format::{FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema_of};
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId};
-use salsa::plumbing::FromId;
+use blaze_query::db::FromId;
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
 
-use super::{HAS_EXPRS, at_of, bits, ensure, idx, packed_bits, packed_of, raw, salsa_id};
+use super::{HAS_EXPRS, at_of, bits, ensure, idx, packed_bits, packed_of, raw};
 use crate::{
     expr_store::{
         BodySourceMap, ExprOrPatSource, ExprSource, ExpressionStoreDiagnostics,
@@ -35,7 +35,7 @@ use crate::{
     },
     hir::{
         BindingId, ExprId, ExprOrPatId, LabelId, PatId,
-        persist::{Code, Column, Placed, Read, Words, WordsRec},
+        persist::{Code, Column, Placed, Read, Words, WordsRec, id_of_bits},
     },
     type_ref::{LifetimeRefId, TypeRefId},
 };
@@ -44,7 +44,7 @@ blaze_format::record! {
     /// A syntax pointer in a file: absent when `file_kind` is 0, and then all zeros.
     #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
     pub(crate) struct Src: 1 {
-        /// The salsa id of the file or of the macro call, as its bits.
+        /// The id of the file or of the macro call, as its bits.
         pub(crate) file: u64,
         /// 0 for no pointer, [`FILE`] or [`MACRO_FILE`].
         pub(crate) file_kind: u32,
@@ -58,7 +58,7 @@ blaze_format::record! {
     /// A run of ids of a [`BackMap`] written in one file: the file and the run's first id.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(crate) struct FileRun: 1 {
-        /// The salsa id of the file or of the macro call, as its bits.
+        /// The id of the file or of the macro call, as its bits.
         pub(crate) file: u64,
         /// [`FILE`] or [`MACRO_FILE`].
         pub(crate) file_kind: u32,
@@ -83,7 +83,7 @@ blaze_format::record! {
     /// `binding_starts` and `binding_pats` are the CSR of each binding's patterns, raw. Each
     /// [`SourceTable`] is its keys, in strictly increasing order of [`Src::key`], and the
     /// value of each beside it: an id raw (a packed one for expressions and patterns), a macro
-    /// call's salsa id as its bits.
+    /// call's id as its bits.
     #[derive(Clone, Copy)]
     pub(crate) struct SourceMapRoot: 4 {
         pub(crate) expr_map_back: BackRec,
@@ -145,7 +145,7 @@ fn file_bits(file: HirFileId) -> (u32, u64) {
 
 /// The file of `file_kind` and `file`, `None` when no file is.
 fn file_of(file_kind: u32, file: u64) -> Option<HirFileId> {
-    let id = salsa_id(file)?;
+    let id = id_of_bits(file)?;
     match file_kind {
         FILE => Some(HirFileId::FileId(FromId::from_id(id))),
         MACRO_FILE => Some(HirFileId::MacroFile(FromId::from_id(id))),
@@ -188,7 +188,7 @@ fn get_table<T, V: Code>(
 
 impl Src {
     /// The order of a [`SourceTable`]'s keys: the file (files before macro files, each by its
-    /// salsa id), the range, the syntax kind.
+    /// id), the range, the syntax kind.
     fn key(&self) -> (u32, u64, u32, u32, u32) {
         (self.file_kind, self.file, self.start, self.end, self.kind)
     }
@@ -214,7 +214,7 @@ impl Src {
             };
         }
         let file = match self.file_kind {
-            FILE | MACRO_FILE => file_of(self.file_kind, self.file).ok_or("a salsa id of index 0")?,
+            FILE | MACRO_FILE => file_of(self.file_kind, self.file).ok_or("an id of 0 or past 32 bits")?,
             _ => return Err("a file kind out of range"),
         };
         let kind = syntax_kind(self.kind).ok_or("a syntax kind out of range")?;
@@ -332,7 +332,7 @@ impl<'a> BackRef<'a> {
         ensure(head.start == 0, head, buffer, "a first file run that does not start at id 0")?;
         for run in self.runs {
             let file = file_of(run.file_kind, run.file).is_some();
-            ensure(file, run, buffer, "a file run of a file kind out of range or salsa id 0")?;
+            ensure(file, run, buffer, "a file run of a file kind out of range or an id of 0 or past 32 bits")?;
         }
         for pair in self.runs.windows(2) {
             let (before, run) = (&pair[0], &pair[1]);
@@ -744,7 +744,7 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
         check_table::<ast::Type, _>(map.types_map, map.types_map_ids, ty, root, buffer)?;
         let lifetime = |&lifetime: &u32| (lifetime as usize) < lifetimes;
         check_table::<ast::Lifetime, _>(map.lifetime_map, map.lifetime_map_ids, lifetime, root, buffer)?;
-        let call = |&call: &u64| salsa_id(call).is_some();
+        let call = |&call: &u64| id_of_bits(call).is_some();
         check_table::<ast::MacroCall, _>(map.expansions, map.expansion_calls, call, root, buffer)?;
         Ok(map)
     }
@@ -773,7 +773,7 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
     /// As [`ExpressionStoreSourceMap::expansion`].
     pub fn expansion(self, src: InFile<MacroCallPtr>) -> Option<MacroCallId> {
         let call = table_get(self.expansions, self.expansion_calls, &src)?;
-        salsa_id(call).map(<MacroCallId as FromId>::from_id)
+        id_of_bits(call).map(<MacroCallId as FromId>::from_id)
     }
 
     pub fn has_exprs(self) -> bool {
@@ -839,7 +839,7 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
                 template_map: get_template(&mut r, exprs)?,
                 expansions: source_table(self.expansions, self.expansion_calls, buffer, |call| {
                     <MacroCallId as FromId>::from_id(
-                        salsa_id(call).expect("checked when the buffer was read"),
+                        id_of_bits(call).expect("checked when the buffer was read"),
                     )
                 })?,
                 diagnostics: r.get()?,
@@ -1264,7 +1264,8 @@ fn f(a: u32, (b, c): (u32, u32)) -> u32 {
         let run = |at: usize, field: usize| runs + at * size_of::<FileRun>() + field;
         assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, start)), 1)), "a first run past 0");
         assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file_kind)), 7)), "a file kind");
-        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), 0)), "a salsa id of 0");
+        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)), 0)), "an id of 0");
+        assert!(refused(&with_word(&bytes, run(0, offset_of!(FileRun, file)) + 4, 1)), "an id past 32 bits");
         let second = offset_of!(FileRun, start);
         assert!(refused(&with_word(&bytes, run(1, second), exprs.runs[2].start)), "runs out of order");
         let empty = exprs.runs[1].start - 1;
@@ -1327,7 +1328,7 @@ fn f(a: u32, (b, c): (u32, u32)) -> u32 {
 
         assert!(refused(&with_word(&bytes, keys + offset_of!(Src, kind), u32::MAX)), "a key's kind");
         assert!(refused(&with_word(&bytes, keys + offset_of!(Src, file_kind), 7)), "a key's file");
-        assert!(refused(&with_word(&bytes, keys + offset_of!(Src, file), 0)), "a key's salsa id");
+        assert!(refused(&with_word(&bytes, keys + offset_of!(Src, file), 0)), "a key's id");
 
         let expr_map = &source_map.store.expr_only.as_deref().expect("a body's source map").expr_map;
         let reversed: Box<[_]> = expr_map.entries().iter().rev().copied().collect();

@@ -91,7 +91,7 @@ fn resolve(
 }
 
 /// File, line and column of where the anchor of the body begins.
-#[salsa::tracked]
+#[blaze_query::tracked]
 fn anchor_location(
     db: &Db,
     owner: DefWithBodyId,
@@ -102,7 +102,7 @@ fn anchor_location(
 }
 
 /// Where the rows of the anchor of the body are.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn anchor_rows(db: &Db, owner: DefWithBodyId) -> Option<span::LineIndex> {
     Some(span::LineIndex::new(body_syntax(db, owner).as_ref()?.text()))
 }
@@ -205,9 +205,9 @@ fn source_range(
 }
 
 /// The [`Place`] of [`source_location_in_file`].
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(revisions = usize::MAX)]
+// Nothing in its arguments is ever collected (the query database frees no interned value),
+// so they stay interned and are never verified.
+#[blaze_query::tracked]
 fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
     let Some(syntax) = body_syntax(db, owner).as_ref() else {
         let (file, line, column) = (*source_location_in_file(db, owner, span))?;
@@ -218,9 +218,9 @@ fn source_place(db: &Db, owner: DefWithBodyId, span: MirSpan) -> Option<Place> {
 }
 
 /// The [`Place`] of [`row_location_in_file`].
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(revisions = usize::MAX)]
+// Nothing in its arguments is ever collected (the query database frees no interned value),
+// so they stay interned and are never verified.
+#[blaze_query::tracked]
 fn row_place(
     db: &Db,
     owner: DefWithBodyId,

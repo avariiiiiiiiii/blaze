@@ -1,0 +1,19 @@
+{
+ "crate": "crates/const-ast",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/const-ast/src/tests.rs",
+   "edits": [
+    {
+     "old": "/// generic there is), salsa (derives and macro-heavy code) and this crate.\n",
+     "new": "/// generic there is), the query engine (derives and generic code) and this crate.\n"
+    },
+    {
+     "old": "    for dir in [\"library/core/src\", \"library/alloc/src\", \"vendor/salsa/src\", \"crates/const-ast/src\"]\n",
+     "new": "    for dir in [\"library/core/src\", \"library/alloc/src\", \"crates/blaze-query/src\", \"crates/const-ast/src\"]\n"
+    }
+   ]
+  }
+ ]
+}

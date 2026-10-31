@@ -27,7 +27,7 @@ pub struct Counted {
     /// Functions put through Cranelift, or through LLVM at level 1: what a build compiled
     /// rather than found.
     compiled: AtomicUsize,
-    /// Compile queries salsa ran rather than handed back, in all and by the crate each was
+    /// Compile queries the query engine ran rather than handed back, in all and by the crate each was
     /// for: what a build says of itself as it goes.
     compiles: AtomicUsize,
     compiles_of: Mutex<FxHashMap<Crate, usize>>,
@@ -120,7 +120,7 @@ pub(crate) fn compiled() {
     each(|it| _ = it.compiled.fetch_add(1, Ordering::Relaxed));
 }
 
-/// Salsa ran a compile query for `krate`.
+/// The query engine ran a compile query for `krate`.
 pub(crate) fn compiles(krate: Crate) {
     each(|it| {
         it.compiles.fetch_add(1, Ordering::Relaxed);

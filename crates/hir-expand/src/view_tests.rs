@@ -8,7 +8,7 @@ use std::{fmt::Write as _, ops::ControlFlow};
 
 use base_db::{
     AbsPathBuf, Crate, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, EditionedFileId,
-    Env, FileId, FileSet, SourceRoot, SourceRootId, TargetKind, VfsPath, salsa::Durability,
+    Env, FileId, FileSet, SourceRoot, SourceRootId, TargetKind, VfsPath, blaze_query::db::Durability,
 };
 use cfg::CfgOptions;
 use expect_test::expect_file;

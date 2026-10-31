@@ -134,7 +134,7 @@ fn relative<'db>(db: &'db Db, body: DefWithBodyId, def: SolverDefId<'db>) -> Opt
 
 /// The index of each target among `body`'s resolutions ([`Target`]), empty when its paths
 /// could not be hashed (it then has no identity, and no record).
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn target_indices(db: &Db, body: DefWithBodyId) -> FxHashMap<Target, u32> {
     let Ok(names) = names_of(db, body) else { return FxHashMap::default() };
     // alloc: the query's value, once per body a record is written or read for

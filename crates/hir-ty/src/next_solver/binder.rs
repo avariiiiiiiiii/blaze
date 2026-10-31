@@ -4,7 +4,6 @@ use rustc_type_ir::{
     FallibleTypeFolder, TypeFoldable as _, TypeFolder, TypeVisitable as _, TypeVisitableExt as _,
     TypeVisitor,
 };
-use salsa::SalsaValue;
 
 use crate::next_solver::{
     Binder, Clauses, DbInterner, EarlyBinder, FnSig, FnSigKind, GenericArg, PolyFnSig,
@@ -19,7 +18,7 @@ use crate::next_solver::{
 /// The value has no rigid aliases: instantiating it needs normalizing again. [`Self::bind`]
 /// makes every alias [`IsRigid::No`](rustc_type_ir::IsRigid::No), as rustc's
 /// [`EarlyBinder::bind`] does; the getters check it in debug builds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct StoredEarlyBinder<T>(T);
 
 impl<T> StoredEarlyBinder<T> {
@@ -108,7 +107,7 @@ impl StoredEarlyBinder<StoredTraitRef> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct StoredPolyFnSig {
     bound_vars: StoredBoundVarKinds,
     sig: StoredFnSig,
@@ -172,7 +171,7 @@ impl StoredFnSig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable, blaze_query::Value)]
 pub struct StoredTraitRef {
     #[type_visitable(ignore)]
     def_id: TraitId,

@@ -2,7 +2,7 @@
 //! dependency's signatures once nothing reads them, written into a [`blaze_format`] buffer and
 //! read back in place.
 //!
-//! The cold form is columns, as the batch is: the keys as their salsa ids (the database that
+//! The cold form is columns, as the batch is: the keys as their ids (the database that
 //! wrote a buffer is the one reading it, as `hir_def::hir::persist` writes them), each value
 //! column as indices into the buffer's type table (`next_solver::persist`), and the side table's
 //! diagnostics as words. The type table is a buffer of its own inside this one, at a buffer's
@@ -22,7 +22,7 @@ use hir_def::{
     StructId, TraitId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
 };
 use la_arena::{Idx, RawIdx};
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 
 use crate::{
     Span, TyLoweringDiagnostic,
@@ -89,7 +89,7 @@ blaze_format::record! {
 
 blaze_format::record! {
     /// A batch's side table: the rows with something, where each one's diagnostics and anonymous
-    /// constants start, the diagnostics as words one after another, the constants as salsa ids.
+    /// constants start, the diagnostics as words one after another, the constants as ids.
     #[derive(Clone, Copy)]
     struct SideRec: 1 {
         rows: Slice<u32>,
@@ -194,12 +194,13 @@ fn bytes_of(words: &[u128]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), size_of_val(words)) }
 }
 
-fn salsa_id(bits: u64) -> Option<salsa::Id> {
-    (bits as u32 != 0).then(|| salsa::Id::from_bits(bits))
+/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`.
+fn query_id(bits: u64) -> Option<blaze_query::db::Id> {
+    u32::try_from(bits).ok().filter(|&bits| bits != 0).map(blaze_query::db::Id::from_u32)
 }
 
 fn id_bits(id: impl AsId) -> u64 {
-    id.as_id().as_bits()
+    u64::from(id.as_id().as_u32())
 }
 
 /// A diagnostic's id: [`id_bits`], or inside `check_cache::relocating` its place in the table.
@@ -216,7 +217,7 @@ fn variant_key(variant: VariantId) -> (u8, u64) {
 }
 
 fn variant_of(tag: u8, bits: u64) -> Option<VariantId> {
-    let id = salsa_id(bits)?;
+    let id = query_id(bits)?;
     Some(match tag {
         0 => EnumVariantId::from_id(id).into(),
         1 => StructId::from_id(id).into(),
@@ -540,7 +541,7 @@ impl<'a> ColdBatchRef<'a> {
         let keys: Box<[ImplId]> = exact(
             self.keys.len(),
             self.keys.iter().map(|&bits| {
-                salsa_id(bits).map(ImplId::from_id).ok_or(self.invalid("an impl of id 0"))
+                query_id(bits).map(ImplId::from_id).ok_or(self.invalid("an impl of id 0"))
             }),
         )?;
         self.ensure(keys.is_sorted_by(|a, b| a < b), "impls that are not ascending")?;
@@ -607,7 +608,7 @@ impl<'a> ColdBatchRef<'a> {
                 if trait_id == 0 {
                     return Ok::<_, FormatError>(None);
                 }
-                let trait_id = salsa_id(trait_id)
+                let trait_id = query_id(trait_id)
                     .map(TraitId::from_id)
                     .ok_or(self.invalid("a trait of id index 0"))?;
                 let trait_ref = TraitRef::new_from_args(interner, trait_id.into(), tys.args(args)?);
@@ -670,7 +671,7 @@ impl<'a> ColdBatchRef<'a> {
         let anon_consts: Box<[AnonConstId<'db>]> = exact(
             side.anon_consts.len(),
             side.anon_consts.iter().map(|&bits| {
-                salsa_id(bits).map(AnonConstId::from_id).ok_or(self.invalid("a constant of id 0"))
+                query_id(bits).map(AnonConstId::from_id).ok_or(self.invalid("a constant of id 0"))
             }),
         )?;
         let range = |starts: &[u32], at: usize, len: usize| {
@@ -950,7 +951,7 @@ impl Words<'_> {
 
     fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
         let bits = self.u64()?;
-        crate::check_cache::id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
+        crate::check_cache::id_of(bits).ok_or(self.invalid("an id of index 0 or not in the table"))
     }
 
     fn generic_def(&mut self) -> Result<GenericDefId, FormatError> {
@@ -1155,8 +1156,8 @@ mod tests {
         assert_eq!((used.allocations, column.unwrap().len()), (1, 1000));
     }
 
-    fn id(index: u32) -> salsa::Id {
-        salsa::Id::from_bits(u64::from(index) | (3 << 32))
+    fn id(index: u32) -> blaze_query::db::Id {
+        blaze_query::db::Id::from_u32(index + (3 << 20))
     }
 
     fn every_diagnostic() -> Vec<TyLoweringDiagnostic> {
@@ -1299,7 +1300,7 @@ mod tests {
                 diagnostics_at: vec![0],
                 anon_consts_at: vec![0],
                 diagnostics: words,
-                anon_consts: vec![id(12).as_bits()],
+                anon_consts: vec![id_bits(id(12))],
             },
             table: table_words(&table),
             table_root,
@@ -1389,7 +1390,7 @@ mod tests {
             let (tag, bits) = variant_key(variant);
             assert_eq!(variant_of(tag, bits), Some(variant));
         }
-        assert_eq!(variant_of(3, id(1).as_bits()), None);
+        assert_eq!(variant_of(3, id_bits(id(1))), None);
         assert_eq!(variant_of(0, 0), None);
     }
 }

@@ -2,7 +2,7 @@
 //! into a running database (frozen dependency artifacts, blaze's `docs/glancer.md`, item 1).
 //! [`Enc`] and [`Dec`] write and read other values that name items, as `hir_ty` does impls.
 //!
-//! The bytes name nothing by a salsa id: a file is the crate it belongs to and its path from
+//! The bytes name nothing by a query database id: a file is the crate it belongs to and its path from
 //! that crate's root directory, a module is its crate and its index in that crate's `DefMap`, a
 //! crate is its index in the frozen crate's dependency closure, and every interned id is
 //! written as the location it interns. Reading interns those locations again, so the ids it
@@ -99,7 +99,7 @@ pub struct Frozen {
 }
 
 /// The crates whose `DefMap` is frozen, set by whoever has the bytes.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct FrozenDefMaps {
     #[returns(ref)]
     pub maps: Arc<FxHashMap<Crate, Frozen>>,
@@ -107,7 +107,7 @@ pub struct FrozenDefMaps {
 
 /// Has name resolution use `maps`.
 pub fn set(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
-    use salsa::{Durability, Setter};
+    use blaze_query::db::{Durability, Setter};
     // alloc: Check/Verify only, which record differences; never when serving
     let maps = Arc::new(maps);
     match FrozenDefMaps::try_get(db) {
@@ -214,7 +214,7 @@ pub fn check_frozen(
 
 /// The frozen `DefMap` of `krate`, by value: a [`set`] that leaves it as it was is backdated
 /// here, so it runs none of the queries of `krate` again.
-#[salsa::tracked(returns(as_ref))]
+#[blaze_query::tracked(returns(as_ref))]
 fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
     // clone: a count of the image the bytes are in, or of their own buffer
     FrozenDefMaps::try_get(db)?.maps(db).get(&krate).cloned()
@@ -271,7 +271,7 @@ pub fn unreadable(db: &Db, krate: Crate, bytes: &[u8]) -> Option<String> {
 }
 
 /// The crates whose lang items are frozen, set by whoever has the bytes.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct FrozenLangItems {
     #[returns(ref)]
     pub maps: Arc<FxHashMap<Crate, Frozen>>,
@@ -279,7 +279,7 @@ pub struct FrozenLangItems {
 
 /// Has finding the lang items of a crate use `maps`.
 pub fn set_lang_items(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
-    use salsa::{Durability, Setter};
+    use blaze_query::db::{Durability, Setter};
     // alloc: once per load of the frozen bytes
     let maps = Arc::new(maps);
     match FrozenLangItems::try_get(db) {
@@ -293,7 +293,7 @@ pub fn set_lang_items(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
 }
 
 /// The frozen lang items of `krate`, by value, as [`frozen_def_map`] is.
-#[salsa::tracked(returns(as_ref))]
+#[blaze_query::tracked(returns(as_ref))]
 fn frozen_lang_items(db: &Db, krate: Crate) -> Option<Frozen> {
     // clone: a count of the image the bytes are in, or of their own buffer
     FrozenLangItems::try_get(db)?.maps(db).get(&krate).cloned()

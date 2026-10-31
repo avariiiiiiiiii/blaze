@@ -6,7 +6,7 @@ use std::{
 use blaze_ids::rng::SplitMix64 as Rng;
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
-use salsa::Durability;
+use blaze_query::db::Durability;
 use span::{Edition, TextSize};
 use syntax::TextRange;
 use triomphe::Arc;
@@ -30,7 +30,7 @@ mod memo_properties;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-fn revision(db: &Db) -> salsa::Revision {
+fn revision(db: &Db) -> blaze_query::db::View {
     db.nonce_and_revision().1
 }
 
@@ -680,7 +680,7 @@ fn threads_pushing_to_a_log_each_get_their_own_index() {
 #[test]
 fn a_log_and_a_column_give_back_what_was_put() {
     use crate::table::{Column, Log};
-    use salsa::plumbing::Id;
+    use blaze_query::db::Id;
 
     let log: Log<u32> = Log::new(1 << 16);
     for value in 0..5_000u32 {
@@ -701,7 +701,7 @@ fn a_log_and_a_column_give_back_what_was_put() {
             column.set(raw, None);
             model.remove(&raw);
         } else {
-            let id = Id::from_bits(rng.below(u32::MAX as u64) + 1);
+            let id = Id::from_u32(rng.below(u64::from(Id::MAX_U32)) as u32 + 1);
             column.set(raw, Some(id));
             model.insert(raw, id);
         }
@@ -912,7 +912,7 @@ fn a_task_that_waited_on_itself_runs_again() {
     let runs: Vec<AtomicUsize> = (0..8).map(|_| AtomicUsize::new(0)).collect();
     run_on_pool(&db, &pool, runs.len(), &|_: &Db, at: usize| {
         if runs[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
-            std::panic::resume_unwind(Box::new(salsa::Cancelled::WouldWaitOnItself));
+            std::panic::resume_unwind(Box::new(blaze_query::db::Cancelled::WouldWaitOnItself));
         }
     });
     let runs: Vec<usize> = runs.iter().map(|it| it.load(Ordering::Relaxed)).collect();
@@ -1036,7 +1036,7 @@ thread_local! {
 
 /// What a `#[path = "../../shared/m.rs"] mod m;` in `anchor` reads: the file and its text's
 /// length, as a def map would.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn shared_module(db: &Db, anchor: EditionedFileId) -> Option<(u32, u32)> {
     SHARED_MODULE_RUNS.with(|it| it.set(it.get() + 1));
     let (anchor, _) = anchor.unpack(db);

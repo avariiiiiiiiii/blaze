@@ -24,7 +24,6 @@ use rustc_type_ir::{
     CoroutineArgs, GenericTypeVisitable,
     inherent::{GenericArgs as _, IntoKind, Ty as _},
 };
-use salsa::SalsaValue;
 use smallvec::{SmallVec, smallvec};
 use stdx::impl_from;
 
@@ -173,7 +172,7 @@ impl<'db> Operand {
 
 /// The index of a field (whether of a struct/enum variant, tuple, or closure).
 /// For a struct/enum it converts from and to the LocalFieldId, for a tuple or closure it's simply the index.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, salsa::SalsaValue, PartialOrd, Ord, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, blaze_query::Value, PartialOrd, Ord, Debug)]
 pub struct FieldIndex(pub u32);
 
 impl FieldIndex {
@@ -1474,14 +1473,14 @@ pub struct UnreachableAfterCall {
 }
 
 /// A body whose code an optimized body has in it: rustc's `Instance` of an inlined callee.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum InlinedBody<'db> {
     Fn(FunctionId),
     Closure(InternedClosureId<'db>),
 }
 
 /// One instance an optimized body inlined, listed once however often it was.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct InlinedCallee<'db> {
     pub body: InlinedBody<'db>,
     /// With regions erased, in the caller's generic parameters (instantiated by
@@ -1494,7 +1493,7 @@ pub struct InlinedCallee<'db> {
 
 /// rustc's inlined `SourceScope`: the code of `callees[callee]`, inlined at `call_site` (a span
 /// of the body, itself `Inlined` when the call was in an inlined body).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct InlinedScope {
     pub callee: u32,
     pub call_site: MirSpan,
@@ -1502,14 +1501,14 @@ pub struct InlinedScope {
 
 /// What `MirSpan::Inlined(n)` is, `n` indexing [`Inlined::spans`]: `span` of the body of the
 /// callee of `scopes[scope]`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct InlinedSpan {
     pub scope: u32,
     pub span: MirSpan,
 }
 
 /// The local an inlined callee's binding is in (its debug info).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct InlinedBinding {
     pub scope: u32,
     pub binding: BindingId,
@@ -1518,7 +1517,7 @@ pub struct InlinedBinding {
 
 /// `promoted_locals` of an inlined callee: `expr` is of the expression store of
 /// `callees[callee]`, evaluated with its `args`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct InlinedPromoted {
     pub local: LocalId,
     pub callee: u32,
@@ -1526,7 +1525,7 @@ pub struct InlinedPromoted {
 }
 
 /// What an optimized body inlined. Empty in every body as it is built.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct Inlined<'db> {
     pub callees: Vec<InlinedCallee<'db>>,
     pub scopes: Vec<InlinedScope>,
@@ -1550,7 +1549,7 @@ impl Inlined<'_> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, blaze_query::Value)]
 pub struct MirBody<'db> {
     pub basic_blocks: Arena<BasicBlock>,
     pub locals: Arena<Local>,
@@ -1689,7 +1688,7 @@ fn hash_by_key<K: Hash + Eq + Copy, V: Hash, H: Hasher>(
 /// What a body means, which depends on the passes it has been through. The IDE only ever
 /// asks for [`MirPhase::Built`]; the interpreter and the code generator run
 /// [`MirPhase::Runtime`], which is computed on its own (`runtime_mir_body` and the like).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum MirPhase {
     /// As lowering builds it, as rustc's MIR building does. A `Drop` drops what the place holds
     /// if it holds anything, which the code that runs it has to keep track of. Calls and drops
@@ -1709,7 +1708,7 @@ pub enum MirPhase {
 /// The locals an `async` body has on top of the ones it declares. Its parameters are a
 /// reference to the future and the `&mut Context` of the current `poll`, and the return slot
 /// has the type of the block's value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub struct CoroutineLocals {
     /// The `Poll` that `Return` and `Yield` hand to the caller of `poll`.
     pub poll: LocalId,
@@ -2012,7 +2011,7 @@ impl MirBody<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, SalsaValue)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, blaze_query::Value)]
 pub enum MirSpan {
     ExprId(ExprId),
     /// Where the expression ends: what leaving a scope does is taken to be written there.
@@ -2251,7 +2250,7 @@ impl<'db> VTableMap<'db> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum MirEvalError<'db> {
     ConstEvalError(String, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError, StoredTy),
@@ -2347,7 +2346,7 @@ impl std::fmt::Debug for MirEvalError<'_> {
 }
 
 /// What an evaluation ran out of: its budget of steps or of bytes, of this size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum Budget {
     Steps(u64),
     Memory(u64),
@@ -2393,7 +2392,7 @@ pub fn pad16(it: &[u8], is_signed: IsSigned) -> [u8; 16] {
 }
 
 // FIXME: Make this smaller, its stored in database queries
-#[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, blaze_query::Value)]
 pub enum MirLowerError<'db> {
     ConstEvalError(Box<str>, Box<ConstEvalError<'db>>),
     LayoutError(LayoutError),
@@ -2465,7 +2464,7 @@ pub fn is_by_move_coroutine<'db>(
 }
 
 /// How much of rustc's optimization pipeline runs: rustc's `-Zmir-opt-level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
 pub enum MirOptLevel {
     /// None: the body is the runtime body.
     Off,
@@ -2497,7 +2496,7 @@ impl MirOptLevel {
 /// What a MIR body is optimized for: the level, whether rustc's UB checks are inserted
 /// (`sess.ub_checks()` of the crate the body is of), and whether the code generator emits
 /// lifetime markers (rustc removes storage markers only when it doesn't).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, blaze_query::Value)]
 pub struct MirOptions {
     pub level: MirOptLevel,
     pub ub_checks: bool,
@@ -2696,11 +2695,7 @@ mod tests {
         use super::{Inlined, InlinedPromoted, InlinedScope, InlinedSpan, MirSpan};
 
         let expr = |n: u32| MirSpan::ExprId(ExprId::from_raw(RawIdx::from(n)));
-        let hash = |inlined: &Inlined<'_>| {
-            let mut hasher = salsa::StableHasher::new();
-            std::hash::Hash::hash(inlined, &mut hasher);
-            hasher.finish128()
-        };
+        let hash = |inlined: &Inlined<'_>| blaze_ids::Hasher::new("hir-ty test").std(inlined).finish();
         let empty = Inlined::default();
         assert!(empty.is_empty());
         let mut scoped = Inlined::default();
@@ -2724,10 +2719,10 @@ mod tests {
         assert_eq!(hash(&scoped), hash(&scoped.clone()));
     }
 
-    fn digest(map: &FxHashMap<u32, Vec<u32>>) -> (u64, u64) {
-        let mut hasher = salsa::StableHasher::new();
-        hash_by_key(map, |key| key, |raw| raw, &mut hasher);
-        hasher.finish128()
+    fn digest(map: &FxHashMap<u32, Vec<u32>>) -> blaze_ids::ContentId {
+        let mut hasher = blaze_ids::Hasher::new("hir-ty test");
+        hash_by_key(map, |key| key, |raw| raw, &mut blaze_ids::StdHash(&mut hasher));
+        hasher.finish()
     }
 
     #[test]

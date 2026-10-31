@@ -6,7 +6,7 @@
 //!
 //! `Work`'s fields as the `nameres` maintainer fills them: `ops`, the round-0 ops that differ;
 //! `region`, the groups run; `rebuilt`, the modules rebuilt; `woken`, the groups a changed
-//! binding woke; `slices`, the salsa inputs set; `keys`, the `(module, name)` bindings that
+//! binding woke; `slices`, the query inputs set; `keys`, the `(module, name)` bindings that
 //! changed; `moved`, the rows of the crate's module table taken out or put back.
 
 use std::fmt::Write;

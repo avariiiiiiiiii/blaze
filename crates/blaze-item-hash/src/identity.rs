@@ -48,7 +48,7 @@ pub fn identity(db: &Db, def: DefWithBodyId) -> Result<ContentId, Unidentified> 
     identity_of(db, def).map_err(|what| Unidentified { def, what })
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn identity_of(db: &Db, def: DefWithBodyId) -> Result<ContentId, &'static str> {
     if inputs::build(db).is_none() {
         return Err("no front-end build is set");

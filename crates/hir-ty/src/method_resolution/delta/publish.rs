@@ -1,4 +1,4 @@
-//! The published slices (design §7, §8): one salsa input per (crate, trait), per (crate, head)
+//! The published slices (design §7, §8): one query input per (crate, trait), per (crate, head)
 //! and per (crate, name), each with its content, set only when the content changed, and its
 //! `ContentId` a query over it, asked only by lane item-hash (through the identities it
 //! installs, [`ImplIdentities`]); the crate's [`SliceDirectory`] for keys a reader asks of
@@ -21,7 +21,7 @@ use hir_def::{BuiltinDeriveImplId, ImplId, ModuleId, TraitId, nameres::crate_def
 use hir_expand::name::Name;
 use rustc_hash::FxHashMap;
 use rustc_type_ir::fast_reject::SimplifiedType as S;
-use salsa::Setter;
+use blaze_query::db::Setter;
 
 use super::head::{Head, HeadDef};
 
@@ -59,7 +59,7 @@ pub struct CandidateRows {
     pub traits: Box<[TraitId]>,
 }
 
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub struct TraitImplsSlice {
     #[returns(copy)]
     pub krate: Crate,
@@ -69,7 +69,7 @@ pub struct TraitImplsSlice {
     pub rows: TraitRows,
 }
 
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub struct InherentSlice {
     #[returns(copy)]
     pub krate: Crate,
@@ -79,7 +79,7 @@ pub struct InherentSlice {
     pub rows: InherentRows,
 }
 
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub struct CandidateSlice {
     #[returns(copy)]
     pub krate: Crate,
@@ -92,7 +92,7 @@ pub struct CandidateSlice {
 /// Every key of one crate that has a slice, and the modules whose bodies hold any inherent
 /// impl (sorted by `ModuleId`), what a whole crate's inherent table merges. Each field is read
 /// on its own, so a new trait key leaves readers of heads and names as they were.
-#[salsa::input(debug)]
+#[blaze_query::input(debug)]
 pub struct SliceDirectory {
     #[returns(copy)]
     pub krate: Crate,
@@ -107,7 +107,7 @@ pub struct SliceDirectory {
 }
 
 /// The directory of every crate the maintainer has gone over; set when a crate is first.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct ImplSlices {
     #[returns(ref)]
     pub crates: Arc<FxHashMap<Crate, SliceDirectory>>,
@@ -125,17 +125,17 @@ pub(crate) fn directory(db: &Db, krate: Crate) -> SliceDirectory {
 
 /// The slice of `trait_` in `krate`, if it has one: reads the directory's traits, and backdates
 /// unless this key gains its slice.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn trait_slice(db: &Db, krate: Crate, trait_: TraitId) -> Option<TraitImplsSlice> {
     directory(db, krate).traits(db).get(&trait_).copied()
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn inherent_slice(db: &Db, krate: Crate, head: Head) -> Option<InherentSlice> {
     directory(db, krate).heads(db).get(&head).copied()
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn candidate_slice(db: &Db, krate: Crate, name: Name) -> Option<CandidateSlice> {
     directory(db, krate).names(db).get(&name).copied()
 }
@@ -179,7 +179,7 @@ pub fn candidate_set_hash(db: &Db, krate: Crate, name: Name) -> ContentId {
 /// trait solver reads of it changes (an impl's generics, where clauses and associated values).
 /// No hash is asked of a database without them: a location names no content, so it is no
 /// identity.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct ImplIdentities {
     #[returns(copy)]
     pub impl_: fn(&Db, ImplId) -> ContentId,
@@ -411,17 +411,17 @@ pub(crate) fn inherent_rows_hash(db: &Db, head: Head, rows: &InherentRows) -> Co
 }
 
 /// The hash of a trait slice's rows ([`trait_rows_hash`]), asked by lane item-hash alone.
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn trait_slice_hash(db: &Db, slice: TraitImplsSlice) -> ContentId {
     trait_rows_hash(db, slice.trait_(db), slice.rows(db))
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn inherent_slice_hash(db: &Db, slice: InherentSlice) -> ContentId {
     inherent_rows_hash(db, slice.head(db), slice.rows(db))
 }
 
-#[salsa::tracked(returns(copy), mem_tag = Infer)]
+#[blaze_query::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn candidate_slice_hash(db: &Db, slice: CandidateSlice) -> ContentId {
     candidate_rows_hash(db, slice.name(db), slice.rows(db))
 }

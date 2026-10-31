@@ -30,7 +30,6 @@ tracing = { workspace = true, features = ["attributes"] }
 smallvec.workspace = true
 triomphe.workspace = true
 rustc_apfloat.workspace = true
-salsa.workspace = true
 
 ra-ap-rustc_parse_format.workspace = true
 rustc_abi.workspace = true

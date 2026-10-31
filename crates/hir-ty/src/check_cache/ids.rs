@@ -2,7 +2,7 @@
 //!
 //! Inside [`relocating`], every id the inference record and its type tables write goes through
 //! [`id_bits`] as its index in a [`Table`] plus one (0 stays "no id"), and every id they read
-//! through [`id_of`]; outside one, both are what they were: an id's salsa bits. [`write`] then
+//! through [`id_of`]; outside one, both are what they were: an id's bits. [`write`] then
 //! gives each entry of the table its portable form, its location: a hir-def item as its index in
 //! the crate's portable table (`hir_def::deps::PortableIds`, frontend-deps' frozen encoding), a
 //! hir-ty interned id as what it is interned by, each id that location names an entry of the same
@@ -24,7 +24,7 @@ use hir_def::{
 use hir_expand::attrs::AttrId;
 use la_arena::{Idx, RawIdx};
 use rustc_hash::FxHashMap;
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 
 use crate::{
     ImplTraitId, InferBodyId,
@@ -40,7 +40,7 @@ use crate::{
 
 type R<T = ()> = Result<T, String>;
 
-/// Which salsa type an entry of a [`Table`] is: an entry is read back only as the kind it was
+/// Which id type an entry of a [`Table`] is: an entry is read back only as the kind it was
 /// written as. The first ten are hir-def's items, which the crate's portable table holds.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(u8)]
@@ -107,7 +107,7 @@ const _: () = {
     }
 };
 
-/// A salsa id type the inference record and its type tables write, by the kind its table
+/// An id type the inference record and its type tables write, by the kind its table
 /// entries are.
 pub(crate) trait Relocate: AsId + FromId + Copy {
     const KIND: IdKind;
@@ -163,8 +163,9 @@ pub(crate) struct Table {
 }
 
 impl Table {
-    /// The index of the id of `kind` whose bits are `bits`, added when it is new.
-    fn index(&mut self, kind: IdKind, bits: u64) -> u32 {
+    /// The index of the id `id` of `kind`, added when it is new.
+    fn index(&mut self, kind: IdKind, id: blaze_query::db::Id) -> u32 {
+        let bits = u64::from(id.as_u32());
         let next = self.entries.len();
         *self.indexes.entry((kind, bits)).or_insert_with(|| {
             self.entries.push((kind, bits));
@@ -225,18 +226,18 @@ pub(crate) fn in_scope() -> bool {
     TABLE.with(|slot| slot.borrow().is_some())
 }
 
-/// The bits written for `id`: its index in the scope's table plus one, or its salsa bits
+/// The bits written for `id`: its index in the scope's table plus one, or its own bits
 /// outside a scope.
 #[inline]
 pub(crate) fn id_bits<T: Relocate>(id: T) -> u64 {
-    let bits = id.as_id().as_bits();
+    let id = id.as_id();
     TABLE.with(|slot| match slot.borrow_mut().as_mut() {
-        None => bits,
+        None => u64::from(id.as_u32()),
         Some(table) => {
             if table.locs && T::KIND.is_late() {
                 table.refused.get_or_insert("an anonymous constant's type names a closure, an opaque type or a constant");
             }
-            u64::from(table.index(T::KIND, bits)) + 1
+            u64::from(table.index(T::KIND, id)) + 1
         }
     })
 }
@@ -249,12 +250,22 @@ pub(crate) fn id_of<T: Relocate>(bits: u64) -> Option<T> {
         return None;
     }
     TABLE.with(|slot| match slot.borrow().as_ref() {
-        None => Some(T::from_id(salsa::Id::from_bits(bits))),
+        None => id_at(bits).map(T::from_id),
         Some(table) => {
             let index = u32::try_from(bits - 1).ok()?;
-            table.get(T::KIND, index).map(|bits| T::from_id(salsa::Id::from_bits(bits)))
+            table.get(T::KIND, index).and_then(id_at).map(T::from_id)
         }
     })
+}
+
+/// The id whose bits are the word `bits`: `None` for 0 or a word past `u32`.
+fn id_at(bits: u64) -> Option<blaze_query::db::Id> {
+    u32::try_from(bits).ok().filter(|&bits| bits != 0).map(blaze_query::db::Id::from_u32)
+}
+
+/// The id a [`Table`] entry holds: [`Table::index`] adds only an id's bits.
+fn entry_id(bits: u64) -> blaze_query::db::Id {
+    id_at(bits).expect("a table entry is an id's bits")
 }
 
 /// The crate's items every body of its part names: frontend-deps' portable table, and the kind
@@ -358,7 +369,7 @@ pub(crate) fn write_with<'db>(
             | IdKind::EnumVariant => Loc::Item(0),
             IdKind::BuiltinDeriveImpl => {
                 let BuiltinDeriveImplLoc { adt, trait_, derive_attr_id, derive_index } =
-                    *BuiltinDeriveImplId::from_id(salsa::Id::from_bits(bits)).loc(db);
+                    *BuiltinDeriveImplId::from_id(entry_id(bits)).loc(db);
                 let trait_ = BuiltinDeriveImplTrait::ALL
                     .iter()
                     .position(|it| *it == trait_)
@@ -371,21 +382,21 @@ pub(crate) fn write_with<'db>(
                 }
             }
             IdKind::OpaqueTy => {
-                match InternedOpaqueTyId::from_id(salsa::Id::from_bits(bits)).loc(db) {
+                match InternedOpaqueTyId::from_id(entry_id(bits)).loc(db) {
                     ImplTraitId::ReturnTypeImplTrait(def, idx) => Loc::Opaque {
                         alias: false,
-                        def: table.index(IdKind::Function, def.as_id().as_bits()),
+                        def: table.index(IdKind::Function, def.as_id()),
                         idx: idx.into_raw().into_u32(),
                     },
                     ImplTraitId::TypeAliasImplTrait(def, idx) => Loc::Opaque {
                         alias: true,
-                        def: table.index(IdKind::TypeAlias, def.as_id().as_bits()),
+                        def: table.index(IdKind::TypeAlias, def.as_id()),
                         idx: idx.into_raw().into_u32(),
                     },
                 }
             }
             IdKind::Closure | IdKind::Coroutine | IdKind::CoroutineClosure => {
-                let id = salsa::Id::from_bits(bits);
+                let id = entry_id(bits);
                 let InternedClosure { owner, expr, kind: closure_kind } = match kind {
                     IdKind::Closure => InternedClosureId::from_id(id).loc(db),
                     IdKind::Coroutine => InternedCoroutineId::from_id(id).loc(db),
@@ -398,7 +409,7 @@ pub(crate) fn write_with<'db>(
                 }
             }
             IdKind::AnonConst => {
-                let loc = AnonConstId::from_id(salsa::Id::from_bits(bits)).loc(db);
+                let loc = AnonConstId::from_id(entry_id(bits)).loc(db);
                 let ty = loc.ty.as_ref().skip_binder().as_ref();
                 let owner = store_owner_entry(table, loc.owner);
                 table.locs = true;
@@ -461,7 +472,7 @@ pub(crate) fn write_with<'db>(
 
 /// The index of the item `bits` of `kind` in `items`, added when it is new.
 fn index_item(items: &mut PortableIds, kind: IdKind, bits: u64) -> R<u32> {
-    let id = salsa::Id::from_bits(bits);
+    let id = entry_id(bits);
     Ok(match kind {
         IdKind::Function => items.index(FunctionId::from_id(id)),
         IdKind::Struct => items.index(StructId::from_id(id)),
@@ -481,7 +492,7 @@ fn index_item(items: &mut PortableIds, kind: IdKind, bits: u64) -> R<u32> {
 /// The bits of the item `index` names in `items` as a `kind`, `None` when it names another.
 pub(crate) fn item_bits(items: &PortableIds, kind: IdKind, index: u32) -> Option<u64> {
     fn bits(id: impl AsId) -> u64 {
-        id.as_id().as_bits()
+        u64::from(id.as_id().as_u32())
     }
     match kind {
         IdKind::Function => items.get::<FunctionId>(index).map(bits),
@@ -505,9 +516,9 @@ pub(crate) fn item_kind_of(byte: u8) -> Option<IdKind> {
 
 fn adt_entry(table: &mut Table, adt: AdtId) -> u32 {
     match adt {
-        AdtId::StructId(it) => table.index(IdKind::Struct, it.as_id().as_bits()),
-        AdtId::UnionId(it) => table.index(IdKind::Union, it.as_id().as_bits()),
-        AdtId::EnumId(it) => table.index(IdKind::Enum, it.as_id().as_bits()),
+        AdtId::StructId(it) => table.index(IdKind::Struct, it.as_id()),
+        AdtId::UnionId(it) => table.index(IdKind::Union, it.as_id()),
+        AdtId::EnumId(it) => table.index(IdKind::Enum, it.as_id()),
     }
 }
 
@@ -515,11 +526,11 @@ fn adt_entry(table: &mut Table, adt: AdtId) -> u32 {
 /// and its entry.
 fn body_entry(table: &mut Table, def: DefWithBodyId) -> (u8, u32) {
     match def {
-        DefWithBodyId::FunctionId(it) => (0, table.index(IdKind::Function, it.as_id().as_bits())),
-        DefWithBodyId::StaticId(it) => (1, table.index(IdKind::Static, it.as_id().as_bits())),
-        DefWithBodyId::ConstId(it) => (2, table.index(IdKind::Const, it.as_id().as_bits())),
+        DefWithBodyId::FunctionId(it) => (0, table.index(IdKind::Function, it.as_id())),
+        DefWithBodyId::StaticId(it) => (1, table.index(IdKind::Static, it.as_id())),
+        DefWithBodyId::ConstId(it) => (2, table.index(IdKind::Const, it.as_id())),
         DefWithBodyId::VariantId(it) => {
-            (3, table.index(IdKind::EnumVariant, it.as_id().as_bits()))
+            (3, table.index(IdKind::EnumVariant, it.as_id()))
         }
     }
 }
@@ -528,14 +539,14 @@ fn body_entry(table: &mut Table, def: DefWithBodyId) -> (u8, u32) {
 fn infer_owner_entry(table: &mut Table, owner: InferBodyId<'_>) -> (u8, u32) {
     match owner {
         InferBodyId::DefWithBodyId(def) => body_entry(table, def),
-        InferBodyId::AnonConstId(it) => (4, table.index(IdKind::AnonConst, it.as_id().as_bits())),
+        InferBodyId::AnonConstId(it) => (4, table.index(IdKind::AnonConst, it.as_id())),
     }
 }
 
 /// An anonymous constant's store: a signature (tags 0 to 8, `GenericDefId`'s variants in
 /// order, an ADT as its three), a body (9 to 12) or a variant's fields (13 to 15).
 fn store_owner_entry(table: &mut Table, owner: ExpressionStoreOwnerId) -> (u8, u32) {
-    let mut item = |kind, id: salsa::Id| table.index(kind, id.as_bits());
+    let mut item = |kind, id: blaze_query::db::Id| table.index(kind, id);
     match owner {
         ExpressionStoreOwnerId::Signature(def) => match def {
             GenericDefId::AdtId(AdtId::StructId(it)) => (0, item(IdKind::Struct, it.as_id())),
@@ -711,7 +722,7 @@ pub(crate) fn read<'db>(
                 derive_attr_id: AttrId::from_item_tree_index(attr),
                 derive_index: index,
             };
-            table.entries[at].1 = BuiltinDeriveImplId::new(db, loc).as_id().as_bits();
+            table.entries[at].1 = u64::from(BuiltinDeriveImplId::new(db, loc).as_id().as_u32());
         }
     }
 
@@ -726,7 +737,7 @@ pub(crate) fn read<'db>(
                     false => ImplTraitId::ReturnTypeImplTrait(entry(&table, def)?, idx),
                     true => ImplTraitId::TypeAliasImplTrait(entry(&table, def)?, idx),
                 };
-                InternedOpaqueTyId::new(db, loc).as_id().as_bits()
+                InternedOpaqueTyId::new(db, loc).as_id().as_u32()
             }
             Loc::AnonConst { owner, expr, ty, allow } => {
                 // alloc: the reason of a refusal
@@ -740,11 +751,11 @@ pub(crate) fn read<'db>(
                 let token = LoweringMode::Analysis
                     .allow_tracked_structs()
                     .expect("analysis lowering may make tracked structs");
-                AnonConstId::new(db, loc, token).as_id().as_bits()
+                AnonConstId::new(db, loc, token).as_id().as_u32()
             }
             _ => continue,
         };
-        table.entries[at].1 = bits;
+        table.entries[at].1 = u64::from(bits);
     }
     // Closures last: an owner may be an anonymous constant.
     for (at, loc) in found.iter().enumerate() {
@@ -754,12 +765,12 @@ pub(crate) fn read<'db>(
             let id_kind = table.entries[at].0;
             let expr = closure_expr(db, owner, expr, id_kind)?;
             let loc = InternedClosure { owner, expr, kind: closure_kind };
-            table.entries[at].1 = match id_kind {
+            table.entries[at].1 = u64::from(match id_kind {
                 IdKind::Closure => InternedClosureId::new(db, loc).as_id(),
                 IdKind::Coroutine => InternedCoroutineId::new(db, loc).as_id(),
                 _ => InternedCoroutineClosureId::new(db, loc).as_id(),
             }
-            .as_bits();
+            .as_u32());
         }
     }
     Ok(table)
@@ -769,7 +780,8 @@ pub(crate) fn read<'db>(
 fn entry<T: Relocate>(table: &Table, index: u32) -> R<T> {
     table
         .get(T::KIND, index)
-        .map(|bits| T::from_id(salsa::Id::from_bits(bits)))
+        .and_then(id_at)
+        .map(T::from_id)
         // alloc: the reason of a refusal
         .ok_or_else(|| format!("an entry {index} that is no {:?} made before it", T::KIND))
 }

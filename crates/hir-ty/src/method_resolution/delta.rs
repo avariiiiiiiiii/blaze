@@ -6,7 +6,7 @@
 //! or gone, bindings changed and defs re-read. It recomputes the key ([`key::ImplKey`]: trait
 //! and simplified self type, as `TraitImpls`/`InherentImpls` index) of each impl the write
 //! could have changed (its read set met the delta), moves the rows whose key changed in the
-//! arrangements, and sets the salsa inputs ([`publish`]) of each `(crate, trait)`,
+//! arrangements, and sets the query inputs ([`publish`]) of each `(crate, trait)`,
 //! `(crate, head)` and `(crate, name)` slice whose rows changed. Their `ContentId`s are queries
 //! over the rows, through the impl and def identities lane item-hash installs.
 //!

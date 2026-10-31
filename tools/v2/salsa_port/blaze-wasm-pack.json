@@ -1,0 +1,24 @@
+{
+ "crate": "crates/blaze-wasm-pack",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/blaze-wasm-pack/Cargo.toml",
+   "edits": [
+    {
+     "old": "base-db.workspace = true\ncfg.workspace = true\n",
+     "new": "base-db.workspace = true\nblaze-query.workspace = true\ncfg.workspace = true\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/blaze-wasm-pack/src/record.rs",
+   "edits": [
+    {
+     "old": "use base_db::{Crate, CrateOrigin, Db, blaze_query::db::Setter as _};\n",
+     "new": "use base_db::{Crate, CrateOrigin, Db};\nuse blaze_query::db::Setter as _;\n"
+    }
+   ]
+  }
+ ]
+}

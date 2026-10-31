@@ -1,0 +1,19 @@
+{
+ "crate": "crates/hir-ty-share",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/hir-ty-share/src/lib.rs",
+   "edits": [
+    {
+     "old": "//! Every query is salsa's, memoized by (instance, environment, options): a hit is one lookup.\n",
+     "new": "//! Every query is the query database's, memoized by (instance, environment, options): a hit is one lookup.\n"
+    },
+    {
+     "old": "    /// The instance is in a cycle of instances or types, which salsa gives this to all of.\n",
+     "new": "    /// The instance is in a cycle of instances or types, which the query engine gives this to all of.\n"
+    }
+   ]
+  }
+ ]
+}

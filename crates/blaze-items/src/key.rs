@@ -87,7 +87,7 @@ pub enum Resolved {
 }
 
 /// The key of a crate: its content, never its id (see the module doc).
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub fn crate_key(db: &Db, krate: Crate) -> ContentId {
     let data = krate.data(db);
     let extra = krate.extra_data(db);
@@ -270,7 +270,7 @@ pub fn module_key(db: &Db, module: ModuleId) -> ItemKey {
     module_key_in(db, module)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn module_key_in<'db>(db: &'db Db, module: ModuleIdLt<'db>) -> ItemKey {
     // Each parent's key is had before the preimage is written, so the recursion up to the
     // crate's root holds no scratch buffer.
@@ -372,7 +372,7 @@ fn siblings(db: &Db, id: ItemId) -> Siblings {
 }
 
 /// The key of an item (see the module doc), hashed in one batch with its siblings'.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub fn item_key(db: &Db, id: ItemId) -> ItemKey {
     let batch = match siblings(db, id) {
         Siblings::Module(it) => module_item_keys(db, it),
@@ -395,7 +395,7 @@ pub(crate) fn item_key_alone(db: &Db, id: ItemId) -> ItemKey {
 
 /// The keys of the items a module's scope declares, sorted by id: 40 bytes per item, found by
 /// binary search.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn module_item_keys<'db>(
     db: &'db Db,
     module: ModuleIdLt<'db>,
@@ -420,9 +420,9 @@ fn module_item_keys<'db>(
     for (_, macros) in scope.legacy_macros() {
         ids.extend(macros.iter().map(|&it| ItemId::Macro(it)));
     }
-    let here = salsa::plumbing::AsId::as_id(&module);
+    let here = blaze_query::db::AsId::as_id(&module);
     ids.retain(|&id| {
-        matches!(siblings(db, id), Siblings::Module(it) if salsa::plumbing::AsId::as_id(&it) == here)
+        matches!(siblings(db, id), Siblings::Module(it) if blaze_query::db::AsId::as_id(&it) == here)
     });
     ids.sort_unstable();
     ids.dedup();
@@ -433,7 +433,7 @@ fn module_item_keys<'db>(
     batch.finish()
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn impl_item_keys(db: &Db, impl_: ImplId) -> Vec<(ItemId, ItemKey)> {
     let items = &impl_.impl_items(db).items;
     let mut batch = Batch::with_capacity(items.len());
@@ -443,7 +443,7 @@ fn impl_item_keys(db: &Db, impl_: ImplId) -> Vec<(ItemId, ItemKey)> {
     batch.finish()
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn trait_item_keys(db: &Db, trait_: TraitId) -> Vec<(ItemId, ItemKey)> {
     let items = &trait_.trait_items(db).items;
     let mut batch = Batch::with_capacity(items.len());
@@ -560,7 +560,7 @@ fn variant_preimage(db: &Db, parent: EnumId, name: &Name, b: &mut Bytes) -> Item
     parent
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn enum_variant_keys(db: &Db, enum_: EnumId) -> Vec<(EnumVariantId, ItemKey)> {
     let variants = &enum_.enum_variants(db).variants;
     let mut batch = Batch::with_capacity(variants.len());
@@ -1086,7 +1086,7 @@ impl std::hash::Hasher for KeyHasher {
 
 /// Every crate of the build by the first 8 bytes of its key, sorted. Stops if two crates have
 /// one: an item of one would be taken for the other's.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn crates_by_prefix(db: &Db) -> Vec<(u64, Crate)> {
     let mut krates: Vec<(u64, Crate)> = base_db::all_crates(db)
         .iter()
@@ -1120,7 +1120,7 @@ pub(crate) fn crate_item_ids(db: &Db, krate: Crate) -> impl Iterator<Item = Item
 
 /// What has a key inside a crate's stores and items' types, in one index: a key that is no
 /// module, impl or trait item is one lookup, not one per store of every crate.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn crate_inner_items(db: &Db, krate: Crate) -> KeyIndex<Resolved> {
     const WHAT: &str = "a crate's index of keys inside bodies";
     let mut rows = key_rows(WHAT);
@@ -1208,7 +1208,7 @@ impl Sink for FrameRows<'_> {
 }
 
 /// The items of a crate's modules, impls and traits, and where to look for the rest.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn crate_items(db: &Db, krate: Crate) -> Items {
     let mut rows = CrateRows { rows: key_rows(CRATE_KEYS), inner: key_rows(CRATE_STORES) };
     def_map_items(db, hir_def::nameres::crate_def_map(db, krate), &mut rows);
@@ -1220,8 +1220,8 @@ fn crate_items(db: &Db, krate: Crate) -> Items {
 
 /// What has a key inside one store or one item's type, transitively (the items of a block
 /// have stores of their own), sorted by [`order`] and distinct.
-// The unit makes the arguments something salsa interns: `Inner` is no salsa struct.
-#[salsa::tracked(returns(ref))]
+// The unit makes the arguments an interned key: `Inner` alone is no ID.
+#[blaze_query::tracked(returns(ref))]
 fn inner_items(db: &Db, inner: Inner, _: ()) -> Box<[Row<Resolved>]> {
     frame::task(Tag::Other, |frame| inner_rows(db, inner, frame))
 }

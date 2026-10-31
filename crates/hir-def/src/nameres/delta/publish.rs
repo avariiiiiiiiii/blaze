@@ -7,7 +7,7 @@
 use base_db::{Crate, Db};
 use hir_expand::name::Name;
 use rustc_hash::FxHashMap;
-use salsa::{Durability, Setter};
+use blaze_query::db::{Durability, Setter};
 use triomphe::Arc;
 
 use super::reads;
@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// One module's scope as the maintainer last built it: what `ScopeSlot::Input` reads.
-#[salsa::input]
+#[blaze_query::input]
 pub(in crate::nameres) struct ScopeInput {
     #[returns(copy)]
     pub(in crate::nameres) module: ModuleId,
@@ -32,21 +32,21 @@ pub(in crate::nameres) struct ScopeInput {
     pub(in crate::nameres) children: FxIndexMap<Name, ModuleId>,
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl ScopeInput {
     /// What one name means in the module. Adding or removing another item leaves this equal,
     /// so a query that only looked names up is not run again.
-    #[salsa::tracked]
+    #[blaze_query::tracked]
     fn name(self, db: &Db, name: Name) -> PerNs {
         self.scope(db).get(&name)
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     fn legacy_macro(self, db: &Db, name: Name) -> Option<Box<[MacroId]>> {
         self.scope(db).get_legacy_macro(&name).map(Box::from)
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     fn traits(self, db: &Db) -> Box<[TraitId]> {
         // alloc: the memo's value, once per module scope
         self.scope(db).traits().collect()
@@ -56,7 +56,7 @@ impl ScopeInput {
 /// A crate's resolution besides its modules' scopes. Set only when the module tree, the crate
 /// env, the crate data, the name records or the diagnostics change: an item added to a module
 /// leaves it as it is.
-#[salsa::input]
+#[blaze_query::input]
 pub(in crate::nameres) struct CrateResolution {
     #[returns(copy)]
     root: ModuleId,
@@ -78,23 +78,23 @@ pub(in crate::nameres) struct CrateResolution {
 
 /// Every maintained crate's [`CrateResolution`]: changes only when a crate gains or loses its
 /// state.
-#[salsa::input(singleton)]
+#[blaze_query::input(singleton)]
 pub(in crate::nameres) struct Resolutions {
     #[returns(ref)]
     crates: FxHashMap<Crate, CrateResolution>,
 }
 
-fn scope_input(id: salsa::Id) -> ScopeInput {
-    <ScopeInput as salsa::plumbing::FromId>::from_id(id)
+fn scope_input(id: blaze_query::db::Id) -> ScopeInput {
+    <ScopeInput as blaze_query::db::FromId>::from_id(id)
 }
 
-fn resolution(id: salsa::Id) -> CrateResolution {
-    <CrateResolution as salsa::plumbing::FromId>::from_id(id)
+fn resolution(id: blaze_query::db::Id) -> CrateResolution {
+    <CrateResolution as blaze_query::db::FromId>::from_id(id)
 }
 
 // What `nameres.rs` reads.
 
-pub(in crate::nameres) fn input_scope(db: &Db, id: salsa::Id) -> &ItemScope {
+pub(in crate::nameres) fn input_scope(db: &Db, id: blaze_query::db::Id) -> &ItemScope {
     let input = scope_input(id);
     if reads::on() {
         reads::note(input.module(db), None);
@@ -102,7 +102,7 @@ pub(in crate::nameres) fn input_scope(db: &Db, id: salsa::Id) -> &ItemScope {
     input.scope(db)
 }
 
-pub(in crate::nameres) fn input_name(db: &Db, id: salsa::Id, name: Name) -> PerNs {
+pub(in crate::nameres) fn input_name(db: &Db, id: blaze_query::db::Id, name: Name) -> PerNs {
     let input = scope_input(id);
     if reads::on() {
         reads::note(input.module(db), Some(name));
@@ -110,7 +110,7 @@ pub(in crate::nameres) fn input_name(db: &Db, id: salsa::Id, name: Name) -> PerN
     *input.name(db, name)
 }
 
-pub(in crate::nameres) fn input_legacy_macro(db: &Db, id: salsa::Id, name: Name) -> Option<&[MacroId]> {
+pub(in crate::nameres) fn input_legacy_macro(db: &Db, id: blaze_query::db::Id, name: Name) -> Option<&[MacroId]> {
     let input = scope_input(id);
     if reads::on() {
         reads::note(input.module(db), None);
@@ -118,7 +118,7 @@ pub(in crate::nameres) fn input_legacy_macro(db: &Db, id: salsa::Id, name: Name)
     input.legacy_macro(db, name).as_deref()
 }
 
-pub(in crate::nameres) fn input_traits(db: &Db, id: salsa::Id) -> &[TraitId] {
+pub(in crate::nameres) fn input_traits(db: &Db, id: blaze_query::db::Id) -> &[TraitId] {
     let input = scope_input(id);
     if reads::on() {
         reads::note(input.module(db), None);
@@ -126,7 +126,7 @@ pub(in crate::nameres) fn input_traits(db: &Db, id: salsa::Id) -> &[TraitId] {
     input.traits(db)
 }
 
-pub(in crate::nameres) fn input_children(db: &Db, id: salsa::Id) -> &FxIndexMap<Name, ModuleId> {
+pub(in crate::nameres) fn input_children(db: &Db, id: blaze_query::db::Id) -> &FxIndexMap<Name, ModuleId> {
     let input = scope_input(id);
     if reads::on() {
         reads::note(input.module(db), None);
@@ -134,11 +134,11 @@ pub(in crate::nameres) fn input_children(db: &Db, id: salsa::Id) -> &FxIndexMap<
     input.children(db)
 }
 
-pub(in crate::nameres) fn published_modules(db: &Db, id: salsa::Id) -> &ModulesMap {
+pub(in crate::nameres) fn published_modules(db: &Db, id: blaze_query::db::Id) -> &ModulesMap {
     resolution(id).modules(db)
 }
 
-pub(in crate::nameres) fn published_records(db: &Db, id: salsa::Id) -> &OwnedRecords {
+pub(in crate::nameres) fn published_records(db: &Db, id: blaze_query::db::Id) -> &OwnedRecords {
     resolution(id).records(db)
 }
 
@@ -147,7 +147,7 @@ pub(in crate::nameres) fn published_records(db: &Db, id: salsa::Id) -> &OwnedRec
 /// themselves.
 pub(in crate::nameres) fn published(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
     let resolution = *Resolutions::try_get(db)?.crates(db).get(&krate)?;
-    let id = salsa::plumbing::AsId::as_id(&resolution);
+    let id = blaze_query::db::AsId::as_id(&resolution);
     let def_map = DefMap {
         krate,
         block: None,
@@ -198,8 +198,8 @@ pub(super) fn set_scope(
     set
 }
 
-pub(super) fn scope_id(input: ScopeInput) -> salsa::Id {
-    salsa::plumbing::AsId::as_id(&input)
+pub(super) fn scope_id(input: ScopeInput) -> blaze_query::db::Id {
+    blaze_query::db::AsId::as_id(&input)
 }
 
 /// Sets a module's scope alone, its children as they are, where it changed: whether it did.

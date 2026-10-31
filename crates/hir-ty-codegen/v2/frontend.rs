@@ -28,7 +28,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::{
     BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike as _,
 };
-use salsa::plumbing::FromId;
+use blaze_query::db::FromId;
 use smallvec::{SmallVec, smallvec};
 
 use super::{Body, BuildTime, HashSource, Hashes, HirInstance, HirStatic, Kind, build::Build, refs, undescribed};
@@ -726,7 +726,7 @@ const ARGS_DOMAIN: &str = "blaze v2 args 1";
 const SHARED_ARGS_DOMAIN: &str = "blaze v2 shared args 1";
 
 /// Whether an instance with no share key for `why` is compiled for its arguments alone by
-/// what it is: one of a cycle (salsa's answer for all of it), a shim built without MIR, or a
+/// what it is: one of a cycle (the query engine's answer for all of it), a shim built without MIR, or a
 /// call of an intrinsic whose code is the instance's. Every other reason is something the key
 /// could not read (a layout, a constant, an intrinsic missing from the table), and an error.
 fn per_instance(why: &Unshared) -> bool {

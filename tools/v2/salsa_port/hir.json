@@ -1,0 +1,15 @@
+{
+ "crate": "crates/hir",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/hir/src/evict.rs",
+   "edits": [
+    {
+     "old": "//! Each value dropped keeps its memo, its fingerprint and the edges it read (salsa's\n",
+     "new": "//! Each value dropped keeps its memo, its fingerprint and the edges it read (the query database's\n"
+    }
+   ]
+  }
+ ]
+}

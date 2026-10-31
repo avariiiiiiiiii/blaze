@@ -17,7 +17,7 @@ use rustc_type_ir::{
     AliasTy, AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitor,
     inherent::{BoundExistentialPredicates as _, IntoKind, SliceLike as _},
 };
-use salsa::plumbing::FromId as _;
+use blaze_query::db::FromId as _;
 use smallvec::SmallVec;
 
 use hir_ty::{
@@ -217,7 +217,7 @@ static NO_HOME: LazyLock<bool> = LazyLock::new(|| std::env::var_os("BLAZE_NO_HOM
 
 /// What `krate` can see: itself and the crates whose impls it knows ([`loaded_crates`]),
 /// sorted to be probed by binary search. One memo for every task that asks.
-#[salsa::tracked(returns(deref))]
+#[blaze_query::tracked(returns(deref))]
 fn sees(db: &Db, krate: Crate) -> Box<[Crate]> {
     // alloc: the memo's result, one exact block
     let mut sees: Box<[Crate]> = loaded_crates(db, krate).into();

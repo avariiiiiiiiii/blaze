@@ -220,8 +220,8 @@ pub fn file_item_tree(db: &Db, file_id: HirFileId, krate: Crate) -> &ItemTree {
 /// A source file's tree is made from its last one where it was edited ([`items`]), so an edit
 /// lowers only the items it touches, and one that touches none returns the last tree itself;
 /// a macro file's is lowered whole, as each expansion is made anew. The tree is behind an
-/// `Arc` so the last one is kept beside salsa without a copy.
-#[salsa::tracked(returns(deref))]
+/// `Arc` so the last one is kept beside the query database without a copy.
+#[blaze_query::tracked(returns(deref))]
 fn file_item_tree_query(
     db: &Db,
     file_id: HirFileId,
@@ -265,7 +265,7 @@ pub(crate) fn lower_whole(db: &Db, file_id: HirFileId, krate: Crate) -> ItemTree
     }
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn block_item_tree_query(
     db: &Db,
     block: BlockId,
@@ -280,7 +280,7 @@ pub(crate) fn block_item_tree_query(
 }
 
 block::columns! {
-    /// The item tree of a source file, as columns (the module's docs), all in one block: a salsa
+    /// The item tree of a source file, as columns (the module's docs), all in one block: a query
     /// memo has no lifetime group of its own, so it is one allocation of the global allocator,
     /// made once a tree (none for a tree with no values).
     pub struct ItemTree(ItemTreeColumn, ItemTreeLens, ItemTreeSinks) {

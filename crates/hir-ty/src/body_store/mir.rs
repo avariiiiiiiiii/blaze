@@ -51,7 +51,7 @@ type Built<'db> = Result<MirBody<'db>, MirLowerError<'db>>;
 /// A `concat!` of no location is kept as a slot too, which reads back as the same constant. The
 /// source map changes with every edit above the body, and only a body that calls one of these
 /// macros reads it.
-#[salsa::tracked(returns(deref), mem_tag = Mir)]
+#[blaze_query::tracked(returns(deref), mem_tag = Mir)]
 pub fn location_literals(db: &Db, def: DefWithBodyId) -> Box<[ExprId]> {
     let body = Body::of(db, def);
     let located = |kind: MacroDefKind| {
@@ -242,7 +242,7 @@ fn offer_mir<'db>(
     owner: MirOwner<'db>,
     schema: SchemaHash,
     body: &MirBody<'db>,
-    reads: Option<salsa::Reads>,
+    reads: Option<blaze_query::db::Reads>,
 ) {
     super::offer(db, def, Step::Mir, schema, reads, |facts, out| {
         // alloc: the reason a body is not stored

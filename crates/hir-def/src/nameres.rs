@@ -127,7 +127,7 @@ pub static EXPAND_BUILTIN_DERIVES: std::sync::atomic::AtomicBool =
 
 /// Builtin derives expanded in one database only: an input, so a def map collected on any
 /// thread of the plane sees it, and setting it reruns what it changes.
-#[salsa::input(singleton, debug)]
+#[blaze_query::input(singleton, debug)]
 pub struct BuiltinDerives {
     #[returns(copy)]
     pub expand: bool,
@@ -135,7 +135,7 @@ pub struct BuiltinDerives {
 
 /// Has the def maps of `db` expand builtin derives (`true`) or only record them.
 pub fn set_expand_builtin_derives(db: &mut Db, expand: bool) {
-    use salsa::{Durability, Setter};
+    use blaze_query::db::{Durability, Setter};
     match BuiltinDerives::try_get(db) {
         Some(it) => {
             it.set_expand(db).with_durability(Durability::HIGH).to(expand);
@@ -270,7 +270,7 @@ type DeriveHelpers =
 
 /// What a collected def map recorded that no resolution reads: how its imports and macro calls
 /// resolved, its diagnostics and the derive helpers in scope of its items.
-#[salsa::tracked]
+#[blaze_query::tracked]
 struct HeldRecords<'db> {
     root: ModuleIdLt<'db>,
     #[tracked]
@@ -282,8 +282,8 @@ struct HeldRecords<'db> {
 /// `delta::CrateResolution`, which the name resolution maintainer sets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecordsSlot {
-    Held(salsa::Id),
-    Published(salsa::Id),
+    Held(blaze_query::db::Id),
+    Published(blaze_query::db::Id),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -501,7 +501,7 @@ pub struct ModuleData {
 
 /// The modules of a `DefMap`, held by the database on their own: a `DefMap` stays what it was
 /// when a module is added to it, and so does everything that was resolved through it.
-#[salsa::tracked]
+#[blaze_query::tracked]
 struct Modules<'db> {
     root: ModuleIdLt<'db>,
     #[tracked]
@@ -509,11 +509,11 @@ struct Modules<'db> {
     table: ModulesMap,
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl<'db> Modules<'db> {
     /// One module of a collected `DefMap`. Depends on the modules there are, and is the same
     /// for as long as the module is.
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     fn module(self, db: &'db Db, module: ModuleId) -> Option<ModuleData> {
         self.table(db).get(&module).cloned()
     }
@@ -521,7 +521,7 @@ impl<'db> Modules<'db> {
     /// What `name` means in `module`: one memo for a path segment, where reading the module
     /// and then its scope is two. Depends on the modules there are and on that module's scope;
     /// backdated while the name means what it did.
-    #[salsa::tracked]
+    #[blaze_query::tracked]
     fn name(self, db: &'db Db, module: ModuleId, name: Name) -> PerNs {
         let Some(data) = self.table(db).get(&module) else {
             panic!("ModuleId not found in ModulesMap: {module:#?}")
@@ -549,23 +549,23 @@ enum ModulesSlot {
     /// While the `DefMap` is being collected.
     Building(ModulesMap),
     /// A `Modules`, once it is.
-    Collected(salsa::Id),
+    Collected(blaze_query::db::Id),
     /// A view of the per-module resolver (`facts`): the modules it holds, and every other
     /// module of its crate read through `facts::row` of `rows` (a `facts` `RowsKey`).
-    Unit { own: ModulesMap, rows: salsa::Id },
+    Unit { own: ModulesMap, rows: blaze_query::db::Id },
     /// A view of the name resolution maintainer (`delta`): the modules its run holds, and every
     /// other module of the crate as the maintainer's state has it. Every read is noted
     /// (`delta::reads`) with its reader: it is what wakes that reader again when the module
     /// changes.
     Maintained { own: ModulesMap, outside: ModulesMap },
     /// A crate's modules as the maintainer published them: `delta::CrateResolution::modules`.
-    Published(salsa::Id),
+    Published(blaze_query::db::Id),
 }
 
 /// The items of one module, held by the database on their own. A query that reads the scope of
 /// a module then depends on that scope and not on the whole `DefMap`, so adding an item to one
 /// module leaves what was resolved through the others alone.
-#[salsa::tracked]
+#[blaze_query::tracked]
 struct ModuleScope<'db> {
     module: ModuleIdLt<'db>,
     #[tracked]
@@ -576,21 +576,21 @@ struct ModuleScope<'db> {
     children: FxIndexMap<Name, ModuleId>,
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 impl<'db> ModuleScope<'db> {
     /// What one name means in the module. Adding or removing another item leaves this equal,
     /// so a query that only looked names up is not re-run.
-    #[salsa::tracked]
+    #[blaze_query::tracked]
     fn name(self, db: &'db Db, name: Name) -> PerNs {
         self.scope(db).get(&name)
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     fn legacy_macro(self, db: &'db Db, name: Name) -> Option<Box<[MacroId]>> {
         self.scope(db).get_legacy_macro(&name).map(Box::from)
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[blaze_query::tracked(returns(ref))]
     fn traits(self, db: &'db Db) -> Box<[crate::TraitId]> {
         // alloc: the memo's value, once per module scope
         self.scope(db).traits().collect()
@@ -611,16 +611,16 @@ enum ScopeSlot {
     /// While the `DefMap` is being collected.
     Building(Box<BuildingScope>),
     /// A `ModuleScope`, once it is.
-    Collected(salsa::Id),
+    Collected(blaze_query::db::Id),
     /// The `ModuleScope` a resolver fact names (a `facts` `ScopeRef`), looked up on first read.
-    Fact(salsa::Id),
+    Fact(blaze_query::db::Id),
     /// The module's scope as the name resolution maintainer published it (`delta::ScopeInput`).
-    Input(salsa::Id),
+    Input(blaze_query::db::Id),
 }
 
 impl ScopeSlot {
     /// The `ModuleScope` of a handed-over or fact slot.
-    fn handle(&self, db: &Db) -> Option<salsa::Id> {
+    fn handle(&self, db: &Db) -> Option<blaze_query::db::Id> {
         match self {
             ScopeSlot::Building(_) | ScopeSlot::Input(_) => None,
             ScopeSlot::Collected(id) => Some(*id),
@@ -638,7 +638,7 @@ pub fn crate_def_map(db: &Db, crate_id: Crate) -> &DefMap {
 
 /// The recursion limit of `krate` (`#![recursion_limit]`, 128 by default): what the solver
 /// reads of the def map, so that it depends on that alone.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
     crate_def_map(db, krate).recursion_limit()
 }
@@ -650,7 +650,7 @@ pub fn crate_recursion_limit(db: &Db, krate: Crate) -> u32 {
 /// that primitive type, unless a generic parameter or a block scope around the path has the
 /// name: blocks are not counted (each has its own def map), nor are generic parameters, so a
 /// caller checks those itself.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 pub fn crate_shadows_primitive_type(db: &Db, krate: Crate) -> bool {
     let pair = crate_local_def_map(db, krate);
     let def_map = pair.def_map(db);
@@ -664,7 +664,7 @@ pub fn crate_shadows_primitive_type(db: &Db, krate: Crate) -> bool {
         })
 }
 
-#[salsa::tracked]
+#[blaze_query::tracked]
 pub(crate) struct DefMapPair<'db> {
     #[tracked]
     #[returns(ref)]
@@ -673,7 +673,7 @@ pub(crate) struct DefMapPair<'db> {
     pub(crate) local: LocalDefMap,
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
     let _p = tracing::info_span!(
         "crate_def_map_query",
@@ -708,7 +708,7 @@ pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
     DefMapPair::new(db, def_map, local_def_map)
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
     // The `'static` ids go only into the `DefMap` this query returns, invalidated with its key.
     let block_id = block_id.to_static();
@@ -824,16 +824,16 @@ impl DefMap {
             derive_helpers_in_scope: std::mem::take(&mut self.derive_helpers_in_scope),
         };
         let held = HeldRecords::new(db, self.root, records);
-        self.records = Some(RecordsSlot::Held(salsa::plumbing::AsId::as_id(&held)));
+        self.records = Some(RecordsSlot::Held(blaze_query::db::AsId::as_id(&held)));
         for (id, module) in modules.iter_mut() {
             if let ScopeSlot::Building(building) = &mut module.scope {
                 let BuildingScope { scope, children } = std::mem::take(&mut **building);
                 let scope = ModuleScope::new(db, id, scope, children);
-                module.scope = ScopeSlot::Collected(salsa::plumbing::AsId::as_id(&scope));
+                module.scope = ScopeSlot::Collected(blaze_query::db::AsId::as_id(&scope));
             }
         }
         let modules = Modules::new(db, self.root, std::mem::replace(modules, ModulesMap::new()));
-        self.modules = ModulesSlot::Collected(salsa::plumbing::AsId::as_id(&modules));
+        self.modules = ModulesSlot::Collected(blaze_query::db::AsId::as_id(&modules));
     }
 
     /// What `name` means in module `id` of this `DefMap`; depends on that name only.
@@ -855,7 +855,7 @@ impl DefMap {
             }
             ModulesSlot::Collected(modules) => {
                 let id = id.to_static();
-                *<Modules<'_> as salsa::plumbing::FromId>::from_id(*modules).name(db, id, *name)
+                *<Modules<'_> as blaze_query::db::FromId>::from_id(*modules).name(db, id, *name)
             }
         }
     }
@@ -863,7 +863,7 @@ impl DefMap {
     /// One module of the `DefMap`; depends on that module only.
     pub fn module<'a>(&'a self, db: &'a Db, id: ModuleIdLt<'_>) -> &'a ModuleData {
         // The `'static` copy only keys the lookup in `self.modules` (and in a collected map the
-        // `Modules::module` query); salsa ids carry a generation, so a freed one matches no later id.
+        // `Modules::module` query); the query database never frees an id, so none is reused.
         let id = id.to_static();
         let found = match &self.modules {
             ModulesSlot::Building(modules) => modules.get(&id),
@@ -877,7 +877,7 @@ impl DefMap {
             }
             ModulesSlot::Published(resolution) => delta::published_modules(db, *resolution).get(&id),
             ModulesSlot::Collected(modules) => {
-                <Modules<'a> as salsa::plumbing::FromId>::from_id(*modules).module(db, id).as_ref()
+                <Modules<'a> as blaze_query::db::FromId>::from_id(*modules).module(db, id).as_ref()
             }
         };
         found
@@ -893,7 +893,7 @@ impl DefMap {
             }
             ModulesSlot::Published(resolution) => delta::published_modules(db, *resolution),
             ModulesSlot::Collected(id) => {
-                <Modules<'a> as salsa::plumbing::FromId>::from_id(*id).table(db)
+                <Modules<'a> as blaze_query::db::FromId>::from_id(*id).table(db)
             }
         }
     }
@@ -953,7 +953,7 @@ impl DefMap {
             Some(slot) => {
                 let held = match slot {
                     RecordsSlot::Held(id) => {
-                        <HeldRecords<'a> as salsa::plumbing::FromId>::from_id(id).records(db)
+                        <HeldRecords<'a> as blaze_query::db::FromId>::from_id(id).records(db)
                     }
                     RecordsSlot::Published(resolution) => delta::published_records(db, resolution),
                 };
@@ -1343,7 +1343,7 @@ impl ModuleData {
             origin,
             visibility,
             parent,
-            scope: ScopeSlot::Collected(salsa::plumbing::AsId::as_id(&scope)),
+            scope: ScopeSlot::Collected(blaze_query::db::AsId::as_id(&scope)),
         }
     }
 
@@ -1353,7 +1353,7 @@ impl ModuleData {
             ScopeSlot::Input(input) => delta::input_scope(db, *input),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
-                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id).scope(db)
+                <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id).scope(db)
             }
         }
     }
@@ -1365,7 +1365,7 @@ impl ModuleData {
             ScopeSlot::Input(input) => delta::input_name(db, *input, *name),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
-                *<ModuleScope<'_> as salsa::plumbing::FromId>::from_id(id).name(db, *name)
+                *<ModuleScope<'_> as blaze_query::db::FromId>::from_id(id).name(db, *name)
             }
         }
     }
@@ -1380,7 +1380,7 @@ impl ModuleData {
             ScopeSlot::Input(input) => delta::input_legacy_macro(db, *input, *name),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
-                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id)
+                <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id)
                     .legacy_macro(db, *name)
                     .as_deref()
             }
@@ -1400,7 +1400,7 @@ impl ModuleData {
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => (
                 None,
                 Some(
-                    <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(self.scope.handle(db).expect("a handed-over slot"))
+                    <ModuleScope<'a> as blaze_query::db::FromId>::from_id(self.scope.handle(db).expect("a handed-over slot"))
                         .traits(db)
                         .iter()
                         .copied(),
@@ -1417,7 +1417,7 @@ impl ModuleData {
             ScopeSlot::Input(input) => delta::input_children(db, *input),
             ScopeSlot::Collected(_) | ScopeSlot::Fact(_) => {
                 let id = self.scope.handle(db).expect("a handed-over slot");
-                <ModuleScope<'a> as salsa::plumbing::FromId>::from_id(id).children(db)
+                <ModuleScope<'a> as blaze_query::db::FromId>::from_id(id).children(db)
             }
         }
     }

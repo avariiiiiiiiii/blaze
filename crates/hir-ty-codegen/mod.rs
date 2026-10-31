@@ -59,7 +59,7 @@ use rustc_type_ir::UintTy;
 use rustc_type_ir::inherent::{
     AdtDef as _, BoundExistentialPredicates as _, GenericArgs as _, IntoKind, SliceLike, Ty as _,
 };
-use salsa::plumbing::{AsId, FromId};
+use blaze_query::db::{AsId, FromId};
 use syntax::{TextRange, TextSize};
 use triomphe::Arc;
 
@@ -688,13 +688,13 @@ struct Instance {
 enum InstanceDef {
     Fn(FunctionId),
     /// An `InternedClosureId`, stored without its database lifetime.
-    Closure(salsa::Id),
+    Closure(blaze_query::db::Id),
     /// An `InternedCoroutineId`: the `Future::poll` of an `async` block. Polled with a null
     /// context, it drops whatever the block holds instead.
-    Coroutine(salsa::Id),
+    Coroutine(blaze_query::db::Id),
     /// The same of the future an `async` closure gives when it is called by value though it
     /// could be called again: that future owns what the closure captured.
-    CoroutineByMove(salsa::Id),
+    CoroutineByMove(blaze_query::db::Id),
     /// `drop_in_place` for the type that is the instance's only generic argument.
     DropGlue,
     /// `FnOnce::call_once` in the vtable of the closure type that is the instance's only
@@ -845,19 +845,19 @@ fn print_of(code: &impl std::hash::Hash) -> u128 {
 
 /// The print of the function's code. The database runs this again only when compiling gave
 /// something else, not each time it compiled.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn root_serial(db: &Db, func: FunctionId) -> u128 {
     compiled_root(db, func).as_ref().map_or(0, print_of)
 }
 
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(copy), revisions = usize::MAX)]
+// Nothing in its arguments is ever collected (the query database frees no interned value),
+// so they stay interned and are never verified.
+#[blaze_query::tracked(returns(copy))]
 fn instance_serial(db: &Db, instance: Instance, env: StoredParamEnvAndCrate) -> u128 {
     compiled_instance(db, instance, env).as_ref().map_or(0, print_of)
 }
 
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn static_serial(db: &Db, id: StaticId) -> u128 {
     compiled_static(db, id).as_ref().map_or(0, print_of)
 }
@@ -866,13 +866,13 @@ fn static_serial(db: &Db, id: StaticId) -> u128 {
 type Row = (u32, base_db::FileId, u32, u32);
 
 /// The rows of the code of a non-generic function, in the order of [`Code::lines`].
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn root_rows(db: &Db, func: FunctionId) -> Vec<Row> {
     compiled_root(db, func).as_ref().map(|it| rows_of(db, it)).unwrap_or_default()
 }
 
 /// The rows of the code of an instance, in the order of [`Code::lines`].
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn instance_rows(
     db: &Db,
     instance: Instance,
@@ -894,7 +894,7 @@ fn rows_of(db: &Db, compiled: &CompiledFunction) -> Vec<Row> {
 }
 
 /// The code of a non-generic function.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db Db, func: FunctionId) -> Result<CompiledFunction> {
     let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
     counted::compiles(func.krate(db));
@@ -991,9 +991,9 @@ fn linked_crates(
 }
 
 /// The code of a function, closure, `async` block or shim with its generic arguments filled in.
-// Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
-// fewer revisions), so they stay interned and are never verified.
-#[salsa::tracked(returns(ref), revisions = usize::MAX, lru = 0)]
+// Nothing in its arguments is ever collected (the query database frees no interned value),
+// so they stay interned and are never verified.
+#[blaze_query::tracked(returns(ref), lru = 0)]
 fn compiled_instance<'db>(
     db: &'db Db,
     instance: Instance,
@@ -1492,7 +1492,7 @@ struct BodyTypes {
     poll: Option<StoredTy>,
 }
 
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn body_types<'db>(
     db: &'db Db,
     instance: Instance,
@@ -1616,7 +1616,7 @@ fn coroutine_instance<'db>(
 type Walked = Vec<(Instance, StoredParamEnvAndCrate)>;
 
 /// The value of a static that rustc exports no symbol for.
-#[salsa::tracked(returns(ref))]
+#[blaze_query::tracked(returns(ref))]
 fn compiled_static<'db>(db: &'db Db, id: StaticId) -> Result<CompiledStatic> {
     let checked = crate_checks_overflow(db, id.krate(db)).unwrap_or(false);
     let mut cg = Recorder::new(db, &**target()?, selected_target()?, checked);
@@ -1690,7 +1690,7 @@ fn refused_const_eval(
 /// macro is called only if the macro is another crate's or the compiler's, and of where the
 /// macro has it otherwise, as it is of what a macro writes of the code of `closure`, or of
 /// the body when there is none, where that is itself what the macro writes.
-#[salsa::tracked]
+#[blaze_query::tracked]
 fn row_location_in_file<'db>(
     db: &'db Db,
     owner: DefWithBodyId,
@@ -1740,7 +1740,7 @@ fn written_place(
 
 /// File, line and column of where a function is declared, from its visibility or `fn` on:
 /// what a pointer to a `#[track_caller]` function reports as its caller, as rustc's shim does.
-#[salsa::tracked]
+#[blaze_query::tracked]
 fn declaration_location<'db>(
     db: &'db Db,
     func: FunctionId,
@@ -1894,7 +1894,7 @@ pub fn stand_in_section(format: object::BinaryFormat) -> (&'static str, &'static
 /// attribute's expansion exports for `__rust_alloc` (the attribute itself is gone from the
 /// static once expanded). The expansion names the function as it exports it, so each module
 /// is asked for the name rather than for the attributes of all its functions.
-#[salsa::tracked(returns(copy))]
+#[blaze_query::tracked(returns(copy))]
 fn declares_global_allocator(db: &Db, krate: Crate) -> bool {
     global_allocator_export(db, krate, "__blaze_global_alloc").is_some()
 }
@@ -2264,7 +2264,7 @@ fn build<'db>(
 }
 
 /// The body of a small function, built to be put where the function is called.
-#[salsa::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]
+#[blaze_query::tracked(returns(ref), no_eq, cycle_result = inlinable_cycle, lru = 0)]
 fn inlinable(
     db: &Db,
     instance: Instance,
@@ -2291,7 +2291,7 @@ fn inlinable(
 /// is called, as LLVM's always-inliner puts it at every level rustc compiles at. `unit` is the
 /// v2 unit's settings it is built under (debug assertions, panic strategy, MIR options), part
 /// of the key; `None` in v1.
-#[salsa::tracked(returns(ref), no_eq, cycle_result = always_inlinable_cycle, lru = 0)]
+#[blaze_query::tracked(returns(ref), no_eq, cycle_result = always_inlinable_cycle, lru = 0)]
 fn always_inlinable(
     db: &Db,
     instance: Instance,
@@ -2345,7 +2345,7 @@ fn built_in_body(
 
 fn inlinable_cycle(
     _: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: Instance,
     _: StoredParamEnvAndCrate,
 ) -> Option<fragment::Inlinable> {
@@ -2354,7 +2354,7 @@ fn inlinable_cycle(
 
 fn always_inlinable_cycle(
     _: &Db,
-    _: salsa::Id,
+    _: blaze_query::db::Id,
     _: Instance,
     _: StoredParamEnvAndCrate,
     _: Option<v2::build::Build>,

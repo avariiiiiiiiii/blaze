@@ -19,16 +19,16 @@ use syntax::view::{self, AstNode as _};
 
 intern::impl_slice_internable!(PathSegments, (), Name);
 
-/// A path's kind and its segments. 24 bytes, `Copy`: the segments are interned once per
+/// A path's kind and its segments. 16 bytes, `Copy`: the segments are interned once per
 /// distinct list (one hash of the names' pointers and a probe, no allocation when the list
-/// exists), so equality and hashing are three words and a clone is a copy. `None` is no segments.
+/// exists), so equality and hashing are two words and a clone is a copy. `None` is no segments.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModPath {
     pub kind: PathKind,
     segments: Option<InternedSlice<PathSegments>>,
 }
 
-const _: () = assert!(size_of::<ModPath>() == 24);
+const _: () = assert!(size_of::<ModPath>() == 16);
 
 /// Segments are gathered here before they are interned: paths longer than this spill to the heap.
 type SegmentBuf = SmallVec<[Name; 8]>;

@@ -1,0 +1,15 @@
+{
+ "crate": "crates/blaze-lazy",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/blaze-lazy/src/compile.rs",
+   "edits": [
+    {
+     "old": "    /// A write to the database stopped the reader before the compile ended (salsa's\n",
+     "new": "    /// A write to the database stopped the reader before the compile ended (the query engine's\n"
+    }
+   ]
+  }
+ ]
+}

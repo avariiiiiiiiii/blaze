@@ -33,8 +33,8 @@ impl_from!(
     EnumId, FunctionId, ImplId, StaticId, StructId, UnionId, TypeAliasId, TraitId, EnumVariantId, ConstId, MacroId for LangItemTarget
 );
 
-/// Salsa query. This will look for lang items in a specific crate.
-#[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
+/// A query. This will look for lang items in a specific crate.
+#[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
 pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
     if let Some(frozen) = crate::nameres::frozen::served_lang_items(db, krate) {
@@ -122,9 +122,9 @@ pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
     if lang_items.is_empty() { None } else { Some(Box::new(lang_items)) }
 }
 
-/// Salsa query. Look for a lang items, starting from the specified crate and recursively
+/// A query. Look for a lang items, starting from the specified crate and recursively
 /// traversing its dependencies.
-#[salsa::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
 pub fn lang_items(db: &Db, start_crate: Crate) -> LangItems {
     let _p = tracing::info_span!("lang_items_query").entered();
 
@@ -329,7 +329,7 @@ impl LangItems {
     }
 }
 
-#[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
+#[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
 pub fn crate_notable_traits(db: &Db, krate: Crate) -> Option<Box<[TraitId]>> {
     blaze_mem::frame::current(|frame| {
         let mut traits = Vec::new_in(frame);
@@ -836,7 +836,7 @@ language_item_table! { LangItems =>
 #[cfg(test)]
 mod tests {
     use intern::{Symbol, sym};
-    use salsa::plumbing::FromId;
+    use blaze_query::db::FromId;
     use hir_expand::fixture;
 
     use super::{LangItemEnum, LangItemTarget, LangItems, crate_lang_items};
@@ -890,8 +890,8 @@ mod tests {
 
     #[test]
     fn assign_keeps_to_the_kind() {
-        let trait_ = TraitId::from_id(salsa::Id::from_bits(5));
-        let struct_ = StructId::from_id(salsa::Id::from_bits(6));
+        let trait_ = TraitId::from_id(blaze_query::db::Id::from_u32(5));
+        let struct_ = StructId::from_id(blaze_query::db::Id::from_u32(6));
         let mut items = LangItems::default();
         items.assign_lang_item(sym::sized, struct_.into());
         assert_eq!(items, LangItems::default());

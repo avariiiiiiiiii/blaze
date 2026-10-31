@@ -1,0 +1,337 @@
+{
+ "crate": "crates/base-db",
+ "base": "8d2f0ab9ce8d0a115eb24c9cca362953b2e8a1cf",
+ "files": [
+  {
+   "path": "crates/base-db/src/db.rs",
+   "edits": [
+    {
+     "old": "//! it: `hir-expand`, `hir-def`, `hir-ty` and the rest declare their queries as salsa tracked\n",
+     "new": "//! it: `hir-expand`, `hir-def`, `hir-ty` and the rest declare their queries as tracked\n"
+    },
+    {
+     "old": "//! caller (docs/v2/plan/lanes/frontend/db.md). salsa registers each crate's ingredients by\n//! type when the storage is made, so this crate names none of them. A query whose code lives\n",
+     "new": "//! caller (docs/v2/plan/lanes/frontend/db.md). Each ingredient is a `static` of the crate that\n//! declares it, which the storage numbers when it is first used, so this crate names none of\n//! them. A query whose code lives\n"
+    },
+    {
+     "old": "/// salsa's accessors, generic over the database, take `&TestDB` as they take `&Db`.\n#[salsa::db]\n",
+     "new": "/// the engine's accessors, generic over the database, take `&TestDB` as they take `&Db`.\n"
+    },
+    {
+     "old": "    storage: salsa::Storage<Db>,\n",
+     "new": "    storage: blaze_query::db::Storage,\n"
+    },
+    {
+     "old": "    /// The events salsa reports, kept only while [`Db::log`] runs; `None` but in a database\n",
+     "new": "    /// The events the query engine reports, kept only while [`Db::log`] runs; `None` but in a database\n"
+    },
+    {
+     "old": "    /// A build's database ([`Db::new`]) that keeps salsa's events while [`Db::log`] runs: for\n",
+     "new": "    /// A build's database ([`Db::new`]) that keeps the query engine's events while [`Db::log`] runs: for\n"
+    },
+    {
+     "old": "    /// [`RunOrder`], it keeps salsa's events while [`Db::log`] runs, and it has empty library\n",
+     "new": "    /// [`RunOrder`], it keeps the query engine's events while [`Db::log`] runs, and it has empty library\n"
+    },
+    {
+     "old": "            // alloc: setup, once per database: salsa's event hook\n            Box::new(move |event: blaze_query::db::Event| {\n",
+     "new": "            // alloc: setup, once per database: the engine's event hook\n            Box::new(move |_: &blaze_query::db::Storage, event: blaze_query::db::Event| {\n"
+    },
+    {
+     "old": "            }) as Box<dyn Fn(blaze_query::db::Event) + Send + Sync> // dyn: salsa's event hook, set once at setup\n",
+     "new": "            }) as blaze_query::db::Hook\n"
+    },
+    {
+     "old": "            storage: salsa::Storage::new(callback),\n",
+     "new": "            storage: blaze_query::db::Storage::new(callback),\n"
+    },
+    {
+     "old": "    /// runs outside salsa's executor, and a task the pump runs on a waiting thread stays out of\n",
+     "new": "    /// runs outside the query engine's executor, and a task the pump runs on a waiting thread stays out of\n"
+    },
+    {
+     "old": "            Run::Pool => run_on_pool(self, blaze_graph::exec::shared(), count, &run),\n",
+     "new": "            Run::Pool => blaze_query::db::pump_barrier(|| {\n                run_on_pool(self, blaze_graph::exec::shared(), count, &run)\n            }),\n"
+    },
+    {
+     "old": "        (self.nonce, salsa::plumbing::ZalsaDatabase::zalsa(self).current_revision())\n",
+     "new": "        (self.nonce, self.storage.view())\n"
+    },
+    {
+     "old": "    /// The names of the queries `f` executed, as salsa names them, in order.\n",
+     "new": "    /// The names of the queries `f` executed, as the query engine names them, in order.\n"
+    },
+    {
+     "old": "                    salsa::Database::ingredient_debug_name(self, database_key.ingredient_index())\n                        .into_owned(),\n",
+     "new": "                    self.storage.ingredient_name(database_key.ingredient_index()).to_owned(),\n"
+    },
+    {
+     "old": "#[salsa::db]\n",
+     "new": ""
+    },
+    {
+     "old": "    /// The plane task this thread runs, from the pool's pump: a thread runs several tasks at\n    /// once, one above the other, and each has its own query stack.\n",
+     "new": ""
+    },
+    {
+     "old": "    fn task_depth(&self) -> u32 {\n        u32::try_from(blaze_graph::pump::depth()).expect(\"a thread runs more than `u32::MAX` tasks\")\n",
+     "new": "    fn storage(&self) -> &blaze_query::db::Storage {\n        &self.storage\n    }\n\n    #[inline]\n    fn storage_mut(&mut self) -> &mut blaze_query::db::Storage {\n        &mut self.storage\n"
+    },
+    {
+     "old": "/// A task that unwinds with [`salsa::Cancelled::WouldWaitOnItself`] asked for a query that a\n",
+     "new": "/// A task that unwinds with [`blaze_query::db::Cancelled::WouldWaitOnItself`] asked for a query that a\n"
+    },
+    {
+     "old": "/// the round is the way back. The first other panic, salsa's other cancellations included,\n",
+     "new": "/// the round is the way back. The first other panic, the engine's other cancellations included,\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/db/executions.rs",
+   "edits": [
+    {
+     "old": "use salsa::IngredientIndex;\n",
+     "new": ""
+    },
+    {
+     "old": "static RAN: Mutex<Option<FxHashMap<IngredientIndex, u32>>> = Mutex::new(None);\nstatic ORDER: Mutex<Vec<IngredientIndex>> = Mutex::new(Vec::new()); // alloc: empty until traced\n",
+     "new": "/// By ingredient index ([`blaze_query::db::Storage::ingredient_name`] names one).\nstatic RAN: Mutex<Option<FxHashMap<u32, u32>>> = Mutex::new(None);\nstatic ORDER: Mutex<Vec<u32>> = Mutex::new(Vec::new()); // alloc: empty until traced\n"
+    },
+    {
+     "old": "    order.into_iter().map(|query| db.ingredient_debug_name(query).into_owned()).collect()\n",
+     "new": "    order.into_iter().map(|query| db.storage().ingredient_name(query).to_owned()).collect()\n"
+    },
+    {
+     "old": "        .map(|(query, count)| (db.ingredient_debug_name(query).into_owned(), count))\n",
+     "new": "        .map(|(query, count)| (db.storage().ingredient_name(query).to_owned(), count))\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/db/shared.rs",
+   "edits": [
+    {
+     "old": "//! every reader ([`salsa::Database::stop_readers`]), then waits for each to let go. This is\n//! what a write to the owner of a salsa database fork did: no task forks the database here,\n//! they share the one `Db`.\n",
+     "new": "//! every reader ([`blaze_query::db::Storage::stop_readers`]), then waits for each to let go:\n//! no task forks the database here, they share the one `Db`.\n"
+    },
+    {
+     "old": "    pub fn stop_readers(&self) {\n        self.db.stop_readers();\n    }\n",
+     "new": "    pub fn stop_readers(&self) {\n        self.db.storage().stop_readers();\n    }\n"
+    },
+    {
+     "old": "            self.db.stop_readers();\n",
+     "new": "            self.db.storage().stop_readers();\n"
+    },
+    {
+     "old": "        let stopped = self.db.readers_stopped();\n",
+     "new": ""
+    },
+    {
+     "old": "        if stopped {\n            db.trigger_cancellation();\n",
+     "new": "        if db.storage().readers_stopped() {\n            db.storage_mut().resume_readers();\n"
+    },
+    {
+     "old": "        if db.readers_stopped() {\n            db.trigger_cancellation();\n",
+     "new": "        if db.storage().readers_stopped() {\n            db.storage_mut().resume_readers();\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/db/shared/tests.rs",
+   "edits": [
+    {
+     "old": "                reader.unwind_if_revision_cancelled();\n",
+     "new": "                blaze_query::db::unwind_if_cancelled(&*reader);\n"
+    },
+    {
+     "old": "    assert!(!shared.readers_stopped(), \"the write clears the stop\");\n",
+     "new": "    assert!(!shared.storage().readers_stopped(), \"the write clears the stop\");\n"
+    },
+    {
+     "old": "    assert!(!shared.readers_stopped());\n",
+     "new": "    assert!(!shared.storage().readers_stopped());\n"
+    },
+    {
+     "old": "    assert!(!shared.readers_stopped(), \"a reader goes on\");\n",
+     "new": "    assert!(!shared.storage().readers_stopped(), \"a reader goes on\");\n"
+    },
+    {
+     "old": "    assert!(shared.readers_stopped());\n",
+     "new": "    assert!(shared.storage().readers_stopped());\n"
+    },
+    {
+     "old": "    assert!(!db.readers_stopped());\n",
+     "new": "    assert!(!db.storage().readers_stopped());\n"
+    },
+    {
+     "old": "            while !db.readers_stopped() {\n",
+     "new": "            while !db.storage().readers_stopped() {\n"
+    },
+    {
+     "old": "            db.unwind_if_revision_cancelled();\n",
+     "new": "            blaze_query::db::unwind_if_cancelled(db);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/db/tests.rs",
+   "edits": [
+    {
+     "old": "/// \"Proof\"). The miss paths salsa keeps out of line (`fetch_unclaimed`, `fetch_cold`) are\n",
+     "new": "/// \"Proof\"). The miss paths the engine keeps out of line (`fetch_cold`) are\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/editioned_file_id.rs",
+   "edits": [
+    {
+     "old": "/// [`EditionedFileId::parse`]. salsa keeps every file's parse ([`Db::admit_parses`] lowers that\n",
+     "new": "/// [`EditionedFileId::parse`]. The query engine keeps every file's parse ([`Db::admit_parses`] lowers that\n"
+    },
+    {
+     "old": "/// What a database keeps its files' parses by: salsa's capacity for them, which\n",
+     "new": "/// What a database keeps its files' parses by: the query engine's capacity for them, which\n"
+    },
+    {
+     "old": "    /// How many parses salsa keeps the values of past a revision; 0 keeps every one.\n",
+     "new": "    /// How many parses the query engine keeps the values of past a view; 0 keeps every one.\n"
+    },
+    {
+     "old": "    /// Sets how many files' parses salsa keeps past this revision by the bytes their trees\n",
+     "new": "    /// Sets how many files' parses the query engine keeps past this view by the bytes their trees\n"
+    },
+    {
+     "old": "    /// How many files' parses salsa keeps now ([`Db::admit_parses`]); 0 is every one.\n",
+     "new": "    /// How many files' parses the query engine keeps now ([`Db::admit_parses`]); 0 is every one.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/files.rs",
+   "edits": [
+    {
+     "old": "    /// no query takes this lock, so no query waits on it. A setter holds it across the salsa\n",
+     "new": "    /// no query takes this lock, so no query waits on it. A setter holds it across the input\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/input.rs",
+   "edits": [
+    {
+     "old": "    /// optimize salsa's query structure\n",
+     "new": "    /// optimize the query engine's dependency structure\n"
+    },
+    {
+     "old": "    /// Sets the graph's crates in `db`, writing only what differs from what is set (salsa does\n",
+     "new": "    /// Sets the graph's crates in `db`, writing only what differs from what is set (the query engine does\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/lib.rs",
+   "edits": [
+    {
+     "old": "//! The front end's one database, [`Db`], and the [`salsa`] inputs it holds: files, source\n",
+     "new": "//! The front end's one database, [`Db`], and the query inputs it holds: files, source\n"
+    },
+    {
+     "old": "\npub use salsa;\n",
+     "new": ""
+    },
+    {
+     "old": "        // If we derive this salsa prints the values recursively, and this causes us to blow.\n",
+     "new": "        // If we derive this the query engine prints the values recursively, and this causes us to blow.\n"
+    },
+    {
+     "old": "                    .field(&format_args!(\"{:04x}\", self.0.index()))\n",
+     "new": "                    .field(&format_args!(\"{:04x}\", self.0.as_u32()))\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/maintain.rs",
+   "edits": [
+    {
+     "old": "//! its state by that delta and sets the salsa inputs whose slice changed. Queries never read a\n",
+     "new": "//! its state by that delta and sets the query inputs whose slice changed. Queries never read a\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/reparse.rs",
+   "edits": [
+    {
+     "old": "//! A slot holds its parse weakly: it lives as long as salsa keeps the parse, so the slots add\n//! no tree to what salsa's LRU keeps. Reading a slot is acquire loads (a `OnceLock` each, never\n",
+     "new": "//! A slot holds its parse weakly: it lives as long as the query engine keeps the parse, so the slots add\n//! no tree to what its `lru` cap keeps. Reading a slot is acquire loads (a `OnceLock` each, never\n"
+    },
+    {
+     "old": "/// again after salsa let one go. Past that, the file's next edit is a whole parse.\n",
+     "new": "/// again after the query engine let one go. Past that, the file's next edit is a whole parse.\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/table.rs",
+   "edits": [
+    {
+     "old": "//! - [`Column`]: a salsa input per dense `u32` ID (a file, a source root), in a\n",
+     "new": "//! - [`Column`]: a query input per dense `u32` ID (a file, a source root), in a\n"
+    },
+    {
+     "old": "        atomic::{AtomicU64, Ordering},\n",
+     "new": "        atomic::{AtomicU32, Ordering},\n"
+    },
+    {
+     "old": "/// A salsa input per ID up to [`Column::MAX`]: a word of the input's ID bits per ID, 0 for none\n/// (an input's index is never 0), in one region reserved for `MAX + 1` words and committed as\n",
+     "new": "/// A query input per ID up to [`Column::MAX`]: a word of the input's ID per ID, 0 for none\n/// (no ID is 0), in one region reserved for `MAX + 1` words and committed as\n"
+    },
+    {
+     "old": "    words: AppendVec<AtomicU64>,\n",
+     "new": "    words: AppendVec<AtomicU32>,\n"
+    },
+    {
+     "old": "            self.words.writer().extend_with((raw - len + 1) as usize, |_| AtomicU64::new(0));\n",
+     "new": "            self.words.writer().extend_with((raw - len + 1) as usize, |_| AtomicU32::new(0));\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/tests.rs",
+   "edits": [
+    {
+     "old": "            let id = Id::from_u32(rng.below(u32::MAX as u64) + 1);\n",
+     "new": "            let id = Id::from_u32(rng.below(u64::from(Id::MAX_U32)) as u32 + 1);\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/tests/memo_properties.rs",
+   "edits": [
+    {
+     "old": "//! Salsa's memos against recomputation: over any run of edits, reads, LRU evictions and\n",
+     "new": "//! The query engine's memos against recomputation: over any run of edits, reads, LRU evictions and\n"
+    },
+    {
+     "old": "    Read { file: u32, through: bool },\n    Evict,\n",
+     "new": "    Read { file: u32, through: bool },\n    /// The `lru` caps apply when a view opens: a write that changed nothing, of every kind.\n    Evict,\n"
+    },
+    {
+     "old": "            Op::Evict => db.trigger_lru_eviction(),\n            Op::SyntheticWrite => db.synthetic_write(Durability::LOW),\n",
+     "new": "            Op::Evict => db.storage_mut().synthetic_write(Durability::HIGH),\n            Op::SyntheticWrite => db.storage_mut().synthetic_write(Durability::LOW),\n"
+    }
+   ]
+  },
+  {
+   "path": "crates/base-db/src/view.rs",
+   "edits": [
+    {
+     "old": "//! whose content changed, so salsa sees no change where there is none.\n",
+     "new": "//! whose content changed, so the query engine sees no change where there is none.\n"
+    }
+   ]
+  }
+ ]
+}

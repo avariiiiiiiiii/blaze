@@ -1,6 +1,6 @@
-//! Processes: whether one runs, ending a worker's process group, the action of `SIGPIPE`, the
-//! CPU time used, and on Windows the handles a child inherits. std has none of these: each is
-//! the one system call that does it.
+//! Processes: whether one runs, how a child ended, ending a worker's process group, the
+//! action of `SIGPIPE`, the CPU time used, and on Windows the handles a child inherits. std
+//! has none of these: each is the one system call that does it.
 
 #[cfg(unix)]
 use std::time::Duration;
@@ -12,6 +12,32 @@ pub fn alive(pid: u32) -> bool {
     // SAFETY: `kill` takes no pointer, so no memory of this process is at stake whatever `pid`
     // is, and a signal of 0 is delivered to nothing: it only asks whether `pid` may be sent one.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// How a child of this process ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reaped {
+    Code(i32),
+    Signal(i32),
+}
+
+/// How `pid` ended, waited for, when it is a child of this process that ended; `None` when
+/// it runs, or is no child of this one (whose end only its parent hears).
+#[cfg(unix)]
+pub fn reap(pid: u32) -> Option<Reaped> {
+    let pid = libc::pid_t::try_from(pid).ok()?;
+    let mut status = 0;
+    // SAFETY: `status` is live for the call to write. `WNOHANG` returns at once; a `pid` that
+    // is no child of this process is refused (`ECHILD`) and touches nothing. A child waited
+    // for here is one no `std::process::Child` of this process waits for again: the one the
+    // CLI starts the daemon as is dropped once spawned.
+    if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != pid {
+        return None;
+    }
+    Some(match libc::WIFSIGNALED(status) {
+        true => Reaped::Signal(libc::WTERMSIG(status)),
+        false => Reaped::Code(libc::WEXITSTATUS(status)),
+    })
 }
 
 /// Whether the process `pid` runs.

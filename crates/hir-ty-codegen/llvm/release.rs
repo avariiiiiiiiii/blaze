@@ -788,6 +788,8 @@ fn apply<'ctx>(
 
 #[cfg(test)]
 mod tests {
+    use inkwell::values::AnyValue as _;
+
     use super::*;
 
     fn parsed<'ctx>(context: &'ctx Context, text: &str) -> Module<'ctx> {

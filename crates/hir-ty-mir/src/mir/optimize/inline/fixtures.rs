@@ -98,6 +98,49 @@ fn inline_never_is_not_inlined() {
     });
 }
 
+/// `<W<Base> as Grow>::Next` normalizes to a type with a bigger alias in it, without end: only
+/// once `deep` is instantiated, as its own body leaves `<T as Grow>::Next` rigid.
+const GROWING: &str = r#"
+//- minicore: sized, copy, option
+pub struct W<T>(T);
+pub struct Base;
+pub trait Grow { type Next; }
+impl Grow for Base { type Next = (); }
+impl<T: Grow> Grow for W<T> { type Next = W<<W<W<T>> as Grow>::Next>; }
+#[inline]
+fn deep<T: Grow>() -> u32 { let _p: Option<<T as Grow>::Next> = None; 1 }
+pub fn caller() -> u32 { deep::<W<Base>>() }
+"#;
+
+#[test]
+fn a_callee_whose_alias_grows_past_the_recursion_limit_is_not_inlined() {
+    optimized(GROWING, "caller", MirOptLevel::Release, |_, body| {
+        assert_eq!(calls(body), 1, "{body:?}");
+        assert!(body.inlined.callees.is_empty());
+    });
+}
+
+/// libm's `sqrt_round<F>` calling `goldschmidt::<F::ISet1>`: the callee's argument names the
+/// caller's own parameter, both index 0, which instantiating is not to take for the callee's.
+const CALLER_PARAMS: &str = r#"
+//- minicore: sized, copy, option
+pub trait Base { type D; }
+pub trait Helper { type Set: Base; }
+#[inline]
+fn wide<T: Base>(x: T) -> T { let _d: Option<<T as Base>::D> = None; x }
+pub fn caller<F: Helper>(x: <F as Helper>::Set) -> <F as Helper>::Set {
+    wide::<<F as Helper>::Set>(x)
+}
+"#;
+
+#[test]
+fn a_callee_whose_arguments_name_the_caller_s_parameters_is_inlined() {
+    optimized(CALLER_PARAMS, "caller", MirOptLevel::Release, |db, body| {
+        assert_eq!(calls(body), 0, "{body:?}");
+        assert_eq!(inlined(body), [function(db, "wide")]);
+    });
+}
+
 const PAIR: &str = r#"
 //- minicore: sized, copy
 #[inline]

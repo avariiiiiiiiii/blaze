@@ -5162,13 +5162,20 @@ impl<'db> Type<'db> {
 
     // FIXME: Find better API that also handles const generics
     /// Whether the type implements `trait_` with `args` after `Self`; a parameter `args` leaves
-    /// out is an error, and a goal with an error never holds here, though the solver, as
-    /// rustc's, proves one (`consider_error_guaranteed_candidate`) to stop errors cascading.
+    /// out is an error, and a goal with a type or const error never holds here, though the
+    /// solver, as rustc's, proves one (`consider_error_guaranteed_candidate`) to stop errors
+    /// cascading. Every region of an inference result is an error region; those are erased
+    /// first, as clippy's types from typeck results are, since the solver would prove any goal
+    /// holding one and trait goals are solved modulo regions (`&str: Display` holds).
     pub fn impls_trait(&self, db: &'db Db, trait_: Trait, args: &[Type<'db>]) -> bool {
         let env = self.param_env(db);
         let interner = DbInterner::new_no_crate(db);
         let (args, _owner) =
             generic_args_from_tys(interner, trait_.id.into(), iter::once(self).chain(args));
+        let args = rustc_type_ir::fold_regions(interner, args, |region, _| match region.kind() {
+            rustc_type_ir::RegionKind::ReError(_) => Region::new_erased(interner),
+            _ => region,
+        });
         if args.references_error() {
             return false;
         }

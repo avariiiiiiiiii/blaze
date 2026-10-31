@@ -239,7 +239,7 @@ pub enum LifetimeElisionKind<'db> {
 
 impl<'db> LifetimeElisionKind<'db> {
     #[inline]
-    pub(crate) fn for_const(
+    pub fn for_const(
         interner: DbInterner<'db>,
         const_parent: ItemContainerId,
     ) -> LifetimeElisionKind<'db> {

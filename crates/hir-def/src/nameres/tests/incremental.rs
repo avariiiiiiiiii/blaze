@@ -110,25 +110,37 @@ pub const BAZ: u32 = 0;
         new_crate_graph
     };
 
-    execute_assert_write(
-        &mut db,
-        |db| {
-            new_crate_graph.set_in_db(db);
-            for &krate in all_crates(db).iter() {
-                crate_def_map(db, krate);
+    let events = db.log_write_in_read_order(|db| {
+        new_crate_graph.set_in_db(db);
+        for &krate in all_crates(db).iter() {
+            crate_def_map(db, krate);
+        }
+    });
+    // `c` gets invalidated as its dependency `b` changed
+    // `b` gets invalidated due to its new dependency edge to `a`
+    let names: Vec<(blaze_query::db::Id, String)> = all_crates(&db)
+        .iter()
+        .map(|&krate| {
+            let name = krate.extra_data(&db).display_name.as_ref().map(|it| it.to_string());
+            (blaze_query::db::AsId::as_id(&krate), name.unwrap_or_default())
+        })
+        .collect();
+    let storage = blaze_query::db::Database::storage(&db);
+    let mut rerun: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event.kind {
+            blaze_query::db::EventKind::WillExecute { database_key }
+                if storage.ingredient_name(database_key.ingredient_index())
+                    == "crate_local_def_map" =>
+            {
+                let key = database_key.key_index();
+                Some(names.iter().find(|(id, _)| *id == key).map_or("?", |(_, name)| name.as_str()))
             }
-        },
-        // `c` gets invalidated as its dependency `b` changed
-        // `b` gets invalidated due to its new dependency edge to `a`
-        &[("crate_local_def_map", 2)],
-        expect![[r#"
-            [
-                "crate_local_def_map",
-                "file_item_tree_query",
-                "crate_local_def_map",
-            ]
-        "#]],
-    );
+            _ => None,
+        })
+        .collect();
+    rerun.sort_unstable();
+    assert_eq!(rerun, ["b", "c"], "the crates whose def map was collected again");
     let all_crates_after = all_crates(&db);
     assert!(
         std::sync::Arc::ptr_eq(&all_crates_before, &all_crates_after),
@@ -438,11 +450,13 @@ m!(Z);
             );
             assert_eq!(module_data.scope(&db).resolutions().count(), 4);
         },
-        // The fixture's write made the six item trees and the three expansions.
+        // The fixture's write made the six item trees and the three expansions; the module is
+        // read from the published resolution for the first time.
         &[("file_item_tree_query", 0), ("parse_macro_expansion", 0)],
         expect![[r#"
             [
                 "crate_local_def_map",
+                "CrateResolution::module",
             ]
         "#]],
     );

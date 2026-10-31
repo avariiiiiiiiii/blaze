@@ -344,8 +344,18 @@ impl<'a, 'f, 'db> Inliner<'a, 'f, 'db> {
             return None;
         }
         // rustc's `try_instantiate_mir_and_normalize_erasing_regions`, which it refuses a callee
-        // it fails for, and its `validate_types`.
-        let callee = monomorphized(db, generic, &site.args.store(), &self.env.store()).ok()?;
+        // it fails for (one whose types overflow the recursion limit, E0275, among them), and
+        // its `validate_types`.
+        let callee = match monomorphized(db, generic, &site.args.store(), &self.env.store()) {
+            Ok(it) => it,
+            Err(error) => {
+                // A type's `Debug` reads the attached database.
+                hir_ty::attach_db(db, || {
+                    tracing::debug!(callee = ?site.callee, ?error, "not inlined: not monomorphized")
+                });
+                return None;
+            }
+        };
         if callee.locals.iter().any(|(_, it)| references_non_lt_error(&it.ty.as_ref())) {
             return None;
         }

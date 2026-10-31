@@ -28,6 +28,12 @@ pub trait Api {
     /// whether another whole response is already held ([`Client::call_ref`]'s), so a caller that
     /// prints writes what it holds only when it is false: one write per burst the daemon sent.
     fn call<F: FnMut(ResponseRef<'_>, bool)>(&mut self, request: Request, on: F) -> Result<bool, ClientError>;
+
+    /// What came of a daemon that hung up on a call ([`hung_up`]); `None` where there is no
+    /// daemon's process and log to ask, as with the tests' fakes.
+    fn died(&mut self) -> Option<anyhow::Result<Died>> {
+        None
+    }
 }
 
 /// One request per connection: anything held once its Done has come (a response to another
@@ -41,6 +47,10 @@ impl Api for Client {
             return Err(ClientError::Refused(blaze_api::ApiError::new(said, None)));
         }
         Ok(ok)
+    }
+
+    fn died(&mut self) -> Option<anyhow::Result<Died>> {
+        Some(died())
     }
 }
 
@@ -163,6 +173,144 @@ pub fn not_listening(socket: &Path, log: &Path, error: &str) -> String {
         PATIENCE.as_secs(),
         log.display()
     )
+}
+
+/// Whether the daemon ended a connection that was waiting on it: its end of the socket closed
+/// (a read found none) or was reset (a write found none).
+pub fn hung_up(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Io(it)
+            if matches!(it.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe)
+    )
+}
+
+/// How many of its log's lines since it listened a daemon that hung up is quoted by, the last.
+const TAIL: usize = 20;
+/// How much of the end of its log is read for them.
+const TAIL_BYTES: u64 = 256 << 10;
+/// How long a daemon that hung up is given to end before it is said to run.
+const ENDING: Duration = Duration::from_secs(1);
+
+/// How the daemon that hung up on a request ended, as its process says.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ended {
+    /// This command started it, and waited for it once it ended.
+    Reaped(crate::raw::process::Reaped),
+    /// It is gone; how only its parent heard, and what its log says.
+    Gone,
+    /// It still runs: it hung up on this request alone.
+    Running,
+}
+
+/// A daemon that hung up on a request: how it ended and what its log says since it listened.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Died {
+    pub log: PathBuf,
+    /// Its pid and how it ended; `None` when the end of its log has no start of it.
+    pub ended: Option<(u32, Ended)>,
+    /// The log's lines since that start that are not blank, the last [`TAIL`].
+    pub said: Vec<String>,
+}
+
+impl std::fmt::Display for Died {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::raw::process::Reaped;
+        match self.ended {
+            Some((pid, Ended::Reaped(Reaped::Signal(signal)))) => write!(
+                f,
+                "the daemon (`blaze serve`, pid {pid}) was ended by signal {signal}{}",
+                blaze_core::signal::described(signal)
+            )?,
+            Some((pid, Ended::Reaped(Reaped::Code(code)))) => {
+                write!(f, "the daemon (`blaze serve`, pid {pid}) exited with code {code}")?;
+            }
+            Some((pid, Ended::Gone)) => write!(f, "the daemon (`blaze serve`, pid {pid}) is gone")?,
+            Some((pid, Ended::Running)) => {
+                write!(f, "the daemon (`blaze serve`, pid {pid}) still runs: it hung up on this request alone")?;
+            }
+            None => write!(f, "the last {} KiB of the daemon's log name no start of it", TAIL_BYTES >> 10)?,
+        }
+        if self.said.is_empty() {
+            write!(f, "; its log {} says nothing since it listened", self.log.display())?;
+            if matches!(self.ended, Some((_, Ended::Gone))) {
+                // A signal it catches writes its line (`serve::signals::record_ends`).
+                f.write_str(
+                    " (a SIGKILL, as an out-of-memory kill or `kill -9` sends, or a SIGSEGV that is no stack \
+                     overflow ends it so)",
+                )?;
+            }
+            return Ok(());
+        }
+        write!(f, "; its log {} ends:", self.log.display())?;
+        for line in &self.said {
+            write!(f, "\n  {line}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The pid of the daemon's last start in `log` (its [`crate::serve::LISTENING`] line), and
+/// its lines after that are not blank, the last [`TAIL`]; `None` when `log` has no start.
+pub fn last_start(log: &str) -> Option<(u32, Vec<&str>)> {
+    // alloc: an error path, once a command
+    let lines: Vec<&str> = log.lines().collect();
+    let (at, pid) = lines.iter().enumerate().rev().find_map(|(at, line)| Some((at, listening_pid(line)?)))?;
+    // alloc: as above
+    let mut said: Vec<&str> = lines[at + 1..].iter().copied().filter(|it| !it.trim().is_empty()).collect();
+    said.drain(..said.len().saturating_sub(TAIL));
+    Some((pid, said))
+}
+
+/// `7` of `blaze serve: listening on /run/blaze/v2.sock (pid 7)`.
+fn listening_pid(line: &str) -> Option<u32> {
+    let (_, pid) = line.strip_prefix(crate::serve::LISTENING)?.rsplit_once(" (pid ")?;
+    pid.strip_suffix(')')?.parse().ok()
+}
+
+/// What came of the daemon that hung up on a request: its log's last start and what it wrote
+/// since, and how its process ended, given [`ENDING`] to.
+#[cfg(unix)]
+pub fn died() -> anyhow::Result<Died> {
+    use std::io::{Read as _, Seek as _};
+
+    use anyhow::Context as _;
+    let log = crate::serve::state()?.join("serve.log");
+    let read = |log: &Path| -> io::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(log)?;
+        let len = file.metadata()?.len();
+        file.seek(io::SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))?;
+        let mut bytes = Vec::new(); // alloc: an error path, once a command
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    // alloc: an error path, once a command
+    let bytes = read(&log).with_context(|| format!("reading the end of the daemon's log {}", log.display()))?;
+    let text = String::from_utf8_lossy(&bytes); // alloc: as above, where the log is not UTF-8
+    let Some((pid, said)) = last_start(&text) else {
+        return Ok(Died { log, ended: None, said: Vec::new() }); // alloc: none, empty
+    };
+    let said = said.into_iter().map(str::to_owned).collect(); // alloc: as above
+    let asked = Instant::now();
+    let ended = loop {
+        if let Some(reaped) = crate::raw::process::reap(pid) {
+            break Ended::Reaped(reaped);
+        }
+        // A process that is gone but not yet waited for by its parent is still `alive`.
+        if !crate::raw::process::alive(pid) {
+            break Ended::Gone;
+        }
+        if asked.elapsed() > ENDING {
+            break Ended::Running;
+        }
+        std::thread::sleep(POLL);
+    };
+    Ok(Died { log, ended: Some((pid, ended)), said })
+}
+
+#[cfg(not(unix))]
+pub fn died() -> anyhow::Result<Died> {
+    anyhow::bail!("blaze's CLI speaks to its daemon over a Unix socket, which this system lacks")
 }
 
 /// Starts `blaze serve` in a process group of its own, so that what ends this command or its
@@ -383,5 +531,70 @@ mod refusals {
         let said = DaemonError::NotListening { socket, log, tries: 9001, error: failed(io::ErrorKind::ConnectionRefused) }.to_string();
         assert!(said.contains("nothing listens at /run/blaze/v2.sock after 10s"), "{said}");
         assert!(said.ends_with("(9001 connects tried)"), "{said}");
+    }
+
+    #[test]
+    fn only_a_closed_or_reset_connection_is_a_hang_up() {
+        for kind in [io::ErrorKind::UnexpectedEof, io::ErrorKind::ConnectionReset, io::ErrorKind::BrokenPipe] {
+            assert!(hung_up(&failed(kind)), "{kind:?}");
+        }
+        assert!(!hung_up(&failed(io::ErrorKind::NotFound)));
+        assert!(!hung_up(&ClientError::Schema { theirs: 0 }));
+    }
+
+    /// hello13's log: two starts, the last one's stack overflow.
+    const OVERFLOWED: &str = "blaze serve: started: the database starts empty: there is no daemon image\n\
+        blaze serve: listening on /b/v2.sock (pid 41)\n\
+        an old run's line\n\
+        blaze serve: listening on /b/v2.sock (pid 4242)\n\
+        \n\
+        thread '<unknown>' (51573835) has overflowed its stack\n\
+        fatal runtime error: stack overflow, aborting\n\
+        blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal\n";
+
+    #[test]
+    fn a_log_says_its_last_start_and_what_came_after_it() {
+        let (pid, said) = last_start(OVERFLOWED).unwrap();
+        assert_eq!(pid, 4242);
+        assert_eq!(
+            said,
+            [
+                "thread '<unknown>' (51573835) has overflowed its stack",
+                "fatal runtime error: stack overflow, aborting",
+                "blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal",
+            ]
+        );
+        assert_eq!(last_start("blaze serve: started: the database starts empty\n"), None);
+        assert_eq!(last_start("blaze serve: listening on /b/v2.sock (pid x)\n"), None);
+        let long: String = std::iter::once("blaze serve: listening on /s (pid 1)\n".to_owned())
+            .chain((0..TAIL + 5).map(|it| format!("line {it}\n")))
+            .collect();
+        let (_, said) = last_start(&long).unwrap();
+        assert_eq!((said.len(), said[0]), (TAIL, "line 5"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_daemon_that_died_says_how_and_quotes_its_log() {
+        use crate::raw::process::Reaped;
+        let log = PathBuf::from("/b/v2/serve.log");
+        let (pid, said) = last_start(OVERFLOWED).unwrap();
+        let said: Vec<String> = said.into_iter().map(str::to_owned).collect();
+        let died = Died { log: log.clone(), ended: Some((pid, Ended::Reaped(Reaped::Signal(libc::SIGABRT)))), said };
+        let text = died.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "the daemon (`blaze serve`, pid 4242) was ended by signal {}, SIGABRT: process abort signal; \
+                 its log /b/v2/serve.log ends:\n  thread '<unknown>'",
+                libc::SIGABRT
+            )),
+            "{text}"
+        );
+        assert!(text.ends_with("\n  blaze serve: pid 4242 ended by signal 6, SIGABRT: process abort signal"), "{text}");
+        let killed = Died { log: log.clone(), ended: Some((7, Ended::Gone)), said: Vec::new() }.to_string();
+        assert!(killed.starts_with("the daemon (`blaze serve`, pid 7) is gone; its log /b/v2/serve.log says nothing"), "{killed}");
+        assert!(killed.contains("SIGKILL"), "{killed}");
+        let running = Died { log, ended: Some((7, Ended::Running)), said: Vec::new() }.to_string();
+        assert!(running.contains("still runs: it hung up on this request alone") && !running.contains("SIGKILL"), "{running}");
     }
 }

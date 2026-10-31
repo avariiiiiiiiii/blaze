@@ -1,4 +1,4 @@
-1
+2
 generated/runner.rs c853fcd571c75413cf80ddb25cdc8f8f
 lexer/err/byte_char_literals.rs c3ef3de877abe1fdf49a5cda3579186e
 lexer/err/byte_strings.rs 9c68adca42c9076b385aab193ff38d25
@@ -127,7 +127,7 @@ parser/err/0050_let_else_right_curly_brace_loop.rs 017a8345d388916d72d587f52d5c0
 parser/err/0051_let_else_right_curly_brace_match.rs df92d13c97e5f442cea7f54d6c14da39
 parser/err/0052_let_else_right_curly_brace_while.rs c230ca42f0193b2b3a8469c8c33f86ab
 parser/err/0053_let_else_right_curly_brace_if.rs 16e480a264754c8958193c90c8a2ceca
-parser/err/0054_float_split_scientific_notation.rs f81422560f3a445f636db06a4f6064ee
+parser/err/0054_float_split_scientific_notation.rs 895cdd0c45b03c169ba67e6aeaec562a
 parser/err/0055_impl_use.rs 5cda17748b5c5b49b41bb5ca939a57e5
 parser/err/0056_let_else_right_curly_brace_struct.rs 1fd0e88b7c78a3b4561f8ad3b4c787f7
 parser/err/0057_let_else_right_curly_brace_arithmetic.rs ddbc28d65a9579c4a4edbcab157c7955

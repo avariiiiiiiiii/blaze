@@ -2107,7 +2107,9 @@ attributes #0 = { alwaysinline }
         let stack = builder.ins().get_stack_pointer(I64);
         builder.ins().return_(&[stack]);
         builder.finalize(isa.frontend_config());
-        let refused = emit(&mut wants, &[], &func, Optimization::NONE, None, &[]).unwrap_err();
+        let Err(refused) = emit(&mut wants, &[], &func, Optimization::NONE, None, &[]) else {
+            panic!("`get_stack_pointer` was emitted");
+        };
         assert_eq!(refused, Unhandled::Opcode(Opcode::GetStackPointer));
         let error = super::super::CodegenError::LlvmRefused(refused);
         assert!(error.to_string().contains("get_stack_pointer"), "{error}");

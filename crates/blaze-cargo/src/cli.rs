@@ -330,7 +330,13 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
         Ok(ok) => ok && !printer.refused(),
         Err(error) => {
             printer.flush()?;
-            printer.err().write_all(say::error(&error.to_string(), shown.color).as_bytes())?;
+            // alloc: the error a command ends with, once
+            let what = match daemon::hung_up(&error).then(|| api.died()).flatten() {
+                Some(Ok(died)) => format!("{error}: {died}"),
+                Some(Err(why)) => format!("{error}, and what came of the daemon is not known: {why:#}"),
+                None => error.to_string(),
+            };
+            printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
             return Ok(Then::Exit(FAILED));
         }
     };

@@ -359,22 +359,31 @@ impl<'t> Parser<'t> {
     }
 
     /// Create an error node and consume the next token.
-    /// A `{` some `}` closes is taken with everything up to that `}`, so the error never splits
-    /// a pair of braces between two nodes.
+    /// A `{` some `}` closes is taken with everything up to that `}`, each pair inside it in a
+    /// node of its own, so every pair of braces is the first and last child of one node.
     pub(crate) fn err_and_bump(&mut self, message: &'static str) {
         let m = self.start();
         self.error(message);
         if self.at(T!['{']) && self.curly_closes(self.pos) {
-            let mut depth = 0usize;
+            // Every `{` after a closed one is closed before it: a stack pairs them.
+            let mut inner = Vec::new(); // alloc: an error path, one marker a nested pair
+            self.bump_any();
             loop {
                 match self.current() {
-                    T!['{'] => depth += 1,
-                    T!['}'] => depth -= 1,
-                    _ => (),
-                }
-                self.bump_any();
-                if depth == 0 {
-                    break;
+                    T!['{'] => {
+                        inner.push(self.start());
+                        self.bump_any();
+                    }
+                    T!['}'] => {
+                        self.bump_any();
+                        match inner.pop() {
+                            Some(pair) => {
+                                pair.complete(self, ERROR);
+                            }
+                            None => break,
+                        }
+                    }
+                    _ => self.bump_any(),
                 }
             }
         } else {

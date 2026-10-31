@@ -2198,10 +2198,9 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     }
 
     fn collect_trait(&mut self, def: TraitId, def_map: &DefMap) {
-        let (signature, source_map) = TraitSignature::with_source_map(self.db, def);
         let items = TraitItems::query_with_diagnostics(self.db, def);
 
-        self.collect_generic_def(&signature.store, source_map, def.into());
+        self.collect_generic_def(def.into());
         self.collect_wfcheck(def.into());
         self.emit_def_diagnostics(&items.1);
         items.0.macro_calls().for_each(|(_, call)| self.collect_macro_call(call));
@@ -2215,10 +2214,10 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         def_map: &'db DefMap,
         impl_assoc_items_scratch: &mut Vec<(Name, AssocItemId)>,
     ) {
-        let (impl_signature, source_map) = ImplSignature::with_source_map(self.db, def);
+        let impl_signature = ImplSignature::of(self.db, def);
         let impl_items = ImplItems::of(self.db, def);
 
-        self.collect_generic_def(&impl_signature.store, source_map, def.into());
+        self.collect_generic_def(def.into());
         self.emit_def_diagnostics(&impl_items.1);
         impl_items.0.macro_calls().for_each(|(_, call)| self.collect_macro_call(call));
         self.collect_assoc_items(&impl_items.0.items, def_map);
@@ -2680,17 +2679,35 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
             .for_each(|diag| self.acc.push(diag));
     }
 
-    fn collect_generic_def(
-        &mut self,
-        store: &ExpressionStore,
-        source_map: &ExpressionStoreSourceMap,
-        def: GenericDefId,
-    ) {
-        self.collect_expr_store(store, source_map);
-        for (anon_consts, diagnostics) in signature_anon_consts_and_diagnostics(self.db, def) {
-            self.collect_anon_consts_and_ty_diagnostics(source_map, anon_consts, diagnostics);
+    /// The checks of `def`'s signature. Like [`Self::check_body`], they read the signature and
+    /// what was found in it without positions, and ask for its source map, which an edit
+    /// before the item in its file makes again, only when there is a diagnostic to place.
+    fn collect_generic_def(&mut self, def: GenericDefId) {
+        let db = self.db;
+        self.collect_blocks(ExpressionStore::of(db, def.into()));
+        let lowered = signature_anon_consts_and_diagnostics(db, def);
+        let reports = signature_store_has_diagnostics(db, def)
+            || lowered.iter().any(|&(anon_consts, diagnostics)| {
+                !diagnostics.is_empty()
+                    || anon_consts.iter().any(|&it| self.anon_const_reports(it))
+            });
+        if reports {
+            let (_, source_map) = ExpressionStore::with_source_map(db, def.into());
+            self.collect_store_diagnostics(source_map);
+            for (anon_consts, diagnostics) in lowered {
+                self.collect_anon_consts_and_ty_diagnostics(source_map, anon_consts, diagnostics);
+            }
         }
         self.collect_const_param_tys(def);
+    }
+
+    /// Whether [`Self::collect_anon_const`] finds anything in `def`, from the results it reads.
+    fn anon_const_reports(&self, def: AnonConstId<'db>) -> bool {
+        let db = self.db;
+        !InferenceResult::of(db, def.into()).diagnostics().is_empty()
+            || !hir_ty::coroutine_obligations::coroutine_obligation_errors(db, def.into()).is_empty()
+            || !hir_ty_borrowck::borrowck_anon_const(db, def).diagnostics.is_empty()
+            || hir_ty::const_valtree::anon_const_valtree_error(db, def).is_some()
     }
 
     fn collect_const_param_tys(&mut self, def: GenericDefId) {
@@ -3024,9 +3041,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
         def: impl Into<GenericDefId> + Into<DefWithBodyId> + Copy,
     ) {
         let generic_def: GenericDefId = def.into();
-        let (signature_store, signature_source_map) =
-            ExpressionStore::with_source_map(self.db, generic_def.into());
-        self.collect_generic_def(signature_store, signature_source_map, generic_def);
+        self.collect_generic_def(generic_def);
 
         let def_with_body: DefWithBodyId = def.into();
         self.collect_def_with_body(def_with_body, generic_def.into());
@@ -3037,8 +3052,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
 
     fn collect_generic_variant(&mut self, def: impl Into<GenericDefId> + Into<VariantId> + Copy) {
         let generic_def: GenericDefId = def.into();
-        let (store, source_map) = ExpressionStore::with_source_map(self.db, generic_def.into());
-        self.collect_generic_def(store, source_map, generic_def);
+        self.collect_generic_def(generic_def);
         self.collect_variant(def.into());
         self.collect_wfcheck(generic_def);
 
@@ -3130,9 +3144,7 @@ impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'
     }
 
     fn collect_only_generic_def(&mut self, def: impl Into<GenericDefId>) {
-        let generic_def: GenericDefId = def.into();
-        let (store, source_map) = ExpressionStore::with_source_map(self.db, generic_def.into());
-        self.collect_generic_def(store, source_map, generic_def);
+        self.collect_generic_def(def.into());
     }
 
     fn collect_module_def(&mut self, def: ModuleDefId, def_map: &DefMap) {
@@ -4498,6 +4510,32 @@ impl<'db> Placing<'db> {
 
     fn get(&self) -> &'db hir_def::expr_store::BodySourceMap {
         self.map.get_or_init(|| &Body::with_source_map(self.db, self.def).1)
+    }
+}
+
+/// Whether lowering `def`'s signature store found anything: read from the map counted from the
+/// signature's own syntax (`relative`), which an edit elsewhere in its file leaves as it was. A
+/// signature a macro writes has no such syntax, and its one map is in the macro's file.
+fn signature_store_has_diagnostics(db: &Db, def: GenericDefId) -> bool {
+    use hir_def::signatures::{EnumSignature, StaticSignature, StructSignature, UnionSignature};
+    macro_rules! of {
+        ($Sig:ident, $id:expr) => {
+            match $Sig::relative(db, $id) {
+                Some((_, map)) => !map.diagnostics().is_empty(),
+                None => !$Sig::with_source_map(db, $id).1.diagnostics().is_empty(),
+            }
+        };
+    }
+    match def {
+        GenericDefId::AdtId(AdtId::EnumId(id)) => of!(EnumSignature, id),
+        GenericDefId::AdtId(AdtId::StructId(id)) => of!(StructSignature, id),
+        GenericDefId::AdtId(AdtId::UnionId(id)) => of!(UnionSignature, id),
+        GenericDefId::ConstId(id) => of!(ConstSignature, id),
+        GenericDefId::FunctionId(id) => of!(FunctionSignature, id),
+        GenericDefId::ImplId(id) => of!(ImplSignature, id),
+        GenericDefId::StaticId(id) => of!(StaticSignature, id),
+        GenericDefId::TraitId(id) => of!(TraitSignature, id),
+        GenericDefId::TypeAliasId(id) => of!(TypeAliasSignature, id),
     }
 }
 

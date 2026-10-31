@@ -24,7 +24,7 @@ use crate::{
 /// is built of their output. Bump it with any change to the tree or the errors some text
 /// parses to; `the_tree_version_names_the_trees_parsed` fails when a file of the parser's test
 /// data parses to another tree under the same version.
-pub const TREE_VERSION: u32 = 1;
+pub const TREE_VERSION: u32 = 2;
 
 const MAGIC: u32 = u32::from_le_bytes(*b"bzp1");
 const HEAD: usize = 12;

@@ -1200,7 +1200,13 @@ impl<'db> Look<'_, '_, 'db> {
         // temporary only the call takes (rustc's `as_call_operand`), the result straight into
         // `local` or through a temporary only `local` takes.
         let min_max = 'min_max: {
-            let private = |temp: LocalId| !self.outer(temp) && self.occurrences(temp).len() == 2;
+            // A `FakeRead` (of an assignment's right side) uses nothing.
+            let private = |temp: LocalId| {
+                let uses = self.occurrences(temp).into_iter().filter(|&(block, at)| {
+                    at.is_none_or(|at| !matches!(self.statement(block, at), StatementKind::FakeRead(_)))
+                });
+                !self.outer(temp) && uses.count() == 2
+            };
             let (mut read, mut written) = (None, None);
             for &kind in &statements {
                 match kind {

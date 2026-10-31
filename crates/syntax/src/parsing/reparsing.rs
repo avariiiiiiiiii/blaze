@@ -712,9 +712,11 @@ fn covering(tree: &FlatTree, range: TextRange) -> u32 {
 
 /// The errors of the tree `units` make: `old_errors`, those of the old tree, that are outside
 /// every unit, moved by what the units before them grew, then each unit's own, from its new
-/// start. `None` when an old error is empty at a unit's start or end: it may be the unit's
-/// own (an unclosed block's "expected `}`" at the end of the text a unit runs to), which its
-/// new errors have again, or its neighbour's, and its place can't tell which.
+/// start. `None` when an old error is empty at the start or end of a unit parsed again as a
+/// node: it may be the unit's own (an unclosed block's "expected `}`" at the end of the text a
+/// unit runs to), which its new errors have again, or its neighbour's, and its place can't tell
+/// which. A token's unit makes no empty error (a lexer error spans its token), so one at its
+/// edge is the parse around it (`let x = foo + bar` missing its `;` after `bar`), and kept.
 fn merge_errors(
     old_errors: impl IntoIterator<Item = SyntaxError>,
     units: &mut [Unit],
@@ -725,7 +727,8 @@ fn merge_errors(
         let before = units.partition_point(|it| it.range.end() <= range.start());
         let at_edge = |unit: Option<&Unit>| {
             unit.is_some_and(|it| {
-                it.range.start() == range.start() || it.range.end() == range.start()
+                it.with.is_some()
+                    && (it.range.start() == range.start() || it.range.end() == range.start())
             })
         };
         if range.is_empty()

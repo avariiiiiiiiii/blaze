@@ -314,7 +314,7 @@ impl<'a, F: FnMut(OutlineStrStep<'_>) + ?Sized> Builder<'a, '_, F> {
             None => {
                 // illegal float literal which doesn't have dot in form (like 1e0)
                 // we should emit an error node here
-                self.step(StrStep::Error { msg: "illegal float literal", pos: self.pos });
+                self.step(StrStep::Error { msg: "illegal float literal", pos: self.offset });
                 self.step(StrStep::Enter { kind: SyntaxKind::ERROR });
                 self.step(StrStep::Token { kind: SyntaxKind::FLOAT_NUMBER, text });
                 self.step(StrStep::Exit);

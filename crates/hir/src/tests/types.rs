@@ -129,6 +129,22 @@ fn a_reference_to_a_type_has_its_environment() {
 }
 
 #[test]
+fn a_reference_with_an_error_region_is_solved_modulo_regions() {
+    let db = fixture::db(TYPES).into_db();
+    crate::attach_db(&db, || {
+        let [t, _] = <[Type<'_>; 2]>::try_from(params(&db, "bounds")).unwrap();
+        let errored = t.add_reference(&db, Mutability::Shared);
+        let u8_arg = params(&db, "adts")[0].fields(&db).remove(0).1;
+        let u8_arg = u8_arg.without_params(&db).expect("`u8` names no parameter");
+        assert!(errored.impls_trait(&db, trait_(&db, "Show"), &[]), "`impl<T: Show> Show for &T`");
+        assert!(
+            !errored.impls_trait(&db, trait_(&db, "Pair"), &[u8_arg]),
+            "an error region is no error goal the solver proves: no `Pair` impl for references",
+        );
+    });
+}
+
+#[test]
 fn sized_is_the_solver_s_answer_in_the_environment() {
     let db = fixture::db(TYPES).into_db();
     crate::attach_db(&db, || {

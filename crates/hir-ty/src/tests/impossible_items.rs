@@ -15,6 +15,8 @@ const FIXTURE: &str = r#"
 pub struct Square;
 pub trait Mark {}
 impl<T: ?Sized> Mark for &T {}
+pub trait Named {}
+impl<'b, T: ?Sized> Named for &'b T {}
 pub trait Each {
     type Item;
     fn copied(self) where Self::Item: Copy, Self: Sized {}
@@ -22,6 +24,7 @@ pub trait Each {
     fn borrowed_static(&self) where &'static Self::Item: Copy {}
     fn borrowed_sized(&self) where for<'a> &'a Self::Item: Sized {}
     fn borrowed_local_trait(&self) where for<'a> &'a Self::Item: Mark {}
+    fn borrowed_named_impl_lifetime(&self) where for<'a> &'a Self::Item: Named {}
 }
 pub struct Squares;
 impl Each for Squares { type Item = Square; }
@@ -77,6 +80,12 @@ fn a_shared_reference_to_the_item_is_copy_through_every_impl() {
             !impossible("borrowed_sized", self_ty),
             "`for<'a> &'a <{self_ty} as Each>::Item: Sized` (the sizedness fast path) holds",
         );
+        assert!(
+            !impossible("borrowed_named_impl_lifetime", self_ty),
+            "`for<'a> &'a <{self_ty} as Each>::Item: Named` (an impl naming its lifetime) holds",
+        );
+        // `Mark`'s impl elides its lifetime, which lowers to `'{region error}`, not the fresh
+        // early-bound parameter rustc's `fresh_lifetime` gives it.
         assert!(
             !impossible("borrowed_local_trait", self_ty),
             "`for<'a> &'a <{self_ty} as Each>::Item: Mark` (a local trait, no unknowable candidate) holds",

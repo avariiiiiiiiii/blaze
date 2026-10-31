@@ -32,7 +32,7 @@ use base_db::{Crate, Db, EditionedFileId, Nonce};
 use blaze_ids::Domain;
 use cfg::CfgOptions;
 use hir_expand::{HirFileId, span_map::SpanMap};
-use span::{AstIdMap, ErasedFileAstId, RealSpanMap};
+use span::{AstIdMap, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
     NodeOrToken, SyntaxKind, Text, TextRange, TextSize,
     ast as tag,
@@ -614,15 +614,17 @@ impl Unchanged {
                 touched[at / 64] |= 1 << (at % 64);
             }
         };
-        // Each map's first is the root's, which is no item's: its entry's range is the whole
-        // text and its anchor begins at 0, before the first item's.
+        // The ast id map's first is the root's, which is no item's: its range is the whole
+        // text. The span map's root anchor, before the first item's, is left out of a map whose
+        // first item begins at 0, so it is told by its id.
         let old = (last.entries.get(1..).unwrap_or_default().iter())
             .filter_map(|&[s, e, kind, id]| self.moved(s, e).map(|[s, e]| [s, e, kind, id]));
         let new = entries.get(1..).unwrap_or_default().iter().copied();
         compare(old, new.filter(|&[s, e, ..]| self.keeps(s, e)), &mut mark);
-        let old = (last.anchors.get(1..).unwrap_or_default().iter())
+        let root = ROOT_ERASED_FILE_AST_ID.into_raw();
+        let old = (last.anchors.iter().filter(|it| it[1] != root))
             .filter_map(|&[s, id]| Some([self.moved(s, s + 1)?[0], id]));
-        let new = starts.iter().zip(pairs).skip(1).map(|(&s, &[id, _])| [s, id]);
+        let new = (starts.iter().zip(pairs)).filter(|it| it.1[0] != root).map(|(&s, &[id, _])| [s, id]);
         compare(old, new.filter(|&[s, _]| self.keeps(s, s + 1)), &mut mark);
     }
 }

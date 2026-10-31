@@ -279,7 +279,7 @@ pub enum Request {
     /// rustdoc run. `private` is `--document-private-items`. Answered with
     /// [`Response::Documented`], then each file as a [`Response::DocPage`], which the client
     /// writes, then rustdoc's warnings as [`Response::Diagnostic`]s.
-    Doc { view: ViewRef, targets: Targets, no_deps: bool, private: bool },
+    Doc { view: ViewRef, no_deps: bool, private: bool, targets: Targets },
 }
 
 /// `blaze test --ub`: each selected test run under `hir_ty_ub::run_test`, nothing compiled.
@@ -353,9 +353,9 @@ pub enum Response {
     /// A file of a [`Request::Doc`]'s documentation: its path under [`Documented::dir`],
     /// `/`-separated, and its bytes.
     DocPage {
-        path: String,
         #[serde(with = "blaze_protocol::bytes")]
         page: Vec<u8>,
+        path: String,
     },
     /// What a [`Request::Doc`] documents and where, before its first [`Response::DocPage`].
     Documented(Documented),
@@ -367,9 +367,9 @@ pub struct Documented {
     /// Where the pages go, absolute: cargo's `target/doc`, or `target/<triple>/doc` with
     /// `--target`.
     pub dir: String,
+    pub pages: u64,
     /// In the order cargo says `Documenting`: the crates asked for first.
     pub crates: Vec<DocumentedCrate>,
-    pub pages: u64,
     pub source_pages: u64,
 }
 
@@ -377,11 +377,11 @@ pub struct Documented {
 pub struct DocumentedCrate {
     /// The crate's name, its directory under [`Documented::dir`].
     pub name: String,
+    /// Asked for, not a dependency documented with it: what `Generated` counts.
+    pub asked: bool,
     /// Its package as cargo's `Documenting` line names it: `serde v1.0.219`, then
     /// `(/abs/path)` for a path package.
     pub package: String,
-    /// Asked for, not a dependency documented with it: what `Generated` counts.
-    pub asked: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

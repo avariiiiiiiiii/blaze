@@ -28,7 +28,7 @@ use hir_ty::{
     Adjustment, InferenceResult, LifetimeElisionKind, LifetimeLoweringMode, TyLoweringContext,
     method_resolution::CandidateId,
     next_solver::{
-        AliasTy, DbInterner, ErrorGuaranteed, GenericArgs, Ty, TyKind, TypingMode,
+        AliasTy, DbInterner, ErrorGuaranteed, GenericArgs, Region, Ty, TyKind, TypingMode,
         infer::DbInternerInferExt,
     },
     traits::structurally_normalize_ty,
@@ -192,6 +192,17 @@ impl<'db> SourceAnalyzer<'db> {
         let type_ref = self.type_id_view(ty)?;
         let generic_def = self.generic_def(db)?;
         let store = self.store()?;
+        // A static's or const's own type elides to `'static` as its lowering does; a type in
+        // a body is inferred.
+        let elision = match self.body_or_sig {
+            Some(BodyOrSig::Sig { def: GenericDefId::StaticId(_), .. }) => {
+                LifetimeElisionKind::Elided(Region::new_static(DbInterner::new_no_crate(db)))
+            }
+            Some(BodyOrSig::Sig { def: GenericDefId::ConstId(it), .. }) => {
+                LifetimeElisionKind::for_const(DbInterner::new_no_crate(db), it.loc(db).container)
+            }
+            _ => LifetimeElisionKind::Infer,
+        };
         let generics = OnceCell::new();
         let ty = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
             TyLoweringContext::new(
@@ -201,7 +212,7 @@ impl<'db> SourceAnalyzer<'db> {
                 self.resolver.expression_store_owner().unwrap_or_else(|| generic_def.into()),
                 generic_def,
                 &generics,
-                LifetimeElisionKind::Infer,
+                elision,
                 LifetimeLoweringMode::LateParam,
                 frame,
             )

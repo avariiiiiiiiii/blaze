@@ -200,6 +200,48 @@ fn skip_container_loop(
     None
 }
 
+/// blaze: the containers a checked skip is inside, innermost last: the first [`Open::INLINE`]
+/// on the stack, so a skip of a value nested no deeper allocates nothing (blaze-ci's
+/// `a_warm_delivery_allocates_only_its_events_strings`), the rest on the heap.
+struct Open {
+    inline: [u8; Open::INLINE],
+    len: usize,
+    spilled: Vec<u8>,
+}
+
+impl Default for Open {
+    fn default() -> Self {
+        Open { inline: [0; Open::INLINE], len: 0, spilled: Vec::new() }
+    }
+}
+
+impl Open {
+    const INLINE: usize = 64;
+
+    fn push(&mut self, container: u8) {
+        match self.inline.get_mut(self.len) {
+            Some(slot) => *slot = container,
+            None => self.spilled.push(container),
+        }
+        self.len += 1;
+    }
+
+    fn last(&self) -> Option<u8> {
+        match self.len {
+            0 => None,
+            len if len <= Open::INLINE => Some(self.inline[len - 1]),
+            _ => self.spilled.last().copied(),
+        }
+    }
+
+    fn pop(&mut self) {
+        if self.len > Open::INLINE {
+            self.spilled.pop();
+        }
+        self.len = self.len.saturating_sub(1);
+    }
+}
+
 pub(crate) struct Pair<'de> {
     pub key: Cow<'de, str>,
     pub val: &'de [u8],
@@ -1231,14 +1273,14 @@ where
         }
     }
 
-    // blaze: a checked skip of an object or array is a loop over the containers still open,
-    // held on the heap as serde_json's `ignore_value` holds them, not a call per level: upstream
+    // blaze: a checked skip of an object or array is a loop over the containers still open
+    // ([`Open`]), as serde_json's `ignore_value` holds them, not a call per level: upstream
     // recursed through `skip_one` once per level with no limit, so a deep enough value in a
     // field skipped overflowed the thread's stack and aborted the process. It takes and refuses
     // what upstream's `skip_object`/`skip_array` did, with the same errors at the same places.
     #[inline(never)]
     fn skip_nested(&mut self, first: u8) -> Result<()> {
-        let mut open: Vec<u8> = Vec::new();
+        let mut open = Open::default();
         let mut entered = Some(first);
         loop {
             if let Some(container) = entered.take() {
@@ -1269,9 +1311,9 @@ where
                 }
             }
             // A value or a container ended: the enclosing container's comma or end.
-            let Some(&inner) = open.last() else { return Ok(()) };
+            let Some(inner) = open.last() else { return Ok(()) };
             match (inner, self.skip_space()) {
-                (b'{', Some(b'}')) | (b'[', Some(b']')) => _ = open.pop(),
+                (b'{', Some(b'}')) | (b'[', Some(b']')) => open.pop(),
                 (b'{', Some(b',')) => match self.skip_space() {
                     Some(b'"') => {
                         self.skip_string()?;

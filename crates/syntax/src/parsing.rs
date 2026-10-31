@@ -173,32 +173,9 @@ pub(crate) fn expand_lazy(
     (tree, errors)
 }
 
-/// The parser's errors in lazy node `at` of `tree`, an outline in `edition`, parsing it if it
-/// was not yet: the errors a full parse of the file reports there, from the one parse of the
-/// body ([`FlatTree::part_errors`]).
-pub(crate) fn body_errors(
-    tree: &FlatTree,
-    at: u32,
-    edition: Edition,
-) -> impl Iterator<Item = SyntaxError> + '_ {
-    let start = tree.range(at).start();
-    let mut tokens_before = None;
-    tree.part_errors(at).iter().map(move |(range, msg)| {
-        // This one error's position is the number of its token in the file, not an offset: in
-        // the body's parse it was the number in the body.
-        let range = match &**msg == ILLEGAL_FLOAT {
-            true => {
-                let before = *tokens_before.get_or_insert_with(|| {
-                    let lexed = parser::LexedStr::new(edition, &tree.source()[..usize::from(start)]);
-                    TextSize::try_from(lexed.len()).unwrap()
-                });
-                *range - start + before
-            }
-            false => *range,
-        };
-        SyntaxError::new(&**msg, range)
-    })
+/// The parser's errors in lazy node `at` of `tree`, an outline, parsing it if it was not yet:
+/// the errors a full parse of the file reports there, from the one parse of the body
+/// ([`FlatTree::part_errors`]).
+pub(crate) fn body_errors(tree: &FlatTree, at: u32) -> impl Iterator<Item = SyntaxError> + '_ {
+    tree.part_errors(at).iter().map(|(range, msg)| SyntaxError::new(&**msg, *range))
 }
-
-/// The message `LexedStr::intersperse_trivia` reports at a float split it cannot make.
-const ILLEGAL_FLOAT: &str = "illegal float literal";

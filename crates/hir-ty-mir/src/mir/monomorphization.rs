@@ -58,6 +58,11 @@ struct Filler<'db> {
     /// How many aliases the fold is normalizing inside of, which rustc's `AssocTypeNormalizer`
     /// stops past the crate's `recursion_limit` with an error.
     depth: usize,
+    /// Whether the fold puts `subst` in place of the parameters, else normalizes the aliases,
+    /// rustc's instantiate then normalize. Apart, as a generic caller's arguments name its own
+    /// parameters, which instantiating again would take for the callee's: `F` of
+    /// `goldschmidt::<F::ISet1>` in `sqrt_round<F>` would grow into `<F::ISet1 as ..>::ISet1`.
+    instantiating: bool,
 }
 
 impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
@@ -78,7 +83,17 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
     }
 
     fn try_fold_ty(&mut self, ty: Ty<'db>) -> Result<Ty<'db>, Self::Error> {
-        if !ty.has_type_flags(TypeFlags::HAS_ALIAS | TypeFlags::HAS_PARAM) {
+        if self.instantiating {
+            if !ty.has_type_flags(TypeFlags::HAS_PARAM) {
+                return Ok(ty);
+            }
+            let TyKind::Param(param) = ty.kind() else { return ty.try_super_fold_with(self) };
+            let arg = self.subst.as_slice().get(param.index as usize).and_then(|arg| arg.ty());
+            return arg.ok_or_else(|| {
+                MirLowerError::GenericArgNotProvided(param.id.into(), self.subst.store())
+            });
+        }
+        if !ty.has_type_flags(TypeFlags::HAS_ALIAS) {
             return Ok(ty);
         }
 
@@ -95,8 +110,9 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                         shown.truncate(cut);
                         shown.push_str("...");
                     }
-                    return Err(MirLowerError::NotSupported(format!(
-                        "reached the recursion limit ({limit}) normalizing {shown}" // alloc: error path
+                    return Err(MirLowerError::NotSupported(format!( // alloc: error path
+                        "E0275: overflow evaluating the requirement `{shown} == _` (the \
+                         recursion limit, {limit}, reached normalizing it)"
                     )));
                 }
                 self.depth += 1;
@@ -104,22 +120,8 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
                 self.depth -= 1;
                 ty
             }
-            TyKind::Param(param) => {
-                let ty = self
-                    .subst
-                    .as_slice()
-                    .get(param.index as usize)
-                    .and_then(|arg| arg.ty())
-                    .ok_or_else(|| {
-                    MirLowerError::GenericArgNotProvided(param.id.into(), self.subst.store())
-                })?;
-                // An argument can be the `impl Future` of an `async fn`, which the body of
-                // the caller only knows by that name.
-                if ty.has_type_flags(TypeFlags::HAS_TY_OPAQUE) {
-                    return self.try_fold_ty(ty);
-                }
-                Ok(ty)
-            }
+            // An argument can be the `impl Future` of an `async fn`, which the body of the
+            // caller only knows by that name: an alias, normalized as the rest.
             _ => ty.try_super_fold_with(self),
         }
     }
@@ -128,6 +130,9 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
         let ConstKind::Param(param) = ct.kind() else {
             return ct.try_super_fold_with(self);
         };
+        if !self.instantiating {
+            return Ok(ct);
+        }
         self.subst.as_slice().get(param.index as usize).and_then(|arg| arg.konst()).ok_or_else(
             || MirLowerError::GenericArgNotProvided(param.id.into(), self.subst.store()),
         )
@@ -137,6 +142,9 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
         let RegionKind::ReEarlyParam(param) = region.kind() else {
             return Ok(region);
         };
+        if !self.instantiating {
+            return Ok(region);
+        }
         // A function generic over nothing but lifetimes is monomorphized without arguments,
         // and what its lifetimes are makes no difference to the code.
         let region = self.subst.as_slice().get(param.index as usize).and_then(|arg| arg.region());
@@ -145,9 +153,9 @@ impl<'db> FallibleTypeFolder<DbInterner<'db>> for Filler<'db> {
 }
 
 impl<'db> Filler<'db> {
-    /// The alias `ty` with its arguments filled, normalized, and what it normalized to filled.
+    /// The alias `ty`, instantiated, with its arguments normalized, normalized, and what it
+    /// normalized to normalized.
     fn normalize_alias(&mut self, ty: Ty<'db>) -> Result<Ty<'db>, MirLowerError<'db>> {
-        // First instantiate params.
         let ty = ty.try_super_fold_with(self)?;
         let ty = self.impl_opaque(ty);
         if let Some(hidden) = self.hidden_with_opaques(ty) {
@@ -191,7 +199,7 @@ impl<'db> Filler<'db> {
         let interner = DbInterner::new_with(db, env.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
         // alloc: none until a binder is entered; the solver's replacer takes a `&mut Vec`
-        Self { infcx, trait_env: env, subst, universes: Vec::new(), depth: 0 }
+        Self { infcx, trait_env: env, subst, universes: Vec::new(), depth: 0, instantiating: false }
     }
 
     /// The `impl Trait` a trait method returns is the one of the impl's method once the
@@ -243,6 +251,9 @@ impl<'db> Filler<'db> {
     {
         // An alias rigid where the body was checked may normalize once its parameters are
         // filled in `PostAnalysis`, as rustc's `post_analysis_normalize` resets them.
+        self.instantiating = true;
+        let t = t.try_fold_with(self)?;
+        self.instantiating = false;
         let t = rustc_type_ir::set_aliases_to_non_rigid(self.infcx.interner, t).skip_normalization();
         // Can't deep normalized as that'll try to normalize consts and fail.
         let t = t.try_fold_with(self)?;

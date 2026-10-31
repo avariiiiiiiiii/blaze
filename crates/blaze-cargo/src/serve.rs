@@ -39,6 +39,11 @@ use blaze_core::{Confine, FileName};
 
 pub use daemon::{Daemon, Options};
 
+/// What the line a daemon writes to its log once it listens starts with, then where and its
+/// pid: `blaze serve: listening on /run/blaze/v2.sock (pid 7)`. The client finds the daemon's
+/// last start by it, and harness/storelib.py's `LISTENING` that it listens.
+pub const LISTENING: &str = "blaze serve: listening on ";
+
 /// Where the daemon is and what it runs.
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -217,6 +222,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         activated,
     };
     signals::catch();
+    signals::record_ends();
     plane::record_panics();
     let steps = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
@@ -261,7 +267,7 @@ fn run(
         environment: proc_macro_api::kept::Environment::new(),
     })
     .map_err(|why| anyhow::anyhow!("keeping proc-macro expansions: {why}"))?;
-    eprintln!("blaze serve: listening on {}", daemon.listening());
+    eprintln!("{LISTENING}{} (pid {})", daemon.listening(), std::process::id());
     loop {
         if signals::signalled() {
             daemon.stop();

@@ -261,6 +261,9 @@ pub fn covered_queries() -> &'static [(&'static str, Key)] {
         ("Modules::module", Any),
         ("Modules::name", Any),
         ("CrateResolution::module", Any),
+        ("ScopeInput::name", Any),
+        ("ScopeInput::legacy_macro", Any),
+        ("ScopeInput::traits", Any),
         ("ModuleIdLt", Any),
         ("BlockIdLt", Any),
     ]

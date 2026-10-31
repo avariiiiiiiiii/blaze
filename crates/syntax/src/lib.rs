@@ -193,10 +193,10 @@ impl<T> Parse<T> {
             errors.extend_from_slice(e);
         }
         let root = self.root();
-        let Some(edition) = self.outline else {
+        if self.outline.is_none() {
             validation::validate(root, errors);
             return;
-        };
+        }
         let tree = self.tree.as_ref().unwrap().flat();
         let mut kept = LAZIES.replace(Scratch::new());
         let lazies = kept.take();
@@ -208,7 +208,7 @@ impl<T> Parse<T> {
                 if !all_bodies && !tree.is_parsed(at) {
                     return false;
                 }
-                errors.extend(parsing::body_errors(tree, at, edition));
+                errors.extend(parsing::body_errors(tree, at));
                 true
             },
             errors,

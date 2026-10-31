@@ -47,6 +47,8 @@ text-size.opt-level = 3
 serde.opt-level = 3
 dissimilar.opt-level = 3
 miniz_oxide.opt-level = 3
+# fence::model's three_threads_two_slots explores ~2^24 states, too many for an unoptimized build.
+blaze-inproc.opt-level = 3
 
 [profile.release]
 # Set this to 1 or 2 to get more useful backtraces in debugger.

@@ -60,12 +60,13 @@ impl<'a> Files<'a> {
     }
 
     /// The name rustc gives `path`: from `root` when it is below it, as cargo runs rustc there,
-    /// else the whole path, as `root` itself keeps it.
+    /// else the whole path, as `root` itself keeps it. A root of `""` or `/` keeps every path
+    /// whole: rustc prints a path as it was given.
     pub fn relative<'p>(path: &'p str, root: &str) -> &'p str {
+        let root = root.trim_end_matches('/');
         if root.is_empty() {
             return path;
         }
-        let root = root.trim_end_matches('/');
         match path.strip_prefix(root).and_then(|rest| rest.strip_prefix('/')) {
             Some(rest) if !rest.is_empty() => rest,
             _ => path,

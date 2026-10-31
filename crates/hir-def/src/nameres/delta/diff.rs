@@ -39,13 +39,19 @@ pub(super) fn keys(db: &Db, module: ModuleId, old: Option<&ModuleData>, new: Opt
             if whole {
                 out.push(((module, None), true));
             }
+            let start = out.len();
             for (&name, res) in os.entries() {
                 if ns.get(&name) != res {
                     out.push(((module, Some(name)), true));
                 }
             }
+            // An old entry that bound nothing (an unresolved import) is one the loop above
+            // already put in when it now binds something.
             for (&name, res) in ns.entries() {
-                if os.get(&name).is_none() && !res.is_none() {
+                if os.get(&name).is_none()
+                    && !res.is_none()
+                    && !out[start..].iter().any(|((_, it), _)| *it == Some(name))
+                {
                     out.push(((module, Some(name)), false));
                 }
             }

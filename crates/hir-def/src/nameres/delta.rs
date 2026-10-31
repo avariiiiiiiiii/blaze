@@ -417,7 +417,8 @@ fn publish_crate(
     modules_changed: &mut Vec<ModuleId>,
     work: &mut Work,
 ) -> CrateDelta {
-    let attrs = queries::crate_data(db, krate);
+    // clone: a count of the crate's attributes, held across the writes to `db` below
+    let attrs = queries::crate_data(db, krate).clone();
     let proc_macro = attrs.proc_macro;
     let root = cs.root;
     // What the impls maintainer is handed, before: the items of every module the write replaced.
@@ -430,7 +431,7 @@ fn publish_crate(
     let mut records_changed = cold || !delta.deleted.is_empty();
     let mut data_changed = cold
         || cs.data.is_none()
-        || cs.data_of.as_ref() != Some(attrs)
+        || cs.data_of.as_ref() != Some(&attrs)
         || delta.deleted.iter().any(|(_, it)| !it.out.crate_ops.is_empty());
     let mut env_changed = false;
 
@@ -504,7 +505,7 @@ fn publish_crate(
         cs.prelude_holder = run.prelude_holder;
         if data_changed {
             cs.data = Some(assemble::data(db, krate, cs));
-            cs.data_of = Some(attrs.clone()); // clone: a count of the crate's attributes
+            cs.data_of = Some(attrs.clone()); // clone: the run keeps its own for the rows after
         }
 
         // Each group of the region's share of the records, on the crate as it now is: what it

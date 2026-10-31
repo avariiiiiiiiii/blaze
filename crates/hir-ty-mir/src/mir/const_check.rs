@@ -746,7 +746,7 @@ fn turbofish<'db>(db: &'db Db, caller: Crate, own: &[GenericArg<'db>]) -> String
     let target = DisplayTarget::from_crate(db, caller);
     // alloc: the text of a diagnostic, made when it is reported
     let shown: Vec<String> =
-        own.iter().filter(|it| it.as_region().is_none()).map(|it| it.display(db, target).to_string()).collect();
+        own.iter().filter(|it| it.region().is_none()).map(|it| it.display(db, target).to_string()).collect();
     match shown.is_empty() {
         // alloc: none, empty
         true => String::new(),

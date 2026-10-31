@@ -109,8 +109,8 @@ pub struct Call {
 
 const _: () = assert!(size_of::<Call>() == 64);
 
-#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug)]
-#[cfg_attr(test, derive(Clone))] // clone: tests decide from copies of one set of summaries
+// clone: the memo keeps one copy of each summary a build made for the builds after it (driver.rs, flight.rs)
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Debug, Clone)]
 pub struct Summary {
     pub key: InstanceKey,
     /// Its instructions, as LLVM counts them after its pre-link pipeline.

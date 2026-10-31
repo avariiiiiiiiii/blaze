@@ -11,8 +11,12 @@ use hir_def::{AttrDefId, EnumVariantId};
 
 use crate::mir::eval::word_bytes;
 use crate::next_solver::{
-    Binder, BoundExistentialPredicates, ExistentialPredicate,
-    infer::traits::{Obligation, ObligationCause},
+    Binder, BoundExistentialPredicates, ExistentialPredicate, TypingMode,
+    infer::{
+        DbInternerInferExt,
+        traits::{Obligation, ObligationCause},
+    },
+    obligation_ctxt::ObligationCtxt,
 };
 
 use super::*;

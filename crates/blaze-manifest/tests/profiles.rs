@@ -6,9 +6,9 @@
 // `expected.json` is what cargo printed on Linux: its unit graph names Linux paths, put in a
 // JSON text as they are, which a Windows path's `\` is not.
 #![cfg(unix)]
-#![allow(dead_code, reason = "the example's module, of which the test uses `main`")]
+#![allow(dead_code, reason = "the walk module, of which the test uses `main`")]
 
-#[path = "../examples/profiles/walk.rs"]
+#[path = "support/profiles_walk.rs"]
 mod walk;
 
 use std::path::Path;

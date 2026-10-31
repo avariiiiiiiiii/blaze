@@ -457,7 +457,7 @@ pub fn apply_args_to_binder<'db, T: TypeFoldable<DbInterner<'db>>>(
     b.skip_binder().fold_with(&mut instantiate)
 }
 
-#[derive(blaze_query::Supertype)]
+#[derive(Clone, Copy, blaze_query::Supertype)]
 pub(crate) enum ItemWithBounds<'db> {
     TypeAliasId(TypeAliasId),
     InternedOpaqueTyId(InternedOpaqueTyId<'db>),

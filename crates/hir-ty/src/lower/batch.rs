@@ -328,7 +328,7 @@ fn module_variants<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Vec<Variant
             VariantId::StructId(it) => (1, it.as_id()),
             VariantId::UnionId(it) => (2, it.as_id()),
         };
-        radix::pack_64(kind, radix::pack_32(id.index(), id.generation()))
+        radix::pack_32(kind, id.as_u32())
     });
     variants.dedup();
     variants
@@ -340,10 +340,7 @@ fn module_impls<A: Allocator>(db: &Db, krate: Crate, alloc: A) -> Vec<ImplId, A>
     for (_, module) in crate_def_map(db, krate).modules(db) {
         impls.extend(module.scope(db).impls());
     }
-    radix::sort_copy_by_key(&mut impls, |it| {
-        let id = it.as_id();
-        radix::pack_32(id.index(), id.generation())
-    });
+    radix::sort_copy_by_key(&mut impls, |it| it.as_id().as_u32());
     impls.dedup();
     impls
 }

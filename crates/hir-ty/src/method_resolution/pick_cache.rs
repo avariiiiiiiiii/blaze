@@ -116,7 +116,7 @@ enum Answer {
 /// scope) triples checked in one revision, across every crate being checked.
 const PICK_BITS: u32 = 16;
 
-static PICKS: LazyLock<Table<PickKey, Revision, Cached>> =
+static PICKS: LazyLock<Table<PickKey, View, Cached>> =
     LazyLock::new(|| Table::new(PICK_BITS));
 
 /// The answer of the probe for `name` on `self_ty` in `ctx`: from the table when it holds it,
@@ -379,7 +379,7 @@ struct CachedSteps {
 /// probed in a revision.
 const STEPS_BITS: u32 = 14;
 
-static STEPS: LazyLock<Table<StepsKey, Revision, CachedSteps>> =
+static STEPS: LazyLock<Table<StepsKey, View, CachedSteps>> =
     LazyLock::new(|| Table::new(STEPS_BITS));
 
 /// Runs `f` on the autoderef steps of `input`: the table's, borrowed in place, when it holds

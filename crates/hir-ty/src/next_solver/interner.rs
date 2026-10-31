@@ -656,7 +656,7 @@ enum AdtDefInner {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AdtDef(AdtDefInner);
 
-const _: () = assert!(size_of::<AdtDef>() == 12);
+const _: () = assert!(size_of::<AdtDef>() == 8);
 
 impl AdtDef {
     pub fn new<'db>(def_id: AdtId, interner: DbInterner<'db>) -> Self {

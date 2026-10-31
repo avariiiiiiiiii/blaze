@@ -143,10 +143,10 @@ struct SharedCaches {
     goals: crate::next_solver::global_goals::Goals,
 }
 
-static SHARED_GENERATIONS: LazyLock<Pool<Generation<Scope, Revision, SharedCaches>>> =
+static SHARED_GENERATIONS: LazyLock<Pool<Generation<Scope, View, SharedCaches>>> =
     LazyLock::new(pool);
 
-static SHARED: LazyLock<Shared<'static, Scope, Revision, SharedCaches>> =
+static SHARED: LazyLock<Shared<'static, Scope, View, SharedCaches>> =
     LazyLock::new(|| Shared::new(SHARED_BITS, LazyLock::force(&SHARED_GENERATIONS)));
 
 /// Runs `f` on the shared cache of `krate` (and `regions`) in `db`, as it is now.
@@ -438,7 +438,7 @@ const SLOT_BITS: u32 = 9;
 #[derive(Default)]
 struct OfQuery {
     #[cfg(debug_assertions)]
-    state: std::sync::OnceLock<(Nonce, Revision)>,
+    state: std::sync::OnceLock<(Nonce, View)>,
     cache: Erased,
 }
 
@@ -450,7 +450,7 @@ static OF_QUERY: LazyLock<Shared<'static, Solved, (), OfQuery>> =
 
 // A generation's header is one line; the rest is the search graph's cache.
 const _: () = assert!(
-    size_of::<Generation<Scope, Revision, SharedCaches>>() - size_of::<SharedCaches>() <= 64
+    size_of::<Generation<Scope, View, SharedCaches>>() - size_of::<SharedCaches>() <= 64
         && size_of::<Generation<Solved, (), OfQuery>>() - size_of::<Erased>() <= 64
 );
 

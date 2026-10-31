@@ -1,6 +1,6 @@
 {
  "crate": "crates/hir-ty",
- "base": "b8c752e457596472d86888086afc758ecfcb8f38",
+ "base": "fd6947867d60c44cd95f580924a79f2acb08bdae",
  "files": [
   {
    "path": "crates/hir-ty/benches/impls.rs",
@@ -245,6 +245,27 @@
    ]
   },
   {
+   "path": "crates/hir-ty/src/display.rs",
+   "edits": [
+    {
+     "old": "                            \"{{closure#{:?}}}\",\n                            blaze_query::db::AsId::as_id(&id).index()\n                        );\n",
+     "new": "                            \"{{closure#{:?}}}\",\n                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)\n                        );\n"
+    },
+    {
+     "old": "                        write!(f, \"{{closure#{:?}}}\", blaze_query::db::AsId::as_id(&id).index())?;\n",
+     "new": "                        write!(f, \"{{closure#{:?}}}\", (blaze_query::db::AsId::as_id(&id).as_u32() - 1))?;\n"
+    },
+    {
+     "old": "                            \"{{{closure_label}#{:?}}}\",\n                            blaze_query::db::AsId::as_id(&id).index()\n                        );\n",
+     "new": "                            \"{{{closure_label}#{:?}}}\",\n                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)\n                        );\n"
+    },
+    {
+     "old": "                            blaze_query::db::AsId::as_id(&id).index()\n",
+     "new": "                            (blaze_query::db::AsId::as_id(&id).as_u32() - 1)\n"
+    }
+   ]
+  },
+  {
    "path": "crates/hir-ty/src/evict.rs",
    "edits": [
     {
@@ -326,6 +347,19 @@
    ]
   },
   {
+   "path": "crates/hir-ty/src/lower/batch.rs",
+   "edits": [
+    {
+     "old": "        radix::pack_64(kind, radix::pack_32(id.index(), id.generation()))\n",
+     "new": "        radix::pack_32(kind, id.as_u32())\n"
+    },
+    {
+     "old": "    radix::sort_copy_by_key(&mut impls, |it| {\n        let id = it.as_id();\n        radix::pack_32(id.index(), id.generation())\n    });\n",
+     "new": "    radix::sort_copy_by_key(&mut impls, |it| it.as_id().as_u32());\n"
+    }
+   ]
+  },
+  {
    "path": "crates/hir-ty/src/lower/persist.rs",
    "edits": [
     {
@@ -382,6 +416,10 @@
    "path": "crates/hir-ty/src/method_resolution.rs",
    "edits": [
     {
+     "old": "use blaze_ids::{\n    bits::{BitMatrix, Ones, words_for},\n    radix,\n};\n",
+     "new": "use blaze_ids::bits::{BitMatrix, Ones, words_for};\n"
+    },
+    {
      "old": "pub(crate) fn in_crate_trait_value_items(\n",
      "new": "pub fn in_crate_trait_value_items(\n"
     },
@@ -392,6 +430,10 @@
     {
      "old": "    // only plain data and `SolverDefId<'db>`, which is `SalsaValue`; no `&'db`.\n    #[salsa_value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))] pub SimplifiedType<'db>,\n",
      "new": "    // only plain data and `SolverDefId<'db>`, which is `blaze_query::db::Value`; no `&'db`.\n    #[value(unsafe(prove(SolverDefId<'db>: blaze_query::db::Value)))] pub SimplifiedType<'db>,\n"
+    },
+    {
+     "old": "    order.sort_unstable_by_key(|&t| {\n        let id = trait_ids[t as usize].as_id();\n        radix::pack_32(id.index(), id.generation())\n    });\n",
+     "new": "    order.sort_unstable_by_key(|&t| trait_ids[t as usize].as_id().as_u32());\n"
     },
     {
      "old": "pub struct InherentImpls<'db> {\n    // SAFETY: salsa may keep this column past `'db` only if nothing in it borrows from the\n    // database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are\n    // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants\n",
@@ -458,12 +500,20 @@
      "new": "        hasher.write_u64(pair(self.solver_crate, self.resolver_crate));\n        hasher.write_u64(pair(self.module, self.self_ty));\n        hasher.write_u64(pair(self.name, self.scope));\n        hasher.write_u64(pair(self.param_env, self.typing_defs));\n        hasher.write_u32(self.bits);\n"
     },
     {
+     "old": "static PICKS: LazyLock<Table<PickKey, Revision, Cached>> =\n",
+     "new": "static PICKS: LazyLock<Table<PickKey, View, Cached>> =\n"
+    },
+    {
      "old": "    solver_crate: u64,\n",
      "new": "    solver_crate: u32,\n"
     },
     {
      "old": "        hasher.write_u64(self.solver_crate);\n",
      "new": "        hasher.write_u32(self.solver_crate);\n"
+    },
+    {
+     "old": "static STEPS: LazyLock<Table<StepsKey, Revision, CachedSteps>> =\n",
+     "new": "static STEPS: LazyLock<Table<StepsKey, View, CachedSteps>> =\n"
     },
     {
      "old": "/// `PhantomData<&'db ()>`) and salsa ids; none is a reference into the database. A table entry\n",
@@ -558,6 +608,10 @@
      "new": "// The database is `Send + Sync` (`blaze_query::db::Database`), so an interner is, by the auto traits.\n"
     },
     {
+     "old": "const _: () = assert!(size_of::<AdtDef>() == 12);\n",
+     "new": "const _: () = assert!(size_of::<AdtDef>() == 8);\n"
+    },
+    {
      "old": "        salsa::Database::unwind_if_revision_cancelled(self.db);\n",
      "new": "        blaze_query::db::unwind_if_cancelled(self.db);\n"
     }
@@ -571,8 +625,24 @@
      "new": "//! - [`shared`]: a goal whose reads `blaze_query::db::capture_reads` recorded, for every query and\n"
     },
     {
+     "old": "static SHARED_GENERATIONS: LazyLock<Pool<Generation<Scope, Revision, SharedCaches>>> =\n",
+     "new": "static SHARED_GENERATIONS: LazyLock<Pool<Generation<Scope, View, SharedCaches>>> =\n"
+    },
+    {
+     "old": "static SHARED: LazyLock<Shared<'static, Scope, Revision, SharedCaches>> =\n",
+     "new": "static SHARED: LazyLock<Shared<'static, Scope, View, SharedCaches>> =\n"
+    },
+    {
      "old": "/// (salsa's `new_revision` takes `&mut Zalsa`). So a lookup reads neither; debug builds check.\n",
      "new": "/// (a new view takes `&mut Storage`). So a lookup reads neither; debug builds check.\n"
+    },
+    {
+     "old": "    state: std::sync::OnceLock<(Nonce, Revision)>,\n",
+     "new": "    state: std::sync::OnceLock<(Nonce, View)>,\n"
+    },
+    {
+     "old": "    size_of::<Generation<Scope, Revision, SharedCaches>>() - size_of::<SharedCaches>() <= 64\n",
+     "new": "    size_of::<Generation<Scope, View, SharedCaches>>() - size_of::<SharedCaches>() <= 64\n"
     }
    ]
   },
@@ -637,6 +707,10 @@
   {
    "path": "crates/hir-ty/src/next_solver/util.rs",
    "edits": [
+    {
+     "old": "#[derive(blaze_query::Supertype)]\n",
+     "new": "#[derive(Clone, Copy, blaze_query::Supertype)]\n"
+    },
     {
      "old": "        reason = \"this happens in a Salsa macro, not sure why only here\"\n",
      "new": "        reason = \"this happens in the tracked macro's expansion, not sure why only here\"\n"

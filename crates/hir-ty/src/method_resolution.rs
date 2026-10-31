@@ -20,10 +20,7 @@ pub mod scope_sets;
 use std::{hash::BuildHasher, ops::Range};
 
 use crate::next_solver::StoredGenericArgs;
-use blaze_ids::{
-    bits::{BitMatrix, Ones, words_for},
-    radix,
-};
+use blaze_ids::bits::{BitMatrix, Ones, words_for};
 use blaze_mem::Frame;
 use either::Either;
 use hir_expand::name::Name;
@@ -1545,10 +1542,7 @@ fn trait_number(
 /// The traits `trait_ids` in the order [`TraitImpls::traits`] holds them, as indices.
 fn order_by_trait_id<'f>(frame: &'f Frame, trait_ids: &[TraitId]) -> &'f mut [u32] {
     let order = frame.alloc_slice_fill_with(trait_ids.len(), |t| t as u32);
-    order.sort_unstable_by_key(|&t| {
-        let id = trait_ids[t as usize].as_id();
-        radix::pack_32(id.index(), id.generation())
-    });
+    order.sort_unstable_by_key(|&t| trait_ids[t as usize].as_id().as_u32());
     order
 }
 

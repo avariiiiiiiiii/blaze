@@ -140,7 +140,9 @@ every other token, and a differential test holds the two equal.
 | `blaze-build-script`, `blaze-usercode` | cargo's build-script protocol (environment, directives); the keying, tracing and store of a run above it. `blaze-wasi`, a second runner nothing calls, goes with the proc-macro engines. |
 | `blaze-fuzz`, `fuzz/` | corpora replayed inside ordinary tests, with an allocation guard; the coverage-guided engine that writes corpora in the same format. |
 | `blaze-codegen`, `hir-ty-codegen` | function instances, keys and compiled code (no backend); the backends that make the code. |
-| `blaze-cache`, `blaze-cache-macros` | the user-facing library of the `#[blaze::cache]` extension (docs/fn-cache.md), compiled into user programs; not a store of blaze's own. |
+`blaze-cache` and `blaze-cache-macros` (the `#[blaze::cache]` library, docs/fn-cache.md) were
+deleted on 2026-10-30 (Andrew): no crate depended on them, and the query database and
+`blaze-cas` keep blaze's own results across runs.
 
 Patching a running program is done twice (`blaze-live` and `blaze-inproc`); `blaze-inproc` is
 v2's, and moving `blaze-live` onto it is with lane link.

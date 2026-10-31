@@ -1047,9 +1047,10 @@ fn journal_run(seed: u64) {
     let mut tickets: FxHashMap<Ticket, (String, u64, bool)> = FxHashMap::default();
     // By head: the latest record acknowledged durable, and whether it was a removal.
     let mut acknowledged: FxHashMap<String, (u64, bool)> = FxHashMap::default();
-    // By head: the sequence of its latest removal, acknowledged or not. A crash keeps a random
-    // prefix of what was appended and not synced, so an unacknowledged removal can survive one.
-    let mut removed: FxHashMap<String, u64> = FxHashMap::default();
+    // By head: the sequence of each removal, acknowledged or not. A crash keeps a random prefix
+    // of what was appended and not synced, so an unacknowledged removal can survive one while
+    // a later one of the same head (after it was made again) is cut.
+    let mut removed: FxHashMap<String, Vec<u64>> = FxHashMap::default();
     let mut old_bases: Vec<ContentId> = Vec::new();
 
     for step in 0..300 {
@@ -1100,7 +1101,7 @@ fn journal_run(seed: u64) {
                     if let Some(ticket) = vfs.remove_head(to) {
                         let sequence = vfs.journal.last_sequence();
                         tickets.insert(ticket, (to.into(), sequence, true));
-                        removed.insert(to.into(), sequence);
+                        removed.entry(to.into()).or_default().push(sequence);
                     }
                 } else if let Some(root) = vfs.head(from) {
                     let ticket = vfs.set_head(to, root).unwrap();
@@ -1151,7 +1152,10 @@ fn journal_run(seed: u64) {
                             "seed {seed}: {head} acknowledged {sequence}, recovered {recovered}"
                         ),
                         None => assert!(
-                            removal || removed.get(head).is_some_and(|&at| at > sequence),
+                            removal
+                                || removed
+                                    .get(head)
+                                    .is_some_and(|it| it.iter().any(|&at| at > sequence)),
                             "seed {seed}: {head} acknowledged {sequence}, recovered nothing"
                         ),
                     }
@@ -1159,7 +1163,9 @@ fn journal_run(seed: u64) {
                 // Sequences after the cut may reuse numbers of moves and removals it lost.
                 let last = vfs.journal.last_sequence();
                 moves.retain(|&sequence, _| sequence <= last);
-                removed.retain(|_, &mut sequence| sequence <= last);
+                for sequences in removed.values_mut() {
+                    sequences.retain(|&sequence| sequence <= last);
+                }
             }
         }
     }

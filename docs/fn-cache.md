@@ -1,8 +1,14 @@
 ---
-status: current
-summary: #[blaze::cache]: results of pure functions kept across runs, keyed by the code they reach.
+status: record
+summary: #[blaze::cache]: results of pure functions kept across runs, keyed by the code they reach. Its library crates were deleted on 2026-10-30.
+date: 2026-10-30
 ---
 # Cached functions
+
+Record: `crates/blaze-cache` and `crates/blaze-cache-macros`, the library and attribute below,
+were deleted on 2026-10-30 (lane dedup, Andrew): nothing in the tree depended on them, and the
+query database and `blaze-cas` keep blaze's own results across runs. What follows is the design
+as it stood.
 
 `#[blaze::cache]` on a pure function keeps what it returns, in memory for the run and on
 disk for the runs after it. A run that calls it again with the same arguments gets the

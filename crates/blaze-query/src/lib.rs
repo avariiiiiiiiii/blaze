@@ -1,6 +1,6 @@
 #![feature(allocator_api, allocator_ext)]
-//! blaze v2's query database (docs/v2/plan/lanes/db.md section 7, docs/v2/plan/lanes/items.md section 6.2), remade
-//! from `vendor/salsa`.
+//! blaze v2's query database (docs/v2/plan/lanes/db.md section 7, docs/v2/plan/lanes/items.md
+//! section 6.2).
 //!
 //! - A query is asked of a [`QueryKey`]: its kind and the content ID of its arguments. Results
 //!   are keyed by input hashes, never by view or revision, so every view shares every equal

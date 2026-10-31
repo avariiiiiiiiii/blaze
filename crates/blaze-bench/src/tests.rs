@@ -35,9 +35,9 @@ fn ci_and_query_hit_command_lines_parse() {
 fn glob_stars_and_marks() {
     assert!(glob("", "db/hit/sequential"));
     assert!(glob("db/*", "db/hit/sequential"));
-    assert!(glob("*/hit/*", "salsa/hit/scattered"));
+    assert!(glob("*/hit/*", "other/hit/scattered"));
     assert!(glob("store/?et_hit", "store/get_hit"));
-    assert!(!glob("db/*", "salsa/hit/sequential"));
+    assert!(!glob("db/*", "other/hit/sequential"));
     assert!(!glob("store/get", "store/get_hit"));
 }
 

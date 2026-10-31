@@ -13,6 +13,8 @@ Part of the [v2 plan](../../plan.md). Section numbers refer to the plan as first
   remade into blaze's: red-green queries keyed by input hashes (section 2), not by revision;
   fingerprints on every edge; results in the zero-copy format; many views at once;
   admission-aware execution. It is no longer a vendored copy kept close to upstream.
+  (2026-10-31: done as `blaze_query::db`, a new engine rather than a remade fork; `vendor/salsa*`
+  is deleted. See [query-unify](db/query-unify.md).)
 - **Why did this rerun**: the agent API answers, for any query that ran, the chain of facts
   back to the input that changed. Over-invalidation is debugged with it, and the oracle reports
   through it.

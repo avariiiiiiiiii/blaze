@@ -88,7 +88,9 @@ thread-local, no downcasters, no revision-keyed claim table.
   64-bit hashes once it was evicted: an `lru` function's value is hashed (`V: Hash`, through
   `blaze_ids`' stable hasher) when it is made, so an evicted value that comes back the same
   keeps its stamp and **eviction never counts as a change** (the `INCREMENTAL.md` bug: every
-  macro of a file expanded again on each edit).
+  macro of a file expanded again on each edit). A `no_eq` function's value is never compared,
+  so it is never hashed either (no `V: Hash` with `lru`): every run of it, evicted or not, is a
+  change (R19, qu-check8: hir-ty-codegen's `Option<Inlinable>`).
 - No backdating when the new run's durability is lower than the old one's, or for a value made
   inside a cycle (#350).
 
@@ -472,7 +474,7 @@ pub trait Function: 'static {
     const NAME: &'static str;                     // `f`, or `SelfTy::f` in a tracked impl / with `self_ty`
     const FILE: &'static str;                     // `file!()` at the definition (every trait here has it)
     const LRU: usize;                             // the starting cap; 0: no cap (R15: the live cap is the table's)
-    const EVICTABLE: bool;                        // `lru = N` given (0 too): `hash` is real, `evict_values*` exist
+    const EVICTABLE: bool;                        // `lru = N` given (0 too): `evict_values*` exist; `hash` is real unless NO_EQ (R19)
     const NO_EQ: bool;
     const CYCLE: CycleKind;
     const TAG: Tag;
@@ -483,7 +485,7 @@ pub trait Function: 'static {
     fn cycle_recover(db: &Self::Db, cycle: &Cycle<'_>, last: &Self::Value, new: Self::Value,
         key: Self::Key) -> Self::Value;           // Fixpoint without cycle_fn: returns `new`
     fn equal(old: &Self::Value, new: &Self::Value) -> bool;   // `==`; `false` when NO_EQ
-    fn hash(value: &Self::Value) -> u64;          // EVICTABLE only (else it panics): blaze_ids' stable hasher
+    fn hash(value: &Self::Value) -> u64;          // EVICTABLE and not NO_EQ only (else it panics): blaze_ids' stable hasher
 }
 pub fn value_hash<V: Hash + ?Sized>(value: &V) -> u64;   // what `hash` calls: the stable hasher
 pub fn fetch<'db, F: Function>(db: &'db F::Db, key: F::Key) -> &'db F::Value;

@@ -1,6 +1,6 @@
 //! What generated code relies on besides the engine: the [`Value`] proof that a type may stay
 //! in a row across views, the borrowed lookups of interned constructors ([`Lookup`],
-//! [`HashEqLike`], salsa's), `ids_of`'s field dispatch, the return modes, and the stable
+//! [`HashEqLike`]), `ids_of`'s field dispatch, the return modes, and the stable
 //! value hash.
 
 use std::{
@@ -127,7 +127,7 @@ pub trait HashEqLike<O> {
     fn eq(&self, data: &O) -> bool;
 }
 
-/// What an interned constructor's argument becomes when its value is new (salsa's `Lookup`, a
+/// What an interned constructor's argument becomes when its value is new (a
 /// `Borrow`/`ToOwned` that works field by field).
 pub trait Lookup<O> {
     fn into_owned(self) -> O;

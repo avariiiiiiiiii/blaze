@@ -457,7 +457,7 @@ impl ast::MacroStmts {
     }
 }
 
-#[cfg(not(no_salsa_async_drops))]
+#[cfg(not(no_async_drops))]
 impl<T> Drop for Parse<T> {
     fn drop(&mut self) {
         // A count that is not the tree's last frees nothing: it is dropped here, not sent.

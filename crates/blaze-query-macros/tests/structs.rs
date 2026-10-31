@@ -88,7 +88,7 @@ struct File {
     text: String,
 }
 
-#[blaze_query_macros::interned(debug, constructor = make, revisions = usize::MAX)]
+#[blaze_query_macros::interned(debug, constructor = make)]
 struct Path<'db> {
     #[returns(ref)]
     text: String,
@@ -97,7 +97,7 @@ struct Path<'db> {
     depth: u32,
 }
 
-#[blaze_query_macros::interned(unsafe(no_lifetime), revisions = usize::MAX)]
+#[blaze_query_macros::interned(unsafe(no_lifetime))]
 struct Symbol {
     #[returns(deref)]
     text: Box<str>,

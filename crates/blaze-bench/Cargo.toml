@@ -17,7 +17,6 @@ blaze-cas.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-query.workspace = true
-salsa.workspace = true
 
 [[bench]]
 name = "store"

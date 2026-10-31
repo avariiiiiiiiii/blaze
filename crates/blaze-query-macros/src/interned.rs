@@ -1,4 +1,4 @@
-//! `#[blaze_query::interned(debug, constructor = name, unsafe(no_lifetime), revisions = ..)]`:
+//! `#[blaze_query::interned(debug, constructor = name, unsafe(no_lifetime))]`:
 //! a struct of fields stored once, its ID the same for equal fields.
 
 use proc_macro2::TokenStream;

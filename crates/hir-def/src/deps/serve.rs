@@ -257,6 +257,9 @@ pub fn serve(
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
     set_images(db, served);
+    // A served crate's modules are the decoded map's, not the ones its dependents were
+    // maintained against: the maintainers run again over the crates now served.
+    db.note_crates_changed();
     Ok(Served { keys, hits, stale })
 }
 

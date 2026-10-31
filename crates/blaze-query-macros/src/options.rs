@@ -1,5 +1,5 @@
-//! The options of each attribute, in salsa's grammar (`(returns(ref), lru = 32, ..)`, commas
-//! between, a trailing one allowed). An option the site doesn't take is an error naming it.
+//! The options of each attribute (`(returns(ref), lru = 32, ..)`, commas between, a trailing one
+//! allowed). An option the site doesn't take is an error naming it.
 
 use proc_macro2::TokenStream;
 use syn::ext::IdentExt;
@@ -40,26 +40,9 @@ pub(crate) struct Options {
     pub(crate) cycle_result: Option<Expr>,
     pub(crate) lru: Option<(Ident, usize)>,
     pub(crate) constructor: Option<Ident>,
-    /// Accepted for salsa's grammar and ignored: nothing interned is ever freed.
-    pub(crate) revisions: Option<Expr>,
     pub(crate) self_ty: Option<Type>,
     pub(crate) mem_tag: Option<Path>,
 }
-
-/// Options salsa has that the front end never uses: refused by name.
-const REFUSED: &[&str] = &[
-    "specify",
-    "persist",
-    "heap_size",
-    "db",
-    "data",
-    "id",
-    "image",
-    "accumulator",
-    "jar",
-    "recovery_fn",
-    "non_update_return_type",
-];
 
 impl Options {
     pub(crate) fn parse(site: Site, tokens: TokenStream) -> syn::Result<Options> {
@@ -159,11 +142,6 @@ impl Options {
                     input.parse::<Token![=]>()?;
                     set(&mut options.constructor, &name, input.parse::<Ident>()?)?;
                 }
-                "revisions" => {
-                    allowed(&[Site::TrackedFn, Site::Interned])?;
-                    input.parse::<Token![=]>()?;
-                    set(&mut options.revisions, &name, input.parse::<Expr>()?)?;
-                }
                 "self_ty" => {
                     allowed(&[Site::TrackedFn])?;
                     input.parse::<Token![=]>()?;
@@ -173,16 +151,6 @@ impl Options {
                     allowed(&[Site::TrackedFn])?;
                     input.parse::<Token![=]>()?;
                     set(&mut options.mem_tag, &name, Path::parse_mod_style(input)?)?;
-                }
-                other if REFUSED.contains(&other) => {
-                    return Err(syn::Error::new(
-                        name.span(),
-                        // alloc: expansion time, the error's message
-                        format!(
-                            "`{name}` is a salsa option blaze_query does not have: nothing in the \
-                             front end uses it"
-                        ),
-                    ));
                 }
                 _ => {
                     return Err(syn::Error::new(
@@ -201,7 +169,7 @@ impl Options {
         Ok(options)
     }
 
-    /// The combinations salsa refuses.
+    /// The combinations refused.
     fn check(&self, site: Site) -> syn::Result<()> {
         if site != Site::TrackedFn {
             return Ok(());

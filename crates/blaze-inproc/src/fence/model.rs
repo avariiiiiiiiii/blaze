@@ -550,6 +550,14 @@ fn daemon_steps(state: &State, config: &Config, out: &mut Vec<State>) -> Result<
 /// The representative of `state`, exploring one state per class checks both properties:
 /// - A dead thread's record is its ID alone: nothing steps it, a spawn reads only its ID, and
 ///   it died from `Top`, where it neither holds the old word nor is in the range.
+/// - Out of a quiescent point a thread's `epoch`, `seen` and `inside` are dead: a quiescent
+///   point writes each before it reads it, and nothing else reads them. So is `reported`
+///   when it holds no slot: only `QEpoch` reads it, past a test that its slot is set, and only
+///   the thread's own quiescent points set its slot.
+/// - A thread at `Called` is taken on to `Inside`: that step reads only the thread's own
+///   `old`, and nothing tells the two apart (`exposed` reads `old || in_range`, a spawn and
+///   the count of threads alive test only for `Unborn` and `Dead`), so it commutes with every
+///   other step and changes neither property.
 /// - Renaming the threads, when every thread plays the same part (no spawn: thread `i` is ID
 ///   `i + 1` throughout). A thread ID only meets another in equality tests and as a bit of a
 ///   set, so renaming the records and every ID with them (the slots' IDs, the OS's list, the
@@ -573,6 +581,18 @@ fn canonical(mut state: State, config: &Config) -> State {
                 calls: 0,
                 quiesces: 0,
             };
+        } else if matches!(thread.pc, Pc::Unborn | Pc::Top | Pc::Called | Pc::Inside | Pc::XRelease | Pc::XGone) {
+            if thread.pc == Pc::Called {
+                thread.in_range = thread.old;
+                thread.old = false;
+                thread.pc = Pc::Inside;
+            }
+            thread.epoch = 0;
+            thread.seen = 0;
+            thread.inside = false;
+            if thread.slot == NONE {
+                thread.reported = 0;
+            }
         }
     }
     if config.spawn {

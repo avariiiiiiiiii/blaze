@@ -88,7 +88,11 @@ pub(super) fn stmt(p: &mut Parser<'_>, semicolon: Semicolon) {
         // test_err attr_end_of_stmt_list
         // fn f() {#[attr]}
         // fn f() {}
-        p.err_and_bump("expected expression, item or let statement");
+        if p.at(T!['}']) {
+            p.error("expected expression, item or let statement");
+        } else {
+            p.err_and_bump("expected expression, item or let statement");
+        }
         m.abandon(p);
         return;
     }
@@ -835,6 +839,10 @@ pub(crate) fn record_expr_field_list(p: &mut Parser<'_>) {
             }
             T!['{'] => {
                 error_block(p, "expected a field");
+                m.abandon(p);
+            }
+            T!['}'] => {
+                p.error("expected identifier");
                 m.abandon(p);
             }
             _ => {

@@ -44,7 +44,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use blaze_codegen::{CompiledFunction, InstanceKey, Relocs, Target};
+use blaze_codegen::{Arch, CompiledFunction, InstanceKey, RelocKind, Relocs, Target};
 use blaze_inproc::{CodeMemory, CodeRange};
 use blaze_lazy::runner::Placer;
 use blaze_lazy::stub::{self, Layout, Stubs};
@@ -129,6 +129,19 @@ pub(crate) fn hook_name(format: Format) -> &'static str {
     }
 }
 
+/// The error of a lazy image that doesn't define its hook itself.
+pub(crate) fn no_hook(format: Format) -> LinkError {
+    LinkError {
+        function: None,
+        // alloc: error path
+        what: format!(
+            "a lazy image without `{}`, the hook its lazy stubs call: link blaze-lazy's `hook` into it",
+            hook_name(format)
+        ),
+        refusal: None,
+    }
+}
+
 /// The address of the name `name` in the image, when the image defines it.
 fn name_addr(image: &Image, name: &str) -> Option<u64> {
     let sym = image.symbols.find(SymKey::Name(image.symbols.find_name(name)?))?;
@@ -167,7 +180,8 @@ pub struct LazyPlacer<S: Slots> {
 /// room than every one before it.
 #[derive(Default)]
 struct Scratch {
-    /// The range's bytes: the code, each datum, then location records and file names.
+    /// The range's bytes: the code, each datum, then location records and file names, then
+    /// veneers.
     bytes: Vec<u8>,
     len: u64,
     /// Where each datum starts in the range.
@@ -178,7 +192,31 @@ struct Scratch {
     starts: Vec<usize>,
     /// The `Location` records the placement writes.
     records: Vec<Record>,
+    /// AArch64: the veneer of each of the code's targets a `bl` reaches in the image, by
+    /// target index; empty elsewhere.
+    veneers: Vec<Veneer>,
 }
+
+/// Room in the range for a range-extension veneer, `adrp x16; add x16, x16, lo12; br x16`:
+/// what a `bl` of placed code goes through to a target in the image past its 128 MiB reach
+/// (an arena is after the image's patch regions, further than that from its code).
+#[derive(Clone, Copy, Debug)]
+struct Veneer {
+    /// The offset in the range, or [`Veneer::NONE`] for a target no `bl` reaches.
+    at: u64,
+    /// Where it jumps, once a branch out of reach went through it.
+    to: Option<u64>,
+}
+
+impl Veneer {
+    const NONE: u64 = u64::MAX;
+    /// `adrp x16, 0; add x16, x16, 0; br x16`.
+    const CODE: [u32; 3] = [0x9000_0010, 0x9100_0210, 0xd61f_0200];
+    const LEN: u64 = 12;
+}
+
+/// How far an AArch64 `b` or `bl` reaches either way.
+const A64_BRANCH_REACH: i64 = 1 << 27;
 
 /// A relocation target, resolved once per target of a table.
 #[derive(Clone, Copy, Debug)]
@@ -345,8 +383,9 @@ impl<S: Slots> Placer for LazyPlacer<S> {
 
 impl Scratch {
     /// Lays the range out (the code, each datum at its alignment, then a `Location` record and
-    /// a file name for each position the image has none for) and resolves every target: the
-    /// range's alignment, its length in [`Scratch::len`].
+    /// a file name for each position the image has none for, then on AArch64 a veneer for each
+    /// target in the image a `bl` reaches) and resolves every target: the range's alignment,
+    /// its length in [`Scratch::len`].
     fn lay_out(&mut self, image: &mut Image, function: &CompiledFunction) -> Result<u64, LinkError> {
         self.data_at.clear();
         self.resolved.clear();
@@ -374,6 +413,21 @@ impl Scratch {
         }
         if !self.records.is_empty() {
             align = align.max(LOCATION_ALIGN);
+        }
+        self.veneers.clear();
+        if image.output.arch == Arch::Aarch64 {
+            let code = &self.resolved[..function.relocs.targets().len()];
+            // alloc: reused across placements; grows only for a function with more targets
+            self.veneers.resize(code.len(), Veneer { at: Veneer::NONE, to: None });
+            for row in function.relocs.rows() {
+                let veneer = &mut self.veneers[row.target as usize];
+                let in_image = matches!(code[row.target as usize], Resolved::Sym(_));
+                if row.kind == RelocKind::Call26 && in_image && veneer.at == Veneer::NONE {
+                    veneer.at = align_up_u64(end, 4);
+                    end = veneer.at + Veneer::LEN;
+                    align = align.max(4);
+                }
+            }
         }
         if end == 0 {
             return Err(LinkError { function: Some(function.key), what: "no code to place".into(), refusal: None });
@@ -516,12 +570,16 @@ impl Scratch {
             bytes[..8].copy_from_slice(&name.wrapping_add(slide).to_le_bytes());
             self.bytes[record.at as usize..][..bytes.len()].copy_from_slice(&bytes);
         }
-        let code = (&function.relocs, 0u64, function.code.len() as u64, true);
-        let data = function.data.iter().zip(&self.data_at).map(|(it, at)| (&it.relocs, *at, it.bytes.len() as u64, false));
-        for (n, (relocs, start, size, in_code)) in std::iter::once(code).chain(data).enumerate() {
-            let resolved = &self.resolved[self.starts[n]..][..relocs.targets().len()];
-            let field = &mut self.bytes[start as usize..][..size as usize];
-            relocate(image, relocs, resolved, field, linked, start, in_code, slide).map_err(fail)?;
+        {
+            let resolved = &self.resolved[..function.relocs.targets().len()];
+            let (code, rest) = self.bytes.split_at_mut(function.code.len());
+            let mut veneers = Veneers { of: &mut self.veneers, bytes: rest, at: function.code.len() as u64 };
+            relocate(image, &function.relocs, resolved, code, linked, 0, Some(&mut veneers), slide).map_err(fail)?;
+        }
+        for (n, (data, at)) in function.data.iter().zip(&self.data_at).enumerate() {
+            let resolved = &self.resolved[self.starts[n + 1]..][..data.relocs.targets().len()];
+            let field = &mut self.bytes[*at as usize..][..data.bytes.len()];
+            relocate(image, &data.relocs, resolved, field, linked, *at, None, slide).map_err(fail)?;
         }
         memory.write(range.offset, &self.bytes).map_err(|it| fail(it.what))?;
         memory.publish(range).map_err(|it| fail(it.what))?;
@@ -554,8 +612,52 @@ fn counter(image: &mut Image, function: &CompiledFunction, of: &InstanceKey, in_
     Ok(Resolved::Counter(cells + crate::counter::offset(pair)))
 }
 
+/// The code's veneers ([`Scratch::veneers`]) and the bytes of the range they are in, from its
+/// offset `at`.
+struct Veneers<'b> {
+    of: &'b mut [Veneer],
+    bytes: &'b mut [u8],
+    at: u64,
+}
+
+impl Veneers<'_> {
+    /// The offset in the range at `linked` of the veneer a `bl` by `ctx` to the code's target
+    /// `target` goes through, written to jump to its target; `None` for one in reach.
+    fn through(&mut self, target: u32, ctx: &Ctx, linked: u64) -> Result<Option<u64>, String> {
+        let Some(veneer) = self.of.get_mut(target as usize).filter(|it| it.at != Veneer::NONE) else {
+            return Ok(None);
+        };
+        let to = ctx.s.wrapping_add(ctx.a as u64);
+        if (-A64_BRANCH_REACH..A64_BRANCH_REACH).contains(&(to.wrapping_sub(ctx.p) as i64)) {
+            return Ok(None);
+        }
+        match veneer.to {
+            Some(it) if it != to => {
+                // alloc: error path
+                return Err(format!("{to:#x} is past a `bl`'s reach, and the veneer of its target jumps to {it:#x}"));
+            }
+            Some(_) => {}
+            None => {
+                let bytes = &mut self.bytes[(veneer.at - self.at) as usize..][..Veneer::LEN as usize];
+                for (word, insn) in bytes.chunks_exact_mut(4).zip(Veneer::CODE) {
+                    word.copy_from_slice(&insn.to_le_bytes());
+                }
+                let addr = linked + veneer.at;
+                let at = |p: u64| Ctx { s: to, a: 0, p, g: 0, tp: None, ..*ctx };
+                // alloc: error path
+                let fail = |it: reloc::Bad| format!("the veneer at {addr:#x} to {to:#x}: {it}");
+                reloc::apply(Apply::A64Page21, &at(addr), &mut bytes[..4]).map_err(fail)?;
+                reloc::apply(Apply::A64Lo12 { shift: 0 }, &at(addr + 4), &mut bytes[4..8]).map_err(fail)?;
+                veneer.to = Some(to);
+            }
+        }
+        Ok(Some(veneer.at))
+    }
+}
+
 /// Applies `relocs` (`resolved` being its targets by index) to `field`, a table's bytes at
-/// offset `start` of the range at `linked`.
+/// offset `start` of the range at `linked`: the code's when `veneers` is given, a datum's
+/// otherwise.
 #[allow(clippy::too_many_arguments)]
 fn relocate(
     image: &Image,
@@ -564,10 +666,11 @@ fn relocate(
     field: &mut [u8],
     linked: u64,
     start: u64,
-    in_code: bool,
+    mut veneers: Option<&mut Veneers<'_>>,
     slide: u64,
 ) -> Result<(), String> {
     let output = &image.output;
+    let in_code = veneers.is_some();
     for (row, reloc) in relocs.rows().iter().zip(relocs.iter()) {
         // alloc: error path
         let at_fail = |what: String| format!("{:?} at {:#x} to {:?}: {what}", reloc.kind, reloc.at, reloc.target);
@@ -586,7 +689,7 @@ fn relocate(
             Resolved::Sym(sym) => sym_value(image, sym, apply).map_err(at_fail)?,
         };
         let s = if apply == Apply::Abs64 && slid { s.wrapping_add(slide) } else { s };
-        let ctx = Ctx {
+        let mut ctx = Ctx {
             arch: output.arch,
             format: output.format,
             s,
@@ -598,6 +701,11 @@ fn relocate(
             tls: image.state.tls,
             tp,
         };
+        if let Some(veneers) = veneers.as_deref_mut().filter(|_| apply == Apply::A64Call26) {
+            if let Some(at) = veneers.through(row.target, &ctx, linked).map_err(at_fail)? {
+                (ctx.s, ctx.a) = (linked + at, 0);
+            }
+        }
         let Some(place) = field.get_mut(reloc.at as usize..) else {
             return Err(at_fail("past the end of its code or data".into()));
         };

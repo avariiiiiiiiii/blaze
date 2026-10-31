@@ -468,8 +468,8 @@ m!(Z);
         expect![[r#"
             [
                 "EditionedFileId::parse_",
-                "HirFileId::ast_id_map_",
                 "file_item_tree_query",
+                "HirFileId::ast_id_map_",
                 "real_span_map",
                 "MacroCallId::macro_arg_",
                 "MacroCallId::macro_arg_",

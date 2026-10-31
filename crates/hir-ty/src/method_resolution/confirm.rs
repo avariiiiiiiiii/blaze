@@ -426,7 +426,16 @@ impl<'a, 'db, 'f> ConfirmContext<'a, 'db, 'f> {
                 arg: TypeLikeConst<'_>,
             ) -> Const<'db> {
                 match arg {
-                    TypeLikeConst::Path(path) => self.ctx.make_path_as_const(path, type_ref),
+                    // Resolved where the call is, as a path expression is: a `let` binding
+                    // before it is in scope there and not at the block's start.
+                    TypeLikeConst::Path(path) => {
+                        let ctx = &mut *self.ctx;
+                        let guard =
+                            ctx.resolver.update_to_inner_scope(ctx.db, ctx.store_owner, self.expr);
+                        let konst = ctx.make_path_as_const(path, type_ref);
+                        ctx.resolver.reset_to_guard(guard);
+                        konst
+                    }
                     TypeLikeConst::Infer => self.ctx.table.next_const_var(type_ref.into()),
                 }
             }

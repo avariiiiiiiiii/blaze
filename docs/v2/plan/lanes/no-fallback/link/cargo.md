@@ -48,6 +48,7 @@ corrupt while the daemon runs stops it (`daemon::Failed`).
 | `serve/plane.rs:270` | rule | a panic with no message | an optional text. Stays |
 | `serve/mounts.rs:95` | rule | `remove_head`'s ticket dropped | a removal's durability is not waited on; `None` means no such head. Stays |
 | `serve/work.rs:481` `Writer::keep` (+ `serve/unit.rs:408`, `serve/tests.rs:431`, parent's `serve/job.rs:2205`) | error | `None` when a write fails to apply or a reader is alive: the kept front end is dropped and the head's next build lowers in full, no reason given | `Result<S::KeptFront, ApiError>` naming why (a reader still alive, another holder, the apply's error); the build ends with it. Queue 01166. Done |
+| `serve/unit.rs` `seed` (+ `blaze-lower` `Lowered::refresh`) | error | edit seeds handed over after the refresh's write, whose nameres maintainer had already parsed the files: every seed refused, `retain` dropped them, each file parsed whole | `refresh` takes a `seed` closure run inside the same `Db::batch` after the texts are set; a refused seed is a `LowerError` naming the file. Queue 01185. Done |
 | `serve/unit/codegen.rs`, `serve/unit/compile.rs`, `serve/job.rs` | parent's | | in the parent's table, `no-fallback/link.md` |
 
 Tests: `serve/daemon.rs` `mod tests` (each classification: layout vs damaged open, symbols,

@@ -1034,30 +1034,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                     return Err(MirEvalError::InternalError("offset args are not provided".into()));
                 };
                 let (ty, signed) = if intrinsic == Intrinsic::Offset {
-                    let Some(ty0) = generic_args.as_slice().first().and_then(|it| it.ty()) else {
-                        return Err(MirEvalError::InternalError(
-                            "offset generic arg is not provided".into(),
-                        ));
-                    };
-                    let Some(ty1) = generic_args.as_slice().get(1).and_then(|it| it.ty()) else {
-                        return Err(MirEvalError::InternalError(
-                            "offset generic arg is not provided".into(),
-                        ));
-                    };
+                    // The operands' types, as rustc's codegen reads them: they are the
+                    // `Ptr` and `Delta` of `offset<Ptr, Delta>`.
+                    let delta = offset.ty;
                     if !matches!(
-                        ty1.kind(),
+                        delta.kind(),
                         TyKind::Int(rustc_type_ir::IntTy::Isize)
                             | TyKind::Uint(rustc_type_ir::UintTy::Usize)
                     ) {
                         return Err(MirEvalError::InternalError(
-                            "offset generic arg is not usize or isize".into(),
+                            "offset's delta is not usize or isize".into(),
                         ));
                     }
-                    match ty0.kind() {
-                        TyKind::RawPtr(ty, _) => (ty, matches!(ty1.kind(), TyKind::Int(_))),
+                    match ptr.ty.kind() {
+                        TyKind::RawPtr(ty, _) => (ty, matches!(delta.kind(), TyKind::Int(_))),
                         _ => {
                             return Err(MirEvalError::InternalError(
-                                "offset generic arg is not a raw pointer".into(),
+                                "offset's pointer is not a raw pointer".into(),
                             ));
                         }
                     }

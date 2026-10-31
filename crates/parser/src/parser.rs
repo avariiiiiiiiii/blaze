@@ -42,6 +42,8 @@ pub(crate) struct Parser<'t> {
     steps: u32,
     /// Whether `fn` bodies are skipped as lazy nodes ([`crate::outline`]).
     outline: bool,
+    /// Which tokens are a `{` some `}` closes ([`Parser::curly_closes`]), made when first asked.
+    closed_curlies: Option<Vec<bool>>,
 }
 
 const PARSER_STEP_LIMIT: usize = if cfg!(debug_assertions) { 150_000 } else { 15_000_000 };
@@ -56,6 +58,7 @@ impl<'t> Parser<'t> {
             errors: Vec::new(), // alloc: empty until the first syntax error, an error path
             steps: 0,
             outline: false,
+            closed_curlies: None,
         }
     }
 
@@ -102,6 +105,34 @@ impl<'t> Parser<'t> {
     pub(crate) fn nth(&self, n: usize) -> SyntaxKind {
         assert!(n <= 3);
         self.inp.kind(self.pos + n)
+    }
+
+    /// The index of the current token, for [`Parser::curly_closes`].
+    pub(crate) fn token_index(&self) -> usize {
+        self.pos
+    }
+
+    /// Whether a `}` closes the `{` at token `open` before the input ends, each `}` closing the
+    /// nearest `{` before it not yet closed, as rustc's token trees pair them.
+    pub(crate) fn curly_closes(&mut self, open: usize) -> bool {
+        let inp = self.inp;
+        let closed = self.closed_curlies.get_or_insert_with(|| {
+            let mut closed = vec![false; inp.len()]; // alloc: once a parse, an error path
+            let mut unclosed = Vec::new(); // alloc: once a parse, an error path
+            for at in 0..inp.len() {
+                match inp.kind(at) {
+                    T!['{'] => unclosed.push(at),
+                    T!['}'] => {
+                        if let Some(it) = unclosed.pop() {
+                            closed[it] = true;
+                        }
+                    }
+                    _ => (),
+                }
+            }
+            closed
+        });
+        closed.get(open).copied().unwrap_or(false)
     }
 
     /// Counts one step that consumed no token, and panics when there have been too many: the

@@ -770,8 +770,11 @@ impl Parsed {
                 });
             }
         }
-        let frame_fixups =
-            if frames.is_empty() { Csr::default() } else { Csr::build(frames.len(), fixup_pairs.iter().copied()) };
+        let frame_fixups = if frames.is_empty() {
+            Csr::default()
+        } else {
+            Csr::build(frames.len(), fixup_pairs.iter().copied())
+        };
         let sections_at = object.symbols.len();
         let frames_at = sections_at + sections;
         debug_assert_eq!(syms.len(), frames_at + frames.len());
@@ -2334,6 +2337,9 @@ impl<'a> Stage<'a> {
                      (`blaze_inproc::runtime`) must be linked into the executable itself"
                 ),
             ));
+        }
+        if self.lazy.is_some() && name == blaze_lazy::hook::SYMBOL {
+            return Err(crate::lazy::no_hook(self.output.format));
         }
         if let Some(special) = self.writer.special(name) {
             return Ok(Decision::Special(special));

@@ -612,9 +612,15 @@ impl<'a> Stage<'a> {
     }
 
     /// Empties every cell holding `body`, which is gone: the cell keeps its bytes (a running
-    /// program may still be in the old code) until a function is put in its slot.
+    /// program may still be in the old code) until a function is put in its slot. The cells
+    /// piece is written again all the same: its rebase list is every filled slot's cell.
     fn unslot(&mut self, body: Sym) {
         let slots = collect_in(self.new.slots_of(body), self.arena);
+        if !slots.is_empty() {
+            if let Some(cells) = self.cells_piece() {
+                self.write.insert(cells);
+            }
+        }
         for slot in slots {
             self.new.set_cell(slot, None);
             self.dirty_cells.remove(slot);
@@ -661,7 +667,8 @@ impl<'a> Stage<'a> {
     }
 
     /// The functions added, made into pieces: their keys built in parallel and interned in
-    /// one batch.
+    /// one batch. They are made in key order, never the change's: slots are given out in the
+    /// order functions are made, and an image is the same whatever order its functions came in.
     fn functions(&mut self, added: &[&'a CompiledFunction]) -> Result<(), LinkError> {
         if added.is_empty() {
             return Ok(());
@@ -700,6 +707,7 @@ impl<'a> Stage<'a> {
             }
             todo.push(function);
         }
+        todo.sort_unstable_by_key(|it| it.key);
         let counts = collect_in(todo.iter().map(|it| key_count(it)), arena);
         let keys: &mut [Wide<'a>] = arena.alloc_slice_fill_with(counts.iter().sum(), |_| Wide::Key(SymKey::Generation));
         let mut parts: FrameVec<'_, &mut [Wide<'a>]> = Vec::with_capacity_in(todo.len(), arena);
@@ -851,14 +859,7 @@ impl<'a> Stage<'a> {
         if hook.is_some_and(|it| self.new.home(it).is_some()) {
             return Ok(());
         }
-        Err(error(
-            None,
-            // alloc: error path
-            format!(
-                "a lazy image without `{}`, the hook its lazy stubs call: link blaze-lazy's `hook` into it",
-                crate::lazy::hook_name(self.output.format)
-            ),
-        ))
+        Err(crate::lazy::no_hook(self.output.format))
     }
 
     fn add_function(&mut self, function: &'a CompiledFunction, syms: &[Sym]) -> Result<(), LinkError> {

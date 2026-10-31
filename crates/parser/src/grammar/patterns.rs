@@ -436,6 +436,7 @@ fn record_pat_field(p: &mut Parser<'_>) {
         T![ref] | T![mut] | IDENT => {
             ident_pat(p, false);
         }
+        T!['}'] => p.error("expected identifier"),
         _ => {
             p.err_and_bump("expected identifier");
         }

@@ -8,6 +8,7 @@ mod const_param_ty;
 mod const_valtree;
 mod elided_lifetime_args;
 mod fn_cache;
+mod impossible_items;
 mod infer_vars;
 mod inhabitedness;
 mod layout_errors;

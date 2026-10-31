@@ -7,7 +7,7 @@
 //! `try_call` with tag and cleanup pads, `br_table` for `match`, stack slots for places).
 //! Function `i` is named `u0:i` and calls the others by those names. Every family is
 //! compiled for every target the IR builder makes code for, by both backends, and the
-//! stencil backend must refuse exactly what Cranelift refuses ([`compile_like_cranelift`]).
+//! stencil backend must refuse exactly what Cranelift refuses ([`compile_like`]).
 //! On the host, [`world`] links each family once per *mix* (every choice of backend per
 //! function, so each caller and callee pair is tried both ways), calls the same arguments
 //! into each, and requires the results, the memory written and the traps to be what the
@@ -260,52 +260,88 @@ pub fn random(rng: &mut Rng, ty: ir::Type) -> DataValue {
     DataValue::read_from_slice_le(&bytes, ty)
 }
 
-/// Each family, on each target, compiles with the stencil backend exactly when it
+/// Each family of `families`, on `target`, compiles with the stencil backend exactly when it
 /// compiles with Cranelift (a panic in Cranelift's lowering, such as its refusal of
 /// `StructArgument` on AArch64, counts as a refusal), and Cranelift refuses what the family
 /// says it does.
-#[test]
-fn compile_like_cranelift() {
+fn compile_like(families: &[fn(&Mk) -> Family], target: Target) {
     let mut failures = Vec::new();
-    for target in host::TARGETS {
-        let mk = Mk::new(target);
-        for make in families() {
-            let family = make(&mk);
-            let mut accepted = true;
-            for (i, func) in family.funcs.iter().enumerate() {
-                let cranelift = host::cranelift_caught(func, &*mk.isa);
-                let stencil = crate::compile(func, &target);
-                accepted &= cranelift.is_ok();
-                match (&cranelift, &stencil) {
-                    (Ok(_), Err(e)) => failures.push(format!(
-                        "{} on {}: u0:{i} compiles with Cranelift, the stencil backend refuses it: {e}\n{}",
-                        family.name,
-                        host::triple(&target),
-                        func.display()
-                    )),
-                    (Err(e), Ok(_)) => failures.push(format!(
-                        "{} on {}: u0:{i} is refused by Cranelift ({e}), the stencil backend compiles it\n{}",
-                        family.name,
-                        host::triple(&target),
-                        func.display()
-                    )),
-                    _ => {}
-                }
-            }
-            if let Some(refused) = family.refused
-                && refused == accepted
-            {
-                failures.push(format!(
-                    "{} on {}: Cranelift {} it, the family says it {}",
+    let mk = Mk::new(target);
+    for make in families {
+        let family = make(&mk);
+        let mut accepted = true;
+        for (i, func) in family.funcs.iter().enumerate() {
+            let cranelift = host::cranelift_caught(func, &*mk.isa);
+            let stencil = crate::compile(func, &target);
+            accepted &= cranelift.is_ok();
+            match (&cranelift, &stencil) {
+                (Ok(_), Err(e)) => failures.push(format!(
+                    "{} on {}: u0:{i} compiles with Cranelift, the stencil backend refuses it: {e}\n{}",
                     family.name,
                     host::triple(&target),
-                    if accepted { "compiles" } else { "refuses" },
-                    if refused { "is refused" } else { "compiles" },
-                ));
+                    func.display()
+                )),
+                (Err(e), Ok(_)) => failures.push(format!(
+                    "{} on {}: u0:{i} is refused by Cranelift ({e}), the stencil backend compiles it\n{}",
+                    family.name,
+                    host::triple(&target),
+                    func.display()
+                )),
+                _ => {}
             }
+        }
+        if let Some(refused) = family.refused
+            && refused == accepted
+        {
+            failures.push(format!(
+                "{} on {}: Cranelift {} it, the family says it {}",
+                family.name,
+                host::triple(&target),
+                if accepted { "compiles" } else { "refuses" },
+                if refused { "is refused" } else { "compiles" },
+            ));
         }
     }
     assert!(failures.is_empty(), "{} disagreements:\n{}", failures.len(), failures.join("\n"));
+}
+
+/// [`compile_like`] split by family module and target, so that each test fits a debug run.
+macro_rules! compile_like_cranelift {
+    ($($name:ident: $families:path, $target:literal;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                compile_like($families, host::TARGETS[$target]);
+            }
+        )*
+    };
+}
+
+compile_like_cranelift! {
+    compile_like_cranelift_calls_x86_64_linux: calls::FAMILIES, 0;
+    compile_like_cranelift_calls_aarch64_linux: calls::FAMILIES, 1;
+    compile_like_cranelift_calls_aarch64_macos: calls::FAMILIES, 2;
+    compile_like_cranelift_calls_x86_64_windows: calls::FAMILIES, 3;
+    compile_like_cranelift_abi_x86_64_linux: abi::FAMILIES, 0;
+    compile_like_cranelift_abi_aarch64_linux: abi::FAMILIES, 1;
+    compile_like_cranelift_abi_aarch64_macos: abi::FAMILIES, 2;
+    compile_like_cranelift_abi_x86_64_windows: abi::FAMILIES, 3;
+    compile_like_cranelift_flow_x86_64_linux: flow::FAMILIES, 0;
+    compile_like_cranelift_flow_aarch64_linux: flow::FAMILIES, 1;
+    compile_like_cranelift_flow_aarch64_macos: flow::FAMILIES, 2;
+    compile_like_cranelift_flow_x86_64_windows: flow::FAMILIES, 3;
+    compile_like_cranelift_frames_x86_64_linux: frames::FAMILIES, 0;
+    compile_like_cranelift_frames_aarch64_linux: frames::FAMILIES, 1;
+    compile_like_cranelift_frames_aarch64_macos: frames::FAMILIES, 2;
+    compile_like_cranelift_frames_x86_64_windows: frames::FAMILIES, 3;
+    compile_like_cranelift_unwind_x86_64_linux: unwind::FAMILIES, 0;
+    compile_like_cranelift_unwind_aarch64_linux: unwind::FAMILIES, 1;
+    compile_like_cranelift_unwind_aarch64_macos: unwind::FAMILIES, 2;
+    compile_like_cranelift_unwind_x86_64_windows: unwind::FAMILIES, 3;
+    compile_like_cranelift_traps_x86_64_linux: traps::FAMILIES, 0;
+    compile_like_cranelift_traps_aarch64_linux: traps::FAMILIES, 1;
+    compile_like_cranelift_traps_aarch64_macos: traps::FAMILIES, 2;
+    compile_like_cranelift_traps_x86_64_windows: traps::FAMILIES, 3;
 }
 
 #[test]

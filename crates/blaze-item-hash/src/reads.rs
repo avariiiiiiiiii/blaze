@@ -300,15 +300,11 @@ pub fn classify(
 }
 
 /// `name` as [`RULES`] lists it, as the two parts it is the concatenation of. The query engine
-/// names a method of a `#[blaze_query::tracked] impl` after its self type as written, generics and
-/// all (`TraitImpls < 'db >::for_crate`), and its hygienic inner function, the method's name with
-/// `_` added (`Body::of_`); the listed name is the type's without its generics and the method's
-/// (`TraitImpls::for_crate`). A free tracked function or a field keeps its name.
+/// names a method of a `#[blaze_query::tracked] impl` `Type::method`, by the type's name
+/// without its generics, unless the impl gives a `self_ty`, whose text is kept as written,
+/// generics and all (`TraitImpls < 'db >::for_crate`); the listed name leaves the generics
+/// out (`TraitImpls::for_crate`). A free tracked function or a field keeps its name.
 pub(crate) fn listed_parts(name: &str) -> [&str; 2] {
-    let name = match name.contains("::") {
-        true => name.trim_end_matches('_'),
-        false => name,
-    };
     let Some(open) = name.find('<') else { return [name, ""] };
     let mut depth = 0usize;
     let close = name[open..].char_indices().find_map(|(at, c)| {

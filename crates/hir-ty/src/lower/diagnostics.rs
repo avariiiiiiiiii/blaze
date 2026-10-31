@@ -47,13 +47,9 @@ pub enum TyLoweringDiagnostic {
 pub enum PatternTypeUnsupported {
     /// Neither a range, `!null` nor `|`: rustc's "pattern not supported in pattern types"
     /// (`pat_to_ty_pat` in `rustc_builtin_macros/src/pattern_type.rs`).
+    /// A range's ends are always lowered: hir-def makes `a..b` and `a..` inclusive as rustc's
+    /// `lower_excluded_range_end` and `lower_ty_pat_range_end` do.
     Pattern,
-    /// `a..b`, which rustc's `lower_excluded_range_end` makes `a..=RangeSub::sub_one(b)` with
-    /// an anon const hir-def does not make yet.
-    ExclusiveEnd,
-    /// `a..` or `..=b`, which rustc's `lower_ty_pat_range_end` completes with an anon const of
-    /// `RangeMin::MIN` or `RangeMax::MAX` that hir-def does not make yet.
-    OpenEnd,
 }
 
 /// Where a lifetime is left out.

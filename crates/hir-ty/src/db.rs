@@ -1361,6 +1361,7 @@ pub mod kinds {
         TRAIT_VALUE_ITEMS = 0x2479, "trait_value_items";
         IN_CRATE_TRAIT_VALUE_ITEMS = 0x247a, "in_crate_trait_value_items";
         CRATES_THAT_NAME = 0x247b, "crates_that_name";
+        MAY_SPECIALIZE = 0x247c, "may_specialize";
 
         // Opaque types.
         IMPL_TYPE_ALIASES = 0x2480, "impl_type_aliases";

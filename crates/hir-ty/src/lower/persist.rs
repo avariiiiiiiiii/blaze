@@ -370,7 +370,7 @@ impl ColdBatch {
 impl Persist for ColdBatch {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ColdBatch"),
-        Part::U64(5),
+        Part::U64(6),
         Part::Schema(<BatchRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ColdBatchRef<'a>;
@@ -904,8 +904,6 @@ pub(crate) fn put_diagnostic(w: &mut Vec<u32>, diagnostic: &TyLoweringDiagnostic
             put_local(w, *source);
             w.push(match reason {
                 PatternTypeUnsupported::Pattern => 0,
-                PatternTypeUnsupported::ExclusiveEnd => 1,
-                PatternTypeUnsupported::OpenEnd => 2,
             });
         }
     }
@@ -1210,8 +1208,6 @@ impl Words<'_> {
                 source: self.local()?,
                 reason: match self.u32()? {
                     0 => PatternTypeUnsupported::Pattern,
-                    1 => PatternTypeUnsupported::ExclusiveEnd,
-                    2 => PatternTypeUnsupported::OpenEnd,
                     _ => return Err(self.invalid("a pattern type not lowered for no reason")),
                 },
             },
@@ -1442,14 +1438,6 @@ mod tests {
             TyLoweringDiagnostic::PatternTypeNotLowered {
                 source,
                 reason: PatternTypeUnsupported::Pattern,
-            },
-            TyLoweringDiagnostic::PatternTypeNotLowered {
-                source,
-                reason: PatternTypeUnsupported::ExclusiveEnd,
-            },
-            TyLoweringDiagnostic::PatternTypeNotLowered {
-                source,
-                reason: PatternTypeUnsupported::OpenEnd,
             },
             TyLoweringDiagnostic::InferVarsNotAllowed { sources: Box::new([Span::TypeRefId(source)]) },
             TyLoweringDiagnostic::InferVarsNotAllowed {

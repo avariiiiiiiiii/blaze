@@ -22,7 +22,12 @@ fn compiled(made: &Made) -> CompiledFunction {
     let relocs: Relocs = made
         .relocs
         .iter()
-        .map(|(at, kind, target)| Relocation { at: start + at, kind: *kind, target: target.clone(), addend: 0 })
+        .map(|(at, kind, target)| Relocation {
+            at: start + at,
+            kind: *kind,
+            target: target.clone(),
+            addend: 0,
+        })
         .collect();
     CompiledFunction {
         key: InstanceKey(id(made.key)),
@@ -45,7 +50,10 @@ fn built(made: &[Made], statics: Vec<Static>) -> Built {
         functions: made.iter().map(compiled).collect(),
         inputs: made.iter().map(|it| (InstanceKey(id(it.key)), CodeHash(id(it.key)))).collect(),
         versions: made.iter().map(|it| (id(it.version), Ok(id(it.version)))).collect(),
-        symbols: made.iter().map(|it| (InstanceKey(id(it.key)), format!("f{}", it.version))).collect(),
+        symbols: made
+            .iter()
+            .map(|it| (InstanceKey(id(it.key)), format!("f{}", it.version)))
+            .collect(),
         statics,
         ..Built::default()
     }
@@ -216,7 +224,12 @@ fn a_position_is_a_location_in_memory() {
         out
     };
     let span = SpanRef { anchor: id(99), index: 0 };
-    let made = [Made { key: 1, version: 10, body: address(), relocs: vec![(2, RelocKind::WasmMemory, Target::Position(span))] }];
+    let made = [Made {
+        key: 1,
+        version: 10,
+        body: address(),
+        relocs: vec![(2, RelocKind::WasmMemory, Target::Position(span))],
+    }];
     let patch = Linker::default().link(&built(&made, Vec::new()), &[(id(99), table)]).unwrap();
     valid(&patch);
     // The name with its NUL, and the record.

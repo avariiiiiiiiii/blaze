@@ -3531,6 +3531,9 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
                 {
                     let found = StructPathFound::Def(def);
                     self.diagnostics.push(not_a_struct_path(node, found, None));
+                } else if let Some(segment) = Self::segment_after_a_variant(self.db, &self.resolver, path) {
+                    let found = StructPathFound::AfterVariant { segment };
+                    self.diagnostics.push(not_a_struct_path(node, found, None));
                 }
                 return (self.types.types.error, None);
             };
@@ -3583,7 +3586,13 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         } else {
             match path_ctx.resolve_path_in_type_ns() {
                 Some((it, idx)) => (it, idx),
-                None => return (self.types.types.error, None),
+                None => {
+                    if let Some(segment) = Self::segment_after_a_variant(self.db, &self.resolver, path) {
+                        let found = StructPathFound::AfterVariant { segment };
+                        self.diagnostics.push(not_a_struct_path(node, found, None));
+                    }
+                    return (self.types.types.error, None);
+                }
             }
         };
         return match resolution {
@@ -3881,6 +3890,24 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             ctx.push_diagnostic(not_a_struct_path(node, found, None));
             (ctx.types.types.error, None)
         }
+    }
+
+    /// The segment after an enum variant in `path` (`X` of `E::A::X`), which the resolver
+    /// resolves to nothing: rustc's E0433 "`A` is a variant, not a module".
+    fn segment_after_a_variant(db: &'db Db, resolver: &Resolver<'db>, path: Path<'_>) -> Option<u32> {
+        if path.type_anchor().is_some() {
+            return None;
+        }
+        let mod_path = path.mod_path()?;
+        let segments = mod_path.segments();
+        (1..segments.len()).find_map(|len| {
+            // alloc: error path: a path that failed to resolve.
+            let prefix = ModPath::from_segments(mod_path.kind, segments[..len].iter().cloned());
+            match resolver.resolve_path_in_type_ns(db, Path::BarePath(&prefix)) {
+                Some((TypeNs::EnumVariantId(_), None, _)) => Some(len as u32),
+                _ => None,
+            }
+        })
     }
 
     /// The struct or union `ty` is, for a struct path that ends at it; else reports it (rustc's

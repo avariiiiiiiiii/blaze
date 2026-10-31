@@ -1,7 +1,11 @@
 //! Forms: which edits reach an item's interface, body and closures, and which leave them.
 
 use blaze_ids::ContentId;
-use hir_def::{AdtId, DefWithBodyId, VariantId, expr_store::Body, hir::Expr};
+use hir_def::{
+    AdtId, DefWithBodyId, VariantId,
+    expr_store::Body,
+    hir::{ClosureKind, Expr},
+};
 use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosure, InternedClosureId},
@@ -41,7 +45,11 @@ fn closures(db: &TestDB, f: ItemId) -> Vec<InternedClosureId<'_>> {
     Body::of(db, owner)
         .exprs()
         .filter_map(|(expr, it)| match it {
-            Expr::Closure { closure_kind, .. } => Some(InternedClosureId::new(
+            // An `async` block is a coroutine, interned as an `InternedCoroutineId`.
+            Expr::Closure {
+                closure_kind: closure_kind @ (ClosureKind::Closure | ClosureKind::CoroutineClosure(_)),
+                ..
+            } => Some(InternedClosureId::new(
                 db,
                 InternedClosure { owner: owner.into(), expr, kind: closure_kind },
             )),

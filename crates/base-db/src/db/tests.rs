@@ -118,7 +118,7 @@ fn an_event_outside_log_is_not_kept() {
 }
 
 #[test]
-#[should_panic(expected = "not made by `Db::for_tests`")]
+#[should_panic(expected = "made by neither `Db::for_tests` nor `Db::logged`")]
 fn a_builds_database_keeps_no_log() {
     let db = Db::new();
     db.log(|| {});

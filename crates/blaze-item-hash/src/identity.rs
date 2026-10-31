@@ -35,7 +35,7 @@ use smallvec::SmallVec;
 
 pub use inputs::{FrontEnd, crate_inputs, set_build};
 
-pub const IDENTITY_DOMAIN: &str = "blaze v2 item identity 2";
+pub const IDENTITY_DOMAIN: &str = "blaze v2 item identity 3";
 
 /// A body that has no identity, and why: its inference, MIR and borrow check are computed
 /// and not filed.
@@ -52,24 +52,41 @@ pub fn identity(db: &Db, def: DefWithBodyId) -> Result<ContentId, Unidentified> 
 
 #[blaze_query::tracked(returns(copy))]
 fn identity_of(db: &Db, def: DefWithBodyId) -> Result<ContentId, &'static str> {
+    let mut h = Hasher::new(IDENTITY_DOMAIN);
+    for (_, part) in identity_parts(db, def)? {
+        h.id(&part);
+    }
+    Ok(h.finish())
+}
+
+/// How many parts [`identity_parts`] gives.
+pub const PARTS: usize = 7;
+
+/// The parts of `def`'s identity, each hashed on its own and named, in the order
+/// [`identity`] hashes them: two identities that differ name the part they differ in.
+pub fn identity_parts(db: &Db, def: DefWithBodyId) -> Result<[(&'static str, ContentId); PARTS], &'static str> {
     if inputs::build(db).is_none() {
         return Err("no front-end build is set");
     }
     let home = def.module(db).krate(db);
-    let mut h = Hasher::new(IDENTITY_DOMAIN);
-    h.id(&crate_inputs(db, home));
-    h.id(&inputs::lang_item_signatures(db, home)?);
+    let part = |name: &'static str| {
+        let mut h = Hasher::new(IDENTITY_DOMAIN);
+        h.part(name.as_bytes());
+        h
+    };
+    let mut h = part("owner");
     owner(db, def, &mut h)?;
+    let owner = h.finish();
     let names = names::names_of(db, def).as_ref().map_err(|it| *it)?;
     let portable =
         portable_body(Body::of(db, def), &names.blank, &slots::of(db, def), &lifetimes(db, def));
-    h.part(portable.bytes());
-    scratch::with_bytes(|buffer| -> Result<(), &'static str> {
+    let hir = part("hir").part(portable.bytes()).finish();
+    let entries = scratch::with_bytes(|buffer| -> Result<ContentId, &'static str> {
         entries::write(db, home, item::own_item(def), &portable, buffer)?;
-        h.part(buffer);
-        Ok(())
+        Ok(part("entries").part(buffer).finish())
     })?;
-    h.part(&names.names).part(&names.traits);
+    let resolutions = part("names").part(&names.names).part(&names.traits).finish();
+    let mut h = part("module chain");
     let mut module = Some(def.module(db));
     let mut depth = 0u32;
     while let Some(it) = module {
@@ -77,8 +94,16 @@ fn identity_of(db: &Db, def: DefWithBodyId) -> Result<ContentId, &'static str> {
         depth += 1;
         module = it.containing_module(db).map(|it| it.to_static());
     }
-    h.update(&depth.to_le_bytes());
-    Ok(h.finish())
+    let modules = h.update(&depth.to_le_bytes()).finish();
+    Ok([
+        ("crate inputs", crate_inputs(db, home)),
+        ("lang items", inputs::lang_item_signatures(db, home)?),
+        ("owner", owner),
+        ("hir", hir),
+        ("entries", entries),
+        ("names", resolutions),
+        ("module chain", modules),
+    ])
 }
 
 /// The names of the lifetime parameters `def`'s body sees, its impl's or trait's first: a

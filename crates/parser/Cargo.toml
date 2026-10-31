@@ -19,6 +19,7 @@ blaze-phf.workspace = true
 ra-ap-rustc_lexer.workspace = true
 rustc-literal-escaper.workspace = true
 smallvec.workspace = true
+stdx.workspace = true
 tracing.workspace = true
 
 edition.workspace = true
@@ -29,7 +30,6 @@ expect-test.workspace = true
 
 blaze-alloc-count.workspace = true
 hegeltest.workspace = true
-stdx.workspace = true
 
 [[bench]]
 name = "lex"

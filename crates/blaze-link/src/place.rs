@@ -527,7 +527,10 @@ impl<'a> Stage<'a> {
         let mut spaces = Vec::with_capacity(classes.len());
         let mut addr = self.plan.base + self.plan.headers;
         let mut code_addr = 0;
-        let mut prot = None;
+        // The headers' protection: a first class that is read-only too shares their page
+        // (`Plan::headers`); any other starts a page of its own, so headers are never mapped
+        // writable or executable.
+        let mut prot = Some(Prot::R);
         let mut text_size = 0;
         let mut data_size = 0;
         for class in classes {

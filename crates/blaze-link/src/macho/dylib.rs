@@ -275,12 +275,13 @@ fn trie_exports(
     let mut stack: SmallVec<[Edge; EDGES_INLINE]> = SmallVec::new();
     let mut node = 0usize;
     loop {
+        let mut r = Reader::starting_at(data, node).map_err(trie_error)?;
+        let terminal = r.uleb().map_err(trie_error)?;
+        // A byte was read at `node`, so it is inside `seen` (the root of an empty trie is not).
         if !seen.insert(node) {
             // alloc: error path
             return Err(format!("node {node:#x} is reached twice (a cycle)"));
         }
-        let mut r = Reader::starting_at(data, node).map_err(trie_error)?;
-        let terminal = r.uleb().map_err(trie_error)?;
         if terminal != 0 {
             let info = usize::try_from(terminal)
                 .ok()

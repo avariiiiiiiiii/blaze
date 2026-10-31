@@ -895,8 +895,17 @@ fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
     let db = signatures_db();
     crate::attach_db(&db, || {
         let (dep, main) = dep_and_main(&db);
-        let (dep_variants, dep_impls) = signatures(&db, dep);
-        let (main_variants, main_impls) = signatures(&db, main);
+        // The def map's impl tables lower each impl's self type and trait as it is built, so
+        // the log starts before the def maps are read.
+        let (mut batched, mut per_item) = (Vec::new(), Vec::new());
+        let (mut dep_variants, mut dep_impls) = (Vec::new(), Vec::new());
+        let (mut main_variants, mut main_impls) = (Vec::new(), Vec::new());
+        let executed = db.log_executed(|| {
+            (dep_variants, dep_impls) = signatures(&db, dep);
+            (main_variants, main_impls) = signatures(&db, main);
+            batched = lowered(&db, &dep_variants, &dep_impls);
+            per_item = lowered(&db, &main_variants, &main_impls);
+        });
         let names = |variants: &[(String, VariantId)]| -> Vec<String> {
             variants.iter().map(|(name, _)| name.clone()).collect()
         };
@@ -904,12 +913,6 @@ fn a_dependency_batch_is_what_the_per_item_lowering_gives() {
         assert_eq!(names(&dep_variants), names(&main_variants));
         assert_eq!(dep_impls.len(), 2);
         assert_eq!(main_impls.len(), 2);
-
-        let (mut batched, mut per_item) = (Vec::new(), Vec::new());
-        let executed = db.log_executed(|| {
-            batched = lowered(&db, &dep_variants, &dep_impls);
-            per_item = lowered(&db, &main_variants, &main_impls);
-        });
         assert_eq!(batched, per_item);
         for batch in BATCHES {
             assert_eq!(count(&executed, batch), 1, "{batch}: {executed:#?}");

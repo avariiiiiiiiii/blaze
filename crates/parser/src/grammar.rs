@@ -113,6 +113,10 @@ pub(crate) mod entry {
             let m = p.start();
 
             while !p.at(EOF) {
+                if p.at(T!['}']) {
+                    p.err_and_bump("expected expression, item or let statement");
+                    continue;
+                }
                 expressions::stmt(p, expressions::Semicolon::Optional);
             }
 
@@ -440,7 +444,9 @@ fn error_let_stmt(p: &mut Parser<'_>, message: &'static str) {
 }
 
 /// The `parser` passed this is required to at least consume one token if it returns `true`.
-/// If the `parser` returns false, parsing will stop.
+/// If the `parser` returns false, parsing will stop. A `{ ... }` list stopped before a `}`
+/// closing it takes the tokens up to that `}` as an error: the `}` is the list's, as in
+/// rustc's token trees, never a block's around it.
 fn delimited(
     p: &mut Parser<'_>,
     bra: SyntaxKind,
@@ -450,6 +456,7 @@ fn delimited(
     first_set: TokenSet,
     mut parser: impl FnMut(&mut Parser<'_>) -> bool,
 ) {
+    let open = p.token_index();
     p.bump(bra);
     while !p.at(ket) && !p.at(EOF) {
         if p.at(delim) {
@@ -477,6 +484,17 @@ fn delimited(
                 break;
             }
         }
+    }
+    if bra == T!['{'] && !p.at(ket) && p.curly_closes(open) {
+        let m = p.start();
+        p.error("expected R_CURLY");
+        while !p.at(EOF) && !p.at(T!['}']) {
+            match p.current() {
+                T!['{'] | T!['('] | T!['['] => items::token_tree(p),
+                _ => p.bump_any(),
+            }
+        }
+        m.complete(p, ERROR);
     }
     p.expect(ket);
 }

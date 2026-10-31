@@ -1558,7 +1558,10 @@ fn linkedit_encodes_into_one_buffer() {
                     + linkedit::function_starts(0x1_0000_0000, &functions, &mut out)
             })
         });
-        assert_eq!(used.allocations, 6, "{n}: the trie's four scratch columns and each stream's cuts");
+        assert_eq!(
+            used.allocations, 6,
+            "{n}: the trie's four scratch columns and each stream's cuts"
+        );
         assert_eq!((out.as_ptr(), out.capacity()), (at, room), "{n}: the buffer never grew");
         assert_eq!(out.len(), len);
     }

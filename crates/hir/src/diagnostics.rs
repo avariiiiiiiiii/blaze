@@ -1596,7 +1596,10 @@ pub(crate) fn bound_source(db: &Db, def: GenericDefId, bound_index: u32) -> Opti
         type_ref::TypeBound,
     };
     use hir_ty::PredicateSource;
-    Some(match *hir_ty::predicate_sources(db, def).get(bound_index as usize)? {
+    let sources = blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
+        hir_ty::predicate_sources(db, def)
+    });
+    Some(match *sources.get(bound_index as usize)? {
         PredicateSource::ImpliedTrait(id) => BoundSource::ImpliedTrait(Trait { id }),
         PredicateSource::ImplicitSized(id) => BoundSource::ImplicitSized(crate::TypeParam { id }),
         PredicateSource::ConstParamType(id) => BoundSource::ConstParamType(crate::ConstParam { id }),
@@ -1675,13 +1678,15 @@ impl Trait {
             };
             Some(DynCompatibilitySite::Syntax(syntax))
         };
-        dyn_compatibility_violation_sites(db, self.id)
-            .into_iter()
-            .map(|(violation, sites)| {
-                let sites = sites.iter().filter_map(site).collect(); // alloc: error path
-                (violation, sites)
-            })
-            .collect() // alloc: error path, a dyn-incompatible trait reported
+        blaze_mem::frame::task(blaze_mem::Tag::Diagnostics, |_| {
+            dyn_compatibility_violation_sites(db, self.id)
+        })
+        .into_iter()
+        .map(|(violation, sites)| {
+            let sites = sites.iter().filter_map(site).collect(); // alloc: error path
+            (violation, sites)
+        })
+        .collect() // alloc: error path, a dyn-incompatible trait reported
     }
 }
 

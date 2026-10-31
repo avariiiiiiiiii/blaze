@@ -1232,14 +1232,6 @@ impl<'db, 'a> TyLoweringContext<'db, 'a> {
     ) -> Option<Pattern<'db>> {
         let unsupported = |reason| TyLoweringDiagnostic::PatternTypeNotLowered { source, reason };
         let pat_kind = match self.store.pat(pat) {
-            hir_def::hir::Pat::Range { start: None, .. } | hir_def::hir::Pat::Range { end: None, .. } => {
-                self.push_diagnostic(unsupported(PatternTypeUnsupported::OpenEnd));
-                return None;
-            }
-            hir_def::hir::Pat::Range { range_type: hir_def::hir::RangeOp::Exclusive, .. } => {
-                self.push_diagnostic(unsupported(PatternTypeUnsupported::ExclusiveEnd));
-                return None;
-            }
             hir_def::hir::Pat::Range {
                 start: Some(start),
                 end: Some(end),

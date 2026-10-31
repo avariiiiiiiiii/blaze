@@ -2130,3 +2130,9 @@ The deep case is the transitive-input summary at work: the engine answers a memo
 edges in 29 ns, one summary test against the view's mask, where the fork's 62-bit closure
 filter takes 500 ns. The fork's half of the bench and its `salsa` dev-dependency are gone
 (2026-10-31, before `vendor/salsa` is deleted); these tables are its record.
+
+**The engine alone**, the main tree's round 7c (`adc8bbbf04`, 2026-10-31 07:00, the same Mac,
+load average 67), minimum / mean: hit 3.4 / 6.2 ns in order and 3.9 / 13.1 ns scattered; hit in
+query 768 µs / 1.4 ms and 1.0 / 3.6 ms; verify 165 / 271 µs by durability and 580 / 866 µs by
+walk; deep unrelated 28.6 / 37.0 ns; interned hit 6.5 / 11.5 ns; cycle 2.5 / 4.8 µs. Every
+minimum is within noise of the port's run above and below every minimum the fork recorded.

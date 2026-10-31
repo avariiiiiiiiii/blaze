@@ -496,6 +496,13 @@ impl Edit<'_> {
                 seen >= AFTER_ITEM && !kind.is_trivia() && !matches!(kind, INT_NUMBER | T![.])
             })
             .map_or(tree.source().len(), |it| usize::from(tree.range(it).end()));
+        // A `{ ... }` list's parse takes the tokens up to the `}` closing it: a `{` left open
+        // in the item may be closed past the tokens it is given, and a `}` it does not open
+        // may close a list of an item before it.
+        let (unclosed, stray) = unpaired_curlies(&lexed);
+        if stray || (unclosed && ahead < tree.source().len()) {
+            return None;
+        }
         self.reads(TextRange::new(range.end(), TextSize::try_from(ahead).unwrap()));
         // `lexes_alone` showed the lexer ends a token where the item ends.
         let ahead = LexedStr::new(self.edition, &tree.source()[usize::from(range.end())..ahead]);
@@ -603,6 +610,21 @@ fn braced(lexed: &LexedStr<'_>, edition: Edition) -> bool {
     }
     let input = lexed.to_input(edition);
     parser::lazy_block_len(&input, 0) == u32::try_from(input.len()).ok()
+}
+
+/// Whether a `{` of `lexed` has no `}` of `lexed` closing it, and whether a `}` of it closes
+/// no `{` of it, each `}` closing the nearest `{` before it not yet closed.
+fn unpaired_curlies(lexed: &LexedStr<'_>) -> (bool, bool) {
+    let (mut open, mut stray) = (0usize, false);
+    for at in 0..lexed.len() {
+        match lexed.kind(at) {
+            T!['{'] => open += 1,
+            T!['}'] if open == 0 => stray = true,
+            T!['}'] => open -= 1,
+            _ => (),
+        }
+    }
+    (open > 0, stray)
 }
 
 /// The smallest element of `tree` whose range holds `range`, never in a lazy node's part:

@@ -176,17 +176,26 @@ impl Linker {
     /// Links what `built` compiled against everything linked before: a module of what is new.
     /// `spans` are the build's span tables by anchor, which its positions are read from.
     pub fn link(&mut self, built: &Built, spans: &[(ContentId, Vec<u8>)]) -> Result<Patch, String> {
-        let ids: FxHashMap<InstanceKey, ContentId> =
-            built.inputs.iter().zip(&built.versions).map(|((key, _), (id, _))| (*key, *id)).collect();
+        let ids: FxHashMap<InstanceKey, ContentId> = built
+            .inputs
+            .iter()
+            .zip(&built.versions)
+            .map(|((key, _), (id, _))| (*key, *id))
+            .collect();
         let kept = |key: &InstanceKey| built.deduped.merged.get(key).copied().unwrap_or(*key);
         let mut functions = Vec::with_capacity(built.functions.len());
         let mut by_key = FxHashMap::default();
         for compiled in &built.functions {
             if compiled.arch != Arch::Wasm32 {
-                return Err(format!("{:?}: code for {:?}, where a page runs wasm32", compiled.key, compiled.arch));
+                return Err(format!(
+                    "{:?}: code for {:?}, where a page runs wasm32",
+                    compiled.key, compiled.arch
+                ));
             }
             let (code, start) = Code::decode(&compiled.code)?;
-            let id = *ids.get(&compiled.key).ok_or_else(|| format!("{:?}: a function the walk did not reach", compiled.key))?;
+            let id = *ids
+                .get(&compiled.key)
+                .ok_or_else(|| format!("{:?}: a function the walk did not reach", compiled.key))?;
             by_key.insert(compiled.key, functions.len());
             functions.push(Function { compiled, code, start, id });
         }
@@ -195,17 +204,24 @@ impl Linker {
         }
         let mut externs: FxHashMap<&str, &Import> = FxHashMap::default();
         for function in &functions {
-            externs.extend(function.code.imports.iter().map(|(name, import)| (name.as_str(), import)));
+            externs
+                .extend(function.code.imports.iter().map(|(name, import)| (name.as_str(), import)));
         }
         for s in &built.statics {
             externs.extend(s.imports.iter().map(|(name, import)| (name.as_str(), import)));
         }
-        let mut spans = Spans { encoded: spans.iter().map(|(id, bytes)| (*id, bytes.as_slice())).collect(), decoded: FxHashMap::default() };
+        let mut spans = Spans {
+            encoded: spans.iter().map(|(id, bytes)| (*id, bytes.as_slice())).collect(),
+            decoded: FxHashMap::default(),
+        };
         let mut out = Output::default();
 
         // Data first, then statics: neither has an address that depends on what is in it.
         let mut new_data = Vec::new();
-        let all_data = functions.iter().flat_map(|it| &it.compiled.data).chain(built.statics.iter().flat_map(|it| &it.data));
+        let all_data = functions
+            .iter()
+            .flat_map(|it| &it.compiled.data)
+            .chain(built.statics.iter().flat_map(|it| &it.data));
         for data in all_data {
             if !self.data.contains_key(&data.id) {
                 let address = self.alloc(data.align, data.bytes.len() as u64)?;
@@ -217,7 +233,10 @@ impl Linker {
         let mut moved = FxHashSet::default();
         for s in &built.statics {
             if let Some(section) = &s.section {
-                return Err(format!("{:?}: a static in `#[link_section = \"{section}\"]`, which a page's module has no place for", s.item));
+                return Err(format!(
+                    "{:?}: a static in `#[link_section = \"{section}\"]`, which a page's module has no place for",
+                    s.item
+                ));
             }
             let key = (s.item, s.instance);
             let size = match &s.init {
@@ -227,7 +246,9 @@ impl Linker {
             let content = self.static_content(s, &ids, &kept)?;
             match self.statics.get_mut(&key) {
                 Some(placed) if placed.content == content => {}
-                Some(placed) if size <= placed.size && placed.address % u64::from(s.align.max(1)) == 0 => {
+                Some(placed)
+                    if size <= placed.size && placed.address % u64::from(s.align.max(1)) == 0 =>
+                {
                     placed.content = content;
                     written_statics.push(s);
                 }
@@ -252,13 +273,19 @@ impl Linker {
         };
         if !moved.is_empty() {
             let mut seen: FxHashSet<ContentId> = new_data.iter().map(|it| it.id).collect();
-            let all_data = functions.iter().flat_map(|it| &it.compiled.data).chain(built.statics.iter().flat_map(|it| &it.data));
-            let again: Vec<&Data> = all_data.filter(|it| points_to_moved(&it.relocs) && seen.insert(it.id)).collect();
+            let all_data = functions
+                .iter()
+                .flat_map(|it| &it.compiled.data)
+                .chain(built.statics.iter().flat_map(|it| &it.data));
+            let again: Vec<&Data> =
+                all_data.filter(|it| points_to_moved(&it.relocs) && seen.insert(it.id)).collect();
             new_data.extend(again);
             for s in &built.statics {
                 if let Init::Bytes { relocs, .. } = &s.init
                     && points_to_moved(relocs)
-                    && !written_statics.iter().any(|it| (it.item, it.instance) == (s.item, s.instance))
+                    && !written_statics
+                        .iter()
+                        .any(|it| (it.item, it.instance) == (s.item, s.instance))
                 {
                     written_statics.push(s);
                 }
@@ -266,13 +293,23 @@ impl Linker {
         }
         for data in &new_data {
             let address = self.data[&data.id];
-            let bytes = self.data_bytes(&data.bytes, &data.relocs, &ids, &kept, &externs, &mut spans, &mut out)?;
+            let bytes = self.data_bytes(
+                &data.bytes,
+                &data.relocs,
+                &ids,
+                &kept,
+                &externs,
+                &mut spans,
+                &mut out,
+            )?;
             out.data.push((address, bytes));
         }
         for s in &written_statics {
             let address = self.statics[&(s.item, s.instance)].address;
             let bytes = match &s.init {
-                Init::Bytes { bytes, relocs } => self.data_bytes(bytes, relocs, &ids, &kept, &externs, &mut spans, &mut out)?,
+                Init::Bytes { bytes, relocs } => {
+                    self.data_bytes(bytes, relocs, &ids, &kept, &externs, &mut spans, &mut out)?
+                }
                 Init::Zeroed { size } => vec![0; *size as usize],
             };
             out.data.push((address, bytes));
@@ -283,8 +320,11 @@ impl Linker {
         for function in &functions {
             linked.push(self.linked(function, &ids, &kept, &externs, &mut spans, &mut out)?);
         }
-        let mut put: Vec<bool> =
-            functions.iter().zip(&linked).map(|(it, linked)| self.slots[&it.id].linked != Some(*linked)).collect();
+        let mut put: Vec<bool> = functions
+            .iter()
+            .zip(&linked)
+            .map(|(it, linked)| self.slots[&it.id].linked != Some(*linked))
+            .collect();
         // A direct call binds the function an import gave when its caller's module was made.
         let mut callers: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
         for (at, function) in functions.iter().enumerate() {
@@ -321,12 +361,21 @@ impl Linker {
                 }
                 let callee = match reloc.target {
                     Target::Function(key) | Target::Direct(key) => {
-                        let callee = *by_key.get(&kept(key)).ok_or_else(|| format!("{:?} calls {key:?}, which the build has no code of", function.compiled.key))?;
+                        let callee = *by_key.get(&kept(key)).ok_or_else(|| {
+                            format!(
+                                "{:?} calls {key:?}, which the build has no code of",
+                                function.compiled.key
+                            )
+                        })?;
                         match put[callee] {
                             true => Callee::Defined(callee),
                             false => {
                                 let slot = self.slots[&functions[callee].id].index;
-                                Callee::Import(out.import(SLOT, &slot.to_string(), &functions[callee].code.ty))
+                                Callee::Import(out.import(
+                                    SLOT,
+                                    &slot.to_string(),
+                                    &functions[callee].code.ty,
+                                ))
                             }
                         }
                     }
@@ -336,7 +385,12 @@ impl Linker {
                         })?;
                         Callee::Import(out.import(&import.module, &import.field, &import.ty))
                     }
-                    other => return Err(format!("{:?}: a call to {other:?}, which is no function", function.compiled.key)),
+                    other => {
+                        return Err(format!(
+                            "{:?}: a call to {other:?}, which is no function",
+                            function.compiled.key
+                        ));
+                    }
                 };
                 direct.push((reloc.at, callee));
             }
@@ -345,7 +399,11 @@ impl Linker {
         }
         let names = names(built);
         let first_defined = out.imports.len() as u32;
-        let index_of: FxHashMap<usize, u32> = order.iter().enumerate().map(|(place, &at)| (at, first_defined + place as u32)).collect();
+        let index_of: FxHashMap<usize, u32> = order
+            .iter()
+            .enumerate()
+            .map(|(place, &at)| (at, first_defined + place as u32))
+            .collect();
         for ((&at, mut body), direct) in order.iter().zip(bodies).zip(calls) {
             let function = &functions[at];
             for (reloc_at, callee) in direct {
@@ -353,7 +411,9 @@ impl Linker {
                     Callee::Defined(callee) => index_of[&callee],
                     Callee::Import(index) => index,
                 };
-                let place = (reloc_at as usize).checked_sub(function.start).ok_or("a relocation in a code header")?;
+                let place = (reloc_at as usize)
+                    .checked_sub(function.start)
+                    .ok_or("a relocation in a code header")?;
                 put_index(&mut body, place, u64::from(index))?;
             }
             let ty = out.ty(&function.code.ty);
@@ -416,7 +476,10 @@ impl Linker {
 
     fn alloc(&mut self, align: u32, size: u64) -> Result<u64, String> {
         let address = self.memory_len.next_multiple_of(u64::from(align.max(1)));
-        let end = address.checked_add(size).filter(|&end| end <= 1 << 32).ok_or("the program's memory past 4 GiB")?;
+        let end = address
+            .checked_add(size)
+            .filter(|&end| end <= 1 << 32)
+            .ok_or("the program's memory past 4 GiB")?;
         self.memory_len = end;
         Ok(address)
     }
@@ -447,7 +510,12 @@ impl Linker {
                     hasher.update(&[reloc.kind as u8]);
                     match reloc.target {
                         Target::Function(key) | Target::Direct(key) => {
-                            let id = ids.get(&kept(key)).ok_or_else(|| format!("{:?} points to {key:?}, which the walk did not reach", s.item))?;
+                            let id = ids.get(&kept(key)).ok_or_else(|| {
+                                format!(
+                                    "{:?} points to {key:?}, which the walk did not reach",
+                                    s.item
+                                )
+                            })?;
                             hasher.update(&[0]).id(id);
                         }
                         Target::Static { item, instance } => {
@@ -463,7 +531,12 @@ impl Linker {
                             hasher.update(&[4]).id(&span.anchor);
                             hashed(&mut hasher, u64::from(span.index));
                         }
-                        other => return Err(format!("{:?}: a static points to {other:?}, which a page's program has none of", s.item)),
+                        other => {
+                            return Err(format!(
+                                "{:?}: a static points to {other:?}, which a page's program has none of",
+                                s.item
+                            ));
+                        }
                     }
                 }
             }
@@ -526,7 +599,12 @@ impl Linker {
     }
 
     /// The address of the `Location` of `span`, placed and written the first time.
-    fn position(&mut self, span: SpanRef, spans: &mut Spans<'_>, out: &mut Output) -> Result<u64, String> {
+    fn position(
+        &mut self,
+        span: SpanRef,
+        spans: &mut Spans<'_>,
+        out: &mut Output,
+    ) -> Result<u64, String> {
         if let Some(&at) = self.positions.get(&span) {
             return Ok(at);
         }
@@ -570,9 +648,13 @@ impl Linker {
         for reloc in relocs.iter() {
             let value = self.value(reloc.target, reloc.kind, ids, kept, externs, spans, out)?;
             let value = (value as i64).wrapping_add(reloc.addend);
-            let value = u32::try_from(value).map_err(|_| format!("a 4-byte place holding {value}"))?;
+            let value =
+                u32::try_from(value).map_err(|_| format!("a 4-byte place holding {value}"))?;
             let at = reloc.at as usize;
-            bytes.get_mut(at..at + 4).ok_or("a relocation outside its data")?.copy_from_slice(&value.to_le_bytes());
+            bytes
+                .get_mut(at..at + 4)
+                .ok_or("a relocation outside its data")?
+                .copy_from_slice(&value.to_le_bytes());
         }
         Ok(bytes)
     }
@@ -595,7 +677,12 @@ impl Linker {
             hashed(&mut hasher, u64::from(reloc.at));
             match (reloc.kind, reloc.target) {
                 (RelocKind::WasmFunction, Target::Function(key) | Target::Direct(key)) => {
-                    let id = ids.get(&kept(key)).ok_or_else(|| format!("{:?} calls {key:?}, which the walk did not reach", function.compiled.key))?;
+                    let id = ids.get(&kept(key)).ok_or_else(|| {
+                        format!(
+                            "{:?} calls {key:?}, which the walk did not reach",
+                            function.compiled.key
+                        )
+                    })?;
                     hasher.update(&[0]).id(id);
                 }
                 (RelocKind::WasmFunction, Target::Extern(name)) => {
@@ -629,13 +716,21 @@ impl Linker {
                 continue;
             }
             let value = self.value(reloc.target, reloc.kind, ids, kept, externs, spans, out)?;
-            let place = (reloc.at as usize).checked_sub(function.start).ok_or("a relocation in a code header")?;
+            let place = (reloc.at as usize)
+                .checked_sub(function.start)
+                .ok_or("a relocation in a code header")?;
             let value = (value as i64).wrapping_add(reloc.addend);
-            let slice = body.get_mut(place..place + INDEX_LEN).ok_or("a relocation outside the body")?;
-            leb::put_padded_i64(slice, value).map_err(|_| format!("a relocated value {value} past its {INDEX_LEN} bytes"))?;
+            let slice =
+                body.get_mut(place..place + INDEX_LEN).ok_or("a relocation outside the body")?;
+            leb::put_padded_i64(slice, value)
+                .map_err(|_| format!("a relocated value {value} past its {INDEX_LEN} bytes"))?;
         }
         for &(at, which) in &function.code.type_fixups {
-            let ty = function.code.types.get(which as usize).ok_or("a type fixup naming no type of the function")?;
+            let ty = function
+                .code
+                .types
+                .get(which as usize)
+                .ok_or("a type fixup naming no type of the function")?;
             let ty = out.ty(ty);
             put_index(&mut body, at as usize, u64::from(ty))?;
         }
@@ -656,7 +751,8 @@ enum Callee {
 
 fn put_index(body: &mut [u8], at: usize, value: u64) -> Result<(), String> {
     let place = body.get_mut(at..at + INDEX_LEN).ok_or("a place outside the body")?;
-    leb::put_padded_u64(place, value).map_err(|_| format!("an index {value} past its {INDEX_LEN} bytes"))
+    leb::put_padded_u64(place, value)
+        .map_err(|_| format!("an index {value} past its {INDEX_LEN} bytes"))
 }
 
 /// What each function is called in the report and a trap: its symbol, or its name for a
@@ -672,15 +768,22 @@ impl Spans<'_> {
     /// The file, line and column of `span`.
     fn position(&mut self, span: SpanRef) -> Result<(String, u32, u32), String> {
         if !self.decoded.contains_key(&span.anchor) {
-            let bytes = self.encoded.get(&span.anchor).ok_or_else(|| format!("a position in {:?}, whose span table the build did not give", span.anchor))?;
+            let bytes = self.encoded.get(&span.anchor).ok_or_else(|| {
+                format!("a position in {:?}, whose span table the build did not give", span.anchor)
+            })?;
             self.decoded.insert(span.anchor, SpanTable::decode(bytes)?);
         }
         let table = &self.decoded[&span.anchor];
-        let [file, line, column] = *table
-            .spans
-            .get(span.index as usize)
-            .ok_or_else(|| format!("span {} of {:?}, whose table has {}", span.index, span.anchor, table.spans.len()))?;
-        let file = table.files.get(file as usize).ok_or("a span in a file its table does not name")?;
+        let [file, line, column] = *table.spans.get(span.index as usize).ok_or_else(|| {
+            format!(
+                "span {} of {:?}, whose table has {}",
+                span.index,
+                span.anchor,
+                table.spans.len()
+            )
+        })?;
+        let file =
+            table.files.get(file as usize).ok_or("a span in a file its table does not name")?;
         Ok((file.clone(), line, column))
     }
 }
@@ -695,7 +798,9 @@ impl SpanTable {
         for _ in 0..count {
             let len = word(&mut at)? as usize;
             let name = take(&mut at, len)?;
-            files.push(String::from_utf8(name.to_vec()).map_err(|_| "a file name that is not UTF-8")?);
+            files.push(
+                String::from_utf8(name.to_vec()).map_err(|_| "a file name that is not UTF-8")?,
+            );
         }
         let count = word(&mut at)?;
         let mut spans = Vec::with_capacity((count as usize).min(at.len() / 12));
@@ -736,14 +841,30 @@ impl Output {
     fn module(self) -> Vec<u8> {
         let mut types = TypeSection::new();
         for ty in &self.types {
-            types.ty().function(ty.params.iter().map(|&it| val_type(it)), ty.results.iter().map(|&it| val_type(it)));
+            types.ty().function(
+                ty.params.iter().map(|&it| val_type(it)),
+                ty.results.iter().map(|&it| val_type(it)),
+            );
         }
         let mut imports = ImportSection::new();
-        let memory = MemoryType { minimum: 0, maximum: None, memory64: false, shared: false, page_size_log2: None };
+        let memory = MemoryType {
+            minimum: 0,
+            maximum: None,
+            memory64: false,
+            shared: false,
+            page_size_log2: None,
+        };
         imports.import(ENV, "memory", EntityType::Memory(memory));
-        let table = TableType { element_type: RefType::FUNCREF, table64: false, minimum: 0, maximum: None, shared: false };
+        let table = TableType {
+            element_type: RefType::FUNCREF,
+            table64: false,
+            minimum: 0,
+            maximum: None,
+            shared: false,
+        };
         imports.import(ENV, "table", EntityType::Table(table));
-        let stack_pointer = GlobalType { val_type: wasm_encoder::ValType::I32, mutable: true, shared: false };
+        let stack_pointer =
+            GlobalType { val_type: wasm_encoder::ValType::I32, mutable: true, shared: false };
         imports.import(ENV, "stack_pointer", EntityType::Global(stack_pointer));
         for (module, field, ty) in &self.imports {
             imports.import(module, field, EntityType::Function(*ty));

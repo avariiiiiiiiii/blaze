@@ -1,0 +1,27 @@
+{
+  "id": "01277",
+  "from_lane": "no-fallback-tools",
+  "owner": "coordinator",
+  "paths": [
+    "crates/blaze-lints/src/blaze/tests.rs",
+    "crates/blaze-lints/src/blaze/parallel/tests.rs",
+    "crates/blaze-lints/src/lints/more_clone_tests.rs",
+    "crates/blaze-lints/src/tests.rs",
+    "crates/blaze-lints/src/query/tests.rs"
+  ],
+  "what": "round 7c blaze-lints: 7 of the 9 failures are not no-fallback and predate it; please assign an owner. hot_dyn, format_collect, each_reduction, useless_borrows_in_formatting and query an_edit_of_one_body_lints_that_body_and_no_other already FAILED in cargo-test3.log (before round 1 f1dbbc5ffc, where no-fallback first landed) and in round2/qu-test1. unnecessary_to_owned and map_filter_map_and_for_each_chains passed in cargo-test3 and FAILED from round2 (window dfde15d869..8d2f0ab9ce; hir-ty changes there: method_resolution.rs +147, next_solver/normalize.rs solve::normalize +115, infer/unify.rs). no-fallback cannot drop findings: its blaze-lints check.rs change turns an unnamed file into Err, which every test .expect()s (a panic, not fewer findings). Symptom for hot_dyn: infer.method_resolution(id) gives nothing usable for method calls and Fn calls on dyn receivers (s.area(), b.area(), f(1), g()), while the path call Shape::area(s) (FnDef type) is found: a hir-ty method-resolution cause, owner unknown to me. query test: after inserting struct S; above both bodies, body_lints reruns once (Body::of_/body_syntax re-executed): an incremental/query-engine question (query-unify port).",
+  "state": "open",
+  "created": "2026-10-31T13:48:10Z",
+  "updated": "2026-10-31T13:48:10Z",
+  "taken_by": null,
+  "why": null,
+  "source": null,
+  "history": [
+    {
+      "at": "2026-10-31T13:48:10Z",
+      "by": "no-fallback-tools",
+      "action": "add",
+      "note": ""
+    }
+  ]
+}

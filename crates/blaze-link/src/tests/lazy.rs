@@ -237,6 +237,24 @@ fn called(arch: Arch, addr: u64, code: &[u8], count: usize) -> Vec<u64> {
         .collect()
 }
 
+/// Where a branch to `to` lands: past the veneer (`adrp x16; add x16, x16, lo12; br x16`) in
+/// the arena that AArch64 placed code reaches a target in the image past a `bl`'s reach by.
+fn past_veneer(placed: &Placed, arch: Arch, to: u64) -> u64 {
+    let in_arena = {
+        let memory = placed.memory.lock().unwrap();
+        memory.offset_of(to).is_some_and(|it| it >= memory.image_len())
+    };
+    if arch == Arch::X86_64 || !in_arena {
+        return to;
+    }
+    let code = placed.code(to, 12);
+    let word = |at: usize| u32::from_le_bytes(code[at..][..4].try_into().unwrap());
+    assert_eq!(word(8), 0xd61f_0200, "`br x16` at {:#x}", to + 8);
+    let imm = (((word(0) >> 5) & 0x7_ffff) << 2) | ((word(0) >> 29) & 3);
+    let pages = i64::from(((imm << 11) as i32) >> 11);
+    (to & !0xfff).wrapping_add_signed(pages << 12) + u64::from((word(4) >> 10) & 0xfff)
+}
+
 fn counter(at: u32, kind: RelocKind, of: u8, addend: i64) -> Relocation {
     Relocation { at, kind, target: Target::Counter(key(of)), addend }
 }
@@ -563,7 +581,9 @@ fn place_writes_code_that_resolves_publishes_it_and_stores_its_slot() {
         let slot = placed.slot(L0);
         let image = placed.image.lock().unwrap();
         let expected = vec![slot_stub(&image, L1), slot_stub(&image, L1), body_addr(&image, CALLER), target];
-        assert_eq!(called(arch, target, &code, 4), expected, "{case:?}: a lazy callee not placed yet, its slot stub");
+        let mut went = called(arch, target, &code, 4);
+        went[2] = past_veneer(&placed, arch, went[2]);
+        assert_eq!(went, expected, "{case:?}: a lazy callee not placed yet, its slot stub; a linked one its body");
         let entry = placed.session.slots(image.lazy_stubs().unwrap()).next().unwrap().1;
         assert_eq!(cell(&image, slot), entry, "{case:?}: the image's cell is still the entry: the run processes store the slot");
     }
@@ -642,7 +662,9 @@ fn a_placed_function_counts_in_its_own_pair_and_a_linked_one_in_the_stage_s() {
 #[test]
 fn the_placer_never_stores_a_slot_of_an_armed_execution_log() {
     for case in CASES {
-        let Some(mut placed) = placed(case, Output { exec_log: true, ..case.lazy() }, "log") else { continue };
+        // The runtime finds the log through the live descriptor.
+        let live = Live { dir: name("live"), path: "/tmp/blaze-link-test/live".into() };
+        let Some(mut placed) = placed(case, Output { exec_log: true, live: Some(live), ..case.lazy() }, "log") else { continue };
         let snapshot = |placed: &Placed| {
             let memory = placed.memory.lock().unwrap();
             memory.bytes(CodeRange { offset: 0, len: memory.image_len() }).unwrap().to_vec()

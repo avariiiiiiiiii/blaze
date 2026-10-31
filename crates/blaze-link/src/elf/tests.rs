@@ -287,7 +287,7 @@ fn the_debug_sections_are_the_cores_not_copies() {
         used
     });
     assert_eq!(used[0].allocations, used[1].allocations, "{used:?}");
-    assert!(used[1].bytes - used[0].bytes < 4096, "the debug info is not copied: {used:?}");
+    assert!(used[1].bytes.abs_diff(used[0].bytes) < 4096, "the debug info is not copied: {used:?}");
 }
 
 fn c_string(data: &[u8], at: u64) -> &str {
@@ -1011,7 +1011,16 @@ fn many_slid_addresses_are_relocated_as_the_model_does() {
 #[test]
 fn many_functions_are_named_in_the_symbol_table() {
     let n = 2 * super::dynamic::CHUNK + 100;
-    let counts = Counts { functions: n as u64, imports: 1, import_names: 6, libraries: 1, library_names: 9, ..Counts::default() };
+    let counts = Counts {
+        functions: n as u64,
+        imports: 1,
+        import_names: 6,
+        exports: 1,
+        export_names: 19,
+        libraries: 1,
+        library_names: 9,
+        ..Counts::default()
+    };
     let mut image = Fixture::new(executable(), &[(Class::Text, 16 * n as u64, 16)], &counts);
     let text = image.at(&Class::Text);
     image.entry = Some(text);

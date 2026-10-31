@@ -469,12 +469,21 @@ fn same_parts(a: &str, b: &str, how: &str) {
     let parts = |crates: &str| {
         let (db, main) = script(crates);
         hir_ty::attach_db(&db, || {
-            let main_body = blaze_item_hash::identity::identity(&db, main.into()).map_err(|it| it.what);
+            let main_body = blaze_item_hash::identity::identity_parts(&db, main.into());
             (main_body, crate::walk::identity_parts(&db, main))
         })
     };
     let ((main_a, parts_a), (main_b, parts_b)) = (parts(a), parts(b));
-    assert_eq!(main_a, main_b, "{how}: the identity of `main`'s body (blaze_item_hash)");
+    match (main_a, main_b) {
+        (Ok(main_a), Ok(main_b)) => {
+            for ((name, a), (_, b)) in main_a.iter().zip(&main_b) {
+                assert_eq!(a, b, "{how}: the {name} part of the identity of `main`'s body (blaze_item_hash)");
+            }
+        }
+        (main_a, main_b) => {
+            assert_eq!(main_a, main_b, "{how}: the identity of `main`'s body (blaze_item_hash)")
+        }
+    }
     let names = |parts: &[(String, Result<ContentId, String>)]| parts.iter().map(|it| it.0.clone()).collect::<Vec<_>>();
     assert_eq!(names(&parts_a), names(&parts_b), "{how}: the instances the walk reaches");
     for ((name, a), (_, b)) in parts_a.iter().zip(&parts_b) {

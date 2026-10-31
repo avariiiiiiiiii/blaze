@@ -184,6 +184,11 @@ struct StackFrame<'db> {
     span: (MirSpan, InferBodyId<'db>),
     /// The function called, when it is not a closure or what an evaluation starts from.
     callee: Option<FunctionId>,
+    /// The caller's place the frame's own return slot is copied to once the frame is popped and
+    /// the machine released its protectors: Miri's `return_place`, which the callee's `_0`
+    /// never aliases. `None` where `_0` is that place itself (no machine checks), or the frame
+    /// is the bottom one of [`Evaluator::interpret_mir`].
+    return_to: Option<Interval>,
 }
 
 impl<'db> StackFrame<'db> {
@@ -195,7 +200,8 @@ impl<'db> StackFrame<'db> {
         callee: Option<FunctionId>,
     ) -> Self {
         let at = locals.body.start_block;
-        StackFrame { locals, then, drops: Vec::new(), at, catch: None, prev_stack_ptr, span, callee } // alloc: empty; a drop fills it from `spare_drops`
+        let drops = Vec::new(); // alloc: empty; a drop fills it from `spare_drops`
+        StackFrame { locals, then, drops, at, catch: None, prev_stack_ptr, span, callee, return_to: None }
     }
 }
 
@@ -1227,7 +1233,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return Err(MirEvalError::StackOverflow);
         }
         let (mut locals, prev_stack_ptr) = self.create_locals_for_body(body, None)?;
-        self.enter_frame(body, &mut locals, args, false)?;
+        self.enter_frame(body, &mut locals, args, None)?;
         let spare = self.spare_code_stacks.pop().unwrap_or_default();
         let prev_code_stack = mem::replace(&mut self.code_stack, spare);
         let prev_running = self.running;
@@ -1298,12 +1304,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 }
                 Ok(Ran::Returned) => {
                     self.machine.ret()?;
-                    if let Some(result) = self.returned(frame, &mut block)? {
+                    if let Some(result) = self.returned(frame, &mut block, false)? {
                         return Ok(result);
                     }
                 }
                 Ok(Ran::TailReturned) => {
-                    if let Some(result) = self.returned(frame, &mut block)? {
+                    if let Some(result) = self.returned(frame, &mut block, true)? {
                         return Ok(result);
                     }
                 }
@@ -1508,6 +1514,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 return Ok(Some(Ran::Called(callee)));
             }
             let Some(target) = target else {
+                // The shim wrote a value of an uninhabited type, of any size: as Miri's copy of
+                // an intrinsic's result, its validity is what stops it.
+                if M::CHECKS && self.waiting.is_none() {
+                    let ty = self.place_ty(destination, locals)?;
+                    let Interval { addr, size } = destination_interval;
+                    self.typed_copy(addr, ty, size, RetagMode::Default)?;
+                }
                 return Err(MirEvalError::UndefinedBehavior(
                     // alloc: error path
                     "Diverging function returned".to_owned(),
@@ -1546,7 +1559,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         frame: &mut StackFrame<'db>,
     ) -> Result<'db, Ran<'db>> {
         let locals = &mut frame.locals;
-        let destination = locals.ptr[return_slot()];
+        let destination = frame.return_to.unwrap_or(locals.ptr[return_slot()]);
         let fn_ty = self.operand_ty(func, locals)?;
         // A function pointer callee is the block's first word, each argument after it at its
         // alignment.
@@ -1641,14 +1654,25 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// `frame` returned, the machine told; `block` is set to where its caller goes on. The
-    /// result of the run when `frame` is the bottom one of [`Self::interpret_mir`].
+    /// result of the run when `frame` is the bottom one of [`Self::interpret_mir`]. `filled`:
+    /// a shim the frame tail-called wrote the result into the frame's destination, so its own
+    /// return slot holds nothing.
     fn returned(
         &mut self,
         frame: StackFrame<'db>,
         block: &mut BasicBlockId,
+        filled: bool,
     ) -> Result<'db, Option<Interval>> {
-        let return_interval = frame.locals.ptr[return_slot()];
+        let mut return_interval = frame.locals.ptr[return_slot()];
         let returned_ty = frame.locals.body.locals[return_slot()].ty.as_ref();
+        if let Some(to) = frame.return_to {
+            // After `machine.ret`, as Miri's `return_from_current_stack_frame`: the place was
+            // protected for the call, and the copy into it is the caller's own write.
+            if !filled && to.size != 0 {
+                self.copy_from_interval(to.addr, return_interval)?;
+            }
+            return_interval = to;
+        }
         let StackFrame { locals, then, drops, prev_stack_ptr, .. } = frame;
         self.unused_locals_store.borrow_mut().entry(locals.body.owner).or_default().push(locals);
         if then == Then::Nested {
@@ -1660,7 +1684,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         self.free_stack(prev_stack_ptr)?;
         match then {
             Then::Block(target) => {
-                // The callee's return slot is the call's destination, now complete.
+                // The call's destination, now complete.
                 if M::CHECKS && return_interval.size != 0 {
                     let Interval { addr, size } = return_interval;
                     self.typed_copy(addr, returned_ty, size, RetagMode::Default)?;
@@ -1868,22 +1892,23 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     /// A frame of `body` with `locals` starts: the machine sees the call, the protected
-    /// places (the `Operand::Move` arguments, and the return place when `in_place_return`, as
-    /// it is the caller's), and the arguments written to its parameters.
+    /// places (the `Operand::Move` arguments, and `return_place`, the caller's destination the
+    /// frame's `_0` is copied to), and the arguments written to its parameters.
     fn enter_frame(
         &mut self,
         body: &'db MirBody<'db>,
         locals: &mut Locals<'db>,
         args: impl Iterator<Item = IntervalOrOwned<M::Shadow>>,
-        in_place_return: bool,
+        return_place: Option<Interval>,
     ) -> Result<'db, ()> {
         if M::CHECKS {
             self.machine.call()?;
             for moved in mem::take(&mut self.moved_args) {
                 self.machine.protect(self.ptr(moved.addr), moved.size as u64)?;
             }
-            let ret = locals.ptr[return_slot()];
-            if in_place_return && ret.size != 0 {
+            if let Some(ret) = return_place
+                && ret.size != 0
+            {
                 self.machine.protect(self.ptr(ret.addr), ret.size as u64)?;
             }
         }
@@ -1920,6 +1945,18 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return Err(MirEvalError::InternalError("too few arguments".into()));
         }
         Ok(())
+    }
+
+    /// The locals of a frame called with `destination`. Without machine checks `_0` is the
+    /// destination itself; with them it is the frame's own, as in Miri, since the machine
+    /// protects the destination for the call and the callee's writes to `_0` are not the
+    /// caller's.
+    fn callee_locals(
+        &mut self,
+        body: &'db MirBody<'db>,
+        destination: Interval,
+    ) -> Result<'db, (Locals<'db>, usize)> {
+        self.create_locals_for_body(body, (!M::CHECKS).then_some(destination))
     }
 
     fn create_locals_for_body(
@@ -4042,6 +4079,11 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             _ => None,
         };
         let Some((pos, block)) = block.filter(|(_, it)| it.origin == origin) else {
+            if M::CHECKS {
+                // The machine names what the pointer is (freed, of another kind, not at the
+                // start), as Miri's `deallocate_ptr` does.
+                self.machine.free(self.ptr(addr), None, None, origin.kind())?;
+            }
             // alloc: error path
             return Err(MirEvalError::UndefinedBehavior(format!(
                 "`{what}` of a pointer that is not the start of memory allocated by it"
@@ -4838,11 +4880,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             self.free_stack(mark)?;
             return Ok(None);
         }
-        let (mut callee_locals, prev_stack_ptr) =
-            self.create_locals_for_body(mir_body, Some(destination))?;
-        self.enter_frame(mir_body, &mut callee_locals, arg_values, true)?;
+        let (mut callee_locals, prev_stack_ptr) = self.callee_locals(mir_body, destination)?;
+        let return_to = M::CHECKS.then_some(destination);
+        self.enter_frame(mir_body, &mut callee_locals, arg_values, return_to)?;
         let mut frame =
             StackFrame::new(callee_locals, then, prev_stack_ptr, (span, locals.body.owner), None);
+        frame.return_to = return_to;
         if let Some(closure_ty) = dropped {
             frame.drops = self.spare_drops.pop().unwrap_or_default();
             frame.drops.push(DropStep::Glue(closure_ty, closure_addr, OwnedBytes::new()));
@@ -5101,10 +5144,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             return Ok(None);
         }
         let span = (span, locals.body.owner);
-        let (mut locals, prev_stack_ptr) =
-            self.create_locals_for_body(mir_body, Some(destination))?;
-        self.enter_frame(mir_body, &mut locals, arg_bytes, true)?;
-        Ok(Some(StackFrame::new(locals, then, prev_stack_ptr, span, Some(def))))
+        let (mut locals, prev_stack_ptr) = self.callee_locals(mir_body, destination)?;
+        let return_to = M::CHECKS.then_some(destination);
+        self.enter_frame(mir_body, &mut locals, arg_bytes, return_to)?;
+        let mut frame = StackFrame::new(locals, then, prev_stack_ptr, span, Some(def));
+        frame.return_to = return_to;
+        Ok(Some(frame))
     }
 
     fn exec_fn_trait(

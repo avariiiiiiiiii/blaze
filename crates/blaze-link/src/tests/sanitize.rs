@@ -183,7 +183,8 @@ fn every_constructor_field_is_inside_its_code_on_both_architectures() {
 fn asan_registers_each_global_with_its_redzone_and_descriptor() {
     let start = function(1, &LEA, vec![rel32(3, of(10))]);
     let item = global(10, 8);
-    let rt = runtime(&["__asan_register_globals", "__asan_unregister_globals"]);
+    let defines = ["__asan_register_globals", "__asan_unregister_globals"];
+    let rt: Arc<[u8]> = archive(&[("asan.o", &runtime(&defines), &defines)]).into();
     let mut image = Image::new(name(TO), sanitized(asan(), false)).unwrap();
     let mut disk = Disk::default();
     let change = Change {

@@ -291,7 +291,7 @@ impl Compiler {
         });
         let cwd = TArc::new(AbsPathBuf::assert("/".into()));
         let mut graph = CrateGraphBuilder::default();
-        let mut add = |root: FileId, name: &str, origin: CrateOrigin| {
+        let mut add = |root: FileId, name: &str, origin: CrateOrigin, attrs: &[&str]| {
             graph.add_crate_root(
                 root,
                 Edition::CURRENT,
@@ -301,14 +301,17 @@ impl Compiler {
                 None,
                 Env::default(),
                 origin,
-                Vec::new(),
+                attrs.iter().map(|&it| it.to_owned()).collect(),
                 TargetKind::Lib { is_proc_macro: false },
                 cwd.clone(),
                 workspace.clone(),
             )
         };
-        let core = self.files.get(CORE).map(|&root| add(root, "core", CrateOrigin::Lang(LangCrateOrigin::Core)));
-        let app = self.files.get(MAIN).map(|&root| add(root, "app", CrateOrigin::Local { repo: None, name: None }));
+        // The graph has no std: without `no_std` the app's prelude is std's, a crate that can't
+        // be found (E0463). `core`'s own source says `#![no_core]`.
+        let core = self.files.get(CORE).map(|&root| add(root, "core", CrateOrigin::Lang(LangCrateOrigin::Core), &[]));
+        let local = CrateOrigin::Local { repo: None, name: None };
+        let app = self.files.get(MAIN).map(|&root| add(root, "app", local, &["no_std"]));
         if let (Some(app), Some(core)) = (app, core) {
             let name = base_db::CrateName::new("core").expect("a crate name");
             let dep = DependencyBuilder::with_prelude(name, core, true, true);

@@ -956,8 +956,19 @@ impl<'a, 'db, 'f, D: Delegate<'db, 'f>> ExprUseVisitor<'a, 'db, 'f, D> {
                 self.consume_expr(base)?;
             }
 
-            Expr::BinaryOp { lhs, rhs, op: None | Some(BinaryOp::Assignment { .. }) } => {
+            Expr::BinaryOp { lhs, rhs, op: None } => {
                 self.consume_expr(lhs)?;
+                self.consume_expr(rhs)?;
+            }
+
+            // rustc's `ExprKind::AssignOp`: an overloaded one takes its lhs by the `&mut`
+            // autoref it records, a builtin one writes it in place.
+            Expr::BinaryOp { lhs, rhs, op: Some(BinaryOp::Assignment { .. }) } => {
+                if self.cx.result.method_resolutions.contains_idx(expr) {
+                    self.consume_expr(lhs)?;
+                } else {
+                    self.mutate_expr(lhs)?;
+                }
                 self.consume_expr(rhs)?;
             }
 

@@ -10,7 +10,7 @@ use crate::{
 };
 
 const FIXTURE: &str = r#"
-//- minicore: sized
+//- minicore: sized, pat
 trait A {}
 trait B {}
 trait Tr {
@@ -24,11 +24,11 @@ struct V<T: Tr> {
     self_default: &'static dyn D,
     not_found: T::Missing,
     ambiguous: <u8>::X,
-    exclusive: builtin#pattern_type(u32 is 0..10),
-    open: builtin#pattern_type(u32 is 1..),
-    not_a_range: builtin#pattern_type(u32 is _),
+    not_a_range: builtin#pattern_type(u8 is _),
     fine: <T as Tr>::X,
-    fine_pattern: builtin#pattern_type(u32 is 1..=10),
+    fine_pattern: builtin#pattern_type(u8 is 1..=10),
+    fine_exclusive: builtin#pattern_type(u8 is 0..10),
+    fine_open: builtin#pattern_type(u8 is 1..),
 }
 "#;
 
@@ -140,17 +140,14 @@ fn a_pattern_type_blaze_does_not_lower_is_an_error_naming_why() {
         .collect();
     assert_eq!(
         reasons,
-        [
-            PatternTypeUnsupported::ExclusiveEnd,
-            PatternTypeUnsupported::OpenEnd,
-            PatternTypeUnsupported::Pattern,
-        ],
-        "before, `0..10` was lowered as `0..=10`, and the others were error types with no diagnostic",
+        [PatternTypeUnsupported::Pattern],
+        "`_` is rustc's \"pattern not supported in pattern types\"; `0..10` and `1..` lower as \
+         `0..=9` and `1..=u8::MAX`",
     );
 }
 
 #[test]
 fn each_field_but_the_valid_ones_has_one_error() {
     let found = diagnostics();
-    assert_eq!(found.len(), 9, "one per invalid field, none for `fine` or `fine_pattern`: {found:?}");
+    assert_eq!(found.len(), 7, "one per invalid field, none for the `fine` ones: {found:?}");
 }

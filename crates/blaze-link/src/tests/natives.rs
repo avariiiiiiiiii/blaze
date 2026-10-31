@@ -232,7 +232,8 @@ fn nodefaultlib_takes_a_default_library_out() {
 fn tlssup() -> Vec<u8> {
     let mut b = Builder::new(BinaryFormat::Coff, Architecture::X86_64, Endianness::Little);
     for (section, name) in [(".tls", "_tls_start"), (".tls$ZZZ", "_tls_end")] {
-        let id = b.add_section(Vec::new(), section.as_bytes().to_vec(), SectionKind::Tls);
+        // tlssup.obj's `.tls` sections are plain initialized data: COFF has no TLS section kind.
+        let id = b.add_section(Vec::new(), section.as_bytes().to_vec(), SectionKind::Data);
         let at = b.append_section_data(id, &[0; 8], 8);
         b.add_symbol(Def {
             name: name.as_bytes().to_vec(),

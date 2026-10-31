@@ -1049,7 +1049,8 @@ fn views_renumber_at_the_limit_and_every_answer_holds() {
         assert_eq!(*get::<ReadB>(&db, cell), 7, "round {round}");
         assert_eq!(*get::<Double>(&db, still), 42, "round {round}");
     }
-    assert!(db.storage().view().as_u32() < start, "renumbered past the limit");
+    assert!(db.storage().view_bits() < start, "renumbered past the limit");
+    assert!(db.storage().view() > before, "the view hosts see is never reused");
     assert_eq!((db.runs("Double"), db.runs("ReadB")), (1, 1), "unchanged across it: never ran");
     assert_eq!(db.runs("Parity"), 6, "once, then once per write of `a`");
 }
